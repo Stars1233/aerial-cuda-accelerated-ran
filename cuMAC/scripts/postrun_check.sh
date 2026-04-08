@@ -1,5 +1,6 @@
 #!/bin/bash -x
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +28,7 @@
 #     ./tdl/.tdl_FAIL or ./tdl/.tdl_PASS
 #     ./cdl/.cdl_FAIL or ./cdl/.cdl_PASS
 #     ./64tr/.64tr_FAIL or ./64tr/.64tr_PASS
+#     ./pfmsort/.pfmsort_FAIL or ./pfmsort/.pfmsort_PASS
 
 
 # Exit codes: 0=PASS, 1=FAIL (sentinel created), 2=SKIP (dir missing)
@@ -36,7 +38,7 @@ LOG_BASE="${1:-}"
 TEST_TYPE="${2:-}"
 
 if [[ -z "$LOG_BASE" || -z "$TEST_TYPE" ]]; then
-  echo "Usage: $0 <LOG_BASE> <srs|drl|4t4r|tdl|cdl|64tr>" >&2
+  echo "Usage: $0 <LOG_BASE> <srs|drl|4t4r|tdl|cdl|64tr|pfmsort>" >&2
   exit 2
 fi
 
@@ -212,7 +214,7 @@ PY
 clear_sentinel "$TEST_TYPE"
 
 case "$TEST_TYPE" in
-  srs|drl|4t4r|tdl|cdl)
+  srs|drl|4t4r|tdl|cdl|pfmsort)
     check_faildir_with_whitelist_allowed "$TEST_TYPE"
     exit $?
     ;;
@@ -221,7 +223,7 @@ case "$TEST_TYPE" in
     exit $?
     ;;
   *)
-    echo "Unknown TEST_TYPE: $TEST_TYPE (expected: srs|drl|4t4r|tdl|cdl|64tr)" >&2
+    echo "Unknown TEST_TYPE: $TEST_TYPE (expected: srs|drl|4t4r|tdl|cdl|64tr|pfmsort)" >&2
     exit 2
     ;;
 esac

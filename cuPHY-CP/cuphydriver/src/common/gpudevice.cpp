@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,6 +36,7 @@ GpuDevice::GpuDevice(
 
     CUDA_CHECK_PHYDRIVER(cudaGetDeviceProperties(&deviceProp, id)); // can also consider getting attributes individually via cudaDeviceGetAttribute
     CUDA_CHECK_PHYDRIVER(cudaDeviceGetAttribute(&device_attr_clock_rate, cudaDevAttrClockRate, id)); // get attribute directly; marked as deprecated in cudaDeviceProp
+    CUDA_CHECK_PHYDRIVER(cudaDeviceGetAttribute(&device_is_direct_rdma_supported, cudaDevAttrGPUDirectRDMASupported, id)); // get attribute directly; unavailable in cudaDeviceProp
 
     setDevice();
 
@@ -47,7 +48,7 @@ GpuDevice::GpuDevice(
     //Maybe constructor can take as input a GDRCopy descriptor
 
     gdrc_h = nullptr;
-    if(init_gdr == true)
+    if(init_gdr == true && device_is_direct_rdma_supported == 1)
     {
         gdrc_h = gdr_open();
         if(gdrc_h == nullptr)
@@ -74,7 +75,7 @@ gdr_t* GpuDevice::getGDRhandler()
 
 struct gpinned_buffer* GpuDevice::newGDRbuf(size_t size)
 {
-    return new gpinned_buffer{&gdrc_h, size};
+    return new gpinned_buffer{&gdrc_h, size, device_is_direct_rdma_supported == 1};
 }
 
 int GpuDevice::runWarmup(int n, cudaStream_t s)
@@ -104,7 +105,7 @@ uint32_t GpuDevice::getId()
 
 void GpuDevice::print_info()
 {
-    NVLOGI_FMT(TAG, "Using GPU {} {}:{}:{} {} kHz",deviceProp.name,deviceProp.pciBusID, deviceProp.pciDeviceID,deviceProp.pciDomainID, device_attr_clock_rate);
+    NVLOGI_FMT(TAG, "Using GPU {} {}:{}:{} {} kHz isRDMASupported:{}",deviceProp.name,deviceProp.pciBusID, deviceProp.pciDeviceID,deviceProp.pciDomainID, device_attr_clock_rate, device_is_direct_rdma_supported);
     // Hz=int64_t(device_attr_clock_rate) * 1000;
 }
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,9 @@
  */
 
 #include <csignal>
+#include <exception>
 #include <libgen.h>
+#include <atomic>
 #include "nvlog.h"
 #include "nvlog.hpp"
 #include "memtrace.h"
@@ -28,12 +30,15 @@
 #define CONFIG_CUBB_ROOT_ENV "CUBB_HOME"
 
 static char logfile_base[MAX_PATH_LEN] = "/tmp";
-static int64_t logfile_count = -1;
 static size_t max_log_file_size_bytes = 20000000000;
-static int32_t max_rotating_file_num = 8;
+static constexpr int DEFAULT_MAX_ROTATING_FILE_NUM = 8;
+static int32_t max_rotating_file_num = DEFAULT_MAX_ROTATING_FILE_NUM;
+static std::atomic<int32_t> current_logfile_index{0};
 
 // Avoid duplicate initiating
 static std::atomic<int> fmt_log_initiated = 0;
+
+static pthread_t g_fmtlog_thread_id = 0; //!< Background polling thread id.
 
 exit_handler& pExitHandler=exit_handler::getInstance();
 
@@ -64,21 +69,45 @@ static inline fmtlog::LogLevel getfmtLogLevel(int level)
     return fmtlog::OFF;
 }
 
-void update_log_filename()
+
+/**
+ * Build the log file path for a given index.
+ * @param buf Output buffer.
+ * @param size Size of buf.
+ * @param index Index 0 = logfile_base only; index > 0 = logfile_base + ".%d".
+ */
+static void build_logfile_path(char* buf, size_t size, int index)
 {
-    static constexpr std::size_t INT64_DIGITS_HEADROOM = 32;
-    char logfile[MAX_PATH_LEN + INT64_DIGITS_HEADROOM] = {0};
-    logfile_count = (logfile_count + 1) % max_rotating_file_num;
-    if (logfile_count == 0)
+    if (index == 0)
     {
-        snprintf(logfile, sizeof(logfile), "%s", logfile_base);
+        snprintf(buf, size, "%s", logfile_base);
     }
     else
     {
-        snprintf(logfile, sizeof(logfile), "%s.%ld", logfile_base, logfile_count);
-        fmtlog::closeLogFile();
+        snprintf(buf, size, "%s.%d", logfile_base, index);
     }
-    fmtlog::setLogFile(logfile, true);
+}
+
+/**
+ * Update the log filename.
+ * @note Uses logfile_base and current_logfile_index. Index 0 = no suffix; index > 0 = .N. Wraps around.
+ */
+void update_log_filename()
+{
+    char new_path[MAX_PATH_LEN] = {0};
+    // Get the next file index and wrap around.
+    int new_index = current_logfile_index.fetch_add(1) + 1;
+    if (new_index == max_rotating_file_num)
+    {
+        current_logfile_index.fetch_sub(max_rotating_file_num - 1);
+    }
+
+    // Wrap around file index to range [1, max_rotating_file_num]
+    new_index = (new_index - 1) % (max_rotating_file_num - 1) + 1;
+    build_logfile_path(new_path, sizeof(new_path), new_index);
+
+    fmtlog::closeLogFile();
+    fmtlog::setLogFile(new_path, true);
 }
 
 static std::atomic_bool anyLogWasFull{false};
@@ -140,13 +169,42 @@ pthread_t startNVPollingThread()
     return thread_id;
 }
 
+/**
+ * Close the fmtlog.
+ * @note bg_thread_id is unused. Kept for API compatibility.
+ */
 void nvlog_fmtlog_close(pthread_t bg_thread_id)
 {
-    if (threadRunning.load() == false) return;
-    threadRunning.store(false);
-    pthread_join(bg_thread_id, NULL);
+    (void)bg_thread_id;  // Unused; uses g_fmtlog_thread_id. Kept for API compatibility.
+
+    int last_index = current_logfile_index.load();
+    if (last_index > 0) // If not the initial log file
+    {
+        last_index = (last_index -1) % (max_rotating_file_num - 1) + 1;
+    }
+
+    char thread_name[16];
+    pthread_getname_np(pthread_self(), thread_name, 16);
+
+    // Print the last log file path for debug
+    char last_file_path[MAX_PATH_LEN] = {0};
+    build_logfile_path(last_file_path, sizeof(last_file_path), last_index);
+    NVLOGC_FMT(TAG, "{}: closing FMT log from [{}] thread on core {}, last file path is {}", __func__, thread_name, sched_getcpu(), last_file_path);
+
+    if (threadRunning.exchange(false) == false)
+    {
+        printf("%s: fmtlog thread already stopped\n", __func__);
+        return;
+    }
+
+    if (g_fmtlog_thread_id != 0)
+    {
+        pthread_join(g_fmtlog_thread_id, NULL);
+        g_fmtlog_thread_id = 0;
+    }
     fmtlog::closeLogFile();
     fmt_log_initiated.store(0);
+    printf("%s: FMT log closed\n", __func__);
 }
 
 void nvlog_fmtlog_thread_init()
@@ -166,6 +224,19 @@ pthread_t nvlog_fmtlog_init(const char* yaml_file, const char* name,void (*exit_
     {
         printf("FMT log already had been initiated");
         return -1;
+    }
+
+    // Start exit watchdog thread on the current CPU core
+    int cpu_id = sched_getcpu();
+    if (cpu_id < 0)
+    {
+        NVLOGW_FMT(TAG, "{}: failed to get current CPU core: cpu_id={}, using default core 0", __func__, cpu_id);
+        cpu_id = 0;
+    }
+
+    if(exit_handler::getInstance().start_exit_watchdog_thread(cpu_id) != 0)
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Failed to start exit watchdog thread on core {}: {}", cpu_id, std::strerror(errno));
     }
 
     if(exit_hdlr_cb)
@@ -195,70 +266,103 @@ pthread_t nvlog_fmtlog_init(const char* yaml_file, const char* name,void (*exit_
     else
     {
         NVLOGC_FMT(TAG, "Using {} for nvlog configuration", yaml_file);
-        const YAML::Node root_node = YAML::LoadFile(yaml_file);
-        aerial::check_yaml_version(root_node, yaml_file);
-        // size_t num_tags = sizeof(g_nvlog_component_ids) / sizeof(nvlog_component_ids);
-
-        const YAML::Node nvlog_node = root_node["nvlog"];
-
-        int shm_log_level     = nvlog_node["shm_log_level"].as<int>();            // Log level of printing to SHM cache and disk file
-        max_log_file_size_bytes = nvlog_node["max_file_size_bytes"].as<size_t>();      // maximum size of each file
-        max_rotating_file_num   = nvlog_node["max_rotating_file_num"].as<size_t>();    // Number of rotating log files
-
-        std::string log_file_path = nvlog_node["log_file_path"].as<std::string>();
-        nvlog_safe_strncpy(logfile_base, log_file_path.c_str(), MAX_PATH_LEN);
-
-        fmtlog::LogLevel fmt_level = getfmtLogLevel(shm_log_level);
-
-        for(size_t n = 0; n < NVLOG_FMTLOG_NUM_TAGS; n++)
+        try
         {
-            g_nvlog_component_levels[n] = fmt_level;
-        }
+            const YAML::Node root_node = YAML::LoadFile(yaml_file);
+            aerial::check_yaml_version(root_node, yaml_file);
+            // size_t num_tags = sizeof(g_nvlog_component_ids) / sizeof(nvlog_component_ids);
 
-        if(YAML::Node all_tags = nvlog_node["nvlog_tags"]; all_tags.IsSequence())
-        {
-            for(YAML::const_iterator tag_node = all_tags.begin(); tag_node != all_tags.end(); ++tag_node)
+            const YAML::Node nvlog_node = root_node["nvlog"];
+
+            int shm_log_level     = nvlog_node["shm_log_level"].as<int>();            // Log level of printing to SHM cache and disk file
+            max_log_file_size_bytes = nvlog_node["max_file_size_bytes"].as<size_t>();      // maximum size of each file
+            max_rotating_file_num   = nvlog_node["max_rotating_file_num"].as<int32_t>();    // Number of rotating log files
+            if (max_rotating_file_num < 2) // At least 2 files are needed, one for reserving initial log, one for rotating tail logs
             {
-                YAML::Node::const_iterator sub_it = tag_node->begin();
-                auto f = sub_it->first;
-                auto key = f.as<std::string>();
-                int itag      = f.as<int>();
-                if(itag >= 0 && itag < NVLOG_DEFAULT_TAG_NUM)
+                NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: invalid yaml configuration: max_rotating_file_num={}, must >= 2, using default={}",
+                    __func__, max_rotating_file_num, DEFAULT_MAX_ROTATING_FILE_NUM);
+                max_rotating_file_num = DEFAULT_MAX_ROTATING_FILE_NUM;
+            }
+
+            std::string log_file_path = nvlog_node["log_file_path"].as<std::string>();
+            nvlog_safe_strncpy(logfile_base, log_file_path.c_str(), MAX_PATH_LEN);
+
+            fmtlog::LogLevel fmt_level = getfmtLogLevel(shm_log_level);
+
+            for(size_t n = 0; n < NVLOG_FMTLOG_NUM_TAGS; n++)
+            {
+                g_nvlog_component_levels[n] = fmt_level;
+            }
+
+            if(YAML::Node all_tags = nvlog_node["nvlog_tags"]; all_tags.IsSequence())
+            {
+                for(YAML::const_iterator tag_node = all_tags.begin(); tag_node != all_tags.end(); ++tag_node)
                 {
-                    std::string tag_name = (*tag_node)[key.c_str()].as<std::string>();
-                    // nvlog_safe_strncpy(tag.tag_name, tag_name.c_str(), cfg->max_tag_len);
-                    bool found = false;
-                    for(int i = 0; i < NVLOG_FMTLOG_NUM_TAGS; ++i)
-
-                    // (auto &c : g_nvlog_component_ids)
+                    YAML::Node::const_iterator sub_it = tag_node->begin();
+                    auto f = sub_it->first;
+                    auto key = f.as<std::string>();
+                    int itag      = f.as<int>();
+                    if(itag >= 0 && itag < NVLOG_DEFAULT_TAG_NUM)
                     {
-                        auto &c = g_nvlog_component_ids[i];
-                        if (itag == c.id)
+                        std::string tag_name = (*tag_node)[key.c_str()].as<std::string>();
+                        // nvlog_safe_strncpy(tag.tag_name, tag_name.c_str(), cfg->max_tag_len);
+                        bool found = false;
+                        for(int i = 0; i < NVLOG_FMTLOG_NUM_TAGS; ++i)
+
+                        // (auto &c : g_nvlog_component_ids)
                         {
-                            found = true;
-                            if((*tag_node)["shm_level"])
+                            auto &c = g_nvlog_component_ids[i];
+                            if (itag == c.id)
                             {
-                                int shm_level = (*tag_node)["shm_level"].as<int>();
-                                g_nvlog_component_levels[i] = getfmtLogLevel(shm_level);
+                                found = true;
+                                if((*tag_node)["shm_level"])
+                                {
+                                    int shm_level = (*tag_node)["shm_level"].as<int>();
+                                    g_nvlog_component_levels[i] = getfmtLogLevel(shm_level);
+                                }
+                                // printf("NVLOG tag %s level set to %d\n", tag_name.c_str(), g_nvlog_component_levels[i]);
                             }
-                            // printf("NVLOG tag %s level set to %d\n", tag_name.c_str(), g_nvlog_component_levels[i]);
                         }
-                    }
 
-                    if(!found)
-                    {
-                        printf("NVLOG tag %s do not match the ones specified in nvlog_fmt.hpp, we currently do not support dynamic tag names, skipping\n", tag_name.c_str());
-                        continue;
-                    }
+                        if(!found)
+                        {
+                            printf("NVLOG tag %s do not match the ones specified in nvlog_fmt.hpp, we currently do not support dynamic tag names, skipping\n", tag_name.c_str());
+                            continue;
+                        }
 
+                    }
                 }
             }
+        }
+        catch(const YAML::BadFile& badFile)
+        {
+            NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "Failed to load yaml file: {} ({})", yaml_file, badFile.what());
+            return -1;
+        }
+        catch(const YAML::ParserException& parseError)
+        {
+            NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: failed to parse yaml file: {} ({})", __func__, yaml_file, parseError.what());
+            return -1;
+        }
+        catch(const YAML::Exception& yamlError)
+        {
+            NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: yaml error while processing file: {} ({})", __func__, yaml_file, yamlError.what());
+            return -1;
+        }
+        catch(const std::exception& ex)
+        {
+            NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: exception while loading yaml file: {} ({})", __func__, yaml_file, ex.what());
+            return -1;
+        }
+        catch(...)
+        {
+            NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: unknown exception while loading yaml file: {}", __func__, yaml_file);
+            return -1;
         }
     }
 
     // Overwrite log path if exported AERIAL_LOG_PATH in environment
     char* env = nullptr;
-    pthread_t thread_id = -1;
     if(env = std::getenv("AERIAL_LOG_PATH"); env != nullptr)
     {
         NVLOGC_FMT(TAG, "AERIAL_LOG_PATH set to {}\n", env);
@@ -268,15 +372,15 @@ pthread_t nvlog_fmtlog_init(const char* yaml_file, const char* name,void (*exit_
     strcat(logfile_base, "/");
     strncat(logfile_base, name, 64);
     NVLOGC_FMT(TAG, "Output log file path {}", logfile_base);
-    // printf("Log file set to %s\n", logfile_base);
-    update_log_filename();
+    current_logfile_index.store(0);
+    fmtlog::setLogFile(logfile_base, true);
     fmtlog::setHeaderPattern("{HMSf} {l} {t} {O} ");
     fmtlog::setLogCB(logcb_aerial, fmtlog::VEB);
     fmtlog::setLogLevel(fmtlog::VEB);
     fmtlog::setLogQFullCB(logfullcb_aerial,NULL);
-    thread_id = startNVPollingThread();
+    g_fmtlog_thread_id = startNVPollingThread();
 
-    return thread_id;
+    return g_fmtlog_thread_id;
 }
 
 extern "C" int is_fmt_log_initiated()
@@ -346,9 +450,8 @@ extern "C" void nvlog_c_init_fmt(const char *file)
         return;
     }
 
+    current_logfile_index.store(0);
     nvlog_safe_strncpy(logfile_base, file, MAX_PATH_LEN);
-    update_log_filename();
-
     printf("FMT log initiated at %s\n", file);
     fmtlog::setLogFile(file, true);
     fmtlog::setHeaderPattern("{HMSf} {l} {t} {O} ");

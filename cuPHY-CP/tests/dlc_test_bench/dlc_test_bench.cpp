@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,12 @@ int main(int argc, char** argv) {
     get_root_path(root, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
     std::string yaml_path = std::string(root).append(NVLOG_DEFAULT_CONFIG_FILE);
     pthread_t bg_thread_id = nvlog_fmtlog_init(yaml_path.c_str(), "nvlog_out.log", NULL);
+
+    if (bg_thread_id == -1)
+    {
+        std::cout << "\n nvlog_fmtlog_init() failed! yaml_path:" << yaml_path.c_str() << std::endl; 
+        return -1; 
+    }
 
     // Check if user wants to run benchmarks
     bool run_benchmarks = false;
@@ -106,10 +112,11 @@ int main(int argc, char** argv) {
         }
         NVLOGC_FMT(TAG_BENCHMARK, "\n=== Benchmarks Complete ===\n");
        
-        // Final flush
+        // Final flush and close logger before exiting benchmark path
         fmtlog::poll(true);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        
+        nvlog_fmtlog_close(bg_thread_id);
+
         return 0;
     }
     
@@ -134,5 +141,11 @@ int main(int argc, char** argv) {
     fmtlog::poll(true);
     
     // Run all tests
-    return RUN_ALL_TESTS();
+    int result = RUN_ALL_TESTS();
+
+    fmtlog::poll(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    nvlog_fmtlog_close(bg_thread_id);
+
+    return result;
 }

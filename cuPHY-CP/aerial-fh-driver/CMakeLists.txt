@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -87,7 +87,7 @@ endif()
 set(AERIAL_FH_TARGET aerial-fh)
 add_library(${AERIAL_FH_TARGET} SHARED ${AERIAL_FH_SRCS})
 target_include_directories(${AERIAL_FH_TARGET} PUBLIC include/)
-target_link_libraries(${AERIAL_FH_TARGET} PRIVATE CUDA::cudart CUDA::cuda_driver nvlog cuphyoamlib app_config slot_command cuphy_pti)#
+target_link_libraries(${AERIAL_FH_TARGET} PRIVATE CUDA::cudart CUDA::cuda_driver nvlog cuphyoamlib app_config slot_command cuphy_pti aerial_utils)#
 target_include_directories(${AERIAL_FH_TARGET} PRIVATE $<BUILD_INTERFACE:${CUBB_HOME}/cuPHY/examples/common>)
 
 #-- DOCA TX
@@ -118,7 +118,7 @@ endif()
 #Link to DOCA shared libraries
 target_compile_options(${AERIAL_FH_TARGET} PRIVATE ${DOCA_CFLAGS})
 target_include_directories(${AERIAL_FH_TARGET} PUBLIC ${DOCA_INCLUDE_DIRS})
-target_link_libraries(${AERIAL_FH_TARGET} PRIVATE json-c -L${DOCA_LIBRARY_DIRS} -ldoca_gpunetio -ldoca_common -ldoca_argp -ldoca_eth)
+target_link_libraries(${AERIAL_FH_TARGET} PRIVATE json-c -L${DOCA_LIBRARY_DIRS} -ldoca_gpunetio -ldoca_common -ldoca_argp -ldoca_eth -ldoca_dpdk_bridge)
 # 	target_link_libraries(${AERIAL_FH_TARGET} PRIVATE -Wl,--whole-archive ${DOCA_LIBRARY_DIRS}/libdoca_gpu_device.a  -Wl,--no-whole-archive)
 # 	target_include_directories(${AERIAL_FH_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../compression_decompression/comp_decomp_lib/include)
 

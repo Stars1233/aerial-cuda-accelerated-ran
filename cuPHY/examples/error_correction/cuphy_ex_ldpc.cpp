@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -464,7 +464,7 @@ int main(int argc, char* argv[])
         //--------------------------------------------------------------
         // Initialize an LDPC decode descriptor structure. (This is only
         // used when the transport block interface is selected.)
-        LDPC_decode_desc dec_desc(dec_cfg);
+        LDPC_decode_desc dec_desc(dec_cfg,CUPHY_LDPC_DECODE_DESC_MAX_TB);
         if(useTBInterface)
         {
             if(spreadTB)

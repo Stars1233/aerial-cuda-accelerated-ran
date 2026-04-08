@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1156,7 +1156,7 @@ inline __device__ void srsFilterMultiply(
    const __half2 *sh_rxSrs,
    const __half2 *sh_W_matrix,
    const __half2 *sh_focc_table,
-   const uint8_t(&portToFoccMap)[MAX_N_ANT_PORTS_PER_COMB],
+   const uint8_t* portToFoccMap,
    cg::thread_block &block,
    cg::thread_block_tile<32> &tile,
    int tid,
@@ -1318,6 +1318,7 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    int              tid         = thisThrdBlk.thread_rank();
    constexpr int WARP_SIZE      = 32;
    cg::thread_block_tile<32> tile = cg::tiled_partition<WARP_SIZE>(thisThrdBlk);
+   constexpr int NUM_WARPS_PER_CTA = SRS_CHEST_BLOCK_SZ / WARP_SIZE;
 
    // filter parameters:
   // tensor_ref_any<CUPHY_C_16F>& tFocc_table       = pStatDescr->tFocc_table;
@@ -1358,7 +1359,9 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    float& noisEstDebias_comb4_nPorts12 = pStatDescr->noisEstDebias_comb4_nPorts12;
 
    uint8_t chEstToL2NormalizationAlgo = pStatDescr->chEstToL2NormalizationAlgo;
-#ifndef ASIM_CUPHY_SRS_OUTPUT_FP32
+#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
+   float   chEstToL2ConstantScaler = 1.0f; //TODO
+#else
    float   chEstToL2ConstantScaler = pStatDescr->chEstToL2ConstantScaler;
 #endif
    uint8_t enableDelayOffsetCorrection = pStatDescr->enableDelayOffsetCorrection;
@@ -1393,7 +1396,7 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    uint8_t combOffset                                = ueDescrFirst.combOffsets[firstUeInBlockCombIdx];
    constexpr uint8_t nCombScPerPrb                   = (combSize == 2) ? 6 : 3;
    uint8_t              cellIdx                      = ueDescrFirst.cellIdx;
-   uint8_t              prgSize                      = ueDescrFirst.prgSize;
+   uint16_t             prgSize                      = ueDescrFirst.prgSize;
 
    // cell parameters:
    cellDescr_t&                cellDescr = pDynDescr->cellDescrs[cellIdx];
@@ -1471,30 +1474,55 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
 
    constexpr uint8_t nSrsScBlock = combSize == 4 ? 12 : 24;
 
-   // shared memory assignments: temporary storage for srs computation
+   // Shared memory assignments: temporary storage for SRS computation
+   // All buffers are carved out from a single dynamic shared memory buffer (sh_buff)
    __shared__ extern __half2 sh_buff[];
-   __half2* sh_rxSrs      = sh_buff;                                            // size [nRxAntSrs * nSrsScBlock]
-   __half2* sh_Hest       = &sh_rxSrs[nRxAntSrs * nSrsScBlock];                 // size [nRxAntSrs * nSrsScBlock * nAntPorts]
-   __half2* sh_W_matrix_w = &sh_Hest[nRxAntSrs * nSrsScBlock * nAntPorts];      // size [nSrsScBlock * nSrsScBlock]
-   __half2* sh_W_matrix_n = &sh_W_matrix_w[nSrsScBlock * nSrsScBlock];          // size [nSrsScBlock * nSrsScBlock]
-   //other shared memory arrays
-   float*   sh_phaseRamp                             = reinterpret_cast<float*>(&sh_W_matrix_n[nSrsScBlock * nSrsScBlock]);         // size [nAntPorts]
-   __half2* sh_avgScCorr                             = reinterpret_cast<__half2*>(&sh_phaseRamp[nAntPorts]);                        // size [nAntPorts]
-   __half2* sh_focc_table                            = &sh_avgScCorr[nAntPorts];                                                    // actual size [(FOCC_LENGTH+1) * FOCC_LENGTH], allocated size is upper limit [13*12]
-   float(*sh_avgSignalEnergyPrb)[N_PRB_PER_COMP_BLK] = reinterpret_cast<float(*)[N_PRB_PER_COMP_BLK]>(&sh_focc_table[13 * 12]);     // size [nAntPorts][N_PRB_PER_COMP_BLK]
-   float(*sh_avgSignalEnergySc)[nSrsScBlock]         = reinterpret_cast<float(*)[nSrsScBlock]>(&sh_avgSignalEnergyPrb[nAntPorts]);  // size [nAntPorts][nSrsScBlock]
-   float*           sh_avgSignalEnergy               = reinterpret_cast<float*>(&sh_avgSignalEnergySc[nAntPorts]);                  // size [nAntPorts]
-   uint32_t*        sh_ueBlockCntr                   = reinterpret_cast<uint32_t*>(&sh_avgSignalEnergy[nAntPorts]);                 // size [nAntPorts]
-   __half2*         sh_tile_avgScCorr                = reinterpret_cast<__half2*>(&sh_ueBlockCntr[nAntPorts]);                      // size [number_of_warps_in_CTA*nAntPorts]
-   __half2*         sh_phaseTable                    = &sh_tile_avgScCorr[tile.meta_group_size() * nAntPorts];                      // actual size [n_SRS_cs_max * nSrsScBlock], allocated size [13 * nSrsScBlock]
-   __shared__ float sh_avgNoiseEnergy;
-   __shared__ float sh_tmpWidebandCsCorrNotUse;
-   __shared__ uint16_t csIdx2UeIdxLut[12]; // 12 >= n_SRS_cs_max
+
+   // === Section 1: __half2 buffers (no cast needed from base) ===
+   __half2* sh_rxSrs      = sh_buff;                                       // size: [nRxAntSrs * nSrsScBlock]
+   __half2* sh_Hest       = &sh_rxSrs[nRxAntSrs * nSrsScBlock];            // size: [nRxAntSrs * nSrsScBlock * nAntPorts]
+   __half2* sh_W_matrix_w = &sh_Hest[nRxAntSrs * nSrsScBlock * nAntPorts]; // size: [nSrsScBlock * nSrsScBlock]
+   __half2* sh_W_matrix_n = &sh_W_matrix_w[nSrsScBlock * nSrsScBlock];     // size: [nSrsScBlock * nSrsScBlock]
+
+   // === Section 2: Mixed-type buffers (require reinterpret_cast) ===
+   float*   sh_phaseRamp           = reinterpret_cast<float*>(&sh_W_matrix_n[nSrsScBlock * nSrsScBlock]);   // size: [nAntPorts]
+   __half2* sh_avgScCorr           = reinterpret_cast<__half2*>(&sh_phaseRamp[nAntPorts]);                  // size: [nAntPorts]
+   __half2* sh_focc_table          = &sh_avgScCorr[nAntPorts];                                              // size: [13 * 12] (upper limit for [(FOCC_LENGTH+1) * FOCC_LENGTH])
+   float(*sh_avgSignalEnergyPrb)[N_PRB_PER_COMP_BLK] = reinterpret_cast<float(*)[N_PRB_PER_COMP_BLK]>(&sh_focc_table[13 * 12]);    // size: [nAntPorts][N_PRB_PER_COMP_BLK]
+   float(*sh_avgSignalEnergySc)[nSrsScBlock]         = reinterpret_cast<float(*)[nSrsScBlock]>(&sh_avgSignalEnergyPrb[nAntPorts]); // size: [nAntPorts][nSrsScBlock]
+   float*    sh_avgSignalEnergy    = reinterpret_cast<float*>(&sh_avgSignalEnergySc[nAntPorts]);            // size: [nAntPorts]
+   uint32_t* sh_ueBlockCntr        = reinterpret_cast<uint32_t*>(&sh_avgSignalEnergy[nAntPorts]);           // size: [nAntPorts]
+   __half2*  sh_tile_avgScCorr     = reinterpret_cast<__half2*>(&sh_ueBlockCntr[nAntPorts]);                // size: [number_of_warps_in_CTA * nAntPorts]
+   __half2*  sh_phaseTable         = &sh_tile_avgScCorr[NUM_WARPS_PER_CTA * nAntPorts];                     // size: [13 * nSrsScBlock] (upper limit for [(n_SRS_cs_max+1) * nSrsScBlock])
+   __half2*  sh_phaseTableEnd      = sh_phaseTable + (nSrsScBlock + 1) * 12;                                // end marker for sh_phaseTable
+
+   // === Section 3: Dynamically-sized buffers (using byte pointer arithmetic) ===
+   // Pattern: define pointer, then advance sh_dynPtr by buffer size
+   uint8_t* sh_dynPtr = reinterpret_cast<uint8_t*>(sh_phaseTableEnd);
+
+   float*    sh_avgNoiseEnergy          = reinterpret_cast<float*>(sh_dynPtr);    sh_dynPtr += sizeof(float);                          // size: [1]
+   float*    sh_tmpWidebandCsCorrNotUse = reinterpret_cast<float*>(sh_dynPtr);    sh_dynPtr += sizeof(float);                          // size: [1]
+   uint16_t* csIdx2UeIdxLut             = reinterpret_cast<uint16_t*>(sh_dynPtr); sh_dynPtr += 12 * sizeof(uint16_t);                  // size: [12] (n_SRS_cs_max <= 12)
+   uint16_t* sh_portToUeIdxWithinBlock  = reinterpret_cast<uint16_t*>(sh_dynPtr); sh_dynPtr += MAX_N_ANT_PORTS_PER_COMB * sizeof(uint16_t); // size: [MAX_N_ANT_PORTS_PER_COMB]
+   uint16_t* sh_ueIdxs                  = reinterpret_cast<uint16_t*>(sh_dynPtr); sh_dynPtr += MAX_N_ANT_PORTS_PER_COMB * sizeof(uint16_t); // size: [MAX_N_ANT_PORTS_PER_COMB]
+   uint8_t*  sh_nUePorts                = sh_dynPtr;                              sh_dynPtr += MAX_N_ANT_PORTS_PER_COMB;               // size: [MAX_N_ANT_PORTS_PER_COMB]
+   uint8_t*  sh_portToFoccMap           = sh_dynPtr;                              sh_dynPtr += MAX_N_ANT_PORTS_PER_COMB;               // size: [MAX_N_ANT_PORTS_PER_COMB]
+   uint8_t*  sh_blockPortToUePortMap    = sh_dynPtr;                              sh_dynPtr += MAX_N_ANT_PORTS_PER_COMB;               // size: [MAX_N_ANT_PORTS_PER_COMB]
+   uint8_t*  sh_ueCombIdxs              = sh_dynPtr;                              sh_dynPtr += MAX_N_ANT_PORTS_PER_COMB;               // size: [MAX_N_ANT_PORTS_PER_COMB]
+   uint8_t*  sh_ueHopIdxs               = sh_dynPtr;                              sh_dynPtr += MAX_N_ANT_PORTS_PER_COMB;               // size: [MAX_N_ANT_PORTS_PER_COMB]
 
    // initialize
    for (int i = tid; i < nAntPorts; i += thisThrdBlk.size()) {
       sh_avgScCorr[i] = __float2half2_rn(0.f);
       sh_phaseRamp[i] = 0;
+      sh_portToFoccMap[i]          = ueGroupDescr.portToFoccMap[i];
+      sh_portToUeIdxWithinBlock[i] = ueGroupDescr.portToUeIdxWithinBlock[i];
+      sh_blockPortToUePortMap[i]   = ueGroupDescr.blockPortToUePortMap[i];
+   }
+   for (int i = tid; i < nUes; i += thisThrdBlk.size()) {
+      sh_ueIdxs[i]     = ueGroupDescr.ueIdxs[i];
+      sh_ueCombIdxs[i] = ueGroupDescr.ueCombIdxs[i];
+      sh_ueHopIdxs[i]  = ueGroupDescr.ueHopIdxs[i];
    }
 
    constexpr uint16_t INVALID_UE_IDX = 0xFFFF;
@@ -1514,8 +1542,8 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    }
 
    if (tid == 0) { // initialize noise and signal energy for wideband SNR
-       sh_avgNoiseEnergy          = 0.0f;
-       sh_tmpWidebandCsCorrNotUse = 0.0f;
+       *sh_avgNoiseEnergy          = 0.0f;
+       *sh_tmpWidebandCsCorrNotUse = 0.0f;
       for(int i = 0; i < nAntPorts; ++i)
       {
           sh_avgSignalEnergy[i] = 0.0f;
@@ -1541,6 +1569,8 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
 //    STEP 1: Load Rx SRS subcarriers, remove ZC cover-code, average repetitions
 //    flatten nested loop over nRxAntSrs -> nSrsScBlocks
    max_loop_iters = nRxAntSrs * nSrsScBlock;
+   // Precompute reciprocal to replace division with multiplication
+   const __half2 invNRepPerHop = __float2half2_rn(1.0f / static_cast<float>(nRepPerHop));
    for(int i = tid; i < max_loop_iters; i += thisThrdBlk.size())
    {
        int scIdx  = i % nSrsScBlock;
@@ -1591,9 +1621,8 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
            // remove ZC coverCode and add :
            srs = __hadd2(srs, complex_conjmul(y, __float22half2_rn(r)));
        }
-       // normalize :
-       sh_rxSrs[i].x = srs.x / static_cast<__half>(nRepPerHop);
-       sh_rxSrs[i].y = srs.y / static_cast<__half>(nRepPerHop);
+       // normalize (use precomputed reciprocal instead of division):
+       sh_rxSrs[i] = __hmul2(srs, invNRepPerHop);
    }
 
 //    STEP 2: remove cyclic shifts and apply wide filter to estimate channel
@@ -1611,14 +1640,14 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
        sh_rxSrs,
        sh_W_matrix_w,
        sh_focc_table,
-       ueGroupDescr.portToFoccMap,
+       sh_portToFoccMap,
        thisThrdBlk,
        tile,
        tid,
        nRxAntSrs,
        sh_phaseRamp,
        sh_phaseTable,
-       ueGroupDescr.portToUeIdxWithinBlock);
+       sh_portToUeIdxWithinBlock);
    __syncthreads();
 
    //=============================================================================
@@ -1659,8 +1688,9 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
        uint8_t portIdx = 0;
        for(int i = 0; i < nUes; ++i)
        {
-           uint16_t ueIdx       = ueGroupDescr.ueIdxs[i];
+           uint16_t ueIdx       = sh_ueIdxs[i];
            uint8_t  nUePorts    = pDynDescr->ueDescrs[ueIdx].nPortsPerComb;
+           sh_nUePorts[i]       = nUePorts;  // Cache for reuse in STEP 6+
            __half2  ueAvgScCorr = {0, 0};
            invScale             = __half2half2(__float2half(__frcp_rn(float(nUePorts))));
 
@@ -1694,14 +1724,14 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
             sh_rxSrs,
             sh_W_matrix_n,
             sh_focc_table,
-            ueGroupDescr.portToFoccMap,
+            sh_portToFoccMap,
             thisThrdBlk,
             tile,
             tid,
             nRxAntSrs,
             sh_phaseRamp,
             sh_phaseTable,
-            ueGroupDescr.portToUeIdxWithinBlock);
+            sh_portToUeIdxWithinBlock);
     }
     else
     {
@@ -1710,14 +1740,14 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
             sh_rxSrs,
             sh_W_matrix_n,
             sh_focc_table,
-            ueGroupDescr.portToFoccMap,
+            sh_portToFoccMap,
             thisThrdBlk,
             tile,
             tid,
             nRxAntSrs,
             sh_phaseRamp,
             sh_phaseTable,
-            ueGroupDescr.portToUeIdxWithinBlock);
+            sh_portToUeIdxWithinBlock);
     }
     __syncthreads();
 
@@ -1743,8 +1773,7 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
 
          for(int j = 0; j < nUes; ++j)
          {
-            uint16_t ueIdx    = ueGroupDescr.ueIdxs[j];
-            uint8_t  nUePorts = pDynDescr->ueDescrs[ueIdx].nPortsPerComb;
+            uint8_t  nUePorts = sh_nUePorts[j];
             float    sigy     = 0.f;
 
             int    scIdx_global = scIdx * combSize;
@@ -1757,7 +1786,7 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
 
             for(int uePortIdx = 0; uePortIdx < nUePorts; ++uePortIdx)
             {
-                auto       foccIdx = ueGroupDescr.portToFoccMap[portIdx];
+                auto       foccIdx = sh_portToFoccMap[portIdx];
                 const auto focc    = sh_focc_table[foccIdx * (FOCC_LENGTH + 1) + scIdxModFoccLength];
                 auto       est     = sh_Hest[portIdx + nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx];
                 auto       est2    = __hmul2(est, est);
@@ -1770,7 +1799,8 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
             sigEnergy[j] += sigy;
          }
          __half2 noise  = __hsub2(scRxEst, sh_rxSrs[i]);
-         noiseEnergy   += static_cast<float>(noise.x * noise.x + noise.y * noise.y);
+         noiseEnergy   += fmaf(__half2float(noise.x), __half2float(noise.x),
+                               __half2float(noise.y) * __half2float(noise.y));
       }
 
       int numGroups = nSrsScBlock / (prgSize * nCombScPerPrb);
@@ -1789,11 +1819,11 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
                est += nAntPorts;
          }
 
-         const int  ueIdxWithinBlock = ueGroupDescr.portToUeIdxWithinBlock[portIdx];
-         const int  ueIdx            = ueGroupDescr.ueIdxs[ueIdxWithinBlock];
-         const int  hopIdx           = ueGroupDescr.ueHopIdxs[ueIdxWithinBlock];
-         const int  combIdx          = ueGroupDescr.ueCombIdxs[ueIdxWithinBlock];
-         const int  uePortIdx        = ueGroupDescr.blockPortToUePortMap[portIdx];
+         const int  ueIdxWithinBlock = sh_portToUeIdxWithinBlock[portIdx];
+         const int  ueIdx            = sh_ueIdxs[ueIdxWithinBlock];
+         const int  hopIdx           = sh_ueHopIdxs[ueIdxWithinBlock];
+         const int  combIdx          = sh_ueCombIdxs[ueIdxWithinBlock];
+         const int  uePortIdx        = sh_blockPortToUePortMap[portIdx];
          ueDescr_t&  ueDesc          = pDynDescr->ueDescrs[ueIdx];
 
          const auto  chEstBuffOffset = blockStartPrb / prgSize - ueDesc.chEstBuffStartPrbGrp;
@@ -1820,14 +1850,17 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
          if(chEstToL2NormalizationAlgo==0)
          {
 #ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
-             tensor_ref_any<CUPHY_C_32F>& tChEstToL2        = ueDesc.tChEstToL2;
-             tChEstToL2({chEstToL2Offset + grpIdx, blockStartAnt + antIdx, portToL2OutUeAntMap[uePortIdx]}) = avgH;
+             tensor_ref_any<CUPHY_C_32F>& tChEstToL2Inner        = ueDesc.tChEstToL2Inner;
+             float2 out;
+             out.x = static_cast<float>(avgH.x*chEstToL2ConstantScaler);
+	           out.y = static_cast<float>(avgH.y*chEstToL2ConstantScaler);
+             tChEstToL2Inner({chEstToL2Offset + grpIdx, blockStartAnt + antIdx, portToL2OutUeAntMap[uePortIdx]}) = out;
 #else
-             tensor_ref_any<CUPHY_C_16I>& tChEstToL2 = ueDesc.tChEstToL2;
-             short2 out;
-             out.x = static_cast<int16_t>(avgH.x*chEstToL2ConstantScaler);
-	         out.y = static_cast<int16_t>(avgH.y*chEstToL2ConstantScaler);
-             tChEstToL2({chEstToL2Offset + grpIdx, blockStartAnt + antIdx, portToL2OutUeAntMap[uePortIdx]}) = out;
+             tensor_ref_any<CUPHY_C_16F>& tChEstToL2Inner = ueDesc.tChEstToL2Inner;
+             half2 out;
+             out.x = static_cast<half>(avgH.x*chEstToL2ConstantScaler);
+	           out.y = static_cast<half>(avgH.y*chEstToL2ConstantScaler);
+             tChEstToL2Inner({chEstToL2Offset + grpIdx, blockStartAnt + antIdx, portToL2OutUeAntMap[uePortIdx]}) = out;
 #endif
          }
          else if(chEstToL2NormalizationAlgo==1)
@@ -1840,21 +1873,28 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
                  uint8_t (&portIdxMappingL2)[MAX_N_ANT_PORTS] = ueDesc.portIdxMappingL2;
                  portIdxMappingL2[portToL2OutUeAntMap[uePortIdx]] = portToUeAntMap[uePortIdx];
              }
+#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
+             tensor_ref_any<CUPHY_C_32F>& tChEstToL2Inner = ueDesc.tChEstToL2Inner;
+             tChEstToL2Inner({chEstToL2Offset + grpIdx, blockStartAnt + antIdx, portToL2OutUeAntMap[uePortIdx]}) = avgH;
+#else
+             tensor_ref_any<CUPHY_C_16F>& tChEstToL2Inner = ueDesc.tChEstToL2Inner;
+             tChEstToL2Inner({chEstToL2Offset + grpIdx, blockStartAnt + antIdx, portToL2OutUeAntMap[uePortIdx]}) = __float22half2_rn(avgH);
+#endif
          }
       }
    } else {
         // Last warp handles average signal energy accumulations.
         uint8_t antPortOffset = 0;
         for (int k = 0; k < nUes; ++k){
-            uint16_t ueIdx       = ueGroupDescr.ueIdxs[k];
-            uint8_t  nUePorts    = pDynDescr->ueDescrs[ueIdx].nPortsPerComb;
+            uint8_t  nUePorts    = sh_nUePorts[k];
             float    energyAccum = 0.0f;
 
             for (int i = thisThrdBlk.size()-1-tid; i < nSrsScBlock; i += WARP_SIZE) {
                 for(int ueAntPortIdx = 0; ueAntPortIdx < nUePorts; ++ueAntPortIdx){
                     for (int j = 0; j < nRxAntSrs; j++) {
                         const __half2 est  = sh_Hest[antPortOffset + ueAntPortIdx + nAntPorts * i + nAntPorts * nSrsScBlock * j];
-                        energyAccum       += static_cast<float>(est.x * est.x + est.y * est.y);
+                        energyAccum       += fmaf(__half2float(est.x), __half2float(est.x),
+                                                  __half2float(est.y) * __half2float(est.y));
                     }
                 }
                 sh_avgSignalEnergySc[k][i] = energyAccum;
@@ -1865,18 +1905,16 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    __syncthreads();
 
    constexpr int numPrbs = nSrsScBlock / nCombScPerPrb;
-   // The reduction below uses the first thread in each warp and, for the warp-based
-   // reduction, the first full warp. Thus, start from the end of the last warp for
-   // this energy reduction.
-   for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUes; ++ueIdxWithinBlock)
-   {
-        for (int i = thisThrdBlk.size()-1-tid; i < numPrbs; i += thisThrdBlk.size()) {
-            float accum = sh_avgSignalEnergySc[ueIdxWithinBlock][i*nCombScPerPrb];
-            for (int j = 1; j < nCombScPerPrb; j++) {
-                accum += sh_avgSignalEnergySc[ueIdxWithinBlock][i*nCombScPerPrb+j];
-            }
-            sh_avgSignalEnergyPrb[ueIdxWithinBlock][i] = accum;
-        }
+   // Flatten UE x PRB iteration for better parallelism (avoids sequential UE loop)
+   const int totalReductionWork = nUes * numPrbs;
+   for (int idx = thisThrdBlk.size()-1-tid; idx < totalReductionWork; idx += thisThrdBlk.size()) {
+       const int ueIdxWithinBlock = idx / numPrbs;
+       const int i = idx % numPrbs;
+       float accum = sh_avgSignalEnergySc[ueIdxWithinBlock][i*nCombScPerPrb];
+       for (int j = 1; j < nCombScPerPrb; j++) {
+           accum += sh_avgSignalEnergySc[ueIdxWithinBlock][i*nCombScPerPrb+j];
+       }
+       sh_avgSignalEnergyPrb[ueIdxWithinBlock][i] = accum;
    }
 
    // No explicit block sync here because there is another block sync below
@@ -1886,7 +1924,7 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
     float warpSum_noiseEnergy = cg::reduce(tile, noiseEnergy, cg::plus<float>());
     if(tile.thread_rank() == 0)
     {
-        atomicAdd(&sh_avgNoiseEnergy, warpSum_noiseEnergy);
+        atomicAdd(sh_avgNoiseEnergy, warpSum_noiseEnergy);
     }
 
     for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUes; ++ueIdxWithinBlock)
@@ -1897,18 +1935,19 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
             atomicAdd(&sh_avgSignalEnergy[ueIdxWithinBlock], warpSum_sigEnergy);
         }
     }
-   __syncthreads();
+    __syncthreads();
 
 
    // STEP 7: calculate correlation w.r.t. cyclic shift in use and not use: sum over, PRB, antenna, cyclic shift
    // Use L2 norm to sum over antennas and compute blocks to reduce dependencies
 
    // precompute phase rotation once and reuse nRxAntSrs times
+   const float invNSrsCSMax = __frcp_rn(static_cast<float>(n_SRS_cs_max));
    for(int i = tid; i < n_SRS_cs_max * nSrsScBlock; i += thisThrdBlk.size())
    {
        int   csIdx =  i / nSrsScBlock;
        int   scIdx =  i % nSrsScBlock;
-       float ang = -2.0f * M_PI * csIdx * scIdx / n_SRS_cs_max;
+       float ang = -2.0f * M_PI * csIdx * scIdx * invNSrsCSMax;
        float sinv, cosv;
        __sincosf(ang, &sinv, &cosv);
        int padded_idx = csIdx * (nSrsScBlock + 1) + scIdx;
@@ -1916,8 +1955,8 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    }
    if(tid < nAntPorts)
    {
-       uint8_t csIdx            = ueGroupDescr.portToFoccMap[tid];          // 0 … n_SRS_cs_max‑1
-       uint8_t ueIdxWithinBlock = ueGroupDescr.portToUeIdxWithinBlock[tid]; // 0 … nUes‑1
+       uint8_t csIdx            = sh_portToFoccMap[tid];          // 0 … n_SRS_cs_max‑1
+       uint8_t ueIdxWithinBlock = sh_portToUeIdxWithinBlock[tid]; // 0 … nUes‑1
        // Each antenna port should have a unique csIdx for correct channel estimation.
        // But atomicCAS is used if L2 misconfigures and duplicates occur, results may be invalid in these cases.
        //csIdx2UeIdxLut[csIdx]    = ueIdxWithinBlock;                       // overwrite
@@ -1926,10 +1965,11 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    __syncthreads();
 
    // calculate correlation over cyclic shifts, sum over PRBs
+   float notUseSumAbs2 = 0.0f;
    for(int i = tid; i < nRxAntSrs * n_SRS_cs_max; i += thisThrdBlk.size())
    {
-       uint8_t antIdx = i / n_SRS_cs_max;
-       uint8_t csIdx  = i % n_SRS_cs_max;
+       int antIdx = i / n_SRS_cs_max;
+       int csIdx  = i - antIdx * n_SRS_cs_max;
        __half2 accSumRxCs {0, 0};
 
 //#pragma unroll
@@ -1940,43 +1980,49 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
            accSumRxCs = __hcmadd(rxSrs, phase_rotation, accSumRxCs);
        }
        float2 accSumRxCsFloat = __half22float2(accSumRxCs);
-       float  accSumRxCsAbs2  = accSumRxCsFloat.x * accSumRxCsFloat.x + accSumRxCsFloat.y * accSumRxCsFloat.y;
+       float  accSumRxCsAbs2  = fmaf(accSumRxCsFloat.x, accSumRxCsFloat.x, accSumRxCsFloat.y * accSumRxCsFloat.y);
 
        // sum over antennas and separate cyclic shifts in use and not used
         uint16_t ueIdxWithinBlock = csIdx2UeIdxLut[csIdx];
 
         if(ueIdxWithinBlock == INVALID_UE_IDX)
         {
-            atomicAdd(&sh_tmpWidebandCsCorrNotUse, accSumRxCsAbs2 / ((n_SRS_cs_max - nAntPorts) * nSrsScBlock * nRxAntSrs));
+            notUseSumAbs2 += accSumRxCsAbs2;
         }else
         {
-            uint16_t         ueIdx                = ueGroupDescr.ueIdxs[ueIdxWithinBlock];
-            uint8_t          nUePorts             = pDynDescr->ueDescrs[ueIdx].nPortsPerComb;
+            uint16_t         ueIdx                = sh_ueIdxs[ueIdxWithinBlock];
+            uint8_t          nUePorts             = sh_nUePorts[ueIdxWithinBlock];
             volatile float&  tmpWidebandCsCorrUse = pDynDescr->ueDescrs[ueIdx].tmpWidebandCsCorrUse;
 
             atomicAdd((float*)(&tmpWidebandCsCorrUse), accSumRxCsAbs2 / (nUePorts * nSrsScBlock * nRxAntSrs));
         }
     }
 
-   if(tid == 0)
-   {
-       sh_avgNoiseEnergy = (noiseEstDebias * nRepPerHop * sh_avgNoiseEnergy) / (nRxAntSrs * nSrsScBlock);
+   // Reduce not-use sum across the block and write once (avoid high-frequency shared atomics).
+   const float warpNotUseSumAbs2 = cg::reduce(tile, notUseSumAbs2, cg::plus<float>());
+   if (tile.thread_rank() == 0) {
+       atomicAdd(sh_tmpWidebandCsCorrNotUse, warpNotUseSumAbs2 / ((n_SRS_cs_max - nAntPorts) * nSrsScBlock * nRxAntSrs));
+   }
+   //__syncthreads(); // not needed, since there is another sync barrier before sh_tmpWidebandCsCorrNotUse being used
+
+  if(tid == 0)
+  {
+      *sh_avgNoiseEnergy = (noiseEstDebias * nRepPerHop * (*sh_avgNoiseEnergy)) / (nRxAntSrs * nSrsScBlock);
 
        float avgSigAllUes = 0.0f;
        for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUes; ++ueIdxWithinBlock)
        {
-            uint16_t ueIdx    = ueGroupDescr.ueIdxs[ueIdxWithinBlock];
-            uint8_t  nUePorts = pDynDescr->ueDescrs[ueIdx].nPortsPerComb;
+            uint8_t  nUePorts = sh_nUePorts[ueIdxWithinBlock];
 
             sh_avgSignalEnergy[ueIdxWithinBlock] /= (nRxAntSrs * nUePorts * nSrsScBlock);
             avgSigAllUes                      += sh_avgSignalEnergy[ueIdxWithinBlock];
        }
        avgSigAllUes /= nUes;
 
-       if(((nAntPorts != 1) && (combSize == 4)) || ((nAntPorts == 4) && (combSize == 2)))
-       {
-           sh_avgNoiseEnergy = max(MIN_NOISE_ENERGY, sh_avgNoiseEnergy - avgSigAllUes * POINT_ONE_PERCENT); // use lower bound MIN_NOISE_ENERGY to avoid negative sh_avgNoiseEnergy
-       }
+      if(((nAntPorts != 1) && (combSize == 4)) || ((nAntPorts == 4) && (combSize == 2)))
+      {
+          *sh_avgNoiseEnergy = max(MIN_NOISE_ENERGY, (*sh_avgNoiseEnergy) - avgSigAllUes * POINT_ONE_PERCENT); // use lower bound MIN_NOISE_ENERGY to avoid negative sh_avgNoiseEnergy
+      }
    }
    __syncthreads();
 
@@ -1990,21 +2036,21 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    {
        for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUes; ++ueIdxWithinBlock)
        {
-           uint16_t ueIdx    = ueGroupDescr.ueIdxs[ueIdxWithinBlock];
-           uint8_t  combIdx  = ueGroupDescr.ueCombIdxs[ueIdxWithinBlock];
+           uint16_t ueIdx    = sh_ueIdxs[ueIdxWithinBlock];
+           uint8_t  combIdx  = sh_ueCombIdxs[ueIdxWithinBlock];
 
            if(combIdx == 0)
            {
-               uint8_t   hopIdx                 = ueGroupDescr.ueHopIdxs[ueIdxWithinBlock];
+               uint8_t   hopIdx                 = sh_ueHopIdxs[ueIdxWithinBlock];
                ueDescr_t& ueDesc                = pDynDescr->ueDescrs[ueIdx];
-               uint8_t   nUePorts               = ueDesc.nPortsPerComb;
+               uint8_t   nUePorts               = sh_nUePorts[ueIdxWithinBlock]; // = ueDesc.nPortsPerComb;
                float*    pUeRbSnr               = ueDesc.pUeRbSnr;
                uint16_t  nPrbsPerHop            = ueDesc.nPrbsPerHop;
                auto      signalEnergyNormalizer = __frcp_rn(nRxAntSrs * nCombScPerPrb * nUePorts);
                for (int i = thisThrdBlk.size()-1-tid; i < N_PRB_PER_COMP_BLK; i += thisThrdBlk.size())
                {
                    sh_avgSignalEnergyPrb[ueIdxWithinBlock][i]                       = sh_avgSignalEnergyPrb[ueIdxWithinBlock][i] * signalEnergyNormalizer;
-                   float rbSnr                                                      = 10.f * log10f(sh_avgSignalEnergyPrb[ueIdxWithinBlock][i] / sh_avgNoiseEnergy);
+                   float rbSnr                                                      = 10.f * log10f(sh_avgSignalEnergyPrb[ueIdxWithinBlock][i] / (*sh_avgNoiseEnergy));
                    pUeRbSnr[nPrbsPerHop * hopIdx + blockStartPrb - hopStartPrb + i] = rbSnr;
                }
            }
@@ -2014,12 +2060,12 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
     if(tid < nUes)
     {
        uint16_t    ueIdxWithinBlock = tid;
-       uint16_t    ueIdx            = ueGroupDescr.ueIdxs[ueIdxWithinBlock];
+       uint16_t    ueIdx            = sh_ueIdxs[ueIdxWithinBlock];
        ueDescr_t&  ueDesc           = pDynDescr->ueDescrs[ueIdx];
 
-       atomicAdd((float*)(&ueDesc.tmpWidebandNoiseEnergy)  , sh_avgNoiseEnergy);
+       atomicAdd((float*)(&ueDesc.tmpWidebandNoiseEnergy)  , *sh_avgNoiseEnergy);
        atomicAdd((float*)(&ueDesc.tmpWidebandSignalEnergy) , sh_avgSignalEnergy[ueIdxWithinBlock]);
-       atomicAdd((float*)(&ueDesc.tmpWidebandCsCorrNotUse) , sh_tmpWidebandCsCorrNotUse);
+       atomicAdd((float*)(&ueDesc.tmpWidebandCsCorrNotUse) , *sh_tmpWidebandCsCorrNotUse);
        atomicAdd((__half2*)(&ueDesc.tmpWidebandScCorr)     , sh_avgScCorr[ueIdxWithinBlock]);
        __threadfence();
        // for finalization step
@@ -2035,7 +2081,7 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    if(tid < nUes)
    {
         uint16_t    ueIdxWithinBlock = tid;
-        uint16_t    ueIdx            = ueGroupDescr.ueIdxs[ueIdxWithinBlock];
+        uint16_t    ueIdx            = sh_ueIdxs[ueIdxWithinBlock];
         ueDescr_t&  ueDesc           = pDynDescr->ueDescrs[ueIdx];
 
         cuphySrsReport_t*&   pUeSrsReport                 = ueDesc.pUeSrsReport;
@@ -2061,7 +2107,7 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
 
             // timing advance:
             uint32_t scs  = (1 << mu) * 15000; //2^mu * 15*10^3
-            toEstMicroSec = float(-1.0e6) * atanf(__half2float(ueDesc.tmpWidebandScCorr.y) / __half2float(ueDesc.tmpWidebandScCorr.x)) / static_cast<float>(2 * M_PI * scs * combSize);
+            toEstMicroSec = float(-1.0e6) * atan2f(__half2float(ueDesc.tmpWidebandScCorr.y), __half2float(ueDesc.tmpWidebandScCorr.x)) / static_cast<float>(2 * M_PI * scs * combSize);
 
             // wideband SC correlation:
             widebandScCorr.x = ueDesc.tmpWidebandScCorr.x;
@@ -2193,7 +2239,7 @@ static inline __device__ void twoStageFourierTransform(const uint32_t THREAD_IDX
 }
 
 
-__global__ void srsChEstNormalizationKernel(srsChEstDynDescr_t* pDynDescr)
+__global__ void srsChEstNormalizationKernel(srsChEstStatDescr_t* pStatDescr, srsChEstDynDescr_t* pDynDescr)
 {
     constexpr int WARP_SIZE   = 32;
     auto          thisThrdBlk = cg::this_thread_block();
@@ -2203,77 +2249,115 @@ __global__ void srsChEstNormalizationKernel(srsChEstDynDescr_t* pDynDescr)
     ueDescr_t&  ueDesc          = pDynDescr->ueDescrs[blockIdx.x];
     //printf("I am in the normalization kernel for UE[%d] with PRG[%d]Ant[%d]Port[%d]!\n", blockIdx.x, ueDesc.nPrbGrpsL2, ueDesc.nRxAntSrsL2, ueDesc.nAntPortsL2);
 #ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
-    tensor_ref_any<CUPHY_C_32F>& tChEstBuff        = ueDesc.tChEstBuff;
+    //tensor_ref_any<CUPHY_C_32F>& tChEstBuff        = ueDesc.tChEstBuff;
+    tensor_ref_any<CUPHY_C_32F>& tChEstToL2Inner   = ueDesc.tChEstToL2Inner;
     tensor_ref_any<CUPHY_C_32F>& tChEstToL2        = ueDesc.tChEstToL2;
 #else
-    tensor_ref_any<CUPHY_C_16F>& tChEstBuff        = ueDesc.tChEstBuff;
+    //tensor_ref_any<CUPHY_C_16F>& tChEstBuff        = ueDesc.tChEstBuff;
+    tensor_ref_any<CUPHY_C_16F>& tChEstToL2Inner   = ueDesc.tChEstToL2Inner;
     tensor_ref_any<CUPHY_C_16I>& tChEstToL2        = ueDesc.tChEstToL2;
 #endif
-
-    uint16_t (&prgIdxMappingL2)[CUPHY_SRS_MAX_N_PRGS_SUPPORTED] = ueDesc.prgIdxMappingL2;
-    uint8_t (&portIdxMappingL2)[MAX_N_ANT_PORTS] = ueDesc.portIdxMappingL2;
 
     int nPrbGrpsL2  = ueDesc.nPrbGrpsL2;
     int nRxAntSrsL2 = ueDesc.nRxAntSrsL2;
     int nAntPortsL2 = ueDesc.nAntPortsL2;
-
-    __shared__ int peakValint;
-    if(tid == 0) peakValint = 0;
-    __syncthreads();
-
-    // find peak value (squared)
-    float localPeak2 = 0.f;
-    for(int prgIdx = tid; prgIdx < nPrbGrpsL2; prgIdx += thisThrdBlk.size())
+    
+    uint16_t prgSize   = ueDesc.prgSize;
+    uint16_t prgSizeL2 = ueDesc.prgSizeL2;
+    uint16_t prgSizeRatio = prgSizeL2/prgSize;
+    uint16_t prgSizeOffset = 0;
+    if(prgSizeL2 > 4)
     {
-        for(int antIdx = 0; antIdx < nRxAntSrsL2; antIdx++)
+        prgSizeOffset = prgSizeRatio / 2 - 1;
+    }
+    
+    uint8_t chEstToL2NormalizationAlgo = pStatDescr->chEstToL2NormalizationAlgo;
+    
+    if(chEstToL2NormalizationAlgo==0)
+    {
+        // down-selection for chEstToL2NormalizationAlgo=0
+        for(int prgIdx = tid; prgIdx < nPrbGrpsL2; prgIdx += thisThrdBlk.size())
         {
-            for(int portIdx = 0; portIdx < nAntPortsL2; portIdx++)
+            for(int antIdx = 0; antIdx < nRxAntSrsL2; antIdx++)
             {
+                for(int portIdx = 0; portIdx < nAntPortsL2; portIdx++)
+                {   
 #ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
-                float2 tmp = tChEstBuff({prgIdxMappingL2[prgIdx], antIdx, portIdxMappingL2[portIdx]});
+                    tChEstToL2({prgIdx, antIdx, portIdx}) = tChEstToL2Inner({prgSizeOffset+prgIdx*prgSizeRatio, antIdx, portIdx});
 #else
-                float2 tmp = __half22float2(tChEstBuff({prgIdxMappingL2[prgIdx], antIdx,portIdxMappingL2[portIdx]}));
-
+                    half2  in = tChEstToL2Inner({prgSizeOffset+prgIdx*prgSizeRatio, antIdx, portIdx});
+                    short2 out;
+                    out.x = static_cast<int16_t>(in.x);
+                    out.y = static_cast<int16_t>(in.y);
+                    tChEstToL2({prgIdx, antIdx, portIdx}) = out;
 #endif
-                float mag2 = tmp.x * tmp.x + tmp.y * tmp.y;
-                localPeak2 = fmaxf(localPeak2, mag2);
+                }
             }
         }
     }
-
-    float blockPeak2 = cg::reduce(tile, localPeak2, cg::greater<float>());
-    int blockPeak2int = __float_as_int(blockPeak2);
-
-    if (tile.thread_rank() == 0)
+    else
     {
-        // since blockPeak2 is positive, it is safe to assume finding the thread with max blockPeak2int is equivalent to finding the thread with max blockPeak2
-        atomicMax(&peakValint, blockPeak2int);
-    }
-    __syncthreads();
-    float peakValInv = rsqrtf(__int_as_float(peakValint));
-    constexpr float fixed_scale = 32768.0f;
-    float scale = fixed_scale * peakValInv;
-
-    for(int prgIdx = tid; prgIdx < nPrbGrpsL2; prgIdx += thisThrdBlk.size())
-    {
-        uint16_t prgIdxMapped = prgIdxMappingL2[prgIdx];
-        for(int antIdx = 0; antIdx < nRxAntSrsL2; antIdx++)
+//        uint16_t (&prgIdxMappingL2)[CUPHY_SRS_MAX_N_PRGS_SUPPORTED] = ueDesc.prgIdxMappingL2;
+//        uint8_t (&portIdxMappingL2)[MAX_N_ANT_PORTS] = ueDesc.portIdxMappingL2;
+    
+        __shared__ int peakValint;
+        if(tid == 0) peakValint = 0;
+        __syncthreads();
+    
+        // find peak value (squared)
+        float localPeak2 = 0.f;
+        for(int prgIdx = tid; prgIdx < nPrbGrpsL2; prgIdx += thisThrdBlk.size())
         {
-            for(int portIdx = 0; portIdx < nAntPortsL2; portIdx++)
+            for(int antIdx = 0; antIdx < nRxAntSrsL2; antIdx++)
             {
+                for(int portIdx = 0; portIdx < nAntPortsL2; portIdx++)
+                {
 #ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
-                float2 tmp = tChEstBuff({prgIdxMapped, antIdx, portIdxMappingL2[portIdx]});
-                float2 res;
-                res.x = scale * tmp.x;
-                res.y = scale * tmp.y;
-                tChEstToL2({prgIdx, antIdx, portIdx}) = res;
+                    float2 tmp = tChEstToL2Inner({prgSizeOffset+prgIdx*prgSizeRatio, antIdx, portIdx});
 #else
-                float2 tmp = __half22float2(tChEstBuff({prgIdxMapped, antIdx,portIdxMappingL2[portIdx]}));
-                short2 res;
-                res.x = static_cast<int16_t>(scale * tmp.x);
-                res.y = static_cast<int16_t>(scale * tmp.y);
-                tChEstToL2({prgIdx, antIdx, portIdx}) = res;
+                    float2 tmp = __half22float2(tChEstToL2Inner({prgSizeOffset+prgIdx*prgSizeRatio, antIdx, portIdx}));
+    
 #endif
+                    float mag2 = fmaf(tmp.x, tmp.x, tmp.y * tmp.y);
+                    localPeak2 = fmaxf(localPeak2, mag2);
+                }
+            }
+        }
+    
+        float blockPeak2 = cg::reduce(tile, localPeak2, cg::greater<float>());
+        int blockPeak2int = __float_as_int(blockPeak2);
+    
+        if (tile.thread_rank() == 0)
+        {
+            // since blockPeak2 is positive, it is safe to assume finding the thread with max blockPeak2int is equivalent to finding the thread with max blockPeak2
+            atomicMax(&peakValint, blockPeak2int);
+        }
+        __syncthreads();
+        float peakValInv = rsqrtf(__int_as_float(peakValint));
+        constexpr float fixed_scale = 32768.0f;
+        float scale = fixed_scale * peakValInv;
+    
+        for(int prgIdx = tid; prgIdx < nPrbGrpsL2; prgIdx += thisThrdBlk.size())
+        {
+            //uint16_t prgIdxMapped = prgIdxMappingL2[prgIdx];
+            for(int antIdx = 0; antIdx < nRxAntSrsL2; antIdx++)
+            {
+                for(int portIdx = 0; portIdx < nAntPortsL2; portIdx++)
+                {
+#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
+                    float2 tmp = tChEstToL2Inner({prgSizeOffset+prgIdx*prgSizeRatio, antIdx, portIdx});
+                    float2 res;
+                    res.x = scale * tmp.x;
+                    res.y = scale * tmp.y;
+                    tChEstToL2({prgIdx, antIdx, portIdx}) = res;
+#else
+                    float2 tmp = __half22float2(tChEstToL2Inner({prgSizeOffset+prgIdx*prgSizeRatio, antIdx, portIdx}));
+                    short2 res;
+                    res.x = static_cast<int16_t>(scale * tmp.x);
+                    res.y = static_cast<int16_t>(scale * tmp.y);
+                    tChEstToL2({prgIdx, antIdx, portIdx}) = res;
+#endif
+                }
             }
         }
     }
@@ -3340,9 +3424,11 @@ void  srsChEst::kernelSelect(srsChEstDynDescr_t*      pCpuDynDesc,
                                                  max_nPorts * sizeof(float) +                                            // sh_avgSignalEnergy
                                                  max_nPorts * sizeof(uint32_t) +                                         // sh_ueBlockCntr
                                                  max_nPorts * (SRS_CHEST_BLOCK_SZ / 32/*TILE_SIZE*/) * sizeof(__half2) + // sh_tile_avgScCorr
-                                                 (max_nSrsScBlock + 1) * 12 * sizeof(__half2); // sh_phaseTable- used for sin/cos LUT in srsFilterMultiply and step 7;
-                                                                                               // the LUT size in srsFilterMultiply is larger or equal to LUT in step 7;
-                                                                                               // +1 is extra padding to reduce bank-conflicts
+                                                 (max_nSrsScBlock + 1) * 12 * sizeof(__half2) +                          // sh_phaseTable- used for sin/cos LUT in srsFilterMultiply and step 7; the LUT size in srsFilterMultiply is larger or equal to LUT in step 7;
+                                                 2 * sizeof(float) +                                                     // sh_avgNoiseEnergy, sh_tmpWidebandCsCorrNotUse (moved to dynamic shared)
+                                                 12 * sizeof(uint16_t) +                                                 // csIdx2UeIdxLut (moved to dynamic shared)
+                                                 2 * MAX_N_ANT_PORTS_PER_COMB * sizeof(uint16_t) +                       // sh_portToUeIdxWithinBlock, sh_ueIdxs
+                                                 5 * MAX_N_ANT_PORTS_PER_COMB * sizeof(uint8_t);                         // sh_nUePorts, sh_portToFoccMap, sh_blockPortToUePortMap, sh_ueCombIdxs, sh_ueHopIdxs
     }
     else
     {
@@ -3370,11 +3456,11 @@ void  srsChEst::kernelSelect(srsChEstDynDescr_t*      pCpuDynDesc,
         kernelNodeParamsDriver.sharedMemBytes = 0;
     }
     
-    if(m_chEstToL2NormalizationAlgo==1)
+    if((m_chEstToL2NormalizationAlgo==1) || (m_chEstToL2NormalizationAlgo==0))
     {
         // launch geometry for srsChEstNormalizationKernel kernel
         dim3  grdDim(nSrsUes);
-        dim3  blkDim(128);
+        dim3  blkDim(256);
         void* kernelFunc = reinterpret_cast<void*>(srsChEstNormalizationKernel);
        {MemtraceDisableScope md;cudaGetFuncBySymbol(&pNormalizationLaunchCfg->kernelNodeParamsDriver.func, kernelFunc);}
         CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = pNormalizationLaunchCfg->kernelNodeParamsDriver;
@@ -3398,6 +3484,7 @@ cuphyStatus_t srsChEst::setup(uint16_t                      nSrsUes,
                               uint32_t*                     h_rbSnrBuffOffsets,
                               cuphySrsReport_t*             d_pSrsReports,
                               cuphySrsChEstBuffInfo_t*      h_chEstBuffInfo,
+                              void**                        d_addrsChEstToL2InnerBuff,
                               void**                        d_addrsChEstToL2Buff,
                               cuphySrsChEstToL2_t*          h_chEstToL2,
                               void*                         d_workspace,
@@ -3445,13 +3532,16 @@ cuphyStatus_t srsChEst::setup(uint16_t                      nSrsUes,
        uint8_t  (&portToL2OutUeAntMap)[MAX_N_COMB_PER_UE][MAX_N_ANT_PORTS]  = ueDescr.portToL2OutUeAntMap;
        float*&                      pUeRbSnr                           = ueDescr.pUeRbSnr;
        uint8_t&                     cellIdx                            = ueDescr.cellIdx;
-       uint8_t&                     prgSize                            = ueDescr.prgSize;
+       uint16_t&                    prgSize                            = ueDescr.prgSize;
+       uint16_t&                    prgSizeL2                          = ueDescr.prgSizeL2;
        cuphySrsReport_t*&           pUeSrsReport                       = ueDescr.pUeSrsReport;
 #ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
        tensor_ref_any<CUPHY_C_32F>& tChEstBuff                         = ueDescr.tChEstBuff;
+       tensor_ref_any<CUPHY_C_32F>& tChEstToL2Inner                    = ueDescr.tChEstToL2Inner;
        tensor_ref_any<CUPHY_C_32F>& tChEstToL2                         = ueDescr.tChEstToL2;
 #else
        tensor_ref_any<CUPHY_C_16F>& tChEstBuff                         = ueDescr.tChEstBuff;
+       tensor_ref_any<CUPHY_C_16F>& tChEstToL2Inner                    = ueDescr.tChEstToL2Inner;
        tensor_ref_any<CUPHY_C_16I>& tChEstToL2                         = ueDescr.tChEstToL2;
 #endif
        uint16_t&                    chEstBuffStartPrbGrp               = ueDescr.chEstBuffStartPrbGrp;
@@ -3470,7 +3560,15 @@ cuphyStatus_t srsChEst::setup(uint16_t                      nSrsUes,
        // some parameters can be directly copied:
        cellIdx  = ueSrsPrm.cellIdx;
        combSize = ueSrsPrm.combSize;
-       prgSize  = ueSrsPrm.prgSize;
+       prgSizeL2= ueSrsPrm.prgSize;
+       if(ueSrsPrm.prgSize > 4)
+       {
+           prgSize = 2;
+       }
+       else
+       {
+           prgSize  = ueSrsPrm.prgSize;
+       }
 
        // comb parameters:
        nCombScPerPrb   = (ueSrsPrm.combSize == 2) ? 6 : 3;
@@ -3687,14 +3785,15 @@ cuphyStatus_t srsChEst::setup(uint16_t                      nSrsUes,
        pUeSrsReport         = d_pSrsReports + ueIdx;
        pUeRbSnr             = d_rbSnrBuff + h_rbSnrBuffOffsets[ueIdx];
 
-       h_chEstToL2[ueIdx].prbGrpSize = ueSrsPrm.prgSize; // populate prgSize from API
+       h_chEstToL2[ueIdx].prbGrpSize = prgSizeL2; // populate prgSize from API
        h_chEstToL2[ueIdx].nPrbGrps   = nHops * nPrbsPerHop / h_chEstToL2[ueIdx].prbGrpSize;
        uint16_t& nPrbGrps   = h_chEstToL2[ueIdx].nPrbGrps;
+       uint16_t  nPrbGrpsInner = nHops * nPrbsPerHop / prgSize;
          
 //         ueChEstBuffInfo.startValidPrg = static_cast<uint16_t>(floor(hopStartPrbs[0] / h_chEstToL2[ueIdx].prbGrpSize));
 //         ueChEstBuffInfo.nValidPrg     = h_chEstToL2[ueIdx].nPrbGrps;
 
-        if(m_chEstToL2NormalizationAlgo==1)
+        if((m_chEstToL2NormalizationAlgo==1)||(m_chEstToL2NormalizationAlgo==0))
         {
             ueDescr.nPrbGrpsL2 = h_chEstToL2[ueIdx].nPrbGrps;
             ueDescr.nRxAntSrsL2 = cellPrm.nRxAntSrs;
@@ -3723,10 +3822,26 @@ cuphyStatus_t srsChEst::setup(uint16_t                      nSrsUes,
          srsChEstToL2Str[0] = 1;
          srsChEstToL2Str[1] = nPrbGrps;
          srsChEstToL2Str[2] = nPrbGrps * cellPrm.nRxAntSrs;
+         
+         
+         std::array<int, CUPHY_DIM_MAX> srsChEstToL2InnerDim;
+         srsChEstToL2InnerDim.fill(1);
+         srsChEstToL2InnerDim[0] = nPrbGrpsInner;
+         srsChEstToL2InnerDim[1] = cellPrm.nRxAntSrs;
+         srsChEstToL2InnerDim[2] = ueSrsPrm.nAntPorts;
+
+         std::array<int, CUPHY_DIM_MAX> srsChEstToL2InnerStr;
+         srsChEstToL2InnerStr.fill(nPrbGrpsInner * cellPrm.nRxAntSrs * ueSrsPrm.nAntPorts);
+         srsChEstToL2InnerStr[0] = 1;
+         srsChEstToL2InnerStr[1] = nPrbGrpsInner;
+         srsChEstToL2InnerStr[2] = nPrbGrpsInner * cellPrm.nRxAntSrs;
+         
 #ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
-         tChEstToL2 = std::move(tensor_ref_any<CUPHY_C_32F>(d_addrsChEstToL2Buff[ueIdx], srsChEstToL2Dim.begin(), srsChEstToL2Str.begin()));
+         tChEstToL2Inner = std::move(tensor_ref_any<CUPHY_C_32F>(d_addrsChEstToL2InnerBuff[ueIdx], srsChEstToL2InnerDim.begin(), srsChEstToL2InnerStr.begin()));
+         tChEstToL2      = std::move(tensor_ref_any<CUPHY_C_32F>(d_addrsChEstToL2Buff[ueIdx], srsChEstToL2Dim.begin(), srsChEstToL2Str.begin()));
 #else
-         tChEstToL2 = std::move(tensor_ref_any<CUPHY_C_16I>(d_addrsChEstToL2Buff[ueIdx], srsChEstToL2Dim.begin(), srsChEstToL2Str.begin()));
+         tChEstToL2Inner = std::move(tensor_ref_any<CUPHY_C_16F>(d_addrsChEstToL2InnerBuff[ueIdx], srsChEstToL2InnerDim.begin(), srsChEstToL2InnerStr.begin()));
+         tChEstToL2      = std::move(tensor_ref_any<CUPHY_C_16I>(d_addrsChEstToL2Buff[ueIdx], srsChEstToL2Dim.begin(), srsChEstToL2Str.begin()));
 #endif
 
        // allocate compute blocks for the user:
@@ -3974,11 +4089,9 @@ cuphyStatus_t srsChEst::setup(uint16_t                      nSrsUes,
    pLaunchCfg->kernelArgs[1] = &kernelArgs.pDynDescr;
    pLaunchCfg->kernelNodeParamsDriver.kernelParams = &(pLaunchCfg->kernelArgs[0]);
    
-   if(m_chEstToL2NormalizationAlgo==1)
-   {
-       pNormalizationLaunchCfg->kernelArgs[0] = &kernelArgs.pDynDescr;
-       pNormalizationLaunchCfg->kernelNodeParamsDriver.kernelParams = &(pNormalizationLaunchCfg->kernelArgs[0]);
-   }
+   pNormalizationLaunchCfg->kernelArgs[0] = &kernelArgs.pStatDescr;
+   pNormalizationLaunchCfg->kernelArgs[1] = &kernelArgs.pDynDescr;
+   pNormalizationLaunchCfg->kernelNodeParamsDriver.kernelParams = &(pNormalizationLaunchCfg->kernelArgs[0]);
    return CUPHY_STATUS_SUCCESS;
 }
 

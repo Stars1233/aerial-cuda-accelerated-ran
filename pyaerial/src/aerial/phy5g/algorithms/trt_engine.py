@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,13 +17,13 @@
 from dataclasses import dataclass
 from typing import Generic
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy  # type: ignore
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.pycuphy.types import DataType
 
@@ -71,7 +71,7 @@ class TrtEngine(Generic[Array]):
                  max_batch_size: int,
                  input_tensors: List[TrtTensorPrms],
                  output_tensors: List[TrtTensorPrms],
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize TrtEngine.
 
         Args:
@@ -83,11 +83,11 @@ class TrtEngine(Generic[Array]):
             output_tensors (List[TrtTensorPrms]): A mapping from tensor names to output tensor
                 dimensions. The names are strings that must match with those found in the TRT model
                 file, and the shapes are iterables of integers. The batch dimension is skipped.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         self.input_names = [tensor.name for tensor in input_tensors]
         self.input_dims = [tensor.dims for tensor in input_tensors]
@@ -108,7 +108,7 @@ class TrtEngine(Generic[Array]):
             self.output_names,
             self.output_dims,
             self.output_cuphy_data_types,
-            self.cuda_stream
+            self._cuda_stream.handle
         )
 
     def run(self, input_tensors: dict[str, Array]) -> dict[str, Array]:
@@ -126,9 +126,14 @@ class TrtEngine(Generic[Array]):
             dict: A mapping from output tensor names to the actual output tensors.
         """
         trt_input = dict()
+        # Track if any input is numpy - if so, return numpy outputs
+        any_numpy_input = False
         for index, name in enumerate(self.input_names):
             try:
                 input_tensor = input_tensors[name]
+
+                if isinstance(input_tensor, np.ndarray):
+                    any_numpy_input = True
 
                 if input_tensor.dtype != self.input_data_types[index]:
                     print(
@@ -136,8 +141,7 @@ class TrtEngine(Generic[Array]):
                     )
                     input_tensor = input_tensor.astype(self.input_data_types[index])
 
-                cpu_copy = isinstance(input_tensor, np.ndarray)
-                with cp.cuda.ExternalStream(int(self.cuda_stream)):
+                with self._cuda_stream:
                     input_tensor = cp.array(input_tensor, order='F')
 
                 # Verify shape.
@@ -163,9 +167,9 @@ class TrtEngine(Generic[Array]):
 
         for index, name in enumerate(self.output_names):
             try:
-                with cp.cuda.ExternalStream(int(self.cuda_stream)):
+                with self._cuda_stream:
                     trt_output[name] = cp.array(trt_output[name])
-                    if cpu_copy:
+                    if any_numpy_input:
                         trt_output[name] = trt_output[name].get(order='F')
                 trt_output[name] = trt_output[name].astype(self.output_data_types[index])
 

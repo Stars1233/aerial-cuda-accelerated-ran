@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,9 @@
 #ifndef ptp_service_status_checking_H
 #define ptp_service_status_checking_H
 
+#include <ctime>
+#include <string>
+
 namespace AppUtils
 {
     enum class ServiceStatus
@@ -30,6 +33,15 @@ namespace AppUtils
 
     ServiceStatus checkPtpServiceStatus(const std::string &syslogPath, double rmsThreshold, const std::string &serviceName);
     int checkPtpServiceStatus(const std::string &syslogPath, double ptp4lRmsThreshold = 10.0, double phc2sysRmsThreshold = 10.0);
+
+    /**
+     * Get most recent PTP port link down/up event timestamps from syslog (ptp4l or systemd-networkd lines).
+     * @param syslogPath Path to the syslog file to scan.
+     * @param[out] outLastLinkDownTs On success, set to the timestamp of the most recent link-down event, or (time_t)-1 if none.
+     * @param[out] outLastLinkUpTs On success, set to the timestamp of the most recent link-up event, or (time_t)-1 if none.
+     * @return void
+     */
+    void getPtpPortLinkEvents(const std::string& syslogPath, time_t& outLastLinkDownTs, time_t& outLastLinkUpTs);
 }
 
 #endif

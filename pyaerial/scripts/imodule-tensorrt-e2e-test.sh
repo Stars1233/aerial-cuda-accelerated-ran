@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,7 +57,7 @@ ONNX_FILENAME="model_${TIMESTAMP}.onnx"
 ENGINE_FILENAME="enhanced_fused_channel_estimator_${TIMESTAMP}.engine"
 
 # Activate virtual environment if it exists and --use-local-venv flag is provided
-if [ $USE_LOCAL_VENV -eq 1 ] && [ -d "${REPO_ROOT}/.venv" ]; then
+if [ "$USE_LOCAL_VENV" -eq 1 ] && [ -d "${REPO_ROOT}/.venv" ]; then
     echo "Activating virtual environment at ${REPO_ROOT}/.venv"
     source "${REPO_ROOT}/.venv/bin/activate"
 fi
@@ -174,7 +175,7 @@ ${PYTHON_CMD} "${REPO_ROOT}/pyaerial/tests/model_to_engine_tests/test_trt_standa
 log_result $? "Standalone TensorRT channel estimator test"
 
 # Step 6: Test TensorRT channel estimator in PUSCH RX pipeline
-if [ $SKIP_PUSCH -eq 1 ]; then
+if [ "$SKIP_PUSCH" -eq 1 ]; then
     echo
     echo "============================================================"
     echo "STEP 6: Testing TensorRT channel estimator in PUSCH RX pipeline"
@@ -197,7 +198,7 @@ fi
 # Generate summary
 echo
 echo "=== Test Summary ==="
-if [ $SKIP_PUSCH -eq 1 ]; then
+if [ "$SKIP_PUSCH" -eq 1 ]; then
     echo "Tests completed with warnings (PUSCH RX test was skipped)"
 else
     echo "All tests completed successfully"
@@ -228,9 +229,9 @@ echo "End time: $(date)"
 echo "Duration: $(($(date +%s) - start_time)) seconds"
 
 # Overall success
-if [ $SKIP_PUSCH -eq 1 ]; then
+if [ "$SKIP_PUSCH" -eq 1 ]; then
     echo "✅ CICD test completed with expected warnings (PUSCH RX test skipped)"
 else
     echo "✅ CICD test completed with expected warnings for TensorRT engine generation"
 fi
-exit 0 
+exit 0

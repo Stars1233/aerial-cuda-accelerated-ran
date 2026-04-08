@@ -1,5 +1,6 @@
 #!/bin/bash -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,6 +50,6 @@ if [[ -n "$AERIAL_BUILDER" ]]
 then
     docker buildx build --builder $AERIAL_BUILDER --pull --load --platform $AERIAL_PLATFORM -t $AERIAL_REPO$AERIAL_IMAGE_NAME:${AERIAL_VERSION_TAG} -f Dockerfile_tmp .
 else
-    DOCKER_BUILDKIT=1 docker build --network host --platform $AERIAL_PLATFORM -t $AERIAL_REPO$AERIAL_IMAGE_NAME:${AERIAL_VERSION_TAG} -f Dockerfile_tmp .
+    DOCKER_BUILDKIT=1 docker build --network host --no-cache --platform $AERIAL_PLATFORM -t $AERIAL_REPO$AERIAL_IMAGE_NAME:${AERIAL_VERSION_TAG} -f Dockerfile_tmp .
 fi
 rm Dockerfile_tmp

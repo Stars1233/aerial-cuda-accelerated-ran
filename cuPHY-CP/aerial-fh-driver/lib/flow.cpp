@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -415,8 +415,11 @@ void Flow::setup_packet_header_gpu()
        for (int i = 0; i < kPeerSlotsInfo; i++) {
             FlowPtrInfo* flow_ptr_info = peer_->get_flow_ptr_info() + i * MAX_DL_EAXCIDS + eaxcid_idx; // host pinned memory
             flow_ptr_info->hdr_stride = flow_number*kMaxPktsFlow;
-            flow_ptr_info->comm_buf = get_nic()->get_flow_comm_buf()->buf_arr_gpu;
-            flow_ptr_info->cpu_comm_gpu_comm_buf = get_nic()->get_flow_comm_buf()->cpu_comms_buf_arr_gpu;
+            flow_ptr_info->pkt_buff_mkey = get_nic()->get_flow_comm_buf()->pkt_buff_mkey;
+            flow_ptr_info->cpu_comms_pkt_buff_mkey = get_nic()->get_flow_comm_buf()->cpu_comms_pkt_buff_mkey;
+            flow_ptr_info->max_pkt_sz = get_nic()->get_flow_comm_buf()->max_pkt_sz;
+            flow_ptr_info->gpu_pkt_addr = get_nic()->get_flow_comm_buf()->gpu_pkt_addr;
+            flow_ptr_info->cpu_pkt_addr = get_nic()->get_flow_comm_buf()->cpu_comms_cpu_pkt_addr;            
            //printf("Flow %p: eaxcid %d, peerslot %d, flow_ptr_info %p, pkt_hdr_gpu %p, rnd %d lkey %u\n", this, eaxcid, i, flow_ptr_info, pkt_hdr_gpu_, packet_size_rnd, pkt_hdr_gpu_lkey_);
         }
      }
@@ -515,6 +518,11 @@ void Flow::create_rx_rule()
     auto  port_id   = nic->get_port_id();
     auto  name      = nic->get_name();
     auto& peer_info = peer_->get_info();
+
+    if(unlikely(rxq_ == nullptr))
+    {
+        THROW_FH(EINVAL, StringBuilder() << "Calling create_rx_rule() but no RXQ assigned to Flow with eAxC=" << info_.eAxC);
+    }
 
     rte_flow_error    err;
     rte_flow_item_eth eth_spec, eth_mask;

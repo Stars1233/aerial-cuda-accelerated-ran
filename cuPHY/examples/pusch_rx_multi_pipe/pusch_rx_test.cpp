@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,7 +52,7 @@ using ms = std::chrono::milliseconds;
 template <typename T>
 using us = std::chrono::microseconds;
 
-PuschRxTest::PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool useCuCtxs, cudaStream_t& delayCuStrm, std::vector<int>& cuStrmPrios, bool& startSyncPt, std::mutex& cvStartSyncPtMutex, std::condition_variable& cvStartSyncPt, std::atomic<std::uint32_t>& atmSyncPtWaitCnt, std::vector<uint32_t>& mpsActiveThrdPcts, uint32_t harq_attempts, uint32_t ldpcLaunchMode, bool drmDebug, bool debug, bool debugEqualizer, bool useGreenCtxs) :
+PuschRxTest::PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool useCuCtxs, cudaStream_t& delayCuStrm, std::vector<int>& cuStrmPrios, bool& startSyncPt, std::mutex& cvStartSyncPtMutex, std::condition_variable& cvStartSyncPt, std::atomic<std::uint32_t>& atmSyncPtWaitCnt, std::vector<uint32_t>& mpsActiveThrdPcts, uint32_t harq_attempts, uint32_t ldpcLaunchMode, uint32_t nMaxLdpcHetConfigs, bool drmDebug, bool debug, bool debugEqualizer, bool useGreenCtxs, uint8_t nMaxTbPerNode) :
     m_name(name),
     m_nPuschRxInst(nPuschRxInst),
     m_useCuCtxs(useCuCtxs),
@@ -67,6 +67,8 @@ PuschRxTest::PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool us
     m_eStartProcRecorded(false),
     m_mpsActiveThrdPcts(mpsActiveThrdPcts),
     m_ldpcLaunchMode(static_cast<cuphyPuschLdpcKernelLaunch_t>(ldpcLaunchMode)),
+    m_nMaxLdpcHetConfigs(nMaxLdpcHetConfigs),
+    m_nMaxTbPerNode(nMaxTbPerNode),
     m_debug(debug),
     m_enableNvProf(false),
     m_nIterations(0),
@@ -491,6 +493,8 @@ void PuschRxTest::PipelineWrkrEntry(uint32_t instIdx, const std::string& trtYaml
         cuphy::stream& cuphyStrm = m_cuphyStrms[instIdx];
         cudaStream_t cuStrm = cuphyStrm.handle();
         StaticApiDataset staticApiDataset(m_inputFileNameVec[0], cuStrm, m_outputFileNameVec[instIdx], m_descramblingOn, 0, true, nullptr, m_ldpcLaunchMode);
+        staticApiDataset.puschStatPrms.nMaxLdpcHetConfigs = m_nMaxLdpcHetConfigs;
+        staticApiDataset.puschStatPrms.nMaxTbPerNode = m_nMaxTbPerNode;
         CUDA_CHECK(cudaStreamSynchronize(cuStrm));
         
         if (not trtYamlInput.empty()) {

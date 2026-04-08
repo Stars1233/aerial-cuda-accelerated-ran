@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -99,7 +99,8 @@ def test_ldpc_rate_match(cuda_stream, test_case_number, scrambling, cupy):
     scrambling_ids = input_file["ue_pars"]["dataScramId"]
     rvs = cw_pars["rv"]
     num_layers = input_file["ue_pars"]["nUeLayers"]
-    cinits = [(rnti << 15) + scrambling_id for rnti, scrambling_id in zip(rntis, scrambling_ids)]
+    cinits = [(np.uint32(rnti) << 15) + scrambling_id
+              for rnti, scrambling_id in zip(rntis, scrambling_ids)]
 
     ref_outputs = []
     for ue_idx in range(num_ues):
@@ -126,7 +127,7 @@ def test_ldpc_rate_match(cuda_stream, test_case_number, scrambling, cupy):
     )
 
     if cupy:
-        with cp.cuda.ExternalStream(int(cuda_stream)):
+        with cuda_stream:
             coded_blocks = [cp.array(cb, order='F') for cb in coded_blocks]
 
     rate_matched_bits = ldpc_rate_matcher.rate_match(
@@ -141,7 +142,7 @@ def test_ldpc_rate_match(cuda_stream, test_case_number, scrambling, cupy):
     )
 
     if cupy:
-        with cp.cuda.ExternalStream(int(cuda_stream)):
+        with cuda_stream:
             rate_matched_bits = [rm_bits.get(order='F') for rm_bits in rate_matched_bits]
 
     for ue_idx in range(num_ues):
@@ -187,7 +188,7 @@ def test_fused_rm_mod(cuda_stream, pdsch_config, csi_rs_config, test_case_number
     )
 
     if cupy:
-        with cp.cuda.ExternalStream(int(cuda_stream)):
+        with cuda_stream:
             zeros_input = cp.zeros_like(ref_buffer, order='F')
             coded_blocks = [cp.array(cb, order='F') for cb in coded_blocks]
     else:
@@ -217,7 +218,7 @@ def test_fused_rm_mod(cuda_stream, pdsch_config, csi_rs_config, test_case_number
     )[0]
 
     if cupy:
-        with cp.cuda.ExternalStream(int(cuda_stream)):
+        with cuda_stream:
             tx_buffer = tx_buffer.get(order='F')
 
     assert np.allclose(ref_buffer, tx_buffer, atol=1e-2)

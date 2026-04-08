@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,14 +16,14 @@
 """pyAerial library - Noise and interference estimation (for equalization)."""
 from typing import Generic
 from typing import List
+from typing import Optional
 from typing import Tuple
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy  # type: ignore
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PuschConfig
 from aerial.phy5g.config import PuschUeConfig
@@ -45,7 +45,7 @@ class NoiseIntfEstimator(Generic[Array]):
                  *,
                  num_rx_ant: int,
                  eq_coeff_algo: int,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize NoiseIntfEstimator.
 
         Args:
@@ -55,11 +55,11 @@ class NoiseIntfEstimator(Generic[Array]):
                 - 0: Zero-forcing equalizer.
                 - 1: MMSE with noise variance only.
                 - 2: MMSE-IRC.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         pusch_stat_prms = get_pusch_stat_prms(
             num_rx_ant=num_rx_ant,
@@ -68,7 +68,7 @@ class NoiseIntfEstimator(Generic[Array]):
         self._pusch_params = pycuphy.PuschParams()
         self._pusch_params.set_stat_prms(pusch_stat_prms)
 
-        self.noise_intf_estimator = pycuphy.NoiseIntfEstimator(cuda_stream)
+        self.noise_intf_estimator = pycuphy.NoiseIntfEstimator(self._cuda_stream.handle)
         self.lw_inv = None  # type: List[Array]
         self.noise_var_pre_eq = None  # type: Array
 
@@ -149,7 +149,7 @@ class NoiseIntfEstimator(Generic[Array]):
               value is in dB.
         """
         cpu_copy = isinstance(rx_slot, np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rx_slot = cp.array(rx_slot, order='F', dtype=cp.complex64)
             channel_est = [cp.array(elem, order='F', dtype=cp.complex64) for elem in channel_est]
 
@@ -178,7 +178,7 @@ class NoiseIntfEstimator(Generic[Array]):
         channel_est = [pycuphy.CudaArrayComplexFloat(elem) for elem in channel_est]
 
         pusch_dyn_prms = _pusch_config_to_cuphy(
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             rx_data=[rx_slot],
             slot=slot,
             pusch_configs=pusch_configs
@@ -189,7 +189,7 @@ class NoiseIntfEstimator(Generic[Array]):
         self.noise_var_pre_eq = self.noise_intf_estimator.get_info_noise_var_pre_eq()
 
         # Transform the output to cupy array.
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             self.lw_inv = [cp.array(elem) for elem in self.lw_inv]
             self.noise_var_pre_eq = cp.array(self.noise_var_pre_eq)
 

@@ -95,7 +95,6 @@ This directory supports building multiple container types:
 To build the Aerial development container, follow these instructions on the platform you will run Aerial on.
 
 ```bash
-source ./setup.sh
 export AERIAL_VERSION_TAG=<custom_tag>
 ./build_base.sh
 ./build_devel.sh
@@ -114,7 +113,6 @@ When built on an x86_64 machine (e.g. the R750), then the container will be amd6
 Now that the containers are built, start an interactive bash shell in the development container:
 
 ```bash
-source ./setup.sh
 export AERIAL_VERSION_TAG=<custom_tag>
 ./run_aerial.sh
 ```

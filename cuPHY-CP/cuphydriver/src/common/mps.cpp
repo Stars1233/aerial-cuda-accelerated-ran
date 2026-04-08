@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -89,11 +89,16 @@ MpsCtx::MpsCtx(
 MpsCtx::MpsCtx(
     phydriver_handle _pdh,
     GpuDevice*       _gDev,
-    CUdevResource* _resources
+    CUdevResource* _resources,
+    const std::string&    _name,
+    bool           _print_resources,
+    bool           _use_workqueues,
+    unsigned int   _wq_concurrency_limit
     ) :
     pdh(_pdh),
     gDev(_gDev),
-    isGreenContext(true)
+    isGreenContext(true),
+    name(_name)
 {
     id         = Time::nowNs().count();
     cuCtx = 0;
@@ -104,13 +109,28 @@ MpsCtx::MpsCtx(
 
     if(_resources == nullptr)
     {
-        NVLOGC_FMT(TAG, "Cannot create a green context with invalid CUdevResource!");
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Cannot create a green context with invalid CUdevResource!");
     }
     else
     {
         devSmCount = _resources->sm.smCount;
+        m_resources[0]      = _resources[0];
+#if CUDA_VERSION >= 13010
+
+        CUresult result;
+        if (!_use_workqueues) {
+            const unsigned int num_resources = 1;
+            result = cuDevResourceGenerateDesc(&cuResourceDesc, &m_resources[0], num_resources);
+        } else {
+            const unsigned int num_resources = 2;
+            m_resources[1].type = CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG;
+            m_resources[1].wqConfig = {.device = cuDev, .wqConcurrencyLimit = _wq_concurrency_limit, .sharingScope = CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED};
+            result = cuDevResourceGenerateDesc(&cuResourceDesc, &m_resources[0], num_resources);
+        }
+#else
         const unsigned int num_resources = 1;
-        CUresult result = cuDevResourceGenerateDesc(&cuResourceDesc, _resources, num_resources);
+        CUresult result = cuDevResourceGenerateDesc(&cuResourceDesc, &m_resources[0], num_resources);
+#endif
         if (result != CUDA_SUCCESS)
         {
             const char* pErrStr;
@@ -126,6 +146,11 @@ MpsCtx::MpsCtx(
         // Get primary context from green context
         CU_CHECK_EXCEPTION(cuCtxFromGreenCtx(&cuCtx, cuGreenCtx));
         ctxCreated = true;
+
+        if(_print_resources)
+        {
+            printGreenCtxResourceInfo();
+        }
     }
 }
 #endif
@@ -188,5 +213,43 @@ void MpsCtx::getResources(CUdevResource* resource) const
        return;
    }
    CU_CHECK_PHYDRIVER(cuGreenCtxGetDevResource(cuGreenCtx, resource,  CU_DEV_RESOURCE_TYPE_SM));
+}
+
+CUgreenCtx MpsCtx::getGreenCtx() const
+{
+    return cuGreenCtx;
+}
+
+void MpsCtx::printGreenCtxResourceInfo() const
+{
+    if ((!ctxCreated) || (!isGreenContext)) {
+       NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "Cannot print resources before a context has been created or for anything other than a green context.");
+       return;
+    }
+
+    CUdevResource sm_resource = {};
+    CU_CHECK(cuGreenCtxGetDevResource(cuGreenCtx, &sm_resource, CU_DEV_RESOURCE_TYPE_SM));
+#if CUDA_VERSION >= 13010
+    NVLOGC_FMT(TAG, "{} green context: device resource with CU_DEV_RESOURCE_TYPE_SM ({}) type has {} SM count, {} minSmPartitionSize and {} smCoscheduledAlignment and {} flags",
+name, (int) CU_DEV_RESOURCE_TYPE_SM, sm_resource.sm.smCount, (int) sm_resource.sm.minSmPartitionSize, (int) sm_resource.sm.smCoscheduledAlignment, (int) sm_resource.sm.flags);
+#else
+    NVLOGC_FMT(TAG, "{} green context: device resource with CU_DEV_RESOURCE_TYPE_SM {} type has {} SM count",
+name, (int) CU_DEV_RESOURCE_TYPE_SM, (int) sm_resource.sm.smCount);
+#endif
+
+#if CUDA_VERSION >= 13010
+   CUdevResource wq_config_resource = {};
+   CU_CHECK(cuGreenCtxGetDevResource(cuGreenCtx, &wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
+   NVLOGC_FMT(TAG, "{} green context: device resource with CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG ({}) type has {} wqConcurrencyLimit and {} sharingScope",
+              name, (int) CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG, (int) wq_config_resource.wqConfig.wqConcurrencyLimit, (int)wq_config_resource.wqConfig.sharingScope);
+#endif
+}
+
+
+unsigned long long MpsCtx::getCtxId() const
+{
+   unsigned long long ctxId = ULLONG_MAX;
+   CU_CHECK(cuCtxGetId(cuCtx, &ctxId));
+   return ctxId;
 }
 #endif

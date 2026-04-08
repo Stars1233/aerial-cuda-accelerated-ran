@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,9 +17,9 @@
 
 #pragma once
 
-#include "cuComplex.h"
-#include "cuda_fp16.h"
+#include "channel_eq/channel_eq.hpp"
 #include "cuphy_kernel_util.cuh"
+#include "cuphy_complex_ops.cuh"
 
 namespace channel_eq {
 
@@ -28,7 +28,6 @@ namespace channel_eq {
 //=============================================================================
 
 static constexpr uint32_t CUDA_MAX_N_THRDS_PER_BLK = 1024;
-static constexpr uint32_t N_THREADS_PER_WARP = 32; // cudaDeviceProp::warpSize;
 
 // FP16 - largest normal number
 static constexpr float LLR_LOW_LIM  = -65504.0f; // std::numeric_limits<__half>::lowest();
@@ -36,6 +35,15 @@ static constexpr float LLR_HIGH_LIM =  65504.0f; // std::numeric_limits<__half>:
 
 // Inverse of zero-forcing regularizer. Equivalent to diagonal MMSE with SNR = 10^(3.6)
 static constexpr float INV_ZF_REGULARIZER = 3981.071705534973f;
+
+// Import types from cuphy_cmplx (explicit declarations to avoid ambiguity)
+using cuphy_cmplx::tensor_ref;
+using cuphy_cmplx::block_1D;
+using cuphy_cmplx::block_2D;
+using cuphy_cmplx::block_3D;
+
+// Import functions and operators from cuphy_cmplx
+using namespace cuphy_cmplx;
 
 //=============================================================================
 // Debug Functions
@@ -70,192 +78,6 @@ __device__ float debug_LLR_get_elem(const float2& Llr, int idx)
     }
 }
 #endif
-
-//=============================================================================
-// Tensor Reference Template
-//=============================================================================
-
-template <typename TElem>
-struct tensor_ref
-{
-    TElem*     addr{};
-    const int32_t* strides{};
-
-    CUDA_BOTH
-    tensor_ref(void* pAddr, const int32_t* pStrides) :
-        addr(static_cast<TElem*>(pAddr)),
-        strides(pStrides)
-    {
-    }
-    
-    CUDA_BOTH int offset(int i0) const
-    {
-        return (strides[0] * i0);
-    }
-    
-    CUDA_BOTH int offset(int i0, int i1) const
-    {
-        return (strides[0] * i0) + (strides[1] * i1);
-    }
-    
-    CUDA_BOTH int offset(int i0, int i1, int i2) const
-    {
-        return (strides[0] * i0) + (strides[1] * i1) + (strides[2] * i2);
-    };
-    
-    CUDA_BOTH int offset(int i0, int i1, int i2, int i3) const
-    {
-        return (strides[0] * i0) + (strides[1] * i1) + (strides[2] * i2) + (strides[3] * i3);
-    };
-    
-    CUDA_BOTH int offset(int i0, int i1, int i2, int i3, int i4) const
-    {
-        return (strides[0] * i0) + (strides[1] * i1) + (strides[2] * i2) + (strides[3] * i3) + (strides[4] * i4);
-    };
-    
-    // clang-format off
-    CUDA_BOTH TElem&       operator()(int i0)                                   { return *(addr + offset(i0));         }
-    CUDA_BOTH TElem&       operator()(int i0, int i1)                           { return *(addr + offset(i0, i1));     }
-    CUDA_BOTH TElem&       operator()(int i0, int i1, int i2)                   { return *(addr + offset(i0, i1, i2)); }
-    CUDA_BOTH TElem&       operator()(int i0, int i1, int i2, int i3)           { return *(addr + offset(i0, i1, i2, i3)); }
-    CUDA_BOTH TElem&       operator()(int i0, int i1, int i2, int i3, int i4)   { return *(addr + offset(i0, i1, i2, i3, i4)); }
-
-    CUDA_BOTH const TElem& operator()(int i0) const                                 { return *(addr + offset(i0));         }
-    CUDA_BOTH const TElem& operator()(int i0, int i1) const                         { return *(addr + offset(i0, i1));     }
-    CUDA_BOTH const TElem& operator()(int i0, int i1, int i2) const                 { return *(addr + offset(i0, i1, i2)); }
-    CUDA_BOTH const TElem& operator()(int i0, int i1, int i2, int i3) const         { return *(addr + offset(i0, i1, i2, i3)); }
-    CUDA_BOTH const TElem& operator()(int i0, int i1, int i2, int i3, int i4) const { return *(addr + offset(i0, i1, i2, i3, i4)); }
-
-    // clang-format on
-};
-
-//=============================================================================
-// Block Templates 
-//=============================================================================
-
-template <typename T, int M>
-struct block_1D
-{
-    T         data[M]{};
-    CUDA_BOTH T& operator()(int idx) { return data[idx]; }
-};
-
-template <typename T, int M, int N>
-struct block_2D
-{
-    T         data[M * N]{};
-    CUDA_BOTH T& operator()(int m, int n) { return data[(n * M) + m]; }
-};
-
-template <typename T, int L, int M, int N>
-struct block_3D
-{
-    T         data[L * M * N]{};
-    CUDA_BOTH T& operator()(int l, int m, int n) { return data[((n * M) + m) * L + l]; }
-};
-
-// Partial specialization of block_1D to use shared memory pointers
-template <typename T, int M>
-struct block_1D<T*, M>
-{
-    CUDA_BOTH block_1D(T* pData) :
-        m_pData(pData) {}; // static_assert(std::is_pointer<T>::value, "Must be a pointer type")
-    block_1D()                    = delete;
-    block_1D(block_1D const& blk) = delete;
-    CUDA_BOTH block_1D& operator  =(block_1D const& block) { m_pData = block.m_pData; };
-    ~block_1D()                   = default;
-
-    CUDA_BOTH T&               operator()(int idx) { return m_pData[idx]; }
-    static constexpr CUDA_BOTH size_t num_elem() { return M; }
-
-private:
-    T* m_pData = nullptr;
-};
-
-// Partial specialization of block_2D to use shared memory pointers
-template <typename T, int M, int N>
-struct block_2D<T*, M, N>
-{
-    CUDA_BOTH block_2D(T* pData) :
-        m_pData(pData){};
-    block_2D()                    = delete;
-    block_2D(block_2D const& blk) = delete;
-    CUDA_BOTH block_2D& operator  =(block_2D const& block) { m_pData = block.m_pData; };
-    ~block_2D()                   = default;
-
-    CUDA_BOTH T&               operator()(int m, int n) { return m_pData[(n * M) + m]; }
-    static constexpr CUDA_BOTH size_t num_elem() { return M * N; }
-
-private:
-    T* m_pData = nullptr;
-};
-
-// Partial specialization of block_3D to use shared memory pointers
-template <typename T, int L, int M, int N>
-struct block_3D<T*, L, M, N>
-{
-    CUDA_BOTH block_3D(T* pData) :
-        m_pData(pData){};
-    block_3D()                    = delete;
-    block_3D(block_3D const& blk) = delete;
-    CUDA_BOTH block_3D& operator  =(block_3D const& block) { m_pData = block.m_pData; };
-    ~block_3D()                   = default;
-
-    CUDA_BOTH T&               operator()(int l, int m, int n) { return m_pData[((n * M) + m) * L + l]; }
-    static constexpr CUDA_BOTH size_t num_elem() { return L * M * N; }
-
-private:
-    T* m_pData = nullptr;
-};
-
-//=============================================================================
-// Type Conversion Templates
-//=============================================================================
-
-// clang-format off
-template <typename T> CUDA_BOTH_INLINE T         cuGet(int);
-template<>            CUDA_BOTH_INLINE float     cuGet(int x) { return(float(x)); }
-template<>            CUDA_BOTH_INLINE __half    cuGet(int x) { return(__half(x)); }
-template<>            CUDA_BOTH_INLINE cuComplex cuGet(int x) { return(make_cuComplex(float(x), 0.0f)); }
-template<>            CUDA_BOTH_INLINE __half2   cuGet(int x) { return(make_half2(__half(x), 0.0));}
-
-template <typename T> CUDA_BOTH_INLINE T         cuGet(float);
-template<>            CUDA_BOTH_INLINE float     cuGet(float x) { return(float(x)); }
-template<>            CUDA_BOTH_INLINE cuComplex cuGet(float x) { return(make_cuComplex(x, 0.0f)); }
-template<>            CUDA_BOTH_INLINE __half2   cuGet(float x) { return(make_half2(x, 0.0f)); }
-
-template <typename T> CUDA_BOTH_INLINE T         cuGet(__half);
-template<>            CUDA_BOTH_INLINE __half    cuGet(__half x) { return x; }
-template<>            CUDA_BOTH_INLINE __half2   cuGet(__half x) { return(make_half2(x, 0.0f)); }
-
-template <typename T> CUDA_BOTH_INLINE T         cuAbs(T);
-template<>            CUDA_BOTH_INLINE float     cuAbs(float x) { return(fabsf(x)); }
-
-//=============================================================================
-// Complex Number Operations
-//=============================================================================
-
-static CUDA_BOTH_INLINE float     cuReal(cuComplex x)                          { return cuCrealf(x); }
-static CUDA_BOTH_INLINE float     cuImag(cuComplex x)                          { return cuCimagf(x); }
-static CUDA_BOTH_INLINE cuComplex cuConj(cuComplex x)                          { return cuConjf(x); }
-static CUDA_BOTH_INLINE cuComplex operator*(cuComplex x, float y)              { return make_cuComplex(cuCrealf(x) * y, cuCimagf(x) * y); }
-static CUDA_BOTH_INLINE cuComplex operator+=(cuComplex &x, float y)            { x = make_cuComplex(cuCrealf(x) + y, cuCimagf(x)); return x; }
-static CUDA_BOTH_INLINE cuComplex operator*=(cuComplex &x, float y)            { x = make_cuComplex(cuCrealf(x) * y, cuCimagf(x) * y); return x; }
-static CUDA_BOTH_INLINE cuComplex cuCma(cuComplex x, cuComplex y, cuComplex a) { return cuCfmaf(x, y,a); } // a = (x*y) + a;
-static CUDA_BOTH_INLINE cuComplex cuCmul(cuComplex x, cuComplex y)             { return cuCmulf(x, y); } // complex mul
-static CUDA_BOTH_INLINE cuComplex operator+(cuComplex x, cuComplex y)          { return cuCaddf(x, y); }
-static CUDA_BOTH_INLINE cuComplex operator-(cuComplex x, cuComplex y)          { return cuCsubf(x, y); }
-static CUDA_BOTH_INLINE cuComplex operator+=(cuComplex &x, cuComplex y)        { x = cuCaddf(x, y); return x; };
-
-// Arithmetic functions for half-precision complex
-static CUDA_INLINE __half  cuReal(__half2 x)                        { return x.x; }
-static CUDA_INLINE __half  cuImag(__half2 x)                        { return x.y; }
-static CUDA_INLINE __half2 cuConj(__half2 x)                        { return conj_fast(x); }
-static CUDA_INLINE __half2 operator*(__half2 x, __half y)           { return __hmul2(x, make_half2(y, y)); }
-static CUDA_INLINE __half2 operator+=(__half2 &x, __half y)         { x = make_half2(cuReal(x) + y, cuImag(x)); return x; }
-static CUDA_INLINE __half2 operator*=(__half2 &x, __half y)         { x = __hmul2(x, make_half2(y, y)); return x; }
-static CUDA_INLINE __half2 cuCma(__half2 x, __half2 y, __half2 a)   { return __hcmadd(x,y,a); } // acc = (x*y) + a;
-static CUDA_INLINE __half2 cuCmul(__half2 x, __half2 y)             { return __hcmadd(x,y, __float2half2_rn(0.f)); } // complex mul
 
 // clang-format on
 

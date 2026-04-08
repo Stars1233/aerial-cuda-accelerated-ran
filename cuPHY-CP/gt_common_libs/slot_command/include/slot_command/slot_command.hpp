@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,54 +55,53 @@
  * including PDSCH, PUSCH, PDCCH, PUCCH, PRACH, SRS, CSI-RS, and SSB.
  */
 struct ReleasedHarqBufferInfo;
-//typedef struct ReleasedHarqBufferInfo ReleasedHarqBufferInfo;
 namespace slot_command_api
 {
 
 using namespace std::chrono;
 
 /// Maximum cells per cell group
-static constexpr int MAX_CELLS_PER_CELL_GROUP = 48;
+inline constexpr int MAX_CELLS_PER_CELL_GROUP = 48;
 
 /// Maximum PDCCH PDUs per cell (needed for per-PDU management vectors)
-static constexpr int MAX_PDCCH_PDUS_PER_CELL = 20;
+inline constexpr int MAX_PDCCH_PDUS_PER_CELL = 20;
 
 #ifdef ENABLE_64C
-static constexpr int MAX_PUSCH_UE_GROUPS = 256;   ///< Maximum PUSCH UE groups (64 cell config)
-static constexpr int MAX_PUSCH_UE_PER_TTI = 256;  ///< Maximum PUSCH UE per TTI (64 cell config)
+inline constexpr int MAX_PUSCH_UE_GROUPS = 256;   ///< Maximum PUSCH UE groups (64 cell config)
+inline constexpr int MAX_PUSCH_UE_PER_TTI = 256;  ///< Maximum PUSCH UE per TTI (64 cell config)
 #else
-static constexpr int MAX_PUSCH_UE_GROUPS = 128;   ///< Maximum PUSCH UE groups (default config)
-static constexpr int MAX_PUSCH_UE_PER_TTI = 128;  ///< Maximum PUSCH UE per TTI (default config)
+inline constexpr int MAX_PUSCH_UE_GROUPS = 132;   ///< Maximum PUSCH UE groups (default config)
+inline constexpr int MAX_PUSCH_UE_PER_TTI = 132;  ///< Maximum PUSCH UE per TTI (default config)
 #endif
-static constexpr int MAX_NUM_PRGS_DBF=273;  ///< Maximum number of PRGs for dynamic beamforming
-static constexpr int MAX_NUM_PRGS=10;       ///< Maximum number of PRGs
+inline constexpr int MAX_NUM_PRGS_DBF=273;  ///< Maximum number of PRGs for dynamic beamforming
+inline constexpr int MAX_NUM_PRGS=10;       ///< Maximum number of PRGs
 
 /// Keeping it separate constant in case there is asymmetry between DL and UL
 #ifdef ENABLE_64C
-static constexpr int MAX_PDSCH_UE_GROUPS = 256;   ///< Maximum PDSCH UE groups (64 cell config)
-static constexpr int MAX_PDSCH_UE_PER_TTI = 256;  ///< Maximum PDSCH UE per TTI (64 cell config)
+inline constexpr int MAX_PDSCH_UE_GROUPS = 256;   ///< Maximum PDSCH UE groups (64 cell config)
+inline constexpr int MAX_PDSCH_UE_PER_TTI = 256;  ///< Maximum PDSCH UE per TTI (64 cell config)
 #else
-static constexpr int MAX_PDSCH_UE_GROUPS = 128;   ///< Maximum PDSCH UE groups (default config)
-static constexpr int MAX_PDSCH_UE_PER_TTI = 128;  ///< Maximum PDSCH UE per TTI (default config)
+inline constexpr int MAX_PDSCH_UE_GROUPS = 192;   ///< Maximum PDSCH UE groups (default config)
+inline constexpr int MAX_PDSCH_UE_PER_TTI = 192;  ///< Maximum PDSCH UE per TTI (default config)
 #endif
 /// Maximum PDSCH UE codewords per TTI (TODO: For SU-MIMO or MU-MIMO with > 4 layers per UE, 2 CW is needed)
-static constexpr int MAX_PDSCH_UE_CW_PER_TTI = MAX_PDSCH_UE_PER_TTI;
-static constexpr uint MAX_DCI_PAYLOAD_LENGTH_BITS = 45;  ///< Maximum DCI payload length in bits
+inline constexpr int MAX_PDSCH_UE_CW_PER_TTI = MAX_PDSCH_UE_PER_TTI;
+inline constexpr uint MAX_DCI_PAYLOAD_LENGTH_BITS = 45;  ///< Maximum DCI payload length in bits
 
-static constexpr int MAX_PUCCH_UE_PER_TTI = 64;         ///< Maximum PUCCH UE per TTI
-static constexpr int MAX_SSB_BLOCKS_PER_SLOT = 3;       ///< Maximum SSB blocks per slot
-static constexpr int MAX_PRACH_MAX_OCCASIONS_PER_CELL = 4;  ///< Maximum PRACH occasions per cell
-static constexpr int MAX_PRACH_OCCASIONS_PER_SLOT = (MAX_PRACH_MAX_OCCASIONS_PER_CELL * MAX_CELLS_PER_SLOT);  ///< Maximum PRACH occasions per slot
-static constexpr int MAX_CSIRS_OCCASIONS_PER_SLOT = 64; ///< Maximum CSI-RS occasions per slot
-static constexpr int MAX_SRS_UE_PER_TTI = 16;           ///< Maximum SRS UE per TTI
+inline constexpr int MAX_PUCCH_UE_PER_TTI = 64;         ///< Maximum PUCCH UE per TTI
+inline constexpr int MAX_SSB_BLOCKS_PER_SLOT = 3;       ///< Maximum SSB blocks per slot
+inline constexpr int MAX_PRACH_MAX_OCCASIONS_PER_CELL = 4;  ///< Maximum PRACH occasions per cell
+inline constexpr int MAX_PRACH_OCCASIONS_PER_SLOT = (MAX_PRACH_MAX_OCCASIONS_PER_CELL * MAX_CELLS_PER_SLOT);  ///< Maximum PRACH occasions per slot
+inline constexpr int MAX_CSIRS_OCCASIONS_PER_SLOT = 64; ///< Maximum CSI-RS occasions per slot
+inline constexpr int MAX_SRS_UE_PER_TTI = 16;           ///< Maximum SRS UE per TTI
 /// Maximum resource blocks for SRS transmission (Table 6.4.1.4.3-1: Csrs index = 61/62/63 & Bsrs = 0)
-static constexpr int MAX_RB_FOR_SRS_TRANS = 272;
-static constexpr int MIN_PRG_SIZE = 1;                   ///< Minimum PRG size
-static constexpr int NUM_GNB_TX_RX_ANT_PORTS = 64;      ///< Number of gNB TX/RX antenna ports
+inline constexpr int MAX_RB_FOR_SRS_TRANS = 272;
+inline constexpr int MIN_PRG_SIZE = 1;                   ///< Minimum PRG size
+inline constexpr int NUM_GNB_TX_RX_ANT_PORTS = 64;      ///< Number of gNB TX/RX antenna ports
 
-static constexpr int MAX_NUM_DIGBFI = 32;  ///< Maximum number of digital beamforming interfaces
+inline constexpr int MAX_NUM_DIGBFI = 32;  ///< Maximum number of digital beamforming interfaces
 
-static constexpr int IQ_REPR_FP32_COMPLEX = 2;  ///< IQ representation FP32 complex
+inline constexpr int IQ_REPR_FP32_COMPLEX = 2;  ///< IQ representation FP32 complex
 /**
  * Maximum MU-MIMO layers
  * Up to 8 DL layers (16 layers not supported)
@@ -110,42 +109,42 @@ static constexpr int IQ_REPR_FP32_COMPLEX = 2;  ///< IQ representation FP32 comp
  * Up to 4 layers/UE DL (or UL) SU-MIMO
  */
 #ifdef ENABLE_32DL
-static constexpr int MAX_MU_MIMO_LAYERS = 32;
+inline constexpr int MAX_MU_MIMO_LAYERS = 32;
 #else
-static constexpr int MAX_MU_MIMO_LAYERS = 16;
+inline constexpr int MAX_MU_MIMO_LAYERS = 16;
 #endif
- static constexpr int MAX_PORTS_FOR_STATIC_BF = 32;   ///< Maximum ports for static beamforming
-static constexpr int MAX_DL_UL_BF_UE_PER_TTI = 8;    ///< Maximum DL/UL beamforming UE per TTI
-static constexpr int MAX_DL_UL_BF_UE_GROUPS = CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS;  ///< Maximum DL/UL BF UE groups
-static constexpr int MAX_B_SRS_INDEX = 4;             ///< Maximum B SRS index
-static constexpr int MAX_SRS_SYM = 4;                 ///< Maximum SRS symbols
-static constexpr int MAX_BFW_COFF_STORE_INDEX = 4;   ///< Maximum beamforming coefficient store index
-static constexpr int MAX_STATIC_BFW_COFF_STORE_INDEX = 32;  ///< Maximum static BFW coefficient store index
-static constexpr int MAX_N_BUNDLE = 276;              ///< Maximum N bundles
-static constexpr int MAX_PUCCH_FORMAT = 5;            ///< Maximum PUCCH format
+ inline constexpr int MAX_PORTS_FOR_STATIC_BF = 32;   ///< Maximum ports for static beamforming
+inline constexpr int MAX_DL_UL_BF_UE_PER_TTI = 8;    ///< Maximum DL/UL beamforming UE per TTI
+inline constexpr int MAX_DL_UL_BF_UE_GROUPS = CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS;  ///< Maximum DL/UL BF UE groups
+inline constexpr int MAX_B_SRS_INDEX = 4;             ///< Maximum B SRS index
+inline constexpr int MAX_SRS_SYM = 4;                 ///< Maximum SRS symbols
+inline constexpr int MAX_BFW_COFF_STORE_INDEX = 4;   ///< Maximum beamforming coefficient store index
+inline constexpr int MAX_STATIC_BFW_COFF_STORE_INDEX = 32;  ///< Maximum static BFW coefficient store index
+inline constexpr int MAX_N_BUNDLE = 276;              ///< Maximum N bundles
+inline constexpr int MAX_PUCCH_FORMAT = 5;            ///< Maximum PUCCH format
 /// Maximum SRS indications per slot (for 16 SRS PDUs in UL_TTI_REQ and nvIPC bufflen as 576000)
-static constexpr int MAX_SRS_IND_PER_SLOT = 24;
+inline constexpr int MAX_SRS_IND_PER_SLOT = 24;
 
-static constexpr int  MAX_SRS_CHEST_BUFFERS_PER_CELL = 1024;
-static constexpr int  MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL = 256;
+inline constexpr int  MAX_SRS_CHEST_BUFFERS_PER_CELL = 1024;
+inline constexpr int  MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL = 256;
 // TBD: Change to max cells once we support mutiple Cells with MU-MIMO
-static constexpr uint32_t MAX_CELLS_MU_MIMO_ENABLE = 6;
-static constexpr uint32_t MAX_SRS_PDU_PER_SLOT = 128;
-static constexpr uint32_t MAX_SRS_CHEST_BUFFERS = MAX_CELLS_MU_MIMO_ENABLE * MAX_SRS_CHEST_BUFFERS_PER_CELL;
-static constexpr int MAX_CPLANE_SPLIT = 4;
-static constexpr int MAX_AP_PER_SLOT_SRS = 64;
-static constexpr int MAX_STATIC_BFW_BEAM_ID = 1024;
-static constexpr int L2A_PROCESSING_DELTA = 2;
-static constexpr int MIN_SRS_PROCESSING_TIME_SLOTS = 1;
-static constexpr int MAX_SRS_PROCESSING_TIME_SLOTS = 11;
-static constexpr uint32_t MAX_ALLOWED_PDSCH_PDUS_PER_SLOT = 256;
+inline constexpr uint32_t MAX_CELLS_MU_MIMO_ENABLE = 9;
+inline constexpr uint32_t MAX_SRS_PDU_PER_SLOT = 128;
+inline constexpr uint32_t MAX_SRS_CHEST_BUFFERS = MAX_CELLS_MU_MIMO_ENABLE * MAX_SRS_CHEST_BUFFERS_PER_CELL;
+inline constexpr int MAX_CPLANE_SPLIT = 4;
+inline constexpr int MAX_AP_PER_SLOT_SRS = 64;
+inline constexpr int MAX_STATIC_BFW_BEAM_ID = 1024;
+inline constexpr int L2A_PROCESSING_DELTA = 2;
+inline constexpr int MIN_SRS_PROCESSING_TIME_SLOTS = 1;
+inline constexpr int MAX_SRS_PROCESSING_TIME_SLOTS = 11;
+inline constexpr uint32_t MAX_ALLOWED_PDSCH_PDUS_PER_SLOT = 256;
 
 /**
  * @brief O-RAN slot indication structure
  *
  * Represents slot timing in O-RAN format with frame ID, subframe ID, and slot ID.
  */
-struct oran_slot_ind
+struct oran_slot_ind final
 {
     uint8_t oslotid_;    ///< O-RAN slot ID (0-1)
     uint8_t osfid_;      ///< O-RAN subframe ID (0-9)
@@ -158,24 +157,24 @@ struct oran_slot_ind
  *
  * Represents slot timing with SFN, slot number, and optional timing tick information.
  */
-struct slot_indication
+struct slot_indication final
 {
     uint64_t tick_;      ///< Timing tick in nanoseconds
     uint64_t t0_;        ///< Reference time T0
     uint16_t sfn_;       ///< System Frame Number (0-1023)
     uint16_t slot_;      ///< Slot number within frame
     bool t0_valid_;      ///< Flag indicating if T0 is valid
-    
+
     /// Default constructor
     slot_indication(): sfn_(0), slot_(0),tick_(0),t0_(0),t0_valid_(false) { }
-    
+
     /**
      * @brief Constructor with SFN, slot, and tick
      * @param sfn System Frame Number
      * @param slot Slot number
      * @param tick Timing tick
      */
-    slot_indication( uint16_t sfn, uint16_t slot, uint64_t tick):
+    explicit slot_indication(const uint16_t sfn, const uint16_t slot, const uint64_t tick):
         sfn_(sfn), slot_(slot), tick_(tick), t0_(0), t0_valid_(false) {
     }
 };
@@ -185,7 +184,7 @@ struct slot_indication
  * @param slot_ind 3GPP slot indication
  * @return O-RAN slot indication
  */
-inline oran_slot_ind to_oran_slot_format(slot_indication & slot_ind)
+[[nodiscard]] inline oran_slot_ind to_oran_slot_format(const slot_indication & slot_ind)
 {
     oran_slot_ind ind;
     ind.oframe_id_ = slot_ind.sfn_ % 256;
@@ -262,7 +261,7 @@ enum report_type{
 enum bfw_coeff_flag_info_t
 {
     BFW_COFF_MEM_FREE = 0,              ///< Memory is free
-    BFW_COFF_MEM_BUSY = 1,              ///< Memory is busy
+    BFW_COFF_MEM_BUSY = 1,             ///< Memory is busy
     BFW_COFF_MEM_BUSY_TO_BE_USED = 2    ///< Memory is busy but will be used
 };
 
@@ -290,11 +289,11 @@ enum srsChestBuffState {
  *
  * Associates a PDU index with its corresponding Radio Network Temporary Identifier.
  */
-typedef struct _pdu_idx_rnti_list_info_t
+struct pdu_idx_rnti_list_info_t
 {
     uint16_t pdu_idx;   ///< PDU index
     uint16_t rnti;      ///< Radio Network Temporary Identifier
-}pdu_idx_rnti_list_info_t;
+};
 
 
 /**
@@ -303,7 +302,7 @@ typedef struct _pdu_idx_rnti_list_info_t
  * Manages memory buffers for beamforming coefficients, including
  * host and device buffer pointers organized by UE groups.
  */
-typedef struct _bfw_coeff_mem_info_t
+struct bfw_coeff_mem_info_t
 {
     uint8_t slotIndex;      ///< Slot index for buffer rotation
     uint16_t sfn;           ///< System Frame Number
@@ -320,7 +319,7 @@ typedef struct _bfw_coeff_mem_info_t
     uint8_t* buff_addr_chunk_h[MAX_DL_UL_BF_UE_GROUPS];
     /// Device (GPU) buffer pointers for each UE group
     uint8_t* buff_addr_chunk_d[MAX_DL_UL_BF_UE_GROUPS];
-}bfw_coeff_mem_info_t;
+};
 
 /**
  * @brief Slot information structure
@@ -419,7 +418,7 @@ struct pusch_params : public ch_params
         for (uint32_t i = 0; i < MAX_PUSCH_UE_GROUPS; i++)
         {
             ue_grp_info[i].nUes = 0;
-            ue_grp_info[i].pUePrmIdxs = &ue_index_info[i*MAX_PDSCH_UE_PER_TTI];
+            ue_grp_info[i].pUePrmIdxs = &ue_index_info[i*MAX_PUSCH_UE_PER_TTI];
             ue_grp_info[i].pDmrsDynPrm = &ue_dmrs_info[i];
             ue_grp_info[i].pCellPrm = cell_dyn_info;
         }
@@ -430,23 +429,23 @@ struct pusch_params : public ch_params
     }
 };
 
-typedef struct
+struct digBeamWeight_t
 {
     int16_t digBeamWeightRe;
     int16_t digBeamWeightIm;
-}digBeamWeight_t;
+};
 
-typedef struct
+struct digBeam_t
 {
     uint8_t beamIdxIQSentInCplane;
     std::vector<digBeamWeight_t> digBeam;
-}digBeam_t;
+};
 
-typedef struct pm_weights_t_ {
+struct pm_weights_t {
     uint16_t layers;
     uint16_t ports;
     cuphyPmW_t weights;
-} pm_weights_t;
+};
 
 using prc_weights_list_t = std::vector<cuphyPmW_t>;
 using prc_weights_idx_list_t = std::vector<uint32_t>;
@@ -660,8 +659,8 @@ struct pdcch_group_params: public ch_params {
     explicit pdcch_group_params() {
         //Note - all other channels manage these lists on per-cell basis
         // However PDCCH manages this per PDU.  It also assumes one to one mapping between PDU and coreset
-        cell_index_list.reserve(MAX_PDCCH_PDUS_PER_CELL*MAX_CELLS_PER_CELL_GROUP);
-        phy_cell_index_list.reserve(MAX_PDCCH_PDUS_PER_CELL*MAX_CELLS_PER_CELL_GROUP);
+        cell_index_list.reserve(MAX_PDCCH_PDUS_PER_CELL * MAX_CELLS_PER_CELL_GROUP);
+        phy_cell_index_list.reserve(MAX_PDCCH_PDUS_PER_CELL * MAX_CELLS_PER_CELL_GROUP);
     }
 
     void reset() {
@@ -962,269 +961,49 @@ struct bfw_params : public ch_params
     }
 };
 
-#define CSIRS_SYMBOL_LOCATION_TABLE_LENGTH (18)
-typedef struct _CsirsTables
+inline constexpr int CSIRS_SYMBOL_LOCATION_TABLE_LENGTH = 18;
+struct CsirsTables
 {
     CsirsSymbLocRow rowData[CSIRS_SYMBOL_LOCATION_TABLE_LENGTH];             /*!< resource mapping table */
     //int8_t          seqTable[MAX_CDM_TYPE][CUPHY_CSIRS_MAX_SEQ_INDEX_COUNT][2][4]; /*!< wf/wt seq table layout: 2- Wf,Wt; 4 max(maxkprimelen, maxlprimelen) */
-} CsirsTables;
-
-static constexpr CsirsTables csirs_tables= {
-    {
-        {1, 3, 1, 1,
-            {0, 0, 0},
-            {0, 4, 8},
-            {0, 0, 0},
-            {0, 0, 0},
-            {0, 0, 0},
-        },
-        {1, 1, 1, 1,
-            {0},
-            {0},
-            {0},
-            {0},
-            {0}
-        },
-        {2, 1, 2, 1,
-            {0},
-            {0},
-            {0},
-            {0},
-            {0}
-        },
-        {4, 2, 2, 1,
-            {0, 0},
-            {0, 2},
-            {0, 0},
-            {0, 0},
-            {0, 1}
-        },
-        {4, 2, 2, 1,
-            {0, 0},
-            {0, 0},
-            {0, 0},
-            {0, 1},
-            {0, 1}
-        },
-        {8, 4, 2, 1,
-            {0, 1, 2, 3},
-            {0, 0, 0, 0},
-            {0, 0, 0, 0},
-            {0, 0, 0, 0},
-            {0, 1, 2, 3}
-        },
-        {8, 4, 2, 1,
-            {0, 1, 0, 1},
-            {0, 0, 0, 0},
-            {0, 0, 0, 0},
-            {0, 0, 1, 1},
-            {0, 1, 2, 3}
-        },
-        {8, 2, 2, 2,
-            {0, 1},
-            {0, 0},
-            {0, 0},
-            {0, 0},
-            {0, 1}
-        },
-        {12, 6, 2, 1,
-            {0, 1, 2, 3, 4, 5},
-            {0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 0},
-            {0, 1, 2, 3, 4, 5}
-        },
-        {12, 3, 2, 2,
-            {0, 1, 2},
-            {0, 0, 0},
-            {0, 0, 0},
-            {0, 0, 0},
-            {0, 1, 2}
-        },
-        {16, 8, 2, 1,
-            {0, 1, 2, 3, 0, 1, 2, 3},
-            {0, 0, 0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 1, 1, 1, 1},
-            {0, 1, 2, 3, 4, 5, 6, 7}
-        },
-        {16, 4, 2, 2,
-            {0, 1, 2, 3},
-            {0, 0, 0, 0},
-            {0, 0, 0, 0},
-            {0, 0, 0, 0},
-            {0, 1, 2, 3}
-        },
-        {24, 12, 2, 1,
-            {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2},
-            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1},
-            {0, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1},
-            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
-        },
-        {24, 6, 2, 2,
-            {0, 1, 2, 0, 1, 2},
-            {0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 1, 1, 1},
-            {0, 0, 0, 0, 0, 0},
-            {0, 1, 2, 3, 4, 5}
-        },
-        {24, 3, 2, 4,
-            {0, 1, 2},
-            {0, 0, 0},
-            {0, 0, 0},
-            {0, 0, 0},
-            {0, 1, 2}
-        },
-        {32, 16, 2, 1,
-            {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3},
-            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1},
-            {0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1},
-            {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-        },
-        {32, 8, 2, 2,
-            {0, 1, 2, 3, 0, 1, 2, 3},
-            {0, 0, 0, 0, 0, 0, 0, 0},
-            {0, 0, 0, 0, 1, 1, 1, 1},
-            {0, 0, 0, 0, 0, 0, 0, 0},
-            {0, 1, 2, 3, 4, 5, 6, 7}
-        },
-        {32, 4, 2, 4,
-            {0, 1, 2, 3},
-            {0, 0, 0, 0},
-            {0, 0, 0, 0},
-            {0, 0, 0, 0},
-            {0, 1, 2, 3}
-        }
-    }
 };
 
-typedef struct _bsrs_info_t
+struct bsrs_info_t
 {
     uint16_t mSRS;
     uint8_t nb;
-}bsrs_info_t;
-
-typedef struct _SrsBwConfigTable
-{
-    bsrs_info_t bsrs_info[MAX_B_SRS_INDEX];
-}SrsBwConfigTable;
-
-/* Table 6.4.1.4.3-1: SRS bandwidth configuration. */
-static constexpr SrsBwConfigTable srs_bw_table[] =
-{
-    /* Csrs Index = 0 */
-    {
-        {
-            {4, 1}, /* Bsrs Index = 0 */
-            {4, 1}, /* Bsrs Index = 1 */
-            {4, 1}, /* Bsrs Index = 2 */
-            {4, 1}  /* Bsrs Index = 3 */
-         }
-    },
-    /* Csrs Index = 1 */
-    {
-       {
-            {8, 1}, /* Bsrs Index = 0 */
-            {4, 2}, /* Bsrs Index = 1 */
-            {4, 1}, /* Bsrs Index = 2 */
-            {4, 1}  /* Bsrs Index = 3 */
-        }
-    },
-    {{{12, 1}, {4, 3}, {4, 1}, {4, 1}}},
-    {{{16, 1}, {4, 4}, {4, 1}, {4, 1}}},
-    {{{16, 1}, {8, 2}, {4, 2}, {4, 1}}},
-    {{{20, 1}, {4, 5}, {4, 1}, {4, 1}}},
-    {{{24, 1}, {4, 6}, {4, 1}, {4, 1}}},
-    {{{24, 1}, {12, 2}, {4, 3}, {4, 1}}},
-    {{{28, 1}, {4, 7}, {4, 1}, {4, 1}}},
-    {{{32, 1}, {16, 2}, {8, 2}, {4, 2}}},
-    {{{36, 1}, {12, 3}, {4, 3}, {4, 1}}},
-    {{{40, 1}, {20, 2}, {4, 5}, {4, 1}}},
-    {{{48, 1}, {16, 3}, {8, 2}, {4, 2}}},
-    {{{48, 1}, {24, 2}, {12, 2}, {4, 3}}},
-    {{{52, 1}, {4, 13}, {4, 1}, {4, 1}}},
-    {{{56, 1}, {28, 2}, {4, 7}, {4, 1}}},
-    {{{60, 1}, {20, 3}, {4, 5}, {4, 1}}},
-    {{{64, 1}, {32, 2}, {16, 2}, {4, 4}}},
-    {{{72, 1}, {24, 3}, {12, 2}, {4, 3}}},
-    {{{72, 1}, {36, 2}, {12, 3}, {4, 3}}},
-    {{{76, 1}, {4, 19}, {4, 1}, {4, 1}}},
-    {{{80, 1}, {40, 2}, {20, 2}, {4, 5}}},
-    {{{88, 1}, {44, 2}, {4, 11}, {4, 1}}},
-    {{{96, 1}, {32, 3}, {16, 2}, {4, 4}}},
-    {{{96, 1}, {48, 2}, {24, 2}, {4, 6}}},
-    {{{104, 1}, {52, 2}, {4, 13}, {4, 1}}},
-    {{{112, 1}, {56, 2}, {28, 2}, {4, 7}}},
-    {{{120, 1}, {60, 2}, {20, 3}, {4, 5}}},
-    {{{120, 1}, {40, 3}, {8, 5}, {4, 2}}},
-    {{{120, 1}, {24, 5}, {12, 2}, {4, 3}}},
-    {{{128, 1}, {64, 2}, {32, 2}, {4, 8}}},
-    {{{128, 1}, {64, 2}, {16, 4}, {4, 4}}},
-    {{{128, 1}, {16, 8}, {8, 2}, {4, 2}}},
-    {{{132, 1}, {44, 3}, {4, 11}, {4, 1}}},
-    {{{136, 1}, {68, 2}, {4, 17}, {4, 1}}},
-    {{{144, 1}, {72, 2}, {36, 2}, {4, 9}}},
-    {{{144, 1}, {48, 3}, {24, 2}, {12, 2}}},
-    {{{144, 1}, {48, 3}, {16, 3}, {4, 4}}},
-    {{{144, 1}, {16, 9}, {8, 2}, {4, 2}}},
-    {{{152, 1}, {76, 2}, {4, 19}, {4, 1}}},
-    {{{160, 1}, {80, 2}, {40, 2}, {4, 10}}},
-    {{{160, 1}, {80, 2}, {20, 4}, {4, 5}}},
-    {{{160, 1}, {32, 5}, {16, 2}, {4, 4}}},
-    {{{168, 1}, {84, 2}, {28, 3}, {4, 7}}},
-    {{{176, 1}, {88, 2}, {44, 2}, {4, 11}}},
-    {{{184, 1}, {92, 2}, {4, 23}, {4, 1}}},
-    {{{192, 1}, {96, 2}, {48, 2}, {4, 12}}},
-    {{{192, 1}, {96, 2}, {24, 4}, {4, 6}}},
-    {{{192, 1}, {64, 3}, {16, 4}, {4, 4}}},
-    {{{192, 1}, {24, 8}, {8, 3}, {4, 2}}},
-    {{{208, 1}, {104, 2}, {52, 2}, {4, 13}}},
-    {{{216, 1}, {108, 2}, {36, 3}, {4, 9}}},
-    {{{224, 1}, {112, 2}, {56, 2}, {4, 14}}},
-    {{{240, 1}, {120, 2}, {60, 2}, {4, 15}}},
-    {{{240, 1}, {80, 3}, {20, 4}, {4, 5}}},
-    {{{240, 1}, {48, 5}, {16, 3}, {8, 2}}},
-    {{{240, 1}, {24, 10}, {12, 2}, {4, 3}}},
-    {{{256, 1}, {128, 2}, {64, 2}, {4, 16}}},
-    {{{256, 1}, {128, 2}, {32, 4}, {4, 8}}},
-    {{{256, 1}, {16, 16}, {8, 2}, {4, 2}}},
-    {{{264, 1}, {132, 2}, {44, 3}, {4, 11}}},
-    {{{272, 1}, {136, 2}, {68, 2}, {4, 17}}},
-    {{{272, 1}, {68, 4}, {4, 17}, {4, 1}}},
-    {{{272, 1}, {16, 17}, {8, 2}, {4, 2}}}
 };
 
-inline __half reinterpret_uint16_as_half(uint16_t value) {
-    union {
-        uint16_t as_uint16;
-        __half as_half;
-    } conversion;
-    
-    conversion.as_uint16 = value;
-    return conversion.as_half;
+struct SrsBwConfigTable
+{
+    bsrs_info_t bsrs_info[MAX_B_SRS_INDEX];
+};
+
+#include "slot_command_tables.hpp"
+
+[[nodiscard]] inline __half reinterpret_uint16_as_half(uint16_t value) {
+    static_assert(sizeof(__half) == sizeof(uint16_t), "Size mismatch");
+    __half result;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
 }
 
-inline uint16_t reinterpret_half_as_uint16(__half value) {
-    union {
-        __half as_half;
-        uint16_t as_uint16;
-    } conversion;
-    
-    conversion.as_half = value;
-    return conversion.as_uint16;
+[[nodiscard]] inline uint16_t reinterpret_half_as_uint16(__half value) {
+    static_assert(sizeof(__half) == sizeof(uint16_t), "Size mismatch");
+    uint16_t result;
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
 }
 
-typedef struct
+struct __attribute__ ((__packed__)) tx_precoding_beamforming_t
 {
     uint16_t num_prgs;
     uint16_t prg_size;
     uint8_t  dig_bf_interfaces;
     uint16_t pm_idx_and_beam_idx[MAX_NUM_PRGS + MAX_NUM_DIGBFI*MAX_NUM_PRGS];
-} __attribute__ ((__packed__)) tx_precoding_beamforming_t;
+};
 
-typedef struct csirs_params_: public ch_params
+struct csirs_params_: public ch_params
 {
     //reMap represents the reMap of the entire bandwidth grid - hence it's is an array of num_dl_prbs * num_OFDM_symbols
     //where each array element represents 12 subcarriers in the lower 12 bits of uint16_t
@@ -1283,7 +1062,8 @@ typedef struct csirs_params_: public ch_params
         csirsDynPrms.nPrecodingMatrices = 0;
         std::memset(symbolMapArray, 0, sizeof(uint16_t) * MAX_CELLS_PER_CELL_GROUP);
     }
-} csirs_params;
+};
+using csirs_params = csirs_params_;
 
 
 struct uci_output_params
@@ -1309,16 +1089,16 @@ template <> struct type_traits <channel_type::CSI_RS> {using type = csirs_params
 template <> struct type_traits <channel_type::BFW> {using type = bfw_params; };
 
 // ru_type::MULTI_SECT_MODE 23-2 max beams for 192 max UCI groups https://nvbugs/4158154 BFW uses 1096
-constexpr size_t MAX_BEAMS = 64;
+inline constexpr size_t MAX_BEAMS = 64;
 
 using beamid_array_t = std::array<uint16_t, MAX_BEAMS>;
 
-typedef enum fh_dir_t_ : uint8_t {
+enum fh_dir_t : uint8_t {
     FH_DIR_UL = 0x00,
     FH_DIR_DL = 0x01
-} fh_dir_t;
+};
 
-typedef struct prb_info_common_t_
+struct __sc_packed prb_info_common_t_
 {
     uint16_t startPrbc;
     uint16_t numPrbc;
@@ -1327,7 +1107,7 @@ typedef struct prb_info_common_t_
     uint16_t numApIndices;
     int32_t freqOffset;
     uint8_t numSymbols;
-    fh_dir_t_ direction;
+    fh_dir_t direction;
     uint8_t filterIndex;
     uint64_t portMask;
     uint32_t ap_index;
@@ -1337,7 +1117,7 @@ typedef struct prb_info_common_t_
     uint8_t isStaticBfwEncoded;
     uint8_t isPdschSplitAcrossPrbInfo;
     explicit prb_info_common_t_(uint16_t startPrb, uint16_t numPrb,
-        uint16_t re_mask=0xFFFF, uint8_t ext_type=0x00, uint8_t start_ap_index = 0x00,
+        uint16_t re_mask=0xFFFF, uint8_t ext_type=0x00, [[maybe_unused]] uint8_t start_ap_index = 0x00,
         uint8_t num_ap_indices = 0x01, int32_t freq_offset=0x0000, uint8_t num_symbols = 1,
         fh_dir_t dir = fh_dir_t::FH_DIR_DL, uint8_t filter_index = 0, uint64_t port_mask = 0ULL, uint8_t useAltPrb = 0, uint8_t isStaticBfwEncoded = 0, uint8_t isPdschSplitAcrossPrbInfo = 0, uint64_t pdsch_port_mask = 0ULL):
             startPrbc(startPrb),
@@ -1361,31 +1141,31 @@ typedef struct prb_info_common_t_
         return std::tie(startPrbc, numPrbc, reMask, extType, numApIndices, freqOffset, numSymbols, direction, filterIndex, portMask, pdschPortMask, useAltPrb, isStaticBfwEncoded, isPdschSplitAcrossPrbInfo)
             == std::tie(other.startPrbc, other.numPrbc, other.reMask, other.extType, other.numApIndices, other.freqOffset, other.numSymbols, other.direction, other.filterIndex, other.portMask, other.pdschPortMask, other.useAltPrb, other.isStaticBfwEncoded, other.isPdschSplitAcrossPrbInfo);
     }
-} __sc_packed prb_info_common_t;
+};
+using prb_info_common_t = prb_info_common_t_;
 
-static constexpr uint16_t MAX_SE5_MASKS = 2;
-typedef struct {
-    Bitfield<uint16_t, 0, 1> ef;
-    Bitfield<uint16_t, 1, 7> extType;
-    Bitfield<uint16_t, 8, 4> nSections;
-    Bitfield<uint16_t, 12, 4> udIqWidth;
-} __sc_packed mod_comp_info_common_t;
+inline constexpr uint16_t MAX_SE5_MASKS = 2;
+struct mod_comp_info_common_t {
+    uint8_t    ef;
+    uint8_t    extType;
+    uint8_t    nSections;
+    uint8_t    udIqWidth;
+};
 
-typedef struct {
-    Bitfield<uint32_t, 0, 12> mcScaleReMask;
-    Bitfield<uint32_t, 12, 1> csf;
-    Bitfield<uint32_t, 13, 15> mcScaleOffset;
-    Bitfield<uint32_t, 28, 4> reserved;
-} __sc_packed mod_comp_info_section_t;
+struct mod_comp_info_section_t {
+    uint16_t    mcScaleReMask;
+    uint16_t    mcScaleOffset;
+    uint8_t     csf;
+};
 
 using se5_array_t = std::array<mod_comp_info_section_t, MAX_SE5_MASKS>;
-typedef struct {
+struct mod_comp_info_t {
     mod_comp_info_common_t common;
     se5_array_t sections;
     float bwScaler;
     std::array<float, MAX_SE5_MASKS> modCompScalingValue;
-} mod_comp_info_t;
-typedef struct bfw_coeff_buf_info_t_
+};
+struct bfw_coeff_buf_info_t
 {
     uint16_t num_prgs;
     uint16_t prg_size;
@@ -1394,31 +1174,35 @@ typedef struct bfw_coeff_buf_info_t_
     uint8_t *header;
     uint8_t *p_buf_bfwCoef_h;
     uint8_t *p_buf_bfwCoef_d;
-}bfw_coeff_buf_info_t;
+};
 
-typedef struct static_bfw_coeff_buf_info_t_
+struct static_bfw_coeff_buf_info_t
 {
     uint16_t num_prgs;
     uint16_t prg_size;
     uint16_t nGnbAnt;
     uint8_t  dig_bf_interfaces;
-}static_bfw_coeff_buf_info_t;
+};
 
-typedef struct _srs_rb_info_t
+struct srs_rb_info_t
 {
     uint16_t srs_start_prbs;
     uint16_t num_srs_prbs;
-}srs_rb_info_t;
+};
 
-typedef struct cplane_sections_info_t_
+struct cplane_sections_info_t
 {
     uint16_t startPrbc[MAX_AP_PER_SLOT_SRS][MAX_CPLANE_SPLIT];
     uint16_t numPrbc[MAX_AP_PER_SLOT_SRS][MAX_CPLANE_SPLIT];
-    int section_id[MAX_AP_PER_SLOT_SRS][MAX_CPLANE_SPLIT];
+    uint16_t section_id[MAX_AP_PER_SLOT_SRS][MAX_CPLANE_SPLIT];
     uint16_t cplane_sections_count[MAX_AP_PER_SLOT_SRS];
-} cplane_sections_info_t;
+     //!< Combined resource element mask for all sections in the antenna port group
+     //!< This is used for CSI-RS compact signaling where multiple logica antenna ports
+     //!< share the same flow id.
+    uint16_t combined_reMask[MAX_AP_PER_SLOT_SRS];
+};
 
-typedef struct prb_info_t_
+struct prb_info_t_
 {
     prb_info_common_t common;
     mod_comp_info_t comp_info;
@@ -1472,16 +1256,30 @@ typedef struct prb_info_t_
         static_bfwCoeff_buf_info.nGnbAnt = NUM_GNB_TX_RX_ANT_PORTS;
         static_bfwCoeff_buf_info.dig_bf_interfaces = 0;
     }
-} prb_info_t;
+};
+using prb_info_t = prb_info_t_;
+
 
 #define MAX_PRB_INFO 512
+#define MAX_CSIRS_PORTS_MAPPED_TO_SINGLE_FLOW 16
+struct overlap_csirs_port_info_t {
+    uint8_t num_ports;
+    uint8_t num_overlap_ports;
+    std::array<std::pair<uint16_t, uint8_t>, MAX_CSIRS_PORTS_MAPPED_TO_SINGLE_FLOW> reMask_ap_idx_pairs;
+    overlap_csirs_port_info_t() {
+        num_ports = 0;
+        num_overlap_ports = 0;
+        reMask_ap_idx_pairs.fill(std::make_pair(0, 0));
+    }
+};
+
 using prb_info_list_t = prb_info_t*;
 using alt_csirs_prb_info_list_t = prb_info_list_t;
 using prb_info_idx_list_t = std::vector<std::size_t>;
 using channel_info_list_t = std::array<prb_info_idx_list_t, channel_type::CHANNEL_MAX>;
 using sym_info_list_t = std::array<channel_info_list_t, OFDM_SYMBOLS_PER_SLOT>;
 using alt_csirs_prb_info_idx_list_t = std::array<prb_info_idx_list_t,OFDM_SYMBOLS_PER_SLOT>;
-typedef struct slot_info_
+struct slot_info_
 {
     sym_info_list_t symbols;
     alt_csirs_prb_info_idx_list_t alt_csirs_prb_info_idx_list;
@@ -1490,6 +1288,7 @@ typedef struct slot_info_
     prb_info_t prbs[MAX_PRB_INFO];
     std::atomic<bool>  section_id_ready;
     prb_info_t alt_csirs_prb_info_list[MAX_PRB_INFO];
+    overlap_csirs_port_info_t overlap_csirs_port_info[MAX_PRB_INFO];
     size_t start_symbol_dl;
     size_t start_symbol_ul;
     explicit slot_info_()
@@ -1510,32 +1309,6 @@ typedef struct slot_info_
         section_id_ready.store(false);
     }
 
-    void print()
-    {
-#if 0
-        for(int i = 0; i < OFDM_SYMBOLS_PER_SLOT; ++i)
-        {
-            printf("sym_info_list_t %d\n", i);
-            for(int j = 0; j < channel_type::CHANNEL_MAX; ++j)
-            {
-                // if(j != 2 && j != 0) continue;
-                printf("channel_info_list_t %d prb_info_idx_list:", j);
-                auto& prb_info_idx_list = symbols[i][j];
-                for(int k = 0; k < prb_info_idx_list.size(); ++k)
-                {
-                    printf("[%d] %ld ", k, prb_info_idx_list[k]);
-                }
-                printf("\n");
-            }
-        }
-
-        for(int i = 0; i < prbs_size; ++i)
-        {
-            printf("[%d] startPrb %u numPrb %u ", i, prbs[i].common.startPrbc, prbs[i].common.numPrbc);
-        }
-        printf("\n");
-#endif
-    }
     void reset()
     {
         for(int i = 0; i < OFDM_SYMBOLS_PER_SLOT; ++i)
@@ -1551,8 +1324,16 @@ typedef struct slot_info_
         prbs_size = 0;
         alt_csirs_prb_info_list_size = 0;
         section_id_ready.store(false);
+
+        // Clean overlap_csirs_port_info array
+        for(std::size_t i = 0; i < MAX_PRB_INFO; ++i)
+        {
+            overlap_csirs_port_info[i].num_ports = 0;
+            overlap_csirs_port_info[i].num_overlap_ports = 0;
+        }
     }
-} slot_info_t;
+};
+using slot_info_t = slot_info_;
 
 struct phy_slot_params
 {
@@ -1572,10 +1353,7 @@ struct phy_slot_params
 
     phy_slot_params()
     {
-        if(!sym_prb_info.get())
-        {
-            sym_prb_info.reset(new slot_info_t);
-        }
+        sym_prb_info = std::make_unique<slot_info_t>();
         reset();
     }
 
@@ -1592,40 +1370,11 @@ struct phy_slot_params
         sym_prb_info->reset();
     }
 
-    phy_slot_params(phy_slot_params&& other):
-        pusch(std::move(other.pusch)),
-        pdsch(std::move(other.pdsch)),
-        pdcch_dl(std::move(other.pdcch_dl)),
-        pdcch_ul(std::move(other.pdcch_ul)),
-        pbch(std::move(other.pbch)),
-        pucch(std::move(other.pucch)),
-        prach(std::move(other.prach)),
-        csi_rs(std::move(other.csi_rs)),
-        srs(std::move(other.srs)),
-        bfw(std::move(other.bfw)),
-        sym_prb_info(std::move(other.sym_prb_info))
-    {
-    }
+    phy_slot_params(phy_slot_params&&) = default;
+    phy_slot_params& operator=(phy_slot_params&&) = default;
 
     phy_slot_params(const phy_slot_params&) = delete;
     phy_slot_params& operator=(const phy_slot_params&) = delete;
-    phy_slot_params& operator=(phy_slot_params&& other) {
-        if (&other == this) {
-            return *this;
-        }
-        pusch = std::move(other.pusch);
-        pdsch = std::move(other.pdsch);
-        pdcch_dl = std::move(other.pdcch_dl);
-        pdcch_ul = std::move(other.pdcch_ul);
-        pbch = std::move(other.pbch);
-        pucch = std::move(other.pucch);
-        prach = std::move(other.prach);
-        csi_rs = std::move(other.csi_rs);
-        srs = std::move(other.srs);
-        sym_prb_info = std::move(other.sym_prb_info);
-
-        return *this;
-    }
 };
 
 /**
@@ -1659,72 +1408,72 @@ struct cell_sub_command
     uint8_t channel_array_size;
     phy_slot_params params;
 
-    pusch_params* get_pusch_params()
+    [[nodiscard]] pusch_params* get_pusch_params()
     {
         create_if(channel_type::PUSCH);
         return params.pusch.get();
     }
 
-    pdsch_params* get_pdsch_params()
+    [[nodiscard]] pdsch_params* get_pdsch_params()
     {
         create_if(channel_type::PDSCH);
         return params.pdsch.get();
     }
 
-    pdcch_params* get_pdcch_dl_params()
+    [[nodiscard]] pdcch_params* get_pdcch_dl_params()
     {
         create_if(channel_type::PDCCH_DL);
         return params.pdcch_dl.get();
     }
 
-    pdcch_params* get_pdcch_ul_params()
+    [[nodiscard]] pdcch_params* get_pdcch_ul_params()
     {
         create_if(channel_type::PDCCH_UL);
         return params.pdcch_ul.get();
     }
 
-    pbch_params* get_pbch_params()
+    [[nodiscard]] pbch_params* get_pbch_params()
     {
         create_if(channel_type::PBCH);
         return params.pbch.get();
     }
 
-    pucch_params* get_pucch_params()
+    [[nodiscard]] pucch_params* get_pucch_params()
     {
         create_if(channel_type::PUCCH);
         return params.pucch.get();
     }
 
-    prach_params* get_prach_params()
+    [[nodiscard]] prach_params* get_prach_params()
     {
         create_if(channel_type::PRACH);
         return params.prach.get();
     }
 
-    csirs_params* get_csi_rs()
+    [[nodiscard]] csirs_params* get_csi_rs()
     {
         create_if(channel_type::CSI_RS);
         return params.csi_rs.get();
     }
 
-    auto sym_prb_info()
+    [[nodiscard]] auto sym_prb_info()
     {
         return params.sym_prb_info.get();
     }
 
-    srs_params* get_srs_params()
+    [[nodiscard]] srs_params* get_srs_params()
     {
         create_if(channel_type::SRS);
         return params.srs.get();
     }
 
-    bfw_params* get_bfw_params()
+    [[nodiscard]] bfw_params* get_bfw_params()
     {
         create_if(channel_type::BFW);
         return params.bfw.get();
     }
 
-    void create_if(channel_type chType)
+    void create_if(const channel_type chType)
     {
         auto index = channel_idx[chType];
         if (index == channel_type::NONE)
@@ -1738,75 +1487,70 @@ struct cell_sub_command
             {
                 case channel_type::PUSCH:
                 {
-                    params.pusch.reset(new pusch_params);
+                    params.pusch = std::make_unique<pusch_params>();
                 }
                 break;
                 case channel_type::PDSCH:
                 {
-                    params.pdsch.reset(new pdsch_params);
+                    params.pdsch = std::make_unique<pdsch_params>();
                 }
                 break;
                 case channel_type::PDCCH_DL:
                 {
-                    params.pdcch_dl.reset(new pdcch_params);
+                    params.pdcch_dl = std::make_unique<pdcch_params>();
                 }
                 break;
                 case channel_type::PDCCH_UL:
                 {
-                    params.pdcch_ul.reset(new pdcch_params);
+                    params.pdcch_ul = std::make_unique<pdcch_params>();
                 }
                 break;
                 case channel_type::PBCH:
                 {
-                    params.pbch.reset(new pbch_params);
+                    params.pbch = std::make_unique<pbch_params>();
                 }
                 break;
                 case channel_type::PUCCH:
                 {
-                    params.pucch.reset(new pucch_params);
+                    params.pucch = std::make_unique<pucch_params>();
                 }
                 break;
                 case channel_type::PRACH:
                 {
-                    params.prach.reset(new prach_params);
+                    params.prach = std::make_unique<prach_params>();
                 }
                 break;
                 case channel_type::CSI_RS:
                 {
-                    params.csi_rs.reset(new csirs_params);
+                    params.csi_rs = std::make_unique<csirs_params>();
                 }
                 break;
                 case channel_type::SRS:
                 {
-                    params.srs.reset(new srs_params);
+                    params.srs = std::make_unique<srs_params>();
                 }
                 break;
                 case channel_type::BFW:
                 {
-                    params.bfw.reset(new bfw_params);
+                    params.bfw = std::make_unique<bfw_params>();
                 }
+                break;
                 default:
                 break;
             }
         }
     }
 
-    cell_sub_command():
-    channel_array_size(0)
+    cell_sub_command()
     {
         reset();
     }
 
-    cell_sub_command(cell_sub_command&& other):
-        cell(other.cell),
-        slot(std::move(other.slot)),
-        channel_idx(std::move(other.channel_idx)),
-        channels(std::move(other.channels)),
-        params(std::move(other.params)),
-        channel_array_size(std::move(other.channel_array_size))
-    {
+    cell_sub_command(const cell_sub_command&) = delete;
+    cell_sub_command& operator=(const cell_sub_command&) = delete;
 
-    }
+    cell_sub_command(cell_sub_command&&) = default;
+    cell_sub_command& operator=(cell_sub_command&&) = default;
 
     void reset()
     {
@@ -1824,27 +1568,23 @@ struct pdsch_fh_prepare_params
 {
     // Holds all of the inputs to update_prc_fh_params_pdsch
     // and update_prc_fh_params_pdsch_csirs
-    pdsch_params* info;
-    cuphyPdschCellGrpDynPrm_t* cell_grp_info;
     cuphyPdschUeGrpPrm_t* grp;
     cuphyPdschUePrm_t* ue;
     cell_sub_command* cell_cmd;
-    csirs_params* csirs_info;
-    int32_t cell_index;
-    uint16_t num_dl_prb;
+    bfw_coeff_mem_info_t *bfwCoeff_mem_info;
+    tx_precoding_beamforming_t *pc_bf;
     // TODO: both the below varibles can be combined.
-    // Used for PDSCH
-    uint32_t ue_grp_index;
     // Used to access BFW bfwCoeff_mem_info buffer for each UEG
     uint32_t ue_grp_bfw_index_per_cell;
-    tx_precoding_beamforming_t pc_bf;
+    // Used for PDSCH
+    uint16_t ue_grp_index;
+    uint16_t num_dl_prb;
+    uint16_t cell_index;
     bool is_new_grp;
     bool bf_enabled;
     bool pm_enabled;
     bool mmimo_enabled;
     bool csirs_compact_mode;
-    bfw_coeff_mem_info_t *bfwCoeff_mem_info;
-    bfw_coeff_mem_info_t *static_bfwCoeff_mem_info;
 };
 
 struct csirs_fh_prepare_params
@@ -1865,23 +1605,25 @@ struct fh_prepare_callback_params
     //Linear array to store pdsch_fh_params across all Cells
     // Size has been limited to MAX_PDSCH_UE_PER_TTI to avoid performance issues in FH_CALLBACK
     std::array<pdsch_fh_prepare_params, MAX_ALLOWED_PDSCH_PDUS_PER_SLOT> pdsch_fh_params = {};
+    //Linear array to store TX Precoding beamforming info across all Cells
+    std::array<tx_precoding_beamforming_t, MAX_ALLOWED_PDSCH_PDUS_PER_SLOT> pc_bf_arr = {};
     //Maintains a record of the start index of pdsch_fh_params per Cell
-    std::array<uint32_t, DL_MAX_CELLS_PER_SLOT> start_index_pdsch_fh_params = {};
+    std::array<uint16_t, DL_MAX_CELLS_PER_SLOT> start_index_pdsch_fh_params = {};
     //Number of PDSCH PDU's per Cell
     std::array<uint8_t, DL_MAX_CELLS_PER_SLOT> num_pdsch_fh_params = {};
     //Total Number of PDSCH PDUs across all the Cells
     uint32_t total_num_pdsch_pdus = {};
-    
-    std::array<csirs_fh_prepare_params, DL_MAX_CELLS_PER_SLOT> csirs_fh_params = {}; 
-    std::array<uint8_t, DL_MAX_CELLS_PER_SLOT> is_csirs_cell = {}; 
 
-    uint32_t num_csirs_cell = {}; 
+    std::array<csirs_fh_prepare_params, DL_MAX_CELLS_PER_SLOT> csirs_fh_params = {};
+    std::array<uint8_t, DL_MAX_CELLS_PER_SLOT> is_csirs_cell = {};
+
+    uint32_t num_csirs_cell = {};
     void reset()
     {
         for (int idx = 0; idx < total_num_pdsch_pdus; ++idx) {
-            pdsch_fh_prepare_params &params = pdsch_fh_params.at(idx);
-            params.pc_bf.num_prgs = 0;
-            params.pc_bf.dig_bf_interfaces = 0;
+            auto &params = pc_bf_arr.at(idx);
+            params.num_prgs = 0;
+            params.dig_bf_interfaces = 0;
         }
         for (int cell = 0; cell < DL_MAX_CELLS_PER_SLOT; ++cell) {
             is_csirs_cell[cell] = 0;
@@ -1914,7 +1656,7 @@ struct pm_group {
     uint16_t nCacheEntries;
     bool precoding_enabled;
 
-    explicit pm_group(bool enablePc, uint16_t max_cells = 1):
+    explicit pm_group(bool enablePc, [[maybe_unused]] uint16_t max_cells = 1):
     nPmPdcch(0),
     nPmPbch(0),
     nPmCsirs(0),
@@ -1958,7 +1700,7 @@ struct cell_group_command
     channel_vec channels;
     uint8_t channel_array_size;
     fh_prepare_callback_params fh_params;
-    explicit cell_group_command():
+    cell_group_command():
     pusch(std::make_unique<pusch_params>()),
     pdsch(std::make_unique<pdsch_params>()),
     pdcch(std::make_unique<pdcch_group_params>()),
@@ -1974,98 +1716,64 @@ struct cell_group_command
         reset();
     }
 
-    cell_group_command(cell_group_command&& other):
-        pusch(std::move(other.pusch)),
-        pdsch(std::move(other.pdsch)),
-        pucch(std::move(other.pucch)),
-        csirs(std::move(other.csirs)),
-        pdcch(std::move(other.pdcch)),
-        prach(std::move(other.prach)),
-        pbch(std::move(other.pbch)),
-        srs(std::move(other.srs)),
-        pmWeights(std::move(other.pmWeights)),
-        bfw(std::move(other.bfw)),
-        channel_idx(std::move(other.channel_idx)),
-        channels(other.channels),
-        slot(std::move(other.slot)),
-        fh_params(std::move(other.fh_params)),
-        channel_array_size(std::move(other.channel_array_size))
-    {
-    }
+    cell_group_command(const cell_group_command&) = delete;
+    cell_group_command& operator=(const cell_group_command&) = delete;
 
-    cell_group_command& operator=(cell_group_command&& other) {
-        if (&other == this) {
-            return *this;
-        }
-        pusch = std::move(other.pusch);
-        pdsch = std::move(other.pdsch);
-        pucch = std::move(other.pucch);
-        csirs = std::move(other.csirs);
-        pdcch = std::move(other.pdcch);
-        prach = std::move(other.prach);
-        pbch = std::move(other.pbch);
-        srs = std::move(other.srs);
-        pmWeights = std::move(other.pmWeights);
-        channels = std::move(other.channels);
-        channel_idx = std::move(other.channel_idx);
-        slot = std::move(other.slot);
-        fh_params = std::move(other.fh_params);
-        channel_array_size = std::move(other.channel_array_size);
-        return *this;
-    }
+    cell_group_command(cell_group_command&&) = default;
+    cell_group_command& operator=(cell_group_command&&) = default;
 
-    pusch_params* get_pusch_params()
+    [[nodiscard]] pusch_params* get_pusch_params()
     {
         create_if(channel_type::PUSCH);
         return pusch.get();
     }
 
-    pdsch_params* get_pdsch_params()
+    [[nodiscard]] pdsch_params* get_pdsch_params()
     {
         create_if(channel_type::PDSCH);
         return pdsch.get();
     }
 
-    pucch_params* get_pucch_params()
+    [[nodiscard]] pucch_params* get_pucch_params()
     {
         create_if(channel_type::PUCCH);
         return pucch.get();
     }
 
-    csirs_params* get_csirs_params()
+    [[nodiscard]] csirs_params* get_csirs_params()
     {
         create_if(channel_type::CSI_RS);
         return csirs.get();
     }
 
-    pdcch_group_params * get_pdcch_params() {
+    [[nodiscard]] pdcch_group_params * get_pdcch_params() {
         create_if(channel_type::PDCCH_DL);
         return pdcch.get();
     }
 
-    prach_params* get_prach_params() {
+    [[nodiscard]] prach_params* get_prach_params() {
         create_if(channel_type::PRACH);
         return prach.get();
     }
 
-    pbch_group_params * get_pbch_params() {
+    [[nodiscard]] pbch_group_params * get_pbch_params() {
         create_if(channel_type::PBCH);
         return pbch.get();
     }
 
-    srs_params* get_srs_params()
+    [[nodiscard]] srs_params* get_srs_params()
     {
         create_if(channel_type::SRS);
         return srs.get();
     }
 
-    bfw_params* get_bfw_params()
+    [[nodiscard]] bfw_params* get_bfw_params()
     {
         create_if(channel_type::BFW);
         return bfw.get();
     }
 
-    void create_if(channel_type chType)
+    void create_if(const channel_type chType)
     {
         auto index = channel_idx[chType];
         if (index == channel_type::NONE)
@@ -2075,44 +1783,7 @@ struct cell_group_command
             index = channel_array_size - 1;
             channel_idx[chType] = index;
 
-            switch(chType)
-            {
-                // {
-                //     pusch.reset(new pusch_params);
-                // }
-                // break;
-                // case channel_type::PDSCH:
-                // {
-                //     pdsch.reset(new pdsch_params);
-                // }
-                // break;
-                // case channel_type::PUCCH:
-                // {
-                //     pucch.reset(new pucch_params);
-                // }
-		//        break;
-                // case channel_type::PDCCH_DL:
-                // case channel_type::PDCCH_UL: {
-                //     pdcch.reset(new pdcch_group_params);
-                // }
-                // break;
-                //case channel_type::PRACH: {
-                //    prach.reset(new prach_params);
-                //}
-                //break;
-                //case channel_type::CSI_RS:
-                //{
-                //    csirs.reset(new csirs_params);
-                //}
-                //break;
-                // case channel_type::PBCH:
-                // {
-                //     pbch.reset(new pbch_group_params);
-                // }
-                //break;
-                default:
-                break;
-            }
+            // All channel params are eagerly allocated in constructor; create_if only registers the channel, no lazy allocation needed.
         }
     }
 
@@ -2151,7 +1822,7 @@ struct cell_group_command
         }
     }
 
-    pm_group* get_pm_group() {
+    [[nodiscard]] pm_group* get_pm_group() {
         return pmWeights.get();
     }
 };
@@ -2187,9 +1858,15 @@ struct ul_output_msg_buffer
     std::vector<uint32_t> tb_offset;
 };
 
-using ul_alloc_buffer = std::function<void (ul_output_msg_buffer&, const pusch_params&  )>;
+using ul_alloc_buffer = void (*)(void* context, ul_output_msg_buffer&, const pusch_params&);
 // need more info for RNTIS for which TB are generated and TB offsets if multiple TB are generated
-using ul_slot_callback = std::function<void (uint32_t nCrc, ul_output_msg_buffer&, const slot_indication&, const pusch_params&, ::cuphyPuschDataOut_t const*, ::cuphyPuschStatPrms_t const*)>;
+using ul_slot_callback = void (*)(void* context,
+                                   uint32_t nCrc,
+                                   ul_output_msg_buffer&,
+                                   const slot_indication&,
+                                   const pusch_params&,
+                                   ::cuphyPuschDataOut_t const*,
+                                   ::cuphyPuschStatPrms_t const*);
 
 /*using ul_prach_callback = std::function<void ( slot_command_api::slot_indication&,
                                                const prach_params& params,
@@ -2201,73 +1878,114 @@ using ul_slot_callback = std::function<void (uint32_t nCrc, ul_output_msg_buffer
                                             const void* rssi)>; */
 
 //Change
-using ul_prach_callback = std::function<void ( slot_command_api::slot_indication&,
-                                               const prach_params& params,
-                                            const uint32_t* num_detectedPrmb,
-                                            const void* prmbIndex_estimates,
-                                            const void* prmbDelay_estimates,
-                                            const void* prmbPower_estimates,
-                                            const void* ant_rssi,
-                                            const void* rssi,
-                                            const void* interference)>;
+using ul_prach_callback = void (*)(void* context,
+                                   slot_command_api::slot_indication&,
+                                   const prach_params& params,
+                                   const uint32_t* num_detectedPrmb,
+                                   const void* prmbIndex_estimates,
+                                   const void* prmbDelay_estimates,
+                                   const void* prmbPower_estimates,
+                                   const void* ant_rssi,
+                                   const void* rssi,
+                                   const void* interference);
 
-using ul_uci_callback = std::function<void (slot_indication&,
-                                            const pucch_params&,
-                                            const uci_output_params&)>;
+using ul_uci_callback = void (*)(void* context,
+                                 slot_indication&,
+                                 const pucch_params&,
+                                 const uci_output_params&);
 
-using ul_uci_callback2 = std::function<void (slot_indication&,
-                                            const pucch_params&,
-                                            const cuphyPucchDataOut_t&)>;
-using ul_uci_early_callback = std::function<void (const slot_indication&, const pusch_params&, ::cuphyPuschDataOut_t const*, ::cuphyPuschStatPrms_t const*, nanoseconds t0_original)>;
-using ul_srs_callback = std::function<void ( ul_output_msg_buffer&,
-                                             const slot_indication&,
-                                             const srs_params&,
-                                             ::cuphySrsDataOut_t const*,
-                                             ::cuphySrsStatPrms_t const*,
-                                             const std::array<bool,UL_MAX_CELLS_PER_SLOT>&)>;
-using ul_free_harq_buffer = std::function<void(const ReleasedHarqBufferInfo& freed_harq_buffer_data, slot_command_api::pusch_params* params, uint16_t sfn, uint16_t slot)>;
+using ul_uci_callback2 = void (*)(void* context,
+                                  slot_indication&,
+                                  const pucch_params&,
+                                  const cuphyPucchDataOut_t&);
+using ul_uci_early_callback = void (*)(void* context,
+                                       const slot_indication&,
+                                       const pusch_params&,
+                                       ::cuphyPuschDataOut_t const*,
+                                       ::cuphyPuschStatPrms_t const*,
+                                       nanoseconds t0_original);
+using ul_srs_callback = void (*)(void* context,
+                                 ul_output_msg_buffer&,
+                                 const slot_indication&,
+                                 const srs_params&,
+                                 ::cuphySrsDataOut_t const*,
+                                 ::cuphySrsStatPrms_t const*,
+                                 const std::array<bool,UL_MAX_CELLS_PER_SLOT>&);
+using ul_free_harq_buffer = void (*)(void* context,
+                                     const ReleasedHarqBufferInfo& freed_harq_buffer_data,
+                                     slot_command_api::pusch_params* params,
+                                     uint16_t sfn,
+                                     uint16_t slot);
 
-using fh_done_using_bfw_coeff_buffer = std::function<void(uint8_t*)>;
+using fh_done_using_bfw_coeff_buffer = void (*)(void* context, uint8_t*);
 
-using fh_done_using_static_bfw_coeff_buffer = std::function<void(uint8_t*)>;
+using fh_done_using_static_bfw_coeff_buffer = void (*)(void* context, uint8_t*);
 
-using ul_tx_error = std::function<void(const slot_command_api::slot_indication&,uint16_t,uint16_t,std::array<uint32_t,UL_MAX_CELLS_PER_SLOT>&,uint8_t,bool)>;
+using ul_tx_error = void (*)(void* context,
+                             const slot_command_api::slot_indication&,
+                             uint16_t,
+                             uint16_t,
+                             std::array<uint32_t,UL_MAX_CELLS_PER_SLOT>&,
+                             uint8_t,
+                             bool);
 
 struct ul_slot_callbacks
 {
     /// Unused
     ul_alloc_buffer alloc_fn;
+    void* alloc_fn_context{};  //!< Context pointer for alloc_fn
     ul_slot_callback callback_fn;
+    void* callback_fn_context{};  //!< Context pointer for callback_fn
     ul_prach_callback prach_cb_fn;
+    void* prach_cb_context{};  //!< Context pointer for prach_cb_fn
     /// Used only for gNB - Harq indication
     // No support for SR and CSI
     ul_uci_callback uci_cb_fn;
+    void* uci_cb_context{};  //!< Context pointer for uci_cb_fn
     ul_uci_callback2 uci_cb_fn2;
+    void* uci_cb_fn2_context{};  //!< Context pointer for uci_cb_fn2
     ul_uci_early_callback callback_fn_early_uci;
+    void* callback_fn_early_uci_context{};  //!< Context pointer for callback_fn_early_uci
     ul_srs_callback srs_cb_fn;
+    void* srs_cb_context{};  //!< Context pointer for srs_cb_fn
     fh_done_using_bfw_coeff_buffer fh_bfw_coeff_usage_done_fn;
-    ul_tx_error         ul_tx_error_fn;
+    void* fh_bfw_coeff_usage_done_fn_context{};  //!< Context pointer for fh_bfw_coeff_usage_done_fn
+    ul_tx_error ul_tx_error_fn;
+    void* ul_tx_error_fn_context{};  //!< Context pointer for ul_tx_error_fn
     ul_free_harq_buffer ul_free_harq_buffer_fn;
+    void* ul_free_harq_buffer_fn_context{};  //!< Context pointer for ul_free_harq_buffer_fn
 };
 
 // may need more changes
-using dl_slot_callback = std::function<void(const slot_command_api::pdsch_params*)>;
+using dl_slot_callback = void (*)(void* context, const slot_command_api::pdsch_params*);
 
 
-using fh_prepare_callback = std::function<void(slot_command_api::cell_group_command*, uint8_t /* cell_id */)>;
+using fh_prepare_callback = void (*)(void* context,
+                                     slot_command_api::cell_group_command*,
+                                     uint8_t /* cell_id */);
 
-using dl_tx_error = std::function<void(const slot_command_api::slot_indication&,uint16_t,uint16_t,std::array<uint32_t,DL_MAX_CELLS_PER_SLOT>&,uint8_t)>;
+using dl_tx_error = void (*)(void* context,
+                             const slot_command_api::slot_indication&,
+                             uint16_t,
+                             uint16_t,
+                             std::array<uint32_t,DL_MAX_CELLS_PER_SLOT>&,
+                             uint8_t);
 
 using l1_exit_error = std::function<void(uint16_t,uint16_t,std::array<uint32_t,DL_MAX_CELLS_PER_SLOT>&,uint8_t)>;
 
 struct dl_slot_callbacks
 {
     dl_slot_callback callback_fn;
+    void* callback_fn_context{};  //!< Context pointer for callback_fn
+
     fh_prepare_callback fh_prepare_callback_fn;
+    void* fh_prepare_callback_fn_context{};  //!< Context pointer for fh_prepare_callback_fn
     fh_prepare_callback_params fh_prepare_cb_prms;
     fh_done_using_bfw_coeff_buffer fh_bfw_coeff_usage_done_fn;
-    dl_tx_error         dl_tx_error_fn;
-    l1_exit_error       l1_exit_error_fn;
+    void* fh_bfw_coeff_usage_done_fn_context{};  //!< Context pointer for fh_bfw_coeff_usage_done_fn
+    dl_tx_error dl_tx_error_fn;
+    void* dl_tx_error_fn_context{};  //!< Context pointer for dl_tx_error_fn
+    l1_exit_error l1_exit_error_fn;
 };
 
 struct callbacks {

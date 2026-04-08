@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,8 @@ namespace puschRx_rssi
 {
 // #define ENABLE_PROFILING
 // #define ENABLE_DEBUG
+
+/*VCAST_DONT_INSTRUMENT_START*/
 
 static constexpr uint32_t N_THREADS_PER_WARP                = 32;
 
@@ -213,6 +215,7 @@ __device__ __forceinline__
     }
     return sum;
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 // FAPI requirement: "RSSI reported will be total received power summed across all antennas".
 // Average across allocated PRBs and measured symbols. Sum across Rx antennas
@@ -1369,7 +1372,7 @@ __global__ void sinrMeasEarlyHarqKernel_v1(puschRxRsrpDynDescr_t* pDynDescr)
 
 
 
-
+/*VCAST_DONT_INSTRUMENT_START*/
  // Using memcpy_async to load channel estimates from shared memory
  // @todo: using this version results in large (v2 is 10x versus v1) kernel runtimes and large launch latency. To be debugged
 template <typename TStorageIn,
@@ -1698,6 +1701,7 @@ __global__ void rsrpMeasKernel_v2(puschRxRsrpDynDescr_t* pDynDescr)
         }
     } 
  }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 template<typename TCompute,
          uint32_t THRD_GRP_TILE_SIZE,            // # of threads in a thread group tile

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,13 +47,13 @@ __device__ void calLosAngleGPU(const CellParam& cellParam, const UtParam& utPara
                               float d_3d, float& phi_los_aod, float& phi_los_aoa,
                               float& theta_los_zod, float& theta_los_zoa);
 
-__device__ float calLosProbGPU(Scenario scenario, float d_2d_out, float h_ut, const float force_los_prob[2], uint8_t outdoor_ind);
+__device__ float calLosProbGPU(Scenario scenario, float d_2d_out, float h_ut, const float force_los_prob[2], uint8_t outdoor_ind, bool is_aerial = false);
 
 // Forward declaration of normalization kernel
 __global__ void normalizeCRNGridsKernel(float** crnGrids, uint32_t totalElements, int numGrids);
 
 __device__ float calPLGPU(const CellParam& cellParam, const UtParam& utParam, Scenario scenario,
-                         float fc, bool isLos, bool optionalPlInd, curandState* state);
+                         float fc, bool isLos, bool optionalPlInd, curandState* state, bool is_aerial = false);
 
 __device__ float calPenetrLosGPU(Scenario scenario, uint8_t outdoor_ind, float fc,
                                 float d_2d_in, uint8_t o2i_building_penetr_loss_ind,
@@ -127,18 +127,23 @@ __global__ void calLinkParamKernel(
                                    threadIdx.x;
     curandState localState = curandStates[globalThreadId];
     
+    // Check if this is an aerial UE (used for LOS probability and path loss)
+    bool is_aerial = (utParams[ueIdx].ue_type == UeType::AERIAL);
+    
     // Calculate LOS probability and determine LOS/NLOS
     // Only regenerate LOS indicator when updateLosState is true (at start or after reset)
     // According to 3GPP TR 38.901, LOS/NLOS state should remain constant during a drop
+    // For aerial UEs, use 3GPP TR 36.777 Table B-1 LOS probability
     if (updateLosState) {
-        float losProb = calLosProbGPU(sysConfig->scenario, d_2d_out, utParams[ueIdx].loc.z, sysConfig->force_los_prob, utParams[ueIdx].outdoor_ind);
+        float losProb = calLosProbGPU(sysConfig->scenario, d_2d_out, utParams[ueIdx].loc.z, sysConfig->force_los_prob, utParams[ueIdx].outdoor_ind, is_aerial);
         linkParams[linkIdx].losInd = (curand_uniform(&localState) <= losProb) ? 1 : 0;
     }
 
     // Calculate path loss (always needed for mode 1 and 2)
+    // For aerial UEs, use 3GPP TR 36.777 Table B-2 path loss models
     if (updatePLAndPenetrationLoss || updateAllLSPs) {
         float pl = calPLGPU(cellParams[siteIdx * nSectorPerSite], utParams[ueIdx], sysConfig->scenario,
-                            simConfig->center_freq_hz / 1e9, linkParams[linkIdx].losInd, false, &localState);
+                            simConfig->center_freq_hz / 1e9, linkParams[linkIdx].losInd, false, &localState, is_aerial);
         
         // Use pre-calculated O2I penetration loss from UE parameters
         // Per 3GPP TR 38.901 Section 7.4.3: O2I is UT-specifically generated, same for ALL BSs
@@ -368,6 +373,26 @@ __global__ void calLinkParamKernel(
         sigma = cmnLinkParams->sigma_lgZSA[lspIdx];
         float zsa_temp = powf(10.0f, corrVars[ZSA_IDX] * sigma + mu);
         linkParams[linkIdx].ZSA = fminf(zsa_temp, 52.0f);  // Limit to 52 degrees
+
+        // 8. Delta Tau (Excess Delay) per 3GPP TR 38.901 Table 7.6.9-1
+        if (sysConfig->enable_propagation_delay == 1) {
+            if (isLos) {
+                linkParams[linkIdx].delta_tau = 0.0f;
+            } else {
+                float mu_lg_dt, sigma_lg_dt;
+                switch (sysConfig->scenario) {
+                    case Scenario::UMi:  mu_lg_dt = -7.5f;  sigma_lg_dt = 0.5f;  break;
+                    case Scenario::UMa:  mu_lg_dt = -7.4f;  sigma_lg_dt = 0.2f;  break;
+                    case Scenario::RMa:  mu_lg_dt = -8.33f; sigma_lg_dt = 0.26f; break;
+                    default:             mu_lg_dt = -7.5f;  sigma_lg_dt = 0.5f;  break;
+                }
+                float r_DT = curand_normal(&localState);
+                float lg_delta_tau = mu_lg_dt + sigma_lg_dt * r_DT;
+                linkParams[linkIdx].delta_tau = powf(10.0f, lg_delta_tau);
+            }
+        } else {
+            linkParams[linkIdx].delta_tau = 0.0f;
+        }
     }
     
     // Store updated curandState back to global memory
@@ -487,7 +512,7 @@ __device__ void calLosAngleGPU(const CellParam& cellParam, const UtParam& utPara
     theta_los_zoa = 180.0f - theta_los_zod;  // ZOA is complementary to ZOD
 }
 
-__device__ float calLosProbGPU(Scenario scenario, float d_2d_out, float h_ut, const float force_los_prob[2], uint8_t outdoor_ind) {
+__device__ float calLosProbGPU(Scenario scenario, float d_2d_out, float h_ut, const float force_los_prob[2], uint8_t outdoor_ind, bool is_aerial) {
     // Check if force_los_prob should be used instead of 3GPP calculations
     // force_los_prob[0] for indoor UTs, force_los_prob[1] for outdoor UEs
     float forced_prob = outdoor_ind ? force_los_prob[1] : force_los_prob[0];
@@ -495,37 +520,119 @@ __device__ float calLosProbGPU(Scenario scenario, float d_2d_out, float h_ut, co
         return forced_prob;  // Use forced value instead of 3GPP calculation
     }
     
-    // Use standard 3GPP LOS probability calculations
+    // Use 3GPP LOS probability calculations
+    // For aerial UEs: 3GPP TR 36.777 Table B-1
+    // For terrestrial UEs: 3GPP TR 38.901 Table 7.4.2-1
     float losProb = 0.0f;
     
-    switch (scenario) {
-        case Scenario::UMa:
-            assert(h_ut <= 23.0f && "UE height must be less than 23m");
-            if (d_2d_out <= 18.0f) {
-                losProb = 1.0f;
-            } else {
-                float c_prime = h_ut <= 13.0f ? 0.0f : powf((h_ut - 13.0f) / 10.0f, 1.5f);
-                losProb = ((18.0f / d_2d_out) + expf(-d_2d_out / 63.0f) * (1.0f - 18.0f / d_2d_out)) *
-                         (1.0f + c_prime * 5.0f / 4.0f * powf(d_2d_out / 100.0f, 3.0f) * expf(-d_2d_out / 150.0f));
-            }
-            break;
-        case Scenario::UMi:
-            if (d_2d_out <= 18.0f) {
-                losProb = 1.0f;
-            } else {
-                losProb = (18.0f / d_2d_out) + expf(-d_2d_out / 36.0f) * (1.0f - 18.0f / d_2d_out);
-            }
-            break;
-        case Scenario::RMa:
-            if (d_2d_out <= 10.0f) {
-                losProb = 1.0f;
-            } else {
-                losProb = expf(-(d_2d_out - 10.0f) / 1000.0f);
-            }
-            break;
-        default:
-            assert(false && "Unknown scenario");
-            break;
+    if (is_aerial) {
+        // Aerial UE LOS probability per 3GPP TR 36.777 Table B-1
+        // P_LOS = 1 if d_2D <= d_1
+        // P_LOS = d_1/d_2D + exp(-d_2D/p_1) * (1 - d_1/d_2D) if d_2D > d_1
+        float d1 = 18.0f;
+        float p1 = 1000.0f;
+        
+        switch (scenario) {
+            case Scenario::RMa:
+                if (h_ut <= 10.0f) {
+                    // h_UT ≤ 10m: Use TR 38.901 RMa P_LOS (terrestrial formula)
+                    if (d_2d_out <= 10.0f) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = expf(-(d_2d_out - 10.0f) / 1000.0f);
+                    }
+                } else if (h_ut <= 40.0f) {
+                    // 10m < h_UT ≤ 40m: Use aerial formula
+                    d1 = fmaxf(1350.8f * log10f(h_ut) - 1602.0f, 18.0f);
+                    p1 = fmaxf(15021.0f * log10f(h_ut) - 16053.0f, 1000.0f);
+                    if (d_2d_out <= d1) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = (d1 / d_2d_out) + expf(-d_2d_out / p1) * (1.0f - d1 / d_2d_out);
+                    }
+                } else {
+                    // h_UT > 40m: 100% LOS
+                    losProb = 1.0f;
+                }
+                break;
+            case Scenario::UMa:
+                if (h_ut <= 22.5f) {
+                    // h_UT ≤ 22.5m: Use TR 38.901 UMa P_LOS (terrestrial formula)
+                    if (d_2d_out <= 18.0f) {
+                        losProb = 1.0f;
+                    } else {
+                        float c_prime = h_ut <= 13.0f ? 0.0f : powf((h_ut - 13.0f) / 10.0f, 1.5f);
+                        losProb = ((18.0f / d_2d_out) + expf(-d_2d_out / 63.0f) * (1.0f - 18.0f / d_2d_out)) *
+                                 (1.0f + c_prime * 5.0f / 4.0f * powf(d_2d_out / 100.0f, 3.0f) * expf(-d_2d_out / 150.0f));
+                    }
+                } else if (h_ut <= 100.0f) {
+                    // 22.5m < h_UT ≤ 100m: Use aerial formula
+                    d1 = fmaxf(460.0f * log10f(h_ut) - 700.0f, 18.0f);
+                    p1 = 4300.0f * log10f(h_ut) - 3800.0f;
+                    if (d_2d_out <= d1) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = (d1 / d_2d_out) + expf(-d_2d_out / p1) * (1.0f - d1 / d_2d_out);
+                    }
+                } else {
+                    // h_UT > 100m: 100% LOS
+                    losProb = 1.0f;
+                }
+                break;
+            case Scenario::UMi:
+                if (h_ut <= 22.5f) {
+                    // h_UT ≤ 22.5m: Use TR 38.901 UMi P_LOS (terrestrial formula)
+                    if (d_2d_out <= 18.0f) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = (18.0f / d_2d_out) + expf(-d_2d_out / 36.0f) * (1.0f - 18.0f / d_2d_out);
+                    }
+                } else {
+                    // 22.5m < h_UT ≤ 300m: Use aerial formula
+                    d1 = fmaxf(294.05f * log10f(h_ut) - 432.94f, 18.0f);
+                    p1 = 233.98f * log10f(h_ut) - 0.95f;
+                    if (d_2d_out <= d1) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = (d1 / d_2d_out) + expf(-d_2d_out / p1) * (1.0f - d1 / d_2d_out);
+                    }
+                }
+                break;
+            default:
+                assert(false && "Unknown scenario");
+                break;
+        }
+    } else {
+        // Terrestrial UE LOS probability per 3GPP TR 38.901 Table 7.4.2-1
+        switch (scenario) {
+            case Scenario::UMa:
+                assert(h_ut <= 23.0f && "UE height must be less than 23m for terrestrial UMa");
+                if (d_2d_out <= 18.0f) {
+                    losProb = 1.0f;
+                } else {
+                    float c_prime = h_ut <= 13.0f ? 0.0f : powf((h_ut - 13.0f) / 10.0f, 1.5f);
+                    losProb = ((18.0f / d_2d_out) + expf(-d_2d_out / 63.0f) * (1.0f - 18.0f / d_2d_out)) *
+                             (1.0f + c_prime * 5.0f / 4.0f * powf(d_2d_out / 100.0f, 3.0f) * expf(-d_2d_out / 150.0f));
+                }
+                break;
+            case Scenario::UMi:
+                if (d_2d_out <= 18.0f) {
+                    losProb = 1.0f;
+                } else {
+                    losProb = (18.0f / d_2d_out) + expf(-d_2d_out / 36.0f) * (1.0f - 18.0f / d_2d_out);
+                }
+                break;
+            case Scenario::RMa:
+                if (d_2d_out <= 10.0f) {
+                    losProb = 1.0f;
+                } else {
+                    losProb = expf(-(d_2d_out - 10.0f) / 1000.0f);
+                }
+                break;
+            default:
+                assert(false && "Unknown scenario");
+                break;
+        }
     }
     return losProb;
 }
@@ -578,8 +685,80 @@ __device__ float calculateRMaLosPathlossGPU(float d_2d, float d_3d, float h_bs, 
     return pl;
 }
 
+// ============================================================================
+// Aerial UE Path Loss Functions (3GPP TR 36.777 Table B-2) - GPU versions
+// Height-dependent formulas with applicability ranges
+// ============================================================================
+
+// Common term: 20*log10(40*π*fc/3) where fc is in GHz
+// = 20*log10(40*π/3) + 20*log10(fc) ≈ 32.44 + 20*log10(fc)
+__device__ float calcFreqTermGPU(float fc) {
+    const float CONST_TERM = 32.44f;  // 20*log10(40*π/3)
+    return CONST_TERM + 20.0f * log10f(fc);
+}
+
+// RMa-AV LOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (10m, 300m], d_2D ≤ 10km:
+// PL = max(23.9 - 1.8*log10(h_UT), 20) * log10(d_3D) + 20*log10(40πfc/3)
+__device__ float calculateRMaAvLosPathlossGPU(float d_3d, float h_ut, float fc) {
+    h_ut = fminf(fmaxf(h_ut, 10.001f), 300.0f);  // Clamp to valid range (10m, 300m]
+    float n = fmaxf(23.9f - 1.8f * log10f(h_ut), 20.0f);
+    return n * log10f(d_3d) + calcFreqTermGPU(fc);
+}
+
+// RMa-AV NLOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (10m, 300m], d_2D ≤ 10km:
+// PL = max(PL_RMa-AV-LOS, -12 + (35 - 5.3*log10(h_UT))*log10(d_3D) + 20*log10(40πfc/3))
+__device__ float calculateRMaAvNlosPathlossGPU(float d_3d, float h_ut, float fc) {
+    h_ut = fminf(fmaxf(h_ut, 10.001f), 300.0f);  // Clamp to valid range (10m, 300m]
+    float pl_los = calculateRMaAvLosPathlossGPU(d_3d, h_ut, fc);
+    float n = 35.0f - 5.3f * log10f(h_ut);
+    float pl_nlos = -12.0f + n * log10f(d_3d) + calcFreqTermGPU(fc);
+    return fmaxf(pl_los, pl_nlos);
+}
+
+// UMa-AV LOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (22.5m, 300m], d_2D ≤ 4km:
+// PL = 28.0 + 22*log10(d_3D) + 20*log10(fc)
+__device__ float calculateUMaAvLosPathlossGPU(float d_3d, float fc) {
+    return 28.0f + 22.0f * log10f(d_3d) + 20.0f * log10f(fc);
+}
+
+// UMa-AV NLOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (10m, 100m], d_2D ≤ 4km:
+// PL = -17.5 + (46 - 7*log10(h_UT))*log10(d_3D) + 20*log10(40πfc/3)
+__device__ float calculateUMaAvNlosPathlossGPU(float d_3d, float h_ut, float fc) {
+    h_ut = fminf(fmaxf(h_ut, 10.001f), 300.0f);  // Clamp to valid range to avoid -inf/NaN from log10f(h_ut)
+    float n = 46.0f - 7.0f * log10f(h_ut);
+    return -17.5f + n * log10f(d_3d) + calcFreqTermGPU(fc);
+}
+
+// UMi-AV LOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (22.5m, 300m], d_2D ≤ 4km:
+// PL = max{PL', 30.9 + (22.25 - 0.5*log10(h_UT))*log10(d_3D) + 20*log10(fc)}
+// where PL' is free space path loss
+__device__ float calculateUMiAvLosPathlossGPU(float d_3d, float h_ut, float fc) {
+    h_ut = fminf(fmaxf(h_ut, 10.001f), 300.0f);  // Clamp to valid range to avoid -inf/NaN from log10f(h_ut)
+    // Free space path loss: PL' = 32.4 + 20*log10(d_3D) + 20*log10(fc)
+    float pl_fspl = 32.4f + 20.0f * log10f(d_3d) + 20.0f * log10f(fc);
+    float n = 22.25f - 0.5f * log10f(h_ut);
+    float pl_av = 30.9f + n * log10f(d_3d) + 20.0f * log10f(fc);
+    return fmaxf(pl_fspl, pl_av);
+}
+
+// UMi-AV NLOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (22.5m, 300m], d_2D ≤ 4km:
+// PL = max{PL_UMi-AV-LOS, 32.4 + (43.2 - 7.6*log10(h_UT))*log10(d_3D) + 20*log10(fc)}
+__device__ float calculateUMiAvNlosPathlossGPU(float d_3d, float h_ut, float fc) {
+    h_ut = fminf(fmaxf(h_ut, 10.001f), 300.0f);  // Clamp to valid range to avoid -inf/NaN from log10f(h_ut)
+    float pl_los = calculateUMiAvLosPathlossGPU(d_3d, h_ut, fc);
+    float n = 43.2f - 7.6f * log10f(h_ut);
+    float pl_nlos = 32.4f + n * log10f(d_3d) + 20.0f * log10f(fc);
+    return fmaxf(pl_los, pl_nlos);
+}
+
 __device__ float calPLGPU(const CellParam& cellParam, const UtParam& utParam, Scenario scenario,
-                         float fc, bool isLos, bool optionalPlInd, curandState* state) {
+                         float fc, bool isLos, bool optionalPlInd, curandState* state, bool is_aerial) {
     float d_3d = sqrtf((cellParam.loc.x - utParam.loc.x)*(cellParam.loc.x - utParam.loc.x) +
                        (cellParam.loc.y - utParam.loc.y)*(cellParam.loc.y - utParam.loc.y) +
                        (cellParam.loc.z - utParam.loc.z)*(cellParam.loc.z - utParam.loc.z));
@@ -589,28 +768,49 @@ __device__ float calPLGPU(const CellParam& cellParam, const UtParam& utParam, Sc
     
     float h_bs = cellParam.loc.z;
     float h_ut = utParam.loc.z;
+    if (is_aerial) {
+        h_ut = fminf(fmaxf((isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 300.0f);
+    }
     
     float pl = 0.0f;
     
+    // ========================================================================
+    // 3GPP TR 36.777 Table B-2: Height-dependent path loss for aerial UEs
+    // Falls back to TR 38.901 for low heights (terrestrial-like behavior)
+    // ========================================================================
+    
     if (isLos) {
-        // LOS path loss calculation
         switch (scenario) {
+            case Scenario::RMa:
+                // RMa-AV LOS: h_UT ≤ 10m → terrestrial; h_UT > 10m → aerial
+                if (is_aerial && h_ut > 10.0f) {
+                    pl = calculateRMaAvLosPathlossGPU(d_3d, h_ut, fc);
+                } else {
+                    pl = calculateRMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
+                }
+                break;
             case Scenario::UMa:
-                pl = calculateUMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc, state);
+                // UMa-AV LOS: h_UT ≤ 22.5m → terrestrial; h_UT > 22.5m → aerial
+                if (is_aerial && h_ut > 22.5f) {
+                    pl = calculateUMaAvLosPathlossGPU(d_3d, fc);
+                } else {
+                    pl = calculateUMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc, state);
+                }
                 break;
             case Scenario::UMi:
-                pl = calculateUMiLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
-                break;
-            case Scenario::RMa:
-                pl = calculateRMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
+                // UMi-AV LOS: h_UT ≤ 22.5m → terrestrial; h_UT > 22.5m → aerial
+                if (is_aerial && h_ut > 22.5f) {
+                    pl = calculateUMiAvLosPathlossGPU(d_3d, h_ut, fc);
+                } else {
+                    pl = calculateUMiLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
+                }
                 break;
             default:
-                break; // Error handling should be added
+                break;
         }
     } else {
-        // NLOS path loss calculation
         if (optionalPlInd) {
-            // Optional path loss model
+            // Optional NLOS formulas (simplified, not height-dependent)
             switch (scenario) {
                 case Scenario::UMa:
                     pl = 32.4f + 20.0f * log10f(fc) + 30.0f * log10f(d_3d);
@@ -619,34 +819,49 @@ __device__ float calPLGPU(const CellParam& cellParam, const UtParam& utParam, Sc
                     pl = 32.4f + 20.0f * log10f(fc) + 31.9f * log10f(d_3d);
                     break;
                 case Scenario::RMa:
-                    // RMa does not support optional pathloss model
-                    pl = calculateRMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc); // Fallback to LOS
+                    // RMa does not support optional pathloss model, fallback to LOS
+                    pl = calculateRMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
                     break;
                 default:
                     break;
             }
         } else {
-            // Standard NLOS path loss model
+            // NLOS path loss per TR 36.777 Table B-2 (aerial) or TR 38.901 (terrestrial)
             switch (scenario) {
+                case Scenario::RMa: {
+                    // RMa-AV NLOS: h_UT ≤ 10m → terrestrial; h_UT > 10m → aerial
+                    if (is_aerial && h_ut > 10.0f) {
+                        pl = calculateRMaAvNlosPathlossGPU(d_3d, h_ut, fc);
+                    } else {
+                        float los_pl = calculateRMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
+                        const float W = 20.0f;
+                        const float h = 5.0f;
+                        float nlos_pl = 161.04f - 7.1f * log10f(W) + 7.5f * log10f(h) - 
+                                      (24.37f - 3.7f * powf(h/h_bs, 2)) * log10f(h_bs) + 
+                                      (43.42f - 3.1f * log10f(h_bs)) * (log10f(d_3d) - 3.0f) + 
+                                      20.0f * log10f(fc) - (3.2f * powf(log10f(11.75f * h_ut), 2) - 4.97f);
+                        pl = fmaxf(los_pl, nlos_pl);
+                    }
+                    break;
+                }
                 case Scenario::UMa: {
-                    float los_pl = calculateUMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc, state);
-                    pl = fmaxf(los_pl, 13.54f + 39.08f * log10f(d_3d) + 20.0f * log10f(fc) - 0.6f * (h_ut - 1.5f));
+                    // UMa-AV NLOS: h_UT <= 22.5m -> terrestrial; h_UT > 22.5m -> aerial (clamped to 100m)
+                    if (is_aerial && h_ut > 22.5f) {
+                        pl = calculateUMaAvNlosPathlossGPU(d_3d, fminf(h_ut, 100.0f), fc);
+                    } else {
+                        float los_pl = calculateUMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc, state);
+                        pl = fmaxf(los_pl, 13.54f + 39.08f * log10f(d_3d) + 20.0f * log10f(fc) - 0.6f * (h_ut - 1.5f));
+                    }
                     break;
                 }
                 case Scenario::UMi: {
-                    float los_pl = calculateUMiLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
-                    pl = fmaxf(los_pl, 35.3f * log10f(d_3d) + 22.4f + 21.3f * log10f(fc) - 0.3f * (h_ut - 1.5f));
-                    break;
-                }
-                case Scenario::RMa: {
-                    float los_pl = calculateRMaLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
-                    const float W = 20.0f;  // Average street width
-                    const float h = 5.0f;  // Average building height
-                    float nlos_pl = 161.04f - 7.1f * log10f(W) + 7.5f * log10f(h) - 
-                                  (24.37f - 3.7f * powf(h/h_bs, 2)) * log10f(h_bs) + 
-                                  (43.42f - 3.1f * log10f(h_bs)) * (log10f(d_3d) - 3.0f) + 
-                                  20.0f * log10f(fc) - (3.2f * powf(log10f(11.75f * h_ut), 2) - 4.97f);
-                    pl = fmaxf(los_pl, nlos_pl);
+                    // UMi-AV NLOS: h_UT ≤ 22.5m → terrestrial; h_UT > 22.5m → aerial
+                    if (is_aerial && h_ut > 22.5f) {
+                        pl = calculateUMiAvNlosPathlossGPU(d_3d, h_ut, fc);
+                    } else {
+                        float los_pl = calculateUMiLosPathlossGPU(d_2d, d_3d, h_bs, h_ut, fc);
+                        pl = fmaxf(los_pl, 35.3f * log10f(d_3d) + 22.4f + 21.3f * log10f(fc) - 0.3f * (h_ut - 1.5f));
+                    }
                     break;
                 }
                 default:
@@ -654,7 +869,6 @@ __device__ float calPLGPU(const CellParam& cellParam, const UtParam& utParam, Sc
             }
         }
     }
-    
     return pl;
 }
 

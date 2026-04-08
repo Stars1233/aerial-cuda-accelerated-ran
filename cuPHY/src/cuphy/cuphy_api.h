@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -226,6 +226,7 @@ typedef struct _cuphyPuschStatPrms
     /// Polar decoder list size
     uint8_t polarDcdrListSz;        // default size for PUSCH to be set to 1
 
+    uint8_t nMaxTbPerNode; // Maximum number of transport blocks per node
     /// channel estimation algorithm selection: 0 - legacy MMSE, 1 - multi-stage MMSE with delay estimation, 2 - RKHS, 3 - LS estimation only
     cuphyPuschChEstAlgoType_t chEstAlgo;
     
@@ -338,6 +339,7 @@ typedef struct _cuphyPuschUeGrpPrm
     uint16_t nPrb;
     
     uint16_t prgSize;
+    uint8_t  enablePerPrgChEstPerUeg;
     
     uint16_t nUplinkStreams;
 
@@ -403,9 +405,7 @@ typedef struct _cuphyPuschUePrm
 
     uint8_t  scid;
     uint16_t dmrsPortBmsk; /// Use to map DMRS port to fOCC/DMRS-grid/tOCC
-#ifdef ENABLE_32DL
-    uint8_t  nlAbove16{0}; // This is not used for pusch. Keeping it in parity with pdsch
-#endif
+    uint8_t  nlAbove16{0}; // This is not used for pusch. Keeping it in parity with pdsch. Will always be set to 0. This helps to use a common function track_eaxcids_fh for both PDSCH and PUSCH.
 
     /// Backend parameters
     uint8_t  mcsTableIndex; /*!< mcsTableIndex and mcsIndx only used for enabling Tb size checking (mcsTableIndex 0:Table 5.1.3.1-1, 1:Table 5.1.3.1-2, 2:Table 5.1.3.1-3, 3:Table 6.1.4.1-1, 4:Table 6.1.4.1-2) */
@@ -438,6 +438,10 @@ typedef struct _cuphyPuschUePrm
     
     /// Weighted average CFO estimation
     float     foForgetCoeff;
+    
+    /// LDPC decoder
+    uint8_t  ldpcEarlyTerminationPerUe;
+    uint8_t  ldpcMaxNumItrPerUe;
 } cuphyPuschUePrm_t;
 
 /// Cell group dynamic parameters
@@ -1941,10 +1945,7 @@ typedef struct _cuphyPdschUePrm
 
     uint16_t pmwPrmIdx; /*!< Index to pre-coding matrix array, i.e., to the pPmwPrms array of the
                                     cuphyPdschCellGrpDynPrm_t struct */
-#ifdef ENABLE_32DL
-    uint8_t  nlAbove16;
-#endif
-
+    uint8_t  nlAbove16{0};
 } cuphyPdschUePrm_t;
 
 /**

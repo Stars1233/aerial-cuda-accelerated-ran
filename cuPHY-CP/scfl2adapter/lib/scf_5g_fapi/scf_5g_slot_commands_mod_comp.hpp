@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,57 +35,21 @@ static constexpr std::array<float, 5> QAM_SCALER_LUT{1.0, (2.0/sqrt(2.0)/SQRT_2)
 inline void update_mod_comp_info_common(prb_info_t& prb_info, float bwScaler);
 inline void update_mod_comp_info_section(prb_info_t& prb_info, uint16_t reMask ,float beta, uint16_t qamOrder);
 
+
 static constexpr uint8_t DEFAULT_CSF = 1;
 static constexpr uint8_t BPSK_CSF = 0;
 
 #define MODTAG (NVLOG_TAG_BASE_SCF_L2_ADAPTER + 4) // "SCF.SLOTCMD"
 
-using bw_scaler_map_t = std::unordered_map<uint16_t, float>;
-static bw_scaler_map_t BW_MAP = {
-    //15Mhz FR1
-    {25,  1.0/std::sqrt(25 * 12)},
-    {52,  1.0/std::sqrt(52 * 12)},
-    {79,  1.0/std::sqrt(79 * 12)},
-    {106,  1.0/std::sqrt(106 * 12)},
-    {133,  1.0/std::sqrt(133 * 12)},
-    {160,  1.0/std::sqrt(160 * 12)},
-    {216,  1.0/std::sqrt(216 * 12)},
-    {270, 1.0/std::sqrt(270 * 12)},
-    //30Mhz FR1
-    {11, 1.0/std::sqrt(11 * 12)},
-    {24, 1.0/std::sqrt(24 * 12)},
-    {38, 1.0/std::sqrt(38 * 12)},
-    {51, 1.0/std::sqrt(51 * 12)},
-    {75, 1.0/std::sqrt(75 * 12)},
-    {162, 1.0/std::sqrt(162 * 12)},
-    {189, 1.0/std::sqrt(189 * 12)},
-    {217, 1.0/std::sqrt(217 * 12)},
-    {245, 1.0/std::sqrt(245 * 12)},
-    {273, 1.0/std::sqrt(273 * 12)},
-    // 60Mhz FR1
-    {18, 1.0/std::sqrt(18 * 12)},
-    {24, 1.0/std::sqrt(24 * 12)},
-    {31, 1.0/std::sqrt(31 * 12)},
-    {79, 1.0/std::sqrt(79 * 12)},
-    {93, 1.0/std::sqrt(93 * 12)},
-    {107, 1.0/std::sqrt(107 * 12)},
-    {121, 1.0/std::sqrt(121 * 12)},
-    {135, 1.0/std::sqrt(135 * 12)},
-    //FR2
-    {32, 1.0/std::sqrt(32 * 12)},
-    {66, 1.0/std::sqrt(66 * 12)},
-    {132, 1.0/std::sqrt(132 * 12)},
-    {264, 1.0/std::sqrt(264 * 12)}
-};
-
-
 inline float getBwScaler(uint16_t num_dl_prb) {
-    auto iter = BW_MAP.find(num_dl_prb);
-    if (iter!= BW_MAP.end()) {
-        return iter->second;
-    } else {
-        return 0.0f;
+    thread_local float bwScaler = 0.0f;
+    thread_local uint16_t cached_num_dl_prb = 0;
+    
+    if (bwScaler == 0.0f || cached_num_dl_prb != num_dl_prb) {
+        cached_num_dl_prb = num_dl_prb;
+        bwScaler = 1.0f / std::sqrt(num_dl_prb * 12);
     }
+    return bwScaler;
 }
 
 inline void update_mod_comp_info_common(prb_info_t& prb_info, float bwScaler) {
@@ -144,7 +108,7 @@ inline void update_mod_comp_info_common_pdsch(prb_info_t& prb_info, float bwScal
 inline uint16_t float_to_modcompscaler(float scale) {
 
     if (!(scale > 0.0f && scale < 1.0f)) {
-        throw std::invalid_argument("Scale must be in the range (0, 1) for modCompScaler encoding.");
+        throw std::invalid_argument(fmt::format("Scale {} must be in the range (0, 1) for modCompScaler encoding.", scale));
     }
     
     int exp = 0;
@@ -213,15 +177,15 @@ inline uint16_t float_to_modcompscaler(float scale) {
 
 inline void update_mod_comp_info_section(prb_info_t& prb_info, uint16_t reMask ,float beta, uint16_t qamOrder, uint8_t shift) {
 
-    auto& section = prb_info.comp_info.sections[prb_info.comp_info.common.nSections.get()];
+    auto& section = prb_info.comp_info.sections[prb_info.comp_info.common.nSections];
     prb_info.common.reMask |= reMask;
     section.mcScaleReMask = reMask;
-    uint8_t prev_udIqWidth = +prb_info.comp_info.common.udIqWidth.get();
+    uint8_t prev_udIqWidth = +prb_info.comp_info.common.udIqWidth;
     uint8_t curr_udIqWidth = getUdIqWidth(qamOrder);
-    if (!prb_info.comp_info.common.nSections.get()) {
+    if (!prb_info.comp_info.common.nSections) {
         section.csf = shift;
     } else {
-        auto prev_csf = static_cast<uint8_t>(prb_info.comp_info.sections[prb_info.comp_info.common.nSections.get() - 1 ].csf.get());
+        auto prev_csf = static_cast<uint8_t>(prb_info.comp_info.sections[prb_info.comp_info.common.nSections - 1 ].csf);
         if (!prev_csf && prev_udIqWidth == CUPHY_QAM_4) { //BPSK
             section.csf = 0;
         } else { // Mixed MCS
@@ -245,7 +209,7 @@ inline void update_mod_comp_info_section(prb_info_t& prb_info, uint16_t reMask ,
             */
             section.csf = 1;
             if (prev_udIqWidth < curr_udIqWidth) {
-                prb_info.comp_info.sections[prb_info.comp_info.common.nSections.get() - 1].csf = 0;
+                prb_info.comp_info.sections[prb_info.comp_info.common.nSections - 1].csf = 0;
             } else if (prev_udIqWidth > curr_udIqWidth) {
                 section.csf = 0;
             }
@@ -253,17 +217,17 @@ inline void update_mod_comp_info_section(prb_info_t& prb_info, uint16_t reMask ,
     }
     const auto tBlIndex = getTblIndex(qamOrder);
 
-    prb_info.comp_info.modCompScalingValue[prb_info.comp_info.common.nSections.get()] = beta * QAM_SCALER_LUT[tBlIndex];
+    prb_info.comp_info.modCompScalingValue[prb_info.comp_info.common.nSections] = beta * QAM_SCALER_LUT[tBlIndex];
     
-    const float calculated_scale = prb_info.comp_info.modCompScalingValue[prb_info.comp_info.common.nSections.get()] * prb_info.comp_info.bwScaler;
+    const float calculated_scale = prb_info.comp_info.modCompScalingValue[prb_info.comp_info.common.nSections] * prb_info.comp_info.bwScaler;
     section.mcScaleOffset = float_to_modcompscaler(calculated_scale);
     
     NVLOGD_FMT(MODTAG, "beta {} tableIndex {} QAM_SCALER_LUT[{}] {} BWscaler {} modCompScalingValue[{}] {} calculated_scale = {} mcScaleOffset = {}", 
                 beta, tBlIndex, tBlIndex, QAM_SCALER_LUT[tBlIndex], prb_info.comp_info.bwScaler, 
-                prb_info.comp_info.common.nSections.get(), prb_info.comp_info.modCompScalingValue[prb_info.comp_info.common.nSections.get()], calculated_scale, section.mcScaleOffset.get());
+                prb_info.comp_info.common.nSections, prb_info.comp_info.modCompScalingValue[prb_info.comp_info.common.nSections], calculated_scale, section.mcScaleOffset);
 
     prb_info.comp_info.common.udIqWidth = std::max(curr_udIqWidth,  prev_udIqWidth);
-    prb_info.comp_info.common.nSections = prb_info.comp_info.common.nSections.get() + 1;
+    prb_info.comp_info.common.nSections = prb_info.comp_info.common.nSections + 1;
 }
 
 }

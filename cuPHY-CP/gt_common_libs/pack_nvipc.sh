@@ -1,5 +1,6 @@
-#!/bin/bash -uex
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#!/bin/bash -ue
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +26,8 @@ fi
 
 DATE=$(date -u "+%Y.%m.%d")
 TEMP_SRC_DIR=${TEMP_SRC_DIR:-/tmp/nvipc_src.$DATE}
-rm -rf $TEMP_SRC_DIR
+rm -rf $TEMP_SRC_DIR/* || true
+rm -rf $TEMP_SRC_DIR || true
 # create externals
 mkdir -p $TEMP_SRC_DIR/external
 (cd $TEMP_SRC_DIR/external &&

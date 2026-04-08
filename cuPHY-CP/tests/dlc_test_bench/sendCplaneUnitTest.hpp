@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -90,18 +90,27 @@ struct TestConfig {
         static TestConfig config;
         return config;
     }
+    bool is_nrsim() const {
+        try {
+            int num = std::stoi(pattern_number);
+            return (num >= 90000 && num < 100000);
+        } catch (...) {
+            return false;
+        }
+    }
 };
 
 struct LocalFapiMessage {
+    static constexpr size_t FAPI_PAYLOAD_BUFFER_SIZE = 64 * 1024;
     scf_fapi_dl_tti_req_t* dl_tti_req; 
     scf_fapi_ul_dci_t* ul_dci_req;
     // scf_fapi_ul_tti_req_t* ul_tti_req; 
 
     LocalFapiMessage() 
     {
-        dl_tti_req = static_cast<scf_fapi_dl_tti_req_t*>(std::malloc(sizeof(scf_fapi_dl_tti_req_t) + 10*1024));
+        dl_tti_req = static_cast<scf_fapi_dl_tti_req_t*>(std::malloc(sizeof(scf_fapi_dl_tti_req_t) + FAPI_PAYLOAD_BUFFER_SIZE));
         dl_tti_req->num_pdus = 0;
-        ul_dci_req = static_cast<scf_fapi_ul_dci_t*>(std::malloc(sizeof(scf_fapi_ul_dci_t) + 8*1024));
+        ul_dci_req = static_cast<scf_fapi_ul_dci_t*>(std::malloc(sizeof(scf_fapi_ul_dci_t) + FAPI_PAYLOAD_BUFFER_SIZE));
         ul_dci_req->num_pdus = 0; 
         // ul_tti_req = new (8*1024); 
     }
@@ -180,6 +189,7 @@ public:
     void TearDown(); 
     void Run(slot_command_api::slot_indication &slot_info); 
     void Reset() { 
+        cell_group_.fh_params.total_num_pdsch_pdus = 0;
         cell_group_.reset(); 
         cell_cmd_.reset();
         singleton_.Reset(); 
@@ -193,6 +203,7 @@ public:
     slot_command_api::cell_group_command &get_cell_group_cmd() { return cell_group_; }
     
     uint16_t get_cell_dl_comp_meth(int cell_index) { return static_cast<uint16_t>(mplane_configs.at(cell_index).dl_comp_meth); }
+    const context_config &get_ctx_cfg () { return ctx_cfg_; }
 
 private:
     std::string ctx_config_file_;

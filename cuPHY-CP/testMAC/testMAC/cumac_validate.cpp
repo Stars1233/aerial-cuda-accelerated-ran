@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,9 +44,8 @@ cumac_validate::cumac_validate()
     log_count  = 0;
 }
 
-cumac_validate::cumac_validate(int _enable, int _log_opt)
+cumac_validate::cumac_validate(int _enable, int _log_opt) : cumac_validate()
 {
-    cumac_validate();
 
     // 0 - disabled; 1 - report error level; 2 - report error and warning level
     enable = _enable;

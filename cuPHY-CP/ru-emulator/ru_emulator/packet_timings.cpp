@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -187,7 +187,7 @@ void RU_Emulator::increment_oran_packet_counters(uint8_t type, uint8_t cell_inde
         }
         case rx_packet_type::UL_C_PLANE:
         {
-            if(oran_packet_counters.ul_c_plane[cell_index].total_slot.load() >= opt_dl_warmup_slots)
+            if(oran_packet_counters.ul_c_plane[cell_index].total_slot.load() >= opt_ul_warmup_slots)
             {
                 if(packet_timer.late != 0)
                 {

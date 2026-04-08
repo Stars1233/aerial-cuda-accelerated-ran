@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@
 #include "utils.hpp"
 #include "gpu_comm.hpp"
 #include <doca_gpunetio.h>
+#include <atomic>
 #define TAG "FH.QUEUE"
 
 // TODO FIXME remove when DOCA warnings are fixed
@@ -32,10 +33,13 @@
 
 namespace aerial_fh
 {
+static std::atomic<uint32_t> g_next_dpdk_rx_queue_idx{MLX5_EXTERNAL_RX_QUEUE_ID_MIN};    
 Queue::Queue(Nic* nic, uint16_t id, uint16_t size) :
     nic_{nic},
     id_{id},
-    size_{size}
+    size_{size},
+    doca_tx_h{},
+    doca_rx_h{}
 {
 }
 
@@ -70,8 +74,15 @@ Txq::Txq(Nic* nic, uint16_t id, bool gpu_m) :
 
     if (is_gpu()) {
 		Fronthaul* fh = nic_->get_fronthaul();
-
-        doca_error_t ret = doca_create_tx_queue(&(doca_tx_h), fh->get_docaGpuParams()->gpu, nic->get_doca_dev(), QUEUE_DESC, id_);
+        doca_error_t ret;
+        if(fh->get_info().enable_gpu_comm_via_cpu==1)
+        {
+            ret = doca_create_tx_queue(&(doca_tx_h), fh->get_docaGpuParams()->gpu, nic->get_doca_dev(), QUEUE_DESC, id_, DOCA_GPU_MEM_TYPE_CPU_GPU);
+        }
+        else
+        {
+            ret = doca_create_tx_queue(&(doca_tx_h), fh->get_docaGpuParams()->gpu, nic->get_doca_dev(), QUEUE_DESC, id_, DOCA_GPU_MEM_TYPE_GPU);
+        }
         if (ret != DOCA_SUCCESS)
                 THROW_FH(ret, StringBuilder() << "Failed to setup DOCA GPU TxQ #" << id_ << " on NIC " << nic_->get_info().name << " because doca_create_tx_queue was a failure");
 
@@ -260,7 +271,8 @@ bool Txq::is_gpu() const {
 }
 
 Rxq::Rxq(Nic* nic, uint16_t id) :
-    Queue{nic, id, nic->get_info().rxq_size}
+    Queue{nic, id, nic->get_info().rxq_size},
+    doca_rxq_items{}  // Zero-initialize all members of doca_rxq_items
 {
     auto port_id   = nic_->get_port_id();
     auto socket_id = rte_eth_dev_socket_id(port_id);
@@ -291,15 +303,23 @@ Rxq::Rxq(Nic* nic, uint16_t id) :
 
     if(!(fh->get_info().cuda_device_ids.empty()) && !fh->get_info().cpu_rx_only) {
         doca_error_t ret;
-        if(fh->get_info().enable_gpu_comm_via_cpu==1){
-            ret = doca_create_rx_queue(&(doca_rx_h), fh->get_docaGpuParams()->gpu, nic->get_doca_dev(), QUEUE_DESC, DOCA_GPU_MEM_TYPE_CPU_GPU, MAX_PKT_SIZE, MAX_PKT_NUM);
+        // Assign a unique incremental DPDK queue index before creating the DOCA RX queue
+        // Use atomic fetch_add to prevent overflow above UINT16_MAX
+        const uint32_t current_idx = g_next_dpdk_rx_queue_idx.fetch_add(1, std::memory_order_relaxed);
+        if (current_idx >= UINT16_MAX) {
+            THROW_FH(EOVERFLOW, StringBuilder() << "Exceeded maximum DPDK RX queue index");
         }
-        else
-        {
-            ret = doca_create_rx_queue(&(doca_rx_h), fh->get_docaGpuParams()->gpu, nic->get_doca_dev(), QUEUE_DESC, DOCA_GPU_MEM_TYPE_GPU, MAX_PKT_SIZE, MAX_PKT_NUM);
-        }
+        doca_rx_h.dpdk_queue_idx = static_cast<uint16_t>(current_idx);
+        ret = doca_create_rx_queue(&(doca_rx_h), fh->get_docaGpuParams()->gpu, nic->get_doca_dev(), QUEUE_DESC, 
+                                    (fh->get_info().enable_gpu_comm_via_cpu == 1) ? DOCA_GPU_MEM_TYPE_CPU_GPU : DOCA_GPU_MEM_TYPE_GPU,
+                                    MAX_PKT_SIZE, MAX_PKT_NUM, fh->get_info().enable_gpu_comm_via_cpu);
         if (ret != DOCA_SUCCESS)
             THROW_FH(ret, StringBuilder() << "Failed to setup DOCA GPU RxQ #" << id_ << " on NIC " << nic_->get_info().name << " because doca_gpu_rxq_create was a failure");
+
+        if(rte_pmd_mlx5_external_rx_queue_id_map(port_id,doca_rx_h.dpdk_queue_idx, doca_rx_h.hw_queue_idx)<0)
+        {
+            THROW_FH(rte_errno, StringBuilder() << "Failed to map DPDK queue index to HW queue index");
+        }
 
         NVLOGI_FMT(TAG,"Doca Ethernet RxQ created! gpu_addr {} cpu_addr {}",
                 (void *)doca_rx_h.eth_rxq_gpu, (void *)doca_rx_h.eth_rxq_cpu);

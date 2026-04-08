@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,7 +53,7 @@ void ru_emulator_setup_slots(void* ru_emulator);
 void ru_emulator_add_flows(void* ru_emulator);
 void ru_emulator_setup_rings(void* ru_emulator);
 void ru_emulator_oam_init(void* ru_emulator);
-void ru_emulator_verify_dl_cplane_content(void* ru_emulator, uint8_t *mbuf_payload, int cell_index);
+void ru_emulator_verify_dl_cplane_content(void* ru_emulator, uint8_t *mbuf_payload, size_t buffer_length, int cell_index);
 void ru_emulator_construct_bfw(void* ru_emulator, int sfn, int slot, int cell_idx, std::vector<uint8_t*> &out);
 
 // Query this at the end of a slot processing to get the total # of slots processed till that slot.

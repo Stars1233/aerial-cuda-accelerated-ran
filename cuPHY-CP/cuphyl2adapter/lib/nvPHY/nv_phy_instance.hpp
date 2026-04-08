@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -120,7 +120,6 @@ protected:
 
     command_t current_cmd;              ///< Current command being processed
     nv::phy_mac_msg_desc cur_dl_msg;    ///< Store the current TB received
-    nv::phy_mac_msg_desc cur_dl_tti_msg; ///< Store the current DL TTI received
     
 protected:
     /**

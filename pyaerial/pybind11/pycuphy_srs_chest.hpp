@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -94,6 +94,7 @@ private:
     std::vector<cuphySrsChEstBuffInfo_t> m_srsChEstBuffInfo;
 
     std::vector<cuphy::buffer<uint8_t, cuphy::pinned_alloc>> m_chEstCpuBuffVec;
+    std::vector<void*> m_dChEstToL2InnerVec;
     std::vector<void*> m_dChEstToL2Vec;
     std::vector<cuphySrsChEstToL2_t> m_chEstToL2Vec;
 

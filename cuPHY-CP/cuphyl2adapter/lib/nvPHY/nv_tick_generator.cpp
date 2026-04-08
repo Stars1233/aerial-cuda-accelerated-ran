@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,6 @@
 
 #define TAG (NVLOG_TAG_BASE_L2_ADAPTER + 7) // "L2A.TICK"
 
-#include <mutex>
 namespace nv
 {
     constexpr int64_t FRAME_PERIOD = 10000000LL;
@@ -30,26 +29,15 @@ namespace nv
     constexpr int64_t SFN_PERIOD = SFN_MAX * FRAME_PERIOD;
     constexpr int64_t TAI_GPS_EPOCH_DELTA = 315964800ULL; //(Jan 6th 1980(GPS epoch) - Jan 1st 1970 (TAI epoch)) /*(365x10 + 2(2 leap years)+5(5 additional days in 1980))x24x60x60*/
     constexpr int64_t GPS_TO_TAI_LAG = 19ULL; //GPS lags TAI by 19s
-    static std::once_flag start_flag;
-    static std::once_flag stop_flag;
-    static std::mutex start_mutex;
-    static std::mutex stop_mutex;
+    static std::atomic<bool> thread_started{false};
     static std::atomic<bool> timer_thread_start{false};
-    void tti_gen::start_slot_indication()
+    void tti_gen::start_tick_generator()
     {
-        bool start_timer_thread = false;
         window_nsec = nv::mu_to_ns(module_->get_mu_highest());
         NVLOGI_FMT(TAG,"{} tick_generator_mode={} window_nsec={}", __FUNCTION__, tick_generator_mode, window_nsec);
-        {
-            std::lock_guard<std::mutex> lock(start_mutex);
-            if(tti_gen_ref == 0)
-            {
-                start_timer_thread = true;
-            }
-            tti_gen_ref++;
-        }
-        if(start_timer_thread)
-        {
+
+        bool expected = false;
+        if (thread_started.compare_exchange_strong(expected, true)) {
             std::thread t;
 
             if (tick_generator_mode == 0)
@@ -68,6 +56,7 @@ namespace nv
             else
             {
                 NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT, "Error configuration: tick_generator_mode={}", tick_generator_mode);
+                thread_started.store(false);
                 return;
             }
 
@@ -111,27 +100,26 @@ namespace nv
         }
     }
 
-    void tti_gen::stop_slot_indication()
+    void tti_gen::stop_tick_generator()
     {
-        bool stop_timer_thread = false;
-        {
-            std::lock_guard<std::mutex> lock(stop_mutex);
-            tti_gen_ref--;
-            if(tti_gen_ref == 0)
-            {
-                stop_timer_thread = true;
-            }
+        NVLOGC_FMT(TAG, "Stopping TTI Generator timer thread");
+        stop_thread.store(true);
+
+        // Stop epoll event loop for timer_fd method (mode 2)
+        if (tick_generator_mode == 2) {
+            epoll_ctx.terminate();
         }
-        NVLOGI_FMT(TAG, "Cell stopped, TTI Generator refcount = {}",tti_gen_ref.load());
-        if (stop_timer_thread)
-        {
-            {
-                NVLOGC_FMT(TAG, "TTI Generator refcount = 0, stopping timer thread.");
-                MemtraceDisableScope md; // at the cell stop
-                pthread_cancel(timer_thread.native_handle());
-                timer_thread.join();
-                NVLOGC_FMT(TAG, "TTI Generator refcount = 0, stopped timer thread");
-            }
+    }
+
+    /**
+     * Join the timer thread
+     *
+     * Blocks until the timer thread completes execution.
+     */
+    void tti_gen::timer_thread_join()
+    {
+        if (timer_thread.joinable()) {
+            timer_thread.join();
         }
     }
 
@@ -243,7 +231,7 @@ namespace nv
                     else
                     {
                         break;
-                    }                
+                    }
                 }
                 else //Target:DU, Source : UE
                 {
@@ -256,13 +244,13 @@ namespace nv
                     {
                         break;
                     }
-                }            
-            }            
+                }
+            }
         }
-        
+
         uint64_t next_expected = get_first_slot_timestamp();
         module_->set_first_tick(true);
-        while(1)
+        while(!stop_thread.load())
         {
             current_scheduled_ts = nanoseconds(next_expected);
 
@@ -279,6 +267,8 @@ namespace nv
             // Add time interval to next expected slot
             next_expected += window_nsec;
         }
+
+        NVLOGC_FMT(TAG, "{}: thread timer_thread exiting", __FUNCTION__);
     }
 
     void tti_gen::slot_indication_thread_poll_method()
@@ -286,6 +276,9 @@ namespace nv
         // enable dynamic memory allocation tracing in real-time code path
         // Use LD_PRELOAD=<special .so> when running cuphycontroller, otherwise this does nothing.
         memtrace_set_config(MI_MEMTRACE_CONFIG_ENABLE | MI_MEMTRACE_CONFIG_EXIT_AFTER_BACKTRACE);
+
+        nvlog_fmtlog_thread_init("timer_thread");
+        NVLOGC_FMT(TAG, "Thread {} initialized fmtlog", __FUNCTION__);
 
 #ifdef dbg
         if(has_thread_cfg)
@@ -309,8 +302,10 @@ namespace nv
         assign_thread_cpu_core(timer_thread_cfg->cpu_affinity);
 
         bool     first = true;
-        uint64_t last_actual, next_expected, first_time;
-        uint64_t runtime;
+        uint64_t last_actual =0;
+        uint64_t next_expected =0;
+        uint64_t first_time =0;
+        uint64_t runtime =0;
         uint64_t count          = 0;
         uint64_t sum_abs_offset = 0;
         int32_t  min_offset     = 0;
@@ -331,7 +326,7 @@ namespace nv
         //window_nsec  = nv::mu_to_ns(1);
         window_nsec  = nv::mu_to_ns(module_->get_mu_highest());
 
-        while(1)
+        while(!stop_thread.load())
         {
             uint64_t curr = sys_clock_time_handler();
             if(first)
@@ -464,7 +459,14 @@ namespace nv
         NVLOGD_FMT(TAG, "min offset:     {}",min_offset);
         NVLOGD_FMT(TAG, "max offset:     {}",max_offset);
         NVLOGD_FMT(TAG, "max abs offset: {}",max_abs_offset);
-        NVLOGD_FMT(TAG, "avg abs offset: {}",sum_abs_offset / count);
+        if(count > 0)
+        {
+            NVLOGD_FMT(TAG, "avg abs offset: {}",sum_abs_offset / count);
+        }
+        else
+        {
+            NVLOGD_FMT(TAG, "avg abs offset: N/A (no events)");
+        }
     }
 
 
@@ -476,12 +478,7 @@ namespace nv
         NVLOGI_FMT(TAG, "slot indication interval is : {} micro secs",delay);
         prev_tp = cur_tp;
 #endif
-        send_slot_indication();
 
-    }
-
-    void tti_gen::send_slot_indication()
-    {
         simulated_cpu_stall_checkpoint(L2A_TICK_THREAD,-1);
         module_->tick_received(current_scheduled_ts);
 
@@ -497,6 +494,9 @@ namespace nv
         // enable dynamic memory allocation tracing in real-time code path
         // Use LD_PRELOAD=<special .so> when running cuphycontroller, otherwise this does nothing.
         memtrace_set_config(MI_MEMTRACE_CONFIG_ENABLE | MI_MEMTRACE_CONFIG_EXIT_AFTER_BACKTRACE);
+
+        nvlog_fmtlog_thread_init("timer_thread");
+        NVLOGC_FMT(TAG, "Thread {} initialized fmtlog", __FUNCTION__);
 
 #ifdef dbg
         if(has_thread_cfg)

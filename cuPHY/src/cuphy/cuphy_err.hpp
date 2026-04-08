@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,7 +129,9 @@ private:
     } while(0)
 
 
-#define CUDA_CHECK_EXCEPTION(c) do {                               \
+#define CUDA_CHECK_EXCEPTION(c) \
+_Pragma("vcast_dont_instrument_start")                             \
+do {                                                               \
         cudaError_t s = c;                                         \
         if((cudaError_t)s != cudaSuccess)                          \
         {                                                          \
@@ -140,7 +142,8 @@ private:
                     cudaGetErrorString(s));                        \
             throw cuphy::cuda_exception(s);                        \
         }                                                          \
-    } while(0)
+    } while(0)                                                     \
+_Pragma("vcast_dont_instrument_end")                               \
 
 #define CU_CHECK_EXCEPTION(c) do {                                 \
         CUresult s = c;                                            \

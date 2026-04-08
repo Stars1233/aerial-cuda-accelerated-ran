@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,19 +17,41 @@
 
 #include "nvlog.hpp"
 
+#include "fapi_defines.hpp"
 #include "test_mac_configs.hpp"
 
 #define TAG (NVLOG_TAG_BASE_TEST_MAC + 6) // "MAC.CFG"
 
 using namespace std;
 
+/**
+ * Convert FAPI group name to FAPI group ID
+ *
+ * @param[in] name FAPI group name
+ * @return FAPI group ID
+ */
+static int fapi_group_id_from_string(const std::string& name)
+{
+    if (name == "DL_TTI_REQ")    return static_cast<int>(DL_TTI_REQ);
+    if (name == "UL_TTI_REQ")    return static_cast<int>(UL_TTI_REQ);
+    if (name == "TX_DATA_REQ")   return static_cast<int>(TX_DATA_REQ);
+    if (name == "UL_DCI_REQ")    return static_cast<int>(UL_DCI_REQ);
+    if (name == "DL_BFW_CVI_REQ") return static_cast<int>(DL_BFW_CVI_REQ);
+    if (name == "UL_BFW_CVI_REQ") return static_cast<int>(UL_BFW_CVI_REQ);
+    return -1;
+}
+
+/**
+ * Constructor
+ *
+ * @param[in] config_node YAML configuration node
+ */
 test_mac_configs::test_mac_configs(yaml::node config_node) :
+#ifdef AERIAL_CUMAC_ENABLE
+    cumac_configs(nullptr),
+#endif
     yaml_config(config_node)
 {
-#ifdef AERIAL_CUMAC_ENABLE
-    cumac_configs = nullptr;
-#endif
-
     // Initiate default values
     for (int i = 0; i < MAX_CELLS_PER_SLOT; i ++)
     {
@@ -144,6 +166,36 @@ test_mac_configs::test_mac_configs(yaml::node config_node) :
         }
     }
 
+    if (config_node.has_key("fapi_tx_deadline_enable"))
+    {
+        fapi_tx_deadline_enable = config_node["fapi_tx_deadline_enable"].as<int>();
+    }
+
+    if (config_node.has_key("fapi_tx_time_per_msg_ns"))
+    {
+        fapi_tx_time_per_msg_ns = config_node["fapi_tx_time_per_msg_ns"].as<int>();
+    }
+
+    if (config_node.has_key("fapi_tx_deadline"))
+    {
+        yaml::node deadline_node = config_node["fapi_tx_deadline"];
+        fapi_tx_deadline_ns.resize(static_cast<size_t>(FAPI_REQ_SIZE), 0);
+        for (int i = 0; i < deadline_node.length(); i++)
+        {
+            std::string group_name = deadline_node[i]["group_id"].as<std::string>();
+            int deadline_us = deadline_node[i]["deadline"].as<int>();
+            int gid = fapi_group_id_from_string(group_name);
+            if (gid >= 0 && gid < FAPI_REQ_SIZE)
+            {
+                fapi_tx_deadline_ns[static_cast<size_t>(gid)] = static_cast<int64_t>(deadline_us) * 1000; // us -> ns
+            }
+            else
+            {
+                NVLOGW_FMT(TAG, "fapi_tx_deadline: unknown group_id '{}', skipped", group_name.c_str());
+            }
+        }
+    }
+
     yaml::node worker_cores_node = config_node["worker_cores"];
     if (worker_cores_node.length() > 0)
     {
@@ -242,8 +294,17 @@ test_mac_configs::test_mac_configs(yaml::node config_node) :
     {
         enableTickDynamicSfnSlot = 1; // default enabled
     }
+
+    // Config validation
+    if (fapi_tx_deadline_enable != 0 && builder_thread_enable == 0)
+    {
+        NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "builder_thread_enable must be enabled when fapi_tx_deadline_enable is enabled");
+    }
 }
 
+/**
+ * Destructor
+ */
 test_mac_configs::~test_mac_configs()
 {
 }

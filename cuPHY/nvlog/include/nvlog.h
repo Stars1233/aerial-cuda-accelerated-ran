@@ -39,6 +39,7 @@ extern "C" {
 #define NVLOG_TAG_BASE_RESERVED 0            // reserved
 #define NVLOG_TAG_BASE_NVLOG 10              // nvlog
 #define NVLOG_TAG_BASE_NVIPC 30              // nvIPC
+#define NVLOG_TAG_BASE_UTIL 80              // aerial_utils
 #define NVLOG_TAG_BASE_CUPHY_CONTROLLER 100  // cuphycontroller
 #define NVLOG_TAG_BASE_CUPHY_DRIVER 200      // cuphydriver
 #define NVLOG_TAG_BASE_L2_ADAPTER 300        // cuphyl2adapter

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -130,12 +130,11 @@ class OptimizedDFT(nn.Module):
         z_i = z_i.reshape(reshape_dims)
 
         # Matrix multiplication for FFT
-        cos_mat = torch.as_tensor(self.cos_matrix_fft, device=z_r.device)
-        sin_mat = torch.as_tensor(self.sin_matrix_fft, device=z_i.device)
-        out_r = torch.matmul(z_r, cos_mat) - \
-            torch.matmul(z_i, sin_mat)
-        out_i = torch.matmul(z_r, sin_mat) + \
-            torch.matmul(z_i, cos_mat)
+        # Type assertions for mypy (register_buffer creates Tensor | Module type)
+        cos_mat: torch.Tensor = self.cos_matrix_fft  # type: ignore[assignment]
+        sin_mat: torch.Tensor = self.sin_matrix_fft  # type: ignore[assignment]
+        out_r = torch.matmul(z_r, cos_mat) - torch.matmul(z_i, sin_mat)
+        out_i = torch.matmul(z_r, sin_mat) + torch.matmul(z_i, cos_mat)
 
         scale = 1.0 / self.seq_len if not self.do_fft else 1.0
         out_r = out_r * scale
@@ -349,6 +348,7 @@ class EnhancedFusedChannelEstimator(nn.Module, PyTorchAlgorithm):
         # Reshape back if needed
         if self.reshape:
             # Reshape back based on ground truth implementation
+            assert orig_shape is not None  # Set when self.reshape is True
             n_batch, subcarriers, n_layers, n_ant, n_symb = orig_shape
             zout = zout.reshape(
                 (n_batch, n_ant, n_layers, n_symb,

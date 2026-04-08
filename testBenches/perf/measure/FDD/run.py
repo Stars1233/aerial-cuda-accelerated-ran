@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,13 +34,14 @@ def run_FDD(args, sms, mig=None):
     uc = json.load(ifile)
     ifile.close()
 
+    uc_basename = os.path.basename(args.uc)
     if args.is_graph:
-        output = "sweep_graphs_" + args.uc.replace("uc_", "").replace(
+        output = "sweep_graphs_" + uc_basename.replace("uc_", "").replace(
             "_TDD.json", ""
         ).replace("_FDD.json", "")
         mode = 1
     else:
-        output = "sweep_streams_" + args.uc.replace("uc_", "").replace(
+        output = "sweep_streams_" + uc_basename.replace("uc_", "").replace(
             "_TDD.json", ""
         ).replace("_FDD.json", "")
         mode = 0
@@ -89,12 +90,18 @@ def run_FDD(args, sms, mig=None):
     sweeps = {}
     powers = {}
 
-    # save test configs and GPU product name
+    # save test configs and GPU product name (exclude inline config/uc blobs; use vector_files when from YAML)
+    def _test_config_for_save():
+        d = dict(vars(args))
+        d.pop("inline_config_obj", None)
+        d.pop("inline_uc_obj", None)
+        return d
+
     if args.is_power:
-        powers['testConfig'] = args
+        powers['testConfig'] = _test_config_for_save()
         powers['testConfig']['smAllocation'] = target
     else:
-        sweeps['testConfig'] = args
+        sweeps['testConfig'] = _test_config_for_save()
         sweeps['testConfig']['smAllocation'] = target
     
     if args.seed is not None:
@@ -224,9 +231,28 @@ def run_FDD(args, sms, mig=None):
                         k,
                     )
 
-        elif "_avg_":
+        elif "_avg_" in args.uc:
 
-            interval = uc["Peak: " + str(k)]
+            peak_key = "Peak: " + str(k)
+            if peak_key not in uc:
+                # Inline UC was built from YAML cap (e.g. 25); --start/--cap can exceed it. Create missing Peak entry.
+                template_peaks = [key for key in uc.keys() if key.startswith("Peak: ")]
+                if not template_peaks:
+                    sys.exit("error: use case file has no Peak: N entry to template from")
+                template_key = max(template_peaks, key=lambda x: int(x.split(":", 1)[1].strip()))
+                template = uc[template_key]
+                new_interval = {}
+                for subcase, ch_dict in template.items():
+                    new_interval[subcase] = {}
+                    for ch_key, testcase_list in ch_dict.items():
+                        base_ch = ch_key.split(" - ", 1)[1] if " - " in ch_key else ch_key
+                        if base_ch in {"MAC", "MAC2"}:
+                            new_interval[subcase][ch_key] = list(testcase_list)
+                        else:
+                            testcase_id = testcase_list[0] if testcase_list else "F08-PP-00"
+                            new_interval[subcase][ch_key] = [testcase_id] * k
+                uc[peak_key] = new_interval
+            interval = uc[peak_key]
 
             for subcase in interval.keys():
 
@@ -235,14 +261,14 @@ def run_FDD(args, sms, mig=None):
                 uc_dl = [x for x in uc_keys if "PDSCH" in x]
 
                 if len(uc_dl) != 1:
-                    sys.exit("error: use case file exhibits an unexpected struture")
+                    sys.exit("error: use case file exhibits an unexpected structure")
                 else:
                     uc_dl = uc_dl[0]
 
                 uc_ul = [x for x in uc_keys if "PUSCH" in x]
 
                 if len(uc_ul) != 1:
-                    sys.exit("error: use case file exhibits an unexpected struture")
+                    sys.exit("error: use case file exhibits an unexpected structure")
                 else:
                     uc_ul = uc_ul[0]
 

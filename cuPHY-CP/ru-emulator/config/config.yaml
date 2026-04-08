@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,10 +14,11 @@
 # limitations under the License.
 
 ---
-aerial_sdk_version: 25-3-cubb
+aerial_sdk_version: 26-1-cubb
 ru_emulator:
 
   ul_core_list: [2,3,4,5,6,7,8,9,10,11]
+  ul_srs_core_list: []  # SRS cores - to be filled when SRS channel is configured
   dl_core_list: [12,13,14,15,16,17,18,19,20,21]
   dl_rx_core_list: [68,70,72,74,76,78,80,82,84,86,88,90,92,94,96,98,100,102,104,106] #Valid only if enable_dl_proc_mt is 1
 
@@ -397,20 +398,23 @@ ru_emulator:
   max_sect_stats: 0
   dl_bfw_validation: 1
   ul_bfw_validation: 1
+  beamid_validation: 0
   validate_dl_timing: 1
   timing_histogram: 0
   timing_histogram_bin_size: 1000 # in nanoseconds
   dl_approx_validation: 0
   enable_mmimo: 0
+  min_ul_cores_per_cell_mmimo: 3
   enable_beam_forming: 0
   enable_cplane_worker_tracing: 0
-  dl_warmup_slots: 2000
+  dl_warmup_slots: 512
+  ul_warmup_slots: 128
   dlc_tb: 0
   fix_beta_dl: 1
   payload_validation: 1
   enable_dl_proc_mt: 0 #Enable multi-threaded processing for dl_proc (receive/process)
-  aerial_fh_txq_size: 4096
-  aerial_fh_rxq_size: 2048
+  aerial_fh_txq_size: 1024
+  aerial_fh_rxq_size: 1024
   aerial_fh_tx_request_num: 32
   aerial_fh_dpdk_thread: 1
   aerial_fh_pdump_client_thread: -1
@@ -418,8 +422,8 @@ ru_emulator:
   aerial_fh_dpdk_file_prefix: "ru_emulator"
   aerial_fh_per_rxq_mempool : 0
   aerial_fh_cpu_mbuf_pool_size_per_rxq: 32768 #Applies only if aerial_fh_per_rxq_mempool is set to 1
-  aerial_fh_cpu_mbuf_pool_rx_size: 262144 #Applies to rx as well if aerial_fh_per_rxq_mempool is set to 0
-  aerial_fh_cpu_mbuf_pool_tx_size: 262144 #Applies to rx as well if aerial_fh_per_rxq_mempool is set to 0
+  aerial_fh_cpu_mbuf_pool_rx_size: 262144
+  aerial_fh_cpu_mbuf_pool_tx_size: 262144
   aerial_fh_split_rx_tx_mempool: 1
   aerial_fh_mtu: 1514
   enable_srs_eaxcid_pacing: 0
@@ -441,5 +445,6 @@ ru_emulator:
     ul_u_plane_tx_offset: 231
     ul_u_plane_tx_offset_srs: 231
   oran_beam_id_info: {static_beam_id_start: 1, static_beam_id_end: 16527, dynamic_beam_id_start: 16528, dynamic_beam_id_end: 32767}
+  enable_precomputed_tx: 1
   ecpri_hdr_cfg_test: {enable: 0, ecpri_hdr_cfg_file: ecpri_hdr_cfg.yaml}
   

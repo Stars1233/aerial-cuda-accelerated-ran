@@ -410,13 +410,20 @@ public:
      * @return Buffer size in bytes
      */
     [[nodiscard]] size_t getSize() const;
-    
+
     /**
      * Count number of elements currently in use
      * 
      * @return Number of elements in use
      */
     [[nodiscard]] size_t countElements() const;
+
+    /**
+     * Get total GPU memory size allocated by this pool for memory footprint
+     *
+     * @return Total GPU memory size allocated by this pool in bytes
+     */
+    [[nodiscard]] size_t getGpuMemSize() const;
 
     /**
      * Pull a free buffer from the pool
@@ -441,6 +448,7 @@ protected:
     RingBufferHandle                               wavgcfo_ring;
     RingBufferInfo                                 ring_info;
     int                                            totRingElems;
+    size_t                                         gpuMemSize;
     GpuDevice*                                     gDev;
 };
 

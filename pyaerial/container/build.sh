@@ -1,5 +1,6 @@
 #!/bin/bash -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -66,21 +67,6 @@ AERIAL_BASE_IMAGE=${AERIAL_REPO}${AERIAL_IMAGE_NAME}:${AERIAL_VERSION_TAG}
 # Target image name.
 PYAERIAL_IMAGE=${PYAERIAL_IMAGE:-pyaerial:$USER-${AERIAL_VERSION_TAG}}
 
-TENSORFLOW_IMAGE=${TENSORFLOW_IMAGE:-tensorflow-with-whl-for-arm}
-
-if [[ "$TARGETARCH" == "arm64" ]]; then
-    if [[ -z $(docker images -q $TENSORFLOW_IMAGE) ]]; then
-        if ! docker manifest inspect $TENSORFLOW_IMAGE >/dev/null 2>&1; then
-            cat << EOF > Dockerfile
-FROM nvcr.io/nvidia/tensorflow:24.05-tf2-py3
-
-RUN TMP=/tmp /opt/tensorflow/nvbuild.sh --sm all --python3.10 --v2
-EOF
-            docker build --platform linux/arm64 -t tensorflow-with-whl-for-arm .
-        fi
-    fi
-fi
-
 cd $cuBB_SDK
 
 # Determine if we need to run cmake configure step
@@ -104,7 +90,7 @@ fi
 
 ./cuPHY-CP/container/run_aerial.sh bash -x -c "\"$CMAKE_FULL_CMD\""
 
-hpccm --recipe pyaerial/container/pyaerial_recipe.py --cpu-target $CPU_TARGET --format docker --userarg AERIAL_BASE_IMAGE=$AERIAL_BASE_IMAGE TENSORFLOW_IMAGE=$TENSORFLOW_IMAGE > Dockerfile_tmp
+hpccm --recipe pyaerial/container/pyaerial_recipe.py --cpu-target $CPU_TARGET --format docker --userarg AERIAL_BASE_IMAGE=$AERIAL_BASE_IMAGE > Dockerfile_tmp
 if [[ -n "$AERIAL_BUILDER" ]]
 then
     docker buildx build --builder $AERIAL_BUILDER --pull --push --progress plain --platform $AERIAL_PLATFORM -t ${PYAERIAL_IMAGE}-${TARGETARCH} -f Dockerfile_tmp .

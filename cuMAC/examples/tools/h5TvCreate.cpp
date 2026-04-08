@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1787,7 +1787,7 @@ void saveToH5_testMAC_perCell(const std::string&                 filename,
     config_request.harqEnabledInd = 0;
     config_request.mcsSelCqi = 0;
     config_request.nMaxCell = cellGrpPrms->nCell;
-    config_request.nMaxActUePerCell = floor(static_cast<float>(cellGrpPrms->nActiveUe)/cellGrpPrms->nCell);
+    config_request.nMaxActUePerCell = cellGrpPrms->nMaxActUePerCell;
     config_request.nMaxSchUePerCell = cellGrpPrms->numUeSchdPerCellTTI;
     config_request.nMaxPrg = cellGrpPrms->nPrbGrp;
     config_request.nPrbPerPrg = 4; // to-do: may be possibly assigned to other values
@@ -1804,6 +1804,7 @@ void saveToH5_testMAC_perCell(const std::string&                 filename,
     config_request.mcsSelSinrCapThr = cellGrpPrms->mcsSelSinrCapThr;
     config_request.mcsSelLutType = cellGrpPrms->mcsSelLutType;
     config_request.prioWeightStep = cellGrpPrms->prioWeightStep;
+    config_request.blerTarget = 0.1;
 
     H5::H5File file_MAC_SCH_CONFIG_REQUEST(MAC_SCH_CONFIG_REQUEST_filename, H5F_ACC_TRUNC);
 
@@ -1828,8 +1829,8 @@ void saveToH5_testMAC_perCell(const std::string&                 filename,
     dataset = file_MAC_SCH_CONFIG_REQUEST.createDataSet("nMaxPrg", datatype_UINT16, dataspace_MAC_SCH_CONFIG_REQUEST);
     dataset.write(&config_request.nMaxPrg, datatype_UINT16);
 
-    dataset = file_MAC_SCH_CONFIG_REQUEST.createDataSet("nPrbPerPrg", datatype_UINT8, dataspace_MAC_SCH_CONFIG_REQUEST);
-    dataset.write(&config_request.nPrbPerPrg, datatype_UINT8);
+    dataset = file_MAC_SCH_CONFIG_REQUEST.createDataSet("nPrbPerPrg", datatype_UINT16, dataspace_MAC_SCH_CONFIG_REQUEST);
+    dataset.write(&config_request.nPrbPerPrg, datatype_UINT16);
 
     dataset = file_MAC_SCH_CONFIG_REQUEST.createDataSet("nMaxBsAnt", datatype_UINT8, dataspace_MAC_SCH_CONFIG_REQUEST);
     dataset.write(&config_request.nMaxBsAnt, datatype_UINT8);
@@ -1870,23 +1871,8 @@ void saveToH5_testMAC_perCell(const std::string&                 filename,
     dataset = file_MAC_SCH_CONFIG_REQUEST.createDataSet("prioWeightStep", datatype_UINT16, dataspace_MAC_SCH_CONFIG_REQUEST);
     dataset.write(&config_request.prioWeightStep, datatype_UINT16);
 
-    if (cellGrpPrms->blerTargetActUe) {
-        std::vector<float> blerTargetActUeCellGrp(cellGrpPrms->nActiveUe);
-        std::vector<float> blerTargetActUe(numActiveUeCell);
-
-        CUDA_CHECK_ERR(cudaMemcpy(blerTargetActUeCellGrp.data(), cellGrpPrms->blerTargetActUe, cellGrpPrms->nActiveUe*sizeof(float), cudaMemcpyDeviceToHost));
-
-        for (int idx = 0; idx < numActiveUeCell; idx++) {
-            int ueIdx = actUeId[idx];
-            blerTargetActUe[idx] = blerTargetActUeCellGrp[ueIdx];
-        }
-
-        hsize_t dims0[] = {static_cast<hsize_t>(numActiveUeCell)};
-
-        H5::DataSpace dataspace_blerTargetActUe(1, dims0);
-        dataset = file_MAC_SCH_CONFIG_REQUEST.createDataSet("blerTargetActUe", H5::PredType::NATIVE_FLOAT, dataspace_blerTargetActUe);
-        dataset.write(blerTargetActUe.data(), H5::PredType::NATIVE_FLOAT);
-    }
+    dataset = file_MAC_SCH_CONFIG_REQUEST.createDataSet("blerTarget", datatype_FLOAT, dataspace_MAC_SCH_CONFIG_REQUEST);
+    dataset.write(&config_request.blerTarget, datatype_FLOAT);
 
     // Close the MAC_SCH_CONFIG_REQUEST TV file
     file_MAC_SCH_CONFIG_REQUEST.close();

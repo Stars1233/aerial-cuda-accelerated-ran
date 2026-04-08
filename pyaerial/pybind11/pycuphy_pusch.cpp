@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,12 +33,14 @@ namespace pycuphy {
 
 PuschPipeline::PuschPipeline(const py::object& statPrms, uint64_t cuStream) {
     m_puschParams.setStatPrms(statPrms);
-    if(m_puschParams.m_puschStatPrms.pDbg->pOutFileName) {
+
+    if(m_puschParams.m_puschStatPrms.pDbg && m_puschParams.m_puschStatPrms.pDbg->pOutFileName) {
         std::string outFilename = std::string(m_puschParams.m_puschStatPrms.pDbg->pOutFileName);
         if (outFilename != "None") {
             m_debugFile.reset(new hdf5hpp::hdf5_file(hdf5hpp::hdf5_file::create(m_puschParams.m_puschStatPrms.pDbg->pOutFileName)));
         }
     }
+
     createPuschRx((cudaStream_t)cuStream);
 }
 
@@ -49,7 +51,6 @@ PuschPipeline::~PuschPipeline() {
 
 
 void PuschPipeline::createPuschRx(cudaStream_t cuStream) {
-    // Create pipeline.
     cuphyStatus_t status = cuphyCreatePuschRx(&m_puschHandle, &m_puschParams.m_puschStatPrms, cuStream);
     if(status != CUPHY_STATUS_SUCCESS) {
         throw cuphy::cuphy_fn_exception(status, "cuphyCreatePuschRx()");

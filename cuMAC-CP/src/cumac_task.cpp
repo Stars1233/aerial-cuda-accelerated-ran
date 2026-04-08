@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +48,15 @@ using namespace cumac;
         }                                                                                                                               \
     } while (0);
 
+#define CHECK_VALUE_MAX_ERR(val, max)                                                                                                    \
+    do                                                                                                                                  \
+    {                                                                                                                                   \
+        if ((val) > (max))                                                                                                               \
+        {                                                                                                                               \
+            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "{} line {}: value > max: {}={} > {}={}", __func__, __LINE__, #val, static_cast<uint32_t>(val), #max, static_cast<uint32_t>(max)); \
+        }                                                                                                                               \
+    } while (0);
+
 // Generate global unique task_id for cumac_task instances
 static uint32_t task_instance_id = 0;
 
@@ -56,23 +65,20 @@ cumac_task::cumac_task()
     task_id = task_instance_id++;
     ss = {.u32 = SFN_SLOT_INVALID};
 
-    cudaEventCreate(&ev_start);
-    cudaEventCreate(&ev_copy1);
-    cudaEventCreate(&ev_copy2);
-    cudaEventCreate(&ev_setup_end);
-
-    cudaEventCreate(&ev_setup);
-
-    cudaEventCreate(&ev_run_start);
-    cudaEventCreate(&ev_run1);
-    cudaEventCreate(&ev_run2);
-    cudaEventCreate(&ev_run3);
-    cudaEventCreate(&ev_run4);
-    cudaEventCreate(&ev_run_end);
-
-    cudaEventCreate(&ev_callback_start);
-    cudaEventCreate(&ev_callback_end);
-    cudaEventCreate(&ev_debug);
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_start));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_copy1));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_copy2));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_setup_end));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_setup));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_run_start));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_run1));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_run2));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_run3));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_run4));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_run_end));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_callback_start));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_callback_end));
+    CHECK_CUDA_ERR(cudaEventCreate(&ev_debug));
 }
 
 void cumac_task::reset_cumac_task(sfn_slot_t _ss)
@@ -114,6 +120,8 @@ void cumac_task::reset_cumac_task(sfn_slot_t _ss)
     cell_num = grpPrms.nCell;
     simParam.totNumCell = cell_num;
 
+    grpPrms.nActiveUe = 0;
+
     NVLOGI_FMT(TAG, "SFN {}.{} reset nUe={} nActiveUe={} numUeSchdPerCellTTI={} nCell={} nPrbGrp={} nBsAnt={} nUeAnt={} precodingScheme={} receiverScheme={} allocType={} prioWeightStep={}", ss.u16.sfn, ss.u16.slot,
                grpPrms.nUe, grpPrms.nActiveUe, grpPrms.numUeSchdPerCellTTI, grpPrms.nCell, grpPrms.nPrbGrp, grpPrms.nBsAnt, grpPrms.nUeAnt, grpPrms.precodingScheme, grpPrms.receiverScheme, grpPrms.allocType, grpPrms.prioWeightStep);
 
@@ -121,13 +129,13 @@ void cumac_task::reset_cumac_task(sfn_slot_t _ss)
 
     if (run_in_cpu)
     {
-        memset(grpPrms.cellAssocActUe, 0, grpPrms.nCell * grpPrms.nActiveUe);
-        memset(grpPrms.cellAssoc, 0, grpPrms.nCell * grpPrms.nUe);
+        memset(grpPrms.cellAssocActUe, 0, static_cast<size_t>(grpPrms.nCell) * grpPrms.nActiveUe);
+        memset(grpPrms.cellAssoc, 0, static_cast<size_t>(grpPrms.nCell) * grpPrms.nUe);
     }
     else if (group_buf_enabled == 0)
     {
-        CHECK_CUDA_ERR(cudaMemset(grpPrms.cellAssocActUe, 0, grpPrms.nCell * grpPrms.nActiveUe));
-        CHECK_CUDA_ERR(cudaMemset(grpPrms.cellAssoc, 0, grpPrms.nCell * grpPrms.nUe));
+        CHECK_CUDA_ERR(cudaMemset(grpPrms.cellAssocActUe, 0, static_cast<size_t>(grpPrms.nCell) * grpPrms.nActiveUe));
+        CHECK_CUDA_ERR(cudaMemset(grpPrms.cellAssoc, 0, static_cast<size_t>(grpPrms.nCell) * grpPrms.nUe));
     }
 
     // PFM sorting
@@ -264,7 +272,7 @@ int cumac_task::setup()
     ts_copy = std::chrono::system_clock::now().time_since_epoch().count();
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_start, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_start, strm));
     }
 
     for (uint32_t cell_id = 0; cell_id < grpPrms.nCell; cell_id++)
@@ -282,38 +290,63 @@ int cumac_task::setup()
     {
         CHECK_VALUE_EQUAL_ERR(buf_num.cellId, data_num.cellId);
         CHECK_VALUE_EQUAL_ERR(buf_num.prgMsk, data_num.prgMsk);
-        CHECK_VALUE_EQUAL_ERR(buf_num.wbSinr, data_num.wbSinr);
-        CHECK_VALUE_EQUAL_ERR(buf_num.avgRatesActUe, data_num.avgRatesActUe);
+        // Allow data_num <= buf_num when nActiveUe < nMaxActUePerCell
+        CHECK_VALUE_MAX_ERR(data_num.wbSinr, buf_num.wbSinr);
+        CHECK_VALUE_MAX_ERR(data_num.avgRatesActUe, buf_num.avgRatesActUe);
+        CHECK_VALUE_MAX_ERR(data_num.cellAssocActUe, buf_num.cellAssocActUe);
+        NVLOGI_FMT(TAG, "SFN {}.{} DATA_NUM UE_SEL: cellId={} prgMsk={} wbSinr={} avgRatesActUe={} cellAssocActUe={} setSchdUePerCellTTI={}",
+            ss.u16.sfn, ss.u16.slot, data_num.cellId, data_num.prgMsk, data_num.wbSinr, data_num.avgRatesActUe, data_num.cellAssocActUe, data_num.setSchdUePerCellTTI);
     }
 
     if (taskBitMask & (0x1 << CUMAC_TASK_PRB_ALLOCATION))
     {
-        CHECK_VALUE_EQUAL_ERR(buf_num.estH_fr, data_num.estH_fr);
-        CHECK_VALUE_EQUAL_ERR(buf_num.postEqSinr, data_num.postEqSinr);
-        CHECK_VALUE_EQUAL_ERR(buf_num.sinVal, data_num.sinVal);
-        CHECK_VALUE_EQUAL_ERR(buf_num.detMat, data_num.detMat);
-        CHECK_VALUE_EQUAL_ERR(buf_num.prdMat, data_num.prdMat);
+        // Allow data_num <= buf_num when nActiveUe < nMaxActUePerCell
+        CHECK_VALUE_MAX_ERR(data_num.estH_fr, buf_num.estH_fr);
+        CHECK_VALUE_MAX_ERR(data_num.postEqSinr, buf_num.postEqSinr);
+        CHECK_VALUE_MAX_ERR(data_num.sinVal, buf_num.sinVal);
+        CHECK_VALUE_MAX_ERR(data_num.detMat, buf_num.detMat);
+        CHECK_VALUE_MAX_ERR(data_num.prdMat, buf_num.prdMat);
+        NVLOGI_FMT(TAG, "SFN {}.{} DATA_NUM PRB_ALLOC: estH_fr={} postEqSinr={} sinVal={} detMat={} prdMat={} allocSol={}",
+            ss.u16.sfn, ss.u16.slot, data_num.estH_fr, data_num.postEqSinr, data_num.sinVal, data_num.detMat, data_num.prdMat, data_num.allocSol);
     }
 
     if (taskBitMask & (0x1 << CUMAC_TASK_PFM_SORT))
     {
         CHECK_VALUE_EQUAL_ERR(buf_num.pfmCellInfo, data_num.pfmCellInfo);
+        NVLOGI_FMT(TAG, "SFN {}.{} DATA_NUM PFM_SORT: pfmCellInfo={}",
+            ss.u16.sfn, ss.u16.slot, data_num.pfmCellInfo);
     }
 
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_copy1, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_copy1, strm));
         if (group_buf_enabled)
         {
+            if (debug_option & DBG_OPT_PRINT_CUMAC_BUF)
+            {
+                // Compare difference between data_num and handler's buf_num:
+                for (int i = 0; i < sizeof(cumac_buf_num_t) / sizeof(uint32_t); i++)
+                {
+                    uint32_t *pdata_num = reinterpret_cast<uint32_t*>(&data_num) + i;
+                    uint32_t *pbuf_num = reinterpret_cast<uint32_t*>(&buf_num) + i;
+                    if (*pdata_num != *pbuf_num)
+                    {
+                        NVLOGI_FMT(TAG, "SFN {}.{} DATA_NUM mismatch: i={} data_num={} buf_num={}", ss.u16.sfn, ss.u16.slot, i, *pdata_num, *pbuf_num);
+                    }
+                }
+            }
+
+            // gpu_copy_cell_bufs uses task_info->data_num for per-cell strides and copy lengths. It must match this TTI's IPC payload sizes (task->data_num), not buf_num from init.
+            CHECK_CUDA_ERR(cudaMemcpyAsync(&gpu_task_info->data_num, &data_num, sizeof(cumac_buf_num_t), cudaMemcpyHostToDevice, strm));
             CHECK_CUDA_ERR(cudaMemcpyAsync(gpu_cell_descs, cpu_cell_descs, sizeof(cell_desc_t) * cell_num, cudaMemcpyHostToDevice, strm));
             cumac_copy_cell_to_group(this, cp_handler->configs.cuda_block_num);
         }
-        cudaEventRecord(ev_copy2, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_copy2, strm));
     }
 
     if (debug_option & DBG_OPT_PRINT_CUMAC_BUF) // Dump buffers
     {
-        cudaStreamSynchronize(strm);
+        CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
         if (taskBitMask & (0x1 << CUMAC_TASK_UE_SELECTION))
         {
             for (int i = 0; i < cell_num; i++)
@@ -337,11 +370,11 @@ int cumac_task::setup()
     // Copy the contiguous estH_fr buffer
     if (taskBitMask & (0x1 << CUMAC_TASK_PRB_ALLOCATION))
     {
-        CHECK_VALUE_EQUAL_ERR(buf_num.estH_fr, data_num.estH_fr);
-        CHECK_VALUE_EQUAL_ERR(buf_num.postEqSinr, data_num.postEqSinr);
-        CHECK_VALUE_EQUAL_ERR(buf_num.sinVal, data_num.sinVal);
-        CHECK_VALUE_EQUAL_ERR(buf_num.detMat, data_num.detMat)
-        CHECK_VALUE_EQUAL_ERR(buf_num.prdMat, data_num.prdMat);
+        CHECK_VALUE_MAX_ERR(data_num.estH_fr, buf_num.estH_fr);
+        CHECK_VALUE_MAX_ERR(data_num.postEqSinr, buf_num.postEqSinr);
+        CHECK_VALUE_MAX_ERR(data_num.sinVal, buf_num.sinVal);
+        CHECK_VALUE_MAX_ERR(data_num.detMat, buf_num.detMat);
+        CHECK_VALUE_MAX_ERR(data_num.prdMat, buf_num.prdMat);
 
         cuComplex *src_estH_fr = input_estH_fr;
         // if (tv != nullptr && debug_option & DBG_OPT_WAR_COPY_GROUP_TV)
@@ -360,7 +393,7 @@ int cumac_task::setup()
 
         if (debug_option & DBG_OPT_PRINT_CUMAC_BUF) // Dump buffers
         {
-            cudaStreamSynchronize(strm);
+            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
             print_array("postEqSinr", grpPrms.postEqSinr, data_num.postEqSinr);
             print_array("sinVal", grpPrms.sinVal, data_num.sinVal);
             print_array("estH_fr", reinterpret_cast<float *>(grpPrms.estH_fr), data_num.estH_fr * 2);
@@ -377,7 +410,7 @@ int cumac_task::setup()
     ts_setup = std::chrono::system_clock::now().time_since_epoch().count();
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_copy2, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_copy2, strm));
     }
 
     // Start call cuMAC setup()
@@ -455,7 +488,7 @@ int cumac_task::setup()
 
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_setup_end, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_setup_end, strm));
     }
     return 0;
 }
@@ -477,7 +510,7 @@ int cumac_task::run()
 
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_run_start, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_run_start, strm));
     }
 
     // UE_SELECTION run
@@ -504,7 +537,7 @@ int cumac_task::run()
         else if (group_buf_enabled == 0)
         {
             CHECK_CUDA_ERR(cudaMemcpyAsync(output_setSchdUePerCellTTI, schdSol.setSchdUePerCellTTI, sizeof(*schdSol.setSchdUePerCellTTI) * data_num.setSchdUePerCellTTI, cudaMemcpyDeviceToHost, strm));
-            cudaStreamSynchronize(strm);
+            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
         }
 
         ts_copy_end = std::chrono::system_clock::now().time_since_epoch().count();
@@ -513,7 +546,7 @@ int cumac_task::run()
 
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_run1, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_run1, strm));
     }
 
     // PRB_ALLOCATION run
@@ -535,7 +568,7 @@ int cumac_task::run()
         else if (group_buf_enabled == 0)
         {
             CHECK_CUDA_ERR(cudaMemcpyAsync(ueStatus.avgRates, input_avgRates, sizeof(float) * data_num.avgRates, cudaMemcpyHostToDevice, strm));
-            cudaStreamSynchronize(strm);
+            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
         }
         else
         {
@@ -581,7 +614,7 @@ int cumac_task::run()
         else if (group_buf_enabled == 0)
         {
             CHECK_CUDA_ERR(cudaMemcpyAsync(output_allocSol, schdSol.allocSol, sizeof(*schdSol.allocSol) * data_num.allocSol, cudaMemcpyDeviceToHost, strm));
-            cudaStreamSynchronize(strm);
+            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
         }
 
         if (debug_option & DBG_OPT_PRINT_CUMAC_BUF) // Dump output buffers
@@ -594,7 +627,7 @@ int cumac_task::run()
 
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_run2, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_run2, strm));
     }
 
     // LAYER_SELECTION run
@@ -621,7 +654,7 @@ int cumac_task::run()
         else if (group_buf_enabled == 0)
         {
             CHECK_CUDA_ERR(cudaMemcpyAsync(output_layerSelSol, schdSol.layerSelSol, sizeof(*schdSol.layerSelSol) * data_num.layerSelSol, cudaMemcpyDeviceToHost, strm));
-            cudaStreamSynchronize(strm);
+            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
         }
 
         if (debug_option & DBG_OPT_PRINT_CUMAC_BUF) // Dump output buffers
@@ -635,7 +668,7 @@ int cumac_task::run()
 
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_run3, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_run3, strm));
     }
 
     // MCS_SELECTION run
@@ -661,7 +694,7 @@ int cumac_task::run()
         else if (group_buf_enabled == 0)
         {
             CHECK_CUDA_ERR(cudaMemcpyAsync(ueStatus.tbErrLast, input_tbErrLast, sizeof(*ueStatus.tbErrLast) * data_num.tbErrLast, cudaMemcpyHostToDevice, strm));
-            cudaStreamSynchronize(strm);
+            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
         }
         else
         {
@@ -692,7 +725,7 @@ int cumac_task::run()
         else if (group_buf_enabled == 0)
         {
             CHECK_CUDA_ERR(cudaMemcpyAsync(output_mcsSelSol, schdSol.mcsSelSol, sizeof(*schdSol.mcsSelSol) * data_num.mcsSelSol, cudaMemcpyDeviceToHost, strm));
-            cudaStreamSynchronize(strm);
+            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
         }
 
         if (debug_option & DBG_OPT_PRINT_CUMAC_BUF) // Dump output buffers
@@ -719,10 +752,10 @@ int cumac_task::run()
 
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_run4, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_run4, strm));
         if (slot_concurrent_enable == 0)
         {
-            cudaStreamSynchronize(strm);
+            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
             sem_post(&cp_handler->gpu_sem);
         }
     }
@@ -738,7 +771,7 @@ int cumac_task::callback()
 
     if (run_in_cpu == 0)
     {
-        cudaEventRecord(ev_callback_start, strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_callback_start, strm));
 
         if (taskBitMask & (0x1 << CUMAC_TASK_UE_SELECTION))
         {
@@ -756,8 +789,8 @@ int cumac_task::callback()
         {
             CHECK_CUDA_ERR(cudaMemcpyAsync(output_mcsSelSol, schdSol.mcsSelSol, sizeof(*schdSol.mcsSelSol) * data_num.mcsSelSol, cudaMemcpyDeviceToHost, strm));
         }
-        cudaEventRecord(ev_callback_end, strm);
-        cudaStreamSynchronize(strm);
+        CHECK_CUDA_ERR(cudaEventRecord(ev_callback_end, strm));
+        CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
     }
 
     if (grpPrms.allocType == 0 && taskBitMask & (0x1 << CUMAC_TASK_PRB_ALLOCATION))
@@ -789,13 +822,13 @@ int cumac_task::callback()
 
     if (debug_option & DBG_OPT_COMPARE_GROUP_TV_BUF)
     {
-        cudaStreamSynchronize(strm);
+        CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
         validate_buffer_callback();
     }
 
     if (debug_option & DBG_OPT_PRINT_CUMAC_BUF) // Dump output buffers
     {
-        cudaStreamSynchronize(strm);
+        CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
 
         if (taskBitMask & (0x1 << CUMAC_TASK_UE_SELECTION))
         {
@@ -822,24 +855,24 @@ int cumac_task::callback()
     if (run_in_cpu == 0)
     {
         // Below are for timing and performance debug
-        cudaEventElapsedTime(&tm_copy1, ev_start, ev_copy1);
-        cudaEventElapsedTime(&tm_copy2, ev_copy1, ev_copy2);
-        cudaEventElapsedTime(&tm_setup, ev_copy2, ev_setup_end);
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_copy1, ev_start, ev_copy1));
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_copy2, ev_copy1, ev_copy2));
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_setup, ev_copy2, ev_setup_end));
 
-        cudaEventElapsedTime(&tm_run1, ev_run_start, ev_run1);
-        cudaEventElapsedTime(&tm_run2, ev_run1, ev_run2);
-        cudaEventElapsedTime(&tm_run3, ev_run2, ev_run3);
-        cudaEventElapsedTime(&tm_run4, ev_run3, ev_run4);
-        cudaEventElapsedTime(&tm_run, ev_run_start, ev_run4);
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_run1, ev_run_start, ev_run1));
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_run2, ev_run1, ev_run2));
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_run3, ev_run2, ev_run3));
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_run4, ev_run3, ev_run4));
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_run, ev_run_start, ev_run4));
 
-        cudaEventElapsedTime(&tm_callback, ev_callback_start, ev_callback_end);
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_callback, ev_callback_start, ev_callback_end));
 
-        cudaEventElapsedTime(&tm_total, ev_start, ev_callback_end);
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_total, ev_start, ev_callback_end));
 
         tm_debug = 0;
-        // cudaEventRecord(ev_debug, strm);
-        // cudaStreamSynchronize(strm);
-        // cudaEventElapsedTime(&tm_debug, ev_callback_end, ev_debug);
+        // CHECK_CUDA_ERR(cudaEventRecord(ev_debug, strm));
+        // CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
+        // CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_debug, ev_callback_end, ev_debug));
 
         float slot_total = static_cast<float>(ts_end - ts_start) / 1E6;
         NVLOGI_FMT(TAG, "SFN {}.{} in {} 0x{:X} TIMING: slot_total={:.3f} gpu_total={:.3f} copy1={:.3f} copy2={:.3f} setup={:.3f} run={:.3f} callback={:.3f} debug={:.3f} | run {:.3f} {:.3f} {:.3f} {:.3f}",
@@ -862,7 +895,7 @@ int cumac_task::validate_buffer_setup()
         return -1;
     }
 
-    cudaStreamSynchronize(strm);
+    CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
 
     if (taskBitMask & (0x1 << CUMAC_TASK_UE_SELECTION))
     {
@@ -903,7 +936,7 @@ int cumac_task::validate_buffer_callback()
         return -1;
     }
 
-    cudaStreamSynchronize(strm);
+    CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
 
     if (taskBitMask & (0x1 << CUMAC_TASK_UE_SELECTION))
     {

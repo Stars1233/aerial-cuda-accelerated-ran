@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- */
+*/
 
 #include <gtest/gtest.h>
 #include "cuphy.hpp"
@@ -119,6 +119,11 @@ protected:
 
         // Initialize UeGrp parameters to zero
         memset(drvdUeGrpPrmsCpu, 0, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t));
+
+        // Allocate a minimal, non-null FO compensation buffer pointer array.
+        // Note: the public API wrapper rejects a null pFoCompensationBuffers argument.
+        ASSERT_EQ(cudaSuccess, cudaMallocHost(&foCompensationBuffersCpu, sizeof(float*)));
+        foCompensationBuffersCpu[0] = nullptr;
     }
 
     // Configure UE group parameters for tests
@@ -160,7 +165,7 @@ protected:
             puschRxCfoTaEstHndl,
             drvdUeGrpPrmsCpu,
             drvdUeGrpPrmsGpu,
-            0, // pFoCompensationBuffers
+            foCompensationBuffersCpu, // pFoCompensationBuffers (must be non-null)
             nUeGrps,
             nMaxPrb,
             nullptr, // pDbg parameter - set to nullptr
@@ -261,6 +266,12 @@ protected:
             drvdUeGrpPrmsCpu = nullptr;
         }
 
+        if(foCompensationBuffersCpu)
+        {
+            cudaFreeHost(foCompensationBuffersCpu);
+            foCompensationBuffersCpu = nullptr;
+        }
+
         // Free GPU memory
         if(statDescrBufGpu)
         {
@@ -302,6 +313,7 @@ protected:
     void*                    dynDescrBufGpu   = nullptr;
     cuphyPuschRxUeGrpPrms_t* drvdUeGrpPrmsCpu = nullptr;
     cuphyPuschRxUeGrpPrms_t* drvdUeGrpPrmsGpu = nullptr;
+    float**                  foCompensationBuffersCpu = nullptr;
 
     // Handle and launch configs
     cuphyPuschRxCfoTaEstHndl_t       puschRxCfoTaEstHndl = nullptr;

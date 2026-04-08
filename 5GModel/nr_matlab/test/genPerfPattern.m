@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -95,10 +95,15 @@ all_patterns = { ...
     '73', ...
     '75', ...
     '77', ...
-    '79', ...
+    '79', '79a', '79b', ...
     '81a', '81b', '81c', '81d', ...
     '83a', '83b', '83c', '83d', ...
-    '85'
+    '85', ...
+    '87', ...
+    '89', ...
+    '91', ...
+    '101', '101a', ...
+    '102', '102a'
 };
 
 compact_patterns = {'59c', '60c', '69'};
@@ -294,6 +299,14 @@ for i = 1:length(patterns)
             dlmix_cmd = 'testCompGenTV_dlmix([13067:13216])';
             ulmix_cmd = 'testCompGenTV_ulmix([7155:7259])';
             bfw_cmd = 'testCompGenTV_bfw([9391])';
+        case '79a'
+            dlmix_cmd = 'testCompGenTV_dlmix([13067:13216])';
+            ulmix_cmd = 'testCompGenTV_ulmix([7953:8057])';
+            bfw_cmd = 'testCompGenTV_bfw([9501])';
+        case '79b'
+            dlmix_cmd = 'testCompGenTV_dlmix([13067:13216])';
+            ulmix_cmd = 'testCompGenTV_ulmix([8058:8162])';
+            bfw_cmd = 'testCompGenTV_bfw([9507])';
         case '81a'
             dlmix_cmd = 'testCompGenTV_dlmix([13217:13366])';
             ulmix_cmd = 'testCompGenTV_ulmix([7365:7469])';
@@ -330,6 +343,30 @@ for i = 1:length(patterns)
             dlmix_cmd = 'testCompGenTV_dlmix([13547:13696])';
             ulmix_cmd = 'testCompGenTV_ulmix([7785:7889])';
             bfw_cmd = 'testCompGenTV_bfw([9461])';
+        case '87'
+            dlmix_cmd = 'testCompGenTV_dlmix(setdiff([13067:13216 13697:13711], 13172:13186))';
+            ulmix_cmd = 'testCompGenTV_ulmix([7155:7259])';
+            bfw_cmd = 'testCompGenTV_bfw([9391])';
+        case '89'
+            dlmix_cmd = 'testCompGenTV_dlmix([13712:13801])';
+            ulmix_cmd = 'testCompGenTV_ulmix([7890:7952])';
+            bfw_cmd = 'testCompGenTV_bfw([9449 9455 9469 9475 9481 9487])';
+        case '91'
+            dlmix_cmd = 'testCompGenTV_dlmix([13802:13951])';
+            ulmix_cmd = 'testCompGenTV_ulmix([8163:8267])';
+            bfw_cmd = 'testCompGenTV_bfw([9461])';
+        case '101'
+            dlmix_cmd = 'testCompGenTV_dlmix([7472:7495])';
+            ulmix_cmd = 'testCompGenTV_ulmix([4375:4470])';
+        case '101a'
+            dlmix_cmd = 'testCompGenTV_dlmix([7472:7495])';
+            ulmix_cmd = 'testCompGenTV_ulmix([8268:8363])';
+        case '102'
+            dlmix_cmd = 'testCompGenTV_dlmix([7496:7519])';
+            ulmix_cmd = 'testCompGenTV_ulmix([8364:8459])';
+        case '102a'
+            dlmix_cmd = 'testCompGenTV_dlmix([7496:7519])';
+            ulmix_cmd = 'testCompGenTV_ulmix([8460:8555])';
         otherwise
             error('Pattern number not found: %s', pattern_str);
     end

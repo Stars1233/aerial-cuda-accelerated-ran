@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <cstring>
 #include <vector>
 
 #include <pybind11/pybind11.h>
@@ -359,6 +360,12 @@ void printPuschDrvdUeGrpPrms(const cuphyPuschRxUeGrpPrms_t& puschRxUeGrpPrms) {
 PuschParams::PuschParams():
 m_LinearAlloc(getBufferSize()) {
 
+    // Zero-initialize all structures to prevent uninitialized memory issues
+    memset(&m_puschStatPrms, 0, sizeof(m_puschStatPrms));
+    memset(&m_puschStatDbgPrms, 0, sizeof(m_puschStatDbgPrms));
+    memset(&m_tracker, 0, sizeof(m_tracker));
+    memset(&m_puschDynPrms, 0, sizeof(m_puschDynPrms));
+
     // Allocate CPU and GPU memory for the PUSCH Rx UE group parameters.
     m_descrSizeBytes = sizeof(cuphyPuschRxUeGrpPrms_t) * MAX_N_USER_GROUPS_SUPPORTED;
     size_t descrAlignBytes = alignof(cuphyPuschRxUeGrpPrms_t);
@@ -442,6 +449,8 @@ void PuschParams::setFilters(const py::array& WFreq,
 
 
 void PuschParams::setStatPrms(const py::object& statPrms) {
+    // Zero-initialize the entire structure to prevent uninitialized memory bugs
+    memset(&m_puschStatPrms, 0, sizeof(m_puschStatPrms));
 
     const py::list cellStatPrmList = statPrms.attr("cellStatPrms");
     uint16_t nCells = cellStatPrmList.size();
@@ -470,6 +479,7 @@ void PuschParams::setStatPrms(const py::object& statPrms) {
     m_puschStatPrms.fixedMaxNumLdpcItrs       = statPrms.attr("fixedMaxNumLdpcItrs").cast<uint8_t>();
     m_puschStatPrms.ldpcClampValue            = statPrms.attr("ldpcClampValue").cast<float>();
     m_puschStatPrms.polarDcdrListSz           = statPrms.attr("polarDcdrListSz").cast<uint8_t>();
+    m_puschStatPrms.nMaxTbPerNode             = statPrms.attr("nMaxTbPerNode").cast<uint8_t>();
     m_puschStatPrms.chEstAlgo                 = statPrms.attr("chEstAlgo").cast<cuphyPuschChEstAlgoType_t>();
     m_puschStatPrms.enablePerPrgChEst         = statPrms.attr("enablePerPrgChEst").cast<uint8_t>();
     m_puschStatPrms.eqCoeffAlgo               = statPrms.attr("eqCoeffAlgo").cast<cuphyPuschEqCoefAlgoType_t>();
@@ -490,6 +500,7 @@ void PuschParams::setStatPrms(const py::object& statPrms) {
     m_puschStatPrms.enableEarlyHarq           = statPrms.attr("enableEarlyHarq").cast<uint8_t>();
     m_puschStatPrms.earlyHarqProcNodePriority = statPrms.attr("earlyHarqProcNodePriority").cast<int32_t>();
     m_puschStatPrms.workCancelMode            = statPrms.attr("workCancelMode").cast<cuphyPuschWorkCancelMode_t>();
+    m_puschStatPrms.enableBatchedMemcpy       = statPrms.attr("enableBatchedMemcpy").cast<uint8_t>();
     if (py::object attr = py::getattr(statPrms, "chestFactorySettingsFilename"); !attr.is_none())
     {
         m_puschrxChestFactorySettingsFilename = statPrms.attr("chestFactorySettingsFilename").cast<
@@ -520,6 +531,9 @@ void PuschParams::setStatPrms(const py::object& statPrms) {
 
     // Cell static parameters.
     for (int cellIdx = 0; cellIdx < nCells; cellIdx ++ ) {
+        // Zero-initialize cell structures to prevent uninitialized memory
+        memset(&m_cellStatPrms[cellIdx], 0, sizeof(m_cellStatPrms[cellIdx]));
+        memset(&m_puschCellStatPrms[cellIdx], 0, sizeof(m_puschCellStatPrms[cellIdx]));
 
         const py::object cellStatPrms = cellStatPrmList[cellIdx];
 
@@ -563,12 +577,20 @@ void PuschParams::setStatPrms(const py::object& statPrms) {
     }
 
     // Next, debug parameters.
+    // cuPHY library requires pDbg to always be non-null, so always provide a valid structure
+    // Zero-initialize the structure to prevent random garbage values causing crashes
+    memset(&m_puschStatDbgPrms, 0, sizeof(m_puschStatDbgPrms));
+    m_puschStatPrms.pDbg = &m_puschStatDbgPrms;
+
     py::object dbg = statPrms.attr("dbg");
     if (std::string(py::str(dbg)) == "None") {
-        m_puschStatPrms.pDbg = nullptr;
+        // Set default values when debug object is None
+        m_puschStatPrms.pDbg->descrmOn = 1;
+        m_puschStatPrms.pDbg->enableApiLogging = 0;
+        m_puschStatPrms.pDbg->forcedNumCsi2Bits = 0;
+        m_puschStatPrms.pDbg->pOutFileName = nullptr;
     }
     else {
-        m_puschStatPrms.pDbg = &m_puschStatDbgPrms;
         m_puschStatPrms.pDbg->descrmOn = dbg.attr("descrmOn").cast<uint8_t>();
         m_puschStatPrms.pDbg->enableApiLogging = dbg.attr("enableApiLogging").cast<uint8_t>();
         m_puschStatPrms.pDbg->forcedNumCsi2Bits = dbg.attr("forcedNumCsi2Bits").cast<uint16_t>();
@@ -747,6 +769,7 @@ void PuschParams::setDynPrmsPhase1(const py::object& dynPrms) {
         m_ueGrpPrms[ueGroupIdx].startPrb = ueGrpPrms.attr("startPrb").cast<uint16_t>();
         m_ueGrpPrms[ueGroupIdx].nPrb = ueGrpPrms.attr("nPrb").cast<uint16_t>();
         m_ueGrpPrms[ueGroupIdx].prgSize = ueGrpPrms.attr("prgSize").cast<uint16_t>();
+        m_ueGrpPrms[ueGroupIdx].enablePerPrgChEstPerUeg = 0;
         m_ueGrpPrms[ueGroupIdx].nUplinkStreams = ueGrpPrms.attr("nUplinkStreams").cast<uint16_t>();
         m_ueGrpPrms[ueGroupIdx].puschStartSym = ueGrpPrms.attr("puschStartSym").cast<uint8_t>();
         m_ueGrpPrms[ueGroupIdx].nPuschSym = ueGrpPrms.attr("nPuschSym").cast<uint8_t>();
@@ -815,6 +838,8 @@ void PuschParams::setDynPrmsPhase1(const py::object& dynPrms) {
         m_uePrms[ueIdx].pUciPrms           = nullptr;  // UCI not supported.
         m_uePrms[ueIdx].debug_d_derateCbsIndices = nullptr;  // Not supported.
         m_uePrms[ueIdx].foForgetCoeff      = 0.0f; // Not supported
+        m_uePrms[ueIdx].ldpcEarlyTerminationPerUe = 0; // Not supported
+        m_uePrms[ueIdx].ldpcMaxNumItrPerUe  = 10; // Not supported
     }
     m_cellGrpDynPrms.nUes = nUes;
     m_cellGrpDynPrms.pUePrms = m_uePrms.data();

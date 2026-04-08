@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +35,6 @@
 //#define ENABLE_DPDK_TX_PKT_TRACING
 
 #define MAX_PKT_DEBUG 0xffff               //!< Maximum packet debug entries
-#define MAX_DL_UPLANE_QUEUES 32            //!< Maximum downlink U-plane queues
 #define MAX_DL_SLOTS_TRIGGER_TIME 512      //!< Maximum downlink slot trigger times
 
 namespace aerial_fh
@@ -236,7 +235,7 @@ typedef union
 /******************************************************************/ /**
  * \brief User data compression methods
  */
-enum class UserDataCompressionMethod
+enum class UserDataCompressionMethod : uint8_t
 {
     NO_COMPRESSION                 = 0b0000,
     BLOCK_FLOATING_POINT           = 0b0001,
@@ -781,6 +780,11 @@ struct CPlaneSectionExt11BundlesInfo
     uint8_t* bfwIQ;
 };
 
+static_assert(std::is_trivially_copyable_v<CPlaneSectionExt11BundlesInfo>);
+static_assert(std::is_trivially_copyable_v<oran_cmsg_sect_ext_type_11_disableBFWs_0_bfp_compressed_bundle_hdr>);
+static_assert(std::is_trivially_copyable_v<oran_cmsg_sect_ext_type_11_disableBFWs_0_bundle_uncompressed>);
+static_assert(std::is_trivially_copyable_v<oran_cmsg_sect_ext_type_11_disableBFWs_1_bundle>);
+
 /******************************************************************/ /**
  * \brief C-plane Section fields
  */
@@ -825,6 +829,12 @@ struct CPlaneSectionExtInfo
     };
 };
 
+static_assert(std::is_trivially_copyable_v<CPlaneSectionExtInfo>);
+static_assert(std::is_trivially_copyable_v<oran_cmsg_ext_hdr>);
+static_assert(std::is_trivially_copyable_v<CPlaneSectionExt4Info>);
+static_assert(std::is_trivially_copyable_v<CPlaneSectionExt5Info>);
+static_assert(std::is_trivially_copyable_v<CPlaneSectionExt11Info>);
+
 /******************************************************************/ /**
  * \brief C-plane Section fields
  */
@@ -845,6 +855,24 @@ struct CPlaneSectionInfo
     CPlaneSectionExtInfo* ext4;   //!< Section Extension Type 4 (modulation compression params)
     CPlaneSectionExtInfo* ext5;   //!< Section Extension Type 5 (modulation compression additional params)
     CPlaneSectionExtInfo* ext11;  //!< Section Extension Type 11 (beamforming weights)
+    // Section ID lookback index for CSI-RS compact signaling.
+    //
+    // Specifies the number of sections to look back in the section array to find
+    // the reference section whose section ID should be reused for the current section.
+    //
+    // In CSI-RS transmissions with compact signaling, multiple sections corresponding
+    // to different logical antenna ports but mapped to the same fronthaul flow must
+    // share the same section ID. This field enables that ID sharing by indicating
+    // which previous section's ID to reuse.
+    //
+    // Value semantics:
+    //   0: Current section is assigned a new section ID (acts as reference section).
+    //   N > 0: Current section reuses the section ID from the section that is N
+    //          positions backward in the same flow's section array.
+    //
+    // NOTE: This is critical for O-RAN compliant CSI-RS compact signaling where section
+    //       ID grouping reduces overhead while section extensions remain unique.
+    uint8_t section_id_lookback_index; //!< Number of index lookback for section id 
 };
 
 /******************************************************************/ /**
@@ -853,17 +881,16 @@ struct CPlaneSectionInfo
 struct CPlaneMsgSendInfo
 {
     FlowHandle                     flow;                //!< eCPRI flow to send on
-    int                            ap_idx;              //!< Antenna port index
-    slot_command_api::slot_info_t* slot_info;           //!< Slot timing information
-    std::atomic<int>*              nxt_section_id;      //!< Next section ID (atomic for thread-safety)
-    MsgSendWindow                  tx_window;           //!< TX timing window
-    CPlaneSectionCommonHdr         section_common_hdr;  //!< Common section header fields
-    oran_pkt_dir                   data_direction;      //!< Data direction (DL/UL)
-    bool                           hasSectionExt;       //!< true if sections have extensions
+    uint16_t*                           nxt_section_id;      //!< Next section ID 
     //! Section-type specific fields
     //!
     //! \note all sections must be of the same type
     CPlaneSectionInfo* sections;  //!< Array of C-plane sections
+    MsgSendWindow                  tx_window;           //!< TX timing window
+    CPlaneSectionCommonHdr         section_common_hdr;  //!< Common section header fields
+    uint8_t                        ap_idx;              //!< Antenna port index
+    oran_pkt_dir                   data_direction;      //!< Data direction (DL/UL)
+    bool                           hasSectionExt;       //!< true if sections have extensions
 };
 
 /******************************************************************/ /**

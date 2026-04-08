@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from msilib import sequence
 from bokeh.plotting import figure, show, output_file, save
 from bokeh.models import BoxAnnotation, Span, Label
 from bokeh.layouts import column
@@ -130,6 +129,14 @@ base.add_argument(
     help="Specifies the bandwidth in PRB number",
     required=False,
 )
+base.add_argument(
+    "--cells",
+    type=int,
+    dest="cells",
+    default=2,
+    help="Specifies the number of cells (default: 2)",
+    required=False,
+)
 args = base.parse_args()
 
 
@@ -139,7 +146,7 @@ for config in args.config:
     data = json.load(ifile)
     ifile.close()
 
-    cells = 2
+    cells = args.cells
 
     if args.nPrb is not None:
         plot(config, data, cells, args.nPrb)

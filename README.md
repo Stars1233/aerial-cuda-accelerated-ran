@@ -32,6 +32,7 @@ aerial-cuda-accelerated-ran/
 │   ├── ru-emulator/         # Radio Unit emulator
 │   ├── testMAC/            # Test MAC implementation
 │   └── container/          # Container build scripts and recipes
+│   └── data_lake/          # data lake and E3 agent
 ├── cuMAC/              # CUDA-accelerated L2 Layer
 ├── cuMAC-CP/           # MAC Control Plane components
 ├── pyaerial/           # Python API and ML/AI tools
@@ -47,15 +48,11 @@ aerial-cuda-accelerated-ran/
 
 ```bash
 # Clone repository
-git clone https://github.com/NVIDIA/aerial-cuda-accelerated-ran.git --recurse-submodules
+git clone --recurse-submodules https://github.com/NVIDIA/aerial-cuda-accelerated-ran.git
 cd aerial-cuda-accelerated-ran
 
-# Enable git LFS (if needed for large files)
-git lfs install
-git lfs pull
-
-# Pull the Aerial container from NGC
-docker pull nvcr.io/nvidia/aerial/aerial-cuda-accelerated-ran:25-3-cubb
+# Enable git LFS and pull files
+sudo apt install git-lfs && git lfs pull
 
 # Start interactive development container
 ./cuPHY-CP/container/run_aerial.sh
@@ -79,7 +76,7 @@ Visit the full documentation at [NVIDIA Docs Hub](https://docs.nvidia.com/aerial
 
 ## Support
 - **Level**: Maintained
-- **How to get help**: 
+- **How to get help**:
   - File issues on GitHub for bugs and feature requests
   - Join discussions for questions and community support
 
@@ -96,7 +93,7 @@ If you use NVIDIA Aerial™ CUDA-Accelerated RAN in your research, please cite:
 @software{nvidia_aerial_cuda_accelerated_ran,
   title = {NVIDIA Aerial™ CUDA-Accelerated RAN},
   author = {NVIDIA Corporation},
-  year = {2025},
+  year = {2025-2026},
   url = {https://github.com/NVIDIA/aerial-cuda-accelerated-ran}
 }
 ```

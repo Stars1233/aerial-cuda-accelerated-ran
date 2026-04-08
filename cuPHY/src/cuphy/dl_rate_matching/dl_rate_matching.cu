@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -523,11 +523,7 @@ __device__ void QAM4_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Ediv
                 int qam_offset = 16 * i + intra_index;
                 int qam_in_num_qams_per_layer_per_TB = CB_start_qam_per_layer + (qam_offset >> shift_bits);
                 if (qam_offset < EdivQm_bits) {
-#ifdef ENABLE_32DL
-                   int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid + 16 * dmrs_params->nlAbove16;
-#else
-                   int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid;
-#endif
+                   int layer_id = calculate_layer_id(dmrs_params->port_ids[tmp_layer_id], dmrs_params->n_scid, dmrs_params->nlAbove16);
                    uint32_t output_index = output_index_no_precoding<csi_rs>(start_Rb, qam_in_num_qams_per_layer_per_TB,
                                                                              REs_per_OFDM_symbol, dmrs_params, ue_grp_params,
                                                                              data_symbol_loc, all_Rbs_symbols, d_xtf_re_map, layer_id,
@@ -638,11 +634,7 @@ __device__ void QAM4_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits,
                 int qams_offset = (i / 3) * 16  + (16 * i_mod_3 + intra_index) / Tnl;
                 int qam_in_num_qams_per_layer_per_TB = CB_start_qam_per_layer + qams_offset;
                 if (qams_offset * Tnl  < EdivQm_bits) {
-#ifdef ENABLE_32DL
-                   int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid + 16 * dmrs_params->nlAbove16;
-#else
-                   int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid;
-#endif
+                   int layer_id = calculate_layer_id(dmrs_params->port_ids[tmp_layer_id], dmrs_params->n_scid, dmrs_params->nlAbove16);
                    uint32_t output_index = output_index_no_precoding<csi_rs>(start_Rb, qam_in_num_qams_per_layer_per_TB,
                                                                              REs_per_OFDM_symbol, dmrs_params, ue_grp_params,
                                                                              data_symbol_loc, all_Rbs_symbols, d_xtf_re_map, layer_id,
@@ -748,11 +740,7 @@ __device__ void QAM16_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Edi
                 int qam_offset = 8 * i + intra_index;
                 int qam_in_num_qams_per_layer_per_TB = CB_start_qam_per_layer + (qam_offset >> shift_bits);
                 if (qam_offset < EdivQm_bits) {
-#ifdef ENABLE_32DL
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid + 16 * dmrs_params->nlAbove16;
-#else
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid;
-#endif
+                    int layer_id = calculate_layer_id(dmrs_params->port_ids[tmp_layer_id], dmrs_params->n_scid, dmrs_params->nlAbove16);
                     uint32_t output_index = output_index_no_precoding<csi_rs>(start_Rb, qam_in_num_qams_per_layer_per_TB,
                                                                               REs_per_OFDM_symbol, dmrs_params, ue_grp_params,
                                                                               data_symbol_loc, all_Rbs_symbols, d_xtf_re_map, layer_id,
@@ -848,11 +836,7 @@ __device__ void QAM16_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits
                 int qams_offset = (i / 3) * 8 + (8 * i_mod_3 + intra_index) / Tnl;
                 int qam_in_num_qams_per_layer_per_TB = CB_start_qam_per_layer + qams_offset;
                 if (qams_offset * Tnl <  EdivQm_bits) {
-#ifdef ENABLE_32DL
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid + 16 * dmrs_params->nlAbove16;
-#else
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid;
-#endif
+                    int layer_id = calculate_layer_id(dmrs_params->port_ids[tmp_layer_id], dmrs_params->n_scid, dmrs_params->nlAbove16);
                     uint32_t output_index = output_index_no_precoding<csi_rs>(start_Rb, qam_in_num_qams_per_layer_per_TB,
                                                                               REs_per_OFDM_symbol, dmrs_params, ue_grp_params,
                                                                               data_symbol_loc, all_Rbs_symbols, d_xtf_re_map, layer_id,
@@ -980,11 +964,7 @@ __device__ void QAM64_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Edi
 
                 int qam_in_num_qams_per_layer_per_TB = CB_start_qam_per_layer + qams_offset;
                 if (qams_offset * Tnl <  EdivQm_bits) {
-#ifdef ENABLE_32DL
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid + 16 * dmrs_params->nlAbove16;
-#else
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid;
-#endif
+                    int layer_id = calculate_layer_id(dmrs_params->port_ids[tmp_layer_id], dmrs_params->n_scid, dmrs_params->nlAbove16);
                     uint32_t output_index = output_index_no_precoding<csi_rs>(start_Rb, qam_in_num_qams_per_layer_per_TB,
                                                                               REs_per_OFDM_symbol, dmrs_params, ue_grp_params,
                                                                               data_symbol_loc, all_Rbs_symbols, d_xtf_re_map, layer_id,
@@ -1110,11 +1090,7 @@ __device__ void QAM64_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits
 
                 int qam_in_num_qams_per_layer_per_TB = CB_start_qam_per_layer + qams_offset;
                 if (qams_offset * Tnl <  EdivQm_bits) {
-#ifdef ENABLE_32DL
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid + 16 * dmrs_params->nlAbove16;
-#else
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid;
-#endif
+                    int layer_id = calculate_layer_id(dmrs_params->port_ids[tmp_layer_id], dmrs_params->n_scid, dmrs_params->nlAbove16);
                     uint32_t output_index = output_index_no_precoding<csi_rs>(start_Rb, qam_in_num_qams_per_layer_per_TB,
                                                                               REs_per_OFDM_symbol, dmrs_params, ue_grp_params,
                                                                               data_symbol_loc, all_Rbs_symbols, d_xtf_re_map, layer_id,
@@ -1225,11 +1201,7 @@ __device__ void QAM256_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Ed
                 int qams_offset = i * 4 + intra_index;
                 int qam_in_num_qams_per_layer_per_TB = CB_start_qam_per_layer + (qams_offset >> shift_bits);
                 if (qams_offset < EdivQm_bits) {
-#ifdef ENABLE_32DL
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid + 16 * dmrs_params->nlAbove16;
-#else
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid;
-#endif
+                    int layer_id = calculate_layer_id(dmrs_params->port_ids[tmp_layer_id], dmrs_params->n_scid, dmrs_params->nlAbove16);
                     uint32_t output_index = output_index_no_precoding<csi_rs>(start_Rb, qam_in_num_qams_per_layer_per_TB,
                                                                               REs_per_OFDM_symbol, dmrs_params, ue_grp_params,
                                                                               data_symbol_loc, all_Rbs_symbols, d_xtf_re_map, layer_id,
@@ -1403,11 +1375,7 @@ __device__ void QAM256_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bit
                 int qams_offset = (i / 3)* 4  + (4 * i_mod_3 + intra_index)/ Tnl;
                 int qam_in_num_qams_per_layer_per_TB = CB_start_qam_per_layer + qams_offset;
                 if (qams_offset * Tnl <  EdivQm_bits) {
-#ifdef ENABLE_32DL
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid + 16 * dmrs_params->nlAbove16;
-#else
-                    int layer_id = dmrs_params->port_ids[tmp_layer_id] + 8 * dmrs_params->n_scid;
-#endif
+                    int layer_id = calculate_layer_id(dmrs_params->port_ids[tmp_layer_id], dmrs_params->n_scid, dmrs_params->nlAbove16);
                     uint32_t output_index = output_index_no_precoding<csi_rs>(start_Rb, qam_in_num_qams_per_layer_per_TB,
                                                                               REs_per_OFDM_symbol, dmrs_params, ue_grp_params,
                                                                               data_symbol_loc, all_Rbs_symbols, d_xtf_re_map, layer_id,
@@ -2049,9 +2017,7 @@ __global__ void dl_rate_matching(dlRateMatchingDescr_t* p_desc) {
 
     const uint8_t * this_TB_port_ids_array =  desc.d_params[TB_id].port_ids;
     const uint8_t  n_scid = desc.d_params[TB_id].n_scid;
-#ifdef ENABLE_32DL
     const uint8_t  nlAbove16 = desc.d_params[TB_id].nlAbove16;
-#endif
 
     /* dynamic shared memory organized as follows:
        - The first rounded_Er_elements (if no layer mapping) or MAX_DL_LAYERS_PER_TB * rounded_Er_element (layer mapping)
@@ -2280,11 +2246,7 @@ subsequent wrap around pass:
             int elements_per_layer = (rounded_Er_elements + Nl_val - 1)/ Nl_val;  //element here is uint32_t
             for (int i = threadIdx.x; i < elements_per_layer * Nl_val; i+= blockDim.x) {
                 int layer = i / elements_per_layer;
-#ifdef ENABLE_32DL
-                uint8_t current_layer = this_TB_port_ids_array[layer] + 8 * n_scid + 16 * nlAbove16;
-#else
-                uint8_t current_layer = this_TB_port_ids_array[layer] + 8 * n_scid;
-#endif
+                uint8_t current_layer = calculate_layer_id(this_TB_port_ids_array[layer], n_scid, nlAbove16);
                 int layer_mapped_index = (cmax * num_TBs * current_layer + TB_id * cmax + CB_id) * rounded_Er_elements + (i % elements_per_layer);
                 rate_matching_output[layer_mapped_index] = dl_rm_shmem[layer * emax_uints +  (i % elements_per_layer)];
             }
@@ -2343,16 +2305,10 @@ __global__ void restructure_rate_matching_output(dlRateMatchingDescr_t* p_desc) 
     }
     const uint8_t* port_ids_array = desc.d_params[TB_id].port_ids;
     const uint8_t n_scid = desc.d_params[TB_id].n_scid;
-#ifdef ENABLE_32DL
     const uint8_t nlAbove16 = desc.d_params[TB_id].nlAbove16;
-#endif
 
     for (int potential_layer_id = 0; potential_layer_id < num_layers; potential_layer_id++) {
-#ifdef ENABLE_32DL
-        int layer_id = port_ids_array[potential_layer_id] + 8 * n_scid + 16 * nlAbove16; // layer_id is the actual layer
-#else
-        int layer_id = port_ids_array[potential_layer_id] + 8 * n_scid;
-#endif
+        int layer_id = calculate_layer_id(port_ids_array[potential_layer_id], n_scid, nlAbove16); // layer_id is the actual layer
 
 
         // Update starting offset in bits for current CB; this is a global offset, not layer specific.
@@ -2569,7 +2525,8 @@ cuphyStatus_t CUPHYWINAPI cuphySetupDlRateMatching(cuphyDlRateMatchingLaunchConf
             // For example, a single UE with an allocation of 273 PRBs, 13 data symbols, 4 layers, 4 layers,
             // and mcsTable=2 and mcsIndex=0 (i.e., lowest code-rate) would require 70984 of shared memory.
             // Note if shmem_size is greater than the max. supported option on that GPU, the call below would fail. FIXME TBD if this is possible in case of retransmission
-            CUDA_CHECK(cudaFuncSetAttribute(fused_dl_rm_and_modulation<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
+            // See cuFuncSetAttribute call below
+            //CUDA_CHECK(cudaFuncSetAttribute(fused_dl_rm_and_modulation<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
 #if 0
             /*cudaFuncAttributes attr;
             CUDA_CHECK(cudaFuncGetAttributes(&attr, fused_dl_rm_and_modulation<false>));
@@ -2580,9 +2537,10 @@ cuphyStatus_t CUPHYWINAPI cuphySetupDlRateMatching(cuphyDlRateMatchingLaunchConf
 #endif
         } else {
             {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&device_function, reinterpret_cast<void*>(fused_dl_rm_and_modulation<true>)));}
-            // In some cases, shmem_size may exceed 48KB, which requires an explicit opt-in. See earlier comment too.
-            CUDA_CHECK(cudaFuncSetAttribute(fused_dl_rm_and_modulation<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
+            // In some cases, shmem_size may exceed 48KB, which requires an explicit opt-in. See earlier comment too. See cuFuncSetAttribute call below
+            //CUDA_CHECK(cudaFuncSetAttribute(fused_dl_rm_and_modulation<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
         }
+        CU_CHECK(cuFuncSetAttribute(device_function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shmem_size));
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].func = device_function;
 
         // Fused rate-matching + modulation kernel.

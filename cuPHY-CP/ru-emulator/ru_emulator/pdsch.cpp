@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,10 +58,6 @@ int RU_Emulator::validate_pdsch(uint8_t cell_index, const struct oran_packet_hea
             return 0;
         }
         tv_index = tv_object->launch_pattern[launch_pattern_slot][cell_index];
-        if(tv_object->launch_pattern[launch_pattern_slot][cell_index] > UINT32_MAX)
-        {
-            re_cons("Launch pattern index exceeds sizeof uint32_t\n");
-        }
     }
 
     struct dl_tv_info& dl_tv_info = pdsch_object.tv_info[tv_index];
@@ -91,6 +87,19 @@ int RU_Emulator::validate_pdsch(uint8_t cell_index, const struct oran_packet_hea
             auto tv_data_idx = mod_comp_data.global_msg_idx_to_tv_idx[mod_comp_msg_idx];
             slot_buf = (unsigned char *)mod_comp_data.mod_comp_payload[tv_data_idx].data.get();
             auto &payload_params = mod_comp_data.mod_comp_payload_params[tv_data_idx];
+
+            if (buffer != nullptr)
+            {
+                auto actual_iq_width = oran_umsg_get_iq_width_from_section_buf(static_cast<uint8_t*>(buffer));
+                if (actual_iq_width != payload_params[2])
+                {
+                    re_cons("PDSCH ERROR udIqWidth mismatch: Cell {} 3GPP slot {} F{} S{} S{} Flow {} symbolId {} sectionId {} "
+                            "startPrb {} numPrb {} actual {} expected {}",
+                            cell_index, launch_pattern_slot, fss.frameId, fss.subframeId, fss.slotId,
+                            flow_index, symbolId, sectionId, startPrb, numPrb, actual_iq_width, payload_params[2]);
+                    pdsch_object.invalid_flag[cell_index][launch_pattern_slot] = true;
+                }
+            }
 
             dl_prb_size = payload_params[2] * 3;
             auto buffer_index = dl_prb_size * (startPrb - payload_params[0]);
@@ -366,7 +375,7 @@ int RU_Emulator::validate_pdsch(uint8_t cell_index, const struct oran_packet_hea
 
         if (pdsch_object.tv_info[tv_index].hasZPCsirsPdu)
         {
-// Disable ZP CSI-RS slot counters according to https://nvbugswb.nvidia.com/NVBugs5/redir.aspx?url=/4041331/31
+// Disable ZP CSI-RS slot counters according to nvbug 4041331
 #if 0
                 ++csirs_object.throughput_slot_counters[cell_index];
                 ++csirs_object.good_slot_counters[cell_index];

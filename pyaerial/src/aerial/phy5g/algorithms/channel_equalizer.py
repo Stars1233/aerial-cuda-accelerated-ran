@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,14 +16,14 @@
 """pyAerial library - Channel equalization and soft demapping."""
 from typing import Generic
 from typing import List
+from typing import Optional
 from typing import Tuple
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PuschConfig
 from aerial.phy5g.config import PuschUeConfig
@@ -46,7 +46,7 @@ class ChannelEqualizer(Generic[Array]):
                  num_rx_ant: int,
                  eq_coeff_algo: int,
                  enable_pusch_tdi: int,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize ChannelEqualizer.
 
         Args:
@@ -56,12 +56,15 @@ class ChannelEqualizer(Generic[Array]):
                 - 0: Zero-forcing equalizer.
                 - 1: MMSE with noise variance only.
                 - 2: MMSE-IRC.
+                - 3: MMSE-IRC with RBLW-based covariance shrinkage.
+                - 4: MMSE-IRC with OAS-based covariance shrinkage.
+
             enable_pusch_tdi (int): Whether to use time-domain interpolation.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new
+                CudaStream is created. Use ``with stream:`` to scope work; call
+                ``stream.synchronize()`` explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         pusch_stat_prms = get_pusch_stat_prms(
             num_rx_ant=num_rx_ant,
@@ -71,7 +74,7 @@ class ChannelEqualizer(Generic[Array]):
         self._pusch_params = pycuphy.PuschParams()
         self._pusch_params.set_stat_prms(pusch_stat_prms)
 
-        self.channel_equalizer = pycuphy.ChannelEqualizer(self.cuda_stream)
+        self.channel_equalizer = pycuphy.ChannelEqualizer(self._cuda_stream.handle)
         self.eq_sym = None  # type: List[Array]
         self.llrs = None  # type: List[Array]
         self.eq_coef = None  # type: List[Array]
@@ -165,7 +168,7 @@ class ChannelEqualizer(Generic[Array]):
             inv_noise_var_lin = \
                 np.float32(np.power(10, - (noise_var_pre_eq.get() - 0.5) / 10.))  # type: ignore
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rx_slot = cp.array(rx_slot, dtype=cp.complex64, order='F')
             channel_est = [cp.array(elem, dtype=cp.complex64, order='F') for elem in channel_est]
             lw_inv = [cp.array(elem, dtype=cp.complex64, order='F') for elem in lw_inv]
@@ -195,7 +198,7 @@ class ChannelEqualizer(Generic[Array]):
         noise_var_pre_eq = pycuphy.CudaArrayFloat(noise_var_pre_eq)
 
         pusch_dyn_prms = _pusch_config_to_cuphy(
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             rx_data=[rx_slot],
             slot=0,  # Not relevant here.
             pusch_configs=pusch_configs
@@ -214,7 +217,7 @@ class ChannelEqualizer(Generic[Array]):
         self.ree_diag_inv = self.channel_equalizer.get_ree_diag_inv()
 
         # Transform the output to CuPy array.
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             self.llrs = [cp.array(elem) for elem in self.llrs]
             self.eq_sym = [cp.array(elem) for elem in self.eq_sym]
             self.ree_diag_inv = [cp.array(elem) for elem in self.ree_diag_inv]

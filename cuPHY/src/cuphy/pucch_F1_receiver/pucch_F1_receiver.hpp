@@ -33,6 +33,15 @@ static constexpr uint32_t F1_MAX_RX_ANTENNA       = 4;
 
 static constexpr float confidenceThrF1 = 0.1; // threshold for determining confidence levels of SR and HARQ values
 
+// Structure to track max UCI shape parameters for dynamic shared memory allocation
+struct F1UciShape
+{
+    uint8_t nAnt     = 0;  // max antennas across all groups
+    uint8_t nSymData = 0;  // max data symbols across all groups
+    uint8_t nSymDmrs = 0;  // max DMRS symbols across all groups
+};
+typedef struct F1UciShape F1UciShape_t;
+
 // Implementation of the PUCCH F1 reciever interface exposed as an opaque data type to abstract out implementation
 // details (PUCCH F1 reciever C++ class). The PUCCH F1 reciever is implemented as a C++ class which inherits
 // from this interface structure defiend as an empty shell (opaque type is a struct since the interface is C
@@ -85,6 +94,10 @@ struct pucchF1RxDynDescr
     cuphyPucchCellPrm_t*              pCellPrms;                           // RX Antennas, slot num , hopping id and input slot buffer
     uint16_t                          numUciGrps;
     uint8_t                           enableUlRxBf;
+    // Max UCI shape for dynamic shared memory offsets (computed at setup)
+    uint8_t                           maxNAnt;                             // max antennas across all groups
+    uint8_t                           maxNSymData;                         // max data symbols across all groups
+    uint8_t                           maxNSymDmrs;                         // max DMRS symbols across all groups
 };
 typedef struct pucchF1RxDynDescr pucchF1RxDynDescr_t;
 
@@ -124,6 +137,7 @@ public:
 
     void kernelSelect(uint32_t                   nUciGrps,
                       pucchF1RxDynDescr_t*       pCpuDynDesc, 
+                      F1UciShape_t&              maxShape,
                       cuphyPucchF1RxLaunchCfg_t* pLaunchCfg);
 
 

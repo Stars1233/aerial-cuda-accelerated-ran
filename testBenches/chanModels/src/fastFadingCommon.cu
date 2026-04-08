@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,9 +17,8 @@
 
 #include "fastFadingCommon.cuh"
 #include <cufftdx.hpp> // for cuFFTdx library
-// #include "cuphy.hpp" // for NVLOGE_FMT, will add back when NVLOG is avaiable for cuMAC
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 fastFadingBaseChan<Tscalar, Tcomplex>::fastFadingBaseChan()
 {
     m_gpuDataUsageByte = 0;  // initialize GPU memory usage in Byte
@@ -29,7 +28,7 @@ fastFadingBaseChan<Tscalar, Tcomplex>::fastFadingBaseChan()
     m_gpuDataUsageByte += sizeof(fastFadingDynDescr_t<Tscalar, Tcomplex>);
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 fastFadingBaseChan<Tscalar, Tcomplex>::~fastFadingBaseChan()
 {
     cudaFree(m_fastFadingDynDescrCpu -> batchCumLen);
@@ -89,7 +88,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::calCfrRelateParam()
     }
     CHECK_CUDAERROR(cudaMalloc((void**)&(m_fastFadingDynDescrCpu -> cfrBatchRotationCfo), sizeof(Tcomplex) * m_nBatch));
     m_gpuDataUsageByte += sizeof(Tcomplex) * m_nBatch;
-    cudaMemcpyAsync(m_fastFadingDynDescrCpu -> cfrBatchRotationCfo, m_cfrBatchRotationCfo.data(), sizeof(Tcomplex) * m_nBatch, cudaMemcpyHostToDevice, m_strm); 
+    cudaMemcpyAsync(m_fastFadingDynDescrCpu -> cfrBatchRotationCfo, m_cfrBatchRotationCfo.data(), sizeof(Tcomplex) * m_nBatch, cudaMemcpyHostToDevice, m_strm);
 
 #if CAL_COS_SIN_IN_GPU
     m_firNzDelayUs2Pi.resize(m_firNzLen);
@@ -101,7 +100,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::calCfrRelateParam()
     }
     CHECK_CUDAERROR(cudaMalloc((void**)&(m_fastFadingDynDescrCpu -> firNzDelayUs2Pi), sizeof(float) * m_firNzLen));
     m_gpuDataUsageByte += sizeof(float) * m_firNzLen;
-    cudaMemcpyAsync(m_fastFadingDynDescrCpu -> firNzDelayUs2Pi, m_firNzDelayUs2Pi.data(), sizeof(float) * m_firNzLen, cudaMemcpyHostToDevice, m_strm); 
+    cudaMemcpyAsync(m_fastFadingDynDescrCpu -> firNzDelayUs2Pi, m_firNzDelayUs2Pi.data(), sizeof(float) * m_firNzLen, cudaMemcpyHostToDevice, m_strm);
 
     // sc frequency in KHz, dim: N_sc
     m_scFreqKHz.resize(N_sc);
@@ -141,7 +140,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::calCfrRelateParam()
 }
 
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 void fastFadingBaseChan<Tscalar, Tcomplex>::genChanProcSig(float refTime0, uint8_t enableSwapTxRx, uint8_t txColumnMajorInd)
 {
     if (m_refTime0 != refTime0) // different ref time, need to regenerate channnel
@@ -162,15 +161,15 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::genChanProcSig(float refTime0, uint8
     cudaStreamSynchronize(m_strm);
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
-{   
+{
     if (m_runMode > 2)
     {
         fprintf(stderr, "Error: unsupported runMode %d\n", m_runMode);
         exit(EXIT_FAILURE);
     }
-    
+
     // copy params to m_fastFadingDynDescrCpu
     m_fastFadingDynDescrCpu -> nLink  = m_nLink;
     m_fastFadingDynDescrCpu -> nBsAnt = m_nBsAnt;
@@ -232,7 +231,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
     m_sigLenRx     = m_nLink * m_nUeAnt * m_sigLenPerAnt;
     if(m_sigLenPerAnt)
     {
-        // find the block dimension for process input signals 
+        // find the block dimension for process input signals
         if (m_procSigFreq == 0)  // processing in time domain
         {
             // {m_procTxSampBlockSample, 1024/m_procTxSampBlockSample}
@@ -271,7 +270,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
         m_fastFadingDynDescrCpu -> txSigIn = nullptr;
         m_fastFadingDynDescrCpu -> rxSigOut = nullptr;
     }
-    
+
     // buffer for output channel
     m_timeChanSizePerLink = m_nBatch * m_nBsAnt * m_nUeAnt * m_firNzLen;
     m_timeChanSize        = m_timeChanSizePerLink * m_nLink;
@@ -280,7 +279,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
     CHECK_CUDAERROR(cudaMalloc((void**)&(m_fastFadingDynDescrCpu -> timeChan), sizeof(Tcomplex) * m_timeChanSize));
     m_gpuDataUsageByte += sizeof(Tcomplex) * m_timeChanSize;
 
-    
+
     // freq channel coefficient, only used when m_runMode=1 or 2
     m_fastFadingDynDescrCpu -> N_sc = m_N_sc;
     m_fastFadingDynDescrCpu -> N_sc_Prbg = m_N_sc_Prbg;
@@ -288,10 +287,10 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
     m_fastFadingDynDescrCpu -> N_sc_last_Prbg = m_N_sc - m_N_sc_Prbg * (m_fastFadingDynDescrCpu -> N_Prbg - 1);
     m_fastFadingDynDescrCpu -> freqConvertType = m_freqConvertType;
     m_fastFadingDynDescrCpu -> scSampling = m_scSampling;
-    m_fastFadingDynDescrCpu -> N_FFT = 4096;  
+    m_fastFadingDynDescrCpu -> N_FFT = 4096;
     switch(m_runMode)
     {
-        case 0: 
+        case 0:
             m_freqChanScSizePerLink = 0;
             m_freqChanPrbgSize = 0;
             m_scFreqKHz.resize(0);
@@ -309,7 +308,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
             m_fastFadingDynDescrCpu -> inverseNScLastPrbg = 1.0f / (m_fastFadingDynDescrCpu -> N_sc_last_Prbg / m_fastFadingDynDescrCpu -> scSampling); // for avg over Sc
             m_freqChanScSizePerLink = 0;
             m_freqChanPrbgSize = m_nBatch * m_nLink * m_nBsAnt * m_nUeAnt * (m_fastFadingDynDescrCpu -> N_Prbg);
-            
+
             m_h_deviceFreqChanScPerLinkPtr = nullptr;
             m_fastFadingDynDescrCpu -> freqChanSc = nullptr;
             CHECK_CUDAERROR(cudaMalloc((void**) &(m_fastFadingDynDescrCpu -> freqChanPrbg), sizeof(Tcomplex) * m_freqChanPrbgSize));
@@ -332,7 +331,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
                 m_gpuDataUsageByte += sizeof(Tcomplex) * m_freqChanScSizePerLink;
             }
             CHECK_CUDAERROR(cudaMemcpy(m_fastFadingDynDescrCpu -> freqChanSc, m_h_deviceFreqChanScPerLinkPtr, m_nLink * sizeof(Tcomplex*), cudaMemcpyHostToDevice));
-        
+
             CHECK_CUDAERROR(cudaMalloc((void**) &(m_fastFadingDynDescrCpu -> freqChanPrbg), sizeof(Tcomplex) * m_freqChanPrbgSize));
             m_gpuDataUsageByte += sizeof(Tcomplex) * m_freqChanPrbgSize;
             break;
@@ -346,7 +345,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
     if (m_fastFadingDynDescrCpu -> saveAntPairSample == 1)
     {
         ASSERT(m_nLink * m_nUeAnt * m_nBsAnt * m_sigLenPerAnt < 4294967296ull, "size of rx samples per antenna pair for all links must be smaller than 4294967296 (2^32)");
-        
+
         CHECK_CUDAERROR(cudaMalloc((void**) &(m_fastFadingDynDescrCpu -> rxSigOutPerAntPair), sizeof(Tcomplex) * m_nLink * m_nUeAnt * m_nBsAnt * m_sigLenPerAnt));
         m_gpuDataUsageByte += sizeof(Tcomplex) * m_nLink * m_nUeAnt * m_nBsAnt * m_sigLenPerAnt;
     }
@@ -354,7 +353,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
     {
         m_fastFadingDynDescrCpu -> rxSigOutPerAntPair = nullptr;
     }
-    
+
     // assert failure if input network size is too large
     ASSERT(m_nBatch < 65536u, "number of batches must be smaller than 65536 (2^16)");
     ASSERT(m_timeChanSize < 4294967296ull, "size of time channel for all links must be smaller than 4294967296 (2^32)");
@@ -362,14 +361,14 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
     ASSERT(m_sigLenRx < 4294967296ull, "size of tx samples for all links must be smaller than 4294967296 (2^32)");
     ASSERT(m_freqChanPrbgSize < 4294967296ull, "size of freq channel on PRBG for all links must be smaller than 4294967296 (2^32)");
     ASSERT(m_freqChanScSizePerLink < 4294967296ull, "size of freq channel on SC per link must be smaller than 4294967296 (2^32)");
-    
+
     // launch dimensions in genTimeChan() will be (firNzLen, m_nBsAnt/m_scaleBsAntTimeChan, m_nUeAnt/m_scaleBsAntTimeChan) scale to handle mMIMO
     findGenFastFadingChanKernelDim(m_firNzPw.size(), m_nBsAnt, m_nUeAnt, m_scaleBsAntTimeChan, m_scaleUeAntTimeChan);
     // launch dimensions in genFreqChan() will be (N_Prbg, m_nBsAnt/m_scaleBsAntFreqChan, m_nUeAnt/m_scaleUeAntFreqChan) scale to handle mMIMO
     findGenFastFadingChanKernelDim(m_fastFadingDynDescrCpu -> N_Prbg, m_nBsAnt, m_nUeAnt, m_scaleBsAntFreqChan, m_scaleUeAntFreqChan);
 
     //copy dyndescriptor to GPU
-    cudaMemcpyAsync(m_fastFadingDynDescrGpu, m_fastFadingDynDescrCpu, sizeof(fastFadingDynDescr_t<Tscalar, Tcomplex>), cudaMemcpyHostToDevice, m_strm);
+    copyDescriptor();
 
     // get kernel inputs
     m_refTime0 = -1.0f;  // invalid time
@@ -379,10 +378,10 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::setup()
     m_args[2] = &m_enableSwapTxRx;  // can be replaced by other param
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 inline void fastFadingBaseChan<Tscalar, Tcomplex>::findGenFastFadingChanKernelDim(const uint16_t & firNzLen, const uint16_t& nUeAnt, const uint16_t& nBsAnt, uint16_t & scaleUeAnt, uint16_t & scaleBsAnt)
 {
-    for (scaleUeAnt = 1; scaleUeAnt <= nUeAnt; ++scaleUeAnt) 
+    for (scaleUeAnt = 1; scaleUeAnt <= nUeAnt; ++scaleUeAnt)
     {
         for (scaleBsAnt = 1; scaleBsAnt <= nBsAnt; ++scaleBsAnt)
         {
@@ -402,14 +401,14 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::processTxSig(uint8_t txColumnMajorIn
     {
         ASSERT(txColumnMajorInd == 0, "processing tx samples in time domain only supports row-major input");
         m_gridDim = {m_nLink, m_nBatch, 1};
-        m_blockDim = {m_procTxSampBlockSample, min(m_enableSwapTxRx ? m_nBsAnt : m_nUeAnt, uint32_t(1024 / m_procTxSampBlockSample)), 1};    
+        m_blockDim = {m_procTxSampBlockSample, min(m_enableSwapTxRx ? m_nBsAnt : m_nUeAnt, uint32_t(1024 / m_procTxSampBlockSample)), 1};
         // dynamic shared memory size
         uint32_t shareMemBytes = sizeof(Tcomplex) * m_firNzLen * (m_enableSwapTxRx ? m_nBsAnt : m_nUeAnt);
         // __shared__ extern Tcomplex chanCoeLocal[]; // m_firNzLen * blockDim.y
-        
-        // static shared memory of uint16_t * MAX_NZ_TAPS_ for 
+
+        // static shared memory of uint16_t * MAX_NZ_TAPS_ for
         // __shared__  uint16_t firNzIdx[MAX_NZ_TAPS_];
-    
+
         cudaGetFuncBySymbol(&m_functionPtr, reinterpret_cast<void*>(processInputKernel_time<Tscalar, Tcomplex>));
         CUresult status = cuLaunchKernel(m_functionPtr, m_gridDim.x, m_gridDim.y, m_gridDim.z, m_blockDim.x, m_blockDim.y, m_blockDim.z, shareMemBytes, m_strm, m_args, nullptr);
         CHECK_CURESULT(status);
@@ -418,7 +417,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::processTxSig(uint8_t txColumnMajorIn
     {
         m_gridDim = {m_nLink, m_nBatch, 1};
         m_blockDim = {m_procTxSampBlockSample, 1, 1};
-    
+
         if (txColumnMajorInd)
         {
             cudaGetFuncBySymbol(&m_functionPtr, reinterpret_cast<void*>(processInputKernel_freq_columnMajor<Tscalar, Tcomplex>));
@@ -432,7 +431,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::processTxSig(uint8_t txColumnMajorIn
     }
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 void fastFadingBaseChan<Tscalar, Tcomplex>::printTimeChan(uint16_t cid, uint16_t uid, int printLen)
 {
     Tcomplex * tempCpuBuffer = new Tcomplex[printLen];
@@ -447,7 +446,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::printTimeChan(uint16_t cid, uint16_t
     delete[] tempCpuBuffer;
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 void fastFadingBaseChan<Tscalar, Tcomplex>::printFreqScChan(uint16_t cid, uint16_t uid, int printLen)
 {
     if(m_runMode != 2)
@@ -468,7 +467,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::printFreqScChan(uint16_t cid, uint16
     delete[] tempCpuBuffer;
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 void fastFadingBaseChan<Tscalar, Tcomplex>::printFreqPrbgChan(uint16_t cid, uint16_t uid, int printLen)
 {
     if(m_runMode != 1 && m_runMode != 2)
@@ -489,7 +488,25 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::printFreqPrbgChan(uint16_t cid, uint
     delete[] tempCpuBuffer;
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
+void fastFadingBaseChan<Tscalar, Tcomplex>::copyDescriptor()
+{
+    cudaMemcpyAsync(m_fastFadingDynDescrGpu, m_fastFadingDynDescrCpu,
+                    sizeof(fastFadingDynDescr_t<Tscalar, Tcomplex>),
+                    cudaMemcpyHostToDevice, m_strm);
+}
+
+template <typename Tscalar, typename Tcomplex>
+void fastFadingBaseChan<Tscalar, Tcomplex>::setTxSigIn(Tcomplex* txSigIn)
+{
+    // Update CPU descriptor
+    m_fastFadingDynDescrCpu->txSigIn = txSigIn;
+
+    // Copy descriptor to GPU
+    copyDescriptor();
+}
+
+template <typename Tscalar, typename Tcomplex>
 void fastFadingBaseChan<Tscalar, Tcomplex>::printSig(uint16_t cid, uint16_t uid, int printLen)
 {
     Tcomplex * tempCpuBuffer = new Tcomplex[printLen];
@@ -516,7 +533,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::printSig(uint16_t cid, uint16_t uid,
     delete[] tempCpuBuffer;
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 void fastFadingBaseChan<Tscalar, Tcomplex>::genFreqChan()
 // generate frequency domain chanel for Sc and/or Prbg
 {
@@ -529,7 +546,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::genFreqChan()
     // set up FFT kernel
     uint32_t shared_memory_size = 0;
     ASSERT(mod(m_nUeAnt * m_nBsAnt, FFTs_PER_BLOCK_CONST_) == 0, "m_nUeAnt * m_nBsAnt must be divisble by FFTs_PER_BLOCK_CONST_");
-    dim3 gridDim = dim3(m_nLink, m_nBatch, m_nUeAnt * m_nBsAnt / FFTs_PER_BLOCK_CONST_); 
+    dim3 gridDim = dim3(m_nLink, m_nBatch, m_nUeAnt * m_nBsAnt / FFTs_PER_BLOCK_CONST_);
     dim3 blockDim; // auto set by cuFFTdx
     const uint32_t cudaDeviceArch = getCudaDeviceArch();
     auto kernelPtr = fast_fading_get_fft_param<Tscalar, Tcomplex>( m_fastFadingDynDescrCpu -> N_FFT, cudaDeviceArch, blockDim, shared_memory_size, m_runMode);
@@ -547,7 +564,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::genFreqChan()
         cudaGetFuncBySymbol(&functionPtr, reinterpret_cast<void*>(kernelPtr));
         CUresult status = cuLaunchKernel(functionPtr, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, shared_memory_size, m_strm, m_args, nullptr);
         CHECK_CURESULT(status);
-        
+
         // convert freq channel from Sc to Prbg
         gridDim = dim3(m_nLink, m_scaleUeAntFreqChan, m_scaleBsAntFreqChan);
         blockDim = dim3(m_fastFadingDynDescrCpu -> N_Prbg, uint(m_nBsAnt / m_scaleBsAntFreqChan), uint(m_nUeAnt / m_scaleUeAntFreqChan));
@@ -556,7 +573,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::genFreqChan()
         status = cuLaunchKernel(functionPtr, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z, 0, m_strm, m_args, nullptr);
         CHECK_CURESULT(status);
     }
-#else 
+#else
     dim3 gridDim = dim3(m_nLink, m_scaleUeAntFreqChan * m_nBatch, m_scaleBsAntFreqChan);
     dim3 blockDim = dim3(m_fastFadingDynDescrCpu -> N_Prbg, uint(m_nBsAnt / m_scaleBsAntFreqChan), uint(m_nUeAnt / m_scaleUeAntFreqChan));
     uint32_t shared_memory_size = sizeof(Tcomplex) * blockDim.y * blockDim.z * m_firNzLen;
@@ -567,7 +584,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::genFreqChan()
 #endif
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 void fastFadingBaseChan<Tscalar, Tcomplex>::saveChanToH5File(hid_t & h5FileHandle, hid_t & complexDataType)
 {
     // assuming all 1D array
@@ -585,7 +602,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::saveChanToH5File(hid_t & h5FileHandl
     writeHdf5DatasetFromGpu<float>(h5FileHandle, "tBatch", H5T_IEEE_F32LE, m_fastFadingDynDescrCpu -> tBatch, dims, rank);
     // cumulative number of samples for each batch [0, 4096, 8192, 12288] means new CIR/CFR per 4096 tx samples. This will be used when specify 14 OFDM symbols
     dims[0] = m_nBatch+1;
-    writeHdf5DatasetFromGpu<uint32_t>(h5FileHandle, "batchCumLen", H5T_STD_U32LE, m_fastFadingDynDescrCpu -> batchCumLen, dims, rank); 
+    writeHdf5DatasetFromGpu<uint32_t>(h5FileHandle, "batchCumLen", H5T_STD_U32LE, m_fastFadingDynDescrCpu -> batchCumLen, dims, rank);
 
     // time channel coefficients for all links
     dims[0] = m_timeChanSize;
@@ -602,7 +619,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::saveChanToH5File(hid_t & h5FileHandl
     }
     // frequency channel on prbg if exists
     if(m_runMode > 0 && m_runMode < 3)
-    {    
+    {
         dims[0] = m_freqChanPrbgSize;
         writeHdf5DatasetFromGpu<Tcomplex>(h5FileHandle, "freqChanPrbg", complexDataType, m_fastFadingDynDescrCpu -> freqChanPrbg, dims, rank);
 
@@ -626,7 +643,7 @@ void fastFadingBaseChan<Tscalar, Tcomplex>::saveChanToH5File(hid_t & h5FileHandl
         writeHdf5DatasetFromGpu<Tcomplex>(h5FileHandle, "txSigIn", complexDataType, m_fastFadingDynDescrCpu -> txSigIn, dims, rank);
         dims[0] = m_sigLenPerAnt * (m_enableSwapTxRx ? m_nBsAnt : m_nUeAnt) * m_nLink;
         writeHdf5DatasetFromGpu<Tcomplex>(h5FileHandle, "rxSigOut", complexDataType, m_fastFadingDynDescrCpu -> rxSigOut, dims, rank);
-        
+
         if (m_fastFadingDynDescrCpu -> saveAntPairSample == 1) // save per antenna sample
         {
             dims[0] = m_sigLenPerAnt * m_nUeAnt * m_nBsAnt * m_nLink;
@@ -643,7 +660,7 @@ static __global__ void fast_fading_fft_kernel(fastFadingDynDescr_t<Tscalar, Tcom
     // GRID(nLink, nBatch, nUeAnt * nBsAnt / FFTs_PER_BLOCK_CONST_)
     // BLOCK(by FFT default)
     using namespace cufftdx;
-    
+
     // Registers
     cuComplex thread_data[FFT::storage_size];
     uint16_t N_sc_over_2 = fastFadingDynDescr -> N_sc >> 1; // divide by 2
@@ -658,7 +675,7 @@ static __global__ void fast_fading_fft_kernel(fastFadingDynDescr_t<Tscalar, Tcom
 
     // Load freq data from global memory to registers
     const uint32_t freq_offsetSc = fastFadingDynDescr -> N_sc * ((blockIdx.y * gridDim.z + blockIdx.z) * FFT::ffts_per_block + local_fft_id);
-    const uint32_t time_offset = firNzLen * global_fft_id; 
+    const uint32_t time_offset = firNzLen * global_fft_id;
     const uint32_t stride = FFT::stride;
     uint32_t       index  = time_offset;
 
@@ -666,14 +683,14 @@ static __global__ void fast_fading_fft_kernel(fastFadingDynDescr_t<Tscalar, Tcom
     Tcomplex * freqChanScLink = fastFadingDynDescr -> freqChanSc[blockIdx.x];
     Tcomplex * freqChanPrbg = fastFadingDynDescr -> freqChanPrbg;
     Tcomplex * timeChan = fastFadingDynDescr -> timeChan;
-    
+
     // get input sinnals
     uint16_t * firNzIdx = fastFadingDynDescr -> firNzIdx;
 
     // FFT::shared_memory_size bytes of shared memory
     using complex_type = typename FFT::value_type;
     extern __shared__ complex_type shared_mem[];// assuming FFT shared memoery size is much higher than firMaxLen
-        
+
     // extern __shared__ Tcomplex shared_mem[];
     // Tcomplex * FFT_shared_mem = shared_mem + (FFT::ffts_per_block)*firMaxLen;
     // if(threadIdx.x == 0)
@@ -703,9 +720,9 @@ static __global__ void fast_fading_fft_kernel(fastFadingDynDescr_t<Tscalar, Tcom
 
     // Make sure not to go out-of-bounds
     #pragma unroll
-    for (uint32_t i = 0; i < FFT::elements_per_thread; i++) 
+    for (uint32_t i = 0; i < FFT::elements_per_thread; i++)
     {
-        if (i * stride + threadIdx.x < cufftdx::size_of<FFT>::value) 
+        if (i * stride + threadIdx.x < cufftdx::size_of<FFT>::value)
         {
             #ifdef USE_MEMOERY_FFT_SHIFT_  // use fftshift later
             if(i * stride + threadIdx.x < firMaxLen)
@@ -748,13 +765,13 @@ static __global__ void fast_fading_fft_kernel(fastFadingDynDescr_t<Tscalar, Tcom
     // Extract per Sc channel coefficients
     index = threadIdx.x;
 #pragma unroll
-    for (uint32_t i = 0; i < FFT::elements_per_thread; i++) 
+    for (uint32_t i = 0; i < FFT::elements_per_thread; i++)
     {
-        if ((i * stride + threadIdx.x) < cufftdx::size_of<FFT>::value) 
+        if ((i * stride + threadIdx.x) < cufftdx::size_of<FFT>::value)
         {
             thread_data[i].x = thread_data[i].x;
             thread_data[i].y = thread_data[i].y;
-            #ifdef USE_MEMOERY_FFT_SHIFT_ 
+            #ifdef USE_MEMOERY_FFT_SHIFT_
             if(index < N_sc_over_2)
             {
                 freqChanScLink[freq_offsetSc + index + N_sc_over_2].x = thread_data[i].x;;
@@ -774,7 +791,7 @@ static __global__ void fast_fading_fft_kernel(fastFadingDynDescr_t<Tscalar, Tcom
             #endif
             index += stride;
         }
-    } 
+    }
 }
 
 template<typename FFT, typename Tscalar, typename Tcomplex>
@@ -784,7 +801,7 @@ static __global__ void fast_fading_fft_kernel_PrbgOnly(fastFadingDynDescr_t<Tsca
     // GRID(nLink, nBatch, nUeAnt * nBsAnt / FFTs_PER_BLOCK_CONST_)
     // BLOCK(by FFT default)
     using namespace cufftdx;
-    
+
     // Registers
     cuComplex thread_data[FFT::storage_size];
     uint16_t N_sc_over_2 = fastFadingDynDescr -> N_sc >> 1; // divide by 2
@@ -805,14 +822,14 @@ static __global__ void fast_fading_fft_kernel_PrbgOnly(fastFadingDynDescr_t<Tsca
 
     // Load freq data from global memory to registers
     const uint32_t freq_offsetPrbg_global = N_Prbg * global_fft_id;
-    const uint32_t time_offset = firNzLen * global_fft_id; 
+    const uint32_t time_offset = firNzLen * global_fft_id;
     const uint32_t stride = FFT::stride;
     uint32_t       index  = time_offset;
 
     // output buffer
     Tcomplex * freqChanPrbg = fastFadingDynDescr -> freqChanPrbg;
     Tcomplex * timeChan = fastFadingDynDescr -> timeChan;
-    
+
     // get input sinnals
     uint16_t * firNzIdx = fastFadingDynDescr -> firNzIdx;
 
@@ -848,9 +865,9 @@ static __global__ void fast_fading_fft_kernel_PrbgOnly(fastFadingDynDescr_t<Tsca
 
     // Make sure not to go out-of-bounds
     #pragma unroll
-    for (uint32_t i = 0; i < FFT::elements_per_thread; i++) 
+    for (uint32_t i = 0; i < FFT::elements_per_thread; i++)
     {
-        if (i * stride + threadIdx.x < cufftdx::size_of<FFT>::value) 
+        if (i * stride + threadIdx.x < cufftdx::size_of<FFT>::value)
         {
             #ifdef USE_MEMOERY_FFT_SHIFT_  // use fftshift later
             if(i * stride + threadIdx.x < firMaxLen)
@@ -895,11 +912,11 @@ static __global__ void fast_fading_fft_kernel_PrbgOnly(fastFadingDynDescr_t<Tsca
     uint16_t freq_offsetSc_local = (fastFadingDynDescr -> N_sc) * local_fft_id;
     Tcomplex * s_freqSc = reinterpret_cast<Tcomplex*>(shared_mem); // for converting CFR on Sc to Prbg
 #pragma unroll
-    for (uint32_t i = 0; i < FFT::elements_per_thread; i++) 
+    for (uint32_t i = 0; i < FFT::elements_per_thread; i++)
     {
-        if ((i * stride + threadIdx.x) < cufftdx::size_of<FFT>::value) 
+        if ((i * stride + threadIdx.x) < cufftdx::size_of<FFT>::value)
         {
-            #ifdef USE_MEMOERY_FFT_SHIFT_ 
+            #ifdef USE_MEMOERY_FFT_SHIFT_
             if(index < N_sc_over_2)
             {
                 s_freqSc[freq_offsetSc_local + (index + N_sc_over_2)].x = thread_data[i].x;
@@ -956,13 +973,13 @@ static __global__ void fast_fading_fft_kernel_PrbgOnly(fastFadingDynDescr_t<Tsca
                 tempSum.x *= inverseNScPrbg;
                 tempSum.y *= inverseNScPrbg;
                 break;
-            
+
             // case 4 will never be run in this kernel
             default:
                 printf("Error: Invalid freqConvertType %d!\n", freqConvertType);
                 break;
-        } 
-        
+        }
+
         // copy freq chan on Prgb to global memory
         freqChanPrbg[freq_offsetPrbg_global + threadIdx.x].x = tempSum.x;
         freqChanPrbg[freq_offsetPrbg_global + threadIdx.x].y = tempSum.y;
@@ -971,8 +988,8 @@ static __global__ void fast_fading_fft_kernel_PrbgOnly(fastFadingDynDescr_t<Tsca
 
 // Choose FFT kernel
 template<typename Tscalar, typename Tcomplex, uint32_t FftSize, uint32_t Arch>
-fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(dim3& block_dim, uint& shared_memory_size, uint8_t& runMode) 
-{ 
+fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(dim3& block_dim, uint& shared_memory_size, uint8_t& runMode)
+{
     using namespace cufftdx;
 
     // use predefined numbers
@@ -980,7 +997,7 @@ fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(dim3& block_dim, ui
                                 + Direction<fft_direction::forward>()
                                 + FFTsPerBlock<FFTs_PER_BLOCK_CONST_>() // + ElementsPerThread<FFT_ELEMENTS_PER_THREAD_CONST_>()
                                 + SM<Arch>() + Block());
-    
+
     // use cuFFTdx configurations
     // Base of the FFT description
     // using FFT_base = decltype(Size<FftSize>() + Precision<Tscalar>() + Type<fft_type::c2c>()
@@ -999,7 +1016,7 @@ fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(dim3& block_dim, ui
     }
     else if(runMode == 2)
     {
-        return fast_fading_fft_kernel<FFT, Tscalar, Tcomplex>;  
+        return fast_fading_fft_kernel<FFT, Tscalar, Tcomplex>;
     }
     else
     {
@@ -1008,8 +1025,8 @@ fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(dim3& block_dim, ui
 }
 
 template<typename Tscalar, typename Tcomplex>
-fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(const int Nfft, uint32_t cudaDeviceArch, dim3& block_dim, uint& shared_memory_size, uint8_t& runMode) 
-{ 
+fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(const int Nfft, uint32_t cudaDeviceArch, dim3& block_dim, uint& shared_memory_size, uint8_t& runMode)
+{
     // current only support cudaDeviceArch = 800, 890, and 900, with Nfft = 4096
     if((Nfft == 4096) && (cudaDeviceArch == 800))
     {
@@ -1025,7 +1042,6 @@ fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(const int Nfft, uin
     }
     else
     {
-        // NVLOGE_FMT(NVLOG_PUScH, AERIAL_CUPHY_EVENT, "Unsupported FFT length or cudaDeviceArch in frequency channel, please add your Nfft or cudaDeviceArch into fast_fading_get_fft_param and retry");
         printf("error: Unsupported FFT length %d or cudaDeviceArch %d in frequency channel, please add your Nfft or cudaDeviceArch into fast_fading_get_fft_param and retry \n", Nfft, cudaDeviceArch);
         exit(EXIT_FAILURE);
     }
@@ -1033,7 +1049,7 @@ fftKernelHandle<Tscalar, Tcomplex> fast_fading_get_fft_param(const int Nfft, uin
 }
 
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 static __global__ void normalizeTimeChan(fastFadingDynDescr_t<Tscalar, Tcomplex> * fastFadingDynDescr)
 {
     // GRID(1,1,1);
@@ -1083,7 +1099,7 @@ static __global__ void normalizeTimeChan(fastFadingDynDescr_t<Tscalar, Tcomplex>
     }
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 static __device__ cuComplex calCfrbyCir(float freqKHz, uint16_t firNzLen, float * firNzDelayUs2Pi, Tcomplex * cir, float cfrPhaseShift)
 {
     cuComplex cfrOnFreqKHz = {0.0f, 0.0f};
@@ -1104,7 +1120,7 @@ static __device__ cuComplex calCfrbyCir(float freqKHz, uint16_t firNzLen, float 
     return cfrOnFreqKHz;
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 static __device__ cuComplex calCfrbyCir_v2(uint16_t firNzLen, Tcomplex * firNzDelayScFreq2Pi, Tcomplex * cir)
 {
     cuComplex cfrOnFreqKHz = {0.0f, 0.0f};
@@ -1119,12 +1135,12 @@ static __device__ cuComplex calCfrbyCir_v2(uint16_t firNzLen, Tcomplex * firNzDe
     return cfrOnFreqKHz;
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 static __global__ void genFreqChanCoeKernel_runMode1(fastFadingDynDescr_t<Tscalar, Tcomplex> * fastFadingDynDescr, float refTime0)
 {
     // GRID(nLink, m_scaleUeAntFreqChan * m_nBatch, m_scaleBsAntFreqChan); blockIdx.y = scaleUeAntFreqChanIdx * nBatch + batchIdx
     // BLOCK(N_Prbg, nBsAnt/m_scaleBsAntFreqChan, nUeAnt/m_scaleUeAntFreqChan);
-    
+
     uint32_t cidUidOffset = blockIdx.x; // linkIdx
     uint32_t nBatch = fastFadingDynDescr -> nBatch;
     uint16_t N_sc = fastFadingDynDescr -> N_sc;
@@ -1135,7 +1151,7 @@ static __global__ void genFreqChanCoeKernel_runMode1(fastFadingDynDescr_t<Tscala
     uint8_t freqConvertType = fastFadingDynDescr -> freqConvertType;
     uint8_t scSampling = fastFadingDynDescr -> scSampling;
     uint16_t nBsAnt = fastFadingDynDescr -> nBsAnt;
-    uint16_t nUeAnt = fastFadingDynDescr -> nUeAnt;    
+    uint16_t nUeAnt = fastFadingDynDescr -> nUeAnt;
     float * scFreqKHz = fastFadingDynDescr -> scFreqKHz;
     Tcomplex * firNzDelayScFreq2Pi = fastFadingDynDescr -> firNzDelayScFreq2Pi;
     float inverseNScPrbg = (threadIdx.x < N_Prbg - 1) ? fastFadingDynDescr -> inverseNScPrbg : fastFadingDynDescr -> inverseNScLastPrbg;
@@ -1156,11 +1172,11 @@ static __global__ void genFreqChanCoeKernel_runMode1(fastFadingDynDescr_t<Tscala
     Tcomplex * s_timeChanLocal = reinterpret_cast<Tcomplex *>(shareData); // firNzLen * nUeAnt * nBsAnt
     // only use shared memory for Tcomplex data type
 
-    __shared__ float s_firNzDelayUs2Pi[MAX_NZ_TAPS_]; // no more than 24 NZ taps based on 3GPP 38.901 
-    
+    __shared__ float s_firNzDelayUs2Pi[MAX_NZ_TAPS_]; // no more than 24 NZ taps based on 3GPP 38.901
+
     // read CIR to shared memory
     uint16_t firNzLen = fastFadingDynDescr -> firNzLen;
-    uint16_t localCirOffset = (threadIdx.z * blockDim.y + threadIdx.y) * firNzLen; 
+    uint16_t localCirOffset = (threadIdx.z * blockDim.y + threadIdx.y) * firNzLen;
 
     uint32_t globalCirOffset = (((cidUidOffset * nBatch + batchIdx) * nUeAnt + ueAntIdx) * nBsAnt + bsAntIdx) * firNzLen; // always use the first batch for conversion of CIR to CFR
 
@@ -1175,16 +1191,16 @@ static __global__ void genFreqChanCoeKernel_runMode1(fastFadingDynDescr_t<Tscala
         Tcomplex tmpCopyCir = timeChan[globalCirOffset + copyIdx];
         s_timeChanLocal[localCirOffset + copyIdx].x = tmpCopyCir.x * cfrRotationTotal.x - tmpCopyCir.y * cfrRotationTotal.y;
         s_timeChanLocal[localCirOffset + copyIdx].y = tmpCopyCir.x * cfrRotationTotal.y + tmpCopyCir.y * cfrRotationTotal.x;
-        
+
         if(threadIdx.y == 0 && threadIdx.z == 0)
         {
             s_firNzDelayUs2Pi[copyIdx] = fastFadingDynDescr -> firNzDelayUs2Pi[copyIdx];
         }
     }
     __syncthreads();
-    
+
     // calculate CFR on sc
-    cuComplex cfrOnFreqKHz = {0.0f, 0.0f};    
+    cuComplex cfrOnFreqKHz = {0.0f, 0.0f};
     cuComplex tempSum = {0.0f, 0.0f};
 #if CAL_COS_SIN_IN_GPU
     float cfrPhaseShift = 0.0f;
@@ -1242,7 +1258,7 @@ static __global__ void genFreqChanCoeKernel_runMode1(fastFadingDynDescr_t<Tscala
             freqChanPrbg[prbg_offet].x = tempSum.x * inverseNScPrbg;
             freqChanPrbg[prbg_offet].y = tempSum.y * inverseNScPrbg;
             break;
-        
+
         case 4: // use average SC for on for the Prbg with removing frequency ramping
             // for the last Prbg, inverseNScPrbg = fastFadingDynDescr -> inverseNScLastPrbg
             tempSum = {0.0f, 0.0f};
@@ -1263,19 +1279,19 @@ static __global__ void genFreqChanCoeKernel_runMode1(fastFadingDynDescr_t<Tscala
             freqChanPrbg[prbg_offet].x = tempSum.x * inverseNScPrbg;
             freqChanPrbg[prbg_offet].y = tempSum.y * inverseNScPrbg;
             break;
-        
+
         default:
             printf("Error: Invalid freqConvertType %d!\n", freqConvertType);
             break;
     }
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 static __global__ void genFreqChanCoeKernel_runMode2(fastFadingDynDescr_t<Tscalar, Tcomplex> * fastFadingDynDescr, float refTime0)
 {
     // GRID(nLink, m_scaleUeAntFreqChan * m_nBatch, m_scaleBsAntFreqChan); blockIdx.y = scaleUeAntFreqChanIdx * nBatch + batchIdx
     // BLOCK(N_Prbg, nBsAnt/m_scaleBsAntFreqChan, nUeAnt/m_scaleUeAntFreqChan);
-    
+
     uint32_t cidUidOffset = blockIdx.x; // linkIdx
     uint32_t nBatch = fastFadingDynDescr -> nBatch;
     uint16_t N_sc = fastFadingDynDescr -> N_sc;
@@ -1286,7 +1302,7 @@ static __global__ void genFreqChanCoeKernel_runMode2(fastFadingDynDescr_t<Tscala
     uint8_t freqConvertType = fastFadingDynDescr -> freqConvertType;
     uint8_t scSampling = fastFadingDynDescr -> scSampling;
     uint16_t nBsAnt = fastFadingDynDescr -> nBsAnt;
-    uint16_t nUeAnt = fastFadingDynDescr -> nUeAnt;    
+    uint16_t nUeAnt = fastFadingDynDescr -> nUeAnt;
     float * scFreqKHz = fastFadingDynDescr -> scFreqKHz;
     Tcomplex * firNzDelayScFreq2Pi = fastFadingDynDescr -> firNzDelayScFreq2Pi;
     float inverseNScPrbg = (threadIdx.x < N_Prbg - 1) ? fastFadingDynDescr -> inverseNScPrbg : fastFadingDynDescr -> inverseNScLastPrbg;
@@ -1308,13 +1324,13 @@ static __global__ void genFreqChanCoeKernel_runMode2(fastFadingDynDescr_t<Tscala
     Tcomplex * s_timeChanLocal = reinterpret_cast<Tcomplex *>(shareData); // firNzLen * nUeAnt * nBsAnt
     // only use shared memory for Tcomplex data type
 
-    __shared__ float s_firNzDelayUs2Pi[MAX_NZ_TAPS_]; // no more than 24 NZ taps based on 3GPP 38.901 
-    
+    __shared__ float s_firNzDelayUs2Pi[MAX_NZ_TAPS_]; // no more than 24 NZ taps based on 3GPP 38.901
+
     // read CIR to shared memory
     uint16_t firNzLen = fastFadingDynDescr -> firNzLen;
-    uint16_t localCirOffset = (threadIdx.z * blockDim.y + threadIdx.y) * firNzLen; 
+    uint16_t localCirOffset = (threadIdx.z * blockDim.y + threadIdx.y) * firNzLen;
     uint32_t globalCirOffset = (((cidUidOffset * nBatch + batchIdx) * nUeAnt + ueAntIdx) * nBsAnt + bsAntIdx) * firNzLen;
-    
+
     for (uint16_t copyIdx = prbgIdx; copyIdx < firNzLen; copyIdx += N_Prbg) // copy NZ taps into the shared, add common cfr ration ref + per batch due to CFO// copy NZ taps into the shared, add common cfr ration ref + per batch due to CFO
     {
         float cfoPhaseRef = 2.0f * M_PI * refTime0 * (fastFadingDynDescr -> cfoHz);
@@ -1333,9 +1349,9 @@ static __global__ void genFreqChanCoeKernel_runMode2(fastFadingDynDescr_t<Tscala
         }
     }
     __syncthreads();
-    
+
     // calculate CFR on sc
-    cuComplex cfrOnFreqKHz = {0.0f, 0.0f};    
+    cuComplex cfrOnFreqKHz = {0.0f, 0.0f};
     cuComplex tempSum = {0.0f, 0.0f};
 #if CAL_COS_SIN_IN_GPU
     float cfrPhaseShift = 0.0f;
@@ -1357,14 +1373,14 @@ static __global__ void genFreqChanCoeKernel_runMode2(fastFadingDynDescr_t<Tscala
         if (freqConvertType == 3 || freqConvertType == 4)
         {
             tempSum.x += cfrOnFreqKHz.x; // add Sc together
-            tempSum.y += cfrOnFreqKHz.y;                    
-        }                
+            tempSum.y += cfrOnFreqKHz.y;
+        }
     }
 
     // convert SC CFR to Prbg CFR based on different freqConvertType
     switch (freqConvertType)
     {
-        case 0: 
+        case 0:
             freqChanPrbg[prbg_offet] = freqChanScLink[sc_start_offset];
             break;
 
@@ -1410,9 +1426,9 @@ static __global__ void genFreqChanCoeKernel_runMode2(fastFadingDynDescr_t<Tscala
             freqChanPrbg[prbg_offet].x = tempSum.x * inverseNScPrbg;
             freqChanPrbg[prbg_offet].y = tempSum.y * inverseNScPrbg;
             break;
-        
+
         default:
-            printf("Error: Invalid freqConvertType %d!\n", freqConvertType);            
+            printf("Error: Invalid freqConvertType %d!\n", freqConvertType);
             break;
     }
 }
@@ -1421,7 +1437,7 @@ template<typename Tscalar, typename Tcomplex>
 static __global__ void convertSctoPrbg(fastFadingDynDescr_t<Tscalar, Tcomplex> * fastFadingDynDescr)
 {
     // GRID(nLink, m_scaleBsAntFreqChan, m_scaleUeAntFreqChan);
-    // BLOCK(N_Prbg, nBsAnt/m_scaleBsAntFreqChan, nUeAnt/m_scaleUeAntFreqChan); 
+    // BLOCK(N_Prbg, nBsAnt/m_scaleBsAntFreqChan, nUeAnt/m_scaleUeAntFreqChan);
 
     uint32_t cidUidOffset = blockIdx.x; // linkIdx
 
@@ -1435,7 +1451,7 @@ static __global__ void convertSctoPrbg(fastFadingDynDescr_t<Tscalar, Tcomplex> *
     float inverseNScPrbg = (threadIdx.x < N_Prbg - 1) ? fastFadingDynDescr -> inverseNScPrbg : fastFadingDynDescr -> inverseNScLastPrbg;
     Tcomplex * freqChanScLink = fastFadingDynDescr -> freqChanSc[cidUidOffset];
     Tcomplex * freqChanPrbg = fastFadingDynDescr -> freqChanPrbg;
-    
+
     // prbg and ant index
     uint16_t prbgIdx  = threadIdx.x;
     uint16_t bsAntIdx = threadIdx.y + blockIdx.z * blockDim.y;
@@ -1473,24 +1489,24 @@ static __global__ void convertSctoPrbg(fastFadingDynDescr_t<Tscalar, Tcomplex> *
             tempSum.x *= inverseNScPrbg;
             tempSum.y *= inverseNScPrbg;
             break;
-        
+
         // case 4 will never be run in this kernel
         default:
             printf("Error: Invalid freqConvertType %d!\n", freqConvertType);
             break;
-    } 
-    
+    }
+
     freqChanPrbg[prbg_offet].x = tempSum.x;
     freqChanPrbg[prbg_offet].y = tempSum.y;
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 static __global__ void processInputKernel_time(fastFadingDynDescr_t<Tscalar, Tcomplex> * fastFadingDynDescr, float refTime0, uint8_t enableSwapTxRx)
 {
     // GRID(nLink, nBatch, 1);
     // BLOCK(m_procTxSampBlockSample, DL:nUeAnt/UL:nBsAnt or smaller, 1);
     // timeChan saved in [nLink, nBatch, nUeAnt, nBsAnt, firNzLen]
-    
+
     // from launch configuration
     uint32_t cidUidOffset = blockIdx.x;
     uint16_t batchIdx = blockIdx.y;
@@ -1506,7 +1522,7 @@ static __global__ void processInputKernel_time(fastFadingDynDescr_t<Tscalar, Tco
     Tcomplex * timeChan = fastFadingDynDescr -> timeChan;
     Tcomplex * txSigIn =  fastFadingDynDescr -> txSigIn;
     Tcomplex * rxSigOut = fastFadingDynDescr -> rxSigOut;
-    float cfoPhaseRef = 2.0f * M_PI * refTime0 * (fastFadingDynDescr -> cfoHz); 
+    float cfoPhaseRef = 2.0f * M_PI * refTime0 * (fastFadingDynDescr -> cfoHz);
     float cfoPhaseSamp = fastFadingDynDescr -> cfoPhaseSamp;
     uint32_t nDelaySample = fastFadingDynDescr -> nDelaySample;
     uint16_t procTxSampBlockSample = fastFadingDynDescr -> procTxSampBlockSample;
@@ -1534,10 +1550,10 @@ static __global__ void processInputKernel_time(fastFadingDynDescr_t<Tscalar, Tco
             nRxAnt = nUeAnt;
         }
     }
-    // Use static 
+    // Use static
     // __shared__ Tcomplex txSigInBlock[BLOCK_SAMPLE_];
     // __shared__ Tcomplex chanCoeLocal[MAX_TX_RX_ANT_ * MAX_NZ_TAPS_];
-    __shared__ uint16_t firNzIdx[MAX_NZ_TAPS_]; // no more than 24 NZ taps based on 3GPP 38.901 
+    __shared__ uint16_t firNzIdx[MAX_NZ_TAPS_]; // no more than 24 NZ taps based on 3GPP 38.901
     if(chanCoeIdx < firNzLen && threadIdx.y == 0)
     {
         firNzIdx[chanCoeIdx] = fastFadingDynDescr -> firNzIdx[chanCoeIdx];
@@ -1550,9 +1566,9 @@ static __global__ void processInputKernel_time(fastFadingDynDescr_t<Tscalar, Tco
         // read input signal and provide output signal
         uint32_t antTxSampOffset, globalTxSampOffset; // antTxSampOffset: tx sample offset for this antenna, i.e., [0, sigLenPerAnt-1]; globalTxSampOffset = antTxSampOffset + offset for current link
         uint32_t antRxSampOffset, globalRxSampOffset; // antRxSampOffset: rx sample offset for this antenna, i.e., [0, sigLenPerAnt-1], consider delay; globalRxSampOffset = antRxSampOffset + offset for current link
-        uint32_t globalAntPairRxSampOffset; // globalRxSampOffset = antRxSampOffset + offset for current link / tx 
+        uint32_t globalAntPairRxSampOffset; // globalRxSampOffset = antRxSampOffset + offset for current link / tx
         cuComplex rxSigReg;
-        cuComplex rxTxSigRegNoCfo; // rx-tx antenna pair sample without CFO 
+        cuComplex rxTxSigRegNoCfo; // rx-tx antenna pair sample without CFO
         Tcomplex tempTxSig, tempChanCoe;
         // copy channel coeficients firNzLen * blockDim.y into shared memory
         for(uint32_t chunkOffset = batchCumLen[batchIdx]; chunkOffset < batchCumLen[batchIdx + 1]; chunkOffset += procTxSampBlockSample) // each chunk for processing
@@ -1611,12 +1627,12 @@ static __global__ void processInputKernel_time(fastFadingDynDescr_t<Tscalar, Tco
                     chanCoeLocal[chanReadOffsetIdx + chanCoeIdx].x = timeChan[gloablCoeMatOffset + chanCoeIdx].x;
                     chanCoeLocal[chanReadOffsetIdx + chanCoeIdx].y = timeChan[gloablCoeMatOffset + chanCoeIdx].y;
                 }
-                __syncthreads(); // wait for time chan to be read   
+                __syncthreads(); // wait for time chan to be read
                 // apply the channel coes to tx symbols, add to local register
                 if(antTxSampOffset < sigLenPerAnt)
                 {
                     for(uint16_t chanSumIdx = 0; chanSumIdx < firNzLen; chanSumIdx++)
-                    {                        
+                    {
                         if(antTxSampOffset >= firNzIdx[chanSumIdx])
                         {
                             tempTxSig = txSigIn[globalTxSampOffset - firNzIdx[chanSumIdx]]; // current TxSig for sum
@@ -1626,9 +1642,9 @@ static __global__ void processInputKernel_time(fastFadingDynDescr_t<Tscalar, Tco
                             tempTxSig.x = 0.0f;
                             tempTxSig.y = 0.0f;
                         }
-                        
+
                         tempChanCoe = chanCoeLocal[chanReadOffsetIdx + chanSumIdx]; // current chanCoe for sum
-                        
+
                         // calculate rx-tx ant pair sample before adding CFO, rxSigRegNoCfo += tempTxSig * tempChanCoe
                         rxTxSigRegNoCfo.x = rxTxSigRegNoCfo.x + static_cast<float>(tempTxSig.x * tempChanCoe.x - tempTxSig.y * tempChanCoe.y);
                         rxTxSigRegNoCfo.y = rxTxSigRegNoCfo.y + static_cast<float>(tempTxSig.x * tempChanCoe.y + tempTxSig.y * tempChanCoe.x);
@@ -1643,7 +1659,7 @@ static __global__ void processInputKernel_time(fastFadingDynDescr_t<Tscalar, Tco
 
                     // save the rx-tx antenna pair data sample to global memory
                     if(antRxSampOffset < sigLenPerAnt)
-                    {  
+                    {
                         rxSigOutPerAntPair[globalAntPairRxSampOffset].x = rxTxSigRegWithCfo.x;
                         rxSigOutPerAntPair[globalAntPairRxSampOffset].y = rxTxSigRegWithCfo.y;
                     }
@@ -1684,7 +1700,7 @@ static __global__ void processInputKernel_time(fastFadingDynDescr_t<Tscalar, Tco
     }
 }
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 static __global__ void processInputKernel_freq(fastFadingDynDescr_t<Tscalar, Tcomplex> * fastFadingDynDescr, float refTime0, uint8_t enableSwapTxRx)
 {
     // GRID(nLink, nBatch, 1);
@@ -1692,7 +1708,7 @@ static __global__ void processInputKernel_freq(fastFadingDynDescr_t<Tscalar, Tco
     // freqChan saved in [nLink, nBatch, nUeAnt, nBsAnt, N_sc]
     // txSigIn saved in  [nLink, nBsAnt, nBatch, N_sc] for DL and [nLink, nUeAnt, nBatch, N_sc] for UL, row major
     // txSigOut saved in [nLink, nUeAnt, nBatch, N_sc] for DL and [nLink, nBsAnt, nBatch, N_sc] for UL, row major
-    
+
     // from launch configuration
     uint32_t cidUidOffset = blockIdx.x;
     uint16_t batchIdx = blockIdx.y;
@@ -1759,7 +1775,7 @@ static __global__ void processInputKernel_freq(fastFadingDynDescr_t<Tscalar, Tco
 }
 
 
-template <typename Tscalar, typename Tcomplex> 
+template <typename Tscalar, typename Tcomplex>
 static __global__ void processInputKernel_freq_columnMajor(fastFadingDynDescr_t<Tscalar, Tcomplex> * fastFadingDynDescr, float refTime0, uint8_t enableSwapTxRx)
 {
     // GRID(nLink, nBatch, 1);

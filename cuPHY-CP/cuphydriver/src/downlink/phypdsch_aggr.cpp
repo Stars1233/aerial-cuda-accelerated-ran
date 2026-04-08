@@ -20,6 +20,7 @@
 #include "phypdsch_aggr.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
+#include "cuda_events.hpp"
 #include "nvlog.hpp"
 #include "exceptions.hpp"
 #include "aerial-fh-driver/oran.hpp"
@@ -403,7 +404,7 @@ int PhyPdschAggr::callback(struct slot_command_api::slot_indication si)
 
     if(pdctx->getDlCb(dl_cb))
     {
-        dl_cb.callback_fn(getDynParams());
+        dl_cb.callback_fn(dl_cb.callback_fn_context, getDynParams());
 
         // for(int idx = 0; idx < cell_id_list.size(); idx++)
         // {
@@ -825,4 +826,15 @@ void printPdschDynPrmsAggr(const cuphyPdschDynPrms_t* dynamic_params)
     NVLOGI_FMT(TAG, "{}", tmp_pTDataTx_addr.str().c_str());
 
     printPdschDynamicCellGroupAggr(const_cast<cuphyPdschCellGrpDynPrm_t*>(cell_group_params));
+}
+
+float PhyPdschAggr::getPdschH2DCopyTime(const uint8_t slot) {
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (!pdctx->enable_prepone_h2d_cpy) {
+        return 0.0f;
+    }
+    const uint8_t slot_index = slot % MAX_PDSCH_TB_CPY_CUDA_EVENTS;
+    return 1000.0f * GetCudaEventElapsedTime(pdctx->get_event_pdsch_tb_cpy_start(slot_index),
+                                             pdctx->get_event_pdsch_tb_cpy_complete(slot_index),
+                                             __func__, getId());
 }

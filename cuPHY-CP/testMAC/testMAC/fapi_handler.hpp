@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <semaphore.h>
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -54,6 +55,17 @@ using namespace nv;
 #define STT_STATISTIC_PERIOD (2000)       // Statistic period for calculating min, max, average time cost. Unit: number of slots
 #define STT_ESTIMATE_COUNT_MAX (3)        // How many times to estimate
 #define STT_ESTIMATE_ADJUST_OFFSET (2500) // Jitter to adjust including nanosleep wakeup time cost. Unit: ns.
+
+// For FAPI TX deadline feature.
+static constexpr int DEADLINE_STATISTIC_PERIOD = 2000; // Statistic period for calculating min, max, average deadline difference. Unit: number of slots
+static constexpr int DEADLINE_DIFF_MAX_NS = 30 * 1000; // Max deadline difference for statistic logging. Unit: ns.
+static constexpr int MAX_SCHEDULE_AHEAD_TIME_NS = 15 * 1000; // Max ahead time for FAPI TX deadline scheduling. Unit: ns.
+static constexpr int AVG_SCHEDULE_AHEAD_TIME_NS = 10 * 1000; // Average ahead time for FAPI TX deadline scheduling. Unit: ns.
+static constexpr int SYSTEM_WAKEUP_TIME_COST_NS = 2500; // Average system wakeup time cost (system timer/thread context switch time). Unit: ns
+
+// This is required to ensure the FAPI TX deadline scheduling is valid.
+static_assert(MAX_SCHEDULE_AHEAD_TIME_NS > AVG_SCHEDULE_AHEAD_TIME_NS + SYSTEM_WAKEUP_TIME_COST_NS,
+    "MAX_SCHEDULE_AHEAD_TIME_NS must be greater than AVG_SCHEDULE_AHEAD_TIME_NS + SYSTEM_WAKEUP_TIME_COST_NS");
 
 enum class fapi_state_t
 {
@@ -104,8 +116,6 @@ public:
     {
         fapi_build_num = 0;
         fapi_sent_num = 0;
-        fapi_build_num = 0;
-        fapi_sent_num = 0;
         for (int i = 0; i < FAPI_REQ_SIZE; i++)
         {
             fapi_msg_cache[i].reset();
@@ -129,8 +139,8 @@ public:
         prach_prambIdx  = 0;
         harq_process_id = 0;
         restart_timer   = nullptr;
-        fapi_state      = fapi_state_t::IDLE;
         schedule_enable = false;
+        fapi_state.store(fapi_state_t::IDLE);
         pending_config.store(0);
     }
 
@@ -141,8 +151,8 @@ public:
         prach_prambIdx  = obj.prach_prambIdx;
         harq_process_id = obj.harq_process_id;
         restart_timer   = obj.restart_timer;
-        fapi_state      = obj.fapi_state;
         schedule_enable = false;
+        fapi_state.store(obj.fapi_state.load());
         pending_config.store(0);
     }
 
@@ -160,9 +170,9 @@ public:
     std::atomic<uint32_t> pending_config;
 
     // Timer for restart single cell
-    timer_t restart_timer;
+    timer_t restart_timer = nullptr;
 
-    fapi_state_t fapi_state;
+    std::atomic<fapi_state_t> fapi_state = fapi_state_t::IDLE;
 
     std::mutex queue_mutex;
 
@@ -192,6 +202,11 @@ public:
     virtual void cell_stop(int cell_id)       = 0;
     virtual void on_msg(nv_ipc_msg_t& msg)    = 0;
     virtual int  schedule_slot(sfn_slot_t ss) = 0;
+
+    /**
+     * Stop all cells and exit the FAPI handler
+     */
+    virtual void terminate() = 0;
 
     virtual void builder_thread_func() = 0;
 
@@ -359,13 +374,13 @@ protected:
 
     int set_restart_timer(int cell_id, int interval);
 
-    int data_buf_opt;
+    int data_buf_opt = 1; //!< Data buffer option: 0=msg_buf, 1=CPU_DATA, 2=CUDA_DATA, 3=GPU_DATA
 
-    int cell_num;
+    int cell_num = 0;
 
-    int notify_mode;
+    int notify_mode = 0;
 
-    uint16_t slots_per_frame;
+    uint16_t slots_per_frame = 0;
 
     // The cell_id for cell which is in configuring
     std::atomic<int32_t> current_config_cell_id;
@@ -378,13 +393,14 @@ protected:
     sem_t scheduler_sem; // Scheduler thread wait on it to start scheduling a slot
     nv_ipc_ring_t* sched_info_ring; // Slot info pending to schedule
 
-    std::atomic<sfn_slot_t> ss_tick; // SFN/SLOT of the tick
-    int64_t                 ts_tick; // Time stamp of the tick
-    sfn_slot_t              ss_fapi_last;
+    std::atomic<sfn_slot_t> ss_tick; //!< SFN/SLOT of the tick
+    int64_t                 ts_tick; //!< Time stamp of the tick
+    int64_t                 ts_tick_tai = 0; //!< The ideal tick time stamp aligned to TAI
+    sfn_slot_t              ss_fapi_last; //!< SFN/SLOT of the last slot
 
-    uint64_t global_tick;
-    uint64_t conformance_test_slot_counter;
-    uint16_t beam_id_position;
+    uint64_t global_tick = 0; //!< Global tick counter
+    uint64_t conformance_test_slot_counter = 0; //!< Conformance test slot counter
+    uint16_t beam_id_position = 0; //!< Beam ID position
 
     // The throughput test result
     std::vector<thrput_t> thrputs;
@@ -398,8 +414,8 @@ protected:
     // Cell first initialization flag, MUST send CONFIG.request when first_init == true
     std::vector<int> first_init;
 
-    test_mac_configs*  configs;
-    launch_pattern*    lp;
+    test_mac_configs*  configs = nullptr;
+    launch_pattern*    lp = nullptr;
     phy_mac_transport& _transport;
 
     //For OAM cell re-attaching to different RUs test, the idea is to replace current cell FAPIs with these of the target cell
@@ -418,33 +434,36 @@ protected:
     
 
     // Timer for restart all cells
-    timer_t restart_timer;
+    timer_t restart_timer = nullptr;
 
     // Timer for check cell config status
-    timer_t reconfig_timer;
+    timer_t reconfig_timer = nullptr;
 
-    ch8_conformance_test_stats* conformance_test_stats;
+    ch8_conformance_test_stats* conformance_test_stats = nullptr;
 
     // fapi_validate vald;
 
-    stat_log_t* schedule_time;
-    stat_log_t* stat_debug;
+    stat_log_t* schedule_time = nullptr;
+    stat_log_t* stat_debug = nullptr;
 
-    stat_log_t* uci_time;
-    stat_log_t* crc_time;
-    stat_log_t* rx_data_time;
-    stat_log_t* srs_ind_time;
+    stat_log_t* uci_time = nullptr;
+    stat_log_t* crc_time = nullptr;
+    stat_log_t* rx_data_time = nullptr;
+    stat_log_t* srs_ind_time = nullptr;
 
-    stat_log_t* stat_stt_send; // Statistic for average time cost of 1 sending message
-    stat_log_t* stat_stt_diff; // Statistic for difference between the expected scheduling end time and actual end time
+    stat_log_t* stat_stt_send = nullptr; // Statistic for average time cost of 1 sending message
+    stat_log_t* stat_stt_diff = nullptr; // Statistic for difference between the expected scheduling end time and actual end time
+
+    stat_log_t* stat_deadline_diff = nullptr; // Statistic for difference between the expected FAPI deadline and actual FAPI sending end time
+    stat_log_t* stat_tx_per_msg = nullptr; // Statistic for average time cost of 1 sending message
 
     std::vector<stt_estimate_t> stt_estimate;
 
     // Negative test flags
-    int rnti_test_mode; // 0 - default, normal mode; 1 - negative test
+    int rnti_test_mode = 0; // 0 - default, normal mode; 1 - negative test
 
     ul_harq_handle_t ul_harq_handle[MAX_CELLS_PER_SLOT][FAPI_MAX_UE][FAPI_MAX_UL_HARQ_ID];
-    uint8_t ul_dci_freq_domain_bits; 
+    uint8_t ul_dci_freq_domain_bits = 0; 
     std::map<uint16_t, uint16_t> rnti_2_ueid_map;
 };
 

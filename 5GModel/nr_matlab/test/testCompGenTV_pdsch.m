@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,9 +48,9 @@ end
 
 selected_TC = [3201:3999];
 if relNum == 2240
-    disabled_TC = [3263, 3270, 3300, 3338, 3339, 3342, 3344, 3356, 3360];
+    disabled_TC = [3263, 3270, 3300, 3338, 3339, 3342, 3344, 3356, 3362];
 else
-    disabled_TC = [3270, 3300, 3342. 3360];
+    disabled_TC = [3270, 3300, 3342, 3362];
 end
 [~,TcIdx] = ismember(disabled_TC, selected_TC);
 selected_TC(TcIdx) = [];
@@ -257,9 +257,10 @@ CFG = {...
  3357,  1,       17,   1,  0,   273,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0; % modComp Qm=6
  3358,  1,        7,   1,  0,   273,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0; % modComp Qm=4
  3359,  1,       27,   1,  0,   136,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0; % modComp w/ partial BW
+ 3360,  1,       27,   2,  0,   253,  2,     12,     0,    0,    273,   211,   0,     41,     2,      2,     1,     41,      2,   0,  16,     0; % modComp w/ mixed modulation
 
  % MU-MIMO > 16 layers 
- 3360,  1,       27,   2,  20,  253,  2,     12,     0,    0,    273,   211,   0,     41,     2,      2,     1,     41,      2,   0,   32,     0; % nl 32 = 4 x 8
+ 3362,  1,       27,   2,  20,  253,  2,     12,     0,    0,    273,   211,   0,     41,     2,      2,     1,     41,      2,   0,   32,     0; % nl 32 = 4 x 8
 
  % different BW
  % mu = 1
@@ -315,6 +316,7 @@ CFG = {...
  3521,  1,        1,   1,  0,   273,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0;  % Cfg from base case 3201, overwrite PDU with invalid VRBtoPRBMapping = 3
  3522,  1,        1,   1,  0,   273,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0;  % Cfg from base case 3201, overwrite PDU with invalid StartSymbolIndex = 14
  3523,  1,        1,   1,  0,   273,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0;  % Cfg from base case 3201, overwrite PDU with invalid NrOfSymbols = 15
+ 3524,  1,        1,   1,  0,   273,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0;  % Cfg from base case 3201, overwrite PDU with invalid numPRGs/prgSize (numPRGs=17, prgSize=16)
     
  % requested TCs
  % numDmrsCdmGrpsNoData and dmrsPort
@@ -625,10 +627,10 @@ CFG = {...
  3859, 1,        27,   1,  0,  273,  2,     12,     0,    0,    273,   211,   0,     41,     2,      2,     1,     41,      2,   0,   8,     0; % nl = 1 x 8UE
 
 % TVs matching with BFW
-% reserved range 3870:3900
+% reserved range 3869:3900
 % 64T64R
 % TC#   mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym  SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 nAnt slotIdx 
-
+ 3869,  1,        27,   1,  0,  273,  2,     12,     0,    0,    273,   1,   0,     41,     2,      2,     1,     41,      2,   0,   16,     0; % nl = 1 x 16UE + PRG size = 16
  3870,  1,        27,   1,  0,  273,  2,     12,     0,    0,    273,   1,   0,     41,     2,      2,     1,     41,      2,   0,   16,     0; % nl = 1 x 16UE
  3871   1,        27,   1,  0,  273,  2,     12,     0,    0,    273,   1,   0,     41,     2,      2,     1,     41,      2,   0,   16,     0;  % 1 layer (1 UE)
  3872   1,        27,   2,  0,  273,  2,     12,     0,    0,    273,   1,   0,     41,     2,      2,     1,     41,      2,   0,   16,     0;  % 2 layer (1 UE)
@@ -669,37 +671,38 @@ INVALID_CFG_FIELD_NAMES = {'pduBitmap', 'BWPSize', 'BWPStart', 'SubcarrierSpacin
     'NrOfCodewords', 'targetCodeRate', 'qamModOrder', 'mcsIndex', 'mcsTable', ... 
     'rvIndex', 'nrOfLayers', 'refPoint', 'DmrsSymbPos', 'dmrsConfigType', ...
     'SCID', 'numDmrsCdmGrpsNoData', 'resourceAlloc', 'rbStart','rbSize', ...
-    'VRBtoPRBMapping', 'StartSymbolIndex', 'NrOfSymbols'
+    'VRBtoPRBMapping', 'StartSymbolIndex', 'NrOfSymbols', 'numPRGs', 'prgSize'
     };
 % Different names in spec -> pdu.fieldName: dlDmrsSymbPos -> DmrsSymbPos
 
 % TC config for invalid params, -1 means no change
-% INVALID_CFG has 23 params that can be overwritten
+% INVALID_CFG has 25 params that can be overwritten
 INVALID_CFG = { ...
-    % TC#  pduBitmap  nBWP  BWP0  scSpace  cpType  nCodeW  codeR  qamM  mcsIdx  mcsTab  rv  nLayers  refP  dmrsPos  dmrsCfg  SCID  nDmrsGrpNoData  resAlloc  RB0  nRB  vPrbMap  sym0  nSym 
-    3501,   1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid pduBitmap = 1
-    3502,  -1,         0,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid BWPSize = 0
-    3503,  -1,        -1,   275,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid BWPStart = 275
-    3504,  -1,        -1,    -1,   5,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid SubcarrierSpacing = 5
-    3505,  -1,        -1,    -1,  -1,       2,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid CyclicPrefix = 2
-    3506,  -1,        -1,    -1,  -1,      -1,      2,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid NrOfCodewords = 2
-    3507,  -1,        -1,    -1,  -1,      -1,     -1,      0,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid targetCodeRate = 0
-    3508,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    10,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid qamModOrder = 10
-    3509,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   32,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid mcsIndex = 32
-    3510,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,      5,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid mcsTable = 5
-    3511,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,      4, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid rvIndex = 4
-    3512,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1,  5,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid nrOfLayers = 5
-    3513,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,       2,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid refPoint = 2
-    3514,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,    0,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid DmrsSymbPos = 0
-    3515,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,       2,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid dmrsConfigType = 2
-    3516,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,       2,   -1,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid SCID = 2
-    3517,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,    3,             -1,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid numDmrsCdmGrpsNoData = 3
-    3518,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,              2,        -1,  -1, -1,      -1,   -1;  % base case 3201 with invalid resourceAlloc = 2
-    3519,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,       275,  -1, -1,      -1,   -1;  % base case 3201 with invalid rbStart = 275
-    3520,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1, 276, -1,      -1,   -1;  % base case 3201 with invalid rbSize = 276
-    3521,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1,  3,      -1,   -1;  % base case 3201 with invalid VRBtoPRBMapping = 3
-    3522,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      14,   -1;  % base case 3201 with invalid StartSymbolIndex = 14
-    3523,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   15;  % base case 3201 with invalid NrOfSymbols = 15
+    % TC#  pduBitmap  nBWP  BWP0  scSpace  cpType  nCodeW  codeR  qamM  mcsIdx  mcsTab  rv  nLayers  refP  dmrsPos  dmrsCfg  SCID  nDmrsGrpNoData  resAlloc  RB0  nRB  vPrbMap  sym0  nSym  numPRGs  prgSize
+    3501,   1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid pduBitmap = 1
+    3502,  -1,         0,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid BWPSize = 0
+    3503,  -1,        -1,   275,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid BWPStart = 275
+    3504,  -1,        -1,    -1,   5,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid SubcarrierSpacing = 5
+    3505,  -1,        -1,    -1,  -1,       2,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid CyclicPrefix = 2
+    3506,  -1,        -1,    -1,  -1,      -1,      2,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid NrOfCodewords = 2
+    3507,  -1,        -1,    -1,  -1,      -1,     -1,      0,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid targetCodeRate = 0
+    3508,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    10,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid qamModOrder = 10
+    3509,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   32,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid mcsIndex = 32
+    3510,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,      5,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid mcsTable = 5
+    3511,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,      4, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid rvIndex = 4
+    3512,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1,  5,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid nrOfLayers = 5
+    3513,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,       2,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid refPoint = 2
+    3514,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,    0,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid DmrsSymbPos = 0
+    3515,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,       2,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid dmrsConfigType = 2
+    3516,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,       2,   -1,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid SCID = 2
+    3517,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,    3,             -1,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid numDmrsCdmGrpsNoData = 3
+    3518,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,              2,        -1,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid resourceAlloc = 2
+    3519,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,       275,  -1, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid rbStart = 275
+    3520,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1, 276, -1,      -1,   -1,  -1,      -1;  % base case 3201 with invalid rbSize = 276
+    3521,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1,  3,      -1,   -1,  -1,      -1;  % base case 3201 with invalid VRBtoPRBMapping = 3
+    3522,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      14,   -1,  -1,      -1;  % base case 3201 with invalid StartSymbolIndex = 14
+    3523,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   15,  -1,      -1;  % base case 3201 with invalid NrOfSymbols = 15
+    3524,  -1,        -1,    -1,  -1,      -1,     -1,     -1,    -1,   -1,     -1,     -1, -1,      -1,   -1,      -1,      -1,   -1,             -1,        -1,  -1, -1,      -1,   -1,  17,      16;  % base case 3201 with invalid numPRGs=17, prgSize=16 (more than prgSize of 10 not in allowed set for 4T4R)
     };
 
 [NallTest, ~] = size(CFG);
@@ -787,7 +790,7 @@ parfor n = 1:NallTest
             SysPar.pdsch{1}.numPRGs = 30;
         end
         
-        if ismember(caseNum, [3870:3900])
+        if ismember(caseNum, [3869:3900])
             SysPar.pdsch{1}.seed = 0;
             SysPar.SimCtrl.enable_dynamic_BF = 1;
             SysPar.carrier.N_FhPort_DL = 16;
@@ -800,6 +803,8 @@ parfor n = 1:NallTest
             SysPar.pdsch{1}.prgSize = 2;
             if ismember(caseNum, [3878 3889])
                 SysPar.pdsch{1}.prgSize = 4;
+            elseif ismember(caseNum, [3869])
+                SysPar.pdsch{1}.prgSize = 16;
             end
             SysPar.pdsch{1}.numPRGs = ceil(SysPar.pdsch{1}.rbSize/SysPar.pdsch{1}.prgSize);
         end
@@ -943,6 +948,17 @@ parfor n = 1:NallTest
             SysPar.pdsch{1}.powerControlOffset = 8 + 2;   % PDSCH/CSIRS = 2 dB         
             SysPar.pdsch{1}.powerControlOffsetSS = 0; % CSIRS/SSB = -3dB            
             SysPar.SimCtrl.genTV.fhMsgMode = 2;
+        elseif caseNum == 3360
+            SysPar.pdsch{1}.powerControlOffset = 8 + 2;   % PDSCH/CSIRS = 2 dB         
+            SysPar.pdsch{1}.powerControlOffsetSS = 0; % CSIRS/SSB = -3dB
+            SysPar.SimCtrl.genTV.fhMsgMode = 2;
+            nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
+                        0  100  27  4  0   0    0;...
+                        0  100  19  3  4   0    0;...
+                        0  100  10  1  7   0    0;...
+                        0  100   1  2  0   1    0;...
+                      100  100  19  4  0   0    1;...
+                      100  100  27  4  4   0    1];
         elseif caseNum == 3265
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                         0  60   10  1  0   0    0;...
@@ -1182,7 +1198,7 @@ parfor n = 1:NallTest
                        20  252  27  2  2   0    0;...
                        20  252  27  2  4   0    0;...
                        20  252  27  2  6   0    0];
-        elseif caseNum == 3360
+        elseif caseNum == 3362
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                        20  252  27  4  0   0    0;...
                        20  252  27  4  4   0    0;...
@@ -1262,7 +1278,7 @@ parfor n = 1:NallTest
                        10  60  27  1  6   0    0;...
                        10  60  27  1  7   0    0];
              
-        elseif caseNum == 3870
+        elseif caseNum == 3870 || caseNum == 3869
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                        0  273  27  1  0   0    0;...
                        0  273  27  1  1   0    0;...
@@ -1642,7 +1658,7 @@ parfor n = 1:NallTest
                     RNTI_ = [1 4 6 7 8 9 10 3];
                     SysPar.pdsch{idxUe}.RNTI = RNTI_(idxUe);
                 end
-                if ismember(caseNum, [3870]) % Combined BFW-PDSCH test vector
+                if ismember(caseNum, [3869, 3870]) % Combined BFW-PDSCH test vector
                     RNTI_ = [4 13 6 11 8 3 16 14 5 15 9 7 10 2 12 1];
                     SysPar.pdsch{idxUe}.RNTI = RNTI_(idxUe);
                 end
@@ -1657,7 +1673,7 @@ parfor n = 1:NallTest
                 if ismember(caseNum, [3891:3896])
                     SysPar.pdsch{idxUe}.RNTI = idxUe;
                 end
-                if ismember(caseNum, [3897:3900])
+                if ismember(caseNum, [3360,3897:3900])
                     SysPar.pdsch{idxUe}.RNTI = idxUe + 6;
                 end
             end
@@ -1710,7 +1726,7 @@ parfor n = 1:NallTest
                 for idxUe = 1:8
                     SysPar.pdsch{idxUe}.DmrsScramblingId = idxUe*41;
                 end
-            elseif caseNum == 3360
+            elseif caseNum == 3362
                 for idxUe = 5:8
                     SysPar.pdsch{idxUe}.nlAbove16 = 1;
                 end
@@ -1802,7 +1818,7 @@ parfor n = 1:NallTest
                 SysPar.pdsch{idxUe}.beamIdx = [1:SysPar.pdsch{idxUe}.digBFInterfaces];
             end
         end
-        if ismember(caseNum, [3870:3900])
+        if ismember(caseNum, [3869:3900])
             for idxUe = 1:length(SysPar.pdsch)
                 SysPar.pdsch{idxUe}.digBFInterfaces = 0;
                 SysPar.pdsch{idxUe}.PMidx = 0;
@@ -1854,7 +1870,7 @@ parfor n = 1:NallTest
         end
         
         % For invalid PDSCH test cases
-        if ismember(caseNum, [3501:3523])  % Tvs with invalid PDSCH params
+        if ismember(caseNum, [3501:3524])  % Tvs with invalid PDSCH params
             SysPar.SimCtrl.negTV.enable = 1;  % enable negTV
             % SimCrtl.negTV.pdufieldName: List of fields to be changed
             % SimCrtl.negTV.pdufieldValue: List of values correspoinding to SimCrtl.negTV.pdufieldName

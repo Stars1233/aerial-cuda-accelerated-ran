@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -95,12 +95,17 @@ def run(args, designated, mig, mig_gpu, command, vectors, mode, target, k):
             else:
                 buffer = system.split(args.cfld)[0].strip().split()
                 env = {}
+                cmd_prefix_tokens = []
 
                 for itm in buffer:
-                    mapping = itm.split("=")
-                    env[mapping[0]] = mapping[1]
+                    mapping = itm.split("=", 1)
+                    if len(mapping) >= 2:
+                        env[mapping[0]] = mapping[1]
+                    else:
+                        cmd_prefix_tokens.append(itm)
 
-                cmd = args.cfld + system.split(args.cfld)[-1].strip()
+                cmd_tail = args.cfld + system.split(args.cfld)[-1].strip()
+                cmd = (" ".join(cmd_prefix_tokens) + " " + cmd_tail).strip() if cmd_prefix_tokens else cmd_tail
                 cmd, stdout = cmd.split(">")
 
                 ofile = open(stdout, "w")
@@ -197,11 +202,19 @@ def run(args, designated, mig, mig_gpu, command, vectors, mode, target, k):
                     if not args.is_save_buffers:
                         os.remove(f"buffer-{mig_gpu}-{str(k).zfill(2)}.txt")
 
+                if args.is_ref_check:
+                    from ..check_ref_mismatch import check_ref_mismatch
+                    # Diagnostic only; does not gate sweep results.
+                    _, ref_data = check_ref_mismatch(lines, cell_count=k)
+
                 if args.is_check_traffic:
                     from ..error import parse
                 else:
                     from .sweep import parse
 
                 results = parse(args, lines)
+
+                if args.is_ref_check and results is not None:
+                    results.update(ref_data)
 
     return results

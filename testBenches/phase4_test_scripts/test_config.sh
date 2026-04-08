@@ -1,5 +1,6 @@
 #!/bin/bash  -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,19 +52,23 @@ show_usage() {
     echo "                                              Alternatively, one can specify the channel bit-mask as a hex value (eg:0xF) b0:PUSCH,b1:PDSCH,b2:PDCCH_UL,b3:PDCCH_DL,b4:PBCH,b5:PUCCH,b6:PRACH,b7:CSI_RS,b8:SRS,b9:DL_BFW,b10:UL_BFW "
     echo "  --DGL=N        , -d N       Enable (1) or disable (0) device graph launch (default: 1)"
     echo "  --green-ctx=N  , -g N       Enable (1) or disable (0) green-context (default: 0)"
+    echo "  --gc-wqs=N                  Enable (1) or disable (0) green context workqueues (default: 1)"
     echo "  --data-lake=N  , -l N       Enable (1) or disable (0) datalake (default: 0)"
     echo "  --dlc-tb=N     , -t N       Enable (1) or disable (0) # Enable/Disable DLC testbench (default: 0)"
     echo "  --ehq=N        , -q N       Enable (1) or disable (0) early-HARQ in PUSCH (default: 1)"
     echo "  --log-nic-timings           Enable additional debug logs related to NIC timings (disabled by default)"
     echo "  --ru-worker-tracing         Enable RU C-plane worker tracing logs (disabled by default)"
     echo "  --reduced-logging           Enable reduced logging mode - disables detailed tracing and processing time logs (disabled by default)"
+    echo "  --cupti                     Enable CUPTI tracing (disabled by default)"
     echo "  --num-cells=N  , -c N       Set number of cells (default: 20)"
     echo "  --num-ports=N  , -p N       Set number of NIC ports (default: 1, acceptable values: 1 or 2)"
     echo "  --num-slots=N  , -T N       Set number of test slots (default: 600000)"
     echo "  --STT=N        , -s N       Set schedule total time (default: 455000 for 4T4R and 480000 for MIMO)"
     echo "  --enable_32dl=N, -e N       Enable (1) or disable (0) enable_32dl (default: 0)"
     echo "  --work-cancel=N, -w N       Set work cancellation mode (0: disable, 1: conditional graph nodes, 2: device graph launch | default: 2)"
-    echo "  --pmu=N        , -m N       Set pmu_metrics mode (0: disabled, 1: general counters (platform agnostic), 2: topdown metrics (Grace only), 3: cache metrics (grace only) | default: 3"
+    echo "  --dlc-packing=N             Set DL C-plane core packing scheme (0: default, 1: fixed per-cell, 2: dynamic workload-based [not yet supported] | default: 0)"
+    echo "  --dlc-core-index=<array>    Set DL C-plane core index per cell for scheme=1 (e.g., --dlc-core-index=[0,1,2] for 3 cells)"
+    echo "  --pmu=N        , -m N       Set pmu_metrics mode (0: disabled, 1: general counters (platform agnostic), 2: topdown metrics (Grace only), 3: cache metrics (Grace only) | default: 0)"
     echo "  --force        , -f         Force re-generation of configuration"
     echo "  --cubb-sdk=PATH             Set cuBB SDK path"
     echo "                              Default: auto-detect (../../ from script dir)"
@@ -77,6 +82,90 @@ show_usage() {
     echo "  $0 59c --num-cells=20 -B 9 -T 30000 --ehq=0 --channels PUSCH+PDSCH+CSI_RS"
 }
 
+# Helper function to compute the number of DLC tasks/cores available
+# This mirrors the logic in cuphydriver_api.cpp get_num_dlc_tasks()
+# Arguments:
+#   $1 - num_workers: number of DL workers from the logical cores config
+#   $2 - commViaCpu: 1 if GL4 mode (gpu_init_comms_via_cpu), 0 otherwise
+#   $3 - mMIMO_enable: 1 if MIMO enabled, 0 otherwise
+# Returns: number of DLC tasks via echo
+get_num_dlc_tasks() {
+    local num_workers=$1
+    local commViaCpu=$2
+    local mMIMO_enable=$3
+
+    # Ensure minimum number of workers required
+    if [ "$num_workers" -lt 2 ]; then
+        echo 0
+        return
+    fi
+
+    if [ "$commViaCpu" -eq 1 ]; then
+        if [ "$mMIMO_enable" -eq 1 ]; then
+            echo $((num_workers - 3))
+        else
+            echo $((num_workers - 2))
+        fi
+    elif [ "$mMIMO_enable" -eq 1 ]; then
+        if [ "$num_workers" -gt 5 ]; then
+            echo $((num_workers - 2))
+        else
+            echo "$num_workers"
+        fi
+    else
+        echo $((num_workers - 1))
+    fi
+}
+
+# Helper function to generate DLC core index array for fixed packing scheme
+# For every group of 3 cells:
+#   - First cell (index 0, 3, 6, ...) gets a dedicated DLC core
+#   - Next two cells (indices 1,2 and 4,5 and 7,8, ...) share a DLC core
+# This means each group of 3 cells uses 2 DLC cores
+# Arguments:
+#   $1 - num_cells: total number of cells
+#   $2 - num_dlc_cores: total available DLC cores
+# Returns: array string like "[0,1,1,2,3,3,4,5,5]" via echo
+# Example: 9 cells, 6 DLC cores -> [0,1,1,2,3,3,4,5,5]
+generate_dlc_core_index_grouped() {
+    local num_cells=$1
+    local num_dlc_cores=$2
+
+    # Calculate required cores: each group of 3 cells needs 2 cores
+    local num_groups=$(( (num_cells + 2) / 3 ))
+    local required_cores=$((num_groups * 2))
+
+    if [ "$num_dlc_cores" -lt "$required_cores" ]; then
+        echo "Error: Not enough DLC cores ($num_dlc_cores) for fixed packing scheme with $num_cells cells (need $required_cores cores for $num_groups groups)" >&2
+        return 1
+    fi
+
+    local result="["
+
+    for ((cell_idx=0; cell_idx<num_cells; cell_idx++)); do
+        if [ "$cell_idx" -gt 0 ]; then
+            result="${result},"
+        fi
+
+        # Determine which group of 3 this cell belongs to
+        local group_idx=$((cell_idx / 3))
+        local pos_in_group=$((cell_idx % 3))
+
+        if [ "$pos_in_group" -eq 0 ]; then
+            # First cell in group gets dedicated core (even core index: 0, 2, 4, ...)
+            local core_idx=$((group_idx * 2))
+            result="${result}${core_idx}"
+        else
+            # Second and third cells in group share a core (odd core index: 1, 3, 5, ...)
+            local core_idx=$((group_idx * 2 + 1))
+            result="${result}${core_idx}"
+        fi
+    done
+
+    result="${result}]"
+    echo "$result"
+}
+
 # Default values
 NUM_CELLS=20
 NUM_PORTS=1
@@ -86,18 +175,24 @@ DEVICE_GRAPH_LAUNCH_ENABLED=1
 EARLY_HARQ_ENABLED=1
 WORK_CANCEL_MODE=2
 USE_GREEN_CONTEXT=0
+USE_GC_WQS=1 # Use green contexts work queues (default enabled, but relevant only if USE_GREEN_CONTEXT is set)
 STT_DEFAULT=455000
 STT=""
 LOG_NIC_TIMINGS=false
 RU_WORKER_TRACING=false
 REDUCED_LOGGING=false
-PMU_METRICS=3
+CUPTI_TRACING=false
+PMU_METRICS=0
 CHANNELS="all"
 CHANNELS_dec=0
 COMPRESSION=1
 DATALAKE=0
 DLC_TB_ENABLED=0
 ENABLE_32DL=0
+DLC_CORE_PACKING_SCHEME=0
+DLC_CORE_PACKING_SCHEME_USER_SPECIFIED=false
+DLC_CORE_INDEX=""
+DLC_CORE_INDEX_USER_SPECIFIED=false
 # Parse command-line arguments
 BFP_EXPLICITLY_SET=false
 while [[ $# -gt 0 ]]; do
@@ -125,7 +220,7 @@ while [[ $# -gt 0 ]]; do
             BFP="$value"
             shift
             ;;
-        --channels*|--DGL*|--dlc-tb*|--ehq*|--green-ctx*|--num-cells*|--num-ports*|--num-slots*|--STT*|--work-cancel*|--pmu*|--compression*|--data-lake*)
+        --channels*|--DGL*|--dlc-tb*|--ehq*|--green-ctx*|--gc-wqs*|--num-cells*|--num-ports*|--num-slots*|--STT*|--work-cancel*|--pmu*|--compression*|--data-lake*)
             if [[ "$1" == *"="* ]]; then
                 # Option with equals sign
                 option="${1%%=*}"
@@ -150,6 +245,7 @@ while [[ $# -gt 0 ]]; do
                 --dlc-tb) DLC_TB_ENABLED="$value" ;;
                 --ehq) EARLY_HARQ_ENABLED="$value" ;;
                 --green-ctx) USE_GREEN_CONTEXT="$value" ;;
+                --gc-wqs) USE_GC_WQS="$value" ;;
                 --num-cells) NUM_CELLS="$value" ;;
                 --num-ports) NUM_PORTS="$value" ;;
                 --num-slots) TEST_SLOTS="$value" ;;
@@ -235,12 +331,44 @@ while [[ $# -gt 0 ]]; do
             REDUCED_LOGGING=true
             shift
             ;;
+        --cupti)
+            CUPTI_TRACING=true
+            shift
+            ;;
         --force|-f)
             FORCE=true
             shift
             ;;
         --enable_32dl)
             ENABLE_32DL="$2"
+            shift 2
+            ;;
+        --dlc-packing=*)
+            DLC_CORE_PACKING_SCHEME="${1#*=}"
+            DLC_CORE_PACKING_SCHEME_USER_SPECIFIED=true
+            shift
+            ;;
+        --dlc-packing)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for $1 option"
+                exit 1
+            fi
+            DLC_CORE_PACKING_SCHEME="$2"
+            DLC_CORE_PACKING_SCHEME_USER_SPECIFIED=true
+            shift 2
+            ;;
+        --dlc-core-index=*)
+            DLC_CORE_INDEX="${1#*=}"
+            DLC_CORE_INDEX_USER_SPECIFIED=true
+            shift
+            ;;
+        --dlc-core-index)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for $1 option"
+                exit 1
+            fi
+            DLC_CORE_INDEX="$2"
+            DLC_CORE_INDEX_USER_SPECIFIED=true
             shift 2
             ;;
         -*)
@@ -397,7 +525,7 @@ if [[ ! " ${valid_perf_patterns[*]} " =~ " $pattern_name " ]]; then
 fi
 
 # Variables appended to VARS (in TEST_CONFIG_FILE) by this script
-    TEST_VARS="PATTERN PATTERN_MODE CHANNELS NUM_CELLS NUM_PORTS TEST_SLOTS WORK_CANCEL_MODE WC_MODE BFP EARLY_HARQ_ENABLED EHQ_STATUS DEVICE_GRAPH_LAUNCH_ENABLED DGL_STATUS USE_GREEN_CONTEXT GC_STATUS PMU_METRICS STT DLC_TB_ENABLED ML2_CELL_MASK0 ML2_CELL_MASK1 ML2_CELL_LIST0 ML2_CELL_LIST1 TESTMAC1_YAML"
+    TEST_VARS="PATTERN PATTERN_MODE CHANNELS NUM_CELLS NUM_PORTS TEST_SLOTS WORK_CANCEL_MODE WC_MODE BFP EARLY_HARQ_ENABLED EHQ_STATUS DEVICE_GRAPH_LAUNCH_ENABLED DGL_STATUS USE_GREEN_CONTEXT USE_GC_WQS GC_STATUS PMU_METRICS STT DLC_TB_ENABLED ML2_CELL_MASK0 ML2_CELL_MASK1 ML2_CELL_LIST0 ML2_CELL_LIST1 TESTMAC1_YAML"
 
 TEST_CONFIG_FILE=$CONFIG_DIR/testBenches/phase4_test_scripts/test_config_summary.sh
 if [[ ! -f $TEST_CONFIG_FILE ]]; then
@@ -452,11 +580,11 @@ if [[ "$USE_GREEN_CONTEXT" -eq 1 && "$WORK_CANCEL_MODE" -ne 0 ]]; then
 fi
 
 if [[ "$DATALAKE" -eq 1 ]]; then
-    yq -i '.cuphydriver_config.datalake_core = 30' "$CUPHY_YAML"
+    yq -i '.cuphydriver_config.data_core = 30' "$CUPHY_YAML"
     yq -i '.cuphydriver_config.datalake_address = "localhost"' "$CUPHY_YAML"
     yq -i '.cuphydriver_config.datalake_samples = 10000' "$CUPHY_YAML"
 elif [[ "$DATALAKE" -eq 0 ]]; then
-    yq -i 'del(.cuphydriver_config.datalake_core)' "$CUPHY_YAML"
+    yq -i 'del(.cuphydriver_config.data_core)' "$CUPHY_YAML"
     yq -i 'del(.cuphydriver_config.datalake_address)' "$CUPHY_YAML"
     yq -i 'del(.cuphydriver_config.datalake_samples)' "$CUPHY_YAML"
 else
@@ -471,7 +599,7 @@ if [[ "$pattern_name" == "62c" ]] || [[ "$pattern_name" == "63c" ]]; then
     yq -i '.cuphydriver_config.max_harq_pools = 512' $CUPHY_YAML
 fi
 
-if [[ "$pattern_name" == "71" ]] || [[ "$pattern_name" == "81b" ]] || [[ "$pattern_name" == "81d" ]]; then
+if [[ "$pattern_name" == "71" ]] || [[ "$pattern_name" == "79a" ]] || [[ "$pattern_name" == "79b" ]] || [[ "$pattern_name" == "81b" ]] || [[ "$pattern_name" == "81d" ]]; then
     yq -i '.cuphydriver_config.pusch_aggr_per_ctx = 4' $CUPHY_YAML
     yq -i '.cuphydriver_config.srs_aggr_per_ctx = 5' $CUPHY_YAML
 fi
@@ -549,10 +677,114 @@ else
     echo "Error: --green-ctx|-g must be either 0 or 1"
     exit 1
 fi
-# pmu metric default value is 3
+if [ "$USE_GC_WQS" -eq 1 ] || [ "$USE_GC_WQS" -eq 0 ]; then
+    yq -i ".cuphydriver_config.use_gc_workqueues = $USE_GC_WQS" $CUPHY_YAML
+else
+    echo "Error: --gc-wqs must be either 0 or 1"
+    exit 1
+fi
 yq -i ".cuphydriver_config.pmu_metrics = $PMU_METRICS" $CUPHY_YAML
 # Update number of cells
 yq -i ".cuphydriver_config.cell_group_num = $NUM_CELLS" $CUPHY_YAML
+# Enable DL core affinity by default
+yq -i '.cuphydriver_config.enable_dl_core_affinity = 1' $CUPHY_YAML
+
+# DL C-plane core packing scheme configuration
+# For pattern 89, default to fixed per-cell packing scheme if not specified by user
+if [ "$pattern_name" == "89" ] && [ "$DLC_CORE_PACKING_SCHEME_USER_SPECIFIED" = false ]; then
+    DLC_CORE_PACKING_SCHEME=1
+    echo "Pattern 89 detected: defaulting to fixed per-cell DLC packing scheme (--dlc-packing=1)"
+fi
+
+if [ "$DLC_CORE_PACKING_SCHEME" -eq 2 ]; then
+    echo "Error: dlc_core_packing_scheme=2 (dynamic workload-based) is not yet supported"
+    exit 1
+fi
+
+if [ "$DLC_CORE_PACKING_SCHEME" -ge 0 ] && [ "$DLC_CORE_PACKING_SCHEME" -le 2 ]; then
+    yq -i ".cuphydriver_config.dlc_core_packing_scheme = $DLC_CORE_PACKING_SCHEME" $CUPHY_YAML
+else
+    echo "Error: --dlc-packing must be 0, 1, or 2"
+    exit 1
+fi
+
+# Compute the number of DLC tasks/cores available for bound checking and auto-generation
+# NUM_DL_WORKERS should already be set by setup1_DU.sh in test_config_summary.sh
+echo "NUM_DL_WORKERS (from test_config_summary.sh): $NUM_DL_WORKERS"
+
+# Determine commViaCpu (1 for GL4 mode, 0 otherwise)
+if [[ "$CONTROLLER_MODE" == "F08_GL4" ]]; then
+    COMM_VIA_CPU=1
+else
+    COMM_VIA_CPU=0
+fi
+
+# Determine mMIMO_enable (1 if MUMIMO is ON, 0 otherwise)
+if [[ "$MUMIMO" == "ON" ]]; then
+    MMIMO_ENABLE=1
+else
+    MMIMO_ENABLE=0
+fi
+
+# Calculate the number of DLC tasks available
+NUM_DLC_TASKS=$(get_num_dlc_tasks "$NUM_DL_WORKERS" "$COMM_VIA_CPU" "$MMIMO_ENABLE")
+echo "DLC tasks available: $NUM_DLC_TASKS (DL workers: $NUM_DL_WORKERS, commViaCpu: $COMM_VIA_CPU, mMIMO: $MMIMO_ENABLE)"
+
+# Set per-cell dlc_core_index when packing scheme is 1 (fixed per-cell)
+if [ "$DLC_CORE_PACKING_SCHEME" -eq 1 ]; then
+    # Auto-generate dlc-core-index for pattern 89 if not specified by user
+    if [ -z "$DLC_CORE_INDEX" ] && [ "$DLC_CORE_INDEX_USER_SPECIFIED" = false ]; then
+        if [ "$pattern_name" == "89" ]; then
+            # Auto-generate for fixed packing scheme: cells at index 0,3,6,... get dedicated cores
+            DLC_CORE_INDEX=$(generate_dlc_core_index_grouped "$NUM_CELLS" "$NUM_DLC_TASKS")
+            if [ $? -ne 0 ]; then
+                echo "Error: Failed to auto-generate dlc_core_index for fixed packing scheme"
+                exit 1
+            fi
+            echo "Auto-generated dlc_core_index (fixed packing scheme): $DLC_CORE_INDEX"
+        else
+            echo "Error: --dlc-core-index must be specified when --dlc-packing=1"
+            exit 1
+        fi
+    fi
+
+    # Parse the dlc_core_index array (e.g., [0,1,2])
+    # Remove brackets and split by comma
+    DLC_CORE_INDEX_CLEAN=$(echo "$DLC_CORE_INDEX" | tr -d '[]' | tr -d ' ')
+    IFS=',' read -ra DLC_CORE_INDEX_ARR <<< "$DLC_CORE_INDEX_CLEAN"
+    
+    if [ "${#DLC_CORE_INDEX_ARR[@]}" -lt "$NUM_CELLS" ]; then
+        echo "Error: dlc_core_index array has ${#DLC_CORE_INDEX_ARR[@]} elements but NUM_CELLS is $NUM_CELLS"
+        exit 1
+    fi
+
+    # Bound checking: ensure all indices are within the available DLC tasks
+    if [ "$DLC_CORE_INDEX_USER_SPECIFIED" = true ]; then
+        for ((i=0; i<NUM_CELLS; i++)); do
+            core_idx=${DLC_CORE_INDEX_ARR[$i]}
+            if [ "$core_idx" -ge "$NUM_DLC_TASKS" ]; then
+                echo "Error: dlc_core_index[$i]=$core_idx exceeds available DLC tasks ($NUM_DLC_TASKS)"
+                echo "  Maximum valid index is $((NUM_DLC_TASKS - 1))"
+                exit 1
+            fi
+            if [ "$core_idx" -lt 0 ]; then
+                echo "Error: dlc_core_index[$i]=$core_idx is negative (must be >= 0)"
+                exit 1
+            fi
+        done
+        echo "Bound checking passed: all dlc_core_index values are within range [0, $((NUM_DLC_TASKS - 1))]"
+    fi
+    
+    # Set dlc_core_index for each cell
+    CELL_COUNT=$(yq '.cuphydriver_config.cells | length' $CUPHY_YAML)
+    for ((i=0; i<CELL_COUNT && i<NUM_CELLS; i++)); do
+        yq -i ".cuphydriver_config.cells[$i].dlc_core_index = ${DLC_CORE_INDEX_ARR[$i]}" $CUPHY_YAML
+    done
+    echo "DL C-plane core packing scheme: fixed per-cell"
+    echo "  dlc_core_index mapping: ${DLC_CORE_INDEX_ARR[*]}"
+else
+    echo "DL C-plane core packing scheme: default"
+fi
 
 #--------------------------------------------------------------
 # cuPHY controller MIMO configuration
@@ -563,21 +795,31 @@ if [[ "$MUMIMO" == "ON" ]]; then
     yq -i '.cuphydriver_config.fix_beta_dl = 0' $CUPHY_YAML
     yq -i '.cuphydriver_config.mMIMO_enable = 1' $CUPHY_YAML
     yq -i '.cuphydriver_config.enable_srs = 1' $CUPHY_YAML
-    if [ "$USE_GREEN_CONTEXT" -eq 1 ]; then
-        yq -i '.cuphydriver_config.mps_sm_srs = 48' $CUPHY_YAML
+    # Dispatch on controller mode first
+    if [[ $CONTROLLER_MODE == "F08_GL4" ]]; then
+        # GL4 mode settings
+        yq -i '.cuphydriver_config.mps_sm_ul_order = 6' $CUPHY_YAML
+        yq -i '.cuphydriver_config.mps_sm_srs = 14' $CUPHY_YAML
+        yq -i '.cuphydriver_config.max_harq_pools = 256' $CUPHY_YAML
+        yq -i '.cuphydriver_config.total_num_srs_chest_buffers = 3072' $CUPHY_YAML
+        yq -i '.cuphydriver_config.ul_input_buffer_per_cell = 5' $CUPHY_YAML
+        yq -i '.cuphydriver_config.bfw_c_plane_chaining_mode = 1' $CUPHY_YAML    
+        yq -i '.cuphydriver_config.cells[].srs_prb_stride = 273' $CUPHY_YAML
     else
-        if [[ $CONTROLLER_MODE == "F08_GL4" ]];then
-            yq -i '.cuphydriver_config.mps_sm_srs = 14' $CUPHY_YAML
-            yq -i '.cuphydriver_config.mps_sm_ul_order = 6' $CUPHY_YAML
-            yq -i '.cuphydriver_config.max_harq_pools = 256' $CUPHY_YAML
-            yq -i '.cuphydriver_config.total_num_srs_chest_buffers = 3072' $CUPHY_YAML
-            yq -i '.cuphydriver_config.ul_input_buffer_per_cell = 5' $CUPHY_YAML
-            yq -i '.cuphydriver_config.bfw_c_plane_chaining_mode = 1' $CUPHY_YAML    
-            yq -i '.cuphydriver_config.cells[].srs_prb_stride = 273' $CUPHY_YAML
+        yq -i ".cuphydriver_config.total_num_srs_chest_buffers = $((1024 * NUM_CELLS))" $CUPHY_YAML
+        # CG1 mode settings - dispatch on green context
+        yq -i '.cuphydriver_config.mps_sm_ul_order = 10' $CUPHY_YAML
+        if [ "$USE_GREEN_CONTEXT" -eq 1 ]; then
+            yq -i '.cuphydriver_config.mps_sm_srs = 48' $CUPHY_YAML
         else
             yq -i '.cuphydriver_config.mps_sm_srs = 32' $CUPHY_YAML
-            yq -i '.cuphydriver_config.mps_sm_ul_order = 10' $CUPHY_YAML
-        fi    
+        fi
+        # Adjust SM provisioning for RTX 4500-class GPUs (SM limit ~82)
+        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 2>/dev/null)
+        if echo "$GPU_NAME" | grep -qiE 'RTX[^,]*4500|RTX Pro 4500'; then
+            yq -i '.cuphydriver_config.mps_sm_pusch = 40' $CUPHY_YAML
+            yq -i '.cuphydriver_config.mps_sm_pdsch = 80' $CUPHY_YAML
+        fi
     fi
     yq -i '.cuphydriver_config.dlc_bfw_enable_divide_per_cell = 1' $CUPHY_YAML
     yq -i '.cuphydriver_config.ulc_alloc_cplane_bfw_txq = 1' $CUPHY_YAML
@@ -613,7 +855,8 @@ if [[ "$MUMIMO" == "ON" ]]; then
 #   sed -i "s/T1a_min_cp_ul_ns: [0-9]\+/T1a_min_cp_ul_ns: 285000/g" $CUPHY_YAML
 #   sed -i "s/T1a_min_cp_dl_ns: [0-9]\+/T1a_min_cp_dl_ns: 419000/g" $CUPHY_YAML
 #   sed -i "s/T1a_max_cp_dl_ns: [0-9]\+/T1a_max_cp_dl_ns: 669000/g" $CUPHY_YAML
-
+else
+    yq -i '.cuphydriver_config.bfw_c_plane_chaining_mode = 0' $CUPHY_YAML
 fi
 
 #--------------------------------------------------------------
@@ -648,6 +891,9 @@ if [[ "$MUMIMO" == "ON" ]]; then
     yq -i '.ru_emulator.enable_mmimo = 1' $RU_YAML
     yq -i '.ru_emulator.fix_beta_dl = 0' $RU_YAML
 
+    yq -i '.ru_emulator.aerial_fh_txq_size = 512' $RU_YAML
+    yq -i '.ru_emulator.aerial_fh_rxq_size = 512' $RU_YAML
+
     EAXC_IDS="[32512, 32513, 32514, 32515, 32516, 32517, 32518, 32519, 32520, 32521, 32522, 32523, 32524, 32525, 32526, 32527]"
     if [[ "$ENABLE_32DL" -eq 1 ]]; then
        EAXC_IDS_PDSCH="[32512, 32513, 32514, 32515, 32516, 32517, 32518, 32519, 32520, 32521, 32522, 32523, 32524, 32525, 32526, 32527, 32528, 32529, 32530, 32531, 32532, 32533, 32534, 32535, 32536, 32537, 32538, 32539, 32540, 32541, 32542, 32543]"
@@ -671,7 +917,14 @@ if [[ "$MUMIMO" == "ON" ]]; then
     yq -i '.ru_emulator.enable_srs_eaxcid_pacing = 1' $RU_YAML
     
     # SRS pacing parameters - pattern-specific configurations
-    if [[ "$pattern_name" == "81a" || "$pattern_name" == "81c" ]]; then
+    if [[ "$pattern_name" == "79a" || "$pattern_name" == "79b" ]]; then
+        # Pattern 79a/79b: 4 SRS symbols in slot *3, 2 in *4, 2 in *5, 16 eAxC IDs per window
+        yq -i '.ru_emulator.srs_pacing_s3_srs_symbols = 4' $RU_YAML
+        yq -i '.ru_emulator.srs_pacing_s4_srs_symbols = 2' $RU_YAML
+        yq -i '.ru_emulator.srs_pacing_s5_srs_symbols = 2' $RU_YAML
+        yq -i '.ru_emulator.srs_pacing_eaxcids_per_tx_window = 16' $RU_YAML
+        yq -i '.ru_emulator.srs_pacing_eaxcids_per_symbol = 64' $RU_YAML
+    elif [[ "$pattern_name" == "81a" || "$pattern_name" == "81c" ]]; then
         # Pattern 81a/81c: 4 SRS symbols in slot *3, 8 eAxC IDs per window
         yq -i '.ru_emulator.srs_pacing_s3_srs_symbols = 4' $RU_YAML
         yq -i '.ru_emulator.srs_pacing_s4_srs_symbols = 0' $RU_YAML
@@ -692,6 +945,10 @@ if [[ "$MUMIMO" == "ON" ]]; then
         yq -i '.ru_emulator.srs_pacing_s5_srs_symbols = 0' $RU_YAML
         yq -i '.ru_emulator.srs_pacing_eaxcids_per_tx_window = 4' $RU_YAML
         yq -i '.ru_emulator.srs_pacing_eaxcids_per_symbol = 64' $RU_YAML
+    fi
+
+    if [[ "$pattern_name" == "89" ]]; then
+        yq -i '.ru_emulator.min_ul_cores_per_cell_mmimo = 2' $RU_YAML
     fi
 fi
 
@@ -863,6 +1120,11 @@ else
     echo "Reduced logging mode enabled - skipping detailed tracing and processing time logs"
 fi
 
+# Enable CUPTI tracing if requested
+if [ "$CUPTI_TRACING" = true ]; then
+    echo "Enabling CUPTI tracing"
+    yq -i '.cuphydriver_config.cupti_enable_tracing = 1' $CUPHY_YAML
+fi
 
 #Logging/cuphy settings for latency summary
 #ToDo may be add an option to disable extended logging?
@@ -1050,6 +1312,25 @@ if [ "$USE_GREEN_CONTEXT" -eq 1 ]; then
     GC_STATUS=enabled
 else
     GC_STATUS=disabled
+fi
+
+#
+# Final GPU-based SM cap to handle RTX 4500-class GPUs (SM limit ~82)
+# This override is applied at the end to ensure it takes effect regardless of earlier branches.
+#
+if [[ "$CONTROLLER_MODE" != "F08_GL4" ]]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 2>/dev/null)
+        if echo "$GPU_NAME" | grep -qiE 'RTX[^,]*4500'; then
+            echo "Detected GPU '$GPU_NAME' → capping mps_sm_pusch and mps_sm_pdsch to 80"
+	    if [[ "$MUMIMO" == "ON" ]]; then
+                yq -i '.cuphydriver_config.mps_sm_pusch = 40' "$CUPHY_YAML"
+	    else
+                yq -i '.cuphydriver_config.mps_sm_pusch = 80' "$CUPHY_YAML"
+	    fi
+            yq -i '.cuphydriver_config.mps_sm_pdsch = 80' "$CUPHY_YAML"
+        fi
+    fi
 fi
 
 PATTERN=$pattern_name

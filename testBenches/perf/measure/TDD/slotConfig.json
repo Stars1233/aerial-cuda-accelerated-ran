@@ -1,4 +1,5 @@
 {
+    "__note__": "Default/example slot configs. For user-specific patterns, define tdd_slot_config in your measure YAML.",
     "dddsu":
     {
         "PDSCH": [1, 1, 1, 1],
@@ -8,6 +9,14 @@
         "MAC": [1, 1, 1, 1]
     },
     "dddsuudddd":
+    {
+        "PDSCH": [0, 0, 1, 1, 1, 1, 1, 1, 1, 0],
+        "PDCCH": [0, 0, 1, 1, 1, 1, 1, 1, 1, 0],
+        "CSIRS": [0, 0, 1, 1, 1, 1, 1, 1, 1, 0],
+        "PBCH": [0, 0, 0, 0, 0, 0, 1, 1, 1, 0],
+        "MAC": [1, 1, 1, 1, 1, 1, 1, 0, 1, 1]
+    },
+    "dddsuudddd_8slot":
     {
         "PDSCH": [1, 1, 1, 1, 1, 1, 1, 1],
         "PDCCH": [1, 1, 1, 1, 1, 1, 1, 1],

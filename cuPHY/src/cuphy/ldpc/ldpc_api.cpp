@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,7 +58,7 @@ void LDPC_decode_desc::add_tensor_as_tb(const tensor_desc& llrTensorDesc,
                                         const tensor_desc& decodeTensorDesc,
                                         void*              decodeAddr)
 {
-    if(num_tbs >= CUPHY_LDPC_DECODE_DESC_MAX_TB)
+    if(num_tbs >= max_tbs_per_desc)
     {
         throw std::runtime_error("Max number of TBS in LDPC descriptor exceeded");
     }
@@ -83,7 +83,7 @@ void LDPC_decode_desc::add_tensor_as_tb(const tensor_desc& llrTensorDesc,
                                         const tensor_desc& softOutputsTensorDesc,
                                         void*              softOutputsAddr)
 {
-    if(num_tbs >= CUPHY_LDPC_DECODE_DESC_MAX_TB)
+    if(num_tbs >= max_tbs_per_desc)
     {
         throw std::runtime_error("Max number of TBS in LDPC descriptor exceeded");
     }
@@ -103,11 +103,11 @@ void LDPC_decode_desc::add_tensor_as_tb(const tensor_desc& llrTensorDesc,
     ++num_tbs;
 }
 
-LDPC_decode_desc& LDPC_decode_desc_set::find(int16_t BG, int Z, int num_parity)
+LDPC_decode_desc& LDPC_decode_desc_set::find(int16_t BG, int Z, int num_parity, cuphyLdpcMaxItrAlgoType_t ldpcMaxNumItrAlgo, uint8_t ldpcMaxNumItrPerUe)
 {
     for(unsigned int i = 0; i < count_; ++i)
     {
-        if(descs_[i].has_config(BG, Z, num_parity) && !descs_[i].is_full())
+        if(descs_[i].has_config(BG, Z, num_parity, ldpcMaxNumItrAlgo, ldpcMaxNumItrPerUe) && !descs_[i].is_full())
         {
             return descs_[i];
         }
@@ -118,6 +118,10 @@ LDPC_decode_desc& LDPC_decode_desc_set::find(int16_t BG, int Z, int num_parity)
         d.config.BG               = BG;
         d.config.Z                = Z;
         d.config.num_parity_nodes = num_parity;
+        if(ldpcMaxNumItrAlgo == LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE)
+        {
+            d.config.max_iterations   = ldpcMaxNumItrPerUe;
+        }
         d.num_tbs                 = 0;
         return d;
     }

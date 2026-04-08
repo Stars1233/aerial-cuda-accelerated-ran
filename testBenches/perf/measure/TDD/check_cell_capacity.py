@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import numpy as np 
+import numpy as np
+import yaml
 
 def calc_ontime_percentage(array, threshold):
     if len(array) == 0:
@@ -35,70 +36,124 @@ def parse_and_compare(s1, s2): # compare cell counts, sort by peak cell first
         return s1
     else:
         return s2
-         
+
+
+def _load_latency_budget_overrides(sweeps):
+    test_config = sweeps.get("testConfig", {})
+    yaml_path = test_config.get("yaml")
+    if not yaml_path:
+        return {}
+
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as ifile:
+            ycfg = yaml.safe_load(ifile) or {}
+    except (OSError, UnicodeDecodeError):
+        return {}
+    except yaml.YAMLError:
+        return {}
+
+    if not isinstance(ycfg, dict):
+        return {}
+
+    latency_budget = None
+    if isinstance(ycfg.get("latency_budget"), dict):
+        latency_budget = ycfg["latency_budget"]
+    elif isinstance(ycfg.get("config"), dict) and isinstance(
+        ycfg["config"].get("latency_budget"), dict
+    ):
+        latency_budget = ycfg["config"]["latency_budget"]
+
+    if not isinstance(latency_budget, dict):
+        return {}
+
+    alias_map = {
+        "PDSCH_DLBFW": "PDSCH+DLBFW",
+        "PDCCH_CSIRS": "PDCCH+CSI-RS",
+        "CSIRS": "CSI-RS",
+    }
+
+    overrides = {}
+    for key, value in latency_budget.items():
+        if not isinstance(value, (int, float)):
+            continue
+        norm_key = alias_map.get(key, key)
+        overrides[norm_key] = value
+
+    return overrides
+
+
 def check_cell_capacity(sweeps):
 
     usecase = sweeps['testConfig']['config'][-8:-5]
     mMIMO_pattern = (sweeps['testConfig']['pattern'] == "dddsuudddd_mMIMO")
+    supported_patterns = {"dddsuudddd", "dddsuudddd_8slot", "dddsuudddd_mMIMO"}
+    latency_budget_overrides = _load_latency_budget_overrides(sweeps)
+    has_custom_latency_budget = len(latency_budget_overrides) > 0
     ontimePercent = {}
     cellCapacity  = "00+00"
     maxCellTested = "00+00"   
     successRunInd = False # whether a success run has been performed
-    if sweeps['testConfig']['pattern'] != "dddsuudddd" and sweeps['testConfig']['pattern'] != "dddsuudddd_mMIMO":
-        print(f"Auto check cell capacity only supports TDD long pattern dddsuudddd. The test is using {sweeps['testConfig']['pattern']}")
-    elif usecase not in ["F08", "F09", "F14"]:
+    if sweeps['testConfig']['pattern'] not in supported_patterns:
+        supported = ", ".join(sorted(supported_patterns))
+        print(
+            f"Auto check cell capacity only supports TDD long patterns: {supported}. "
+            f"The test is using {sweeps['testConfig']['pattern']}"
+        )
+    elif usecase not in ["F08", "F09", "F14"] and not has_custom_latency_budget:
         print(f"Auto check cell capacity only supports F08, F09, F14. The test is using {usecase}")
-    else:    
+    else:
         # (i) gather latency constraints (ii) check on time percentage per channel (iii) obtain cell capacity
-        
+        def budget(name, default):
+            return latency_budget_overrides.get(name, default)
+
         # set latency budget, according to compare.py (used for drawing CDF)
         constraints = {}
 
         # hard coded latency constraints
-        constraints['ULBFW1'] = 615
-        constraints['ULBFW2'] = 615
-        constraints['PUSCH1_SUBSLOT_PROC'] = 755
-        constraints['PUSCH1'] = 2000 if mMIMO_pattern else 1500
-        constraints['PUCCH1'] = 2000 if mMIMO_pattern else 1500
-        constraints['PUSCH2_SUBSLOT_PROC'] = 755  
-        constraints['PUSCH2'] = 1855 if mMIMO_pattern else 1500  
-        constraints['PUCCH2'] = 3000 if mMIMO_pattern else 1500
-        constraints['SRS1'] = 2500 if mMIMO_pattern else 500
-        constraints['SRS2'] = 2500 if mMIMO_pattern else 500
-        constraints['SSB'] = 200 if mMIMO_pattern else 375
-        constraints['MAC'] = 500
-        constraints['MAC2'] = 500
+        constraints['ULBFW1'] = budget("ULBFW1", 615)
+        constraints['ULBFW2'] = budget("ULBFW2", 615)
+        constraints['PUSCH1_SUBSLOT_PROC'] = budget("PUSCH1_SUBSLOT_PROC", 755)
+        constraints['PUSCH1'] = budget("PUSCH1", 2000 if mMIMO_pattern else 1500)
+        constraints['PUCCH1'] = budget("PUCCH1", 2000 if mMIMO_pattern else 1500)
+        constraints['PUSCH2_SUBSLOT_PROC'] = budget("PUSCH2_SUBSLOT_PROC", 755)
+        constraints['PUSCH2'] = budget("PUSCH2", 1855 if mMIMO_pattern else 1500)
+        constraints['PUCCH2'] = budget("PUCCH2", 3000 if mMIMO_pattern else 1500)
+        constraints['SRS1'] = budget("SRS1", 2500 if mMIMO_pattern else 500)
+        constraints['SRS2'] = budget("SRS2", 2500 if mMIMO_pattern else 500)
+        constraints['SSB'] = budget("SSB", 200 if mMIMO_pattern else 375)
+        constraints['MAC'] = budget("MAC", 500)
+        constraints['MAC2'] = budget("MAC2", 500)
                 
         for key in sweeps.keys():
             if '+' in key:
                 
                 if mMIMO_pattern: # mMIMO new pattern
                     
-                    constraints['PRACH'] = 3000
-                    constraints['DLBFW'] = 250
-                    constraints['PDSCH'] = 300
-                    constraints['PDCCH'] = 300
-                    constraints['CSI-RS'] = 300
+                    constraints['PRACH'] = budget("PRACH", 3000)
+                    constraints['DLBFW'] = budget("DLBFW", 250)
+                    constraints['PDSCH'] = budget("PDSCH", 300)
+                    constraints['PDCCH'] = budget("PDCCH", 300)
+                    constraints['CSI-RS'] = budget("CSI-RS", 300)
                 
                 else:
 
                     # latency constraints based on test configs
                     if sweeps[key].get("DLBFW", None) is not None:
-                        constraints['PDSCH+DLBFW'] = 500
+                        constraints['PDSCH+DLBFW'] = budget("PDSCH+DLBFW", 500)
                     else:
-                        constraints['PDSCH'] = 375
+                        constraints['PDSCH'] = budget("PDSCH", 375)
                     
                     if sweeps[key].get("CSI-RS", None) is not None:
-                        constraints['PDCCH+CSI-RS'] = 375
+                        constraints['PDCCH+CSI-RS'] = budget("PDCCH+CSI-RS", 375)
                     else:
-                        constraints['PDCCH'] = 375
+                        constraints['PDCCH'] = budget("PDCCH", 375)
 
                     if sweeps[key]['Mode'] == "Sequential":
-                        constraints['PRACH'] = 1500
+                        constraints['PRACH'] = budget("PRACH", 1500)
                     elif sweeps[key]['Mode'] == "Parallel":
-                        constraints['PRACH'] = 1250
+                        constraints['PRACH'] = budget("PRACH", 1250)
                     else:
-                        constraints['PRACH'] = 2000
+                        constraints['PRACH'] = budget("PRACH", 2000)
             
                 # extact latency from tested results and compare
                 ontimePercent[key] = {}

@@ -1,5 +1,6 @@
 #!/bin/bash -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +29,8 @@ CONFIG_DIR=$cuBB_SDK
 
 NSYS_ENABLED=false
 MEMTRACE_ENABLED=false
+CUDA_TRACER_ENABLED=false
+CUDA_TRACER_OUTPUT="/tmp/cuda_api_tracer.log"
 BUILD_DIR=build.$(uname -m)
 ADDITIONAL_OPTIONS=""
 
@@ -47,6 +50,7 @@ show_usage() {
   echo "  --nsys_trace <nsys -t options>   Specify Nsight Systems' -t options, e.g., cuda,osrt."
   echo "  --gdb_script <script>            Specify the gdb script to use."
   echo "  --timeout <seconds>              Kill cuphy after seconds"
+  echo "  --cuda_tracer [output_path]      Enable CUDA API call counting (LD_PRELOAD). Optional path for log (default: /tmp/cuda_api_tracer.log)."
   echo "  -h, --help                       Show this help message."
   echo
   echo "Examples:"
@@ -145,6 +149,20 @@ while [[ $# -gt 0 ]]; do
           TIMEOUT="$2"
           shift 2
           ;;
+        --cuda_tracer)
+          CUDA_TRACER_ENABLED=true
+          if [[ -n "$2" && "$2" != -* ]]; then
+            CUDA_TRACER_OUTPUT="$2"
+            shift 2
+          else
+            shift
+          fi
+          ;;
+        --cuda_tracer=*)
+          CUDA_TRACER_ENABLED=true
+          CUDA_TRACER_OUTPUT="${1#*=}"
+          shift
+          ;;
         -h|--help)
             show_usage
             exit 0
@@ -214,8 +232,8 @@ fi
 #----------------------------------------------------------------------------------
 stop_mps() {
     # Stop existing MPS
-    export CUDA_MPS_PIPE_DIRECTORY=/var
-    export CUDA_MPS_LOG_DIRECTORY=/var
+    export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+    export CUDA_MPS_LOG_DIRECTORY=/var/log/nvidia-mps
     sudo -E echo quit | sudo -E nvidia-cuda-mps-control || true
 }
 
@@ -224,8 +242,8 @@ restart_mps() {
     stop_mps
 
     # Start MPS
-    export CUDA_MPS_PIPE_DIRECTORY=/var
-    export CUDA_MPS_LOG_DIRECTORY=/var
+    export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+    export CUDA_MPS_LOG_DIRECTORY=/var/log/nvidia-mps
     sudo -E nvidia-cuda-mps-control -d
     sudo -E echo start_server -uid 0 | sudo -E nvidia-cuda-mps-control
 }
@@ -245,20 +263,49 @@ else
     WITH_TIMEOUT=""
 fi
 
+# CUDA API tracer: use env to pass LD_PRELOAD (sudo often strips it even with -E)
+if [ "$CUDA_TRACER_ENABLED" = true ]; then
+    # Unset inherited tracer env so nvidia-smi, nvcc, etc. do not load the tracer and create stray log files
+    unset LD_PRELOAD CUDA_API_TRACER_OUTPUT 2>/dev/null || true
+    CUDA_TRACER_SO="${cuBB_SDK}/testBenches/phase4_test_scripts/syscall_tracer/libcuda_api_tracer.so"
+    if [[ ! -f "$CUDA_TRACER_SO" ]]; then
+        echo "Error: CUDA tracer library not found at $CUDA_TRACER_SO. Run ./build_cuda_api_tracer.sh first."
+        exit 1
+    fi
+    CUDA_TRACER_PREFIX=(env "LD_PRELOAD=$CUDA_TRACER_SO" "CUDA_API_TRACER_OUTPUT=$CUDA_TRACER_OUTPUT")
+    echo "CUDA API tracer enabled: LD_PRELOAD=$CUDA_TRACER_SO, output=$CUDA_TRACER_OUTPUT"
+else
+    CUDA_TRACER_PREFIX=()
+fi
+
+if [ "$NSYS_ENABLED" = true ] && [ "$CUDA_TRACER_ENABLED" = true ]; then
+    echo "Warning: CUDA API tracer is ignored when nsys profiling is enabled (LD_PRELOAD would apply to nsys, not the target)."
+    CUDA_TRACER_PREFIX=()
+fi
+
+# Log some system information, such as nvidia-smi output.
+echo "nvidia-smi | grep \"Driver Version\""
+nvidia-smi | grep "Driver Version" || echo "Warning: Could not retrieve driver version from nvidia-smi"
+echo "cat /proc/driver/nvidia/version"
+cat /proc/driver/nvidia/version || echo "Warning: Could not read /proc/driver/nvidia/version"
+echo "nvcc --version"
+nvcc --version || echo "Warning: Could not retrieve nvcc version"
+
+
 if [ "$NSYS_ENABLED" = true ]; then
-    echo "$NSYS_EXEC profile -t $NSYS_TRACE_TYPE -s none --cpuctxsw=none" "${ADDITIONAL_OPTIONS[@]}" "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller_scf $CONTROLLER_MODE"
-    sudo -E $NSYS_EXEC profile -t $NSYS_TRACE_TYPE -s none --cpuctxsw=none "${ADDITIONAL_OPTIONS[@]}" "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf" $CONTROLLER_MODE
+    echo "${CUDA_TRACER_PREFIX[@]}" LD_BIND_NOW=1 $NSYS_EXEC profile -t $NSYS_TRACE_TYPE -s none --cpuctxsw=none --run-as=root "${ADDITIONAL_OPTIONS[@]}" "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf" $CONTROLLER_MODE
+    sudo -E "${CUDA_TRACER_PREFIX[@]}" LD_BIND_NOW=1 $NSYS_EXEC profile -t $NSYS_TRACE_TYPE -s none --cpuctxsw=none --run-as=root "${ADDITIONAL_OPTIONS[@]}" "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf" $CONTROLLER_MODE
     RET=$?
     # If you want to collect osrt events, you may want to increase he osrt threshold to 10us (e.g., via --osrt-threshold 10000)
 
 else
     if [ "$MEMTRACE_ENABLED" = false ]; then
-        echo "$WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf $CONTROLLER_MODE"
-        sudo -E $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf" $CONTROLLER_MODE
+        echo "${CUDA_TRACER_PREFIX[@]}" LD_BIND_NOW=1 $WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf $CONTROLLER_MODE
+        sudo -E "${CUDA_TRACER_PREFIX[@]}" LD_BIND_NOW=1 $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf" $CONTROLLER_MODE
         RET=$?
     else
-        echo "AERIAL_MEMTRACE=1 $WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf $CONTROLLER_MODE"
-        sudo -E AERIAL_MEMTRACE=1 $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf" $CONTROLLER_MODE
+        echo "${CUDA_TRACER_PREFIX[@]}" LD_BIND_NOW=1 AERIAL_MEMTRACE=1 $WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf $CONTROLLER_MODE
+        sudo -E "${CUDA_TRACER_PREFIX[@]}" LD_BIND_NOW=1 AERIAL_MEMTRACE=1 $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/cuphycontroller/examples/cuphycontroller_scf" $CONTROLLER_MODE
         RET=$?
     fi
 fi

@@ -31,6 +31,7 @@ The recommended way to run tests is using the test configuration parser, which a
 |-----------|---------|-------------|
 | DU1* | `$cuBB_SDK/testBenches/phase4_test_scripts/copy_test_files.sh $COPY_TEST_FILES_PARAMS` | Copy test vectors |
 | DU1 | `$cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh $BUILD_AERIAL_PARAMS` | Build Aerial SDK |
+| RU  | `$cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh $BUILD_AERIAL_PARAMS` | Build Aerial SDK (if different arch than DU) |
 | DU1 | `$cuBB_SDK/testBenches/phase4_test_scripts/setup1_DU.sh $SETUP1_DU_PARAMS` | Configure DU setup |
 | RU | `$cuBB_SDK/testBenches/phase4_test_scripts/setup2_RU.sh $SETUP2_RU_PARAMS` | Configure RU setup |
 | DU1 | `$cuBB_SDK/testBenches/phase4_test_scripts/test_config.sh $TEST_CONFIG_PARAMS` | Configure test parameters |
@@ -51,7 +52,7 @@ Format: `F08_<cells>C_<pattern>_<modifiers>`
 
 - `F08` - Required prefix for performance test cases
 - `<cells>C` - Number of cells (e.g., `6C`, `20C`)
-- `<pattern>` - Pattern number (e.g., `79`, `59c`)
+- `<pattern>` - Pattern number (e.g., `69`, `59c`)
 - `<modifiers>` - Optional modifiers in any order:
   - `BFP9` or `BFP14` - BFP compression with specified bits
   - `STT<value>` - Schedule total time (e.g., `STT480000`)
@@ -104,6 +105,7 @@ $cuBB_SDK/testBenches/phase4_test_scripts/parse_test_config_params.sh "F08_6C_79
 
 ## Environment Variables Set by Parser
 
+### Test Execution Variables
 - `COPY_TEST_FILES_PARAMS` - Parameters for copy_test_files.sh
 - `BUILD_AERIAL_PARAMS` - Parameters for build_aerial_sdk.sh
 - `SETUP1_DU_PARAMS` - Parameters for setup1_DU.sh
@@ -113,18 +115,20 @@ $cuBB_SDK/testBenches/phase4_test_scripts/parse_test_config_params.sh "F08_6C_79
 - `RUN2_CUPHYCONTROLLER_PARAMS` - Parameters for run2_cuPHYcontroller.sh
 - `RUN3_TESTMAC_PARAMS` - Parameters for run3_testMAC.sh
 
-## Antenna Configuration Patterns
+### Post-Processing Variables
+- `POST_PROCESSING_CICD_PARAMS` - All flags for post_processing_cicd.sh (exact flags used for CICD)
+- `PARSE_LOGS_PARAMS` - Parameters for post_processing_parse.sh
+- `POST_PROCESSING_PERF_PARAMS` - Parameters for post_processing_analyze.sh --perf-metrics
+- `POST_PROCESSING_COMPARE_PARAMS` - Parameters for post_processing_analyze.sh --compare-logs
+- `POST_PROCESSING_GATING_PARAMS` - Parameters for post_processing_analyze.sh --gating-threshold
+- `POST_PROCESSING_WARNING_PARAMS` - Parameters for post_processing_analyze.sh --warning-threshold
+- `POST_PROCESSING_ABSOLUTE_PARAMS` - Parameters for post_processing_analyze.sh --absolute-threshold
+- `POST_PROCESSING_LATENCY_PARAMS` - Parameters for post_processing_analyze.sh --latency-summary (NICD only)
 
-Test patterns are designed for different antenna configurations:
+## MUMIMO Patterns
 
-- **4T4R (4 Transmit / 4 Receive):**
-  - Pattern `59c` - Peak traffic load
-  - Pattern `60c` - Average traffic load
-
-- **64T64R (64 Transmit / 64 Receive):**
-  - Pattern `79` - Requires MUMIMO configuration
-
-MUMIMO configuration should be used when running 64T64R patterns. All MUMIMO patterns are defined in the `mimo_patterns` variable in `valid_perf_patterns.sh`.
+MUMIMO configuration is selected based on a fixed pattern list.  As of 9/17/2025 the following are MUMIMO patterns:
+66a, 66b, 66c, 66d, 67a, 67b, 67c, 67d, 69, 69a, 69b, 69c, 71, 73, 79
 
 ## Manual Script Usage
 
@@ -132,10 +136,10 @@ All scripts support `-h` or `--help` options for detailed usage information. You
 
 ```bash
 # Example manual usage
-$cuBB_SDK/testBenches/phase4_test_scripts/copy_test_files.sh 79 --max_cells 6
+$cuBB_SDK/testBenches/phase4_test_scripts/copy_test_files.sh 69 --max_cells 6
 $cuBB_SDK/testBenches/phase4_test_scripts/setup1_DU.sh --mumimo 1
 $cuBB_SDK/testBenches/phase4_test_scripts/setup2_RU.sh
-$cuBB_SDK/testBenches/phase4_test_scripts/test_config.sh 79 --compression=4 --num-cells=6 --num-slots=600000
+$cuBB_SDK/testBenches/phase4_test_scripts/test_config.sh 69 --compression=4 --num-cells=6 --num-slots=600000
 $cuBB_SDK/testBenches/phase4_test_scripts/run1_RU.sh
 $cuBB_SDK/testBenches/phase4_test_scripts/run2_cuPHYcontroller.sh
 $cuBB_SDK/testBenches/phase4_test_scripts/run3_testMAC.sh
@@ -212,6 +216,125 @@ The --ml2 0/1 is translated to below arguments for test_mac:
 # Second instance: enable cell 4~7 by cell_mask=0xF0, explicitly select config file test_mac_config_1.yaml
 --ml2 1  =>  --cells 0xF0 --config test_mac_config_1.yaml
 ```
+
+## Post-Processing Scripts
+
+### Prerequisites: Virtual Environment Setup
+
+The post-processing scripts require a Python virtual environment with the `aerial_postproc` package installed. Before running any post-processing scripts, create the virtual environment:
+
+```bash
+# Create the virtual environment (one-time setup)
+$cuBB_SDK/testBenches/phase4_test_scripts/aerial_postproc/venv_create.sh
+```
+
+By default, the virtual environment is created at `$HOME/.aerial_postproc_venv`. To use a custom location, set the `AERIAL_POSTPROC_VENV` environment variable before creating and using the venv:
+
+```bash
+# Create venv at custom location
+export AERIAL_POSTPROC_VENV=/path/to/custom/venv
+$cuBB_SDK/testBenches/phase4_test_scripts/aerial_postproc/venv_create.sh
+
+# The post-processing scripts will automatically use this location
+./post_processing_cicd.sh ...
+```
+
+Note: In CICD environments, the venv is typically pre-installed at `/opt/aerial_postproc_venv`.
+
+### Script Overview
+
+Three scripts are provided for post-processing test results:
+
+- **post_processing_parse.sh** - Runs the expensive parsing step to generate binary output folders
+- **post_processing_analyze.sh** - Runs downstream processing on already-parsed binary data
+- **post_processing_cicd.sh** - CICD wrapper that runs the full sequence with proper return codes
+
+### Using Post-Processing with Generated Parameters
+
+**CICD Workflow (Simple - Recommended):**
+```bash
+source test_params.sh
+./post_processing_cicd.sh phy.log testmac.log ru.log ./output $POST_PROCESSING_CICD_PARAMS
+exit $?
+```
+
+**Developer Workflow (Granular):**
+```bash
+source test_params.sh
+
+# Step 1: Parse logs (expensive, do once)
+./post_processing_parse.sh phy.log testmac.log ru.log ./output $PARSE_LOGS_PARAMS
+
+# Step 2: Run individual post-processing as needed
+./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_PERF_PARAMS
+./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_COMPARE_PARAMS
+./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_GATING_PARAMS
+./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_WARNING_PARAMS
+./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_ABSOLUTE_PARAMS
+
+# NICD only (if POST_PROCESSING_LATENCY_PARAMS is set)
+if [[ -n "$POST_PROCESSING_LATENCY_PARAMS" ]]; then
+    ./post_processing_analyze.sh ./output/binary_ls ./output $POST_PROCESSING_LATENCY_PARAMS
+fi
+```
+
+### Manual Script Usage
+
+The following sections document the individual scripts and their options for manual invocation.
+
+#### post_processing_parse.sh
+Runs the expensive cicd_parse.py step to generate binary output folders.
+
+```bash
+# Parse for performance metrics only
+./post_processing_parse.sh phy.log testmac.log ru.log ./output --perf-metrics --mmimo
+
+# Parse for latency summary only (NICD)
+./post_processing_parse.sh phy.log testmac.log ru.log ./output --latency-summary --mmimo
+
+# Parse for both formats
+./post_processing_parse.sh phy.log testmac.log ru.log ./output --perf-metrics --latency-summary --mmimo
+```
+
+#### post_processing_analyze.sh
+Runs downstream processing on already-parsed binary data.
+
+```bash
+# Performance metrics extraction (creates perf.csv)
+./post_processing_analyze.sh ./output/binary ./output --perf-metrics --mmimo
+
+# Compare logs visualization
+./post_processing_analyze.sh ./output/binary ./output --compare-logs --label "my_test" --mmimo
+
+# Gating threshold check
+./post_processing_analyze.sh ./output/binary ./output --gating-threshold /path/to/gating_perf_requirements.csv
+
+# Warning threshold check
+./post_processing_analyze.sh ./output/binary ./output --warning-threshold /path/to/warning_perf_requirements.csv
+
+# Absolute threshold check
+./post_processing_analyze.sh ./output/binary ./output --absolute-threshold /path/to/perf_requirements.csv
+
+# Latency summary visualization (NICD)
+./post_processing_analyze.sh ./output/binary_ls ./output --latency-summary --mmimo
+```
+
+#### post_processing_cicd.sh
+CICD wrapper that runs the full post-processing sequence with proper return codes.
+
+```bash
+# Full CICD workflow (recommended)
+./post_processing_cicd.sh phy.log testmac.log ru.log ./output \
+    --gating-threshold /path/to/gating_perf_requirements.csv \
+    --warning-threshold /path/to/warning_perf_requirements.csv \
+    --absolute-threshold /path/to/perf_requirements.csv \
+    --mmimo --label my_test
+```
+
+Return codes:
+- 0 = All gating/absolute thresholds passed
+- 1 = Gating threshold failed OR absolute threshold failed OR processing error
+- Warning threshold failure does NOT cause return 1 (prints warning instead)
 
 ## Additional Notes
 

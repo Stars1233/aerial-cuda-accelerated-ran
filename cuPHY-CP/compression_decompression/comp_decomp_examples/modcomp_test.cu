@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,11 +28,11 @@
 // TODO  - include from slot_command.hpp
 #include "oran.hpp"
 typedef struct {
-    Bitfield<uint32_t, 0, 1> ef;
-    Bitfield<uint32_t, 1, 7> extType;
-    Bitfield<uint32_t, 8, 8> udIqWidth;
-    Bitfield<uint32_t, 16, 1> csf;
-    Bitfield<uint32_t, 17, 15> modCompScaler;
+    uint16_t   modCompScaler; 
+    uint8_t    ef;
+    uint8_t    extType;
+    uint8_t    udIqWidth;
+    uint8_t     csf;
 } mod_comp_info_t;
 
 class ModCompHdr{

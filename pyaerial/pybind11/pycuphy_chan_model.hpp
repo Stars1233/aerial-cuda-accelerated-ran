@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,11 +26,11 @@
 #include <complex>
 #include <cuda_runtime.h>
 #include "fading_chan.cuh"  // include the fading channel header
+#include "cuda_array_interface.hpp"  // for cuda_array_t
 
 // Add channel models includes
 #include "chanModelsApi.hpp"
 #include "chanModelsDataset.hpp"
-#include "cuda_array_interface.hpp"  // for cuda_array_t
 
 namespace py = pybind11;
 
@@ -70,7 +70,7 @@ public:
 
     void run(py::array_t<std::complex<Tscalar>> freqDataOutCpu = py::none(), uint8_t enableSwapTxRx = 0); // run function to enable changing out numpy array in run, if not provided, use the memory address in initialization
     void printFreqSample(int printLen = 10){ m_ofdmDeModulateHandle -> printFreqSample(printLen); }
-    uintptr_t getFreqDataOut(){return reinterpret_cast<uintptr_t>(m_ofdmDeModulateHandle -> getFreqDataOut()); } 
+    uintptr_t getFreqDataOut(){return reinterpret_cast<uintptr_t>(m_ofdmDeModulateHandle -> getFreqDataOut()); }
 
 private:
     ofdm_demodulate::ofdmDeModulate<Tscalar, Tcomplex> * m_ofdmDeModulateHandle;
@@ -88,14 +88,12 @@ template class OfdmDeModulateWrapper<float, cuComplex>;
 template <typename Tscalar, typename Tcomplex>
 class TdlChanWrapper{
 public:
-    TdlChanWrapper(tdlConfig_t* tdlCfg, py::array_t<std::complex<Tscalar>> txSigInCpu, uint16_t randSeed, uintptr_t streamHandle); // constructor using Python array on CPU
-    TdlChanWrapper(tdlConfig_t* tdlCfg, uintptr_t txSigInGpu, uint16_t randSeed, uintptr_t streamHandle); // constructor using GPU memory pointer
+    TdlChanWrapper(tdlConfig_t* tdlCfg, uint16_t randSeed, uintptr_t streamHandle);
     ~TdlChanWrapper();
 
-    // note: convert the channel pointer to uintptr_t for easy handling in Python
     void reset(){ m_tdlChanHandle -> reset(); }
-    void run(float refTime0 = 0.0f, uint8_t enableSwapTxRx = 0, uint8_t txColumnMajorInd = 0);  // GPU memory for tx and rx samples
-    void run(py::array_t<std::complex<Tscalar>> txFreqSigInCpu, py::array_t<std::complex<Tscalar>> rxFreqSigOutCpu, float refTime0 = 0.0f, uint8_t enableSwapTxRx = 0, uint8_t txColumnMajorInd = 0);  // numpy for tx and rx samples
+    void run(const cuda_array_t<std::complex<Tscalar>>& txSigIn, float refTime0 = 0.0f, uint8_t enableSwapTxRx = 0, uint8_t txColumnMajorInd = 0);
+    cuda_array_t<std::complex<Tscalar>> getRxSignalOutArray(uint8_t enableSwapTxRx);
     uintptr_t getTimeChan(){ return reinterpret_cast<uintptr_t>(m_tdlChanHandle -> getTimeChan()); }
     uintptr_t getFreqChanSc(){ return reinterpret_cast<uintptr_t>(m_tdlChanHandle -> getFreqChanSc()); }
     uintptr_t getFreqChanPrbg(){ return reinterpret_cast<uintptr_t>(m_tdlChanHandle -> getFreqChanPrbg()); }
@@ -116,7 +114,7 @@ public:
 
     /**
     * @brief This function saves the tdl data into h5 file, for verification in matlab using verify_tdl.m
-    * 
+    *
     * @param padFileNameEnding optional ending of h5 file, e.g., tdlChan_1cell1Ue_4x4_A30_dopp10_cfo200_runMode0_FP32_swap0<padFileNameEnding>.h5
     */
     void saveTdlChanToH5File(std::string & padFileNameEnding = nullptr) {m_tdlChanHandle -> saveTdlChanToH5File(padFileNameEnding); };
@@ -124,14 +122,9 @@ public:
 private:
     tdlChan<Tscalar, Tcomplex> * m_tdlChanHandle;
     cudaStream_t m_cuStrm;
-    size_t m_txSigSizeDl, m_txSigSizeUl;
-    size_t m_rxSigSizeDl, m_rxSigSizeUl;
-    Tcomplex* m_txSigInCpu;
-    Tcomplex* m_txSigInGpu;
     uint16_t m_nLink;
     uint8_t m_runMode;
     tdlConfig_t* m_tdlCfg;
-    uint8_t m_externGpuAlloc; // indicator for txSigIn storage type: 0 - internal GPU memory allocation; 1 - external GPU memory allocation
 };
 // explicit instantiation
 template class TdlChanWrapper<float, cuComplex>;
@@ -140,14 +133,12 @@ template class TdlChanWrapper<float, cuComplex>;
 template <typename Tscalar, typename Tcomplex>
 class CdlChanWrapper{
 public:
-    CdlChanWrapper(cdlConfig_t* cdlCfg, py::array_t<std::complex<Tscalar>> txSigInCpu, uint16_t randSeed, uintptr_t streamHandle); // constructor using Python array on CPU
-    CdlChanWrapper(cdlConfig_t* cdlCfg, uintptr_t txSigInGpu, uint16_t randSeed, uintptr_t streamHandle); // constructor using GPU memory pointer
+    CdlChanWrapper(cdlConfig_t* cdlCfg, uint16_t randSeed, uintptr_t streamHandle);
     ~CdlChanWrapper();
 
-    // note: convert the channel pointer to uintptr_t for easy handling in Python
     void reset(){ m_cdlChanHandle -> reset(); }
-    void run(float refTime0 = 0.0f, uint8_t enableSwapTxRx = 0, uint8_t txColumnMajorInd = 0);  // GPU memory for tx and rx samples
-    void run(py::array_t<std::complex<Tscalar>> txFreqSigInCpu, py::array_t<std::complex<Tscalar>> rxFreqSigOutCpu, float refTime0 = 0.0f, uint8_t enableSwapTxRx = 0, uint8_t txColumnMajorInd = 0);  // numpy for tx and rx samples
+    void run(const cuda_array_t<std::complex<Tscalar>>& txSigIn, float refTime0 = 0.0f, uint8_t enableSwapTxRx = 0, uint8_t txColumnMajorInd = 0);
+    cuda_array_t<std::complex<Tscalar>> getRxSignalOutArray(uint8_t enableSwapTxRx);
     uintptr_t getTimeChan(){ return reinterpret_cast<uintptr_t>(m_cdlChanHandle -> getTimeChan()); }
     uintptr_t getFreqChanSc(){ return reinterpret_cast<uintptr_t>(m_cdlChanHandle -> getFreqChanSc()); }
     uintptr_t getFreqChanPrbg(){ return reinterpret_cast<uintptr_t>(m_cdlChanHandle -> getFreqChanPrbg()); }
@@ -168,7 +159,7 @@ public:
 
     /**
     * @brief This function saves the cdl data into h5 file, for verification in matlab using verify_cdl.m
-    * 
+    *
     * @param padFileNameEnding optional ending of h5 file, e.g., cdlChan_1cell1Ue_4x4_A30_dopp10_cfo200_runMode0_FP32_swap0<padFileNameEnding>.h5
     */
     void saveCdlChanToH5File(std::string & padFileNameEnding = nullptr) {m_cdlChanHandle -> saveCdlChanToH5File(padFileNameEnding); };
@@ -176,15 +167,10 @@ public:
 private:
     cdlChan<Tscalar, Tcomplex> * m_cdlChanHandle;
     cudaStream_t m_cuStrm;
-    size_t m_txSigSizeDl, m_txSigSizeUl;
-    size_t m_rxSigSizeDl, m_rxSigSizeUl;
-    Tcomplex* m_txSigInCpu;
-    Tcomplex* m_txSigInGpu;
     uint16_t m_nLink;
     uint16_t m_nBsAnt, m_nUeAnt;
     uint8_t m_runMode;
     cdlConfig_t* m_cdlCfg;
-    uint8_t m_externGpuAlloc; // indicator for txSigIn storage type: 0 - internal GPU memory allocation; 1 - external GPU memory allocation
 };
 // explicit instantiation
 template class CdlChanWrapper<float, cuComplex>;
@@ -193,8 +179,8 @@ template class CdlChanWrapper<float, cuComplex>;
 template <typename Tscalar, typename Tcomplex>
 class GauNoiseAdderWrapper{
 public:
-    GauNoiseAdderWrapper(uint32_t nThreads, int seed, uintptr_t streamHandle); // constructor using Python array on CPU
-    void addNoise(py::array_t<std::complex<Tscalar>> noisySignal, uintptr_t d_signal, uint32_t signalSize, float snr_db); // noise free signal on GPU, will copy back noisySignal to numpy array
+    GauNoiseAdderWrapper(uint32_t nThreads, int seed, uintptr_t streamHandle);
+    void addNoise(uintptr_t d_signal, uint32_t signalSize, float snr_db);
     ~GauNoiseAdderWrapper();
 
 private:
@@ -214,25 +200,25 @@ public:
                       const ExternalConfig& external_config,
                       uint32_t randSeed = 0,
                       uintptr_t streamHandle = 0);
-    
+
     // Constructor with just sim_config and system_level_config
     StatisChanModelWrapper(const SimConfig& sim_config,
                       const SystemLevelConfig& system_level_config,
                       uint32_t randSeed = 0,
                       uintptr_t streamHandle = 0);
-    
+
     // Delete copy constructor and assignment operator
     StatisChanModelWrapper(const StatisChanModelWrapper&) = delete;
     StatisChanModelWrapper& operator=(const StatisChanModelWrapper&) = delete;
-    
+
     // Delete move constructor and assignment operator
     StatisChanModelWrapper(StatisChanModelWrapper&&) = delete;
     StatisChanModelWrapper& operator=(StatisChanModelWrapper&&) = delete;
-    
+
     ~StatisChanModelWrapper();
 
     void reset() { m_statisChanModelHandle->reset(); }
-    
+
     // System level run method
     void run(float refTime = 0.0f,
              uint8_t continuous_fading = 1,
@@ -245,22 +231,25 @@ public:
              py::object cir_n_taps = py::none(),
              py::object cfr_sc = py::none(),
              py::object cfr_prbg = py::none());
-    
+
     // Link level run method
     void run_link_level(float refTime0 = 0.0f,
                        uint8_t continuous_fading = 1,
                        uint8_t enableSwapTxRx = 0,
                        uint8_t txColumnMajorInd = 0);
-    
+
     void dump_los_nlos_stats(py::array_t<float> lost_nlos_stats = py::array_t<float>());
-    void dump_pathloss_shadowing_stats(py::array_t<float> pathloss_shadowing,
-                                     py::array_t<int> activeCell = py::array_t<int>(),
-                                     py::array_t<int> activeUt = py::array_t<int>());
+    void dump_pl_sf_stats(py::array_t<float> pl_sf,
+                          py::array_t<int> activeCell = py::array_t<int>(),
+                          py::array_t<int> activeUt = py::array_t<int>());
+    void dump_pl_sf_ant_gain_stats(py::array_t<float> pl_sf_ant_gain,
+                          py::array_t<int> activeCell = py::array_t<int>(),
+                          py::array_t<int> activeUt = py::array_t<int>());
     void dump_topology_to_yaml(const std::string& filename);  // see dumpTopologyToYaml in sls_chan.cuh
-    
+
     /**
      * Save SLS channel data to H5 file for debugging
-     * 
+     *
      * @param filename_ending Optional string to append to filename
      */
     void saveSlsChanToH5File(std::string_view filename_ending = "");

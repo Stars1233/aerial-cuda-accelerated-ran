@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -96,6 +97,7 @@ class TestVector:
         self.negTV_enable = None
         self.enable_dynamic_BF = None
         self.enable_static_dynamic_beamforming = None
+        self.fh_msg_mode = 0 # fhMsgMode: 0 disabled, non-zero enables FH modulation compression mode(s)
         pass
 
     def get_prach_prb_stride(self,parsed_testvector):
@@ -433,7 +435,8 @@ class TestVector:
                 self.dl_comp_meth = TestVector.COMPRESSION_FIXED
                 self.ul_comp_meth = TestVector.COMPRESSION_FIXED
         if 'fhMsgMode' in list(parsed_testvector.keys()):
-            if(0 != int(parsed_testvector['fhMsgMode'][0][0])):
+            self.fh_msg_mode = int(parsed_testvector['fhMsgMode'][0][0])
+            if self.fh_msg_mode != 0:
                 self.dl_comp_meth = TestVector.COMPRESSION_MOD
 
         if 'ul_gain_calibration' in cellConfigKeys:
@@ -452,6 +455,8 @@ class TestVector:
 
         if 'enable_static_dynamic_beamforming' in cellConfigKeys:
             self.enable_static_dynamic_beamforming = int(parsed_testvector['Cell_Config']['enable_static_dynamic_beamforming'][0])
+
+        self.pusch_ldpc_max_num_itr_algo_type = int(self.algoOptions['LDPC_DMI_method'])
 
         # PDUX
         nPdu = np.array(parsed_testvector['nPdu'][0])
@@ -544,6 +549,7 @@ class LaunchPattern:
         self.l2adapter_attributes = None
         self.special_l2adapter_config_file = None
         self.mus = None
+        self.has_fh_msg_mode = False
 
     def parse_launch_pattern_file(self, lpname):
         if lpname == None or  type(lpname) != str:
@@ -575,6 +581,8 @@ class LaunchPattern:
             if(num_cells > 1):
                 tv_cfg.multicell_test = 1
             tv_cfg.parse_tv_string(cfg_tv_abs, None)
+            if tv_cfg.fh_msg_mode != 0:
+                self.has_fh_msg_mode = True
             self.cells[config_index]['dl_comp_meth'] = int(tv_cfg.dl_comp_meth)
         for slotindex in range(len(celltvs)):
             cell_configs = celltvs[slotindex]['config']
@@ -590,6 +598,8 @@ class LaunchPattern:
                         if(num_cells > 1):
                             tv.multicell_test = 1
                         tv.parse_tv_string(abstvname, slotindex)
+                        if tv.fh_msg_mode != 0:
+                            self.has_fh_msg_mode = True
                         self.mus.append(int(tv.mu))
                         for key,eaxc_channel_val in tv.eAxCList:
                             if key not in self.cells[config_index]["eAxCChList"]:
@@ -626,6 +636,7 @@ class LaunchPattern:
                         self.cells[config_index]['max_amp_ul'] = tv.max_amp_ul
                         self.cells[config_index]['enable_dynamic_BF'] = tv.enable_dynamic_BF
                         self.cells[config_index]['enable_static_dynamic_beamforming'] = tv.enable_static_dynamic_beamforming
+                        self.cells[config_index]['pusch_ldpc_max_num_itr_algo_type'] = tv.pusch_ldpc_max_num_itr_algo_type
                     
                         # if tv.special_l2adapter_config_file:
                         #     special_l2a_file = True
@@ -727,10 +738,35 @@ class CuphyConfiguration:
     def write_lp_config(self, lp):
         self.get_fresh_template()
 
+        # If any TV in the launch pattern enables fhMsgMode, ensure mMIMO_enable is set in output config.
+        if getattr(lp, "has_fh_msg_mode", False):
+            self.yaml_file['cuphydriver_config']['mMIMO_enable'] = 1
+
+        if (type(lp.name) is int and lp.name >= 90024 and lp.name <= 90026):
+            self.yaml_file['cuphydriver_config']['pusch_aggr_per_ctx'] = 15
+            self.yaml_file['cuphydriver_config']['prach_aggr_per_ctx'] = 8
+            self.yaml_file['cuphydriver_config']['pucch_aggr_per_ctx'] = 8
+            self.yaml_file['cuphydriver_config']['ul_input_buffer_per_cell'] = 21
+
         if (type(lp.name) is int and lp.name >= 90061 and lp.name <= 90063):
             self.yaml_file['cuphydriver_config']['pusch_aggr_per_ctx'] = 9
             self.yaml_file['cuphydriver_config']['prach_aggr_per_ctx'] = 4
             self.yaml_file['cuphydriver_config']['ul_input_buffer_per_cell'] = 15
+
+        if type(lp.name) is int and lp.name in [90027, 90028, 90029, 90064]:
+            self.yaml_file['cuphydriver_config']['pusch_aggr_per_ctx'] = 9
+            self.yaml_file['cuphydriver_config']['prach_aggr_per_ctx'] = 6
+            self.yaml_file['cuphydriver_config']['pucch_aggr_per_ctx'] = 6
+            self.yaml_file['cuphydriver_config']['ul_input_buffer_per_cell'] = 15
+
+        if type(lp.name) is int and lp.name >= 90065 and lp.name <= 90067:
+            self.yaml_file['cuphydriver_config']['ul_srs_aggr3_task_launch_offset_ns'] = 4000000
+            self.yaml_file['cuphydriver_config']['pusch_aggr_per_ctx'] = 9
+            self.yaml_file['cuphydriver_config']['prach_aggr_per_ctx'] = 6
+            self.yaml_file['cuphydriver_config']['pucch_aggr_per_ctx'] = 6
+            self.yaml_file['cuphydriver_config']['srs_aggr_per_ctx'] = 6
+            self.yaml_file['cuphydriver_config']['ul_input_buffer_per_cell'] = 15
+            self.yaml_file['cuphydriver_config']['ul_input_buffer_per_cell_srs'] = 8
 
         if type(lp.name) is int and (lp.name in [90159, 90160]):
             self.yaml_file["cuphydriver_config"]["split_ul_cuda_streams"] = 0
@@ -758,6 +794,9 @@ class CuphyConfiguration:
             self.yaml_file['cuphydriver_config']['ul_srs_aggr3_task_launch_offset_ns'] = 500000
             self.yaml_file['cuphydriver_config']['pusch_aggr_per_ctx'] = 6
 
+        if type(lp.name) is int and (lp.name in [90200, 90201]):
+            self.yaml_file['cuphydriver_config']['fix_beta_dl'] = 1
+
         if len(lp.cells) > 0:
             self.yaml_file['cuphydriver_config']['cell_group_num'] = len(lp.cells)
         for cell_index in range(len(lp.cells)):
@@ -772,6 +811,7 @@ class CuphyConfiguration:
             self.yaml_file['cuphydriver_config']['cells'][cell_index]['ul_iq_data_fmt']['bit_width'] = lp.cells[cell_index]['compression_bits']
             self.yaml_file['cuphydriver_config']['cells'][cell_index]['ul_gain_calibration'] = lp.cells[cell_index]['ul_gain_calibration']
             self.yaml_file['cuphydriver_config']['cells'][cell_index]['max_amp_ul'] = lp.cells[cell_index]['max_amp_ul']
+            self.yaml_file['cuphydriver_config']['cells'][cell_index]['pusch_ldpc_max_num_itr_algo_type'] = lp.cells[cell_index]['pusch_ldpc_max_num_itr_algo_type']
 
             if len(lp.cells[cell_index]['pusch_special_attributes']) > 0:
                 self.yaml_file['cuphydriver_config'].update(lp.cells[cell_index]['pusch_special_attributes'])

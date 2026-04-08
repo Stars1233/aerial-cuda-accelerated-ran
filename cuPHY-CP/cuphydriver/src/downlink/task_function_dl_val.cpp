@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,6 @@
 #include "aerial-fh-driver/oran.hpp"
 #include <sched.h>
 #include <unistd.h>
-#include "task_instrumentation.hpp"
 #include "memtrace.h"
 #include "nvlog_fmt.hpp"
 #include "scf_5g_fapi.h"

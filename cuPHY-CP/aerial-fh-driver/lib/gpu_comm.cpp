@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@
 #include "cuphy_pti.hpp"
 #include "cuphy.hpp"
 #include "mlx5.hpp"
+#include <doca_eth_txq.h>
 
 #ifndef DOCA_GPUNETIO_WQE_PI_MASK
 #define DOCA_GPUNETIO_WQE_PI_MASK 0xFFFF
@@ -44,7 +45,8 @@ int gpu_comm_cpu_poll_cq(void * cq_buf_, uint32_t * cq_ci, uint16_t cqe_s, uint1
 
 GpuComm::GpuComm(Nic* nic) :
     nic_{nic},
-    bf_db_host_{nullptr}
+    bf_db_host_{nullptr},
+    bf_db_dev_{nullptr}
 {
     /* Assume CUDA and context is set from calling thread */
     ASSERT_CUDA_FH(cudaStreamCreateWithPriority(&cstream_, cudaStreamNonBlocking, -5));
@@ -60,8 +62,8 @@ GpuComm::GpuComm(Nic* nic) :
     int flags=cudaEventDisableTiming;
 
     for (int sym = 0; sym < pkt_copy_done_evt.size(); sym++) {
-        cudaEventCreateWithFlags(&pkt_copy_done_evt[sym],flags);
-        cudaEventCreate(&trigger_end[sym]);
+        ASSERT_CUDA_FH(cudaEventCreateWithFlags(&pkt_copy_done_evt[sym],flags));
+        ASSERT_CUDA_FH(cudaEventCreate(&trigger_end[sym]));
     }
 
     PrepareParams prepare{};
@@ -74,12 +76,10 @@ GpuComm::GpuComm(Nic* nic) :
     gpucomm_prepare_send(prepare, cstream_);
     cudaStreamSynchronize(cstream_);
 
-    /* Buffers for memsetting PRB pointers */
-    ASSERT_CUDA_FH(cudaMalloc(&d_buffers_addr, sizeof(CleanupDlBufInfo) * API_MAX_NUM_CELLS));
-    ASSERT_CUDA_FH(cudaMallocHost(&h_buffers_addr, sizeof(CleanupDlBufInfo) * API_MAX_NUM_CELLS));
     ASSERT_CUDA_FH(cudaMallocHost((void**)&host_pinned_error_flag, sizeof(uint32_t)));
+
     *host_pinned_error_flag = 0;
-    for (int q = 0; q < MAX_DL_UPLANE_QUEUES; q++) {
+    for (int q = 0; q < API_MAX_NUM_CELLS; q++) {
         ASSERT_CUDA_FH(cudaMallocHost(&pkt_start_debug[q], MAX_PKT_DEBUG * sizeof(*pkt_start_debug[q])));
      }
 
@@ -89,12 +89,10 @@ GpuComm::GpuComm(Nic* nic) :
 GpuComm::~GpuComm()
 {
     bf_db_host_ = nullptr;
-    ASSERT_CUDA_FH(cudaFree(d_buffers_addr));
-    ASSERT_CUDA_FH(cudaFreeHost(h_buffers_addr));
     ASSERT_CUDA_FH(cudaFreeHost(host_pinned_error_flag));
     ASSERT_CUDA_FH(cudaStreamDestroy(cstream_));
     ASSERT_CUDA_FH(cudaStreamDestroy(cstream_pkt_copy_));
-    for (int q = 0; q < MAX_DL_UPLANE_QUEUES; q++) {
+    for (int q = 0; q < API_MAX_NUM_CELLS; q++) {
         ASSERT_CUDA_FH(cudaFreeHost(pkt_start_debug[q]));
     }
 }
@@ -137,8 +135,8 @@ void GpuComm::traceCqe(TxRequestGpuPercell *pTxRequestGpuPercell)
                 requests[idx] = static_cast<TxRequestUplaneGpuComm*>(pTxRequestGpuPercell->tx_v_per_nic[idx]);
                 txh[idx] = requests[idx]->txq->get_doca_tx_items();
                 txh[idx]->frame_id = requests[idx]->frame_id;
-                txh[idx]->frame_id = requests[idx]->subframe_id;
-                txh[idx]->frame_id = requests[idx]->slot_id;
+                txh[idx]->subframe_id = requests[idx]->subframe_id;
+                txh[idx]->slot_id = requests[idx]->slot_id;
                 txh[idx]->gCommsHdl = static_cast<void*>(this);
                 txh[idx]->cell_idx = idx;
                 txq_poll_cq(requests[idx]->txq,NULL);
@@ -150,7 +148,7 @@ void GpuComm::traceCqe(TxRequestGpuPercell *pTxRequestGpuPercell)
 int GpuComm::cpu_send(TxRequestGpuPercell *pTxRequestGpuPercell, PreparePRBInfo &prb_info, PacketTimingInfo &packet_timing_info) {
     doca_tx_items_t *txh[kGpuCommSendPeers];
     TxRequestUplaneGpuComm* requests[kGpuCommSendPeers];
-    NVLOGI_FMT(TAG,"Starting cpu_send");
+    NVLOGI_FMT(TAG,"Starting cpu_send, pTxRequestGpuPercell->size={}", pTxRequestGpuPercell->size);
     packet_timing_info.cpu_send_start_timestamp = std::chrono::system_clock::now().time_since_epoch().count();
     for(int idx = 0; idx < kGpuCommSendPeers; idx++) {
         requests[idx] = nullptr;
@@ -159,19 +157,17 @@ int GpuComm::cpu_send(TxRequestGpuPercell *pTxRequestGpuPercell, PreparePRBInfo 
             requests[idx] = static_cast<TxRequestUplaneGpuComm*>(pTxRequestGpuPercell->tx_v_per_nic[idx]);
             txh[idx] = requests[idx]->txq->get_doca_tx_items();
             txh[idx]->frame_id = requests[idx]->frame_id;
-            txh[idx]->frame_id = requests[idx]->subframe_id;
-            txh[idx]->frame_id = requests[idx]->slot_id;
+            txh[idx]->subframe_id = requests[idx]->subframe_id;
+            txh[idx]->slot_id = requests[idx]->slot_id;
             txh[idx]->gCommsHdl = static_cast<void*>(this);
             txh[idx]->cell_idx = idx;
 
             NVLOGD_FMT(TAG, "GpuComm on TXQ[{}] = {} DOCA txq info {}",
                     idx, requests[idx]->txq->get_id(), reinterpret_cast<void*>(txh[idx]->eth_txq_gpu));
+            NVLOGI_FMT(TAG, "requests[{}]->h_up_slot_info_->old_wqe_pi={} ptr={:p}",
+                idx, requests[idx]->h_up_slot_info_->old_wqe_pi, (void*)&requests[idx]->h_up_slot_info_->old_wqe_pi);
         }
     }
-
-
-    NVLOGI_FMT(TAG, "requests[0]->h_up_slot_info_->old_wqe_pi={}/{}  {}/{}", requests[0]->h_up_slot_info_->old_wqe_pi, requests[1]->h_up_slot_info_->old_wqe_pi,
-            (void*)&requests[0]->h_up_slot_info_->old_wqe_pi, (void*)&(requests[1]->h_up_slot_info_->old_wqe_pi));
 
     if (prb_info.compression_stop_evt != nullptr) {
         ASSERT_CUDA_FH(cudaStreamWaitEvent(cstream_pkt_copy_, prb_info.compression_stop_evt));
@@ -183,8 +179,6 @@ int GpuComm::cpu_send(TxRequestGpuPercell *pTxRequestGpuPercell, PreparePRBInfo 
     uint64_t time1[ORAN_ALL_SYMBOLS], time2[ORAN_ALL_SYMBOLS];
     float diff=0.0;
     PacketCopyParams copy_params;
-    uint32_t wqe_pi;
-    std::array<uint32_t, 16> wqes_sent{};
     uint32_t num_packets;
     //Reset all timestamps in packet_timing_info to 0 before loop start
     packet_timing_info.pkt_copy_done_timestamp.fill(0);
@@ -226,6 +220,7 @@ int GpuComm::cpu_send(TxRequestGpuPercell *pTxRequestGpuPercell, PreparePRBInfo 
 
             if (copy_params.max_pkts == 0) {
                 NVLOGI_FMT(TAG, "Skipping F{}S{}S{} symbol {} with 0 packets", requests[0]->frame_id,requests[0]->subframe_id,requests[0]->slot_id, copies_finished);
+                time1[copies_finished] = std::chrono::steady_clock::now().time_since_epoch().count();
             }
             else {
                 NVLOGI_FMT(TAG, "Launching copy kernel for symbol {}", copies_finished);
@@ -297,32 +292,14 @@ int GpuComm::cpu_send(TxRequestGpuPercell *pTxRequestGpuPercell, PreparePRBInfo 
                 {
                     packet_timing_info.pkt_copy_done_timestamp[check_symbol] = std::chrono::system_clock::now().time_since_epoch().count();
                 }
-                time2[check_symbol] = std::chrono::steady_clock::now().time_since_epoch().count();
-                diff = (time2[check_symbol]-time1[check_symbol])/1000.0;
-                prb_info.p_packet_mem_copy_per_symbol_dur_us[check_symbol]=diff;
-                NVLOGI_FMT(TAG, "Launching trigger kernel for symbol {}", check_symbol);
+                time2[check_symbol]                                        = std::chrono::steady_clock::now().time_since_epoch().count();
+                diff                                                       = (time2[check_symbol] - time1[check_symbol]) / 1000.0;
+                prb_info.p_packet_mem_copy_per_symbol_dur_us[check_symbol] = diff;
+                NVLOGI_FMT(TAG, "Processing symbol {} after D2H copy completion", check_symbol);
                 packet_timing_info.frame_id = requests[0]->frame_id;
                 packet_timing_info.subframe_id = requests[0]->subframe_id;
                 packet_timing_info.slot_id = requests[0]->slot_id;
-
-                for (int cell = 0; cell < pTxRequestGpuPercell->size; cell++) {
-                    // Write to DBREC
-rte_io_wmb();
-                    //printf("PI sym %d (wqebbs_per_cell) %u\n", check_symbol, (requests[cell]->h_up_slot_info_->wqebbs_per_cell[check_symbol] + wqes_sent[cell]) & DOCA_GPUNETIO_WQE_PI_MASK);
-                    wqe_pi = (requests[cell]->h_up_slot_info_->wqebbs_per_cell[check_symbol] + requests[cell]->h_up_slot_info_->old_wqe_pi + wqes_sent[cell]) & DOCA_GPUNETIO_WQE_PI_MASK;
-                    //printf("{} : F%dS%dS%d PI sym %d (wqebbs_per_cell) %d requests[cell]->h_up_slot_info_->old_wqe_pi=%u\n", requests[0]->frame_id,requests[0]->subframe_id,requests[0]->slot_id, check_symbol, wqe_pi, requests[cell]->h_up_slot_info_->old_wqe_pi);
-                    NVLOGI_FMT(TAG, "Cell {} F{}S{}S{} PI sym {} wqe_pi {} wqebbs_per_cell {} requests[cell]->h_up_slot_info_->old_wqe_pi={} ptr={}  wqes_sent[cell]={}", cell, requests[0]->frame_id,requests[0]->subframe_id,requests[0]->slot_id, check_symbol, wqe_pi,
-                        requests[cell]->h_up_slot_info_->wqebbs_per_cell[check_symbol], requests[cell]->h_up_slot_info_->old_wqe_pi, (void*)&requests[cell]->h_up_slot_info_->old_wqe_pi, wqes_sent[cell]);
-                    DOCA_GPUNETIO_VOLATILE(*((uint32_t *)requests[cell]->h_up_slot_info_->sq_db_rec)) = CPU_TO_BE32(wqe_pi);
-                    wqes_sent[cell] += requests[cell]->h_up_slot_info_->wqebbs_per_cell[check_symbol];
-rte_wmb();
-                    // // Write to DBREG
-                    //printf("WQE %d %p testwqe %d\n", requests[cell]->h_up_slot_info_->wqe[check_symbol], requests[cell]->h_up_slot_info_->sq_db, requests[cell]->h_up_slot_info_->test_wqe[check_symbol]);
-                    NVLOGI_FMT(TAG, "Cell {}  WQE {} {} testwqe {}", cell, requests[cell]->h_up_slot_info_->wqe[check_symbol], requests[cell]->h_up_slot_info_->sq_db, requests[cell]->h_up_slot_info_->test_wqe[check_symbol]);
-                    // //auto txr = static_cast<TxRequestUplaneGpuComm*>(pTxRequestGpuPercell->tx_v_per_nic[cell]);
-                    DOCA_GPUNETIO_VOLATILE(*(volatile uint64_t *)requests[cell]->h_up_slot_info_->sq_db) = requests[cell]->h_up_slot_info_->wqe[check_symbol];
-rte_wmb();
-                }
+                                
                 if(packet_timing_info.num_packets_per_symbol[check_symbol] > 0)
                 {
                     packet_timing_info.trigger_done_timestamp[check_symbol] = std::chrono::system_clock::now().time_since_epoch().count();
@@ -334,6 +311,15 @@ rte_wmb();
                 break;
             }
         } while (check_symbol < copies_finished);
+    }
+
+    // Call CPU proxy progress for each cell after D2H copy completes
+    // Note: doca_gpu_dev_eth_txq_submit_proxy is now called from within gpu_comm_prepare_send_doca kernel
+    for (int cell = 0; cell < pTxRequestGpuPercell->size; cell++) {
+        const doca_error_t result = doca_eth_txq_gpu_cpu_proxy_progress(txh[cell]->eth_txq_cpu);
+        if (result != DOCA_SUCCESS) {
+            NVLOGE_FMT(TAG, AERIAL_DPDK_API_EVENT, "doca_eth_txq_gpu_cpu_proxy_progress failed for cell {} : {}", cell, doca_error_get_descr(result));
+        }
     }
 
     // Accumulate the total packets per flow for the next copy round
@@ -386,8 +372,8 @@ int GpuComm::send(TxRequestGpuPercell *pTxRequestGpuPercell, uint32_t hdr_len, u
             requests[idx] = static_cast<TxRequestUplaneGpuComm*>(pTxRequestGpuPercell->tx_v_per_nic[idx]);
             txh[idx] = requests[idx]->txq->get_doca_tx_items();
             txh[idx]->frame_id = requests[idx]->frame_id;
-            txh[idx]->frame_id = requests[idx]->subframe_id;
-            txh[idx]->frame_id = requests[idx]->slot_id;
+            txh[idx]->subframe_id = requests[idx]->subframe_id;
+            txh[idx]->slot_id = requests[idx]->slot_id;
             txh[idx]->gCommsHdl = static_cast<void*>(this);
             txh[idx]->cell_idx = idx;
 
@@ -417,8 +403,7 @@ int GpuComm::send(TxRequestGpuPercell *pTxRequestGpuPercell, uint32_t hdr_len, u
     if(prb_info.enable_prepare_tracing) {
         ASSERT_CUDA_FH(cudaEventRecord(prb_info.comm_start_evt, cstream_));
     }
-    //ASSERT_CUDA_FH(cudaMemcpyAsync((void*)d_buffers_addr, (void*)h_buffers_addr, sizeof(*h_buffers_addr) * API_MAX_NUM_CELLS, cudaMemcpyHostToDevice, cstream_));
-    launch_memset_kernel((void*)d_buffers_addr, pTxRequestGpuPercell->size, max_buffer_size, cleanup, cstream_);
+    launch_memset_kernel(pTxRequestGpuPercell->size, max_buffer_size, cleanup, cstream_);
     if(prb_info.enable_prepare_tracing) {
         ASSERT_CUDA_FH(cudaEventRecord(prb_info.comm_copy_evt, cstream_));
     }
@@ -568,7 +553,9 @@ int gpu_comm_cpu_poll_cq(void * cq_buf_, uint32_t * cq_ci, uint16_t cqe_s, uint1
         if (unlikely(ret != MLX5_CQE_STATUS_SW_OWN)) {
             if (likely(ret != MLX5_CQE_STATUS_ERR)) {
                 /* No new CQEs in completion queue. */
-                assert(ret == MLX5_CQE_STATUS_HW_OWN);
+                if(ret != MLX5_CQE_STATUS_HW_OWN) {
+                    NVLOGF_FMT(TAG, AERIAL_DPDK_API_EVENT, "Unexpected CQE status: {} != {}", ret, MLX5_CQE_STATUS_HW_OWN);
+                }
                 break;
             }
             /*
@@ -672,7 +659,7 @@ uint32_t GpuComm::getErrorFlag()
 
 // stub definitions when DOCA GPU communication is disabled
 
-void launch_memset_kernel(void* d_buffers_addr, int num_cells, size_t max_buffer_size, CleanupParams &params, cudaStream_t strm)
+void launch_memset_kernel(int num_cells, size_t max_buffer_size, CleanupParams &params, cudaStream_t strm)
 {
     NVLOGW_FMT(TAG, "launch_memset_kernel called but DOCA GPU communication is disabled");
 }

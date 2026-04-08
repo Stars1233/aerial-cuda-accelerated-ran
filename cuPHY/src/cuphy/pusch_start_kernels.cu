@@ -92,17 +92,28 @@ symbolWaitKernel(ch_est::puschRxChEstStatDescr_t* pStatDescr, ch_est::puschRxChE
     }
 }
 
-template <bool ENABLE_DEVICE_GRAPH_LAUNCH>
+template <bool ENABLE_DEVICE_GRAPH_LAUNCH, bool SUB_SLOT>
 static __global__ void
 deviceGraphLaunchKernel(ch_est::puschRxChEstDynDescr_t* pDynDescr, CUgraphExec deviceGraphExec)
 {
     if(ENABLE_DEVICE_GRAPH_LAUNCH && threadIdx.x==0)
     {
         bool timedOut = false;
-        if(pDynDescr->pPostSubSlotWaitKernelStatusGpu)
+        if (SUB_SLOT)
         {
-            timedOut = *(pDynDescr->pPostSubSlotWaitKernelStatusGpu) == PUSCH_RX_WAIT_KERNEL_STATUS_TIMEOUT;
+            if(pDynDescr->pPreSubSlotWaitKernelStatusGpu)
+            {
+                timedOut = *(pDynDescr->pPreSubSlotWaitKernelStatusGpu) == PUSCH_RX_WAIT_KERNEL_STATUS_TIMEOUT;
+            }
         }
+        else
+        {
+            if(pDynDescr->pPostSubSlotWaitKernelStatusGpu)
+            {
+                timedOut = *(pDynDescr->pPostSubSlotWaitKernelStatusGpu) == PUSCH_RX_WAIT_KERNEL_STATUS_TIMEOUT;
+            }
+        }
+        
         if(!timedOut)
         {
             cudaGraphLaunch(deviceGraphExec, cudaStreamGraphFireAndForget);
@@ -110,49 +121,53 @@ deviceGraphLaunchKernel(ch_est::puschRxChEstDynDescr_t* pDynDescr, CUgraphExec d
     }
 }
 
-template <typename CFG, typename FUNC>
-void setKernelParamsImpl(CFG& launchCfg, const bool mode, void* kernelArgs0, void* kernelArgs1, FUNC&& kernelFunc)
+template <typename CFG, typename GetFunc>
+static inline void setKernelParamsCommon(CFG& launchCfg,
+                                         void* kernelArgs0,
+                                         void* kernelArgs1,
+                                         GetFunc&& getFunc)
 {
-    // static_assert(std::is_invocable_r_v<CUfunction, FUNC>,
-    //     "FUNC must be invocable (Function, lambda etc...), returning CUfunction");
     dim3 gridDims(1);
     dim3 blockDims(32);
 
-    CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = launchCfg.kernelNodeParamsDriver;
-    {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc(mode)));}
+    CUDA_KERNEL_NODE_PARAMS& p = launchCfg.kernelNodeParamsDriver;
+    { MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&p.func, getFunc())); }
 
-    // populate kernel parameters
-    kernelNodeParamsDriver.blockDimX = blockDims.x;
-    kernelNodeParamsDriver.blockDimY = blockDims.y;
-    kernelNodeParamsDriver.blockDimZ = blockDims.z;
+    p.blockDimX = blockDims.x; p.blockDimY = blockDims.y; p.blockDimZ = blockDims.z;
+    p.gridDimX  = gridDims.x;  p.gridDimY  = gridDims.y;  p.gridDimZ  = gridDims.z;
+    p.extra = nullptr; p.sharedMemBytes = 0;
 
-    kernelNodeParamsDriver.gridDimX = gridDims.x;
-    kernelNodeParamsDriver.gridDimY = gridDims.y;
-    kernelNodeParamsDriver.gridDimZ = gridDims.z;
-
-    kernelNodeParamsDriver.extra          = nullptr;
-    kernelNodeParamsDriver.sharedMemBytes = 0;
-
-    // input placeholder for kernelargs
-    void* placeholderPtr      = nullptr;
-    launchCfg.kernelArgs[0] = kernelArgs0 == nullptr ? &placeholderPtr : kernelArgs0;
-    launchCfg.kernelArgs[1] = kernelArgs1 == nullptr ? &placeholderPtr : kernelArgs1;
-    launchCfg.kernelNodeParamsDriver.kernelParams = launchCfg.kernelArgs;
+    void* placeholderPtr = nullptr;
+    launchCfg.kernelArgs[0] = kernelArgs0 ? kernelArgs0 : &placeholderPtr;
+    launchCfg.kernelArgs[1] = kernelArgs1 ? kernelArgs1 : &placeholderPtr;
+    p.kernelParams = launchCfg.kernelArgs;
 }
 
+template <typename CFG, typename FUNC>
+void setKernelParamsImpl(CFG& launchCfg, const uint8_t puschRxFullSlotMode, void* kernelArgs0, void* kernelArgs1, FUNC&& kernelFunc)
+{
+    setKernelParamsCommon(launchCfg, kernelArgs0, kernelArgs1, [&]{ return kernelFunc(puschRxFullSlotMode); });
+}
+
+template <typename CFG, typename FUNC>
+void setDGLKernelParamsImpl(CFG& launchCfg, const uint8_t enableDeviceGraphLaunch, const uint8_t puschRxFullSlotMode, void* kernelArgs0, void* kernelArgs1, FUNC&& kernelFunc)
+{
+    setKernelParamsCommon(launchCfg, kernelArgs0, kernelArgs1, [&]{ return kernelFunc(enableDeviceGraphLaunch, puschRxFullSlotMode); });
+
+}
 
 // setup for symbolWaitKernel, where it waits for certain number of symbols to arrive before proceeding to start the PUSCH pipeline
 void StartKernels::setWaitKernelParams(cuphyPuschRxWaitLaunchCfg_t* pLaunchCfg,
-                                       const uint8_t                puschRxProcMode,
+                                       const uint8_t                puschRxFullSlotMode,
                                        void*                        ppStatDescr,
                                        void*                        ppDynDescr)
 {
     setKernelParamsImpl(*pLaunchCfg,
-                        puschRxProcMode,
+                        puschRxFullSlotMode,
                         ppStatDescr,
                         ppDynDescr,
-                        [](const auto mode) -> void* {
-                            const auto ret = (mode == CUPHY_PUSCH_FULL_SLOT_PATH ?
+                        [](const auto puschRxFullSlotMode) -> void* {
+                            const auto ret = (puschRxFullSlotMode == CUPHY_PUSCH_FULL_SLOT_PATH ?
                                                   symbolWaitKernel<false> :
                                                   symbolWaitKernel<true>);
                             return reinterpret_cast<void*>(ret);
@@ -161,19 +176,21 @@ void StartKernels::setWaitKernelParams(cuphyPuschRxWaitLaunchCfg_t* pLaunchCfg,
 
 // used in kernel node that launches full-slot or sub-slot PUSCH graph from device
 void StartKernels::setDeviceGraphLaunchKernelParams(cuphyPuschRxDglLaunchCfg_t* pLaunchCfg,
-                                                    uint8_t                     enableDeviceGraphLaunch,
+                                                    const uint8_t               enableDeviceGraphLaunch,
+                                                    const uint8_t               puschRxFullSlotMode,
                                                     void*                       ppDynDescr,
                                                     void*                       ppDeviceGraph)
 {
-    setKernelParamsImpl(*pLaunchCfg,
-                        enableDeviceGraphLaunch,
-                        ppDynDescr,
-                        ppDeviceGraph,
-                        [](const auto mode) -> void* {
-                            const auto ret = mode ?
-                                                 deviceGraphLaunchKernel<true> :
-                                                 deviceGraphLaunchKernel<false>;
-                            return reinterpret_cast<void*>(ret);
+    setDGLKernelParamsImpl(*pLaunchCfg,
+                           enableDeviceGraphLaunch,
+                           puschRxFullSlotMode,
+                           ppDynDescr,
+                           ppDeviceGraph,
+                           [](const auto enableDeviceGraphLaunch, const auto puschRxFullSlotMode) -> void* {
+                               const auto ret = enableDeviceGraphLaunch ? 
+                                              (puschRxFullSlotMode == CUPHY_PUSCH_FULL_SLOT_PATH ? deviceGraphLaunchKernel<true, false>  : deviceGraphLaunchKernel<true, true>) : 
+                                              (puschRxFullSlotMode == CUPHY_PUSCH_FULL_SLOT_PATH ? deviceGraphLaunchKernel<false, false> : deviceGraphLaunchKernel<false, true>);
+                               return reinterpret_cast<void*>(ret);
                         });
 }
 } // namespace pusch

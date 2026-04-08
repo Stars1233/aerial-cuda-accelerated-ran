@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@ import csv
 import glob
 import re
 import logging
+import yaml
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from generate_tv import TVGenerator
@@ -69,6 +70,16 @@ class cuMACTest:
             self.log_file = (
                 Path(config["log_folder"])
                 / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_cuMAC_{self.config['option']}_{self.config['tv_index']}_test_main.log"
+            )
+        elif self.config["option"] == "pfmsort":
+            self.csv_filename = (
+                self.cumac_folder / "scripts/cumac_pfmsort_parameters.csv"
+            )
+            self.pfmsort_config_file = self.cumac_folder / "examples/pfmSort/config.yaml"
+            self.pfmsort_config_file_bak = self.pfmsort_config_file.with_suffix(".yaml_bak")
+            self.log_file = (
+                Path(config["log_folder"])
+                / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_cuMAC_pfmsort_{self.config['tv_index']}_test_main.log"
             )
         else:
             self.csv_filename = self.cumac_folder / "scripts/cumac_tv_parameters.csv"
@@ -265,13 +276,269 @@ class cuMACTest:
         )
         return all_combinations
 
-    def cumac_test_cmd(self):
-        numSimChnRlz = self.run_subprocess(
-            f"grep 'numSimChnRlz' {self.param_file} | awk '{{print $3}}'"
+    def pfmsort_test_parameters_comb(self):
+        """Generate parameter combinations for PFM sort test."""
+        num_cells = [1, 8, 16, 32, 40]
+        num_ue_per_cell = [16, 64, 128, 256, 512]
+        num_dl_lc_per_ue = [2, 4]
+        num_ul_lcg_per_ue = [2, 4]
+        if self.config["smoke"]:
+            seeds = [0, 1, 2]
+        else:
+            seeds = [0, 1, 2, 3, 4, 5]
+
+        all_combinations = list(
+            itertools.product(
+                num_cells,
+                num_ue_per_cell,
+                num_dl_lc_per_ue,
+                num_ul_lcg_per_ue,
+                seeds,
+            )
         )
+
+        with open(self.csv_filename, "w", newline="") as csvfile:
+            csv_writer = csv.writer(csvfile)
+            csv_writer.writerow(
+                [
+                    "Index",
+                    "NUM_CELL",
+                    "NUM_UE_PER_CELL",
+                    "NUM_DL_LC_PER_UE",
+                    "NUM_UL_LCG_PER_UE",
+                    "SEED",
+                ]
+            )
+            for i, combo in enumerate(all_combinations, start=1):
+                padded_index = f"{i:04}"
+                csv_writer.writerow([padded_index] + list(combo))
+
+        self.logger.info(
+            f"Generated {len(all_combinations)} parameter combinations written to {self.csv_filename}."
+        )
+        return all_combinations
+
+    def update_pfmsort_config(self, params):
+        """Update the PFM sort config.yaml file with test parameters."""
+        self.logger.info(f"Updating PFM sort config file: {self.pfmsort_config_file}")
+
+        try:
+            # Read the existing config file if it exists
+            if os.path.exists(self.pfmsort_config_file):
+                with open(self.pfmsort_config_file, 'r') as f:
+                    config_data = yaml.safe_load(f) or {}
+            else:
+                config_data = {}
+
+            # Update parameters
+            config_data['NUM_CELL'] = int(params['NUM_CELL'])
+            config_data['NUM_UE_PER_CELL'] = int(params['NUM_UE_PER_CELL'])
+            config_data['NUM_DL_LC_PER_UE'] = int(params['NUM_DL_LC_PER_UE'])
+            config_data['NUM_UL_LCG_PER_UE'] = int(params['NUM_UL_LCG_PER_UE'])
+            config_data['SEED'] = int(params['SEED'])
+
+            # Write updated config
+            with open(self.pfmsort_config_file, 'w') as f:
+                yaml.dump(config_data, f, default_flow_style=False)
+
+            self.logger.info(f"Updated config: NUM_CELL={params['NUM_CELL']}, "
+                             f"NUM_UE_PER_CELL={params['NUM_UE_PER_CELL']}, "
+                             f"NUM_DL_LC_PER_UE={params['NUM_DL_LC_PER_UE']}, "
+                             f"NUM_UL_LCG_PER_UE={params['NUM_UL_LCG_PER_UE']}, "
+                             f"SEED={params['SEED']}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to update config file: {e}")
+            return False
+
+    def run_pfmsort_test(self):
+        """Run a single PFM sort test with current configuration."""
+        test_log = (
+            Path(self.config["log_folder"])
+            / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_cuMAC_pfmsort_"
+            f"{self.config['tv_index']}_test.log"
+        )
+
+        cmd = f"cd {self.config['cubb_sdk']} && {self.build_path}/cuMAC/examples/pfmSort/pfmSortTest"
+
+        self.logger.info(f"Starting PFM sort test, log stored in {test_log}")
+        self.logger.info(f"Running command: {cmd}")
+
+        test_cmd = f"{cmd} > {test_log} 2>&1"
+        result = self.run_subprocess(test_cmd, self.log_file)
+
+        # Check return code and log content
+        if result == 1:
+            self.logger.error(
+                f"PFM sort test FAILED with non-zero exit code, please check {test_log}"
+            )
+            fail_log = test_log.with_suffix(".FAIL")
+            test_log.rename(fail_log)
+            return False
+        else:
+            # Check log content for pass/fail message
+            try:
+                with open(test_log, 'r') as f:
+                    log_content = f.read()
+
+                if "PFM sorting test passed" in log_content:
+                    self.logger.info("PFM sorting test PASSED")
+                    pass_log = test_log.with_suffix(".PASS")
+                    test_log.rename(pass_log)
+                    return True
+                elif "PFM sorting test failed" in log_content:
+                    self.logger.error("PFM sorting test FAILED - check log for details")
+                    fail_log = test_log.with_suffix(".FAIL")
+                    test_log.rename(fail_log)
+                    return False
+                else:
+                    self.logger.warning("Could not determine test result from log")
+                    unknown_log = test_log.with_suffix(".UNKNOWN")
+                    test_log.rename(unknown_log)
+                    return False
+            except Exception as e:
+                self.logger.error(f"Error reading test log: {e}")
+                return False
+
+    def run_pfmsort_test_single(self):
+        """Run a single PFM sort test case based on tv_index."""
+        if not os.path.exists(self.csv_filename):
+            self.pfmsort_test_parameters_comb()
+
+        with open(self.csv_filename, "r") as csvfile:
+            csv_reader = csv.DictReader(csvfile)
+            params = next(
+                (
+                    row
+                    for row in csv_reader
+                    if row["Index"] == self.config["tv_index"]
+                ),
+                None,
+            )
+
+        if params:
+            self.logger.info(
+                f"Running PFM sort test case {self.config['tv_index']}"
+            )
+            self.logger.info(f"Parameters: {params}")
+
+            # Build cuMAC only if build folder doesn't exist
+            if not self.build_path.exists():
+                self.logger.info("Build folder not found, building cuMAC...")
+                if not self.build_cumac():
+                    self.logger.error(
+                        f"Failed to build cuMAC, please check the {self.log_file}"
+                    )
+                    return
+            else:
+                self.logger.info("Build folder exists, skipping build step")
+
+            # Backup config file if not already backed up
+            if not self.pfmsort_config_file_bak.exists() and os.path.exists(self.pfmsort_config_file):
+                self.run_subprocess(
+                    f"cp -f {self.pfmsort_config_file} {self.pfmsort_config_file_bak}"
+                )
+
+            # Update config file
+            if self.update_pfmsort_config(params):
+                # Run test
+                self.run_pfmsort_test()
+            else:
+                self.logger.error("Failed to update PFM sort config")
+
+            # Restore original config
+            if self.pfmsort_config_file_bak.exists():
+                self.run_subprocess(
+                    f"cp {self.pfmsort_config_file_bak} {self.pfmsort_config_file}"
+                )
+        else:
+            self.logger.error(
+                f"Test case index {self.config['tv_index']} not found in {self.csv_filename}"
+            )
+
+    def run_pfmsort_test_all(self):
+        """Run all PFM sort test cases."""
+        if not os.path.exists(self.csv_filename):
+            self.pfmsort_test_parameters_comb()
+
+        # Build cuMAC only once if build folder doesn't exist
+        if not self.build_path.exists():
+            self.logger.info("Build folder not found, building cuMAC...")
+            if not self.build_cumac():
+                self.logger.error(
+                    f"Failed to build cuMAC, please check the {self.log_file}"
+                )
+                return
+        else:
+            self.logger.info("Build folder exists, skipping build step")
+
+        # Backup config file
+        if not self.pfmsort_config_file_bak.exists() and os.path.exists(self.pfmsort_config_file):
+            self.run_subprocess(
+                f"cp -f {self.pfmsort_config_file} {self.pfmsort_config_file_bak}"
+            )
+
+        with open(self.csv_filename, "r") as csvfile:
+            parameters_list = list(csv.DictReader(csvfile))
+
+        total_tests = len(parameters_list)
+        passed_tests = 0
+        failed_tests = 0
+
+        for params in parameters_list:
+            self.config["tv_index"] = params["Index"]
+            self.logger.info(
+                f"Processing PFM sort test {self.config['tv_index']} of {total_tests}"
+            )
+
+            # Update config file and run test
+            if self.update_pfmsort_config(params):
+                # Run test
+                if self.run_pfmsort_test():
+                    passed_tests += 1
+                else:
+                    failed_tests += 1
+            else:
+                self.logger.error(f"Failed to update config for test {self.config['tv_index']}")
+                failed_tests += 1
+
+        # Restore original config
+        if self.pfmsort_config_file_bak.exists():
+            self.run_subprocess(
+                f"cp {self.pfmsort_config_file_bak} {self.pfmsort_config_file}"
+            )
+
+        self.logger.info(
+            f"PFM sort test suite completed: {passed_tests} passed, {failed_tests} unsuccessful out of {total_tests} total"
+        )
+
+        self.check_and_rename_log_file(
+            self.log_file, "PFM Sort Tests", "fail|Fail|ERROR|FAIL"
+        )
+
+    def cumac_test_cmd(self):
+        numSimChnRlz = self.get_parameter_value("numSimChnRlz")
+        numCellConst = self.get_parameter_value("numCellConst")
+        numActiveUePerCellConst = self.get_parameter_value("numActiveUePerCellConst")
+        raw_num_cell = numCellConst
+        raw_num_active_ue_per_cell = numActiveUePerCellConst
+        try:
+            numCellConst = int(numCellConst.split()[0]) if numCellConst else 0
+            numActiveUePerCellConst = int(numActiveUePerCellConst.split()[0]) if numActiveUePerCellConst else 0
+            numActiveLinks = numCellConst * (numCellConst * numActiveUePerCellConst)
+        except (ValueError, TypeError, IndexError):
+            self.logger.exception(
+                "Failed to parse numCellConst/numActiveUePerCellConst for numActiveLinks; "
+                "numCellConst=%r, numActiveUePerCellConst=%r. Using numActiveLinks=999999 to disable sanitizer.",
+                raw_num_cell, raw_num_active_ue_per_cell
+            )
+            numActiveLinks = 999999  # disable sanitizer on parse error
+        
+        # Disable compute-sanitizer for numActiveLinks > 25600 (too slow / high memory)
         compute_sanitizer_cmd = (
             "compute-sanitizer --error-exitcode 0 --tool memcheck --leak-check full "
-            if numSimChnRlz.strip() == "10"
+            if numSimChnRlz.strip() == "10" and numActiveLinks <= 25600  # 25600 links = 16 Cells, 100 UEs per cell
             else ""
         )
 
@@ -292,7 +559,7 @@ class cuMACTest:
             )
             cmd = f"{self.build_path}/cuMAC/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
             test_cmd = [
-                "timeout -s 9 3600",
+                "timeout -s 9 600",
                 compute_sanitizer_cmd,
                 str(cmd),
                 "-d",
@@ -324,7 +591,7 @@ class cuMACTest:
                 str(test_log),
             ]
         elif self.config["option"] == "drl":
-            cmd = f"{self.build_path}/cuMAC/examples/drlMcsSelection/drlMcsSelection"
+            cmd = f"{self.build_path}/cuMAC/examples/ml/drlMcsSelection/drlMcsSelection"
             test_log = (
                 Path(self.config["log_folder"])
                 / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_cuMAC_{self.config['option']}_test.log"
@@ -334,7 +601,7 @@ class cuMACTest:
                 "-i",
                 self.config["tv_folder"],
                 "-m",
-                f"{self.config['cubb_sdk']}/cuMAC/testVectors/trtEngine/model.onnx",
+                f"{self.config['cubb_sdk']}/cuMAC/examples/ml/trainedModels/model.onnx",
                 "-g",
                 self.config["gpu_id"],
                 ">",
@@ -675,10 +942,38 @@ class cuMACTest:
         self.run_subprocess(self.check_command, self.log_file)
         return param_combin
 
-    def get_parameter_value(self, param):
-        return self.run_subprocess(
-            f"grep '{param}' {self.param_file} | awk '{{print $3}}'", self.log_file
-        ).strip()
+    def get_parameter_value(self, param: str) -> str:
+        """Get the value of a preprocessor macro from the parameters header.
+
+        Runs grep/awk via run_subprocess to find the #define line for the given
+        macro in self.param_file; command output is appended to self.log_file.
+        If the subprocess fails or returns non-string (e.g. 1), returns "".
+
+        Args:
+            param: Macro name to look up (e.g. "numCellConst"). Lookup is done
+                in self.param_file.
+
+        Returns:
+            The stripped macro value (third token of the matching #define line),
+            or "" if no match, run_subprocess fails (returns 1), or result is not
+            a string.
+
+        Raises:
+            None. run_subprocess catches subprocess.CalledProcessError and
+            other Exception and returns 1 instead of raising.
+
+        Examples:
+            >>> self.get_parameter_value("numCellConst")
+            '16'
+            >>> self.get_parameter_value("nonexistent")
+            ''
+        """
+        # Match only the line that defines this macro (#define param value), not lines that use it
+        result = self.run_subprocess(
+            f"grep -E '^\\s*#\\s*define\\s+{param}\\s+' {self.param_file} | awk '{{print $3}}'",
+            self.log_file,
+        )
+        return result.strip() if isinstance(result, str) else ""
 
     def _is_ul_supported_index(self):
         """Check if the current index supports UL direction."""
@@ -902,6 +1197,17 @@ class cuMACTest:
             self.check_and_rename_log_file(
                 self.log_file, f"{self.config['option']} TEST", "fail|Fail|ERROR|FAIL"
             )
+        elif self.config["option"] == "pfmsort":
+            if self.config["tv_index"] == "all":
+                self.run_pfmsort_test_all()
+            else:
+                self.run_pfmsort_test_single()
+            self.logger.info(
+                f"Complete to run cuMAC PFM sort tests {self.config['tv_index']}."
+            )
+            self.check_and_rename_log_file(
+                self.log_file, "PFM Sort TEST", "fail|Fail|ERROR|FAIL"
+            )
 
     def main():
         parser = argparse.ArgumentParser(
@@ -936,8 +1242,8 @@ class cuMACTest:
             "-o",
             "--option",
             choices=["4t4r", "4t4r_tdl", "4t4r_cdl", "f1",
-                     "f2", "f3", "f4", "64tr", "drl", "srs"],
-            help="Options for cuMAC Tests, 4t4r - 4T4R tests, 4t4r_tdl - 4T4R tdl tests, 4t4r_cdl - 4T4R cdl tests, f1/f2 - TDL tests, f3/f4 - CDL tests, 64tr - mMIMO tests, drl - DRL tests, srs - SRS tests",
+                     "f2", "f3", "f4", "64tr", "drl", "srs", "pfmsort"],
+            help="Options for cuMAC Tests, 4t4r - 4T4R tests, 4t4r_tdl - 4T4R tdl tests, 4t4r_cdl - 4T4R cdl tests, f1/f2 - TDL tests, f3/f4 - CDL tests, 64tr - mMIMO tests, drl - DRL tests, srs - SRS tests, pfmsort - PFM sorting tests",
         )
         parser.add_argument(
             "-i",
@@ -949,6 +1255,12 @@ class cuMACTest:
             dest="allow_bigger_cpu_gpu_gap",
             action="store_true",
             help="If present (i.e., --allow-bigger-cpu-gpu-gap), tdl and cdl tests will relax allow bigger cpu/gpu perf gap, cpuGpuPerfGapPerUeConst = 0.05, cpuGpuPerfGapSumRConst = 0.05."
+        )
+        parser.add_argument(
+            "--smoke",
+            dest="smoke",
+            action="store_true",
+            help="If present, run smoke tests with reduced parameter combinations (e.g., fewer seeds for pfmsort tests)."
         )
         parser.add_argument("-g", "--gpu_id", help="GPU device ID")
         parser.add_argument("-s", "--cubb_sdk", help="cuBB SDK folder")
@@ -964,7 +1276,7 @@ class cuMACTest:
                 args.cmake
                 if args.cmake is not None
                 #else "cmake -Bbuild -GNinja && cmake --build build"
-                else f"cmake -Bbuild -GNinja -DCMAKE_TOOLCHAIN_FILE={args.cubb_sdk}/cuPHY/cmake/toolchains/grace-cross && cmake --build build --target cumac_examples"
+                else f"cmake -Bbuild -GNinja -DCMAKE_TOOLCHAIN_FILE={args.cubb_sdk}/cuPHY/cmake/toolchains/grace-cross -DNVIPC_FMTLOG_ENABLE=ON && cmake --build build --target cumac_examples"
             ),
             "log_folder": (
                 args.log_folder if args.log_folder is not None else os.getcwd()
@@ -979,6 +1291,7 @@ class cuMACTest:
             "tv_index": args.tv_index,
             "gpu_id": args.gpu_id if args.gpu_id is not None else "0",
             "allow_bigger_cpu_gpu_gap": args.allow_bigger_cpu_gpu_gap,
+            "smoke": args.smoke,
         }
         test = cuMACTest(config)
         test.test_main()

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,6 +44,7 @@
 
 // Required includes for update_cell_command API
 #include "scf_5g_fapi.h"                   // For scf_fapi_pdcch_pdu_t
+#include "scf_5g_fh_callback_context.hpp"  // For scf_5g_fapi::LegacyCellGroupFhContext
 #include "slot_command/slot_command.hpp"    // For cell_group_command, cell_sub_command
 #include "nv_phy_fapi_msg_common.hpp"       // For slot_indication
 #include "nv_phy_config_option.hpp"         // For nv::phy_config_option
@@ -58,7 +59,7 @@
 // Forward declaration to avoid namespace conflicts from including scf_5g_slot_commands_pdcch.hpp
 namespace scf_5g_fapi {
     // Forward declare the types we need to avoid conflicts
-    using pm_weight_map_t = std::unordered_map<uint32_t, slot_command_api::pm_weights_t_>;
+    using pm_weight_map_t = std::unordered_map<uint32_t, slot_command_api::pm_weights_t>;
 
     // Extern declaration of the update_cell_command function with correct signature
 #ifdef ENABLE_L2_SLT_RSP
@@ -78,18 +79,18 @@ void update_cell_command(slot_command_api::cell_group_command* cell_group, slot_
                              nv::phy_config_option& config_option, pm_weight_map_t& pm_map, nv::slot_detail_t*  slot_detail, bool mmimo_enabled);
 
     void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd,
-                             scf_fapi_pdsch_pdu_t& msg, uint8_t testMode, slot_command_api::slot_indication& slotinfo,
+                             const scf_fapi_pdsch_pdu_t& msg, uint8_t testMode, slot_command_api::slot_indication& slotinfo,
                              int32_t cell_index, pm_weight_map_t& pm_map, bool pm_enabled, bool bf_enabled, uint16_t num_dl_prb,
                              bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t*  slot_detail);
 
     void update_cell_command(slot_command_api::cell_group_command* cell_grp_cmd, cell_sub_command& cell_cmd,
-                             scf_fapi_csi_rsi_pdu_t& msg, slot_command_api::slot_indication & slotinfo, int32_t cell_index,
+                             const scf_fapi_csi_rsi_pdu_t& msg, slot_command_api::slot_indication & slotinfo, int32_t cell_index,
                              cuphyCellStatPrm_t cell_params, nv::phy_config_option& config_option,
                              pm_weight_map_t& pm_map,uint32_t csirs_offset, bool pdsch_exist,
                              uint16_t cell_stat_prm_idx, bool mmimo_enabled, nv::slot_detail_t*  slot_detail);
 
     template <bool mplane_configured_ru_type, bool config_options_precoding_enabled, bool config_options_bf_enabled>
-    void fh_callback(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell_index);
+    void fh_callback(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
 }
 
 namespace aerial_fh {
@@ -256,8 +257,14 @@ void SendCPlaneUnitTest::Setup(int cell_index)
         NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Creating context_config structure...");
 
         // Read from the Cuphycontroller config file
+        std::string cuphy_yaml_name;
+        if (TestConfig::instance().is_nrsim()) {
+            cuphy_yaml_name = "cuphycontroller_nrSim_SCF_CG1_" + TestConfig::instance().pattern_number + ".yaml";
+        } else {
+            cuphy_yaml_name = "cuphycontroller_F08_CG1.yaml";
+        }
         char temp_config_file[MAX_PATH_LEN];
-        get_full_path_file(temp_config_file, CONFIG_YAML_FILE_PATH, "cuphycontroller_F08_CG1.yaml", CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+        get_full_path_file(temp_config_file, CONFIG_YAML_FILE_PATH, cuphy_yaml_name.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
 
         // Parse YAML config
         yaml::file_parser parser(temp_config_file);
@@ -270,7 +277,7 @@ void SendCPlaneUnitTest::Setup(int cell_index)
         ctx_cfg_.validation = 1;  // Enable validation mode for safer testing
         ctx_cfg_.fh_cpu_core = 0;
         ctx_cfg_.prometheus_cpu_core = 2;
-        ctx_cfg_.datalake_core = -1;
+        ctx_cfg_.data_core = -1;
         ctx_cfg_.mMIMO_enable = (config_node["cuphydriver_config"]["mMIMO_enable"].as<uint>() > 0);
 
         // DPDK configuration for testing
@@ -308,6 +315,8 @@ void SendCPlaneUnitTest::Setup(int cell_index)
 
         NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Creating Minimal PhydriverContext instance...");
         bool minimal = true;
+        cudaFree(0);
+        cudaSetDevice(ctx_cfg_.gpu_id);        
         // This is a minimally constructed phydriver object that is setup for FhProxy creation.
         ctx_ = std::make_unique<PhyDriverCtx>(ctx_cfg_, minimal);
         NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest PhyDriverCtx created successfully!");
@@ -391,8 +400,14 @@ void SendCPlaneUnitTest::Setup(int cell_index)
         Setup_bfwMemInfo(0);
 
         // Use pattern number from command line arguments
-        const char *argv[6] = {"ru_emulator", "F08", "1C", TestConfig::instance().pattern_number.c_str(), "--config", "config.yaml"};
-        ru_emulator_init(ru_emulator_, 6, (char **)argv);
+        if (TestConfig::instance().is_nrsim()) {
+            std::string ru_config = "ru_emulator_config_nrSim_SCF_CG1_" + TestConfig::instance().pattern_number + ".yaml";
+            const char *argv[5] = {"ru_emulator", "nrSim", TestConfig::instance().pattern_number.c_str(), "--config", ru_config.c_str()};
+            ru_emulator_init(ru_emulator_, 5, (char **)argv);
+        } else {
+            const char *argv[6] = {"ru_emulator", "F08", "1C", TestConfig::instance().pattern_number.c_str(), "--config", "config.yaml"};
+            ru_emulator_init(ru_emulator_, 6, (char **)argv);
+        }
         NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest RU Emulator instance initialized with pattern {}...",
                    TestConfig::instance().pattern_number);
 
@@ -476,14 +491,11 @@ void SendCPlaneUnitTest::Run(slot_command_api::slot_indication &slot_info)
 {
     NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Test Run Start...");
 
-    // Generate the FAPI messages for selected sfn/slot
     auto [run_dl_cplane, run_ul_cplane] = GenerateFapiMessagesForSlot(slot_info.sfn_,slot_info.slot_);
 
     if (run_dl_cplane) { // TODO support UL
-        // Execute L2A commands to process the FAPI PDU
         TestUpdateCellCommand(slot_info);
 
-        // Execute sendCPlane
         TestSendCPlaneComplete(slot_info);
     } else {
         NVLOGC_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Test Run skipped for SFN:{} SLT:{}...", slot_info.sfn_, slot_info.slot_);
@@ -510,7 +522,7 @@ void MockPeer::send_cplane_packets_dl(MbufArray& mbufs_bfw, MbufArray& mbufs_reg
     if (verify_cplane) {
         try {
             for (int i = 0; i < num_pkts; ++i) {
-                ru_emulator_verify_dl_cplane_content(ru_emulator_global, rte_pktmbuf_mtod(mbuf[i], uint8_t *), 0 /* cell_index */);
+                ru_emulator_verify_dl_cplane_content(ru_emulator_global, rte_pktmbuf_mtod(mbuf[i], uint8_t *), rte_pktmbuf_pkt_len(mbuf[i]), 0 /* cell_index */);
             }
         } catch (const std::exception& e) {
             NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT, "Error in {}:{}", __func__, e.what());
@@ -540,7 +552,7 @@ void MockPeer::send_cplane_packets_ul(MbufArray& mbufs_bfw, MbufArray& mbufs_reg
     if (verify_cplane) {
         try {
             for (int i = 0; i < num_pkts; ++i) {
-                ru_emulator_verify_dl_cplane_content(ru_emulator_global, rte_pktmbuf_mtod(mbuf[i], uint8_t *), 0 /* cell_index */);
+                ru_emulator_verify_dl_cplane_content(ru_emulator_global, rte_pktmbuf_mtod(mbuf[i], uint8_t *), rte_pktmbuf_pkt_len(mbuf[i]), 0 /* cell_index */);
             }
         } catch (const std::exception& e) {
             NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT, "Error in {}:{}", __func__, e.what());
@@ -566,7 +578,7 @@ void MockPeer::send_cplane_enqueue_nic(Txq *txq, rte_mbuf* mbuf[], size_t num_pk
     if (verify_cplane) {
         try {
             for (int i = 0; i < num_pkts; ++i) {
-                ru_emulator_verify_dl_cplane_content(ru_emulator_global, rte_pktmbuf_mtod(mbuf[i], uint8_t *), 0 /* cell_index */);
+                ru_emulator_verify_dl_cplane_content(ru_emulator_global, rte_pktmbuf_mtod(mbuf[i], uint8_t *), rte_pktmbuf_pkt_len(mbuf[i]), 0 /* cell_index */);
             }
         } catch (const std::exception& e) {
             NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT, "Error in {}:{}", __func__, e.what());
@@ -624,12 +636,11 @@ void SendCPlaneUnitTest::TestSendCPlaneComplete(slot_command_api::slot_indicatio
     slot_command_api::oran_slot_ind slot_indication = to_oran_slot_format(slot_ind);
 
     uint8_t* bfw_header_p = nullptr;
-    std::atomic<int> cplane_info_count{0};
 
     ti_subtask_info tis{};
     int cell_id = 0;
 
-    int ret = fh_proxy_->sendCPlane(
+    int ret = fh_proxy_->prepareCPlaneInfo(
         cell_id,                                    // cell_id
         MULTI_SECT_MODE,                            // ru_type
         peer_id_g,                                  // peer_id
@@ -646,16 +657,16 @@ void SendCPlaneUnitTest::TestSendCPlaneComplete(slot_command_api::slot_indicatio
         &bfw_header_p,                              // bfw_header
         t_ns(0),                                    // start_ch_task_time
         true,                                       // prevSlotBfwCompStatus
-        cplane_info_count,                          // cplane_info_for_uplane_rdy_count
         tis                                         // ti_info
     );
 
     // Verify successful completion
     ASSERT_TRUE(ret == SEND_CPLANE_NO_ERROR);
     if (ctx_cfg_.mMIMO_enable) {
-        // In the MMIMO code path, additional counters need to have been set by sendCPlane
-        ASSERT_TRUE(slot_info.section_id_ready.load() == true);  // Critical: Must be set by sendCPlane
-        ASSERT_TRUE(cplane_info_count.load() == 1);              // Should be incremented
+        int ret1 = fh_proxy_->sendCPlaneMMIMO (true /* isBFW */, cell_id, peer_id_g, DIRECTION_DOWNLINK, tis);  
+        int ret2 = fh_proxy_->sendCPlaneMMIMO (false /* isBFW */, cell_id, peer_id_g, DIRECTION_DOWNLINK, tis);  
+        ASSERT_TRUE(ret1 == SEND_CPLANE_NO_ERROR);  
+        ASSERT_TRUE(ret2 == SEND_CPLANE_NO_ERROR); 
     }
     NVLOGC_FMT(TAG_UNIT_TB_DLC, "Debug: sendCPlane completed successfully SFN:{} SLT:{}!", slot_ind.sfn_, slot_ind.slot_);
 
@@ -710,7 +721,6 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
     NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Test Starting {} - demonstrating parameter setup", __func__);
 
     try {
-
         // Create a mock PDCCH PDU
         scf_fapi_pdcch_pdu_t pdcch_pdu{};
         // Create cell parameters
@@ -734,8 +744,19 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
         ssb_cell_params.carrier_config_.dl_grid_size[4] = cell_configs.dlGridSize;
 
         // Read from the L2A config file
+        std::string l2a_yaml_name;
+        if (TestConfig::instance().is_nrsim()) {
+            std::string cuphy_cfg_name = "cuphycontroller_nrSim_SCF_CG1_" + TestConfig::instance().pattern_number + ".yaml";
+            char cuphy_cfg_path[MAX_PATH_LEN];
+            get_full_path_file(cuphy_cfg_path, CONFIG_YAML_FILE_PATH, cuphy_cfg_name.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+            yaml::file_parser cuphy_parser(cuphy_cfg_path);
+            yaml::document cuphy_doc = cuphy_parser.next_document();
+            l2a_yaml_name = cuphy_doc.root()["l2adapter_filename"].as<std::string>();
+        } else {
+            l2a_yaml_name = "l2_adapter_config_F08_CG1.yaml";
+        }
         char temp_config_file[MAX_PATH_LEN];
-        get_full_path_file(temp_config_file, CONFIG_YAML_FILE_PATH, "l2_adapter_config_F08_CG1.yaml", CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+        get_full_path_file(temp_config_file, CONFIG_YAML_FILE_PATH, l2a_yaml_name.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
 
         // Parse YAML config
         yaml::file_parser parser(temp_config_file);
@@ -766,8 +787,10 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
         nv::slot_detail_t* slot_detail = nullptr; // No slot detail for this test
         const bool mmimo_enabled = ctx_cfg_.mMIMO_enable;        // Enable mMIMO
 
-        // Create a local precoding matrix map with the correct type
-        auto pm_map = nv::PHY_module::pm_map();
+        auto& pm_map = nv::PHY_module::pm_map();
+
+        // Ensure pm_group is created for precoding-enabled nrSim patterns
+        cell_group_.create_pm_group(config_options.precoding_enabled, 1);
 
         // Makes an instance with phydriverctx that just stores our
         // modified fh_proxy_ -> this allows L2A APIs to execute
@@ -827,12 +850,7 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
                 }
                 case DL_TTI_PDU_TYPE_PDSCH:
                 {
-
                     if (constructed_bfw_memory == false && mmimo_enabled == true) {
-                        // When PDSCH PDU is encountered, the prior slot is
-                        // expected to have sent a BFW_DL PDU for the GPU kernel
-                        // to generate the BFW. This TB doesn't include GPU, so a
-                        // one-shot construction of BFW memory with the BFW (from the tv)
                         std::vector<uint8_t*> bfw_start_ptr_vec{};
                         ru_emulator_construct_bfw(ru_emulator_, slot_info.sfn_, slot_info.slot_, 0 /* cell id */, bfw_start_ptr_vec);
                         int ueg_idx = 0;
@@ -998,19 +1016,23 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
         if (run_fh_cb) {
             if ((!config_options.precoding_enabled) && (!config_options.bf_enabled))
             {
-                scf_5g_fapi::fh_callback<true /* mplane_configured_ru_type */,false /* config_options_precoding_enabled */,false /*config_options_bf_enabled */>(&cell_group_, slot_detail, cell_index);
+                scf_5g_fapi::LegacyCellGroupFhContext fh_context(cell_group_, cell_index);
+                scf_5g_fapi::fh_callback<true /* mplane_configured_ru_type */,false /* config_options_precoding_enabled */,false /*config_options_bf_enabled */>(fh_context, slot_detail);
             }
             else if ((!config_options.precoding_enabled) && (config_options.bf_enabled))
             {
-                scf_5g_fapi::fh_callback<true /* mplane_configured_ru_type */,false /* config_options_precoding_enabled */,true /*config_options_bf_enabled */>(&cell_group_, slot_detail, cell_index);
+                scf_5g_fapi::LegacyCellGroupFhContext fh_context(cell_group_, cell_index);
+                scf_5g_fapi::fh_callback<true /* mplane_configured_ru_type */,false /* config_options_precoding_enabled */,true /*config_options_bf_enabled */>(fh_context, slot_detail);
             }
             else if ((config_options.precoding_enabled) && (!config_options.bf_enabled))
             {
-                scf_5g_fapi::fh_callback<true /* mplane_configured_ru_type */,true /* config_options_precoding_enabled */,false /*config_options_bf_enabled */>(&cell_group_, slot_detail, cell_index);
+                scf_5g_fapi::LegacyCellGroupFhContext fh_context(cell_group_, cell_index);
+                scf_5g_fapi::fh_callback<true /* mplane_configured_ru_type */,true /* config_options_precoding_enabled */,false /*config_options_bf_enabled */>(fh_context, slot_detail);
             }
             else // ((config_options.precoding_enabled) && (config_options.bf_enabled))
             {
-                scf_5g_fapi::fh_callback<true /* mplane_configured_ru_type */,true /* config_options_precoding_enabled */,true /*config_options_bf_enabled */>(&cell_group_, slot_detail, cell_index);
+                scf_5g_fapi::LegacyCellGroupFhContext fh_context(cell_group_, cell_index);
+                scf_5g_fapi::fh_callback<true /* mplane_configured_ru_type */,true /* config_options_precoding_enabled */,true /*config_options_bf_enabled */>(fh_context, slot_detail);
             }
         }
 
@@ -1073,8 +1095,13 @@ void SendCPlaneUnitTest::Setup_TestMAC_Integration()
     // Create testMAC configs with yaml::node
     testmac_configs_ = std::make_shared<test_mac_configs>(config_node);
 
-    // Build pattern filename dynamically
-    std::string pattern_file = "launch_pattern_F08_1C_" + TestConfig::instance().pattern_number + ".yaml";
+    // Build pattern filename dynamically based on pattern type
+    std::string pattern_file;
+    if (TestConfig::instance().is_nrsim()) {
+        pattern_file = "launch_pattern_nrSim_" + TestConfig::instance().pattern_number + ".yaml";
+    } else {
+        pattern_file = "launch_pattern_F08_1C_" + TestConfig::instance().pattern_number + ".yaml";
+    }
 
     // Create and parse launch pattern
     launch_pattern_ = new launch_pattern(testmac_configs_.get());
@@ -1316,7 +1343,12 @@ static std::vector<int> GenerateLaunchPatternSlots() {
         return std::vector<int>{};
     }
 
-    std::string pattern_file = "launch_pattern_F08_1C_" + pattern_num + ".yaml";
+    std::string pattern_file;
+    if (TestConfig::instance().is_nrsim()) {
+        pattern_file = "launch_pattern_nrSim_" + pattern_num + ".yaml";
+    } else {
+        pattern_file = "launch_pattern_F08_1C_" + pattern_num + ".yaml";
+    }
 
     char pattern_file_array[MAX_PATH_LEN];
     get_full_path_file(pattern_file_array, CONFIG_LAUNCH_PATTERN_PATH, pattern_file.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
@@ -1361,7 +1393,7 @@ std::unique_ptr<aerial_fh::SendCPlaneUnitTest> g_benchmark_test_instance = nullp
 /**
  * Benchmark setup/teardown for sendCPlane benchmarks
  */
-static void BenchmarkGlobalSetup(const ::benchmark::State& state) {
+static void BenchmarkGlobalSetup() {
     // Initialize test instance once (check if already initialized)
     if (!g_benchmark_test_instance) {
 
@@ -1410,19 +1442,33 @@ void RegisterDynamicBenchmarks() {
         return;
     }
 
+    BenchmarkGlobalSetup(); 
+
     NVLOGC_FMT(TAG_UNIT_TB_COMMON, "Registering {} slot benchmarks", slots.size());
 
-    // Register a benchmark for each slot
-    for (const auto& slot : slots) {
-        const uint16_t sfn = slot / 20;
-        const uint16_t slot_num = slot % 20;
-        const std::string bench_name = fmt::format("SendCPlane_{}/{}", sfn, slot_num);
+    // Register a benchmark for each slot (only DL slots)
+    for (const auto& lp_slot : slots) {
+        const uint16_t sfn = lp_slot / 20;
+        const uint16_t slot = lp_slot % 20;
+
+        // Pre-check if this slot has DL C-Plane (avoid registering UL-only slots)
+        auto [run_dl, run_ul] = g_benchmark_test_instance->GenerateFapiMessagesForSlot(sfn, slot);
+        g_benchmark_test_instance->Reset();  // Clean up after check
+        
+        if (!run_dl) {
+            NVLOGC_FMT(TAG_UNIT_TB_COMMON, "Skipping UL-only slot {}/{} from benchmark registration", sfn, slot);
+            continue;  // Skip UL-only slots
+        }
+
+        const string bench_name = fmt::format("SendCPlane_{}_{}", sfn, slot); 
 
         ::benchmark::RegisterBenchmark(
             bench_name.c_str(),
-            [slot, bench_name](benchmark::State& state) {
-                const uint16_t sfn = slot / 20;
-                const uint16_t slot_num = slot % 20;
+            [lp_slot, bench_name](benchmark::State& state) {
+                const uint16_t sfn = lp_slot / 20;
+                const uint16_t slot = lp_slot  % 20;
+                
+                // thrash_cache();
 
                 NVLOGC_FMT(TAG_UNIT_TB_COMMON, "[BENCHMARK] Starting {} benchmark!", bench_name);
                 fmtlog::poll(true);  // Flush immediately
@@ -1433,20 +1479,15 @@ void RegisterDynamicBenchmarks() {
                 slot_info.slot_ = slot;
 
                 // Prepare FAPI messages once before benchmark loop
+                // Note: UL-only slots are filtered out during registration, so this slot has DL C-Plane
                 auto [run_dl_cplane, run_ul_cplane] = g_benchmark_test_instance->GenerateFapiMessagesForSlot(sfn, slot);
-
-                if (!run_dl_cplane)
-                {
-                    state.SkipWithError("Reason for skipping iteration (Not a DL slot)");
-                    return;
-                }
 
                 g_benchmark_test_instance->TestUpdateCellCommand(slot_info);
 
                 // Flush all setup logs before starting benchmark iterations
                 fmtlog::poll(true);
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                int cell_id = 0;
+                const int cell_id = 0;
 
                 slot_info.tick_ = ::Time::nowNs().count(); // Update timestamp each iteration
 
@@ -1472,13 +1513,10 @@ void RegisterDynamicBenchmarks() {
                     slot_command_api::oran_slot_ind slot_indication = to_oran_slot_format(slot_info);
 
                     uint8_t* bfw_header = nullptr;
-                    std::atomic<int> cplane_info_count{0};
                     ti_subtask_info tis{};
 
-                    // thrash_cache(10);
-
                     state.ResumeTiming();
-                    int ret = aerial_fh::fh_proxy_->sendCPlane(
+                    int ret = aerial_fh::fh_proxy_->prepareCPlaneInfo(
                         0,                                  // cell_id
                         MULTI_SECT_MODE,                    // ru_type
                         aerial_fh::peer_id_g,               // peer_id
@@ -1495,13 +1533,21 @@ void RegisterDynamicBenchmarks() {
                         &bfw_header,                        // bfw_header
                         t_ns(0),                            // start_ch_task_time
                         true,                               // prevSlotBfwCompStatus
-                        cplane_info_count,                  // cplane_info_for_uplane_rdy_count
                         tis                                 // ti_info
                     );
+                    
+                    if (g_benchmark_test_instance->get_ctx_cfg().mMIMO_enable) {
+                        int ret1 = aerial_fh::fh_proxy_->sendCPlaneMMIMO (true /* isBFW */, 0, aerial_fh::peer_id_g, DIRECTION_DOWNLINK, tis);  
+                        int ret2 = aerial_fh::fh_proxy_->sendCPlaneMMIMO (false /* isBFW */, 0, aerial_fh::peer_id_g, DIRECTION_DOWNLINK, tis);  
+                        if (ret1 != SEND_CPLANE_NO_ERROR || ret2 != SEND_CPLANE_NO_ERROR) {
+                            state.SkipWithError("prepareCPlaneInfo failed!");
+                            break;
+                        }
+                    }
 
                     // Verify successful completion
                     if (ret != SEND_CPLANE_NO_ERROR) {
-                        state.SkipWithError("sendCPlane failed!");
+                        state.SkipWithError("prepareCPlaneInfo failed!");
                         break;
                     }
                 }
@@ -1512,17 +1558,19 @@ void RegisterDynamicBenchmarks() {
 
                 // Report additional statistics
                 state.SetItemsProcessed(state.iterations());
-                state.SetLabel(fmt::format("{}_{}", sfn, slot));
+                state.SetLabel(bench_name);
 
                 NVLOGC_FMT(TAG_UNIT_TB_COMMON, "[BENCHMARK] Completed {} benchmark: {} iterations!", bench_name, state.iterations());
+                fmtlog::poll(true);
+
+                // Cleanup after benchmark
+                g_benchmark_test_instance->Reset();
             }
         )
         ->Unit(benchmark::kMicrosecond)
-        ->Iterations(200000)
-        ->DisplayAggregatesOnly(false)
-        ->Setup(BenchmarkGlobalSetup)
-        ->Teardown(BenchmarkGlobalTeardown)
-        ->Complexity();
+        // ->Repetitions(10) // Turn this ON to repeat the benchmark several times. Provides mean/std-dev statistics
+        ->Iterations(200000) 
+        ->DisplayAggregatesOnly(false);
     }
 }
 } // namespace aerial_fh

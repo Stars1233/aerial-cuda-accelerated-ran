@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -524,7 +524,7 @@ namespace cumac {
         m_cdlCfg = std::make_unique<cdlConfig_t>();
         // check antenna size configuration
         assert(nBsAnt == std::accumulate(bsAntSize.begin(), bsAntSize.end(), 1U, std::multiplies<uint32_t>()));
-        assert(nBsAnt == std::accumulate(ueAntSize.begin(), ueAntSize.end(), 1U, std::multiplies<uint32_t>()));
+        assert(nUeAnt == std::accumulate(ueAntSize.begin(), ueAntSize.end(), 1U, std::multiplies<uint32_t>()));
         // default CDLA30-5-Low
         m_cdlCfg->delayProfile = 'A';
         m_cdlCfg->delaySpread = 30;
@@ -2941,11 +2941,28 @@ void network::copyCellAssocResGpu2Cpu(cudaStream_t strm)
     bool matchMcsSel    = true;
     bool matchPrg       = true;
 
-    for (int uIdx = 0; uIdx<nUe; uIdx++) {
-        if (schdSolCpu->setSchdUePerCellTTI[ueSelIdxCpu[uIdx]] != setSchdUePerCellTTI[ueSelIdxGpu[uIdx]]) {
-            matchUeSel = false;
-        }
+    // Per-cell set comparison for UE selection (order of selected UEs in each cell can be different)
+    for (int cIdx = 0; cIdx < nCell; cIdx++) {
+        int offset = cIdx * numUeSchdPerCellTTI;
 
+        std::vector<uint16_t> cpuSet(schdSolCpu->setSchdUePerCellTTI + offset,
+                                     schdSolCpu->setSchdUePerCellTTI + offset + numUeSchdPerCellTTI);
+        std::vector<uint16_t> gpuSet(setSchdUePerCellTTI.get() + offset,
+                                     setSchdUePerCellTTI.get() + offset + numUeSchdPerCellTTI);
+
+        std::sort(cpuSet.begin(), cpuSet.end());
+        std::sort(gpuSet.begin(), gpuSet.end());
+
+        if (cpuSet != gpuSet) {
+            matchUeSel = false;
+            printf("Failure: CPU and GPU UE selection mismatch at cell %d\n", cIdx);
+            for (int uIdx = 0; uIdx < numUeSchdPerCellTTI; uIdx++) {
+                printf("  cell %d, uIdx %d: CPU = %d, GPU = %d\n", cIdx, uIdx, cpuSet[uIdx], gpuSet[uIdx]);
+            }
+        }
+    }
+    
+    for (int uIdx = 0; uIdx<nUe; uIdx++) {
         if (schdSolCpu->layerSelSol[ueSelIdxCpu[uIdx]] != layerSelSol[ueSelIdxGpu[uIdx]]) {
             matchLayerSel = false;
         }

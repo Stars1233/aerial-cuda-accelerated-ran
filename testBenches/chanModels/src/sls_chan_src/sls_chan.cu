@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,9 +85,20 @@ slsChan<Tscalar, Tcomplex>::slsChan(const SimConfig* simConfig, const SystemLeve
     , m_rxSigOut(nullptr)
     , m_d_curandStates(nullptr)
     , m_maxCurandStates(0)
+    , m_d_stParams(nullptr)
+    , m_d_spstParams(nullptr)
+    , m_d_spstOffsets(nullptr)
+    , m_d_sensingChannelRCS(nullptr)
+    , m_totalSpstCount(0)
 {
     // Perform BS and UE dropping
     bsUeDropping();
+    
+    // Perform sensing target dropping if ISAC is enabled
+    if (m_sysConfig->isac_type == 1 || m_sysConfig->isac_type == 2) {
+        stDropping();
+    }
+    
 #ifdef SLS_DEBUG_
     dumpTopologyToYaml("network_topology.yaml");
 #endif
@@ -103,6 +114,9 @@ slsChan<Tscalar, Tcomplex>::slsChan(const SimConfig* simConfig, const SystemLeve
     m_linkParams.resize(m_topology.nSite * m_topology.nUT);
     // Initialize cluster parameters vector with the correct size
     m_clusterParams.resize(m_topology.nSite * m_topology.nUT);
+    
+    // Initialize ISAC-specific reference points / links (monostatic or bistatic)
+    initializeIsacParams();
     
     // Find BS boundaries first
     findBsBoundary(m_topology.cellParams, m_topology.ISD, m_maxX, m_minX, m_maxY, m_minY);
@@ -120,10 +134,21 @@ slsChan<Tscalar, Tcomplex>::slsChan(const SimConfig* simConfig, const SystemLeve
     // generate CRN and calculate link/cluster parameters
     if (m_simConfig->cpu_only_mode == 1) {
         generateCRN();
+        // Generate RP clusters after CRN is ready (monostatic ISAC only)
+        if (m_sysConfig->isac_type == 1) {
+            generateRpClusters();
+        }
         calLinkParam();
+        if (m_sysConfig->isac_type > 0 && m_topology.nST > 0) {
+            calculateAllTargetLinkParams();
+        }
         calClusterRay();
     } else {
         generateCRNGPU();
+        // Generate RP clusters after CRN is ready (monostatic ISAC only)
+        if (m_sysConfig->isac_type == 1) {
+            generateRpClusters();
+        }
         calLinkParamGPU();
         calClusterRayGPU();
     }
@@ -143,6 +168,18 @@ void slsChan<Tscalar, Tcomplex>::run(const float refTime,
                                     const std::vector<Tcomplex*>& cfrScPerCell,
                                     const std::vector<Tcomplex*>& cfrPrbgPerCell)
 {
+    // Use previous refTime to compute mobility delta_t.
+    // This prevents integrating mobility from time 0 on every run().
+    float mobilityRefTime = refTime;
+    if (m_hasPrevRefTime) {
+        mobilityRefTime = m_prevRefTime;
+        // Guard against non-monotonic time to avoid negative delta_t in mobility helpers.
+        if (refTime < mobilityRefTime) {
+            mobilityRefTime = refTime;
+        }
+    }
+    m_prevRefTime = refTime;
+    m_hasPrevRefTime = true;
     m_refTime = refTime;
 
     // Update UT locations if provided
@@ -175,6 +212,62 @@ void slsChan<Tscalar, Tcomplex>::run(const float refTime,
             }
         }
     }
+
+    // If no external UT updates were provided, advance UE mobility using built-in model
+    // This applies straight-line motion with redirection and optional wrap-around.
+    if (utNewLoc.empty() && utNewVelocity.empty()) {
+        if (m_sysConfig && m_sysConfig->enable_ue_mobility_wraparound == 1) {
+            // Wrap-around enabled (only valid for 1, 7, or 19 sites)
+            const uint32_t numTiers = m_sysConfig->getNumTiers();
+            updateAllUtLocationsWithWrapAround(
+                m_topology.utParams,
+                m_refTime,
+                mobilityRefTime,  // reference time (previous run)
+                m_topology.cellParams,
+                m_topology.minBsUeDist2d,
+                numTiers,
+                m_sysConfig->isd,
+                true,            // enable wrap-around
+                m_randSeed       // seed for direction changes
+            );
+        } else {
+            // No wrap-around
+            updateAllUtLocations(
+                m_topology.utParams,
+                m_refTime,
+                mobilityRefTime,  // reference time (previous run)
+                m_topology.cellParams,
+                m_topology.minBsUeDist2d,
+                m_randSeed
+            );
+        }
+
+        // Mobility changed positions; recompute link params
+        m_updatePerTTILinkParams = true;
+
+        // Update UT params on GPU if needed
+        if (m_simConfig->cpu_only_mode == 0) {
+            CHECK_CUDAERROR(cudaMemcpyAsync(
+                m_d_utParams,
+                m_topology.utParams.data(),
+                m_topology.utParams.size() * sizeof(UtParam),
+                cudaMemcpyHostToDevice,
+                m_strm));
+        }
+    }
+
+#ifdef SHOW_TRAJECTORY
+    // SHOW_TRAJECTORY: UE positions/velocities after applying mobility updates
+    printf("SHOW_TRAJECTORY: t=%.6f dt=%.6f UE locations (nUT=%u)\n",
+           m_refTime, (m_refTime - mobilityRefTime), m_topology.nUT);
+    for (uint32_t i = 0; i < m_topology.utParams.size(); ++i) {
+        const auto& ut = m_topology.utParams[i];
+        printf("  UE uid=%u loc=(%.3f, %.3f, %.3f) vel=(%.3f, %.3f, %.3f)\n",
+               ut.uid,
+               ut.loc.x, ut.loc.y, ut.loc.z,
+               ut.velocity[0], ut.velocity[1], ut.velocity[2]);
+    }
+#endif
 
     // update UT new location and velocity to GPU (GPU mode only)
     if (m_simConfig->cpu_only_mode == 0) {
@@ -227,6 +320,92 @@ void slsChan<Tscalar, Tcomplex>::run(const float refTime,
     
     // Update active link indices based on active cells and UTs
     updateActiveLinkInd(activeCell, activeUt);
+
+    // Update target locations and link parameters if needed
+    // Regeneration trigger shared by comm LSPs and ISAC links
+    const bool needLinkUpdate = (!continuous_fading) || m_updatePerTTILinkParams;
+
+    // Prepare ISAC CIR config (populated only if ISAC is enabled)
+    IsacCirConfig isacConfig{};
+
+    // ============================================================
+    // ISAC: Generate Target Channel link parameters
+    // ============================================================
+    if (m_sysConfig->isac_type > 0 && m_topology.nST > 0) {
+        // ISAC channel combination currently requires CPU mode
+        // GPU implementation is TODO
+        if (m_simConfig->cpu_only_mode != 1) {
+            throw std::runtime_error("ISAC channel model requires cpu_only_mode=1. "
+                                     "GPU mode not yet supported for ISAC.");
+        }
+#ifdef SLS_DEBUG_
+        printf("DEBUG: ISAC enabled (type=%d), generating target channel for %u STs\n", 
+               m_sysConfig->isac_type, m_topology.nST);
+#endif
+        // ISAC reference points/links are initialized in constructor
+        
+        // Update target locations based on mobility
+        updateAllTargetLocations(m_topology.stParams, m_refTime, mobilityRefTime);
+
+        // Optional wrap-around for sensing targets (STs)
+        if (m_sysConfig && m_sysConfig->enable_st_mobility_wraparound == 1) {
+            const uint32_t numTiers = m_sysConfig->getNumTiers();  // validates 1/7/19 sites
+            for (auto& st : m_topology.stParams) {
+                applyWrapAroundToUe(st.loc, numTiers, m_sysConfig->isd, true);
+            }
+        }
+
+#ifdef SHOW_TRAJECTORY
+        // SHOW_TRAJECTORY: ST positions after applying mobility updates
+        printf("SHOW_TRAJECTORY: t=%.6f dt=%.6f ST locations (nST=%u)\n",
+               m_refTime, (m_refTime - mobilityRefTime), m_topology.nST);
+        for (uint32_t i = 0; i < m_topology.stParams.size(); ++i) {
+            const auto& st = m_topology.stParams[i];
+            printf("  ST sid=%u loc=(%.3f, %.3f, %.3f) vel=(%.3f, %.3f, %.3f) n_spst=%u\n",
+                   st.sid,
+                   st.loc.x, st.loc.y, st.loc.z,
+                   st.velocity[0], st.velocity[1], st.velocity[2],
+                   st.n_spst);
+        }
+#endif
+
+        // Regenerate target link params when fading resets / per-TTI updates
+        if (needLinkUpdate) {
+            calculateAllTargetLinkParams();
+            m_targetChannelParams.nTargetLinks = static_cast<uint32_t>(m_targetChannelParams.targetLinks.size());
+        }
+        
+#ifdef SLS_DEBUG_
+        printf("DEBUG: Calculated %u target links\n", m_targetChannelParams.nTargetLinks);
+#endif
+        
+        // Build ISAC CIR config on the fly
+        uint32_t total_spst = 0;
+        for (const auto& st : m_topology.stParams) {
+            total_spst += st.n_spst;
+        }
+        isacConfig.n_spst_total = total_spst;
+        isacConfig.n_st = m_topology.nST;
+        isacConfig.is_monostatic = (m_sysConfig->isac_type == 1);
+        isacConfig.isac_enabled = (m_sysConfig->isac_type > 0) && (total_spst > 0);
+        isacConfig.disable_background = (m_sysConfig->isac_disable_background == 1);
+        isacConfig.disable_target = (m_sysConfig->isac_disable_target == 1);
+        // Store background CIR dimensions and tap count
+        // For monostatic: use ISAC antenna panels (64×64), bg uses 32 taps
+        // For bistatic: use comm link dimensions (UE×BS), bg uses 24 taps
+        if (m_sysConfig->isac_type == 1 && !m_targetChannelParams.monostaticRefPoints.empty()) {
+            const auto& ref = m_targetChannelParams.monostaticRefPoints.front();
+            isacConfig.bg_n_rx_ant = (*m_antPanelConfig)[ref.srx_ant_panel_idx].nAnt;
+            isacConfig.bg_n_tx_ant = (*m_antPanelConfig)[ref.stx_ant_panel_idx].nAnt;
+            // Monostatic background: 3 RPs × 24 = 72 taps stride, but per-component stays 24
+            isacConfig.bg_stride = ISAC_NUM_REFERENCE_POINTS * ISAC_BG_MAX_TAPS;  // 72 for buffer stride
+        } else {
+            isacConfig.bg_n_rx_ant = m_cmnLinkParams.nUeAnt;
+            isacConfig.bg_n_tx_ant = m_cmnLinkParams.nBsAnt;
+            // bg_max_taps defaults to ISAC_BG_MAX_TAPS (24)
+        }
+        isacConfig.updateTotalMaxTaps();
+    }
     
 #ifdef SLS_DEBUG_
     // Debug: Print m_activeLinkParams after updateActiveLinkInd
@@ -248,7 +427,7 @@ void slsChan<Tscalar, Tcomplex>::run(const float refTime,
     }
 
     // Regenerate large scale parameters if not in continuous fading mode or location changed
-    if (!continuous_fading || m_updatePerTTILinkParams) {
+    if (needLinkUpdate) {
         m_updatePLAndPenetrationLoss = m_sysConfig->enable_per_tti_lsp >= 1;
         m_updateAllLSPs = m_sysConfig->enable_per_tti_lsp == 2;
         if (m_simConfig->cpu_only_mode == 1) {
@@ -277,7 +456,7 @@ void slsChan<Tscalar, Tcomplex>::run(const float refTime,
         CHECK_CUDAERROR(cudaStreamSynchronize(m_strm));
     }
     
-    // Generate Channel Impulse Response (CIR)
+    // Generate Channel Impulse Response (CIR) - Background Channel
     if (m_simConfig->cpu_only_mode == 1) {
         generateCIR();
     } else {
@@ -286,6 +465,114 @@ void slsChan<Tscalar, Tcomplex>::run(const float refTime,
     // Synchronize stream for all processing (GPU mode only)
     if (m_simConfig->cpu_only_mode == 0) {
         CHECK_CUDAERROR(cudaStreamSynchronize(m_strm));
+    }
+
+    
+    // ISAC channel combination currently requires CPU mode
+    if (m_sysConfig->isac_type > 0 && m_topology.nST > 0) {
+        if (m_simConfig->cpu_only_mode != 1) {
+            throw std::runtime_error("ISAC channel generation currently requires cpu_only_mode=1");
+        }
+        // Generate target CIR and combine with background for each active link
+        const float lambda_0 = 3e8f / m_simConfig->center_freq_hz;
+        const float sampleRate = m_simConfig->sc_spacing_hz * m_simConfig->fft_size;
+        
+        // Get ISAC antenna panel configs
+        uint32_t txAntIdx = (m_topology.cellParams.empty() ? 0 : m_topology.cellParams[0].antPanelIdx);
+        uint32_t rxAntIdx = (m_topology.utParams.empty() ? 0 : m_topology.utParams[0].antPanelIdx);
+        if (m_sysConfig->isac_type == 1 && !m_targetChannelParams.monostaticRefPoints.empty()) {
+            const auto& ref = m_targetChannelParams.monostaticRefPoints.front();
+            txAntIdx = ref.stx_ant_panel_idx;
+            rxAntIdx = ref.srx_ant_panel_idx;
+        }
+        const AntPanelConfig& txCfg = (*m_antPanelConfig)[txAntIdx];
+        const AntPanelConfig& rxCfg = (*m_antPanelConfig)[rxAntIdx];
+        const uint32_t combTxAnt = txCfg.nAnt;
+        const uint32_t combRxAnt = rxCfg.nAnt;
+        
+        // Generate monostatic background CIR (BS -> RPs) if monostatic mode
+        if (m_sysConfig->isac_type == 1 && !m_targetChannelParams.monostaticRefPoints.empty()) {
+            const auto& ref = m_targetChannelParams.monostaticRefPoints.front();
+            
+            // Build background params from reference point
+            MonostaticBackgroundParams bgParams;
+            bgParams.bs_id = ref.bs_id;
+            bgParams.stx_srx_loc = ref.stx_loc;  // Same as srx_loc for monostatic
+            bgParams.stx_srx_height = ref.stx_loc.z;
+            bgParams.scenario = static_cast<Scenario>(m_sysConfig->scenario);
+            
+            // Copy the 3 reference points (they were generated in initializeMonostaticRefPoints)
+            for (int i = 0; i < 3; ++i) {
+                bgParams.rps[i] = ref.background_rps[i];
+            }
+            
+            generateMonostaticBackgroundCIR(
+                bgParams,
+                txCfg,
+                rxCfg,
+                m_simConfig->center_freq_hz,
+                lambda_0,
+                m_simConfig->n_snapshot_per_slot,
+                m_refTime,
+                sampleRate,
+                m_monostaticBackgroundCIR
+            );
+        }
+        
+        // Generate target CIR (all STs combined)
+        generateTargetCIR(
+            m_targetChannelParams.targetLinks,
+            txCfg,
+            rxCfg,
+            m_simConfig->n_snapshot_per_slot,
+            m_refTime,
+            lambda_0,
+            sampleRate,
+            isacConfig,
+            m_targetCIR
+        );
+        
+        // Combine background and target CIR
+        // For monostatic: write to m_cirCoe (allocated with 64x64 dimensions)
+        // For bistatic: use communication link CIR
+        if (m_sysConfig->isac_type == 1 && m_monostaticBackgroundCIR.cirCoe != nullptr) {
+            // Monostatic: combine once and write to internal buffer
+            // m_cirCoe was allocated with effective antenna counts (64×64)
+            combineBackgroundAndTargetCIR(
+                m_monostaticBackgroundCIR.cirCoe, m_monostaticBackgroundCIR.cirNormDelay, m_monostaticBackgroundCIR.cirNtaps,
+                m_targetCIR.cirCoe, m_targetCIR.cirNormDelay, m_targetCIR.cirNtaps,
+                m_cirCoe, m_cirNormDelay, m_cirNtaps,
+                combRxAnt, combTxAnt,
+                m_simConfig->n_snapshot_per_slot,
+                isacConfig
+            );
+        } else {
+            // Bistatic or non-ISAC: combine per active link
+            for (size_t activeLinkIdx = 0; activeLinkIdx < m_activeLinkParams.size(); ++activeLinkIdx) {
+                auto& activeLink = m_activeLinkParams[activeLinkIdx];
+                const size_t combinedCoeSize = static_cast<size_t>(m_simConfig->n_snapshot_per_slot) *
+                                               combRxAnt * combTxAnt * isacConfig.total_max_taps;
+                std::vector<cuComplex> combinedCirCoe(combinedCoeSize);
+                std::vector<uint16_t> combinedCirNormDelay(isacConfig.total_max_taps, 0);
+                uint16_t combinedCirNtaps = 0;
+                combineBackgroundAndTargetCIR(
+                    activeLink.cirCoe, activeLink.cirNormDelay, activeLink.cirNtaps,
+                    m_targetCIR.cirCoe, m_targetCIR.cirNormDelay, m_targetCIR.cirNtaps,
+                    combinedCirCoe.data(), combinedCirNormDelay.data(), &combinedCirNtaps,
+                    combRxAnt, combTxAnt,
+                    m_simConfig->n_snapshot_per_slot,
+                    isacConfig
+                );
+                std::memcpy(activeLink.cirCoe, combinedCirCoe.data(), combinedCoeSize * sizeof(cuComplex));
+                std::memcpy(activeLink.cirNormDelay, combinedCirNormDelay.data(),
+                            static_cast<size_t>(isacConfig.total_max_taps) * sizeof(uint16_t));
+                activeLink.cirNtaps[0] = combinedCirNtaps;
+            }
+        }
+        
+#ifdef SLS_DEBUG_
+        printf("DEBUG: Target channel generation and combination completed\n");
+#endif
     }
 
     // Generate Channel Frequency Response (CFR) if run_mode > 0
@@ -364,8 +651,10 @@ template <typename Tscalar, typename Tcomplex>
 void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEnding)
 {
     // Create HDF5 file with optional filename ending
+    // Include random seed in filename for multi-drop analysis (e.g., _seed42)
     std::string outFilename = "slsChanData_" + std::to_string(m_topology.nSite) + "sites_" + 
-                             std::to_string(m_topology.nUT) + "uts" + std::string(filenameEnding) + ".h5";
+                             std::to_string(m_topology.nUT) + "uts" + std::string(filenameEnding) + 
+                             "_seed" + std::to_string(m_randSeed) + ".h5";
     hid_t slsH5File = H5Fcreate(outFilename.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
     if (slsH5File < 0) {
         fprintf(stderr, "Failed to create HDF5 file: %s\n", outFilename.c_str());
@@ -374,9 +663,11 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
 
     // Calculate total number of links
     const uint32_t nTotalLinks = m_topology.nSite * m_topology.nUT;
+
+    const std::uint8_t h5_dump_level = (m_simConfig != nullptr) ? m_simConfig->h5_dump_level : 1;
     
     // Dump Link Parameters
-    if (!m_linkParams.empty() && m_linkParams.size() >= nTotalLinks) {
+    if (h5_dump_level >= 1 && !m_linkParams.empty() && m_linkParams.size() >= nTotalLinks) {
         // Create compound datatype for LinkParams
         hid_t linkParamsType = H5Tcreate(H5T_COMPOUND, sizeof(LinkParams));
         H5Tinsert(linkParamsType, "d2d", HOFFSET(LinkParams, d2d), H5T_NATIVE_FLOAT);
@@ -417,7 +708,7 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
     }
 
     // Dump Cluster Parameters
-    if (!m_clusterParams.empty() && m_clusterParams.size() >= nTotalLinks) {
+    if (h5_dump_level >= 1 && !m_clusterParams.empty() && m_clusterParams.size() >= nTotalLinks) {
         // Create compound datatype for ClusterParams
         hid_t clusterParamsType = H5Tcreate(H5T_COMPOUND, sizeof(ClusterParams));
         H5Tinsert(clusterParamsType, "nCluster", HOFFSET(ClusterParams, nCluster), H5T_NATIVE_UINT16);
@@ -473,7 +764,7 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
 #ifdef SLS_DEBUG_
     printf("DEBUG: m_activeLinkParams.size() = %zu\n", m_activeLinkParams.size());
 #endif
-    if (!m_activeLinkParams.empty()) {
+    if (h5_dump_level >= 1 && !m_activeLinkParams.empty()) {
         // Create compound datatype for activeLink
         hid_t activeLinkType = H5Tcreate(H5T_COMPOUND, sizeof(activeLink<Tcomplex>));
         H5Tinsert(activeLinkType, "cid", HOFFSET(activeLink<Tcomplex>, cid), H5T_NATIVE_UINT16);
@@ -503,7 +794,13 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
     if (!m_cirCoePerCell.empty() && m_cirCoePerCell[0] != nullptr) {
         const uint32_t nCells = static_cast<uint32_t>(m_cirCoePerCell.size());
         const uint32_t nUtsPerCell = m_topology.nUT;
-        const uint32_t nCirCoeff = m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
+        const uint32_t nSnapshots = m_simConfig->n_snapshot_per_slot;
+
+        // Use ISAC-effective antenna counts and tap budget if enabled (monostatic), otherwise comm defaults
+        uint32_t dumpTxAnt = (m_effectiveBsAnt > 0) ? m_effectiveBsAnt : m_cmnLinkParams.nBsAnt;
+        uint32_t dumpRxAnt = (m_effectiveUeAnt > 0) ? m_effectiveUeAnt : m_cmnLinkParams.nUeAnt;
+        const uint32_t dumpMaxTaps = (m_lastAllocatedMaxTaps > 0) ? m_lastAllocatedMaxTaps : static_cast<uint32_t>(N_MAX_TAPS);
+        const uint32_t nCirCoeff = dumpRxAnt * dumpTxAnt * dumpMaxTaps;
         
         // Create groups for CIR data
         hid_t cirGroup = H5Gcreate2(slsH5File, "cirPerCell", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -511,12 +808,18 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         // Dump CIR coefficients per cell
         for (uint32_t cellIdx = 0; cellIdx < nCells; ++cellIdx) {
             if (m_cirCoePerCell[cellIdx] != nullptr) {
+                const uint32_t nActiveUt = (cellIdx < m_activeUt.size() && !m_activeUt[cellIdx].empty())
+                                              ? static_cast<uint32_t>(m_activeUt[cellIdx].size())
+                                              : nUtsPerCell;
+
                 // Create dataset name
                 std::string datasetName = "cirCoe_cell" + std::to_string(cellIdx);
                 
-                // Create dataspace (nUtsPerCell x nCirCoeff complex values)
-                hsize_t cirDims[2] = {nUtsPerCell, nCirCoeff};
-                hid_t cirDataspace = H5Screate_simple(2, cirDims, nullptr);
+                // Create dataspace as a 5D tensor to match Python API:
+                // [nActiveUtForThisCell, n_snapshot_per_slot, nUtAnt, nBsAnt, nTaps]
+                // Note: underlying memory layout is unchanged (still contiguous), only dataset shape differs.
+                hsize_t cirDims[5] = {nActiveUt, nSnapshots, dumpRxAnt, dumpTxAnt, dumpMaxTaps};
+                hid_t cirDataspace = H5Screate_simple(5, cirDims, nullptr);
                 
                 // Create complex datatype
                 hid_t complexType = H5Tcreate(H5T_COMPOUND, sizeof(Tcomplex));
@@ -531,17 +834,17 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
                 Tcomplex* dataPtr = nullptr;
                 std::vector<Tcomplex> hostData;
                 
-                if (m_simConfig->cpu_only_mode == 0 && m_simConfig->internal_memory_mode >= 1) {
-                    // GPU memory - copy to host
-                    hostData.resize(nUtsPerCell * nCirCoeff);
-                    CHECK_CUDAERROR(cudaMemcpy(hostData.data(), m_cirCoePerCell[cellIdx], 
-                                               nUtsPerCell * nCirCoeff * sizeof(Tcomplex), 
-                                               cudaMemcpyDeviceToHost));
-                    dataPtr = hostData.data();
-                } else {
-                    // CPU memory - use pointer directly
-                    dataPtr = m_cirCoePerCell[cellIdx];
-                }
+                    if (m_simConfig->cpu_only_mode == 0 && m_simConfig->internal_memory_mode >= 1) {
+                        // GPU memory - copy to host (include all snapshots)
+                        hostData.resize(static_cast<size_t>(nActiveUt) * nSnapshots * nCirCoeff);
+                        CHECK_CUDAERROR(cudaMemcpy(hostData.data(), m_cirCoePerCell[cellIdx], 
+                                                   static_cast<size_t>(nActiveUt) * nSnapshots * nCirCoeff * sizeof(Tcomplex), 
+                                                   cudaMemcpyDeviceToHost));
+                        dataPtr = hostData.data();
+                    } else {
+                        // CPU memory - use pointer directly
+                        dataPtr = m_cirCoePerCell[cellIdx];
+                    }
                 
                 // Write data
                 H5Dwrite(cirDataset, complexType, H5S_ALL, H5S_ALL, H5P_DEFAULT, dataPtr);
@@ -578,9 +881,12 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         if (!m_cirNormDelayPerCell.empty() && m_cirNormDelayPerCell[0] != nullptr) {
             for (uint32_t cellIdx = 0; cellIdx < nCells; ++cellIdx) {
                 if (m_cirNormDelayPerCell[cellIdx] != nullptr) {
+                    const uint32_t nActiveUt = (cellIdx < m_activeUt.size() && !m_activeUt[cellIdx].empty())
+                                                  ? static_cast<uint32_t>(m_activeUt[cellIdx].size())
+                                                  : nUtsPerCell;
                     std::string datasetName = "cirNormDelay_cell" + std::to_string(cellIdx);
                     
-                    hsize_t delayDims[2] = {nUtsPerCell, N_MAX_TAPS};
+                    hsize_t delayDims[2] = {nActiveUt, dumpMaxTaps};
                     hid_t delayDataspace = H5Screate_simple(2, delayDims, nullptr);
                     hid_t delayDataset = H5Dcreate2(cirGroup, datasetName.c_str(), H5T_NATIVE_UINT16, delayDataspace,
                                                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -591,9 +897,9 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
                     
                     if (m_simConfig->cpu_only_mode == 0 && m_simConfig->internal_memory_mode >= 1) {
                         // GPU memory - copy to host
-                        hostDelayData.resize(nUtsPerCell * N_MAX_TAPS);
+                        hostDelayData.resize(static_cast<size_t>(nActiveUt) * dumpMaxTaps);
                         CHECK_CUDAERROR(cudaMemcpy(hostDelayData.data(), m_cirNormDelayPerCell[cellIdx], 
-                                                   nUtsPerCell * N_MAX_TAPS * sizeof(uint16_t), 
+                                                   static_cast<size_t>(nActiveUt) * dumpMaxTaps * sizeof(uint16_t), 
                                                    cudaMemcpyDeviceToHost));
                         delayPtr = hostDelayData.data();
                     } else {
@@ -613,9 +919,12 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         if (!m_cirNtapsPerCell.empty() && m_cirNtapsPerCell[0] != nullptr) {
             for (uint32_t cellIdx = 0; cellIdx < nCells; ++cellIdx) {
                 if (m_cirNtapsPerCell[cellIdx] != nullptr) {
+                    const uint32_t nActiveUt = (cellIdx < m_activeUt.size() && !m_activeUt[cellIdx].empty())
+                                                  ? static_cast<uint32_t>(m_activeUt[cellIdx].size())
+                                                  : nUtsPerCell;
                     std::string datasetName = "cirNtaps_cell" + std::to_string(cellIdx);
                     
-                    hsize_t ntapsDims[1] = {nUtsPerCell};
+                    hsize_t ntapsDims[1] = {nActiveUt};
                     hid_t ntapsDataspace = H5Screate_simple(1, ntapsDims, nullptr);
                     hid_t ntapsDataset = H5Dcreate2(cirGroup, datasetName.c_str(), H5T_NATIVE_UINT16, ntapsDataspace,
                                                   H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -626,9 +935,9 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
                     
                     if (m_simConfig->cpu_only_mode == 0 && m_simConfig->internal_memory_mode >= 1) {
                         // GPU memory - copy to host
-                        hostNtapsData.resize(nUtsPerCell);
+                        hostNtapsData.resize(nActiveUt);
                         CHECK_CUDAERROR(cudaMemcpy(hostNtapsData.data(), m_cirNtapsPerCell[cellIdx], 
-                                                   nUtsPerCell * sizeof(uint16_t), 
+                                                   nActiveUt * sizeof(uint16_t), 
                                                    cudaMemcpyDeviceToHost));
                         ntapsPtr = hostNtapsData.data();
                     } else {
@@ -654,7 +963,8 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
     if (!m_freqChanPrbgPerCell.empty() && m_freqChanPrbgPerCell[0] != nullptr) {
         const uint32_t nCells = static_cast<uint32_t>(m_freqChanPrbgPerCell.size());
         const uint32_t nUtsPerCell = m_topology.nUT;
-        const uint32_t nPrbgCoeff = m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * m_simConfig->n_prb;
+        const uint32_t nSnapshots = m_simConfig->n_snapshot_per_slot;
+        const uint32_t nPrbgCoeff = m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * m_simConfig->n_prbg;
         
         // Create group for CFR PRBG data
         hid_t cfrPrbgGroup = H5Gcreate2(slsH5File, "cfrPrbgPerCell", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -663,8 +973,8 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
             if (m_freqChanPrbgPerCell[cellIdx] != nullptr) {
                 std::string datasetName = "cfrPrbg_cell" + std::to_string(cellIdx);
                 
-                hsize_t cfrDims[2] = {nUtsPerCell, nPrbgCoeff};
-                hid_t cfrDataspace = H5Screate_simple(2, cfrDims, nullptr);
+                hsize_t cfrDims[3] = {nUtsPerCell, nSnapshots, nPrbgCoeff};
+                hid_t cfrDataspace = H5Screate_simple(3, cfrDims, nullptr);
                 
                 // Create complex datatype
                 hid_t complexType = H5Tcreate(H5T_COMPOUND, sizeof(Tcomplex));
@@ -679,10 +989,10 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
                 std::vector<Tcomplex> hostCfrData;
                 
                 if (m_simConfig->cpu_only_mode == 0 && m_simConfig->internal_memory_mode >= 1) {
-                    // GPU memory - copy to host
-                    hostCfrData.resize(nUtsPerCell * nPrbgCoeff);
+                    // GPU memory - copy to host (include all snapshots)
+                    hostCfrData.resize(nUtsPerCell * nSnapshots * nPrbgCoeff);
                     CHECK_CUDAERROR(cudaMemcpy(hostCfrData.data(), m_freqChanPrbgPerCell[cellIdx], 
-                                               nUtsPerCell * nPrbgCoeff * sizeof(Tcomplex), 
+                                               nUtsPerCell * nSnapshots * nPrbgCoeff * sizeof(Tcomplex), 
                                                cudaMemcpyDeviceToHost));
                     cfrPtr = hostCfrData.data();
                 } else {
@@ -708,6 +1018,7 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
     if (!m_freqChanScPerCell.empty() && m_freqChanScPerCell[0] != nullptr) {
         const uint32_t nCells = static_cast<uint32_t>(m_freqChanScPerCell.size());
         const uint32_t nUtsPerCell = m_topology.nUT;
+        const uint32_t nSnapshots = m_simConfig->n_snapshot_per_slot;
         uint32_t nScCoeff{};
         
         // Determine number of subcarriers based on run mode
@@ -732,8 +1043,8 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
                 if (m_freqChanScPerCell[cellIdx] != nullptr) {
                     std::string datasetName = "cfrSc_cell" + std::to_string(cellIdx);
                     
-                    hsize_t cfrDims[2] = {nUtsPerCell, nScCoeff};
-                    hid_t cfrDataspace = H5Screate_simple(2, cfrDims, nullptr);
+                    hsize_t cfrDims[3] = {nUtsPerCell, nSnapshots, nScCoeff};
+                    hid_t cfrDataspace = H5Screate_simple(3, cfrDims, nullptr);
                     
                     // Create complex datatype
                     hid_t complexType = H5Tcreate(H5T_COMPOUND, sizeof(Tcomplex));
@@ -748,10 +1059,10 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
                     std::vector<Tcomplex> hostCfrData;
                     
                     if (m_simConfig->cpu_only_mode == 0 && m_simConfig->internal_memory_mode >= 1) {
-                        // GPU memory - copy to host
-                        hostCfrData.resize(nUtsPerCell * nScCoeff);
+                        // GPU memory - copy to host (include all snapshots)
+                        hostCfrData.resize(nUtsPerCell * nSnapshots * nScCoeff);
                         CHECK_CUDAERROR(cudaMemcpy(hostCfrData.data(), m_freqChanScPerCell[cellIdx], 
-                                                   nUtsPerCell * nScCoeff * sizeof(Tcomplex), 
+                                                   nUtsPerCell * nSnapshots * nScCoeff * sizeof(Tcomplex), 
                                                    cudaMemcpyDeviceToHost));
                         cfrScPtr = hostCfrData.data();
                     } else {
@@ -779,12 +1090,12 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         // Common link parameters (always available)
         hid_t linkGroup = H5Gcreate2(configGroup, "linkParams", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
         
-        hid_t nUeAntDataset = H5Dcreate2(linkGroup, "nUeAnt", H5T_NATIVE_UINT8, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        H5Dwrite(nUeAntDataset, H5T_NATIVE_UINT8, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nUeAnt);
+        hid_t nUeAntDataset = H5Dcreate2(linkGroup, "nUeAnt", H5T_NATIVE_UINT16, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        H5Dwrite(nUeAntDataset, H5T_NATIVE_UINT16, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nUeAnt);
         H5Dclose(nUeAntDataset);
         
-        hid_t nBsAntDataset = H5Dcreate2(linkGroup, "nBsAnt", H5T_NATIVE_UINT8, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        H5Dwrite(nBsAntDataset, H5T_NATIVE_UINT8, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nBsAnt);
+        hid_t nBsAntDataset = H5Dcreate2(linkGroup, "nBsAnt", H5T_NATIVE_UINT16, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        H5Dwrite(nBsAntDataset, H5T_NATIVE_UINT16, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nBsAnt);
         H5Dclose(nBsAntDataset);
         
         H5Gclose(linkGroup);
@@ -920,6 +1231,69 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
             H5Tclose(cellParamType);
         }
 
+        // Save per-site BS parameters (unique sites) for convenience
+        if (!m_topology.cellParams.empty()) {
+            // Collect unique site IDs and locations (cells are per-sector and may share a siteId)
+            std::vector<uint32_t> siteIds;
+            std::vector<float> site_loc_x, site_loc_y, site_loc_z;
+            siteIds.reserve(m_topology.nSite);
+            site_loc_x.reserve(m_topology.nSite);
+            site_loc_y.reserve(m_topology.nSite);
+            site_loc_z.reserve(m_topology.nSite);
+
+            for (const auto& cell : m_topology.cellParams) {
+                bool seen = false;
+                for (const auto& sid : siteIds) {
+                    if (sid == cell.siteId) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    siteIds.push_back(cell.siteId);
+                    site_loc_x.push_back(cell.loc.x);
+                    site_loc_y.push_back(cell.loc.y);
+                    site_loc_z.push_back(cell.loc.z);
+                }
+            }
+
+            const hsize_t nSites = siteIds.size();
+            hid_t siteGroup = H5Gcreate2(topologyGroup, "siteParams", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            hid_t siteDataspace = H5Screate_simple(1, &nSites, nullptr);
+
+            // Velocity for BS/sites (stationary)
+            std::vector<float> site_vel_x(nSites, 0.0f);
+            std::vector<float> site_vel_y(nSites, 0.0f);
+            std::vector<float> site_vel_z(nSites, 0.0f);
+
+            hid_t siteIdDataset = H5Dcreate2(siteGroup, "siteId", H5T_NATIVE_UINT32, siteDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(siteIdDataset, H5T_NATIVE_UINT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, siteIds.data());
+            H5Dclose(siteIdDataset);
+
+            hid_t siteLocXDataset = H5Dcreate2(siteGroup, "loc_x", H5T_NATIVE_FLOAT, siteDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(siteLocXDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, site_loc_x.data());
+            H5Dclose(siteLocXDataset);
+            hid_t siteLocYDataset = H5Dcreate2(siteGroup, "loc_y", H5T_NATIVE_FLOAT, siteDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(siteLocYDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, site_loc_y.data());
+            H5Dclose(siteLocYDataset);
+            hid_t siteLocZDataset = H5Dcreate2(siteGroup, "loc_z", H5T_NATIVE_FLOAT, siteDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(siteLocZDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, site_loc_z.data());
+            H5Dclose(siteLocZDataset);
+
+            hid_t siteVelXDataset = H5Dcreate2(siteGroup, "velocity_x", H5T_NATIVE_FLOAT, siteDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(siteVelXDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, site_vel_x.data());
+            H5Dclose(siteVelXDataset);
+            hid_t siteVelYDataset = H5Dcreate2(siteGroup, "velocity_y", H5T_NATIVE_FLOAT, siteDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(siteVelYDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, site_vel_y.data());
+            H5Dclose(siteVelYDataset);
+            hid_t siteVelZDataset = H5Dcreate2(siteGroup, "velocity_z", H5T_NATIVE_FLOAT, siteDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(siteVelZDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, site_vel_z.data());
+            H5Dclose(siteVelZDataset);
+
+            H5Sclose(siteDataspace);
+            H5Gclose(siteGroup);
+        }
+
         // Save UT parameters as part of topology
         if (!m_topology.utParams.empty()) {
             // Create individual datasets for UT parameters to avoid offsetof issues with inheritance
@@ -998,6 +1372,300 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         
             H5Sclose(utDataspace);
             H5Gclose(utGroup);
+        }
+        
+        // Save ST (sensing target) parameters if ISAC is enabled
+        if (m_sysConfig && m_sysConfig->isac_type > 0 && !m_topology.stParams.empty()) {
+            hid_t stGroup = H5Gcreate2(topologyGroup, "stParams", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            hsize_t stCount = m_topology.stParams.size();
+            hid_t stDataspace = H5Screate_simple(1, &stCount, nullptr);
+            
+            // Extract ST data arrays
+            std::vector<uint32_t> sids;
+            std::vector<int32_t> target_types;
+            std::vector<float> loc_x, loc_y, loc_z;
+            std::vector<float> vel_x, vel_y, vel_z;
+            std::vector<uint8_t> outdoor_inds;
+            std::vector<uint8_t> rcs_models;
+            std::vector<uint32_t> n_spsts;
+            
+            for (const auto& st : m_topology.stParams) {
+                sids.push_back(st.sid);
+                target_types.push_back(static_cast<int32_t>(st.target_type));
+                loc_x.push_back(st.loc.x);
+                loc_y.push_back(st.loc.y);
+                loc_z.push_back(st.loc.z);
+                vel_x.push_back(st.velocity[0]);
+                vel_y.push_back(st.velocity[1]);
+                vel_z.push_back(st.velocity[2]);
+                outdoor_inds.push_back(st.outdoor_ind);
+                rcs_models.push_back(st.rcs_model);
+                n_spsts.push_back(st.n_spst);
+            }
+            
+            // Save ST arrays
+            hid_t sidDataset = H5Dcreate2(stGroup, "sid", H5T_NATIVE_UINT32, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(sidDataset, H5T_NATIVE_UINT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, sids.data());
+            H5Dclose(sidDataset);
+            
+            hid_t typeDataset = H5Dcreate2(stGroup, "target_type", H5T_NATIVE_INT32, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(typeDataset, H5T_NATIVE_INT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, target_types.data());
+            H5Dclose(typeDataset);
+            
+            hid_t stLocXDataset = H5Dcreate2(stGroup, "loc_x", H5T_NATIVE_FLOAT, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(stLocXDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, loc_x.data());
+            H5Dclose(stLocXDataset);
+            
+            hid_t stLocYDataset = H5Dcreate2(stGroup, "loc_y", H5T_NATIVE_FLOAT, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(stLocYDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, loc_y.data());
+            H5Dclose(stLocYDataset);
+            
+            hid_t stLocZDataset = H5Dcreate2(stGroup, "loc_z", H5T_NATIVE_FLOAT, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(stLocZDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, loc_z.data());
+            H5Dclose(stLocZDataset);
+
+            hid_t stVelXDataset = H5Dcreate2(stGroup, "velocity_x", H5T_NATIVE_FLOAT, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(stVelXDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vel_x.data());
+            H5Dclose(stVelXDataset);
+            hid_t stVelYDataset = H5Dcreate2(stGroup, "velocity_y", H5T_NATIVE_FLOAT, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(stVelYDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vel_y.data());
+            H5Dclose(stVelYDataset);
+            hid_t stVelZDataset = H5Dcreate2(stGroup, "velocity_z", H5T_NATIVE_FLOAT, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(stVelZDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, vel_z.data());
+            H5Dclose(stVelZDataset);
+            
+            hid_t stOutdoorDataset = H5Dcreate2(stGroup, "outdoor_ind", H5T_NATIVE_UINT8, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(stOutdoorDataset, H5T_NATIVE_UINT8, H5S_ALL, H5S_ALL, H5P_DEFAULT, outdoor_inds.data());
+            H5Dclose(stOutdoorDataset);
+            
+            hid_t rcsModelDataset = H5Dcreate2(stGroup, "rcs_model", H5T_NATIVE_UINT8, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(rcsModelDataset, H5T_NATIVE_UINT8, H5S_ALL, H5S_ALL, H5P_DEFAULT, rcs_models.data());
+            H5Dclose(rcsModelDataset);
+            
+            hid_t nSpstDataset = H5Dcreate2(stGroup, "n_spst", H5T_NATIVE_UINT32, stDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(nSpstDataset, H5T_NATIVE_UINT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, n_spsts.data());
+            H5Dclose(nSpstDataset);
+            
+            H5Sclose(stDataspace);
+            H5Gclose(stGroup);
+        }
+        
+        // Save ISAC target link parameters if available
+        // Contains all components for 3GPP TR 38.901 coupling loss formula:
+        // L = PL(d1) + PL(d2) + 10*log10(c²/(4πf)²) - 10*log10(σ_RCS,A) + SF1 + SF2
+        if (m_sysConfig && m_sysConfig->isac_type > 0 && !m_targetChannelParams.targetLinks.empty()) {
+            hid_t isacGroup = H5Gcreate2(topologyGroup, "isacTargetLinks", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            hsize_t linkCount = m_targetChannelParams.targetLinks.size();
+            hid_t linkDataspace = H5Screate_simple(1, &linkCount, nullptr);
+            
+            // Extract ISAC target link data - all components for coupling loss
+            std::vector<uint32_t> st_ids, spst_ids, tx_ids, rx_ids;
+            std::vector<float> total_pathloss, total_delay;
+            std::vector<float> rcs_dbsm, rcs_linear;
+            std::vector<float> rcs_sigma_m_dbsm;  // σ_RCS,A (Component A only) for coupling loss calibration
+            std::vector<float> target_loc_x, target_loc_y, target_loc_z;
+            // Incident path (TX -> SPST): PL(d1), SF1, K1
+            std::vector<float> incident_d3d, incident_d2d;
+            std::vector<float> incident_pathloss, incident_sf;
+            std::vector<uint8_t> incident_los;
+            std::vector<float> incident_k;  // Ricean K-factor in dB
+            // Scattered path (SPST -> RX): PL(d2), SF2, K2
+            std::vector<float> scattered_d3d, scattered_d2d;
+            std::vector<float> scattered_pathloss, scattered_sf;
+            std::vector<uint8_t> scattered_los;
+            std::vector<float> scattered_k;  // Ricean K-factor in dB
+            // Pre-computed coupling loss using 3GPP formula
+            std::vector<float> coupling_loss_db;
+            
+            // Speed of light and carrier frequency for wavelength term
+            const float c = 3.0e8f;
+            const float freq_hz = m_simConfig ? m_simConfig->center_freq_hz : 6.0e9f;
+            // Wavelength term: 10*log10(c² / 4πf²)
+            const float wavelength_term_db = 10.0f * std::log10(c * c / (4.0f * M_PI * freq_hz * freq_hz));
+            
+            for (const auto& link : m_targetChannelParams.targetLinks) {
+                st_ids.push_back(link.st_id);
+                spst_ids.push_back(link.spst_id);
+                tx_ids.push_back(link.tx_id);
+                rx_ids.push_back(link.rx_id);
+                total_pathloss.push_back(link.total_pathloss);
+                total_delay.push_back(link.total_delay);
+                rcs_dbsm.push_back(link.rcs_dbsm);
+                rcs_linear.push_back(link.rcs_linear);
+                target_loc_x.push_back(link.target_loc.x);
+                target_loc_y.push_back(link.target_loc.y);
+                target_loc_z.push_back(link.target_loc.z);
+                
+                // Get σ_M (Component A) from ST parameters for coupling loss calibration
+                float sigma_m_dbsm = 0.0f;
+                if (link.st_id < m_topology.stParams.size() && 
+                    link.spst_id < m_topology.stParams[link.st_id].spst_configs.size()) {
+                    sigma_m_dbsm = m_topology.stParams[link.st_id].spst_configs[link.spst_id].rcs_sigma_m_dbsm;
+                }
+                rcs_sigma_m_dbsm.push_back(sigma_m_dbsm);
+                
+                // Incident path components
+                incident_d3d.push_back(link.incident.d3d);
+                incident_d2d.push_back(link.incident.d2d);
+                incident_pathloss.push_back(link.incident.pathloss);
+                incident_sf.push_back(link.incident.shadow_fading);
+                incident_los.push_back(link.incident.los_ind);
+                incident_k.push_back(link.incident.ricean_k);  // Ricean K-factor in dB
+                
+                // Scattered path components
+                scattered_d3d.push_back(link.scattered.d3d);
+                scattered_d2d.push_back(link.scattered.d2d);
+                scattered_pathloss.push_back(link.scattered.pathloss);
+                scattered_sf.push_back(link.scattered.shadow_fading);
+                scattered_los.push_back(link.scattered.los_ind);
+                scattered_k.push_back(link.scattered.ricean_k);  // Ricean K-factor in dB
+                
+                // Compute coupling loss per 3GPP TR 38.901 Eq. 7.9.6.1-1:
+                // L = PL(d1) + PL(d2) + wavelength_term - σ_RCS,A + SF1 + SF2
+                // where σ_RCS,A = σ_M (Component A, deterministic mean RCS)
+                // Note: total_pathloss = PL1 + PL2 + SF1 + SF2 (already computed)
+                // Coupling loss is negative (power loss), so we negate
+                float coupling = -(link.total_pathloss + wavelength_term_db - sigma_m_dbsm);
+                coupling_loss_db.push_back(coupling);
+            }
+            
+            // Save ISAC link data
+            auto saveVec = [&](const char* name, const std::vector<float>& data) {
+                hid_t ds = H5Dcreate2(isacGroup, name, H5T_NATIVE_FLOAT, linkDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+                H5Dwrite(ds, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, data.data());
+                H5Dclose(ds);
+            };
+            auto saveVecU32 = [&](const char* name, const std::vector<uint32_t>& data) {
+                hid_t ds = H5Dcreate2(isacGroup, name, H5T_NATIVE_UINT32, linkDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+                H5Dwrite(ds, H5T_NATIVE_UINT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, data.data());
+                H5Dclose(ds);
+            };
+            auto saveVecU8 = [&](const char* name, const std::vector<uint8_t>& data) {
+                hid_t ds = H5Dcreate2(isacGroup, name, H5T_NATIVE_UINT8, linkDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+                H5Dwrite(ds, H5T_NATIVE_UINT8, H5S_ALL, H5S_ALL, H5P_DEFAULT, data.data());
+                H5Dclose(ds);
+            };
+            
+            // Link identifiers
+            saveVecU32("st_id", st_ids);
+            saveVecU32("spst_id", spst_ids);
+            saveVecU32("tx_id", tx_ids);
+            saveVecU32("rx_id", rx_ids);
+            
+            // Target location
+            saveVec("target_loc_x", target_loc_x);
+            saveVec("target_loc_y", target_loc_y);
+            saveVec("target_loc_z", target_loc_z);
+            
+            // RCS values
+            saveVec("rcs_dbsm", rcs_dbsm);
+            saveVec("rcs_linear", rcs_linear);
+            saveVec("rcs_sigma_m_dbsm", rcs_sigma_m_dbsm);  // σ_RCS,A (Component A) for calibration
+            
+            // Incident path (TX -> SPST): for PL(d1), SF1, K1
+            saveVec("incident_d3d", incident_d3d);
+            saveVec("incident_d2d", incident_d2d);
+            saveVec("incident_pathloss", incident_pathloss);
+            saveVec("incident_sf", incident_sf);
+            saveVecU8("incident_los", incident_los);
+            saveVec("incident_k", incident_k);  // Ricean K-factor in dB
+            
+            // Scattered path (SPST -> RX): for PL(d2), SF2, K2
+            saveVec("scattered_d3d", scattered_d3d);
+            saveVec("scattered_d2d", scattered_d2d);
+            saveVec("scattered_pathloss", scattered_pathloss);
+            saveVec("scattered_sf", scattered_sf);
+            saveVecU8("scattered_los", scattered_los);
+            saveVec("scattered_k", scattered_k);  // Ricean K-factor in dB
+            
+            // Pre-computed values
+            saveVec("total_pathloss", total_pathloss);
+            saveVec("total_delay", total_delay);
+            
+            // Pre-computed coupling loss (3GPP formula)
+            saveVec("coupling_loss_db", coupling_loss_db);
+            
+            // Save wavelength term as scalar for reference
+            hid_t scalarSpace = H5Screate(H5S_SCALAR);
+            hid_t wlDataset = H5Dcreate2(isacGroup, "wavelength_term_db", H5T_NATIVE_FLOAT, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            H5Dwrite(wlDataset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, &wavelength_term_db);
+            H5Dclose(wlDataset);
+            H5Sclose(scalarSpace);
+            
+            H5Sclose(linkDataspace);
+            H5Gclose(isacGroup);
+        }
+        
+        // Save ISAC background reference point parameters (monostatic mode)
+        // Contains one-way coupling loss for background channel calibration:
+        // L_background = PL(d) + SF
+        if (m_sysConfig && m_sysConfig->isac_type == 1 && !m_targetChannelParams.monostaticRefPoints.empty()) {
+            hid_t bgGroup = H5Gcreate2(topologyGroup, "isacBackgroundLinks", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+            
+            // Count total RPs across all BS reference points
+            const size_t n_bs = m_targetChannelParams.monostaticRefPoints.size();
+            const size_t total_rps = n_bs * ISAC_NUM_REFERENCE_POINTS;  // 3 RPs per BS
+            
+            hsize_t rpCount = total_rps;
+            hid_t rpDataspace = H5Screate_simple(1, &rpCount, nullptr);
+            
+            // Extract background RP data
+            std::vector<uint32_t> bs_ids, rp_ids;
+            std::vector<float> rp_loc_x, rp_loc_y, rp_loc_z;
+            std::vector<float> d_2d_values, d_3d_values;
+            std::vector<float> pathloss_values, sf_values;
+            std::vector<float> coupling_loss_db;
+            
+            for (const auto& ref : m_targetChannelParams.monostaticRefPoints) {
+                for (int i = 0; i < ISAC_NUM_REFERENCE_POINTS; ++i) {
+                    const auto& rp = ref.background_rps[i];
+                    
+                    bs_ids.push_back(ref.bs_id);
+                    rp_ids.push_back(rp.rp_id);
+                    
+                    rp_loc_x.push_back(rp.loc.x);
+                    rp_loc_y.push_back(rp.loc.y);
+                    rp_loc_z.push_back(rp.loc.z);
+                    
+                    d_2d_values.push_back(rp.d_2d);
+                    d_3d_values.push_back(rp.d_3d);
+                    
+                    pathloss_values.push_back(rp.pathloss);
+                    sf_values.push_back(rp.shadow_fading);
+                    
+                    // Background coupling loss (one-way TX → RP): L = -(PL + SF)
+                    // Per 3GPP TR 38.901 Table 7.9.6.1-1: "coupling loss between Tx and one reference point"
+                    float coupling = -(rp.pathloss + rp.shadow_fading);
+                    coupling_loss_db.push_back(coupling);
+                }
+            }
+            
+            // Helper lambdas for saving
+            auto saveBgVec = [&](const char* name, const std::vector<float>& data) {
+                hid_t ds = H5Dcreate2(bgGroup, name, H5T_NATIVE_FLOAT, rpDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+                H5Dwrite(ds, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, data.data());
+                H5Dclose(ds);
+            };
+            auto saveBgVecU32 = [&](const char* name, const std::vector<uint32_t>& data) {
+                hid_t ds = H5Dcreate2(bgGroup, name, H5T_NATIVE_UINT32, rpDataspace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+                H5Dwrite(ds, H5T_NATIVE_UINT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, data.data());
+                H5Dclose(ds);
+            };
+            
+            // Save background RP data
+            saveBgVecU32("bs_id", bs_ids);
+            saveBgVecU32("rp_id", rp_ids);
+            saveBgVec("rp_loc_x", rp_loc_x);
+            saveBgVec("rp_loc_y", rp_loc_y);
+            saveBgVec("rp_loc_z", rp_loc_z);
+            saveBgVec("d_2d", d_2d_values);
+            saveBgVec("d_3d", d_3d_values);
+            saveBgVec("pathloss", pathloss_values);
+            saveBgVec("shadow_fading", sf_values);
+            saveBgVec("coupling_loss_db", coupling_loss_db);
+            
+            H5Sclose(rpDataspace);
+            H5Gclose(bgGroup);
         }
         
         H5Gclose(topologyGroup);
@@ -1142,12 +1810,12 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         H5Dwrite(nLinkDataset, H5T_NATIVE_UINT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nLink);
         H5Dclose(nLinkDataset);
         
-        hid_t nUeAntDataset = H5Dcreate2(cmnLinkGroup, "nUeAnt", H5T_NATIVE_UINT32, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        H5Dwrite(nUeAntDataset, H5T_NATIVE_UINT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nUeAnt);
+        hid_t nUeAntDataset = H5Dcreate2(cmnLinkGroup, "nUeAnt", H5T_NATIVE_UINT16, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        H5Dwrite(nUeAntDataset, H5T_NATIVE_UINT16, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nUeAnt);
         H5Dclose(nUeAntDataset);
         
-        hid_t nBsAntDataset = H5Dcreate2(cmnLinkGroup, "nBsAnt", H5T_NATIVE_UINT32, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
-        H5Dwrite(nBsAntDataset, H5T_NATIVE_UINT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nBsAnt);
+        hid_t nBsAntDataset = H5Dcreate2(cmnLinkGroup, "nBsAnt", H5T_NATIVE_UINT16, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+        H5Dwrite(nBsAntDataset, H5T_NATIVE_UINT16, H5S_ALL, H5S_ALL, H5P_DEFAULT, &m_cmnLinkParams.nBsAnt);
         H5Dclose(nBsAntDataset);
         
         hid_t lambda0Dataset = H5Dcreate2(cmnLinkGroup, "lambda_0", H5T_NATIVE_FLOAT, scalarSpace, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
@@ -1175,29 +1843,51 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         scenarioVal = static_cast<int>(Scenario::RMa);
         H5Tenum_insert(scenarioEnumType, "RMa", &scenarioVal);
         
+        // Add array types
+        hsize_t arrayDim2[1] = {2};
+        hid_t floatArray2Type = H5Tarray_create2(H5T_NATIVE_FLOAT, 1, arrayDim2);
+        hsize_t arrayDimDropCells[1] = {SystemLevelConfig::kMaxUtDropCells};
+        hid_t uintArrayDropCellsType = H5Tarray_create2(H5T_NATIVE_UINT32, 1, arrayDimDropCells);
+
         // Insert SystemLevelConfig fields
         H5Tinsert(sysConfigType, "scenario", HOFFSET(SystemLevelConfig, scenario), scenarioEnumType);
         H5Tinsert(sysConfigType, "isd", HOFFSET(SystemLevelConfig, isd), H5T_NATIVE_FLOAT);
         H5Tinsert(sysConfigType, "n_site", HOFFSET(SystemLevelConfig, n_site), H5T_NATIVE_UINT32);
         H5Tinsert(sysConfigType, "n_sector_per_site", HOFFSET(SystemLevelConfig, n_sector_per_site), H5T_NATIVE_UINT8);
         H5Tinsert(sysConfigType, "n_ut", HOFFSET(SystemLevelConfig, n_ut), H5T_NATIVE_UINT32);
+        H5Tinsert(sysConfigType, "n_ut_drop_cells", HOFFSET(SystemLevelConfig, n_ut_drop_cells), H5T_NATIVE_UINT32);
+        H5Tinsert(sysConfigType, "ut_drop_cells", HOFFSET(SystemLevelConfig, ut_drop_cells), uintArrayDropCellsType);
+        H5Tinsert(sysConfigType, "ut_drop_option", HOFFSET(SystemLevelConfig, ut_drop_option), H5T_NATIVE_UINT8);
+        H5Tinsert(sysConfigType, "ut_cell_2d_dist", HOFFSET(SystemLevelConfig, ut_cell_2d_dist), floatArray2Type);
         H5Tinsert(sysConfigType, "optional_pl_ind", HOFFSET(SystemLevelConfig, optional_pl_ind), H5T_NATIVE_UINT8);
         H5Tinsert(sysConfigType, "o2i_building_penetr_loss_ind", HOFFSET(SystemLevelConfig, o2i_building_penetr_loss_ind), H5T_NATIVE_UINT8);
         H5Tinsert(sysConfigType, "o2i_car_penetr_loss_ind", HOFFSET(SystemLevelConfig, o2i_car_penetr_loss_ind), H5T_NATIVE_UINT8);
         H5Tinsert(sysConfigType, "enable_near_field_effect", HOFFSET(SystemLevelConfig, enable_near_field_effect), H5T_NATIVE_UINT8);
         H5Tinsert(sysConfigType, "enable_non_stationarity", HOFFSET(SystemLevelConfig, enable_non_stationarity), H5T_NATIVE_UINT8);
-        
-        // Add array types for force_los_prob and force_ut_speed
-        hsize_t arrayDim2[1] = {2};
-        hid_t floatArray2Type = H5Tarray_create2(H5T_NATIVE_FLOAT, 1, arrayDim2);
+
+        // Add array fields for force_los_prob and force_ut_speed
         H5Tinsert(sysConfigType, "force_los_prob", HOFFSET(SystemLevelConfig, force_los_prob), floatArray2Type);
         H5Tinsert(sysConfigType, "force_ut_speed", HOFFSET(SystemLevelConfig, force_ut_speed), floatArray2Type);
+
+        // ST distribution option (needed to interpret ST dropping / per-sector behavior)
+        hid_t uint8Array2Type = H5Tarray_create2(H5T_NATIVE_UINT8, 1, arrayDim2);
+        H5Tinsert(sysConfigType, "st_distribution_option", HOFFSET(SystemLevelConfig, st_distribution_option), uint8Array2Type);
         
         H5Tinsert(sysConfigType, "force_indoor_ratio", HOFFSET(SystemLevelConfig, force_indoor_ratio), H5T_NATIVE_FLOAT);
         H5Tinsert(sysConfigType, "disable_pl_shadowing", HOFFSET(SystemLevelConfig, disable_pl_shadowing), H5T_NATIVE_UINT8);
         H5Tinsert(sysConfigType, "disable_small_scale_fading", HOFFSET(SystemLevelConfig, disable_small_scale_fading), H5T_NATIVE_UINT8);
         H5Tinsert(sysConfigType, "enable_per_tti_lsp", HOFFSET(SystemLevelConfig, enable_per_tti_lsp), H5T_NATIVE_UINT8);
         H5Tinsert(sysConfigType, "enable_propagation_delay", HOFFSET(SystemLevelConfig, enable_propagation_delay), H5T_NATIVE_UINT8);
+        H5Tinsert(sysConfigType, "enable_ue_mobility_wraparound", HOFFSET(SystemLevelConfig, enable_ue_mobility_wraparound), H5T_NATIVE_UINT8);
+        
+        // ISAC configuration fields
+        H5Tinsert(sysConfigType, "isac_type", HOFFSET(SystemLevelConfig, isac_type), H5T_NATIVE_UINT8);
+        H5Tinsert(sysConfigType, "n_st", HOFFSET(SystemLevelConfig, n_st), H5T_NATIVE_UINT32);
+        H5Tinsert(sysConfigType, "st_target_type", HOFFSET(SystemLevelConfig, st_target_type), H5T_NATIVE_INT);
+        H5Tinsert(sysConfigType, "st_rcs_model", HOFFSET(SystemLevelConfig, st_rcs_model), H5T_NATIVE_UINT8);
+        H5Tinsert(sysConfigType, "isac_disable_background", HOFFSET(SystemLevelConfig, isac_disable_background), H5T_NATIVE_UINT8);
+        H5Tinsert(sysConfigType, "isac_disable_target", HOFFSET(SystemLevelConfig, isac_disable_target), H5T_NATIVE_UINT8);
+        H5Tinsert(sysConfigType, "st_size_ind", HOFFSET(SystemLevelConfig, st_size_ind), H5T_NATIVE_UINT8);
 
         // Create dataspace and dataset for SystemLevelConfig (single instance)
         hsize_t sysConfigDims[1] = {1};
@@ -1212,6 +1902,8 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         H5Dclose(sysConfigDataset);
         H5Sclose(sysConfigDataspace);
         H5Tclose(floatArray2Type);
+        H5Tclose(uintArrayDropCellsType);
+        H5Tclose(uint8Array2Type);
         H5Tclose(scenarioEnumType);
         H5Tclose(sysConfigType);
     }
@@ -1235,6 +1927,7 @@ void slsChan<Tscalar, Tcomplex>::saveSlsChanToH5File(std::string_view filenameEn
         H5Tinsert(simConfigType, "freq_convert_type", HOFFSET(SimConfig, freq_convert_type), H5T_NATIVE_INT);
         H5Tinsert(simConfigType, "sc_sampling", HOFFSET(SimConfig, sc_sampling), H5T_NATIVE_INT);
         H5Tinsert(simConfigType, "proc_sig_freq", HOFFSET(SimConfig, proc_sig_freq), H5T_NATIVE_INT);
+        H5Tinsert(simConfigType, "h5_dump_level", HOFFSET(SimConfig, h5_dump_level), H5T_NATIVE_UINT8);
 
         // Create dataspace and dataset for SimConfig (single instance)
         hsize_t simConfigDims[1] = {1};
@@ -1353,6 +2046,10 @@ slsChan<Tscalar, Tcomplex>::~slsChan()
         if (m_d_corrDistNlos) cudaFree(m_d_corrDistNlos);
         if (m_d_corrDistO2i) cudaFree(m_d_corrDistO2i);
         if (m_d_curandStates) cudaFree(m_d_curandStates);
+        if (m_d_stParams) cudaFree(m_d_stParams);
+        if (m_d_spstParams) cudaFree(m_d_spstParams);
+        if (m_d_spstOffsets) cudaFree(m_d_spstOffsets);
+        if (m_d_sensingChannelRCS) cudaFree(m_d_sensingChannelRCS);
         if (m_simConfig) {
             if (m_simConfig->internal_memory_mode >= 1) {
                 if (m_cirCoe) cudaFree(m_cirCoe);
@@ -1401,6 +2098,10 @@ void slsChan<Tscalar, Tcomplex>::allocateStaticGpuMem()
         m_d_crnNlos = nullptr;
         m_d_crnO2i = nullptr;
         m_d_curandStates = nullptr;
+        m_d_stParams = nullptr;
+        m_d_spstParams = nullptr;
+        m_d_spstOffsets = nullptr;
+        m_d_sensingChannelRCS = nullptr;
         m_maxCurandStates = 0;
         return;
     }
@@ -1476,7 +2177,7 @@ void slsChan<Tscalar, Tcomplex>::allocateStaticGpuMem()
             maxCorrDist = 120.0f;
             break;
         default:
-            fprintf(stderr, "ERROR: Invalid scenario: %d\n", m_sysConfig->scenario);
+            fprintf(stderr, "ERROR: Invalid scenario: %d\n", static_cast<int>(m_sysConfig->scenario));
             exit(EXIT_FAILURE);
             break;
     }
@@ -1527,13 +2228,50 @@ void slsChan<Tscalar, Tcomplex>::allocateStaticGpuMem()
 }
 
 template <typename Tscalar, typename Tcomplex>
+uint32_t slsChan<Tscalar, Tcomplex>::getEffectiveMaxTaps() const
+{
+    uint32_t taps = N_MAX_TAPS;
+    if (m_sysConfig && m_sysConfig->isac_type > 0) {
+        IsacCirConfig isacCfg{};
+        uint32_t totalSpst = 0;
+        for (const auto& st : m_topology.stParams) {
+            totalSpst += st.n_spst;
+        }
+        isacCfg.n_spst_total = totalSpst;
+        isacCfg.n_st = m_topology.nST;
+        isacCfg.is_monostatic = (m_sysConfig->isac_type == 1);
+        isacCfg.isac_enabled = (totalSpst > 0);
+        // bg_max_taps stays at 24 for per-component tap count calculation
+        isacCfg.updateTotalMaxTaps();
+        taps = isacCfg.getEffectiveMaxTaps();
+    }
+    return taps;
+}
+
+template <typename Tscalar, typename Tcomplex>
 void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
 {
-    // only allocated for internal memory allocation if existing are not sufficient
-    if (nLinks <= m_lastAllocatedLinks) {
+
+    // Determine effective taps for allocation (ISAC can require more than N_MAX_TAPS)
+    const uint32_t maxTaps = getEffectiveMaxTaps();
+
+    // Determine effective antenna dims (ISAC monostatic may need larger arrays)
+    uint32_t effTxAnt = m_cmnLinkParams.nBsAnt;
+    uint32_t effRxAnt = m_cmnLinkParams.nUeAnt;
+    if (m_sysConfig && m_sysConfig->isac_type == 1 && !m_targetChannelParams.monostaticRefPoints.empty()) {
+        const auto& ref = m_targetChannelParams.monostaticRefPoints.front();
+        effTxAnt = std::max(effTxAnt, static_cast<uint32_t>((*m_antPanelConfig)[ref.stx_ant_panel_idx].nAnt));
+        effRxAnt = std::max(effRxAnt, static_cast<uint32_t>((*m_antPanelConfig)[ref.srx_ant_panel_idx].nAnt));
+    }
+
+    // Only allocate if link count grows or tap budget grows (antenna growth just increases stride)
+    if (nLinks <= m_lastAllocatedLinks && maxTaps <= m_lastAllocatedMaxTaps && effTxAnt == m_effectiveBsAnt && effRxAnt == m_effectiveUeAnt) {
         return;
     }
-    m_lastAllocatedLinks = nLinks;
+    m_lastAllocatedLinks = std::max<size_t>(m_lastAllocatedLinks, nLinks);
+    m_lastAllocatedMaxTaps = maxTaps;
+    m_effectiveBsAnt = effTxAnt;
+    m_effectiveUeAnt = effRxAnt;
 
     // Early return for CPU-only mode - skip all GPU allocations
     if (m_simConfig && m_simConfig->cpu_only_mode == 1) {
@@ -1542,9 +2280,9 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
             // Reallocate cirCoe with NULL check using contiguous layout: (total_active_links, n_snapshots, n_ut_ant, n_bs_ant, max_taps)
             Tcomplex* temp_cirCoe = (Tcomplex*)realloc(m_cirCoe, m_lastAllocatedLinks *
                                 m_simConfig->n_snapshot_per_slot *
-                                m_cmnLinkParams.nUeAnt * 
-                                m_cmnLinkParams.nBsAnt * 
-                                N_MAX_TAPS *
+                                m_effectiveUeAnt * 
+                                m_effectiveBsAnt * 
+                                maxTaps *
                                 sizeof(Tcomplex));
             if (temp_cirCoe == nullptr) {
                 fprintf(stderr, "Failed to reallocate m_cirCoe\n");
@@ -1553,7 +2291,7 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
             m_cirCoe = temp_cirCoe;
 
             // Reallocate cirNormDelay with NULL check
-            uint16_t* temp_cirNormDelay = (uint16_t*)realloc(m_cirNormDelay, m_lastAllocatedLinks * N_MAX_TAPS * sizeof(uint16_t));
+            uint16_t* temp_cirNormDelay = (uint16_t*)realloc(m_cirNormDelay, m_lastAllocatedLinks * maxTaps * sizeof(uint16_t));
             if (temp_cirNormDelay == nullptr) {
                 fprintf(stderr, "Failed to reallocate m_cirNormDelay\n");
                 return;
@@ -1579,7 +2317,7 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
                 m_freqChanSc = nullptr;
             }
             else if (m_simConfig->run_mode == 1) {
-                // Reallocate freqChanPrbg with NULL check
+                // Mode 1: CIR and CFR on PRBG only
                 Tcomplex* temp_freqChanPrbg = (Tcomplex*)realloc(m_freqChanPrbg, m_lastAllocatedLinks *
                                 m_simConfig->n_snapshot_per_slot *
                                 m_cmnLinkParams.nUeAnt * 
@@ -1592,9 +2330,24 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
                 }
                 m_freqChanPrbg = temp_freqChanPrbg;
                 m_freqChanSc = nullptr;
-            } else if (m_simConfig->run_mode == 2 || m_simConfig->run_mode == 3) {
-                // Mode 2: CIR and CFR on SC (n_prb * 12 subcarriers) 
-                // Mode 3: CIR and CFR on PRB/SC (same as mode 2)
+            } else if (m_simConfig->run_mode == 2) {
+                // Mode 2: CIR and CFR on SC only (n_prb * 12 subcarriers)
+                m_freqChanPrbg = nullptr;
+                
+                // Reallocate freqChanSc with NULL check
+                Tcomplex* temp_freqChanSc = (Tcomplex*)realloc(m_freqChanSc, m_lastAllocatedLinks *
+                                m_simConfig->n_snapshot_per_slot *
+                                m_cmnLinkParams.nUeAnt * 
+                                m_cmnLinkParams.nBsAnt * 
+                                m_simConfig->n_prb * 12 *
+                                sizeof(Tcomplex));
+                if (temp_freqChanSc == nullptr) {
+                    fprintf(stderr, "Failed to reallocate m_freqChanSc\n");
+                    return;
+                }
+                m_freqChanSc = temp_freqChanSc;
+            } else if (m_simConfig->run_mode == 3) {
+                // Mode 3: CIR and CFR on both PRBG and SC
                 Tcomplex* temp_freqChanPrbg = (Tcomplex*)realloc(m_freqChanPrbg, m_lastAllocatedLinks *
                                 m_simConfig->n_snapshot_per_slot *
                                 m_cmnLinkParams.nUeAnt * 
@@ -1620,18 +2373,8 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
                 }
                 m_freqChanSc = temp_freqChanSc;
             } else if (m_simConfig->run_mode == 4) {
-                // Mode 4: CIR and CFR on all N_FFT subcarriers
-                Tcomplex* temp_freqChanPrbg = (Tcomplex*)realloc(m_freqChanPrbg, m_lastAllocatedLinks *
-                                m_simConfig->n_snapshot_per_slot *
-                                m_cmnLinkParams.nUeAnt * 
-                                m_cmnLinkParams.nBsAnt * 
-                                m_simConfig->n_prbg *
-                                sizeof(Tcomplex));
-                if (temp_freqChanPrbg == nullptr) {
-                    fprintf(stderr, "Failed to reallocate m_freqChanPrbg\n");
-                    return;
-                }
-                m_freqChanPrbg = temp_freqChanPrbg;
+                // Mode 4: CIR and CFR on all N_FFT subcarriers only (no PRBG)
+                m_freqChanPrbg = nullptr;
 
                 // Reallocate freqChanSc for N_FFT subcarriers
                 Tcomplex* temp_freqChanSc = (Tcomplex*)realloc(m_freqChanSc, m_lastAllocatedLinks *
@@ -1703,9 +2446,9 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
                               m_simConfig->n_snapshot_per_slot *
                               m_cmnLinkParams.nUeAnt * 
                               m_cmnLinkParams.nBsAnt * 
-                              N_MAX_TAPS *
+                              maxTaps *
                               sizeof(Tcomplex)));    
-        CHECK_CUDAERROR(cudaMalloc((void**)&m_cirNormDelay, m_lastAllocatedLinks * N_MAX_TAPS * sizeof(uint16_t)));
+        CHECK_CUDAERROR(cudaMalloc((void**)&m_cirNormDelay, m_lastAllocatedLinks * maxTaps * sizeof(uint16_t)));
         CHECK_CUDAERROR(cudaMalloc((void**)&m_cirNtaps, m_lastAllocatedLinks * sizeof(uint16_t)));
         
         // Initialize cirNtaps to zero
@@ -1715,11 +2458,11 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
     // Allocate CFR memory for mode 2 only (internal CFR)
     if (m_simConfig->internal_memory_mode == 2) {
         if (m_simConfig->run_mode == 0) {
-            // Mode 0: CIR only
+            // Mode 0: CIR only - no CFR needed
             m_freqChanPrbg = nullptr;
             m_freqChanSc = nullptr;
         }
-        else if (m_simConfig->run_mode == 1 || m_simConfig->run_mode == 3) {
+        else if (m_simConfig->run_mode == 1) {
             // Mode 1: CIR and CFR on PRBG only
             CHECK_CUDAERROR(cudaMalloc((void**)&m_freqChanPrbg, m_lastAllocatedLinks *
                               m_simConfig->n_snapshot_per_slot *
@@ -1728,9 +2471,17 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
                               m_simConfig->n_prbg *
                               sizeof(Tcomplex)));
             m_freqChanSc = nullptr;
-        } else if (m_simConfig->run_mode == 2 || m_simConfig->run_mode == 3) {
-            // Mode 2: CIR and CFR on SC (n_prb * 12 subcarriers)
-            // Mode 3: CIR and CFR on PRB/SC (same as mode 2)
+        } else if (m_simConfig->run_mode == 2) {
+            // Mode 2: CIR and CFR on SC only (n_prb * 12 subcarriers)
+            m_freqChanPrbg = nullptr;
+            CHECK_CUDAERROR(cudaMalloc((void**)&m_freqChanSc, m_lastAllocatedLinks *
+                              m_simConfig->n_snapshot_per_slot *
+                              m_cmnLinkParams.nUeAnt * 
+                              m_cmnLinkParams.nBsAnt * 
+                              m_simConfig->n_prb * 12 *
+                              sizeof(Tcomplex)));
+        } else if (m_simConfig->run_mode == 3) {
+            // Mode 3: CIR and CFR on both PRBG and SC
             CHECK_CUDAERROR(cudaMalloc((void**)&m_freqChanPrbg, m_lastAllocatedLinks *
                               m_simConfig->n_snapshot_per_slot *
                               m_cmnLinkParams.nUeAnt * 
@@ -1744,13 +2495,8 @@ void slsChan<Tscalar, Tcomplex>::allocateDynamicGpuMem(uint32_t nLinks)
                               m_simConfig->n_prb * 12 *
                               sizeof(Tcomplex)));
         } else if (m_simConfig->run_mode == 4) {
-            // Mode 4: CIR and CFR on all N_FFT subcarriers
-            CHECK_CUDAERROR(cudaMalloc((void**)&m_freqChanPrbg, m_lastAllocatedLinks *
-                              m_simConfig->n_snapshot_per_slot *
-                              m_cmnLinkParams.nUeAnt * 
-                              m_cmnLinkParams.nBsAnt * 
-                              m_simConfig->n_prbg *
-                              sizeof(Tcomplex)));
+            // Mode 4: CIR and CFR on all N_FFT subcarriers only (no PRBG)
+            m_freqChanPrbg = nullptr;
             CHECK_CUDAERROR(cudaMalloc((void**)&m_freqChanSc, m_lastAllocatedLinks *
                               m_simConfig->n_snapshot_per_slot *
                               m_cmnLinkParams.nUeAnt * 
@@ -1775,6 +2521,9 @@ void slsChan<Tscalar, Tcomplex>::updateActiveLinkInd(
         printf("  activeCell[%zu]: %u\n", i, activeCell[i]);
     }
 #endif
+    
+    // Use effective taps (ISAC may require more than N_MAX_TAPS)
+    const uint32_t maxTaps = getEffectiveMaxTaps();
     
     // save of previous active link parameters
     std::vector<activeLink<Tcomplex>> prevActiveLinkParams = m_activeLinkParams;
@@ -1887,14 +2636,17 @@ void slsChan<Tscalar, Tcomplex>::updateActiveLinkInd(
             // Set per-cell pointers for internal memory mode
             if (m_simConfig->internal_memory_mode >= 1) {
                 // Set CIR pointers to the appropriate positions in contiguous buffers
+                // Use ISAC-effective antenna counts (64x64 for monostatic) if available
+                const uint32_t effRxAnt = (m_effectiveUeAnt > 0) ? m_effectiveUeAnt : m_cmnLinkParams.nUeAnt;
+                const uint32_t effTxAnt = (m_effectiveBsAnt > 0) ? m_effectiveBsAnt : m_cmnLinkParams.nBsAnt;
                 if (m_cirCoe) {
                     const size_t cirCoeOffset = linkIdx * m_simConfig->n_snapshot_per_slot * 
-                                              m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
+                                              effRxAnt * effTxAnt * maxTaps;
                     m_cirCoePerCell[i] = m_cirCoe + cirCoeOffset;
                 }
                 
                 if (m_cirNormDelay) {
-                    const size_t cirNormDelayOffset = linkIdx * N_MAX_TAPS;
+                    const size_t cirNormDelayOffset = linkIdx * maxTaps;
                     m_cirNormDelayPerCell[i] = m_cirNormDelay + cirNormDelayOffset;
                 }
                 
@@ -1941,8 +2693,11 @@ void slsChan<Tscalar, Tcomplex>::updateActiveLinkInd(
                 
                 if (m_simConfig->internal_memory_mode >= 1) {
                     // Internal modes: Use contiguous storage with global linkIdx offset
-                    const size_t cirCoeOffset = linkIdx * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
-                    const size_t cirNormDelayOffset = linkIdx * N_MAX_TAPS;
+                    // Use ISAC-effective antenna counts (64x64 for monostatic) if available
+                    const uint32_t effRxAnt = (m_effectiveUeAnt > 0) ? m_effectiveUeAnt : m_cmnLinkParams.nUeAnt;
+                    const uint32_t effTxAnt = (m_effectiveBsAnt > 0) ? m_effectiveBsAnt : m_cmnLinkParams.nBsAnt;
+                    const size_t cirCoeOffset = linkIdx * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * maxTaps;
+                    const size_t cirNormDelayOffset = linkIdx * maxTaps;
                     const size_t cirNtapsOffset = linkIdx;
                     
                     // Bounds checking for internal memory access
@@ -1988,8 +2743,8 @@ void slsChan<Tscalar, Tcomplex>::updateActiveLinkInd(
                     }
                 } else {
                     // External mode (0): Use per-cell storage with cell-specific offsets
-                    const size_t cirCoeOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
-                    const size_t cirNormDelayOffset = utIdxInCell * N_MAX_TAPS;
+                    const size_t cirCoeOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * maxTaps;
+                    const size_t cirNormDelayOffset = utIdxInCell * maxTaps;
                     const size_t cirNtapsOffset = utIdxInCell;
                     
                     cirCoePtr = (i < m_cirCoePerCell.size() && m_cirCoePerCell[i] != nullptr) ? m_cirCoePerCell[i] + cirCoeOffset : nullptr;
@@ -2069,7 +2824,7 @@ void slsChan<Tscalar, Tcomplex>::updateActiveLinkInd(
             if (m_cirCoePerCell[i] != nullptr) {
                 // Calculate offset from base pointer
                 size_t offset = (m_cirCoePerCell[i] - m_cirCoe) / 
-                              (m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS);
+                              (m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * maxTaps);
                 printf("  Cell array[%zu]: ptr offset = %zu links", i, offset);
                 if (offset >= m_lastAllocatedLinks) {
                     printf(" **ERROR: OFFSET OUT OF BOUNDS!**");
@@ -2089,6 +2844,11 @@ void slsChan<Tscalar, Tcomplex>::copyContiguousToPerCell(
     if (m_simConfig->internal_memory_mode == 0) {
         return; // No internal storage to copy from
     }
+
+    // Use effective taps (ISAC may require more than N_MAX_TAPS)
+    const uint32_t maxTaps = getEffectiveMaxTaps();
+    const uint32_t effRxAnt = (m_effectiveUeAnt > 0) ? m_effectiveUeAnt : m_cmnLinkParams.nUeAnt;
+    const uint32_t effTxAnt = (m_effectiveBsAnt > 0) ? m_effectiveBsAnt : m_cmnLinkParams.nBsAnt;
     
 #ifdef SLS_DEBUG_
     printf("DEBUG: Copying from contiguous internal storage to per-cell external arrays\n");
@@ -2102,9 +2862,9 @@ void slsChan<Tscalar, Tcomplex>::copyContiguousToPerCell(
                 // Copy CIR data if external per-cell arrays are provided
                 if (m_simConfig->internal_memory_mode >= 1) {
                     if (i < m_cirCoePerCell.size() && m_cirCoePerCell[i] != nullptr && m_cirCoe != nullptr) {
-                        const size_t contiguousOffset = linkIdx * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
-                        const size_t perCellOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
-                        const size_t copySize = m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
+                        const size_t contiguousOffset = linkIdx * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * maxTaps;
+                        const size_t perCellOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * maxTaps;
+                        const size_t copySize = m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * maxTaps;
                         
                         if (m_simConfig->cpu_only_mode == 1) {
                             memcpy(m_cirCoePerCell[i] + perCellOffset, m_cirCoe + contiguousOffset, copySize * sizeof(Tcomplex));
@@ -2114,13 +2874,13 @@ void slsChan<Tscalar, Tcomplex>::copyContiguousToPerCell(
                     }
                     
                     if (i < m_cirNormDelayPerCell.size() && m_cirNormDelayPerCell[i] != nullptr && m_cirNormDelay != nullptr) {
-                        const size_t contiguousOffset = linkIdx * N_MAX_TAPS;
-                        const size_t perCellOffset = utIdxInCell * N_MAX_TAPS;
+                        const size_t contiguousOffset = linkIdx * maxTaps;
+                        const size_t perCellOffset = utIdxInCell * maxTaps;
                         
                         if (m_simConfig->cpu_only_mode == 1) {
-                            memcpy(m_cirNormDelayPerCell[i] + perCellOffset, m_cirNormDelay + contiguousOffset, N_MAX_TAPS * sizeof(uint16_t));
+                            memcpy(m_cirNormDelayPerCell[i] + perCellOffset, m_cirNormDelay + contiguousOffset, maxTaps * sizeof(uint16_t));
                         } else {
-                            CHECK_CUDAERROR(cudaMemcpyAsync(m_cirNormDelayPerCell[i] + perCellOffset, m_cirNormDelay + contiguousOffset, N_MAX_TAPS * sizeof(uint16_t), cudaMemcpyDeviceToDevice, m_strm));
+                            CHECK_CUDAERROR(cudaMemcpyAsync(m_cirNormDelayPerCell[i] + perCellOffset, m_cirNormDelay + contiguousOffset, maxTaps * sizeof(uint16_t), cudaMemcpyDeviceToDevice, m_strm));
                         }
                     }
                     
@@ -2139,9 +2899,9 @@ void slsChan<Tscalar, Tcomplex>::copyContiguousToPerCell(
                 // Copy CFR data if mode 2 and external per-cell arrays are provided
                 if (m_simConfig->internal_memory_mode == 2) {
                     if (i < m_freqChanPrbgPerCell.size() && m_freqChanPrbgPerCell[i] != nullptr && m_freqChanPrbg != nullptr) {
-                        const size_t contiguousOffset = linkIdx * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * m_simConfig->n_prbg;
-                        const size_t perCellOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * m_simConfig->n_prbg;
-                        const size_t copySize = m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * m_simConfig->n_prbg;
+                        const size_t contiguousOffset = linkIdx * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * m_simConfig->n_prbg;
+                        const size_t perCellOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * m_simConfig->n_prbg;
+                        const size_t copySize = m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * m_simConfig->n_prbg;
                         
                         if (m_simConfig->cpu_only_mode == 1) {
                             memcpy(m_freqChanPrbgPerCell[i] + perCellOffset, m_freqChanPrbg + contiguousOffset, copySize * sizeof(Tcomplex));
@@ -2152,9 +2912,9 @@ void slsChan<Tscalar, Tcomplex>::copyContiguousToPerCell(
                     
                     if (i < m_freqChanScPerCell.size() && m_freqChanScPerCell[i] != nullptr && m_freqChanSc != nullptr) {
                         uint32_t scPerLink = (m_simConfig->run_mode == 4) ? m_simConfig->fft_size : (m_simConfig->n_prb * 12);
-                        const size_t contiguousOffset = linkIdx * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * scPerLink;
-                        const size_t perCellOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * scPerLink;
-                        const size_t copySize = m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * scPerLink;
+                        const size_t contiguousOffset = linkIdx * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * scPerLink;
+                        const size_t perCellOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * scPerLink;
+                        const size_t copySize = m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * scPerLink;
                         
                         if (m_simConfig->cpu_only_mode == 1) {
                             memcpy(m_freqChanScPerCell[i] + perCellOffset, m_freqChanSc + contiguousOffset, copySize * sizeof(Tcomplex));
@@ -2179,6 +2939,11 @@ void slsChan<Tscalar, Tcomplex>::copyPerCellToContiguous(
     if (m_simConfig->internal_memory_mode == 0) {
         return; // No internal storage to copy to
     }
+
+    // Use effective taps (ISAC may require more than N_MAX_TAPS)
+    const uint32_t maxTaps = getEffectiveMaxTaps();
+    const uint32_t effRxAnt = (m_effectiveUeAnt > 0) ? m_effectiveUeAnt : m_cmnLinkParams.nUeAnt;
+    const uint32_t effTxAnt = (m_effectiveBsAnt > 0) ? m_effectiveBsAnt : m_cmnLinkParams.nBsAnt;
     
 #ifdef SLS_DEBUG_
     printf("DEBUG: Copying from per-cell external arrays to contiguous internal storage\n");
@@ -2192,9 +2957,9 @@ void slsChan<Tscalar, Tcomplex>::copyPerCellToContiguous(
                 // Copy CIR data from external per-cell arrays if available
                 if (m_simConfig->internal_memory_mode >= 1) {
                     if (i < m_cirCoePerCell.size() && m_cirCoePerCell[i] != nullptr && m_cirCoe != nullptr) {
-                        const size_t contiguousOffset = linkIdx * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
-                        const size_t perCellOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
-                        const size_t copySize = m_simConfig->n_snapshot_per_slot * m_cmnLinkParams.nUeAnt * m_cmnLinkParams.nBsAnt * N_MAX_TAPS;
+                        const size_t contiguousOffset = linkIdx * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * maxTaps;
+                        const size_t perCellOffset = utIdxInCell * m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * maxTaps;
+                        const size_t copySize = m_simConfig->n_snapshot_per_slot * effRxAnt * effTxAnt * maxTaps;
                         
                         if (m_simConfig->cpu_only_mode == 1) {
                             memcpy(m_cirCoe + contiguousOffset, m_cirCoePerCell[i] + perCellOffset, copySize * sizeof(Tcomplex));
@@ -2204,13 +2969,13 @@ void slsChan<Tscalar, Tcomplex>::copyPerCellToContiguous(
                     }
                     
                     if (i < m_cirNormDelayPerCell.size() && m_cirNormDelayPerCell[i] != nullptr && m_cirNormDelay != nullptr) {
-                        const size_t contiguousOffset = linkIdx * N_MAX_TAPS;
-                        const size_t perCellOffset = utIdxInCell * N_MAX_TAPS;
+                        const size_t contiguousOffset = linkIdx * maxTaps;
+                        const size_t perCellOffset = utIdxInCell * maxTaps;
                         
                         if (m_simConfig->cpu_only_mode == 1) {
-                            memcpy(m_cirNormDelay + contiguousOffset, m_cirNormDelayPerCell[i] + perCellOffset, N_MAX_TAPS * sizeof(uint16_t));
+                            memcpy(m_cirNormDelay + contiguousOffset, m_cirNormDelayPerCell[i] + perCellOffset, maxTaps * sizeof(uint16_t));
                         } else {
-                            CHECK_CUDAERROR(cudaMemcpyAsync(m_cirNormDelay + contiguousOffset, m_cirNormDelayPerCell[i] + perCellOffset, N_MAX_TAPS * sizeof(uint16_t), cudaMemcpyDeviceToDevice, m_strm));
+                            CHECK_CUDAERROR(cudaMemcpyAsync(m_cirNormDelay + contiguousOffset, m_cirNormDelayPerCell[i] + perCellOffset, maxTaps * sizeof(uint16_t), cudaMemcpyDeviceToDevice, m_strm));
                         }
                     }
                     
@@ -2440,10 +3205,10 @@ void slsChan<Tscalar, Tcomplex>::dump_los_nlos_stats(float* lost_nlos_stats) {
 }
 
 template <typename Tscalar, typename Tcomplex>
-void slsChan<Tscalar, Tcomplex>::dump_pathloss_shadowing_stats(float* pathloss_shadowing,
-                                                              const std::vector<uint16_t>& activeCell,
-                                                              const std::vector<uint16_t>& activeUt) {
-    if (pathloss_shadowing == nullptr) {
+void slsChan<Tscalar, Tcomplex>::dump_pl_sf_stats(float* pl_sf,
+                                                  const std::vector<uint16_t>& activeCell,
+                                                  const std::vector<uint16_t>& activeUt) {
+    if (pl_sf == nullptr) {
         return;
     }
     
@@ -2478,7 +3243,7 @@ void slsChan<Tscalar, Tcomplex>::dump_pathloss_shadowing_stats(float* pathloss_s
     }
     
     // Step 2: Initialize output array
-    std::memset(pathloss_shadowing, 0, total_elements * sizeof(float));
+    std::memset(pl_sf, 0, total_elements * sizeof(float));
     
     // Step 3: Fill the array with pathloss + shadowing data
     for (uint32_t cell_idx = 0; cell_idx < num_cells; ++cell_idx) {
@@ -2516,8 +3281,132 @@ void slsChan<Tscalar, Tcomplex>::dump_pathloss_shadowing_stats(float* pathloss_s
                 
                 // Store total loss = - (pathloss - shadow fading) (both in dB)
                 // The sign of the shadow fading is defined so that positive SF means more received power at UT than predicted by the path loss model
-                pathloss_shadowing[arrayIdx] = - (m_linkParams[linkIdx].pathloss - m_linkParams[linkIdx].SF);
+                pl_sf[arrayIdx] = - (m_linkParams[linkIdx].pathloss - m_linkParams[linkIdx].SF);
             }
+        }
+    }
+}
+
+template <typename Tscalar, typename Tcomplex>
+void slsChan<Tscalar, Tcomplex>::dump_pl_sf_ant_gain_stats(float* pl_sf_ant_gain,
+                                                                       const std::vector<uint16_t>& activeCell,
+                                                                       const std::vector<uint16_t>& activeUt) {
+    if (pl_sf_ant_gain == nullptr) {
+        return;
+    }
+
+    // Step 1: Same dimension logic as dump_pl_sf_stats
+    const bool dump_all_cells = activeCell.empty();
+    const bool dump_all_uts = activeUt.empty();
+
+    uint32_t num_cells, num_uts, total_elements;
+    const uint32_t total_sectors = m_sysConfig->n_sector_per_site * m_sysConfig->n_site;
+
+    if (dump_all_cells && dump_all_uts) {
+        num_cells = total_sectors;
+        num_uts = m_sysConfig->n_ut;
+        total_elements = num_cells * num_uts;
+    } else if (dump_all_cells && !dump_all_uts) {
+        num_cells = total_sectors;
+        num_uts = activeUt.size();
+        total_elements = num_cells * num_uts;
+    } else if (!dump_all_cells && dump_all_uts) {
+        num_cells = activeCell.size();
+        num_uts = m_sysConfig->n_ut;
+        total_elements = num_cells * num_uts;
+    } else {
+        num_cells = activeCell.size();
+        num_uts = activeUt.size();
+        total_elements = num_cells * num_uts;
+    }
+
+    std::memset(pl_sf_ant_gain, 0, total_elements * sizeof(float));
+
+    // Antenna gain: read from panel antTheta/antPhi when available (antModel 0 = isotropic, 1 = directional)
+    for (uint32_t cell_idx = 0; cell_idx < num_cells; ++cell_idx) {
+        uint16_t cid = dump_all_cells ? static_cast<uint16_t>(cell_idx) : activeCell[cell_idx];
+
+        if (cid >= m_topology.cellParams.size()) continue;
+
+        const uint16_t site_id = m_topology.cellParams[cid].siteId;
+        const float sector_orient_deg = m_topology.cellParams[cid].antPanelOrientation[1];
+
+        // Resolve BS antenna panel and G_max (element gain); antenna panel config is required
+        if (m_antPanelConfig == nullptr) {
+            throw std::runtime_error("pl_sf_ant_gain: antenna panel config is required (m_antPanelConfig is null)");
+        }
+        uint32_t ant_panel_idx = m_topology.cellParams[cid].antPanelIdx;
+        if (ant_panel_idx >= m_antPanelConfig->size()) {
+            throw std::runtime_error(
+                "pl_sf_ant_gain: cell " + std::to_string(cid) + " antPanelIdx " + std::to_string(ant_panel_idx)
+                + " is out of range (config size " + std::to_string(m_antPanelConfig->size()) + ")");
+        }
+        const AntPanelConfig* bs_panel = &(*m_antPanelConfig)[ant_panel_idx];
+        // Per antenna element gain only (no array gain 10*log10(nAnt)); downstream may apply array/beamforming gain separately
+        float G_max = SLS_ANTENNA_GAIN_MAX_DBI;
+
+        for (uint32_t ue_idx = 0; ue_idx < num_uts; ++ue_idx) {
+            uint16_t uid = dump_all_uts ? static_cast<uint16_t>(ue_idx) : activeUt[ue_idx];
+
+            const uint32_t linkIdx = site_id * m_sysConfig->n_ut + uid;
+
+            if (linkIdx >= m_linkParams.size() || cid >= total_sectors || uid >= m_sysConfig->n_ut) {
+                continue;
+            }
+
+            const uint32_t arrayIdx = cell_idx * num_uts + ue_idx;
+
+            float pathloss = m_linkParams[linkIdx].pathloss;
+            float SF = m_linkParams[linkIdx].SF;
+
+            // BS-side antenna gain (ZOD / AOD, subtract BS downtilt)
+            float bs_theta_deg = m_linkParams[linkIdx].theta_LOS_ZOD - m_topology.cellParams[cid].antPanelOrientation[0];
+            float bs_phi_deg = m_linkParams[linkIdx].phi_LOS_AOD - sector_orient_deg;
+
+            int bs_theta_idx = static_cast<int>(std::round(bs_theta_deg));
+            if (bs_theta_idx < 0 || bs_theta_idx >= 360) {
+                bs_theta_idx = bs_theta_idx % 360;
+                if (bs_theta_idx < 0) bs_theta_idx += 360;
+            }
+            bs_theta_idx = (bs_theta_idx > 180) ? 360 - bs_theta_idx : bs_theta_idx;
+
+            int bs_phi_idx = static_cast<int>(std::round(bs_phi_deg));
+            if (bs_phi_idx < 0 || bs_phi_idx > 359) {
+                bs_phi_idx = bs_phi_idx % 360;
+                if (bs_phi_idx < 0) bs_phi_idx += 360;
+            }
+            bs_phi_idx = std::max(0, std::min(359, bs_phi_idx));
+
+            float bs_ant_gain = bs_panel->antTheta[bs_theta_idx] + bs_panel->antPhi[bs_phi_idx]
+                                + (bs_panel->antModel == 1 ? G_max : 0.0f);
+
+            // UE-side antenna gain (ZOA / AOA, subtract UE downtilt)
+            uint32_t ue_panel_idx = m_topology.utParams[uid].antPanelIdx;
+            const AntPanelConfig* ue_panel = (ue_panel_idx < m_antPanelConfig->size())
+                                             ? &(*m_antPanelConfig)[ue_panel_idx] : bs_panel;
+
+            float ue_theta_deg = m_linkParams[linkIdx].theta_LOS_ZOA - m_topology.utParams[uid].antPanelOrientation[0];
+            float ue_phi_deg = m_linkParams[linkIdx].phi_LOS_AOA - m_topology.utParams[uid].antPanelOrientation[1];
+
+            int ue_theta_idx = static_cast<int>(std::round(ue_theta_deg));
+            if (ue_theta_idx < 0 || ue_theta_idx >= 360) {
+                ue_theta_idx = ue_theta_idx % 360;
+                if (ue_theta_idx < 0) ue_theta_idx += 360;
+            }
+            ue_theta_idx = (ue_theta_idx > 180) ? 360 - ue_theta_idx : ue_theta_idx;
+
+            int ue_phi_idx = static_cast<int>(std::round(ue_phi_deg));
+            if (ue_phi_idx < 0 || ue_phi_idx > 359) {
+                ue_phi_idx = ue_phi_idx % 360;
+                if (ue_phi_idx < 0) ue_phi_idx += 360;
+            }
+            ue_phi_idx = std::max(0, std::min(359, ue_phi_idx));
+
+            float ue_ant_gain = ue_panel->antTheta[ue_theta_idx] + ue_panel->antPhi[ue_phi_idx]
+                                + (ue_panel->antModel == 1 ? G_max : 0.0f);
+
+            // Total: BS gain + UE gain - pathloss + SF (all dB, per element, no array gain)
+            pl_sf_ant_gain[arrayIdx] = bs_ant_gain + ue_ant_gain - pathloss + SF;
         }
     }
 }

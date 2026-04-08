@@ -321,6 +321,7 @@ static inline __device__ void LowPaprSeqGen(__half2* rbase, int m_zc, int u, int
     }
 }
 
+__launch_bounds__(F3_CG_SIZE,12)
 static __global__ void
 pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 {
@@ -328,129 +329,11 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     auto                      cta  = cg::this_thread_block();
     cg::thread_block_tile<32> tile = cg::tiled_partition<32>(cta);
 
+    int      tid     = cta.thread_rank();
     uint32_t uci_num = blockIdx.x;
-
-    // Shared memory for each group. This can be optimized later by dynamically launching based on the actual antennas
-    // and data/dmrs symbols
-
-    // We alias the dmrs symbols onto the data since we use that before getting any data. Find the max between the two sizes
-    // so we don't overrun the buffer
-    constexpr uint32_t shm_round = std::max(MAX_DATA_SYMS_F3 * F3_DATA_FETCH_SCS, MAX_DMRS_SYMS_F3 * N_TONES_PER_PRB * F3_MAX_PRBS);
-
-    __shared__ __half2 y_data[F3_GROUPS_PER_BLOCK * shm_round * F3_MAX_RX_ANTENNA];
-    __shared__ __half2 y_ch_est[F3_GROUPS_PER_BLOCK * MAX_DMRS_SYMS_F3 * N_TONES_PER_PRB * F3_MAX_PRBS * F3_MAX_RX_ANTENNA]; // 12288
-    __shared__ __half2 r_base[F3_GROUPS_PER_BLOCK * F3_MAX_PRBS * N_TONES_PER_PRB];                                          // 768
-    __shared__ __half2 x_dmrs[F3_GROUPS_PER_BLOCK * N_TONES_PER_PRB * F3_MAX_PRBS * MAX_DMRS_SYMS_F3];
-    __shared__ __half2 z_data[F3_GROUPS_PER_BLOCK * MAX_DATA_SYMS_F3 * F3_MAX_PRBS * N_TONES_PER_PRB]; // 10752
-    __shared__ int     cs[F3_GROUPS_PER_BLOCK * F3_MAX_SYMS];
-    __shared__ float   ch_first_hop[F3_GROUPS_PER_BLOCK * F3_MAX_PRBS * N_TONES_PER_PRB];
-    __shared__ float   ch_second_hop[F3_GROUPS_PER_BLOCK * F3_MAX_PRBS * N_TONES_PER_PRB];
-    __shared__ float   eq_first_hop[F3_GROUPS_PER_BLOCK * F3_MAX_PRBS * N_TONES_PER_PRB];
-    __shared__ float   eq_second_hop[F3_GROUPS_PER_BLOCK * F3_MAX_PRBS * N_TONES_PER_PRB];
-    __shared__ float   rx_energy_reduc[F3_CG_SIZE / 32];
-    __shared__ float   rssi_linear_reduc[F3_CG_SIZE / 32];
-    __shared__ float   r_tilde_reduc[F3_CG_SIZE / 32];
-    __shared__ __half2 sc_corr_reduc[F3_CG_SIZE / 32];
-
-    // Per-group shared memory carveouts
-    __half2* uci_data_s        = &y_data[0];
-    __half2* uci_dmrs_s        = &y_data[0]; // Aliased
-    __half2* uci_x_dmrs        = &x_dmrs[0];
-    __half2* uci_r_base        = &r_base[0];
-    __half2* uci_ch_est        = &y_ch_est[0];
-    __half2* uci_z_data        = &z_data[0];
-    __half2* uci_z             = &y_data[0]; // Aliased
-    __half2* uci_scrmLLR       = &z_data[0]; // Aliased
-    int*     uci_cs            = &cs[0];
-    float*   uci_ch_first_hop  = &ch_first_hop[0];
-    float*   uci_ch_second_hop = &ch_second_hop[0];
-    float*   uci_eq_first_hop  = &eq_first_hop[0];
-    float*   uci_eq_second_hop = &eq_second_hop[0];
-    __half2  tmp;
-    float2   tmpf;
 
     // UCI data for this group
     auto uci_data = &pDynDescr->uciPrms[uci_num];
-
-    // Moved Gold sequence generations from CPU to GPU
-    uint32_t randomSeqScrm[144];
-    uint8_t  u[2];
-    uint8_t  v[2];
-    uint16_t csCommon[F3_MAX_SYMS];
-
-    uint16_t E_tot            = uci_data->E_tot;
-    uint16_t dataScramblingId = uci_data->dataScramblingId;
-    uint16_t rnti             = uci_data->rnti;
-    //descrambling random sequence
-    uint16_t round            = ceil(float(E_tot)/32.0);
-    int cInit                 = rnti * 32768 + dataScramblingId;
-    int seqStart              = 0;
-    for(int i = 0; i < round; i++)
-    {
-        uint32_t g       = descrambling::gold32n(cInit, seqStart);
-        randomSeqScrm[i] = g;
-        seqStart        += 32;
-    }
-
-    //csCommon
-    uint16_t pucchHoppingId = uci_data->pucchHoppingId;
-    uint16_t slotNum        = uci_data->slotNum;
-    uint8_t  startSymTemp   = uci_data->startSym;
-    uint8_t  Counter        = 0;
-    uint32_t g              = descrambling::gold32n(pucchHoppingId, 112 * slotNum + 8 * startSymTemp);
-
-    for(int i = 0; i < uci_data->nSym; i++)
-    {
-        if(Counter == 4)
-        {
-            startSymTemp += 4;
-            g             = descrambling::gold32n(pucchHoppingId, 112 * slotNum + 8 * startSymTemp);
-            Counter       = 0;
-        }
-
-        csCommon[i] = (g >> (Counter * 8) & LOWER_BYTE_BMSK);
-        Counter++;
-    }
-
-    //u, v
-    if(uci_data->groupHopFlag)
-    {
-        uint32_t g    = descrambling::gold32n(floor(pucchHoppingId / 30.0), 16 * slotNum);
-        uint8_t  f_ss = pucchHoppingId % 30;
-
-        // first hop
-        uint8_t f_gh  = (g & LOWER_BYTE_BMSK) % 30;
-        u[0]          = (f_ss + f_gh) % 30;
-
-        // second hop
-        if(uci_data->freqHopFlag)
-        {
-            f_gh = ((g >> 8) & LOWER_BYTE_BMSK) % 30;
-            u[1] = (f_ss + f_gh) % 30;
-        } else {
-            u[1] = u[0];
-        }
-    } else {
-        uint8_t uTemp = pucchHoppingId % 30;
-        u[0]          = uTemp;
-        u[1]          = uTemp;
-    }
-
-    if(uci_data->sequenceHopFlag)
-    {
-        uint32_t g = descrambling::gold32n(32 * floor(pucchHoppingId / 30.0) + pucchHoppingId % 30, 2 * slotNum);
-        v[0] = g & LOWER_BIT_BMSK;
-
-        if(uci_data->freqHopFlag)
-        {
-            v[1] = (g >> 1) & LOWER_BIT_BMSK;
-        } else {
-            v[1] = v[0];
-        }
-    } else {
-        v[0] = 0;
-        v[1] = 0;
-    }
 
     // cell idx
     int16_t cellIdx  = uci_data->cellIdx;
@@ -466,103 +349,185 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     tensor_ref<const __half2> tDataRx(pDynDescr->pCellPrms[cellIdx].tDataRx.pAddr, pDynDescr->pCellPrms[cellIdx].tDataRx.strides);
 
-    // Lane without our group
-    int lane     = cta.thread_rank();
-    int dmrs_idx = 0;
-    int data_idx = 0;
-
     uint32_t prb_size = uci_data->prbSize;
     uint32_t tot_scs  = prb_size * N_TONES_PER_PRB;
 
     constexpr int prbBlockSize = 4;
     constexpr int scsBlockSize = prbBlockSize * N_TONES_PER_PRB;
 
-    // Initialize shared memory
-    if(lane < uci_data->nSym)
-    {
-        uci_cs[lane] = (csCommon[lane] + 0) % 12;
+    //===========================================================================
+    // dynamic shared memory allocations
+    extern __shared__ __half2 sh_buff[];
+
+    int y_data_elems = max(uci_data->nSym_data * F3_DATA_FETCH_SCS * numRxAnt,  // for uci_data_s
+                           uci_data->nSym_dmrs * tot_scs * numRxAnt);         // for uci_dmrs_s
+    y_data_elems = max(y_data_elems, uci_data->nSym_data * tot_scs);          // for uci_z (IDFT output)
+
+    const int z_data_elems = max(uci_data->nSym_data * tot_scs,                 // for IDFT output
+                                tot_scs * numRxAnt * uci_data->nSym_dmrs);    // for GEMV temp buffer
+
+    __half2* y_data   = reinterpret_cast<__half2*>(sh_buff);                      // [y_data_elems]
+    __half2* y_ch_est = &y_data[y_data_elems];                                    // [nAnt * nSym_dmrs * tot_scs]
+    __half2* r_base   = &y_ch_est[numRxAnt * uci_data->nSym_dmrs * tot_scs];      // [tot_scs]
+    __half2* x_dmrs   = &r_base[prb_size * N_TONES_PER_PRB];                      // [nSym_dmrs * tot_scs]
+    __half2* z_data   = &x_dmrs[uci_data->nSym_dmrs * tot_scs];                   // [z_data_elems]
+    __half*  eq_first_hop  = reinterpret_cast<__half*>(&z_data[z_data_elems]);    // [tot_scs]
+    __half*  eq_second_hop = &eq_first_hop[tot_scs];                              // [tot_scs]
+
+    //---------------------------------------------------------------------------
+    // static shared memory allocations
+    constexpr int NUM_WARPS = F3_CG_SIZE / 32;
+    __shared__ uint8_t cs[F3_MAX_SYMS];
+    __shared__ float   rx_energy_reduc[NUM_WARPS];
+    __shared__ float   rssi_linear_reduc[NUM_WARPS];
+    __shared__ float   r_tilde_reduc[NUM_WARPS];
+    __shared__ __half2 sc_corr_reduc[NUM_WARPS];
+    __shared__ uint32_t randomSeqScrm[144];  // CTA-cooperative cache of Gold words
+    __shared__ uint16_t csCommon[F3_MAX_SYMS];
+    __shared__ uint8_t  u_s[2];
+    __shared__ uint8_t  v_s[2];
+    //---------------------------------------------------------------------------
+    // Per-group shared memory carveouts with aliasing for memory efficiency.
+    // Aliased buffers are used in distinct phases (separated by __syncthreads).
+    //
+    // y_data aliases (used sequentially):
+    //   - uci_dmrs_s   : DMRS symbol loading from global memory
+    //   - uci_data_s   : Data symbol loading (block-wise)
+    //   - uci_z        : IDFT output storage
+    //
+    // z_data aliases (used sequentially):
+    //   - uci_gemv_temp: W filter GEMV temporary buffer
+    //   - uci_z_data   : Equalized data (after IDFT input)
+    //   - uci_scrmLLR  : Descrambled LLR output
+    //---------------------------------------------------------------------------
+    __half2* uci_data_s        = &y_data[0];  // Aliased with y_data
+    __half2* uci_dmrs_s        = &y_data[0];  // Aliased with y_data
+    __half2* uci_z             = &y_data[0];  // Aliased with y_data
+    __half2* uci_x_dmrs        = &x_dmrs[0];
+    __half2* uci_r_base        = &r_base[0];
+    __half2* uci_ch_est        = &y_ch_est[0];
+    __half2* uci_gemv_temp     = &z_data[0];  // Aliased with z_data
+    __half2* uci_z_data        = &z_data[0];  // Aliased with z_data
+    __half2* uci_scrmLLR       = &z_data[0];  // Aliased with z_data
+    uint8_t* uci_cs            = &cs[0];
+    __half*  uci_eq_first_hop  = &eq_first_hop[0];
+    __half*  uci_eq_second_hop = &eq_second_hop[0];
+    //===========================================================================
+
+    // Cooperatively populate randomSeqScrm
+    const int cInit = uci_data->rnti * 32768 + uci_data->dataScramblingId;
+    const int round = (uci_data->E_tot + 31) >> 5;   // ceil(E_tot/32)
+    for (int idx = tid; idx < round; idx += F3_CG_SIZE) {
+        randomSeqScrm[idx] = descrambling::gold32n(cInit, idx * 32);
     }
 
-    for(int i = lane; i < F3_MAX_PRBS * N_TONES_PER_PRB; i += F3_CG_SIZE)
+    // Cooperatively populate csCommon - parallelize Gold sequence computation across threads
+    if(tid < uci_data->nSym)
     {
-        uci_ch_first_hop[lane]  = 0.0;
-        uci_ch_second_hop[lane] = 0.0;
+        const int pucchHoppingId = uci_data->pucchHoppingId;
+        const int slotNum        = uci_data->slotNum;
+        const int startSym       = uci_data->startSym;
+
+        // Each thread handles symbols where tid matches (gold_word_idx % F3_CG_SIZE)
+        // Gold word covers 4 symbols, so we compute one Gold word per 4 symbols
+        const int      gold_idx = tid / 4; // Which Gold word
+        const int      byte_idx = tid % 4; // Which byte within Gold word
+
+        const uint32_t g = descrambling::gold32n(pucchHoppingId, 112 * slotNum + 8 * (startSym + gold_idx * 4));
+        csCommon[tid]    = (uint16_t)((g >> (byte_idx * 8)) & LOWER_BYTE_BMSK);
     }
+
+    //__syncthreads();  // Not needed here; a barrier is already executed before randomSeqScrm and csCommon are used.
+
+    // u_s and v_s computation - parallelize across 2 threads
+    // Thread 0: compute u (group hopping)
+    // Thread 1: compute v (sequence hopping)
+    if(tid == 0)
+    {
+        const int pucchHoppingId = uci_data->pucchHoppingId;
+        const int slotNum        = uci_data->slotNum;
+        const int f_ss           = pucchHoppingId % 30;
+
+        if(uci_data->groupHopFlag)
+        {
+            const uint32_t g_uv  = descrambling::gold32n(pucchHoppingId / 30, 16 * slotNum);
+            int            f_gh0 = (int)(g_uv & LOWER_BYTE_BMSK) % 30;
+            u_s[0]               = (uint8_t)((f_ss + f_gh0) % 30);
+
+            if(uci_data->freqHopFlag)
+            {
+                int f_gh1 = (int)((g_uv >> 8) & LOWER_BYTE_BMSK) % 30;
+                u_s[1]    = (uint8_t)((f_ss + f_gh1) % 30);
+            }
+            else { u_s[1] = u_s[0]; }
+        }
+        else { u_s[0] = u_s[1] = (uint8_t)f_ss; }
+    }
+    else if(tid == 1)
+    {
+        const int pucchHoppingId = uci_data->pucchHoppingId;
+        const int slotNum        = uci_data->slotNum;
+
+        if(uci_data->sequenceHopFlag)
+        {
+            const int      q   = pucchHoppingId / 30;
+            const int      r   = pucchHoppingId % 30;
+            const uint32_t g_v = descrambling::gold32n(32 * q + r, 2 * slotNum);
+            v_s[0]             = (uint8_t)(g_v & LOWER_BIT_BMSK);
+            v_s[1]             = uci_data->freqHopFlag ? (uint8_t)((g_v >> 1) & LOWER_BIT_BMSK) : v_s[0];
+        }
+        else { v_s[0] = v_s[1] = 0; }
+    }
+
+    __syncthreads();
+
+    // load shared results into locals
+    uint8_t u[2] = {u_s[0], u_s[1]};
+    uint8_t v[2] = {v_s[0], v_s[1]};
+
+    // init cs[] from csCommon (unchanged use-site)
+    if(tid < uci_data->nSym) { uci_cs[tid] = (csCommon[tid] + 0) % 12; }
 
     // Load DMRS symbols. The DMRS symbols are loaded first since there are possibly fewer of them total than data
     // symbols, and we need to load the data symbols in blocks to conserve memory. F3 is different than F1 in
     // that the DMRS symbols aren't every other symbol, and instead can be anywhere.
+    const int dmrs_load_work      = tot_scs * uci_data->nSym_dmrs * numRxAnt;
+    const int dmrsFirstHopStartSc = (uci_data->startPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
+    const int dmrsSecondHopStartSc= (uci_data->secondHopPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
+    const int dmrs_half_nSym      = uci_data->nSym / 2;
+    const int nSym_dmrs_local     = uci_data->nSym_dmrs;
+
     float rssi_linear_temp = 0;
-    
-    int check_sym = 0;
-    for(int i = lane; i < tot_scs; i += F3_CG_SIZE)
+
+    for(int w = tid; w < dmrs_load_work; w += F3_CG_SIZE)
     {
-        int firstHopSc = (uci_data->startPrb + uci_data->bwpStart) * N_TONES_PER_PRB + i;
-        if(uci_data->freqHopFlag)
-        {
-            for(int sym = uci_data->startSym; sym < uci_data->startSym + uci_data->nSym / 2; sym++)
-            {
-                if(uci_data->SetSymDmrs[dmrs_idx] == check_sym)
-                {
-                    for(int a = 0; a < numRxAnt; a++)
-                    {
-                        tmp = tDataRx(firstHopSc, sym, a);
-                        tmpf = __half22float2(tmp);
-                        rssi_linear_temp += tmpf.x*tmpf.x + tmpf.y*tmpf.y;
-                        uci_dmrs_s[a * uci_data->nSym_dmrs * tot_scs + dmrs_idx * tot_scs + i] = tmp;
-                    }
-                    dmrs_idx++;
-                }
+        const int sc       = w / (nSym_dmrs_local * numRxAnt);
+        const int rem      = w % (nSym_dmrs_local * numRxAnt);
+        const int dmrs_sym = rem / numRxAnt;
+        const int a        = rem % numRxAnt;
 
-                check_sym++;
-            }
+        // SetSymDmrs[dmrs_sym] gives relative OFDM symbol index for this DMRS symbol
+        const int rel_ofdm_sym = uci_data->SetSymDmrs[dmrs_sym];
+        const int ofdm_sym     = uci_data->startSym + rel_ofdm_sym;
 
-            int secondHopSc = (uci_data->secondHopPrb + uci_data->bwpStart) * N_TONES_PER_PRB + i;
-            for(int sym = uci_data->startSym + uci_data->nSym / 2; sym < uci_data->startSym + uci_data->nSym; sym++)
-            {
-                if(uci_data->SetSymDmrs[dmrs_idx] == check_sym)
-                {
-                    for(int a = 0; a < numRxAnt; a++)
-                    {
-                        tmp = tDataRx(secondHopSc, sym, a);
-                        tmpf = __half22float2(tmp);
-                        rssi_linear_temp += tmpf.x*tmpf.x + tmpf.y*tmpf.y;
-                        uci_dmrs_s[a * uci_data->nSym_dmrs * tot_scs + dmrs_idx * tot_scs + i] = tmp;
-                    }
-                    dmrs_idx++;
-                }
+        // Determine frequency position based on hop
+        const int baseSc = (uci_data->freqHopFlag && rel_ofdm_sym >= dmrs_half_nSym)
+                               ? dmrsSecondHopStartSc : dmrsFirstHopStartSc;
 
-                check_sym++;
-            }
-        }
-        else
-        {
-            for(int sym = uci_data->startSym; sym < uci_data->startSym + uci_data->nSym; sym++)
-            {
-                if(uci_data->SetSymDmrs[dmrs_idx] == check_sym)
-                {
-                    for(int a = 0; a < numRxAnt; a++)
-                    {
-                        tmp = tDataRx(firstHopSc, sym, a);
-                        tmpf = __half22float2(tmp);
-                        rssi_linear_temp += tmpf.x*tmpf.x + tmpf.y*tmpf.y;
-                        uci_dmrs_s[a * uci_data->nSym_dmrs * tot_scs + dmrs_idx * tot_scs + i] = tmp;
-                    }
+        auto tmp  = tDataRx(baseSc + sc, ofdm_sym, a);
+        auto tmpf = __half22float2(tmp);
+        rssi_linear_temp += tmpf.x * tmpf.x + tmpf.y * tmpf.y;
 
-                    dmrs_idx++;
-                }
-
-                check_sym++;
-            }
-        }
+        uci_dmrs_s[a * nSym_dmrs_local * tot_scs + dmrs_sym * tot_scs + sc] = tmp;
     }
 
     __syncthreads();
 
     rssi_linear_temp = cg::reduce(tile, rssi_linear_temp, cg::plus<float>());
 
-    // Generate the r_base vector in shared memory and make the initial channel estimates
-    for(int sym = 0; sym < uci_data->nSym_dmrs; sym++)
+    // Phase 1: Generate r_base and x_dmrs for each DMRS symbol (serial due to r_base reuse)
+    const int nSym_dmrs = uci_data->nSym_dmrs;
+    for(int sym = 0; sym < nSym_dmrs; sym++)
     {
         bool firstHop = false;
         if((sym == 0 && !uci_data->AddDmrsFlag) || (sym <= 1 && uci_data->AddDmrsFlag))
@@ -597,57 +562,78 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
                 LowPaprSeqGen(uci_r_base, tot_scs, u[0], v[1]);
             }
         }
+        __syncthreads();    // ensure uci_r_base is ready
 
-        __syncthreads();
-
-        __half2 x_dmrs;
-        for(int i = lane; i < tot_scs; i += F3_CG_SIZE)
+        // Compute x_dmrs only, store to uci_x_dmrs
+        for(int i = tid; i < tot_scs; i += F3_CG_SIZE)
         {
-            x_dmrs = {cosf(i * (2.0 * (M_PI / 12.0)) * uci_cs[uci_data->SetSymDmrs[sym]]),
-                      sinf(i * (2.0 * (M_PI / 12.0)) * uci_cs[uci_data->SetSymDmrs[sym]])};
+            __half2 x_dmrs = {cosf(i * (2.0 * (M_PI / 12.0)) * uci_cs[uci_data->SetSymDmrs[sym]]),
+                              sinf(i * (2.0 * (M_PI / 12.0)) * uci_cs[uci_data->SetSymDmrs[sym]])};
             x_dmrs = complex_mul(uci_r_base[i], x_dmrs);
-
             uci_x_dmrs[sym * tot_scs + i] = x_dmrs;
+        }
+        __syncthreads();    // ensure uci_r_base is not overwritten before updating uci_x_dmrs
+    }
+
+    // Phase 2: Compute channel estimates (flattened across sym, subcarrier; antenna serial)
+    // Each thread reads a unique x_dmrs element to avoid bank conflicts, then loops over antennas.
+    {
+        const int ch_est_items = nSym_dmrs * tot_scs;
+        for(int w = tid; w < ch_est_items; w += F3_CG_SIZE)
+        {
+            const int sym = w / tot_scs;
+            const int i   = w % tot_scs;
+
+            const __half2 x = uci_x_dmrs[sym * tot_scs + i];  // One read per thread, no conflicts
 
             for(int a = 0; a < numRxAnt; a++)
             {
-                uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + i] =
-                    complex_conjmul(uci_dmrs_s[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + i], x_dmrs);
+                uci_ch_est[a * nSym_dmrs * tot_scs + sym * tot_scs + i] =
+                    complex_conjmul(uci_dmrs_s[a * nSym_dmrs * tot_scs + sym * tot_scs + i], x);
             }
         }
-
-        __syncthreads();
     }
+
+    __syncthreads();
 
     // Filter channel estimates in the frequency domain using W* filters. This is done by a GEMV operation
     // where each thread is calculating one inner product from a row in W.
+    // gemv_temp aliases z_data (sized to hold both IDFT output and GEMV temp).
     if(uci_data->prbSize < 4)
     {
         __half2* Ws[3] = {&d_W1[0][0], &d_W2[0][0], &d_W3[0][0]};
         __half2* W     = Ws[uci_data->prbSize - 1];
 
-        for(int a = 0; a < numRxAnt; a++)
+        const int nSym_dmrs = uci_data->nSym_dmrs;
+        const int gemv_work = tot_scs * numRxAnt * nSym_dmrs;
+
+        // Phase 1: Compute all GEMV rows in parallel, write to gemv_temp
+        for(int w = tid; w < gemv_work; w += F3_CG_SIZE)
         {
-            for(int sym = 0; sym < uci_data->nSym_dmrs; sym++)
+            const int row = w % tot_scs;
+            const int rem = w / tot_scs;
+            const int sym = rem % nSym_dmrs;
+            const int ant = rem / nSym_dmrs;
+
+            __half2 accum = {0.0, 0.0};
+            for(int sc = 0; sc < tot_scs; sc++)
             {
-                __half2 accum = {0.0, 0.0};
-                if(lane < tot_scs)
-                {
-                    for(int sc = 0; sc < tot_scs; sc++)
-                    {
-                        accum += complex_mul(W[lane * tot_scs + sc], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + sc]);
-                    }
-                }
-
-                __syncthreads();
-
-                if(lane < tot_scs)
-                {
-                    uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + lane] = accum;
-                }
-                __syncthreads();
+                accum = complex_addmul(W[row * tot_scs + sc], uci_ch_est[ant * nSym_dmrs * tot_scs + sym * tot_scs + sc], accum);
             }
+            uci_gemv_temp[w] = accum;
         }
+        __syncthreads();
+
+        // Phase 2: Copy from gemv_temp to uci_ch_est
+        for(int w = tid; w < gemv_work; w += F3_CG_SIZE)
+        {
+            const int row = w % tot_scs;
+            const int rem = w / tot_scs;
+            const int sym = rem % nSym_dmrs;
+            const int ant = rem / nSym_dmrs;
+            uci_ch_est[ant * nSym_dmrs * tot_scs + sym * tot_scs + row] = uci_gemv_temp[w];
+        }
+        __syncthreads();
     }
     else
     {
@@ -664,38 +650,38 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
                 // Iterate over all the blocks of 4
                 for(block = 0; block < first_pass; block++)
                 {
-                    if(lane < scsBlockSize)
+                    if(tid < scsBlockSize)
                     {
                         for(int sc = 0; sc < scsBlockSize; sc++)
                         {
-                            accum += complex_mul(d_W4[lane][sc], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + (block * scsBlockSize) + sc]);
+                            accum = complex_addmul(d_W4[tid][sc], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + (block * scsBlockSize) + sc], accum);
                         }
                     }
 
                     __syncthreads();
 
-                    if(lane < scsBlockSize)
+                    if(tid < scsBlockSize)
                     {
-                        uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + (block * scsBlockSize) + lane] = accum;
+                        uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + (block * scsBlockSize) + tid] = accum;
                     }
                 }
 
                 __syncthreads();
 
                 // Now if we have a partial block, do that one here.
-                if((block * scsBlockSize < tot_scs) && lane < scsBlockSize)
+                if((block * scsBlockSize < tot_scs) && tid < scsBlockSize)
                 {
                     accum = {0.0, 0.0};
 
                     int start = block * scsBlockSize - (scsBlockSize - (tot_scs - block * scsBlockSize));
                     for(int sc = 0; sc < scsBlockSize; sc++)
                     {
-                        accum += complex_mul(d_W4[lane][sc], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + start + sc]);
+                        accum = complex_addmul(d_W4[tid][sc], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + start + sc], accum);
                     }
 
                     __syncthreads();
 
-                    uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + start + lane] = accum;
+                    uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + start + tid] = accum;
 
                     __syncthreads();
                 }
@@ -705,63 +691,41 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     __syncthreads();
 
-    // Derive equalizer coefficients.
-  // if (threadIdx.x == 0) {
-  //   for (int sc = 0; sc < tot_scs; sc++) {
-  //     for (int a = 0; a < pDynDescr->numRxAnt; a++) {
-  //       auto tmp = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + sc];
-  //       uci_ch_first_hop[sc] += __half2float(tmp.x*tmp.x+tmp.y*tmp.y);
-  //     }
-  //     uci_eq_first_hop[sc] = (1+uci_data->noiseVar) * 1/(uci_ch_first_hop[sc]+uci_data->noiseVar);
-  //   }
-
-  //   if (uci_data->nSym_dmrs >= 2) {
-  //     int symNum = uci_data->nSym_dmrs >> 1;
-  //     for (int sc = 0; sc < tot_scs; sc++) {
-  //       for (int a = 0; a < pDynDescr->numRxAnt; a++) {
-  //         auto tmp = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + symNum*tot_scs + sc];
-  //         uci_ch_second_hop[sc] += __half2float(tmp.x*tmp.x+tmp.y*tmp.y);
-  //       }
-
-  //       uci_eq_second_hop[sc] = (1+uci_data->noiseVar) * 1/(uci_ch_second_hop[sc]+uci_data->noiseVar);
-  //     }
-  //   }
-  // }
-
-
     // Calculate RE energy to compare against DTX threshold. A full CTA reduction is performed to compute
     // the total power
     float rx_energy = 0.0;
     float r_tilde   = 0.0;
     int   num_samps = tot_scs * uci_data->nSym_dmrs * numRxAnt;
-    for(int tid = lane; tid < num_samps; tid += F3_CG_SIZE)
+    for(int i = tid; i < num_samps; i += F3_CG_SIZE)
     {
-        rx_energy += __half2float(uci_ch_est[tid].x * uci_ch_est[tid].x + uci_ch_est[tid].y * uci_ch_est[tid].y);
+        rx_energy += __half2float(uci_ch_est[i].x * uci_ch_est[i].x + uci_ch_est[i].y * uci_ch_est[i].y);
     }
 
-    for(int a = 0; a < numRxAnt; a++)
+    // Flatten r_tilde computation across (antenna, symbol, subcarrier) for better parallelism
     {
-        for(int sym = 0; sym < uci_data->nSym_dmrs; sym++)
+        const int rtilde_work = numRxAnt * nSym_dmrs * tot_scs;
+        for(int w = tid; w < rtilde_work; w += F3_CG_SIZE)
         {
-            for(int prb = lane; prb < tot_scs; prb += F3_CG_SIZE)
-            {
-                auto tmp = uci_dmrs_s[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + prb] -
-                           complex_mul(uci_x_dmrs[sym * tot_scs + prb], uci_ch_est[a * tot_scs * uci_data->nSym_dmrs + sym * tot_scs + prb]);
-                r_tilde += static_cast<float>(tmp.x * tmp.x + tmp.y * tmp.y);
-            }
+            const int a   = w / (nSym_dmrs * tot_scs);
+            const int rem = w % (nSym_dmrs * tot_scs);
+            const int sym = rem / tot_scs;
+            const int prb = rem % tot_scs;
+
+            auto tmp = uci_dmrs_s[a * nSym_dmrs * tot_scs + sym * tot_scs + prb] -
+                       complex_mul(uci_x_dmrs[sym * tot_scs + prb], uci_ch_est[a * nSym_dmrs * tot_scs + sym * tot_scs + prb]);
+            r_tilde += static_cast<float>(tmp.x * tmp.x + tmp.y * tmp.y);
         }
     }
 
     // Correlate and sum adjacent subcarriers for Timing Advance
     __half2 sum_sc_corr = {0.0,0.0};
-    for(int i = lane; i< num_samps; i+=F3_CG_SIZE)
+    for(int i = tid; i< num_samps; i+=F3_CG_SIZE)
     {
         if(((i+1)%tot_scs)!=0)
         {
             sum_sc_corr += complex_conjmul(uci_ch_est[i+1],uci_ch_est[i]);
         }
     }
-    __syncthreads();
 
     sum_sc_corr = cg::reduce(tile, sum_sc_corr, cg::plus<__half2>());
     rx_energy = cg::reduce(tile, rx_energy, cg::plus<float>()) / (float)num_samps;
@@ -776,19 +740,19 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     }
 
     __syncthreads();
-    
+
     rx_energy           = 0.0;
     r_tilde             = 0.0;
     rssi_linear_temp    = 0.0;
     sum_sc_corr         = {0.0,0.0};
-    if(cta.thread_rank() == 0)
+    if(tid == 0)
     {
-        for(int i = 0; i < F3_CG_SIZE / 32; i++)
+        for(int i = 0; i < NUM_WARPS; i++)
         {
-            rx_energy           += rx_energy_reduc[i];
-            r_tilde             += r_tilde_reduc[i];
-            sum_sc_corr         += sc_corr_reduc[i];
-            rssi_linear_temp    += rssi_linear_reduc[i];
+            rx_energy        += rx_energy_reduc[i];
+            r_tilde          += r_tilde_reduc[i];
+            sum_sc_corr      += sc_corr_reduc[i];
+            rssi_linear_temp += rssi_linear_reduc[i];
         }
 
         r_tilde_reduc[0] = MIN_DB;
@@ -799,11 +763,11 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
         if(rx_energy > MIN_DB_LIN)
         {
-            r_tilde *= FILT_BIAS_LIN;
+        r_tilde *= FILT_BIAS_LIN;
             if (r_tilde > MIN_DB_LIN)
             {
                 r_tilde_reduc[0]   = 10 * log10(r_tilde);
-            }
+    }
 
             // TA report
             float  angle = atan2f(__half2float(sum_sc_corr.y),__half2float(sum_sc_corr.x));
@@ -821,13 +785,13 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
         r_tilde_reduc[1]   = r_tilde; // Store linear version for other threads later
 
         // SINR report
-        pDynDescr->pSinr[uci_num] = std::min({MAX_DB, sinr_dB});
+        pDynDescr->pSinr[uci_num]   = std::min({MAX_DB, sinr_dB});
 
         // RSRP report
-        pDynDescr->pRsrp[uci_num] = std::min({MAX_DB, rsrp_dB});
+        pDynDescr->pRsrp[uci_num]   = std::min({MAX_DB, rsrp_dB});
 
         // RSSI report
-        pDynDescr->pRssi[uci_num] = std::min({MAX_DB, rssi_dB});
+        pDynDescr->pRssi[uci_num]   = std::min({MAX_DB, rssi_dB});
 
         // Interference level report 
         pDynDescr->pInterf[uci_num] = std::min({MAX_DB, r_tilde_reduc[0]}); // value in dB
@@ -838,7 +802,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     __syncthreads();
 
-    if(cta.thread_rank() == 0)
+    if(tid == 0)
     {
         if(rx_energy_reduc[0] < uci_data->DTXthreshold)
         {
@@ -848,243 +812,213 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     float noiseVar_est = r_tilde_reduc[1];
     // Derive equalizer coefficients.
-    bool TdiModePf3 = true;
-    if (threadIdx.x == 0)
     {
-        for (int sc = 0; sc < tot_scs; sc++)
+        const float noiseVar_est = r_tilde_reduc[1];
+        const bool  TdiModePf3   = true; // keep current behavior
+
+        for(int sc = tid; sc < tot_scs; sc += F3_CG_SIZE)
         {
-            if((TdiModePf3) && (uci_data->nSym_dmrs==4))
+            float ch0 = 0.f, ch1 = 0.f;
+
+            if(TdiModePf3 && (uci_data->nSym_dmrs == 4))
             {
-                for (int a = 0; a < numRxAnt; a++)
+                // ---- First hop: average dmrs0 + dmrs1 ----
+                for(int a = 0; a < numRxAnt; ++a)
                 {
-                    auto dmrs0 = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + sc];
-                    auto dmrs1 = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + tot_scs + sc];
-                    auto tmp  = dmrs0 + dmrs1; //dmrs0+dmrs1
-                    uci_ch_first_hop[sc] += (__half2float(tmp.x*tmp.x+tmp.y*tmp.y)/4.0);
-                    // average the first two DMRS ChEst and store it back to the first DMRS ChEst
-                    uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + sc] = complex_mul(tmp,{0.5,0.0});
+                    auto dmrs0 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 0 * tot_scs + sc];
+                    auto dmrs1 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 1 * tot_scs + sc];
+                    auto s01   = dmrs0 + dmrs1;                                 // sum
+                    ch0 += __half2float(s01.x * s01.x + s01.y * s01.y) * 0.25f; // (|dmrs0+dmrs1|^2)/4
+                    // store average back to dmrs0 slot (matches original)
+                    uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 0 * tot_scs + sc] = complex_mul(s01, {0.5, 0.0});
+                }
+                // ---- Second hop: average dmrs2 + dmrs3 ----
+                for(int a = 0; a < numRxAnt; ++a)
+                {
+                    auto dmrs2 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 2 * tot_scs + sc];
+                    auto dmrs3 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 3 * tot_scs + sc];
+                    auto s23   = dmrs2 + dmrs3;                                 // sum
+                    ch1 += __half2float(s23.x * s23.x + s23.y * s23.y) * 0.25f; // (|dmrs2+dmrs3|^2)/4
+                    // store average back to dmrs2 slot (matches original)
+                    uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 2 * tot_scs + sc] = complex_mul(s23, {0.5, 0.0});
                 }
             }
             else
             {
-                for (int a = 0; a < numRxAnt; a++)
+                // ---- First hop: single DMRS0 ----
+                for(int a = 0; a < numRxAnt; ++a)
                 {
-                    auto tmp = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + sc]; //dmrs0
-                    uci_ch_first_hop[sc] += __half2float(tmp.x * tmp.x + tmp.y * tmp.y);
+                    auto h0 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 0 * tot_scs + sc];
+                    ch0 += __half2float(h0.x * h0.x + h0.y * h0.y);
                 }
-            }
-            uci_eq_first_hop[sc] = (1.0 + noiseVar_est) / (uci_ch_first_hop[sc] + noiseVar_est);
-            
-            if(uci_data->nSym_dmrs==2)
-            {
-                for (int a = 0; a < numRxAnt; a++)
+                // ---- Second hop (if present): use mid DMRS ----
+                if(uci_data->nSym_dmrs >= 2)
                 {
-                    auto tmp = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + tot_scs + sc]; //dmrs1
-                    uci_ch_second_hop[sc] += __half2float(tmp.x*tmp.x+tmp.y*tmp.y);
-                }
-                uci_eq_second_hop[sc] = (1.0+noiseVar_est)/(uci_ch_second_hop[sc]+noiseVar_est);
-                
-#ifdef ENABLE_DEBUG_F3
-                    if ((sc==0) && (uci_num==0)){
-                        printf("uci_eq_first_hop=%f\n", uci_eq_first_hop[0]);
-                        printf("uci_ch_first_hop=%f\n", uci_ch_first_hop[0]);
-                        printf("uci_eq_second_hop=%f\n", uci_eq_second_hop[0]);
-                        printf("uci_ch_second_hop=%f\n", uci_ch_second_hop[0]);
-                    }
-#endif
-            }   
-            else if(uci_data->nSym_dmrs==4)
-            {
-                if(TdiModePf3)
-                {
-                    for (int a = 0; a < numRxAnt; a++)
+                    int symNum = uci_data->nSym_dmrs >> 1; // 1 when nSym_dmrs==2
+                    for(int a = 0; a < numRxAnt; ++a)
                     {
-                        auto dmrs2 = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + 2*tot_scs + sc];
-                        auto dmrs3 = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + 3*tot_scs + sc];
-                        auto tmp  = dmrs2 + dmrs3; //dmrs2+dmrs3
-                        uci_ch_second_hop[sc] += (__half2float(tmp.x*tmp.x+tmp.y*tmp.y)/4.0);
-                        // average the last two DMRS ChEst and save back to the third DMRS ChEst.
-                        uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + 2*tot_scs + sc] = complex_mul(tmp,{0.5,0.0});
+                        auto h2 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + symNum * tot_scs + sc];
+                        ch1 += __half2float(h2.x * h2.x + h2.y * h2.y);
                     }
                 }
-                else
-                {
-                    for (int a = 0; a < numRxAnt; a++)
-                    {
-                        auto tmp = uci_ch_est[a*uci_data->nSym_dmrs*tot_scs + 2*tot_scs + sc]; //dmrs2
-                        uci_ch_second_hop[sc] += __half2float(tmp.x * tmp.x + tmp.y * tmp.y);
-                    }
-                }
-                uci_eq_second_hop[sc] = (1.0 + noiseVar_est) / (uci_ch_second_hop[sc] + noiseVar_est);
             }
-        }
-#ifdef ENABLE_DEBUG_F3
-        //////////////////////
-        //for debug purpose///
-        /////////////////////
-        for (int sc = 0; sc < tot_scs; sc++)
-        {
-            printf("ch first hop = %f\n", uci_ch_first_hop[sc]);
-        }
-        printf("nSym_dmrs = %d\n", uci_data->nSym_dmrs);
-        if(uci_data->nSym_dmrs>=2)
-        {
-            for (int sc = 0; sc < tot_scs; sc++)
+
+            // write EQ coeffs
+            uci_eq_first_hop[sc] = __float2half((1.f + noiseVar_est) / (ch0 + noiseVar_est));
+
+            if(uci_data->nSym_dmrs >= 2)
             {
-                printf("ch second hop = %f\n", uci_ch_second_hop[sc]);
+                uci_eq_second_hop[sc] = __float2half((1.f + noiseVar_est) / (ch1 + noiseVar_est));
             }
         }
-        //////////////////////////
-#endif
     }
+
 
     // Now read in all the data symbols and do processing on those. Since there are a large number of data symbols we must do them in blocks
-    // to conserve shared memory
-    // Assume we're launching with at least 64 threads/block to do this fetching
-    int data_blocks = (tot_scs + (F3_DATA_FETCH_SCS - 1)) / tot_scs;
-    int startSc = (uci_data->startPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
+    // to conserve shared memory.
+    const int data_blocks       = (tot_scs + (F3_DATA_FETCH_SCS - 1)) / F3_DATA_FETCH_SCS;
+    const int firstHopStartSc   = (uci_data->startPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
+    const int secondHopStartSc  = (uci_data->secondHopPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
+    const int nSym_data         = uci_data->nSym_data;
+    const int half_nSym         = uci_data->nSym / 2;
+    const int half_nSym_data    = nSym_data / 2;
+    const int ch_sym_second_hop = nSym_dmrs >> 1;  // DMRS symbol index for second hop
+
     for(int dblock = 0; dblock < data_blocks; dblock++)
     {
-        data_idx     = 0;
-        check_sym    = 0;
-        int scs_lane = dblock * F3_DATA_FETCH_SCS + lane;
+        const int sc_base = dblock * F3_DATA_FETCH_SCS;
+        const int span    = min((int)F3_DATA_FETCH_SCS, (int)tot_scs - sc_base);
 
-        if(scs_lane < tot_scs && lane < F3_DATA_FETCH_SCS)
+        // LOAD: Flatten (sc_off, data_sym, antenna) across all threads
+        const int load_work = span * nSym_data * numRxAnt;
+        for(int w = tid; w < load_work; w += F3_CG_SIZE)
         {
-            if(uci_data->freqHopFlag)
+            const int sc_off   = w / (nSym_data * numRxAnt);
+            const int rem      = w % (nSym_data * numRxAnt);
+            const int data_sym = rem / numRxAnt;
+            const int a        = rem % numRxAnt;
+
+            // SetSymData[data_sym] gives relative symbol index (0-based from startSym)
+            const int rel_sym  = uci_data->SetSymData[data_sym];
+            const int ofdm_sym = uci_data->startSym + rel_sym;
+            const int scs_abs  = sc_base + sc_off;
+
+            // Determine frequency position based on hop
+            const int baseSc = (uci_data->freqHopFlag && rel_sym >= half_nSym)
+                                   ? secondHopStartSc : firstHopStartSc;
+
+            uci_data_s[sc_off * nSym_data * numRxAnt + data_sym * numRxAnt + a] =
+                tDataRx(baseSc + scs_abs, ofdm_sym, a);
+        }
+
+        __syncthreads();
+
+        // EQUALIZE: Flatten (sc_off, sym) across all threads
+        const int eq_work = span * nSym_data;
+        for(int w = tid; w < eq_work; w += F3_CG_SIZE)
+        {
+            const int sc_off  = w / nSym_data;
+            const int sym     = w % nSym_data;
+            const int scs_abs = sc_base + sc_off;
+
+            __half2 accum = {0.0, 0.0};
+
+            // Determine channel estimate symbol and equalizer coefficient
+            int    ch_sym_idx;
+            __half eq_coeff;
+            if(sym < half_nSym_data)
             {
-                for(int sym = uci_data->startSym; sym < uci_data->startSym + uci_data->nSym / 2; sym++)
-                {
-                    if(uci_data->SetSymData[data_idx] == check_sym)
-                    {
-                        for(int a = 0; a < numRxAnt; a++)
-                        {
-                            uci_data_s[lane * uci_data->nSym_data * numRxAnt + data_idx * numRxAnt + a] = tDataRx(startSc + scs_lane, sym, a);
-                        }
-                        data_idx++;
-                    }
-
-                    check_sym++;
-                }
-
-                int secondHopStartSc = (uci_data->secondHopPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
-                for(int sym = uci_data->startSym + uci_data->nSym / 2; sym < uci_data->startSym + uci_data->nSym; sym++)
-                {
-                    if(uci_data->SetSymData[data_idx] == check_sym)
-                    {
-                        for(int a = 0; a < numRxAnt; a++)
-                        {
-                            uci_data_s[lane * uci_data->nSym_data * numRxAnt + data_idx * numRxAnt + a] = tDataRx(secondHopStartSc + scs_lane, sym, a);
-                        }
-                        data_idx++;
-                    }
-
-                    check_sym++;
-                }
+                // First hop - use first DMRS
+                ch_sym_idx = 0;
+                eq_coeff   = uci_eq_first_hop[scs_abs];
+            }
+            else if(nSym_dmrs == 1)
+            {
+                // Second hop but only 1 DMRS - use first DMRS
+                ch_sym_idx = 0;
+                eq_coeff   = uci_eq_first_hop[scs_abs];
             }
             else
             {
-                for(int sym = uci_data->startSym; sym < uci_data->startSym + uci_data->nSym; sym++)
-                {
-                    if(uci_data->SetSymData[data_idx] == check_sym)
-                    {
-                        for(int a = 0; a < numRxAnt; a++)
-                        {
-                            uci_data_s[lane * uci_data->nSym_data * numRxAnt + data_idx * numRxAnt + a] = tDataRx(startSc + scs_lane, sym, a);
-                        }
-                        data_idx++;
-                    }
-
-                    check_sym++;
-                }
+                // Second hop with multiple DMRS - use second DMRS
+                ch_sym_idx = ch_sym_second_hop;
+                eq_coeff   = uci_eq_second_hop[scs_abs];
             }
-        }
 
-        __syncthreads();
-
-        // Equalize signal in the frequency domain
-        if(scs_lane < tot_scs && lane < F3_DATA_FETCH_SCS)
-        {
-            // First hop
-            for(int sym = 0; sym < uci_data->nSym_data / 2; sym++)
+            for(int a = 0; a < numRxAnt; a++)
             {
-                __half2 accum = {0.0, 0.0};
-                for(int a = 0; a < numRxAnt; a++)
-                {
-                    accum += complex_conjmul(uci_data_s[lane * uci_data->nSym_data * numRxAnt + sym * numRxAnt + a], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + scs_lane]);
-                }
-
-                uci_z_data[sym * tot_scs + scs_lane] = {accum.x * __float2half(uci_eq_first_hop[scs_lane]), accum.y * __float2half(uci_eq_first_hop[scs_lane])};
+                accum += complex_conjmul(
+                    uci_data_s[sc_off * nSym_data * numRxAnt + sym * numRxAnt + a],
+                    uci_ch_est[a * nSym_dmrs * tot_scs + ch_sym_idx * tot_scs + scs_abs]);
             }
 
-            // Second hop
-            for(int sym = uci_data->nSym_data / 2; sym < uci_data->nSym_data; sym++)
-            {
-                __half2 accum = {0.0, 0.0};
-                if(uci_data->nSym_dmrs == 1)
-                {
-                    for(int a = 0; a < numRxAnt; a++)
-                    {
-                        accum += complex_conjmul(uci_data_s[lane * uci_data->nSym_data * numRxAnt + sym * numRxAnt + a], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + scs_lane]);
-                    }
-
-                    uci_z_data[sym * tot_scs + scs_lane] = {accum.x * __float2half(uci_eq_first_hop[scs_lane]), accum.y * __float2half(uci_eq_first_hop[scs_lane])};
-                }
-                else
-                {
-                    int symNum = uci_data->nSym_dmrs >> 1;
-                    for(int a = 0; a < numRxAnt; a++)
-                    {
-                        // Use the second symbol
-                        accum += complex_conjmul(uci_data_s[lane * uci_data->nSym_data * numRxAnt + sym * numRxAnt + a], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + symNum * tot_scs + scs_lane]);
-                    }
-
-                    uci_z_data[sym * tot_scs + scs_lane] = {accum.x * __float2half(uci_eq_second_hop[scs_lane]), accum.y * __float2half(uci_eq_second_hop[scs_lane])};
-                }
-            }
+            uci_z_data[sym * tot_scs + scs_abs] = complex_scalar_multiply(accum, eq_coeff);
         }
 
         __syncthreads();
     }
-
-    __syncthreads();
 
     // Do an IDFT on each symbol's subcarrier data.
-    for(int i = lane; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
-    {
-        int symnum = i / tot_scs;
-        int fftidx = i % tot_scs;
+    // Precompute loop-invariant values
+    const float tot_scs_f     = (float)tot_scs;
+    const float idft_scale    = rsqrtf(tot_scs_f);  // 1/sqrt(tot_scs) = sqrt(tot_scs)/tot_scs
+    const float ang_base      = 2.0f * M_PI / tot_scs_f;
 
-        __half2 accum = {0.0, 0.0};
-        for(int sc = 0; sc < tot_scs; sc++)
+    for (int i = tid; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
+    {
+        const int symnum = i / tot_scs;
+        const int fftidx = i % tot_scs;
+
+        float2 accum = {0.0f, 0.0f};
+
+        // IDFT optimization: Use recurrence w *= Wk instead of recomputing sin/cos.
+        // Reduces O(N²) transcendentals to O(N) at cost of accumulated rounding error.
+        //--------------------------------------------------------------------------------
+        // Error remains acceptable (< 10^-6) for tot_scs ≤ 192.
+        // One sincos per output bin k = fftidx
+        float s, c;
+        __sincosf(ang_base * fftidx, &s, &c);
+
+        // w = (Wk)^n via recurrence
+        float2 Wk = {c, s};
+        float2 w  = {1.0f, 0.0f};
+        //--------------------------------------------------------------------------------
+
+        for (int sc = 0; sc < tot_scs; sc++)
         {
-            __half theta = __float2half(2*M_PI / tot_scs * fftidx * sc);
-            __half2 tmp = {hcos(theta), hsin(theta)};
-            accum += complex_mul(uci_z_data[symnum * tot_scs + sc], tmp);
+            // accum += z[n] * w
+            float2 z = __half22float2(uci_z_data[symnum * tot_scs + sc]);
+            accum    = complex_addmul(z, w, accum);
+
+            // w *= Wk
+            w = complex_mul(w, Wk);
         }
 
-        uci_z[symnum * tot_scs + fftidx] = {accum.x * __float2half(sqrtf(tot_scs) / tot_scs), accum.y * __float2half(sqrtf(tot_scs) / tot_scs)};
+        uci_z[symnum * tot_scs + fftidx] = __floats2half2_rn(accum.x * idft_scale, accum.y * idft_scale);
     }
 
     __syncthreads();
 
-    // Demodulate
+    // Demodulate - precompute scaling factors
+    const float demod_scale = 2.0f / noiseVar_est;
+    const float pi2_scale   = 1.41421356237f / noiseVar_est;  // sqrt(2) / noiseVar = 2/sqrt(2)/noiseVar
+
     if(uci_data->pi2Bpsk)
     {
         __half* out = reinterpret_cast<__half*>(&uci_scrmLLR[0]);
-        for(int i = lane; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
+        for(int i = tid; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
         {
             __half2 tmp = complex_mul({1, -1}, uci_z[i]);
             __half* ri  = (__half*)(&tmp) + (i % 2);
-            out[i]      = __float2half(2.0 / sqrtf(2.0) * __half2float(*ri) / noiseVar_est);
+            out[i]      = __float2half(pi2_scale * __half2float(*ri));
         }
     }
     else
     {
-        for(int i = lane; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
+        for(int i = tid; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
         {
-            uci_scrmLLR[i].x = __float2half(2.0 * __half2float(uci_z[i].x) / noiseVar_est);
-            uci_scrmLLR[i].y = __float2half(2.0 * __half2float(uci_z[i].y) / noiseVar_est);
+            uci_scrmLLR[i].x = __float2half(demod_scale * __half2float(uci_z[i].x));
+            uci_scrmLLR[i].y = __float2half(demod_scale * __half2float(uci_z[i].y));
         }
     }
 
@@ -1100,14 +1034,18 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
         }
 #endif
     // Write output values to global for next kernel
-    for (int i = lane; i < uci_data->E_tot; i += F3_CG_SIZE) {
-        int      idx                            = i / 32;
-        uint32_t off                            = i % 32;
-        __half*  scrm                           = reinterpret_cast<__half*>(&uci_scrmLLR[0]) + i;
-        pDynDescr->pDescramLLRaddrs[uci_num][i] = __hmul((__half)(1 - 2 * ((randomSeqScrm[idx] & (1U << off)) > 0)), *scrm);
+    for(int i = tid; i < uci_data->E_tot; i += F3_CG_SIZE)
+    {
+        const int      idx = i >> 5; // which 32-bit word
+        const int      off = i & 31; // which bit
+        const uint32_t g   = randomSeqScrm[idx];
+        const __half* scrm = reinterpret_cast<const __half*>(&uci_scrmLLR[0]) + i;
+        const __half  sign = (__half)(1 - 2 * ((g & (1U << off)) > 0));
+        //
+        pDynDescr->pDescramLLRaddrs[uci_num][i] = __hmul(sign, *scrm);
     }
 
-    if(threadIdx.x == 0)
+    if(tid == 0)
     {
         pDynDescr->pDTXflags[uci_num] = 0;
     }
@@ -1145,31 +1083,50 @@ pucchF3Rx::pucchF3Rx(cudaStream_t strm)
    }
 }
 
- void  pucchF3Rx::kernelSelect(uint16_t           nUcis,
-                               pucchF3RxDynDescr_t*     pCpuDynDesc,
-                               cuphyPucchF3RxLaunchCfg_t* pLaunchCfg)
+void pucchF3Rx::kernelSelect(uint16_t nUcis,
+                             UciShape_t& maxUshape,
+                             cuphyPucchF3RxLaunchCfg_t* pLaunchCfg)
 {
-  // kernel (only one kernel option for now)
-  void* kernelFunc = reinterpret_cast<void*>(pucchF3RxKernel);
-  CUDA_CHECK(cudaGetFuncBySymbol(&pLaunchCfg->kernelNodeParamsDriver.func, kernelFunc));
+    // kernel (only one kernel option for now)
+    void* kernelFunc = reinterpret_cast<void*>(pucchF3RxKernel);
+    CUDA_CHECK(cudaGetFuncBySymbol(&pLaunchCfg->kernelNodeParamsDriver.func, kernelFunc));
 
-  // launch geometry (can change!)
-  dim3 gridDim(nUcis);
-  dim3 blockDim(F3_CG_SIZE);
+    // launch geometry (can change!)
+    dim3 gridDim(nUcis);
+    dim3 blockDim(F3_CG_SIZE);
 
-  // populate kernel parameters
-  CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = pLaunchCfg->kernelNodeParamsDriver;
+    // populate kernel parameters
+    CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = pLaunchCfg->kernelNodeParamsDriver;
 
-  kernelNodeParamsDriver.blockDimX = blockDim.x;
-  kernelNodeParamsDriver.blockDimY = blockDim.y;
-  kernelNodeParamsDriver.blockDimZ = blockDim.z;
+    kernelNodeParamsDriver.blockDimX = blockDim.x;
+    kernelNodeParamsDriver.blockDimY = blockDim.y;
+    kernelNodeParamsDriver.blockDimZ = blockDim.z;
 
-  kernelNodeParamsDriver.gridDimX = gridDim.x;
-  kernelNodeParamsDriver.gridDimY = gridDim.y;
-  kernelNodeParamsDriver.gridDimZ = gridDim.z;
+    kernelNodeParamsDriver.gridDimX = gridDim.x;
+    kernelNodeParamsDriver.gridDimY = gridDim.y;
+    kernelNodeParamsDriver.gridDimZ = gridDim.z;
 
-  kernelNodeParamsDriver.extra      = nullptr;
-  kernelNodeParamsDriver.sharedMemBytes = 0;
+    kernelNodeParamsDriver.extra = nullptr;
+
+    // Dynamic shared memory size computation for kernel
+    // NOTE: This layout MUST match the kernel's shared memory allocation in pucchF3RxKernel()
+    // Uses maxUshape (max across all UCIs) to ensure sufficient memory for any UCI
+    int dyn_shared_sz = 0;
+
+    const int tot_scs = maxUshape.nPrb * N_TONES_PER_PRB;
+    int y_data_elems = max(maxUshape.nSymData * F3_DATA_FETCH_SCS * maxUshape.nAnt,   // for uci_data_s
+                           maxUshape.nSymDmrs * tot_scs * maxUshape.nAnt);          // for uci_dmrs_s
+    y_data_elems = max(y_data_elems, maxUshape.nSymData * tot_scs);               // for uci_z (IDFT output)
+
+    dyn_shared_sz += y_data_elems * sizeof(__half2);                                  // y_data
+    dyn_shared_sz += maxUshape.nAnt * maxUshape.nSymDmrs * tot_scs * sizeof(__half2); // y_ch_est
+    dyn_shared_sz += tot_scs * sizeof(__half2);                                       // r_base
+    dyn_shared_sz += maxUshape.nSymDmrs * tot_scs * sizeof(__half2);                  // x_dmrs
+    // z_data: max of IDFT output size and GEMV temp buffer size
+    const int z_data_elems = max(maxUshape.nSymData * tot_scs, tot_scs * maxUshape.nAnt * maxUshape.nSymDmrs);
+    dyn_shared_sz += z_data_elems * sizeof(__half2);                                  // z_data
+    dyn_shared_sz += 2 * tot_scs * sizeof(__half);                                    // uci_eq_first_hop and uci_eq_second_hop
+    kernelNodeParamsDriver.sharedMemBytes = dyn_shared_sz;
 }
 
 void pucchF3Rx::setup(cuphyTensorPrm_t*          pDataRx, // input slot buffer
@@ -1200,6 +1157,8 @@ void pucchF3Rx::setup(cuphyTensorPrm_t*          pDataRx, // input slot buffer
     }
     pCpuDynDesc->numUcis      = nF3Ucis;
     pCpuDynDesc->enableUlRxBf = enableUlRxBf;
+
+    UciShape_t maxUshape = {};
 
     for(int uciIdx = 0; uciIdx < nF3Ucis; ++uciIdx)
     {
@@ -1374,6 +1333,19 @@ void pucchF3Rx::setup(cuphyTensorPrm_t*          pDataRx, // input slot buffer
         pCpuDynDesc->uciPrms[uciIdx].cellIdx = cellIdx;
         
         pCpuDynDesc->uciPrms[uciIdx].nUplinkStreams   = pF3UciPrms[uciIdx].nUplinkStreams;
+
+        //find the largest UCI shape params
+        maxUshape.nPrb     = max(maxUshape.nPrb, prbSize);
+        maxUshape.nSymData = max(maxUshape.nSymData, nSym_data);
+        maxUshape.nSymDmrs = max(maxUshape.nSymDmrs, nSym_dmrs);
+        if(enableUlRxBf)
+        {
+            maxUshape.nAnt = max(maxUshape.nAnt, pF3UciPrms[uciIdx].nUplinkStreams);
+        }
+        else
+        {
+            maxUshape.nAnt = max(maxUshape.nAnt, pCmnCellPrms[cellIdx].nRxAnt);
+        }
     }
 
     for (uint16_t i = 0; i < nCells; i++)
@@ -1399,11 +1371,11 @@ void pucchF3Rx::setup(cuphyTensorPrm_t*          pDataRx, // input slot buffer
     // Optional descriptor copy to GPU memory
     if(enableCpuToGpuDescrAsyncCpy)
     {
-    cudaMemcpyAsync(pGpuDynDesc, pCpuDynDesc, sizeof(pucchF3RxDynDescr_t), cudaMemcpyHostToDevice, strm);
+        cudaMemcpyAsync(pGpuDynDesc, pCpuDynDesc, sizeof(pucchF3RxDynDescr_t), cudaMemcpyHostToDevice, strm);
     }
 
     // select kernel (includes launch geometry). Populate launchCfg.
-    kernelSelect(nF3Ucis, pCpuDynDesc, pLaunchCfg);
+    kernelSelect(nF3Ucis, maxUshape, pLaunchCfg);
     pLaunchCfg->kernelArgs[0]                       = &m_kernelArgs.pDynDescr;
     pLaunchCfg->kernelNodeParamsDriver.kernelParams = &(pLaunchCfg->kernelArgs[0]);
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -788,7 +788,7 @@ namespace cumac {
         uint16_t    nMaxActUePerCell; // A constant integer for the maximum number of active UEs per cell
         uint8_t     nMaxSchUePerCell; // A constant integer for the maximum number of UEs that can be scheduled per TTI per cell
         uint16_t    nMaxPrg; // A constant integer for the maximum number of PRGs for allocation in each cell
-        uint8_t     nPrbPerPrg; // A constant integer for the number of PRBs per PRG (PRB group) 
+        uint16_t    nPrbPerPrg; // A constant integer for the number of PRBs per PRG (PRB group)
         uint8_t     nMaxBsAnt; // A constant integer for the maximum number of BS antenna ports.  
         uint8_t     nMaxUeAnt; // A constant integer for the maximum number of UE antenna ports.  
         uint32_t    scSpacing; // Subcarrier spacing of the carrier. Value: 15000, 30000, 60000, 120000 (Hz)  
@@ -802,7 +802,7 @@ namespace cumac {
         float       mcsSelSinrCapThr; // SINR capping threshold for MCS selection
         uint8_t     mcsSelLutType; // MCS selection LUT type
         uint16_t    prioWeightStep; // Step size for UE priority weight increment per TTI if UE does not get scheduled. For priority-based UE selection
-        float*      blerTargetActUe = nullptr; // BLER targets of all active UEs in the cell
+        float       blerTarget; // BLER target
     };
 
     struct MAC_SCH_TTI_REQUEST {

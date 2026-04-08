@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# By default, "${CMAKE_SOURCE_DIR}/aerial-sdk-version" includes "25-3-cubb"
+# By default, "${CMAKE_SOURCE_DIR}/aerial-sdk-version" includes "26-1-cubb"
 # During packaging, this string will be replaced with a specific version.
 # Below cmake code we will read it and populate AERIAL_SDK_VERSION
 # The value of AERIAL_SDK_VERSION will be compared against distributed YAML files with

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +14,7 @@
 # limitations under the License.
 
 ---
-aerial_sdk_version: 25-3-cubb
+aerial_sdk_version: 26-1-cubb
 ru_emulator:
 
   ul_core_list: [2,3,4,5,6,7,8,9,10,11]
@@ -743,21 +743,23 @@ ru_emulator:
   dl_approx_validation: 0
   enable_mmimo: 0
   enable_beam_forming: 0
-  dl_warmup_slots: 2000
+  dl_warmup_slots: 512
+  ul_warmup_slots: 128
   dlc_tb: 0
   fix_beta_dl: 1
   payload_validation: 1
   enable_dl_proc_mt: 0 #Enable multi-threaded processing for dl_proc (receive/process)
-  aerial_fh_txq_size: 4096
-  aerial_fh_rxq_size: 2048
+  aerial_fh_txq_size: 1024
+  aerial_fh_rxq_size: 1024
   aerial_fh_tx_request_num: 32
   aerial_fh_dpdk_thread: 1
   aerial_fh_pdump_client_thread: -1
   aerial_fh_accu_tx_sched_res_ns: 500 #Flag applicable only for CX6-DX : BF3/CX7 HW and beyond support accurate send scheduling directly on timestamp, for CX6-DX this is implemented via software emulation
   aerial_fh_dpdk_file_prefix: "ru_emulator"
   aerial_fh_per_rxq_mempool : 0
-  aerial_fh_cpu_mbuf_pool_size: 32768 #Applies only if aerial_fh_per_rxq_mempool is set to 1
-  aerial_fh_cpu_mbuf_pool_tx_size: 524288 #Applies to rx as well if aerial_fh_per_rxq_mempool is set to 0
+  aerial_fh_cpu_mbuf_pool_size_per_rxq: 32768 #Applies only if aerial_fh_per_rxq_mempool is set to 1
+  aerial_fh_cpu_mbuf_pool_rx_size: 262144
+  aerial_fh_cpu_mbuf_pool_tx_size: 262144
   aerial_fh_split_rx_tx_mempool: 1
   aerial_fh_mtu: 1514
   debug_u_plane_prints: 0
@@ -770,3 +772,5 @@ ru_emulator:
     dl_u_plane_timing_delay: 345
     dl_u_plane_window_size: 51
     ul_u_plane_tx_offset: 231
+  oran_beam_id_info: {static_beam_id_start: 1, static_beam_id_end: 16527, dynamic_beam_id_start: 16528, dynamic_beam_id_end: 32767}
+  ecpri_hdr_cfg_test: {enable: 0, ecpri_hdr_cfg_file: ecpri_hdr_cfg.yaml}

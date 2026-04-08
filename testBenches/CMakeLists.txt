@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,10 +59,8 @@ endif ()
 
 OPTION(ENABLE_64C "Enable 64C" OFF)
 if ("${ARCH}" STREQUAL "aarch64")
-    OPTION(LEGO_MGX_CG1 "MGX CG1 Platform" ON)
     OPTION(ENABLE_20C "Enable 20C" ON)
 else ()
-    OPTION(LEGO_MGX_CG1 "MGX CG1 Platform" OFF)
     OPTION(ENABLE_20C "Enable 20C" OFF)
 endif()
 option(ENABLE_NVTX  "Enable use of NVTX" OFF)
@@ -148,6 +146,7 @@ add_custom_target(testbenches_examples
         fading_chan_ex
         gau_noise_adder_ex
         ofdm_mod_demod
+        sls_chan_ex
         tdl_chan_ex
     COMMENT "Builds all specified testbench examples"
 )

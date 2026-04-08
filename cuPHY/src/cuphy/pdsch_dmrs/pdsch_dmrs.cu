@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -222,9 +222,7 @@ cuphyStatus_t CUPHYWINAPI cuphyUpdatePdschDmrsParams(PdschDmrsParams * h_dmrs_pa
 
             h_dmrs_params[TB_id].n_scid = ue->scid;
             h_dmrs_params[TB_id].dmrs_scid = ue->dmrsScrmId;
-#ifdef ENABLE_32DL
             h_dmrs_params[TB_id].nlAbove16 = ue->nlAbove16;
-#endif
             h_dmrs_params[TB_id].ref_point = ue->refPoint;
             h_dmrs_params[TB_id].BWP_start_PRB = ue->BWPStart;
 
@@ -257,7 +255,6 @@ cuphyStatus_t CUPHYWINAPI cuphyUpdatePdschDmrsParams(PdschDmrsParams * h_dmrs_pa
 #endif
     return CUPHY_STATUS_SUCCESS;
 }
-
 
 template<bool enablePrecoding, typename Tcomplex, typename Tscalar=typename scalar_from_complex<Tcomplex>::type>
 __global__ void fused_dmrs(pdschDmrsDescr_t* p_desc) {
@@ -385,11 +382,7 @@ __global__ void fused_dmrs(pdschDmrsDescr_t* p_desc) {
                 }
                 if(!enablePrecoding)
                 {
-#ifdef ENABLE_32DL
-                    const int layer = port_idx + (params[TB_id].n_scid << 3) + (params[TB_id].nlAbove16 << 4);
-#else
-                    const int layer = port_idx + (params[TB_id].n_scid << 3);
-#endif
+                    const int layer = calculate_layer_id(port_idx, params[TB_id].n_scid, params[TB_id].nlAbove16);
                     uint32_t output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * layer + symbol_loc[symbol_id])) +
                                             (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
                     if (!cdm_grps_no_data_1)
@@ -407,11 +400,7 @@ __global__ void fused_dmrs(pdschDmrsDescr_t* p_desc) {
                 {
                     if(!params[TB_id].enablePrcdBf)
                     {
-#ifdef ENABLE_32DL
-                        const int layer = port_idx + (params[TB_id].n_scid << 3) + (params[TB_id].nlAbove16 << 4);
-#else
-                        const int layer = port_idx + (params[TB_id].n_scid << 3);
-#endif
+                        const int layer = calculate_layer_id(port_idx, params[TB_id].n_scid, params[TB_id].nlAbove16);
                         uint32_t output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * layer + symbol_loc[symbol_id])) +
                                                 (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
                         // No need to perform atomicAdd with 0 for the alternate RE

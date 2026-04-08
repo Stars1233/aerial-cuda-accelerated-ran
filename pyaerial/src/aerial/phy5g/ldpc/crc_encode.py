@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +16,13 @@
 """pyAerial library - CRC encoding."""
 from typing import Generic
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy  # type: ignore
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PdschConfig
 from aerial.phy5g.ldpc.util import get_pdsch_config_attrs
@@ -38,18 +38,18 @@ class CrcEncoder(Generic[Array]):
     routines under the hood.
     """
 
-    def __init__(self, max_num_tbs: int = 128, cuda_stream: int = None) -> None:
+    def __init__(self, max_num_tbs: int = 128, cuda_stream: Optional[CudaStream] = None) -> None:
         """initialize the CRC encoder.
 
         Args:
             max_num_tbs (int): The maximum number of transport blocks.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new
+                CudaStream is created. Use ``with stream:`` to scope work; call
+                ``stream.synchronize()`` explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
-        self.crc_encoder = pycuphy.CrcEncoder(cuda_stream, max_num_tbs)
+        self.crc_encoder = pycuphy.CrcEncoder(self._cuda_stream.handle, max_num_tbs)
 
     def encode(self,
                *,
@@ -108,14 +108,14 @@ class CrcEncoder(Generic[Array]):
             )
 
         cpu_copy = isinstance(tb_inputs[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tb_inputs = [cp.array(tb_input, order='F', dtype=np.uint8) for tb_input in tb_inputs]
             tb_inputs = cp.concatenate(tb_inputs, axis=0)
 
         tb_inputs = pycuphy.CudaArrayUint8(tb_inputs)
         crc_outs = self.crc_encoder.encode(tb_inputs, tb_sizes, code_rates)
         num_info_bits = self.crc_encoder.get_num_info_bits()
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             for tb_idx, crc_out in enumerate(crc_outs):
                 crc_out = cp.array(crc_out, order='F')
                 num_cbs = crc_out.shape[1]

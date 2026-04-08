@@ -1,0 +1,279 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# cubb_gpu_test_config.yaml
+# Use with:
+#   cd $cuBB_SDK/testBenches/perf
+#   python3 measure.py --yaml cubb_gpu_test_config.yaml
+#
+# Notes:
+# - Keys under `config:` mostly map to long CLI flags in `measure.py` / `measure/cli.py` (without leading `--`).
+# - CLI flags override YAML if you pass both.
+# - YAML-only sections are supported by downstream logic:
+#   - `vector_files` (+ `usecase`) can auto-generate `--config` and `--uc` JSON files.
+#   - `tdd_priorities`, `start_delay`, and `override_test_vectors` are written into generated `vectors-XX.yaml`.
+#   - `latency_budget` overrides default thresholds used by TDD auto cell-capacity check.
+
+config:
+  # --- Paths / inputs (required) ---
+  usecase: F08  # Used when auto-generating config/uc JSON from `vector_files` (F08/F09/F14 supported by default capacity-budget detection)
+  testbench_folder: /opt/nvidia/cuBB/build.aarch64/testBenches # Path to built cubb_gpu_test_bench folder (passed to --cuphy)
+  testvectors_folder: /opt/nvidia/cuBB/testVectors             # Path to testVectors directory (passed to --vector_folder)
+  # Per-channel test-vector (TV) files.
+  # Notes on how to generate ULMIX and DLMIX test vectors (MATLAB, from 5GModel/nr_matlab):
+  #   cd 5GModel/nr_matlab
+  #   matlab
+  #   In MATLAB:
+  #     testCompGenTV_dlmix([9481, 9696, 9905, 9906, 10047]);   % DLMIX: SSB, PDCCH, PDSCH, CSIRS
+  #     testCompGenTV_ulmix([4544, 4548, 4566]);                % ULMIX: PRACH, PUSCH, PUCCH
+  #   Outputs go to GPU_test_input/ (copy to testVectors or set testvectors_folder accordingly).
+  #   Per-channel cuPHY files (e.g. *_PDSCH_gNB_CUPHY_s0p5.h5) are produced automatically;
+  #   slot/PDU suffix (s0p5, s0p3, etc.) depends on the test case—adjust vector_files if names differ.
+  #
+  # Copy all TVs listed in this YAML to a new location (e.g. testVectors or container path):
+  #   cd $cuBB_SDK/testBenches/perf
+  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml <src_dir> <dst_dir>
+  # Example: from MATLAB GPU_test_input to SDK testVectors:
+  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml $cuBB_SDK/5GModel/nr_matlab/GPU_test_input $cuBB_SDK/testVectors
+  # Example: from archive to container mount:
+  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml /path/to/tv/archive /opt/nvidia/cuBB/testVectors
+  #
+  # - Each key is a workload/channel name (PDSCH/PUSCH/PRACH/PDCCH/PUCCH/SSB/CSIRS/MAC).
+  # - Each value is a LIST of TV filenames under `testvectors_folder`.
+  # - When sweeping N cells, TV selection is round-robin per cell index:
+  #     tv_idx = cell_idx % len(vector_files[CHANNEL])
+  #   Example: 2 TVs + 8 cells -> [0,1,0,1,0,1,0,1].
+  # - Different channels can use different TV lists; their selections are independent.
+  # - Exception: cuMAC (`MAC`) uses ONE TV for all cells; keep `MAC` list length = 1.
+  vector_files:
+    PDSCH: 
+      - TVnr_DLMIX_7484_PDSCH_gNB_CUPHY_s0p0.h5
+    PUSCH: 
+      - TVnr_ULMIX_4382_PUSCH_gNB_CUPHY_s0p0.h5
+    PRACH: 
+      - TVnr_ULMIX_4417_PRACH_gNB_CUPHY_s0p0.h5
+
+  # --- GPU controls (required) ---
+  gpu: 0                                            # GPU index for the run (passed to --gpu)
+  freq: 1980                                        # Target GPU graphics clock MHz for run (passed to --freq)
+  power: 900                                        # GPU power limit W (passed to --power)
+  target: ["8", "100", "132"]       # SM allocation per isolated sub-context (passed to --target)
+                                                    # order is: PRACH, PDCCH, PUCCH, PDSCH, PUSCH, SSB, SRS, MAC if all isolated
+                                                    # By default, PUSCH and PDSCH are enabled, unless no_pusch or no_pdsch is set
+                                                    # cuMAC always runs in its own sub-context
+                                                    # an error will be given if the number of targets does not match the number of isolated sub-contexts
+                                                    # a warning will be given if the number of SM is capped by GPU maxSmCount
+                                                    
+                                                    # This SM allocation will impact overall performance and latency.
+                                                    # It can be used for both MPS and green context.
+                                                    # The SM allocation is the upper limit of the SMs one workload can use.
+                                                    # For green context, cubb_gpu_test_bench.cpp will automatically split the SMs into multiple green contexts.
+
+  # traffic generator priorities
+  # If present, traffic generation will use these instead of reading the JSON file.
+  tdd_priorities:
+    PUSCH: 3
+    PUSCH2: 3
+    ULBFW: 3
+    PUCCH: 2
+    PUCCH2: 2
+    PRACH: 2
+    UL_ORDER: 0
+    UL_SRS_ORDER: 0
+    SRS: 3
+    PDSCH: 1
+    DLBFW: 2
+    PDCCH: 1
+    CSIRS: 1
+    SSB: 1
+    GPU_CMN: 0
+    MAC: 0
+    MAC2: 0
+    
+  # --- Sweep settings / duration ---
+  tdd_pattern: dddsuudddd                           # TDD pattern selector (passed to --tdd_pattern), choose from dddsu, dddsuudddd (10-slot), dddsuudddd_8slot, dddsuudddd_mMIMO
+  # Optional in-YAML slot masks keyed by TDD pattern name.
+  # Keep only the pattern(s) you use here; this YAML becomes your source of truth.
+  # For more examples, see measure/TDD/slotConfig.json.
+  tdd_slot_config:
+    dddsuudddd:
+      PDSCH: [0, 0, 1, 1, 1, 1, 1, 1, 1, 0]
+      PDCCH: [0, 0, 1, 1, 1, 1, 1, 1, 1, 0]
+      CSIRS: [0, 0, 1, 1, 1, 1, 1, 1, 1, 0]
+      PBCH: [0, 0, 0, 0, 0, 0, 1, 1, 1, 0]
+      MAC: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  start: 20                                         # Minimum number of cells to try (passed to --start)
+  cap: 20                                           # Maximum number of cells to try (passed to --cap)
+  step_size: 1                                      # Step when sweeping cell count (passed to --step_size)
+  # total number of cells to sweep is start, start + step_size, start + 2 * step_size, ..., cap
+  iterations: 1                                     # Averaging iterations per sweep point (passed to --iterations)
+  slots: 40                                         # Number of iterations for each pattern after one setup (passed to --slots)
+  # for dddsu pattern, it has to be a multiple of 4
+  # for dddsuudddd pattern, it has to be a multiple of 10
+  # for dddsuudddd_8slot pattern, it has to be a multiple of 8
+  # for dddsuudddd_mMIMO, it has to be a multiple of 15
+  delay: 10000                                      # Delay-kernel duration (passed to --delay), delay in us between setup and run of each pattern
+  # cubb_gpu_test_bench will setup one pattern, launch delay kernel, then run the pattern for iterations times.
+  # For latency measurement, recommend to set a higher numnber of slots, iterations to 1 and delay to 10000 (1ms). cubb_gpu_test_bench will setup one pattern, launch delay kernel, then run the pattern. Repeat this for multiple slots.
+  # For power measurement, recommend to set slots to 4/8/10/15, iterations to 2000 and delay to 0. cubb_gpu_test_bench will setup once, run one pattern for multiple iterations to keep GPU busy.
+
+  # --- Feature toggles (booleans) ---
+  graph: true                                       # Use CUDA graphs instead of streams (passed to --graph), recommend to set to true for lower latency
+  save_buffers: true                                # Save intermediate buffers instead of erasing (passed to --save_buffers)
+  test: false                                       # Enable test mode (passed to --test). Test mode will on provide yaml file and CLI options to C++ testbench, not run the testbench.
+  measure_power: false                              # Run power measurement mode (passed to --measure_power)
+  enable_ref_check: false                           # Enable reference checks for all channels (passed to --enable_ref_check). WARNING: do not use during latency or power measurements -- the extra work will skew the timeline.
+  use_green_contexts: false                         # Use green contexts instead of MPS (passed to --use_green_contexts)
+  enable_mps_for_green_contexts: false              # Keep MPS enabled for green contexts (passed to --enable_mps_for_green_contexts)  # for trace capture
+  enable_nvprof: false                              # Enable profiler start/stop inside cubb_gpu_test_bench (passed to --enable_nvprof)
+  enable_sqlite: false                              # Export sqlite file in nsys (passed to --enable_sqlite)
+  debug: false                                      # Enable debug mode (passed to --debug), for trace capture
+  debug_mode: nsys                                  # Debug mode: cta/triage/nsys/ncu/incu/nsys_simple (passed to --debug_mode)
+
+  # --- Channel workload toggles / isolation ---
+  no_pdsch: false                                   # Disable PDSCH workload (passed to --no_pdsch)
+  no_pusch: false                                   # Disable PUSCH workload (passed to --no_pusch)
+  prach: true                                       # Include PRACH workload (passed to --prach)
+  prach_isolate: true                               # Run PRACH in its own sub-CTX (passed to --prach_isolate)
+  pdcch: false                                      # Include PDCCH workload (passed to --pdcch)
+  pdcch_isolate: false                              # Run PDCCH in its own sub-CTX (passed to --pdcch_isolate)
+  pucch: false                                      # Include PUCCH workload (passed to --pucch)
+  pucch_isolate: false                              # Run PUCCH in its own sub-CTX (passed to --pucch_isolate)
+  ssb: false                                        # Include SSB workload (passed to --ssb)
+  ssb_isolate: false                                # Run SSB in its own sub-CTX (passed to --ssb_isolate)
+  csirs: false                                      # Include CSI-RS workload (passed to --csirs)
+  rec_bf: false                                     # Reciprocal beamforming option (passed to --rec_bf)
+  srs_isolate: false                                # Run SRS in its own sub-CTX (passed to --srs_isolate)
+  mac: false                                        # Run cuMAC workload in dedicated sub-CTX (passed to --mac)
+  mac2: false                                       # Second MAC workload mode (passed to --mac2)
+  mac_timer: true                                   # MAC uses internal timer (passed to --mac_timer)
+
+  # --- Cell grouping / packing options ---
+  groups_dl: true                                   # Use DL cell groups (passed to --groups_dl), recommend to set to true for lower latency
+  pack_pdsch: true                                  # Use packed DL cell groups for PDSCH (passed to --pack_pdsch), recommend to set to true for lower latency
+  groups_pusch: true                                # Use UL cell groups for PUSCH (passed to --groups_pusch), recommend to set to true for lower latency
+
+  # --- PUSCH / LDPC options ---
+  ldpc_parallel: true                               # Run LDPC decoder TB in parallel (passed to --ldpc_parallel), recommend to set to true for lower latency
+  pusch_cascaded: true                              # Cascade 2nd UL slot after 1st in DDDSUUDDDD (passed to --pusch_cascaded). If true, PUSCH2/PUCCH2 starts after the completion of PUSCH1. Otherwise, PUSCH2/PUCCH2 starts after it's own delay, independent of PUSCH1
+  pusch_subslot_proc: "0"                           # Subslot processing for PUSCH: "0","1","00","01","10","11" (passed to --pusch_subslot_proc). We have at most 2 PUSCHs, 0 for disable and 1 for enable.
+
+  # --- cuMAC options ---
+  # Optional; when present in the input YAML (root or config.cumac_options), these override cuMAC kernel/config defaults.
+  # Independent of tdd_slot_config.MAC, which only controls per-slot run enable/disable.
+  cumac_options:
+    # modules_called: [UE selection, PRG allocation, layer selection, MCS selection]; 0 = disable, 1 = enable
+    modules_called: [1, 1, 1, 1]
+    # light_weight_flag per slot: 0 = heavy kernel; 1 = light (SRS computation); 2 = light (SRS loading). Up to 10 slots.
+    cumac_light_weight_flag: [1, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+    # perc_sm_num_thrd_blk: percentage of SMs for thread blocks in light-weight kernels, per slot. Up to 10 slots.
+    perc_sm_num_thrd_blk: [6.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    half_precision: 0       # 0 = float32, 1 = half precision
+    sch_alg: 1              # 0 = RR, 1 = PF
+    hetero_ue_sel_cells: 0  # 0 = disabled, 1 = heterogeneous UE selection across cells
+
+  # --- Experimental extras, not recommended to change ---
+  2cb_per_sm: true                                  # Enable 2 CB/SM (GA100 feature flag) (passed to --2cb_per_sm)
+  GH200: false                                      # Force GH200 mode (skip auto-detect) (passed to --GH200)
+  unsafe: false                                     # Power measurement without timeouts (passed to --unsafe)
+  check_traffic: false                              # Check functional errors in traffic (passed to --check_traffic)
+  numa: 0                                           # NUMA node selection (passed to --numa)
+
+override_test_vectors:
+  enable_override: false  # set to true to enable test vector override; otherwise, the default test vectors will be used.
+  # USE CAUTION WHEN OVERRIDING TEST VECTORS:
+  # - If you are not sure about the override value, leave it as -1.
+  # - If you are sure about the override value, set it to the desired value.
+  # Per-field sentinel: set a detailed override value to -1 to keep TV default (no overwrite).
+  # Any other explicit value attempts overwrite for that field.
+  # Note: generated vectors YAML omits this entire section when:
+  #   - enable_override is false, or
+  #   - all effective override values are -1.
+  PUSCH:
+    enable_early_harq: -1                           # Early HARQ decode path enable (0/1)
+    enable_cfo_correction: -1                       # Carrier frequency offset correction enable (0/1)
+    enable_weighted_average_cfo: -1                 # Weighted-average CFO estimation enable (0/1)
+    enable_to_estimation: -1                        # Timing offset estimation enable (0/1)
+    tdi_mode: -1                                    # TDI mode selector (0=off, 1=on)
+    enable_dft_sofdm: -1                            # DFT-s-OFDM processing enable (0/1)
+    enable_rssi_measurement: -1                     # RSSI measurement enable (0/1)
+    enable_sinr_measurement: -1                     # SINR measurement enable (0/1)
+    enable_static_dynamic_beamforming: -1           # Static/dynamic beamforming control (0/1)
+    ldpc_early_termination: -1                      # LDPC early termination enable (0/1)
+    ldpc_algorithm_index: -1                        # LDPC decoder algorithm selector
+    ldpc_flags: -1                                  # LDPC decoder flags bitmask
+    ldpc_use_half: -1                               # LDPC half-precision path enable (0/1)
+    ldpc_max_num_iterations: 10                     # Fixed maximum LDPC iterations
+    ldpc_max_num_iterations_algorithm_index: 0      # LDPC max-iteration strategy (0=fixed,1=LUT,2=per-UE)
+    dmrs_channel_estimation_algorithm_index: -1     # DMRS channel estimation algorithm selector
+    enable_per_prg_channel_estimation: -1           # Per-PRG channel estimation enable (0/1)
+    eq_coefficient_algorithm_index: -1              # Equalizer coefficient algorithm selector
+    list_length: -1                                 # Polar decoder list size
+  PUCCH:
+    list_length: -1                                 # PUCCH polar decoder list size
+  SRS:
+    chEst_alg_selector: -1                          # SRS channel estimation algorithm selector, to be added later
+
+start_delay:
+  # Start offsets for channel workloads in generated vectors YAML.
+  # Uplink
+    # UL_ANCHOR: optional UL anchor channel for timeline semantics [PUSCH(default), PRACH, PUCCH].
+    #            Anchor channel delay is absolute from UL time origin; PUSCH1/PUCCH1/PRACH are relative to anchor start when this key is set.
+    # Behavior summary:
+    #   - PUSCH2: if pusch_cascaded, delay is after PUSCH1 completion (default 0); otherwise delay is relative to UL anchor start.
+    #   - PUCCH2: if pusch_cascaded and UL_ANCHOR != PUSCH, delay is after PUCCH1 completion (default 0).
+    #   - PUCCH2: otherwise (non-cascaded or UL_ANCHOR == PUSCH/unspecified), keeps anchor/legacy timeline behavior.
+    # PUSCH1: relative to UL anchor start (absolute from UL origin when UL_ANCHOR == PUSCH).
+    # PUCCH1: relative to UL anchor start (legacy: relative to PUSCH1 start).
+    # PRACH: relative to UL anchor start (legacy when UL_ANCHOR unset: if set -> relative to PUSCH1 start, else starts after PUSCH1 completion).
+  # Downlink
+    # PDSCH: delay (us) applied after each 500 us slot boundary; then PDSCH slot start is recorded. Applied per slot.
+    # PDCCH: relative to slot boundary for that slot (500 us); delay then run PDCCH. Applied per slot.
+    # PDCCH_CSIRS: delay after PDCCH end before CSI-RS (default 0).
+    # PDSCH_DLBFW (and DLBFW): delay from slot start before DLBFW runs (not after DLBFW).
+    # SSB: relative to slot boundary for that slot. SSB is fixed for the last 4 slots.
+  # MAC/MAC2: slot-aligned like PDSCH in each slot.
+  UL_ANCHOR: PUSCH
+  PUSCH1: 1796
+  PUSCH2: 0
+  PUCCH1: 0
+  PUCCH2: 0
+  PRACH: 694
+  PDSCH: 120
+  PDCCH: 0
+  PDCCH_CSIRS: 0
+  PDSCH_DLBFW: 0
+  SSB: 0
+  MAC: 0
+  MAC2: 0
+
+latency_budget:                                 
+  # Overrides default thresholds used by measure/TDD/check_cell_capacity.py.
+  # Providing latency_budget enables capacity checking with these custom thresholds.
+  PUSCH1: 1250
+  PUSCH1_SUBSLOT_PROC: 650
+  PUSCH2: 1250
+  PUSCH2_SUBSLOT_PROC: 650
+  PUCCH1: 650
+  PUCCH2: 650
+  PRACH: 1196
+  PDSCH: 375
+  PDCCH: 375
+  PDCCH_CSIRS: 375
+  PDSCH_DLBFW: 375
+  SSB: 375
+  MAC: 500
+  MAC2: 500

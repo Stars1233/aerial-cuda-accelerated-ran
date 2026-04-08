@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,11 +56,11 @@ class TVGenerator:
         self.option = option if option is not None else "1"
         self.tvIndex = tvIndex
         self.gpuid = gpuid if gpuid is not None else "0"
-        if cmake is None:
-            self.build_path = f"{self.cubb}/cuMAC"
-        else:
-            self.build_path = f"{self.cubb}"
-        self.buildCommand = f"cd {self.build_path} && {self.cmake}"
+        # if cmake is None:
+        #    self.build_path = f"{self.cubb}/cuMAC"
+        # else:
+        #    self.build_path = f"{self.cubb}"
+        self.buildCommand = f"cd {self.cubb} && {self.cmake}"
         if self.option == "3":
             self.tvIndex = "testMAC"
             self.log_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_generate_cuMAC_{self.tvIndex}TV_main.log"
@@ -248,11 +248,11 @@ class TVGenerator:
 
     def generate_tv(self):
         """Generate TV and copy the result to the specified folder."""
-        # Determine the correct path for cmd based on build_path
-        if "cuMAC" in self.build_path:
-            cmd = f"timeout -s 9 3600 {self.build_path}/build/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
-        else:
-            cmd = f"timeout -s 9 3600 {self.build_path}/build/cuMAC/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
+        # Disable the build path check after 25-3 release,all build path is in /opt/nvidia/cuBB
+        # if "cuMAC" in self.cubb:
+        #    cmd = f"timeout -s 9 7200 {self.cubb}/build/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
+        # else:
+        cmd = f"timeout -s 9 3600 {self.cubb}/build/cuMAC/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
         param_file = f"{self.cubb}/cuMAC/examples/parameters.h"
 
         if self.option in ["1", "4"]:
@@ -284,7 +284,7 @@ class TVGenerator:
                 original_tvIndex = self.tvIndex
                 self.tvIndex = f"{original_tvIndex}_f{f_value}"
                 fast_fading_tv_name = f"{base_tv_name}{self.tvIndex}.h5"
-                generate_tv_log = f"{self.logfolder}/generate_{fast_fading_tv_name}.log"
+                generate_tv_log = f"{self.logfolder}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_generate_{fast_fading_tv_name}.log"
                 generate_fast_fading_tv_cmd = base_cmd + [
                     "-t",
                     "1",
@@ -296,7 +296,7 @@ class TVGenerator:
                 self.logger.info(
                     f"Running command: {generate_fast_fading_tv_cmd}")
 
-                if not os.path.exists(f"{self.cubb}/cuMAC/build"):
+                if not os.path.exists(f"{self.cubb}/build"):
                     self.logger.info(
                         "Building cuMAC again as no build folder found ......."
                     )
@@ -381,14 +381,14 @@ class TVGenerator:
                     "Building cuMAC to apply new parameters .......")
                 self.run_subprocess(self.buildCommand, self.log_file)
 
-            if not os.path.exists(f"{self.cubb}/cuMAC/build"):
+            if not os.path.exists(f"{self.cubb}/build"):
                 self.logger.info(
                     "Building cuMAC again as no build folder found ......."
                 )
                 self.run_subprocess(self.buildCommand, self.log_file)
 
             generate_tv_log = (
-                f"{self.logfolder}/generate_{base_tv_name}{self.tvIndex}.log"
+                f"{self.logfolder}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_generate_{base_tv_name}{self.tvIndex}.log"
             )
             # Original behavior for other options
             if "_f" in self.tvIndex:

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,12 +16,12 @@
 """pyAerial - SRS transmitter pipeline class definition."""
 from typing import Any
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 
 from aerial import pycuphy  # type: ignore
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.srs.srs_api import SrsTxConfig
 from aerial.phy5g.srs.srs_api import SrsTxPipeline
@@ -38,7 +38,7 @@ class SrsTx(SrsTxPipeline[Array, SrsTxConfig]):
                  num_max_srs_ues: int,
                  num_slot_per_frame: int,
                  num_symb_per_slot: int,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize SrsTx.
 
         Args:
@@ -46,17 +46,16 @@ class SrsTx(SrsTxPipeline[Array, SrsTxConfig]):
                 handle. Memory allocation is based on this number.
             num_slot_per_frame (int): Number of slots per frame.
             num_symb_per_slot (int): Number of symbols in a slot.
-            cuda_stream (int): The CUDA stream to run the pipeline. If not given,
-                one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new
+                CudaStream is created. Use ``with stream:`` to scope work; call
+                ``stream.synchronize()`` explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         self.srs_tx = pycuphy.SrsTx(num_max_srs_ues,
                                     num_slot_per_frame,
                                     num_symb_per_slot,
-                                    self.cuda_stream)
+                                    self._cuda_stream.handle)
 
     def __call__(self,
                  config: SrsTxConfig,
@@ -76,7 +75,7 @@ class SrsTx(SrsTxPipeline[Array, SrsTxConfig]):
         """
         num_tx_ant = [cfg.num_ant_ports for cfg in config.srs_configs]
         tx_buffers = self.srs_tx.run(config.slot, config.frame, config.srs_configs)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tx_buffers = [cp.array(buf) for buf in tx_buffers]
             tx_buffers = [buf[..., :num_tx_ant[idx]] for idx, buf in enumerate(tx_buffers)]
 

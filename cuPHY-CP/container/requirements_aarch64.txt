@@ -1,3 +1,0 @@
-tensorrt==10.11.0.33
-tensorrt_dispatch==10.11.0.33
-tensorrt_lean==10.11.0.33

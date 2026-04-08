@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,19 +35,12 @@ end
 switch compTvMode
     case 'both'
         genTV = 1;
-        genTVmax = 0;
         testCompliance = 1;
     case 'genTV'
         genTV = 1;
-        genTVmax = 0;
-        testCompliance = 0;
-    case 'genTVmax'
-        genTV = 1;
-        genTVmax = 1;
         testCompliance = 0;
     case 'testCompliance'
         genTV = 0;
-        genTVmax = 0;
         testCompliance = 1;
     otherwise
         error('compTvMode is not supported...\n');
@@ -234,9 +227,9 @@ CFG = {...
     7325,  1,        1,   1,  0,     8,  0,      4,     0,    0,    273, 20002,    0,    41,     2,      1,     0,     41,      2,   0,   4,     0; % HARQ 2tx
     7326,  1,        1,   1,  0,     8,  0,      4,     0,    0,    273, 20000,    0,    41,     2,      1,     0,     41,      2,   0,   4,     0; % HARQ 2tx with 2ue
     % multiple UEs
-    7327,  1,        1,   1,  0,   273,  0,     14,     0,    0,    273,    0,    0,      0,     2,      2,     0,      0,      2,   0,   8,     0; % 8 UEs FDM same nl
-    7328,  1,        1,   1,  0,   273,  0,     14,     0,    0,    273,    0,    0,      0,     2,      2,     0,      0,      2,   0,   8,     0; % 8 UEs FDM mixed nl
-    7329,  1,        1,   1,  0,   273,  0,     14,     0,    0,    273,    0,    0,      0,     2,      2,     0,      0,      2,   0,   8,     0; % 16 UEs FDM
+    7327,  1,        1,   1,  0,   273,  0,     14,     0,    0,    273,    1,    0,      0,     2,      2,     0,      0,      2,   0,   4,     0; % 8 UEs FDM same nl
+    7328,  1,        1,   1,  0,   273,  0,     14,     0,    0,    273,    9,    0,      0,     2,      2,     0,      0,      2,   0,   4,     0; % 8 UEs FDM mixed nl
+    7329,  1,        1,   1,  0,   273,  0,     14,     0,    0,    273,   17,    0,      0,     2,      2,     0,      0,      2,   0,   4,     0; % 16 UEs FDM
     7330,  1,        1,   1,  0,   273,  0,     14,     0,    0,    273,    0,    0,      0,     2,      2,     0,      0,      2,   0,   8,     0; % 16 UEs FDM + CDM
     % test nLayer
     7331,  1,       27,   1,  0,   273,  0,     14,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   8,     0; % nl=(1+2)
@@ -490,7 +483,7 @@ CFG = {...
     7830,          1,  27,   1,  0, 273,   0,    14,     0,    0,    273,   30,    0,     21,     2,      1,     0,     13,      2,   0,   4,    14; % table=1, max CB,
     7831,          1,  27,   1,  0, 273,   0,    14,     0,    0,    273,   31,    0,     21,     2,      1,     0,     13,      2,   0,   4,    19; % table=1, max CB,
 
-    % 32T32R mMIMO reserved 7851-7869
+    % 32T32R mMIMO reserved 7851-7868
     % TC#   mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym  SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 nAnt slotIdx
     7851,    0,       27,   1,  0, 273, 0,      8,    0,    0,    273,    46,    0,     41,     2,      1,     0,     41,      2,   0,   4,     0; % nl=(1+2)
     7852,    0,       27,   1,  0, 78, 0,      8,    0,    0,    78,    46,    0,     41,     2,      1,     0,     41,      2,   0,   4,     0; % 30 MHz
@@ -500,8 +493,10 @@ CFG = {...
     %7856  %79033,  0,       27,   1,  120, 100, 0,      8,    0,    0,    273,    46,    0,     41,     2,      1,     0,     41,      2,   0,   4,     0; % nl=(1+2)
     %7857  %79035,  0,       27,   1,  120, 100, 0,      8,    0,    0,    273,    46,    0,     41,     2,      1,     0,     41,      2,   0,   4,     0; % nl=(1+2)
 
-    % 64T64R mMIMO reserved 7870-7899
+    % 64T64R mMIMO reserved 7868-7900
     % TC#   mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym  SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 nAnt slotIdx
+    7868,  0,        27,   4,   0,  273, 0,      8,    0,    0,    273,    1,    0,     41,     2,      2,     0,     41,      2,   0,   8,      0; % nl=(4) static beamforming
+    7869,  0,        27,   4,   0,  273, 0,      8,    0,    0,    273,    1,    0,     41,     2,      2,     0,     41,      2,   0,   16,     0; % nl=(4) wideband beamforming
     7870,  0,        27,   1,   0,  273, 0,      8,    0,    0,    273,    1,    0,     41,     2,      2,     0,     41,      2,   0,   16,     0; % nl=(1+1+1+1+1+1+1+1)
     7871,  0,        27,   1,   0,  273, 0,      8,    0,    0,    273,    1,    0,     41,     2,      1,     0,     41,      2,   0,   16,     0; % nl=(1)
     7872,  0,        27,   2,   0,  273, 0,      8,    0,    0,    273,    1,    0,     41,     2,      1,     0,     41,      2,   0,   16,     0; % nl=(2)
@@ -532,7 +527,7 @@ CFG = {...
     7897,  1,         1,   2,   0,  273, 0,     14,    0,    0,    273,    0,    0,     41,     2,      1,     3,     41,      2,   0,   16,     0; % nl=(2+2) weighted average CFO
     7898,  1,         1,   2,   0,    8, 0,      4,    0,    0,    273,20001,    0,     41,     2,      1,     0,     41,      2,   0,   16,     0; % UL TTI Bundling 7tx  
     7899,  1,         1,   2,   0,    8, 0,      4,    0,    0,    273,20001,    0,     41,     2,      1,     0,     41,      2,   0,   16,     0; % mixed test case - one UL TTI Bundling UE 4 slots + 3 normal UEs 1 slots   
-
+    7900,  0,        27,   1,   0,  273, 0,      8,    0,    0,    273,    1,    0,     41,     2,      1,     0,     41,      2,   0,   16,     0; % TC7873 + LDPC_DMI_method = 'per_UE'
 
 
     % specific configuration for TV generation
@@ -596,6 +591,8 @@ CFG = {...
     7966,  2,        8,   2,  0,   273,  0,     14,     0,    0,    273,    7,    0,      0,     2,      2,     1,      0,      2,   0,  16,     0; % LDPC BG2, 42 parity nodes, Zc = 384, nl=(2+2+2+2)
     7967,  2,       21,   2,  0,     6,  0,     14,     0,    0,    273,    7,    0,      0,     2,      2,     1,      0,      2,   0,  16,     0; % LDPC BG2, 15 parity nodes, Zc = 384, nl=(2+2+2+2)
     7968,  1,        5,   2,  0,   273,  0,     14,     0,    0,    273,    7,    0,      0,     2,      2,     1,      0,      2,   0,  16,     0; % LDPC BG1, 38 parity nodes, Zc = 384, nl=(2+2+2+2)
+    7969,  1,       27,   2,  0,   273,  0,     14,     0,    0,    273,    7,    0,      0,     2,      2,     1,      0,      2,   0,  16,     0; % LDPC BG1,  4 parity nodes, Zc = 384, nl=(2+2+2+2)
+    7970,  1,       27,   2,  0,    54,  0,     14,     0,    0,    273,    7,    0,      0,     2,      2,     1,      0,      2,   0,  16,     0; % LDPC BG1,  4 parity nodes, Zc = 384, nl=(2+2+2+2), same TBSize and nCB with 7968
 
 
     % TC#   mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym  SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 nAnt slotIdx
@@ -746,7 +743,8 @@ CFG = {...
     7156,  1,       27,   2,  0,    45,  0,     14,     0,    0,    273,    7,    0,      0,     2,      1,     1,      0,      2,   0,   4,     0; % LDPC BG1,  4 parity nodes, Zc = 384, 6 UE FDM
     7157,  2,        8,   2,  0,   273,  0,     14,     0,    0,    273,    7,    0,      0,     2,      1,     1,      0,      2,   0,   4,     0; % LDPC BG2, 42 parity nodes, Zc = 384, 1 UE
     7158,  2,       21,   2,  0,     5,  0,     14,     0,    0,    273,    7,    0,      0,     2,      1,     1,      0,      2,   0,   4,     0; % LDPC BG2, 15 parity nodes, Zc = 384, 1 UE
-    7159,  1,        5,   2,  0,   136,  0,     14,     0,    0,    273,    7,    0,      0,     2,      1,     1,      0,      2,   0,   4,     0; % LDPC BG1, 39 parity nodes, Zc = 384, 3 UE FDM
+    7159,  1,        5,   2,  0,   136,  0,     14,     0,    0,    273,    7,    0,      0,     2,      1,     1,      0,      2,   0,   4,     0; % LDPC BG1, 39 parity nodes, Zc = 384, 2 UE FDM
+    7160,  1,       27,   2,  0,   136,  0,     14,     0,    0,    273,    7,    0,      0,     2,      1,     1,      0,      2,   0,   4,     0; % LDPC BG1,  4 parity nodes, Zc = 384, 2 UE FDM
 
     % TC#   mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym  SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 nAnt slotIdx
     % UCI on PUSCH
@@ -870,7 +868,6 @@ CFG = {...
     7625,  1        27,   1,  0,     4,  0,     14,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0; % High PUSCH code-rate with large UCI. TBS > nSchLLRS. Expect CRC error.
                                                                                                                                                     % Here TBS = 4608 bits, with 4288 SCH LLRs. CRC error expected.
 
-    
     % Invalid PUSCH PDU
     % CFG is for generating I/Q samples, PUSCH params will be overwrittin using INVALID_CFG
     % TC#   mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym  SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 nAnt slotIdx
@@ -1050,9 +1047,6 @@ parfor n = 1:NallTest
         if genTV
             nTV = nTV + 1;
             SysPar.SimCtrl.genTV.enable = 1;
-            if genTVmax
-                SysPar.SimCtrl.genTV.cuPHY_max = 1;
-            end
             SysPar.SimCtrl.genTV.TVname = sprintf('TVnr_%04d', caseNum);
             if ismember(caseNum, disabled_TC)
                 SysPar.SimCtrl.genTV.TVname = sprintf('disabled_TVnr_%04d', caseNum);
@@ -1091,14 +1085,14 @@ parfor n = 1:NallTest
         %         SysPar.carrier.Nant_UE =  CFG{idxSet, 21};
         SysPar.pusch{1}.seed = caseNum;
         SysPar.pusch{1}.pduBitmap = 1;   % Default PDU bitmap for PUSCH
-        if caseNum >= 7851 && caseNum < 7869
+        if caseNum >= 7851 && caseNum < 7868
             SysPar.pusch{1}.seed = 0;
             SysPar.SimCtrl.enable_dynamic_BF = 1;
             SysPar.carrier.Nant_gNB_srs = 32;
             SysPar.carrier.N_FhPort_DL = 8;
             SysPar.pusch{1}.prgSize = 2;
         end
-        if ismember(caseNum, [7870:7899 7964:7968])
+        if ismember(caseNum, [7868:7900 7964:7970])
             SysPar.pusch{1}.seed = 0;
             SysPar.SimCtrl.enable_dynamic_BF = 1;
             SysPar.SimCtrl.enable_static_dynamic_beamforming = 1; % 64TR
@@ -1106,6 +1100,9 @@ parfor n = 1:NallTest
             SysPar.carrier.N_FhPort_DL = CFG{idxSet, 21};
             SysPar.carrier.N_FhPort_UL = SysPar.carrier.Nant_gNB;
             SysPar.pusch{1}.prgSize = 2;
+            if ismember(caseNum, [7868:7869])
+                SysPar.pusch{1}.prgSize = 272;
+            end
             if caseNum == 7889
                 SysPar.SimCtrl.bfw.enable_prg_chest = 1;
             end
@@ -2252,6 +2249,10 @@ parfor n = 1:NallTest
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                 0   136    5  2  0   0    0;...
                 136 137    5  2  0   0    1];
+        elseif caseNum == 7160
+            nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
+                0   136   27  2  0   0    0;...
+                136 137   27  2  0   0    1];
         elseif caseNum == 7233
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                 0  60   10  1  0   0    0;...
@@ -2627,7 +2628,7 @@ parfor n = 1:NallTest
                 80   5   25  1  0   0    4;...
                 100  10   20  2  0   0    5;...
                 120   5   15  1  0   0    6;...
-                140  10   10  4  0   0    7];
+                140  10   10  2  0   0    7];
         elseif caseNum == 7329
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                 0   5    5  1  0   0    0;...
@@ -2637,7 +2638,7 @@ parfor n = 1:NallTest
                 80   5   25  1  0   0    4;...
                 100  10   20  2  0   0    5;...
                 120   5   15  1  0   0    6;...
-                140  10   10  4  0   0    7;...
+                140  10   10  2  0   0    7;...
                 160   5    5  1  0   0    8;...
                 180  10   10  2  0   0    9;...
                 200   5   15  1  0   0   10;...
@@ -2645,7 +2646,7 @@ parfor n = 1:NallTest
                 220   5   25  1  0   0   12;...
                 230  10   20  2  0   0   13;...
                 240   5   15  1  0   0   14;...
-                250  10   10  4  0   0   15];
+                250  10   10  2  0   0   15];
         elseif ismember(caseNum, [7330, 7344])
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                 0   5    5  1  0   0    0;...
@@ -2787,7 +2788,7 @@ parfor n = 1:NallTest
         elseif caseNum == 7872
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                 0  273  1   2  0   0    0];
-        elseif caseNum == 7873
+        elseif ismember(caseNum, [7873 7900])
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                 0  273  1   1  0   0    0;...
                 0  273  1   1  1   0    0];
@@ -3093,6 +3094,18 @@ parfor n = 1:NallTest
                         0  273  5   2  2   0    0;...
                         0  273  5   2  4   0    0;...
                         0  273  5   2  6   0    0;];
+        elseif caseNum == 7969
+            nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
+                        0  273  27  2  0   0    0;...
+                        0  273  27  2  2   0    0;...
+                        0  273  27  2  4   0    0;...
+                        0  273  27  2  6   0    0;];
+        elseif caseNum == 7970
+            nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
+                        0   54  27  2  0   0    0;...
+                        0   54  27  2  2   0    0;...
+                        0   54  27  2  4   0    0;...
+                        0   54  27  2  6   0    0;];
         end
 
         % Lower SNR for the de-rate matching kernel test when E+F>N_cb 
@@ -3275,6 +3288,7 @@ parfor n = 1:NallTest
                     PRGSIZE_ = [2 4 4];
                     if length(PRGSIZE_) > 0
                         SysPar.pusch{idxUe}.prgSize = PRGSIZE_(idxUe);
+                        SysPar.pusch{idxUe}.enable_prg_chest = 1;
                     end
                 end
 
@@ -3331,7 +3345,7 @@ parfor n = 1:NallTest
                 if ismember(caseNum, [7870 7879])
                     RNTI_ = [1 4 6 7 8 9 10 3];
                 end
-                if caseNum == 7873
+                if ismember(caseNum, [7873 7900])
                     RNTI_ = [1 4];
                 end
                 if caseNum == 7874
@@ -3598,13 +3612,19 @@ parfor n = 1:NallTest
         end
 
         for idxUe = 1:length(SysPar.pusch)
-            if ismember(caseNum, [7870:7899 7964:7968])
+            if ismember(caseNum, [7869:7900 7964:7970])
                 SysPar.pusch{idxUe}.digBFInterfaces = 0;
             else
-                digBFInterfaces = SysPar.carrier.Nant_gNB;
+                digBFInterfaces = SysPar.carrier.Nant_gNB; % TC7868 digBFInterfaces = Nant_gNB = 8 for 64TR static beamforming
                 SysPar.pusch{idxUe}.digBFInterfaces = digBFInterfaces;
                 SysPar.pusch{idxUe}.beamIdx = [1:digBFInterfaces];
             end
+        end
+
+        if ismember(caseNum, [7900])
+            SysPar.SimCtrl.alg.LDPC_DMI_method = 'per_UE';
+            SysPar.pusch{1}.ldpcMaxNumItrPerUe = 20;
+            SysPar.pusch{2}.ldpcMaxNumItrPerUe = 24;
         end
 
         if ismember(caseNum, [7897]) % weighted average CFO
@@ -3649,6 +3669,7 @@ parfor n = 1:NallTest
 
         if ismember(caseNum, [7702:7708, 7712])  % Tvs with invalid PUSCH params
             SysPar.SimCtrl.negTV.enable = 1;  % enable negTV
+            SysPar.SimCtrl.negTV.channel = [SysPar.SimCtrl.negTV.channel, {'PUSCH'}];
             % SimCrtl.negTV.pdufieldName: List of fields to be changed
             % SimCrtl.negTV.pdufieldValue: List of values correspoinding to SimCrtl.negTV.pdufieldName
             invalidCfgList = cell2mat(INVALID_CFG(:,1));

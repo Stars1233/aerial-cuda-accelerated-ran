@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 #include <string.h>
 #include <string_view>
 #include <sys/time.h>
+#include <semaphore.h>
 #include <filesystem>
 
 #include "nv_mac_factory.hpp"
@@ -28,6 +29,7 @@
 #include "test_mac.hpp"
 
 #include "cuphyoam.hpp"
+#include "common_utils.hpp"
 #include "signal_handler.hpp"
 
 #include "nv_utils.h"
@@ -168,6 +170,20 @@ int parse_channel_mask(char* arg, uint32_t* mask)
     return 0;
 }
 
+/**
+ * SIGNAL handler function
+ *
+ * @param[in] signum Signal number
+ */
+static void signal_handler(int signum)
+{
+    // Set the nvlog exit_handler atomic flag to trigger exiting the application
+    exit_handler::getInstance().set_exit_handler_flag(exit_handler::l1_state::L1_EXIT);
+
+    // Note: It's not async-signal-safe to print log in signal handler, but it's really necessary to add log to avoid silent exiting.
+    NVLOGC_FMT(TAG, "[signal_handler] received signal {} - {} - {}", signum, sigabbrev_np(signum), sigdescr_np(signum));
+}
+
 ////////////////////////////////////////////////////////////////////////
 int main(int argc, char* argv[])
 {
@@ -207,15 +223,8 @@ int main(int argc, char* argv[])
 
     assign_thread_name("mac_init");
 
-    if(ENABLE_CELL_STOP_SIGNAL_HANDLER)
-    {
-        test_mac_signal_setup();
-    }
-    else
-    {
-        generic_signal_setup();
-    }
-
+    int ret = EXIT_SUCCESS;
+    test_mac* testmac = nullptr;
     try{
         // Parse input parameters
         int show_thrput = 0;
@@ -317,6 +326,10 @@ int main(int argc, char* argv[])
         nvlog_fmtlog_thread_init();
         NVLOGC_FMT(TAG, "Thread {} initialized fmtlog", __FUNCTION__);
 
+        // Register signal handlers after nvlog is initialized
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+
         string pattern_file;
         if (mode == 0) {
             pattern_file = "launch_pattern" + pattern + ".yaml";
@@ -352,6 +365,7 @@ int main(int argc, char* argv[])
 #ifdef AERIAL_CUMAC_ENABLE
         yaml::file_parser* p_cumac_yaml_file = nullptr;
         yaml::document cumac_yaml_doc;
+        configs->cumac_configs = nullptr; // Explicitly initialize to nullptr to avoid coverity warning
         // Load TestCUMAC config if enabled
         if (yaml_root.has_key("test_cumac_config_file"))
         {
@@ -385,7 +399,7 @@ int main(int argc, char* argv[])
 
             if (_cumac_handler->get_cumac_configs()->cumac_cp_standalone) {
                 _cumac_handler->join();
-                return 0;
+                goto quit;
             }
         }
 #endif
@@ -393,7 +407,7 @@ int main(int argc, char* argv[])
         launch_pattern *lp = new launch_pattern(configs);
         if(lp->launch_pattern_parsing(pattern_file.c_str(), channel_mask, cell_mask) < 0)
         {
-            return -1;
+            goto quit;
         }
 
         int fapi_10_04 = 0;
@@ -404,12 +418,18 @@ int main(int argc, char* argv[])
                 lp->get_cell_num(), lp->get_negative_test(), show_thrput, fapi_10_04);
         if(show_thrput)
         {
-            return 0;
+            goto quit;
         }
 
         oam_init(configs->oam_server_addr);
 
-        test_mac* testmac = create_test_mac(doc.root(), lp->get_cell_num());
+        // Check app exiting before creating test_mac instance which may be blocked on nvIPC connection
+        if (is_app_exiting())
+        {
+            goto quit;
+        }
+
+        testmac = create_test_mac(doc.root(), lp->get_cell_num());
 
         // Set the test_mac_config and launch_pattern pointer to test_mac
         testmac->set_launch_pattern_and_configs(configs, lp);
@@ -420,13 +440,32 @@ int main(int argc, char* argv[])
         // Wait for the MAC thread to complete
         testmac->join();
 
-        nvlog_fmtlog_close(bg_thread_id);
+        NVLOGC_FMT(TAG, "test_mac deconstructed");
     }
     catch(std::exception& e)
     {
-        NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "test_mac exit with exception: {}", e.what());
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "test_mac exit with exception: {}", e.what());
+        ret = EXIT_FAILURE;
     }
 
-    NVLOGC_FMT(TAG, "test_mac exit normally", __func__);
-    return 0;
+quit:
+    NVLOGC_FMT(TAG, "main: start quitting ...");
+
+    if (testmac != nullptr)
+    {
+        delete testmac;
+    }
+
+    nvlog_fmtlog_close();
+
+    if (ret == EXIT_SUCCESS)
+    {
+        printf("EXIT successfully from main function\n");
+    }
+    else
+    {
+        printf("EXIT from main function with error_code=%d\n", ret);
+    }
+
+    return ret;
 }

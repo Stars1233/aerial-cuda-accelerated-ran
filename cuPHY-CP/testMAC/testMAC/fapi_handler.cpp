@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -432,6 +432,14 @@ fapi_handler::fapi_handler(phy_mac_transport& transport, test_mac_configs* confi
     {
         stat_stt_send->set_limit(stat_stt_send, 0, 500 * 1000);
     }
+    if ((stat_deadline_diff = stat_log_open("TX:DEADLINE_DIFF", STAT_MODE_COUNTER, DEADLINE_STATISTIC_PERIOD)) != NULL)
+    {
+        stat_deadline_diff->set_limit(stat_deadline_diff, -DEADLINE_DIFF_MAX_NS, DEADLINE_DIFF_MAX_NS);
+    }
+    if ((stat_tx_per_msg = stat_log_open("TX:PER_MSG_TIME", STAT_MODE_COUNTER, STT_STATISTIC_PERIOD)) != NULL)
+    {
+        stat_tx_per_msg->set_limit(stat_tx_per_msg, 0, 100 * 1000);
+    }
 
     int pattern_len = lp->get_slot_cell_patterns().size();
     stt_estimate.resize(pattern_len);
@@ -502,6 +510,14 @@ fapi_handler::~fapi_handler()
     if (stat_stt_send != NULL)
     {
         stat_stt_send->close(stat_stt_send);
+    }
+    if (stat_deadline_diff != NULL)
+    {
+        stat_deadline_diff->close(stat_deadline_diff);
+    }
+    if (stat_tx_per_msg != NULL)
+    {
+        stat_tx_per_msg->close(stat_tx_per_msg);
     }
 }
 
@@ -828,7 +844,12 @@ int fapi_handler::schedule_cell_update(uint64_t slot_counter)
                 cpu_set_t mask;
                 CPU_ZERO(&mask);
                 CPU_SET(0, &mask);
-                pthread_setaffinity_np(oam_cmd_thread.native_handle(), sizeof(mask), &mask);
+
+                int rc = pthread_setaffinity_np(oam_cmd_thread.native_handle(), sizeof(mask), &mask);
+                if(rc != 0)
+                {
+                    NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: set affinity failed: err={} - {}", __func__, rc, strerror(rc));
+                }
 
                 oam_cmd_thread.detach();
 
@@ -894,15 +915,15 @@ void fapi_handler::static_ul_dl_scheduler(uint32_t sfn, uint32_t slot, uint64_t 
     nvlog_gettime_rt(&ts_now);
 
     int64_t handle_delay = ts_start.tv_sec * 1000000000LL + ts_start.tv_nsec - ts_tick;
-    int64_t mac_sched_time = (ts_now.tv_sec * 1000000000LL + ts_now.tv_nsec - ts_tick) / 1000; // us
+    int64_t mac_sched_time = (ts_now.tv_sec * 1000000000LL + ts_now.tv_nsec - ts_tick_tai) / 1000; // us
 
     if (schedule_time != NULL)
     {
         schedule_time->add(schedule_time, mac_sched_time); // us
     }
 
-    NVLOGI_FMT(TAG, "SFN {}.{} slot_counter={} fapi_count={} scheduled in {} us - SLOT.ind handle delay={}",
-            sfn, slot, slot_counter, fapi_count, mac_sched_time, handle_delay);
+    NVLOGI_FMT(TAG, "SFN {}.{} slot_counter={} fapi_count={} scheduled in {} us - SLOT.ind handle delay={} tai_diff={}",
+            sfn, slot, slot_counter, fapi_count, mac_sched_time, handle_delay, ts_tick_tai - ts_tick);
 
     // Print throughput statistic info every second (print after finishing scheduling, do not include throughput of this slot)
     if(slot_counter > 0 && slot_counter % SLOTS_PER_SECOND == 0)

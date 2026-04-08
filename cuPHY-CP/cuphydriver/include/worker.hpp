@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -231,32 +231,21 @@ public:
     MemFoot                  mf; ///< Memory footprint tracker
 
     /**
-     * @brief Initializes PMU performance counters.
+     * @brief Creates PMU counters for this worker's thread.
+     * Must be called from the worker thread (not the main thread).
      */
-    void initPerfCounters();
-    
-    /**
-     * @brief Reads PMU counter values at start of measurement.
-     */
-    void readStartCounters();
-    
-    /**
-     * @brief Reads PMU counter values at end of measurement.
-     */
-    void readEndCounters();
-    
-    /**
-     * @brief Formats PMU counter metrics into a string.
-     * 
-     * @param out_str Output string buffer
-     * @param max_chars Maximum characters to write to buffer
-     */
-    void formatCounterMetrics(char* out_str, int max_chars);
-    
+    void initPMU();
+
     /**
      * @brief Destroys PMU performance counters.
      */
-    void destroyPerfCounters();
+    void destroyPMU();
+
+    /**
+     * @brief Gets the PMU delta summarizer for direct access.
+     * @return Pointer to PMUDeltaSummarizer (may be nullptr before initPMU)
+     */
+    PMUDeltaSummarizer* getPMU() { return pmuds; }
 
 private:
     phydriver_handle         pdh;            ///< cuPHYdriver handle

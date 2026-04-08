@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -154,6 +154,19 @@ public:
     uint32_t getTimeChanSize(){return m_timeChanSize;};
     uint32_t getFreqChanScPerLinkSize(){return m_freqChanScSizePerLink;};
     uint32_t getFreqChanPrbgSize(){return m_freqChanPrbgSize;};
+    
+    /**
+     * @brief Set the input signal pointer for processing
+     * Updates CPU descriptor and copies to GPU
+     * @param txSigIn GPU pointer to input signal
+     */
+    void setTxSigIn(Tcomplex* txSigIn);
+    
+    /**
+     * @brief Copy the CPU descriptor to GPU
+     * Call after modifying CPU descriptor fields to sync changes to GPU
+     */
+    void copyDescriptor();
 
     // for printout samples
     void printTimeChan(uint16_t cid = 0, uint16_t uid = 0, int printLen = 10);

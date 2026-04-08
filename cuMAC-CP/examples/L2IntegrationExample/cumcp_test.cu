@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -341,8 +341,8 @@ __global__ void pfmSort(uint8_t*    main_in_buf,
     bitonicSort<float, uint16_t, uint16_t>(valueShared, rntiShared, lidShared, minPow2);
 
     // Store the sorted results
-    uint16_t num_lc_output;
-    uint32_t out_buf_offset;
+    uint16_t num_lc_output = 0;
+    uint32_t out_buf_offset = 0;
     if (blockIdx.x == 0) {
         num_lc_output = num_lc_dl_gbr_crtc;
         out_buf_offset = 0;
@@ -441,7 +441,7 @@ int main(int argc, char** argv)
         test_task_t *task = test_task_ring->get_buf_addr(i);
         if (task == nullptr)
         {
-            NVLOGE(TAG, AERIAL_CUMAC_CP_EVENT, "Error cumac_task ring lengh: i=%d length=%d", i, ring_len);
+            NVLOGE(TAG, AERIAL_CUMAC_CP_EVENT, "Error cumac_task ring length: i=%d length=%d", i, ring_len);
             return -1;
         }
 
@@ -452,8 +452,8 @@ int main(int argc, char** argv)
     uint8_t max_num_UL_LCG = MAX_NUM_LCG;
 
     // Create cuMAC-CP receiver thread
-    pthread_t thread_id;
-    int ret = pthread_create(&thread_id, NULL, cumacCp_blocking_recv_task, NULL);
+    pthread_t recv_thread_id;
+    int ret = pthread_create(&recv_thread_id, NULL, cumacCp_blocking_recv_task, NULL);
     if(ret != 0)
     {
         NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s failed, ret=%d", __func__, ret);
@@ -485,12 +485,12 @@ int main(int argc, char** argv)
         cudaEvent_t startCopyH2D, stopCopyH2D;
         cudaEvent_t startKernel, stopKernel;
         cudaEvent_t startCopyD2H, stopCopyD2H;
-        cudaEventCreate(&startCopyH2D);
-        cudaEventCreate(&stopCopyH2D);
-        cudaEventCreate(&startKernel);
-        cudaEventCreate(&stopKernel);
-        cudaEventCreate(&startCopyD2H);
-        cudaEventCreate(&stopCopyD2H);
+        CHECK_CUDA_ERR(cudaEventCreate(&startCopyH2D));
+        CHECK_CUDA_ERR(cudaEventCreate(&stopCopyH2D));
+        CHECK_CUDA_ERR(cudaEventCreate(&startKernel));
+        CHECK_CUDA_ERR(cudaEventCreate(&stopKernel));
+        CHECK_CUDA_ERR(cudaEventCreate(&startCopyD2H));
+        CHECK_CUDA_ERR(cudaEventCreate(&stopCopyD2H));
 
         struct timespec slot_start, slot_end;
         clock_gettime(CLOCK_REALTIME, &slot_start);
@@ -504,7 +504,7 @@ int main(int argc, char** argv)
         if(ipc->tx_allocate(ipc, &send_msg, 0) != 0)
         {
             NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s error: NVIPC memory pool is full", __func__);
-            return -1;
+            break;
         }
 
         // MSG part
@@ -534,18 +534,18 @@ int main(int argc, char** argv)
 
         clock_gettime(CLOCK_REALTIME, &slot_end);
         int64_t slot_duration = nvlog_timespec_interval(&slot_start, &slot_end);
-        NVLOGI(TAG, "cuMAC-CP Slot preparation duration: %d ns", slot_duration);
+        NVLOGI(TAG, "cuMAC-CP Slot preparation duration: %ld ns", slot_duration);
 
         // Copy data from NVIPC buffer to GPU buffer
-        cudaEventRecord(startCopyH2D);
+        CHECK_CUDA_ERR(cudaEventRecord(startCopyH2D));
         for (int rIdx = 0; rIdx < 100; rIdx++) {
             CHECK_CUDA_ERR(cudaMemcpyAsync(task->gpu_buf, task->recv_msg.data_buf, task->recv_msg.data_len, cudaMemcpyHostToDevice, task->strm));
         }
-        cudaEventRecord(stopCopyH2D);
-        cudaEventSynchronize(stopCopyH2D);
+        CHECK_CUDA_ERR(cudaEventRecord(stopCopyH2D));
+        CHECK_CUDA_ERR(cudaEventSynchronize(stopCopyH2D));
     
         // Launch PFM sorting kernel
-        cudaEventRecord(startKernel);
+        CHECK_CUDA_ERR(cudaEventRecord(startKernel));
         for (int rIdx = 0; rIdx < 100; rIdx++) {
             pfmSort<<<num_blocks, num_threads, 0, task->strm>>>(gpu_main_in_buf, 
                                                                 task->gpu_buf, 
@@ -563,29 +563,38 @@ int main(int argc, char** argv)
                                                                 task->num_output_sorted_lc[7],
                                                                 task->num_output_sorted_lc[8],
                                                                 task->num_output_sorted_lc[9]);
+            CHECK_CUDA_ERR(cudaGetLastError());
         }
-        cudaEventRecord(stopKernel);
-        cudaEventSynchronize(stopKernel);
+        CHECK_CUDA_ERR(cudaEventRecord(stopKernel));
+        CHECK_CUDA_ERR(cudaEventSynchronize(stopKernel));
 
-        cudaEventRecord(startCopyD2H);
+        CHECK_CUDA_ERR(cudaEventRecord(startCopyD2H));
         for (int rIdx = 0; rIdx < 100; rIdx++) {
             CHECK_CUDA_ERR(cudaMemcpyAsync(data_buf, gpu_out_buf, data_size, cudaMemcpyDeviceToHost, task->strm));
         }
-        cudaEventRecord(stopCopyD2H);
-        cudaEventSynchronize(stopCopyD2H);
+        CHECK_CUDA_ERR(cudaEventRecord(stopCopyD2H));
+        CHECK_CUDA_ERR(cudaEventSynchronize(stopCopyD2H));
 
         CHECK_CUDA_ERR(cudaStreamSynchronize(task->strm));
 
         // calculate timings
         float timeH2D, timeKernel, timeD2H;
 
-        cudaEventElapsedTime(&timeH2D, startCopyH2D, stopCopyH2D);
-        cudaEventElapsedTime(&timeKernel, startKernel, stopKernel);
-        cudaEventElapsedTime(&timeD2H, startCopyD2H, stopCopyD2H);
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&timeH2D, startCopyH2D, stopCopyH2D));
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&timeKernel, startKernel, stopKernel));
+        CHECK_CUDA_ERR(cudaEventElapsedTime(&timeD2H, startCopyD2H, stopCopyD2H));
 
         printf("Host to Device copy time: %f microseconds\n", timeH2D*10.0);
         printf("Kernel execution time:     %f microseconds\n", timeKernel*10.0);
         printf("Device to Host copy time: %f microseconds\n", timeD2H*10.0);
+
+        // Destroy CUDA events
+        CHECK_CUDA_ERR(cudaEventDestroy(startCopyH2D));
+        CHECK_CUDA_ERR(cudaEventDestroy(stopCopyH2D));
+        CHECK_CUDA_ERR(cudaEventDestroy(startKernel));
+        CHECK_CUDA_ERR(cudaEventDestroy(stopKernel));
+        CHECK_CUDA_ERR(cudaEventDestroy(startCopyD2H));
+        CHECK_CUDA_ERR(cudaEventDestroy(stopCopyD2H));
 
         // todo: validate the results
 
@@ -596,13 +605,13 @@ int main(int argc, char** argv)
         if(ipc->tx_send_msg(ipc, &send_msg) < 0)
         {
             NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s error: send message failed", __func__);
-            return -1;
+            break;
         }
 
         if(ipc->tx_tti_sem_post(ipc) < 0)
         {
             NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s error: tx notification failed", __func__);
-            return -1;
+            break;
         }
 
         // Release the NVIPC message buffer
@@ -616,8 +625,37 @@ int main(int argc, char** argv)
     CHECK_CUDA_ERR(cudaFree(gpu_main_in_buf));
     CHECK_CUDA_ERR(cudaFree(gpu_out_buf));
     for (int i = 0; i < ring_len; i++) {
-        CHECK_CUDA_ERR(cudaFree(test_task_ring->get_buf_addr(i)->gpu_buf));
+        test_task_t *task = test_task_ring->get_buf_addr(i);
+        if (task == nullptr)
+        {
+            NVLOGE(TAG, AERIAL_CUMAC_CP_EVENT, "Error cumac_task ring length: i=%d length=%d", i, ring_len);
+            continue;
+        }
+        CHECK_CUDA_ERR(cudaFree(task->gpu_buf));
     }
 
-    return 0;
+    int exit_code = 0;
+    if(recv_thread_id != 0)
+    {
+        // Cancel the receiver thread
+        NVLOGI(TAG, "%s: canceling receiver thread", __func__);
+        if(pthread_cancel(recv_thread_id) != 0)
+        {
+            NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s pthread_cancel failed, stderr=%s", __func__, strerror(errno));
+        }
+
+        // Wait for the receiver thread to finish
+        NVLOGI(TAG, "%s: waiting for receiver thread to exit", __func__);
+        int ret = pthread_join(recv_thread_id, NULL);
+        if(ret != 0)
+        {
+            NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s pthread_join failed, stderr=%s", __func__, strerror(ret));
+            exit_code = -1;
+        }
+    }
+
+    // Synchronize CUDA device before exiting
+    CHECK_CUDA_ERR(cudaDeviceSynchronize());
+
+    return exit_code;
 }

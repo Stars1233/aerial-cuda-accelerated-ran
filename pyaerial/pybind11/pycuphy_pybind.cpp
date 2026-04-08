@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -96,7 +96,7 @@ void vector_to_carray(const std::vector<T>& vec, T (&dest)[N]) {
     }
 }
 
-// Helper function to convert numpy array to C-style array (keep for property setters)
+// Copy numpy/buffer array into fixed C array (at most N elements; remainder zero-filled).
 template<typename T, size_t N>
 void numpy_to_carray(const py::array_t<T>& arr, T (&dest)[N]) {
     py::buffer_info buf = arr.request();
@@ -115,20 +115,30 @@ void numpy_to_carray(const py::array_t<T>& arr, T (&dest)[N]) {
     }
 }
 
-// Helper function to convert C-style array to numpy array  
+// C fixed-size array -> Python list (small channel-model vectors; CIR/CFR buffers stay ndarray).
 template<typename T, size_t N>
-py::array_t<T> carray_to_numpy(const T (&src)[N]) {
-    // Create a new array with the same size as the source array
-    auto result = py::array_t<T>(N);
-    
-    // Get a mutable buffer to the array's data
-    auto buf = result.request();
-    T* ptr = static_cast<T*>(buf.ptr);
-    
-    // Copy the source array's data to the NumPy array
-    std::copy(src, src + N, ptr);
-    
-    return result;
+py::list carray_to_pylist(const T (&src)[N]) {
+    py::list out;
+    for (size_t i = 0; i < N; ++i) {
+        out.append(src[i]);
+    }
+    return out;
+}
+
+// Python list, tuple, or ndarray -> fixed C array (getters return list; setters accept array-likes).
+template<typename T, size_t N>
+void object_to_fixed_carray(const py::object& obj, T (&dest)[N]) {
+    py::array_t<T> arr = py::array_t<T>::ensure(obj);
+    if (arr) {
+        numpy_to_carray(arr, dest);
+        return;
+    }
+    py::sequence seq = obj.cast<py::sequence>();
+    std::vector<T> vec;
+    for (auto item : seq) {
+        vec.push_back(py::cast<T>(item));
+    }
+    vector_to_carray(vec, dest);
 }
 
 
@@ -485,14 +495,14 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def_readwrite("tx_signal_in", &tdlConfig_t::txSigIn);
 
     py::class_<pycuphy::TdlChanWrapper<float, cuComplex>>(m, "TdlChan")
-        .def(py::init<tdlConfig_t*, uintptr_t, uint16_t, uintptr_t>(),
-            py::arg("tdl_cfg"), py::arg("tx_signal_in_gpu"), py::arg("rand_seed"), py::arg("stream_handle"))
-        .def(py::init<tdlConfig_t*, py::array_t<std::complex<float>>, uint16_t, uintptr_t>(),
-            py::arg("tdl_cfg"), py::arg("tx_signal_in_cpu"), py::arg("rand_seed"), py::arg("stream_handle"))
-        .def("run", py::overload_cast<float, uint8_t, uint8_t>(&pycuphy::TdlChanWrapper<float, cuComplex>::run),
-            py::arg("ref_time0"), py::arg("enable_swap_tx_rx") = 0, py::arg("tx_column_major_ind") = 0)
-        .def("run", py::overload_cast<py::array_t<std::complex<float>>, py::array_t<std::complex<float>>, float, uint8_t, uint8_t>(&pycuphy::TdlChanWrapper<float, cuComplex>::run),
-            py::arg("tx_freq_signal_in_cpu"), py::arg("rx_freq_signal_out_cpu"), py::arg("ref_time0"), py::arg("enable_swap_tx_rx") = 0, py::arg("tx_column_major_ind") = 0)
+        .def(py::init<tdlConfig_t*, uint16_t, uintptr_t>(),
+            py::arg("tdl_cfg"), py::arg("rand_seed"), py::arg("stream_handle"))
+        .def("run", &pycuphy::TdlChanWrapper<float, cuComplex>::run,
+            py::arg("tx_signal_in"), py::arg("ref_time0") = 0.0f, py::arg("enable_swap_tx_rx") = 0, py::arg("tx_column_major_ind") = 0,
+            "Run channel with CuPy/GPU array input")
+        .def("get_rx_signal_out_array", &pycuphy::TdlChanWrapper<float, cuComplex>::getRxSignalOutArray,
+            py::arg("enable_swap_tx_rx") = 0,
+            "Get output signal as a CUDA array compatible with CuPy")
         .def("reset", &pycuphy::TdlChanWrapper<float, cuComplex>::reset)
         .def("get_time_chan", &pycuphy::TdlChanWrapper<float, cuComplex>::getTimeChan)
         .def("get_freq_chan_sc", &pycuphy::TdlChanWrapper<float, cuComplex>::getFreqChanSc)
@@ -552,14 +562,14 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def_readwrite("tx_signal_in", &cdlConfig_t::txSigIn);
 
     py::class_<pycuphy::CdlChanWrapper<float, cuComplex>>(m, "CdlChan")
-        .def(py::init<cdlConfig_t*, uintptr_t, uint16_t, uintptr_t>(),
-            py::arg("cdl_cfg"), py::arg("tx_signal_in_gpu"), py::arg("rand_seed"), py::arg("stream_handle"))
-        .def(py::init<cdlConfig_t*, py::array_t<std::complex<float>>, uint16_t, uintptr_t>(),
-            py::arg("cdl_cfg"), py::arg("tx_signal_in_cpu"), py::arg("rand_seed"), py::arg("stream_handle"))
-        .def("run", py::overload_cast<float, uint8_t, uint8_t>(&pycuphy::CdlChanWrapper<float, cuComplex>::run),
-            py::arg("ref_time0"), py::arg("enable_swap_tx_rx") = 0, py::arg("tx_column_major_ind") = 0)
-        .def("run", py::overload_cast<py::array_t<std::complex<float>>, py::array_t<std::complex<float>>, float, uint8_t, uint8_t>(&pycuphy::CdlChanWrapper<float, cuComplex>::run),
-            py::arg("tx_freq_signal_in_cpu"), py::arg("rx_freq_signal_out_cpu"), py::arg("ref_time0"), py::arg("enable_swap_tx_rx") = 0, py::arg("tx_column_major_ind") = 0)
+        .def(py::init<cdlConfig_t*, uint16_t, uintptr_t>(),
+            py::arg("cdl_cfg"), py::arg("rand_seed"), py::arg("stream_handle"))
+        .def("run", &pycuphy::CdlChanWrapper<float, cuComplex>::run,
+            py::arg("tx_signal_in"), py::arg("ref_time0") = 0.0f, py::arg("enable_swap_tx_rx") = 0, py::arg("tx_column_major_ind") = 0,
+            "Run channel with CuPy/GPU array input")
+        .def("get_rx_signal_out_array", &pycuphy::CdlChanWrapper<float, cuComplex>::getRxSignalOutArray,
+            py::arg("enable_swap_tx_rx") = 0,
+            "Get output signal as a CUDA array compatible with CuPy")
         .def("reset", &pycuphy::CdlChanWrapper<float, cuComplex>::reset)
         .def("get_time_chan", &pycuphy::CdlChanWrapper<float, cuComplex>::getTimeChan)
         .def("get_freq_chan_sc", &pycuphy::CdlChanWrapper<float, cuComplex>::getFreqChanSc)
@@ -595,6 +605,24 @@ PYBIND11_MODULE(_pycuphy, m) {
         .value("SMa", Scenario::SMa, "Suburban Macro scenario (TODO: Not supported yet)")
         .export_values();
 
+    // Bind SensingTargetType enum (for ISAC)
+    py::enum_<SensingTargetType>(m, "SensingTargetType", "Sensing target types for ISAC per 3GPP TR 38.901 Section 7.9")
+        .value("UAV", SensingTargetType::UAV, "UAV sensing target (Table 7.9.1-1)")
+        .value("AUTOMOTIVE", SensingTargetType::AUTOMOTIVE, "Automotive sensing target (Table 7.9.1-2)")
+        .value("HUMAN", SensingTargetType::HUMAN, "Human sensing target (Table 7.9.1-3)")
+        .value("AGV", SensingTargetType::AGV, "Automated Guided Vehicle sensing target (Table 7.9.1-4)")
+        .value("HAZARD", SensingTargetType::HAZARD, "Hazards on roads/railways sensing target (Table 7.9.1-5)")
+        .export_values();
+
+    // Bind UeType enum
+    py::enum_<UeType>(m, "UeType", "UE (User Equipment) device types per 3GPP categorization")
+        .value("TERRESTRIAL", UeType::TERRESTRIAL, "Traditional handheld/fixed UE (smartphones, tablets, CPE)")
+        .value("VEHICLE", UeType::VEHICLE, "Vehicular UE for V2X communication (cars, trucks, buses)")
+        .value("AERIAL", UeType::AERIAL, "Aerial UE (drones, UAVs for communication)")
+        .value("AGV", UeType::AGV, "Automated Guided Vehicle (industrial robots)")
+        .value("RSU", UeType::RSU, "Road Side Unit (fixed V2X infrastructure)")
+        .export_values();
+
     // Bind Coordinate struct
     py::class_<Coordinate>(m, "Coordinate", "3D coordinate structure for global coordinate system")
         .def(py::init<>(), "Default constructor")
@@ -609,6 +637,83 @@ PYBIND11_MODULE(_pycuphy, m) {
                    ", y=" + std::to_string(c.y) + 
                    ", z=" + std::to_string(c.z) + ")";
         });
+
+    // Bind SpstParam struct (SPST = Sub-Pixel Scattering Point for ISAC)
+    py::class_<SpstParam>(m, "SpstParam", "SPST (Scattering Point) parameter configuration for ISAC sensing targets")
+        .def(py::init<>(), "Default constructor")
+        .def(py::init<uint32_t, const Coordinate&, float, float, float>(),
+             "Initialize with SPST parameters",
+             py::arg("spst_id"), py::arg("loc_in_st_lcs"), 
+             py::arg("rcs_sigma_m_dbsm") = -12.81f, py::arg("rcs_sigma_d_dbsm") = 1.0f, 
+             py::arg("rcs_sigma_s_db") = 3.74f)
+        .def_readwrite("spst_id", &SpstParam::spst_id, "SPST ID within the ST (0-indexed)")
+        .def_readwrite("loc_in_st_lcs", &SpstParam::loc_in_st_lcs, 
+                      "Location of SPST in ST's local coordinate system")
+        .def_readwrite("rcs_sigma_m_dbsm", &SpstParam::rcs_sigma_m_dbsm, 
+                      "Mean monostatic RCS sigma_M in dBsm")
+        .def_readwrite("rcs_sigma_d_dbsm", &SpstParam::rcs_sigma_d_dbsm, 
+                      "Mean monostatic RCS sigma_D in dBsm")
+        .def_readwrite("rcs_sigma_s_db", &SpstParam::rcs_sigma_s_db, 
+                      "Standard deviation sigma_s_dB in dB")
+        .def_readwrite("enable_forward_scattering", &SpstParam::enable_forward_scattering,
+                      "Control forward scattering effect: 0=disable, 1=enable");
+
+    // Bind StParam struct (Sensing Target for ISAC)
+    py::class_<StParam>(m, "StParam", "Sensing Target (ST) parameter configuration for ISAC")
+        .def(py::init<>(), "Default constructor")
+        .def(py::init<uint32_t, uint8_t, const Coordinate&>(),
+             "Initialize with basic ST parameters",
+             py::arg("sid"), py::arg("outdoor_ind") = 1, py::arg("loc") = Coordinate())
+        .def(py::init<uint32_t, SensingTargetType, uint8_t, const Coordinate&, uint8_t>(),
+             "Initialize with target type and RCS model",
+             py::arg("sid"), py::arg("target_type"), py::arg("outdoor_ind"), 
+             py::arg("loc"), py::arg("rcs_model") = 1)
+        .def_readwrite("sid", &StParam::sid, "Global ST ID (Sensing Target ID)")
+        .def_readwrite("target_type", &StParam::target_type, "Type of sensing target")
+        .def_readwrite("outdoor_ind", &StParam::outdoor_ind, "0: indoor, 1: outdoor")
+        .def_readwrite("loc", &StParam::loc, "ST location in GCS")
+        .def_readwrite("rcs_model", &StParam::rcs_model, 
+                      "RCS model: 1=deterministic monostatic, 2=angular dependent")
+        .def_property("n_spst",
+            [](const StParam& self) { return self.n_spst; },
+            [](StParam& self, uint32_t value) {
+                self.n_spst = value;
+                try {
+                    self.validateSpstConsistency(true);
+                } catch (const std::invalid_argument& e) {
+                    throw py::value_error(e.what());
+                }
+            },
+            "Number of scattering points (SPSTs)")
+        .def_property("spst_configs",
+            [](const StParam& self) { return self.spst_configs; },
+            [](StParam& self, const std::vector<SpstParam>& value) {
+                self.spst_configs = value;
+                try {
+                    self.validateSpstConsistency(false);
+                } catch (const std::invalid_argument& e) {
+                    throw py::value_error(e.what());
+                }
+            },
+            "List of SPST parameter configurations")
+        .def_property("velocity",
+            [](const StParam& self) { return pycuphy::carray_to_pylist(self.velocity); },
+            [](StParam& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.velocity);
+            },
+            "Velocity vector [vx, vy, vz] in m/s")
+        .def_property("target_orientation",
+            [](const StParam& self) { return pycuphy::carray_to_pylist(self.orientation); },
+            [](StParam& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.orientation);
+            },
+            "Target orientation [azimuth, elevation] in degrees")
+        .def_property("physical_size",
+            [](const StParam& self) { return pycuphy::carray_to_pylist(self.physical_size); },
+            [](StParam& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.physical_size);
+            },
+            "Physical dimensions [length, width, height] in meters");
 
         // Bind AntPanelConfig struct with numpy array support
     py::class_<AntPanelConfig>(m, "AntPanelConfig", "Antenna panel configuration parameters")
@@ -641,7 +746,7 @@ PYBIND11_MODULE(_pycuphy, m) {
              "Initialize with full antenna parameters including direct patterns",
              py::arg("n_ant"), py::arg("ant_size"), py::arg("ant_spacing"), py::arg("ant_theta"), py::arg("ant_phi"), py::arg("ant_polar_angles"), py::arg("ant_model") = 2)
         .def_readwrite("n_ant", &AntPanelConfig::nAnt, 
-                      "Number of antennas in the array (nAnt = M_g * N_g * P * M * N)")
+                      "Number of antennas in the array (nAnt = M_g * N_g * M * N * P)")
         .def_property("ant_size", 
             [](const AntPanelConfig& self) { 
                 py::list result;
@@ -733,37 +838,51 @@ PYBIND11_MODULE(_pycuphy, m) {
     // Bind UtParamCfg struct (public API) with numpy array support
     py::class_<UtParamCfg>(m, "UtParamCfg", "User Terminal parameter configuration")
         .def(py::init<>(), "Default constructor")
-        .def(py::init<uint32_t, const Coordinate&, uint8_t, uint32_t>(),
+        .def(py::init<uint32_t, const Coordinate&, uint8_t, uint32_t, UeType>(),
              "Initialize with basic parameters",
-             py::arg("uid"), py::arg("loc"), py::arg("outdoor_ind") = 0, py::arg("ant_panel_idx") = 0)
-        .def(py::init([](uint32_t uid, const Coordinate& loc, uint8_t outdoor_ind, uint32_t ant_panel_idx, const std::vector<float>& ant_panel_orientation, const std::vector<float>& velocity) {
+             py::arg("uid"), py::arg("loc"), py::arg("outdoor_ind") = 0, py::arg("ant_panel_idx") = 0, py::arg("ue_type") = UeType::TERRESTRIAL)
+        .def(py::init([](uint32_t uid, const Coordinate& loc, uint8_t outdoor_ind, uint32_t ant_panel_idx, const std::vector<float>& ant_panel_orientation, const std::vector<float>& velocity, UeType ue_type) {
                  auto result = std::make_unique<UtParamCfg>();
                  result->uid = uid;
                  result->loc = loc;
                  result->outdoor_ind = outdoor_ind;
+                 result->ue_type = ue_type;
                  result->antPanelIdx = ant_panel_idx;
                  pycuphy::vector_to_carray(ant_panel_orientation, result->antPanelOrientation);
                  pycuphy::vector_to_carray(velocity, result->velocity);
                  return result;
              }),
              "Initialize with full parameters including orientation and velocity",
-             py::arg("uid"), py::arg("loc"), py::arg("outdoor_ind"), py::arg("ant_panel_idx"), py::arg("ant_panel_orientation"), py::arg("velocity"))
+             py::arg("uid"), py::arg("loc"), py::arg("outdoor_ind"), py::arg("ant_panel_idx"), py::arg("ant_panel_orientation"), py::arg("velocity"), py::arg("ue_type") = UeType::TERRESTRIAL)
         .def_readwrite("uid", &UtParamCfg::uid, "Global UE ID")
         .def_readwrite("loc", &UtParamCfg::loc, "UE location")
         .def_readwrite("outdoor_ind", &UtParamCfg::outdoor_ind, "Outdoor indicator: 0=indoor, 1=outdoor")
+        .def_readwrite("ue_type", &UtParamCfg::ue_type, "UE type: TERRESTRIAL, VEHICLE, AERIAL, AGV, RSU")
         .def_readwrite("ant_panel_idx", &UtParamCfg::antPanelIdx, "Antenna panel configuration index")
         .def_property("ant_panel_orientation",
-            [](const UtParamCfg& self) { return pycuphy::carray_to_numpy(self.antPanelOrientation); },
-            [](UtParamCfg& self, const py::array_t<float>& arr) {
-                pycuphy::numpy_to_carray(arr, self.antPanelOrientation);
+            [](const UtParamCfg& self) { return pycuphy::carray_to_pylist(self.antPanelOrientation); },
+            [](UtParamCfg& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.antPanelOrientation);
             },
             "Antenna panel orientation in GCS [theta, phi, slant_offset]")
         .def_property("velocity",
-            [](const UtParamCfg& self) { return pycuphy::carray_to_numpy(self.velocity); },
-            [](UtParamCfg& self, const py::array_t<float>& arr) {
-                pycuphy::numpy_to_carray(arr, self.velocity);
+            [](const UtParamCfg& self) { return pycuphy::carray_to_pylist(self.velocity); },
+            [](UtParamCfg& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.velocity);
             },
-            "Velocity vector [vx, vy, vz] in m/s, vz=0 per 3GPP spec");
+            "Velocity vector [vx, vy, vz] in m/s, vz=0 per 3GPP spec")
+        .def_readwrite("monostatic_ind", &UtParamCfg::monostatic_ind, 
+                      "0: not a monostatic sensing receiver, 1: monostatic sensing receiver")
+        .def_readwrite("same_antenna_panel_ind", &UtParamCfg::same_antenna_panel_ind,
+                      "0: use second antenna panel for sensing, 1: use same antenna panel")
+        .def_readwrite("second_ant_panel_idx", &UtParamCfg::second_ant_panel_idx,
+                      "Second antenna panel index for sensing RX (when monostatic_ind=1)")
+        .def_property("second_ant_panel_orientation",
+            [](const UtParamCfg& self) { return pycuphy::carray_to_pylist(self.second_ant_panel_orientation); },
+            [](UtParamCfg& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.second_ant_panel_orientation);
+            },
+            "Second antenna panel orientation for sensing RX [theta, phi, slant_offset]");
 
     // Bind CellParam struct with numpy array support
     py::class_<CellParam>(m, "CellParam", "Cell/Base Station parameters")
@@ -787,11 +906,21 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def_readwrite("loc", &CellParam::loc, "Cell location")
         .def_readwrite("ant_panel_idx", &CellParam::antPanelIdx, "Antenna panel configuration index")
         .def_property("ant_panel_orientation",
-            [](const CellParam& self) { return pycuphy::carray_to_numpy(self.antPanelOrientation); },
-            [](CellParam& self, const py::array_t<float>& arr) {
-                pycuphy::numpy_to_carray(arr, self.antPanelOrientation);
+            [](const CellParam& self) { return pycuphy::carray_to_pylist(self.antPanelOrientation); },
+            [](CellParam& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.antPanelOrientation);
             },
-            "Antenna panel orientation in GCS [theta, phi, slant_offset]");
+            "Antenna panel orientation in GCS [theta, phi, slant_offset]")
+        .def_readwrite("monostatic_ind", &CellParam::monostatic_ind,
+                      "0: not monostatic, 1: monostatic (BS acts as both TX and RX for sensing)")
+        .def_readwrite("second_ant_panel_idx", &CellParam::second_ant_panel_idx,
+                      "Second antenna panel index for sensing RX (when monostatic_ind=1)")
+        .def_property("second_ant_panel_orientation",
+            [](const CellParam& self) { return pycuphy::carray_to_pylist(self.second_ant_panel_orientation); },
+            [](CellParam& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.second_ant_panel_orientation);
+            },
+            "Second antenna panel orientation for sensing RX [theta, phi, slant_offset]");
 
     // Bind SystemLevelConfig struct
     py::class_<SystemLevelConfig>(m, "SystemLevelConfig", "System-level configuration parameters")
@@ -799,7 +928,7 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def(py::init<Scenario, uint32_t, uint8_t, uint32_t, float>(),
              "Initialize with basic parameters",
              py::arg("scenario"), py::arg("n_site"), py::arg("n_sector_per_site"), py::arg("n_ut"), py::arg("isd") = 1732.0f)
-        .def(py::init([](Scenario scenario, uint32_t n_site, uint32_t n_sector_per_site, uint32_t n_ut, float isd, uint8_t optional_pl_ind, uint8_t o2i_building_penetr_loss_ind, uint8_t o2i_car_penetr_loss_ind, uint8_t enable_near_field_effect, uint8_t enable_non_stationarity, const std::vector<float>& force_los_prob, const std::vector<float>& force_ut_speed, float force_indoor_ratio, uint8_t disable_pl_shadowing, uint8_t disable_small_scale_fading, uint8_t enable_per_tti_lsp, uint8_t enable_propagation_delay) {
+        .def(py::init([](Scenario scenario, uint32_t n_site, uint32_t n_sector_per_site, uint32_t n_ut, float isd, const std::vector<uint32_t>& ut_drop_cells, uint8_t ut_drop_option, const std::vector<float>& ut_cell_2d_dist, uint8_t optional_pl_ind, uint8_t o2i_building_penetr_loss_ind, uint8_t o2i_car_penetr_loss_ind, uint8_t enable_near_field_effect, uint8_t enable_non_stationarity, const std::vector<float>& force_los_prob, const std::vector<float>& force_ut_speed, float force_indoor_ratio, uint8_t disable_pl_shadowing, uint8_t disable_small_scale_fading, uint8_t enable_per_tti_lsp, uint8_t enable_propagation_delay) {
                  auto result = std::make_unique<SystemLevelConfig>();
                  result->scenario = scenario;
                  result->n_site = n_site;
@@ -818,18 +947,70 @@ PYBIND11_MODULE(_pycuphy, m) {
                  result->disable_small_scale_fading = disable_small_scale_fading;
                  result->enable_per_tti_lsp = enable_per_tti_lsp;
                  result->enable_propagation_delay = enable_propagation_delay;
+                 result->ut_drop_option = ut_drop_option;
+                 pycuphy::vector_to_carray(ut_cell_2d_dist, result->ut_cell_2d_dist);
+                 pycuphy::vector_to_carray(ut_drop_cells, result->ut_drop_cells);
+                 result->n_ut_drop_cells = static_cast<uint32_t>(ut_drop_cells.size());
                  return result;
              }),
              "Initialize with full system-level parameters",
-             py::arg("scenario"), py::arg("n_site"), py::arg("n_sector_per_site"), py::arg("n_ut"), py::arg("isd"), py::arg("optional_pl_ind"), 
-             py::arg("o2i_building_penetr_loss_ind"), py::arg("o2i_car_penetr_loss_ind"), py::arg("enable_near_field_effect"), 
-             py::arg("enable_non_stationarity"), py::arg("force_los_prob"), py::arg("force_ut_speed"), 
-                             py::arg("force_indoor_ratio"), py::arg("disable_pl_shadowing"), py::arg("disable_small_scale_fading"), py::arg("enable_per_tti_lsp"), py::arg("enable_propagation_delay"))
+             py::arg("scenario"), py::arg("n_site"), py::arg("n_sector_per_site"), py::arg("n_ut"), py::arg("isd"),
+             py::arg("ut_drop_cells") = std::vector<uint32_t>{}, py::arg("ut_drop_option") = 0, py::arg("ut_cell_2d_dist") = std::vector<float>{-1.0f, -1.0f},
+             py::arg("optional_pl_ind") = 0, py::arg("o2i_building_penetr_loss_ind") = 1, py::arg("o2i_car_penetr_loss_ind") = 0, py::arg("enable_near_field_effect") = 0,
+             py::arg("enable_non_stationarity") = 0, py::arg("force_los_prob") = std::vector<float>{-1.0f, -1.0f}, py::arg("force_ut_speed") = std::vector<float>{-1.0f, -1.0f},
+             py::arg("force_indoor_ratio") = -1.0f, py::arg("disable_pl_shadowing") = 0, py::arg("disable_small_scale_fading") = 0, py::arg("enable_per_tti_lsp") = 1, py::arg("enable_propagation_delay") = 1)
         .def_readwrite("scenario", &SystemLevelConfig::scenario, "Deployment scenario")
         .def_readwrite("isd", &SystemLevelConfig::isd, "Inter-site distance in meters")
         .def_readwrite("n_site", &SystemLevelConfig::n_site, "Number of sites")
         .def_readwrite("n_sector_per_site", &SystemLevelConfig::n_sector_per_site, "Sectors per site")
         .def_readwrite("n_ut", &SystemLevelConfig::n_ut, "Total number of UTs")
+        .def_readwrite("isac_type", &SystemLevelConfig::isac_type,
+                      "ISAC type: 0=communication only, 1=monostatic sensing, 2=bistatic sensing")
+        .def_readwrite("n_st", &SystemLevelConfig::n_st, "Total number of sensing targets (STs)")
+        .def_property("st_horizontal_speed",
+            [](const SystemLevelConfig& self) { return pycuphy::carray_to_pylist(self.st_horizontal_speed); },
+            [](SystemLevelConfig& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.st_horizontal_speed);
+            },
+            "Horizontal speed range [min, max] in m/s for ISAC sensing targets "
+            "(default: [8.33, 8.33] = fixed 30 km/h)")
+        .def_readwrite("st_vertical_velocity", &SystemLevelConfig::st_vertical_velocity,
+                      "Vertical velocity in m/s for ISAC sensing targets (vz component, default: 0.0)")
+        .def_property("st_distribution_option",
+            [](const SystemLevelConfig& self) { return pycuphy::carray_to_pylist(self.st_distribution_option); },
+            [](SystemLevelConfig& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.st_distribution_option);
+            },
+            "ST distribution option [horizontal, vertical]: 0=Option A, 1=Option B, 2=Option C")
+        .def_property("st_height",
+            [](const SystemLevelConfig& self) { return pycuphy::carray_to_pylist(self.st_height); },
+            [](SystemLevelConfig& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.st_height);
+            },
+            "ST height range [min, max] in meters for vertical Option B (default: [100, 100])")
+        // Backward-compatible alias (deprecated): st_fixed_height
+        .def_property("st_fixed_height",
+            [](const SystemLevelConfig& self) { return pycuphy::carray_to_pylist(self.st_height); },
+            [](SystemLevelConfig& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.st_height);
+            },
+            "Deprecated alias of st_height")
+        .def_readwrite("st_minimum_distance", &SystemLevelConfig::st_minimum_distance,
+                      "Minimum distance between STs in meters (0=auto based on physical size)")
+        .def_readwrite("st_size_ind", &SystemLevelConfig::st_size_ind,
+                      "ST size index: 0=small, 1=medium, 2=large")
+        .def_readwrite("st_min_dist_from_tx_rx", &SystemLevelConfig::st_min_dist_from_tx_rx,
+                      "Minimum 3D distance from ST to any STX/SRX (BS/UE) in meters (default: 10m)")
+        .def_readwrite("st_target_type", &SystemLevelConfig::st_target_type,
+                      "Default target type for auto-generated STs (SensingTargetType enum)")
+        .def_readwrite("st_rcs_model", &SystemLevelConfig::st_rcs_model,
+                      "RCS model for STs: 1=deterministic monostatic, 2=angular dependent")
+        .def_readwrite("path_drop_threshold_db", &SystemLevelConfig::path_drop_threshold_db,
+                      "Path power drop threshold in dB for ISAC ray/path pruning (default: 40 dB)")
+        .def_readwrite("isac_disable_background", &SystemLevelConfig::isac_disable_background,
+                      "ISAC calibration mode: 0=combine target with background, 1=target CIR only")
+        .def_readwrite("isac_disable_target", &SystemLevelConfig::isac_disable_target,
+                      "ISAC calibration mode: 0=include target CIR, 1=background CIR only")
         .def_readwrite("optional_pl_ind", &SystemLevelConfig::optional_pl_ind, 
                       "Pathloss equation: 0=standard, 1=optional")
         .def_readwrite("o2i_building_penetr_loss_ind", &SystemLevelConfig::o2i_building_penetr_loss_ind,
@@ -841,15 +1022,15 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def_readwrite("enable_non_stationarity", &SystemLevelConfig::enable_non_stationarity,
                       "Non-stationarity: 0=disable, 1=enable")
         .def_property("force_los_prob",
-            [](const SystemLevelConfig& self) { return pycuphy::carray_to_numpy(self.force_los_prob); },
-            [](SystemLevelConfig& self, const py::array_t<float>& arr) {
-                pycuphy::numpy_to_carray(arr, self.force_los_prob);
+            [](const SystemLevelConfig& self) { return pycuphy::carray_to_pylist(self.force_los_prob); },
+            [](SystemLevelConfig& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.force_los_prob);
             },
             "Force LOS probability [outdoor, indoor], -1 for auto calculation")
         .def_property("force_ut_speed",
-            [](const SystemLevelConfig& self) { return pycuphy::carray_to_numpy(self.force_ut_speed); },
-            [](SystemLevelConfig& self, const py::array_t<float>& arr) {
-                pycuphy::numpy_to_carray(arr, self.force_ut_speed);
+            [](const SystemLevelConfig& self) { return pycuphy::carray_to_pylist(self.force_ut_speed); },
+            [](SystemLevelConfig& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.force_ut_speed);
             },
             "Force UT speed [outdoor, indoor] in m/s, -1 for auto calculation")
         .def_readwrite("force_indoor_ratio", &SystemLevelConfig::force_indoor_ratio,
@@ -861,7 +1042,9 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def_readwrite("enable_per_tti_lsp", &SystemLevelConfig::enable_per_tti_lsp,
                       "LSP per TTI: 0=disable, 1=update PL/shadowing, 2=update all")
         .def_readwrite("enable_propagation_delay", &SystemLevelConfig::enable_propagation_delay,
-                      "Propagation delay in CIR: 0=disable, 1=enable");
+                      "Propagation delay in CIR: 0=disable, 1=enable")
+        .def_readwrite("ut_drop_option", &SystemLevelConfig::ut_drop_option,
+                      "UT drop control: 0=random across region, 1=same UTs per site, 2=same UTs per sector");
 
     // Bind LinkLevelConfig struct
     py::class_<LinkLevelConfig>(m, "LinkLevelConfig", "Link-level configuration parameters")
@@ -887,9 +1070,9 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def_readwrite("delay_spread", &LinkLevelConfig::delay_spread,
                       "Delay spread in nanoseconds")
         .def_property("velocity",
-            [](const LinkLevelConfig& self) { return pycuphy::carray_to_numpy(self.velocity); },
-            [](LinkLevelConfig& self, const py::array_t<float>& arr) {
-                pycuphy::numpy_to_carray(arr, self.velocity);
+            [](const LinkLevelConfig& self) { return pycuphy::carray_to_pylist(self.velocity); },
+            [](LinkLevelConfig& self, const py::object& obj) {
+                pycuphy::object_to_fixed_carray(obj, self.velocity);
             },
             "Velocity vector [vx, vy, vz] in m/s, vz=0 per 3GPP spec")
         .def_readwrite("num_ray", &LinkLevelConfig::num_ray,
@@ -946,7 +1129,9 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def_readwrite("optional_cfr_dim", &SimConfig::optional_cfr_dim,
                       "Optional CFR dimension")
         .def_readwrite("cpu_only_mode", &SimConfig::cpu_only_mode,
-                      "CPU only mode: 0=GPU mode, 1=CPU only mode");
+                      "CPU only mode: 0=GPU mode, 1=CPU only mode")
+        .def_readwrite("h5_dump_level", &SimConfig::h5_dump_level,
+                      "H5 dump level: 0=minimal (topology+CIR/CFR+config), 1=full (default)");
 
     // Bind ExternalConfig struct
     py::class_<ExternalConfig>(m, "ExternalConfig", "External configuration parameters")
@@ -958,14 +1143,16 @@ PYBIND11_MODULE(_pycuphy, m) {
                  result->ant_panel_config = ant_panel_config;
                  return result;
              }),
-             "Initialize with full parameters",
+             "Initialize with parameters (without ST config)",
              py::arg("cell_config"), py::arg("ut_config"), py::arg("ant_panel_config"))
         .def_readwrite("cell_config", &ExternalConfig::cell_config,
                       "Cell configuration list")
         .def_readwrite("ut_config", &ExternalConfig::ut_config,
                       "UT configuration list")
         .def_readwrite("ant_panel_config", &ExternalConfig::ant_panel_config,
-                      "Antenna panel configuration list");
+                      "Antenna panel configuration list")
+        .def_readwrite("st_config", &ExternalConfig::st_config,
+                      "Sensing target (ST) configuration list for ISAC");
 
     // Bind StatisChanModelWrapper class
     py::class_<pycuphy::StatisChanModelWrapper<float, cuComplex>>(m, "StatisChanModel",
@@ -1010,9 +1197,14 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def("dump_los_nlos_stats", &pycuphy::StatisChanModelWrapper<float, cuComplex>::dump_los_nlos_stats,
              "Dump LOS/NLOS statistics for all links",
              py::arg("lost_nlos_stats") = py::array_t<float>())
-        .def("dump_pathloss_shadowing_stats", &pycuphy::StatisChanModelWrapper<float, cuComplex>::dump_pathloss_shadowing_stats,
+        .def("dump_pl_sf_stats", &pycuphy::StatisChanModelWrapper<float, cuComplex>::dump_pl_sf_stats,
              "Dump pathloss and shadowing statistics for links",
-             py::arg("pathloss_shadowing"),
+             py::arg("pl_sf"),
+             py::arg("active_cell") = py::array_t<int>(),
+             py::arg("active_ut") = py::array_t<int>())
+        .def("dump_pl_sf_ant_gain_stats", &pycuphy::StatisChanModelWrapper<float, cuComplex>::dump_pl_sf_ant_gain_stats,
+             "Dump pathloss, shadowing and antenna gain statistics",
+             py::arg("pl_sf_ant_gain"),
              py::arg("active_cell") = py::array_t<int>(),
              py::arg("active_ut") = py::array_t<int>());
 
@@ -1020,5 +1212,6 @@ PYBIND11_MODULE(_pycuphy, m) {
         .def(py::init<uint32_t, int, uintptr_t>(),
             py::arg("num_threads"), py::arg("rand_seed"), py::arg("stream_handle"))
         .def("add_noise", &pycuphy::GauNoiseAdderWrapper<float, cuComplex>::addNoise,
-            py::arg("noisy_signal"), py::arg("d_signal"), py::arg("signal_size"), py::arg("snr_db"));
+            py::arg("d_signal"), py::arg("signal_size"), py::arg("snr_db"),
+            "Add Gaussian noise in-place on GPU");
  }

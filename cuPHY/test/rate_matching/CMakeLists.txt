@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,14 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(testRateMatching "${PROJECT_SOURCE_DIR}/src/cuphy/rate_matching/testRateMatching.cpp" dummy.cu)
-add_dependencies(testRateMatching CRCLUTGEN)
-target_link_libraries(testRateMatching cuphy cuphy_channels cuphy_hdf5)
-target_link_libraries(testRateMatching gtest gtest_main)
-add_test(testRateMatching testRateMatching)
-
-add_executable(testRMtvs "${PROJECT_SOURCE_DIR}/src/cuphy/rate_matching/testRMtvs.cpp" dummy.cu)
-add_dependencies(testRMtvs CRCLUTGEN)
-target_link_libraries(testRMtvs cuphy cuphy_channels cuphy_hdf5)
-target_link_libraries(testRMtvs gtest gtest_main)
-
+########################################################################
+add_executable(test_rate_matching test_rate_match.cpp dummy.cu)
+target_include_directories(test_rate_matching PRIVATE ${PROJECT_SOURCE_DIR}/examples/common)
+target_link_libraries(test_rate_matching cuphy gtest)
+target_compile_options(test_rate_matching PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+                       -lineinfo
+                       >)
+add_test(NAME test_rate_matching COMMAND test_rate_matching)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,9 +39,15 @@ from pathlib import Path
 from scipy import stats
 
 # Set up logging
-def setup_logging(log_file: Optional[str] = None):
-    """Configure logging to output to console or file"""
+def setup_logging(log_file: Optional[str] = None, log_level: str = 'ERROR'):
+    """Configure logging to output to console or file
+    
+    Args:
+        log_file: Optional path to log file
+        log_level: Logging level ('DEBUG', 'INFO', 'WARNING', 'ERROR')
+    """
     format_str = '%(asctime)s - %(levelname)s - %(message)s'
+    level = getattr(logging, log_level.upper(), logging.INFO)
     
     if log_file:
         # Create logs directory if it doesn't exist
@@ -50,7 +56,7 @@ def setup_logging(log_file: Optional[str] = None):
         
         # Set up file handler
         logging.basicConfig(
-            level=logging.ERROR,
+            level=level,
             format=format_str,
             handlers=[
                 logging.FileHandler(log_file, mode='w'),
@@ -59,10 +65,57 @@ def setup_logging(log_file: Optional[str] = None):
         )
         print(f"Logging to file: {log_file}")
     else:
-        logging.basicConfig(level=logging.ERROR, format=format_str)
+        logging.basicConfig(level=level, format=format_str)
 
 # Logger will be configured in main() based on command line arguments
 logger = logging.getLogger(__name__)
+
+import re
+import glob
+
+def find_multi_seed_files(base_h5_file: str) -> List[str]:
+    """
+    Find all H5 files matching the base pattern with different random seeds.
+    
+    The H5 filename format is: slsChanData_{sites}sites_{uts}uts_{suffix}_seed{N}.h5
+    Given one file, this function finds all files with the same base pattern but different seeds.
+    
+    Args:
+        base_h5_file: Path to one of the H5 files (any seed)
+        
+    Returns:
+        Sorted list of matching H5 file paths
+    """
+    base_path = Path(base_h5_file)
+    
+    # Extract the base pattern by removing _seed{N} suffix
+    # Pattern: ...._seed123.h5 -> ...._seed*.h5
+    filename = base_path.stem  # Without .h5
+    
+    # Match pattern: _seed followed by digits at the end
+    seed_pattern = re.compile(r'^(.+)_seed(\d+)$')
+    match = seed_pattern.match(filename)
+    
+    if match:
+        base_name = match.group(1)
+        # Create glob pattern to find all seed variants
+        glob_pattern = str(base_path.parent / f"{base_name}_seed*.h5")
+        matching_files = sorted(glob.glob(glob_pattern))
+        
+        if matching_files:
+            logger.info(f"Found {len(matching_files)} H5 files with different seeds:")
+            for f in matching_files:
+                # Extract seed number for logging
+                seed_match = seed_pattern.match(Path(f).stem)
+                if seed_match:
+                    logger.info(f"  - {f} (seed={seed_match.group(2)})")
+            return matching_files
+    
+    # If no seed pattern found or no matches, return just the original file
+    logger.warning(f"No seed pattern found in filename: {base_h5_file}")
+    logger.warning("Expected format: ...._seed{N}.h5")
+    logger.warning("Proceeding with single file analysis.")
+    return [base_h5_file]
 
 @dataclass
 class ClusterParams:
@@ -276,6 +329,87 @@ class SystemLevelConfig:
     disable_small_scale_fading: int
     enable_per_tti_lsp: int
     enable_propagation_delay: int
+    ut_drop_option: int = 0  # 0: random across region, 1: same UTs per site, 2: same UTs per sector
+
+@dataclass
+class ISACConfig:
+    """Data structure for ISAC (Integrated Sensing and Communications) configuration"""
+    isac_type: int = 0           # 0: comm only, 1: monostatic, 2: bistatic
+    n_st: int = 0                # Number of sensing targets
+    st_target_type: int = 0      # 0: UAV, 1: AUTOMOTIVE, 2: HUMAN, 3: AGV, 4: HAZARD
+    st_rcs_model: int = 1        # 1: deterministic, 2: angular-dependent
+    isac_disable_background: int = 0  # 0: combined, 1: target only
+    isac_disable_target: int = 0      # 0: include target, 1: background only
+    st_size_ind: int = 0         # Size index for the target
+    
+    @property
+    def is_enabled(self) -> bool:
+        """Check if ISAC mode is enabled"""
+        return self.isac_type > 0 and self.n_st > 0
+    
+    @property
+    def is_monostatic(self) -> bool:
+        """Check if monostatic sensing mode"""
+        return self.isac_type == 1
+    
+    @property
+    def is_bistatic(self) -> bool:
+        """Check if bistatic sensing mode"""
+        return self.isac_type == 2
+    
+    @property
+    def is_target_only(self) -> bool:
+        """Check if target-only mode (background disabled)"""
+        return self.isac_disable_background == 1 and self.isac_disable_target == 0
+    
+    @property
+    def is_background_only(self) -> bool:
+        """Check if background-only mode (target disabled)"""
+        return self.isac_disable_target == 1 and self.isac_disable_background == 0
+    
+    @property
+    def is_combined(self) -> bool:
+        """Check if combined mode (both target and background)"""
+        return self.isac_disable_background == 0 and self.isac_disable_target == 0
+    
+    @property
+    def target_type_name(self) -> str:
+        """Get human-readable target type name"""
+        target_map = {0: 'UAV', 1: 'AUTOMOTIVE', 2: 'HUMAN', 3: 'AGV', 4: 'HAZARD'}
+        return target_map.get(self.st_target_type, 'UNKNOWN')
+    
+    @property
+    def sensing_mode_name(self) -> str:
+        """Get sensing mode name for reference data lookup"""
+        if self.isac_type == 1:
+            return 'TRPmo'  # TRP monostatic
+        elif self.isac_type == 2:
+            return 'bistatic'
+        return 'comm_only'
+    
+    def get_isac_scenario_key(self, freq_ghz: float, is_background: bool = False) -> str:
+        """
+        Get ISAC-specific scenario key for reference data lookup
+        
+        Args:
+            freq_ghz: Frequency in GHz
+            is_background: True for background channel, False for target channel
+            
+        Returns:
+            Scenario key string (e.g., 'TRPmo(t)-6GHz' or 'TRPmo(b)-6GHz')
+        """
+        freq_int = int(round(freq_ghz))
+        
+        if self.isac_type == 1:  # Monostatic
+            channel_suffix = '(b)' if is_background else '(t)'
+            return f'TRPmo{channel_suffix}-{freq_int}GHz'
+        elif self.isac_type == 2:  # Bistatic
+            # For bistatic, we have TRP-TRP, TRP-UE, UE-UE modes
+            # Default to TRP-TRP for now
+            channel_suffix = '(b)' if is_background else ''
+            return f'TRP-TRP{channel_suffix}-{freq_int}GHz'
+        
+        return f'UMa-{freq_int}GHz'  # Fallback to standard
 
 @dataclass
 class SimConfig:
@@ -335,17 +469,52 @@ class ThreeGPPReferenceData:
             logger.error(f"Failed to load 3GPP reference data: {e}")
             return False
     
-    def get_scenario_key(self, scenario: str, freq_ghz: float) -> Optional[str]:
+    def get_scenario_key(self, scenario: str, freq_ghz: float, 
+                         isac_config: 'ISACConfig' = None, 
+                         isac_channel_type: str = None) -> Optional[str]:
         """
         Get the scenario key for matching reference data
         
         Args:
             scenario: Scenario name (UMa, UMi, InH)
             freq_ghz: Frequency in GHz
+            isac_config: Optional ISACConfig for ISAC mode
+            isac_channel_type: For ISAC, 'target' or 'background'
             
         Returns:
             Scenario key string or None if not found
         """
+        freq_int = int(round(freq_ghz))
+        
+        # Check if this is ISAC mode with valid config
+        if isac_config and isac_config.is_enabled and isac_channel_type:
+            # ISAC scenario keys have different format:
+            # TRPmo(t)-6GHz, TRPmo(b)-6GHz for monostatic target/background
+            # TRP-TRP-6GHz, TRP-TRP(b)-6GHz for bistatic
+            is_background = (isac_channel_type.lower() == 'background')
+            isac_scenario_key = isac_config.get_isac_scenario_key(freq_ghz, is_background)
+            
+            if isac_scenario_key in self.available_scenarios:
+                logger.info(f"Using ISAC scenario key: {isac_scenario_key}")
+                return isac_scenario_key
+            
+            # Try with trailing space (some Excel exports have this)
+            isac_scenario_key_space = isac_scenario_key + ' '
+            if isac_scenario_key_space in self.available_scenarios:
+                logger.info(f"Using ISAC scenario key (with space): {isac_scenario_key_space}")
+                return isac_scenario_key_space
+            
+            # Try finding closest match
+            prefix = isac_scenario_key.split('-')[0]  # e.g., 'TRPmo(t)'
+            for avail_scenario in self.available_scenarios:
+                if avail_scenario.startswith(prefix) and f'{freq_int}GHz' in avail_scenario:
+                    logger.warning(f"Exact match not found for {isac_scenario_key}, using {avail_scenario}")
+                    return avail_scenario
+            
+            logger.warning(f"ISAC scenario key not found: {isac_scenario_key}")
+            # Fall through to standard lookup
+        
+        # Standard (non-ISAC) scenario lookup
         # Map scenario names to expected format
         scenario_map = {
             'UMA': 'UMa',
@@ -359,7 +528,6 @@ class ThreeGPPReferenceData:
         scenario_normalized = scenario_map.get(scenario.upper(), scenario)
         
         # Try exact frequency match (6, 30, 60, 70 GHz)
-        freq_int = int(round(freq_ghz))
         scenario_key = f"{scenario_normalized}-{freq_int}GHz"
         
         if scenario_key in self.available_scenarios:
@@ -414,11 +582,13 @@ class ThreeGPPReferenceData:
             return None, None
         
         cdf_percentiles = np.array(metric_data.get('cdf_percentiles', []))
-        companies = metric_data.get('companies', [])
+        # Always use data_dict keys as the source of truth for available companies
         data_dict = metric_data.get('data', {})
         
         if len(cdf_percentiles) == 0 or len(data_dict) == 0:
             return None, None
+        
+        companies = list(data_dict.keys())
         
         if company_name and company_name in data_dict:
             # Return specific company data (convert None to NaN)
@@ -457,11 +627,13 @@ class ThreeGPPReferenceData:
             return None, None, None
         
         cdf_percentiles = np.array(metric_data.get('cdf_percentiles', []))
-        companies = metric_data.get('companies', [])
+        # Always use data_dict keys as the source of truth for available companies
         data_dict = metric_data.get('data', {})
         
         if len(cdf_percentiles) == 0 or len(data_dict) == 0:
             return None, None, None
+        
+        companies = list(data_dict.keys())
         
         # Collect all company data
         all_company_data = []
@@ -485,7 +657,18 @@ class ThreeGPPReferenceData:
 class H5ChannelAnalyzer:
     """Main analyzer class for H5 channel data"""
     
-    def __init__(self, h5_file_path: str, reference_json_path: str = None, calibration_phase: int = 2):
+    def __init__(self, h5_file_path: str, reference_json_path: str = None, calibration_phase: int = 2,
+                 isac_channel_type: str = None):
+        """
+        Initialize H5 Channel Analyzer
+        
+        Args:
+            h5_file_path: Path to H5 file
+            reference_json_path: Path to 3GPP reference JSON file
+            calibration_phase: Calibration phase (1 or 2)
+            isac_channel_type: For ISAC mode, specify 'target' or 'background' channel type
+                              Required for ISAC calibration, ignored for communication-only mode
+        """
         self.h5_file_path = Path(h5_file_path)
         self.cluster_params: Optional[ClusterParams] = None
         self.link_params: List[LinkParams] = []
@@ -496,7 +679,9 @@ class H5ChannelAnalyzer:
         self.cir_ntaps_per_cell: Dict[int, np.ndarray] = {}  # {cell_id: ntaps array}
         self.system_level_config: Optional[SystemLevelConfig] = None
         self.sim_config: Optional[SimConfig] = None
+        self.isac_config: Optional[ISACConfig] = None
         self.calibration_phase = calibration_phase
+        self.isac_channel_type = isac_channel_type  # 'target' or 'background'
         # Store UE-to-row mappings if available from H5 file
         self.ue_row_mappings: Dict[int, Dict[int, int]] = {}  # {cell_id: {ue_id: row_idx}}
         # 3GPP reference data
@@ -888,6 +1073,9 @@ class H5ChannelAnalyzer:
     
     def _parse_ut_params_h5(self, h5_file: h5py.File) -> None:
         """Parse UT parameters from H5 file (now part of topology structure)"""
+        # Initialize ut_params list
+        self.ut_params = []
+        
         # Try new topology structure first
         if 'topology' in h5_file and 'utParams' in h5_file['topology']:
             ut_group = h5_file['topology']['utParams']
@@ -903,11 +1091,17 @@ class H5ChannelAnalyzer:
             velocities_z = ut_group['velocity_z'][:]
             d_2d_ins = ut_group['d_2d_in'][:]
             
-            # Create UT parameter objects
+            # Create UT parameter dictionaries
             for i in range(len(uids)):
-                # Create a simple UT param object (we may need to define this dataclass)
-                # For now, we'll store essential info for antenna gain calculation
-                pass  # TODO: Define UtParams dataclass if needed
+                ut_param = {
+                    'uid': int(uids[i]),
+                    'location': {'x': float(locs_x[i]), 'y': float(locs_y[i]), 'z': float(locs_z[i])},
+                    'outdoor_ind': int(outdoor_inds[i]),
+                    'ant_panel_idx': int(ant_panel_idxs[i]),
+                    'velocity': {'x': float(velocities_x[i]), 'y': float(velocities_y[i]), 'z': float(velocities_z[i])},
+                    'd_2d_in': float(d_2d_ins[i])
+                }
+                self.ut_params.append(ut_param)
             
             logger.info(f"Parsed {len(uids)} UT parameters from topology structure")
         # Fallback to old structure for backward compatibility
@@ -925,6 +1119,18 @@ class H5ChannelAnalyzer:
             velocities_z = ut_group['velocity_z'][:]
             d_2d_ins = ut_group['d_2d_in'][:]
             
+            # Create UT parameter dictionaries
+            for i in range(len(uids)):
+                ut_param = {
+                    'uid': int(uids[i]),
+                    'location': {'x': float(locs_x[i]), 'y': float(locs_y[i]), 'z': float(locs_z[i])},
+                    'outdoor_ind': int(outdoor_inds[i]),
+                    'ant_panel_idx': int(ant_panel_idxs[i]),
+                    'velocity': {'x': float(velocities_x[i]), 'y': float(velocities_y[i]), 'z': float(velocities_z[i])},
+                    'd_2d_in': float(d_2d_ins[i])
+                }
+                self.ut_params.append(ut_param)
+            
             logger.info(f"Parsed {len(uids)} UT parameters from old structure")
         else:
             logger.warning("utParams dataset not found in H5 file (checked both topology/utParams and utParams)")
@@ -941,6 +1147,7 @@ class H5ChannelAnalyzer:
                 scenario_val = int(record['scenario'])
                 scenario_str = scenario_map.get(scenario_val, f'Unknown({scenario_val})')
                 
+                ut_drop_option = int(record['ut_drop_option']) if 'ut_drop_option' in record.dtype.names else 0
                 self.system_level_config = SystemLevelConfig(
                     scenario=scenario_str,
                     isd=float(record['isd']),
@@ -958,11 +1165,228 @@ class H5ChannelAnalyzer:
                     disable_pl_shadowing=int(record['disable_pl_shadowing']),
                     disable_small_scale_fading=int(record['disable_small_scale_fading']),
                     enable_per_tti_lsp=int(record['enable_per_tti_lsp']),
-                    enable_propagation_delay=int(record['enable_propagation_delay'])
+                    enable_propagation_delay=int(record['enable_propagation_delay']),
+                    ut_drop_option=ut_drop_option
                 )
                 logger.info(f"Parsed SystemLevelConfig: {self.system_level_config.scenario} scenario, {self.system_level_config.n_site} sites, {self.system_level_config.n_ut} UTs")
+                
+                # Parse ISAC configuration fields (optional - may not exist in older H5 files)
+                try:
+                    isac_type = int(record['isac_type']) if 'isac_type' in record.dtype.names else 0
+                    n_st = int(record['n_st']) if 'n_st' in record.dtype.names else 0
+                    st_target_type = int(record['st_target_type']) if 'st_target_type' in record.dtype.names else 0
+                    st_rcs_model = int(record['st_rcs_model']) if 'st_rcs_model' in record.dtype.names else 1
+                    isac_disable_background = int(record['isac_disable_background']) if 'isac_disable_background' in record.dtype.names else 0
+                    isac_disable_target = int(record['isac_disable_target']) if 'isac_disable_target' in record.dtype.names else 0
+                    st_size_ind = int(record['st_size_ind']) if 'st_size_ind' in record.dtype.names else 0
+                    
+                    self.isac_config = ISACConfig(
+                        isac_type=isac_type,
+                        n_st=n_st,
+                        st_target_type=st_target_type,
+                        st_rcs_model=st_rcs_model,
+                        isac_disable_background=isac_disable_background,
+                        isac_disable_target=isac_disable_target,
+                        st_size_ind=st_size_ind
+                    )
+                    
+                    if self.isac_config.is_enabled:
+                        mode_str = 'target-only' if self.isac_config.is_target_only else \
+                                   'background-only' if self.isac_config.is_background_only else 'combined'
+                        logger.info(f"Parsed ISACConfig: type={self.isac_config.isac_type} "
+                                   f"({'monostatic' if self.isac_config.is_monostatic else 'bistatic'}), "
+                                   f"n_st={self.isac_config.n_st}, "
+                                   f"target_type={self.isac_config.target_type_name}, "
+                                   f"mode={mode_str}")
+                except Exception as e:
+                    logger.debug(f"ISAC config fields not found in H5 (this is normal for non-ISAC simulations): {e}")
+                    self.isac_config = ISACConfig()  # Default: communication only
         else:
             logger.warning("systemLevelConfig dataset not found in H5 file")
+
+    def _compute_phase2_coupling_loss_from_cir(self, use_virtualization: bool = False) -> Optional[np.ndarray]:
+        """
+        Compute Phase 2 coupling loss from CIR data (includes fast fading).
+        
+        Phase 1 and Phase 2 are independent:
+        - Phase 1: Large-scale only (PL + SF formula)
+        - Phase 2: Includes fast fading from CIR
+        
+        CIR format in H5 (supported):
+        - Legacy: [n_ue, n_snapshots, n_cir_coeff] where n_cir_coeff = n_rx_ant × n_tx_ant × n_max_taps (flattened)
+        - New:    [n_ue, n_snapshots, n_rx_ant, n_tx_ant, n_max_taps]
+        
+        Args:
+            use_virtualization: If True, use antenna virtualization (keep array gain).
+                              If False, apply antenna normalization (divide by n_ant).
+                              
+                              - UMa calibration: use_virtualization=True (matches 3GPP reference)
+                              - ISAC calibration: use_virtualization=False (per-antenna normalization)
+        
+        Returns:
+            Array of coupling loss values (dB)
+        """
+        try:
+            with h5py.File(self.h5_file_path, 'r') as f:
+                coupling_losses = []
+                
+                # Iterate through all cells
+                for cell_idx in range(self.system_level_config.n_site * self.system_level_config.n_sector_per_site):
+                    cir_key = f'cirPerCell/cirCoe_cell{cell_idx}'
+                    
+                    if cir_key not in f:
+                        continue
+                    
+                    # CIR data:
+                    # - Legacy: [n_ue, n_snapshots, n_cir_coeff]
+                    # - New:    [n_ue, n_snapshots, n_rx_ant, n_tx_ant, n_max_taps]
+                    cir_data = f[cir_key][:]
+                    
+                    # Convert to complex if needed
+                    if cir_data.dtype.names and 'real' in cir_data.dtype.names:
+                        cir_complex = cir_data['real'] + 1j * cir_data['imag']
+                    else:
+                        cir_complex = cir_data
+                    
+                    logger.debug(f"Cell {cell_idx}: CIR shape = {cir_complex.shape}")
+                    
+                    # For each UE/RP in this cell
+                    for ue_idx in range(cir_complex.shape[0]):
+                        # ue_cir has snapshot dimension first:
+                        # - Legacy: [n_snapshots, n_cir_coeff]
+                        # - New:    [n_snapshots, n_rx_ant, n_tx_ant, n_max_taps]
+                        ue_cir = cir_complex[ue_idx]
+                        
+                        # Step 1: Compute total power per snapshot (sum over all CIR taps and antennas)
+                        # |H|^2 for each snapshot: [n_snapshots]
+                        if ue_cir.ndim < 2:
+                            power_per_snapshot = np.array([np.sum(np.abs(ue_cir) ** 2)])
+                        else:
+                            power_per_snapshot = np.sum(np.abs(ue_cir) ** 2, axis=tuple(range(1, ue_cir.ndim)))
+                        
+                        # Step 2: Average power across snapshots (ALWAYS enabled)
+                        # This normalizes over n_snapshot_per_slot (e.g., 14 snapshots)
+                        # CRITICAL: Use mean, not sum, to get stable power estimate
+                        n_snapshots = len(power_per_snapshot)
+                        avg_power = np.mean(power_per_snapshot)
+                        
+                        # Step 3: Apply antenna virtualization or normalization
+                        if use_virtualization:
+                            # Antenna virtualization: Keep array gain (for UMa calibration)
+                            # This matches 3GPP reference calibration which includes antenna gain
+                            final_power = avg_power
+                            n_rx_ant = self.system_level_config.n_ue_ant if hasattr(self.system_level_config, 'n_ue_ant') else 2
+                            n_tx_ant = self.system_level_config.n_bs_ant if hasattr(self.system_level_config, 'n_bs_ant') else 2
+                            logger.debug(f"Using antenna virtualization: n_rx={n_rx_ant}, n_tx={n_tx_ant}, final_power={final_power:.2e}")
+                        else:
+                            # Antenna normalization: Divide by number of antenna pairs (for ISAC calibration)
+                            # For dual-pol isotropic: n_rx_ant = 2, n_tx_ant = 2 → divide by 4
+                            n_rx_ant = self.system_level_config.n_ue_ant if hasattr(self.system_level_config, 'n_ue_ant') else 2
+                            n_tx_ant = self.system_level_config.n_bs_ant if hasattr(self.system_level_config, 'n_bs_ant') else 2
+                            final_power = avg_power / (n_rx_ant * n_tx_ant)
+                            logger.debug(f"Using antenna normalization: n_rx={n_rx_ant}, n_tx={n_tx_ant}, "
+                                       f"avg_power={avg_power:.2e}, final_power={final_power:.2e}")
+                        
+                        if final_power > 0:
+                            # Coupling loss in dB (reported as negative per 3GPP convention)
+                            coupling_loss_db = 10.0 * np.log10(final_power)
+                            coupling_losses.append(coupling_loss_db)
+                            
+                            logger.debug(f"Cell {cell_idx}, UE {ue_idx}: "
+                                       f"n_snapshots={n_snapshots}, "
+                                       f"n_rx_ant={n_rx_ant}, n_tx_ant={n_tx_ant}, "
+                                       f"Avg power (over snapshots)={avg_power:.2e}, "
+                                       f"Final power={final_power:.2e}, "
+                                       f"Coupling loss={coupling_loss_db:.2f} dB")
+                
+                if coupling_losses:
+                    logger.info(f"Computed Phase 2 coupling loss from CIR: {len(coupling_losses)} samples")
+                    logger.info(f"  CL range: [{min(coupling_losses):.2f}, {max(coupling_losses):.2f}] dB")
+                    logger.info(f"  CL mean: {np.mean(coupling_losses):.2f} dB")
+                    return np.array(coupling_losses)
+                else:
+                    logger.warning("No valid CIR data found for Phase 2 coupling loss computation")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error computing Phase 2 coupling loss from CIR: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+    
+    def _get_isac_coupling_loss(self) -> Optional[np.ndarray]:
+        """
+        Get ISAC coupling loss from H5 file.
+        
+        For target channel (isac_channel_type='target'):
+            Reads from topology/isacTargetLinks/coupling_loss_db
+            L = PL(d1) + PL(d2) + 10*log10(c²/(4πf)²) - 10*log10(σ_RCS,A) + SF1 + SF2
+        
+        For background channel (isac_channel_type='background'):
+            Reads from topology/isacBackgroundLinks/coupling_loss_db
+            L = PL(d) + SF (one-way path to Reference Point)
+        
+        Returns:
+            Array of coupling loss values in dB, or None if not available
+        """
+        try:
+            with h5py.File(self.h5_file_path, 'r') as f:
+                # Check if background channel is requested
+                if self.isac_channel_type == 'background':
+                    if 'topology/isacBackgroundLinks/coupling_loss_db' in f:
+                        coupling_loss = f['topology/isacBackgroundLinks/coupling_loss_db'][:]
+                        
+                        # Log the components if available
+                        if 'topology/isacBackgroundLinks/pathloss' in f:
+                            pathloss = f['topology/isacBackgroundLinks/pathloss'][:]
+                            sf = f['topology/isacBackgroundLinks/shadow_fading'][:]
+                            rp_z = f['topology/isacBackgroundLinks/rp_loc_z'][:]
+                            d_3d = f['topology/isacBackgroundLinks/d_3d'][:]
+                            
+                            logger.info("=== ISAC Background Link Parameters ===")
+                            for i in range(min(5, len(coupling_loss))):
+                                logger.info(f"  RP {i}: height={rp_z[i]:.1f}m, d_3d={d_3d[i]:.1f}m")
+                                logger.info(f"    PL={pathloss[i]:.2f}dB, SF={sf[i]:.2f}dB")
+                                logger.info(f"    Coupling loss={coupling_loss[i]:.2f}dB")
+                        
+                        logger.info(f"Loaded {len(coupling_loss)} ISAC background coupling loss values from H5")
+                        return coupling_loss
+                    else:
+                        logger.warning("ISAC background coupling loss data not found in H5 file")
+                        logger.warning("Please rebuild C++ and re-run simulation to generate background channel data")
+                        return None
+                
+                # Target channel (default)
+                if 'topology/isacTargetLinks/coupling_loss_db' in f:
+                    coupling_loss = f['topology/isacTargetLinks/coupling_loss_db'][:]
+                    
+                    # Log the components if available
+                    if 'topology/isacTargetLinks/incident_pathloss' in f:
+                        incident_pl = f['topology/isacTargetLinks/incident_pathloss'][:]
+                        scattered_pl = f['topology/isacTargetLinks/scattered_pathloss'][:]
+                        incident_sf = f['topology/isacTargetLinks/incident_sf'][:]
+                        scattered_sf = f['topology/isacTargetLinks/scattered_sf'][:]
+                        rcs_dbsm = f['topology/isacTargetLinks/rcs_dbsm'][:]
+                        target_z = f['topology/isacTargetLinks/target_loc_z'][:]
+                        wavelength_term = f['topology/isacTargetLinks/wavelength_term_db'][()]
+                        
+                        logger.info("=== ISAC Target Link Parameters ===")
+                        for i in range(min(5, len(coupling_loss))):
+                            logger.info(f"  Link {i}: target_height={target_z[i]:.1f}m")
+                            logger.info(f"    PL(d1)={incident_pl[i]:.2f}dB, SF1={incident_sf[i]:.2f}dB")
+                            logger.info(f"    PL(d2)={scattered_pl[i]:.2f}dB, SF2={scattered_sf[i]:.2f}dB")
+                            logger.info(f"    RCS={rcs_dbsm[i]:.2f}dBsm, wavelength_term={wavelength_term:.2f}dB")
+                            logger.info(f"    Coupling loss={coupling_loss[i]:.2f}dB")
+                    
+                    logger.info(f"Loaded {len(coupling_loss)} ISAC coupling loss values from H5: {coupling_loss}")
+                    return coupling_loss
+                else:
+                    logger.warning("ISAC coupling loss data not found in H5 file")
+                    logger.warning("Please rebuild C++ and re-run simulation to generate ISAC data")
+                    return None
+        except Exception as e:
+            logger.error(f"Error reading ISAC coupling loss: {e}")
+            return None
 
     def _parse_sim_config_h5(self, h5_file: h5py.File) -> None:
         """Parse SimConfig from H5 file"""
@@ -1368,7 +1792,7 @@ class H5ChannelAnalyzer:
         
         return coupling_loss
     
-    def compute_wideband_sir(self) -> float:
+    def compute_wideband_sir(self, skip_isac_check: bool = False) -> float:
         """
         Compute wideband Signal-to-Interference Ratio (SIR) before receiver without noise.
         SIR = Signal power / Interference power
@@ -1411,6 +1835,61 @@ class H5ChannelAnalyzer:
         logger.info(f"Wideband SIR: {sir_db:.2f} dB")
         return sir_db
     
+    def compute_cluster_angle_spread_with_los(self, cluster_angles_deg: List[float], cluster_powers: List[float],
+                                             los_angle_deg: float, los_power: float, is_zenith: bool = False) -> float:
+        """
+        Compute angle spread for LOS scenarios using TR 25.996 Annex A Equations A-1, A-3.
+        
+        This explicitly includes the LOS path power and angle separate from NLOS clusters.
+        
+        Per TR 25.996 Annex A:
+        - Equation A-3: μ_θ = (Σ θ_i * P_i) / (Σ P_i)  [power-weighted mean]
+        - Equation A-2: θ_{i,μ} = mod(θ_i - μ_θ + π, 2π) - π  [wrap angles relative to mean]
+        - Equation A-1: σ_AS = sqrt(Σ (θ_{i,μ})² * P_i / Σ P_i)  [RMS spread]
+        
+        Args:
+            cluster_angles_deg: List of NLOS cluster angles in degrees (not including LOS)
+            cluster_powers: List of NLOS cluster powers in linear scale
+            los_angle_deg: LOS path angle in degrees  
+            los_power: LOS path power in linear scale
+            is_zenith: If True, angles are zenith angles [0, 180]. If False, azimuth [-180, 180]
+            
+        Returns:
+            Angle spread in degrees per TR 25.996 Annex A
+        """
+        if not cluster_angles_deg or len(cluster_angles_deg) == 0:
+            # Only LOS, no spread
+            return 0.0
+        
+        # Combine LOS and NLOS components
+        all_angles_deg = np.concatenate([[los_angle_deg], np.array(cluster_angles_deg)])
+        all_powers = np.concatenate([[los_power], np.array(cluster_powers)])
+        
+        # Convert to radians
+        all_angles_rad = np.deg2rad(all_angles_deg)
+        
+        # Normalize powers
+        total_power = np.sum(all_powers)
+        if total_power == 0:
+            return 0.0
+        
+        # Step 1: Calculate power-weighted mean angle (Equation A-3)
+        mu_theta_rad = np.sum(all_angles_rad * all_powers) / total_power
+        
+        # Step 2: Wrap angles relative to mean (Equation A-2)
+        # θ_{i,μ} = mod(θ_i - μ_θ + π, 2π) - π
+        theta_wrapped_rad = np.mod(all_angles_rad - mu_theta_rad + np.pi, 2*np.pi) - np.pi
+        
+        # Step 3: Calculate RMS spread (Equation A-1)
+        # σ_AS = sqrt(Σ (θ_{i,μ})² * P_i / Σ P_i)
+        variance = np.sum((theta_wrapped_rad**2) * all_powers) / total_power
+        rms_spread_rad = np.sqrt(variance)
+        
+        # Convert to degrees
+        rms_spread_deg = np.rad2deg(rms_spread_rad)
+        
+        return rms_spread_deg
+    
     def compute_circular_angle_spread(self, angles_deg: List[float], powers: List[float] = None, is_zenith: bool = False) -> float:
         """
         Compute circular angle spread according to 3GPP TR 25.996 Annex A specification.
@@ -1421,6 +1900,9 @@ class H5ChannelAnalyzer:
         3. Calculate theta_n,m,mu(Delta) = mod(theta_n,m(Delta) - mu_theta(Delta) + pi, 2*pi) - pi
         4. Calculate sigma_AS(Delta) = sqrt(Sum [theta_n,m,mu(Delta)]^2 * P_n,m / Sum P_n,m)
         5. Find sigma_AS = min_Delta sigma_AS(Delta)
+        
+        NOTE: This is for NLOS scenarios (Equation A-1). For LOS scenarios, use
+        compute_cluster_angle_spread_with_los() which implements Equation A-3.
         
         Args:
             angles_deg: List of angles in degrees
@@ -1584,6 +2066,226 @@ class H5ChannelAnalyzer:
         
         return serving_assignments
     
+    def analyze_delay_and_angle_spreads_isac(self) -> Dict[str, np.ndarray]:
+        """
+        Analyze delay spread and angle spreads for ISAC channels.
+        For ISAC target/background channels, we analyze ALL links (not just serving cell).
+        
+        Per 3GPP 38.901 Table 7.9.6.2-1:
+        - Delay spread and angle spreads are calculated separately for target/background channels
+        - For monostatic: spreads computed separately for each reference point
+        
+        Returns CDFs for DS, ASD, ZSD, ASA, ZSA.
+        """
+        logger.info(f"Analyzing delay and angle spreads for ISAC {self.isac_channel_type} channel")
+        
+        # If multi-seed data is available, return it directly
+        if hasattr(self, '_is_multi_seed') and self._is_multi_seed and hasattr(self, '_multi_seed_spreads'):
+            logger.info(f"Using multi-seed combined spread data")
+            return self._multi_seed_spreads
+        
+        # Collect all relevant parameters for ALL ISAC links
+        ds_values = []
+        asd_values = []
+        zsd_values = []
+        asa_values = []
+        zsa_values = []
+        
+        # Load cluster parameters from H5 file if not already loaded
+        cluster_params_per_link = self._load_all_cluster_params()
+        
+        # For ISAC target channel, load LOS status and K-factor from ISAC target links
+        isac_target_los = None
+        isac_target_k = None  # K-factor array (will be in dB)
+        if self.isac_channel_type == 'target':
+            try:
+                with h5py.File(self.h5_file_path, 'r') as f:
+                    if 'topology/isacTargetLinks/incident_los' in f:
+                        isac_target_los = f['topology/isacTargetLinks/incident_los'][:]
+                        logger.info(f"Loaded {len(isac_target_los)} ISAC target LOS indicators from H5")
+                        
+                        # Try to load K-factor from ISAC target links (new format)
+                        if 'topology/isacTargetLinks/incident_k' in f:
+                            isac_target_k = f['topology/isacTargetLinks/incident_k'][:]
+                            logger.info(f"Loaded {len(isac_target_k)} ISAC target K-factors from H5 (incident path)")
+                        else:
+                            # Fallback: Check for K-factor override in system config (old method or if incident_k not saved)
+                            if 'systemLevelConfig' in f:
+                                sys_config = f['systemLevelConfig'][()]
+                                if hasattr(sys_config, 'dtype') and sys_config.dtype.names:
+                                    if 'st_override_k_db' in sys_config.dtype.names:
+                                        st_override_k_db = sys_config['st_override_k_db']
+                                        if isinstance(st_override_k_db, np.ndarray):
+                                            st_override_k_db = st_override_k_db[0] if len(st_override_k_db) > 0 else st_override_k_db
+                                        if not np.isnan(st_override_k_db):
+                                            # Apply same K-factor to all links
+                                            isac_target_k = np.full(len(isac_target_los), st_override_k_db)
+                                            logger.info(f"Using overridden K-factor: {st_override_k_db:.2f} dB for all LOS ISAC targets (from systemLevelConfig)")
+            except Exception as e:
+                logger.warning(f"Could not load ISAC target link data: {e}")
+                logger.warning("Falling back to linkParams data")
+        
+        # For ISAC, analyze ALL active links (no serving cell filtering)
+        for idx, active_link in enumerate(self.active_link_params):
+            if active_link.lsp_read_idx >= len(self.link_params):
+                continue
+            
+            # Get cluster parameters for this link
+            if (active_link.lsp_read_idx < len(cluster_params_per_link) and 
+                cluster_params_per_link[active_link.lsp_read_idx] is not None):
+                
+                cluster_param = cluster_params_per_link[active_link.lsp_read_idx]
+                n_clusters = cluster_param['n_cluster']
+                n_rays_per_cluster = cluster_param['n_ray_per_cluster']
+                total_rays = n_clusters * n_rays_per_cluster
+                
+                # Get LOS status and K-factor for this link
+                # For ISAC target channel, use ISAC-specific data; otherwise use linkParams
+                if self.isac_channel_type == 'target' and isac_target_los is not None and idx < len(isac_target_los):
+                    # Use ISAC target link data (BS→ST→BS path)
+                    is_los = (isac_target_los[idx] == 1)
+                    if is_los and isac_target_k is not None and idx < len(isac_target_k):
+                        # Use K-factor from ISAC target links (saved in H5 file)
+                        k_factor_db = isac_target_k[idx]
+                        k_factor_linear = np.power(10.0, k_factor_db / 10.0)
+                    else:
+                        # NLOS or K-factor not available: use linkParams K-factor
+                        lp = self.link_params[active_link.lsp_read_idx]
+                        k_factor_linear = lp.k_factor
+                else:
+                    # Use traditional link params (BS→UE path) for background or when ISAC data unavailable
+                    lp = self.link_params[active_link.lsp_read_idx]
+                    is_los = (lp.los_ind == 1)
+                    k_factor_linear = lp.k_factor  # K-factor in linear scale
+                
+                # Compute per-ray powers according to 3GPP TR 25.996 Annex A
+                cluster_powers = np.array(cluster_param['powers'][:n_clusters])
+                ray_powers = np.repeat(cluster_powers / n_rays_per_cluster, n_rays_per_cluster)
+                
+                # Compute DS from actual cluster delays (RMS delay spread)
+                if cluster_param['delays'] is not None and len(cluster_param['delays']) >= n_clusters:
+                    cluster_delays = np.array(cluster_param['delays'][:n_clusters])
+                    total_power = np.sum(cluster_powers)
+                    if total_power > 0:
+                        mean_delay = np.sum(cluster_powers * cluster_delays) / total_power
+                        mean_delay_sq = np.sum(cluster_powers * cluster_delays**2) / total_power
+                        ds_rms = np.sqrt(mean_delay_sq - mean_delay**2)
+                        ds_values.append(ds_rms)
+                
+                # Compute angle spreads using TR 25.996 Annex A for LOS, Equation A-1 for NLOS
+                if is_los and n_clusters > 1:
+                    # LOS case: Use TR 25.996 Annex A with explicit LOS component
+                    # Per 3GPP TR 38.901 Eq. 7.5-7: P_LOS = K_R / (K_R + 1), P_NLOS = 1 / (K_R + 1)
+                    los_power = k_factor_linear / (k_factor_linear + 1)
+                    nlos_total_power = 1.0 / (k_factor_linear + 1)
+                    
+                    # All NLOS cluster powers (stored in cluster_powers) are normalized and need to be
+                    # scaled by the total NLOS power allocation: nlos_cluster_power_actual = cluster_power_normalized * P_NLOS
+                    # The cluster_powers array is normalized such that sum(cluster_powers) ≈ 1.0
+                    # For LOS scenarios: cluster_powers[0] = LOS cluster power, cluster_powers[1:] = NLOS cluster powers
+                    # We need to scale ALL NLOS clusters (excluding cluster 0 which is LOS) by nlos_total_power
+                    nlos_cluster_powers_actual = cluster_powers[1:] * nlos_total_power
+                    
+                    # LOS angles are from first ray of first cluster (geometric angles)
+                    # NLOS cluster angles are from cluster centers (phi_n_aod, not phi_n_m_aod)
+                    if (cluster_param['phi_n_m_aod'] is not None and len(cluster_param['phi_n_m_aod']) >= n_rays_per_cluster and
+                        cluster_param['phi_n_aod'] is not None and len(cluster_param['phi_n_aod']) >= n_clusters):
+                        los_aod = cluster_param['phi_n_m_aod'][0]  # First ray of first cluster
+                        nlos_aod = np.array(cluster_param['phi_n_aod'][1:n_clusters])  # Cluster centers (skip first)
+                        if len(nlos_aod) > 0:
+                            asd_spread = self.compute_cluster_angle_spread_with_los(
+                                nlos_aod.tolist(), nlos_cluster_powers_actual.tolist(),
+                                los_aod, los_power, is_zenith=False
+                            )
+                            asd_values.append(asd_spread)
+                    
+                    if (cluster_param['phi_n_m_aoa'] is not None and len(cluster_param['phi_n_m_aoa']) >= n_rays_per_cluster and
+                        cluster_param['phi_n_aoa'] is not None and len(cluster_param['phi_n_aoa']) >= n_clusters):
+                        los_aoa = cluster_param['phi_n_m_aoa'][0]  # First ray of first cluster
+                        nlos_aoa = np.array(cluster_param['phi_n_aoa'][1:n_clusters])  # Cluster centers (skip first)
+                        if len(nlos_aoa) > 0:
+                            asa_spread = self.compute_cluster_angle_spread_with_los(
+                                nlos_aoa.tolist(), nlos_cluster_powers_actual.tolist(),
+                                los_aoa, los_power, is_zenith=False
+                            )
+                            asa_values.append(asa_spread)
+                    
+                    if (cluster_param['theta_n_m_zod'] is not None and len(cluster_param['theta_n_m_zod']) >= n_rays_per_cluster and
+                        cluster_param['theta_n_zod'] is not None and len(cluster_param['theta_n_zod']) >= n_clusters):
+                        los_zod = cluster_param['theta_n_m_zod'][0]  # First ray of first cluster
+                        nlos_zod = np.array(cluster_param['theta_n_zod'][1:n_clusters])  # Cluster centers (skip first)
+                        if len(nlos_zod) > 0:
+                            zsd_spread = self.compute_cluster_angle_spread_with_los(
+                                nlos_zod.tolist(), nlos_cluster_powers_actual.tolist(),
+                                los_zod, los_power, is_zenith=True
+                            )
+                            zsd_values.append(zsd_spread)
+                    
+                    if (cluster_param['theta_n_m_zoa'] is not None and len(cluster_param['theta_n_m_zoa']) >= n_rays_per_cluster and
+                        cluster_param['theta_n_zoa'] is not None and len(cluster_param['theta_n_zoa']) >= n_clusters):
+                        los_zoa = cluster_param['theta_n_m_zoa'][0]  # First ray of first cluster
+                        nlos_zoa = np.array(cluster_param['theta_n_zoa'][1:n_clusters])  # Cluster centers (skip first)
+                        if len(nlos_zoa) > 0:
+                            zsa_spread = self.compute_cluster_angle_spread_with_los(
+                                nlos_zoa.tolist(), nlos_cluster_powers_actual.tolist(),
+                                los_zoa, los_power, is_zenith=True
+                            )
+                            zsa_values.append(zsa_spread)
+                
+                else:
+                    # NLOS case or single cluster: Use per-ray calculation (Equation A-1)
+                    if cluster_param['phi_n_m_aod'] is not None and len(cluster_param['phi_n_m_aod']) >= total_rays:
+                        asd_circular = self.compute_circular_angle_spread(
+                            cluster_param['phi_n_m_aod'][:total_rays],
+                            ray_powers.tolist(),
+                            is_zenith=False
+                        )
+                        asd_values.append(asd_circular)
+                    
+                    if cluster_param['phi_n_m_aoa'] is not None and len(cluster_param['phi_n_m_aoa']) >= total_rays:
+                        asa_circular = self.compute_circular_angle_spread(
+                            cluster_param['phi_n_m_aoa'][:total_rays],
+                            ray_powers.tolist(),
+                            is_zenith=False
+                        )
+                        asa_values.append(asa_circular)
+                    
+                    if cluster_param['theta_n_m_zod'] is not None and len(cluster_param['theta_n_m_zod']) >= total_rays:
+                        zod_angles = np.array(cluster_param['theta_n_m_zod'][:total_rays])
+                        zsd_spread = self.compute_circular_angle_spread(
+                            zod_angles.tolist(),
+                            ray_powers.tolist(),
+                            is_zenith=True
+                        )
+                        zsd_values.append(zsd_spread)
+                    
+                    if cluster_param['theta_n_m_zoa'] is not None and len(cluster_param['theta_n_m_zoa']) >= total_rays:
+                        zoa_angles = np.array(cluster_param['theta_n_m_zoa'][:total_rays])
+                        zsa_spread = self.compute_circular_angle_spread(
+                            zoa_angles.tolist(),
+                            ray_powers.tolist(),
+                            is_zenith=True
+                        )
+                        zsa_values.append(zsa_spread)
+        
+        logger.info(f"Collected {len(ds_values)} delay spread samples from ISAC links")
+        logger.info(f"Collected {len(asd_values)} ASD samples, {len(asa_values)} ASA samples")
+        logger.info(f"Collected {len(zsd_values)} ZSD samples, {len(zsa_values)} ZSA samples")
+        
+        # Create results dictionary
+        results = {
+            'DS': np.array(ds_values),
+            'ASD': np.array(asd_values), 
+            'ZSD': np.array(zsd_values),
+            'ASA': np.array(asa_values),
+            'ZSA': np.array(zsa_values)
+        }
+        
+        # Save to JSON file
+        self._save_spreads_to_json(results, f'isac_{self.isac_channel_type}')
+        
+        return results
+    
     def analyze_delay_and_angle_spreads(self, association_method: str = 'rsrp', 
                                         serving_assignments: Dict[int, int] = None) -> Dict[str, np.ndarray]:
         """
@@ -1599,6 +2301,11 @@ class H5ChannelAnalyzer:
                 If None, will compute using association_method.
         """
         logger.info("Analyzing delay and angle spreads")
+        
+        # If multi-seed data is available, return it directly
+        if hasattr(self, '_is_multi_seed') and self._is_multi_seed and hasattr(self, '_multi_seed_spreads'):
+            logger.info(f"Using multi-seed combined spread data")
+            return self._multi_seed_spreads
         
         # Use pre-computed serving assignments if provided, otherwise compute them
         if serving_assignments is None:
@@ -1636,6 +2343,10 @@ class H5ChannelAnalyzer:
                 n_rays_per_cluster = cluster_param['n_ray_per_cluster']
                 total_rays = n_clusters * n_rays_per_cluster
                 
+                # Get LOS status and K-factor for this link (already retrieved in line 2224)
+                is_los = (link.los_ind == 1)
+                k_factor_linear = link.k_factor  # K-factor in linear scale
+                
                 # Compute per-ray powers according to 3GPP TR 25.996 Annex A
                 # Each ray within a cluster gets equal power (1/M of the cluster power)
                 cluster_powers = np.array(cluster_param['powers'][:n_clusters])
@@ -1652,42 +2363,103 @@ class H5ChannelAnalyzer:
                         ds_rms = np.sqrt(mean_delay_sq - mean_delay**2)
                         ds_values.append(ds_rms)
                 
-                # Compute angle spreads from PER-RAY data using TR 25.996 Annex A method
-                if cluster_param['phi_n_m_aod'] is not None and len(cluster_param['phi_n_m_aod']) >= total_rays:
-                    asd_circular = self.compute_circular_angle_spread(
-                        cluster_param['phi_n_m_aod'][:total_rays],
-                        ray_powers.tolist(),
-                        is_zenith=False  # ASD is azimuth (circular)
-                    )
-                    asd_values.append(asd_circular)
+                # Compute angle spreads using TR 25.996 Annex A for LOS, Equation A-1 for NLOS
+                if is_los and n_clusters > 1:
+                    # LOS case: Use TR 25.996 Annex A with explicit LOS component
+                    # Per 3GPP TR 38.901 Eq. 7.5-7: P_LOS = K_R / (K_R + 1), P_NLOS = 1 / (K_R + 1)
+                    los_power = k_factor_linear / (k_factor_linear + 1)
+                    nlos_total_power = 1.0 / (k_factor_linear + 1)
+                    
+                    # All NLOS cluster powers (stored in cluster_powers) are normalized and need to be
+                    # scaled by the total NLOS power allocation: nlos_cluster_power_actual = cluster_power_normalized * P_NLOS
+                    # The cluster_powers array is normalized such that sum(cluster_powers) ≈ 1.0
+                    # For LOS scenarios: cluster_powers[0] = LOS cluster power, cluster_powers[1:] = NLOS cluster powers
+                    # We need to scale ALL NLOS clusters (excluding cluster 0 which is LOS) by nlos_total_power
+                    nlos_cluster_powers_actual = cluster_powers[1:] * nlos_total_power
+                    
+                    # LOS angles are from first ray of first cluster (geometric angles)
+                    # NLOS cluster angles are from cluster centers (phi_n_aod, not phi_n_m_aod)
+                    if (cluster_param['phi_n_m_aod'] is not None and len(cluster_param['phi_n_m_aod']) >= n_rays_per_cluster and
+                        cluster_param['phi_n_aod'] is not None and len(cluster_param['phi_n_aod']) >= n_clusters):
+                        los_aod = cluster_param['phi_n_m_aod'][0]  # First ray of first cluster
+                        nlos_aod = np.array(cluster_param['phi_n_aod'][1:n_clusters])  # Cluster centers (skip first)
+                        if len(nlos_aod) > 0:
+                            asd_spread = self.compute_cluster_angle_spread_with_los(
+                                nlos_aod.tolist(), nlos_cluster_powers_actual.tolist(),
+                                los_aod, los_power, is_zenith=False
+                            )
+                            asd_values.append(asd_spread)
+                    
+                    if (cluster_param['phi_n_m_aoa'] is not None and len(cluster_param['phi_n_m_aoa']) >= n_rays_per_cluster and
+                        cluster_param['phi_n_aoa'] is not None and len(cluster_param['phi_n_aoa']) >= n_clusters):
+                        los_aoa = cluster_param['phi_n_m_aoa'][0]  # First ray of first cluster
+                        nlos_aoa = np.array(cluster_param['phi_n_aoa'][1:n_clusters])  # Cluster centers (skip first)
+                        if len(nlos_aoa) > 0:
+                            asa_spread = self.compute_cluster_angle_spread_with_los(
+                                nlos_aoa.tolist(), nlos_cluster_powers_actual.tolist(),
+                                los_aoa, los_power, is_zenith=False
+                            )
+                            asa_values.append(asa_spread)
+                    
+                    if (cluster_param['theta_n_m_zod'] is not None and len(cluster_param['theta_n_m_zod']) >= n_rays_per_cluster and
+                        cluster_param['theta_n_zod'] is not None and len(cluster_param['theta_n_zod']) >= n_clusters):
+                        los_zod = cluster_param['theta_n_m_zod'][0]  # First ray of first cluster
+                        nlos_zod = np.array(cluster_param['theta_n_zod'][1:n_clusters])  # Cluster centers (skip first)
+                        if len(nlos_zod) > 0:
+                            zsd_spread = self.compute_cluster_angle_spread_with_los(
+                                nlos_zod.tolist(), nlos_cluster_powers_actual.tolist(),
+                                los_zod, los_power, is_zenith=True
+                            )
+                            zsd_values.append(zsd_spread)
+                    
+                    if (cluster_param['theta_n_m_zoa'] is not None and len(cluster_param['theta_n_m_zoa']) >= n_rays_per_cluster and
+                        cluster_param['theta_n_zoa'] is not None and len(cluster_param['theta_n_zoa']) >= n_clusters):
+                        los_zoa = cluster_param['theta_n_m_zoa'][0]  # First ray of first cluster
+                        nlos_zoa = np.array(cluster_param['theta_n_zoa'][1:n_clusters])  # Cluster centers (skip first)
+                        if len(nlos_zoa) > 0:
+                            zsa_spread = self.compute_cluster_angle_spread_with_los(
+                                nlos_zoa.tolist(), nlos_cluster_powers_actual.tolist(),
+                                los_zoa, los_power, is_zenith=True
+                            )
+                            zsa_values.append(zsa_spread)
                 
-                if cluster_param['phi_n_m_aoa'] is not None and len(cluster_param['phi_n_m_aoa']) >= total_rays:
-                    asa_circular = self.compute_circular_angle_spread(
-                        cluster_param['phi_n_m_aoa'][:total_rays],
-                        ray_powers.tolist(),
-                        is_zenith=False  # ASA is azimuth (circular)
-                    )
-                    asa_values.append(asa_circular)
-                
-                if cluster_param['theta_n_m_zod'] is not None and len(cluster_param['theta_n_m_zod']) >= total_rays:
-                    # For ZSD: Use zenith-specific calculation (linear, not circular)
-                    zod_angles = np.array(cluster_param['theta_n_m_zod'][:total_rays])
-                    zsd_spread = self.compute_circular_angle_spread(
-                        zod_angles.tolist(),
-                        ray_powers.tolist(),
-                        is_zenith=True  # ZSD is zenith (linear)
-                    )
-                    zsd_values.append(zsd_spread)
-                
-                if cluster_param['theta_n_m_zoa'] is not None and len(cluster_param['theta_n_m_zoa']) >= total_rays:
-                    # For ZSA: Use zenith-specific calculation (linear, not circular)
-                    zoa_angles = np.array(cluster_param['theta_n_m_zoa'][:total_rays])                        
-                    zsa_spread = self.compute_circular_angle_spread(
-                        zoa_angles.tolist(),
-                        ray_powers.tolist(),
-                        is_zenith=True  # ZSA is zenith (linear)
-                    )                        
-                    zsa_values.append(zsa_spread)
+                else:
+                    # NLOS case or single cluster: Use per-ray calculation (Equation A-1)
+                    if cluster_param['phi_n_m_aod'] is not None and len(cluster_param['phi_n_m_aod']) >= total_rays:
+                        asd_circular = self.compute_circular_angle_spread(
+                            cluster_param['phi_n_m_aod'][:total_rays],
+                            ray_powers.tolist(),
+                            is_zenith=False  # ASD is azimuth (circular)
+                        )
+                        asd_values.append(asd_circular)
+                    
+                    if cluster_param['phi_n_m_aoa'] is not None and len(cluster_param['phi_n_m_aoa']) >= total_rays:
+                        asa_circular = self.compute_circular_angle_spread(
+                            cluster_param['phi_n_m_aoa'][:total_rays],
+                            ray_powers.tolist(),
+                            is_zenith=False  # ASA is azimuth (circular)
+                        )
+                        asa_values.append(asa_circular)
+                    
+                    if cluster_param['theta_n_m_zod'] is not None and len(cluster_param['theta_n_m_zod']) >= total_rays:
+                        # For ZSD: Use zenith-specific calculation (linear, not circular)
+                        zod_angles = np.array(cluster_param['theta_n_m_zod'][:total_rays])
+                        zsd_spread = self.compute_circular_angle_spread(
+                            zod_angles.tolist(),
+                            ray_powers.tolist(),
+                            is_zenith=True  # ZSD is zenith (linear)
+                        )
+                        zsd_values.append(zsd_spread)
+                    
+                    if cluster_param['theta_n_m_zoa'] is not None and len(cluster_param['theta_n_m_zoa']) >= total_rays:
+                        # For ZSA: Use zenith-specific calculation (linear, not circular)
+                        zoa_angles = np.array(cluster_param['theta_n_m_zoa'][:total_rays])                        
+                        zsa_spread = self.compute_circular_angle_spread(
+                            zoa_angles.tolist(),
+                            ray_powers.tolist(),
+                            is_zenith=True  # ZSA is zenith (linear)
+                        )                        
+                        zsa_values.append(zsa_spread)
 
         # Create results dictionary
         results = {
@@ -1771,84 +2543,153 @@ class H5ChannelAnalyzer:
             Dictionary with largest, smallest singular values and their ratios
         """
         logger.info("Computing PRB singular values from CIR data (MATLAB-style)")
+
+        # Phase 1 calibration is large-scale only; PRB singular value analysis is not applicable.
+        if self.calibration_phase == 1:
+            logger.info("Skipping PRB singular value computation for Phase 1 calibration (large-scale only)")
+            return {}
+        
+        # Skip for ISAC mode - ISAC uses BS→ST→BS channels, not BS→UE
+        if self.isac_config and self.isac_config.is_enabled:
+            logger.info("Skipping PRB singular value computation for ISAC mode (no BS→UE links)")
+            return {}
         
         if not self.cir_per_cell:
             logger.error("No CIR data available. Cannot compute singular values.")
             return {}
         
         # Initialize results - collect ALL normalized SVs (not just largest/smallest)
-        all_normalized_svs = []
-        largest_sv = []
-        smallest_sv = []
-        sv_ratios = []
+        all_normalized_svs: List[float] = []
+        largest_sv: List[float] = []
+        smallest_sv: List[float] = []
+        sv_ratios: List[float] = []
+
+        total_cells = len(self.cir_per_cell)
+        skipped_cells = 0
+        used_cells = 0
         
         # Process CIR data for each cell
         for cell_id, cir_data in self.cir_per_cell.items():
             logger.info(f"Processing CIR for cell {cell_id}, shape: {cir_data.shape}")
             
-            # CIR data shape: [nUE, nTaps * nRx * nTx]
-            # Need to reshape to [nUE, nTaps, nRx, nTx]
+            # CIR data shape (Phase-2 typical): [nUE, nSnapshots, nCoeffs]
+            # CIR data shape (legacy):         [nUE, nCoeffs]
+            #
+            # We compute PRB SVs at t=0, so if snapshot dimension exists we take snapshot 0.
+            # Then reshape per UE as [nTaps, nRx, nTx].
             
+            if cir_data.ndim not in (2, 3, 4, 5):
+                logger.warning(f"Unexpected CIR ndim={cir_data.ndim} for cell {cell_id}, skipping")
+                skipped_cells += 1
+                continue
+
             n_ues = cir_data.shape[0]
-            total_elements = cir_data.shape[1] if len(cir_data.shape) > 1 else cir_data.shape[0]
+            # Determine (nRx, nTx, nTaps) depending on dataset shape
+            if cir_data.ndim == 5:
+                # [nUE, nSnapshots, nRx, nTx, nTaps]
+                n_snapshots = cir_data.shape[1]
+                n_rx = cir_data.shape[2]
+                n_tx = cir_data.shape[3]
+                n_taps = cir_data.shape[4]
+                total_elements = n_rx * n_tx * n_taps
+            elif cir_data.ndim == 4:
+                # [nUE, nRx, nTx, nTaps] (treat as nSnapshots=1)
+                n_snapshots = 1
+                n_rx = cir_data.shape[1]
+                n_tx = cir_data.shape[2]
+                n_taps = cir_data.shape[3]
+                total_elements = n_rx * n_tx * n_taps
+            else:
+                # Legacy:
+                # - [nUE, nSnapshots, nCoeffs]
+                # - [nUE, nCoeffs]
+                n_snapshots = cir_data.shape[1] if cir_data.ndim == 3 else 1
+                total_elements = cir_data.shape[-1]
             
             # Get antenna counts from antenna panel configuration
             # Find the cell parameter for this cell to get BS antenna panel idx
             cell_param = next((c for c in self.cell_params if c.cid == cell_id), None)
             if cell_param is None:
                 logger.warning(f"Cell {cell_id} not found in cell_params, skipping")
+                skipped_cells += 1
                 continue
             
             # Get BS antenna panel configuration
             bs_ant_panel = self.antenna_panels.get(cell_param.ant_panel_idx)
             if bs_ant_panel is None:
                 logger.warning(f"BS antenna panel {cell_param.ant_panel_idx} not found, skipping cell {cell_id}")
+                skipped_cells += 1
                 continue
             
             n_tx = bs_ant_panel.n_antennas  # BS antennas
             
-            # Get UE antenna panel configuration (assume all UEs use the same panel, typically index 1)
-            # Try to find UE antenna panel - usually the second panel (idx=1) in the config
-            ue_ant_panel_idx = 1 if 1 in self.antenna_panels else 0
-            ue_ant_panel = self.antenna_panels.get(ue_ant_panel_idx)
-            if ue_ant_panel is None:
-                # Fallback: try any available panel index > 0
-                ue_panel_indices = [idx for idx in self.antenna_panels.keys() if idx != cell_param.ant_panel_idx]
-                if ue_panel_indices:
-                    ue_ant_panel_idx = ue_panel_indices[0]
-                    ue_ant_panel = self.antenna_panels[ue_ant_panel_idx]
-                else:
-                    logger.warning(f"No UE antenna panel found, skipping cell {cell_id}")
+            if cir_data.ndim in (2, 3):
+                # UE antenna count is not always reliably represented by the "default" UE panel index in the H5 metadata
+                # (e.g., UMa datasets can store CIR as 24 taps × 2 Rx × 64 Tx = 3072 coefficients).
+                # We prefer to infer nRx from the coefficient length and BS nTx when possible.
+                n_taps = 24  # Default per 3GPP
+                if total_elements % n_taps != 0:
+                    logger.error(f"CIR coeff length {total_elements} not divisible by n_taps={n_taps}, skipping cell {cell_id}")
+                    skipped_cells += 1
                     continue
-            
-            n_rx = ue_ant_panel.n_antennas  # UE antennas
-            
-            # Number of taps is fixed at 24 for CIR (per 3GPP)
-            n_taps = 24
-            
-            # Verify dimensions
-            expected_elements = n_taps * n_rx * n_tx
-            if expected_elements != total_elements:
-                logger.error(f"CIR dimension mismatch for cell {cell_id}:")
-                logger.error(f"  Expected: {n_taps} taps × {n_rx} RX ant × {n_tx} TX ant = {expected_elements}")
-                logger.error(f"  Actual: {total_elements}")
-                logger.error(f"  BS panel idx: {cell_param.ant_panel_idx}, UE panel idx: {ue_ant_panel_idx}")
-                # Try to infer correct dimensions
-                n_taps_inferred = total_elements // (n_rx * n_tx)
-                if n_taps_inferred * n_rx * n_tx == total_elements:
-                    logger.warning(f"  Using inferred n_taps={n_taps_inferred} instead")
-                    n_taps = n_taps_inferred
+
+                n_ant_pairs = total_elements // n_taps  # nRx * nTx
+
+                # First try: infer nRx using BS nTx
+                n_rx = None
+                if n_tx > 0 and (n_ant_pairs % n_tx == 0):
+                    n_rx = n_ant_pairs // n_tx
                 else:
-                    logger.error(f"  Cannot infer correct dimensions, skipping cell {cell_id}")
+                    # Fallback: try UE panel metadata to infer nTx
+                    ue_ant_panel_idx = 1 if 1 in self.antenna_panels else 0
+                    ue_ant_panel = self.antenna_panels.get(ue_ant_panel_idx)
+                    if ue_ant_panel is not None and ue_ant_panel.n_antennas > 0 and (n_ant_pairs % ue_ant_panel.n_antennas == 0):
+                        n_rx = ue_ant_panel.n_antennas
+                        n_tx = n_ant_pairs // n_rx
+                    else:
+                        # Final fallback: choose a factor pair close to BS nTx
+                        best_pair = None
+                        for cand_tx in range(1, n_ant_pairs + 1):
+                            if n_ant_pairs % cand_tx != 0:
+                                continue
+                            cand_rx = n_ant_pairs // cand_tx
+                            score = abs(cand_tx - n_tx)
+                            if best_pair is None or score < best_pair[0]:
+                                best_pair = (score, cand_rx, cand_tx)
+                        if best_pair is None:
+                            logger.error(f"Cannot factor n_ant_pairs={n_ant_pairs} for cell {cell_id}, skipping")
+                            skipped_cells += 1
+                            continue
+                        _, n_rx, n_tx = best_pair
+                        logger.warning(f"Inferred nRx={n_rx}, nTx={n_tx} from coeff length for cell {cell_id}")
+
+                expected_elements = n_taps * n_rx * n_tx
+                if expected_elements != total_elements:
+                    logger.error(f"CIR dimension mismatch for cell {cell_id}: expected {expected_elements}, actual {total_elements}")
+                    skipped_cells += 1
                     continue
+
+            used_cells += 1
             
-            logger.info(f"  Cell {cell_id}: nUE={n_ues}, nTaps={n_taps}, nRx={n_rx} (UE panel {ue_ant_panel_idx}), nTx={n_tx} (BS panel {cell_param.ant_panel_idx})")
+            logger.info(f"  Cell {cell_id}: nUE={n_ues}, nTaps={n_taps}, nRx={n_rx}, nTx={n_tx} (BS panel {cell_param.ant_panel_idx})")
             logger.info(f"  Total elements: {total_elements} = {n_taps}×{n_rx}×{n_tx}")
             
             # Process each UE
             for ue_idx in range(min(n_ues, 100)):  # Limit to first 100 UEs for performance
-                # Extract CIR for this UE and reshape
-                cir_ue = cir_data[ue_idx].reshape(n_taps, n_rx, n_tx)
+                # Extract CIR for this UE at t=0 and reshape to [nTaps, nRx, nTx]
+                if cir_data.ndim == 5:
+                    # [nUE, nSnapshots, nRx, nTx, nTaps] -> [nTaps, nRx, nTx]
+                    cir_ue = np.transpose(cir_data[ue_idx, 0, :, :, :], (2, 0, 1))
+                elif cir_data.ndim == 4:
+                    # [nUE, nRx, nTx, nTaps] -> [nTaps, nRx, nTx]
+                    cir_ue = np.transpose(cir_data[ue_idx, :, :, :], (2, 0, 1))
+                else:
+                    # Legacy flattened coefficients -> reshape [nTaps, nRx, nTx]
+                    if cir_data.ndim == 3:
+                        cir_vec = cir_data[ue_idx, 0, :]
+                    else:
+                        cir_vec = cir_data[ue_idx, :]
+                    cir_ue = cir_vec.reshape(n_taps, n_rx, n_tx)
                 
                 # === STEP 1: FFT to frequency domain (matching MATLAB) ===
                 # MATLAB: tmp_fd = (1./sqrt(sizeFFT)) * fftshift(fft(H, sizeFFT, 3), 3)
@@ -1886,6 +2727,17 @@ class H5ChannelAnalyzer:
                         # SVD failed for this frequency bin, skip it
                         continue
         
+        logger.info(
+            f"PRB SV summary: total_cells={total_cells}, used_cells={used_cells}, skipped_cells={skipped_cells}"
+        )
+
+        if len(largest_sv) == 0:
+            logger.warning(
+                "No singular values collected (all CIRs were skipped or numerically invalid). "
+                "Skipping PRB singular value plots."
+            )
+            return {}
+
         logger.info(f"Collected {len(all_normalized_svs)} normalized singular values")
         logger.info(f"Largest SV range: [{np.min(largest_sv):.2e}, {np.max(largest_sv):.2e}]")
         
@@ -2162,8 +3014,10 @@ class H5ChannelAnalyzer:
                 
                 if active_link_found:
                     # Calculate CIR power for this UE-cell link
-                    # CIR data shape from H5 is typically (n_ues_for_this_cell, n_taps) for this specific cell
-                    if len(cir_data.shape) == 2:  # (n_ues, n_taps)
+                    # CIR data shape can be:
+                    #   2D: (n_ues, n_taps)
+                    #   3D: (n_ues, n_snapshots, n_taps)
+                    if len(cir_data.shape) >= 2:  # 2D or 3D
                         # Try to get explicit UE-to-row mapping from H5 file first
                         ue_row_idx = self._get_ue_row_mapping(cell_id, ue_idx)
                         
@@ -2180,12 +3034,14 @@ class H5ChannelAnalyzer:
                                 ue_row_idx = cell_ue_indices.index(ue_idx)
                         
                         if ue_row_idx is not None and ue_row_idx < cir_data.shape[0]:
-                            # Sum power across all taps for this UE
-                            ue_cir_power = np.sum(np.abs(cir_data[ue_row_idx, :])**2)
+                            # Sum power across all snapshots and taps for this UE
+                            # For 2D: cir_data[ue_row_idx, :] -> (n_taps,)
+                            # For 3D: cir_data[ue_row_idx, :, :] or cir_data[ue_row_idx] -> (n_snapshots, n_taps)
+                            ue_cir_power = np.sum(np.abs(cir_data[ue_row_idx])**2)
                         else:
                             logger.debug(f"Could not find valid row mapping for cell {cell_id}, UE {ue_idx}")
                     else:
-                        # For other shapes, sum all power (fallback)
+                        # For 1D or unexpected shapes, sum all power (fallback)
                         ue_cir_power = np.sum(np.abs(cir_data)**2) / cir_data.size  # Normalize by size
                 
                 power_per_cell[cell_id] = ue_cir_power
@@ -2307,6 +3163,39 @@ class H5ChannelAnalyzer:
         """
         logger.info(f"Computing coupling loss for serving cells only (virtualization={'ON' if use_virtualization else 'OFF'})")
         
+        # If multi-seed data is available, return it directly
+        if hasattr(self, '_is_multi_seed') and self._is_multi_seed and hasattr(self, '_multi_seed_coupling_losses'):
+            logger.info(f"Using multi-seed combined data: {len(self._multi_seed_coupling_losses)} samples")
+            return self._multi_seed_coupling_losses
+        
+        # For ISAC mode, use the appropriate coupling loss based on calibration phase
+        if self.isac_config and self.isac_config.is_enabled:
+            # Phase 2: Compute from CIR to include all small-scale effects
+            if self.calibration_phase == 2:
+                # ISAC uses antenna normalization (divide by n_ant) for per-antenna power
+                phase2_coupling = self._compute_phase2_coupling_loss_from_cir(use_virtualization=False)
+                if phase2_coupling is not None and len(phase2_coupling) > 0:
+                    logger.info(f"Using Phase 2 coupling loss from CIR: {len(phase2_coupling)} samples")
+                    logger.info("Phase 2 includes: PL, SF, RCS (A+B1+B2), antenna patterns, polarization, ray powers")
+                    logger.info("Using antenna normalization (per-antenna power)")
+                    return phase2_coupling
+                else:
+                    logger.warning("Phase 2 CIR computation failed, falling back to Phase 1 formula")
+            
+            # Phase 1 or fallback: Use saved coupling loss (large-scale only)
+            isac_coupling_losses = self._get_isac_coupling_loss()
+            if isac_coupling_losses is not None and len(isac_coupling_losses) > 0:
+                if self.calibration_phase == 1:
+                    logger.info(f"Using Phase 1 coupling loss (large-scale only): {len(isac_coupling_losses)} samples")
+                else:
+                    logger.warning(f"Using Phase 1 formula as fallback: {len(isac_coupling_losses)} samples")
+                return isac_coupling_losses
+        
+        # For UMa calibration (non-ISAC): Use formula-based approach for both Phase 1 and Phase 2
+        # Coupling Loss = -(PL - SF - antenna_gain)
+        # Note: Both phases use the same formula. Phase 2 calibration includes additional metrics
+        # (delay spread, angle spreads) but coupling loss is still computed from large-scale parameters.
+        
         # Get serving cell assignments based on CIR power
         serving_assignments = self.get_serving_cell_assignments()
         
@@ -2366,24 +3255,30 @@ class H5ChannelAnalyzer:
         else:
             ntaps = int(cir_ntaps)
         
-        # Compute power as sum of squared magnitudes (simple approach)
-        if ntaps > 0 and hasattr(cir_coe, 'shape'):
-            if len(cir_coe.shape) >= 3:
-                # 3D array: snapshot x antenna x taps
-                H = cir_coe[:, :, :ntaps]
-                power = np.sum(np.abs(H)**2)
-            elif len(cir_coe.shape) == 2:
-                # 2D array: antenna x taps or snapshot x taps
-                power = np.sum(np.abs(cir_coe[:, :ntaps])**2)
-            else:
-                # 1D array: just taps
-                power = np.sum(np.abs(cir_coe[:ntaps])**2)
-            return float(power)
-        elif ntaps > 0:
-            # Not an array, just sum
-            return float(np.sum(np.abs(cir_coe)**2))
-        else:
+        # Compute power as sum of squared magnitudes.
+        # Supported CIR shapes for this helper:
+        # - New:  [nSnapshots, nRx, nTx, nTaps] or [nRx, nTx, nTaps]
+        # - Comm: [nSnapshots, nAnt, nTaps]
+        # - Legacy flattened: [nSnapshots, nCoeffs] or [nCoeffs]
+        if ntaps <= 0:
             return 0.0
+
+        if not hasattr(cir_coe, 'shape'):
+            return float(np.sum(np.abs(cir_coe) ** 2))
+
+        arr = np.asarray(cir_coe)
+
+        # Heuristic: very large last-dimension implies flattened coefficients, not taps.
+        if arr.ndim <= 2 and arr.shape[-1] > 4096:
+            return float(np.sum(np.abs(arr) ** 2))
+
+        # If arr has a tap axis, it is expected to be the last axis.
+        if arr.shape[-1] >= ntaps:
+            slicer = (slice(None),) * (arr.ndim - 1) + (slice(0, ntaps),)
+            return float(np.sum(np.abs(arr[slicer]) ** 2))
+
+        # Fallback: sum everything
+        return float(np.sum(np.abs(arr) ** 2))
     
     def _apply_virtualization_to_cir(self, H, calibration_phase, tilt_deg=12.0, sum_ports=False) -> float:
         """
@@ -2899,6 +3794,436 @@ class H5ChannelAnalyzer:
                 breakdown = f"S={signal_pwr_dbm:.1f} / (I={interf_pwr_dbm:.1f} + N={noise_power_dbm:.1f}) = {signal_pwr_dbm:.1f} / {interf_plus_noise_dbm:.1f}"
                 
                 print(f"{ue_idx:<6} {serving_cell:<6} {d_2d_val:<10.1f} {d_3d_val:<10.1f} {signal_pwr_dbm:<12.2f} {interf_pwr_dbm:<12.2f} {sir_db[ue_idx]:<10.2f} {sinr_db[ue_idx]:<10.2f} {breakdown}")
+        
+        # Print detailed analysis for high SINR UEs (SINR > 25 dB)
+        high_sinr_ues = [(ue_idx, sinr_db[ue_idx]) for ue_idx in range(n_uts) 
+                         if ue_idx < len(sinr_db) and np.isfinite(sinr_db[ue_idx]) and sinr_db[ue_idx] > 25.0]
+        
+        if len(high_sinr_ues) > 0:
+            print(f"\n{'='*100}")
+            print(f"DETAILED ANALYSIS FOR HIGH SINR UEs (SINR > 25 dB) - Total: {len(high_sinr_ues)} UEs")
+            print(f"{'='*100}")
+            
+            # Sort by SINR (highest first)
+            high_sinr_ues.sort(key=lambda x: x[1], reverse=True)
+            
+            for ue_idx, sinr_val in high_sinr_ues[:20]:  # Print top 20 high SINR UEs
+                if ue_idx in serving_assignments and ue_idx < len(serving_cells):
+                    serving_cell = serving_cells[ue_idx]
+                    
+                    print(f"\n{'='*100}")
+                    print(f"UE {ue_idx}: SINR = {sinr_val:.2f} dB, SIR = {sir_db[ue_idx]:.2f} dB")
+                    print(f"{'='*100}")
+                    
+                    # Get link parameters for this UE-serving cell pair
+                    for active_link in self.active_link_params:
+                        if active_link.uid == ue_idx and active_link.cid == serving_cell:
+                            if active_link.lsp_read_idx < len(self.link_params):
+                                link = self.link_params[active_link.lsp_read_idx]
+                                
+                                # Get CIR and pathloss gains
+                                ue_powers_linear = power_matrix_linear[:, ue_idx]
+                                serving_cir_linear = ue_powers_linear[serving_cell]
+                                cir_gain_db = 10 * np.log10(serving_cir_linear) if serving_cir_linear > 0 else -np.inf
+                                pathloss_gain_db = -(link.pathloss - link.sf)
+                                antenna_contribution = cir_gain_db - pathloss_gain_db
+                                
+                                # K-factor
+                                k_db = link.k_factor
+                                k_linear = 10**(k_db / 10.0) if np.isfinite(k_db) else 0.0
+                                
+                                # Power values
+                                signal_pwr_dbm = serving_powers_log[ue_idx] if ue_idx < len(serving_powers_log) else np.nan
+                                interf_pwr_dbm = interference_powers_log[ue_idx] if ue_idx < len(interference_powers_log) else np.nan
+                                
+                                # Get UE location from utParams if available
+                                ue_location = None
+                                if hasattr(self, 'ut_params') and ue_idx < len(self.ut_params):
+                                    ue_location = self.ut_params[ue_idx].get('location') if isinstance(self.ut_params[ue_idx], dict) else None
+                                
+                                # Get serving cell location
+                                serving_cell_location = None
+                                serving_cell_site_id = None
+                                for cell in self.cell_params:
+                                    if cell.cid == serving_cell:
+                                        serving_cell_location = cell.location
+                                        serving_cell_site_id = cell.site_id
+                                        break
+                                
+                                print(f"  Serving Cell: {serving_cell} (Site {serving_cell_site_id})" if serving_cell_site_id is not None else f"  Serving Cell: {serving_cell}")
+                                if serving_cell_location:
+                                    print(f"  Serving Cell Location: ({serving_cell_location['x']:.1f}, {serving_cell_location['y']:.1f}, {serving_cell_location['z']:.1f}) m")
+                                if ue_location:
+                                    print(f"  UE Location: ({ue_location['x']:.1f}, {ue_location['y']:.1f}, {ue_location['z']:.1f}) m")
+                                print(f"  Distance: d_2d = {link.d2d:.1f} m, d_3d = {link.d3d:.1f} m")
+                                print(f"  LOS State: {'LOS' if link.los_ind else 'NLOS'}")
+                                print(f"  K-factor: {k_linear:.6e} linear ({k_db:.2f} dB)")
+                                print(f"")
+                                print(f"  === CHANNEL GAINS ===")
+                                print(f"  CIR Gain (includes antenna array + fading): {cir_gain_db:.2f} dB")
+                                print(f"  Pathloss Gain (large-scale only):          {pathloss_gain_db:.2f} dB")
+                                print(f"  Antenna Array + Fading Contribution:        {antenna_contribution:.2f} dB")
+                                print(f"")
+                                print(f"  === RECEIVED POWERS ===")
+                                print(f"  TX Power:           {tx_power_dbm:.2f} dBm")
+                                print(f"  Signal RX Power:    {signal_pwr_dbm:.2f} dBm  (TX + CIR gain)")
+                                print(f"  Interference Power: {interf_pwr_dbm:.2f} dBm")
+                                print(f"  Noise Power:        {noise_power_dbm:.2f} dBm")
+                                print(f"")
+                                print(f"  === SIR/SINR ===")
+                                print(f"  SIR  = {sir_db[ue_idx]:.2f} dB  (Signal / Interference, no noise)")
+                                print(f"  SINR = {sinr_val:.2f} dB  (Signal / (Interference + Noise))")
+                                
+                                # Calculate noise contribution to total interference+noise
+                                interf_linear = 10**(interf_pwr_dbm / 10)
+                                noise_linear = 10**(noise_power_dbm / 10)
+                                total_in = interf_linear + noise_linear
+                                noise_contribution_pct = (noise_linear / total_in) * 100
+                                interf_contribution_pct = (interf_linear / total_in) * 100
+                                
+                                print(f"")
+                                print(f"  === INTERFERENCE + NOISE BREAKDOWN ===")
+                                print(f"  Interference contribution: {interf_contribution_pct:.1f}%")
+                                print(f"  Noise contribution:        {noise_contribution_pct:.1f}%")
+                                
+                                # Detailed interference breakdown from each cell with co-sited analysis
+                                if ue_idx in interference_breakdown:
+                                    interf_list = interference_breakdown[ue_idx]
+                                    
+                                    # Calculate co-sited vs other-site interference
+                                    co_sited_interf_power_linear = 0.0
+                                    other_site_interf_power_linear = 0.0
+                                    
+                                    for cell_idx, rx_pwr, cir_db in interf_list:
+                                        # Get interfering cell site
+                                        interf_site_id = None
+                                        for cell in self.cell_params:
+                                            if cell.cid == cell_idx:
+                                                interf_site_id = cell.site_id
+                                                break
+                                        
+                                        rx_pwr_linear = 10**(rx_pwr / 10)
+                                        if interf_site_id == serving_cell_site_id:
+                                            co_sited_interf_power_linear += rx_pwr_linear
+                                        else:
+                                            other_site_interf_power_linear += rx_pwr_linear
+                                    
+                                    total_interf_linear = co_sited_interf_power_linear + other_site_interf_power_linear
+                                    co_sited_pct = (co_sited_interf_power_linear / total_interf_linear * 100) if total_interf_linear > 0 else 0
+                                    other_site_pct = (other_site_interf_power_linear / total_interf_linear * 100) if total_interf_linear > 0 else 0
+                                    
+                                    print(f"")
+                                    print(f"  === CO-SITED vs OTHER-SITE INTERFERENCE ===")
+                                    if co_sited_interf_power_linear > 0:
+                                        co_sited_dbm = 10 * np.log10(co_sited_interf_power_linear)
+                                        print(f"  Co-sited interference (Site {serving_cell_site_id}): {co_sited_dbm:.2f} dBm ({co_sited_pct:.1f}%)")
+                                    else:
+                                        print(f"  Co-sited interference: None")
+                                    
+                                    if other_site_interf_power_linear > 0:
+                                        other_site_dbm = 10 * np.log10(other_site_interf_power_linear)
+                                        print(f"  Other-site interference: {other_site_dbm:.2f} dBm ({other_site_pct:.1f}%)")
+                                    else:
+                                        print(f"  Other-site interference: None")
+                                    
+                                    print(f"")
+                                    print(f"  === TOP INTERFERING CELLS ===")
+                                    print(f"  {'Cell':<8} {'Site':<6} {'Type':<10} {'RX Power':<12} {'CIR Gain':<12} {'Distance':<12} {'Rel to Signal':<15}")
+                                    print(f"  {'-'*95}")
+                                    for i, (cell_idx, rx_pwr, cir_db) in enumerate(interf_list[:5]):  # Top 5 interferers
+                                        rel_db = rx_pwr - signal_pwr_dbm
+                                        # Find distance to interfering cell and its location
+                                        interf_dist = None
+                                        interf_cell_location = None
+                                        interf_site_id = None
+                                        for al in self.active_link_params:
+                                            if al.uid == ue_idx and al.cid == cell_idx:
+                                                if al.lsp_read_idx < len(self.link_params):
+                                                    interf_dist = self.link_params[al.lsp_read_idx].d2d
+                                                    break
+                                        # Get interfering cell location
+                                        for cell in self.cell_params:
+                                            if cell.cid == cell_idx:
+                                                interf_cell_location = cell.location
+                                                interf_site_id = cell.site_id
+                                                break
+                                        dist_str = f"{interf_dist:.1f} m" if interf_dist is not None else "N/A"
+                                        site_str = f"{interf_site_id}" if interf_site_id is not None else "N/A"
+                                        interf_type = "CO-SITED" if interf_site_id == serving_cell_site_id else "Other"
+                                        print(f"  {cell_idx:<8} {site_str:<6} {interf_type:<10} {rx_pwr:<12.2f} {cir_db:<12.2f} {dist_str:<12} {rel_db:>+6.2f} dB")
+                                        if interf_cell_location:
+                                            print(f"    Location: ({interf_cell_location['x']:.1f}, {interf_cell_location['y']:.1f}, {interf_cell_location['z']:.1f}) m")
+                                
+                                break
+            
+            print(f"\n{'='*100}")
+            print(f"SUMMARY: {len(high_sinr_ues)} UEs with SINR > 25 dB")
+            if len(high_sinr_ues) > 0:
+                high_sinrs = [sinr for _, sinr in high_sinr_ues]
+                print(f"  SINR Range: [{np.min(high_sinrs):.2f}, {np.max(high_sinrs):.2f}] dB")
+                print(f"  SINR Mean:  {np.mean(high_sinrs):.2f} dB")
+                print(f"  SINR Median: {np.median(high_sinrs):.2f} dB")
+                
+                # Analyze why SINR might be limited
+                print(f"\n  === ANALYSIS: Why SINR doesn't reach 35 dB ===")
+                
+                # Check K-factor distribution for high SINR UEs
+                k_factors_high_sinr = []
+                los_count = 0
+                distances = []
+                for ue_idx, _ in high_sinr_ues:
+                    if ue_idx < len(serving_cells):
+                        serving_cell = serving_cells[ue_idx]
+                        for active_link in self.active_link_params:
+                            if active_link.uid == ue_idx and active_link.cid == serving_cell:
+                                if active_link.lsp_read_idx < len(self.link_params):
+                                    link = self.link_params[active_link.lsp_read_idx]
+                                    k_factors_high_sinr.append(link.k_factor)
+                                    if link.los_ind:
+                                        los_count += 1
+                                    distances.append(link.d2d)
+                                    break
+                
+                if len(k_factors_high_sinr) > 0:
+                    print(f"  K-factor for high SINR UEs: Mean = {np.mean(k_factors_high_sinr):.2f} dB, "
+                          f"Max = {np.max(k_factors_high_sinr):.2f} dB")
+                    print(f"  LOS percentage: {100*los_count/len(high_sinr_ues):.1f}% ({los_count}/{len(high_sinr_ues)})")
+                    print(f"  Distance: Mean = {np.mean(distances):.1f} m, Min = {np.min(distances):.1f} m")
+                    print(f"")
+                    print(f"  Possible reasons for SINR < 35 dB:")
+                    print(f"  1. **CO-SITED INTERFERENCE** - Other sectors at same site cause strong interference")
+                    print(f"  2. Interference from neighboring cells (check 'CO-SITED vs OTHER-SITE' above)")
+                    print(f"  3. K-factor not high enough (typical LOS K ~ 5-10 dB for close UEs)")
+                    print(f"  4. UE distances too far (should be < 50m for very high SINR)")
+                    print(f"  5. Shadow fading variations reducing signal strength")
+            print(f"{'='*100}\n")
+        else:
+            print(f"\n{'='*100}")
+            print(f"NO UEs with SINR > 25 dB found in simulation")
+            print(f"{'='*100}")
+            print(f"Max SINR: {np.max(sinr_db[np.isfinite(sinr_db)]):.2f} dB")
+            print(f"{'='*100}\n")
+        
+        # Print detailed analysis for UEs within 50m of serving cell
+        close_ues = []
+        for ue_idx in range(n_uts):
+            if ue_idx in serving_assignments and ue_idx < len(serving_cells):
+                serving_cell = serving_cells[ue_idx]
+                for active_link in self.active_link_params:
+                    if active_link.uid == ue_idx and active_link.cid == serving_cell:
+                        if active_link.lsp_read_idx < len(self.link_params):
+                            link = self.link_params[active_link.lsp_read_idx]
+                            if link.d2d <= 50.0:
+                                sinr_val = sinr_db[ue_idx] if ue_idx < len(sinr_db) and np.isfinite(sinr_db[ue_idx]) else np.nan
+                                close_ues.append((ue_idx, link.d2d, sinr_val))
+                            break
+        
+        if len(close_ues) > 0:
+            print(f"\n{'='*100}")
+            print(f"DETAILED ANALYSIS FOR CLOSE UEs (d_2d <= 50m) - Total: {len(close_ues)} UEs")
+            print(f"{'='*100}")
+            
+            # Sort by distance (closest first)
+            close_ues.sort(key=lambda x: x[1])
+            
+            for ue_idx, distance, sinr_val in close_ues[:20]:  # Print top 20 closest UEs
+                if ue_idx in serving_assignments and ue_idx < len(serving_cells):
+                    serving_cell = serving_cells[ue_idx]
+                    
+                    print(f"\n{'='*100}")
+                    print(f"UE {ue_idx}: d_2d = {distance:.1f} m, SINR = {sinr_val:.2f} dB, SIR = {sir_db[ue_idx]:.2f} dB")
+                    print(f"{'='*100}")
+                    
+                    # Get link parameters for this UE-serving cell pair
+                    for active_link in self.active_link_params:
+                        if active_link.uid == ue_idx and active_link.cid == serving_cell:
+                            if active_link.lsp_read_idx < len(self.link_params):
+                                link = self.link_params[active_link.lsp_read_idx]
+                                
+                                # Get CIR and pathloss gains
+                                ue_powers_linear = power_matrix_linear[:, ue_idx]
+                                serving_cir_linear = ue_powers_linear[serving_cell]
+                                cir_gain_db = 10 * np.log10(serving_cir_linear) if serving_cir_linear > 0 else -np.inf
+                                pathloss_gain_db = -(link.pathloss - link.sf)
+                                antenna_contribution = cir_gain_db - pathloss_gain_db
+                                
+                                # K-factor
+                                k_db = link.k_factor
+                                k_linear = 10**(k_db / 10.0) if np.isfinite(k_db) else 0.0
+                                
+                                # Power values
+                                signal_pwr_dbm = serving_powers_log[ue_idx] if ue_idx < len(serving_powers_log) else np.nan
+                                interf_pwr_dbm = interference_powers_log[ue_idx] if ue_idx < len(interference_powers_log) else np.nan
+                                
+                                # Get UE location from utParams if available
+                                ue_location = None
+                                if hasattr(self, 'ut_params') and ue_idx < len(self.ut_params):
+                                    ue_location = self.ut_params[ue_idx].get('location') if isinstance(self.ut_params[ue_idx], dict) else None
+                                
+                                # Get serving cell location
+                                serving_cell_location = None
+                                serving_cell_site_id = None
+                                for cell in self.cell_params:
+                                    if cell.cid == serving_cell:
+                                        serving_cell_location = cell.location
+                                        serving_cell_site_id = cell.site_id
+                                        break
+                                
+                                print(f"  Serving Cell: {serving_cell} (Site {serving_cell_site_id})" if serving_cell_site_id is not None else f"  Serving Cell: {serving_cell}")
+                                if serving_cell_location:
+                                    print(f"  Serving Cell Location: ({serving_cell_location['x']:.1f}, {serving_cell_location['y']:.1f}, {serving_cell_location['z']:.1f}) m")
+                                if ue_location:
+                                    print(f"  UE Location: ({ue_location['x']:.1f}, {ue_location['y']:.1f}, {ue_location['z']:.1f}) m")
+                                print(f"  Distance: d_2d = {link.d2d:.1f} m, d_3d = {link.d3d:.1f} m")
+                                print(f"  LOS State: {'LOS' if link.los_ind else 'NLOS'}")
+                                print(f"  K-factor: {k_linear:.6e} linear ({k_db:.2f} dB)")
+                                print(f"  Shadow Fading: {link.sf:.2f} dB")
+                                print(f"  Pathloss: {link.pathloss:.2f} dB")
+                                print(f"")
+                                print(f"  === CHANNEL GAINS ===")
+                                print(f"  CIR Gain (includes antenna array + fading): {cir_gain_db:.2f} dB")
+                                print(f"  Pathloss Gain (large-scale only):          {pathloss_gain_db:.2f} dB")
+                                print(f"  Antenna Array + Fading Contribution:        {antenna_contribution:.2f} dB")
+                                print(f"")
+                                print(f"  === RECEIVED POWERS ===")
+                                print(f"  TX Power:           {tx_power_dbm:.2f} dBm")
+                                print(f"  Signal RX Power:    {signal_pwr_dbm:.2f} dBm  (TX + CIR gain)")
+                                print(f"  Interference Power: {interf_pwr_dbm:.2f} dBm")
+                                print(f"  Noise Power:        {noise_power_dbm:.2f} dBm")
+                                print(f"")
+                                print(f"  === SIR/SINR ===")
+                                print(f"  SIR  = {sir_db[ue_idx]:.2f} dB  (Signal / Interference, no noise)")
+                                print(f"  SINR = {sinr_val:.2f} dB  (Signal / (Interference + Noise))")
+                                
+                                # Calculate noise contribution to total interference+noise
+                                interf_linear = 10**(interf_pwr_dbm / 10)
+                                noise_linear = 10**(noise_power_dbm / 10)
+                                total_in = interf_linear + noise_linear
+                                noise_contribution_pct = (noise_linear / total_in) * 100
+                                interf_contribution_pct = (interf_linear / total_in) * 100
+                                
+                                print(f"")
+                                print(f"  === INTERFERENCE + NOISE BREAKDOWN ===")
+                                print(f"  Interference contribution: {interf_contribution_pct:.1f}%")
+                                print(f"  Noise contribution:        {noise_contribution_pct:.1f}%")
+                                
+                                # Detailed interference breakdown from each cell with co-sited analysis
+                                if ue_idx in interference_breakdown:
+                                    interf_list = interference_breakdown[ue_idx]
+                                    
+                                    # Calculate co-sited vs other-site interference
+                                    co_sited_interf_power_linear = 0.0
+                                    other_site_interf_power_linear = 0.0
+                                    
+                                    for cell_idx, rx_pwr, cir_db in interf_list:
+                                        # Get interfering cell site
+                                        interf_site_id = None
+                                        for cell in self.cell_params:
+                                            if cell.cid == cell_idx:
+                                                interf_site_id = cell.site_id
+                                                break
+                                        
+                                        rx_pwr_linear = 10**(rx_pwr / 10)
+                                        if interf_site_id == serving_cell_site_id:
+                                            co_sited_interf_power_linear += rx_pwr_linear
+                                        else:
+                                            other_site_interf_power_linear += rx_pwr_linear
+                                    
+                                    total_interf_linear = co_sited_interf_power_linear + other_site_interf_power_linear
+                                    co_sited_pct = (co_sited_interf_power_linear / total_interf_linear * 100) if total_interf_linear > 0 else 0
+                                    other_site_pct = (other_site_interf_power_linear / total_interf_linear * 100) if total_interf_linear > 0 else 0
+                                    
+                                    print(f"")
+                                    print(f"  === CO-SITED vs OTHER-SITE INTERFERENCE ===")
+                                    if co_sited_interf_power_linear > 0:
+                                        co_sited_dbm = 10 * np.log10(co_sited_interf_power_linear)
+                                        print(f"  Co-sited interference (Site {serving_cell_site_id}): {co_sited_dbm:.2f} dBm ({co_sited_pct:.1f}%)")
+                                    else:
+                                        print(f"  Co-sited interference: None")
+                                    
+                                    if other_site_interf_power_linear > 0:
+                                        other_site_dbm = 10 * np.log10(other_site_interf_power_linear)
+                                        print(f"  Other-site interference: {other_site_dbm:.2f} dBm ({other_site_pct:.1f}%)")
+                                    else:
+                                        print(f"  Other-site interference: None")
+                                    
+                                    print(f"")
+                                    print(f"  === TOP INTERFERING CELLS ===")
+                                    print(f"  {'Cell':<8} {'Site':<6} {'Type':<10} {'RX Power':<12} {'CIR Gain':<12} {'Distance':<12} {'Rel to Signal':<15}")
+                                    print(f"  {'-'*95}")
+                                    for i, (cell_idx, rx_pwr, cir_db) in enumerate(interf_list[:5]):  # Top 5 interferers
+                                        rel_db = rx_pwr - signal_pwr_dbm
+                                        # Find distance to interfering cell and its location
+                                        interf_dist = None
+                                        interf_cell_location = None
+                                        interf_site_id = None
+                                        for al in self.active_link_params:
+                                            if al.uid == ue_idx and al.cid == cell_idx:
+                                                if al.lsp_read_idx < len(self.link_params):
+                                                    interf_dist = self.link_params[al.lsp_read_idx].d2d
+                                                    break
+                                        # Get interfering cell location
+                                        for cell in self.cell_params:
+                                            if cell.cid == cell_idx:
+                                                interf_cell_location = cell.location
+                                                interf_site_id = cell.site_id
+                                                break
+                                        dist_str = f"{interf_dist:.1f} m" if interf_dist is not None else "N/A"
+                                        site_str = f"{interf_site_id}" if interf_site_id is not None else "N/A"
+                                        interf_type = "CO-SITED" if interf_site_id == serving_cell_site_id else "Other"
+                                        print(f"  {cell_idx:<8} {site_str:<6} {interf_type:<10} {rx_pwr:<12.2f} {cir_db:<12.2f} {dist_str:<12} {rel_db:>+6.2f} dB")
+                                        if interf_cell_location:
+                                            print(f"    Location: ({interf_cell_location['x']:.1f}, {interf_cell_location['y']:.1f}, {interf_cell_location['z']:.1f}) m")
+                                
+                                break
+            
+            print(f"\n{'='*100}")
+            print(f"SUMMARY: {len(close_ues)} UEs within 50m of serving cell")
+            if len(close_ues) > 0:
+                distances = [d for _, d, _ in close_ues]
+                sinrs = [s for _, _, s in close_ues if np.isfinite(s)]
+                print(f"  Distance Range: [{np.min(distances):.1f}, {np.max(distances):.1f}] m")
+                print(f"  Distance Mean:  {np.mean(distances):.1f} m")
+                print(f"  Distance Median: {np.median(distances):.1f} m")
+                if len(sinrs) > 0:
+                    print(f"")
+                    print(f"  SINR Range: [{np.min(sinrs):.2f}, {np.max(sinrs):.2f}] dB")
+                    print(f"  SINR Mean:  {np.mean(sinrs):.2f} dB")
+                    print(f"  SINR Median: {np.median(sinrs):.2f} dB")
+                
+                # Check LOS percentage and K-factor for close UEs
+                los_count = 0
+                k_factors_close = []
+                for ue_idx, _, _ in close_ues:
+                    if ue_idx < len(serving_cells):
+                        serving_cell = serving_cells[ue_idx]
+                        for active_link in self.active_link_params:
+                            if active_link.uid == ue_idx and active_link.cid == serving_cell:
+                                if active_link.lsp_read_idx < len(self.link_params):
+                                    link = self.link_params[active_link.lsp_read_idx]
+                                    if link.los_ind:
+                                        los_count += 1
+                                    k_factors_close.append(link.k_factor)
+                                    break
+                
+                if len(k_factors_close) > 0:
+                    print(f"")
+                    print(f"  LOS percentage: {100*los_count/len(close_ues):.1f}% ({los_count}/{len(close_ues)})")
+                    print(f"  K-factor: Mean = {np.mean(k_factors_close):.2f} dB, Max = {np.max(k_factors_close):.2f} dB, Min = {np.min(k_factors_close):.2f} dB")
+                    
+                    print(f"")
+                    print(f"  === ANALYSIS: Why close UEs might not have very high SINR ===")
+                    print(f"  1. **CO-SITED INTERFERENCE** - Other sectors at same site are equally close")
+                    print(f"  2. Interference from neighboring cells (see 'CO-SITED vs OTHER-SITE' above)")
+                    print(f"  3. Interfering cells may also be close, reducing SIR")
+                    print(f"  4. Shadow fading variations (negative SF reduces signal)")
+                    print(f"  5. K-factor might be low even for close LOS links")
+                    print(f"  6. Small-scale fading effects captured in CIR")
+            print(f"{'='*100}\n")
+        else:
+            print(f"\n{'='*100}")
+            print(f"NO UEs within 50m of serving cell found")
+            print(f"{'='*100}\n")
         
         # Filter out invalid values
         valid_sir = sir_db[np.isfinite(sir_db)]
@@ -3653,8 +4978,26 @@ class H5ChannelAnalyzer:
             print(f"Number of PRBs: {self.sim_config.n_prb}")
             print(f"Run mode: {self.sim_config.run_mode}")
         
-        # Analyze SF and LOS/NLOS statistics
-        sf_los_stats = self.analyze_sf_and_los_statistics()
+        # Detect ISAC mode - affects what analyses are performed
+        is_isac_mode = self.isac_config and self.isac_config.is_enabled
+        if is_isac_mode:
+            print(f"\n{'='*60}")
+            print(f"ISAC SENSING MODE - LIMITED ANALYSIS")
+            print(f"{'='*60}")
+            print(f"  ISAC uses BS→ST→BS channels (not BS→UE)")
+            if self.calibration_phase == 2:
+                print(f"  Phase 2 {self.isac_channel_type} channel: Computing coupling loss, delay spread, angle spreads")
+                print(f"  Skipping: SIR/SINR, K-factor, PRB singular values")
+                print(f"  Note: Per 3GPP 38.901 Table 7.9.6.2-1, CDFs are generated separately for target/background channels")
+            else:
+                print(f"  Skipping: SIR/SINR, K-factor, PRB singular values, angle spreads")
+                print(f"  Computing: Coupling loss only (primary ISAC calibration metric)")
+            print(f"{'='*60}\n")
+        
+        # Analyze SF and LOS/NLOS statistics (skip for ISAC - no UE links)
+        sf_los_stats = None
+        if not is_isac_mode:
+            sf_los_stats = self.analyze_sf_and_los_statistics()
         
         # Create output directory
         output_path = Path(output_dir)
@@ -3684,25 +5027,39 @@ class H5ChannelAnalyzer:
         # Get scenario key for reference data matching
         scenario_key = None
         if self.reference_data and self.system_level_config and self.sim_config:
+            # For ISAC mode, use ISAC-specific scenario keys
             scenario_key = self.reference_data.get_scenario_key(
                 self.system_level_config.scenario,
-                self.sim_config.center_freq_hz / 1e9
+                self.sim_config.center_freq_hz / 1e9,
+                isac_config=self.isac_config,
+                isac_channel_type=self.isac_channel_type
             )
             if scenario_key:
                 logger.info(f"Using 3GPP reference data for scenario: {scenario_key}")
                 print(f"\n{'='*60}")
-                print(f"3GPP REFERENCE DATA: ENABLED (Phase {self.calibration_phase})")
-                print(f"{'='*60}")
-                print(f"Scenario key: {scenario_key}")
-                if self.calibration_phase == 1:
-                    print(f"Phase 1 metrics: coupling_loss, wideband_sir (SIR), geometry_sinr (SINR)")
+                if self.isac_config and self.isac_config.is_enabled:
+                    print(f"3GPP ISAC REFERENCE DATA: ENABLED (Phase {self.calibration_phase})")
+                    print(f"{'='*60}")
+                    print(f"ISAC scenario key: {scenario_key}")
+                    print(f"Target type: {self.isac_config.target_type_name}")
+                    print(f"Sensing mode: {'Monostatic' if self.isac_config.is_monostatic else 'Bistatic'}")
+                    print(f"Channel type: {self.isac_channel_type or 'auto-detected'}")
                 else:
-                    print(f"Phase 2 metrics: coupling_loss, wideband_sir, delay_spread, angle_spreads")
+                    print(f"3GPP REFERENCE DATA: ENABLED (Phase {self.calibration_phase})")
+                    print(f"{'='*60}")
+                    print(f"Scenario key: {scenario_key}")
+                if self.calibration_phase == 1:
+                    print(f"Phase 1 metrics: coupling_loss")
+                else:
+                    print(f"Phase 2 metrics: coupling_loss, delay_spread, angle_spreads")
                 print(f"Reference curves will be overlaid on relevant CDF plots.")
                 print(f"{'='*60}\n")
             else:
                 print(f"\n{'='*60}")
                 print(f"3GPP REFERENCE DATA: Not available for this scenario/frequency")
+                if self.isac_config and self.isac_config.is_enabled:
+                    print(f"ISAC mode detected but no matching reference data found.")
+                    print(f"Expected scenario key pattern: {self.isac_config.get_isac_scenario_key(self.sim_config.center_freq_hz / 1e9, self.isac_channel_type == 'background')}")
                 print(f"{'='*60}\n")
         else:
             print(f"\n{'='*60}")
@@ -3744,20 +5101,24 @@ class H5ChannelAnalyzer:
                 metric_name='Coupling Loss'
             )
         
-        # 2. Wideband SIR (single value)
-        sir_db = self.compute_wideband_sir()
-        print(f"\n=== WIDEBAND SIR (Before Receiver, No Noise) ===")
-        print(f"SIR: {sir_db:.2f} dB")
+        # 2. Wideband SIR (single value) - skip for ISAC (no UE links)
+        serving_assignments = {}
+        sir_sinr_results = {'SIR': [], 'SINR': [], 'noise_power_dbm': -92.0}
         
-        # Compute serving assignments once for efficiency (reused by SIR/SINR and angle spread analysis)
-        logger.info(f"Computing serving cell assignments using {association_method.upper()} method...")
-        serving_assignments = self._compute_serving_assignments(association_method)
-        logger.info(f"Serving assignments computed for {len(serving_assignments)} UEs")
-        
-        # 2a. SIR/SINR geometry analysis with CDFs
-        print(f"\n=== SIR/SINR ({association_method.upper()}) ===")
-        sir_sinr_results = self.compute_sir_sinr_geometry(center_freq_hz, association_method, serving_assignments)
-        if len(sir_sinr_results['SIR']) > 0:
+        if not is_isac_mode:
+            sir_db = self.compute_wideband_sir()
+            print(f"\n=== WIDEBAND SIR (Before Receiver, No Noise) ===")
+            print(f"SIR: {sir_db:.2f} dB")
+            
+            # Compute serving assignments once for efficiency (reused by SIR/SINR and angle spread analysis)
+            logger.info(f"Computing serving cell assignments using {association_method.upper()} method...")
+            serving_assignments = self._compute_serving_assignments(association_method)
+            logger.info(f"Serving assignments computed for {len(serving_assignments)} UEs")
+            
+            # 2a. SIR/SINR geometry analysis with CDFs
+            print(f"\n=== SIR/SINR ({association_method.upper()}) ===")
+            sir_sinr_results = self.compute_sir_sinr_geometry(center_freq_hz, association_method, serving_assignments)
+        if not is_isac_mode and len(sir_sinr_results['SIR']) > 0:
             print(f"SIR: Mean = {np.mean(sir_sinr_results['SIR']):.2f} dB, Std = {np.std(sir_sinr_results['SIR']):.2f} dB")
             print(f"SINR: Mean = {np.mean(sir_sinr_results['SINR']):.2f} dB, Std = {np.std(sir_sinr_results['SINR']):.2f} dB")
             print(f"Noise Power: {sir_sinr_results['noise_power_dbm']:.1f} dBm")
@@ -3838,9 +5199,20 @@ class H5ChannelAnalyzer:
                 metric_name='SINR'
             )
         
-        # 3. Delay and angle spreads CDFs (only for Phase 2)
-        if self.calibration_phase == 2:
-            spreads = self.analyze_delay_and_angle_spreads(association_method, serving_assignments)
+        # 3. Delay and angle spreads CDFs (Phase 2 only)
+        # Per 3GPP 38.901 Table 7.9.6.2-1 NOTE: "CDFs can be separately generated for target channel, background channel"
+        # For ISAC Phase 2: compute for BOTH target and background channels separately
+        should_compute_spreads = (
+            self.calibration_phase == 2 and 
+            (not is_isac_mode or (is_isac_mode and self.isac_channel_type in ['target', 'background']))
+        )
+        
+        if should_compute_spreads:
+            # Use ISAC-specific function for ISAC mode (analyzes all links, not just serving cell)
+            if is_isac_mode:
+                spreads = self.analyze_delay_and_angle_spreads_isac()
+            else:
+                spreads = self.analyze_delay_and_angle_spreads(association_method, serving_assignments)
             
             # Metric name mapping to reference JSON keys
             metric_map = {
@@ -3851,7 +5223,17 @@ class H5ChannelAnalyzer:
                 'ZSA': 'angle_spread_zsa'
             }
             
-            print(f"\n=== DELAY AND ANGLE SPREADS ({association_method.upper()}) ===")
+            # Set appropriate labels and suffixes based on mode
+            if is_isac_mode:
+                channel_label = f"ISAC {self.isac_channel_type.capitalize()} Channel"
+                print(f"\n=== DELAY AND ANGLE SPREADS ({channel_label}) ===")
+                association_suffix = f"_isac_{self.isac_channel_type}"
+                assoc_label = channel_label
+            else:
+                print(f"\n=== DELAY AND ANGLE SPREADS ({association_method.upper()}) ===")
+                association_suffix = f"_{association_method}"
+                assoc_label = association_method.upper()
+            
             for param_name, values in spreads.items():
                 if len(values) > 0:
                     print(f"{param_name}: Mean = {np.mean(values):.2f}, Std = {np.std(values):.2f}")
@@ -3873,10 +5255,8 @@ class H5ChannelAnalyzer:
                     
                     # Plot CDF with reference data
                     units = "ns" if param_name == "DS" else "degrees"
-                    association_suffix = f"_{association_method}"
-                    assoc_label = association_method.upper()
                     
-                    # Create clear title indicating association method and reference comparison
+                    # Create clear title indicating channel type and reference comparison
                     if ref_data:
                         title = f'CDF of {param_name} ({assoc_label}) vs 3GPP Reference'
                     else:
@@ -3891,12 +5271,24 @@ class H5ChannelAnalyzer:
                         reference_envelope=ref_envelope,
                         metric_name=param_name
                     )
+                else:
+                    print(f"{param_name}: No data collected")
+        elif is_isac_mode:
+            print(f"\n=== DELAY AND ANGLE SPREADS ===")
+            print(f"Skipped for ISAC {self.isac_channel_type} channel (unknown channel type or Phase 1)")
         else:
             print(f"\n=== DELAY AND ANGLE SPREADS ===")
             print("Skipped for Phase 1 calibration (not included in Phase 1 reference data)")
         
         # 4. PRB Singular Values CDFs
-        sv_results = self.compute_prb_singular_values()
+        # Not applicable for Phase 1 calibration (large-scale only).
+        # Also skip for ISAC (no BS→UE links).
+        if self.calibration_phase == 1:
+            print(f"\n=== PRB SINGULAR VALUES (t=0) ===")
+            print("Skipped for Phase 1 calibration (large-scale only)")
+            sv_results = {}
+        else:
+            sv_results = self.compute_prb_singular_values()
         
         print(f"\n=== PRB SINGULAR VALUES (t=0) ===")
         if sv_results:
@@ -4028,7 +5420,29 @@ def main():
             '  python analysis_channel_stats.py input.h5 --no-virtualization\n'
             '\n'
             '  # CIR-based with Phase 2 reference curves:\n'
-            '  python analysis_channel_stats.py input.h5 --assoc cir --reference-json 3gpp_calibration_phase2.json'
+            '  python analysis_channel_stats.py input.h5 --assoc cir --reference-json 3gpp_calibration_phase2.json\n'
+            '\n'
+            'ISAC Calibration Mode:\n'
+            '  For ISAC (Integrated Sensing and Communications) calibration, use:\n'
+            '  --isac-channel: Specify channel type for ISAC reference data lookup\n'
+            '                  Required for ISAC calibration, auto-detected from H5 file\n'
+            '    target:     Use target channel reference (TRPmo(t), TRP-TRP, etc.)\n'
+            '    background: Use background channel reference (TRPmo(b), TRP-TRP(b), etc.)\n'
+            '\n'
+            '  IMPORTANT: 3GPP calibrates target and background channels SEPARATELY.\n'
+            '  If combined mode (isac_disable_background=0), an error is thrown.\n'
+            '  Run with isac_disable_background=1 for target-only analysis.\n'
+            '\n'
+            'ISAC Example Usage:\n'
+            '  # ISAC Phase 1 (Large Scale) - target channel:\n'
+            '  python analysis_channel_stats.py isac_target.h5 \\\n'
+            '      --reference-json 3gpp_calibration_isac_uav_phase1.json \\\n'
+            '      --calibration-phase 1 --isac-channel target\n'
+            '\n'
+            '  # ISAC Phase 2 (Full) - background channel:\n'
+            '  python analysis_channel_stats.py isac_background.h5 \\\n'
+            '      --reference-json 3gpp_calibration_isac_uav_phase2.json \\\n'
+            '      --calibration-phase 2 --isac-channel background'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -4041,6 +5455,9 @@ def main():
                        help='3GPP calibration phase: 1 (coupling_loss, wideband_sir, geometry_sinr) or 2 (coupling_loss, wideband_sir, spreads) (default: 2)')
     parser.add_argument('--log-file', type=str,
                        help='Log file path (if not provided, logs to console only)')
+    parser.add_argument('--log-level', type=str, default='ERROR',
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help='Logging level (default: ERROR)')
     parser.add_argument('--assoc', type=str, default='rsrp', 
                        choices=['rsrp', 'cir', 'distance'],
                        help='Cell association method: rsrp (RSRP-based, default), cir (CIR power-based), or distance (minimal distance-based)')
@@ -4048,27 +5465,202 @@ def main():
                        help='Use antenna virtualization per ITU-R M.2101 (default: True)')
     parser.add_argument('--no-virtualization', dest='use_virtualization', action='store_false',
                        help='Disable antenna virtualization (use simple 10*log10(N) gain)')
+    parser.add_argument('--isac-channel', type=str, choices=['target', 'background'],
+                       help='ISAC channel type for reference data lookup. Required for ISAC calibration.')
+    parser.add_argument('--multi-seed', action='store_true',
+                       help='Enable multi-seed analysis: find all H5 files matching the base pattern with different seeds '
+                            '(e.g., file_seed10.h5, file_seed20.h5) and combine results for CDF analysis.')
     
     args = parser.parse_args()
     
     # Get association method from command line argument
     association_method = args.assoc
     calibration_phase = args.calibration_phase
+    isac_channel_type = args.isac_channel
     
     # Append association method and phase number to output directory if using default
     output_dir = args.output_dir
     if output_dir == 'channel_analysis_plots':
-        output_dir = f'channel_analysis_plots_{association_method}_phase{calibration_phase}'
+        if isac_channel_type:
+            output_dir = f'channel_analysis_plots_isac_{isac_channel_type}_phase{calibration_phase}'
+        else:
+            output_dir = f'channel_analysis_plots_{association_method}_phase{calibration_phase}'
         logger.info(f"Using phase and association-specific output directory: {output_dir}")
     
     # Set up logging based on command line arguments
-    setup_logging(log_file=args.log_file)
+    setup_logging(log_file=args.log_file, log_level=args.log_level)
     
-    # Initialize analyzer with optional reference data
-    analyzer = H5ChannelAnalyzer(args.h5_file, reference_json_path=args.reference_json, calibration_phase=calibration_phase)
+    # Multi-seed mode: find and combine multiple H5 files with different seeds
+    if args.multi_seed:
+        h5_files = find_multi_seed_files(args.h5_file)
+        if len(h5_files) > 1:
+            print(f"\n{'='*60}")
+            print(f"MULTI-SEED ANALYSIS MODE: {len(h5_files)} drops found")
+            print(f"{'='*60}")
+            for f in h5_files:
+                print(f"  - {f}")
+            print(f"{'='*60}\n")
+            
+            # Collect data from all files
+            all_coupling_losses = []
+            all_ds_values = []
+            all_asd_values = []
+            all_zsd_values = []
+            all_asa_values = []
+            all_zsa_values = []
+            first_analyzer = None
+            is_isac_mode = False
+            
+            for h5_file in h5_files:
+                print(f"Processing: {h5_file}")
+                temp_analyzer = H5ChannelAnalyzer(
+                    h5_file,
+                    reference_json_path=args.reference_json,
+                    calibration_phase=calibration_phase,
+                    isac_channel_type=isac_channel_type
+                )
+                temp_analyzer.parse_h5_file()
+                
+                # Store the first analyzer for config info
+                if first_analyzer is None:
+                    first_analyzer = temp_analyzer
+                    is_isac_mode = temp_analyzer.isac_config and temp_analyzer.isac_config.is_enabled
+                
+                # Collect coupling loss data
+                coupling_losses = temp_analyzer.compute_coupling_loss_serving_cells_only(args.use_virtualization)
+                all_coupling_losses.extend(coupling_losses.tolist())
+                
+                # For Phase 2, indicate if using CIR-based computation
+                if calibration_phase == 2 and is_isac_mode:
+                    print(f"  -> Collected {len(coupling_losses)} Phase 2 coupling loss samples (from CIR)")
+                else:
+                    print("  -> Collected " + str(len(coupling_losses)) + " coupling loss samples")
+                
+                # Collect delay/angle spreads for Phase 2
+                if calibration_phase == 2:
+                    if is_isac_mode:
+                        spreads = temp_analyzer.analyze_delay_and_angle_spreads_isac()
+                    else:
+                        spreads = temp_analyzer.analyze_delay_and_angle_spreads(association_method)
+                    
+                    if spreads['DS'] is not None and len(spreads['DS']) > 0:
+                        all_ds_values.extend(spreads['DS'].tolist())
+                    if spreads['ASD'] is not None and len(spreads['ASD']) > 0:
+                        all_asd_values.extend(spreads['ASD'].tolist())
+                    if spreads['ZSD'] is not None and len(spreads['ZSD']) > 0:
+                        all_zsd_values.extend(spreads['ZSD'].tolist())
+                    if spreads['ASA'] is not None and len(spreads['ASA']) > 0:
+                        all_asa_values.extend(spreads['ASA'].tolist())
+                    if spreads['ZSA'] is not None and len(spreads['ZSA']) > 0:
+                        all_zsa_values.extend(spreads['ZSA'].tolist())
+                    
+                    print(f"  -> Collected {len(spreads['DS'])} delay spread samples")
+                    print(f"  -> Collected {len(spreads['ASD'])} ASD, {len(spreads['ASA'])} ASA, {len(spreads['ZSD'])} ZSD, {len(spreads['ZSA'])} ZSA samples")
+            
+            # Update the first analyzer with combined data
+            print(f"\nTotal samples collected:")
+            print(f"  Coupling losses: {len(all_coupling_losses)}")
+            if calibration_phase == 2:
+                print(f"  Delay spreads: {len(all_ds_values)}")
+                print(f"  Angle spreads: ASD={len(all_asd_values)}, ZSD={len(all_zsd_values)}, ASA={len(all_asa_values)}, ZSA={len(all_zsa_values)}")
+            
+            # Create combined analyzer using first file's config but with multi-seed data
+            analyzer = first_analyzer
+            analyzer._multi_seed_coupling_losses = np.array(all_coupling_losses)
+            analyzer._multi_seed_spreads = {
+                'DS': np.array(all_ds_values),
+                'ASD': np.array(all_asd_values),
+                'ZSD': np.array(all_zsd_values),
+                'ASA': np.array(all_asa_values),
+                'ZSA': np.array(all_zsa_values)
+            }
+            analyzer._is_multi_seed = True
+            
+        else:
+            print("Multi-seed mode enabled but only 1 file found. Proceeding with single file.")
+            analyzer = H5ChannelAnalyzer(
+                args.h5_file, 
+                reference_json_path=args.reference_json, 
+                calibration_phase=calibration_phase,
+                isac_channel_type=isac_channel_type
+            )
+            analyzer.parse_h5_file()
+            analyzer._is_multi_seed = False
+    else:
+        # Standard single-file analysis
+        analyzer = H5ChannelAnalyzer(
+            args.h5_file, 
+            reference_json_path=args.reference_json, 
+            calibration_phase=calibration_phase,
+            isac_channel_type=isac_channel_type
+        )
+        analyzer.parse_h5_file()
+        analyzer._is_multi_seed = False
     
-    # Parse the H5 file
-    analyzer.parse_h5_file()
+    # ISAC mode validation
+    if analyzer.isac_config and analyzer.isac_config.is_enabled:
+        logger.info("=" * 60)
+        logger.info("ISAC MODE DETECTED")
+        logger.info("=" * 60)
+        logger.info(f"  Sensing mode: {'Monostatic' if analyzer.isac_config.is_monostatic else 'Bistatic'}")
+        logger.info(f"  Target type: {analyzer.isac_config.target_type_name}")
+        logger.info(f"  Number of STs: {analyzer.isac_config.n_st}")
+        logger.info(f"  RCS model: {analyzer.isac_config.st_rcs_model}")
+        logger.info(f"  Disable background: {analyzer.isac_config.isac_disable_background}")
+        logger.info(f"  Disable target: {analyzer.isac_config.isac_disable_target}")
+        
+        # Determine CIR mode
+        if analyzer.isac_config.is_target_only:
+            cir_mode = "target-only"
+        elif analyzer.isac_config.is_background_only:
+            cir_mode = "background-only"
+        else:
+            cir_mode = "combined"
+        logger.info(f"  CIR mode: {cir_mode}")
+        
+        # Check for combined mode - this is not supported for 3GPP calibration
+        if analyzer.isac_config.is_combined:
+            if args.reference_json:
+                logger.error("=" * 60)
+                logger.error("ERROR: ISAC COMBINED MODE NOT SUPPORTED FOR CALIBRATION")
+                logger.error("=" * 60)
+                logger.error("The H5 file contains combined target+background CIR data.")
+                logger.error("3GPP TR 38.901 Section 7.9.6 requires SEPARATE calibration for:")
+                logger.error("  - Target channel (coupling loss for target path)")
+                logger.error("  - Background channel (coupling loss for reference points)")
+                logger.error("")
+                logger.error("To fix this, choose ONE of the following:")
+                logger.error("  Option A (Target-only):")
+                logger.error("    1. Set 'isac_disable_background: 1' in your YAML config")
+                logger.error("    2. Re-run simulation to generate target-only CIR")
+                logger.error("    3. Analyze with: --isac-channel target")
+                logger.error("")
+                logger.error("  Option B (Background-only):")
+                logger.error("    1. Set 'isac_disable_target: 1' in your YAML config")
+                logger.error("    2. Re-run simulation to generate background-only CIR")
+                logger.error("    3. Analyze with: --isac-channel background")
+                logger.error("=" * 60)
+                raise ValueError("ISAC combined mode not supported for 3GPP calibration. "
+                               "Set isac_disable_background=1 OR isac_disable_target=1 in YAML config.")
+            else:
+                logger.warning("ISAC combined mode detected. No reference JSON provided, proceeding with analysis.")
+        
+        # Auto-detect channel type if not specified
+        if not isac_channel_type and args.reference_json:
+            if analyzer.isac_config.is_target_only:
+                isac_channel_type = 'target'
+                analyzer.isac_channel_type = 'target'
+                logger.info(f"Auto-detected ISAC channel type: target (background disabled)")
+            elif analyzer.isac_config.is_background_only:
+                isac_channel_type = 'background'
+                analyzer.isac_channel_type = 'background'
+                logger.info(f"Auto-detected ISAC channel type: background (target disabled)")
+            else:
+                logger.warning("Cannot auto-detect ISAC channel type for combined mode.")
+        
+        if isac_channel_type:
+            logger.info(f"  Reference lookup: {isac_channel_type} channel")
+        logger.info("=" * 60)
     
     # Log the cell association method being used
     logger.info(f"Using '{association_method}' cell association for analysis")

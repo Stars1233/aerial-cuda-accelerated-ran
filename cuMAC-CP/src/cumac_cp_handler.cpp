@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -132,7 +132,7 @@ void sched_slot_data::reset_slot_data(sfn_slot_t ss) {
 
     ss_sched = ss;
     if ((task = handler->task_ring->alloc()) == nullptr) {
-        NVLOGW_FMT(TAG, "SFN {}.{}: task process can't catch up with enqueue, drop slot", ss.u16.sfn, ss.u16.slot);
+        NVLOGW_FMT(TAG, "SFN {}.{} task process can't catch up with enqueue, drop slot", ss.u16.sfn, ss.u16.slot);
         return;
     }
 
@@ -177,7 +177,7 @@ cumac_cp_handler::~cumac_cp_handler() {
 int cumac_cp_handler::check_config_params()
 {
     memset(&group_params, 0, sizeof(group_params));
-    group_params.sigmaSqrd = 1.0;
+    group_params.sigmaSqrd = 1.0; // Default; per-TTI value is taken from SCH_TTI.request in on_sch_tti_request
 
     for (int cell_id = 0; cell_id < configs.cell_num; cell_id++)
     {
@@ -187,7 +187,7 @@ int cumac_cp_handler::check_config_params()
         group_params.nCell += 1;
         group_params.totNumCell += 1;
         group_params.nMaxSchdUePerRnd += cell.nMaxSchUePerCell;
-        group_params.nActiveUe += cell.nMaxActUePerCell;
+        group_params.nActiveUe += cell.nMaxActUePerCell; // group_params.nActiveUe is used for max buffer size calculation, not the real active UEs count.
 
         if (cell_id == 0)
         {
@@ -239,6 +239,8 @@ int cumac_cp_handler::check_config_params()
             CHECK_VALUE_EQUAL_ERR(group_params.mcsSelLutType, cell.mcsSelLutType);
             CHECK_VALUE_EQUAL_ERR(group_params.harqEnabledInd, cell.harqEnabledInd);
             CHECK_VALUE_EQUAL_ERR(group_params.mcsSelCqi, cell.mcsSelCqi);
+
+            CHECK_VALUE_EQUAL_ERR(cell_configs[0].blerTarget, cell.blerTarget);
         }
     }
 
@@ -257,7 +259,7 @@ int cumac_cp_handler::check_config_params()
         cumac_task *task = task_ring->get_buf_addr(i);
         if (task == nullptr)
         {
-            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "Error cumac_task ring lengh: i={} length={}", i, ring_len);
+            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "Error cumac_task ring length: i={} length={}", i, ring_len);
             return -1;
         }
 
@@ -442,7 +444,7 @@ int cumac_cp_handler::initiate_cumac_task(cumac_task *task)
 
     grpPrms->numUeSchdPerCellTTI = group_params.numUeSchdPerCellTTI;
     grpPrms->nUe = group_params.nUe;
-    grpPrms->nActiveUe = group_params.nActiveUe;
+    grpPrms->nActiveUe = group_params.nActiveUe; // nActiveUe can change per slot request
     grpPrms->nCell = group_params.nCell;
 
     grpPrms->nPrbGrp = group_params.nPrbGrp;
@@ -484,8 +486,8 @@ int cumac_cp_handler::initiate_cumac_task(cumac_task *task)
     malloc_cumac_buf(task, &grpPrms->cellAssoc, &buf_num.cellAssoc, group_params.nCell * group_params.nUe);
     malloc_cumac_buf(task, &grpPrms->cellAssocActUe, &buf_num.cellAssocActUe, group_params.nCell * group_params.nActiveUe);
 
-    CHECK_CUDA_ERR(cudaMemset(grpPrms->cellAssoc, 0, group_params.nCell * group_params.nUe));
-    CHECK_CUDA_ERR(cudaMemset(grpPrms->cellAssocActUe, 0, group_params.nCell * group_params.nActiveUe));
+    CHECK_CUDA_ERR(cudaMemset(grpPrms->cellAssoc, 0, static_cast<size_t>(group_params.nCell) * group_params.nUe));
+    CHECK_CUDA_ERR(cudaMemset(grpPrms->cellAssocActUe, 0, static_cast<size_t>(group_params.nCell) * group_params.nActiveUe));
 
     malloc_cumac_buf(task, &grpPrms->blerTargetActUe, &buf_num.blerTargetActUe, group_params.nActiveUe);
     CHECK_CUDA_ERR(cudaMemcpy(grpPrms->blerTargetActUe, blerTargetActUe, sizeof(float) * group_params.nActiveUe, cudaMemcpyHostToDevice));
@@ -592,22 +594,17 @@ void cumac_cp_handler::on_config_request(nv_ipc_msg_t& msg) {
     cfg = *reinterpret_cast<cumac_cell_configs_t*>(req->body);
 
     if (configured_cell_num == 0) {
-        // Allocate based on the cell config data, not group_params (which isn't set yet)
-        const std::size_t alloc_size = sizeof(float) * cfg.nMaxActUePerCell * cfg.nMaxCell;
-        blerTargetActUe = reinterpret_cast<float*>(malloc(alloc_size));
+        // Allocate blerTargetActUe for all cells when first cell config is received
+        const size_t blerTargetActUe_num = static_cast<size_t>(cfg.nMaxActUePerCell) * static_cast<size_t>(cfg.nMaxCell);
+        blerTargetActUe = reinterpret_cast<float*>(malloc(sizeof(float) * blerTargetActUe_num));
         if (blerTargetActUe == nullptr) {
-            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "{}: malloc failed for blerTargetActUe, size={}", __func__, alloc_size);
+            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "{}: malloc failed for blerTargetActUe, num={}", __func__, blerTargetActUe_num);
             return;
         }
+        for (size_t i = 0; i < blerTargetActUe_num; i++) {
+            blerTargetActUe[i] = cfg.blerTarget;
+        }
     }
-    
-    // Copy blerTargetActUe with bounds checking
-    if (blerTargetActUe == nullptr) {
-        NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "{}: blerTargetActUe is NULL for cell_id={}", __func__, msg.cell_id);
-        return;
-    }
-    
-    memcpy(blerTargetActUe + msg.cell_id * cfg.nMaxActUePerCell, req->body + sizeof(cumac_cell_configs_t), sizeof(float) * cfg.nMaxActUePerCell);
 
     NVLOGC_FMT(TAG, "{}: cell_id={} nMaxCell={} nMaxPrg={} nPrbPerPrg={} nMaxBsAnt={} nMaxUeAnt={} harqEnabledInd={}",
             __func__, msg.cell_id, cfg.nMaxCell, cfg.nMaxPrg, cfg.nPrbPerPrg, cfg.nMaxBsAnt, cfg.nMaxUeAnt, cfg.harqEnabledInd);
@@ -738,11 +735,14 @@ void cumac_cp_handler::on_sch_tti_request(nv_ipc_msg_t& msg, cumac_task* task)
 
     if (task == nullptr)
     {
-        NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "SFN {}.{}: cell_id={} task == nullptr", head.sfn, head.slot, cell_id);
+        NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "SFN {}.{} cell_id={} task == nullptr", head.sfn, head.slot, cell_id);
         return;
     }
 
     task->taskBitMask = req.taskBitMask;
+
+    task->grpPrms.sigmaSqrd = req.sigmaSqrd; // Use request value; no longer hardcoded to 1.0
+    task->grpPrms.nActiveUe += req.nActiveUe;
 
     struct cumacCellGrpPrms* grpPrms = &task->grpPrms;
     struct cumacCellGrpUeStatus* ueStatus = &task->ueStatus;
@@ -752,18 +752,20 @@ void cumac_cp_handler::on_sch_tti_request(nv_ipc_msg_t& msg, cumac_task* task)
 
     if (req.taskBitMask & 0x0F) // Check common parameters for the four 4T4R modules
     {
+        // Below parameter validations are for debugging
         CHECK_VALUE_EQUAL_ERR(cell_id, req.cellID);
-        CHECK_VALUE_EQUAL_ERR(grpPrms->numUeSchdPerCellTTI, cfg.nMaxSchUePerCell);
-        CHECK_VALUE_EQUAL_ERR(grpPrms->nUe, grpPrms->numUeSchdPerCellTTI * grpPrms->nCell);
-        CHECK_VALUE_EQUAL_ERR(grpPrms->nActiveUe, req.nActiveUe * grpPrms->nCell);
+        CHECK_VALUE_MAX_ERR(grpPrms->numUeSchdPerCellTTI, cfg.nMaxSchUePerCell);
+        CHECK_VALUE_MAX_ERR(grpPrms->nUe, grpPrms->numUeSchdPerCellTTI * grpPrms->nCell);
+        // CHECK_VALUE_EQUAL_ERR(grpPrms->nActiveUe, req.nActiveUe * grpPrms->nCell);
+        CHECK_VALUE_MAX_ERR(req.nActiveUe, cfg.nMaxActUePerCell);
         CHECK_VALUE_EQUAL_ERR(grpPrms->nCell, configs.cell_num);
 
-        CHECK_VALUE_EQUAL_ERR(grpPrms->nPrbGrp, group_params.nPrbGrp);
-        CHECK_VALUE_EQUAL_ERR(grpPrms->nBsAnt, req.nBsAnt);
-        CHECK_VALUE_EQUAL_ERR(grpPrms->nUeAnt, req.nUeAnt);
+        CHECK_VALUE_MAX_ERR(grpPrms->nPrbGrp, group_params.nPrbGrp);
+        CHECK_VALUE_MAX_ERR(grpPrms->nBsAnt, req.nBsAnt);
+        CHECK_VALUE_MAX_ERR(grpPrms->nUeAnt, req.nUeAnt);
         CHECK_VALUE_EQUAL_ERR(grpPrms->W, group_params.W);
 
-        CHECK_VALUE_EQUAL_ERR(grpPrms->sigmaSqrd, req.sigmaSqrd);
+        // CHECK_VALUE_EQUAL_ERR(grpPrms->sigmaSqrd, req.sigmaSqrd);
         // CHECK_VALUE_EQUAL_ERR(grpPrms->Pt_Rbg, 0);
         // CHECK_VALUE_EQUAL_ERR(grpPrms->Pt_rbgAnt, 0);
         CHECK_VALUE_EQUAL_ERR(grpPrms->precodingScheme, cfg.precoderType);
@@ -789,25 +791,27 @@ void cumac_cp_handler::on_sch_tti_request(nv_ipc_msg_t& msg, cumac_task* task)
     {
         if (task->run_in_cpu)
         {
-            // Populate cellAssocActUe buffer:
+            // Populate cellAssocActUe buffer: (Assume each cell has the same nActiveUe)
             // ue_id_offset = req.nActiveUe * cell_id
             // cell_offset = group_params.nActiveUe * cell_id
             // home_offset_for_cell_cellAssocActUe = cell_offset + ue_id_offset = (group_params.nActiveUe + req.nActiveUe ) * cell_id
-            memset(grpPrms->cellAssocActUe + (group_params.nActiveUe + req.nActiveUe) * cell_id, 1, req.nActiveUe);
+            uint32_t total_active_ue = group_params.nCell * req.nActiveUe;
+            memset(grpPrms->cellAssocActUe + (total_active_ue + req.nActiveUe) * cell_id, 1, req.nActiveUe);
             memset(grpPrms->cellAssoc + (group_params.numUeSchdPerCellTTI * group_params.nCell + group_params.numUeSchdPerCellTTI) * cell_id, 1, group_params.numUeSchdPerCellTTI);
         }
         else if (task->group_buf_enabled == 0)
         {
-            // Populate cellAssocActUe buffer:
+            // Populate cellAssocActUe buffer: (Assume each cell has the same nActiveUe)
             // ue_id_offset = req.nActiveUe * cell_id
             // cell_offset = group_params.nActiveUe * cell_id
             // home_offset_for_cell_cellAssocActUe = cell_offset + ue_id_offset = (group_params.nActiveUe + req.nActiveUe ) * cell_id
-            CHECK_CUDA_ERR(cudaMemsetAsync(grpPrms->cellAssocActUe + (group_params.nActiveUe + req.nActiveUe) * cell_id, 1, req.nActiveUe, task->strm));
+            uint32_t total_active_ue = group_params.nCell * req.nActiveUe;
+            CHECK_CUDA_ERR(cudaMemsetAsync(grpPrms->cellAssocActUe + (total_active_ue + req.nActiveUe) * cell_id, 1, req.nActiveUe, task->strm));
             CHECK_CUDA_ERR(cudaMemsetAsync(grpPrms->cellAssoc + (group_params.numUeSchdPerCellTTI * group_params.nCell + group_params.numUeSchdPerCellTTI) * cell_id, 1, group_params.numUeSchdPerCellTTI, task->strm));
         }
 
         task->data_num.cellId += 1;
-        task->data_num.cellAssocActUe += group_params.nActiveUe;
+        task->data_num.cellAssocActUe += group_params.nCell * req.nActiveUe; // Actual count this TTI, not configured max
         task->data_num.cellAssoc += group_params.nCell * group_params.numUeSchdPerCellTTI;
 
         uint32_t prgMsk_num = 0;
@@ -819,6 +823,11 @@ void cumac_cp_handler::on_sch_tti_request(nv_ipc_msg_t& msg, cumac_task* task)
         // Copy to a contiguous CPU buffer for later selection
         memcpy(task->input_avgRatesActUe + task->data_num.avgRatesActUe, src + req.offsets.avgRatesActUe, req.nActiveUe * sizeof(float));
         copy_from_ipc_buf(transp, msg, task, ueStatus->avgRatesActUe, "avgRatesActUe", req.offsets.avgRatesActUe, task->data_num.avgRatesActUe, req.nActiveUe);
+
+        if (task->debug_option & DBG_OPT_PRINT_NVIPC_BUF) // Dump IPC buffers
+        {
+            NVLOGI_FMT_ARRAY(TAG, "NVIPC_avgRatesActUe", reinterpret_cast<float*>(src + req.offsets.avgRatesActUe), req.nActiveUe);
+        }
     }
 
     if (req.taskBitMask & (0x1 << CUMAC_TASK_PRB_ALLOCATION)) // multiCellScheduler buffers
@@ -861,8 +870,8 @@ void cumac_cp_handler::on_sch_tti_request(nv_ipc_msg_t& msg, cumac_task* task)
         memcpy(&cell_desc->offsets, &req.offsets, sizeof(cumac_tti_req_buf_offsets_t));
     }
 
-    NVLOGI_FMT(TAG, "SFN {}.{}: RECV: SCH_TTI.req cell_id={} cellID={} ULDLSch={} nActiveUe={} nBsAnt={} nUeAnt={} group: nCell={} nActiveUe={} nUe={}",
-        head.sfn, head.slot, cell_id, req.cellID, req.ULDLSch, req.nActiveUe, req.nBsAnt, req.nUeAnt, grpPrms->nCell, grpPrms->nActiveUe, grpPrms->nActiveUe, grpPrms->nUe);
+    NVLOGI_FMT(TAG, "SFN {}.{} RECV: SCH_TTI.req cell_id={} cellID={} ULDLSch={} nActiveUe={} nBsAnt={} nUeAnt={} group: nCell={} nActiveUe={} nUe={}",
+        head.sfn, head.slot, cell_id, req.cellID, req.ULDLSch, req.nActiveUe, req.nBsAnt, req.nUeAnt, grpPrms->nCell, grpPrms->nActiveUe, grpPrms->nUe);
 }
 
 void cumac_cp_handler::print_cumac_cp_thrput(uint64_t slot_counter)
@@ -915,38 +924,67 @@ int cumac_cp_handler::send_sch_tti_response(cumac_task *task, int cell_id)
         return -1;
     }
 
+    // Get the request message header and payload
+    nv::phy_mac_msg_desc& req_msg = task->tti_reqs[cell_id];
+    cumac_sch_tti_req_t& req_head = *reinterpret_cast<cumac_sch_tti_req_t*>(req_msg.msg_buf);
+    cumac_tti_req_payload_t& req = req_head.payload;
+
     cumac_sch_tti_resp_t& resp = *cumac_init_msg_header<cumac_sch_tti_resp_t>(&msg, CUMAC_SCH_TTI_RESPONSE, cell_id);
     resp.sfn = task->ss.u16.sfn;
     resp.slot = task->ss.u16.slot;
 
+    // Per-cell slice length in setSchdUePerCellTTI / allocSol / layer / MCS buffers (nCell * nMaxSch from CONFIG)
+    const size_t nMaxSchUePerCell = static_cast<size_t>(task->grpPrms.numUeSchdPerCellTTI);
+
+    if ((task_mask & (0x1u << CUMAC_TASK_UE_SELECTION)) && task->output_setSchdUePerCellTTI != nullptr)
+    {
+        const uint16_t* row = task->output_setSchdUePerCellTTI + static_cast<size_t>(cell_id) * nMaxSchUePerCell;
+        uint32_t nActual = 0;
+        for (uint32_t i = 0; i < nMaxSchUePerCell; i++)
+        {
+            if (row[i] != 0xFFFFu)
+            {
+                nActual++;
+            }
+        }
+        resp.nUeSchd = static_cast<uint16_t>(nActual);
+    }
+    else
+    {
+        // UE selection not run or no CPU copy: keep prior max-slots semantics for L2
+        resp.nUeSchd = static_cast<uint16_t>(nMaxSchUePerCell);
+    }
+
     memset(&resp.offsets, INVALID_CUMAC_BUF_OFFSET, sizeof(resp.offsets));
 
-    uint32_t nUeSchd = task->grpPrms.numUeSchdPerCellTTI;
     uint32_t ipc_offset = 0;
 
     if (task_mask & (0x1 << CUMAC_TASK_UE_SELECTION)) // UE_SELECTION result
     {
-        uint32_t setSchdUePerCellTTI_offset = nUeSchd * cell_id;
-        transp.copy_to_data_buf(msg, ipc_offset, task->output_setSchdUePerCellTTI + setSchdUePerCellTTI_offset, sizeof(*task->output_setSchdUePerCellTTI) * nUeSchd);
+        size_t setSchdUePerCellTTI_offset = nMaxSchUePerCell * cell_id;
+        transp.copy_to_data_buf(msg, ipc_offset, task->output_setSchdUePerCellTTI + setSchdUePerCellTTI_offset, sizeof(*task->output_setSchdUePerCellTTI) * resp.nUeSchd);
         // Map L1 group ue_id to L2 per cell ue_id
         uint16_t *ue_id_buf = reinterpret_cast<uint16_t *>(reinterpret_cast<uint8_t *>(msg.data_buf) + ipc_offset);
         uint32_t ue_id_base = cell_id * task->grpPrms.nActiveUe / task->grpPrms.nCell;
-        for (uint32_t i = 0; i < nUeSchd; i++)
+        for (uint32_t i = 0; i < resp.nUeSchd; i++)
         {
-            *(ue_id_buf + i) -= ue_id_base;
+            if (ue_id_buf[i] != 0xFFFFu)
+            {
+                ue_id_buf[i] = static_cast<uint16_t>(ue_id_buf[i] - ue_id_base);
+            }
         }
         resp.offsets.setSchdUePerCellTTI = ipc_offset;
-        ipc_offset += nUeSchd * sizeof(*task->output_setSchdUePerCellTTI);
+        ipc_offset += resp.nUeSchd * sizeof(*task->output_setSchdUePerCellTTI);
         if (task->debug_option & DBG_OPT_PRINT_NVIPC_BUF) // Dump IPC buffers
         {
-            NVLOGI_FMT_ARRAY(TAG, "ARRAY setSchdUePerCellTTI", ue_id_buf, nUeSchd);
+            NVLOGI_FMT_ARRAY(TAG, "ARRAY setSchdUePerCellTTI", ue_id_buf, resp.nUeSchd);
         }
     }
 
     if (task_mask & (0x1 << CUMAC_TASK_PRB_ALLOCATION)) // PRB_ALLOCATION result
     {
-        uint32_t allocSol_num = cell_cfg.allocType == 1 ? 2 * nUeSchd : task->grpPrms.nPrbGrp;
-        uint32_t allocSol_offset = allocSol_num * cell_id;
+        uint32_t allocSol_num = cell_cfg.allocType == 1 ? 2 * resp.nUeSchd : task->grpPrms.nPrbGrp;
+        size_t allocSol_offset = cell_cfg.allocType == 1 ? 2 * static_cast<size_t>(nMaxSchUePerCell) * cell_id : static_cast<size_t>(task->grpPrms.nPrbGrp) * cell_id;
         transp.copy_to_data_buf(msg, ipc_offset, task->output_allocSol + allocSol_offset, sizeof(*task->output_allocSol) * allocSol_num);
         resp.offsets.allocSol = ipc_offset;
         ipc_offset += allocSol_num * sizeof(*task->output_allocSol);
@@ -954,18 +992,18 @@ int cumac_cp_handler::send_sch_tti_response(cumac_task *task, int cell_id)
 
     if (task_mask & (0x1 << CUMAC_TASK_LAYER_SELECTION)) // LAYER_SELECTION result
     {
-        uint32_t layerSelSol_offset = nUeSchd * cell_id;
-        transp.copy_to_data_buf(msg, ipc_offset, task->output_layerSelSol + layerSelSol_offset, sizeof(*task->output_layerSelSol) * nUeSchd);
+        size_t layerSelSol_offset = static_cast<size_t>(nMaxSchUePerCell) * cell_id;
+        transp.copy_to_data_buf(msg, ipc_offset, task->output_layerSelSol + layerSelSol_offset, sizeof(*task->output_layerSelSol) * resp.nUeSchd);
         resp.offsets.layerSelSol = ipc_offset;
-        ipc_offset += nUeSchd * sizeof(*task->output_layerSelSol);
+        ipc_offset += resp.nUeSchd * sizeof(*task->output_layerSelSol);
     }
 
     if (task_mask & (0x1 << CUMAC_TASK_MCS_SELECTION)) // MCS_SELECTION result
     {
-        uint32_t mcsSelSol_offset = nUeSchd * cell_id;
-        transp.copy_to_data_buf(msg, ipc_offset, task->output_mcsSelSol + mcsSelSol_offset, sizeof(*task->output_mcsSelSol) * nUeSchd);
+        size_t mcsSelSol_offset = static_cast<size_t>(nMaxSchUePerCell) * cell_id;
+        transp.copy_to_data_buf(msg, ipc_offset, task->output_mcsSelSol + mcsSelSol_offset, sizeof(*task->output_mcsSelSol) * resp.nUeSchd);
         resp.offsets.mcsSelSol = ipc_offset;
-        ipc_offset += nUeSchd * sizeof(*task->output_mcsSelSol);
+        ipc_offset += resp.nUeSchd * sizeof(*task->output_mcsSelSol);
     }
 
     if (task_mask & (0x1 << CUMAC_TASK_PFM_SORT)) // PFM_SORT result
@@ -977,8 +1015,8 @@ int cumac_cp_handler::send_sch_tti_response(cumac_task *task, int cell_id)
 
     msg.data_len = ipc_offset;
 
-    NVLOGI_FMT(TAG, "SFN {}.{}: SEND: SCH_TTI.resp cell_id={} msg_len={} data_len={} nUeSchd={} allocSol_offset={} layerSelSol_offset={} mcsSelSol_offset={} setSchdUePerCellTTI_offset={}",
-               resp.sfn, resp.slot, cell_id, msg.msg_len, msg.data_len, nUeSchd, resp.offsets.allocSol, resp.offsets.layerSelSol, resp.offsets.mcsSelSol, resp.offsets.setSchdUePerCellTTI);
+    NVLOGI_FMT(TAG, "SFN {}.{} SEND: SCH_TTI.resp cell_id={} msg_len={} data_len={} nActiveUe={} nMaxSchUePerCell={} nUeSchd={} allocSol_offset={} layerSelSol_offset={} mcsSelSol_offset={} setSchdUePerCellTTI_offset={}",
+               resp.sfn, resp.slot, cell_id, msg.msg_len, msg.data_len, task->grpPrms.nActiveUe, nMaxSchUePerCell, resp.nUeSchd, resp.offsets.allocSol, resp.offsets.layerSelSol, resp.offsets.mcsSelSol, resp.offsets.setSchdUePerCellTTI);
 
     transp.tx_send(msg);
     transp.notify(1);
@@ -1002,7 +1040,8 @@ void cumac_cp_handler::handle_slot_msg(nv::phy_mac_msg_desc &msg_desc, sfn_slot_
 
     if (configured_cell_num < configs.cell_num)
     {
-        NVLOGW_FMT(TAG, "SFN {}.{}: cell_id={} skip before all cells configured", ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, get_cumac_msg_name(msg_desc.msg_id));
+        NVLOGW_FMT(TAG, "SFN {}.{} cell_id={} msg_id=0x{:02X} {} skip before all cells configured",
+            ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, msg_desc.msg_id, get_cumac_msg_name(msg_desc.msg_id));
         transp.rx_release(msg_desc);
         return;
     }
@@ -1011,8 +1050,8 @@ void cumac_cp_handler::handle_slot_msg(nv::phy_mac_msg_desc &msg_desc, sfn_slot_
     if (ss_msg.u32 != slot_data.ss_sched.u32)
     {
         // This is the first message of a new slot, reset slot_data and cuda_task buffer
-        NVLOGI_FMT(TAG, "SFN {}.{} received: SFN {}.{} cell {} {} for new slot", slot_data.ss_sched.u16.sfn, slot_data.ss_sched.u16.slot,
-                   ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, get_cumac_msg_name(msg_desc.msg_id));
+        NVLOGI_FMT(TAG, "SFN {}.{} received: SFN {}.{} cell_id={} msg_id=0x{:02X} {} for new slot", slot_data.ss_sched.u16.sfn, slot_data.ss_sched.u16.slot,
+                   ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, msg_desc.msg_id, get_cumac_msg_name(msg_desc.msg_id));
         global_tick ++;
         slot_data.reset_slot_data(ss_msg);
         if (slot_data.task != nullptr)
@@ -1074,8 +1113,8 @@ void cumac_cp_handler::handle_slot_msg_reorder(nv::phy_mac_msg_desc& msg_desc, s
     sched_slot_data& slot_data = get_sched_slot_data(ss_msg);
     if (ss_msg.u32 != slot_data.ss_sched.u32) {
         // This is the first message of a new slot, reset slot_data and cuda_task buffer
-        NVLOGI_FMT(TAG, "SFN {}.{} received: SFN {}.{} cell {} {} for new slot", slot_data.ss_sched.u16.sfn, slot_data.ss_sched.u16.slot,
-                   ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, get_cumac_msg_name(msg_desc.msg_id));
+        NVLOGI_FMT(TAG, "SFN {}.{} received: SFN {}.{} cell_id={} msg_id=0x{:02X} {} for new slot", slot_data.ss_sched.u16.sfn, slot_data.ss_sched.u16.slot,
+                   ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, msg_desc.msg_id, get_cumac_msg_name(msg_desc.msg_id));
         slot_data.reset_slot_data(ss_msg);
         slot_data.task->ts_start = transport(msg_desc.cell_id).get_ts_send(msg_desc);
     }

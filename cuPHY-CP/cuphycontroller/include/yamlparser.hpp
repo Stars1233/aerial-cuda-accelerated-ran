@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,6 +76,7 @@
 #define YAML_PARAM_LOGLVL "log_level"
 
 #define YAML_PARAM_USE_GREEN_CONTEXTS "use_green_contexts"
+#define YAML_PARAM_USE_GC_WORKQUEUES "use_gc_workqueues"
 #define YAML_PARAM_USE_BATCHED_MEMCPY "use_batched_memcpy"
 #define YAML_PARAM_MPS_SM_PUSCH "mps_sm_pusch"
 #define YAML_PARAM_MPS_SM_PUCCH "mps_sm_pucch"
@@ -119,6 +120,9 @@
 #define YAML_PARAM_ENABLE_L1_PARAM_SANITY_CHECK "enable_l1_param_sanity_check"
 #define YAML_PARAM_ENABLE_CPU_TASK_TRACING "enable_cpu_task_tracing"
 #define YAML_PARAM_ENABLE_PREPARE_TRACING "enable_prepare_tracing"
+#define YAML_PARAM_CUPTI_ENABLE_TRACING "cupti_enable_tracing"
+#define YAML_PARAM_CUPTI_BUFFER_SIZE "cupti_buffer_size"
+#define YAML_PARAM_CUPTI_NUM_BUFFERS "cupti_num_buffers"
 #define YAML_PARAM_CQE_TRACER_CONFIG "cqe_tracer_config"
 #define YAML_PARAM_OK_TESTBENCH_CONFIG "ok_testbench_config"
 #define YAML_PARAM_DATA_CONFIG "data_config"
@@ -141,6 +145,9 @@
 #define YAML_PARAM_SENDCPLANE_ULBFW_BACKOFF_TH_NS "sendCPlane_ulbfw_backoff_th_ns"
 #define YAML_PARAM_SENDCPLANE_DLBFW_BACKOFF_TH_NS "sendCPlane_dlbfw_backoff_th_ns"
 #define YAML_PARAM_ENABLE_SRS "enable_srs" 
+#define YAML_PARAM_ENABLE_DL_CORE_AFFINITY "enable_dl_core_affinity"
+#define YAML_PARAM_DLC_CORE_PACKING_SCHEME "dlc_core_packing_scheme"
+#define YAML_PARAM_DLC_CORE_INDEX "dlc_core_index"
 #define YAML_PARAM_UE_MODE "ue_mode"
 #define YAML_PARAM_NOTIFY_UL_HARQ_BUFFER_RELEASE "notify_ul_harq_buffer_release"
 #define YAML_PARAM_DL_VALIDATION_WORKERS "workers_dl_validation"
@@ -269,6 +276,7 @@
 #define YAML_PARAM_CELL_LOWER_GUARD_BW "lower_guard_bw"
 #define YAML_PARAM_PUSCH_FORCE_NUM_CSI2_BITS "pusch_forcedNumCsi2Bits"
 #define YAML_PARAM_PUSCH_N_MAX_LDPC_HET_CONFIGS "pusch_nMaxLdpcHetConfigs"
+#define YAML_PARAM_PUSCH_N_MAX_TB_PER_NODE "pusch_nMaxTbPerNode"
 
 // Launch pattern keys
 #define YAML_LP_SLOTS "slots"
@@ -330,6 +338,7 @@ struct cuphydriver_config
     int pdump_client_thread;
     std::string dpdk_file_prefix;
     uint8_t  use_green_contexts;
+    uint8_t  use_gc_workqueues;
     uint8_t  use_batched_memcpy;
     uint32_t mps_sm_pusch;
     uint32_t mps_sm_pucch;
@@ -349,7 +358,7 @@ struct cuphydriver_config
     std::vector<uint8_t> workers_list_ul;
     std::vector<uint8_t> workers_list_dl;
     int16_t debug_worker;
-    int16_t datalake_core;
+    int16_t data_core;
     uint8_t datalake_db_write_enable;
     uint32_t datalake_samples;
     std::string datalake_address;
@@ -360,8 +369,8 @@ struct cuphydriver_config
     uint32_t num_rows_pusch;
     uint32_t num_rows_hest;
     uint8_t e3_agent_enabled;
-    uint16_t e3_pub_port;
     uint16_t e3_rep_port;
+    uint16_t e3_pub_port;
     uint16_t e3_sub_port;
     uint8_t datalake_drop_tables;
     std::vector<uint16_t> gpus_list;
@@ -387,6 +396,9 @@ struct cuphydriver_config
     uint8_t enable_l1_param_sanity_check;
     uint8_t enable_cpu_task_tracing;
     uint8_t enable_prepare_tracing;
+    uint8_t cupti_enable_tracing;
+    uint64_t cupti_buffer_size;
+    uint16_t cupti_num_buffers;
     uint8_t disable_empw;
     uint8_t enable_dl_cqe_tracing;
     uint64_t cqe_trace_cell_mask;
@@ -408,7 +420,10 @@ struct cuphydriver_config
     uint32_t sendCPlane_dlbfw_backoff_th_ns;
     uint16_t forcedNumCsi2Bits;
     uint32_t pusch_nMaxLdpcHetConfigs;
+    uint8_t pusch_nMaxTbPerNode;
     uint8_t enable_srs;
+    uint8_t enable_dl_core_affinity;
+    uint8_t dlc_core_packing_scheme;
     uint8_t ue_mode;
     std::vector<uint8_t> workers_dl_validation;
     uint8_t mCh_segment_proc_enable;
@@ -487,7 +502,7 @@ public:
     std::string& get_cuphydriver_dpdk_file_prefix();
     uint32_t& get_cuphydriver_workers_sched_priority();
     int16_t get_cuphydriver_debug_worker();
-    int16_t get_cuphydriver_datalake_core();
+    int16_t get_cuphydriver_data_core();
     uint32_t get_cuphydriver_datalake_samples();
     std::string& get_cuphydriver_datalake_address();
     std::string& get_cuphydriver_datalake_engine();
@@ -495,8 +510,8 @@ public:
     uint32_t get_cuphydriver_num_rows_pusch();
     uint32_t get_cuphydriver_num_rows_hest();
     uint8_t get_cuphydriver_e3_agent_enabled();
-    uint16_t get_cuphydriver_e3_pub_port();
     uint16_t get_cuphydriver_e3_rep_port();
+    uint16_t get_cuphydriver_e3_pub_port();
     uint16_t get_cuphydriver_e3_sub_port();
     uint8_t get_cuphydriver_datalake_drop_tables();
     uint8_t get_cuphydriver_datalake_store_failed_pdu();
@@ -519,6 +534,7 @@ public:
     uint32_t& get_cuphydriver_order_kernel_rx_pkts_timeout();
     uint8_t& get_cplane_disable();
     uint8_t&  get_cuphydriver_use_green_contexts();
+    uint8_t&  get_cuphydriver_use_gc_workqueues();
     uint8_t&  get_cuphydriver_use_batched_memcpy();
     uint32_t& get_cuphydriver_mps_sm_pusch();
     uint32_t& get_cuphydriver_mps_sm_pucch();
@@ -559,6 +575,9 @@ public:
     uint8_t get_cuphydriver_enable_l1_param_sanity_check()const;    
     uint8_t get_cuphydriver_enable_cpu_task_tracing() const;
     uint8_t get_cuphydriver_enable_prepare_tracing() const;
+    uint8_t get_cuphydriver_cupti_enable_tracing() const;
+    uint64_t get_cuphydriver_cupti_buffer_size() const;
+    uint16_t get_cuphydriver_cupti_num_buffers() const;
     uint8_t get_cuphydriver_disable_empw()const;
     uint8_t get_cuphydriver_enable_dl_cqe_tracing() const;
     uint64_t get_cuphydriver_cqe_trace_cell_mask()const;
@@ -580,7 +599,10 @@ public:
     std::vector<uint32_t>& get_cuphydriver_dl_wait_th();
     uint16_t get_cuphydriver_forcedNumCsi2Bits();
     uint32_t get_cuphydriver_pusch_nMaxLdpcHetConfigs();
+    uint8_t get_cuphydriver_pusch_nMaxTbPerNode();
     uint8_t& get_cuphydriver_enable_srs();
+    uint8_t& get_cuphydriver_enable_dl_core_affinity();
+    uint8_t& get_cuphydriver_dlc_core_packing_scheme();
     uint8_t& get_cuphydriver_ch_segment_proc_enable();
     uint8_t& get_pusch_aggr_per_ctx();
     uint8_t& get_prach_aggr_per_ctx();

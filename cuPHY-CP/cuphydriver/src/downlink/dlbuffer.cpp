@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,12 @@
 #include <typeinfo>
 #include <slot_command/slot_command.hpp>
 
+#ifdef ENABLE_32DL
+#define MAX_PDSCH_DL_LAYERS 32
+#else
+#define MAX_PDSCH_DL_LAYERS 16
+#endif
+
 DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_t _cell_id) :
     pdh(_pdh),
     gDev(_gDev),
@@ -48,7 +54,7 @@ DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_
                                         CUPHY_C_16F,
                                         CUPHY_N_TONES_PER_PRB * ORAN_MAX_PRB,
                                         OFDM_SYMBOLS_PER_SLOT,
-                                        MAX_DL_LAYERS, //cell_ptr->geteAxCNum(),
+                                        MAX_PDSCH_DL_LAYERS,
                                         cuphy::tensor_flags::align_tight
                                     );
 
@@ -77,7 +83,7 @@ DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_
     //Processing State Variables
     compression_is_queued = false;
     buffer_ready_gdr = gDev->newGDRbuf(1 * sizeof(uint32_t));
-    mf.addGpuPinnedSize(sizeof(uint32_t));
+    mf.addGpuPinnedSize(buffer_ready_gdr->size_alloc);
     resetProcessingState();
 
     //Reserving variables
@@ -253,7 +259,7 @@ cuphy::tensor_device* DLOutputBuffer::getTensor()
 //// COMPRESSION
 /////////////////////////////////////////////////////////////////////////////////////////
 
-int DLOutputBuffer::runCompression(compression_params &params, MpsCtx * mpsCtx, cudaStream_t stream)
+int DLOutputBuffer::runCompression(const std::array<compression_params, NUM_USER_DATA_COMPRESSION_METHODS>& cparams_array, MpsCtx * mpsCtx, cudaStream_t stream)
 {
     mpsCtx->setCtx();
 
@@ -263,7 +269,7 @@ int DLOutputBuffer::runCompression(compression_params &params, MpsCtx * mpsCtx, 
     }
     
 
-    launch_kernel_compression(stream, params);
+    launch_kernel_compression(stream, cparams_array);
    
     {
         MemtraceDisableScope md;

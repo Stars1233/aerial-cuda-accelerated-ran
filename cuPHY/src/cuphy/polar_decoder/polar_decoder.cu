@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -174,58 +174,67 @@ __device__ __forceinline__ T find_msb(T in)
 // if a and b are same sign, return +1, otherwise return -1
 __device__ __forceinline__ __half signof(__half x, __half y)
 {
-    if((__hgt(x, 0) && __hgt(y, 0)) || (__hlt(x, 0) && __hlt(y, 0)))
-        return __half{1};
-    else
-        return __half{-1};
+    const __half h0 = __float2half(0.f);
+    const bool same_sign = (__hgt(x, h0) == __hgt(y, h0));
+    return same_sign ? __float2half(1.f) : __float2half(-1.f);
 }
 
 // vectorized singof
 __device__ __forceinline__ __half2 signof2(__half2 a, __half2 b)
 {
-    __half2 x   = __half2{a.x, b.x};
-    __half2 y   = __half2{a.y, b.y};
-    __half2 z   = __half2{0, 0};
-    __half2 ret = __half2{-1, -1};
+    union Half2U {
+        __half2 h2;
+        uint32_t u32;
+    };
 
-    if(__hbgt2(x, z) || __hblt2(x, z))
-        ret.x = __half{1};
-    if(__hbgt2(y, z) || __hblt2(y, z))
-        ret.y = __half{1};
+    Half2U ua{a};
+    Half2U ub{b};
+    Half2U ur;
 
-    return ret;
+    // XOR the sign bits of a and b, then mask out everything except the sign bits
+    // Using XOR, if a and b have the same sign, corresponding sign bit is 0, otherwise it is 1
+    uint32_t sign_mask = (ua.u32 ^ ub.u32) & 0x80008000u;
+
+    // 0x3C00 = +1.0 in half, so 0x3C003C00 = {+1, +1} in half2
+    // XORing with sign_mask flips the sign bit per lane if signs differ
+    ur.u32 = 0x3C003C00u ^ sign_mask;
+
+    return ur.h2;
 }
 
 // to return type of polar tree node
 // type 0 => both child nodes are type 0 (for stage 0, it means frozen bits), no need to traverse the tree
 // type 1 => both child nodes are type 1 (for stage 0, it means info bits), no need to traverse the tree
 // type 3 => two child nodes are mix of type 0 and 1, traverse the tree as usual
-__device__ __forceinline__ uint8_t get_type(int32_t stage, int32_t n, int32_t sub_idx, uint8_t* treeTypes)
+__device__ __forceinline__ uint8_t get_type(int32_t stage, int32_t n, int32_t sub_idx, const uint8_t* __restrict__ treeTypes)
 {
-    int32_t node_idx = (1 << (n - stage)) + sub_idx;
-    return treeTypes[node_idx];
+    const int32_t node_idx = (1 << (n - stage)) + sub_idx;
+    return __ldg(&treeTypes[node_idx]);//treeTypes[node_idx];
 }
 
-// similar to get_type, but reading 8-values of uint8_t at a time
-__device__ __forceinline__ uint8x8 get_type8(int32_t stage, int32_t n, int32_t sub_idx, uint8x8* treeTypes)
+    // similar to get_type, but reading 8-values of uint8_t at a time
+__device__ __forceinline__ uint8x8 get_type8(int32_t stage, int32_t n, int32_t sub_idx, const uint8x8* __restrict__ treeTypes)
 {
-    int32_t node_idx = ((1 << (n - stage)) + sub_idx) / 8;
+    const int32_t node_idx = ((1 << (n - stage)) + sub_idx) / 8;
     uint8x8 type8;
-    type8.u64 = treeTypes[node_idx].u64;
+    type8.u64 = __ldg(&treeTypes[node_idx].u64);//treeTypes[node_idx].u64;
     return type8;
 }
 
-__device__ __forceinline__ void xor_butterfly(bool* cw, const int32_t stage, const int32_t sz)
+__device__ __forceinline__ void xor_butterfly(bool* __restrict__ cw, const int32_t stage, const int32_t sz)
 {
 #ifdef _DEBUG
     assert(sz == (1 << stage));
+    assert(blockDim.x == 32);
 #endif
     for(int32_t j = stage; j > 0; j--)
     {
         int32_t jumpSz = 1 << (j - 1);
+        int32_t mask = (jumpSz << 1) - 1;
         for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
         {
-            if((i % (2 * jumpSz)) < jumpSz)
+            //if((i % (2 * jumpSz)) < jumpSz)
+            if((i & mask) < jumpSz)
             {
                 bool& a = cw[i];
                 bool& b = cw[i + jumpSz];
@@ -236,12 +245,24 @@ __device__ __forceinline__ void xor_butterfly(bool* cw, const int32_t stage, con
     }
 }
 
-// F kernel: implementation of box-plus (min-sum) kernel
-// combine 2 arrays of length sz/2 and output an array of length sz/2
-__device__ __forceinline__ void F_kernel(__half* llrOut, __half* llrIn, int32_t sz)
+// Vectorized copy: assumes source and destination are 2-byte aligned and sz is even
+__device__ __forceinline__ void copy_est_from_cs(bool* __restrict__ est, const bool* __restrict__ cs, int32_t sz)
 {
-    __half* a = llrIn;      // first half input
-    __half* b = &llrIn[sz]; // second half input
+    auto est_w = reinterpret_cast<uint16_t*>(est);
+    auto cs_w  = reinterpret_cast<const uint16_t*>(cs);
+
+    for (int32_t i = threadIdx.x; i < sz / 2; i += blockDim.x)
+    {
+        est_w[i] = cs_w[i];
+    }
+}
+
+// F function: implementation of box-plus (min-sum)
+// combine 2 arrays of length sz/2 and output an array of length sz/2
+__device__ __forceinline__ void F_func(__half* __restrict__ llrOut, const __half* __restrict__ llrIn, int32_t sz)
+{
+    const __half* a = llrIn;      // first half input
+    const __half* b = &llrIn[sz]; // second half input
     if(sz == 1)
     {
         __half minAbs = __hlt(__habs(a[0]), __habs(b[0])) ? __habs(a[0]) : __habs(b[0]);
@@ -249,36 +270,57 @@ __device__ __forceinline__ void F_kernel(__half* llrOut, __half* llrIn, int32_t 
     }
     else
     {
-        for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
+        // reinterpret as half2 to vectorize processing
+        const __half2 *a2 = reinterpret_cast<const __half2*>(a);
+        const __half2 *b2 = reinterpret_cast<const __half2*>(b);
+        __half2 *o2 = reinterpret_cast<      __half2*>(llrOut);
+
+        for (int32_t i = threadIdx.x; i < (sz >> 1); i += blockDim.x)
         {
-            __half minAbs = __hlt(__habs(a[i]), __habs(b[i])) ? __habs(a[i]) : __habs(b[i]);
-            llrOut[i]      = __hmul(signof(a[i], b[i]), minAbs);
+            __half2 a2i = a2[i];
+            __half2 b2i = b2[i];
+
+#if __CUDA_ARCH__ >= 800
+            __half2 minAbs2 = __hmin2(__habs2(a2i), __habs2(b2i));
+#else
+            __half2 aAbs = __habs2(a2i);
+            __half2 bAbs = __habs2(b2i);
+            __half2 minAbs2;
+            minAbs2.x = __hlt(aAbs.x, bAbs.x) ? aAbs.x : bAbs.x;
+            minAbs2.y = __hlt(aAbs.y, bAbs.y) ? aAbs.y : bAbs.y;
+#endif
+
+            __half2 sign2   = signof2(a2i, b2i);
+
+            o2[i] = __hmul2(sign2, minAbs2);
         }
     }
 }
 
-// G kernel: implementation of repetition likelihood kernel
+// G function: implementation of repetition likelihood
 // combine 2 arrays of length sz/2 based on bit array Est0 and output an array of length sz/2
 // examine different variants impact on performance
-__device__ __forceinline__ void G_kernel(__half* llrOut, __half* llrIn, bool* est, int32_t sz)
+__device__ __forceinline__ void G_func(__half* __restrict__ llrOut, const __half* __restrict__ llrIn, const bool* __restrict__ est, int32_t sz)
 {
-    __half* a = llrIn;      // first half input
-    __half* b = &llrIn[sz]; // second half input
+    const __half* a = llrIn;      // first half input
+    const __half* b = &llrIn[sz]; // second half input
 
     for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
     {
-        __half u = static_cast<__half>(1 - 2 * est[i]); // u is +1 or -1
-        llrOut[i] = b[i] + __hmul(u, a[i]);
+        const __half ai = __ldg(a + i); //a[i]
+        const __half bi = __ldg(b + i); //b[i]
+        const __half u  = est[i] ? __float2half(-1.f) : __float2half(1.f);
+        llrOut[i] = __hfma(u, ai, bi);
     }
 }
 
-// H kernel: implementation of combining codewords in polar code
-// unlike kernel F and G, kernel H input/output arrays of hard decisions (bits)
+// H function: implementation of combining codewords in polar code
+// unlike F and G, H input/output arrays of hard decisions (bits)
 // combine 2 arrays of length sz/2 and output an array of length sz/2
 // examine bitwise storage instead of boolean
 // est_in0 : input from first child node, size sz/2
 // est_in1 : input from second child node, size sz/2
-__device__ __forceinline__ void H_kernel(bool* estOut, bool* estIn0, bool* estIn1, int32_t sz)
+__device__ __forceinline__ void H_func(bool* __restrict__ estOut, const bool* __restrict__ estIn0, const bool* __restrict__ estIn1, int32_t sz)
 {
     bool* out0 = estOut;      // output first m values
     bool* out1 = &estOut[sz]; // output second m values
@@ -297,9 +339,12 @@ __device__ __forceinline__ void H_kernel(bool* estOut, bool* estIn0, bool* estIn
     }
 }
 
-// bit-manipulation kernels ====================================================================
+// bit-manipulation functions ====================================================================
 
-__device__ __forceinline__ void xorBit(uint32_t* Z, int32_t n1, uint32_t g, int32_t n2)
+// `xorBit()` is a legacy/utility device helper that is not called by any shipped kernel path in
+// the polar decoder. No test can cover it through the public API. Exclude from coverage.
+/*VCAST_DONT_INSTRUMENT_START*/
+__device__ __forceinline__ void xorBit(uint32_t* __restrict__ Z, int32_t n1, uint32_t g, int32_t n2)
 {
     int32_t  wIdx = n1 / WORD_LENGTH;
     int32_t  bIdx = n1 % WORD_LENGTH;
@@ -319,8 +364,9 @@ __device__ __forceinline__ void xorBit(uint32_t* Z, int32_t n1, uint32_t g, int3
         Z[wIdx] = Z[wIdx] | (1 << bIdx);
     }
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
-__device__ __forceinline__ uint8_t isBitSet(const uint32_t* Z, int32_t idx)
+__device__ __forceinline__ uint8_t isBitSet(const uint32_t* __restrict__ Z, int32_t idx)
 {
     int32_t  wIdx  = idx / WORD_LENGTH;
     int32_t  bIdx  = idx % WORD_LENGTH;
@@ -352,6 +398,11 @@ __device__ __forceinline__ uint64_t isBitSet8(const uint32_t w32, uint32_t idx)
     return res.u64;
 }
 
+// This is a `__device__` template overload. The polar decoder uses the pointer overload
+// `setResetSingleBit(uint32_t* wrdArray, ...)` in all executed paths; this template overload is
+// not instantiated/executed in the instrumented kernels, so statement/branch coverage will show
+// it uncovered. Exclude from coverage unless a real call site is added.
+/*VCAST_DONT_INSTRUMENT_START*/
 template<typename T>
 __device__ __forceinline__ void setResetSingleBit(T& wrd, uint32_t idx, uint8_t val) {
 #ifdef _DEBUG
@@ -363,9 +414,10 @@ __device__ __forceinline__ void setResetSingleBit(T& wrd, uint32_t idx, uint8_t 
         wrd |= (1 << idx);
     }
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 // return a single 32-bit word starting from bitIdx in wrdArray
-__device__ __forceinline__ uint32_t getWord(const uint32_t * wrdArray, const uint32_t arrSize, const uint32_t bitIdx) {
+__device__ __forceinline__ uint32_t getWord(const uint32_t* __restrict__ wrdArray, const uint32_t arrSize, const uint32_t bitIdx) {
     uint32_t wIdx = bitIdx / WORD_LENGTH;
     uint32_t bIdx = bitIdx % WORD_LENGTH;
 
@@ -381,7 +433,7 @@ __device__ __forceinline__ uint32_t getWord(const uint32_t * wrdArray, const uin
 
 // sets bits bitIdx in wrdArray to val
 // (note there is no out of bound check)
-__device__ __forceinline__ void setResetSingleBit(uint32_t* wrdArray, uint32_t bitIdx, uint8_t val) {
+__device__ __forceinline__ void setResetSingleBit(uint32_t* __restrict__ wrdArray, uint32_t bitIdx, uint8_t val) {
     uint32_t wIdx = bitIdx / WORD_LENGTH;
     uint32_t bIdx = bitIdx % WORD_LENGTH;
 
@@ -393,7 +445,7 @@ __device__ __forceinline__ void setResetSingleBit(uint32_t* wrdArray, uint32_t b
 }
 
 // reset sz bits in wrdArray starting from bitIdx
-__device__ __forceinline__ void resetBits(uint32_t* wrdArray, uint32_t bitIdx, uint32_t sz)
+__device__ __forceinline__ void resetBits(uint32_t* __restrict__ wrdArray, uint32_t bitIdx, uint32_t sz)
 {
     uint32_t  wIdx  = bitIdx / WORD_LENGTH;
     uint32_t  bIdx  = bitIdx % WORD_LENGTH;
@@ -439,8 +491,8 @@ __device__ __forceinline__ void resetBits(uint32_t* wrdArray, uint32_t bitIdx, u
 
 // Bits are copied to Dst array, starting from bitIdxDst
 // note: start index for Src is always 0, for general case,
-// we need to implement an approach similar to that used in xorBits kernel
-__device__ __forceinline__ void copyBits(const uint32_t* Src, uint32_t sz, uint32_t* Dst, uint32_t bitIdxDst)
+// we need to implement an approach similar to that used in xorBits function
+__device__ __forceinline__ void copyBits(const uint32_t* __restrict__ Src, uint32_t sz, uint32_t* __restrict__ Dst, uint32_t bitIdxDst)
 {
     uint32_t wrd     = Src[0];
 
@@ -506,9 +558,9 @@ __device__ __forceinline__ void copyBits(const uint32_t* Src, uint32_t sz, uint3
 
 // Start indices for sources can be different, they can also be different from destination start index
 // sz bits from two sources are XORed and stored in Dst
-__device__ __forceinline__ void xorBits(const uint32_t* Src0, uint32_t srcBitIdx0, uint32_t Src0size,
-                                        const uint32_t* Src1, uint32_t srcBitIdx1, uint32_t Src1size,
-                                        uint32_t* Dst, uint32_t bitIdxDst, uint32_t sz)
+__device__ __forceinline__ void xorBits(const uint32_t* __restrict__ Src0, uint32_t srcBitIdx0, uint32_t Src0size,
+                                        const uint32_t* __restrict__ Src1, uint32_t srcBitIdx1, uint32_t Src1size,
+                                        uint32_t* __restrict__ Dst, uint32_t bitIdxDst, uint32_t sz)
 {
     uint32_t wIdx_s0  = srcBitIdx0 / WORD_LENGTH;
     uint32_t bIdx_s0  = srcBitIdx0 % WORD_LENGTH;
@@ -517,6 +569,7 @@ __device__ __forceinline__ void xorBits(const uint32_t* Src0, uint32_t srcBitIdx
 
     uint32_t wrd0, wrd0_0, wrd0_1;
     wrd0 = wrd0_0 = Src0[wIdx_s0];
+
     if (bIdx_s0 > 0) {
         wrd0_1 = (wIdx_s0 + 1) < Src0size ? Src0[wIdx_s0 + 1] : 0;
         wrd0   = __funnelshift_rc(wrd0_0, wrd0_1, bIdx_s0);
@@ -525,11 +578,14 @@ __device__ __forceinline__ void xorBits(const uint32_t* Src0, uint32_t srcBitIdx
 
     uint32_t wrd1, wrd1_0, wrd1_1;
     wrd1 = wrd1_0 = Src1[wIdx_s1];
+    // passes srcBitIdx1 = 0, bIdx_s1 is always 0
+    /*VCAST_DONT_INSTRUMENT_START*/
     if (bIdx_s1 > 0) {
         wrd1_1 = (wIdx_s1 + 1) < Src1size ? Src1[wIdx_s1 + 1] : 0;
         wrd1   = __funnelshift_rc(wrd1_0, wrd1_1, bIdx_s1);
         wrd1_0 = wrd1_1;
     }
+    /*VCAST_DONT_INSTRUMENT_END*/
 
     uint32_t wIdx_d  = bitIdxDst / WORD_LENGTH;
     uint32_t bIdx_d  = bitIdxDst % WORD_LENGTH;
@@ -576,7 +632,11 @@ __device__ __forceinline__ void xorBits(const uint32_t* Src0, uint32_t srcBitIdx
         uint32_t wrd_nxt;
         for (uint32_t i = 0; i < numMidWords; i++) {
             // extract wrd_next, but first need to extract wrd0 and wrd1
+
+            /*VCAST_DONT_INSTRUMENT_START*/
             if (bIdx_s0 == 0) {
+                // `wrd0` already contains the first extracted 32-bit chunk (starting at `srcBitIdx0`).
+                // For mid-word i, load the next source word (+1) and then advance by i.
                 wrd0 = Src0[wIdx_s0 + 1 + i];
             } else {
                 wrd0_1 = (wIdx_s0 + 2 + i) < Src0size ? Src0[wIdx_s0 + 2 + i] : 0;
@@ -587,10 +647,16 @@ __device__ __forceinline__ void xorBits(const uint32_t* Src0, uint32_t srcBitIdx
             if (bIdx_s1 == 0) {
                 wrd1 = Src1[wIdx_s1 + 1 + i];
             } else {
+                // Unaligned: build the aligned 32-bit chunk at bit offset `bIdx_s1` from the 2-word window
+                // (`wrd1_0` = previous upper word, `wrd1_1` = newly loaded lower word). `+2` because the
+                // initial extraction already consumed `Src1[wIdx_s1]`/`Src1[wIdx_s1 + 1]`.]
+                // Extract the next aligned 32-bit chunk across (`wrd1_0`, `wrd1_1`).
+                // Advance the sliding 32-bit window for the next iteration.
                 wrd1_1 = (wIdx_s1 + 2 + i) < Src1size ? Src1[wIdx_s1 + 2 + i] : 0;
                 wrd1 = __funnelshift_rc(wrd1_0, wrd1_1, bIdx_s1);
                 wrd1_0 = wrd1_1;
             }
+            /*VCAST_DONT_INSTRUMENT_END*/
 
             wrd_nxt = wrd0 ^ wrd1;
 
@@ -610,10 +676,10 @@ __device__ __forceinline__ void xorBits(const uint32_t* Src0, uint32_t srcBitIdx
 }
 
 //======================================================================================================================
-// CRC kernels
+// CRC functions
 
 #ifdef ENABLE_DEBUG
-__device__ __forceinline__ uint32_t ComputeCRC8Basic(uint8_t* bytes, int nBytes, uint32_t poly)
+__device__ __forceinline__ uint32_t ComputeCRC8Basic(const uint8_t* __restrict__ bytes, int nBytes, uint32_t poly)
 {
     uint32_t crc = 0; // start with 0 so the first byte can be 'xor'ed
 
@@ -638,7 +704,7 @@ __device__ __forceinline__ uint32_t ComputeCRC8Basic(uint8_t* bytes, int nBytes,
     return crc;
 }
 
-__device__ __forceinline__ uint32_t ComputeCRC16Basic(uint8_t* bytes, int nBytes, uint32_t poly)
+__device__ __forceinline__ uint32_t ComputeCRC16Basic(const uint8_t* __restrict__ bytes, int nBytes, uint32_t poly)
 {
     uint32_t crc = 0; // start with 0 so first byte can be 'xored' in
 
@@ -704,7 +770,7 @@ __device__ __forceinline__ void printCRC16table(uint32_t poly)
 }
 #endif
 
-__device__ __forceinline__ uint8_t ComputeCRC8LUT(uint8_t* bytes, int nBytes)
+__device__ __forceinline__ uint8_t ComputeCRC8LUT(const uint8_t* __restrict__ bytes, int nBytes)
 {
     uint8_t crc = 0; // start with 0 so the first byte can be 'xor'ed
 
@@ -717,7 +783,7 @@ __device__ __forceinline__ uint8_t ComputeCRC8LUT(uint8_t* bytes, int nBytes)
     return crc;
 }
 
-__device__ __forceinline__ uint16_t ComputeCRC16LUT(uint8_t* bytes, int nBytes)
+__device__ __forceinline__ uint16_t ComputeCRC16LUT(const uint8_t* __restrict__ bytes, int nBytes)
 {
     uint16_t crc = 0; // start with 0 so first byte can be 'xored' in
 
@@ -732,7 +798,7 @@ __device__ __forceinline__ uint16_t ComputeCRC16LUT(uint8_t* bytes, int nBytes)
 }
 
 // verify CRC
-__device__ __forceinline__ bool validate_crc(const uint8_t nCrcBits, const uint32_t* X, const uint16_t nPayloadBits, uint32_t* sharedBuf)
+__device__ __forceinline__ bool validate_crc(const uint8_t nCrcBits, const uint32_t* __restrict__ X, const uint16_t nPayloadBits, uint32_t* __restrict__ sharedBuf)
 {
     uint32_t maskCrc = 0;
     if(nCrcBits == 11)
@@ -773,7 +839,7 @@ __device__ __forceinline__ bool validate_crc(const uint8_t nCrcBits, const uint3
 }
 
 // append received CRC bits to info bits, then verify CRC correctness
-__device__ __forceinline__ uint8_t append_and_validate_crc(const uint32_t receivedCrc, const uint8_t nCrcBits, const uint32_t* X, const uint16_t nPayloadBits)
+__device__ __forceinline__ uint8_t append_and_validate_crc(const uint32_t receivedCrc, const uint8_t nCrcBits, const uint32_t* __restrict__ X, const uint16_t nPayloadBits)
 {
     uint32_t maskCrc = 0;
     if(nCrcBits == 11)
@@ -842,7 +908,7 @@ __device__ __forceinline__ void updateCRCstatus(polarDecoderDynDescr_t* pDynDesc
 
 //======================================================================================================================
 
-__device__ __forceinline__ void updateUciSegEstForTwoCbsInUciSeg(polarDecoderDynDescr_t* pDynDescr, uint16_t A_cw, uint32_t* cbEst, const uint32_t BLOCK_IDX)
+__device__ __forceinline__ void updateUciSegEstForTwoCbsInUciSeg(polarDecoderDynDescr_t* __restrict__ pDynDescr, uint16_t A_cw, uint32_t* __restrict__ cbEst, const uint32_t BLOCK_IDX)
 {
     uint8_t   cbIdxWithinUciSeg = pDynDescr->pCwPrmsGpu[BLOCK_IDX].cbIdxWithinUciSeg;
     uint8_t   zeroInsertFlag    = pDynDescr->pCwPrmsGpu[BLOCK_IDX].zeroInsertFlag;
@@ -930,7 +996,6 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
 {
     const uint32_t BLOCK_IDX = blockIdx.x;
 
-
     uint16_t N_cw     = pDynDescr->pCwPrmsGpu[BLOCK_IDX].N_cw;
     uint8_t  nCrcBits = pDynDescr->pCwPrmsGpu[BLOCK_IDX].nCrcBits;
     uint16_t A_cw     = pDynDescr->pCwPrmsGpu[BLOCK_IDX].A_cw;
@@ -968,7 +1033,7 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
 
     // Initialize ==========================================================================
     int32_t sz;               // length of sub-array in cwTreeLLR
-    int32_t& idx = sz;              // used for retrieving start index of sub-array in cwTreeLLR
+    int32_t& idx = sz;        // used for retrieving start index of sub-array in cwTreeLLR; aliasing with sz is by design
     int32_t stage     = n_cw; // stage variable
     uint8_t type      = 10;   // decoding type used to simplify in pruned tree
     int32_t subIdx    = 0;    // index used to retrieve node id in get_type()
@@ -983,11 +1048,11 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         sz = 1 << stage;
         auto* in  = &cwTreeLLR[idx + sz];
         auto* out = &cwTreeLLR[idx];
-        F_kernel(out, in, sz);
+        F_func(out, in, sz);
         __syncthreads();
 #ifdef ENABLE_DEBUG
         if (threadIdx.x == 0) {
-            printf("F kernel ----------------- stage %d, size %d, idx %d, type %d ------------------\n", stage, sz, idx, get_type(stage, n_cw, subIdx, treeTypes));
+            printf("F function ----------------- stage %d, size %d, idx %d, type %d ------------------\n", stage, sz, idx, get_type(stage, n_cw, subIdx, treeTypes));
             printf("in1: ");
             for (int i = 0; i < sz; i++) {
                 printf("%6.1f ", __half2float(in[i]));
@@ -1024,7 +1089,7 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
 
         // at this point, type is either 0 or 1
 #ifdef _DEBUG
-        assert(type < 10);
+        assert(type < 3);
 #endif
         if(type == 0)
         {
@@ -1115,17 +1180,17 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         bitIdx += sz;
         if(bitIdx == (N_cw - 1)) break;
 
-        // use H kernel to combine codeword estimates all the way up to stage_idx
+        // use H function to combine codeword estimates all the way up to stage_idx
         int32_t stage_idx   = POLAR_DEPTH[bitIdx];
         int32_t temp_H_cntr = 0;
         while(stage < stage_idx)
         {
             sz = 1 << stage;
-            auto* in_0 = &cs_est[idx - 1]; // in0 is always read from cwEst
+            auto* in_0 = &cs_est[idx]; // in0 is always read from cwEst
             // in1 and cs keep switching. Initially, in1 is read from cs_buffer_b
             auto* in_1 = temp_H_cntr % 2 ? cs_buffer_b : cs_buffer_a;
             cs         = temp_H_cntr % 2 ? cs_buffer_a : cs_buffer_b;
-            H_kernel(cs, in_0, in_1, sz);
+            H_func(cs, in_0, in_1, sz);
             __syncthreads();
 
             temp_H_cntr++;
@@ -1133,14 +1198,14 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
             subIdx /= 2;
         }
 
-        // use G kernel with new codeword for stage_idx to update LLRs of the sibling branch
+        // use G function with new codeword for stage_idx to update LLRs of the sibling branch
         sz = 1 << stage;
         subIdx++;
-        G_kernel(&cwTreeLLR[idx], &cwTreeLLR[idx + sz], cs, sz);
+        G_func(&cwTreeLLR[idx], &cwTreeLLR[idx + sz], cs, sz);
         __syncthreads();
 
         type = get_type(stage, n_cw, subIdx, treeTypes);
-        // use F kernel to propagate updated LLRs up to stage 0 (next bit at leaf node)
+        // use F function to propagate updated LLRs up to stage 0 (next bit at leaf node)
         while(stage > -1)
         {
             if(type != 3)
@@ -1153,23 +1218,21 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
             sz = 1 << stage;
             auto* in  = &cwTreeLLR[idx + sz];
             auto* out = &cwTreeLLR[idx];
-            F_kernel(out, in, sz);
+            F_func(out, in, sz);
             __syncthreads();
         }
 
         // store stage_idx codeword estimate
         sz = 1 << stage_idx;
-        auto est = &cs_est[idx - 1];
+        auto est = &cs_est[idx];
         if(sz == 1)
         {
             est[0] = cs[0];
         }
         else
         {
-            for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
-            {
-                est[i] = cs[i];
-            }
+            // Vectorized copy: assumes est and cs are 2-byte aligned and sz is even
+            copy_est_from_cs(est, cs, sz);
         }
         __syncthreads();
     }
@@ -1222,18 +1285,21 @@ polarDecoderKernel(polarDecoderDynDescr_t* pDynDescr)
 
 //**********************************************************************************************//
 //                                                                                              //
-//                      List Polar Decoder Kernels & Utility Functions                          //
+//                      List Polar Decoder & Utility Functions                                  //
 //                                                                                              //
 //**********************************************************************************************//
 
-// merge sort kernels ===================================================================================
+// merge sort functions ==========================================================================
 
 //ToDo add epsilon for float comparison?
 template<uint SORT_DIR>
-__forceinline__ __device__ uint binarySearchInclusive(__half val, __half *data, uint L, uint stride) {
+__forceinline__ __device__ uint binarySearchInclusive(__half val, const __half* __restrict__ data, uint L, uint stride) {
+    // loop starts with stride = 1
+    /*VCAST_DONT_INSTRUMENT_START*/
     if (L == 0) {
         return 0;
     }
+    /*VCAST_DONT_INSTRUMENT_END*/
 
     uint pos = 0;
 
@@ -1249,10 +1315,13 @@ __forceinline__ __device__ uint binarySearchInclusive(__half val, __half *data, 
 }
 
 template<uint SORT_DIR>
-__forceinline__ __device__ uint binarySearchExclusive(__half val, __half *data, uint L, uint stride) {
+__forceinline__ __device__ uint binarySearchExclusive(__half val, const __half* __restrict__ data, uint L, uint stride) {
+    // loop starts with stride = 1
+    /*VCAST_DONT_INSTRUMENT_START*/
     if (L == 0) {
         return 0;
     }
+    /*VCAST_DONT_INSTRUMENT_END*/
 
     uint pos = 0;
 
@@ -1269,7 +1338,7 @@ __forceinline__ __device__ uint binarySearchExclusive(__half val, __half *data, 
 
 // block-level merge sort (binary search-based)
 template<uint32_t LIST_SZ, uint32_t ITEM_PER_THRD, uint32_t SORT_DIR>
-__forceinline__ __device__ void mergeSortSharedKernel(__half* key, uint32_t* val, const thread_group& grp, __half* s_key) {
+__forceinline__ __device__ void mergeSortShared(__half* __restrict__ key, uint32_t* __restrict__ val, const thread_group& grp, __half* __restrict__ s_key) {
     constexpr uint32_t arrayLength = LIST_SZ * ITEM_PER_THRD;
     //__shared__ __half s_key[arrayLength];
     __shared__ uint32_t  s_val[arrayLength];
@@ -1328,8 +1397,8 @@ __forceinline__ __device__ void mergeSortSharedKernel(__half* key, uint32_t* val
 // For each path function decodes R0 codeword and updates path metric
 template<uint32_t TILE_SIZE>
 __device__ __forceinline__ void
-R0_decoder(int16_t* pathPrime, __half* pathMetric, uint32_t* csBitWords, const int stage, const int num_path,
-           const __half* cwLLR, const int N, const thread_block_tile<TILE_SIZE>& tile)
+R0_decoder(int16_t* __restrict__ pathPrime, __half* __restrict__ pathMetric, uint32_t* __restrict__ csBitWords, const int stage, const int num_path,
+           const __half* __restrict__ cwLLR, const int N, const thread_block_tile<TILE_SIZE>& tile)
 {
     int tile_rank = tile.meta_group_rank();
     if(tile_rank < num_path)
@@ -1351,8 +1420,8 @@ R0_decoder(int16_t* pathPrime, __half* pathMetric, uint32_t* csBitWords, const i
 
 template<int32_t LIST_SZ = 8>
 __device__ __forceinline__ void
-R1_S0_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t * csBitWords,
-              int &num_path, const __half *cwLLR, const int N, const thread_group& grp) {
+R1_S0_decoder(int16_t* __restrict__ pathPrime, __half* __restrict__ pathMetric, uint32_t* __restrict__ csBitWords,
+              int &num_path, const __half* __restrict__ cwLLR, const int N, const thread_group& grp) {
     int      tid               = grp.thread_rank();
     __half   childrenPm[2]    = {-HFLT_MAX, -HFLT_MAX};
     uint32_t childrenIds[2];
@@ -1369,7 +1438,7 @@ R1_S0_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t * csBitWords,
         }
     }
 
-    // shared memory used in transpose operation and merge-sort kernel
+    // shared memory used in transpose operation and merge-sort function
     __shared__ __half temp[2 * LIST_SZ];
     // first we need to rearrange registers as following
     // [t0,0 t0,1]          [t0,0 t1,0]
@@ -1414,7 +1483,7 @@ R1_S0_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t * csBitWords,
 
         auto tile = tiled_partition<LIST_SZ>(this_thread_block());
         if (tile.meta_group_rank() == 0) {
-            mergeSortSharedKernel<LIST_SZ, 2, 0>(childrenPm, childrenIds, tile, temp);
+            mergeSortShared<LIST_SZ, 2, 0>(childrenPm, childrenIds, tile, temp);
         }
 
         if (LIST_SZ >= 2) {
@@ -1427,11 +1496,14 @@ R1_S0_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t * csBitWords,
                 pathMetric[2 * tid + 1] = childrenPm[1];
             }
         } else {
+            // When nPolLists == 1, cuPHY selects the non-list kernel (polarDecoderKernel)
+            /*VCAST_DONT_INSTRUMENT_START*/
             if (tid == 0) {
                 pathPrime[0] = childrenIds[0] % LIST_SZ;
                 setResetSingleBit(csBitWords, 0, childrenIds[0] / LIST_SZ);
                 pathMetric[0] = childrenPm[0];
             }
+            /*VCAST_DONT_INSTRUMENT_END*/
         }
     }
 }
@@ -1443,8 +1515,8 @@ R1_S0_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t * csBitWords,
 // 4) If nChildren > L, the L best are kept
 template<int32_t LIST_SZ = 8>
 __device__ __forceinline__ void
-R1_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t* csBitWords, bool *c0_tmp,
-           int & numPath, const int stage, const __half *cwLLR, const int N, const thread_group& grp)
+R1_decoder(int16_t* __restrict__ pathPrime, __half* __restrict__ pathMetric, uint32_t* __restrict__ csBitWords, bool* __restrict__ c0_tmp,
+           int & numPath, const int stage, const __half* __restrict__ cwLLR, const int N, const thread_group& grp)
 {
     int      tid           = grp.thread_rank();
     int      sz            = 1 << stage;
@@ -1509,7 +1581,7 @@ R1_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t* csBitWords, bool 
         c0_3[lrb_idx1] = f1;
     }
 
-    // shared memory used in transpose operation and merge-sort kernel
+    // shared memory used in transpose operation and merge-sort function
     __shared__ __half temp[4 * LIST_SZ];
     // first we need to rearrange registers as following
     // [t0,0 t0,1 t0,2 t0,3]          [t0,0 t1,0 t2,0 t3,0]
@@ -1580,7 +1652,7 @@ R1_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t* csBitWords, bool 
 
         auto tile = tiled_partition<LIST_SZ * 2>(this_thread_block());
         if (tile.meta_group_rank() == 0) {
-            mergeSortSharedKernel<LIST_SZ, 4, 0>(childrenPm, childrenIds, tile, temp);
+            mergeSortShared<LIST_SZ, 4, 0>(childrenPm, childrenIds, tile, temp);
         }
 
         if (LIST_SZ >= 4) {
@@ -1599,10 +1671,10 @@ R1_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t* csBitWords, bool 
                 int cxb = childrenIds[1] / numPath;
                 int cxc = childrenIds[2] / numPath;
                 int cxd = childrenIds[3] / numPath;
-                int cya = childrenIds[0] % numPath;
-                int cyb = childrenIds[1] % numPath;
-                int cyc = childrenIds[2] % numPath;
-                int cyd = childrenIds[3] % numPath;
+                int cya = childrenIds[0] & (numPath - 1); //% numPath;
+                int cyb = childrenIds[1] & (numPath - 1); //% numPath;
+                int cyc = childrenIds[2] & (numPath - 1); //% numPath;
+                int cyd = childrenIds[3] & (numPath - 1); //% numPath;
 
                 for (int i = 0; i < sz; i++)
                     {
@@ -1633,6 +1705,8 @@ R1_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t* csBitWords, bool 
                     setResetSingleBit(csBitWords, (N + BCO * WORD_LENGTH) + i, tmp[i]);
                 }
             }
+        // When nPolLists == 1, cuPHY selects the non-list kernel (polarDecoderKernel)
+        /*VCAST_DONT_INSTRUMENT_START*/
         } else if (LIST_SZ == 1) {
             if(tid == 0)
             {
@@ -1645,6 +1719,7 @@ R1_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t* csBitWords, bool 
                 }
             }
         }
+        /*VCAST_DONT_INSTRUMENT_END*/
 
         numPath = LIST_SZ;
     }
@@ -1653,7 +1728,7 @@ R1_decoder(int16_t * pathPrime, __half * pathMetric, uint32_t* csBitWords, bool 
 // XOR Butterfly algorithm =============================================================================================
 
 // This is a special case of xor butterfly where sz = 32
-__device__ __forceinline__ void xor32_butterfly(bool8* outBits, int outBitsIdx0, uint32_t& sh_wrd)
+__device__ __forceinline__ void xor32_butterfly(bool8* __restrict__ outBits, int outBitsIdx0, uint32_t& sh_wrd)
 {
     uint32_t wrd = sh_wrd;
     // stage = 5
@@ -1682,7 +1757,7 @@ __device__ __forceinline__ void xor32_butterfly(bool8* outBits, int outBitsIdx0,
 }
 
 // This is a special case of xor butterfly where sz < 32
-__device__ __forceinline__ void xor2to16_butterfly(bool* outBits, int outBitsIdx0, uint32_t& sh_wrd, const int sz, const thread_group& grp)
+__device__ __forceinline__ void xor2to16_butterfly(bool* __restrict__ outBits, int outBitsIdx0, uint32_t& sh_wrd, const int sz, const thread_group& grp)
 {
     uint32_t upperHalfShifted;
 
@@ -1720,7 +1795,7 @@ __device__ __forceinline__ void xor2to16_butterfly(bool* outBits, int outBitsIdx
 }
 
 // General xor-butterfly
-__device__ __forceinline__ void xor_butterfly3(bool * outBits, uint32_t* inWords, uint32_t inWordsSize, int bitIdx, uint32_t * shTempWordBuf, const int stage, const int sz, const thread_group& grp)
+__device__ __forceinline__ void xor_butterfly3(bool* __restrict__ outBits, const uint32_t* __restrict__ inWords, uint32_t inWordsSize, int bitIdx, uint32_t* __restrict__ shTempWordBuf, const int stage, const int sz, const thread_group& grp)
 {
     int nWrds = div_round_up(sz, WORD_LENGTH);
 
@@ -1740,8 +1815,10 @@ __device__ __forceinline__ void xor_butterfly3(bool * outBits, uint32_t* inWords
         {
             for (int j = stage; j > 5; j--) {
                 int jump_sz = 1 << (j - 6);
+                int mask = (jump_sz << 1) - 1;
                 for (int i = 0; i < nWrds; i++) {
-                    if ((i % (2 * jump_sz)) < jump_sz) {
+                    //if ((i % (2 * jump_sz)) < jump_sz) {
+                    if ((i & mask) < jump_sz) {
                         shTempWordBuf[i] = shTempWordBuf[i] ^ shTempWordBuf[i + jump_sz];
                     }
                 }
@@ -1763,7 +1840,7 @@ __device__ __forceinline__ void xor_butterfly3(bool * outBits, uint32_t* inWords
 // get the primary path indices for a given stage and path
 template<int32_t LIST_SZ = 8>
 __device__ __forceinline__ void
-get_p_prime(int16_t * pathPrime, const int16_t * llPointers, const int numStages, const int stage, const thread_group& grp)
+get_p_prime(int16_t* __restrict__ pathPrime, const int16_t* __restrict__ llPointers, const int numStages, const int stage, const thread_group& grp)
 {
     __shared__ int16_t temp[LIST_SZ];
     int tid = grp.thread_rank();
@@ -1781,10 +1858,10 @@ get_p_prime(int16_t * pathPrime, const int16_t * llPointers, const int numStages
 
 // ======================== LIST POLAR DECODER =================================================
 
-// F kernel: implementation of box-plus (min-sum) kernel
+// F function: implementation of box-plus (min-sum)
 // combine 2 arrays of length sz/2 and output an array of length sz/2
 
-__device__ __forceinline__ void F_kernel1(__half* llrOut, __half* llrIn, int sz, const thread_group& grp)
+__device__ __forceinline__ void F_func1(__half* __restrict__ llrOut, __half* __restrict__ llrIn, int sz, const thread_group& grp)
 {
     __half*a = llrIn;           // first half input
     __half*b = &llrIn[sz];      // second half input
@@ -1799,7 +1876,7 @@ __device__ __forceinline__ void F_kernel1(__half* llrOut, __half* llrIn, int sz,
     grp.sync();
 }
 
-__device__ __forceinline__ void F_kernel4(half2x2_u64* llrOut, half2x2_u64* llrIn, int sz, const thread_group& grp)
+__device__ __forceinline__ void F_func4(half2x2_u64* __restrict__ llrOut, half2x2_u64* __restrict__ llrIn, int sz, const thread_group& grp)
 {
     half2x2_u64* a = llrIn;           // first half input
     half2x2_u64* b = &llrIn[sz];      // second half input
@@ -1812,22 +1889,22 @@ __device__ __forceinline__ void F_kernel4(half2x2_u64* llrOut, half2x2_u64* llrI
         bi.u64 = b[i].u64;
 
 #if __CUDA_ARCH__ >= 800
-        minAbs.hf.x = __hmin2(__habs2(ai.hf.x), __habs2(bi.hf.x));
-        minAbs.hf.y = __hmin2(__habs2(ai.hf.y), __habs2(bi.hf.y));
+        minAbs.hf2.x = __hmin2(__habs2(ai.hf2.x), __habs2(bi.hf2.x));
+        minAbs.hf2.y = __hmin2(__habs2(ai.hf2.y), __habs2(bi.hf2.y));
 #else
         half2x2_u64 aAbs, bAbs;
-        aAbs.hf.x = __habs2(ai.hf.x);
-        aAbs.hf.y = __habs2(ai.hf.y);
-        bAbs.hf.x = __habs2(bi.hf.x);
-        bAbs.hf.y = __habs2(bi.hf.y);
+        aAbs.hf2.x = __habs2(ai.hf2.x);
+        aAbs.hf2.y = __habs2(ai.hf2.y);
+        bAbs.hf2.x = __habs2(bi.hf2.x);
+        bAbs.hf2.y = __habs2(bi.hf2.y);
 
-        minAbs.hf.x.x = __hlt(aAbs.hf.x.x, bAbs.hf.x.x) ? aAbs.hf.x.x : bAbs.hf.x.x;
-        minAbs.hf.x.y = __hlt(aAbs.hf.x.y, bAbs.hf.x.y) ? aAbs.hf.x.y : bAbs.hf.x.y;
-        minAbs.hf.y.x = __hlt(aAbs.hf.y.x, bAbs.hf.y.x) ? aAbs.hf.y.x : bAbs.hf.y.x;
-        minAbs.hf.y.y = __hlt(aAbs.hf.y.y, bAbs.hf.y.y) ? aAbs.hf.y.y : bAbs.hf.y.y;
+        minAbs.hf2.x.x = __hlt(aAbs.hf2.x.x, bAbs.hf2.x.x) ? aAbs.hf2.x.x : bAbs.hf2.x.x;
+        minAbs.hf2.x.y = __hlt(aAbs.hf2.x.y, bAbs.hf2.x.y) ? aAbs.hf2.x.y : bAbs.hf2.x.y;
+        minAbs.hf2.y.x = __hlt(aAbs.hf2.y.x, bAbs.hf2.y.x) ? aAbs.hf2.y.x : bAbs.hf2.y.x;
+        minAbs.hf2.y.y = __hlt(aAbs.hf2.y.y, bAbs.hf2.y.y) ? aAbs.hf2.y.y : bAbs.hf2.y.y;
 #endif
-        ci.hf.x = __hmul2(signof2(ai.hf.x, bi.hf.x), minAbs.hf.x);
-        ci.hf.y = __hmul2(signof2(ai.hf.y, bi.hf.y), minAbs.hf.y);
+        ci.hf2.x = __hmul2(signof2(ai.hf2.x, bi.hf2.x), minAbs.hf2.x);
+        ci.hf2.y = __hmul2(signof2(ai.hf2.y, bi.hf2.y), minAbs.hf2.y);
 
         // store 64-bit
         llrOut[i].u64 = ci.u64;
@@ -1835,34 +1912,34 @@ __device__ __forceinline__ void F_kernel4(half2x2_u64* llrOut, half2x2_u64* llrI
     grp.sync();
 }
 
-__device__ __forceinline__ void F_kernel(__half* llrOut, __half* llrIn, int sz, const thread_group& grp)
+__device__ __forceinline__ void F_func(__half* __restrict__ llrOut, __half* __restrict__ llrIn, int sz, const thread_group& grp)
 {
     if(sz < 4) {
-        F_kernel1(llrOut, llrIn, sz, grp);
+        F_func1(llrOut, llrIn, sz, grp);
     } else {
         half2x2_u64* llrOut4 = reinterpret_cast<half2x2_u64*>(llrOut);
         half2x2_u64* llrIn4  = reinterpret_cast<half2x2_u64*>(llrIn);
-        F_kernel4(llrOut4, llrIn4, sz / 4, grp);
+        F_func4(llrOut4, llrIn4, sz / 4, grp);
     }
 }
 
 //-----------------------------------------------------------------------------------------------------------------------------------
-// G kernel: implementation of repetition likelihood kernel
+// G function: implementation of repetition likelihood
 // combine 2 arrays of length sz/2 based on bit array Est0 and output an array of length sz/2
 // examine different variants impact on performance
 
-__device__ __forceinline__ void G_kernel1(__half * llrOut, __half * llrIn, uint32_t est, int sz, const thread_group& grp) {
+__device__ __forceinline__ void G_func1(__half* __restrict__ llrOut, __half* __restrict__ llrIn, uint32_t est, int sz, const thread_group& grp) {
     __half *a = llrIn;            // first half input
     __half *b = &llrIn[sz];       // second half input
 
     for (int i = grp.thread_rank(); i < sz; i += grp.size()) {
-        __half u = static_cast<__half>(1 - 2 * isBitSet(est, i)); // u is +1 or -1
-        llrOut[i] = __hadd(b[i], __hmul(u, a[i]));
+        const __half u = isBitSet(est, i) ? __float2half(-1.f) : __float2half(1.f); // u is +1 or -1
+        llrOut[i] = __hfma(u, a[i], b[i]);
     }
     grp.sync();
 }
 
-__device__ __forceinline__ void G_kernel4(half2x2_u64 * llrOut, half2x2_u64 * llrIn, const uint32_t* estBits, int sz, const thread_group& grp) {
+__device__ __forceinline__ void G_func4(half2x2_u64* __restrict__ llrOut, half2x2_u64* __restrict__ llrIn, const uint32_t* __restrict__ estBits, int sz, const thread_group& grp) {
     half2x2_u64 *a = llrIn;          // first half input
     half2x2_u64 *b = &llrIn[sz];     // second half input
     half2x2_u64 ai, bi, ci, ui;
@@ -1873,17 +1950,17 @@ __device__ __forceinline__ void G_kernel4(half2x2_u64 * llrOut, half2x2_u64 * ll
         int32_t  bIdx  = (4 * i) % WORD_LENGTH;
         int32_t est   = estBits[wIdx];
 
-        ui.hf.x.x = static_cast<__half>(1 - 2 * ((est >> bIdx++) & int32_t(1)));
-        ui.hf.x.y = static_cast<__half>(1 - 2 * ((est >> bIdx++) & int32_t(1)));
-        ui.hf.y.x = static_cast<__half>(1 - 2 * ((est >> bIdx++) & int32_t(1)));
-        ui.hf.y.y = static_cast<__half>(1 - 2 * ((est >> bIdx) & int32_t(1)));
+        ui.hf2.x.x = static_cast<__half>(1 - 2 * ((est >> bIdx++) & int32_t(1)));
+        ui.hf2.x.y = static_cast<__half>(1 - 2 * ((est >> bIdx++) & int32_t(1)));
+        ui.hf2.y.x = static_cast<__half>(1 - 2 * ((est >> bIdx++) & int32_t(1)));
+        ui.hf2.y.y = static_cast<__half>(1 - 2 * ((est >> bIdx) & int32_t(1)));
 
         // read 64-bit
         ai.u64 = a[i].u64;
         bi.u64 = b[i].u64;
 
-        ci.hf.x = __hadd2(bi.hf.x, __hmul2(ui.hf.x, ai.hf.x));
-        ci.hf.y = __hadd2(bi.hf.y, __hmul2(ui.hf.y, ai.hf.y));
+        ci.hf2.x = __hfma2(ui.hf2.x, ai.hf2.x, bi.hf2.x);
+        ci.hf2.y = __hfma2(ui.hf2.y, ai.hf2.y, bi.hf2.y);
 
         // store 64-bit
         llrOut[i].u64 = ci.u64;
@@ -1892,32 +1969,32 @@ __device__ __forceinline__ void G_kernel4(half2x2_u64 * llrOut, half2x2_u64 * ll
     grp.sync();
 }
 
-__device__ __forceinline__ void G_kernel(__half * llrOut, __half * llrIn, const uint32_t* estBits, int sz, const thread_group& grp)
+__device__ __forceinline__ void G_func(__half* __restrict__ llrOut, __half* __restrict__ llrIn, const uint32_t* __restrict__ estBits, int sz, const thread_group& grp)
 {
     if(sz < 4) {
-        G_kernel1(llrOut, llrIn, estBits[0], sz, grp);
+        G_func1(llrOut, llrIn, estBits[0], sz, grp);
     } else {
         half2x2_u64* llrOut4 = reinterpret_cast<half2x2_u64*>(llrOut);
         half2x2_u64* llrIn4  = reinterpret_cast<half2x2_u64*>(llrIn);
-        G_kernel4(llrOut4, llrIn4, estBits, sz / 4, grp);
+        G_func4(llrOut4, llrIn4, estBits, sz / 4, grp);
     }
 }
 //-----------------------------------------------------------------------------------------------------------------------------------
 
-// H kernel: implementation of combining codewords in polar code
-// unlike kernel F and G, kernel H input/output arrays of hard decisions (bits)
+// H function: implementation of combining codewords in polar code
+// unlike F and G, H input/output arrays of hard decisions (bits)
 // combine 2 arrays of length sz/2 and output an array of length sz/2
 // examine bitwise storage instead of boolean
 // est_in0 : input from first child node, size sz/2
 // est_in1 : input from second child node, size sz/2
-__device__ __forceinline__ void H_kernel(uint32_t*           bitsOut,
-                                         const uint32_t*     bitsIn0,
-                                         const int           in0IdxOffset,
-                                         uint32_t            in0ArraySz,
-                                         const uint32_t*     bitsIn1,
-                                         uint32_t            in1ArraySz,
-                                         int                 sz,
-                                         const thread_group& grp)
+__device__ __forceinline__ void H_func(uint32_t* __restrict__      bitsOut,
+                                         const uint32_t* __restrict__ bitsIn0,
+                                         const int                    in0IdxOffset,
+                                         uint32_t                     in0ArraySz,
+                                         const uint32_t* __restrict__ bitsIn1,
+                                         uint32_t                     in1ArraySz,
+                                         int                          sz,
+                                         const thread_group&          grp)
 {
     // NOTE:  use in0IdxOffset for index of bitsIn0,
     // iniIdxOffset is always 0, hence not passed as input arg
@@ -1944,12 +2021,6 @@ __device__ __forceinline__ void
 listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
 {
     const uint32_t BLOCK_IDX = blockIdx.x;
-    uint8_t exitFlag         =  pDynDescr->pCwPrmsGpu[BLOCK_IDX].exitFlag;
-
-    if(exitFlag == 1)
-    {
-        return;
-    }
 
     uint16_t N_cw     = pDynDescr->pCwPrmsGpu[BLOCK_IDX].N_cw;
     uint8_t  nCrcBits = pDynDescr->pCwPrmsGpu[BLOCK_IDX].nCrcBits;
@@ -2018,10 +2089,10 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         sz = 1 << stage;
         auto* out = &cwTreeLLR[sz];
         auto* in  = &out[sz];
-        F_kernel(out, in, sz, thisThrdBlk);
+        F_func(out, in, sz, thisThrdBlk);
 #if ENABLE_DEBUG
         if (threadIdx.x == 0 && stage==4) {
-            printf("F kernel ----------------- stage %d, size %d, idx %d, type %d ------------------\n", stage, sz, idx0, get_type(stage, n_cw, subIdx, treeTypes));
+            printf("F function ----------------- stage %d, size %d, idx %d, type %d ------------------\n", stage, sz, idx0, get_type(stage, n_cw, subIdx, treeTypes));
             printf("in1: ");
             for (int i = 0; i < sz; i++) {
                 printf("%6.1f ", __half2float(in[i]));
@@ -2075,7 +2146,7 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         bitIdx += sz;
         if (bitIdx == (N_cw - 1)) break;
 
-        // use H kernel to combine codeword estimates all the way up to stage d
+        // use H function to combine codeword estimates all the way up to stage d
         int stage_idx = POLAR_DEPTH[bitIdx];
         int csBufferSelector = 0;
 
@@ -2091,7 +2162,7 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
                 // output: cs and in1 keep switching.
                 csBits = csBufferSelector % 2 ? &csBitWordsA[p * (N_words + BCO)] : &csBitWordsB[p * (N_words + BCO)];
                 //
-                H_kernel(csBits, inBits0, sz - 1, N_words, inBits1, N_words, sz, tile);
+                H_func(csBits, inBits0, sz - 1, N_words, inBits1, N_words, sz, tile);
             }
 
             get_p_prime<LIST_SZ>(pathPrime, llPointers, n_cw, stage, thisThrdBlk);
@@ -2100,7 +2171,7 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
             csBufferSelector++;
         }
 
-        // use G kernel with new codeword for stage_idx to update LLRs of the sibling branch
+        // use G function with new codeword for stage_idx to update LLRs of the sibling branch
         sz = 1 << stage;
         subIdx++;
 
@@ -2112,11 +2183,11 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
             auto llrOut  = &cwTreeLLR[sz + (2 * N_cw) * p];
             auto llrIn   = &cwTreeLLR[2 * sz + (2 * N_cw) * path];
             //
-            G_kernel(llrOut, llrIn, csBits, sz, tile);
+            G_func(llrOut, llrIn, csBits, sz, tile);
         }
 
         type = get_type(stage, n_cw, subIdx, treeTypes);
-        // use F kernel to propagate updated LLRs up to stage 0 (next bit at leaf node)
+        // use F function to propagate updated LLRs up to stage 0 (next bit at leaf node)
         while (stage > -1) {
             if (type != 3) {
                 break;
@@ -2129,7 +2200,7 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
                 int   p   = tile.meta_group_rank();
                 auto* out = &cwTreeLLR[sz + (2 * N_cw) * p];
                 auto* in  = &out[sz];
-                F_kernel(out, in, sz, tile);
+                F_func(out, in, sz, tile);
             }
         }
 
@@ -2274,7 +2345,6 @@ listPolarDecoderKernel(polarDecoderDynDescr_t* pDynDescr)
         return;
     }
 
-
     // first run simple polar decoder (list size 1)
     singlePolarDecoder(pDynDescr);
     __syncthreads();
@@ -2339,7 +2409,7 @@ void polarDecoder::kernelSelect(uint16_t                      nPolCws,
         dyn_shared_sz += LIST_SZ * (polar_decoder::N_MAX_WORDS + polar_decoder::BCO) * sizeof(uint32_t);     // for storing estimated code word per stage, each word
                                                                                                              // stores 32 bits, +BCO is to minimize bank conflicts
 
-        // since in fall-back method, we first run with list size 1 and use polarDecoderKernel() kernel instead of listPolarDecoderKernel<tileSize, 1>(),
+        // since in fall-back method, we first run with list size 1 and use polarDecoderKernel() instead of listPolarDecoderKernel<tileSize, 1>(),
         // let's ensure allocated dynamic shared mem is large enough for LIST_SZ=1 as well
         dyn_shared_sz = max(dyn_shared_sz, 5 * polar_decoder::N_MAX_CODED_BITS / 2);
 

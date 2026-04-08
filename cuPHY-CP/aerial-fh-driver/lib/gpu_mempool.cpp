@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,7 +46,7 @@ GpuMempool::GpuMempool(Gpu* gpu, Nic* nic,bool host_pinned) :
 
     if(host_pinned)
     {
-        cudaMallocHost((void**)&host_buf_ptr, buffer_size);
+        ASSERT_CUDA_FH(cudaMallocHost((void**)&host_buf_ptr, buffer_size));
         gpu_mem_ = {host_buf_ptr, RTE_BAD_IOVA, buffer_size, droom_sz};
     }
     else
@@ -112,7 +112,7 @@ GpuMempool::~GpuMempool()
 
     if(host_pinned_)
     {
-        cudaFreeHost(gpu_mem_.buf_ptr);
+        ASSERT_CUDA_FH(cudaFreeHost(gpu_mem_.buf_ptr));
     }
     else
     {

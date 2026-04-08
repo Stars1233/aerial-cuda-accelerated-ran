@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,7 +28,7 @@
 #include "pusch_utils.hpp"
 #include "datasets.hpp"
 #include "nvlog.hpp"
-#include "gsl/gsl-lite.hpp"
+#include "gsl-lite/gsl-lite.hpp"
 
 #define PUSCH_NOISE_INTF_EST_EQ_TEST 0
 #define PUSCH_CFO_TA_EST_EQ_TEST PUSCH_NOISE_INTF_EST_EQ_TEST + 1
@@ -408,8 +408,8 @@ int main(int argc, char* argv[])
         
         auto dynCpuDescrStartAddrs = m_kernelDynDescr.getCpuStartAddrs();
         auto dynGpuDescrStartAddrs = m_kernelDynDescr.getGpuStartAddrs();
-        gsl::span<cuphyPuschRxUeGrpPrms_t> m_drvdUeGrpPrmsCpu = gsl::span(reinterpret_cast<cuphyPuschRxUeGrpPrms_t*>(dynCpuDescrStartAddrs[PUSCH_FRONT_END_PARAMS_EQ_TEST]), MAX_N_USER_GROUPS_SUPPORTED);
-        gsl::span<cuphyPuschRxUeGrpPrms_t> m_drvdUeGrpPrmsGpu = gsl::span(reinterpret_cast<cuphyPuschRxUeGrpPrms_t*>(dynGpuDescrStartAddrs[PUSCH_FRONT_END_PARAMS_EQ_TEST]), MAX_N_USER_GROUPS_SUPPORTED);
+        gsl_lite::span<cuphyPuschRxUeGrpPrms_t> m_drvdUeGrpPrmsCpu = gsl_lite::span(reinterpret_cast<cuphyPuschRxUeGrpPrms_t*>(dynCpuDescrStartAddrs[PUSCH_FRONT_END_PARAMS_EQ_TEST]), MAX_N_USER_GROUPS_SUPPORTED);
+        gsl_lite::span<cuphyPuschRxUeGrpPrms_t> m_drvdUeGrpPrmsGpu = gsl_lite::span(reinterpret_cast<cuphyPuschRxUeGrpPrms_t*>(dynGpuDescrStartAddrs[PUSCH_FRONT_END_PARAMS_EQ_TEST]), MAX_N_USER_GROUPS_SUPPORTED);
         uint32_t m_nMaxPrb = PuschRx::expandFrontEndParameters(&dynApiDataset.puschDynPrm, &staticApiDataset.puschStatPrms, m_drvdUeGrpPrmsCpu.data(), subSlotProcessingFrontLoadedDmrsEnabled, maxDmrsMaxLen, enableRssiMeasurement, maxNPrbAlloc);
         
         ///////////////////////////////////////////

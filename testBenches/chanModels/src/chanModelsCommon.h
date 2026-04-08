@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "cuComplex.h"
+#include <curand.h>
 
 // copied function generate_native_HDF5_fp16_type() from aerial_sdk/cuPHY/src/cuphy_hdf5/cuphy_hdf5.cpp, which creates __half to be used in saving to hdf5
 ////////////////////////////////////////////////////////////////////////
@@ -65,6 +66,16 @@ void writeHdf5DatasetFromGpu(hid_t & fileId, const char * datasetName, hid_t & d
         if (cudaStatus != cudaSuccess) { \
             fprintf(stderr, "CUDA error: %s at line %d in file %s\n", \
                     cudaGetErrorString(cudaStatus), __LINE__, __FILE__); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
+
+#define CHECK_CURANDERROR(status) \
+    do { \
+        curandStatus_t curandStatus = (status); \
+        if (curandStatus != CURAND_STATUS_SUCCESS) { \
+            fprintf(stderr, "cuRAND error: status %d at line %d in file %s\n", \
+                    static_cast<int>(curandStatus), __LINE__, __FILE__); \
             exit(EXIT_FAILURE); \
         } \
     } while (0)

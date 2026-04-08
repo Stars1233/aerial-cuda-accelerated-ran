@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,10 +20,11 @@ import numpy as np
 import cupy as cp
 import yaml
 import os
-from typing import Tuple, List
-from aerial.pycuphy import (
+import time
+from typing import Tuple, List, Optional
+from aerial.phy5g.channel_models import (
     SimConfig, SystemLevelConfig, LinkLevelConfig, ExternalConfig,
-    StatisChanModel, Coordinate, AntPanelConfig, UtParamCfg, CellParam, Scenario
+    StatisticalChannel, Coordinate, AntPanelConfig, UtParamCfg, CellParam, Scenario
 )
 
 
@@ -97,12 +98,22 @@ def _read_system_level_config(sl_config: dict) -> SystemLevelConfig:
         raise RuntimeError(f"Invalid scenario: {scenario_str}")
 
     # Use new constructor with Python lists - much cleaner
+    ut_cell_2d_dist = sl_config.get("ut_cell_2d_dist", [-1.0, -1.0])
+    if len(ut_cell_2d_dist) != 2:
+        raise RuntimeError(
+            f"ut_cell_2d_dist must contain exactly 2 elements, got {len(ut_cell_2d_dist)}"
+        )
+    ut_drop_cells = [int(cid) for cid in sl_config.get("ut_drop_cells", [])]
+
     return SystemLevelConfig(
         scenario=scenario_map[scenario_str],
         n_site=int(sl_config["n_site"]),
         n_sector_per_site=int(sl_config["n_sector_per_site"]),  # Add missing parameter
         n_ut=int(sl_config["n_ut"]),
         isd=float(sl_config["isd"]),
+        ut_drop_cells=ut_drop_cells,
+        ut_drop_option=int(sl_config.get("ut_drop_option", 0)),
+        ut_cell_2d_dist=[float(ut_cell_2d_dist[0]), float(ut_cell_2d_dist[1])],
         optional_pl_ind=int(sl_config["optional_pl_ind"]),
         o2i_building_penetr_loss_ind=int(sl_config["o2i_building_penetr_loss_ind"]),
         o2i_car_penetr_loss_ind=int(sl_config["o2i_car_penetr_loss_ind"]),
@@ -252,11 +263,11 @@ def _read_single_panel_config(panel_config: dict) -> AntPanelConfig:
 
 
 def create_channel_model_from_config(
-        config_file: str = None,
-        n_site: int = None,
-        n_ut: int = None,
-        scenario: Scenario = None) -> Tuple[StatisChanModel, SimConfig,
-                                            SystemLevelConfig]:
+        config_file: Optional[str] = None,
+        n_site: Optional[int] = None,
+        n_ut: Optional[int] = None,
+        scenario: Optional[Scenario] = None) -> Tuple[StatisticalChannel, SimConfig,
+                                                      SystemLevelConfig]:
     """
     Create a channel model configuration from YAML file with optional
     overrides.
@@ -305,8 +316,12 @@ def create_channel_model_from_config(
     per_slot_update._initial_ut_config = external_config.ut_config
 
     # Create the channel model
-    chan_model = StatisChanModel(sim_config, system_config, link_config,
-                                 external_config)
+    chan_model = StatisticalChannel(
+        sim_config=sim_config,
+        system_level_config=system_config,
+        link_level_config=link_config,
+        external_config=external_config
+    )
 
     return chan_model, sim_config, system_config
 
@@ -620,7 +635,7 @@ def setup_active_links(n_active_cells, n_uts):
     # Generate active UTs - each cell connects to UT 0 and UT 1
     active_uts = []
     for cell_id in range(n_active_cells):
-        cell_uts = list(range(min(2, n_uts)))
+        cell_uts = list(range(min(10, n_uts)))
         active_uts.append(cell_uts)
 
     total_active_links = sum(len(cell_uts) for cell_uts in active_uts)
@@ -702,8 +717,8 @@ def allocate_cfr_arrays(sim_config, active_cells, active_uts, n_snapshots, n_ut_
 
             print(f"  Allocating CFR arrays for Cell {cell_id}: {n_uts_this_cell} UTs")
 
-            # CFR PRBG allocation (used in run modes 1, 2, 3) – NumPy for CPU-only
-            if sim_config.run_mode >= 1 and sim_config.run_mode != 4:
+            # CFR PRBG allocation (used in run modes 1 and 3 only)
+            if sim_config.run_mode in (1, 3):
                 if sim_config.cpu_only_mode == 1:
                     cfr_prbg_np = np.zeros((n_uts_this_cell, n_snapshots, n_ut_ant,
                                             n_bs_ant, sim_config.n_prbg),
@@ -719,7 +734,7 @@ def allocate_cfr_arrays(sim_config, active_cells, active_uts, n_snapshots, n_ut_
                     print(f"    Cell {cell_id} CFR PRBG pointer: 0x{cfr_prbg_ptr:x}")
                     assert cfr_prbg_ptr != 0, f"Null cfr_prbg pointer for cell {cell_id}"
 
-            # CFR SC allocation (used in run modes 2, 3, 4)
+            # CFR SC allocation (used in run modes 2, 3, and 4 only)
             if sim_config.run_mode >= 2:
                 if sim_config.run_mode == 4:
                     n_subcarriers = sim_config.fft_size  # Mode 4: Use N_FFT subcarriers
@@ -765,7 +780,8 @@ def print_buffer_info(sim_config, active_cells, active_uts, total_active_links,
         print(f"    Cell {i} cir_norm_delay shape: {cir_norm_delay_per_cell[i].shape}")
         print(f"    Cell {i} cir_n_taps shape: {cir_n_taps_per_cell[i].shape}")
 
-        if sim_config.run_mode >= 1 and sim_config.run_mode != 4:
+        # cfr_prbg is only allocated for run_mode 1 or 3
+        if sim_config.run_mode in (1, 3) and len(cfr_prbg_per_cell) > i:
             print(f"    Cell {i} cfr_prbg shape: {cfr_prbg_per_cell[i].shape}")
         elif sim_config.run_mode == 4:
             print(f"    Cell {i} cfr_prbg: NOT ALLOCATED (run mode 4 uses only SC)")
@@ -880,17 +896,23 @@ def run_channel_model_step(chan_model, tti, sim_config, active_cells, active_uts
                            ut_new_locations, ut_new_velocities, cir_coe_per_cell,
                            cir_norm_delay_per_cell, cir_n_taps_per_cell,
                            cfr_prbg_per_cell, cfr_sc_per_cell):
-    """Execute the channel model for one TTI."""
+    """Execute the channel model for one TTI.
+
+    Returns:
+        float: Execution time in milliseconds
+    """
 
     # Prepare CFR arrays based on run mode
-    cfr_prbg_args = (cfr_prbg_per_cell if (sim_config.run_mode >= 1 and
-                     sim_config.run_mode != 4) else [])
+    cfr_prbg_args = (cfr_prbg_per_cell if sim_config.run_mode in (1, 3) else [])
     cfr_sc_args = cfr_sc_per_cell if sim_config.run_mode >= 2 else []
 
     print("  Passing to channel model:")
     print(f"    cfr_prbg_args: {len(cfr_prbg_args)} arrays "
           f"(mode 4 = 0, others = {len(active_cells)})")
     print(f"    cfr_sc_args: {len(cfr_sc_args)} arrays")
+
+    # Start timing
+    start_time = time.perf_counter()
 
     chan_model.run(
         ref_time=tti * 0.5e-3,  # TTI duration = 0.5ms
@@ -910,6 +932,12 @@ def run_channel_model_step(chan_model, tti, sim_config, active_cells, active_uts
     if sim_config.cpu_only_mode == 0:
         print("  Synchronizing GPU kernels before reading results...")
         cp.cuda.get_current_stream().synchronize()
+
+    # End timing after synchronization
+    end_time = time.perf_counter()
+    elapsed_ms = (end_time - start_time) * 1000.0
+
+    return elapsed_ms
 
 
 def process_cir_statistics(cir_coe_per_cell, cir_n_taps_per_cell, cir_norm_delay_per_cell,
@@ -1063,31 +1091,31 @@ def dump_final_statistics(chan_model, system_config, active_cells):
     chan_model.dump_los_nlos_stats(los_nlos_stats)
     print(f"LOS ratio: {np.mean(los_nlos_stats):.2f}")
 
-    # Pathloss statistics for ALL UTs (full range)
+    # Pathloss shadowing statistics for ALL UTs (full range)
     all_uts = list(range(system_config.n_ut))  # Use all UTs from 0 to n_ut-1
-    pathloss_stats = np.zeros((len(active_cells), len(all_uts)), dtype=np.float32)
+    pl_sf_stats = np.zeros((len(active_cells), len(all_uts)), dtype=np.float32)
 
-    print(f"Dumping pathloss for {len(active_cells)} cells and {len(all_uts)} UTs...")
-    chan_model.dump_pathloss_shadowing_stats(
-        pathloss_shadowing=pathloss_stats,
+    print(f"Dumping pathloss shadowing for {len(active_cells)} cells and {len(all_uts)} UTs...")
+    chan_model.dump_pl_sf_stats(
+        pl_sf=pl_sf_stats,
         active_cell=np.array(active_cells, dtype=np.int32),
         active_ut=np.array(all_uts, dtype=np.int32)
     )
     # convert to minus dB
-    pathloss_stats = -pathloss_stats
+    pl_sf_stats = -pl_sf_stats
     # Print basic statistics
-    valid_pathloss = pathloss_stats[~np.isnan(pathloss_stats)]
-    valid_pathloss = valid_pathloss[np.isfinite(valid_pathloss)]
-    print(f"Total pathloss samples: {len(valid_pathloss)} "
+    valid_pl_sf = pl_sf_stats[~np.isnan(pl_sf_stats)]
+    valid_pl_sf = valid_pl_sf[np.isfinite(valid_pl_sf)]
+    print(f"Total pathloss shadowing samples: {len(valid_pl_sf)} "
           f"(from {len(active_cells)} cells × {len(all_uts)} UTs)")
-    print(f"Average pathloss: {np.mean(valid_pathloss):.1f} dB")
-    print(f"Pathloss std: {np.std(valid_pathloss):.1f} dB")
-    print(f"Pathloss range: [{np.min(valid_pathloss):.1f}, {np.max(valid_pathloss):.1f}] dB")
+    print(f"Average pathloss shadowing: {np.mean(valid_pl_sf):.1f} dB")
+    print(f"Pathloss shadowing std: {np.std(valid_pl_sf):.1f} dB")
+    print(f"Pathloss shadowing range: [{np.min(valid_pl_sf):.1f}, {np.max(valid_pl_sf):.1f}] dB")
 
     # Additional percentile statistics
     percentiles = [5, 10, 25, 50, 75, 90, 95]
-    percentile_values = np.percentile(valid_pathloss, percentiles)
-    print("Pathloss percentiles:")
+    percentile_values = np.percentile(valid_pl_sf, percentiles)
+    print("Pathloss shadowing percentiles:")
     for p, val in zip(percentiles, percentile_values):
         print(f"  P{p}: {val:.1f} dB")
 
@@ -1099,10 +1127,17 @@ def run_channel_simulation(chan_model, sim_config, system_config, n_tti):
     n_active_cells, n_snapshots, n_bs_ant, n_ut_ant, max_taps = (
         setup_simulation_parameters(sim_config, system_config))
 
+    # Timing statistics
+    tti_times = []
+    total_start_time = time.perf_counter()
+
     # Simulation loop
     last_active_cells = []
     for tti_idx in range(n_tti):
+        tti_start_time = time.perf_counter()
+        print(f"\n{'=' * 80}")
         print(f"Running TTI {tti_idx}")
+        print(f"{'=' * 80}")
         try:
             # Per-slot update: mobility, allocations, and buffer preparation
             (active_cells, active_uts,
@@ -1114,7 +1149,7 @@ def run_channel_simulation(chan_model, sim_config, system_config, n_tti):
                 tti_idx)
             last_active_cells = active_cells
 
-            # Run the channel model
+            # Run the channel model (returns execution time)
             run_channel_model_step(
                 chan_model, tti_idx, sim_config, active_cells, active_uts,
                 ut_new_locations, ut_new_velocities, cir_coe_per_cell,
@@ -1140,12 +1175,38 @@ def run_channel_simulation(chan_model, sim_config, system_config, n_tti):
                 print("  Final GPU sync for TTI completion...")
                 cp.cuda.get_current_stream().synchronize()
 
+            # Calculate TTI timing
+            tti_end_time = time.perf_counter()
+            tti_elapsed_ms = (tti_end_time - tti_start_time) * 1000.0
+            tti_times.append(tti_elapsed_ms)
+
         except Exception as e:
             print(f"Error running simulation at TTI {tti_idx}: {e}")
             raise  # Re-raise to help with debugging
 
+    # Calculate total simulation time
+    total_end_time = time.perf_counter()
+    total_elapsed_ms = (total_end_time - total_start_time) * 1000.0
+    total_elapsed_s = total_elapsed_ms / 1000.0
+
     # Dump final statistics
     dump_final_statistics(chan_model, system_config, last_active_cells)
+
+    # Print timing summary
+    print(f"\n{'=' * 80}")
+    print("TIMING SUMMARY")
+    print(f"{'=' * 80}")
+    print(f"Total TTIs simulated: {n_tti}")
+    print(f"Total simulation time: {total_elapsed_ms:.3f} ms ({total_elapsed_s:.3f} s)")
+    print("\nPer-TTI timing statistics:")
+    print(f"  Average: {np.mean(tti_times):.3f} ms")
+    print(f"  Minimum: {np.min(tti_times):.3f} ms")
+    print(f"  Maximum: {np.max(tti_times):.3f} ms")
+    print(f"  Std Dev: {np.std(tti_times):.3f} ms")
+    if n_tti > 1:
+        print(f"\nFirst TTI: {tti_times[0]:.3f} ms (includes initialization overhead)")
+        print(f"Average excluding first TTI: {np.mean(tti_times[1:]):.3f} ms")
+    print(f"{'=' * 80}\n")
 
 
 @pytest.mark.parametrize("n_site,n_ut,n_tti", [

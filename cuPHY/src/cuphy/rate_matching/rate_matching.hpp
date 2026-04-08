@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,9 @@
 
 #include <functional>
 #include "cuphy.h"
+
+constexpr float    LLR_MAX_ABS_VALUE = 10000.0f;
+constexpr uint32_t DERM_BLK_DIM      = 96;  // block dimension for de-rate-matching kernels
 
 struct puschRxRateMatchDescr
 {
@@ -85,6 +88,7 @@ private:
     // class state modifed by setup saved in data member.
     CUfunction m_kernelFunc;
     CUfunction m_resetBufferKernelFunc;  // Reset buffer kernel dispatcher
+    CUfunction m_clampBufferKernelFunc;  // Clamp buffer kernel dispatcher
     int        m_descramblingOn;
     int        m_rmFPconfig{};  // Store FP configuration for kernel selection
 };

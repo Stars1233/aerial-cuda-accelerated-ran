@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -244,6 +244,7 @@ void printPdschCellGrpDynPrms(const cuphyPdschCellGrpDynPrm_t& cellGrpDynPrms) {
         // Precoding parameters
         printf("  enablePrcdBf: %4d\n", uePrms[ueId].enablePrcdBf);
         printf("  pmwPrmIdx:    %4d\n", uePrms[ueId].pmwPrmIdx);
+        printf("  nlAbove16:    %4d\n", uePrms[ueId].nlAbove16);
 
         // Add pointer to parent UE group
         bool found = false;
@@ -552,6 +553,8 @@ void PdschParams::setDynPrms(const py::object& dynPrms) {
             m_cellGrpDynPrms.pUePrms[ueIdx].pmwPrmIdx      = uePrms.attr("pmwPrmIdx").cast<uint16_t>();
         else
             m_cellGrpDynPrms.pUePrms[ueIdx].pmwPrmIdx      = 0;
+
+        m_cellGrpDynPrms.pUePrms[ueIdx].nlAbove16          = 0; // Not supported 32 layer PDSCH yet
 
         py::list cwIdxs                                    = uePrms.attr("cwIdxs");
         uint8_t nCw                                        = cwIdxs.size();

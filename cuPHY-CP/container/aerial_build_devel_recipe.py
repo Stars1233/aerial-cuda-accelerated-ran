@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -80,6 +80,7 @@ ospackages=[
         'pciutils',
         'pkg-config',
         'pybind11-dev',
+        'python3-apt',
         'python3-cairo',
         'python3-pyelftools',
         'python3-testresources',
@@ -101,51 +102,35 @@ ospackages=[
 Stage0 += user(user='root')
 Stage0 += packages(ospackages=ospackages)
 
+# Install TensorRT for CUDA 13.0 (compatible with CUDA 13.1 runtime)
+# TensorRT 10.14.1.48 is the latest version supporting CUDA 13.0
+# Note: As of Jan 2026, TensorRT doesn't officially support CUDA 13.1 yet
+# CUDA 13.0 libraries work with CUDA 13.1 due to forward compatibility
+TENSORRT_VERSION = "10.14.1.48"
+TENSORRT_MAJOR = "10.14.1"
+CUDA_VERSION = "13.0"
 if cpu_target == 'x86_64':
-    tensorrt=[
-        "libnvinfer10",
-        "libnvinfer-vc-plugin10",
-        "libnvinfer-lean10",
-        "libnvinfer-dispatch10",
-        "libnvonnxparsers10",
-        "libnvinfer-bin",
-        "libnvinfer-samples",
-        "python3-libnvinfer",
-        "python3-libnvinfer-lean",
-        "python3-libnvinfer-dispatch",
-        "libnvinfer-win-builder-resource10",
-        "libnvinfer-win-builder-resource10",
-        "tensorrt",
-        "libnvinfer-headers-python-plugin-dev",
-        "libnvinfer-plugin10",
-        "libnvinfer-headers-dev",
-        "libnvinfer-headers-plugin-dev",
-        "libnvinfer-dev",
-        "libnvinfer-lean-dev",
-        "libnvinfer-plugin-dev",
-        "libnvinfer-vc-plugin-dev",
-        "libnvinfer-dispatch-dev",
-        "libnvonnxparsers-dev",
-        "libnvinfer-headers-python-plugin-dev",
-        "libnvinfer-dev",
-        "libnvinfer-lean-dev",
-        "libnvinfer-dispatch-dev",
-        "libnvinfer-plugin-dev",
-        "libnvinfer-vc-plugin-dev",
-        "libnvonnxparsers-dev",
-        "python3-libnvinfer-dev",
-        "tensorrt-dev",
-        ]
+    TENSORRT_ARCH = "x86_64-gnu"
+else:
+    TENSORRT_ARCH = "aarch64-gnu"
 
-    Stage0 += packages(ospackages=[f"{pack}=10.12.0.36-1+cuda12.9" for pack in tensorrt])
+TENSORRT_FILENAME = f"TensorRT-{TENSORRT_VERSION}.Linux.{TENSORRT_ARCH}.cuda-{CUDA_VERSION}.tar.gz"
+TENSORRT_URL = f"https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/{TENSORRT_MAJOR}/tars/{TENSORRT_FILENAME}"
 
-if cpu_target == 'aarch64':
-    Stage0 += packages(ospackages=[
-        "tensorrt",
-        "tensorrt-dev",
-        ])
+# Download and install TensorRT
+Stage0 += shell(commands=[
+    f'wget -q {TENSORRT_URL} -O /tmp/{TENSORRT_FILENAME}',
+    f'tar -xzf /tmp/{TENSORRT_FILENAME} -C /tmp/',
+    f'cp -Pr /tmp/TensorRT-{TENSORRT_VERSION}/lib/* /usr/local/lib/',
+    f'cp -P /tmp/TensorRT-{TENSORRT_VERSION}/bin/* /usr/local/bin/',
+    f'cp -r /tmp/TensorRT-{TENSORRT_VERSION}/include/* /usr/local/include/',
+    'ldconfig',
+    f'rm -rf /tmp/TensorRT-{TENSORRT_VERSION} /tmp/{TENSORRT_FILENAME}',
+])
 
-Stage0 += environment(variables={"PATH":"$PATH:/usr/src/tensorrt/bin"})
+Stage0 += environment(variables={
+    "LD_LIBRARY_PATH": "$LD_LIBRARY_PATH:/usr/local/lib",
+})
 
 # Screen setup
 Stage0 += shell(commands=[
@@ -156,20 +141,12 @@ Stage0 += shell(commands=[
 
 Stage0 += pip(pip="pip3", requirements=f'requirements.txt')
 
-# Handle platform specific version differences
-# Explicitly installing these is not necessary and causes some confusion for now. Ignore - they come from apt installs.
-#if cpu_target == 'x86_64':
-#    Stage0 += pip(pip="pip3", requirements=f'requirements_x86_64.txt')
-#
-#if cpu_target == 'aarch64':
-#    Stage0 += pip(pip="pip3", requirements=f'requirements_aarch64.txt')
-
 # Install nsight-systems
 if cpu_target == 'x86_64':
-    cli_package_url = 'https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2025_3/NsightSystems-linux-cli-public-2025.3.1.90-3582212.deb'
+    cli_package_url = 'https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2026_1/NsightSystems-linux-cli-public-2026.1.1.204-3717666.deb'
 
 if cpu_target == 'aarch64':
-    cli_package_url = 'https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2025_3/nsight-systems-cli-2025.3.1_2025.3.1.90-1_arm64.deb'
+    cli_package_url = 'https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2026_1/nsight-systems-cli-2026.1.1_2026.1.1.204-1_arm64.deb'
 
 Stage0 += shell(commands=[
     f'wget {cli_package_url}',
@@ -178,11 +155,12 @@ Stage0 += shell(commands=[
 ])
 
 # Workaround - Needed so host-launched graphs appear under the right green context
+# Updated for CUDA 13.1
 if cpu_target == 'x86_64':
-    Stage0 += shell(commands=["cp /usr/local/cuda/lib64/libcupti.so /opt/nvidia/nsight-systems-cli/2025.3.1/target-linux-x64/libcupti.so.12.9"])
+    Stage0 += shell(commands=["cp /usr/local/cuda/lib64/libcupti.so /opt/nvidia/nsight-systems-cli/2026.1.1/target-linux-x64/libcupti.so.13.1"])
 
 if cpu_target == 'aarch64':
-    Stage0 += shell(commands=["cp /usr/local/cuda/lib64/libcupti.so /opt/nvidia/nsight-systems-cli/2025.3.1/target-linux-sbsa-armv8/libcupti-sbsa.so.12.9"])
+    Stage0 += shell(commands=["cp /usr/local/cuda/lib64/libcupti.so /opt/nvidia/nsight-systems-cli/2026.1.1/target-linux-sbsa-armv8/libcupti-sbsa.so.13.1"])
 
 if cpu_target == 'aarch64':
     yq_binary='wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_arm64 -O /usr/bin/yq'

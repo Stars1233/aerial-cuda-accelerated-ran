@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -250,6 +250,16 @@ public:
     cudaEvent_t                getPuschStartEvent();
     cudaEvent_t                getPusch2StartEvent();
     cudaEvent_t                getPucch2DelayStopEvent();
+    /**
+     * @brief Get the PRACH start CUDA event.
+     * @return cudaEvent_t handle representing the PRACH start event.
+     */
+    cudaEvent_t                getPrachStartEvent();
+    /**
+     * @brief Get the PUCCH start CUDA event.
+     * @return cudaEvent_t handle representing the PUCCH start event.
+     */
+    cudaEvent_t                getPucchStartEvent();
     cudaEvent_t                getPusch1EndEvent();
 private:
     void msgProcess(std::shared_ptr<testWrkrCmdMsg>& shPtrMsg); // reference to shared_ptr optional (used for performance)

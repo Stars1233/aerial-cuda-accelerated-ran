@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,22 @@
 #include <iostream>
 #include <random>
 #include <cmath>
+
+/**
+ * CUDA error checking macro.
+ *
+ * Prints file, line, and error string to stderr on failure.
+ */
+#define CHECK_CUDA_ERR(stmt)                                                                  \
+    do                                                                                        \
+    {                                                                                         \
+        cudaError_t result = (stmt);                                                          \
+        if (cudaSuccess != result)                                                            \
+        {                                                                                     \
+            fprintf(stderr, "[%s:%d] CUDA error: %s\n", __FILE__, __LINE__,                   \
+                    cudaGetErrorString(result));                                              \
+        }                                                                                     \
+    } while (0)
 
 struct inputStruct {
     float* pfm = nullptr;
@@ -158,7 +174,7 @@ int main() {
     size_t size = 23*numUe * sizeof(uint8_t);
 
     uint8_t* d_dataBuffer;
-    cudaMalloc((void **)&d_dataBuffer, size);
+    CHECK_CUDA_ERR(cudaMalloc((void **)&d_dataBuffer, size));
     uint16_t* d_ue_id = (uint16_t*) (d_dataBuffer+numUe*16);
 
     ////////////////////////////
@@ -192,12 +208,12 @@ int main() {
     cudaEvent_t startKernel, stopKernel;
     cudaEvent_t startCopyD2H, stopCopyD2H;
 
-    cudaEventCreate(&startCopyH2D);
-    cudaEventCreate(&stopCopyH2D);
-    cudaEventCreate(&startKernel);
-    cudaEventCreate(&stopKernel);
-    cudaEventCreate(&startCopyD2H);
-    cudaEventCreate(&stopCopyD2H);
+    CHECK_CUDA_ERR(cudaEventCreate(&startCopyH2D));
+    CHECK_CUDA_ERR(cudaEventCreate(&stopCopyH2D));
+    CHECK_CUDA_ERR(cudaEventCreate(&startKernel));
+    CHECK_CUDA_ERR(cudaEventCreate(&stopKernel));
+    CHECK_CUDA_ERR(cudaEventCreate(&startCopyD2H));
+    CHECK_CUDA_ERR(cudaEventCreate(&stopCopyD2H));
 
     // CUDA kernel layout
     int threadsPerBlock = 1024;
@@ -205,35 +221,36 @@ int main() {
 
     // perform PFM sorting in GPU
     // step 1: copy data from host to device
-    cudaEventRecord(startCopyH2D);
+    CHECK_CUDA_ERR(cudaEventRecord(startCopyH2D));
     for (int rIdx = 0; rIdx < 1000; rIdx++) {
-    cudaMemcpy(d_dataBuffer, dataBuffer.get(), size, cudaMemcpyHostToDevice);
+        CHECK_CUDA_ERR(cudaMemcpy(d_dataBuffer, dataBuffer.get(), size, cudaMemcpyHostToDevice));
     }
-    cudaEventRecord(stopCopyH2D);
-    cudaEventSynchronize(stopCopyH2D);
+    CHECK_CUDA_ERR(cudaEventRecord(stopCopyH2D));
+    CHECK_CUDA_ERR(cudaEventSynchronize(stopCopyH2D));
  
     // step 2: launch kernel for PFM sorting in GPU
-    cudaEventRecord(startKernel);
+    CHECK_CUDA_ERR(cudaEventRecord(startKernel));
     for (int rIdx = 0; rIdx < 1000; rIdx++) {
-    pfmSort<<<blocksPerGrid, threadsPerBlock>>>(d_dataBuffer, numUe);
+        pfmSort<<<blocksPerGrid, threadsPerBlock>>>(d_dataBuffer, numUe);
+        CHECK_CUDA_ERR(cudaGetLastError());
     }
-    cudaEventRecord(stopKernel);
-    cudaEventSynchronize(stopKernel);
+    CHECK_CUDA_ERR(cudaEventRecord(stopKernel));
+    CHECK_CUDA_ERR(cudaEventSynchronize(stopKernel));
  
     // step 3: copy result back to host
-    cudaEventRecord(startCopyD2H);
+    CHECK_CUDA_ERR(cudaEventRecord(startCopyD2H));
     for (int rIdx = 0; rIdx < 1000; rIdx++) {
-    cudaMemcpy(inputDataPtr->ue_id, d_ue_id, numUe*sizeof(uint16_t), cudaMemcpyDeviceToHost);
+        CHECK_CUDA_ERR(cudaMemcpy(inputDataPtr->ue_id, d_ue_id, numUe*sizeof(uint16_t), cudaMemcpyDeviceToHost));
     }
-    cudaEventRecord(stopCopyD2H);
-    cudaEventSynchronize(stopCopyD2H);
+    CHECK_CUDA_ERR(cudaEventRecord(stopCopyD2H));
+    CHECK_CUDA_ERR(cudaEventSynchronize(stopCopyD2H));
 
     // calculate timings
     float timeH2D, timeKernel, timeD2H;
 
-    cudaEventElapsedTime(&timeH2D, startCopyH2D, stopCopyH2D);
-    cudaEventElapsedTime(&timeKernel, startKernel, stopKernel);
-    cudaEventElapsedTime(&timeD2H, startCopyD2H, stopCopyD2H);
+    CHECK_CUDA_ERR(cudaEventElapsedTime(&timeH2D, startCopyH2D, stopCopyH2D));
+    CHECK_CUDA_ERR(cudaEventElapsedTime(&timeKernel, startKernel, stopKernel));
+    CHECK_CUDA_ERR(cudaEventElapsedTime(&timeD2H, startCopyD2H, stopCopyD2H));
 
     std::cout << "Host to Device copy time: " << timeH2D<< " microseconds\n";
     std::cout << "Kernel execution time:     " << timeKernel << " microseconds\n";
@@ -249,7 +266,14 @@ int main() {
     */
  
     // Free memory
-    cudaFree(d_dataBuffer);
- 
+    CHECK_CUDA_ERR(cudaFree(d_dataBuffer));
+
+    CHECK_CUDA_ERR(cudaEventDestroy(startCopyH2D));
+    CHECK_CUDA_ERR(cudaEventDestroy(stopCopyH2D));
+    CHECK_CUDA_ERR(cudaEventDestroy(startKernel));
+    CHECK_CUDA_ERR(cudaEventDestroy(stopKernel));
+    CHECK_CUDA_ERR(cudaEventDestroy(startCopyD2H));
+    CHECK_CUDA_ERR(cudaEventDestroy(stopCopyD2H));
+
     return 0;
 }

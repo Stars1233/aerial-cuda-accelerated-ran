@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,10 +79,6 @@ int RU_Emulator::validate_csirs(uint8_t cell_index, const struct oran_packet_hea
         return 0;
     }
     tv_index = tv_object->launch_pattern[launch_pattern_slot][cell_index];
-    if(tv_object->launch_pattern[launch_pattern_slot][cell_index] > UINT32_MAX)
-    {
-        re_cons("Launch pattern index exceeds sizeof uint32_t\n");
-    }
     struct dl_tv_info& tv_info = tv_object->tv_info[tv_index];
 
     if (cell_configs[cell_index].dl_comp_meth == aerial_fh::UserDataCompressionMethod::MODULATION_COMPRESSION)
@@ -108,6 +104,20 @@ int RU_Emulator::validate_csirs(uint8_t cell_index, const struct oran_packet_hea
             auto tv_data_idx = mod_comp_data.global_msg_idx_to_tv_idx[mod_comp_msg_idx];
             slot_buf = (unsigned char *)mod_comp_data.mod_comp_payload[tv_data_idx].data.get();
             auto &payload_params = mod_comp_data.mod_comp_payload_params[tv_data_idx];
+
+            if (buffer != nullptr)
+            {
+                auto actual_iq_width = oran_umsg_get_iq_width_from_section_buf(static_cast<uint8_t*>(buffer));
+                if (actual_iq_width != payload_params[2])
+                {
+                    re_cons("CSI_RS ERROR udIqWidth mismatch: Cell {} 3GPP slot {} F{} S{} S{} Flow {} symbolId {} sectionId {} "
+                            "startPrb {} numPrb {} actual {} expected {}",
+                            cell_index, launch_pattern_slot, fss.frameId, fss.subframeId, fss.slotId,
+                            flow_index, symbolId, sectionId, startPrb, numPrb, actual_iq_width, payload_params[2]);
+                    csirs_object.invalid_flag[cell_index][launch_pattern_slot] = true;
+                }
+            }
+
             if (!payload_params[3])
             {
                 dl_prb_size = payload_params[2] * 3;

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 ---
-aerial_sdk_version: 25-3-cubb
+aerial_sdk_version: 26-1-cubb
 l2adapter_filename: l2_adapter_config_nrSim_SCF_MIXBW.yaml
 aerial_metrics_backend_address: 127.0.0.1:8081
 low_priority_core: 18

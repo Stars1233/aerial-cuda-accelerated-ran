@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -124,7 +124,7 @@ def _run_test_body(input_file, pdsch_config, csi_rs_config, cuda_stream, cupy):
     )
 
     if cupy:
-        with cp.cuda.ExternalStream(int(cuda_stream)):
+        with cuda_stream:
             tb_inputs = [cp.array(tb, dtype=cp.uint8, order='F') for tb in tb_inputs]
 
     xtf = pdsch_tx(
@@ -135,7 +135,7 @@ def _run_test_body(input_file, pdsch_config, csi_rs_config, cuda_stream, cupy):
     )
 
     if cupy:
-        with cp.cuda.ExternalStream(int(cuda_stream)):
+        with cuda_stream:
             xtf = xtf.get(order='F')
 
     ref_xtf = np.array(input_file["Xtf"]["re"]) + 1j * np.array(input_file["Xtf"]["im"])

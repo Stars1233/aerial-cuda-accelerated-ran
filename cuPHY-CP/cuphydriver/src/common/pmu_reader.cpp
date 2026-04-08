@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,11 +72,23 @@ bool PMUReader::addCounter(unsigned int type, unsigned long long config, bool di
 int PMUReader::readCounters(uint64_t* counters, int num_slots) {
 
     read_format data;
+    data.num_counters = 0;
 
     if(num_counters_ > 0) {
 
         //Perform single read on group leader
-        read(fids_[0], &data, sizeof(read_format));
+        const ssize_t bytes_read = read(fids_[0], &data, sizeof(read_format));
+
+        if(bytes_read < 0) {
+            PMU_READER_ERR_FUNC("PMUReader :: Failed to read counters from file descriptor (errno=%d)\n", errno);
+            return 0;
+        }
+
+        if(static_cast<size_t>(bytes_read) < sizeof(read_format)) {
+            PMU_READER_ERR_FUNC("PMUReader :: Incomplete read of counter data (read %zd bytes, expected %zu bytes)\n",
+                                bytes_read, sizeof(read_format));
+            return 0;
+        }
 
         //PMU_READER_INF_FUNC("Executed read.  time_enabled=%lli, time_running=%lli\n",data.time_enabled,data.time_running);
 
@@ -252,13 +264,25 @@ void PMUReaderCacheMissRatios::readMetrics(uint64_t* counts, CacheMissRatioMetri
     }
 }
 
-PMUDeltaSummarizer::PMUDeltaSummarizer(PMU_TYPE pmu_type)
+static const char* pmu_type_to_string(PMU_TYPE pmu_type)
 {
+    switch (pmu_type)
+    {
+        case PMU_TYPE_DISABLED:      return "PMU_TYPE_DISABLED";
+        case PMU_TYPE_GENERAL:       return "PMU_TYPE_GENERAL";
+        case PMU_TYPE_TOPDOWN:       return "PMU_TYPE_TOPDOWN";
+        case PMU_TYPE_CACHE_METRICS: return "PMU_TYPE_CACHE_METRICS";
+        default:                     return "UNKNOWN";
+    }
+}
 
-    pmu_type_ = pmu_type;
+PMUDeltaSummarizer::PMUDeltaSummarizer(PMU_TYPE pmu_type) :
+    pmu_type_(pmu_type),
+    pmur_(nullptr)
+{
 #if !defined(__arm__) && !defined(__aarch64__)
     if(pmu_type_ != PMU_TYPE_DISABLED && pmu_type_ != PMU_TYPE_GENERAL) {
-        PMU_READER_ERR_FUNC("PMUDeltaSummarizer :: Unable to set pmu_type=%s for non Grace system.  Disabling pmu_metrics.", pmu_type_);
+        PMU_READER_ERR_FUNC("PMUDeltaSummarizer :: Unable to set pmu_type=%s for non Grace system.  Disabling pmu_metrics.", pmu_type_to_string(pmu_type_));
         pmu_type_ = PMU_TYPE_DISABLED;
     }
 #endif
@@ -286,6 +310,11 @@ PMUDeltaSummarizer::PMUDeltaSummarizer(PMU_TYPE pmu_type)
         PMU_READER_INF_FUNC("PMUReader :: Format 3 :: l1i_miss_pki,l1d_miss_pki,l2d_miss_pki,l3d_miss_pki,mem_access_pki,ipc\n");
     }
 
+    // Warmup: exercise the ioctl/read path once to avoid cold-path overhead
+    if (pmu_type_ != PMU_TYPE_DISABLED) {
+        recordStart();
+        recordStop();
+    }
 }
 
 PMUDeltaSummarizer::~PMUDeltaSummarizer()

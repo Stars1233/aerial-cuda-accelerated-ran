@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@ import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial.phy5g.api import Array
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Pipeline
 from aerial.phy5g.api import PipelineFactory
 from aerial.phy5g.config import AerialPuschRxConfig
@@ -40,13 +41,13 @@ class SeparablePuschRxPipelineFactory(PipelineFactory[AerialPuschRxConfig]):
 
     def create(self,
                config: AerialPuschRxConfig,
-               cuda_stream: int,
+               cuda_stream: CudaStream,
                **kwargs: Any) -> Pipeline:
         """Create the pipeline.
 
         Args:
             config (AerialPuschRxConfig): Pipeline configuration object.
-            cuda_stream (int): CUDA stream used to run the tool.
+            cuda_stream (CudaStream): CUDA stream used to run the pipeline.
 
         Returns:
             SeparablePuschRx: A `SeparablePuschRx` pipeline object.
@@ -76,7 +77,7 @@ class SeparablePuschRx(PuschRxPipeline[PuschConfig, Array]):
                  enable_pusch_tdi: int,
                  eq_coeff_algo: int,
                  chest_factory_settings_filename: Optional[str],
-                 cuda_stream: int) -> None:
+                 cuda_stream: CudaStream) -> None:
         """Initialize SeparablePuschRx.
 
         Args:
@@ -90,33 +91,34 @@ class SeparablePuschRx(PuschRxPipeline[PuschConfig, Array]):
                 - 0 - ZF.
                 - 1 - MMSE (default).
                 - 2 - MMSE-IRC.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (CudaStream): CUDA stream. Use ``with stream:`` to scope work; call
+                ``stream.synchronize()`` explicitly when sync is needed.
         """
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = cuda_stream
 
         # Build the components of the receiver.
         self.channel_estimator = ChannelEstimator(
             num_rx_ant=num_rx_ant,
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             chest_factory_settings_filename=chest_factory_settings_filename
         )
         self.channel_equalizer = ChannelEqualizer(
             num_rx_ant=num_rx_ant,
             enable_pusch_tdi=enable_pusch_tdi,
             eq_coeff_algo=eq_coeff_algo,
-            cuda_stream=self.cuda_stream
+            cuda_stream=self._cuda_stream
         )
         self.noise_intf_estimator = NoiseIntfEstimator(
             num_rx_ant=num_rx_ant,
             eq_coeff_algo=eq_coeff_algo,
-            cuda_stream=self.cuda_stream
+            cuda_stream=self._cuda_stream
         )
         self.derate_match = LdpcDeRateMatch(
             enable_scrambling=True,
-            cuda_stream=self.cuda_stream
+            cuda_stream=self._cuda_stream
         )
-        self.decoder = LdpcDecoder(cuda_stream=self.cuda_stream)
-        self.crc_checker = CrcChecker(cuda_stream=self.cuda_stream)
+        self.decoder = LdpcDecoder(cuda_stream=self._cuda_stream)
+        self.crc_checker = CrcChecker(cuda_stream=self._cuda_stream)
 
     def __call__(self,
                  slot: int,

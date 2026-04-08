@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -301,6 +301,7 @@ class PdschUePrm(NamedTuple):
         enablePrcdBf (bool): Enable pre-coding for this UE.
         pmwPrmIdx (int): Index to pre-coding matrix array, i.e., to the pmwPrms list of the
             `PdschCellGrpDynPrm`.
+        nlAbove16 (numpy.uint8): Number of layers above 16. Value: 0 -> 1.
     """
     ueGrpPrmIdx : int
     scid : numpy.uint8
@@ -316,6 +317,7 @@ class PdschUePrm(NamedTuple):
     cwIdxs : List[int]
     enablePrcdBf : bool
     pmwPrmIdx : int
+    nlAbove16 : numpy.uint8 = numpy.uint8(0)
 
 
 class PdschCwPrm(NamedTuple):
@@ -635,6 +637,7 @@ class PuschStatPrms(NamedTuple):
         ldpcClampValue (numpy.float32): 128.0.
         polarDcdrListSz (numpy.uint8): Polar decoder list size. Default size for PUSCH
             to be set to 1.
+        nMaxTbPerNode (numpy.uint8): Maximum number of transport blocks per node.
         chEstAlgo (PuschChEstAlgoType): Channel estimation algorithm.
 
             - 0 - Legacy MMSE
@@ -694,6 +697,7 @@ class PuschStatPrms(NamedTuple):
             nodes in graphs mode. The priority values are same as CUDA stream priorities with lower
             numbers imply greater priorities.
         workCancelMode (PuschWorkCancelMode): Flag to control work cancellation mode in PUSCH
+        enableBatchedMemcpy (numpy.uint8): Flag to control batched memory copy in PUSCH.
         chestFactorySettingsFilename (Optional[str]): Path to the chest factory settings file.
     """
     outInfo : List[CuPHYTracker]
@@ -722,6 +726,7 @@ class PuschStatPrms(NamedTuple):
     fixedMaxNumLdpcItrs: numpy.uint8
     ldpcClampValue: numpy.float32
     polarDcdrListSz : numpy.uint8
+    nMaxTbPerNode : numpy.uint8
     chEstAlgo: PuschChEstAlgoType
     enablePerPrgChEst: numpy.uint8
     eqCoeffAlgo : PuschEqCoefAlgoType
@@ -743,6 +748,7 @@ class PuschStatPrms(NamedTuple):
     enableEarlyHarq : numpy.uint8
     earlyHarqProcNodePriority : numpy.int32
     workCancelMode : PuschWorkCancelMode
+    enableBatchedMemcpy : numpy.uint8
     chestFactorySettingsFilename : Optional[str]
 
 
@@ -844,6 +850,9 @@ class PuschUePrm(NamedTuple):
         scid (numpy.uint8): DMRS sequence initialization [TS38.211, sec 7.4.1.1.2].
             Should match what is sent in DCI 1_1, otherwise set to 0. Value : 0 -> 1.
         dmrsPortBmsk (numpy.uint16): Use to map DMRS port to fOCC/DMRS-grid/tOCC.
+        nlAbove16 (numpy.uint8): Number of layers above 16. Value: 0 -> 1.
+            Not supported for PUSCH. Keeping it in parity with pdsch.
+            Will always be set to 0.
         mcsTable (numpy.uint8): MCS (Modulation and Coding Scheme) Table Id.
             [TS38.214, sec 6.1.4.1].
 
@@ -886,6 +895,7 @@ class PuschUePrm(NamedTuple):
     enableTfPrcd: numpy.uint8
     scid : numpy.uint8
     dmrsPortBmsk : numpy.uint16
+    nlAbove16 : numpy.uint8
     mcsTable : numpy.uint8
     mcsIndex : numpy.uint8
     TBSize: numpy.uint32

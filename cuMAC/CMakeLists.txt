@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,6 +62,13 @@ block()
     if (("86" IN_LIST CMAKE_CUDA_ARCHITECTURES_NO_EXT) OR
         ("89" IN_LIST CMAKE_CUDA_ARCHITECTURES_NO_EXT))
         add_compile_definitions(CUDA_ARCH_86_89)
+    endif()
+
+    # Blackwell (sm_100, sm_120, sm_121) also needs reduced blocks per SM
+    if (("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_NO_EXT) OR
+        ("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_NO_EXT) OR
+        ("121" IN_LIST CMAKE_CUDA_ARCHITECTURES_NO_EXT))
+        add_compile_definitions(CUDA_ARCH_100_120_121)
     endif()
 endblock()
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,10 +17,12 @@
 
 #include <iostream>
 #include <fstream>
-#include <string>
+#include <sstream>
 #include <stdexcept>
 #include <cstdlib>
 #include <iomanip>
+#include <cctype>
+#include <cstring>
 
 #include "nv_utils.h"
 #include "nvlog_fmt.hpp"
@@ -32,6 +34,133 @@ using namespace AppUtils;
 
 #define TAG (NVLOG_TAG_BASE_APP_CFG_UTILS + 2) // "APP.UTILS"
 
+/** Sentinel for invalid or missing timestamp. */
+static constexpr time_t kInvalidTimestamp = static_cast<time_t>(-1);
+/** Max bytes from end of syslog to scan (tail only, for low latency). */
+static constexpr long long kMaxSyslogScanBytes = 256LL * 1024;
+
+/* Returns true if line contains needle (case-insensitive). Needle must be lowercase.
+ * Uses in-place comparison to avoid allocating a copy. */
+static inline bool containsSubstring(const std::string& line, const char* needle) {
+    const size_t n = std::strlen(needle);
+    if (line.size() < n) return false;
+    for (size_t i = 0; i <= line.size() - n; ++i) {
+        size_t j = 0;
+        for (; j < n && std::tolower(static_cast<unsigned char>(line[i + j])) == needle[j]; ++j) {}
+        if (j == n) {
+            const size_t end = i + n;
+            if (end >= line.size() || !std::isalpha(static_cast<unsigned char>(line[end])))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool checkIfLinkDown(const std::string& line) {
+    return containsSubstring(line, "link down");
+}
+
+static bool checkIfLinkUp(const std::string& line) {
+    return containsSubstring(line, "link up");
+}
+
+/* Check if syslog line indicates PTP port link down/up (ptp4l or systemd-networkd). */
+static void checkPortLinkStatus(const std::string& line, bool& out_is_down, bool& out_is_up) {
+    out_is_down = false;
+    out_is_up = false;
+    const bool has_ptp4l = (line.find("ptp4l:") != std::string::npos);
+    const bool has_networkd = (line.find("systemd-networkd") != std::string::npos);
+    if (has_ptp4l) {
+        out_is_down = checkIfLinkDown(line);
+        out_is_up = checkIfLinkUp(line);
+    }
+    if (has_networkd) {
+        out_is_down |= checkIfLinkDown(line);
+        out_is_up |= checkIfLinkUp(line);
+    }
+}
+
+static time_t parseSyslogTimestamp(const std::string& line) {
+    std::string timestampStr;
+    size_t pos = 0;
+    for (int i = 0; i < 3 && pos < line.length(); ++i) {
+        while (pos < line.length() && std::isspace(line[pos])) ++pos;
+        while (pos < line.length() && !std::isspace(line[pos])) {
+            timestampStr += line[pos++];
+        }
+        if (i < 2) timestampStr += " ";
+    }
+    if (timestampStr.empty()) return kInvalidTimestamp;
+    std::tm tm = {};
+    std::istringstream ss(timestampStr);
+    ss >> std::get_time(&tm, "%b %d %H:%M:%S");
+    if (ss.fail()) return kInvalidTimestamp;
+    time_t now = time(nullptr);
+    std::tm local_tm = {};
+    if (localtime_r(&now, &local_tm) != nullptr) {
+        tm.tm_year = local_tm.tm_year;
+        /* Syslog has no year; if parsed month is ahead of current month, entry is from previous year. */
+        if (tm.tm_mon > local_tm.tm_mon)
+            tm.tm_year -= 1;
+        tm.tm_isdst = local_tm.tm_isdst;
+    }
+    return mktime(&tm);
+}
+
+void AppUtils::getPtpPortLinkEvents(const std::string& syslogPath, time_t& outLastLinkDownTs, time_t& outLastLinkUpTs) {
+    outLastLinkDownTs = kInvalidTimestamp;
+    outLastLinkUpTs = kInvalidTimestamp;
+    try {
+        std::ifstream file(syslogPath, std::ios::binary);
+        if (!file.is_open()) return;
+        file.seekg(0, std::ios::end);
+        long long fileSize = file.tellg();
+        if (fileSize <= 0) return;
+
+        long long scanStart = (fileSize > kMaxSyslogScanBytes) ? (fileSize - kMaxSyslogScanBytes) : 0;
+
+        std::string line;
+        long long pos = fileSize - 1;
+        while (pos >= scanStart) {
+            file.seekg(pos, std::ios::beg);
+            char c;
+            if (!file.get(c)) {
+                file.clear();
+                --pos;
+                continue;
+            }
+            if (c == '\n' || pos == 0) {
+                long long lineStart = (pos == 0 ? 0 : pos + 1);
+                file.seekg(lineStart, std::ios::beg);
+                file.clear();
+                if (std::getline(file, line)) {
+                    bool is_down = false, is_up = false;
+                    checkPortLinkStatus(line, is_down, is_up);
+                    if (is_down || is_up) {
+                        const time_t ts = parseSyslogTimestamp(line);
+                        if (ts != kInvalidTimestamp) {
+                            if (is_down && outLastLinkDownTs == kInvalidTimestamp) outLastLinkDownTs = ts;
+                            if (is_up && outLastLinkUpTs == kInvalidTimestamp) outLastLinkUpTs = ts;
+                            if (outLastLinkDownTs != kInvalidTimestamp && outLastLinkUpTs != kInvalidTimestamp) break;
+                        }
+                    }
+                } else {
+                    file.clear();
+                }
+                pos = (pos == scanStart ? scanStart - 1 : pos - 1);
+            } else {
+                --pos;
+            }
+        }
+        file.close();
+    } catch (const std::exception& e) {
+        NVLOGW_FMT(TAG, "getPtpPortLinkEvents failed: {}", e.what());
+        /* Leave out* as kInvalidTimestamp (already set above). */
+    } catch (...) {
+        NVLOGW_FMT(TAG, "getPtpPortLinkEvents failed: unknown exception");
+        /* Leave out* as kInvalidTimestamp (already set above). */
+    }
+}
 
 ServiceStatus AppUtils::checkPtpServiceStatus(const std::string& syslogPath, double rmsThreshold, const std::string& serviceName) {
     try {
@@ -68,9 +197,9 @@ ServiceStatus AppUtils::checkPtpServiceStatus(const std::string& syslogPath, dou
         // Check file size
         file.seekg(0, std::ios::end);
         long long fileSize = file.tellg();
-        if (fileSize == 0) {
+        if (fileSize <= 0) {
             file.close();
-            throw std::runtime_error("Syslog file is empty: " + syslogPath);
+            throw std::runtime_error("Syslog file is empty or unreadable: " + syslogPath);
         }
 
         // Step 3: Parse syslog for the latest service RMS using reverse reading
@@ -112,38 +241,17 @@ ServiceStatus AppUtils::checkPtpServiceStatus(const std::string& syslogPath, dou
         // Step 4: Extract RMS from the last service line
         double rmsValue = -1.0;
         if (!lastLine.empty()) {
-            // Parse timestamp (format: "May 14 10:15:47")
-            std::string timestampStr;
             try {
-                size_t pos = 0;
-                // Extract first three fields (month, day, time)
-                for (int i = 0; i < 3 && pos < lastLine.length(); ++i) {
-                    while (pos < lastLine.length() && std::isspace(lastLine[pos])) ++pos;
-                    while (pos < lastLine.length() && !std::isspace(lastLine[pos])) {
-                        timestampStr += lastLine[pos++];
-                    }
-                    if (i < 2) timestampStr += " ";
+                time_t logTime = parseSyslogTimestamp(lastLine);
+                if (logTime == kInvalidTimestamp) {
+                    throw std::runtime_error("Failed to parse timestamp");
                 }
-
-                std::tm tm = {};
-                std::istringstream ss(timestampStr);
-		//std::cout << "log timestamp===>" << timestampStr << std::endl;
-                ss >> std::get_time(&tm, "%b %d %H:%M:%S");
-                if (ss.fail()) {
-                    throw std::runtime_error("Failed to parse timestamp: " + timestampStr);
-                }
-
-                time_t now = time(nullptr);
-                std::tm* local = localtime(&now);
-                tm.tm_year = local->tm_year;
-                tm.tm_isdst = local->tm_isdst;
-
-                time_t logTime = mktime(&tm);
                 time_t currentTime = time(nullptr);
-
                 double timeDiff = std::difftime(currentTime, logTime);
-                if (timeDiff > 1.0) {
-                    throw std::runtime_error("Log timestamp (" + timestampStr + ") is more than 1 second old: " + std::to_string(timeDiff) + " seconds");
+                // Use threshold > 1s to tolerate log updates every 1s and polling/IO jitter
+                const double kLogStalenessThresholdSeconds = 1.5;
+                if (timeDiff > kLogStalenessThresholdSeconds) {
+                    throw std::runtime_error("Log timestamp is more than " + std::to_string(kLogStalenessThresholdSeconds) + " seconds old: " + std::to_string(timeDiff) + " seconds");
                 }
             } catch (const std::exception& e) {
                 throw std::runtime_error("Error parsing timestamp in " + serviceName + " line: (" + lastLine + ") : " + e.what());

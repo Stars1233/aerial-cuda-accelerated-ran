@@ -31,8 +31,8 @@ namespace pusch {
         /**
          * Setting wait kernels params, using Kernels functions defined in the .cu file.
          */
-        void setWaitKernelParams(cuphyPuschRxWaitLaunchCfg_t* pLaunchCfg, uint8_t puschRxProcMode, void* ppStatDescr, void* ppDynDescr) final;
-        void setDeviceGraphLaunchKernelParams(cuphyPuschRxDglLaunchCfg_t* pLaunchCfg, uint8_t enableDeviceGraphLaunch, void* ppDynDescr, void* ppDeviceGraph) final;
+        void setWaitKernelParams(cuphyPuschRxWaitLaunchCfg_t* pLaunchCfg, uint8_t puschRxFullSlotMode, void* ppStatDescr, void* ppDynDescr) final;
+        void setDeviceGraphLaunchKernelParams(cuphyPuschRxDglLaunchCfg_t* pLaunchCfg, uint8_t enableDeviceGraphLaunch, uint8_t puschRxFullSlotMode, void* ppDynDescr, void* ppDeviceGraph) final;
     };
 
     /**
@@ -41,8 +41,8 @@ namespace pusch {
      */
     class NullStartKernels final : public IStartKernels {
     public:
-        void setWaitKernelParams(cuphyPuschRxWaitLaunchCfg_t* pLaunchCfg, uint8_t puschRxProcMode, void* ppStatDescr, void* ppDynDescr) final {}
-        void setDeviceGraphLaunchKernelParams(cuphyPuschRxDglLaunchCfg_t* pLaunchCfg, uint8_t enableDeviceGraphLaunch, void* ppDynDescr, void* ppDeviceGraph) final {}
+        void setWaitKernelParams(cuphyPuschRxWaitLaunchCfg_t* pLaunchCfg, uint8_t puschRxFullSlotMode, void* ppStatDescr, void* ppDynDescr) final {}
+        void setDeviceGraphLaunchKernelParams(cuphyPuschRxDglLaunchCfg_t* pLaunchCfg, uint8_t enableDeviceGraphLaunch, uint8_t puschRxFullSlotMode, void* ppDynDescr, void* ppDeviceGraph) final {}
     };
 
 } // namespace pusch

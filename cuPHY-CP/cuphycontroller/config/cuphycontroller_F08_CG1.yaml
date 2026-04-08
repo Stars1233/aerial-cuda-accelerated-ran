@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-aerial_sdk_version: 25-3-cubb
+aerial_sdk_version: 26-1-cubb
 l2adapter_filename: l2_adapter_config_F08_CG1.yaml
 aerial_metrics_backend_address: 127.0.0.1:8081
 
@@ -40,6 +40,7 @@ cuphydriver_config:
   fh_stats_dump_cpu_core: -1
   pdump_client_thread: -1
   use_green_contexts: 0 # Experimental feature; disabled by default
+  use_gc_workqueues: 1  # Experimental feature
   use_batched_memcpy: 1 # Requires >= CUDA 12.8
   mps_sm_pusch: 100
   mps_sm_pucch: 2
@@ -110,6 +111,10 @@ cuphydriver_config:
   puxch_polarDcdrListSz: 8
   enable_cpu_task_tracing: 0
   enable_prepare_tracing: 0
+  cupti_enable_tracing: 0        # CUPTI GPU tracing (see cuPHY/src/cuphy/cupti_helper.hpp for details)
+  cupti_buffer_size: 2147483648  # 2GB recommended (CUPTI will internally limit to 2GiB per buffer, may be fixed in future versions)
+  cupti_num_buffers: 2           # If run is appropriate length the log dump will occur after run is complete, minimizing impact to the system. (i.e. only 1 buffer is needed)
+                                 # Default is 2 buffers to allow for longer runs, but keep in mind that log dump will occur in the middle of the run if one buffer is exceeded.
   disable_empw: 0 #1=>Disables Multi packet WQE feature
   cqe_tracer_config:
     enable_dl_cqe_tracing: 0
@@ -177,6 +182,8 @@ cuphydriver_config:
   dynamic_beam_id_end: 32767 #15bit max value
   bfw_c_plane_chaining_mode: 2 # 0: Default memcpy of BFW weights, 1: CPU mbuf chaining of BFW weights, 2: GPU mbuf chaining of BFW weights
   notify_ul_harq_buffer_release: 0
+  enable_dl_core_affinity: 1
+  dlc_core_packing_scheme: 0
   cells:
     - name: O-RU 0
       cell_id: 1
@@ -232,6 +239,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 1
       cell_id: 2
       ru_type: 3
@@ -286,6 +294,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 2
       cell_id: 3
       ru_type: 3
@@ -340,6 +349,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 3
       cell_id: 4
       ru_type: 3
@@ -394,6 +404,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 4
       cell_id: 5
       ru_type: 3
@@ -448,6 +459,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 5
       cell_id: 6
       ru_type: 3
@@ -502,6 +514,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 6
       cell_id: 7
       ru_type: 3
@@ -556,6 +569,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 7
       cell_id: 8
       ru_type: 3
@@ -610,6 +624,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 8
       cell_id: 9
       ru_type: 3
@@ -664,6 +679,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 9
       cell_id: 10
       ru_type: 3
@@ -718,6 +734,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 10
       cell_id: 11
       ru_type: 3
@@ -772,6 +789,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 11
       cell_id: 12
       ru_type: 3
@@ -826,6 +844,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 12
       cell_id: 13
       ru_type: 3
@@ -880,6 +899,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 13
       cell_id: 14
       ru_type: 3
@@ -934,6 +954,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 14
       cell_id: 15
       ru_type: 3
@@ -988,6 +1009,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 15
       cell_id: 16
       ru_type: 3
@@ -1042,6 +1064,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 16
       cell_id: 17
       ru_type: 3
@@ -1096,6 +1119,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 17
       cell_id: 18
       ru_type: 3
@@ -1150,6 +1174,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 18
       cell_id: 19
       ru_type: 3
@@ -1204,6 +1229,7 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0
     - name: O-RU 19
       cell_id: 20
       ru_type: 3
@@ -1258,3 +1284,4 @@ cuphydriver_config:
       ul_gain_calibration: 48.68
       lower_guard_bw: 845
       tv_pusch: cuPhyChEstCoeffs.h5
+      dlc_core_index: 0

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -99,11 +99,7 @@ __device__ __inline__ uint32_t output_index_calc(int allocated_Rbs, int start_da
 
     int symbol_id = tid / Rbs_per_symbol; // This is the symbol # within all the layer(s) TB blockIdx.y maps to.
     int layer_cnt = symbol_id / data_symbols_per_layer;
-#ifdef ENABLE_32DL
-    int layer_id = params[blockIdx.y].port_ids[layer_cnt] + 8 * params[blockIdx.y].n_scid + 16 * params[blockIdx.y].nlAbove16;
-#else
-    int layer_id = params[blockIdx.y].port_ids[layer_cnt] + 8 * params[blockIdx.y].n_scid;
-#endif
+    int layer_id = calculate_layer_id(params[blockIdx.y].port_ids[layer_cnt], params[blockIdx.y].n_scid, params[blockIdx.y].nlAbove16);
     int per_layer_symbol_id = symbol_id % data_symbols_per_layer;
     int symbol_pos = (params->data_sym_loc >> (4*per_layer_symbol_id)) & 0xF;
 
@@ -132,11 +128,7 @@ __device__ uint32_t input_index_calc(int max_bits_per_layer, int allocated_Rbs, 
     int TB_id = blockIdx.y;
     int layer_cnt = tid / num_symbols_per_layer_per_TB; //check layer cnt is valid
     int symbol_id_within_layer = tid % num_symbols_per_layer_per_TB;
-#ifdef ENABLE_32DL
-    int layer_id = params[TB_id].port_ids[layer_cnt] + 8 * params[TB_id].n_scid + 16 * params[TB_id].nlAbove16;
-#else
-    int layer_id = params[TB_id].port_ids[layer_cnt] + 8 * params[TB_id].n_scid;
-#endif
+    int layer_id = calculate_layer_id(params[TB_id].port_ids[layer_cnt], params[TB_id].n_scid, params[TB_id].nlAbove16);
 
     uint32_t input_index = (layer_id * num_TBs + TB_id)* rounded_num_elements_per_layer;
     input_index += (symbol_id_within_layer * Tqam / 32);
@@ -726,7 +718,12 @@ __global__ void sym_mod_util(const tensor_layout_any tDstLayout,
         // Dispatch to the approprate QAM function
         switch(log2_QAM)
         {
+        // Coverage note: this default path is intentionally unreachable via public API.
+        // cuphyModulateSymbol() validates log2_QAM to {1,2,4,6,8} before launching sym_mod_util,
+        // so invalid values never reach this switch in normal/tested flows.
+        /*VCAST_DONT_INSTRUMENT_START*/
         default:
+        /*VCAST_DONT_INSTRUMENT_END*/
         case 1:  mod_BPSK_t::modulate  (symAddr, SYM_ADDR_END, block_src, no_table);   break;
         case 2:  mod_QPSK_t::modulate  (symAddr, SYM_ADDR_END, block_src, no_table);   break;
         case 4:  mod_QAM16_t::modulate (symAddr, SYM_ADDR_END, block_src, tbl_QAM16);  break;
@@ -784,10 +781,16 @@ cuphyStatus_t symbol_modulate(const tensor_desc& tSym,
                                                                              log2_QAM,
                                                                              SYMBOLS_PER_BATCH);
     }
+
+    // Coverage note: this branch is guarded by the public API.
+    // cuphyModulateSymbol() performs the same type validation and returns
+    // CUPHY_STATUS_UNSUPPORTED_TYPE before reaching cuphy_i::symbol_modulate().
+    /*VCAST_DONT_INSTRUMENT_START*/
     else
     {
         return CUPHY_STATUS_UNSUPPORTED_TYPE;
     }
+    /*VCAST_DONT_INSTRUMENT_END*/
 
     cudaError_t e = cudaGetLastError();
     DEBUG_PRINTF("CUDA STATUS (%s:%i): %s\n", __FILE__, __LINE__, cudaGetErrorString(e));

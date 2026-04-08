@@ -13,10 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if(ENABLE_CUPTI_TRACING)
-  add_executable(cuphy_cupti_example cuphy_cupti_example.cpp test_kernel.cu)
-  target_link_libraries(cuphy_cupti_example cuphy yaml)
+add_executable(cuphy_cupti_example cuphy_cupti_example.cpp test_kernel.cu)
+target_link_libraries(cuphy_cupti_example cuphy yaml)
 
-  add_executable(cuphy_cupti_correlation_example cuphy_cupti_correlation_example.cpp test_kernel.cu)
-  target_link_libraries(cuphy_cupti_correlation_example cuphy yaml)
-endif()
+add_executable(cuphy_cupti_correlation_example cuphy_cupti_correlation_example.cpp test_kernel.cu)
+target_link_libraries(cuphy_cupti_correlation_example cuphy yaml)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,56 +36,6 @@
 using namespace std;
 using namespace nv;
 
-typedef enum
-{
-    MAC_RUNNING  = 0,
-    MAC_SIGNALED = 1,
-    MAC_STOPPING = 2,
-} mac_state_t;
-
-static std::atomic_int run_flag = mac_state_t::MAC_RUNNING;
-
-static void signal_handler(int signum)
-{
-    char thread_name[16];
-    pthread_getname_np(pthread_self(), thread_name, 16);
-    NVLOGC_FMT(TAG, "{}: run_flag={} thread [{}] received SIGNAL {} - {} - {}", __func__, run_flag.load(), thread_name, signum, sigabbrev_np(signum), sigdescr_np(signum));
-
-    char ts_buf[32] = "";
-    get_gettimeofday_str(ts_buf);
-    printf("%s [PRINTF] %s: run_flag=%d thread [%s] received SIGNAL %d - %s - %s\n", ts_buf, __func__, run_flag.load(), thread_name, signum, sigabbrev_np(signum), sigdescr_np(signum));
-
-    if(signum == SIGINT || signum == SIGTERM || signum == SIGUSR1)
-    {
-        if(run_flag.load() == mac_state_t::MAC_RUNNING)
-        {
-            run_flag.store(mac_state_t::MAC_SIGNALED);
-        }
-        else
-        {
-            log_backtrace_printf(thread_name);
-
-            get_gettimeofday_str(ts_buf);
-            printf("%s [PRINTF] %s: run_flag=%d exit: thread [%s] handled SIGNAL %d - %s - %s\n", ts_buf, __func__, run_flag.load(), thread_name, signum, sigabbrev_np(signum), sigdescr_np(signum));
-
-            exit(1);
-            // run_flag.store(mac_state_t::MAC_FORCE_KILLING);
-        }
-        usleep(20000); // Add a delay to give enough time to fmtlog producers to flush logs
-    }
-
-    get_gettimeofday_str(ts_buf);
-    printf("%s [PRINTF] %s: run_flag=%d thread [%s] handled SIGNAL %d - %s - %s\n", ts_buf, __func__, run_flag.load(), thread_name, signum, sigabbrev_np(signum), sigdescr_np(signum));
-}
-
-void test_mac_signal_setup()
-{
-    NVLOGC_FMT(TAG, "{}: register signal handler", __func__);
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGUSR1, signal_handler);
-}
-
 test_mac::test_mac(yaml::node yaml_root, uint32_t cell_num) :
         testmac_yaml(yaml_root) {
 
@@ -97,13 +47,6 @@ test_mac::test_mac(yaml::node yaml_root, uint32_t cell_num) :
     _fapi_handler = NULL; // Will be created later by set_launch_pattern_and_configs()
 
     mac_recv_tid = 0; // MAC receiver thread ID, initialized to 0
-
-    if(ENABLE_CELL_STOP_SIGNAL_HANDLER)
-    {
-        // Initialize run flag for cell stop signal handling
-        // Note: This signal is not used currently. Use APP signal handler instead of this one
-        run_flag.store(mac_state_t::MAC_RUNNING);
-    }
 
     NVLOGC_FMT(TAG, "{} construct finished", __func__);
 }
@@ -149,6 +92,13 @@ void* oam_thread_func(void* arg)
     CuphyOAM* oam = CuphyOAM::getInstance();
     while(1)
     {
+        if (is_app_exiting())
+        {
+            NVLOGC_FMT(TAG, "OAM thread exiting due to app exiting");
+            _fapi_handler->terminate();
+            break;
+        }
+
         CuphyOAMCellCtrlCmd* cmd;
         while((cmd = oam->get_cell_ctrl_cmd()) != nullptr)
         {
@@ -272,12 +222,6 @@ void* mac_recv_thread_func(void *arg)
     test_mac_configs* configs = testmac->get_configs();
     fapi_handler *_fapi_handler = testmac->get_fapi_handler();
 
-    pthread_t sched_thread_id;
-    if(pthread_create(&sched_thread_id, NULL, scheduler_thread_func, _fapi_handler) !=  0)
-    {
-        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Create scheduler thread failed");
-    }
-
     if (configs->builder_thread_enable != 0)
     {
         pthread_t thread_id;
@@ -343,21 +287,6 @@ void* mac_recv_thread_func(void *arg)
     // Main message receive loop
     while (1) {
         try {
-            // Check for cell stop signal if handler is enabled
-            if (ENABLE_CELL_STOP_SIGNAL_HANDLER) {
-                int flag = run_flag.load();
-                if (flag == mac_state_t::MAC_SIGNALED) {
-                    // Stop signal received, stop all cells
-                    for (int cell_id = 0; cell_id < _fapi_handler->get_cell_num(); cell_id++) {
-                        _fapi_handler->cell_stop(cell_id);
-                    }
-                    run_flag.store(mac_state_t::MAC_STOPPING);
-                } else if (flag == mac_state_t::MAC_STOPPING && _fapi_handler->is_stopped()) {
-                    // All cells stopped, exit message looping
-                    break;
-                }
-            }
-
             // Wait for incoming messages from PHY
             transport.rx_wait();
 
@@ -377,8 +306,6 @@ void* mac_recv_thread_func(void *arg)
             }
         } catch (std::exception &e) {
             NVLOGF_FMT(TAG, AERIAL_TEST_MAC_EVENT, "mac_recv_thread_func: exception: {}", e.what());
-        } catch (...) {
-            NVLOGF_FMT(TAG, AERIAL_TEST_MAC_EVENT, "mac_recv_thread_func: unknown exception");
         }
     }
 
@@ -386,13 +313,27 @@ void* mac_recv_thread_func(void *arg)
 }
 
 void test_mac::start() {
+    NVLOGC_FMT(TAG, "test_mac::start");
+
+    if(pthread_create(&mac_sched_tid, NULL, scheduler_thread_func, get_fapi_handler()) !=  0)
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Create mac_sched thread failed");
+    }
+
     if (pthread_create(&mac_recv_tid, NULL, mac_recv_thread_func, this) != 0) {
         NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Create mac_recv thread failed");
     }
 }
 
 void test_mac::join() {
-    if (pthread_join(mac_recv_tid, NULL) != 0) {
-        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Join  mac_recv thread failed");
+    if (mac_sched_tid != 0 && pthread_join(mac_sched_tid, NULL) != 0) {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Join mac_sched thread failed");
     }
+
+    if (mac_recv_tid != 0) {
+        pthread_cancel(mac_recv_tid);
+        pthread_join(mac_recv_tid, NULL);
+    }
+
+    NVLOGC_FMT(TAG, "test_mac: [mac_sched] and [mac_recv] threads joined");
 }

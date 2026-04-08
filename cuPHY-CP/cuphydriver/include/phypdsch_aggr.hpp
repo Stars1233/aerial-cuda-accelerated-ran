@@ -154,6 +154,17 @@ public:
      */
     int waitH2dCopyCudaEventRec();
 
+    /**
+     * @brief Get PDSCH H2D copy duration in microseconds for given slot.
+     *
+     * Calculates the elapsed time between the H2D copy start and completion CUDA events
+     * for the specified slot. Returns 0 if preponed H2D copy is not enabled.
+     *
+     * @param[in] slot Slot number to get the H2D copy time for
+     * @return H2D copy duration in microseconds, or 0 if preponed H2D copy is disabled
+     */
+    float getPdschH2DCopyTime(uint8_t slot);
+
 protected:
     cuphyPdschTxHndl_t                  handle;         ///< cuPHY PDSCH transmission handle (opaque handle to cuPHY PDSCH TX object)
     uint64_t                            procModeBmsk;   /*!< Processing mode bitmask [B2 B1 B0]: 

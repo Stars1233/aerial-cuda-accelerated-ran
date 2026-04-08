@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -858,7 +858,8 @@ int nv_ipc_dump_config(nv_ipc_config_t *cfg)
         nv_ipc_config_shm_t *transp_cfg = &cfg->transport_config.shm;
         prefix = transp_cfg->prefix;
         mempool = transp_cfg->mempool_size;
-        NVLOGC(TAG, "[%s]: transport=%d ring_len=%d cuda_device_id=%d", prefix, transp_cfg->ring_len, transp_cfg->cuda_device_id);
+        NVLOGC(TAG, "[%s]: transport=%d ring_len=%d cuda_device_id=%d",
+                prefix, cfg->ipc_transport, transp_cfg->ring_len, transp_cfg->cuda_device_id);
     }
     else if (cfg->ipc_transport == NV_IPC_TRANSPORT_DPDK)
     {
@@ -1159,7 +1160,10 @@ static int ipc_debug_open(nv_ipc_debug_t* ipc_debug, nv_ipc_config_t* ipc_cfg)
         ipc_debug->cmd_ring = nv_ipc_ring_open(RING_TYPE_SHM_PRIMARY, name, 64, sizeof(nvipc_cmd_t));
 
         // Create the background thread for receiving dynamic PCAP and other commands
-        pthread_create(&ipc_debug->debug_thread_id, NULL, pcap_shm_caching_thread_func, ipc_debug);
+        if(pthread_create(&ipc_debug->debug_thread_id, NULL, pcap_shm_caching_thread_func, ipc_debug) != 0)
+        {
+            NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "pthread_create failed: name=%s", name);
+        }
     }
     else
     {

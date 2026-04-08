@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +51,13 @@ base.add_argument(
     nargs="+",
     dest="filenames",
     help="Specifies the files containing the results",
+)
+base.add_argument(
+    "--filename",
+    type=str,
+    nargs="+",
+    dest="filename",
+    help="Alias for --filenames (same effect)",
 )
 base.add_argument(
     "--folder",
@@ -106,6 +113,17 @@ base.add_argument(
 )
 
 args = base.parse_args()
+
+# Merge --filename and --filenames, preserving order and removing duplicates
+_fn  = args.filenames or []
+_fa  = getattr(args, "filename", None) or []
+seen = set()
+merged = []
+for f in _fn + _fa:
+    if f not in seen:
+        seen.add(f)
+        merged.append(f)
+args.filenames = merged if merged else None
 
 if args.filenames is None and args.folder is None:
     base.error("please specify which files or folder to analyze")
@@ -431,12 +449,36 @@ for kidx, ikey in enumerate(data.keys()):
         
         latency_to_cdf(ikey, mac_buffer, "MAC", channels)
         
-    else: # separate cuMAC heavy kernel and light kernel; default heavy kernel only runs at slot 0
-          # NOTE: change indexed for cuMAC slot with heavy kernel  
+    else: # separate cuMAC heavy kernel and light kernel using saved mac_slot_config and cumac_light_weight_flag
+        test_cfg = data[ikey].get("testConfig", {})
+        mac_slot_config = test_cfg.get("mac_slot_config")
+        cumac_light_weight_flag = test_cfg.get("cumac_light_weight_flag")
+        pattern_len = test_cfg.get("pattern_len", 10)
 
-        mac_heavy_buffer = mac_buffer[::8]
-        mac_light_buffer = [element for index, element in enumerate(mac_buffer) if index % 8 != 0]
-    
+        if mac_slot_config is not None and cumac_light_weight_flag is not None:
+            lw = cumac_light_weight_flag
+            if len(lw) == 0:
+                mac_heavy_buffer = mac_buffer[::8]
+                mac_light_buffer = [element for index, element in enumerate(mac_buffer) if index % 8 != 0]
+            else:
+                n_mac_per_pattern = sum(1 for j in range(min(len(mac_slot_config), pattern_len)) if mac_slot_config[j] == 1)
+                n_lw = len(lw)
+                mac_heavy_buffer = []
+                mac_light_buffer = []
+                for i in range(len(mac_buffer)):
+                    if not n_mac_per_pattern:
+                        break
+                    mac_run_idx = i % n_mac_per_pattern
+                    lw_idx = mac_run_idx % n_lw
+                    if lw[lw_idx] == 0:
+                        mac_heavy_buffer.append(mac_buffer[i])
+                    else:
+                        mac_light_buffer.append(mac_buffer[i])
+        else:
+            # backward compat: fallback to previous hardcoded split (heavy every 8th slot)
+            mac_heavy_buffer = mac_buffer[::8]
+            mac_light_buffer = [element for index, element in enumerate(mac_buffer) if index % 8 != 0]
+
         latency_to_cdf(ikey, mac_heavy_buffer, "MAC_heavy", channels)
         latency_to_cdf(ikey, mac_light_buffer, "MAC_light", channels)
         
@@ -447,12 +489,38 @@ for kidx, ikey in enumerate(data.keys()):
         
         latency_to_cdf(ikey, mac2_buffer, "MAC2", channels)
         
-    else: # separate cuMAC heavy kernel and light kernel; default heavy kernel only runs at slot 0
-          # NOTE: change indexed for cuMAC slot with heavy kernel  
+    else: # separate cuMAC2 heavy kernel and light kernel using same config as MAC1
+        test_cfg = data[ikey].get("testConfig", {})
+        mac_slot_config = test_cfg.get("mac_slot_config")
+        cumac_light_weight_flag = test_cfg.get("cumac_light_weight_flag")
+        pattern_len = test_cfg.get("pattern_len", 10)
+        mac2_lw_offset = test_cfg.get("mac2_light_weight_flag_offset", 2)
 
-        mac2_heavy_buffer = mac2_buffer[2::8] # 2 slot gap of MAC2, see cumacTestWorkerVec[macWorkerMap["MAC2"]].init(*) in cubb_gpu_test_bench.cpp
-        mac2_light_buffer = [element for index, element in enumerate(mac2_buffer) if index % 8 != 0]      
-        
+        if mac_slot_config is not None and cumac_light_weight_flag is not None:
+            lw = cumac_light_weight_flag
+            n_lw = len(lw)
+            if n_lw == 0:
+                mac2_heavy_buffer = mac2_buffer[2::8]
+                mac2_light_buffer = [element for index, element in enumerate(mac2_buffer) if index % 8 != 0]
+            else:
+                mac2_slot_indices = [j for j in range(min(len(mac_slot_config), pattern_len)) if mac_slot_config[j] == 1]
+                n_mac2_per_pattern = len(mac2_slot_indices) if mac2_slot_indices else 0
+                mac2_heavy_buffer = []
+                mac2_light_buffer = []
+                for i in range(len(mac2_buffer)):
+                    if not n_mac2_per_pattern:
+                        break
+                    mac_run_idx = i % n_mac2_per_pattern
+                    lw_idx = (mac_run_idx - mac2_lw_offset + n_lw) % n_lw
+                    if lw[lw_idx] == 0:
+                        mac2_heavy_buffer.append(mac2_buffer[i])
+                    else:
+                        mac2_light_buffer.append(mac2_buffer[i])
+        else:
+            # backward compat: fallback to previous hardcoded split
+            mac2_heavy_buffer = mac2_buffer[2::8]
+            mac2_light_buffer = [element for index, element in enumerate(mac2_buffer) if index % 8 != 0]
+
         latency_to_cdf(ikey, mac2_heavy_buffer, "MAC2_heavy", channels)
         latency_to_cdf(ikey, mac2_light_buffer, "MAC2_light", channels)
 

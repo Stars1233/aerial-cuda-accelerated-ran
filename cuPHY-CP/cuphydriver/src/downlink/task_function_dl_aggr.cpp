@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,11 +34,13 @@
 #include "aerial-fh-driver/oran.hpp"
 #include <sched.h>
 #include <unistd.h>
-#include "task_instrumentation.hpp"
+#include "task_instrumentation_v3.hpp"
+#include "task_instrumentation_v3_factories.hpp"
 #include "memtrace.h"
 #include "nvlog_fmt.hpp"
 #include "cupti_helper.hpp"
 #include "cuphy_pti.hpp"
+#include <optional>
 #include "scf_5g_fapi.h"
 #include "app_config.hpp"
 
@@ -62,10 +64,97 @@ int non_blocking_event_wait_with_timeout(cudaEvent_t event, t_ns timeout) {
     return 0;
 }
 
+/**
+ * Populate compression parameters array based on cell compression methods
+ * 
+ * Iterates through cells and populates the compression_params array indexed by
+ * the compression method from aerial_fh::UserDataCompressionMethod enum.
+ * 
+ * @param[out] cparams_array Array of compression_params structures, one per compression method
+ * @param[in] slot_map Pointer to the slot map containing cell information
+ * @param[in] pdctx Pointer to the PHY driver context
+ * @param[in] first_cell Index of the first cell to process
+ * @param[in] num_cells Number of cells to process
+ * @return Total number of valid cells processed across all compression methods
+ */
+int populateCompressionParams(
+    std::array<compression_params, NUM_USER_DATA_COMPRESSION_METHODS>& cparams_array,
+    SlotMapDl* slot_map,
+    PhyDriverCtx* pdctx,
+    const int first_cell,
+    const int num_cells)
+{
+    using CompMethod = aerial_fh::UserDataCompressionMethod;
+    
+    // Cell index counters for each compression method
+    std::array<int, NUM_USER_DATA_COMPRESSION_METHODS> cell_idx{};
+    int valid_cell_count{};
+    
+    // Initialize compression params for each method
+    for(std::size_t i = 0; i < NUM_USER_DATA_COMPRESSION_METHODS; ++i)
+    {
+        cparams_array[i].num_cells = 0;
+        cparams_array[i].gpu_comms = pdctx->gpuCommDlEnabled();
+    }
+    
+    // Populate compression params for each cell
+    for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++)
+    {
+        Cell* cell_ptr = slot_map->aggr_cell_list[i];
+        DLOutputBuffer* dlbuf = slot_map->aggr_dlbuf_list[i];
+        if(cell_ptr == nullptr || dlbuf == nullptr) continue;
+        
+        const uint8_t comp_meth = cell_ptr->getDLCompMeth();
+        
+        // Validate compression method index
+        if(comp_meth >= NUM_USER_DATA_COMPRESSION_METHODS)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, 
+                "Invalid compression method {} for cell {}", comp_meth, i);
+            continue;
+        }
+        
+        // Map NO_COMPRESSION to BLOCK_FLOATING_POINT array for processing
+        // Both methods can be handled by the same kernel path
+        // comp_meth[] stays the cell's real method (not array_idx) for kernel_compress.
+        const uint8_t array_idx = (comp_meth == static_cast<uint8_t>(CompMethod::NO_COMPRESSION)) 
+                                    ? static_cast<uint8_t>(CompMethod::BLOCK_FLOATING_POINT) 
+                                    : comp_meth;
+        
+        compression_params& cparams = cparams_array[array_idx];
+        int& curr_cell_idx = cell_idx[array_idx];
+        
+        // Build the compression parameters structure
+        cparams.input_ptrs[curr_cell_idx]   = dlbuf->getBufD();
+        cparams.prb_ptrs[curr_cell_idx]     = pdctx->gpuCommDlEnabled() ? dlbuf->getPrbPtrs() : nullptr;
+        cparams.beta[curr_cell_idx]         = cell_ptr->getBetaDlPowerScaling();
+        cparams.comp_meth[curr_cell_idx]    = comp_meth;
+        cparams.bit_width[curr_cell_idx]    = cell_ptr->getDLBitWidth();
+        cparams.num_antennas[curr_cell_idx] = cell_ptr->geteAxCNumPdsch();
+        cparams.max_num_prb_per_symbol[curr_cell_idx] = cell_ptr->getDLGridSize();
+        cparams.num_prbs[curr_cell_idx]     = ORAN_MAX_PRB * ORAN_PUSCH_SYMBOLS_X_SLOT * cell_ptr->geteAxCNumPdsch();
+        
+        // Initialize mod_compression config pointers if ModComp is enabled
+        if(comp_meth == static_cast<uint8_t>(CompMethod::MODULATION_COMPRESSION))
+        {
+            cparams.mod_compression_config[curr_cell_idx] = dlbuf->getModCompressionConfig();
+        }
+        
+        curr_cell_idx++;
+        cparams.num_cells++;
+        valid_cell_count++;
+        NVLOGI_FMT(TAG, "Compression params for cell {} (comp_meth: {}): num_cells: {}, gpu_comms: {}, curr_cell_idx: {}",
+            i, comp_meth, cparams.num_cells, cparams.gpu_comms, curr_cell_idx);
+    }
+    
+    return valid_cell_count;
+}
+
 int task_work_function_debug(Worker* worker, void* param, int first_cell, int num_cells, int num_dl_tasks)
 {
-    TI_INIT_DL("Debug Task",13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "Debug Task", 13);
+    ti.add("Start Task");
     int                                                                          task_num = 1, ret = 0;
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -73,9 +162,10 @@ int task_work_function_debug(Worker* worker, void* param, int first_cell, int nu
     int                                                                          sfn = 0, slot = 0;
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     // Compression DL Buf is the first dlbuf FIXME: create a compression object
     DLOutputBuffer *compression_dlbuf = nullptr;
     DLOutputBuffer *prepare_tx_dlbuf_per_nic[MAX_NUM_OF_NIC_SUPPORTED] = {nullptr};
@@ -94,8 +184,7 @@ int task_work_function_debug(Worker* worker, void* param, int first_cell, int nu
     //Condition check for DL BFW only scheduling on the slot (return immediately)
     if(slot_map->aggr_dlbfw && (slot_map->getNumCells()==0))
     {
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
         return 0;
     }
 
@@ -125,14 +214,14 @@ int task_work_function_debug(Worker* worker, void* param, int first_cell, int nu
         return -1;
     }
 
-    TI_ADD("Wait DL Gpu Comm End"); // Synchronize end of GPU Comm Task
+    ti.add("Wait DL Gpu Comm End"); // Synchronize end of GPU Comm Task
     if(slot_map->waitDlGpuCommEnd() < 0) {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitDlGpuCommEnd returned error for SFN {}.{} Map {}", sfn, slot, slot_map->getId());
         EXIT_L1(EXIT_FAILURE);
     }    
 
     //Wait for PrePrepare to start
-    TI_ADD("PrePrepare Stop Wait");
+    ti.add("PrePrepare Stop Wait");
     if(prepare_tx_dlbuf_per_nic[0]->waitPrePrepareStop() != 0)
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task DL {} Map {} got PrePrepare Stop wait error", task_num , slot_map->getId());
@@ -144,7 +233,7 @@ int task_work_function_debug(Worker* worker, void* param, int first_cell, int nu
     }
 
     //Wait for compression to start
-    TI_ADD("Compression Start Wait");
+    ti.add("Compression Start Wait");
     if(compression_dlbuf->waitCompressionStart() != 0)
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task DL {} Map {} got COMPRESSION DL wait start error", task_num , slot_map->getId());
@@ -156,7 +245,7 @@ int task_work_function_debug(Worker* worker, void* param, int first_cell, int nu
     }
 
     //Wait for compression to stop
-    TI_ADD("Compression Wait");
+    ti.add("Compression Wait");
     PUSH_RANGE_PHYDRV("DL WAIT COMP", 3);
     slot_map->timings.start_t_dl_compression_compl = Time::nowNs();
     if(compression_dlbuf->waitCompressionStop() != 0)
@@ -167,12 +256,10 @@ int task_work_function_debug(Worker* worker, void* param, int first_cell, int nu
     slot_map->timings.end_t_dl_compression_compl = Time::nowNs();
     POP_RANGE_PHYDRV;
 
-    //TI_ADD("Prepare Tracing"); // Could consider adding this extra tag here to measure effect of event queries
+    //ti.add("Prepare Tracing"); // Could consider adding this extra tag here to measure effect of event queries
     //NVLOGC_FMT(TAG, "Prepare tracing start");
-//#if 1 // If set to 0, all prepre_execution_duration*, channel_to_compression_gap and compression_execution_duration are all set to 0
-t_ns wait_thresh_t(pdctx->getcuphy_dl_channel_wait_th());
-if(pdctx->getUseGreenContexts() == 0 && pdctx->gpuCommEnabledViaCpu() == false) {
-#if 1 // If set to 0, a single getPrepareExecutionTimes function is used to avoid querying the same event multiple times
+    t_ns wait_thresh_t(pdctx->getcuphy_dl_channel_wait_th());
+
     if(pdctx->enablePrepareTracing()) {
         //Note: prepare events are always before compression execution, therefore no waits are needed here
         for(int i = 0; i < MAX_NUM_OF_NIC_SUPPORTED; ++i)
@@ -208,35 +295,8 @@ if(pdctx->getUseGreenContexts() == 0 && pdctx->gpuCommEnabledViaCpu() == false) 
     slot_map->timings.channel_to_compression_gap = compression_dlbuf->getChannelToCompressionGap();
     slot_map->timings.compression_execution_duration = compression_dlbuf->getCompressionExecutionTime();
     //NVLOGC_FMT(TAG, "Prepare tracing end");
-#else
-    for(int i = 0; i < MAX_NUM_OF_NIC_SUPPORTED; ++i)
-    {
-        if(pdctx->enablePrepareTracing() && prepare_tx_dlbuf_per_nic[i])
-        {
-            prepare_tx_dlbuf_per_nic[i]->getPrepareExecutionTimes(slot_map->timings.prepare_execution_duration1[i], slot_map->timings.prepare_execution_duration2[i], slot_map->timings.prepare_execution_duration3[i]);
-        }
-        else
-        {
-            slot_map->timings.prepare_execution_duration1[i] = 0.0;
-            slot_map->timings.prepare_execution_duration2[i] = 0.0;
-            slot_map->timings.prepare_execution_duration3[i] = 0.0;
-        }
-    }
-    slot_map->timings.channel_to_compression_gap = compression_dlbuf->getChannelToCompressionGap();
-    slot_map->timings.compression_execution_duration = compression_dlbuf->getCompressionExecutionTime();
-#endif
-//#else
-} else {
-    // in green contexts mode skip (for now) prepare tracing event queries as it can have high overhead.
-    slot_map->timings.prepare_execution_duration1[0] = 0.0;
-    slot_map->timings.prepare_execution_duration2[0] = 0.0;
-    slot_map->timings.prepare_execution_duration3[0] = 0.0;
-    slot_map->timings.channel_to_compression_gap = 0;
-    slot_map->timings.compression_execution_duration = 0;
-}
-//#endif
 
-    TI_ADD("Trigger synchronize");
+    ti.add("Trigger synchronize");
     if(pdctx->gpuCommEnabledViaCpu())
     {
         if(slot_map->waitDlCpuDoorBellTaskDone() < 0) {
@@ -290,16 +350,16 @@ if(pdctx->getUseGreenContexts() == 0 && pdctx->gpuCommEnabledViaCpu() == false) 
     memset(stats->dh_gpu_stop_times, 0, sizeof(uint64_t)*CUPHY_PTI_ACTIVITIES_MAX);
 #endif
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 }
 
 int task_work_function_dl_aggr_bfw(Worker* worker, void* param, int first_cell, int num_cells, int num_dl_tasks)
 {
-    TI_INIT_DL("DL Task BFW",13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task BFW", 13);
+    ti.add("Start Task");
     int                                                                          task_num = 1, ret = 0;
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -320,9 +380,10 @@ int task_work_function_dl_aggr_bfw(Worker* worker, void* param, int first_cell, 
     PhyDlBfwAggr* dlbfw = slot_map->aggr_dlbfw;
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     struct slot_command_api::dl_slot_callbacks dl_cb;
     std::array<uint32_t,DL_MAX_CELLS_PER_SLOT> cell_idx_list={};
     int cell_count=0;
@@ -352,7 +413,7 @@ int task_work_function_dl_aggr_bfw(Worker* worker, void* param, int first_cell, 
     if (dlbfw) {
         try
         {
-            TI_ADD("Cuda Setup");
+            ti.add("Cuda Setup");
             if (dlbfw->setup(slot_map->aggr_cell_list))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "DL BFW Setup returned error for Map {} SFN {}.{}",slot_map->getId(), sfn, slot);
@@ -365,7 +426,7 @@ int task_work_function_dl_aggr_bfw(Worker* worker, void* param, int first_cell, 
             slot_map->timings.end_t_dl_bfw_setup[0] = Time::nowNs();
             slot_map->timings.start_t_dl_bfw_run[0] = slot_map->timings.end_t_dl_bfw_setup[0];
 
-            TI_ADD("Cuda Run");
+            ti.add("Cuda Run");
             if(dlbfw->run())
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "DL BFW run returned error for Map {} SFN {}.{}",slot_map->getId(), sfn, slot);
@@ -373,14 +434,14 @@ int task_work_function_dl_aggr_bfw(Worker* worker, void* param, int first_cell, 
                 slot_map->getCellMplaneIdxList(cell_idx_list,&cell_count);
                 if(pdctx->getDlCb(dl_cb))
                 {
-                    dl_cb.dl_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_DL_BFW_CVI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
+                    dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_DL_BFW_CVI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
                 }
                 //goto exit_error;
             }
             else
                 dlbfw->setRunStatus(CH_RUN_DONE_NO_ERROR);
 
-            TI_ADD("Signal Completion");
+            ti.add("Signal Completion");
             if(dlbfw->signalRunCompletionEvent(false))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "DL BFW signalCompletion returned error SFN {}.{}\n", sfn, slot);
@@ -393,11 +454,11 @@ int task_work_function_dl_aggr_bfw(Worker* worker, void* param, int first_cell, 
     slot_map->timings.end_t_dl_bfw_run[0] = Time::nowNs();
     POP_RANGE_PHYDRV
 
-    TI_ADD("Signal Slot End Task");
+    ti.add("Signal Slot End Task");
     slot_map->addSlotEndTask();
     start_t_2 = Time::nowNs();
 
-    TI_ADD("Wait Run Start");
+    ti.add("Wait Run Start");
     start_t = Time::nowNs();
     do
     {
@@ -411,7 +472,7 @@ int task_work_function_dl_aggr_bfw(Worker* worker, void* param, int first_cell, 
         goto exit_error;
     }
 
-    TI_ADD("Wait Run Completion");
+    ti.add("Wait Run Completion");
     start_t = Time::nowNs();
     slot_map->timings.start_t_dl_bfw_compl[0] = start_t;
     do
@@ -436,8 +497,7 @@ int task_work_function_dl_aggr_bfw(Worker* worker, void* param, int first_cell, 
         slot_map->timings.end_t_dl_bfw_cb[0] = Time::nowNs();
     }
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
     // NVSLOGI(TAG) << "SFN " << sfn << "." << slot
     //             << " Task DL " << task_num << " DLBFW Map " << slot_map->getId() << " DL objects " << slot_map->getNumCells()
     //             << " Started at " << start_t_1.count()
@@ -458,8 +518,9 @@ exit_error:
 
 int task_work_function_dl_aggr_1_pdsch(Worker* worker, void* param, int first_cell, int num_cells, int num_dl_tasks)
 {
-    TI_INIT_DL("DL Task PDSCH",13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task PDSCH", 13);
+    ti.add("Start Task");
     int                                                                          task_num = 1, ret = 0;
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -469,9 +530,10 @@ int task_work_function_dl_aggr_1_pdsch(Worker* worker, void* param, int first_ce
     PhyPdschAggr* pdsch = slot_map->aggr_pdsch;
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     uint32_t cpu;
     struct slot_command_api::dl_slot_callbacks dl_cb;
     std::array<uint32_t,DL_MAX_CELLS_PER_SLOT> cell_idx_list={};
@@ -502,7 +564,7 @@ int task_work_function_dl_aggr_1_pdsch(Worker* worker, void* param, int first_ce
     if (pdsch) {
         try
         {
-            TI_ADD("Cuda Setup");
+            ti.add("Cuda Setup");
             if (pdsch->setup(slot_map->aggr_cell_list, slot_map->aggr_dlbuf_list))
             {
                 // Logging takes place in phypdsch_aggr.cpp
@@ -516,7 +578,7 @@ int task_work_function_dl_aggr_1_pdsch(Worker* worker, void* param, int first_ce
             slot_map->timings.end_t_dl_pdsch_setup[0] = Time::nowNs();
             slot_map->timings.start_t_dl_pdsch_run[0] = slot_map->timings.end_t_dl_pdsch_setup[0];
 
-            TI_ADD("Cuda Run");
+            ti.add("Cuda Run");
             if(pdsch->run())
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PDSCH run returned error for Map {}",slot_map->getId());
@@ -524,7 +586,7 @@ int task_work_function_dl_aggr_1_pdsch(Worker* worker, void* param, int first_ce
                 slot_map->getCellMplaneIdxList(cell_idx_list,&cell_count);
                 if(pdctx->getDlCb(dl_cb))
                 {
-                    dl_cb.dl_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_DL_TTI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
+                    dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_DL_TTI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
                 }
                 //goto exit_error;
             }
@@ -532,7 +594,7 @@ int task_work_function_dl_aggr_1_pdsch(Worker* worker, void* param, int first_ce
                 pdsch->setRunStatus(CH_RUN_DONE_NO_ERROR);
 #if SIGNAL_COMPLETION_W_EVENTS
 
-            TI_ADD("Signal Completion");
+            ti.add("Signal Completion");
             if(pdsch->signalRunCompletionEvent(false))
 #else
             if(pdsch->signalRunCompletion())
@@ -547,14 +609,13 @@ int task_work_function_dl_aggr_1_pdsch(Worker* worker, void* param, int first_ce
     slot_map->timings.end_t_dl_pdsch_run[0] = Time::nowNs();
     POP_RANGE_PHYDRV
 
-    TI_ADD("Signal Slot Channel End");
+    ti.add("Signal Slot Channel End");
     slot_map->addSlotChannelEnd();
-    TI_ADD("Signal Slot End Task");
+    ti.add("Signal Slot End Task");
     slot_map->addSlotEndTask();
     start_t_2 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
     // NVSLOGI(TAG) << "SFN " << sfn << "." << slot
     //             << " Task DL " << task_num << " PDSCH Map " << slot_map->getId() << " DL objects " << slot_map->getNumCells()
     //             << " Started at " << start_t_1.count()
@@ -576,8 +637,9 @@ exit_error:
 
 int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_cell, int num_cells, int num_dl_tasks)
 {
-    TI_INIT_DL("DL Task Control", 13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task Control", 13);
+    ti.add("Start Task");
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
     PhyPdcchAggr* pdcch_dl = slot_map->aggr_pdcch_dl;
@@ -588,9 +650,10 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
     int ret;
     int sfn  = slot_map->getSlot3GPP().sfn_;
     int slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     std::string map_str = std::to_string(slot_map->getId());
     struct slot_command_api::dl_slot_callbacks dl_cb;
     std::array<uint32_t,DL_MAX_CELLS_PER_SLOT> cell_idx_list={};
@@ -616,7 +679,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
 
     try {
         // Setup for each control channel
-        TI_ADD("PDCCH_DL Setup");
+        ti.add("PDCCH_DL Setup");
         if(pdcch_dl != nullptr) {
             PUSH_RANGE_PHYDRV((std::string("DL PDCCH DL Setup") + map_str).c_str(), 2);
             slot_map->timings.start_t_dl_pdcchdl_setup[0] = Time::nowNs();
@@ -631,7 +694,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
             tasks++;
         }
 
-        TI_ADD("PDCCH_UL Setup");
+        ti.add("PDCCH_UL Setup");
         if (pdcch_ul != nullptr) {
             PUSH_RANGE_PHYDRV((std::string("DL PDCCH UL Setup") + map_str).c_str(), 2);
             slot_map->timings.start_t_dl_pdcchul_setup[0] = Time::nowNs();
@@ -646,7 +709,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
             tasks++;
         }
 
-        TI_ADD("PBCH Setup");
+        ti.add("PBCH Setup");
         if (pbch != nullptr) {
             PUSH_RANGE_PHYDRV((std::string("DL PBCH Setup") + map_str).c_str(), 2);
             slot_map->timings.start_t_dl_pbch_setup[0] = Time::nowNs();
@@ -661,7 +724,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
             tasks++;
         }
 
-        TI_ADD("CSIRS Setup");
+        ti.add("CSIRS Setup");
         if (csirs != nullptr) {
             PUSH_RANGE_PHYDRV((std::string("DL CSIRS Setup") + map_str).c_str(), 2);
             slot_map->timings.start_t_dl_csirs_setup[0] = Time::nowNs();
@@ -677,7 +740,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
         }
 
         // Run
-        TI_ADD("PDCCH_DL Run");
+        ti.add("PDCCH_DL Run");
         if (pdcch_dl != nullptr) {
             PUSH_RANGE_PHYDRV((std::string("DL PDCCH DL Run") + map_str).c_str(), 2);
             slot_map->timings.start_t_dl_pdcchdl_run[0] = Time::nowNs();
@@ -687,7 +750,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
                 slot_map->getCellMplaneIdxList(cell_idx_list,&cell_count);
                 if(pdctx->getDlCb(dl_cb))
                 {
-                    dl_cb.dl_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_DL_TTI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
+                    dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_DL_TTI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
                 }
             }
             else
@@ -706,7 +769,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
             slot_map->timings.end_t_dl_pdcchdl_run[0] = Time::nowNs();
         }
 
-        TI_ADD("PDCCH_UL Run");
+        ti.add("PDCCH_UL Run");
         if (pdcch_ul != nullptr) {
             PUSH_RANGE_PHYDRV((std::string("DL PDCCH UL Run") + map_str).c_str(), 2);
             slot_map->timings.start_t_dl_pdcchul_run[0] = Time::nowNs();
@@ -716,7 +779,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
                 slot_map->getCellMplaneIdxList(cell_idx_list,&cell_count);
                 if(pdctx->getDlCb(dl_cb))
                 {
-                    dl_cb.dl_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_DCI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
+                    dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_DCI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
                 }
             }
             else
@@ -735,7 +798,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
             slot_map->timings.end_t_dl_pdcchul_run[0] = Time::nowNs();
         }
 
-        TI_ADD("PBCH Run");
+        ti.add("PBCH Run");
         if (pbch != nullptr) {
             PUSH_RANGE_PHYDRV((std::string("DL PBCH Run") + map_str).c_str(), 2);
             slot_map->timings.start_t_dl_pbch_run[0] = Time::nowNs();
@@ -745,7 +808,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
                 slot_map->getCellMplaneIdxList(cell_idx_list,&cell_count);
                 if(pdctx->getDlCb(dl_cb))
                 {
-                    dl_cb.dl_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_DL_TTI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
+                    dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_DL_TTI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
                 }
             }
             else
@@ -765,7 +828,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
             slot_map->timings.end_t_dl_pbch_run[0] = Time::nowNs();
         }
 
-        TI_ADD("CSIRS Run");
+        ti.add("CSIRS Run");
         if (csirs != nullptr) {
             PUSH_RANGE_PHYDRV((std::string("DL CSIRS Run") + map_str).c_str(), 2);
             slot_map->timings.start_t_dl_csirs_run[0] = Time::nowNs();
@@ -775,7 +838,7 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
                 slot_map->getCellMplaneIdxList(cell_idx_list,&cell_count);
                 if(pdctx->getDlCb(dl_cb))
                 {
-                    dl_cb.dl_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_DL_TTI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
+                    dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_DL_TTI_REQUEST,SCF_ERROR_CODE_L1_DL_CH_ERROR,cell_idx_list,cell_count);
                 }
             }
             else
@@ -797,30 +860,31 @@ int task_work_function_dl_aggr_control(Worker* worker, void* param, int first_ce
     }
     PHYDRIVER_CATCH_EXCEPTIONS_FATAL_EXIT()
 
-    TI_ADD("Signal Slot Channel End");
+    ti.add("Signal Slot Channel End");
     slot_map->addSlotChannelEnd();
-    TI_ADD("Signal Slot End Task");
+    ti.add("Signal Slot End Task");
     slot_map->addSlotEndTask();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn, slot, slot_map->getId(), cpu);
+    ti.add("End Task");
 
     return 0;
 }
 
 int task_work_function_dl_fh_cb(Worker* worker, void* param, int first_cell, int num_cells, int num_dl_tasks)
 {
-    TI_INIT_DL("DL Task FH Callback", 3);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task FH Callback", 3);
+    ti.add("Start Task");
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
     struct slot_command_api::dl_slot_callbacks dl_cb;
 
     int sfn  = slot_map->getSlot3GPP().sfn_;
     int slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     pdctx->getDlCtx()->setCtx();
 
@@ -839,7 +903,7 @@ int task_work_function_dl_fh_cb(Worker* worker, void* param, int first_cell, int
         if(cell_ptr == nullptr) continue;
 
         if (valid) {
-            dl_cb.fh_prepare_callback_fn(slot_map->aggr_slot_params->cgcmd, cell_ptr->getIdx());
+            dl_cb.fh_prepare_callback_fn(dl_cb.fh_prepare_callback_fn_context, slot_map->aggr_slot_params->cgcmd, cell_ptr->getIdx());
         }
         slot_map->setCellFHCBDone(cell_ptr->getIdx()); 
     }
@@ -847,8 +911,7 @@ int task_work_function_dl_fh_cb(Worker* worker, void* param, int first_cell, int
     slot_map->setFHCBDone();
     slot_map->addSlotEndTask();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 }
@@ -857,8 +920,9 @@ int task_work_function_cplane(Worker* worker, void* param, int task_num, int fir
 {
     char name[64];
     sprintf(name, "DL Task C-Plane %d", task_num + 1);
-    TI_INIT_DL(name,14);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, name, 14);
+    ti.add("Start Task");
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
     Cell * cell_ptr = nullptr;
@@ -866,9 +930,10 @@ int task_work_function_cplane(Worker* worker, void* param, int task_num, int fir
     t_ns                                                                         start_tx;
     int sfn = slot_map->getSlot3GPP().sfn_;
     int slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     struct slot_command_api::dl_slot_callbacks dl_cb;
     std::array<uint32_t,DL_MAX_CELLS_PER_SLOT> cplane_tx_err_cell_idx_list={};
     int cplane_tx_err_cell_count=0;
@@ -902,7 +967,7 @@ int task_work_function_cplane(Worker* worker, void* param, int task_num, int fir
         try
         {
 
-            TI_ADD("Wait DLBFW Completion");
+            ti.add("Wait DLBFW Completion");
             int prevSlotDlBfwCompStatus = 1;
             if(pdctx->getmMIMO_enable() && task_num < slot_map->getNumCells())
             {
@@ -930,10 +995,26 @@ int task_work_function_cplane(Worker* worker, void* param, int task_num, int fir
 
             }
             
-            TI_ADD("CPlane Prepare");
-            const bool valid = pdctx->getDlCb(dl_cb);  
-            for(int i = task_num; i < slot_map->getNumCells(); i += num_tasks)
+            ti.add("CPlane Prepare");
+            const bool valid = pdctx->getDlCb(dl_cb);
+            const uint8_t dlc_packing_scheme = pdctx->get_dlc_core_packing_scheme();
+            
+            bool send_nonbfw[MAX_CELLS_PER_SLOT]{}; 
+
+            for(int i = 0; i < slot_map->getNumCells(); i++)
             {
+                // Apply packing scheme filter
+                if (dlc_packing_scheme == 0) {
+                    // Scheme 0 (default): strided iteration - task_num handles cells task_num, task_num+num_tasks, etc.
+                    if ((i % num_tasks) != task_num) continue;
+                } else if (dlc_packing_scheme == 1) {
+                    // Scheme 1 (fixed per-cell): check if cell's dlc_core_index matches this task_num
+                    Cell* check_cell = slot_map->aggr_cell_list[i];
+                    if (check_cell == nullptr) continue;
+                    if (check_cell->getDlcCoreIndex() != task_num) continue;
+                }
+                // Note: Scheme 2 (dynamic workload-based) is not yet supported and validated during init
+
                 if(pdsch)
                 {
                     if(pdctx->getUeMode()) //Skip sending DLC plane packets in UE mode (Spec effeciency)
@@ -966,7 +1047,7 @@ int task_work_function_cplane(Worker* worker, void* param, int task_num, int fir
                 ti_subtask_info tis{}; 
                 if(slot_map->aggr_slot_info[i]) //slot_info != nullptr)
                 {
-                    if((ret=fhproxy->sendCPlane(
+                    if((ret=fhproxy->prepareCPlaneInfo(
                         cell_ptr->getIdx(),
                         cell_ptr->getRUType(),
                         cell_ptr->getPeerId(),
@@ -976,27 +1057,70 @@ int task_work_function_cplane(Worker* worker, void* param, int task_num, int fir
                         DIRECTION_DOWNLINK,
                         slot_oran_ind, //it_ulchannels.second.slot_oran_ind,
                         *(slot_map->aggr_slot_info[i]), //*slot_map->aggr_slot_info[i], //*slot_info,
-                        0, slot_map->getDynBeamIdOffset(), 0, 0,&bfw_header,t_ns(0), prevSlotDlBfwCompStatus,slot_map->atom_dl_cplane_info_for_uplane_rdy_count,
-                        tis))!=SEND_CPLANE_NO_ERROR)
+                        0, slot_map->getDynBeamIdOffset(), 0, 0,&bfw_header,t_ns(0), prevSlotDlBfwCompStatus, tis))!=SEND_CPLANE_NO_ERROR)
                     {
                         //Do not return with a negative error code if DLC error
                         cplane_tx_err_cell_idx_list[cplane_tx_err_cell_count++]=cell_ptr->getIdx();
-                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "DL C-plane send error for task num {} error type {} Map {}",i,ret,slot_map->getId());
+                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "DL C-plane prepare error for task num {} error type {} Map {}",i,ret,slot_map->getId());
+                        // If the first step failed, none of the sendCPlaneMMIMO will execute, so setup any unblocking signals here. 
                         slot_map->atom_dl_cplane_info_for_uplane_rdy_count.fetch_add(1);
+                        slot_map->aggr_slot_info[i]->section_id_ready.store(true);
                     }
-                    // Appends any subtask instrumentation added by the sendCPlane call.
-                    TI_APPEND_LIST(tis); 
+
+                    if (ret == SEND_CPLANE_NO_ERROR && pdctx->getmMIMO_enable()) {
+                        // Construct & send BFW packets first as they have stricter deadline reqs
+                        if ((ret = fhproxy->sendCPlaneMMIMO(
+                                   true /* BFW packets */,
+                                   cell_ptr->getIdx(),
+                                   cell_ptr->getPeerId(),
+                                   DIRECTION_DOWNLINK,
+                                   tis)) != SEND_CPLANE_NO_ERROR) {
+                            cplane_tx_err_cell_idx_list[cplane_tx_err_cell_count++]=cell_ptr->getIdx();
+                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "DL C-plane MMIMO BFW Send error for task num {} error type {} Map {}",i,ret,slot_map->getId());
+                        }
+                        send_nonbfw[i] = true; // Pending sending non-BFW packets.
+                    }
+
+                    // Appends any subtask instrumentation added by the sendCPlane/sendCPlaneMMIMO call.
+                    ti.appendList(tis);
                 }
 
                 if(valid)
                 {
                     if(bfw_header != nullptr)
                     {
-                        dl_cb.fh_bfw_coeff_usage_done_fn(bfw_header);
+                        dl_cb.fh_bfw_coeff_usage_done_fn(dl_cb.fh_bfw_coeff_usage_done_fn_context, bfw_header);
                     }
                 }
+
+                if (!pdctx->getmMIMO_enable()) {
+                    // For nonMMIMO case, this is the end time for when a cell's C-Plane processing is done.
+                    slot_map->timings.end_t_dl_cplane[i] = Time::nowNs();
+                }
+            } // for(int i = 0; i < slot_map->getNumCells(); i++)
+            
+            // Handle the pending non-BFW packet construction & sending. 
+            for(int i = 0; i < slot_map->getNumCells(); i++)
+            {
+                if (send_nonbfw[i]) 
+                {
+                    ti_subtask_info tis{}; 
+                    cell_ptr = slot_map->aggr_cell_list[i];
+                    if ((ret=fhproxy->sendCPlaneMMIMO(false /* nonBFW packets */, cell_ptr->getIdx(), cell_ptr->getPeerId(), DIRECTION_DOWNLINK, tis)) != SEND_CPLANE_NO_ERROR) {
+                        cplane_tx_err_cell_idx_list[cplane_tx_err_cell_count++]=cell_ptr->getIdx();
+                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "DL C-plane MMIMO non-BFW Send error for task num {} error type {} Map {}",i,ret,slot_map->getId()); 
+                    }
+
+                    // Appends any subtask instrumentation added by the sendCPlaneMMIMO call.
+                    ti.appendList(tis);
+                }
+                // For MMIMO case, this is the end time for when a cell's C-Plane processing is done.
                 slot_map->timings.end_t_dl_cplane[i] = Time::nowNs();
+                // Now since the cell's workload is completed successfully (Prepare, BFW and non-BFW) - setup unblocking signals.
+                slot_map->atom_dl_cplane_info_for_uplane_rdy_count.fetch_add(1);
+                slot_map->aggr_slot_info[i]->section_id_ready.store(true);
             }
+
             if(valid)
             {
                 if(cplane_tx_err_cell_count>0)
@@ -1011,7 +1135,7 @@ int task_work_function_cplane(Worker* worker, void* param, int task_num, int fir
                     {
                         msg_id = SCF_FAPI_DL_BFW_CVI_REQUEST;
                     }
-                    dl_cb.dl_tx_error_fn(slot_ind,msg_id,SCF_ERROR_CODE_L1_DL_CPLANE_TX_ERROR,cplane_tx_err_cell_idx_list,cplane_tx_err_cell_count);
+                    dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_ind,msg_id,SCF_ERROR_CODE_L1_DL_CPLANE_TX_ERROR,cplane_tx_err_cell_idx_list,cplane_tx_err_cell_count);
                 }
             }
         }
@@ -1019,21 +1143,27 @@ int task_work_function_cplane(Worker* worker, void* param, int task_num, int fir
         POP_RANGE_PHYDRV
     } // if (!pdctx->isCPlaneDisabled)
 
-    TI_ADD("Signal completion");
+    ti.add("Signal completion");
     
     slot_map->incDLCDone();
     slot_map->addSlotEndTask();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    // Signal C-plane completion for this task when DL affinity is disabled
+    // This allows task_work_function_dl_aggr_2_gpu_comm_prepare to synchronize. Applicable only when mMIMO is enabled.
+    if (pdctx->getmMIMO_enable() && pdctx->get_enable_dl_core_affinity() == 0) {
+        slot_map->setCplaneDoneForTask(task_num);
+    }
+
+    ti.add("End Task");
 
     return 0;
 }
 
 int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int first_cell, int num_cells, int num_dl_tasks)
 {
-    TI_INIT_DL("DL Task Compression",14);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task Compression", 14);
+    ti.add("Start Task");
     int                                                                          task_num = 1, ret = 0;
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -1052,9 +1182,10 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
     struct slot_command_api::dl_slot_callbacks dl_cb;
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     uint32_t cpu;
     ret = getcpu(&cpu, nullptr);
     if(ret != 0)
@@ -1065,7 +1196,7 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
 
     pdctx->dl_aggr_compression_task.lock(); //Mutex lock to ensure that Compression kernel for future slots dont get launched before compression kernel for present slot
     //NVLOGI_FMT(TAG,"DL Task 1(Compression) started on CPU {} for Map {}, SFN slot ({},{})", cpu, slot_map->getId(), sfn, slot);
-    TI_ADD("Buffer Selection");
+    ti.add("Buffer Selection");
     pdctx->getDlCtx()->setCtx();
     cudaStream_t first_strm;
     int local_cell_cnt = 0;
@@ -1117,47 +1248,24 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
     /////////////////////////////////////////////////////////////////////////////////////
     //// Compression Preparation
     /////////////////////////////////////////////////////////////////////////////////////
-    TI_ADD("Create Compression Params");
-    compression_params cparams;
-    cparams.num_cells = num_cells;
-    cparams.gpu_comms = pdctx->gpuCommDlEnabled();
-
-    for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++)
-    {
-        Cell * cell_ptr = slot_map->aggr_cell_list[i];
-        DLOutputBuffer * dlbuf = slot_map->aggr_dlbuf_list[i];
-        if(cell_ptr == nullptr || dlbuf == nullptr) continue;
-        
-        // Build the compression parameters structure
-        cparams.input_ptrs[valid_cell_idx]   = dlbuf->getBufD();
-        cparams.prb_ptrs[valid_cell_idx]     = pdctx->gpuCommDlEnabled() ? dlbuf->getPrbPtrs() : nullptr;
-        cparams.beta[valid_cell_idx]         = cell_ptr->getBetaDlPowerScaling();
-        cparams.comp_meth[valid_cell_idx]    = cell_ptr->getDLCompMeth();
-        cparams.bit_width[valid_cell_idx]    = cell_ptr->getDLBitWidth();
-        cparams.num_antennas[valid_cell_idx] = cell_ptr->geteAxCNumPdsch();
-        cparams.max_num_prb_per_symbol[valid_cell_idx]  = cell_ptr->getDLGridSize();
-        cparams.num_prbs[valid_cell_idx]     = ORAN_MAX_PRB * ORAN_PUSCH_SYMBOLS_X_SLOT * cell_ptr->geteAxCNumPdsch();
-
-        //Initialize mod_compression config pointers if enabled
-        if(cell_ptr->getDLCompMeth() == 4)
-        {    
-            cparams.mod_compression_config[valid_cell_idx] = dlbuf->getModCompressionConfig();
-        }
-
-        //printf("Build compression params: cell %d, valid_cell_idx %d, num_prbs %d\n", i, valid_cell_idx, cparams.num_prbs[valid_cell_idx]);
-        valid_cell_idx++;
-    }
+    ti.add("Create Compression Params");
+    
+    // Array of compression params - one per compression method (indexed by aerial_fh::UserDataCompressionMethod)
+    std::array<compression_params, NUM_USER_DATA_COMPRESSION_METHODS> cparams_array{};
+    
+    // Populate compression parameters for all cells, grouped by compression method
+    valid_cell_idx = populateCompressionParams(cparams_array, slot_map, pdctx, first_cell, num_cells);
 
     // For compression additionally wait for all enabled DL channel and GPU init comms
     // tasks to end. GPU init comms prepares the PRB buffers needed by compression
-    TI_ADD("Wait Slot Channel End");
+    ti.add("Wait Slot Channel End");
     if(slot_map->waitSlotChannelEnd(num_tasks_to_wait) < 0) {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitSlotChannelEnd returned error for Map {} num_dl_tasks {} num_dlc_tasks {} num_tasks_ignore_for_wait {}",slot_map->getId(),num_dl_tasks,num_dlc_tasks,num_tasks_ignore_for_wait);
         goto exit_error;
     }
     start_t_1 = Time::nowNs();
 
-    TI_ADD("Channel Waits");
+    ti.add("Channel Waits");
 #if SIGNAL_COMPLETION_W_EVENTS
     if (pbch && pbch->waitRunCompletionGPUEvent(first_strm, pdctx->getDlCtx())) {
 #else
@@ -1206,7 +1314,7 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
     if(pdsch||csirs||pdcch_dl||pdcch_ul||pbch)
     {
         //Record that the channels have completed
-        TI_ADD("Record Channels Done");
+        ti.add("Record Channels Done");
         if(compression_dlbuf==nullptr)
             goto exit_error;
         {
@@ -1214,7 +1322,7 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
             CUDA_CHECK_PHYDRIVER(cudaEventRecord(compression_dlbuf->getAllChannelsDoneEvt(), first_strm));
         }
 
-        TI_ADD("Wait DL Gpu Comm End"); // Synchronize end of GPU Comm Task
+        ti.add("Wait DL Gpu Comm End"); // Synchronize end of GPU Comm Task
         if(slot_map->waitDlGpuCommEnd() < 0) {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitDlGpuCommEnd returned error");
             EXIT_L1(EXIT_FAILURE);
@@ -1222,7 +1330,7 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
 
         // Wait for GPU init comms prepare to finish making the buffers needed for compression
         // Note: this event is in another stream and another context!!!
-        TI_ADD("Stream Wait Prepare");
+        ti.add("Stream Wait Prepare");
         if(pdctx->gpuCommDlEnabled()) {
             for(int i = 0; i < MAX_NUM_OF_NIC_SUPPORTED; ++i)
             {
@@ -1234,11 +1342,14 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
         /////////////////////////////////////////////////////////////////////////////////////
         //// Compression
         /////////////////////////////////////////////////////////////////////////////////////
-        TI_ADD("Compression Run");
+        ti.add("Compression Run");
         PUSH_RANGE_PHYDRV((std::string("DL COMPRESS") + std::to_string(slot_map->getId())).c_str(), 2);
         slot_map->timings.start_t_dl_compression_cuda = Time::nowNs();
-        // Run batched compression on all cells
-        if(compression_dlbuf->runCompression(cparams, pdctx->getDlCtx(), first_strm))
+        
+        // Run batched compression for all compression methods
+        // The array contains compression params for all 7 compression methods (indexed by aerial_fh::UserDataCompressionMethod)
+        // runCompression and launch_kernel_compression will process only those methods that have cells (num_cells > 0)
+        if(compression_dlbuf->runCompression(cparams_array, pdctx->getDlCtx(), first_strm))
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "COMPRESSION cell returned error");
             goto exit_error;
@@ -1247,7 +1358,7 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
         slot_map->timings.end_t_dl_compression_cuda = Time::nowNs();
         POP_RANGE_PHYDRV
 
-        TI_ADD("Set Ready Flag");
+        ti.add("Set Ready Flag");
         if(pdctx->gpuCommDlEnabled()) {
             /* Notify GComm output buffer is ready */
             for(int i = 0; i < MAX_NUM_OF_NIC_SUPPORTED; ++i)
@@ -1258,13 +1369,12 @@ int task_work_function_dl_aggr_1_compression(Worker* worker, void* param, int fi
         }
     }
 
-    TI_ADD("Signal Slot End Task");
+    ti.add("Signal Slot End Task");
     slot_map->setDlCompEnd();
     slot_map->addSlotEndTask();
     start_t_2 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
     // NVSLOGI(TAG) << "SFN " << sfn << "." << slot
     //             << " Task DL " << task_num << " Compression Map " << slot_map->getId() << " DL objects " << slot_map->getNumCells()
     //             << " Started at " << start_t_1.count()
@@ -1311,8 +1421,9 @@ void* queue_log_thread_func(void* arg)
 
 int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, int num_cells,int num_dl_tasks)
 {
-    TI_INIT_DL("DL Task CPU Comms",13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task CPU Comms", 13);
+    ti.add("Start Task");
     int                                                                          task_num = 2, ret = 0;
     uint16_t                                                                     numPrb, startPrb, endPrb;
     uint16_t                                                                     _numPrb, _startPrb, _endPrb;
@@ -1337,9 +1448,10 @@ int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, in
     cudaStream_t first_dl_stream = nullptr;
     cuphyBatchedMemcpyHelper& batchedMemcpyHelper = slot_map->getBatchedMemcpyHelper();
     batchedMemcpyHelper.reset(); // reset for upcoming batch of updateMemcpy calls
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     CuphyPtiSetIndexScope cuphy_pti_index_scope(slot);
     ret = getcpu(&cpu, nullptr);
     if(ret != 0)
@@ -1351,7 +1463,7 @@ int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, in
     start_t_1 = Time::nowNs();
 
     if(pdctx->getmMIMO_enable()) {
-        TI_ADD("Wait DLC")
+        ti.add("Wait DLC");
         int num_dlc_tasks = get_num_dlc_tasks(pdctx->getNumDLWorkers(),pdctx->gpuCommEnabledViaCpu(),pdctx->getmMIMO_enable());
         slot_map->waitDLCDone(num_dlc_tasks);
     }
@@ -1359,7 +1471,7 @@ int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, in
     /////////////////////////////////////////////////////////////////////////////////////
     //// Prepare U-plane
     /////////////////////////////////////////////////////////////////////////////////////
-    TI_ADD("UPlane Prepare");
+    ti.add("UPlane Prepare");
     PUSH_RANGE_PHYDRV("DL UPL PREP", 3);
     for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++)
     {
@@ -1416,7 +1528,7 @@ int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, in
     //// Wait + TX U-plane
     /////////////////////////////////////////////////////////////////////////////////////
 
-    TI_ADD("Channel Waits");
+    ti.add("Channel Waits");
     if(pdsch != nullptr)
     {
         PUSH_RANGE_PHYDRV("DL WAIT PDSCH", 3);
@@ -1487,7 +1599,7 @@ int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, in
         // NVSLOGD(TAG)  << "Task DL " << task_num << " Map " << slot_map->getId() << " CSI RS " << (long int)csirs->getId() << " COMPLETED cell " << cell_ptr->getPhyId();
     }
 
-    TI_ADD("Compression Wait");
+    ti.add("Compression Wait");
     PUSH_RANGE_PHYDRV("DL WAIT COMP", 3);
     slot_map->timings.start_t_dl_compression_compl = Time::nowNs();
     if(first_dlbuf==nullptr)
@@ -1507,7 +1619,7 @@ int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, in
     POP_RANGE
     POP_RANGE_PHYDRV
 
-    TI_ADD("Uplane TX");
+    ti.add("Uplane TX");
     for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++)
     {
         Cell* cell_ptr = slot_map->aggr_cell_list[i];
@@ -1522,7 +1634,7 @@ int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, in
     }
 
     //FIXME: only PDSCH should call the callback if present?
-    TI_ADD("PDSCH Callback");
+    ti.add("PDSCH Callback");
     PUSH_RANGE_PHYDRV("DL CALLBACK", 3);
     if(pdsch != nullptr)
     {
@@ -1531,7 +1643,7 @@ int task_work_function_dl_aggr_2(Worker* worker, void* param, int first_cell, in
         slot_map->timings.end_t_dl_callback = Time::nowNs();
     }
 
-    TI_ADD("Metric Update");
+    ti.add("Metric Update");
     for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++)
     {
         Cell* cell_ptr = slot_map->aggr_cell_list[i];
@@ -1567,8 +1679,7 @@ cleanup:
 
     start_t_2 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
     // NVSLOGI(TAG) << "SFN " << sfn << "." << slot
     //             << " Task DL " << task_num << " Map " << slot_map->getId() << " DL objects " << slot_map->getNumCells()
     //             << " Started at " << start_t_1.count()
@@ -1587,8 +1698,9 @@ exit_error:
 
 int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first_cell, int num_cells,int num_dl_tasks)
 {
-    TI_INIT_DL("DL Task GPU Comms",13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task GPU Comms", 13);
+    ti.add("Start Task");
     int                                                                          task_num = 2, ret = 0;
     uint16_t                                                                     numPrb, startPrb, endPrb;
     uint16_t                                                                     _numPrb, _startPrb, _endPrb;
@@ -1624,9 +1736,10 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
     cudaStream_t first_dl_stream = nullptr;
     cuphyBatchedMemcpyHelper& batchedMemcpyHelper = slot_map->getBatchedMemcpyHelper();
     batchedMemcpyHelper.reset(); // reset for upcoming batch of updateMemcpy calls
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     CuphyPtiSetIndexScope cuphy_pti_index_scope(slot);
 
     uint32_t cpu;
@@ -1640,7 +1753,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
     start_t_1 = Time::nowNs();
 
     //NVLOGI_FMT(TAG,"DL Task 2 started on CPU {} for Map {}, SFN slot ({},{})", cpu, slot_map->getId(), sfn, slot);
-    TI_ADD("Wait Slot Start Task"); // Synchronize the Compression task and GPU Uplane prepare
+    ti.add("Wait Slot Start Task"); // Synchronize the Compression task and GPU Uplane prepare
     if(slot_map->waitFHCBDone() < 0) {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitFHCBDone returned error");
         goto exit_error;
@@ -1654,7 +1767,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
     }    
 
     if(pdctx->getmMIMO_enable()) {
-        TI_ADD("Wait Peer Update");
+        ti.add("Wait Peer Update");
         slot_map->waitPeerUpdateDone();
     }
 
@@ -1663,7 +1776,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
         /////////////////////////////////////////////////////////////////////////////////////
         //// U-Plane
         /////////////////////////////////////////////////////////////////////////////////////
-        TI_ADD("UPlane Prepare");
+        ti.add("UPlane Prepare");
         PUSH_RANGE_PHYDRV((std::string("DL UPL PREP") + std::to_string(slot_map->getId())).c_str(), 3);
         for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++)
         {
@@ -1722,11 +1835,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
                 prb_info_per_nic[nic_index].max_num_prb_per_symbol[cell_index] = cell_ptr->getDLGridSize();
 
                 for (auto ant = 0; ant < eaxc.size(); ant++) {
-#ifdef ENABLE_32DL
                     prb_info_per_nic[nic_index].eAxCMap[cell_index][eaxc[ant] & 0x1f] = ant;
-#else
-                    prb_info_per_nic[nic_index].eAxCMap[cell_index][eaxc[ant] & 0xf] = ant;
-#endif
                 }
             }
 
@@ -1770,7 +1879,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
         // Ready/wait information for trigger. Only a single trigger for all cells. Note that GPU comms
         // mode does not need to set the compression output pointer since the compression kernel writes
         // directly into the packet buffer after the header
-        TI_ADD("Uplane TX");
+        ti.add("Uplane TX");
 
         for(int i = 0; i < MAX_NUM_OF_NIC_SUPPORTED; i++)
         {
@@ -1815,7 +1924,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
         slot_map->timings.end_t_dl_utx[0] = Time::nowNs();
     }
 
-    TI_ADD("Signal Slot Channel End");
+    ti.add("Signal Slot Channel End");
     slot_map->addSlotChannelEnd();
     slot_map->setDlGpuCommEnd();
     POP_RANGE_PHYDRV
@@ -1825,7 +1934,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
     {
 
         //Wait here till H2D copy is completed before trigerring callback
-        TI_ADD("PDSCH TB H2D Wait");
+        ti.add("PDSCH TB H2D Wait");
         start_t = Time::nowNs();
         while(!pdsch_tb_h2d_done)
         {
@@ -1838,7 +1947,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
         }
         if(!slot_map->pdsch_cb_done){
             //Trigger PDSCH callback as soon as wait for H2D copy is done
-            TI_ADD("PDSCH Callback");
+            ti.add("PDSCH Callback");
             PUSH_RANGE_PHYDRV((std::string("DL CALLBACK") + std::to_string(slot_map->getId())).c_str(), 3);
             slot_map->timings.start_t_dl_callback = Time::nowNs();
             pdsch->callback(/* slot_map->aggr_slot_params, */ slot_map->getSlot3GPP());
@@ -1848,7 +1957,7 @@ int task_work_function_dl_aggr_2_gpu_comm(Worker* worker, void* param, int first
         }
     }
 
-    TI_ADD("Metric Update");
+    ti.add("Metric Update");
     for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++)
     {
         Cell* cell_ptr = slot_map->aggr_cell_list[i];
@@ -1877,8 +1986,7 @@ cleanup:
 
     start_t_2 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
     // NVSLOGI(TAG) << "SFN " << sfn << "." << slot
     //             << " Task DL " << task_num << " Map " << slot_map->getId() << " DL objects " << slot_map->getNumCells()
     //             << " Started at " << start_t_1.count()
@@ -1897,8 +2005,9 @@ exit_error:
 
 int task_work_function_dl_aggr_2_ring_cpu_doorbell(Worker* worker, void* param, int first_cell, int num_cells,int num_dl_tasks)
 {
-    TI_INIT_DL("DL Aggr2 Ring CPU Doorbell",13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Aggr2 Ring CPU Doorbell", 13);
+    ti.add("Start Task");
     int                                                                          task_num = 1, ret = 0;
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -1916,9 +2025,10 @@ int task_work_function_dl_aggr_2_ring_cpu_doorbell(Worker* worker, void* param, 
     //pdctx->dl_cpu_db_task.lock();
 
 NVLOGI_FMT(TAG,"starting cpudb");
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     CuphyPtiSetIndexScope cuphy_pti_index_scope(slot);
 
     ret = getcpu(&cpu, nullptr);
@@ -1927,13 +2037,13 @@ NVLOGI_FMT(TAG,"starting cpudb");
         NVLOGI_FMT(TAG,"getcpu failed for {}", __FUNCTION__);
     }
 
-    TI_ADD("Wait DL Comp End"); // Synchronize end of Compression Task
+    ti.add("Wait DL Comp End"); // Synchronize end of Compression Task
     if(slot_map->waitDlCompEnd() < 0) {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitDlCompEnd returned error");
         EXIT_L1(EXIT_FAILURE);
     }     
 
-    TI_ADD("Get Prepare Tx DL Buf");
+    ti.add("Get Prepare Tx DL Buf");
     for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++)
     {
         DLOutputBuffer * dlbuf = slot_map->aggr_dlbuf_list[i];
@@ -1953,7 +2063,7 @@ NVLOGI_FMT(TAG,"starting cpudb");
     }    
 
     pdctx->setGpuCommsCtx();
-    TI_ADD("CPU copy and ring doorbell");
+    ti.add("CPU copy and ring doorbell");
     for(int i = 0; i < MAX_NUM_OF_NIC_SUPPORTED; i++)
     {
         if(slot_map->tx_v_for_slot_map[i].size>0)
@@ -1998,8 +2108,7 @@ NVLOGI_FMT(TAG,"starting cpudb");
 
     slot_map->setDlCpuDoorBellTaskDone();
     slot_map->addSlotEndTask();
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);   
+    ti.add("End Task");
     //pdctx->dl_cpu_db_task.unlock();
 
     return 0; 
@@ -2007,8 +2116,9 @@ NVLOGI_FMT(TAG,"starting cpudb");
 
 int task_work_function_dl_aggr_3_buf_cleanup(Worker* worker, void* param, int first_cell, int num_cells,int num_dl_tasks)
 {
-    TI_INIT_DL("DL Task Buff Cleanup",13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task Buff Cleanup", 13);
+    ti.add("Start Task");
     int                                                                          task_num = 1, ret = 0;
     SlotMapDl*                                                                   slot_map = (SlotMapDl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -2026,9 +2136,10 @@ int task_work_function_dl_aggr_3_buf_cleanup(Worker* worker, void* param, int fi
     struct slot_command_api::oran_slot_ind slot_oran_ind = slot_command_api::to_oran_slot_format(slot_ind);
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     int num_dlc_tasks = get_num_dlc_tasks(pdctx->getNumDLWorkers(),pdctx->gpuCommEnabledViaCpu(),pdctx->getmMIMO_enable());
     int num_tasks_to_wait = 0;
     if(pdctx->gpuCommEnabledViaCpu())
@@ -2049,7 +2160,7 @@ int task_work_function_dl_aggr_3_buf_cleanup(Worker* worker, void* param, int fi
     //NVLOGI_FMT(TAG,"DL Task 3(DL Buff Cleanup) started on CPU {} for Map {}, SFN slot ({},{})", cpu, slot_map->getId(), sfn, slot);
     start_t_1 = Time::nowNs();
 
-    TI_ADD("Buffer Clearing");
+    ti.add("Buffer Clearing");
     pdctx->getDlCtx()->setCtx();
 #ifdef CUPHY_PTI_ENABLE_TRACING
     if (((sfn % 128) == 0) && (slot == 0))
@@ -2116,14 +2227,14 @@ int task_work_function_dl_aggr_3_buf_cleanup(Worker* worker, void* param, int fi
     slot_map->addSlotEndTask();
 
     //Make sure that all tasks (except debug thread) have run to completion
-    TI_ADD("Wait Slot End Task");
+    ti.add("Wait Slot End Task");
     if(slot_map->waitSlotEndTask(num_dl_tasks) < 0)
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitSlotEnd returned error");
         if(pdctx->getDlCb(dl_cb))
         {
                 auto msg_id = (pdcch_ul == nullptr)? SCF_FAPI_DL_TTI_REQUEST: SCF_FAPI_UL_DCI_REQUEST;
-                dl_cb.dl_tx_error_fn(slot_ind,msg_id,SCF_ERROR_CODE_L1_DL_CPU_TASK_ERROR,cell_idx_list,cell_count);
+                dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_ind,msg_id,SCF_ERROR_CODE_L1_DL_CPU_TASK_ERROR,cell_idx_list,cell_count);
         }
     }
 
@@ -2142,7 +2253,7 @@ int task_work_function_dl_aggr_3_buf_cleanup(Worker* worker, void* param, int fi
     slot_map->timings.start_t_dl_pbch_compl[0]=start_t;
     slot_map->timings.start_t_dl_csirs_compl[0]=start_t;
 
-    TI_ADD("Wait cuPHY Channel Done");
+    ti.add("Wait cuPHY Channel Done");
     while(!pdsch_cuphy_done || !pdcch_dl_cuphy_done || !pdcch_ul_cuphy_done || !pbch_cuphy_done || !csirs_cuphy_done)
     {
         if(!pdcch_dl_cuphy_done)
@@ -2248,13 +2359,13 @@ cleanup:
         if(pdctx->getDlCb(dl_cb))
         {
                 auto msg_id = (!pdcch_ul_cuphy_done)? SCF_FAPI_DL_TTI_REQUEST : SCF_FAPI_UL_DCI_REQUEST;
-                dl_cb.dl_tx_error_fn(slot_ind,msg_id,SCF_ERROR_CODE_L1_DL_GPU_ERROR,cell_idx_list,cell_count);
+                dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context, slot_ind,msg_id,SCF_ERROR_CODE_L1_DL_GPU_ERROR,cell_idx_list,cell_count);
         }
     }
 
     if(pdsch && !slot_map->pdsch_cb_done){
         //Trigger PDSCH callback before Slot Map release if CB is not completed
-        TI_ADD("PDSCH Callback");
+        ti.add("PDSCH Callback");
         PUSH_RANGE_PHYDRV((std::string("DL CALLBACK") + std::to_string(slot_map->getId())).c_str(), 3);
         slot_map->timings.start_t_dl_callback = Time::nowNs();
         pdsch->callback(/* slot_map->aggr_slot_params, */ slot_map->getSlot3GPP());
@@ -2263,14 +2374,13 @@ cleanup:
         POP_RANGE_PHYDRV
     }
 
-    TI_ADD("Slot Map Release");
+    ti.add("Slot Map Release");
     PUSH_RANGE_PHYDRV((std::string("DL CLEANUP") + std::to_string(slot_map->getId())).c_str(), 3);
     slot_map->release(num_cells);
     POP_RANGE_PHYDRV
 
     start_t_2 = Time::nowNs();
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
     // NVSLOGI(TAG) << "SFN " << sfn << "." << slot
     //             << " Task DL " << task_num << " Map " << slot_map->getId() << " DL objects " << slot_map->getNumCells()
     //             << " Started at " << start_t_1.count()
@@ -2293,9 +2403,10 @@ exit_error:
 int task_work_function_dl_aggr_2_gpu_comm_prepare(Worker* worker, void* param, int task_num, int first_cell, int num_tasks) {
     char name[64];
     sprintf(name, "DL Task GPU Comms Prepare %d", task_num + 1);
-    TI_INIT_DL(name,14);    
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, name, 14);
 
-    TI_ADD("Start Task");
+    ti.add("Start Task");
     SlotMapDl* slot_map = (SlotMapDl*)param;
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
     FhProxy* fhproxy = pdctx->getFhProxy();
@@ -2311,10 +2422,12 @@ int task_work_function_dl_aggr_2_gpu_comm_prepare(Worker* worker, void* param, i
     PreparePRBInfo prb_info_per_nic[MAX_NUM_OF_NIC_SUPPORTED];
     cudaStream_t first_dl_stream = nullptr;
     int ret = 0;
+    const uint8_t dlc_packing_scheme = pdctx->get_dlc_core_packing_scheme();
     cuphyBatchedMemcpyHelper& batchedMemcpyHelper = slot_map->getBatchedMemcpyHelper();
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     CuphyPtiSetIndexScope cuphy_pti_index_scope(slot);    
 
     uint32_t cpu;
@@ -2325,13 +2438,23 @@ int task_work_function_dl_aggr_2_gpu_comm_prepare(Worker* worker, void* param, i
         goto exit_error;
     }
 
-    TI_ADD("Wait Slot Start Task"); // Synchronize the Compression task and GPU Uplane prepare
+    ti.add("Wait Slot Start Task"); // Synchronize the Compression task and GPU Uplane prepare
     if(slot_map->waitFHCBDone() < 0) {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitFHCBDone returned error");
         goto exit_error;
-    }    
+    }
 
-    TI_ADD("UPlane Prepare");
+    // When DL affinity is disabled, wait for C-plane task to complete for this task_num
+    // This ensures proper serialization between task_work_function_cplane and this task
+    if (pdctx->getmMIMO_enable() && pdctx->get_enable_dl_core_affinity() == 0) {
+        ti.add("Wait CPlane Done");
+        if (slot_map->waitCplaneDoneForTask(task_num) < 0) {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitCplaneDoneForTask returned error for task_num {}", task_num);
+            goto exit_error;
+        }
+    }
+
+    ti.add("UPlane Prepare");
     PUSH_RANGE_PHYDRV((std::string("DL UPL PREP") + std::to_string(slot_map->getId())).c_str(), 3);
 
     //Deduce first_dl_stream here
@@ -2344,7 +2467,19 @@ int task_work_function_dl_aggr_2_gpu_comm_prepare(Worker* worker, void* param, i
         break;
     }
     
-    for(int i = task_num; i < slot_map->getNumCells(); i+=num_tasks) {
+    for(int i = 0; i < slot_map->getNumCells(); i++) {
+        // Apply packing scheme filter
+        if (dlc_packing_scheme == 0) {
+            // Scheme 0 (default): strided iteration - task_num handles cells task_num, task_num+num_tasks, etc.
+            if ((i % num_tasks) != task_num) continue;
+        } else if (dlc_packing_scheme == 1) {
+            // Scheme 1 (fixed per-cell): check if cell's dlc_core_index matches this task_num
+            Cell* check_cell = slot_map->aggr_cell_list[i];
+            if (check_cell == nullptr) continue;
+            if (check_cell->getDlcCoreIndex() != task_num) continue;
+        }
+        // Note: Scheme 2 (dynamic workload-based) is not yet supported and validated during init
+
         Cell* cell_ptr = slot_map->aggr_cell_list[i];
         auto nic_index = cell_ptr->getNicIndex();
         DLOutputBuffer* dlbuf = slot_map->aggr_dlbuf_list[i];
@@ -2387,11 +2522,7 @@ int task_work_function_dl_aggr_2_gpu_comm_prepare(Worker* worker, void* param, i
             prb_info_per_nic[nic_index].max_num_prb_per_symbol[cell_index] = cell_ptr->getDLGridSize();
 
             for (auto ant = 0; ant < eaxc.size(); ant++) {
-#ifdef ENABLE_32DL
                 prb_info_per_nic[nic_index].eAxCMap[cell_index][eaxc[ant] & 0x1f] = ant;
-#else
-                prb_info_per_nic[nic_index].eAxCMap[cell_index][eaxc[ant] & 0xf] = ant;
-#endif
             }
         }
 
@@ -2408,12 +2539,11 @@ int task_work_function_dl_aggr_2_gpu_comm_prepare(Worker* worker, void* param, i
     }
     POP_RANGE_PHYDRV
 
-    TI_ADD("Signal UPlane Prepare End");
+    ti.add("Signal UPlane Prepare End");
     slot_map->incUplanePrepDone();
     slot_map->addSlotEndTask();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
     return 0;
     
 exit_error:
@@ -2421,8 +2551,9 @@ exit_error:
 }
 
 int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int first_cell, int num_cells, int num_tasks) {
-    TI_INIT_DL("DL Task GPU Comms TX", 13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextDL(param, worker);
+    TaskInstrumentation ti(ctx, "DL Task GPU Comms TX", 13);
+    ti.add("Start Task");
     SlotMapDl* slot_map = (SlotMapDl*)param;
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
     FhProxy* fhproxy = pdctx->getFhProxy();
@@ -2433,9 +2564,10 @@ int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int fi
     int cell_index_per_nic[MAX_NUM_OF_NIC_SUPPORTED] = {0};
     int slot = slot_map->getSlot3GPP().slot_;
     int ret = 0;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     CuphyPtiSetIndexScope cuphy_pti_index_scope(slot);   
 
     uint32_t cpu;
@@ -2446,7 +2578,7 @@ int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int fi
         goto exit_error;
     }
 
-    TI_ADD("Wait Uplane Prepare"); // Synchronize the UPlane prepare tasks
+    ti.add("Wait Uplane Prepare"); // Synchronize the UPlane prepare tasks
     if(slot_map->waitUplanePrepDone(num_tasks) < 0) {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitUplanePrepDone returned error");
         goto exit_error;
@@ -2481,11 +2613,7 @@ int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int fi
         prb_info_per_nic[nic_index].max_num_prb_per_symbol[cell_index] = cell_ptr->getDLGridSize();
 
         for (auto ant = 0; ant < eaxc.size(); ant++) {
-#ifdef ENABLE_32DL
             prb_info_per_nic[nic_index].eAxCMap[cell_index][eaxc[ant] & 0x1f] = ant;
-#else
-            prb_info_per_nic[nic_index].eAxCMap[cell_index][eaxc[ant] & 0xf] = ant;
-#endif
         }
 
         struct umsg_fh_tx_msg& txmsg = dlbuf->getTxMsgContainer();
@@ -2510,7 +2638,7 @@ int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int fi
     }
    
 
-    TI_ADD("Uplane TX");
+    ti.add("Uplane TX");
     pdctx->setGpuCommsCtx();
     PUSH_RANGE_PHYDRV((std::string("DL UPL GTX") + std::to_string(slot_map->getId())).c_str(), 3);
     slot_map->timings.start_t_dl_utx[0] = Time::nowNs();
@@ -2545,14 +2673,14 @@ int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int fi
     slot_map->timings.end_t_dl_utx[0] = Time::nowNs();
     POP_RANGE_PHYDRV
 
-    TI_ADD("Signal Slot Channel End");
+    ti.add("Signal Slot Channel End");
     slot_map->addSlotChannelEnd();
     slot_map->setDlGpuCommEnd();
     pdctx->setDlCtx();
 
     // Handle PDSCH callback if needed
     if(slot_map->aggr_pdsch != nullptr && !slot_map->pdsch_cb_done) {
-        TI_ADD("PDSCH TB H2D Wait");
+        ti.add("PDSCH TB H2D Wait");
         t_ns start_t = Time::nowNs();
         t_ns h2d_wait_th(pdctx->geth2d_copy_wait_th());
         bool pdsch_tb_h2d_done = false;
@@ -2565,7 +2693,7 @@ int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int fi
             }
         }
 
-        TI_ADD("PDSCH Callback");
+        ti.add("PDSCH Callback");
         PUSH_RANGE_PHYDRV((std::string("DL CALLBACK") + std::to_string(slot_map->getId())).c_str(), 3);
         slot_map->timings.start_t_dl_callback = Time::nowNs();
         slot_map->aggr_pdsch->callback(slot_map->getSlot3GPP());
@@ -2574,7 +2702,7 @@ int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int fi
         POP_RANGE_PHYDRV
     }
 
-    TI_ADD("Metric Update");
+    ti.add("Metric Update");
     for(int i = first_cell; i < first_cell + num_cells && i < slot_map->getNumCells(); i++) {
         Cell* cell_ptr = slot_map->aggr_cell_list[i];
         cell_ptr->updateMetric(CellMetric::kDlSlotsTotal, 1);
@@ -2588,8 +2716,7 @@ int task_work_function_dl_aggr_2_gpu_comm_tx(Worker* worker, void* param, int fi
 cleanup:
     slot_map->addSlotEndTask();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
     return 0;
 
 exit_error:

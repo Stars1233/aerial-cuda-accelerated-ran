@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +29,10 @@
 class cumac_validate {
 public:
     // 0 - disabled; 1 - report error level; 2 - report error and warning levels
-    int enable;
+    int enable = VALD_ENABLE_ERR;
 
     // 0 - no print; 1 - print per MSG; 2 - print per PDU
-    int log_opt;
+    int log_opt = 1;
 
     cumac_validate();
     cumac_validate(int _enable, int _log_opt);
@@ -228,23 +228,23 @@ public:
         return check_result == VALD_OK ? 0 : report(level);
     }
 
-    int  cell_id;
+    int  cell_id = 0;    //!< Cell ID
 
 protected:
-    char errbuf[VALD_LOG_BUF_SIZE];
-    int  offset;
-    int  msg_id;
+    char errbuf[VALD_LOG_BUF_SIZE] = "";    //!< Error buffer
+    int  offset = 0;        //!< Offset in error buffer
+    int  msg_id = 0;        //!< Message ID
 
-    uint16_t sfn;
-    uint16_t slot;
-    uint32_t err_count;
-    uint32_t err_pdu;
-    uint32_t warn_count;
-    uint32_t warn_pdu;
-    uint32_t log_count;
+    uint16_t sfn = 0;        //!< SFN
+    uint16_t slot = 0;        //!< Slot
+    uint32_t err_count = 0;    //!< Error count
+    uint32_t err_pdu = 0;    //!< Error PDU count
+    uint32_t warn_count = 0; //!< Warning count
+    uint32_t warn_pdu = 0;   //!< Warning PDU count
+    uint32_t log_count = 0;  //!< Log count
 
-    cumac_thrput_t* thrput;
-    cumac_req_t*    cumac_req;
+    cumac_thrput_t* thrput = nullptr;    //!< Throughput
+    cumac_req_t*    cumac_req = nullptr;    //!< CUMAC request
 };
 
 // Report fail with text string

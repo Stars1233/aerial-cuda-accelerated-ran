@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -159,6 +159,7 @@ void setPerTbParams(PerTbParams& tbParams,
     uint32_t Kb = get_Kb(tbSize, tbParams.bg);
     ldpcParams.KbArray.push_back(Kb);
 
+    tbParams.k0 = k0;
     tbParams.nZpBitsPerCb = (numParityNodes * Zc) + tbParams.K;
     tbParams.mScUciSum = 0;
     tbParams.isDataPresent = 1;
@@ -237,6 +238,7 @@ void readDmrsParams(const std::vector<py::object>& pdschConfigs,
             dmrsPrm.beta_dmrs = betaDmrs;
             dmrsPrm.beta_qam = betaQam;
             dmrsPrm.num_layers = layers;
+            dmrsPrm.nlAbove16 = 0;  // Initialize for 16-layer mode (32-layer not supported in pyaerial yet)
 
             auto dmrsPortsBmsk = pdschUeConfig.attr("dmrs_ports").cast<uint16_t>();
             for (int i = 0; i < layers; i++) {

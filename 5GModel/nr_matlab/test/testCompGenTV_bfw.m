@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -294,6 +294,11 @@ SRS_CHEST_BUFF_CFG28 = [num2cell(ueNumbers), num2cell(commonValues)];
 ueNumbers = (0:47).';
 commonValues = repmat([0, 137, 2, 64, 0], 48, 1);  % startPrbGrp, nPrbGrp, nUeAnt, nGnbAnt, gainDB
 SRS_CHEST_BUFF_CFG29 = [num2cell(ueNumbers), num2cell(commonValues)];
+
+% build SRS_CHEST_BUFF_CFG30
+ueNumbers = (0:23).';
+commonValues = repmat([0, 137, 4, 64, 0], 24, 1);  % startPrbGrp, nPrbGrp, nUeAnt, nGnbAnt, gainDB
+SRS_CHEST_BUFF_CFG30 = [num2cell(ueNumbers), num2cell(commonValues)];
 
 % Note: Even test cases are used for DLBFW and odd cases are ULBFW
 UE_GRPS_CFG = {...
@@ -670,7 +675,7 @@ UE_GRPS_CFG = {...
    335         176         24        64     1         [42                  ]  [0]
    336         200         24        64     1         [43                  ]  [0]
    337         224         24        64     1         [44                  ]  [0]
-   338         248         14        64     1         [45                  ]  [0]
+   338         248         13        64     1         [45                  ]  [0]
    % PDSCH set 1
    % reuse cfg 326~331 from PDSCH set 0
    339         0           96        64     16        [ 6  6  7  7  8  8  9  9 10 10 11 11 12 12 13 13]  [0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1]
@@ -690,13 +695,13 @@ UE_GRPS_CFG = {...
    347         224         24        64     1         [16                  ]  [0]
    348         248         25        64     1         [17                  ]  [0]
    % PDSCH set 0
-   349         20          76        64     16        [ 6  6  7  7  8  8  9  9 10 10 11 11 12 12 13 13]  [0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1]
-   350         96          40        64     4         [14 14 15 15         ]  [0 1 0 1]
-   351         136         40        64     4         [16 16 17 17         ]  [0 1 0 1]
-   352         176         24        64     1         [18                  ]  [0]
-   353         200         24        64     1         [19                  ]  [0]
-   354         224         24        64     1         [20                  ]  [0]
-   355         248         25        64     1         [21                  ]  [0]
+   349         20          76        64     8         [ 6  6  7  7  8  8  9  9]  [0 1 0 1 0 1 0 1]
+   350         96          40        64     4         [10 10 11 11         ]  [0 1 0 1]
+   351         136         40        64     4         [12 12 13 13         ]  [0 1 0 1]
+   352         176         24        64     1         [14                  ]  [0]
+   353         200         24        64     1         [15                  ]  [0]
+   354         224         24        64     1         [16                  ]  [0]
+   355         248         25        64     1         [17                  ]  [0]
    % PUSCH set 1
    356         10          86        64     4         [18 19 20 21         ]  [0 0 0 0]
    357         96          40        64     2         [22 23               ]  [0 0]
@@ -704,16 +709,157 @@ UE_GRPS_CFG = {...
    359         176         24        64     1         [26                  ]  [0]
    360         200         24        64     1         [27                  ]  [0]
    361         224         24        64     1         [28                  ]  [0]
-   362         248         14        64     1         [29                  ]  [0]
+   362         248         13        64     1         [29                  ]  [0]
    % PDSCH set 1
    % reuse cfg 350~355 from PDSCH set 0
-   363         0           96        64     16        [ 6  6  7  7  8  8  9  9 10 10 11 11 12 12 13 13]  [0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1]
+   363         0           96        64     8         [ 6  6  7  7  8  8  9  9]  [0 1 0 1 0 1 0 1]
    % PUSCH set 2
    % reuse cfg 356~361 from PUSCH set 1
    364         248         25        64     1         [29                  ]  [0]
    % PDSCH set 4
    % reuse cfg 363 from PDSCH set 1, cfg 350~354 from PDSCH set 0
-   365         248         17        64     1         [21                  ]  [0]
+   365         248         17        64     1         [17                  ]  [0]
+%   UEGRP#      startPrb    nPrb      nRxAnt nBfLayers         ueIdxs               ueLayersIdxs
+   % PUSCH set 0, 90 MHz heavy
+   366         26          62        64     8         [ 6  7  8  9 10 11 12 13]  [0 0 0 0 0 0 0 0]
+   367         88          34        64     4         [14 15 16 17         ]  [0 0 0 0]
+   368         122         34        64     4         [18 19 20 21         ]  [0 0 0 0]
+   369         156         22        64     1         [22                  ]  [0]
+   370         178         22        64     1         [23                  ]  [0]
+   371         200         22        64     1         [24                  ]  [0]
+   372         222         22        64     1         [25                  ]  [0]
+   % PDSCH set 0, 90 MHz heavy
+   373         20          68        64     16        [ 6  6  7  7  8  8  9  9 10 10 11 11 12 12 13 13]  [0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1]
+   374         88          34        64     8         [14 14 15 15 16 16 17 17]  [0 1 0 1 0 1 0 1]
+   375         122         34        64     8         [18 18 19 19 20 20 21 21]  [0 1 0 1 0 1 0 1]
+   376         156         22        64     2         [22 22               ]  [0 1]
+   377         178         22        64     2         [23 23               ]  [0 1]
+   378         200         22        64     2         [24 24               ]  [0 1]
+   379         222         22        64     2         [25 25               ]  [0 1]
+   % PUSCH set 1, 90 MHz heavy
+   380         10          78        64     8         [26 27 28 29 30 31 32 33]  [0 0 0 0 0 0 0 0]
+   381         88          34        64     4         [34 35 36 37         ]  [0 0 0 0]
+   382         122         34        64     4         [38 39 40 41         ]  [0 0 0 0]
+   383         156         22        64     1         [42                  ]  [0]
+   384         178         22        64     1         [43                  ]  [0]
+   385         200         22        64     1         [44                  ]  [0]
+   386         222         10        64     1         [45                  ]  [0]
+   % PDSCH set 1, 90 MHz heavy
+   % reuse cfg 374~379 from PDSCH set 0
+   387         0           88        64     16        [ 6  6  7  7  8  8  9  9 10 10 11 11 12 12 13 13]  [0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1]
+   % PUSCH set 2, 90 MHz heavy
+   % reuse cfg 380~385 from PUSCH set 1
+   388         222         22        64     1         [45                  ]  [0]
+   % PDSCH set 4, 90 MHz heavy
+   % reuse cfg 387 from PDSCH set 1, cfg 374~378 from PDSCH set 0
+   389         222         14        64     2         [25 25               ]  [0 1]
+   % PUSCH set 0, 90 MHz light
+   390         26          62        64     4         [ 6  7  8  9         ]  [0 0 0 0]
+   391         88          34        64     2         [10 11               ]  [0 0]
+   392         122         34        64     2         [12 13               ]  [0 0]
+   393         156         22        64     1         [14                  ]  [0]
+   394         178         22        64     1         [15                  ]  [0]
+   395         200         22        64     1         [16                  ]  [0]
+   396         222         22        64     1         [17                  ]  [0]
+   % PDSCH set 0, 90 MHz light
+   397         20          68        64     8         [ 6  6  7  7  8  8  9  9]  [0 1 0 1 0 1 0 1]
+   398         88          34        64     4         [10 10 11 11         ]  [0 1 0 1]
+   399         122         34        64     4         [12 12 13 13         ]  [0 1 0 1]
+   400         156         22        64     1         [14                  ]  [0]
+   401         178         22        64     1         [15                  ]  [0]
+   402         200         22        64     1         [16                  ]  [0]
+   403         222         22        64     1         [17                  ]  [0]
+   % PUSCH set 1, 90 MHz light
+   404         10          78        64     4         [18 19 20 21         ]  [0 0 0 0]
+   405         88          34        64     2         [22 23               ]  [0 0]
+   406         122         34        64     2         [24 25               ]  [0 0]
+   407         156         22        64     1         [26                  ]  [0]
+   408         178         22        64     1         [27                  ]  [0]
+   409         200         22        64     1         [28                  ]  [0]
+   410         222         10        64     1         [29                  ]  [0]
+   % PDSCH set 1, 90 MHz light
+   % reuse cfg 398~403 from PDSCH set 0
+   411         0           88        64     8         [ 6  6  7  7  8  8  9  9]  [0 1 0 1 0 1 0 1]
+   % PUSCH set 2, 90 MHz light
+   % reuse cfg 404~409 from PUSCH set 1
+   412         222         22        64     1         [29                  ]  [0]
+   % PDSCH set 4, 90 MHz light
+   % reuse cfg 411 from PDSCH set 1, cfg 398~402 from PDSCH set 0
+   413         222         14        64     1         [17                  ]  [0]
+   % PUSCH set 0, 60 MHz heavy
+   414         26          30        64     8         [ 6  7  8  9 10 11 12 13]  [0 0 0 0 0 0 0 0]
+   415         56          24        64     4         [14 15 16 17         ]  [0 0 0 0]
+   416         80          24        64     4         [18 19 20 21         ]  [0 0 0 0]
+   417         104         14        64     1         [22                  ]  [0]
+   418         118         14        64     1         [23                  ]  [0]
+   419         132         14        64     1         [24                  ]  [0]
+   420         146         14        64     1         [25                  ]  [0]
+   % PDSCH set 0, 60 MHz heavy
+   421         20          36        64     16        [ 6  6  7  7  8  8  9  9 10 10 11 11 12 12 13 13]  [0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1]
+   422         56          24        64     8         [14 14 15 15 16 16 17 17]  [0 1 0 1 0 1 0 1]
+   423         80          24        64     8         [18 18 19 19 20 20 21 21]  [0 1 0 1 0 1 0 1]
+   424         104         14        64     2         [22 22               ]  [0 1]
+   425         118         14        64     2         [23 23               ]  [0 1]
+   426         132         14        64     2         [24 24               ]  [0 1]
+   427         146         14        64     2         [25 25               ]  [0 1]
+   % PUSCH set 1, 60 MHz heavy
+   428         10          46        64     8         [26 27 28 29 30 31 32 33]  [0 0 0 0 0 0 0 0]
+   429         56          24        64     4         [34 35 36 37         ]  [0 0 0 0]
+   430         80          24        64     4         [38 39 40 41         ]  [0 0 0 0]
+   431         104         14        64     1         [42                  ]  [0]
+   432         118         14        64     1         [43                  ]  [0]
+   433         132          8        64     1         [44                  ]  [0]
+   434         140          8        64     1         [45                  ]  [0]
+   % PDSCH set 1, 60 MHz heavy
+   % reuse cfg 422~427 from PDSCH set 0
+   435         0           56        64     16        [ 6  6  7  7  8  8  9  9 10 10 11 11 12 12 13 13]  [0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1]
+   % PUSCH set 2, 60 MHz heavy
+   % reuse cfg 428~433 from PUSCH set 1
+   436         140         20        64     1         [45                  ]  [0]
+   % PDSCH set 4, 60 MHz heavy
+   % reuse cfg 435 from PDSCH set 1, cfg 422~426 from PDSCH set 0
+   437         146         6         64     2         [25 25               ]  [0 1]
+   % PUSCH set 0, 60 MHz light
+   438         26          30        64     4         [ 6  7  8  9         ]  [0 0 0 0]
+   439         56          24        64     2         [10 11               ]  [0 0]
+   440         80          24        64     2         [12 13               ]  [0 0]
+   441         104         14        64     1         [14                  ]  [0]
+   442         118         14        64     1         [15                  ]  [0]
+   443         132         14        64     1         [16                  ]  [0]
+   444         146         14        64     1         [17                  ]  [0]
+   % PDSCH set 0, 60 MHz light
+   445         20          36        64     8         [ 6  6  7  7  8  8  9  9]  [0 1 0 1 0 1 0 1]
+   446         56          24        64     4         [10 10 11 11         ]  [0 1 0 1]
+   447         80          24        64     4         [12 12 13 13         ]  [0 1 0 1]
+   448         104         14        64     1         [14                  ]  [0]
+   449         118         14        64     1         [15                  ]  [0]
+   450         132         14        64     1         [16                  ]  [0]
+   451         146         14        64     1         [17                  ]  [0]
+   % PUSCH set 1, 60 MHz light
+   452         10          46        64     4         [18 19 20 21         ]  [0 0 0 0]
+   453         56          24        64     2         [22 23               ]  [0 0]
+   454         80          24        64     2         [24 25               ]  [0 0]
+   455         104         14        64     1         [26                  ]  [0]
+   456         118         14        64     1         [27                  ]  [0]
+   457         132          8        64     1         [28                  ]  [0]
+   458         140          8        64     1         [29                  ]  [0]
+   % PDSCH set 1, 60 MHz light
+   % reuse cfg 446~451 from PDSCH set 0
+   459         0           56        64     8         [ 6  6  7  7  8  8  9  9]  [0 1 0 1 0 1 0 1]
+   % PUSCH set 2, 60 MHz light
+   % reuse cfg 452~457 from PUSCH set 1
+   460         140         20        64     1         [29                  ]  [0]
+   % PDSCH set 4, 60 MHz light
+   % reuse cfg 459 from PDSCH set 1, cfg 446~450 from PDSCH set 0
+   461         146         6         64     1         [17                  ]  [0]
+   % 24DL
+   462         20          253       64     24        [ 6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29]  [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+   463         0           273       64     24        [ 6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29]  [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+   464         0           265       64     24        [ 6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29]  [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+   465         28          245       64     8         [ 6  7  8  9 10 11 12 13]  [0 0 0 0 0 0 0 0]
+   466         12          249       64     8         [ 14 15 16 17 18 19 20 21]  [0 0 0 0 0 0 0 0]
+   467         37          236       64     8         [ 6  7  8  9 10 11 12 13]  [0 0 0 0 0 0 0 0]
+   468         12          261       64     8         [ 14 15 16 17 18 19 20 21]  [0 0 0 0 0 0 0 0]
    };
 
 CFG = {...
@@ -877,7 +1023,7 @@ CFG = {...
   %
   9294    2       [172 173]   20           0            -30       2               2    %  DLMIX 2 UE group (mix of UE layers)
   %
-  9296    1       76          20           0           -30       2               273  % 8 layer DL (2+2+2+2)
+  9296    1       76          20          0            -30       2               273  % 8 layer DL (2+2+2+2)
   9300    1       130         1           0            -30       1               2    % SRS PRG-size 1, BFW PRG-size 2
   9301    1       130         1           0            -30       1               4    % SRS PRG-size 1, BFW PRG-size 4
   9302    1       130         1           0            -30       1               32   % SRS PRG-size 1, BFW PRG-size 137
@@ -886,6 +1032,7 @@ CFG = {...
   9305    1       130         1           0            -30       4               32   % SRS PRG-size 4, BFW PRG-size 156
   9306    1       133         20          0            -30       2                4   % SRS PRG-size 2, BFW PRG-size 4
   9307    1       133         20          0            -30       2               64   % SRS PRG-size 2, BFW PRG-size 32
+  9308    1       71          20          0            -30       16              16   % 16 layers (16UEx1) SRS PRG-size 16, BFW PRG-size 16
   %
   9309    2       [126 127]   20           0           -30       2               2    %  ULMIX 3 UE groups (2 dynamic BF) 2nd Cell
   9310    2       [121 122]   20           0           -30       2               2    %  DLMIX 3 UE groups (2 dynamic BF) 2nd Cell  
@@ -1008,14 +1155,14 @@ CFG = {...
   9425    1       [305]       26           0            -30       2               2    % ULMIX 1 UE group (1 UEG x 8 Layer)
   9426    1       [306:309]   26           0            -30       2               2    % DLMIX 4 UE group (4 UEG x 16 Layer)
   9427    1       [310]       26           0            -30       2               2    % ULMIX 1 UE group (1 UEG x 8 Layer)
-  % 64TR 25-3 column E, 4 SRS symbols in S slot reuse 9401/9403/9405 for UL
-  9430    1       [311]       27           0            -30       2               2    % DLMIX 1 UE group (32 UE x 1 Layer)
-  9432    1       [312]       27           0            -30       2               2    % DLMIX 1 UE group (32 UE x 1 Layer)
-  9434    1       [313]       27           0            -30       2               2    % DLMIX 1 UE group (32 UE x 1 Layer) 
-  9429    1       [314]       27           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)  
-  9431    1       [315]       27           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)              
-  9433    1       [316]       27           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)              
-  9435    1       [317]       27           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)                          
+  % 64TR 25-3 column E, 4 SRS symbols in S slot, bfwPrgSize = 16
+  9430    1       [311]       27           0            -30       2              16    % DLMIX 1 UE group (32 UE x 1 Layer)
+  9432    1       [312]       27           0            -30       2              16    % DLMIX 1 UE group (32 UE x 1 Layer)
+  9434    1       [313]       27           0            -30       2              16    % DLMIX 1 UE group (32 UE x 1 Layer) 
+  9429    1       [314]       27           0            -30       2              16    % ULMIX 1 UE group (8 UE x 1 Layer)  
+  9431    1       [315]       27           0            -30       2              16    % ULMIX 1 UE group (8 UE x 1 Layer)              
+  9433    1       [316]       27           0            -30       2              16    % ULMIX 1 UE group (8 UE x 1 Layer)              
+  9435    1       [317]       27           0            -30       2              16    % ULMIX 1 UE group (8 UE x 1 Layer)                          
   % 64TR, Ph4 column B, srsPrgSize = 4, bfwPrgSize = 16
   9437    1       [272]       28           0            -30       4              16    % ULMIX 1 UE group (8 UE x 1 Layer)              
   9438    1       [273]       28           0            -30       4              16    % DLMIX 1 UE group (16 UE x 1 Layer)              
@@ -1035,25 +1182,79 @@ CFG = {...
   9449    7       [318:324]            29           0          -30            2               2              
   9450    7       [325:331]            29           0          -30            2               2              
   9451    7       [332:338]            29           0          -30            2               2              
-  9452    7       [326:331, 339]       29           0          -30            2               2              
+  9452    7       [339, 326:331]       29           0          -30            2               2              
   9453    7       [332:337, 340]       29           0          -30            2               2              
-  9454    7       [326:330, 339, 341]  29           0          -30            2               2                       
+  9454    7       [339, 326:330, 341]  29           0          -30            2               2                       
   % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz light
 % CFG#    nUeGrps ueGrpIdxs            chEstBufCfg lambda      noise_dB       srsPrbGrpSize   bfwPrbGrpSize
   9455    7       [342:348]            29           0          -30            2               2              
   9456    7       [349:355]            29           0          -30            2               2              
   9457    7       [356:362]            29           0          -30            2               2              
-  9458    7       [350:355, 363]       29           0          -30            2               2              
+  9458    7       [363, 350:355]       29           0          -30            2               2              
   9459    7       [356:361, 364]       29           0          -30            2               2              
-  9460    7       [350:354, 363, 365]  29           0          -30            2               2                 
-  % 64TR 25-3 column E, 2 SRS symbols in S slot, 1 SRS symbol in each U slot
-  9462    1       [311]       27           0            -30       2               2    % DLMIX 1 UE group (32 UE x 1 Layer)
-  9464    1       [312]       27           0            -30       2               2    % DLMIX 1 UE group (32 UE x 1 Layer)
-  9466    1       [313]       27           0            -30       2               2    % DLMIX 1 UE group (32 UE x 1 Layer) 
-  9461    1       [314]       27           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)  
-  9463    1       [315]       27           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)              
-  9465    1       [316]       27           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)              
-  9467    1       [317]       27           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)  
+  9460    7       [363, 350:354, 365]  29           0          -30            2               2                 
+  % 64TR 25-3 column E, 2 SRS symbols in S slot, 1 SRS symbol in each U slot, bfwPrgSize = 16
+  9462    1       [311]       27           0            -30       2               16    % DLMIX 1 UE group (32 UE x 1 Layer)
+  9464    1       [312]       27           0            -30       2               16    % DLMIX 1 UE group (32 UE x 1 Layer)
+  9466    1       [313]       27           0            -30       2               16    % DLMIX 1 UE group (32 UE x 1 Layer) 
+  9461    1       [314]       27           0            -30       2               16    % ULMIX 1 UE group (8 UE x 1 Layer)  
+  9463    1       [315]       27           0            -30       2               16    % ULMIX 1 UE group (8 UE x 1 Layer)              
+  9465    1       [316]       27           0            -30       2               16    % ULMIX 1 UE group (8 UE x 1 Layer)              
+  9467    1       [317]       27           0            -30       2               16    % ULMIX 1 UE group (8 UE x 1 Layer)  
+  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz heavy
+% CFG#    nUeGrps ueGrpIdxs            chEstBufCfg lambda      noise_dB       srsPrbGrpSize   bfwPrbGrpSize
+  9469    7       [366:372]            29           0          -30            2               2              
+  9470    7       [373:379]            29           0          -30            2               2              
+  9471    7       [380:386]            29           0          -30            2               2              
+  9472    7       [387, 374:379]       29           0          -30            2               2              
+  9473    7       [380:385, 388]       29           0          -30            2               2              
+  9474    7       [387, 374:378, 389]  29           0          -30            2               2              
+  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz light
+% CFG#    nUeGrps ueGrpIdxs            chEstBufCfg lambda      noise_dB       srsPrbGrpSize   bfwPrbGrpSize
+  9475    7       [390:396]            29           0          -30            2               2              
+  9476    7       [397:403]            29           0          -30            2               2              
+  9477    7       [404:410]            29           0          -30            2               2              
+  9478    7       [411, 398:403]       29           0          -30            2               2              
+  9479    7       [404:409, 412]       29           0          -30            2               2              
+  9480    7       [411, 398:402, 413]  29           0          -30            2               2              
+  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz heavy
+% CFG#    nUeGrps ueGrpIdxs            chEstBufCfg lambda      noise_dB       srsPrbGrpSize   bfwPrbGrpSize
+  9481    7       [414:420]            29           0          -30            2               2              
+  9482    7       [421:427]            29           0          -30            2               2              
+  9483    7       [428:434]            29           0          -30            2               2              
+  9484    7       [435, 422:427]       29           0          -30            2               2              
+  9485    7       [428:433, 436]       29           0          -30            2               2              
+  9486    7       [435, 422:426, 437]  29           0          -30            2               2             
+  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz light
+% CFG#    nUeGrps ueGrpIdxs            chEstBufCfg lambda      noise_dB       srsPrbGrpSize   bfwPrbGrpSize
+  9487    7       [438:444]            29           0          -30            2               2              
+  9488    7       [445:451]            29           0          -30            2               2              
+  9489    7       [452:458]            29           0          -30            2               2              
+  9490    7       [459, 446:451]       29           0          -30            2               2              
+  9491    7       [452:457, 460]       29           0          -30            2               2              
+  9492    7       [459, 446:450, 461]  29           0          -30            2               2        
+  % 64TR 25-3 column D, 2 SRS symbols in S slot, 1 SRS symbol in each U slot, bfwPrgSize = 16
+  9494    1       [462]                27           0          -30            2               16    % DLMIX 1 UE group (24 UE x 1 Layer)
+  9496    1       [463]                27           0          -30            2               16    % DLMIX 1 UE group (24 UE x 1 Layer)
+  9498    1       [464]                27           0          -30            2               16    % DLMIX 1 UE group (24 UE x 1 Layer)   
+  9493    1       [465]                27           0          -30            2               16    % ULMIX 1 UE group (8 UE x 1 Layer)  
+  9495    1       [466]                27           0          -30            2               16    % ULMIX 1 UE group (8 UE x 1 Layer)              
+  9497    1       [467]                27           0          -30            2               16    % ULMIX 1 UE group (8 UE x 1 Layer)              
+  9499    1       [468]                27           0          -30            2               16    % ULMIX 1 UE group (8 UE x 1 Layer)       
+  % 64TR, Ph4 column B, pattern 79a (4 SRS in S slot, 2 SRS in U slot, 2 ports per UE)
+  9501    1       [272]       23           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)              
+  9502    1       [273]       23           0            -30       2               2    % DLMIX 1 UE group (16 UE x 1 Layer)              
+  9503    1       [274]       23           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)             
+  9504    1       [275]       23           0            -30       2               2    % DLMIX 1 UE group (16 UE x 1 Layer)
+  9505    1       [280]       23           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)
+  9506    1       [276]       23           0            -30       2               2    % DLMIX 1 UE group (16 UE x 1 Layer)  
+  % 64TR, Ph4 column B, pattern 79b (4 SRS in S slot, 2 SRS in U slot, 4 ports per UE)
+  9507    1       [272]       30           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)              
+  9508    1       [273]       30           0            -30       2               2    % DLMIX 1 UE group (16 UE x 1 Layer)              
+  9509    1       [274]       30           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)             
+  9510    1       [275]       30           0            -30       2               2    % DLMIX 1 UE group (16 UE x 1 Layer)
+  9511    1       [280]       30           0            -30       2               2    % ULMIX 1 UE group (8 UE x 1 Layer)
+  9512    1       [276]       30           0            -30       2               2    % DLMIX 1 UE group (16 UE x 1 Layer) 
 
   % 64TR perf
   % GFG#  nUeGrps ueGrpIdxs chEstBufCfg lambda     noise_dB       srsPrbGrpSize   bfwPrbGrpSize
@@ -1092,6 +1293,7 @@ CFG = {...
 %   will use individual TV number for different prgSize and N_ID_CELL cases
 SRS_BFW_TV_LOOKUP = {
 %   srsTV   mainTV  loadOnlyTV                            prgSize  N_ID_CELL
+    8046,   9308,     {},                                   16,      [];
     8412,   9226,     {},                                   [],      [];
     8413,   9227,     {},                                   [],      [];
     8512,   9236,   {9237},                                 [],      [];
@@ -1144,16 +1346,22 @@ SRS_BFW_TV_LOOKUP = {
     21623,  9385,   {9386, 9387, 9388, 9390},               [],      [];
     21643,  9391,   {9392, 9393, 9394, 9395, 9396},         [],      [];
     21663,  9400,   {}                                      [],      [];
-    {21642, 21653}, 9819, {9820},                           [],      [];  % Example using two SRS TVs
-    21673,  9401,   {9402, 9403, 9404, 9405, 9406, 9429, 9430, 9431, 9432, 9433, 9434, 9435, 9816, 9818},         [],      [];
+    {21642,21653},  9819, {9820},                           [],      [];  % Example using two SRS TVs
+    21673,  9401,   {9402, 9403, 9404, 9405, 9406, 9429, 9430, 9431, 9432, 9433, 9434, 9435, 9816, 9818},         [],      [];  % 9429~9435 are using prgSize = 16, configured below
     21693,  9407,   {9408, 9409, 9410, 9411, 9412},         [],      [];
-    {21713,21723}, 9413, {9414, 9415, 9416, 9417, 9418, 9419},       [],      [];
+    {21713,21723},  9413, {9414, 9415, 9416, 9417, 9418, 9419},      [],      [];
     {21733,21734,21735,21743}, 9421, {9422, 9423, 9424, 9425, 9426, 9427}, [],      [];
     21773,  9437,   {9438, 9439, 9440, 9441, 9442},         16,      [];
     21772,  9443,   {9444, 9445, 9446, 9447, 9448},         16,      [];
-    {21793,21803},  9449,   {9450, 9451, 9452, 9453, 9454}, [],      [];
-    {21813,21823},  9455,   {9456, 9457, 9458, 9459, 9460}, [],      [];
-    {21753, 21763}, 9461,   {9462, 9463, 9464, 9465, 9466, 9467},    [],      [];
+    {21793,21803},  9449,  {9450, 9451, 9452, 9453, 9454},  [],      [];
+    {21813,21823},  9455,  {9456, 9457, 9458, 9459, 9460},  [],      [];
+    {21753,21763},  9461,  {9462, 9463, 9464, 9465, 9466, 9467, 9493, 9494, 9495, 9496, 9497, 9498, 9499}, 16,      [];
+    {21833,21843},  9469,  {9470, 9471, 9472, 9473, 9474},  [],      [];
+    {21853,21863},  9475,  {9476, 9477, 9478, 9479, 9480},  [],      [];
+    {21873,21883},  9481,  {9482, 9483, 9484, 9485, 9486},  [],      [];
+    {21893,21903},  9487,  {9488, 9489, 9490, 9491, 9492},  [],      [];
+    21640,  9501,   {9502, 9503, 9504, 9505, 9506},         [],      [];  % pattern 79a
+    21641,  9507,   {9508, 9509, 9510, 9511, 9512},         [],      [];  % pattern 79b
 };
 
 % sanity check: mainTV and loadOnlyTV shouldn't have same BFW TV number
@@ -1254,6 +1462,9 @@ parfor n = 1:NallTest
         lambda         = CFG{idxSet, 5};
         noiseEnergy_dB = CFG{idxSet, 6};
         srsPrbGrpSize  = CFG{idxSet, 7};
+        if srsPrbGrpSize > 4
+           srsPrbGrpSize = 2; 
+        end
         bfwPrbGrpSize  = CFG{idxSet, 8};
         
         testAlloc     = [];
@@ -1370,6 +1581,13 @@ parfor n = 1:NallTest
                 SysPar.carrier.N_FhPort_DL = 16;
                 SysPar.carrier.N_FhPort_UL = 16;
                 SysPar.carrier.Nant_gNB = 64;
+            case {30}
+                SRS_CHEST_BUFF_CFG = SRS_CHEST_BUFF_CFG30;
+                SysPar.SimCtrl.enable_dynamic_BF = 1;
+                SysPar.carrier.numTxPort = 16;
+                SysPar.carrier.N_FhPort_DL = 16;
+                SysPar.carrier.N_FhPort_UL = 16;
+                SysPar.carrier.Nant_gNB = 64;
             otherwise
                 error('chEstBufIdx is not supported ...\n');
         end
@@ -1402,6 +1620,12 @@ parfor n = 1:NallTest
             elseif (ismember(caseNum, [9437:9442]))
                 SysPar.srsChEstBuff{ueIdx + 1}.startValidPrg  = 0;
                 SysPar.srsChEstBuff{ueIdx + 1}.nValidPrg      = 69;
+            elseif (ismember(caseNum, [9469:9480]))
+                SysPar.srsChEstBuff{ueIdx + 1}.startValidPrg  = 0;
+                SysPar.srsChEstBuff{ueIdx + 1}.nValidPrg      = 120;
+            elseif (ismember(caseNum, [9481:9492]))
+                SysPar.srsChEstBuff{ueIdx + 1}.startValidPrg  = 0;
+                SysPar.srsChEstBuff{ueIdx + 1}.nValidPrg      = 80;
             end
         end
         
@@ -1466,6 +1690,9 @@ parfor n = 1:NallTest
                     % Set optional parameters
                     if ~isempty(prg_size)
                         SysPar.bfw{i + 1}.prgSize = prg_size;
+                    end
+                    if ismember(caseNum, [9429:9435])
+                        SysPar.bfw{i + 1}.prgSize = 16;
                     end
                     if ~isempty(n_id_cell)
                         SysPar.carrier.N_ID_CELL = n_id_cell;

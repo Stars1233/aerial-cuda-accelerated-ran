@@ -24,14 +24,7 @@
 bool MemFoot::init(phydriver_handle _pdh, std::string _name, size_t _cpu_obj_size) {
     pdh = _pdh;
     name = _name;
-    items = 0;
-    cpu_obj_size = 0;
-    cpu_regular_size = 0;
-    cpu_pinned_size = 0;
-    gpu_pinned_size = 0;
-    gpu_regular_size = 0;
     initialized = true;
-
     cpu_obj_size = _cpu_obj_size;
 
     // Currently the CPU regular size of the various MemFoot objects isn't
@@ -91,10 +84,6 @@ bool MemFoot::addGpuRegularSize(size_t size)
     }
 
     return true;
-}
-
-const char * MemFoot::getName() const {
-    return name.c_str();
 }
 
 size_t MemFoot::getCpuObjSize() const {

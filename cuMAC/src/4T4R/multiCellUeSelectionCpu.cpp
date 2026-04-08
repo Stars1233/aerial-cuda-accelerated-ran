@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +31,8 @@ multiCellUeSelectionCpu::~multiCellUeSelectionCpu() {}
 
 void multiCellUeSelectionCpu::multiCellUeSelCpu()
 {
+    constexpr float kEps = 1e-6f;
+
     for (int cIdx = 0; cIdx < pCpuDynDesc->nCell; cIdx++) {
         uint16_t cellIdx = pCpuDynDesc->cellId[cIdx];
         std::vector<pfMetricUeSel> pf;
@@ -44,12 +46,12 @@ void multiCellUeSelectionCpu::multiCellUeSelCpu()
 
                     pfMetricUeSel pfTemp;
 
-                    double dataRate = 0;
+                    float dataRate = 0.0f;
                     for (int j = 0; j < pCpuDynDesc->nUeAnt; j++) {
-                        dataRate += pCpuDynDesc->W*log2(1.0 + pCpuDynDesc->wbSinr[uIdx*pCpuDynDesc->nUeAnt + j]);
+                        dataRate += log2f(1.0f + pCpuDynDesc->wbSinr[uIdx*pCpuDynDesc->nUeAnt + j]);
                     }
-                    float dataRateF = static_cast<float>(dataRate);
-                    pfTemp.first = pow(dataRateF, pCpuDynDesc->betaCoeff)/pCpuDynDesc->avgRatesActUe[uIdx];
+                    dataRate *= pCpuDynDesc->W;
+                    pfTemp.first = powf(dataRate, pCpuDynDesc->betaCoeff) / fmaxf(pCpuDynDesc->avgRatesActUe[uIdx], kEps);
                     pfTemp.second = uIdx;
 
                     pf.push_back(pfTemp);
@@ -87,6 +89,8 @@ void multiCellUeSelectionCpu::multiCellUeSelCpu()
 
 void multiCellUeSelectionCpu::multiCellUeSelCpu_hetero()
 {
+    constexpr float kEps = 1e-6f;
+
     for (int cIdx = 0; cIdx < pCpuDynDesc->nCell; cIdx++) {
         uint16_t cellIdx = pCpuDynDesc->cellId[cIdx];
         std::vector<pfMetricUeSel> pf;
@@ -100,12 +104,12 @@ void multiCellUeSelectionCpu::multiCellUeSelCpu_hetero()
 
                     pfMetricUeSel pfTemp;
 
-                    double dataRate = 0;
+                    float dataRate = 0.0f;
                     for (int j = 0; j < pCpuDynDesc->nUeAnt; j++) {
-                        dataRate += pCpuDynDesc->W*log2(1.0 + pCpuDynDesc->wbSinr[uIdx*pCpuDynDesc->nUeAnt + j]);
+                        dataRate += log2f(1.0f + pCpuDynDesc->wbSinr[uIdx*pCpuDynDesc->nUeAnt + j]);
                     }
-                    float dataRateF = static_cast<float>(dataRate);
-                    pfTemp.first = pow(dataRateF, pCpuDynDesc->betaCoeff)/pCpuDynDesc->avgRatesActUe[uIdx];
+                    dataRate *= pCpuDynDesc->W;
+                    pfTemp.first = powf(dataRate, pCpuDynDesc->betaCoeff) / fmaxf(pCpuDynDesc->avgRatesActUe[uIdx], kEps);
                     pfTemp.second = uIdx;
 
                     pf.push_back(pfTemp);

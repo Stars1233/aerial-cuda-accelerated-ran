@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,7 @@
  */
 
 #include "fading_chan.cuh"
-#include "cuphy.hpp"
+#include "chanModelsCommon.h"
 
 /**
  * @brief display usage of fading channel test
@@ -65,16 +65,14 @@ void test_fadeChan(std::string inputFileName, int nTti = 10, uint8_t fadingMode 
     uint16_t N_bsLayer              = dset_elem["N_bsAnt"].as<uint16_t>();
     uint16_t N_ueLayer              = dset_elem["N_ueAnt"].as<uint16_t>();
     uint16_t N_symbol_slot          = dset_elem["N_symbol_slot"].as<uint16_t>();
-    // create freqData Gpu tensor
-    // get cuPHY tensor type based on template parameters
-    cuphyDataType_t cuphyTensorType = enableHalfPrecision ? CUPHY_C_16F : CUPHY_C_32F;
+    Tcomplex* freqTxGpuPtr = nullptr;
+    Tcomplex* freqRxGpuPtr = nullptr;
+    size_t txBytes = sizeof(Tcomplex) * (size_t)N_sc * N_symbol_slot * N_bsLayer;
+    size_t rxBytes = sizeof(Tcomplex) * (size_t)N_sc * N_symbol_slot * N_ueLayer;
+    CHECK_CUDAERROR(cudaMalloc(&freqTxGpuPtr, txBytes));
+    CHECK_CUDAERROR(cudaMalloc(&freqRxGpuPtr, rxBytes));
 
-    cuphy::tensor_device freqTxGpu(cuphyTensorType, N_sc, N_symbol_slot, N_bsLayer, cuphy::tensor_flags::align_tight);
-    cuphy::tensor_device freqRxGpu(cuphyTensorType, N_sc, N_symbol_slot, N_ueLayer, cuphy::tensor_flags::align_tight);
-
-    /*------------------------ Create fading channel ------------------------*/
-    // uint8_t fadingMode, uint16_t randSeed
-    fadingChan<Tcomplex> * fadeChanPtr = new fadingChan<Tcomplex>(static_cast<Tcomplex*>(freqTxGpu.addr()), static_cast<Tcomplex*>(freqRxGpu.addr()), cuMainStrm, fadingMode, randSeed, phyChanType);
+    fadingChan<Tcomplex> * fadeChanPtr = new fadingChan<Tcomplex>(freqTxGpuPtr, freqRxGpuPtr, cuMainStrm, fadingMode, randSeed, phyChanType);
 
     fadeChanPtr -> setup(inputFile, 1/*enableSwapTxRx*/);  // assuming UL
 
@@ -98,7 +96,7 @@ void test_fadeChan(std::string inputFileName, int nTti = 10, uint8_t fadingMode 
         fadeChanPtr -> run(TTIlen * TTIIdx, targetSNR);
 
         cudaEventRecord(stop, cuMainStrm);
-        CUDA_CHECK(cudaEventSynchronize(stop));
+        CHECK_CUDAERROR(cudaEventSynchronize(stop));
         cudaStreamSynchronize(cuMainStrm);
         cudaEventElapsedTime(&elapsedTime, start, stop);
         elapsedTimeVec.push_back(elapsedTime);
@@ -133,6 +131,8 @@ void test_fadeChan(std::string inputFileName, int nTti = 10, uint8_t fadingMode 
         printf("Success: fading channel runs without errors\n");
     }
 
+    cudaFree(freqTxGpuPtr);
+    cudaFree(freqRxGpuPtr);
     delete fadeChanPtr;
     cudaEventDestroy(start);
     cudaEventDestroy(stop);

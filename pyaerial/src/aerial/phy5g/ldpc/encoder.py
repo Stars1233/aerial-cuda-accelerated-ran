@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
 """pyAerial library - LDPC encoding."""
 from typing import Generic
 from typing import List
+from typing import Optional
 
 import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
@@ -25,6 +26,7 @@ from aerial import pycuphy  # type: ignore
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PdschConfig
 from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.ldpc.util import get_pdsch_config_attrs
 from aerial.phy5g.ldpc.util import get_pdsch_tb_sizes
 
@@ -41,7 +43,7 @@ class LdpcEncoder(Generic[Array]):
     def __init__(self,
                  puncturing: bool = True,
                  max_num_code_blocks: int = 152,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize LdpcEncoder.
 
         Initialization does all the necessary memory allocations for cuPHY.
@@ -50,11 +52,11 @@ class LdpcEncoder(Generic[Array]):
             puncturing (bool): Whether to puncture the systematic bits (2Zc). Default: True.
             max_num_code_blocks (int): Maximum number of code blocks. Memory is allocated based
                 on this. Default: 152.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         self.puncturing = puncturing
 
@@ -68,7 +70,7 @@ class LdpcEncoder(Generic[Array]):
         # Create LDPC encoder object.
         self.pycuphy_ldpc_encoder = pycuphy.LdpcEncoder(
             self.output_device_ptr,
-            self.cuda_stream
+            self._cuda_stream.handle
         )
 
         self.pycuphy_ldpc_encoder.set_puncturing(puncturing)
@@ -144,7 +146,7 @@ class LdpcEncoder(Generic[Array]):
                                                                           tb_sizes,
                                                                           code_rates,
                                                                           redundancy_versions):
-            with cp.cuda.ExternalStream(int(self.cuda_stream)):
+            with self._cuda_stream:
                 cb_size, num_cb = tb_code_blocks.shape
                 if np.mod(cb_size, 32):
                     pad = 32 - np.mod(cb_size, 32)
@@ -169,7 +171,7 @@ class LdpcEncoder(Generic[Array]):
                 int(redundancy_version)
             )
 
-            with cp.cuda.ExternalStream(int(self.cuda_stream)):
+            with self._cuda_stream:
                 tb_coded_bits = cp.array(tb_coded_bits, order='F')
 
                 # Unpack bits.

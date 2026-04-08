@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -89,6 +89,8 @@ static constexpr uint32_t NS_X_US = 1000ULL;
 static constexpr uint32_t NS_X_MS = 1000000ULL;
 static constexpr uint32_t NS_X_S = 1000000000ULL;
 
+constexpr uint32_t MAX_SEM_ITEMS = 4096;     //!< Maximum semaphore items
+
 
 enum order_kernel_exit_code {
     ORDER_KERNEL_RUNNING = 0,
@@ -105,9 +107,33 @@ enum order_kernel_exit_code {
     ORDER_KERNEL_EXIT_ERROR7 = 11,
 };
 
+/**
+ * Semaphore list of possible statuses.
+ */
+ enum aerial_fh_gpu_semaphore_status {
+	/* Semaphore is free and can be (re)used. */
+	AERIAL_FH_GPU_SEMAPHORE_STATUS_FREE = 0,
+	AERIAL_FH_GPU_SEMAPHORE_STATUS_READY = 1,
+	AERIAL_FH_GPU_SEMAPHORE_STATUS_DONE = 2,
+	AERIAL_FH_GPU_SEMAPHORE_STATUS_HOLD = 3,
+	AERIAL_FH_GPU_SEMAPHORE_STATUS_ERROR = 4,
+	AERIAL_FH_GPU_SEMAPHORE_STATUS_EXIT = 5,
+};
+
 struct order_sem_info
 {
     uint32_t pkts;
+};
+
+struct aerial_fh_gpu_semaphore_packet {
+	enum aerial_fh_gpu_semaphore_status status; /**< status */
+	uint32_t num_packets;		       /**< num_packets */
+	uint64_t doca_buf_idx_start;	       /**< doca_buf_idx_start */
+};
+
+struct aerial_fh_gpu_semaphore_gpu {
+	struct aerial_fh_gpu_semaphore_packet pkt_info_gpu[MAX_SEM_ITEMS]; /**< Packet info, GPU pointer */
+	uint32_t num_items;				/**< Number of items in semaphore */
 };
 
 //need to expose this for the order kernel in cuphydriver
@@ -121,9 +147,11 @@ typedef struct doca_rx_items {
     void *gpu_pkt_addr;                     /* DOCA mmap GPU memory address */
     void *cpu_pkt_addr;			/* DOCA mmap CPU memory address */
     uint16_t dpdk_queue_idx;
+    uint32_t hw_queue_idx;
 
     struct doca_gpu_semaphore *sem_cpu;     /* One semaphore per queue to report stats, CPU handler*/
     struct doca_gpu_semaphore_gpu *sem_gpu; /* One semaphore per queue to report stats, GPU handler*/
+    struct aerial_fh_gpu_semaphore_gpu *sem_gpu_aerial_fh; /* One semaphore per queue to report stats, GPU handler*/
     int nitems;
     int dmabuf_fd;                          /* DMABuf file descriptor */
 } doca_rx_items_t;

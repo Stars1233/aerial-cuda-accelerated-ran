@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@ import numpy as np
 import os
 import uuid
 import sys
+import yaml
 
 from .traffic import traffic_avg, traffic_het
 from .execute import run
@@ -25,21 +26,26 @@ from .check_cell_capacity import check_cell_capacity
 
 def run_TDD(args, sms, mig=None):
 
-    ifile = open(args.config)
-    config = json.load(ifile)
-    ifile.close()
+    if getattr(args, "inline_config_obj", None) is not None:
+        config = args.inline_config_obj
+    else:
+        with open(args.config) as ifile:
+            config = json.load(ifile)
 
-    ifile = open(args.uc)
-    uc = json.load(ifile)
-    ifile.close()
+    if getattr(args, "inline_uc_obj", None) is not None:
+        uc = args.inline_uc_obj
+    else:
+        with open(args.uc) as ifile:
+            uc = json.load(ifile)
 
+    uc_basename = os.path.basename(args.uc)
     if args.is_graph:
-        output = "sweep_graphs_" + args.uc.replace("uc_", "").replace(
+        output = "sweep_graphs_" + uc_basename.replace("uc_", "").replace(
             "_TDD.json", ""
         ).replace("_FDD.json", "")
         mode = 1
     else:
-        output = "sweep_streams_" + args.uc.replace("uc_", "").replace(
+        output = "sweep_streams_" + uc_basename.replace("uc_", "").replace(
             "_TDD.json", ""
         ).replace("_FDD.json", "")
         mode = 0
@@ -125,13 +131,74 @@ def run_TDD(args, sms, mig=None):
     sweeps = {}
     powers = {}
 
-    # save test configs and GPU product name
+    # save test configs and GPU product name (exclude inline config/uc blobs; use vector_files when from YAML)
+    def _test_config_for_save():
+        d = dict(vars(args))
+        d.pop("inline_config_obj", None)
+        d.pop("inline_uc_obj", None)
+        return d
+
+    def _load_mac_slot_and_light_weight(yaml_path, pattern):
+        """Load mac_slot_config (MAC run per slot) and cumac_light_weight_flag from config YAML for compare.py."""
+        mac_slot_config = None
+        cumac_light_weight_flag = None
+        if not yaml_path or not pattern:
+            return mac_slot_config, cumac_light_weight_flag
+        paths_to_try = [yaml_path]
+        if os.path.isabs(yaml_path) and not os.path.isfile(yaml_path):
+            paths_to_try.append(os.path.join(os.getcwd(), os.path.basename(yaml_path)))
+        for p in paths_to_try:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    ycfg = yaml.safe_load(f) or {}
+                cfg = ycfg.get("config") if isinstance(ycfg.get("config"), dict) else {}
+                tdd_slot = cfg.get("tdd_slot_config") or {}
+                slot_cfg = tdd_slot.get(pattern) if isinstance(tdd_slot, dict) else {}
+                if isinstance(slot_cfg.get("MAC"), list):
+                    mac_slot_config = slot_cfg["MAC"]
+                cumac_opts = cfg.get("cumac_options") or {}
+                if isinstance(cumac_opts.get("cumac_light_weight_flag"), list):
+                    cumac_light_weight_flag = cumac_opts["cumac_light_weight_flag"]
+                if mac_slot_config is not None or cumac_light_weight_flag is not None:
+                    break
+            except (yaml.YAMLError, FileNotFoundError, TypeError, OSError):
+                continue
+        return mac_slot_config, cumac_light_weight_flag
+
     if args.is_power:
-        powers['testConfig'] = vars(args)
-        powers['testConfig']['smAllocation'] = str(target) 
+        powers['testConfig'] = _test_config_for_save()
+        powers['testConfig']['smAllocation'] = str(target)
     else:
-        sweeps['testConfig'] = vars(args)
+        sweeps['testConfig'] = _test_config_for_save()
         sweeps['testConfig']['smAllocation'] = str(target)
+
+    yaml_path = getattr(args, "yaml", None)
+    pattern = getattr(args, "pattern", None)
+    mac_slot_config, cumac_light_weight_flag = _load_mac_slot_and_light_weight(yaml_path, pattern)
+    if mac_slot_config is not None:
+        if args.is_power:
+            powers['testConfig']['mac_slot_config'] = mac_slot_config
+        else:
+            sweeps['testConfig']['mac_slot_config'] = mac_slot_config
+    if cumac_light_weight_flag is not None:
+        if args.is_power:
+            powers['testConfig']['cumac_light_weight_flag'] = cumac_light_weight_flag
+        else:
+            sweeps['testConfig']['cumac_light_weight_flag'] = cumac_light_weight_flag
+
+    def _ensure_mac_cumac_in_test_config(tc):
+        """If testConfig has yaml and pattern but missing MAC/cumac keys, try loading from YAML (e.g. for phase3 or re-saves)."""
+        if not isinstance(tc, dict) or (tc.get("mac_slot_config") is not None and tc.get("cumac_light_weight_flag") is not None):
+            return
+        yp = tc.get("yaml") or tc.get("config_yaml")
+        pat = tc.get("pattern")
+        if not yp or not pat:
+            return
+        msc, clw = _load_mac_slot_and_light_weight(yp, pat)
+        if msc is not None:
+            tc["mac_slot_config"] = msc
+        if clw is not None:
+            tc["cumac_light_weight_flag"] = clw
     
     if args.seed is not None:
         np.random.seed(args.seed)
@@ -218,9 +285,28 @@ def run_TDD(args, sms, mig=None):
                     args, mig, mig_gpu, command, vectors, mode, target, k, k
                 )
 
-        elif "_avg_":
+        elif "_avg_" in args.uc:
 
-            interval = uc["Peak: " + str(k)]
+            peak_key = "Peak: " + str(k)
+            if peak_key not in uc:
+                # Inline UC was built from YAML cap (e.g. 25); --start/--cap can exceed it. Create missing Peak entry.
+                template_peaks = [key for key in uc.keys() if key.startswith("Peak: ")]
+                if not template_peaks:
+                    sys.exit("error: use case file has no Peak: N entry to template from")
+                template_key = max(template_peaks, key=lambda x: int(x.split(":", 1)[1].strip()))
+                template = uc[template_key]
+                new_interval = {}
+                for subcase, ch_dict in template.items():
+                    new_interval[subcase] = {}
+                    for ch_key, testcase_list in ch_dict.items():
+                        base_ch = ch_key.split(" - ", 1)[1] if " - " in ch_key else ch_key
+                        if base_ch in {"MAC", "MAC2"}:
+                            new_interval[subcase][ch_key] = list(testcase_list)
+                        else:
+                            testcase_id = testcase_list[0] if testcase_list else "F08-PP-00"
+                            new_interval[subcase][ch_key] = [testcase_id] * k
+                uc[peak_key] = new_interval
+            interval = uc[peak_key]
 
             for subcase in interval.keys():
 
@@ -230,7 +316,7 @@ def run_TDD(args, sms, mig=None):
 
                 if len(uc_dl) != 1:
                     sys.exit(
-                        "error: use case file exhibits an unexpected struture (PDSCH)"
+                        "error: use case file exhibits an unexpected structure (PDSCH)"
                     )
                 else:
                     uc_dl = uc_dl[0]
@@ -239,7 +325,7 @@ def run_TDD(args, sms, mig=None):
 
                 if len(uc_ul) != 1:
                     sys.exit(
-                        "error: use case file exhibits an unexpected struture (PUSCH)"
+                        "error: use case file exhibits an unexpected structure (PUSCH)"
                     )
                 else:
                     uc_ul = uc_ul[0]
@@ -494,6 +580,7 @@ def run_TDD(args, sms, mig=None):
 
     if args.is_power:
         if len(list(powers.keys())) > 0:
+            _ensure_mac_cumac_in_test_config(powers.get("testConfig"))
             ofile = open(output.replace("sweep", "power") + ".json", "w")
             json.dump(powers, ofile, indent=2)
             ofile.close()
@@ -508,8 +595,12 @@ def run_TDD(args, sms, mig=None):
             # the max cell count that all channels pass (within latency threshold) will be the cell capacity
             # a warning of unknown cell capacity will be given if all tested cell counts pass or none passes
             if not args.is_test:
-                check_cell_capacity(sweeps)
+                if args.is_ref_check:
+                    print("enable_ref_check is on, skip cell capacity check")
+                else:
+                    check_cell_capacity(sweeps)
             
+                _ensure_mac_cumac_in_test_config(sweeps.get("testConfig"))
                 ofile = open(output_file, "w")
                 json.dump(sweeps, ofile, indent=2)
                 ofile.close()

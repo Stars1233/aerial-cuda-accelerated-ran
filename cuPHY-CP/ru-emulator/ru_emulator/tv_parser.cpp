@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,34 @@
 #include "tv_parser.hpp"
 #include "ru_emulator.hpp"
 #include <set>
+
+/**
+ * @brief Try to read beam IDs from an HDF5 PDU dataset element (4T4R beam ID validation)
+ *
+ * Reads the digBFInterfaces and beamIdx fields from a PDU compound dataset.
+ * If the fields are not present (e.g., older test vectors), the function
+ * gracefully falls back to defaults and beam ID validation will be skipped.
+ *
+ * @param[in] pdu_pars HDF5 dataset element for the PDU
+ * @param[out] info tv_info structure to populate with expected beam IDs
+ */
+static void try_read_beam_ids_from_pdu(hdf5hpp::hdf5_dataset_elem& pdu_pars, tv_info& info)
+{
+    try
+    {
+        info.digBFInterfaces = pdu_pars["digBFInterfaces"].as<uint16_t>();
+        if (info.digBFInterfaces > 0)
+        {
+            info.expected_beam_ids = pdu_pars["beamIdx"].as<std::vector<uint16_t>>();
+        }
+    }
+    catch (const std::exception&)
+    {
+        // beamIdx/digBFInterfaces not present in this TV - beam ID validation will be skipped
+        info.digBFInterfaces = 0;
+        info.expected_beam_ids.clear();
+    }
+}
 
 void RU_Emulator::load_tvs()
 {
@@ -335,6 +363,16 @@ void RU_Emulator::load_pusch_tvs()
             }
             pusch_found = true;
 
+            // Read beam IDs for this PDU (first PDU populates expected_beam_ids
+            // as fallback; all PDUs populate per_pdu_beam_ids)
+            tv_info pdu_beam_info{};
+            try_read_beam_ids_from_pdu(pdu_pars, pdu_beam_info);
+            if (ul_tv_info.expected_beam_ids.empty())
+            {
+                ul_tv_info.digBFInterfaces = pdu_beam_info.digBFInterfaces;
+                ul_tv_info.expected_beam_ids = pdu_beam_info.expected_beam_ids;
+            }
+
             pdu_info pdu_info;
             pdu_info.startSym = pdu_pars["StartSymbolIndex"].as<uint8_t>();
             pdu_info.numSym = pdu_pars["NrOfSymbols"].as<uint8_t>();
@@ -375,6 +413,13 @@ void RU_Emulator::load_pusch_tvs()
                 }
             }
 
+            if (!pdu_beam_info.expected_beam_ids.empty())
+            {
+                ul_tv_info.per_pdu_beam_ids.push_back({
+                    pdu_info.startPrb,
+                    pdu_info.numPrb,
+                    pdu_beam_info.expected_beam_ids});
+            }
             ul_tv_info.pdu_infos.emplace_back(std::move(pdu_info));
             count++;
         }
@@ -572,6 +617,17 @@ void RU_Emulator::load_pucch_tvs()
                 continue;
             }
             pucch_found = true;
+
+            // Read beam IDs for this PDU (first PDU populates expected_beam_ids
+            // as fallback; all PDUs populate per_pdu_beam_ids)
+            tv_info pdu_beam_info{};
+            try_read_beam_ids_from_pdu(pdu_pars, pdu_beam_info);
+            if (ul_tv_info.expected_beam_ids.empty())
+            {
+                ul_tv_info.digBFInterfaces = pdu_beam_info.digBFInterfaces;
+                ul_tv_info.expected_beam_ids = pdu_beam_info.expected_beam_ids;
+            }
+
             // Multiple PDUs, Assume all have the same params, and accumulate TB size
             pdu_info pdu_info;
             pdu_info.freqHopFlag = pdu_pars["freqHopFlag"].as<uint32_t>();
@@ -585,6 +641,14 @@ void RU_Emulator::load_pucch_tvs()
             if (opt_enable_mmimo)
             {
                 get_ul_ports(pdu_pars, pdu_info);
+            }
+
+            if (!pdu_beam_info.expected_beam_ids.empty())
+            {
+                ul_tv_info.per_pdu_beam_ids.push_back({
+                    pdu_info.startPrb,
+                    pdu_info.numPrb,
+                    pdu_beam_info.expected_beam_ids});
             }
 
             ul_tv_info.endPrb = std::max(static_cast<int>(pdu_info.startPrb) + static_cast<int>(pdu_info.numPrb), static_cast<int>(ul_tv_info.endPrb));
@@ -943,9 +1007,9 @@ void RU_Emulator::load_dl_tvs()
 
 }
 
-void load_dl_qams(hdf5hpp::hdf5_file& hdf5file, dl_tv_object& tv_object, dl_tv_info& dl_tv_info, bool mod_comp_enabled, const std::vector<struct cell_config>& cell_configs, bool selective_load)
+void load_dl_qams(hdf5hpp::hdf5_file& hdf5file, dl_tv_object& tv_object, dl_tv_info& dl_tv_info, bool mod_comp_enabled, bool non_mod_comp_enabled, const std::vector<struct cell_config>& cell_configs, bool selective_load)
 {
-    if (!mod_comp_enabled)
+    if (non_mod_comp_enabled)
     {
         std::unordered_set<int> fmts;
         if (selective_load)
@@ -1031,7 +1095,8 @@ void load_dl_qams(hdf5hpp::hdf5_file& hdf5file, dl_tv_object& tv_object, dl_tv_i
             }
         }
     }
-    else if (hdf5file.is_valid_dataset("nMsg_new"))
+
+    if (mod_comp_enabled && hdf5file.is_valid_dataset("nMsg_new"))
     {
         uint32_t nMsg = 0;
         hdf5hpp::hdf5_dataset dset = hdf5file.open_dataset("nMsg_new");
@@ -1072,6 +1137,38 @@ void load_dl_qams(hdf5hpp::hdf5_file& hdf5file, dl_tv_object& tv_object, dl_tv_i
                 mc_scale_remask = hdr["mcScaleReMask"].as<std::vector<uint16_t>>();
             }
 
+            tv_mod_comp_ext_info ext_info;
+            hdf5hpp::hdf5_datatype hdr_dtype = dset_msg_hdr.get_datatype();
+            bool has_ext_fields = H5Tget_member_index(hdr_dtype.id(), "extType") >= 0 &&
+                                  H5Tget_member_index(hdr_dtype.id(), "nMask") >= 0 &&
+                                  H5Tget_member_index(hdr_dtype.id(), "mcScaleOffset") >= 0 &&
+                                  H5Tget_member_index(hdr_dtype.id(), "mcScaleReMask") >= 0 &&
+                                  H5Tget_member_index(hdr_dtype.id(), "csf") >= 0;
+            if (has_ext_fields)
+            {
+                ext_info.ext_type = hdr["extType"].as<uint32_t>();
+                ext_info.n_mask = hdr["nMask"].as<uint32_t>();
+                std::vector<uint32_t> tv_re_masks = hdr["mcScaleReMask"].as<std::vector<uint32_t>>();
+                std::vector<double> tv_offsets = hdr["mcScaleOffset"].as<std::vector<double>>();
+                std::vector<uint32_t> tv_csf = hdr["csf"].as<std::vector<uint32_t>>();
+                uint32_t max_k = std::min({ext_info.n_mask, uint32_t(2),
+                                           uint32_t(tv_re_masks.size()),
+                                           uint32_t(tv_offsets.size()),
+                                           uint32_t(tv_csf.size())});
+                if (max_k < ext_info.n_mask)
+                {
+                    re_warn("ModComp ext vectors shorter than nMask={}: reMask={} offset={} csf={}", 
+                            ext_info.n_mask, tv_re_masks.size(), tv_offsets.size(), tv_csf.size());
+                }
+                for (uint32_t k = 0; k < max_k; k++)
+                {
+                    ext_info.mc_scale_re_mask[k] = static_cast<uint16_t>(tv_re_masks[k]);
+                    ext_info.mc_scale_offset_encoded[k] = float_to_modcompscaler(static_cast<float>(tv_offsets[k]));
+                    ext_info.csf[k] = tv_csf[k];
+                }
+                ext_info.valid = true;
+            }
+
             for (int j = 0; j < channel_type.size(); j++)
             {
                 if ((tv_object.nrsim_ch_type != nrsim_tv_type::PDCCH && (int)(tv_object.nrsim_ch_type) == channel_type[j]) || (tv_object.nrsim_ch_type == nrsim_tv_type::PDCCH && dl_tv_info.prb_map[sym][startPrbc] && ((1 << portIdx) & dl_tv_info.prb_num_flow_map[sym][startPrbc])))
@@ -1090,6 +1187,7 @@ void load_dl_qams(hdf5hpp::hdf5_file& hdf5file, dl_tv_object& tv_object, dl_tv_i
                     Dataset d = std::move(load_tv_datasets_single(hdf5file, " ", cur_payload));
                     mod_comp_obj.mod_comp_payload.emplace_back(std::move(d));
                     mod_comp_obj.mod_comp_payload_params.push_back({startPrbc, numPrbc, udIqWidth, skip_iq_validation});
+                    mod_comp_obj.mod_comp_ext_info.push_back(ext_info);
                     mod_comp_obj.global_msg_idx_to_tv_idx[i - 1] = num_msgs;
                     num_msgs++;
                     // mod_comp_obj.fss_mod_comp_payload_idx[portIdx][section_id] = i;
@@ -1214,6 +1312,17 @@ void RU_Emulator::load_pdsch_tvs()
                 continue;
             }
             pdsch_found = true;
+
+            // Read beam IDs for this PDU (first PDU populates expected_beam_ids
+            // as fallback; all PDUs populate per_pdu_beam_ids)
+            tv_info pdu_beam_info{};
+            try_read_beam_ids_from_pdu(pdu_pars, pdu_beam_info);
+            if (dl_tv_info.expected_beam_ids.empty())
+            {
+                dl_tv_info.digBFInterfaces = pdu_beam_info.digBFInterfaces;
+                dl_tv_info.expected_beam_ids = pdu_beam_info.expected_beam_ids;
+            }
+
             // dl_tv_info.startPrb = pdu_pars["rbStart"].as<uint16_t>() + pdu_pars["BWPStart"].as<uint16_t>();
             // dl_tv_info.numPrb = pdu_pars["rbSize"].as<uint16_t>();
 
@@ -1323,6 +1432,13 @@ void RU_Emulator::load_pdsch_tvs()
                 dl_tv_info.numPrb += pdu_info.numPrb * pdu_info.flow_indices.size() * pdu_info.numDataSym;
                 pdu_info.numFlows = pdu_info.flow_indices.size();
                 dl_tv_info.pdu_infos.push_back(pdu_info);
+                if (!pdu_beam_info.expected_beam_ids.empty())
+                {
+                    dl_tv_info.per_pdu_beam_ids.push_back({
+                        static_cast<uint16_t>(p.first),
+                        static_cast<uint16_t>(p.second),
+                        pdu_beam_info.expected_beam_ids});
+                }
                 re_info("PDSCH PDU {} startSym {} startDataSym {} numSym {} numDataSym {} startPrb {} numPrb {} numFlows {}",
                         dl_tv_info.pdu_infos.size() - 1, pdu_info.startSym, pdu_info.startDataSym, pdu_info.numSym,
                         pdu_info.numDataSym, pdu_info.startPrb, pdu_info.numPrb, pdu_info.flow_indices.size());
@@ -1349,7 +1465,7 @@ void RU_Emulator::load_pdsch_tvs()
         timers.compute += compute_end - compute_start;
         auto load_qams_start = get_ns();
         re_info("Loading qams for {}", pdsch_object.tv_names[i].c_str());
-        load_dl_qams(hdf5file, pdsch_object, dl_tv_info, opt_mod_comp_enabled == RE_ENABLED, cell_configs, selective_tv_load);
+        load_dl_qams(hdf5file, pdsch_object, dl_tv_info, opt_mod_comp_enabled == RE_ENABLED, opt_non_mod_comp_enabled == RE_ENABLED, cell_configs, selective_tv_load);
         auto load_qams_end = get_ns();
         timers.load += load_qams_end - load_qams_start;
         pdsch_object.tv_info.emplace_back(dl_tv_info);
@@ -1391,6 +1507,27 @@ void RU_Emulator::load_pbch_tvs()
                 continue;
             }
             pbch_found = true;
+
+            // Collect beam IDs from ALL SSB PDUs for 4T4R validation.
+            // Multiple SSB beams share the same eAxC with different beam IDs,
+            // so we accumulate all unique beam IDs across all SSB PDUs.
+            {
+                struct dl_tv_info temp_info{};
+                try_read_beam_ids_from_pdu(pdu_pars, temp_info);
+                for (uint16_t id : temp_info.expected_beam_ids)
+                {
+                    if (std::find(dl_tv_info.expected_beam_ids.begin(),
+                                  dl_tv_info.expected_beam_ids.end(), id) == dl_tv_info.expected_beam_ids.end())
+                    {
+                        dl_tv_info.expected_beam_ids.push_back(id);
+                    }
+                }
+                if (temp_info.digBFInterfaces > dl_tv_info.digBFInterfaces)
+                {
+                    dl_tv_info.digBFInterfaces = temp_info.digBFInterfaces;
+                }
+            }
+
             uint16_t ssbSubcarrierOffset = pdu_pars["ssbSubcarrierOffset"].as<uint16_t>();
             uint16_t ssbOffsetPointA = pdu_pars["SsbOffsetPointA"].as<uint16_t>();
 
@@ -1450,7 +1587,7 @@ void RU_Emulator::load_pbch_tvs()
         }
         re_info("Loading qams for {}", pbch_object.tv_names[i].c_str());
         generate_prb_map(dl_tv_info, dl_tv_info.pdu_infos);
-        load_dl_qams(hdf5file, pbch_object, dl_tv_info, opt_mod_comp_enabled == RE_ENABLED, cell_configs, selective_tv_load);
+        load_dl_qams(hdf5file, pbch_object, dl_tv_info, opt_mod_comp_enabled == RE_ENABLED, opt_non_mod_comp_enabled == RE_ENABLED, cell_configs, selective_tv_load);
         //dl_tv_info.numFlows = load_first_dimension_dataset(hdf5file, pbch_object.tv_names[i], "X_tf");
         pbch_object.tv_info.emplace_back(dl_tv_info);
         hdf5file.close();
@@ -1655,6 +1792,16 @@ void RU_Emulator::load_pdcch_tvs(struct dl_tv_object& tv_object)
             }
             pdcch_found = true;
 
+            // Read beam IDs for this PDU (first PDU populates expected_beam_ids
+            // for fallback; all PDUs populate per_pdu_beam_ids)
+            tv_info pdu_beam_info{};
+            try_read_beam_ids_from_pdu(pdu_pars, pdu_beam_info);
+            if (dl_tv_info.expected_beam_ids.empty())
+            {
+                dl_tv_info.digBFInterfaces = pdu_beam_info.digBFInterfaces;
+                dl_tv_info.expected_beam_ids = pdu_beam_info.expected_beam_ids;
+            }
+
             cuphyPdcchCoresetDynPrm_t pdcchCoresetParam;
             pdcchCoresetParam.freq_domain_resource = static_cast<uint64_t>(pdu_pars["FreqDomainResource0"].as<uint32_t>()) << 32 | pdu_pars["FreqDomainResource1"].as<uint32_t>();
             pdcchCoresetParam.start_rb = pdu_pars["BWPStart"].as<uint32_t>();
@@ -1730,6 +1877,12 @@ void RU_Emulator::load_pdcch_tvs(struct dl_tv_object& tv_object)
                 dl_tv_info.numPrb += numPrb * pdu_info.numSym; // * pdu_info.numFlows, flow will be decided at validation
                 dl_tv_info.startSym = pdu_pars["StartSymbolIndex"].as<uint8_t>();
                 dl_tv_info.numSym = pdu_pars["DurationSymbols"].as<uint8_t>();
+                if (!pdu_beam_info.expected_beam_ids.empty())
+                {
+                    dl_tv_info.per_pdu_beam_ids.push_back({
+                        startPrb, numPrb,
+                        pdu_beam_info.expected_beam_ids});
+                }
                 dl_tv_info.pdu_infos.push_back(std::move(pdu_info));
 
             }
@@ -1741,7 +1894,7 @@ void RU_Emulator::load_pdcch_tvs(struct dl_tv_object& tv_object)
         auto load_qams_start = get_ns();
         re_info("Loading qams for {}", tv_object.tv_names[i].c_str());
         generate_prb_map(dl_tv_info, dl_tv_info.pdu_infos);
-        load_dl_qams(hdf5file, tv_object, dl_tv_info, opt_mod_comp_enabled == RE_ENABLED, cell_configs, selective_tv_load);
+        load_dl_qams(hdf5file, tv_object, dl_tv_info, opt_mod_comp_enabled == RE_ENABLED, opt_non_mod_comp_enabled == RE_ENABLED, cell_configs, selective_tv_load);
         auto load_qams_end = get_ns();
         timers.load += load_qams_end - load_qams_start;
         //dl_tv_info.numFlows = load_first_dimension_dataset(hdf5file, tv_object.tv_names[i], "X_tf");
@@ -1880,9 +2033,27 @@ void RU_Emulator::load_csirs_tvs()
                 continue;
             }
             csirs_found = true;
-            // FIXME: Assume CSI_RS PDU type will be either all ZP or all !ZP
 
+            // Use CSIType from the PDU to distinguish ZP from NZP CSI-RS.
+            // ZP CSI-RS beam IDs are meaningless (no signal transmitted) and stored
+            // separately so the validator can identify and skip ZP sections.
+            // Only NZP CSI-RS beam IDs are validated.
             uint8_t csirs_type = pdu_pars["CSIType"].as<uint8_t>();
+            {
+                struct dl_tv_info temp_info{};
+                try_read_beam_ids_from_pdu(pdu_pars, temp_info);
+                if (!temp_info.expected_beam_ids.empty())
+                {
+                    if (cuphyCsiType_t::ZP_CSI_RS != csirs_type)
+                    {
+                        // Non-ZP CSI-RS (TRS or NZP): store as a beam ID set for validation
+                        tv_info.csirs_beam_id_sets.push_back(std::move(temp_info.expected_beam_ids));
+                    }
+                    // ZP CSI-RS: no signal transmitted, beam ID is meaningless — skip
+                }
+            }
+
+            // FIXME: Assume CSI_RS PDU type will be either all ZP or all !ZP
             if(cuphyCsiType_t::ZP_CSI_RS != csirs_type)
             {
                 tv_info.isZP = false;
@@ -1954,7 +2125,7 @@ void RU_Emulator::load_csirs_tvs()
         }
         tv_info.csirsMaxPortNum = csirs_max_port_num;
         re_info("Loading CSI_RS qams for {}", csirs_object.tv_names[i].c_str());
-        load_dl_qams(hdf5file, csirs_object, tv_info, opt_mod_comp_enabled == RE_ENABLED, cell_configs, selective_tv_load);
+        load_dl_qams(hdf5file, csirs_object, tv_info, opt_mod_comp_enabled == RE_ENABLED, opt_non_mod_comp_enabled == RE_ENABLED, cell_configs, selective_tv_load);
 
         Dataset re_map = std::move(load_tv_datasets_single(hdf5file, csirs_object.tv_names[i], tv_info.isZP ? "Xtf_remap" : "Xtf_remap_trsnzp"));
         uint32_t* re_map_array = static_cast<uint32_t*>(re_map.data.get());
@@ -2145,6 +2316,7 @@ void RU_Emulator::load_csirs_tvs()
         re_info("CSI_RS TV {} numREs {} numFlows {}", csirs_object.tv_names[i].c_str(), tv_info.csirsNumREs, tv_info.numFlows);
         hdf5file.close();
     }
+
 }
 
 void RU_Emulator::generate_prb_map(struct tv_info &tv_info_, std::vector<pdu_info> &pdu_infos)
@@ -2209,7 +2381,7 @@ void RU_Emulator::load_bfw_tvs(bool dirDL)
             bfw_found = true;
             count++;
 
-            bfw_info bfw_info;
+            bfw_info bfw_info{};
             bfw_info.bfwUL = pdu_pars["bfwUL"].as<uint32_t>();
             bfw_info.prgSize = pdu_pars["prgSize"].as<uint32_t>();
             bfw_info.bfwPrbGrpSize = pdu_pars["bfwPrbGrpSize"].as<uint32_t>();

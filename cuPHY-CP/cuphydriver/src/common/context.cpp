@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 3) // "DRV.CTX"
 #define TAG_STARTUP_TIMES (NVLOG_TAG_BASE_CUPHY_CONTROLLER + 5) // "CTL.STARTUP_TIMES"
 #define TAG_METRICS_FAPI_SRS_TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 44) // "DRV.SRS_FAPI_PACKET_SUMMARY"
+#define TAG_PERF_METRICS (NVLOG_TAG_BASE_CUPHY_DRIVER + 48) // "DRV.PERF_METRICS"
 
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -56,7 +57,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config & ctx_cfg, bool minimal) :
     standalone = ctx_cfg.standalone;
     validation = ctx_cfg.validation;  // Enable validation mode for safer testing
     prometheus_cpu_core = ctx_cfg.prometheus_cpu_core;
-    datalake_core = ctx_cfg.datalake_core; 
+    data_core = ctx_cfg.data_core; 
     enable_cpu_init_comms     = ctx_cfg.enable_cpu_init_comms;
 
     enable_ul_cuphy_graphs  = ctx_cfg.enable_ul_cuphy_graphs;
@@ -64,9 +65,13 @@ PhyDriverCtx::PhyDriverCtx(const context_config & ctx_cfg, bool minimal) :
 
     // Initialize additional fields that FhProxy constructor may use
     enable_gpu_comm_via_cpu  = ctx_cfg.enable_gpu_comm_via_cpu;  // CPU-only mode
-    send_static_bfw_wt_all_cplane  = ctx_cfg.send_static_bfw_wt_all_cplane; 
+    send_static_bfw_wt_all_cplane  = ctx_cfg.send_static_bfw_wt_all_cplane;
     enable_gpu_comm_dl     = ctx_cfg.enable_gpu_comm_dl;
     mMIMO_enable           = ctx_cfg.mMIMO_enable;
+    pusch_nMaxTbPerNode    = ctx_cfg.pusch_nMaxTbPerNode;
+    sendCPlane_timing_error_th_ns = ctx_cfg.sendCPlane_timing_error_th_ns;
+    start_section_id_prach = ctx_cfg.start_section_id_prach;
+    start_section_id_srs   = ctx_cfg.start_section_id_srs;
 
     fh_proxy = std::make_unique<FhProxy>((phydriver_handle)this,ctx_cfg);
 
@@ -136,6 +141,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     workers_dl_cores    = ctx_cfg.dl_cores;
     workers_dl_validation_cores = ctx_cfg.dl_validation_cores;
     use_green_contexts  = ctx_cfg.use_green_contexts;
+    use_gc_workqueues   = ctx_cfg.use_gc_workqueues;
 
     mps_sm_pusch        = ctx_cfg.mps_sm_pusch;
     mps_sm_pucch        = ctx_cfg.mps_sm_pucch;
@@ -178,6 +184,9 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     disable_empw = ctx_cfg.disable_empw;
     enable_cpu_task_tracing = ctx_cfg.enable_cpu_task_tracing;
     enable_prepare_tracing = ctx_cfg.enable_prepare_tracing;
+    cupti_enable_tracing = ctx_cfg.cupti_enable_tracing;
+    cupti_buffer_size = ctx_cfg.cupti_buffer_size;
+    cupti_num_buffers = ctx_cfg.cupti_num_buffers;
     enable_dl_cqe_tracing = ctx_cfg.enable_dl_cqe_tracing;
     cqe_trace_cell_mask = ctx_cfg.cqe_trace_cell_mask;
     cqe_trace_slot_mask = ctx_cfg.cqe_trace_slot_mask;
@@ -192,6 +201,24 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 
     mMIMO_enable           = ctx_cfg.mMIMO_enable;
     enable_srs             = ctx_cfg.enable_srs;
+    enable_dl_core_affinity = ctx_cfg.enable_dl_core_affinity;
+    dlc_core_packing_scheme = ctx_cfg.dlc_core_packing_scheme;
+    
+    // Validate DL C-plane core packing scheme
+    if (dlc_core_packing_scheme == 2) {
+        NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT, "dlc_core_packing_scheme=2 (dynamic workload-based) is not yet supported");
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "dlc_core_packing_scheme=2 is not yet supported");
+    }
+    if (dlc_core_packing_scheme > 2) {
+        NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT, "Invalid dlc_core_packing_scheme value: {}. Must be 0, 1, or 2", dlc_core_packing_scheme);
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Invalid dlc_core_packing_scheme value");
+    }
+    // Note: scheme 1 (fixed per-cell) requires enable_dl_core_affinity=1
+    if (dlc_core_packing_scheme == 1 && enable_dl_core_affinity == 0) {
+        NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT, "dlc_core_packing_scheme=1 requires enable_dl_core_affinity=1");
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "dlc_core_packing_scheme=1 requires enable_dl_core_affinity=1");
+    }
+    
     aggr_obj_non_avail_th  = ctx_cfg.aggr_obj_non_avail_th;
     split_ul_cuda_streams  = ctx_cfg.split_ul_cuda_streams;
     serialize_pucch_pusch  = ctx_cfg.serialize_pucch_pusch;
@@ -200,6 +227,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     sendCPlane_dlbfw_backoff_th_ns = ctx_cfg.sendCPlane_dlbfw_backoff_th_ns;
     forcedNumCsi2Bits         = ctx_cfg.forcedNumCsi2Bits;
     pusch_nMaxLdpcHetConfigs  = ctx_cfg.pusch_nMaxLdpcHetConfigs;
+    pusch_nMaxTbPerNode       = ctx_cfg.pusch_nMaxTbPerNode;
     mCh_segment_proc_enable   = ctx_cfg.mCh_segment_proc_enable;
     max_ru_unhealthy_ul_slots = ctx_cfg.max_ru_unhealthy_ul_slots;
     ul_pcap_capture_enable = ctx_cfg.ul_pcap_capture_enable;
@@ -231,7 +259,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     task_list_debug = std::unique_ptr<TaskList>(new TaskList((phydriver_handle)this, 3, TASK_LIST_SIZE));
 
     debug_worker  = ctx_cfg.debug_worker;
-    datalake_core  = ctx_cfg.datalake_core;
+    data_core  = ctx_cfg.data_core;
 
     enable_ul_cuphy_graphs = ctx_cfg.enable_ul_cuphy_graphs;
     enable_dl_cuphy_graphs = ctx_cfg.enable_dl_cuphy_graphs;
@@ -331,8 +359,8 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
             ctx_cfg.num_rows_pusch,
             ctx_cfg.num_rows_hest,
             ctx_cfg.e3_agent_enabled,
-            ctx_cfg.e3_pub_port,
             ctx_cfg.e3_rep_port,
+            ctx_cfg.e3_pub_port,
             ctx_cfg.e3_sub_port,
             ctx_cfg.datalake_drop_tables));
 
@@ -353,7 +381,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
         // Set thread CPU affinity
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
-        CPU_SET(datalake_core, &cpuset);
+        CPU_SET(data_core, &cpuset);
         status = pthread_setaffinity_np(datalake_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
         if(status)
         {
@@ -384,9 +412,18 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 
     // Log value of CUDA_DEVICE_MAX_CONNECTIONS env. variable. Useful for debugging, esp. for green contexts
     const char* dev_max_connections_env_var = getenv("CUDA_DEVICE_MAX_CONNECTIONS");
-    NVLOGC_FMT(TAG, "CUDA_DEVICE_MAX_CONNECTIONS {}", dev_max_connections_env_var);
+    NVLOGC_FMT(TAG, "CUDA_DEVICE_MAX_CONNECTIONS {}", dev_max_connections_env_var ? dev_max_connections_env_var : "not set");
     //FIXME Shall we manually hardcode the value to 12 or 32 for green contexts instead of relying on the user doing it beforehand?
     // Could also throw an error if this is green contexts mode and the value is below some threshold.
+
+    // Log CUDA runtime version
+    auto runtime_version = 0;
+    CUDA_CHECK_PHYDRIVER(cudaRuntimeGetVersion(&runtime_version));
+    NVLOGC_FMT(TAG, "CUDA runtime version from cudaRuntimeGetVersion(): {}", runtime_version);
+    // Log latest CUDA version supported by the driver
+    auto driver_version = 0;
+    CUDA_CHECK_PHYDRIVER(cudaDriverGetVersion(&driver_version));
+    NVLOGC_FMT(TAG, "CUDA driver version from cudaDriverGetVersion(): {}", driver_version);
 
     {
 #if CUDA_VERSION < 12040
@@ -396,8 +433,20 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
             NVLOGF_FMT(TAG,AERIAL_INTERNAL_EVENT, "Green contexts are not supported before CUDA 12.4. Set use_green_contexts to 0 in the cuphycontroller yaml file and rerun.");
         }
 #endif
+
+        bool use_workqueues = (use_gc_workqueues != 0);
         NVLOGC_FMT(TAG, "use_green_contexts {}", use_green_contexts);
+        NVLOGC_FMT(TAG, "use_gc_workqueues {}", use_gc_workqueues);
         if (use_green_contexts != 0) {
+
+                const bool print_resources = true;
+
+                unsigned int wq_concurrency_limit_of_2 = 2;
+                unsigned int wq_concurrency_limit_of_1 = 1;
+                // For specific GCs (PUSCH, PDSCH, Order kernel), a concurrency limit add-on of 1 is needed in the mMIMO case, as more
+                // streams exist for those cases
+                unsigned int wq_concurrency_limit_mmimo_add_on = (this->mMIMO_enable) ? 1 : 0;
+
 		CUdevice device;
 		CU_CHECK_PHYDRIVER(cuDeviceGet(&device, gpu_device->getId()));
 		int gpuId = gpu_device->getId();
@@ -486,7 +535,8 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_pusch_split], &actual_split_groups[resource_index_pusch_split], &initial_device_GPU_resources, &devResources[resource_index_pusch_split+1], use_flags, min_sm_counts[resource_index_pusch_split]));
 		//greenContexts[0].create(gpuId, &devResources[resource_index_pusch_split+1]);
 
-		puschMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pusch_split+1]);
+                // Increasing wq concurrency limit, if applicable, in case of mMIMO case by 1, given UL-BFW also runs under PUSCH ctx in this case
+		puschMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pusch_split+1], "PUSCH", print_resources, use_workqueues, wq_concurrency_limit_of_2 + wq_concurrency_limit_mmimo_add_on);
 		mpsCtxList.push_back(puschMpsCtx);
 		NVLOGC_FMT(TAG, "PUSCH green context with SM count of {}.", devResources[resource_index_pusch_split+1].sm.smCount);
 
@@ -501,7 +551,8 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                     min_sm_counts[resource_index_prep_for_ul_ctrl_split] -= second_split_modulo_SM_granularity;
                 }
                 CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_prep_for_ul_ctrl_split], &actual_split_groups[resource_index_prep_for_ul_ctrl_split], &initial_device_GPU_resources, &devResources[resource_index_prep_for_ul_ctrl_split+1], use_flags, min_sm_counts[resource_index_prep_for_ul_ctrl_split]));
-                tmpGreenContextsForResplit[0].create(gpuId, &devResources[resource_index_prep_for_ul_ctrl_split+1]);
+                tmpGreenContextsForResplit[0].create(gpuId, &devResources[resource_index_prep_for_ul_ctrl_split+1], print_resources);
+                // Note tmpGreenContexts used only for resplit are created with defaults in cuPHY/examples/common/cuphy.hpp etc.
 
                 // Now resplit the remaining split. It'll be {PUCCH, PRACH}
 
@@ -513,11 +564,11 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                 tmpGreenContextsForResplit[0].getResources(&resource_to_split);
                 CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_pucch_split], &actual_split_groups[resource_index_pucch_split], &resource_to_split, &devResources[resource_index_pucch_split+1], use_flags, min_sm_counts[resource_index_pucch_split]));
 
-		pucchMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pucch_split]);
+		pucchMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pucch_split], "PUCCH", print_resources, use_workqueues, wq_concurrency_limit_of_1);
 		mpsCtxList.push_back(pucchMpsCtx);
 		NVLOGC_FMT(TAG, "PUCCH green context with SM count of {}.", devResources[resource_index_pucch_split].sm.smCount);
 
-		prachMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pucch_split + 1]);
+		prachMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pucch_split + 1], "PRACH", print_resources, use_workqueues, wq_concurrency_limit_of_1);
 		mpsCtxList.push_back(prachMpsCtx);
 		NVLOGC_FMT(TAG, "PRACH green context with SM count of {}.", devResources[resource_index_pucch_split+1].sm.smCount);
 
@@ -537,7 +588,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 
 
 		CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_pdsch_split], &actual_split_groups[resource_index_pdsch_split], &initial_device_GPU_resources, &devResources[resource_index_pdsch_split+1], use_flags, min_sm_counts[resource_index_pdsch_split]));
-		pdschMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pdsch_split]);
+		pdschMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pdsch_split], "PDSCH", print_resources, use_workqueues, wq_concurrency_limit_of_2 + wq_concurrency_limit_mmimo_add_on);
 		mpsCtxList.push_back(pdschMpsCtx);
 		dlMpsCtx = pdschMpsCtx;
 		NVLOGC_FMT(TAG, "PDSCH green context with SM count of {}.", devResources[resource_index_pdsch_split].sm.smCount);
@@ -548,7 +599,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		actual_split_groups[resource_index_dl_ctrl_split] = 1;
 		min_sm_counts[resource_index_dl_ctrl_split] = getMpsSmDlCtrl();
 		CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_dl_ctrl_split], &actual_split_groups[resource_index_dl_ctrl_split], &initial_device_GPU_resources, &devResources[resource_index_dl_ctrl_split+1], use_flags, min_sm_counts[resource_index_dl_ctrl_split]));
-		dlCtrlMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_dl_ctrl_split]);
+		dlCtrlMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_dl_ctrl_split], "DL Ctrl", print_resources, use_workqueues, wq_concurrency_limit_of_2);
 		mpsCtxList.push_back(dlCtrlMpsCtx);
 		csiRsMpsCtx = dlCtrlMpsCtx;
 		pbchMpsCtx  = dlCtrlMpsCtx;
@@ -579,7 +630,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		NVLOGC_FMT(TAG, "UL order green context with SM count of {}.", devResources[resource_index_ul_order_split].sm.smCount);
 #else
                 // Based on the observation from #if 0 clause, try to not have order kernel overlap with any of PUSCH or UL control channel SMs
-                tmpGreenContextsForResplit[2].create(gpuId, &devResources[resource_index_pusch_split]);
+                tmpGreenContextsForResplit[2].create(gpuId, &devResources[resource_index_pusch_split], print_resources);
                 CUdevResource complement_of_pusch_split = {};
                 tmpGreenContextsForResplit[2].getResources(&complement_of_pusch_split); // we need to get the resources from the green context we had created and resplit
                 // Add extra check in case PUSCH got almost all SMs which would leave 0 for that split. Could consider adding a temp. workaround in that case or simply ignoring yaml's SM alloc
@@ -587,7 +638,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 			NVLOGC_FMT(TAG, "Doing an exceptional GC split for order kernel. You are advised to not assign that many SMs to PUSCH!");
 			min_sm_counts[resource_index_ul_order_split] = getMpsSmUlOrder();
                         CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_ul_order_split], &actual_split_groups[resource_index_ul_order_split], &initial_device_GPU_resources, &devResources[resource_index_ul_order_split+1], use_flags, min_sm_counts[resource_index_ul_order_split]));
-			ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split]);
+			ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split], "UL order", print_resources, use_workqueues, wq_concurrency_limit_of_1 + wq_concurrency_limit_mmimo_add_on);
 			mpsCtxList.push_back(ulMpsCtx);
 			NVLOGC_FMT(TAG, "UL order green context with SM count of {}.", devResources[resource_index_ul_order_split].sm.smCount);
                 }
@@ -602,7 +653,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 			}
 
 			CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_ul_order_split], &actual_split_groups[resource_index_ul_order_split], &complement_of_pusch_split, &devResources[resource_index_ul_order_split+1], use_flags, min_sm_counts[resource_index_ul_order_split]));
-			ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split+1]);
+			ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split+1], "UL order", print_resources, use_workqueues, wq_concurrency_limit_of_1 + wq_concurrency_limit_mmimo_add_on);
 			mpsCtxList.push_back(ulMpsCtx);
 			NVLOGC_FMT(TAG, "UL order green context with SM count of {}.", devResources[resource_index_ul_order_split+1].sm.smCount);
                 }
@@ -615,7 +666,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 #if 1
 			min_sm_counts[resource_index_gpu_comm_split] = getMpsSmGpuComms();
 			CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_gpu_comm_split], &actual_split_groups[resource_index_gpu_comm_split], &initial_device_GPU_resources, &devResources[resource_index_gpu_comm_split+1], use_flags, min_sm_counts[resource_index_gpu_comm_split]));
-			gpuCommsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_gpu_comm_split]);
+			gpuCommsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_gpu_comm_split], "GPU comm", print_resources, use_workqueues, wq_concurrency_limit_of_1);
 			mpsCtxList.push_back(gpuCommsMpsCtx);
 
 		        NVLOGC_FMT(TAG, "GPU comm green context with SM count of {}.", devResources[resource_index_gpu_comm_split].sm.smCount);
@@ -642,7 +693,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 #if 1
 		    min_sm_counts[resource_index_srs_split] = getMpsSmSrs();
 		    CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_srs_split], &actual_split_groups[resource_index_srs_split], &resource_to_split_for_srs, &devResources[resource_index_srs_split+1], use_flags, min_sm_counts[resource_index_srs_split]));
-			srsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_srs_split]);
+			srsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_srs_split], "SRS", print_resources, use_workqueues, wq_concurrency_limit_of_1);
 			mpsCtxList.push_back(srsMpsCtx);
 
 		        NVLOGC_FMT(TAG, "SRS green context with SM count of {}.", devResources[resource_index_srs_split].sm.smCount);
@@ -661,32 +712,76 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		   NVLOGC_FMT(TAG, "SRS green context with SM count of {}.", devResources[resource_index_srs_split+1].sm.smCount);
 #endif
                 }
+// Get a warning if the total of requested WQs exceeds CUDA_DEVICE_MAX_CONNECTIONS env. variable.
+#if CUDA_VERSION >= 13010
+                if(use_workqueues) {
+
+                    CUdevResource initial_WQ_config_resources = {};
+                    CU_CHECK_PHYDRIVER(cuDeviceGetDevResource(device,
+                                                              &initial_WQ_config_resources,
+                                                              CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
+                    unsigned int initial_device_wqs = initial_WQ_config_resources.wqConfig.wqConcurrencyLimit; // should match CUDA_DEVICE_MAX_CONNECTIONS
+
+                    // Sum up the requested wqConcurrencyLimits across all GCs with CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED sharing scope,
+                    // Also include tmp GCs used for resplits for completeness.
+                    unsigned int requested_wq_count = 0;
+                    for (auto gc : mpsCtxList) {
+                        CUdevResource wq_config_resource{};
+                        CU_CHECK_PHYDRIVER(cuGreenCtxGetDevResource(gc->getGreenCtx(), &wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
+                        if(wq_config_resource.wqConfig.sharingScope == CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED)
+                        {
+                            requested_wq_count += wq_config_resource.wqConfig.wqConcurrencyLimit;
+                        }
+                    }
+                    for (int i = 0; i <= 2; i += 2)
+                    {
+                        CUdevResource wq_config_resource{};
+                        tmpGreenContextsForResplit[i].getResources(&wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG);
+                        if(wq_config_resource.wqConfig.sharingScope == CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED)
+                        {
+                            requested_wq_count += wq_config_resource.wqConfig.wqConcurrencyLimit;
+                        }
+                    }
+                    if(requested_wq_count > initial_device_wqs)
+                    {
+                        NVLOGW_FMT(TAG, "Total WQ count requested is {} but GPU's initial WQ concurrency limit is {} (CUDA_DEVICE_MAX_CONNECTIONS {}). There is a risk of aliasing depending on how these GCs are used!",
+                                         requested_wq_count, initial_device_wqs, dev_max_connections_env_var ? dev_max_connections_env_var : "not set");
+                    }
+                }
+#endif
 #endif
         } else {
 
 		puschMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmPusch());
+		NVLOGC_FMT(TAG, "PUSCH MPS context with max. SM count of {}.", getMpsSmPusch());
 		mpsCtxList.push_back(puschMpsCtx);
 		pucchMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmPucch());
+		NVLOGC_FMT(TAG, "PUCCH MPS context with max. SM count of {}.", getMpsSmPucch());
 		mpsCtxList.push_back(pucchMpsCtx);
 		prachMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmPrach());
+		NVLOGC_FMT(TAG, "PRACH MPS context with max. SM count of {}.", getMpsSmPrach());
 		mpsCtxList.push_back(prachMpsCtx);
 		pdschMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmPdsch());
+		NVLOGC_FMT(TAG, "PDSCH MPS context with max. SM count of {}.", getMpsSmPdsch());
 		mpsCtxList.push_back(pdschMpsCtx);
 		//pdcchMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmPdcch());
 		//pbchMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmPbch());
 		dlCtrlMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmDlCtrl());
+		NVLOGC_FMT(TAG, "DL Ctrl MPS context with max. SM count of {}.", getMpsSmDlCtrl());
 		mpsCtxList.push_back(dlCtrlMpsCtx);
 		csiRsMpsCtx = dlCtrlMpsCtx;
 		pbchMpsCtx  = dlCtrlMpsCtx;
 		pdcchMpsCtx = dlCtrlMpsCtx;
 		// If the cuphycontroller yaml config file does not contain the mps_sm_ul_order key, a default value of 16 SMs is used.
 		ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmUlOrder());
+		NVLOGC_FMT(TAG, "UL Order MPS context with max. SM count of {}.", getMpsSmUlOrder());
 		mpsCtxList.push_back(ulMpsCtx);
 
 		dlMpsCtx = pdschMpsCtx;
 		if(this->enable_srs) //Move SRS MPS context creation under enable srs flag for memory savings
 		{
 			srsMpsCtx   = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmSrs());
+		        NVLOGC_FMT(TAG, "SRS MPS context with max. SM count of {}.", getMpsSmSrs());
 			mpsCtxList.push_back(srsMpsCtx);
 		}
 		if(this->mMIMO_enable)
@@ -698,6 +793,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		if(gpuCommDlEnabled()) {
 			// If the cuphycontroller yaml config file does not contain the mps_sm_gpu_comms key, the old default value of 8 SMs is used.
 			gpuCommsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, getMpsSmGpuComms());
+		        NVLOGC_FMT(TAG, "GPU comm MPS context with max. SM count of {}.", getMpsSmGpuComms());
 			mpsCtxList.push_back(gpuCommsMpsCtx);
 		}
         }
@@ -812,10 +908,15 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 
         // Allocate helper buffers used to memset DL cells' output buffers
         h_dl_buffers_addr = cuphy::make_unique_pinned<CleanupDlBufInfo>(PDSCH_MAX_CELLS_PER_CELL_GROUP * DL_HELPER_MEMSET_BUFFERS_PER_CTX);
+        mf.addCpuPinnedSize(sizeof(CleanupDlBufInfo) * PDSCH_MAX_CELLS_PER_CELL_GROUP * DL_HELPER_MEMSET_BUFFERS_PER_CTX);
         d_dl_buffers_addr = cuphy::make_unique_device<CleanupDlBufInfo>(PDSCH_MAX_CELLS_PER_CELL_GROUP * DL_HELPER_MEMSET_BUFFERS_PER_CTX);
+        mf.addGpuRegularSize(sizeof(CleanupDlBufInfo) * PDSCH_MAX_CELLS_PER_CELL_GROUP * DL_HELPER_MEMSET_BUFFERS_PER_CTX);
 
         for(int i=0;i<MAX_PDSCH_TB_CPY_CUDA_EVENTS;i++)
-            CUDA_CHECK(cudaEventCreateWithFlags(&pdsch_tb_cpy_complete[i], cudaEventDisableTiming));
+        {
+            CUDA_CHECK(cudaEventCreate(&pdsch_tb_cpy_start[i]));
+            CUDA_CHECK(cudaEventCreate(&pdsch_tb_cpy_complete[i]));
+        }
 
         if(this->mMIMO_enable)
         {
@@ -1018,6 +1119,21 @@ PhyDriverCtx::~PhyDriverCtx()
         }
 
         exit_dl_validation.store(true);
+        
+        // Log Order Kernel timing statistics per slot
+        NVLOGC_FMT(TAG_PERF_METRICS, "Order Kernel Completion Statistics (per slot):");
+        char logLabel[32];
+        snprintf(logLabel, sizeof(logLabel), "Order Kernel Completion");
+        for (int slotIdx = 0; slotIdx < 80; slotIdx++) {
+            
+            
+            int64_t count = order_kernel_timing_tracker.getTotalCount(slotIdx);
+            if (count > 0) {
+                order_kernel_timing_tracker.logStats<TAG_PERF_METRICS>(1, logLabel, slotIdx);
+            }
+        }
+        // Log combined statistics across all slots
+        order_kernel_timing_tracker.logStats<TAG_PERF_METRICS>(1, logLabel, -1);
 
         if(ul_stats.active())
         {
@@ -1302,6 +1418,16 @@ PhyDriverCtx::~PhyDriverCtx()
         } catch(const std::exception& e) {
             printf("EXCEPTION in cudaStreamDestroy: %s\n", e.what());
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "EXCEPTION in cudaStreamDestroy: {}", e.what());
+        }
+
+        try {
+            for(int i = 0; i < MAX_PDSCH_TB_CPY_CUDA_EVENTS; i++) {
+                CUDA_CHECK_PHYDRIVER(cudaEventDestroy(pdsch_tb_cpy_start[i]));
+                CUDA_CHECK_PHYDRIVER(cudaEventDestroy(pdsch_tb_cpy_complete[i]));
+            }
+            NVLOGI_FMT(TAG, "PDSCH TB copy events destroyed");
+        } catch(const std::exception& e) {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "EXCEPTION in cudaEventDestroy for pdsch_tb_cpy events: {}", e.what());
         }
 
         /*
@@ -3134,6 +3260,10 @@ uint8_t PhyDriverCtx::getUseGreenContexts() const {
     return use_green_contexts;
 }
 
+uint8_t PhyDriverCtx::getUseGCWorkqueues() const {
+    return use_gc_workqueues;
+}
+
 // Returns the requested configuration (yaml). However use of batched memcpy
 // may not be possible if an insufficient CUDA_VERSION is used
 uint8_t PhyDriverCtx::getUseBatchedMemcpy() const {
@@ -3333,6 +3463,18 @@ bool PhyDriverCtx::enablePrepareTracing(void) const {
     return (enable_prepare_tracing == 1);
 }
 
+bool PhyDriverCtx::cuptiTracingEnabled(void) const {
+    return (cupti_enable_tracing == 1);
+}
+
+uint64_t PhyDriverCtx::cuptiBufferSize(void) const {
+    return cupti_buffer_size;
+}
+
+uint16_t PhyDriverCtx::cuptiNumBuffers(void) const {
+    return cupti_num_buffers;
+}
+
 bool PhyDriverCtx::disableEmpw(void) const {
     return (disable_empw == 1);
 }
@@ -3379,6 +3521,14 @@ uint8_t PhyDriverCtx::getmMIMO_enable(void) const {
 
 uint8_t PhyDriverCtx::get_enable_srs(void) const {
     return enable_srs;
+}
+
+uint8_t PhyDriverCtx::get_enable_dl_core_affinity(void) const {
+    return enable_dl_core_affinity;
+}
+
+uint8_t PhyDriverCtx::get_dlc_core_packing_scheme(void) const {
+    return dlc_core_packing_scheme;
 }
 
 uint8_t PhyDriverCtx::getUeMode() const {
@@ -3520,6 +3670,10 @@ uint16_t PhyDriverCtx::getForcedNumCsi2Bits(void) const {
 
 uint32_t PhyDriverCtx::getPuschMaxNumLdpcHetConfigs(void) const {
     return pusch_nMaxLdpcHetConfigs;
+}
+
+uint8_t PhyDriverCtx::getPuschMaxNumTbPerNode(void) const {
+    return pusch_nMaxTbPerNode;
 }
 
  DataLake* PhyDriverCtx::getDataLake(void) {

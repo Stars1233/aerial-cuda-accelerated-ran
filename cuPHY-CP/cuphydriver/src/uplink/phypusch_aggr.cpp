@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,7 +71,7 @@ PhyPuschAggr::PhyPuschAggr(
         bStartOffsetsTbCrc     = std::move(cuphy::buffer<uint32_t, cuphy::pinned_alloc>(MAX_N_TBS_PER_CELL_GROUP_SUPPORTED));
         bStartOffsetsTbPayload = std::move(cuphy::buffer<uint32_t, cuphy::pinned_alloc>(MAX_N_TBS_PER_CELL_GROUP_SUPPORTED));
 
-        nUciPayloadBytes = MAX_N_PRBS_SUPPORTED * MAX_N_BBU_LAYERS_SUPPORTED * OFDM_SYMBOLS_PER_SLOT * CUPHY_N_TONES_PER_PRB * CUPHY_QAM_256;
+        nUciPayloadBytes = MAX_N_PRBS_SUPPORTED * MAX_N_BBU_LAYERS_PUSCH_SUPPORTED * OFDM_SYMBOLS_PER_SLOT * CUPHY_N_TONES_PER_PRB * CUPHY_QAM_256;
         nUciUes = CUPHY_MAX_N_UCI_ON_PUSCH;
         nUciSegs = nUciUes * 3;
         nCsi2Bits = CUPHY_MAX_N_CSI2_WORDS*32;
@@ -103,7 +103,7 @@ PhyPuschAggr::PhyPuschAggr(
 
         // Channel estimates buffer allocation - Currently only first UE group
         // Worst case conservative allocation : max antennas * max layers * max subcarriers * max DMRS estimates
-        int totHestDataSize = MAX_AP_PER_SLOT * MAX_N_BBU_LAYERS_SUPPORTED * (ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB) * OFDM_SYMBOLS_PER_SLOT;
+        int totHestDataSize = MAX_AP_PER_SLOT * MAX_N_BBU_LAYERS_PUSCH_SUPPORTED * (ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB) * OFDM_SYMBOLS_PER_SLOT;
         if(pdctx->datalake_enabled()) {
             bChannelEsts = std::move(cuphy::buffer<float2, cuphy::pinned_alloc>(totHestDataSize));
             bChannelEstSizes = std::move(cuphy::buffer<uint32_t, cuphy::pinned_alloc>(1)); // Only first UE group
@@ -255,7 +255,7 @@ PhyPuschAggr::PhyPuschAggr(
 
     //Sub-slot Processing specific    
     sym_ord_done_sig_arr.reset(gDev->newGDRbuf(ORAN_PUSCH_SYMBOLS_X_SLOT * sizeof(uint32_t)));
-    mf.addGpuRegularSize(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t));
+    mf.addGpuPinnedSize(sym_ord_done_sig_arr->size_alloc);
 
     CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_setup_ph1));
     CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_setup_ph1));
@@ -452,7 +452,8 @@ void PhyPuschAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     static_params.enablePerPrgChEst   = static_cast<uint8_t>(pdctx->getPuschEnablePerPrgChEst());
     static_params.pOutInfo = &cuphy_tracker;
     
-    static_params.nMaxLdpcHetConfigs  = pdctx->getPuschMaxNumLdpcHetConfigs(); 
+    static_params.nMaxLdpcHetConfigs  = pdctx->getPuschMaxNumLdpcHetConfigs();
+    static_params.nMaxTbPerNode       = pdctx->getPuschMaxNumTbPerNode();
     NVLOGC_FMT(TAG, "{}: PUSCH enableDeviceGraphLaunch={} enableCsiP2Fapiv3 = {} nMaxLdpcHetConfigs = {}", __func__, static_params.enableDeviceGraphLaunch, static_params.enableCsiP2Fapiv3, static_params.nMaxLdpcHetConfigs);
     /********************************************************/
     //For the first scheduler kernel (pre-early-HARQ) set timeout to 1100us which is >= 400us before T0 (which is PUSCH UL worker start) + 640us after T0 (~440us for symbol-3 arrival + 200us for reorder latency).
@@ -492,6 +493,8 @@ int PhyPuschAggr::createPhyObj()
     #ifdef SCF_FAPI_10_04
         csi2MapGpuBuffer = cuphy::make_unique_device<uint16_t>(cellCount * CUPHY_CSI2_SIZE_MAP_BUFFER_SIZE_PER_CELL);
         csi2MapParamsGpuBuffer = cuphy::make_unique_device<cuphyCsi2MapPrm_t> (cellCount * CUPHY_MAX_NUM_CSI2_SIZE_MAPS_PER_CELL);
+        mf.addGpuRegularSize(sizeof(uint16_t) * cellCount * CUPHY_CSI2_SIZE_MAP_BUFFER_SIZE_PER_CELL);
+        mf.addGpuRegularSize(sizeof(cuphyCsi2MapPrm_t) * cellCount * CUPHY_MAX_NUM_CSI2_SIZE_MAPS_PER_CELL);
     #endif 
 
     size_t mapOffset = 0, mapParamsOffset = 0;
@@ -569,7 +572,16 @@ int PhyPuschAggr::createPhyObj()
         if(i == 0)
         {
             //Assuming it's the same for all the cells
-            static_params.ldpcMaxNumItrAlgo    = cell_ptr->getPuschLdpcMaxNumItrAlgoType() == 0 ? LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED : LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT;
+            uint8_t pusch_ldpc_max_num_itr_algo_type = cell_ptr->getPuschLdpcMaxNumItrAlgoType();
+            static_params.ldpcMaxNumItrAlgo    = LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT;
+            if(pusch_ldpc_max_num_itr_algo_type==0)
+            {
+                static_params.ldpcMaxNumItrAlgo = LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED;
+            }
+            else if(pusch_ldpc_max_num_itr_algo_type==2)
+            {
+                static_params.ldpcMaxNumItrAlgo = LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE;
+            }
             static_params.fixedMaxNumLdpcItrs  = cell_ptr->getFixedMaxNumLdpcItrs();
             static_params.ldpcEarlyTermination = cell_ptr->getPuschLdpcEarlyTermination();
             static_params.ldpcAlgoIndex        = cell_ptr->getPuschLdpcAlgoIndex();
@@ -861,7 +873,7 @@ int PhyPuschAggr::setup(
             }
             else
             {
-                NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PhyPuschAggr{}: SFN {}.{} allocated buffer {} {} size {} rnti {} hPID {} ndi {} cell_id {} hq_buffer_counter {} hb_slot is full",
+                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PhyPuschAggr{}: SFN {}.{} allocated buffer {} {} size {} rnti {} hPID {} ndi {} cell_id {} hq_buffer_counter {} hb_slot is full",
                    this_id, si->sfn_, si->slot_,
                    k, reinterpret_cast<void*>(hb_ptr), dyn_params.pDataOut->h_harqBufferSizeInBytes[k],
                    dyn_params.pCellGrpDynPrm->pUePrms[k].rnti,
@@ -1365,7 +1377,7 @@ int PhyPuschAggr::callback(std::array<uint8_t,UL_MAX_CELLS_PER_SLOT>& cell_timeo
 
         // Only for compilation to run pass actual cuphyPuschDataOut_t* struct
         // nCRC calculated on the GPU with cuPHYTools kernel
-        ul_cb.callback_fn(nTbCrcErrors, msg, *(aggr_slot_params->si), *pusch, &DataOut, &static_params);
+        ul_cb.callback_fn(ul_cb.callback_fn_context, nTbCrcErrors, msg, *(aggr_slot_params->si), *pusch, &DataOut, &static_params);
     }
 
     // Free HARQ buffer for CRC == 0
@@ -1438,7 +1450,7 @@ int PhyPuschAggr::callback(std::array<uint8_t,UL_MAX_CELLS_PER_SLOT>& cell_timeo
     if((released_harq_buffer_info.num_released_harq_buffers > 0) && (pdctx->getNotifyUlHarqBufferRelease()))
     {
         pdctx->getUlCb(ul_cb);
-        ul_cb.ul_free_harq_buffer_fn(released_harq_buffer_info, pusch, si->sfn_, si->slot_);
+        ul_cb.ul_free_harq_buffer_fn(ul_cb.ul_free_harq_buffer_fn_context, released_harq_buffer_info, pusch, si->sfn_, si->slot_);
         released_harq_buffer_info.reset();
     }
 

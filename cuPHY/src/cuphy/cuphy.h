@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,7 +28,6 @@
 #include <stdint.h>
 #include "cuComplex.h"
 #include "cuda_fp16.h"
-#include "cufft.h"
 #include <cuda.h>
 
 #ifndef CUPHYWINAPI
@@ -47,11 +46,9 @@ extern "C" {
 #define MAX_N_DMRSSYMS_SUPPORTED 4
 #define MAX_ENCODED_CODE_BLOCK_BIT_SIZE 25344 // Do not modify. Used in DL channels.
 #define MAX_DECODED_CODE_BLOCK_BIT_SIZE 8448
-#ifdef ENABLE_32DL
 #define MAX_N_BBU_LAYERS_SUPPORTED 32
-#else
-#define MAX_N_BBU_LAYERS_SUPPORTED 16
-#endif
+#define MAX_N_BBU_LAYERS_PUCCH_SUPPORTED 16
+#define MAX_N_BBU_LAYERS_PUSCH_SUPPORTED 16
 #define MAX_N_LAYERS_PUSCH 8 // maximum number of layers per PUSCH UE group
 #define MAX_N_ANTENNAS_SUPPORTED 64
 #define MAX_N_CARRIERS_SUPPORTED 10
@@ -65,9 +62,9 @@ extern "C" {
 #define MAX_N_TBS_SUPPORTED (MAX_N_TBS_PER_CELL_GROUP_SUPPORTED)            // maximum number of transport blocks supported
 #define MAX_N_USER_GROUPS_SUPPORTED 256                                     // maximum number of FDM user groups supported per cell
 #else
-#define MAX_N_TBS_PER_CELL_GROUP_SUPPORTED 128                              // maximum number of transport blocks supported for an entire cell-group
+#define MAX_N_TBS_PER_CELL_GROUP_SUPPORTED 192                              // maximum number of transport blocks supported for an entire cell-group
 #define MAX_N_TBS_SUPPORTED (MAX_N_TBS_PER_CELL_GROUP_SUPPORTED)            // maximum number of transport blocks supported
-#define MAX_N_USER_GROUPS_SUPPORTED 128                                     // maximum number of FDM user groups supported per cell
+#define MAX_N_USER_GROUPS_SUPPORTED 192                                     // maximum number of FDM user groups supported per cell
 #endif
 #define MAX_N_PRBS_SUPPORTED 273
 #define CUPHY_PUSCH_RX_MAX_N_TIME_CH_EST (4)                               // maximum number of channel estimates in time (max of 3 additional positions)
@@ -103,7 +100,7 @@ extern "C" {
 #ifdef ENABLE_64C
 #define PDSCH_MAX_UES_PER_CELL_GROUP 256   // Used for overprovisioned allocations etc.
 #else
-#define PDSCH_MAX_UES_PER_CELL_GROUP 128   // Used for overprovisioned allocations etc.
+#define PDSCH_MAX_UES_PER_CELL_GROUP 192   // Used for overprovisioned allocations etc.
 #endif
 #else
 //If you want a min. single cell config, use:
@@ -151,7 +148,7 @@ extern "C" {
 // Maximum number of heterogenous channel estimation configs supported for legacy ChEst algorithm
 #define CUPHY_PUSCH_RX_CH_EST_LEGACY_MMSE_N_MAX_HET_CFGS (16)
 // Maximum number of heterogenous channel estimation configs supported for multistage ChEst algorithm
-#define CUPHY_PUSCH_RX_CH_EST_MULTISTAGE_MMSE_N_MAX_HET_CFGS (2)
+#define CUPHY_PUSCH_RX_CH_EST_MULTISTAGE_MMSE_N_MAX_HET_CFGS (4)
 // Maximum number of heterogenous channel estimation configs supported for all ChEst algorithms
 static constexpr int CUPHY_PUSCH_RX_CH_EST_ALL_ALGS_N_MAX_HET_CFGS = std::max(
     CUPHY_PUSCH_RX_CH_EST_LEGACY_MMSE_N_MAX_HET_CFGS, CUPHY_PUSCH_RX_CH_EST_MULTISTAGE_MMSE_N_MAX_HET_CFGS);
@@ -227,7 +224,6 @@ static constexpr int CUPHY_PUSCH_RX_CH_EST_ALL_ALGS_N_MAX_HET_CFGS = std::max(
 #define CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP (16) // Maximum number of layers beamformed
 #endif
 #define CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS (72) // 24 UeGrps/cell * 3 cells
-#define CUPHY_BFW_COEF_COMP_N_MAX_TOTAL_LAYERS (CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP * CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS)
 #define CUPHY_BFW_MIN_PRB_GRP_SIZE 2
 #define CUPHY_BFW_N_MAX_PRB_GRPS ((MAX_N_PRBS_SUPPORTED+1)/CUPHY_BFW_MIN_PRB_GRP_SIZE)
 
@@ -1120,18 +1116,10 @@ const char* CUPHYWINAPI cuphyGetErrorName(cuphyStatus_t status);
 #define MAX_DL_LAYERS_PER_TB 4
 
 /* Maximum number of downlink layers */
-#ifdef ENABLE_32DL
-#define MAX_DL_LAYERS 32 //same as MAX_N_BBU_LAYERS_SUPPORTED 32
-#else
-#define MAX_DL_LAYERS 16
-#endif
+#define MAX_DL_LAYERS 32
 
 /* Maximum number of downlink ports */
-#ifdef ENABLE_32DL
-#define MAX_DL_PORTS 32 //FIXME
-#else
-#define MAX_DL_PORTS 16
-#endif
+#define MAX_DL_PORTS 32
 
 /* Maximum size of Resource Block Mask for Resource Allocation Type 0 (with 8 RBs per byte) */
 #define MAX_RBMASK_UINT32_ELEMENTS 9 // ceil(273 RBs/32)
@@ -3373,8 +3361,9 @@ typedef struct cuphyPuschRxRateMatch* cuphyPuschRxRateMatchHndl_t;
 
 typedef struct
 {
-    CUDA_KERNEL_NODE_PARAMS kernelNodeParamsDriver;           // Main de_rate_matching_global2 kernel
+    CUDA_KERNEL_NODE_PARAMS kernelNodeParamsDriver;          // Main de_rate_matching_global2 kernel
     CUDA_KERNEL_NODE_PARAMS resetKernelNodeParamsDriver;     // Reset buffer kernel (launched first)
+    CUDA_KERNEL_NODE_PARAMS clampKernelNodeParamsDriver;     // Clamp buffer kernel (launched last)
     void*                   desc;
     void*                   kernelArgs[1];
 } cuphyPuschRxRateMatchLaunchCfg_t;
@@ -3533,6 +3522,11 @@ struct PerTbParams
     uint32_t cinit;        /*!< used to generate scrambling sequence; seed2 arg. of gold32 */
     uint32_t nDataBytes;   /*!< number of data bytes in transport block (no CRCs) */
     uint32_t nZpBitsPerCb; /*!< number of zero padded encoded bits per codeblock (input to LDPC decoder) */
+    uint32_t k0;           /*!< k0 from TS 38.212 rate matching, depends on {bg, rv, Zc, Ncb} */
+
+    uint8_t  ldpcEarlyTerminationPerUe;
+    uint8_t  ldpcMaxNumItrPerUe;
+
 
     uint32_t firstCodeBlockIndex;                         /// for symbol-by-symbol processing
     uint32_t encodedSize;                                 /// Size in bytes of encoded Tb
@@ -3776,8 +3770,9 @@ typedef struct
  */
 typedef enum _cuphyLdpcMaxNumItrAlgoType
 {
-    LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED = 0,
-    LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT   = 1
+    LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED   = 0,
+    LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT     = 1,
+    LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE  = 2
 } cuphyLdpcMaxItrAlgoType_t;
 
 /**
@@ -4783,9 +4778,7 @@ struct PdschDmrsParams
                                                            num_layers rows and Np columns */
     uint8_t ueGrp_idx;                                /*!< UE group identifier associated with this TB */
     uint8_t dmrsCdmGrpsNoData1;                       /*!< is PDSCH CDM groups without data set to 1 for this TB */
-#ifdef ENABLE_32DL    
-    uint8_t nlAbove16;
-#endif
+    uint8_t nlAbove16{0};
 };
 
 /**
@@ -7520,7 +7513,7 @@ typedef struct
 typedef struct
 {
     CUDA_KERNEL_NODE_PARAMS kernelNodeParamsDriver;
-    void*                   kernelArgs[1];
+    void*                   kernelArgs[2];
 } cuphySrsChEstNormalizationLaunchCfg_t;
 
 
@@ -7617,6 +7610,7 @@ cuphyStatus_t CUPHYWINAPI cuphyCreateSrsChEst(  cuphySrsChEstHndl_t*    pSrsChEs
  * \param h_rbSnrBuffOffsets          - Host pointer to rb SNR buffer offsets
  * \param h_chEstBuffInfo             - Host pointer to channel estimation buffer information
  * \param d_pSrsReports               - Device pointer to SRS reports
+ * \param d_addrsChEstToL2InnerBuff   - Device pointer to channel estimation to L2 buffer
  * \param d_addrsChEstToL2Buff        - Device pointer to channel estimation to L2 buffer
  * \param h_chEstToL2                 - Host pointer to channel estimation to L2 buffer
  * \param enableCpuToGpuDescrAsyncCpy - Flag when set enables async copy of CPU descriptor into GPU
@@ -7641,6 +7635,7 @@ cuphyStatus_t CUPHYWINAPI cuphySetupSrsChEst(   cuphySrsChEstHndl_t          srs
                                                  uint32_t*                     h_rbSnrBuffOffsets,
                                                  cuphySrsReport_t*             d_pSrsReports,
                                                  cuphySrsChEstBuffInfo_t*      h_chEstBuffInfo,
+                                                 void**                        d_addrsChEstToL2InnerBuff,
                                                  void**                        d_addrsChEstToL2Buff,
                                                  cuphySrsChEstToL2_t*          h_chEstToL2,
                                                  void*                         d_workspace,

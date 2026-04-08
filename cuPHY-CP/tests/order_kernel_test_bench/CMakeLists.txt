@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,9 +71,8 @@ target_include_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${CUBB_HOME
 target_include_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator)
  
 #Link to DOCA shared libraries
-if (DOCA_GPU_DPDK)
-    target_link_libraries(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE -L${DOCA_LIBRARY_DIRS} -ldoca_gpunetio -ldoca_common -ldoca_argp -ldoca_eth)
-endif(DOCA_GPU_DPDK)
+target_link_libraries(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE -L${DOCA_LIBRARY_DIRS} -ldoca_gpunetio -ldoca_gpunetio_device -ldoca_common -ldoca_argp -ldoca_eth)
 
 target_link_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${DPDK_LIBRARY_DIRS})
 target_link_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${DPDK_LIBRARY_DIRS}/dpdk/pmds-22.1)
+target_link_libraries(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE aerial_utils)

@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +16,7 @@
 # limitations under the License.
 
 if [ ! -v AERIAL_VERSION_TAG ]; then
-   AERIAL_VERSION_TAG="25-3-cubb"
+   AERIAL_VERSION_TAG="26-1-cubb"
 fi
 
 if [ ! -v AERIAL_REPO ]; then

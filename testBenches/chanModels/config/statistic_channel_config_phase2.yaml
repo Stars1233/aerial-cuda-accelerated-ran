@@ -1,0 +1,100 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Statistic Channel Model Configuration
+
+# System Level Configuration - UMa 6 GHz Full Calibration (Config 1)
+system_level:
+  scenario: "UMa"  # Scenario type: UMa (Urban Macro) at 6 GHz
+  isd: 1732.0  # Inter-site distance in meters, only used for RMa scenario (1732 or 5000), ignored for UMa/UMi
+  n_site: 19  # Number of sites in the simulation
+  n_sector_per_site: 3  # Number of sectors per site, typically 3 for hexagonal cell layout
+  n_ut: 570  # Total number of User Terminals (UTs) in the simulation
+  optional_pl_ind: 0  # Path loss model: 0=standard pathloss equation, 1=optional path loss equation
+  o2i_building_penetr_loss_ind: 2  # Outdoor-to-Indoor building penetration loss: 0=none, 1=low-loss, 2=50% low-loss, 50% high-loss, 3=high-loss (for indoor UTs)
+  o2i_car_penetr_loss_ind: 0  # Outdoor-to-Indoor car penetration loss: 0=none, 1=basic car, 2=50% basic, 50% metallized, 3=metallized (RMa only)
+  enable_near_field_effect: 0  # Near field effect: 0=disable, 1=enable
+  enable_non_stationarity: 0  # Non-stationarity effect: 0=disable, 1=enable
+  force_indoor_ratio: -1  # Force indoor ratio for all links. -1 uses Table 7.4.1-1
+  force_los_prob: [-1, -1]  # Force LOS probability for [indoor, outdoor] links. [-1,-1] uses Table 7.4.1-1
+  force_ut_speed: [-1, -1]  # Force UT speed for [indoor, outdoor] links. [-1,-1] uses Table 7.4.1-1
+  disable_pl_shadowing: 0  # Path loss and shadowing calculation: 0=calculate, 1=disable
+  disable_small_scale_fading: 0  # Small scale fading: 0=calculate, 1=disable (fast fading = 1, only pathloss)
+  enable_per_tti_lsp: 1  # LSP update per TTI: 0=disable, 1=update PL/O2I/shadowing only, 2=update everything
+  enable_propagation_delay: 1  # Propagation delay in CIR: 0=disable, 1=enable (delay = cluster_delay + propagation_delay)
+
+# Link Level Configuration
+link_level:
+  fast_fading_type: 0  # Fast fading model: 0=AWGN, 1=TDL (Tapped Delay Line), 2=CDL (Clustered Delay Line)
+  delay_profile: "A"  # Delay profile type: 'A' to 'C' (TODO: support for 'D' and 'E')
+  delay_spread: 30.0  # Delay spread in nanoseconds
+  velocity: [0, 0, 0]  # Velocity vector (vx, vy, vz) in m/s, |velocity| = speed, vz = 0 per 3GPP spec
+  num_ray: 0  # Number of rays per path (default: 48 for TDL, 20 for CDL)
+  cfo_hz: 200.0  # Carrier frequency offset in Hz
+  delay: 0.0  # Delay in seconds
+
+# Simulation Configuration - UMa 6 GHz, 20 MHz bandwidth
+simulation:
+  link_sim_ind: 0  # Link simulation indicator
+  center_freq_hz: 6e9  # Center frequency in Hz (6 GHz for UMa calibration)
+  bandwidth_hz: 20e6  # Bandwidth in Hz (20 MHz for 6 GHz per calibration table)
+  sc_spacing_hz: 15000  # Subcarrier spacing in Hz (15 kHz for FR1)
+  fft_size: 2048  # FFT size for OFDM processing (20 MHz / 15 kHz ≈ 1333 → nearest power of 2)
+  n_prb: 106  # Number of Physical Resource Blocks (PRBs) for 20 MHz @ 15 kHz SCS
+  n_prbg: 53  # Number of PRB Groups (PRBGs) ≈ n_prb/2
+  n_snapshot_per_slot: 1  # Number of channel realizations per slot (1 or 14)
+  run_mode: 0  # run mode, 0: CIR only, 1: CIR and CFR on PRBG, 2: CIR and CFR on Sc, 3: CIR and CFR on PRBG/Sc, 4: CIR and CFR on all N_FFT subcarriers, no PRBG
+  internal_memory_mode: 1  # Memory management: 0=external memory for CIR/CFR (buffer allocated outside), 1=internal memory for CIR, external memory for CFR (use get*()), 2=internal memory for CIR/CFR (use get*())
+  freq_convert_type: 1  # Frequency conversion: 0=first SC, 1=center SC, 2=last SC, 3=avg SC, 4=avg SC without ramping
+  sc_sampling: 1  # Subcarrier sampling within PRBG (0:scSampling:N_sc_Prbg-1), only for freqConvertType=3/4
+  proc_sig_freq: 0  # Signal processing frequency indicator (TODO: not used for now)
+  optional_cfr_dim: 0  # Optional CFR dimension: 0: [nActiveUtForThisCell, n_snapshot_per_slot, nUtAnt, nBsAnt, nPrbg / nSc], 1: [nActiveUtForThisCell, n_snapshot_per_slot, nPrbg / nSc, nBsAnt, nUtAnt]
+  cpu_only_mode: 0  # CPU only mode: 0=GPU mode, 1=CPU only mode
+  h5_dump_level: 1  # 0=minimal dump, 1=full dump (default)
+
+# Antenna Panel Configurations - UMa 6 GHz Full Calibration (Config 1)
+antenna_panels:
+  # BS antenna panel configuration (index 0) - Config 1
+  # M=4, N=4, P=2, M_g=1, N_g=2 => Total: 4×4×2×1×2 = 64 antennas
+  # All 16 elements per polarization per panel mapped to single CRS port
+  # Panning angles: (0,0) degrees; downlink angles as per large-scale calibrations
+  panel_0:
+    n_ant: 64  # Total number of antennas (M * N * P * M_g * N_g = 4*4*2*1*2)
+    ant_size: [1, 1, 8, 4, 2]  # Array dimensions [M_g, N_g, M, N, P] = [1, 2, 4, 4, 2]
+    ant_spacing: [2.5, 2.5, 0.5, 0.5]  # Spacing in wavelengths [d_g_h, d_g_v, d_h, d_v] = [2.5λ, 2.5λ, 0.5λ, 0.5λ]
+    ant_theta: []  # Antenna pattern A(theta, phi=0) in dB, 180 elements (required for ant_model=2)
+    ant_phi: []  # Antenna pattern A(theta=90, phi) in dB, 360 elements (required for ant_model=2)
+    ant_polar_angles: [45, -45]  # Polarization angles [roll_angle_first_polz, roll_angle_second_polz] - Model-2 TR36.873 (±45° slant)
+    ant_model: 1  # Antenna model: 0=isotropic, 1=directional (3GPP), 2=direct pattern
+
+  # UE antenna panel configuration (index 1)
+  # M_g=N_g=1, M=N=1, P=2 => Total: 1×1×2×1×1 = 2 antennas (dual-pol)
+  # Isotropic pattern, array orientation: Ω_UT,α uniform [0,360]°, Ω_UT,β=90°, Ω_UT,γ=0°
+  panel_1:
+    n_ant: 2  # Total number of antennas (M * N * P * M_g * N_g = 1*1*2*1*1)
+    ant_size: [1, 1, 1, 1, 2]  # Array dimensions [M_g, N_g, M, N, P] = [1, 1, 1, 1, 2]
+    ant_spacing: [0, 0, 0.5, 0.5]  # Spacing in wavelengths [d_g_h, d_g_v, d_h, d_v]
+    ant_theta: []  # Antenna pattern A(theta, phi=0) in dB, 180 elements (required for ant_model=2)
+    ant_phi: []  # Antenna pattern A(theta=90, phi) in dB, 360 elements (required for ant_model=2)
+    ant_polar_angles: [0, 90]  # Polarization angles [roll_angle_first_polz, roll_angle_second_polz] - Orthogonal linear polarization
+    ant_model: 0  # Antenna model: 0=isotropic (omnidirectional), 1=directional (3GPP), 2=direct pattern 
+
+# Test Bench Configuration (for C++ examples)
+test_bench:
+  n_tti: 10                     # Number of TTIs to simulate
+  continuous_fading: 1          # Enable continuous fading between TTIs
+  rand_seed: 0                  # Random seed for the simulation
+  enable_half_precision: false  # Use single precision floating point
+  enable_swap_tx_rx: false      # Normal DL mode (false), UL mode (true)

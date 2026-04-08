@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@
 #include <vector>
 #include <stdexcept>
 #include <cstdint>
+#include <unordered_set>
 
 class ConfigReader {
 public:
@@ -72,6 +73,53 @@ public:
                 system_config.n_site = sl["n_site"].as<std::uint32_t>();
                 system_config.n_sector_per_site = sl["n_sector_per_site"].as<std::uint8_t>();
                 system_config.n_ut = sl["n_ut"].as<std::uint32_t>();
+                if (sl["ut_drop_option"]) {
+                    system_config.ut_drop_option = sl["ut_drop_option"].as<std::uint8_t>();
+                }
+                if (sl["ut_cell_2d_dist"] && sl["ut_cell_2d_dist"].IsSequence()) {
+                    if (sl["ut_cell_2d_dist"].size() != 2) {
+                        throw std::runtime_error("ut_cell_2d_dist must contain exactly 2 values: [min, max]");
+                    }
+                    system_config.ut_cell_2d_dist[0] = sl["ut_cell_2d_dist"][0].as<float>();
+                    system_config.ut_cell_2d_dist[1] = sl["ut_cell_2d_dist"][1].as<float>();
+                }
+                system_config.n_ut_drop_cells = 0;
+                const YAML::Node utDropCells = sl["ut_drop_cells"];
+                if (utDropCells) {
+                    const uint32_t maxDropCells = static_cast<uint32_t>(sizeof(system_config.ut_drop_cells) / sizeof(system_config.ut_drop_cells[0]));
+                    const uint32_t nSector = system_config.n_site * system_config.n_sector_per_site;
+                    std::unordered_set<uint32_t> seenCell;
+                    auto appendCid = [&](uint32_t cid) {
+                        if (cid >= nSector) {
+                            throw std::runtime_error("ut_drop_cells contains invalid cell id " + std::to_string(cid) +
+                                                     " (must be < n_site * n_sector_per_site = " + std::to_string(nSector) + ")");
+                        }
+                        if (!seenCell.insert(cid).second) {
+                            return;  // duplicate, skip
+                        }
+                        if (system_config.n_ut_drop_cells >= maxDropCells) {
+                            throw std::runtime_error("ut_drop_cells exceeds max supported entries (" + std::to_string(maxDropCells) + ")");
+                        }
+                        system_config.ut_drop_cells[system_config.n_ut_drop_cells++] = cid;
+                    };
+
+                    if (utDropCells.IsNull()) {
+                        // Treat null as empty list: allow all cells.
+                    } else if (utDropCells.IsScalar()) {
+                        // Single number is treated as one-element list.
+                        appendCid(utDropCells.as<std::uint32_t>());
+                    } else if (utDropCells.IsSequence()) {
+                        if (utDropCells.size() > nSector) {
+                            throw std::runtime_error("ut_drop_cells contains more entries (" + std::to_string(utDropCells.size()) +
+                                                     ") than total cells (" + std::to_string(nSector) + ")");
+                        }
+                        for (std::size_t i = 0; i < utDropCells.size(); ++i) {
+                            appendCid(utDropCells[i].as<std::uint32_t>());
+                        }
+                    } else {
+                        throw std::runtime_error("ut_drop_cells must be null, a single number, or a sequence");
+                    }
+                }
                 system_config.optional_pl_ind = sl["optional_pl_ind"].as<std::uint8_t>();
                 system_config.o2i_building_penetr_loss_ind = sl["o2i_building_penetr_loss_ind"].as<std::uint8_t>();
                 system_config.o2i_car_penetr_loss_ind = sl["o2i_car_penetr_loss_ind"].as<std::uint8_t>();
@@ -86,6 +134,118 @@ public:
                 system_config.disable_small_scale_fading = sl["disable_small_scale_fading"].as<std::uint8_t>();
                 system_config.enable_per_tti_lsp = sl["enable_per_tti_lsp"].as<std::uint8_t>();
                 system_config.enable_propagation_delay = sl["enable_propagation_delay"].as<uint8_t>();
+                
+                // ISAC Configuration (optional, defaults to communication-only mode)
+                if (sl["isac_type"]) {
+                    system_config.isac_type = sl["isac_type"].as<std::uint8_t>();
+                }
+                if (sl["n_st"]) {
+                    system_config.n_st = sl["n_st"].as<std::uint32_t>();
+                }
+                if (sl["st_target_type"]) {
+                    const std::uint8_t target_type_raw = sl["st_target_type"].as<std::uint8_t>();
+                    constexpr std::uint8_t max_target_type =
+                        static_cast<std::uint8_t>(SensingTargetType::HAZARD);
+                    if (target_type_raw > max_target_type) {
+                        throw std::runtime_error(
+                            "Invalid st_target_type value " + std::to_string(target_type_raw) +
+                            ". Valid range is [0, " + std::to_string(max_target_type) + "].");
+                    }
+                    system_config.st_target_type = static_cast<SensingTargetType>(target_type_raw);
+                }
+                if (sl["st_rcs_model"]) {
+                    system_config.st_rcs_model = sl["st_rcs_model"].as<std::uint8_t>();
+                }
+                if (sl["st_horizontal_speed"]) {
+                    const YAML::Node& speedNode = sl["st_horizontal_speed"];
+                    if (speedNode.IsSequence()) {
+                        if (speedNode.size() != 2) {
+                            throw std::runtime_error("st_horizontal_speed must have exactly 2 elements: [min, max]");
+                        }
+                        system_config.st_horizontal_speed[0] = speedNode[0].as<float>();
+                        system_config.st_horizontal_speed[1] = speedNode[1].as<float>();
+                    } else {
+                        // Backward compatible: scalar means fixed speed
+                        const float v = speedNode.as<float>();
+                        system_config.st_horizontal_speed[0] = v;
+                        system_config.st_horizontal_speed[1] = v;
+                    }
+                }
+                if (sl["st_vertical_velocity"]) {
+                    system_config.st_vertical_velocity = sl["st_vertical_velocity"].as<float>();
+                }
+                if (sl["st_min_dist_from_tx_rx"]) {
+                    system_config.st_min_dist_from_tx_rx = sl["st_min_dist_from_tx_rx"].as<float>();
+                }
+                if (sl["st_minimum_distance"]) {
+                    system_config.st_minimum_distance = sl["st_minimum_distance"].as<float>();
+                }
+                if (sl["st_size_ind"]) {
+                    system_config.st_size_ind = sl["st_size_ind"].as<std::uint8_t>();
+                }
+                if (sl["st_distribution_option"]) {
+                    auto dist_opt = sl["st_distribution_option"].as<std::vector<int>>();
+                    if (dist_opt.size() < 2) {
+                        throw std::runtime_error(
+                            "st_distribution_option must contain at least 2 elements, but got " +
+                            std::to_string(dist_opt.size()));
+                    }
+                    system_config.st_distribution_option[0] = static_cast<std::uint8_t>(dist_opt[0]);
+                    system_config.st_distribution_option[1] = static_cast<std::uint8_t>(dist_opt[1]);
+                }
+                // ST height range for vertical Option B
+                // New key: st_height: [min, max] (or scalar for fixed height)
+                // Legacy key supported: st_fixed_height
+                auto parse_height_range = [&](const YAML::Node& heightNode) {
+                    if (heightNode.IsSequence()) {
+                        if (heightNode.size() != 2) {
+                            throw std::runtime_error("st_height must have exactly 2 elements: [min, max]");
+                        }
+                        system_config.st_height[0] = heightNode[0].as<float>();
+                        system_config.st_height[1] = heightNode[1].as<float>();
+                    } else {
+                        const float h = heightNode.as<float>();
+                        system_config.st_height[0] = h;
+                        system_config.st_height[1] = h;
+                    }
+                };
+                if (sl["st_height"]) {
+                    parse_height_range(sl["st_height"]);
+                } else if (sl["st_fixed_height"]) {
+                    // Backward compatible: old name
+                    parse_height_range(sl["st_fixed_height"]);
+                }
+                if (sl["st_drop_radius"]) {
+                    system_config.st_drop_radius = sl["st_drop_radius"].as<float>();
+                }
+                if (sl["st_override_k_db"]) {
+                    const auto& node = sl["st_override_k_db"];
+                    if (node.IsNull()) {
+                        system_config.st_override_k_db = std::numeric_limits<float>::quiet_NaN();
+                    } else {
+                        system_config.st_override_k_db = node.as<float>();
+                    }
+                }
+                if (sl["path_drop_threshold_db"]) {
+                    system_config.path_drop_threshold_db = sl["path_drop_threshold_db"].as<float>();
+                }
+                if (sl["isac_disable_background"]) {
+                    system_config.isac_disable_background = sl["isac_disable_background"].as<std::uint8_t>();
+                }
+                if (sl["isac_disable_target"]) {
+                    system_config.isac_disable_target = sl["isac_disable_target"].as<std::uint8_t>();
+                }
+                
+                // Aerial UE Configuration (optional)
+                if (sl["aerial_ue_fast_fading_alt"]) {
+                    system_config.aerial_ue_fast_fading_alt = sl["aerial_ue_fast_fading_alt"].as<std::uint8_t>();
+                }
+                if (sl["aerial_ue_height_min"]) {
+                    system_config.aerial_ue_height_min = sl["aerial_ue_height_min"].as<float>();
+                }
+                if (sl["aerial_ue_height_max"]) {
+                    system_config.aerial_ue_height_max = sl["aerial_ue_height_max"].as<float>();
+                }
             }
 
             // Read Link Level Configuration
@@ -121,6 +281,9 @@ public:
                 sim_config.proc_sig_freq = tc["proc_sig_freq"].as<int>();
                 sim_config.optional_cfr_dim = tc["optional_cfr_dim"].as<int>();
                 sim_config.cpu_only_mode = tc["cpu_only_mode"].as<int>();
+                if (tc["h5_dump_level"]) {
+                    sim_config.h5_dump_level = tc["h5_dump_level"].as<int>();
+                }
             }
 
             // Read Antenna Panel Configurations

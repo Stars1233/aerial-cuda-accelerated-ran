@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +24,6 @@
 #include <vector>
 #include <array>
 #include <stdio.h>
-#include <assert.h>
 #include <memory>
 #include <cstring>
 #include <gdrapi.h>
@@ -58,7 +57,6 @@ namespace fh_gen
                    __LINE__,                         \
                    cudaGetErrorString(result));      \
         }                                            \
-        assert(cudaSuccess == result);               \
     } while(0)
 
 #define CU_CHECK(stmt)                   \
@@ -72,15 +70,38 @@ namespace fh_gen
                    __LINE__,                       \
                    +result);                        \
         }                                          \
-        assert(CUDA_SUCCESS == result);            \
     } while(0)
+
+// NB. Buffer management inspired by cuPHY
+struct hpinned_alloc
+{
+    static void* allocate(size_t nbytes)
+    {
+        void* addr;
+        // CUDA_CHECK(cudaMallocHost(&addr, nbytes));
+        CUDA_CHECK(cudaHostAlloc(&addr, nbytes, cudaHostAllocDefault | cudaHostAllocPortable));
+        return addr;
+    }
+
+    static void deallocate(void* addr)
+    {
+        // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "hpinned_alloc CUDA_CHECK(cudaFreeHost"));
+        CUDA_CHECK(cudaFreeHost(addr));
+    }
+
+    static void clear(void* addr, size_t nbytes)
+    {
+        memset(addr, 0, nbytes);
+    }
+};
 
 typedef struct gpinned_buffer
 {
 public:
-    gpinned_buffer(gdr_t* _g, size_t _size_input) :
+    gpinned_buffer(gdr_t* _g, size_t _size_input, bool _is_rdma_supported) :
         g(_g),
-        size_input(_size_input)
+        size_input(_size_input),
+        is_rdma_supported(_is_rdma_supported)
     {
         CUdeviceptr        dev_addr = 0;
         void*              host_ptr = NULL;
@@ -89,6 +110,20 @@ public:
 
         if(g == nullptr || size_input == 0)
             THROW("gpinned_buffer bad input arguments");
+        
+        // If RDMA is supported - proceed to using GDRCopy library for further allocation
+        // If not, use CUDA pinned host memory allocation. 
+        if (!is_rdma_supported)
+        {
+
+            host_ptr = hpinned_alloc::allocate(size_input); 
+            // In a system with full unified memory, the host and the device pointer _may_ match.
+            CU_CHECK(cuMemHostGetDevicePointer(&dev_addr, host_ptr, 0));
+
+            addr_d    = (uintptr_t)dev_addr;
+            addr_h    = (uintptr_t)host_ptr;
+            return; 
+        }
 
         if(size_input < GPU_MIN_PIN_SIZE)
             size_input = GPU_MIN_PIN_SIZE;
@@ -160,13 +195,18 @@ public:
         addr_d    = (uintptr_t)dev_addr;
         addr_h    = (uintptr_t)host_ptr;
         size_free = pin_size;
+        size_alloc = alloc_size;
     };
 
     ~gpinned_buffer()
     {
+        if (is_rdma_supported) {
         gdr_unmap(*g, mh, (void*)addr_h, size_free);
         gdr_unpin_buffer(*g, mh);
         CU_CHECK(cuMemFree((CUdeviceptr)addr_free));
+        } else {
+            hpinned_alloc::deallocate((void*)addr_h); 
+        }
     };
 
     void* addrh()
@@ -186,6 +226,7 @@ public:
 
     // Used to measure memory footprint
     size_t     size_free;
+    size_t     size_alloc;
 
 protected:
     gdr_t*     g;
@@ -195,6 +236,7 @@ protected:
     uintptr_t  addr_h;    //host memory
     uintptr_t  addr_free; //must be used to free memory
     size_t     size_input;
+    bool       is_rdma_supported; 
 } gpinned_buffer;
 
 class GpuDevice {
@@ -204,9 +246,13 @@ public:
     struct gpinned_buffer* newGDRbuf(size_t size);
     gdr_t*                 getGDRhandler();
     void                   setDevice();
+    void                   print_info();
 private:
     uint32_t              id;
     int                   tot_devs;
+    struct cudaDeviceProp deviceProp;
+    int                   device_attr_clock_rate;
+    int                   device_is_direct_rdma_supported; 
     gdr_t                 gdrc_h;
     bool                  init_gdr;
 };
@@ -229,29 +275,6 @@ struct device_alloc
     static void clear(void* addr, size_t nbytes)
     {
         CUDA_CHECK(cudaMemset(addr, 0, nbytes));
-    }
-};
-
-// NB. Buffer management inspired by cuPHY
-struct hpinned_alloc
-{
-    static void* allocate(size_t nbytes)
-    {
-        void* addr;
-        // CUDA_CHECK(cudaMallocHost(&addr, nbytes));
-        CUDA_CHECK(cudaHostAlloc(&addr, nbytes, cudaHostAllocDefault | cudaHostAllocPortable));
-        return addr;
-    }
-
-    static void deallocate(void* addr)
-    {
-        // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "hpinned_alloc CUDA_CHECK(cudaFreeHost"));
-        CUDA_CHECK(cudaFreeHost(addr));
-    }
-
-    static void clear(void* addr, size_t nbytes)
-    {
-        memset(addr, 0, nbytes);
     }
 };
 

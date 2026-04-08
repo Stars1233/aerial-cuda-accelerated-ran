@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -202,7 +202,7 @@ size_t SrsChannelEstimator::getBufferSize() const {
     static constexpr size_t maxCells = 3;  // TODO: Only one cell currently.
     static constexpr size_t maxSrsReportMem = maxNumSrsUes * sizeof(cuphySrsReport_t) + extraPadding;
 
-    const size_t maxChEstToL2Mem     = maxCells * m_nPrbs * MAX_N_ANTENNAS_SUPPORTED * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL * sizeof(float2) * CUPHY_SRS_MAX_FULL_BAND_CHEST_PER_TTI + extraPadding;
+    const size_t maxChEstToL2Mem     = maxCells * m_nPrbs * MAX_N_ANTENNAS_SUPPORTED * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL * sizeof(float2) * CUPHY_SRS_MAX_FULL_BAND_CHEST_PER_TTI * 2 + extraPadding;
     const size_t maxRbSnrMem         = maxNumSrsUes * m_nPrbs * sizeof(float) + extraPadding;
     const size_t maxRkhsWorkspaceMem = maxCells * CUPHY_SRS_RKHS_WORKSPACE_SIZE_PER_CELL + extraPadding; // TODO: only allocate if RKHS configured in static paramaters
 
@@ -299,6 +299,7 @@ const std::vector<cuphySrsChEstBuffInfo_t>& SrsChannelEstimator::estimate(
     m_tSrsChEstVec.clear();
     m_srsChEstBuffInfo.resize(nSrsUes);
     m_chEstCpuBuffVec.resize(nSrsUes);
+    m_dChEstToL2InnerVec.resize(nSrsUes);
     m_dChEstToL2Vec.resize(nSrsUes);
     m_chEstToL2Vec.resize(nSrsUes);
     m_srsRbSnrBuffOffsets.resize(nSrsUes);
@@ -330,6 +331,7 @@ const std::vector<cuphySrsChEstBuffInfo_t>& SrsChannelEstimator::estimate(
         // Allocate buffers for ChEst to L2.
         size_t maxChEstSize = nPrbGrpsPerHop * nRxAntSrs * nHops * nAntPorts * sizeof(float2);
         m_chEstCpuBuffVec[ueIdx] = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(maxChEstSize));
+        m_dChEstToL2InnerVec[ueIdx] = m_linearAlloc.alloc(maxChEstSize);
         m_dChEstToL2Vec[ueIdx] = m_linearAlloc.alloc(maxChEstSize);
         m_chEstToL2Vec[ueIdx].pChEstCpuBuff = m_chEstCpuBuffVec[ueIdx].addr();
 
@@ -355,6 +357,7 @@ const std::vector<cuphySrsChEstBuffInfo_t>& SrsChannelEstimator::estimate(
                                                    m_srsRbSnrBuffOffsets.data(),
                                                    m_dSrsReports,
                                                    m_srsChEstBuffInfo.data(),
+                                                   m_dChEstToL2InnerVec.data(),
                                                    m_dChEstToL2Vec.data(),
                                                    m_chEstToL2Vec.data(),
                                                    d_workspace,

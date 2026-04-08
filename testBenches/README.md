@@ -27,7 +27,7 @@ testBenches/
 
 `cubb_gpu_test_bench` is a GPU-only testbench that enables multiple channels sharing the same GPU through NVIDIA Multi-Process Service (MPS). It can execute the workloads, measure the latency of each workload over a specific number of time slots, and visualize the latency results. Here latency refers to the execution time of each workload on the GPU as measured by CUDA events. This means that the setup stage and CPU execution is not considered in cubb_gpu_test_bench. Additionally, it can collect Nsight traces for profiling purposes.
 
-The core component is a C platform testbench located at `<aerial_sdk>/testBenches/cubb_gpu_test_bench` that accepts several command options and a yaml file. Please use `cubb_gpu_test_bench -h` to see the available command options. To facilitate the tests, a Python interface `<aerial_sdk>/testBenches/perf` is provided that help generate the command options and yaml file, visualize results, and collect Nsight traces. Using the Python interface is highly recommended for ease of use.
+The core component is a C platform testbench at `<aerial_sdk>/testBenches/cubb_gpu_test_bench` that accepts command options and a YAML input file (`cubb_gpu_test_bench -h` for options). A Python interface in `<aerial_sdk>/testBenches/perf` drives the testbench: it can use a **single YAML config** for all defaults and **CLI flags to override** any parameter, optionally skipping separate JSON generation when the YAML defines test vectors and use case. It also visualizes results and can collect Nsight traces. Using the Python interface is recommended.
 
 ![Diagram of cubb_gpu_test_bench](perf/cubb_gpu_test_bench.png)
 
@@ -44,56 +44,81 @@ If not using the cuBB container, make sure the following requirements are met:
 
 ## Test Vectors (TVs)
 
-A TV is a H5 file that includes the configurations, input data and reference output data for a specific channel. It can be generated using 5GModel of Aerial SDK located in `<aerial_sdk>/5GModel`. Use the following commend in MATLAB to generate the performance TVs to be used for cubb_gpu_test_bench tests
+A TV is an H5 file that includes the configurations, input data and reference output data for a specific channel. TVs are generated in MATLAB from 5GModel at `<aerial_sdk>/5GModel`. They should be available in either the **full** or **compact** set of performance TVs, depending on which generation path you use.
+
+### Generating TVs in MATLAB
+
+**When using `cubb_gpu_test_config.yaml` (ULMIX/DLMIX)** — Generate only the channels needed for that config. From `<aerial_sdk>/5GModel/nr_matlab` in MATLAB:
+
+```matlab
+testCompGenTV_dlmix([9481, 9696, 9905, 9906, 10047]);   % DLMIX: SSB, PDCCH, PDSCH, CSIRS
+testCompGenTV_ulmix([4544, 4548, 4566]);                % ULMIX: PRACH, PUSCH, PUCCH
+```
+
+Outputs go to `GPU_test_input/`. The resulting filenames match the `vector_files` in `cubb_gpu_test_config.yaml` (e.g. `TVnr_DLMIX_9905_PDSCH_gNB_CUPHY_s0p5.h5`, `TVnr_ULMIX_4548_PUSCH_gNB_CUPHY_s0p5.h5`). Slot/PDU suffixes (s0p5, s0p3, etc.) depend on the test case; adjust the YAML `vector_files` if names differ. The MAC TV (e.g. `TV_cumac_F08-MC-CC-20PC_DL.h5`) may come from a separate flow or archive.
+
+**Legacy perf TVs** — To use the older perf TV naming (e.g. for scripts that expect `example_100_testcases_avg_F08.json`), generate the full perf set in MATLAB:
 
 ```matlab
 runRegression({'TestVector'}, {'perf_TVs'}, {'full'})
 ```
 
-Wait for the TV generation to finish and copy the TVs to a `<test_vectors>` folder, either inside or outside of `<aerial_sdk>`. Note that each test of cubb_gpu_test_bench only use a subset of TVs. For instance, only the following TVs are required to run the example below of 4T4R 20C:
+Wait for generation to finish. Legacy TV filenames follow patterns like `TV_cuphy_F08-RA-01.h5`, `TV_cuphy_V08-DS-02_slot0_MIMO4x4_PRB45_DataSyms12_qam256.h5`, etc.
 
-| Channel | TV File Name                                                     |
-| ------- | ---------------------------------------------------------------- |
-| PDSCH   | TV_cuphy_V08-DS-02_slot0_MIMO4x4_PRB45_DataSyms12_qam256.h5      |
-| PUSCH   | TV_cuphy_U08-US-02_snrdb40.00_MIMO2x4_PRB45_DataSyms13_qam256.h5 |
-| PRACH   | TV_cuphy_F08-RA-01.h5                                            |
-| PDCCH   | TV_cuphy_F08-DC-40_PRB273.h5                                     |
-| PUCCH   | TV_cuphy_F08-UC-RC_PRB273.h5                                     |
-| SSB     | TV_cuphy_F08-SS-01.h5                                            |
-| CSIRS   | TV_cuphy_F08-CR-01.h5                                            |
+### Copying TVs to your testvectors folder
 
-`<aerial_sdk>/testBenches/perf/copyCubbGpuTestbenchTv.py` is a sample script to copy the commonly used performance TVs for cell capacity measurement. Please change the `tvSource, tvDestination, tvNames` on L98 and/or L100 as needed.
+**Recommended: shell script + YAML** — When using a YAML config (e.g. `cubb_gpu_test_config.yaml`) with `vector_files`, use the copy script so the set stays in sync with the YAML:
 
-* If you see the following error, it is mostly likely a TV issue. Please try pull the latest Aerial SDK changes and regenerate the latest TVs.
+```shell
+cd <aerial_sdk>/testBenches/perf
+./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml <src_dir> <dst_dir>
+```
+
+Example: from MATLAB `GPU_test_input` to SDK testVectors:
+
+```shell
+./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml $cuBB_SDK/5GModel/nr_matlab/GPU_test_input $cuBB_SDK/testVectors
+```
+
+Example: from an archive to a container mount:
+
+```shell
+./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml /path/to/tv/archive /opt/nvidia/cuBB/testVectors
+```
+
+**Alternative (legacy TV names)** — `copyCubbGpuTestbenchTv.py` copies a fixed list of commonly used performance TVs; adjust `tvSource`, `tvDestination`, and `tvNames` (L98/L100) as needed.
+
+* If you see the following error, it is most likely a TV issue. Please try pull the latest Aerial SDK changes and regenerate the latest TVs.
   ```shell
   terminate called after throwing an instance of 'cuphy::cuphyHDF5_exception' what(): No such scalar or structure field with the given name exists.
   ```
 
-## Building cubb_gpu_test_bench Testbench
+## Building cubb_gpu_test_bench
 
-The cubb_gpu_test_bench is built as part of the standard Aerial SDK build process. To build the complete Aerial SDK including cubb_gpu_test_bench:
+`cubb_gpu_test_bench` is built as part of the standard Aerial SDK. You can use the phase4 build script or configure and build with CMake directly.
+
+**Using the build script (recommended)** — From the SDK root, build the full Aerial SDK (includes cubb_gpu_test_bench):
 
 ```shell
-# Build full Aerial SDK
 $cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh
 ```
 
-Alternatively, you can manually configure the build options:
+To build only `cubb_gpu_test_bench` with custom CMake options:
 
 ```shell
-# Recommend running from the aerial_sdk root directory
-cmake -B<build_dir> -GNinja -DCMAKE_TOOLCHAIN_FILE=cuPHY/cmake/toolchains/native -DCMAKE_BUILD_TYPE=Debug
+$cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh --targets cubb_gpu_test_bench -- -DCMAKE_TOOLCHAIN_FILE=cuPHY/cmake/toolchains/<tool_chain_file> -DCMAKE_BUILD_TYPE=<Release|Debug>
 ```
 
-Once configured, you can build all testbench example targets (including cubb_gpu_test_bench and channel models below) using the `testbenches_examples` target:
+**Manual CMake build** — Without the script, configure from the aerial_sdk root, then build:
+
 ```shell
-# Run from the directory that contains <build_dir>
+# Configure (replace <build_dir>, <tool_chain_file>, and <Release|Debug> as needed)
+cmake -B <build_dir> -GNinja -DCMAKE_TOOLCHAIN_FILE=cuPHY/cmake/toolchains/<tool_chain_file> -DCMAKE_BUILD_TYPE=<Release|Debug>
+
+# Build all testbench examples (cubb_gpu_test_bench + channel models)
 cmake --build <build_dir> --target testbenches_examples
-```
 
-To build a single target, for example `cubb_gpu_test_bench`:
-```shell
-# Run from the directory that contains <build_dir>
+# Or build only cubb_gpu_test_bench
 cmake --build <build_dir> --target cubb_gpu_test_bench
 ```
 
@@ -101,106 +126,95 @@ cmake --build <build_dir> --target cubb_gpu_test_bench
 
 The main goal of this testbench is to measure the latency of multi-channel, multi-cell workloads. It repeatedly launches a pre-defined pattern on the GPU and measures latency per channel using CUDA events. In this latency measurement mode, channel objects are reset between patterns. Due to workload variation and interactions between multiple channels (e.g., different numbers of SMs assigned per channel over time), latency varies across iterations. This produces CDFs (Cumulative Distribution Functions) of latency for different channels. By comparing these latencies against the budgets, we can determine whether a specific cell count is achievable.
 
-Here we use an example of 4T4R 20C on GH200 to show how to run the tests. Assuming the current directory is `<testBenches>/perf`, there are three steps:
+### Recommended: YAML config + CLI overrides
 
-### Step 1: Initial Setup
+The preferred way to run tests is with a **single YAML file** that holds all defaults. You can **skip the JSON generation step** when the YAML defines `vector_files` and `usecase`: the Python interface will generate the test-case and use-case JSON in memory. Any **CLI flag overrides the YAML** for that option.
 
-```shell
-python3 generate_avg_TDD.py --peak 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 --avg 0 --case F08 --exact --fdm
-```
+1. **Prepare a YAML config** (e.g. `cubb_gpu_test_config.yaml`, or `cubb_gpu_test_config_perf101.yaml` in `<testBenches>/perf`). In it set:
+   * `config.testbench_folder` (or `cuphy`) and `config.testvectors_folder` (or `vectors`)
+   * `config.vector_files`: per-channel lists of TV filenames under the testvectors folder
+   * `config.usecase`: e.g. `F08` (used for auto cell-capacity detection and generated JSON names)
+   * GPU and sweep settings: `gpu`, `freq`, `power`, `target`, `start`, `cap`, `slots`, `iterations`, `delay`, `graph`, etc.
+   * Optional: `tdd_priorities`, `start_delay`, `override_test_vectors`, `latency_budget` (see comments in the sample YAML)
 
-Since we want to run 20C, make sure 20 is included in `--peak`. There should be a JSON file `uc_avg_F08_TDD.json` generated.
+2. **Run from `<testBenches>/perf`**:
 
-### Step 2: Run Tests
+   ```shell
+   python3 measure.py --yaml cubb_gpu_test_config.yaml --start 20 --cap 20 --slots 300
+   ```
 
-```shell
-python3 measure.py --cuphy <testBenches>/build --vectors <test_vectors> --config example_100_testcases_avg_F08.json --uc uc_avg_F08_TDD.json --delay 100000 --gpu 0 --freq 1980 --start 20 --cap 20 --iterations 1 --slots 400 --power 900 --target 8 12 8 117 132 12 --2cb_per_sm --save_buffer --priority --prach --prach_isolate --pdcch --pdcch_isolate --pucch --pucch_isolate --tdd_pattern dddsuudddd --pusch_cascaded --ssb --ssb_isolate --csirs --groups_dl --pack_pdsch --groups_pusch --ldpc_parallel --graph
-```
+   Omit `--start`/`--cap` (and other flags) to use the values from the YAML. Any CLI input can override the corresponding parameter in the YAML file, e.g. `--freq 1980 --target 8 12 8 90 132 12`.
 
-Commonly used configs in the above commend are:
+3. **Outputs**: `vectors-<N>.yaml`, `buffer-<N>.txt`, and a results JSON (e.g. `008_012_008_090_132_012_sweep_graphs_avg_F08.json`). The script prints detected GPU, cell count, and SM allocation; for TDD F08/F09/F14 it can auto-report cell capacity (100% on-time).
 
-* --gpu: GPU ordinal of the GH200 to run tests
-* --freq: GPU clock frequency in MHz. cubb_gpu_test_bench will always run under this clock frequency. If the GPU currently has a different clock frequency, the GPU clock frequency will be changed before running tests and restored after running tests.
-* --start and --cap: to sweep over a range [--start, --cap] of cell counts.
-* --slots: number of slots to be run. Typically use 8 or 16 for debugging, 120 for quick latency test, and 400 for cell capacity measurement.
-* --power: GPU power limit to run. Similar to --freq, if different from the current GPU power limit, it will be changed and restored.
-* --target: number of SMs for each subcontext. This has a significant impact on performance and requires manual efforts to optimize.
-* --graph: enable graph mode. If omitted, stream mode will be used. Using graph mode to run the tests typically leads to a lower latency.
+4. **Visualize latency**: `python3 compare.py --filename <results_json> --cells 20+0`. Use multiple `--filename` / `--cells` to compare runs.
 
-When running the above commend, you should see the detected GPU platform, number of cells, SM allocations. For instance, output from 20 peak cell runs on GH200 with SM allocation 8 12 8 117 132 12:
+   ```shell
+   python3 compare.py --filename 008_012_008_090_132_012_sweep_graphs_avg_F08.json --cells 20+0
+   ```
 
-```shell
-Auto detect GPU enabled: GH200 detected, running on NVIDIA GH200 480GB
-Number of active cells: 20+0(8,12,8,117,132,12)
-```
 
-Wait for the run to finish. There should be three files generated:
+**Key options** (set in YAML or override via CLI):
 
-* `vectors-20.yaml`: the yaml file used as input to C platform testbench.
-* `buffer-20.txt`: all printout message from C platform testbench
-* `008_012_008_117_132_012_sweep_graphs_avg_F08.json`: cubb_gpu_test_bench results with three fields
+| Option | Meaning |
+|--------|--------|
+| `--gpu` | GPU ordinal |
+| `--freq` | GPU clock frequency (MHz); set and restored around the run |
+| `--power` | GPU power limit (W); set and restored around the run |
+| `--start`, `--cap` | Cell count sweep range [start, cap] |
+| `--slots` | Slots per run (e.g. 8/16 debug, 120 quick, 400 capacity) |
+| `--target` | SM allocation per subcontext (order depends on isolation flags) |
+| `--graph` | Use CUDA graphs (recommended for lower latency) |
 
-  * `testConfig` : copy of python3 input options, GPU platform, and SM allocation used in cubb_gpu_test_bench tests. Note that SM allocation is capped by the total number of SMs on GPU, i.e., (SM allocation) = min (maxSmCount, --target). A warning will be given if a target parameter is capped by maxSmCount. Actual SM allocation used in running the pattern is saved under `testConfig['smAllocation']`.
-  * `20+00`:
-    * latencies for each channel
-    * `memoryUseMB`: GPU memory used for each channel object, DL and UL
-    * `ontimePercent`: On time percentage of each channel. 1.0 means 100%. See Auto detect cell capacity below.
+*Auto-detect cell capacity*: For TDD patterns dddsuudddd and usecases F08, F09, F14, the script checks on-time percentage of all channels; 100% on-time is PASS. Result is printed and stored in the results JSON under `ontimePercent`.
 
-*Auto detect cell capacity*: For TDD long pattern dddsuudddd and F08, F09, F14, the scripts can auto detect cell capacity without drawing the CDF. It checks the on time percentage of all channels and a PASS means 100 % on time percentage. The on time percentages will also be saved in the results JSON file under ontimePercent of each cell setting. Further, there are three types of printout messages:
+---
 
-* If all tested cell settings pass: *Warning: max cell count `<maxCellTested>` passed based on `<nSlots>` slots run, unknown cell capacity (100% on time for all channels), please try larger cell counts*
-* If all tested cell settings fail: *Warning: no cell count passed based on `<nSlots>` slots run, unknown cell capacity (100% on time for all channels), please try smaller cell counts*
-* Otherwise, the highest cell count passes will be the cell capacity: *Cell capacity is `<cellCapacity>` based on `<nSlots>` slots run (100% on time for all channels)*
+### Legacy instructions (JSON config)
 
-### Step 3: Visualization
+If you prefer the older workflow with explicit JSON config and use-case files:
 
-```shell
-python3 compare.py --filename 008_012_008_117_132_012_sweep_graphs_avg_F08.json --cells 20+0
-```
+1. **Generate use-case JSON** (optional; not needed when using YAML with `vector_files`):
 
-There should be a `compare-YYYY_MM_DD.png` file generated where `YYYY_MM_DD` is the date. This figure draws the CDF of the latency results per channel.
+   ```shell
+   python3 generate_avg_TDD.py --peak 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 --avg 0 --case F08 --exact --fdm
+   ```
 
-To compare the CDF of different runs, e.g., multiple cell counts, two commits before and after CUDA optimizations, CDFs running on different GPU platforms, use `python3 compare.py --filename <json file 1> <json file 2> ... --cells <cell count 1>+0 <cell count 2>+0 ...` . If the `<json file *>` contains folder information, the immediate parent folder will be displayed in the legend.
+   This produces e.g. `uc_avg_F08_TDD.json`. For 20C, include 20 in `--peak`.
+
+2. **Run with explicit config and UC**:
+
+   ```shell
+   python3 measure.py --cuphy <testBenches>/build --vectors <test_vectors> --config example_100_testcases_avg_F08.json --uc uc_avg_F08_TDD.json --delay 100000 --gpu 0 --freq 1980 --start 20 --cap 20 --iterations 1 --slots 300 --power 900 --target 8 12 8 90 132 12 --2cb_per_sm --save_buffer --priority --prach --prach_isolate --pdcch --pdcch_isolate --pucch --pucch_isolate --tdd_pattern dddsuudddd --pusch_cascaded --ssb --ssb_isolate --csirs --groups_dl --pack_pdsch --groups_pusch --ldpc_parallel --graph
+   ```
+
+Other steps are the same with above instructions.
 
 ### Other Usages
 
 #### Collect Nsight Systems Traces
 
-Add `--debug --debug_mode nsys` to the `python3 measure.py ...` command above. It's recommended to use a small number of slots (8 or 16) when collecting traces. By default, it will include CUDA graph node information. Use `--debug --debug_mode nsys_simple` to omit the details inside each graph.
+Add `--debug --debug_mode nsys` to your `measure.py` command (YAML or legacy). Use a small number of slots (8 or 16) when collecting traces. By default, traces include CUDA graph node information; use `--debug_mode nsys_simple` to omit details inside each graph.
 
 #### GPU Power and Memory Measurement
 
 **Quick GPU status check**: Run `nvidia-smi dmon` in a separate terminal to monitor GPU status in real-time.
 
-**Detailed power and memory measurement**: The Python interface supports GPU power and memory measurement using the `--measure_power` option. It queries GPU status every 10 ms during the test (both setup and run phases). A JSON file will be generated if the test runs successfully. 
+**Detailed power and memory measurement**: Use the `--measure_power` option. The script queries GPU status every 10 ms during the test; a JSON file is written on success. Power/memory measurement needs the GPU continuously busy: use `--delay 0 --slots 10 --iterations 1000` and `--measure_power`.
 
-Power and memory measurement support both stream and graph modes. Unlike the latency measurement mode above, power measurement requires keeping the GPU continuously busy running patterns without gaps. To achieve this, modify the test parameters to `--delay 0 --slots 8 --iterations 1000` and add `--measure_power`. This keeps the workload running continuously to maintain consistent GPU utilization. 
-
-Example for 4T4R 8 peak cells:
+With YAML config:
 
 ```shell
-python3 measure.py --cuphy <testBenches>/build --vectors <test_vectors> --config example_100_testcases_avg_F08.json --uc uc_avg_F08_TDD.json --delay 0 --gpu 0 --freq 1410 --start 8 --cap 8 --iterations 1000 --slots 8 --power 300 --target 8 16 16 92 108 16 --2cb_per_sm --save_buffer --priority --prach --prach_isolate --pdcch --pdcch_isolate --pucch --pucch_isolate --tdd_pattern dddsuudddd --pusch_cascaded --ssb --ssb_isolate --csirs --groups_dl --pack_pdsch --groups_pusch --ldpc_parallel --graph --measure_power
+python3 measure.py --yaml cubb_gpu_test_config.yaml --delay 0 --start 8 --cap 8 --iterations 1000 --slots 10 --measure_power
 ```
 
-**Analyze power consumption**:
+**Analyze power**: `python3 power.py --filename <power_results_json> --cells 8+0` — plots GPU power over time and prints max power (keep GPU frequency locked during measurement).
 
-```shell
-python3 power.py --filename 008_016_016_092_108_016_power_graphs_avg_F08.json --cells 8+0
-```
-
-This command displays power measurements and generates a plot of GPU power consumption over time. The maximum GPU power will be output to the command line. Ensure the GPU frequency is locked during measurement.
-
-**Analyze memory consumption**:
-
-```shell
-python3 memory_plot.py --filename 008_016_016_092_108_016_power_graphs_avg_F08.json --cells 8+0
-```
-
-This command displays the maximum GPU memory usage and generates a plot of GPU memory consumption over time. The peak GPU memory consumption will be output to the command line.
+**Analyze memory**: `python3 memory_plot.py --filename <power_results_json> --cells 8+0` — plots GPU memory over time and prints peak usage.
 
 #### Running the C Platform Testbench Natively
 
-To run the C platform testbench natively (e.g., for debugging purposes), add `--test` to the `python3 measure.py ...` command above. This displays the command options and YAML file for the testbench without running the tests. You can then run the C platform testbench directly using the displayed command options and YAML file. Note that running the testbench natively requires manually starting the MPS server.
+For debugging, add `--test` to your `measure.py` command. The script then only prints the C testbench command and the generated vectors YAML path; run that command yourself. Start the MPS server manually when running the C testbench natively.
 
 ---
 
@@ -214,10 +228,11 @@ The `chanModels` directory contains 3GPP 38.901 channel model implementations fo
 - **Location**: `chanModels/src/sls_chan_src/`
 - **Functionality**: 3GPP TR 38.901 statistical channel model implementation
   - Supports UMa, UMi, and RMa
-  - GPU-accelerated computation with CUDA kernels and a CPU-only mode if GPU is not available
+  - Supports ISAC UAV sensing targets (CPU-only)
+  - For UMa/UMi/RMa, GPU-accelerated computation with CUDA kernels and a CPU-only mode if GPU is not available
   - Configurable via YAML files
 - **Example**: `chanModels/examples/sls_chan/` - Demo application with H5 output support
-- Currently, only 6 GHz - UMa is calibrated with 3GPP reference curves. Calibration of other scenarios will be added later
+- Currently, only 6 GHz - UMa, 6 GHz - UMa-AV monostatic sensing are calibrated with 3GPP reference curves. Calibration of other scenarios will be added later
 
 ### Link Level Channel Model
 #### Tapped Delay Line (TDL) Channel Model
@@ -245,39 +260,36 @@ The `chanModels` directory contains 3GPP 38.901 channel model implementations fo
 
 ## Building and Running Channel Model Examples
 
-Channel model examples are built as part of the standard Aerial SDK build process. To build the complete Aerial SDK including cubb_gpu_test_bench:
+Channel model examples are built as part of the standard Aerial SDK. You can use the phase4 build script or configure and build with CMake directly (same options as [Building cubb_gpu_test_bench](#building-cubb_gpu_test_bench)).
+
+**Using the build script (recommended)** — From the SDK root, build the full Aerial SDK (includes channel model examples):
 
 ```shell
-# Build full Aerial SDK
 $cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh
 ```
 
-Alternatively, you can manually configure the build options:
+To build only channel-model (and other testbench) targets with custom CMake options:
 
 ```shell
-# Recommend running from the aerial_sdk root directory
-cmake -B<build_dir> -GNinja -DCMAKE_TOOLCHAIN_FILE=cuPHY/cmake/toolchains/native -DCMAKE_BUILD_TYPE=Debug
+$cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh --targets testbenches_examples -- -DCMAKE_TOOLCHAIN_FILE=cuPHY/cmake/toolchains/<tool_chain_file> -DCMAKE_BUILD_TYPE=<Release|Debug>
 ```
 
-Once configured, you can build all testbench example targets (including cubb_gpu_test_bench above and channel models) using the `testbenches_examples` target:
+**Manual CMake build** — Without the script, configure from the aerial_sdk root, then build:
+
 ```shell
-# Run from the directory that contains <build_dir>
+# Configure (replace <build_dir>, <tool_chain_file>, and <Release|Debug> as needed)
+cmake -B <build_dir> -GNinja -DCMAKE_TOOLCHAIN_FILE=cuPHY/cmake/toolchains/<tool_chain_file> -DCMAKE_BUILD_TYPE=<Release|Debug>
+
+# Build all testbench examples (cubb_gpu_test_bench + channel models)
 cmake --build <build_dir> --target testbenches_examples
-```
 
-To build a single target of channel models, use the following commands:
-
-```shell
-# Or build specific examples
+# Or build specific channel model examples
 cmake --build <build_dir> --target sls_chan_ex
 cmake --build <build_dir> --target tdl_chan_ex
 cmake --build <build_dir> --target cdl_chan_ex
 ```
 
-Usage instructions for each example can be found by running:
-```shell
-<example_executable> -h
-```
+Run any example with `-h` for usage instructions (e.g. `sls_chan_ex -h`, `tdl_chan_ex -h`, `cdl_chan_ex -h`).
 
 # Phase-4 Test Scripts (cuBB Tests)
 

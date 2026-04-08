@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,18 +32,21 @@
 #include <unordered_map>
 #include "aerial-fh-driver/oran.hpp"
 #include <sched.h>
-#include "task_instrumentation.hpp"
+#include "task_instrumentation_v3.hpp"
+#include "task_instrumentation_v3_factories.hpp"
 #include "memtrace.h"
 #include "nvlog_fmt.hpp"
 #include "cuphy_pti.hpp"
 #include "cupti_helper.hpp"
+#include <optional>
 #include "scf_5g_fapi.h"
 #include "cuphyoam.hpp"
 
 int task_work_function_ul_aggr_bfw(Worker* worker, void* param, int first_cell, int num_cells, int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task BFW",13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task BFW", 13);
+    ti.add("Start Task");
     int                                                                          ret = 0;
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -53,9 +56,10 @@ int task_work_function_ul_aggr_bfw(Worker* worker, void* param, int first_cell, 
     PhyUlBfwAggr* ulbfw = slot_map->aggr_ulbfw;
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     struct slot_command_api::ul_slot_callbacks ul_cb;
     std::array<uint32_t,UL_MAX_CELLS_PER_SLOT> cell_idx_list={};
     int cell_count=0;
@@ -85,7 +89,7 @@ int task_work_function_ul_aggr_bfw(Worker* worker, void* param, int first_cell, 
     if (ulbfw) {
         try
         {
-            TI_ADD("Cuda Setup");
+            ti.add("Cuda Setup");
             if (ulbfw->setup(slot_map->aggr_cell_list))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "UL BFW Setup returned error for Map {}",slot_map->getId());
@@ -97,7 +101,7 @@ int task_work_function_ul_aggr_bfw(Worker* worker, void* param, int first_cell, 
 
             slot_map->timings.start_t_ul_bfw_run[0] = Time::nowNs();
 
-            TI_ADD("Cuda Run");
+            ti.add("Cuda Run");
             if(ulbfw->run())
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "UL BFW run returned error for Map {}",slot_map->getId());
@@ -106,14 +110,14 @@ int task_work_function_ul_aggr_bfw(Worker* worker, void* param, int first_cell, 
                 if(pdctx->getUlCb(ul_cb))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                    ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_BFW_CVI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                    ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_BFW_CVI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                 }
                 //goto exit_error;
             }
             else
                 ulbfw->setRunStatus(CH_RUN_DONE_NO_ERROR);
 
-            TI_ADD("Signal Completion");
+            ti.add("Signal Completion");
             if(ulbfw->signalRunCompletionEvent(ulbfw->getStream(),false))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "ULBFW signalCompletion returned error");
@@ -131,8 +135,7 @@ int task_work_function_ul_aggr_bfw(Worker* worker, void* param, int first_cell, 
     slot_map->addSlotEndTask();
     start_t_2 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 
@@ -142,8 +145,9 @@ exit_error:
 }
 
 int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int first_cell, int num_cells, int num_ul_tasks) {
-    TI_INIT_UL("UL Task PUCCH and PUSCH",20);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task PUCCH and PUSCH", 20);
+    ti.add("Start Task");
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     int                                                                          ret = 0, i = 0;
     PhyPuschAggr* pusch = slot_map->aggr_pusch;
@@ -159,35 +163,33 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_pucch_pusch timeout waiting for ULC Tasks, Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted())
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_pucch_pusch Task aborted for Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
@@ -199,9 +201,10 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
 
     
 
-    #ifdef CUPTI_ENABLE_TRACING
-        CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-    #endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     //Determine PUSCH Phase1, PUSCH Phase1, and PUCCH stream
     cudaStream_t* pusch_streams = pdctx->getUlOrderStreamsPusch();
@@ -240,7 +243,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
         PUSH_RANGE_PHYDRV("UL_CUPHY_PUCCH_SETUP", 1);
         slot_map->timings.start_t_ul_pucch_cuda[0] = Time::nowNs();
         try {
-            TI_ADD("PUCCH Cuda Setup");
+            ti.add("PUCCH Cuda Setup");
             if(pucch->setup(slot_map->aggr_cell_list, slot_map->aggr_ulbuf_st1, pucch_stream))
             {
                 NVLOGW_FMT(TAG,"PUCCH setup returned error for Map {}",slot_map->getId());
@@ -259,7 +262,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
         PUSH_RANGE_PHYDRV("UL_CUPHY_PUSCH_SETUP", 1);
         slot_map->timings.start_t_ul_pusch_cuda[0] = Time::nowNs();
         try {
-            TI_ADD("PUSCH Cuda Setup");
+            ti.add("PUSCH Cuda Setup");
             if(pusch->setup(slot_map->aggr_cell_list, slot_map->aggr_ulbuf_st1, phase1_stream, phase2_stream))
             {
                 NVLOGW_FMT(TAG, "PUSCH setup returned error for Map {}",slot_map->getId());
@@ -279,7 +282,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
 
 
     ////Pause CPU until order kernel is launched
-    TI_ADD("Wait for Order Launch");
+    ti.add("Wait for Order Launch");
     if(!oentity->getOrderLaunchedStatus()){
         if(oentity->waitOrderLaunched(1*NS_X_MS))
         {
@@ -288,7 +291,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
         }
     }
 
-    TI_ADD("PUSCH Stream Wait");
+    ti.add("PUSCH Stream Wait");
     if(pusch != nullptr) {
             //Wait on Order kernel completion done event if there is no early-HARQ UEs or no front-loaded DM-RS UEs
             if(slot_map->getIsEarlyHarqPresent()==0 && slot_map->getIsFrontLoadedDmrsPresent()==0){
@@ -303,7 +306,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
         slot_map->timings.start_t_ul_pusch_run[0] = Time::nowNs();
         try {
 
-            TI_ADD("PUSCH Cuda Run");
+            ti.add("PUSCH Cuda Run");
 
             //Run call ordering used when running with PUSCH EH
             //PUSCH_RUN_EARLY_HARQ_PROC  = 1, // processing sub-slot OFDMs in early-HARQ + D2H copies of early-HARQ result
@@ -327,7 +330,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
                     if(pdctx->getUlCb(ul_cb))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                        ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                     }
                     //goto error_next;
                 }
@@ -340,7 +343,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
     }
 
     ////Pause pucch stream
-    TI_ADD("PUCCH Stream Wait");
+    ti.add("PUCCH Stream Wait");
     if(pucch != nullptr) {
         oentity = slot_map->aggr_order_entity;
         pucch->waitToStartGPUEvent(oentity->getRunCompletionEvt(), pucch_stream);
@@ -361,7 +364,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
                 }
             }
 
-            TI_ADD("PUCCH Cuda Run");
+            ti.add("PUCCH Cuda Run");
             if(pucch->run())
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUCCH run returned error for Map {}",slot_map->getId());
@@ -370,14 +373,14 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
                 if(pdctx->getUlCb(ul_cb))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                    ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(), SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                    ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(), SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                 }
                 //goto error_next;
             }
             else
                 pucch->setRunStatus(CH_RUN_DONE_NO_ERROR);
 
-            TI_ADD("PUCCH Signal Completion");
+            ti.add("PUCCH Signal Completion");
             if(pucch->signalRunCompletionEvent(pucch_stream,false))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUCCH signalRunCompletionEvent returned error");
@@ -419,7 +422,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
                     if(pdctx->getUlCb(ul_cb))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                        ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(), SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(), SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                     }
                     //goto error_next;
                 }
@@ -447,14 +450,14 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
                     if(pdctx->getUlCb(ul_cb))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                        ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(), SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(), SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                     }
                     //goto error_next;
                 }
                 else
                     pusch->setRunStatus(CH_RUN_DONE_NO_ERROR);
 
-                TI_ADD("PUSCH Signal Completion");
+                ti.add("PUSCH Signal Completion");
                 if(pusch->signalRunCompletionEvent(phase2_stream,false))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUSCH signalRunCompletionEvent returned error");
@@ -472,14 +475,14 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
                     if(pdctx->getUlCb(ul_cb))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                        ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                     }
                 //goto error_next;
                 }
                 else
                     pusch->setRunStatus(CH_RUN_DONE_NO_ERROR);
 
-                TI_ADD("Signal Completion");
+                ti.add("Signal Completion");
                 if(pusch->signalRunCompletionEvent(phase2_stream,false))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUSCH signalRunCompletionEvent returned error");
@@ -496,12 +499,11 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
         POP_RANGE_PHYDRV
     }
 
-    TI_ADD("Signal Channel End Task");
+    ti.add("Signal Channel End Task");
     slot_map->addChannelEndTask();
     slot_map->addSlotEndTask();
     
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 
@@ -520,8 +522,9 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
 
 int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_cell, int num_cells,int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task PUSCH",12);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task PUSCH", 12);
+    ti.add("Start Task");
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     int                                                                          ret = 0, i = 0;
     t_ns                                                                         start_t_1, start_t_3, start_tx;
@@ -539,35 +542,33 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_pusch timeout waiting for ULC Tasks, Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted())
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_pusch Task aborted for Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
@@ -578,9 +579,10 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
 
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
     uint32_t cpu;
     ret = getcpu(&cpu, nullptr);
     if(ret != 0)
@@ -624,7 +626,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
     if(pusch != nullptr)
     {
         try {
-            TI_ADD("Cuda Setup");
+            ti.add("Cuda Setup");
             if(pusch->setup(slot_map->aggr_cell_list, slot_map->aggr_ulbuf_st1, phase1_stream, phase2_stream))
             {
                 NVLOGW_FMT(TAG, "PUSCH setup returned error for Map {}",slot_map->getId());
@@ -639,7 +641,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
 
             t1 = Time::nowNs();
 
-            TI_ADD("Wait for Order Launch");
+            ti.add("Wait for Order Launch");
             if(!oentity->getOrderLaunchedStatus()){
                 if(oentity->waitOrderLaunched(1*NS_X_MS))
                 {
@@ -648,7 +650,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
                 }
             }
 
-            TI_ADD("Wait To Start GPU");
+            ti.add("Wait To Start GPU");
             //Wait on Order kernel completion done event if there is no early-HARQ UEs or no front-loaded DM-RS UEs
             if(slot_map->getIsEarlyHarqPresent()==0 && slot_map->getIsFrontLoadedDmrsPresent()==0){
                 oentity = slot_map->aggr_order_entity;
@@ -658,7 +660,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
             // t2 = Time::nowNs();
             slot_map->timings.start_t_ul_pusch_run[0] = Time::nowNs();
 
-            TI_ADD("Cuda Run");
+            ti.add("Cuda Run");
             //PUSCH_RUN_EARLY_HARQ_PROC  = 1, // processing sub-slot OFDMs in early-HARQ + D2H copies of early-HARQ result
             //                                  Note - runs on phase1_stream
             //PUSCH_RUN_FULL_SLOT_PROC   = 2, // processing full-slot OFDMs (aka non-early-HARQ)
@@ -676,7 +678,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
                     if(pdctx->getUlCb(ul_cb))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                        ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                     }
                     //goto error_next;
                 }
@@ -684,7 +686,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
                     pusch->setRunStatus(CH_RUN_DONE_NO_ERROR);
 
                 // t3 = Time::nowNs();
-                TI_ADD("Signal Completion");
+                ti.add("Signal Completion");
                 if(pusch->signalRunCompletionEvent(phase2_stream,false))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUSCH signalRunCompletionEvent returned error");
@@ -701,7 +703,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
                     if(pdctx->getUlCb(ul_cb))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                        ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                     }
                     //goto error_next;
                 }
@@ -716,7 +718,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
                     if(pdctx->getUlCb(ul_cb))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                        ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                     }
                     //goto error_next;
                 }
@@ -734,14 +736,14 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
                     if(pdctx->getUlCb(ul_cb))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                        ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST, SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                     }
                 //goto error_next;
                 }
                 else
                     pusch->setRunStatus(CH_RUN_DONE_NO_ERROR);
 
-                TI_ADD("Signal Completion");
+                ti.add("Signal Completion");
                 if(pusch->signalRunCompletionEvent(phase2_stream,false))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUSCH signalRunCompletionEvent returned error");
@@ -758,13 +760,12 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
     slot_map->timings.end_t_ul_pusch_cuda[0] = Time::nowNs();
     POP_RANGE_PHYDRV
 
-    TI_ADD("Signal Channel End Task");
+    ti.add("Signal Channel End Task");
     slot_map->addChannelEndTask();
     slot_map->addSlotEndTask();
     start_t_3 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 
@@ -782,8 +783,9 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
 
 int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_cell, int num_cells,int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task PUCCH",10);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task PUCCH", 10);
+    ti.add("Start Task");
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     int                                                                          ret = 0, i = 0;
     t_ns                                                                         start_t_1, start_t_3, start_tx;
@@ -803,44 +805,43 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
     cudaStream_t stream;
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_pucch timeout waiting for ULC Tasks, Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted())
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_pucch Task aborted for Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     uint32_t cpu;
     ret = getcpu(&cpu, nullptr);
@@ -884,7 +885,7 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
     if(pucch != nullptr)
     {
         try {
-            TI_ADD("Cuda Setup");
+            ti.add("Cuda Setup");
             if(pucch->setup(slot_map->aggr_cell_list, slot_map->aggr_ulbuf_st1, stream))
             {
                 NVLOGW_FMT(TAG,"PUCCH setup returned error for Map {}",slot_map->getId());
@@ -895,7 +896,7 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
 
             t1 = Time::nowNs();
 
-            TI_ADD("Wait for Order Launch");
+            ti.add("Wait for Order Launch");
             if(!oentity->getOrderLaunchedStatus()){
                 if(oentity->waitOrderLaunched(1*NS_X_MS))
                 {
@@ -903,14 +904,14 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
                     goto error_next;
                 }
             }
-            TI_ADD("Wait To Start GPU");
+            ti.add("Wait To Start GPU");
             oentity = slot_map->aggr_order_entity;
             pucch->waitToStartGPUEvent(oentity->getRunCompletionEvt(), stream);
 
             // t2 = Time::nowNs();
             slot_map->timings.start_t_ul_pucch_run[0] = Time::nowNs();
 
-            TI_ADD("Cuda Run");
+            ti.add("Cuda Run");
             if(pucch->run())
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUCCH run returned error for Map {}",slot_map->getId());
@@ -919,7 +920,7 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
                 if(pdctx->getUlCb(ul_cb))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                    ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                    ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                 }
                 //goto error_next;
             }
@@ -928,7 +929,7 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
 
             // t3 = Time::nowNs();
 
-            TI_ADD("Signal Completion");
+            ti.add("Signal Completion");
             if(pucch->signalRunCompletionEvent(stream,false))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUCCH signalRunCompletionEvent returned error");
@@ -940,13 +941,12 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
     slot_map->timings.end_t_ul_pucch_cuda[0] = Time::nowNs();
     POP_RANGE_PHYDRV
 
-    TI_ADD("Signal Channel End Task");
+    ti.add("Signal Channel End Task");
     slot_map->addChannelEndTask();
     slot_map->addSlotEndTask();
     start_t_3 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 
@@ -964,8 +964,9 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
 
 int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_cell, int num_cells,int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task PRACH",10);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task PRACH", 10);
+    ti.add("Start Task");
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     int                                                                          ret = 0, i = 0;
     t_ns                                                                         start_t_1, start_t_3, start_tx;
@@ -986,44 +987,43 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
     cudaStream_t stream;
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_prach timeout waiting for ULC Tasks, Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted())
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_prach Task aborted for Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     uint32_t cpu;
     ret = getcpu(&cpu, nullptr);
@@ -1066,7 +1066,7 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
     {
         try
         {
-            TI_ADD("Cuda Setup");
+            ti.add("Cuda Setup");
             if(prach->setup(slot_map->aggr_cell_list, slot_map->aggr_ulbuf_st3, stream))
             {
                 NVLOGW_FMT(TAG, "PRACH setup returned error for Map {}",slot_map->getId());
@@ -1077,7 +1077,7 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
 
             t1 = Time::nowNs();
 
-            TI_ADD("Wait for Order Launch");
+            ti.add("Wait for Order Launch");
             if(!oentity->getOrderLaunchedStatus()){
                 if(oentity->waitOrderLaunched(1*NS_X_MS))
                 {
@@ -1085,13 +1085,13 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
                     goto error_next;
                 }
             }
-            TI_ADD("Wait To Start GPU");
+            ti.add("Wait To Start GPU");
             oentity = slot_map->aggr_order_entity;
             prach->waitToStartGPUEvent(oentity->getRunCompletionEvt(), stream);
             // t2 = Time::nowNs();
             slot_map->timings.start_t_ul_prach_run[0] = Time::nowNs();
 
-            TI_ADD("Cuda Run");
+            ti.add("Cuda Run");
             if(prach->run())
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PRACH run returned error for Map {}",slot_map->getId());
@@ -1100,7 +1100,7 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
                 if(pdctx->getUlCb(ul_cb))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                    ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                    ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                 }
                 //goto error_next;
             }
@@ -1108,7 +1108,7 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
                 prach->setRunStatus(CH_RUN_DONE_NO_ERROR);
             // t3 = Time::nowNs();
 
-            TI_ADD("Signal Completion");
+            ti.add("Signal Completion");
             if(prach->signalRunCompletionEvent(stream,false))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PRACH signalRunCompletionEvent returned error");
@@ -1120,13 +1120,12 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
     slot_map->timings.end_t_ul_prach_cuda[0] = Time::nowNs();
     POP_RANGE_PHYDRV
 
-    TI_ADD("Signal Channel End Task");
+    ti.add("Signal Channel End Task");
     slot_map->addChannelEndTask();
     slot_map->addSlotEndTask();
     start_t_3 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 
@@ -1144,8 +1143,9 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
 
 int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell, int num_cells,int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task SRS",10);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task SRS", 10);
+    ti.add("Start Task");
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     int                                                                          ret = 0, i = 0;
     t_ns                                                                         start_t_1, start_t_3, start_tx;
@@ -1164,40 +1164,39 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
 
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_srs timeout waiting for ULC Tasks, Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted())
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_srs Task aborted for Slot Map {}",slot_map->getId());
 
-        TI_ADD("Signal Channel End Task");
+        ti.add("Signal Channel End Task");
         slot_map->addChannelEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
@@ -1226,7 +1225,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
     if(srs != nullptr)
     {
         try {
-            TI_ADD("Cuda Setup");
+            ti.add("Cuda Setup");
             if(srs->setup(slot_map->aggr_cell_list, slot_map->aggr_ulbuf_st2))
             {
                 NVLOGW_FMT(TAG, "SRS setup returned error for Map {}",slot_map->getId());
@@ -1237,7 +1236,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
 
             t1 = Time::nowNs();
 
-            TI_ADD("Wait for Order Launch");
+            ti.add("Wait for Order Launch");
             if(!oentity->getOrderLaunchedStatusSrs()){
                 if(oentity->waitOrderLaunchedSrs(1*NS_X_MS))
                 {
@@ -1246,7 +1245,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
                 }
             }
 
-            TI_ADD("Wait To Start GPU");
+            ti.add("Wait To Start GPU");
             oentity = slot_map->aggr_order_entity;
             if(pdctx->get_ru_type_for_srs_proc() == SINGLE_SECT_MODE) {
                 srs->waitToStartGPUEvent(oentity->getRunCompletionEvt());
@@ -1257,7 +1256,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
             // t2 = Time::nowNs();
             slot_map->timings.start_t_ul_srs_run[0] = Time::nowNs();
 
-            TI_ADD("Cuda Run");
+            ti.add("Cuda Run");
             if(srs->run())
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SRS run returned error for Map {}",slot_map->getId());
@@ -1266,7 +1265,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
                 if(pdctx->getUlCb(ul_cb))
                 {
                     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                    ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
+                    ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CH_ERROR,cell_idx_list,cell_count, false);
                 }
                 //goto error_next;
             }
@@ -1274,7 +1273,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
                 srs->setRunStatus(CH_RUN_DONE_NO_ERROR);
             // t3 = Time::nowNs();
 
-            TI_ADD("Signal Completion");
+            ti.add("Signal Completion");
             if(srs->signalRunCompletionEvent(srs->getStream(),false))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SRS signalRunCompletionEvent returned error");
@@ -1286,13 +1285,12 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
     slot_map->timings.end_t_ul_srs_cuda[0] = Time::nowNs();
     POP_RANGE_PHYDRV
 
-    TI_ADD("Signal Channel End Task");
+    ti.add("Signal Channel End Task");
     slot_map->addChannelEndTask();
     slot_map->addSlotEndTask();
     start_t_3 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 
@@ -1313,8 +1311,9 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
 {
     char name[64];
     sprintf(name, "UL Task CPlane %d", task_num + 1);
-    TI_INIT_UL(name,40);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, name, 40);
+    ti.add("Start Task");
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
     int                                                                          ret = 0, i = 0;
@@ -1337,9 +1336,10 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
     start_t_1 = Time::nowNs();
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     ret = getcpu(&cpu, nullptr);
     if(ret != 0)
@@ -1359,7 +1359,7 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
             try
             {
 
-                TI_ADD("Wait ULBFW Completion");
+                ti.add("Wait ULBFW Completion");
                 t_start_ul_channel_tasks = slot_map->getTaskTsExec(1);
                 int prevSlotUlBfwCompStatus = 1;
                 if(pdctx->getmMIMO_enable() && task_num < slot_map->getNumCells())
@@ -1388,7 +1388,7 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
                     }
                 }
                 
-                TI_ADD("CPlane Prepare");
+                ti.add("CPlane Prepare");
                 for(int i = task_num; i < slot_map->getNumCells(); i += num_tasks)
                 {
                     cell_ptr = slot_map->aggr_cell_list[i];
@@ -1423,7 +1423,7 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
                                    0; 
                     if(slot_map->aggr_slot_info[i])
                     {
-                        if((ret=fhproxy->sendCPlane(
+                        if((ret=fhproxy->prepareCPlaneInfo(
                             cell_ptr->getIdx(),
                             cell_ptr->getRUType(),
                             cell_ptr->getPeerId(),
@@ -1438,12 +1438,12 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
                             frameStruct,
                             0,&bfw_header,
                             t_start_ul_channel_tasks,
-                            prevSlotUlBfwCompStatus,slot_map->atom_ul_cplane_info_for_uplane_rdy_count,
+                            prevSlotUlBfwCompStatus,
                             tis))!=SEND_CPLANE_NO_ERROR)
                         {
                             cplane_tx_err_cell_idx_list[cplane_tx_err_cell_count++]=cell_ptr->getIdx();
 
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "UL C-plane send error for cell index {},error type {} Map {} Abort UL Tasks!\n",i,ret,slot_map->getId());
+                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "UL C-plane prepare error for cell index {},error type {} Map {} Abort UL Tasks!\n",i,ret,slot_map->getId());
                             send_Cplane_error|=ret; //OR the ret code in order to prevent overwriting of the errorneous ret state if any from previous interations of the loop
                             slot_map->atom_ul_cplane_info_for_uplane_rdy_count.fetch_add(1);
                             //TODO: we should really keep track of the following:
@@ -1464,14 +1464,29 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
                             //     goto error_next;
                             // }
                         }
+
+                        if (ret == SEND_CPLANE_NO_ERROR && pdctx->getmMIMO_enable()) 
+                        {
+                            // First, prepare and enqueue the BFW packets into the NIC as they have a stricter deadline. 
+                            int ret1 = fhproxy->sendCPlaneMMIMO (true /* isBFW */, cell_ptr->getIdx(), cell_ptr->getPeerId(), DIRECTION_UPLINK, tis);  
+                            // Next, prepare and enqueue the non-BFW packets into the NIC. 
+                            int ret2 = fhproxy->sendCPlaneMMIMO (false /* isBFW */, cell_ptr->getIdx(), cell_ptr->getPeerId(), DIRECTION_UPLINK, tis);  
+                            if (ret1 != SEND_CPLANE_NO_ERROR || ret2 != SEND_CPLANE_NO_ERROR) 
+                            {
+                                cplane_tx_err_cell_idx_list[cplane_tx_err_cell_count++]=cell_ptr->getIdx();
+                                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "UL C-plane send error for cell index {},error type BFW:{} nonBFW:{} Map {} Abort UL Tasks!\n",i,ret1,ret2,slot_map->getId());
+                            }
+                            slot_map->aggr_slot_info[i]->section_id_ready.store(true);
+                            slot_map->atom_ul_cplane_info_for_uplane_rdy_count.fetch_add(1);
+                        }
                         // Appends any subtask instrumentation added by the sendCPlane call.
-                        TI_APPEND_LIST(tis); 
+                        ti.appendList(tis); 
                     }
                     if(pdctx->getUlCb(ul_cb))
                     {
                         if(bfw_header != nullptr)
                         {
-                            ul_cb.fh_bfw_coeff_usage_done_fn(bfw_header);
+                            ul_cb.fh_bfw_coeff_usage_done_fn(ul_cb.fh_bfw_coeff_usage_done_fn_context, bfw_header);
                         }
                     }
                     slot_map->timings.end_t_ul_cplane[i] = Time::nowNs();
@@ -1482,26 +1497,25 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
         } // if (!pdctx->isCPlaneDisabled)
     }
 
-    TI_ADD("Cplane error check");
+    ti.add("Cplane error check");
     if(send_Cplane_error) {
         //Abort the rest of the pipeline on any cplane error
 
         if(pdctx->getUlCb(ul_cb))
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-            ul_cb.ul_tx_error_fn(slot_ind,SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CPLANE_TX_ERROR,cplane_tx_err_cell_idx_list,cplane_tx_err_cell_count, false);
+            ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_ind,SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CPLANE_TX_ERROR,cplane_tx_err_cell_idx_list,cplane_tx_err_cell_count, false);
         }
         slot_map->abortTasks();
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task ul_aggr_1_cplane {} aborted the tasklist for an error", task_num);
     }
 
     //Increment completion counters
-    TI_ADD("Signal completion");
+    ti.add("Signal completion");
     slot_map->addULCTasksComplete();
     slot_map->addSlotEndTask();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
     error_next:
@@ -1516,8 +1530,9 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
 
 int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int first_cell, int num_cells,int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task AGGR3 Early UCI IND",10);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task AGGR3 Early UCI IND", 10);
+    ti.add("Start Task");
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
     t_ns                                                                         start_t;
@@ -1534,9 +1549,10 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
 
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     ret = getcpu(&cpu, nullptr);
     if(ret != 0)
@@ -1546,7 +1562,7 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
     }
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -1555,14 +1571,13 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
         slot_map->setEarlyUciEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted())
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_3_early_uci_ind Task aborted for Slot Map {}",slot_map->getId());
@@ -1570,8 +1585,7 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
         slot_map->setEarlyUciEndTask();
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
@@ -1579,7 +1593,7 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
     if(slot_map->getIsEarlyHarqPresent()==1) //Task should immediately return if Early Harq is not present
     {
         //Note: currently this is needed as otherwise PUCCH seems to wait for PUSCH completion
-        TI_ADD("PUCCH Wait");
+        ti.add("PUCCH Wait");
         if(pucch != nullptr) {
             bool pucch_finished;
             bool pucch_timeout;
@@ -1595,7 +1609,7 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
             }
         }
 
-        TI_ADD("UCI Det Completion WAIT");
+        ti.add("UCI Det Completion WAIT");
         start_t = Time::nowNs();
         while(!isEarlyUciDetComplete)
         {
@@ -1609,10 +1623,10 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
                 NVLOGI_FMT(TAG,"Triggering Early UCI Indication Callback to L2A for Slot Map {}",slot_map->getId());
                 if(pdctx->getUlCb(ul_cb))
                 {
-                    TI_ADD("Early UCI Callback");
-                    ul_cb.callback_fn_early_uci(slot_map->getSlot3GPP(),*pusch->getDynParams(),pusch->getPuschDynParams()->pDataOut,pusch->getPuschStatParams(), slot_map->get_t0());
+                    ti.add("Early UCI Callback");
+                    ul_cb.callback_fn_early_uci(ul_cb.callback_fn_early_uci_context, slot_map->getSlot3GPP(),*pusch->getDynParams(),pusch->getPuschDynParams()->pDataOut,pusch->getPuschStatParams(), slot_map->get_t0());
 
-                    TI_ADD("Run PUSCH_RUN_FULL_SLOT_COPY");
+                    ti.add("Run PUSCH_RUN_FULL_SLOT_COPY");
                     //PUSCH_RUN_FULL_SLOT_COPY: D2H copies all PUSCH results from GPU to CPU
                     //                          Note - runs on phase2_stream
                     if(pusch->run(cuphyPuschRunPhase_t::PUSCH_RUN_FULL_SLOT_COPY))
@@ -1632,7 +1646,7 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
                         phase2_stream = streams[PHASE2_SPLIT_STREAM1];
                     }
 
-                    TI_ADD("Signal Completion");
+                    ti.add("Signal Completion");
                     if(pusch->signalRunCompletionEvent(phase2_stream,false))
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "PUSCH signalRunCompletionEvent returned error");
@@ -1658,8 +1672,7 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
     slot_map->setEarlyUciEndTask();
     slot_map->addSlotEndTask();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
    error_next:
@@ -1670,8 +1683,9 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
 {
     char name[64];
     sprintf(name, "UL Task Order Kernel %d", ok_task_num);    
-    TI_INIT_UL(name,10);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, name, 10);
+    ti.add("Start Task");
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
     int                                                                          task_num = 1, ret = 0, i = 0;
@@ -1719,7 +1733,7 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
     std::fill(num_order_cells_sym_mask_arr.begin(),num_order_cells_sym_mask_arr.end(),0);
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
@@ -1728,22 +1742,20 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
 
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted())
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_1_orderKernel Task aborted for Slot Map {}",slot_map->getId());
 
         slot_map->addSlotEndTask();
 
-        TI_ADD("End Task");
-        TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+        ti.add("End Task");
 
         return 0;
     }
@@ -1752,9 +1764,10 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
 
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     ret = getcpu(&cpu, nullptr);
     if(ret != 0)
@@ -1776,7 +1789,7 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
         }
 #endif
 
-        TI_ADD("Run Order");
+        ti.add("Run Order");
         if(srs)
         {
             srs_pparms = srs->getDynParams();
@@ -1908,7 +1921,7 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
         slot_map->timings.end_t_ul_order_cuda = Time::nowNs();
     }
 
-    TI_ADD("Unlock Next Task");
+    ti.add("Unlock Next Task");
     if(slot_map->unlockNextTask(task_num, slot_map->getNumCells()) == false)
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task {} can't activate the next one", task_num);
@@ -1919,8 +1932,7 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
 
     start_t_3 = Time::nowNs();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 
@@ -1938,8 +1950,9 @@ error_next:
 
 int task_work_function_ul_aggr_2(Worker* worker, void* param, int first_cell, int num_cells,int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task UL AGGR 2",10);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task UL AGGR 2", 10);
+    ti.add("Start Task");
     int                                                                          task_num = 2, ret_task = 0, ret_order = 0, completed_cells = 0;
     int                                                                          ret_rx = 0;
     SlotMapUl*                                                                   slot_map = (SlotMapUl*)param;
@@ -1974,7 +1987,7 @@ int task_work_function_ul_aggr_2(Worker* worker, void* param, int first_cell, in
     start_t_1 = Time::nowNs();
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -1982,7 +1995,7 @@ int task_work_function_ul_aggr_2(Worker* worker, void* param, int first_cell, in
         goto error_next;
     }
     
-    TI_ADD("Wait Current Task");
+    ti.add("Wait Current Task");
     while(1)
     {
 
@@ -2007,7 +2020,7 @@ int task_work_function_ul_aggr_2(Worker* worker, void* param, int first_cell, in
 
     start_t_2 = Time::nowNs();
 
-    TI_ADD("RX Data");
+    ti.add("RX Data");
     PUSH_RANGE_PHYDRV("UL RX", 1);
     // while(completed_cells < slot_map->getNumCells()) // Add time constraints? E.g. // Time::getDifferenceNsToNow(slot_map->getTaskTsExec(task_num)) < t_ns(Cell::getTtiNsFromMu(MU_SUPPORTED))
     while(completed_cells < num_cells)
@@ -2157,15 +2170,14 @@ int task_work_function_ul_aggr_2(Worker* worker, void* param, int first_cell, in
 
     start_t_3 = Time::nowNs();
 
-    TI_ADD("Unlock Next Task");
+    ti.add("Unlock Next Task");
     if(slot_map->unlockNextTask(task_num, num_cells) == false)
     {
         NVLOGE(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task %d can't activate the next one\n", task_num );
         return -1;
     }
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 
@@ -2184,8 +2196,9 @@ error_next:
 
 int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, int num_cells,int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task UL AGGR 3",34);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task UL AGGR 3", 34);
+    ti.add("Start Task");
 
 
     int                                                                          task_num = 3, ret_task = 0;
@@ -2256,9 +2269,10 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
     bool log_once = false;
     bool pusch_reorder_kernel_timeout_state = false;
     bool pusch_terminating_state = false;
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     uint32_t cpu;
     ret = getcpu(&cpu, nullptr);
@@ -2272,7 +2286,7 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
     std::fill(cell_timeout_list.begin(),cell_timeout_list.end(),ORDER_KERNEL_EXIT_PRB);
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -2282,7 +2296,7 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted())
     {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_3 Task aborted for Slot Map {}",slot_map->getId());
@@ -2338,7 +2352,7 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
     if(!en_orderKernel_tb)
     {
         /*The channel end waits are now needed to ensure cuda event recording for channel run completion is called before cudaEventSynchronize*/
-        TI_ADD("Wait Channel End Task");
+        ti.add("Wait Channel End Task");
         if(slot_map->waitChannelEndTask(num_ul_tasks_to_wait) < 0) {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitChannelEndTask returned error for Slot Map {} num_ul_tasks={} num_ulc_tasks={} num_ul_tasks_to_wait={}",slot_map->getId(),num_ul_tasks,num_ulc_tasks,num_ul_tasks_to_wait);
             ret_task=-1;
@@ -2346,7 +2360,7 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
         }
     }
 
-    TI_ADD("Wait Loop");
+    ti.add("Wait Loop");
     start_t = Time::nowNs();
     slot_map->timings.start_t_ul_pusch_compl[0] = Time::nowNs();
     slot_map->timings.start_t_ul_pucch_compl[0] = Time::nowNs();
@@ -2362,9 +2376,13 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
             bool ok_timeout = false;
             if(wa == WAIT_ACTION_COMPLETED) {
 
-                TI_ADD("Wait Order");
+                ti.add("Wait Order");
+                
+                // Add Order Kernel timing measurement
+                int64_t duration = Time::nowNs().count() - slot_map->getSlot3GPP().t0_;
+                pdctx->order_kernel_timing_tracker.addValue(duration, sfn, slot);
 
-                TI_ADD("Order Metrics");
+                ti.add("Order Metrics");
                 for(int ii = first_cell; ii < first_cell + num_cells && ii < slot_map->getNumCells(); ii++)
                 {
                     Cell*     cell_ptr    = slot_map->aggr_cell_list[ii];
@@ -2439,7 +2457,7 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
                 if(!early_uci_task_complete){
                     early_uci_task_complete = slot_map->waitEarlyUciEndTaskNonBlocking();
                     if(early_uci_task_complete){
-                        TI_ADD("Wait EarlyUCITaskEnd");
+                        ti.add("Wait EarlyUCITaskEnd");
                     }
                 }
                 
@@ -2473,20 +2491,20 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
                 wa = pusch_waiter.checkAction();
                 switch(wa) {
                     case WAIT_ACTION_STARTED:
-                        TI_ADD("Started PUSCH");
+                        ti.add("Started PUSCH");
                         break;
                     case WAIT_ACTION_COMPLETED:
                         slot_map->timings.end_t_ul_pusch_compl[0] = Time::nowNs();
 
-                        TI_ADD("Validate PUSCH");
+                        ti.add("Validate PUSCH");
                         pusch->validate(cell_timeout_list,gpu_early_harq_timeout,slot_map->aggr_ulbuf_pcap_capture, slot_map->aggr_ulbuf_pcap_capture_ts);
 
-                        TI_ADD("Callback PUSCH");
+                        ti.add("Callback PUSCH");
                         slot_map->timings.start_t_ul_pusch_cb[0] = Time::nowNs();
                         pusch->callback(cell_timeout_list,gpu_early_harq_timeout);
                         slot_map->timings.end_t_ul_pusch_cb[0] = Time::nowNs();
 
-                        TI_ADD("Done PUSCH");
+                        ti.add("Done PUSCH");
                         break;
                 }
             }
@@ -2495,20 +2513,20 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
             wa = pucch_waiter.checkAction();
             switch(wa) {
                 case WAIT_ACTION_STARTED:
-                    TI_ADD("Started PUCCH");
+                    ti.add("Started PUCCH");
                     break;
                 case WAIT_ACTION_COMPLETED:
                     slot_map->timings.end_t_ul_pucch_compl[0] = Time::nowNs();
 
-                    TI_ADD("Validate PUCCH");
+                    ti.add("Validate PUCCH");
                     pucch->validate();
 
-                    TI_ADD("Callback PUCCH");
+                    ti.add("Callback PUCCH");
                     slot_map->timings.start_t_ul_pucch_cb[0] = Time::nowNs();
                     pucch->callback();
                     slot_map->timings.end_t_ul_pucch_cb[0] = Time::nowNs();
 
-                    TI_ADD("Done PUCCH");
+                    ti.add("Done PUCCH");
                     break;
             }
 
@@ -2516,20 +2534,20 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
             wa = prach_waiter.checkAction();
             switch(wa) {
                 case WAIT_ACTION_STARTED:
-                    TI_ADD("Started PRACH");
+                    ti.add("Started PRACH");
                     break;
                 case WAIT_ACTION_COMPLETED:
                     slot_map->timings.end_t_ul_prach_compl[0] = Time::nowNs();
 
-                    TI_ADD("Validate PRACH");
+                    ti.add("Validate PRACH");
                     prach->validate();
 
-                    TI_ADD("Callback PRACH");
+                    ti.add("Callback PRACH");
                     slot_map->timings.start_t_ul_prach_cb[0] = Time::nowNs();
                     prach->callback();
                     slot_map->timings.end_t_ul_prach_cb[0] = Time::nowNs();
 
-                    TI_ADD("Done PRACH");
+                    ti.add("Done PRACH");
                     break;
             }
 
@@ -2539,20 +2557,20 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
                 wa = srs_waiter.checkAction();
                 switch(wa) {
                     case WAIT_ACTION_STARTED:
-                        TI_ADD("Started SRS");
+                        ti.add("Started SRS");
                         break;
                     case WAIT_ACTION_COMPLETED:
                         slot_map->timings.end_t_ul_srs_compl[0] = Time::nowNs();
 
-                        TI_ADD("Validate SRS");
+                        ti.add("Validate SRS");
                         srs->validate();
 
-                        TI_ADD("Callback SRS");
+                        ti.add("Callback SRS");
                         slot_map->timings.start_t_ul_srs_cb[0] = Time::nowNs();
                         srs->callback(srs_order_cell_timeout_list);
                         slot_map->timings.end_t_ul_srs_cb[0] = Time::nowNs();
 
-                        TI_ADD("Done SRS");
+                        ti.add("Done SRS");
                         break;
                 }
             }            
@@ -2704,7 +2722,7 @@ Example output log (last entry for 100K slots):
         if(pdctx->getUlCb(ul_cb))
         {
             NVLOGI_FMT(TAG, "Calling ul_tx_error_fn {}\n",__LINE__);
-            ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_MISSING_UL_IQ,cell_error_list,cell_error_count,true);
+            ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_MISSING_UL_IQ,cell_error_list,cell_error_count,true);
         }
     }
 
@@ -2712,18 +2730,18 @@ Example output log (last entry for 100K slots):
     //Make sure that all UL tasks have run to completion here and release the slot map if SRS is not present or FX RU
     if(!srs || pdctx->get_ru_type_for_srs_proc() == SINGLE_SECT_MODE)
     {
-        TI_ADD("Wait Slot End Task");
+        ti.add("Wait Slot End Task");
         if(slot_map->waitSlotEndTask(num_ul_tasks) < 0)
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitSlotEnd returned error");
             if(pdctx->getUlCb(ul_cb))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-                ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_ERROR_INDICATION,SCF_ERROR_CODE_L1_UL_CPU_TASK_ERROR,cell_idx_list,cell_count,false);
+                ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_ERROR_INDICATION,SCF_ERROR_CODE_L1_UL_CPU_TASK_ERROR,cell_idx_list,cell_count,false);
             }
         }
 
-        TI_ADD("Slot Map Release");
+        ti.add("Slot Map Release");
         PUSH_RANGE_PHYDRV("UL CLEAN", 1);
         if(ret_task==-1)
             slot_map->release(num_cells,false);
@@ -2732,16 +2750,16 @@ Example output log (last entry for 100K slots):
         POP_RANGE_PHYDRV
     }
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return 0;
 }
 
 int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell, int num_cells,int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task UL AGGR 3 SRS",10);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task UL AGGR 3 SRS", 10);
+    ti.add("Start Task");
 
     SlotMapUl* slot_map = (SlotMapUl*)param;
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -2769,9 +2787,10 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
 
-#ifdef CUPTI_ENABLE_TRACING
-    CuphyCuptiScopedExternalId cuphy_cupti_scoped_external_id(slot_map->getSlot3GPP().t0_);
-#endif
+    std::optional<CuphyCuptiScopedExternalId> cuphy_cupti_scoped_external_id;
+    if (pdctx->cuptiTracingEnabled()) {
+        cuphy_cupti_scoped_external_id.emplace(slot_map->getSlot3GPP().t0_);
+    }
 
     uint32_t cpu;
     ret = getcpu(&cpu, nullptr);
@@ -2782,7 +2801,7 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
     }
 
     //Only run after ULC tasks have completed
-    TI_ADD("ULC Tasks Complete Wait");
+    ti.add("ULC Tasks Complete Wait");
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0) {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_3_srs timeout waiting for ULC Tasks, Slot Map {}",slot_map->getId());
@@ -2791,7 +2810,7 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
     }
 
     //Check abort condition
-    TI_ADD("Check Task Abort");
+    ti.add("Check Task Abort");
     if(slot_map->tasksAborted()) {
         NVLOGW_FMT(TAG,"task_work_function_ul_aggr_3_srs Task aborted for Slot Map {}",slot_map->getId());
         ret_task=-1;
@@ -2802,7 +2821,7 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
         order_waiter_srs.setState(WAIT_STATE_COMPLETED);
     }
 
-    TI_ADD("Wait Loop");
+    ti.add("Wait Loop");
     start_t = Time::nowNs();
     slot_map->timings.start_t_ul_srs_compl[0] = Time::nowNs();
     bool still_waiting;
@@ -2813,7 +2832,7 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
         if(!(pdctx->cpuCommEnabled()) && srs) {
             wa = order_waiter_srs.checkAction(true);
             if(wa == WAIT_ACTION_COMPLETED) {
-                TI_ADD("Wait SRS Order");
+                ti.add("Wait SRS Order");
 
                 for(int ii = first_cell; ii < first_cell + num_cells && ii < slot_map->getNumCells(); ii++) {
                     Cell* cell_ptr = slot_map->aggr_cell_list[ii];
@@ -2861,20 +2880,20 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
         wa = srs_waiter.checkAction();
         switch(wa) {
             case WAIT_ACTION_STARTED:
-                TI_ADD("Started SRS");
+                ti.add("Started SRS");
                 break;
             case WAIT_ACTION_COMPLETED:
                 slot_map->timings.end_t_ul_srs_compl[0] = Time::nowNs();
 
-                TI_ADD("Validate SRS");
+                ti.add("Validate SRS");
                 srs->validate();
 
-                TI_ADD("Callback SRS");
+                ti.add("Callback SRS");
                 slot_map->timings.start_t_ul_srs_cb[0] = Time::nowNs();
                 srs->callback(srs_order_cell_timeout_list);
                 slot_map->timings.end_t_ul_srs_cb[0] = Time::nowNs();
 
-                TI_ADD("Done SRS");
+                ti.add("Done SRS");
                 break;
         }
 
@@ -2901,18 +2920,18 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
 cleanup:
     slot_map->addSlotEndTask();
 
-    TI_ADD("Wait Slot End Task");
+    ti.add("Wait Slot End Task");
     if(slot_map->waitSlotEndTask(num_ul_tasks) < 0)
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitSlotEnd returned error");
         if(pdctx->getUlCb(ul_cb))
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
-            ul_cb.ul_tx_error_fn(slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CPU_TASK_ERROR,cell_idx_list,cell_count, false);
+            ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context, slot_map->getSlot3GPP(),SCF_FAPI_UL_TTI_REQUEST,SCF_ERROR_CODE_L1_UL_CPU_TASK_ERROR,cell_idx_list,cell_count, false);
         }
     }
 
-    TI_ADD("Slot Map Release");
+    ti.add("Slot Map Release");
     PUSH_RANGE_PHYDRV("UL CLEAN", 1);
     if(ret_task==-1)
         slot_map->release(num_cells,false);
@@ -2920,16 +2939,16 @@ cleanup:
         slot_map->release(num_cells,true);
     POP_RANGE_PHYDRV    
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return ret_task;
 }
 
 int task_work_function_ul_aggr_3_ulbfw(Worker* worker, void* param, int first_cell, int num_cells, int num_ul_tasks)
 {
-    TI_INIT_UL("UL Task UL AGGR 3 ULBFW", 13);
-    TI_ADD("Start Task");
+    auto ctx = makeInstrumentationContextUL(param, worker);
+    TaskInstrumentation ti(ctx, "UL Task UL AGGR 3 ULBFW",  13);
+    ti.add("Start Task");
     int ret = 0;
     SlotMapUl* slot_map = (SlotMapUl*)param;
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
@@ -2957,13 +2976,13 @@ int task_work_function_ul_aggr_3_ulbfw(Worker* worker, void* param, int first_ce
     NVLOGI_FMT(TAG, "UL Task 3 (ULBFW) started CPU {} for Map {}, SFN slot ({},{})", 
                cpu, slot_map->getId(), slot_map->getSlot3GPP().sfn_, slot_map->getSlot3GPP().slot_);
 
-    TI_ADD("Wait ULBFW End Task");
+    ti.add("Wait ULBFW End Task");
     if(slot_map->waitUlBfwEndTask() < 0) {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "ULBFW task timed out for Slot Map {}", slot_map->getId());
         goto cleanup;
     }
 
-    TI_ADD("Wait Loop");
+    ti.add("Wait Loop");
     start_t = Time::nowNs();
     slot_map->timings.start_t_ul_bfw_compl[0] = Time::nowNs();
     do {
@@ -2971,19 +2990,19 @@ int task_work_function_ul_aggr_3_ulbfw(Worker* worker, void* param, int first_ce
         wa = ulbfw_waiter.checkAction();
         switch(wa) {
             case WAIT_ACTION_STARTED:
-                TI_ADD("Started ULBFW");
+                ti.add("Started ULBFW");
                 break;
             case WAIT_ACTION_COMPLETED:
                 slot_map->timings.end_t_ul_bfw_compl[0] = Time::nowNs();
 
-                TI_ADD("Validate ULBFW");
+                ti.add("Validate ULBFW");
                 ulbfw->validate();
 
-                TI_ADD("Callback ULBFW");
+                ti.add("Callback ULBFW");
                 slot_map->timings.start_t_ul_bfw_cb[0] = Time::nowNs();
                 ulbfw->callback();
                 slot_map->timings.end_t_ul_bfw_cb[0] = Time::nowNs();
-                TI_ADD("Done ULBFW");
+                ti.add("Done ULBFW");
                 break;
         }
         still_waiting = ulbfw_waiter.stillWaiting();
@@ -3006,8 +3025,7 @@ int task_work_function_ul_aggr_3_ulbfw(Worker* worker, void* param, int first_ce
 cleanup:
     slot_map->addSlotEndTask();
 
-    TI_ADD("End Task");
-    TI_NVSLOGI(sfn,slot,slot_map->getId(),cpu);
+    ti.add("End Task");
 
     return ret;
 }

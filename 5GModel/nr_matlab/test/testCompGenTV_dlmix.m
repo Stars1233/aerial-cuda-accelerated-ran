@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,7 +54,7 @@ switch compTvMode
         error('compTvMode is not supported...\n');
 end
 
-selected_TC = [100:599, 1000:13600, 20000:29999];
+selected_TC = [100:599, 1000:13900, 20000:29999];
 disabled_TC = [];
 [~,TcIdx] = ismember(disabled_TC, selected_TC);
 selected_TC(TcIdx) = [];
@@ -93,10 +93,15 @@ perf_pattern_table = [
     69,         12232,   12441,   15,     7;  % 69, 69a, 69b, 69c, 69d, 69e, 71
     73,         12442,   12721,   20,    10;  % 73
     75,         12722,   12931,   15,     7;  % 75
-    79,         13067,   13216,   15,     7;  % 79
+    79,         13067,   13216,   15,     7;  % 79, 79a, 79b
     81,         13217,   13381,   15,     7;  % 81, 81a, 81b
     83,         13382,   13546,   15,     7;  % 83, 83a, 83b
     85,         13547,   13696,   15,     7;  % 85
+    87,         13697,   13711,   15,     7;  % 87, also need 13067~13216 from pattern 79
+    89,         13712,   13801,    9,     9;  % 89
+    91,         13802,   13951,   15,     7;  % 91
+    101,        7472,    7495,    24,    24;  % 101, 101a
+    102,        7496,    7519,    24,    24;  % 102, 102a
 ];
 
 % generate compact TV list from performance patterns
@@ -118,6 +123,7 @@ compact_TV_non_perf_pattern = [103, 120:128, 130:135, 141, 142, 143, 144, 150:18
 
 % combine both compact TV sets
 compact_TC = [compact_TV_non_perf_pattern, compact_TV_perf_pattern];
+compact_TC = unique(compact_TC);
 
 % only generate FAPI TV in this set for per-MR cicd
 % keep cuPHY TVs for one of each kind
@@ -135,11 +141,20 @@ for i = 1:size(perf_pattern_table, 1)
     compact_TV_FAPI_only = [compact_TV_FAPI_only, fapi_only_tvs];
 end
 
-full_TC = [100:599, 1000:13600, 20000:29999];
+% performance pattern compact TVs required for cuBB GPU test bench
+compact_TV_perf_pattern_cuBB_gpu = [
+    9481, 9696, 9905, 9906, 10047, ... % from 59c
+    7484, ... % from 101
+    7481, ... % from 101a
+    7516, ... % from 102
+];
+compact_TV_FAPI_only = setdiff(compact_TV_FAPI_only, compact_TV_perf_pattern_cuBB_gpu);  % exclude cuBB GPU test bench TVs from FAPI-only set, will generate both cuPHY and FAPI TVs
 
-MIMO_64TR_TC = [190, 192:195, 281, 296:461, 11252:11431, 12232:12441, 12442:12721, 12722:12931, 12932:13066, 13067:13216, 13217:13381, 13382:13546, 13547:13696, 20000:21109];
+full_TC = [100:599, 1000:13951, 20000:29999];
 
-negative_TC = [500, 501, 502, 20584, 20585, 20594, 20595, 20831, 20950:20989, 13547:13696];
+MIMO_64TR_TC = [190, 192:195, 281, 296:461, 11252:11431, 12232:13951, 20000:21309];
+
+negative_TC = [500, 501, 502, 20584, 20585, 20594, 20595, 20831, 20950:20989, 21270:21309, 13547:13696, 13802:13951];
 
 if isnumeric(caseSet)
     TcToTest = caseSet;
@@ -284,7 +299,7 @@ CFG = {...
     193      0      12       {}   {57 58}  num2cell([408,409,412])     {106}; % 8 CSI-RS antennas, 32 ports
     194      0      13       {}   {57 58}  num2cell([408,412])         {106}; % 4 CSI-RS antennas, 32 ports
 % Based on 191 but no modcompression
-    195      0       9       {}      {55}              {415}             {};
+    195      0      13       {}      {55}              {415}             {};
 
     280      0       9       {}        {}              {354}              {2};
     281      0      10       {}        {}              {416}              {2};
@@ -1179,7 +1194,7 @@ CFG = {...
   20891      1      10       {}   {72 71}   num2cell(2337:2352)           {82 83};
   20892      2      10       {}   {72 71}   num2cell(2337:2352)           {};
   20893      3      10       {}     {}                {}                  {113 114};  % slot 23: 8-port CSI_RS + SRS, for nrSim 90644, 90646
-  20894      3      10       {}     {}                {}                  {119 120 121 114};  % slot 23: 8-port + 32-port CSI_RS + SRS, for nrSim 90645, 90647
+  20894      3      10       {}     {}                {}                  {119 120 114};  % slot 23: 8-port + 32-port CSI_RS + SRS, for nrSim 90645, 90647
   20896      6      10       {}     {72}    num2cell(2369:2384)           {};
   20897      7      10       {}     {72}    num2cell(2369:2384)           {};
   20898      8      10       {}     {72}    num2cell(2369:2384)           {};
@@ -1217,7 +1232,7 @@ CFG = {...
   20931      1      10       {}   {72 71}   num2cell(2465:2528)           {82 83};
   20932      2      10       {}   {72 71}   num2cell(2465:2528)           {};
   20933      3      10       {}     {}                {}                  {113 114};  % slot 23: 8-port CSI_RS + SRS, for nrSim 90649, 90650
-  20934      3      10       {}     {}                {}                  {119 120 121 114};  % slot 23: 8-port + 32-port CSI_RS + SRS, for nrSim 90651, 90652
+  20934      3      10       {}     {}                {}                  {119 120 114};  % slot 23: 8-port + 32-port CSI_RS + SRS, for nrSim 90651, 90652
   20936      6      10       {}     {72}    num2cell(2593:2656)           {};
   20937      7      10       {}     {72}    num2cell(2593:2656)           {};
   20938      8      10       {}     {72}    num2cell(2593:2656)           {};
@@ -1348,43 +1363,237 @@ CFG = {...
   21044      3      10       {}     {72}    num2cell(928:947)                    {};       % slot 63
   21045      3      10       {}     {}      {}                                   {115 116};  % slot 23: CSI_RS + SRS
   % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz light
-  21070      0      10       {22}   {72}    num2cell(958:973)                    {};
-  21071      1      10       {}   {72 71}   num2cell(974:989)                    {};
-  21072      2      10       {}   {72 71}   num2cell(974:989)                    {};
-  21073      3      10       {}     {72}    num2cell(990:1005)                   {};
-  21076      6      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21077      7      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21078      8      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21079      9      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21080     10      10       {}   {72 70}   num2cell([1006:1013, 966:972, 1014, 1015])   {};  % both 72 and 70 PDDCH is on symbol 0, 1015 is PDSCH for CCH
-  21081     11      10       {}   {72 71}   num2cell(974:989)                    {};
-  21082     12      10       {}   {72 71}   num2cell(974:989)                    {};
-  21083     13      10       {}     {72}    num2cell(990:1005)                   {};
-  21086     16      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21087     17      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21088     18      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21089     19      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21090      0      10       {}     {72}    num2cell([1006:1013, 966:973])       {82 83};
-  21091      1      10       {}   {72 71}   num2cell(974:989)                    {82 83};
-  21092      2      10       {}   {72 71}   num2cell(974:989)                    {};
+  21070      0      10       {22}   {72}    num2cell(958:969)                    {};
+  21071      1      10       {}   {72 71}   num2cell(970:981)                    {};
+  21072      2      10       {}   {72 71}   num2cell(970:981)                    {};
+  21073      3      10       {}     {72}    num2cell(982:993)                    {};
+  21076      6      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21077      7      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21078      8      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21079      9      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21080     10      10       {}   {72 70}   num2cell([994:997, 962:968, 998, 999])   {};  % both 72 and 70 PDDCH is on symbol 0, 999 is PDSCH for CCH
+  21081     11      10       {}   {72 71}   num2cell(970:981)                    {};
+  21082     12      10       {}   {72 71}   num2cell(970:981)                    {};
+  21083     13      10       {}     {72}    num2cell(982:993)                    {};
+  21086     16      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21087     17      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21088     18      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21089     19      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21090      0      10       {}     {72}    num2cell([994:997, 962:969])         {82 83};
+  21091      1      10       {}   {72 71}   num2cell(970:981)                    {82 83};
+  21092      2      10       {}   {72 71}   num2cell(970:981)                    {};
   21093      3      10       {}      {}     {}                                   {113 114};  % slot 23: CSI_RS + SRS
-  21096      6      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21097      7      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21098      8      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21099      9      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21100     10      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21101     11      10       {}   {72 71}   num2cell(974:989)                    {};
-  21102     12      10       {}   {72 71}   num2cell(974:989)                    {};
-  21103     13      10       {}     {72}    num2cell(990:1005)                   {};
-  21106     16      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21107     17      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21108     18      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
-  21109     19      10       {}     {72}    num2cell([1006:1013, 966:973])       {};
+  21096      6      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21097      7      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21098      8      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21099      9      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21100     10      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21101     11      10       {}   {72 71}   num2cell(970:981)                    {};
+  21102     12      10       {}   {72 71}   num2cell(970:981)                    {};
+  21103     13      10       {}     {72}    num2cell(982:993)                    {};
+  21106     16      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21107     17      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21108     18      10       {}     {72}    num2cell([994:997, 962:969])         {};
+  21109     19      10       {}     {72}    num2cell([994:997, 962:969])         {};
   % additional CSI-RS cases
-  21074      0      10       {}     {72}    num2cell([1006:1013, 966:973])       {82 83};  % slot 60
-  21075      1      10       {}   {72 71}   num2cell(974:989)                    {82 83};  % slot 61
-  21084      3      10       {}     {72}    num2cell(990:1005)                   {};       % slot 63
+  21074      0      10       {}     {72}    num2cell([994:997, 962:969])         {82 83};  % slot 60
+  21075      1      10       {}   {72 71}   num2cell(970:981)                    {82 83};  % slot 61
+  21084      3      10       {}     {72}    num2cell(982:993)                    {};       % slot 63
   21085      3      10       {}     {}      {}                                   {115 116};  % slot 23: CSI_RS + SRS
+
+  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz heavy
+  21110      0      14       {22}   {83}    num2cell(1000:1019)                  {};
+  21111      1      14       {}   {83 82}   num2cell(1020:1039)                  {};
+  21112      2      14       {}   {83 82}   num2cell(1020:1039)                  {};
+  21113      3      14       {}     {83}    num2cell(1040:1059)                  {};
+  21116      6      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21117      7      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21118      8      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21119      9      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21120     10      14       {}   {83 81}   num2cell([1060:1067, 1008:1018, 1068, 1069])   {};  % both 83 and 81 PDDCH is on symbol 0, 1069 is PDSCH for CCH
+  21121     11      14       {}   {83 82}   num2cell(1020:1039)                  {};
+  21122     12      14       {}   {83 82}   num2cell(1020:1039)                  {};
+  21123     13      14       {}     {83}    num2cell(1040:1059)                  {};
+  21126     16      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21127     17      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21128     18      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21129     19      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21130      0      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {122 123};
+  21131      1      14       {}   {83 82}   num2cell(1020:1039)                  {122 123};
+  21132      2      14       {}   {83 82}   num2cell(1020:1039)                  {};
+  21133      3      14       {}      {}     {}                                   {124 125};  % slot 23: CSI_RS + SRS
+  21136      6      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21137      7      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21138      8      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21139      9      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21140     10      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21141     11      14       {}   {83 82}   num2cell(1020:1039)                  {};
+  21142     12      14       {}   {83 82}   num2cell(1020:1039)                  {};
+  21143     13      14       {}     {83}    num2cell(1040:1059)                  {};
+  21146     16      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21147     17      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21148     18      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  21149     19      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {};
+  % additional CSI-RS cases
+  21114      0      14       {}     {83}    num2cell([1060:1067, 1008:1019])     {122 123};  % slot 60
+  21115      1      14       {}   {83 82}   num2cell(1020:1039)                  {122 123};  % slot 61
+  21124      3      14       {}     {83}    num2cell(1040:1059)                  {};       % slot 63
+  21125      3      14       {}     {}      {}                                   {126 127};  % slot 23: CSI_RS + SRS
+
+  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz light
+  21150      0      14       {22}   {83}    num2cell(1070:1081)                  {};
+  21151      1      14       {}   {83 82}   num2cell(1082:1093)                  {};
+  21152      2      14       {}   {83 82}   num2cell(1082:1093)                  {};
+  21153      3      14       {}     {83}    num2cell(1094:1105)                  {};
+  21156      6      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21157      7      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21158      8      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21159      9      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21160     10      14       {}   {83 81}   num2cell([1106:1109, 1074:1080, 1110, 1111])   {};  % both 83 and 81 PDDCH is on symbol 0, 1111 is PDSCH for CCH
+  21161     11      14       {}   {83 82}   num2cell(1082:1093)                  {};
+  21162     12      14       {}   {83 82}   num2cell(1082:1093)                  {};
+  21163     13      14       {}     {83}    num2cell(1094:1105)                  {};
+  21166     16      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21167     17      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21168     18      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21169     19      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21170      0      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {122 123};
+  21171      1      14       {}   {83 82}   num2cell(1082:1093)                  {122 123};
+  21172      2      14       {}   {83 82}   num2cell(1082:1093)                  {};
+  21173      3      14       {}      {}     {}                                   {124 125};  % slot 23: CSI_RS + SRS
+  21176      6      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21177      7      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21178      8      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21179      9      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21180     10      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21181     11      14       {}   {83 82}   num2cell(1082:1093)                  {};
+  21182     12      14       {}   {83 82}   num2cell(1082:1093)                  {};
+  21183     13      14       {}     {83}    num2cell(1094:1105)                  {};
+  21186     16      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21187     17      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21188     18      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  21189     19      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {};
+  % additional CSI-RS cases
+  21154      0      14       {}     {83}    num2cell([1106:1109, 1074:1081])     {122 123};  % slot 60
+  21155      1      14       {}   {83 82}   num2cell(1082:1093)                  {122 123};  % slot 61
+  21164      3      14       {}     {83}    num2cell(1094:1105)                  {};       % slot 63
+  21165      3      14       {}     {}      {}                                   {126 127};  % slot 23: CSI_RS + SRS
+
+  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz heavy
+  21190      0      15       {22}   {86}    num2cell(1112:1131)                  {};
+  21191      1      15       {}   {86 85}   num2cell(1132:1151)                  {};
+  21192      2      15       {}   {86 85}   num2cell(1132:1151)                  {};
+  21193      3      15       {}     {86}    num2cell(1152:1171)                  {};
+  21196      6      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21197      7      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21198      8      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21199      9      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21200     10      15       {}   {86 84}   num2cell([1172:1179, 1120:1130, 1180, 1181])   {};  % both 86 and 84 PDDCH is on symbol 0, 1181 is PDSCH for CCH
+  21201     11      15       {}   {86 85}   num2cell(1132:1151)                  {};
+  21202     12      15       {}   {86 85}   num2cell(1132:1151)                  {};
+  21203     13      15       {}     {86}    num2cell(1152:1171)                  {};
+  21206     16      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21207     17      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21208     18      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21209     19      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21210      0      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {128 129};
+  21211      1      15       {}   {86 85}   num2cell(1132:1151)                  {128 129};
+  21212      2      15       {}   {86 85}   num2cell(1132:1151)                  {};
+  21213      3      15       {}      {}     {}                                   {130 131};  % slot 23: CSI_RS + SRS
+  21216      6      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21217      7      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21218      8      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21219      9      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21220     10      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21221     11      15       {}   {86 85}   num2cell(1132:1151)                  {};
+  21222     12      15       {}   {86 85}   num2cell(1132:1151)                  {};
+  21223     13      15       {}     {86}    num2cell(1152:1171)                  {};
+  21226     16      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21227     17      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21228     18      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  21229     19      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {};
+  % additional CSI-RS cases
+  21194      0      15       {}     {86}    num2cell([1172:1179, 1120:1131])     {128 129};  % slot 60
+  21195      1      15       {}   {86 85}   num2cell(1132:1151)                  {128 129};  % slot 61
+  21204      3      15       {}     {86}    num2cell(1152:1171)                  {};       % slot 63
+  21205      3      15       {}     {}      {}                                   {132 133};  % slot 23: CSI_RS + SRS
+
+  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz light
+  21230      0      15       {22}   {86}    num2cell(1182:1193)                  {};
+  21231      1      15       {}   {86 85}   num2cell(1194:1205)                  {};
+  21232      2      15       {}   {86 85}   num2cell(1194:1205)                  {};
+  21233      3      15       {}     {86}    num2cell(1206:1217)                  {};
+  21236      6      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21237      7      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21238      8      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21239      9      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21240     10      15       {}   {86 84}   num2cell([1218:1221, 1186:1192, 1222, 1223])   {};  % both 86 and 84 PDDCH is on symbol 0, 1223 is PDSCH for CCH
+  21241     11      15       {}   {86 85}   num2cell(1194:1205)                  {};
+  21242     12      15       {}   {86 85}   num2cell(1194:1205)                  {};
+  21243     13      15       {}     {86}    num2cell(1206:1217)                  {};
+  21246     16      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21247     17      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21248     18      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21249     19      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21250      0      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {128 129};
+  21251      1      15       {}   {86 85}   num2cell(1194:1205)                  {128 129};
+  21252      2      15       {}   {86 85}   num2cell(1194:1205)                  {};
+  21253      3      15       {}      {}     {}                                   {130 131};  % slot 23: CSI_RS + SRS
+  21256      6      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21257      7      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21258      8      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21259      9      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21260     10      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21261     11      15       {}   {86 85}   num2cell(1194:1205)                  {};
+  21262     12      15       {}   {86 85}   num2cell(1194:1205)                  {};
+  21263     13      15       {}     {86}    num2cell(1206:1217)                  {};
+  21266     16      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21267     17      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21268     18      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  21269     19      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {};
+  % additional CSI-RS cases
+  21234      0      15       {}     {86}    num2cell([1218:1221, 1186:1193])     {128 129};  % slot 60
+  21235      1      15       {}   {86 85}   num2cell(1194:1205)                  {128 129};  % slot 61
+  21244      3      15       {}     {86}    num2cell(1206:1217)                  {};       % slot 63
+  21245      3      15       {}     {}      {}                                   {132 133};  % slot 23: CSI_RS + SRS
+
+  % 64TR 25-3 column D 24DL
+  21270      0      10       {22}   {87}    num2cell(2961:2984)           {};
+  21271      1      10       {}   {87 71}   num2cell(2985:3008)           {};
+  21272      2      10       {}   {87 71}   num2cell(2985:3008)           {};
+  21273      3      10       {}     {87}    num2cell(3009:3032)           {};
+  21276      6      10       {}     {87}    num2cell(3033:3056)           {};
+  21277      7      10       {}     {87}    num2cell(3033:3056)           {};
+  21278      8      10       {}     {87}    num2cell(3033:3056)           {};
+  21279      9      10       {}     {87}    num2cell(3033:3056)           {};
+  21280     10      10       {}   {87 70}  num2cell([3057:3080,847])      {};  % both 80 and 70 PDDCH is on symbol 0, 847 is PDSCH for CCH
+  21281     11      10       {}   {87 71}   num2cell(2985:3008)           {};
+  21282     12      10       {}   {87 71}   num2cell(2985:3008)           {};
+  21283     13      10       {}     {87}    num2cell(3009:3032)           {};
+  21286     16      10       {}     {87}    num2cell(3033:3056)           {};
+  21287     17      10       {}     {87}    num2cell(3033:3056)           {};
+  21288     18      10       {}     {87}    num2cell(3033:3056)           {};
+  21289     19      10       {}     {87}    num2cell(3033:3056)           {};
+  21290      0      10       {}     {87}    num2cell(3033:3056)           {82 83};
+  21291      1      10       {}   {87 71}   num2cell(2985:3008)           {82 83};
+  21292      2      10       {}   {87 71}   num2cell(2985:3008)           {};
+  21293      3      10       {}     {}                {}                  {113 114};  % slot 23: CSI_RS + SRS
+  21296      6      10       {}     {87}    num2cell(3033:3056)           {};
+  21297      7      10       {}     {87}    num2cell(3033:3056)           {};
+  21298      8      10       {}     {87}    num2cell(3033:3056)           {};
+  21299      9      10       {}     {87}    num2cell(3033:3056)           {};
+  21300     10      10       {}     {87}    num2cell(3033:3056)           {};
+  21301     11      10       {}   {87 71}   num2cell(2985:3008)           {};
+  21302     12      10       {}   {87 71}   num2cell(2985:3008)           {};
+  21303     13      10       {}     {87}    num2cell(3009:3032)           {};
+  21306     16      10       {}     {87}    num2cell(3033:3056)           {};
+  21307     17      10       {}     {87}    num2cell(3033:3056)           {};
+  21308     18      10       {}     {87}    num2cell(3033:3056)           {};
+  21309     19      10       {}     {87}    num2cell(3033:3056)           {};
+  % additional CSI-RS cases
+  21274      0      10       {}     {87}    num2cell(3033:3056)           {82 83};  % slot 60
+  21275      1      10       {}   {87 71}   num2cell(2985:3008)           {82 83};  % slot 61
+  21284      3      10       {}     {87}    num2cell(3009:3032)           {};       % slot 63
 
       % pattern 5: F08 8C (PDSCH + PDCCH + CSI-RS + PBCH , different RNTIs)
 %       148     0        1      {4}        {3}    num2cell(21:36)  {3};
@@ -4080,7 +4289,31 @@ CFG = {...
     end
     % end pattern 59: 7 beams, 100 MHz (273 PRBs), 20C, peak cell, OTA
 
-    % [7472:7871] are available for future DLMIX TVs
+    %% pattern 101: 1 UE SU-MIMO, 4 layers, MCS 27, 256QAM, PDSCH only, all D slots, 24C
+    % PDSCH: cfg 1224 (1 UE, all D slot)
+                            % TC#  slotIdx   cell    ssb      pdcch      pdsch       csirs
+    row_count = length(CFG);
+    % all D slots, single UE wideband
+    for i = 7472:7495
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         1         {}        {}        {1224}      {}};
+        CellIdxInPatternMap(i) = mod(i-7472, 24);
+    end
+    % end pattern 101: 1 UE SU-MIMO, 4 layers, MCS 27, 256QAM, PDSCH only, 24C
+
+    %% pattern 102: 1 UE SU-MIMO, 4 layers, MCS 27, 256QAM, PDSCH only (reduced PRB), all D slots, 24C
+    % PDSCH: cfg 1225 (1 UE, all D slot, reduced PRB)
+                            % TC#  slotIdx   cell    ssb      pdcch      pdsch       csirs
+    row_count = length(CFG);
+    % all D slots, single UE wideband
+    for i = 7496:7519
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         1         {}        {}        {1225}      {}};
+        CellIdxInPatternMap(i) = mod(i-7496, 24);
+    end
+    % end pattern 102: 1 UE SU-MIMO, 4 layers, MCS 27, 256QAM, PDSCH only (reduced PRB), 24C
+                  
+    % [7520:7871] are available for future DLMIX TVs
 
                             % TC#  slotIdx   cell    ssb      pdcch      pdsch       csirs
     %% pattern 60: 7 beams, 100 MHz (273 PRBs), 40C, ave cell, OTA, disjoint PDSCH and CSIRS
@@ -4621,7 +4854,7 @@ CFG = {...
     % slot {20}, TRS index 0/0, CSIRS index 1~4
     for i = 11312:11326
         row_count = row_count + 1;
-        CellIdxInPatternMap(i) = mod(i-11252, 15);        
+        CellIdxInPatternMap(i) = mod(i-11252, 15);
         if mod(CellIdxInPatternMap(i),2) == 0  % even cell: trs symbol 5,9, csi-rs on symbol 13
             CFG(row_count, 1:7) = { i    0        10      {}        {64}     num2cell(674:681)     {82 83 84}};
         else  % odd cell: trs symbol 6,10, csi-rs on symbol 12
@@ -4661,7 +4894,7 @@ CFG = {...
     for i = 12232:12246
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {23}        {75}    num2cell(719:734)    {}};
-        SsbBeamIdxMap(i) = [0 1 2 3] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [0 1 2 3];
         CellIdxInPatternMap(i) = mod(i-12232, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -4669,7 +4902,7 @@ CFG = {...
     for i = 12247:12261
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {24}        {75,74}    num2cell(735:750)    {}};
-        SsbBeamIdxMap(i) = [4 5 6 7] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [4 5 6 7];
         CellIdxInPatternMap(i) = mod(i-12232, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -4677,7 +4910,7 @@ CFG = {...
     for i = 12262:12276
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {25}        {75,74}    num2cell(735:750)    {}};
-        SsbBeamIdxMap(i) = [8 9 10 11] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [8 9 10 11];
         CellIdxInPatternMap(i) = mod(i-12232, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -4824,7 +5057,7 @@ CFG = {...
     for i = 12442:12461
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        11      {23}        {69}    num2cell(767:782)    {}};
-        SsbBeamIdxMap(i) = [0 1 2 3] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [0 1 2 3];
         CellIdxInPatternMap(i) = mod(i-12442, 20);
         pdschDynamicBfMap(i) = 1;
     end
@@ -4832,7 +5065,7 @@ CFG = {...
     for i = 12462:12481
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        11      {24}        {69,68}    num2cell(783:798)    {}};
-        SsbBeamIdxMap(i) = [4 5 6 7] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [4 5 6 7];
         CellIdxInPatternMap(i) = mod(i-12442, 20);
         pdschDynamicBfMap(i) = 1;
     end
@@ -4840,7 +5073,7 @@ CFG = {...
     for i = 12482:12501
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        11      {25}        {69,68}    num2cell(783:798)    {}};
-        SsbBeamIdxMap(i) = [8 9 10 11] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [8 9 10 11];
         CellIdxInPatternMap(i) = mod(i-12442, 20);
         pdschDynamicBfMap(i) = 1;
     end
@@ -4987,7 +5220,7 @@ CFG = {...
     for i = 12722:12736
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {23}        {75}    num2cell(2001:2064)    {}};
-        SsbBeamIdxMap(i) = [0 1 2 3] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [0 1 2 3];
         CellIdxInPatternMap(i) = mod(i-12722, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -4995,7 +5228,7 @@ CFG = {...
     for i = 12737:12751
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {24}        {75,74}    num2cell(2065:2128)    {}};
-        SsbBeamIdxMap(i) = [4 5 6 7] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [4 5 6 7];
         CellIdxInPatternMap(i) = mod(i-12722, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -5003,7 +5236,7 @@ CFG = {...
     for i = 12752:12766
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {25}        {75,74}    num2cell(2065:2128)    {}};
-        SsbBeamIdxMap(i) = [8 9 10 11] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [8 9 10 11];
         CellIdxInPatternMap(i) = mod(i-12722, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -5150,7 +5383,7 @@ CFG = {...
     for i = 12932:12946
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {22}        {72}    num2cell(2321:2336)    {}};
-        SsbBeamIdxMap(i) = [0 1 2 3] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [0 1 2 3];
         CellIdxInPatternMap(i) = mod(i-12932, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -5186,7 +5419,7 @@ CFG = {...
     % slot {13} is the same with {3}
     % slot {16,17,18,19} is the same with {6,7,8,9}
     %%%%% frame 1:  
-    % slot {20}, TRS index 0/0, CSIRS index 1~4
+    % slot {20}, TRS + CSIRS, TRS index 0/0, CSIRS index 1~4
     for i = 13007:13021
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-12932, 15);        
@@ -5200,7 +5433,7 @@ CFG = {...
         CsiZpBeamIdxMap(i) = [5, 6, 7, 8];
         pdschDynamicBfMap(i) = 1;        
     end
-    % slot {21}, TRS + CSIRS, TRS index 9/9
+    % slot {21}, TRS, TRS index 9/9
     for i = 13022:13036
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-12932, 15);
@@ -5228,7 +5461,7 @@ CFG = {...
     % slot {53} is the same with {3}
     % slot {56,57,58,59} is the same with {6,7,8,9}
     %%%%% frame 3: 
-    % slot {60}, TRS index 10/10
+    % slot {60}, TRS, TRS index 10/10
     for i = 13037:13051
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-12932, 15);
@@ -5240,7 +5473,7 @@ CFG = {...
         TrsBeamIdxMap(i) = 10;
         pdschDynamicBfMap(i) = 1;
     end
-    % slot {61}, TRS + CSIRS, TRS index 11/11
+    % slot {61}, TRS, TRS index 11/11
     for i = 13052:13066
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-12932, 15);
@@ -5267,7 +5500,7 @@ CFG = {...
     for i = 13067:13081
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {22}        {72}    num2cell(2321:2336)    {}};
-        SsbBeamIdxMap(i) = [0 1 2 3] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [0 1 2 3];
         CellIdxInPatternMap(i) = mod(i-13067, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -5303,7 +5536,7 @@ CFG = {...
     % slot {13} is the same with {3}
     % slot {16,17,18,19} is the same with {6,7,8,9}
     %%%%% frame 1:  
-    % slot {20}, TRS index 0/0
+    % slot {20}, TRS, TRS index 0
     for i = 13142:13156
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13067, 15);        
@@ -5312,7 +5545,7 @@ CFG = {...
         TrsBeamIdxMap(i) = 0;
         pdschDynamicBfMap(i) = 1;        
     end
-    % slot {21}, TRS, TRS index 1/1
+    % slot {21}, TRS, TRS index 1
     for i = 13157:13171
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13067, 15);
@@ -5322,14 +5555,14 @@ CFG = {...
         pdschDynamicBfMap(i) = 1;
     end
     % slot {22} is the same with {1,2}
-    % slot {23}, NZP CSI-RS index 2~9/2~9, CSI_RS ZP index 10~13
+    % slot {23}, NZP CSI-RS index 4~11, CSI_RS ZP index 12~15
     for i = 13172:13186
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13067, 15);        
         % all cells: NZP csi-rs on symbol 4,5, ZP csi-rs on symbol 2,3
         CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {113 114}};
-        CsiBeamIdxMap(i) = [2, 3, 4, 5, 6, 7, 8, 9];
-        CsiZpBeamIdxMap(i) = [10, 11, 12, 13];
+        CsiBeamIdxMap(i) = [4, 5, 6, 7, 8, 9, 10, 11];
+        CsiZpBeamIdxMap(i) = [12, 13, 14, 15];
         pdschDynamicBfMap(i) = 1;        
     end
     % slot {26,27,28,29,30} is the same with {6,7,8,9}
@@ -5346,22 +5579,22 @@ CFG = {...
     % slot {53} is the same with {3}
     % slot {56,57,58,59} is the same with {6,7,8,9}
     %%%%% frame 3: 
-    % slot {60}, TRS index 14/14
+    % slot {60}, TRS, TRS index 2
     for i = 13187:13201
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13067, 15);
         % all cells: trs symbol 5,9
         CFG(row_count, 1:7) = { i    0        10      {}         {72}      num2cell(2369:2384)     {82 83}};
-        TrsBeamIdxMap(i) = 14;
+        TrsBeamIdxMap(i) = 2;
         pdschDynamicBfMap(i) = 1;
     end
-    % slot {61}, TRS, TRS index 15/15
+    % slot {61}, TRS, TRS index 3
     for i = 13202:13216
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13067, 15);
         % all cells: trs symbol 5,9
         CFG(row_count, 1:7) = { i    0        10      {}        {72,71}     num2cell(2337:2352)     {82 83}};
-        TrsBeamIdxMap(i) = 15;
+        TrsBeamIdxMap(i) = 3;
         pdschDynamicBfMap(i) = 1;
     end
     % slot {63} is the same with {3}
@@ -5379,7 +5612,7 @@ CFG = {...
     for i = 13217:13231
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {22}        {72}    num2cell(2321:2336)    {}};
-        SsbBeamIdxMap(i) = [0 1 2 3] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [0 1 2 3];
         CellIdxInPatternMap(i) = mod(i-13217, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -5415,7 +5648,7 @@ CFG = {...
     % slot {13} is the same with {3}
     % slot {16,17,18,19} is the same with {6,7,8,9}
     %%%%% frame 1:  
-    % slot {20}, TRS index 0/0
+    % slot {20}, TRS, TRS index 0
     for i = 13292:13306
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13217, 15);        
@@ -5424,7 +5657,7 @@ CFG = {...
         TrsBeamIdxMap(i) = 0;
         pdschDynamicBfMap(i) = 1;        
     end
-    % slot {21}, TRS, TRS index 1/1
+    % slot {21}, TRS, TRS index 1
     for i = 13307:13321
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13217, 15);
@@ -5434,7 +5667,7 @@ CFG = {...
         pdschDynamicBfMap(i) = 1;
     end
     % slot {22} is the same with {1,2}
-    % slot {23}, NZP CSI-RS index 2~9/2~9, CSI_RS ZP index 10~13, for pattern 81 a/b
+    % slot {23}, NZP CSI-RS index 2~9, CSI_RS ZP index 10~13, for pattern 81 a/b
     for i = 13322:13336
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13217, 15);        
@@ -5458,7 +5691,7 @@ CFG = {...
     % slot {53} is the same with {3}
     % slot {56,57,58,59} is the same with {6,7,8,9}
     %%%%% frame 3: 
-    % slot {60}, TRS index 38/38
+    % slot {60}, TRS, TRS index 38
     for i = 13337:13351
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13217, 15);
@@ -5467,7 +5700,7 @@ CFG = {...
         TrsBeamIdxMap(i) = 38;
         pdschDynamicBfMap(i) = 1;
     end
-    % slot {61}, TRS, TRS index 39/39
+    % slot {61}, TRS, TRS index 39
     for i = 13352:13366
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13217, 15);
@@ -5481,16 +5714,16 @@ CFG = {...
     % slot {71,72} is the same with {1,2}
     % slot {73} is the same with {3}
     % slot {76,77,78,79} is the same with {6,7,8,9}
-    % slot {23}, NZP CSI-RS index 2~33/2~33, CSI_RS ZP index 34~37, for pattern 81 c/d
+    % slot {23}, NZP CSI-RS index 2~41, CSI_RS ZP index 42~45, for pattern 81 c/d
     for i = 13367:13381
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13217, 15);        
         % all cells: NZP csi-rs on symbol 2,3,4,5, ZP csi-rs on symbol 2,3
-        CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {119 120 121 114}};
-        CsiBeamIdxMap(i) = [2:33];
-        CsiZpBeamIdxMap(i) = [34:37];
+        CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {119 120 114}};
+        CsiBeamIdxMap(i) = [2:41];  % 8 ports + 32 ports = 40 ports
+        CsiZpBeamIdxMap(i) = [42:45];
         pdschDynamicBfMap(i) = 1;    
-        enableCsiRs32PortsMap(i) = 1;    
+        enableCsiRs32PortsMap(i) = 1;
     end
     % end pattern 81: 64TR peak, 100 MHz (273 PRBs), OTA, 64TR 25-3 column B TC, 15C
 
@@ -5502,7 +5735,7 @@ CFG = {...
     for i = 13382:13396
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {22}        {72}    num2cell(2401:2464)    {}};
-        SsbBeamIdxMap(i) = [0 1 2 3] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [0 1 2 3];
         CellIdxInPatternMap(i) = mod(i-13382, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -5538,7 +5771,7 @@ CFG = {...
     % slot {13} is the same with {3}
     % slot {16,17,18,19} is the same with {6,7,8,9}
     %%%%% frame 1:  
-    % slot {20}, TRS index 0/0
+    % slot {20}, TRS, TRS index 0
     for i = 13457:13471
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13382, 15);        
@@ -5547,7 +5780,7 @@ CFG = {...
         TrsBeamIdxMap(i) = 0;
         pdschDynamicBfMap(i) = 1;        
     end
-    % slot {21}, TRS + CSIRS, TRS index 1/1
+    % slot {21}, TRS, TRS index 1
     for i = 13472:13486
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13382, 15);
@@ -5557,7 +5790,7 @@ CFG = {...
         pdschDynamicBfMap(i) = 1;
     end
     % slot {22} is the same with {1,2}
-    % slot {23}, NZP CSI-RS index 2~9/2~9, CSI_RS ZP index 10~13, for pattern 83 a/b
+    % slot {23}, NZP CSI-RS index 2~9, CSI_RS ZP index 10~13, for pattern 83 a/b
     for i = 13487:13501
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13382, 15);        
@@ -5581,7 +5814,7 @@ CFG = {...
     % slot {53} is the same with {3}
     % slot {56,57,58,59} is the same with {6,7,8,9}
     %%%%% frame 3: 
-    % slot {60}, TRS index 38/38
+    % slot {60}, TRS, TRS index 38
     for i = 13502:13516
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13382, 15);
@@ -5590,7 +5823,7 @@ CFG = {...
         TrsBeamIdxMap(i) = 38;
         pdschDynamicBfMap(i) = 1;
     end
-    % slot {61}, TRS + CSIRS, TRS index 39/39
+    % slot {61}, TRS, TRS index 39
     for i = 13517:13531
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13382, 15);
@@ -5604,15 +5837,15 @@ CFG = {...
     % slot {71,72} is the same with {1,2}
     % slot {73} is the same with {3}
     % slot {76,77,78,79} is the same with {6,7,8,9}
-    % slot {23}, NZP CSI-RS index 2~33/2~33, CSI_RS ZP index 34~37, for pattern 83 c/d
+    % slot {23}, NZP CSI-RS index 2~41, CSI_RS ZP index 42~45, for pattern 83 c/d
     for i = 13532:13546
         row_count = row_count + 1;
         CellIdxInPatternMap(i) = mod(i-13382, 15);        
         % all cells: NZP csi-rs on symbol 2,3,4,5, ZP csi-rs on symbol 2,3
-        CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {119 120 121 114}};
-        CsiBeamIdxMap(i) = [2:33];
-        CsiZpBeamIdxMap(i) = [34:37];
-        enableCsiRs32PortsMap(i) = 1;    
+        CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {119 120 114}};
+        CsiBeamIdxMap(i) = [2:41];  % 8 ports + 32 ports = 40 ports
+        CsiZpBeamIdxMap(i) = [42:45];
+        enableCsiRs32PortsMap(i) = 1;
     end
     % end pattern 83: 64TR peak, 100 MHz (273 PRBs), OTA, 64TR 25-3 column G TC, 15C, 64 UEs per TTI
     
@@ -5624,7 +5857,7 @@ CFG = {...
     for i = 13547:13561
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    0        10      {22}        {80}    num2cell(2721:2752)    {}};
-        SsbBeamIdxMap(i) = [0 1 2 3] + beamIdx_ssb_static(1);
+        SsbBeamIdxMap(i) = [0 1 2 3];
         CellIdxInPatternMap(i) = mod(i-13547, 15);
         pdschDynamicBfMap(i) = 1;
     end
@@ -5728,6 +5961,451 @@ CFG = {...
     % slot {76,77,78,79} is the same with {6,7,8,9}
     % end pattern 85: 64TR peak, 100 MHz (273 PRBs), OTA, 25-3 column E TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEGs, 8 UEs per slot, 1 layer per UE, 32 DL layer with more PUCCH, SRS in S slot (2 symbols)
 
+    % pattern 87: 64TR peak, 100 MHz (273 PRBs), OTA, 64TR worst case Ph4 column B TC, 32 port CSI-RS, 15C, based on 90641
+    % reuse all TVs from pattern 79 except for slot {23} with NZP+ZP CSI-RS
+    % pattern 79 is 8 port and pattern 87 is 32 port
+    % slot {23}, NZP CSI-RS index 4~35, CSI_RS ZP index 36~67
+    for i = 13697:13711
+        row_count = row_count + 1;
+        CellIdxInPatternMap(i) = mod(i-13067, 15);        
+        % all cells: NZP csi-rs on symbol 4,5, ZP csi-rs on symbol 2,3
+        CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {115 116}};
+        CsiBeamIdxMap(i) = [4:35];
+        CsiZpBeamIdxMap(i) = [36:67];
+        enableCsiRs32PortsMap(i) = 1;
+    end
+    % end pattern 87: 64TR peak, 100 MHz (273 PRBs), OTA, 64TR worst case Ph4 column B TC, 32 port CSI-RS, 15C, based on 90641
+
+                                    % TC#  slotIdx   cell    ssb      pdcch      pdsch       csirs
+    %% pattern 89: 64TR peak, Mixed 100 MHz (273 PRBs) + 90 MHz (244 PRBs) + 60 MHz (160 PRBs), OTA, realistic traffic, 9C, PUSCH CP-OFDM, Mixed PUCCH F1/F3. Based on 90655,90656,90658~90661
+    row_count = length(CFG);
+    
+    %%%%% frame 0:
+    % slot {0}, SSB + PDCCH + PDSCH set 0
+    for i = 13712:13720
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {22}   {72}    num2cell(888:907)     {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {22}   {72}    num2cell(958:969)     {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {22}   {72}    num2cell(958:969)     {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {22}   {83}    num2cell(1000:1019)   {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {22}   {83}    num2cell(1070:1081)   {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {22}   {83}    num2cell(1070:1081)   {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {22}   {86}    num2cell(1112:1131)   {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {22}   {86}    num2cell(1182:1193)   {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {22}   {86}    num2cell(1182:1193)   {}};
+        end
+        SsbBeamIdxMap(i) = [0 1 2 3];
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    
+    % slot {1,2}, PDCCH + PDSCH set 1
+    for i = 13721:13729
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10       {}   {72 71}    num2cell(908:927)     {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10       {}   {72 71}    num2cell(970:981)     {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10       {}   {72 71}    num2cell(970:981)     {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14       {}   {83 82}    num2cell(1020:1039)   {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14       {}   {83 82}    num2cell(1082:1093)   {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14       {}   {83 82}    num2cell(1082:1093)   {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15       {}   {86 85}    num2cell(1132:1151)   {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15       {}   {86 85}    num2cell(1194:1205)   {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15       {}   {86 85}    num2cell(1194:1205)   {}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    
+    % slot {3}, PDCCH + PDSCH set 2
+    for i = 13730:13738
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell(928:947)     {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell(982:993)     {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell(982:993)     {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell(1040:1059)   {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell(1094:1105)   {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell(1094:1105)   {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell(1152:1171)   {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell(1206:1217)   {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell(1206:1217)   {}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    
+    % slot {6,7,8,9}, PDCCH + PDSCH set 3
+    for i = 13739:13747
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([948:955, 896:907])         {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([994:997, 962:969])         {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([994:997, 962:969])         {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1060:1067, 1008:1019])     {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1106:1109, 1074:1081])     {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1106:1109, 1074:1081])     {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1172:1179, 1120:1131])     {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1218:1221, 1186:1193])     {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1218:1221, 1186:1193])     {}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    
+    % slot {10}, PDCCH + CCH PDSCH
+    for i = 13748:13756
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 70}   num2cell([948:955, 896:906, 956, 957])         {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 70}   num2cell([994:997, 962:968, 998, 999])         {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 70}   num2cell([994:997, 962:968, 998, 999])         {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 81}   num2cell([1060:1067, 1008:1018, 1068, 1069])   {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 81}   num2cell([1106:1109, 1074:1080, 1110, 1111])   {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 81}   num2cell([1106:1109, 1074:1080, 1110, 1111])   {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 84}   num2cell([1172:1179, 1120:1130, 1180, 1181])   {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 84}   num2cell([1218:1221, 1186:1192, 1222, 1223])   {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 84}   num2cell([1218:1221, 1186:1192, 1222, 1223])   {}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {11,12} is the same with {1,2}
+    % slot {13} is the same with {3}
+    % slot {16,17,18,19} is the same with {6,7,8,9}
+    
+    %%%%% frame 1:
+    % slot {20}, TRS, TRS index 0
+    for i = 13757:13765
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([948:955, 896:907])         {82 83}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([994:997, 962:969])         {82 83}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([994:997, 962:969])         {82 83}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1060:1067, 1008:1019])     {122 123}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1106:1109, 1074:1081])     {122 123}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1106:1109, 1074:1081])     {122 123}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1172:1179, 1120:1131])     {128 129}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1218:1221, 1186:1193])     {128 129}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1218:1221, 1186:1193])     {128 129}};
+        end
+        TrsBeamIdxMap(i) = 0;
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    
+    % slot {21}, TRS, TRS index 1
+    for i = 13766:13774
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 71}     num2cell(908:927)       {82 83}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 71}     num2cell(970:981)       {82 83}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 71}     num2cell(970:981)       {82 83}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 82}     num2cell(1020:1039)     {122 123}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 82}     num2cell(1082:1093)     {122 123}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 82}     num2cell(1082:1093)     {122 123}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 85}     num2cell(1132:1151)     {128 129}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 85}     num2cell(1194:1205)     {128 129}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 85}     num2cell(1194:1205)     {128 129}};
+        end
+        TrsBeamIdxMap(i) = 1;
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {22} is the same with {1,2}
+    
+    % slot {23}, NZP CSI-RS, CSI_RS ZP
+    for i = 13775:13783
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {113 114}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {113 114}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {113 114}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {}          {}         {}     {124 125}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}          {}         {}     {124 125}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}          {}         {}     {124 125}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {}          {}         {}     {130 131}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}          {}         {}     {130 131}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}          {}         {}     {130 131}};
+        end
+        CsiBeamIdxMap(i) = [4, 5, 6, 7, 8, 9, 10, 11];
+        CsiZpBeamIdxMap(i) = [12, 13, 14, 15];
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {26,27,28,29,30} is the same with {6,7,8,9}
+    % slot {31,32} is the same with {1,2}
+    % slot {33} is the same with {3}
+    % slot {36,37,38,39} is the same with {6,7,8,9}
+    
+    %%%%% frame 2:
+    % slot {40} is the same with {0}
+    % slot {41,42} is the same with {1,2}
+    % slot {43} is the same with {3}
+    % slot {46,47,48,49} is the same with {6,7,8,9}
+    % slot {50} is the same with {10}
+    % slot {51,52} is the same with {1,2}
+    % slot {53} is the same with {3}
+    % slot {56,57,58,59} is the same with {6,7,8,9}
+    
+    %%%%% frame 3:
+    % slot {60}, TRS, TRS index 2
+    for i = 13784:13792
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([948:955, 896:907])         {82 83}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([994:997, 962:969])         {82 83}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72}     num2cell([994:997, 962:969])         {82 83}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1060:1067, 1008:1019])     {122 123}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1106:1109, 1074:1081])     {122 123}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83}     num2cell([1106:1109, 1074:1081])     {122 123}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1172:1179, 1120:1131])     {128 129}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1218:1221, 1186:1193])     {128 129}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86}     num2cell([1218:1221, 1186:1193])     {128 129}};
+        end
+        TrsBeamIdxMap(i) = 2;
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    
+    % slot {61}, TRS, TRS index 3
+    for i = 13793:13801
+        row_count = row_count + 1;
+        cellIdx = mod(i-13712, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 71}     num2cell(908:927)       {82 83}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 71}     num2cell(970:981)       {82 83}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0        10      {}   {72 71}     num2cell(970:981)       {82 83}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 82}     num2cell(1020:1039)     {122 123}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 82}     num2cell(1082:1093)     {122 123}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0        14      {}   {83 82}     num2cell(1082:1093)     {122 123}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 85}     num2cell(1132:1151)     {128 129}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 85}     num2cell(1194:1205)     {128 129}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0        15      {}   {86 85}     num2cell(1194:1205)     {128 129}};
+        end
+        TrsBeamIdxMap(i) = 3;
+        CellIdxInPatternMap(i) = cellIdx;
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {63} is the same with {3}
+    % slot {66,67,68,69,70} is the same with {6,7,8,9}
+    % slot {71,72} is the same with {1,2}
+    % slot {73} is the same with {3}
+    % slot {76,77,78,79} is the same with {6,7,8,9}
+    % end pattern 89: 64TR peak, Mixed 100 MHz (273 PRBs) + 90 MHz (244 PRBs) + 60 MHz (160 PRBs), OTA, realistic traffic, 9C, PUSCH CP-OFDM, Mixed PUCCH F1/F3. Based on 90655,90656,90658~90661
+
+                                % TC#  slotIdx   cell    ssb      pdcch      pdsch       csirs
+    %% pattern 91: 64TR peak, 100 MHz (273 PRBs), OTA, 25-3 column D TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEGs, 8 UEs per slot, 1 layer per UE, 24 DL layer with more PUCCH, SRS in S slot (2 symbols)
+    row_count = length(CFG); 
+    %%%%% frame 0:         
+    % slot {0}, 4 ssb, index 0~3   
+    for i = 13802:13816
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0        10      {22}        {87}    num2cell(2961:2984)    {}};
+        SsbBeamIdxMap(i) = [0 1 2 3];
+        CellIdxInPatternMap(i) = mod(i-13802, 15);
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {1,2} 
+    for i = 13817:13831
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0        10       {}         {87,71}    num2cell(2985:3008)    {}};
+        CellIdxInPatternMap(i) = mod(i-13802, 15);
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {3}
+    for i = 13832:13846
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0        10      {}        {87}     num2cell(3009:3032)     {}};
+        CellIdxInPatternMap(i) = mod(i-13802, 15);
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {6,7,8,9}
+    for i = 13847:13861
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0        10      {}        {87}     num2cell(3033:3056)     {}};
+        CellIdxInPatternMap(i) = mod(i-13802, 15);
+        pdschDynamicBfMap(i) = 1;
+    end 
+    % slot {10}
+    for i = 13862:13876
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0        10      {}       {87,70}    num2cell([3057:3080,847])     {}};
+        CellIdxInPatternMap(i) = mod(i-13802, 15);
+        pdschDynamicBfMap(i) = 1;
+    end 
+    % slot {11,12} is the same with {1,2}
+    % slot {13} is the same with {3}
+    % slot {16,17,18,19} is the same with {6,7,8,9}
+    %%%%% frame 1:  
+    % slot {20}, TRS, TRS index 0
+    for i = 13877:13891
+        row_count = row_count + 1;
+        CellIdxInPatternMap(i) = mod(i-13802, 15);        
+        % all cells: trs symbol 5,9
+        CFG(row_count, 1:7) = { i    0        10      {}        {87}     num2cell(3033:3056)     {82 83}};
+        TrsBeamIdxMap(i) = 0;
+        pdschDynamicBfMap(i) = 1;        
+    end
+    % slot {21}, TRS, TRS index 1
+    for i = 13892:13906
+        row_count = row_count + 1;
+        CellIdxInPatternMap(i) = mod(i-13802, 15);
+        % all cells: trs symbol 5,9
+        CFG(row_count, 1:7) = { i    0        10      {}        {87,71}     num2cell(2985:3008)     {82 83}};
+        TrsBeamIdxMap(i) = 1;
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {22} is the same with {1,2}
+    % slot {23}, NZP CSI-RS index 2~9, CSI_RS ZP index 10~13
+    for i = 13907:13921
+        row_count = row_count + 1;
+        CellIdxInPatternMap(i) = mod(i-13802, 15);        
+        % all cells: NZP csi-rs on symbol 4,5, ZP csi-rs on symbol 2,3
+        CFG(row_count, 1:7) = { i    0        10      {}          {}         {}     {113 114}};
+        CsiBeamIdxMap(i) = [2, 3, 4, 5, 6, 7, 8, 9];
+        CsiZpBeamIdxMap(i) = [10, 11, 12, 13];
+        pdschDynamicBfMap(i) = 1;        
+    end
+    % slot {26,27,28,29,30} is the same with {6,7,8,9}
+    % slot {31,32} is the same with {1,2}
+    % slot {33} is the same with {3}
+    % slot {36,37,38,39} is the same with {6,7,8,9}
+    %%%%% frame 2: 
+    % slot {40} is the same with {0}
+    % slot {41,42} is the same with {1,2}
+    % slot {43} is the same with {3}
+    % slot {46,47,48,49} is the same with {6,7,8,9}
+    % slot {50} is the same with {10}
+    % slot {51,52} is the same with {1,2}
+    % slot {53} is the same with {3}
+    % slot {56,57,58,59} is the same with {6,7,8,9}
+    %%%%% frame 3: 
+    % slot {60}, TRS, TRS index 14
+    for i = 13922:13936
+        row_count = row_count + 1;
+        CellIdxInPatternMap(i) = mod(i-13802, 15);
+        % all cells: trs symbol 5,9
+        CFG(row_count, 1:7) = { i    0        10      {}         {87}      num2cell(3033:3056)     {82 83}};
+        TrsBeamIdxMap(i) = 14;
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {61}, TRS, TRS index 15
+    for i = 13937:13951
+        row_count = row_count + 1;
+        CellIdxInPatternMap(i) = mod(i-13802, 15);
+        % all cells: trs symbol 5,9
+        CFG(row_count, 1:7) = { i    0        10      {}        {87,71}     num2cell(2985:3008)     {82 83}};
+        TrsBeamIdxMap(i) = 15;
+        pdschDynamicBfMap(i) = 1;
+    end
+    % slot {63} is the same with {3}
+    % slot {66,67,68,69,70} is the same with {6,7,8,9}
+    % slot {71,72} is the same with {1,2}
+    % slot {73} is the same with {3}
+    % slot {76,77,78,79} is the same with {6,7,8,9}
+    % end pattern 91: 64TR peak, 100 MHz (273 PRBs), OTA, 25-3 column D TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEGs, 8 UEs per slot, 1 layer per UE, 24 DL layer with more PUCCH, SRS in S slot (2 symbols)
+
     % NOTE: use getLargestTvNum(CFG, threshold) to see the current largest DLMIX TV numbers for <threshold and >= threshold
     %       Search for "available for future DLMIX TVs" to find the avaiable DLMIX TV numbers smaller than that
     largestTvNum = getLargestTvNum(CFG, 20000);
@@ -5775,6 +6453,10 @@ CFG_Cell = {...
     % 64TR
     1      273            41        8      64;    % 12
     1      273            41        4      64;    % 13
+    % 64TR 90 MHz
+    1      244            41       16      64;    % 14
+    % 64TR 60 MHz
+    1      160            41       16      64;    % 15
     };
 
 CFG_SSB = {...
@@ -5931,6 +6613,16 @@ CFG_PDCCH = { ...
    79, 273,   0,   0,    1,    2,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0},       {2 2 2 2},   {39},   {ones(1, 46)};
 % PDCCH DCI1_1x32   
    80, 273,   0,   0,    1,    1,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0}, num2cell(ones(1,32)), {39},   {[zeros(1,8) ones(1, 38)]};  % PDCCH for DL
+% 64TR realistic traffic with Center/Middle/Edge, 90 MHz heavy / light
+   81, 244,   0,   0,    1,    1,    0,    6,    0,   0,      1,    1,        {0},        {41},  {0}, {8},                  {39},   {[ones(1,8) zeros(1, 32)]};  % PDCCH for CCH
+   82, 244,   0,   1,    1,    2,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0}, num2cell(ones(1,8)),  {39},   {ones(1, 40)};  % PDCCH for UL
+   83, 244,   0,   0,    1,    1,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0}, num2cell(ones(1,16)), {39},   {[zeros(1,8) ones(1, 32)]};  % PDCCH for DL
+% 64TR realistic traffic with Center/Middle/Edge, 60 MHz heavy / light
+   84, 160,   0,   0,    1,    1,    0,    6,    0,   0,      1,    1,        {0},        {41},  {0}, {8},                  {39},   {[ones(1,8) zeros(1, 19)]};  % PDCCH for CCH
+   85, 160,   0,   1,    1,    2,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0}, num2cell(ones(1,8)),  {39},   {ones(1, 27)};  % PDCCH for UL
+   86, 160,   0,   0,    1,    1,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0}, num2cell(ones(1,16)), {39},   {[zeros(1,8) ones(1, 19)]};  % PDCCH for DL
+   % PDCCH DCI1_1x24   
+   87, 273,   0,   0,    1,    1,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0}, num2cell(ones(1,24)), {39},   {[zeros(1,8) ones(1, 38)]};  % PDCCH for DL
    };
 % NOTE: For HARQ test cases, coresetMap will be overwritting based on aggregation level (using mapOnes and mapZeros)
 
@@ -7132,67 +7824,316 @@ CFG_PDSCH = {...
     959,  1,     19,   2,   20,   76,  1,   13,     0,    0,    273,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
     960,  1,     19,   2,   20,   76,  1,   13,     0,    0,    273,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
     961,  1,     19,   2,   20,   76,  1,   13,     0,    0,    273,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
-    962,  1,     19,   2,   20,   76,  1,   13,     1,    0,    273,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
-    963,  1,     19,   2,   20,   76,  1,   13,     1,    0,    273,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
-    964,  1,     19,   2,   20,   76,  1,   13,     1,    0,    273,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
-    965,  1,     19,   2,   20,   76,  1,   13,     1,    0,    273,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
-    966,  1,     10,   2,   96,   40,  1,   13,     0,    0,    273,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
-    967,  1,     10,   2,   96,   40,  1,   13,     0,    0,    273,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
-    968,  1,     10,   2,  136,   40,  1,   13,     0,    0,    273,    17,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
-    969,  1,     10,   2,  136,   40,  1,   13,     0,    0,    273,    18,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
-    970,  1,      4,   1,  176,   24,  1,   13,     0,    0,    273,    19,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
-    971,  1,      4,   1,  200,   24,  1,   13,     0,    0,    273,    20,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
-    972,  1,      4,   1,  224,   24,  1,   13,     0,    0,    273,    21,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
-    973,  1,      4,   1,  248,   25,  1,   13,     0,    0,    273,    22,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    962,  1,     10,   2,   96,   40,  1,   13,     0,    0,    273,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+    963,  1,     10,   2,   96,   40,  1,   13,     0,    0,    273,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+    964,  1,     10,   2,  136,   40,  1,   13,     0,    0,    273,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+    965,  1,     10,   2,  136,   40,  1,   13,     0,    0,    273,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+    966,  1,      4,   1,  176,   24,  1,   13,     0,    0,    273,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+    967,  1,      4,   1,  200,   24,  1,   13,     0,    0,    273,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+    968,  1,      4,   1,  224,   24,  1,   13,     0,    0,    273,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+    969,  1,      4,   1,  248,   25,  1,   13,     0,    0,    273,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
     % PDSCH set 1: PRB 0~272, OFDM symbol 2~13, 100 MHz light
-    974,  1,     19,   2,    0,   96,  2,   12,     0,    0,    273,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
-    975,  1,     19,   2,    0,   96,  2,   12,     0,    0,    273,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
-    976,  1,     19,   2,    0,   96,  2,   12,     0,    0,    273,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
-    977,  1,     19,   2,    0,   96,  2,   12,     0,    0,    273,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
-    978,  1,     19,   2,    0,   96,  2,   12,     1,    0,    273,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
-    979,  1,     19,   2,    0,   96,  2,   12,     1,    0,    273,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
-    980,  1,     19,   2,    0,   96,  2,   12,     1,    0,    273,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
-    981,  1,     19,   2,    0,   96,  2,   12,     1,    0,    273,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
-    982,  1,     10,   2,   96,   40,  2,   12,     0,    0,    273,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
-    983,  1,     10,   2,   96,   40,  2,   12,     0,    0,    273,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
-    984,  1,     10,   2,  136,   40,  2,   12,     0,    0,    273,    17,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
-    985,  1,     10,   2,  136,   40,  2,   12,     0,    0,    273,    18,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
-    986,  1,      4,   1,  176,   24,  2,   12,     0,    0,    273,    19,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
-    987,  1,      4,   1,  200,   24,  2,   12,     0,    0,    273,    20,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
-    988,  1,      4,   1,  224,   24,  2,   12,     0,    0,    273,    21,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
-    989,  1,      4,   1,  248,   25,  2,   12,     0,    0,    273,    22,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    970,  1,     19,   2,    0,   96,  2,   12,     0,    0,    273,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+    971,  1,     19,   2,    0,   96,  2,   12,     0,    0,    273,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+    972,  1,     19,   2,    0,   96,  2,   12,     0,    0,    273,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+    973,  1,     19,   2,    0,   96,  2,   12,     0,    0,    273,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+    974,  1,     10,   2,   96,   40,  2,   12,     0,    0,    273,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+    975,  1,     10,   2,   96,   40,  2,   12,     0,    0,    273,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+    976,  1,     10,   2,  136,   40,  2,   12,     0,    0,    273,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+    977,  1,     10,   2,  136,   40,  2,   12,     0,    0,    273,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+    978,  1,      4,   1,  176,   24,  2,   12,     0,    0,    273,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+    979,  1,      4,   1,  200,   24,  2,   12,     0,    0,    273,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+    980,  1,      4,   1,  224,   24,  2,   12,     0,    0,    273,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+    981,  1,      4,   1,  248,   25,  2,   12,     0,    0,    273,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
     % PDSCH set 2: PRB 0~272, OFDM symbol 1~5, 100 MHz light
-    990,  1,     19,   2,    0,   96,  1,    5,     0,    0,    273,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
-    991,  1,     19,   2,    0,   96,  1,    5,     0,    0,    273,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
-    992,  1,     19,   2,    0,   96,  1,    5,     0,    0,    273,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
-    993,  1,     19,   2,    0,   96,  1,    5,     0,    0,    273,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
-    994,  1,     19,   2,    0,   96,  1,    5,     1,    0,    273,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
-    995,  1,     19,   2,    0,   96,  1,    5,     1,    0,    273,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
-    996,  1,     19,   2,    0,   96,  1,    5,     1,    0,    273,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
-    997,  1,     19,   2,    0,   96,  1,    5,     1,    0,    273,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
-    998,  1,     10,   2,   96,   40,  1,    5,     0,    0,    273,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
-    999,  1,     10,   2,   96,   40,  1,    5,     0,    0,    273,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
-   1000,  1,     10,   2,  136,   40,  1,    5,     0,    0,    273,    17,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
-   1001,  1,     10,   2,  136,   40,  1,    5,     0,    0,    273,    18,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
-   1002,  1,      4,   1,  176,   24,  1,    5,     0,    0,    273,    19,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
-   1003,  1,      4,   1,  200,   24,  1,    5,     0,    0,    273,    20,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
-   1004,  1,      4,   1,  224,   24,  1,    5,     0,    0,    273,    21,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
-   1005,  1,      4,   1,  248,   25,  1,    5,     0,    0,    273,    22,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    982,  1,     19,   2,    0,   96,  1,    5,     0,    0,    273,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+    983,  1,     19,   2,    0,   96,  1,    5,     0,    0,    273,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+    984,  1,     19,   2,    0,   96,  1,    5,     0,    0,    273,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+    985,  1,     19,   2,    0,   96,  1,    5,     0,    0,    273,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+    986,  1,     10,   2,   96,   40,  1,    5,     0,    0,    273,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+    987,  1,     10,   2,   96,   40,  1,    5,     0,    0,    273,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+    988,  1,     10,   2,  136,   40,  1,    5,     0,    0,    273,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+    989,  1,     10,   2,  136,   40,  1,    5,     0,    0,    273,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+    990,  1,      4,   1,  176,   24,  1,    5,     0,    0,    273,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+    991,  1,      4,   1,  200,   24,  1,    5,     0,    0,    273,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+    992,  1,      4,   1,  224,   24,  1,    5,     0,    0,    273,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+    993,  1,      4,   1,  248,   25,  1,    5,     0,    0,    273,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
     % PDSCH set 3: PRB 0~272, OFDM symbol 1~13, 100 MHz light
-    % reuse cfg 966~973 from PDSCH set 0: PRB 20~272, OFDM symbol 1~13, 100 MHz light
-   1006,  1,     19,   2,    0,   96,  1,   13,     0,    0,    273,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
-   1007,  1,     19,   2,    0,   96,  1,   13,     0,    0,    273,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
-   1008,  1,     19,   2,    0,   96,  1,   13,     0,    0,    273,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
-   1009,  1,     19,   2,    0,   96,  1,   13,     0,    0,    273,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
-   1010,  1,     19,   2,    0,   96,  1,   13,     1,    0,    273,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
-   1011,  1,     19,   2,    0,   96,  1,   13,     1,    0,    273,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
-   1012,  1,     19,   2,    0,   96,  1,   13,     1,    0,    273,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
-   1013,  1,     19,   2,    0,   96,  1,   13,     1,    0,    273,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+    % reuse cfg 962~969 from PDSCH set 0: PRB 20~272, OFDM symbol 1~13, 100 MHz light
+    994,  1,     19,   2,    0,   96,  1,   13,     0,    0,    273,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+    995,  1,     19,   2,    0,   96,  1,   13,     0,    0,    273,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+    996,  1,     19,   2,    0,   96,  1,   13,     0,    0,    273,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+    997,  1,     19,   2,    0,   96,  1,   13,     0,    0,    273,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
     % PDSCH set 4: PRB 0~264, OFDM symbol 1~13, 100 MHz light
-    % reuse cfg 966~972 from PDSCH set 0: PRB 20~272, OFDM symbol 1~13, 100 MHz light, cfg 1006~1013 from PDSCH set 3: PRB 0~272, OFDM symbol 1~13, 100 MHz light
-   1014,  1,      4,   1,  248,   17,  1,   13,     0,    0,    273,    22,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % reuse cfg 962~968 from PDSCH set 0: PRB 20~272, OFDM symbol 1~13, 100 MHz light, cfg 994~997 from PDSCH set 3: PRB 0~272, OFDM symbol 1~13, 100 MHz light
+    998,  1,      4,   1,  248,   17,  1,   13,     0,    0,    273,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
     % PDSCH for CCH
-   1015,  1,     27,   1,  265,    8,  1,   13,     0,    0,    273, 65535,    0,     41,     2,      2,     1,     41,      2,   0,   7;  % CCH config
+    999,  1,     27,   1,  265,    8,  1,   13,     0,    0,    273, 65535,    0,     41,     2,      2,     1,     41,      2,   0,   7;  % CCH config
+   % cfg#  mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym   SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+   % PDSCH set 0: PRB 20~243, OFDM symbol 1~13
+   1000,  1,     19,   2,   20,   68,  1,   13,     0,    0,    244,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1001,  1,     19,   2,   20,   68,  1,   13,     0,    0,    244,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1002,  1,     19,   2,   20,   68,  1,   13,     0,    0,    244,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1003,  1,     19,   2,   20,   68,  1,   13,     0,    0,    244,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1004,  1,     19,   2,   20,   68,  1,   13,     1,    0,    244,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
+   1005,  1,     19,   2,   20,   68,  1,   13,     1,    0,    244,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
+   1006,  1,     19,   2,   20,   68,  1,   13,     1,    0,    244,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
+   1007,  1,     19,   2,   20,   68,  1,   13,     1,    0,    244,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+   1008,  1,     10,   2,   88,   34,  1,   13,     0,    0,    244,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1009,  1,     10,   2,   88,   34,  1,   13,     0,    0,    244,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1010,  1,     10,   2,   88,   34,  1,   13,     0,    0,    244,    17,    0,     41,     2,      2,     1,     41,      2,   4,   1;  % Middle UEG1 port4
+   1011,  1,     10,   2,   88,   34,  1,   13,     0,    0,    244,    18,    0,     41,     2,      2,     1,     41,      2,   6,   1;  % Middle UEG1 port6
+   1012,  1,     10,   2,  122,   34,  1,   13,     0,    0,    244,    19,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1013,  1,     10,   2,  122,   34,  1,   13,     0,    0,    244,    20,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1014,  1,     10,   2,  122,   34,  1,   13,     0,    0,    244,    21,    0,     41,     2,      2,     1,     41,      2,   4,   2;  % Middle UEG2 port4
+   1015,  1,     10,   2,  122,   34,  1,   13,     0,    0,    244,    22,    0,     41,     2,      2,     1,     41,      2,   6,   2;  % Middle UEG2 port6
+   1016,  1,      4,   2,  156,   22,  1,   13,     0,    0,    244,    23,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1017,  1,      4,   2,  178,   22,  1,   13,     0,    0,    244,    24,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1018,  1,      4,   2,  200,   22,  1,   13,     0,    0,    244,    25,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1019,  1,      4,   2,  222,   22,  1,   13,     0,    0,    244,    26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 1: PRB 0~243, OFDM symbol 2~13
+   1020,  1,     19,   2,    0,   88,  2,   12,     0,    0,    244,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1021,  1,     19,   2,    0,   88,  2,   12,     0,    0,    244,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1022,  1,     19,   2,    0,   88,  2,   12,     0,    0,    244,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1023,  1,     19,   2,    0,   88,  2,   12,     0,    0,    244,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1024,  1,     19,   2,    0,   88,  2,   12,     1,    0,    244,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
+   1025,  1,     19,   2,    0,   88,  2,   12,     1,    0,    244,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
+   1026,  1,     19,   2,    0,   88,  2,   12,     1,    0,    244,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
+   1027,  1,     19,   2,    0,   88,  2,   12,     1,    0,    244,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+   1028,  1,     10,   2,   88,   34,  2,   12,     0,    0,    244,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1029,  1,     10,   2,   88,   34,  2,   12,     0,    0,    244,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1030,  1,     10,   2,   88,   34,  2,   12,     0,    0,    244,    17,    0,     41,     2,      2,     1,     41,      2,   4,   1;  % Middle UEG1 port4
+   1031,  1,     10,   2,   88,   34,  2,   12,     0,    0,    244,    18,    0,     41,     2,      2,     1,     41,      2,   6,   1;  % Middle UEG1 port6
+   1032,  1,     10,   2,  122,   34,  2,   12,     0,    0,    244,    19,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1033,  1,     10,   2,  122,   34,  2,   12,     0,    0,    244,    20,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1034,  1,     10,   2,  122,   34,  2,   12,     0,    0,    244,    21,    0,     41,     2,      2,     1,     41,      2,   4,   2;  % Middle UEG2 port4
+   1035,  1,     10,   2,  122,   34,  2,   12,     0,    0,    244,    22,    0,     41,     2,      2,     1,     41,      2,   6,   2;  % Middle UEG2 port6
+   1036,  1,      4,   2,  156,   22,  2,   12,     0,    0,    244,    23,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1037,  1,      4,   2,  178,   22,  2,   12,     0,    0,    244,    24,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1038,  1,      4,   2,  200,   22,  2,   12,     0,    0,    244,    25,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1039,  1,      4,   2,  222,   22,  2,   12,     0,    0,    244,    26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 2: PRB 0~243, OFDM symbol 1~5
+   1040,  1,     19,   2,    0,   88,  1,    5,     0,    0,    244,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1041,  1,     19,   2,    0,   88,  1,    5,     0,    0,    244,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1042,  1,     19,   2,    0,   88,  1,    5,     0,    0,    244,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1043,  1,     19,   2,    0,   88,  1,    5,     0,    0,    244,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1044,  1,     19,   2,    0,   88,  1,    5,     1,    0,    244,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
+   1045,  1,     19,   2,    0,   88,  1,    5,     1,    0,    244,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
+   1046,  1,     19,   2,    0,   88,  1,    5,     1,    0,    244,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
+   1047,  1,     19,   2,    0,   88,  1,    5,     1,    0,    244,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+   1048,  1,     10,   2,   88,   34,  1,    5,     0,    0,    244,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1049,  1,     10,   2,   88,   34,  1,    5,     0,    0,    244,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1050,  1,     10,   2,   88,   34,  1,    5,     0,    0,    244,    17,    0,     41,     2,      2,     1,     41,      2,   4,   1;  % Middle UEG1 port4
+   1051,  1,     10,   2,   88,   34,  1,    5,     0,    0,    244,    18,    0,     41,     2,      2,     1,     41,      2,   6,   1;  % Middle UEG1 port6
+   1052,  1,     10,   2,  122,   34,  1,    5,     0,    0,    244,    19,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1053,  1,     10,   2,  122,   34,  1,    5,     0,    0,    244,    20,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1054,  1,     10,   2,  122,   34,  1,    5,     0,    0,    244,    21,    0,     41,     2,      2,     1,     41,      2,   4,   2;  % Middle UEG2 port4
+   1055,  1,     10,   2,  122,   34,  1,    5,     0,    0,    244,    22,    0,     41,     2,      2,     1,     41,      2,   6,   2;  % Middle UEG2 port6
+   1056,  1,      4,   2,  156,   22,  1,    5,     0,    0,    244,    23,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1057,  1,      4,   2,  178,   22,  1,    5,     0,    0,    244,    24,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1058,  1,      4,   2,  200,   22,  1,    5,     0,    0,    244,    25,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1059,  1,      4,   2,  222,   22,  1,    5,     0,    0,    244,    26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 3: PRB 0~243, OFDM symbol 1~13
+    % reuse cfg 1008~1019 from PDSCH set 0: PRB 20~243, OFDM symbol 1~13
+   1060,  1,     19,   2,    0,   88,  1,   13,     0,    0,    244,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1061,  1,     19,   2,    0,   88,  1,   13,     0,    0,    244,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1062,  1,     19,   2,    0,   88,  1,   13,     0,    0,    244,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1063,  1,     19,   2,    0,   88,  1,   13,     0,    0,    244,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1064,  1,     19,   2,    0,   88,  1,   13,     1,    0,    244,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
+   1065,  1,     19,   2,    0,   88,  1,   13,     1,    0,    244,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
+   1066,  1,     19,   2,    0,   88,  1,   13,     1,    0,    244,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
+   1067,  1,     19,   2,    0,   88,  1,   13,     1,    0,    244,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+    % PDSCH set 4: PRB 0~235, OFDM symbol 1~13
+    % reuse cfg 1008~1018 from PDSCH set 0: PRB 20~243, OFDM symbol 1~13, cfg 1060~1067 from PDSCH set 3: PRB 0~243, OFDM symbol 1~13
+   1068,  1,      4,   2,  222,   14,  1,   13,     0,    0,    244,    26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH for CCH
+   1069,  1,     27,   1,  236,    8,  1,   13,     0,    0,    244, 65535,    0,     41,     2,      2,     1,     41,      2,   0,   7;  % CCH config
+% cfg#  mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym   SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+   % PDSCH set 0: PRB 20~243, OFDM symbol 1~13
+   1070,  1,     19,   2,   20,   68,  1,   13,     0,    0,    244,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1071,  1,     19,   2,   20,   68,  1,   13,     0,    0,    244,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1072,  1,     19,   2,   20,   68,  1,   13,     0,    0,    244,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1073,  1,     19,   2,   20,   68,  1,   13,     0,    0,    244,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1074,  1,     10,   2,   88,   34,  1,   13,     0,    0,    244,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1075,  1,     10,   2,   88,   34,  1,   13,     0,    0,    244,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1076,  1,     10,   2,  122,   34,  1,   13,     0,    0,    244,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1077,  1,     10,   2,  122,   34,  1,   13,     0,    0,    244,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1078,  1,      4,   1,  156,   22,  1,   13,     0,    0,    244,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1079,  1,      4,   1,  178,   22,  1,   13,     0,    0,    244,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1080,  1,      4,   1,  200,   22,  1,   13,     0,    0,    244,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1081,  1,      4,   1,  222,   22,  1,   13,     0,    0,    244,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 1: PRB 0~243, OFDM symbol 2~13
+   1082,  1,     19,   2,    0,   88,  2,   12,     0,    0,    244,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1083,  1,     19,   2,    0,   88,  2,   12,     0,    0,    244,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1084,  1,     19,   2,    0,   88,  2,   12,     0,    0,    244,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1085,  1,     19,   2,    0,   88,  2,   12,     0,    0,    244,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1086,  1,     10,   2,   88,   34,  2,   12,     0,    0,    244,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1087,  1,     10,   2,   88,   34,  2,   12,     0,    0,    244,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1088,  1,     10,   2,  122,   34,  2,   12,     0,    0,    244,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1089,  1,     10,   2,  122,   34,  2,   12,     0,    0,    244,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1090,  1,      4,   1,  156,   22,  2,   12,     0,    0,    244,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1091,  1,      4,   1,  178,   22,  2,   12,     0,    0,    244,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1092,  1,      4,   1,  200,   22,  2,   12,     0,    0,    244,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1093,  1,      4,   1,  222,   22,  2,   12,     0,    0,    244,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 2: PRB 0~243, OFDM symbol 1~5
+   1094,  1,     19,   2,    0,   88,  1,    5,     0,    0,    244,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1095,  1,     19,   2,    0,   88,  1,    5,     0,    0,    244,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1096,  1,     19,   2,    0,   88,  1,    5,     0,    0,    244,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1097,  1,     19,   2,    0,   88,  1,    5,     0,    0,    244,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1098,  1,     10,   2,   88,   34,  1,    5,     0,    0,    244,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1099,  1,     10,   2,   88,   34,  1,    5,     0,    0,    244,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1100,  1,     10,   2,  122,   34,  1,    5,     0,    0,    244,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1101,  1,     10,   2,  122,   34,  1,    5,     0,    0,    244,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1102,  1,      4,   1,  156,   22,  1,    5,     0,    0,    244,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1103,  1,      4,   1,  178,   22,  1,    5,     0,    0,    244,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1104,  1,      4,   1,  200,   22,  1,    5,     0,    0,    244,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1105,  1,      4,   1,  222,   22,  1,    5,     0,    0,    244,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 3: PRB 0~243, OFDM symbol 1~13
+    % reuse cfg 1074~1081 from PDSCH set 0: PRB 20~243, OFDM symbol 1~13
+   1106,  1,     19,   2,    0,   88,  1,   13,     0,    0,    244,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1107,  1,     19,   2,    0,   88,  1,   13,     0,    0,    244,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1108,  1,     19,   2,    0,   88,  1,   13,     0,    0,    244,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1109,  1,     19,   2,    0,   88,  1,   13,     0,    0,    244,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+    % PDSCH set 4: PRB 0~235, OFDM symbol 1~13
+    % reuse cfg 1074~1080 from PDSCH set 0: PRB 20~243, OFDM symbol 1~13, cfg 1106~1109 from PDSCH set 3: PRB 0~243, OFDM symbol 1~13
+   1110,  1,      4,   1,  222,   14,  1,   13,     0,    0,    244,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH for CCH
+   1111,  1,     27,   1,  236,    8,  1,   13,     0,    0,    244, 65535,    0,     41,     2,      2,     1,     41,      2,   0,   7;  % CCH config
+% cfg#  mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym   SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+   % PDSCH set 0: PRB 20~159, OFDM symbol 1~13
+   1112,  1,     19,   2,   20,   36,  1,   13,     0,    0,    160,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1113,  1,     19,   2,   20,   36,  1,   13,     0,    0,    160,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1114,  1,     19,   2,   20,   36,  1,   13,     0,    0,    160,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1115,  1,     19,   2,   20,   36,  1,   13,     0,    0,    160,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1116,  1,     19,   2,   20,   36,  1,   13,     1,    0,    160,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
+   1117,  1,     19,   2,   20,   36,  1,   13,     1,    0,    160,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
+   1118,  1,     19,   2,   20,   36,  1,   13,     1,    0,    160,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
+   1119,  1,     19,   2,   20,   36,  1,   13,     1,    0,    160,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+   1120,  1,     10,   2,   56,   24,  1,   13,     0,    0,    160,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1121,  1,     10,   2,   56,   24,  1,   13,     0,    0,    160,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1122,  1,     10,   2,   56,   24,  1,   13,     0,    0,    160,    17,    0,     41,     2,      2,     1,     41,      2,   4,   1;  % Middle UEG1 port4
+   1123,  1,     10,   2,   56,   24,  1,   13,     0,    0,    160,    18,    0,     41,     2,      2,     1,     41,      2,   6,   1;  % Middle UEG1 port6
+   1124,  1,     10,   2,   80,   24,  1,   13,     0,    0,    160,    19,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1125,  1,     10,   2,   80,   24,  1,   13,     0,    0,    160,    20,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1126,  1,     10,   2,   80,   24,  1,   13,     0,    0,    160,    21,    0,     41,     2,      2,     1,     41,      2,   4,   2;  % Middle UEG2 port4
+   1127,  1,     10,   2,   80,   24,  1,   13,     0,    0,    160,    22,    0,     41,     2,      2,     1,     41,      2,   6,   2;  % Middle UEG2 port6
+   1128,  1,      4,   2,  104,   14,  1,   13,     0,    0,    160,    23,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1129,  1,      4,   2,  118,   14,  1,   13,     0,    0,    160,    24,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1130,  1,      4,   2,  132,   14,  1,   13,     0,    0,    160,    25,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1131,  1,      4,   2,  146,   14,  1,   13,     0,    0,    160,    26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 1: PRB 0~159, OFDM symbol 2~13
+   1132,  1,     19,   2,    0,   56,  2,   12,     0,    0,    160,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1133,  1,     19,   2,    0,   56,  2,   12,     0,    0,    160,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1134,  1,     19,   2,    0,   56,  2,   12,     0,    0,    160,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1135,  1,     19,   2,    0,   56,  2,   12,     0,    0,    160,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1136,  1,     19,   2,    0,   56,  2,   12,     1,    0,    160,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
+   1137,  1,     19,   2,    0,   56,  2,   12,     1,    0,    160,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
+   1138,  1,     19,   2,    0,   56,  2,   12,     1,    0,    160,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
+   1139,  1,     19,   2,    0,   56,  2,   12,     1,    0,    160,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+   1140,  1,     10,   2,   56,   24,  2,   12,     0,    0,    160,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1141,  1,     10,   2,   56,   24,  2,   12,     0,    0,    160,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1142,  1,     10,   2,   56,   24,  2,   12,     0,    0,    160,    17,    0,     41,     2,      2,     1,     41,      2,   4,   1;  % Middle UEG1 port4
+   1143,  1,     10,   2,   56,   24,  2,   12,     0,    0,    160,    18,    0,     41,     2,      2,     1,     41,      2,   6,   1;  % Middle UEG1 port6
+   1144,  1,     10,   2,   80,   24,  2,   12,     0,    0,    160,    19,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1145,  1,     10,   2,   80,   24,  2,   12,     0,    0,    160,    20,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1146,  1,     10,   2,   80,   24,  2,   12,     0,    0,    160,    21,    0,     41,     2,      2,     1,     41,      2,   4,   2;  % Middle UEG2 port4
+   1147,  1,     10,   2,   80,   24,  2,   12,     0,    0,    160,    22,    0,     41,     2,      2,     1,     41,      2,   6,   2;  % Middle UEG2 port6
+   1148,  1,      4,   2,  104,   14,  2,   12,     0,    0,    160,    23,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1149,  1,      4,   2,  118,   14,  2,   12,     0,    0,    160,    24,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1150,  1,      4,   2,  132,   14,  2,   12,     0,    0,    160,    25,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1151,  1,      4,   2,  146,   14,  2,   12,     0,    0,    160,    26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 2: PRB 0~159, OFDM symbol 1~5
+   1152,  1,     19,   2,    0,   56,  1,    5,     0,    0,    160,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1153,  1,     19,   2,    0,   56,  1,    5,     0,    0,    160,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1154,  1,     19,   2,    0,   56,  1,    5,     0,    0,    160,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1155,  1,     19,   2,    0,   56,  1,    5,     0,    0,    160,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1156,  1,     19,   2,    0,   56,  1,    5,     1,    0,    160,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
+   1157,  1,     19,   2,    0,   56,  1,    5,     1,    0,    160,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
+   1158,  1,     19,   2,    0,   56,  1,    5,     1,    0,    160,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
+   1159,  1,     19,   2,    0,   56,  1,    5,     1,    0,    160,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+   1160,  1,     10,   2,   56,   24,  1,    5,     0,    0,    160,    15,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1161,  1,     10,   2,   56,   24,  1,    5,     0,    0,    160,    16,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1162,  1,     10,   2,   56,   24,  1,    5,     0,    0,    160,    17,    0,     41,     2,      2,     1,     41,      2,   4,   1;  % Middle UEG1 port4
+   1163,  1,     10,   2,   56,   24,  1,    5,     0,    0,    160,    18,    0,     41,     2,      2,     1,     41,      2,   6,   1;  % Middle UEG1 port6
+   1164,  1,     10,   2,   80,   24,  1,    5,     0,    0,    160,    19,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1165,  1,     10,   2,   80,   24,  1,    5,     0,    0,    160,    20,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1166,  1,     10,   2,   80,   24,  1,    5,     0,    0,    160,    21,    0,     41,     2,      2,     1,     41,      2,   4,   2;  % Middle UEG2 port4
+   1167,  1,     10,   2,   80,   24,  1,    5,     0,    0,    160,    22,    0,     41,     2,      2,     1,     41,      2,   6,   2;  % Middle UEG2 port6
+   1168,  1,      4,   2,  104,   14,  1,    5,     0,    0,    160,    23,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1169,  1,      4,   2,  118,   14,  1,    5,     0,    0,    160,    24,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1170,  1,      4,   2,  132,   14,  1,    5,     0,    0,    160,    25,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1171,  1,      4,   2,  146,   14,  1,    5,     0,    0,    160,    26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 3: PRB 0~159, OFDM symbol 1~13
+    % reuse cfg 1120~1131 from PDSCH set 0: PRB 20~159, OFDM symbol 1~13
+   1172,  1,     19,   2,    0,   56,  1,   13,     0,    0,    160,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1173,  1,     19,   2,    0,   56,  1,   13,     0,    0,    160,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1174,  1,     19,   2,    0,   56,  1,   13,     0,    0,    160,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1175,  1,     19,   2,    0,   56,  1,   13,     0,    0,    160,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1176,  1,     19,   2,    0,   56,  1,   13,     1,    0,    160,    11,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port8
+   1177,  1,     19,   2,    0,   56,  1,   13,     1,    0,    160,    12,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port10
+   1178,  1,     19,   2,    0,   56,  1,   13,     1,    0,    160,    13,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port12
+   1179,  1,     19,   2,    0,   56,  1,   13,     1,    0,    160,    14,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port14
+    % PDSCH set 4: PRB 0~151, OFDM symbol 1~13
+    % reuse cfg 1120~1130 from PDSCH set 0: PRB 20~159, OFDM symbol 1~13, cfg 1172~1179 from PDSCH set 3: PRB 0~159, OFDM symbol 1~13
+   1180,  1,      4,   2,  146,    6,  1,   13,     0,    0,    160,    26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH for CCH
+   1181,  1,     27,   1,  152,    8,  1,   13,     0,    0,    160, 65535,    0,     41,     2,      2,     1,     41,      2,   0,   7;  % CCH config
+% cfg#  mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym   SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+   % PDSCH set 0: PRB 20~159, OFDM symbol 1~13
+   1182,  1,     19,   2,   20,   36,  1,   13,     0,    0,    160,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1183,  1,     19,   2,   20,   36,  1,   13,     0,    0,    160,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1184,  1,     19,   2,   20,   36,  1,   13,     0,    0,    160,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1185,  1,     19,   2,   20,   36,  1,   13,     0,    0,    160,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1186,  1,     10,   2,   56,   24,  1,   13,     0,    0,    160,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1187,  1,     10,   2,   56,   24,  1,   13,     0,    0,    160,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1188,  1,     10,   2,   80,   24,  1,   13,     0,    0,    160,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1189,  1,     10,   2,   80,   24,  1,   13,     0,    0,    160,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1190,  1,      4,   1,  104,   14,  1,   13,     0,    0,    160,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1191,  1,      4,   1,  118,   14,  1,   13,     0,    0,    160,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1192,  1,      4,   1,  132,   14,  1,   13,     0,    0,    160,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1193,  1,      4,   1,  146,   14,  1,   13,     0,    0,    160,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 1: PRB 0~159, OFDM symbol 2~13
+   1194,  1,     19,   2,    0,   56,  2,   12,     0,    0,    160,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1195,  1,     19,   2,    0,   56,  2,   12,     0,    0,    160,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1196,  1,     19,   2,    0,   56,  2,   12,     0,    0,    160,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1197,  1,     19,   2,    0,   56,  2,   12,     0,    0,    160,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1198,  1,     10,   2,   56,   24,  2,   12,     0,    0,    160,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1199,  1,     10,   2,   56,   24,  2,   12,     0,    0,    160,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1200,  1,     10,   2,   80,   24,  2,   12,     0,    0,    160,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1201,  1,     10,   2,   80,   24,  2,   12,     0,    0,    160,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1202,  1,      4,   1,  104,   14,  2,   12,     0,    0,    160,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1203,  1,      4,   1,  118,   14,  2,   12,     0,    0,    160,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1204,  1,      4,   1,  132,   14,  2,   12,     0,    0,    160,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1205,  1,      4,   1,  146,   14,  2,   12,     0,    0,    160,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 2: PRB 0~159, OFDM symbol 1~5
+   1206,  1,     19,   2,    0,   56,  1,    5,     0,    0,    160,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1207,  1,     19,   2,    0,   56,  1,    5,     0,    0,    160,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1208,  1,     19,   2,    0,   56,  1,    5,     0,    0,    160,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1209,  1,     19,   2,    0,   56,  1,    5,     0,    0,    160,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1210,  1,     10,   2,   56,   24,  1,    5,     0,    0,    160,    11,    0,     41,     2,      2,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1211,  1,     10,   2,   56,   24,  1,    5,     0,    0,    160,    12,    0,     41,     2,      2,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1212,  1,     10,   2,   80,   24,  1,    5,     0,    0,    160,    13,    0,     41,     2,      2,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1213,  1,     10,   2,   80,   24,  1,    5,     0,    0,    160,    14,    0,     41,     2,      2,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1214,  1,      4,   1,  104,   14,  1,    5,     0,    0,    160,    15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1215,  1,      4,   1,  118,   14,  1,    5,     0,    0,    160,    16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1216,  1,      4,   1,  132,   14,  1,    5,     0,    0,    160,    17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1217,  1,      4,   1,  146,   14,  1,    5,     0,    0,    160,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH set 3: PRB 0~159, OFDM symbol 1~13
+    % reuse cfg 1186~1193 from PDSCH set 0: PRB 20~159, OFDM symbol 1~13
+   1218,  1,     19,   2,    0,   56,  1,   13,     0,    0,    160,     7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1219,  1,     19,   2,    0,   56,  1,   13,     0,    0,    160,     8,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1220,  1,     19,   2,    0,   56,  1,   13,     0,    0,    160,     9,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1221,  1,     19,   2,    0,   56,  1,   13,     0,    0,    160,    10,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+    % PDSCH set 4: PRB 0~151, OFDM symbol 1~13
+    % reuse cfg 1186~1192 from PDSCH set 0: PRB 20~159, OFDM symbol 1~13, cfg 1218~1221 from PDSCH set 3: PRB 0~159, OFDM symbol 1~13
+   1222,  1,      4,   1,  146,    6,  1,   13,     0,    0,    160,    18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PDSCH for CCH
+   1223,  1,     27,   1,  152,    8,  1,   13,     0,    0,    160, 65535,    0,     41,     2,      2,     1,     41,      2,   0,   7;  % CCH config
+% cfg#  mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym   SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+   % 4TR PDSCH: PRB 0~272, OFDM symbol 0~13
+   1224,  1,     27,   4,    0,  273,  0,   14,     0,    0,    273,     7,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, all D slot
+   % 4TR PDSCH: PRB 0~53, OFDM symbol 0~13
+   1225,  1,     27,   4,    0,   54,  0,   14,     0,    0,    273,     7,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, all D slot
 };
 
 % append generated PXSCH config
@@ -7399,6 +8340,7 @@ cfgUeg.endPrb = 272;
 cfgUeg.sym0 = 1;
 cfgUeg.Nsym = 13;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
 
@@ -7412,6 +8354,7 @@ cfgUeg.endPrb = 272;
 cfgUeg.sym0 = 2;
 cfgUeg.Nsym = 12;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
 
@@ -7425,6 +8368,7 @@ cfgUeg.endPrb = 272;
 cfgUeg.sym0 = 1;
 cfgUeg.Nsym = 5;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
 
@@ -7438,6 +8382,7 @@ cfgUeg.endPrb = 272;
 cfgUeg.sym0 = 1;
 cfgUeg.Nsym = 13;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
 
@@ -7451,6 +8396,7 @@ cfgUeg.endPrb = 264;
 cfgUeg.sym0 = 1;
 cfgUeg.Nsym = 13;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
 
@@ -7515,6 +8461,76 @@ cfgUeg = baseCfgUeg;
 cfgUeg.pxsch_cfg_idx = CFG_PDSCH{end, 1} + 1;
 cfgUeg.nUeg = 1;
 cfgUeg.nUePerUeg = 16;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 264;
+cfgUeg.sym0 = 1;
+cfgUeg.Nsym = 13;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 24 UEs per UEG, 1 layer per UE, PDSCH prb 20~272, OFDM symbol 1~13, 100 MHz, CFG 2961:2984
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PDSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 24;
+cfgUeg.startPrb = 20;
+cfgUeg.endPrb = 272;
+cfgUeg.sym0 = 1;
+cfgUeg.Nsym = 13;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 24 UEs per UEG, 1 layer per UE, PDSCH prb 0~272, OFDM symbol 2~13, 100 MHz, CFG 2985:3008
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PDSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 24;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 272;
+cfgUeg.sym0 = 2;
+cfgUeg.Nsym = 12;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 24 UEs per UEG, 1 layer per UE, PDSCH prb 0~272, OFDM symbol 1~5, 100 MHz, CFG 3009:3032
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PDSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 24;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 272;
+cfgUeg.sym0 = 1;
+cfgUeg.Nsym = 5;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 24 UEs per UEG, 1 layer per UE, PDSCH prb 0~272, OFDM symbol 1~13, 100 MHz, CFG 3033:3056
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PDSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 24;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 272;
+cfgUeg.sym0 = 1;
+cfgUeg.Nsym = 13;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 24 UEs per UEG, 1 layer per UE, PDSCH prb 0~264, OFDM symbol 1~13, 100 MHz, CFG 3057:3080
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PDSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 24;
 cfgUeg.startPrb = 0;
 cfgUeg.endPrb = 264;
 cfgUeg.sym0 = 1;
@@ -7756,16 +8772,31 @@ CFG_CSIRS = {...
     % 32-port CSI-RS variant of 8-port version above
     115,  1,  16, 1,   2,    0,    273,   4,   5,   41,   {ones(1,12)}; % 32-port, row 16 sym 4, 5
     116,  2,  16, 1,   2,    0,    273,   2,   3,   41,   {ones(1,12)}; % 32-port, row 16 sym 2, 3, ZP CSI-RS
+    % Ph4 column B 32-port CSI-RS patterns, both odd and even cells use {82 83} or {115 116}
     % CSI-RS for heterogeneous UE group pattern
     117,  0,  1,  0,   3,   20,    253,   6,    0,   41,    {[0 1 0 0]};
     118,  1,  4,  1,   2,   20,    253,   9,    0,   41,    {ones(1,12)};
  % cfg#  CSI Row CDM Density RB0  nRB  sym0  sym1   nID  FreqDomain
     % mixed 8-port and 32-port CSI-RS pattern
     119,  1,   7, 1,   2,    0,    273,   4,   5,   41,   {[1 1 0 0 0 0]}; %  8-port, row 7 sym 4, 5
-    120,  1,  16, 1,   2,    0,    273,   2,   3,   41,   {ones(1,12)};    % 32-port, row 16 sym 2, 3
-    121,  1,  16, 1,   2,    0,    273,   4,   5,   41,   {[0 0 1 1 1 1]}; % 32-port, row 16 sym 4, 5
-    % 25-3 column B patterns, both odd and even cells use {119 120 121 114}
-    % 25-3 column G patterns, both odd and even cells use {119 120 121 114}
+    120,  1,  16, 1,   2,    0,    273,   2,   4,   41,   {ones(1,12)};    % 32-port, row 16 sym 2, 3, 4, 5
+    121,  1,  16, 1,   2,    0,    273,   4,   6,   41,   {[0 0 1 1 1 1]}; % 32-port, row 16 sym 4, 5, 6, 7 - unused
+    % 25-3 column B patterns, both odd and even cells use {119 120 114}
+    % 25-3 column G patterns, both odd and even cells use {119 120 114}
+    % 64TR realistic traffic with Center/Middle/Edge, 90 MHz heavy / light
+    122,  0,  1,  0,   3,    0,    244,   5,    0,   41,    {[0 1 0 0]};  % modified from 82
+    123,  0,  1,  0,   3,    0,    244,   9,    0,   41,    {[0 1 0 0]};  % modified from 83
+    124,  1,  7,  1,   2,    0,    244,   4,   5,   41,   {ones(1,12)}; % 8 port, row 7 sym 4, 5; modified from 113
+    125,  2,  5,  1,   2,    0,    244,   2,   3,   41,   {[0 0 0 1 0 0]}; % 8 port, row 5 sym 2, 3, ZP CSI-RS; modified from 114
+    126,  1,  16, 1,   2,    0,    244,   4,   5,   41,   {ones(1,12)}; % 32-port, row 16 sym 4, 5; modified from 115
+    127,  2,  16, 1,   2,    0,    244,   2,   3,   41,   {ones(1,12)}; % 32-port, row 16 sym 2, 3, ZP CSI-RS; modified from 116
+    % 64TR realistic traffic with Center/Middle/Edge, 60 MHz heavy / light
+    128,  0,  1,  0,   3,    0,    160,   5,    0,   41,    {[0 1 0 0]};  % modified from 82
+    129,  0,  1,  0,   3,    0,    160,   9,    0,   41,    {[0 1 0 0]};  % modified from 83
+    130,  1,  7,  1,   2,    0,    160,   4,   5,   41,   {ones(1,12)}; % 8 port, row 7 sym 4, 5; modified from 113
+    131,  2,  5,  1,   2,    0,    160,   2,   3,   41,   {[0 0 0 1 0 0]}; % 8 port, row 5 sym 2, 3, ZP CSI-RS; modified from 114
+    132,  1,  16, 1,   2,    0,    160,   4,   5,   41,   {ones(1,12)}; % 32-port, row 16 sym 4, 5; modified from 115
+    133,  2,  16, 1,   2,    0,    160,   2,   3,   41,   {ones(1,12)}; % 32-port, row 16 sym 2, 3, ZP CSI-RS; modified from 116
 };
 
 CFG_PRACH = {...
@@ -7845,6 +8876,10 @@ parfor n = 1:NallTest
         end
         SysPar.carrier.Nant_gNB = CFG_Cell{idxCfg, 4};
         SysPar.carrier.Nant_UE = CFG_Cell{idxCfg, 5};
+
+        if ismember(caseNum, MIMO_64TR_TC) && (SysPar.carrier.Nant_UE < 32)
+            error('Case %d: Nant_UE must be greater than or equal to 32 for MIMO 64TR TCs.  Please review the cell configuration.', caseNum);
+        end
         
          % FAPI override for negative test cases
         if (caseNum == 502)
@@ -7860,7 +8895,7 @@ parfor n = 1:NallTest
             SysPar.carrier.Nant_gNB_srs = 32;
         end
 
-        if idxCfg == 10 || idxCfg == 11 % 64TR static and dynamic beamforming
+        if SysPar.carrier.Nant_UE == 64 % 64TR static and dynamic beamforming
             SysPar.SimCtrl.enable_static_dynamic_beamforming = 1;
             SysPar.carrier.Nant_gNB_srs = 64;
         end
@@ -8124,9 +9159,9 @@ parfor n = 1:NallTest
                     SysPar.pdcch{idx_dci}.numDlDci =  1;
                     SysPar.pdcch{idx_dci}.isCSS =  CFG_PDCCH{idxCfg, 12};
                     SysPar.pdcch{idx_dci}.forceCceIndex = 1;
-                    if ismember(idxCfg, [25:38, 53, 55, 57, 61, 63, 64, 66, 67, 69, 70, 72, 73, 75, 80]) % 64TR
+                    if ismember(idxCfg, [25:38, 53, 55, 57, 61, 63, 64, 66, 67, 69, 70, 72, 73, 75, 80, 81, 83, 84, 86]) % 64TR
                         SysPar.pdcch{idx_dci}.dciUL = 0;
-                    elseif ismember(idxCfg, [39:52, 54, 56, 58, 62, 65, 68, 71, 74]) 
+                    elseif ismember(idxCfg, [39:52, 54, 56, 58, 62, 65, 68, 71, 74, 82, 85]) 
                         SysPar.pdcch{idx_dci}.dciUL = 1;
                     end
                     % SysPar.pdcch{idx_dci}.coresetMap = cell2mat(CFG_PDCCH{idxCfg, 18});
@@ -8322,7 +9357,7 @@ parfor n = 1:NallTest
                 SysPar.pdsch{idx}.prgSize = SysPar.pdsch{idx}.rbSize;
                 SysPar.pdsch{idx}.numPRGs = 1;
             end
-            if ismember(CFG_PDSCH{idxCfg, 1}, [2881:2960])
+            if ismember(CFG_PDSCH{idxCfg, 1}, [2721:3080])
                 SysPar.pdsch{idx}.prgSize = 16;
                 SysPar.pdsch{idx}.numPRGs = ceil(SysPar.pdsch{idx}.rbSize/SysPar.pdsch{idx}.prgSize);
             end
@@ -8669,7 +9704,7 @@ parfor n = 1:NallTest
                 SysPar.pdsch{idx}.dataScramblingId = CFG_PDSCH{idxCfg, 14} + mod(caseNum - 7872, 20);
             end % end pdsch dataScramblingId config
 
-            if ismember(cfg{idx}, [879:886,2737:2752,2769:2784,2801:2816,2833:2848,2865:2880]) %32DL
+            if ismember(cfg{idx}, [879:886,2737:2752,2769:2784,2801:2816,2833:2848,2865:2880,2977:2984,3001:3008,3025:3032,3049:3056,3073:3080]) %32/24DL
                 SysPar.pdsch{idx}.nlAbove16 = 1;
             end
 
@@ -8703,7 +9738,7 @@ parfor n = 1:NallTest
             end
 
             % enable precoding 
-            if ismember(caseNum, [1208:8271]) || (enableIdentityPrecoderMap.isKey(caseNum) && enableIdentityPrecoderMap(caseNum) == 1)
+            if ismember(caseNum, [1208:7519 7872:8271]) || (enableIdentityPrecoderMap.isKey(caseNum) && enableIdentityPrecoderMap(caseNum) == 1)
                 switch SysPar.pdsch{idx}.nrOfLayers
                     case 4
                         SysPar.pdsch{idx}.prcdBf = 12;
@@ -8716,7 +9751,7 @@ parfor n = 1:NallTest
                 end
 
                 % precoding hack, using identity matrix
-                if ismember(caseNum, [1208:8271]) || (enableIdentityPrecoderMap.isKey(caseNum) && enableIdentityPrecoderMap(caseNum) == 1)
+                if ismember(caseNum, [1208:7519 7872:8271]) || (enableIdentityPrecoderMap.isKey(caseNum) && enableIdentityPrecoderMap(caseNum) == 1)
                     SysPar.pdsch{idx}.prcdBf = 14;
                 end
             end            
@@ -8728,7 +9763,7 @@ parfor n = 1:NallTest
         end
 
         % enable BetaForce for all perf TVs with/without pdsch (cuphydriver and RU apply it across all slots) 
-        if ismember(caseNum, [1208:8271]) || (enableIdentityPrecoderMap.isKey(caseNum) && enableIdentityPrecoderMap(caseNum) == 1)
+        if ismember(caseNum, [1208:7519 7872:8271]) || (enableIdentityPrecoderMap.isKey(caseNum) && enableIdentityPrecoderMap(caseNum) == 1)
             SysPar.SimCtrl.oranCompressBetaForce = 1;
         end
         testAlloc.pdsch = length(cfg);
@@ -8774,10 +9809,15 @@ parfor n = 1:NallTest
                     (ismember(caseNum, 20831))        || ... % 32DL
                     (ismember(caseNum, 20870:20909))  || ... % 25-3 column B, nrSim pattern 90644/90645/90646/90647
                     (ismember(caseNum, 20910:20949))  || ... % 25-3 column G, 64 UEs per TTI, nrSim pattern 90649/90650/90651/90652
-                    (ismember(caseNum, 20950:20989))  || ... % 25-3 column E, nrSim pattern 90648 32DL 
+                    (ismember(caseNum, 20950:20989))  || ... % 25-3 column E, nrSim pattern 90648/90657 32DL 
                     (ismember(caseNum, 20990:21029))  || ... % Ph4 column B, srsPrgSize = 2/4 and bfwPrgSize = 16, nrSim pattern 90653/90654, 100 MHz
                     (ismember(caseNum, 21030:21069))  || ... % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz heavy, nrSim pattern 90655
-                    (ismember(caseNum, 21070:21109))  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz light, nrSim pattern 90656
+                    (ismember(caseNum, 21070:21109))  || ... % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz light, nrSim pattern 90656
+                    (ismember(caseNum, 21110:21149))  || ... % 64TR MU-MIMO realistic traffic with Center/Middle/Edge,  90 MHz heavy, nrSim pattern 90658
+                    (ismember(caseNum, 21150:21189))  || ... % 64TR MU-MIMO realistic traffic with Center/Middle/Edge,  90 MHz light, nrSim pattern 90659
+                    (ismember(caseNum, 21190:21229))  || ... % 64TR MU-MIMO realistic traffic with Center/Middle/Edge,  60 MHz heavy, nrSim pattern 90660
+                    (ismember(caseNum, 21230:21269))  || ... % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz light, nrSim pattern 90661
+                    (ismember(caseNum, 21270:21309))     ... % 25-3 column D, nrSim pattern 90662 24DL 
                     SysPar.pdsch{idxUe}.digBFInterfaces = 0; % RTW
                     SysPar.pdsch{idxUe}.beamIdx = beamIdx_dynamic_offset + [1:digBFInterfaces];
                     beamIdx_dynamic_offset = beamIdx_dynamic_offset + digBFInterfaces;               
@@ -8801,7 +9841,7 @@ parfor n = 1:NallTest
         % disable precoding for PDSCH CFG for CCH
         for idxUe = 1:length(cfg)
             idxCfg = find(cellfun(@(x) isequal(x,cfg{idxUe}), CFG_PDSCH(:,1)));
-            if ismember(CFG_PDSCH{idxCfg,1}, [847, 887, 957, 1015])
+            if ismember(CFG_PDSCH{idxCfg,1}, [847, 887, 957, 999, 1069, 1111, 1181, 1223])
                 digBFInterfaces = SysPar.pdsch{idxUe}.nrOfLayers;
                 SysPar.pdsch{idxUe}.digBFInterfaces = digBFInterfaces; % non-RTW
                 SysPar.pdsch{idxUe}.beamIdx = beamIdx_static_offset + [1:digBFInterfaces];
@@ -8858,6 +9898,12 @@ parfor n = 1:NallTest
         if ismember(caseNum, [MIMO_64TR_TC]) || CsiBeamIdxMap.isKey(caseNum) || TrsBeamIdxMap.isKey(caseNum)
             beamIdx_static_offset = beamIdx_csirs_static(1);
             [row2nPort, ~] = getCsirsConfig();
+            % For NZP with CsiBeamIdxMap: one TV can have multiple NZP PDUs; map uses non-overlapping segments (e.g. PDU1 32 beams, PDU2 8 beams -> 40 entries)
+            fullCsiBeamIdx = [];
+            if CsiBeamIdxMap.isKey(caseNum)
+                fullCsiBeamIdx = CsiBeamIdxMap(caseNum);
+            end
+            nzpReadOffset = 1;  % 1-based index into fullCsiBeamIdx for next NZP PDU
             for idxUe = 1:length(SysPar.csirs)
                 digBFInterfaces = row2nPort(SysPar.csirs{idxUe}.Row);
                 if (SysPar.csirs{idxUe}.CSIType == csirsType.TRS && TrsBeamIdxMap.isKey(caseNum))  % by mapping method
@@ -8866,11 +9912,12 @@ parfor n = 1:NallTest
                     end
                     SysPar.csirs{idxUe}.beamIdx = beamIdx_static_offset + TrsBeamIdxMap(caseNum);    
                 elseif (SysPar.csirs{idxUe}.CSIType == csirsType.NZP && CsiBeamIdxMap.isKey(caseNum))  % by mapping method
-                    if digBFInterfaces > length(CsiBeamIdxMap(caseNum))
-                        error('csi rs NZP beams mapping error: digBFInterfaces = %d but CsiBeamIdxMap(%d) = %s \n', digBFInterfaces, caseNum, mat2str(CsiBeamIdxMap(caseNum)));
+                    if nzpReadOffset + digBFInterfaces - 1 > length(fullCsiBeamIdx)
+                        error('csi rs NZP beams mapping error: need %d beams for PDU but CsiBeamIdxMap(%d) has %d (used %d so far). \n', ...
+                            digBFInterfaces, caseNum, length(fullCsiBeamIdx), nzpReadOffset - 1);
                     end
-                    fullCsiBeamIdx = CsiBeamIdxMap(caseNum);
-                    SysPar.csirs{idxUe}.beamIdx = beamIdx_static_offset + fullCsiBeamIdx(1:digBFInterfaces);  
+                    SysPar.csirs{idxUe}.beamIdx = beamIdx_static_offset + fullCsiBeamIdx(nzpReadOffset : nzpReadOffset + digBFInterfaces - 1);
+                    nzpReadOffset = nzpReadOffset + digBFInterfaces;
                 elseif (SysPar.csirs{idxUe}.CSIType == csirsType.ZP && CsiZpBeamIdxMap.isKey(caseNum))
                     if digBFInterfaces ~= length(CsiZpBeamIdxMap(caseNum))
                         error('csi rs ZP beams mapping error: digBFInterfaces = %d but CsiZpBeamIdxMap(%d) = %s \n', digBFInterfaces, caseNum, mat2str(CsiZpBeamIdxMap(caseNum)));
@@ -8885,6 +9932,10 @@ parfor n = 1:NallTest
                 else
                     SysPar.csirs{idxUe}.digBFInterfaces = digBFInterfaces;
                 end
+            end
+            % Sanity: total NZP beams assigned should match CsiBeamIdxMap length
+            if CsiBeamIdxMap.isKey(caseNum) && (nzpReadOffset - 1) ~= length(fullCsiBeamIdx)
+                error('csi rs NZP beams mapping error: CsiBeamIdxMap(%d) has %d entries but NZP PDUs use %d. \n', caseNum, length(fullCsiBeamIdx), nzpReadOffset - 1);
             end
         end
         
@@ -8986,13 +10037,13 @@ parfor n = 1:NallTest
             SysPar.Chan{1}.SNR = 100;
             SysPar.SimCtrl.timeDomainSim = 1;
             
-             if ismember(caseNum, [190,192:194,280,281,296,12232:13696,20560:20831,20840:20861,20870:20949,20950:21029,21030:21069,21070:21109])  % nrSim pattern 90624~90636,90638~90656 and perf pattern 69,69a,69b,69c,69d,69e,71,73,75,77,79,81,83,85
+             if ismember(caseNum, [190,192:194,280,281,296,12232:13951,20560:20831,20840:20861,20870:21309])  % nrSim pattern 90624~90636,90638~90662 and perf pattern 69,69a,69b,69c,69d,69e,71,73,75,77,79,81,83,85,87,89,91
                 SysPar.SimCtrl.genTV.fhMsgMode = 2; % enable modulation compression
                 if enableCsiRs32PortsMap.isKey(caseNum) && enableCsiRs32PortsMap(caseNum) == 1
                     SysPar.SimCtrl.nPort_enable_csirs_compression = 32;
                 end
 
-                if ismember(caseNum, [20831, 20950:20989, 13547:13696])
+                if ismember(caseNum, [20831, 20950:20989, 21270:21309, 13547:13696, 13802:13951])
                     SysPar.SimCtrl.enable_dynamic_BF = 1;
                     SysPar.carrier.Nant_gNB = 64;
                     SysPar.carrier.N_FhPort_DL = 32;

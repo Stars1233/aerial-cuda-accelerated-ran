@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -237,6 +237,8 @@ __device__ __forceinline__ uint32_t warpLevelExclusiveScan(bool pred)
     return __popc(validRelSeqBmsk & __lanemask_lt());
 }
 
+// the stream-compaction code uses exclusive scan, not inclusive scan, so these functions are never called
+/*VCAST_DONT_INSTRUMENT_START*/
 //  __lanemask_le() returns the mask of all lanes (including inactive ones) with ID less than or equal to the
 // current lane
 __device__ __forceinline__ uint32_t __lanemask_le()
@@ -254,6 +256,7 @@ __device__ __forceinline__ uint32_t warpLevelInclusiveScan(bool pred)
     uint32_t validRelSeqBmsk = __ballot_sync(FULL_WARP_ACTIVE_BMSK, pred);
     return __popc(validRelSeqBmsk & __lanemask_le());
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 // 1. Per warp use __ballot to receive a bit mask representing all the threads in the warp which returns true
 //    to the predicate argument (i.e. if the information bit location corresponding to the thread is valid)
@@ -370,17 +373,22 @@ __device__ void computeInterleaverIdxs(thread_block const& thisThrdBlk, thread_b
 #endif
 }
 
+
 // Number of entries to be sorted needs to be power of 2 for Bitonic sort
 __device__ __forceinline__ uint32_t getNumBitonicSortEntries(uint32_t nEntries)
 {
     uint32_t nSortEntries = roundUpToPow2Gpu(nEntries);
     if(nSortEntries < 2) nSortEntries = 2;
 
+    // the bitonic sort code is never called
+    /*VCAST_DONT_INSTRUMENT_START*/
     // The number of sort entires is not expected to exceed 512 (N_MAX_CODED_BITS)
     if(nSortEntries > N_MAX_CODED_BITS) nSortEntries = N_MAX_CODED_BITS;
+    /*VCAST_DONT_INSTRUMENT_END*/
 
     return nSortEntries;
 }
+
 
 //--------------------------------------------------------------------------------------------------------
 // Helpers for Bit extraction

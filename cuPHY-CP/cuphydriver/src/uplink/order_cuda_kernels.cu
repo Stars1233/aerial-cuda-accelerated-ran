@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include "aerial-fh-driver/api.hpp"
 #include "aerial-fh-driver/oran.hpp"
+#include "aerial-fh-driver/sem.hpp"
 #include "gpu_blockFP.h" //Compression Decompression repo
 #include "gpu_fixed.h"  //Compression Decompression repo
 #include "nvlog.hpp"
@@ -26,7 +27,8 @@
 #pragma nv_diag_suppress 177 // warning #177-D: variable "wqe_id" was declared but never referenced
 #pragma nv_diag_suppress 550 // #550-D: variable "wqe_id_last" was set but never used
 #include <doca_gpunetio.h>
-#include <doca_gpunetio_dev_src_eth.cuh>
+#include <doca_gpunetio_dev_eth_rxq.cuh>
+#include <doca_gpunetio_dev_sem.cuh>
 #pragma nv_diag_restore 177
 #pragma nv_diag_restore 550
 
@@ -256,7 +258,7 @@ __global__ void order_kernel_doca(
 	unsigned long long first_packet_start = 0;
 	unsigned long long current_time = 0;
 	unsigned long long kernel_start = __globaltimer();
-	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;;
+	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;
 	uint8_t* buffer;
 	int prb_x_slot=pusch_prb_x_slot+prach_prb_x_slot;
 	doca_error_t ret = (doca_error_t)0;
@@ -273,8 +275,7 @@ __global__ void order_kernel_doca(
 	__shared__ uint32_t done_shared_sh;
 	__shared__ uint32_t last_stride_idx;
 	__shared__ uint64_t rx_timestamp;
-	struct doca_gpu_buf *buf_ptr;
-	uintptr_t rx_pkt_addr;
+	__shared__ struct doca_gpu_dev_eth_rxq_attr out_attr_sh[512];
 
     /* Note: WIP for a more generic approach to calculate and pass the startRB from the cuPHY-CP */
 	uint16_t startPRB_offset_idx_0 = 0 * 12 * prb_size;
@@ -325,17 +326,17 @@ __global__ void order_kernel_doca(
 			if (threadIdx.x == 0 || threadIdx.x == 32 || threadIdx.x == 64)
 				t0 = __globaltimer();
 */
-			// Add rx timestamp
-			if (threadIdx.x == 0) {
-				ret = doca_gpu_dev_eth_rxq_receive_thread(doca_rxq, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
-				/* If any thread returns receive error, the whole execution stops */
-				if (ret != DOCA_SUCCESS) {
-					doca_gpu_dev_semaphore_set_status(sem_gpu, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
-					DOCA_GPUNETIO_VOLATILE(*exit_cond_d) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
-					printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
-							blockIdx.x, threadIdx.x, ret, sem_idx_rx);
-				}
+		// Add rx timestamp
+		if (threadIdx.x == 0) {
+			ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_THREAD,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, out_attr_sh);
+		/* If any thread returns receive error, the whole execution stops */
+		if (ret != DOCA_SUCCESS) {
+			doca_gpu_dev_semaphore_set_status(sem_gpu, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
+			DOCA_GPUNETIO_VOLATILE(*exit_cond_d) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
+				printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
+						blockIdx.x, threadIdx.x, ret, sem_idx_rx);
 			}
+		}
 /*
 			if (threadIdx.x == 0 || threadIdx.x == 32 || threadIdx.x == 64)
 				t1 = __globaltimer();
@@ -346,10 +347,10 @@ __global__ void order_kernel_doca(
 			if (threadIdx.x == 0 || threadIdx.x == 32 || threadIdx.x == 64)
 				t2 = __globaltimer();
 */
-			if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
-				if (threadIdx.x == 0)
-					doca_gpu_dev_semaphore_set_packet_info(sem_gpu, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
-				sem_idx_rx = (sem_idx_rx+1) & (sem_order_num - 1);
+		if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
+			if (threadIdx.x == 0)
+				doca_gpu_dev_semaphore_set_packet_info(sem_gpu, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
+			sem_idx_rx = (sem_idx_rx+1) & (sem_order_num - 1);
 /*
 				if (threadIdx.x == 0 || threadIdx.x == 32 || threadIdx.x == 64) {
 					printf("ThreadIdx %d Rx %d sem_idx_rx %d pkts took %lld us sync %lld us\n",
@@ -375,11 +376,14 @@ __global__ void order_kernel_doca(
 			/* Block 1 waits on semaphore for new packets and process them */
 
 			/* Semaphore wait */
-			if (threadIdx.x == 0) {
-				do {
-					ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
-				} while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d) == ORDER_KERNEL_RUNNING);
+		if (threadIdx.x == 0) {
+			do {
+				ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
+			} while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d) == ORDER_KERNEL_RUNNING);
 			}
+            // COVERITY_DEVIATION: blockIdx.x is uniform across all threads in a block.
+            // All threads in this block will reach __syncthreads(), no actual divergence.
+            // coverity[CUDA.DIVERGENCE_AT_COLLECTIVE_OPERATION]
 			__syncthreads();
 
 			/* Check error or exit condition */
@@ -396,12 +400,9 @@ __global__ void order_kernel_doca(
 			if(DOCA_GPUNETIO_VOLATILE(rx_pkt_num) == 0)
 				continue;
 
-			/* Order & decompress packets */
-			for (uint32_t pkt_idx = warpId; pkt_idx < rx_pkt_num; pkt_idx += nwarps) {
-				doca_gpu_dev_eth_rxq_get_buf(doca_rxq, rx_buf_idx + pkt_idx, &buf_ptr);
-			    doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-
-                uint8_t *pkt_thread = (uint8_t*)rx_pkt_addr;
+		/* Order & decompress packets */
+		for (uint32_t pkt_idx = warpId; pkt_idx < rx_pkt_num; pkt_idx += nwarps) {
+            uint8_t *pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq, rx_buf_idx + pkt_idx);
 				uint16_t section_id_pkt  = oran_umsg_get_section_id(pkt_thread);
 				uint8_t frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
 				uint8_t subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
@@ -467,6 +468,11 @@ __global__ void order_kernel_doca(
 						else if(section_id_pkt == prach_section_id_1) buffer = prach_buffer_1;
 						else if(section_id_pkt == prach_section_id_2) buffer = prach_buffer_2;
 						else if(section_id_pkt == prach_section_id_3) buffer = prach_buffer_3;
+						else {
+							// Invalid section_id - skip this packet
+                            printf("ERROR invalid section_id %d for Cell %d F%dS%dS%d\n", section_id_pkt, blockIdx.x, frameId_pkt, subframeId_pkt, slotId_pkt);
+							continue;
+						}
 						gbuf_offset_ptr = buffer + oran_get_offset_from_hdr(pkt_thread, (uint16_t)get_eaxc_index(prach_eAxC_map, prach_eAxC_num,
 																		oran_umsg_get_flowid(pkt_thread)),
 																		prach_symbols_x_slot, prach_prb_x_port_x_symbol, prb_size);
@@ -529,10 +535,10 @@ __global__ void order_kernel_doca(
 			__threadfence();
 			__syncthreads();
 
-			if(threadIdx.x == 0) {
-				if(DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
-					doca_gpu_dev_semaphore_set_status(sem_gpu, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
-					last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num - 1);
+		if(threadIdx.x == 0) {
+			if(DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
+				doca_gpu_dev_semaphore_set_status(sem_gpu, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
+				last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num - 1);
 					__threadfence();
 				}
 				DOCA_GPUNETIO_VOLATILE(rx_pkt_num) = 0;
@@ -683,7 +689,7 @@ __global__ void order_kernel_doca_single(
 	unsigned long long first_packet_start = 0;
 	unsigned long long current_time = 0;
 	unsigned long long kernel_start = __globaltimer();
-	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;;
+	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;
 	uint8_t* buffer;
 	int prb_x_slot=pusch_prb_x_slot[cell_idx]+prach_prb_x_slot[cell_idx];
 	doca_error_t ret = (doca_error_t)0;
@@ -722,8 +728,7 @@ __global__ void order_kernel_doca_single(
     __shared__ uint64_t next_slot_rx_packets_ts_sh[ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_MAX_SYMBOLS];
     __shared__ uint32_t next_slot_rx_packets_count_sh[ORAN_MAX_SYMBOLS];
     __shared__ uint32_t next_slot_rx_bytes_count_sh[ORAN_MAX_SYMBOLS];
-	struct doca_gpu_buf *buf_ptr;
-	uintptr_t rx_pkt_addr;
+    __shared__ struct doca_gpu_dev_eth_rxq_attr out_attr_sh[512];
 
 	//Cell specific (de-reference from host pinned memory once)
 	uint8_t* done_shared_cell=*(done_shared+cell_idx);
@@ -859,6 +864,9 @@ __global__ void order_kernel_doca_single(
                 next_slot_rx_packets_count_sh[threadIdx.x]=0;
                 next_slot_rx_bytes_count_sh[threadIdx.x]=0;
             }
+            // COVERITY_DEVIATION: blockIdx.x is uniform across all threads in a block.
+            // All threads in this block will reach __syncthreads(), no actual divergence.
+            // coverity[CUDA.DIVERGENCE_AT_COLLECTIVE_OPERATION]
             __syncthreads();
             for(uint32_t pkt_idx=threadIdx.x;pkt_idx<max_pkt_idx;pkt_idx+=blockDim.x)
             {
@@ -922,14 +930,30 @@ __global__ void order_kernel_doca_single(
 				// printf("Timeout check Done Exit condition (%d)\n",DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell));
 				DOCA_GPUNETIO_VOLATILE(rx_pkt_num) = 0;
 			}
+
+            // COVERITY_DEVIATION: blockIdx.x is uniform across all threads in a block.
+            // All threads in this block will reach __syncthreads(), no actual divergence.
+            // coverity[CUDA.DIVERGENCE_AT_COLLECTIVE_OPERATION]
 			__syncthreads();
 
 			if (DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) != ORDER_KERNEL_RUNNING)
 				break;
 
             if(commViaCpu)
-            {
-                ret = doca_gpu_dev_eth_rxq_receive_block(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
+        {
+            ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, out_attr_sh);
+            /* If any thread returns receive error, the whole execution stops */
+            if (ret != DOCA_SUCCESS) {
+                doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
+                DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
+                printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
+                        blockIdx.x, threadIdx.x, ret, sem_idx_rx);
+            }
+        }
+        else
+        {
+            if (threadIdx.x == 0) {
+                ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_THREAD,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, out_attr_sh);
                 /* If any thread returns receive error, the whole execution stops */
                 if (ret != DOCA_SUCCESS) {
                     doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
@@ -938,18 +962,6 @@ __global__ void order_kernel_doca_single(
                             blockIdx.x, threadIdx.x, ret, sem_idx_rx);
                 }
             }
-            else
-            {
-                if (threadIdx.x == 0) {
-                    ret = doca_gpu_dev_eth_rxq_receive_thread(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
-                    /* If any thread returns receive error, the whole execution stops */
-                    if (ret != DOCA_SUCCESS) {
-                        doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
-                        DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
-                        printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
-                                blockIdx.x, threadIdx.x, ret, sem_idx_rx);
-                    }
-                }
 
                 if(pcap_capture_enable && (pcap_capture_cell_bitmask & (cell_idx_mask)) != 0)
                 {
@@ -957,30 +969,41 @@ __global__ void order_kernel_doca_single(
                 }
             }
 			__threadfence();
-			__syncthreads();
+		__syncthreads();
 
-			if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
-                    if (threadIdx.x == 0){
-    					doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);                        
-                        atomicAdd(&rx_pkt_num_total,rx_pkt_num);
-                        //printf("Cell Idx %d F%dS%dS%d rx_pkt_num %d\n",cell_idx,frameId, subframeId, slotId,rx_pkt_num);    
-                    }    
-					// Check rx timestamp --  can be done for all packets
-                    for(uint32_t pkt_idx=threadIdx.x;pkt_idx<rx_pkt_num;pkt_idx+=blockDim.x)
-                    {
-                        doca_gpu_dev_eth_rxq_get_buf(doca_rxq_cell, rx_buf_idx+pkt_idx, &buf_ptr);
-                        doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-
-    					pkt_thread = (uint8_t*)rx_pkt_addr;
-                        frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
+		if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
+            if (threadIdx.x == 0){
+				doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);                        
+                atomicAdd(&rx_pkt_num_total,rx_pkt_num);
+                //printf("Cell Idx %d F%dS%dS%d rx_pkt_num %d\n",cell_idx,frameId, subframeId, slotId,rx_pkt_num);    
+            }    
+			// Check rx timestamp --  can be done for all packets
+                for(uint32_t pkt_idx=threadIdx.x;pkt_idx<rx_pkt_num;pkt_idx+=blockDim.x)
+                {
+					pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq_cell, rx_buf_idx + pkt_idx);
+                    frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
                         subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
                         slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);
     					symbol_id_pkt = oran_umsg_get_symbol_id(pkt_thread);
+
+                        // Bounds check for symbol_id_pkt from untrusted packet data
+                        if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+                        {
+                            printf("ERROR invalid symbol_id %d (max %d) for Cell %d F%dS%dS%d\n",
+                                   symbol_id_pkt,
+                                   ORAN_ALL_SYMBOLS - 1,
+                                   cell_idx,
+                                   frameId_pkt,
+                                   subframeId_pkt,
+                                   slotId_pkt);
+                            continue; // Skip this packet
+                        }
+
                         slot_count_curr = (2*subframeId_pkt+slotId_pkt);
                         section_buf = oran_umsg_get_first_section_buf(pkt_thread);
                         ecpri_payload_length = min(oran_umsg_get_ecpri_payload(pkt_thread),ORAN_ECPRI_MAX_PAYLOAD_LEN);
 
-    					doca_gpu_dev_eth_rxq_get_buf_timestamp(doca_rxq_cell, rx_buf_idx+pkt_idx, &rx_timestamp);
+    					rx_timestamp = out_attr_sh[pkt_idx].timestamp_ns;
 
                         // Store received packets in buffer
                         if(pcap_capture_enable && (pcap_capture_cell_bitmask & (cell_idx_mask)) != 0)
@@ -1044,7 +1067,7 @@ __global__ void order_kernel_doca_single(
                                     atomicAdd(&next_slot_num_prb_ch2_sh,num_prb);
                                 }
                                 __threadfence_block();
-                                section_buf_size = compressed_prb_size * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
+                                section_buf_size = static_cast<uint32_t>(compressed_prb_size) * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
                                 current_length += section_buf_size;
                                 section_buf += section_buf_size;
                             }                              
@@ -1091,7 +1114,7 @@ __global__ void order_kernel_doca_single(
                                     atomicAdd(&num_prb_ch2_sh,num_prb);
                                 }
                                 __threadfence_block();
-                                section_buf_size = compressed_prb_size * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
+                                section_buf_size = static_cast<uint32_t>(compressed_prb_size) * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
                                 current_length += section_buf_size;
                                 section_buf += section_buf_size;
                             }
@@ -1122,10 +1145,10 @@ __global__ void order_kernel_doca_single(
 
 			/* Semaphore wait */
 			if (threadIdx.x == 0) {
-				// printf("Block idx %d waiting on sem %d addr %lx\n", blockIdx.x, sem_idx_order, &(sem_gpu_cell[sem_idx_order]));
-				do {
-					ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu_cell, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
-				} while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING);
+			// printf("Block idx %d waiting on sem %d addr %lx\n", blockIdx.x, sem_idx_order, &(sem_gpu_cell[sem_idx_order]));
+			do {
+				ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu_cell, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
+			} while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING);
 				// FIXME: check timeout
 			}
 			__syncthreads();
@@ -1141,12 +1164,9 @@ __global__ void order_kernel_doca_single(
 			if(DOCA_GPUNETIO_VOLATILE(rx_pkt_num) == 0)
 				continue;
 
-			/* Order & decompress packets */
-			for (uint32_t pkt_idx = warpId; pkt_idx < rx_pkt_num; pkt_idx += nwarps) {
-				doca_gpu_dev_eth_rxq_get_buf(doca_rxq_cell, rx_buf_idx + pkt_idx, &buf_ptr);
-				doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-
-				pkt_thread = (uint8_t*)rx_pkt_addr;
+		/* Order & decompress packets */
+		for (uint32_t pkt_idx = warpId; pkt_idx < rx_pkt_num; pkt_idx += nwarps) {
+			pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq_cell, rx_buf_idx + pkt_idx);
 				frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
 				subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
 				slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);
@@ -1226,6 +1246,11 @@ __global__ void order_kernel_doca_single(
 							else if(section_id == prach_section_id_1) buffer = prach_buffer_1_cell;
 							else if(section_id == prach_section_id_2) buffer = prach_buffer_2_cell;
 							else if(section_id == prach_section_id_3) buffer = prach_buffer_3_cell;
+							else {
+								// Invalid section_id - skip this section
+                                printf("ERROR invalid section_id %d for Cell %d F%dS%dS%d\n", section_id, cell_idx, frameId_pkt, subframeId_pkt, slotId_pkt);
+								break;
+							}
 							gbuf_offset_ptr = buffer + oran_get_offset_from_hdr(pkt_thread, (uint16_t)get_eaxc_index(prach_eAxC_map_cell, prach_eAxC_num_cell,
 																		 oran_umsg_get_flowid(pkt_thread)),
 													    prach_symbols_x_slot, prach_prb_x_port_x_symbol_cell, prb_size, start_prb);
@@ -1289,15 +1314,15 @@ __global__ void order_kernel_doca_single(
                         break;
                     }
 				}
-			}
-			__syncthreads();
+		}
+		__syncthreads();
 
-			if(threadIdx.x == 0 && DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
-				doca_gpu_dev_semaphore_set_status(sem_gpu_cell, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
-				last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num_cell - 1);
-			}
+		if(threadIdx.x == 0 && DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
+			doca_gpu_dev_semaphore_set_status(sem_gpu_cell, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
+			last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num_cell - 1);
+		}
 
-			sem_idx_order = (sem_idx_order+1) & (sem_order_num_cell - 1);
+		sem_idx_order = (sem_idx_order+1) & (sem_order_num_cell - 1);
 		}
 	}
 
@@ -1423,8 +1448,6 @@ __global__ void receive_kernel_for_test_bench(
     int prb_x_slot=0;
     const uint16_t sem_order_num_cell=sem_order_num[cell_idx];
     doca_error_t ret = (doca_error_t)0;
-    struct doca_gpu_buf *buf_ptr;
-    uintptr_t rx_pkt_addr;
     uint32_t o_next_slot_rx_pkt_count;
     __shared__ uint32_t next_slot_first_pkt_rcvd;
     __shared__ uint32_t next_slot_first_pkt_idx;
@@ -1438,6 +1461,7 @@ __global__ void receive_kernel_for_test_bench(
 	__shared__ uint32_t next_slot_num_prb_ch2_sh;
     __shared__ uint32_t exit_rx_cta_sh;      
     __shared__ uint32_t pkt_idx_offset_from_prev_slot;
+    __shared__ struct doca_gpu_dev_eth_rxq_attr out_attr_sh[512];
 
     next_slot_num_prb_ch1_cell = *(next_slot_num_prb_ch1+cell_idx);
     if(srs_mode)
@@ -1522,40 +1546,44 @@ __global__ void receive_kernel_for_test_bench(
 				break;
 
 			// Add rx timestamp
-			if (threadIdx.x == 0) {
-				ret = doca_gpu_dev_eth_rxq_receive_thread(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
-				/* If any thread returns receive error, the whole execution stops */
-				if (ret != DOCA_SUCCESS) {
-					doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
-					DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
-					//printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
-					//	blockIdx.x, threadIdx.x, ret, sem_idx_rx);
-				}
-                //printf("[receive_kernel_for_test_bench]F%dS%dS%d Received packet count %d pkt_dst_buf for curr slot %p Ordered PRB count %d\n",frameId, subframeId, slotId,rx_pkt_num,(void*)(tb_fh_buf_cell+((pkt_idx_offset_from_prev_slot)*max_pkt_size)),(num_prb_ch1_sh+num_prb_ch2_sh));
-			}
-			__threadfence();
-			__syncthreads();
+            ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, out_attr_sh);
+            /* If any thread returns receive error, the whole execution stops */
+            if (ret != DOCA_SUCCESS) {
+                doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
+                DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
+                //printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
+                //	blockIdx.x, threadIdx.x, ret, sem_idx_rx);
+            }
+            //printf("[receive_kernel_for_test_bench]F%dS%dS%d Received packet count %d pkt_dst_buf for curr slot %p Ordered PRB count %d\n",frameId, subframeId, slotId,rx_pkt_num,(void*)(tb_fh_buf_cell+((pkt_idx_offset_from_prev_slot)*max_pkt_size)),(num_prb_ch1_sh+num_prb_ch2_sh));
 
-			if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
-                if (threadIdx.x == 0){
-                    doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
-                }
-                // Check rx timestamp --  can be done for all packets
-                for(uint32_t pkt_idx=threadIdx.x;pkt_idx<rx_pkt_num;pkt_idx+=blockDim.x)
+		if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
+        if (threadIdx.x == 0){
+            doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
+        }
+            // Check rx timestamp --  can be done for all packets
+            for(uint32_t pkt_idx=threadIdx.x;pkt_idx<rx_pkt_num;pkt_idx+=blockDim.x)
+            {
+                pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq_cell, rx_buf_idx + pkt_idx);
+                frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
+                subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
+                slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);                    
+                symbol_id_pkt = oran_umsg_get_symbol_id(pkt_thread);
+                // Warning for invalid symbol_id (not used for array indexing here, only for packet metadata)
+                if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
                 {
-                    doca_gpu_dev_eth_rxq_get_buf(doca_rxq_cell, rx_buf_idx+pkt_idx, &buf_ptr);
-                    doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-
-                    pkt_thread = (uint8_t*)rx_pkt_addr;
-                    frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
-                    subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
-                    slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);                    
-                    symbol_id_pkt = oran_umsg_get_symbol_id(pkt_thread);
-                    slot_count_curr = (2*subframeId_pkt+slotId_pkt);
-                    section_buf = oran_umsg_get_first_section_buf(pkt_thread);
-                    ecpri_payload_length = min(oran_umsg_get_ecpri_payload(pkt_thread),ORAN_ECPRI_MAX_PAYLOAD_LEN);
-                    // Network endianness to CPU endianness
-                    if((frameId_pkt!=frameId) || (((slot_count_curr-slot_count_input+20)%20)>1)) //Drop scoring if packets from 2 or greater slots away are received during current slot reception or if the frame IDs mis-match
+                    printf("WARNING invalid symbol_id %d (max %d) for Cell %d F%dS%dS%d\n",
+                           symbol_id_pkt,
+                           ORAN_ALL_SYMBOLS - 1,
+                           cell_idx,
+                           frameId_pkt,
+                           subframeId_pkt,
+                           slotId_pkt);
+                }
+                slot_count_curr = (2*subframeId_pkt+slotId_pkt);
+                section_buf = oran_umsg_get_first_section_buf(pkt_thread);
+                ecpri_payload_length = min(oran_umsg_get_ecpri_payload(pkt_thread),ORAN_ECPRI_MAX_PAYLOAD_LEN);
+                // Network endianness to CPU endianness
+                if((frameId_pkt!=frameId) || (((slot_count_curr-slot_count_input+20)%20)>1)) //Drop scoring if packets from 2 or greater slots away are received during current slot reception or if the frame IDs mis-match
                     {
                         continue;
                     }
@@ -1606,7 +1634,7 @@ __global__ void receive_kernel_for_test_bench(
                                 }                                
                             }
                             __threadfence_block();
-                            section_buf_size = compressed_prb_size * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
+                            section_buf_size = static_cast<uint32_t>(compressed_prb_size) * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
                             current_length += section_buf_size;
                             section_buf += section_buf_size;
                         }                        
@@ -1661,7 +1689,7 @@ __global__ void receive_kernel_for_test_bench(
                                 }                                
                             }
                             __threadfence_block();
-                            section_buf_size = compressed_prb_size * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
+                            section_buf_size = static_cast<uint32_t>(compressed_prb_size) * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
                             current_length += section_buf_size;
                             section_buf += section_buf_size;
                         }
@@ -1831,8 +1859,6 @@ const uint32_t&  max_rx_pkts,
 const uint64_t& timeout_ns,
 uint64_t& rx_buf_idx,
 struct doca_gpu_semaphore_gpu* sem_gpu_cell,
-struct doca_gpu_buf *buf_ptr,
-uintptr_t rx_pkt_addr,
 uint64_t&		slot_start_cell,
 uint64_t&		ta4_min_ns_cell,
 uint64_t&		ta4_max_ns_cell,
@@ -1865,7 +1891,8 @@ uint8_t *pcap_buffer_cell,
 uint8_t *pcap_buffer_ts_cell,
 uint8_t& pcap_capture_enable,
 uint64_t& pcap_capture_cell_bitmask,
-uint32_t& pcap_pkt_num_total
+uint32_t& pcap_pkt_num_total,
+struct doca_gpu_dev_eth_rxq_attr *out_attr_sh
 )
 {
     unsigned long long current_time = 0;
@@ -1948,28 +1975,28 @@ uint32_t& pcap_pkt_num_total
         // Add rx timestamp
         if(commViaCpu)
         {
-                ret = doca_gpu_dev_eth_rxq_receive_block(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
-                printf("doca_gpu_dev_eth_rxq_receive_block triggered for F%dS%dS%d\n",frameId, subframeId, slotId);
-                /* If any thread returns receive error, the whole execution stops */
-                if (ret != DOCA_SUCCESS) {
-                    doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
-                    DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR1;
-                    printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
-                        blockIdx.x, threadIdx.x, ret, sem_idx_rx);
-                }
-        }
+            ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, out_attr_sh);
+            printf("doca_gpu_dev_eth_rxq_recv<BLOCK> triggered for F%dS%dS%d\n",frameId, subframeId, slotId);
+            /* If any thread returns receive error, the whole execution stops */
+            if (ret != DOCA_SUCCESS) {
+                doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
+                DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR1;
+                printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
+                    blockIdx.x, threadIdx.x, ret, sem_idx_rx);
+            }
+    }
         else
         {
-            if (threadIdx.x == 0) {
-                ret = doca_gpu_dev_eth_rxq_receive_thread(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
-                /* If any thread returns receive error, the whole execution stops */
-                if (ret != DOCA_SUCCESS) {
-                    doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
-                    DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR1;
-                    printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
-                        blockIdx.x, threadIdx.x, ret, sem_idx_rx);
-                }
+        if (threadIdx.x == 0) {
+            ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_THREAD,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, out_attr_sh);
+            /* If any thread returns receive error, the whole execution stops */
+            if (ret != DOCA_SUCCESS) {
+                doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
+                DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR1;
+                printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
+                    blockIdx.x, threadIdx.x, ret, sem_idx_rx);
             }
+        }
             if(pcap_capture_enable && (pcap_capture_cell_bitmask & (cell_idx_mask)) != 0)
             {
                 start_pcap_pkt_offset = pcap_pkt_num_total;
@@ -1977,38 +2004,50 @@ uint32_t& pcap_pkt_num_total
         }
         __threadfence();
         __syncthreads();
-        
+    
 
-        if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
-            if (threadIdx.x == 0){
-                doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
-                atomicAdd(&rx_pkt_num_total,rx_pkt_num);                        
-                // printf("Receive kernel Cell Idx %d F%dS%dS%d rx_pkt_num %d rx_buf_idx %lu sem_idx_rx %d READY\n",cell_idx,frameId, subframeId, slotId, rx_pkt_num, rx_buf_idx, sem_idx_rx);
-            }
+    if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
+        if (threadIdx.x == 0){
+            doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
+            atomicAdd(&rx_pkt_num_total,rx_pkt_num);                        
+            // printf("Receive kernel Cell Idx %d F%dS%dS%d rx_pkt_num %d rx_buf_idx %lu sem_idx_rx %d READY\n",cell_idx,frameId, subframeId, slotId, rx_pkt_num, rx_buf_idx, sem_idx_rx);
+        }
 
-            // Check rx timestamp --  can be done for all packets
+        // Check rx timestamp --  can be done for all packets
             for(uint32_t pkt_idx=threadIdx.x;pkt_idx<rx_pkt_num;pkt_idx+=blockDim.x)
             {
                 if(ok_tb_enable)
                 {
                     pkt_thread = (uint8_t*)(tb_fh_buf_cell+((pkt_idx)*max_pkt_size));
-                }
-                else
-                {
-                    doca_gpu_dev_eth_rxq_get_buf(doca_rxq_cell, rx_buf_idx+pkt_idx, &buf_ptr);
-                    doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-                    pkt_thread = (uint8_t*)rx_pkt_addr;
-                }
-                
-                frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
+            }
+            else
+            {
+                pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq_cell, rx_buf_idx + pkt_idx);
+            }
+            
+            frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
                 subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
                 slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);                    
                 symbol_id_pkt = oran_umsg_get_symbol_id(pkt_thread);
+
+                // Bounds check for symbol_id_pkt from untrusted packet data
+                if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+                {
+                    printf("ERROR invalid symbol_id %d (max %d) for Cell %d F%dS%dS%d\n",
+                           symbol_id_pkt,
+                           ORAN_ALL_SYMBOLS - 1,
+                           cell_idx,
+                           frameId_pkt,
+                           subframeId_pkt,
+                           slotId_pkt);
+                    continue; // Skip this packet
+                }
+
                 slot_count_curr = (2*subframeId_pkt+slotId_pkt);
                 section_buf = oran_umsg_get_first_section_buf(pkt_thread);
                 ecpri_payload_length = min(oran_umsg_get_ecpri_payload(pkt_thread),ORAN_ECPRI_MAX_PAYLOAD_LEN);
 
-                doca_gpu_dev_eth_rxq_get_buf_timestamp(doca_rxq_cell, rx_buf_idx+pkt_idx, &rx_timestamp);
+                rx_timestamp = out_attr_sh[pkt_idx].timestamp_ns;
 
                 // Store received packets in buffer
                 if(!ok_tb_enable && pcap_capture_enable && (pcap_capture_cell_bitmask & (cell_idx_mask)) != 0)
@@ -2081,7 +2120,7 @@ uint32_t& pcap_pkt_num_total
                             atomicAdd(&next_slot_num_prb_ch2_sh,num_prb);
                         }
                         __threadfence_block();
-                        section_buf_size = compressed_prb_size * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
+                        section_buf_size = static_cast<uint32_t>(compressed_prb_size) * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
                         current_length += section_buf_size;
                         section_buf += section_buf_size;
                     }                        
@@ -2134,7 +2173,7 @@ uint32_t& pcap_pkt_num_total
                             atomicAdd(&num_prb_ch2_sh,num_prb);
                         }
                         __threadfence_block();
-                        section_buf_size = compressed_prb_size * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
+                        section_buf_size = static_cast<uint32_t>(compressed_prb_size) * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
                         current_length += section_buf_size;
                         section_buf += section_buf_size;
                     }
@@ -2184,8 +2223,6 @@ __device__ __forceinline__ void order_kernel_doca_process_receive_packets_subSlo
     int laneId,
     struct doca_gpu_eth_rxq* doca_rxq_cell,
     uint64_t rx_buf_idx,
-    struct doca_gpu_buf *buf_ptr,
-    uintptr_t rx_pkt_addr,
     uint32_t* exit_cond_d_cell,
 	const uint8_t		frameId,
 	const uint8_t		subframeId,
@@ -2261,18 +2298,30 @@ __device__ __forceinline__ void order_kernel_doca_process_receive_packets_subSlo
         if(ok_tb_enable)
         {
             pkt_thread = (uint8_t*)(tb_fh_buf_cell+((pkt_idx)*max_pkt_size));
-        }
-        else
-        {
-            doca_gpu_dev_eth_rxq_get_buf(doca_rxq_cell, rx_buf_idx + pkt_idx, &buf_ptr);
-            doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-            pkt_thread = (uint8_t*)rx_pkt_addr;
-        }
-        frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
+    }
+    else
+    {
+        pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq_cell, rx_buf_idx + pkt_idx);
+    }
+    frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
         subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
         slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);
         symbol_id_pkt = oran_umsg_get_symbol_id(pkt_thread);
-        #if 0
+
+        // Bounds check for symbol_id_pkt from untrusted packet data
+        if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+        {
+            printf("ERROR invalid symbol_id %d (max %d) for Cell %d F%dS%dS%d\n",
+                   symbol_id_pkt,
+                   ORAN_ALL_SYMBOLS - 1,
+                   (blockIdx.x / 2),
+                   frameId_pkt,
+                   subframeId_pkt,
+                   slotId_pkt);
+            continue; // Skip this packet
+        }
+
+#if 0
         if (laneId == 0 && warpId == 0)
             printf("pkt_thread %lx: src %x:%x:%x:%x:%x:%x dst %x:%x:%x:%x:%x:%x proto %x:%x vlan %x:%x ecpri %x:%x hdr %x:%x:%x:%x:%x:%x:%x:%x\n",
                 // "pkt_idx %d stride_start_idx %d section_id_pkt %d/%d frameId_pkt %d/%d subframeId_pkt %d/%d slotId_pkt %d/%d\n",
@@ -2351,6 +2400,11 @@ __device__ __forceinline__ void order_kernel_doca_process_receive_packets_subSlo
                     else if(section_id == prach_section_id_1) buffer = prach_buffer_1_cell;
                     else if(section_id == prach_section_id_2) buffer = prach_buffer_2_cell;
                     else if(section_id == prach_section_id_3) buffer = prach_buffer_3_cell;
+                    else {
+                        // Invalid section_id - skip this section
+                        printf("ERROR invalid section_id %d for Cell %d F%dS%dS%d\n", section_id, (blockIdx.x / 2), frameId_pkt, subframeId_pkt, slotId_pkt);
+                        break;
+                    }
                     gbuf_offset_ptr = buffer + oran_get_offset_from_hdr(pkt_thread, (uint16_t)get_eaxc_index(prach_eAxC_map_cell, prach_eAxC_num_cell,
                                                                     oran_umsg_get_flowid(pkt_thread)),
                                                 prach_symbols_x_slot, prach_prb_x_port_x_symbol_cell, prb_size, start_prb);
@@ -2578,8 +2632,6 @@ __global__ void receive_process_kernel_for_test_bench(
     struct doca_gpu_eth_rxq* doca_rxq_cell=*(doca_rxq+cell_idx);
     const uint64_t timeout_ns = rx_pkts_timeout_ns;
     struct doca_gpu_semaphore_gpu* sem_gpu_cell=*(sem_gpu+cell_idx);
-    struct doca_gpu_buf *buf_ptr=nullptr;
-    uintptr_t rx_pkt_addr=0x0;
     uint64_t		slot_start_cell=slot_start[cell_idx];
 	uint64_t		ta4_min_ns_cell=ta4_min_ns[cell_idx];
 	uint64_t		ta4_max_ns_cell=ta4_max_ns[cell_idx];
@@ -2608,8 +2660,11 @@ __global__ void receive_process_kernel_for_test_bench(
 	__shared__ uint32_t num_prb_ch1_sh;
 	__shared__ uint32_t num_prb_ch2_sh;
 	__shared__ uint32_t next_slot_num_prb_ch1_sh;
-	__shared__ uint32_t next_slot_num_prb_ch2_sh;      
+	__shared__ uint32_t next_slot_num_prb_ch2_sh;
+    __shared__ struct doca_gpu_dev_eth_rxq_attr out_attr_sh[512];
 
+    // COVERITY_DEVIATION: blockIdx.x is uniform across all threads in a block, so all threads
+    // in this block will take the same branch. No actual thread divergence occurs.
     if((blockIdx.x & 0x1) == 0) //Receive CTA
     {
         if(threadIdx.x==0){
@@ -2622,17 +2677,14 @@ __global__ void receive_process_kernel_for_test_bench(
             exit_rx_cta_sh=0;
         }
         sem_idx_rx=0;
+        // COVERITY_DEVIATION: blockIdx.x is uniform across all threads in a block.
+        // All threads in this block will reach __syncthreads(), no actual divergence.
+        // coverity[CUDA.DIVERGENCE_AT_COLLECTIVE_OPERATION]
         __syncthreads();
-        order_kernel_doca_receive_packets_subSlot(true,tb_fh_buf_cell,max_pkt_size,first_packet_received,first_packet_received_time,timeout_first_pkt_ns,timeout_no_pkt_ns,timeout_log_enable,order_kernel_last_timeout_error_time_cell,timeout_log_interval_ns,kernel_start,
-                                                    cell_idx,sem_idx_rx,last_sem_idx_rx_h_cell,sem_idx_order,last_sem_idx_order_h_cell,pusch_ordered_prbs_cell,pusch_prb_x_slot_cell,prach_ordered_prbs_cell,prach_prb_x_slot_cell,
-                                                    frameId,subframeId,slotId,done_shared_sh,last_stride_idx,rx_pkt_num_total,sym_ord_done_sig_arr,exit_cond_d_cell,rx_pkt_num,commViaCpu,doca_rxq_cell,max_rx_pkts,timeout_ns,
-                                                    rx_buf_idx,sem_gpu_cell,buf_ptr,rx_pkt_addr,slot_start_cell,ta4_min_ns_cell,ta4_max_ns_cell,slot_duration_cell,next_slot_rx_packets_count_sh,next_slot_rx_bytes_count_sh,rx_packets_count_sh,rx_bytes_count_sh,
-                                                    next_slot_early_rx_packets_count_sh,next_slot_on_time_rx_packets_count_sh,next_slot_late_rx_packets_count_sh,early_rx_packets_count_sh,on_time_rx_packets_count_sh,late_rx_packets_count_sh,
-                                                    ul_rx_pkt_tracing_level,next_slot_rx_packets_ts_sh,rx_packets_ts_sh,bit_width_cell,rx_packets_ts_earliest_sh,rx_packets_ts_latest_sh,num_prb_ch1_sh,num_prb_ch2_sh,next_slot_num_prb_ch1_sh,next_slot_num_prb_ch2_sh,sem_order_num_cell,prach_section_id_0,prb_x_slot,exit_rx_cta_sh,
-                                                    nullptr, nullptr, dummy8, dummy64, dummy32_sh
-                                                );
-        if(threadIdx.x==0){
-            printf("[Receive CTA]Exited receive_process_kernel_for_test_bench() for F%dS%dS%d cell ID %d\n",frameId,subframeId,slotId,cell_idx);            
+        order_kernel_doca_receive_packets_subSlot(true, tb_fh_buf_cell, max_pkt_size, first_packet_received, first_packet_received_time, timeout_first_pkt_ns, timeout_no_pkt_ns, timeout_log_enable, order_kernel_last_timeout_error_time_cell, timeout_log_interval_ns, kernel_start, cell_idx, sem_idx_rx, last_sem_idx_rx_h_cell, sem_idx_order, last_sem_idx_order_h_cell, pusch_ordered_prbs_cell, pusch_prb_x_slot_cell, prach_ordered_prbs_cell, prach_prb_x_slot_cell, frameId, subframeId, slotId, done_shared_sh, last_stride_idx, rx_pkt_num_total, sym_ord_done_sig_arr, exit_cond_d_cell, rx_pkt_num, commViaCpu, doca_rxq_cell, max_rx_pkts, timeout_ns, rx_buf_idx, sem_gpu_cell, slot_start_cell, ta4_min_ns_cell, ta4_max_ns_cell, slot_duration_cell, next_slot_rx_packets_count_sh, next_slot_rx_bytes_count_sh, rx_packets_count_sh, rx_bytes_count_sh, next_slot_early_rx_packets_count_sh, next_slot_on_time_rx_packets_count_sh, next_slot_late_rx_packets_count_sh, early_rx_packets_count_sh, on_time_rx_packets_count_sh, late_rx_packets_count_sh, ul_rx_pkt_tracing_level, next_slot_rx_packets_ts_sh, rx_packets_ts_sh, bit_width_cell, rx_packets_ts_earliest_sh, rx_packets_ts_latest_sh, num_prb_ch1_sh, num_prb_ch2_sh, next_slot_num_prb_ch1_sh, next_slot_num_prb_ch2_sh, sem_order_num_cell, prach_section_id_0, prb_x_slot, exit_rx_cta_sh, nullptr, nullptr, dummy8, dummy64, dummy32_sh, out_attr_sh);
+        if(threadIdx.x == 0)
+        {
+            printf("[Receive CTA]Exited receive_process_kernel_for_test_bench() for F%dS%dS%d cell ID %d\n", frameId, subframeId, slotId, cell_idx);
         }                                                    
         __syncthreads();
     }
@@ -2645,13 +2697,13 @@ __global__ void receive_process_kernel_for_test_bench(
         while (DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING)
         {
                 if(threadIdx.x==0){
-                    printf("Entered while loop processing inside receive_process_kernel_for_test_bench() for F%dS%dS%d cell ID%d rx_pkt_num_slot_cell %d pusch_ordered_prbs_cell %d prach_ordered_prbs_cell %d prb_x_slot %d pusch_prb_symbol_map_cell[0] %d num_order_cells_sym_mask_arr[0] %d\n",frameId,subframeId,slotId,cell_idx,rx_pkt_num_slot_cell,pusch_ordered_prbs_cell[0],prach_ordered_prbs_cell[0],prb_x_slot,pusch_prb_symbol_map_cell[0],num_order_cells_sym_mask_arr[0]);
-                    do {
-                        ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu_cell, 0, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
-                    } while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING);                
+                printf("Entered while loop processing inside receive_process_kernel_for_test_bench() for F%dS%dS%d cell ID%d rx_pkt_num_slot_cell %d pusch_ordered_prbs_cell %d prach_ordered_prbs_cell %d prb_x_slot %d pusch_prb_symbol_map_cell[0] %d num_order_cells_sym_mask_arr[0] %d\n",frameId,subframeId,slotId,cell_idx,rx_pkt_num_slot_cell,pusch_ordered_prbs_cell[0],prach_ordered_prbs_cell[0],prb_x_slot,pusch_prb_symbol_map_cell[0],num_order_cells_sym_mask_arr[0]);
+                do {
+                    ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu_cell, 0, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
+                } while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING);
                 }
                 /* Order & decompress packets */
-                order_kernel_doca_process_receive_packets_subSlot(true,tb_fh_buf_cell,max_pkt_size,rx_pkt_num_slot_cell,warpId,nwarps,laneId,nullptr,0,nullptr,0,exit_cond_d_cell,frameId,subframeId,slotId,
+                order_kernel_doca_process_receive_packets_subSlot(true,tb_fh_buf_cell,max_pkt_size,rx_pkt_num_slot_cell,warpId,nwarps,laneId,nullptr,0,exit_cond_d_cell,frameId,subframeId,slotId,
                                                                 &done_shared_sh,&last_stride_idx,bit_width_cell,comp_meth_cell,beta_cell,ru_type_cell,pkt_offset_ptr,gbuf_offset_ptr,prb_size,cell_idx_mask,prb_x_slot,
                                                                 pusch_eAxC_map_cell,pusch_eAxC_num_cell,pusch_symbols_x_slot,pusch_prb_x_port_x_symbol_cell,pusch_buffer_cell,pusch_ordered_prbs_cell,
                                                                 pusch_prb_symbol_map_cell,pusch_prb_symbol_ordered,pusch_prb_symbol_ordered_done,sym_ord_done_sig_arr,sym_ord_done_mask_arr,num_order_cells_sym_mask_arr,1,
@@ -2788,7 +2840,7 @@ __global__ void order_kernel_doca_single_subSlot(
 	unsigned long long first_packet_received_time = 0;
 	unsigned long long current_time = 0;
 	unsigned long long kernel_start = __globaltimer();
-	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;;
+	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;
 	uint8_t* buffer;
 	int prb_x_slot=pusch_prb_x_slot[cell_idx]+prach_prb_x_slot[cell_idx];
 	doca_error_t ret = (doca_error_t)0;
@@ -2828,8 +2880,7 @@ __global__ void order_kernel_doca_single_subSlot(
 	__shared__ uint32_t pusch_prb_symbol_ordered[ORAN_PUSCH_SYMBOLS_X_SLOT];
 	__shared__ uint32_t pusch_prb_symbol_ordered_done[ORAN_PUSCH_SYMBOLS_X_SLOT];
     __shared__ uint32_t pcap_pkt_num_total;
-	struct doca_gpu_buf *buf_ptr=nullptr;
-	uintptr_t rx_pkt_addr=0;
+    __shared__ struct doca_gpu_dev_eth_rxq_attr out_attr_sh[512];
 
 	//Cell specific (de-reference from host pinned memory once)
 	uint8_t* done_shared_cell=*(done_shared+cell_idx);
@@ -2976,6 +3027,9 @@ __global__ void order_kernel_doca_single_subSlot(
                 next_slot_rx_packets_count_sh[threadIdx.x]=0;
                 next_slot_rx_bytes_count_sh[threadIdx.x]=0;
             }
+            // COVERITY_DEVIATION: blockIdx.x is uniform across all threads in a block.
+            // All threads in this block will reach __syncthreads(), no actual divergence.
+            // coverity[CUDA.DIVERGENCE_AT_COLLECTIVE_OPERATION]
             __syncthreads();
             for(uint32_t pkt_idx=threadIdx.x;pkt_idx<max_pkt_idx;pkt_idx+=blockDim.x)
             {
@@ -3004,10 +3058,10 @@ __global__ void order_kernel_doca_single_subSlot(
         order_kernel_doca_receive_packets_subSlot(false,nullptr,max_pkt_size,first_packet_received,first_packet_received_time,timeout_first_pkt_ns,timeout_no_pkt_ns,timeout_log_enable,order_kernel_last_timeout_error_time_cell,timeout_log_interval_ns,kernel_start,
                                                     cell_idx,sem_idx_rx,last_sem_idx_rx_h_cell,sem_idx_order,last_sem_idx_order_h_cell,pusch_ordered_prbs_cell,pusch_prb_x_slot_cell,prach_ordered_prbs_cell,prach_prb_x_slot_cell,
                                                     frameId,subframeId,slotId,done_shared_sh,last_stride_idx,rx_pkt_num_total,sym_ord_done_sig_arr,exit_cond_d_cell,rx_pkt_num,commViaCpu,doca_rxq_cell,max_rx_pkts,timeout_ns,
-                                                    rx_buf_idx,sem_gpu_cell,buf_ptr,rx_pkt_addr,slot_start_cell,ta4_min_ns_cell,ta4_max_ns_cell,slot_duration_cell,next_slot_rx_packets_count_sh,next_slot_rx_bytes_count_sh,rx_packets_count_sh,rx_bytes_count_sh,
+                                                    rx_buf_idx,sem_gpu_cell,slot_start_cell,ta4_min_ns_cell,ta4_max_ns_cell,slot_duration_cell,next_slot_rx_packets_count_sh,next_slot_rx_bytes_count_sh,rx_packets_count_sh,rx_bytes_count_sh,
                                                     next_slot_early_rx_packets_count_sh,next_slot_on_time_rx_packets_count_sh,next_slot_late_rx_packets_count_sh,early_rx_packets_count_sh,on_time_rx_packets_count_sh,late_rx_packets_count_sh,
                                                     ul_rx_pkt_tracing_level,next_slot_rx_packets_ts_sh,rx_packets_ts_sh,bit_width_cell,rx_packets_ts_earliest_sh,rx_packets_ts_latest_sh,num_prb_ch1_sh,num_prb_ch2_sh,next_slot_num_prb_ch1_sh,next_slot_num_prb_ch2_sh,sem_order_num_cell,prach_section_id_0,prb_x_slot,exit_rx_cta_sh,
-                                                    pcap_buffer_cell, pcap_buffer_ts_cell, pcap_capture_enable, pcap_capture_cell_bitmask, pcap_pkt_num_total
+                                                    pcap_buffer_cell, pcap_buffer_ts_cell, pcap_capture_enable, pcap_capture_cell_bitmask, pcap_pkt_num_total, out_attr_sh
                                                 );
     }
     else
@@ -3018,12 +3072,15 @@ __global__ void order_kernel_doca_single_subSlot(
 
             /* Semaphore wait */
             if (threadIdx.x == 0) {
-                // printf("Process kernel Block idx %d waiting on sem %d sem_gpu_cell %p\n", blockIdx.x, sem_idx_order, sem_gpu_cell);
-                do {
-                    ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu_cell, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
-                } while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING);
+            // printf("Process kernel Block idx %d waiting on sem %d sem_gpu_cell %p\n", blockIdx.x, sem_idx_order, sem_gpu_cell);
+            do {
+                ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu_cell, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
+            } while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING);
                 // printf("Process kernel Cell Idx %d F%dS%dS%d rx_pkt_num %d sem_idx_order %d rx_buf_idx %lu, pcap_pkt_num_total %d\n",cell_idx,frameId, subframeId, slotId, rx_pkt_num, sem_idx_order, rx_buf_idx, pcap_pkt_num_total);
             }
+            // COVERITY_DEVIATION: blockIdx.x is uniform across all threads in a block.
+            // All threads in this block will reach __syncthreads(), no actual divergence.
+            // coverity[CUDA.DIVERGENCE_AT_COLLECTIVE_OPERATION]
             __syncthreads();
 
             /* Check error or exit condition */
@@ -3039,20 +3096,20 @@ __global__ void order_kernel_doca_single_subSlot(
             if(DOCA_GPUNETIO_VOLATILE(rx_pkt_num) == 0)
                 continue;
 
-            order_kernel_doca_process_receive_packets_subSlot(false,nullptr,max_pkt_size,rx_pkt_num,warpId,nwarps,laneId,doca_rxq_cell,rx_buf_idx,buf_ptr,rx_pkt_addr,exit_cond_d_cell,frameId,subframeId,slotId,
+            order_kernel_doca_process_receive_packets_subSlot(false,nullptr,max_pkt_size,rx_pkt_num,warpId,nwarps,laneId,doca_rxq_cell,rx_buf_idx,exit_cond_d_cell,frameId,subframeId,slotId,
                                                             &done_shared_sh,&last_stride_idx,bit_width_cell,comp_meth_cell,beta_cell,ru_type_cell,pkt_offset_ptr,gbuf_offset_ptr,prb_size,cell_idx_mask,prb_x_slot,
                                                             pusch_eAxC_map_cell,pusch_eAxC_num_cell,pusch_symbols_x_slot,pusch_prb_x_port_x_symbol_cell,pusch_buffer_cell,pusch_ordered_prbs_cell,
                                                             pusch_prb_symbol_map_cell,pusch_prb_symbol_ordered,pusch_prb_symbol_ordered_done,sym_ord_done_sig_arr,sym_ord_done_mask_arr,num_order_cells_sym_mask_arr,pusch_prb_non_zero,
                                                             prach_eAxC_map_cell,prach_eAxC_num_cell,prach_symbols_x_slot,prach_prb_x_port_x_symbol_cell,prach_section_id_0,prach_section_id_1,prach_section_id_2,prach_section_id_3,
-                                                            prach_buffer_0_cell,prach_buffer_1_cell,prach_buffer_2_cell,prach_buffer_3_cell,prach_ordered_prbs_cell);
-            __syncthreads();
+                                                        prach_buffer_0_cell,prach_buffer_1_cell,prach_buffer_2_cell,prach_buffer_3_cell,prach_ordered_prbs_cell);
+        __syncthreads();
 
-            if(threadIdx.x == 0 && DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
-                doca_gpu_dev_semaphore_set_status(sem_gpu_cell, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
-                last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num_cell - 1);
-            }
+        if(threadIdx.x == 0 && DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
+            doca_gpu_dev_semaphore_set_status(sem_gpu_cell, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
+            last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num_cell - 1);
+        }
 
-            sem_idx_order = (sem_idx_order+1) & (sem_order_num_cell - 1);                
+        sem_idx_order = (sem_idx_order+1) & (sem_order_num_cell - 1);
         }
     }
 
@@ -3148,6 +3205,7 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
     /* DOCA objects */
     struct doca_gpu_eth_rxq **doca_rxq,
     struct doca_gpu_semaphore_gpu **sem_gpu,
+    struct aerial_fh_gpu_semaphore_gpu **sem_gpu_aerial_fh,
     const uint16_t* sem_order_num,
 
     /* Cell */
@@ -3295,6 +3353,7 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
     uint32_t* last_sem_idx_order_h_cell=*(last_sem_idx_order_h+cell_idx);
     struct doca_gpu_eth_rxq* doca_rxq_cell=*(doca_rxq+cell_idx);
     struct doca_gpu_semaphore_gpu* sem_gpu_cell=*(sem_gpu+cell_idx);
+    struct aerial_fh_gpu_semaphore_gpu* sem_gpu_aerial_fh_cell=*(sem_gpu_aerial_fh+cell_idx);
     int pusch_prb_x_slot_cell=pusch_prb_x_slot[cell_idx];
     int prach_prb_x_slot_cell=prach_prb_x_slot[cell_idx];
 
@@ -3357,6 +3416,7 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
     const uint32_t laneId = threadIdx.x % 32;
     const uint32_t nwarps = blockDim.x / 32;
 
+    uint32_t max_rx_pkts_ = max(max_rx_pkts, blockDim.x);
 
     if(tid == 0){
         if constexpr (srs_enable==ORDER_KERNEL_SRS_ENABLE) {
@@ -3507,8 +3567,8 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
             uint32_t warp_srs_ordered_prbs_cell_this_burst = 0;
 
             if (tid == 0) {
-                const doca_error_t ret = doca_gpu_dev_semaphore_get_packet_info_status(
-                    sem_gpu_cell, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
+                const doca_error_t ret = aerial_fh_gpu_dev_semaphore_get_packet_info_status(
+                    sem_gpu_aerial_fh_cell, sem_idx_order, AERIAL_FH_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
                 if constexpr (ok_tb_enable)
                 {
                     rx_pkt_num = rx_pkt_num_slot[cell_idx];
@@ -3528,7 +3588,7 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
             // Each warp handles one packet at a time, with packets dynamically scheduled to
             // warps using atomicAdd().
             while (1) {
-                uint32_t pkt_idx;
+                uint32_t pkt_idx{0};  // Initialize to prevent Coverity warning
                 if (laneId == 0) {
                     pkt_idx = atomicAdd(&sh_next_pkt_ind, 1);
                 }
@@ -3545,19 +3605,14 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                 }
                 else
                 {
-                    struct doca_gpu_buf *buf_ptr;
-                    doca_gpu_dev_eth_rxq_get_buf(doca_rxq_cell, rx_buf_idx + pkt_idx, &buf_ptr);
-                    uintptr_t rx_pkt_addr;
-                    doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-                    doca_gpu_dev_eth_rxq_get_buf_timestamp(doca_rxq_cell, rx_buf_idx+pkt_idx, &rx_timestamp);
-                    pkt_thread = (uint8_t*)rx_pkt_addr;
-
+                    pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq_cell, rx_buf_idx + pkt_idx);
+                    rx_timestamp=doca_gpu_dev_eth_rxq_get_pkt_ts(doca_rxq_cell, rx_buf_idx + pkt_idx);
                     // PCAP Capture
                     if constexpr(!ok_tb_enable)
                     {
                         if(pcap_capture_enable && (pcap_capture_cell_bitmask & cell_idx_mask) != 0)
                         {
-                            uint32_t offset;
+                            uint32_t offset{0};  // Initialize to prevent Coverity warning
                             if(laneId == 0)
                             {
                                 offset = atomicAdd(&pcap_pkt_num_total, 1) % MAX_PKTS_PER_PCAP_BUFFER;
@@ -3579,13 +3634,27 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                                 *timestamp_ptr          = rx_timestamp;
                             }
                         }
-                    }
+                    }                    
                 }
 
                 uint8_t frameId_pkt     = oran_umsg_get_frame_id(pkt_thread);
                 uint8_t subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
                 uint8_t slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);
                 uint8_t symbol_id_pkt   = oran_umsg_get_symbol_id(pkt_thread);
+
+                // Bounds check for symbol_id_pkt from untrusted packet data
+                if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+                {
+                    printf("ERROR invalid symbol_id %d (max %d) for Cell %d F%dS%dS%d\n",
+                           symbol_id_pkt,
+                           ORAN_ALL_SYMBOLS - 1,
+                           cell_idx,
+                           frameId_pkt,
+                           subframeId_pkt,
+                           slotId_pkt);
+                    continue; // Skip this packet
+                }
+
                 const uint8_t seq_id_pkt = oran_get_sequence_id(pkt_thread);
                 const uint16_t ecpri_payload_length = oran_umsg_get_ecpri_payload(pkt_thread);
                 int32_t full_slot_diff = calculate_slot_difference(frameId, frameId_pkt, subframeId, subframeId_pkt, slotId, slotId_pkt);
@@ -3687,6 +3756,11 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                                 else if(section_id == prach_section_id_1) buffer = prach_buffer_1_cell;
                                 else if(section_id == prach_section_id_2) buffer = prach_buffer_2_cell;
                                 else if(section_id == prach_section_id_3) buffer = prach_buffer_3_cell;
+                                else {
+                                    // Invalid section_id - skip this section
+                                    printf("ERROR invalid section_id %d for Cell %d F%dS%dS%d\n", section_id, cell_idx, frameId_pkt, subframeId_pkt, slotId_pkt);
+                                    break;
+                                }
                                 gbuf_offset_ptr = buffer + oran_get_offset_from_hdr(pkt_thread, (uint16_t)get_eaxc_index(prach_eAxC_map_cell, prach_eAxC_num_cell,
                                                                                 oran_umsg_get_flowid(pkt_thread)),
                                                             prach_symbols_x_slot, prach_prb_x_port_x_symbol_cell, prb_size, start_prb);
@@ -3809,7 +3883,7 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
             __syncthreads();
 
             if(tid == 0 && DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
-                doca_gpu_dev_semaphore_set_status(sem_gpu_cell, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
+                aerial_fh_gpu_dev_semaphore_set_status(sem_gpu_aerial_fh_cell, last_sem_idx_order, AERIAL_FH_GPU_SEMAPHORE_STATUS_DONE);
                 last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num_cell - 1);
             }
 
@@ -3907,17 +3981,17 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
         __syncthreads();
 
         {
-            doca_error_t ret = doca_gpu_dev_eth_rxq_receive_block(doca_rxq_cell, max_rx_pkts, rx_pkts_timeout_ns, &rx_pkt_num, &rx_buf_idx);
+            doca_error_t ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell,max_rx_pkts_,rx_pkts_timeout_ns,&rx_buf_idx,&rx_pkt_num,nullptr);
             /* If any thread returns receive error, the whole execution stops */
             if (ret != DOCA_SUCCESS) {
-                doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
+                aerial_fh_gpu_dev_semaphore_set_status(sem_gpu_aerial_fh_cell, sem_idx_rx, AERIAL_FH_GPU_SEMAPHORE_STATUS_ERROR);
                 atomicCAS(exit_cond_d_cell, ORDER_KERNEL_RUNNING, ORDER_KERNEL_EXIT_ERROR1);
                 printf("Exit from rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
                     blockIdx.x, threadIdx.x, ret, sem_idx_rx);
             } else {
                 if (rx_pkt_num > 0) {
                     if (tid == 0){
-                        doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
+                        aerial_fh_gpu_dev_semaphore_set_packet_info(sem_gpu_aerial_fh_cell, sem_idx_rx, AERIAL_FH_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
                         rx_pkt_num_total += rx_pkt_num;
                         if (first_packet_received == 0) {
                             first_packet_received = 1;
@@ -4101,7 +4175,7 @@ uint8_t num_order_cells
 	unsigned long long first_packet_start = 0;
 	unsigned long long current_time = 0;
 	unsigned long long kernel_start = __globaltimer();
-	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;;
+	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;
 	uint8_t* buffer;
 	int prb_x_slot=pusch_prb_x_slot[cell_idx]+prach_prb_x_slot[cell_idx];
 	int ret = 0;
@@ -4325,6 +4399,20 @@ uint8_t num_order_cells
                     subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
                     slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);
                     symbol_id_pkt = oran_umsg_get_symbol_id(pkt_thread);
+
+                    // Bounds check for symbol_id_pkt from untrusted packet data
+                    if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+                    {
+                        printf("ERROR invalid symbol_id %d (max %d) for Cell %d F%dS%dS%d\n",
+                               symbol_id_pkt,
+                               ORAN_ALL_SYMBOLS - 1,
+                               cell_idx,
+                               frameId_pkt,
+                               subframeId_pkt,
+                               slotId_pkt);
+                        continue; // Skip this packet
+                    }
+
                     ecpri_payload_length = min(oran_umsg_get_ecpri_payload(pkt_thread),ORAN_ECPRI_MAX_PAYLOAD_LEN);
 
                     slot_count_curr = (2*subframeId_pkt+slotId_pkt);       
@@ -4395,6 +4483,20 @@ uint8_t num_order_cells
 				subframeId_pkt  = oran_umsg_get_subframe_id(pkt_thread);
 				slotId_pkt      = oran_umsg_get_slot_id(pkt_thread);
 				symbol_id_pkt = oran_umsg_get_symbol_id(pkt_thread);
+
+                // Bounds check for symbol_id_pkt from untrusted packet data
+                if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+                {
+                    printf("ERROR invalid symbol_id %d (max %d) for Cell %d F%dS%dS%d\n",
+                           symbol_id_pkt,
+                           ORAN_ALL_SYMBOLS - 1,
+                           cell_idx,
+                           frameId_pkt,
+                           subframeId_pkt,
+                           slotId_pkt);
+                    continue; // Skip this packet
+                }
+
                 slot_count_curr = (2*subframeId_pkt+slotId_pkt);
                 #if 0
                 if(laneId==0)
@@ -4449,6 +4551,11 @@ uint8_t num_order_cells
 							else if(section_id == prach_section_id_1) buffer = prach_buffer_1_cell;
 							else if(section_id == prach_section_id_2) buffer = prach_buffer_2_cell;
 							else if(section_id == prach_section_id_3) buffer = prach_buffer_3_cell;
+							else {
+								// Invalid section_id - skip this section
+                                printf("ERROR invalid section_id %d for Cell %d F%dS%dS%d\n", section_id, cell_idx, frameId_pkt, subframeId_pkt, slotId_pkt);
+								break;
+							}
 							gbuf_offset_ptr = buffer + oran_get_offset_from_hdr(pkt_thread, (uint16_t)get_eaxc_index(prach_eAxC_map_cell, prach_eAxC_num_cell,
 																		 oran_umsg_get_flowid(pkt_thread)),
 													    prach_symbols_x_slot, prach_prb_x_port_x_symbol_cell, prb_size, start_prb);
@@ -4654,7 +4761,7 @@ __global__ void order_kernel_doca_single_srs(
 	unsigned long long first_packet_start = 0;
 	unsigned long long current_time = 0;
 	unsigned long long kernel_start = __globaltimer();
-	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;;
+	uint8_t* pkt_offset_ptr, *gbuf_offset_ptr;
 	uint8_t* buffer;
 	int prb_x_slot=srs_prb_x_slot[cell_idx];
 	doca_error_t ret = (doca_error_t)0;
@@ -4686,8 +4793,7 @@ __global__ void order_kernel_doca_single_srs(
     __shared__ uint64_t next_slot_rx_packets_ts_sh[ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_MAX_SYMBOLS];
     __shared__ uint32_t next_slot_rx_packets_count_per_sym_sh[ORAN_MAX_SYMBOLS];    
     __shared__ uint32_t dropped_packets_printed;
-	struct doca_gpu_buf *buf_ptr;
-	uintptr_t rx_pkt_addr;
+    __shared__ struct doca_gpu_dev_eth_rxq_attr out_attr_sh[512];
 
 	//Cell specific (de-reference from host pinned memory once)
 	uint8_t* done_shared_cell=*(done_shared+cell_idx);
@@ -4838,23 +4944,23 @@ __global__ void order_kernel_doca_single_srs(
 			// deadlock waiting on two different syncthreads.
 			__syncthreads();
 
-			if (threadIdx.x == 0) {
-				ret = doca_gpu_dev_eth_rxq_receive_thread(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
-				/* If any thread returns receive error, the whole execution stops */
-				if (ret != DOCA_SUCCESS) {
-					doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
-					DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
-					printf("Exit from SRS rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
-							blockIdx.x, threadIdx.x, ret, sem_idx_rx);
-				}
+		if (threadIdx.x == 0) {
+			ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_THREAD,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, out_attr_sh);
+			/* If any thread returns receive error, the whole execution stops */
+			if (ret != DOCA_SUCCESS) {
+				doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
+				DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
+				printf("Exit from SRS rx kernel block %d threadIdx %d ret %d sem_idx_rx %d\n",
+						blockIdx.x, threadIdx.x, ret, sem_idx_rx);
 			}
+		}
 			__threadfence();
 			__syncthreads();
 
-			if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
-				if (threadIdx.x == 0) {
-					doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
-					if (first_packet == 0) {
+		if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0) {
+			if (threadIdx.x == 0) {
+				doca_gpu_dev_semaphore_set_packet_info(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_READY, rx_pkt_num, rx_buf_idx);
+				if (first_packet == 0) {
 						first_packet = 1;
 						first_packet_start  = __globaltimer();
 					}
@@ -4870,10 +4976,10 @@ __global__ void order_kernel_doca_single_srs(
 			/* Block 1 waits on semaphore for new packets and process them */
 
 			/* Semaphore wait */
-			if (threadIdx.x == 0) {
-				do {
-					ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu_cell, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
-				} while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING);
+		if (threadIdx.x == 0) {
+			do {
+				ret = doca_gpu_dev_semaphore_get_packet_info_status(sem_gpu_cell, sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_READY, &rx_pkt_num, &rx_buf_idx);
+			} while (ret == DOCA_ERROR_NOT_FOUND && DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) == ORDER_KERNEL_RUNNING);
 			}
 			__syncthreads();
 
@@ -4893,14 +4999,11 @@ __global__ void order_kernel_doca_single_srs(
 			/* Order & decompress packets */
 			for (uint32_t pkt_idx = warpId; pkt_idx < rx_pkt_num; pkt_idx += nwarps) {
 
-                ////
-                ////PACKET RECEPTION
-                ////
+            ////
+            ////PACKET RECEPTION
+            ////
 
-				doca_gpu_dev_eth_rxq_get_buf(doca_rxq_cell, rx_buf_idx + pkt_idx, &buf_ptr);
-				doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-
-				uint8_t *pkt_thread = (uint8_t*)rx_pkt_addr;
+			uint8_t *pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq_cell, rx_buf_idx + pkt_idx);
 				uint16_t section_id_pkt  = oran_umsg_get_section_id(pkt_thread);
 
 				uint8_t frameId_pkt      = oran_umsg_get_frame_id(pkt_thread);
@@ -4909,6 +5012,18 @@ __global__ void order_kernel_doca_single_srs(
                 int32_t full_slot_diff = calculate_slot_difference(frameId, frameId_pkt, subframeId, subframeId_pkt, slotId, slotId_pkt);
 
 		 		uint8_t symbol_id_pkt    = oran_umsg_get_symbol_id(pkt_thread);
+
+                // Warning for invalid symbol_id (not used for array indexing here, only for timing calculations)
+                if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+                {
+                    printf("WARNING invalid symbol_id %d (max %d) for Cell %d F%dS%dS%d\n",
+                           symbol_id_pkt,
+                           ORAN_ALL_SYMBOLS - 1,
+                           cell_idx,
+                           frameId_pkt,
+                           subframeId_pkt,
+                           slotId_pkt);
+                }
 
                 // calculate SRS Symbol Tx delay
                 uint64_t srs_symbol_tx_delay_ns = (symbol_id_pkt * slot_duration_cell) / ORAN_MAX_SYMBOLS;
@@ -4920,7 +5035,7 @@ __global__ void order_kernel_doca_single_srs(
                     //     printf("[%d] Full slot diff %d, Desired frame %d/%d/%d, Packet frame %d/%d/%d\n", pkt_idx, full_slot_diff, frameId, subframeId, slotId, frameId_pkt, subframeId_pkt, slotId_pkt);
                     // }
 
-                    doca_gpu_dev_eth_rxq_get_buf_timestamp(doca_rxq_cell, rx_buf_idx+pkt_idx, &rx_timestamp);
+                    rx_timestamp = out_attr_sh[pkt_idx].timestamp_ns;
                     uint16_t ecpri_payload_length = oran_umsg_get_ecpri_payload(pkt_thread);
                     if(full_slot_diff > 0) //Only keep packets that are in the future slots
                     {
@@ -5118,10 +5233,10 @@ __global__ void order_kernel_doca_single_srs(
 			}
 			__syncthreads();
 
-			if(threadIdx.x == 0 && DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
-				doca_gpu_dev_semaphore_set_status(sem_gpu_cell, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
-				last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num_cell - 1);
-				if (first_packet == 0) {
+		if(threadIdx.x == 0 && DOCA_GPUNETIO_VOLATILE(done_shared_sh) == 1) {
+			doca_gpu_dev_semaphore_set_status(sem_gpu_cell, last_sem_idx_order, DOCA_GPU_SEMAPHORE_STATUS_DONE);
+			last_sem_idx_order = (last_sem_idx_order + 1) & (sem_order_num_cell - 1);
+			if (first_packet == 0) {
 						first_packet = 1;
 						first_packet_start  = __globaltimer();
 				}
@@ -5541,6 +5656,7 @@ int launch_order_kernel_doca_single_subSlot(
 
 	struct doca_gpu_eth_rxq **doca_rxq,
 	struct doca_gpu_semaphore_gpu **sem_gpu,
+	struct aerial_fh_gpu_semaphore_gpu **sem_gpu_aerial_fh,
 	const uint16_t* sem_order_num,
 
 	int*                   cell_id,
@@ -5674,7 +5790,7 @@ int launch_order_kernel_doca_single_subSlot(
                 MemtraceDisableScope md;
                 order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
                     /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_order_num,
+                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
                     /* Cell specific */
                     cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
                     /* Timeout */
@@ -5709,7 +5825,7 @@ int launch_order_kernel_doca_single_subSlot(
                 MemtraceDisableScope md;
                 order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
                     /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_order_num,
+                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
                     /* Cell specific */
                     cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
                     /* Timeout */
@@ -5746,7 +5862,7 @@ int launch_order_kernel_doca_single_subSlot(
                 MemtraceDisableScope md;
                 order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_NUM_THREADS,2><<<cudaBlocks, ORDER_KERNEL_PINGPONG_NUM_THREADS, 0, stream>>>(
                     /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_order_num,
+                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
                     /* Cell specific */
                     cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
                     /* Timeout */
@@ -5787,7 +5903,7 @@ int launch_order_kernel_doca_single_subSlot(
                 MemtraceDisableScope md;
                 order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
                     /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_order_num,
+                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
                     /* Cell specific */
                     cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
                     /* Timeout */
@@ -5822,7 +5938,7 @@ int launch_order_kernel_doca_single_subSlot(
                 MemtraceDisableScope md;
                 order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
                     /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_order_num,
+                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
                     /* Cell specific */
                     cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
                     /* Timeout */
@@ -5859,7 +5975,7 @@ int launch_order_kernel_doca_single_subSlot(
                 MemtraceDisableScope md;
                 order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_NUM_THREADS,2><<<cudaBlocks, ORDER_KERNEL_PINGPONG_NUM_THREADS, 0, stream>>>(
                     /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_order_num,
+                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
                     /* Cell specific */
                     cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
                     /* Timeout */
@@ -6045,6 +6161,10 @@ uint8_t num_order_cells
                                                 prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
                                                 prach_prb_x_slot, prach_prb_x_symbol, prach_prb_x_symbol_x_antenna,
                                                 ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,num_order_cells);
+
+	result = cudaGetLastError();
+	if(cudaSuccess != result)
+	    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} \n", __FILE__, __LINE__, cudaGetErrorString(result));
     
     return 0;
 }
@@ -6464,6 +6584,15 @@ __device__ void populate_addrs_ch1(
 
                 uint64_t rx_timestamp       = rx_queue_sync_list[rx_queue_index].rx_timestamp[(ORDER_KERNEL_MAX_PKTS_BLOCK * blockIdx.x) + threadIdx.x];
                 uint8_t symbol_id_pkt       = oran_umsg_get_symbol_id((uint8_t*)msg_addr[threadIdx.x]);
+
+                // Warning for invalid symbol_id (not used for array indexing here, only for timing calculations)
+                if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+                {
+                    printf("WARNING invalid symbol_id %d (max %d) in single-packet kernel\n",
+                           symbol_id_pkt,
+                           ORAN_ALL_SYMBOLS - 1);
+                }
+
                 uint64_t packet_early_thres = slot_start + ta4_min_ns + (slot_duration * symbol_id_pkt / ORAN_MAX_SYMBOLS);
                 uint64_t packet_late_thres  = slot_start + ta4_max_ns + (slot_duration * symbol_id_pkt / ORAN_MAX_SYMBOLS);
 
@@ -6621,6 +6750,15 @@ __device__ void populate_addrs_ch2(
 
                 uint64_t rx_timestamp       = rx_queue_sync_list[rx_queue_index].rx_timestamp[(ORDER_KERNEL_MAX_PKTS_BLOCK * blockIdx.x) + threadIdx.x];
                 uint8_t symbol_id_pkt       = oran_umsg_get_symbol_id((uint8_t*)tmp_addr);
+
+                // Warning for invalid symbol_id (not used for array indexing here, only for timing calculations)
+                if(__builtin_expect(symbol_id_pkt >= ORAN_ALL_SYMBOLS, 0))
+                {
+                    printf("WARNING invalid symbol_id %d (max %d) in dual-channel kernel\n",
+                           symbol_id_pkt,
+                           ORAN_ALL_SYMBOLS - 1);
+                }
+
                 uint64_t packet_early_thres = slot_start + ta4_min_ns + (slot_duration * symbol_id_pkt / ORAN_MAX_SYMBOLS);
                 uint64_t packet_late_thres  = slot_start + ta4_max_ns + (slot_duration * symbol_id_pkt / ORAN_MAX_SYMBOLS);
 
@@ -7470,6 +7608,7 @@ void launch_receive_process_kernel_for_test_bench(
     const uint32_t  max_rx_pkts,
     const uint32_t  rx_pkts_timeout_ns,
     struct doca_gpu_semaphore_gpu **sem_gpu,
+    struct aerial_fh_gpu_semaphore_gpu **sem_gpu_aerial_fh,
 	uint64_t*		slot_start,
 	uint64_t*		ta4_min_ns,
 	uint64_t*		ta4_max_ns,
@@ -7507,7 +7646,7 @@ void launch_receive_process_kernel_for_test_bench(
             MemtraceDisableScope md;
             order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
                 /* DOCA objects */
-                doca_rxq, sem_gpu, sem_order_num,
+                doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
                 /* Cell specific */
                 cell_id, ru_type, cell_health, start_cuphy_d, exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
                 /* Timeout */
@@ -7544,7 +7683,7 @@ void launch_receive_process_kernel_for_test_bench(
             MemtraceDisableScope md;
             order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_NUM_THREADS,2><<<cudaBlocks, ORDER_KERNEL_PINGPONG_NUM_THREADS, 0, stream>>>(
                 /* DOCA objects */
-                doca_rxq, sem_gpu, sem_order_num,
+                doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
                 /* Cell specific */
                 cell_id, ru_type, cell_health, start_cuphy_d, exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
                 /* Timeout */

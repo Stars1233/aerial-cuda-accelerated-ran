@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-aerial_sdk_version: 25-3-cubb
+aerial_sdk_version: 26-1-cubb
 l2adapter_filename: l2_adapter_config_P5G_GH.yaml
 aerial_metrics_backend_address: 127.0.0.1:8081
 
@@ -174,7 +174,7 @@ cuphydriver_config:
   notify_ul_harq_buffer_release: 0
 
   # data_config:
-    # datalake_core: 12           # This must be set for Data Lake and/or E3 Agent to be used
+    # data_core: 12               # This must be set for Data Lake and/or E3 Agent to be used
     # datalake_db_write_enable: 1   # Enable/disable ClickHouse writes based on datalake_data_types
     # datalake_samples: 1000000
     # datalake_address: localhost
@@ -183,13 +183,13 @@ cuphydriver_config:
     # datalake_data_types: [fh, pusch, hest]  # Data types to write to ClickHouse DB (all types always collected in memory for E3 Agent):
                                             # fh = Fronthaul IQ samples,pusch = PUSCH/FAPI data, hest = channel estimates
     # datalake_store_failed_pdu: 0      # Set to 1 to store PDU data even when CRC fails
-    # e3_agent_enable: 0          # Enable/disable E3 Agent and dApp capabilities
+    # e3_agent_enable: 1          # Enable/disable E3 Agent and dApp capabilities
     # num_rows_fh: 120
     # num_rows_pusch: 200
     # num_rows_hest: 140
-    # e3_pub_port: 5555           # E3 publisher port for indication messages
-    # e3_rep_port: 5556           # E3 reply port for E3AP requests
-    # e3_sub_port: 5560           # E3 subscriber port for Manager messages
+    # e3_rep_port: 5555           # E3 reply port for E3AP requests (dApp REQ → Agent REP)
+    # e3_pub_port: 5556           # E3 publisher port for indication messages (Agent PUB → dApp SUB)
+    # e3_sub_port: 5557           # E3 subscriber port for dApp messages (dApp PUB → Agent SUB)
 
   cells:
     - name: O-RU 0

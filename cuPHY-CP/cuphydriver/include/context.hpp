@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,6 +53,7 @@
 #include "metrics.hpp"
 #include "cv_memory_bank_srs_chest.hpp"
 #include "ul_pcap_capture_thread.hpp"
+#include "perf_metrics/percentile_tracker.hpp"
 
 // Current max. limit of green contexts used in cuphydriver. 7 green contexts are currently used.
 // Affects size of various vectors/arrays in PhyDriverCtx. Increase if you plan to add more green contexts.
@@ -232,7 +233,17 @@ public:
     HarqPoolManager *   getHarPoolManager() const;
     WAvgCfoPoolManager * getWAvgCfoPoolManager() const;
     CvSrsChestMemoryBank* getCvSrsChestMemoryBank() const;
+    /**
+     * @brief Return if green contexts (GC) mode is enabled.
+     * @return Non-zero if GC enabled, zero otherwise
+     */
     uint8_t             getUseGreenContexts() const;
+    /**
+     * @brief Return if GC workqueue feature is enabled.
+     * Only relevant if green context mode is enabled
+     * @return Non-zero if GC WQs enabled, zero otherwise
+     */
+    uint8_t             getUseGCWorkqueues() const;
     uint8_t             getUseBatchedMemcpy() const;
     int                 getMpsSmPusch() const;
     int                 getMpsSmPucch() const;
@@ -318,6 +329,9 @@ public:
     bool                enableL1ParamSanityCheck(void) const;
     uint8_t             enableCPUTaskTracing(void) const;
     bool                enablePrepareTracing(void) const;
+    bool                cuptiTracingEnabled(void) const;
+    uint64_t            cuptiBufferSize(void) const;
+    uint16_t            cuptiNumBuffers(void) const;
     bool                disableEmpw(void) const;
     bool                enableDlCqeTracing(void) const;
     uint64_t            get_cqe_trace_cell_mask(void) const;
@@ -330,11 +344,12 @@ public:
     uint8_t             getPMUMetrics(void) const;
 
     bool                debug_worker_enabled() const { return debug_worker != -1; };
-    bool                datalake_enabled() const { return datalake_core != -1; };
+    bool                datalake_enabled() const { return data_core != -1; };
     bool                splitUlCudaStreamsEnabled(void) const { return !(!(split_ul_cuda_streams)); };
     bool                serializePucchPusch(void) const { return !(!(serialize_pucch_pusch)); };
     uint16_t            getForcedNumCsi2Bits(void) const;
     uint32_t            getPuschMaxNumLdpcHetConfigs(void) const;
+    uint8_t             getPuschMaxNumTbPerNode(void) const;
     uint8_t             getPuschAggrPerCtx(void) const;
     uint8_t             getPrachAggrPerCtx(void) const;
     uint8_t             getPucchAggrPerCtx(void) const;
@@ -371,6 +386,7 @@ public:
     cudaStream_t        getH2DCpyStream(void)const { return H2D_TB_CPY_stream;};
     MpsCtx *            getPdschMpsCtx(void)const{return pdschMpsCtx;};
     cudaEvent_t         get_event_pdsch_tb_cpy_complete(uint8_t slot_idx){return pdsch_tb_cpy_complete[slot_idx%MAX_PDSCH_TB_CPY_CUDA_EVENTS];};
+    cudaEvent_t         get_event_pdsch_tb_cpy_start(uint8_t slot_idx){return pdsch_tb_cpy_start[slot_idx%MAX_PDSCH_TB_CPY_CUDA_EVENTS];};
 
     uint32_t             getAggr_obj_non_avail_th(void) const;
     h2d_copy_prepone_info_t* get_h2d_copy_prepone_info(uint16_t idx){return &h2d_cpy_info[idx];};
@@ -378,6 +394,8 @@ public:
     
     uint8_t                 getmMIMO_enable() const;
     uint8_t                 get_enable_srs() const;
+    uint8_t                 get_enable_dl_core_affinity() const;
+    uint8_t                 get_dlc_core_packing_scheme() const;
     uint8_t                 getCellGroupNum() const;
     uint8_t                 get_ch_segment_proc_enable() const;
     uint32_t                geth2d_copy_wait_th(void) const;
@@ -472,8 +490,11 @@ public:
     std::atomic<bool> stop_ul_pcap_thread{false};
     uint8_t                 getPuschAggrFactor() const;
     void                    setPuschAggrFactor(uint8_t pusch_aggr_factor_);
+    
+    perf_metrics::PercentileTracker order_kernel_timing_tracker{0, 3000000, 1000, 80};  ///< Track Order Kernel completion times per slot (0-3ms range, 1μs buckets, 80 slots)
 
 private:
+    std::array<cudaEvent_t,MAX_PDSCH_TB_CPY_CUDA_EVENTS> pdsch_tb_cpy_start;
     std::array<cudaEvent_t,MAX_PDSCH_TB_CPY_CUDA_EVENTS> pdsch_tb_cpy_complete;
     std::array<cudaEvent_t,SLOTS_PER_FRAME> dlbfw_run_completion_event;
     std::array<cudaEvent_t,SLOTS_PER_FRAME> ulbfw_run_completion_event;
@@ -561,6 +582,7 @@ private:
     MpsCtx *ulBfwMpsCtx;
 
     uint8_t  use_green_contexts;
+    uint8_t  use_gc_workqueues;
     std::array<cuphy::cudaGreenContext, CURRENT_MAX_GREEN_CTXS> tmpGreenContextsForResplit;
 #if CUDA_VERSION >= 12040
     CUdevResource initial_device_GPU_resources;
@@ -585,7 +607,7 @@ private:
     ////////////////////////////////////////////
 
     std::shared_ptr<DataLake> dataLake;
-    int16_t datalake_core;
+    int16_t data_core;
     std::thread datalake_thread;
 
     // Section Id per UL channel. ORAN SectionId 12bits
@@ -730,6 +752,9 @@ private:
     uint8_t                                enable_cpu_task_tracing;
     uint8_t                                enable_l1_param_sanity_check;
     uint8_t                                enable_prepare_tracing;
+    uint8_t                                cupti_enable_tracing;
+    uint64_t                               cupti_buffer_size;
+    uint16_t                               cupti_num_buffers;
     uint8_t                                enable_dl_cqe_tracing;
     uint64_t                               cqe_trace_cell_mask;
     uint32_t                               cqe_trace_slot_mask;
@@ -741,6 +766,8 @@ private:
     uint8_t                                pmu_metrics;
     uint8_t                                mMIMO_enable;
     uint8_t                                enable_srs;
+    uint8_t                                enable_dl_core_affinity;
+    uint8_t                                dlc_core_packing_scheme;
     uint8_t                                ue_mode;
     uint8_t                                mCh_segment_proc_enable;
     uint32_t                               aggr_obj_non_avail_th;
@@ -786,6 +813,7 @@ private:
     uint32_t                               cuphy_dl_channel_wait_th;
     uint16_t                               forcedNumCsi2Bits;
     uint32_t                               pusch_nMaxLdpcHetConfigs;
+    uint8_t                                pusch_nMaxTbPerNode;
     cudaStream_t                           stream_timing_dl;
     cudaStream_t                           stream_timing_ul;
     uint8_t                                slot_advance;

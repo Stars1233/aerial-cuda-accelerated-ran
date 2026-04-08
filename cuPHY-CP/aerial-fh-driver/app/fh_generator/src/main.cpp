@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -80,6 +80,12 @@ char* modifyFileName(const char* path, const char* prefix) {
 
     // Prepend prefix
     char* prefixedFileName = (char*)malloc(strlen(modifiedFileName) + strlen(prefix) + 1);
+    if(prefixedFileName == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "modifyFileName: Failed to allocate memory for prefixed file name");
+        free(modifiedFileName);
+        return nullptr;
+    }
     strcpy(prefixedFileName, prefix);
     strcat(prefixedFileName, modifiedFileName);
 
@@ -91,67 +97,31 @@ char* modifyFileName(const char* path, const char* prefix) {
 
 int main(int argc, char* argv[])
 {
-
-    if(argc == 2)
+    try
     {
-        char        yaml_file[1024];
-        std::string relative_path = std::string("../../../../../").append(NVLOG_DEFAULT_CONFIG_FILE);
-        nv_get_absolute_path(yaml_file, relative_path.c_str());
-        char *nvlog_output_file_name = modifyFileName(argv[1], "fhgen_du_");
-        pthread_t bg_thread_id = nvlog_fmtlog_init(yaml_file, nvlog_output_file_name, NULL);
-        std::string config_file{argv[1]};
-        signal(SIGINT, signal_handler);
-        signal(SIGTERM, signal_handler);
-
-        try
+        if(argc == 2)
         {
+            char        yaml_file[1024];
+            std::string relative_path = std::string("../../../../../").append(NVLOG_DEFAULT_CONFIG_FILE);
+            nv_get_absolute_path(yaml_file, relative_path.c_str());
+            char*       nvlog_output_file_name = modifyFileName(argv[1], "fhgen_du_");
+            if(nvlog_output_file_name == nullptr)
+            {
+                NVLOGE_FMT(TAG,AERIAL_SYSTEM_API_EVENT, "main: Failed to modify file name");
+                return -1;
+            }
+            pthread_t   bg_thread_id           = nvlog_fmtlog_init(yaml_file, nvlog_output_file_name, NULL);
+            std::string config_file{argv[1]};
+            signal(SIGINT, signal_handler);
+            signal(SIGTERM, signal_handler);
+
             NVLOGC_FMT(TAG, "Starting FH Generator for DU side");
             gen = new FhGenerator(config_file, FhGenType::DU);
-        }
-        FH_GEN_CATCH_EXCEPTIONS();
-        auto curr_time = now_ns();
-        auto next_time = curr_time + 1000000000;
-        while(!gen->exit_signal())
-        {
-            auto time = now_ns();
-            if(time < next_time)
-            {
-                if(next_time - time > 75 * 1000)
-                {
-                    usleep(1000);
-                }
-                continue;
-            }
-            gen->print_periodic_counters();
-            curr_time = next_time;
-            next_time = curr_time + 1000000000;
-        }
-        sleep(1);
-        delete gen;
-        NVLOGC_FMT(TAG, "Closing FH Generator for DU side");
-    }
-    else if(argc == 3)
-    {
-        char        yaml_file[1024];
-        std::string relative_path = std::string("../../../../../").append(NVLOG_DEFAULT_CONFIG_FILE);
-        nv_get_absolute_path(yaml_file, relative_path.c_str());
-        char *nvlog_output_file_name = modifyFileName(argv[1], "fhgen_ru_");
-        pthread_t bg_thread_id = nvlog_fmtlog_init(yaml_file, nvlog_output_file_name, NULL);
-        std::string ru{argv[2]};
-        std::string config_file{argv[1]};
-        signal(SIGINT, signal_handler);
-        signal(SIGTERM, signal_handler);
-        if(ru == "-r")
-        {
-            NVLOGC_FMT(TAG, "Starting FH Generator for RU side");
-            try
-            {
-                gen = new FhGenerator(config_file, FhGenType::RU);
-            }
-            FH_GEN_CATCH_EXCEPTIONS();
+
             auto curr_time = now_ns();
             auto next_time = curr_time + 1000000000;
-            while(!gen->exit_signal()) {
+            while(!gen->exit_signal())
+            {
                 auto time = now_ns();
                 if(time < next_time)
                 {
@@ -167,16 +137,58 @@ int main(int argc, char* argv[])
             }
             sleep(1);
             delete gen;
+            NVLOGC_FMT(TAG, "Closing FH Generator for DU side");
+        }
+        else if(argc == 3)
+        {
+            char        yaml_file[1024];
+            std::string relative_path = std::string("../../../../../").append(NVLOG_DEFAULT_CONFIG_FILE);
+            nv_get_absolute_path(yaml_file, relative_path.c_str());
+            char*       nvlog_output_file_name = modifyFileName(argv[1], "fhgen_ru_");
+            if(nvlog_output_file_name == nullptr)
+            {
+                NVLOGE_FMT(TAG,AERIAL_SYSTEM_API_EVENT, "main: Failed to modify file name");
+                return -1;
+            }
+            pthread_t   bg_thread_id           = nvlog_fmtlog_init(yaml_file, nvlog_output_file_name, NULL);
+            std::string ru{argv[2]};
+            std::string config_file{argv[1]};
+            signal(SIGINT, signal_handler);
+            signal(SIGTERM, signal_handler);
+            if(ru == "-r")
+            {
+                NVLOGC_FMT(TAG, "Starting FH Generator for RU side");
+                gen            = new FhGenerator(config_file, FhGenType::RU);
+                auto curr_time = now_ns();
+                auto next_time = curr_time + 1000000000;
+                while(!gen->exit_signal())
+                {
+                    auto time = now_ns();
+                    if(time < next_time)
+                    {
+                        if(next_time - time > 75 * 1000)
+                        {
+                            usleep(1000);
+                        }
+                        continue;
+                    }
+                    gen->print_periodic_counters();
+                    curr_time = next_time;
+                    next_time = curr_time + 1000000000;
+                }
+                sleep(1);
+                delete gen;
+            }
+            else
+            {
+                usage();
+            }
+            NVLOGC_FMT(TAG, "Closing FH Generator for RU side");
         }
         else
         {
             usage();
         }
-        NVLOGC_FMT(TAG, "Closing FH Generator for RU side");
-
     }
-    else
-    {
-        usage();
-    }
+    FH_GEN_CATCH_EXCEPTIONS();
 }

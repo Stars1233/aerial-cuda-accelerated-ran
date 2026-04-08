@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -78,7 +78,7 @@ def test_csirs_rx_run(cuda_stream, test_case_number, cupy):
     rx_data = np.array(input_file["X_tf"])["re"] + 1j * np.array(input_file["X_tf"])["im"]
     rx_data = rx_data.transpose(2, 1, 0)
     if cupy:
-        with cp.cuda.ExternalStream(int(cuda_stream)):
+        with cuda_stream:
             rx_data = cp.array(rx_data, order='F', dtype=cp.complex64)
 
     csirs_rx = CsiRsRx(num_prb_dl_bwp=[rx_data.shape[0] // 12], cuda_stream=cuda_stream)

@@ -595,11 +595,21 @@ void BfwTx::writeDbgBufSynch(cudaStream_t cuStream)
         for(int ueGrpIdx = 0; ueGrpIdx < nUeGrps; ++ueGrpIdx)
         {
             cuphyBfwUeGrpPrm_t const& ueGrpPrm = pUeGrpPrms[ueGrpIdx];
+            // Use the appropriate buffer based on whether host output buffer is enabled
+            uint8_t* pBfwCoefBuf{};
+            if(m_hostOutputBuffer && ueGrpIdx < static_cast<int>(m_bfwComppVec.size()))
+            {
+                pBfwCoefBuf = m_bfwComppVec[ueGrpIdx];
+            }
+            else
+            {
+                pBfwCoefBuf = m_pDynPrms->pDataOut->pBfwCoef[ueGrpIdx];
+            }
             cuphy::tensor_ref tRefBfwCompCoef;
             tRefBfwCompCoef.desc().set(CUPHY_R_8U, m_bundleSizeRun ? m_bundleSizeRun : m_bundleSize, ueGrpPrm.nPrbGrp, ueGrpPrm.nBfLayers, cuphy::tensor_flags::align_tight);
             cuphyTensorPrm_t tPrmBfwCompCoef;
             tPrmBfwCompCoef.desc  = tRefBfwCompCoef.desc().handle();
-            tPrmBfwCompCoef.pAddr = m_bfwComppVec[ueGrpIdx];
+            tPrmBfwCompCoef.pAddr = pBfwCoefBuf;
             cuphy::write_HDF5_dataset(m_outHdf5File, tPrmBfwCompCoef, std::string("bfwComp" + std::to_string(ueGrpIdx)).c_str(), cuStream);
         }
 

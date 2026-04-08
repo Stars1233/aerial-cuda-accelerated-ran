@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,7 @@ if BUILD_TYPE == "rel":
     BUILD_TYPE = ""  # don't use 'rel' in the build string
 
 # The short X.Y version
-VERSION = "2025.3"  # pylint: disable=invalid-name
+VERSION = "2026.1"  # pylint: disable=invalid-name
 
 # Create release version according to https://www.python.org/dev/peps/pep-0440/
 # The full version, including alpha/beta/rc tags

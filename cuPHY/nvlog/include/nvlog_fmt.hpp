@@ -18,16 +18,67 @@
 #pragma once
 #ifndef NVLOG_FMT_HPP
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 //#define FMTLOG_HEADER_ONLY
 #ifdef NVIPC_FMTLOG_ENABLE
 #include "fmtlog.h"
 #endif
-#pragma GCC diagnostic pop
 
 #ifdef NVIPC_FMTLOG_ENABLE
 #include <string_view>
+#include <type_traits>
+#include "enum_utils.hpp"
+
+// =============================================================================
+// Generic formatter for ALL enum types to work with fmt library
+// =============================================================================
+// This allows using enums directly in NVLOG_FMT without explicit static_cast:
+//   NVLOGC_FMT(TAG, "value: {}", my_enum);  // Works automatically!
+//
+// Technical approach:
+// - Uses SFINAE (std::enable_if_t) instead of C++20 concepts for NVCC compatibility
+// - SFINAE condition: only applies when T is an enum (std::is_enum_v<T> == true)
+// - Inherits from formatter for the enum's underlying integer type
+// - Uses to_underlying() for clean enum-to-int conversion (C++23 compatible)
+// - Zero runtime cost: enum-to-int cast is optimized away (same bit representation)
+// =============================================================================
+template <typename T>
+struct fmt::formatter<T, std::enable_if_t<std::is_enum_v<T>, char>> : fmt::formatter<std::underlying_type_t<T>>
+{
+    using underlying_type = std::underlying_type_t<T>;  //!< Compile-time query: what int type backs this enum?
+    using base = fmt::formatter<underlying_type>;       //!< Inherit formatting logic from underlying type
+
+    /**
+     * Parse format specifications at compile time
+     *
+     * Called by fmt during compile-time format string validation.
+     * Delegates to the base integer formatter to handle specs like {:x}, {:d}, etc.
+     *
+     * @param ctx Format parse context containing format spec string
+     * @return Iterator to end of parsed format specification
+     */
+    constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin())
+    {
+        return base::parse(ctx);
+    }
+
+    /**
+     * Format the enum value at runtime
+     * 
+     * Converts enum to its underlying integer type using to_underlying() and 
+     * delegates to the base formatter. The conversion is zero-cost since enum 
+     * and underlying type share identical memory layout.
+     * 
+     * @param value The enum value to format
+     * @param ctx Format context for output
+     * @return Iterator to end of formatted output
+     */
+    template <typename FormatContext>
+    auto format(const T& value, FormatContext& ctx) const -> decltype(ctx.out())
+    {
+        // Convert enum to underlying type and delegate to base formatter
+        return base::format(to_underlying(value), ctx);
+    }
+};
 #endif
 #include <unistd.h>
 #include "memtrace.h"
@@ -233,6 +284,10 @@ inline constexpr nvlog_component_ids g_nvlog_component_ids[] {
     {60, "MAC"},
     {61, "NVIPC.PCAP"},
 
+    // aerial_utils
+    {80, "UTIL"},
+    {81, "UTIL.MEMFOOT"},
+
     // cuPHYController
     {100, "CTL"},
     {101, "CTL.SCF"},
@@ -291,6 +346,7 @@ inline constexpr nvlog_component_ids g_nvlog_component_ids[] {
     {245, "DRV.SYMBOL_TIMINGS_SRS"},
     {246, "DRV.PACKET_TIMINGS_SRS"},
     {247, "DRV.WAVGCFO_POOL"},
+    {248, "DRV.PERF_METRICS"},
 
     // cuphyl2adapter
     {300, "L2A"},

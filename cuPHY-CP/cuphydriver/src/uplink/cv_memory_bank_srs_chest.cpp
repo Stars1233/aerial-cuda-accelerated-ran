@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,8 +36,6 @@ CvSrsChestMemoryBank::CvSrsChestMemoryBank(phydriver_handle _pdh, GpuDevice* _gD
 
     mf.init(_pdh, std::string("CvSrsChestMemoryBank"), sizeof(CVSrsChestBuff));
 
-    mf.addGpuRegularSize(total_num_srs_chest_buffers * CV_NUM_PRBG * CV_NUM_GNB_ANT * CV_NUM_UE_LAYER * sizeof(uint32_t));
-
     gDev->setDevice();
 
     // Allocate memory for CV buffers
@@ -45,7 +43,9 @@ CvSrsChestMemoryBank::CvSrsChestMemoryBank(phydriver_handle _pdh, GpuDevice* _gD
     uint32_t  size_of_each_buffer = CV_NUM_PRBG * CV_NUM_GNB_ANT * CV_NUM_UE_LAYER * sizeof(uint32_t);
     for(uint32_t idx = 0; idx < total_num_srs_chest_buffers ; idx++)
     {
-        CVSrsChestBuff* buffer = new CVSrsChestBuff(new dev_buf(size_of_each_buffer * sizeof(uint8_t), gDev));
+        dev_buf* buffer_dev = new dev_buf(size_of_each_buffer, gDev);
+        mf.addGpuRegularSize(buffer_dev->size_alloc);
+        CVSrsChestBuff* buffer = new CVSrsChestBuff(buffer_dev);
         buffer->setSrsChestBuffState(slot_command_api::SRS_CHEST_BUFF_NONE);
         arr_cv_srs_chest_buff[idx] = buffer;
         memIndexPool.push(idx);
@@ -160,7 +160,8 @@ void CvSrsChestMemoryBank::updateSrsChestBufferState(uint32_t cell_id, uint16_t 
     //Range check
     if(buffer_idx >= srsChEstBuffIndexMap[cell_id].mempoolSize)
     {
-        NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "updateSrsChestBufferState: Invalid buffer_idx {} for cellId {} with mempoolsize {} ", buffer_idx, cell_id, srsChEstBuffIndexMap[cell_id].mempoolSize);
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "updateSrsChestBufferState: Invalid buffer_idx {} for cellId {} with mempoolsize {} ", buffer_idx, cell_id, srsChEstBuffIndexMap[cell_id].mempoolSize);
+        return;
     }
 
     uint32_t realBuffIndex = srsChEstBuffIndexMap[cell_id].indexMap[buffer_idx];
@@ -181,7 +182,7 @@ slot_command_api::srsChestBuffState CvSrsChestMemoryBank::getSrsChestBufferState
     //Range check
     if(buffer_idx >= srsChEstBuffIndexMap[cell_id].mempoolSize)
     {
-        NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "getSrsChestBufferState: Invalid buffer_idx {} for cellId {} with mempoolsize {} ", buffer_idx, cell_id, srsChEstBuffIndexMap[cell_id].mempoolSize);
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "getSrsChestBufferState: Invalid buffer_idx {} for cellId {} with mempoolsize {} ", buffer_idx, cell_id, srsChEstBuffIndexMap[cell_id].mempoolSize);
         return slot_command_api::SRS_CHEST_BUFF_NONE;
     }
 
@@ -202,7 +203,7 @@ uint32_t CvSrsChestMemoryBank::getSrsChestBufferUsage(uint32_t cell_id, uint32_t
     //Range check
     if(buffer_idx >= srsChEstBuffIndexMap[cell_id].mempoolSize)
     {
-        NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "getSrsChestBufferState: Invalid buffer_idx {} for cellId {} with mempoolsize {} rnti={} ", buffer_idx, cell_id, srsChEstBuffIndexMap[cell_id].mempoolSize, rnti);
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "getSrsChestBufferUsage: Invalid buffer_idx {} for cellId {} with mempoolsize {} rnti={} ", buffer_idx, cell_id, srsChEstBuffIndexMap[cell_id].mempoolSize, rnti);
         return slot_command_api::SRS_CHEST_BUFF_NONE;
     }
 
@@ -223,7 +224,8 @@ void CvSrsChestMemoryBank::updateSrsChestBufferUsage(uint32_t cell_id, uint32_t 
     //Range check
     if(buffer_idx >= srsChEstBuffIndexMap[cell_id].mempoolSize)
     {
-        NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "updateSrsChestBufferState: Invalid buffer_idx {} for cellId {} with mempoolsize {} rnti={} ", buffer_idx, cell_id, srsChEstBuffIndexMap[cell_id].mempoolSize, rnti);
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "updateSrsChestBufferUsage: Invalid buffer_idx {} for cellId {} with mempoolsize {} rnti={} ", buffer_idx, cell_id, srsChEstBuffIndexMap[cell_id].mempoolSize, rnti);
+        return;
     }
 
     uint32_t realBuffIndex = srsChEstBuffIndexMap[cell_id].indexMap[buffer_idx];
@@ -268,7 +270,8 @@ bool CvSrsChestMemoryBank::memPoolAllocatePerCell(uint32_t requestedBy, uint16_t
                                 NVLOGD_FMT(TAG, "Cell id {} already exists in srsChEstBuffIndexMap..ignoring it", cell_id);
                                 break;
                             default:
-                                NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Unsupported condition requestedBy {} stored {}!!!", requestedBy,srsChEstBuffIndexMap[cell_id].requestedBy);
+                                retVal = false;
+                                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Unsupported condition requestedBy {} stored {}!!!", requestedBy,srsChEstBuffIndexMap[cell_id].requestedBy);
                                 break;
                         }
                     }
@@ -282,7 +285,8 @@ bool CvSrsChestMemoryBank::memPoolAllocatePerCell(uint32_t requestedBy, uint16_t
                                 NVLOGD_FMT(TAG, "Cell id {} already exists in srsChEstBuffIndexMap..ignoring it", cell_id);
                                 break;
                             default:
-                                NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Unsupported condition requestedBy {} stored {}!!!", requestedBy,srsChEstBuffIndexMap[cell_id].requestedBy);
+                                retVal = false;
+                                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Unsupported condition requestedBy {} stored {}!!!", requestedBy,srsChEstBuffIndexMap[cell_id].requestedBy);
                                 break;
                         }
                     }
@@ -296,7 +300,8 @@ bool CvSrsChestMemoryBank::memPoolAllocatePerCell(uint32_t requestedBy, uint16_t
                                 NVLOGD_FMT(TAG, "Cell id {} already exists in srsChEstBuffIndexMap..ignoring it", cell_id);
                                 break;
                             default:
-                                NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Unsupported condition requestedBy {} stored {}!!!", requestedBy,srsChEstBuffIndexMap[cell_id].requestedBy);
+                                retVal = false;
+                                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Unsupported condition requestedBy {} stored {}!!!", requestedBy,srsChEstBuffIndexMap[cell_id].requestedBy);
                                 break;
                         }
                     }

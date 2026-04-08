@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,9 @@
 import argparse
 from importlib import util
 import subprocess
+import json
+import re
+from pathlib import Path
 
 from .FDD.properties import avg_subs, het_subs
 
@@ -23,6 +26,21 @@ from .FDD.properties import avg_subs, het_subs
 def arguments():
 
     base = argparse.ArgumentParser()
+    base.add_argument(
+        "--yaml",
+        type=str,
+        dest="yaml",
+        help=(
+            "YAML file providing defaults for measure.py. "
+            "Keys should match long option names without the leading '--'. "
+            "(e.g., cuphy, vectors, config, uc, freq, cap, start, iterations, slots, power, "
+            "target: [..], graph: true). "
+            "You may also provide 'config_inline' (a dict matching the JSON testcases format); "
+            "it will be written next to the YAML and used as --config. "
+            "Explicit CLI flags override YAML."
+        ),
+        required=False,
+    )
     base.add_argument(
         "--cuphy",
         type=str,
@@ -42,14 +60,14 @@ def arguments():
         type=str,
         dest="config",
         help="Specifies the file contaning the test cases list",
-        required=True,
+        required=False,
     )
     base.add_argument(
         "--uc",
         type=str,
         dest="uc",
         help="Specifies the file contaning the use case config",
-        required=True,
+        required=False,
     )
     base.add_argument(
         "--target",
@@ -191,6 +209,18 @@ def arguments():
         help="Specifies whether to enable debug mode",
     )
     base.add_argument(
+        "--enable_nvprof",
+        action="store_true",
+        dest="is_enable_nvprof",
+        help="Enable cudaProfilerStart/Stop in cubb_gpu_test_bench around each pattern run",
+    )
+    base.add_argument(
+        "--enable_sqlite",
+        action="store_true",
+        dest="is_enable_sqlite",
+        help="Enable --export sqlite in nsys profile command",
+    )
+    base.add_argument(
         "--debug_mode",
         type=str,
         dest="debug_mode",
@@ -313,7 +343,7 @@ def arguments():
         "--tdd_pattern",
         type=str,
         dest="pattern",
-        choices=["dddsu", "dddsuudddd", "dddsuudddd_mMIMO"],
+        choices=["dddsu", "dddsuudddd", "dddsuudddd_8slot", "dddsuudddd_mMIMO"],
         default="dddsu",
         help="Specifies the TDD pattern to run",
     )
@@ -409,7 +439,261 @@ def arguments():
         help="Specifies the subslot processing setting for PUSCH",
     )
 
-    args = base.parse_args()
+    base.add_argument(
+        "--enable_ref_check",
+        action="store_true",
+        dest="is_ref_check",
+        help=(
+            "Enable reference checks for all channels "
+            "(appends -k --k -b --c PUSCH,PDSCH,PDCCH,PUCCH,SSB,DLBFW,ULBFW,CSIRS,PRACH,SRS). "
+            "WARNING: do not use during latency or power measurements -- "
+            "the extra checking work will skew the timeline."
+        ),
+    )
+
+    # Optional YAML config support (keeps legacy CLI fully working).
+    #
+    # Semantics:
+    # - YAML provides defaults (expanded into argv)
+    # - Explicit CLI flags override YAML (because CLI args are appended after YAML args)
+    # - For store_true flags, YAML can enable a flag, but CLI cannot explicitly disable it
+    #   (same behavior as legacy CLI).
+    #
+    # Note: Some YAMLs (e.g., phase3_test_config.yaml) include additional, non-CLI keys
+    # (vector_files, latency_budget, etc.). We ignore any YAML keys that do not map to a
+    # known CLI flag to avoid argparse "unrecognized arguments" errors.
+    yaml_parser = argparse.ArgumentParser(add_help=False)
+    yaml_parser.add_argument("--yaml", type=str, dest="yaml")
+    yaml_args, remaining_argv = yaml_parser.parse_known_args()
+
+    injected_argv: list[str] = []
+    generated_config_obj: dict | None = None
+    generated_uc_obj: dict | None = None
+    yaml_vector_files_for_save: dict | None = None
+    if yaml_args.yaml:
+        try:
+            import yaml  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "YAML config requested via --yaml but PyYAML is not available. "
+                "Install it with: pip install pyyaml"
+            ) from e
+
+        cfg_path = Path(yaml_args.yaml).expanduser()
+        with cfg_path.open("r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f) or {}
+
+        if not isinstance(raw_cfg, dict):
+            raise ValueError(
+                f"--yaml must contain a YAML mapping/dict, got: {type(raw_cfg).__name__}"
+            )
+
+        # Allow either top-level mapping, or nested "measure:" mapping.
+        root: dict = raw_cfg.get("measure") if isinstance(raw_cfg.get("measure"), dict) else raw_cfg  # type: ignore[assignment]
+
+        # phase3 YAMLs commonly place actual CLI defaults under "config:"; keep those,
+        # but also consider other top-level keys (they will be filtered to known CLI flags).
+        cfg: dict = {}
+        if isinstance(root.get("config"), dict):
+            cfg.update({k: v for k, v in root.items() if k != "config"})
+            cfg.update(root["config"])  # config section wins
+        else:
+            cfg.update(root)
+
+        # Friendly YAML aliases -> actual CLI option names (without leading '--').
+        yaml_aliases: dict[str, str] = {
+            "testbench_folder": "cuphy",
+            "testvectors_folder": "vectors",
+            "tdd_pattern": "tdd_pattern",
+            "export_sqlite": "enable_sqlite",
+        }
+
+        # Optional: inline JSON configs (written next to the YAML file).
+        # - config_inline -> --config
+        # - uc_inline     -> --uc
+        if "config_inline" in cfg and "--config" not in remaining_argv:
+            inline = cfg.get("config_inline")
+            if not isinstance(inline, dict):
+                raise ValueError(
+                    "'config_inline' must be a mapping/dict (same structure as the JSON file)"
+                )
+            out_json = cfg_path.with_suffix(".testcases.json")
+            out_json.write_text(
+                json.dumps(inline, indent=4, sort_keys=False) + "\n", encoding="utf-8"
+            )
+            cfg["config"] = str(out_json)
+            cfg.pop("config_inline", None)
+
+        if "uc_inline" in cfg and "--uc" not in remaining_argv:
+            inline = cfg.get("uc_inline")
+            if not isinstance(inline, dict):
+                raise ValueError(
+                    "'uc_inline' must be a mapping/dict (same structure as the JSON file)"
+                )
+            out_json = cfg_path.with_suffix(".uc.json")
+            out_json.write_text(
+                json.dumps(inline, indent=4, sort_keys=False) + "\n", encoding="utf-8"
+            )
+            cfg["uc"] = str(out_json)
+            cfg.pop("uc_inline", None)
+
+        # Optional: derive config/uc JSONs from YAML-only TV lists (phase3 style).
+        # This allows running with just --yaml when the YAML provides:
+        #   config:
+        #     vector_files: { PDSCH: [..], PUSCH: [..], ... }
+        vector_files = cfg.get("vector_files")
+        if isinstance(vector_files, dict):
+            # Infer usecase (F01/F08/F09/F14) if not explicitly provided.
+            usecase = cfg.get("usecase")
+            if not usecase:
+                # Best-effort: infer from any filename that contains e.g. "F08".
+                for v in vector_files.values():
+                    items = v if isinstance(v, list) else [v]
+                    for item in items:
+                        if not isinstance(item, str):
+                            continue
+                        # Match e.g. "F08" even in tokens like "TV_cumac_F08-...".
+                        m = re.search(r"F\d\d(?!\d)", item)
+                        if m:
+                            usecase = m.group(0)
+                            break
+                    if usecase:
+                        break
+
+            if not usecase or not isinstance(usecase, str):
+                raise ValueError(
+                    "YAML provides 'vector_files' but no 'usecase'. Add e.g.:\n"
+                    "  config:\n"
+                    "    usecase: F08\n"
+                    "or include an Fxx marker in a filename (e.g. MAC TV)."
+                )
+
+            is_tdd = "tdd_pattern" in cfg
+            duplex = "TDD" if is_tdd else "FDD"
+            testcase_id = f"{usecase}-PP-00"
+
+            # Generate config JSON (example_cubb_* format) if missing.
+            if "config" not in cfg and "--config" not in remaining_argv:
+                config_inline: dict[str, dict[str, object]] = {}
+                for ch, tvs in vector_files.items():
+                    if tvs is None:
+                        continue
+                    if not isinstance(ch, str):
+                        continue
+
+                    key = f"{usecase} - {ch}"
+
+                    # Normalize to either string or list[str]
+                    if isinstance(tvs, str):
+                        tv_obj: object = tvs
+                    elif isinstance(tvs, list):
+                        tv_obj = [str(x) for x in tvs]
+                    else:
+                        continue
+
+                    # Match existing convention: MAC uses a single string when only one TV is provided.
+                    if ch in {"MAC", "MAC2"} and isinstance(tv_obj, list) and len(tv_obj) == 1:
+                        tv_obj = tv_obj[0]
+
+                    config_inline[key] = {testcase_id: tv_obj}
+
+                generated_config_obj = config_inline
+                # Keep a synthetic name for downstream metadata/usecase checks.
+                cfg["config"] = str(cfg_path.with_suffix(f".{usecase}.testcases.json"))
+
+            # Generate UC JSON (uc_avg_* format) if missing.
+            if "uc" not in cfg and "--uc" not in remaining_argv:
+                uc_inline: dict[str, dict[str, dict[str, list[str]]]] = {}
+                channels = [f"{usecase} - {ch}" for ch in vector_files.keys() if isinstance(ch, str)]
+
+                # Build Peak: N -> Average: 0 -> channel -> [testcase_id ...]
+                cap = int(cfg.get("cap", 1))
+                for peak in range(1, max(cap, 1) + 1):
+                    avg0: dict[str, list[str]] = {}
+                    for ch_key in channels:
+                        base_ch = ch_key.split(" - ", 1)[1] if " - " in ch_key else ch_key
+                        if base_ch in {"MAC", "MAC2"}:
+                            avg0[ch_key] = [testcase_id]
+                        else:
+                            avg0[ch_key] = [testcase_id] * peak
+                    uc_inline[f"Peak: {peak}"] = {"Average: 0": avg0}
+
+                generated_uc_obj = uc_inline
+                # Keep a synthetic name for downstream mode checks/output naming.
+                cfg["uc"] = str(cfg_path.with_name(f"uc_avg_{usecase}_{duplex}.json"))
+                # Normalize for saved JSON: channel -> list of .h5 (no inline config/uc blobs).
+                yaml_vector_files_for_save = {}
+                for ch, tvs in vector_files.items():
+                    if not isinstance(ch, str) or tvs is None:
+                        continue
+                    yaml_vector_files_for_save[ch] = [
+                        str(x) for x in (tvs if isinstance(tvs, list) else [tvs])
+                    ]
+
+        known_flags = set(base._option_string_actions.keys())
+        # YAML-only keys that are intentionally consumed by downstream modules
+        # (traffic generation, capacity checks, JSON derivation), not argparse.
+        non_cli_yaml_keys = {
+            "vector_files",
+            "usecase",
+            "tdd_priorities",
+            "tdd_slot_config",
+            "start_delay",
+            "latency_budget",
+            "override_test_vectors",
+        }
+
+        ignored_yaml_keys: list[str] = []
+        # Expand YAML into argv; only inject options not explicitly present in CLI argv.
+        for k, v in cfg.items():
+            if v is None:
+                continue
+
+            key = yaml_aliases.get(str(k), str(k))
+            flag = f"--{key}"
+
+            if flag not in known_flags:
+                if str(k) not in non_cli_yaml_keys:
+                    ignored_yaml_keys.append(str(k))
+                continue
+
+            if flag in remaining_argv:
+                continue  # CLI overrides YAML
+
+            if isinstance(v, bool):
+                if v:
+                    injected_argv.append(flag)
+                continue
+
+            if isinstance(v, (list, tuple)):
+                injected_argv.append(flag)
+                injected_argv.extend([str(x) for x in v])
+                continue
+
+            injected_argv.extend([flag, str(v)])
+
+        if ignored_yaml_keys:
+            # Best-effort visibility without failing the run.
+            print(
+                "Warning: ignoring unknown YAML keys (not CLI options): "
+                + ", ".join(sorted(set(ignored_yaml_keys)))
+            )
+
+    # Parse YAML-expanded argv first, then append CLI argv (CLI wins on repeated flags).
+    args = base.parse_args(injected_argv + remaining_argv)
+    # Preserve YAML path for downstream modules that consume extra YAML-only sections
+    # (e.g., tdd_priorities/start_delay/override_test_vectors/latency_budget).
+    args.yaml = yaml_args.yaml
+    # Preserve in-memory config/uc objects when vector_files is used in YAML mode.
+    args.inline_config_obj = generated_config_obj
+    args.inline_uc_obj = generated_uc_obj
+    if yaml_vector_files_for_save is not None:
+        args.vector_files = yaml_vector_files_for_save
+
+    if args.config is None and args.inline_config_obj is None:
+        base.error("Missing --config (or provide YAML vector_files to generate config in-memory)")
+    if args.uc is None and args.inline_uc_obj is None:
+        base.error("Missing --uc (or provide YAML vector_files to generate uc in-memory)")
 
     if args.start > args.cap:
         base.error(
@@ -444,7 +728,7 @@ def arguments():
         if args.subs is not None:
             base.error("The number of sub-CTXs to use cannot be set with TDD use cases")
         if "_het_" in args.uc:
-            if args.pattern == "dddsuudddd":
+            if args.pattern in {"dddsuudddd", "dddsuudddd_8slot", "dddsuudddd_mMIMO"}:
                 base.error(
                     "extended TDD pattern is not supported for heterogeneous traffic"
                 )
@@ -453,6 +737,8 @@ def arguments():
     if args.pattern == "dddsu":
         args.pattern_len = 4
     elif args.pattern == "dddsuudddd":
+        args.pattern_len = 10
+    elif args.pattern == "dddsuudddd_8slot":
         args.pattern_len = 8
     elif args.pattern == "dddsuudddd_mMIMO":
         args.pattern_len = 15
@@ -521,6 +807,19 @@ def arguments():
     else:
         if args.is_unsafe:
             print("Warning: --unsafe is only applicable for power measurements")
+
+    if args.is_ref_check:
+        if args.is_power:
+            print(
+                "WARNING: --enable_ref_check is enabled with power measurement. "
+                "Reference checks will skew the timeline and power results. "
+                "Some cuPHY channels may not support ref check with power mode and may crash."
+            )
+        elif not args.is_test:
+            print(
+                "WARNING: --enable_ref_check is enabled. "
+                "Reference checks will skew latency results; do not use for latency measurements."
+            )
 
     if args.is_rec_bf or args.is_prach:
         if "TDD" not in args.uc or "_avg_" not in args.uc:

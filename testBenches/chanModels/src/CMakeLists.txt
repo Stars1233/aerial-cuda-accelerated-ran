@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,6 +29,8 @@ set(CHAN_MODELS_SRC
     sls_chan_src/sls_chan_small_scale.cu
     sls_chan_src/sls_chan_large_scale_GPU.cu
     sls_chan_src/sls_chan_small_scale_GPU.cu
+    sls_chan_src/sls_chan_isac.cpp
+    sls_chan_src/sls_chan_ue_mobility.cpp
     gauNoiseAdder.cu
 )
 
@@ -50,7 +52,6 @@ target_link_libraries(chanModels
     ${HDF5_C_LIBRARIES}
     cuda
     curand
-    nvlog
     yaml-cpp
     mathdx::cufftdx
 )
@@ -60,7 +61,6 @@ target_include_directories(chanModels
     PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../cuPHY/examples/common
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../cuPHY/src/cuphy
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
     ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES}
     ${HDF5_INCLUDE_DIRS}

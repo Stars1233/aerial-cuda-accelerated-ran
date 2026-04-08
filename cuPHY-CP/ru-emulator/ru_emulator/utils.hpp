@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,6 +42,7 @@
 #include <mutex>
 #include "aerial-fh-driver/fh_mutex.hpp"
 
+#include <bitset>
 #include <unordered_set>
 #include <vector_types.h>
 #include <cuda_fp16.h>
@@ -574,6 +575,29 @@ struct tv_info
     uint16_t nPrbDlBwp = 0;     //!< Number of PRBs in DL BWP (for beta_dl calculation)
     uint16_t nPrbUlBwp = 0;     //!< Number of PRBs in UL BWP
     uint16_t numGnbAnt = 0;     //!< Number of gNodeB antenna ports
+
+    // 4T4R beam ID validation fields (read from HDF5 test vectors)
+    uint8_t digBFInterfaces = 0;                    //!< Number of digital beamforming interfaces
+    std::vector<uint16_t> expected_beam_ids;         //!< Expected beam IDs (PDSCH/PBCH/PDCCH or primary CSI-RS set)
+    //! All non-ZP CSI-RS beam ID sets from all PDUs (TRS + NZP CSI-RS).
+    //! Each inner vector is one PDU's beamIdx array.
+    //! Multiple CSI-RS types can coexist in a single TV (e.g. TRS with 1 beam ID
+    //! and NZP CSI-RS with 4 beam IDs). Used for per-eAxC validation.
+    std::vector<std::vector<uint16_t>> csirs_beam_id_sets;
+
+    /** Per-PDU beam-to-PRB mapping entry.
+     *  Associates a contiguous PRB range with the beam IDs carried on that range.
+     */
+    struct pdu_beam_entry {
+        uint16_t startPrb;              //!< PRB start index (0-based, in PRB units)
+        uint16_t numPrb;                //!< Number of PRBs in this range
+        std::vector<uint16_t> beam_ids; //!< List of beam identifiers for the range
+    };
+    /** Per-PDU beam IDs for multi-PDU slots.
+     *  Each entry maps a PRB range to its beam IDs, supporting slots with
+     *  multiple PDSCH PDUs that carry distinct beam assignments.
+     */
+    std::vector<pdu_beam_entry> per_pdu_beam_ids;
 };
 
 /**
@@ -649,9 +673,10 @@ using ul_cell_cpu_assignment_array = std::array<ul_cell_cpu_assignment, MAX_RU_T
  * @param[in] num_cores Number of CPU cores available
  * @param[in] enable_mmimo Enable massive MIMO mode
  * @param[in] is_srs Whether this is for SRS processing
+ * @param[in] min_cores_per_cell_mmimo Minimum cores per cell for mMIMO (default: 3)
  * @return Array of CPU assignments per thread
  */
-ul_cell_cpu_assignment_array get_cell_cpu_assignment(int num_cells, int num_cores, bool enable_mmimo, bool is_srs);
+ul_cell_cpu_assignment_array get_cell_cpu_assignment(int num_cells, int num_cores, bool enable_mmimo, bool is_srs, int min_cores_per_cell_mmimo = 3);
 
 /**
  * Uplink test vector information (extends tv_info)
@@ -820,6 +845,7 @@ typedef struct oran_c_plane_section_info_t
     uint8_t numSymbol;          //!< Number of symbols
     uint16_t beamId;            //!< Beam ID for beamforming
     int32_t freqOffset;         //!< Frequency offset
+    uint8_t reserved;           //!< Reserved field
 
     uint64_t rx_time;           //!< Receive time in nanoseconds
     uint64_t tx_time;           //!< Transmit time in nanoseconds
@@ -854,6 +880,210 @@ typedef struct oran_c_plane_section_info_t
 } oran_c_plane_section_info_t;
 
 /**
+ * Per-sectionId record for intra-slot uniqueness & multiple-citations checks.
+ */
+struct SlotSectionIdEntry {
+    uint32_t generation{0};
+    uint16_t startPrbc{0};
+    uint16_t numPrbc{0};
+    uint8_t  rb{0};
+    uint8_t  numSymbol{0};
+    uint8_t  udCompHdr{0};
+};
+
+/**
+ * Tracks sectionId usage per slot for a single eAxC and a single ID range [BASE, BASE+N).
+ * Used for DL (full 0-4095) and for UL split into PUSCH+PUCCH (0-1023), PRACH (2048-2111), SRS (3072-3135).
+ *
+ * Validates: sectionId uniqueness, "multiple citations" consistency, and (DL only) C/U-plane cross-match.
+ */
+template <size_t N, uint16_t BASE = 0>
+struct SlotSectionIdTrackerRange
+{
+    static constexpr size_t NUM_ENTRIES = N;
+    static constexpr uint16_t BASE_ID = BASE;
+    static constexpr uint16_t MAX_SECTION_ID = (BASE + N <= 4096) ? static_cast<uint16_t>(BASE + N - 1) : 4095;
+
+    bool in_range(uint16_t sid) const { return sid >= BASE && sid < BASE + N; }
+    size_t to_index(uint16_t sid) const { return static_cast<size_t>(sid - BASE); }
+
+    // --- Current slot state ---
+    std::array<SlotSectionIdEntry, N> entries{};
+    std::bitset<N> uplane_sids_seen{};
+    std::bitset<N> cplane_sids_announced{};
+    uint32_t current_generation{1};
+    struct fssId current_fss{0, 0, 0};
+
+    // --- Previous slot state (for 2-slot deferred cross-validation, DL only) ---
+    std::bitset<N> prev_uplane_sids_seen{};
+    std::bitset<N> prev_cplane_sids_announced{};
+    struct fssId prev_fss{0, 0, 0};
+    bool has_prev{false};
+
+    /**
+     * @brief Advances the tracker to a new slot, archiving current state as previous.
+     *
+     * Side-effects: copies @c uplane_sids_seen (U-plane section IDs seen this slot)
+     * and @c cplane_sids_announced (C-plane section IDs announced this slot) into
+     * their @c prev_ counterparts; increments @c current_generation (skipping zero),
+     * used to invalidate duplicate-consistency entries across slots; resets both
+     * bitsets and stores @p new_fss as @c current_fss.
+     *
+     * @param[in] new_fss  Frame/subframe/slot identifier for the new slot.
+     */
+    void advance_slot(const struct fssId& new_fss)
+    {
+        prev_uplane_sids_seen = uplane_sids_seen;
+        prev_cplane_sids_announced = cplane_sids_announced;
+        prev_fss = current_fss;
+        has_prev = true;
+        if (++current_generation == 0) ++current_generation;
+        uplane_sids_seen.reset();
+        cplane_sids_announced.reset();
+        current_fss = new_fss;
+    }
+
+    /**
+     * @brief Advances the tracker to a new slot with deferred cross-validation
+     *        of the previous slot's U-plane sectionIds against C-plane announcements.
+     *
+     * Before archiving: computes the set of section IDs in @c prev_uplane_sids_seen
+     * but not in @c prev_cplane_sids_announced and invokes @p warn_fn once per
+     * such orphan (U-plane section without C-plane announcement). Then performs
+     * the same side-effects as the single-argument overload (archive to @c prev_*,
+     * increment @c current_generation, reset @c uplane_sids_seen and
+     * @c cplane_sids_announced, set @c current_fss).
+     *
+     * @tparam WarnFn  Callable with signature <tt>void(uint16_t sid, const fssId& fss)</tt>.
+     *
+     * @param[in] new_fss  Frame/subframe/slot identifier for the new slot.
+     * @param[in] warn_fn  Called for each unmatched U-plane sectionId from the
+     *                     previous slot; receives the absolute sectionId and
+     *                     the previous slot's fssId.
+     */
+    template <typename WarnFn>
+    void advance_slot(const struct fssId& new_fss, WarnFn&& warn_fn)
+    {
+        if (has_prev && prev_uplane_sids_seen.any())
+        {
+            auto unmatched = prev_uplane_sids_seen & ~prev_cplane_sids_announced;
+            if (unmatched.any())
+            {
+#if defined(__GLIBCXX__)
+                for (size_t i = unmatched._Find_first(); i < N; i = unmatched._Find_next(i))
+                    warn_fn(static_cast<uint16_t>(BASE + i), prev_fss);
+#else
+                for (size_t i = 0; i < N; ++i)
+                {
+                    if (unmatched.test(i))
+                        warn_fn(static_cast<uint16_t>(BASE + i), prev_fss);
+                }
+#endif
+            }
+        }
+        prev_uplane_sids_seen = uplane_sids_seen;
+        prev_cplane_sids_announced = cplane_sids_announced;
+        prev_fss = current_fss;
+        has_prev = true;
+        if (++current_generation == 0) ++current_generation;
+        uplane_sids_seen.reset();
+        cplane_sids_announced.reset();
+        current_fss = new_fss;
+    }
+
+    /**
+     * @brief Tests whether @p fss refers to the same slot currently being tracked.
+     *
+     * @param[in] fss  Frame/subframe/slot identifier to compare.
+     * @return @c true if @p fss matches @c current_fss on all three fields.
+     */
+    bool is_same_slot(const struct fssId& fss) const
+    {
+        return fss.frameId == current_fss.frameId &&
+               fss.subframeId == current_fss.subframeId &&
+               fss.slotId == current_fss.slotId;
+    }
+
+    /**
+     * @brief Tests whether @p fss is a forward-monotonic slot relative to the
+     *        current tracked slot, accounting for frame-id wraparound.
+     *
+     * @param[in] fss  Frame/subframe/slot identifier to compare.
+     * @return @c true if @p fss is strictly ahead of @c current_fss (within
+     *         half the total slot space, to distinguish forward wrap from backward).
+     */
+    bool is_forward_slot(const struct fssId& fss) const
+    {
+        static_assert(static_cast<int64_t>(ORAN_MAX_FRAME_ID) * ORAN_MAX_SUBFRAME_ID * ORAN_MAX_SLOT_ID <= INT32_MAX,
+                      "FSS slot linearization must fit in int32_t to avoid overflow");
+        constexpr int32_t total_slots = ORAN_MAX_FRAME_ID * ORAN_MAX_SUBFRAME_ID * ORAN_MAX_SLOT_ID;
+        int32_t cur = current_fss.frameId * (ORAN_MAX_SUBFRAME_ID * ORAN_MAX_SLOT_ID)
+                    + current_fss.subframeId * ORAN_MAX_SLOT_ID + current_fss.slotId;
+        int32_t nxt = fss.frameId * (ORAN_MAX_SUBFRAME_ID * ORAN_MAX_SLOT_ID)
+                    + fss.subframeId * ORAN_MAX_SLOT_ID + fss.slotId;
+        int32_t diff = nxt - cur;
+        if (diff < 0) diff += total_slots;
+        return diff > 0 && diff < total_slots / 2;
+    }
+
+    /**
+     * @brief Records a U-plane sectionId as seen in the current slot.
+     *
+     * Sets the corresponding bit in @c uplane_sids_seen if @p sid falls
+     * within the tracker's valid range [BASE, BASE+N).  Out-of-range IDs
+     * are silently ignored.
+     *
+     * @param[in] sid  The sectionId from the U-plane packet header.
+     */
+    void record_uplane_sid(uint16_t sid)
+    {
+        if (in_range(sid))
+            uplane_sids_seen.set(to_index(sid));
+    }
+};
+
+/// DL: section IDs start from 0; max per eAxC is 448 (C-plane) or 896 (U-plane mMIMO). 1024 covers both.
+static constexpr size_t DL_SECTION_ID_SIZE = 1024;
+using SlotSectionIdTracker = SlotSectionIdTrackerRange<DL_SECTION_ID_SIZE, 0>;
+
+/// UL section ID ranges: limited per-channel size and channel-specific start indices to match DU-side
+/// (cuphydriver / FH driver) usage rather than ORAN max limits.
+static constexpr uint16_t UL_PRACH_SECTION_ID_BASE = 2048;
+static constexpr uint16_t UL_SRS_SECTION_ID_BASE   = 3072;
+static constexpr size_t   UL_PRACH_SECTION_ID_SIZE = 64;
+static constexpr size_t   UL_SRS_SECTION_ID_SIZE   = 64;
+static constexpr size_t   UL_PUSCH_PUCCH_SECTION_ID_SIZE = 1024;
+
+using SlotSectionIdTrackerPuschPucch = SlotSectionIdTrackerRange<UL_PUSCH_PUCCH_SECTION_ID_SIZE, 0>;
+using SlotSectionIdTrackerPrach      = SlotSectionIdTrackerRange<UL_PRACH_SECTION_ID_SIZE, UL_PRACH_SECTION_ID_BASE>;
+using SlotSectionIdTrackerSrs        = SlotSectionIdTrackerRange<UL_SRS_SECTION_ID_SIZE, UL_SRS_SECTION_ID_BASE>;
+
+/** Per-eAxC UL: three trackers (PUSCH+PUCCH, PRACH, SRS) with channel-specific section ID ranges
+ *  and limited sizes, aligned with DU/cuphy/FH channel-specific start indices and section counts. */
+struct ULSectionIdTrackerSet
+{
+    SlotSectionIdTrackerPuschPucch pusch_pucch;
+    SlotSectionIdTrackerPrach      prach;
+    SlotSectionIdTrackerSrs       srs;
+
+    /** Advance all three to the same slot (call when any would advance). */
+    void advance_slot_all(const struct fssId& new_fss)
+    {
+        pusch_pucch.advance_slot(new_fss);
+        prach.advance_slot(new_fss);
+        srs.advance_slot(new_fss);
+    }
+
+    /** Record U-plane sectionId in the tracker that covers it (only one will). */
+    void record_uplane_sid(uint16_t sid)
+    {
+        if (pusch_pucch.in_range(sid)) pusch_pucch.record_uplane_sid(sid);
+        else if (prach.in_range(sid))  prach.record_uplane_sid(sid);
+        else if (srs.in_range(sid))    srs.record_uplane_sid(sid);
+    }
+};
+
+/**
  * ORAN C-plane message information (aggregated from multiple sections)
  */
 typedef struct oran_c_plane_info_t
@@ -865,6 +1095,7 @@ typedef struct oran_c_plane_info_t
     int16_t eaxcId_index{};     //!< eAxC ID index within cell
     uint8_t section_type{};     //!< Section type (0=unused, 1=all RBs, 3=PRB mask)
     uint8_t section_id{};       //!< Section ID
+    uint8_t udCompHdr{};        //!< User data compression header from C-plane common header (udCompMeth[3:0] | udIqWidth[7:4])
     uint8_t startSym{};         //!< Starting OFDM symbol index
     uint8_t numSym{};           //!< Number of OFDM symbols
     uint16_t startPrbc{};       //!< Starting PRB index (compressed)
@@ -885,6 +1116,7 @@ typedef struct oran_c_plane_info_t
     struct ul_tv_object* tv_object{};  //!< Pointer to UL test vector object
     struct dl_tv_object* dl_tv_object{};  //!< Pointer to DL test vector object
     ul_channel channel_type{};  //!< Uplink channel type
+    bool is_mixed_channel{};    //!< True if sections have different channel types
     uint16_t tv_index{};        //!< Test vector index
     uint8_t numberOfSections{}; //!< Number of sections in this C-plane message
     // std::vector<oran_c_plane_section_info_t> section_infos;
@@ -939,6 +1171,45 @@ struct tv_object
 };
 
 /**
+ * Encode a floating-point scale value (0, 1) into a 15-bit modCompScaler
+ * format: 4-bit exponent | 11-bit mantissa.
+ * Decoded value = mantissa / (2048 * 2^exp).
+ * Uses the same direct frexp-based conversion as the DU side so that
+ * the encoded values match exactly for TV comparison.
+ */
+inline uint16_t float_to_modcompscaler(float scale)
+{
+    if (!(scale > 0.0f && scale < 1.0f))
+    {
+        return 0;
+    }
+
+    int exp = 0;
+    float mantissa_float = std::frexp(scale, &exp);
+
+    int mantissa = static_cast<int>(std::round(mantissa_float * 2048.0f));
+    int custom_exp = -exp;
+
+    mantissa = std::clamp(mantissa, 0, 0x7FF);
+    custom_exp = std::clamp(custom_exp, 0, 15);
+
+    return static_cast<uint16_t>((custom_exp << 11) | mantissa);
+}
+
+/**
+ * Per-message expected SE4/SE5 extension values loaded from the TV.
+ */
+struct tv_mod_comp_ext_info
+{
+    uint32_t ext_type = 0;
+    uint32_t n_mask = 0;
+    uint16_t mc_scale_re_mask[2] = {0, 0};
+    uint16_t mc_scale_offset_encoded[2] = {0, 0};
+    uint32_t csf[2] = {0, 0};
+    bool valid = false;
+};
+
+/**
  * Test vector modulation/compression object for DL
  */
 struct tv_mod_comp_object
@@ -949,6 +1220,7 @@ struct tv_mod_comp_object
     std::unordered_map<int, int> global_msg_idx_to_tv_idx;  //!< Map from global message index to TV index
     //!< Payload parameters: {startPrb, numPrb, udIqWidth, skip_iq_validation}
     std::vector<std::array<int, 4>> mod_comp_payload_params;
+    std::vector<tv_mod_comp_ext_info> mod_comp_ext_info;  //!< Per-message expected SE4/SE5 values from TV
     //std::array<std::array<std::array<std::array<std::array<std::unordered_map<int, int>, 64>, SLOT_NUM_SYMS>, ORAN_MAX_SLOT_X_SUBFRAME_ID>, ORAN_MAX_FRAME_ID>, MAX_CELLS_PER_SLOT> fss_mod_comp_payload_idx;
 };
 
@@ -994,6 +1266,41 @@ struct ul_tv_object : tv_object
     std::array<std::array<std::atomic<uint16_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> section_rx_counters{};  //!< Section RX counters [cell][slot]
     std::array<std::array<std::atomic<uint32_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> prb_rx_counters{};  //!< PRB RX counters [cell][slot]
     std::array<std::array<aerial_fh::FHMutex, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> rx_counters_mtx{};  //!< RX counter mutexes [cell][slot]
+};
+
+// ---------------------------------------------------------------------------
+// Pre-computed UL TX cache structures
+// ---------------------------------------------------------------------------
+// Leverages the deterministic launch pattern to pre-resolve per-eAxC flow
+// handles, TX queue indices, and TX time offsets at init time, eliminating
+// per-packet TV lookup and tx_time calculation from the hot TX path.
+
+/**
+ * @brief Pre-resolved TX parameters for one eAxC within a launch-pattern
+ *        slot/cell combination.
+ *
+ * Built once at init by precompute_ul_tx_cache() and read on the hot TX
+ * path by tx_slot_precomputed().  Every entry in the containing vector
+ * is valid; no sentinel/placeholder values exist.
+ */
+struct PrecomputedEaxcTx {
+    aerial_fh::FlowHandle flow{};               ///< ORAN flow handle for this eAxC (from ul_peer_flow_map or peer_flow_map_srs).
+    ul_channel channel_type = ul_channel::NONE;  ///< UL channel type (PUSCH, PUCCH, or SRS).
+    ul_tv_object* tv_object = nullptr;           ///< Owning TV object for IQ data and launch pattern lookup.
+    uint16_t eaxcId = 0;                         ///< ORAN eAxC ID transmitted in the eCPRI header.
+    int16_t eaxcId_index = -1;                   ///< Zero-based index into the cell's eAxC list; used to select IQ data pointers.
+    int start_sym = 0;                           ///< First active symbol for this channel (from tv_info.startSym).
+    int num_sym = 0;                             ///< Number of active symbols (from tv_info.numSym).
+    std::array<int, ORAN_ALL_SYMBOLS> txq_index{};           ///< Per-symbol TX queue index (from get_txq_index()).
+    std::array<int64_t, ORAN_ALL_SYMBOLS> tx_time_offset_ns{}; ///< Per-symbol TX time offset in ns relative to slot T0.
+};
+
+/**
+ * @brief Collection of pre-resolved eAxC TX entries for one
+ *        (launch-pattern slot, cell) pair.
+ */
+struct PrecomputedSlotCellTx {
+    std::vector<PrecomputedEaxcTx> eaxc_entries; ///< All eAxC entries for this slot/cell (PUSCH + PUCCH + SRS).
 };
 
 // SIMD vector types for optimized IQ sample processing

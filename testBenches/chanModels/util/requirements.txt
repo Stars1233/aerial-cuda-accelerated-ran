@@ -1,0 +1,6 @@
+# Python dependencies for chanModels util (calibrations, analysis, visualization)
+matplotlib
+scipy
+h5py
+numpy
+pyyaml

@@ -225,10 +225,36 @@ if isfield(SysPar.bfw{1},'srsTv')
             nPrg = size(SRS_IND_Hest,1);
             % Populate Channel Estimate buffers based on SRS RNTI
             chan_BF{srsIdx}(1:nPrg,:,:) = SRS_IND_Hest;
-            % If the last bundle is partial, it won't have an SRS
-            % estimate, copy the last bundle to populate it
-            if(1==size(chan_BF{srsIdx},1)-nPrg)
-                chan_BF{srsIdx}(nPrg+1,:,:) = chan_BF{srsIdx}(nPrg,:,:);
+            
+            % Get SRS valid PRG range for padding (SRS may not cover full BW)
+            startValidPrg = srsChestMap.startValidPrg(i);  % 0-based
+            nValidPrg = srsChestMap.nValidPrg(i);
+            
+            % Only perform padding if there are valid PRGs
+            if nValidPrg > 0
+                endValidPrg = startValidPrg + nValidPrg - 1;  % 0-based
+                
+                % Pad PRGs before startValidPrg by copying first valid PRG
+                if startValidPrg > 0
+                    for padPrgIdx = 1 : startValidPrg  % 1-based index
+                        chan_BF{srsIdx}(padPrgIdx,:,:) = chan_BF{srsIdx}(startValidPrg + 1,:,:);
+                    end
+                end
+                
+                % Pad PRGs after endValidPrg by copying last valid PRG
+                % First pad within nPrg (SRS buffer size)
+                if endValidPrg < (nPrg - 1)
+                    for padPrgIdx = (endValidPrg + 2) : nPrg  % 1-based index
+                        chan_BF{srsIdx}(padPrgIdx,:,:) = chan_BF{srsIdx}(endValidPrg + 1,:,:);
+                    end
+                end
+            end
+            
+            % Then pad if BFW buffer is larger than SRS buffer
+            if(size(chan_BF{srsIdx},1) > nPrg)
+                for padPrgIdx = (nPrg+1) : size(chan_BF{srsIdx},1)
+                    chan_BF{srsIdx}(padPrgIdx,:,:) = chan_BF{srsIdx}(nPrg,:,:);
+                end
             end
         end
         H5F.close(fileID);

@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,5 +28,5 @@ echo $SCRIPT starting...
 rm -rf $MODEL_ROOT/nr_matlab/yamlmatlab
 cd $MODEL_ROOT/nr_matlab && git clone https://github.com/jerelbn/yamlmatlab.git
 cd yamlmatlab && git checkout e011be81a77d2bbcb5a88c244789f2211aadeb59
-cd external && rm snakeyaml-1.9.jar && wget -q https://repo1.maven.org/maven2/org/yaml/snakeyaml/2.5/snakeyaml-2.5.jar && md5sum -c $SCRIPT_DIR/snakeyaml-2.5.jar.md5
+cd external && rm -f snakeyaml-1.9.jar && wget -q --tries=3 --waitretry=5 -O snakeyaml-2.5.jar https://repo1.maven.org/maven2/org/yaml/snakeyaml/2.5/snakeyaml-2.5.jar && sha256sum -c $SCRIPT_DIR/snakeyaml-2.5.jar.sha256
 find $MODEL_ROOT/nr_matlab/yamlmatlab -type f -name '*.m' -exec sed -i 's/snakeyaml-1.9.jar/snakeyaml-2.5.jar/g' {} \;

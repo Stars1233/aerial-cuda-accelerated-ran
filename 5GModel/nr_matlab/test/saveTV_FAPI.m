@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -596,7 +596,7 @@ switch pdu.type
         
         % convert pdu format and write to TV
 %         pdu = formatU32Struct(pdu);
-        pdu = formatU32Struct(pdu, {'foForgetCoeff', 'postEqNoiseVardB','noiseVardB','rsrpdB', 'rsrpdB_ehq', ...
+        pdu = formatU32Struct(pdu, {'foForgetCoeff','ldpcEarlyTerminationPerUe','ldpcMaxNumItrPerUe','postEqNoiseVardB','noiseVardB','rsrpdB', 'rsrpdB_ehq', ...
             'sinrdB', 'sinrdB_ehq', 'postEqSinrdB','dmrsRssiReportedDb', 'dmrsRssiReportedDb_ehq', 'cfoEstHz', 'toEstMicroSec'});
 
         % Overwrite the invalid params in SimCtrl.negTV PUSCH TV
@@ -611,6 +611,10 @@ switch pdu.type
             for pduFieldIdx = 1:length(pduFieldName) % extact the params and overwrite pdu
                 pdu.(pduFieldName{pduFieldIdx}) = pduFieldValue{pduFieldIdx};
             end
+
+            if(SimCtrl.negTV.enable == 5)
+                pdu.tbErr = uint32(1); % FAPI overwrite for TC7712
+            end
         end
 
         hdf5_write_nv_exp(h5File, pduName, pdu);
@@ -620,7 +624,11 @@ switch pdu.type
         hdf5_write_nv_exp(h5File, [pduName, '_csi1Uci']          , uint8_convert(csi1Uci));
         hdf5_write_nv_exp(h5File, [pduName, '_csi2Uci']          , uint8_convert(csi2Uci));
         if cbErr_isfield
-            hdf5_write_nv_exp(h5File, [pduName, '_cbErr'], uint8_convert(cbErr, 0));
+            if(SimCtrl.negTV.enable == 5)
+                hdf5_write_nv_exp(h5File, [pduName, '_cbErr'], uint8_convert(ones(length(cbErr), 1), 0));
+            else
+                hdf5_write_nv_exp(h5File, [pduName, '_cbErr'], uint8_convert(cbErr, 0));
+            end
         end
 
         % CRC.indication with PUSCH data
@@ -656,9 +664,12 @@ switch pdu.type
             indication.postEqSinrdB = measurements.postEqSinrdB;
             indication.noiseVardB = measurements.noiseVardB ;
             indication.postEqNoiseVardB = measurements.postEqNoiseVardB;
-
             hdf5_write_nv_exp(h5File, indicationName, indication);
-            hdf5_write_nv_exp(h5File, [indicationName, '_CbCrcStatus'], uint8_convert(cbErr, 0));
+            if(SimCtrl.negTV.enable == 5)
+                hdf5_write_nv_exp(h5File, [indicationName, '_CbCrcStatus'], uint8_convert(ones(length(cbErr), 1), 0));
+            else
+                hdf5_write_nv_exp(h5File, [indicationName, '_CbCrcStatus'], uint8_convert(cbErr, 0));
+            end
 %             hdf5_write_nv_exp(h5File, [indicationName, '_data'], uint8_convert(payload, 0));
             idxIndication = idxIndication + 1;
         end
@@ -770,6 +781,9 @@ switch pdu.type
         % SRS report0: PRG SNR. See table 3-141 of FAPIv3
         Tc                                    = 1/(480e3*4096);
         mu                                    = carrier.mu;
+        if isnan(pdu.srsOutput.toEstMicroSec)
+            pdu.srsOutput.toEstMicroSec = 0.0;
+        end
         TimingAdvance                         = round(pdu.srsOutput.toEstMicroSec*1e-6/(16*64*Tc/2^mu));
         report0 = [];
         report0.TimingAdvance      = uint32(TimingAdvance + 31); % [0:63] => [-31:32]
@@ -786,8 +800,8 @@ switch pdu.type
         report1 = [];
         report1.numUeSrsAntPorts      = uint16(2^pdu.numAntPorts);
         report1.numGnbAntennaElements = uint16(pdu.srsOutput.chEstBuffer_nRxAntSrs);
-        report1.prgSize               = uint16(pdu.srsOutput.prgSize); % cuPHY currently reports channel I/Q matrix per PRBG with variable prgSize
-        report1.numPRGs               = uint16(pdu.srsOutput.nUniqueHops * pdu.srsOutput.nPrbsPerHop / pdu.srsOutput.prgSize);
+        report1.prgSize               = uint16(pdu.srsOutput.prgSizeL2); % cuPHY currently reports channel I/Q matrix per PRBG with variable prgSize
+        report1.numPRGs               = uint16(pdu.srsOutput.nUniqueHops * pdu.srsOutput.nPrbsPerHop / pdu.srsOutput.prgSizeL2);
 
         HestBuff = complex(single(pdu.srsOutput.Hest));     % Hest buffer for the user. May contain PRBs / ueAnts not sounded by this SRS PDU
         HestToL2 = complex(single(pdu.srsOutput.HestToL2)); % Hest to be reported to L2. Only contains PRBs / ueAnts sounded by this SRS PDU
@@ -1001,6 +1015,17 @@ Alg_Config = rmfield(Alg_Config, 'enableNoiseEstForZf');
 Alg_Config = rmfield(Alg_Config, 'useNrUCIDecode');
 Alg_Config = rmfield(Alg_Config, 'LDPC_DMI_ML_model_path');
 Alg_Config.enablePerPrgChEst = uint8(SimCtrl.bfw.enable_prg_chest);
+
+if strcmp(SimCtrl.alg.LDPC_DMI_method,'fixed')
+    Alg_Config.LDPC_DMI_method = uint8(0);
+elseif strcmp(SimCtrl.alg.LDPC_DMI_method,'LUT_spef')
+    Alg_Config.LDPC_DMI_method = uint8(1); 
+elseif strcmp(SimCtrl.alg.LDPC_DMI_method,'per_UE')  
+    Alg_Config.LDPC_DMI_method = uint8(2);
+elseif strcmp(SimCtrl.alg.LDPC_DMI_method,'ML')  
+    Alg_Config.LDPC_DMI_method = uint8(3); 
+end
+
 Alg_Config = formatU32Struct(Alg_Config);
 hdf5_write_nv_exp(h5File, 'Alg_Config', Alg_Config);
 

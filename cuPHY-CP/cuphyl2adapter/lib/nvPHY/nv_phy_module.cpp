@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,6 @@
 
 #include "nv_phy_module.hpp"
 #include "nv_phy_factory.hpp"
-#include "nv_module_dispatch_factory.hpp"
 #include "nv_phy_driver_proxy.hpp"
 #include "memtrace.h"
 #include "oran_utils/conversion.hpp"
@@ -211,11 +210,6 @@ PHY_module::PHY_module(yaml::node node_config) :
         // expose via the public interface
         phy_refs_.push_back(*phy_instances_.back());
     }
-    //------------------------------------------------------------------
-    // Create a module dispatch object based on the
-    std::string msg_type = node_config["msg_type"].as<std::string>();
-    module_dispatch_.reset(nv::module_dispatch_factory::create(msg_type.c_str()));
-
     std::unique_ptr<member_event_callback<PHY_module>> mcb_p(new member_event_callback<PHY_module>(this, &PHY_module::msg_processing));
     for (phy_mac_transport* ptransport : transport_wrapper_.get_transports())
     {
@@ -486,7 +480,12 @@ PHY_module::PHY_module(yaml::node node_config) :
 // PHY_module::join()
 void PHY_module::join()
 {
-    thread_.join();
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+
+    // Tick thread is not started at initial, so join it after the msg_processing thread joined
+    tti_module_.timer_thread_join();
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -572,12 +571,28 @@ void PHY_module::start()
     }
 }
 
+/**
+    * Stop the PHY module
+    *
+    * Signals the module thread and tick generator to stop.
+    */
+void PHY_module::stop()
+{
+    stop_tick_generator();
+    if (epoll_ctx_p)
+    {
+        epoll_ctx_p->terminate();
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////
 // PHY_module::recv_msg()
 #ifdef ENABLE_L2_SLT_RSP
 bool PHY_module::recv_msg()
 {
     phy_mac_msg_desc smsg;
+    static uint32_t last_processed_slot = 0xFFFFFFFF;
+
     while(transport_wrapper().rx_recv(smsg) >= 0)
     {
         if(simulated_cpu_stall_checkpoint(L2A_MSG_THREAD,-1))
@@ -586,6 +601,17 @@ bool PHY_module::recv_msg()
         sfn_slot_t ss_msg = nv_ipc_get_sfn_slot(&smsg);
         NVLOGI_FMT(TAG, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SFN {}.{}",
                 ss_curr.u16.sfn, ss_curr.u16.slot, smsg.cell_id, smsg.msg_id, ss_msg.u16.sfn, ss_msg.u16.slot);
+
+        // Reset L1 limit errors when we start processing a NEW slot
+        // This prevents counter accumulation across slots
+        if (ss_msg.u32 != SFN_SLOT_INVALID && ss_msg.u32 != last_processed_slot) {
+            NVLOGD_FMT(TAG, "New slot detected: SFN {}.{} (was {}.{}), resetting L1 limit errors (PDSCH parsed was {})",
+                       ss_msg.u16.sfn, ss_msg.u16.slot,
+                       (last_processed_slot >> 16) & 0xFFFF, last_processed_slot & 0xFFFF,
+                       group_limit_errors_.pdsch_errors.parsed);
+            reset_l1_limit_errors();
+            last_processed_slot = ss_msg.u32;
+        }
 
         // For disordered FAPI in Multi-L2: new slot messages comes before processing current slot and updating ss_curr
         if(ss_msg.u32 != SFN_SLOT_INVALID && smsg.msg_id != 0x82 && ss_msg.u32 == get_next_sfn_slot(ss_curr).u32) {
@@ -632,6 +658,10 @@ bool PHY_module::recv_msg()
                 }
             }
             next_slot_fapi_num = 0;
+            // Log PDSCH counter before reset for debugging
+            NVLOGD_FMT(TAG, "Resetting L1 limit errors at slot end - PDSCH parsed={}, errors={}",
+                       group_limit_errors_.pdsch_errors.parsed,
+                       group_limit_errors_.pdsch_errors.errors);
             reset_l1_limit_errors();
         }
     }
@@ -664,7 +694,9 @@ bool PHY_module::recv_msg()
             } else {
                 if (num_msgs >= slot_msgs_received.size())
                 {
-                    NVLOGF_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "SFN {}.{}: received msg_id=0x{:02X} for SFN {}.{}, num_msgs={} exceeds array boundary\n", ss_curr.u16.sfn, ss_curr.u16.slot, smsg.msg_id, ss_msg.u16.sfn, ss_msg.u16.slot, num_msgs);
+                    NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "SFN {}.{}: received msg_id=0x{:02X} for SFN {}.{}, num_msgs={} exceeds array boundary", ss_curr.u16.sfn, ss_curr.u16.slot, smsg.msg_id, ss_msg.u16.sfn, ss_msg.u16.slot, num_msgs);
+                    transport_wrapper().rx_release(smsg);
+                    continue;
                 }
                 slot_msgs_received[num_msgs] = smsg;
                 num_msgs++;
@@ -861,17 +893,12 @@ void PHY_module::msg_processing()
     memtrace_set_config(MI_MEMTRACE_CONFIG_ENABLE | MI_MEMTRACE_CONFIG_EXIT_AFTER_BACKTRACE);
     try
     {
-#ifdef LEGO_MGX_CG1
-        if(transport_wrapper().poll())
-        {
-            recv_msg();
-        }
-        else
-        {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(1));
-        }
-#else
+        // The while loop in recv_msg() returns only when there is no more message to receive. No need to add additional polling here.
         recv_msg();
+
+#ifdef FORCE_SLEEP_OF_L2A_MSG_THREAD
+        // Add sleep to avoid system blocking by SCHED_FIFO + polling thread
+        std::this_thread::sleep_for(std::chrono::nanoseconds(1));
 #endif
     }
     catch(std::exception& e)
@@ -880,7 +907,9 @@ void PHY_module::msg_processing()
     }
     catch(...)
     {
-        NVLOGF_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "PHY_module::msg_processing() unknown exception");
+        // Need rethrow abi::__forced_unwind exception to avoid "FATAL: exception not rethrown" in pthread_join()
+        NVLOGC_FMT(TAG, "PHY_module::msg_processing() re-throwing unknown exception");
+        throw;
     }
 }
 #else
@@ -924,10 +953,11 @@ void PHY_module::thread_func()
     nvlog_fmtlog_thread_init("msg_processing");
     NVLOGC_FMT(TAG, "Thread {} on CPU {} initialized fmtlog", __FUNCTION__, thread_cfg_->cpu_affinity);
 
-    while(1)
+    while(!pExitHandler.test_exit_in_flight())
     {
         msg_processing();
     }
+    NVLOGC_FMT(TAG, "Thread msg_processing exiting");
 }
 #else
 void PHY_module::thread_func()
@@ -1062,9 +1092,9 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
 
                 if(phy_list_size >= MAX_CELLS_PER_CELL_GROUP)
                 {
-                    NVLOGC_FMT(TAG, "phy_list_size {} >= MAX_CELLS_PER_CELL_GROUP {}", phy_list_size, MAX_CELLS_PER_CELL_GROUP);
-                    EXIT_L1(EXIT_FAILURE);
-                    return; // Already exited in above line. Add return here to avoid converity scan warning.
+                    partial_cmd = true;
+                    NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "phy_list_size {} >= MAX_CELLS_PER_CELL_GROUP {}", phy_list_size, MAX_CELLS_PER_CELL_GROUP);
+                    continue;
                 }
                 phy_list[phy_list_size] = stat_prm_idx_to_cell_id_map[staticIdx];
                 ++phy_list_size;
@@ -1143,7 +1173,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
             auto slot = ss_curr.u16.slot;
             if(!slot_end_rcvd)
                 slot = (slot + nv::mu_to_slot_in_sf(get_mu_highest()) - 1)% (nv::mu_to_slot_in_sf(get_mu_highest()));
-            NVLOGW_FMT(TAG, "Dropping the slot command for sfn {} slot {}", ss_curr.u16.sfn, slot);
+            NVLOGW_FMT(TAG, "Dropping the slot command for SFN {}.{}", ss_curr.u16.sfn, slot);
             PHYDriverProxy::getInstance().l1_resetBatchedMemcpyBatches(); //used to guard against case when the slot is dropped and PDSCH H2D copies are batched with preponing (prepone_h2d_copy=1) enabled and without separate copy thread (enable_h2d_copy_thread in cuphycontroller yaml = 0)
         }
 
@@ -1252,6 +1282,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
         if (first_tick)
         {
             first_tick = false;
+
             uint64_t slot_temp;
             uint8_t SLOT_MAX=20;
             // Initialize SFN.  Convert from system time (which is synchronized to TIA/PTP time) to GPS time
@@ -1271,12 +1302,20 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
                 tick_updater_.slot_info_.sfn_ = (tick_updater_.slot_info_.sfn_+1)%FAPI_SFN_MAX;
             }
             tick_updater_.slot_info_.slot_ = (slot_temp+tick_updater_.slot_advance_)%SLOT_MAX;
-            NVLOGI_FMT(TAG,"FIRST tick received: sfn={}, slot={}, tick={}, seconds since epoch = {}, nanoseconds = {}",
+            NVLOGI_FMT(TAG,"FIRST tick received: SFN {}.{} tick={} seconds since epoch = {} nanoseconds = {}",
                  static_cast<unsigned>(tick_updater_.slot_info_.sfn_),
                  static_cast<unsigned>(tick_updater_.slot_info_.slot_),
                  tick.count(),
                  tick.count() / 1000000000ULL,
                  tick.count() % 1000000000ULL);
+        }
+
+        // Stop tick generator and skip sending SLOT.indication if app exit is in flight
+        if (pExitHandler.test_exit_in_flight())
+        {
+            NVLOGC_FMT(TAG, "{}: Stop tick generator because app exit is in flight", __FUNCTION__);
+            tti_module_.stop_tick_generator();
+            return;
         }
 
         sfn_slot_t sfn_slot;
@@ -1291,12 +1330,11 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
         int64_t tick_err = ts_now.count() - tick.count();
         if (test_type != 2) // Do not send SLOT.indication in tick unit test
         {
-
             if(tick_err < timer_thread_wakeup_threshold_)
             {
                 current_tick_list_[sfn_slot.u16.slot%10] = tick;
                 l1_slot_ind_tick_[sfn_slot.u16.slot%10] = ts_now;
-                NVLOGI_FMT(TAG,"{}: sfn={}, slot={}, tick={} ts_now={} tick_err={} threshold={}",
+                NVLOGI_FMT(TAG,"{}: SFN {}.{} tick={} ts_now={} tick_err={} threshold={}",
                 __func__,static_cast<unsigned>(tick_updater_.slot_info_.sfn_),
                 static_cast<unsigned>(tick_updater_.slot_info_.slot_),tick.count(), ts_now.count(),tick_err,timer_thread_wakeup_threshold_);
                 phy_refs_[0].get().send_slot_indication(tick_updater_.slot_info_);
@@ -1322,7 +1360,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
             static int count = 0;
             if (count == 0)
             {
-                NVLOGD_FMT(TAG,"tick received: sfn={}, slot={}, tick={}, seconds since epoch = {}, nanoseconds = {}",
+                NVLOGD_FMT(TAG,"tick received: SFN {}.{} tick={} seconds since epoch = {} nanoseconds = {}",
                      static_cast<unsigned>(tick_updater_.slot_info_.sfn_),
                      static_cast<unsigned>(tick_updater_.slot_info_.slot_),
                      tick.count(),
@@ -1500,15 +1538,17 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
         NVLOGI_FMT(TAG, "{} value={}", __FUNCTION__, value);
 
         if (value) {
-            tti_module_.start_slot_indication();
+            tti_module_.start_tick_generator();
             if(!transport_wrapper().get_all_cells_configured()) {
                 NVLOGC_FMT(TAG, "SLOT.indication cannot be sent until all cells are configured");
             }
-        } else
-        {
-            tti_module_.stop_slot_indication();
         }
+    }
 
+    void PHY_module::stop_tick_generator()
+    {
+        NVLOGI_FMT(TAG, "{}", __FUNCTION__);
+        tti_module_.stop_tick_generator();
     }
 
     void PHY_module::set_bfw_coeff_buff_info(uint32_t cell_index, bfw_buffer_info* buff)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,7 +30,12 @@
 #include "cumac.h"
 #include "trafficFlows.hpp"
 
-
+// Structure to hold parameter pairs (mean, stddev) to avoid std::pair ABI issues
+struct TrafficParams
+{
+    float mean;
+    float stddev;
+};
 
 enum class Arrival_t {uniform, poisson, full_buffer};
 
@@ -45,11 +50,11 @@ private:
    float     packet_stddev;   //!< Packet size stddev
 
 public:
-    std::pair<float,float> GetPktSizeParams(){
-        return std::make_pair(packet_size,packet_stddev);
+    TrafficParams GetPktSizeParams(){
+        return {packet_size, packet_stddev};
     }
-    std::pair<float,float> GetArrivalParams(){
-        return std::make_pair(arrival_rate,arrival_stddev);
+    TrafficParams GetArrivalParams(){
+        return {arrival_rate, arrival_stddev};
     }
     Arrival_t GetArrivalType(){
         return arrival_type;
@@ -233,9 +238,9 @@ public:
         {
             pending_traffic[i].flow_id = i;
             auto pkt_size = flow_cfgs[i].GetPktSizeParams();
-            pkt_size_dist[i] = std::normal_distribution<>(pkt_size.first,pkt_size.second);
+            pkt_size_dist[i] = std::normal_distribution<>(pkt_size.mean,pkt_size.stddev);
             auto arrival = flow_cfgs[i].GetArrivalParams();
-            arrival_dist[i] = std::poisson_distribution<>(arrival.first);
+            arrival_dist[i] = std::poisson_distribution<>(arrival.mean);
             arrival_type[i] = flow_cfgs[i].GetArrivalType();
         }
     }

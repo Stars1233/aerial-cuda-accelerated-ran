@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,10 @@
 constexpr int LOS_MATRIX_SIZE = 7;  // 7x7 matrix for LOS cases
 constexpr int NLOS_MATRIX_SIZE = 6; // 6x6 matrix for NLOS cases
 constexpr int O2I_MATRIX_SIZE = 6;  // 6x6 matrix for O2I cases
+
+// 3GPP maximum antenna element gain (dBi); used for antenna pattern (antTheta/antPhi) in small-scale
+// and for pathloss+antenna-gain aggregation in sls_chan
+constexpr float SLS_ANTENNA_GAIN_MAX_DBI = 8.0f;
 
 // Parameter indices for correlation matrices
 constexpr int SF_IDX = 0;   // Shadow Fading
@@ -267,6 +271,7 @@ struct corrDist_t {
     float ASA;  // Azimuth Spread of Arrival
     float ZSD;  // Zenith Spread of Departure
     float ZSA;  // Zenith Spread of Arrival
+    float DT;   // Delta Tau (excess delay) per 3GPP TR 38.901 Table 7.6.9-1
 };
 
 // UMa correlation distances
@@ -277,7 +282,8 @@ const corrDist_t corrDistUmaLos = {
     18.0f,  // ASD (LOS)
     15.0f,  // ASA (LOS)
     15.0f,  // ZSD (LOS)
-    15.0f   // ZSA (LOS)
+    15.0f,  // ZSA (LOS)
+    50.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 UMa
 };
 
 const corrDist_t corrDistUmaNlos = {
@@ -287,7 +293,8 @@ const corrDist_t corrDistUmaNlos = {
     50.0f,  // ASD (NLOS)
     50.0f,  // ASA (NLOS)
     50.0f,  // ZSD (NLOS)
-    50.0f   // ZSA (NLOS)
+    50.0f,  // ZSA (NLOS)
+    50.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 UMa
 };
 
 const corrDist_t corrDistUmaO2i = {
@@ -297,7 +304,8 @@ const corrDist_t corrDistUmaO2i = {
     11.0f,  // ASD (O2I)
     17.0f,  // ASA (O2I)
     25.0f,  // ZSD (O2I)
-    25.0f   // ZSA (O2I)
+    25.0f,  // ZSA (O2I)
+    10.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 InH (indoor)
 };
 
 // UMi correlation distances
@@ -308,7 +316,8 @@ const corrDist_t corrDistUmiLos = {
     8.0f,   // ASD (LOS)
     8.0f,   // ASA (LOS)
     12.0f,  // ZSD (LOS)
-    12.0f   // ZSA (LOS)
+    12.0f,  // ZSA (LOS)
+    15.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 UMi
 };
 
 const corrDist_t corrDistUmiNlos = {
@@ -318,17 +327,19 @@ const corrDist_t corrDistUmiNlos = {
     10.0f,  // ASD (NLOS)
     9.0f,   // ASA (NLOS)
     10.0f,  // ZSD (NLOS)
-    10.0f   // ZSA (NLOS)
+    10.0f,  // ZSA (NLOS)
+    15.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 UMi
 };
 
 const corrDist_t corrDistUmiO2i = {
-    7.0f,  // SF (O2I)
+    7.0f,   // SF (O2I)
     0.0f,   // K (O2I) - not applicable for O2I
     10.0f,  // DS (O2I)
     11.0f,  // ASD (O2I)
     17.0f,  // ASA (O2I)
     25.0f,  // ZSD (O2I)
-    25.0f   // ZSA (O2I)
+    25.0f,  // ZSA (O2I)
+    10.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 InH (indoor)
 };
 
 // RMa correlation distances
@@ -339,7 +350,8 @@ const corrDist_t corrDistRmaLos = {
     25.0f,  // ASD (LOS)
     35.0f,  // ASA (LOS)
     15.0f,  // ZSD (LOS)
-    15.0f   // ZSA (LOS)
+    15.0f,  // ZSA (LOS)
+    50.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 RMa
 };
 
 const corrDist_t corrDistRmaNlos = {
@@ -349,18 +361,20 @@ const corrDist_t corrDistRmaNlos = {
     30.0f,  // ASD (NLOS)
     40.0f,  // ASA (NLOS)
     50.0f,  // ZSD (NLOS)
-    50.0f   // ZSA (NLOS)
+    50.0f,  // ZSA (NLOS)
+    50.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 RMa
 };
 
 // RMa O2I correlation distances
 const corrDist_t corrDistRmaO2i = {
-    120.0f,  // SF (O2I)
+    120.0f, // SF (O2I)
     0.0f,   // K (O2I) - not applicable for O2I
     36.0f,  // DS (O2I)
     30.0f,  // ASD (O2I)
     40.0f,  // ASA (O2I)
     50.0f,  // ZSD (O2I)
-    50.0f   // ZSA (O2I)
+    50.0f,  // ZSA (O2I)
+    50.0f   // DT (Delta Tau) per 3GPP TR 38.901 Table 7.6.9-1 RMa/indoor
 };
 
 // Table 7.5-2: Scaling factors for AOA, AOD generation (C_phi^NLOS)

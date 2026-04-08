@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,6 +46,7 @@
 typedef struct orderKernelConfigParams{
     struct doca_gpu_eth_rxq *rxq_info_gpu[UL_MAX_CELLS_PER_SLOT];          ///< DOCA GPU receive queue handles for direct GPU packet access
     struct doca_gpu_semaphore_gpu *sem_gpu[UL_MAX_CELLS_PER_SLOT];         ///< DOCA GPU semaphores for RX/order kernel synchronization
+    struct aerial_fh_gpu_semaphore_gpu *sem_gpu_aerial_fh[UL_MAX_CELLS_PER_SLOT]; ///< Aerial FH GPU semaphores for RX/order kernel synchronization
     uint16_t sem_order_num[UL_MAX_CELLS_PER_SLOT];                         ///< Semaphore value to signal after ordering complete
     int                   cell_id[UL_MAX_CELLS_PER_SLOT];                  ///< Physical cell IDs
     int                   comp_meth[UL_MAX_CELLS_PER_SLOT];                ///< Compression method
@@ -138,6 +139,7 @@ typedef struct orderKernelConfigParams{
 typedef struct orderKernelConfigParamsSrs{
     struct doca_gpu_eth_rxq *rxq_info_gpu[UL_MAX_CELLS_PER_SLOT];          ///< DOCA GPU receive queue handles for direct GPU packet access
     struct doca_gpu_semaphore_gpu *sem_gpu[UL_MAX_CELLS_PER_SLOT];         ///< DOCA GPU semaphores for RX/order kernel synchronization
+    struct aerial_fh_gpu_semaphore_gpu *sem_gpu_aerial_fh[UL_MAX_CELLS_PER_SLOT]; ///< Aerial FH GPU semaphores for RX/order kernel synchronization
     uint16_t sem_order_num[UL_MAX_CELLS_PER_SLOT];                         ///< Semaphore value to signal after ordering complete
     int                   cell_id[UL_MAX_CELLS_PER_SLOT];                  ///< Physical cell IDs
     int                   comp_meth[UL_MAX_CELLS_PER_SLOT];                ///< Compression method

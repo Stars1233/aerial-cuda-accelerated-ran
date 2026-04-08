@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -115,9 +115,9 @@ cumac_receiver::cumac_receiver(yaml::node &yaml_node, cumac_cp_configs &_configs
     {
         NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT, "Invalid GPU ID: gpu_id={}", configs.gpu_id);
     }
-    
-    cudaSetDevice(configs.gpu_id);
-    
+
+    CHECK_CUDA_ERR(cudaSetDevice(configs.gpu_id));
+
     task_ring = new lock_free_ring_pool<cumac_task>("cumac_task", configs.task_ring_len, sizeof(cumac_task));
 
     if (sem_init(&_task_sem, 0, 0) != 0)

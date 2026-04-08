@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,7 +46,7 @@ static constexpr uint32_t PRACH_MAX_OCCASIONS_AGGR = slot_command_api::MAX_PRACH
 static constexpr uint32_t PRACH_MAX_OCCASIONS = slot_command_api::MAX_PRACH_OCCASIONS_PER_SLOT;       ///< Max PRACH occasions per slot
 static constexpr uint32_t PRACH_MAX_NUM_PREAMBLES = 64;             ///< Maximum number of PRACH preambles
 static constexpr uint32_t PHY_DLBFW_AGGR_X_CTX = 10;                ///< DL beamforming weight aggregation objects per context
-static constexpr uint32_t PHY_PDSCH_AGGR_X_CTX = 10;                ///< PDSCH aggregation objects per context
+static constexpr uint32_t PHY_PDSCH_AGGR_X_CTX = 5;                ///< PDSCH aggregation objects per context
 static constexpr uint32_t PHY_PDCCH_DL_AGGR_X_CTX = 10;             ///< DL PDCCH aggregation objects per context
 static constexpr uint32_t PHY_PDCCH_UL_AGGR_X_CTX = 0;              ///< UL PDCCH aggregation objects per context (unused)
 static constexpr uint32_t PHY_PBCH_AGGR_X_CTX = 10;                 ///< PBCH aggregation objects per context

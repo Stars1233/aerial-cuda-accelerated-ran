@@ -18,6 +18,8 @@
 #ifndef MEMFOOT_H
 #define MEMFOOT_H
 
+#include "memfoot_global.hpp"
+
 #include <string>
 #include "cuphydriver_api.hpp"
 
@@ -28,14 +30,14 @@
  * GPU pinned, GPU regular) for a specific component or object. Used throughout
  * cuPHYDriver to measure and report memory usage for debugging and optimization.
  */
-class MemFoot {
+class MemFoot : public MemFootBase {
 public:
     /**
      * @brief Construct memory footprint tracker
      *
      * Initializes all memory counters to zero and sets uninitialized state.
      */
-    MemFoot()
+    MemFoot():MemFootBase(MF_MODULE_PHYDRV)
     {
         items = 0;
         cpu_obj_size = 0;
@@ -93,14 +95,27 @@ public:
      * @return true on success
      */
     bool addGpuRegularSize(size_t size);
-    
+
+    /**
+     * @brief Get total GPU memory size
+     *
+     * @return Total GPU memory in bytes
+     */
+    size_t getGpuSize() override
+    {
+        return gpu_regular_size + gpu_pinned_size;
+    }
+
     /**
      * @brief Get name of this memory footprint
      *
      * @return Name string (component/object identifier)
      */
-    const char * getName() const;
-    
+    std::string getName() override
+    {
+        return name;
+    }
+
     /**
      * @brief Get CPU object size
      *

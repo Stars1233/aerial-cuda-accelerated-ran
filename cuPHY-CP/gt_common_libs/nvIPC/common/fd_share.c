@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -100,7 +100,8 @@ int recv_fd(int fd)
     struct cmsghdr* cmptr = NULL;
 
     status = -1;
-    for(;;)
+    int retry_count = 0;
+    for(retry_count = 0; retry_count < 10; retry_count++)
     {
         iov[0].iov_base = buf;
         iov[0].iov_len  = sizeof(buf);
@@ -161,7 +162,12 @@ int recv_fd(int fd)
             return newfd;
         }
     }
-    free(cmptr);
+
+    if (cmptr != NULL)
+    {
+        free(cmptr);
+    }
+    NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "recv_fd failed after %d retries", retry_count);
     return -1;
 }
 

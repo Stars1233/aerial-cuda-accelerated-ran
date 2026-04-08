@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +16,8 @@
 """pyAerial library - CSI-RS receiver."""
 from typing import Any
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
@@ -26,7 +26,7 @@ from aerial.phy5g.api import Array
 from aerial.phy5g.csirs.csirs_api import CsiRsConfig
 from aerial.phy5g.csirs.csirs_api import CsiRsRxConfig
 from aerial.phy5g.csirs.csirs_api import CsiRsRxPipeline
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 
 
 class CsiRsRx(CsiRsRxPipeline[CsiRsRxConfig, Array]):
@@ -34,16 +34,16 @@ class CsiRsRx(CsiRsRxPipeline[CsiRsRxConfig, Array]):
 
     This class implements CSI-RS reception within a slot.
     """
-    def __init__(self, num_prb_dl_bwp: List[int], cuda_stream: int = None) -> None:
+    def __init__(self, num_prb_dl_bwp: List[int], cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize CsiRsRx.
 
         Args:
             num_prb_dl_bwp (List[int]): Number of PRBs in DL BWP.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         self.csi_rs_rx = pycuphy.CsiRsRx(num_prb_dl_bwp)
 
@@ -69,15 +69,15 @@ class CsiRsRx(CsiRsRxPipeline[CsiRsRxConfig, Array]):
             List[List[[Array]]: Channel estimation buffers for the slot for each UE.
         """
         cpu_copy = isinstance(rx_data[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rx_data = [cp.array(buf, order='F', dtype=cp.complex64) for buf in rx_data]
             rx_data = [pycuphy.CudaArrayComplexFloat(buf) for buf in rx_data]
         ch_est = self.csi_rs_rx.run(csirs_configs,
                                     rx_data,
                                     ue_cell_association,
-                                    self.cuda_stream)
+                                    self._cuda_stream.handle)
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             ch_est = [[cp.array(buf) for buf in ue_ch_est] for ue_ch_est in ch_est]
             if cpu_copy:
                 ch_est = [[buf.get(order='F') for buf in ue_ch_est] for ue_ch_est in ch_est]

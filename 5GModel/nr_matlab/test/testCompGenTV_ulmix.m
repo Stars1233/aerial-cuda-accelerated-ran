@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,13 +61,13 @@ switch compTvMode
         error('compTvMode is not supported...\n');
 end
 
-selected_TC = [500:999, 1000:7800, 20000:29999];
+selected_TC = [500:999, 1000:8555, 20000:29999];
 disabled_TC = [];
 % These are tests that are run from elsewhere.  Generating them explicity
 % should work but we don't want them generated as part of selected TCs
 % because it will create race conditions if they are simultaneously
 % generated in 2 places
-bypass_TC = [743,763,783,803,823,843,863 21203:20:21383, 21423:10:21493, 4791:4805, 5461:5475, 5581:5595, 5731:5745, 5851:5865, 4836:4850, 21523, 21563, 21583, 21603, 21623, 21642, 21643, 21653, 21663, 21673, 21693, 21713, 21723, 21733:21735,21743, 21753, 21763, 21772, 21773, 21793, 21803, 21813, 21823];
+bypass_TC = [743,763,783,803,823,843,863 21203:20:21383, 21423:10:21493, 4791:4805, 5461:5475, 5581:5595, 5731:5745, 5851:5865, 4836:4850, 21523, 21563, 21583, 21603, 21623, 21640:21643, 21653, 21663, 21673, 21693, 21713, 21723, 21733:21735,21743, 21753, 21763, 21772, 21773, 21793:10:21903];
 [~,TcIdx] = ismember([disabled_TC,bypass_TC], selected_TC);
 TcIdx = TcIdx(TcIdx > 0);  % Filter out zero indices to prevent out-of-bounds error
 selected_TC(TcIdx) = [];
@@ -143,6 +143,15 @@ perf_pattern_table = [
     83.1,       7575,    7679,    15,     7;  % 83a, 83c
     83.2,       7680,    7784,    15,     7;  % 83b, 83d
     85,         7785,    7889,    15,     7;  % 85
+    % 87 reuse the ULMIX TVs from pattern 85
+    89,         7890,    7952,     9,     9;  % 89
+    79.1,       7953,    8057,    15,     6;  % 79a
+    79.2,       8058,    8162,    15,     6;  % 79b
+    91,         8163,    8267,    15,     7;  % 91
+    101,        4375,    4470,    24,    24;  % 101
+    101.1,      8268,    8363,    24,    24;  % 101a
+    102,        8364,    8459,    24,    24;  % 102
+    102.1,      8460,    8555,    24,    24;  % 102a
 ];
 
 % generate compact TV list from performance patterns
@@ -158,15 +167,16 @@ for i = 1:size(perf_pattern_table, 1)
 end
 
 % non-performance pattern compact TVs
-compact_TV_non_perf_pattern = [530:541, 550:589, 590, 603, 604, 605, 606, 607, 608, 609, 610, 611, 636, 637, 644, 645, 652, 653, 660, 661, 700:879, ...
+compact_TV_non_perf_pattern = [508:519, 530:547, 550:589, 590, 603, 605, 606, 607, 608, 609, 610, 611, 612:618, 619:630, 636, 637, 644, 645, 652:658, 660, 661, 700:879, ...
                                 3920:3927, ... % ULMIX TVs with PRACH + PUCCH + PUSCH + SRS
-                                3928:3939, ... % SRS in consecutive slots with SRS + PUCCH
-                                4300:4335, ... % SRS in consecutive slots with SRS + other channels
+                                3928:3941, ... % SRS in consecutive slots with SRS + PUCCH
+                                4300:4336, ... % SRS in consecutive slots with SRS + other channels
                                 3840, 6996, ... % negative TC
                                 20000:29999]; % mMIMO, multi-cell % negative TC
 
 % combine both compact TV sets
 compact_TC = [compact_TV_non_perf_pattern, compact_TV_perf_pattern];
+compact_TC = unique(compact_TC);
 
 % only generate FAPI TV in this set for per-MR cicd
 % keep cuPHY TVs for one of each kind
@@ -184,9 +194,18 @@ for i = 1:size(perf_pattern_table, 1)
     compact_TV_FAPI_only = [compact_TV_FAPI_only, fapi_only_tvs];
 end
 
-full_TC = [500:999, 1000:7800, 20000:29999];
+% performance pattern compact TVs required for cuBB GPU test bench
+compact_TV_perf_pattern_cuBB_gpu = [
+    4544, 4548, 4566, ... % from 59c
+    4382, 4417, ... % from 101
+    8310, 8337, ... % from 101a
+    8375, 8393, ... % from 102
+];
+compact_TV_FAPI_only = setdiff(compact_TV_FAPI_only, compact_TV_perf_pattern_cuBB_gpu);  % exclude cuBB GPU test bench TVs from FAPI-only set, will generate both cuPHY and FAPI TVs
 
-MIMO_64TR_TC = [590, 700:879, 3920:3939, 4300:4335, 4791:4910, 5431:5970, 6371:6445, 6446:6520, 6521:6620, 6621:6695, 6696:6770, 6771:6845, 6846:6920, 6921:6995, 6996, 7050:7154, 7155:7259, 7260:7364, 7365:7469, 7470:7574, 7575:7679, 7680:7784, 21000:29999];
+full_TC = [500:999, 1000:8555, 20000:29999];
+
+MIMO_64TR_TC = [590, 700:879, 3920:3941, 4300:4336, 4791:4910, 5431:5970, 6371:6445, 6446:6520, 6521:6620, 6621:6695, 6696:6770, 6771:6845, 6846:6920, 6921:6995, 6996, 7050:7952, 8163:8267, 21000:29999];
 
 negative_TC = [605, 606, 607, 608, 609, 610, 611, 3840, 6996];
 
@@ -239,6 +258,7 @@ enableUlRxBfMap = containers.Map('KeyType','int32', 'ValueType','any');  % for a
 earlyHarqDisableMap = containers.Map('KeyType','int32', 'ValueType','any');  % for disabling early HARQ feedback
 harqProcessIdMap = containers.Map('KeyType','int32', 'ValueType','any');  % for setting HARQ process ID
 srsRntiStartMap = containers.Map('KeyType','int32', 'ValueType','any');  % for setting SRS RNTI
+ldpcFixMaxIterMap = containers.Map('KeyType','int32', 'ValueType','any');  % for setting fixed LDPC iteration number
 
 CFG = {...
   % TC#   slotIdx   cell     prach     pucch      pusch      srs
@@ -250,20 +270,19 @@ CFG = {...
     505     5        1         {1}    {3, 4}     {5, 6}       {};
 %     506     6        1          {}        {}        {}        {};
 %     507     7        1          {}        {}        {}        {};
-%     508     8        1          {}        {}        {}        {};
-%     509     9        1          {}        {}        {}        {};
-%     510    10        1          {}        {}        {}        {};
-%     511    11        1          {}        {}        {}        {};
-%     512    12        1          {}        {}        {}        {};    
-%     513    13        1          {}    {1, 2}     {1, 2}       {};
-    514    14        1          {}    {3, 4}     {3, 4}       {};
-    515    15        1          {}    {3, 4}     {5, 6}       {};
-%     516    16        1          {}        {}        {}        {};
-%     517    17        1          {}        {}        {}        {};
-%     518    18        1          {}        {}        {}        {};
-%     519    19        1          {}        {}        {}        {};    
-
-  % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    % DSUUU 1UEs
+      508      0        2         {4}     {7}        {550}     {3};
+      509      0        2          {}     {7}        {550}     {3};
+      510      0        2          {}     {7}        {550}     {3};
+      511      0        2          {}     {7}        {550}     {3};
+      512      0        2          {}     {7}        {550}     {3};    
+      513      0        2          {}     {7}        {550}     {3};
+      514      0        2          {}     {7}        {550}     {3};
+      515      0        2          {}     {7}        {550}     {3};
+      516      0        2          {}     {7}        {550}     {3};
+      517      0        2          {}     {7}        {550}     {3};
+      518      0        2          {}     {7}        {550}     {3};
+      519      0        2          {}     {7}        {550}     {3};    
     % dynamic cell initialization
       520      0        2         {7}     {5}       {14}        {};
       521      0        2      {7, 8}     {5}       {14}        {};
@@ -276,13 +295,33 @@ CFG = {...
     % 32T32R-SRS
       534      0        8        {12}      {}         {307, 308}   {};
       535      0        8          {}      {}         {309, 310}   {};
-    % DSUUU
-      536     0         2          {}     {7}       num2cell(550) {3};
-      537     0         2         {4}     {7}       num2cell(550) {3};
-      538     0         2          {}     {7}   num2cell(550:551) {3};
-      539     0         2         {4}     {7}   num2cell(550:551) {3};
-      540     0         2          {}     {7}   num2cell(550:553) {3};
-      541     0         2         {4}     {7}   num2cell(550:553) {3};  
+    % DSUUU 4UEs
+      536      0        2         {4}     {7}   num2cell(550:553) {3}; 
+      537      0        2          {}     {7}   num2cell(550:553) {3};
+      538      0        2          {}     {7}   num2cell(550:553) {3};
+      539      0        2          {}     {7}   num2cell(550:553) {3}; 
+      540      0        2          {}     {7}   num2cell(550:553) {3};
+      541      0        2          {}     {7}   num2cell(550:553) {3};
+      542      0        2          {}     {7}   num2cell(550:553) {3}; 
+      543      0        2          {}     {7}   num2cell(550:553) {3};
+      544      0        2          {}     {7}   num2cell(550:553) {3};
+      545      0        2          {}     {7}   num2cell(550:553) {3}; 
+      546      0        2          {}     {7}   num2cell(550:553) {3};
+      547      0        2          {}     {7}   num2cell(550:553) {3};
+    % DSUUU 2UEs
+      619      0        2         {4}     {7}   num2cell(550:551) {3};
+      620      0        2          {}     {7}   num2cell(550:551) {3};
+      621      0        2          {}     {7}   num2cell(550:551) {3};
+      622      0        2          {}     {7}   num2cell(550:551) {3};
+      623      0        2          {}     {7}   num2cell(550:551) {3};
+      624      0        2          {}     {7}   num2cell(550:551) {3};
+      625      0        2          {}     {7}   num2cell(550:551) {3};
+      626      0        2          {}     {7}   num2cell(550:551) {3};
+      627      0        2          {}     {7}   num2cell(550:551) {3};
+      628      0        2          {}     {7}   num2cell(550:551) {3};
+      629      0        2          {}     {7}   num2cell(550:551) {3};
+      630      0        2          {}     {7}   num2cell(550:551) {3};
+
        
     % HARQ TC
   % TC#   slotIdx cell     prach               pucch             pusch          srs
@@ -570,6 +609,8 @@ CFG = {...
     21636      3  11               {}                   {}                 {}   {31};  % slot 23
     21637     13  11               {}                   {}                 {}   {32};  % slot 33
   % 64TR 'worst case' Ph4 column B
+    21640      3  11               {}                   {}                 {}   {36};  % for pattern 79a, 4 SRS symbols in S slot, 2 ports per UE
+    21641      3  11               {}                   {}                 {}   {41};  % for pattern 79b, 4 SRS symbols in S slot, 4 ports per UE
     21642      3  11               {}                   {}                 {}   {24};  % for BFW with multiple SRS TVs
     21643      3  11               {}                   {}                 {}   {24};
     21644      4  11               {}              {81,82}  num2cell(2145:2152)   {};
@@ -653,6 +694,52 @@ CFG = {...
   % additional SRS for different RNTIs
     21826      3  11               {}                   {}                 {}   {31};  % slot 23
     21827     13  11               {}                   {}                 {}   {32};  % slot 33
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz heavy
+    21833      3  14               {}                   {}                       {}   {39};
+    21834      4  14               {}              {81,82}        num2cell(913:932)     {};
+    21835      5  14             {80}              {78,83}        num2cell(933:952)     {};
+    21843     13  14               {}                   {}                       {}   {39};
+    21844     14  14               {}           {80,79,82}        num2cell(913:932)     {};
+    21845     15  14               {}              {77,83}  num2cell([933:951, 953])    {};
+  % additional SRS for different RNTIs
+    21846      3  14               {}                   {}                 {}   {39};  % slot 23
+    21847     13  14               {}                   {}                 {}   {39};  % slot 33
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz light
+    21853      3  14               {}                   {}                       {}   {39};
+    21854      4  14               {}              {81,82}        num2cell(954:965)     {};
+    21855      5  14             {80}              {78,83}        num2cell(966:977)     {};
+    21863     13  14               {}                   {}                       {}   {39};
+    21864     14  14               {}           {80,79,82}        num2cell(954:965)     {};
+    21865     15  14               {}              {77,83}  num2cell([966:976, 978])    {};
+  % additional SRS for different RNTIs
+    21866      3  14               {}                   {}                 {}   {39};  % slot 23
+    21867     13  14               {}                   {}                 {}   {39};  % slot 33
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz heavy
+    21873      3  15               {}                   {}                       {}   {40};
+    21874      4  15               {}              {81,82}        num2cell(979:998)     {};
+    21875      5  15             {81}              {78,83}        num2cell(999:1018)    {};
+    21883     13  15               {}                   {}                       {}   {40};
+    21884     14  15               {}           {80,79,82}        num2cell(979:998)     {};
+    21885     15  15               {}              {77,83}  num2cell([999:1017, 1019])   {};
+  % additional SRS for different RNTIs
+    21886      3  15               {}                   {}                 {}   {40};  % slot 23
+    21887     13  15               {}                   {}                 {}   {40};  % slot 33
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz light
+    21893      3  15               {}                   {}                       {}   {40};
+    21894      4  15               {}              {81,82}        num2cell(1020:1031)   {};
+    21895      5  15             {81}              {78,83}        num2cell(1032:1043)   {};
+    21903     13  15               {}                   {}                       {}   {40};
+    21904     14  15               {}           {80,79,82}        num2cell(1020:1031)   {};
+    21905     15  15               {}              {77,83}  num2cell([1032:1042, 1044])   {};
+  % additional SRS for different RNTIs
+    21906      3  15               {}                   {}                 {}   {40};  % slot 23
+    21907     13  15               {}                   {}                 {}   {40};  % slot 33
+  % 64TR 25-3 column D, 24 DL layer with more PUCCH
+    % 2 SRS symbols in S slot 21753 and 21763
+    21914      4  11               {}              {99, 100}  num2cell(2313:2320)   {};
+    21915      5  11             {75}              {101,102}  num2cell(2321:2328)   {};
+    21924     14  11               {}          {103,104,105}  num2cell(2329:2336)   {};
+    21925     15  11               {}              {106,102}  num2cell(2337:2344)   {};
 
     %negative test cases
     605    4  2               {}                 {57}   num2cell(161:166)         {}; %overlapping PUSCH+PUCCH
@@ -663,106 +750,15 @@ CFG = {...
     610    25  2              {}                 {}     num2cell(544:549)        {3}; %overlapping PUSCH on SRS symbol
     611    34  2              {}                 {}     num2cell(161:166)        {}; %UCI PUSCH IQ data and FAPI PDU mismatch for CSI length (Num FAPI bits are less)
 
-    % F08  prach + pucch + pusch, different RNTIs
-%     540      0         2         {2}     {5}   num2cell(14:29)     {};
-%     541      0         2         {2}     {5}   num2cell(14:29)     {};
-%     542      0         2         {2}     {5}   num2cell(14:29)     {};
-%     543      0         2         {2}     {5}   num2cell(14:29)     {};
-%     544      0         2         {2}     {5}   num2cell(14:29)     {};
-%     545      0         2         {2}     {5}   num2cell(14:29)     {};
-%     546      0         2         {2}     {5}   num2cell(14:29)     {};
-%     547      0         2         {2}     {5}   num2cell(14:29)     {};
-%     548      0         2         {2}     {5}   num2cell(14:29)     {};
-%     549      0         2         {2}     {5}   num2cell(14:29)     {};
-%     550      0         2         {2}     {5}   num2cell(14:29)     {};
-%     551      0         2         {2}     {5}   num2cell(14:29)     {};
-%     552      0         2         {2}     {5}   num2cell(14:29)     {};
-%     553      0         2         {2}     {5}   num2cell(14:29)     {};
-%     554      0         2         {2}     {5}   num2cell(14:29)     {};
-%     555      0         2         {2}     {5}   num2cell(14:29)     {};
-    % F08  UCI on pusch (prach + pucch + pusch, different RNTIs)
-%     556      0         2         {2}     {5}   num2cell(14:29)     {};
-%     557      0         2         {2}     {5}   num2cell(14:29)     {};
-%     558      0         2         {2}     {5}   num2cell(14:29)     {};
-%     559      0         2         {2}     {5}   num2cell(14:29)     {};
-%     560      0         2         {2}     {5}   num2cell(14:29)     {};
-%     561      0         2         {2}     {5}   num2cell(14:29)     {};
-%     562      0         2         {2}     {5}   num2cell(14:29)     {};
-%     563      0         2         {2}     {5}   num2cell(14:29)     {};
-%     564      0         2         {2}     {5}   num2cell(14:29)     {};
-%     565      0         2         {2}     {5}   num2cell(14:29)     {};
-%     566      0         2         {2}     {5}   num2cell(14:29)     {};
-%     567      0         2         {2}     {5}   num2cell(14:29)     {};
-%     568      0         2         {2}     {5}   num2cell(14:29)     {};
-%     569      0         2         {2}     {5}   num2cell(14:29)     {};
-%     570      0         2         {2}     {5}   num2cell(14:29)     {};
-%     571      0         2         {2}     {5}   num2cell(14:29)     {};
-    % F08 8 cell UCI on pusch (prach + pucch + pusch, different RNTIs)
-%     572      0         2         {2}     {5}   num2cell(14:29)     {};
-%     573      0         2         {2}     {5}   num2cell(14:29)     {};
-%     574      0         2         {2}     {5}   num2cell(14:29)     {};
-%     575      0         2         {2}     {5}   num2cell(14:29)     {};
-%     576      0         2         {2}     {5}   num2cell(14:29)     {};
-%     577      0         2         {2}     {5}   num2cell(14:29)     {};
-%     578      0         2         {2}     {5}   num2cell(14:29)     {};
-%     579      0         2         {2}     {5}   num2cell(14:29)     {};
-%     580      0         2         {2}     {5}   num2cell(14:29)     {};
-%     581      0         2         {2}     {5}   num2cell(14:29)     {};
-%     582      0         2         {2}     {5}   num2cell(14:29)     {};
-%     583      0         2         {2}     {5}   num2cell(14:29)     {};
-%     584      0         2         {2}     {5}   num2cell(14:29)     {};
-%     585      0         2         {2}     {5}   num2cell(14:29)     {};
-%     586      0         2         {2}     {5}   num2cell(14:29)     {};
-%     587      0         2         {2}     {5}   num2cell(14:29)     {};
-%     588      0         2         {2}     {5}   num2cell(14:29)     {};
-%     589      0         2         {2}     {5}   num2cell(14:29)     {};
-%     590      0         2         {2}     {5}   num2cell(14:29)     {};
-%     591      0         2         {2}     {5}   num2cell(14:29)     {};
-%     592      0         2         {2}     {5}   num2cell(14:29)     {};
-%     593      0         2         {2}     {5}   num2cell(14:29)     {};
-%     594      0         2         {2}     {5}   num2cell(14:29)     {};
-%     595      0         2         {2}     {5}   num2cell(14:29)     {};
-%     596      0         2         {2}     {5}   num2cell(14:29)     {};
-%     597      0         2         {2}     {5}   num2cell(14:29)     {};
-%     598      0         2         {2}     {5}   num2cell(14:29)     {};
-%     599      0         2         {2}     {5}   num2cell(14:29)     {};
-%     600      0         2         {2}     {5}   num2cell(14:29)     {};
-%     601      0         2         {2}     {5}   num2cell(14:29)     {};
-%     602      0         2         {2}     {5}   num2cell(14:29)     {};
-      603      0         2         {2}     {5}   num2cell(14:29)     {};
     % F08 8 cell, No UCI, (prach + pucch + pusch, different RNTIs)
-      604      0         2         {2}     {5}   num2cell(14:29)     {};
-%     605      0         2         {2}     {5}   num2cell(14:29)     {};
-%     606      0         2         {2}     {5}   num2cell(14:29)     {};
-%     607      0         2         {2}     {5}   num2cell(14:29)     {};
-%     608      0         2         {2}     {5}   num2cell(14:29)     {};
-%     609      0         2         {2}     {5}   num2cell(14:29)     {};
-%     610      0         2         {2}     {5}   num2cell(14:29)     {};
-%     611      0         2         {2}     {5}   num2cell(14:29)     {};
-%     612      0         2         {2}     {5}   num2cell(14:29)     {};
-%     613      0         2         {2}     {5}   num2cell(14:29)     {};
-%     614      0         2         {2}     {5}   num2cell(14:29)     {};
-%     615      0         2         {2}     {5}   num2cell(14:29)     {};
-%     616      0         2         {2}     {5}   num2cell(14:29)     {};
-%     617      0         2         {2}     {5}   num2cell(14:29)     {};
-%     618      0         2         {2}     {5}   num2cell(14:29)     {};
-%     619      0         2         {2}     {5}   num2cell(14:29)     {};
-%     620      0         2         {2}     {5}   num2cell(14:29)     {};
-%     621      0         2         {2}     {5}   num2cell(14:29)     {};
-%     622      0         2         {2}     {5}   num2cell(14:29)     {};
-%     623      0         2         {2}     {5}   num2cell(14:29)     {};
-%     624      0         2         {2}     {5}   num2cell(14:29)     {};
-%     625      0         2         {2}     {5}   num2cell(14:29)     {};
-%     626      0         2         {2}     {5}   num2cell(14:29)     {};
-%     627      0         2         {2}     {5}   num2cell(14:29)     {};
-%     628      0         2         {2}     {5}   num2cell(14:29)     {};
-%     629      0         2         {2}     {5}   num2cell(14:29)     {};
-%     630      0         2         {2}     {5}   num2cell(14:29)     {};
-%     631      0         2         {2}     {5}   num2cell(14:29)     {};
-%     632      0         2         {2}     {5}   num2cell(14:29)     {};
-%     633      0         2         {2}     {5}   num2cell(14:29)     {};
-%     634      0         2         {2}     {5}   num2cell(14:29)     {};
-%     635      0         2         {2}     {5}   num2cell(14:29)     {};
+      603      0         2         {2}     {5}   num2cell(14:29)     {};
+      612      0         2         {2}     {5}   num2cell(14:29)     {};
+      613      0         2         {2}     {5}   num2cell(14:29)     {};
+      614      0         2         {2}     {5}   num2cell(14:29)     {};
+      615      0         2         {2}     {5}   num2cell(14:29)     {};
+      616      0         2         {2}     {5}   num2cell(14:29)     {};
+      617      0         2         {2}     {5}   num2cell(14:29)     {};
+      618      0         2         {2}     {5}   num2cell(14:29)     {};
     % F08 8 cell UCI on pusch (prach + pucch + pusch) 50% traffic on PUSCH
       636      0         2         {2}     {5}   num2cell(62:77)     {};
       637      0         2         {2}     {5}   num2cell(62:77)     {};
@@ -782,11 +778,11 @@ CFG = {...
 %     651      0         2         {2}     {5}   num2cell(62:77)     {};
       652      0         2         {2}     {5}   num2cell(62:77)     {};
       653      0         2         {2}     {5}   num2cell(62:77)     {};
-%     654      0         2         {2}     {5}   num2cell(62:77)     {};
-%     655      0         2         {2}     {5}   num2cell(62:77)     {};
-%     656      0         2         {2}     {5}   num2cell(62:77)     {};
-%     657      0         2         {2}     {5}   num2cell(62:77)     {};
-%     658      0         2         {2}     {5}   num2cell(62:77)     {};
+      654      0         2         {2}     {5}   num2cell(62:77)     {};
+      655      0         2         {2}     {5}   num2cell(62:77)     {};
+      656      0         2         {2}     {5}   num2cell(62:77)     {};
+      657      0         2         {2}     {5}   num2cell(62:77)     {};
+      658      0         2         {2}     {5}   num2cell(62:77)     {};
 %     659      0         2         {2}     {5}   num2cell(62:77)     {};
       660      0         2         {2}     {5}   num2cell(62:77)     {};
       661      0         2         {2}     {5}   num2cell(62:77)     {};
@@ -818,7 +814,7 @@ harqProcessIdMap(21645) = 1;
 % Ph4 column B
 harqProcessIdMap(21654) = 1;
 harqProcessIdMap(21655) = 1;
-% Rel-25-3 column B/G/E
+% Rel-25-3 column B/C/G/E
 harqProcessIdMap(21684) = 1;
 harqProcessIdMap(21685) = 1;
 harqProcessIdMap(21704) = 1;
@@ -829,6 +825,8 @@ harqProcessIdMap(21744) = 1;
 harqProcessIdMap(21745) = 1;
 harqProcessIdMap(21764) = 1;
 harqProcessIdMap(21765) = 1;
+harqProcessIdMap(21924) = 1;
+harqProcessIdMap(21925) = 1;
 % Ph4 column B, srsPrgSize = 4 and bfwPrgSize = 16
 harqProcessIdMap(21784) = 1;
 harqProcessIdMap(21785) = 1;
@@ -838,9 +836,57 @@ harqProcessIdMap(21805) = 1;
 % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz light
 harqProcessIdMap(21824) = 1;
 harqProcessIdMap(21825) = 1;
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz heavy
+harqProcessIdMap(21844) = 1;
+harqProcessIdMap(21845) = 1;
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz light
+harqProcessIdMap(21864) = 1;
+harqProcessIdMap(21865) = 1;
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz heavy
+harqProcessIdMap(21884) = 1;
+harqProcessIdMap(21885) = 1;
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz light
+harqProcessIdMap(21904) = 1;
+harqProcessIdMap(21905) = 1;
 
 
 %% additional SRS start RNTI config
+srsRntiStartMap(int32(508)) = 2;
+srsRntiStartMap(int32(509)) = 6;
+srsRntiStartMap(int32(510)) = 10;
+srsRntiStartMap(int32(511)) = 14;
+srsRntiStartMap(int32(512)) = 18;
+srsRntiStartMap(int32(513)) = 22;
+srsRntiStartMap(int32(514)) = 26;
+srsRntiStartMap(int32(515)) = 30;
+srsRntiStartMap(int32(516)) = 34;
+srsRntiStartMap(int32(517)) = 38;
+srsRntiStartMap(int32(518)) = 42;
+srsRntiStartMap(int32(519)) = 46;
+srsRntiStartMap(int32(536)) = 2;
+srsRntiStartMap(int32(537)) = 6;
+srsRntiStartMap(int32(538)) = 10;
+srsRntiStartMap(int32(539)) = 14;
+srsRntiStartMap(int32(540)) = 18;
+srsRntiStartMap(int32(541)) = 22;
+srsRntiStartMap(int32(542)) = 26;
+srsRntiStartMap(int32(543)) = 30;
+srsRntiStartMap(int32(544)) = 34;
+srsRntiStartMap(int32(545)) = 38;
+srsRntiStartMap(int32(546)) = 42;
+srsRntiStartMap(int32(547)) = 46;
+srsRntiStartMap(int32(619)) = 2;
+srsRntiStartMap(int32(620)) = 6;
+srsRntiStartMap(int32(621)) = 10;
+srsRntiStartMap(int32(622)) = 14;
+srsRntiStartMap(int32(623)) = 18;
+srsRntiStartMap(int32(624)) = 22;
+srsRntiStartMap(int32(625)) = 26;
+srsRntiStartMap(int32(626)) = 30;
+srsRntiStartMap(int32(627)) = 34;
+srsRntiStartMap(int32(628)) = 38;
+srsRntiStartMap(int32(629)) = 42;
+srsRntiStartMap(int32(630)) = 46;
 srsRntiStartMap(int32(713)) = 2;
 srsRntiStartMap(int32(733)) = 3;
 
@@ -861,6 +907,22 @@ srsRntiStartMap(int32(21787)) = 79;
 srsRntiStartMap(int32(21782)) = 31;
 srsRntiStartMap(int32(21788)) = 55;
 srsRntiStartMap(int32(21789)) = 79;
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz heavy
+srsRntiStartMap(int32(21843)) = 31;
+srsRntiStartMap(int32(21846)) = 55;
+srsRntiStartMap(int32(21847)) = 79;
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz light
+srsRntiStartMap(int32(21863)) = 31;
+srsRntiStartMap(int32(21866)) = 55;
+srsRntiStartMap(int32(21867)) = 79;
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz heavy
+srsRntiStartMap(int32(21883)) = 31;
+srsRntiStartMap(int32(21886)) = 55;
+srsRntiStartMap(int32(21887)) = 79;
+% 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz light
+srsRntiStartMap(int32(21903)) = 31;
+srsRntiStartMap(int32(21906)) = 55;
+srsRntiStartMap(int32(21907)) = 79;
 
     % TC#   slotIdx   cell     prach     pucch      pusch      srs
     % F08 8 cell, relaxed complexity (prach + pucch + uci@pusch) 
@@ -2036,6 +2098,7 @@ srsRntiStartMap(int32(21789)) = 79;
         row_count = row_count + 1;
         CFG(row_count, 1:7) = { i    3         2       {4,5,6,3}  {7}   num2cell(167:172)   {2}};
         PrachBeamIdxMap(i) = 0; % + prach{idx} 0,1,2,3 
+        CellIdxInPatternMap(i) = 1;
     end
 
     % modified from pattern 59 3060:3079, 6 UEG, 37 PRBs per UEG; 4 SRS UEs, wideband on OFDM symbol 13
@@ -2096,7 +2159,22 @@ srsRntiStartMap(int32(21789)) = 79;
         srsRntiStartMap(int32(i)) = (i-3928) * 8 + 1;
     end
 
-    % [3940:4039] are available for future ULMIX TVs
+    % other two SRS + PUCCH + PUSCH + PRACH TVs with different RNTI, cellId = 42
+    for i = 3940 % U1, same with 3926 except for cell id
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    4         2       {4,5,6,3}  {7}   num2cell(556:561)   {14}};
+        PrachBeamIdxMap(i) = 0; % + prach{idx} 0,1,2,3 
+        CellIdxInPatternMap(i) = 1;
+    end
+
+    for i = 3941 % U2, same with 3927 except for cell id
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    5         2       {4,5,6,3}  {7}   num2cell(556:561)   {15}};
+        PrachBeamIdxMap(i) = 0; % + prach{idx} 0,1,2,3 
+        CellIdxInPatternMap(i) = 1;
+    end
+    
+    % [3942:4039] are available for future ULMIX TVs
 
     %% pattern 62c (S slot): 7 beams, 100 MHz (273 PRBs), 40C, peak cell
                             % TC#   slotIdx   cell     prach     pucch      pusch      srs
@@ -2198,6 +2276,7 @@ srsRntiStartMap(int32(21789)) = 79;
         srsRntiStartMap(int32(i)) = (i-4324) * 8 + 1;
         PrachBeamIdxMap(i) = 0; % + prach{idx} 0,1,2,3
     end
+    CellIdxInPatternMap(4327) = 1;
 
     for i = 4325:3:4334  % U1
         row_count = row_count + 1;
@@ -2205,6 +2284,9 @@ srsRntiStartMap(int32(21789)) = 79;
         srsRntiStartMap(int32(i)) = (i-4324) * 8 + 1;
         PrachBeamIdxMap(i) = 0; % + prach{idx} 0,1,2,3
     end
+    CellIdxInPatternMap(4328) = 1;
+    CellIdxInPatternMap(4331) = 1;
+    srsRntiStartMap(4328) = 150;
 
     for i = 4326:3:4335 % U2
         row_count = row_count + 1;
@@ -2212,9 +2294,61 @@ srsRntiStartMap(int32(21789)) = 79;
         srsRntiStartMap(int32(i)) = (i-4324) * 8 + 1;
         PrachBeamIdxMap(i) = 0; % + prach{idx} 0,1,2,3
     end
+    CellIdxInPatternMap(4329) = 1;
+    srsRntiStartMap(4326) = 200;
+    srsRntiStartMap(4329) = 250;
+    srsRntiStartMap(4335) = 300;
+
+    for i = 4336 % S, same with 4333 except for cell id
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i           33            2      {4,5,6,3}     {}   {}   {5}};
+        srsRntiStartMap(int32(i)) = (i-4324) * 8 + 1;
+        PrachBeamIdxMap(i) = 0; % + prach{idx} 0,1,2,3
+        CellIdxInPatternMap(i) = 1;
+    end
     %%
     
-    % [4336:4470] are available for future ULMIX TVs
+    % [4337:4374] are available for future ULMIX TVs
+
+    %% pattern 101: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH + PRACH, 1 pilot @ 3rd symbol, type-A, cdm group 2, 13 data symbols, 10 fixed LDPC iterations, 24C
+    % PUSCH: cfg 1045 (slot 4), cfg 1046 (slot 5 with PRACH), cfg 1047 (slot 14), cfg 1048 (slot 15)
+    % PRACH: cfg 82
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {4}
+    for i = 4375:4398
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1045}     {}};
+        CellIdxInPatternMap(i) = mod(i-4375, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {5}, prach
+    for i = 4399:4422
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {82}       {}        {1046}     {}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-4375, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {14}
+    for i = 4423:4446
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1047}     {}};
+        CellIdxInPatternMap(i) = mod(i-4375, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {15}
+    for i = 4447:4470
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1048}     {}};
+        CellIdxInPatternMap(i) = mod(i-4375, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % end pattern 101: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH + PRACH, 24C
 
     %% pattern 59c: 7 beams, 100 MHz (273 PRBs), 40C, peak cell, OTA, 4UL streams, 18 PUCCH UCIs
                             % TC#   slotIdx   cell     prach     pucch      pusch      srs
@@ -3785,6 +3919,573 @@ srsRntiStartMap(int32(21789)) = 79;
     % slot {43,44,45,53,54,55,63,64,65,73,74,75} is the same with {* % 40}
     % end pattern 85: 64TR peak, 100 MHz (273 PRBs), OTA, 25-3 column E TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEGs, 8 UEs per slot, 1 layer per UE, 32 DL layer with more PUCCH, SRS in S slot (2 symbols)
     
+    % pattern 87 reuse the ULMIX TVs from pattern 85
+
+    %% pattern 89: 64TR peak, Mixed 100 MHz (273 PRBs) + 90 MHz (244 PRBs) + 60 MHz (160 PRBs), OTA, realistic traffic, 9C, PUSCH CP-OFDM, Mixed PUCCH F1/F3. Based on 90655,90656,90658~90661
+                                    % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    
+    % slot {4}, PUCCH + PUSCH set 0
+    for i = 7890:7898
+        row_count = row_count + 1;
+        cellIdx = mod(i-7890, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0         11        {}         {81,82}   num2cell(847:866)     {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {}         {81,82}   num2cell(888:899)     {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {}         {81,82}   num2cell(888:899)     {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0         14        {}         {81,82}   num2cell(913:932)     {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {}         {81,82}   num2cell(954:965)     {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {}         {81,82}   num2cell(954:965)     {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0         15        {}         {81,82}   num2cell(979:998)     {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {}         {81,82}   num2cell(1020:1031)   {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {}         {81,82}   num2cell(1020:1031)   {}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+    end
+    
+    % slot {5}, PRACH + PUCCH + PUSCH set 1
+    for i = 7899:7907
+        row_count = row_count + 1;
+        cellIdx = mod(i-7890, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0         11        {75}       {78,83}   num2cell(867:886)     {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {75}       {78,83}   num2cell(900:911)     {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {75}       {78,83}   num2cell(900:911)     {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0         14        {80}       {78,83}   num2cell(933:952)     {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {80}       {78,83}   num2cell(966:977)     {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {80}       {78,83}   num2cell(966:977)     {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0         15        {81}       {78,83}   num2cell(999:1018)    {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {81}       {78,83}   num2cell(1032:1043)   {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {81}       {78,83}   num2cell(1032:1043)   {}};
+        end
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = cellIdx;
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+    end
+
+    % slot {13}, SRS only
+    % for i = 7908:7916
+    %     row_count = row_count + 1;
+    %     cellIdx = mod(i-7890, 9);
+    %     switch cellIdx
+    %         case 0  % 100 MHz heavy
+    %             CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+    %         case 1  % 100 MHz light
+    %             CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+    %         case 2  % 100 MHz light
+    %             CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+    %         case 3  % 90 MHz heavy
+    %             CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+    %         case 4  % 90 MHz light
+    %             CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+    %         case 5  % 90 MHz light
+    %             CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+    %         case 6  % 60 MHz heavy
+    %             CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+    %         case 7  % 60 MHz light
+    %             CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+    %         case 8  % 60 MHz light
+    %             CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+    %     end
+    %     CellIdxInPatternMap(i) = cellIdx;
+    %     srsRntiStartMap(int32(i)) = 31;  % slot 13 SRS RNTI start
+    % end
+    
+    % slot {14}, PUCCH + PUSCH set 0
+    for i = 7917:7925
+        row_count = row_count + 1;
+        cellIdx = mod(i-7890, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0         11        {}         {80,79,82}   num2cell(847:866)     {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {}         {80,79,82}   num2cell(888:899)     {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {}         {80,79,82}   num2cell(888:899)     {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0         14        {}         {80,79,82}   num2cell(913:932)     {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {}         {80,79,82}   num2cell(954:965)     {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {}         {80,79,82}   num2cell(954:965)     {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0         15        {}         {80,79,82}   num2cell(979:998)     {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {}         {80,79,82}   num2cell(1020:1031)   {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {}         {80,79,82}   num2cell(1020:1031)   {}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        harqProcessIdMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+    end
+    
+    % slot {15}, PUCCH + PUSCH set 2 (full BW)
+    for i = 7926:7934
+        row_count = row_count + 1;
+        cellIdx = mod(i-7890, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0         11          {}       {77,83}      num2cell([867:885, 887])   {}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11          {}       {77,83}      num2cell([900:910, 912])   {}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11          {}       {77,83}      num2cell([900:910, 912])   {}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0         14          {}       {77,83}      num2cell([933:951, 953])   {}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14          {}       {77,83}      num2cell([966:976, 978])   {}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14          {}       {77,83}      num2cell([966:976, 978])   {}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0         15          {}       {77,83}      num2cell([999:1017, 1019]) {}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15          {}       {77,83}      num2cell([1032:1042, 1044]) {}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15          {}       {77,83}      num2cell([1032:1042, 1044]) {}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        harqProcessIdMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+    end
+    
+    % slot {23}, SRS only
+    for i = 7935:7943
+        row_count = row_count + 1;
+        cellIdx = mod(i-7890, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        srsRntiStartMap(int32(i)) = 55;  % slot 23 SRS RNTI start
+    end
+    
+    % slot {33}, SRS only
+    for i = 7944:7952
+        row_count = row_count + 1;
+        cellIdx = mod(i-7890, 9);
+        switch cellIdx
+            case 0  % 100 MHz heavy
+                CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+            case 1  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+            case 2  % 100 MHz light
+                CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {24}};
+            case 3  % 90 MHz heavy
+                CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+            case 4  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+            case 5  % 90 MHz light
+                CFG(row_count, 1:7) = { i    0         14        {}         {}   {}   {39}};
+            case 6  % 60 MHz heavy
+                CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+            case 7  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+            case 8  % 60 MHz light
+                CFG(row_count, 1:7) = { i    0         15        {}         {}   {}   {40}};
+        end
+        CellIdxInPatternMap(i) = cellIdx;
+        srsRntiStartMap(int32(i)) = 79;  % slot 33 SRS RNTI start
+    end
+    % slot {24} is the same with {4}
+    % slot {25} is the same with {5}
+    % slot {34} is the same with {14}
+    % slot {35} is the same with {15}
+    % slot {43,44,45,53,54,55,63,64,65,73,74,75} is the same with {* % 40}
+    % end pattern 89: 64TR peak, Mixed 100 MHz (273 PRBs) + 90 MHz (244 PRBs) + 60 MHz (160 PRBs), OTA, realistic traffic, 9C, PUSCH CP-OFDM, Mixed PUCCH F1/F3. Based on 90655,90656,90658~90661
+    
+    %% pattern 79a: 64TR peak, 100 MHz (273 PRBs), OTA, 64TR worst case Ph4 column B TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEG, 8 UEs per UEG, 1 layer per UE, 4 SRS symbols in S slot, 2 SRS symbols in each U slot, 2 ports per UE
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {3} is S slot for BFW binding, already defined as TC 21640
+    % slot {4}, U slot
+    for i = 7953:7967
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {81,82}   num2cell(2345:2352)   {31}};
+        CellIdxInPatternMap(i) = mod(i-7953, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+        srsRntiStartMap(i) = 55;
+    end
+    % slot {5}, U slot, prach
+    for i = 7968:7982
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {75}       {78,83}   num2cell(2353:2360)   {31}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-7953, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+        srsRntiStartMap(i) = 79;
+    end
+    % slot {13}, S slot, SRS only
+    for i = 7983:7997
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {36}};
+        CellIdxInPatternMap(i) = mod(i-7953, 15);
+        srsRntiStartMap(i) = 103;
+    end
+    % slot {14}, U slot
+    for i = 7998:8012
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {80,79,82}   num2cell(2345:2352)   {31}};
+        CellIdxInPatternMap(i) = mod(i-7953, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        harqProcessIdMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+        srsRntiStartMap(i) = 151;
+    end
+    % slot {15}, U slot
+    for i = 8013:8027
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11          {}       {77,83}      num2cell(2361:2368)   {31}};
+        CellIdxInPatternMap(i) = mod(i-7953, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        harqProcessIdMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+        srsRntiStartMap(i) = 175;
+    end
+    % slot {23}, S slot, SRS only
+    for i = 8028:8042
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {36}};
+        CellIdxInPatternMap(i) = mod(i-7953, 15);
+        srsRntiStartMap(i) = 199;
+    end
+    % slot {33}, S slot, SRS only
+    for i = 8043:8057
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {36}};
+        CellIdxInPatternMap(i) = mod(i-7953, 15);
+        srsRntiStartMap(i) = 247;
+    end
+    % slot {24} is the same with {4}
+    % slot {25} is the same with {5}
+    % slot {34} is the same with {14}
+    % slot {35} is the same with {15}
+    % slot {43,44,45,53,54,55,63,64,65,73,74,75} is the same with {* % 40}
+    % end pattern 79a: 64TR peak, 100 MHz (273 PRBs), OTA, 64TR worst case Ph4 column B TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEG, 8 UEs per UEG, 1 layer per UE, 4 SRS symbols in S slot, 2 SRS symbols in each U slot, 2 ports per UE
+
+    %% pattern 79b: 64TR peak, 100 MHz (273 PRBs), OTA, 64TR worst case Ph4 column B TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEG, 8 UEs per UEG, 1 layer per UE, 4 SRS symbols in S slot, 2 SRS symbols in each U slot, 4 ports per UE
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {3} is S slot for BFW binding, already defined as TC 21641
+    % slot {4}, U slot
+    for i = 8058:8072
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {81,82}   num2cell(2345:2352)   {42}};
+        CellIdxInPatternMap(i) = mod(i-8058, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+        srsRntiStartMap(i) = 31;
+    end
+    % slot {5}, U slot, prach
+    for i = 8073:8087
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {75}       {78,83}   num2cell(2353:2360)   {42}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-8058, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+        srsRntiStartMap(i) = 43;
+    end
+    % slot {13}, S slot, SRS only
+    for i = 8088:8102
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {41}};
+        CellIdxInPatternMap(i) = mod(i-8058, 15);
+        srsRntiStartMap(i) = 55;
+    end
+    % slot {14}, U slot
+    for i = 8103:8117
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {80,79,82}   num2cell(2345:2352)   {42}};
+        CellIdxInPatternMap(i) = mod(i-8058, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        harqProcessIdMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+        srsRntiStartMap(i) = 79;
+    end
+    % slot {15}, U slot
+    for i = 8118:8132
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11          {}       {77,83}      num2cell(2361:2368)   {42}};
+        CellIdxInPatternMap(i) = mod(i-8058, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        harqProcessIdMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_18_7";
+        srsRntiStartMap(i) = 91;
+    end
+    % slot {23}, S slot, SRS only
+    for i = 8133:8147
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {41}};
+        CellIdxInPatternMap(i) = mod(i-8058, 15);
+        srsRntiStartMap(i) = 103;
+    end
+    % slot {33}, S slot, SRS only
+    for i = 8148:8162
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {41}};
+        CellIdxInPatternMap(i) = mod(i-8058, 15);
+        srsRntiStartMap(i) = 127;
+    end
+    % slot {24} is the same with {4}
+    % slot {25} is the same with {5}
+    % slot {34} is the same with {14}
+    % slot {35} is the same with {15}
+    % slot {43,44,45,53,54,55,63,64,65,73,74,75} is the same with {* % 40}
+    % end pattern 79b: 64TR peak, 100 MHz (273 PRBs), OTA, 64TR worst case Ph4 column B TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEG, 8 UEs per UEG, 1 layer per UE, 4 SRS symbols in S slot, 2 SRS symbols in each U slot, 4 ports per UE
+
+    %% pattern 91: 64TR peak, 100 MHz (273 PRBs), OTA, 25-3 column D TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEGs, 8 UEs per slot, 1 layer per UE, 24 DL layer with more PUCCH, SRS in S slot (2 symbols)
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {4}
+    for i = 8163:8177
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {99,100}   num2cell(2313:2320)   {}};
+        CellIdxInPatternMap(i) = mod(i-8163, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_13_10";
+    end
+    % slot {5}, prach
+    for i = 8178:8192
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {75}       {101,102}   num2cell(2321:2328)   {}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-8163, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_13_10";
+    end
+    % slot {13}
+    % for i = 8193:8207
+    %     row_count = row_count + 1;
+    %     CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {26}};
+    %     CellIdxInPatternMap(i) = mod(i-8163, 15);
+    % end
+    % slot {14}
+    for i = 8208:8222
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {103,104,105}   num2cell(2329:2336)   {}};
+        CellIdxInPatternMap(i) = mod(i-8163, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        harqProcessIdMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_13_10";
+    end
+    % slot {15}
+    for i = 8223:8237
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11          {}       {106,102}      num2cell(2337:2344)   {}};
+        CellIdxInPatternMap(i) = mod(i-8163, 15);
+        puschDynamicBfMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        harqProcessIdMap(i) = 1;
+        UciOnPuschMap(i) = "64TR_4_13_10";
+    end
+    % slot {23}
+    for i = 8238:8252
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {31}};
+        CellIdxInPatternMap(i) = mod(i-8163, 15);
+    end
+    % slot {24} is the same with {4}
+    % slot {25} is the same with {5}
+    % slot {33}
+    for i = 8253:8267
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         11        {}         {}   {}   {32}};
+        CellIdxInPatternMap(i) = mod(i-8163, 15);
+    end
+    % slot {34} is the same with {14}
+    % slot {35} is the same with {15}
+    % slot {43,44,45,53,54,55,63,64,65,73,74,75} is the same with {* % 40}
+    % end pattern 91: 64TR peak, 100 MHz (273 PRBs), OTA, 25-3 column D TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEGs, 8 UEs per slot, 1 layer per UE, 24 DL layer with more PUCCH, SRS in S slot (2 symbols)
+
+    %% pattern 101a: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH + PRACH + UCI-on-PUSCH, 1 pilot @ 3rd symbol, type-A, cdm group 2, 13 data symbols, 10 fixed LDPC iterations, 24C
+    % PUSCH: cfg 1045 (slot 4), cfg 1046 (slot 5 with PRACH), cfg 1047 (slot 14), cfg 1048 (slot 15)
+    % PRACH: cfg 82
+    % UCI-on-PUSCH: "7beams_4_37_5"
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {4}
+    for i = 8268:8291
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1045}     {}};
+        CellIdxInPatternMap(i) = mod(i-8268, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+        UciOnPuschMap(i) = "7beams_4_37_5";
+    end
+    % slot {5}, prach
+    for i = 8292:8315
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {82}       {}        {1046}     {}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-8268, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+        UciOnPuschMap(i) = "7beams_4_37_5";
+    end
+    % slot {14}
+    for i = 8316:8339
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1047}     {}};
+        CellIdxInPatternMap(i) = mod(i-8268, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+        UciOnPuschMap(i) = "7beams_4_37_5";
+    end
+    % slot {15}
+    for i = 8340:8363
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1048}     {}};
+        CellIdxInPatternMap(i) = mod(i-8268, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+        UciOnPuschMap(i) = "7beams_4_37_5";
+    end
+    % end pattern 101a: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH + PRACH + UCI-on-PUSCH, 24C
+
+
+    %% pattern 102: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH (reduced PRB) + PRACH, 1 pilot @ 3rd symbol, type-A, cdm group 2, 13 data symbols, 10 fixed LDPC iterations, 24C
+    % PUSCH: cfg 1049 (slot 4), cfg 1050 (slot 5 with PRACH), cfg 1051 (slot 14), cfg 1052 (slot 15)
+    % PRACH: cfg 83
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {4}
+    for i = 8364:8387
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1049}     {}};
+        CellIdxInPatternMap(i) = mod(i-8364, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {5}, prach
+    for i = 8388:8411
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {83}       {}        {1050}     {}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-8364, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {14}
+    for i = 8412:8435
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1051}     {}};
+        CellIdxInPatternMap(i) = mod(i-8364, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {15}
+    for i = 8436:8459
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1052}     {}};
+        CellIdxInPatternMap(i) = mod(i-8364, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % end pattern 102: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH (reduced PRB) + PRACH, 24C
+    
+    %% pattern 102a: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH (reduced PRB) + PRACH + UCI-on-PUSCH, 1 pilot @ 3rd symbol, type-A, cdm group 2, 13 data symbols, 10 fixed LDPC iterations, 24C
+    % PUSCH: cfg 1049 (slot 4), cfg 1050 (slot 5 with PRACH), cfg 1051 (slot 14), cfg 1052 (slot 15)
+    % PRACH: cfg 83
+    % UCI-on-PUSCH: "7beams_4_37_5"
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {4}
+    for i = 8460:8483
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1049}     {}};
+        CellIdxInPatternMap(i) = mod(i-8460, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+        UciOnPuschMap(i) = "7beams_4_37_5";
+    end
+    % slot {5}, prach
+    for i = 8484:8507
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {83}       {}        {1050}     {}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-8460, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+        UciOnPuschMap(i) = "7beams_4_37_5";
+    end
+    % slot {14}
+    for i = 8508:8531
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1051}     {}};
+        CellIdxInPatternMap(i) = mod(i-8460, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+        UciOnPuschMap(i) = "7beams_4_37_5";
+    end
+    % slot {15}
+    for i = 8532:8555
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {}        {1052}     {}};
+        CellIdxInPatternMap(i) = mod(i-8460, 24);
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+        UciOnPuschMap(i) = "7beams_4_37_5";
+    end
+    % end pattern 102a: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH (reduced PRB) + PRACH + UCI-on-PUSCH, 24C
+                            
     % NOTE: use getLargestTvNum(CFG, threshold) to see the current largest ULMIX TV numbers for <threshold and >= threshold
     %       Search for "available for future ULMIX TVs" to find the avaiable ULMIX TV numbers smaller than that
     largestTvNum = getLargestTvNum(CFG, 20000);
@@ -3813,9 +4514,13 @@ CFG_Cell = {...
     % 64TR
     1      273            41       16       4;    % 11    
     % 64TR perf % note: now it means 16 UL streams for PUSCH. To update after PUSCH/SRS Rx buffer separated
-    1      273            41        16      4;    % 12
+    1      273            41       16       4;    % 12
     % 64TR 40 MHz
-    1      106            41        16      4;    % 13
+    1      106            41       16       4;    % 13
+    % 64TR 90 MHz
+    1      244            41       16       4;    % 14
+    % 64TR 60 MHz
+    1      160            41       16       4;    % 15
     };
 
 CFG_PRACH = {...
@@ -3928,6 +4633,14 @@ CFG_PRACH = {...
     77,        1,  1, 158,     0,        0,   14,     1,    70;
     78,        1,  1, 158,     0,        0,   14,     2,    82;
     79,        1,  1, 158,     0,        0,   14,     3,    94;
+    % 64TR realistic traffic with Center/Middle/Edge, 90 MHz heavy / light
+    80,        1,  1, 158,     0,        0,   14,     0,   232;
+    % 64TR realistic traffic with Center/Middle/Edge, 60 MHz heavy / light
+    81,        1,  1, 158,     0,        0,   14,     0,   148;
+    % 4TR one PRACH occasion at PRB 261
+    82,        1,  1, 158,     0,        0,    5,     0,   261;
+    % 4TR one PRACH occasion at PRB 42
+    83,        1,  1, 158,     0,        0,    5,     0,   42;
     };
 
 CFG_PUCCH = {...
@@ -4154,6 +4867,32 @@ CFG_PUCCH = {...
     0   1  0  12 ... % f1 Nf t0 Nt
    floor(mod(0:127,12)/2)*2 ...%cs0
    mod(0:127,2) ...%tOCCidx
+    0      0      0     0    0   1;    
+% 64TR TC PF3 4bitx24UEs (24 PRBs, 12 OFDM symbols)
+   99   24      4   3  [0:23] 0 [ones(1,24)] 0  12   0     0       0      0      0     0    0   1;
+% 64TR TC PF1 1bitx72UEs (4 PRBs, PRB 24~27)
+  100   72      0   1    repelem(24:27, 18)     0   1  repmat(0:4:8,6,4)    4  repmat([0:4:8, 1:4:9, 2:4:10, 3:4:11],1,6)     repmat(0:1,3,12)      0      0      1     1    0   1;  % postive SR, 6 UE multiplexing (by 3 cyclic shift & 2 tOCC) per 4 OFDM symbols, 18 UEs per RB, total 72 UEs on 4 RBs
+% 64TR TC PF1 2bitx48UEs (8 PRBs, 12 OFDM symbols)
+  101   48      2    1 ...
+   floor([0:47]/6) ... % f0
+    0   1  0  12 ... % f1 Nf t0 Nt
+   floor(mod(0:47,6)/2)*4 ...%cs0
+   mod(0:47,2) ...%tOCCidx
+    0      0      0     0    0   1;   
+% 64TR TC PF1 1bitx72UEs (4 PRBs, PRB 8~11)
+  102   72      0   1    repelem(8:11, 18)     0   1  repmat(0:4:8,6,4)    4  repmat([0:4:8, 1:4:9, 2:4:10, 3:4:11],1,6)     repmat(0:1,3,12)      0      0      1     1    0   1;  % postive SR, 6 UE multiplexing (by 3 cyclic shift & 2 tOCC) per 4 OFDM symbols, 18 UEs per RB, total 72 UEs on 4 RBs 
+% 64TR TC PF3 3bitx32UEs (12 OFDM symbols)
+  103   32      3   3    [0:31]     0   1  0  12   0     0       0      0      0     0    0   1;
+% 64TR TC PF1 1bitx1UE (12 OFDM symbols)
+  104    1      1   1     32        0   1  0  12   0     0       0      0      0     0    0   1;
+% 64TR TC PF1 1bitx72UEs (4 PRBs, PRB 33~36)
+  105   72      0   1    repelem(33:36, 18)     0   1  repmat(0:4:8,6,4)    4  repmat([0:4:8, 1:4:9, 2:4:10, 3:4:11],1,6)     repmat(0:1,3,12)      0      0      1     1    0   1;  % postive SR, 6 UE multiplexing (by 3 cyclic shift & 2 tOCC) per 4 OFDM symbols, 18 UEs per RB, total 72 UEs on 4 RBs
+   % 64TR TC PF1 1bitx96UEs (8 PRBs, 12 OFDM symbols)
+  106   96     1    1 ...
+   floor([0:95]/12) ... % f0
+    0   1  0  12 ... % f1 Nf t0 Nt
+   floor(mod(0:95,12)/2)*2 ...%cs0
+   mod(0:95,2) ...%tOCCidx
     0      0      0     0    0   1;    
    };
 
@@ -5221,7 +5960,7 @@ CFG_PUSCH = {...
     883,  1,         4,  1, 176,    24, 0,       14,     0,    0,    273,   43,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
     884,  1,         4,  1, 200,    24, 0,       14,     0,    0,    273,   44,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
     885,  1,         4,  1, 224,    24, 0,       14,     0,    0,    273,   45,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
-    886,  1,         4,  1, 248,    14, 0,       14,     0,    0,    273,   46,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    886,  1,         4,  1, 248,    13, 0,       14,     0,    0,    273,   46,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
     % PUSCH set 2: PRB 10~272, OFDM symbol 0~13, 100 MHz heavy
     % reuse cfg 867~885 from PUSCH set 1: PRB 10~261, OFDM symbol 0~13, 100 MHz heavy
     887,  1,         4,  1, 248,    25, 0,       14,     0,    0,    273,   46,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
@@ -5251,10 +5990,169 @@ CFG_PUSCH = {...
     908,  1,         4,  1, 176,    24, 0,       14,     0,    0,    273,   27,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
     909,  1,         4,  1, 200,    24, 0,       14,     0,    0,    273,   28,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
     910,  1,         4,  1, 224,    24, 0,       14,     0,    0,    273,   29,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
-    911,  1,         4,  1, 248,    14, 0,       14,     0,    0,    273,   30,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    911,  1,         4,  1, 248,    13, 0,       14,     0,    0,    273,   30,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
     % PUSCH set 2: PRB 10~272, OFDM symbol 0~13, 100 MHz light
     % reuse cfg 900~910 from PUSCH set 1: PRB 10~261, OFDM symbol 0~13, 100 MHz light
     912,  1,         4,  1, 248,    25, 0,       14,     0,    0,    273,   30,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 0: PRB 26~271, OFDM symbol 0~13, 90 MHz heavy
+    913,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,    7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+    914,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,    8,    0,     41,     2,      2,     1,     41,      2,   1,   0;  % Center UEG0 port1
+    915,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,    9,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+    916,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,   10,    0,     41,     2,      2,     1,     41,      2,   3,   0;  % Center UEG0 port3
+    917,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,   11,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+    918,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,   12,    0,     41,     2,      2,     1,     41,      2,   5,   0;  % Center UEG0 port5
+    919,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,   13,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+    920,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,   14,    0,     41,     2,      2,     1,     41,      2,   7,   0;  % Center UEG0 port7
+    921,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   15,    0,     41,     2,      1,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+    922,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   16,    0,     41,     2,      1,     1,     41,      2,   1,   1;  % Middle UEG1 port1
+    923,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   17,    0,     41,     2,      1,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+    924,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   18,    0,     41,     2,      1,     1,     41,      2,   3,   1;  % Middle UEG1 port3
+    925,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   19,    0,     41,     2,      1,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+    926,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   20,    0,     41,     2,      1,     1,     41,      2,   1,   2;  % Middle UEG2 port1
+    927,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   21,    0,     41,     2,      1,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+    928,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   22,    0,     41,     2,      1,     1,     41,      2,   3,   2;  % Middle UEG2 port3
+    929,  1,         4,  1, 156,    22, 0,       14,     0,    0,    244,   23,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+    930,  1,         4,  1, 178,    22, 0,       14,     0,    0,    244,   24,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+    931,  1,         4,  1, 200,    22, 0,       14,     0,    0,    244,   25,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+    932,  1,         4,  1, 222,    22, 0,       14,     0,    0,    244,   26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 1: PRB 10~231, OFDM symbol 0~13
+    933,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   27,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+    934,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   28,    0,     41,     2,      2,     1,     41,      2,   1,   0;  % Center UEG0 port1
+    935,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   29,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+    936,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   30,    0,     41,     2,      2,     1,     41,      2,   3,   0;  % Center UEG0 port3
+    937,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   31,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+    938,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   32,    0,     41,     2,      2,     1,     41,      2,   5,   0;  % Center UEG0 port5
+    939,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   33,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+    940,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   34,    0,     41,     2,      2,     1,     41,      2,   7,   0;  % Center UEG0 port7
+    941,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   35,    0,     41,     2,      1,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+    942,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   36,    0,     41,     2,      1,     1,     41,      2,   1,   1;  % Middle UEG1 port1
+    943,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   37,    0,     41,     2,      1,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+    944,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   38,    0,     41,     2,      1,     1,     41,      2,   3,   1;  % Middle UEG1 port3
+    945,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   39,    0,     41,     2,      1,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+    946,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   40,    0,     41,     2,      1,     1,     41,      2,   1,   2;  % Middle UEG2 port1
+    947,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   41,    0,     41,     2,      1,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+    948,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   42,    0,     41,     2,      1,     1,     41,      2,   3,   2;  % Middle UEG2 port3
+    949,  1,         4,  1, 156,    22, 0,       14,     0,    0,    244,   43,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+    950,  1,         4,  1, 178,    22, 0,       14,     0,    0,    244,   44,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+    951,  1,         4,  1, 200,    22, 0,       14,     0,    0,    244,   45,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+    952,  1,         4,  1, 222,    10, 0,       14,     0,    0,    244,   46,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 2: PRB 10~243, OFDM symbol 0~13
+    % reuse cfg 933~951 from PUSCH set 1: PRB 10~231, OFDM symbol 0~13
+    953,  1,         4,  1, 222,    22, 0,       14,     0,    0,    244,   46,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 0: PRB 26~243, OFDM symbol 0~13
+    954,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,    7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+    955,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,    8,    0,     41,     2,      2,     1,     41,      2,   1,   0;  % Center UEG0 port1
+    956,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,    9,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+    957,  1,        19,  1,  26,    62, 0,       14,     0,    0,    244,   10,    0,     41,     2,      2,     1,     41,      2,   3,   0;  % Center UEG0 port3
+    958,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   11,    0,     41,     2,      1,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+    959,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   12,    0,     41,     2,      1,     1,     41,      2,   1,   1;  % Middle UEG1 port1
+    960,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   13,    0,     41,     2,      1,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+    961,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   14,    0,     41,     2,      1,     1,     41,      2,   1,   2;  % Middle UEG2 port1
+    962,  1,         4,  1, 156,    22, 0,       14,     0,    0,    244,   15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+    963,  1,         4,  1, 178,    22, 0,       14,     0,    0,    244,   16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+    964,  1,         4,  1, 200,    22, 0,       14,     0,    0,    244,   17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+    965,  1,         4,  1, 222,    22, 0,       14,     0,    0,    244,   18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 1: PRB 10~231, OFDM symbol 0~13
+    966,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   19,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+    967,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   20,    0,     41,     2,      2,     1,     41,      2,   1,   0;  % Center UEG0 port1
+    968,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   21,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+    969,  1,        19,  1,  10,    78, 0,       14,     0,    0,    244,   22,    0,     41,     2,      2,     1,     41,      2,   3,   0;  % Center UEG0 port3
+    970,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   23,    0,     41,     2,      1,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+    971,  1,        10,  1,  88,    34, 0,       14,     0,    0,    244,   24,    0,     41,     2,      1,     1,     41,      2,   1,   1;  % Middle UEG1 port1
+    972,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   25,    0,     41,     2,      1,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+    973,  1,        10,  1, 122,    34, 0,       14,     0,    0,    244,   26,    0,     41,     2,      1,     1,     41,      2,   1,   2;  % Middle UEG2 port1
+    974,  1,         4,  1, 156,    22, 0,       14,     0,    0,    244,   27,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+    975,  1,         4,  1, 178,    22, 0,       14,     0,    0,    244,   28,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+    976,  1,         4,  1, 200,    22, 0,       14,     0,    0,    244,   29,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+    977,  1,         4,  1, 222,    10, 0,       14,     0,    0,    244,   30,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 2: PRB 10~243, OFDM symbol 0~13
+    % reuse cfg 966~976 from PUSCH set 1: PRB 10~231, OFDM symbol 0~13
+    978,  1,         4,  1, 222,    22, 0,       14,     0,    0,    244,   30,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 0: PRB 26~159, OFDM symbol 0~13
+    979,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,    7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+    980,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,    8,    0,     41,     2,      2,     1,     41,      2,   1,   0;  % Center UEG0 port1
+    981,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,    9,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+    982,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,   10,    0,     41,     2,      2,     1,     41,      2,   3,   0;  % Center UEG0 port3
+    983,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,   11,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+    984,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,   12,    0,     41,     2,      2,     1,     41,      2,   5,   0;  % Center UEG0 port5
+    985,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,   13,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+    986,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,   14,    0,     41,     2,      2,     1,     41,      2,   7,   0;  % Center UEG0 port7
+    987,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   15,    0,     41,     2,      1,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+    988,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   16,    0,     41,     2,      1,     1,     41,      2,   1,   1;  % Middle UEG1 port1
+    989,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   17,    0,     41,     2,      1,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+    990,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   18,    0,     41,     2,      1,     1,     41,      2,   3,   1;  % Middle UEG1 port3
+    991,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   19,    0,     41,     2,      1,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+    992,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   20,    0,     41,     2,      1,     1,     41,      2,   1,   2;  % Middle UEG2 port1
+    993,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   21,    0,     41,     2,      1,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+    994,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   22,    0,     41,     2,      1,     1,     41,      2,   3,   2;  % Middle UEG2 port3
+    995,  1,         4,  1, 104,    14, 0,       14,     0,    0,    160,   23,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+    996,  1,         4,  1, 118,    14, 0,       14,     0,    0,    160,   24,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+    997,  1,         4,  1, 132,    14, 0,       14,     0,    0,    160,   25,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+    998,  1,         4,  1, 146,    14, 0,       14,     0,    0,    160,   26,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 1: PRB 10~147, OFDM symbol 0~13
+    999,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   27,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1000,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   28,    0,     41,     2,      2,     1,     41,      2,   1,   0;  % Center UEG0 port1
+   1001,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   29,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1002,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   30,    0,     41,     2,      2,     1,     41,      2,   3,   0;  % Center UEG0 port3
+   1003,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   31,    0,     41,     2,      2,     1,     41,      2,   4,   0;  % Center UEG0 port4
+   1004,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   32,    0,     41,     2,      2,     1,     41,      2,   5,   0;  % Center UEG0 port5
+   1005,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   33,    0,     41,     2,      2,     1,     41,      2,   6,   0;  % Center UEG0 port6
+   1006,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   34,    0,     41,     2,      2,     1,     41,      2,   7,   0;  % Center UEG0 port7
+   1007,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   35,    0,     41,     2,      1,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1008,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   36,    0,     41,     2,      1,     1,     41,      2,   1,   1;  % Middle UEG1 port1
+   1009,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   37,    0,     41,     2,      1,     1,     41,      2,   2,   1;  % Middle UEG1 port2
+   1010,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   38,    0,     41,     2,      1,     1,     41,      2,   3,   1;  % Middle UEG1 port3
+   1011,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   39,    0,     41,     2,      1,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1012,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   40,    0,     41,     2,      1,     1,     41,      2,   1,   2;  % Middle UEG2 port1
+   1013,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   41,    0,     41,     2,      1,     1,     41,      2,   2,   2;  % Middle UEG2 port2
+   1014,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   42,    0,     41,     2,      1,     1,     41,      2,   3,   2;  % Middle UEG2 port3
+   1015,  1,         4,  1, 104,    14, 0,       14,     0,    0,    160,   43,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1016,  1,         4,  1, 118,    14, 0,       14,     0,    0,    160,   44,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1017,  1,         4,  1, 132,     8, 0,       14,     0,    0,    160,   45,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1018,  1,         4,  1, 140,     8, 0,       14,     0,    0,    160,   46,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 2: PRB 10~159, OFDM symbol 0~13
+    % reuse cfg 999~1017 from PUSCH set 1: PRB 10~147, OFDM symbol 0~13
+   1019,  1,         4,  1, 140,    20, 0,       14,     0,    0,    160,   46,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 0: PRB 26~159, OFDM symbol 0~13
+   1020,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,    7,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1021,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,    8,    0,     41,     2,      2,     1,     41,      2,   1,   0;  % Center UEG0 port1
+   1022,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,    9,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1023,  1,        19,  1,  26,    30, 0,       14,     0,    0,    160,   10,    0,     41,     2,      2,     1,     41,      2,   3,   0;  % Center UEG0 port3
+   1024,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   11,    0,     41,     2,      1,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1025,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   12,    0,     41,     2,      1,     1,     41,      2,   1,   1;  % Middle UEG1 port1
+   1026,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   13,    0,     41,     2,      1,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1027,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   14,    0,     41,     2,      1,     1,     41,      2,   1,   2;  % Middle UEG2 port1
+   1028,  1,         4,  1, 104,    14, 0,       14,     0,    0,    160,   15,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1029,  1,         4,  1, 118,    14, 0,       14,     0,    0,    160,   16,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1030,  1,         4,  1, 132,    14, 0,       14,     0,    0,    160,   17,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1031,  1,         4,  1, 146,    14, 0,       14,     0,    0,    160,   18,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 1: PRB 10~147, OFDM symbol 0~13
+   1032,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   19,    0,     41,     2,      2,     1,     41,      2,   0,   0;  % Center UEG0 port0
+   1033,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   20,    0,     41,     2,      2,     1,     41,      2,   1,   0;  % Center UEG0 port1
+   1034,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   21,    0,     41,     2,      2,     1,     41,      2,   2,   0;  % Center UEG0 port2
+   1035,  1,        19,  1,  10,    46, 0,       14,     0,    0,    160,   22,    0,     41,     2,      2,     1,     41,      2,   3,   0;  % Center UEG0 port3
+   1036,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   23,    0,     41,     2,      1,     1,     41,      2,   0,   1;  % Middle UEG1 port0
+   1037,  1,        10,  1,  56,    24, 0,       14,     0,    0,    160,   24,    0,     41,     2,      1,     1,     41,      2,   1,   1;  % Middle UEG1 port1
+   1038,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   25,    0,     41,     2,      1,     1,     41,      2,   0,   2;  % Middle UEG2 port0
+   1039,  1,        10,  1,  80,    24, 0,       14,     0,    0,    160,   26,    0,     41,     2,      1,     1,     41,      2,   1,   2;  % Middle UEG2 port1
+   1040,  1,         4,  1, 104,    14, 0,       14,     0,    0,    160,   27,    0,     41,     2,      1,     1,     41,      2,   0,   3;  % Edge UEG3 port0
+   1041,  1,         4,  1, 118,    14, 0,       14,     0,    0,    160,   28,    0,     41,     2,      1,     1,     41,      2,   0,   4;  % Edge UEG4 port0
+   1042,  1,         4,  1, 132,     8, 0,       14,     0,    0,    160,   29,    0,     41,     2,      1,     1,     41,      2,   0,   5;  % Edge UEG5 port0
+   1043,  1,         4,  1, 140,     8, 0,       14,     0,    0,    160,   30,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+    % PUSCH set 2: PRB 10~159, OFDM symbol 0~13
+    % reuse cfg 1032~1042 from PUSCH set 1: PRB 10~147, OFDM symbol 0~13
+   1044,  1,         4,  1, 140,    20, 0,       14,     0,    0,    160,   30,    0,     41,     2,      1,     1,     41,      2,   0,   6;  % Edge UEG6 port0
+% TC#   mcsTable  mcs  nl  rb0     Nrb  sym0   Nsym  SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+   % 4TR PUSCH set 0: PRB 0~272 and 0~260, OFDM symbol 0~13
+   1045,  1,        27,  2,   0,   273, 0,       14,     0,    0,    273,    7,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 4
+   1046,  1,        27,  2,   0,   261, 0,       14,     0,    0,    273,    8,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 5
+   1047,  1,        27,  2,   0,   273, 0,       14,     0,    0,    273,    9,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 14
+   1048,  1,        27,  2,   0,   273, 0,       14,     0,    0,    273,   10,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 15
+   % 4TR PUSCH set 0: PRB 0~53 and 0~41, OFDM symbol 0~13
+   1049,  1,        27,  2,   0,    54, 0,       14,     0,    0,    273,    7,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 4
+   1050,  1,        27,  2,   0,    42, 0,       14,     0,    0,    273,    8,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 5
+   1051,  1,        27,  2,   0,    54, 0,       14,     0,    0,    273,    9,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 14
+   1052,  1,        27,  2,   0,    54, 0,       14,     0,    0,    273,   10,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 15
    % 610,  1,         2,  2, 100,   40,   0,   14,     0,    0,    273,     1,    0,     41,     2,      2,    1,     41,      2,   0,    0; 
    % 611,  1,         2,  2, 100,   40,   0,   14,     0,    0,    273,     2,    0,     41,     2,      2,    1,     41,      2,   2,    0; 
    % 612,  1,         2,  2, 100,   40,   0,   14,     0,    0,    273,     3,    0,     41,     2,      2,    1,     41,      2,   4,    0; 
@@ -5535,6 +6433,7 @@ cfgUeg.nUePerUeg = 8;
 cfgUeg.startPrb = 36;
 cfgUeg.endPrb = 272;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
 
@@ -5547,6 +6446,7 @@ cfgUeg.nUePerUeg = 8;
 cfgUeg.startPrb = 15;
 cfgUeg.endPrb = 260;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
 
@@ -5558,6 +6458,7 @@ cfgUeg.nUePerUeg = 8;
 cfgUeg.startPrb = 47;
 cfgUeg.endPrb = 272;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
 
@@ -5570,6 +6471,7 @@ cfgUeg.nUePerUeg = 8;
 cfgUeg.startPrb = 15;
 cfgUeg.endPrb = 272;
 cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
 CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
 
@@ -5581,7 +6483,7 @@ cfgUeg.nUePerUeg = 8;
 cfgUeg.startPrb = 26;
 cfgUeg.endPrb = 272;
 cfgUeg.nl = 1;
-cfgUeg.prgSize = 4;
+cfgUeg.prgSize = 16;
 CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
 
@@ -5594,7 +6496,7 @@ cfgUeg.nUePerUeg = 8;
 cfgUeg.startPrb = 10;
 cfgUeg.endPrb = 260;
 cfgUeg.nl = 1;
-cfgUeg.prgSize = 4;
+cfgUeg.prgSize = 16;
 CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
 
@@ -5607,7 +6509,95 @@ cfgUeg.nUePerUeg = 8;
 cfgUeg.startPrb = 10;
 cfgUeg.endPrb = 272;
 cfgUeg.nl = 1;
-cfgUeg.prgSize = 4;
+cfgUeg.prgSize = 16;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 8 UEs per UEG, 1 layer per UE, PUSCH prb 36~272, 13 OFDM symbols, CFG 2313~2320
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 8;
+cfgUeg.startPrb = 28;
+cfgUeg.endPrb = 272;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 8 UEs per UEG, 1 layer per UE, PUSCH prb 15~260, 13 OFDM symbols, CFG 2321~2328
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.startRnti = 15;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 8;
+cfgUeg.startPrb = 12;
+cfgUeg.endPrb = 260;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 8 UEs per UEG, 1 layer per UE, PUSCH prb 47~272, 13 OFDM symbols, CFG 2329~2336
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 8;
+cfgUeg.startPrb = 37;
+cfgUeg.endPrb = 272;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 8 UEs per UEG, 1 layer per UE, PUSCH prb 15~272, 13 OFDM symbols, CFG 2337~2344
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.startRnti = 15;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 8;
+cfgUeg.startPrb = 12;
+cfgUeg.endPrb = 272;
+cfgUeg.nl = 1;
+cfgUeg.prgSize = 16;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 8 UEs per UEG, 1 layer per UE, PUSCH prb 26~272, 12 OFDM symbols (for pattern 79a/79b slot 4/14), CFG 2345~2352
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 8;
+cfgUeg.Nsym = 12;
+cfgUeg.startPrb = 26;
+cfgUeg.endPrb = 272;
+cfgUeg.nl = 1;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 8 UEs per UEG, 1 layer per UE, PUSCH prb 10~260, 12 OFDM symbols (for pattern 79a/79b slot 5), CFG 2353~2360
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.startRnti = 15;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 8;
+cfgUeg.Nsym = 12;
+cfgUeg.startPrb = 10;
+cfgUeg.endPrb = 260;
+cfgUeg.nl = 1;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 8 UEs per UEG, 1 layer per UE, PUSCH prb 10~272, 12 OFDM symbols (for pattern 79a/79b slot 15), CFG 2361~2368
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.startRnti = 15;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 8;
+cfgUeg.Nsym = 12;
+cfgUeg.startPrb = 10;
+cfgUeg.endPrb = 272;
+cfgUeg.nl = 1;
 CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
 
@@ -5671,6 +6661,10 @@ CFG_SRS = {
    36    7     2    1     1    10    63     0    0     4        0      0    0    0      0    0     0      1      0     0      48; % 48 users wideband. Time and comb multiplexed. UE 1~12 on OFDM symbol 10; UE 13~24 on OFDM symbol 11; UE 25~36 on OFDM symbol 12; UE 37~48 on OFDM symbol 13
    37   55     2    1     1    13    63     0    0     4        0      0    0    0      0    0     0      1      0     0      12; % 12 users wideband. Time and comb multiplexed. UE 1~12 on OFDM symbol 13
    38    7     2    1     1    12    63     0    0     4        0      0    0    0      0    0     0      1      0     0      24; % 24 users wideband. Time and comb multiplexed. UE 1~12 on OFDM symbol 12; UE 13~24 on OFDM symbol 13, prgSize = 4
+   39    7     2    1     1    12    56     0    0     4        0      0    0    0      0    0     0      1      0     0      24; % 24 users wideband. Time and comb multiplexed. UE 1~12 on OFDM symbol 12; UE 13~24 on OFDM symbol 13, 240 PRBs, 90 MHz bandwidth  (244 PRBs)
+   40    7     2    1     1    12    42     0    0     4        0      0    0    0      0    0     0      1      0     0      24; % 24 users wideband. Time and comb multiplexed. UE 1~12 on OFDM symbol 12; UE 13~24 on OFDM symbol 13, 160 PRBs, 60 MHz bandwidth (160 PRBs)
+   41    7     4    1     1    10    63     0    0     4        0      0    0    0      0    0     0      1      0     0      24; % 24 users wideband. Time and comb multiplexed. UE 1~4 on OFDM symbol 10; UE 5~8 on OFDM symbol 11; UE 9~12 on OFDM symbol 12; UE 13~16 on OFDM symbol 13
+   42   31     4    1     1    12    63     0    0     4        0      0    0    0      0    0     0      1      0     0      12; % 12 users wideband. Time and comb multiplexed. UE 1~6 on OFDM symbol 12; UE 7~12 on OFDM symbol 13
    };
 
 [NallTest, ~] = size(CFG);
@@ -5715,7 +6709,7 @@ parfor n = 1:NallTest
             rng(500);
         elseif ismember(caseNum, [1128, 2107, 2451, 2453, 2487, 2519, 2524, 2525, 3589, 3630, 4254, 4358, 5397])
             rng(600);
-        elseif ismember(caseNum, [1198, 1221, 1223, 1300, 1341, 1359, 1392, 1810, 2116, 2462, 2571, 2237, 2446, 2217, 2474, 2453, 2885, 3307, 3413, 4316, 4342, 4382, 4242, 4573, 5225, 5534, 5812, 5794, 5812, 6140])
+        elseif ismember(caseNum, [1198, 1221, 1223, 1300, 1341, 1359, 1392, 1810, 2116, 2462, 2571, 2237, 2446, 2217, 2474, 2453, 2885, 3307, 3413, 4316, 4342, 4382, 4242, 4573, 5225, 5534, 5794, 5812, 6140, 21845])
             rng(caseNum + 100);
         else
             rng(caseNum);
@@ -5953,7 +6947,7 @@ parfor n = 1:NallTest
             SysPar.carrier.SFN_start = 964;
         end
 
-        if ismember(idxCfg, [11, 12, 13]) % 64TR static and dynamic beamforming
+        if ismember(idxCfg, [11, 12, 13, 14, 15]) % 64TR static and dynamic beamforming
             SysPar.SimCtrl.enable_static_dynamic_beamforming = 1;
             SysPar.carrier.N_FhPort_UL = 4; % default num of RX streams for static beamforming
             SysPar.carrier.Nant_gNB_srs = 64;            
@@ -5986,11 +6980,7 @@ parfor n = 1:NallTest
             end
             SysPar.prach{idx}.allSubframes = 1;
             
-            if ismember(caseNum, [530])
-                SysPar.prach{idx}.idxUE = idx-1; % only fix for the new TCs
-            else
-                SysPar.prach{idx}.idxUE = idx; % bug to be fixed
-            end
+            SysPar.prach{idx}.idxUE = idx-1;  % use 0-indexing for idxUE
             
             SysPar.prach{1}.msg1_FDM = length(cfg); % only on {1} based on 0513
             SysPar.SimCtrl.timeDomainSim = 1;
@@ -6039,7 +7029,7 @@ parfor n = 1:NallTest
                     SysPar.prach{idxUe}.digBFInterfaces = digBFInterfaces;
                     SysPar.prach{idxUe}.beamIdx = beamIdx_static_offset + PrachBeamIdxMap(caseNum) + idxUe * digBFInterfaces;
                 else  
-                    if ismember(caseNum, [820:879,21480:21829])
+                    if ismember(caseNum, [820:879,21480:21925])
                         digBFInterfaces = 2;
                     else
                         digBFInterfaces = 4;
@@ -6223,7 +7213,7 @@ parfor n = 1:NallTest
                     pucchTemp.RNTI =  idxUe - 1 + 20001;
                 elseif ismember(caseNum, [3926 : 3927]) % (24 UEs)
                     pucchTemp.RNTI =  idxUe - 1 + 24 * (caseNum - 3926 + 1); % 0~23 used for TV 3924 
-                elseif ismember(caseNum, [3928 : 3939]) % (24 UEs)
+                elseif ismember(caseNum, [3928 : 3941]) % (24 UEs)
                     pucchTemp.RNTI =  idxUe - 1 + 24 * mod(caseNum - 3928, 3); % 12 TVs for PUCCH + SRS
                 elseif ismember(caseNum, [4220 : 4299]) % (24 UEs)
                     pucchTemp.RNTI =  idxUe - 1 + 24 * (caseNum - 4220);
@@ -6344,6 +7334,10 @@ parfor n = 1:NallTest
                 SysPar.pusch{idx}.prgSize = 2;
                 SysPar.pusch{idx}.numPRGs = ceil(SysPar.pusch{idx}.rbSize/SysPar.pusch{idx}.prgSize);
             end
+            if ismember(CFG_PUSCH{idxCfg, 1}, [2257:2344])
+                SysPar.pusch{idx}.prgSize = 16;
+                SysPar.pusch{idx}.numPRGs = ceil(SysPar.pusch{idx}.rbSize/SysPar.pusch{idx}.prgSize);
+            end
             if  VARY_PRB_NUM > 0  % in study of sweeping PRB numbers, overwrite pusch PRB numbers 
                 if ismember(caseNum, [1840:1855, 1872:1903, 2016:2031, 2048:2063, 2240:2255, 2272:2287, 3088:3103, 3600:3639, 3680:3719]) % no prach pattern 44, 47, 51, 60
                     PRB_num_noPrach = min(VARY_PRB_NUM, floor((273-1)/6));
@@ -6366,19 +7360,19 @@ parfor n = 1:NallTest
             SysPar.pusch{idx}.BWPSize =  CFG_PUSCH{idxCfg, 11};
             SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12};
             
-%             if ismember(caseNum, [522 : 537])
-%                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 16 * (caseNum - 522);
-%             elseif ismember(caseNum, [540 : 555])
-%                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 16 * (caseNum - 540);
-%             elseif ismember(caseNum, [556 : 571])
-%                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 16 * (caseNum - 556);
-%             elseif ismember(caseNum, [572 : 603])
-%                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 16 * (caseNum - 572);                
+            if ismember(caseNum, [508 : 519])
+                SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 1 * (caseNum - 508);
+            end
+
+            if ismember(caseNum, [536 : 547])
+                SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 4 * (caseNum - 536);
+            end
+
             if ismember(caseNum, [604 : 635])
                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 16 * (caseNum - 604);
-            elseif ismember(caseNum, [636 : 667]) % RNTI 0 - 511 (16 UEs) 
+            elseif ismember(caseNum, [636 : 667]) 
                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 16 * (caseNum - 636);
-            elseif ismember(caseNum, [668 : 699]) % RNTI 0 - 511 (6 UEs) 
+            elseif ismember(caseNum, [668 : 699])
                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 16 * (caseNum - 668);
             elseif ismember(caseNum, [700 : 763]) %(6 UEs) 
                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 6 * (caseNum - 700);
@@ -6472,7 +7466,11 @@ parfor n = 1:NallTest
                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 6 * (caseNum - 3760);
             elseif ismember(caseNum, [4220 : 4299]) %  (6 UEs)
                 SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 6 * (caseNum - 4220);
-            end % end pusch rnti config
+            end % 
+
+            if ismember(caseNum, [619 : 630])
+                SysPar.pusch{idx}.RNTI =  CFG_PUSCH{idxCfg, 12} + 2 * (caseNum - 619); % overwrite RNTI for 619~630
+            end
     
             % PUSCH RNTI using mapping method
             if CellIdxInPatternMap.isKey(caseNum)
@@ -6527,6 +7525,11 @@ parfor n = 1:NallTest
             % use different harq process id for slot-based cases
             if (harqProcessIdMap.isKey(caseNum) && harqProcessIdMap(caseNum) ~= 0)
                 SysPar.pusch{idx}.harqProcessID = harqProcessIdMap(caseNum);
+            end
+
+            if (ldpcFixMaxIterMap.isKey(caseNum) && ldpcFixMaxIterMap(caseNum) ~= 0)
+                SysPar.SimCtrl.alg.LDPC_maxItr = ldpcFixMaxIterMap(caseNum); % max number of iterations of PUSCH LDPC decoder
+                SysPar.SimCtrl.alg.LDPC_DMI_method = 'fixed'; % fixed: fix the num of LDPC iterations, ML: use machine learning model to predict, LUT_spef: use LUT for max num LDPC itrs, per_UE: use per-UE max num LDPC itrs provided by L2. 
             end
             
             % containing UCI
@@ -6743,7 +7746,7 @@ parfor n = 1:NallTest
                 SysPar.pusch{idx}.rankBitOffset   = 0;
                 SysPar.pusch{idx}.rankBitSize     = 2;
             end
-            if ismember(caseNum, [21640:21659, 21770:21829]) || (UciOnPuschMap.isKey(caseNum) && UciOnPuschMap(caseNum) == "64TR_4_18_7")
+            if ismember(caseNum, [21640:21659, 21770:21909]) || (UciOnPuschMap.isKey(caseNum) && UciOnPuschMap(caseNum) == "64TR_4_18_7")
                 SysPar.SimCtrl.enable_multi_csiP2_fapiv3 = 1;
                 SysPar.pusch{idx}.pduBitmap = 2^0 + 2^1 + 2^5;
                 SysPar.pusch{idx}.harqAckBitLength = 4;  % number of HARQ bits
@@ -6762,7 +7765,7 @@ parfor n = 1:NallTest
                 SysPar.pusch{idx}.betaOffsetCsi2 = 13;
             end
 
-            if ismember(caseNum, [21670:21765]) || (UciOnPuschMap.isKey(caseNum) && UciOnPuschMap(caseNum) == "64TR_4_13_10")
+            if ismember(caseNum, [21670:21765,21914:21915,21924:21925]) || (UciOnPuschMap.isKey(caseNum) && UciOnPuschMap(caseNum) == "64TR_4_13_10")
                 SysPar.SimCtrl.enable_multi_csiP2_fapiv3 = 1;
                 SysPar.pusch{idx}.pduBitmap = 2^0 + 2^1 + 2^5;
                 SysPar.pusch{idx}.harqAckBitLength = 4;  % number of HARQ bits
@@ -6906,10 +7909,10 @@ parfor n = 1:NallTest
             beamIdx_static_offset = beamIdx_pusch_static(1);
             for idxUe = 1:length(SysPar.pusch)
                 % digBFInterfaces = SysPar.pusch{idxUe}.nrOfLayers;
-                if (ismember(caseNum, [590, 740:799, 21203:21415]) && idxUe < length(SysPar.pusch)) || (ismember(caseNum, [534:535,800:819,21520:21829]))
+                if (ismember(caseNum, [590, 740:799, 21203:21415]) && idxUe < length(SysPar.pusch)) || (ismember(caseNum, [534:535,800:819,21520:21925]))
                     SysPar.pusch{idxUe}.digBFInterfaces = 0; % RTW
                     SysPar.pusch{idxUe}.beamIdx = beamIdx_dynamic_offset + [1:digBFInterfaces];
-                    beamIdx_dynamic_offset = beamIdx_dynamic_offset + digBFInterfaces;               
+                    beamIdx_dynamic_offset = beamIdx_dynamic_offset + digBFInterfaces;              
                 elseif (ismember(caseNum, [21423:21475]))
                     SysPar.pusch{idxUe}.digBFInterfaces = 0;
                     SysPar.pusch{idxUe}.seed = 0;
@@ -7174,13 +8177,14 @@ parfor n = 1:NallTest
         % column I patterns: nrSim 90638 and perf pattern 77, 100 MHz
         % Ph4 column B patterns: nrSim 90640 and perf pattern 79, 100 MHz
         % 25-3 column B patterns: nrSim 90644~90647 and perf pattern 81a, 81b, 81c, 81d, 100 MHz
-        % 25-3 column E pattern: nrSim 90648, 100 MHz
+        % 25-3 column D pattern: nrSim 90662, 100 MHz
+        % 25-3 column E pattern: nrSim 90648/90657, 100 MHz
         % 25-3 column G patterns: nrSim 90649~90652 and perf pattern 83a, 83b, 83c, 83d, 100 MHz
         % Ph4 column B patterns nrSim 90653, srsPrgSize = 4 and bfwPrgSize = 16, 100 MHz
         % Ph4 column B patterns nrSim 90654, srsPrgSize = 2 and bfwPrgSize = 16, 100 MHz
         % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz heavy
         % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz light
-        if (ismember(caseNum, [21523:21829]) || ...
+        if (ismember(caseNum, [21523:29999]) || ...
             enableUlRxBfMap.isKey(caseNum) && enableUlRxBfMap(caseNum) == 1)
             SysPar.SimCtrl.enableUlRxBf = 1;
             SysPar.SimCtrl.CellConfigPorts = SysPar.carrier.Nant_gNB;
@@ -7191,6 +8195,10 @@ parfor n = 1:NallTest
             SysPar.SimCtrl.negTV.enable = 4;
             for idx = 1 : SysPar.SimCtrl.N_UE
                 SysPar.Chan{idx}.SNR = 10;
+            end
+            
+            if caseNum == 605
+                SysPar.SimCtrl.negTV.enable = 6; % need to ignore ru-emulator result checking in cicd scripts
             end
         end
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,7 +52,7 @@ int load_num_antenna_from_nr_tv(hdf5hpp::hdf5_file& hdf5file);
 int load_num_antenna_from_nr_tv_srs(hdf5hpp::hdf5_file& hdf5file);
 int load_num_antenna_from_nr_tv_zp_csi_rs(hdf5hpp::hdf5_file& hdf5file);
 int load_num_antenna_from_nr_prach_tv(hdf5hpp::hdf5_file& hdf5file, std::string dset);
-void load_dl_qams(hdf5hpp::hdf5_file& hdf5file, dl_tv_object& tv_object, dl_tv_info& dl_tv_info, bool mod_comp_enabled, const std::vector<struct cell_config>& cell_configs, bool selective_load);
+void load_dl_qams(hdf5hpp::hdf5_file& hdf5file, dl_tv_object& tv_object, dl_tv_info& dl_tv_info, bool mod_comp_enabled, bool non_mod_comp_enabled, const std::vector<struct cell_config>& cell_configs, bool selective_load);
 void load_bfw_qams(hdf5hpp::hdf5_file& hdf5file, dl_tv_object& tv_object);
 void parse_coreset(cuphyPdcchCoresetDynPrm_t& coreset, dci_param_list& dci, std::vector<std::pair<u_int16_t, u_int16_t>>& prb_pair);
 bool merge_pdu_if_adjacent(std::vector<pdu_info>& existing_pdus, pdu_info& new_pdu);

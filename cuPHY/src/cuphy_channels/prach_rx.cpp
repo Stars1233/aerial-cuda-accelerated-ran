@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -479,7 +479,7 @@ static cuphyStatus_t deriveParams(const cuphyPrachCellStatPrms_t* prach_cuphy_pa
     }
 
     // generate ZC sequence and preamble
-    constexpr uint8_t Nprmb = 64;
+    constexpr uint8_t Nprmb = PRACH_MAX_NUM_PREAMBLES;
     uint16_t uvalues[Nprmb];
 
     uint16_t oldu = std::numeric_limits<unsigned short>::max();
@@ -541,7 +541,7 @@ static cuphyStatus_t deriveParams(const cuphyPrachCellStatPrms_t* prach_cuphy_pa
         return CUPHY_STATUS_INTERNAL_ERROR;
     }
 
-    constexpr int N_nc = 1;
+    constexpr int N_nc = PRACH_NUM_NON_COHERENT_COMBINING_GROUPS;
 
     // Add derived paramters into PrachParams
     prach_params->L_RA = L_RA;
@@ -594,32 +594,6 @@ static size_t getReceiverWorkspaceSize(const PrachParams * prach_params,
     else
         return (sizeof(unsigned int) + sizeof(float) + sizeof(float) * N_ant + pdp_buffer_elements * sizeof(prach_pdp_t<__half>) + fft_buffer_elements * prach_element_size + sizeof(prach_det_t<__half>));
 }
-
-#ifndef USE_CUFFTDX
-/** @brief: Allocate FFT plan for PRACH detector
- *  @param[in] prach_params: pointer to PRACH configuration parameters on the host.
- *  @param[in] fft_plan: fft plan.
- *  @return cuphy status
- */
-static cuphyStatus_t allocateFftPlan(const PrachParams * prach_params, cufftHandle * fft_plan) { 
-
-    const int Nfft = prach_params->Nfft;
-    const int N_ant = prach_params->N_ant;
-    const int uCount = prach_params->uCount;
-    const int N_nc = prach_params->N_nc;
-
-    cufftResult res = cufftPlan1d(fft_plan, Nfft, CUFFT_C2C, N_ant * uCount * N_nc);
-    if (CUFFT_SUCCESS != res){
-        NVLOGE_FMT(NVLOG_PRACH, AERIAL_CUDA_API_EVENT, 
-                   "CUFFT error: Plan creation failed with code {} for N_ant {}, uCount {}, N_nc {}, Nfft {}",
-                   res, N_ant, uCount, N_nc, Nfft);
-
-        return CUPHY_STATUS_ALLOC_FAILED;
-    }
-
-    return CUPHY_STATUS_SUCCESS;
-}
-#endif
 
 template <fmtlog::LogLevel log_level>
 static void printPrachCellStatPrms(cuphyPrachCellStatPrms_t const* pCellPrms)
@@ -814,6 +788,10 @@ PrachRx::PrachRx(cuphyPrachStatPrms_t const* pStatPrms, cuphyStatus_t* status) :
     h_staticParam = cuphy::buffer<PrachDeviceInternalStaticParamPerOcca, cuphy::pinned_alloc>(nMaxOccasions);
     h_dynParam = cuphy::buffer<PrachInternalDynParamPerOcca, cuphy::pinned_alloc>(nMaxOccasions);
 
+    const int nFftSizes = sizeof(PRACH_SUPPORTED_FFT_SIZES) / sizeof(PRACH_SUPPORTED_FFT_SIZES[0]);
+    const int maxFftsPerOccasion = MAX_N_ANTENNAS_SUPPORTED * PRACH_MAX_NUM_PREAMBLES * PRACH_NUM_NON_COHERENT_COMBINING_GROUPS;
+    h_fftPointers = cuphy::buffer<cuFloatComplex *, cuphy::pinned_alloc>(nFftSizes * nMaxOccasions * maxFftsPerOccasion);
+
     d_staticParam = cuphy::buffer<PrachDeviceInternalStaticParamPerOcca, cuphy::device_alloc>(nMaxOccasions, &m_memoryFootprint);
     d_dynParam = cuphy::buffer<PrachInternalDynParamPerOcca, cuphy::device_alloc>(nMaxOccasions, &m_memoryFootprint);
 
@@ -838,15 +816,6 @@ PrachRx::PrachRx(cuphyPrachStatPrms_t const* pStatPrms, cuphyStatus_t* status) :
             cuphy::buffer<float, cuphy::device_alloc>& prach_workspace_buffer = staticParam[prachOccasion].prach_workspace_buffer;
             prach_workspace_buffer = std::move(buffer<float, device_alloc>(div_round_up(prach_workspace_size, sizeof(float)), &m_memoryFootprint));
 
-#ifndef USE_CUFFTDX
-            // allocate FFT plan
-            cufftHandle& fft_plan = staticParam[prachOccasion].fft_plan;
-            *status = allocateFftPlan(&prach_params, &fft_plan);
-            if(*status != CUPHY_STATUS_SUCCESS)
-            {
-                return;
-            }
-#endif
             staticParam[prachOccasion].enableUlRxBf = pStatPrms->enableUlRxBf;
             
             h_staticParam[prachOccasion] = {prach_params, prach_workspace_buffer.addr(), d_y_u_ref.addr(), pStatPrms->enableUlRxBf};
@@ -892,14 +861,17 @@ PrachRx::PrachRx(cuphyPrachStatPrms_t const* pStatPrms, cuphyStatus_t* status) :
     }
     cuphyStream.synchronize();
 
-    // GraphNodeType::FFTNode to launch all kernels in pipeline + nTotCellOcca for FFT calls
-    nodes.resize(GraphNodeType::FFTNode + nTotCellOcca);
+    // GraphNodeType::FFTNode is the last entry in the enum and we create PRACH_NUM_SUPPORTED_FFT_SIZES nodes
+    // for FFTs, so we create GraphNodeType::FFTNode + PRACH_NUM_SUPPORTED_FFT_SIZES total nodes.
+    nodes.resize(GraphNodeType::FFTNode + PRACH_NUM_SUPPORTED_FFT_SIZES);
     // initialize graph nodes with nOccaProc as nMaxOccasions
     nPrevOccaProc = nTotCellOcca;
     *status = cuphyPrachCreateGraph(&graph, &graphInstance, nodes, strm,
                             d_dynParam.addr(), 
                             d_staticParam.addr(),
                             staticParam.data(),
+                            h_fftPointers.addr(),
+                            h_fftInfo,
                             (uint32_t*)numDetectedPrmb.pAddr,
                             (uint32_t*)prmbIndexEstimates.pAddr,
                             (float*)prmbDelayEstimates.pAddr,
@@ -939,13 +911,6 @@ PrachRx::PrachRx(cuphyPrachStatPrms_t const* pStatPrms, cuphyStatus_t* status) :
 
 PrachRx::~PrachRx()
 {
-#ifndef USE_CUFFTDX
-    for(int prachOccasion = 0; prachOccasion < nMaxOccasions; ++prachOccasion)
-    {
-        cufftHandle& fft_plan = staticParam[prachOccasion].fft_plan;
-        cufftDestroy(fft_plan);
-    }
-#endif
 }
 
 // PRACH Setup
@@ -1028,6 +993,9 @@ cuphyStatus_t PrachRx::expandParameters(cuphyPrachDynPrms_t* pDynPrms)
                                 d_dynParam.addr(),
                                 d_staticParam.addr(),
                                 h_dynParam.addr(),
+                                staticParam.data(),
+                                h_fftPointers.addr(),
+                                h_fftInfo,
                                 (uint32_t*)numDetectedPrmb.pAddr,
                                 (uint32_t*)prmbIndexEstimates.pAddr,
                                 (float*)prmbDelayEstimates.pAddr,
@@ -1081,6 +1049,8 @@ cuphyStatus_t PrachRx::Run()
                                 d_staticParam.addr(),
                                 h_dynParam.addr(),
                                 staticParam.data(),
+                                h_fftPointers.addr(),
+                                h_fftInfo,
                                 (uint32_t*)numDetectedPrmb.pAddr,
                                 (uint32_t*)prmbIndexEstimates.pAddr,
                                 (float*)prmbDelayEstimates.pAddr,

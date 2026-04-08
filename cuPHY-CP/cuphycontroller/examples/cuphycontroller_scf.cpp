@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,38 +39,37 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_CONTROLLER + 1) // "CTL.SCF"
 #define TAG_STARTUP_TIMES (NVLOG_TAG_BASE_CUPHY_CONTROLLER + 5) // "CTL.STARTUP_TIMES"
 
-phydriver_handle pdh;
+phydriver_handle pdh; //!< cuPHYDriver handle pointer
 
 static void l1_setPhydriverHandle();
 static void l1_setFmtLogThreadId(pthread_t id);
 
+/**
+ * The nvlog exit handler for L1 to cleanup and exit
+ */
+static void nvlog_exit_handler(void)
+{
+    char thread_name[16];
+    pthread_getname_np(pthread_self(), thread_name, 16);
+    NVLOGC_FMT(TAG, "{}: nvlog exit handler called in thread [{}]", __func__, thread_name);
 
+    // Call L1 exit handler
+    l1_exit_handler();
+}
 
-void signal_handler(int signum)
+/**
+ * The signal handler to trigger L1 cleanup and exit
+ * @param signum Signal number
+ */
+static void signal_handler(int signum)
 {
     if (signum == SIGINT || signum == SIGTERM) {
-        NVLOGC_FMT(TAG, "Signal {} received, preparing to exit...", signum);
-
         // Change exit_handler_flag to L1_EXIT to let msg_processing thread stop sending SLOT.indication
         exit_handler::getInstance().set_exit_handler_flag(exit_handler::L1_EXIT);
-        // Sleep 100ms to wait for ongoing pipelines to finish
-        usleep(100 * 1000); // 100ms
-
-#ifdef CUPTI_ENABLE_TRACING
-        cuphy_cupti_helper_stop();
-#endif
-        // cuphydriver deinitialization
-        int ret = pc_finalize_phydriver(pdh);
-        if(ret)
-        {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "pc_finalize_phydriver error {}", ret);
-            EXIT_L1(EXIT_FAILURE);
-        }
-
-        NVLOGC_FMT(TAG, "====> PhyDriver finalized! Exit from signal_handler after 1s delay...");
-        usleep(1000000); // Add a delay to give enough time to fmtlog producers and logging thread
     }
-    EXIT_L1(EXIT_SUCCESS);
+
+    // Note: It's not async-signal-safe to print log in signal handler, but it's really necessary to add log to avoid silent exiting.
+    NVLOGC_FMT(TAG, "[signal_handler] received signal {} - {} - {}", signum, sigabbrev_np(signum), sigdescr_np(signum));
 }
 
 int main(int argc,char* argv[]) {
@@ -84,7 +83,7 @@ int main(int argc,char* argv[]) {
     if (curl_init_res != CURLE_OK) {
             NVLOGE_FMT(TAG, AERIAL_PTP_ERROR_EVENT, "curl_global_init failed with error: {}", curl_easy_strerror(curl_init_res));
             exit(EXIT_FAILURE);
-     }
+    }
 
     // Debug starting CPU core issue
     printf("Started cuphycontroller on CPU core %d\n", sched_getcpu());
@@ -186,12 +185,11 @@ int main(int argc,char* argv[]) {
     char root[1024];
     get_root_path(root, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
     std::string yaml_path = std::string(root).append(NVLOG_DEFAULT_CONFIG_FILE);
-    pthread_t bg_thread_id = nvlog_fmtlog_init(yaml_path.c_str(), "phy.log",&l1_exit_handler);
+    pthread_t bg_thread_id = nvlog_fmtlog_init(yaml_path.c_str(), "phy.log",&nvlog_exit_handler);
     l1_setFmtLogThreadId(bg_thread_id);
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-
 
     YamlParser parser_cfg, parser_l2pattern;
     std::vector<phydriverwrk_handle> workers_descr(16);
@@ -229,9 +227,11 @@ int main(int argc,char* argv[]) {
     TI_GENERIC_ADD("Cuphy PTI Init");
     cuphy_pti_init(parser_cfg.get_cuphydriver_nics()[0].address.c_str());
 
-#ifdef CUPTI_ENABLE_TRACING
-    cuphy_cupti_helper_init();
-#endif
+    if (parser_cfg.get_cuphydriver_cupti_enable_tracing()) {
+        cuphy_cupti_helper_init(
+            parser_cfg.get_cuphydriver_cupti_buffer_size(),
+            parser_cfg.get_cuphydriver_cupti_num_buffers());
+    }
 
     try
     {
@@ -291,7 +291,7 @@ int main(int argc,char* argv[]) {
     ctx_cfg.dl_cores = parser_cfg.get_cuphydriver_workers_dl();
     ctx_cfg.dl_validation_cores = parser_cfg.get_cuphydriver_workers_dl_validation();
     ctx_cfg.debug_worker = parser_cfg.get_cuphydriver_debug_worker();
-    ctx_cfg.datalake_core = parser_cfg.get_cuphydriver_datalake_core();
+    ctx_cfg.data_core = parser_cfg.get_cuphydriver_data_core();
     ctx_cfg.datalake_db_write_enable = parser_cfg.get_cuphydriver_datalake_db_write_enable();
     ctx_cfg.datalake_samples = parser_cfg.get_cuphydriver_datalake_samples();
     ctx_cfg.datalake_address = parser_cfg.get_cuphydriver_datalake_address();
@@ -302,11 +302,12 @@ int main(int argc,char* argv[]) {
     ctx_cfg.num_rows_pusch = parser_cfg.get_cuphydriver_num_rows_pusch();
     ctx_cfg.num_rows_hest = parser_cfg.get_cuphydriver_num_rows_hest();
     ctx_cfg.e3_agent_enabled = parser_cfg.get_cuphydriver_e3_agent_enabled();
-    ctx_cfg.e3_pub_port = parser_cfg.get_cuphydriver_e3_pub_port();
     ctx_cfg.e3_rep_port = parser_cfg.get_cuphydriver_e3_rep_port();
+    ctx_cfg.e3_pub_port = parser_cfg.get_cuphydriver_e3_pub_port();
     ctx_cfg.e3_sub_port = parser_cfg.get_cuphydriver_e3_sub_port();
     ctx_cfg.datalake_drop_tables = parser_cfg.get_cuphydriver_datalake_drop_tables();
     ctx_cfg.use_green_contexts = parser_cfg.get_cuphydriver_use_green_contexts();
+    ctx_cfg.use_gc_workqueues  = parser_cfg.get_cuphydriver_use_gc_workqueues();
     ctx_cfg.use_batched_memcpy = parser_cfg.get_cuphydriver_use_batched_memcpy();
     ctx_cfg.mps_sm_pusch = parser_cfg.get_cuphydriver_mps_sm_pusch();
     ctx_cfg.mps_sm_pucch = parser_cfg.get_cuphydriver_mps_sm_pucch();
@@ -345,6 +346,9 @@ int main(int argc,char* argv[]) {
     ctx_cfg.enable_cpu_task_tracing = parser_cfg.get_cuphydriver_enable_cpu_task_tracing();
     ctx_cfg.enable_l1_param_sanity_check = parser_cfg.get_cuphydriver_enable_l1_param_sanity_check();
     ctx_cfg.enable_prepare_tracing = parser_cfg.get_cuphydriver_enable_prepare_tracing();
+    ctx_cfg.cupti_enable_tracing = parser_cfg.get_cuphydriver_cupti_enable_tracing();
+    ctx_cfg.cupti_buffer_size = parser_cfg.get_cuphydriver_cupti_buffer_size();
+    ctx_cfg.cupti_num_buffers = parser_cfg.get_cuphydriver_cupti_num_buffers();
     ctx_cfg.enable_dl_cqe_tracing = parser_cfg.get_cuphydriver_enable_dl_cqe_tracing();
     ctx_cfg.cqe_trace_cell_mask = parser_cfg.get_cuphydriver_cqe_trace_cell_mask();
     ctx_cfg.cqe_trace_slot_mask = parser_cfg.get_cuphydriver_cqe_trace_slot_mask();
@@ -371,7 +375,10 @@ int main(int argc,char* argv[]) {
     ctx_cfg.sendCPlane_dlbfw_backoff_th_ns = parser_cfg.get_cuphydriver_sendCPlane_dlbfw_backoff_th_ns();
     ctx_cfg.forcedNumCsi2Bits = parser_cfg.get_cuphydriver_forcedNumCsi2Bits();
     ctx_cfg.pusch_nMaxLdpcHetConfigs = parser_cfg.get_cuphydriver_pusch_nMaxLdpcHetConfigs();
+    ctx_cfg.pusch_nMaxTbPerNode = parser_cfg.get_cuphydriver_pusch_nMaxTbPerNode();
     ctx_cfg.enable_srs = parser_cfg.get_cuphydriver_enable_srs();
+    ctx_cfg.enable_dl_core_affinity = parser_cfg.get_cuphydriver_enable_dl_core_affinity();
+    ctx_cfg.dlc_core_packing_scheme = parser_cfg.get_cuphydriver_dlc_core_packing_scheme();
     ctx_cfg.ue_mode = parser_cfg.get_cuphydriver_ue_mode();
     ctx_cfg.mCh_segment_proc_enable = parser_cfg.get_cuphydriver_ch_segment_proc_enable();
     ctx_cfg.pusch_aggr_per_ctx = parser_cfg.get_pusch_aggr_per_ctx();
@@ -516,7 +523,17 @@ int main(int argc,char* argv[]) {
         TI_GENERIC_ADD("Init SCF FAPI");
         scf_5g_fapi::init();
         TI_GENERIC_ADD("Create PHY_group");
-        grp = std::make_unique<nv::PHY_group>(parser_cfg.get_l2adapter_filename().c_str());
+
+        try
+        {
+            grp = std::make_unique<nv::PHY_group>(parser_cfg.get_l2adapter_filename().c_str());
+        }
+        catch (const std::exception &e)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Failed to create PHY_group: {}", e.what());
+            goto quit;
+        }
+
         TI_GENERIC_ADD("Start PHY_group");
         grp->start();
         NVLOGC_FMT(TAG, "cuPHYController configured for {} cells", parser_cfg.get_cuphydriver_cell_group_num());
@@ -538,25 +555,45 @@ int main(int argc,char* argv[]) {
         {
             pthread_setname_np(pthread_self(), "phy_main");
             nvlog_fmtlog_thread_init("phy_main");
-            grp->join();
+            if (grp)
+            {
+                NVLOGC_FMT(TAG, "Joining PHY_group");
+                grp->join();
+                NVLOGC_FMT(TAG, "Joined PHY_group");
+            }
         }
+        NVLOGC_FMT(TAG, "Shutting down CuphyOAM");
         CuphyOAM *oam = CuphyOAM::getInstance();
         oam->shutdown();
         oam->wait_shutdown();
     }
 
 quit:
+    // Stop CUPTI tracing (safe to call even if CUPTI wasn't initialized)
+    NVLOGC_FMT(TAG, "Stopping CUPTI tracing");
+    cuphy_cupti_helper_stop();
+
+    NVLOGC_FMT(TAG, "Finalizing PHYDriver");
     ret = pc_finalize_phydriver(pdh);
     if(ret)
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "pc_finalize_phydriver error {}", ret);
-        EXIT_L1(EXIT_FAILURE);
     }
     NVLOGC_FMT(TAG, "====> PhyDriver finalized! Exit from main function ...");
     nvlog_fmtlog_close(bg_thread_id);
 
     curl_global_cleanup();
-    return 0;
+
+    if (ret == EXIT_SUCCESS)
+    {
+        printf("EXIT successfully from main function\n");
+    }
+    else
+    {
+        printf("EXIT from main function with error_code=%d\n", ret);
+    }
+
+    return ret;
 }
 
 static void l1_setPhydriverHandle()

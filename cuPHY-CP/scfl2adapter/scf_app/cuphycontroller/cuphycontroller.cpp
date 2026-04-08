@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +51,21 @@ void l2sa_exit_handler()
     exit(EXIT_FAILURE);
 }
 
+/**
+ * The signal handler to trigger L1 cleanup and exit
+ * @param signum Signal number
+ */
+static void signal_handler(int signum)
+{
+    if (signum == SIGINT || signum == SIGTERM) {
+        // Change exit_handler_flag to L1_EXIT to let msg_processing thread stop sending SLOT.indication
+        exit_handler::getInstance().set_exit_handler_flag(exit_handler::L1_EXIT);
+    }
+
+    // Note: It's not async-signal-safe to print log in signal handler, but it's really necessary to add log to avoid silent exiting.
+    NVLOGC_FMT(TAG, "[signal_handler] received signal {} - {} - {}", signum, sigabbrev_np(signum), sigdescr_np(signum));
+}
+
 void oam_init()
 {
     CuphyOAM* oam = CuphyOAM::getInstance();
@@ -66,8 +81,6 @@ int main(int argc, const char* argv[])
 {
     // Debug starting CPU core issue
     printf("Started l2sa on CPU core %d\n", sched_getcpu());
-
-    signal_setup();
 
     int return_value = 0;
     try
@@ -122,6 +135,10 @@ int main(int argc, const char* argv[])
         pthread_t bg_thread_id = nvlog_fmtlog_init(yaml_file, "l2sa.log", l2sa_exit_handler);
         nvlog_fmtlog_thread_init();
         NVLOGC_FMT(TAG, "Thread {} initialized fmtlog", __FUNCTION__);
+
+        // Register signal handlers after nvlog is initialized
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
 
         // Initialize PHYDriverProxy
         thread_config thread_cfg;

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,12 +16,13 @@
 """pyAerial library - LDPC decoding."""
 from typing import Generic
 from typing import List
-import cuda.bindings.runtime as cudart  # type: ignore
+from typing import Optional
+
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy  # type: ignore
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PuschConfig
 from aerial.phy5g.ldpc.util import get_code_block_size
@@ -37,23 +38,23 @@ class LdpcDecoder(Generic[Array]):
     def __init__(self,
                  num_iterations: int = 10,
                  throughput_mode: bool = False,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize LdpcDecoder.
 
         Args:
             num_iterations (int): Number of LDPC decoder iterations. Default: 10.
             throughput_mode (bool): Enable throughput mode. Default: False.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
         self.num_iterations = num_iterations
         self.throughput_mode = throughput_mode
 
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         # Create cuPHY LDPC decoder object.
-        self.pycuphy_ldpc_decoder = pycuphy.LdpcDecoder(self.cuda_stream)
+        self.pycuphy_ldpc_decoder = pycuphy.LdpcDecoder(self._cuda_stream.handle)
 
         self.pycuphy_ldpc_decoder.set_num_iterations(num_iterations)
         self.pycuphy_ldpc_decoder.set_throughput_mode(throughput_mode)
@@ -97,7 +98,7 @@ class LdpcDecoder(Generic[Array]):
             List[Array]: The decoded bits.
         """
         self.cpu_copy = isinstance(input_llrs[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             input_llrs = [cp.array(llr, dtype=cp.float16, order='F') for llr in input_llrs]
 
         # If PuschConfigs given, read the other parameters from that (the rest are ignored).
@@ -145,7 +146,7 @@ class LdpcDecoder(Generic[Array]):
             [np.uint32(rate_match_len) for rate_match_len in rate_match_lengths]
         )
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             decoded_bits_ = [cp.array(elem) for elem in decoded_bits_]
             if self.cpu_copy:
                 decoded_bits_ = [elem.get(order='F') for elem in decoded_bits_]

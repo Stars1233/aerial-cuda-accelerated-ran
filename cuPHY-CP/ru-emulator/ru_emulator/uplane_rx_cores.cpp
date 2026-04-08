@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,6 +55,8 @@ void RU_Emulator::validate_dl_channels(uint8_t cell_index, uint8_t curr_launch_p
         validate_csirs(cell_index, header_info, section_buffer);
     }
 }
+
+// validate_uplane_section_id_match moved to sectionid_validation.cpp (cold)
 
 void *uplane_proc_rx_core_wrapper(void *arg)
 {
@@ -183,7 +185,7 @@ void *RU_Emulator::uplane_proc_validate_core(void *arg)
 
     uint8_t curr_launch_pattern_slot = 0;
     struct fssId curr_fss{0,0,0};
-    std::array<std::array<std::array<uint64_t, CounterTimingMax>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> local_packet_counters;
+    std::array<std::array<std::array<uint64_t, CounterTimingMax>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> local_packet_counters{};
 
     uint16_t buf_read_idx;
     uint16_t buf_write_idx;
@@ -197,14 +199,16 @@ void *RU_Emulator::uplane_proc_validate_core(void *arg)
     struct fssId prev_fss[MAX_FLOWS_PER_DL_CORE];
     uint64_t prev_t0[MAX_FLOWS_PER_DL_CORE];
 
-    //Init peofiling variables
-    for(int i=0;i<MAX_FLOWS_PER_DL_CORE;i++)
+    // Init peofiling variables
+    for (int i = 0; i < MAX_FLOWS_PER_DL_CORE; i++)
     {
-        first_packet_of_slot_rx_burst[i]=true;
-        slot_validate_start_t[i]=0;
-        slot_validate_end_t[i]=0;
-        packet_count_slot[i]=0;
-        prev_t0[i]=0;
+        first_packet_of_slot_rx_burst[i] = true;
+        slot_validate_start_t[i] = 0;
+        slot_validate_end_t[i] = 0;
+        packet_count_slot[i] = 0;
+        prev_t0[i] = 0;
+        prev_launch_pattern_slot[i] = MAX_LAUNCH_PATTERN_SLOTS;
+        prev_fss[i] = {0,0,0};
     }
 
     int64_t frame_cycle_time_ns = get_frame_cycle_time_ns(max_slot_id, opt_tti_us);
@@ -255,6 +259,11 @@ void *RU_Emulator::uplane_proc_validate_core(void *arg)
                     {
                         do_throw(sb() << "Flow index not found from Flow value... ");
                     }
+                }
+
+                if (unlikely(opt_sectionid_validation == RE_ENABLED))
+                {
+                    validate_uplane_section_id_match(cell_index, header_info);
                 }
 
                 if(first_packet_of_slot_rx_burst[header_info.flow_index]==false)
@@ -404,7 +413,7 @@ void *RU_Emulator::uplane_proc_validate_core(void *arg)
 
                     if(opt_timing_histogram == RE_ENABLED)
                     {
-                        toa += STATS_MAX_BINS/2 * opt_timing_histogram_bin_size;
+                        toa += STATS_MAX_BINS/2 * static_cast<int64_t>(opt_timing_histogram_bin_size);
 
                         if(toa < 0)
                         {
@@ -443,7 +452,7 @@ void *RU_Emulator::uplane_proc_validate_core(void *arg)
 
                     validate_dl_channels(cell_index, curr_launch_pattern_slot, header_info, section_buffer, prev_pbch_time);
 
-                    section_buf_offset += ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD + header_info.numPrb * cell_configs[cell_index].dl_prb_size;
+                    section_buf_offset += ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD + static_cast<size_t>(header_info.numPrb) * cell_configs[cell_index].dl_prb_size;
                 }
             }
             ret = aerial_fh::free_rx_messages(&mbuf_info[core_index*PACKET_RX_BUFFER_COUNT*MAX_PACKET_PER_RX_BURST+buf_read_idx*MAX_PACKET_PER_RX_BURST],nb_mbufs_rx);
@@ -459,8 +468,15 @@ void *RU_Emulator::uplane_proc_validate_core(void *arg)
             pkt_buf_read_idx[core_index]=buf_read_idx;
         }
         validate_end_t = get_ns();
-        re_dbg("Cell {}-{}: 3GPP {} F{} S{} S{} Validate {} packets complete Avg Time {:4.2f} us per pkt Total Time {:4.2f} us t0 {} curr time {}",
-                    cell_index, core_index, header_info.launch_pattern_slot, header_info.fss.frameId, header_info.fss.subframeId, header_info.fss.slotId, nb_mbufs_rx, (float)(validate_end_t - validate_start_t)/1000/ nb_mbufs_rx,(float)(validate_end_t - validate_start_t)/1000,slot_t0,get_ns());
+        if (unlikely(nb_mbufs_rx == 0))
+        {
+            re_warn("Unexpected: nb_mbufs_rx is 0");
+        }
+        else
+        {
+            re_dbg("Cell {}-{}: 3GPP {} F{} S{} S{} Validate {} packets complete Avg Time {:4.2f} us per pkt Total Time {:4.2f} us t0 {} curr time {}",
+                   cell_index, core_index, header_info.launch_pattern_slot, header_info.fss.frameId, header_info.fss.subframeId, header_info.fss.slotId, nb_mbufs_rx, (float)(validate_end_t - validate_start_t) / 1000 / nb_mbufs_rx, (float)(validate_end_t - validate_start_t) / 1000, slot_t0, get_ns());
+        }
         if(opt_forever == RE_DISABLED)
         {
             //Assuming all slots have the same number of cells
@@ -535,7 +551,7 @@ void *RU_Emulator::uplane_proc_core(void *arg)
 
     uint8_t curr_launch_pattern_slot = 0;
     struct fssId curr_fss{0,0,0};
-    std::array<std::array<std::array<uint64_t, CounterTimingMax>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> local_packet_counters;
+    std::array<std::array<std::array<uint64_t, CounterTimingMax>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> local_packet_counters{};
 
     //Profiling variables : Only use for accurate interpretation if all the flows of a cell are mapped to the same CPU core
     bool first_packet_of_slot_rx_burst[MAX_FLOWS_PER_DL_CORE];
@@ -547,13 +563,15 @@ void *RU_Emulator::uplane_proc_core(void *arg)
     uint64_t prev_t0[MAX_FLOWS_PER_DL_CORE];
 
     //Init peofiling variables
-    for(int i=0;i<MAX_FLOWS_PER_DL_CORE;i++)
+    for (int i = 0; i < MAX_FLOWS_PER_DL_CORE; i++)
     {
-        first_packet_of_slot_rx_burst[i]=true;
-        slot_validate_start_t[i]=0;
-        slot_validate_end_t[i]=0;
-        packet_count_slot[i]=0;
-        prev_t0[i]=0;
+        first_packet_of_slot_rx_burst[i] = true;
+        slot_validate_start_t[i] = 0;
+        slot_validate_end_t[i] = 0;
+        packet_count_slot[i] = 0;
+        prev_t0[i] = 0;
+        prev_launch_pattern_slot[i] = MAX_LAUNCH_PATTERN_SLOTS;
+        prev_fss[i] = {0,0,0};
     }
 
     // NOT SURE WHY THIS DOESNT WORK, have to split up the multiplication.
@@ -609,6 +627,11 @@ void *RU_Emulator::uplane_proc_core(void *arg)
                 {
                     do_throw(sb() << "Flow index not found from Flow value... ");
                 }
+            }
+
+            if (unlikely(opt_sectionid_validation == RE_ENABLED))
+            {
+                validate_uplane_section_id_match(cell_index, header_info);
             }
 
             if(first_packet_of_slot_rx_burst[header_info.flow_index]==false)
@@ -801,7 +824,7 @@ void *RU_Emulator::uplane_proc_core(void *arg)
 
                 if(opt_timing_histogram == RE_ENABLED)
                 {
-                    toa += STATS_MAX_BINS/2 * opt_timing_histogram_bin_size;
+                    toa += STATS_MAX_BINS/2 * static_cast<int64_t>(opt_timing_histogram_bin_size);
 
                     if(toa < 0)
                     {
@@ -854,17 +877,19 @@ void *RU_Emulator::uplane_proc_core(void *arg)
                 {
                     auto com_meth = oran_umsg_get_com_meth_from_section_buf(section_buffer);
                     auto iq_width = oran_umsg_get_iq_width_from_section_buf(section_buffer);
-                    if (static_cast<aerial_fh::UserDataCompressionMethod>(com_meth) != cell_configs[cell_index].dl_comp_meth)
+                    auto reserved_bits = oran_umsg_get_comp_hdr_reserved_bits_from_section_buf(section_buffer);
+
+                    if (unlikely(static_cast<aerial_fh::UserDataCompressionMethod>(com_meth) != cell_configs[cell_index].dl_comp_meth || reserved_bits))
                     {
-                        re_cons("Cell {}-{}: 3GPP {} F{} S{} S{} symbol {} com_meth {} iq_width {}", cell_index, core_index, header_info.launch_pattern_slot, header_info.fss.frameId, header_info.fss.subframeId, header_info.fss.slotId, header_info.symbolId, com_meth, iq_width);
+                        re_cons("Cell {}-{}: 3GPP {} F{} S{} S{} symbol {} com_meth {} iq_width {} reserved_bits {}", cell_index, core_index, header_info.launch_pattern_slot, header_info.fss.frameId, header_info.fss.subframeId, header_info.fss.slotId, header_info.symbolId, com_meth, iq_width, reserved_bits);
                         sleep(1);
                         do_throw(sb() << "Wrong udCompHdr...\n");
                     }
-                    sect_iq_data_sz = header_info.numPrb * iq_width * 3;
+                    sect_iq_data_sz = static_cast<size_t>(header_info.numPrb) * iq_width * 3;
                 }
                 else
                 {
-                    sect_iq_data_sz = header_info.numPrb * cell_configs[cell_index].dl_prb_size;
+                    sect_iq_data_sz = static_cast<size_t>(header_info.numPrb) * cell_configs[cell_index].dl_prb_size;
                 }
 
                 validate_dl_channels(cell_index, curr_launch_pattern_slot, header_info, section_buffer, prev_pbch_time);
@@ -880,13 +905,20 @@ void *RU_Emulator::uplane_proc_core(void *arg)
             }
         }
         validate_end_t = get_ns();
-        ret = aerial_fh::free_rx_messages(&info[0],nb_mbufs_rx);
-        if ( ret != 0)
+        if (unlikely(nb_mbufs_rx == 0))
         {
-            do_throw(sb() <<"Error in FH free_rx_messages\n");
+            re_warn("Unexpected: nb_mbufs_rx is 0");
         }
-        re_dbg("Cell {}-{}: 3GPP {} F{} S{} S{} Validate {} packets complete Avg Time {:4.2f} us per pkt Total Time {:4.2f} us t0 {} curr time {}",
-                    cell_index, core_index, header_info.launch_pattern_slot, header_info.fss.frameId, header_info.fss.subframeId, header_info.fss.slotId, nb_mbufs_rx, (float)(validate_end_t - validate_start_t)/1000/ nb_mbufs_rx,(float)(validate_end_t - validate_start_t)/1000,slot_t0,get_ns());
+        else
+        {
+            ret = aerial_fh::free_rx_messages(&info[0],nb_mbufs_rx);
+            if ( ret != 0)
+            {
+                do_throw(sb() <<"Error in FH free_rx_messages\n");
+            }
+            re_dbg("Cell {}-{}: 3GPP {} F{} S{} S{} Validate {} packets complete Avg Time {:4.2f} us per pkt Total Time {:4.2f} us t0 {} curr time {}",
+                   cell_index, core_index, header_info.launch_pattern_slot, header_info.fss.frameId, header_info.fss.subframeId, header_info.fss.slotId, nb_mbufs_rx, (float)(validate_end_t - validate_start_t) / 1000 / nb_mbufs_rx, (float)(validate_end_t - validate_start_t) / 1000, slot_t0, get_ns());
+        }
         ++flow_counter;
         if(flow_counter == flow_count)
         {

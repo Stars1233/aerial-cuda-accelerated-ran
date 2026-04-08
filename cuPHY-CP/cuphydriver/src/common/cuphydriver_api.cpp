@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -576,12 +576,14 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                         if(cell_ptr == nullptr)
                         {
                             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Cell {} is not present in the PhyDriver context", cell_phy_id);
+                            cell_index++;
                             continue;
                         }
 
                         if(cell_ptr->isActive() == false)
                         {
                             NVLOGW_FMT(TAG, "Cell {} is not active, can't run anything", cell_ptr->getPhyId());
+                            cell_index++;
                             continue;
                         }
 
@@ -691,6 +693,7 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                         if(cell_ptr == nullptr)
                         {
                             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Cell {} is not present in the PhyDriver context", cell_phy_id);
+                            cell_index++;
                             continue;
                         }
 
@@ -704,6 +707,7 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                         if(cell_ptr->isActive() == false)
                         {
                             NVLOGW_FMT(TAG, "Cell {} is not active, can't run anything", cell_ptr->getPhyId());
+                            cell_index++;
                             continue;
                         }
 
@@ -1135,6 +1139,8 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                     if(!pdctx->h2d_copy_thread_enable)
                     {
                         pdctx->getPdschMpsCtx()->setCtx();
+
+                        CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_start(sc->cell_groups.slot.slot_3gpp.slot_), pdctx->getH2DCpyStream()));
 
                         // If there is no seperate copy thread, launch the copy here. The information about the copy batches is filled in in the offload funciton.
                         cuphyStatus_t batched_memcpy_status = pdctx->performBatchedMemcpy(); // still a no-op if yaml flag is 0
@@ -1582,16 +1588,8 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
         int num_dlc_tasks = get_num_dlc_tasks(num_dl_workers,pdctx->gpuCommEnabledViaCpu(), pdctx->getmMIMO_enable());
         int dl_worker_offset;
         int dlbfw_core_index = 0;
-        bool ENABLE_DL_AFFINITY = false;
+        const bool ENABLE_DL_AFFINITY = (pdctx->get_enable_dl_core_affinity() != 0);
 
-        if (!pdctx->getmMIMO_enable())
-        {
-            ENABLE_DL_AFFINITY = (num_dl_workers >= 3);
-        }
-        else
-        {
-            ENABLE_DL_AFFINITY = (num_dl_workers >= 5);
-        }
         if(pdctx->getmMIMO_enable() && pdctx->gpuCommEnabledViaCpu())
         {
             if(num_dl_workers < 3) {
@@ -2256,6 +2254,9 @@ void* ptp_svc_monitoring_func(void* arg)
     std::string syslogPath = "/host/var/log/syslog";
     auto ptp_rms_threshold = appConfig.getPtpRmsThreshold();
     int ptp_status = 0;
+    /* Single thread runs this (one pthread from l1_initialize); no synchronization needed. */
+    static time_t last_reported_link_down_ts = time(nullptr);
+    static time_t last_reported_link_up_ts = time(nullptr);
 
     while(1)
     {
@@ -2276,7 +2277,44 @@ void* ptp_svc_monitoring_func(void* arg)
             }
             ptp_status = new_ptp_status;
         }
-        sleep(1);
+
+        time_t link_down_ts = static_cast<time_t>(-1);
+        time_t link_up_ts = static_cast<time_t>(-1);
+        AppUtils::getPtpPortLinkEvents(syslogPath, link_down_ts, link_up_ts);
+        const bool new_down = (link_down_ts != static_cast<time_t>(-1) && link_down_ts > last_reported_link_down_ts);
+        const bool new_up = (link_up_ts != static_cast<time_t>(-1) && link_up_ts > last_reported_link_up_ts);
+        if (new_down || new_up) {
+            if (new_down) last_reported_link_down_ts = link_down_ts;
+            if (new_up) last_reported_link_up_ts = link_up_ts;
+
+            slot_command_api::dl_slot_callbacks dl_cb{};
+            std::array<uint32_t, MAX_CELLS_PER_SLOT> cell_idx_list = {};
+            const auto cell_count = pdctx->getCellIdxList(cell_idx_list);
+            if (pdctx->getDlCb(dl_cb) && cell_count > 0 && dl_cb.l1_exit_error_fn) {
+                if (new_down && new_up) {
+                    /* Ordering is best-effort when link_down_ts == link_up_ts (syslog has 1s granularity). */
+                    if (link_down_ts <= link_up_ts) {
+                        dl_cb.l1_exit_error_fn(SCF_FAPI_ERROR_INDICATION, SCF_ERROR_CODE_FH_PORT_DOWN, cell_idx_list, cell_count);
+                        NVLOGI_FMT(TAG, "FH port link down indication (0x99)");
+                        dl_cb.l1_exit_error_fn(SCF_FAPI_ERROR_INDICATION, SCF_ERROR_CODE_FH_PORT_UP, cell_idx_list, cell_count);
+                        NVLOGI_FMT(TAG, "FH port link up indication (0x9A)");
+                    } else {
+                        dl_cb.l1_exit_error_fn(SCF_FAPI_ERROR_INDICATION, SCF_ERROR_CODE_FH_PORT_UP, cell_idx_list, cell_count);
+                        NVLOGI_FMT(TAG, "FH port link up indication (0x9A)");
+                        dl_cb.l1_exit_error_fn(SCF_FAPI_ERROR_INDICATION, SCF_ERROR_CODE_FH_PORT_DOWN, cell_idx_list, cell_count);
+                        NVLOGI_FMT(TAG, "FH port link down indication (0x99)");
+                    }
+                } else if (new_down) {
+                    dl_cb.l1_exit_error_fn(SCF_FAPI_ERROR_INDICATION, SCF_ERROR_CODE_FH_PORT_DOWN, cell_idx_list, cell_count);
+                    NVLOGI_FMT(TAG, "FH port link down indication (0x99)");
+                } else if (new_up) {
+                    dl_cb.l1_exit_error_fn(SCF_FAPI_ERROR_INDICATION, SCF_ERROR_CODE_FH_PORT_UP, cell_idx_list, cell_count);
+                    NVLOGI_FMT(TAG, "FH port link up indication (0x9A)");
+                }
+            }
+        }
+
+        usleep(200000);  /* 200 ms poll for faster port link indication */
     }
 
     NVLOGI_FMT(TAG, "ptp_svc_monitoring thread exit");
@@ -2794,6 +2832,12 @@ void l1_copy_TB_to_gpu_buf(phydriver_handle pdh, uint16_t phy_cell_id, uint8_t *
     pdctx->enable_prepone_h2d_cpy = true;
     NVLOGI_FMT(TAG, "l1_copy_TB_to_gpu_buf pdh={} cell_id={} tb_buff={} gpu_buff_ref={} tb_len={} slot_index={}",(void*)pdh,phy_cell_id,(void*)tb_buff,(void*)gpu_buff_ref,tb_len,slot_index);
     pdctx->getPdschMpsCtx()->setCtx();
+    
+    if(pdctx->num_pdsch_buff_copy == 0)
+    {
+        CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_start(slot_index), pdctx->getH2DCpyStream()));
+    }
+    
     CUDA_CHECK(cudaMemcpyAsync((uint32_t*)(* gpu_buff_ref),
                                             tb_buff,
                                             tb_len,
@@ -2832,6 +2876,8 @@ void* l1_copy_TB_to_gpu_buf_thread_func(void* arg)
 
     //bool do_batched_memcpy = (CUPHYDRIVER_PDSCH_USE_BATCHED_COPY == 1) && (pdctx->getUseBatchedMemcpy() == 1) && (CUDA_VERSION >= 12080);
     cudaStream_t h2d_copy_stream = pdctx->getH2DCpyStream();
+    std::array<int32_t, PDSCH_MAX_GPU_BUFFS> active_batch_sfn;
+    active_batch_sfn.fill(-1);
 
     while(1)
     {
@@ -2845,6 +2891,18 @@ void* l1_copy_TB_to_gpu_buf_thread_func(void* arg)
                 NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_func pdh={} cell_id={} tb_buff={} gpu_buff_ref={} tb_len={} slot_index={} h2d_read_idx={} h2d_write_idx={}",pdh,h2d_cpy_info.phy_cell_id,(void*)h2d_cpy_info.tb_buff,(void*)h2d_cpy_info.gpu_buff_ref,h2d_cpy_info.tb_len,h2d_cpy_info.slot_index,h2d_read_idx,h2d_write_idx);
                 /*All cuda operation should happen in PDSCH context*/
                 pdctx->getPdschMpsCtx()->setCtx();
+
+                uint8_t si = h2d_cpy_info.slot_index;
+                if (batched_memcpy_helper[si].getMemcpyCount() > 0 &&
+                    active_batch_sfn[si] != static_cast<int32_t>(h2d_cpy_info.sfn))
+                {
+                    NVLOGW_FMT(TAG, "{}: Stale batch detected for slot_index={} (SFN {} vs {}), discarding {}/{} copies (slot was likely dropped)",
+                               __func__, (int)si, active_batch_sfn[si], (int)h2d_cpy_info.sfn,
+                               batched_memcpy_helper[si].getMemcpyCount(),
+                               batched_memcpy_helper[si].getMaxMemcopiesCount());
+                    batched_memcpy_helper[si].reset();
+                }
+                active_batch_sfn[si] = static_cast<int32_t>(h2d_cpy_info.sfn);
 
                 // orig memcpy had a (uint32_t*)(c->get_pdsch_tb_buffer(h2d_cpy_info.slot_index))
                 batched_memcpy_helper[h2d_cpy_info.slot_index].updateMemcpy((uint32_t*)c->get_pdsch_tb_buffer(h2d_cpy_info.slot_index),
@@ -2877,6 +2935,8 @@ void* l1_copy_TB_to_gpu_buf_thread_func(void* arg)
 
                 if (batched_memcpy_helper[slot_index].getMemcpyCount() != 0)
                 {
+                    CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_start(h2d_copy_done_cur_slot_idx), pdctx->getH2DCpyStream()));
+                    
                     NVLOGI_FMT(TAG, "Launching batched memcpy with {} copies for slot {} ", batched_memcpy_helper[slot_index].getMemcpyCount(), slot_index);
                     cuphyStatus_t status = batched_memcpy_helper[slot_index].launchBatchedMemcpy(h2d_copy_stream);
                     if (status != CUPHY_STATUS_SUCCESS)
@@ -2886,6 +2946,7 @@ void* l1_copy_TB_to_gpu_buf_thread_func(void* arg)
                     }
                     batched_memcpy_helper[slot_index].reset();
                 }
+                active_batch_sfn[slot_index] = -1;
 
                 NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_func triggering cudaEventRecord h2d_read_idx={},h2d_write_idx={}",(int)h2d_read_idx,(int)h2d_write_idx);
                 CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_complete(h2d_copy_done_cur_slot_idx), pdctx->getH2DCpyStream()));
@@ -2901,7 +2962,7 @@ void* l1_copy_TB_to_gpu_buf_thread_func(void* arg)
     return nullptr;
 }
 
-void l1_copy_TB_to_gpu_buf_thread_offload(phydriver_handle pdh, uint16_t phy_cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref, uint32_t tb_len, uint8_t slot_index)
+void l1_copy_TB_to_gpu_buf_thread_offload(phydriver_handle pdh, uint16_t phy_cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref, uint32_t tb_len, uint8_t slot_index, uint16_t sfn)
 {
     h2d_copy_prepone_info_t h2d_cpy_info;
     h2d_copy_prepone_info_t* h2d_cpy_info_pdctx;
@@ -2912,6 +2973,7 @@ void l1_copy_TB_to_gpu_buf_thread_offload(phydriver_handle pdh, uint16_t phy_cel
     h2d_cpy_info.gpu_buff_ref=gpu_buff_ref;
     h2d_cpy_info.tb_len=tb_len;
     h2d_cpy_info.slot_index=slot_index;
+    h2d_cpy_info.sfn=sfn;
     Cell* c = pdctx->getCellByPhyId(phy_cell_id);
     (*gpu_buff_ref) = (uint8_t *)c->get_pdsch_tb_buffer(slot_index);
     pdctx->enable_prepone_h2d_cpy = true;
@@ -3267,7 +3329,8 @@ void l1_exit_handler()
     if(l1_getPhydriverHandle() == nullptr)
     {
         AERIAL_PRINT_BACKTRACE(32ULL);
-        std::exit(EXIT_FAILURE); //Exit immediately
+        NVLOGW_FMT(TAG, "L1 exit handler: PhyDriver handle is null, cleanup may be incomplete");
+        return;
     }
 
 #ifdef ENABLE_DPDK_TX_PKT_TRACING
@@ -3343,7 +3406,7 @@ void l1_exit_handler()
             std::fflush(nullptr);
             asm volatile("" : : : "memory"); //Memory barrier inserted here to prevent compiler from reordering and thereby prematurely triggering the system abort before SCF_ERROR_CODE_L1_P2_EXIT_ERROR is sent to L2
             AERIAL_PRINT_BACKTRACE(trace_cnt_max);
-            std::abort();
+            return;
         }
         else
         {
@@ -3351,7 +3414,7 @@ void l1_exit_handler()
             asm volatile("" : : : "memory"); //Memory barrier inserted here to prevent compiler from reordering
             MemtraceDisableScope md;
             AERIAL_PRINT_BACKTRACE(trace_cnt_max);
-            std::exit(EXIT_FAILURE); //Exit immediately
+            return;
         }
     }
     else // core dump set to 0
@@ -3360,7 +3423,7 @@ void l1_exit_handler()
         asm volatile("" : : : "memory"); //Memory barrier inserted here to prevent compiler from reordering
         MemtraceDisableScope md;
         AERIAL_PRINT_BACKTRACE(trace_cnt_max);
-        std::exit(EXIT_FAILURE); //Exit immediately
+        return;
     }
 }
 

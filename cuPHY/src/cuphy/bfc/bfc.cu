@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,9 +16,9 @@
  */
 
 #include <algorithm>
-#include "cuComplex.h"
 #include <cooperative_groups.h>
 #include "bfc.hpp"
+#include "cuphy_complex_ops.cuh"
 #include "cuphy.hpp"
 #include "type_convert.hpp"
 #include "bfw_blockFP.cuh"
@@ -30,7 +30,16 @@ namespace bfw_coefComp
 {
 // #define ENABLE_DEBUG
 
-static constexpr uint32_t N_THREADS_PER_WARP = 32; // cudaDeviceProp::warpSize;
+/*VCAST_DONT_INSTRUMENT_START*/
+
+// Import types from cuphy_cmplx (explicit declarations to avoid ambiguity)
+using cuphy_cmplx::tensor_ref;
+using cuphy_cmplx::block_1D;
+using cuphy_cmplx::block_2D;
+using cuphy_cmplx::block_3D;
+
+// Import functions and operators from cuphy_cmplx
+using namespace cuphy_cmplx;
 
 template <typename TElem, int NDim>
 struct tensor_ref_v0
@@ -93,202 +102,8 @@ struct tensor_ref_v0
     CUDA_BOTH size_t num_elem() { return n_elem; };
 };
 
-template <typename TElem>
-struct tensor_ref
-{
-    TElem*         pAddr;
-    const int32_t* strides;
-
-    CUDA_BOTH
-    tensor_ref(void* pAddr, const int32_t* pStrides) :
-        pAddr(static_cast<TElem*>(pAddr)),
-        strides(pStrides)
-    {
-    }
-    CUDA_BOTH int offset(int i0) const
-    {
-        return (strides[0] * i0);
-    }
-    CUDA_BOTH int offset(int i0, int i1) const
-    {
-        return (strides[0] * i0) + (strides[1] * i1);
-    }
-    CUDA_BOTH int offset(int i0, int i1, int i2) const
-    {
-        return (strides[0] * i0) + (strides[1] * i1) + (strides[2] * i2);
-    };
-    CUDA_BOTH int offset(int i0, int i1, int i2, int i3) const
-    {
-        return (strides[0] * i0) + (strides[1] * i1) + (strides[2] * i2) + (strides[3] * i3);
-    };
-    CUDA_BOTH int offset(int i0, int i1, int i2, int i3, int i4) const
-    {
-        return (strides[0] * i0) + (strides[1] * i1) + (strides[2] * i2) + (strides[3] * i3) + (strides[4] * i4);
-    };    
-    // clang-format off
-    CUDA_BOTH TElem&       operator()(int i0)                                 { return *(pAddr + offset(i0));                 }
-    CUDA_BOTH TElem&       operator()(int i0, int i1)                         { return *(pAddr + offset(i0, i1));             }
-    CUDA_BOTH TElem&       operator()(int i0, int i1, int i2)                 { return *(pAddr + offset(i0, i1, i2));         }
-    CUDA_BOTH TElem&       operator()(int i0, int i1, int i2, int i3)         { return *(pAddr + offset(i0, i1, i2, i3));     }
-    CUDA_BOTH TElem&       operator()(int i0, int i1, int i2, int i3, int i4) { return *(pAddr + offset(i0, i1, i2, i3, i4)); }
-
-    CUDA_BOTH const TElem& operator()(int i0) const                                 { return *(pAddr + offset(i0));                 }
-    CUDA_BOTH const TElem& operator()(int i0, int i1) const                         { return *(pAddr + offset(i0, i1));             }
-    CUDA_BOTH const TElem& operator()(int i0, int i1, int i2) const                 { return *(pAddr + offset(i0, i1, i2));         }
-    CUDA_BOTH const TElem& operator()(int i0, int i1, int i2, int i3) const         { return *(pAddr + offset(i0, i1, i2, i3));     }
-    CUDA_BOTH const TElem& operator()(int i0, int i1, int i2, int i3, int i4) const { return *(pAddr + offset(i0, i1, i2, i3, i4)); }
-
-    // clang-format on
-#if 0    
-    if(std::is_const<TElem>::value) {
-      CUDA_BOTH const TElem& operator()(int i0) const                         { return __ldg(addr + offset(i0));         }
-      CUDA_BOTH const TElem& operator()(int i0, int i1) const                 { return __ldg(addr + offset(i0, i1));     }
-      CUDA_BOTH const TElem& operator()(int i0, int i1, int i2) const         { return __ldg(addr + offset(i0, i1, i2)); }
-      CUDA_BOTH const TElem& operator()(int i0, int i1, int i2, int i3) const { return __ldg(addr + offset(i0, i1, i2, i3)); }
-    }
-    else {
-      CUDA_BOTH const TElem& operator()(int i0) const                         { return *(addr + offset(i0));         }
-      CUDA_BOTH const TElem& operator()(int i0, int i1) const                 { return *(addr + offset(i0, i1));     }
-      CUDA_BOTH const TElem& operator()(int i0, int i1, int i2) const         { return *(addr + offset(i0, i1, i2)); }
-      CUDA_BOTH const TElem& operator()(int i0, int i1, int i2, int i3) const { return *(addr + offset(i0, i1, i2, i3)); }
-    }
-#endif
-};
-
-template <typename T, int M>
-struct block_1D
-{
-    T         data[M];
-    CUDA_BOTH T& operator()(int idx) { return data[idx]; }
-};
-
-template <typename T, int M, int N>
-struct block_2D
-{
-    T         data[M * N];
-    CUDA_BOTH T& operator()(int m, int n) { return data[(n * M) + m]; }
-};
-
-template <typename T, int L, int M, int N>
-struct block_3D
-{
-    T         data[L * M * N];
-    CUDA_BOTH T& operator()(int l, int m, int n) { return data[((n * M) + m) * L + l]; }
-};
-
-// Partial specialization of block_1D to use shared memory pointers
-template <typename T, int M>
-struct block_1D<T*, M>
-{
-    CUDA_BOTH block_1D(T* pData) :
-        m_pData(pData){}; // static_assert(std::is_pointer<T>::value, "Must be a pointer type")
-    block_1D()                    = delete;
-    block_1D(block_1D const& blk) = delete;
-    CUDA_BOTH block_1D& operator  =(block_1D const& block) { m_pData = block.m_pData; };
-    ~block_1D()                   = default;
-
-    CUDA_BOTH T&               operator()(int idx) { return m_pData[idx]; }
-    static constexpr CUDA_BOTH size_t num_elem() { return M; }
-
-private:
-    T* m_pData = nullptr;
-};
-
-// Partial specialization of block_2D to use shared memory pointers
-template <typename T, int M, int N>
-struct block_2D<T*, M, N>
-{
-    CUDA_BOTH block_2D(T* pData) :
-        m_pData(pData){};
-    block_2D()                    = delete;
-    block_2D(block_2D const& blk) = delete;
-    CUDA_BOTH block_2D& operator  =(block_2D const& block) { m_pData = block.m_pData; };
-    ~block_2D()                   = default;
-
-    CUDA_BOTH T&               operator()(int m, int n) { return m_pData[(n * M) + m]; }
-    static constexpr CUDA_BOTH size_t num_elem() { return M * N; }
-
-private:
-    T* m_pData = nullptr;
-};
-
-// Partial specialization of block_3D to use shared memory pointers
-template <typename T, int L, int M, int N>
-struct block_3D<T*, L, M, N>
-{
-    CUDA_BOTH block_3D(T* pData) :
-        m_pData(pData){};
-    block_3D()                    = delete;
-    block_3D(block_3D const& blk) = delete;
-    CUDA_BOTH block_3D& operator  =(block_3D const& block) { m_pData = block.m_pData; };
-    ~block_3D()                   = default;
-
-    CUDA_BOTH T&               operator()(int l, int m, int n) { return m_pData[((n * M) + m) * L + l]; }
-    static constexpr CUDA_BOTH size_t num_elem() { return L * M * N; }
-
-private:
-    T* m_pData = nullptr;
-};
-
-// clang-format off
-template <typename T> CUDA_BOTH_INLINE T         cuGet(int);
-// template<>            CUDA_BOTH_INLINE __half    cuGet(int x) { return(__half(x)); }
-template<>            CUDA_BOTH_INLINE float     cuGet(int x) { return(float(x)); }
-// template<>            CUDA_BOTH_INLINE __half2 cuGet(int x) { return(make_cuComplex(float(x), 0.0f)); }
-template<>            CUDA_BOTH_INLINE cuComplex cuGet(int x) { return(make_cuComplex(float(x), 0.0f)); }
-// template<>             CUDA_BOTH_INLINE __half2 cuGet(int x) { return __halves2half2(__half(x), __half(0)); }
-
-template <typename T> CUDA_BOTH_INLINE T         cuGet(float);
-template<>            CUDA_BOTH_INLINE float     cuGet(float x) { return(float(x)); }
-template<>            CUDA_BOTH_INLINE cuComplex cuGet(float x) { return(make_cuComplex(x, 0.0f)); }
-
-template <typename T> CUDA_BOTH_INLINE T         cuAbs(T);
-template<>            CUDA_BOTH_INLINE float     cuAbs(float x) { return(fabsf(x)); }
-
-template <typename T> CUDA_INLINE T         cuRSqrt(T);
-template<>            CUDA_INLINE float     cuRSqrt(float x) { return(rsqrtf(x)); }
-template<>            CUDA_INLINE half      cuRSqrt(half x)  { return(hrsqrt(x)); }
-
-static CUDA_BOTH_INLINE float     cuReal(cuComplex x)                   { return(cuCrealf(x)); }
-static CUDA_BOTH_INLINE float     cuImag(cuComplex x)                   { return(cuCimagf(x)); }
-static CUDA_BOTH_INLINE cuComplex cuConj(cuComplex x)                   { return(cuConjf(x)); }
-static CUDA_BOTH_INLINE cuComplex operator*(cuComplex x, float y)       { return(make_cuComplex(cuCrealf(x)*y, cuCimagf(x)*y)); }
-static CUDA_BOTH_INLINE cuComplex operator*(float x, cuComplex y)       { return(make_cuComplex(cuCrealf(y)*x, cuCimagf(y)*x)); }
-static CUDA_BOTH_INLINE cuComplex operator*(cuComplex x, cuComplex y)   { return(cuCmulf(x, y)); }
-static CUDA_BOTH_INLINE cuComplex operator+=(cuComplex &x, cuComplex y) { x = cuCaddf(x, y); return x; };
-static CUDA_BOTH_INLINE cuComplex cuFma(cuComplex x, cuComplex y, cuComplex a) { return cuCfmaf(x,y,a); }// a = (x*y) + a;
-
-#if 0
-static CUDA_BOTH_INLINE cuComplex operator-(cuComplex x, cuComplex y)   { return(cuCsubf(x, y)); }
-static CUDA_BOTH_INLINE cuComplex operator+=(cuComplex &x, float y)     { x = make_cuComplex(cuCrealf(x) + y, cuCimagf(x)); return x; }
-static CUDA_BOTH_INLINE cuComplex operator*=(cuComplex &x, float y)     { x = make_cuComplex(cuCrealf(x)*y, cuCimagf(x)*y); return x; }
-static CUDA_BOTH_INLINE float cuCRmul(cuComplex x, cuComplex y) { return((cuCrealf(x) * cuCrealf(y)) - (cuCimagf(x) * cuCimagf(y))); }
-static CUDA_BOTH_INLINE float cuCImul(cuComplex x, cuComplex y) { return((cuCrealf(x) * cuCimagf(y)) + (cuCimagf(x) * cuCrealf(y))); }
-static CUDA_BOTH_INLINE cuComplex cuNeg(cuComplex x)                  { return(make_cuComplex(-cuCrealf(x), -cuCimagf(x))); }
-static CUDA_BOTH_INLINE cuComplex cuAdd(cuComplex x, cuComplex y)       { return(cuCaddf(x, y)); }
-static CUDA_BOTH_INLINE cuComplex cuMul(cuComplex x, cuComplex y)       { return(cuCmulf(x, y)); }
-static CUDA_BOTH_INLINE cuComplex cuDiv(cuComplex x, cuComplex y)       { return(cuCdivf(x, y)); }
-static CUDA_BOTH_INLINE cuComplex operator+(cuComplex x, cuComplex y)   { return(cuCaddf(x, y)); }
-static CUDA_BOTH_INLINE cuComplex operator-=(cuComplex x, cuComplex y)  { return(cuCsubf(x, y)); }
-static CUDA_BOTH_INLINE cuComplex operator*(cuComplex x, cuComplex y)   { return(cuCmulf(x, y)); }
-static CUDA_BOTH_INLINE cuComplex operator/(cuComplex x, float y)       { return(make_cuComplex(cuCrealf(x)/y, cuCimagf(x)/y)); }
-static CUDA_BOTH_INLINE cuComplex operator*=(cuComplex &x, cuComplex y) { x = cuCmulf(x, y); return x; };
-static CUDA_BOTH_INLINE cuComplex operator/=(cuComplex &x, float y)     { x = make_cuComplex(cuCrealf(x)/y, cuCimagf(x)/y); return x; }
-
-// cuda_fp16.hpp
-//__device__ __forceinline__ __half operator*(const __half &lh, const __half &rh) { return __hmul(lh, rh); }  
-// __device__ __forceinline__ __half2& operator*=(__half2 &lh, const __half2 &rh) { lh = __hmul2(lh, rh); return lh; } 
-
-// static CUDA_BOTH_INLINE __half2 cuConj(__half2 &hc) { __half2 t; t.x = hc.x; t.y = -hc.y; return t; }
-// static CUDA_BOTH_INLINE __half2 cuGet(int x) {  __half2 t; t.x = __half(x); t.y = __float2half(0.0f); return t; } 
-#endif
-// clang-format on
-
-template <typename T>
-CUDA_BOTH_INLINE constexpr T div_round_up(T val, T divide_by)
-{
-    return ((val + (divide_by - 1)) / divide_by);
-}
+// Note: tensor_ref, block_1D, block_2D, block_3D, cuGet, cuAbs, cuRSqrt, div_round_up
+// are now provided by cuphy_complex_ops.cuh
 
 template <typename TStorageIn,
           typename TCompute,
@@ -324,6 +139,7 @@ __device__ __forceinline__ void cmplxMatLoadColMjr(thread_block const&          
         }
     }
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 template <typename TStorageIn,
           typename TCompute,
@@ -404,6 +220,7 @@ __device__ __forceinline__ void cmplxMatStore_v0(thread_block const&            
     }
 }
 
+/*VCAST_DONT_INSTRUMENT_START*/
 template <typename TStorageOut,
           typename TCompute,
           uint32_t N_ROWS_MAT,
@@ -440,7 +257,9 @@ __device__ __forceinline__ void cmplxMatStore(thread_block const&               
         }
     }
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
+/*VCAST_DONT_INSTRUMENT_START*/
 template <uint32_t THRD_GRP_SIZE>
 __device__ __forceinline__
     __half2
@@ -456,6 +275,7 @@ __device__ __forceinline__
     thisThrdGrp.sync();
     return sum;
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 template <uint32_t THRD_GRP_SIZE>
 __device__ __forceinline__
@@ -473,6 +293,7 @@ __device__ __forceinline__
     return sum;
 }
 
+/*VCAST_DONT_INSTRUMENT_START*/
 template <uint32_t THRD_GRP_SIZE>
 __device__ __forceinline__ __half
 thrdGrpAllReduceSum(thread_block_tile<THRD_GRP_SIZE> const& thisThrdGrp, __half const& val)
@@ -486,6 +307,7 @@ thrdGrpAllReduceSum(thread_block_tile<THRD_GRP_SIZE> const& thisThrdGrp, __half 
     thisThrdGrp.sync();
     return sum;
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 template <uint32_t THRD_GRP_SIZE>
 __device__ __forceinline__ float
@@ -553,7 +375,7 @@ __device__ __forceinline__ void luFactorizeIter(thread_block const&             
 #ifdef ENABLE_DEBUG
                 printf("After storing multiplier: A[%d][%d] = %f+j%f\n", i, k, Aik.x, Aik.y);
 #endif
-                matA(i, THRD_ABS_IDX) = cuFma(Aik, matA(k, THRD_ABS_IDX), matA(i, THRD_ABS_IDX));
+                matA(i, THRD_ABS_IDX) = cuCma(Aik, matA(k, THRD_ABS_IDX), matA(i, THRD_ABS_IDX));
 
 #ifdef ENABLE_DEBUG
                 printf("A[%d][%d] = %f+j%f\n", i, THRD_ABS_IDX, matA(i, THRD_ABS_IDX).x, matA(i, THRD_ABS_IDX).y);
@@ -648,7 +470,7 @@ __device__ __forceinline__ void luFactorizeParallel_v1(thread_block const&      
                 // if((THRD_ABS_IDX > k) && (THRD_ABS_IDX < N_COLS_MAT))
                 if(matColIdx < N_COLS_MAT)
                 {
-                    matA(matRowIdx, matColIdx) = cuFma(Aik, matA(k, matColIdx), matA(matRowIdx, matColIdx));
+                    matA(matRowIdx, matColIdx) = cuCma(Aik, matA(k, matColIdx), matA(matRowIdx, matColIdx));
 
 #ifdef ENABLE_DEBUG
                     printf("A[%d][%d] = %f+j%f\n", matRowIdx, matColIdx, matA(matRowIdx, matColIdx).x, matA(matRowIdx, matColIdx).y);
@@ -680,6 +502,8 @@ __device__ __forceinline__ void luFactorizeParallel_v1(thread_block const&      
     }
 }
 
+// luFactorizeParallel_v2 not used in the current implementation
+/*VCAST_DONT_INSTRUMENT_START*/
 // Inplace LU factorization of Matrix - Parallel version (entire sub-matrix update done one in parallel)
 // - Parallel version maybe used (over iterative version) if the thread block size is much larger than the
 // length of a row (i.e. N_COLS_MAT) of the augmented matrix resulting in fewer inactive threads during LU factorization.
@@ -753,7 +577,7 @@ __device__ __forceinline__ void luFactorizeParallel_v2(thread_block const&      
 #endif
                 // Perform Gaussian elimination:
                 // linear combination of row k and row i starting from column element k+1:N_COLS_A
-                matA(matRowIdx, matColIdx) = cuFma(Aik, matA(k, matColIdx), matA(matRowIdx, matColIdx));
+                matA(matRowIdx, matColIdx) = cuCma(Aik, matA(k, matColIdx), matA(matRowIdx, matColIdx));
 
 #ifdef ENABLE_DEBUG
                 printf("A[%d][%d] = %f+j%f\n", matRowIdx, matColIdx, matA(matRowIdx, matColIdx).x, matA(matRowIdx, matColIdx).y);
@@ -772,6 +596,7 @@ __device__ __forceinline__ void luFactorizeParallel_v2(thread_block const&      
         thisThrdBlk.sync();
     }
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 // BeamFormingCancellation (BFC) coefficient computation kernel
 // {N_LAYERS, N_BS_ANTS} = {16,64}
@@ -852,10 +677,10 @@ bfc_mmse_coef_comp_kernel_v0(tensor_ref_v0<const typename complex_from_scalar<TS
 
     // Iterations to compute one element of G. Each thread group computes the inner product needed to produce
     // one element of G
-    constexpr uint32_t N_INNER_ITER_TO_COMP_G_ELEM = div_round_up(N_COLS_H, N_THRDS_PER_GRP);
+    constexpr uint32_t N_INNER_ITER_TO_COMP_G_ELEM = div_round_up_cexp(N_COLS_H, N_THRDS_PER_GRP);
 
     // Each thread group computes one element of G per outer loop iteration
-    constexpr uint32_t N_OUTER_ITER_TO_COMP_G = div_round_up(N_TRI_ELEMS_G, N_THRD_GRPS_PER_THRD_BLK);
+    constexpr uint32_t N_OUTER_ITER_TO_COMP_G = div_round_up_cexp(N_TRI_ELEMS_G, N_THRD_GRPS_PER_THRD_BLK);
 
     // Each thrdGrp computes either part of or whole column of C
     constexpr uint32_t N_MAX_INNER_ITER_TO_COMP_C = N_ROWS_LINV;
@@ -866,7 +691,7 @@ bfc_mmse_coef_comp_kernel_v0(tensor_ref_v0<const typename complex_from_scalar<TS
     
     // Number of iterations to compute Frobeius norm
     constexpr uint32_t N_INNER_ITER_TO_COMP_FNORM = N_ROWS_C / N_THRDS_PER_GRP;
-    constexpr uint32_t N_OUTER_ITER_TO_COMP_FNORM = div_round_up(N_COLS_C, N_THRD_GRPS_PER_THRD_BLK);
+    constexpr uint32_t N_OUTER_ITER_TO_COMP_FNORM = div_round_up_cexp(N_COLS_C, N_THRD_GRPS_PER_THRD_BLK);
 
     //--------------------------------------------------------------------------------------------------------
     // Compute indices used for element access
@@ -989,7 +814,7 @@ bfc_mmse_coef_comp_kernel_v0(tensor_ref_v0<const typename complex_from_scalar<TS
         for(uint32_t j = 0; j < N_INNER_ITER_TO_COMP_G_ELEM; ++j)
         {
             uint32_t        iElem = (j * N_THRDS_PER_GRP) + THRD_IDX;
-            TComplexCompute prod  = shH(iGRow, iElem) * cuConj(shH(iGCol, iElem));
+            TComplexCompute prod  = cuCmul(shH(iGRow, iElem), cuConj(shH(iGCol, iElem)));
             G += thrdGrpAllReduceSum<N_THRDS_PER_GRP>(thrdGrp, prod);
         }
 
@@ -1104,7 +929,7 @@ bfc_mmse_coef_comp_kernel_v0(tensor_ref_v0<const typename complex_from_scalar<TS
             TComplexCompute DinvLinv = shDinv(iElem) * shLinv(iElem, iCCol);
 
             // Multiply F'*(inv(D)*inv(L))
-            C = cuFma(cuConj(shF(iElem, C_ROW_IDX)), DinvLinv, C);
+            C = cuCma(cuConj(shF(iElem, C_ROW_IDX)), DinvLinv, C);
         }
         // TCompute absCSqr = cuReal(cuConj(C) * C);
         // atomicAdd(&shCFrobeniusNorm, absCSqr);
@@ -1138,7 +963,7 @@ bfc_mmse_coef_comp_kernel_v0(tensor_ref_v0<const typename complex_from_scalar<TS
             if((iRowC < N_ROWS_C) && (iColC < N_COLS_C))
             {
                 TComplexCompute C = shC(iRowC, iColC);
-                absCSqr = cuReal(cuConj(C) * C);
+                absCSqr = cuReal(C) * cuReal(C) + cuImag(C) * cuImag(C);
             }
             absCSqrSum += thrdGrpAllReduceSum<N_THRDS_PER_GRP>(thrdGrp, absCSqr);
         }
@@ -1195,7 +1020,7 @@ bfc_mmse_coef_comp_kernel_launch(uint32_t           Nprb,
 {
     constexpr uint32_t N_THRDS_PER_GRP            = N_THREADS_PER_WARP;
     constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK_1 = N_LAYERS/2; // Large layer count (e.g. 8,16)
-    constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK_2 = div_round_up(N_BS_ANTS+2*N_LAYERS, N_THRDS_PER_GRP); // Small layer count (e.g. 2,4)
+    constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK_2 = div_round_up_cexp(N_BS_ANTS+2*N_LAYERS, N_THRDS_PER_GRP); // Small layer count (e.g. 2,4)
 
     constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK = (N_THRD_GRPS_PER_THRD_BLK_1 > N_THRD_GRPS_PER_THRD_BLK_2) ? N_THRD_GRPS_PER_THRD_BLK_1 : N_THRD_GRPS_PER_THRD_BLK_2;
 
@@ -1483,26 +1308,17 @@ __device__ __forceinline__ void srsChEstLoadRowMjr(thread_block const&          
             // Gather SRS channel estimates from different layers of potentially different UEs
             tensor_ref<const TComplexStorageIn> tSrsChEst(bfLayerPrm.tInfoSrsChEst.pAddr, bfLayerPrm.tInfoSrsChEst.strides); // (N_PRB_GRP, N_GNB_ANTS, N_LAYERS)
             
-            uint16_t srsPrgIdx = iSrcPrbGrp + bfLayerPrm.chEstInfoStartPrbGrp;
-            uint16_t startValidPrg = bfLayerPrm.startValidPrg;
-            uint16_t nValidPrg     = bfLayerPrm.nValidPrg;
-            if((srsPrgIdx>=startValidPrg)&&(srsPrgIdx<(startValidPrg+nValidPrg)))
-            {
-                iSrcPrbGrp = srsPrgIdx -  bfLayerPrm.chEstInfoStartPrbGrp;
-            }
-            else if(srsPrgIdx<startValidPrg)
-            {
-                iSrcPrbGrp = startValidPrg -  bfLayerPrm.chEstInfoStartPrbGrp;  
-            }
-            else if(srsPrgIdx>=(startValidPrg+nValidPrg))
-            {
-                iSrcPrbGrp = startValidPrg+nValidPrg-1-bfLayerPrm.chEstInfoStartPrbGrp;
-            }
+            // Clamp srsPrgIdx to valid range and compute iSrcPrbGrp
+            const uint16_t srsPrgIdx     = iSrcPrbGrp + bfLayerPrm.chEstInfoStartPrbGrp;
+            const uint16_t startValidPrg = bfLayerPrm.startValidPrg;
+            const uint16_t endValidPrg   = startValidPrg + bfLayerPrm.nValidPrg - 1;
+            iSrcPrbGrp = max(startValidPrg, min(srsPrgIdx, endValidPrg)) - bfLayerPrm.chEstInfoStartPrbGrp;
 
             // The last PRB group will not be populated with group size of 2 since SRS will not occupy 
             // the final odd PRB so we copy the previous channel estimate
-            shSrsChEst(iRow, iCol) =
-                type_convert<TComplexCompute>(tSrsChEst(iSrcPrbGrp-(iSrcPrbGrp==MAX_PRB_GRP_IDX), iCol, iSrcRow));
+            // Use __ldg() for read-only cached access (texture cache path) - better for scattered reads
+            const TComplexStorageIn* srcPtr = &tSrsChEst(iSrcPrbGrp-(iSrcPrbGrp==MAX_PRB_GRP_IDX), iCol, iSrcRow);
+            shSrsChEst(iRow, iCol) = type_convert<TComplexCompute>(__ldg(srcPtr));
 
 #ifdef ENABLE_DEBUG
             printf("Mat[%d][%d][%d] = %f+j%f\n", iPrbGrp, iRow, iCol, shSrsChEst(iRow, iCol).x, shSrsChEst(iRow, iCol).y);
@@ -1523,7 +1339,7 @@ template <typename TStorageIn,
           uint32_t N_LAYERS,  // # of layers (# of cols in H matrix)
           uint32_t N_THRD_GRPS_PER_THRD_BLK,
           uint32_t N_THRDS_PER_GRP>
-__global__ void
+__global__ void //__launch_bounds__(N_THRDS_PER_GRP * N_THRD_GRPS_PER_THRD_BLK, 2048 / (N_THRDS_PER_GRP * N_THRD_GRPS_PER_THRD_BLK))
 bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr_t* pDynDescr)
 {
     //--------------------------------------------------------------------------------------------------------
@@ -1613,10 +1429,10 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
 
     // Iterations to compute one element of G. Each thread group computes the inner product needed to produce
     // one element of G
-    constexpr uint32_t N_INNER_ITER_TO_COMP_G_ELEM = div_round_up(N_COLS_H, N_THRDS_PER_GRP);
+    constexpr uint32_t N_INNER_ITER_TO_COMP_G_ELEM = div_round_up_cexp(N_COLS_H, N_THRDS_PER_GRP);
 
     // Each thread group computes one element of G per outer loop iteration
-    constexpr uint32_t N_OUTER_ITER_TO_COMP_G = div_round_up(N_TRI_ELEMS_G, N_THRD_GRPS_PER_THRD_BLK);
+    constexpr uint32_t N_OUTER_ITER_TO_COMP_G = div_round_up_cexp(N_TRI_ELEMS_G, N_THRD_GRPS_PER_THRD_BLK);
 
     //--------------------------------------------------------------------------------------------------------
     // Compute indices used for element access
@@ -1632,7 +1448,7 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
     const uint32_t COL_IDX_I = THRD_ABS_IDX / N_ROWS_I;
 
     //--------------------------------------------------------------------------------------------------------
-    // Shared memory allocation
+    // Shared memory allocation (all dynamic to avoid per-instantiation static memory bloat)
     // H[N_TONES_PER_ITER*N_INST]
 
     // Shared memory contents as processing progresses:
@@ -1640,26 +1456,35 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
 
     constexpr uint32_t N_SMEM_R_ELEMS = N_ROWS_R;
     constexpr uint32_t N_SMEM_A_ELEMS = (N_ROWS_A + 1) * N_COLS_A; // (N_ROWS_A + 1) for SMEM padding to avoid bank conflicts
-#ifndef ENABLE_32DL
     constexpr uint32_t N_SMEM_C_ELEMS = (N_ROWS_C + 1) * N_COLS_C; // (N_ROWS_C + 1) for SMEM padding to avoid bank conflicts
-#endif
 
     typedef typename complex_from_scalar<TCompute>::type    TComplexCompute;
     typedef typename complex_from_scalar<TStorageIn>::type  TComplexStorageIn;
     typedef typename complex_from_scalar<TStorageOut>::type TComplexStorageOut;
 
-    __shared__ TCompute smemBlkR[N_SMEM_R_ELEMS];
-#ifdef ENABLE_32DL
-    extern __shared__ TComplexCompute smemBlkAC[];
-    TComplexCompute* smemBlkA = smemBlkAC;
-    TComplexCompute* smemBlkC = &(smemBlkAC[N_SMEM_A_ELEMS]);
-#else
-     __shared__ TComplexCompute smemBlkA[N_SMEM_A_ELEMS];
-     __shared__ TComplexCompute smemBlkC[N_SMEM_C_ELEMS];
-#endif
-    __shared__ TCompute shCFrobeniusNorm;
-    __shared__ TCompute layerScalingFactors[N_SMEM_R_ELEMS];
-    __shared__ TCompute antEnergies[N_ROWS_C];
+    // Dynamic shared memory layout:
+    // [smemBlkA: N_SMEM_A_ELEMS * TComplexCompute]
+    // [smemBlkC: N_SMEM_C_ELEMS * TComplexCompute]
+    // [smemBlkR: N_SMEM_R_ELEMS * TCompute]
+    // [layerScalingFactors: N_SMEM_R_ELEMS * TCompute]
+    // [antEnergies: N_ROWS_C * TCompute]
+    // [shCFrobeniusNorm: 1 * TCompute]
+    extern __shared__ char sharedMemory[];
+
+    // Compute offsets with proper alignment (TComplexCompute is 8 bytes for float2)
+    constexpr size_t OFFSET_A = 0;
+    constexpr size_t OFFSET_C = OFFSET_A + N_SMEM_A_ELEMS * sizeof(TComplexCompute);
+    constexpr size_t OFFSET_R = OFFSET_C + N_SMEM_C_ELEMS * sizeof(TComplexCompute);
+    constexpr size_t OFFSET_LAYER_SCALING = OFFSET_R + N_SMEM_R_ELEMS * sizeof(TCompute);
+    constexpr size_t OFFSET_ANT_ENERGIES = OFFSET_LAYER_SCALING + N_SMEM_R_ELEMS * sizeof(TCompute);
+    constexpr size_t OFFSET_FROBENIUS = OFFSET_ANT_ENERGIES + N_ROWS_C * sizeof(TCompute);
+
+    TComplexCompute* smemBlkA = reinterpret_cast<TComplexCompute*>(sharedMemory + OFFSET_A);
+    TComplexCompute* smemBlkC = reinterpret_cast<TComplexCompute*>(sharedMemory + OFFSET_C);
+    TCompute* smemBlkR = reinterpret_cast<TCompute*>(sharedMemory + OFFSET_R);
+    TCompute* layerScalingFactors = reinterpret_cast<TCompute*>(sharedMemory + OFFSET_LAYER_SCALING);
+    TCompute* antEnergies = reinterpret_cast<TCompute*>(sharedMemory + OFFSET_ANT_ENERGIES);
+    TCompute& shCFrobeniusNorm = *reinterpret_cast<TCompute*>(sharedMemory + OFFSET_FROBENIUS);
 
     constexpr uint32_t            SMEM_START_OFFSET_R = 0;
     block_1D<TCompute*, N_ROWS_R> shR(&smemBlkR[SMEM_START_OFFSET_R]);
@@ -1758,7 +1583,7 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
             for(uint32_t j = 0; j < N_INNER_ITER_TO_COMP_G_ELEM; ++j)
             {
              	uint32_t        iElem = (j * N_THRDS_PER_GRP) + THRD_IDX;
-                TComplexCompute prod  = shH(iGRow, iElem) * cuConj(shH(iGCol, iElem));
+                TComplexCompute prod  = cuCmul(shH(iGRow, iElem), cuConj(shH(iGCol, iElem)));
                 G += thrdGrpAllReduceSum<N_THRDS_PER_GRP>(thrdGrp, prod);
             }
 
@@ -1782,116 +1607,51 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
     }
     else {
 
-        // For the case of N_LAYERS >= 4, there are sufficient independent elements (min 10) of G to parallelize over.  As well, multiple threads can be
-        // assigned to an element of G.  The final reduction is performed using atomicAdd in shared, which is relatively slow.  So the max # of threads 
-        // pere element is capped.  However, in practice, N_LAYERS == 8 uses only 3 'batches', so there are relatively few atomicAdds performed.
-
-        // The serial sum (in this case) has poor accuracy properties relative to the parallel reduction (for the case of N_LAYERS <4).  For the case of
-        // fp32, the SNR were, on average -0.578 dB lower than reference.  
-        //      cuphy_ex_bfc -i .../BFW/TV_list_bfw_8cell_3slot_32Rx.yaml -r 1 -c -m 1
-        // To remedy this, a version was written which would perform the accumulation in double-precision.  This resulted in an average SNR of +0.095 dB.
-        // However, the fp64 version required an additional 8 registers.  As that seems more important at this time than -.578 dB, the fp32 version is
-        // used here.
-
-        // The fp64 version actually faster for some kernels.  This might be because the greater # of registers results in less occupancy and better
-        // l1, l2 hit rates?  Retained as comment for future evaluation.
+        // Single-pass Gram matrix computation: each thread computes one full element of G.
+        // For small N_BS_ANTS (e.g., <= 64), the inner product over K=N_BS_ANTS provides
+        // sufficient work per thread for latency hiding, eliminating the need for batching,
+        // atomicAdds, and extra barriers.
 
         TComplexCompute g;
         
-        // Compute the batches.
-        constexpr uint32_t HALF_G_ELEMS = (N_LAYERS*N_LAYERS + N_LAYERS)/2;         // lower triangular, including diagonal.
-        constexpr uint32_t N_THREADS = N_THRDS_PER_GRP*N_THRD_GRPS_PER_THRD_BLK;
-        constexpr uint32_t N_BATCHES1 = N_THREADS / HALF_G_ELEMS;
-        const uint32_t N_BATCHES = N_BATCHES1 <= 8 ? N_BATCHES1 : 8;
-        const uint32_t BATCH_SIZE = (N_BS_ANTS+N_BATCHES-1)/N_BATCHES;
-        const uint32_t batch = THRD_ABS_IDX/HALF_G_ELEMS;
+        // Lower triangular element count (including diagonal)
+        constexpr uint32_t HALF_G_ELEMS = (N_LAYERS*N_LAYERS + N_LAYERS)/2;
 
-        // Assign each thread to a cell of G.
-        const uint32_t i = THRD_ABS_IDX - batch * HALF_G_ELEMS;
-        const uint32_t irow = (sqrtf(1+8*i)-1)/2;
-        const uint32_t icol = i-(irow*irow+irow)/2;
-        uint32_t kstart = batch * BATCH_SIZE;
-        uint32_t kend = (batch+1)*BATCH_SIZE;
-        if ( batch == N_BATCHES-1 ) kend = N_BS_ANTS;
-        if ( batch >= N_BATCHES ) {
-            kstart = 0;
-            kend = 0;
+        // Each thread maps to one element of G; only first HALF_G_ELEMS threads participate
+        const uint32_t i = THRD_ABS_IDX;
+        const bool participates = (i < HALF_G_ELEMS);
+
+        // Compute (irow, icol) from linear index i
+        // For lower triangular: i = irow*(irow+1)/2 + icol, solve for irow, icol
+        uint32_t irow = 0, icol = 0;
+        if (participates) {
+            irow = (uint32_t)((sqrtf(1.0f + 8.0f*i) - 1.0f) * 0.5f);
+            icol = i - (irow*irow + irow)/2;
         }
 
-        // use batch zero to initialize lower triangular to zero.
-        if ( batch == 0 ) {
-            shG(irow,icol) = cuGet<TComplexCompute>(0);
+        // Single-pass: each thread computes full k=0..N_BS_ANTS inner product
+        g = cuGet<TComplexCompute>(0);
+        if (participates) {
+            for (int k = 0; k < N_BS_ANTS; ++k) {
+                g = cuCma(shH(irow,k), cuConj(shH(icol,k)), g);
+            }
+            
+            // Direct store - no atomics needed since each element has exactly one writer
+            // For diagonal, imaginary part is mathematically zero (Hermitian property)
+            shG(irow, icol) = g;
         }
 
-        // Sync threads to ensure shG is initialized to zero before atomic adds
+        // Sync before upper triangular mirror and diagonal update
         thisThrdBlk.sync();
 
-        // Perform the GEMM segment
-        if ( kend > 0 ) {
-            
-            /*
-
-              // Double-precision accumulation
-              // saved just in the event it is useful in the future
-
-                cuDoubleComplex G1, G2, G;       
-                TComplexCompute g1, g2;
-                G.x = 0.;
-                G.y = 0.;
-
-                for ( int k=kstart; k<kend; ++k ) {
-                    g1 = shH(irow,k);
-                    g2 = shH(icol,k);
-                    
-                    // Accumulate in double-precision.
-                    G1.x = g1.x;
-                    G1.y = g1.y;
-                    G2.x = g2.x;
-                    G2.y = -g2.y;
-                    G.x += (G1.x * G2.x - G1.y * G2.y);
-                    G.y += (G1.x * G2.y + G1.y * G2.x);
-                }
-                
-                g1.x = (float) G.x;
-                g1.y = (float) G.y;
-                
-                atomicAdd( &(shG(irow,icol).x), g1.x);
-                atomicAdd( &(shG(irow,icol).y), g1.y);
-            */
-            
-            // Initialize register used for accumulation to zero.
-            g = cuGet<TComplexCompute>(0);
-            
-            // Segment of inner product.
-            for ( int k=kstart; k<kend; ++k ) {
-                g = cuFma ( shH(irow,k), cuConj(shH(icol,k)), g );
+        // Mirror to upper triangular and add regularization to diagonal
+        if (participates) {
+            if (irow != icol) {
+                shG(icol, irow) = cuConj(g);
+            } else {
+                g.x += shR(irow);
+                shG(irow, icol) = g;
             }
-            // Atomic accumulation in SMEM
-            atomicAdd( &(shG(irow,icol).x), g.x);
-            atomicAdd( &(shG(irow,icol).y), g.y);
-            
-        }
-
-        // ensure all atomicAdds have completed before reflecting the complex conjgate
-        thisThrdBlk.sync();
-
-        // use batch 0 to update the upper triangular
-        if ( batch == 0 ) {
-
-            if ( icol <= irow ) {
-
-                g = shG(irow,icol);
-
-                if ( irow != icol ) {
-                    shG(icol, irow) = cuConj(g);
-                }
-                else {
-                    g.x += shR(irow);
-                    shG(irow,icol) = g;
-                }
-
-            }
-
         }
 
     }
@@ -1987,13 +1747,13 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
 	        // Multiply inv(D)*inv(L)
 	        TComplexCompute DinvLinv = shDinv(iElem) * shLinv(iElem,icol);
 	        // Multiply F'*(inv(D)*inv(L))
-          C = cuFma( cuConj(shF(iElem,irow)), DinvLinv, C );
+          C = cuCma( cuConj(shF(iElem,irow)), DinvLinv, C );
       }
       
       // Store the computed element of C
       shC( irow, icol ) = C;
       
-      TCompute absCSqVal = cuReal( cuConj(C)*C );
+      TCompute absCSqVal = cuReal(C) * cuReal(C) + cuImag(C) * cuImag(C);
       
       if(bfwPowerNormAlg_selector==0)
       {
@@ -2003,7 +1763,13 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
       }
       else if(bfwPowerNormAlg_selector==1)
       {
-          atomicAdd( &layerScalingFactors[icol], absCSqVal);
+          // All threads in a warp work on the same column (icol) per iteration.
+          // Using warp-level reduction to sum values, then single atomicAdd per warp.
+          TCompute warpSum = reduce(thrdGrp, absCSqVal, plus<TCompute>());
+          if (thrdGrp.thread_rank() == 0)
+          {
+              atomicAdd(&layerScalingFactors[icol], warpSum);
+          }
       }
     }
     
@@ -2047,20 +1813,87 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
         }
         
         thisThrdBlk.sync();
-        
-        for ( uint32_t idx=THRD_ABS_IDX; idx<N_ROWS_C*N_COLS_C; idx+=blockDim.x*blockDim.y ) 
+
+
+        // Compute per-antenna energy ==================================================================================
+        //
+        // Goal: reduce atomicAdd traffic when accumulating antEnergies[irow].
+        //
+        // Original behavior:
+        //   For each visited (irow, icol), compute |shC(irow,icol)|^2 and atomicAdd into antEnergies[irow].
+        //
+        // Optimization idea:
+        //   Each thread processes multiple (irow,icol) elements across the loop. Instead of doing an atomicAdd
+        //   every iteration, accumulate per-row energy in registers and perform only 1-2 atomicAdds per thread
+        //   at the end.
+        //
+        // Why 1-2 rows per thread is safe here:
+        //   The loop advances idx by STRIDE = blockDim.x * blockDim.y. With the cuPHY BFW configuration
+        //   (warp-sized groups), STRIDE is a multiple of 32. For N_ROWS_C (N_BS_ANTS) in {32, 64} this implies:
+        //     ROW_SHIFT = STRIDE % N_ROWS_C is either:
+        //       - 0  (thread always maps to the same row), or
+        //       - N_ROWS_C/2 (thread alternates between two rows separated by N_ROWS_C/2).
+        //
+        // IMPORTANT: If we change the launch geometry or allow other N_ROWS_C values, this assumption may break
+        //            and the two-accumulator scheme would be incorrect. The static_asserts below protect this.
+        //
+        // Examples:
+        //   N_BS_ANTS=64, N_LAYERS=8  -> N_THRD_GRPS=4 (even) -> ROW_SHIFT=0  (single-row path)
+        //   N_BS_ANTS=64, N_LAYERS=3  -> N_THRD_GRPS=3 (odd)  -> ROW_SHIFT=32 (two-row path)
+        //   N_BS_ANTS=32, N_LAYERS=*  -> ROW_SHIFT=0 always    (single-row path)
+        // ----------------------------------------------------------------------
+
+        constexpr uint32_t STRIDE = N_THRDS_PER_GRP * N_THRD_GRPS_PER_THRD_BLK;
+        static_assert(N_THRDS_PER_GRP == 32, "Energy reduction assumes warp-sized thread groups (32).");
+        static_assert(N_ROWS_C == 32 || N_ROWS_C == 64, "Energy reduction assumes N_ROWS_C (N_BS_ANTS) is 32 or 64.");
+
+        constexpr uint32_t ROW_SHIFT = STRIDE % N_ROWS_C;
+        // Valid cases: 0 (single-row) or N_ROWS_C/2 (two-row alternation)
+        static_assert(ROW_SHIFT == 0 || (2 * ROW_SHIFT == N_ROWS_C),
+                      "Energy reduction assumes each thread touches <=2 rows; update logic if this changes.");
+
+        const uint32_t row0 = THRD_ABS_IDX % N_ROWS_C;
+
+        TCompute energy0 = cuGet<TCompute>(0);
+        TCompute energy1 = cuGet<TCompute>(0);
+
+        for (uint32_t idx = THRD_ABS_IDX; idx < N_ROWS_C * N_COLS_C; idx += STRIDE)
         {
-            uint32_t icol = idx/N_ROWS_C;
-            uint32_t irow = idx - icol*N_ROWS_C; 
-            
-            shC( irow, icol ) = shC( irow, icol ) * type_convert<TCompute>(layerScalingFactors[icol]);
-            
-            TCompute absCSqVal = cuReal( cuConj(shC( irow, icol ))*shC( irow, icol ) );
-            
-            atomicAdd( &antEnergies[irow], absCSqVal);
+            const uint32_t icol = idx / N_ROWS_C;
+            const uint32_t irow = idx - icol * N_ROWS_C;
+
+            // Apply scaling (same as original)
+            shC(irow, icol) = shC(irow, icol) * type_convert<TCompute>(layerScalingFactors[icol]);
+
+            // |C|^2 = Re^2 + Im^2  (same as original)
+            const auto cre = cuReal(shC(irow, icol));
+            const auto cim = cuImag(shC(irow, icol));
+            const TCompute absCSqVal = cre * cre + cim * cim;
+
+            if constexpr (ROW_SHIFT == 0)
+            {
+                // Thread always contributes to the same antenna row.
+                energy0 += absCSqVal;
+            }
+            else
+            {
+                // Thread alternates between row0 and row1 = row0 + N_ROWS_C/2 (mod N_ROWS_C).
+                if (irow == row0) energy0 += absCSqVal;
+                else energy1 += absCSqVal;
+            }
+        }
+
+        // Commit once per touched row (1-2 atomics per thread)
+        atomicAdd(&antEnergies[row0], energy0);
+
+        if constexpr (ROW_SHIFT != 0)
+        {
+            const uint32_t row1 = (row0 + ROW_SHIFT) % N_ROWS_C; // i.e., row0 + N_ROWS_C/2 for N_ROWS_C=64
+            atomicAdd(&antEnergies[row1], energy1);
         }
         
         thisThrdBlk.sync();
+        //==============================================================================================================
 
         for (uint32_t s = N_ROWS_C/2; s > 0; s/=2) 
         {
@@ -2100,7 +1933,6 @@ bfwMmseCoefCompKernel_v1(bfwCoefCompStatDescr_t* pStatDescr, bfwCoefCompDynDescr
     bfw_scale_compress_blockFP<TCompute, N_BS_ANTS + 1, N_BS_ANTS, N_LAYERS, MAX_PRBG_PER_LAYER, COMP_THRDS>( 
         &smemBlkC[0],               // Shared memory input pointer for the antennas
         output + output_index,      // Output pointer for the first antenna
-        //output,                   // Output pointer for the first antenna
         beta*shCFrobeniusNorm,      // Scaling factor
         compressBits,               // Number of compressed bits, if 16=uncompressed, 32=FP pass-through
         beamIdOffset,               // Starting offset for dynamic beam IDs
@@ -2148,15 +1980,42 @@ void bfwCoefComp::bfwMmseCoefComp(bool                         getKernelFuncOnly
                                   uint16_t                     nUeGrps,
                                   cuphyBfwCoefCompLaunchCfg_t& launchCfg)
 {
-    constexpr uint32_t N_THRDS_PER_GRP            = N_THREADS_PER_WARP;
-    constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK_1 = N_LAYERS/2; // Large layer count (e.g. 8,16)
-    constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK_2 = div_round_up(N_BS_ANTS+2*N_LAYERS, N_THRDS_PER_GRP); // Small layer count (e.g. 2,4)
-    
-    // original result for even layer counts - presume this provides best performance.
-    constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK_3 = (N_THRD_GRPS_PER_THRD_BLK_1 > N_THRD_GRPS_PER_THRD_BLK_2) ? N_THRD_GRPS_PER_THRD_BLK_1 : N_THRD_GRPS_PER_THRD_BLK_2;
+    // ========================================================================
+    // CTA Size Selection
+    // ========================================================================
+    // Block dimensions: (N_THRDS_PER_GRP, N_THRD_GRPS_PER_THRD_BLK)
+    //                   (    warp_size  ,       num_warps        )
+    //
+    // The number of warps affects different kernel stages:
+    //   - LU factor:    Needs enough threads for matrix operations
+    //   - MMSE coeffs:  Block-stride loop over N_BS_ANTS × N_LAYERS elements
+    //   - Normalization: Per-layer and per-antenna operations
+    // ========================================================================
 
-    // odd layer counts must have N_LAYERS groups or code in bfwMmseCoefCompKernel_v1 'stage 3' will not work correctly.
-    constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK = (N_LAYERS==32) ? 32: ((N_THRDS_PER_GRP%N_LAYERS==0) ? N_THRD_GRPS_PER_THRD_BLK_3 : N_LAYERS);
+    constexpr uint32_t N_THRDS_PER_GRP = N_THREADS_PER_WARP;  // 32 (warp size)
+
+    // Strategy 1: Scale with layer count (good for large N_LAYERS: 8, 16, 32)
+    // Rationale: More layers need more parallel work for MMSE coefficient computation
+    constexpr uint32_t WARPS_FOR_LARGE_LAYERS = N_LAYERS / 2;
+
+    // Strategy 2: Scale with matrix size (good for small N_LAYERS: 1, 2, 4)
+    // Rationale: Need enough threads to cover H matrix load and C matrix computation
+    constexpr uint32_t MIN_THREADS_NEEDED = N_BS_ANTS + 2 * N_LAYERS;
+    constexpr uint32_t WARPS_FOR_SMALL_LAYERS = div_round_up_cexp(MIN_THREADS_NEEDED, N_THRDS_PER_GRP);
+    
+    // Take the larger of the two strategies
+    constexpr uint32_t WARPS_CALCULATED = (WARPS_FOR_LARGE_LAYERS > WARPS_FOR_SMALL_LAYERS)
+                                        ? WARPS_FOR_LARGE_LAYERS
+                                        : WARPS_FOR_SMALL_LAYERS;
+
+    // Special case: When warp size (32) is not divisible by N_LAYERS,
+    // force N_LAYERS warps to ensure correct thread-to-layer mapping in stage 3
+    // (e.g., layerScalingFactors initialization and per-layer normalization)
+    constexpr bool WARP_ALIGNS_WITH_LAYERS = (N_THRDS_PER_GRP % N_LAYERS == 0);
+
+    // Final selection (with special case for N_LAYERS=32)
+    constexpr uint32_t N_THRD_GRPS_PER_THRD_BLK = (N_LAYERS == 32) ? 32
+                                                : (WARP_ALIGNS_WITH_LAYERS ? WARPS_CALCULATED : N_LAYERS);
 
     void* kernelFunc = reinterpret_cast<void*>(bfwMmseCoefCompKernel_v1<TStorageIn,
                                                                         TStorageOut,
@@ -2174,28 +2033,26 @@ void bfwCoefComp::bfwMmseCoefComp(bool                         getKernelFuncOnly
         dim3 blockDim, gridDim;
         bfwMmseCoefCompKernelLaunchGeo<N_BS_ANTS, N_LAYERS, N_THRD_GRPS_PER_THRD_BLK, N_THRDS_PER_GRP>(nMaxPrbGrp, nUeGrps, gridDim, blockDim);
     
-//#if 0
-//        constexpr int32_t  N_ITER = N_THRD_BLK_TONES / N_TONES_PER_ITER;
-//        constexpr uint32_t N_INST = (1 == N_ITER) ? 1 : 2; // double buffering for pipelining
-//        constexpr uint32_t N_SMEM_ELEMS =
-//            (((N_BS_ANTS + 1) * N_LAYERS * N_INST) +
-//             ((N_LAYERS + 1) * (N_LAYERS + N_LAYERS + N_BS_ANTS))) *
-//                N_TONES_PER_ITER;
-//    
-//        int nShmemBytes    = N_SMEM_ELEMS * sizeof(TComplexCompute);
-//        int nMaxShmemBytes = nShmemBytes;
-//        cudaFuncSetAttribute(bfc_mmse_coef_comp_kernel_v1<TStorageIn, TStorageOut, TCompute, N_THRD_BLK_TONES, N_TONES_PER_ITER, N_BS_ANTS, N_LAYERS, NH>,
-//                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-//                             nMaxShmemBytes);
-//#else
-#ifdef ENABLE_32DL
-        int nShmemBytes = sizeof(TCompute)*(N_LAYERS+1)*(2*N_LAYERS+N_BS_ANTS)*2 + sizeof(TCompute)*(N_BS_ANTS+1)*N_LAYERS*2;
-        cudaFuncSetAttribute(bfwMmseCoefCompKernel_v1<TStorageIn, TStorageOut, TCompute, N_BS_ANTS, N_LAYERS, N_THRD_GRPS_PER_THRD_BLK, N_THRDS_PER_GRP>,
+        // Dynamic shared memory size calculation:
+        // smemBlkA: (N_LAYERS+1) * (2*N_LAYERS + N_BS_ANTS) complex floats
+        // smemBlkC: (N_BS_ANTS+1) * N_LAYERS complex floats
+        // smemBlkR: N_LAYERS floats
+        // layerScalingFactors: N_LAYERS floats
+        // antEnergies: N_BS_ANTS floats
+        // shCFrobeniusNorm: 1 float
+        constexpr int nSmemA = (N_LAYERS + 1) * (2 * N_LAYERS + N_BS_ANTS) * sizeof(TCompute) * 2;  // complex = 2 floats
+        constexpr int nSmemC = (N_BS_ANTS + 1) * N_LAYERS * sizeof(TCompute) * 2;
+        constexpr int nSmemR = N_LAYERS * sizeof(TCompute);
+        constexpr int nSmemLayerScaling = N_LAYERS * sizeof(TCompute);
+        constexpr int nSmemAntEnergies = N_BS_ANTS * sizeof(TCompute);
+        constexpr int nSmemFrobenius = sizeof(TCompute);
+
+        int nShmemBytes = nSmemA + nSmemC + nSmemR + nSmemLayerScaling + nSmemAntEnergies + nSmemFrobenius;
+
+        /*cudaFuncSetAttribute(bfwMmseCoefCompKernel_v1<TStorageIn, TStorageOut, TCompute, N_BS_ANTS, N_LAYERS, N_THRD_GRPS_PER_THRD_BLK, N_THRDS_PER_GRP>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             nShmemBytes);  
-#else
-        int nShmemBytes = 0;      
-#endif
+                             nShmemBytes);*/
+        CU_CHECK(cuFuncSetAttribute(kernelNodeParamsDriver.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, nShmemBytes));
     
         kernelNodeParamsDriver.blockDimX = blockDim.x;
         kernelNodeParamsDriver.blockDimY = blockDim.y;
@@ -2223,7 +2080,6 @@ void bfwCoefComp::bfwCoefCompKernelSelL0(bool                         getKernelF
         constexpr uint32_t N_BS_ANTS = 64; // # of BS antenna (# of rows in H matrix)
         switch(nLayers)
         {
-#ifdef ENABLE_32DL
             // nLayers == 32
             case 32:
             {
@@ -2336,7 +2192,6 @@ void bfwCoefComp::bfwCoefCompKernelSelL0(bool                         getKernelF
                 bfwMmseCoefComp<TStorageIn, TStorageOut, TCompute, N_BS_ANTS, N_LAYERS>(getKernelFuncOnly, nMaxPrbGrp, nUeGrps, launchCfg);
                 break;
             }
-#endif
             // nLayers == 16
             case 16:
             {
@@ -2558,6 +2413,8 @@ void bfwCoefComp::bfwCoefCompKernelSelL1(bool                         getKernelF
                                                                       nLayers,
                                                                       launchCfg);
     }
+    // lambdaType is always CUPHY_R_32F at compile time, so the following condition is not possible
+    /*VCAST_DONT_INSTRUMENT_START*/
     else if((CUPHY_C_16F == srsChEstType) && (CUPHY_R_16F == lambdaType))
     {
         using TStorageIn  = scalar_from_complex<data_type_traits<CUPHY_C_16F>::type>::type;
@@ -2569,6 +2426,7 @@ void bfwCoefComp::bfwCoefCompKernelSelL1(bool                         getKernelF
                                                                   nLayers,
                                                                   launchCfg);    
     }
+    /*VCAST_DONT_INSTRUMENT_END*/
     else
     {
         NVLOGE_FMT(NVLOG_BFW, AERIAL_CUPHY_EVENT, "{}:{} No kernel available to launch with requested data type srsChEstType ({}) lambdaType ({})", 

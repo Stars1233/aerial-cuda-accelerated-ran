@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -302,21 +302,39 @@ int nv_ipc_parse_yaml_node(nv_ipc_config_t* cfg, yaml::node* yaml_node, nv_ipc_m
 int load_nv_ipc_yaml_config(nv_ipc_config_t* cfg, const char* yaml_path, nv_ipc_module_t module_type)
 {
     NVLOGI_FMT(TAG, "{}: {}", __FUNCTION__, yaml_path);
-    yaml::file_parser fp(yaml_path);
-    yaml::document    doc        = fp.next_document();
-    yaml::node        yaml_root  = doc.root();
+    try
+    {
+        yaml::file_parser fp(yaml_path);
+        yaml::document    doc        = fp.next_document();
+        yaml::node        yaml_root  = doc.root();
 
-    if (yaml_root.has_key("nvipc_log")) {
-        yaml::node nvlog_node = yaml_root["nvipc_log"];
-        std::string log_file = nvlog_node["fmt_log_path"].as<std::string>().append("/");
-        log_file.append(nvlog_node["fmt_log_name"].as<std::string>());
-        log_file.append(is_module_primary(module_type) ? "_primary.log" : "_secondary.log");
-        nvlog_c_init(log_file.c_str());
-        nvlog_set_log_level(nvlog_node["log_level"].as<int>());
-        nvlog_set_max_file_size(nvlog_node["fmt_log_max_size"].as<uint64_t>() * 1024 * 1024);
+        if (yaml_root.has_key("nvipc_log")) {
+            yaml::node nvlog_node = yaml_root["nvipc_log"];
+            std::string log_file = nvlog_node["fmt_log_path"].as<std::string>().append("/");
+            log_file.append(nvlog_node["fmt_log_name"].as<std::string>());
+            log_file.append(is_module_primary(module_type) ? "_primary.log" : "_secondary.log");
+            nvlog_c_init(log_file.c_str());
+            nvlog_set_log_level(nvlog_node["log_level"].as<int>());
+            nvlog_set_max_file_size(nvlog_node["fmt_log_max_size"].as<uint64_t>() * 1024 * 1024);
+        }
+
+        yaml::node nvipc_node = yaml_root["transport"];
+        nv_ipc_parse_yaml_node(cfg, &nvipc_node, module_type);
+        return 0;
     }
-
-    yaml::node nvipc_node = yaml_root["transport"];
-    nv_ipc_parse_yaml_node(cfg, &nvipc_node, module_type);
-    return 0;
+    catch(const YAML::BadFile& badFile)
+    {
+        NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: BadFile exception: {}", __func__, badFile.what());
+        return -1;
+    }
+    catch(const std::exception& e)
+    {
+        NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: Exception: {}", __func__, e.what());
+        return -1;
+    }
+    catch(...)
+    {
+        NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: Unknown error", __func__);
+        return -1;
+    }
 }

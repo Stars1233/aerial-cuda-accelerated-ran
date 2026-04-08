@@ -51,6 +51,7 @@ target_include_directories(nvphy_generic PRIVATE ${CUDA_INCLUDE_DIRS})
 target_include_directories(nvphy_generic PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_link_libraries(nvphy_generic PRIVATE CUDA::cudart CUDA::cuda_driver)
 target_link_libraries(nvphy_generic PUBLIC cuphyoamlib app_config nvlog nvipc)
+target_link_libraries(nvphy_generic PUBLIC aerial_utils)
 
 install(TARGETS nvphy_generic DESTINATION ${PROJECT_NAME}/lib)
 
@@ -89,6 +90,7 @@ target_include_directories(nvphy PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES
 target_include_directories(nvphy PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/cuphydriver/include/>)
 target_link_libraries(nvphy PRIVATE gRPC::grpc++ gRPC::grpc++_reflection)
 target_link_libraries(nvphy PUBLIC nvphy_generic cuphydriver)
+target_link_libraries(nvphy PUBLIC aerial_utils)
 
 install(TARGETS nvphy DESTINATION ${PROJECT_NAME}/lib)
 

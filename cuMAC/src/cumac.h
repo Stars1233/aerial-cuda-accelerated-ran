@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +38,7 @@
  #include <fcntl.h>
  #include <stdatomic.h>
  #include <inttypes.h>
+ #include <bit>
  #include <iostream>
  #include <fstream>
  #include <random>
@@ -191,6 +192,8 @@
     } launchCfg_t;
  }
  #include "cumac_pfm_sort.h"
+ #include "cumac_muUeGrp.h"
+ #include "cumac_msg.h"
  #include "cpuMatAlg/cpuMatAlg.h"
  #include "4T4R/cellAssociation.cuh"
  #include "4T4R/cellAssociationCpu.h"

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,8 +36,8 @@ cdlChan<Tscalar, Tcomplex>::cdlChan(cdlConfig_t * cdlCfg, uint16_t randSeed, cud
     this->m_nCell             = cdlCfg->nCell;
     this->m_nUe               = cdlCfg->nUe;
     this->m_nLink             = this->m_nCell * this->m_nUe;
-    this->m_nBsAnt            = std::accumulate(cdlCfg->bsAntSize.begin(), cdlCfg->bsAntSize.end(), 1U, std::multiplies<uint32_t>());
-    this->m_nUeAnt            = std::accumulate(cdlCfg->ueAntSize.begin(), cdlCfg->ueAntSize.end(), 1U, std::multiplies<uint32_t>());
+    this->m_nBsAnt            = std::accumulate(cdlCfg->bsAntSize.begin(), cdlCfg->bsAntSize.end(), 1U, std::multiplies<uint16_t>());
+    this->m_nUeAnt            = std::accumulate(cdlCfg->ueAntSize.begin(), cdlCfg->ueAntSize.end(), 1U, std::multiplies<uint16_t>());
     this->m_runMode           = cdlCfg->runMode;
     this->m_maxDopplerShift   = cdlCfg->maxDopplerShift;
     this->m_sigLenPerAnt      = cdlCfg->sigLenPerAnt;
@@ -107,7 +107,6 @@ cdlChan<Tscalar, Tcomplex>::cdlChan(cdlConfig_t * cdlCfg, uint16_t randSeed, cud
     // TODO: currently does not support CDL-D and CDL-E with LOS path, will added later
     if(m_LosTap)
     {
-        // NVLOGE_FMT(NVLOG_PUScH, AERIAL_CUPHY_EVENT, "ERROR: CDL with LOS path is not supported yet");
         printf("ERROR: CDL with LOS path is not supported yet! \n");
         exit(EXIT_FAILURE);
     }
@@ -632,18 +631,19 @@ __device__ inline void findAntLocAndDBar(const uint16_t & u, const uint16_t* __r
     float* __restrict__ d_bar_u, 
     float& zetaAnt) 
 {
-    // Extract dimensions from AntSize
-    // uint16_t M = AntSize[0];
-    // uint16_t N = AntSize[1];
-    // uint16_t P = AntSize[2];
-    uint16_t temp = u / AntSize[2];
+    // AntSize order: {M_g, N_g, M, N, P}
+    // AntSpacing order: {d_g_h, d_g_v, d_h, d_v}
+    const uint16_t m = AntSize[2];
+    const uint16_t n = AntSize[3];
+    const uint16_t p = AntSize[4];
+    uint16_t temp = u / p;
 
     // Calculate d_bar_rx_u (3D vector)
     d_bar_u[0] = 0.0f;
-    d_bar_u[1] = (temp % AntSize[1]) * AntSpacing[1];
-    d_bar_u[2] = (temp / AntSize[1]) % AntSize[0] * AntSpacing[0];
+    d_bar_u[1] = (temp % n) * AntSpacing[2];
+    d_bar_u[2] = (temp / n) % m * AntSpacing[3];
 
-    zetaAnt = antPolarAngles[u % AntSize[2]] * D2PI;
+    zetaAnt = antPolarAngles[u % p] * D2PI;
 }
 
 // Device function to calculate A_dB_3D

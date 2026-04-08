@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +16,8 @@
 """pyAerial - Separable PDSCH Tx pipeline built from pyAerial components."""
 from typing import Any
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
@@ -38,7 +38,7 @@ from aerial.phy5g.ldpc import LdpcRateMatch
 from aerial.phy5g.ldpc import LdpcEncoder
 from aerial.phy5g.ldpc import CrcEncoder
 from aerial.phy5g.ldpc.util import get_pdsch_config_attrs
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 
 
 class SeparablePdschTxPipelineFactory(PipelineFactory[AerialPdschTxConfig]):
@@ -46,13 +46,13 @@ class SeparablePdschTxPipelineFactory(PipelineFactory[AerialPdschTxConfig]):
 
     def create(self,
                config: AerialPdschTxConfig,
-               cuda_stream: int,
+               cuda_stream: CudaStream,
                **kwargs: Any) -> Pipeline:
         """Create the pipeline.
 
         Args:
             config (AerialPdschTxConfig): Pipeline configuration object.
-            cuda_stream (int): CUDA stream used to run the tool.
+            cuda_stream (CudaStream): CUDA stream used to run the pipeline.
 
         Returns:
             SeparablePdschTx: A `SeparablePdschTx` pipeline object.
@@ -88,7 +88,7 @@ class SeparablePdschTx(PdschTxPipeline[PdschConfig, Array]):
                  num_dl_bwp: int = NUM_PRB_MAX,
                  max_num_cells: int = 1,
                  max_num_tbs: int = 1,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize SeparablePdschTx.
 
         Args:
@@ -99,12 +99,11 @@ class SeparablePdschTx(PdschTxPipeline[PdschConfig, Array]):
             num_dl_bwp (int): Number of DL BWP.
             max_num_cells (int): Maximum number of cells per slot.
             max_num_tbs (int): Maximum number of transport blocks per cell group.
-            cuda_stream (int): CUDA stream used to run the pipeline. If not given,
-                one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream used to run the pipeline. If not given,
+                a new CudaStream is created. Use ``with stream:`` to scope work; call
+                ``stream.synchronize()`` explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         self.cell_id = cell_id
         self.num_rx_ant = num_rx_ant
@@ -115,17 +114,17 @@ class SeparablePdschTx(PdschTxPipeline[PdschConfig, Array]):
         # Create the components.
         self.crc_encoder = CrcEncoder(
             max_num_tbs=max_num_tbs,
-            cuda_stream=self.cuda_stream
+            cuda_stream=self._cuda_stream
         )
-        self.ldpc_encoder = LdpcEncoder(cuda_stream=self.cuda_stream)
+        self.ldpc_encoder = LdpcEncoder(cuda_stream=self._cuda_stream)
         self.ldpc_rate_match = LdpcRateMatch(
             enable_scrambling=True,
             max_num_tbs=max_num_tbs,
             num_dl_bwp_prbs=num_dl_bwp,
-            cuda_stream=self.cuda_stream
+            cuda_stream=self._cuda_stream
         )
         self.dmrs_tx = DmrsTx(
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             num_bwp_prbs=num_dl_bwp,
             max_num_cells=max_num_cells,
             max_num_tbs=max_num_tbs
@@ -189,7 +188,7 @@ class SeparablePdschTx(PdschTxPipeline[PdschConfig, Array]):
         )
 
         # Initialize the output buffer.
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tx_buffer = cp.zeros(
                 (self.num_dl_bwp * NUM_RE_PER_PRB, NUM_SYMBOLS, MAX_DL_LAYERS),
                 dtype=np.complex64,

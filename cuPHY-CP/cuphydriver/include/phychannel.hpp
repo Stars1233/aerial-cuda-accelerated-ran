@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -133,53 +133,6 @@ typedef enum ch_run_status{
     CH_RUN_DONE_NO_ERROR,       ///< Run phase completed successfully
     CH_RUN_DONE_ERROR           ///< Run phase completed with errors
 }ch_run_status_t;
-
-/**
- * @brief Slot parameters with move semantics for aggregated channel processing
- *
- * Holds slot indication and channel-specific parameters with move semantics for efficient ownership transfer.
- */
-struct slot_params_aggr_mv
-{
-    struct slot_command_api::slot_indication si;                       ///< Slot indication (SFN, slot number, tick)
-    std::unique_ptr<slot_command_api::pusch_params> pusch;             ///< PUSCH (uplink shared channel) parameters
-    std::unique_ptr<slot_command_api::pucch_params> pucch;             ///< PUCCH (uplink control channel) parameters
-    std::unique_ptr<slot_command_api::prach_params> prach;             ///< PRACH (random access channel) parameters
-    std::unique_ptr<slot_command_api::pdsch_params> pdsch;             ///< PDSCH (downlink shared channel) parameters
-    std::unique_ptr<slot_command_api::pdcch_group_params> pdcch;       ///< PDCCH (downlink control channel) group parameters
-    std::unique_ptr<slot_command_api::pbch_group_params> pbch;         ///< PBCH (broadcast channel) group parameters
-    std::unique_ptr<slot_command_api::csirs_params> csirs;             ///< CSI-RS (channel state information reference signal) parameters
-
-    slot_params_aggr_mv();
-
-    explicit slot_params_aggr_mv(slot_command_api::slot_indication& other,
-                            struct slot_command_api::cell_group_command * cgcmd
-                        ) :
-        si(other.sfn_, other.slot_, other.tick_),
-        pusch(std::move(cgcmd->pusch)),
-        pucch(std::move(cgcmd->pucch)),
-        prach(std::move(cgcmd->prach)),
-        pdsch(std::move(cgcmd->pdsch)),
-        pdcch(std::move(cgcmd->pdcch)),
-        pbch(std::move(cgcmd->pbch)),
-        csirs(std::move(cgcmd->csirs))
-    {
-    }
-
-    slot_params_aggr_mv(const slot_params_aggr_mv&) = delete;
-    slot_params_aggr_mv& operator=(const slot_params_aggr_mv&) = delete;
-
-    ~slot_params_aggr_mv()
-    {
-        pusch.reset();
-        pucch.reset();
-        prach.reset();
-        pdsch.reset();
-        pdcch.reset();
-        pbch.reset();
-        csirs.reset();
-    }
-};
 
 /**
  * @brief Base class for PHY channel processing

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -78,7 +78,7 @@ public:
      * @param[in] _cp cuMAC pattern configuration
      */
     void set_cumac_pattern(cumac_pattern* _cp);
-    cumac_handler* _cumac_handler; //!< cuMAC handler instance
+    cumac_handler* _cumac_handler = nullptr; //!< cuMAC handler instance
 #endif
 
     /**
@@ -110,12 +110,13 @@ public:
 
 private:
 
-    pthread_t mac_recv_tid; //!< MAC receiver thread ID
+    pthread_t mac_recv_tid = 0; //!< MAC receiver thread ID
+    pthread_t mac_sched_tid = 0; //!< MAC scheduler thread ID
 
-    phy_mac_transport* _transport; //!< MAC-PHY transport object for IPC communication
+    phy_mac_transport* _transport = nullptr; //!< MAC-PHY transport object for IPC communication
 
-    test_mac_configs* configs;     //!< Test MAC configuration parameters
-    fapi_handler*     _fapi_handler; //!< FAPI message handler
+    test_mac_configs* configs = nullptr;     //!< Test MAC configuration parameters
+    fapi_handler*     _fapi_handler = nullptr; //!< FAPI message handler
 
     yaml::node testmac_yaml; //!< YAML configuration node
     ch8_conformance_test_stats conformance_test_stats; //!< Conformance test statistics

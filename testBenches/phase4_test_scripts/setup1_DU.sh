@@ -1,5 +1,6 @@
 #!/bin/bash -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -100,6 +101,10 @@ show_usage() {
     echo "  --ru-host-type=TYPE               Set RU host type for core configuration"
     echo "                                    Default: _R750"
     echo
+    echo "  --core-config-input-override=YAML  Override logical core configuration file"
+    echo "                                     example: --core-config-input-override=l1_logical_cores_DU_CG1_RU_CG1.yaml"
+    echo "                                     Default: unset"
+    echo
     echo "  --mumimo <0|1>, -m <0|1>    Select the mumimo test mode:"
     echo "                                0 - mmimo test mode OFF (default)"
     echo "                                1 - mmimo test mode ON"
@@ -183,6 +188,19 @@ while [[ $# -gt 0 ]]; do
           fi
           CONFIG_DIR="$2"
           CONFIG_DIR_SET=true
+          shift 2
+          ;;
+        --core-config-input-override=*)
+          CORE_CONFIG_INPUT_OVERRIDE="${1#*=}"
+          shift
+          ;;
+        --core-config-input-override)
+          if [[ -z "$2" || "$2" == -* ]]; then
+            echo "Error: Missing value for $1 option"
+            show_usage
+            exit 1
+          fi
+          CORE_CONFIG_INPUT_OVERRIDE="$2"
           shift 2
           ;;
         --cubb-sdk=*)
@@ -358,8 +376,12 @@ fi
 
 CORE_CONFIG_OUTPUT=$CONFIG_DIR/testBenches/phase4_test_scripts
 
-#ToDo maybe add an option to allow manual selection of CORE_CONFIG_INPUT as well
-CORE_CONFIG_INPUT=l1_logical_cores_DU${CUPHY_HOST_TYPE}_RU${RU_HOST_TYPE}${OPT}.yaml
+# Allow manual selection of CORE_CONFIG_INPUT via optional CLI override
+if [[ -n "$CORE_CONFIG_INPUT_OVERRIDE" ]]; then
+    CORE_CONFIG_INPUT="${CORE_CONFIG_INPUT_OVERRIDE}"
+else
+    CORE_CONFIG_INPUT=l1_logical_cores_DU${CUPHY_HOST_TYPE}_RU${RU_HOST_TYPE}${OPT}.yaml
+fi
 
 echo "Using CORE_CONFIG_INPUT: $CORE_CONFIG_INPUT"
 
@@ -384,8 +406,13 @@ fi
 # Create test_config_summary.sh
 TEST_CONFIG_FILE=$CONFIG_DIR/testBenches/phase4_test_scripts/test_config_summary.sh
 DU_SETUP_COMPLETE=1
+
+# Read NUM_DL_WORKERS from CUPHY YAML to populate in test_config_summary.sh
+NUM_DL_WORKERS=$(yq '.cuphydriver_config.workers_dl | length' $CUPHY_YAML)
+echo "NUM_DL_WORKERS from CUPHY YAML: $NUM_DL_WORKERS"
+
 # Write variables to the test_config_summary.sh
-VARS="VARS CUPHY_HOST_TYPE RU_HOST_TYPE CONTROLLER_MODE DU_PCIE_0 DU_PCIE_1 DU_ETH_INTERFACE_0 DU_ETH_INTERFACE_1 DU_MAC_ADDRESS_0 DU_MAC_ADDRESS_1 DU_HYPER_THREADED MUMIMO CUPHY_YAML TESTMAC_YAML L2A_YAML NVLOG_YAML NRSIM_TC DU_SETUP_COMPLETE MULTI_L2"
+VARS="VARS CUPHY_HOST_TYPE RU_HOST_TYPE CONTROLLER_MODE DU_PCIE_0 DU_PCIE_1 DU_ETH_INTERFACE_0 DU_ETH_INTERFACE_1 DU_MAC_ADDRESS_0 DU_MAC_ADDRESS_1 DU_HYPER_THREADED MUMIMO CUPHY_YAML TESTMAC_YAML L2A_YAML NVLOG_YAML NRSIM_TC DU_SETUP_COMPLETE MULTI_L2 NUM_DL_WORKERS"
 > "$TEST_CONFIG_FILE"  # Clear the file before writing
 for var in ${VARS}; do
     echo "$var=\"${!var}\"" >> "$TEST_CONFIG_FILE"

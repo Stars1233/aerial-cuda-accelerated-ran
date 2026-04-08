@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,14 +16,14 @@
 """pyAerial library - RSRP and pre-/post-equalizer SINR estimation."""
 from typing import Generic
 from typing import List
+from typing import Optional
 from typing import Tuple
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PuschConfig
 from aerial.phy5g.config import PuschUeConfig
@@ -40,18 +40,18 @@ class RsrpEstimator(Generic[Array]):
     def __init__(self,
                  num_rx_ant: int,
                  enable_pusch_tdi: int,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize RsrpEstimator.
 
         Args:
             num_rx_ant (int): Number of receive antennas.
             enable_pusch_tdi (int): Whether time-interpolation is used in computing equalizer
                 coefficients. This impacts post-equalizer SINR.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         pusch_stat_prms = get_pusch_stat_prms(
             num_rx_ant=num_rx_ant,
@@ -60,7 +60,7 @@ class RsrpEstimator(Generic[Array]):
         self._pusch_params = pycuphy.PuschParams()
         self._pusch_params.set_stat_prms(pusch_stat_prms)
 
-        self.rsrp_estimator = pycuphy.RsrpEstimator(self.cuda_stream)
+        self.rsrp_estimator = pycuphy.RsrpEstimator(self._cuda_stream.handle)
         self.rsrp = None  # type: Array
         self.pre_eq_sinr = None  # type: Array
         self.post_eq_sinr = None  # type: Array
@@ -109,7 +109,7 @@ class RsrpEstimator(Generic[Array]):
 
         """
         cpu_copy = isinstance(channel_est[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             channel_est = [cp.array(elem, order='F', dtype=cp.complex64) for elem in channel_est]
             ree_diag_inv = [cp.array(elem, order='F') for elem in ree_diag_inv]
             noise_var_pre_eq = cp.array(noise_var_pre_eq, dtype=cp.float32)
@@ -150,7 +150,7 @@ class RsrpEstimator(Generic[Array]):
         noise_var_pre_eq = pycuphy.CudaArrayFloat(noise_var_pre_eq)
 
         pusch_dyn_prms = _pusch_config_to_cuphy(
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             rx_data=[rx_data],
             slot=0,  # Not relevant here.
             pusch_configs=pusch_configs
@@ -168,7 +168,7 @@ class RsrpEstimator(Generic[Array]):
         self.noise_var_post_eq = self.rsrp_estimator.get_info_noise_var_post_eq()
 
         # Transform the output to cupy array.
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             self.rsrp = cp.array(self.rsrp)
             self.pre_eq_sinr = cp.array(self.pre_eq_sinr)
             self.post_eq_sinr = cp.array(self.post_eq_sinr)

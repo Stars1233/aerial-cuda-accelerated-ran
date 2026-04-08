@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -160,7 +160,6 @@ OPTION(NVIPC_FMTLOG_ENABLE "Enable nvIPC logging with fmtlog" ON)
 OPTION(NVIPC_DOCA_ENABLE "Enable nvIPC on DOCA" OFF)
 OPTION(ENABLE_BLOCKING_LOGGER "Logger blocks calling thread, instead of dropping message, if log queue is full" OFF)
 OPTION(ENABLE_CUPHY_PTI_TRACING "Enable kernel tracing using cuPHY PTI" OFF)
-OPTION(ENABLE_CUPTI_TRACING "Enable kernel tracing using cupti" OFF)
 OPTION(ENABLE_SCHED_FIFO_ALL_RT "Enable SCHED_FIFO on all high priority threads.  When OFF, SCHED_FIFO still used on some threads." ON)
 OPTION(ENABLE_LINE_INFO "Add -lineinfo flag to compiler in release build" OFF)
 
@@ -171,10 +170,10 @@ OPTION(ENABLE_32DL "Enable 32-layer Downlink" OFF)
 OPTION(ENABLE_PUSCH_PER_UE_PREQ_NOISE_VAR "Enable PUSCH per-UE pre-EQ noise-interference power reporting" ON)
 
 if ("${ARCH}" STREQUAL "aarch64")
-    OPTION(LEGO_MGX_CG1 "MGX CG1 Platform" ON)
+    OPTION(FORCE_SLEEP_OF_L2A_MSG_THREAD "Enable WAR for system hang with SCHED_FIFO + 100% CPU polling" ON)
     OPTION(ENABLE_20C "Enable 20C" ON)
 else ()
-    OPTION(LEGO_MGX_CG1 "MGX CG1 Platform" OFF)
+    OPTION(FORCE_SLEEP_OF_L2A_MSG_THREAD "Enable WAR for system hang with SCHED_FIFO + 100% CPU polling" OFF)
     OPTION(ENABLE_20C "Enable 20C" OFF)
 endif()
 
@@ -217,10 +216,6 @@ if(ENABLE_CUPHY_PTI_TRACING)
     add_definitions(-DCUPHY_PTI_ENABLE_TRACING)
 endif()
 
-if(ENABLE_CUPTI_TRACING)
-    add_definitions(-DCUPTI_ENABLE_TRACING)
-endif()
-
 if(ENABLE_SCHED_FIFO_ALL_RT)
     add_definitions(-DENABLE_SCHED_FIFO_ALL_RT)
 endif()
@@ -229,8 +224,8 @@ if(EARLY_UCI_CUBB_CALLFLOW_TEST)
     add_definitions(-DEARLY_UCI_CUBB_CALLFLOW_TEST)
 endif()
 
-if(LEGO_MGX_CG1)
-    add_definitions(-DLEGO_MGX_CG1)
+if(FORCE_SLEEP_OF_L2A_MSG_THREAD)
+    add_definitions(-DFORCE_SLEEP_OF_L2A_MSG_THREAD)
 endif()
 
 if (ENABLE_PUSCH_PER_UE_PREQ_NOISE_VAR)
@@ -251,6 +246,11 @@ endif ()
 find_package(CUDAToolkit)
 if (NOT ${CUDAToolkit_FOUND})
     message("CUDA_TOOLKIT_ROOT_DIR NOT FOUND")
+else ()
+    include_directories(
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${CUDAToolkit_INCLUDE_DIRS}/cccl
+    )
 endif ()
 
 # ----------------------------------------------------------------------

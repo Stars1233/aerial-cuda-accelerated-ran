@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,11 +17,10 @@
 from typing import Generic, Optional
 from typing import List
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PuschConfig
 from aerial.phy5g.config import PuschUeConfig
@@ -48,7 +47,7 @@ class ChannelEstimator(Generic[Array]):
                  ch_est_algo: int = 1,
                  enable_per_prg_chest: int = 0,
                  enable_ul_rx_bf: int = 0,
-                 cuda_stream: int = None,
+                 cuda_stream: Optional[CudaStream] = None,
                  chest_filter_h5: str = None,
                  w_freq_array: np.ndarray = None,
                  w_freq4_array: np.ndarray = None,
@@ -82,7 +81,9 @@ class ChannelEstimator(Generic[Array]):
                 - 0: Disable (default).
                 - 1: Enable.
 
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
             chest_filter_h5 (str): Filename of an HDF5 file containing channel estimation filters.
             w_freq_array (np.ndarray):
             w_freq4_array (np.ndarray):
@@ -92,9 +93,7 @@ class ChannelEstimator(Generic[Array]):
             shift_seq4_array (np.ndarray):
             unshift_seq4_array (np.ndarray):
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         # Sanity check on the parameters.
         # pylint: disable=too-many-boolean-expressions
@@ -151,11 +150,11 @@ class ChannelEstimator(Generic[Array]):
             self._filters["UnShiftSeq"],
             self._filters["ShiftSeq4"],
             self._filters["UnShiftSeq4"],
-            self.cuda_stream
+            self._cuda_stream.handle
         )
         if chest_factory_settings_filename is not None:
             self._pusch_params.set_chest_factory_settings_filename(chest_factory_settings_filename)
-        self._channel_estimator = pycuphy.ChannelEstimator(self._pusch_params, self.cuda_stream)
+        self._channel_estimator = pycuphy.ChannelEstimator(self._pusch_params, self._cuda_stream.handle)
 
     def estimate(self,  # pylint: disable=too-many-arguments
                  *,
@@ -227,7 +226,7 @@ class ChannelEstimator(Generic[Array]):
             Rx ant x layer x frequency x time Numpy or CuPy array, per UE group.
         """
         cpu_copy = isinstance(rx_slot, np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rx_slot = cp.array(rx_slot, order='F', dtype=cp.complex64)
 
         # If pusch_configs is given, use that directly. Else all the other parameters
@@ -255,7 +254,7 @@ class ChannelEstimator(Generic[Array]):
         rx_slot = pycuphy.CudaArrayComplexFloat(rx_slot)
 
         pusch_dyn_prms = _pusch_config_to_cuphy(
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             rx_data=[rx_slot],
             slot=slot,
             pusch_configs=pusch_configs
@@ -263,7 +262,7 @@ class ChannelEstimator(Generic[Array]):
         self._pusch_params.set_dyn_prms(pusch_dyn_prms)
         channel_est = self._channel_estimator.estimate(self._pusch_params)
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             channel_est = [cp.array(elem) for elem in channel_est]
             if cpu_copy:
                 channel_est = [elem.get(order='F') for elem in channel_est]

@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,11 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # Script to print UUID for 5GModel in aerial_sdk
 
 SCRIPT=$(readlink -f $0)
 SCRIPT_DIR=$(dirname $SCRIPT)
-cuBB_SDK=$SCRIPT_DIR/..
 
 LC_ALL=C
 
@@ -28,7 +29,8 @@ cd $cuBB_SDK
 # This way we can ignore files that do not affect the outcome of TV generation.
 # e.g. egrep -v "\.md$|5GModel/documents"
 non_uuid="\.md$"
-non_uuid="${non_uuid}|5GModel/aerial_mcore/aerial_pkg/dist"  # dist is used when creating/installing aerial_mcore
+non_uuid="${non_uuid}|5GModel/aerial_mcore/aerial_pkg"
+non_uuid="${non_uuid}|5GModel/nr_matlab/CompilerSDKOutput"
 non_uuid="${non_uuid}|5GModel/nr_matlab/scripts"
 non_uuid="${non_uuid}|5GModel/documents"
 

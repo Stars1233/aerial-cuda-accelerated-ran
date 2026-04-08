@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -249,6 +249,7 @@ void OrderKernelTestBench::setup_config_params()
         ok_tb_config_params->order_kernel_last_timeout_error_time[cell_count]=ok_tb_input_params.order_kernel_last_timeout_error_time[cell_count];
         ok_tb_config_params->last_sem_idx_rx_h[cell_count]=ok_tb_input_params.last_sem_idx_rx_h[cell_count];
         ok_tb_config_params->sem_gpu[cell_count]=ok_tb_input_params.sem_gpu[cell_count];
+        ok_tb_config_params->sem_gpu_aerial_fh[cell_count]=ok_tb_input_params.sem_gpu_aerial_fh[cell_count];
         ok_tb_config_params->doca_rxq[cell_count]=ok_tb_input_params.doca_rxq[cell_count];
     }
         ok_tb_config_params->prb_size=DEFAULT_PRB_STRIDE;
@@ -306,6 +307,7 @@ OrderKernelTestBench::~OrderKernelTestBench()
         cudaFree(ok_tb_input_params.last_sem_idx_rx_h[cell_count]);
         cudaFreeHost(ok_tb_input_params.pkt_info[cell_count]);
         cudaFreeHost(ok_tb_input_params.sem_gpu[cell_count]);
+        cudaFreeHost(ok_tb_input_params.sem_gpu_aerial_fh[cell_count]);
         cudaFree(ok_tb_input_params.doca_rxq[cell_count]);            
     }
     cudaFree(ok_tb_input_params.sym_ord_done_sig_arr);
@@ -390,6 +392,7 @@ void OrderKernelTestBench::setup_input_params()
         CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.sem_gpu[cell_count],sizeof(doca_gpu_semaphore_gpu_t)));
         CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.pkt_info[cell_count],sizeof(struct doca_gpu_semaphore_packet)*4096));
         ok_tb_input_params.sem_gpu[cell_count]->pkt_info_gpu=(struct doca_gpu_semaphore_packet *)ok_tb_input_params.pkt_info[cell_count];
+        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.sem_gpu_aerial_fh[cell_count],sizeof(struct aerial_fh_gpu_semaphore_gpu)));
         CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.cq_db_rec[cell_count],sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.rq_db_rec[cell_count],sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.doca_rxq[cell_count],sizeof(struct doca_gpu_eth_rxq)));
@@ -1398,6 +1401,8 @@ int OrderKernelTestBench::run_test()
     }
 
     NVLOGC_FMT(TAG_ORDER_TB_RUN, "Run launch_process_kernel_for_test_bench");
+    //cudaFree(0);
+    //cudaSetDevice(0);
 
     setup_input_params();
     read_ok_tb_config_file_params();
@@ -1468,6 +1473,7 @@ int OrderKernelTestBench::run_test()
             *ok_tb_input_params.exit_cond_d[cell_idx]=ORDER_KERNEL_RUNNING;
             ok_tb_config_params->exit_cond_d[cell_idx]=ok_tb_input_params.exit_cond_d[cell_idx];
             ok_tb_config_params->sem_gpu[cell_idx]->pkt_info_gpu[0].status=DOCA_GPU_SEMAPHORE_STATUS_READY;
+            ok_tb_config_params->sem_gpu_aerial_fh[cell_idx]->pkt_info_gpu[slot_count%MAX_SEM_ITEMS].status=AERIAL_FH_GPU_SEMAPHORE_STATUS_READY;
 
 
             OrderKernelSetupDocaParams(cell_idx);            
@@ -1582,6 +1588,7 @@ int OrderKernelTestBench::run_test()
             ok_tb_config_params->max_rx_pkts,
             ok_tb_config_params->rx_pkts_timeout_ns,
             ok_tb_config_params->sem_gpu,
+            ok_tb_config_params->sem_gpu_aerial_fh,
             ok_tb_config_params->slot_start,
             ok_tb_config_params->ta4_min_ns,
             ok_tb_config_params->ta4_max_ns,

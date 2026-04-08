@@ -54,3 +54,23 @@ target_link_libraries(perf_metrics_accumulator_benchmark PRIVATE perf_metrics)
 if(TARGET nvlog)
     target_link_libraries(perf_metrics_accumulator_benchmark PRIVATE nvlog)
 endif()
+
+# Percentile tracker unit test
+
+add_executable(percentile_tracker_unit_test 
+    percentile_tracker_unit_test.cpp
+)
+
+# Set C++ standard
+set_target_properties(percentile_tracker_unit_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+)
+
+# Link with the perf_metrics library
+target_link_libraries(percentile_tracker_unit_test PRIVATE perf_metrics)
+
+# Ensure nvlog headers are available for the test
+if(TARGET nvlog)
+    target_link_libraries(percentile_tracker_unit_test PRIVATE nvlog)
+endif()

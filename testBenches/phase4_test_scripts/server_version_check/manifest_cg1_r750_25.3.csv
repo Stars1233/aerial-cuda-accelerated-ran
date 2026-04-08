@@ -1,0 +1,25 @@
+system_type,component,version,optional
+DU,BMC,1.03,n
+DU,BIOS,2.0c,n
+DU,VBIOS,96.00.8D.00.03,n
+DU,Ubuntu,22.04,n
+DU,Kernel,6.8.0-1025-nvidia-64k,n
+DU,GPU Driver,575.57.08,n
+DU,CUDA,12.9.0,n
+DU,DOCA OFED,25.04-0.6.1,n
+DU,PTP4L,4.2,n
+DU,GDRCOPY,2.5,n
+DU,BlueField FW,32.45.1020,n
+DU,aerial00 Link Speed,200G,n
+DU,GPU Clock Lock,Locked at 1980MHz (Max),n
+DU,Cmdline,"BOOT_IMAGE=/vmlinuz-6.8.0-1025-nvidia-64k root=/dev/mapper/ubuntu--vg-ubuntu--lv ro pci=realloc=off pci=pcie_bus_safe default_hugepagesz=512M hugepagesz=512M hugepages=48 tsc=reliable processor.max_cstate=0 audit=0 idle=poll rcu_nocb_poll nosoftlockup irqaffinity=0 isolcpus=managed_irq,domain,4-64 nohz_full=4-64 rcu_nocbs=4-64 earlycon module_blacklist=nouveau acpi_power_meter.force_cap_on=y numa_balancing=disable init_on_alloc=0 preempt=none",n
+DU,Container Toolkit,1.17.7,y
+RU,BMC,7.20,n
+RU,BIOS,1.17.2,n
+RU,Ubuntu,22.04,n
+RU,Kernel,5.15.0-1042-nvidia-lowlatency,n
+RU,PTP4L,4.2,n
+RU,BlueField FW,32.45.1020,n
+RU,aerial00 Link Speed,200G,n
+RU,Cmdline,"BOOT_IMAGE=/vmlinuz-5.15.0-1042-nvidia-lowlatency root=/dev/mapper/ubuntu--vg-ubuntu--lv ro pci=realloc=off default_hugepagesz=1G hugepagesz=1G hugepages=16 tsc=reliable clocksource=tsc intel_idle.max_cstate=0 mce=ignore_ce processor.max_cstate=0 intel_pstate=disable audit=0 idle=poll rcu_nocb_poll nosoftlockup iommu=off irqaffinity=0-3 isolcpus=managed_irq,domain,4-47 nohz_full=4-47 rcu_nocbs=4-47 noht numa_balancing=disable",n
+RU,Container Toolkit,1.17.6,y

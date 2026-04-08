@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,8 +33,11 @@ __global__ void kernel_compress(compression_params params)
     const int prbs_per_symbol = params.max_num_prb_per_symbol[cell_id];
     const int in_prb_offset = antenna_id * SLOT_NUM_SYMS * prbs_per_symbol + symbol_id * prbs_per_symbol;
     const int out_prb_offset = symbol_id * params.num_antennas[cell_id] * prbs_per_symbol + antenna_id * prbs_per_symbol;
-
+    // coverity[CUDA_INITIATION_OBJECT_DEVICE_THREAD_BLOCK:SUPPRESS]
+    // coverity[initiation_object_device_thread_block]
     __shared__ __align__(16) uint8_t sm[COMPRESSION_THREADS * 15]; // (threads / 32) * 10 * 48 bytes
+    // coverity[CUDA_INITIATION_OBJECT_DEVICE_THREAD_BLOCK:SUPPRESS]
+    // coverity[initiation_object_device_thread_block]
     __shared__ uint8_t* sm_prb_ptr[(COMPRESSION_THREADS / 32) * 10]; // 10 prbs per warp
 
     uint8_t**  prb_ptrs     = params.prb_ptrs[cell_id];

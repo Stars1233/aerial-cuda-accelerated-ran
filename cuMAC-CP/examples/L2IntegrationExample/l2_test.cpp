@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -150,13 +150,13 @@ static int test_l2_send_slot(nv_ipc_t* ipc, uint32_t slot, uint32_t sfn, uint32_
     int64_t buildMsg_duration = nvlog_timespec_interval(&buildMsg_start, &buildMsg_end);
     int64_t sendMsg_duration = nvlog_timespec_interval(&sendMsg_start, &sendMsg_end);
 
-    NVLOGI(TAG, "L2 NVIPC shared buffer allocation duration: %d ns", nvipcAlloc_duration);
-    NVLOGI(TAG, "L2 NVIPC message build duration: %d ns", buildMsg_duration);
-    NVLOGI(TAG, "L2 NVIPC message send duration: %d ns", sendMsg_duration);
+    NVLOGI(TAG, "L2 NVIPC shared buffer allocation duration: %ld ns", nvipcAlloc_duration);
+    NVLOGI(TAG, "L2 NVIPC message build duration: %ld ns", buildMsg_duration);
+    NVLOGI(TAG, "L2 NVIPC message send duration: %ld ns", sendMsg_duration);
 
-    printf("L2 NVIPC shared buffer allocation duration: %d ns\n", nvipcAlloc_duration);
-    printf("L2 NVIPC message build duration: %d ns\n", buildMsg_duration);
-    printf("L2 NVIPC message send duration: %d ns\n", sendMsg_duration);
+    printf("L2 NVIPC shared buffer allocation duration: %ld ns\n", nvipcAlloc_duration);
+    printf("L2 NVIPC message build duration: %ld ns\n", buildMsg_duration);
+    printf("L2 NVIPC message send duration: %ld ns\n", sendMsg_duration);
 
     return 0;
 }
@@ -376,8 +376,8 @@ int main(int argc, char** argv)
     usleep(1000000);
 
     // Create L2 receiver thread
-    pthread_t thread_id;
-    int ret = pthread_create(&thread_id, NULL, l2_blocking_recv_task, NULL);
+    pthread_t recv_thread_id;
+    int ret = pthread_create(&recv_thread_id, NULL, l2_blocking_recv_task, NULL);
     if(ret != 0)
     {
         NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s failed, ret=%d", __func__, ret);
@@ -438,6 +438,25 @@ int main(int argc, char** argv)
 
         // Update timestamp for next slot
         get_next_slot_timespec(&ts_slot, SLOT_INTERVAL_NS);
+    }
+
+    if(recv_thread_id != 0)
+    {
+        // Cancel the receiver thread
+        NVLOGI(TAG, "%s: canceling receiver thread", __func__);
+        if(pthread_cancel(recv_thread_id) != 0)
+        {
+            NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s pthread_cancel failed, stderr=%s", __func__, strerror(errno));
+        }
+
+        // Wait for the receiver thread to finish
+        NVLOGI(TAG, "%s: waiting for receiver thread to exit", __func__);
+        int ret = pthread_join(recv_thread_id, NULL);
+        if(ret != 0)
+        {
+            NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s pthread_join failed, stderr=%s", __func__, strerror(ret));
+            return -1;
+        }
     }
 
     return 0;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,15 @@
 #include "fapi_handler.hpp"
 #include "scf_5g_fapi_msg_helpers.hpp"
 
+// Schedule item structure for each FAPI message.
+typedef struct {
+    int cell_id; // Cell ID
+    fapi_group_t group_id; // FAPI group ID, represents the TX FAPI message
+    int32_t exist; // Whether the FAPI message exists in current slot. 0 - not exist, 1 - exist
+    int32_t remain_num; // Remaining number of messages to send within the same TX deadline.
+    int64_t tx_deadline; // FAPI TX deadline time. Unit: ns.
+} schedule_item_t;
+
 class scf_fapi_handler : public fapi_handler {
 public:
     scf_fapi_handler(phy_mac_transport& ipc_transport, test_mac_configs* configs, launch_pattern* lp, ch8_conformance_test_stats* conformance_test_stats);
@@ -37,6 +46,11 @@ public:
     int  schedule_slot(sfn_slot_t ss);
     int  schedule_fapi_reqs(sfn_slot_t ss, int ts_offset);
     int  schedule_fapi_request(int cell_id, sfn_slot_t ss, fapi_group_t group_id, int32_t ts_offset);
+
+    /**
+     * Stop all cells and exit the FAPI handler
+     */
+    void terminate();
 
     // FAPI builder thread function
     void builder_thread_func();
@@ -107,6 +121,8 @@ protected:
     int compare_ul_measurement(fapi_validate* vald, ul_measurement_t& tv, uint8_t* payload, uint16_t pdu_type);
     int compare_ul_measurement_ehq(fapi_validate* vald, ul_measurement_t& tv, uint8_t* payload, uint16_t pdu_type);
 
+    // Reorder schedule sequence per slot (only items with fapi_reqs.size() > 0), by deadline
+    int reorder_schedule_sequence(sfn_slot_t ss);
 
     // Data members
 
@@ -116,6 +132,12 @@ protected:
 
     // Dynamic slot test parameters for spectral efficiency
     std::vector<uint8_t> dyn_tb_data_gen_buf;
+
+    // Schedule item list. size = cell_num * FAPI_REQ_SIZE
+    std::vector<schedule_item_t> schedule_item_list;
+
+    // Schedule sequence (indices into schedule_item_list). Size = number of items with fapi_reqs.size() > 0 for current slot.
+    std::vector<int> schedule_sequence;
 };
 
 #endif /* _SCF_FAPI_HANDLER_HPP_ */

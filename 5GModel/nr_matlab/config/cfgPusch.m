@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,6 +85,7 @@ pusch.part2SizeMapping = [5, 5, 4, 4];
 % pusch.lowPaprGroupNumber = 0;
 % pusch.lowPaprSequenceNumber = 0;
 pusch.prgSize = 273;
+pusch.enable_prg_chest = 0;
 pusch.csiPart2BitLength = 255;
 
 % 10.04 FAPI CSI2 constants:
@@ -101,6 +102,8 @@ pusch.nCsi2Reports            = 0;
 pusch.flagCsiPart2            = 0;
 pusch.foForgetCoeff           = 0.0;
 pusch.foCompensationBuffer    = 1.0;
+pusch.ldpcEarlyTerminationPerUe = 0;
+pusch.ldpcMaxNumItrPerUe      = 10;
 
 
 return

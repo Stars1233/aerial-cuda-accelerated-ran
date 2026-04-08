@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -93,7 +93,6 @@ args = base.parse_args()
 
 gpu_freq = []
 mem_freq = []
-power = []
 mem_used = []
 testConfig = []
 
@@ -113,7 +112,6 @@ for filename in args.filenames:
             
             gpu_freq.extend([int(x[0]) for x in data[cells]])
             mem_freq.extend([int(x[1]) for x in data[cells]])
-            power.extend([float(x[2]) for x in data[cells]])
             mem_used.extend([float(x[3]) for x in data[cells]])
             
             # Add test config once per file, not for each data point

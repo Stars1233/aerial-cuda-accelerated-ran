@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +27,8 @@ namespace aerial_fh
 {
 RingBuffer::RingBuffer(Fronthaul* fhi, RingBufferInfo const* info) :
     fhi_{fhi},
-    info_{*info}
+    info_{*info},
+    id_{0}
 {
     NVLOGI_FMT(TAG, "Creating ring buffer '{}' of size {}", info_.name, info_.count);
 

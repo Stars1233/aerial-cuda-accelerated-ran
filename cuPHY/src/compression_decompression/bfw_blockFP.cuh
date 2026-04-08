@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -160,7 +160,6 @@ __device__ inline void bfw_scale_compress_blockFP(
         auto tile32 = cg::tiled_partition<32>(cg::this_thread_block());
         auto tx     = tile32.thread_rank();
         auto ty     = tile32.meta_group_rank();
-        tile32.sync();
 
         constexpr int prbs_per_warp = 32 * 4 / N_ANT; // 32 threads x 4 antennas per thread
 
@@ -175,11 +174,13 @@ __device__ inline void bfw_scale_compress_blockFP(
             if(iprb < N_LAYERS)
             {
                 // Transpose to an output (N_ANT, ngrps, N_LAYERS)
-                uint8_t* sm_prb_ptr = reinterpret_cast<uint8_t*>(smem + iprb * SM_LDIM);
+                uint8_t* compVals = reinterpret_cast<uint8_t*>(smem + iprb * SM_LDIM);
                 uint32_t out_offset = iprb * ngrps * compbytes;
-#pragma unroll 1
-                for(int b = tx; b < compbytes; b += 32)
-                    output[out_offset + b] = sm_prb_ptr[b];
+
+                // Copy compressed bytes to global memory
+                for (int b = tx; b < compbytes; b += 32) {
+                    output[out_offset + b] = compVals[b];
+                }
             }
         }
     }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,13 +53,13 @@
  // for other channel models, *AntSize, *AntSpacing, *AntPolarAngles, *AntPattern, vDirection are not used
  // by default, UE uses isotropic antennas, BS uses directional antennas
  #define nBsAntConst            4 
- #define bsAntSizeConst         {1,2,2,1,1} // {M_g,N_g,P,M,N} 3GPP TR 38.901 Section 7.3. Assuming one panel, fix M=N=1. P can be 1 or 2
- #define bsAntSpacingConst      {0.5f, 0.5f, 1.0f, 1.0f} // BS antenna spacing w.r.t. wavelength. Assuming one panel, fix last two elements to 1.0f
+#define bsAntSizeConst          {1,1,1,2,2} // {M_g,N_g,M,N,P} 3GPP TR 38.901 Section 7.3
+#define bsAntSpacingConst       {1.0f, 1.0f, 0.5f, 0.5f} // BS antenna spacing [d_g_h, d_g_v, d_h, d_v] in wavelengths
  #define bsAntPolarAnglesConst  {45.0f, -45.0f} // BS antenna polarization angles
  #define bsAntPatternConst      1 // 0: isotropic; 1: 38.901
  #define nUeAntConst            4 // assumption's that nUeAntConst <= nBsAntConst; nUeAntConst is also equal to the maximum number of layers
- #define ueAntSizeConst         {2,2,1,1,1} // {M_g,N_g,P,M,N} 3GPP TR 38.901 Section 7.3. Assuming one panel, fix M=N=1. P can be 1 or 2
- #define ueAntSpacingConst      {0.5f, 0.5f, 1.0f, 1.0f} // UE antenna spacing w.r.t. wavelength. Assuming one panel, fix last two elements to 1.0f
+#define ueAntSizeConst          {1,1,2,2,1} // {M_g,N_g,M,N,P} 3GPP TR 38.901 Section 7.3
+#define ueAntSpacingConst       {1.0f, 1.0f, 0.5f, 0.5f} // UE antenna spacing [d_g_h, d_g_v, d_h, d_v] in wavelengths
  #define ueAntPolarAnglesConst  {0.0f, 90.0f} // UE antenna polarization angles
  #define ueAntPatternConst      0  // 0: isotropic; 1: 38.901
  #define vDirectionConst        {90, 0} // moving direction, [RxA; RxZ] — RxA and RxZ specify the azimuth and zenith of the direction of travel of the moving UE; moving speed is converted to maxDopplerShift in cdlCfg

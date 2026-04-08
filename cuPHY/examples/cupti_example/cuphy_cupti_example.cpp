@@ -25,6 +25,7 @@
 #include "test_kernel.h"
 #include "cupti_helper.hpp"
 #include "util.hpp"
+#include "common_utils.hpp"
 
 #define TAG "CUPHY.CUPTI"
 

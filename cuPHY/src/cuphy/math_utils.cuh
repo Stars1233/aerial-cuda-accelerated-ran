@@ -39,6 +39,37 @@ __forceinline__ __device__ T complex_mul(const T& a, const T& b)
     return __hcmadd(a, b, c);
   }
 
+// complex_addmul() //ToDo: may consider switching to cuCma()
+  __device__ __inline__  float2 complex_addmul( float2 x, float2 y, float2 acc)
+  {
+      float real_res;
+      float imag_res;
+
+      real_res = (cuCrealf(x) *  cuCrealf(y)) + cuCrealf(acc);
+      imag_res = (cuCrealf(x) *  cuCimagf(y)) + cuCimagf(acc);
+
+      real_res = -(cuCimagf(x) * cuCimagf(y))  + real_res;
+      imag_res =  (cuCimagf(x) *  cuCrealf(y)) + imag_res;
+
+      return make_cuComplex(real_res, imag_res);
+  }
+
+  __device__ __inline__  __half2 complex_addmul( __half2 x, __half2 y, __half2 acc)
+  {
+      return __hcmadd(x,y,acc);
+  }
+
+  __device__ float2 complex_scalar_multiply(float2 vector_val, float scalar_val)
+  {
+      return make_float2(vector_val.x * scalar_val, vector_val.y * scalar_val);
+  }
+
+  __device__ __half2 complex_scalar_multiply(__half2 vector_val, __half scalar_val)
+  {
+      return __hmul2(vector_val, make_half2(scalar_val, scalar_val));
+  }
+
+
   ////////////////////////////////////////////////////////////////////////
   // real_mul() multiplies complex value with a real value
   template <typename T1, typename T2>

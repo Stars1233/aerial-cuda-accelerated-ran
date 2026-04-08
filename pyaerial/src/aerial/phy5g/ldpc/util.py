@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -574,7 +574,7 @@ def code_block_desegment(
     transport_block = transport_block.astype(np.uint8)
 
     if not return_bits:
-        transport_block = np.packbits(transport_block)
+        transport_block = np.packbits(transport_block)  # type: ignore[assignment]
 
     return transport_block
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,7 +52,16 @@ PhyPucchAggr::PhyPucchAggr(
     pf0OutBuffer = std::move(cuphy::buffer<cuphyPucchF0F1UciOut_t, cuphy::pinned_alloc>(UL_MAX_CELLS_PER_SLOT * MAX_PUCCH_F0_UCIS));
     pf1OutBuffer = std::move(cuphy::buffer<cuphyPucchF0F1UciOut_t, cuphy::pinned_alloc>(UL_MAX_CELLS_PER_SLOT* MAX_PUCCH_F1_UCIS));
 
-    pucch_users = 128; // 1B x 128 users
+    // Calculate PUCCH user buffer size based on F2/F3 UCI limits
+    // With ENABLE_64C: MAX_CELLS_PER_SLOT=40, each cell supports 24 F2+F3 UCIs
+    // Total: 40 * 24 = 960 (matches CUPHY_PUCCH_F2_MAX_UCI and CUPHY_PUCCH_F3_MAX_UCI)
+#ifdef ENABLE_64C
+    pucch_users = 960;  // MAX_CELLS_PER_SLOT (40) * 24 UCIs per cell
+#else
+    pucch_users = 480;  // MAX_CELLS_PER_SLOT (20) * 24 UCIs per cell
+#endif
+    NVLOGI_FMT(TAG, "PhyPucchAggr: Allocating buffers for pucch_users={}", pucch_users);
+    
     bPucchF2OutOffsets = std::move(cuphy::buffer<cuphyPucchF234OutOffsets_t, cuphy::pinned_alloc>(pucch_users));
     bPucchF3OutOffsets = std::move(cuphy::buffer<cuphyPucchF234OutOffsets_t, cuphy::pinned_alloc>(pucch_users));
     bCrcFlags = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pucch_users));
@@ -65,10 +74,9 @@ PhyPucchAggr::PhyPucchAggr(
     bHarqDetectionStatus = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pucch_users));
     bCsiP1DetectionStatus = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pucch_users));
     bCsiP2DetectionStatus = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pucch_users));
-    pucch_users = pucch_users * 816;
-    uint32_t  nUciPayloadBytes = MAX_N_PRBS_SUPPORTED * MAX_N_BBU_LAYERS_SUPPORTED * OFDM_SYMBOLS_PER_SLOT * CUPHY_N_TONES_PER_PRB * CUPHY_QAM_256;
-    bUciPayloads = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(nUciPayloadBytes)); // 4B x 128 users
-    pucch_users = 128;
+    
+    uint32_t  nUciPayloadBytes = MAX_N_PRBS_SUPPORTED * MAX_N_BBU_LAYERS_PUCCH_SUPPORTED * OFDM_SYMBOLS_PER_SLOT * CUPHY_N_TONES_PER_PRB * CUPHY_QAM_256;
+    bUciPayloads = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(nUciPayloadBytes));
 
     procModeBmsk = PUCCH_PROC_MODE_FULL_SLOT;
 
@@ -131,7 +139,7 @@ PhyPucchAggr::~PhyPucchAggr()
 
 slot_command_api::pucch_params* PhyPucchAggr::getDynParams()
 {
-    return aggr_slot_params->cgcmd->pucch.get();;
+    return aggr_slot_params->cgcmd->pucch.get();
 }
 
 int PhyPucchAggr::createPhyObj() 
@@ -406,7 +414,7 @@ int PhyPucchAggr::callback()
     {
         NVLOGI_FMT(TAG, "Calling PUCCH UL callback for cell {}", cell_id);
         auto pucch = getDynParams();
-        ul_cb.uci_cb_fn2(*(aggr_slot_params->si), *pucch, DataOut);
+        ul_cb.uci_cb_fn2(ul_cb.uci_cb_fn2_context, *(aggr_slot_params->si), *pucch, DataOut);
     }
     
     //cell_ptr->updateMetric(CellMetric::kPucchProcessingTime, this->getGPURunTime());

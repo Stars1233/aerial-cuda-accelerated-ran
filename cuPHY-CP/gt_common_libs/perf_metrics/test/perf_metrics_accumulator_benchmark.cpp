@@ -29,8 +29,8 @@
 #include <cmath>
 #include <cstdint>
 
-// Use a known NVLOG tag for testing
-#define TAG_TEST_PERF 54
+// Use DRV.PERF_METRICS tag for testing (NVLOG_TAG_BASE_CUPHY_DRIVER + 48)
+#define TAG_PERF_METRICS 248
 
 /**
  * Calculate statistics from a vector of durations

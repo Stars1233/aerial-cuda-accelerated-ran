@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,7 +59,12 @@ for idxPdu = 1:nPdu
     SrsParamsList(idxPdu).Tsrs = pdu.Tsrs;
     SrsParamsList(idxPdu).Toffset = pdu.Toffset;
     SrsParamsList(idxPdu).groupOrSequenceHopping = pdu.groupOrSequenceHopping;
-    SrsParamsList(idxPdu).prgSize = pdu.prgSize;
+    SrsParamsList(idxPdu).prgSizeL2 = pdu.prgSize;
+    if pdu.prgSize > 4
+        SrsParamsList(idxPdu).prgSize = 2;
+    else
+        SrsParamsList(idxPdu).prgSize = pdu.prgSize;
+    end
     SrsParamsList(idxPdu).RNTI = pdu.RNTI;
 
     nAntPorts                      = SrsParamsList(idxPdu).nAntPorts;
@@ -177,6 +182,7 @@ function [srsUeDescriptors, srsUeGroupDescriptors, nComputeBlocks, computeBlockD
         groupOrSequenceHopping = SrsParamsList(ueIdx + 1).groupOrSequenceHopping;
         srsAntPortToUeAntMap   = SrsParamsList(ueIdx + 1).srsAntPortToUeAntMap;
         prgSize                = SrsParamsList(ueIdx + 1).prgSize;
+        prgSizeL2              = SrsParamsList(ueIdx + 1).prgSizeL2;
         chEstBuffStartPrbGrp   = srsRxDatabase{ueIdx + 1}.chEstBuffer_startPrbGrp;
         
         slotNum     = cellParams.slotNum;
@@ -374,9 +380,12 @@ function [srsUeDescriptors, srsUeGroupDescriptors, nComputeBlocks, computeBlockD
         end
         
         % set tensor dimension for ChEst report to L2:
-        srsRxDatabase{ueIdx + 1}.prgSize = prgSize;        
-        srsRxDatabase{ueIdx + 1}.HestToL2   = zeros(nPrbsPerHop/prgSize *nHops_prime, srsRxDatabase{ueIdx + 1}.chEstBuffer_nRxAntSrs, nAntPorts);
-        srsRxDatabase{ueIdx + 1}.nPrbGrps   = nPrbsPerHop / prgSize * nHops_prime;
+        srsRxDatabase{ueIdx + 1}.prgSize       = prgSize;  
+        srsRxDatabase{ueIdx + 1}.prgSizeL2     = prgSizeL2;        
+        srsRxDatabase{ueIdx + 1}.HestToL2Inner = zeros(nPrbsPerHop/prgSize *nHops_prime, srsRxDatabase{ueIdx + 1}.chEstBuffer_nRxAntSrs, nAntPorts);
+        srsRxDatabase{ueIdx + 1}.HestToL2      = zeros(nPrbsPerHop/prgSizeL2 *nHops_prime, srsRxDatabase{ueIdx + 1}.chEstBuffer_nRxAntSrs, nAntPorts);
+        srsRxDatabase{ueIdx + 1}.nPrbGrps      = nPrbsPerHop / prgSize * nHops_prime;
+        srsRxDatabase{ueIdx + 1}.nPrbGrpsL2    = nPrbsPerHop / prgSizeL2 * nHops_prime;
         srsRxDatabase{ueIdx + 1}.startValidPrg = floor(hopStartPrbs(1) / prgSize);
         
         % save user descriptor:
@@ -1399,7 +1408,7 @@ function srsRxDatabase = srsComputeBlock(computeBlockDescriptor, srsUeDescriptor
             for portIdx = 0 : (nPortsPerComb - 1)
                 for avgHestIdx = 0 : (nPrgPerCompBlk - 1)
                     srsRxDatabase{ueIdx + 1}.Hest(chEstBuffOffset + avgHestIdx + 1, blockStartAnt + antIdx + 1, portToUeAntMap(portIdx + 1) + 1)          = avgHest(antPortOffset + portIdx + 1, avgHestIdx + 1, antIdx + 1);
-                    srsRxDatabase{ueIdx + 1}.HestToL2(chEstToL2Offset + avgHestIdx + 1, blockStartAnt + antIdx + 1, portToL2OutUeAntMap(portIdx + 1) + 1) = avgHest(antPortOffset + portIdx + 1, avgHestIdx + 1, antIdx + 1);
+                    srsRxDatabase{ueIdx + 1}.HestToL2Inner(chEstToL2Offset + avgHestIdx + 1, blockStartAnt + antIdx + 1, portToL2OutUeAntMap(portIdx + 1) + 1) = avgHest(antPortOffset + portIdx + 1, avgHestIdx + 1, antIdx + 1);
                 end
             end
             antPortOffset = antPortOffset + nPortsPerComb;
@@ -1452,6 +1461,23 @@ function srsRxDatabase = finalizeSrsOutput(nSrsUes, srsRxDatabase, srsUeDescript
 
         % check correlation over other CS based on nPortsPerComb
         srsRxDatabase{ueIdx + 1}.widebandCsCorrRatioDb = 10*log10(srsRxDatabase{ueIdx + 1}.widebandCsCorrUse / srsRxDatabase{ueIdx + 1}.widebandCsCorrNotUse);
+        
+        
+        prgSize   = srsRxDatabase{ueIdx + 1}.prgSize;
+        prgSizeL2 = srsRxDatabase{ueIdx + 1}.prgSizeL2;
+
+        if prgSizeL2 > 4  
+            % down-selection
+            sz = size(srsRxDatabase{ueIdx + 1}.HestToL2);
+            prgSizeRatio = prgSizeL2 / prgSize;
+            prgSizeOffset = floor(prgSizeRatio / 2);
+            for prgIdx = 0 : sz(1)-1
+                srsRxDatabase{ueIdx + 1}.HestToL2(prgIdx+1,:,:) = srsRxDatabase{ueIdx + 1}.HestToL2Inner(prgSizeOffset+prgIdx*prgSizeRatio,:,:);
+            end
+
+        else
+            srsRxDatabase{ueIdx + 1}.HestToL2 = srsRxDatabase{ueIdx + 1}.HestToL2Inner;
+        end
 
         global SimCtrl;
         if(SimCtrl.alg.srs_chEst_toL2_normalization_algo_selector == 0)
@@ -1479,6 +1505,7 @@ function [srsRxDatabase, SrsParamsList] = init_srs_rx_dataBase(nSrsUes, SrsParam
         ueSrsRx                      = [];
         ueSrsRx.rbSnrs               = zeros(nPrbs, 1);
         ueSrsRx.Hest                 = zeros(nPrbGrps, nRxAntSrs, nUeAnt);
+        ueSrsRx.HestToL2Inner        = [];
         ueSrsRx.HestToL2             = [];
         ueSrsRx.HestNormToL2         = [];
         ueSrsRx.toEstMicroSec        = 0;
@@ -1489,7 +1516,9 @@ function [srsRxDatabase, SrsParamsList] = init_srs_rx_dataBase(nSrsUes, SrsParam
         ueSrsRx.widebandCsCorrUse    = 0;
         ueSrsRx.widebandCsCorrNotUse = 0;
         ueSrsRx.widebandCsCorrRatioDb= 0;
+        ueSrsRx.prgSizeL2            = 0;
         ueSrsRx.prgSize              = 0;
+        ueSrsRx.nPrbGrpsL2           = 0;
         ueSrsRx.nPrbGrps             = 0;
         ueSrsRx.startValidPrg        = 0;
         
@@ -1537,7 +1566,7 @@ function saveTV_srs(tvDirName, TVname,  SrsParamsList, Xtf_srs, SrsOutputList, c
         srsUePrms(ueIdx + 1).Tsrs                     = uint16(SrsParamsList(ueIdx + 1).Tsrs);
         srsUePrms(ueIdx + 1).Toffset                  = uint16(SrsParamsList(ueIdx + 1).Toffset);
         srsUePrms(ueIdx + 1).groupOrSequenceHopping   = uint8(SrsParamsList(ueIdx + 1).groupOrSequenceHopping);
-        srsUePrms(ueIdx + 1).prgSize                  = uint16(SrsParamsList(ueIdx + 1).prgSize);
+        srsUePrms(ueIdx + 1).prgSize                  = uint16(SrsParamsList(ueIdx + 1).prgSizeL2);
         srsUePrms(ueIdx + 1).RNTI                     = uint16(SrsParamsList(ueIdx + 1).RNTI);
 
         srsAntPortToUeAntMap = 0;
@@ -1677,9 +1706,9 @@ function saveTV_srs(tvDirName, TVname,  SrsParamsList, Xtf_srs, SrsOutputList, c
         HestNormToL2 = ueSrsRx.HestNormToL2;
         nameStr  = strcat('HestNormToL2Ue',num2str(ueIdx));
         hdf5_write_nv(h5File, nameStr, complex(int16(HestNormToL2)));
-        
-        srsChEstToL2Prms(ueIdx + 1).nPrbGrps   = ueSrsRx.nPrbGrps;
-        srsChEstToL2Prms(ueIdx + 1).prgSize    = ueSrsRx.prgSize;
+
+        srsChEstToL2Prms(ueIdx + 1).nPrbGrps   = ueSrsRx.nPrbGrpsL2;
+        srsChEstToL2Prms(ueIdx + 1).prgSize    = ueSrsRx.prgSizeL2;
         
         % SRS ChEst buffer paramaters:
         srsChEstBufferInfo(ueIdx + 1).nRxAnt      = uint16(ueSrsRx.chEstBuffer_nRxAntSrs);

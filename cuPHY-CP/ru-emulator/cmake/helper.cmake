@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,7 @@ set(SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/ru_emulator.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/packet_timings.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/standalone.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/timing_utils.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/sectionid_validation.cpp
             )
 
 

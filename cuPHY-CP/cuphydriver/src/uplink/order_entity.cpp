@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,166 +52,166 @@ OrderEntity::OrderEntity(phydriver_handle _pdh, GpuDevice* _gDev) :
     for(auto& start_cuphy:start_cuphy_gdr){
         start_cuphy.reset(gDev->newGDRbuf(sizeof(uint32_t)));
         ((uint32_t*)(start_cuphy->addrh()))[0] = 0;
-        mf.addGpuPinnedSize(start_cuphy->size_free);
+        mf.addGpuPinnedSize(start_cuphy->size_alloc);
     }
 
     for(auto& order_kernel_exit_cond:order_kernel_exit_cond_gdr){
         order_kernel_exit_cond.reset(gDev->newGDRbuf(sizeof(uint32_t)));
         ((uint32_t*)(order_kernel_exit_cond->addrh()))[0] = ORDER_KERNEL_RUNNING;
-        mf.addGpuPinnedSize(order_kernel_exit_cond->size_free);
+        mf.addGpuPinnedSize(order_kernel_exit_cond->size_alloc);
     }
 
     for(auto& start_cuphy:start_cuphy_srs_gdr){
         start_cuphy.reset(gDev->newGDRbuf(sizeof(uint32_t)));
         ((uint32_t*)(start_cuphy->addrh()))[0] = 0;
-        mf.addGpuPinnedSize(start_cuphy->size_free);
+        mf.addGpuPinnedSize(start_cuphy->size_alloc);
     }
 
     for(auto& order_kernel_exit_cond:order_kernel_srs_exit_cond_gdr){
         order_kernel_exit_cond.reset(gDev->newGDRbuf(sizeof(uint32_t)));
         ((uint32_t*)(order_kernel_exit_cond->addrh()))[0] = ORDER_KERNEL_RUNNING;
-        mf.addGpuPinnedSize(order_kernel_exit_cond->size_free);
+        mf.addGpuPinnedSize(order_kernel_exit_cond->size_alloc);
     }    
 
     //Ordered PRBs
     for(auto& oprbs_prach:ordered_prbs_prach){
         oprbs_prach.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(oprbs_prach->size_alloc);
     }
     for(auto& oprbs_pusch:ordered_prbs_pusch){
         oprbs_pusch.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(oprbs_pusch->size_alloc);
     }
 
     for(auto& oprbs_srs:ordered_prbs_srs){
         oprbs_srs.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(oprbs_srs->size_alloc);
     }
 
     /*Sub-slot Processing specific*/
     pusch_prb_symbol_map_gdr.reset(gDev->newGDRbuf(sizeof(uint32_t)*UL_MAX_CELLS_PER_SLOT*ORAN_PUSCH_SYMBOLS_X_SLOT));
-    mf.addGpuPinnedSize(sizeof(uint32_t)*UL_MAX_CELLS_PER_SLOT*ORAN_PUSCH_SYMBOLS_X_SLOT);
+    mf.addGpuPinnedSize(pusch_prb_symbol_map_gdr->size_alloc);
     sym_ord_done_mask_arr.reset(gDev->newGDRbuf(ORAN_PUSCH_SYMBOLS_X_SLOT * sizeof(uint32_t)));
-    mf.addGpuRegularSize(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t));
+    mf.addGpuPinnedSize(sym_ord_done_mask_arr->size_alloc);
     num_order_cells_sym_mask_arr.reset(gDev->newGDRbuf(ORAN_PUSCH_SYMBOLS_X_SLOT * sizeof(uint32_t)));
-    mf.addGpuRegularSize(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t));    
+    mf.addGpuPinnedSize(num_order_cells_sym_mask_arr->size_alloc);
 
     //Multi-Block barrier
     // order_barrier_flag.reset(new dev_buf(1 * sizeof(int), gDev));
     // order_barrier_flag->clear();
     order_barrier_flag.reset(gDev->newGDRbuf(sizeof(int)));
-    mf.addGpuPinnedSize(order_barrier_flag->size_free);
+    mf.addGpuPinnedSize(order_barrier_flag->size_alloc);
 
     for(auto& done_sh:done_shared){
         done_sh.reset(new dev_buf(1 * sizeof(uint8_t), gDev));
         done_sh->clear();
-        mf.addGpuRegularSize(sizeof(uint32_t));
+        mf.addGpuRegularSize(done_sh->size_alloc);
     }
     for(auto& done_sh:done_shared_srs){
         done_sh.reset(new dev_buf(1 * sizeof(uint8_t), gDev));
         done_sh->clear();
-        mf.addGpuRegularSize(sizeof(uint32_t));
+        mf.addGpuRegularSize(done_sh->size_alloc);
     }    
 
     ready_shared.reset(new dev_buf(1 * sizeof(int), gDev));
     ready_shared->clear();
-    mf.addGpuRegularSize(sizeof(uint32_t));
+    mf.addGpuRegularSize(ready_shared->size_alloc);
 
     rx_queue_index.reset(new dev_buf(1 * sizeof(int), gDev));
     rx_queue_index->clear();
-    mf.addGpuRegularSize(sizeof(uint32_t));
+    mf.addGpuRegularSize(rx_queue_index->size_alloc);
 
     //Early/On-time/Late RX packets
     for(auto& early_rx_pkts:early_rx_packets){
         early_rx_pkts.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(early_rx_pkts->size_alloc);
         ACCESS_ONCE(*((uint32_t*)early_rx_pkts->addrh())) = 0;
     }
     for(auto& on_time_rx_pkts:on_time_rx_packets){
         on_time_rx_pkts.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(on_time_rx_pkts->size_alloc);
         ACCESS_ONCE(*((uint32_t*)on_time_rx_pkts->addrh())) = 0;
     }
     for(auto& late_rx_pkts:late_rx_packets){
         late_rx_pkts.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(late_rx_pkts->size_alloc);
         ACCESS_ONCE(*((uint32_t*)late_rx_pkts->addrh())) = 0;
     }
     for(auto& rx_pkts_ts:rx_packets_ts){
         rx_pkts_ts.reset(gDev->newGDRbuf(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t)));
-        mf.addGpuPinnedSize(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t));
+        mf.addGpuPinnedSize(rx_pkts_ts->size_alloc);
     }    
     for(auto& rx_pkts_count:rx_packets_count){
         rx_pkts_count.reset(gDev->newGDRbuf(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
-        mf.addGpuPinnedSize(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t));
+        mf.addGpuPinnedSize(rx_pkts_count->size_alloc);
     }
     for(auto& rx_bts_count:rx_bytes_count){
         rx_bts_count.reset(gDev->newGDRbuf(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
-        mf.addGpuPinnedSize(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t));
+        mf.addGpuPinnedSize(rx_bts_count->size_alloc);
     }
     for(auto& rx_pkts_dropped_count:rx_packets_dropped_count){
         rx_pkts_dropped_count.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(rx_pkts_dropped_count->size_alloc);
         ACCESS_ONCE(*((uint32_t*)rx_pkts_dropped_count->addrh())) = 0;
     }
 
     for(auto& rx_pkts_ts_earliest:rx_packets_ts_earliest){
         rx_pkts_ts_earliest.reset(gDev->newGDRbuf(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t)));
-        mf.addGpuPinnedSize(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t));
+        mf.addGpuPinnedSize(rx_pkts_ts_earliest->size_alloc);
     }
     for(auto& rx_pkts_ts_latest:rx_packets_ts_latest){
         rx_pkts_ts_latest.reset(gDev->newGDRbuf(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t)));
-        mf.addGpuPinnedSize(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t));
+        mf.addGpuPinnedSize(rx_pkts_ts_latest->size_alloc);
     }
 
     //Early/On-time/Late RX packets for SRS
     for(auto& early_rx_pkts_srs:early_rx_packets_srs){
         early_rx_pkts_srs.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(early_rx_pkts_srs->size_alloc);
         ACCESS_ONCE(*((uint32_t*)early_rx_pkts_srs->addrh())) = 0;
     }
     for(auto& on_time_rx_pkts_srs:on_time_rx_packets_srs){
         on_time_rx_pkts_srs.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(on_time_rx_pkts_srs->size_alloc);
         ACCESS_ONCE(*((uint32_t*)on_time_rx_pkts_srs->addrh())) = 0;
     }
     for(auto& late_rx_pkts_srs:late_rx_packets_srs){
         late_rx_pkts_srs.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(late_rx_pkts_srs->size_alloc);
         ACCESS_ONCE(*((uint32_t*)late_rx_pkts_srs->addrh())) = 0;
     }
 
     for(auto& rx_pkts_count_srs:rx_packets_count_srs){
         rx_pkts_count_srs.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(rx_pkts_count_srs->size_alloc);
         ACCESS_ONCE(*((uint32_t*)rx_pkts_count_srs->addrh())) = 0;
     }
     for(auto& rx_bts_count_srs:rx_bytes_count_srs){
         rx_bts_count_srs.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(rx_bts_count_srs->size_alloc);
         ACCESS_ONCE(*((uint32_t*)rx_bts_count_srs->addrh())) = 0;
     }
     for(auto& rx_pkts_dropped_count_srs:rx_packets_dropped_count_srs){
         rx_pkts_dropped_count_srs.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-        mf.addGpuPinnedSize(sizeof(uint32_t));
+        mf.addGpuPinnedSize(rx_pkts_dropped_count_srs->size_alloc);
         ACCESS_ONCE(*((uint32_t*)rx_pkts_dropped_count_srs->addrh())) = 0;
     }
 
     for(auto& rx_pkts_ts:rx_packets_ts_srs){
         rx_pkts_ts.reset(gDev->newGDRbuf(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t)));
-        mf.addGpuPinnedSize(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t));
+        mf.addGpuPinnedSize(rx_pkts_ts->size_alloc);
     }    
     for(auto& rx_pkts_count_srs:rx_packets_count_per_sym_srs){
         rx_pkts_count_srs.reset(gDev->newGDRbuf(ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint32_t)));
-        mf.addGpuPinnedSize(ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint32_t));
+        mf.addGpuPinnedSize(rx_pkts_count_srs->size_alloc);
     }
     for(auto& rx_pkts_ts_earliest_srs:rx_packets_ts_earliest_srs){
         rx_pkts_ts_earliest_srs.reset(gDev->newGDRbuf(ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t)));
-        mf.addGpuPinnedSize(ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t));
+        mf.addGpuPinnedSize(rx_pkts_ts_earliest_srs->size_alloc);
     }
     for(auto& rx_pkts_ts_latest_srs:rx_packets_ts_latest_srs){
         rx_pkts_ts_latest_srs.reset(gDev->newGDRbuf(ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t)));
-        mf.addGpuPinnedSize(ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t));
+        mf.addGpuPinnedSize(rx_pkts_ts_latest_srs->size_alloc);
     }      
 
     /*
@@ -219,28 +219,28 @@ OrderEntity::OrderEntity(phydriver_handle _pdh, GpuDevice* _gDev) :
      */
     for(auto& eAxC_map:eAxC_map_gdr){
         eAxC_map.reset(gDev->newGDRbuf(MAX_AP_PER_SLOT * sizeof(uint16_t)));
-        mf.addGpuPinnedSize(eAxC_map->size_free);
+        mf.addGpuPinnedSize(eAxC_map->size_alloc);
     }
     std::fill(std::begin(eAxC_num),std::end(eAxC_num),0);
 
     for(auto& eAxC_prach_map:eAxC_prach_map_gdr){
         eAxC_prach_map.reset(gDev->newGDRbuf(MAX_AP_PER_SLOT * sizeof(uint16_t)));
-        mf.addGpuPinnedSize(eAxC_prach_map->size_free);
+        mf.addGpuPinnedSize(eAxC_prach_map->size_alloc);
     }
     std::fill(std::begin(eAxC_prach_num),std::end(eAxC_prach_num),0);
 
     for(auto& eAxC_srs_map:eAxC_srs_map_gdr){
         eAxC_srs_map.reset(gDev->newGDRbuf(MAX_AP_PER_SLOT_SRS * sizeof(uint16_t)));
-        mf.addGpuPinnedSize(eAxC_srs_map->size_free);
+        mf.addGpuPinnedSize(eAxC_srs_map->size_alloc);
     }
     std::fill(std::begin(eAxC_srs_num),std::end(eAxC_srs_num),0);
 
 
     cell_order_list_size = 0;
 
-    cudaMallocHost((void**)&order_kernel_config_params, sizeof(orderKernelConfigParams_t));
-    cudaMallocHost((void**)&order_kernel_config_params_srs, sizeof(orderKernelConfigParamsSrs_t));
-    cudaMallocHost((void**)&orderKernelConfigParamsCpuInitComms, sizeof(orderKernelConfigParamsCpuInitComms_t));
+    CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&order_kernel_config_params, sizeof(orderKernelConfigParams_t)));
+    CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&order_kernel_config_params_srs, sizeof(orderKernelConfigParamsSrs_t)));
+    CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&orderKernelConfigParamsCpuInitComms, sizeof(orderKernelConfigParamsCpuInitComms_t)));
 
     CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_idle));
     CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_order));
@@ -259,9 +259,9 @@ OrderEntity::~OrderEntity()
     PhyDriverCtx * pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
     pdctx->setUlCtx();
 
-    cudaFreeHost(order_kernel_config_params);
-    cudaFreeHost(order_kernel_config_params_srs);
-    cudaFreeHost(orderKernelConfigParamsCpuInitComms);
+    CUDA_CHECK_PHYDRIVER(cudaFreeHost(order_kernel_config_params));
+    CUDA_CHECK_PHYDRIVER(cudaFreeHost(order_kernel_config_params_srs));
+    CUDA_CHECK_PHYDRIVER(cudaFreeHost(orderKernelConfigParamsCpuInitComms));
 
     CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_idle));
     CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_order));
@@ -529,6 +529,7 @@ int OrderEntity::runOrder(
 
                 order_kernel_config_params_srs->rxq_info_gpu[cell_count]=cell_ptr->docaGetRxqInfoSrs()->eth_rxq_gpu; //FIXME : Add seperate DOCA RxQ API for SRS
                 order_kernel_config_params_srs->sem_gpu[cell_count]=cell_ptr->docaGetRxqInfoSrs()->sem_gpu;//FIXME : Add seperate DOCA  API for SRS
+                order_kernel_config_params_srs->sem_gpu_aerial_fh[cell_count]=cell_ptr->docaGetRxqInfoSrs()->sem_gpu_aerial_fh;
                 order_kernel_config_params_srs->sem_order_num[cell_count]=cell_ptr->docaGetSemNumSrs();//FIXME : Add seperate DOCA  API for SRS
 
                 order_kernel_config_params_srs->cell_id[cell_count]=cell_ptr->getPhyId();
@@ -713,6 +714,7 @@ int OrderEntity::runOrder(
                     if(launch_order_kernel_doca_single_subSlot(first_strm,
                                             order_kernel_config_params_srs->rxq_info_gpu,
                                             order_kernel_config_params_srs->sem_gpu,
+                                            order_kernel_config_params_srs->sem_gpu_aerial_fh,
                                             order_kernel_config_params_srs->sem_order_num,
 
                                             order_kernel_config_params_srs->cell_id,
@@ -1173,6 +1175,7 @@ int OrderEntity::runOrder(
 
                     order_kernel_config_params->rxq_info_gpu[cell_count]=cell_ptr->docaGetRxqInfo()->eth_rxq_gpu;
                     order_kernel_config_params->sem_gpu[cell_count]=cell_ptr->docaGetRxqInfo()->sem_gpu;
+                    order_kernel_config_params->sem_gpu_aerial_fh[cell_count]=cell_ptr->docaGetRxqInfo()->sem_gpu_aerial_fh;
                     order_kernel_config_params->sem_order_num[cell_count]=cell_ptr->docaGetRxqInfo()->nitems;
 
                     order_kernel_config_params->cell_id[cell_count]=cell_ptr->getPhyId();
@@ -1384,6 +1387,7 @@ int OrderEntity::runOrder(
                     if(launch_order_kernel_doca_single_subSlot(first_strm,
                                             order_kernel_config_params->rxq_info_gpu,
                                             order_kernel_config_params->sem_gpu,
+                                            order_kernel_config_params->sem_gpu_aerial_fh,
                                             order_kernel_config_params->sem_order_num,
 
                                             order_kernel_config_params->cell_id,

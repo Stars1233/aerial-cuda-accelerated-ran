@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,8 +28,25 @@ CuMACTestWorkerImpl::CuMACTestWorkerImpl(std::string const& name, uint32_t worke
     m_fp16Mode(1),
     m_ref_check_mac(false)
 {
+    // Default cuMAC config (overridable via setCumacOptions from YAML)
+    CumacOptions def;
+    setCumacOptions(def);
     // Start worker thread
     m_thrd = std::thread(&CuMACTestWorkerImpl::run, this, std::cref(greenCtx));
+}
+
+void CuMACTestWorkerImpl::setCumacOptions(const CumacOptions& opts)
+{
+    for(int i = 0; i < 4; i++)
+        m_modulesCalled[i] = opts.modules_called[i];
+    for(int i = 0; i < kMaxMacSlotsPerPattern; i++)
+    {
+        m_cumacLightWeightFlag[i] = opts.cumac_light_weight_flag[i];
+        m_percSmNumThrdBlk[i]     = opts.perc_sm_num_thrd_blk[i];
+    }
+    m_halfPrecision     = opts.half_precision;
+    m_schAlg            = opts.sch_alg;
+    m_heteroUeSelCells = opts.hetero_ue_sel_cells;
 }
 
 CuMACTestWorkerImpl::~CuMACTestWorkerImpl()
@@ -118,6 +135,10 @@ void CuMACTestWorkerImpl::init(uint32_t nStrms, uint32_t nItrsPerStrm, uint32_t 
 
 void CuMACTestWorkerImpl::macInit(std::vector<std::string> inFileNamesMac, uint32_t nMacSlots, bool ref_check_mac, bool waitRsp)
 {
+    if (nMacSlots > kMaxMacSlotsPerPattern) {
+        printf("ERROR: nMacSlots (%u) exceeds kMaxMacSlotsPerPattern (%u)\n", nMacSlots, kMaxMacSlotsPerPattern);
+        exit(1);
+    }
     m_nMacSlots         = nMacSlots;
     m_ref_check_mac     = ref_check_mac;
     
@@ -309,7 +330,11 @@ void CuMACTestWorkerImpl::macInitHandler(std::shared_ptr<void>& shPtrPayload)
         {
             //m_macPipes_cpuRef.resize(m_nMacSlots);
         }
-        // TODO: using multiple streams to creat cuMAC pipes, currently only use 1 CUDA stream
+        // Resize timing events to m_nMacSlots (one per MAC run); initHandler may have used m_nItrsPerStrmMac
+        m_timeMacSlotStartEvents.resize(m_nMacSlots);
+        m_timeMacSlotEndEvents.resize(m_nMacSlots);
+        m_totMacSlotStartTime.resize(m_nMacSlots);
+        m_totMacSlotEndTime.resize(m_nMacSlots);
         for(uint32_t strmIdx = 0; strmIdx < m_nStrmsMac; ++strmIdx)
         {
             for(uint32_t itrPerStrmIdx = 0; itrPerStrmIdx < m_nItrsPerStrmMac; itrPerStrmIdx ++)
@@ -318,12 +343,12 @@ void CuMACTestWorkerImpl::macInitHandler(std::shared_ptr<void>& shPtrPayload)
                 if(m_internalTimer && strmIdx == 0)
                     m_macInterSlotStartEventVec.emplace_back(cudaEventDisableTiming);
                 
-                m_macPipes.emplace_back(std::make_unique<cumac::cumacSubcontext>(inFileNamesMac[macSlotIdx], 1/*using GPU*/, m_halfPrecision/*using half precision*/, 0/*no RI-based layer selection*/, 0/*not Asim*/, m_heteroUeSelCells/*UE selection config*/, m_schAlg/*scheduling algorithm*/, m_modulesCalled /*UE selection, PRG allocation, layer selection, and MCS selection*/, m_cuStrmsMac[strmIdx].handle())); // using cumac::cumacSubcontext class, 
+                m_macPipes.emplace_back(std::make_unique<cumac::cumacSubcontext>(inFileNamesMac[macSlotIdx], 1/*using GPU*/, m_halfPrecision/*using half precision*/, 0/*no RI-based layer selection*/, 0/*not Asim*/, m_heteroUeSelCells/*UE selection config*/, m_schAlg/*scheduling algorithm*/, m_modulesCalled /*UE selection, PRG allocation, layer selection, and MCS selection*/, m_cuStrmsMac[strmIdx].handle())); // using cumac::cumacSubcontext class,
 
                 if(m_ref_check_mac)
                 {
-                    m_macPipes_cpuRef.emplace_back(std::make_unique<cumac::cumacSubcontext>(inFileNamesMac[macSlotIdx], 0/*using CPU*/, m_halfPrecision/*using half precision*/, 0/*no RI-based layer selection*/, 0/*not Asim*/, m_heteroUeSelCells/*UE selection config*/, m_schAlg/*scheduling algorithm*/, m_modulesCalled /*UE selection, PRG allocation, layer selection, and MCS selection*/, m_cuStrmsMac[strmIdx].handle())); // using cumac::cumacSubcontext class, 
-                    
+                    m_macPipes_cpuRef.emplace_back(std::make_unique<cumac::cumacSubcontext>(inFileNamesMac[macSlotIdx], 0/*using CPU*/, m_halfPrecision/*using half precision*/, 0/*no RI-based layer selection*/, 0/*not Asim*/, m_heteroUeSelCells/*UE selection config*/, m_schAlg/*scheduling algorithm*/, m_modulesCalled /*UE selection, PRG allocation, layer selection, and MCS selection*/, m_cuStrmsMac[strmIdx].handle())); // using cumac::cumacSubcontext class,
+
                     // TODO: GPU and CPU per slot solution might not match if using half precision on GPU
                     if(m_halfPrecision)
                     {
@@ -378,27 +403,36 @@ void CuMACTestWorkerImpl::macSetupHandler(std::shared_ptr<void>& shPtrPayload)
 
     if(m_runMac)
     {
-        // assuming 1 multicell scheduler per stream
-        for(uint32_t strmIdx = 0; strmIdx < m_nStrmsMac; ++strmIdx)
+        uint32_t runIdx = 0;
+        const uint32_t nSlotConfig = static_cast<uint32_t>(m_macSlotRunFlag.size());
+        for(uint32_t itrPerStrmIdx = 0; itrPerStrmIdx < m_nItrsPerStrmMac; itrPerStrmIdx++)
         {
-            for(uint32_t itrPerStrmIdx = 0; itrPerStrmIdx < m_nItrsPerStrmMac; itrPerStrmIdx ++)
+            for(uint32_t strmIdx = 0; strmIdx < m_nStrmsMac && runIdx < m_nMacSlots; ++strmIdx)
             {
-                uint32_t macSlotIdx = itrPerStrmIdx * m_nStrmsMac + strmIdx;
+                const uint32_t slotIdx = itrPerStrmIdx * m_nStrmsMac + strmIdx;
+                if(slotIdx >= nSlotConfig || m_macSlotRunFlag[slotIdx] == 0)
+                    continue;
 
-                // m_cumacLightWeightFlag defines which kenel we need
-                // m_lightWeightFlagOffset will change the position of heavy/light kernels, right shift
-                m_macPipes[macSlotIdx]->setup(inFileNamesMac[macSlotIdx], m_cumacLightWeightFlag[(macSlotIdx - m_lightWeightFlagOffset + m_nMacSlots) % m_nMacSlots], m_percSmNumThrdBlk[(macSlotIdx - m_lightWeightFlagOffset + m_nMacSlots) % m_nMacSlots], m_cuStrmsMac[strmIdx].handle());
-
-                // only warm-up heavy kernel and light weight (SRS computation) kernel
-                if(m_cumacLightWeightFlag[(macSlotIdx - m_lightWeightFlagOffset + m_nMacSlots) % m_nMacSlots] <= 2)
+                if(runIdx >= m_macPipes.size() || runIdx >= inFileNamesMac.size())
                 {
-                    m_macPipes[macSlotIdx]->run(m_cuStrmsMac[strmIdx].handle());
+                    printf("ERROR: macSetupHandler runIdx (%u) out of bounds (m_macPipes=%zu, inFileNamesMac=%zu)\n", runIdx, m_macPipes.size(), inFileNamesMac.size());
+                    break;
+                }
+
+                const uint32_t macSlotIdx = runIdx;
+                const uint32_t lwSlot = (macSlotIdx - m_lightWeightFlagOffset + m_nMacSlots) % m_nMacSlots;
+                m_macPipes[runIdx]->setup(inFileNamesMac[runIdx], m_cumacLightWeightFlag[lwSlot], m_percSmNumThrdBlk[lwSlot], m_cuStrmsMac[strmIdx].handle());
+
+                if(m_cumacLightWeightFlag[lwSlot] <= 2)
+                {
+                    m_macPipes[runIdx]->run(m_cuStrmsMac[strmIdx].handle());
                 }
 
                 if(m_ref_check_mac)
                 {
-                    m_macPipes_cpuRef[macSlotIdx]->setup(inFileNamesMac[macSlotIdx], m_cumacLightWeightFlag[(macSlotIdx - m_lightWeightFlagOffset + m_nMacSlots) % m_nMacSlots], m_percSmNumThrdBlk[(macSlotIdx - m_lightWeightFlagOffset + m_nMacSlots) % m_nMacSlots], m_cuStrmsMac[strmIdx].handle());
+                    m_macPipes_cpuRef[runIdx]->setup(inFileNamesMac[runIdx], m_cumacLightWeightFlag[lwSlot], m_percSmNumThrdBlk[lwSlot], m_cuStrmsMac[strmIdx].handle());
                 }
+                runIdx++;
             }
         }
 
@@ -446,19 +480,19 @@ void CuMACTestWorkerImpl::macRunHandler(std::shared_ptr<void>& shPtrPayload)
                 // note: no initial delay is introduced in cuMAC internal timer
             } 
 
-            for(uint32_t itrPerStrmIdx = 0; itrPerStrmIdx < m_nItrsPerStrmMac; itrPerStrmIdx ++)
+            const uint32_t nSlotConfig = static_cast<uint32_t>(m_macSlotRunFlag.size());
+            uint32_t runIdx = 0;
+            for(uint32_t itrPerStrmIdx = 0; itrPerStrmIdx < m_nItrsPerStrmMac; itrPerStrmIdx++)
             {
                 for(uint32_t strmIdx = 0; strmIdx < m_nStrmsMac; ++strmIdx)
                 {
-                    uint32_t macSlotIdx = itrPerStrmIdx * m_nStrmsMac + strmIdx;// TODO: seperate cuMAC workload in multiple streams
-                    // 2 streams to run 8 slots: stream 0 [0, 2, 4, 6]; stream1 [1, 3, 5, 7]
+                    const uint32_t slotIdx = itrPerStrmIdx * m_nStrmsMac + strmIdx;
+                    if(slotIdx >= nSlotConfig || runIdx >= m_nMacSlots || m_macSlotRunFlag[slotIdx] == 0)
+                        continue;
 
-                    // Check if this slot should run based on slot configuration
-                    if (m_macSlotRunFlag[macSlotIdx] == 0) {
-                        continue; // Skip this slot if not enabled
-                    }
+                    const uint32_t macSlotIdx = runIdx; // contiguous enabled-run index
 
-                    if(strmIdx != 0) 
+                    if(strmIdx != 0)
                     {
                         CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsMac[strmIdx].handle(), macRunMsgPayload.startEvent, 0));
                     }
@@ -469,7 +503,14 @@ void CuMACTestWorkerImpl::macRunHandler(std::shared_ptr<void>& shPtrPayload)
                     }
                     else if(macRunMsgPayload.externalInterSlotEventVec != nullptr)
                     {
-                        CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsMac[strmIdx].handle(), (*macRunMsgPayload.externalInterSlotEventVec)[macSlotIdx].handle(), 0));
+                        if(slotIdx < macRunMsgPayload.externalInterSlotEventVec->size())
+                        {
+                            CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsMac[strmIdx].handle(), (*macRunMsgPayload.externalInterSlotEventVec)[slotIdx].handle(), 0));
+                        }
+                        else
+                        {
+                            printf("WARNING: externalInterSlotEventVec out of bounds (slotIdx=%u, size=%zu), skipping wait\n", slotIdx, macRunMsgPayload.externalInterSlotEventVec->size());
+                        }
                     }
 
                     CUDA_CHECK(cudaEventRecord(m_timeMacSlotStartEvents[macSlotIdx].handle(), m_cuStrmsMac[strmIdx].handle()));
@@ -499,11 +540,11 @@ void CuMACTestWorkerImpl::macRunHandler(std::shared_ptr<void>& shPtrPayload)
                         }
                         if (pass) 
                         {
-                            printf("CUMAC REFERENCE CHECK at slot %d: PASSED, CPU and GPU scheduler solutions match! \n", macSlotIdx);
+                            printf("cuMAC REFERENCE CHECK at slot %d: PASSED, CPU and GPU scheduler solutions match! \n", macSlotIdx);
                         } 
                         else 
                         {
-                            printf("CUMAC REFERENCE CHECK at slot %d: FAILED, CPU and GPU scheduler solutions do not match! \n", macSlotIdx);
+                            printf("cuMAC REFERENCE CHECK at slot %d: FAILED, CPU and GPU scheduler solutions do not match! \n", macSlotIdx);
                         }
                     }
                     // // record end, currently not in effect
@@ -512,15 +553,16 @@ void CuMACTestWorkerImpl::macRunHandler(std::shared_ptr<void>& shPtrPayload)
                     //     m_stopEvents[i].record(m_cuStrmsMac[i].handle());
                     //     CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsMac[macSlotIdx].handle(), m_stopEvents[i].handle(), 0));
                     // }
-                    
+
+                    runIdx++;
                 }
 
-                if(m_internalTimer)
+                if(m_internalTimer && (itrPerStrmIdx + 1) < m_macInterSlotStartEventVec.size())
                 {
-                    // find time slot duration in us
-                    uint64_t           gpu_slot_start_time_offset_ns = static_cast<uint64_t>(itrPerStrmIdx + 1) * (time_slot_duration * NS_PER_US);
+                    // record next slot boundary (end of this iteration)
+                    uint64_t gpu_slot_start_time_offset_ns = static_cast<uint64_t>(itrPerStrmIdx + 1) * (time_slot_duration * NS_PER_US);
                     gpu_ns_delay_until(m_GPUtime_d.addr(), gpu_slot_start_time_offset_ns, m_cuStrmsMac[0].handle());
-                    CUDA_CHECK(cudaEventRecord(m_macInterSlotStartEventVec[itrPerStrmIdx+1].handle(), m_cuStrmsMac[0].handle())); 
+                    CUDA_CHECK(cudaEventRecord(m_macInterSlotStartEventVec[itrPerStrmIdx + 1].handle(), m_cuStrmsMac[0].handle()));
                 }
             }
 
@@ -642,8 +684,8 @@ void CuMACTestWorkerImpl::resetEvalHandler(std::shared_ptr<void>& shPtrPayload)
 
     commnTestResetEvalMsgPayload& resetEvalPayload = *std::static_pointer_cast<commnTestResetEvalMsgPayload>(shPtrPayload);
 
-    // reset timers
-    for(uint32_t itrIdx = 0; itrIdx < m_nItrsPerStrmMac; ++itrIdx)
+    // reset timers (one per MAC run)
+    for(uint32_t itrIdx = 0; itrIdx < m_nMacSlots; ++itrIdx)
     {
         m_totMacSlotStartTime[itrIdx] = 0;
         m_totMacSlotEndTime[itrIdx]   = 0;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,10 +28,41 @@
 #include "sls_chan_src/sls_chan.cuh"
 #include "config_reader.hpp"
 
-// Main channel model class
+/**
+ * @brief Main statistical channel model class
+ * 
+ * Supports multiple channel models:
+ * - Link-level: TDL (Tapped Delay Line), CDL (Clustered Delay Line)
+ * - System-level: 3GPP TR 38.901 models (UMa, UMi, RMa)
+ * - ISAC: Integrated Sensing and Communications (3GPP TR 38.901 Section 7.9)
+ * 
+ * ISAC Features (via SystemLevelConfig.isac_type):
+ * - Type 0: Communication only (traditional channel model)
+ * - Type 1: Monostatic sensing (BS acts as TX and RX for sensing)
+ * - Type 2: Bistatic sensing (separate TX and RX for sensing)
+ * 
+ * Sensing targets are configured via ExternalConfig.st_config with:
+ * - 5 target types (UAV, AUTOMOTIVE, HUMAN, AGV, HAZARD); UAV small/large is controlled by st_size_ind
+ * - 2 RCS models (Model 1: deterministic, Model 2: angular dependent)
+ * - Multi-SPST support (up to 5 scattering points for automotive/AGV)
+ * 
+ * @see StParam for sensing target parameters
+ * @see SpstParam for scattering point parameters
+ * @see SystemLevelConfig.isac_type for ISAC mode selection
+ */
 template <typename Tscalar, typename Tcomplex>
 class statisChanModel {
 public:
+    /**
+     * @brief Constructor for statistical channel model
+     * 
+     * @param sim_config Simulation configuration (frequency, bandwidth, FFT, etc.)
+     * @param system_level_config System-level configuration (scenario, sites, UTs, ISAC)
+     * @param link_level_config Link-level configuration (TDL/CDL parameters)
+     * @param external_config External configuration (cells, UTs, antenna panels, sensing targets)
+     * @param randSeed Random seed for reproducible simulations
+     * @param strm CUDA stream for GPU operations (nullptr creates internal stream)
+     */
     statisChanModel(const SimConfig* sim_config,
                 const SystemLevelConfig* system_level_config,
                 const LinkLevelConfig* link_level_config,
@@ -79,16 +110,28 @@ public:
     /**
     * @brief Dump pathloss and shadowing statistics (negative value in dB)
     * 
-    * @param pathloss_shadowing Pointer to array for storing pathloss+shadowing stats (required)
+    * @param pl_sf Pointer to array for storing pathloss+shadowing stats (required)
     *                          If activeCell and activeUt are provided: dimension [activeCell.size(), activeUt.size()]
     *                          If activeCell or activeUt are empty: use dimension n_sector*n_site or n_ut for the empty one
     *                          Values are total loss = - (pathloss - shadow_fading) in dB
     * @param activeCell Vector of active cell IDs (optional, empty vector dumps all cells)
     * @param activeUt Vector of active UT IDs (optional, empty vector dumps all UEs)
     */
-    void dump_pathloss_shadowing_stats(float* pathloss_shadowing,
-                                     const std::vector<uint16_t>& activeCell = {},
-                                     const std::vector<uint16_t>& activeUt = {});
+    void dump_pl_sf_stats(float* pl_sf,
+                          const std::vector<uint16_t>& activeCell = {},
+                          const std::vector<uint16_t>& activeUt = {});
+
+    /**
+     * @brief Dump pathloss, shadowing and antenna gain statistics
+     * antGain is per antenna element only (no array gain); downstream may add array/beamforming gain.
+     * @param pl_sf_ant_gain Pointer to array for storing gain stats (required)
+     * @param activeCell Vector of active cell IDs (optional, empty vector dumps all cells)
+     * @param activeUt Vector of active UT IDs (optional, empty vector dumps all UEs)
+     */
+    void dump_pl_sf_ant_gain_stats(float* pl_sf_ant_gain,
+                                   const std::vector<uint16_t>& activeCell = {},
+                                   const std::vector<uint16_t>& activeUt = {});
+
     void dump_topology_to_yaml(const std::string& filename);
     
     /**

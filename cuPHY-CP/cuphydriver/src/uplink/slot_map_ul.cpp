@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -416,7 +416,7 @@ int SlotMapUl::waitChannelEndTask(int num_channels) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGI_FMT(TAG, "Wait UL channel threads for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait UL channel threads for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
             return -1;
         }
 
@@ -441,7 +441,7 @@ int SlotMapUl::waitULCTasksComplete(int num_tasks) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGI_FMT(TAG, "waitULCTasksComplete for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGW_FMT(TAG, "waitULCTasksComplete for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
             return -1;
         }
     } while(atom_ulc_tasks_complete != num_tasks);
@@ -462,7 +462,7 @@ int SlotMapUl::waitSlotEndTask(int num_tasks) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGI_FMT(TAG, "Wait UL threads for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait UL threads for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
             return -1;
         }
     } while(atom_ul_end_threads != num_tasks);
@@ -506,7 +506,7 @@ int SlotMapUl::waitUlBfwEndTask() {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGI_FMT(TAG, "waitUlBfwEndTask for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitUlBfwEndTask for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
             return -1;
         }
     } while(ulbfw_task_done != true);

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -135,7 +135,6 @@ tdlChan<Tscalar, Tcomplex>::tdlChan(tdlConfig_t * tdlCfg, uint16_t randSeed, cud
     // TODO: currently does not support TDL-D and TDL-E with LOS path, will added later
     if(m_LosTap)
     {
-        // NVLOGE_FMT(NVLOG_PUScH, AERIAL_CUPHY_EVENT, "ERROR: TDL with LOS path is not supported yet");
         printf("ERROR: TDL with LOS path is not supported yet! \n");
         exit(EXIT_FAILURE);
     }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -173,7 +173,8 @@ struct ueDescr_t{
         uint8_t  portToUeAntMap[MAX_N_COMB_PER_UE][MAX_N_ANT_PORTS];
         uint8_t  portToL2OutUeAntMap[MAX_N_COMB_PER_UE][MAX_N_ANT_PORTS];
         uint8_t  cellIdx;
-        uint8_t  prgSize;
+        uint16_t prgSize;
+        uint16_t prgSizeL2;
 
         // ue group parameters:
         uint32_t ueBlockCntr;
@@ -190,10 +191,12 @@ struct ueDescr_t{
         float*                       pUeRbSnr;
         cuphySrsReport_t*            pUeSrsReport;
 #ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
-        tensor_ref_any<CUPHY_C_32F>  tChEstBuff;        
+        tensor_ref_any<CUPHY_C_32F>  tChEstBuff;   
+        tensor_ref_any<CUPHY_C_32F>  tChEstToL2Inner;
         tensor_ref_any<CUPHY_C_32F>  tChEstToL2;
 #else
-        tensor_ref_any<CUPHY_C_16F>  tChEstBuff;        
+        tensor_ref_any<CUPHY_C_16F>  tChEstBuff; 
+        tensor_ref_any<CUPHY_C_16F>  tChEstToL2Inner;  
         tensor_ref_any<CUPHY_C_16I>  tChEstToL2;
 #endif        
         uint16_t                     chEstBuffStartPrbGrp;
@@ -243,7 +246,7 @@ public:
 
     
 
-    cuphyStatus_t setup( uint16_t                      nSrsUes,
+    cuphyStatus_t setup( uint16_t                     nSrsUes,
                         cuphyUeSrsPrm_t*              h_srsUePrms,
                         uint16_t                      nCells,
                         cuphyTensorPrm_t*             pTDataRx, 
@@ -252,13 +255,14 @@ public:
                         uint32_t*                     h_rbSnrBuffOffsets,
                         cuphySrsReport_t*             d_pSrsReports,
                         cuphySrsChEstBuffInfo_t*      h_chEstBuffInfo,
+                        void**                        d_addrsChEstToL2InnerBuff,
                         void**                        d_addrsChEstToL2Buff,
                         cuphySrsChEstToL2_t*          h_chEstToL2,
                         void*                         d_workspace,
                         bool                          enableCpuToGpuDescrAsyncCpy,
-                        srsChEstDynDescr_t*          pCpuDynDesc,
+                        srsChEstDynDescr_t*           pCpuDynDesc,
                         void*                         pGpuDynDesc,
-                        cuphySrsChEstLaunchCfg_t*    pLaunchCfg,
+                        cuphySrsChEstLaunchCfg_t*     pLaunchCfg,
                         cuphySrsChEstNormalizationLaunchCfg_t* pNormalizationLaunchCfg,
                         cudaStream_t                  strm);
 

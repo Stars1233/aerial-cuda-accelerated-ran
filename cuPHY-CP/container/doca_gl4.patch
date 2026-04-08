@@ -1,0 +1,149 @@
+diff --git b/libs/doca_eth/doca_eth_rxq/src/eth_rxq_common.c a/libs/doca_eth/doca_eth_rxq/src/eth_rxq_common.c
+index 807cdc126c..529db3eedc 100644
+--- b/libs/doca_eth/doca_eth_rxq/src/eth_rxq_common.c
++++ a/libs/doca_eth/doca_eth_rxq/src/eth_rxq_common.c
+@@ -439,13 +439,23 @@ static doca_error_t eth_rxq_common_create_cq(struct doca_eth_rxq *rxq, uint32_t
+ 
+ 		umem_size = MLX5_ALIGN_UP_BY(umem_size, umem_align);
+ 
++		void *cmem_ptr;
++
+ 		status = priv_doca_ctx_get_gpu_ops(&rxq->ctx_base)
+-				 ->alloc_cb(priv_doca_ctx_get_gpu_dev(&rxq->ctx_base),
+-					    umem_size,
+-					    umem_align,
+-					    DOCA_GPU_MEM_TYPE_GPU,
+-					    (void **)&(rxq_cq->cq_umem_buf),
+-					    NULL);
++			->alloc_cb(priv_doca_ctx_get_gpu_dev(&rxq->ctx_base),
++					umem_size,
++					umem_align,
++					DOCA_GPU_MEM_TYPE_CPU_GPU,
++					(void **)&(rxq_cq->cq_umem_buf),
++					(void **)&cmem_ptr);
++
++		if (cmem_ptr != (void *)rxq_cq->cq_umem_buf) {
++			DOCA_DLOG_ERR("ETH_RXQ %p: Failed as CPU addr %p and GPU addr %p are different",
++					rxq, cmem_ptr, (void *)rxq_cq->cq_umem_buf);
++		} else {
++			DOCA_DLOG_INFO("ETH_RXQ %p: CQ UMEM on CPU memory. CPU addr %p GPU addr %p",
++					rxq, cmem_ptr, (void *)rxq_cq->cq_umem_buf);
++		}
+ 		if (status != DOCA_SUCCESS) {
+ 			DOCA_DLOG_ERR("ETH_RXQ %p: Failed to create CQ: failed to alloc CQ UMEM buffer. err=%s",
+ 				      rxq,
+@@ -708,13 +718,23 @@ static doca_error_t eth_rxq_common_create_rq(struct doca_eth_rxq *rxq)
+ 
+ 		umem_size = MLX5_ALIGN_UP_BY(umem_size, umem_align);
+ 
++		void *cmem_ptr;
++
+ 		status = priv_doca_ctx_get_gpu_ops(&rxq->ctx_base)
+-				 ->alloc_cb(priv_doca_ctx_get_gpu_dev(&rxq->ctx_base),
+-					    umem_size,
+-					    umem_align,
+-					    DOCA_GPU_MEM_TYPE_GPU,
+-					    (void **)&(rxq->eth_rq.rq_umem_buf),
+-					    NULL);
++			->alloc_cb(priv_doca_ctx_get_gpu_dev(&rxq->ctx_base),
++					umem_size,
++					umem_align,
++					DOCA_GPU_MEM_TYPE_CPU_GPU,
++					(void **)&(rxq->eth_rq.rq_umem_buf),
++					(void **)&cmem_ptr);
++
++		if (cmem_ptr != (void *)rxq->eth_rq.rq_umem_buf) {
++			DOCA_DLOG_ERR("ETH_RXQ %p: Failed as CPU addr %p and GPU addr %p are different",
++					rxq, cmem_ptr, (void *)rxq->eth_rq.rq_umem_buf);
++		} else {
++			DOCA_DLOG_INFO("ETH_RXQ %p: RQ UMEM on CPU memory. CPU addr %p GPU addr %p",
++					rxq, cmem_ptr, (void *)rxq->eth_rq.rq_umem_buf);
++		}
+ 		if (status != DOCA_SUCCESS) {
+ 			DOCA_DLOG_ERR("ETH_RXQ %p: Failed to create RQ: failed to alloc RQ UMEM buffer. err=%s",
+ 				      rxq,
+diff --git b/libs/doca_eth/doca_eth_txq/src/eth_txq_common.c a/libs/doca_eth/doca_eth_txq/src/eth_txq_common.c
+index b4ad925ec1..df2b74bfe5 100644
+--- b/libs/doca_eth/doca_eth_txq/src/eth_txq_common.c
++++ a/libs/doca_eth/doca_eth_txq/src/eth_txq_common.c
+@@ -353,13 +353,23 @@ static doca_error_t eth_txq_common_create_sq(struct doca_eth_txq *txq)
+ 
+ 		umem_size = MLX5_ALIGN_UP_BY(umem_size, umem_align);
+ 
++		void *cmem_ptr;
++
+ 		status = priv_doca_ctx_get_gpu_ops(&txq->ctx_base)
+-				 ->alloc_cb(priv_doca_ctx_get_gpu_dev(&txq->ctx_base),
+-					    umem_size,
+-					    umem_align,
+-					    DOCA_GPU_MEM_TYPE_GPU,
+-					    (void **)&(txq->eth_sq.sq_umem_buf),
+-					    NULL);
++			->alloc_cb(priv_doca_ctx_get_gpu_dev(&txq->ctx_base),
++					umem_size,
++					umem_align,
++					DOCA_GPU_MEM_TYPE_CPU_GPU,
++					(void **)&(txq->eth_sq.sq_umem_buf),
++					(void **)&cmem_ptr);
++
++		if (cmem_ptr != (void *)txq->eth_sq.sq_umem_buf) {
++			DOCA_DLOG_ERR("ETH_TXQ %p: Failed as CPU addr %p and GPU addr %p are different",
++					txq, cmem_ptr, (void *)txq->eth_sq.sq_umem_buf);
++		} else {
++			DOCA_DLOG_INFO("ETH_TXQ %p: CQ UMEM on CPU memory. CPU addr %p GPU addr %p",
++					txq, cmem_ptr, (void *)txq->eth_sq.sq_umem_buf);
++		}
+ 		if (status != DOCA_SUCCESS) {
+ 			DOCA_DLOG_ERR("ETH_TXQ %p: Failed to alloc SQ UMEM buffer. err=%s",
+ 				      txq,
+diff --git b/libs/doca_gpunetio/include/special/doca_gpunetio_dev_src_eth.cuh a/libs/doca_gpunetio/include/special/doca_gpunetio_dev_src_eth.cuh
+index 377312d9ea..1d5b4a6208 100644
+--- b/libs/doca_gpunetio/include/special/doca_gpunetio_dev_src_eth.cuh
++++ a/libs/doca_gpunetio/include/special/doca_gpunetio_dev_src_eth.cuh
+@@ -283,6 +283,7 @@ __device__ inline int priv_doca_gpu_dev_eth_flush_gmem(struct doca_gpu_eth_rxq *
+ 
+ #endif
+ 
++
+ /**
+  * @brief Receive packets through the GPU handler of an Ethernet rxq object.
+  * This function must be invoked per-thread.
+@@ -387,8 +388,10 @@ __device__ inline doca_error_t doca_gpu_dev_eth_rxq_receive_thread(struct doca_g
+ 
+ 	if (_rx_pkts > 0) {
+ #if __CUDA_ARCH__ < 900
++		/*
+ 		if (eth_rxq->need_flush)
+ 			priv_doca_gpu_dev_eth_flush_gmem(eth_rxq);
++		*/
+ #endif
+ 		cqe_ci = (DOCA_GPUNETIO_VOLATILE(eth_rxq->cqe_ci) + (DOCA_GPUNETIO_VOLATILE(num_rx_pkts[0]) - 1)) &
+ 			 DOCA_GPUNETIO_CQE_CI_MASK;
+@@ -558,7 +561,7 @@ __device__ inline doca_error_t doca_gpu_dev_eth_rxq_receive_block(struct doca_gp
+ 			DOCA_GPUNETIO_VOLATILE(doca_gpu_buf_idx[0]) = local_buf_idx;
+ 
+ #if __CUDA_ARCH__ < 900
+-			priv_doca_gpu_dev_eth_flush_gmem(eth_rxq);
++			//priv_doca_gpu_dev_eth_flush_gmem(eth_rxq);
+ #endif
+ 			cqe_ci = (DOCA_GPUNETIO_VOLATILE(eth_rxq->cqe_ci) +
+ 				  (DOCA_GPUNETIO_VOLATILE(num_rx_pkts[0]) - 1)) &
+@@ -1291,6 +1294,18 @@ __device__ inline doca_error_t doca_gpu_dev_eth_txq_wait_completion(struct doca_
+ 	return DOCA_SUCCESS;
+ }
+ 
++__host__ __device__ doca_error_t
++doca_gpu_dev_eth_txq_get_dbr(struct doca_gpu_eth_txq *eth_txq, uintptr_t *dbr) {
++	*dbr = eth_txq->sq_db;
++	return DOCA_SUCCESS;
++}
++
++__host__ __device__ doca_error_t
++doca_gpu_dev_eth_txq_get_wqe_mem(struct doca_gpu_eth_txq *eth_txq, uintptr_t *wqe_mem) {
++	*wqe_mem = eth_txq->wqe_addr;
++	return DOCA_SUCCESS;
++}
++
+ 
+ #ifdef __cplusplus
+ } /* extern "C" */

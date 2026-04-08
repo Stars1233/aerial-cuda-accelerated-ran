@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include "h5TvCreate.h"
 #include "h5TvLoad.h"
 #include <yaml-cpp/yaml.h>
+#include <unordered_set>  // for std::unordered_set
 #include "chanModelsApi.hpp"
 
 struct netDataMmimo {
@@ -143,6 +144,9 @@ private:
     uint8_t m_ueGrpMode{}; // MU-MIMO UE grouping mode, 0: dynamic UE grouping per TTI, 1: flag-triggered UE grouping (controlled by the muUeGrpTrigger flag in cumacCellGrpPrms)
     uint8_t m_muGrpUpdate{0}; // trigger for performing MU-MIMO UE grouping in the current TTI, 0: not triggering UE grouping in the current TTI, 1: triggering UE grouping in the current TTI
     uint16_t m_nCell{};  // total number of cells
+    std::vector<uint16_t> m_activeCellIds;  // Active cell IDs for SLS generation; empty means all [0..m_nCell-1]
+    std::vector<uint16_t> m_utDropCellIds;  // Optional UT drop-cell IDs for SLS UE dropping; empty means use active cells
+    std::vector<uint32_t> m_dumpChanSlots;  // Slot indices for SLS H5 dump; only used when fading_type == 1
     uint8_t m_semiStatFreqAlloc{}; // indication for whether or not to enable semi-static subband allocation for SU UEs/MU UEGs
     uint16_t m_numUeForGrpPerCell{}; // number of UEs considered for MU-MIMO UE grouping per TTI per cell 
     uint8_t m_numUeSchdPerCellTTI{}; // total number of SU-MIMO UEs and MU-MIMO UE groups scheduled per TTI per cell 

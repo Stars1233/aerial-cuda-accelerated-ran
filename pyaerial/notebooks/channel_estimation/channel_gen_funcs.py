@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,177 +13,201 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sionna
-import numpy as np
-import tensorflow as tf
+"""Channel generation utilities for ML channel estimation training and testing.
 
+Provides PyAerialChannelGenerator for generating training data (clean/noisy channel
+pairs) and PyAerialChannelEstimateGenerator for generating LS/MMSE estimates from
+a full PUSCH transmission through a fading channel.
+"""
+
+import math
+import numpy as np
+
+from aerial.phy5g.channel_models import FadingChannel, CdlChannelConfig, TdlChannelConfig
 from aerial.phy5g.pdsch import PdschTx
 from aerial.phy5g.algorithms import ChannelEstimator
 from aerial.phy5g.ldpc import get_mcs, random_tb
-from aerial.util.cuda import get_cuda_stream
-
-# Configure the notebook to use only a single GPU and allocate only as much memory as needed.
-gpus = tf.config.list_physical_devices('GPU')
-tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
-tf.config.experimental.set_memory_growth(gpus[0], True)
-print(gpus)
+from aerial.util.cuda import CudaStream
 
 
-class SionnaChannelGenerator(tf.keras.Model):
+def _ant_count_to_size(n_ant: int) -> tuple:
+    """Convert a scalar antenna count to (M_g, N_g, M, N, P).
+
+    Uses dual-polarization (P=2) when n_ant is even, single-pol (P=1) otherwise.
+    M and N are chosen so M*N*P == n_ant with M <= N.
     """
-    Generator class for Sionna channels.
+    n_ant = max(1, n_ant)
+    if n_ant % 2 == 0:
+        half = n_ant // 2
+        m = int(math.isqrt(half))
+        while m > 0:
+            if half % m == 0:
+                return (1, 1, m, half // m, 2)
+            m -= 1
+    m = int(math.isqrt(n_ant))
+    while m > 0:
+        if n_ant % m == 0:
+            return (1, 1, m, n_ant // m, 1)
+        m -= 1
+    return (1, 1, 1, n_ant, 1)
+
+
+def _make_channel_config(channel_model: str, n_bs_ant: int = None, n_ue_ant: int = None):
+    """Create a FadingChannel config from a channel model string.
+
+    Args:
+        channel_model: Channel model identifier, e.g. 'CDL-C', 'TDL-A'.
+        n_bs_ant: Number of BS antennas (for TDL or CDL). If None, uses defaults.
+        n_ue_ant: Number of UE antennas (for TDL or CDL). If None, uses defaults.
+
+    Returns:
+        CdlChannelConfig or TdlChannelConfig instance.
     """
-    def __init__(self, num_prbs: int, channel_name: str = 'UMa', batch_size: int = 1):
-        """
-        Initializor for a Sionna Channel Generator. It defines an anntena array and
-        a resource grid in order to generate channels conveniently.
+    model_upper = channel_model.upper()
+    profile = channel_model.split('-')[-1].upper()
 
-        For simplicity, we currently hardcode for single user, single antenna, single layer,
-        and several other parameters like frequency, delay spread, link direction, etc.
-        """
-        super().__init__()
+    if 'CDL' in model_upper:
+        delay_spreads = {'A': 30.0, 'B': 100.0, 'C': 300.0, 'D': 30.0, 'E': 100.0}
+        kwargs = dict(
+            delay_profile=profile,
+            delay_spread=delay_spreads.get(profile, 100.0),
+            max_doppler_shift=5.0,
+        )
+        if n_bs_ant is not None:
+            kwargs['bs_ant_size'] = _ant_count_to_size(n_bs_ant)
+        if n_ue_ant is not None:
+            kwargs['ue_ant_size'] = _ant_count_to_size(n_ue_ant)
+        return CdlChannelConfig(**kwargs)
+    elif 'TDL' in model_upper:
+        delay_spreads = {'A': 30.0, 'B': 100.0, 'C': 300.0}
+        return TdlChannelConfig(
+            delay_profile=profile,
+            delay_spread=delay_spreads.get(profile, 100.0),
+            max_doppler_shift=5.0,
+            n_bs_ant=n_bs_ant if n_bs_ant is not None else 1,
+            n_ue_ant=n_ue_ant if n_ue_ant is not None else 1,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported channel model: {channel_model}. Use 'CDL-x' or 'TDL-x'."
+        )
 
+
+class PyAerialChannelGenerator:
+    """Channel generator using pyAerial FadingChannel for ML training.
+
+    Generates pairs of (clean_channel, noisy_channel) suitable for training
+    denoising-based channel estimation models. Each sample is an independent
+    single-OFDM-symbol channel realization for one Tx-Rx antenna pair.
+    With multiple Rx antennas the antenna dimension is flattened into the
+    batch, so the effective output size is ``batch_size * num_rx_ant``.
+
+    Args:
+        num_prbs: Number of PRBs in the UE allocation.
+        channel_model: Channel model identifier (e.g. 'CDL-C', 'TDL-A').
+        batch_size: Number of independent channel realizations per call.
+        num_rx_ant: Number of receive (BS) antennas. Default: 2.
+    """
+
+    def __init__(self, num_prbs: int, channel_model: str = 'CDL-C', batch_size: int = 32,
+                 num_rx_ant: int = 2):
+        """Initialize the channel generator.
+
+        For simplicity, we currently hardcode for single user, single layer,
+        and several other parameters like delay spread, link direction, etc.
+        """
         self.num_prbs = num_prbs
         self.batch_size = batch_size
+        self._num_rx_ant = num_rx_ant
+        self.n_sc = num_prbs * 12
 
-        # parameters for channel modeling
-        self.channel_model = channel_name
-        self.fc = 3.5e9                 # Frequency [Hz]
-        self.link_direction = 'uplink'  # Link direction (direction of the signal)
-        self.delay_spread = 100e-9      # Nominal delay spread [s]
-        self.ue_speed = 1               # User speed [m/s]
+        config = _make_channel_config(channel_model, n_bs_ant=num_rx_ant, n_ue_ant=1)
+        self.channel = FadingChannel(
+            channel_config=config,
+            n_sc=self.n_sc,
+            numerology=1,           # 30 kHz SCS
+            disable_noise=True,     # We add noise manually for controlled SNR
+        )
 
-        single_ant = sionna.phy.channel.tr38901.PanelArray(
-            num_rows_per_panel=1,
-            num_cols_per_panel=1,
-            polarization='single',
-            polarization_type='V',
-            antenna_pattern='omni',
-            carrier_frequency=self.fc)
+        # Pre-allocate unit probe signal: (n_cell, n_ue, n_tx_ant, n_symbol, n_sc)
+        n_bs_ant = self.channel.n_bs_ant
+        self._probe = np.ones((1, 1, n_bs_ant, 14, self.n_sc), dtype=np.complex64)
 
-        self.ue_array, self.gnb_array = single_ant, single_ant
+    def gen_channel(self, snr_db: float):
+        """Generate a batch of (clean_channel, noisy_channel) pairs.
 
-        self.channel = self.make_channel()
+        Runs the channel model batch_size times, each time generating an
+        independent realization. The clean channel is the CFR, and the noisy
+        version has AWGN added at the specified SNR.
 
-        self.rg = sionna.phy.ofdm.ResourceGrid(
-            num_ofdm_symbols=1,
-            fft_size=self.num_prbs * 12,  # Num. subcarriers
-            subcarrier_spacing=30e3,      # [kHz]
-            num_tx=1,
-            num_streams_per_tx=1)
+        Args:
+            snr_db: Signal-to-noise ratio in dB.
 
-        self.channel_generator = sionna.phy.channel.GenerateOFDMChannel(
-            self.channel,
-            self.rg,
-            normalize_channel=True)
-
-        self.awgn = sionna.phy.channel.AWGN()
-
-        sionna.phy.config.xla_compat = True  # Necessary for proper model compilation
-
-    def make_channel(self):
+        Returns:
+            Tuple of (h, h_noisy):
+                h: Clean channel frequency response,
+                    shape (batch_size, num_rx_ant, n_sc).
+                h_noisy: Channel with AWGN noise,
+                    shape (batch_size, num_rx_ant, n_sc).
         """
-        Create the channel object, using one of the 3GPP defined channel models.
-        Available channel models in Sionna: https://nvlabs.github.io/sionna/api/channel.html
-        This function further requires the batch size for the number of channels to sample,
-        and transmit and receive arrays for the dimensions of the channel, and some
-        information to determine the delay/doppler spread to include in the channel,
-        like user speeds and carrier frequency.
-        """
-        rx_array = self.gnb_array if self.link_direction == 'uplink' else self.ue_array
-        tx_array = self.ue_array if self.link_direction == 'uplink' else self.gnb_array
+        no = 10.0 ** (-float(snr_db) / 10.0)
+        std = np.sqrt(no / 2).astype(np.float32)
 
-        num_rx_ant, num_tx_ant = rx_array.num_ant, tx_array.num_ant
+        n_rx = self._num_rx_ant
+        h_all = np.empty((self.batch_size, n_rx, self.n_sc), dtype=np.complex64)
+        h_noisy_all = np.empty((self.batch_size, n_rx, self.n_sc), dtype=np.complex64)
 
-        # Setup network topology (required in UMi, UMa, and RMa)
-        if self.channel_model in ['UMi', 'UMa']:
-            topology = sionna.phy.channel.gen_single_sector_topology(
-                batch_size=self.batch_size,
-                num_ut=1,
-                scenario=self.channel_model.lower(),
-                min_ut_velocity=self.ue_speed,
-                max_ut_velocity=self.ue_speed,
+        for i in range(self.batch_size):
+            # Run channel to generate fading coefficients
+            self.channel.run(freq_in=self._probe, tti_idx=0, snr_db=0.0)
+
+            # Get clean channel frequency response
+            # Shape: (n_cell, n_ue, n_symbol, n_ue_ant, n_bs_ant, n_sc)
+            # Extract all Rx (BS) antennas for UE ant 0 at first OFDM symbol
+            cfr = self.channel.get_channel_frequency_response()
+            h = cfr[0, 0, 0, 0, :, :]  # (n_rx_ant, n_sc)
+
+            # Add independent AWGN noise per Rx antenna
+            noise = std * (
+                np.random.randn(n_rx, self.n_sc).astype(np.float32)
+                + 1j * np.random.randn(n_rx, self.n_sc).astype(np.float32)
             )
 
-        # Configure a channel impulse reponse (CIR) generator for the channel models
-        if self.channel_model == "Rayleigh":
-            ch_model = sionna.phy.channel.RayleighBlockFading(
-                num_rx=1,
-                num_rx_ant=num_rx_ant,
-                num_tx=1,
-                num_tx_ant=num_tx_ant
-            )
-        elif "CDL" in self.channel_model:
-            ch_model = sionna.phy.channel.tr38901.CDL(
-                model=self.channel_model[-1],
-                delay_spread=self.delay_spread,
-                carrier_frequency=self.fc,
-                ut_array=self.ue_array,
-                bs_array=self.gnb_array,
-                direction=self.link_direction,
-                min_speed=self.ue_speed
-            )
-        elif 'UMi' in self.channel_model or 'UMa' in self.channel_model:
-            if 'UMa' in self.channel_model:
-                model = sionna.phy.channel.tr38901.UMa
-            else:
-                model = sionna.phy.channel.tr38901.UMi
+            h_all[i] = h
+            h_noisy_all[i] = h + noise
 
-            ch_model = model(carrier_frequency=self.fc,
-                             o2i_model='low',
-                             bs_array=self.gnb_array,
-                             ut_array=self.ue_array,
-                             direction=self.link_direction,
-                             enable_pathloss=False)
-            ch_model.set_topology(*topology, los=None)
+            # Reset for next independent realization
+            self.channel.reset()
 
-        elif 'TDL' in self.channel_model:
-            ch_model = sionna.phy.channel.tr38901.TDL(
-                model=self.channel_model[-1],
-                delay_spread={'A': 30e-9, 'B': 100e-9, 'C': 300e-9}[self.channel_model[-1]],
-                carrier_frequency=self.fc,
-                num_rx_ant=num_rx_ant,
-                num_tx_ant=num_tx_ant
-            )
-        else:
-            raise ValueError(f"Invalid channel model {self.channel_model}!")
-
-        return ch_model
-
-    @tf.function(jit_compile=True)
-    def gen_channel_jit(self, snr_db):
-        """ Sample channel and add noise based on an SNR value in dB. """
-        h = self.channel_generator(self.batch_size)
-
-        # Add noise
-        No = tf.math.pow(10., tf.cast(-snr_db, tf.float32) / 10.)
-        h_n = self.awgn(h, No)
-
-        # Squeeze: tx/rx id, tx/rx ant id, ofdm symb dimensions
-        return tf.squeeze(h, (1, 2, 3, 4, 5)), tf.squeeze(h_n, (1, 2, 3, 4, 5))
+        return h_all, h_noisy_all
 
 
-class PyAerialChannelEstimateGenerator():
+class PyAerialChannelEstimateGenerator:
+    """Generator for PyAerial LS/MMSE channel estimates for ML testing.
+
+    Transmits a PUSCH signal through a FadingChannel, then applies PyAerial's
+    channel estimators (LS, MS-MMSE) to the received signal. Returns the
+    estimates alongside the ground truth channel.
+
+    Args:
+        num_prbs: Number of PRBs in the UE allocation.
+        channel_model: Channel model identifier (e.g. 'CDL-C', 'TDL-A').
+        batch_size: Number of independent channel realizations per call.
+        num_rx_ant: Number of receive (BS) antennas. Default: 2.
     """
-    A Generator Class for PyAerial Channel Estimates.
 
-    This classes uses SionnaChannelGenerator
-    Implements PyAerial channels estimators:
-        - 'LS': Least Squares
-        - 'MMSE': Minimum Mean Squared Error
-        - 'MS MMSE': Multi-stage MMSE
-    """
-    def __init__(self, sionna_channel, batch=True):
-        self.num_prbs = sionna_channel.num_prbs
-        self.num_subcarriers = self.num_prbs * 12
-        self.batch_size = 32 if batch else 1  # only works for these 2 values
+    def __init__(self, num_prbs: int, channel_model: str = 'CDL-C', batch_size: int = 32,
+                 num_rx_ant: int = 2):
+        self.num_prbs = num_prbs
+        self.num_subcarriers = num_prbs * 12
+        self.batch_size = batch_size
+        self._num_rx_ant = num_rx_ant
 
-        # DMRS parameters
+        # DMRS parameters (shared between Tx and channel estimation)
         self.dmrs_params = dict(
             num_ues=1,                    # We simulate only one UE
             slot=0,                       # Slot number
             num_dmrs_cdm_grps_no_data=2,  # Number of DMRS CDM groups without data
-            dmrs_scrm_id=41,              # DMRS scrambling ID
             start_prb=0,                  # Start PRB index
             num_prbs=self.num_prbs,       # Number of allocated PRBs
             dmrs_syms=[0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # Binary list indicating
@@ -197,150 +221,154 @@ class PyAerialChannelEstimateGenerator():
 
         # DMRS parameters only used for channel estimation
         self.ch_est_dmrs_params = dict(
+            dmrs_scrm_id=41,              # DMRS scrambling ID (ChannelEstimator uses singular form)
             prg_size=1,                   # PRG size
             num_ul_streams=1,             # Number of UL streams
             dmrs_max_len=1,               # 1: single-symbol DMRS. 2: double-symbol
             dmrs_add_ln_pos=0,            # Number of additional DMRS positions.
         )
 
-        self.tx_tensor = self.make_tx_tensor()[:self.num_subcarriers]
+        # DMRS symbol index
+        self.dmrs_idx = self.dmrs_params['dmrs_syms'].index(1)
 
-        # Obtain the symbols with DMRS
-        self.dmrs_idxs = self.dmrs_params['dmrs_syms'].index(1)
+        # Generate transmit signal, truncated to allocated subcarriers
+        self.tx_tensor = self._make_tx_tensor()[:self.num_subcarriers]
 
-        self.rg = sionna.phy.ofdm.ResourceGrid(
-            num_ofdm_symbols=14,  # Note: generating a single symbol does not speed up
-            fft_size=self.num_prbs * 12,
-            subcarrier_spacing=30e3,
-            num_tx=1,
-            num_streams_per_tx=1)
-
-        self.mapper = sionna.phy.ofdm.ResourceGridMapper(self.rg)
-
-        self.channel = sionna.phy.channel.OFDMChannel(
-            channel_model=sionna_channel.channel,
-            resource_grid=self.rg,
-            add_awgn=True,
-            normalize_channel=True,
-            return_channel=True
+        # Create FadingChannel: single Tx antenna, num_rx_ant Rx antennas.
+        config = _make_channel_config(channel_model, n_bs_ant=num_rx_ant, n_ue_ant=1)
+        self.channel = FadingChannel(
+            channel_config=config,
+            n_sc=self.num_subcarriers,
+            numerology=1,
         )
 
-        self.ls_estimator = self.create_channel_estimator('LS')
-        self.mmse_estimator = self.create_channel_estimator('MS MMSE')
+        # Create PyAerial channel estimators with matching Rx antenna count
+        self.ls_estimator = self._create_channel_estimator('LS')
+        self.mmse_estimator = self._create_channel_estimator('MS MMSE')
 
-    def create_channel_estimator(self, estimator_type):
-        """
-        # Create the PyAerial (cuPHY) channel estimator with each algorithm:
-            #- 0 - MMSE (legacy)
-            #- 1 - Multi-stage MMSE with delay estimation (default)
-            #- 2 - RKHS (not available yet)
-            #- 3 - LS channel estimation only
+    def _create_channel_estimator(self, estimator_type: str):
+        """Create a PyAerial channel estimator.
+
+        Args:
+            estimator_type: One of 'MMSE', 'MS MMSE', 'LS'.
         """
         assert estimator_type in ['MMSE', 'MS MMSE', 'LS']
         ch_est_algo = {'MMSE': 0, 'MS MMSE': 1, 'LS': 3}[estimator_type]
+        return ChannelEstimator(
+            num_rx_ant=self._num_rx_ant,
+            ch_est_algo=ch_est_algo,
+            cuda_stream=CudaStream()
+        )
 
-        return ChannelEstimator(num_rx_ant=1, ch_est_algo=ch_est_algo,
-                                cuda_stream=get_cuda_stream())
+    def _make_tx_tensor(self, mcs=1, seed=42):
+        """Create a PUSCH transmit tensor for channel probing.
 
-    def make_tx_tensor(self, mcs=1, seed=42):
-        """
-        Creates a tensor containing the data to be transmitted.
-        This tensor needs to be passed through the channel to obtain the received
-        symbols and extract the DM-RS from those.
+        Returns:
+            np.ndarray: Transmitted signal, shape (subcarriers, symbols, tx_antennas).
         """
         pusch_tx = PdschTx(cell_id=41, num_rx_ant=1, num_tx_ant=1)
 
-        # Get modulation order and coderate.
-        mod_order, coderate = get_mcs(mcs)  # MCS index (according to TS 38.214 tables)
+        mod_order, coderate = get_mcs(mcs)
 
-        # Generate random bits for the transport block reused in each transmission
         np.random.seed(seed)
-        tb_input = random_tb(mod_order=mod_order,
-                             code_rate=coderate,
-                             dmrs_syms=self.dmrs_params['dmrs_syms'],
-                             num_prbs=self.num_prbs,
-                             start_sym=self.dmrs_params['start_sym'],
-                             num_symbols=self.dmrs_params['num_symbols'],
-                             num_layers=self.dmrs_params['layers'][0])
+        tb_input = random_tb(
+            mod_order=mod_order,
+            code_rate=coderate,
+            dmrs_syms=self.dmrs_params['dmrs_syms'],
+            num_prbs=self.num_prbs,
+            start_sym=self.dmrs_params['start_sym'],
+            num_symbols=self.dmrs_params['num_symbols'],
+            num_layers=self.dmrs_params['layers'][0]
+        )
 
-        # Transmit PUSCH: Take transport blocks and ...
-        # Input parameters are lists as the interface supports multiple UEs
-        tx_tensor = pusch_tx.run(**self.dmrs_params,
-                                 rntis=[1234],           # UE RNTI
-                                 data_scids=[0],         # Data scrambling ID
-                                 tb_inputs=[tb_input],   # Input transport block in bytes
-                                 code_rates=[coderate],  # Code rate x 1024
-                                 mod_orders=[mod_order]  # Modulation order
-                                 )  # OUTPUT: subcarriers x symbols(time) x tx_antennas
+        tx_tensor = pusch_tx.run(
+            **self.dmrs_params,
+            dmrs_scrm_ids=[41],
+            rntis=[1234],
+            data_scids=[0],
+            tb_inputs=[tb_input],
+            code_rates=[coderate],
+            mod_orders=[mod_order]
+        )  # Output: (subcarriers, symbols, tx_antennas)
 
-        del pusch_tx  # Otherwise throws an error - with this throws only a warning
-
+        del pusch_tx
         return tx_tensor
 
-    @tf.function(jit_compile=True)
-    def apply_channel(self, snr):
-        """Transmit the Tx tensor through the radio channel."""
-        # Add batch and num_tx dimensions that Sionna expects and reshape.
+    def _apply_channel(self, snr_db: float):
+        """Apply fading channel to the transmit tensor.
 
-        # (subcarriers, symbols, tx_ant)
-        tx_tensor = tf.transpose(self.tx_tensor, (2, 1, 0))
-        # (tx_ant, symbols, subcarriers)
-        tx_tensor = tf.reshape(tx_tensor, (1, -1))[None, None]
-        # (1, num_tx=1, num_streams_per_tx=1, num_data_symbols = symbols * subcarriers)
-        tx_tensor = tf.repeat(tx_tensor, self.batch_size, axis=0)  # Repeat Tensor across batches
-        # (batch_size, num_tx=1, num_streams_per_tx=1, symbols, subcarriers)
-        tx_tensor = self.mapper(tx_tensor)
-        # (batch_size, num_tx=1, num_streams_per_tx=1, symbols, subcarriers)
-        No = tf.math.pow(10., -tf.convert_to_tensor(snr) / 10.)
-        rx_tensor, h = self.channel(tx_tensor, No)
-        # rx : (batch_size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size)
-        # h  : (batch_size, num_tx, num_tx_ant, num_rx, num_rx_ant, num_ofdm_symbols, fft_size)
-        h = tf.transpose(h[:, 0, 0, 0, ...], (0, 3, 2, 1))
-        rx_tensor = tf.transpose(rx_tensor[:, 0, ...], (0, 3, 2, 1))
-        # both: (batch_size, subcarriers, symb, rx_ant)
-        return rx_tensor, h
+        Follows the same pattern as example_pusch_simulation.ipynb:
+        reshape (n_sc, n_symbol, n_tx_ant) -> (n_cell, n_ue, n_tx_ant, n_symbol, n_sc)
+        for FadingChannel input, and reverse for output.
 
-    def __call__(self, snr):
-        """ Object call function. When the PyAerialChannelEstimator is called, it
-        creates a transmit tensor, passes it over a channel, extracts the received
-        DM-RS from the received signal and performs channel estimation on it."""
-        # Transmits tx_tensor over channel
-        y, h = self.apply_channel(np.array([snr], dtype=np.float32))
-        y, h = y.numpy(), h.numpy()
+        Args:
+            snr_db: Signal-to-noise ratio in dB.
 
-        # Get GT channel
-        gt = h[:, :self.num_subcarriers, self.dmrs_idxs, 0]
+        Returns:
+            Tuple of (rx_slot, gt):
+                rx_slot: Received signal, shape (n_sc, n_symbol, n_rx_ant).
+                gt: Ground truth channel at DMRS symbol for all Rx antennas,
+                    shape (n_rx_ant, n_sc).
+        """
+        # Reshape for FadingChannel: (n_cell, n_ue, n_tx_ant, n_symbol, n_sc)
+        # TX has 1 UE antenna; with enable_swap_tx_rx the channel outputs
+        # n_bs_ant (= num_rx_ant) receive antennas.
+        tx_reshaped = self.tx_tensor.transpose((2, 1, 0))[None, None, ...]
 
-        ls = np.zeros((self.batch_size, int(self.num_subcarriers / 2)), dtype=np.complex64)
-        mmse = np.zeros((self.batch_size, self.num_subcarriers), dtype=np.complex64)
+        rx = self.channel.run(
+            freq_in=tx_reshaped,
+            tti_idx=0,
+            snr_db=snr_db,
+            enable_swap_tx_rx=True
+        )
+
+        # Get ground truth CFR at the DMRS symbol for all Rx antennas
+        # Shape: (n_cell, n_ue, n_symbol, n_ue_ant, n_bs_ant, n_sc)
+        cfr = self.channel.get_channel_frequency_response()
+        gt = cfr[0, 0, self.dmrs_idx, 0, :, :]  # (n_rx_ant, n_sc)
+
+        # Reshape to (n_sc, n_symbol, n_rx_ant)
+        rx_slot = rx[0, 0].transpose((2, 1, 0))
+
+        # Reset for next independent realization
+        self.channel.reset()
+
+        return rx_slot, gt
+
+    def __call__(self, snr_db: float):
+        """Generate LS, MMSE, and ground truth channel estimates.
+
+        For each batch element, transmits the PUSCH signal through a new
+        channel realization, then runs PyAerial LS and MS-MMSE estimators.
+
+        Args:
+            snr_db: Signal-to-noise ratio in dB.
+
+        Returns:
+            Tuple of (ls, mmse, gt):
+                ls: LS estimates, shape (batch_size, num_rx_ant, n_sc / 2).
+                mmse: MMSE estimates, shape (batch_size, num_rx_ant, n_sc).
+                gt: Ground truth channel, shape (batch_size, num_rx_ant, n_sc).
+        """
+        n_rx = self._num_rx_ant
+        n_sc = self.num_subcarriers
+        ls = np.zeros((self.batch_size, n_rx, n_sc // 2), dtype=np.complex64)
+        mmse = np.zeros((self.batch_size, n_rx, n_sc), dtype=np.complex64)
+        gt = np.zeros((self.batch_size, n_rx, n_sc), dtype=np.complex64)
+
         for b in range(self.batch_size):
-            # Get LS and MMSE channel estimates
-            est_param = {'rx_slot': y[b], **self.dmrs_params, **self.ch_est_dmrs_params}
-            ls[b] = self.ls_estimator.estimate(**est_param)[0].swapaxes(0, 2).squeeze() / np.sqrt(2)
-            mmse[b] = self.mmse_estimator.estimate(**est_param)[0].squeeze()
+            rx_slot, gt_b = self._apply_channel(snr_db)
+            gt[b] = gt_b  # (n_rx_ant, n_sc)
+
+            # Run PyAerial channel estimators
+            # Estimates have shape (n_rx_ant, n_layers, n_freq, n_time) per UE group.
+            est_param = {'rx_slot': rx_slot, **self.dmrs_params, **self.ch_est_dmrs_params}
+            ls_est = self.ls_estimator.estimate(**est_param)[0]
+            mmse_est = self.mmse_estimator.estimate(**est_param)[0]
+            # Extract all Rx antennas, squeeze layer and time dims.
+            # LS output is (freq, layer, rx_ant, time) — needs transpose.
+            # MMSE output is (rx_ant, layer, freq, time) — already correct.
+            ls[b] = ls_est[:, 0, :, 0].T / np.sqrt(2)  # (n_rx_ant, n_freq)
+            mmse[b] = mmse_est[:, 0, :, 0]              # (n_rx_ant, n_freq)
 
         return ls, mmse, gt
-
-
-def sionna_to_pyaerial_shape(ch, n_sub: int, interp: int = 2, n_symb: int = 2,
-                             n_ant: int = 4, n_layers: int = 4, est_type: str = 'ls'):
-    """
-    Transforms a [batch, sub] array generated by Sionna into
-    - LS:      [batch,  subcarrier, layers,    rx antennas,      symbols]
-    - MMSE/GT: [batch, rx antennas, layers, interp * subcarrier, symbols]
-    The choice of which shape is selected depends on <est_type>
-
-    interp = 2   # interpolation factor from LS to MMSE (= comb size)
-    n_symb = 2   # num of dmrs symbols in 1 slot
-    n_ant = 4    # number of rx antennas
-    n_layers = 4 # number of layers
-    n_sub = 48*6 # number of subcarriers (dmrs has 1 every 2)
-    """
-    assert n_symb * n_ant * n_layers <= ch.shape[0]
-
-    if est_type == 'ls':
-        ch_r = ch.reshape(n_ant, n_layers, n_symb, n_sub).transpose(3, 1, 0, 2)
-    else:
-        ch_r = ch.reshape(n_ant, n_layers, n_symb, interp * n_sub).transpose(0, 1, 3, 2)
-
-    return ch_r[None, ...]  # add batch dimension

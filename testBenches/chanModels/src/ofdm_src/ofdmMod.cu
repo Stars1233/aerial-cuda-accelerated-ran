@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -419,7 +419,7 @@ m_enableSwapTxRx(0)
     m_pOfdmModCfg->kernelArgs[1] = &m_enableSwapTxRx;
 
     CUDA_KERNEL_NODE_PARAMS& ofdmModKernelNodeParams = m_pOfdmModCfg->kernelNodeParamsDriver;
-    CUDA_CHECK(cudaGetFuncBySymbol(&ofdmModKernelNodeParams.func, reinterpret_cast<void*>(kernelPtr)));
+    CHECK_CUDAERROR(cudaGetFuncBySymbol(&ofdmModKernelNodeParams.func, reinterpret_cast<void*>(kernelPtr)));
     // ofdmModKernelNodeParams.func = kernelPtr;
     ofdmModKernelNodeParams.blockDimX = block_dim.x;
     ofdmModKernelNodeParams.blockDimY = block_dim.y;
@@ -457,7 +457,7 @@ m_enableSwapTxRx(0)
         m_pWindowCfg = new ofdmLaunchCfg_t;
         CUDA_KERNEL_NODE_PARAMS& windowKernelNodeParams = m_pWindowCfg->kernelNodeParamsDriver;
         m_pOfdmModCfg->kernelArgs[0] = &m_ofdmModdynDescprGpu;
-        CUDA_CHECK(cudaGetFuncBySymbol(&windowKernelNodeParams.func, reinterpret_cast<void*>(applyWindow<Tscalar, Tcomplex>)));
+        CHECK_CUDAERROR(cudaGetFuncBySymbol(&windowKernelNodeParams.func, reinterpret_cast<void*>(applyWindow<Tscalar, Tcomplex>)));
         // windowKernelNodeParams.func = kernelPtr;
         windowKernelNodeParams.blockDimX = m_ofdmModdynDescprCpu -> ofdmWindowLen;
         windowKernelNodeParams.blockDimY = m_ofdmModdynDescprCpu -> N_symbol_slot;

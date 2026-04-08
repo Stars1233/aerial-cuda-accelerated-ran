@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +19,6 @@ from typing import List
 from typing import Optional
 import math
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
@@ -27,7 +26,7 @@ from aerial import pycuphy  # type: ignore
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PdschConfig
 from aerial.phy5g.config import CsiRsConfig
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 
 
 class LdpcRateMatch(Generic[Array]):
@@ -43,7 +42,7 @@ class LdpcRateMatch(Generic[Array]):
                  num_dl_bwp_prbs: int = 273,
                  max_num_code_blocks: int = 152,
                  max_num_tbs: int = 128,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize LdpcRateMatch.
 
         Args:
@@ -54,11 +53,11 @@ class LdpcRateMatch(Generic[Array]):
                 based on this number.
             max_num_tbs (int): Maximum number of transport blocks. Memory will be allocated
                 based on this number.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         # Create pycuphy LDPC rate match object.
         self.pycuphy_ldpc_rate_match = pycuphy.LdpcRateMatch(
@@ -66,7 +65,7 @@ class LdpcRateMatch(Generic[Array]):
             num_dl_bwp_prbs,
             max_num_tbs,
             max_num_code_blocks,
-            self.cuda_stream
+            self._cuda_stream.handle
         )
 
     def rate_match(self,
@@ -123,7 +122,7 @@ class LdpcRateMatch(Generic[Array]):
         max_num_cbs = max(cb.shape[1] for cb in coded_blocks)
 
         rm_out = []
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rate_matched_bits = cp.array(rate_matched_bits)
 
             # Unpack bits.
@@ -179,7 +178,7 @@ class LdpcRateMatch(Generic[Array]):
         cpu_copy = isinstance(coded_blocks[0], np.ndarray)
         coded_blocks = self._prepare_coded_blocks(coded_blocks)
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tx_buffer = cp.array(tx_buffer, order='F')
 
         coded_blocks = pycuphy.CudaArrayUint32(coded_blocks)
@@ -190,7 +189,7 @@ class LdpcRateMatch(Generic[Array]):
                                                       pdsch_configs,
                                                       csi_rs_configs)
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tx_buffer = cp.array(tx_buffer)
             if cpu_copy:
                 tx_buffer = tx_buffer.get(order='F')
@@ -210,7 +209,7 @@ class LdpcRateMatch(Generic[Array]):
         Returns:
             cp.ndarray: Prepared coded blocks in a single CuPy array.
         """
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             coded_blocks = [cp.array(cb, order='F', dtype=cp.uint8) for cb in coded_blocks]
             num_tbs = len(coded_blocks)
             max_num_cbs = max(cb.shape[1] for cb in coded_blocks)

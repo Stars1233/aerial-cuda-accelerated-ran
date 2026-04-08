@@ -1,5 +1,6 @@
 #!/bin/bash -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,11 +40,13 @@ TESTVECTOR_DIR=${TESTVECTOR_DIR:-/mnt/cicd_tvs/develop/GPU_test_input}
 # Paths
 TEST_PATTERNS_4T4R="${SCRIPT_DIR}/test_patterns_4t4r.csv"
 TEST_PATTERNS_MMIMO="${SCRIPT_DIR}/test_patterns_mmimo.csv"
+TEST_PATTERNS_NRSIM="${SCRIPT_DIR}/test_patterns_nrsim.csv"
 DLC_TEST_BENCH="${cuBB_SDK}/${BUILD_DIR}/cuPHY-CP/tests/dlc_test_bench/dlc_test_bench"
 COPY_TEST_FILES="${cuBB_SDK}/testBenches/phase4_test_scripts/copy_test_files.sh"
 SETUP1_DU="${cuBB_SDK}/testBenches/phase4_test_scripts/setup1_DU.sh"
 SETUP2_RU="${cuBB_SDK}/testBenches/phase4_test_scripts/setup2_RU.sh"
 TEST_CONFIG="${cuBB_SDK}/testBenches/phase4_test_scripts/test_config.sh"
+TEST_CONFIG_NRSIM="${cuBB_SDK}/testBenches/phase4_test_scripts/test_config_nrSim.sh"
 TEST_CONFIG_SUMMARY="${CONFIG_DIR}/testBenches/phase4_test_scripts/test_config_summary.sh"
 
 # Log file
@@ -53,6 +56,8 @@ LOG_FILE="/tmp/pattern_test_results_$(date +%Y%m%d_%H%M%S).log"
 CONFIG_FILES=(
 cuPHY-CP/cuphycontroller/config/cuphycontroller_F08_CG1.yaml
 cuPHY-CP/cuphycontroller/config/l2_adapter_config_F08_CG1.yaml
+cuPHY-CP/cuphycontroller/config/cuphycontroller_nrSim_SCF_CG1.yaml
+cuPHY-CP/cuphycontroller/config/l2_adapter_config_nrSim_SCF_CG1.yaml
 cuPHY-CP/ru-emulator/config/config.yaml
 cuPHY-CP/testMAC/testMAC/test_mac_config.yaml
 cuPHY/nvlog/config/nvlog_config.yaml
@@ -67,44 +72,61 @@ declare -a PASSED_TESTS
 # Flags for controlling test execution
 RUN_4T4R=false
 RUN_MMIMO=false
+RUN_NRSIM=false
 FORCE_CLEANUP=false
+DO_BUILD=false
+SKIP_COPY=false
 
 # Function to show usage
 show_usage() {
     cat << EOF
 Usage: $0 [OPTIONS]
 
-Run DLC test bench pattern tests for 4T4R and/or mMIMO configurations.
+Run DLC test bench pattern tests for 4T4R, mMIMO, and/or nrSim configurations.
 
 OPTIONS:
     -4, --4t4r          Run only 4T4R pattern tests
     -m, --mmimo         Run only mMIMO pattern tests
+    -n, --nrsim         Run only nrSim pattern tests (90xxx cases)
+    -b, --build         Build the project before running tests
     -c, --cleanup       Force cleanup before running tests
     -h, --help          Show this help message
 
 EXAMPLES:
-    # Run both 4T4R and mMIMO tests (default)
+    # Run 4T4R and mMIMO tests (default, no build)
     $0
+
+    # Build and run both tests
+    $0 --build
 
     # Run only 4T4R tests
     $0 --4t4r
 
+    # Build and run only 4T4R tests
+    $0 --4t4r --build
+
     # Run only mMIMO tests
     $0 --mmimo
+
+    # Run only nrSim tests
+    $0 --nrsim
 
     # Run both with forced cleanup
     $0 --cleanup
 
-    # Run only 4T4R with cleanup
-    $0 --4t4r --cleanup
+    # Build, cleanup, and run only 4T4R
+    $0 --4t4r --build --cleanup
 
 NOTES:
-    - If no flags are specified, both 4T4R and mMIMO tests will run
+    - If no flags are specified, 4T4R and mMIMO tests will run
+    - Use --nrsim to include nrSim (90xxx) pattern tests
+    - Building is optional and only performed if --build is specified
     - Each test phase is automatically preceded by cleanup
     - Use --cleanup to force an additional cleanup before starting
     - Test patterns are read from:
       * 4T4R:  ${SCRIPT_DIR}/test_patterns_4t4r.csv
       * mMIMO: ${SCRIPT_DIR}/test_patterns_mmimo.csv
+      * nrSim: ${SCRIPT_DIR}/test_patterns_nrsim.csv
 
 EOF
     exit 0
@@ -130,6 +152,12 @@ log_error() {
 log_warning() {
     echo -e "${YELLOW}[WARN]${NC} $1"
     echo "[WARN] $1" >> "$LOG_FILE"
+}
+
+
+build() {
+    cd $cuBB_SDK
+    $cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh --preset perf --targets dlc_test_bench
 }
 
 # Function to read patterns from file (skip comments and empty lines)
@@ -169,11 +197,15 @@ run_4t4r_pattern_test() {
     log_info "========================================"
 
     # Step 1: Copy test files
-    log_info "Step 1: Copying test files for pattern ${pattern_num}..."
-    if ! "$COPY_TEST_FILES" --src $TESTVECTOR_DIR --dst $CONFIG_DIR/testVectors "$pattern_num" --max_cells 1 >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to copy test files for pattern ${pattern_num}"
-        FAILED_TESTS+=("$test_name: copy_test_files failed")
-        return 1
+    if [ "$SKIP_COPY" = false ]; then
+        log_info "Step 1: Copying test files for pattern ${pattern_num}..."
+        if ! "$COPY_TEST_FILES" --src $TESTVECTOR_DIR --dst $CONFIG_DIR/testVectors "$pattern_num" --max_cells 1 >> "$LOG_FILE" 2>&1; then
+            log_error "Failed to copy test files for pattern ${pattern_num}"
+            FAILED_TESTS+=("$test_name: copy_test_files failed")
+            return 1
+        fi
+    else
+        log_info "Step 1: Skipping copy_test_files (--skip-copy)"
     fi
 
     # Step 2: Setup DU
@@ -248,11 +280,15 @@ run_mmimo_pattern_test() {
     fi
 
     # Step 4: Copy test files
-    log_info "Step 4: Copying test files for pattern ${pattern_num}..."
-    if ! "$COPY_TEST_FILES"  --src $TESTVECTOR_DIR --dst $CONFIG_DIR/testVectors "$pattern_num" --max_cells 1 >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to copy test files for pattern ${pattern_num}"
-        FAILED_TESTS+=("$test_name: copy_test_files failed")
-        return 1
+    if [ "$SKIP_COPY" = false ]; then
+        log_info "Step 4: Copying test files for pattern ${pattern_num}..."
+        if ! "$COPY_TEST_FILES"  --src $TESTVECTOR_DIR --dst $CONFIG_DIR/testVectors "$pattern_num" --max_cells 1 >> "$LOG_FILE" 2>&1; then
+            log_error "Failed to copy test files for pattern ${pattern_num}"
+            FAILED_TESTS+=("$test_name: copy_test_files failed")
+            return 1
+        fi
+    else
+        log_info "Step 4: Skipping copy_test_files (--skip-copy)"
     fi
 
     # Step 5: Run DLC test bench
@@ -264,6 +300,65 @@ run_mmimo_pattern_test() {
     else
         local ret=$?
         log_error "dlc_test_bench failed for pattern ${pattern_num} (exit code: $ret)"
+        FAILED_TESTS+=("$test_name: dlc_test_bench failed (exit code: $ret)")
+        return 1
+    fi
+}
+
+# Function to run test for a single pattern (nrSim mode)
+run_nrsim_pattern_test() {
+    local pattern_num="$1"
+    local test_name="nrSim_Pattern_${pattern_num}"
+
+    log_info "========================================"
+    log_info "Testing nrSim: Pattern ${pattern_num}"
+    log_info "========================================"
+
+    # Step 1: Setup DU with nrSim controller mode
+    log_info "Step 1: Running setup1_DU.sh -y nrSim_SCF_CG1_${pattern_num} --ru-host-type=_CG1..."
+    if ! "$SETUP1_DU" --config_dir=$CONFIG_DIR -y "nrSim_SCF_CG1_${pattern_num}" --ru-host-type=_CG1 >> "$LOG_FILE" 2>&1; then
+        log_error "setup1_DU.sh failed for nrSim pattern ${pattern_num}"
+        FAILED_TESTS+=("$test_name: setup1_DU failed")
+        return 1
+    fi
+
+    # Step 2: Setup RU
+    log_info "Step 2: Running setup2_RU.sh..."
+    if ! "$SETUP2_RU" --config_dir=$CONFIG_DIR >> "$LOG_FILE" 2>&1; then
+        log_error "setup2_RU.sh failed for nrSim pattern ${pattern_num}"
+        FAILED_TESTS+=("$test_name: setup2_RU failed")
+        return 1
+    fi
+
+    # Step 3: Copy test files
+    if [ "$SKIP_COPY" = false ]; then
+        log_info "Step 3: Copying test files for nrSim pattern ${pattern_num}..."
+        if ! "$COPY_TEST_FILES" --src $TESTVECTOR_DIR --dst $CONFIG_DIR/testVectors "$pattern_num" --max_cells 1 >> "$LOG_FILE" 2>&1; then
+            log_error "Failed to copy test files for nrSim pattern ${pattern_num}"
+            FAILED_TESTS+=("$test_name: copy_test_files failed")
+            return 1
+        fi
+    else
+        log_info "Step 3: Skipping copy_test_files (--skip-copy)"
+    fi
+
+    # Step 4: Test config (nrSim-specific)
+    log_info "Step 4: Running test_config_nrSim.sh..."
+    if ! "$TEST_CONFIG_NRSIM" --config_dir=$CONFIG_DIR --dlc-tb=1 >> "$LOG_FILE" 2>&1; then
+        log_error "test_config_nrSim.sh failed for pattern ${pattern_num}"
+        FAILED_TESTS+=("$test_name: test_config_nrSim failed")
+        return 1
+    fi
+
+    # Step 5: Run DLC test bench
+    log_info "Step 5: Running dlc_test_bench for nrSim pattern ${pattern_num}..."
+    if sudo -E "$DLC_TEST_BENCH" -p "$pattern_num" >> "$LOG_FILE" 2>&1; then
+        log_success "Pattern ${pattern_num} (nrSim) PASSED"
+        PASSED_TESTS+=("$test_name")
+        return 0
+    else
+        local ret=$?
+        log_error "dlc_test_bench failed for nrSim pattern ${pattern_num} (exit code: $ret)"
         FAILED_TESTS+=("$test_name: dlc_test_bench failed (exit code: $ret)")
         return 1
     fi
@@ -348,6 +443,29 @@ run_mmimo_tests() {
     fi
 }
 
+# Function to run nrSim pattern tests
+run_nrsim_tests() {
+    log_info "========================================="
+    log_info "PHASE 3: nrSim Pattern Tests"
+    log_info "========================================="
+
+    # Read nrSim patterns
+    readarray -t patterns_nrsim < <(read_patterns "$TEST_PATTERNS_NRSIM")
+
+    if [ ${#patterns_nrsim[@]} -eq 0 ]; then
+        log_warning "No nrSim patterns found in $TEST_PATTERNS_NRSIM"
+    else
+        log_info "Found ${#patterns_nrsim[@]} nrSim patterns: ${patterns_nrsim[*]}"
+        log_info ""
+
+        for pattern in "${patterns_nrsim[@]}"; do
+            run_nrsim_pattern_test "$pattern"
+            echo ""
+            echo "" >> "$LOG_FILE"
+        done
+    fi
+}
+
 # Function to print summary
 print_summary() {
     echo ""
@@ -404,8 +522,20 @@ main() {
                 RUN_MMIMO=true
                 shift
                 ;;
+            -n|--nrsim)
+                RUN_NRSIM=true
+                shift
+                ;;
+            -b|--build)
+                DO_BUILD=true
+                shift
+                ;;
             -c|--cleanup)
                 FORCE_CLEANUP=true
+                shift
+                ;;
+            --skip-copy)
+                SKIP_COPY=true
                 shift
                 ;;
             -h|--help)
@@ -419,8 +549,8 @@ main() {
         esac
     done
 
-    # If no specific test flags provided, run both along with clean-up
-    if [ "$RUN_4T4R" = false ] && [ "$RUN_MMIMO" = false ]; then
+    # If no specific test flags provided, run 4T4R and mMIMO along with clean-up
+    if [ "$RUN_4T4R" = false ] && [ "$RUN_MMIMO" = false ] && [ "$RUN_NRSIM" = false ]; then
         FORCE_CLEANUP=true
         RUN_4T4R=true
         RUN_MMIMO=true
@@ -436,8 +566,17 @@ main() {
     log_info "Test Configuration:"
     log_info "  - Run 4T4R tests: $RUN_4T4R"
     log_info "  - Run mMIMO tests: $RUN_MMIMO"
+    log_info "  - Run nrSim tests: $RUN_NRSIM"
+    log_info "  - Build project: $DO_BUILD"
     log_info "  - Force cleanup: $FORCE_CLEANUP"
     log_info ""
+
+    if [ "$DO_BUILD" = true ]; then
+        if ! build; then
+            log_error "build failed"
+            exit 1
+        fi
+    fi
 
     # Verify required files exist
     if [ ! -x "$DLC_TEST_BENCH" ]; then
@@ -482,6 +621,24 @@ main() {
     else
         log_info "========================================="
         log_info "Skipping mMIMO Pattern Tests"
+        log_info "========================================="
+        log_info ""
+    fi
+
+    # ============================================
+    # Phase 3: nrSim Pattern Tests
+    # ============================================
+    if [ "$RUN_NRSIM" = true ]; then
+        # ============================================
+        # Cleanup (optional - based on --cleanup flag)
+        # ============================================
+        if [ "$FORCE_CLEANUP" = true ]; then
+            perform_cleanup "Cleanup before nrSim tests"
+        fi
+        run_nrsim_tests
+    else
+        log_info "========================================="
+        log_info "Skipping nrSim Pattern Tests"
         log_info "========================================="
         log_info ""
     fi

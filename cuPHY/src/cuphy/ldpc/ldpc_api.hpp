@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -132,16 +132,20 @@ class LDPC_decode_desc final : public cuphyLDPCDecodeDesc_t
 public:
     //------------------------------------------------------------------
     // Constructor
-    explicit LDPC_decode_desc(const cuphyLDPCDecodeConfigDesc_t& config_in) : cuphyLDPCDecodeDesc_t{}
+    explicit LDPC_decode_desc(const cuphyLDPCDecodeConfigDesc_t& config_in, uint8_t max_tbs_per_desc_in) : cuphyLDPCDecodeDesc_t{}, max_tbs_per_desc(max_tbs_per_desc_in)
     {
         config  = config_in;
         num_tbs = 0;
+        assert(max_tbs_per_desc > 0);
+        assert(CUPHY_LDPC_DECODE_DESC_MAX_TB >= max_tbs_per_desc);
     }
     //------------------------------------------------------------------
     // Constructor
-    LDPC_decode_desc() : cuphyLDPCDecodeDesc_t{}
+    LDPC_decode_desc(uint8_t max_tbs_per_desc_in) : cuphyLDPCDecodeDesc_t{}, max_tbs_per_desc(max_tbs_per_desc_in)
     {
         num_tbs = 0;
+        assert(max_tbs_per_desc > 0);
+        assert(CUPHY_LDPC_DECODE_DESC_MAX_TB >= max_tbs_per_desc);
     }
     //------------------------------------------------------------------
     // add_tensor_as_tb()
@@ -169,16 +173,19 @@ public:
     void reset() { num_tbs = 0; }
     //------------------------------------------------------------------
     // has_config()
-    [[nodiscard]] bool has_config(const int16_t BG_, const int Z_, const int parity_nodes) const
-    {
-        return ((BG_ == config.BG) && (Z_ == config.Z) && (parity_nodes == config.num_parity_nodes));
+    [[nodiscard]] bool has_config(const int16_t BG_, const int Z_, const int parity_nodes, const cuphyLdpcMaxItrAlgoType_t ldpcMaxNumItrAlgo, const uint8_t ldpcMaxNumItrPerUe) const
+    {   if(ldpcMaxNumItrAlgo == LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE)
+            return ((BG_ == config.BG) && (Z_ == config.Z) && (parity_nodes == config.num_parity_nodes) && (ldpcMaxNumItrPerUe == config.max_iterations));
+        return ((BG_ == config.BG) && (Z_ == config.Z) && (parity_nodes == config.num_parity_nodes)); 
     }
     //------------------------------------------------------------------
     // is_full()
     [[nodiscard]] bool is_full() const
     {
-        return (num_tbs == CUPHY_LDPC_DECODE_DESC_MAX_TB);
+        return (num_tbs == max_tbs_per_desc);
     }
+    private:
+    uint8_t max_tbs_per_desc;
 };
 
 ////////////////////////////////////////////////////////////////////////
@@ -189,7 +196,8 @@ public:
 class LDPC_decode_desc_set final
 {
 public:
-    LDPC_decode_desc_set() : count_(0) { }
+    LDPC_decode_desc_set() : count_(0), max_tbs_per_desc_(CUPHY_LDPC_DECODE_DESC_MAX_TB) { }
+    explicit LDPC_decode_desc_set(uint8_t max_tbs_per_desc) : count_(0), max_tbs_per_desc_(max_tbs_per_desc) { }
     LDPC_decode_desc& operator[](size_t idx) { return descs_[idx]; }
     [[nodiscard]] unsigned int count() const { return count_; }
     //------------------------------------------------------------------
@@ -202,12 +210,13 @@ public:
     // descriptor configuration set. If all descriptors of the
     // LDPC_decode_desc_set are used, an exception is thrown.
     [[nodiscard]]
-    LDPC_decode_desc& find(int16_t BG, int Z, int num_parity);
+    LDPC_decode_desc& find(int16_t BG, int Z, int num_parity, cuphyLdpcMaxItrAlgoType_t ldpcMaxNumItrAlgo, uint8_t ldpcMaxNumItrPerUe);
 
     void resize(size_t maxSize)
     {
         max_count_ = maxSize;
-        descs_.resize(maxSize);
+        const LDPC_decode_desc default_desc(max_tbs_per_desc_);
+        descs_.resize(maxSize, default_desc);
     }
     //------------------------------------------------------------------
     // reset()
@@ -221,6 +230,7 @@ public:
 private:
     unsigned int                            count_{};
     unsigned int                            max_count_{};
+    uint8_t                                 max_tbs_per_desc_{};
     std::vector<LDPC_decode_desc> descs_;
 };
 

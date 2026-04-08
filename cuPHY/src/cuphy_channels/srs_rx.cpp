@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -115,7 +115,11 @@ constexpr uint16_t SRS_BW_TABLE[64][8] =
     std::array<size_t, maxCellsInCellGrp> maxSrsChEstToL2MemPerCell{};
 
     for(int cellIdx = 0; cellIdx < nMaxCells; cellIdx++){
-        maxSrsChEstToL2MemPerCell[cellIdx] = m_nPrbs * pCellStatPrms[cellIdx].nRxAntSrs * sizeof(float2) * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL * CUPHY_SRS_MAX_FULL_BAND_CHEST_PER_TTI;
+#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
+        maxSrsChEstToL2MemPerCell[cellIdx] = m_nPrbs * pCellStatPrms[cellIdx].nRxAntSrs * sizeof(float2) * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL * CUPHY_SRS_MAX_FULL_BAND_CHEST_PER_TTI * 2; 
+#else
+        maxSrsChEstToL2MemPerCell[cellIdx] = m_nPrbs * pCellStatPrms[cellIdx].nRxAntSrs * sizeof(short2) * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL * CUPHY_SRS_MAX_FULL_BAND_CHEST_PER_TTI * 2;
+#endif
     }
     std::sort(maxSrsChEstToL2MemPerCell.begin(), maxSrsChEstToL2MemPerCell.end(), std::greater<>());
 
@@ -205,7 +209,20 @@ void SrsRx::createComponents(cuphySrsFilterPrms_t* pSrsFilterPrms, cudaStream_t 
         size_t maxChEstSize           = nPrbGrpsPerHop * nRxAntSrs * nHops * nAntPorts * sizeof(short2);
 #endif
         m_gpuAddrsChEstToL2Vec[ueIdx] = m_LinearAlloc.alloc(maxChEstSize);
+        
+        size_t maxChEstInnerSize = maxChEstSize;
+        if(prgSize > 4)
+        {
+            prgSize = 2;
+            nPrbGrpsPerHop = SRS_BW_TABLE[m_hUeSrsPrm[ueIdx].configIdx][2*m_hUeSrsPrm[ueIdx].bandwidthIdx] / prgSize;
+#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
+            maxChEstInnerSize = nPrbGrpsPerHop * nRxAntSrs * nHops * nAntPorts * sizeof(float2);
+#else
+            maxChEstInnerSize = nPrbGrpsPerHop * nRxAntSrs * nHops * nAntPorts * sizeof(short2);
+#endif
+        }
 
+        m_gpuAddrsChEstToL2InnerVec[ueIdx] = m_LinearAlloc.alloc(maxChEstInnerSize);
 
         nBytesRkhsWorkspace += CUPHY_SRS_RKHS_WORKSPACE_SIZE_PER_UE; 
     }
@@ -219,6 +236,7 @@ void SrsRx::createComponents(cuphySrsFilterPrms_t* pSrsFilterPrms, cudaStream_t 
 
  SrsRx::SrsRx(cuphySrsStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     m_LinearAlloc(getBufferSize(pStatPrms), &m_memoryFootprint),
+    m_gpuAddrsChEstToL2InnerVec(CUPHY_SRS_MAX_N_USERS),
     m_gpuAddrsChEstToL2Vec(CUPHY_SRS_MAX_N_USERS),
     m_srsCellPrmsVec(pStatPrms->nMaxCellsPerSlot),
     m_hCellStatPrms(pStatPrms->pCellStatPrms),
@@ -282,10 +300,7 @@ void SrsRx::createComponents(cuphySrsFilterPrms_t* pSrsFilterPrms, cudaStream_t 
      CU_CHECK_EXCEPTION(cuGraphCreate(&m_graph, 0));
      CUPHY_CHECK(cuphySetEmptyKernelNodeParams(&m_emptyNode0ParamsDriver));
      CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_srsKernelNode, m_graph, nullptr, 0, &m_emptyNode0ParamsDriver));
-     if(m_chEstToL2NormalizationAlgo==1)
-     {
-         CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_srsNormalizationKernelNode, m_graph, &m_srsKernelNode, 1, &m_emptyNode0ParamsDriver));
-     }
+     CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_srsNormalizationKernelNode, m_graph, &m_srsKernelNode, 1, &m_emptyNode0ParamsDriver));
      // add dependencies
      // as there is only one kernel node, for now dependencies not used
 
@@ -295,10 +310,7 @@ void SrsRx::createComponents(cuphySrsFilterPrms_t* pSrsFilterPrms, cudaStream_t 
  {
      MemtraceDisableScope md;
      CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_graphExec, m_srsKernelNode, &(m_srsChEstLaunchCfg.kernelNodeParamsDriver)));
-     if(m_chEstToL2NormalizationAlgo==1)
-     {
-         CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_graphExec, m_srsNormalizationKernelNode, &(m_srsChEstNormalizationLaunchCfg.kernelNodeParamsDriver)));
-     }
+     CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_graphExec, m_srsNormalizationKernelNode, &(m_srsChEstNormalizationLaunchCfg.kernelNodeParamsDriver)));
  }
 
  cuphyStatus_t SrsRx::setupComponents(bool enableCpuToGpuDescrAsyncCpy, const cuphySrsDynPrms_t *pDynPrm)
@@ -316,6 +328,7 @@ void SrsRx::createComponents(cuphySrsFilterPrms_t* pSrsFilterPrms, cudaStream_t 
                                                             m_outputPrms.h_rbSnrBuffOffsets,
                                                             m_outputPrms.d_srsReports,
                                                             m_outputPrms.h_chEstBuffInfo,
+                                                            m_gpuAddrsChEstToL2InnerVec.data(),
                                                             m_gpuAddrsChEstToL2Vec.data(),
                                                             m_outputPrms.h_srsChEstToL2,
                                                             m_gpuAddrRkhsWorskpace,
@@ -474,11 +487,8 @@ void SrsRx::setupCmn(const cuphySrsDynPrms_t *pDynPrm)
             CUresult srsChEstRunStatus = launch_kernel(m_srsChEstLaunchCfg.kernelNodeParamsDriver, m_cuStream);
             if(CUDA_SUCCESS != srsChEstRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
             
-            if(m_chEstToL2NormalizationAlgo==1)
-            {
-                CUresult srsChEstNormalizationRunStatus = launch_kernel(m_srsChEstNormalizationLaunchCfg.kernelNodeParamsDriver, m_cuStream);
-                if(CUDA_SUCCESS != srsChEstNormalizationRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
-            }
+            CUresult srsChEstNormalizationRunStatus = launch_kernel(m_srsChEstNormalizationLaunchCfg.kernelNodeParamsDriver, m_cuStream);
+            if(CUDA_SUCCESS != srsChEstNormalizationRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
         }
 
         if(m_outputPrms.cpuCopyOn)

@@ -1,5 +1,7 @@
 cuPHY-CP/cuphycontroller/config/*_dyncore.yaml
 cuPHY-CP/testMAC/testMAC/*_dyncore.yaml
+cuPHY-CP/gt_common_libs/nvipc_src.20*
+core.*
 testVectors/*.h5
 testVectors/multi-cell/*.yaml
 .cache/

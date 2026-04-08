@@ -59,7 +59,7 @@ namespace pusch {
          * @param ppDynDescr - if defined, use it for kernelArgs[0]
          * @param ppDeviceGraph - if defined, use it for kernelArgs[1]
          */
-        virtual void setDeviceGraphLaunchKernelParams(cuphyPuschRxDglLaunchCfg_t* pLaunchCfg, uint8_t enableDeviceGraphLaunch,
+        virtual void setDeviceGraphLaunchKernelParams(cuphyPuschRxDglLaunchCfg_t* pLaunchCfg, uint8_t enableDeviceGraphLaunch, uint8_t puschRxProcMode,
                                                       void* ppDynDescr, void* ppDeviceGraph) = 0;
     };
 

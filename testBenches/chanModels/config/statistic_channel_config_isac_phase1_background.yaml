@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# ISAC Calibration Phase 1: Large Scale Calibration (without fast fading)
+# Reference: 3GPP TR 38.901 V19.0.0 Section 7.9.6.1
+# =============================================================================
+#
+# This configuration implements Table 7.9.6.1-1 for UAV sensing targets:
+# - Scenario: UMa-AV
+# - Sensing mode: TRP monostatic
+# - Target type: UAV small size (0.3m x 0.4m x 0.2m)
+# - Single 360-degree sector
+# - FR1: 6 GHz, 100 MHz bandwidth
+# - Single dual-pol isotropic antenna for BS/UT
+# - 1 sensing target at fixed height 200m
+# - Minimum 3D distance: 10m between STX/SRX and target
+# - Component A of RCS: -12.81 dBsm
+#
+# Metrics to compute:
+# - Coupling loss for target channel (pathloss + shadow fading + RCS_A)
+# - Coupling loss for background channel (monostatic reference points)
+
+# System Level Configuration
+system_level:
+  scenario: "UMa"                # UMa-AV scenario per Table 7.9.6.1-1
+  isd: 500.0                     # Inter-site distance per Table 7.9.6.1-1 (UMa ISD=500m)
+  n_site: 1                      # Single site per calibration
+  n_sector_per_site: 1           # Single 360-degree sector
+  n_ut: 1                        # Minimal UTs (focus on sensing targets)
+  optional_pl_ind: 0             # Standard pathloss equation
+  o2i_building_penetr_loss_ind: 0  # No O2I (all outdoor)
+  o2i_car_penetr_loss_ind: 0     # No car penetration
+  enable_near_field_effect: 0    # Disable for calibration
+  enable_non_stationarity: 0     # Disable for calibration
+  force_indoor_ratio: 0          # Force all outdoor
+  force_los_prob: [-1, -1]       # Use model-based LOS probability
+  force_ut_speed: [0, 0]         # Static UTs for calibration
+  disable_pl_shadowing: 0        # Enable pathloss and shadow fading
+  disable_small_scale_fading: 1  # PHASE 1: Disable fast fading (large scale only)
+  enable_per_tti_lsp: 0          # Static LSP for calibration
+  enable_propagation_delay: 1    # Enable propagation delay
+  
+  # ISAC Configuration for TRP Monostatic Sensing
+  isac_type: 1                   # Monostatic sensing (BS as TX/RX)
+  n_st: 1                        # 1 target per drop (multiple drops for CDF)
+  st_target_type: 0              # UAV target type
+  st_rcs_model: 1                # Deterministic monostatic RCS (single SPST)
+  st_vertical_velocity: 0.0      # Static target for calibration
+  st_horizontal_speed: [0.0, 0.0]  # Horizontal speed range [min,max] in m/s for calibration
+  st_distribution_option: [0, 1] # Uniform horizontal (exclude min2D), height-range vertical
+  st_drop_radius: 500.0          # Phase 1: Use ISD=500m as drop radius (override default ~288m)
+  st_override_k_db: .nan         # Background channel: use LSP-generated K
+  st_height: [200.0, 200.0]      # ST height range [min,max] in meters (Table 7.9.6.1-1)
+  st_minimum_distance: 0.0       # Auto-compute from physical size
+  st_min_dist_from_tx_rx: 10.0   # Minimum 3D distance 10m per Table 7.9.6.1-1
+  st_size_ind: 1                 # Small UAV (0.3m x 0.4m x 0.2m)
+  path_drop_threshold_db: 40.0   # Path drop threshold
+  isac_disable_background: 0     # 0=combined, 1=target-only (set to 1 for separate target analysis)
+  isac_disable_target: 1         # 0=include target, 1=background-only (set to 1 for separate background analysis)
+  
+  # Aerial UE Configuration (TR 36.777 Annex B.1.3)
+  aerial_ue_fast_fading_alt: 3   # B.1.3: Traditional fast fading with K=15dB
+  aerial_ue_height_min: 1.5      # Terrestrial UE height
+  aerial_ue_height_max: 300.0    # Max aerial height
+
+# Link Level Configuration
+link_level:
+  fast_fading_type: 0            # AWGN (no fast fading for Phase 1)
+  delay_profile: "A"             # Not used for Phase 1
+  delay_spread: 30.0             # Not used for Phase 1
+  velocity: [0, 0, 0]            # Static for calibration
+  num_ray: 0                     # Default rays
+  cfo_hz: 0.0                    # No CFO for calibration
+  delay: 0.0                     # No additional delay
+
+# Simulation Configuration
+simulation:
+  link_sim_ind: 0                # System-level simulation
+  center_freq_hz: 6e9            # FR1: 6 GHz per Table 7.9.6.1-1
+  bandwidth_hz: 100e6            # FR1: 100 MHz per Table 7.9.6.1-1
+  sc_spacing_hz: 30000           # 30 kHz SCS
+  fft_size: 4096                 # FFT size
+  n_prb: 273                     # PRBs for 100 MHz
+  n_prbg: 137                    # PRB groups
+  n_snapshot_per_slot: 1         # Single snapshot for Phase 1
+  run_mode: 0                    # CIR only (no CFR needed for large scale)
+  internal_memory_mode: 1        # Internal CIR memory
+  freq_convert_type: 1           # Center SC
+  sc_sampling: 1                 # Default sampling
+  proc_sig_freq: 0               # Not used
+  optional_cfr_dim: 0            # Default dimension
+  cpu_only_mode: 1               # CPU mode for calibration
+  h5_dump_level: 1               # 0=minimal dump, 1=full dump (default)
+
+# Antenna Panel Configurations
+antenna_panels:
+  # BS antenna: Single dual-pol isotropic antenna per Table 7.9.6.1-1
+  panel_0:
+    n_ant: 2                     # Single dual-pol (M,N,P,Mg,Ng;Mp,Np) = (1,1,2,1,1;1,1)
+    ant_size: [1, 1, 1, 1, 2]    # [M_g, N_g, M, N, P] = 1x1x1x1x2 = 2 antennas
+    ant_spacing: [0, 0, 0.5, 0.5]  # Half-wavelength spacing
+    ant_theta: []                # Not needed for isotropic
+    ant_phi: []                  # Not needed for isotropic
+    ant_polar_angles: [45, -45]  # ±45° polarization
+    ant_model: 0                 # Isotropic per Table 7.9.6.1-1
+
+  # UE antenna: Single dual-pol isotropic antenna per Table 7.9.6.1-1
+  panel_1:
+    n_ant: 2                     # Single dual-pol (M,N,P,Mg,Ng;Mp,Np) = (1,1,2,1,1;1,1)
+    ant_size: [1, 1, 1, 1, 2]    # [M_g, N_g, M, N, P] = 1x1x1x1x2 = 2 antennas
+    ant_spacing: [0, 0, 0.5, 0.5]  # Half-wavelength spacing
+    ant_theta: []                # Not needed for isotropic
+    ant_phi: []                  # Not needed for isotropic
+    ant_polar_angles: [0, 90]    # 0/90° polarization
+    ant_model: 0                 # Isotropic per Table 7.9.6.1-1
+
+# Test Bench Configuration
+test_bench:
+  n_tti: 1                       # Single TTI per drop (multiple runs for CDF)
+  continuous_fading: 0           # No continuous fading for Phase 1
+  rand_seed: 0                   # Random seed (0 = time-based)
+  enable_half_precision: false   # Full precision
+  enable_swap_tx_rx: false       # DL mode
+
+

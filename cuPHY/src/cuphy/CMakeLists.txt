@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,7 @@ file(MAKE_DIRECTORY ${LUTS_DIR})
 add_executable(genLUT crc/gen_crc_LUTs.cpp descrambling/descrambling.hpp)
 
 target_include_directories(genLUT PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_link_libraries(genLUT PUBLIC aerial_utils)
 
 add_custom_command( OUTPUT
             ${LUTS_DIR}/G_CRC_24_A_P_LUT.h
@@ -56,6 +57,7 @@ add_custom_target(CRCLUTGEN DEPENDS
 
 add_executable(genPucchLUT pucch_receiver/gen_pucch_receiver_LUTs.cpp)
 target_include_directories(genPucchLUT PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_link_libraries(genPucchLUT PUBLIC aerial_utils)
 
 add_custom_command( OUTPUT
             ${LUTS_DIR}/PUCCH_RECEIVER_F1_TOCC_VALUES_LUT.h
@@ -265,11 +267,8 @@ add_library(cuphy
     cuphy_pti.cpp
     cuphy_pti.cu
     copy_kernel.cu
+    cupti_helper.cpp
 )
-
-if(ENABLE_CUPTI_TRACING)
-    target_sources(cuphy PRIVATE cupti_helper.cpp)
-endif()
 
 
 # ----------------------------------------------------------------------
@@ -291,6 +290,7 @@ if (NOT BUILD_SHARED_LIBS)
     set(NVLOG_LIB nvlog_static)
 endif()
 target_link_libraries(cuphy_pti PUBLIC CUDA::cudart ${NVLOG_LIB})
+target_link_libraries(cuphy_pti PUBLIC aerial_utils)
 
 # Install cuphy_pti
 install(TARGETS cuphy_pti DESTINATION lib)
@@ -384,11 +384,8 @@ endif()
 
 # Link with cuda library for driver API
 target_link_libraries(cuphy PUBLIC cuda CUDA::nvtx3 ${NVLOG_LIB} ${NVINFER} gsl-lite::gsl-lite yaml-cpp mathdx::cufftdx)
-target_link_libraries(cuphy PRIVATE cufft)
-
-if(ENABLE_CUPTI_TRACING)
-    target_link_libraries(cuphy PUBLIC CUDA::cupti)
-endif()
+target_link_libraries(cuphy PUBLIC aerial_utils)
+target_link_libraries(cuphy PUBLIC CUDA::cupti)
 
 # Function to setup LDPC decoder cubins for a target
 function(setup_ldpc_cubins TARGET_NAME)
@@ -456,6 +453,7 @@ target_include_directories(cuphy_ldpc
 )
 
 target_link_libraries(cuphy_ldpc PUBLIC cuda CUDA::nvtx3 ${NVLOG_LIB} gsl-lite::gsl-lite)
+target_link_libraries(cuphy_ldpc PUBLIC aerial_utils)
 
 set_target_properties(cuphy_ldpc PROPERTIES
     INTERFACE_SYSTEM_INCLUDE_DIRECTORIES $<TARGET_PROPERTY:cuphy_ldpc,INTERFACE_INCLUDE_DIRECTORIES>

@@ -1,4 +1,1 @@
-onnxruntime==1.22.0
-sionna-no-rt==1.0.2
-ml-dtypes==0.2.0
-tensorflow-cpu-aws==2.15.0
+onnxruntime

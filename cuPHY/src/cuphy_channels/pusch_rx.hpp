@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -94,6 +94,20 @@ struct condGraphInfo final {
 //#endif
     CUgraph* m_pGraph[3]{};
 };
+
+// helper to represent the graph + parent nodes for a conditional stage (C0/C1/C2)
+struct CondStage
+{
+    CUgraph* pGraph = nullptr;              // graph where subsequent nodes should be added
+    std::vector<CUgraphNode> parents;       // parent nodes for the next stage
+};
+
+// Helper to return the terminal nodes of different pipeline stage functions
+struct StageResult
+{
+    std::vector<CUgraphNode> terminalNodes;  // Last nodes of this stage
+};
+
 
 class PuschRx : public cuphyPuschRx {
 public:
@@ -328,8 +342,54 @@ private:
     void launchLDPCStreamsTensor(cudaStream_t strm);
     void launchLDPCStreamsTB(cudaStream_t strm);
 
+    // CUDA graph building blocks =================================================================
+    StageResult buildFrontEndStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                   CUgraph*                        pGraph,
+                                   const std::vector<CUgraphNode>& initialParents,
+                                   void*&                          arg);
+
+    StageResult buildSoftDemapStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                    CUgraph*                        pGraph,
+                                    const std::vector<CUgraphNode>& eqCoefDeps,
+                                    void*&                          arg);
+
+    StageResult buildSchBackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                     CUgraph*                        pGraph,
+                                     const std::vector<CUgraphNode>& schParents);
+
+    StageResult buildUciP1BackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                       CUgraph*                        pGraph,
+                                       const std::vector<CUgraphNode>& softDemapParents);
+
+    StageResult buildCsiP2BackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                       CUgraph*                        pGraph,
+                                       const std::vector<CUgraphNode>& uciP1Parents,
+                                       bool                            useCondIfOrDglC2);
+    // Conditional Graph helper functions ==========================================================
+    CondStage enterConditionalStage0(CUgraph&                        fullSlotGraph,
+                                     CUgraphNode&                    emptyRootNode,
+                                     condGraphInfo&                  condInfo,
+                                     CUcontext                       current_context,
+                                     unsigned int                    cond_handle_flags,
+                                     const std::vector<CUgraphNode>& initialParents);
+
+    CondStage enterConditionalStage1(condGraphInfo&                  condInfo,
+                                     CUcontext                       current_context,
+                                     unsigned int                    cond_handle_flags,
+                                     const std::vector<CUgraphNode>& parents,
+                                     std::vector<CUgraphNode>&       dglParentsOut);
+
+    CondStage enterConditionalStage2(condGraphInfo&                  condInfo,
+                                     CUcontext                       current_context,
+                                     unsigned int                    cond_handle_flags,
+                                     bool                            use_cond_if_node_c2,
+                                     const std::vector<CUgraphNode>& parentsForC2,
+                                     std::vector<CUgraphNode>&       dglParentsOut);
+    // ============================================================================================
+
+
     // graph functions
-    void createFullSlotGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo&  condInfo);
+    void createFullSlotGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo& condInfo);
     void updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraphExec graphExec, condGraphInfo& condInfo);
 
     void createEarlyHarqGraph();  // for early-HARQ portion of PUSCH pipeline
@@ -616,6 +676,7 @@ private:
     CUgraphNode     m_chEqSoftDemapIdftNodes[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES][CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS];
     CUgraphNode     m_chEqSoftDemapAfterDftNodes[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES][CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS];
     CUgraphNode     m_resetRateMatchNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
+    CUgraphNode     m_clampRateMatchNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     CUgraphNode     m_rateMatchNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     std::vector<std::vector<CUgraphNode>>     m_ldpcDecoderNodes;
     CUgraphNode     m_crcNodes[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES][2];  // CB CRC + TB CRC
@@ -723,9 +784,9 @@ private:
     uint32_t m_maxNCbsPerTb;
 
     // CUDA stream used for GPU operations
-    cudaStream_t phase1Stream;
+    cudaStream_t phase1Stream{};
     cuphy::event m_phase1Complete;
-    cudaStream_t phase2Stream;
+    cudaStream_t phase2Stream{};
     cuphy::stream_pool m_G0streamPool; // Use a pool of CUDA streams to concurrently perform early-HARQ output copy and PUSCH_RUN_FULL_SLOT_PROC
     cuphy::stream_pool m_G1streamPool; // Use a pool of CUDA streams to concurrently launch some kernels in CSI-P1 and CSI-P2
     cuphy::stream_pool m_G2streamPool; // Use a pool of CUDA streams to concurrently launch some other kernels in CSI-P1 and CSI-P2
@@ -757,6 +818,9 @@ private:
     const bool m_useBatchedMemcpy;
     //  Array of 3, index 0 for early harq, index  1 for non EH, and 2 for H2D setup; see batchedmMemcpyHelperTarget
     cuphyBatchedMemcpyHelper m_batchedMemcpyHelper[batchedMemcpyHelperTarget::TOTAL_CNT];
+
+    // Determine from PuschRx ctor passed stream if green context is used
+    bool m_useGreenContext{};
 };
 
 #endif // !defined(PUSCH_RX_HPP_INCLUDED_)

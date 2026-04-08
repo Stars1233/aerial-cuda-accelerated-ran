@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,8 @@ from typing import TypeVar
 
 import numpy as np
 import cupy as cp  # type: ignore
+
+from aerial.util.cuda import CudaStream
 
 Array = TypeVar("Array", np.ndarray, cp.ndarray)
 _SlotConfigT = TypeVar("_SlotConfigT", bound="SlotConfig")
@@ -50,14 +52,15 @@ class PipelineFactory(ABC, Generic[_PipelineConfigT]):
     """A generic pipeline factory defining the interface that the factories need to implement."""
 
     @abstractmethod
-    def create(self, config: _PipelineConfigT, cuda_stream: int, **kwargs: Any) -> Pipeline:
+    def create(self, config: _PipelineConfigT, cuda_stream: CudaStream, **kwargs: Any) -> Pipeline:
         """Create the pipeline.
 
         Args:
             config (PipelineConfig): Pipeline configuration. Note that for the implementation of
                 this method, a `PipelineConfig` may also be subclassed to implement an arbitrary
                 pipeline configuration.
-            cuda_stream (int): CUDA stream used to run the pipeline.
+            cuda_stream (CudaStream): CUDA stream used to run the pipeline. Use ``with stream:``
+                to scope work; call ``stream.synchronize()`` explicitly when sync is needed.
 
         Returns:
             Pipeline: A pipeline object, the class of which is derived from `Pipeline`.

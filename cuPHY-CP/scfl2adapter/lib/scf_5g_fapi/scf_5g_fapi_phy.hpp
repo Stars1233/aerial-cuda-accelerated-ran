@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -291,6 +291,23 @@ public:
                 ::cuphySrsStatPrms_t const* srsStatPrms,
                 const std::array<bool,UL_MAX_CELLS_PER_SLOT>& srs_order_cell_timeout_list);
     void create_ul_dl_callbacks(slot_command_api::callbacks &cb);
+    
+    /**
+     * @brief Wrapper for DL TB processed callback - provides public access for static wrapper
+     * @param params PDSCH parameters
+     */
+    void on_dl_tb_processed_callback(const slot_command_api::pdsch_params* params);
+    
+    /**
+     * @brief FH prepare callback wrappers - provide public access for static wrappers
+     * @param grp_cmd Cell group command
+     * @param cell Cell ID
+     */
+    void fh_prepare_callback_wrapper_tff(slot_command_api::cell_group_command* grp_cmd, uint8_t cell);  // <true,false,false>
+    void fh_prepare_callback_wrapper_tft(slot_command_api::cell_group_command* grp_cmd, uint8_t cell);  // <true,false,true>
+    void fh_prepare_callback_wrapper_ttf(slot_command_api::cell_group_command* grp_cmd, uint8_t cell);  // <true,true,false>
+    void fh_prepare_callback_wrapper_ttt(slot_command_api::cell_group_command* grp_cmd, uint8_t cell);  // <true,true,true>
+    
     void send_rx_data_indication(const slot_command_api::slot_indication& slot,
         const slot_command_api::pusch_params&, ::cuphyPuschDataOut_t const*, ::cuphyPuschStatPrms_t const* puschStatPrms);
     void send_rx_pe_noise_var_indication(const slot_command_api::slot_indication& slot, const slot_command_api::pusch_params& params,
@@ -298,7 +315,15 @@ public:
 
     void prepare_dl_slot_command(slot_command_api::slot_indication& slot_ind, scf_fapi_csi_rsi_pdu_t& pdu,uint32_t,bool);
     void prepare_dl_slot_command(slot_command_api::slot_indication& slot_ind, scf_fapi_pdcch_pdu_t& pdu, uint8_t testMode);
-    void prepare_dl_slot_command(slot_command_api::slot_indication& slot_ind, scf_fapi_pdsch_pdu_t& pdu, uint8_t testMode);
+
+    /**
+     * Prepare the DL slot command for PDSCH
+     * @param slot_ind The slot information, including SFN, slot, and tick
+     * @param pdu The scf_fapi_pdsch_pdu_t data structure
+     * @param testMode The test mode
+     * @return true if PDSCH accepted, false if rejected (e.g. check_bf_pc_params failed). When false, caller must set pdsch_valid_flag. */
+    bool prepare_dl_slot_command(slot_command_api::slot_indication& slot_ind, scf_fapi_pdsch_pdu_t& pdu, uint8_t testMode);
+
     void prepare_dl_slot_command(slot_command_api::slot_indication& slot_ind, scf_fapi_ssb_pdu_t& pdu);
     void prepare_ul_slot_command(slot_command_api::slot_indication& slot_ind, scf_fapi_prach_pdu_t& req);
     void prepare_ul_slot_command(slot_command_api::slot_indication& slot_ind, scf_fapi_pdcch_pdu_t& pdu);
@@ -321,8 +346,29 @@ public:
     virtual void send_cell_config_response(int32_t cell_id, uint8_t response_code) override;
     virtual void handle_cell_config_response(int32_t cell_id, uint8_t response_code) override;
     bool process_dl_tx_request();
-    void send_error_indication(scf_fapi_message_id_e msg_id,  scf_fapi_error_codes_t error_code, uint16_t sfn, uint16_t slot, uint16_t total_errors = 0, nv::slot_limit_cell_error_t* cell_error = nullptr, nv::slot_limit_group_error_t* group_error = nullptr);
-    void send_error_indication_l1(scf_fapi_message_id_e msg_id,  scf_fapi_error_codes_t error_code, uint16_t sfn, uint16_t slot,int32_t cell_idx, bool log_info=false, uint16_t total_errors=0, nv::slot_limit_cell_error_t* cell_error = nullptr, nv::slot_limit_group_error_t* group_error = nullptr);
+    /** @brief Send an SCF FAPI error indication to the MAC for this PHY instance's configured carrier.
+     *  @param[in] msg_id FAPI message ID the error is associated with.
+     *  @param[in] error_code SCF error code placed in the indication.
+     *  @param[in] sfn System frame number for the indication.
+     *  @param[in] slot Slot index for the indication.
+     *  @param[in] log_info If true, log the outgoing indication at info level; if false, at error/event level.
+     *  @param[in] total_errors Optional PDU count when populating error extension fields.
+     *  @param[in] cell_error Optional per-cell L1 limit error context for extension payload.
+     *  @param[in] group_error Optional group L1 limit error context for extension payload.
+     */
+    void send_error_indication(scf_fapi_message_id_e msg_id,  scf_fapi_error_codes_t error_code, uint16_t sfn, uint16_t slot, bool log_info = false, uint16_t total_errors = 0, nv::slot_limit_cell_error_t* cell_error = nullptr, nv::slot_limit_group_error_t* group_error = nullptr);
+    /** @brief Send an SCF FAPI error indication for an explicit cell index (transport / L1 path).
+     *  @param[in] msg_id FAPI message ID the error is associated with.
+     *  @param[in] error_code SCF error code placed in the indication.
+     *  @param[in] sfn System frame number for the indication.
+     *  @param[in] slot Slot index for the indication.
+     *  @param[in] cell_idx Carrier index used to select the IPC transport.
+     *  @param[in] log_info If true, log the outgoing indication at info level; if false, at error/event level.
+     *  @param[in] total_errors Optional PDU count when populating error extension fields.
+     *  @param[in] cell_error Optional per-cell L1 limit error context for extension payload.
+     *  @param[in] group_error Optional group L1 limit error context for extension payload.
+     */
+    void send_error_indication_l1(scf_fapi_message_id_e msg_id,  scf_fapi_error_codes_t error_code, uint16_t sfn, uint16_t slot, int32_t cell_idx, bool log_info = false, uint16_t total_errors=0, nv::slot_limit_cell_error_t* cell_error = nullptr, nv::slot_limit_group_error_t* group_error = nullptr);
     void send_released_harq_buffer_error_indication(const ReleasedHarqBufferInfo &released_harq_buffer_info, const slot_command_api::pusch_params* params, uint16_t sfn, uint16_t slot);
     void update_ssb_config();
     void update_prach_addln_configs();
@@ -374,6 +420,9 @@ public:
 
     // CSI2 Maps
     void copy_csi2_maps_from(uint16_t nCsi2MapsOther, uint16_t* csi2MapBufferOther, cuphyCsi2MapPrm_t * csi2MapParamsBufferOther);
+    
+    // DBT PDU Table Pointer
+    int update_dbt_pdu_table_ptr(int32_t cell_id, void* dbt_pdu_table_ptr);
 private:
     int check_sfn_slot(int cell_id, int msg_id, sfn_slot_t ss_msg);
     bool can_handle_msg(uint8_t typeId);
@@ -395,6 +444,9 @@ private:
     uint32_t dl_pdu_index[MAX_PDSCH_UE_GROUPS];
     uint32_t dl_pdu_index_size;
     bool valid_dci_rx = false;
+
+    /** True when PDSCH was rejected this slot (e.g. check_bf_pc_params failed). Persists across messages so TX_DATA can be dropped when it arrives separately. */
+    bool pdsch_rejected_ = false;
 
     // Duplicate message check
     bool duplicate_dl_tti_req = false;
@@ -437,6 +489,8 @@ private:
     uint16_t nCsi2Maps;
     cuphy::unique_pinned_ptr<uint16_t> csi2MapCpuBuffer;
     cuphy::unique_pinned_ptr<cuphyCsi2MapPrm_t> csi2MapParamsCpuBuffer;
+
+    void* dbt_pdu_table_ptr{nullptr};
 };
 
 } // namespace scf_5g_fapi

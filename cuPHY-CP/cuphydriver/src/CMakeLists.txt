@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,6 +60,7 @@ set(SOURCES
 	common/pmu_reader.cpp
 	common/memfoot.cpp
 	common/metrics.cpp
+	common/task_instrumentation_v3.cpp
 
 	uplink/task_function_ul_aggr.cpp
 	uplink/slot_map_ul.cpp
@@ -101,8 +102,8 @@ if (TARGET aerial_metrics)
 	target_compile_definitions(${TARGET} PRIVATE AERIAL_METRICS)
 endif()
 
-#set_target_properties(${TARGET} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-#set_target_properties(${TARGET} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_target_properties(${TARGET} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+set_target_properties(${TARGET} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 #-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
 #Include directories
 #-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
@@ -147,12 +148,11 @@ target_include_directories(${TARGET} PRIVATE $<BUILD_INTERFACE:${CUPHYDRIVER_HOM
 target_link_libraries(${TARGET} PRIVATE CUDA::cudart CUDA::cuda_driver ${MISC_REQ_LIBS})
 target_link_libraries(${TARGET} PRIVATE aerial-fh cuphy_channels cuphy cuphy_hdf5 cuphy_cpp_header_only ${NVTX_LIB})
 target_link_libraries(${TARGET} PUBLIC slot_command nvlog oran_utils app_config app_utils comp_decomp_lib Backward::Backward nvipc)
-target_link_libraries(${TARGET} PRIVATE cuphyoamlib gdrapi)
+target_link_libraries(${TARGET} PRIVATE cuphyoamlib gdrapi perf_metrics)
 
 target_include_directories(${TARGET} PUBLIC ${DOCA_INCLUDE_DIRS})
-target_link_libraries(${TARGET} PRIVATE json-c -L${DOCA_LIBRARY_DIRS} -ldoca_gpunetio -ldoca_common -ldoca_argp -ldoca_eth)
+target_link_libraries(${TARGET} PRIVATE json-c -L${DOCA_LIBRARY_DIRS} -ldoca_gpunetio -ldoca_common -ldoca_gpunetio_device -ldoca_argp -ldoca_eth)
 # Temporary solution waiting for header file to expose CUDA device functions for Order Kernel
 # target_link_libraries(${TARGET} PRIVATE -Wl,--whole-archive ${DOCA_LIBRARY_DIRS}/libdoca_gpu_device.a  -Wl,--no-whole-archive)
 
 #target_link_libraries(${TARGET} PRIVATE comp_decomp_lib)
-

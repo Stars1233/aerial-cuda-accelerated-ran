@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,7 +57,7 @@ else
     % contentions with CICD generating them in 2 places at once (SRS + BFW)
     % Ideally, better handling of single-write-multiple-read (SWMR) should be
     % supported to resolve contentions automatically
-    disabled_TC = [8412,8413,8512:8526,8531,8532,8535:8555,8558,8559:8566];
+    disabled_TC = [8046,8412,8413,8512:8526,8531,8532,8535:8555,8558,8559:8566];
 end
 [~,TcIdx] = ismember(disabled_TC, selected_TC);
 selected_TC(TcIdx) = [];
@@ -139,7 +139,8 @@ CFG = {...
     8042   1     2    4     4    9     0     0    0     2        0      0    0    0      0    0     0      1      0       0; % Nrep = 4, 4 PRBs per PRBG
     8043   1     2    4     2    9     3     0    2     2        1      7   20   15      3    0     0      1      0       0; % freqHopping = 3, 4 PRBs per PRBG
     8044   1     2    4     2    9     3     0    2     2        1      7   20   15      0    2     0      1      0       0; % grpSeqHopping = 2, 4 PRBs per PRBG
-
+    8045   1     2    1     1    9    63     0    0     4        0      0    0    0      0    0     0      1      0       0; % 4 users wideband. Time multiplexed. Heterogeneous PRG size
+    8046   30    4    1     1    9    63     1    0     4        1      0    0    0      0    0     0      1      0       0; % TC8512 + SRS PRG size = 16
    % Multiple parameters
    % TC#  rnti  Nap nSym  Nrep sym0 cfgIdx seqId bwIdx cmbSz cmbOffset cs  fPos fShift frqH grpH resType Tsrs  Toffset idxSlot
     8051  17     1    1     1   13     1     3    3     2        0      1    3    1      2    0     0      1      0       3;
@@ -466,7 +467,7 @@ parfor n = 1:NallTest
         if ismember(caseNum, [8054:8057])
             SysPar.srs{1}.usage = USAGE_NON_CODEBOOK;
         end
-        if ismember(caseNum, [8512, 8514 8516 8518 8520 8522 8524 8526 8628 8530 8532 8534 8536 8538 8540 8542:2:8554 8558])
+        if ismember(caseNum, [8046 8512 8514 8516 8518 8520 8522 8524 8526 8628 8530 8532 8534 8536 8538 8540 8542:2:8554 8558])
             SysPar.srs{1}.usage = USAGE_NON_CODEBOOK;
         end
         if ismember(caseNum, [8513 8515 8517 8519 8521 8523 8525 8527 8529 8531 8533 8535 8537 8539 8541:2:8553 8557])
@@ -544,7 +545,7 @@ parfor n = 1:NallTest
             SysPar.srs{5}.frequencyShift = 80;
 
             
-        elseif ismember(caseNum,[8032 8408])
+        elseif ismember(caseNum,[8032 8408 8045])
             SysPar.testAlloc.srs = 4;
             SysPar.SimCtrl.N_UE  = 4;
             [SysPar.srs{2:SysPar.SimCtrl.N_UE}] = deal(SysPar.srs{1});
@@ -553,6 +554,13 @@ parfor n = 1:NallTest
             SysPar.srs{2}.timeStartPosition = 10;
             SysPar.srs{3}.timeStartPosition = 11;
             SysPar.srs{4}.timeStartPosition = 12;
+
+            if caseNum == 8045
+                SysPar.srs{1}.prgSize = 4;
+                SysPar.srs{2}.prgSize = 8;
+                SysPar.srs{3}.prgSize = 16;
+                SysPar.srs{4}.prgSize = 272;
+            end
 
         elseif ismember(caseNum,[8033,8035,8409, 8420])
             SysPar.testAlloc.srs = 16;
@@ -932,9 +940,13 @@ parfor n = 1:NallTest
             SysPar.srs{7}.combOffset = 2;
             SysPar.srs{8}.combOffset = 3;
 
-        elseif ismember(caseNum, [8512,8536,8538,8555])
+        elseif ismember(caseNum, [8046,8512,8536,8538,8555])
             SysPar.testAlloc.srs = 16;
             SysPar.SimCtrl.N_UE  = 16;
+
+            if caseNum == 8046
+                SysPar.srs{1}.prgSize = 16;
+            end
             [SysPar.srs{2:SysPar.SimCtrl.N_UE}] = deal(SysPar.srs{1});
             [SysPar.Chan{2:SysPar.SimCtrl.N_UE}] = deal(SysPar.Chan{1});
             
@@ -1223,14 +1235,14 @@ parfor n = 1:NallTest
             SysPar.carrier.N_FhPort_UL     = 4;
             SysPar.SimCtrl.enable_dynamic_BF = 1;
         end
-        if ismember(caseNum, [8501:8599])
+        if ismember(caseNum, [8046,8501:8599])
             SysPar.carrier.Nant_gNB        = 64;
             SysPar.carrier.Nant_gNB_srs    = 64;
             SysPar.carrier.N_FhPort_DL     = 16;
             SysPar.carrier.N_FhPort_UL     = 16;
             SysPar.SimCtrl.enable_dynamic_BF = 1;
         end
-        if ismember(caseNum, [8512,8536,8538,8555])
+        if ismember(caseNum, [8046,8512,8536,8538,8555])
             SysPar.srs{1}.RNTI = 4;
             SysPar.srs{2}.RNTI = 13;
             SysPar.srs{3}.RNTI = 6;

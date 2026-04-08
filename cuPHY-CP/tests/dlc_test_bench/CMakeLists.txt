@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -63,6 +63,7 @@ add_executable(dlc_test_bench
     ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/standalone.cpp
     ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/cplane_rx_cores.cpp
     ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/uplane_rx_cores.cpp
+    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/sectionid_validation.cpp
 )
 
 # Add dependencies to ensure libraries are built before the test

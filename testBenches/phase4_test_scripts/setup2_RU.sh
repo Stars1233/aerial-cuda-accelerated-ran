@@ -1,5 +1,6 @@
 #!/bin/bash -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,6 +58,10 @@ show_usage() {
     echo "  --ru-yaml=Y, -y Y        Set ru-emulator YAML file"
     echo "                           Default: $RU_CFG.yaml"
     echo 
+    echo "  --core-config-input-override=YAML  Override logical core configuration file"
+    echo "                                     example: --core-config-input-override=l1_logical_cores_DU_CG1_RU_CG1.yaml"
+    echo "                                     Default: unset"
+    echo
     echo "  --config_dir <path>      Specify the path to the directory containing config files. (default: "\$cuBB_SDK")"
     echo "                           the testBenches scripts will modify configuration files and write output files to this location"
     echo
@@ -96,6 +101,19 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             RU_ETH_INTERFACE_1="$2"
+            shift 2
+            ;;
+        --core-config-input-override=*)
+            CORE_CONFIG_INPUT_OVERRIDE="${1#*=}"
+            shift
+            ;;
+        --core-config-input-override)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for $1 option"
+                show_usage
+                exit 1
+            fi
+            CORE_CONFIG_INPUT_OVERRIDE="$2"
             shift 2
             ;;
         --ru-yaml*)
@@ -261,6 +279,8 @@ if [[ "$CONTROLLER_MODE" == *nrSim_SCF* ]]; then
         echo "No file containing '$CONTROLLER_MODE' found in $RU_CFG_PATH"
         exit 1
     fi
+elif [[ "$RU_CFG" == *yaml ]]; then
+    RU_YAML=${CONFIG_DIR}/cuPHY-CP/ru-emulator/config/$RU_CFG
 else
     # Default to single port config (can be overridden with --ru-yaml)
     RU_YAML=${CONFIG_DIR}/cuPHY-CP/ru-emulator/config/config.yaml
@@ -291,8 +311,12 @@ fi
 
 CORE_CONFIG_OUTPUT=$CONFIG_DIR/testBenches/phase4_test_scripts
 
-#ToDo maybe add an option to allow manual selection of CORE_CONFIG_INPUT as well
-CORE_CONFIG_INPUT=l1_logical_cores_DU${CUPHY_HOST_TYPE}_RU${RU_HOST_TYPE}${OPT}.yaml
+# Allow manual selection of CORE_CONFIG_INPUT via optional CLI override
+if [[ -n "$CORE_CONFIG_INPUT_OVERRIDE" ]]; then
+    CORE_CONFIG_INPUT="${CORE_CONFIG_INPUT_OVERRIDE}"
+else
+    CORE_CONFIG_INPUT=l1_logical_cores_DU${CUPHY_HOST_TYPE}_RU${RU_HOST_TYPE}${OPT}.yaml
+fi
 
 echo "Using CORE_CONFIG_INPUT: $CORE_CONFIG_INPUT"
 
@@ -310,6 +334,14 @@ if [[ -f $cuBB_SDK/cubb_scripts/autoconfig/l1_core_config/$CORE_CONFIG_INPUT ]];
         fi
     fi
     )
+fi
+
+# Override core assignments for NRSIM_TC 90629 on R750
+if [[ "$NRSIM_TC" == "90629" && "$RU_HOST_TYPE" == "_R750" ]]; then
+    echo "Overriding core assignments for NRSIM_TC 90629 on R750"
+    yq -i ".ru_emulator.ul_core_list = [5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41]" $RU_YAML
+    yq -i ".ru_emulator.dl_core_list = [4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44]" $RU_YAML
+    echo "Core assignments overridden in $RU_YAML"
 fi
 
 #==============================================================

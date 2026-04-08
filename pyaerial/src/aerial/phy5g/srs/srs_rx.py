@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,14 +16,14 @@
 """pyAerial - SRS receiver pipeline class definition."""
 from typing import Any
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 
 from aerial import pycuphy  # type: ignore
 from aerial.pycuphy.chest_filters import srs_chest_params_from_hdf5
 from aerial.pycuphy.chest_filters import CUPHY_CHEST_COEFF_FILE
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.srs.srs_api import SrsRxPipeline
 from aerial.phy5g.srs.srs_api import SrsRxConfig
@@ -44,7 +44,7 @@ class SrsRx(SrsRxPipeline[SrsRxConfig, SrsReport, Array]):
                  enable_delay_offset_correction: int = 1,
                  chest_params: dict = None,
                  num_max_srs_ues: int = 192,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize SrsRx.
 
         Args:
@@ -61,11 +61,11 @@ class SrsRx(SrsRxPipeline[SrsRxConfig, SrsReport, Array]):
                 Set to None to use defaults.
             num_max_srs_ues (int): Maximum number of SRS UEs. This number is used in memory
                 allocations. Default: 192.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         num_cells = len(num_rx_ant)
 
@@ -79,7 +79,7 @@ class SrsRx(SrsRxPipeline[SrsRxConfig, SrsReport, Array]):
                                     enable_delay_offset_correction,
                                     chest_params,
                                     num_max_srs_ues,
-                                    cuda_stream)
+                                    self._cuda_stream.handle)
 
     def __call__(self,
                  rx_data: List[Array],
@@ -96,7 +96,7 @@ class SrsRx(SrsRxPipeline[SrsRxConfig, SrsReport, Array]):
         Returns:
             List[SrsReport]: The SRS reports per UE, see `SrsReport`.
         """
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rx_data = [cp.array(elem, order='F', dtype=cp.complex64) for elem in rx_data]
             rx_data = [pycuphy.CudaArrayComplexFloat(elem) for elem in rx_data]
 

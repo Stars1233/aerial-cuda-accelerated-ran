@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -112,31 +112,85 @@ namespace cumac {
       ueIds[eIdx] = 0xFFFF;
    }
 
-   __shared__ int nAssocUeFound;
+   __shared__ int nAssocUeFoundLeft;
+   __shared__ int nAssocUeFoundRight;
    if (threadIdx.x == 0) {
-      nAssocUeFound = 0;
+      nAssocUeFoundLeft = 0;
+      nAssocUeFoundRight = 0;
    }
    __syncthreads();
 
-   for (int uIdx = threadIdx.x; uIdx < pDynDescr->nActiveUe; uIdx += blockDim.x) {
-      if (pDynDescr->cellAssocActUe[cellIdx*pDynDescr->nActiveUe + uIdx]) {
-         int storeIdx = atomicAdd(&nAssocUeFound, 1);
+   const float W = pDynDescr->W;
+   const float betaCoeff = pDynDescr->betaCoeff;
+   const int nActiveUe = pDynDescr->nActiveUe;
+   const int nUeAnt = pDynDescr->nUeAnt;
+   const int cellUeOffset = (int)cellIdx * nActiveUe;
+   for (int uIdx = threadIdx.x; uIdx < nActiveUe; uIdx += blockDim.x) {
+      bool isCandidate = false;
+      float candidateRate = 0.0f;
 
+      if (pDynDescr->cellAssocActUe[cellUeOffset + uIdx]) {
          if (pDynDescr->newDataActUe == nullptr || pDynDescr->newDataActUe[uIdx] == 1) { // new transmission
-            if (pDynDescr->bufferSize != nullptr && pDynDescr->bufferSize[uIdx] == 0) {
-               continue;
+            if (pDynDescr->bufferSize == nullptr || pDynDescr->bufferSize[uIdx] != 0) {
+               float dataRate = 0.0f;
+               const int ueAntOffset = uIdx * nUeAnt;
+               for (int j = 0; j < nUeAnt; j++) {
+                  dataRate += log2f(1.0f + pDynDescr->wbSinr[ueAntOffset + j]);
+               }
+               dataRate *= W;
+               constexpr float kEps = 1e-6f;
+               candidateRate = powf(dataRate, betaCoeff) / fmaxf(pDynDescr->avgRatesActUe[uIdx], kEps);
+               isCandidate = true;
             }
-
-            double dataRate = 0;
-            for (int j = 0; j < pDynDescr->nUeAnt; j++) {
-               dataRate += pDynDescr->W*log2(1.0 + pDynDescr->wbSinr[uIdx*pDynDescr->nUeAnt + j]);
-            }
-            float dataRateF = static_cast<float>(dataRate);
-            avgRate[storeIdx] = pow(dataRateF, pDynDescr->betaCoeff)/pDynDescr->avgRatesActUe[uIdx];
-            ueIds[storeIdx] = uIdx; // global UE index
          } else { // re-transmission
-            avgRate[storeIdx] = std::numeric_limits<float>::max();
-            ueIds[storeIdx] = uIdx; // global UE index
+            candidateRate = std::numeric_limits<float>::max();
+            isCandidate = true;
+         }
+      }
+
+      if (isCandidate) {
+         int storeIdx = 0;
+         if (uIdx & 0x1) {
+            int rightOff = atomicAdd(&nAssocUeFoundRight, 1);
+            storeIdx = maxNumActUePerCell_ - 1 - rightOff;
+         } else {
+            storeIdx = atomicAdd(&nAssocUeFoundLeft, 1);
+         }
+         avgRate[storeIdx] = candidateRate;
+         ueIds[storeIdx] = uIdx; // global UE index
+      }
+   }
+   __syncthreads();
+
+   int nLeft = nAssocUeFoundLeft;
+   int nRight = nAssocUeFoundRight;
+   int rightStart = maxNumActUePerCell_ - nRight;
+   for (int base = 0; base < nRight; base += blockDim.x) {
+      int i = base + threadIdx.x;
+      float tmpRate;
+      uint16_t tmpId;
+      if (i < nRight) {
+         tmpRate = avgRate[rightStart + i];
+         tmpId = ueIds[rightStart + i];
+      }
+      __syncthreads();
+      if (i < nRight) {
+         avgRate[nLeft + i] = tmpRate;
+         ueIds[nLeft + i] = tmpId;
+      }
+      __syncthreads();
+   }
+
+   int nAssocUeFound = nLeft + nRight;
+
+   // Clear stale right-group duplicates that fall outside the compacted range
+   for (int base = 0; base < nRight; base += blockDim.x) {
+      int i = base + threadIdx.x;
+      if (i < nRight) {
+         int srcIdx = rightStart + i;
+         if (srcIdx >= nAssocUeFound) {
+            avgRate[srcIdx] = -1.0f;
+            ueIds[srcIdx] = 0xFFFF;
          }
       }
    }
@@ -173,31 +227,86 @@ namespace cumac {
       ueIds[eIdx] = 0xFFFF;
    }
 
-   __shared__ int nAssocUeFound;
+   __shared__ int nAssocUeFoundLeft;
+   __shared__ int nAssocUeFoundRight;
    if (threadIdx.x == 0) {
-      nAssocUeFound = 0;
+      nAssocUeFoundLeft = 0;
+      nAssocUeFoundRight = 0;
    }
    __syncthreads();
 
-   for (int uIdx = threadIdx.x; uIdx < pDynDescr->nActiveUe; uIdx += blockDim.x) {
-      if (pDynDescr->cellAssocActUe[cellIdx*pDynDescr->nActiveUe + uIdx]) {
-         int storeIdx = atomicAdd(&nAssocUeFound, 1);
+   const float W = pDynDescr->W;
+   const float betaCoeff = pDynDescr->betaCoeff;
+   const int nActiveUe = pDynDescr->nActiveUe;
+   const int nUeAnt = pDynDescr->nUeAnt;
+   const int cellUeOffset = (int)cellIdx * nActiveUe;
+   for (int uIdx = threadIdx.x; uIdx < nActiveUe; uIdx += blockDim.x) {
+      bool isCandidate = false;
+      float candidateRate = 0.0f;
 
+      if (pDynDescr->cellAssocActUe[cellUeOffset + uIdx]) {
          if (pDynDescr->newDataActUe == nullptr || pDynDescr->newDataActUe[uIdx] == 1) { // new transmission
-            if (pDynDescr->bufferSize != nullptr && pDynDescr->bufferSize[uIdx] == 0) {
-               continue;
+            if (pDynDescr->bufferSize == nullptr || pDynDescr->bufferSize[uIdx] != 0) {
+               float dataRate = 0.0f;
+               const int ueAntOffset = uIdx * nUeAnt;
+               for (int j = 0; j < nUeAnt; j++) {
+                  dataRate += log2f(1.0f + pDynDescr->wbSinr[ueAntOffset + j]);
+               }
+               dataRate *= W;
+               constexpr float kEps = 1e-6f;
+               candidateRate = powf(dataRate, betaCoeff) / fmaxf(pDynDescr->avgRatesActUe[uIdx], kEps);
+               isCandidate = true;
             }
-
-            double dataRate = 0;
-            for (int j = 0; j < pDynDescr->nUeAnt; j++) {
-               dataRate += pDynDescr->W*log2(1.0 + pDynDescr->wbSinr[uIdx*pDynDescr->nUeAnt + j]);
-            }
-            float dataRateF = static_cast<float>(dataRate);
-            avgRate[storeIdx] = pow(dataRateF, pDynDescr->betaCoeff)/pDynDescr->avgRatesActUe[uIdx];
-            ueIds[storeIdx] = uIdx; // global UE index
          } else { // re-transmission
-            avgRate[storeIdx] = std::numeric_limits<float>::max();
-            ueIds[storeIdx] = uIdx; // global UE index
+            candidateRate = std::numeric_limits<float>::max();
+            isCandidate = true;
+         }
+      }
+
+      if (isCandidate) {
+         int storeIdx = 0;
+         if (uIdx & 0x1) {
+            int rightOff = atomicAdd(&nAssocUeFoundRight, 1);
+            storeIdx = maxNumActUePerCell_ - 1 - rightOff;
+         } else {
+            storeIdx = atomicAdd(&nAssocUeFoundLeft, 1);
+         }
+         avgRate[storeIdx] = candidateRate;
+         ueIds[storeIdx] = uIdx; // global UE index
+      }
+   }
+   __syncthreads();
+
+
+   int nLeft = nAssocUeFoundLeft;
+   int nRight = nAssocUeFoundRight;
+   int rightStart = maxNumActUePerCell_ - nRight;
+   for (int base = 0; base < nRight; base += blockDim.x) {
+      int i = base + threadIdx.x;
+      float tmpRate;
+      uint16_t tmpId;
+      if (i < nRight) {
+         tmpRate = avgRate[rightStart + i];
+         tmpId = ueIds[rightStart + i];
+      }
+      __syncthreads();
+      if (i < nRight) {
+         avgRate[nLeft + i] = tmpRate;
+         ueIds[nLeft + i] = tmpId;
+      }
+      __syncthreads();
+   }
+
+   int nAssocUeFound = nLeft + nRight;
+
+   // Clear stale right-group duplicates that fall outside the compacted range
+   for (int base = 0; base < nRight; base += blockDim.x) {
+      int i = base + threadIdx.x;
+      if (i < nRight) {
+         int srcIdx = rightStart + i;
+         if (srcIdx >= nAssocUeFound) {
+            avgRate[srcIdx] = -1.0f;
+            ueIds[srcIdx] = 0xFFFF;
          }
       }
    }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,6 @@
  */
 
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 10) // "DRV.WORKER"
-#define PMU_TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 42) // "DRV.PMU"
 
 #include "cuphydriver_api.hpp"
 #include "constant.hpp"
@@ -59,6 +58,7 @@ Worker::Worker(
     wargs.arg           = arg;
     wargs.whandler      = static_cast<phydriverwrk_handle>(this);
     wid = 0;
+    pmuds = nullptr;
 
     CPU_ZERO(&wcpuset);
     CPU_SET(cpucore, &wcpuset);
@@ -97,7 +97,7 @@ Worker::~Worker()
     }
 
     //Stop performance counters
-    destroyPerfCounters();
+    destroyPMU();
 
 };
 
@@ -248,37 +248,16 @@ int Worker::waitExit()
     return pthread_join(wid, &retval);
 }
 
-void Worker::initPerfCounters() {
-
-    t_ns tt1 = Time::nowNs();
+void Worker::initPMU() {
+    // PMUDeltaSummarizer must be constructed on the thread it will measure
+    // (perf_event_open uses pid=0 = calling thread). Worker is constructed on
+    // the main thread, but this runs on the worker thread after pthread_create.
     pmuds = new PMUDeltaSummarizer(pmu_type);
-    t_ns tt2 = Time::nowNs();
-    NVLOGD_FMT(PMU_TAG,"initPerfCounters {}",(tt2-tt1).count());
 }
 
-void Worker::readStartCounters() {
-    t_ns tt1 = Time::nowNs();
-    pmuds->recordStart();
-    t_ns tt2 = Time::nowNs();
-    NVLOGD_FMT(PMU_TAG,"readStartCounters {}",(tt2-tt1).count());
-}
-
-void Worker::readEndCounters() {
-    t_ns tt1 = Time::nowNs();
-    pmuds->recordStop();
-    t_ns tt2 = Time::nowNs();
-    NVLOGD_FMT(PMU_TAG,"readEndCounters {}",(tt2-tt1).count());
-}
-
-void Worker::formatCounterMetrics(char* out_str, int max_chars) {
-    t_ns tt1 = Time::nowNs();
-    pmuds->formatCounterMetrics(out_str,max_chars);
-    t_ns tt2 = Time::nowNs();
-    NVLOGD_FMT(PMU_TAG,"formatCounterMetrics {}",(tt2-tt1).count());
-}
-
-void Worker::destroyPerfCounters() {
+void Worker::destroyPMU() {
     delete pmuds;
+    pmuds = nullptr;
 }
 
 enum worker_default_type Worker::getType()
@@ -327,11 +306,7 @@ int worker_default(phydriverwrk_handle whandler, void* arg)
     }
     PHYDRIVER_CATCH_EXCEPTIONS();
 
-    //Start performance counters
-    w->initPerfCounters();
-    //Read once to warm up the counter
-    w->readStartCounters();
-    w->readEndCounters();
+    w->initPMU();
 
     // Get coreId - only use first core in unlikely scenario worker is assigned multiple cores
     coreId = w->getCPUAffinity();

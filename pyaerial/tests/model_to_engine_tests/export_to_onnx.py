@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,42 @@ import onnx
 import onnxruntime as ort
 
 from aerial.model_to_engine.model.enhanced_channel_estimator import EnhancedFusedChannelEstimator
+
+
+def get_onnx_providers():
+    """Get list of ONNX Runtime execution providers for model verification.
+
+    Uses CPU provider for ONNX verification to avoid CUDA library dependency issues.
+    The actual TensorRT export handles GPU execution separately.
+    """
+    return ['CPUExecutionProvider']
+
+
+def export_to_onnx(model, dummy_input, onnx_path):
+    """Export model to ONNX using TorchScript-based exporter.
+
+    Uses dynamo=False because the dynamo exporter's optimizer has a bug
+    (IndexError in onnxscript _basic_rules.py), and disabling optimization
+    produces models with runtime issues. The TorchScript exporter is stable.
+
+    Args:
+        model: PyTorch model to export
+        dummy_input: Example input tensor for tracing
+        onnx_path: Path to save the ONNX model
+    """
+    torch.onnx.export(
+        model,
+        (dummy_input,),
+        onnx_path,
+        input_names=['z'],
+        output_names=['zout'],
+        dynamic_axes={
+            'z': {0: 'batch'},
+            'zout': {0: 'batch'}
+        },
+        opset_version=18,
+        dynamo=False,
+    )
 
 
 def main():
@@ -76,30 +112,19 @@ def main():
     # Export model to ONNX
     print(f"Exporting model to ONNX: {args.onnx_path}")
     dummy_input = torch.tensor(input_data, device=device)
-
-    torch.onnx.export(
-        model,
-        (dummy_input,),
-        args.onnx_path,
-        input_names=['z'],
-        output_names=['zout'],
-        dynamic_axes={
-            'z': {0: 'batch', 1: 'subcarriers'},
-            'zout': {0: 'batch', 3: 'subcarriers_out'}
-        },
-        opset_version=16,
-    )
+    export_to_onnx(model, dummy_input, args.onnx_path)
 
     # Verify the ONNX model
     onnx_model = onnx.load(args.onnx_path)
     onnx.checker.check_model(onnx_model)
     print("ONNX model is valid")
 
-    # Run inference with ONNX Runtime
+    # Run inference with ONNX Runtime (CPU is sufficient for verification)
     print("Running ONNX inference")
+    providers = get_onnx_providers()
     ort_session = ort.InferenceSession(
         args.onnx_path,
-        providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+        providers=providers
     )
 
     ort_inputs = {ort_session.get_inputs()[0].name: input_data}

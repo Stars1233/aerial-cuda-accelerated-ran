@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,7 @@ import cupy as cp
 import numpy as np
 
 from aerial import pycuphy
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.util.fapi import dmrs_fapi_to_bit_array
 from aerial.phy5g.pdsch import PdschTx
 from aerial.phy5g.pusch import PuschRx
@@ -55,19 +55,18 @@ def pytest_configure():
 
 @pytest.fixture(name="cuda_stream", scope="function")
 def fixture_cuda_stream():
-    """A fixture for setting up CUDA and creating a CUDA stream."""
+    """A fixture for setting up CUDA and creating a CUDA stream.
+
+    Yields a CudaStream. Use ``with cuda_stream:`` in the test to set it as
+    the current stream (CudaStream is not re-entrant). Stream is destroyed
+    when the CudaStream is GC'd.
+    """
     # TODO: Figure out how to set the GPU in CICD.
     gpu_id = 0
     cudart.cudaSetDevice(gpu_id)
 
-    # Allocate a CUDA stream.
-    cu_stream = check_cuda_errors(cudart.cudaStreamCreate())
-    check_cuda_errors(cudart.cudaStreamSynchronize(cu_stream))
-
-    # Let the test run and the destroy the CUDA stream.
-    yield cu_stream
-
-    check_cuda_errors(cudart.cudaStreamDestroy(cu_stream))
+    stream = CudaStream()
+    yield stream
 
 
 @pytest.fixture(name="pdsch_tx", scope="function")

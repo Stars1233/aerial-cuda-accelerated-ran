@@ -16,8 +16,11 @@
 ---
 # Transport settings for L2 / secondary NVIPC
 transport:
+  # Transport type: only "shm" for shared memory is supported
   type: shm
+  # Shared memory transport configuration
   shm_config:
+    # Prefix used for shared memory object names (e.g., /dev/shm/${prefix}_*)
     prefix: nvipc
 
 nvipc_log:

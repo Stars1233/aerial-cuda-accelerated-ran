@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@ from .noise_intf_estimator import NoiseIntfEstimator
 from .cfo_ta_estimator import CfoTaEstimator
 from .rsrp_estimator import RsrpEstimator
 from .demapper import Demapper
+from .demapper import ModulationMapper
 from .srs_channel_estimator import SrsChannelEstimator
 from .srs_channel_estimator import SrsCellPrms
 from .srs_channel_estimator import UeSrsPrms

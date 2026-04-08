@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <semaphore.h>
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -121,8 +122,8 @@ public:
         prach_prambIdx  = 0;
         harq_process_id = 0;
         restart_timer   = nullptr;
-        cumac_state      = cumac_state_t::IDLE;
         schedule_enable = false;
+        cumac_state.store(cumac_state_t::IDLE);
         pending_config.store(0);
     }
 
@@ -133,8 +134,8 @@ public:
         prach_prambIdx  = obj.prach_prambIdx;
         harq_process_id = obj.harq_process_id;
         restart_timer   = obj.restart_timer;
-        cumac_state      = obj.cumac_state;
         schedule_enable = false;
+        cumac_state.store(obj.cumac_state.load());
         pending_config.store(0);
     }
 
@@ -152,7 +153,7 @@ public:
 
     timer_t restart_timer; //!< Timer for single cell restart
 
-    cumac_state_t cumac_state; //!< Current cuMAC state for this cell
+    std::atomic<cumac_state_t> cumac_state = cumac_state_t::IDLE; //!< Current cuMAC state for this cell
 
     std::mutex queue_mutex; //!< Mutex protecting message queue
 
@@ -427,23 +428,23 @@ protected:
 
     int copy_complex_to_ipc_buf(phy_mac_msg_desc& msg_desc, cuComplex* src, const char* debug_info, uint32_t& src_offset, uint32_t& dst_offset, uint32_t num);
 
-    int data_buf_opt; //!< Data buffer option: 0=msg_buf, 1=CPU_DATA, 2=CUDA_DATA, 3=GPU_DATA
+    int data_buf_opt = 1; //!< Data buffer option: 0=msg_buf, 1=CPU_DATA, 2=CUDA_DATA, 3=GPU_DATA
 
-    int cell_num;            //!< Total number of cells
-    int configured_cell_num; //!< Number of cells successfully configured
+    int cell_num = 0;            //!< Total number of cells
+    int configured_cell_num = 0; //!< Number of cells successfully configured
 
-    int notify_mode; //!< IPC notification mode: per-cell, per-TTI, or per-message
+    int notify_mode = 0; //!< IPC notification mode: per-cell, per-TTI, or per-message
 
-    uint16_t slots_per_frame; //!< Number of slots per frame (depends on numerology)
+    uint16_t slots_per_frame = 0; //!< Number of slots per frame (depends on numerology)
 
     // cuMAC thread IDs
-    pthread_t cumac_recv_tid;    //!< Receiver thread ID
-    pthread_t cumac_sched_tid;   //!< Scheduler thread ID
-    pthread_t cumac_builder_tid; //!< Builder thread ID
-    pthread_t cumac_tick_tid;    //!< Tick thread ID (for standalone mode)
+    pthread_t cumac_recv_tid = 0;    //!< Receiver thread ID
+    pthread_t cumac_sched_tid = 0;   //!< Scheduler thread ID
+    pthread_t cumac_builder_tid = 0; //!< Builder thread ID
+    pthread_t cumac_tick_tid = 0;    //!< Tick thread ID (for standalone mode)
 
-    std::atomic<int32_t> current_config_cell_id; //!< Cell ID currently being configured (-1 if none)
-    std::atomic<int32_t> config_retry_counter;   //!< Retry counter for cell configuration
+    std::atomic<int32_t> current_config_cell_id = -1; //!< Cell ID currently being configured (-1 if none)
+    std::atomic<int32_t> config_retry_counter = 0;   //!< Retry counter for cell configuration
 
     sem_t cumac_build_sem; // CUMAC builder thread wait on it to start building CUMAC message
     sem_t cumac_sched_ready; // cumac_scheds buffer is ready for next slot
@@ -454,15 +455,15 @@ protected:
 
     std::atomic<sfn_slot_t> ss_build; // SFN/SLOT of the current building tick for building or worker thread
     std::atomic<sfn_slot_t> ss_tick; // SFN/SLOT of the current scheduling tick
-    int64_t                 ts_tick; // Time stamp of the current scheduling tick
+    int64_t                 ts_tick = 0; // Time stamp of the current scheduling tick
     sfn_slot_t              ss_cumac_last;
 
-    uint64_t global_tick;
-    uint64_t conformance_test_slot_counter;
-    uint16_t beam_id_position;
+    uint64_t global_tick = 0;
+    uint64_t conformance_test_slot_counter = 0;
+    uint16_t beam_id_position = 0; //!< Beam ID position
 
     // The throughput test result
-    std::vector<cumac_thrput_t> cumac_thrputs;
+    std::vector<cumac_thrput_t> cumac_thrputs; //!< Throughput test result
 
     // summary test result
     // std::vector<results_summary_t> cell_summary;
@@ -473,10 +474,10 @@ protected:
     // Cell first initialization flag, MUST send CONFIG.request when first_init == true
     std::vector<int> first_init;
 
-    test_mac_configs*  testmac_configs;
-    test_cumac_configs* cumac_configs;
-    cumac_pattern*    lp;
-    phy_mac_transport* _transport;
+    test_mac_configs*  testmac_configs = nullptr;
+    test_cumac_configs* cumac_configs = nullptr;
+    cumac_pattern*    lp = nullptr;
+    phy_mac_transport* _transport = nullptr;
 
     //For OAM cell re-attaching to different RUs test, the idea is to replace current cell CUMACs with these of the target cell
     std::unordered_map<int, int> cell_id_map;
@@ -493,15 +494,15 @@ protected:
     std::atomic<int> cell_build_counter = 0; // Cell counter which have finished building cuMAC messages
 
     // Timer for restart all cells
-    timer_t restart_timer;
+    timer_t restart_timer = nullptr;
 
     // Timer for check cell config status
-    timer_t reconfig_timer;
+    timer_t reconfig_timer = nullptr;
 
-    stat_log_t* schedule_time;
-    stat_log_t* stat_debug;
+    stat_log_t* schedule_time = nullptr;
+    stat_log_t* stat_debug = nullptr;
 
-    stat_log_t* cumac_ul_time;
+    stat_log_t* cumac_ul_time = nullptr;
 };
 
 cumac_handler* get_cumac_handler_instance();

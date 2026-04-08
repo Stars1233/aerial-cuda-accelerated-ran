@@ -59,6 +59,7 @@ Cell::Cell(
     txq_count_uplane       = _mplane.nic_cfg.txq_count_uplane;
     nic_name               = _mplane.nic_name;
     nic_index              = _mplane.nic_index;
+    dlc_core_index         = _mplane.dlc_core_index;
     tv_pusch_h5            = _mplane.tv_pusch_h5;
     tv_srs_h5              = _mplane.tv_srs_h5;
     dl_comp_meth           = _mplane.dl_comp_meth;
@@ -208,6 +209,7 @@ Cell::Cell(
         {
 
             bfw_coeff_buffer_dev = std::move(cuphy::buffer<uint8_t, cuphy::device_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
+            mf.addGpuRegularSize(sizeof(uint8_t)*pdctx->getFhProxy()->getBfwCoeffSize());
             bfw_coeff_buffer_pinned = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
             pdctx->registerBufferToFh(bfw_coeff_buffer_pinned.addr(), pdctx->getFhProxy()->getBfwCoeffSize());
             pdctx->registerBufferToFh(bfw_coeff_buffer_dev.addr(), pdctx->getFhProxy()->getBfwCoeffSize());
@@ -221,63 +223,86 @@ Cell::Cell(
 
     TI_GENERIC_ADD("cudaMemsets");
     last_sem_idx_rx_h.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(last_sem_idx_rx_h->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)last_sem_idx_rx_h->addr(), 0, sizeof(uint32_t)));
     last_sem_idx_order_h.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(last_sem_idx_order_h->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)last_sem_idx_order_h->addr(), 0, sizeof(uint32_t)));
 
     ul_pcap_capture_buffer_index.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(ul_pcap_capture_buffer_index->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)ul_pcap_capture_buffer_index->addr(), 0, sizeof(uint32_t)));
 
     last_sem_idx_srs_rx_h.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(last_sem_idx_srs_rx_h->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)last_sem_idx_srs_rx_h->addr(), 0, sizeof(uint32_t)));
     last_sem_idx_srs_order_h.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(last_sem_idx_srs_order_h->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)last_sem_idx_srs_order_h->addr(), 0, sizeof(uint32_t)));
     order_kernel_last_timeout_error_time.reset(new dev_buf(1 * sizeof(uint64_t), gDev));
+    mf.addGpuRegularSize(order_kernel_last_timeout_error_time->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)order_kernel_last_timeout_error_time->addr(), 0, sizeof(uint64_t)));
     order_kernel_srs_last_timeout_error_time.reset(new dev_buf(1 * sizeof(uint64_t), gDev));
+    mf.addGpuRegularSize(order_kernel_srs_last_timeout_error_time->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)order_kernel_srs_last_timeout_error_time->addr(), 0, sizeof(uint64_t)));
     
     next_slot_on_time_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_on_time_rx_packets->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_on_time_rx_packets->addr(), 0, sizeof(uint32_t)));
     next_slot_early_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_early_rx_packets->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_early_rx_packets->addr(), 0, sizeof(uint32_t)));
     next_slot_late_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_late_rx_packets->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_late_rx_packets->addr(), 0, sizeof(uint32_t)));
 
     next_slot_on_time_rx_packets_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_on_time_rx_packets_srs->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_on_time_rx_packets_srs->addr(), 0, sizeof(uint32_t)));
     next_slot_early_rx_packets_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_early_rx_packets_srs->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_early_rx_packets_srs->addr(), 0, sizeof(uint32_t)));
     next_slot_late_rx_packets_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_late_rx_packets_srs->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_late_rx_packets_srs->addr(), 0, sizeof(uint32_t)));
 
     next_slot_rx_packets_count_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_rx_packets_count_srs->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_packets_count_srs->addr(), 0, sizeof(uint32_t)));
     next_slot_rx_bytes_count_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_rx_bytes_count_srs->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_bytes_count_srs->addr(), 0, sizeof(uint32_t)));
 
     next_slot_rx_packets_ts_srs.reset(new dev_buf(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t), gDev));
+    mf.addGpuRegularSize(next_slot_rx_packets_ts_srs->size_alloc);
     CUDA_CHECK(cudaMemset((uint64_t*)next_slot_rx_packets_ts_srs->addr(), 0, ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t)));
     
     next_slot_rx_packets_count_per_sym_srs.reset(new dev_buf(ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_rx_packets_count_per_sym_srs->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_packets_count_per_sym_srs->addr(), 0, ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint32_t)));
 
     next_slot_rx_packets_ts.reset(new dev_buf(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t), gDev));
+    mf.addGpuRegularSize(next_slot_rx_packets_ts->size_alloc);
     CUDA_CHECK(cudaMemset((uint64_t*)next_slot_rx_packets_ts->addr(), 0, ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t)));
     
     next_slot_rx_packets_count.reset(new dev_buf(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_rx_packets_count->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_packets_count->addr(), 0, ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
 
     next_slot_rx_bytes_count.reset(new dev_buf(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_rx_bytes_count->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_bytes_count->addr(), 0, ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
 
     next_slot_num_prb_ch1.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_num_prb_ch1->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_num_prb_ch1->addr(), 0, sizeof(uint32_t)));
 
     next_slot_num_prb_ch2.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_num_prb_ch2->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_num_prb_ch2->addr(), 0, sizeof(uint32_t)));
 
     next_slot_num_prb_ch3.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
+    mf.addGpuRegularSize(next_slot_num_prb_ch3->size_alloc);
     CUDA_CHECK(cudaMemset((uint32_t*)next_slot_num_prb_ch3->addr(), 0, sizeof(uint32_t)));
 
     uint32_t max_K_per_CB = CUPHY_LDPC_BG1_INFO_NODES * CUPHY_LDPC_MAX_LIFTING_SIZE;
@@ -288,6 +313,7 @@ Cell::Cell(
     for(int i = 0; i < PDSCH_MAX_GPU_BUFFS ; i++)
     {
        CUDA_CHECK_PHYDRIVER(cudaMalloc(&pdsch_tb_buffer[i], tb_bytes));   
+       mf.addGpuRegularSize(tb_bytes);
     }
 
     TI_GENERIC_ADD("Print memory footprint");
@@ -1416,6 +1442,11 @@ int Cell::setNicName(std::string nic_name)
 uint32_t  Cell::getNicIndex() const
 {
     return nic_index;
+}
+
+uint8_t Cell::getDlcCoreIndex() const
+{
+    return dlc_core_index;
 }
 
 uint32_t* Cell::getLastRxItem() const

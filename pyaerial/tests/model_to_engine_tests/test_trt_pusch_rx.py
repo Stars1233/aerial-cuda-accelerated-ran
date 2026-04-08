@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,7 +28,7 @@ from aerial.phy5g.ldpc import LdpcDeRateMatch
 from aerial.phy5g.ldpc import LdpcDecoder
 from aerial.phy5g.ldpc import CrcChecker
 from aerial.phy5g.config import PuschConfig, PuschUeConfig
-from aerial.util.cuda import get_cuda_stream
+from aerial.util.cuda import CudaStream
 
 
 def safe_to_numpy_with_order(array, order='F'):
@@ -357,7 +357,7 @@ def main():
     )
 
     # Create a proper CUDA stream instead of using the default (0)
-    cuda_stream = get_cuda_stream()
+    cuda_stream = CudaStream()
 
     # Dictionary to store timing information
     timings = {}

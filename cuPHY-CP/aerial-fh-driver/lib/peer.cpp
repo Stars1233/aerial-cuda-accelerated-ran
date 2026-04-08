@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,7 +85,7 @@ Peer::~Peer()
     free_nic_resources();
     //cudaFreeHost(up_symbol_info_gpu_); //FIXME error checking?
     free(cplane_sections_info_list_);
-    cudaFree(h_up_slot_info_);
+    cudaFreeHost(h_up_slot_info_);
     cudaFree(d_up_slot_info_);
     cudaFree(d_flow_pkt_hdr_index_);
     cudaFree(d_flow_sym_pkt_hdr_index_);
@@ -97,14 +97,14 @@ Peer::~Peer()
         for(int up_slot_idx = 0; up_slot_idx < kPeerSlotsInfo; ++up_slot_idx)
         {
             auto& message_info = partial_up_slot_info_[up_slot_idx].message_info;
-            for(int msg_idx = 0; msg_idx < TMP_MAX_MESSAGES_PER_SYMBOL; ++msg_idx)
+            for(int msg_idx = 0; msg_idx < kPeerSymbolsInfo; ++msg_idx)
             {
                 ASSERT_CUDA_FH(cudaFreeHost(message_info[msg_idx].mod_comp_params));
             }
         }
     }
-    cudaFreeHost(partial_up_slot_info_);
-    cudaFreeHost(h_flow_hdr_size_info_);
+    ASSERT_CUDA_FH(cudaFreeHost(partial_up_slot_info_));
+    ASSERT_CUDA_FH(cudaFreeHost(h_flow_hdr_size_info_));
 }
 
 void Peer::update_max_num_prbs_per_symbol(uint16_t max_num_prbs_per_symbol)
@@ -381,33 +381,35 @@ void Peer::gpu_comm_create_up_slot_list()
         return;
     Gpu* gpu_ = nic_->get_fronthaul()->gpus()[nic_->get_info().cuda_device].get();
 
+    size_t gpu_mem_size = 0;
+
     // Allocate u-plane slot info array on the GPU
     ASSERT_CUDA_FH(cudaMalloc((void**)&d_up_slot_info_, sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo));
     ASSERT_CUDA_FH(cudaMemset(d_up_slot_info_, 0, sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo));
     ASSERT_CUDA_FH(cudaMallocHost((void**)&h_up_slot_info_, sizeof(UplaneSlotInfoHost_t) * kPeerSlotsInfo));
-    gpu_regular_size += sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo;
+    gpu_mem_size += sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo;
 
    // Allocate large buffer of kPeerSlotsInof * MAX_DL_EAXCIDS elements initially memset to 0 to keep track of gpu_index per unique flow
     ASSERT_CUDA_FH(cudaMalloc((void**)&d_flow_pkt_hdr_index_, sizeof(uint32_t) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
     ASSERT_CUDA_FH(cudaMemset(d_flow_pkt_hdr_index_, 0, sizeof(uint32_t) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
-    gpu_regular_size += sizeof(uint32_t) * kPeerSlotsInfo * MAX_DL_EAXCIDS;
+    gpu_mem_size += sizeof(uint32_t) * kPeerSlotsInfo * MAX_DL_EAXCIDS;
 
     ASSERT_CUDA_FH(cudaMalloc((void**)&d_flow_sym_pkt_hdr_index_, sizeof(uint32_t) * 14 * MAX_DL_EAXCIDS));
     ASSERT_CUDA_FH(cudaMemset(d_flow_sym_pkt_hdr_index_, 0, sizeof(uint32_t) * 14 * MAX_DL_EAXCIDS));
-    gpu_regular_size += sizeof(uint32_t) * 14 * MAX_DL_EAXCIDS;
+    gpu_mem_size += sizeof(uint32_t) * 14 * MAX_DL_EAXCIDS;
 
     ASSERT_CUDA_FH(cudaMalloc((void**)&d_block_count_, sizeof(uint32_t)));
     ASSERT_CUDA_FH(cudaMemset(d_block_count_, 0, sizeof(uint32_t)));
-    gpu_regular_size += sizeof(uint32_t);
+    gpu_mem_size += sizeof(uint32_t);
 
 
     ASSERT_CUDA_FH(cudaMallocHost((void**)&h_flow_hdr_size_info_, sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
     cpu_pinned_size += sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS;
     ASSERT_CUDA_FH(cudaMalloc((void**)&d_ecpri_seq_id_, sizeof(uint32_t) * MAX_DL_EAXCIDS));
-    gpu_regular_size += sizeof(uint32_t) * MAX_DL_EAXCIDS;
+    gpu_mem_size += sizeof(uint32_t) * MAX_DL_EAXCIDS;
     ASSERT_CUDA_FH(cudaMemset(d_ecpri_seq_id_, 0, sizeof(uint32_t) * MAX_DL_EAXCIDS));
     ASSERT_CUDA_FH(cudaMalloc((void**)&d_hdr_template_, sizeof(uint32_t) * 8 * kPeerSlotsInfo * MAX_DL_EAXCIDS));
-    gpu_regular_size += sizeof(uint32_t) * 8 * kPeerSlotsInfo * MAX_DL_EAXCIDS;
+    gpu_mem_size += sizeof(uint32_t) * 8 * kPeerSlotsInfo * MAX_DL_EAXCIDS;
     ASSERT_CUDA_FH(cudaMallocHost((void**)&partial_up_slot_info_, sizeof(PartialUplaneSlotInfo_t) * kPeerSlotsInfo));
     cpu_pinned_size += sizeof(PartialUplaneSlotInfo_t) * kPeerSlotsInfo;
 
@@ -416,7 +418,7 @@ void Peer::gpu_comm_create_up_slot_list()
         for(int up_slot_idx = 0; up_slot_idx < kPeerSlotsInfo; ++up_slot_idx)
         {
             auto& message_info = partial_up_slot_info_[up_slot_idx].message_info;
-            for(int msg_idx = 0; msg_idx < TMP_MAX_MESSAGES_PER_SYMBOL; ++msg_idx)
+            for(int msg_idx = 0; msg_idx < kPeerSymbolsInfo; ++msg_idx)
             {
                 ASSERT_CUDA_FH(cudaMallocHost((void**)&(message_info[msg_idx].mod_comp_params), sizeof(ModCompPartialSectionInfoPerMessagePerSymbol_t)));
                 cpu_pinned_size += sizeof(ModCompPartialSectionInfoPerMessagePerSymbol_t);
@@ -426,6 +428,9 @@ void Peer::gpu_comm_create_up_slot_list()
     up_slot_info_cnt_ = 0;
 
     up_tx_request_ = (TxRequestUplaneGpuComm*) allocate_memory(sizeof(TxRequestUplaneGpuComm) * kPeerSlotsInfo, pageSizeAlign);
+
+    gpu_regular_size += gpu_mem_size;
+    memfoot_add_gpu_size(MF_TAG_FH_PEER, gpu_mem_size);
 }
 
 size_t Peer::getCpuRegularSize() const {
@@ -972,6 +977,10 @@ void Peer::create_rx_rule_with_cpu_mirroring()
     auto port_id  = nic_->get_port_id();
     auto name     = nic_->get_name();
     auto rxq_pcap = nic_->get_pcap_rxq();
+    if(unlikely(rxq_pcap == nullptr || rxq_ == nullptr))
+    {
+        THROW_FH(EINVAL, StringBuilder() << "Failed to get PCAP RXQ or RXQ for Peer " << info_.dst_mac_addr << " on NIC " << name);
+    }
 
     rte_flow_error    err;
     rte_flow_item_eth eth_spec, eth_mask;
@@ -1241,6 +1250,7 @@ inline void finalize_packet_common(rte_mbuf*& m, rte_mbuf** mbufs, uint16_t mtu,
     add_packet_to_mbuf_array(m, *(txq_info.mbufs_));
 }
 
+// coverity[exn_spec_violation]
 inline void add_new_packet(Fronthaul* fhi, const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, uint16_t& packet_num, rte_mbuf*& m, Flow* flow, SequenceIdGenerator& sequence_id_generator, PacketHeaderTemplate*& data, uint8_t*& common_hdr_ptr, uint8_t*& section_ptr, uint16_t common_hdr_size, uint16_t mtu, uint16_t pkt_section_info_room, uint16_t& pkt_remaining_capacity, uint16_t& total_section_info_size, uint8_t& sections_generated, sendCPlaneTxqInfo& txq_info) noexcept
 {
     // End current packet
@@ -1253,6 +1263,7 @@ inline void add_new_packet(Fronthaul* fhi, const CPlaneMsgSendInfo& info, rte_mb
                total_section_info_size, sections_generated);
 }
 
+// coverity[exn_spec_violation]
 inline void populate_last_packet(Fronthaul* fhi, const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, rte_mbuf*& m, SequenceIdGenerator& sequence_id_generator, PacketHeaderTemplate*& data, uint8_t*& common_hdr_ptr, uint16_t mtu, uint16_t& pkt_remaining_capacity, uint8_t& sections_generated, sendCPlaneTxqInfo& txq_info) noexcept
 {
     finalize_packet_common(m, mbufs, mtu, pkt_remaining_capacity, data, sequence_id_generator,
@@ -1494,6 +1505,63 @@ inline uint16_t populate_se11(uint8_t* section_ptr, CPlaneSectionExtInfo* ext11_
 
     return ext11_len;
 }
+inline void update_cplane_combined_reMask(CPlaneSectionInfo& section_info, int ap_idx, int sym_id, uint16_t reMask)
+{
+    auto& cplane_sections_info = section_info.prb_info->cplane_sections_info;
+    cplane_sections_info[sym_id]->combined_reMask[ap_idx] |= reMask;
+}
+
+/**
+ * Handle section ID assignment based on lookback index
+ * 
+ * Assigns section ID based on section_id_lookback_index for CSI-RS compact signaling.
+ * 
+ * Case 1: lookback_index > 0 (Reference existing section)
+ *   The current section reuses the section ID from a previous section in the array.
+ *   This enables CSI-RS compact signaling where multiple antenna ports share the same section ID.
+ *   
+ *   Example: If section_num=3 and lookback_index=2:
+ *     section_id = sections[3-2].sectionId = sections[1].sectionId
+ *
+ * Case 2: lookback_index == 0 (Create new section ID)
+ *   The current section is a reference section that gets a new unique section ID.
+ *   This section ID is saved so future sections can reference it via lookback.
+ *   
+ *   Note: section_num - lookback_index = section_num - 0 = section_num (saves to current section)
+ * 
+ * @param[in,out] sections Array of C-plane section info
+ * @param[in] section_num Current section number
+ * @param[in] ap_idx Antenna port index
+ * @param[in] sym_id Symbol ID
+ * @param[in,out] nxt_section_id Array of atomic next section IDs per antenna port
+ * @return Section ID to use for this section
+ */
+inline uint16_t handle_section_id_assignment(CPlaneSectionInfo* sections, const uint8_t section_num, const int ap_idx, const int sym_id, uint16_t* nxt_section_id)
+{
+    uint16_t section_id = nxt_section_id[ap_idx];
+    
+    if(sections[section_num].section_id_lookback_index > 0)
+    {
+        // Reuse section ID from referenced section (lookback_index positions back)
+        if (sections[section_num].section_id_lookback_index > section_num) {
+            THROW_FH(EINVAL, StringBuilder() << "Invalid lookback index: " << sections[section_num].section_id_lookback_index << " exceeds section number: " << section_num);
+        }
+        auto& ref_section = sections[section_num - sections[section_num].section_id_lookback_index];
+        section_id = ref_section.sect_1.sectionId;
+        //The refrence section should also carry the reMask of all the section that refrence its 
+        //section id.
+        update_cplane_combined_reMask(ref_section, ap_idx, sym_id, sections[section_num].prb_info->common.reMask);
+    }
+    else
+    {
+        nxt_section_id[ap_idx]++;
+        // Store the new section ID in current section (section_num - 0 = section_num)
+        // This makes the current section the reference point for future sections
+        sections[section_num].sect_1.sectionId = section_id;
+    }
+    
+    return section_id;
+}
 
 inline void store_cplane_section_info(CPlaneSectionInfo& section_info, int ap_idx, int sym_id, uint16_t start_prbc, uint16_t num_prbc, uint16_t section_id)
 {
@@ -1587,6 +1655,7 @@ inline uint16_t Peer::prepare_cplane_message_mmimo_no_se(const CPlaneMsgSendInfo
 
                 for(auto i = 0; i < slot_command_api::MAX_AP_PER_SLOT_SRS; i++) {
                     cur_section_info.prb_info->cplane_sections_info[sym_id]->cplane_sections_count[i] = 0;
+                    cur_section_info.prb_info->cplane_sections_info[sym_id]->combined_reMask[i] = 0;
                 }
                 cur_section_info.prb_info->cplane_sections_info_sym_map |= (1 << sym_id);
             }
@@ -1605,13 +1674,20 @@ inline uint16_t Peer::prepare_cplane_message_mmimo_no_se(const CPlaneMsgSendInfo
         auto sect_info_ptr = reinterpret_cast<CPlaneSectionInfo*>(section_ptr);
         if(info.sections[section_num].csirs_of_multiplex_pdsch_csirs) //csirs part of pdsch+csirs
         {
-            auto cplane_section_idx         = info.sections[section_num].prb_info->cplane_sections_info[sym_id]->cplane_sections_count[ap_idx];
-            sect_info_ptr->sect_1.sectionId = info.sections[section_num - 1].prb_info->cplane_sections_info[sym_id]->section_id[ap_idx][cplane_section_idx - 1];
+            //Get section ID for all CSI-RS sections from the PDSCH section.
+            auto ref_section_num = section_num - info.sections[section_num].section_id_lookback_index;
+            auto cplane_section_idx         = info.sections[ref_section_num].prb_info->cplane_sections_info[sym_id]->cplane_sections_count[ap_idx];
+            sect_info_ptr->sect_1.sectionId = info.sections[ref_section_num].prb_info->cplane_sections_info[sym_id]->section_id[ap_idx][cplane_section_idx - 1]; // we did cplane_section_idx - 1 because gets incremented after saving section id for PDSCH section.
         }
         else
         {
-            sect_info_ptr->sect_1.sectionId = nxt_section_id[ap_idx]++;
+            uint16_t section_id = handle_section_id_assignment(info.sections, section_num, ap_idx, sym_id, nxt_section_id);
+            sect_info_ptr->sect_1.sectionId = section_id;
             store_cplane_section_info(info.sections[section_num], ap_idx, sym_id, info.sections[section_num].sect_1.startPrbc.get(), info.sections[section_num].sect_1.numPrbc.get(), sect_info_ptr->sect_1.sectionId.get());
+            if(info.sections[section_num].section_id_lookback_index == 0)
+            {
+                update_cplane_combined_reMask(info.sections[section_num], ap_idx, sym_id, info.sections[section_num].prb_info->common.reMask);
+            }
         }
 
         section_ptr += section_hdr_size;
@@ -1706,6 +1782,7 @@ uint16_t Peer::prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rt
                     for(auto i = 0; i < slot_command_api::MAX_AP_PER_SLOT_SRS; i++)
                     {
                         cur_section_info.prb_info->cplane_sections_info[sym_id]->cplane_sections_count[i] = 0;
+                        cur_section_info.prb_info->cplane_sections_info[sym_id]->combined_reMask[i] = 0;
                     }
                     cur_section_info.prb_info->cplane_sections_info_sym_map |= (1 << sym_id);
                 }
@@ -1946,6 +2023,7 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
                     for(auto i = 0; i < slot_command_api::MAX_AP_PER_SLOT_SRS; i++)
                     {
                         cur_section_info.prb_info->cplane_sections_info[sym_id]->cplane_sections_count[i] = 0;
+                        cur_section_info.prb_info->cplane_sections_info[sym_id]->combined_reMask[i] = 0;
                     }
                     cur_section_info.prb_info->cplane_sections_info_sym_map |= (1 << sym_id);
                 }
@@ -1968,7 +2046,11 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
             // This if block handles the PDSCH+CSIRS over lap case. We expect here that PDSCH section will always be followed by CSIRS section for the overlap.
             // ext11_ptr is the current PDSCH section ext11 pointer.
             // nxt_ext11_ptr is the next CSIRS section ext11 pointer.
-            if(section_num + 1 < number_of_sections && info.sections[section_num + 1].csirs_of_multiplex_pdsch_csirs && (ext11_ptr != nullptr || nxt_ext11_ptr != nullptr))
+            if(section_num + 1 < number_of_sections && info.sections[section_num + 1].csirs_of_multiplex_pdsch_csirs && (ext11_ptr != nullptr || nxt_ext11_ptr != nullptr) &&
+            //Added below check because in case of csi-rs compact signalling, 
+            //multiple CSIRS sections can be present for the same PDSCH section.
+            //In such cases all csirs section reference their section id from the PDSCH section.
+            info.sections[section_num].section_id_lookback_index == 0) 
             {
                 int pdsch_sect_sz         = section_hdr_size;
                 int pdsch_ext11_hdr_size  = 0;
@@ -2011,35 +2093,47 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
                 {
                     pdsch_ext5_hdr_size = sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_5);
                 }
-
-                bool                  csirs_bfw       = false;
-                CPlaneSectionExtInfo* csirs_ext11_ptr = nullptr;
-                if(nxt_ext11_ptr != nullptr)
-                {
-                    csirs_ext11_ptr                     = static_cast<CPlaneSectionExtInfo*>(info.sections[section_num + 1].ext11);
-                    oran_cmsg_ext_hdr* ext11_common_hdr = nullptr;
-                    csirs_sect_sz += csirs_ext11_ptr->ext_11.ext_hdr.extLen << 2;
-                    csirs_bfw            = csirs_ext11_ptr->ext_11.static_bfw;
-                    csirs_num_bundles    = csirs_ext11_ptr->ext_11.numPrbBundles;
-                    csirs_num_bundle_prb = csirs_ext11_ptr->ext_11.numBundPrb;
-
-                }
-                if(nxt_ext4_ptr != nullptr)
-                {
-                    csirs_sect_sz += sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_4);
-                }
-                if(nxt_ext5_ptr != nullptr)
-                {
-                    csirs_sect_sz += sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_5);
-                }
-
                 int pdsch_start_bundle = 0;
                 int pdsch_start_prbc   = info.sections[section_num].sect_1.startPrbc;
                 int pdsch_max_num_prbc = (info.sections[section_num].sect_1.numPrbc == 0) ? info_.max_num_prbs_per_symbol : info.sections[section_num].sect_1.numPrbc;
 
                 bool pdsch_one_bundle = pdsch_num_bundle_prb >= pdsch_max_num_prbc;
-                bool csirs_one_bundle = csirs_num_bundle_prb >= pdsch_max_num_prbc;
                 int  split_count      = 0;
+                bool                  csirs_bfw       = false;
+                auto csirs_section_index = section_num + 1;
+                CPlaneSectionExtInfo* csirs_ext11_ptr = nullptr;
+                while(info.sections[csirs_section_index].csirs_of_multiplex_pdsch_csirs && info.sections[csirs_section_index].section_id_lookback_index > 0)
+                {
+                    if(nxt_ext11_ptr != nullptr)
+                    {
+                        csirs_ext11_ptr                     = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext11);
+                        oran_cmsg_ext_hdr* ext11_common_hdr = nullptr;
+                        csirs_sect_sz += csirs_ext11_ptr->ext_11.ext_hdr.extLen << 2;
+                        csirs_bfw            = csirs_ext11_ptr->ext_11.static_bfw;
+                        csirs_num_bundles    = csirs_ext11_ptr->ext_11.numPrbBundles;
+                        csirs_num_bundle_prb = csirs_ext11_ptr->ext_11.numBundPrb;
+
+                    }
+                    if(nxt_ext4_ptr != nullptr)
+                    {
+                        csirs_sect_sz += sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_4);
+                    }
+                    if(nxt_ext5_ptr != nullptr)
+                    {
+                        csirs_sect_sz += sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_5);
+                    }
+                    if(++csirs_section_index < number_of_sections)
+                    {
+                        nxt_ext11_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext11);
+                        nxt_ext4_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext4);
+                        nxt_ext5_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext5);
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }                
+                bool csirs_one_bundle = csirs_num_bundle_prb >= pdsch_max_num_prbc;
                 while(pdsch_max_num_prbc)
                 {
                     if(unlikely(++split_count > kMaxSplitCount))
@@ -2055,12 +2149,12 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
                     if(total_section_info_size != 0 && start_new_dyn_bfw_packet)
                     {
                         add_new_packet(fhi, info, mbufs, packet_num, m, flow, sequence_id_generator, data, common_hdr_ptr, section_ptr, common_hdr_size, mtu, pkt_section_info_room, pkt_remaining_capacity, total_section_info_size, sections_generated,
-                            prev_section_dyn_bfw ? bfw_txq_info : txq_info);
+                            last_packet_disableBFWs == 0 ? bfw_txq_info : txq_info);
                     }
                     else if(total_section_info_size + min_pdsch_sect_sz + csirs_sect_sz > pkt_section_info_room)
                     {
                         add_new_packet(fhi, info, mbufs, packet_num, m, flow, sequence_id_generator, data, common_hdr_ptr, section_ptr, common_hdr_size, mtu, pkt_section_info_room, pkt_remaining_capacity, total_section_info_size, sections_generated,
-                            prev_section_dyn_bfw ? bfw_txq_info : txq_info);
+                            last_packet_disableBFWs == 0 ? bfw_txq_info : txq_info);
                     }
                     prev_section_dyn_bfw = (ext11_ptr != nullptr && last_packet_disableBFWs == 0 && pdsch_ext11_ptr->ext_11.static_bfw == false);
                     int pdsch_bundle_room         = 0;
@@ -2097,17 +2191,26 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
                     {
                         pdsch_ext11_ptr->ext_11.ext_hdr.numBundPrb = current_pdsch_num_prbc;
                     }
-                    if(csirs_one_bundle && csirs_ext11_ptr != nullptr)
-                    {
-                        csirs_ext11_ptr->ext_11.ext_hdr.numBundPrb = current_pdsch_num_prbc;
-                    }
+
 
                     uint16_t section_id = nxt_section_id[ap_idx]++;
 
                     //csirs section
                     //FIXME PDSCH with dyn BFW needs to start new packet for CSIRS
-                    populate_section_info(section_ptr, info.sections[section_num + 1], total_section_info_size, pkt_remaining_capacity, section_hdr_size, info_.max_num_prbs_per_symbol, pdsch_start_prbc, current_pdsch_num_prbc, section_id, 0, csirs_num_bundles, sections_generated, &chain_info);
-
+                    auto csirs_section_index = section_num + 1;
+                    while(info.sections[csirs_section_index].csirs_of_multiplex_pdsch_csirs && info.sections[csirs_section_index].section_id_lookback_index > 0)
+                    {
+                        auto csirs_ext11_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext11);
+                        if(csirs_one_bundle && csirs_ext11_ptr != nullptr)
+                        {
+                            csirs_ext11_ptr->ext_11.ext_hdr.numBundPrb = current_pdsch_num_prbc;
+                        }
+                        populate_section_info(section_ptr, info.sections[csirs_section_index], total_section_info_size, pkt_remaining_capacity, section_hdr_size, info_.max_num_prbs_per_symbol, pdsch_start_prbc, current_pdsch_num_prbc, section_id, 0, csirs_num_bundles, sections_generated, &chain_info);
+                        if(++csirs_section_index >= number_of_sections)
+                        {
+                            break;
+                        }
+                    }
                     //pdsch section
                     chain_info.header_mbuf = m;
                     populate_section_info(section_ptr, info.sections[section_num], total_section_info_size, pkt_remaining_capacity, section_hdr_size, info_.max_num_prbs_per_symbol, pdsch_start_prbc, current_pdsch_num_prbc, section_id, pdsch_start_bundle, current_pdsch_num_bundles, sections_generated, &chain_info);
@@ -2119,7 +2222,7 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
                     pdsch_start_prbc += current_pdsch_num_prbc;
                     pdsch_max_num_prbc -= current_pdsch_num_prbc;
                 }
-                section_num++;
+                section_num = (csirs_section_index - 1);
             }
             else if(ext11_ptr != nullptr)
             {
@@ -2159,13 +2262,13 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
                     if(total_section_info_size != 0 && start_new_dyn_bfw_packet)
                     {
                         add_new_packet(fhi, info, mbufs, packet_num, m, flow, sequence_id_generator, data, common_hdr_ptr, section_ptr, common_hdr_size, mtu, pkt_section_info_room, pkt_remaining_capacity, total_section_info_size, sections_generated,
-                            prev_section_dyn_bfw ? bfw_txq_info : txq_info);
+                            last_packet_disableBFWs == 0 ? bfw_txq_info : txq_info);
                     }
                     // Packet fragmentation
                     else if(total_section_info_size + min_sect_sz > pkt_section_info_room)
                     {
                         add_new_packet(fhi, info, mbufs, packet_num, m, flow, sequence_id_generator, data, common_hdr_ptr, section_ptr, common_hdr_size, mtu, pkt_section_info_room, pkt_remaining_capacity, total_section_info_size, sections_generated,
-                            prev_section_dyn_bfw ? bfw_txq_info : txq_info);
+                            last_packet_disableBFWs == 0 ? bfw_txq_info : txq_info);
                     }
                     prev_section_dyn_bfw = (ext11_ptr != nullptr && disableBFWs == 0 && ext11_ptr->ext_11.static_bfw == false);
 
@@ -2200,11 +2303,14 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
                         ext11_ptr->ext_11.ext_hdr.numBundPrb = current_num_prbc;
                     }
 
-                    uint16_t section_id = nxt_section_id[ap_idx]++;
+                    uint16_t section_id = handle_section_id_assignment(info.sections, section_num, ap_idx, sym_id, nxt_section_id);
                     chain_info.header_mbuf = m;
                     populate_section_info(section_ptr, info.sections[section_num], total_section_info_size, pkt_remaining_capacity, section_hdr_size, info_.max_num_prbs_per_symbol, start_prbc, current_num_prbc, section_id, start_bundle, current_num_bundles, sections_generated, &chain_info);
                     store_cplane_section_info(info.sections[section_num], ap_idx, sym_id, start_prbc, current_num_prbc, section_id);
-
+                    if(info.sections[section_num].section_id_lookback_index == 0)
+                    {
+                        update_cplane_combined_reMask(info.sections[section_num], ap_idx, sym_id, info.sections[section_num].prb_info->common.reMask);
+                    }
                     start_bundle += current_num_bundles;
                     num_bundles -= current_num_bundles;
                     start_prbc += current_num_prbc;
@@ -2244,13 +2350,22 @@ void Peer::prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mb
                 auto  sect_info_ptr        = reinterpret_cast<CPlaneSectionInfo*>(section_ptr);
                 if(info.sections[section_num].csirs_of_multiplex_pdsch_csirs) //csirs part of pdsch+csirs
                 {
-                    auto cplane_section_idx         = info.sections[section_num].prb_info->cplane_sections_info[sym_id]->cplane_sections_count[ap_idx];
-                    sect_info_ptr->sect_1.sectionId = info.sections[section_num - 1].prb_info->cplane_sections_info[sym_id]->section_id[ap_idx][cplane_section_idx - 1];
+                    //Get section ID for all CSI-RS sections from the PDSCH section.
+                    auto ref_section_num = section_num - info.sections[section_num].section_id_lookback_index;
+                    auto cplane_section_idx         = info.sections[ref_section_num].prb_info->cplane_sections_info[sym_id]->cplane_sections_count[ap_idx];
+                    sect_info_ptr->sect_1.sectionId = info.sections[ref_section_num].prb_info->cplane_sections_info[sym_id]->section_id[ap_idx][cplane_section_idx - 1]; // we did cplane_section_idx - 1 because gets incremented after saving section id for PDSCH section.
                 }
                 else
                 {
-                    sect_info_ptr->sect_1.sectionId                                      = nxt_section_id[ap_idx]++;
+                    uint16_t section_id = handle_section_id_assignment(info.sections, section_num, ap_idx, sym_id, nxt_section_id);
+                    sect_info_ptr->sect_1.sectionId                                      = section_id;
                     store_cplane_section_info(info.sections[section_num], ap_idx, sym_id, info.sections[section_num].sect_1.startPrbc.get(), info.sections[section_num].sect_1.numPrbc.get(), sect_info_ptr->sect_1.sectionId.get());
+                    //Todo: Need to figure out how to run this code only for CSI-RS. It will not to do any functional harm but is unnecessary overhead.
+                    //for other channels.
+                    if(info.sections[section_num].section_id_lookback_index == 0)
+                    {
+                        update_cplane_combined_reMask(info.sections[section_num], ap_idx, sym_id, info.sections[section_num].prb_info->common.reMask);
+                    }
                 }
                 pkt_remaining_capacity -= section_hdr_size + ext_len;
                 total_section_info_size += section_hdr_size + ext_len;
@@ -2352,7 +2467,7 @@ void Peer::count_cplane_packets_mmimo_ext11(
         }
 
         auto min_sect_sz = section_hdr_size + ext11_hdr_size + bundle_size;
-        bool start_new_dyn_bfw_packet = prev_section_dyn_bfw || (ext11_ptr != nullptr && disableBFWs == 0 && ext11_ptr->ext_11.static_bfw == false);
+        bool start_new_dyn_bfw_packet = prev_section_dyn_bfw || (disableBFWs == 0 && ext11_ptr->ext_11.static_bfw == false);
         start_new_dyn_bfw_packet = start_new_dyn_bfw_packet && (info_.bfw_cplane_info.bfw_chain_mode != BfwCplaneChainingMode::NO_CHAINING);
         if(direction == DIRECTION_DOWNLINK && (total_section_info_size != 0 && start_new_dyn_bfw_packet)) {
             // Start new packet always if last section has dyn BFW weights if chaining enabled with DL
@@ -2365,7 +2480,7 @@ void Peer::count_cplane_packets_mmimo_ext11(
             ++section_num_packets;
             total_section_info_size = 0;
         }
-        prev_section_dyn_bfw = (ext11_ptr != nullptr && disableBFWs == 0 && ext11_ptr->ext_11.static_bfw == false);
+        prev_section_dyn_bfw = (disableBFWs == 0 && ext11_ptr->ext_11.static_bfw == false);
 
         int bundle_room = 0;
         int current_num_bundles = 0;
@@ -2557,9 +2672,9 @@ cplaneCountInfo Peer::count_cplane_packets_mmimo_dl(CPlaneMsgSendInfo const* inf
                     nxt_ext4_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[section_num + 1].ext4);
                     nxt_ext5_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[section_num + 1].ext5);
                 }
-
+                auto csirs_section_index = section_num + 1;
                 //Handle section split with pdsch+csi_rs
-                if(section_num + 1 < number_of_sections && info.sections[section_num + 1].csirs_of_multiplex_pdsch_csirs && (ext11_ptr != nullptr || nxt_ext11_ptr != nullptr))
+                if(section_num + 1 < number_of_sections && info.sections[section_num + 1].csirs_of_multiplex_pdsch_csirs && (info.sections[section_num].section_id_lookback_index== 0) && (ext11_ptr != nullptr || nxt_ext11_ptr != nullptr))
                 {
                     int pdsch_sect_sz         = section_hdr_size;
                     int pdsch_ext11_hdr_size  = 0;
@@ -2606,22 +2721,36 @@ cplaneCountInfo Peer::count_cplane_packets_mmimo_dl(CPlaneMsgSendInfo const* inf
                     }
 
                     bool csirs_bfw = false;
-                    if(nxt_ext11_ptr != nullptr)
+                    csirs_section_index = section_num + 1;
+                    CPlaneSectionExtInfo* csirs_ext11_ptr = nullptr;
+                    while(info.sections[csirs_section_index].csirs_of_multiplex_pdsch_csirs && info.sections[csirs_section_index].section_id_lookback_index > 0)
                     {
-                        auto               csirs_ext11_ptr  = static_cast<CPlaneSectionExtInfo*>(info.sections[section_num + 1].ext11);
-                        oran_cmsg_ext_hdr* ext11_common_hdr = nullptr;
-                        csirs_sect_sz += csirs_ext11_ptr->ext_11.ext_hdr.extLen << 2;
-                        csirs_bfw         = csirs_ext11_ptr->ext_11.static_bfw;
-                        csirs_num_bundles = csirs_ext11_ptr->ext_11.numPrbBundles;
-                    }
-
-                    if(nxt_ext4_ptr != nullptr)
-                    {
-                        csirs_sect_sz += sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_4);
-                    }
-                    if(nxt_ext5_ptr != nullptr)
-                    {
-                        csirs_sect_sz += sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_5);
+                        if(nxt_ext11_ptr != nullptr)
+                        {
+                            csirs_ext11_ptr                     = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext11);
+                            oran_cmsg_ext_hdr* ext11_common_hdr = nullptr;
+                            csirs_sect_sz += csirs_ext11_ptr->ext_11.ext_hdr.extLen << 2;
+                            csirs_bfw         = csirs_ext11_ptr->ext_11.static_bfw;
+                            csirs_num_bundles = csirs_ext11_ptr->ext_11.numPrbBundles;
+                        }
+                        if(nxt_ext4_ptr != nullptr)
+                        {
+                            csirs_sect_sz += sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_4);
+                        }
+                        if(nxt_ext5_ptr != nullptr)
+                        {
+                            csirs_sect_sz += sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_5);
+                        }
+                        if(++csirs_section_index < number_of_sections)
+                        {
+                            nxt_ext11_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext11);
+                            nxt_ext4_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext4);
+                            nxt_ext5_ptr = static_cast<CPlaneSectionExtInfo*>(info.sections[csirs_section_index].ext5);
+                        }
+                        else
+                        {
+                            break;
+                        }
                     }
 
                     int start_prbc = info.sections[section_num].sect_1.startPrbc.get();
@@ -2705,7 +2834,7 @@ cplaneCountInfo Peer::count_cplane_packets_mmimo_dl(CPlaneMsgSendInfo const* inf
                         pdsch_num_bundles -= current_pdsch_num_bundles;
                         pdsch_max_num_prbc -= current_pdsch_num_prbc;
                     }
-                    section_num++;
+                    section_num = (csirs_section_index - 1);
                 }
                 else if(ext11_ptr != nullptr)
                 {
@@ -4262,22 +4391,25 @@ void Peer::gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msg
        partial_up_slot_info->last_sym_with_packets = std::max(partial_up_slot_info->last_sym_with_packets, symbol_id);
        syms_with_packets_mask |= (1U << symbol_id);
 
-       int current_messages = partial_up_slot_info->section_info[symbol_id].num_messages;
-       partial_up_slot_info->message_info[symbol_id].num_prbu[current_messages] = msgi_num_prbu;
+       int current_messages                                                       = partial_up_slot_info->section_info[symbol_id].num_messages;
+       partial_up_slot_info->message_info[symbol_id].num_prbu[current_messages]   = msgi_num_prbu;
        partial_up_slot_info->message_info[symbol_id].start_prbu[current_messages] = msgi_start_prbu;
        partial_up_slot_info->message_info[symbol_id].section_id[current_messages] = msgi_section_id;
-       partial_up_slot_info->message_info[symbol_id].rb[current_messages] = msgi_rb;
-        if(info[i].section_info.mod_comp_enable)
-        {
-            partial_up_slot_info->message_info[symbol_id].mod_comp_params->prb_size_upl[current_messages] = msgi_section_prb_size;
-            partial_up_slot_info->message_info[symbol_id].mod_comp_params->mod_comp_enabled[current_messages] = 1;
-        }
-        else
-        {
-            partial_up_slot_info->message_info[symbol_id].mod_comp_params = nullptr;
-        }
+       partial_up_slot_info->message_info[symbol_id].rb[current_messages]         = msgi_rb;
+       if(info[i].section_info.mod_comp_enable)
+       {
+           partial_up_slot_info->message_info[symbol_id].mod_comp_params->prb_size_upl[current_messages]     = msgi_section_prb_size;
+           partial_up_slot_info->message_info[symbol_id].mod_comp_params->mod_comp_enabled[current_messages] = 1;
+       }
+       else
+       {
+           partial_up_slot_info->message_info[symbol_id].mod_comp_params = nullptr;
+       }
+       if(unlikely(dlu_eaxcid_idx_mp[info[i].eaxcid] >= MAX_DL_EAXCIDS))
+       {
+           THROW_FH(ENOMEM, StringBuilder() << "eaxcid idx " << dlu_eaxcid_idx_mp[info[i].eaxcid] << " out of bounds, max " << MAX_DL_EAXCIDS - 1);
+       }
        partial_up_slot_info->message_info[symbol_id].flow_index_info[current_messages] = dlu_eaxcid_idx_mp[info[i].eaxcid];
-
        partial_up_slot_info->section_info[symbol_id].num_messages += 1;
 
 
@@ -4286,13 +4418,13 @@ void Peer::gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msg
            uint16_t prb_per_pkt_upl                                                    = (nic_->get_mtu() - ORAN_IQ_HDR_SZ) / msgi_section_prb_size;
            tmp_packets                                                                 = (msgi_num_prbu + prb_per_pkt_upl - 1) / prb_per_pkt_upl;
            partial_up_slot_info->message_info[symbol_id].num_packets[current_messages] = tmp_packets;
-           partial_up_slot_info->message_info[symbol_id].num_bytes[current_messages]   = tmp_packets * ORAN_IQ_HDR_SZ + msgi_num_prbu * msgi_section_prb_size;
+           partial_up_slot_info->message_info[symbol_id].num_bytes[current_messages]   = static_cast<uint32_t>(tmp_packets) * ORAN_IQ_HDR_SZ + static_cast<uint32_t>(msgi_num_prbu) * msgi_section_prb_size;
        }
        else
        {
            tmp_packets                                                                 = (msgi_num_prbu + prbs_per_pkt_upl_ - 1) / prbs_per_pkt_upl_;
            partial_up_slot_info->message_info[symbol_id].num_packets[current_messages] = tmp_packets;
-           partial_up_slot_info->message_info[symbol_id].num_bytes[current_messages]   = tmp_packets * ORAN_IQ_HDR_SZ + msgi_num_prbu * prb_size_upl_;
+           partial_up_slot_info->message_info[symbol_id].num_bytes[current_messages]   = static_cast<uint32_t>(tmp_packets) * ORAN_IQ_HDR_SZ + static_cast<uint32_t>(msgi_num_prbu) * prb_size_upl_;
        }
 
        if(commViaCpu)

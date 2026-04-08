@@ -27,7 +27,7 @@
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
 HarqPool::HarqPool(size_t _size,size_t _sizePool, GpuDevice* _gDev, FronthaulHandle _fhi_handle)
     :
-    size(_size), sizePool(_sizePool),gDev(_gDev)
+    size(_size), sizePool(_sizePool), gpuMemSize(0), gDev(_gDev)
 {
     char * ring_name;
 
@@ -54,7 +54,10 @@ HarqPool::HarqPool(size_t _size,size_t _sizePool, GpuDevice* _gDev, FronthaulHan
     // Create HARQ set of free buffers
     for(int i = 0; i < sizePool-1; i++)
     {
-        hb_list.push_back(std::unique_ptr<HarqBuffer>(new HarqBuffer(new dev_buf(size * sizeof(uint8_t), gDev), size)));
+        dev_buf* _dev_buf = new dev_buf(size, gDev);
+        gpuMemSize += _dev_buf->size_alloc;
+        hb_list.push_back(std::unique_ptr<HarqBuffer>(new HarqBuffer(_dev_buf, size)));
+
         // Push all the HARQ buffers in the ring
         if(aerial_fh::ring_enqueue(hb_ring, (void*)hb_list[i].get()))
         {
@@ -84,6 +87,10 @@ size_t HarqPool::getSize() const {
 
 size_t HarqPool::countElements() const {
     return sizePool - ((int)aerial_fh::ring_free_count(hb_ring));
+}
+
+size_t HarqPool::getGpuMemSize() const {
+    return gpuMemSize;
 }
 
 // Allocate a buffer from FH rte_ring
@@ -296,8 +303,9 @@ HarqPoolManager::HarqPoolManager(phydriver_handle _pdh, GpuDevice* _gDev) :
     // Create HARQ buffer pools for each size
     for(int i = 0; i < MAX_HARQ_POOLS; i++)
     {
-        hb_pool_list.push_back(std::unique_ptr<HarqPool>(new HarqPool(HARQ_POOL_SIZE[i],pdctx->getMaxHarqPools(),gDev, fhproxy->getFhInstance())));
-        mf.addGpuRegularSize(HARQ_POOL_SIZE[i] * pdctx->getMaxHarqPools());
+        HarqPool* hb_pool = new HarqPool(HARQ_POOL_SIZE[i], pdctx->getMaxHarqPools(), gDev, fhproxy->getFhInstance());
+        mf.addGpuRegularSize(hb_pool->getGpuMemSize());
+        hb_pool_list.push_back(std::unique_ptr<HarqPool>(hb_pool));
     }
 
     // Prepare MAX_BUCKET_ENTRY buckets

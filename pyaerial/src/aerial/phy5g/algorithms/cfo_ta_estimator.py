@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,14 +16,14 @@
 """pyAerial library - Carrier frequency offset and timing advance estimation (for equalization)."""
 from typing import Generic
 from typing import List
+from typing import Optional
 from typing import Tuple
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy  # type: ignore
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PuschConfig
 from aerial.phy5g.config import PuschUeConfig
@@ -47,7 +47,7 @@ class CfoTaEstimator(Generic[Array]):
                  enable_cfo_correction: bool = True,
                  enable_weighted_ave_cfo_est: bool = False,
                  enable_to_estimation: bool = True,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize CfoTaEstimator.
 
         Args:
@@ -68,11 +68,11 @@ class CfoTaEstimator(Generic[Array]):
                 - 0: Disable.
                 - 1: Enable (default).
 
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         pusch_stat_prms = get_pusch_stat_prms(
             num_rx_ant=num_rx_ant,
@@ -84,7 +84,7 @@ class CfoTaEstimator(Generic[Array]):
         self._pusch_params = pycuphy.PuschParams()
         self._pusch_params.set_stat_prms(pusch_stat_prms)
 
-        self.cfo_ta_estimator = pycuphy.CfoTaEstimator(cuda_stream)
+        self.cfo_ta_estimator = pycuphy.CfoTaEstimator(self._cuda_stream.handle)
         self.cfo_est = None  # type: List[Array]
         self.cfo_hz = None  # type: Array
         self.ta = None  # type: Array
@@ -127,7 +127,7 @@ class CfoTaEstimator(Generic[Array]):
             - *Array*: Timing offset per UE, in microseconds.
         """
         cpu_copy = isinstance(channel_est[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             channel_est = [cp.array(elem, order='F', dtype=cp.complex64) for elem in channel_est]
             # Dummy empty Rx data (Rx data not needed).
             rx_data = cp.zeros((3276, 14, 1), dtype=cp.complex64)
@@ -164,7 +164,7 @@ class CfoTaEstimator(Generic[Array]):
         rx_data = pycuphy.CudaArrayComplexFloat(rx_data)
 
         pusch_dyn_prms = _pusch_config_to_cuphy(
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             rx_data=[rx_data],
             slot=0,  # Not used.
             pusch_configs=pusch_configs
@@ -176,7 +176,7 @@ class CfoTaEstimator(Generic[Array]):
         self.cfo_hz = self.cfo_ta_estimator.get_cfo_hz()
         self.ta = self.cfo_ta_estimator.get_ta()
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             self.cfo_est = [cp.array(elem) for elem in self.cfo_est]
             self.cfo_hz = cp.array(self.cfo_hz)
             self.ta = cp.array(self.ta)

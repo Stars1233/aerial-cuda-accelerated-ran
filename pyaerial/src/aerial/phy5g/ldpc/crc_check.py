@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,14 +16,14 @@
 """pyAerial library - CRC checking."""
 from typing import Generic
 from typing import List
+from typing import Optional
 from typing import Tuple
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy  # type: ignore
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PuschConfig
 
@@ -36,17 +36,17 @@ class CrcChecker(Generic[Array]):
     It uses cuPHY accelerated CRC routines under the hood.
     """
 
-    def __init__(self, cuda_stream: int = None) -> None:
+    def __init__(self, cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize CrcChecker.
 
         Args:
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new
+                CudaStream is created. Use ``with stream:`` to scope work; call
+                ``stream.synchronize()`` explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
-        self.crc_checker = pycuphy.CrcChecker(self.cuda_stream)
+        self.crc_checker = pycuphy.CrcChecker(self._cuda_stream.handle)
 
         self.cb_crcs = None  # type: List[Array]
 
@@ -84,7 +84,7 @@ class CrcChecker(Generic[Array]):
               Transport block CRC check results for each UE.
         """
         cpu_copy = isinstance(input_bits[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             input_bits = [cp.array(elem, order='F', dtype=cp.float16) for elem in input_bits]
 
         max_code_block_size = 8448
@@ -105,7 +105,7 @@ class CrcChecker(Generic[Array]):
 
         # cuPHY wants the LDPC output / CRC input extended to maximum number of info bits K
         # and stacked together.
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tot_num_code_blocks = sum(bits.shape[1] for bits in input_bits)
             crc_input = cp.zeros(
                 (max_code_block_size, tot_num_code_blocks),
@@ -129,7 +129,7 @@ class CrcChecker(Generic[Array]):
         self.cb_crcs = self.crc_checker.get_cb_crcs()
         tb_crcs = self.crc_checker.get_tb_crcs()
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tb_payloads = [cp.array(elem) for elem in tb_payloads]
             tb_crcs = [cp.array(elem) for elem in tb_crcs]
             self.cb_crcs = [cp.array(elem) for elem in self.cb_crcs]

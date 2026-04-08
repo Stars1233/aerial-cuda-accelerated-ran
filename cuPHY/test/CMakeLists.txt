@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,7 @@
 # limitations under the License.
 
 find_package(GTest REQUIRED)
+find_package(CUDAToolkit REQUIRED COMPONENTS cudart curand)
 
 include_directories("${PROJECT_SOURCE_DIR}/src/cuphy/crc")
 include_directories("${PROJECT_SOURCE_DIR}/src/cuphy/descrambling")
@@ -53,3 +54,16 @@ add_subdirectory(tensor_desc_tests)
 add_subdirectory(cuphy)
 add_subdirectory(cuphy_api)
 add_subdirectory(uciOnPusch_csi2Ctrl)
+add_subdirectory(prach_receiver)
+add_subdirectory(pucch_F2_front_end)
+add_subdirectory(pucch_F3_segLLRs)
+add_subdirectory(pusch_noise_intf_est)
+add_subdirectory(pucch_F1_receiver)
+add_subdirectory(pucch_F0_receiver)
+add_subdirectory(polar_decoder)
+add_subdirectory(polar_encoder)
+add_subdirectory(bfc)
+add_subdirectory(pusch_rssi)
+add_subdirectory(embed_pdcch_tf_signal)
+add_subdirectory(ss)
+add_subdirectory(rate_matching)

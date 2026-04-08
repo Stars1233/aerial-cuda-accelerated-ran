@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -205,8 +205,7 @@ __device__ void calculateFieldComponentsGPU(const AntPanelConfig& antPanelConfig
     }
 
     // Convert from dB to linear
-    constexpr float G_max = 8.0f;
-    float A_db_3D = antPanelConfig.antTheta[theta_idx] + antPanelConfig.antPhi[phi_idx] + (antPanelConfig.antModel == 1 ? G_max : 0.0f);
+    float A_db_3D = antPanelConfig.antTheta[theta_idx] + antPanelConfig.antPhi[phi_idx] + (antPanelConfig.antModel == 1 ? SLS_ANTENNA_GAIN_MAX_DBI : 0.0f);
     float A_3D_sqrt = powf(10.0f, A_db_3D / 20.0f); // equivalent to sqrt(10^(A_db_3D/10))
     
     // Apply polarization
@@ -1016,10 +1015,12 @@ __global__ void generateCIRKernel(const activeLink<Tcomplex>* activeLinkParams,
                     if (subClusterIdx == 1) clusterDelay += 1.28f * C_DS;
                     else if (subClusterIdx == 2) clusterDelay += 2.56f * C_DS;
                     
-                    // Calculate tap index for this subcluster, including propagation delay if enabled
+                    // Calculate tap index for this subcluster, including propagation delay and delta_tau if enabled
                     uint16_t tapIdx;
                     if (sysConfig->enable_propagation_delay == 1) {
-                        tapIdx = (uint16_t)roundf((clusterDelay * 1e-9f + linkParams[lspReadIdx].d3d / 3.0e8f) * simConfig->sc_spacing_hz * simConfig->fft_size);
+                        // Add propagation delay (d3d/c) and excess delay delta_tau per 3GPP TR 38.901 Section 7.6.9
+                        // delta_tau is 0 for LOS, lognormal for NLOS (already computed and stored in linkParams)
+                        tapIdx = (uint16_t)roundf((clusterDelay * 1e-9f + linkParams[lspReadIdx].d3d / 3.0e8f + linkParams[lspReadIdx].delta_tau) * simConfig->sc_spacing_hz * simConfig->fft_size);
                     } else {
                         tapIdx = (uint16_t)roundf(clusterDelay * 1e-9f * simConfig->sc_spacing_hz * simConfig->fft_size);
                     }
@@ -1084,10 +1085,12 @@ __global__ void generateCIRKernel(const activeLink<Tcomplex>* activeLinkParams,
             else {
                 // Process regular cluster (like CPU reference)
                 float clusterDelay = clusterParams[lspReadIdx].delays[clusterIdx];
-                // Calculate tap index for this subcluster, including propagation delay if enabled
+                // Calculate tap index for this regular cluster, including propagation delay and delta_tau if enabled
                 uint16_t tapIdx;
                 if (sysConfig->enable_propagation_delay == 1) {
-                    tapIdx = (uint16_t)roundf((clusterDelay * 1e-9f + linkParams[lspReadIdx].d3d / 3.0e8f) * simConfig->sc_spacing_hz * simConfig->fft_size);
+                    // Add propagation delay (d3d/c) and excess delay delta_tau per 3GPP TR 38.901 Section 7.6.9
+                    // delta_tau is 0 for LOS, lognormal for NLOS (already computed and stored in linkParams)
+                    tapIdx = (uint16_t)roundf((clusterDelay * 1e-9f + linkParams[lspReadIdx].d3d / 3.0e8f + linkParams[lspReadIdx].delta_tau) * simConfig->sc_spacing_hz * simConfig->fft_size);
                 } else {
                     tapIdx = (uint16_t)roundf(clusterDelay * 1e-9f * simConfig->sc_spacing_hz * simConfig->fft_size);
                 }

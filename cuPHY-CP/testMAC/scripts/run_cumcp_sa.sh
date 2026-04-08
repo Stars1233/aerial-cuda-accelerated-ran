@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,6 +80,8 @@ fi
 
 echo "Parameters: duration=$duration, test_group=$test_group, test_case=$test_case, alloc_type=$alloc_type"
 
+script_start=$(date +%s)
+
 if [ "$cuBB_SDK" = "" ]; then
     echo "Please set cuBB_SDK first"
     exit 1
@@ -88,12 +91,10 @@ LOCAL_DIR=$(dirname $(readlink -f "$0"))
 
 echo "cuBB_SDK=$cuBB_SDK"
 
-if [ "$BUILD" = "" ]; then
-    BUILD="build"
-fi
-
-if [[ -d $cuBB_SDK/build-$(arch) ]]; then
-    BUILD=build-$(arch)
+if [ "${BUILD}" != "" ]; then
+    export BUILD="${BUILD}"
+else
+    export BUILD="build.$(arch)"
 fi
 
 if [ "$test_group" != "F08" ]; then
@@ -136,13 +137,36 @@ if [ "$LOG_PATH" = "" ]; then
     export LOG_PATH=$cuBB_SDK/logs/latest
 fi
 echo "LOG_PATH=$LOG_PATH"
-if [ ! -d $LOG_PATH ]; then
-    mkdir -p $LOG_PATH
+
+# Make sure the parent directory of LOG_PATH is writable
+log_parent=$(dirname -- "$LOG_PATH")
+${USE_SUDO} chmod 777 "$log_parent" || true
+echo "ls -la $log_parent"
+ls -la "$log_parent"
+
+# Create LOG_PATH if it doesn't exist
+if [ ! -d "$LOG_PATH" ]; then
+    if ! mkdir -p "$LOG_PATH"; then
+        echo "Error: cannot create LOG_PATH: $LOG_PATH"
+        exit 1
+    fi
 fi
 
 # chmod to fix NFS storage permission issue
-chmod 777 $LOG_PATH
-cd $LOG_PATH
+chmod 777 "$LOG_PATH"
+if [ ! -w "$LOG_PATH" ]; then
+    echo "Error: LOG_PATH is not writable: $LOG_PATH"
+    exit 1
+fi
+
+# Clean old logs if exist
+rm -rf $LOG_PATH/*
+
+cd "$LOG_PATH" || { echo "Error: cannot cd to LOG_PATH: $LOG_PATH"; exit 1; }
+
+# Show the LOG_PATH directory contents
+echo "ls -la $LOG_PATH"
+ls -la "$LOG_PATH"
 
 function kill_all {
     signal=$1
@@ -227,10 +251,6 @@ LOCAL_CMD_PHY_LOG="cp /tmp/cumac_cp.log /tmp/testmac.log ${cuBB_SDK}/${mac_cfg_y
 
 # Disable test_mac FAPI validation for L2SA test
 LOCAL_MAC_CMD="${LOCAL_MAC_CMD}"
-
-
-# Clean old logs
-rm -rf $LOG_PATH/*
 
 is_screen_running() {
     title=$1
@@ -334,6 +354,11 @@ run_in_screen() {
     screen -L -t $title -dmS $title bash -c "$cmd";
 }
 
+# Show the LOG_PATH directory contents
+echo "ls -la $LOG_PATH"
+ls -la "$LOG_PATH"
+echo "PWD=$(pwd)"
+
 run_in_screen cum "$LOCAL_CUMAC_CP_CMD" 1
 sleep 2
 run_in_screen mac "$LOCAL_MAC_CMD" 1
@@ -371,10 +396,12 @@ test_result=$?
 # Kill after test
 kill_all SIGINT
 
-# Collect logs
 bash -c "$LOCAL_CMD_PHY_LOG" > $LOG_PATH/nvlog_collect.log 2>&1
 
 # $USE_SUDO chown $(whoami):$(whoami) ./*
+
+script_end=$(date +%s)
+echo "Total test time: $((script_end - script_start))s"
 
 if [ "${QA_TEST}" != "" ]; then
     exit $test_result

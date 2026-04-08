@@ -1,5 +1,6 @@
 #!/bin/bash -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -203,10 +204,10 @@ BASE_RU_YAML=$(basename "$RU_YAML")
 if [[ "$CONTROLLER_MODE" == *nrSim_SCF* ]]; then
     NRSIM_TC=$(echo "$CONTROLLER_MODE" | sed -E 's/nrSim_SCF_(CG1_)?//')
     echo "$WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator nrSim $NRSIM_TC" "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"
-    { sudo -E LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator" nrSim $NRSIM_TC --config $BASE_RU_YAML "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"; RET=$?; } || true
+    { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator" nrSim $NRSIM_TC --config $BASE_RU_YAML "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"; RET=$?; } || true
 else
     echo "$WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator F08 $NUM_CELLS $PATTERN --config $BASE_RU_YAML" "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"
     # shellcheck disable=SC1073
-    { sudo -E LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator" F08 $NUM_CELLS $PATTERN --config $BASE_RU_YAML "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"; RET=$?; } || true
+    { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator" F08 $NUM_CELLS $PATTERN --config $BASE_RU_YAML "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"; RET=$?; } || true
 fi
 exit $RET

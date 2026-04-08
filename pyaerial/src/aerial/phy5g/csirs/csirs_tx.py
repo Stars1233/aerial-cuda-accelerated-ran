@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +16,8 @@
 """pyAerial library - CSI-RS transmitter."""
 from typing import Any
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
@@ -26,7 +26,7 @@ from aerial.phy5g.api import Array
 from aerial.phy5g.csirs.csirs_api import CsiRsConfig
 from aerial.phy5g.csirs.csirs_api import CsiRsTxConfig
 from aerial.phy5g.csirs.csirs_api import CsiRsTxPipeline
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 
 
 class CsiRsTx(CsiRsTxPipeline[CsiRsTxConfig, Array]):
@@ -34,18 +34,20 @@ class CsiRsTx(CsiRsTxPipeline[CsiRsTxConfig, Array]):
 
     This class implements CSI-RS transmission within a slot.
     """
-    def __init__(self, num_prb_dl_bwp: List[int],
-                 num_ant_dl: List[int] = None, cuda_stream: int = None) -> None:
+    def __init__(self,
+                 num_prb_dl_bwp: List[int],
+                 num_ant_dl: Optional[List[int]] = None,
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize CsiRsTx.
 
         Args:
             num_prb_dl_bwp (List[int]): Number of PRBs in DL BWP.
             num_ant_dl (List[int]): Number of antennas in DL.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
         if num_ant_dl is None:
             # Default of max CSI-RS ports; replicate per cell
             num_ant_dl = [32] * len(num_prb_dl_bwp)
@@ -84,14 +86,14 @@ class CsiRsTx(CsiRsTxPipeline[CsiRsTxConfig, Array]):
         """
         precoding_matrices = precoding_matrices or []
         cpu_copy = isinstance(tx_buffers[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tx_buffers = [cp.array(tx_buf, order='F', dtype=cp.complex64) for tx_buf in tx_buffers]
             tx_buffers = [pycuphy.CudaArrayComplexFloat(tx_buf) for tx_buf in tx_buffers]
         self.csi_rs_tx.run(csirs_configs,
                            precoding_matrices,
                            tx_buffers,
-                           self.cuda_stream)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+                           self._cuda_stream.handle)
+        with self._cuda_stream:
             tx_buffers = [cp.array(tx_buf) for tx_buf in tx_buffers]
             if cpu_copy:
                 tx_buffers = [tx_buf.get(order='F') for tx_buf in tx_buffers]

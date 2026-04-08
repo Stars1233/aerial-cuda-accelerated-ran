@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -67,6 +67,8 @@ void usage()
     printf("    --M <activeThrdPcts>   Enables use of cuda-contexts (one per thread) and uses a list of comma seperated values for active thread percentage\n");
     printf("    --H                    Use half precision (FP16)\n");
     printf("    -H <harq attempts>     Tests PUSCH HARQ by incrementally testing input HDF5 filenames of the form filename_s#p0.h5. \n");
+    printf("    -L  nLdpcHetConfigs    Override max heterogenous LDPC workload configs (default: 32)\n");
+    printf("    -T  nMaxTbPerNode      Maximum number of transport blocks per node (default: 32)\n");
     printf("    --S slot index in yaml Slot index in yaml file to use\n");
     printf("    --G SM count           Use green contexts with specified SM count per context. Do not use in combination with --M (MPS)\n");
 }
@@ -111,6 +113,8 @@ int main(int argc, char* argv[])
         uint32_t SMsPerGreenCtx     = 0;
         uint64_t procModeBmsk       = 0;
         uint32_t ldpcLaunchMode     = 0;
+        uint32_t nMaxLdpcHetConfigs = 32;
+        uint8_t  nMaxTbPerNode      = 32; // Maximum number of transport blocks per node
         std::vector<uint32_t> mpsActiveThrdPcts;
         uint32_t defaultMpsActiveThrdPct = 100;
         uint32_t harq_attempts = 1;
@@ -238,6 +242,22 @@ int main(int argc, char* argv[])
                     if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%u", &ldpcLaunchMode)) || (3 < ldpcLaunchMode))
                     {
                         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid LDPC kernel launch mode ({})", ldpcLaunchMode);
+                        exit(1);
+                    }
+                    ++iArg;
+                    break;
+                case 'L':
+                    if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%u", &nMaxLdpcHetConfigs)) || (nMaxLdpcHetConfigs == 0))
+                    {
+                        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid LDPC heterogeneous config count ({})", nMaxLdpcHetConfigs);
+                        exit(1);
+                    }
+                    ++iArg;
+                    break;
+                case 'T':
+                    if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%hhu", &nMaxTbPerNode)) || (nMaxTbPerNode == 0) || (nMaxTbPerNode > CUPHY_LDPC_DECODE_DESC_MAX_TB))
+                    {
+                        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid nMaxTbPerNode value ({})", nMaxTbPerNode);
                         exit(1);
                     }
                     ++iArg;
@@ -491,7 +511,7 @@ int main(int argc, char* argv[])
         std::mutex                 cvStartSyncPtMutex;
         std::condition_variable    cvStartSyncPt;
         std::atomic<std::uint32_t> atmSyncPtWaitCnt(0);
-        PuschRxTest                puschRxTest("PuschRx", nInst, useCuCtxs, delayCuStrm, cuStrmPrios, startSyncPt, cvStartSyncPtMutex, cvStartSyncPt, atmSyncPtWaitCnt, mpsActiveThrdPcts, harq_attempts, 1<<ldpcLaunchMode, drmDebug, debug, debugEqualizer, useGreenCtxs);
+        PuschRxTest                puschRxTest("PuschRx", nInst, useCuCtxs, delayCuStrm, cuStrmPrios, startSyncPt, cvStartSyncPtMutex, cvStartSyncPt, atmSyncPtWaitCnt, mpsActiveThrdPcts, harq_attempts, 1<<ldpcLaunchMode, nMaxLdpcHetConfigs, drmDebug, debug, debugEqualizer, useGreenCtxs, nMaxTbPerNode);
 
         //cudaSetDevice(gpuId); // reminder that this wil bind the primary context of this device to the calling thread; see cudaSetDevice documentation
 

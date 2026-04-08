@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,6 +42,8 @@ int main(int argc, char* argv[]) {
     std::string log_name = "srs_bfw.log";
     nv_get_absolute_path(nvlog_yaml_file, relative_path.c_str());
     pthread_t log_thread_id = -1;
+    bool     useGreenCtxs   = false;
+    uint32_t SMsPerGreenCtx = 0;
 
     try {
         // Setup CLI11 for command line argument parsing
@@ -88,6 +90,10 @@ int main(int argc, char* argv[]) {
         app.add_flag("--rnti-warning", rnti_not_found_as_warning, 
             "Treat RNTI not found as warning instead of error (default: error)");
 
+        app.add_option("--G", SMsPerGreenCtx, "Use green contexts with specified SM count per context")
+            ->check(CLI::PositiveNumber)
+            ->each([&useGreenCtxs](const std::string&) { useGreenCtxs = true; });
+
         // Custom validator to ensure at least one of SRS or BFW is specified
         app.callback([&]() {
             if (srs_input_filenames.empty() && bfw_input_filename.empty()) {
@@ -120,6 +126,46 @@ int main(int argc, char* argv[]) {
         }
 
         // Initialize CUDA
+        const int gpuId = 0; // select GPU device 0
+        CUDA_CHECK(cudaSetDevice(gpuId));
+        CUdevice current_device;
+        CU_CHECK(cuDeviceGet(&current_device, gpuId));
+
+#if CUDA_VERSION >= 12040
+        CUdevResource initial_device_GPU_resources = {};
+        CUdevResourceType default_resource_type = CU_DEV_RESOURCE_TYPE_SM;
+        CUdevResource split_result[2] = {{}, {}};
+        cuphy::cudaGreenContext srs_bfw_green_ctx;
+        unsigned int split_groups = 1;
+
+        if(useGreenCtxs)
+        {
+            // Best to ensure that MPS service is not running
+            int mpsEnabled = 0;
+            CU_CHECK(cuDeviceGetAttribute(&mpsEnabled, CU_DEVICE_ATTRIBUTE_MPS_ENABLED, current_device));
+            if (mpsEnabled == 1) {
+                NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT, "MPS is enabled. Heads-up that currently using green contexts with MPS enabled can have unintended side effects. Will run regardless.");
+            } else {
+                NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "MPS service is not running.");
+            }
+
+            // Check SMsPerGreenCtxs value is in valid range
+            int32_t gpuMaxSmCount = 0;
+            CU_CHECK(cuDeviceGetAttribute(&gpuMaxSmCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, current_device));
+            if (SMsPerGreenCtx > static_cast<uint32_t>(gpuMaxSmCount))
+            {
+                NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT, "ERROR: Invalid --G argument {}. It is greater than {} (GPU's max SMs).", SMsPerGreenCtx, gpuMaxSmCount);
+                return 1;
+            }
+
+            CU_CHECK(cuDeviceGetDevResource(current_device, &initial_device_GPU_resources, default_resource_type));
+            CU_CHECK(cuDevSmResourceSplitByCount(&split_result[0], &split_groups, &initial_device_GPU_resources, &split_result[1], 0, SMsPerGreenCtx));
+            srs_bfw_green_ctx.create(gpuId, &split_result[0]);
+            srs_bfw_green_ctx.bind();
+            NVLOGC_FMT(NVLOG_SRS, "SRS_BFW green context will have access to {} SMs ({} SMs requested).", srs_bfw_green_ctx.getSmCount(), SMsPerGreenCtx);
+        }
+#endif
+
         cuphy::stream cuStrmMain(cudaStreamNonBlocking);
         cudaStream_t cuStrm = cuStrmMain.handle();
 

@@ -29,6 +29,9 @@ int cuda_version_check();
 int cuda_page_lock(void* phost, size_t size);
 int cuda_page_unlock(void* phost);
 
+// Check if a CPU memory buffer is host pinned memory: 1 if yes, 0 if no
+int cuda_is_host_pinned_memory(void* phost);
+
 // CUDA memory copy function wrapper
 int nv_ipc_memcpy_to_host(void* host, const void* device, size_t size);
 int nv_ipc_memcpy_to_device(void* device, const void* host, size_t size);

@@ -17,7 +17,7 @@
 # log files stored at /tmp directory (default)
 # log file path can be customized using environment variable $AERIAL_LOG_PATH
 # Log levels: 0 - NONE, 1 - FATAL, 2 - ERROR, 3 - CONSOLE, 4 - WARNING, 5 - INFO, 6 - DEBUG, 7 - VERBOSE
-aerial_sdk_version: 25-3-cubb
+aerial_sdk_version: 26-1-cubb
 nvlog:
   shm_log_level: 4 # SHM log level
   max_file_size_bytes: 50000000000 # Size in bytes The rotating log files in /tmp (default)
@@ -71,6 +71,9 @@ nvlog:
     - 59: "PHY"
     - 60: "MAC"
     - 61: "NVIPC.PCAP"
+
+    - 80: "UTIL"      # aerial_utils
+    - 81: "UTIL.MEMFOOT"
 
     - 100: "CTL"        # cuPHYController
     - 101: "CTL.SCF"
@@ -145,6 +148,8 @@ nvlog:
       #shm_level: 5
     - 247: "DRV.WAVGCFO_POOL"
       #shm_level: 5
+    - 248: "DRV.PERF_METRICS"
+      shm_level: 5
 
     - 300: "L2A"        # cuphyl2adapter
     - 301: "L2A.MAC"

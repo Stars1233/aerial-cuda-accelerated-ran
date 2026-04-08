@@ -1,5 +1,9 @@
 # cubb_scripts
 
+## Installation
+
+See [install/README.md](install/README.md) for Aerial SDK installation and make targets. At the moment the installation only supports DGX Spark.
+
 ## Dependencies
 <p>pyyaml (https://pypi.org/project/PyYAML/) <p>
 <p>h5py (https://docs.h5py.org/en/latest/build.html)<p>

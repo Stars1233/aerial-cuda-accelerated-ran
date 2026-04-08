@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,26 +43,35 @@ public:
         }
 
         mempool = nv_ipc_mempool_open(primary, name, sizeof(T), length, -1);
-        if (mempool == nullptr) {
-            // throw std::runtime_error(std::string("Create lock-free memory pool failed")); 
-        }
     }
 
     T* alloc() {
+        if (mempool == nullptr) {
+            return nullptr;
+        }
         int32_t index = mempool->alloc(mempool);
         return reinterpret_cast<T*>(mempool->get_addr(mempool, index));
     }
 
     int free(T* buf) {
+        if (mempool == nullptr) {
+            return -1;
+        }
         int32_t index = mempool->get_index(mempool, buf);
         return  mempool->free(mempool, index);
     }
 
     int get_pool_len(T* buf) {
+        if (mempool == nullptr) {
+            return -1;
+        }
         return  mempool->get_pool_len(mempool);
     }
 
     int get_free_count(T* buf) {
+        if (mempool == nullptr) {
+            return -1;
+        }
         return  mempool->get_free_count(mempool);
     }
 
@@ -73,14 +82,14 @@ public:
     }
 
 private:
-    nv_ipc_mempool_t* mempool;
+    nv_ipc_mempool_t* mempool = nullptr;
 };
 
 /* There's a object memory pool and a ring queue inside the ring */
 template <typename T>
 class lock_free_ring_pool {
 public:
-    lock_free_ring_pool(const char* name, uint32_t length, size_t buf_size = sizeof(T), uint32_t flags = LOCK_FREE_OPT_APP_INTERNAL) {
+    lock_free_ring_pool(const char* name, uint32_t length, uint32_t buf_size = sizeof(T), uint32_t flags = LOCK_FREE_OPT_APP_INTERNAL) {
         ring_type_t type;
         if (flags == LOCK_FREE_OPT_SHM_PRIMARY) {
             type = RING_TYPE_SHM_PRIMARY;
@@ -91,57 +100,81 @@ public:
         }
 
         ring = nv_ipc_ring_open(type, name, length, buf_size);
-        if (ring == nullptr) {
-            throw std::runtime_error(std::string("Create lock-free ring failed")); 
-        }
     }
 
     // Allocate a buffer from the memory pool. Return nullptr if the memory pool is empty
     T* alloc() {
+        if (ring == nullptr) {
+            return nullptr;
+        }
         int32_t index = ring->alloc(ring);
         return index < 0 ? nullptr : reinterpret_cast<T*>(ring->get_addr(ring, index));
     }
 
     // Free the buffer back to the memory pool
     int free(T* buf) {
+        if (ring == nullptr) {
+            return -1;
+        }
         int32_t index = ring->get_index(ring, buf);
         return ring->free(ring, index);
     }
 
     // Enqueue the buffer pointer into the ring queue
     int enqueue(T* buf) {
+        if (ring == nullptr) {
+            return -1;
+        }
         int32_t index = ring->get_index(ring, buf);
         return ring->enqueue_by_index(ring, index);
     }
 
     // Dequeue a buffer pointer from ring queue. Return nullptr if the ring queue is empty
     T* dequeue() {
+        if (ring == nullptr) {
+            return nullptr;
+        }
         int32_t index = ring->dequeue_by_index(ring);
         return reinterpret_cast<T*>(ring->get_addr(ring, index));
     }
 
     // Automatically allocate a buffer, copy the source object into the buffer, and enqueue the buffer pointer to the ring pool
     int copy_enqueue(T* obj) {
+        if (ring == nullptr) {
+            return -1;
+        }
         return ring->enqueue(ring, obj);
     }
 
     // Automatically dequeue a buffer pointer from the ring queue, copy to the destination buffer, and free the source buffer to the memory pool
     int copy_dequeue(T* obj) {
+        if (ring == nullptr) {
+            return -1;
+        }
         return ring->dequeue(ring, obj);
     }
 
     // Get the buffer pointer by buffer index
     T* get_buf_addr(int32_t index) {
+        if (ring == nullptr) {
+            return nullptr;
+        }
         return index < 0 ? nullptr : reinterpret_cast<T*>(ring->get_addr(ring, index));
     }
 
     // Get the index pointer by buffer pointer
     int32_t get_buf_index(T* buf) {
+        if (ring == nullptr) {
+            return -1;
+        }
         return ring->get_index(ring, buf);
     }
 
     // Get free buffer count in the ring memory pool
     unsigned int get_free_count() {
+        if (ring == nullptr) {
+            return 0;
+        }
         int free_count = ring->get_free_count(ring);
         return free_count < 0 ? 0 : free_count;
     }
@@ -149,18 +182,27 @@ public:
     // Get enqueued object count
     // ring_len = free_count + enqueued_count only when no flowing buffer (which was allocated but not enqueued).
     unsigned int get_enqueued_count() {
+        if (ring == nullptr) {
+            return 0;
+        }
         int count = ring->get_count(ring);
         return count < 0 ? 0 : count;
     }
 
     // Get the object buffer size
     unsigned int get_buf_size() {
+        if (ring == nullptr) {
+            return 0;
+        }
         int buf_size = ring->get_buf_size(ring);
         return buf_size < 0 ? 0 : buf_size;
     }
 
     // Get the ring length
     unsigned int get_ring_len() {
+        if (ring == nullptr) {
+            return 0;
+        }
         int ring_len = ring->get_ring_len(ring);
         return ring_len < 0 ? 0 : ring_len;
     }
@@ -172,7 +214,7 @@ public:
     }
 
 private:
-    nv_ipc_ring_t* ring;
+    nv_ipc_ring_t* ring = nullptr;
 };
 
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -100,13 +100,13 @@ namespace scf_5g_fapi
     static constexpr uint8_t srs_rep_factor_idx_to_numRepFactor[]={1,2,4};
     static constexpr uint8_t srs_comb_idx_to_combSize[]={2,4,8};
 
-    inline void update_fh_params_pusch(cuphyPuschUeGrpPrm_t& grp, bool is_new_grp, cuphyPuschUePrm_t& ue, scf_fapi_rx_beamforming_t& pmi_bf_pdu, scf_fapi_pusch_pdu_t& msg, cell_sub_command& cell_cmd, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool bf_enabled = false, enum ru_type ru = OTHER_MODE, bool mmimo_enabled=0, nv::slot_detail_t* slot_detail = nullptr, uint32_t bfwUeGrpIndex = 0, int32_t cell_index = 0, uint16_t ul_bandwidth = MAX_N_PRBS_SUPPORTED);
-    inline void update_fh_params_pucch(cuphyPucchUciPrm_t& uci_info, uint16_t prb_size, scf_fapi_rx_beamforming_t& pmi_bf_pdu, cell_sub_command& cmd, bool bf_enabled = false, enum ru_type ru = OTHER_MODE, nv::slot_detail_t* slot_detail = nullptr, bool mmimo_enabled=0, int32_t cell_index = 0, uint16_t ul_bandwidth = MAX_N_PRBS_SUPPORTED);
-    inline void update_fh_params_prach(nv::phy_config& config, nv::prach_addln_config_t& addln_config, scf_fapi_prach_pdu_t& pdu, scf_fapi_rx_beamforming_t & bf_pdu, cell_sub_command& cell_cmd, bool bf_enabled = false, enum ru_type ru = OTHER_MODE, nv::slot_detail_t* slot_detail = nullptr, bool mmimo_enabled=0, int32_t cell_index = 0);
-    inline void update_fh_params_srs(cell_sub_command& cell_cmd, scf_fapi_rx_beamforming_t& pmi_bf_pdu, uint8_t nSrsSym, uint8_t srsStartSym, srs_params *srs_params, bool bf_enabled = false, enum ru_type ru = OTHER_MODE, nv::slot_detail_t* slot_detail = nullptr, int32_t cell_index = 0, bool last_non_prach_pdu = false);
+    inline void update_fh_params_pusch(cuphyPuschUeGrpPrm_t& grp, bool is_new_grp, cuphyPuschUePrm_t& ue, const scf_fapi_rx_beamforming_t& pmi_bf_pdu, const scf_fapi_pusch_pdu_t& msg, cell_sub_command& cell_cmd, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool bf_enabled = false, enum ru_type ru = OTHER_MODE, bool mmimo_enabled=0, nv::slot_detail_t* slot_detail = nullptr, uint32_t bfwUeGrpIndex = 0, int32_t cell_index = 0, uint16_t ul_bandwidth = MAX_N_PRBS_SUPPORTED);
+    inline void update_fh_params_pucch(cuphyPucchUciPrm_t& uci_info, uint16_t prb_size, const scf_fapi_rx_beamforming_t& pmi_bf_pdu, cell_sub_command& cmd, bool bf_enabled = false, enum ru_type ru = OTHER_MODE, nv::slot_detail_t* slot_detail = nullptr, bool mmimo_enabled=0, int32_t cell_index = 0, uint16_t ul_bandwidth = MAX_N_PRBS_SUPPORTED);
+    inline void update_fh_params_prach(nv::phy_config& config, nv::prach_addln_config_t& addln_config, const scf_fapi_prach_pdu_t& pdu, const scf_fapi_rx_beamforming_t & bf_pdu, cell_sub_command& cell_cmd, bool bf_enabled = false, enum ru_type ru = OTHER_MODE, nv::slot_detail_t* slot_detail = nullptr, bool mmimo_enabled=0, int32_t cell_index = 0);
+    // finalize_srs_slot is now declared in the header file
     inline void update_new_coreset(cuphyPdcchCoresetDynPrm_t& coreset, scf_fapi_pdcch_pdu_t& msg, uint8_t testMode, slot_indication & slotinfo, cuphyCellStatPrm_t& cell_params);
     inline bool ifAnySymbolPresent(sym_info_list_t& symbols, uint16_t channelMask);
-    inline int8_t calc_start_prb(scf_fapi_srs_pdu_t& msg, cell_sub_command& cell_cmd, srs_rb_info_t srs_rb_info[], uint8_t& nHops);
+    inline int8_t calc_start_prb(const scf_fapi_srs_pdu_t& msg, cell_sub_command& cell_cmd, srs_rb_info_t srs_rb_info[], uint8_t& nHops);
     inline void merge_srs_prb_interval(srs_rb_info_per_sym_t& interval, srs_rb_info_per_sym_t& final_intervals);
 
     static inline void to_u8_array(uint32_t bchPayload, uint8_t* mib)
@@ -125,7 +125,7 @@ namespace scf_5g_fapi
         return dmrsAddlPosition;
     }
 
-    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, scf_fapi_pusch_pdu_t& msg, int32_t cell_index, slot_indication & slotinfo, int staticPuschSlotNum, uint8_t lbrm, bool bf_enabled, uint16_t cell_stat_prm_idx, float dtx_threshold, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t* slot_detail, uint16_t ul_bandwidth) {
+    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_pusch_pdu_t& msg, int32_t cell_index, slot_indication & slotinfo, int staticPuschSlotNum, uint8_t lbrm, bool bf_enabled, uint16_t cell_stat_prm_idx, float dtx_threshold, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t* slot_detail, uint16_t ul_bandwidth) {
 
         cell_sub_cmd.slot.type = SLOT_UPLINK;
         cell_sub_cmd.slot.slot_3gpp = slotinfo;
@@ -240,7 +240,10 @@ namespace scf_5g_fapi
         ue.ueGrpIdx = ueGrpIndex;
         ue.pUeGrpPrm = &info->ue_grp_info[ueGrpIndex];
         
-        ue.foForgetCoeff = 0.0f; // Default value, will be updated if extension is present
+        // Default value, will be updated if extension is present
+        ue.foForgetCoeff = 0.0f; 
+        ue.ldpcEarlyTerminationPerUe = 0;
+        ue.ldpcMaxNumItrPerUe = 10;
 
         // update UE Group - no group present use 0 as default
         auto& ue_grp = info->ue_grp_info[ueGrpIndex];
@@ -271,11 +274,11 @@ namespace scf_5g_fapi
         auto& cell_grp_info         = info->cell_grp_info;
         cell_grp_info.nUes++;
 
-        uint8_t* next = &msg.payload[0];
+        const uint8_t* next = &msg.payload[0];
         ue.pduBitmap = msg.pdu_bitmap;
         // Data expected on PUSCH
         if (msg.pdu_bitmap & 0x1) {
-            auto data = reinterpret_cast<scf_fapi_pusch_data_t*>(next);
+            auto data = reinterpret_cast<const scf_fapi_pusch_data_t*>(next);
             ue.rv = data->rv_index;
             info->ue_tb_size[pusch_ue_idx] = data->tb_size;
             ue.TBSize = data->tb_size;
@@ -289,7 +292,7 @@ namespace scf_5g_fapi
 
         // PUSCH UCI Data
         if (msg.pdu_bitmap & 0x2) {
-            auto data = reinterpret_cast<scf_fapi_pusch_uci_t*>(next);
+            auto data = reinterpret_cast<const scf_fapi_pusch_uci_t*>(next);
             ue.pUciPrms = &info->uci_info[pusch_ue_idx];
             auto uci_prms = ue.pUciPrms;
             uci_prms->nBitsHarq = data->harq_ack_bit_length;
@@ -331,7 +334,7 @@ namespace scf_5g_fapi
             ue.enableTfPrcd = 1;
             if (msg.pdu_bitmap & 0x8)
             {
-                auto dftsofdm = reinterpret_cast<scf_fapi_pusch_dftsofdm_t*>(next);
+                auto dftsofdm = reinterpret_cast<const scf_fapi_pusch_dftsofdm_t*>(next);
                 ue.lowPaprGroupNumber = dftsofdm->lowPaprGroupNumber;
                 ue.lowPaprSequenceNumber = dftsofdm->lowPaprSequenceNumber;
                 ue.groupOrSequenceHopping = 0; //no use
@@ -344,7 +347,7 @@ namespace scf_5g_fapi
         }
 
         // BEAMFORMING CONFIGS
-        auto& bf = *reinterpret_cast<scf_fapi_rx_beamforming_t*>(next);
+        const auto& bf = *reinterpret_cast<const scf_fapi_rx_beamforming_t*>(next);
         nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
         auto & mplane_info = phyDriver.getMPlaneConfig(cell_index);
         ru_type ru = mplane_info.ru;
@@ -358,6 +361,15 @@ namespace scf_5g_fapi
         }
         
         ue_grp.prgSize = bf.prg_size;
+        
+        if((mmimo_enabled) && ((ue_grp.prgSize==1) || (ue_grp.prgSize==2) || (ue_grp.prgSize==3) || (ue_grp.prgSize==4)))
+        {
+            ue_grp.enablePerPrgChEstPerUeg = 1;
+        }
+        else
+        {
+            ue_grp.enablePerPrgChEstPerUeg = 0;
+        }
         
         update_fh_params_pusch(ue_grp, newUeGrp, ue, bf, msg, cell_sub_cmd, bfwCoeff_mem_info, bf_enabled, ru, mmimo_enabled, slot_detail,bfwUeGrpIndex, cell_index, ul_bandwidth);
         if (mmimo_enabled == 0 || bf.dig_bf_interfaces!= 0)
@@ -375,7 +387,7 @@ namespace scf_5g_fapi
 
         // PUSCH Maintenance Parameters
     #ifdef SCF_FAPI_10_04
-        auto maintenance = reinterpret_cast<scf_fapi_pusch_maintenance_t*>(next);
+        auto maintenance = reinterpret_cast<const scf_fapi_pusch_maintenance_t*>(next);
         next += sizeof(scf_fapi_pusch_maintenance_t);
 
         // Defualts for CSIP2
@@ -388,7 +400,7 @@ namespace scf_5g_fapi
         }
 
         if (isCsiP2Signaled && msg.pdu_bitmap & 0x2) {
-            auto csip2_info = reinterpret_cast<scf_uci_csip2_info_t*> (next);
+            auto csip2_info = reinterpret_cast<const scf_uci_csip2_info_t*> (next);
             auto numparts = csip2_info->numPart2s;
             NVLOGD_FMT(TAG, "CSI P2 numParts {} pusch_ue_idx {}", numparts, pusch_ue_idx);
             ue.pUciPrms = &info->uci_info[pusch_ue_idx];
@@ -402,12 +414,12 @@ namespace scf_5g_fapi
                 pUciPrms->pCalcCsi2SizePrms = &info->csip2_v3_params[pusch_ue_idx * CUPHY_MAX_N_CSI2_REPORTS_PER_UE];
                 size_t offset = 0;
                 for (int i = 0; i <  csip2_info->numPart2s; i++) {
-                    auto csip2_part = reinterpret_cast<scf_uci_csip2_part_t*>(next + offset);
+                    auto csip2_part = reinterpret_cast<const scf_uci_csip2_part_t*>(next + offset);
                     auto num1PartParams = csip2_part->numPart1Params;
 
                     offset += sizeof(scf_uci_csip2_part_t) ;
-                    auto csip2_part_offset = reinterpret_cast<scf_uci_csip2_part_param_offset_t*>(next + offset);
-                    auto csip2_part_size_offset = reinterpret_cast<scf_uci_csip2_part_param_size_t*>(next + offset + csip2_part->numPart1Params *  sizeof(uint16_t));
+                    auto csip2_part_offset = reinterpret_cast<const scf_uci_csip2_part_param_offset_t*>(next + offset);
+                    auto csip2_part_size_offset = reinterpret_cast<const scf_uci_csip2_part_param_size_t*>(next + offset + csip2_part->numPart1Params *  sizeof(uint16_t));
 
                     for ( uint16_t j = 0; j < csip2_part->numPart1Params; j++) {
                             pUciPrms->pCalcCsi2SizePrms[i].prmOffsets[j] = reinterpret_cast<uint16_t>(csip2_part_offset->paramOffsets[j]);
@@ -416,7 +428,7 @@ namespace scf_5g_fapi
                     }
 
                     offset +=  csip2_part->numPart1Params * ((sizeof(uint16_t) + sizeof(uint8_t)));
-                    auto csip2_part_scope = reinterpret_cast<scf_uci_csip2_part_scope_t*>(&csip2_info->payload[0] + offset);
+                    auto csip2_part_scope = reinterpret_cast<const scf_uci_csip2_part_scope_t*>(&csip2_info->payload[0] + offset);
 
                     pUciPrms->pCalcCsi2SizePrms[i].nPart1Prms = num1PartParams;
                     pUciPrms->pCalcCsi2SizePrms[i].csi2sizeMapIdx = csip2_part_scope->part2SizeMapIndex;
@@ -430,9 +442,11 @@ namespace scf_5g_fapi
         }
 
         if (phyDriver.l1_get_enable_weighted_average_cfo()) {    // PUSCH Extension  
-            auto puschExtension = reinterpret_cast<scf_fapi_pusch_extension_t*>(next);
+            auto puschExtension = reinterpret_cast<const scf_fapi_pusch_extension_t*>(next);
             // PUSCH Extension for weighted average CFO estimation
             ue.foForgetCoeff = static_cast<float>(puschExtension->fo_forget_coeff) / 100.0f;
+            ue.ldpcEarlyTerminationPerUe = puschExtension->ldpc_early_termination;
+            ue.ldpcMaxNumItrPerUe = puschExtension->n_iterations;
             NVLOGD_FMT(TAG, "PUSCH Extension for weighted average CFO estimation {} LDPC n_iterations {} ldpc_early_termination {} ", 
                 ue.foForgetCoeff, puschExtension->ldpc_early_termination, puschExtension->n_iterations);
             next += sizeof(scf_fapi_pusch_extension_t);
@@ -532,7 +546,7 @@ namespace scf_5g_fapi
         }
     }
 
-    void update_cell_command(cell_group_command* grp, cell_sub_command& cell_cmd, slot_indication & slotinfo, scf_fapi_prach_pdu_t& req, nv::phy_config& cell_params, nv::prach_addln_config_t& addln_config, 
+    void update_cell_command(cell_group_command* grp, cell_sub_command& cell_cmd, slot_indication & slotinfo, const scf_fapi_prach_pdu_t& req, nv::phy_config& cell_params, nv::prach_addln_config_t& addln_config,
                              int32_t cell_index, bool bf_enabled, nv::slot_detail_t*  slot_detail, bool mmimo_enabled) {
         //cell_cmd.create_if(channel_type::PRACH);
 	    cell_cmd.slot.type = SLOT_UPLINK;
@@ -566,7 +580,7 @@ namespace scf_5g_fapi
         update_fh_params_prach(cell_params, addln_config, req, req.beam_index, cell_cmd, bf_enabled, ru, slot_detail,mmimo_enabled, cell_index);
     }
 
-    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, slot_indication & slotinfo, scf_fapi_pucch_pdu_t& pdu, int32_t cell_index, const nv::pucch_dtx_t_list& dtx_thresholds,
+    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, slot_indication & slotinfo, const scf_fapi_pucch_pdu_t& pdu, int32_t cell_index, const nv::pucch_dtx_t_list& dtx_thresholds,
                              uint16_t cell_stat_prm_idx, nv::phy_config_option& config_option, nv::slot_detail_t*  slot_detail, bool mmimo_enabled, uint16_t ul_bandwidth, uint16_t pucch_hopping_id)
     {
         // cell_sub_cmd.create_if(channel_type::PUCCH);
@@ -703,10 +717,10 @@ namespace scf_5g_fapi
         auto & mplane_info = phyDriver.getMPlaneConfig(cell_index);
         ru_type ru = mplane_info.ru;
 
-        update_fh_params_pucch(uci_info, pdu.prb_size, *reinterpret_cast<scf_fapi_rx_beamforming_t*>(&pdu.payload[0]),cell_sub_cmd, config_option.bf_enabled, ru, slot_detail,mmimo_enabled, cell_index, ul_bandwidth);
+        update_fh_params_pucch(uci_info, pdu.prb_size, *reinterpret_cast<const scf_fapi_rx_beamforming_t*>(&pdu.payload[0]),cell_sub_cmd, config_option.bf_enabled, ru, slot_detail,mmimo_enabled, cell_index, ul_bandwidth);
     }
 
-int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, scf_fapi_srs_pdu_t& msg, int32_t cell_index, slot_indication & slotinfo, cuphyCellStatPrm_t cell_params, uint16_t cell_stat_prm_idx,
+int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_srs_pdu_t& msg, int32_t cell_index, slot_indication & slotinfo, cuphyCellStatPrm_t cell_params, uint16_t cell_stat_prm_idx,
                                     bool bf_enabled, size_t nvIpcAllocBuffLen, int *p_srs_ind_index, int mutiple_srs_ind_allowed, nv::phy_mac_transport& transport, bool is_last_srs_pdu, bool is_last_non_prach_pdu, nv::slot_detail_t*  slot_detail,
                                     bool mmimo_enabled)
 {
@@ -718,16 +732,16 @@ int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell
     }
 
 #ifdef SCF_FAPI_10_04_SRS
-    uint8_t* next = &msg.payload[0];
+    const uint8_t* next = &msg.payload[0];
     /* It is optional for L2 to encode Rx Beamforming PDU, so L1 needs to check if it's present and if present then decode it */
-    scf_fapi_rx_beamforming_t* srs_rx_bf = reinterpret_cast<scf_fapi_rx_beamforming_t*>(next);
+    const scf_fapi_rx_beamforming_t* srs_rx_bf = reinterpret_cast<const scf_fapi_rx_beamforming_t*>(next);
 
     /* If TRP scheme is 0, then beamforming PDU is present, if it's not present then the next byte will be in the range of [4,272]*/
     if(srs_rx_bf->trp_scheme == 0) {
        next += (sizeof(scf_fapi_rx_beamforming_t) + (sizeof(uint16_t) * srs_rx_bf->num_prgs * srs_rx_bf->dig_bf_interfaces));
     }
 
-    scs_fapi_v4_srs_params_t* srs_v4_parms = reinterpret_cast<scs_fapi_v4_srs_params_t*>(next);
+    const scs_fapi_v4_srs_params_t* srs_v4_parms = reinterpret_cast<const scs_fapi_v4_srs_params_t*>(next);
 
     if (srs_v4_parms->rep_scope != 0)
     {
@@ -801,20 +815,33 @@ int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell
 
     srs_rb_info_t srs_rb_info[MAX_SRS_SYM]={{0}};
     uint8_t nHops = 0;
-    uint16_t prgSize = 0;
+    uint16_t prgSize = MIN_PRG_SIZE;
+    uint16_t prgSizeL2 = MIN_PRG_SIZE;
     uint16_t num_sym_info = calc_start_prb(msg, cell_sub_cmd, srs_rb_info, nHops);
 #ifdef SCF_FAPI_10_04_SRS
-    /* PRG SIZE in SRS PDU can be set to only 1 or 2 or 4. One of these values can only supported from the cuPHY perspective. */
+    // PRG SIZE in SRS PDU can be set to any integer value between 1 and 272;
+    // The input of prgSize for the cuPHY internal processing should be 1, 2, or 4;
+    // If PRG SIZE in SRS PDU is greater than 4 or equal to 3, then prgSize will be set to 2; otherwise prgSize will be equal to PRG SIZE in SRS PDU;
     NVLOGD_FMT(TAG, "{}: PRG SIZE in SRS PDU set to {}", __func__, static_cast<uint16_t>(srs_v4_parms->prg_size));
-    prgSize = srs_v4_parms->prg_size;
+    prgSizeL2 = std::max(prgSizeL2, srs_v4_parms->prg_size);
+    if((prgSizeL2 > 4) || (prgSizeL2 == 3))
+    {
+        prgSize = 2;
+    }
+    else
+    {
+        prgSize = prgSizeL2;
+    }
 #else
-    /* For FAPI 10_02, PRG SIZE is set to 1. This field is not presnt in FAPI 10.02 SRS PDU but is mandatorily needed by cuPHY module.*/
+    /* For FAPI 10_02, PRG SIZE is set to 1. This field is not present in FAPI 10.02 SRS PDU but is mandatorily needed by cuPHY module.*/
     prgSize = MIN_PRG_SIZE;
+    prgSizeL2 = MIN_PRG_SIZE;
 #endif
-
+    
+    uint16_t num_prg_l2 = (nHops * srs_rb_info[0].num_srs_prbs)/prgSizeL2;
     uint16_t num_prg = (nHops * srs_rb_info[0].num_srs_prbs)/prgSize;
 
-    if((srs_params->srs_indications[srs_params->cell_grp_info.nCells-1][*p_srs_ind_index].data_len + (sizeof(scf_fapi_norm_ch_iq_matrix_info_t) + (srs_ant_idx_to_port[msg.num_ant_ports] * num_prg * cell_params.nRxAntSrs * IQ_REPR_32BIT_NORMALIZED_IQ_SIZE_4))) >= nvIpcAllocBuffLen)
+    if((srs_params->srs_indications[srs_params->cell_grp_info.nCells-1][*p_srs_ind_index].data_len + (sizeof(scf_fapi_norm_ch_iq_matrix_info_t) + (srs_ant_idx_to_port[msg.num_ant_ports] * num_prg_l2 * cell_params.nRxAntSrs * IQ_REPR_32BIT_NORMALIZED_IQ_SIZE_4))) >= nvIpcAllocBuffLen)
     {
         /* FAPI 10.04 supports splitting of SRS reports to L2 into multiple SRS IND's. 
          * Incase the mutiple SRS IND's is configured by L2 in Cell Config PDU then L1 will send multiple SRS IND's for the SRS_PDU's requested by L2 in UL_TTI.request. 
@@ -873,7 +900,7 @@ int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell
     ue.chEstBuffIdx = srs_ue_idx;
     ue.rnti = msg.rnti;
     ue.handle = msg.handle;
-    ue.prgSize = prgSize;
+    ue.prgSize = prgSizeL2;
     ue.usage = SRS_REPORT_FOR_BEAM_MANAGEMENT; /* This field is not present in FAPI 10.02. Hence setting default value for FAPI 10.02 */
     ue.nValidPrg = num_prg;
     ue.startValidPrg = floor(srs_rb_info[0].srs_start_prbs/prgSize);
@@ -975,17 +1002,17 @@ int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell
     /* update the start address of channel estimation write */
     srs_params->srs_chest_buffer[cell_grp_info.nSrsUes] = (uint8_t*)(p_desc->data_buf) + sizeof(uint8_t)*(p_desc->data_len);
     /* Adding the sizeof header plus the IQ sample length */
-    p_desc->data_len += (ue.nAntPorts * num_prg * cell_params.nRxAntSrs * IQ_REPR_32BIT_NORMALIZED_IQ_SIZE_4);
+    p_desc->data_len += (ue.nAntPorts * num_prg_l2 * cell_params.nRxAntSrs * IQ_REPR_32BIT_NORMALIZED_IQ_SIZE_4);
 
     cell_grp_info.nSrsUes++;
     srs_params->srs_ue_per_cell[srs_params->cell_grp_info.nCells-1].cell_idx = cell_index;
     srs_params->srs_ue_per_cell[srs_params->cell_grp_info.nCells-1].num_srs_ues++;
 
-    NVLOGD_FMT(TAG,"{}: Cell={} store_idx={} num_srs_ues_per_cell={} srs_chest_buffer[{}]:{} data_len={} nAntPorts={} prg_size={} gnb_ant={}, nHops={} num_sym_info {} srs_ind_index={}",
+    NVLOGD_FMT(TAG,"{}: Cell={} store_idx={} num_srs_ues_per_cell={} srs_chest_buffer[{}]:{} data_len={} nAntPorts={} prg_size_l2={} gnb_ant={}, nHops={} num_sym_info {} srs_ind_index={}",
                     __func__, cell_index, srs_params->cell_grp_info.nCells-1, srs_params->srs_ue_per_cell[srs_params->cell_grp_info.nCells-1].num_srs_ues,
                     cell_grp_info.nSrsUes,reinterpret_cast<void*>(srs_params->srs_chest_buffer[cell_grp_info.nSrsUes]),
                     srs_params->srs_indications[srs_params->cell_grp_info.nCells-1][*p_srs_ind_index].data_len,
-                    static_cast<int>(ue.nAntPorts), static_cast<uint16_t>(num_prg), static_cast<uint16_t>(cell_params.nRxAntSrs), static_cast<uint8_t>(nHops),
+                    static_cast<int>(ue.nAntPorts), static_cast<uint16_t>(num_prg_l2), static_cast<uint16_t>(cell_params.nRxAntSrs), static_cast<uint8_t>(nHops),
                     static_cast<uint8_t>(num_sym_info), *p_srs_ind_index);
 
     nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
@@ -1009,7 +1036,7 @@ int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell
 
     if (is_last_srs_pdu)
     {
-        update_fh_params_srs(cell_sub_cmd, *srs_rx_bf, cell_info->nSrsSym, cell_info->srsStartSym, srs_params, bf_enabled, ru, slot_detail, cell_index, is_last_non_prach_pdu);
+        finalize_srs_slot(cell_sub_cmd, *srs_rx_bf, cell_info->nSrsSym, cell_info->srsStartSym, srs_params, bf_enabled, ru, slot_detail, cell_index, is_last_non_prach_pdu);
     }
 
     srs_params->scf_ul_tti_handle_list.push_back(msg.handle);
@@ -1023,7 +1050,7 @@ int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell
 #ifdef SCF_FAPI_10_04
 void update_cell_command(cell_group_command* cell_grp_cmd,
                          cell_sub_command& cell_sub_cmd,
-                         scf_fapi_dl_bfw_group_config_t& bfw_msg,
+                         const scf_fapi_dl_bfw_group_config_t& bfw_msg,
                          int32_t cell_index,
                          slot_indication & slotinfo,
                          cuphyCellStatPrm_t cell_params,
@@ -1069,7 +1096,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
     uint8_t ueAntIdx = 0;
 
     nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-    uint8_t* next = &bfw_msg.dl_bfw_cvi_config.payload[0];
+    const uint8_t* next = &bfw_msg.dl_bfw_cvi_config.payload[0];
 
     ue.beamIdOffset = (bfwType == slot_command_api::UL_BFW) ? -1 : phyDriver.l1_getDynamicBeamIdOffset(cell_index);
     //NVLOGC_FMT(TAG, "{} line {}: SFN={}:SLOT:{}  ue.beamIdOffset {}", __FUNCTION__, __LINE__,cell_grp_cmd->slot.slot_3gpp.sfn_, cell_grp_cmd->slot.slot_3gpp.slot_, ue.beamIdOffset);
@@ -1082,7 +1109,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         uint16_t srsStartPrg    = 0;
         uint16_t srsStartValidPrg = 0;
         uint16_t srsNValidPrg   = 0;
-        scf_dl_bfw_config_start_t& bfw_config_start  = *reinterpret_cast<scf_dl_bfw_config_start_t*>(next);
+        const scf_dl_bfw_config_start_t& bfw_config_start  = *reinterpret_cast<const scf_dl_bfw_config_start_t*>(next);
         srsChestBufferIndexL2 = static_cast<uint16_t>((bfw_config_start.handle >> 8) & 0xFFFF);
         cuphyTensorDescriptor_t srsDescr = NULL;
 
@@ -1146,7 +1173,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                         static_cast<uint16_t>(bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].pdu_idx),
                         static_cast<uint16_t>(bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].rnti));
 
-        uint8_t* ue_ant_idx = &bfw_config_start.payload[0];
+        const uint8_t* ue_ant_idx = &bfw_config_start.payload[0];
         for (ueAntIdx = 0; ueAntIdx < bfw_config_start.num_ue_ants; ueAntIdx++)
         {
             bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx + ue.nBfLayers].chEstInfoBufIdx = ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx;
@@ -1195,15 +1222,8 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         }
         else
         {
-            if(1)
-            {
-                NVLOGF_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: memory not available for storing bfwCoeff, exit at SFN={}:SLOT:{}",
-                    __FUNCTION__, __LINE__,cell_grp_cmd->slot.slot_3gpp.sfn_, cell_grp_cmd->slot.slot_3gpp.slot_);
-            }
-            else
-            {
-                NVLOGC_FMT(TAG, "{} line {}: memory not available for storing bfwCoeff", __FUNCTION__, __LINE__);
-            }
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: SFN {}.{} memory not available for storing bfwCoeff",
+                __FUNCTION__, __LINE__, cell_grp_cmd->slot.slot_3gpp.sfn_, cell_grp_cmd->slot.slot_3gpp.slot_);
         }
         ue.pBfLayerPrm = &bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx];
         bfw_params->prevUeGrpPerLayerInfoBufIdx += ue.nBfLayers;
@@ -1214,7 +1234,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         bfw_params->nue_grps_per_cell[cell_index]++;
         if(bfw_params->nue_grps_per_cell[cell_index] > CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS)
         {
-            NVLOGF_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: bfw_params->nue_grps_per_cell[{}]:{} > CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS:{}",
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: bfw_params->nue_grps_per_cell[{}]:{} > CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS:{}",
                 __FUNCTION__, __LINE__, cell_index, bfw_params->nue_grps_per_cell[cell_index], CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS);
             return;
         }
@@ -1296,8 +1316,8 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         return dmrsBmsk;
     }
 
-    inline void update_fh_params_pusch(cuphyPuschUeGrpPrm_t& grp, bool is_new_grp, cuphyPuschUePrm_t& ue, scf_fapi_rx_beamforming_t& pmi_bf_pdu,
-                    scf_fapi_pusch_pdu_t& msg, cell_sub_command& cell_cmd, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool bf_enabled, enum ru_type ru,
+    inline void update_fh_params_pusch(cuphyPuschUeGrpPrm_t& grp, bool is_new_grp, cuphyPuschUePrm_t& ue, const scf_fapi_rx_beamforming_t& pmi_bf_pdu,
+                    const scf_fapi_pusch_pdu_t& msg, cell_sub_command& cell_cmd, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool bf_enabled, enum ru_type ru,
                     bool mmimo_enabled, nv::slot_detail_t *slot_detail, uint32_t bfwUeGrpIndex, int32_t cell_index, uint16_t ul_bandwidth) {
         auto sym_prbs{cell_cmd.sym_prb_info()};
         auto& prbs{sym_prbs->prbs};
@@ -1337,7 +1357,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                 prb_info.common.portMask = (1 << pmi_bf_pdu.dig_bf_interfaces) -1;
             }
             else if (mmimo_enabled && pmi_bf_pdu.dig_bf_interfaces == 0) {
-                prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                 //NVLOGD_FMT(TAG, "{}:{} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
                 track_eaxcids_fh(ue, prb_info.common);
             }
@@ -1401,14 +1421,14 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
 
                 if (iter != idxlist.end()){
                     auto& prb{prbs[*iter]};
-                            prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                            prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                             //NVLOGD_FMT(TAG, "{}:{} not pm_enabled prb_info.common.portMask {}, ue.dmrsPortBmsk {}, ue.scid {}", __FILE__, __LINE__, static_cast<uint32_t>(prb.common.portMask), static_cast<uint64_t>(ue.dmrsPortBmsk), ue.scid);
                             track_eaxcids_fh(ue, prb.common);
                     }
         }
     }
 
-    inline void update_fh_params_pucch(cuphyPucchUciPrm_t& uci_info, uint16_t prb_size, scf_fapi_rx_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, bool bf_enabled,
+    inline void update_fh_params_pucch(cuphyPucchUciPrm_t& uci_info, uint16_t prb_size, const scf_fapi_rx_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, bool bf_enabled,
                                        enum ru_type ru, nv::slot_detail_t* slot_detail, bool mmimo_enabled, int32_t cell_index, uint16_t ul_bandwidth) {
         auto sym_prbs{cell_cmd.sym_prb_info()};
         auto& prbs{sym_prbs->prbs};
@@ -1520,7 +1540,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
 
                 if(bf_enabled)
                 {
-                    update_beam_list(prb_info2.beams_array, prb_info2.beams_array_size, pmi_bf_pdu, mmimo_enabled, prb_info, cell_index);
+                    update_beam_list(prb_info2.beams_array, prb_info2.beams_array_size, pmi_bf_pdu, mmimo_enabled, prb_info2, cell_index);
                 }
                 prb_info2.common.numSymbols = secondHopNsym;
                 if ( mmimo_enabled && pmi_bf_pdu.dig_bf_interfaces != 0){
@@ -1532,7 +1552,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         }
     }
 
-    inline void update_fh_params_prach(nv::phy_config& config, nv::prach_addln_config_t& addln_config, scf_fapi_prach_pdu_t& pdu, scf_fapi_rx_beamforming_t & bf_pdu, cell_sub_command& cell_cmd,
+    inline void update_fh_params_prach(nv::phy_config& config, nv::prach_addln_config_t& addln_config, const scf_fapi_prach_pdu_t& pdu, const scf_fapi_rx_beamforming_t & bf_pdu, cell_sub_command& cell_cmd,
                                        bool bf_enabled, enum ru_type ru, nv::slot_detail_t* slot_detail, bool mmimo_enabled, int32_t cell_index) {
         uint8_t n_ra_t{pdu.num_prach_ocas};
         uint8_t l0{pdu.prach_start_symbol};
@@ -1589,7 +1609,8 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         }
     }
 
-    inline void update_fh_params_srs(cell_sub_command& cell_cmd, scf_fapi_rx_beamforming_t& pmi_bf_pdu,
+    // Moved out of anonymous namespace to allow external access for finalization when last PDU is dropped
+    void finalize_srs_slot(cell_sub_command& cell_cmd, const scf_fapi_rx_beamforming_t& pmi_bf_pdu,
         uint8_t nSrsSym, uint8_t srsStartSym, srs_params *srs_params,
         bool bf_enabled, enum ru_type ru, nv::slot_detail_t* slot_detail, int32_t cell_index, bool last_non_prach_pdu)
     {
@@ -1674,7 +1695,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         }
     }
 
-    inline int8_t calc_start_prb(scf_fapi_srs_pdu_t& msg, cell_sub_command& cell_cmd, srs_rb_info_t srs_rb_info[], uint8_t& nHops)
+    inline int8_t calc_start_prb(const scf_fapi_srs_pdu_t& msg, cell_sub_command& cell_cmd, srs_rb_info_t srs_rb_info[], uint8_t& nHops)
     {
         uint16_t hopStartPrbs[MAX_SRS_SYM] = {0};
         uint16_t numPrbs[MAX_SRS_SYM] = {0};

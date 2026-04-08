@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -98,6 +98,9 @@ phy_mac_transport::phy_mac_transport(yaml::node node_config, nv_ipc_module_t mod
     {
         throw std::runtime_error("Error returned from create_nv_ipc_interface()");
     }
+
+    // Check if all necessary data memory pools (cpu_data and cpu_large) are host pinned memory
+    nv_ipc_check_host_pinned_memory(ipc_.get());
 
     nv_ipc_set_reset_callback(ipc_.get(), transport_reset_callback, this);
 
@@ -227,9 +230,11 @@ void phy_mac_transport::rx_release(phy_mac_msg_desc& msg_desc)
 {
     if(0 != ipc_->rx_release(ipc_.get(), &msg_desc))
     {
-        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}[{}]: error: cell_id={} msg_id=0x{:02X} msg_buf={} data_buf={}",
-                __FUNCTION__, transport_id, msg_desc.cell_id, msg_desc.msg_id, msg_desc.msg_buf, msg_desc.data_buf);
-        throw std::runtime_error("phy_mac_transport::rx_release() failure");
+        sfn_slot_t ss_msg = nv_ipc_get_sfn_slot(&msg_desc);
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: error: transport_id={} SFN {}.{} cell_id={} msg_id=0x{:02X} msg_buf={} data_buf={} ts_send={}",
+                __FUNCTION__, transport_id, ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, msg_desc.msg_id, msg_desc.msg_buf, msg_desc.data_buf, get_ts_send(msg_desc));
+        throw std::runtime_error(fmt::format("{}: error: transport_id={} SFN {}.{} cell_id={} msg_id=0x{:02X} msg_buf={} data_buf={} ts_send={}",
+                __FUNCTION__, transport_id, ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, msg_desc.msg_id, msg_desc.msg_buf, msg_desc.data_buf, get_ts_send(msg_desc)));
     }
 }
 
@@ -239,7 +244,11 @@ void phy_mac_transport::tx_release(phy_mac_msg_desc& msg_desc)
 {
     if(0 != ipc_->tx_release(ipc_.get(), &msg_desc))
     {
-        throw std::runtime_error("phy_mac_transport::tx_release() failure");
+        sfn_slot_t ss_msg = nv_ipc_get_sfn_slot(&msg_desc);
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: error: transport_id={} SFN {}.{} cell_id={} msg_id=0x{:02X} msg_buf={} data_buf={} ts_send={}",
+            __FUNCTION__, transport_id, ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, msg_desc.msg_id, msg_desc.msg_buf, msg_desc.data_buf, get_ts_send(msg_desc));
+        throw std::runtime_error(fmt::format("{}: error: transport_id={} SFN {}.{} cell_id={} msg_id=0x{:02X} msg_buf={} data_buf={} ts_send={}",
+                __FUNCTION__, transport_id, ss_msg.u16.sfn, ss_msg.u16.slot, msg_desc.cell_id, msg_desc.msg_id, msg_desc.msg_buf, msg_desc.data_buf, get_ts_send(msg_desc)));
     }
 }
 

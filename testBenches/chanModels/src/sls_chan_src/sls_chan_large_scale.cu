@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -125,6 +125,79 @@ inline float calculateRMaLosPathloss(float d_2d, float d_3d, float h_bs, float h
     return pl;
 }
 
+// ============================================================================
+// Aerial UE Path Loss Functions (3GPP TR 36.777 Table B-2)
+// Height-dependent formulas with applicability ranges
+// ============================================================================
+
+// Common term: 20*log10(40*π*fc/3) where fc is in GHz
+// = 20*log10(40*π/3) + 20*log10(fc) ≈ 32.44 + 20*log10(fc)
+inline float calcFreqTerm(float fc) {
+    constexpr float CONST_TERM = 32.44f;  // 20*log10(40*π/3)
+    return CONST_TERM + 20.0f * std::log10(fc);
+}
+
+// RMa-AV LOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (10m, 300m], d_2D ≤ 10km:
+// PL = max(23.9 - 1.8*log10(h_UT), 20) * log10(d_3D) + 20*log10(40πfc/3)
+inline float calculateRMaAvLosPathloss(float d_3d, float h_ut, float fc) {
+    // Clamp to TR 36.777 Table B-2 range; replace NaN/non-positive so log10(h_ut) is safe
+    h_ut = std::min(std::max((std::isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 300.0f);
+    float n = std::max(23.9f - 1.8f * std::log10(h_ut), 20.0f);
+    return n * std::log10(d_3d) + calcFreqTerm(fc);
+}
+
+// RMa-AV NLOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (10m, 300m], d_2D ≤ 10km:
+// PL = max(PL_RMa-AV-LOS, -12 + (35 - 5.3*log10(h_UT))*log10(d_3D) + 20*log10(40πfc/3))
+inline float calculateRMaAvNlosPathloss(float d_3d, float h_ut, float fc) {
+    h_ut = std::min(std::max((std::isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 300.0f);
+    float pl_los = calculateRMaAvLosPathloss(d_3d, h_ut, fc);
+    float n = 35.0f - 5.3f * std::log10(h_ut);
+    float pl_nlos = -12.0f + n * std::log10(d_3d) + calcFreqTerm(fc);
+    return std::max(pl_los, pl_nlos);
+}
+
+// UMa-AV LOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (22.5m, 300m], d_2D ≤ 4km:
+// PL = 28.0 + 22*log10(d_3D) + 20*log10(fc)
+inline float calculateUMaAvLosPathloss(float d_3d, float fc) {
+    return 28.0f + 22.0f * std::log10(d_3d) + 20.0f * std::log10(fc);
+}
+
+// UMa-AV NLOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (10m, 100m], d_2D ≤ 4km:
+// PL = -17.5 + (46 - 7*log10(h_UT))*log10(d_3D) + 20*log10(40πfc/3)
+inline float calculateUMaAvNlosPathloss(float d_3d, float h_ut, float fc) {
+    h_ut = std::min(std::max((std::isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 100.0f);
+    float n = 46.0f - 7.0f * std::log10(h_ut);
+    return -17.5f + n * std::log10(d_3d) + calcFreqTerm(fc);
+}
+
+// UMi-AV LOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (22.5m, 300m], d_2D ≤ 4km:
+// PL = max{PL', 30.9 + (22.25 - 0.5*log10(h_UT))*log10(d_3D) + 20*log10(fc)}
+// where PL' is free space path loss
+inline float calculateUMiAvLosPathloss(float d_3d, float h_ut, float fc) {
+    h_ut = std::min(std::max((std::isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 300.0f);
+    // Free space path loss: PL' = 32.4 + 20*log10(d_3D) + 20*log10(fc)
+    float pl_fspl = 32.4f + 20.0f * std::log10(d_3d) + 20.0f * std::log10(fc);
+    float n = 22.25f - 0.5f * std::log10(h_ut);
+    float pl_av = 30.9f + n * std::log10(d_3d) + 20.0f * std::log10(fc);
+    return std::max(pl_fspl, pl_av);
+}
+
+// UMi-AV NLOS path loss per 3GPP TR 36.777 Table B-2
+// h_UT ∈ (22.5m, 300m], d_2D ≤ 4km:
+// PL = max{PL_UMi-AV-LOS, 32.4 + (43.2 - 7.6*log10(h_UT))*log10(d_3D) + 20*log10(fc)}
+inline float calculateUMiAvNlosPathloss(float d_3d, float h_ut, float fc) {
+    h_ut = std::min(std::max((std::isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 300.0f);
+    float pl_los = calculateUMiAvLosPathloss(d_3d, h_ut, fc);
+    float n = 43.2f - 7.6f * std::log10(h_ut);
+    float pl_nlos = 32.4f + n * std::log10(d_3d) + 20.0f * std::log10(fc);
+    return std::max(pl_los, pl_nlos);
+}
+
 // Helper functions for LSP calculation
 inline void calDist(const CellParam& bs, const UtParam& ut, float& d_2d, float& d_3d, float& d_2d_in, float& d_2d_out, float& d_3d_in, float& d_3d_out) {
     // Calculate total 2D distance
@@ -152,7 +225,7 @@ inline void calDist(const CellParam& bs, const UtParam& ut, float& d_2d, float& 
     d_3d_out = d_3d - d_3d_in;
 }
 
-inline float calLosProb(scenario_t scenario, float d_2d_out, float h_ut, const float force_los_prob[2], uint8_t outdoor_ind) {
+inline float calLosProb(scenario_t scenario, float d_2d_out, float h_ut, const float force_los_prob[2], uint8_t outdoor_ind, bool is_aerial = false) {
     // Check if force_los_prob should be used instead of 3GPP calculations
     // force_los_prob[0] for indoor UTs, force_los_prob[1] for outdoor UEs
     float forced_prob = outdoor_ind ? force_los_prob[1] : force_los_prob[0];
@@ -160,68 +233,201 @@ inline float calLosProb(scenario_t scenario, float d_2d_out, float h_ut, const f
         return forced_prob;  // Use forced value instead of 3GPP calculation
     }
     
-    // Use standard 3GPP LOS probability calculations
+    // Use 3GPP LOS probability calculations
+    // For aerial UEs: 3GPP TR 36.777 Table B-1
+    // For terrestrial UEs: 3GPP TR 38.901 Table 7.4.2-1
     float losProb = 0.0f;
-    switch (scenario) {
-        case scenario_t::UMa:
-            assert(h_ut <= 23.0f && "UE height must be less than 23m");
-            if (d_2d_out <= 18.0f) {
-                losProb = 1.0f;
-            } else {
-                float c_prime = h_ut <= 13.0f ? 0.0f : std::pow((h_ut - 13.0f) / 10.0f, 1.5f);
-                losProb = ((18.0f / d_2d_out) + std::exp(-d_2d_out / 63.0f) * (1.0f - 18.0f / d_2d_out)) *
-                         (1.0f + c_prime * 5.0f / 4.0f * std::pow(d_2d_out / 100.0f, 3.0f) * std::exp(-d_2d_out / 150.0f));
-            }
-            break;
-        case scenario_t::UMi:
-            if (d_2d_out <= 18.0f) {
-                losProb = 1.0f;
-            } else {
-                losProb = (18.0f / d_2d_out) + std::exp(-d_2d_out / 36.0f) * (1.0f - 18.0f / d_2d_out);
-            }
-            break;
-        case scenario_t::RMa:
-            if (d_2d_out <= 10.0f) {
-                losProb = 1.0f;
-            } else {
-                losProb = std::exp(-(d_2d_out - 10.0f) / 1000.0f);
-            }
-            break;
-        default:
-            assert(false && "Unknown scenario");
-            break;
+    
+    if (is_aerial) {
+        h_ut = std::min(std::max((std::isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 300.0f);
+        // Aerial UE LOS probability per 3GPP TR 36.777 Table B-1
+        // P_LOS = 1 if d_2D <= d_1
+        // P_LOS = d_1/d_2D + exp(-d_2D/p_1) * (1 - d_1/d_2D) if d_2D > d_1
+        float d1 = 18.0f;
+        float p1 = 1000.0f;
+        
+        switch (scenario) {
+            case scenario_t::RMa:
+                if (h_ut <= 10.0f) {
+                    // h_UT ≤ 10m: Use TR 38.901 RMa P_LOS (terrestrial formula)
+                    if (d_2d_out <= 10.0f) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = std::exp(-(d_2d_out - 10.0f) / 1000.0f);
+                    }
+                } else if (h_ut <= 40.0f) {
+                    // 10m < h_UT ≤ 40m: Use aerial formula
+                    d1 = std::max(1350.8f * std::log10(h_ut) - 1602.0f, 18.0f);
+                    p1 = std::max(15021.0f * std::log10(h_ut) - 16053.0f, 1000.0f);
+                    if (d_2d_out <= d1) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = (d1 / d_2d_out) + std::exp(-d_2d_out / p1) * (1.0f - d1 / d_2d_out);
+                    }
+                } else {
+                    // h_UT > 40m: 100% LOS
+                    losProb = 1.0f;
+                }
+                break;
+            case scenario_t::UMa:
+                if (h_ut <= 22.5f) {
+                    // h_UT ≤ 22.5m: Use TR 38.901 UMa P_LOS (terrestrial formula)
+                    if (d_2d_out <= 18.0f) {
+                        losProb = 1.0f;
+                    } else {
+                        float c_prime = h_ut <= 13.0f ? 0.0f : std::pow((h_ut - 13.0f) / 10.0f, 1.5f);
+                        losProb = ((18.0f / d_2d_out) + std::exp(-d_2d_out / 63.0f) * (1.0f - 18.0f / d_2d_out)) *
+                                 (1.0f + c_prime * 5.0f / 4.0f * std::pow(d_2d_out / 100.0f, 3.0f) * std::exp(-d_2d_out / 150.0f));
+                    }
+                } else if (h_ut <= 100.0f) {
+                    // 22.5m < h_UT ≤ 100m: Use aerial formula
+                    d1 = std::max(460.0f * std::log10(h_ut) - 700.0f, 18.0f);
+                    p1 = 4300.0f * std::log10(h_ut) - 3800.0f;
+                    if (d_2d_out <= d1) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = (d1 / d_2d_out) + std::exp(-d_2d_out / p1) * (1.0f - d1 / d_2d_out);
+                    }
+                } else {
+                    // h_UT > 100m: 100% LOS
+                    losProb = 1.0f;
+                }
+                break;
+            case scenario_t::UMi:
+                if (h_ut <= 22.5f) {
+                    // h_UT ≤ 22.5m: Use TR 38.901 UMi P_LOS (terrestrial formula)
+                    if (d_2d_out <= 18.0f) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = (18.0f / d_2d_out) + std::exp(-d_2d_out / 36.0f) * (1.0f - 18.0f / d_2d_out);
+                    }
+                } else {
+                    // 22.5m < h_UT ≤ 300m: Use aerial formula
+                    d1 = std::max(294.05f * std::log10(h_ut) - 432.94f, 18.0f);
+                    p1 = 233.98f * std::log10(h_ut) - 0.95f;
+                    if (d_2d_out <= d1) {
+                        losProb = 1.0f;
+                    } else {
+                        losProb = (d1 / d_2d_out) + std::exp(-d_2d_out / p1) * (1.0f - d1 / d_2d_out);
+                    }
+                }
+                break;
+            default:
+                assert(false && "Unknown scenario");
+                break;
+        }
+    } else {
+        // Terrestrial UE LOS probability per 3GPP TR 38.901 Table 7.4.2-1
+        switch (scenario) {
+            case scenario_t::UMa:
+                assert(h_ut <= 23.0f && "UE height must be less than 23m for terrestrial UMa");
+                if (d_2d_out <= 18.0f) {
+                    losProb = 1.0f;
+                } else {
+                    float c_prime = h_ut <= 13.0f ? 0.0f : std::pow((h_ut - 13.0f) / 10.0f, 1.5f);
+                    losProb = ((18.0f / d_2d_out) + std::exp(-d_2d_out / 63.0f) * (1.0f - 18.0f / d_2d_out)) *
+                             (1.0f + c_prime * 5.0f / 4.0f * std::pow(d_2d_out / 100.0f, 3.0f) * std::exp(-d_2d_out / 150.0f));
+                }
+                break;
+            case scenario_t::UMi:
+                if (d_2d_out <= 18.0f) {
+                    losProb = 1.0f;
+                } else {
+                    losProb = (18.0f / d_2d_out) + std::exp(-d_2d_out / 36.0f) * (1.0f - 18.0f / d_2d_out);
+                }
+                break;
+            case scenario_t::RMa:
+                if (d_2d_out <= 10.0f) {
+                    losProb = 1.0f;
+                } else {
+                    losProb = std::exp(-(d_2d_out - 10.0f) / 1000.0f);
+                }
+                break;
+            default:
+                assert(false && "Unknown scenario");
+                break;
+        }
     }
     return losProb;
 }
 
 
-inline float calSfStd(scenario_t scenario, bool isLos, float fc, bool optionalPlInd, float d_2d, float h_bs, float h_ut) {
+template <typename Tscalar, typename Tcomplex>
+float slsChan<Tscalar, Tcomplex>::calSfStd(scenario_t scenario, bool isLos, float fc, bool optionalPlInd, float d_2d, float h_bs, float h_ut,
+                        bool is_aerial) {
+    if (is_aerial) {
+        h_ut = std::min(std::max((std::isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 300.0f);
+    }
     float sf_std = 0.0f;
     if (isLos) {
         switch (scenario) {
-            case scenario_t::UMa:
-            case scenario_t::UMi:
-                sf_std = (fc < 6e9f ? 7.0f : 4.0f);
-                break;
             case scenario_t::RMa: {
-                float d_bp = 2 * M_PI * h_bs * h_ut * fc / 3.0e8f;
-                sf_std = d_2d <= d_bp ? 4.0f : 6.0f;
+                // 3GPP TR 36.777 Table B-3: RMa-AV LOS
+                // h_UT > 10m: σ_SF = 4.2 * exp(-0.0046 * h_UT)
+                // h_UT ≤ 10m: According to Table 7.4.1-1 of TR 38.901
+                if (is_aerial && h_ut > 10.0f) {
+                    sf_std = 4.2f * expf(-0.0046f * h_ut);
+                } else {
+                    float d_bp = 2 * M_PI * h_bs * h_ut * fc / 3.0e8f;
+                    sf_std = d_2d <= d_bp ? 4.0f : 6.0f;
+                }
                 break;
             }
+            case scenario_t::UMa:
+                // 3GPP TR 36.777 Table B-3: UMa-AV LOS
+                // h_UT > 22.5m: σ_SF = 4.64 * exp(-0.0066 * h_UT)
+                // h_UT ≤ 22.5m: According to Table 7.4.1-1 of TR 38.901
+                if (is_aerial && h_ut > 22.5f) {
+                    sf_std = 4.64f * expf(-0.0066f * h_ut);
+                } else {
+                    sf_std = (fc < 6e9f ? 7.0f : 4.0f);
+                }
+                break;
+            case scenario_t::UMi:
+                // 3GPP TR 36.777 Table B-3: UMi-AV LOS
+                // h_UT > 22.5m: σ_SF = max(5 * exp(-0.01 * h_UT), 2)
+                // h_UT ≤ 22.5m: According to Table 7.4.1-1 of TR 38.901
+                if (is_aerial && h_ut > 22.5f) {
+                    sf_std = fmaxf(5.0f * expf(-0.01f * h_ut), 2.0f);
+                } else {
+                    sf_std = (fc < 6e9f ? 7.0f : 4.0f);
+                }
+                break;
             default:
                 assert(false && "Unknown scenario");
                 break;
         }
     } else {
         switch (scenario) {
+            case scenario_t::RMa:
+                // 3GPP TR 36.777 Table B-3: RMa-AV NLOS
+                // h_UT > 10m: σ_SF = 6
+                // h_UT ≤ 10m: According to Table 7.4.1-1 of TR 38.901 (σ_SF = 8)
+                if (is_aerial && h_ut > 10.0f) {
+                    sf_std = 6.0f;
+                } else {
+                    sf_std = 8.0f;
+                }
+                break;
             case scenario_t::UMa:
-                sf_std = (fc < 6e9f ? 7.0f : (optionalPlInd ? 7.8f : 6.0f));
+                // 3GPP TR 36.777 Table B-3: UMa-AV NLOS
+                // h_UT > 22.5m: σ_SF = 6
+                // h_UT ≤ 22.5m: According to Table 7.4.1-1 of TR 38.901
+                if (is_aerial && h_ut > 22.5f) {
+                    sf_std = 6.0f;
+                } else {
+                    sf_std = (fc < 6e9f ? 7.0f : (optionalPlInd ? 7.8f : 6.0f));
+                }
                 break;
             case scenario_t::UMi:
-                sf_std = (fc < 6e9f ? 7.0f : (optionalPlInd ? 8.2f : 7.82f));
-                break;
-            case scenario_t::RMa:
-                sf_std = 8.0f;
+                // 3GPP TR 36.777 Table B-3: UMi-AV NLOS
+                // h_UT > 22.5m: σ_SF = 8
+                // h_UT ≤ 22.5m: According to Table 7.4.1-1 of TR 38.901
+                if (is_aerial && h_ut > 22.5f) {
+                    sf_std = 8.0f;
+                } else {
+                    sf_std = (fc < 6e9f ? 7.0f : (optionalPlInd ? 8.2f : 7.82f));
+                }
                 break;
             default:
                 assert(false && "Unknown scenario");
@@ -348,18 +554,43 @@ float calPenetrLos(scenario_t scenario, bool outdoor_ind, float fc, float d_2d_i
 }
 
 inline float calPL(scenario_t scenario, bool isLos, float d_2d, float d_3d, float h_bs, float h_ut, float fc, 
-                  bool optionalPlInd, std::mt19937& gen, std::uniform_real_distribution<float>& uniformDist) {
+                  bool optionalPlInd, std::mt19937& gen, std::uniform_real_distribution<float>& uniformDist,
+                  bool is_aerial = false) {
+    if (is_aerial) {
+        h_ut = std::min(std::max((std::isnan(h_ut) || h_ut <= 0.0f) ? 10.001f : h_ut, 10.001f), 300.0f);
+    }
     float pl = 0.0f;
+    
+    // ========================================================================
+    // 3GPP TR 36.777 Table B-2: Height-dependent path loss for aerial UEs
+    // Falls back to TR 38.901 for low heights (terrestrial-like behavior)
+    // ========================================================================
+    
     if (isLos) {
         switch (scenario) {
+            case scenario_t::RMa:
+                // RMa-AV LOS: h_UT ≤ 10m → terrestrial; h_UT > 10m → aerial
+                if (is_aerial && h_ut > 10.0f) {
+                    pl = calculateRMaAvLosPathloss(d_3d, h_ut, fc);
+                } else {
+                    pl = calculateRMaLosPathloss(d_2d, d_3d, h_bs, h_ut, fc);
+                }
+                break;
             case scenario_t::UMa:
-                pl = calculateUMaLosPathloss(d_2d, d_3d, h_bs, h_ut, fc, gen, uniformDist);
+                // UMa-AV LOS: h_UT ≤ 22.5m → terrestrial; h_UT > 22.5m → aerial
+                if (is_aerial && h_ut > 22.5f) {
+                    pl = calculateUMaAvLosPathloss(d_3d, fc);
+                } else {
+                    pl = calculateUMaLosPathloss(d_2d, d_3d, h_bs, h_ut, fc, gen, uniformDist);
+                }
                 break;
             case scenario_t::UMi:
-                pl = calculateUMiLosPathloss(d_2d, d_3d, h_bs, h_ut, fc);
-                break;
-            case scenario_t::RMa:
-                pl = calculateRMaLosPathloss(d_2d, d_3d, h_bs, h_ut, fc);
+                // UMi-AV LOS: h_UT ≤ 22.5m → terrestrial; h_UT > 22.5m → aerial
+                if (is_aerial && h_ut > 22.5f) {
+                    pl = calculateUMiAvLosPathloss(d_3d, h_ut, fc);
+                } else {
+                    pl = calculateUMiLosPathloss(d_2d, d_3d, h_bs, h_ut, fc);
+                }
                 break;
             default:
                 assert(false && "Unknown scenario");
@@ -367,6 +598,7 @@ inline float calPL(scenario_t scenario, bool isLos, float d_2d, float d_3d, floa
         }
     } else {
         if (optionalPlInd) {
+            // Optional NLOS formulas (simplified, not height-dependent)
             switch (scenario) {
                 case scenario_t::UMa:
                     pl = 32.4f + 20.0f * std::log10(fc) + 30.0f * std::log10(d_3d);
@@ -382,26 +614,42 @@ inline float calPL(scenario_t scenario, bool isLos, float d_2d, float d_3d, floa
                     break;
             }
         } else {
+            // NLOS path loss per TR 36.777 Table B-2 (aerial) or TR 38.901 (terrestrial)
             switch (scenario) {
+                case scenario_t::RMa: {
+                    // RMa-AV NLOS: h_UT ≤ 10m → terrestrial; h_UT > 10m → aerial
+                    if (is_aerial && h_ut > 10.0f) {
+                        pl = calculateRMaAvNlosPathloss(d_3d, h_ut, fc);
+                    } else {
+                        float los_pl = calculateRMaLosPathloss(d_2d, d_3d, h_bs, h_ut, fc);
+                        constexpr float W = 20.0f;
+                        constexpr float h = 5.0f;
+                        float nlos_pl = 161.04f - 7.1f * std::log10(W) + 7.5f * std::log10(h) - 
+                                      (24.37f - 3.7f * std::pow(h/h_bs, 2)) * std::log10(h_bs) + 
+                                      (43.42f - 3.1f * std::log10(h_bs)) * (std::log10(d_3d) - 3.0f) + 
+                                      20.0f * std::log10(fc) - (3.2f * std::pow(std::log10(11.75f * h_ut), 2) - 4.97f);
+                        pl = std::max(los_pl, nlos_pl);
+                    }
+                    break;
+                }
                 case scenario_t::UMa: {
-                    float los_pl = calculateUMaLosPathloss(d_2d, d_3d, h_bs, h_ut, fc, gen, uniformDist);
-                    pl = std::max(los_pl, 13.54f + 39.08f * std::log10(d_3d) + 20.0f * std::log10(fc) - 0.6f * (h_ut - 1.5f));
+                    // UMa-AV NLOS: h_UT <= 22.5m -> terrestrial; h_UT > 22.5m -> aerial (clamped to 100m)
+                    if (is_aerial && h_ut > 22.5f) {
+                        pl = calculateUMaAvNlosPathloss(d_3d, std::min(h_ut, 100.0f), fc);
+                    } else {
+                        float los_pl = calculateUMaLosPathloss(d_2d, d_3d, h_bs, h_ut, fc, gen, uniformDist);
+                        pl = std::max(los_pl, 13.54f + 39.08f * std::log10(d_3d) + 20.0f * std::log10(fc) - 0.6f * (h_ut - 1.5f));
+                    }
                     break;
                 }
                 case scenario_t::UMi: {
-                    float los_pl = calculateUMiLosPathloss(d_2d, d_3d, h_bs, h_ut, fc);
-                    pl = std::max(los_pl, 35.3f * std::log10(d_3d) + 22.4f + 21.3f * std::log10(fc) - 0.3f * (h_ut - 1.5f));
-                    break;
-                }
-                case scenario_t::RMa: {
-                    float los_pl = calculateRMaLosPathloss(d_2d, d_3d, h_bs, h_ut, fc);
-                    constexpr float W = 20.0f;  // Average street width
-                    constexpr float h = 5.0f;  // Average building height
-                    float nlos_pl = 161.04f - 7.1f * std::log10(W) + 7.5f * std::log10(h) - 
-                                  (24.37f - 3.7f * std::pow(h/h_bs, 2)) * std::log10(h_bs) + 
-                                  (43.42f - 3.1f * std::log10(h_bs)) * (std::log10(d_3d) - 3.0f) + 
-                                  20.0f * std::log10(fc) - (3.2f * std::pow(std::log10(11.75f * h_ut), 2) - 4.97f);
-                    pl = std::max(los_pl, nlos_pl);
+                    // UMi-AV NLOS: h_UT ≤ 22.5m → terrestrial; h_UT > 22.5m → aerial
+                    if (is_aerial && h_ut > 22.5f) {
+                        pl = calculateUMiAvNlosPathloss(d_3d, h_ut, fc);
+                    } else {
+                        float los_pl = calculateUMiLosPathloss(d_2d, d_3d, h_bs, h_ut, fc);
+                        pl = std::max(los_pl, 35.3f * std::log10(d_3d) + 22.4f + 21.3f * std::log10(fc) - 0.3f * (h_ut - 1.5f));
+                    }
                     break;
                 }
                 default:
@@ -532,9 +780,14 @@ inline void genCRN(float maxX, float minX, float maxY, float minY,
 
 // Function to get LSP value at a specific location
 inline float getLspAtLocation(float x, float y, float maxX, float minX, float maxY, float minY, const std::vector<std::vector<float>>& crn) {
+    if (crn.empty() || crn[0].empty()) return 0.0f;
+
     // Calculate the normalized position within the grid
-    float normX = (x - minX) / (maxX - minX);
-    float normY = (y - minY) / (maxY - minY);
+    constexpr float kMinDomainExtent = 1e-6f;
+    const float rangeX = maxX - minX;
+    const float rangeY = maxY - minY;
+    float normX = (rangeX < kMinDomainExtent) ? 0.5f : (x - minX) / rangeX;
+    float normY = (rangeY < kMinDomainExtent) ? 0.5f : (y - minY) / rangeY;
 
     // Clamp normalized coordinates to [0, 1] to match GPU boundary handling
     if (normX < 0.0f) normX = 0.0f;
@@ -576,6 +829,9 @@ template <typename Tscalar, typename Tcomplex>
 void slsChan<Tscalar, Tcomplex>::calCmnLinkParams()
 {
     // Initialize common link parameters based on scenario
+    if (m_simConfig->center_freq_hz <= 0.0f) {
+        throw std::invalid_argument("center_freq_hz must be positive");
+    }
     float fc = m_simConfig->center_freq_hz;
     float lgfc = std::log10(fc / 1e9);
     float lg1fc = std::log10(1.0f + fc / 1e9);
@@ -970,10 +1226,16 @@ void slsChan<Tscalar, Tcomplex>::generateCRN()
                                     (m_sysConfig->scenario == scenario_t::UMi) ? corrDistUmiO2i : corrDistRmaO2i;
 
     // Generate independent CRN fields for each site
+    // Conditionally include Delta Tau (DT) CRN only if enable_propagation_delay is enabled
+    const bool includeDeltaTau = (m_sysConfig->enable_propagation_delay != 0);
+    const uint32_t nLspLos = includeDeltaTau ? 8 : 7;   // 7 LSPs + optional DT
+    const uint32_t nLspNlos = includeDeltaTau ? 7 : 6;  // 6 LSPs + optional DT (no K)
+    const uint32_t nLspO2i = includeDeltaTau ? 7 : 6;   // 6 LSPs + optional DT (no K)
+    
     for (uint16_t siteIdx = 0; siteIdx < nSite; siteIdx++) {
-        m_crnLos[siteIdx].resize(7);
-        m_crnNlos[siteIdx].resize(6);
-        m_crnO2i[siteIdx].resize(6);
+        m_crnLos[siteIdx].resize(nLspLos);
+        m_crnNlos[siteIdx].resize(nLspNlos);
+        m_crnO2i[siteIdx].resize(nLspO2i);
         
         // Generate CRN for LOS case for this site
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistLos.SF, m_gen, m_normalDist, m_crnLos[siteIdx][0]);
@@ -983,6 +1245,9 @@ void slsChan<Tscalar, Tcomplex>::generateCRN()
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistLos.ASA, m_gen, m_normalDist, m_crnLos[siteIdx][4]);
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistLos.ZSD, m_gen, m_normalDist, m_crnLos[siteIdx][5]);
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistLos.ZSA, m_gen, m_normalDist, m_crnLos[siteIdx][6]);
+        if (includeDeltaTau) {
+            genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistLos.DT, m_gen, m_normalDist, m_crnLos[siteIdx][7]);  // Delta Tau
+        }
 
         // Generate CRN for NLOS case for this site
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistNlos.SF, m_gen, m_normalDist, m_crnNlos[siteIdx][0]);
@@ -991,6 +1256,9 @@ void slsChan<Tscalar, Tcomplex>::generateCRN()
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistNlos.ASA, m_gen, m_normalDist, m_crnNlos[siteIdx][3]);
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistNlos.ZSD, m_gen, m_normalDist, m_crnNlos[siteIdx][4]);
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistNlos.ZSA, m_gen, m_normalDist, m_crnNlos[siteIdx][5]);
+        if (includeDeltaTau) {
+            genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistNlos.DT, m_gen, m_normalDist, m_crnNlos[siteIdx][6]);  // Delta Tau
+        }
 
         // Generate CRN for O2I case for this site
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistO2i.SF, m_gen, m_normalDist, m_crnO2i[siteIdx][0]);
@@ -999,12 +1267,17 @@ void slsChan<Tscalar, Tcomplex>::generateCRN()
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistO2i.ASA, m_gen, m_normalDist, m_crnO2i[siteIdx][3]);
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistO2i.ZSD, m_gen, m_normalDist, m_crnO2i[siteIdx][4]);
         genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistO2i.ZSA, m_gen, m_normalDist, m_crnO2i[siteIdx][5]);
+        if (includeDeltaTau) {
+            genCRN(m_maxX, m_minX, m_maxY, m_minY, corrDistO2i.DT, m_gen, m_normalDist, m_crnO2i[siteIdx][6]);  // Delta Tau
+        }
     }
 }
 
 template <typename Tscalar, typename Tcomplex>
 void slsChan<Tscalar, Tcomplex>::calLinkParam()
 {
+    // Check if delta_tau computation is enabled (saves memory and computation when disabled)
+    const bool includeDeltaTau = (m_sysConfig->enable_propagation_delay != 0);
 
     // Calculate link parameters for site-UT pairs (co-sited sectors share link parameters)
     uint32_t nSiteUeLink = m_topology.nSite * m_topology.nUT;  // not including sectors
@@ -1039,19 +1312,24 @@ void slsChan<Tscalar, Tcomplex>::calLinkParam()
             m_linkParams[linkIdx].theta_LOS_ZOD = theta_los_zod;
             m_linkParams[linkIdx].theta_LOS_ZOA = theta_los_zoa;
 
+            // Check if this is an aerial UE (used for LOS probability and path loss)
+            bool is_aerial = (m_topology.utParams[ueIdx].ue_type == UeType::AERIAL);
+            
             // Calculate LOS probability and determine LOS/NLOS
             // Only regenerate LOS indicator when m_updateLosState is true (at start or after reset)
             // According to 3GPP TR 38.901, LOS/NLOS state should remain constant during a drop
+            // For aerial UEs, use 3GPP TR 36.777 Table B-1 LOS probability
             if (m_updateLosState) {
-                float losProb = calLosProb(m_sysConfig->scenario, d_2d_out, m_topology.utParams[ueIdx].loc.z, m_sysConfig->force_los_prob, m_topology.utParams[ueIdx].outdoor_ind);
+                float losProb = calLosProb(m_sysConfig->scenario, d_2d_out, m_topology.utParams[ueIdx].loc.z, m_sysConfig->force_los_prob, m_topology.utParams[ueIdx].outdoor_ind, is_aerial);
                 m_linkParams[linkIdx].losInd = (m_uniformDist(m_gen) <= losProb) ? 1 : 0;
             }
 
             // Calculate path loss (always needed for mode 1 and 2)
+            // For aerial UEs, use 3GPP TR 36.777 Table B-2 path loss models
             if (m_updatePLAndPenetrationLoss) {
                 float pl = calPL(m_sysConfig->scenario, m_linkParams[linkIdx].losInd, d_2d, d_3d, 
                             m_topology.cellParams[siteIdx * m_topology.n_sector_per_site].loc.z, m_topology.utParams[ueIdx].loc.z, 
-                            m_simConfig->center_freq_hz / 1e9, m_sysConfig->optional_pl_ind, m_gen, m_uniformDist);
+                            m_simConfig->center_freq_hz / 1e9, m_sysConfig->optional_pl_ind, m_gen, m_uniformDist, is_aerial);
 
                 // Use pre-calculated O2I penetration loss from UE parameters
                 // Per 3GPP TR 38.901 Section 7.4.3: O2I is UT-specifically generated, same for ALL BSs
@@ -1069,7 +1347,7 @@ void slsChan<Tscalar, Tcomplex>::calLinkParam()
             uint8_t & isLos = m_linkParams[linkIdx].losInd;
             bool isIndoor = (m_topology.utParams[ueIdx].outdoor_ind == 0);
             
-            float r_SF, r_K, r_DS, r_ASD, r_ASA, r_ZSD, r_ZSA;
+            float r_SF, r_K, r_DS, r_ASD, r_ASA, r_ZSD, r_ZSA, r_DT{};
             
             if (isIndoor) {
                 // For indoor UEs, always use O2I correlation regardless of LOS/NLOS
@@ -1081,6 +1359,9 @@ void slsChan<Tscalar, Tcomplex>::calLinkParam()
                 r_ASA = getLspAtLocation(utX, utY, m_maxX, m_minX, m_maxY, m_minY, m_crnO2i[siteIdx][3]);
                 r_ZSD = getLspAtLocation(utX, utY, m_maxX, m_minX, m_maxY, m_minY, m_crnO2i[siteIdx][4]);
                 r_ZSA = getLspAtLocation(utX, utY, m_maxX, m_minX, m_maxY, m_minY, m_crnO2i[siteIdx][5]);
+                if (includeDeltaTau) {
+                    r_DT = getLspAtLocation(utX, utY, m_maxX, m_minX, m_maxY, m_minY, m_crnO2i[siteIdx][6]);  // Delta Tau
+                }
             } else {
                 // For outdoor UEs, use LOS/NLOS correlation
                 // Use site-specific CRN to get independent shadow fading per site
@@ -1091,6 +1372,9 @@ void slsChan<Tscalar, Tcomplex>::calLinkParam()
                 r_ASA = getLspAtLocation(utX, utY, m_maxX, m_minX, m_maxY, m_minY, isLos ? m_crnLos[siteIdx][4] : m_crnNlos[siteIdx][3]);
                 r_ZSD = getLspAtLocation(utX, utY, m_maxX, m_minX, m_maxY, m_minY, isLos ? m_crnLos[siteIdx][5] : m_crnNlos[siteIdx][4]);
                 r_ZSA = getLspAtLocation(utX, utY, m_maxX, m_minX, m_maxY, m_minY, isLos ? m_crnLos[siteIdx][6] : m_crnNlos[siteIdx][5]);
+                if (includeDeltaTau) {
+                    r_DT = getLspAtLocation(utX, utY, m_maxX, m_minX, m_maxY, m_minY, isLos ? m_crnLos[siteIdx][7] : m_crnNlos[siteIdx][6]);  // Delta Tau
+                }
             }
             
             // Create array of uncorrelated variables
@@ -1141,7 +1425,8 @@ void slsChan<Tscalar, Tcomplex>::calLinkParam()
             
             if (m_updatePLAndPenetrationLoss) {
                 // 1. Shadow Fading (SF) - update for mode 1 and 2
-                m_linkParams[linkIdx].SF = corrVars[SF_IDX] * calSfStd(m_sysConfig->scenario, losInd, m_simConfig->center_freq_hz, m_sysConfig->optional_pl_ind, d_2d, h_bs, h_ut);
+                // For aerial UEs, use 3GPP TR 36.777 Table B-3 height-dependent SF std
+                m_linkParams[linkIdx].SF = corrVars[SF_IDX] * calSfStd(m_sysConfig->scenario, losInd, m_simConfig->center_freq_hz, m_sysConfig->optional_pl_ind, d_2d, h_bs, h_ut, is_aerial);
             }
             
             if (m_updateAllLSPs) {
@@ -1217,6 +1502,47 @@ void slsChan<Tscalar, Tcomplex>::calLinkParam()
                 sigma = m_cmnLinkParams.sigma_lgZSA[lspIdx];
                 float zsa_temp = std::pow(10.0f, corrVars[ZSA_IDX] * sigma + mu);
                 m_linkParams[linkIdx].ZSA = std::min(zsa_temp, 52.0f);  // Limit to 52 degrees
+                
+                // 8. Delta Tau (Excess Delay) per 3GPP TR 38.901 Table 7.6.9-1
+                // Only compute if enable_propagation_delay is enabled (saves memory and computation)
+                // LOS: Delta Tau = 0 (per Eq. 7.6-44)
+                // NLOS: lg(Delta Tau) = log10(Delta Tau/1s) ~ N(mu_lg_DT, sigma_lg_DT)
+                // Note: mu and sigma are time-invariant (only scenario-dependent), so compute once and save
+                if (includeDeltaTau) {
+                    if (losInd) {
+                        // LOS: Delta Tau = 0
+                        m_linkParams[linkIdx].delta_tau = 0.0f;
+                    } else {
+                        // NLOS: Generate from lognormal distribution per Table 7.6.9-1
+                        float mu_lg_dt{}, sigma_lg_dt{};
+                        switch (m_sysConfig->scenario) {
+                            case scenario_t::UMi:
+                                mu_lg_dt = -7.5f;
+                                sigma_lg_dt = 0.5f;
+                                break;
+                            case scenario_t::UMa:
+                                mu_lg_dt = -7.4f;
+                                sigma_lg_dt = 0.2f;
+                                break;
+                            case scenario_t::RMa:
+                                mu_lg_dt = -8.33f;
+                                sigma_lg_dt = 0.26f;
+                                break;
+                            default:
+                                // Default to UMi
+                                mu_lg_dt = -7.5f;
+                                sigma_lg_dt = 0.5f;
+                                break;
+                        }
+                        // lg(Delta Tau) = mu + sigma * r_DT (where r_DT is spatially correlated)
+                        const float lg_delta_tau = mu_lg_dt + sigma_lg_dt * r_DT;
+                        // Delta Tau in seconds = 10^(lg(Delta Tau))
+                        m_linkParams[linkIdx].delta_tau = std::pow(10.0f, lg_delta_tau);
+                    }
+                } else {
+                    // enable_propagation_delay disabled: skip delta_tau computation
+                    m_linkParams[linkIdx].delta_tau = 0.0f;
+                }
             }
         }
     }

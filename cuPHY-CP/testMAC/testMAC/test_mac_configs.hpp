@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include "yaml.hpp"
 #include "nv_phy_utils.hpp"
 #include "common_utils.hpp"
+#include <vector>
 
 #ifdef AERIAL_CUMAC_ENABLE
 #include "cumac_configs.hpp"
@@ -113,7 +114,7 @@ public:
     ~test_mac_configs();
 
 #ifdef AERIAL_CUMAC_ENABLE
-    test_cumac_configs* cumac_configs;
+    test_cumac_configs* cumac_configs = nullptr;
 #endif
 
     struct nv::thread_config& get_recv_thread_config()
@@ -205,6 +206,33 @@ public:
         return &conformance_test_params;
     }
 
+    /**
+     * Get FAPI sending deadline for a group (nanoseconds). Returns 0 if not configured.
+     *
+     * @param[in] group_id FAPI group ID
+     * @return FAPI sending deadline in nanoseconds
+     */
+    int64_t get_fapi_tx_deadline_ns(size_t group_id) const
+    {
+        if (group_id < fapi_tx_deadline_ns.size())
+            return fapi_tx_deadline_ns[group_id];
+        return 0;
+    }
+
+    /**
+     * Whether FAPI sending deadline (per-message send time) is enabled.
+     *
+     * @return True if FAPI sending deadline is enabled, false otherwise
+     */
+    int get_fapi_tx_deadline_enable() const { return fapi_tx_deadline_enable; }
+
+    /**
+     * Time cost per FAPI message (ns), for deadline send_time estimate. Default 1000.
+     *
+     * @return Time cost per FAPI message in nanoseconds
+     */
+    int get_fapi_tx_time_per_msg_ns() const { return fapi_tx_time_per_msg_ns; }
+
     int get_early_harq_deadline_ns()
     {
         return early_harq_deadline_ns;
@@ -262,6 +290,10 @@ public:
 
     std::vector<int32_t> schedule_total_time; //!< L2 scheduler total time budget per slot (nanoseconds)
 
+    std::vector<int64_t> fapi_tx_deadline_ns; //!< FAPI sending deadline per group (nanoseconds). Empty or unset means 0 (send at slot start).
+    int fapi_tx_deadline_enable = 0; //!< Enable deadline-based send time and nanosleep (0=off, 1=on)
+    int fapi_tx_time_per_msg_ns = 1000; //!< Time per FAPI message (ns) for send_time estimate
+
     int oam_cell_ctrl_cmd;      //!< Enable OAM cell control commands
     std::string oam_server_addr; //!< OAM server address
 
@@ -293,29 +325,29 @@ public:
 private:
 
     // Parameters loaded from YAML configuration file
-    int max_msg_size;  //!< Maximum IPC message buffer size
-    int max_data_size; //!< Maximum IPC data buffer size
-    int ipc_sync_mode; //!< IPC synchronization mode (per-cell, per-TTI, per-msg)
+    int max_msg_size = 0;  //!< Maximum IPC message buffer size
+    int max_data_size = 0; //!< Maximum IPC data buffer size
+    int ipc_sync_mode = 0; //!< IPC synchronization mode (per-cell, per-TTI, per-msg)
 
-    int restart_option; //!< Cell restart behavior option
+    int restart_option = 0; //!< Cell restart behavior option
 
-    int fapi_tb_loc; //!< Transport block data location (0=msg_buf, 1=CPU_DATA, 2=CUDA_DATA, 3=GPU_DATA)
+    int fapi_tb_loc = 0; //!< Transport block data location (0=msg_buf, 1=CPU_DATA, 2=CUDA_DATA, 3=GPU_DATA)
 
     // All cells restart test configuration
-    int test_slots;       //!< Total slots to run before restarting all cells
-    int restart_interval; //!< Interval in seconds before restarting after test completion
+    int test_slots = 0;       //!< Total slots to run before restarting all cells
+    int restart_interval = 0; //!< Interval in seconds before restarting after test completion
 
     // Single cell restart test configuration
-    int cell_run_slots;  //!< Number of slots to run a single cell before stopping
-    int cell_stop_slots; //!< Number of slots to keep cell stopped before restarting
+    int cell_run_slots = 0;  //!< Number of slots to run a single cell before stopping
+    int cell_stop_slots = 0; //!< Number of slots to keep cell stopped before restarting
 
     yaml::node yaml_config; //!< Full YAML configuration node
 
-    struct nv::thread_config recv_thread_config;    //!< Receiver thread configuration
-    struct nv::thread_config sched_thread_config;   //!< Scheduler thread configuration
-    struct nv::thread_config builder_thread_config; //!< Builder thread configuration
+    struct nv::thread_config recv_thread_config = {};    //!< Receiver thread configuration
+    struct nv::thread_config sched_thread_config = {};   //!< Scheduler thread configuration
+    struct nv::thread_config builder_thread_config = {}; //!< Builder thread configuration
 
-    conformance_test_params_t conformance_test_params; //!< Conformance test parameters
+    conformance_test_params_t conformance_test_params = {}; //!< Conformance test parameters
 
 #ifdef SCF_FAPI_10_04
     uint8_t indication_per_slot[6]{}; //!< SCF 10.04 indication flags per slot
@@ -324,8 +356,8 @@ private:
     std::vector<cell_update_cmd_t> cell_update_commands; //!< Network reconfiguration test procedures
 
     bool is_dummy_tti_enabled = false;    //!< Enable dummy TTI for testing
-    int enableTickDynamicSfnSlot; //!< Enable dynamic SFN/slot in tick events
-    int enable_srs_l1_limit_testing; //!< Enable SRS L1 limit testing
+    int enableTickDynamicSfnSlot = 0; //!< Enable dynamic SFN/slot in tick events
+    int enable_srs_l1_limit_testing = 0; //!< Enable SRS L1 limit testing
 };
 
 #endif /* _TEST_MAC_CONFIGS_HPP */

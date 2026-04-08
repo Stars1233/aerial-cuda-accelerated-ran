@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -75,14 +75,14 @@ def ofdm_mod_demod_numpy(cuphy_carrier_prms, n_tti, cuda_stream):
     # Step 2: create OFDM modulation and demodulation objects
     ofdm_mod = pycuphy.OfdmModulate(cuphy_carrier_prms=cuphy_carrier_prms,
                                     freq_data_in_cpu=freq_in,
-                                    stream_handle=cuda_stream
+                                    stream_handle=cuda_stream.handle
                                     )
     time_data_gpu = ofdm_mod.get_time_data_out()
     ofdm_demod = pycuphy.OfdmDeModulate(cuphy_carrier_prms=cuphy_carrier_prms,
                                         time_data_in_gpu=time_data_gpu,
                                         freq_data_out_cpu=freq_out,
                                         prach=0,
-                                        stream_handle=cuda_stream
+                                        stream_handle=cuda_stream.handle
                                         )
     # Step 3: run test and compare results
     for tti_idx in range(0, n_tti):
@@ -124,14 +124,14 @@ def ofdm_mod_demod_gpu_only(cuphy_carrier_prms, n_tti, cuda_stream):
     # Step 2: create OFDM modulation and demodulation objects
     ofdm_mod = pycuphy.OfdmModulate(cuphy_carrier_prms=cuphy_carrier_prms,
                                     freq_data_in_gpu=freq_in_gpu,
-                                    stream_handle=cuda_stream
+                                    stream_handle=cuda_stream.handle
                                     )
     time_data_in_gpu = ofdm_mod.get_time_data_out()
     ofdm_demod = pycuphy.OfdmDeModulate(cuphy_carrier_prms=cuphy_carrier_prms,
                                         time_data_in_gpu=time_data_in_gpu,
                                         freq_data_out_gpu=freq_out_gpu,
                                         prach=0,
-                                        stream_handle=cuda_stream
+                                        stream_handle=cuda_stream.handle
                                         )
 
     # Step 3: run test and compare results

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,4 +15,4 @@
 
 set(SOURCES tdl_chan_ex.cpp  dummy.cu)
 add_executable(tdl_chan_ex ${SOURCES})
-target_link_libraries(tdl_chan_ex PRIVATE curand cuphy_hdf5 chanModels)
+target_link_libraries(tdl_chan_ex PRIVATE curand chanModels)

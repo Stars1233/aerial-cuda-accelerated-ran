@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -199,16 +199,16 @@ static int stat_log_print(stat_log_t* stat)
 
         if(priv_data->min < priv_data->limit_min || priv_data->max > priv_data->limit_max)
         {
-            NVLOGC(TAG, "[%s][N=%ld][MIN=%ld AVG=%ld MAX=%ld] exceed limit\n", priv_data->name, priv_data->counter, priv_data->min, avg, priv_data->max);
+            NVLOGC(TAG, "[%s][N=%d][MIN=%ld AVG=%ld MAX=%ld] exceed limit\n", priv_data->name, priv_data->counter, priv_data->min, avg, priv_data->max);
         }
         else
         {
-            NVLOG_C(priv_data->log_level, TAG, "[%s][N=%ld][MIN=%ld AVG=%ld MAX=%ld]\n", priv_data->name, priv_data->counter, priv_data->min, avg, priv_data->max);
+            NVLOG_C(priv_data->log_level, TAG, "[%s][N=%d][MIN=%ld AVG=%ld MAX=%ld]\n", priv_data->name, priv_data->counter, priv_data->min, avg, priv_data->max);
         }
     }
     else
     {
-        NVLOG_C(priv_data->log_level, TAG, "[%s][N=%ld][MIN=NA AVG=NA MAX=NA]\n", priv_data->name, priv_data->counter);
+        NVLOG_C(priv_data->log_level, TAG, "[%s][N=%d][MIN=NA AVG=NA MAX=NA]\n", priv_data->name, priv_data->counter);
     }
 
     return 0;

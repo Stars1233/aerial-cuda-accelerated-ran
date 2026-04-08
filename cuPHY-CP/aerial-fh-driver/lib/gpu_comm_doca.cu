@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,8 @@
 
 #include <doca_gpunetio.h>
 #include <cooperative_groups.h>
-#include <doca_gpunetio_dev_src_eth.cuh>
+#include <cstdint>
+#include <doca_gpunetio_dev_eth_txq.cuh>
 
 //The relevant memcpy_async code below should also be guarded with an else clause.
 //However, not having it allowed us to catch a case where the old non-memcpy code path was exercised
@@ -91,7 +92,7 @@ int gpu_comm_warmup(cudaStream_t cstream)
         NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching warmup kernel failed with {}", __FILE__, __LINE__, cudaGetErrorString(result));
     return 0;
 }
-__global__ void memset_kernel(void* d_buffers, CleanupParams params) {
+__global__ void memset_kernel(CleanupParams params) {
 
     const uint4 val = {0, 0, 0, 0};
     int cell = blockIdx.y;
@@ -122,12 +123,12 @@ __global__ void memset_kernel(void* d_buffers, CleanupParams params) {
     }
 }
 
-void launch_memset_kernel(void* d_buffers_addr, int num_cells, size_t max_buffer_size, CleanupParams& cleanup, cudaStream_t strm) {
+void launch_memset_kernel(int num_cells, size_t max_buffer_size, CleanupParams& cleanup, cudaStream_t strm) {
 
     int num_threads = 1024;
     // max_buffer_size is in bytes
     int blocks = (max_buffer_size + sizeof(uint4)*num_threads - 1) / (sizeof(uint4)*num_threads);
-    memset_kernel<<<dim3(blocks, num_cells), num_threads, 0, strm>>>(d_buffers_addr, cleanup);
+    memset_kernel<<<dim3(blocks, num_cells), num_threads, 0, strm>>>(cleanup);
     cudaError_t result = cudaGetLastError();
     if(cudaSuccess != result)
         NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching memset kernel failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
@@ -186,8 +187,6 @@ __global__ void gpu_comm_pre_prepare_send_doca(PrepareParams params, struct cuph
     uint32_t*  cell_flow_d_ecpri_seq_id      = params.cell_params[cell_id].flow_d_ecpri_seq_id;
     uint16_t max_num_prb_per_symbol          = params.cell_params[cell_id].max_num_prb_per_symbol;
     size_t mtu = params.cell_params[cell_id].mtu;
-    if (this_slot_info == NULL)
-        return;
 
     PartialUplaneSlotInfo_t* this_partial_slot_info    = params.cell_params[cell_id].partial_slot_info;
     UplaneSymbolInfoGpu_t* this_slot_gpu_symbol_info = this_slot_info->gpu_symbol_info + sym; //copy to shared
@@ -252,7 +251,13 @@ __global__ void gpu_comm_pre_prepare_send_doca(PrepareParams params, struct cuph
         uint8_t msg_rb = message_info_per_symbol.rb[msg_index];
 
         uint8_t eaxcid = message_info_per_symbol.flow_index_info[msg_index];
-
+#ifdef DBG_GPU_COMM
+        if (eaxcid >= MAX_DL_EAXCIDS)
+        {
+            printf("gpu_comm_pre_prepare_send_doca: cell_id %d eaxcid %d out of bounds, max %d\n", cell_id, eaxcid, MAX_DL_EAXCIDS - 1);
+            continue;
+        }
+#endif
         //Get ptr to location where the atomicInc will take place to get pkt_header_index
         uint32_t* msg_flow_d_info = cell_flow_d_info + eaxcid;
         uint32_t* msg_flow_sym_d_info = cell_flow_sym_d_info + sym*MAX_DL_EAXCIDS + eaxcid;
@@ -300,8 +305,7 @@ __global__ void gpu_comm_pre_prepare_send_doca(PrepareParams params, struct cuph
 
             //FIXME new sizeof(UplaneSymbolPacketInfo) is 16B, i.e., 128bits.
             uint32_t start_prbu_num_prbu = (msg_rb == 0)? (((int)pkt_num_prbs << 16) |(msg_start_prbu + prb_cnt)):(((int)pkt_num_prbs << 16) |(msg_start_prbu + 2 * prb_cnt)) ;
-            this_slot_gpu_symbol_info->packet_info[i].comm_buf = msg_flow_hdr_size_info->comm_buf;
-            this_slot_gpu_symbol_info->packet_info[i].cpu_comms_gpu_comm_buf = msg_flow_hdr_size_info->cpu_comm_gpu_comm_buf;
+            this_slot_gpu_symbol_info->packet_info[i].pkt_buff_mkey = (enable_gpu_comm_via_cpu) ? msg_flow_hdr_size_info->cpu_comms_pkt_buff_mkey : msg_flow_hdr_size_info->pkt_buff_mkey;
             this_slot_gpu_symbol_info->packet_info[i].rb   = msg_rb;
             this_slot_gpu_symbol_info->packet_info[i].prb_size   = prb_size_upl;
             // printf("sym %d pkt %d start_prbu %d hdr_stride %d old_hdr_idx %d\n",
@@ -310,12 +314,19 @@ __global__ void gpu_comm_pre_prepare_send_doca(PrepareParams params, struct cuph
 
             *((uint32_t*)&this_slot_gpu_symbol_info->packet_info[i].start_prbu) = start_prbu_num_prbu;
 
-            doca_gpu_dev_buf_get_buf((const struct doca_gpu_buf_arr *)this_slot_gpu_symbol_info->packet_info[i].comm_buf,
-                        this_slot_gpu_symbol_info->packet_info[i].hdr_stride,
-                        &this_slot_gpu_symbol_info->packet_info[i].buf);
+            if(enable_gpu_comm_via_cpu)
+            {
+                this_slot_gpu_symbol_info->packet_info[i].hdr_addr_tx = ((uint64_t)(msg_flow_hdr_size_info->cpu_pkt_addr) + (uint64_t)(this_slot_gpu_symbol_info->packet_info[i].hdr_stride*msg_flow_hdr_size_info->max_pkt_sz));
+                //printf("gpu_comm_pre_prepare_send_doca: hdr_addr_tx %lu cpu_pkt_addr %lu\n",this_slot_gpu_symbol_info->packet_info[i].hdr_addr_tx,(uint64_t)(msg_flow_hdr_size_info->cpu_pkt_addr));
+                this_slot_gpu_symbol_info->packet_info[i].hdr_addr = (uintptr_t)((uint64_t)(msg_flow_hdr_size_info->gpu_pkt_addr) + (uint64_t)(this_slot_gpu_symbol_info->packet_info[i].hdr_stride*msg_flow_hdr_size_info->max_pkt_sz));
+            }
+            else
+            {
+                this_slot_gpu_symbol_info->packet_info[i].hdr_addr_tx = ((uint64_t)(msg_flow_hdr_size_info->gpu_pkt_addr) + (uint64_t)(this_slot_gpu_symbol_info->packet_info[i].hdr_stride*msg_flow_hdr_size_info->max_pkt_sz));
+                this_slot_gpu_symbol_info->packet_info[i].hdr_addr =   (uintptr_t)this_slot_gpu_symbol_info->packet_info[i].hdr_addr_tx;      
+            }
+            
 
-            doca_gpu_dev_buf_get_addr((const struct doca_gpu_buf *)this_slot_gpu_symbol_info->packet_info[i].buf,
-                                &this_slot_gpu_symbol_info->packet_info[i].hdr_addr);
             // if(threadIdx.x == 0)
             // {
             //     auto& pkt_hdr_gpu = this_slot_gpu_symbol_info->packet_info[i].hdr_addr;
@@ -339,13 +350,6 @@ __global__ void gpu_comm_pre_prepare_send_doca(PrepareParams params, struct cuph
                 printf("gpu_comm_pre_prepare_send_doca: cell_id %d eaxcid %d threadIdx.x %d sym id %d hdr addr %p",cell_id,eaxcid,threadIdx.x,sym,(void*)this_slot_gpu_symbol_info->packet_info[i].hdr_addr);
             }
 */
-            //Overwrite "buf" address for CPU Comms
-            if(enable_gpu_comm_via_cpu)
-            {
-                doca_gpu_dev_buf_get_buf((const struct doca_gpu_buf_arr *)this_slot_gpu_symbol_info->packet_info[i].cpu_comms_gpu_comm_buf,
-                            this_slot_gpu_symbol_info->packet_info[i].hdr_stride,
-                            &this_slot_gpu_symbol_info->packet_info[i].buf);
-            }
 
             oran_umsg_hdrs *oran = (oran_umsg_hdrs*)(this_slot_gpu_symbol_info->packet_info[i].hdr_addr);
 //             printf("pkt %d sym=%d flow=%d starting at index %u with old sym %d cumulative %d stride %d ptr %p\n", old_tot_packets, sym, eaxcid, old_hdr_idx, old_sym_pkts, this_partial_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count[eaxcid][sym], this_slot_gpu_symbol_info->packet_info[i].hdr_stride,
@@ -430,11 +434,7 @@ __global__ void gpu_comm_pre_prepare_send_doca(PrepareParams params, struct cuph
       UplaneSymbolPacketInfo_t *packet_ptr    = &(this_slot_gpu_symbol_info->packet_info[pkt]);
       hdr_ptr                                 = (uint8_t*)packet_ptr->hdr_addr;
       hdr_format                              = (struct oran_umsg_hdrs *) hdr_ptr;
-#ifdef ENABLE_32DL
       uint16_t antenna_id                          = (hdr_format->ecpri.ecpriPcid >> 8) & 0x1f;
-#else
-      uint16_t antenna_id                          = (hdr_format->ecpri.ecpriPcid >> 8) & 0xf;
-#endif
       uint16_t antenna_idx                         = params.payload_info.eAxCMap[cell_id][antenna_id];
       //printf("gpu_comm_pre_prepare_send_doca: cell_id=%d ecpriPcid=%d antenna_id=%u antenna_idx=%u\n", cell_id, hdr_format->ecpri.ecpriPcid, antenna_id, antenna_idx);
       int packet_hdr_size = ORAN_UMSG_IQ_HDR_SIZE;
@@ -482,7 +482,6 @@ __global__ void gpu_comm_pre_prepare_send_doca(PrepareParams params, struct cuph
             }
         }
     }
-
 }
 
 int gpucomm_pre_prepare_send(PrepareParams &params, cudaStream_t cstream)
@@ -515,29 +514,29 @@ int gpucomm_pre_prepare_send(PrepareParams &params, cudaStream_t cstream)
     return 0;
 }
 
-template <bool enable_gpu_comm_via_cpu=false>
+template <bool enable_gpu_comm_via_cpu=false, bool enable_dl_cqe_tracing=false>
 __global__ void gpu_comm_prepare_send_doca(PrepareParams params, struct cuphy_pti_activity_stats_t activity_stats)
 {
     CuphyPtiRecordStartStopTimeScope scoped_record_start_stop_time(activity_stats);
     doca_error_t ret_doca;
     auto block  = cg::this_thread_block();
-    auto copy_group = cg::tiled_partition<THREAD_PER_PACKET_COPY>(block);   //4 threads group
-    uint32_t wqebb_idx_start = 0, tot_wqe = 0, wqebb_idx = 0;
+    uint32_t wqebb_idx_start = 0,wqebb_idx = 0;
     uint16_t prbu_buf_len = 0;
     __shared__ UplaneSymbolInfoGpu_t symbol_info;
     int sym                             = blockIdx.y;
     int cell_id                         = blockIdx.x;
     int packet_id;
     int packet_size;
-    uint8_t txq_send_flag = DOCA_GPU_SEND_FLAG_NONE;
+    doca_gpu_eth_send_flags txq_send_flag = DOCA_GPUNETIO_ETH_SEND_FLAG_NONE;
     uint32_t slot_id_abs = params.subframe_id*2 + params.slot_id;
     bool cqe_gen_en = ((params.payload_info.cqe_trace_cell_mask & (0x1<<cell_id)) && (params.payload_info.cqe_trace_slot_mask & (0x1<<slot_id_abs)));
+    struct doca_gpu_dev_eth_txq_wqe *wqe_ptr=NULL;
 
-    if(params.payload_info.enable_dl_cqe_tracing)
+    if(enable_dl_cqe_tracing)
     {
         if(cqe_gen_en)
         {
-            txq_send_flag=DOCA_GPU_SEND_FLAG_NOTIFY;
+            txq_send_flag=DOCA_GPUNETIO_ETH_SEND_FLAG_NOTIFY;
         }
     }
 
@@ -575,8 +574,9 @@ __global__ void gpu_comm_prepare_send_doca(PrepareParams params, struct cuphy_pt
     if(symbol_info.tot_pkts == 0)
         return;
 
-    ret_doca = doca_gpu_dev_eth_txq_get_info(eth_txq_gpu, &wqebb_idx_start, &tot_wqe);
+    wqebb_idx_start=static_cast<uint32_t>(doca_gpu_dev_eth_atomic_read<uint64_t, DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU>(&eth_txq_gpu->wqe_pi));
     wqebb_idx_start += symbol_info.previous_wqebbs + symbol_info.previous_waits;
+    //printf("gpu_comm_prepare_send_doca: wqebb_idx_start %d sym %d\n", wqebb_idx_start, sym);
 
 #ifdef DBG_GPU_COMM
     if ((threadIdx.x == 0) && (threadIdx.y == 0))
@@ -585,11 +585,12 @@ __global__ void gpu_comm_prepare_send_doca(PrepareParams params, struct cuphy_pt
 
     // One CTA per symbol/cell, so the first thread needs to set the sending timestamp
     if (threadIdx.x == 0) {
-        ret_doca = doca_gpu_dev_eth_txq_wait_time_enqueue_weak(eth_txq_gpu, symbol_info.ts, wqebb_idx_start & 0xFFFF, txq_send_flag);
+        wqe_ptr=doca_gpu_dev_eth_txq_get_wqe_ptr(eth_txq_gpu, wqebb_idx_start & 0xFFFF);
+        ret_doca = doca_gpu_dev_eth_txq_wqe_prepare_wait_time(eth_txq_gpu,wqe_ptr,wqebb_idx_start & 0xFFFF,symbol_info.ts,txq_send_flag);
         if (ret_doca != DOCA_SUCCESS) {
             printf("Error %d doca gpunetio enqueue wait on time\n", ret_doca);
         }
-        if(params.payload_info.enable_dl_cqe_tracing){
+        if(enable_dl_cqe_tracing){
             if(cqe_gen_en)
             {
                 params.cell_params[cell_id].start_dbg_info[wqebb_idx_start].time        = symbol_info.ts;
@@ -642,7 +643,7 @@ __global__ void gpu_comm_prepare_send_doca(PrepareParams params, struct cuphy_pt
         //uint32_t ds_idx         = (rel_pkt_id + 2) % SEGMENTS_PER_WQE;
         pkts_in_wqe             = (pkt_wqe_idx == last_wqe_idx) ? symbol_info.tot_pkts % EMPW_DSEG_MAX_NUM : EMPW_DSEG_MAX_NUM;
         wqebb_idx               = (wqebb_idx_start + rel_wqebb_idx) & 0xFFFF;
-        if(params.payload_info.enable_dl_cqe_tracing){
+        if(enable_dl_cqe_tracing){
             if(cqe_gen_en)
             {
                 params.cell_params[cell_id].start_dbg_info[wqebb_idx].time        = symbol_info.ts;
@@ -675,8 +676,8 @@ __global__ void gpu_comm_prepare_send_doca(PrepareParams params, struct cuphy_pt
         //     ((struct oran_ether_hdr*)(pkt_hdr_gpu))->src_addr.addr_bytes[4],
         //     ((struct oran_ether_hdr*)(pkt_hdr_gpu))->src_addr.addr_bytes[5]);
         // }
-    ret_doca = doca_gpu_dev_eth_txq_send_enqueue_empw(eth_txq_gpu, packet_ptr->buf, packet_size,
-                            wqebb_idx, pkts_in_wqe, rel_pkt_id, txq_send_flag);
+        wqe_ptr=doca_gpu_dev_eth_txq_get_wqe_ptr(eth_txq_gpu, wqebb_idx);
+        ret_doca = doca_gpu_dev_eth_txq_wqe_prepare_send_empw(eth_txq_gpu,wqe_ptr,wqebb_idx,pkts_in_wqe, rel_pkt_id,(uint64_t)packet_ptr->hdr_addr_tx,packet_ptr->pkt_buff_mkey,packet_size,txq_send_flag);
 
 #ifdef DBG_GPU_COMM
         if (ret_doca != DOCA_SUCCESS) {
@@ -694,13 +695,13 @@ __global__ void gpu_comm_prepare_send_doca(PrepareParams params, struct cuphy_pt
             (rel_pkt_id == 0)) {
                 this_slot_info->last_wqebb_ctrl_idx[sym] = wqebb_idx;
                 h_slot_info->wqebbs_per_cell[sym]        = this_slot_info->gpu_symbol_info[sym].tot_wqebbs + (this_slot_info->gpu_symbol_info[sym].tot_pkts > 0 ? 1 : 0);
-                h_slot_info->sq_db_rec                                = eth_txq_gpu->sq_db_rec;
+                //h_slot_info->sq_db_rec                                = eth_txq_gpu->sq_db_rec; //TODO: Check for the replacement in DOCA 3.2
                 h_slot_info->wqe_mask                                  = eth_txq_gpu->wqe_mask;
                 uint32_t wqe_idx = wqebb_idx & eth_txq_gpu->wqe_mask;
                 h_slot_info->test_wqe[sym] = wqe_idx;
-                h_slot_info->wqe[sym] = *((uint64_t *)(&(((struct mlx5_wqe_eth *)eth_txq_gpu->wqe_addr)[wqe_idx])));
-                h_slot_info->wqe_addr[sym] = &(((struct mlx5_wqe_eth *)eth_txq_gpu->wqe_addr)[wqe_idx]);
-                h_slot_info->sq_db = eth_txq_gpu->sq_db;
+                //h_slot_info->wqe[sym] = *((uint64_t *)(&(((struct mlx5_wqe_eth *)eth_txq_gpu->wqe_addr)[wqe_idx]))); //TODO: Check for the replacement in DOCA 3.2
+                //h_slot_info->wqe_addr[sym] = &(((struct mlx5_wqe_eth *)eth_txq_gpu->wqe_addr)[wqe_idx]); //TODO: Check for the replacement in DOCA 3.2
+                //h_slot_info->sq_db = eth_txq_gpu->sq_db; //TODO: Check for the replacement in DOCA 3.2
         }
 
         __syncthreads();
@@ -709,15 +710,18 @@ __global__ void gpu_comm_prepare_send_doca(PrepareParams params, struct cuphy_pt
             uint32_t oldBlock = atomicAdd(block_count, 1);
 
             if (oldBlock == params.cell_params[cell_id].partial_slot_info->syms_with_packets - 1) {
-                    uint32_t wqe_pi = eth_txq_gpu->wqe_pi;
+                    const uint32_t wqe_pi = static_cast<uint32_t>(doca_gpu_dev_eth_atomic_read<uint64_t, DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU>(&eth_txq_gpu->wqe_pi));
 
                     h_slot_info->old_wqe_pi = wqe_pi;
                     uint32_t wqebbs_per_cell = 0;
                     for (int isym = 0; isym < 14; isym++) {
                         wqebbs_per_cell += this_slot_info->gpu_symbol_info[isym].tot_wqebbs + (this_slot_info->gpu_symbol_info[isym].tot_pkts > 0 ? 1 : 0);
                     }
-                    wqe_pi = (wqe_pi + wqebbs_per_cell) & DOCA_GPUNETIO_WQE_PI_MASK;
-                    eth_txq_gpu->wqe_pi = wqe_pi;
+                    
+                    // Submit all WQEs for this cell by calling submit_proxy with the final producer index
+                    const uint32_t final_wqe_pi = wqe_pi + wqebbs_per_cell;
+                    doca_gpu_dev_eth_txq_submit_proxy<DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU, DOCA_GPUNETIO_ETH_SYNC_SCOPE_CTA>(eth_txq_gpu, final_wqe_pi);
+                    //printf("gpu_comm_prepare_send_doca: wqe_pi %d wqebbs_per_cell %d final_wqe_pi %d cell %d sym %d\n", wqe_pi, wqebbs_per_cell, final_wqe_pi, cell_id, sym);
                 *block_count = 0;
             }
         }
@@ -737,22 +741,22 @@ __global__ void gpu_comm_prepare_send_doca_nonEmpw(PrepareParams params, struct 
     CuphyPtiRecordStartStopTimeScope scoped_record_start_stop_time(activity_stats);
     doca_error_t ret_doca;
     auto block  = cg::this_thread_block();
-    auto copy_group = cg::tiled_partition<THREAD_PER_PACKET_COPY>(block);   //4 threads group
-    uint32_t wqebb_idx_start = 0, tot_wqe = 0;
+    uint32_t wqebb_idx_start = 0;
     uint16_t prbu_buf_len = 0;
     __shared__ UplaneSymbolInfoGpu_t symbol_info;
     int sym                             = blockIdx.y;
     int cell_id                         = blockIdx.x;
     int packet_id;
-    uint8_t txq_send_flag = DOCA_GPU_SEND_FLAG_NONE;
+    doca_gpu_eth_send_flags txq_send_flag = DOCA_GPUNETIO_ETH_SEND_FLAG_NONE;
     uint32_t slot_id_abs = params.subframe_id*2 + params.slot_id;
     bool cqe_gen_en = ((params.payload_info.cqe_trace_cell_mask & (0x1<<cell_id)) && (params.payload_info.cqe_trace_slot_mask & (0x1<<slot_id_abs)));
+    struct doca_gpu_dev_eth_txq_wqe *wqe_ptr=NULL;
 
     if(params.payload_info.enable_dl_cqe_tracing)
     {
         if(cqe_gen_en)
         {
-            txq_send_flag=DOCA_GPU_SEND_FLAG_NOTIFY;
+            txq_send_flag=DOCA_GPUNETIO_ETH_SEND_FLAG_NOTIFY;
         }
     }
 
@@ -788,7 +792,7 @@ __global__ void gpu_comm_prepare_send_doca_nonEmpw(PrepareParams params, struct 
     if(symbol_info.tot_pkts == 0)
         return;
 
-    ret_doca = doca_gpu_dev_eth_txq_get_info(eth_txq_gpu, &wqebb_idx_start, &tot_wqe);
+    wqebb_idx_start=static_cast<uint32_t>(doca_gpu_dev_eth_atomic_read<uint64_t, DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU>(&eth_txq_gpu->wqe_pi));
     wqebb_idx_start += symbol_info.previous_pkts + symbol_info.previous_waits;
 
 #ifdef DBG_GPU_COMM
@@ -798,7 +802,8 @@ __global__ void gpu_comm_prepare_send_doca_nonEmpw(PrepareParams params, struct 
 
     // One CTA per symbol/cell, so the first thread needs to set the sending timestamp
     if (threadIdx.x == 0) {
-        ret_doca = doca_gpu_dev_eth_txq_wait_time_enqueue_weak(eth_txq_gpu, symbol_info.ts, wqebb_idx_start & 0xFFFF, txq_send_flag);
+        wqe_ptr=doca_gpu_dev_eth_txq_get_wqe_ptr(eth_txq_gpu, wqebb_idx_start & 0xFFFF);
+        ret_doca = doca_gpu_dev_eth_txq_wqe_prepare_wait_time(eth_txq_gpu,wqe_ptr,wqebb_idx_start & 0xFFFF,symbol_info.ts,txq_send_flag);        
         if (ret_doca != DOCA_SUCCESS) {
             printf("Error %d doca gpunetio enqueue wait on time\n", ret_doca);
         }
@@ -849,7 +854,8 @@ __global__ void gpu_comm_prepare_send_doca_nonEmpw(PrepareParams params, struct 
         UplaneSymbolPacketInfo_t *packet_ptr = &(symbol_info.packet_info[packet_id]);
         prbu_buf_len = packet_ptr->num_prbu * prb_size_upl;
         wqe_idx = (wqebb_idx_start + packet_id) & 0xFFFF;
-        ret_doca = doca_gpu_dev_eth_txq_send_enqueue_weak(eth_txq_gpu, packet_ptr->buf, ORAN_UMSG_IQ_HDR_SIZE + prbu_buf_len, wqe_idx,txq_send_flag);
+        wqe_ptr=doca_gpu_dev_eth_txq_get_wqe_ptr(eth_txq_gpu, wqe_idx);
+        ret_doca = doca_gpu_dev_eth_txq_wqe_prepare_send(eth_txq_gpu,wqe_ptr,wqe_idx,(uint64_t)packet_ptr->hdr_addr_tx,packet_ptr->pkt_buff_mkey,ORAN_UMSG_IQ_HDR_SIZE + prbu_buf_len,txq_send_flag);        
 
 #ifdef DBG_GPU_COMM
         if (ret_doca != DOCA_SUCCESS) {
@@ -871,16 +877,38 @@ int gpucomm_prepare_send(PrepareParams &params, cudaStream_t cstream)
         if(params.enable_gpu_comm_via_cpu == 1)
         {
             const bool enable_gpu_comm_via_cpu = true;
-            gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-                params,
-                activity_stats);
+            if(params.payload_info.enable_dl_cqe_tracing)
+            {
+                const bool enable_dl_cqe_tracing = true;
+                gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu, enable_dl_cqe_tracing><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
+                    params,
+                    activity_stats);
+            }
+            else
+            {
+                const bool enable_dl_cqe_tracing = false;
+                gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu, enable_dl_cqe_tracing><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
+                    params,
+                    activity_stats);
+            }
         }
         else
         {
             const bool enable_gpu_comm_via_cpu = false;
-            gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-                params,
-                activity_stats);
+            if(params.payload_info.enable_dl_cqe_tracing)
+            {
+                const bool enable_dl_cqe_tracing = true;
+                gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu, enable_dl_cqe_tracing><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
+                    params,
+                    activity_stats);
+            }
+            else
+            {
+                const bool enable_dl_cqe_tracing = false;
+                gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu, enable_dl_cqe_tracing><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
+                    params,
+                    activity_stats);
+            }
         }
     }
     else
@@ -897,23 +925,55 @@ int gpucomm_prepare_send(PrepareParams &params, cudaStream_t cstream)
     }
     return 0;
 }
+// Simple kernel to ring doorbell for each cell
+// Each thread handles one cell based on threadIdx.x
+__global__ void gpucomm_ring_doorbell_per_cell(doca_gpu_eth_txq** txq_handlers, const uint32_t* wqe_indices, const uint32_t num_cells)
+{
+    const uint32_t cell_id = threadIdx.x;
+    
+    if (cell_id < num_cells) {
+        doca_gpu_dev_eth_txq_submit_proxy<DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU,DOCA_GPUNETIO_ETH_SYNC_SCOPE_CTA>(txq_handlers[cell_id], wqe_indices[cell_id]);
+        //printf("gpucomm_ring_doorbell_per_cell cell_id %d wqe_indices[cell_id] %d\n", cell_id, wqe_indices[cell_id]);
+    }
+}
+
+// Host function to launch the ring doorbell kernel
+int gpucomm_ring_doorbell_for_cells(doca_gpu_eth_txq** d_txq_handlers, const uint32_t* d_wqe_indices, const uint32_t num_cells, cudaStream_t cstream)
+{
+    if (num_cells == 0) {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] num_cells is 0", __FILE__, __LINE__);
+        return -1;
+    }
+    
+    if (num_cells > 1024) {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] num_cells {} exceeds maximum block size", __FILE__, __LINE__, num_cells);
+        return -1;
+    }
+    
+    // Launch with 1 block and num_cells threads (CTA size based on number of cells)
+    gpucomm_ring_doorbell_per_cell<<<1, num_cells, 0, cstream>>>(d_txq_handlers, d_wqe_indices, num_cells);
+    
+    const cudaError_t result = cudaGetLastError();
+    if (cudaSuccess != result) {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching gpucomm_ring_doorbell_per_cell kernel failed with {}", __FILE__, __LINE__, cudaGetErrorString(result));
+        return -1;
+    }
+    
+    return 0;
+}
 
 __global__ void gpu_comm_trigger_send_doca_cx6(TriggerParams params, const uint32_t ncells, uint32_t *wait_flag, const uint32_t wait_val,struct cuphy_pti_activity_stats_t activity_stats)
 {
     CuphyPtiRecordStartStopTimeScope scoped_record_start_stop_time(activity_stats);
-    uint32_t wqebbs_per_cell = params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS -1].previous_wqebbs +
-                    params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].tot_wqebbs +
-                    params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].previous_waits +
-                    (params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].tot_pkts > 0 ? 1 : 0);
 
-    doca_gpu_dev_eth_txq_commit_weak((struct doca_gpu_eth_txq *)params.cell_params[threadIdx.x].eth_txq_gpu, wqebbs_per_cell);
+    doca_gpu_dev_eth_txq_update_dbr(params.cell_params[threadIdx.x].eth_txq_gpu,params.cell_params[threadIdx.x].d_slot_info->last_wqebb_ctrl_idx[0]);
     // Assuming less than 32 cells
     __syncwarp();
 
     if (threadIdx.x == 0) {
         while(DOCA_GPUNETIO_VOLATILE(*wait_flag) != wait_val);
         for (int i = 0; i < blockDim.x; i++)
-            doca_gpu_dev_eth_txq_push_empw((const struct doca_gpu_eth_txq *)params.cell_params[i].eth_txq_gpu, params.cell_params[i].d_slot_info->last_wqebb_ctrl_idx[0]);
+            doca_gpu_dev_eth_txq_ring_db(params.cell_params[i].eth_txq_gpu,params.cell_params[i].d_slot_info->last_wqebb_ctrl_idx[0]); 
             // doca_gpu_device_send_trigger_thread_cx6(params.cell_params[i].txq_info_gpu);
     }
 }
@@ -922,12 +982,14 @@ __global__ void gpu_comm_trigger_send_doca_cx7(TriggerParams params, const uint3
 {
     CuphyPtiRecordStartStopTimeScope scoped_record_start_stop_time(activity_stats);
 
+    //printf("gpu_comm_trigger_send_doca_cx7 threadIdx.x %d params.cell_params[i].d_slot_info->last_wqebb_ctrl_idx[0] %d\n", threadIdx.x, params.cell_params[threadIdx.x].d_slot_info->last_wqebb_ctrl_idx[0]);
     uint32_t wqebbs_per_cell;
     wqebbs_per_cell = params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS -1].previous_wqebbs +
                     params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].tot_wqebbs +
                     params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].previous_waits +
                     (params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].tot_pkts > 0 ? 1 : 0);
-    doca_gpu_dev_eth_txq_commit_weak((struct doca_gpu_eth_txq *)params.cell_params[threadIdx.x].eth_txq_gpu, wqebbs_per_cell);
+    doca_gpu_dev_eth_txq_update_dbr(params.cell_params[threadIdx.x].eth_txq_gpu,wqebbs_per_cell);
+    doca_gpu_dev_eth_atomic_add<uint64_t, DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU>(&params.cell_params[threadIdx.x].eth_txq_gpu->wqe_pi, wqebbs_per_cell);
 
     // Assuming less than 32 cells
     if (wait_flag && threadIdx.x == 0)
@@ -939,11 +1001,11 @@ __global__ void gpu_comm_trigger_send_doca_cx7(TriggerParams params, const uint3
     if (threadIdx.x == 0) {
         while(DOCA_GPUNETIO_VOLATILE(*wait_flag) != wait_val);
         for (int i = 0; i < blockDim.x; i++)
-            doca_gpu_dev_eth_txq_push_empw((const struct doca_gpu_eth_txq *)params.cell_params[i].eth_txq_gpu, params.cell_params[i].d_slot_info->last_wqebb_ctrl_idx[0]);
+            doca_gpu_dev_eth_txq_ring_db(params.cell_params[i].eth_txq_gpu,params.cell_params[i].eth_txq_gpu->wqe_pi); 
             // doca_gpu_device_send_trigger_thread_cx6(params.cell_params[i].txq_info_gpu);
     }
 #else
-    doca_gpu_dev_eth_txq_push_empw((const struct doca_gpu_eth_txq *)params.cell_params[threadIdx.x].eth_txq_gpu, params.cell_params[threadIdx.x].d_slot_info->last_wqebb_ctrl_idx[0]);
+    doca_gpu_dev_eth_txq_ring_db(params.cell_params[threadIdx.x].eth_txq_gpu,params.cell_params[threadIdx.x].eth_txq_gpu->wqe_pi);
 #endif
 }
 
@@ -954,8 +1016,9 @@ __global__ void gpu_comm_trigger_send_doca_nonEmpw_cx7(TriggerParams params, con
     wqebbs_per_cell = params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS -1].previous_pkts +
                     params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].tot_pkts +
                     params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].previous_waits +
-                    (params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].tot_pkts > 0 ? 1 : 0);
-    doca_gpu_dev_eth_txq_commit_weak((struct doca_gpu_eth_txq *)params.cell_params[threadIdx.x].eth_txq_gpu, wqebbs_per_cell);
+                    (params.cell_params[threadIdx.x].d_slot_info->gpu_symbol_info[SLOT_NUM_SYMS-1].tot_pkts > 0 ? 1 : 0);    
+    doca_gpu_dev_eth_txq_update_dbr(params.cell_params[threadIdx.x].eth_txq_gpu,wqebbs_per_cell);
+    doca_gpu_dev_eth_atomic_add<uint64_t, DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU>(&params.cell_params[threadIdx.x].eth_txq_gpu->wqe_pi, wqebbs_per_cell);
     // Assuming less than 32 cells
 
     if (wait_flag && threadIdx.x == 0)
@@ -967,11 +1030,11 @@ __global__ void gpu_comm_trigger_send_doca_nonEmpw_cx7(TriggerParams params, con
     if (threadIdx.x == 0) {
         while(DOCA_GPUNETIO_VOLATILE(*wait_flag) != wait_val);
         for (int i = 0; i < blockDim.x; i++)
-            doca_gpu_dev_eth_txq_push_empw((const struct doca_gpu_eth_txq *)params.cell_params[i].eth_txq_gpu, params.cell_params[i].d_slot_info->last_wqebb_ctrl_idx[0]);
+            doca_gpu_dev_eth_txq_ring_db(params.cell_params[i].eth_txq_gpu,params.cell_params[i].d_slot_info->last_wqebb_ctrl_idx[0]);
             // doca_gpu_device_send_trigger_thread_cx6(params.cell_params[i].txq_info_gpu);
     }
 #else
-    doca_gpu_dev_eth_txq_push_empw((const struct doca_gpu_eth_txq *)params.cell_params[threadIdx.x].eth_txq_gpu, params.cell_params[threadIdx.x].d_slot_info->last_wqebb_ctrl_idx[0]);
+    doca_gpu_dev_eth_txq_ring_db(params.cell_params[threadIdx.x].eth_txq_gpu,params.cell_params[threadIdx.x].d_slot_info->last_wqebb_ctrl_idx[0]);
 #endif
 }
 
@@ -1020,15 +1083,18 @@ int gpucomm_trigger_send(TriggerParams &params, cudaStream_t cstream, bool cx6)
 
 void force_loading_gpu_comm_kernels()
 {
-    std::array<void*, 11> gpu_comm_kernels = {
+    std::array<void*, 14> gpu_comm_kernels = {
      (void*)warmup,
      (void*)memset_kernel,
      (void*)packet_memcpy_kernel,
      (void*)gpu_comm_pre_prepare_send_doca<true>,
      (void*)gpu_comm_pre_prepare_send_doca<false>,
-     (void*)gpu_comm_prepare_send_doca<true>,
-     (void*)gpu_comm_prepare_send_doca<false>,
+     (void*)gpu_comm_prepare_send_doca<false, false>,
+     (void*)gpu_comm_prepare_send_doca<false, true>,
+     (void*)gpu_comm_prepare_send_doca<true, false>,
+     (void*)gpu_comm_prepare_send_doca<true, true>,
      (void*)gpu_comm_prepare_send_doca_nonEmpw,
+     (void*)gpucomm_ring_doorbell_per_cell,
      (void*)gpu_comm_trigger_send_doca_cx6,
      (void*)gpu_comm_trigger_send_doca_cx7,
      (void*)gpu_comm_trigger_send_doca_nonEmpw_cx7};

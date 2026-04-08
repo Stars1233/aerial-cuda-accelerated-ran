@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +35,11 @@ static std::unique_ptr<SimulatePhyDriver> sSimulateDrv;
 PHYDriverProxy& PHYDriverProxy::getInstance()
 {
     return *sProxy;
+}
+
+PHYDriverProxy* PHYDriverProxy::getInstancePtr()
+{
+    return sProxy.get();
 }
 
 void PHYDriverProxy::make(phydriver_handle driver, mplane_config& config)
@@ -392,11 +397,11 @@ std::vector<cell_mplane_info>& PHYDriverProxy::getMPlaneConfigList()
     return config_;
 }
 
-void PHYDriverProxy:: l1_copy_TB_to_gpu_buf(uint16_t phy_cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref,uint32_t tb_len, uint8_t slot_index)
+void PHYDriverProxy:: l1_copy_TB_to_gpu_buf(uint16_t phy_cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref,uint32_t tb_len, uint8_t slot_index, uint16_t sfn)
 {
     /*Copy Tb from CPU buff to GPU*/
     //::l1_copy_TB_to_gpu_buf(driver_, phy_cell_id, tb_buff, gpu_buff_ref, tb_len, slot_index);
-    ::l1_copy_TB_to_gpu_buf_thread_offload(driver_, phy_cell_id, tb_buff, gpu_buff_ref, tb_len, slot_index);
+    ::l1_copy_TB_to_gpu_buf_thread_offload(driver_, phy_cell_id, tb_buff, gpu_buff_ref, tb_len, slot_index, sfn);
     return;
 }
 

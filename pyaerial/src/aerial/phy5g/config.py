@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@ from typing import List, Optional
 import numpy as np
 import cupy as cp  # type: ignore
 
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.csirs.csirs_api import CsiRsConfig
 from aerial.phy5g.api import SlotConfig
 from aerial.phy5g.api import PipelineConfig
@@ -200,7 +201,7 @@ class AerialPuschRxConfig(PipelineConfig):
 
 
 def _pusch_config_to_cuphy(
-        cuda_stream: int,
+        cuda_stream: CudaStream,
         rx_data: List[cp.ndarray],
         slot: int,
         pusch_configs: List[PuschConfig]) -> PuschDynPrms:
@@ -240,8 +241,10 @@ def _pusch_config_to_cuphy(
             ue_prms.append(PuschUePrm(
                 pduBitmap=np.uint16(1),
                 ueGrpIdx=np.uint16(ue_grp_idx),
+                enableTfPrcd=np.uint8(0),  # Disabled, not supported by pyAerial.
                 scid=np.uint8(ue_params.scid),
                 dmrsPortBmsk=np.uint16(ue_params.dmrs_ports),
+                nlAbove16=np.uint8(0),
                 mcsTable=np.uint8(ue_params.mcs_table),
                 mcsIndex=np.uint8(ue_params.mcs_index),
                 TBSize=np.uint32(ue_params.tb_size),
@@ -257,8 +260,7 @@ def _pusch_config_to_cuphy(
                 i_lbrm=np.uint8(0),
                 maxLayers=np.uint8(4),
                 maxQm=np.uint8(8),
-                n_PRB_LBRM=np.uint16(273),
-                enableTfPrcd=np.uint8(0),  # Disabled, not supported by pyAerial.
+                n_PRB_LBRM=np.uint16(273)
             ))
 
         num_ues += num_ues_in_grp
@@ -307,8 +309,8 @@ def _pusch_config_to_cuphy(
         harqBuffersInOut=[]
     )
     pusch_dyn_prms = PuschDynPrms(
-        phase1Stream=cuda_stream,
-        phase2Stream=cuda_stream,
+        phase1Stream=cuda_stream.handle,
+        phase2Stream=cuda_stream.handle,
         setupPhase=PuschSetupPhase.PUSCH_SETUP_PHASE_1,
         procModeBmsk=np.uint64(0),  # Controls PUSCH mode (e.g., will use CUDA graphs
                                     # if least significant bit is 1; streams if 0)
@@ -566,7 +568,7 @@ class PdschDmrsConfig:
 
 def _pdsch_config_to_cuphy(  # pylint: disable=too-many-locals
         *,
-        cuda_stream: int,
+        cuda_stream: CudaStream,
         tb_inputs: List[cp.ndarray],
         tx_output_mem: np.uint64,
         slot: int,
@@ -665,7 +667,8 @@ def _pdsch_config_to_cuphy(  # pylint: disable=too-many-locals
                 dataScramId=np.uint16(ue_params.data_scid),
                 cwIdxs=list(np.array(range(num_cws, num_cws + num_cws_per_ue), dtype=np.uint16)),
                 enablePrcdBf=enable_prcd_bf,
-                pmwPrmIdx=ue_pmw_prm_idx
+                pmwPrmIdx=ue_pmw_prm_idx,
+                nlAbove16=np.uint8(0)  # Not supporting 32 layer PDSCH
             ))
 
             tb_offset += tb_inputs[ue_idx].size
@@ -685,7 +688,7 @@ def _pdsch_config_to_cuphy(  # pylint: disable=too-many-locals
         pmwPrms=pmw_prms
     )
 
-    with cp.cuda.ExternalStream(int(cuda_stream)):
+    with cuda_stream:
         tb_inputs = cp.concatenate(tb_inputs)
 
     # Wrap CuPy arrays into pycuphy types.
@@ -707,7 +710,7 @@ def _pdsch_config_to_cuphy(  # pylint: disable=too-many-locals
     )
 
     pdsch_dyn_prms = PdschDynPrms(
-        cuStream=cuda_stream,
+        cuStream=cuda_stream.handle,
         procModeBmsk=np.uint64(4),  # Enable inter-cell batching.
         cellGrpDynPrm=cell_grp_dyn_prm,
         dataIn=data_in,

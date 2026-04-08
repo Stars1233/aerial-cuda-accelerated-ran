@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -451,6 +451,7 @@ switch pduType
         if(isfield(pdsch,'prgSize'))
             pdu.prgSize         = pdsch.prgSize;
         end
+        pdu.enable_prg_chest = 0;
 
         % static beamforming
         if SimCtrl.enable_static_dynamic_beamforming && pdsch.digBFInterfaces

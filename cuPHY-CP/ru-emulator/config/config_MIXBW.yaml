@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +14,7 @@
 # limitations under the License.
 
 ---
-aerial_sdk_version: 25-3-cubb
+aerial_sdk_version: 26-1-cubb
 ru_emulator:
   core_list:
   - 2
@@ -568,7 +568,8 @@ ru_emulator:
   dl_approx_validation: 0
   enable_mmimo: 0
   enable_beam_forming: 1
-  dl_warmup_slots: 2000
+  dl_warmup_slots: 512
+  ul_warmup_slots: 128
   dlc_tb: 0
   fix_beta_dl: 0
   payload_validation: 1

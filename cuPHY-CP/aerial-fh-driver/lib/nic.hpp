@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -399,7 +399,7 @@ protected:
     void create_cpu_pinned_mbuf_pool();            //!< Create CPU-pinned mbuf memory pool
     void create_tx_request_uplane_pool();          //!< Create TX request pool for U-plane
     void create_tx_request_cplane_pool();          //!< Create TX request pool for C-plane
-    void print_link_info() const;                  //!< Print link status information
+    void check_physical_link_status() const;       //!< Check link status
     void add_device();                             //!< Add device to DPDK
     void remove_device();                          //!< Remove device from DPDK
     void set_port_id();                            //!< Set DPDK port ID

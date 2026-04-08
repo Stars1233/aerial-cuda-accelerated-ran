@@ -176,19 +176,19 @@ PhyPrachAggr::PhyPrachAggr(
                                     MAX_N_ANTENNAS_SUPPORTED,
                                     PRACH_MAX_OCCASIONS_AGGR,
                                     cuphy::tensor_flags::align_tight));
-        mf.addGpuRegularSize(ant_rssi.desc().get_size_in_bytes());
+        mf.addCpuPinnedSize(ant_rssi.desc().get_size_in_bytes());
 
         rssi = std::move(cuphy::tensor_pinned(
                                     CUPHY_R_32F,
                                     PRACH_MAX_OCCASIONS_AGGR,
                                     cuphy::tensor_flags::align_tight));
-        mf.addGpuRegularSize(rssi.desc().get_size_in_bytes());
+        mf.addCpuPinnedSize(rssi.desc().get_size_in_bytes());
 
         interference = std::move(cuphy::tensor_pinned(
                                     CUPHY_R_32F,
                                     PRACH_MAX_OCCASIONS_AGGR,
                                     cuphy::tensor_flags::align_tight));
-        mf.addGpuRegularSize(interference.desc().get_size_in_bytes());
+        mf.addCpuPinnedSize(interference.desc().get_size_in_bytes());
 
         pDynParams.cuStream = s_channel;
         pDynParams.pDataOut = &pOutput;
@@ -859,6 +859,7 @@ int PhyPrachAggr::callback()
         #endif
         
         ul_cb.prach_cb_fn(
+            ul_cb.prach_cb_context,
             *(aggr_slot_params->si), *prach, (uint32_t*)cpu_num_detectedPrmb.addr(),
             cpu_prmbIndex_estimates.addr(), cpu_prmbDelay_estimates.addr(), cpu_prmbPower_estimates.addr(),
             (void *)ant_rssi.addr(), (void *)rssi.addr(), (void *)interference.addr());

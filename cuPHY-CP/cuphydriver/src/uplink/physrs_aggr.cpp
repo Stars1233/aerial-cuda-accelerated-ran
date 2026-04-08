@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -109,6 +109,7 @@ PhySrsAggr::PhySrsAggr(
             tDataRxInput[idx] = std::move(cuphy::tensor_device(CUPHY_C_16F, ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB,
                                                                 ORAN_MAX_SRS_SYMBOLS, MAX_AP_PER_SLOT_SRS, /*Change this  to actual number of SRS eAxC IDs used in the test if SRS_H5DUMP is enabled*/
                                                                 cuphy::tensor_flags::align_tight));
+            mf.addGpuRegularSize(tDataRxInput[idx].desc().get_size_in_bytes());
             DataIn.pTDataRx[idx].desc = tDataRxInput[idx].desc().handle();
             DataIn.pTDataRx[idx].pAddr = nullptr;
         }
@@ -171,7 +172,7 @@ void PhySrsAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     tPrmW_comb2_nPorts2_wide = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb2_nPorts2_wide"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmW_comb2_nPorts2_wide.desc().get_size_in_bytes());
     tPrmW_comb2_nPorts4_wide = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb2_nPorts4_wide"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
-    mf.addGpuRegularSize(tPrmW_comb2_nPorts2_wide.desc().get_size_in_bytes());
+    mf.addGpuRegularSize(tPrmW_comb2_nPorts4_wide.desc().get_size_in_bytes());
     tPrmW_comb2_nPorts8_wide = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb2_nPorts8_wide"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmW_comb2_nPorts8_wide.desc().get_size_in_bytes());
     tPrmW_comb4_nPorts1_wide = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts1_wide"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
@@ -179,7 +180,7 @@ void PhySrsAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     tPrmW_comb4_nPorts2_wide = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts2_wide"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmW_comb4_nPorts2_wide.desc().get_size_in_bytes());
     tPrmW_comb4_nPorts4_wide = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts4_wide"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
-    mf.addGpuRegularSize(tPrmW_comb4_nPorts2_wide.desc().get_size_in_bytes());
+    mf.addGpuRegularSize(tPrmW_comb4_nPorts4_wide.desc().get_size_in_bytes());
     tPrmW_comb4_nPorts6_wide = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts6_wide"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmW_comb4_nPorts6_wide.desc().get_size_in_bytes());
     tPrmW_comb4_nPorts12_wide = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts12_wide"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
@@ -189,7 +190,7 @@ void PhySrsAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     tPrmW_comb2_nPorts2_narrow = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb2_nPorts2_narrow"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmW_comb2_nPorts2_narrow.desc().get_size_in_bytes());
     tPrmW_comb2_nPorts4_narrow = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb2_nPorts4_narrow"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
-    mf.addGpuRegularSize(tPrmW_comb2_nPorts2_narrow.desc().get_size_in_bytes());
+    mf.addGpuRegularSize(tPrmW_comb2_nPorts4_narrow.desc().get_size_in_bytes());
     tPrmW_comb2_nPorts8_narrow = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb2_nPorts8_narrow"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmW_comb2_nPorts8_narrow.desc().get_size_in_bytes());
     tPrmW_comb4_nPorts1_narrow = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts1_narrow"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
@@ -197,7 +198,7 @@ void PhySrsAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     tPrmW_comb4_nPorts2_narrow = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts2_narrow"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmW_comb4_nPorts2_narrow.desc().get_size_in_bytes());
     tPrmW_comb4_nPorts4_narrow = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts4_narrow"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);    
-    mf.addGpuRegularSize(tPrmW_comb4_nPorts2_narrow.desc().get_size_in_bytes());
+    mf.addGpuRegularSize(tPrmW_comb4_nPorts4_narrow.desc().get_size_in_bytes());
     tPrmW_comb4_nPorts6_narrow = cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts6_narrow"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);    
     mf.addGpuRegularSize(tPrmW_comb4_nPorts6_narrow.desc().get_size_in_bytes());
     tPrmW_comb4_nPorts12_narrow= cuphy::tensor_from_dataset(fInput.open_dataset("W_comb4_nPorts12_narrow"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);    
@@ -207,7 +208,7 @@ void PhySrsAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     tPrmSrsRkhs_eigValues_grid1 = cuphy::tensor_from_dataset(fInput.open_dataset("srsRkhs_eigValues_grid1"), CUPHY_R_32F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmSrsRkhs_eigValues_grid1.desc().get_size_in_bytes());
     tPrmSrsRkhs_eigValues_grid2 = cuphy::tensor_from_dataset(fInput.open_dataset("srsRkhs_eigValues_grid2"), CUPHY_R_32F, cuphy::tensor_flags::align_tight, s_channel);
-    mf.addGpuRegularSize(tPrmSrsRkhs_eigValues_grid1.desc().get_size_in_bytes());
+    mf.addGpuRegularSize(tPrmSrsRkhs_eigValues_grid2.desc().get_size_in_bytes());
     tPrmSrsRkhs_eigenCorr_grid0 = cuphy::tensor_from_dataset(fInput.open_dataset("srsRkhs_eigenCorr_grid0"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
     mf.addGpuRegularSize(tPrmSrsRkhs_eigenCorr_grid0.desc().get_size_in_bytes());
     tPrmSrsRkhs_eigenCorr_grid1 = cuphy::tensor_from_dataset(fInput.open_dataset("srsRkhs_eigenCorr_grid1"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, s_channel);
@@ -567,10 +568,15 @@ int PhySrsAggr::setup(
         }
         else
         {
+            uint16_t prgSize = dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].prgSize;
+            if(prgSize > 4)
+            {
+                prgSize = 2; 
+            }
             cv_ptr->configSrsInfo(pparms->dl_ul_bwp_max_prg[cell_idx],
                                   pparms->nGnbAnt, 
                                   CV_NUM_UE_LAYER, 
-                                  dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].prgSize, 
+                                  prgSize, 
                                   dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].srsStartPrg,
                                   dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].startValidPrg,
                                   dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].nValidPrg);
@@ -645,7 +651,10 @@ int PhySrsAggr::run()
             ret=-1;
         }    
     }
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+    {
+        MemtraceDisableScope md;
+        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+    }
 
     t_ns t3 = Time::nowNs();
     NVLOGD_FMT(TAG, "PhySrsAggr{} ru", this_id);
@@ -770,7 +779,7 @@ int PhySrsAggr::callback(const std::array<bool,UL_MAX_CELLS_PER_SLOT>& srs_order
 
         // Only for compilation to run pass actual cuphyPuschDataOut_t* struct
         // nCRC calculated on the GPU with cuPHYTools kernel
-        ul_cb.srs_cb_fn(msg, *(aggr_slot_params->si), *srs, &DataOut, &static_params, srs_order_cell_timeout_list);
+        ul_cb.srs_cb_fn(ul_cb.srs_cb_context, msg, *(aggr_slot_params->si), *srs, &DataOut, &static_params, srs_order_cell_timeout_list);
     }
 
     return 0;

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@ import os
 import yaml
 
 from ..analyze import extract
+from ..traffic_utils import expand_tvs_for_cells, get_tv_for_cell
 
 
 def traffic_het(args, vectors, k, testcases, filenames):
@@ -40,13 +41,13 @@ def traffic_het(args, vectors, k, testcases, filenames):
 
         if not args.is_no_pdsch:
             channel["PDSCH"] = [
-                os.path.join(args.vfld, filenames_dl[testcases_dl[tidx_dl]])
-                for tidx_dl in tidxs_dl
+                os.path.join(args.vfld, get_tv_for_cell(filenames_dl, testcases_dl[tidx_dl], cell_idx))
+                for cell_idx, tidx_dl in enumerate(tidxs_dl)
             ]
         if not args.is_no_pusch:
             channel["PUSCH"] = [
-                os.path.join(args.vfld, filenames_ul[testcases_ul[tidx_ul]])
-                for tidx_ul in tidxs_ul
+                os.path.join(args.vfld, get_tv_for_cell(filenames_ul, testcases_ul[tidx_ul], cell_idx))
+                for cell_idx, tidx_ul in enumerate(tidxs_ul)
             ]
 
         channels.append(channel)
@@ -76,16 +77,14 @@ def traffic_avg(args, vectors, testcases, filenames):
         channel = {}
 
         if not args.is_no_pdsch:
-            channel["PDSCH"] = [
-                os.path.join(args.vfld, filenames_dl[testcase])
-                for testcase in testcases_dl
-            ]
+            channel["PDSCH"] = expand_tvs_for_cells(
+                filenames_dl, testcases_dl, args.vfld
+            )
 
         if not args.is_no_pusch:
-            channel["PUSCH"] = [
-                os.path.join(args.vfld, filenames_ul[testcase])
-                for testcase in testcases_ul
-            ]
+            channel["PUSCH"] = expand_tvs_for_cells(
+                filenames_ul, testcases_ul, args.vfld
+            )
 
         channels.append(channel)
 

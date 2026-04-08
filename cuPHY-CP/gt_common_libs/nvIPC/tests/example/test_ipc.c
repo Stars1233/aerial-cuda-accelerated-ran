@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -75,6 +75,10 @@
 
 // The CUDA device ID, get from nvipc_config
 int test_cuda_device_id = -1;
+
+pthread_t recv_thread_id = 0;
+
+uint64_t total_test_slots = 10000;
 
 atomic_ulong poll_counter;
 
@@ -464,8 +468,6 @@ void* epoll_recv_task(void* arg)
 
 int create_recv_thread(void)
 {
-    pthread_t thread_id;
-
     void* (*recv_task)(void*);
     if(blocking_flag)
     {
@@ -477,7 +479,7 @@ int create_recv_thread(void)
     }
 
     // epoll_recv_task
-    int ret = pthread_create(&thread_id, NULL, recv_task, NULL);
+    int ret = pthread_create(&recv_thread_id, NULL, recv_task, NULL);
     if(ret != 0)
     {
         NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s failed, ret = %d", __func__, ret);
@@ -686,8 +688,9 @@ int main(int argc, char** argv)
 #endif
     {
         create_recv_thread();
-        while(1)
+        while(total_test_slots > 0)
         {
+            total_test_slots--;
             usleep(3 * 1000 * 1000);
 
             if(module_type != NV_IPC_MODULE_PRIMARY)
@@ -703,6 +706,26 @@ int main(int argc, char** argv)
             }
         }
     }
+
+    if(recv_thread_id != 0)
+    {
+        // Cancel the receiver thread
+        NVLOGI(TAG, "%s: canceling receiver thread", __func__);
+        if(pthread_cancel(recv_thread_id) != 0)
+        {
+            NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s pthread_cancel failed, stderr=%s", __func__, strerror(errno));
+        }
+
+        // Wait for the receiver thread to finish
+        NVLOGI(TAG, "%s: waiting for receiver thread to exit", __func__);
+        int ret = pthread_join(recv_thread_id, NULL);
+        if(ret != 0)
+        {
+            NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s pthread_join failed, stderr=%s", __func__, strerror(ret));
+            return -1;
+        }
+    }
+
     nvlog_c_close();
     return 0;
 }

@@ -1,0 +1,106 @@
+{
+  "sequence": [
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "special_slot_3",
+    "ul_noPRACH_4",
+    "ul_1PRACH_5",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "special_slot_13",
+    "ul_noPRACH_14",
+    "ul_noPRACH_15",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "special_slot_3",
+    "ul_noPRACH_4",
+    "ul_1PRACH_5",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "special_slot_13",
+    "ul_noPRACH_14",
+    "ul_noPRACH_15",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot",
+    "dl_slot"
+  ],
+  "types": {
+    "dl_slot": {
+      "pdsch": [
+        [
+          0,
+          14,
+          0,
+          54
+        ]
+      ]
+    },
+    "special_slot_3": {},
+    "ul_noPRACH_4": {
+      "pusch": [
+        [
+          0,
+          14,
+          0,
+          54
+        ]
+      ]
+    },
+    "ul_1PRACH_5": {
+      "prach": [
+        [
+          0,
+          12,
+          42,
+          54
+        ]
+      ],
+      "pusch": [
+        [
+          0,
+          14,
+          0,
+          42
+        ]
+      ]
+    },
+    "special_slot_13": {},
+    "ul_noPRACH_14": {
+      "pusch": [
+        [
+          0,
+          14,
+          0,
+          54
+        ]
+      ]
+    },
+    "ul_noPRACH_15": {
+      "pusch": [
+        [
+          0,
+          14,
+          0,
+          54
+        ]
+      ]
+    }
+  }
+}

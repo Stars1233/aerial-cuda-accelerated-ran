@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -77,34 +77,51 @@ void* timer_fd_test(void* arg)
 
 int main(int argc, const char* argv[])
 {
-    phy_epoll_context* ep_ctx_p = nullptr;
-
     try {
-        ep_ctx_p = new phy_epoll_context();
-    } catch(std::system_error& e) {
-        return -1;
-    }
+        phy_epoll_context* ep_ctx_p = nullptr;
 
-    unique_ptr<oneshot_timer_test>                        oneshot_timer_test_p(new oneshot_timer_test());
-    unique_ptr<member_event_callback<oneshot_timer_test>> mcb_p(new member_event_callback<oneshot_timer_test>(oneshot_timer_test_p.get(), &oneshot_timer_test::oneshot_timer_handler));
+        try {
+            ep_ctx_p = new phy_epoll_context();
+        } catch(std::system_error& e) {
+            NVLOGC_FMT(TAG, "Failed to create phy_epoll_context: {}", e.what());
+            return -1;
+        }
 
-    unique_ptr<periodic_timer_test>                        periodic_timer_test_p(new periodic_timer_test());
-    unique_ptr<member_event_callback<periodic_timer_test>> mcb_p1(new member_event_callback<periodic_timer_test>(periodic_timer_test_p.get(), &periodic_timer_test::periodic_timer_handler));
-    try {
-        ep_ctx_p->add_fd(oneshot_timer_test_p->get_fd(), mcb_p.get());
-        ep_ctx_p->add_fd(periodic_timer_test_p->get_fd(), mcb_p1.get());
+        unique_ptr<oneshot_timer_test>                        oneshot_timer_test_p(new oneshot_timer_test());
+        unique_ptr<member_event_callback<oneshot_timer_test>> mcb_p(new member_event_callback<oneshot_timer_test>(oneshot_timer_test_p.get(), &oneshot_timer_test::oneshot_timer_handler));
+
+        unique_ptr<periodic_timer_test>                        periodic_timer_test_p(new periodic_timer_test());
+        unique_ptr<member_event_callback<periodic_timer_test>> mcb_p1(new member_event_callback<periodic_timer_test>(periodic_timer_test_p.get(), &periodic_timer_test::periodic_timer_handler));
+        try {
+            ep_ctx_p->add_fd(oneshot_timer_test_p->get_fd(), mcb_p.get());
+            ep_ctx_p->add_fd(periodic_timer_test_p->get_fd(), mcb_p1.get());
+        } catch(std::exception& e) {
+            NVLOGC_FMT(TAG, "Failed to add fd to epoll context: {}", e.what());
+            delete ep_ctx_p;
+            return -1;
+        }
+
+        pthread_t thread_id;
+        int       ret = pthread_create(&thread_id, NULL, timer_fd_test, ep_ctx_p);
+        if(ret != 0)
+        {
+            NVLOGC_FMT(TAG, "pthread_create failed: {}", strerror(ret));
+            delete ep_ctx_p;
+            return -1;
+        }
+        else
+        {
+            sleep(1);
+            ep_ctx_p->terminate();
+            pthread_join(thread_id, NULL);
+            delete ep_ctx_p;
+        }
+        return 0;
     } catch(std::exception& e) {
+        NVLOGC_FMT(TAG, "Unhandled exception in main: {}", e.what());
+        return -1;
+    } catch(...) {
+        NVLOGC_FMT(TAG, "Unknown exception in main");
         return -1;
     }
-
-    pthread_t thread_id;
-    int       ret = pthread_create(&thread_id, NULL, timer_fd_test, ep_ctx_p);
-    if(ret == -1)
-    {
-        NVLOGC_FMT(TAG, "pthread_create failed \n");
-    }
-
-    sleep(1);
-    ep_ctx_p->terminate();
-    pthread_join(thread_id, NULL);
 }

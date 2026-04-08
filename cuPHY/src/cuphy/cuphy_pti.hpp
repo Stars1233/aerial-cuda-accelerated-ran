@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include "memfoot_global.h"
 #include "nvlog_fmt.hpp"
 
 #define CHECK_CUDA(expr_to_check) do {            \

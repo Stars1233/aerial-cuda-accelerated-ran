@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -584,6 +584,16 @@ int YamlParser::parse_single_cell(yaml::node cell,std::string *p_unique_nic_info
             mplane_cfg.nMaxRxAnt = DEFAULT_MAX_4T4R_RXANT;
         }
 
+        try
+        {
+            mplane_cfg.dlc_core_index = static_cast<uint8_t>(static_cast<uint16_t>(cell[YAML_PARAM_DLC_CORE_INDEX]));
+        }
+        catch(const std::exception& e)
+        {
+            // Default to 0; actual value should be set via test_config.sh when scheme=1
+            mplane_cfg.dlc_core_index = 0;
+        }
+
         cell_configs.push_back(cell_cfg);
         mplane_configs.push_back(mplane_cfg);
     }
@@ -708,6 +718,22 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
             NVLOGW_FMT(TAG, "cuphycontroller config. yaml does not have use_green_contexts key (experimental feature); defaulting to {}.", phydriver_config.use_green_contexts);
         }
 
+        if(root.has_key("use_gc_workqueues"))
+        {
+            phydriver_config.use_gc_workqueues = static_cast<uint8_t>(root[YAML_PARAM_USE_GC_WORKQUEUES]);
+            if((phydriver_config.use_green_contexts == 0) && (phydriver_config.use_gc_workqueues != 0))
+            {
+                NVLOGW_FMT(TAG, "use_gc_workqueues={} is set but use_green_contexts is 0; forcing use_gc_workqueues to 0.",
+                           phydriver_config.use_gc_workqueues);
+                phydriver_config.use_gc_workqueues = 0;
+            }
+        }
+        else
+        {
+            phydriver_config.use_gc_workqueues = 0; // default value as the key is currently only present in a few config. files.
+            NVLOGW_FMT(TAG, "cuphycontroller config. yaml does not have use_gc_workqueues key (experimental feature); defaulting to {}.", phydriver_config.use_gc_workqueues);
+        }
+
         if(root.has_key("use_batched_memcpy"))
         {
             phydriver_config.use_batched_memcpy = static_cast<uint8_t>(root[YAML_PARAM_USE_BATCHED_MEMCPY]);
@@ -815,6 +841,36 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
         {
             NVLOGW_FMT(TAG, "{} Using default value of 0 to ENABLE_PREPARE_TRACING", e.what());
             phydriver_config.enable_prepare_tracing = 0;
+        }
+
+        try
+        {
+            phydriver_config.cupti_enable_tracing = static_cast<uint8_t>(static_cast<uint16_t>(root[YAML_PARAM_CUPTI_ENABLE_TRACING]));
+        }
+        catch(const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "{} Using default value of 0 to CUPTI_ENABLE_TRACING", e.what());
+            phydriver_config.cupti_enable_tracing = 0;
+        }
+
+        try
+        {
+            phydriver_config.cupti_buffer_size = static_cast<uint64_t>(root[YAML_PARAM_CUPTI_BUFFER_SIZE]);
+        }
+        catch(const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "{} Using default value of 2GB for cupti_buffer_size", e.what());
+            phydriver_config.cupti_buffer_size = 2ULL * 1024 * 1024 * 1024;
+        }
+
+        try
+        {
+            phydriver_config.cupti_num_buffers = static_cast<uint16_t>(root[YAML_PARAM_CUPTI_NUM_BUFFERS]);
+        }
+        catch(const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "{} Using default value of 2 for cupti_num_buffers", e.what());
+            phydriver_config.cupti_num_buffers = 2;
         }
 
 
@@ -944,6 +1000,26 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
         {
             NVLOGW_FMT(TAG, "{} Using default value of 0 to YAML_PARAM_ENABLE_SRS", e.what());
             phydriver_config.enable_srs = 0;
+        }
+
+        try
+        {
+            phydriver_config.enable_dl_core_affinity = static_cast<uint8_t>(static_cast<uint16_t>(root[YAML_PARAM_ENABLE_DL_CORE_AFFINITY]));
+        }
+        catch(const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "{} Using default value of 1 to YAML_PARAM_ENABLE_DL_CORE_AFFINITY", e.what());
+            phydriver_config.enable_dl_core_affinity = 1;
+        }
+
+        try
+        {
+            phydriver_config.dlc_core_packing_scheme = static_cast<uint8_t>(static_cast<uint16_t>(root[YAML_PARAM_DLC_CORE_PACKING_SCHEME]));
+        }
+        catch(const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "{} Using default value of 0 to YAML_PARAM_DLC_CORE_PACKING_SCHEME", e.what());
+            phydriver_config.dlc_core_packing_scheme = 0;
         }
 
         try
@@ -1580,17 +1656,21 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
 
         if(root.has_key(YAML_PARAM_DATA_CONFIG)) {
             yaml::node data_cfg = root[YAML_PARAM_DATA_CONFIG];
-            // Handle optional datalake_core (set to -1 to disable)
-            if(data_cfg.has_key("datalake_core")) {
-                phydriver_config.datalake_core = data_cfg["datalake_core"].as<uint16_t>();
+            // Handle optional data_core (set to -1 to disable)
+            // Support deprecated "datalake_core" for backward compatibility
+            if(data_cfg.has_key("data_core")) {
+                phydriver_config.data_core = data_cfg["data_core"].as<uint16_t>();
+            } else if(data_cfg.has_key("datalake_core")) {
+                NVLOGW_FMT(TAG, "Config key 'datalake_core' is deprecated, use 'data_core' instead.");
+                phydriver_config.data_core = data_cfg["datalake_core"].as<uint16_t>();
             } else {
-                phydriver_config.datalake_core = -1;
+                phydriver_config.data_core = -1;
             }
             
             if(data_cfg.has_key("datalake_db_write_enable")) {
                 phydriver_config.datalake_db_write_enable = data_cfg["datalake_db_write_enable"].as<uint8_t>();
             } else {
-                phydriver_config.datalake_db_write_enable = 1;
+                phydriver_config.datalake_db_write_enable = 0;
             }
             
             if(data_cfg.has_key("datalake_samples")) {
@@ -1642,22 +1722,22 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
                 phydriver_config.e3_agent_enabled = false;
             }
             
-            if(data_cfg.has_key("e3_pub_port")) {
-                phydriver_config.e3_pub_port = data_cfg["e3_pub_port"].as<uint16_t>();
-            } else {
-                phydriver_config.e3_pub_port = 5555;
-            }
-            
             if(data_cfg.has_key("e3_rep_port")) {
                 phydriver_config.e3_rep_port = data_cfg["e3_rep_port"].as<uint16_t>();
             } else {
-                phydriver_config.e3_rep_port = 5556;
+                phydriver_config.e3_rep_port = 5555;
+            }
+            
+            if(data_cfg.has_key("e3_pub_port")) {
+                phydriver_config.e3_pub_port = data_cfg["e3_pub_port"].as<uint16_t>();
+            } else {
+                phydriver_config.e3_pub_port = 5556;
             }
             
             if(data_cfg.has_key("e3_sub_port")) {
                 phydriver_config.e3_sub_port = data_cfg["e3_sub_port"].as<uint16_t>();
             } else {
-                phydriver_config.e3_sub_port = 5560;
+                phydriver_config.e3_sub_port = 5557;
             }
             
             // Handle optional datalake_drop_tables
@@ -1679,8 +1759,8 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
             }
         } else {
             NVLOGI_FMT(TAG," Using default values for data_config");
-            phydriver_config.datalake_core = -1;
-            phydriver_config.datalake_db_write_enable = 1;
+            phydriver_config.data_core = -1;
+            phydriver_config.datalake_db_write_enable = 0;
             phydriver_config.datalake_samples = 1000000;
             phydriver_config.datalake_address = "localhost";
             phydriver_config.datalake_engine = "Memory";
@@ -1691,9 +1771,9 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
             phydriver_config.num_rows_hest = 140;
             phydriver_config.datalake_drop_tables = 0;
             phydriver_config.e3_agent_enabled = false;
-            phydriver_config.e3_pub_port = 5555;
-            phydriver_config.e3_rep_port = 5556;
-            phydriver_config.e3_sub_port = 5560;
+            phydriver_config.e3_rep_port = 5555;
+            phydriver_config.e3_pub_port = 5556;
+            phydriver_config.e3_sub_port = 5557;
         }
     
         yaml::node gpus_list_y = root[YAML_PARAM_GPUS];
@@ -1766,6 +1846,24 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
         {
             NVLOGW_FMT(TAG, "{} Using default value of 32 to PUSCH-N-MAX-LDPC-HET-CONFIGS", e.what());
             phydriver_config.pusch_nMaxLdpcHetConfigs = 32;
+        }
+        try
+        {
+            uint8_t temp_value = static_cast<uint8_t>(root[YAML_PARAM_PUSCH_N_MAX_TB_PER_NODE]);
+            if (temp_value > CUPHY_LDPC_DECODE_DESC_MAX_TB) {
+                NVLOGW_FMT(TAG, "pusch_nMaxTbPerNode value {} exceeds maximum {}, using maximum", temp_value, CUPHY_LDPC_DECODE_DESC_MAX_TB);
+                phydriver_config.pusch_nMaxTbPerNode = CUPHY_LDPC_DECODE_DESC_MAX_TB;
+            } else if (temp_value == 0) {
+                NVLOGW_FMT(TAG, "pusch_nMaxTbPerNode cannot be zero, using default value 32");
+                phydriver_config.pusch_nMaxTbPerNode = 32;
+            } else {
+                phydriver_config.pusch_nMaxTbPerNode = temp_value;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "{} Using default value of 32 to PUSCH-N-MAX-TB-PER-NODE", e.what());
+            phydriver_config.pusch_nMaxTbPerNode = 32;
         }
 
         try
@@ -1841,12 +1939,13 @@ void YamlParser::print_configs() const
     for(int i = 0; i < phydriver_config.workers_list_dl.size(); ++i)
         NVLOGC_FMT(TAG, "\t- {}", phydriver_config.workers_list_dl[i]);
     NVLOGC_FMT(TAG, "Debug worker: {}", phydriver_config.debug_worker);
-    NVLOGC_FMT(TAG, "Data Lake core: {}", phydriver_config.datalake_core);
+    NVLOGC_FMT(TAG, "Data Lake core: {}", phydriver_config.data_core);
 
     NVLOGC_FMT(TAG, "SRS starting Section ID: {}", phydriver_config.start_section_id_srs);
     NVLOGC_FMT(TAG, "PRACH starting Section ID: {}", phydriver_config.start_section_id_prach);
 
     NVLOGC_FMT(TAG, "USE GREEN CONTEXTS: {}", phydriver_config.use_green_contexts);
+    NVLOGC_FMT(TAG, "USE GC WORKQUEUES: {}", phydriver_config.use_gc_workqueues);
     NVLOGC_FMT(TAG, "USE BATCHED MEMCPY: {}", phydriver_config.use_batched_memcpy);
     NVLOGC_FMT(TAG, "MPS SM PUSCH: {}", phydriver_config.mps_sm_pusch);
     NVLOGC_FMT(TAG, "MPS SM PUCCH: {}", phydriver_config.mps_sm_pucch);
@@ -1941,6 +2040,9 @@ void YamlParser::print_configs() const
     NVLOGC_FMT(TAG, "enable_l1_param_sanity_check: {}", phydriver_config.enable_l1_param_sanity_check);
     NVLOGC_FMT(TAG, "enable_ok_tb: {}", phydriver_config.enable_ok_tb);
     NVLOGC_FMT(TAG, "enable_prepare_tracing: {}", phydriver_config.enable_prepare_tracing);
+    NVLOGC_FMT(TAG, "cupti_enable_tracing: {}", phydriver_config.cupti_enable_tracing);
+    NVLOGC_FMT(TAG, "cupti_buffer_size: {}", phydriver_config.cupti_buffer_size);
+    NVLOGC_FMT(TAG, "cupti_num_buffers: {}", phydriver_config.cupti_num_buffers);
     NVLOGC_FMT(TAG, "mCh_segment_proc_enable: {}", phydriver_config.mCh_segment_proc_enable);
     NVLOGC_FMT(TAG, "pmu_metrics: {}", phydriver_config.pmu_metrics);
     NVLOGC_FMT(TAG, "puschCfo: {}", phydriver_config.puschCfo);
@@ -1967,6 +2069,7 @@ void YamlParser::print_configs() const
     NVLOGC_FMT(TAG, "datalake_samples: {}", phydriver_config.datalake_samples);
     NVLOGC_FMT(TAG, "num_ok_tb_slot: {}", phydriver_config.num_ok_tb_slot);
     NVLOGC_FMT(TAG, "pusch_nMaxLdpcHetConfigs: {}", phydriver_config.pusch_nMaxLdpcHetConfigs);
+    NVLOGC_FMT(TAG, "pusch_nMaxTbPerNode: {}", phydriver_config.pusch_nMaxTbPerNode);
     NVLOGC_FMT(TAG, "sendCPlane_dlbfw_backoff_th_ns: {}", phydriver_config.sendCPlane_dlbfw_backoff_th_ns);
     NVLOGC_FMT(TAG, "sendCPlane_ulbfw_backoff_th_ns: {}", phydriver_config.sendCPlane_ulbfw_backoff_th_ns);
     NVLOGC_FMT(TAG, "ul_order_max_rx_pkts: {}", phydriver_config.ul_order_max_rx_pkts);
@@ -2073,8 +2176,8 @@ int16_t YamlParser::get_cuphydriver_debug_worker() {
     return phydriver_config.debug_worker;
 }
 
-int16_t YamlParser::get_cuphydriver_datalake_core() {
-    return phydriver_config.datalake_core;
+int16_t YamlParser::get_cuphydriver_data_core() {
+    return phydriver_config.data_core;
 }
 uint8_t YamlParser::get_cuphydriver_datalake_db_write_enable() {
     return phydriver_config.datalake_db_write_enable;
@@ -2109,12 +2212,12 @@ uint8_t YamlParser::get_cuphydriver_e3_agent_enabled() {
     return phydriver_config.e3_agent_enabled;
 }
 
-uint16_t YamlParser::get_cuphydriver_e3_pub_port() {
-    return phydriver_config.e3_pub_port;
-}
-
 uint16_t YamlParser::get_cuphydriver_e3_rep_port() {
     return phydriver_config.e3_rep_port;
+}
+
+uint16_t YamlParser::get_cuphydriver_e3_pub_port() {
+    return phydriver_config.e3_pub_port;
 }
 
 uint16_t YamlParser::get_cuphydriver_e3_sub_port() {
@@ -2252,6 +2355,10 @@ uint8_t& YamlParser::get_cplane_disable()
 
 uint8_t& YamlParser::get_cuphydriver_use_green_contexts() {
     return phydriver_config.use_green_contexts;
+}
+
+uint8_t& YamlParser::get_cuphydriver_use_gc_workqueues() {
+    return phydriver_config.use_gc_workqueues;
 }
 
 uint8_t& YamlParser::get_cuphydriver_use_batched_memcpy() {
@@ -2394,6 +2501,18 @@ uint8_t YamlParser::get_cuphydriver_enable_prepare_tracing()const {
     return phydriver_config.enable_prepare_tracing;
 }
 
+uint8_t YamlParser::get_cuphydriver_cupti_enable_tracing()const {
+    return phydriver_config.cupti_enable_tracing;
+}
+
+uint64_t YamlParser::get_cuphydriver_cupti_buffer_size()const {
+    return phydriver_config.cupti_buffer_size;
+}
+
+uint16_t YamlParser::get_cuphydriver_cupti_num_buffers()const {
+    return phydriver_config.cupti_num_buffers;
+}
+
 uint8_t YamlParser::get_cuphydriver_disable_empw()const {
     return phydriver_config.disable_empw;
 }
@@ -2447,6 +2566,14 @@ uint8_t& YamlParser::get_cuphydriver_enable_srs() {
     return phydriver_config.enable_srs;
 }
 
+uint8_t& YamlParser::get_cuphydriver_enable_dl_core_affinity() {
+    return phydriver_config.enable_dl_core_affinity;
+}
+
+uint8_t& YamlParser::get_cuphydriver_dlc_core_packing_scheme() {
+    return phydriver_config.dlc_core_packing_scheme;
+}
+
 uint32_t& YamlParser::get_cuphydriver_aggr_obj_non_avail_th() {
     return phydriver_config.aggr_obj_non_avail_th;
 }
@@ -2481,6 +2608,10 @@ uint16_t YamlParser::get_cuphydriver_forcedNumCsi2Bits() {
 
 uint32_t YamlParser::get_cuphydriver_pusch_nMaxLdpcHetConfigs() {
     return phydriver_config.pusch_nMaxLdpcHetConfigs;
+}
+
+uint8_t YamlParser::get_cuphydriver_pusch_nMaxTbPerNode() {
+    return phydriver_config.pusch_nMaxTbPerNode;
 }
 
 uint8_t& YamlParser::get_cuphydriver_ch_segment_proc_enable() {

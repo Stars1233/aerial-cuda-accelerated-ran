@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,7 @@
 #include "prach_receiver/prach_receiver.hpp"
 #include "util.hpp"
 #include "utils.cuh"
-#include <iostream>
+#include <array>
 #include <iostream>
 #include <cstdlib>
 #include <string>
@@ -135,6 +135,9 @@ private:
     cuphy::buffer<PrachDeviceInternalStaticParamPerOcca, cuphy::device_alloc> d_staticParam;
     cuphy::buffer<PrachInternalDynParamPerOcca, cuphy::device_alloc> d_dynParam;
     cuphy::buffer<PrachInternalDynParamPerOcca, cuphy::pinned_alloc> h_dynParam;
+
+    cuphy::buffer<cuFloatComplex *, cuphy::pinned_alloc> h_fftPointers;
+    std::array<FftInfo, PRACH_NUM_SUPPORTED_FFT_SIZES> h_fftInfo;
 
     cuphyTensorPrm_t numDetectedPrmb;
     cuphyTensorPrm_t prmbIndexEstimates;

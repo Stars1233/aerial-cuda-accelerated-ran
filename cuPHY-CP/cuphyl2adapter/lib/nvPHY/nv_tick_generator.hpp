@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,7 +48,6 @@ namespace nv
         
         public:
         explicit tti_gen(yaml::node config , PHY_module &m):
-        tti_gen_ref(0),
         module_(&m),
         current_ts(0ns),
         current_scheduled_ts(0ns)
@@ -87,7 +86,6 @@ namespace nv
         epoll_ctx(std::move(other.epoll_ctx)),
         timer_fd_p(std::move(other.timer_fd_p)),
         timer_mcb_p(std::move(other.timer_mcb_p)),
-        tti_gen_ref(std::move(other.tti_gen_ref.load())),
         current_ts(std::move(other.current_ts)),
         current_scheduled_ts(std::move(other.current_scheduled_ts)),
         thread_id(std::move(other.thread_id)),
@@ -97,8 +95,15 @@ namespace nv
 
         void set_module(PHY_module& m) { module_ = &m; } 
 
-        void start_slot_indication();
-        void stop_slot_indication();
+        void start_tick_generator();
+        void stop_tick_generator();
+
+        /**
+         * Join the timer thread
+         *
+         * Blocks until the timer thread completes execution.
+         */
+        void timer_thread_join();
 
         private:
         uint64_t sys_clock_time_handler();
@@ -107,7 +112,6 @@ namespace nv
         void slot_indication_thread_sleep_method();
         void slot_indication_thread_timer_fd_method();
         void slot_indication_handler();
-        void send_slot_indication();
 
         private:
         std::thread timer_thread; // timer thread
@@ -124,7 +128,7 @@ namespace nv
         phy_epoll_context                                epoll_ctx;
         unique_ptr<timer_fd>                             timer_fd_p;
         unique_ptr<member_event_callback<tti_gen>> timer_mcb_p;
-        std::atomic_int tti_gen_ref;
+        std::atomic<bool> stop_thread{false};
         nanoseconds current_ts;
         nanoseconds current_scheduled_ts;
         PHY_module* module_;

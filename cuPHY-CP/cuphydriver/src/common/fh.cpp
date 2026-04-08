@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@
 #include "context.hpp"
 #include <unistd.h>
 #include "ti_generic.hpp"
+#include <limits>
 
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
@@ -39,19 +40,9 @@ static constexpr uint16_t MAX_PRB_INFO_PRB_SYMBOL = 273;
 static constexpr uint16_t MAX_COMP_INFO_PER_PRB = 4;
 
 static constexpr int NUM_BUFFER_PER_DIR = 2; 
-
-// The buffers are per direction (to avoid ULC & DLC stomping), max_cells_per_slot (to enable cell level parallelism), num_msg_info_types (to separate BFW vs non-BFW)
-// message_infos_[NUM_BUFFER_PER_DIR][MAX_CELLS_PER_SLOT][fh_msg_info_type::NUM_MSG_INFO_TYPES][MAX_CPLANE_MSGS_PER_SLOT]
-static std::array<std::array<std::array<std::array<fhproxy_cmsg, MAX_CPLANE_MSGS_PER_SLOT>, fh_msg_info_type::NUM_MSG_INFO_TYPES>, MAX_CELLS_PER_SLOT>, NUM_BUFFER_PER_DIR> message_infos_; 
-
-// section_infos_[NUM_BUFFER_PER_DIR][MAX_CELLS_PER_SLOT][fh_msg_info_type::NUM_MSG_INFO_TYPES][MAX_AP_PER_SLOT_SRS][MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP];
-static std::array<std::array<std::array<std::array<std::array<fhproxy_cmsg_section, MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP>, MAX_AP_PER_SLOT_SRS>,fh_msg_info_type::NUM_MSG_INFO_TYPES>,MAX_CELLS_PER_SLOT>,NUM_BUFFER_PER_DIR> section_infos_;
-
-// int section_count_[NUM_BUFFER_PER_DIR][MAX_CELLS_PER_SLOT][fh_msg_info_type::NUM_MSG_INFO_TYPES][MAX_AP_PER_SLOT_SRS];
-static std::array<std::array<std::array<std::array<int, MAX_AP_PER_SLOT_SRS>,fh_msg_info_type::NUM_MSG_INFO_TYPES>,MAX_CELLS_PER_SLOT>,NUM_BUFFER_PER_DIR> section_count_;
-
-// int start_section_count_[NUM_BUFFER_PER_DIR][MAX_CELLS_PER_SLOT][fh_msg_info_type::NUM_MSG_INFO_TYPES][MAX_AP_PER_SLOT_SRS];
-static std::array<std::array<std::array<std::array<int, MAX_AP_PER_SLOT_SRS>,fh_msg_info_type::NUM_MSG_INFO_TYPES>,MAX_CELLS_PER_SLOT>,NUM_BUFFER_PER_DIR> start_section_count_;
+    
+// The buffers are per direction (to avoid ULC & DLC stomping) and max_cells_per_slot (to enable cell level parallelism)
+static std::array<std::array<cplane_buffer_t,MAX_CELLS_PER_SLOT>,NUM_BUFFER_PER_DIR> cplane_prepare_buffer; 
 
 FhProxy::FhProxy(
     phydriver_handle _pdh, const context_config& ctx_cfg) : pdh(_pdh)
@@ -327,9 +318,10 @@ int FhProxy::registerPeer(
         return -1;
     }
     // Update allocations related to Peer creation
-    mf.addGpuRegularSize(aerial_fh::get_gpu_regular_size(peer));
+    // FH Peer's GPU memory is tracked in aerial-fh-driver, do not duplicate tracking here
+    // mf.addGpuRegularSize(aerial_fh::get_gpu_regular_size(peer));
+    // mf.addGpuPinnedSize(aerial_fh::get_gpu_pinned_size(peer));
     mf.addCpuRegularSize(aerial_fh::get_cpu_regular_size(peer));
-    mf.addGpuPinnedSize(aerial_fh::get_gpu_pinned_size(peer));
     mf.addCpuPinnedSize(aerial_fh::get_cpu_pinned_size(peer));
 
     aerial_fh::get_doca_rxq_items(peer,&d_rxq_info);
@@ -344,6 +336,7 @@ int FhProxy::registerPeer(
     doca_rxq_info->sem_cpu=d_rxq_info.sem_cpu;
     doca_rxq_info->sem_gpu=d_rxq_info.sem_gpu;
     doca_rxq_info->nitems=d_rxq_info.nitems;
+    doca_rxq_info->sem_gpu_aerial_fh=d_rxq_info.sem_gpu_aerial_fh;
 
     if(pdctx->get_enable_srs())
     {
@@ -359,6 +352,7 @@ int FhProxy::registerPeer(
         doca_rxq_info_srs->sem_cpu=d_rxq_info.sem_cpu;
         doca_rxq_info_srs->sem_gpu=d_rxq_info.sem_gpu;
         doca_rxq_info_srs->nitems=d_rxq_info.nitems;
+        doca_rxq_info_srs->sem_gpu_aerial_fh=d_rxq_info.sem_gpu_aerial_fh;
     }
 
     peer_id = Time::nowNs().count();
@@ -390,7 +384,7 @@ int FhProxy::registerPeer(
 
     peer_ptr->rx_order_items.sync_ready_list_gdr   = gDev->newGDRbuf(RX_QUEUE_SYNC_LIST_ITEMS * sizeof(uint32_t));
     peer_ptr->rx_order_items.sync_item             = 0;
-    mf.addGpuPinnedSize(peer_ptr->rx_order_items.sync_ready_list_gdr->size_free);
+    mf.addGpuPinnedSize(peer_ptr->rx_order_items.sync_ready_list_gdr->size_alloc);
 
     peer_ptr->rx_order_items.last_ordered_h.reset(std::move(new host_buf(1 * sizeof(int), nullptr)));
     peer_ptr->rx_order_items.last_ordered_h->clear();
@@ -411,9 +405,9 @@ int FhProxy::registerPeer(
 
     peer_ptr->rx_order_items.umsg_rx_index = 0;
 
-    peer_ptr->rx_order_items.flush_gmem.reset(new gpinned_buffer{gDev->getGDRhandler(), sizeof(uint32_t)});
+    peer_ptr->rx_order_items.flush_gmem.reset(gDev->newGDRbuf(sizeof(uint32_t)));
     ((uint32_t*)peer_ptr->rx_order_items.flush_gmem->addrh())[0] = 0;
-    mf.addGpuPinnedSize(peer_ptr->rx_order_items.flush_gmem->size_free);
+    mf.addGpuPinnedSize(peer_ptr->rx_order_items.flush_gmem->size_alloc);
 
     return 0;
 }
@@ -770,8 +764,8 @@ uint8_t* FhProxy::getStaticBFWWeights(uint16_t cell_id, uint16_t beamIdx)
     auto beamIt = staticBfwMap.find(beamIdx);
     if (beamIt == staticBfwMap.end())
     {
-        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "{} beamIdx={} not found for cell_id={}", __func__, beamIdx, cell_id);
-        return nullptr; // Indicate failure
+        NVLOGI_FMT(TAG, "{} beamIdx={} not found for cell_id={}", __func__, beamIdx, cell_id);
+        return nullptr; // indicate that the given beamIdx is predefined beam
     }
 
     auto& [beamWeightSent, beamWeights] = beamIt->second;
@@ -958,7 +952,7 @@ int FhProxy::sendCPlane_timingCheck(t_ns start_tx_time,t_ns start_ch_task_time,i
     return ret;
 }
 
-int increment_section_count(int& section_count, int max, int flow)
+int increment_section_count(uint16_t& section_count, int max, int flow)
 {
     if(section_count + 1 >= max)
     {
@@ -969,17 +963,17 @@ int increment_section_count(int& section_count, int max, int flow)
     return 0;
 }
 
-void fill_section_ext4_ext5(slot_command_api::mod_comp_info_t& comp_info, fhproxy_cmsg_section& section_info, fhproxy_cmsg_section_ext* section_ext_infos, size_t& section_ext_index)
+void fill_section_ext4_ext5(slot_command_api::mod_comp_info_t& comp_info, fhproxy_cmsg_section& section_info, std::array<fhproxy_cmsg_section_ext,MAX_CPLANE_SECTIONS_EXT_PER_SLOT> &section_ext_infos, size_t& section_ext_index)
 {
     auto& section_ext_info                       = section_ext_infos[section_ext_index++];
     section_ext_info.sect_ext_common_hdr.ef      = (section_info.ext11 == nullptr) ? 0 : 1;
-    if(comp_info.common.nSections.get() == 1)
+    if(comp_info.common.nSections == 1)
     {
         section_ext_info.sect_ext_common_hdr.extType = ORAN_CMSG_SECTION_EXT_TYPE_4;
         section_ext_info.ext_4.ext_hdr.extLen        = 1;
-        section_ext_info.ext_4.ext_hdr.csf           = comp_info.sections[0].csf.get();
+        section_ext_info.ext_4.ext_hdr.csf           = comp_info.sections[0].csf;
  
-        section_ext_info.ext_4.ext_hdr.modCompScalor = comp_info.sections[0].mcScaleOffset.get();;
+        section_ext_info.ext_4.ext_hdr.modCompScalor = comp_info.sections[0].mcScaleOffset;
         section_info.ext4                            = &section_ext_info;
 #if 0
         NVLOGC_FMT(TAG, "mcScaleOffset {} val {} mcScaleOffsetAsInt {} ", __half2float(mcScaleOffset), val, mcScaleOffsetAsInt);
@@ -987,18 +981,18 @@ void fill_section_ext4_ext5(slot_command_api::mod_comp_info_t& comp_info, fhprox
 #endif
 
     }
-    else if(comp_info.common.nSections.get() == 2)
+    else if(comp_info.common.nSections == 2)
     {
         section_ext_info.sect_ext_common_hdr.extType      = ORAN_CMSG_SECTION_EXT_TYPE_5;
         section_ext_info.ext_5.ext_hdr.extLen             = 3;
-        section_ext_info.ext_5.ext_hdr.csf_1              = comp_info.sections[0].csf.get();
+        section_ext_info.ext_5.ext_hdr.csf_1              = comp_info.sections[0].csf;
 
-        section_ext_info.ext_5.ext_hdr.mcScaleOffset_1    = comp_info.sections[0].mcScaleOffset.get();
-        section_ext_info.ext_5.ext_hdr.mcScaleReMask_1    = comp_info.sections[0].mcScaleReMask.get();
-        section_ext_info.ext_5.ext_hdr.csf_2              = comp_info.sections[1].csf.get();
+        section_ext_info.ext_5.ext_hdr.mcScaleOffset_1    = comp_info.sections[0].mcScaleOffset;
+        section_ext_info.ext_5.ext_hdr.mcScaleReMask_1    = comp_info.sections[0].mcScaleReMask;
+        section_ext_info.ext_5.ext_hdr.csf_2              = comp_info.sections[1].csf;
 
-        section_ext_info.ext_5.ext_hdr.mcScaleOffset_2    = comp_info.sections[1].mcScaleOffset.get();
-        section_ext_info.ext_5.ext_hdr.mcScaleReMask_2    = comp_info.sections[1].mcScaleReMask.get();
+        section_ext_info.ext_5.ext_hdr.mcScaleOffset_2    = comp_info.sections[1].mcScaleOffset;
+        section_ext_info.ext_5.ext_hdr.mcScaleReMask_2    = comp_info.sections[1].mcScaleReMask;
         section_ext_info.ext_5.ext_hdr.zero_padding       = 0;
         section_ext_info.ext_5.ext_hdr.extra_zero_padding = 0;
         section_info.ext5                                 = &section_ext_info;
@@ -1012,7 +1006,7 @@ void fill_section_ext4_ext5(slot_command_api::mod_comp_info_t& comp_info, fhprox
     }
     else
     {
-        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Modulation compression nSections error {}!", comp_info.common.nSections.get());
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Modulation compression nSections error {}!", comp_info.common.nSections);
     }
     section_info.sect_1.ef = 1;
 }
@@ -1036,7 +1030,13 @@ void FhProxy::fill_dynamic_section_ext11(const slot_command_api::oran_slot_ind& 
     section_ext_info.ext_11.numPrbBundles = (params.numPrbc + bfwCoeff_buf_info.prg_size - 1) / bfwCoeff_buf_info.prg_size;
     section_ext_info.ext_11.numBundPrb    = bfwCoeff_buf_info.prg_size;
     section_ext_info.sect_ext_common_hdr.extType = ORAN_CMSG_SECTION_EXT_TYPE_11;
-    section_ext_info.ext_11.ext_hdr.numBundPrb = bfwCoeff_buf_info.prg_size;//Overflow may happen, handle further in FH driver with section_ext_info.ext_11.numBundPrb
+    // Fix: When prg_size covers entire bandwidth (>= numPrbc), set numBundPrb to numPrbc
+    // since the section will be split and numBundPrb should reflect actual PRBs in the bundle
+    if (bfwCoeff_buf_info.prg_size >= static_cast<uint32_t>(params.numPrbc)) {
+        section_ext_info.ext_11.ext_hdr.numBundPrb = static_cast<uint8_t>(std::min(params.numPrbc, 255));
+    } else {
+        section_ext_info.ext_11.ext_hdr.numBundPrb = static_cast<uint8_t>(std::min(static_cast<int>(bfwCoeff_buf_info.prg_size), 255));
+    }
     section_ext_info.ext_11.ext_hdr.disableBFWs = params.disableBFWs;
     section_ext_info.ext_11.ext_hdr.RAD = params.RAD;
     section_ext_info.ext_11.ext_hdr.reserved = 0;
@@ -1080,23 +1080,24 @@ void FhProxy::fill_dynamic_section_ext11(const slot_command_api::oran_slot_ind& 
         int start_bundle_offset = params.startPrbc / bfwCoeff_buf_info.prg_size;
         for(int bundle_index = start_bundle_offset; bundle_index < start_bundle_offset + numPrbBundles; ++bundle_index)
         {
-            auto& bundle_info = params.section_ext_11_bundle_infos[params.section_ext_11_bundle_index++];
-            if(params.section_ext_11_bundle_index == MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT)
+            if(unlikely(params.section_ext_11_bundle_index == MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT))
             {
-                NVLOGC_FMT(TAG, "MAX section ext bundles reached");
+                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "MAX section ext bundles reached");
             }
+            auto& bundle_info = params.section_ext_11_bundle_infos[params.section_ext_11_bundle_index++];
 
             if(params.disableBFWs == 0)
             {
                 params.bfw_beam_id[cur_prb] = params.dyn_beam_id++;
-                if(params.dyn_beam_id > params.slot_dyn_beam_id_offset + dynamic_beam_ids_per_slot)
+                if(unlikely(params.dyn_beam_id > params.slot_dyn_beam_id_offset + dynamic_beam_ids_per_slot))
                 {
                     NVLOGW_FMT(TAG, "MAX number of dynamic beam ids reached");
                 }
+                
+                memset(&bundle_info.disableBFWs_0_compressed, 0, sizeof(bundle_info.disableBFWs_0_compressed)); 
 
                 params.bfw_seen[cur_prb] = true;
                 bundle_info.disableBFWs_0_compressed.beamId = params.bfw_beam_id[cur_prb];
-                bundle_info.disableBFWs_0_compressed.reserved = 0;  // Initialize reserved field
                 // ru_type::MULTI_SECT_MODE does not send the TX precoding and beamforming PDU, we can set the inner beamId to a dummy value.
                 auto buffer_ptr = reinterpret_cast<uint8_t*>(bfwCoeff_buf_info.p_buf_bfwCoef_h);
                 // Note1: in the representation: nGnbAnt x nPrbGrpBfw x nLayers, nGnbAnt is the innermost i.e. fastest changing dimension
@@ -1108,20 +1109,25 @@ void FhProxy::fill_dynamic_section_ext11(const slot_command_api::oran_slot_ind& 
                 int buffer_index = params.active_ap_idx * bfwCoeff_buf_info.num_prgs * (section_ext_info.ext_11.bfwIQ_size + 1); // +1 for exponent
                 buffer_index += bundle_index * (section_ext_info.ext_11.bfwIQ_size + 1); // +1 for exponent
                 bundle_info.disableBFWs_0_compressed.bfwCompParam.exponent = buffer_ptr[buffer_index++];
-                bundle_info.disableBFWs_0_compressed.bfwCompParam.reserved = 0;  // Initialize reserved field
                 bundle_info.bfwIQ = &buffer_ptr[buffer_index];
                 *params.bfw_header = bfwCoeff_buf_info.header;
             }
             else
             {
+                memset(&bundle_info.disableBFWs_1, 0, sizeof(bundle_info.disableBFWs_1)); 
                 bundle_info.disableBFWs_1.beamId = params.bfw_beam_id[cur_prb];
-                bundle_info.disableBFWs_1.reserved = 0;  // Initialize reserved field
             }
             cur_prb += bfwCoeff_buf_info.prg_size;
         }
     }
     else
-    {
+    {        
+        // Use absolute startPrbc to calculate beamId with start_bundle_offset
+
+        int start_bundle_offset = params.startPrbc / bfwCoeff_buf_info.prg_size;
+        int start_beamid_offset = (params.section_info.sect_1.startPrbc.get() - params.startPrbc) / CUPHY_BFW_MIN_PRB_GRP_SIZE;
+        // NVLOGC_FMT(TAG, "start_bundle_offset {}, start_beamid_offset {}", start_bundle_offset, start_beamid_offset);
+
         if(params.disableBFWs == 0)
         {
             *params.bfw_header = bfwCoeff_buf_info.header;
@@ -1142,33 +1148,27 @@ void FhProxy::fill_dynamic_section_ext11(const slot_command_api::oran_slot_ind& 
             }
 
             section_ext_info.ext_11.bfwIQ = &bfw_chaining_buffer[offset];
-
-        }
-        // Use absolute startPrbc to calculate beamId with start_bundle_offset
-
-        int start_bundle_offset = params.startPrbc / bfwCoeff_buf_info.prg_size;
-        int start_beamid_offset = (params.section_info.sect_1.startPrbc.get() - params.startPrbc) / CUPHY_BFW_MIN_PRB_GRP_SIZE;
-        //NVLOGC_FMT(TAG, "start_bundle_offset {}, start_beamid_offset {}", start_bundle_offset, start_beamid_offset);
-
-        for(int bundle_index = start_bundle_offset; bundle_index < start_bundle_offset + numPrbBundles; ++bundle_index)
-        {
-            auto& bundle_info = params.section_ext_11_bundle_infos[params.section_ext_11_bundle_index++];
-            if(params.section_ext_11_bundle_index == MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT)
-            {
-                NVLOGC_FMT(TAG, "MAX section ext bundles reached");
-            }
-
-            if(params.disableBFWs == 0)
+            
+            for(int bundle_index = start_bundle_offset; bundle_index < start_bundle_offset + numPrbBundles; ++bundle_index)
             {
                 // IQ AND Beam IDs filled out by kernel, use the same logic as kernel
                 params.bfw_seen[cur_prb] = true;
+                cur_prb += bfwCoeff_buf_info.prg_size;
             }
-            else
+
+        } else {
+
+            for(int bundle_index = start_bundle_offset; bundle_index < start_bundle_offset + numPrbBundles; ++bundle_index)
             {
+                if(unlikely(params.section_ext_11_bundle_index == MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT))
+                {
+                    NVLOGC_FMT(TAG, "MAX section ext bundles reached");
+                }
+                auto& bundle_info = params.section_ext_11_bundle_infos[params.section_ext_11_bundle_index++];
+                memset(&bundle_info.disableBFWs_1, 0, sizeof(bundle_info.disableBFWs_1)); 
+
                 bundle_info.disableBFWs_1.beamId = params.slot_dyn_beam_id_offset + params.active_ap_idx * CUPHY_BFW_N_MAX_PRB_GRPS + bundle_index + start_beamid_offset;
-                bundle_info.disableBFWs_1.reserved = 0;  // Initialize reserved field
             }
-            cur_prb += bfwCoeff_buf_info.prg_size;
         }
     }
     section_ext_info.ext_11.bundles = &params.section_ext_11_bundle_infos[section_bundle_start_index];
@@ -1178,12 +1178,15 @@ void FhProxy::fill_dynamic_section_ext11(const slot_command_api::oran_slot_ind& 
 }
 
 
-void fill_static_section_ext(uint8_t* static_bfw_ptr, uint32_t cell_id, slot_command_api::prb_info_t& prb_info, fhproxy_cmsg_section &section_info, fhproxy_cmsg_section_ext* section_ext_infos, fhproxy_cmsg_section_ext_11_bundle_info* section_ext_11_bundle_infos,
-    size_t& section_ext_index, size_t& section_ext_11_bundle_index, int L_TRX, int bfwIQBitwidth, int disableBFWs, int RAD, int active_ap_idx, int actual_ap_idx, int startPrbc, int numPrbc, uint16_t static_beam_id, uint8_t static_buff_count)
+void fill_static_section_ext(uint8_t* static_bfw_ptr, uint32_t cell_id, slot_command_api::prb_info_t& prb_info, fhproxy_cmsg_section &section_info, std::array<fhproxy_cmsg_section_ext,MAX_CPLANE_SECTIONS_EXT_PER_SLOT> &section_ext_infos, std::array<fhproxy_cmsg_section_ext_11_bundle_info,MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT> &section_ext_11_bundle_infos,
+    size_t& section_ext_index, size_t& section_ext_11_bundle_index, int bfwIQBitwidth, int disableBFWs, int RAD, int active_ap_idx, int actual_ap_idx, int startPrbc, int numPrbc, uint16_t static_beam_id)
 {
     auto& bfwCoeff_buf_info = prb_info.static_bfwCoeff_buf_info;
     if(static_bfw_ptr == nullptr)
     {
+        // No static BFW available, clear extension flag and set beamId
+        section_info.sect_1.ef = 0;
+        section_info.sect_1.beamId = static_beam_id;
         return;
     }
     section_info.sect_1.ef = 1;
@@ -1191,7 +1194,7 @@ void fill_static_section_ext(uint8_t* static_bfw_ptr, uint32_t cell_id, slot_com
     int extLenBytes = sizeof(oran_cmsg_ext_hdr) + sizeof(oran_cmsg_sect_ext_type_11) + sizeof(oran_cmsg_sect_ext_type_11_disableBFWs_0_bfwCompHdr);
     section_ext_info.sect_ext_common_hdr.ef = 0;
     section_ext_info.ext_11.bundle_hdr_size = sizeof(oran_cmsg_sect_ext_type_11_disableBFWs_0_bundle_uncompressed);
-    L_TRX = bfwCoeff_buf_info.nGnbAnt;
+    int L_TRX = bfwCoeff_buf_info.nGnbAnt;
     section_ext_info.ext_11.bfwIQ_size = (L_TRX * bfwIQBitwidth * 2) / 8;
     int bundleLenBytes = section_ext_info.ext_11.bundle_hdr_size + section_ext_info.ext_11.bfwIQ_size;
     section_ext_info.ext_11.numPrbBundles = (numPrbc + bfwCoeff_buf_info.prg_size - 1) / bfwCoeff_buf_info.prg_size;
@@ -1209,7 +1212,13 @@ void fill_static_section_ext(uint8_t* static_bfw_ptr, uint32_t cell_id, slot_com
     disableBFWs = 0;
 
     section_ext_info.sect_ext_common_hdr.extType = ORAN_CMSG_SECTION_EXT_TYPE_11;
-    section_ext_info.ext_11.ext_hdr.numBundPrb = bfwCoeff_buf_info.prg_size;//Overflow may happen, handle further in FH driver with section_ext_info.ext_11.numBundPrb
+    // Fix: When prg_size covers entire bandwidth (>= numPrbc), set numBundPrb to numPrbc
+    // since the section will be split and numBundPrb should reflect actual PRBs in the bundle
+    if (bfwCoeff_buf_info.prg_size >= static_cast<uint32_t>(numPrbc)) {
+        section_ext_info.ext_11.ext_hdr.numBundPrb = static_cast<uint8_t>(std::min(numPrbc, 255));
+    } else {
+        section_ext_info.ext_11.ext_hdr.numBundPrb = static_cast<uint8_t>(std::min(static_cast<int>(bfwCoeff_buf_info.prg_size), 255));
+    }
     section_ext_info.ext_11.ext_hdr.disableBFWs = disableBFWs;
     section_ext_info.ext_11.ext_hdr.RAD = RAD;
     section_ext_info.ext_11.ext_hdr.reserved = 0;
@@ -1225,22 +1234,75 @@ void fill_static_section_ext(uint8_t* static_bfw_ptr, uint32_t cell_id, slot_com
     // cuPHY fills buffer from index 0 regardless of startPrbc
     // for(int bundle_index = 0; bundle_index < numPrbBundles; ++bundle_index)
     {
-        auto& bundle_info = section_ext_11_bundle_infos[section_ext_11_bundle_index++];
         if(section_ext_11_bundle_index == MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT)
         {
-            NVLOGC_FMT(TAG, "MAX section ext reached");
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "MAX section ext reached");
         }
+        auto& bundle_info = section_ext_11_bundle_infos[section_ext_11_bundle_index++];
+        memset(&bundle_info.disableBFWs_0_uncompressed, 0, sizeof(bundle_info.disableBFWs_0_uncompressed)); 
+
         // ru_type::MULTI_SECT_MODE does not send the TX precoding and beamforming PDU, we can set the inner beamId to a dummy value.
         bundle_info.disableBFWs_0_uncompressed.beamId = static_beam_id;
-        bundle_info.disableBFWs_0_uncompressed.reserved = 0;  // Initialize reserved field
         bundle_info.bfwIQ = static_bfw_ptr;
     }
     section_ext_info.ext_11.bundles = &section_ext_11_bundle_infos[section_bundle_start_index];
     section_info.ext11 = &section_ext_info;
 }
 
+int FhProxy::sendCPlaneMMIMO(
+    bool is_bfw,
+    uint32_t cell_id,
+    peer_id_t peer_id,
+    oran_pkt_dir direction,
+    ti_subtask_info &ti_info)
+{
 
-int FhProxy::sendCPlane(
+    int                  buf_idx        = (direction == DIRECTION_DOWNLINK) ? 0 : 1;
+    auto                 &message_index = cplane_prepare_buffer.at(buf_idx).at(cell_id).message_index_; 
+    auto                 &message_infos = cplane_prepare_buffer.at(buf_idx).at(cell_id).message_infos_;
+    struct fh_peer_t     *peer_ptr      = getPeerFromId(peer_id);
+
+    if (unlikely(!peer_ptr))
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Peer {} is not registered!", peer_id); 
+        return SEND_CPLANE_FUNC_ERROR; 
+    }
+
+    if (is_bfw) 
+    {
+        if (message_index[fh_msg_info_type::BFW_MSG_INFO] > 0) 
+        {
+            char sbuf[MAX_SUBTASK_CHARS];
+            // sym-id is encoded to be 0 to be forward looking to allow for future updates 
+            // to task organization on a per-symbol basis
+            snprintf(sbuf, sizeof(sbuf), "bfw_prepare cell_%d sym_%d", cell_id, 0); 
+            TI_SUBTASK_INFO_ADD(ti_info,sbuf);
+            if(0 == send_cplane_mmimo(peer_ptr->peer, const_cast<const fhproxy_cmsg*>(&message_infos[fh_msg_info_type::BFW_MSG_INFO][0]), message_index[fh_msg_info_type::BFW_MSG_INFO]))
+            {
+                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "aerial_fh::send_cplane (bfw) error cell {}", cell_id);
+                return SEND_CPLANE_FUNC_ERROR;
+            }
+        }
+    } else 
+    {
+        if (message_index[fh_msg_info_type::NON_BFW_MSG_INFO] > 0) 
+        {
+            char sbuf[MAX_SUBTASK_CHARS];
+            // sym-id is encoded to be 0 to be forward looking to allow for future updates 
+            // to task organization on a per-symbol basis
+            snprintf(sbuf, sizeof(sbuf), "nonbfw_prepare cell_%d sym_%d", cell_id, 0); 
+            TI_SUBTASK_INFO_ADD(ti_info,sbuf);
+            if(0 == send_cplane_mmimo(peer_ptr->peer, const_cast<const fhproxy_cmsg*>(&message_infos[fh_msg_info_type::NON_BFW_MSG_INFO][0]), message_index[fh_msg_info_type::NON_BFW_MSG_INFO]))
+            {
+                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "aerial_fh::send_cplane (non-bfw) error cell {}", cell_id);
+                return SEND_CPLANE_FUNC_ERROR;
+            }
+        }
+    }
+    return SEND_CPLANE_NO_ERROR;
+}
+
+int FhProxy::prepareCPlaneInfo(
     uint32_t cell_id,
     ru_type ru,
     peer_id_t peer_id,
@@ -1257,7 +1319,6 @@ int FhProxy::sendCPlane(
     uint8_t** bfw_header,
     t_ns start_ch_task_time,
     int  prevSlotBfwCompStatus,
-    std::atomic<int>& cplane_info_for_uplane_rdy_count,
     ti_subtask_info &ti_info
     )
 {
@@ -1278,8 +1339,12 @@ int FhProxy::sendCPlane(
     start_tx_time += t_ns(AppConfig::getInstance().getTaiOffset());
 
     fhproxy_cmsg_section section_infos[MAX_CPLANE_SECTIONS_PER_SLOT];
-    fhproxy_cmsg_section_ext section_ext_infos[MAX_CPLANE_SECTIONS_EXT_PER_SLOT];
-    fhproxy_cmsg_section_ext_11_bundle_info section_ext_11_bundle_infos[MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT];
+    
+    // Ping-pong per direction
+    int buf_idx = (direction == DIRECTION_DOWNLINK) ? 0 : 1;
+    auto &section_ext_infos = cplane_prepare_buffer.at(buf_idx).at(cell_id).section_ext_infos_; 
+    auto &section_ext_11_bundle_infos = cplane_prepare_buffer.at(buf_idx).at(cell_id).section_ext_11_bundle_infos_; 
+
     int                 disableBFWs = 0;
     int                 RAD = 0;
     int                 numBundPrb = 0;
@@ -1354,25 +1419,27 @@ int FhProxy::sendCPlane(
     if(pdctx->getmMIMO_enable())
     {
         
-        // slot-level ping-pong
-        int buf_idx = (direction == DIRECTION_DOWNLINK) ? 0 : 1;
-
-        size_t               message_index[fh_msg_info_type::NUM_MSG_INFO_TYPES]{};
+        std::array<std::array<uint16_t, MAX_AP_PER_SLOT_SRS>,fh_msg_info_type::NUM_MSG_INFO_TYPES> section_count;
+        std::array<std::array<uint16_t, MAX_AP_PER_SLOT_SRS>,fh_msg_info_type::NUM_MSG_INFO_TYPES> start_section_count;
+        
         // Choose the right buffers & counter arrays for current slot & cell. 
-        auto                 &message_infos = message_infos_.at(buf_idx).at(cell_id);
-        auto                 &section_infos_per_ant_per_msgtype = section_infos_.at(buf_idx).at(cell_id);
-        auto                 &section_count_per_ant_per_msgtype = section_count_.at(buf_idx).at(cell_id);
-        auto                 &start_section_count_per_ant_per_msgtype = start_section_count_.at(buf_idx).at(cell_id);
+        auto                 &message_index = cplane_prepare_buffer.at(buf_idx).at(cell_id).message_index_; 
+        auto                 &message_infos = cplane_prepare_buffer.at(buf_idx).at(cell_id).message_infos_;
+        auto                 &section_infos_per_ant_per_msgtype = cplane_prepare_buffer.at(buf_idx).at(cell_id).section_infos_;
+        auto                 &section_count_per_ant_per_msgtype = section_count;
+        auto                 &start_section_count_per_ant_per_msgtype = start_section_count;
 
-        // These are atomic to allow for potential parallelism between BFW and non-BFW tasks.
-        std::atomic<int>     section_id_per_ant[MAX_AP_PER_SLOT_SRS];
-        std::atomic<int>     start_section_id_srs_per_ant[MAX_AP_PER_SLOT_SRS];
-        std::atomic<int>     start_section_id_prach_per_ant[MAX_AP_PER_SLOT_SRS];
+        // NOTE: These are non-atomic! For any concurrency between BFW and non-BFW tasks, these ought to be atomic.
+        auto                 &section_id_per_ant = cplane_prepare_buffer.at(buf_idx).at(cell_id).section_id_per_ant_;
+        auto                 &start_section_id_srs_per_ant = cplane_prepare_buffer.at(buf_idx).at(cell_id).start_section_id_srs_per_ant_;
+        auto                 &start_section_id_prach_per_ant = cplane_prepare_buffer.at(buf_idx).at(cell_id).start_section_id_prach_per_ant_;
+
         uint64_t             sent_ext_11_port_mask[ORAN_ALL_SYMBOLS][ORAN_MAX_PRB_X_SLOT]{};
         std::array<csirs_section_id_info_t, MAX_FLOWS> csirs_section_id_map{};
         bool                 sent_ext_11[ORAN_ALL_SYMBOLS][ORAN_MAX_PRB_X_SLOT]{};
-        uint8_t              static_buff_count = 0;
-        uint8_t*             static_bfw_ptr = nullptr;
+
+        message_index[fh_msg_info_type::BFW_MSG_INFO] = 0; 
+        message_index[fh_msg_info_type::NON_BFW_MSG_INFO] = 0; 
 
         for(int i = 0; i < MAX_AP_PER_SLOT_SRS; ++i)
         {
@@ -1383,6 +1450,7 @@ int FhProxy::sendCPlane(
             start_section_id_srs_per_ant[i] = start_section_id_srs;
             start_section_id_prach_per_ant[i] = start_section_id_prach;
         }
+
         uint16_t dyn_bfw_beam_id[MAX_AP_PER_SLOT][ORAN_MAX_PRB]{};
         bool     dyn_bfw_seen[MAX_AP_PER_SLOT][ORAN_MAX_PRB]{};
         //for each symbol
@@ -1449,7 +1517,13 @@ int FhProxy::sendCPlane(
                 for(auto prb_info_idx : *prb_index_list)
                 {
                     auto &prb_info = prbs[prb_info_idx];
-                    int beam_idx = 0;
+                    // Initialize beam_idx based on the first set bit in portMask.
+                    // This is needed when prb_info is divided into multiple entries in the prb_info_list.
+                    // (e.g., DMRS 4-port allocation, resulting in split into two entries in the prb_info_list with 
+                    // portMask=0x3 for layers 0,1 and portMask=0xc for layers 2,3).
+                    // The beam_idx should start at the layer offset to index correctly into beams_array.
+                    int beam_idx = (prb_info.common.portMask != 0) ? __builtin_ctzll(prb_info.common.portMask) : 0;
+                    auto &overlap_csirs_port_info = slot_info.overlap_csirs_port_info[prb_info_idx];
                     int csirs_beam_idx = 0;
                     int active_ap_idx = 0;
                     int overlaping_csirs_section_start_idx = 0;
@@ -1466,7 +1540,7 @@ int FhProxy::sendCPlane(
                     if(mod_comp_enabled) {
                         if(channel_type == slot_command_api::channel_type::PDSCH_CSIRS)
                         {
-                            re_mask = ~prb_info.comp_info.sections[1].mcScaleReMask.get();
+                            re_mask = ~prb_info.comp_info.sections[1].mcScaleReMask;
                         }
                     }
                     // If it is pdsch + sect 11, only send for the first symbol
@@ -1529,15 +1603,12 @@ int FhProxy::sendCPlane(
                             csi_rs_prb_info = &prb_info;
                             beams_csirs_array = &prb_info.beams_array2;
                             beams_csirs_array_size = prb_info.beams_array_size2;
-                            prb_info.common.reMask = prb_info.comp_info.sections[0].mcScaleReMask.get();
-                            overlapping_csi_rs_remask = prb_info.comp_info.sections[1].mcScaleReMask.get();
-                            
-                            if(mod_comp_enabled)
-                            {
-                                pdsch_comp_info.common.nSections = 1;
-                                csi_rs_comp_info.common.nSections =1;
-                                csi_rs_comp_info.sections[0] = prb_info.comp_info.sections[1];
-                            }
+                            prb_info.common.reMask = prb_info.comp_info.sections[0].mcScaleReMask;
+                            overlapping_csi_rs_remask = prb_info.comp_info.sections[1].mcScaleReMask;
+
+                            pdsch_comp_info.common.nSections = 1;
+                            csi_rs_comp_info.common.nSections =1;
+                            csi_rs_comp_info.sections[0] = prb_info.comp_info.sections[1];
                         }
                         
                         if(channel_type == slot_command_api::channel_type::CSI_RS)
@@ -1596,7 +1667,7 @@ int FhProxy::sendCPlane(
                         auto                                    start_prbc             = prb_info.common.startPrbc;
                         auto                                    num_prbc_split         = ORAN_MAX_PRB_X_SECTION;
                         auto                                    flow_idx               = ap_idx % flows.size();
-
+                        csirs_section_id_info_t& csirs_section_id_info = csirs_section_id_map[flow_idx];
                         radio_app_hdr.dataDirection   = prb_info.common.direction;
                         
                         // A singleton local instance that gets populated until BFW vs non-BFW decision is known
@@ -1618,9 +1689,17 @@ int FhProxy::sendCPlane(
                         {
                             if(beams_csirs_array_size > 0)
                             {
-                                beams_csirs_array_size = std::min(beams_csirs_array_size, num_ports); //TODO: This needs to be changed to num_ports
-                                csirs_beam_id          = (*beams_csirs_array)[csirs_beam_idx % beams_csirs_array_size];
-                                csirs_beam_idx         = (csirs_beam_idx + 1) % beams_csirs_array_size; //TODO: Need to check if the beam_idx is correct
+                                beams_csirs_array_size = std::min(beams_csirs_array_size, overlap_csirs_port_info.num_ports != 0 ? overlap_csirs_port_info.num_ports : num_ports); //TODO: This needs to be changed to num_ports
+                                if(overlap_csirs_port_info.num_overlap_ports > 0)
+                                {
+                                    csirs_beam_idx = overlap_csirs_port_info.reMask_ap_idx_pairs[0].second % beams_csirs_array_size;
+                                    csirs_beam_id          = (*beams_csirs_array)[csirs_beam_idx];
+                                }
+                                else
+                                {
+                                    csirs_beam_id          = (*beams_csirs_array)[csirs_beam_idx % beams_csirs_array_size];
+                                    csirs_beam_idx         = (csirs_beam_idx + 1) % beams_csirs_array_size; //TODO: Need to check if the beam_idx is correct
+                                }
                             } 
                         }
 
@@ -1652,10 +1731,50 @@ int FhProxy::sendCPlane(
                         {
                             radio_app_hdr.sectionType     = ORAN_CMSG_SECTION_TYPE_1;
                             if (channel_type == slot_command_api::channel_type::CSI_RS) {
-                                csirs_section_id_info_t& csirs_section_id_info = csirs_section_id_map[flow_idx];
+                                // Manage section ID lookback index for CSI-RS compact signaling with section splits
+                                //
+                                // csirs_section_id_info[flow_idx].section_id_lookback_index tracks the lookback distance
+                                // for NEW sections to reference the correct section ID when CSI-RS sections are split.
+                                //
+                                // Key behaviors:
+                                // 1. After a split: Both resulting sections have lookback_index=0 (independent section IDs)
+                                // 2. When split occurs: Increment csirs_section_id_info[flow_idx].section_id_lookback_index
+                                // 3. For new sections: Increment csirs_section_id_info[flow_idx].section_id_lookback_index 
+                                //    before assignment to correctly reference existing sections
+                                //
+                                // Example 1 - With section split:
+                                //
+                                //   Initial: csirs_section_id_info[flow_idx].section_id_lookback_index = 0
+                                //   Section[0]: lookback=0, section_id=100 (reference section)
+                                //
+                                //   Section[0] splits due to PRB constraints:
+                                //     csirs_section_id_info[flow_idx].section_id_lookback_index → 1
+                                //     Section[0]: PRB 0-255,   lookback=0, section_id=100 (first half, independent)
+                                //     Section[1]: PRB 255-end, lookback=0, section_id=101 (second half, independent)
+                                //
+                                //   New section arrives (same PRB set):
+                                //     csirs_section_id_info[flow_idx].section_id_lookback_index: 1 → 2
+                                //     Section[2]: lookback=2, section_id=100 (references Section[2-2]=Section[0])
+                                //     
+                                //   Section[2] splits:
+                                //     Section[2]: PRB 0-255,   lookback=2, section_id=100 (keep lookback)
+                                //     Section[3]: PRB 255-end, lookback=2, section_id=101 (references Section[3-2]=Section[1])
+                                //
+                                // Example 2 - Without section split:
+                                //
+                                //   Initial: csirs_section_id_info[flow_idx].section_id_lookback_index = 0
+                                //   Section[0]: lookback=0, section_id=100 (reference section)
+                                //
+                                //   New section arrives (same PRB set, no split needed):
+                                //     csirs_section_id_info[flow_idx].section_id_lookback_index: 0 → 1
+                                //     Section[1]: lookback=1, section_id=100 (references Section[1-1]=Section[0])
+                                //
+                                // The lookback_index ensures new sections correctly pair with their corresponding
+                                // reference sections (matching antenna port) to obtain the same section ID.
                                 if(csirs_section_id_info.start_prb == start_prbc && csirs_section_id_info.num_prb == num_prbc && csirs_section_id_info.symbol == symbol_id)
                                 {
                                     section_info.sect_1.sectionId = csirs_section_id_info.csirs_section_id;
+                                    section_info.section_id_lookback_index = ++csirs_section_id_info.section_id_lookback_index;
                                 }
                                 else
                                 {
@@ -1664,7 +1783,10 @@ int FhProxy::sendCPlane(
                                     csirs_section_id_info.symbol = symbol_id;
                                     csirs_section_id_info.csirs_section_id = section_id_per_ant[flow_idx]++;
                                     section_info.sect_1.sectionId = csirs_section_id_info.csirs_section_id;
+                                    section_info.section_id_lookback_index = 0;
+                                    csirs_section_id_info.section_id_lookback_index = 0;
                                 }
+                                beam_idx = ap_idx; // This is done because for CSI-RS one PRB will carry data for only one ap_idx. So beam_idx doesn't get updated and remains 0.
                             } else {
                                 section_info.sect_1.sectionId = channel_type == slot_command_api::channel_type::SRS ? start_section_id_srs_per_ant[flow_idx]++ : section_id_per_ant[flow_idx]++;
                             }
@@ -1818,15 +1940,15 @@ int FhProxy::sendCPlane(
 
                             if(csirs_section_only)
                             {
-                                static_bfw_ptr = getStaticBFWWeights(cell_id, csirs_beam_id);
-                                fill_static_section_ext(static_bfw_ptr, cell_id, *csi_rs_prb_info, section_info, section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, L_TRX, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, csirs_beam_id, static_buff_count);
+                                uint8_t* static_bfw_ptr = getStaticBFWWeights(cell_id, csirs_beam_id);
+                                fill_static_section_ext(static_bfw_ptr, cell_id, *csi_rs_prb_info, section_info, section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, csirs_beam_id);
                             }
                             else
                             {
                                 if (prb_info.common.isStaticBfwEncoded)
                                 {
-                                    static_bfw_ptr = getStaticBFWWeights(cell_id, beam_id);
-                                    fill_static_section_ext(static_bfw_ptr, cell_id, prb_info, section_info, section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, L_TRX, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, beam_id, static_buff_count);
+                                    uint8_t* static_bfw_ptr = getStaticBFWWeights(cell_id, beam_id);
+                                    fill_static_section_ext(static_bfw_ptr, cell_id, prb_info, section_info, section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, beam_id);
                                 }
                                 else
                                 {
@@ -1834,7 +1956,6 @@ int FhProxy::sendCPlane(
                                     section_info.sect_1.beamId = beam_id;
                                 }
                             }
-                            static_buff_count++;
                         }
 
                         if(mod_comp_enabled && section_info.ext4 == nullptr)
@@ -1856,44 +1977,62 @@ int FhProxy::sendCPlane(
                         if(both_pdsch_csirs_included)
                         { //Followed by csirs
                             auto pdsch_section_index = section_count_per_ant[flow_idx] - 1;
-                            auto csirs_section_index = section_count_per_ant[flow_idx];
-                            memcpy(&section_infos_per_ant[flow_idx][csirs_section_index], &section_infos_per_ant[flow_idx][pdsch_section_index], sizeof(section_template));
-                            section_infos_per_ant[flow_idx][csirs_section_index].sect_1.reMask = overlapping_csi_rs_remask;
-                            section_infos_per_ant[flow_idx][csirs_section_index].csirs_of_multiplex_pdsch_csirs = true;
-                            section_infos_per_ant[flow_idx][csirs_section_index].ext4 = nullptr;
-                            section_infos_per_ant[flow_idx][csirs_section_index].ext5 = nullptr;
-                            section_infos_per_ant[flow_idx][csirs_section_index].ext11 = nullptr;
-                            if(encode_stat_ext_11)
+                            uint8_t num_overlap_ports = overlap_csirs_port_info.num_overlap_ports ? overlap_csirs_port_info.num_overlap_ports : 1;
+                            for(uint8_t i = 0; i < num_overlap_ports; i++)
                             {
-                                message_template.hasSectionExt = true;
-                                int startPrbc                  = 0;
-                                int numPrbc                    = prb_info.common.numPrbc;
-                                if((numPrbc > ORAN_MAX_PRB_X_SECTION) && (numPrbc < ORAN_MAX_PRB_X_SLOT))
+                                auto csirs_section_index = section_count_per_ant[flow_idx];
+                                memcpy(&section_infos_per_ant[flow_idx][csirs_section_index], &section_infos_per_ant[flow_idx][pdsch_section_index], sizeof(section_template));
+                                section_infos_per_ant[flow_idx][csirs_section_index].sect_1.reMask = overlap_csirs_port_info.num_overlap_ports > 0 ? overlap_csirs_port_info.reMask_ap_idx_pairs[i].first : overlapping_csi_rs_remask;
+                                section_infos_per_ant[flow_idx][csirs_section_index].csirs_of_multiplex_pdsch_csirs = true;
+                                section_infos_per_ant[flow_idx][csirs_section_index].ext4 = nullptr;
+                                section_infos_per_ant[flow_idx][csirs_section_index].ext5 = nullptr;
+                                section_infos_per_ant[flow_idx][csirs_section_index].ext11 = nullptr;
+                                if(overlap_csirs_port_info.num_overlap_ports > 0)
                                 {
-                                    prg_size = prb_info.bfwCoeff_buf_info.prg_size;
-                                    numPrbc  = adjustPrbCountMuMimo(numPrbc, prg_size);
+                                    csirs_beam_idx = overlap_csirs_port_info.reMask_ap_idx_pairs[i].second % beams_csirs_array_size;
                                 }
-                                num_prbc_split = numPrbc;
-                                static_bfw_ptr = getStaticBFWWeights(cell_id, csirs_beam_id);
-                                fill_static_section_ext(static_bfw_ptr, cell_id, *csi_rs_prb_info, section_infos_per_ant[flow_idx][csirs_section_index], section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, L_TRX, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, csirs_beam_id, static_buff_count);
-                                static_buff_count++;
-                            }
-                            else
-                            {
-                                section_infos_per_ant[flow_idx][csirs_section_index].sect_1.ef     = 0;
-                                section_infos_per_ant[flow_idx][csirs_section_index].sect_1.beamId = csirs_beam_id;
-                            }
-                            increment_section_count(section_count_per_ant[flow_idx], MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP, flow_idx);
-                            if(mod_comp_enabled)
-                            {
-                                fill_section_ext4_ext5(csi_rs_comp_info, section_infos_per_ant[flow_idx][csirs_section_index], section_ext_infos, section_ext_index);
+                                csirs_beam_id          = (*beams_csirs_array)[csirs_beam_idx];
+                                section_infos_per_ant[flow_idx][csirs_section_index].section_id_lookback_index = i + 1;
+                                
+                                if(encode_stat_ext_11)
+                                {
+                                    message_template.hasSectionExt = true;
+                                    int startPrbc                  = 0;
+                                    int numPrbc                    = prb_info.common.numPrbc;
+                                    if((numPrbc > ORAN_MAX_PRB_X_SECTION) && (numPrbc < ORAN_MAX_PRB_X_SLOT))
+                                    {
+                                        prg_size = prb_info.bfwCoeff_buf_info.prg_size;
+                                        numPrbc  = adjustPrbCountMuMimo(numPrbc, prg_size);
+                                    }
+                                    num_prbc_split = numPrbc;
+                                    uint8_t* static_bfw_ptr = getStaticBFWWeights(cell_id, csirs_beam_id);
+                                    fill_static_section_ext(static_bfw_ptr, cell_id, *csi_rs_prb_info, section_infos_per_ant[flow_idx][csirs_section_index], section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, csirs_beam_id);
+                                    //static_buff_count++;
+                                }
+                                else
+                                {
+                                    section_infos_per_ant[flow_idx][csirs_section_index].sect_1.ef     = 0;
+                                    section_infos_per_ant[flow_idx][csirs_section_index].sect_1.beamId = csirs_beam_id;
+                                }
+                                increment_section_count(section_count_per_ant[flow_idx], MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP, flow_idx);
+                                if(mod_comp_enabled)
+                                {
+                                    fill_section_ext4_ext5(csi_rs_comp_info, section_infos_per_ant[flow_idx][csirs_section_index], section_ext_infos, section_ext_index);
+                                }
                             }
                         }
 
                         if ((num_prbc > ORAN_MAX_PRB_X_SECTION) && (num_prbc < ORAN_MAX_PRB_X_SLOT))
                         {
-                            auto prev_section_index = section_count_per_ant[flow_idx] - (both_pdsch_csirs_included ? 2 : 1);
+                            uint8_t num_overlap_ports = both_pdsch_csirs_included? overlap_csirs_port_info.num_overlap_ports > 0 ? overlap_csirs_port_info.num_overlap_ports : 1 : 0;
+                            auto prev_section_index = section_count_per_ant[flow_idx] - (num_overlap_ports + 1);
                             auto curr_section_index = section_count_per_ant[flow_idx];
+                            // For CSI-RS: Increment lookback index to account for the section split
+                            // This ensures subsequent sections reference the correct split section for section ID
+                            if(channel_type == slot_command_api::channel_type::CSI_RS) 
+                            {
+                                csirs_section_id_info.section_id_lookback_index++;
+                            }
                             memcpy(&section_infos_per_ant[flow_idx][curr_section_index], &section_infos_per_ant[flow_idx][prev_section_index], sizeof(section_template));
                             
                             //Incase alternate PRB is being used in a section. if the section started from
@@ -1942,15 +2081,14 @@ int FhProxy::sendCPlane(
                                 message_template.hasSectionExt = true;
                                 if(csirs_section_only)
                                 {
-                                    static_bfw_ptr = getStaticBFWWeights(cell_id, csirs_beam_id);
-                                    fill_static_section_ext(static_bfw_ptr, cell_id, *csi_rs_prb_info, section_info, section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, L_TRX, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, csirs_beam_id, static_buff_count);
+                                    uint8_t* static_bfw_ptr = getStaticBFWWeights(cell_id, csirs_beam_id);
+                                    fill_static_section_ext(static_bfw_ptr, cell_id, *csi_rs_prb_info, section_info, section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, csirs_beam_id);
                                 }
                                 else
                                 {
-                                    static_bfw_ptr = getStaticBFWWeights(cell_id, beam_id);
-                                    fill_static_section_ext(static_bfw_ptr, cell_id, prb_info, section_info, section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, L_TRX, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, beam_id, static_buff_count);
+                                    uint8_t* static_bfw_ptr = getStaticBFWWeights(cell_id, beam_id);
+                                    fill_static_section_ext(static_bfw_ptr, cell_id, prb_info, section_info, section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, beam_id);
                                 }
-                                static_buff_count++;
                             }
                             increment_section_count(section_count_per_ant[flow_idx], MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP, flow_idx);
 
@@ -1964,32 +2102,40 @@ int FhProxy::sendCPlane(
 
                             if(both_pdsch_csirs_included)
                             {//Followed by csirs
-                                auto pdsch_section_index = section_count_per_ant[flow_idx] - 1;
-                                auto csirs_section_index = section_count_per_ant[flow_idx];
-                                memcpy(&section_infos_per_ant[flow_idx][csirs_section_index], &section_infos_per_ant[flow_idx][pdsch_section_index], sizeof(section_template));
-                                section_infos_per_ant[flow_idx][csirs_section_index].sect_1.reMask                  = overlapping_csi_rs_remask;
-                                section_infos_per_ant[flow_idx][csirs_section_index].csirs_of_multiplex_pdsch_csirs = true;
-                                section_infos_per_ant[flow_idx][csirs_section_index].ext4                           = nullptr;
-                                section_infos_per_ant[flow_idx][csirs_section_index].ext5                           = nullptr;
-                                section_infos_per_ant[flow_idx][csirs_section_index].ext11                          = nullptr;
-                                if(encode_stat_ext_11)
-                                {
-                                    message_template.hasSectionExt = true;
-                                    int startPrbc                  = num_prbc_split;
-                                    int numPrbc                    = prb_info.common.numPrbc - num_prbc_split;
-                                    static_bfw_ptr = getStaticBFWWeights(cell_id, csirs_beam_id);
-                                    fill_static_section_ext(static_bfw_ptr, cell_id, *csi_rs_prb_info, section_infos_per_ant[flow_idx][csirs_section_index], section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, L_TRX, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, csirs_beam_id, static_buff_count);
-                                    static_buff_count++;
-                                }
-                                else
-                                {
-                                    section_infos_per_ant[flow_idx][csirs_section_index].sect_1.ef     = 0;
-                                    section_infos_per_ant[flow_idx][csirs_section_index].sect_1.beamId = csirs_beam_id;
-                                }
-                                increment_section_count(section_count_per_ant[flow_idx], MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP, flow_idx);
-                                if(mod_comp_enabled)
-                                {
-                                    fill_section_ext4_ext5(csi_rs_comp_info, section_infos_per_ant[flow_idx][csirs_section_index], section_ext_infos, section_ext_index);
+                                for(uint8_t i = 0; i < num_overlap_ports; i++){
+                                    auto pdsch_section_index = section_count_per_ant[flow_idx] - (i + 1);
+                                    auto csirs_section_index = section_count_per_ant[flow_idx];
+                                    memcpy(&section_infos_per_ant[flow_idx][csirs_section_index], &section_infos_per_ant[flow_idx][pdsch_section_index], sizeof(section_template));
+                                    section_infos_per_ant[flow_idx][csirs_section_index].sect_1.reMask                  = overlap_csirs_port_info.num_overlap_ports > 0 ? overlap_csirs_port_info.reMask_ap_idx_pairs[i].first : overlapping_csi_rs_remask;;
+                                    section_infos_per_ant[flow_idx][csirs_section_index].csirs_of_multiplex_pdsch_csirs = true;
+                                    section_infos_per_ant[flow_idx][csirs_section_index].ext4                           = nullptr;
+                                    section_infos_per_ant[flow_idx][csirs_section_index].ext5                           = nullptr;
+                                    section_infos_per_ant[flow_idx][csirs_section_index].ext11                          = nullptr;
+                                    if(overlap_csirs_port_info.num_overlap_ports > 0){
+                                        csirs_beam_idx = overlap_csirs_port_info.reMask_ap_idx_pairs[i].second % beams_csirs_array_size;
+                                    }
+                                    csirs_beam_id          = (*beams_csirs_array)[csirs_beam_idx];
+                                    section_infos_per_ant[flow_idx][csirs_section_index].section_id_lookback_index = i + 1;
+
+                                    if(encode_stat_ext_11)
+                                    {
+                                        message_template.hasSectionExt = true;
+                                        int startPrbc                  = num_prbc_split;
+                                        int numPrbc                    = prb_info.common.numPrbc - num_prbc_split;
+                                        uint8_t* static_bfw_ptr = getStaticBFWWeights(cell_id, csirs_beam_id);
+                                        fill_static_section_ext(static_bfw_ptr, cell_id, *csi_rs_prb_info, section_infos_per_ant[flow_idx][csirs_section_index], section_ext_infos, section_ext_11_bundle_infos, section_ext_index, section_ext_11_bundle_index, staticBFWIQBitwidth, disableBFWs, RAD, active_ap_idx, ap_idx, startPrbc, numPrbc, csirs_beam_id);
+                                        //static_buff_count++;
+                                    }
+                                    else
+                                    {
+                                        section_infos_per_ant[flow_idx][csirs_section_index].sect_1.ef     = 0;
+                                        section_infos_per_ant[flow_idx][csirs_section_index].sect_1.beamId = csirs_beam_id;
+                                    }
+                                    increment_section_count(section_count_per_ant[flow_idx], MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP, flow_idx);
+                                    if(mod_comp_enabled)
+                                    {
+                                        fill_section_ext4_ext5(csi_rs_comp_info, section_infos_per_ant[flow_idx][csirs_section_index], section_ext_infos, section_ext_index);
+                                    }
                                 }
                             }
                         }
@@ -2009,18 +2155,17 @@ int FhProxy::sendCPlane(
                         message_template.sections  = &section_infos_per_ant_per_msgtype[bfw_type][ap_idx][start_section_idx];
                         message_template.flow      = flows[ap_idx].handle;
                         message_template.ap_idx    = ap_idx;
-                        message_template.slot_info = &slot_info;
                         if(channel_type == slot_command_api::channel_type::PRACH)
                         {
-                            message_template.nxt_section_id = start_section_id_prach_per_ant;
+                            message_template.nxt_section_id = &start_section_id_prach_per_ant[0];
                         }
                         else if(channel_type == slot_command_api::channel_type::SRS)
                         {
-                            message_template.nxt_section_id = start_section_id_srs_per_ant;
+                            message_template.nxt_section_id = &start_section_id_srs_per_ant[0];
                         }
                         else
                         {
-                            message_template.nxt_section_id = section_id_per_ant;
+                            message_template.nxt_section_id = &section_id_per_ant[0];
                         }
                         memcpy(&message_infos[bfw_type][message_index[bfw_type]++], &message_template, sizeof(message_template));
                     }
@@ -2030,39 +2175,21 @@ int FhProxy::sendCPlane(
             end_tx_time = start_tx_time + tx_time;
         } // for(int symbol_id = start_symbol; symbol_id < slot_info.symbols.size(); symbol_id++)
 
-        // First, prepare and enqueue the BFW packets into the NIC as they have a stricter deadline. 
-        if (message_index[fh_msg_info_type::BFW_MSG_INFO] > 0) 
-        {
-            char sbuf[MAX_SUBTASK_CHARS];
-            // sym-id is encoded to be 0 to be forward looking to allow for future updates 
-            // to task organization on a per-symbol basis
-            snprintf(sbuf, sizeof(sbuf), "bfw_prepare cell_%d sym_%d", cell_id, 0); 
-            TI_SUBTASK_INFO_ADD(ti_info,sbuf);
-            if(0 == send_cplane_mmimo(peer_ptr->peer, const_cast<const fhproxy_cmsg*>(&message_infos[fh_msg_info_type::BFW_MSG_INFO][0]), message_index[fh_msg_info_type::BFW_MSG_INFO]))
-            {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "aerial_fh::send_cplane (bfw) error cell {}", cell_id);
-                return SEND_CPLANE_FUNC_ERROR;
-            }
-        }
-        
-        // Next, prepare and enqueue the non-BFW packets into the NIC. 
-        if (message_index[fh_msg_info_type::NON_BFW_MSG_INFO] > 0) 
-        {
-            char sbuf[MAX_SUBTASK_CHARS];
-            // sym-id is encoded to be 0 to be forward looking to allow for future updates 
-            // to task organization on a per-symbol basis
-            snprintf(sbuf, sizeof(sbuf), "nonbfw_prepare cell_%d sym_%d", cell_id, 0); 
-            TI_SUBTASK_INFO_ADD(ti_info,sbuf);
-            if(0 == send_cplane_mmimo(peer_ptr->peer, const_cast<const fhproxy_cmsg*>(&message_infos[fh_msg_info_type::NON_BFW_MSG_INFO][0]), message_index[fh_msg_info_type::NON_BFW_MSG_INFO]))
-            {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "aerial_fh::send_cplane (non-bfw) error cell {}", cell_id);
-                return SEND_CPLANE_FUNC_ERROR;
-            }
-        }
-
-        // All packets are prepared & queued, ungate the dependent tasks
-        slot_info.section_id_ready.store(true);
-        cplane_info_for_uplane_rdy_count.fetch_add(1);
+        /*
+         * NOTE: For MMIMO DL - the task ordering is setup to process the BFW
+         * packets of all the cells followed by non-BFW packets. This enables
+         * meeting the stricter BFW packet deadlines. See
+         * task_dl_function_dl_aggr.cpp::task_work_function_cplane() for the
+         * ordering of sendCPlaneMMIMO calls.
+         *
+         * For MMIMO UL - the task ordering is setup to process BFW of a cell followed by its non-BFW packets.
+         * See task_function_ul_aggr.cpp::task_work_function_ul_aggr_1_cplane() for the ordering of 
+         * sendCPlaneMMIMO calls. 
+         *
+         * Note: The data structures for section_id (start_section_id_prach_per_ant/start_section_id_srs_per_ant/section_id_per_ant) 
+         * need to be made atomic if BFW and non-BFW will execute concurrently. 
+         *
+         * */
 
     }
     else
@@ -2354,7 +2481,6 @@ int FhProxy::sendCPlane(
                                         int buffer_index = ap_index * prb_info->bfwCoeff_buf_info.num_prgs * (section_ext_info.ext_11.bfwIQ_size + 1);  // +1 for exponent
                                         buffer_index += bundle_index * (section_ext_info.ext_11.bfwIQ_size + 1); // +1 for exponent
                                         bundle_info.disableBFWs_0_compressed.bfwCompParam.exponent = buffer_ptr[buffer_index++];
-                                        bundle_info.disableBFWs_0_compressed.bfwCompParam.reserved = 0;  // Initialize reserved field
                                         bundle_info.bfwIQ = &buffer_ptr[buffer_index];
                                         *bfw_header = prb_info->bfwCoeff_buf_info.header;
                                     }
@@ -2423,6 +2549,8 @@ int FhProxy::sendCPlane(
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "aerial_fh::send_cplane error");
             return SEND_CPLANE_FUNC_ERROR;
         }
+
+
         // Uncomment the following code when Modcomp is to be enabled for 4T4R
 // #else
 //         std::array<std::size_t, MAX_FLOWS> num_section_per_flow = {};
@@ -2842,7 +2970,6 @@ int FhProxy::prepareUPlanePackets(
         section_info.sym_inc      = false;
         bool cplane_section_info_exist = true;
 
-        std::array<std::pair<uint16_t, int>, MAX_FLOWS> csirs_remask_map;
         //Assuming the compression method will be the same for a given cell 
         if(dl_comp_method == aerial_fh::UserDataCompressionMethod::MODULATION_COMPRESSION)
             { 
@@ -2985,6 +3112,10 @@ int FhProxy::prepareUPlanePackets(
                         message_template.flow   = flows[flow_idx].handle;
                         message_template.eaxcid = flows[flow_idx].eAxC_id;
                         bool split_prb = false;
+                        if((channel_type == slot_command_api::channel_type::CSI_RS) && (prb_info.cplane_sections_info[symbol_id]->combined_reMask[flow_idx] == 0))
+                        {
+                            continue;
+                        }
                         for(auto cplane_section_idx = 0; cplane_section_idx < prb_info.cplane_sections_info[symbol_id]->cplane_sections_count[flow_idx]; cplane_section_idx++)
                         {
                             auto num_prbu   = prb_info.cplane_sections_info[symbol_id]->numPrbc[flow_idx][cplane_section_idx];
@@ -3025,44 +3156,36 @@ int FhProxy::prepareUPlanePackets(
                                 scale_val.x = prb_info.comp_info.modCompScalingValue[0];
                                 
 
-                                uint8_t udIqwidth = static_cast<uint8_t>(prb_info.comp_info.common.udIqWidth);
-                                uint8_t csf_1     = static_cast<uint8_t>(prb_info.comp_info.sections[0].csf.get());
+                                auto    udIqwidth = prb_info.comp_info.common.udIqWidth;
+                                auto    csf_1     = prb_info.comp_info.sections[0].csf;
                                 uint8_t csf_2     = 0;
-
-                                uint16_t reMask_1 = static_cast<uint16_t>(prb_info.comp_info.sections[0].mcScaleReMask.get());
+                                uint16_t reMask_1 = 0;
                                 uint16_t reMask_2 = 0;
+                                if(channel_type == slot_command_api::channel_type::CSI_RS)
+                                {
+                                    reMask_1 = prb_info.cplane_sections_info[symbol_id]->combined_reMask[flow_idx];
+                                }
+                                else
+                                {
+                                    reMask_1 = prb_info.comp_info.sections[0].mcScaleReMask;
+                                }
 
                                 if(prb_info.comp_info.common.nSections == 2)
                                 {
                                     scale_val.y = prb_info.comp_info.modCompScalingValue[1];
-                                    csf_2       = static_cast<uint8_t>(prb_info.comp_info.sections[1].csf.get());
-                                    reMask_2    = static_cast<uint16_t>(prb_info.comp_info.sections[1].mcScaleReMask.get());
+                                    csf_2       = prb_info.comp_info.sections[1].csf;
+                                    reMask_2    = prb_info.comp_info.sections[1].mcScaleReMask;
                                 }
-                                if(channel_type == slot_command_api::channel_type::CSI_RS)
-                                {
-                                    auto& remask_count = csirs_remask_map[flow_idx];
-                                    remask_count.first |= prb_info.comp_info.sections[0].mcScaleReMask.get();
-                                    (split_prb)? remask_count.second+=2 : remask_count.second++;
-                                    if(remask_count.second == prb_info.cplane_sections_info[symbol_id]->cplane_sections_count[flow_idx])
-                                    {
-                                        reMask_1 = remask_count.first;
-                                        remask_count.first = 0;
-                                        remask_count.second = 0;
-                                        is_csirs_remask_set = true;
-                                    }
-                                }
-                                if(channel_type != slot_command_api::channel_type::CSI_RS || is_csirs_remask_set)
-                                {
-                                    mod_comp_config_temp->scaling[flow_idx][symbol_id][mod_comp_msg_index] = scale_val;
-                                    mod_comp_config_temp->params_per_list[flow_idx][symbol_id][mod_comp_msg_index].set(static_cast<QamListParam::qamwidth>(udIqwidth), csf_1, csf_2);
-                                    mod_comp_config_temp->prb_params_per_list[flow_idx][symbol_id][mod_comp_msg_index].set(reMask_1, reMask_2);
 
-                                    mod_comp_config_temp->num_messages_per_list[flow_idx][symbol_id]++;
+                                mod_comp_config_temp->scaling[flow_idx][symbol_id][mod_comp_msg_index] = scale_val;
+                                mod_comp_config_temp->params_per_list[flow_idx][symbol_id][mod_comp_msg_index].set(static_cast<QamListParam::qamwidth>(udIqwidth), csf_1, csf_2);
+                                mod_comp_config_temp->prb_params_per_list[flow_idx][symbol_id][mod_comp_msg_index].set(reMask_1, reMask_2);
+
+                                mod_comp_config_temp->num_messages_per_list[flow_idx][symbol_id]++;
 #if 0
-                                    NVLOGC_FMT(TAG, "flw_idx: {}, sym_id: {}, msg_index: {}, udIqwith={}, mcScale_1={}, mcScale_2={}, start_prbu={}, num_prb={}, csf_1={}, csf_2={}, re_1={}, re_2={}", 
-                                        flow_idx, symbol_id, mod_comp_msg_index, udIqwidth, scale_val.x, scale_val.y, section_info.start_prbu, section_info.num_prbu, csf_1, csf_2, reMask_1, reMask_2);
+                                NVLOGC_FMT(TAG, "flw_idx: {}, sym_id: {}, msg_index: {}, udIqwith={}, mcScale_1={}, mcScale_2={}, start_prbu={}, num_prb={}, csf_1={}, csf_2={}, re_1={}, re_2={}", 
+                                    flow_idx, symbol_id, mod_comp_msg_index, udIqwidth, scale_val.x, scale_val.y, section_info.start_prbu, section_info.num_prbu, csf_1, csf_2, reMask_1, reMask_2);
 #endif
-                                }   
                             }
                             memcpy(&umsg_tx_list.umsg_info_symbol_antenna[message_index++], &message_template, sizeof(message_template));
 
@@ -3086,43 +3209,37 @@ int FhProxy::prepareUPlanePackets(
                                     float2 scale_val = {0, 0};
                                     scale_val.x      = prb_info.comp_info.modCompScalingValue[0];
 
-                                    uint8_t udIqwidth = static_cast<uint8_t>(prb_info.comp_info.common.udIqWidth);
-                                    uint8_t csf_1     = static_cast<uint8_t>(prb_info.comp_info.sections[0].csf.get());
+                                    uint8_t udIqwidth = prb_info.comp_info.common.udIqWidth;
+                                    uint8_t csf_1     = prb_info.comp_info.sections[0].csf;
                                     uint8_t csf_2     = 0;
-
-                                    uint16_t reMask_1 = static_cast<uint16_t>(prb_info.comp_info.sections[0].mcScaleReMask.get());
                                     uint16_t reMask_2 = 0;
+                                    uint16_t reMask_1 = 0;
+                                    if(channel_type == slot_command_api::channel_type::CSI_RS)
+                                    {
+                                        reMask_1 = prb_info.cplane_sections_info[symbol_id]->combined_reMask[flow_idx];
+                                    }
+                                    else
+                                    {
+                                        reMask_1 = prb_info.comp_info.sections[0].mcScaleReMask;
+                                    }
 
                                     if(prb_info.comp_info.common.nSections == 2)
                                     {
                                         scale_val.y = prb_info.comp_info.modCompScalingValue[1];
-                                        csf_2       = static_cast<uint8_t>(prb_info.comp_info.sections[1].csf.get());
-                                        reMask_2    = static_cast<uint16_t>(prb_info.comp_info.sections[1].mcScaleReMask.get());
+                                        csf_2       = prb_info.comp_info.sections[1].csf;
+                                        reMask_2    = prb_info.comp_info.sections[1].mcScaleReMask;
                                     }
-                                    if(channel_type == slot_command_api::channel_type::CSI_RS && is_csirs_remask_set)
-                                    {
-                                        reMask_1 = csirs_remask_map[flow_idx].first;
-                                    }
-                                    if(channel_type != slot_command_api::channel_type::CSI_RS || is_csirs_remask_set)
-                                    {
-                                        mod_comp_config_temp->scaling[flow_idx][symbol_id][mod_comp_msg_index] = scale_val;
-                                        mod_comp_config_temp->params_per_list[flow_idx][symbol_id][mod_comp_msg_index].set(static_cast<QamListParam::qamwidth>(udIqwidth), csf_1, csf_2);
-                                        mod_comp_config_temp->prb_params_per_list[flow_idx][symbol_id][mod_comp_msg_index].set(reMask_1, reMask_2);
+                                    mod_comp_config_temp->scaling[flow_idx][symbol_id][mod_comp_msg_index] = scale_val;
+                                    mod_comp_config_temp->params_per_list[flow_idx][symbol_id][mod_comp_msg_index].set(static_cast<QamListParam::qamwidth>(udIqwidth), csf_1, csf_2);
+                                    mod_comp_config_temp->prb_params_per_list[flow_idx][symbol_id][mod_comp_msg_index].set(reMask_1, reMask_2);
 
-                                        mod_comp_config_temp->num_messages_per_list[flow_idx][symbol_id]++;
+                                    mod_comp_config_temp->num_messages_per_list[flow_idx][symbol_id]++;
 #if 0
                                         NVLOGC_FMT(TAG, "flw_idx: {}, sym_id: {}, msg_index: {}, udIqwith={}, mcScale_1={}, mcScale_2={}, start_prbu={}, num_prb={}, csf_1={}, csf_2={}, re_1={}, re_2={}", 
                                                 flow_idx, symbol_id, mod_comp_msg_index, udIqwidth, scale_val.x, scale_val.y, section_info.start_prbu, section_info.num_prbu, csf_1, csf_2, reMask_1, reMask_2);
 #endif
                                         memcpy(&umsg_tx_list.umsg_info_symbol_antenna[message_index++], &message_template, sizeof(message_template));
-                                    }
                                 }
-                            }
-                            if(is_csirs_remask_set)
-                            {
-                                csirs_remask_map[flow_idx].first = 0;
-                                csirs_remask_map[flow_idx].second = 0;
-                                is_csirs_remask_set = false;
                             }
                         }
 #if 0
@@ -3133,12 +3250,6 @@ int FhProxy::prepareUPlanePackets(
 #endif
                     }
                 }
-    #if 0
-                if ((channel_type == slot_command_api::channel_type::PDSCH_CSIRS) && (slot_info.symbols[symbol_id][slot_command_api::channel_type::PDSCH_CSIRS].size() > 0))
-                {
-                    channel_type +=1;
-                }
-    #endif
             }
 
             start_tx_time = end_tx_time;
@@ -3292,18 +3403,18 @@ int FhProxy::prepareUPlanePackets(
                             float2 scale_val = {0, 0};
                             scale_val.x      = prb_info.comp_info.modCompScalingValue[0];
 
-                            uint8_t udIqwidth = static_cast<uint8_t>(prb_info.comp_info.common.udIqWidth);
-                            uint8_t csf_1     = static_cast<uint8_t>(prb_info.comp_info.sections[0].csf.get());
+                            auto udIqwidth    = prb_info.comp_info.common.udIqWidth;
+                            auto csf_1        = prb_info.comp_info.sections[0].csf;
                             uint8_t csf_2     = 0;
 
-                            uint16_t reMask_1 = static_cast<uint16_t>(prb_info.comp_info.sections[0].mcScaleReMask.get());
+                            uint16_t reMask_1 = static_cast<uint16_t>(prb_info.comp_info.sections[0].mcScaleReMask);
                             uint16_t reMask_2 = 0;
 
                             if(prb_info.comp_info.common.nSections == 2)
                             {
                                 scale_val.y = prb_info.comp_info.modCompScalingValue[1];
-                                csf_2       = static_cast<uint8_t>(prb_info.comp_info.sections[1].csf.get());
-                                reMask_2    = static_cast<uint16_t>(prb_info.comp_info.sections[1].mcScaleReMask.get());
+                                csf_2       = prb_info.comp_info.sections[1].csf;
+                                reMask_2    = prb_info.comp_info.sections[1].mcScaleReMask;
                             }
 
                             mod_comp_config_temp->scaling[flow_index][symbol_id][mod_comp_msg_index] = scale_val;
@@ -3351,17 +3462,17 @@ int FhProxy::prepareUPlanePackets(
                                 scale_val.x      = prb_info.comp_info.modCompScalingValue[0];
 
                                 uint8_t udIqwidth = static_cast<uint8_t>(prb_info.comp_info.common.udIqWidth);
-                                uint8_t csf_1     = static_cast<uint8_t>(prb_info.comp_info.sections[0].csf.get());
+                                uint8_t csf_1     = static_cast<uint8_t>(prb_info.comp_info.sections[0].csf);
                                 uint8_t csf_2     = 0;
 
-                                uint16_t reMask_1 = static_cast<uint16_t>(prb_info.comp_info.sections[0].mcScaleReMask.get());
+                                uint16_t reMask_1 = static_cast<uint16_t>(prb_info.comp_info.sections[0].mcScaleReMask);
                                 uint16_t reMask_2 = 0;
 
                                 if(prb_info.comp_info.common.nSections == 2)
                                 {
                                     scale_val.y = prb_info.comp_info.modCompScalingValue[1];
-                                    csf_2       = static_cast<uint8_t>(prb_info.comp_info.sections[1].csf.get());
-                                    reMask_2    = static_cast<uint16_t>(prb_info.comp_info.sections[1].mcScaleReMask.get());
+                                    csf_2       = static_cast<uint8_t>(prb_info.comp_info.sections[1].csf);
+                                    reMask_2    = static_cast<uint16_t>(prb_info.comp_info.sections[1].mcScaleReMask);
                                 }
 
                                 mod_comp_config_temp->scaling[flow_index][symbol_id][mod_comp_msg_index] = scale_val;
@@ -3445,7 +3556,7 @@ int FhProxy::RingCPUDoorbell(TxRequestGpuPercell *pTxRequestGpuPercell, PrepareP
 
     if(0 != aerial_fh::ring_cpu_doorbell(nic_map[pTxRequestGpuPercell->nic_name], pTxRequestGpuPercell, prb_info, packet_timing_info))
     {
-        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "aerial_fh::send_uplane_gpu_comm error");
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "aerial_fh::ring_cpu_doorbell error");
         return -1;
     }
 

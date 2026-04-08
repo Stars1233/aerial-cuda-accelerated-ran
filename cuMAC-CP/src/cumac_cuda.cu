@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include <cuda_runtime_api.h>
 
 #include "cumac_cuda.hpp"
+#include "nvlog.hpp"
 
 #define TAG (NVLOG_TAG_BASE_CUMAC_CP + 5) // "CUMCP.TASK"
 
@@ -35,7 +36,7 @@ inline cudaError __checkLastCudaError(const char* file, int line)
     cudaError lastErr = cudaGetLastError();
     if(lastErr != cudaSuccess)
     {
-        NVLOGE_FMT(TAG, AERIAL_NVIPC_API_EVENT, "Error at {} line {}: {}", file, line, cudaGetErrorString(lastErr));
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "Error at {} line {}: {}", file, line, cudaGetErrorString(lastErr));
     }
     return lastErr;
 }
@@ -49,7 +50,17 @@ inline cudaError __checkLastCudaError(const char* file, int line)
     } while(0)
 #define HANDLE_NULL(x)
 
-static __global__ void gpu_copy_avgRates(float *avgRatesActUe, float *avgRates, uint16_t *setSchdUePerCellTTI, uint32_t number)
+/**
+ * Speculation barrier with CTA scope.
+ *
+ * @note Uses membar.cta to constrain speculative loads within the block.
+ */
+static __device__ __forceinline__ void speculation_barrier()
+{
+    asm volatile("membar.cta;" ::: "memory");
+}
+
+static __global__ void gpu_copy_avgRates(float *avgRatesActUe, float *avgRates, uint16_t *setSchdUePerCellTTI, uint32_t number, uint32_t max_active_ue)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -57,12 +68,19 @@ static __global__ void gpu_copy_avgRates(float *avgRatesActUe, float *avgRates, 
     for (int i = index; i < number; i += stride)
     {
         uint16_t ue_id = *(setSchdUePerCellTTI + i);
-        // TODO: add range check
-        *(avgRates + i) = *(avgRatesActUe + ue_id);
+        if (ue_id < max_active_ue)
+        {
+            speculation_barrier(); // Add barrier to avoid speculative loads
+            *(avgRates + i) = *(avgRatesActUe + ue_id);
+        }
+        else
+        {
+            *(avgRates + i) = 0.0f;
+        }
     }
 }
 
-static __global__ void gpu_copy_tbErrLast(int8_t *tbErrLastActUe, int8_t *tbErrLast, uint16_t *setSchdUePerCellTTI, uint32_t number)
+static __global__ void gpu_copy_tbErrLast(int8_t *tbErrLastActUe, int8_t *tbErrLast, uint16_t *setSchdUePerCellTTI, uint32_t number, uint32_t max_active_ue)
 {
     int index = threadIdx.x + blockIdx.x * blockDim.x;
     int stride = blockDim.x * gridDim.x;
@@ -70,8 +88,15 @@ static __global__ void gpu_copy_tbErrLast(int8_t *tbErrLastActUe, int8_t *tbErrL
     for (int i = index; i < number; i += stride)
     {
         uint16_t ue_id = *(setSchdUePerCellTTI + i);
-        // TODO: add range check
-        *(tbErrLast + i) = *(tbErrLastActUe + ue_id);
+        if (ue_id < max_active_ue)
+        {
+            speculation_barrier(); // Add barrier to avoid speculative loads
+            *(tbErrLast + i) = *(tbErrLastActUe + ue_id);
+        }
+        else
+        {
+            *(tbErrLast + i) = 0;
+        }
     }
 }
 
@@ -305,7 +330,7 @@ int cumac_copy_cell_to_group(cumac_task *task, uint32_t cuda_block_num)
     cudaError lastErr = cudaGetLastError();
     if(lastErr != cudaSuccess)
     {
-        NVLOGI_FMT(TAG, "SFN {}.{} {} line {}: {}", task->ss.u16.sfn, task->ss.u16.slot, __func__, __LINE__, cudaGetErrorString(lastErr));
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "SFN {}.{} {} line {}: {}", task->ss.u16.sfn, task->ss.u16.slot, __func__, __LINE__, cudaGetErrorString(lastErr));
     }
     return 0;
 }
@@ -338,7 +363,13 @@ int cumac_copy_avgRates(cumac_task* task, uint32_t cuda_block_num)
     float *avgRatesActUe = task->ueStatus.avgRatesActUe;
     uint32_t number = task->data_num.setSchdUePerCellTTI;
 
-    gpu_copy_avgRates<<<cuda_block_num, N_THREAD_PER_BLOCK, 0, task->strm>>>(avgRatesActUe, avgRates, setSchdUePerCellTTI, number);
+    const uint32_t max_active_ue = task->data_num.avgRatesActUe;
+    gpu_copy_avgRates<<<cuda_block_num, N_THREAD_PER_BLOCK, 0, task->strm>>>(avgRatesActUe, avgRates, setSchdUePerCellTTI, number, max_active_ue);
+    cudaError lastErr = cudaGetLastError();
+    if(lastErr != cudaSuccess)
+    {
+        NVLOGI_FMT(TAG, "SFN {}.{} {} line {}: {}", task->ss.u16.sfn, task->ss.u16.slot, __func__, __LINE__, cudaGetErrorString(lastErr));
+    }
 
     return 0;
 }
@@ -356,7 +387,13 @@ int cumac_copy_tbErrLast(cumac_task* task, uint32_t cuda_block_num)
     int8_t *tbErrLastActUe = task->ueStatus.tbErrLastActUe;
     uint32_t number = task->data_num.setSchdUePerCellTTI;
 
-    gpu_copy_tbErrLast<<<cuda_block_num, N_THREAD_PER_BLOCK, 0, task->strm>>>(tbErrLastActUe, tbErrLast, setSchdUePerCellTTI, number);
+    const uint32_t max_active_ue = task->data_num.tbErrLastActUe;
+    gpu_copy_tbErrLast<<<cuda_block_num, N_THREAD_PER_BLOCK, 0, task->strm>>>(tbErrLastActUe, tbErrLast, setSchdUePerCellTTI, number, max_active_ue);
+    cudaError lastErr = cudaGetLastError();
+    if(lastErr != cudaSuccess)
+    {
+        NVLOGI_FMT(TAG, "SFN {}.{} {} line {}: {}", task->ss.u16.sfn, task->ss.u16.slot, __func__, __LINE__, cudaGetErrorString(lastErr));
+    }
 
     return 0;
 }

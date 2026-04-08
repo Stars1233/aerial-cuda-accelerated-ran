@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,7 +58,6 @@ SimCtrl.genTV.enableUE = 0;
 SimCtrl.genTV.tvDirName = 'GPU_test_input';
 SimCtrl.genTV.genYamlCfg = 0;    % generate yaml config file for test cases
 SimCtrl.genTV.cuPHY = 1; % generate cuPHY TV
-SimCtrl.genTV.cuPHY_max = 0; % generate cuPHY TV + maximum intermediate variables
 SimCtrl.genTV.FAPI = 1; % generate FAPI TV
 SimCtrl.genTV.launchPattern = 0; % generate launch pattern file
 SimCtrl.genTV.fhMsgMode = 0; % 1: modComp SE4 only, 2: modComp SE4/5
@@ -105,7 +104,7 @@ SimCtrl.alg.LDPC_earlyTermAlg = 'SAFEET'; % early termination alg, PCE: parity c
 SimCtrl.alg.LDPC_earlyTerm_NBF_num_consecutive_itr = 2; % num of consecutive iterations that have no sign flipping
 SimCtrl.alg.LDPC_earlyTerm_SAFEET_badItrThres = 2; % max num of bad iters
 SimCtrl.alg.LDPC_flags = 2; % CUPHY_LDPC_DECODE_CHOOSE_THROUGHPUT
-SimCtrl.alg.LDPC_DMI_method = 'LUT_spef'; % fixed: fix the num of LDPC iterations, ML: use machine learning model to predict, , LUT_spef: use LUT for max num LDPC itrs. 
+SimCtrl.alg.LDPC_DMI_method = 'LUT_spef'; % fixed: fix the num of LDPC iterations, ML: use machine learning model to predict, LUT_spef: use LUT for max num LDPC itrs, per_UE: use per-UE max num LDPC itrs provided by L2. 
 SimCtrl.alg.LDPC_DMI_ML_model_path = ''; % path of the saved ML model file trained from AMLAsim
 SimCtrl.alg.LDPC_DMI_ML_confidence_thres = 0; % if model softmax out >= this threshold, apply the prediction, otherwise still use the default maxNumItr
 SimCtrl.alg.LDPC_DMI_LUT_SNRmargin_dB = 0; % the SNRmargin to be added to the effective SNR for LUT base LDPC maxItr selection

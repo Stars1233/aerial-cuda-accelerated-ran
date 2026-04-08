@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,19 +130,36 @@ else
    fi
 fi
 
-if [[ $(lspci 2>/dev/null | grep -i "3D controller: NVIDIA") ]]; then
-   GPU_FLAG="--gpus all"
+has_docker_gpu() {
+  docker info --format '{{json .Runtimes}}' 2>/dev/null \
+    | grep -q '"nvidia"' \
+    && command -v nvidia-container-cli >/dev/null 2>&1 \
+    && nvidia-container-cli info >/dev/null 2>&1
+}
 
-   if ! modinfo gdrdrv > /dev/null 2>&1; then
-       echo ""
-       echo "Please download and install from https://developer.nvidia.com/gdrcopy"
-       exit 1
-   fi
+GPU_FLAG=""
+GDRDRV_DEVICE_FLAG=""
+server_id=""
+[ -f "/sys/devices/virtual/dmi/id/board_vendor" ] && server_id=$(cat /sys/devices/virtual/dmi/id/board_vendor)"-"
+[ -f "/sys/devices/virtual/dmi/id/board_name" ] && server_id+=$(cat /sys/devices/virtual/dmi/id/board_name)
+echo "server_id: $server_id"
+if [[ $server_id == "NVIDIA-P4242" ]]; then
+    AERIAL_CHECK_GDRDRV=0
+    echo "Skipping gdrdrv check for DGX Spark"
+fi
+if has_docker_gpu; then
+  GPU_FLAG="--gpus all"
+  if [ "${AERIAL_CHECK_GDRDRV:-1}" -eq 1 ] && ! modinfo gdrdrv > /dev/null 2>&1; then
+      echo ""
+      echo "Please download and install from https://developer.nvidia.com/gdrcopy.  Or set AERIAL_CHECK_GDRDRV=0 and re-run"
+      exit 1
+  else
+      GDRDRV_DEVICE_FLAG="--device=/dev/gdrdrv:/dev/gdrdrv"
+  fi
 else
-   GPU_FLAG=""
-   echo This system has no GPU, running without --gpus all parameter
-   echo Creating soft link for libcuda.so.1 for RU Emulator dependency
-   CMDS="sudo ln -s /usr/local/cuda/compat/libcuda.so.1 /usr/lib/\$(arch)-linux-gnu/libcuda.so.1 && $CMDS"
+  echo This system has no GPU, running without --gpus all parameter
+  echo Creating soft link for libcuda.so.1 for RU Emulator dependency
+  CMDS="sudo ln -s /usr/local/cuda/compat/libcuda.so.1 /usr/lib/\$(arch)-linux-gnu/libcuda.so.1 && $CMDS"
 fi
 
 if [[ "$(arch)" == "aarch64" ]]; then
@@ -192,7 +210,7 @@ docker run --platform=$AERIAL_PLATFORM \
     --hostname c_aerial_$USER \
     --add-host c_aerial_$USER:127.0.0.1 \
     --network host --shm-size=4096m \
-    --device=/dev/gdrdrv:/dev/gdrdrv \
+    $GDRDRV_DEVICE_FLAG \
     -u $USER_ID:$GROUP_ID \
     -w /opt/nvidia/cuBB \
     -v $host_cuBB_SDK:/opt/nvidia/cuBB \
@@ -203,7 +221,7 @@ docker run --platform=$AERIAL_PLATFORM \
     -v /etc:/host/etc \
     -v /run/systemd/system:/run/systemd/system \
     -v /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket \
-    -v /var/log/syslog:/host/var/log/syslog \
+    -v /var/log:/host/var/log:ro \
     -e host_cuBB_SDK=$host_cuBB_SDK \
     --userns=host --ipc=host -v /var/log/aerial:/var/log/aerial \
     $AERIAL_REPO$AERIAL_IMAGE_NAME:$AERIAL_VERSION_TAG fixuid /bin/bash -c "$CMDS"

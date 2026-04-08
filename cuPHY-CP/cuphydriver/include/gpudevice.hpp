@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,13 +24,13 @@
 #include <vector>
 #include <array>
 #include <stdio.h>
-#include <assert.h>
 #include <memory>
 #include <cstring>
 #include "locks.hpp"
 #include <gdrapi.h>
 #include "nvlog.hpp"
 #include "memfoot.hpp"
+#include "cuphydriver_api.hpp"
 
 #if USE_NVTX
 #include "nvtx3/nvToolsExt.h"
@@ -122,7 +122,6 @@ const int      num_colors_phydrv = sizeof(colors_phydrv) / sizeof(uint32_t);
                    __LINE__,                       \
                    +result);                        \
         }                                          \
-        assert(CUDA_SUCCESS == result);            \
     } while(0)
 
 #define CU_CHECK_L1_EXIT_PHYDRIVER_NONFATAL(stmt)  \
@@ -428,6 +427,7 @@ int launch_order_kernel_doca_single_subSlot(
 
 	struct doca_gpu_eth_rxq **doca_rxq,
 	struct doca_gpu_semaphore_gpu **sem_gpu,
+    struct aerial_fh_gpu_semaphore_gpu **sem_gpu_aerial_fh,
 	const uint16_t* sem_order_num,
 
     int*                   cell_id,
@@ -815,6 +815,7 @@ void launch_receive_process_kernel_for_test_bench(
     const uint32_t  max_rx_pkts,
     const uint32_t  rx_pkts_timeout_ns,
     struct doca_gpu_semaphore_gpu **sem_gpu,
+    struct aerial_fh_gpu_semaphore_gpu **sem_gpu_aerial_fh,
 	uint64_t*		slot_start,
 	uint64_t*		ta4_min_ns,
 	uint64_t*		ta4_max_ns,
@@ -827,11 +828,57 @@ void launch_receive_process_kernel_for_test_bench(
 
 void launch_kernel_compression(
     cudaStream_t stream,
-    compression_params &params);
+    const std::array<compression_params, NUM_USER_DATA_COMPRESSION_METHODS>& cparams_array);
 
 #ifdef __cplusplus
 }
 #endif
+
+/**
+ * @brief Host pinned memory allocator
+ *
+ * Allocator for host (CPU) pinned memory using cudaHostAlloc/cudaFreeHost.
+ * Pinned memory enables faster DMA transfers between CPU and GPU.
+ * Used with IOBuf template for host-side buffer management.
+ */
+struct hpinned_alloc
+{
+    /**
+     * @brief Allocate host pinned memory
+     *
+     * @param nbytes - Number of bytes to allocate
+     * @return Pointer to allocated pinned host memory
+     */
+    static void* allocate(size_t nbytes)
+    {
+        void* addr;
+        // CUDA_CHECK_PHYDRIVER(cudaMallocHost(&addr, nbytes));
+        CUDA_CHECK_PHYDRIVER(cudaHostAlloc(&addr, nbytes, cudaHostAllocDefault | cudaHostAllocPortable));
+        return addr;
+    }
+
+    /**
+     * @brief Free host pinned memory
+     *
+     * @param addr - Pointer to pinned host memory to free
+     */
+    static void deallocate(void* addr)
+    {
+        // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "hpinned_alloc CUDA_CHECK_PHYDRIVER(cudaFreeHost"));
+        CUDA_CHECK_PHYDRIVER(cudaFreeHost(addr));
+    }
+
+    /**
+     * @brief Clear host pinned memory to zero
+     *
+     * @param addr   - Pointer to host memory to clear
+     * @param nbytes - Number of bytes to clear
+     */
+    static void clear(void* addr, size_t nbytes)
+    {
+        memset(addr, 0, nbytes);
+    }
+};
 
 /**
  * @brief GPU Direct RDMA (GDR) pinned buffer
@@ -849,9 +896,10 @@ public:
      * @param _g           - GDR context handle
      * @param _size_input  - Requested buffer size in bytes (will be rounded to GPU page size)
      */
-    gpinned_buffer(gdr_t* _g, size_t _size_input) :
+    gpinned_buffer(gdr_t* _g, size_t _size_input, bool _is_rdma_supported) :
         g(_g),
-        size_input(_size_input)
+        size_input(_size_input),
+        is_rdma_supported(_is_rdma_supported)
     {
         CUdeviceptr        dev_addr = 0;
         void*              host_ptr = NULL;
@@ -860,6 +908,20 @@ public:
 
         if(g == nullptr || size_input == 0)
             PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "gpinned_buffer bad input arguments");
+
+        // If RDMA is supported - proceed to using GDRCopy library for further allocation
+        // If not, use CUDA pinned host memory allocation. 
+        if (!is_rdma_supported)
+        {
+
+            host_ptr = hpinned_alloc::allocate(size_input); 
+            // In a system with full unified memory, the host and the device pointer _may_ match.
+            CU_CHECK_PHYDRIVER(cuMemHostGetDevicePointer(&dev_addr, host_ptr, 0));
+
+            addr_d    = (uintptr_t)dev_addr;
+            addr_h    = (uintptr_t)host_ptr;
+            return; 
+        }
 
         if(size_input < GPU_MIN_PIN_SIZE)
             size_input = GPU_MIN_PIN_SIZE;
@@ -932,6 +994,7 @@ public:
         addr_d    = (uintptr_t)dev_addr;
         addr_h    = (uintptr_t)host_ptr;
         size_free = pin_size;
+        size_alloc = alloc_size;
     };
 
     /**
@@ -941,9 +1004,13 @@ public:
      */
     ~gpinned_buffer()
     {
-        gdr_unmap(*g, mh, (void*)addr_h, size_free);
-        gdr_unpin_buffer(*g, mh);
-        CU_CHECK_PHYDRIVER(cuMemFree((CUdeviceptr)addr_free));
+        if (is_rdma_supported) {
+            gdr_unmap(*g, mh, (void*)addr_h, size_free);
+            gdr_unpin_buffer(*g, mh);
+            CU_CHECK_PHYDRIVER(cuMemFree((CUdeviceptr)addr_free));
+        } else {
+            hpinned_alloc::deallocate((void*)addr_h); 
+        }
     };
 
     /**
@@ -976,7 +1043,9 @@ public:
         return size_input;
     }
 
+    // Used to measure memory footprint
     size_t     size_free;                                  ///< Actual allocated size (rounded to GPU page size) for memory footprint tracking
+    size_t     size_alloc;                                 ///< Requested buffer size in bytes for memory footprint tracking
 
 protected:
     gdr_t*     g;                                          ///< GDR context handle
@@ -986,6 +1055,7 @@ protected:
     uintptr_t  addr_h;                                     ///< Host memory address (mapped from GPU memory)
     uintptr_t  addr_free;                                  ///< Original GPU address for freeing (may be unaligned)
     size_t     size_input;                                 ///< Requested buffer size in bytes
+    bool       is_rdma_supported;                          ///< Denotes if GPU RDMA is supported in the target
 } gpinned_buffer;
 
 /**
@@ -1045,6 +1115,7 @@ private:
     int                   tot_devs;                            ///< Total number of CUDA devices in system
     struct cudaDeviceProp deviceProp;                          ///< CUDA device properties (name, compute capability, memory, etc.)
     int                   device_attr_clock_rate;              ///< GPU clock rate in kHz
+    int                   device_is_direct_rdma_supported;     ///< Denotes if GPU Direct RDMA is supported in target
     gdr_t                 gdrc_h;                              ///< GPUDirect RDMA context handle
     bool                  init_gdr;                            ///< Flag indicating GDR was initialized for this device
 };
@@ -1094,52 +1165,6 @@ struct device_alloc
 };
 
 /**
- * @brief Host pinned memory allocator
- *
- * Allocator for host (CPU) pinned memory using cudaHostAlloc/cudaFreeHost.
- * Pinned memory enables faster DMA transfers between CPU and GPU.
- * Used with IOBuf template for host-side buffer management.
- */
-struct hpinned_alloc
-{
-    /**
-     * @brief Allocate host pinned memory
-     *
-     * @param nbytes - Number of bytes to allocate
-     * @return Pointer to allocated pinned host memory
-     */
-    static void* allocate(size_t nbytes)
-    {
-        void* addr;
-        // CUDA_CHECK_PHYDRIVER(cudaMallocHost(&addr, nbytes));
-        CUDA_CHECK_PHYDRIVER(cudaHostAlloc(&addr, nbytes, cudaHostAllocDefault | cudaHostAllocPortable));
-        return addr;
-    }
-
-    /**
-     * @brief Free host pinned memory
-     *
-     * @param addr - Pointer to pinned host memory to free
-     */
-    static void deallocate(void* addr)
-    {
-        // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "hpinned_alloc CUDA_CHECK_PHYDRIVER(cudaFreeHost"));
-        CUDA_CHECK_PHYDRIVER(cudaFreeHost(addr));
-    }
-
-    /**
-     * @brief Clear host pinned memory to zero
-     *
-     * @param addr   - Pointer to host memory to clear
-     * @param nbytes - Number of bytes to clear
-     */
-    static void clear(void* addr, size_t nbytes)
-    {
-        memset(addr, 0, nbytes);
-    }
-};
-
-/**
  * @brief Generic I/O buffer with templated allocator
  *
  * RAII wrapper for memory buffers with configurable allocation strategy.
@@ -1157,6 +1182,7 @@ public:
     IOBuf() :
         _addr(nullptr),
         _size(0),
+        size_alloc(0),
         gDev(nullptr) {}
     
     /**
@@ -1168,9 +1194,10 @@ public:
     IOBuf(size_t numElements, GpuDevice* _gDev) :
         // addr(static_cast<T*>(TAllocator::allocate(numElements * sizeof(T)))),
         _size(numElements),
+        size_alloc(numElements * sizeof(T)),
         gDev(_gDev)
     {
-        _addr = static_cast<T*>(TAllocator::allocate(_size * sizeof(T)));
+        _addr = static_cast<T*>(TAllocator::allocate(size_alloc));
         // std::cout << "Allocated a new buffer of " << _size << "bytes" << std::endl;
     };
 
@@ -1189,6 +1216,8 @@ public:
     T*     addr() { return _addr; }                            ///< Get buffer address
     size_t size() const { return _size; }                      ///< Get buffer size in elements
     void   clear() { TAllocator::clear(_addr, _size); }       ///< Clear buffer to zero
+
+    size_t     size_alloc;                                     ///< Actual allocated size in bytes for memory footprint tracking
 
 private:
     T*         _addr;                                          ///< Buffer address (device or host depending on TAllocator)

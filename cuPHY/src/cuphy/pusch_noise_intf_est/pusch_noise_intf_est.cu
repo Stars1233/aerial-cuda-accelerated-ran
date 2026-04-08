@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,7 @@
  // static constexpr uint32_t N_THREADS_PER_WARP = 32;
  // static constexpr float NOISE_REGULARIZER = 0.00001; //small noise regularizer corresponding to -50dB SNR
  
+ /*VCAST_DONT_INSTRUMENT_START*/
  template <typename TElem>
  struct tensor_ref
  {
@@ -206,7 +207,8 @@
 
  // static CUDA_BOTH_INLINE cuComplex operator/(cuComplex x, float y)       { return(make_cuComplex(cuCrealf(x)/y, cuCimagf(x)/y)); }
  // clang-format on
-  
+ /*VCAST_DONT_INSTRUMENT_END*/
+ 
  template <typename T>
  CUDA_BOTH_INLINE constexpr T div_round_up(T val, T divide_by)
  {

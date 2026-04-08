@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,15 +15,14 @@
  * limitations under the License.
  */
 
-#include "cuphy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include <cmath>
+#include <numeric>
+#include <vector>
 #include "hdf5hpp.hpp"
-#include "cuphy_hdf5.hpp"
-#include "cuphy.hpp"
-#include "datasets.hpp"
-#include "cuphy_internal.h"
+#include "chanModelsCommon.h"
 
 #include "ofdmMod.cuh"
 #include "ofdmDemod.cuh"
@@ -67,10 +66,19 @@ inline void carrier_pars_from_dataset_elem(cuphyCarrierPrms * CarrierPrms, const
 template<typename Tscalar, typename Tcomplex>
 bool checkOfdmRes(Tcomplex * dataIn, Tcomplex * dataOut, int compareLen)
 {
-    const Tscalar tolerance = static_cast<Tscalar>(0.001f); //update tolerance as needed.
+    const Tscalar tolerance = static_cast<Tscalar>(0.001f);
     for(int i=0; i<compareLen; i++)
     {
-        if(!(complex_approx_equal<Tcomplex, Tscalar>(dataIn[i], dataOut[i], tolerance)))
+        auto approxEq = [&](Tscalar a, Tscalar b) {
+            Tscalar diff = std::fabs(float(a) - float(b));
+            Tscalar m = std::max(std::fabs(float(a)), std::fabs(float(b)));
+            if (m <= std::numeric_limits<Tscalar>::epsilon()) {
+                return diff <= tolerance;
+            }
+            Tscalar ratio = (diff >= tolerance) ? (Tscalar)(diff / m) : diff;
+            return ratio <= tolerance;
+        };
+        if(!(approxEq(dataIn[i].x, dataOut[i].x) && approxEq(dataIn[i].y, dataOut[i].y)))
         {
             printf("input and output samples do not match! starting %d\n", i);
             printf("In: %f + %f i, out %f + %f i\n", float(dataIn[i].x), float(dataIn[i].y), float(dataOut[i].x), float(dataOut[i].y));
@@ -127,14 +135,15 @@ void test_OFDM(std::string inputFileName, int nTti = 10, uint16_t randSeed = 0, 
     }
 
     uint  blocks = (enableSwapTxRx ? (CarrierPrms -> N_ueLayer) : (CarrierPrms -> N_bsLayer)) * (CarrierPrms -> N_symbol_slot);
-    CarrierPrms -> ofdmWindowLen = 0; // ofdm windowing effect not tested
+    CarrierPrms -> ofdmWindowLen = 0;
     const uint  freqDataSize = (CarrierPrms -> N_sc) * blocks;
-    // create freqDataInGpu tensor
-    cuphyDataType_t cuphyTensorType = enableHalfPrecision ? CUPHY_C_16F : CUPHY_C_32F;
-    cuphy::tensor_device freqDataInGpu(cuphyTensorType, freqDataSize, cuphy::tensor_flags::align_tight);
-    cuphy::tensor_device freqDataOutGpu(cuphyTensorType, freqDataSize, cuphy::tensor_flags::align_tight);
 
-    ofdm_modulate::ofdmModulate<Tscalar, Tcomplex> * ofdmMod = new ofdm_modulate::ofdmModulate<Tscalar, Tcomplex>(CarrierPrms, static_cast<Tcomplex*>(freqDataInGpu.addr()), cuMainStrm);
+    Tcomplex* freqDataInGpuPtr = nullptr;
+    Tcomplex* freqDataOutGpuPtr = nullptr;
+    CHECK_CUDAERROR(cudaMalloc(&freqDataInGpuPtr, sizeof(Tcomplex) * freqDataSize));
+    CHECK_CUDAERROR(cudaMalloc(&freqDataOutGpuPtr, sizeof(Tcomplex) * freqDataSize));
+
+    ofdm_modulate::ofdmModulate<Tscalar, Tcomplex> * ofdmMod = new ofdm_modulate::ofdmModulate<Tscalar, Tcomplex>(CarrierPrms, freqDataInGpuPtr, cuMainStrm);
 
     const uint timeDataSize = ofdmMod -> getTimeDataLen();
     Tcomplex * freqDataInCpu = new Tcomplex[freqDataSize];
@@ -150,8 +159,8 @@ void test_OFDM(std::string inputFileName, int nTti = 10, uint16_t randSeed = 0, 
         printf("Using TV to test OFDM, time and frequency domain ref check enabled \n");
         hdf5hpp::hdf5_file input_file = hdf5hpp::hdf5_file::open(inputFileName.c_str());
         hdf5hpp::hdf5_dataset Xtf_dataset = input_file.open_dataset("X_tf");
-        Xtf_dataset.read(freqDataInCpu);//freqDataInGpu.addr());
-        cudaMemcpyAsync(freqDataInGpu.addr(), freqDataInCpu, sizeof(Tcomplex)*freqDataSize, cudaMemcpyHostToDevice, cuMainStrm);
+        Xtf_dataset.read(freqDataInCpu);
+        cudaMemcpyAsync(freqDataInGpuPtr, freqDataInCpu, sizeof(Tcomplex)*freqDataSize, cudaMemcpyHostToDevice, cuMainStrm);
 
         // read reference time domain data
         hdf5hpp::hdf5_dataset Xt_dataset = input_file.open_dataset("X_t");
@@ -159,19 +168,33 @@ void test_OFDM(std::string inputFileName, int nTti = 10, uint16_t randSeed = 0, 
     }
     else
     {
-        // use random generated data as frequency input
         printf("Using random input to test OFDM, only frequency domain ref check enabled \n");
-        cuphy::rng rng;
-        cuComplex m32_0      = make_cuFloatComplex(0.0f, 0.0f);
-        cuComplex stddev32_1 = make_cuFloatComplex(sqrt(0.5f), sqrt(0.5f));
-        rng.normal(freqDataInGpu, m32_0, stddev32_1, cuMainStrm);
+        curandGenerator_t curandGen;
+        CHECK_CURANDERROR(curandCreateGenerator(&curandGen, CURAND_RNG_PSEUDO_DEFAULT));
+        CHECK_CURANDERROR(curandSetStream(curandGen, cuMainStrm));
+        if constexpr (std::is_same_v<Tcomplex, cuComplex>) {
+            CHECK_CURANDERROR(curandGenerateNormal(curandGen, (float*)freqDataInGpuPtr, freqDataSize * 2, 0.0f, sqrtf(0.5f)));
+        } else {
+            float* d_tmpBuf = nullptr;
+            CHECK_CUDAERROR(cudaMalloc((void**)&d_tmpBuf, freqDataSize * 2 * sizeof(float)));
+            CHECK_CURANDERROR(curandGenerateNormal(curandGen, d_tmpBuf, freqDataSize * 2, 0.0f, sqrtf(0.5f)));
+            std::vector<float> h_floats(freqDataSize * 2);
+            CHECK_CUDAERROR(cudaMemcpy(h_floats.data(), d_tmpBuf, freqDataSize * 2 * sizeof(float), cudaMemcpyDeviceToHost));
+            cudaFree(d_tmpBuf);
+            std::vector<__half> h_halves(freqDataSize * 2);
+            for (uint32_t i = 0; i < freqDataSize * 2; ++i) {
+                h_halves[i] = __float2half(h_floats[i]);
+            }
+            CHECK_CUDAERROR(cudaMemcpy(freqDataInGpuPtr, h_halves.data(), freqDataSize * 2 * sizeof(__half), cudaMemcpyHostToDevice));
+        }
+        CHECK_CURANDERROR(curandDestroyGenerator(curandGen));
     }
     cudaStreamSynchronize(cuMainStrm);
 
     // get time signal from OFDM modulate for OFDM demodulation
     Tcomplex * timeDataInGpu = ofdmMod -> getTimeDataOut();
 
-    ofdm_demodulate::ofdmDeModulate<Tscalar, Tcomplex> * ofdmDeMod = new ofdm_demodulate::ofdmDeModulate<Tscalar, Tcomplex>(CarrierPrms, timeDataInGpu, static_cast<Tcomplex*>(freqDataOutGpu.addr()), prach, 0 /*perAntSamp*/, cuMainStrm);
+    ofdm_demodulate::ofdmDeModulate<Tscalar, Tcomplex> * ofdmDeMod = new ofdm_demodulate::ofdmDeModulate<Tscalar, Tcomplex>(CarrierPrms, timeDataInGpu, freqDataOutGpuPtr, prach, 0 /*perAntSamp*/, cuMainStrm);
 
     // measure time
     float elapsedTime;
@@ -199,8 +222,8 @@ void test_OFDM(std::string inputFileName, int nTti = 10, uint16_t randSeed = 0, 
         }
 
         cudaEventRecord(stop, cuMainStrm);
-        CUDA_CHECK(cudaEventSynchronize(start));
-        CUDA_CHECK(cudaEventSynchronize(stop));
+        CHECK_CUDAERROR(cudaEventSynchronize(start));
+        CHECK_CUDAERROR(cudaEventSynchronize(stop));
         cudaDeviceSynchronize();
         cudaEventElapsedTime(&elapsedTime, start, stop);
         measureTime.push_back(elapsedTime);
@@ -208,8 +231,8 @@ void test_OFDM(std::string inputFileName, int nTti = 10, uint16_t randSeed = 0, 
 
     /*-----------------        check results match       --------------*/
     // check whether ofdm modulation input vs ofdm demodulation out 
-    cudaMemcpy(freqDataInCpu, freqDataInGpu.addr(), freqDataSize * sizeof(Tcomplex), cudaMemcpyDeviceToHost);
-    CUDA_CHECK(cudaMemcpy(freqDataOutCpu, ofdmDeMod -> getFreqDataOut(), freqDataSize * sizeof(Tcomplex), cudaMemcpyDeviceToHost));
+    CHECK_CUDAERROR(cudaMemcpy(freqDataInCpu, freqDataInGpuPtr, freqDataSize * sizeof(Tcomplex), cudaMemcpyDeviceToHost));
+    CHECK_CUDAERROR(cudaMemcpy(freqDataOutCpu, ofdmDeMod -> getFreqDataOut(), freqDataSize * sizeof(Tcomplex), cudaMemcpyDeviceToHost));
     if(checkOfdmRes<Tscalar, Tcomplex>(freqDataInCpu, freqDataOutCpu, freqDataSize))
     {
         printf("OFDM test PASS, frequency input and output samples match \n");
@@ -222,7 +245,7 @@ void test_OFDM(std::string inputFileName, int nTti = 10, uint16_t randSeed = 0, 
     // checkofdm modulation output vs ref TV 
     if(!inputFileName.empty())
     {
-        CUDA_CHECK(cudaMemcpy(timeDataOutCpu, timeDataInGpu, timeDataSize * sizeof(Tcomplex), cudaMemcpyDeviceToHost));
+        CHECK_CUDAERROR(cudaMemcpy(timeDataOutCpu, timeDataInGpu, timeDataSize * sizeof(Tcomplex), cudaMemcpyDeviceToHost));
         if(checkOfdmRes<Tscalar, Tcomplex>(timeDataOutCpu_ref, timeDataOutCpu, timeDataSize))
         {
             printf("OFDM test PASS, time input and output samples match \n");
@@ -242,10 +265,12 @@ void test_OFDM(std::string inputFileName, int nTti = 10, uint16_t randSeed = 0, 
     delete[] timeDataOutCpu;
     delete[] timeDataOutCpu_ref;
 
+    cudaFree(freqDataInGpuPtr);
+    cudaFree(freqDataOutGpuPtr);
     delete CarrierPrms;
     delete ofdmMod;
     delete ofdmDeMod;
-    
+
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     cudaStreamDestroy(cuMainStrm);

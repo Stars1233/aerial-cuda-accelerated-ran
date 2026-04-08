@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 
 # MAC configuration file
 ---
-aerial_sdk_version: 25-3-cubb
+aerial_sdk_version: 26-1-cubb
 name: fapi_gnb_configure_mac
 class: test_mac
 
@@ -64,6 +64,22 @@ estimate_send_time: -1
 # In the current implementation N must be less than or equal to 20.
 schedule_total_time: 0
 # schedule_total_time: [225000,225000,450000,450000,450000,450000,450000,225000,225000,225000]
+
+# FAPI TX deadline feature enable: 0 - disabled; 1 - enabled. Note: builder_thread_enable must be enabled when fapi_tx_deadline_enable is enabled.
+fapi_tx_deadline_enable: 0
+# Estimated time cost of one FAPI message sending. Unit: ns.
+# Used for deadline-based send_time estimation: send_start_time = tx_deadline - fapi_tx_time_per_msg_ns * remain_num_msgs.
+# The value may change for specific platform and test case. May get a average value from testmac.log to increase precision.
+# Reference log: 13:57:07.594827 INF 26104 0 [NVLOG.STAT] [TX:PER_MSG_TIME][N=2000][MIN=216 AVG=336 MAX=648]
+fapi_tx_time_per_msg_ns: 336
+# FAPI TX deadline configuration. Unit: us
+fapi_tx_deadline:
+  - {group_id: DL_TTI_REQ, deadline: 270}
+  - {group_id: UL_TTI_REQ, deadline: 336}
+  - {group_id: TX_DATA_REQ, deadline: 450}
+  - {group_id: UL_DCI_REQ, deadline: 336}
+  - {group_id: DL_BFW_CVI_REQ, deadline: 450}
+  - {group_id: UL_BFW_CVI_REQ, deadline: 336}
 
 # FAPI message bit mask:
 # bit 0 - DL_TTI.req

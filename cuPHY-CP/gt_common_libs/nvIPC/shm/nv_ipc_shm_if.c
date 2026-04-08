@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -125,14 +125,16 @@ typedef struct
 } priv_data_t;
 
 #define IPC_DUMPING_CHECK(priv_data)                                                              \
-    if (atomic_load(&priv_data->ipc_debug->shm_data->ipc_dumping))                                \
+    if ((priv_data->ipc_debug != NULL) && (priv_data->ipc_debug->shm_data != NULL) &&             \
+        atomic_load(&priv_data->ipc_debug->shm_data->ipc_dumping))                                \
     {                                                                                             \
         NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s line %d: ipc dumping, skip", __func__, __LINE__); \
         return -1;                                                                                \
     }
 
 #define IPC_DUMPING_CHECK_BLOCKING(priv_data)                                                     \
-    if (atomic_load(&priv_data->ipc_debug->shm_data->ipc_dumping))                                \
+    if ((priv_data->ipc_debug != NULL) && (priv_data->ipc_debug->shm_data != NULL) &&             \
+        atomic_load(&priv_data->ipc_debug->shm_data->ipc_dumping))                                \
     {                                                                                             \
         NVLOGE(TAG, AERIAL_NVIPC_API_EVENT, "%s line %d: ipc dumping, wait", __func__, __LINE__); \
         sleep(100000);                                                                            \
@@ -293,7 +295,12 @@ static int shm_ipc_open(nv_ipc_t* ipc, const nv_ipc_config_shm_t* cfg)
                     return -1;
                 }
             }
-        }        
+        }
+        else
+        {
+            // Not used memory pool, set to NULL
+            priv_data->mempools[pool_id] = NULL;
+        }
     }
 
     if(CONFIG_USE_EVENT_FD)
@@ -1572,6 +1579,58 @@ int nvipc_fw_free(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
 int nv_ipc_shm_send_loopback(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
 {
     return ring_rx_enqueue(ipc, msg);
+}
+
+// Check if all necessary data memory pools (cpu_data and cpu_large) are host pinned memory
+void nv_ipc_check_host_pinned_memory(nv_ipc_t* ipc)
+{
+    if(ipc == NULL)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: instance not exist", __func__);
+        return;
+    }
+
+    priv_data_t* priv_data = get_private_data(ipc);
+    if (priv_data == NULL)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: get_private_data failed", __func__);
+        return;
+    }
+
+    if (!priv_data->primary || priv_data->cfg->ipc_transport != NV_IPC_TRANSPORT_SHM)
+    {
+        // Only check for SHM IPC in primary process
+        return;
+    }
+
+    const char* prefix = priv_data->cfg->transport_config.shm.prefix;
+#ifdef NVIPC_CUDA_ENABLE
+    for (int pool_id = 0; pool_id < NV_IPC_MEMPOOL_NUM; pool_id++)
+    {
+        // Only check cpu_data and cpu_large memory pools
+        if (pool_id == NV_IPC_MEMPOOL_CPU_DATA || pool_id == NV_IPC_MEMPOOL_CPU_LARGE)
+        {
+            nv_ipc_mempool_t* mempool = priv_data->mempools[pool_id];
+            if (mempool == NULL)
+            {
+                // Skip not used memory pool
+                continue;
+            }
+
+            void* addr = mempool->get_addr(mempool, 0);
+            if (cuda_is_host_pinned_memory(addr) == 1)
+            {
+                NVLOGC(TAG, "[%s] %s: memory pool %d was host pinned memory", prefix, __func__, pool_id);
+            }
+            else
+            {
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "[%s] %s: memory pool %d was not host pinned memory", prefix, __func__, pool_id);
+            }
+        }
+    }
+#else
+    NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "[%s] %s: NVIPC_CUDA_ENABLE was not enabled in build", prefix, __func__);
+#endif
 }
 
 nv_ipc_config_t* nv_ipc_get_primary_config(nv_ipc_t* ipc)

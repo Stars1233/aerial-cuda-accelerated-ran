@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -194,7 +194,7 @@ void fadingChan<Tcomplex>::readCarrierChanPar(hdf5hpp::hdf5_file& inputFile)
             printf("Input Xtf format error with rank %d, dims: [ ", ndims);
             for(auto i : dims)
             {
-                printf("%" PRIu64 " ", i);
+                printf("%llu ", (unsigned long long)i);
             }
             printf("] but ntxLayer = %d\n", ntxLayer);
             exit(1);
@@ -344,7 +344,6 @@ void fadingChan<Tcomplex>::read_Xtf(hdf5hpp::hdf5_file& inputFile)
         }
         default: // report error
         {
-            // NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "Error: unsupported fading mode");
             fprintf(stderr, "Error! unsupported fading mode \n");
             exit(1);
         }

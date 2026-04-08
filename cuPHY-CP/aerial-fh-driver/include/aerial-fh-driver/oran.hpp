@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +19,6 @@
 #define AERIAL_FH_DRIVER_ORAN__
 
 #include <inttypes.h>
-#include <assert.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -60,13 +59,13 @@ class __attribute__((__packed__)) Bitfield {
     __host__ __device__ T be_to_le(T value)
     {
         T tmp = value;
-        if(sizeof(T) == sizeof(uint16_t))
+        if constexpr(sizeof(T) == sizeof(uint16_t))
         {
             tmp = 0;
             tmp |= (value & 0xFF00) >> 8;
             tmp |= (value & 0x00FF) << 8;
         }
-        else if(sizeof(T) == sizeof(uint32_t))
+        else if constexpr(sizeof(T) == sizeof(uint32_t))
         {
             tmp = 0;
             tmp |= value >> 24;
@@ -79,13 +78,13 @@ class __attribute__((__packed__)) Bitfield {
     __host__ __device__ T le_to_be(T value)
     {
         T tmp = value;
-        if(sizeof(T) == sizeof(uint16_t))
+        if constexpr(sizeof(T) == sizeof(uint16_t))
         {
             tmp = 0;
             tmp |= (value & 0xFF00) >> 8;
             tmp |= (value & 0x00FF) << 8;
         }
-        else if(sizeof(T) == sizeof(uint32_t))
+        else if constexpr(sizeof(T) == sizeof(uint32_t))
         {
             tmp = 0;
             tmp |= value >> 24;
@@ -99,9 +98,8 @@ class __attribute__((__packed__)) Bitfield {
 public:
     __host__ __device__ void operator=(T value)
     {
+        // value must fit inside the bitfield member. This line guarantees value <= Maximum.
         value &= Maximum;
-        // v must fit inside the bitfield member
-        assert(value <= Maximum);
 
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         field = be_to_le(field);
@@ -124,9 +122,9 @@ public:
     __host__ __device__ T get() const
     {
         #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-            if(sizeof(T) == sizeof(uint16_t))
+            if constexpr(sizeof(T) == sizeof(uint16_t))
                 return (T)((((field & 0xFF00) >> 8 | (field & 0x00FF) << 8) >> Offset) & Maximum);
-            else if(sizeof(T) == sizeof(uint32_t))
+            else if constexpr(sizeof(T) == sizeof(uint32_t))
                 return (T)(
                     ((
                         field >> 24                |
@@ -287,7 +285,7 @@ struct oran_ecpri_hdr
 /**
  * ORAN packet direction
  */
-enum oran_pkt_dir
+enum oran_pkt_dir : std::uint8_t
 {
     DIRECTION_UPLINK = 0,    //!< Uplink (UE to gNB)
     DIRECTION_DOWNLINK       //!< Downlink (gNB to UE)
@@ -1437,6 +1435,11 @@ F_TYPE uint8_t oran_umsg_get_iq_width_from_section_buf(uint8_t* section_buf)
     return (uint8_t)((struct oran_u_section_compression_hdr*)(section_buf + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD))->udIqWidth;
 }
 
+F_TYPE uint8_t oran_umsg_get_comp_hdr_reserved_bits_from_section_buf(uint8_t* section_buf)
+{
+    return (uint8_t)((struct oran_u_section_compression_hdr*)(section_buf + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD))->reserved;
+}
+
 // oran_cmsg_radio_app_hdr
 F_TYPE uint8_t oran_cmsg_get_frame_id(uint8_t* mbuf_payload)
 {
@@ -1467,6 +1470,11 @@ F_TYPE uint8_t oran_cmsg_get_section_type(uint8_t* mbuf_payload)
 F_TYPE uint8_t oran_msg_get_data_direction(uint8_t* mbuf_payload)
 {
     return (uint8_t)((struct oran_cmsg_radio_app_hdr*)(mbuf_payload + ORAN_CMSG_HDR_OFFSET))->dataDirection;
+}
+
+F_TYPE uint8_t oran_msg_get_sect1_common_hdr_reserved_field(uint8_t* mbuf_payload)
+{
+    return (uint8_t)((struct oran_cmsg_sect1_common_hdr*)(mbuf_payload + ORAN_CMSG_HDR_OFFSET))->reserved;
 }
 
 F_TYPE bool oran_cmsg_get_section_1_ef(oran_cmsg_sect1* sect_hdr)

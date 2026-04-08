@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,12 +60,19 @@ typedef enum
     SCF_ERROR_CODE_L1_MISSING_UL_IQ = 0x44, //Indicates OK timeout error . For L2 it means missing UL IQ data
     SCF_ERROR_CODE_MSG_CAPACITY_EXCEEDED = 0x45, //Indicates capacity exceeded error
     SCF_ERROR_CODE_RHOCP_PTP_EVENTS_ERROR = 0x46, //Indicates RHOCP PTP Events not returned as sync
-    SCF_ERROR_CODE_RHOCP_PTP_EVENTS_SYNCED = 0x47,   //Indicates RHOCP PTP Events back to sync again after unsynced 
+    SCF_ERROR_CODE_RHOCP_PTP_EVENTS_SYNCED = 0x47,   //Indicates RHOCP PTP Events back to sync again after unsynced
+    SCF_ERROR_CODE_SRS_WITHOUT_PUSCH_UNSUPPORTED = 0x48,  // SINGLE_SECT_MODE: unsupported UL channel combination (e.g. SRS without PUSCH)
 // L1 limit exceeded error codes ---- begin
     SCF_FAPI_SSB_PBCH_L1_LIMIT_EXCEEDED =   0x81, // SSB/PBCH L1 limit exceeded
     SCF_FAPI_PDCCH_L1_LIMIT_EXCEEDED = 0x82, // PDCCH L1 limit exceeded
     SCF_FAPI_PDSCH_L1_LIMIT_EXCEEDED = 0x84, // PDSCH L1 limit exceeded
     SCF_FAPI_CSIRS_L1_LIMIT_EXCEEDED = 0x88, // CSIRS L1 limit exceeded
+
+    //FH port link status error codes ---- begin
+    SCF_ERROR_CODE_FH_PORT_DOWN = 0x99,  // Indicates FH port link down
+    SCF_ERROR_CODE_FH_PORT_UP   = 0x9A,  // Indicates FH port link up
+    //FH port link status error codes ---- end
+
     SCF_FAPI_PUSCH_L1_LIMIT_EXCEEDED = 0xC1, // PUSCH L1 limit exceeded
     SCF_FAPI_PUCCH_L1_LIMIT_EXCEEDED = 0xC2, // PUCCH L1 limit exceeded
     SCF_FAPI_SRS_L1_LIMIT_EXCEEDED = 0xC4, // SRS L1 limit exceeded

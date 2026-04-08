@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,11 +47,11 @@ struct CPlaneTX
     aerial_fh::FlowId     eAxC;
     uint16_t              vlan_id;
     int64_t               slot_offset;
-    uint8_t               section_count;
+    uint16_t              section_count;
     uint8_t               symbol_id;
     oran_pkt_dir          direction;
     CPlaneTXSectionList   section_list;
-    bool operator<(const CPlaneTX& a)
+    bool                  operator<(const CPlaneTX& a)
     {
         return slot_offset < a.slot_offset;
     }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -127,19 +127,19 @@ void DataLake::initMem(void) {
 	// Not sure this actually helps.
 	forEachPuschInfoMember(p, [this](auto& vec) { vec.reserve(numRowsToInsertPusch); });
 	forEachPuschInfoMember(pInsertPusch, [this](auto& vec) { vec.reserve(numRowsToInsertPusch); });
-	
+
 	forEachHestInfoMember(pHest, [this](auto& vec) { vec.reserve(numRowsToInsertHest); });
 	forEachHestInfoMember(pInsertHest, [this](auto& vec) { vec.reserve(numRowsToInsertHest); });
 
 	// Define average PDU size for buffer allocation
 	constexpr uint32_t averagePduSize = 80000; // Largest PDU MCS table 1 MCS 27 14 symbols 273 PRBs is 159749 bytes
-	
+
 	if (e3AgentEnabled) {
 		// E3 MODE: Create E3Agent instance and use shared memory
 		e3_agent = std::make_unique<E3Agent>(
 			this,
-			e3PubPort,
 			e3RepPort,
+			e3PubPort,
 			e3SubPort,
 			numRowsToInsertFh,
 			numRowsToInsertPusch,
@@ -147,30 +147,30 @@ void DataLake::initMem(void) {
 			numFhSamples,
 			maxHestSamplesPerRow
 		);
-		
+
 		// Create shared memory buffers through E3Agent
 		if (!e3_agent->createSharedMemoryBuffers(&pFh, &pInsertFh, &p, &pInsertPusch, &pHest, &pInsertHest)) {
 			NVLOGF_FMT(TAG_DATALAKE, AERIAL_CONFIG_EVENT, "Failed to create E3 Agent shared memory buffers");
 		}
-		
+
 		// Initialize E3Agent (starts threads)
 		if (!e3_agent->init()) {
-			NVLOGF_FMT(TAG_DATALAKE, AERIAL_CONFIG_EVENT, "Failed to initialize E3 Agent - check ports {}/{}/{} availability and permissions", 
-				e3PubPort, e3RepPort, e3SubPort);
+			NVLOGF_FMT(TAG_DATALAKE, AERIAL_CONFIG_EVENT, "Failed to initialize E3 Agent - check ports {}/{}/{} availability and permissions",
+				e3RepPort, e3PubPort, e3SubPort);
 		}
-		
-		NVLOGC_FMT(TAG_DATALAKE, "E3 Agent initialized successfully on ports {}/{}/{}", e3PubPort, e3RepPort, e3SubPort);
+
+		NVLOGC_FMT(TAG_DATALAKE, "E3 Agent initialized successfully on ports {}/{}/{}", e3RepPort, e3PubPort, e3SubPort);
 	} else {
 		// REGULAR MODE: Use heap allocation for buffers
 		e3_agent = nullptr;
-		
+
 		pFh->pDataAlloc = new fhDataType[numFhSamples*numRowsToInsertFh];
 		pInsertFh->pDataAlloc = new fhDataType[numFhSamples*numRowsToInsertFh];
 		p->pDataAlloc = new uint8_t[averagePduSize*numRowsToInsertPusch];
 		pInsertPusch->pDataAlloc = new uint8_t[averagePduSize*numRowsToInsertPusch];
 		pHest->pDataAlloc = new hestDataType[maxHestSamplesPerRow*numRowsToInsertHest];
 		pInsertHest->pDataAlloc = new hestDataType[maxHestSamplesPerRow*numRowsToInsertHest];
-		
+
 		NVLOGC_FMT(TAG_DATALAKE, "DataLake initialized with regular heap allocation");
 	}
 
@@ -181,7 +181,7 @@ void DataLake::initMem(void) {
 		pHest->hestData[i] = pHest->pDataAlloc + i * maxHestSamplesPerRow;
 		pInsertHest->hestData[i] = pInsertHest->pDataAlloc + i * maxHestSamplesPerRow;
 	}
-	
+
 	if (pHest->pDataAlloc && pInsertHest->pDataAlloc) {
 		NVLOGI_FMT(TAG_DATALAKE,"Allocated memory for H estimates: 0x{:x}, 0x{:x}",
 			(uintptr_t)pHest->pDataAlloc, (uintptr_t)pInsertHest->pDataAlloc);
@@ -197,7 +197,7 @@ void DataLake::initMem(void) {
 		NVLOGC_FMT(TAG_DATALAKE,"Failed to allocate memory for fhData");
 		return;
 	}
-	
+
 	// Initialize fhData vectors with the correct size
 	pFh->fhData.resize(numRowsToInsertFh);
 	pInsertFh->fhData.resize(numRowsToInsertFh);
@@ -233,9 +233,6 @@ void DataLake::initMem(void) {
 
 	p->pduOffsetsColumn = std::make_shared<ch::ColumnUInt64>();
 	pInsertPusch->pduOffsetsColumn = std::make_shared<ch::ColumnUInt64>();
-
-	p->pDataAlloc = new uint8_t[averagePduSize*numRowsToInsertPusch];
-	pInsertPusch->pDataAlloc = new uint8_t[averagePduSize*numRowsToInsertPusch];
 
 	if (p->pDataAlloc && pInsertPusch->pDataAlloc) {
 		NVLOGI_FMT(TAG_DATALAKE,"Allocated memory for pduData: 0x{:x}, 0x{:x} of size {} bytes",
@@ -277,7 +274,7 @@ void DataLake::dbInit (std::string host, std::string engine, bool dropTables) {
 			NVLOGC_FMT(TAG_DATALAKE,"Creating tables using datalake_engine: {}",engine);
 			NVLOGC_FMT(TAG_DATALAKE,"If you have changed engine, you may need to drop tables for this to take effect.");
 		}
-	
+
 		// Create FAPI Table
 		std::string createTableFapi = "CREATE TABLE IF NOT EXISTS fapi ( \
 			TsTaiNs						DateTime64(9)	NOT NULL, \
@@ -464,7 +461,7 @@ void DataLake::collectSlot(void)
 		auto ue = &params_->ue_info[ueIdx];
 		auto ueGrp = ue->pUeGrpPrm;
 		uint16_t ueRnti = params_->ue_info[ueIdx].rnti;
-		
+
 		auto it = std::find_if(ueSampCnt.begin(), ueSampCnt.end(),
 			[&](const std::tuple<uint16_t,uint32_t>& ue ) {return std::get<0>(ue) == ueRnti;}
 		);
@@ -522,7 +519,7 @@ void DataLake::collectSlot(void)
 			e3_buffer_info.sfn = slot_->sfn_;
 			e3_buffer_info.slot = slot_->slot_;
 			e3_buffer_info.timestamp_ns = ts_ns;
-			
+
 			// IQ metadata
 			if (params_->cell_grp_info.nCells > 0) {
 				e3_buffer_info.cell_id = puschStatPrms_->pCellStatPrms[0].phyCellId;
@@ -534,27 +531,33 @@ void DataLake::collectSlot(void)
 				e3_buffer_info.n_rx_ant_srs = 0;
 			}
 			e3_buffer_info.n_cells = params_->cell_grp_info.nCells;
-			
+
 			// H estimates and PUSCH metadata - from first UE group
 			if (params_->cell_grp_info.nUeGrps > 0 && params_->cell_grp_info.nUes > 0) {
 				// TODO: Extend to capture all UEs using array/vector structure for per-UE data
 				//       Currently only capturing first UE from params_->cell_grp_info.nUes total
 				e3_buffer_info.n_ue = 1;  // Only first UE captured
-				
+
 				auto ue = &params_->ue_info[0];  // First UE
 				auto ueGrp = ue->pUeGrpPrm;
-				
+
 				// H estimates metadata
 				e3_buffer_info.n_bs_ants = puschStatPrms_->pCellStatPrms[0].nRxAnt;  // Using RX antennas as BS antennas
 				e3_buffer_info.n_layers = ue->nUeLayers;
 				e3_buffer_info.rb_size = ueGrp->nPrb;
 				e3_buffer_info.n_subcarriers = ueGrp->nPrb * 12;  // 12 subcarriers per PRB
 				e3_buffer_info.dmrs_symb_pos = ueGrp->dmrsSymLocBmsk;
-				
+
 				// Calculate number of DMRS estimates from dmrsAddlnPos
 				uint8_t dmrsAddlnPos = ueGrp->pDmrsDynPrm->dmrsAddlnPos;
 				e3_buffer_info.n_dmrs_estimates = dmrsAddlnPos + 1;
-				
+
+				// Get actual H estimates data size
+				e3_buffer_info.hest_data_size = 0;
+				if (out_->pChannelEstSizes) {
+					e3_buffer_info.hest_data_size = out_->pChannelEstSizes[0];  // Number of __half2 elements
+				}
+
 				// PUSCH FAPI fields
 				e3_buffer_info.rnti = ue->rnti;
 				e3_buffer_info.qam_mod_order = ue->qamModOrder;
@@ -563,7 +566,7 @@ void DataLake::collectSlot(void)
 				e3_buffer_info.rb_start = ueGrp->startPrb;
 				e3_buffer_info.start_symbol_index = ueGrp->puschStartSym;
 				e3_buffer_info.nr_of_symbols = ueGrp->nPuschSym;
-				
+
 				// CB errors and RSRP for first UE (UE index 0)
 				uint32_t cbStartOffset = out_->pStartOffsetsCbCrc[0];
 				uint32_t cbEndOffset = (params_->cell_grp_info.nUes > 1) ?
@@ -575,14 +578,14 @@ void DataLake::collectSlot(void)
 					}
 				}
 				e3_buffer_info.cb_errors = cbErrorCount;
-				
+
 				// RSRP for first UE
 				if (out_->pRsrp != nullptr) {
 					e3_buffer_info.rsrp = out_->pRsrp[0];
 				} else {
 					e3_buffer_info.rsrp = -std::numeric_limits<float>::max();
 				}
-				
+
 				// CQI/SINR for first UE
 				if (out_->pSinrPostEq != nullptr) {
 					e3_buffer_info.cqi = out_->pSinrPostEq[0];
@@ -591,11 +594,11 @@ void DataLake::collectSlot(void)
 				} else {
 					e3_buffer_info.cqi = -std::numeric_limits<float>::max();
 				}
-				
+
 				// CB count for first UE
 				uint32_t numCbsForFirstUe = cbEndOffset - cbStartOffset;
 				e3_buffer_info.cb_count = numCbsForFirstUe;
-				
+
 				// RSSI for first UE's group (per-UE-group data)
 				if (out_->pRssi != nullptr) {
 					e3_buffer_info.rssi = out_->pRssi[ue->ueGrpIdx];
@@ -623,13 +626,13 @@ void DataLake::collectSlot(void)
 			std::lock_guard<std::mutex> lock(e3_buffer_mutex);
 			e3_buffer_info.tb_crc_fail = 0;  // Default to no CRC failure
 		}
-		
+
 		for(uint16_t ueIdx = 0; ueIdx < nUes; ++ueIdx) {
 			if(ueIdx > 0) {
 				std::timespec_get(&ts, TIME_UTC);
 				ts_ns = ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
 			}
-			
+
 			p->tsSwNs.push_back(ts_ns);
 			p->tsTaiNs.push_back(ts_tai_ns);
 
@@ -698,7 +701,7 @@ void DataLake::collectSlot(void)
 			p->newDataIndicator.push_back(ue->ndi);
 
 			p->tbSize.push_back(tb_size);
-			
+
 			// Calculate actual number of CBs per UE from CB CRC data
 			uint32_t cbStartOffset = out_->pStartOffsetsCbCrc[ueIdx];
 			uint32_t cbEndOffset = (ueIdx < nUes - 1) ?
@@ -815,26 +818,26 @@ void DataLake::collectSlot(void)
 			if (pHest->tsTaiNs.size() == 0) {
 				pHest->collectStartTime = std::chrono::high_resolution_clock::now();
 			}
-			
+
 			// Get the first cell ID
 			uint16_t cellId = 0;
 			if (params_->cell_grp_info.nCells > 0) {
 				cellId = puschStatPrms_->pCellStatPrms[0].phyCellId;
 			}
-			
+
 			pHest->tsSwNs.push_back(ts_ns);
 			pHest->tsTaiNs.push_back(ts_tai_ns);
 			pHest->sfn.push_back(slot_->sfn_);
 			pHest->slot.push_back(slot_->slot_);
 			pHest->cellId.push_back(cellId);
-			
+
 			// Get size for first UE group only (in elements, not bytes)
 			uint32_t hestSize = 0;
 			if (out_->pChannelEstSizes) {
 				hestSize = out_->pChannelEstSizes[0];  // Number of __half2 elements
 			}
 			pHest->hestSize.push_back(hestSize);
-			
+
 			// Copy H estimates data for first UE group only
 			size_t dataIndex = pHest->tsTaiNs.size() - 1;
 			if (hestSize > 0 && hestSize <= maxHestSamplesPerRow) {
@@ -843,11 +846,11 @@ void DataLake::collectSlot(void)
 				NVLOGV_FMT(TAG_DATALAKE,"{:4}.{:02} {} us: Copied {} H estimate samples to hest[{}]",
 					slot_->sfn_, slot_->slot_, GET_ELAPSED_US(notifyTime), hestSize, dataIndex);
 			}
-			
+
 			if (pHest->tsTaiNs.size() == numRowsToInsertHest) {
 				pHest->collectFullTime = std::chrono::high_resolution_clock::now();
 			}
-			
+
 			NVLOGD_FMT(TAG_DATALAKE,"{:4}.{:02} {} us: collectSlot done H estimates in hest.{} buffer, size: {}",
 				slot_->sfn_,slot_->slot_,GET_ELAPSED_US(notifyTime),pHest->bufferName,pHest->tsTaiNs.size());
 		}
@@ -870,7 +873,7 @@ void DataLake::doInserts() {
 		NVLOGD_FMT(TAG_DATALAKE,"{:4}.{:02} {} pFH: {}, {} us since notify",
 			slot_->sfn_,slot_->slot_,__FUNCTION__,pFh->bufferName,GET_ELAPSED_US(notifyTime));
 		std::swap(pFh, pInsertFh);
-		
+
 		if (fhDbEnabled) {
 			inserted = true;
 			submitTask([=,this]() { insertFh(pInsertFh); });
@@ -883,7 +886,7 @@ void DataLake::doInserts() {
 		NVLOGD_FMT(TAG_DATALAKE,"{:4}.{:02} {} pPusch: {}, {} us since notify",
 			slot_->sfn_,slot_->slot_,__FUNCTION__,p->bufferName,GET_ELAPSED_US(notifyTime));
 		std::swap(p, pInsertPusch);
-		
+
 		if (puschDbEnabled) {
 			inserted = true;
 			submitTask([=,this]() { insertPusch(pInsertPusch); });
@@ -896,7 +899,7 @@ void DataLake::doInserts() {
 		NVLOGD_FMT(TAG_DATALAKE,"{:4}.{:02} {} pHest: {}, {} us since notify",
 			slot_->sfn_,slot_->slot_,__FUNCTION__,pHest->bufferName,GET_ELAPSED_US(notifyTime));
 		std::swap(pHest, pInsertHest);
-		
+
 		if (hestDbEnabled) {
 			inserted = true;
 			submitTask([=,this]() { insertHest(pInsertHest); });
@@ -1280,13 +1283,13 @@ void DataLake::insertHest(hestInfo_t* hestInfo) {
 	for (size_t row = 0; row < hestInfo->tsTaiNs.size(); ++row) {
 		const uint32_t hestSize = hestInfo->hestSize[row];
 		const hestDataType* src_data = hestInfo->hestData[row];
-			
+
 		// Copy interleaved complex data: cuFloatComplex -> [real, imag, real, imag, ...]
 		for (uint32_t i = 0; i < hestSize; ++i) {
 			local_data_vector[dest_offset++] = src_data[i].x; // real part
 			local_data_vector[dest_offset++] = src_data[i].y; // imaginary part
 		}
-			
+
 		// Fill remaining slots with zeros if needed
 		const uint32_t remainingSlots = maxHestSamplesPerRow - hestSize;
 		for (uint32_t i = 0; i < remainingSlots * 2; ++i) {

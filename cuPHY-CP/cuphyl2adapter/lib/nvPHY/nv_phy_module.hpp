@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -163,7 +163,6 @@ public:
         thread_(std::move(other.thread_)),
         phy_instances_(std::move(other.phy_instances_)),
         phy_refs_(std::move(other.phy_refs_)),
-        module_dispatch_(std::move(other.module_dispatch_)),
         epoll_ctx_p(std::move(other.epoll_ctx_p)),
         thread_cfg_(std::move(other.thread_cfg_)),
         dl_tbs_queue_(std::move(other.dl_tbs_queue_)),
@@ -265,6 +264,13 @@ public:
      */
     void start();
     
+    /**
+     * Stop the PHY module
+     *
+     * Signals the module thread and tick generator to stop.
+     */
+    void stop();
+
     /**
      * @brief Join the PHY module thread
      *
@@ -372,7 +378,12 @@ public:
      * @param flag TTI flag value
      */
     void set_tti_flag(bool flag);
-    
+
+    /**
+     * @brief Stop the tick generator
+     */
+    void stop_tick_generator();
+
     /**
      * @brief Set whether all cells are configured
      * @param value true if all cells configured, false otherwise
@@ -633,8 +644,6 @@ private:
 
     std::vector<PHY_instance_ptr> phy_instances_;
     std::vector<PHY_instance_ref> phy_refs_;
-
-    std::unique_ptr<PHY_module_dispatch> module_dispatch_;
 
     std::unique_ptr<member_event_callback<PHY_module>> msg_mcb_p;
     std::unique_ptr<phy_epoll_context>                 epoll_ctx_p;

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,10 +17,10 @@
 from typing import Generic
 from typing import List
 from typing import NamedTuple
+from typing import Optional
 from typing import Tuple
 import warnings
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
@@ -28,7 +28,7 @@ from aerial.phy5g.api import Array
 from aerial import pycuphy  # type: ignore
 from aerial.pycuphy.chest_filters import CUPHY_CHEST_COEFF_FILE
 from aerial.pycuphy.chest_filters import srs_chest_params_from_hdf5
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 
 
 class SrsCellPrms(NamedTuple):
@@ -148,14 +148,16 @@ class SrsChannelEstimator(Generic[Array]):
                  chest_algo_idx: int = None,
                  enable_delay_offset_correction: int = None,
                  chest_params: dict = None,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize SrsChannelEstimator.
 
         Args:
             chest_algo_idx (int) : ChEst algorithm index. 0: MMSE, 1: RKHS.
             chest_params (dict): Dictionary of channel estimation filters and parameters.
                 Set to None to use defaults.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
         warnings.warn("This class is deprecated. Use the full SRS Rx pipeline SrsRx instead.",
                       DeprecationWarning)
@@ -168,9 +170,7 @@ class SrsChannelEstimator(Generic[Array]):
             enable_delay_offset_correction = 1
         self.enable_delay_offset_correction = enable_delay_offset_correction
 
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         if chest_params is None:
             # Default SRS channel estimation parameters are loaded from the cuPHY filter file.
@@ -179,7 +179,7 @@ class SrsChannelEstimator(Generic[Array]):
         self.channel_estimator = pycuphy.SrsChannelEstimator(chest_algo_idx,
                                                              enable_delay_offset_correction,
                                                              chest_params,
-                                                             self.cuda_stream)
+                                                             self._cuda_stream.handle)
 
     def estimate(self,
                  *,
@@ -216,7 +216,7 @@ class SrsChannelEstimator(Generic[Array]):
               host memory always.
         """
         cpu_copy = isinstance(rx_data, np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rx_data = cp.array(rx_data, order='F', dtype=cp.complex64)
 
         # Wrap CuPy array into pycuphy types.
@@ -234,7 +234,7 @@ class SrsChannelEstimator(Generic[Array]):
         rb_snr_buffer = self.channel_estimator.get_rb_snr_buffer()
         srs_report = self.channel_estimator.get_srs_report()
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rb_snr_buffer = cp.array(rb_snr_buffer)
             ch_est = [cp.array(elem) for elem in ch_est]
             if cpu_copy:

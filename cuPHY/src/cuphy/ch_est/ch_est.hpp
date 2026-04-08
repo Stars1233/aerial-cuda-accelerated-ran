@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -97,6 +97,7 @@ private:
                         uint8_t                         nLayers,
                         uint8_t                         nDmrsSyms,
                         uint8_t                         nDmrsGridsPerPrb,
+                        uint8_t                         enablePerPrgChEstPerUeg,
                         uint16_t                        nTotalDataPrb,
                         uint8_t                         Nh,
                         uint16_t                        nUeGrps,
@@ -112,6 +113,7 @@ private:
                         uint8_t                         nLayers,
                         uint8_t                         nDmrsSyms,
                         uint8_t                         nDmrsGridsPerPrb,
+                        uint8_t                         enablePerPrgChEstPerUeg,
                         uint16_t                        nTotalDataPrb,
                         uint8_t                         Nh,
                         uint16_t                        nUeGrps,
@@ -128,7 +130,8 @@ private:
               uint32_t N_LAYERS,
               uint32_t N_DMRS_GRIDS_PER_PRB,
               uint32_t N_DMRS_SYMS>
-    void kernelSelectL0(uint16_t                        nTotalDataPrb,
+    void kernelSelectL0(uint8_t                         enablePerPrgChEstPerUeg,
+                        uint16_t                        nTotalDataPrb,
                         uint16_t                        nUeGrps,
                         uint32_t                        nRxAnt,
                         uint8_t                         enableDftSOfdm,
@@ -182,7 +185,8 @@ private:
               uint32_t N_DMRS_PRB_IN_PER_CLUSTER,
               uint32_t N_DMRS_INTERP_PRB_OUT_PER_CLUSTER,
               uint32_t N_DMRS_SYMS>
-    void multiStageChEst(uint16_t                        nTotalDataPrb,
+    void multiStageChEst(uint8_t                         enablePerPrgChEstPerUeg,
+                         uint16_t                        nTotalDataPrb,
                          uint16_t                        nUeGrps,
                          uint32_t                        nRxAnt,
                          uint8_t                         enableDftSOfdm,
@@ -218,10 +222,10 @@ private:
 
     struct puschRxChEstHash_t
     {
-        std::size_t operator()(const std::tuple<int, int, int, int, int>& comb) const
+        std::size_t operator()(const std::tuple<int, int, int, int, int, int>& comb) const
         {
             // Combine hashes of three integer indices using XOR and multiplication
-            return std::get<0>(comb) ^ (std::get<1>(comb) * 7) ^ (std::get<2>(comb) * 13) ^ (std::get<3>(comb) * 17) ^ (std::get<4>(comb) * 31);
+            return std::get<0>(comb) ^ (std::get<1>(comb) * 7) ^ (std::get<2>(comb) * 13) ^ (std::get<3>(comb) * 17) ^ (std::get<4>(comb) * 31) ^ (std::get<5>(comb) * 63);
         }
     };
 
@@ -235,7 +239,7 @@ private:
                 : func(f), hetCfgIdx(idx) {};
     };
 
-    using chEstHashMap_t = std::unordered_map<std::tuple<int, int, int, int, int>, chEstHashVal, puschRxChEstHash_t>;
+    using chEstHashMap_t = std::unordered_map<std::tuple<int, int, int, int, int, int>, chEstHashVal, puschRxChEstHash_t>;
 
     // used in setup function for channel estimation to check if a het config has been used previously
     chEstHashMap_t m_ChEstHashTable;

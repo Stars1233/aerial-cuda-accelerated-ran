@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,13 +16,13 @@
 """pyAerial library - LDPC derate matching."""
 from typing import Generic
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
 from aerial import pycuphy  # type: ignore
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PuschConfig
 
@@ -32,7 +32,7 @@ class LdpcDeRateMatch(Generic[Array]):
 
     def __init__(self,
                  enable_scrambling: bool = True,
-                 cuda_stream: int = None) -> None:
+                 cuda_stream: Optional[CudaStream] = None) -> None:
         """Initialize LdpcDeRateMatch.
 
         Initialization does all the necessary memory allocations for cuPHY.
@@ -40,16 +40,16 @@ class LdpcDeRateMatch(Generic[Array]):
         Args:
             enable_scrambling (bool): Whether to descramble the bits before derate matching.
                 Default: True.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         # Create the cuPHY LDPC derate match object.
         self.pycuphy_ldpc_derate_match = pycuphy.LdpcDerateMatch(
             enable_scrambling,
-            self.cuda_stream
+            self._cuda_stream.handle
         )
 
     def derate_match(  # pylint: disable=too-many-arguments
@@ -91,7 +91,7 @@ class LdpcDeRateMatch(Generic[Array]):
             List[Array]: Derate matched LLRs for each UE.
         """
         cpu_copy = isinstance(input_llrs[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             input_llrs = [cp.array(llr, order='F', dtype=cp.float16) for llr in input_llrs]
 
         # If PuschConfigs given, read the other parameters from that (the rest are ignored).
@@ -167,7 +167,7 @@ class LdpcDeRateMatch(Generic[Array]):
 
                 # The cuPHY derate matcher pads all inputs to 256-QAM as it supports MU-MIMO, and
                 # different users may be different modulation order. We add this padding here.
-                with cp.cuda.ExternalStream(int(self.cuda_stream)):
+                with self._cuda_stream:
                     derate_match_input = \
                         cp.zeros(
                             (8, int(rate_match_lengths[ue_idx] / mod_orders[ue_idx])),
@@ -200,7 +200,7 @@ class LdpcDeRateMatch(Generic[Array]):
             [np.uint32(idx) for idx in ue_grp_idx]
         )
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             derate_matched_llrs = [cp.array(elem) for elem in derate_matched_llrs]
             if cpu_copy:
                 derate_matched_llrs = [elem.get(order='F') for elem in derate_matched_llrs]

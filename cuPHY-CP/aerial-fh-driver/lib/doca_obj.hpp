@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include <doca_buf_array.h>
 #include <doca_log.h>
 #include <doca_eth_txq_gpu_data_path.h>
+#include <doca_eth_rxq_gpu_data_path.h>
 #include <doca_pe.h>
 
 #ifndef AERIAL_FH_DOCAOBJ_HPP__
@@ -41,6 +42,7 @@ typedef struct doca_tx_buf {
 	struct doca_buf_arr *buf_arr;		/* DOCA buffer array object around GPU memory buffer */
 	struct doca_gpu_buf_arr *buf_arr_gpu;	/* DOCA buffer array GPU handle */
 	int dmabuf_fd;				/* DMABuf file descriptor */
+	uint32_t pkt_buff_mkey;			/* mkey value of the buffer */
 
 	/* CPU comms defs */
 	struct doca_mmap *cpu_comms_mmap;
@@ -48,6 +50,7 @@ typedef struct doca_tx_buf {
 	uint8_t *cpu_comms_gpu_pkt_addr; // Not used but required by DOCA
 	struct doca_buf_arr *cpu_comms_buf_arr;
 	struct doca_gpu_buf_arr *cpu_comms_buf_arr_gpu;	/* DOCA buffer array GPU handle */
+	uint32_t cpu_comms_pkt_buff_mkey;			/* mkey value of the CPU comms buffer */
 } doca_tx_buf_t;
 
 typedef struct doca_tx_items
@@ -68,11 +71,11 @@ typedef struct doca_tx_items
 } doca_tx_items_t;
 
 doca_error_t doca_init_logger(void);
-doca_error_t doca_create_rx_queue(struct doca_rx_items *item, struct doca_gpu *gpu, struct doca_dev *ddev, int ndescr, enum doca_gpu_mem_type mtype, int max_pkt_size, int num_pkts);
+doca_error_t doca_create_rx_queue(struct doca_rx_items *item, struct doca_gpu *gpu, struct doca_dev *ddev, int ndescr, enum doca_gpu_mem_type mtype, int max_pkt_size, int num_pkts, uint8_t enable_gpu_comm_via_cpu);
 doca_error_t doca_destroy_rx_queue(struct doca_gpu *gpu, struct doca_rx_items *item);
 doca_error_t doca_create_semaphore(struct doca_rx_items *item, struct doca_gpu *gpu, int nitems, enum doca_gpu_mem_type sem_mtype, enum doca_gpu_mem_type custom_mtype, int custom_nbytes);
 doca_error_t doca_destroy_semaphore(struct doca_gpu_semaphore *sem_cpu);
-doca_error_t doca_create_tx_queue(struct doca_tx_items *item, struct doca_gpu *gpu_dev, struct doca_dev *ddev, int ndescr, int txq_id);
+doca_error_t doca_create_tx_queue(struct doca_tx_items *item, struct doca_gpu *gpu_dev, struct doca_dev *ddev, int ndescr, int txq_id, enum doca_gpu_mem_type mtype);
 doca_error_t doca_destroy_tx_queue(struct doca_tx_items *item);
 doca_error_t doca_create_tx_buf(struct doca_tx_buf *buf, struct doca_gpu *gpu_dev, struct doca_dev *ddev, enum doca_gpu_mem_type mtype, uint32_t num_packets, uint32_t max_pkt_sz,uint8_t enable_gpu_comm_via_cpu);
 void error_send_packet_cb(struct doca_eth_txq_gpu_event_error_send_packet *event_error, union doca_data event_user_data);

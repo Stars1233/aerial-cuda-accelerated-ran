@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -101,6 +101,7 @@ private:
     cuphy::linear_alloc<128, cuphy::device_alloc> m_LinearAlloc;
     cuphyTensorPrm_t*                             m_hPrmDataRx{};
     OutputParams                                  m_outputPrms{};
+    std::vector<void*>                            m_gpuAddrsChEstToL2InnerVec;
     std::vector<void*>                            m_gpuAddrsChEstToL2Vec;
 
     // stream worker:

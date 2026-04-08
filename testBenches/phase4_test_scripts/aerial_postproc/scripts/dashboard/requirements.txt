@@ -1,0 +1,14 @@
+# Dashboard upload requirements
+# Requires NVIDIA internal network access for PyPI
+
+--extra-index-url https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf-gpuwa-pypi/simple
+
+# Core data processing
+pandas>=1.5
+numpy>=1.24
+
+# NVIDIA internal dashboard API
+nvdataflow2==1.0.7
+
+# NCU report parsing
+ncu-report

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,13 @@
 #if !defined(PRACH_RECEIVER_HPP_INCLUDED_)
 #define PRACH_RECEIVER_HPP_INCLUDED_
 
-#define USE_CUFFTDX 1 // If you comment this out, you'd need to also uncomment a line in cuphy_channels/CMakeLists.txt to link with cufft
+// Support IFFT sizes for PRACH. These must be powers of 2 for cuFFTDx implementation. We currently iterate
+// through this array for each occasion to find a match, so if this array grows large then we should change
+// to a hash map or similar to avoid quadratic complexity.
+constexpr static uint32_t PRACH_SUPPORTED_FFT_SIZES[] = { 256, 1024 };
+constexpr static uint32_t PRACH_NUM_SUPPORTED_FFT_SIZES = sizeof(PRACH_SUPPORTED_FFT_SIZES) / sizeof(PRACH_SUPPORTED_FFT_SIZES[0]);
+constexpr static uint32_t PRACH_NUM_NON_COHERENT_COMBINING_GROUPS = 1;
+constexpr static uint32_t PRACH_MAX_NUM_PREAMBLES = 64;
 
 // enum used as index into graph node container
 enum GraphNodeType
@@ -47,6 +53,18 @@ struct prach_det_t
     int prmbIdx[CUPHY_PRACH_RX_NUM_PREAMBLE];      // array for detected preamble index
     int loc[CUPHY_PRACH_RX_NUM_PREAMBLE];          // array for detected peak location
     int Ndet;                       // number of detected preambles
+};
+
+using FftKernelHandle = void (*)(cuFloatComplex **d_fft, uint32_t numFfts);
+
+// Metadata needed for batched cuFFTDx kernel launches. This metadata is per FFT size.
+struct FftInfo {
+    cuFloatComplex **data{nullptr};
+    FftKernelHandle kernelPtr{nullptr};
+    dim3 block_dim{0, 0, 0};
+    uint32_t shared_memory_size{0};
+    uint32_t ffts_per_block{0};
+    uint32_t numFfts{0};
 };
 
 #if defined(__cplusplus)
@@ -78,9 +96,6 @@ struct PrachInternalStaticParamPerOcca
     PrachParams prach_params;
     cuphy::buffer<float, cuphy::device_alloc> prach_workspace_buffer;
     cuphy::buffer<__half2, cuphy::device_alloc> d_y_u_ref;
-#ifndef USE_CUFFTDX
-    cufftHandle fft_plan;
-#endif
     uint8_t  enableUlRxBf;
 };
 
@@ -114,6 +129,8 @@ cuphyStatus_t cuphyPrachCreateGraph(cudaGraph_t* graph, cudaGraphExec_t* graphIn
                                     const PrachInternalDynParamPerOcca* d_dynParam,
                                     const PrachDeviceInternalStaticParamPerOcca* d_staticParam,
                                     const PrachInternalStaticParamPerOcca* h_staticParam,
+                                    cuFloatComplex **h_fftPointers,
+                                    std::array<FftInfo, PRACH_NUM_SUPPORTED_FFT_SIZES> &fftInfo,
                                     uint32_t* num_detectedPrmb_addr,
                                     uint32_t* prmbIndex_estimates_addr,
                                     float* prmbDelay_estimates_addr,
@@ -138,6 +155,9 @@ cuphyStatus_t cuphyPrachUpdateGraph(cudaGraphExec_t graphInstance, std::vector<c
                                     const PrachInternalDynParamPerOcca* d_dynParam,
                                     const PrachDeviceInternalStaticParamPerOcca* d_staticParam,
                                     const PrachInternalDynParamPerOcca* h_dynParam,
+                                    const PrachInternalStaticParamPerOcca* h_staticParam,
+                                    cuFloatComplex **h_fftPointers,
+                                    std::array<FftInfo, PRACH_NUM_SUPPORTED_FFT_SIZES> &fftInfo,
                                     uint32_t* num_detectedPrmb_addr,
                                     uint32_t* prmbIndex_estimates_addr,
                                     float* prmbDelay_estimates_addr,
@@ -175,6 +195,8 @@ cuphyStatus_t cuphyPrachReceiver(const PrachInternalDynParamPerOcca* d_dynParam,
                                 const PrachDeviceInternalStaticParamPerOcca* d_staticParam,
                                 const PrachInternalDynParamPerOcca* h_dynParam,
                                 const PrachInternalStaticParamPerOcca* h_staticParam,
+                                cuFloatComplex **h_fftPointers,
+                                std::array<FftInfo, PRACH_NUM_SUPPORTED_FFT_SIZES> &fftInfo,
                                 uint32_t* num_detectedPrmb_addr,
                                 uint32_t* prmbIndex_estimates_addr,
                                 float* prmbDelay_estimates_addr,

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -211,7 +211,10 @@ int PhyUlBfwAggr::run()
             ret=-1;
         }
     }
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+    {
+        MemtraceDisableScope md;
+        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+    }
     struct slot_command_api::slot_indication* si = aggr_slot_params->si;
     NVLOGD_FMT(TAG, "UL PhyBfwAggr{} SFN {}.{} run", this_id, si->sfn_, si->slot_);
 

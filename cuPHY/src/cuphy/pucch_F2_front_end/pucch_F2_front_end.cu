@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,7 @@ std::mutex pucchF2Rx::m_mutexConstMemInit;
 
 namespace pucch_F2
 {
+/*VCAST_DONT_INSTRUMENT_START*/
 template <typename TElem>
 struct tensor_ref
 {
@@ -73,6 +74,7 @@ struct tensor_ref
     CUDA_BOTH const TElem& operator()(int i0, int i1, int i2, int i3) const { return *(addr + offset(i0, i1, i2, i3)); }
     // clang-format on
 };
+/*VCAST_DONT_INSTRUMENT_END*/
 
 // Lookup tables in constant memory. Some of these are stored either transposed or the conjugate of the MATLAB version
 // since they're only used in that format.

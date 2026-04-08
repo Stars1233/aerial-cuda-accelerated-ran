@@ -54,6 +54,7 @@ void cuphy_pti_init(const char* nic_pci_addr)
         CHECK_CUDA(cudaHostAlloc(&_cuphy_pti_all_stats[k].dh_gpu_stop_times,sizeof(uint64_t)*CUPHY_PTI_ACTIVITIES_MAX,cudaHostAllocPortable));
         CHECK_CUDA(cudaMalloc(&_cuphy_pti_all_stats[k].d_cta_counts,sizeof(uint32_t)*CUPHY_PTI_ACTIVITIES_MAX));
         CHECK_CUDA(cudaMemset(_cuphy_pti_all_stats[k].d_cta_counts,0,sizeof(uint32_t)*CUPHY_PTI_ACTIVITIES_MAX));
+        memfoot_add_gpu_size(MF_TAG_CUPHY_OTHER, sizeof(uint32_t)*CUPHY_PTI_ACTIVITIES_MAX);
     }
 
     constexpr uint32_t PTP_REG_ADDR_OFFSET = 0x1040;

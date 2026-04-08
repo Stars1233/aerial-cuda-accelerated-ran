@@ -25,6 +25,15 @@ namespace
 {
 
 ////////////////////////////////////////////////////////////////////////
+// Structure to hold mean and variance results
+template <typename T>
+struct welford_result
+{
+    T mean;
+    T variance;
+};
+
+////////////////////////////////////////////////////////////////////////
 // Welford's online algorithm to compute mean and variance using a
 // single pass over the data.
 template <typename T>
@@ -47,17 +56,16 @@ public:
         m_sq_  += delta_ * (val - mean_);
         //printf("%f\n", val);
     }
-    std::pair<T, T> get()
+    welford_result<T> get()
     {
-        //printf("N_ = %lu\n", N_);
         // Dividing by N-1 here to return the SAMPLE variance.
         // Divide instead by N to get the POPULATION variance.
-        return std::pair<T, T>(mean_, m_sq_ / (N_ - 1));
+        return {mean_, m_sq_ / (N_ - 1)};
     }
 private:
     T      delta_, m_sq_, mean_;
     size_t N_;
-       
+
 };
 
 ////////////////////////////////////////////////////////////////////////
@@ -84,18 +92,18 @@ void normal_dist_test(THostType m, THostType stddev, THostType tol)
     {
         w.update(t(i));
     }
-    std::pair<THostType, THostType> stats = w.get();
+    auto [mean, variance] = w.get();
 #if TEST_RNG_PRINT_STATISTICS
     printf("mean = %8.3f, variance = %8.3f, stddev = %8.3f, stddev_rel_error = %.3f\n",
-           stats.first,
-           stats.second,
-           std::sqrt(stats.second),
-           (std::sqrt(stats.second) - stddev) / stddev);
+           mean,
+           variance,
+           std::sqrt(variance),
+           (std::sqrt(variance) - stddev) / stddev);
 #endif
     // Using tolerance for both mean bias and relative STDDEV error.
     // TODO: Better metrics.
-    EXPECT_LT(std::abs(stats.first - m),                   tol);
-    EXPECT_LT((std::sqrt(stats.second) - stddev) / stddev, tol);
+    EXPECT_LT(std::abs(mean - m),                   tol);
+    EXPECT_LT((std::sqrt(variance) - stddev) / stddev, tol);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -131,26 +139,26 @@ void complex_normal_dist_test(TValueType m, TValueType stddev, THostScalarType t
         wReal.update(t(i).x);
         wImag.update(t(i).y);
     }
-    std::pair<THostScalarType, THostScalarType> statsReal = wReal.get();
-    std::pair<THostScalarType, THostScalarType> statsImag = wImag.get();
+    auto [realMean, realVariance] = wReal.get();
+    auto [imagMean, imagVariance] = wImag.get();
 #if TEST_RNG_PRINT_STATISTICS
     printf("real: mean = %f, variance = %f, stddev = %f, stddev_rel_error = %.3f\n",
-           statsReal.first,
-           statsReal.second,
-           std::sqrt(statsReal.second),
-           (std::sqrt(statsReal.second) - stddev.x) / stddev.x);
+           realMean,
+           realVariance,
+           std::sqrt(realVariance),
+           (std::sqrt(realVariance) - stddev.x) / stddev.x);
     printf("imag: mean = %f, variance = %f, stddev = %f, stddev_rel_error = %.3f\n",
-           statsImag.first,
-           statsImag.second,
-           std::sqrt(statsImag.second),
-           (std::sqrt(statsImag.second) - stddev.y) / stddev.y);
+           imagMean,
+           imagVariance,
+           std::sqrt(imagVariance),
+           (std::sqrt(imagVariance) - stddev.y) / stddev.y);
 #endif
     // Using tolerance for both mean bias and relative STDDEV error.
     // TODO: Better metrics.
-    EXPECT_LT(std::abs(statsReal.first - m.x),                     tol);
-    EXPECT_LT((std::sqrt(statsReal.second) - stddev.x) / stddev.x, tol);
-    EXPECT_LT(std::abs(statsImag.first - m.y),                     tol);
-    EXPECT_LT((std::sqrt(statsImag.second) - stddev.y) / stddev.y, tol);
+    EXPECT_LT(std::abs(realMean - m.x),                     tol);
+    EXPECT_LT((std::sqrt(realVariance) - stddev.x) / stddev.x, tol);
+    EXPECT_LT(std::abs(imagMean - m.y),                     tol);
+    EXPECT_LT((std::sqrt(imagVariance) - stddev.y) / stddev.y, tol);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -179,21 +187,21 @@ void uniform_dist_test(THostType a, THostType b, THostType tol)
         EXPECT_LE(static_cast<THostType>(t(i)), b);
         w.update(t(i));
     }
-    std::pair<THostType, THostType> stats = w.get();
+    auto [mean, variance] = w.get();
     THostType m = (a + b) / 2;
     THostType stddev = std::sqrt((b - a) * (b - a) / 12);
 #if TEST_RNG_PRINT_STATISTICS
     printf("mean = %8.3f, variance = %8.3f, stddev = %8.3f (expected %8.3f), stddev_rel_error = %.3f\n",
-           stats.first,
-           stats.second,
-           std::sqrt(stats.second),
+           mean,
+           variance,
+           std::sqrt(variance),
            stddev,
-           (std::sqrt(stats.second) - stddev) / stddev);
+           (std::sqrt(variance) - stddev) / stddev);
 #endif
     // Using tolerance for both mean bias and relative STDDEV error.
     // TODO: Better metrics.
-    EXPECT_LT(std::abs(stats.first - m),                   tol);
-    EXPECT_LT((std::sqrt(stats.second) - stddev) / stddev, tol);
+    EXPECT_LT(std::abs(mean - m),                   tol);
+    EXPECT_LT((std::sqrt(variance) - stddev) / stddev, tol);
 }
   
 ////////////////////////////////////////////////////////////////////////
@@ -229,30 +237,30 @@ void complex_uniform_dist_test(TValueType minVal, TValueType maxVal, THostScalar
         wReal.update(t(i).x);
         wImag.update(t(i).y);
     }
-    std::pair<THostScalarType, THostScalarType> statsReal = wReal.get();
-    std::pair<THostScalarType, THostScalarType> statsImag = wImag.get();
+    auto [realMean, realVariance] = wReal.get();
+    auto [imagMean, imagVariance] = wImag.get();
     THostScalarType m_real      = (minVal.x + maxVal.x) / 2;
     THostScalarType m_imag      = (minVal.y + maxVal.y) / 2;
     THostScalarType stddev_real = std::sqrt((maxVal.x - minVal.x) * (maxVal.x - minVal.x) / 12);
     THostScalarType stddev_imag = std::sqrt((maxVal.y - minVal.y) * (maxVal.y - minVal.y) / 12);
 #if TEST_RNG_PRINT_STATISTICS
     printf("real: mean = %f, variance = %f, stddev = %f, stddev_rel_error = %.3f\n",
-           statsReal.first,
-           statsReal.second,
-           std::sqrt(statsReal.second),
-           (std::sqrt(statsReal.second) - stddev_real) / stddev_real);
+           realMean,
+           realVariance,
+           std::sqrt(realVariance),
+           (std::sqrt(realVariance) - stddev_real) / stddev_real);
     printf("imag: mean = %f, variance = %f, stddev = %f, stddev_rel_error = %.3f\n",
-           statsImag.first,
-           statsImag.second,
-           std::sqrt(statsImag.second),
-           (std::sqrt(statsImag.second) - stddev_imag) / stddev_imag);
+           imagMean,
+           imagVariance,
+           std::sqrt(imagVariance),
+           (std::sqrt(imagVariance) - stddev_imag) / stddev_imag);
 #endif
     // Using tolerance for both mean bias and relative STDDEV error.
     // TODO: Better metrics.
-    EXPECT_LT(std::abs(statsReal.first - m_real),                        tol);
-    EXPECT_LT((std::sqrt(statsReal.second) - stddev_real) / stddev_real, tol);
-    EXPECT_LT(std::abs(statsImag.first - m_imag),                        tol);
-    EXPECT_LT((std::sqrt(statsImag.second) - stddev_imag) / stddev_imag, tol);
+    EXPECT_LT(std::abs(realMean - m_real),                        tol);
+    EXPECT_LT((std::sqrt(realVariance) - stddev_real) / stddev_real, tol);
+    EXPECT_LT(std::abs(imagMean - m_imag),                        tol);
+    EXPECT_LT((std::sqrt(imagVariance) - stddev_imag) / stddev_imag, tol);
 }
 
 } // namespace

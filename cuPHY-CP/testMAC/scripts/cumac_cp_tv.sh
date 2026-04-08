@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +34,12 @@ function usage {
     echo "  $script_name --cell_num=8 --alloc_type=1"
     echo "  $script_name 8 1                    # positional arguments"
     echo "  $script_name -c 4 -r                # force regeneration"
+}
+
+function LOG_INFO {
+    LOG_TIME="$(date -u '+%T.%6N')"
+    info="$1"
+    echo "${LOG_TIME} ${info}"
 }
 
 # Initialize default values
@@ -118,7 +125,7 @@ if [ "$cuBB_SDK" = "" ]; then
     exit 1
 fi
 
-echo "Parameters: cell_num=${cell_num} alloc_type=${alloc_type} force_renew=${force_renew}"
+LOG_INFO "Parameters: cell_num=${cell_num} alloc_type=${alloc_type} force_renew=${force_renew}"
 
 if [ `whoami` = "root" ];then
     USE_SUDO=""
@@ -136,13 +143,13 @@ function check_tv_validity {
         alloc_type_in_tv=$(h5ls -ld ${file_path}/cumacSchedulerParam | grep -o 'allocType=[0-9.]*' | cut -d '=' -f 2)
         cell_num_in_tv=$(h5ls -ld ${file_path}/cumacSchedulerParam | grep -o 'nCell=[0-9.]*' | cut -d '=' -f 2)
         if [ "${cell_num_in_tv}" != "${cell_num}" ] || [ "${alloc_type_in_tv}" != "${alloc_type}" ]; then
-            echo "TV at ${cuBB_SDK}/testVectors/${folder_name}/ is invalid: cell_num=${cell_num_in_tv} alloc_type=${alloc_type_in_tv}"
+            LOG_INFO "TV at ${cuBB_SDK}/testVectors/${folder_name}/ is invalid: cell_num=${cell_num_in_tv} alloc_type=${alloc_type_in_tv}"
             return 1
         fi
-        echo "TV at ${cuBB_SDK}/testVectors/${folder_name}/ is valid"
+        LOG_INFO "TV at ${cuBB_SDK}/testVectors/${folder_name}/ is valid"
         return 0
     else
-        echo "TV is not found at ${cuBB_SDK}/testVectors/${folder_name}"
+        LOG_INFO "TV is not found at ${cuBB_SDK}/testVectors/${folder_name}"
         return 1
     fi
 }
@@ -152,7 +159,7 @@ if [ "${force_renew}" = "0" ]; then
     check_tv_validity "cumac"
     return_code=$?
     if [ ${return_code} -eq 0 ]; then
-        echo "Found TV for cell_num=${cell_num} alloc_type=${alloc_type} at ${cuBB_SDK}/testVectors/cumac"
+        LOG_INFO "Found TV for cell_num=${cell_num} alloc_type=${alloc_type} at ${cuBB_SDK}/testVectors/cumac"
         exit 0
     fi
 
@@ -160,8 +167,8 @@ if [ "${force_renew}" = "0" ]; then
     check_tv_validity "${OUTPUT_DIR}"
     return_code=$?
     if [ ${return_code} -eq 0 ]; then
-        echo "Found TV for cell_num=${cell_num} alloc_type=${alloc_type} at ${cuBB_SDK}/testVectors/${OUTPUT_DIR}"
-        echo "Update link to ${cuBB_SDK}/testVectors/${OUTPUT_DIR}"
+        LOG_INFO "Found TV for cell_num=${cell_num} alloc_type=${alloc_type} at ${cuBB_SDK}/testVectors/${OUTPUT_DIR}"
+        LOG_INFO "Update link to ${cuBB_SDK}/testVectors/${OUTPUT_DIR}"
         cd ${cuBB_SDK}/testVectors
         rm -rf cumac
         ln -s ${OUTPUT_DIR} cumac
@@ -170,16 +177,15 @@ if [ "${force_renew}" = "0" ]; then
 fi
 
 # Generate TV
-echo "======================================"
-echo "Generate TV for cell_num=${cell_num} alloc_type=${alloc_type} ..."
+LOG_INFO "======================================"
+LOG_INFO "Generate TV for cell_num=${cell_num} alloc_type=${alloc_type} ..."
 
-if [ "${BUILD}" != "" ]; then
-    export BUILD=${BUILD}
-elif [ "$(arch)" = "aarch64" ]; then
-    export BUILD=build.aarch64
-else
-    export BUILD=build
+if [ "${BUILD}" = "" ]; then
+    export BUILD=build.$(arch)
 fi
+
+# Set BUILD_DIR to same with BUILD for build_aerial_sdk.sh
+export BUILD_DIR=${BUILD}
 
 function sed_set_value {
     name="$1"
@@ -187,7 +193,7 @@ function sed_set_value {
     file="$3"
     # sed_cmd="sed -i 's/${name}[ ]*:.*/${name}: ${value}/g' ${file}"
     sed_cmd="sed -i 's/${name}[ ]*.*/${name} ${value}/g' ${file}"
-    echo "${sed_cmd}"
+    LOG_INFO "${sed_cmd}"
     eval "${sed_cmd}"
 }
 
@@ -201,32 +207,40 @@ sed_set_value "#define gpuAllocTypeConst" "${alloc_type}" ${cuBB_SDK}/cuMAC/exam
 sed_set_value "#define cpuAllocTypeConst" "${alloc_type}" ${cuBB_SDK}/cuMAC/examples/parameters.h
 
 # Build
-echo "cd ${cuBB_SDK} && testBenches/phase4_test_scripts/build_aerial_sdk.sh > build_aerial_sdk.log 2>&1"
-cd ${cuBB_SDK} && testBenches/phase4_test_scripts/build_aerial_sdk.sh > build_aerial_sdk.log 2>&1
+LOG_INFO "cd ${cuBB_SDK} && testBenches/phase4_test_scripts/build_aerial_sdk.sh --targets multiCellSchedulerUeSelection pfmSortTest cumac_cp test_mac > build_aerial_sdk.log 2>&1"
+build_start=$(date +%s)
+cd ${cuBB_SDK} && testBenches/phase4_test_scripts/build_aerial_sdk.sh --targets multiCellSchedulerUeSelection pfmSortTest cumac_cp test_mac > build_aerial_sdk.log 2>&1
 return_code=$?
+build_end=$(date +%s)
+LOG_INFO "build_aerial_sdk.sh time cost: $((build_end - build_start))s"
 if [ ${return_code} -ne 0 ]; then
-    echo "$cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh > build_aerial_sdk.log 2>&1 failed"
+    LOG_INFO "$cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh --targets multiCellSchedulerUeSelection pfmSortTest cumac_cp test_mac > build_aerial_sdk.log 2>&1 failed"
     exit 1
 fi
-echo "======================================"
+LOG_INFO "======================================"
 
 # Remove old TV link or folder if exist
 rm -rf ${cuBB_SDK}/testVectors/cumac
 rm -rf ${cuBB_SDK}/testVectors/${OUTPUT_DIR}
 mkdir -p ${cuBB_SDK}/testVectors/${OUTPUT_DIR}
+ls -ld ${cuBB_SDK}/testVectors/${OUTPUT_DIR}
 
 # Run test vector generation
 LOCAL_CMD="cuMAC/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection -t 3 > cumac_cp_tv.log 2>&1"
 LOCAL_CMD="${cuBB_SDK}/${BUILD}/${LOCAL_CMD}"
+LOCAL_CMD="timeout -s 9 600 ${LOCAL_CMD}" # 10 minutes timeout
 LOCAL_CMD="cd ${cuBB_SDK}/testVectors/${OUTPUT_DIR} && ${USE_SUDO} ${LOCAL_CMD}"
-echo "${LOCAL_CMD}"
+LOG_INFO "${LOCAL_CMD}"
+tv_start=$(date +%s)
 eval "${LOCAL_CMD}"
 return_code=$?
+tv_end=$(date +%s)
+LOG_INFO "TV generation [multiCellSchedulerUeSelection -t 3] time cost: $((tv_end - tv_start))s"
 if [ ${return_code} -ne 0 ]; then
-    echo "4T4R TV generation failed"
+    LOG_INFO "4T4R TV generation failed"
     exit 1
 fi
-echo "======================================"
+LOG_INFO "======================================"
 
 ########################################################
 # Generate PFM sorting TV
@@ -235,12 +249,16 @@ echo "======================================"
 sed_set_value "NUM_CELL:" "${cell_num}" "${cuBB_SDK}/cuMAC/examples/pfmSort/config.yaml"
 LOCAL_CMD="cuMAC/examples/pfmSort/pfmSortTest -t 2 >> cumac_cp_tv.log 2>&1"
 LOCAL_CMD="${cuBB_SDK}/${BUILD}/${LOCAL_CMD}"
+LOCAL_CMD="timeout -s 9 600 ${LOCAL_CMD}" # 10 minutes timeout
 LOCAL_CMD="cd ${cuBB_SDK}/testVectors/${OUTPUT_DIR} && ${USE_SUDO} ${LOCAL_CMD}"
-echo "${LOCAL_CMD}"
+LOG_INFO "${LOCAL_CMD}"
+tv_start=$(date +%s)
 eval "${LOCAL_CMD}"
 return_code=$?
+tv_end=$(date +%s)
+LOG_INFO "TV generation [pfmSortTest -t 2] time cost: $((tv_end - tv_start))s"
 if [ ${return_code} -ne 0 ]; then
-    echo "PFM sorting TV generation failed"
+    LOG_INFO "PFM sorting TV generation failed"
     exit 1
 fi
 
@@ -249,6 +267,6 @@ cd ${cuBB_SDK}/testVectors
 rm -rf cumac
 ln -s ${OUTPUT_DIR} cumac
 
-echo "TV generation succeeded: ${cuBB_SDK}/testVectors/cumac -> ${cuBB_SDK}/testVectors/${OUTPUT_DIR}"
-echo "======================================"
+LOG_INFO "TV generation succeeded: ${cuBB_SDK}/testVectors/cumac -> ${cuBB_SDK}/testVectors/${OUTPUT_DIR}"
+LOG_INFO "======================================"
 exit 0

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,16 @@
 #include "tests_scf_5g_slot_commands_utils.hpp"
 #include "scf_5g_slot_commands_pdsch_csirs.hpp"
 
+namespace scf_5g_fapi {
+    uint16_t getPdschCsirsPrbOverlap(
+        uint16_t csirs_remap,
+        bool use_alt_prb,
+        uint16_t startPdschPrbOffset,
+        uint16_t nPdschPrb,
+        uint16_t* reMap,
+        int32_t cell_idx);
+}
+
 namespace {
 constexpr const char* CONFIG_LAUNCH_PATTERN_PATH = "testVectors/multi-cell/";
 constexpr const char* CONFIG_TEST_VECTOR_PATH = "testVectors/";
@@ -50,10 +60,9 @@ Dataset load_tv_datasets_single(hdf5hpp::hdf5_file& hdf5file, std::string const 
     if(fh_mem == nullptr)
     {
        NVLOGC_FMT(CB_TB_TAG,"allocate_memory failure ");
+       throw std::bad_alloc();
     }
     d.data.reset(memset(fh_mem, 0, d.size));
-    if (d.data.get() == nullptr)
-        NVLOGC_FMT(CB_TB_TAG, "malloc testvector data failed");
     NVLOGI_FMT(CB_TB_TAG,"Reading {}-byte dataset {}", d.size, dataset.c_str());
     dset.read(d.data.get());
     NVLOGI_FMT(CB_TB_TAG,"Read {}-byte dataset {}", d.size, dataset.c_str());
@@ -369,12 +378,9 @@ void setup_fhcb_csirs_pdsch_input_command(std::shared_ptr<cell_group_command> ce
 
             auto& pdsch_pdu = all_pdsch_pdus[cell_idx][ue_idx];
             auto& pdsch_fh_params = cell_grp_cmd->fh_params.pdsch_fh_params[cell_grp_cmd->fh_params.total_num_pdsch_pdus];
-            pdsch_fh_params.info = pdsch_params;
             pdsch_fh_params.cell_cmd = sp_cell_sub_cmds[cell_idx].get();
-            pdsch_fh_params.cell_grp_info = &pdsch_params->cell_grp_info;
             pdsch_fh_params.ue = &pdsch_params->ue_info[pdsch_ue_idx];
             pdsch_fh_params.grp = &pdsch_params->ue_grp_info[pdsch_ue_grp_idx];
-            pdsch_fh_params.csirs_info = csirs_params;
             pdsch_fh_params.cell_index = cell_idx;
             pdsch_fh_params.num_dl_prb = pdsch_pdu.BWPSize;
             pdsch_fh_params.ue_grp_index = pdsch_ue_grp_idx;
@@ -454,12 +460,17 @@ void setup_fhcb_csirs_pdsch_input_command(std::shared_ptr<cell_group_command> ce
         csirs_params->nCells++;
         pdsch_params->cell_grp_info.pCellPrms[cell_idx].nCsiRsPrms = csirsList_idx - csirs_start_idx;
         pdsch_params->cell_grp_info.pCsiRsPrms = &csirs_params->csirsList[0];
-        cell_grp_cmd->fh_params.is_csirs_cell[cell_idx]=(nPdus > 0) ? 1 : 0;
+        cell_grp_cmd->fh_params.is_csirs_cell[cell_idx] = 1; // nPdus > 0 guaranteed by continue statement at line 422
     }
 }
 
 void setup_tvs(yaml::node& schedule, int slot, int num_cells, std::vector<std::string>& tvs)
 {
+    if(schedule.length() == 0)
+    {
+        NVLOGE_FMT(CB_TB_TAG, AERIAL_L2ADAPTER_EVENT, "Error: Empty schedule, cannot setup test vectors");
+        return;
+    }
     slot = slot % schedule.length();
     auto node = schedule[slot];
     auto slot_config = node["config"];
@@ -682,7 +693,8 @@ TEST_P(FhCbTest,fhcb_test)
     calc_golden_slot_info(golden_tf_grid, golden_slot_info);
 #endif
     for (uint8_t cell = 0; cell < num_cells; ++cell) {
-        scf_5g_fapi::fh_callback<false,true,false>(cell_grp_cmd.get(), nullptr, cell);
+        scf_5g_fapi::LegacyCellGroupFhContext fh_context(*cell_grp_cmd, cell);
+        scf_5g_fapi::fh_callback<false,true,false>(fh_context, nullptr);
     }
 
     validate_output(sp_cell_sub_cmds, sp_cell_sub_cmds_ref, num_cells);
@@ -776,7 +788,8 @@ static void BM_scfl2adapter_fhcb_basic_csirs_pdsch(benchmark::State& state) {
 
             state.ResumeTiming();
             for (int k = 0; k < num_cells; ++k) {
-                scf_5g_fapi::fh_callback<false,true,false>(cell_grp_cmd.get(), nullptr, k);
+                scf_5g_fapi::LegacyCellGroupFhContext fh_context(*cell_grp_cmd, k);
+                scf_5g_fapi::fh_callback<false,true,false>(fh_context, nullptr);
             }
     }
 }
@@ -1065,6 +1078,54 @@ TEST_F(ProcessSetBitsTest, EdgeBits) {
     for (const auto& pos : positions) {
         EXPECT_EQ(pos.count, 1) << "Count should always be 1";
     }
+}
+
+class PdschCsirsPrbOverlapTest : public ::testing::Test {
+protected:
+    static constexpr uint16_t kRemapMask = 0x0FFF;
+};
+
+TEST_F(PdschCsirsPrbOverlapTest, ReturnsFirstNonMatchingOffsetWithoutAltPrb) {
+    std::array<uint16_t, 8> reMap{
+        0x0123, 0x0123, 0x0123, 0x0124, 0x0124, 0x0124, 0x0124, 0x0124
+    };
+    const uint16_t start = 0;
+    const uint16_t count = 8;
+    const uint16_t csirs_remap = 0x0123 & kRemapMask;
+
+    const uint16_t rb_idx = scf_5g_fapi::getPdschCsirsPrbOverlap(
+        csirs_remap, false, start, count, reMap.data(), 0);
+
+    EXPECT_EQ(rb_idx, 3);
+}
+
+TEST_F(PdschCsirsPrbOverlapTest, HonorsAltPrbMatchRule) {
+    // With use_alt_prb enabled, val lower-12bits equal to (csirs_remap - 1) is treated as match.
+    std::array<uint16_t, 6> reMap{
+        0x0233, 0x0233, 0x0234, 0x0234, 0x0235, 0x0235
+    };
+    const uint16_t start = 0;
+    const uint16_t count = 6;
+    const uint16_t csirs_remap = 0x0234 & kRemapMask;
+
+    const uint16_t rb_idx = scf_5g_fapi::getPdschCsirsPrbOverlap(
+        csirs_remap, true, start, count, reMap.data(), 0);
+
+    EXPECT_EQ(rb_idx, 4);
+}
+
+TEST_F(PdschCsirsPrbOverlapTest, ReturnsEndWhenAllEntriesMatch) {
+    std::array<uint16_t, 5> reMap{
+        0x0101, 0x0101, 0x0101, 0x0101, 0x0101
+    };
+    const uint16_t start = 0;
+    const uint16_t count = 5;
+    const uint16_t csirs_remap = 0x0101 & kRemapMask;
+
+    const uint16_t rb_idx = scf_5g_fapi::getPdschCsirsPrbOverlap(
+        csirs_remap, false, start, count, reMap.data(), 0);
+
+    EXPECT_EQ(rb_idx, start + count);
 }
 
 } // anonymous namespace

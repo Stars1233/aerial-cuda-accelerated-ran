@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,33 +29,9 @@
 #include <algorithm>  // For std::clamp, std::shuffle
 
 
-// Helper function to wrap azimuth angle to [-180, 180] degrees
-inline float wrapAzimuth(const float phi) {
-    float wrapped = std::fmod(phi + 180.0f, 360.0f);
-    if (wrapped < 0.0f) {
-        wrapped += 360.0f;
-    }
-    return wrapped - 180.0f;
-}
-
-// Helper function to wrap zenith angle to [0, 180] degrees
-inline float wrapZenith(const float theta) {
-    float wrapped = std::fmod(theta, 360.0f);
-    if (wrapped < 0.0f) {
-        wrapped += 360.0f;
-    }
-    // Map to [0, 180] using symmetry
-    if (wrapped > 180.0f) {
-        wrapped = 360.0f - wrapped;
-    }
-    return wrapped;
-}
-
 // Helper function to calculate field components
 inline void calculateFieldComponents(
     const AntPanelConfig& antConfig, float theta, float phi, float zeta, float& F_theta, float& F_phi) {
-    constexpr float G_max = 8.0f;       // Maximum antenna gain (dBi)
-
     // Convert angles to radians
     float zeta_rad = zeta * M_PI / 180.0f;
 
@@ -77,7 +53,7 @@ inline void calculateFieldComponents(
             phi_idx += 360;  // Only add 360 if negative, avoiding second modulo
         }
     }
-    float A_db_3D = antConfig.antTheta[theta_idx] + antConfig.antPhi[phi_idx] + (antConfig.antModel == 1 ? G_max : 0.0f);
+    float A_db_3D = antConfig.antTheta[theta_idx] + antConfig.antPhi[phi_idx] + (antConfig.antModel == 1 ? SLS_ANTENNA_GAIN_MAX_DBI : 0.0f);
     float A_3D_sqrt = powf(10.0f, A_db_3D / 20.0f); // equivalent to sqrt(10^(A_db_3D/10))
     F_theta = A_3D_sqrt * cosf(zeta_rad);
     F_phi = A_3D_sqrt * sinf(zeta_rad);
@@ -218,8 +194,9 @@ inline void genClusterDelayAndPower(
 }
 
 
-// Inline function to generate cluster angles
-inline void genClusterAngle(
+// Static member function to generate cluster angles
+template <typename Tscalar, typename Tcomplex>
+void slsChan<Tscalar, Tcomplex>::genClusterAngle(
     uint8_t nCluster,
     float C_ASA,
     float C_ASD,
@@ -351,8 +328,9 @@ inline void genClusterAngle(
     }
 }
 
-// Inline function to generate ray angles within clusters
-inline void genRayAngle(
+// Static member function to generate ray angles within clusters
+template <typename Tscalar, typename Tcomplex>
+void slsChan<Tscalar, Tcomplex>::genRayAngle(
     uint8_t nCluster,
     uint16_t nRayPerCluster,
     const float* phi_n_AoA,

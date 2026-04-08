@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -335,12 +335,6 @@ static void* cumac_tick_thread_func(void* arg)
             NVLOGE_FMT(TAG, AERIAL_CLOCK_API_EVENT, "clock_nanosleep returned error ret: {}", ret);
         }
 
-        if(pExitHandler.test_exit_in_flight())
-        {
-            NVLOGW_FMT(TAG, "App is exiting, stop cumac_tick thread");
-            break;
-        }
-
         // Call TTI handler to send SLOT.indication
         sched_info.ts = ts_expected.tv_sec * 1e9 + ts_expected.tv_nsec;
         _cumac_handler->on_tick_event(sched_info);
@@ -399,9 +393,14 @@ void cumac_handler::stop()
 
 void cumac_handler::join() {
     NVLOGC_FMT(TAG, "{}", __func__);
-    if (pthread_join(cumac_recv_tid, NULL) != 0) {
-        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Join  mac_recv thread failed");
+    if (cumac_sched_tid != 0 && pthread_join(cumac_sched_tid, NULL) != 0) {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Join cumac_sched thread failed");
     }
+    if (cumac_recv_tid != 0) {
+        pthread_cancel(cumac_recv_tid);
+        pthread_join(cumac_recv_tid, NULL);
+    }
+    NVLOGC_FMT(TAG, "cumac_handler: [cumac_sched] and [cumac_recv] threads joined");
 }
 
 void cumac_handler::cell_init(int cell_id)
@@ -711,7 +710,12 @@ int cumac_handler::schedule_cell_update(uint64_t slot_counter)
                 cpu_set_t mask;
                 CPU_ZERO(&mask);
                 CPU_SET(0, &mask);
-                pthread_setaffinity_np(oam_cmd_thread.native_handle(), sizeof(mask), &mask);
+
+                int rc = pthread_setaffinity_np(oam_cmd_thread.native_handle(), sizeof(mask), &mask);
+                if(rc != 0)
+                {
+                    NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: set affinity failed: err={} - {}", __func__, rc, strerror(rc));
+                }
 
                 oam_cmd_thread.detach();
 
@@ -928,6 +932,13 @@ void cumac_handler::print_cumac_thrput(uint64_t slot_counter)
 
 void cumac_handler::on_tick_event(sched_info_t sched_info)
 {
+    if (is_app_exiting())
+    {
+        // Wake up cumac_sched thread to exit the loop
+        sem_post(&cumac_scheduler_sem);
+        return;
+    }
+
     if (configured_cell_num < cell_num) {
         NVLOGI_FMT(TAG, "SFN {}.{} on_tick_event ts={} skipped before cumac_cp init finishing", sched_info.ss.u16.sfn, sched_info.ss.u16.slot, sched_info.ts);
         return;
@@ -1087,12 +1098,26 @@ int cumac_handler::handle_sch_tti_response(nv::phy_mac_msg_desc& msg_desc, cumac
     uint8_t* buf_home = static_cast<uint8_t*>(msg_desc.data_buf);
 
     cumac_req_t* req = get_cumac_req_data(msg_desc.cell_id, resp->sfn, resp->slot);
+    if (req == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} {} req=nullptr",
+            resp->sfn, resp->slot, msg_desc.cell_id, msg_desc.msg_id, get_cumac_msg_name(msg_desc.msg_id));
+        return -1;
+    }
+
+    if (req->tv_data == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} {} tv_data=nullptr",
+            resp->sfn, resp->slot, msg_desc.cell_id, msg_desc.msg_id, get_cumac_msg_name(msg_desc.msg_id));
+        return -1;
+    }
+
     cumac_cell_configs_t& cell_cfg = lp->get_cumac_cell_configs(msg_desc.cell_id);
 
-    // CUMAC MSG validation
+    // CUMAC MSG validation: use actual response sizes (nUeSchd, nActiveUe) from cuMAC-CP
     vald.msg_start(msg_desc.cell_id, msg_desc.msg_id, resp->sfn, resp->slot);
     vald.set_cumac_req(req);
-    uint32_t nUeSchd = cell_cfg.nMaxSchUePerCell;
+    uint32_t nUeSchd = resp->nUeSchd;   // Actual scheduled UEs this TTI (may be < nMaxSchUePerCell)
 
     if(cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_UE_SELECTION))
     {
@@ -1114,7 +1139,7 @@ int cumac_handler::handle_sch_tti_response(nv::phy_mac_msg_desc& msg_desc, cumac
     if(cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_PRB_ALLOCATION))
     {
         int16_t* allocSol     = reinterpret_cast<int16_t*>(buf_home + resp->offsets.allocSol);
-        uint32_t  allocSol_num = cell_cfg.allocType == 0 ? req->tv_data->req.nPrbGrp : 2 * cell_cfg.nMaxSchUePerCell;
+        uint32_t  allocSol_num = cell_cfg.allocType == 0 ? req->tv_data->req.nPrbGrp : 2 * nUeSchd;
 
         CUMAC_VALIDATE_BYTES_ERR(&vald, allocSol, req->tv_data->resp.allocSol, allocSol_num * sizeof(int16_t));
 
@@ -1232,10 +1257,6 @@ void cumac_handler::receiver_thread_func()
     {
         NVLOGE_FMT(TAG, AERIAL_NVIPC_API_EVENT, "IPC send failed, please check whether cumac_cp is running properly", e.what());
     }
-    catch(...)
-    {
-        NVLOGW_FMT(TAG, "cumac_handler receiver_thread_func unknown exception");
-    }
 
     if(cumac_build_in_advance != 0)
     {
@@ -1252,8 +1273,6 @@ void cumac_handler::receiver_thread_func()
             }
         } catch (std::exception &e) {
             NVLOGW_FMT(TAG, "cumac receiver_thread_func: exception: {}", e.what());
-        } catch (...) {
-            NVLOGW_FMT(TAG, "cumac receiver_thread_func: unknown exception");
         }
     }
 }
@@ -1263,6 +1282,34 @@ void cumac_handler::scheduler_thread_func()
     sched_info_t sched_info;
     while(sem_wait(&cumac_scheduler_sem) == 0)
     {
+        if (is_app_exiting())
+        {
+            NVLOGC_FMT(TAG, "App is exiting, stop all cuMAC RUNNING cells");
+            // Stop all RUNNING cells
+            for (int cell_id = 0; cell_id < cell_num; cell_id++)
+            {
+                if (cumac_cell_data[cell_id].cumac_state == cumac_state_t::RUNNING)
+                {
+                    cell_stop(cell_id);
+                }
+            }
+
+            int wait_count = 0;
+            for (int cell_id = 0; cell_id < cell_num; cell_id++)
+            {
+                while (wait_count < 10 && cumac_cell_data[cell_id].cumac_state == cumac_state_t::RUNNING)
+                {
+                    // Still has at least one RUNNING cell, wait 100ms for it to stop
+                    usleep(100 * 1000);
+                    wait_count++;
+                }
+            }
+            NVLOGC_FMT(TAG, "Waited for {} ms for all RUNNING cells to stop", wait_count * 100);
+
+            // Exit the while loop to exit the scheduler thread
+            break;
+        }
+
         while (sched_info_ring->dequeue(sched_info_ring, &sched_info) == 0)
         {
             // No need worry about overflow. Even 1us a tick, the overflow time is 1.84*10^19 / 10^6 / 86400 / 365 = 5.83*10^5 years.
@@ -1285,6 +1332,7 @@ void cumac_handler::scheduler_thread_func()
             lp->check_init_pattern_finishing(global_tick + 1);
         }
     }
+    NVLOGC_FMT(TAG, "[cumac_sched] thread exiting");
 }
 
 void cumac_handler::build_first_slot()
@@ -1447,7 +1495,7 @@ int cumac_handler::send_config_request(int cell_id)
 
     cumac_config_req_t* req = cumac_init_msg_header<cumac_config_req_t>(&msg_desc, CUMAC_CONFIG_REQUEST, cell_id);
     cumac_cell_configs_t& cfgs = lp->get_cumac_cell_configs(cell_id);
-    memcpy(req->body, &lp->get_cumac_cell_configs(cell_id), sizeof(cumac_cell_configs_t) + sizeof(float) * cfgs.nMaxActUePerCell);
+    memcpy(req->body, &lp->get_cumac_cell_configs(cell_id), sizeof(cumac_cell_configs_t));
     req->header.body_len += sizeof(cumac_cell_configs_t);
     msg_desc.msg_len = req->header.body_len + sizeof(cumac_msg_header_t);
 

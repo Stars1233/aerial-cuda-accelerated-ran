@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,13 +45,15 @@ namespace {
 
 ////////////////////////////////////////////////////////////////////////
 // Compute capabilities
-constexpr  uint64_t CC_7_0  = ( 7ULL << 32);
+constexpr uint64_t CC_7_0  = ( 7ULL << 32);
 constexpr uint64_t CC_7_5  = ( 7ULL << 32) + 5;
 constexpr uint64_t CC_8_0  = ( 8ULL << 32);
 constexpr uint64_t CC_8_6  = ( 8ULL << 32) + 6;
 constexpr uint64_t CC_8_9  = ( 8ULL << 32) + 9;
 constexpr uint64_t CC_9_0  = ( 9ULL << 32);
 constexpr uint64_t CC_10_0 = (10ULL << 32);
+constexpr uint64_t CC_12_0 = (12ULL << 32);
+constexpr uint64_t CC_12_1 = (12ULL << 32) + 1;
 
 enum LDPC_ALGO
 {
@@ -333,6 +335,8 @@ decoder::decoder(const cuphy_i::context& ctx) :
             algo_factory<LDPC_ALGO_REG_BOX_PLUS>                      ::create(*this, algos_);
             break;
         case CC_10_0:
+        case CC_12_0:
+        case CC_12_1:
             // Blackwell (B100)
             algo_factory<LDPC_ALGO_REG_INDEX_FP_DESC_DYN>             ::create(*this, algos_);
             algo_factory<LDPC_ALGO_REG_INDEX_FP_X2_DESC_DYN>          ::create(*this, algos_);
@@ -387,8 +391,11 @@ int decoder::choose_algo(const cuphyLDPCDecodeConfigDesc_t& config) const
     case CC_8_6:  return choose_algo_sm86( config);
     case CC_8_9:  return choose_algo_sm89( config);
     case CC_9_0:  return choose_algo_sm90( config);
-#endif
-    // case CC_10_0: return choose_algo_sm100(config); // For Blackwell (CC 10 and 12), it will choose LDPC_ALGO_REG_INDEX_FP_X2_DESC_DYN using choose_algo_sm70( config)
+    case CC_10_0:
+    case CC_12_0:
+    case CC_12_1:
+    return choose_algo_sm100(config);
+    #endif
     }
 }
 

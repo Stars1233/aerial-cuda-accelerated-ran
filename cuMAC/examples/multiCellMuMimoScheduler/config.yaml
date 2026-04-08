@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@ fullBufferTraffic: 1
 DL: 1
 harqEnabled: 1
 nCell: 6
+activeCellIds: [] # list of active cell IDs for SLS generation, e.g. [0, 4, 8]; [] means all cells [0..nCell-1]. If given, its length must be equal to nCell
 ueGrpMode: 0
 semiStatFreqAlloc: 0
 nActiveUePerCell: 64
@@ -61,6 +62,7 @@ chanEstNmseDB: -15.0
 
 channel_config:
   fading_type: 0  # 0: internal Rayleigh fading, 1: using statistic channel model based on config below
+  dump_chan_slots: [] # list of slots to dump channel data to H5 file, e.g. [0, 1, 2]; [] means no dump
   
   # NOTE: Most parameters are automatically derived from cuMAC config above:
   # - nCell, nBsAnt, nUeAnt, nPrbGrp → antenna configuration and PRBG parameters
@@ -71,6 +73,9 @@ channel_config:
   system_level:
     scenario: "UMa"  # Scenario type: UMa (Urban Macro), UMi (Urban Micro), RMa (Rural Macro). TODO: currently only UMa is calibrated, will remove this restriction later
     isd: 1732.0  # Inter-site distance in meters, only used for RMa scenario (1732 or 5000), ignored for UMa/UMi
+    ut_drop_option: 0  # UT drop control: 0: randomly across whole region; 1: same number of UTs in each site; 2: same number of UTs in each sector. If nUt is not divisible by nSector/nSite, the remaining UTs will be assigned to the first nUt % (nSector/nSite) sectors/sites. E.g., nUt=20, nSector=3, sector 0 will have 7 UTs, sector 1 will have 7 UTs, sector 2 will have 6 UTs.
+    ut_drop_cells: []  # If given, it must be a subset of activeCellIds. Example: activeCellIds:[0,4,8], ut_drop_cells:[0,8]. [] means use all active cells.
+    ut_cell_2d_dist: [-1, -1]  # UT-to-serving-cell 2D distance [min,max] in meters for UE dropping. Use [-1,-1] for default dropping behavior.
     optional_pl_ind: 0  # Path loss model: 0=standard pathloss equation, 1=optional path loss equation
     o2i_building_penetr_loss_ind: 1  # Outdoor-to-Indoor building penetration loss: 0=none, 1=low-loss, 2=high-loss (for indoor UTs)
     o2i_car_penetr_loss_ind: 0  # Outdoor-to-Indoor car penetration loss: 0=none, 1=basic car, 2=metallized car window (RMa only)
@@ -110,16 +115,22 @@ channel_config:
 
   # Antenna Panel Configuration (required - cuMAC only specifies total antenna counts)
   antenna_panels:
-    panel_0:  # BS (Base Station) antenna panel
-      n_ant: 64  # Total number of antennas (will be validated against cuMAC m_nBsAnt)
-      ant_model: 1  # Antenna model: 0=isotropic, 1=3GPP directional, 2=from file
-      ant_size: [1, 1, 8, 8, 1]  # [M1, M2, M3, M4, M5] where M3*M4 = main array size
-      ant_spacing: [0.5, 0.5, 0.5, 0.5]  # [d_H, d_V, d_H_panel, d_V_panel] in wavelengths
-      ant_polar_angles: [0, 90]  # [theta, phi] polarization angles in degrees
-      
-    panel_1:  # UE (User Equipment) antenna panel  
-      n_ant: 4  # Total number of antennas (will be validated against cuMAC m_nUeAnt)
-      ant_model: 1  # Antenna model: 0=isotropic, 1=3GPP directional, 2=from file
-      ant_size: [1, 1, 2, 2, 1]  # [M1, M2, M3, M4, M5] where M3*M4 = main array size
-      ant_spacing: [0.5, 0.5, 0.5, 0.5]  # [d_H, d_V, d_H_panel, d_V_panel] in wavelengths
-      ant_polar_angles: [0, 90]  # [theta, phi] polarization angles in degrees 
+    # BS antenna panel configuration (index 0)
+    panel_0:
+      n_ant: 64  # Total number of antennas (M_g * N_g * P * M * N)
+      ant_size: [1, 1, 8, 4, 2]  # Array dimensions [M_g,N_g,M,N,P], M_g=N_g=1 for single panel
+      ant_spacing: [2.5, 2.5, 0.5, 0.5]  # Spacing in wavelengths [d_g_h,d_g_v,d_h,d_v]
+      ant_theta: []  # Antenna pattern A(theta, phi=0) in dB, 180 elements (required for ant_model=2)
+      ant_phi: []  # Antenna pattern A(theta=90, phi) in dB, 360 elements (required for ant_model=2)
+      ant_polar_angles: [45, -45]  # Polarization angles [roll_angle_first_polz, roll_angle_second_polz]
+      ant_model: 1  # Antenna model: 0=isotropic, 1=directional (3GPP), 2=direct pattern
+
+    # UE antenna panel configuration (index 1)
+    panel_1:
+      n_ant: 4  # Total number of antennas (M_g * N_g * P * M * N)
+      ant_size: [1, 1, 2, 2, 1]  # Array dimensions [M_g,N_g,M,N,P], M_g=N_g=1 for single panel
+      ant_spacing: [2.5, 2.5, 0.5, 0.5]  # Spacing in wavelengths [d_g_h,d_g_v,d_h,d_v]
+      ant_theta: []  # Antenna pattern A(theta, phi=0) in dB, 180 elements (required for ant_model=2)
+      ant_phi: []  # Antenna pattern A(theta=90, phi) in dB, 360 elements (required for ant_model=2)
+      ant_polar_angles: [0, 90]  # Polarization angles [roll_angle_first_polz, roll_angle_second_polz]
+      ant_model: 0  # Antenna model: 0=isotropic, 1=directional (3GPP), 2=direct pattern

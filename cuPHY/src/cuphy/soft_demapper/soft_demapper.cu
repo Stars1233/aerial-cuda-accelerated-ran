@@ -24,6 +24,7 @@
 #include "soft_demapper_tables.cuh"
 #include "cuphy_context.hpp"
 #include "nvlog.hpp"
+#include "memfoot_global.h"
 
 namespace
 {
@@ -64,6 +65,7 @@ soft_demapper_context::soft_demapper_context() :
             4,                                 // levels
             32)                                // width
 {
+    memfoot_add_gpu_size(MF_TAG_CUPHY_OTHER, QAMtex_.get_gpu_size_alloc());
     QAMtex_.copy_to_level(QAM_256_table,
                           sizeof(QAM_256_table),  // pitch
                           0,                      // level

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,11 +55,16 @@ PhyChannel::PhyChannel(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_t _cell_
 
     setCtx();
 
+    // Initialize memory footprint tracker for base class, name can be overridden by derived classes
+    mf.init(pdh, std::string("PhyChannelBase"), 0);
+
     channel_complete_h.reset(new host_buf(1 * sizeof(uint32_t), gDev));
     channel_complete_h->clear();
+    mf.addCpuPinnedSize(1 * sizeof(uint32_t));
 
     channel_complete_gdr.reset(gDev->newGDRbuf(1 * sizeof(uint32_t)));
     ((uint32_t*)channel_complete_gdr->addrh())[0] = 0;
+    mf.addGpuPinnedSize(channel_complete_gdr->size_alloc);
 
     CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_run));
     CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_run));
@@ -169,27 +174,6 @@ static int get_channel_count(slot_params* params)
     return channels;
 }
 
-static int get_channel_aggr_count(slot_params_aggr* params)
-{
-    int channels = 0;
-
-    if(params->cgcmd->pusch != nullptr)
-        channels++;
-    if(params->cgcmd->pdsch != nullptr)
-        channels++;
-    if(params->cgcmd->pdcch != nullptr)
-        channels++;
-    if(params->cgcmd->pucch != nullptr)
-        channels++;
-    if(params->cgcmd->pbch != nullptr)
-        channels++;
-    if(params->cgcmd->prach != nullptr)
-        channels++;
-    if(params->cgcmd->csirs != nullptr)
-        channels++;
-
-    return channels;
-}
 
 int PhyChannel::setDynParams(slot_params* curr_slot_params) //struct slot_command_api::slot_indication si, slot_command_api::phy_slot_params& slot_phy_prms)
 {
@@ -487,10 +471,12 @@ int PhyChannel::reserve(uint8_t * _buf_d, uint8_t * _buf_h, size_t _buf_sz)
         goto exit;
     }
 
-    if(active == true)
-        ret = -1;
-    else
-        active = true;
+    // Atomically check if already active and set to active if not
+    // exchange() returns the old value and sets the new value atomically
+    if(active.exchange(true) == true)
+    {
+        ret = -1;  // Was already active, cannot reserve
+    }
 
     if(ret == 0)
     {
@@ -514,10 +500,12 @@ int PhyChannel::reserve(uint8_t * _buf_d, size_t _buf_sz, cuphy::tensor_device* 
         goto exit;
     }
 
-    if(active == true)
-        ret = -1;
-    else
-        active = true;
+    // Atomically check if already active and set to active if not
+    // exchange() returns the old value and sets the new value atomically
+    if(active.exchange(true) == true)
+    {
+        ret = -1;  // Was already active, cannot reserve
+    }
 
     if(ret == 0)
     {
@@ -535,10 +523,12 @@ int PhyChannel::reserveCellGroup()
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
     int ret = 0;
 
-    if(active == true)
-        ret = -1;
-    else
-        active = true;
+    // Atomically check if already active and set to active if not
+    // exchange() returns the old value and sets the new value atomically
+    if(active.exchange(true) == true)
+    {
+        ret = -1;  // Was already active, cannot reserve
+    }
 
 exit:
     return ret;
@@ -561,9 +551,11 @@ float PhyChannel::getGPURunTime() {
     return 1000.0f * GetCudaEventElapsedTime(start_run, end_run, __func__, getId());
 }
 
+
 void PhyChannel::printGpuMemoryFootprint() {
     if (pCuphyTracker) {
-        cuphyMf.printGpuMemoryFootprint();
+        // TODO
+        // cuphyMf.printGpuMemoryFootprint();
         //pCuphyTracker->printMemoryFootprint(); // for stdout
         // Can expand as needed
     }
@@ -571,7 +563,8 @@ void PhyChannel::printGpuMemoryFootprint() {
 
 void PhyChannel::updateMemoryTracker() {
     if (pCuphyTracker) {
-        cuphyMf.addGpuRegularSize(pCuphyTracker->getGpuRegularSize());
+        // TODO
+        // cuphyMf.addGpuRegularSize(pCuphyTracker->getGpuRegularSize());
         //FIXME can easily expand to track host pinned memory etc.
     }
 }

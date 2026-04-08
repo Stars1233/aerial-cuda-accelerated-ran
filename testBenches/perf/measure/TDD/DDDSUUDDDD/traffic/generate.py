@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,12 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import yaml
 import json
 import re
 
+logger = logging.getLogger(__name__)
+
 from ....analyze import extract
+from ....traffic_utils import (
+    drop_minus_one_overrides,
+    expand_tvs_for_cells,
+    is_truthy,
+    load_tdd_yaml_overrides,
+)
 
 
 def run(args, vectors, testcases, filenames, sLotConfig):
@@ -56,10 +65,13 @@ def run(args, vectors, testcases, filenames, sLotConfig):
 
     payload = {}
     payload["cells"] = len(testcases_dl)
+    payload["slots_per_pattern"] = args.pattern_len
 
-    ifile = open("measure/TDD/priorities.json", "r")
-    priorities = json.load(ifile)
-    ifile.close()
+    priorities, start_delay, tv_overrides, cumac_options = load_tdd_yaml_overrides(getattr(args, "yaml", None), logger)
+
+    if priorities is None:
+        with open("measure/TDD/priorities.json", "r", encoding="utf-8") as ifile:
+            priorities = json.load(ifile)
 
     buffer = {}
 
@@ -76,34 +88,29 @@ def run(args, vectors, testcases, filenames, sLotConfig):
         channel = {}
 
         if not args.is_no_pdsch and sLotConfig["PDSCH"][sweep_idx % args.pattern_len]:
-            channel["PDSCH"] = [
-                os.path.join(args.vfld, filenames_dl[testcase])
-                for testcase in testcases_dl
-            ]
+            channel["PDSCH"] = expand_tvs_for_cells(
+                filenames_dl, testcases_dl, args.vfld
+            )
 
         if testcases_cdl is not None and sLotConfig["PDCCH"][sweep_idx % args.pattern_len]:
-            channel["PDCCH"] = [
-                os.path.join(args.vfld, filenames_cdl[testcase])
-                for testcase in testcases_cdl
-            ]
+            channel["PDCCH"] = expand_tvs_for_cells(
+                filenames_cdl, testcases_cdl, args.vfld
+            )
 
         if testcases_cr is not None and sLotConfig["CSIRS"][sweep_idx % args.pattern_len]:
-            channel["CSIRS"] = [
-                os.path.join(args.vfld, filenames_cr[testcase])
-                for testcase in testcases_cr
-            ]
+            channel["CSIRS"] = expand_tvs_for_cells(
+                filenames_cr, testcases_cr, args.vfld
+            )
 
         if testcases_dlbf is not None and sLotConfig["PDSCH"][sweep_idx % args.pattern_len]:
-            channel["DLBFW"] = [
-                os.path.join(args.vfld, filenames_dlbf[testcase])
-                for testcase in testcases_dlbf
-            ]
+            channel["DLBFW"] = expand_tvs_for_cells(
+                filenames_dlbf, testcases_dlbf, args.vfld
+            )
 
         if testcases_ssb is not None and sLotConfig["PBCH"][sweep_idx % args.pattern_len]:
-            channel["SSB"] = [
-                os.path.join(args.vfld, filenames_ssb[testcase])
-                for testcase in testcases_ssb
-            ]
+            channel["SSB"] = expand_tvs_for_cells(
+                filenames_ssb, testcases_ssb, args.vfld
+            )
 
         if testcases_mac is not None and sLotConfig["MAC"][sweep_idx % args.pattern_len]:
             for testcase in testcases_mac:
@@ -118,8 +125,6 @@ def run(args, vectors, testcases, filenames, sLotConfig):
                 if matches:
                     # Get the last match of '-(\d+)PC'
                     last_match = matches[-1]
-                    number = int(last_match.group(1))
-                    
                     # Replace the default cell count in TV name with actual cell count
                     macTvName = macTvName[:last_match.start(1)] + str(payload["cells"]) + macTvName[last_match.end(1):]
                     channel["MAC"] = [os.path.join(args.vfld, macTvName)]
@@ -139,8 +144,6 @@ def run(args, vectors, testcases, filenames, sLotConfig):
                 if matches:
                     # Get the last match of '-(\d+)PC'
                     last_match = matches[-1]
-                    number = int(last_match.group(1))
-
                     # Replace the default cell count in TV name with actual cell count
                     mac2TvName = mac2TvName[:last_match.start(1)] + str(args.mac2) + mac2TvName[last_match.end(1):] # mac2 using fixed number of cells
                     channel["MAC2"] = [os.path.join(args.vfld, mac2TvName)]
@@ -150,61 +153,64 @@ def run(args, vectors, testcases, filenames, sLotConfig):
         if sweep_idx % args.pattern_len == 0:
 
             if not args.is_no_pusch:
-
-                channel["PUSCH"] = [
-                    os.path.join(args.vfld, filenames_ul[testcase])
-                    for testcase in testcases_ul
-                ]
+                channel["PUSCH"] = expand_tvs_for_cells(
+                    filenames_ul, testcases_ul, args.vfld
+                )
 
             if testcases_ulbf is not None:
-                channel["ULBFW"] = [
-                    os.path.join(args.vfld, filenames_ulbf[testcase])
-                    for testcase in testcases_ulbf
-            ]
+                channel["ULBFW"] = expand_tvs_for_cells(
+                    filenames_ulbf, testcases_ulbf, args.vfld
+                )
 
             if testcases_cul is not None:
-                channel["PUCCH"] = [
-                    os.path.join(args.vfld, filenames_cul[testcase])
-                    for testcase in testcases_cul
-                ]
+                channel["PUCCH"] = expand_tvs_for_cells(
+                    filenames_cul, testcases_cul, args.vfld
+                )
 
             if testcases_ra is not None:
-                channel["PRACH"] = [
-                    os.path.join(args.vfld, filenames_ra[testcase])
-                    for testcase in testcases_ra
-                ]
+                channel["PRACH"] = expand_tvs_for_cells(
+                    filenames_ra, testcases_ra, args.vfld
+                )
 
             if testcases_sr is not None:
-                channel["SRS"] = [
-                    os.path.join(args.vfld, filenames_sr[testcase])
-                    for testcase in testcases_sr
-                ]
+                channel["SRS"] = expand_tvs_for_cells(
+                    filenames_sr, testcases_sr, args.vfld
+                )
 
         if sweep_idx % args.pattern_len == 1:
 
             if not args.is_no_pusch:
-
-                channel["PUSCH"] = [
-                    os.path.join(args.vfld, filenames_ul[testcase])
-                    for testcase in testcases_ul
-                ]
+                channel["PUSCH"] = expand_tvs_for_cells(
+                    filenames_ul, testcases_ul, args.vfld
+                )
 
             if testcases_ulbf is not None:
-                channel["ULBFW"] = [
-                    os.path.join(args.vfld, filenames_ulbf[testcase])
-                    for testcase in testcases_ulbf
-            ]
+                channel["ULBFW"] = expand_tvs_for_cells(
+                    filenames_ulbf, testcases_ulbf, args.vfld
+                )
 
             if testcases_cul is not None:
-                channel["PUCCH"] = [
-                    os.path.join(args.vfld, filenames_cul[testcase])
-                    for testcase in testcases_cul
-                ]
+                channel["PUCCH"] = expand_tvs_for_cells(
+                    filenames_cul, testcases_cul, args.vfld
+                )
                 
         channels.append(channel)
 
     payload["slots"] = channels
     payload["parameters"] = extract(args, channels)
+    # Keep optional YAML-only sections near the end for readability.
+    if isinstance(start_delay, dict) and start_delay:
+        payload["start_delay"] = start_delay
+
+    if isinstance(cumac_options, dict) and cumac_options:
+        payload["cumac_options"] = cumac_options
+
+    cleaned_tv_overrides = drop_minus_one_overrides(tv_overrides)
+    if isinstance(cleaned_tv_overrides, dict) and cleaned_tv_overrides:
+        enabled = is_truthy(cleaned_tv_overrides.get("enable_override", False))
+        meaningful_keys = [k for k in cleaned_tv_overrides.keys() if k != "enable_override"]
+        if enabled and len(meaningful_keys) > 0:
+            payload["override_test_vectors"] = cleaned_tv_overrides
 
     ofile = open(vectors, "w")
     yaml.dump(payload, ofile, sort_keys=False)

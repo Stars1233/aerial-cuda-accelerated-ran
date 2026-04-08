@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,7 +51,12 @@ phy_epoll_context::~phy_epoll_context()
 // phy_epoll_context::add_fd()
 void phy_epoll_context::add_fd(int fd, event_callback* cb, uint32_t events)
 {
-    assert(epoll_fd != ipc_base::INVALID_FD);
+    if(epoll_fd == ipc_base::INVALID_FD)
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: Invalid fd: {}", __func__, fd);
+        return;
+    }
+
     if(cb == nullptr || fd == ipc_base::INVALID_FD)
     {
         std::string err_str = "";
@@ -74,10 +79,16 @@ void phy_epoll_context::add_fd(int fd, event_callback* cb, uint32_t events)
 // phy_epoll_context::remove_fd()
 void phy_epoll_context::remove_fd(int fd)
 {
-    assert(epoll_fd != ipc_base::INVALID_FD);
+    if(epoll_fd == ipc_base::INVALID_FD)
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: Invalid epoll_fd: {}", __func__, epoll_fd);
+        return;
+    }
+
     if(fd == ipc_base::INVALID_FD)
     {
-        throw std::runtime_error("Invalid fd" + std::string(__PRETTY_FUNCTION__));
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: Invalid fd: {}", __func__, fd);
+        return;
     }
     to_be_removed_fd_list.insert(fd);
 }
@@ -86,7 +97,12 @@ void phy_epoll_context::remove_fd(int fd)
 // phy_epoll_context::add_fd_internal()
 void phy_epoll_context::add_fd_internal(int fd, event_callback* cb, uint32_t events)
 {
-    assert(epoll_fd != ipc_base::INVALID_FD);
+    if(epoll_fd == ipc_base::INVALID_FD)
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: Invalid fd: {}", __func__, fd);
+        return;
+    }
+
     if(cb == nullptr || fd == ipc_base::INVALID_FD)
     {
         std::string err_str = "";
@@ -119,10 +135,16 @@ void phy_epoll_context::add_fd_internal(int fd, event_callback* cb, uint32_t eve
 // phy_epoll_context::remove_fd_internal()
 void phy_epoll_context::remove_fd_internal(int fd)
 {
-    assert(epoll_fd != ipc_base::INVALID_FD);
+    if(epoll_fd == ipc_base::INVALID_FD)
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: Invalid epoll_fd: {}", __func__, epoll_fd);
+        return;
+    }
+
     if(fd == ipc_base::INVALID_FD)
     {
-        throw std::runtime_error("Invalid fd" + std::string(__PRETTY_FUNCTION__));
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: Invalid fd: {}", __func__, fd);
+        return;
     }
 
     std::unordered_map<int, event_callback*>::iterator it = fd_cache.find(fd);
@@ -168,7 +190,12 @@ void phy_epoll_context::fd_processing()
 // phy_epoll_context::start_event_loop()
 void phy_epoll_context::start_event_loop()
 {
-    assert(epoll_fd != ipc_base::INVALID_FD);
+    if(epoll_fd == ipc_base::INVALID_FD)
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: Invalid epoll_fd: {}", __func__, epoll_fd);
+        return;
+    }
+
     if(to_be_added_fd_list.empty())
     {
         return;

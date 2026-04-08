@@ -93,6 +93,13 @@ int nv_ipc_shm_send_loopback(nv_ipc_t* ipc, nv_ipc_msg_t* msg);
 int nv_ipc_shm_rx_poll(nv_ipc_t* ipc);
 
 /**
+ * Check if all necessary data memory pools (cpu_data and cpu_large) are host pinned memory
+ *
+ * @param[in] ipc IPC instance
+ */
+void nv_ipc_check_host_pinned_memory(nv_ipc_t* ipc);
+
+/**
  * Get CUDA device count
  *
  * @return Number of CUDA devices

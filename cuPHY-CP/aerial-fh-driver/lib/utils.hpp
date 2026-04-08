@@ -18,6 +18,7 @@
 #ifndef AERIAL_FH_UTILS_HPP__
 #define AERIAL_FH_UTILS_HPP__
 
+#include "memfoot_global.h"
 #include "defaults.hpp"
 #include "output_formatting.hpp"
 #include "nvlog.hpp"

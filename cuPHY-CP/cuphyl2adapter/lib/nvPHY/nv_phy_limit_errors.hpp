@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -132,9 +132,9 @@ struct pucch_limit_error_t {
     uint8_t pf4_errors;    ///< Error code for PUCCH format 4 limit violations
     uint8_t pf0_parsed;    ///< Parsed status for PUCCH format 0
     uint8_t pf1_parsed;    ///< Parsed status for PUCCH format 1
-    uint8_t pf2_parsed;    ///< Parsed status for PUCCH format 2
-    uint8_t pf3_parsed;    ///< Parsed status for PUCCH format 3
-    uint8_t pf4_parsed;    ///< Parsed status for PUCCH format 4
+    uint16_t pf2_parsed;   ///< Parsed status for PUCCH format 2 (needs uint16_t for limits up to 480)
+    uint16_t pf3_parsed;   ///< Parsed status for PUCCH format 3 (needs uint16_t for limits up to 480)
+    uint16_t pf4_parsed;   ///< Parsed status for PUCCH format 4 (needs uint16_t for limits up to 480)
 };
 
 /**

@@ -820,3 +820,5 @@ pusch:
   nCsi2Reports: 0.0
   foForgetCoeff: 0.0
   foCompensationBuffer: 1.0
+  ldpcEarlyTerminationPerUe: 0
+  ldpcMaxNumItrPerUe: 10

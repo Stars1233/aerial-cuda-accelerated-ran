@@ -20,10 +20,10 @@
 #include <unistd.h>
 #include <mutex>
 #include <pthread.h>
+#include <vector>
 
 #include "nvlog.hpp"
 #include "cupti_helper.hpp"
-
 
 #define TAG "CUPHY.CUPTI"
 
@@ -47,10 +47,11 @@
 #define ALIGN_BUFFER(buffer, align)                                                 \
   (((uintptr_t) (buffer) & ((align)-1)) ? ((buffer) + (align) - ((uintptr_t) (buffer) & ((align)-1))) : (buffer))
 
-// For typical workloads, it's suggested to choose a size between 1 and 10 MB. " from https://docs.nvidia.com/cupti/r_main.html
-// We choose 1GB to reduce BufferRequest() callback frequency in the high-priority threads
-#define BUF_SIZE (1 * 1024 * 1024 * 1024)
-constexpr int MAX_BUFFERS = 8;
+// Runtime configurable values (set during init)
+static uint64_t g_cupti_buffer_size = 0;
+static uint16_t g_cupti_num_buffers = 0;
+
+#define MAX_ACTIVITY_PRINTS_PER_SECOND 100000LLU
 
 #define CUPTI_API_CALL(apiFunctionCall)                                                                 \
 do                                                                                                      \
@@ -80,6 +81,61 @@ GetName(
     return pName;
 }
 
+static std::string
+GetCuptiVersionString(
+    const uint32_t version)
+{
+    // CUDA 13.0+ uses format xxyyzz (major.minor.patch)
+    if (version >= 130000)
+    {
+        const uint32_t major = version / 10000;
+        const uint32_t minor = (version / 100) % 100;
+        const uint32_t patch = version % 100;
+        
+        if (patch > 0)
+        {
+            return fmt::format("CUDA Toolkit {}.{} Update {}", major, minor, patch);
+        }
+        else
+        {
+            return fmt::format("CUDA Toolkit {}.{}", major, minor);
+        }
+    }
+    
+    // Pre-CUDA 13 incremental API versions
+    switch (version)
+    {
+        case 1:  return "CUDAToolsSDK 4.0";
+        case 2:  return "CUDAToolsSDK 4.1";
+        case 3:  return "CUDA Toolkit 5.0";
+        case 4:  return "CUDA Toolkit 5.5";
+        case 5:  return "CUDA Toolkit 6.0";
+        case 6:  return "CUDA Toolkit 6.5";
+        case 7:  return "CUDA Toolkit 6.5 (with sm_52 support)";
+        case 8:  return "CUDA Toolkit 7.0";
+        case 9:  return "CUDA Toolkit 8.0";
+        case 10: return "CUDA Toolkit 9.0";
+        case 11: return "CUDA Toolkit 9.1";
+        case 12: return "CUDA Toolkit 10.0, 10.1 or 10.2";
+        case 13: return "CUDA Toolkit 11.0";
+        case 14: return "CUDA Toolkit 11.1";
+        case 15: return "CUDA Toolkit 11.2, 11.3 or 11.4";
+        case 16: return "CUDA Toolkit 11.5";
+        case 17: return "CUDA Toolkit 11.6";
+        case 18: return "CUDA Toolkit 11.8";
+        case 19: return "CUDA Toolkit 12.0";
+        case 20: return "CUDA Toolkit 12.2";
+        case 21: return "CUDA Toolkit 12.3";
+        case 22: return "CUDA Toolkit 12.4";
+        case 23: return "CUDA Toolkit 12.5";
+        case 24: return "CUDA Toolkit 12.6";
+        case 26: return "CUDA Toolkit 12.8";
+        case 27: return "CUDA Toolkit 12.9";
+        case 28: return "CUDA Toolkit 12.9 Update 1";
+        default: return "Unknown CUPTI version";
+    }
+}
+
 static const char *
 GetMemoryKindString(
     CUpti_ActivityMemoryKind memoryKind)
@@ -102,6 +158,21 @@ GetMemoryKindString(
             return "DEVICE_STATIC";
         case CUPTI_ACTIVITY_MEMORY_KIND_MANAGED_STATIC:
             return "MANAGED_STATIC";
+        default:
+            return "<unknown>";
+    }
+}
+
+static const char *
+GetMemoryOperationTypeString(
+    CUpti_ActivityMemoryOperationType memoryOperationType)
+{
+    switch (memoryOperationType)
+    {
+        case CUPTI_ACTIVITY_MEMORY_OPERATION_TYPE_ALLOCATION:
+            return "ALLOC";
+        case CUPTI_ACTIVITY_MEMORY_OPERATION_TYPE_RELEASE:
+            return "FREE";
         default:
             return "<unknown>";
     }
@@ -242,7 +313,9 @@ void PrintActivity(CUpti_Activity *pRecord)
         case CUPTI_ACTIVITY_KIND_DRIVER:
         case CUPTI_ACTIVITY_KIND_RUNTIME:
         case CUPTI_ACTIVITY_KIND_INTERNAL_LAUNCH_API:
-        if (1) {
+        {
+            //Log all driver/runtime API calls that are enabled (should only be kernel launches and graph launches)
+
             CUpti_ActivityAPI *pApiRecord = (CUpti_ActivityAPI *)pRecord;
             const char* pName = NULL;
             const char* activity = NULL;
@@ -273,8 +346,8 @@ void PrintActivity(CUpti_Activity *pRecord)
                     static_cast<uint32_t>(pApiRecord->threadId),
                     static_cast<uint32_t>(pApiRecord->correlationId));
 
+            break;
         }
-        break;
 #endif
 
         case CUPTI_ACTIVITY_KIND_MEMORY:
@@ -295,36 +368,88 @@ void PrintActivity(CUpti_Activity *pRecord)
             break;
         }
 
+        case CUPTI_ACTIVITY_KIND_MEMORY2:
+        {
+            CUpti_ActivityMemory4 *pMemory4Record = (CUpti_ActivityMemory4 *)(void *)pRecord;
+
+            NVLOGI_FMT(TAG, "MEMORY2 {} timestamp {}, size {} bytes, address {}, memoryKind {}, name \"{}\", isAsync {}, streamId {}, deviceId {}, contextId {}, processId {}, correlationId {}",
+                    GetMemoryOperationTypeString(pMemory4Record->memoryOperationType),
+                    (unsigned long long)pMemory4Record->timestamp,
+                    (unsigned long long)pMemory4Record->bytes,
+                    (unsigned long long)pMemory4Record->address,
+                    GetMemoryKindString(pMemory4Record->memoryKind),
+                    GetName(pMemory4Record->name),
+                    static_cast<uint32_t>(pMemory4Record->isAsync),
+                    static_cast<uint32_t>(pMemory4Record->streamId),
+                    static_cast<uint32_t>(pMemory4Record->deviceId),
+                    static_cast<uint32_t>(pMemory4Record->contextId),
+                    static_cast<uint32_t>(pMemory4Record->processId),
+                    static_cast<uint32_t>(pMemory4Record->correlationId));
+
+            break;
+        }
+
         case CUPTI_ACTIVITY_KIND_GRAPH_TRACE:
         {
-            CUpti_ActivityGraphTrace2 *pMemoryRecord = (CUpti_ActivityGraphTrace2 *)(void *)pRecord;
+            CUpti_ActivityGraphTrace2 *pGraphTraceRecord = (CUpti_ActivityGraphTrace2 *)(void *)pRecord;
 
-            NVLOGI_FMT(TAG, "GRAPH_TRACE [ {}, {} ] duration {}, graphId {}, streamId {}, deviceId {} {}, contextId {} {}",
-                    (unsigned long long)pMemoryRecord->start,
-                    (unsigned long long)pMemoryRecord->end,
-                    (unsigned long long)(pMemoryRecord->end - pMemoryRecord->start),
-                    static_cast<uint32_t>(pMemoryRecord->graphId),
-                    static_cast<uint32_t>(pMemoryRecord->streamId),
-                    static_cast<uint32_t>(pMemoryRecord->deviceId),
-                    static_cast<uint32_t>(pMemoryRecord->endDeviceId),
-                    static_cast<uint32_t>(pMemoryRecord->contextId),
-                    static_cast<uint32_t>(pMemoryRecord->endContextId));
+            NVLOGI_FMT(TAG, "GRAPH_TRACE [ {}, {} ] duration {}, graphId {}, correlationId {}, streamId {}, deviceId [{}, {}], contextId [{}, {}]",
+                    (unsigned long long)pGraphTraceRecord->start,
+                    (unsigned long long)pGraphTraceRecord->end,
+                    (unsigned long long)(pGraphTraceRecord->end - pGraphTraceRecord->start),
+                    static_cast<uint32_t>(pGraphTraceRecord->graphId),
+                    static_cast<uint32_t>(pGraphTraceRecord->correlationId),
+                    static_cast<uint32_t>(pGraphTraceRecord->streamId),
+                    static_cast<uint32_t>(pGraphTraceRecord->deviceId),
+                    static_cast<uint32_t>(pGraphTraceRecord->endDeviceId),
+                    static_cast<uint32_t>(pGraphTraceRecord->contextId),
+                    static_cast<uint32_t>(pGraphTraceRecord->endContextId));
+
+            break;
+        }
+
+        case CUPTI_ACTIVITY_KIND_DEVICE_GRAPH_TRACE:
+        {
+            CUpti_ActivityDeviceGraphTrace *pDeviceGraphRecord = (CUpti_ActivityDeviceGraphTrace *)(void *)pRecord;
+
+            NVLOGI_FMT(TAG, "DEVICE_GRAPH_TRACE [DEVICE-LAUNCHED] [ {}, {} ] duration {}, graphId {}, streamId {}, deviceId {}, contextId {}",
+                    (unsigned long long)pDeviceGraphRecord->start,
+                    (unsigned long long)pDeviceGraphRecord->end,
+                    (unsigned long long)(pDeviceGraphRecord->end - pDeviceGraphRecord->start),
+                    static_cast<uint32_t>(pDeviceGraphRecord->graphId),
+                    static_cast<uint32_t>(pDeviceGraphRecord->streamId),
+                    static_cast<uint32_t>(pDeviceGraphRecord->deviceId),
+                    static_cast<uint32_t>(pDeviceGraphRecord->contextId));
+
+            break;
+        }
+
+        case CUPTI_ACTIVITY_KIND_DEVICE:
+        {
+            CUpti_ActivityDevice5 *pDeviceRecord = (CUpti_ActivityDevice5 *)(void *)pRecord;
+
+            NVLOGI_FMT(TAG, "DEVICE id {}, computeCapability {}.{}, name \"{}\"",
+                    static_cast<uint32_t>(pDeviceRecord->id),
+                    static_cast<uint32_t>(pDeviceRecord->computeCapabilityMajor),
+                    static_cast<uint32_t>(pDeviceRecord->computeCapabilityMinor),
+                    GetName(pDeviceRecord->name));
 
             break;
         }
 
         default:
-            NVLOGW_FMT(TAG, "CUPTI Activity {} printing not implemented",activityKind);
+            NVLOGW_FMT(TAG, "CUPTI Activity {} printing not implemented",static_cast<uint32_t>(activityKind));
             break;
     }
 }
 
 static std::mutex g_cupti_helper_mutex;
-static uint8_t *pBufferEmpty[MAX_BUFFERS] {nullptr};
-static uint8_t *pBufferReady[MAX_BUFFERS] {nullptr};
-static size_t bufferReadyValidSize[MAX_BUFFERS] {0};
+static std::vector<uint8_t*> pBufferEmpty;
+static std::vector<uint8_t*> pBufferReady;
+static std::vector<size_t> bufferReadyValidSize;
 static std::thread* cupti_polling_thread;
 static bool cupti_polling_thread_done = false;
+static bool cupti_initialized = false;
 
 // Buffer Management Functions
 static void CUPTIAPI
@@ -333,7 +458,9 @@ BufferRequested(
     size_t *pSize,
     size_t *pMaxNumRecords)
 {
-    NVLOGI_FMT(TAG,"BufferRequested() entered");
+    static int request_count = 0;
+    request_count++;
+    NVLOGI_FMT(TAG,"BufferRequested [#{}] entered", request_count);
     const std::lock_guard<std::mutex> lock(g_cupti_helper_mutex);
 
     // This callback will be called from whatever thread made the CUDA API call
@@ -342,7 +469,7 @@ BufferRequested(
     // use previously allocated buffer to speedup high priority thread
     uint8_t *pBuffer = nullptr;
     int buf_idx = -1;
-    for (int k=0; k<MAX_BUFFERS; k++)
+    for (int k=0; k<g_cupti_num_buffers; k++)
     {
         if (pBufferEmpty[k] != nullptr)
         {
@@ -357,10 +484,15 @@ BufferRequested(
         NVLOGF_FMT(TAG,AERIAL_MEMORY_EVENT,"Unable to find pre-allocated cupti buffer");
     }
 
-    *pSize = BUF_SIZE;
+    *pSize = g_cupti_buffer_size;
     *ppBuffer = pBuffer;
     *pMaxNumRecords = 0;
-    NVLOGI_FMT(TAG,"BufferRequested: pBuffer={} [{}]",reinterpret_cast<void*>(pBuffer),buf_idx);
+    NVLOGI_FMT(TAG,"BufferRequested [#{}]: pBuffer={} [{}], size={}, maxNumRecords={}",
+               request_count,
+               reinterpret_cast<void*>(pBuffer),
+               buf_idx,
+               *pSize,
+               *pMaxNumRecords);
 }
 
 
@@ -369,14 +501,70 @@ void PrintActivityBuffer(uint8_t *pBuffer, size_t validBytes)
     CUpti_Activity *pRecord = NULL;
     CUptiResult status = CUPTI_SUCCESS;
 
+    static uint64_t total_records = 0;
+    static uint64_t external_correlation_records = 0;
+    
+    // Rate limiting: max prints per 100ms window
+    static constexpr uint64_t MAX_PRINTS_PER_WINDOW = MAX_ACTIVITY_PRINTS_PER_SECOND / 10;
+    static constexpr std::chrono::milliseconds WINDOW_DURATION{100};
+    
+    auto window_start = std::chrono::system_clock::now();
+    uint64_t prints_in_current_window = 0;
+    
+    // Console logging: start after 1 second, then every second
+    const auto buffer_start = std::chrono::system_clock::now();
+    auto last_console_log = buffer_start;
+    static constexpr std::chrono::seconds CONSOLE_LOG_INTERVAL{1};
+    static constexpr std::chrono::seconds CONSOLE_LOG_START_DELAY{1};
+    uint64_t records_in_current_buffer = 0;
+    
     do {
         status = cuptiActivityGetNextRecord(pBuffer, validBytes, &pRecord);
         if (status == CUPTI_SUCCESS)
         {
+            total_records++;
+            records_in_current_buffer++;
+            if (pRecord->kind == CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION)
+            {
+                external_correlation_records++;
+            }
+            
+            // Rate limiting: check if we need to wait for next window
+            if (prints_in_current_window >= MAX_PRINTS_PER_WINDOW)
+            {
+                const auto now = std::chrono::system_clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - window_start);
+                
+                if (elapsed < WINDOW_DURATION)
+                {
+                    // Sleep until next window starts
+                    const auto sleep_duration = WINDOW_DURATION - elapsed;
+                    std::this_thread::sleep_for(sleep_duration);
+                }
+                
+                // Start new window
+                window_start = std::chrono::system_clock::now();
+                prints_in_current_window = 0;
+            }
+            
             PrintActivity(pRecord);
+            prints_in_current_window++;
+            
+            // Periodic console logging
+            const auto now = std::chrono::system_clock::now();
+            const auto elapsed_since_start = std::chrono::duration_cast<std::chrono::seconds>(now - buffer_start);
+            const auto elapsed_since_last_log = std::chrono::duration_cast<std::chrono::seconds>(now - last_console_log);
+            
+            if (elapsed_since_start >= CONSOLE_LOG_START_DELAY && elapsed_since_last_log >= CONSOLE_LOG_INTERVAL)
+            {
+                NVLOGC_FMT(TAG, "PrintActivityBuffer processing: {} records processed, {} seconds elapsed", 
+                           records_in_current_buffer, elapsed_since_start.count());
+                last_console_log = now;
+            }
         }
         else if (status == CUPTI_ERROR_MAX_LIMIT_REACHED)
         {
+            //This is the normal condition that exits the loop
             break;
         }
         else
@@ -384,6 +572,9 @@ void PrintActivityBuffer(uint8_t *pBuffer, size_t validBytes)
             CUPTI_API_CALL(status);
         }
     } while (1);
+    
+    NVLOGI_FMT(TAG, "PrintActivityBuffer stats: total_records={}, external_correlation_records={}", 
+               total_records, external_correlation_records);
 }
 
 
@@ -396,6 +587,7 @@ BufferCompleted(
     size_t validSize)
 {
     static int first_time = 1;
+    static int completion_count = 0;
     if (first_time)
     {
         pthread_t my_pthread = pthread_self();
@@ -404,45 +596,60 @@ BufferCompleted(
         first_time = 0;
     }
 
-    NVLOGI_FMT(TAG, "BufferCompleted: pBuffer={} size={} validSize={}",reinterpret_cast<void*>(pBuffer),size,validSize);
+    completion_count++;
+    
+    // Check for dropped records
+    size_t dropped = 0;
+    CUPTI_API_CALL(cuptiActivityGetNumDroppedRecords(context, streamId, &dropped));
+    if (dropped > 0)
+    {
+        NVLOGW_FMT(TAG, "WARNING: {} CUPTI activity records were DROPPED!", dropped);
+    }
 
     // Place buffer on ready list
     bool bufferMoved = false;
-    if (1)
+    int buf_idx = -1;
     {
         const std::lock_guard<std::mutex> lock(g_cupti_helper_mutex);
-        for (int k=0; k<MAX_BUFFERS; k++)
+        for (int k=0; k<g_cupti_num_buffers; k++)
         {
             if (pBufferReady[k] == nullptr)
             {
                 pBufferReady[k] = pBuffer;
                 bufferReadyValidSize[k] = validSize;
                 bufferMoved = true;
+                buf_idx = k;
                 break; //out of for loop
             }
         }
     }
+    
+    NVLOGI_FMT(TAG, "BufferCompleted [#{}]: pBuffer={} [{}], size={} validSize={} ({}% full), dropped={}",
+               completion_count,
+               reinterpret_cast<void*>(pBuffer),
+               buf_idx,
+               size,
+               validSize,
+               (validSize * 100) / size,
+               dropped);
 
-    if (bufferMoved)
+    if (!bufferMoved)
     {
-        NVLOGI_FMT(TAG, "BufferCompleted return");
-    }
-    else
-    {
-        NVLOGF_FMT(TAG,AERIAL_MEMORY_EVENT,"Unable to allocate replacement cupti buffer");
+        NVLOGF_FMT(TAG,AERIAL_MEMORY_EVENT,"Unable to place completed buffer in ready queue - all slots full!");
     }
 }
 
 static CUpti_SubscriberHandle subscriber;
 static void CuptiCallbackHandler(void* pUserData, CUpti_CallbackDomain domain, CUpti_CallbackId callbackId, const void *pCallbackData)
 {
-    NVLOGI_FMT(TAG,"CuptiCallbackHandler: pUserData={} domain={} callbackId={}",pUserData,domain,callbackId);
+    NVLOGI_FMT(TAG,"CuptiCallbackHandler: pUserData={} domain={} callbackId={}",pUserData,static_cast<uint32_t>(domain),static_cast<uint32_t>(callbackId));
 }
 
 void printReadyBuffers()
 {
-    for (int k=0; k<MAX_BUFFERS; k++)
+    for (int k=0; k<g_cupti_num_buffers; k++)
     {
+        //Check if this buffer is ready to be printed
         uint8_t *pBuffer = nullptr;
         size_t validSize {0};
         if (pBufferReady[k] != nullptr)
@@ -453,30 +660,43 @@ void printReadyBuffers()
             bufferReadyValidSize[k] = 0;
             pBufferReady[k] = nullptr;
         }
+
+        //Print the buffer if it is ready to be printed
         if (validSize > 0)
         {
-            NVLOGI_FMT(TAG,"PrintActivityBuffer: pBuffer={} [{}]",reinterpret_cast<void*>(pBuffer),k);
+            NVLOGI_FMT(TAG,"PrintActivityBuffer: pBuffer={} [{}], validSize={}",reinterpret_cast<void*>(pBuffer),k,validSize);
             PrintActivityBuffer(pBuffer, validSize);
         }
+
+        //Clear the buffer if it is ready to be printed
         if (pBuffer)
         {
-            int buf_idx = -1;
-            memset(pBuffer,0,BUF_SIZE);
-            const std::lock_guard<std::mutex> lock(g_cupti_helper_mutex);
+            
+            //Clear the buffer
+            memset(pBuffer,0,g_cupti_buffer_size);
 
-            for (int n=0; n<MAX_BUFFERS; n++)
+            //Search empty list (list of buffers that are not in use) for a place to put the buffer
             {
-                if (pBufferEmpty[n] == nullptr)
+                const std::lock_guard<std::mutex> lock(g_cupti_helper_mutex);
+                int buf_idx = -1;
+                for (int n=0; n<g_cupti_num_buffers; n++)
                 {
-                    pBufferEmpty[n] = pBuffer;
-                    buf_idx = n;
-                    break; // out of for loop
+                    if (pBufferEmpty[n] == nullptr)
+                    {
+                        pBufferEmpty[n] = pBuffer;
+                        buf_idx = n;
+                        break; // out of for loop
+                    }
+                }
+
+                //Warn if there is no place to put the buffer
+                if (buf_idx == -1)
+                {
+                    NVLOGF_FMT(TAG,AERIAL_MEMORY_EVENT,"Unable to place activity buffer on empty list");
                 }
             }
-            if (buf_idx == -1)
-            {
-                NVLOGF_FMT(TAG,AERIAL_MEMORY_EVENT,"Unable to place activity buffer on empty list");
-            }
+
+            
         }
     }
 }
@@ -520,21 +740,41 @@ void launch_cupti_stats_polling_worker(int32_t cpu_core)
     }
 }
 
-void cuphy_cupti_helper_init()
+void cuphy_cupti_helper_init(uint64_t buffer_size, uint16_t num_buffers)
 {
     const std::lock_guard<std::mutex> lock(g_cupti_helper_mutex);
 
+    // Validate parameters
+    if (buffer_size == 0) {
+        NVLOGF_FMT(TAG, AERIAL_CONFIG_EVENT, "Invalid CUPTI buffer_size: 0");
+        exit(EXIT_FAILURE);
+    }
+    if (num_buffers == 0) {
+        NVLOGF_FMT(TAG, AERIAL_CONFIG_EVENT, "Invalid CUPTI num_buffers: 0");
+        exit(EXIT_FAILURE);
+    }
+
+    g_cupti_buffer_size = buffer_size;
+    g_cupti_num_buffers = num_buffers;
+
+    // Resize buffer tracking vectors
+    pBufferEmpty.resize(num_buffers, nullptr);
+    pBufferReady.resize(num_buffers, nullptr);
+    bufferReadyValidSize.resize(num_buffers, 0);
+
+    NVLOGI_FMT(TAG, "CUPTI init with buffer_size={} bytes, num_buffers={}", g_cupti_buffer_size, g_cupti_num_buffers);
+
     // allocate initial buffers (in the low priority thread)
-    for (int k=0; k<MAX_BUFFERS; k++)
+    for (int k=0; k<g_cupti_num_buffers; k++)
     {
         uint8_t *pBuffer;
-        CHECK_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&pBuffer), BUF_SIZE+ALIGN_SIZE, cudaHostAllocPortable));
+        CHECK_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&pBuffer), g_cupti_buffer_size+ALIGN_SIZE, cudaHostAllocPortable));
         if (pBuffer == nullptr)
         {
             NVLOGF_FMT(TAG,AERIAL_MEMORY_EVENT,"Unable to allocate initial cupti buffer");
         }
         pBufferEmpty[k] = ALIGN_BUFFER(pBuffer, ALIGN_SIZE);
-        memset(pBufferEmpty[k],0,BUF_SIZE);
+        memset(pBufferEmpty[k],0,g_cupti_buffer_size);
     }
 
     if (1)
@@ -566,45 +806,77 @@ void cuphy_cupti_helper_init()
     }
 
     CUPTI_API_CALL(cuptiSubscribe(&subscriber, CuptiCallbackHandler, NULL));
+    
+    // Runtime CUPTI version check
+    uint32_t cuptiVersion = 0;
+    CUPTI_API_CALL(cuptiGetVersion(&cuptiVersion));
+    NVLOGW_FMT(TAG, "CUPTI Runtime Version: {} ({})", cuptiVersion, GetCuptiVersionString(cuptiVersion));
+    
+#if defined(CUPTI_API_VERSION)
+    NVLOGW_FMT(TAG, "CUPTI Compile-Time API Version: {} ({})", 
+               static_cast<uint32_t>(CUPTI_API_VERSION), 
+               GetCuptiVersionString(static_cast<uint32_t>(CUPTI_API_VERSION)));
+#endif
+    
     CUPTI_API_CALL(cuptiActivityRegisterCallbacks(BufferRequested, BufferCompleted));
     CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_EXTERNAL_CORRELATION));
+    CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DEVICE));
     CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL));
-    CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME));
-    CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));
+    CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_RUNTIME));  // Required for EXTERNAL_CORRELATION
+    CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_DRIVER));   // Required for EXTERNAL_CORRELATION (app uses both APIs)
     // CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_GRAPH_TRACE));
+    
+    // Enable device graph tracing (CUDA 12.8+)
+    // This automatically enables CUPTI_ACTIVITY_KIND_DEVICE_GRAPH_TRACE
+    // CUPTI_API_CALL(cuptiActivityEnableDeviceGraph(1));
 
     //CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMORY));
+    // CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMORY2));
     //CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_ENVIRONMENT));
     //CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONTEXT));
-    //CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY));
+    // CUPTI_API_CALL(cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY));
 
-    //CUPTI_API_CALL(cuptiActivityFlushPeriod(10)); // time in ms
+    // CUPTI_API_CALL(cuptiActivityFlushPeriod(250)); // time in ms
 
     //Disable specific activity inherent in Aerial that overwhelms the output
     {
-        //There are many Aerial calls to cudaEventQuery
-        CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaEventQuery_v3020, 0));
-        CUPTI_API_CALL(cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuEventQuery, 0));
+        //Example of disabling cudaEventQuery only
+        // CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaEventQuery_v3020, 0));
+        // CUPTI_API_CALL(cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuEventQuery, 0));
 
-        //Enable only specific runtime API activity
+        //Disable all runtime API activity
         for (int k=1; k<CUPTI_RUNTIME_TRACE_CBID_SIZE; k++)
         {
             CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(k, 0));
         }
+        // Enable all cudaLaunchKernel variants
         CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000, 1));
+        CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_ptsz_v7000, 1));
+        CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_v11060, 1));
+        CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernelExC_ptsz_v11060, 1));
+        // Enable all cudaGraphLaunch variants
+        CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_v10000, 1));
+        CUPTI_API_CALL(cuptiActivityEnableRuntimeApi(CUPTI_RUNTIME_TRACE_CBID_cudaGraphLaunch_ptsz_v10000, 1));
 
-        //Enable only specific driver API activity
+        //Disable all driver API activity
         for (int k=1; k<CUPTI_DRIVER_TRACE_CBID_SIZE; k++)
         {
             CUPTI_API_CALL(cuptiActivityEnableDriverApi(k, 0));
         }
+        // Enable all cuLaunchKernel variants
         CUPTI_API_CALL(cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel, 1));
+        CUPTI_API_CALL(cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel_ptsz, 1));
+        CUPTI_API_CALL(cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx, 1));
+        CUPTI_API_CALL(cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx_ptsz, 1));
+        // Enable all cuGraphLaunch variants
         CUPTI_API_CALL(cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch, 1));
+        CUPTI_API_CALL(cuptiActivityEnableDriverApi(CUPTI_DRIVER_TRACE_CBID_cuGraphLaunch_ptsz, 1));
     }
 
 
     NVLOGW_FMT(TAG,"Intialized cuPHY CUPTI");
-    launch_cupti_stats_polling_worker(-1); 
+    launch_cupti_stats_polling_worker(-1);
+    cupti_initialized = true;
 }
 
 void cuphy_cupti_helper_flush()
@@ -615,9 +887,13 @@ void cuphy_cupti_helper_flush()
 
 void cuphy_cupti_helper_stop()
 {
+    if (!cupti_initialized) {
+        return;
+    }
     cuphy_cupti_helper_flush();
     cupti_polling_thread_done = true;
     int ret = pthread_join(cupti_polling_thread->native_handle(), NULL);
+    (void)ret; // suppress unused variable warning
 }
 
 void cuphy_cupti_helper_push_external_id(uint64_t id)
@@ -627,7 +903,7 @@ void cuphy_cupti_helper_push_external_id(uint64_t id)
 
 void cuphy_cupti_helper_pop_external_id()
 {
-    uint64_t id;
+    uint64_t id{};
     CUPTI_API_CALL(cuptiActivityPopExternalCorrelationId(CUPTI_EXTERNAL_CORRELATION_KIND_AERIAL, &id));
 }
 

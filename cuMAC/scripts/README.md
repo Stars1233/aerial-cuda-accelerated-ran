@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 **Aerial cuMAC Tests**
 
 All cuMAC Tests are included in the cumac_tests.sh. Current support cuMAC Multi-cell Scheduling for 4T4R and 64TR, SRS, DRL MCS selection, TDL and CDL tests.

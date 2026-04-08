@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,7 +41,7 @@ constexpr uint32_t kMaxPrbSize = 48;
 constexpr uint32_t kMaxSlotCount = ORAN_MAX_SLOT_X_SUBFRAME_ID * 4;
 constexpr uint32_t kMaxSectionNum = 273;
 constexpr uint8_t  kMaxNicsSupported = 2;
-constexpr uint8_t  kOrderEntityNum = 4;
+constexpr uint8_t  kOrderEntityNum = 16;
 
 static constexpr uint32_t ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM = 50; //50 is a safe number to assume?
 static constexpr uint32_t MAX_UPLANE_MSGS_PER_SLOT = (kMaxSectionNum * kMaxAntennas * ORAN_ALL_SYMBOLS);

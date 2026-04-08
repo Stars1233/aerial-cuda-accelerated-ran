@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,8 @@ namespace cumac {
 
 constexpr uint16_t VSIZE = 1024; // shared memory size used in type-1 allocation kernels
 
-#ifdef CUDA_ARCH_86_89
+// Architectures with higher register pressure need fewer blocks per SM
+#if defined(CUDA_ARCH_86_89) || defined(CUDA_ARCH_100_120_121)
 constexpr uint8_t MinBlkPerSM_ = 1;
 #else
 constexpr uint8_t MinBlkPerSM_ = 2;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #define PMU_READER
 
 #include <cstdint>
+#include <cerrno>
 #include <unistd.h>
 #include <asm/unistd.h>
 #include <sys/ioctl.h>
@@ -148,6 +149,18 @@ class PMUReaderCacheMissRatios : public PMUReader {
 //Single interface that computes delta and format results in a string
 class PMUDeltaSummarizer{
     public:
+    /**
+     * @brief Construct PMU delta summarizer and warm up counters.
+     *
+     * IMPORTANT: Must be constructed on the thread whose counters you want to
+     * measure. The underlying perf_event_open syscall uses pid=0 (calling thread).
+     * Counters attached here cannot be transferred to another thread.
+     *
+     * Performs one warmup recordStart()/recordStop() cycle to avoid cold-path
+     * overhead on the first real measurement.
+     *
+     * @param pmu_type PMU counter configuration (DISABLED, GENERAL, TOPDOWN, CACHE_METRICS)
+     */
     PMUDeltaSummarizer(PMU_TYPE pmu_type);
     ~PMUDeltaSummarizer();
     void recordStart();

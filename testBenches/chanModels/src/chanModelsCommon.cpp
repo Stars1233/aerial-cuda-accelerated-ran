@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,10 +56,10 @@ hid_t generate_native_HDF5_fp16_type()
  * @param fileId hdf5 file id
  * @param datasetName dataset name
  * @param dataType h5 compound data type, depending on __half2 or cuComplex
- * @param dataspaceId data sapce id
+ * @param dataspaceId data space id
  * @param dataGpu pointer to GPU data, data can be 1D array
- * @param dims dimentions of data
- * @param rank rand of dimension
+ * @param dims dimensions of data
+ * @param rank rank of dimension
  */
 template <typename T>
 void writeHdf5DatasetFromGpu(hid_t & fileId, const char * datasetName, hid_t & dataType, void * dataGpu, hsize_t * dims, uint8_t & rank)

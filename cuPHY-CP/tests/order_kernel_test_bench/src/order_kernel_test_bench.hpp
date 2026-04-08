@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -422,6 +422,7 @@ struct doca_gpu_eth_rxq *doca_rxq[UL_MAX_CELLS_PER_SLOT];
 uint32_t  max_rx_pkts;
 uint32_t  rx_pkts_timeout_ns;
 doca_gpu_semaphore_gpu_t *sem_gpu[UL_MAX_CELLS_PER_SLOT];
+struct aerial_fh_gpu_semaphore_gpu *sem_gpu_aerial_fh[UL_MAX_CELLS_PER_SLOT];
 uint64_t		slot_start[UL_MAX_CELLS_PER_SLOT];
 uint64_t		ta4_min_ns[UL_MAX_CELLS_PER_SLOT];
 uint64_t		ta4_max_ns[UL_MAX_CELLS_PER_SLOT];
@@ -468,6 +469,7 @@ typedef struct orderKernelTbInputParams{
     struct doca_gpu_eth_rxq *doca_rxq[UL_MAX_CELLS_PER_SLOT];
     doca_gpu_semaphore_gpu_t *sem_gpu[UL_MAX_CELLS_PER_SLOT];
     struct doca_gpu_semaphore_packet *pkt_info[UL_MAX_CELLS_PER_SLOT];
+    struct aerial_fh_gpu_semaphore_gpu *sem_gpu_aerial_fh[UL_MAX_CELLS_PER_SLOT];
     struct mlx5_cqe *cqe_addr[UL_MAX_CELLS_PER_SLOT];
     uint32_t* cq_db_rec[UL_MAX_CELLS_PER_SLOT];
     uint32_t* rq_db_rec[UL_MAX_CELLS_PER_SLOT];    

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include <getopt.h>
 #include <signal.h>
 
+#include <cinttypes>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -71,6 +72,11 @@ struct srs_slot_type_info {
     int txq_base_offset{};
     int64_t slot_time_offset_ns{};  //!< Time offset from s3's t0 (0 for s3, -500us for s4, -1000us for s5)
 };
+
+int get_txq_index(const ul_channel channel_type, const int launch_pattern_slot, const int symbol, const int16_t eaxcId_index,
+                  const int split_srs_txq, const int enable_srs_eaxcid_pacing,
+                  const srs_slot_type_info& srs_s3_info, const srs_slot_type_info& srs_s4_info, const srs_slot_type_info& srs_s5_info,
+                  const int srs_pacing_eaxcids_per_symbol, const int srs_pacing_eaxcids_per_tx_window);
 
 class RU_Emulator
 {
@@ -488,6 +494,33 @@ class RU_Emulator
         int tx_slot(slot_tx_info & slot_tx, int cell_index, tx_symbol_timers& timers, aerial_fh::TxqHandle* txqs, aerial_fh::TxRequestHandle* tx_request, bool enable_mmimo, perf_metrics::PerfMetricsAccumulator* profiler);
 
         /**
+         * C-plane-gated pre-computed TX path.  Iterates C-plane infos
+         * (like legacy tx_slot) but uses the pre-built cache for
+         * IQ pointer resolution, flow handles, TXQ indices, and TX
+         * timing offsets.  Section IDs, FSS, and slot_t0 come from
+         * the live C-plane messages, preserving correct DU timing.
+         *
+         * @param[in,out] slot_tx           Slot TX info with C-plane messages
+         * @param[in] cell_index            Cell identifier
+         * @param[in,out] timers            Timing metrics
+         * @param[in] txqs                  Transmit queue handles
+         * @param[in] tx_request            Transmit request handle
+         * @param[in] profiler              Performance metrics accumulator
+         * @return number of U-plane packets transmitted
+         */
+        int tx_slot_precomputed(slot_tx_info& slot_tx, int cell_index,
+                                tx_symbol_timers& timers,
+                                aerial_fh::TxqHandle* txqs,
+                                aerial_fh::TxRequestHandle* tx_request,
+                                perf_metrics::PerfMetricsAccumulator* profiler);
+
+        /**
+         * Build the pre-computed UL TX cache from launch patterns and TVs.
+         * Called once after test vectors are loaded and peers are configured.
+         */
+        void precompute_ul_tx_cache();
+
+        /**
          * Handle section type 1 C-plane message (UL/DL data channels)
          *
          * @param[in,out] c_plane_info C-plane packet information
@@ -566,6 +599,24 @@ class RU_Emulator
          * @param[in] cell_index Cell identifier
          */
         void increment_section_rx_counter_v2(oran_c_plane_info_t& c_plane_info, uint16_t cell_index);
+
+        /**
+         * @brief Classifies sections by PRB-range matching in SINGLE_SECT_MODE
+         *        and updates section RX counters.
+         *
+         * For SINGLE_SECT_MODE RU types, iterates each section in @p c_plane_info
+         * and reclassifies it as PUCCH / SRS / PUSCH via prb_range_matching(),
+         * updating both section_info and c_plane_info tv_object / channel_type
+         * before calling increment_section_rx_counter_v2().  For other RU types,
+         * calls increment_section_rx_counter_v2() directly.
+         *
+         * @param[in,out] c_plane_info  C-plane info whose sections may be reclassified.
+         * @param[in]     cell_index    Cell identifier.
+         *
+         * @see increment_section_rx_counter_v2
+         * @see prb_range_matching
+         */
+        inline void update_ul_throughput_counters(oran_c_plane_info_t& c_plane_info, uint16_t cell_index);
 
         /**
          * Process C-plane packet timing and update timing statistics
@@ -651,9 +702,10 @@ class RU_Emulator
          * @param[in] index_rx Index of current packet in burst
          * @param[in] rte_rx_time Receive timestamp
          * @param[in] mbuf_payload Pointer to packet payload
+         * @param[in] buffer_length Length of @p mbuf_payload in bytes
          * @param[in] cell_index Cell identifier
          */
-        void parse_c_plane(oran_c_plane_info_t& c_plane_info, int nb_rx, int index_rx, uint64_t rte_rx_time, uint8_t* mbuf_payload, int cell_index);
+        void parse_c_plane(oran_c_plane_info_t& c_plane_info, int nb_rx, int index_rx, uint64_t rte_rx_time, uint8_t* mbuf_payload, size_t buffer_length, int cell_index);
 
         /**
          * Parse all sections within a C-plane packet
@@ -932,6 +984,19 @@ class RU_Emulator
          */
         bool c_plane_channel_type_checking(oran_c_plane_info_t &c_plane_info, uint16_t cell_index, struct dl_tv_object& tv_obj);
 
+        using prb_map_t = std::array<std::array<bool, MAX_NUM_PRBS_PER_SYMBOL>, OFDM_SYMBOLS_PER_SLOT>;
+
+        /**
+         * Resolve the PRB allocation map for a given UL channel in the current slot/cell.
+         * Used to hoist the launch pattern lookup out of per-section loops.
+         *
+         * @param[in] c_plane_info C-plane packet information
+         * @param[in] cell_index Cell identifier
+         * @param[in] tv_obj UL test vector object
+         * @return Pointer to the prb_map, or nullptr if channel has no allocation in this slot/cell
+         */
+        const prb_map_t* resolve_prb_map(oran_c_plane_info_t &c_plane_info, uint16_t cell_index, struct ul_tv_object& tv_obj);
+
         /**
          * Determine channel type from C-plane packet properties
          *
@@ -1027,6 +1092,20 @@ class RU_Emulator
         void validate_dl_channels(uint8_t cell_index, uint8_t curr_launch_pattern_slot, const struct oran_packet_header_info &header_info, void *section_buffer, uint64_t &prev_pbch_time);
         bool u_plane_channel_type_checking(const struct oran_packet_header_info &header_info, uint16_t cell_index, struct dl_tv_object &tv_obj);
 
+        /** Validates that U-plane sectionId was announced in C-plane for the same slot/eAxC.
+         *
+         * Looks up the DL SlotSectionIdTracker for the packet's eAxC and verifies
+         * that the sectionId carried in the U-plane header was previously recorded
+         * by C-plane processing for the current slot. Silently skips the check when
+         * no tracker exists for the eAxC or when the tracker's slot does not match
+         * the packet's FSS (C-plane may not have arrived yet).
+         *
+         * @param[in] cell_index Cell identifier used for tracker lookup and logging.
+         * @param[in] header_info Parsed U-plane packet header containing sectionId,
+         *                        flowValue (eAxC ID), and FSS.
+         */
+        void validate_uplane_section_id_match(uint8_t cell_index, const struct oran_packet_header_info &header_info);
+
         /**
          * Verify extension type 11 (beamforming weights) in C-plane section
          *
@@ -1057,6 +1136,63 @@ class RU_Emulator
         void dynamic_beamid_validation(oran_c_plane_info_t &c_plane_info, int cell_index);
 
         /**
+         * Validates C-plane section IDs for default coupling (range and duplicate consistency) using the given DL tracker.
+         * @param[in,out] c_plane_info C-plane message info; sections and eAxC index used for lookup.
+         * @param[in] cell_index Cell index for tracker and counters.
+         * @param[in,out] tracker Slot section ID tracker for this eAxC (DL).
+         */
+        void validate_section_id_default_coupling(oran_c_plane_info_t& c_plane_info, int cell_index,
+                                                  SlotSectionIdTracker& tracker);
+
+        /**
+         * Template implementation: validates C-plane section IDs for default coupling against a range-based tracker.
+         * @tparam N Number of section IDs in the tracker range.
+         * @tparam BASE Base (start) section ID of the tracker range.
+         * @param[in,out] c_plane_info C-plane message info; sections and eAxC index used for lookup.
+         * @param[in] cell_index Cell index for tracker and counters.
+         * @param[in,out] tracker Slot section ID tracker (range [BASE, BASE+N)) for this eAxC.
+         */
+        template <size_t N, uint16_t BASE>
+        void validate_section_id_default_coupling_impl(oran_c_plane_info_t& c_plane_info, int cell_index,
+                                                       SlotSectionIdTrackerRange<N, BASE>& tracker);
+        /**
+         * Validates every C-plane section ID in c_plane_info against the tracker range and duplicate-citation consistency.
+         * @tparam N Number of section IDs in the tracker range.
+         * @tparam BASE Base (start) section ID of the tracker range.
+         * @param[in,out] c_plane_info C-plane message info; section list and eAxC/slot data.
+         * @param[in] cell_index Cell index for logging and counters.
+         * @param[in,out] tracker Slot section ID tracker (range [BASE, BASE+N)) for this eAxC.
+         */
+        template <size_t N, uint16_t BASE>
+        void validate_section_id_sections_only_impl(oran_c_plane_info_t& c_plane_info, int cell_index,
+                                                    SlotSectionIdTrackerRange<N, BASE>& tracker);
+
+        /**
+         * Validates DL C-plane section IDs (default coupling): range check and duplicate consistency.
+         * @param[in,out] c_plane_info C-plane message info; must have valid eAxC index.
+         * @param[in] cell_index Cell index for tracker and counters.
+         */
+        void sid_dl_validate(oran_c_plane_info_t& c_plane_info, int cell_index);
+        /**
+         * Validates UL C-plane section IDs per channel (PRACH/SRS/PUSCH-PUCCH) using upstream channel_type and trackers.
+         * @param[in,out] c_plane_info C-plane message info; channel_type and eaxcId_index set by find_channel_type/find_eAxC_index.
+         * @param[in] cell_index Cell index for tracker and counters.
+         * @return true if validation passed or packet has 0 sections; false on invalid eAxC, out-of-range, or section ID mismatch.
+         */
+        bool sid_real_ul(oran_c_plane_info_t& c_plane_info, int cell_index);
+
+        template <size_t N, uint16_t BASE>
+        bool sid_real_ul_one_channel_impl(oran_c_plane_info_t& c_plane_info, int cell_index, uint16_t first_sid,
+                                          std::vector<SlotSectionIdTrackerRange<N, BASE>>& vec,
+                                          int mtx_type, const char* channel_name);
+        bool sid_real_ul_one_channel(oran_c_plane_info_t& c_plane_info, int cell_index, uint16_t first_sid);
+
+        /**
+         * Initializes section ID validation state (DL and UL tracker vectors and sizes); called from apply_configs().
+         */
+        void sectionid_validation_init();
+
+        /**
          * Validate modulation and compression parameters in C-plane section
          *
          * @param[in] c_plane_info C-plane packet information
@@ -1071,8 +1207,39 @@ class RU_Emulator
          *
          * @param[in] c_plane_info C-plane packet information
          * @param[in] cell_index Cell identifier
+         * @param[in] is_pdsch_included Pre-computed flag indicating PDSCH PRB overlap with this C-plane message
          */
-        void validate_remask(oran_c_plane_info_t& c_plane_info, int cell_index);
+        void validate_remask(oran_c_plane_info_t& c_plane_info, int cell_index, bool is_pdsch_included);
+
+        /**
+         * Validate a single CSI-RS section's beam ID against non-ZP CSI-RS beam ID sets.
+         * Uses modulo indexing (ap_idx % beams_array_size) to derive the expected beam ID.
+         *
+         * @param[in] csirs_beam_id_sets Pointer to resolved CSI-RS beam ID sets (TRS + NZP); nullptr skips validation
+         * @param[in,out] c_plane_info C-plane info with section data
+         * @param[in] sec_idx Section index to validate
+         * @param[in] num_dl_flows Number of DL eAxC flows
+         * @param[in] cell_index Cell identifier
+         */
+        void validate_dl_beamid_csirs(const std::vector<std::vector<uint16_t>>* csirs_beam_id_sets,
+                                      oran_c_plane_info_t& c_plane_info, int sec_idx,
+                                      size_t num_dl_flows, int cell_index);
+
+        /**
+         * Validate a single non-CSI-RS section's beam ID (PDSCH/PBCH/PDCCH).
+         * PBCH uses membership check; PDSCH/PDCCH uses positional division mapping.
+         *
+         * @param[in] non_csirs_beam_ids Pointer to the expected beam ID vector
+         * @param[in] non_csirs_is_pbch Whether the matched channel is PBCH/SSB
+         * @param[in,out] c_plane_info C-plane info with section data
+         * @param[in] sec_idx Section index to validate
+         * @param[in] num_dl_flows Number of DL eAxC flows
+         * @param[in] cell_index Cell identifier
+         */
+        void validate_dl_beamid_non_csirs(const std::vector<uint16_t>* non_csirs_beam_ids,
+                                          bool non_csirs_is_pbch,
+                                          oran_c_plane_info_t& c_plane_info, int sec_idx,
+                                          size_t num_dl_flows, int cell_index);
 
         /**
          * Verify downlink C-plane packet content against test vectors
@@ -1268,6 +1435,7 @@ class RU_Emulator
         int opt_dl_enabled;                              //!< Enable downlink data processing (PDSCH/PBCH/PDCCH/CSI-RS)
         int opt_dlc_tb;                                  //!< Enable DL C-plane transport block mode (skip IQ validation, buffer is nullptr)
         int opt_mod_comp_enabled;                        //!< Enable modulation compression for IQ data
+        int opt_non_mod_comp_enabled;                    //!< Enable BFP/FIX_POINT for IQ data
         
         // Core and thread assignment
         int opt_low_priority_core;                       //!< CPU core ID for low-priority background tasks
@@ -1293,6 +1461,7 @@ class RU_Emulator
         int opt_symbol_offset_us;                        //!< Symbol timing offset in microseconds
         int opt_validate_dl_timing;                      //!< Enable downlink packet timing validation against ORAN windows
         int opt_dl_warmup_slots;                         //!< Number of warmup slots before starting DL validation
+        int opt_ul_warmup_slots;                         //!< Number of warmup slots before starting UL validation
         int opt_timing_histogram;                        //!< Enable timing histogram collection for distribution analysis
         int opt_timing_histogram_bin_size;               //!< Histogram bin size in nanoseconds
         
@@ -1307,18 +1476,22 @@ class RU_Emulator
         int opt_bfw_dl_validation;                       //!< Enable downlink beamforming weight validation
         int opt_bfw_ul_validation;                       //!< Enable uplink beamforming weight validation
         int opt_beamforming;                             //!< Enable beamforming weight processing
+        int opt_beamid_validation;                       //!< Enable 4T4R beam ID validation against test vectors
+        int opt_sectionid_validation;                    //!< Enable C-plane/U-plane sectionId cross-validation
         int opt_dl_approx_validation;                    //!< Enable approximate IQ comparison with tolerance (vs exact match)
         int opt_debug_u_plane_threshold;                 //!< U-plane debug print threshold for packet count
         int opt_debug_u_plane_prints;                    //!< Enable detailed U-plane debug prints
         
         // Advanced features
         int opt_enable_mmimo;                            //!< Enable massive MIMO mode (multiple cores per cell)
+        int opt_min_ul_cores_per_cell_mmimo;             //!< Minimum number of UL cores per cell for mMIMO (default: 3)
         int opt_enable_beam_forming;                     //!< Enable beamforming weight processing and validation
         int opt_enable_cplane_worker_tracing;            //!< Enable detailed C-plane worker thread tracing
         int opt_drop_packet_every_ten_secs;              //!< Intentionally drop packets every 10 seconds (for robustness testing)
         int opt_enable_dl_proc_mt;                       //!< Enable multi-threaded downlink processing
         int opt_ul_only;                                 //!< Uplink-only mode (no DL processing, TX-only)
-        
+        int opt_enable_precomputed_tx = 0;               //!< Pre-compute UL TX messages from launch pattern at init
+
         // DL processing configuration
         float opt_num_flows_per_dl_thread;               //!< Number of flows (eAxC IDs) per DL processing thread
         
@@ -1376,6 +1549,7 @@ class RU_Emulator
         std::vector<struct cell_config> cell_configs;           //!< Per-cell configuration (indexed by eth addr)
         std::vector<std::string> nic_interfaces;                //!< List of NIC interface names (PCIe addresses)
         std::vector<int> ul_core_list;                          //!< CPU core IDs for uplink worker threads
+        std::vector<int> ul_srs_core_list;                      //!< CPU core IDs for SRS uplink worker threads
         std::vector<int> dl_core_list;                          //!< CPU core IDs for downlink worker threads
         std::vector<int> dl_rx_core_list;                       //!< CPU core IDs for DL RX worker threads (multi-threaded mode)
         int opt_standalone_core_id;                             //!< CPU core ID for standalone mode
@@ -1652,6 +1826,12 @@ class RU_Emulator
         bool enable_srs;                             //!< SRS enabled flag
 
         /////////////////////////////////////////////////////
+        //// PRE-COMPUTED UL TX CACHE
+        /////////////////////////////////////////////////////
+        // precomputed_tx_cache[launch_pattern_slot][cell_index] -> list of eAxC TX entries
+        std::vector<std::vector<PrecomputedSlotCellTx>> precomputed_tx_cache;
+
+        /////////////////////////////////////////////////////
         //// DOWNLINK TEST VECTOR OBJECTS
         /////////////////////////////////////////////////////
         dl_tv_object pdsch_object;                   //!< PDSCH test vectors and validation counters
@@ -1712,6 +1892,24 @@ class RU_Emulator
         std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> error_dl_section_counters;   //!< DL C-plane sections with validation errors (opt_dlc_tb mode)
         std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> total_ul_section_counters;   //!< Total UL C-plane sections processed (opt_dlc_tb mode)
         std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> error_ul_section_counters;   //!< UL C-plane sections with validation errors (opt_dlc_tb mode)
+
+        /** UL uses separate tracker vectors per channel so section ID ranges/sizes match DU-side
+         *  (cuphydriver / FH) channel-specific start indices and limited section counts. */
+        struct SectionIdTrackerStorage
+        {
+            std::array<std::vector<SlotSectionIdTracker>, MAX_CELLS_PER_SLOT> dl;
+            std::array<std::vector<SlotSectionIdTrackerPuschPucch>, MAX_CELLS_PER_SLOT> ul_pusch_pucch;
+            std::array<std::vector<SlotSectionIdTrackerPrach>, MAX_CELLS_PER_SLOT> ul_prach;
+            std::array<std::vector<SlotSectionIdTrackerSrs>, MAX_CELLS_PER_SLOT> ul_srs;
+            std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> error_dl_uplane{};
+        };
+        std::unique_ptr<SectionIdTrackerStorage> section_id_trackers;
+
+        // 4T4R beam ID validation counters
+        std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> beamid_dl_error_counters{};  //!< DL beam ID mismatch errors per cell
+        std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> beamid_ul_error_counters{};  //!< UL beam ID mismatch errors per cell
+        std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> beamid_dl_total_counters{};  //!< Total DL beam IDs checked per cell
+        std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> beamid_ul_total_counters{};  //!< Total UL beam IDs checked per cell
 
         /////////////////////////////////////////////////////
         //// eCPRI SEQUENCE ID TRACKING

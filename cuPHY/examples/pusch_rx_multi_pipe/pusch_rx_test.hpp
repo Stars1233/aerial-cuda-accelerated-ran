@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -64,8 +64,8 @@ public:
 
     PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool useCuCtxs, cudaStream_t& delayCuStrm, std::vector<int>& cuStrmPrios,
                 bool& startSyncPt, std::mutex& cvStartSyncPtMutex, std::condition_variable& cvStartSyncPt, std::atomic<std::uint32_t>& atmSyncPtWaitCnt,
-                std::vector<uint32_t>& mpsActiveThrdPcts, uint32_t harq_attempts, uint32_t ldpcLaunchMode, bool drmDebug, bool debug, bool debugEqualizer,
-                bool useGreenCtx);
+                std::vector<uint32_t>& mpsActiveThrdPcts, uint32_t harq_attempts, uint32_t ldpcLaunchMode, uint32_t nMaxLdpcHetConfigs, bool drmDebug,
+                bool debug, bool debugEqualizer, bool useGreenCtx, uint8_t nMaxTbPerNode);
     PuschRxTest(PuschRxTest const&) = delete;
     PuschRxTest& operator=(PuschRxTest const&) = delete;
     ~PuschRxTest();
@@ -107,6 +107,8 @@ private:
     std::vector<int> m_gpuIds;
 
     cuphyPuschLdpcKernelLaunch_t m_ldpcLaunchMode;
+    uint32_t m_nMaxLdpcHetConfigs;
+    uint8_t  m_nMaxTbPerNode   = 1;
 
     bool     m_debug           = false;
     bool     m_enableNvProf    = false;

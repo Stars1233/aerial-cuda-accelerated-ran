@@ -56,6 +56,7 @@ SlotMapDl::SlotMapDl(phydriver_handle _pdh, uint64_t _id, uint8_t _enableBatched
     atom_fhcb_done.store(false);
     atom_dlc_done.store(0);
     atom_uplane_prep_done.store(0);
+    atom_cplane_done_mask.store(0);
 
     atom_dl_cplane_start    = 0;
     atom_dl_end_threads     = 0;
@@ -150,6 +151,24 @@ void SlotMapDl::incDLCDone() {
 
 void SlotMapDl::incUplanePrepDone() {
     std::atomic_fetch_add(&(atom_uplane_prep_done), 1);
+}
+
+void SlotMapDl::setCplaneDoneForTask(const int task_num) {
+    const uint32_t mask = 1U << task_num;
+    atom_cplane_done_mask.fetch_or(mask);
+}
+
+int SlotMapDl::waitCplaneDoneForTask(const int task_num) {
+    const uint32_t mask = 1U << task_num;
+    t_ns start_wait = Time::nowNs();
+    do {
+        if (Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2)) {
+            NVLOGI_FMT(TAG, "waitCplaneDoneForTask for Map {} task {} is taking more than {} ns", getId(), task_num, (GENERIC_WAIT_THRESHOLD_NS * 2));
+            return -1;
+        }
+    } while ((atom_cplane_done_mask.load() & mask) == 0);
+
+    return 0;
 }
 
 int SlotMapDl::waitDLCDone(int num_dlc_tasks) {
@@ -403,6 +422,7 @@ int SlotMapDl::release(int num_cells)
     }
     atom_dlc_done.store(0);
     atom_uplane_prep_done.store(0);
+    atom_cplane_done_mask.store(0);
 
     atom_dl_cplane_start    = 0;
     atom_dl_end_threads     = 0;
@@ -586,6 +606,7 @@ void SlotMapDl::printTimes()
 
     if (aggr_pdsch != nullptr) {
         NVLOGI_FMT(TAG, "[PHYDRV] SFN {}.{} PDSCH Aggr {:x} Map {} times ===> "
+            "[PDSCH H2D Copy] {{ DURATION: {:.2f} us }} "
             "[CPU CUDA Setup] {{ START: {} END: {} DURATION: {} us Setup STATUS: {} }} "
             "[CPU CUDA Run] {{ START: {} END: {} DURATION: {} us Run STATUS: {} }} "
             "[GPU Setup] {{ DURATION: {:.2f} us }} "
@@ -593,6 +614,7 @@ void SlotMapDl::printTimes()
             "[Max GPU Time] {{ START: {} END: {} DURATION: {} us }} "
             "[CPU wait GPU Time] {{ START: {} END: {} DURATION: {} us }}",
             sfn, slot, aggr_pdsch->getId(), getId(),
+            aggr_pdsch->getPdschH2DCopyTime(static_cast<uint8_t>(slot)),
             timings.start_t_dl_pdsch_setup[0].count(), timings.end_t_dl_pdsch_setup[0].count(), Time::NsToUs(timings.end_t_dl_pdsch_setup[0] - timings.start_t_dl_pdsch_setup[0]).count(), +aggr_pdsch->getSetupStatus(),
             timings.start_t_dl_pdsch_run[0].count(), timings.end_t_dl_pdsch_run[0].count(), Time::NsToUs(timings.end_t_dl_pdsch_run[0] - timings.start_t_dl_pdsch_run[0]).count(), +aggr_pdsch->getRunStatus(),
             (aggr_pdsch->getSetupStatus()==CH_SETUP_DONE_NO_ERROR)?aggr_pdsch->getGPUSetupTime():0,

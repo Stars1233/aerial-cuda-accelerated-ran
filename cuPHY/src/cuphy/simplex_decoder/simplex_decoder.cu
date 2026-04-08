@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,8 +32,7 @@ const int SIMPLEX_DECODER_TPB = 32;
 // The use of cuda::memcpy_async, cuda::pipeline, and cuda::barrier should be disabled for A100 GPU 
 // because under the Ampere architecture, there's a potential issue with the wait/arrive logic of CUDA barriers, 
 // which will cause errors/CICD failures when testing with the compute-sanitizer synccheck tool.
-// For more info refer to NVBUG: https://nvbugswb.nvidia.com/NvBugs5/SWBug.aspx?bugid=4114257&cmtNo=
-// and JIRA BUG: https://jirasw.nvidia.com/browse/DTCS-1070
+// For more info refer to NVBUG-4114257 and JIRA BUG DTCS-1070
 // To re-enable the use of cuda::memcpy_async and cuda::pipeline for Simplex decoder, uncomment the following definition (keep it commented out for A100):
 
 // #define USE_ASYNC
@@ -226,6 +225,10 @@ __global__ void simplex_decoder_kernel(simplexDecoderDynDescr_t* pDynDescr)
         {
             uint32_t maxBitsPerCw = 3 * pCwPrmsGpu[blockIdx.x].nBitsPerQam;
             E_clipped = maxBitsPerCw * (SIMPLEX_DECODER_MAX_E / maxBitsPerCw);
+            if (cta.thread_rank() == 0)
+            {
+                printf("WARNING: E_clipped (=%d) exceeded max E (=%d)\n", E_clipped, SIMPLEX_DECODER_MAX_E);
+            }
         }
         cuda::memcpy_async(cta, s_in[0], pCwPrmsGpu[blockIdx.x].d_LLRs, sizeof(T)*E_clipped, pipeline);
         pipeline.producer_commit();
@@ -249,6 +252,10 @@ __global__ void simplex_decoder_kernel(simplexDecoderDynDescr_t* pDynDescr)
                     {
                         uint32_t maxBitsPerCw = 3 * pCwPrmsGpu[cw+gridDim.x].nBitsPerQam;
                         E_clipped = maxBitsPerCw * (SIMPLEX_DECODER_MAX_E / maxBitsPerCw);
+                        if (cta.thread_rank() == 0)
+                        {
+                            printf("WARNING: E_clipped (=%d) exceeded max E (=%d)\n", E_clipped, SIMPLEX_DECODER_MAX_E);
+                        }
                     }
                     cuda::memcpy_async(cta, s_in[(wp++) % 2], pCwPrmsGpu[cw+gridDim.x].d_LLRs, sizeof(T)*E_clipped, pipeline);
                     pipeline.producer_commit();
@@ -265,6 +272,10 @@ __global__ void simplex_decoder_kernel(simplexDecoderDynDescr_t* pDynDescr)
             {
                 uint32_t maxBitsPerCw = 3 * pCwPrmsGpu[cw].nBitsPerQam;
                 E_clipped = maxBitsPerCw * (SIMPLEX_DECODER_MAX_E / maxBitsPerCw);
+                if (cta.thread_rank() == 0)
+                {
+                    printf("WARNING: E_clipped (=%d) exceeded max E (=%d)\n", E_clipped, SIMPLEX_DECODER_MAX_E);
+                }
             }
             float confLevelFloat;
             simplex_decode_core(cw, cta, s_in[(rp++) % 2], pCwPrmsGpu[cw].d_cbEst, pCwPrmsGpu[cw].K, E_clipped, pCwPrmsGpu[cw].nBitsPerQam, &confLevelFloat);
@@ -314,8 +325,20 @@ __global__ void simplex_decoder_kernel(simplexDecoderDynDescr_t* pDynDescr)
 #else
         if(pCwPrmsGpu[cw].exitFlag == 0)
         {
+            // Clip E to avoid shared memory buffer overflow
+            uint32_t E_clipped = pCwPrmsGpu[cw].E;
+            if(E_clipped > SIMPLEX_DECODER_MAX_E)
+            {
+                uint32_t maxBitsPerCw = 3 * pCwPrmsGpu[cw].nBitsPerQam;
+                E_clipped = maxBitsPerCw * (SIMPLEX_DECODER_MAX_E / maxBitsPerCw);
+                if (cta.thread_rank() == 0)
+                {
+                    printf("WARNING: E_clipped (=%d) exceeded max E (=%d)\n", E_clipped, SIMPLEX_DECODER_MAX_E);
+                }
+            }
+
             // Cooperative load codeword
-            for (int e=cta.thread_rank(); e<pCwPrmsGpu[cw].E; e+=cta.size())
+            for (int e=cta.thread_rank(); e<E_clipped; e+=cta.size())
             {
                 s_in[e] = pCwPrmsGpu[cw].d_LLRs[e];
             }
@@ -323,7 +346,7 @@ __global__ void simplex_decoder_kernel(simplexDecoderDynDescr_t* pDynDescr)
 
             // Decode codeword
             float confLevelFloat;
-            simplex_decode_core(cw, cta, s_in, pCwPrmsGpu[cw].d_cbEst, pCwPrmsGpu[cw].K, pCwPrmsGpu[cw].E, pCwPrmsGpu[cw].nBitsPerQam, &confLevelFloat);
+            simplex_decode_core(cw, cta, s_in, pCwPrmsGpu[cw].d_cbEst, pCwPrmsGpu[cw].K, E_clipped, pCwPrmsGpu[cw].nBitsPerQam, &confLevelFloat);
 
             if(cta.thread_rank() == 0)
             {

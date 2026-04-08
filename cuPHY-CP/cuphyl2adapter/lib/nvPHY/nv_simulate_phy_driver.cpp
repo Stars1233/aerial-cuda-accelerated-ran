@@ -535,7 +535,7 @@ void SimulatePhyDriver::send_uci_indications(slot_indication& si, cell_sub_comma
 
         NVLOGI_FMT(TAG, "{}: callback PHY_UL_HARQ_INDICATION cell={} nF0Ucis={} nF1Ucis={}", __FUNCTION__, params->cell_index_list[0], params->grp_dyn_pars.nF0Ucis, params->grp_dyn_pars.nF1Ucis);
 
-        ul_cb.uci_cb_fn2(si, *params, pucchOut);
+        ul_cb.uci_cb_fn2(ul_cb.uci_cb_fn2_context, si, *params, pucchOut);
     }
     else if(ul_cb.uci_cb_fn)
     {
@@ -659,7 +659,7 @@ int SimulatePhyDriver::onSlotTask(SlotTask* task)
                 puschDataOut.totNumUciSegs = 0;
             }
 
-            ul_cb.callback_fn(0, buf, si, *pusch, &puschDataOut, &puschStatPrms);
+            ul_cb.callback_fn(ul_cb.callback_fn_context, 0, buf, si, *pusch, &puschDataOut, &puschStatPrms);
         }
         if(channel == channel_type::PUCCH)
         {
@@ -669,7 +669,7 @@ int SimulatePhyDriver::onSlotTask(SlotTask* task)
                 break;
             }
             printParameters(pucch, &pucchDataOut);
-            ul_cb.uci_cb_fn2(si, *pucch, pucchDataOut);
+            ul_cb.uci_cb_fn2(ul_cb.uci_cb_fn2_context, si, *pucch, pucchDataOut);
         }
         if(channel == channel_type::SRS)
         {
@@ -681,7 +681,7 @@ int SimulatePhyDriver::onSlotTask(SlotTask* task)
             }
             //printParameters(srs, &srsDataOut);
             std::array<bool,UL_MAX_CELLS_PER_SLOT> srs_order_cell_timeout_list = {false};
-            ul_cb.srs_cb_fn (buf, si, *srs, &srsDataOut, &srsStatPrms,srs_order_cell_timeout_list);
+            ul_cb.srs_cb_fn(ul_cb.srs_cb_context, buf, si, *srs, &srsDataOut, &srsStatPrms, srs_order_cell_timeout_list);
         }
 
         if(channel == channel_type::PDSCH)
@@ -694,7 +694,7 @@ int SimulatePhyDriver::onSlotTask(SlotTask* task)
             }
             NVLOGD_FMT(TAG, "{}: slot={} channel={}-{} pdsch_params={}", __FUNCTION__, si.slot_, cgc.channel_array_size, +channel, reinterpret_cast<void*>(cgc.pdsch.get()));
             //dl_cb.callback_fn(si);
-            dl_cb.callback_fn(dlParam);
+            dl_cb.callback_fn(dl_cb.callback_fn_context, dlParam);
             printParameters(&(dlParam->cell_grp_info));
         }
     }
@@ -731,7 +731,7 @@ int SimulatePhyDriver::onSlotTask(SlotTask* task)
                     {
                         puschDataOut.pStartOffsetsTbCrc[i] = i;
                     }
-                    ul_cb.callback_fn(0, buf, si, *pusch, &puschDataOut, &puschStatPrms);
+                    ul_cb.callback_fn(ul_cb.callback_fn_context, 0, buf, si, *pusch, &puschDataOut, &puschStatPrms);
                     printParameters(&pusch->cell_grp_info);
                 }
                 if(channel == channel_type::PRACH)
@@ -745,7 +745,7 @@ int SimulatePhyDriver::onSlotTask(SlotTask* task)
                     float    interference            = 0;
 
                     slot_command_api::prach_params* params = csc.get_prach_params();
-                    ul_cb.prach_cb_fn(si, *params, (const unsigned int*)&num_detectedPrmb, (const void*)&prmbIndex_estimates, (const void*)&prmbDelay_estimates, (const void*)&prmbPower_estimates, (const void*)&rssi, (const void*)&ant_rssi, (const void*)&interference);
+                    ul_cb.prach_cb_fn(ul_cb.prach_cb_context, si, *params, (const unsigned int*)&num_detectedPrmb, (const void*)&prmbIndex_estimates, (const void*)&prmbDelay_estimates, (const void*)&prmbPower_estimates, (const void*)&rssi, (const void*)&ant_rssi, (const void*)&interference);
                 }
 
                 if(channel == channel_type::PUCCH)

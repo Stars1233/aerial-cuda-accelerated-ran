@@ -8,6 +8,7 @@
   "configurePresets": [
     {
       "name": "minimal-base",
+      "generator": "Ninja",
       "hidden": true,
       "description": "Base minimal configuration - use minimal-x86 or minimal-arm instead",
       "binaryDir": "${sourceDir}/build-minimal",

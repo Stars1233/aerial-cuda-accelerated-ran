@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,13 +36,31 @@ bool compareCpuGpuAllocSol(cumac::cumacSubcontext* subcontextGpu, cumac::cumacSu
     bool matchLayerSel  = true;
     bool matchMcsSel    = true;
 
-    if (modulesCalled[0] == 1) { // UE selection
-        uint16_t* setSchdUePerCellTTI = new uint16_t[subcontextGpu->cellGrpPrmsGpu->nUe];
-        CUDA_CHECK_ERR(cudaMemcpy(setSchdUePerCellTTI, subcontextGpu->schdSolGpu->setSchdUePerCellTTI, sizeof(uint16_t)*subcontextGpu->cellGrpPrmsGpu->nUe, cudaMemcpyDeviceToHost)); 
+    if (modulesCalled[0] == 1) { // UE selection, compare UE selection solutions for each cell. Order of selected UEs in each cell can be different.
+        uint16_t nUe = subcontextGpu->cellGrpPrmsGpu->nUe;
+        uint16_t nCell = subcontextGpu->cellGrpPrmsGpu->nCell;
+        uint8_t  nUePerCell = subcontextGpu->cellGrpPrmsGpu->numUeSchdPerCellTTI;
 
-        for (int uIdx = 0; uIdx<subcontextGpu->cellGrpPrmsGpu->nUe; uIdx++) {
-            if (subcontextCpu->schdSolCpu->setSchdUePerCellTTI[uIdx] != setSchdUePerCellTTI[uIdx]) {
+        uint16_t* setSchdUePerCellTTI = new uint16_t[nUe];
+        CUDA_CHECK_ERR(cudaMemcpy(setSchdUePerCellTTI, subcontextGpu->schdSolGpu->setSchdUePerCellTTI, sizeof(uint16_t)*nUe, cudaMemcpyDeviceToHost));
+
+        for (int cIdx = 0; cIdx < nCell; cIdx++) {
+            int offset = cIdx * nUePerCell;
+
+            std::vector<uint16_t> cpuSet(subcontextCpu->schdSolCpu->setSchdUePerCellTTI + offset,
+                                         subcontextCpu->schdSolCpu->setSchdUePerCellTTI + offset + nUePerCell);
+            std::vector<uint16_t> gpuSet(setSchdUePerCellTTI + offset,
+                                         setSchdUePerCellTTI + offset + nUePerCell);
+
+            std::sort(cpuSet.begin(), cpuSet.end());
+            std::sort(gpuSet.begin(), gpuSet.end());
+
+            if (cpuSet != gpuSet) {
                 matchUeSel = false;
+                printf("Failure: CPU and GPU UE selection mismatch at cell %d\n", cIdx);
+                for (int uIdx = 0; uIdx < nUePerCell; uIdx++) {
+                    printf("  cell %d, uIdx %d: CPU = %d, GPU = %d\n", cIdx, uIdx, cpuSet[uIdx], gpuSet[uIdx]);
+                }
                 break;
             }
         }
@@ -52,7 +70,7 @@ bool compareCpuGpuAllocSol(cumac::cumacSubcontext* subcontextGpu, cumac::cumacSu
         } else {
             printf("Failure: CPU and GPU UE selection solutions do not match\n");
         }
-        delete setSchdUePerCellTTI;
+        delete[] setSchdUePerCellTTI;
     }
 
     if (modulesCalled[1] == 1) { // PRG allocation
@@ -80,7 +98,7 @@ bool compareCpuGpuAllocSol(cumac::cumacSubcontext* subcontextGpu, cumac::cumacSu
         } else {
             printf("Failure: CPU and GPU PRG allocation solutions do not match\n");
         }
-        delete allocSol;
+        delete[] allocSol;
     }
 
     if (modulesCalled[2] == 1) { // layer selection
@@ -99,7 +117,7 @@ bool compareCpuGpuAllocSol(cumac::cumacSubcontext* subcontextGpu, cumac::cumacSu
         } else {
             printf("Failure: CPU and GPU layer selection solutions do not match\n");
         }
-        delete layerSelSol;
+        delete[] layerSelSol;
     }
 
     if (modulesCalled[3] == 1) { // MCS selection
@@ -118,7 +136,7 @@ bool compareCpuGpuAllocSol(cumac::cumacSubcontext* subcontextGpu, cumac::cumacSu
         } else {
             printf("Failure: CPU and GPU MCS selection solutions do not match\n");
         }
-        delete mcsSelSol;
+        delete[] mcsSelSol;
     }
 
     return matchUeSel & matchPrg & matchLayerSel & matchMcsSel ;

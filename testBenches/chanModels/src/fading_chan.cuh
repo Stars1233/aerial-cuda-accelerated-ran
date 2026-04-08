@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,9 @@
 #include "./tdl_chan_src/tdl_chan.cuh"
 #include "./cdl_chan_src/cdl_chan.cuh"
 #include "gauNoiseAdder.cuh"
+// Only remaining header from cuPHY tree (cuPHY/examples/common/hdf5hpp.hpp).
+// Header-only HDF5 C++ wrapper; no transitive cuPHY/CUDA dependencies.
+// TODO: copy into chanModels/src/ to fully decouple from the cuPHY tree.
 #include "hdf5hpp.hpp"
 
 template<class T> struct getScalarType {};

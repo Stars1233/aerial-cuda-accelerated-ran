@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -956,11 +956,11 @@ int launch_pattern::parse_tv_pusch(hdf5hpp::hdf5_file& file, fapi_req_t* req)
         cell_configs_t& cell_configs = get_cell_configs(req->cell_idx);
         if (cell_configs.enableWeightedAverageCfo == 1){
             tv_data->foForgetCoeff = h5dset_try_parse<float>(hdf5dset, "foForgetCoeff", 0.0f);
-            tv_data->nIterations = h5dset_try_parse<uint8_t>(hdf5dset, "nIterations", 0);
-            tv_data->ldpcEarlyTermination = h5dset_try_parse<uint8_t>(hdf5dset, "ldpcEarlyTermination", 0);
+            tv_data->nIterations = h5dset_try_parse<uint8_t>(hdf5dset, "ldpcMaxNumItrPerUe", 10);
+            tv_data->ldpcEarlyTermination = h5dset_try_parse<uint8_t>(hdf5dset, "ldpcEarlyTerminationPerUe", 0);
         } else { // Disabled
             tv_data->foForgetCoeff = 0.0f;
-            tv_data->nIterations = 0;
+            tv_data->nIterations = 10;
             tv_data->ldpcEarlyTermination = 0;
         }
 #endif
@@ -2144,6 +2144,12 @@ void* parsing_thread_func(void* arg)
 
     for(size_t id = 0; id < slot_list.length(); ++id)
     {
+        if(is_app_exiting())
+        {
+            NVLOGC_FMT(TAG, "{}: thread [{}] exiting due to application exiting", __FUNCTION__, slot_parsing->thread_id);
+            break;
+        }
+
         int slot_id = slot_list[id]["slot"].as<int>();
         curr_slot = slot_id;
         yaml::node cell_configs = slot_list[id]["config"];
@@ -2743,10 +2749,14 @@ int launch_pattern::update_expected_values(int cell_id, fapi_req_t *req)
     if(req->channel == channel_type_t::PUSCH)
     {
         pusch_tv_t& pusch_tv = req->tv_data->pusch_tv;
-        expected[cell_id].error = 0;
+        
         if (pusch_tv.negTV_enable==1) {
             // Expected One Error per cell per slot.
-            expected[cell_id].error = 1;
+            expected[cell_id].error++;
+        }
+        else
+        {
+            expected[cell_id].error = 0;
         }
         for(const pusch_tv_data_t* tv_data: pusch_tv.data)
         {
@@ -2909,7 +2919,7 @@ int launch_pattern::add_dyn_slot_channel(slot_pattern_t& slots_data, int cell_id
         NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "{}: channel not supported yet: {}",
                 __FUNCTION__, get_channel_name(req->channel));
         delete req;
-        break;
+        return -1;
     }
     NVLOGI_FMT(TAG, "{}: added tv: slot {} {:<8} {}",
             __FUNCTION__, slot_id, get_channel_name(ch), req->tv_file.c_str());
@@ -3211,7 +3221,7 @@ int launch_pattern::parse_pdu_dset_names(hdf5hpp::hdf5_file& file, tv_dset_list&
         if(pdu_type == tv_channel_type_t::TV_BFW_DL)
         {
             uint32_t bfwUL = pdu_ds["bfwUL"].as<uint32_t>();
-            NVLOGW_FMT(TAG, "bfwUL= {}\n", bfwUL);
+            //NVLOGW_FMT(TAG, "bfwUL= {}\n", bfwUL);
             if(bfwUL == 1)
             {
                 pdu_type = tv_channel_type_t::TV_BFW_UL;

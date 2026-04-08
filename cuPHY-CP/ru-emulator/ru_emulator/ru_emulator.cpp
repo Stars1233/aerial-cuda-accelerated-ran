@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -255,11 +255,19 @@ int RU_Emulator::start()
     {
     if(opt_ul_enabled == RE_ENABLED)
     {
-        const int total_ul_cores = ul_core_list.size();
-        int num_core_ul = total_ul_cores;
+        int num_core_ul = ul_core_list.size();
         int num_core_srs = 0;
+        
         if(opt_enable_mmimo && enable_srs)
         {
+            // SRS is enabled - require ul_srs_core_list to be configured
+            if(ul_srs_core_list.empty())
+            {
+                do_throw(fmt::format("ERROR: SRS is enabled but ul_srs_core_list is empty. "
+                                    "Please configure ul_srs_core_list in config.yaml. Aborting !!!"));
+            }
+
+            // Calculate required SRS cores based on cells and MAX_SRS_CELLS_PER_CORE
             if (opt_num_cells >= 6) {
                 //For 6C and above assume we can hit enqueue in time for MAX_SRS_CELLS_PER_CORE per core
                 num_core_srs = (opt_num_cells + MAX_SRS_CELLS_PER_CORE - 1) / MAX_SRS_CELLS_PER_CORE;
@@ -267,22 +275,25 @@ int RU_Emulator::start()
                 //Note: this allows one core per cell up to 5C.  This is a workaround for establishing scaling for 81a/81b/81c/81d
                 num_core_srs = opt_num_cells;
             }
-            // Ensure num_core_srs doesn't exceed available cores
-            if(num_core_srs >= total_ul_cores)
+            
+            // Validate we have enough SRS cores
+            const int available_srs_cores = ul_srs_core_list.size();
+            if(num_core_srs > available_srs_cores)
             {
-                num_core_srs = total_ul_cores - 1;
-                if(num_core_srs < 0) num_core_srs = 0;
+                do_throw(fmt::format("ERROR: Requested {} SRS cores for {} cells, but only {} cores in ul_srs_core_list. "
+                                    "Need at least {} cores to maintain MAX_SRS_CELLS_PER_CORE={} constraint. This will degrade SRS performance. Aborting !!!",
+                                    num_core_srs, opt_num_cells, available_srs_cores, num_core_srs, MAX_SRS_CELLS_PER_CORE));
             }
-            num_core_ul -= num_core_srs;
-            // Ensure num_core_ul is not negative
-            if(num_core_ul < 0) num_core_ul = 0;
+
+            re_cons("Allocating {} non-SRS cores and {} SRS cores for {} cells", 
+                    num_core_ul, num_core_srs, opt_num_cells);
         }
 
         if (num_core_ul == 0) {
-            do_throw(fmt::format("No UL cores left after SRS split – aborting start()."));
+            do_throw(fmt::format("No UL cores available – aborting start()."));
         }
 
-        ul_cell_cpu_assignment_array ul_cell_cpu_assignment = get_cell_cpu_assignment(opt_num_cells, num_core_ul, opt_enable_mmimo, false);
+        ul_cell_cpu_assignment_array ul_cell_cpu_assignment = get_cell_cpu_assignment(opt_num_cells, num_core_ul, opt_enable_mmimo, false, opt_min_ul_cores_per_cell_mmimo);
 
         for (int i = 0; i < num_core_ul; ++i)
         {
@@ -296,8 +307,7 @@ int RU_Emulator::start()
             cpu_set_t tcpuset ;
 
             CPU_ZERO(&tcpuset);
-            CPU_SET(ul_core_list[ul_core_index],&tcpuset);
-            ul_core_index++;
+            CPU_SET(ul_core_list[i],&tcpuset);
 
             int ret = pthread_create(&tid_ul_core[ul_thread_count], NULL /* attr */, cplane_core_wrapper, (void*)&(cplane_core_params[i]) );
             if(ret != 0)
@@ -318,28 +328,27 @@ int RU_Emulator::start()
         ul_cell_cpu_assignment_array srs_cell_cpu_assignment;
         if(num_core_srs > 0)
         {
-            srs_cell_cpu_assignment = get_cell_cpu_assignment(opt_num_cells, num_core_srs, opt_enable_mmimo, true);
+            srs_cell_cpu_assignment = get_cell_cpu_assignment(opt_num_cells, num_core_srs, opt_enable_mmimo, true, opt_min_ul_cores_per_cell_mmimo);
         }
 
-        for(int i = num_core_ul; i < num_core_ul + num_core_srs; ++i)
+        for(int i = 0; i < num_core_srs; ++i)
         {
-            // Boundary check to prevent out-of-bounds access
-            if(i >= total_ul_cores)
-            {
-                do_throw(fmt::format("SRS core index {} exceeds available ul_core_list size {}, skipping", i, total_ul_cores));
-            }
-
-            cplane_core_params[i].rue = this;
-            cplane_core_params[i].thread_id = i - num_core_ul;
-            cplane_core_params[i].cpu_id = ul_core_list[i];
-            cplane_core_params[i].num_cells_per_core = srs_cell_cpu_assignment[i - num_core_ul].num_cells_per_core;
-            cplane_core_params[i].start_cell_index = srs_cell_cpu_assignment[i - num_core_ul].start_cell_index;
-            cplane_core_params[i].is_srs = true;
+            const int thread_index = num_core_ul + i;
+            
+            // SRS cores come from dedicated ul_srs_core_list
+            int srs_cpu_id = ul_srs_core_list[i];
+            
+            cplane_core_params[thread_index].rue = this;
+            cplane_core_params[thread_index].thread_id = i;
+            cplane_core_params[thread_index].cpu_id = srs_cpu_id;
+            cplane_core_params[thread_index].num_cells_per_core = srs_cell_cpu_assignment[i].num_cells_per_core;
+            cplane_core_params[thread_index].start_cell_index = srs_cell_cpu_assignment[i].start_cell_index;
+            cplane_core_params[thread_index].is_srs = true;
 
             cpu_set_t tcpuset;
             CPU_ZERO(&tcpuset);
-            CPU_SET(ul_core_list[i],&tcpuset);
-            int ret = pthread_create(&tid_ul_core[ul_thread_count], NULL /* attr */, cplane_core_wrapper, (void*)&(cplane_core_params[i]) );
+            CPU_SET(srs_cpu_id,&tcpuset);
+            int ret = pthread_create(&tid_ul_core[ul_thread_count], NULL /* attr */, cplane_core_wrapper, (void*)&(cplane_core_params[thread_index]) );
             if(ret != 0)
             {
                 re_dbg("pthread creation error");
@@ -675,6 +684,11 @@ int RU_Emulator::finalize_dlc_tb()
     generate_results_string(buffer, total_dl_section_counters);
     buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| DL C-Plane Err Sections");
     generate_results_string(buffer, error_dl_section_counters);
+    if (opt_sectionid_validation == RE_ENABLED)
+    {
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| DL Unannounced U-plane Sections");
+        generate_results_string(buffer, section_id_trackers->error_dl_uplane);
+    }
     print_divider(opt_num_cells);
 
     buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| UL C-Plane TOT Sections");
@@ -682,6 +696,19 @@ int RU_Emulator::finalize_dlc_tb()
     buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| UL C-Plane Err Sections");
     generate_results_string(buffer, error_ul_section_counters);
     print_divider(opt_num_cells);
+
+    if (opt_beamid_validation == RE_ENABLED)
+    {
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| DL BeamID TOT Checked  ");
+        generate_results_string(buffer, beamid_dl_total_counters);
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| DL BeamID Err Mismatch ");
+        generate_results_string(buffer, beamid_dl_error_counters);
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| UL BeamID TOT Checked  ");
+        generate_results_string(buffer, beamid_ul_total_counters);
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| UL BeamID Err Mismatch ");
+        generate_results_string(buffer, beamid_ul_error_counters);
+        print_divider(opt_num_cells);
+    }
 
     return RE_OK;
 }
@@ -767,6 +794,19 @@ int RU_Emulator::finalize()
     if(opt_bfw_ul_validation == RE_ENABLED)
     {
         generate_results_log(bfw_ul_object);
+        print_divider(opt_num_cells);
+    }
+
+    if (opt_beamid_validation == RE_ENABLED)
+    {
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| DL BeamID TOT Checked  ");
+        generate_results_string(buffer, beamid_dl_total_counters);
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| DL BeamID Err Mismatch ");
+        generate_results_string(buffer, beamid_dl_error_counters);
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| UL BeamID TOT Checked  ");
+        generate_results_string(buffer, beamid_ul_total_counters);
+        buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| UL BeamID Err Mismatch ");
+        generate_results_string(buffer, beamid_ul_error_counters);
         print_divider(opt_num_cells);
     }
 
@@ -1949,7 +1989,7 @@ void RU_Emulator::generate_max_sections_count_log()
         }
         for(int i = 0; i < opt_num_cells; ++i)
         {
-            buffer_index += snprintf(buffer + buffer_index, MAX_PRINT_LOG_LENGTH - buffer_index, "| %11u ",  max_sections_per_slot[section_type][i]);
+            buffer_index += snprintf(buffer + buffer_index, MAX_PRINT_LOG_LENGTH - buffer_index, "| %11" PRIu32 " ",  max_sections_per_slot[section_type][i]);
         }
         buffer_index += snprintf(buffer + buffer_index, MAX_PRINT_LOG_LENGTH - buffer_index, "|");
         NVLOGC_FMT(TAG, "{}", buffer);

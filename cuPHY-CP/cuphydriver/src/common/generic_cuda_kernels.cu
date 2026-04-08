@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -273,50 +273,75 @@ void launch_kernel_check_crc(cudaStream_t stream, const uint32_t* i_buf, size_t 
 
 void launch_kernel_compression(
     cudaStream_t stream,
-    compression_params &params)
+    const std::array<compression_params, NUM_USER_DATA_COMPRESSION_METHODS>& cparams_array)
 {
     cudaError_t result = cudaSuccess;
-
-    // PRBs can vary by threads, so launch enough to cover the worst case
-    auto max_antennas   = std::max_element(params.num_antennas, params.num_antennas + params.num_cells);
-
-    // If all cells have the same compression bit_width, we can specialize the kernel
-    bool const_bfp = true;
-    int first_bfp = params.bit_width[0];
-
-    if (params.comp_meth[0] != 4)
-    {
-        for (int i=1; i<params.num_cells; i++)
-            if (params.bit_width[i] != first_bfp)
-                const_bfp = false;
-    }
-    else // Assuming compression method will be the same between the cells
-    {
-        const_bfp = false;
-    }
-
-    dim3 blocks(*max_antennas, params.num_cells, SLOT_NUM_SYMS);
-
     MemtraceDisableScope md;
-    if(const_bfp && first_bfp == 9)
-        kernel_compress<9><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
-    else if(const_bfp && first_bfp == 14)
-        kernel_compress<14><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
-    else if(const_bfp && first_bfp == 16)
-        kernel_compress<16><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
-    else if(params.comp_meth[0] == 4)
-        {   
-            const int nwarps = 2;
-            dim3 threads(32, nwarps, SLOT_NUM_SYMS);
-            dim3 blocks((MAX_SECTIONS_PER_UPLANE_SYMBOL + nwarps - 1)/nwarps , *max_antennas, params.num_cells);
-            kernel_mod_compression<QAM_Comp><<<blocks, threads, 0, stream>>>(params);
-        }
-    else // Otherwise use the non-specialized kernel
-        kernel_compress<0><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
 
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    // Process each compression method that has cells
+    for(std::size_t comp_method = 0; comp_method < NUM_USER_DATA_COMPRESSION_METHODS; ++comp_method)
+    {
+        const compression_params& params = cparams_array[comp_method];
+        
+        // Skip if no cells for this compression method
+        if(params.num_cells == 0)
+            continue;
+
+        // PRBs can vary by threads, so launch enough to cover the worst case
+        auto max_antennas = std::max_element(params.num_antennas, params.num_antennas + params.num_cells);
+
+        switch (static_cast<aerial_fh::UserDataCompressionMethod>(comp_method))
+        {
+            case aerial_fh::UserDataCompressionMethod::NO_COMPRESSION:
+            case aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT:
+            {
+                dim3 blocks(*max_antennas, params.num_cells, SLOT_NUM_SYMS);
+
+                // If all cells have the same compression bit_width, we can specialize the kernel
+                const auto first_bfp = params.bit_width[0];
+                const bool const_bfp = std::all_of(
+                    params.bit_width,
+                    params.bit_width + params.num_cells,
+                    [first_bfp](decltype(first_bfp) bw) { return bw == first_bfp; }
+                );
+            
+                if(const_bfp && first_bfp == 9)
+                {
+                    kernel_compress<9><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
+                }
+                else if(const_bfp && first_bfp == 14)
+                {
+                    kernel_compress<14><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
+                }
+                else if(const_bfp && first_bfp == 16)
+                {
+                    kernel_compress<16><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
+                }
+                else // Otherwise use the non-specialized kernel
+                {
+                    kernel_compress<0><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
+                }
+                break;
+            }
+            case aerial_fh::UserDataCompressionMethod::MODULATION_COMPRESSION:
+            {
+                const int nwarps = 2;
+                dim3 threads(32, nwarps, SLOT_NUM_SYMS);
+                dim3 blocks_mod((MAX_SECTIONS_PER_UPLANE_SYMBOL + nwarps - 1)/nwarps , *max_antennas, params.num_cells);
+                kernel_mod_compression<QAM_Comp><<<blocks_mod, threads, 0, stream>>>(params);
+                break;
+            }
+            default:
+                // Other compression methods not yet implemented
+                NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Compression method {} not implemented", comp_method);
+                break;
+        }
+
+        result = cudaGetLastError();
+        if(cudaSuccess != result)
+            NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} for compression method {}", 
+                __FILE__, __LINE__, cudaGetErrorString(result), comp_method);
+    }
 }
 
 #define COPY_BLOCKS 4

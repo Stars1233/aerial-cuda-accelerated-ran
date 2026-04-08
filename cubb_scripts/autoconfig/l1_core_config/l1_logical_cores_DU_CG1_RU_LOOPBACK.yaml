@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,20 +58,18 @@ dl_debug_thread: 9 #Note: set to -1 to disable
 l2a_pcap_capture_thread: 10
 
 ##Test Bench Only (testmac)
-tbonly_tm_all_low_priority_threads: 11
+tbonly_tm_all_low_priority_threads: 0
 tbonly_tm_schedule_thread: 12
 tbonly_tm_receive_thread: 13
 tbonly_tm_builder_thread: 14
 tbonly_worker_threads: []
 
 ##Test Bench Only (ru_emulator)
-#Note: ru_emulator logical cores are on separate machine, and will not conflict with cuphycontroller/testmac
-#Note: the offset is used in loopback config to ensure RU cores start after the DU cores.
-tbonly_re_offset: 16
-tbonly_re_ul_threads: [0,1,2,3,4,5,6,7,8,9,10] 
-tbonly_re_dl_threads: [11,12,13,14,15,16,17,18,19,20]
-tbonly_re_all_low_priority_threads: 21
-tbonly_re_dpdk_thread: 22
+#Note: with loopback config, ru_emulator logical cores are on the same machine as the cuphycontroller/testmac, and they start after the DU cores.
+tbonly_re_ul_threads: [16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
+tbonly_re_dl_threads: [37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56]
+tbonly_re_all_low_priority_threads: 0
+tbonly_re_dpdk_thread: 0
 tbonly_re_pdump_client_thread: -1
 
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,7 @@
 #include "common_utils.hpp"
 
 #include <chrono>
+#include <vector>
 
 #define TAG (NVLOG_TAG_BASE_TEST_MAC + 23) // "CUMAC.PATTERN"
 
@@ -588,17 +589,13 @@ int cumac_pattern::load_h5_config_params(int cell_id, const char* config_params_
         return -1;
     }
 
-    if(!hdf5file.is_valid_dataset("blerTargetActUe"))
+    if(!hdf5file.is_valid_dataset("blerTarget"))
     {
-        NVLOGW_FMT(TAG, "Dataset blerTargetActUe not exist in file {}", h5path);
+        NVLOGW_FMT(TAG, "Dataset blerTarget not exist in file {}", h5path);
         return -1;
     }
 
-    uint16_t nMaxActUePerCell = 0;
-    h5dset_try_read(hdf5file, "nMaxActUePerCell", &nMaxActUePerCell, sizeof(nMaxActUePerCell));
-
-    cumac_cell_configs_t* cfgs = reinterpret_cast<cumac_cell_configs_t*>(
-        malloc(sizeof(cumac_cell_configs_t) + sizeof(float) * nMaxActUePerCell));
+    cumac_cell_configs_t* cfgs = reinterpret_cast<cumac_cell_configs_t*>(malloc(sizeof(cumac_cell_configs_t)));
     if(cfgs == nullptr)
     {
         NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to allocate memory for cfgs");
@@ -630,7 +627,7 @@ int cumac_pattern::load_h5_config_params(int cell_id, const char* config_params_
     h5dset_try_read(hdf5file, "mcsSelSinrCapThr", &cfgs->mcsSelSinrCapThr, sizeof(cfgs->mcsSelSinrCapThr));
     h5dset_try_read(hdf5file, "mcsSelLutType", &cfgs->mcsSelLutType, sizeof(cfgs->mcsSelLutType));
 
-    h5dset_try_read(hdf5file, "blerTargetActUe", &cfgs->blerTargetActUe, sizeof(float) * nMaxActUePerCell);
+    h5dset_try_read(hdf5file, "blerTarget", &cfgs->blerTarget, sizeof(cfgs->blerTarget));
 
     NVLOGC_FMT(TAG, "{}: cell_id={} nMaxCell={}->{} nMaxPrg={} nPrbPerPrg={} nMaxBsAnt={} nMaxUeAnt={} harqEnabledInd={} h5file={}",
             __func__, cell_id, cfgs->nMaxCell, cell_num, cfgs->nMaxPrg, cfgs->nPrbPerPrg, cfgs->nMaxBsAnt, cfgs->nMaxUeAnt, cfgs->harqEnabledInd, config_params_h5_file);
@@ -660,6 +657,7 @@ int cumac_pattern::load_h5_config_params(int cell_id, const char* config_params_
         CHECK_VALUE_EQUAL_ERR(cfgs0.sinValThr, cfgs->sinValThr);
         CHECK_VALUE_EQUAL_ERR(cfgs0.corrThr, cfgs->corrThr);
         CHECK_VALUE_EQUAL_ERR(cfgs0.prioWeightStep, cfgs->prioWeightStep);
+        CHECK_VALUE_EQUAL_ERR(cfgs0.blerTarget, cfgs->blerTarget);
     }
 
     cumac_cell_configs_v[cell_id] = cfgs;
@@ -700,6 +698,12 @@ static void* parsing_thread_func(void* arg)
 
     for(size_t id = 0; id < slot_list.length(); ++id)
     {
+        if(is_app_exiting())
+        {
+            NVLOGC_FMT(TAG, "{}: thread [{}] exiting due to application exiting", __FUNCTION__, slot_parsing->thread_id);
+            break;
+        }
+
         int slot_id = slot_list[id]["slot"].as<int>();
         curr_slot = slot_id;
         yaml::node cumac_cell_configs = slot_list[id]["config"];

@@ -44,7 +44,7 @@ ULInputBuffer::ULInputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_t 
 
     addr_d.reset(new dev_buf(addr_sz * sizeof(uint8_t), gDev));
     addr_d->clear();
-    mf.addGpuRegularSize(addr_sz);
+    mf.addGpuRegularSize(addr_d->size_alloc);
 
     addr_h.reset(new host_buf(addr_sz * sizeof(uint8_t), gDev));
     addr_h->clear();

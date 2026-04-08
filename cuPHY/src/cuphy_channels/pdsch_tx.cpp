@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,11 +79,7 @@ void print_TB_config_params(PdschPerTbParams* kernel_params, PdschDmrsParams* dm
     layers_strm << "* layer_map[" << TB_layers << "] = {";
     for(int layer_cnt = 0; layer_cnt < TB_layers; layer_cnt++)
     {
-#ifdef ENABLE_32DL
-        layers_strm << std::to_string(dmrs_params[TB_id].port_ids[layer_cnt] + 8 * dmrs_params[TB_id].n_scid + 16 * dmrs_params[TB_id].nlAbove16);
-#else
-        layers_strm << std::to_string(dmrs_params[TB_id].port_ids[layer_cnt] + 8 * dmrs_params[TB_id].n_scid);
-#endif
+        layers_strm << std::to_string(calculate_layer_id(dmrs_params[TB_id].port_ids[layer_cnt], dmrs_params[TB_id].n_scid, dmrs_params[TB_id].nlAbove16));
         if(layer_cnt != TB_layers - 1)
         {
             layers_strm << ", ";
@@ -882,11 +878,7 @@ void PdschTx::print_csv_friendly_config()
         std::cout << "{";
         int TB_layers = kernel_params[TB_id].Nl;
         for(int layer_cnt = 0; layer_cnt < TB_layers; layer_cnt++) {
-#ifdef ENABLE_32DL
-            std::cout << h_dmrs_params[TB_id].port_ids[layer_cnt] + 8 * h_dmrs_params[TB_id].n_scid + 16 * h_dmrs_params[TB_id].nlAbove16;
-#else
-            std::cout << h_dmrs_params[TB_id].port_ids[layer_cnt] + 8 * h_dmrs_params[TB_id].n_scid;
-#endif
+            std::cout << calculate_layer_id(h_dmrs_params[TB_id].port_ids[layer_cnt], h_dmrs_params[TB_id].n_scid, h_dmrs_params[TB_id].nlAbove16);
             if(layer_cnt != TB_layers - 1)
             {
                 std::cout << "-";
@@ -2505,7 +2497,7 @@ int PdschTx::refCheckModulationMultipleCells(cudaStream_t cuda_strm)
                                                  CUPHY_C_16F,
                                                  dims[0],
                                                  dims[1],
-                                                 dims[2], //MAX_DL_LAYERS,
+                                                 dims[2],
                                                  cuphy::tensor_flags::align_tight);
         #else
         tensor_device cell_data_tx_tensor = tensor_device(dynamic_params->pDataOut->pTDataTx[cell].pAddr,
@@ -2618,11 +2610,7 @@ int PdschTx::refCheckModulationMultipleCells(cudaStream_t cuda_strm)
                 ref_symbol.y = (half)output_data(symbol_id).y;
 
                 int layer_cnt = symbol_id / (qam_elements / TB_num_layers);
-#ifdef ENABLE_32DL
-                int layer_id  = tmp_h_dmrs_params.port_ids[layer_cnt] + 8 * tmp_h_dmrs_params.n_scid + 16 * tmp_h_dmrs_params.nlAbove16;
-#else
-                int layer_id  = tmp_h_dmrs_params.port_ids[layer_cnt] + 8 * tmp_h_dmrs_params.n_scid;
-#endif
+                int layer_id  = calculate_layer_id(tmp_h_dmrs_params.port_ids[layer_cnt], tmp_h_dmrs_params.n_scid, tmp_h_dmrs_params.nlAbove16);
 
                 int symbol_pos = (allocated_data_or_dmrs_w_data_symbol_loc >> (4 * per_layer_symbol_offset)) & 0xF; // data or dmrs w/ data symbol
                 bool symbol_is_dmrs = (dmrs_bitmask >> symbol_pos) & 0x1;
@@ -2843,11 +2831,7 @@ int PdschTx::refCheckDmrsMultipleCells(cudaStream_t cuda_strm)
                         int layer_id = tmp_layer;
                         if(!h_dmrs_params[overall_TB_id].enablePrcdBf)
                         {
-#ifdef ENABLE_32DL
-                            layer_id = h_dmrs_params[overall_TB_id].port_ids[tmp_layer] + 8 * h_dmrs_params[overall_TB_id].n_scid + 16 * h_dmrs_params[overall_TB_id].nlAbove16;
-#else
-                            layer_id = h_dmrs_params[overall_TB_id].port_ids[tmp_layer] + 8 * h_dmrs_params[overall_TB_id].n_scid;
-#endif
+                            layer_id = calculate_layer_id(h_dmrs_params[overall_TB_id].port_ids[tmp_layer], h_dmrs_params[overall_TB_id].n_scid, h_dmrs_params[overall_TB_id].nlAbove16);
                         }
                         int delta =  (h_dmrs_params[overall_TB_id].port_ids[tmp_layer] >> 1) & 0x1U;
 

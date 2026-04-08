@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,8 @@
 namespace aerial_fh
 {
 Fronthaul::Fronthaul(FronthaulInfo const* info) :
-    info_{*info}
+    info_{*info},
+    docaParams_{}
 {
     NVLOGI_FMT(TAG, "Opening Fronthaul interface");
     validate_input();
@@ -227,7 +228,6 @@ void Fronthaul::eal_init()
 
 void Fronthaul::doca_gpu_setup()
 {
-	doca_error_t ret_doca;
 	int ret;
 
 	std::vector<std::string> args;
@@ -272,9 +272,11 @@ void Fronthaul::doca_gpu_setup()
 	if (ret < 0)
 		THROW_FH(ret, StringBuilder() << "DPDK init failed " << ret);
 
+    printf("INFO: Fronthaul::doca_gpu_setup: cuda_device_ids.size() = %zu, cuda_device_ids_for_compute.size() = %zu\n", info_.cuda_device_ids.size(), info_.cuda_device_ids_for_compute.size());
 	/* Initialize DOCA GPU instance. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    doca_error_t ret_doca = DOCA_SUCCESS;
 	if(!info_.cuda_device_ids.empty())
 	{
 		ret_doca = doca_gpu_create(Gpu::cuda_device_id_to_pci_bus_id(info_.cuda_device_ids[0]).c_str(), &docaParams_.gpu);

@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -249,16 +249,18 @@ for cellIdx = 1 : nCell
         bsAntLocs = zeros(3, nBsAnt); % [x; y; z] for each Tx antenna
         ueAntPolarAngles = zeros(1, nUeAnt); % Polar angles for Rx antennas
         bsAntPolarAngles = zeros(1, nBsAnt); % Polar angles for Tx antennas
+        [ueDh, ueDv] = getElemSpacing(UeAntSpacing);
+        [bsDh, bsDv] = getElemSpacing(BsAntSpacing);
 
         for u = 1:nUeAnt
             [mAnt, uAnt, pAnt] = findAntLoc(u, UeAntSize);
-            ueAntLocs(:, u) = [0; (uAnt-1) * UeAntSpacing(2); (mAnt-1) * UeAntSpacing(1)];
+            ueAntLocs(:, u) = [0; (uAnt-1) * ueDh; (mAnt-1) * ueDv];
             ueAntPolarAngles(u) = UeAntPolarAngles(pAnt);
         end
 
         for s = 1:nBsAnt
             [mAnt, uAnt, pAnt]  = findAntLoc(s, BsAntSize);
-            bsAntLocs(:, s) = [0; (uAnt-1) * BsAntSpacing(2); (mAnt-1) * BsAntSpacing(1)];
+            bsAntLocs(:, s) = [0; (uAnt-1) * bsDh; (mAnt-1) * bsDv];
             bsAntPolarAngles(s) = BsAntPolarAngles(pAnt);
         end
 
@@ -639,16 +641,26 @@ function cfr = calCfrFromCir(N_sc, N_sc_Prbg, scSpacingHz, f_samp, timeDelay, cf
 end
 
 function [mAnt, nAnt, pAnt] = findAntLoc(u, AntSize)
+    % AntSize convention: [M_g, N_g, M, N, P]
+    assert(numel(AntSize) == 5, ...
+        'AntSize must be [M_g, N_g, M, N, P] (5 elements).');
+    M = AntSize(3);
+    N = AntSize(4);
+    P = AntSize(5);
 
-    M = AntSize(1);
-    N = AntSize(2);
-    P = AntSize(3);
-    
     u = u-1;
     pAnt = mod(u, P)+1;
     nAnt = mod(floor(u/P), N)+1;
     mAnt = mod(floor(u/(P*N)), M)+1;
     
+end
+
+function [d_h, d_v] = getElemSpacing(AntSpacing)
+    % AntSpacing convention: [d_g_h, d_g_v, d_h, d_v]
+    assert(numel(AntSpacing) == 4, ...
+        'AntSpacing must be [d_g_h, d_g_v, d_h, d_v] (4 elements).');
+    d_h = AntSpacing(3);
+    d_v = AntSpacing(4);
 end
 
 function A_dB_3D = calc_A_dB_3D(theta, phi)

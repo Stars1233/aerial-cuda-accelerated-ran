@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,13 +42,13 @@ FhGenerator::FhGenerator(const std::string& config_file, FhGenType type) :
     yaml_parser_(this, config_file)
 {
     initialize_random_number_generator();
-    setup_fh_driver();
-
     if(fh_gen_type_ == FhGenType::DU)
     {
         cudaFree(0);
-        cudaSetDevice(0);
+        CUDA_CHECK(cudaSetDevice(0));
     }
+    setup_fh_driver();
+
     add_nics();
     add_peers();
     add_flows();

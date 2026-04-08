@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,9 +16,11 @@
  */
 
 #include "tdl_chan.cuh"
+#include "chanModelsCommon.h"
 #include <cassert>
+#include <type_traits>
+#include <thread>
 #include "hdf5hpp.hpp"
-#include "cuphy_hdf5.hpp"
 #include <H5Cpp.h>
 
 /**
@@ -38,25 +40,21 @@ void test_TDL(tdlConfig_t * tdlCfg, uint32_t nTti, bool & enableHalfPrecision, u
     cudaStream_t cuMainStrm;
     cudaStreamCreate(&cuMainStrm);
 
-    cuphy::tensor_ref txSigInTensor;
-    cuphy::rng rng;
-    cuComplex m32_0      = make_cuFloatComplex(0.0f, 0.0f);
-    cuComplex stddev32_1 = make_cuFloatComplex(sqrt(0.5f), sqrt(0.5f));
+    curandGenerator_t curandGen = nullptr;
+    uint32_t txSigSize = 0;
 
-    if(tdlCfg -> sigLenPerAnt) // randomly generate test input signal
+    if(tdlCfg -> sigLenPerAnt)
     {
-        uint32_t txSigSize;
         if (enableSwapTxRx)
             txSigSize = (tdlCfg -> nCell) * (tdlCfg -> nUe) * (tdlCfg -> sigLenPerAnt) * (tdlCfg -> nUeAnt);
         else
             txSigSize = (tdlCfg -> nCell) * (tdlCfg -> nUe) * (tdlCfg -> sigLenPerAnt) * (tdlCfg -> nBsAnt);
-        
-        ASSERT(txSigSize <= 2147483647u, "size of tx time signal for all links must be smaller than 2147483647u (cuPHY tensor limitation)");
 
-        CUDA_CHECK(cudaMalloc((void**) &(tdlCfg -> txSigIn), sizeof(Tcomplex) * txSigSize));
-        /*  Set random input time signals   */
-        txSigInTensor.desc().set(enableHalfPrecision ? CUPHY_C_16F : CUPHY_C_32F,  txSigSize, cuphy::tensor_flags::align_tight);
-        txSigInTensor.set_addr(tdlCfg -> txSigIn);
+        ASSERT(txSigSize <= 2147483647u, "size of tx time signal for all links must be smaller than 2147483647u");
+
+        CHECK_CUDAERROR(cudaMalloc((void**) &(tdlCfg -> txSigIn), sizeof(Tcomplex) * txSigSize));
+        CHECK_CURANDERROR(curandCreateGenerator(&curandGen, CURAND_RNG_PSEUDO_DEFAULT));
+        CHECK_CURANDERROR(curandSetStream(curandGen, cuMainStrm));
         printf("TDL channel test: tx time signals use %.2f MB GPU memory. \n", sizeof(Tcomplex) * txSigSize / 1024.0f / 1024.0f);
     }
     else
@@ -81,7 +79,21 @@ void test_TDL(tdlConfig_t * tdlCfg, uint32_t nTti, bool & enableHalfPrecision, u
     // generate random tx signals
     if(tdlCfg -> sigLenPerAnt)
     {
-        rng.normal(txSigInTensor, m32_0, stddev32_1, cuMainStrm);
+        if constexpr (std::is_same_v<Tcomplex, cuComplex>) {
+            CHECK_CURANDERROR(curandGenerateNormal(curandGen, (float*)(tdlCfg -> txSigIn), txSigSize * 2, 0.0f, sqrtf(0.5f)));
+        } else {
+            float* d_tmpBuf = nullptr;
+            CHECK_CUDAERROR(cudaMalloc((void**)&d_tmpBuf, txSigSize * 2 * sizeof(float)));
+            CHECK_CURANDERROR(curandGenerateNormal(curandGen, d_tmpBuf, txSigSize * 2, 0.0f, sqrtf(0.5f)));
+            std::vector<float> h_floats(txSigSize * 2);
+            CHECK_CUDAERROR(cudaMemcpy(h_floats.data(), d_tmpBuf, txSigSize * 2 * sizeof(float), cudaMemcpyDeviceToHost));
+            cudaFree(d_tmpBuf);
+            std::vector<__half> h_halves(txSigSize * 2);
+            for (uint32_t i = 0; i < txSigSize * 2; ++i) {
+                h_halves[i] = __float2half(h_floats[i]);
+            }
+            CHECK_CUDAERROR(cudaMemcpy(tdlCfg -> txSigIn, h_halves.data(), txSigSize * 2 * sizeof(__half), cudaMemcpyHostToDevice));
+        }
     }
 
     // warm up GPU kernels
@@ -171,6 +183,7 @@ void test_TDL(tdlConfig_t * tdlCfg, uint32_t nTti, bool & enableHalfPrecision, u
       }
     }
     /*---------------    clean up memory       --------------------*/
+    if(curandGen) curandDestroyGenerator(curandGen);
     cudaFree(tdlCfg -> txSigIn);
     delete tdlChanTest;
     cudaEventDestroy(start);

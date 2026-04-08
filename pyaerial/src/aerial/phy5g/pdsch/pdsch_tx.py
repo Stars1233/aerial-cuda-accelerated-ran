@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
 """pyAerial library - PDSCH transmitter."""
 from typing import Any
 from typing import List
+from typing import Optional
 
 import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
@@ -23,6 +24,7 @@ import numpy as np
 
 from aerial import pycuphy  # type: ignore
 from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.pycuphy.util import get_pdsch_stat_prms
 from aerial.phy5g.api import Array
 from aerial.phy5g.api import Pipeline
@@ -45,13 +47,15 @@ class PdschTxPipelineFactory(PipelineFactory[AerialPdschTxConfig]):
 
     def create(self,
                config: AerialPdschTxConfig,
-               cuda_stream: int,
+               cuda_stream: CudaStream,
                **kwargs: Any) -> Pipeline:
         """Create the pipeline.
 
         Args:
             config (AerialPdschTxConfig): Pipeline configuration object.
-            cuda_stream (int): CUDA stream used to run the pipeline.
+            cuda_stream (CudaStream): CUDA stream used to run the pipeline.
+                Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
 
         Returns:
             PdschTx: A `PdschTx` pipeline object.
@@ -83,7 +87,7 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
         num_ul_bwp: int = NUM_PRB_MAX,
         num_dl_bwp: int = NUM_PRB_MAX,
         mu: int = 1,
-        cuda_stream: int = None
+        cuda_stream: Optional[CudaStream] = None
     ) -> None:
         """Initialize PdschTx.
 
@@ -96,11 +100,11 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
             num_dl_bwp (int): Number of PRBs in a downlink bandwidth part.
                 Default: 273.
             mu (int): Numerology. Values in [0, 3]. Default: 1.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new
+                CudaStream is created. Use ``with stream:`` to scope work; call
+                ``stream.synchronize()`` explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         pdsch_tx_stat_prms = get_pdsch_stat_prms(
             cell_id=cell_id,
@@ -112,13 +116,14 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
         )
         self.pdsch_pipeline = pycuphy.PdschPipeline(pdsch_tx_stat_prms)
         self.output_dims = [num_dl_bwp * NUM_RE_PER_PRB, NUM_SYMBOLS, MAX_DL_LAYERS]
-        self.num_bytes = num_dl_bwp * NUM_RE_PER_PRB * NUM_SYMBOLS * MAX_DL_LAYERS * 4
+        # Use int() to prevent overflow with numpy int16/int32 types
+        self.num_bytes = int(num_dl_bwp) * NUM_RE_PER_PRB * NUM_SYMBOLS * MAX_DL_LAYERS * 4
 
         # Complex half output.
         self.tx_output_mem = check_cuda_errors(cudart.cudaMalloc(self.num_bytes))
 
         # Complex float output.
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             self.tx_output = cp.ndarray(
                 shape=(num_dl_bwp * NUM_RE_PER_PRB, NUM_SYMBOLS, MAX_DL_LAYERS),
                 dtype=cp.complex64,
@@ -256,12 +261,14 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
 
         cpu_copy = isinstance(tb_inputs[0], np.ndarray)
 
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tb_inputs = [cp.array(tb, dtype=cp.uint8, order='F') for tb in tb_inputs]
 
         # Reset the output buffer.
         check_cuda_errors(
-            cudart.cudaMemsetAsync(self.tx_output_mem, 0., self.num_bytes, self.cuda_stream)
+            cudart.cudaMemsetAsync(
+                self.tx_output_mem, 0., self.num_bytes, self._cuda_stream.handle
+            )
         )
 
         if pdsch_configs is None:
@@ -310,7 +317,7 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
         # Create the dynamic params structure. Default parameters inserted for those
         # that are not given.
         pdsch_tx_dyn_prms = _pdsch_config_to_cuphy(
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             tb_inputs=tb_inputs,
             tx_output_mem=self.tx_output_mem,
             slot=slot,
@@ -325,7 +332,7 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
             self.tx_output_mem,
             self.tx_output.data.ptr,
             self.output_dims,
-            self.cuda_stream
+            self._cuda_stream.handle
         )
 
         tx_slot = PdschTx.cuphy_to_tx(
@@ -337,7 +344,7 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
         )
 
         if cpu_copy:
-            with cp.cuda.ExternalStream(int(self.cuda_stream)):
+            with self._cuda_stream:
                 tx_slot = tx_slot.get(order='F')
 
         self.num_ues = num_ues
@@ -362,7 +369,8 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
 
     def __del__(self) -> None:
         """Destructor."""
-        check_cuda_errors(cudart.cudaFree(self.tx_output_mem))
+        if hasattr(self, 'tx_output_mem'):
+            check_cuda_errors(cudart.cudaFree(self.tx_output_mem))
 
     @classmethod
     def cuphy_to_tx(

@@ -151,6 +151,20 @@ void LdpcDerateMatch::derateMatch(const std::vector<cuphyTensorPrm_t>& inputLlrs
                                                      static_cast<CUstream>(m_cuStream),
                                                      kernelNodeParamsDriver.kernelParams,
                                                      kernelNodeParamsDriver.extra));
+    
+    // Launch clamp kernel using the CUDA driver API.
+    const CUDA_KERNEL_NODE_PARAMS& clmapKernelNodeParamsDriver = puschRmLaunchCfg.clampKernelNodeParamsDriver;
+    CU_CHECK_EXCEPTION_PRINTF_VERSION(cuLaunchKernel(clmapKernelNodeParamsDriver.func,
+                                                     clmapKernelNodeParamsDriver.gridDimX,
+                                                     clmapKernelNodeParamsDriver.gridDimY,
+                                                     clmapKernelNodeParamsDriver.gridDimZ,
+                                                     clmapKernelNodeParamsDriver.blockDimX,
+                                                     clmapKernelNodeParamsDriver.blockDimY,
+                                                     clmapKernelNodeParamsDriver.blockDimZ,
+                                                     clmapKernelNodeParamsDriver.sharedMemBytes,
+                                                     static_cast<CUstream>(m_cuStream),
+                                                     clmapKernelNodeParamsDriver.kernelParams,
+                                                     clmapKernelNodeParamsDriver.extra));
 }
 
 

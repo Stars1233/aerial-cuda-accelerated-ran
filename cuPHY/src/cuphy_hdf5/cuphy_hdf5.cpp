@@ -16,6 +16,7 @@
  */
 
 #include "cuphy_hdf5.h"
+#include "memfoot_global.h"
 #include <limits>
 #include <array>
 #include <algorithm>

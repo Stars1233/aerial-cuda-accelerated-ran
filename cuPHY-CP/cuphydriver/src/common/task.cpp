@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -118,6 +118,7 @@ Task::Task(
     first_cell = 0;
     num_cells = 0;
     num_tasks = 0;
+    desired_wid = 0;
     name.reserve(TASK_NAME_RESERVE_LENGTH);
 }
 

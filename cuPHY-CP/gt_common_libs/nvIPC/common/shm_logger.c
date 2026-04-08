@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -353,6 +353,8 @@ void shmlogger_save_ipc_msg(shmlogger_t* logger, nv_ipc_msg_t* msg, int32_t flag
     record.buf_size = msg->msg_len + data_size_limit;
     record.data_len = msg->data_len;
     record.flags    = flags;
+    record.msg_id   = flags & 0xFFFF; // Not used
+
     gettimeofday(&record.tv, NULL);
 
     int    record_size = get_record_size(&record);
@@ -399,6 +401,8 @@ void shmlogger_save_fh_buffer(shmlogger_t* logger, const char* buffer, int32_t s
     record_t record;
     record.buf_size = size;
     record.flags    = flags;
+    record.msg_id   = flags & 0xFFFF; // Not used
+    record.data_len = 0; // Not used
 
     int    record_size = get_record_size(&record);
     size_t shm_offset  = atomic_fetch_add(&logger->shmlog->offset, record_size);
@@ -430,6 +434,8 @@ void shmlogger_save_buffer(shmlogger_t* logger, const char* buffer, int32_t size
     record_t record;
     record.buf_size = size;
     record.flags    = flags;
+    record.msg_id   = flags & 0xFFFF; // Not used
+    record.data_len = 0; // Not used
 
     int    record_size = get_record_size(&record);
     size_t shm_offset  = atomic_fetch_add(&logger->shmlog->offset, record_size);
@@ -683,7 +689,7 @@ static int collect_file_log(shmlogger_t* logger, const char* src_path, const cha
         {
             fwrite(buf, 1, nbytes, fp_dst);
             size += nbytes;
-            NVLOGC(TAG_LOG_COLLECT, "%s: copy block 0: nbytes=0x%X=%d MB", __func__, nbytes, nbytes >> 20);
+            NVLOGC(TAG_LOG_COLLECT, "%s: copy block 0: nbytes=0x%lX=%ld MB", __func__, nbytes, nbytes >> 20);
         }
     }
 
@@ -705,7 +711,8 @@ static int collect_file_log(shmlogger_t* logger, const char* src_path, const cha
         {
             fwrite(buf, 1, nbytes, fp_dst);
             size += nbytes;
-            NVLOGC(TAG_LOG_COLLECT, "%s: copy block 1: nbytes=0x%X w_pos=0x%lX r_pos=0x%lX", __func__, nbytes, ftell(fp_dst) - nbytes, ftell(fp_src) - nbytes);
+            NVLOGC(TAG_LOG_COLLECT, "%s: copy block 1: nbytes=0x%lX w_pos=0x%lX r_pos=0x%lX",
+                    __func__, nbytes, ftell(fp_dst) - nbytes, ftell(fp_src) - nbytes);
         }
     }
 
@@ -723,7 +730,7 @@ static int collect_file_log(shmlogger_t* logger, const char* src_path, const cha
         {
             fwrite(buf, 1, nbytes, fp_dst);
             size += nbytes;
-            NVLOGC(TAG_LOG_COLLECT, "%s: copy block 2: nbytes=0x%X w_pos=0x%lX r_pos=0x%lX to_read=0x%lX", __func__, nbytes, ftell(fp_dst) - nbytes, ftell(fp_src) - nbytes, to_read);
+            NVLOGC(TAG_LOG_COLLECT, "%s: copy block 2: nbytes=0x%lX w_pos=0x%lX r_pos=0x%lX to_read=0x%lX", __func__, nbytes, ftell(fp_dst) - nbytes, ftell(fp_src) - nbytes, to_read);
         }
         else
         {

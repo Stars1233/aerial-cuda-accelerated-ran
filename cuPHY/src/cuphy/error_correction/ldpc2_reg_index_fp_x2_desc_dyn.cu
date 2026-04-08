@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -600,9 +600,9 @@ cuphyStatus_t reg_index_fp_x2_desc_dyn::get_launch_config(const ldpc::decoder&  
     launchConfig.kernel_node_params_driver.extra          = nullptr;
     launchConfig.kernel_node_params_driver.kernelParams   = launchConfig.kernel_args;
 
-
-    launchConfig.kernel_node_params_driver.sharedMemBytes = shmem_llr_buffer_size(launchConfig.decode_desc.config.num_parity_nodes + max_info_nodes<1>::value,   // num shared memory nodes
-                                                                                  Z,               // lifting size
+ 
+    launchConfig.kernel_node_params_driver.sharedMemBytes = shmem_llr_buffer_size(NUM_VAR_NODES,    // num shared memory nodes
+                                                                                  Z,                // lifting size
                                                                                   sizeof(__half2)); // element size
     cudaFunction_t deviceFunction;
     MemtraceDisableScope md;

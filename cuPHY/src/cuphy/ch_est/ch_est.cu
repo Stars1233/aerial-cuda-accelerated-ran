@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -5120,14 +5120,15 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
            uint32_t N_DMRS_INTERP_PRB_OUT_PER_CLUSTER, // # of PRBs bearing channel estimates (interpolated tones) at output
            uint32_t N_DMRS_SYMS>                       // # of time domain DMRS symbols (1,2 or 4)
  void
- puschRxChEstKernelBuilder::multiStageChEst(uint16_t           nTotalDataPrb,
+ puschRxChEstKernelBuilder::multiStageChEst(uint8_t            enablePerPrgChEstPerUeg,
+                               uint16_t                        nTotalDataPrb,
                                uint16_t                        nUeGrps,
                                uint32_t                        nRxAnt,
                                uint8_t                         enableDftSOfdm,
                                uint8_t                         enablePerPrgChEst, 
                                cuphyPuschRxChEstLaunchCfg_t&   launchCfg)
  {
-     if(enablePerPrgChEst==1)
+     if((enablePerPrgChEst==1)&&(enablePerPrgChEstPerUeg==1))
      {
          void* kernelFunc = reinterpret_cast<void*>(windowedChEstPreNoDftSOfdmKernel<TStorage,
                                                         TDataRx,
@@ -5344,7 +5345,8 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
            uint32_t N_LAYERS,
            uint32_t N_DMRS_GRIDS_PER_PRB,
            uint32_t N_DMRS_SYMS>
- void puschRxChEstKernelBuilder::kernelSelectL0(uint16_t           nTotalDataPrb,
+ void puschRxChEstKernelBuilder::kernelSelectL0(uint8_t            enablePerPrgChEstPerUeg,
+                                   uint16_t                        nTotalDataPrb,
                                    uint16_t                        nUeGrps,
                                    uint32_t                        nRxAnt,
                                    uint8_t                         enableDftSOfdm,
@@ -5376,7 +5378,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                             N_DMRS_GRIDS_PER_PRB,
                             N_DMRS_PRB_IN_PER_CLUSTER,
                             N_DMRS_INTERP_PRB_OUT_PER_CLUSTER,
-                            N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
+                            N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
          } else if(chEstAlgo==PUSCH_CH_EST_ALGO_TYPE_LS_ONLY) {
             lsChEst<TStorage,
                     TDataRx,
@@ -5409,7 +5411,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                             N_DMRS_GRIDS_PER_PRB,
                             N_DMRS_PRB_IN_PER_CLUSTER,
                             N_DMRS_INTERP_PRB_OUT_PER_CLUSTER,
-                            N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
+                            N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
          } else if(chEstAlgo==PUSCH_CH_EST_ALGO_TYPE_LS_ONLY) {
             lsChEst<TStorage,
                     TDataRx,
@@ -5444,7 +5446,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                     N_DMRS_GRIDS_PER_PRB,
                                     N_PRBS,
                                     N_PRBS,
-                                    N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
+                                    N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
                  } else if(chEstAlgo==PUSCH_CH_EST_ALGO_TYPE_LS_ONLY) {
                      lsChEst<TStorage,
                              TDataRx,
@@ -5477,7 +5479,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                     N_DMRS_GRIDS_PER_PRB,
                                     N_PRBS,
                                     N_PRBS,
-                                    N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
+                                    N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
                  } else if(chEstAlgo==PUSCH_CH_EST_ALGO_TYPE_LS_ONLY) {
                      lsChEst<TStorage,
                              TDataRx,
@@ -5510,7 +5512,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                     N_DMRS_GRIDS_PER_PRB,
                                     N_PRBS,
                                     N_PRBS,
-                                    N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
+                                    N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nRxAnt, enableDftSOfdm, enablePerPrgChEst, launchCfg);
                  } else if(chEstAlgo==PUSCH_CH_EST_ALGO_TYPE_LS_ONLY) {
                      lsChEst<TStorage,
                              TDataRx,
@@ -5624,6 +5626,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                    uint8_t                         nLayers,
                                    uint8_t                         nDmrsSyms,
                                    uint8_t                         nDmrsGridsPerPrb,
+                                   uint8_t                         enablePerPrgChEstPerUeg,
                                    uint16_t                        nTotalDataPrb,
                                    uint8_t                         Nh,
                                    uint16_t                        nUeGrps,
@@ -5655,7 +5658,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                TCompute,
                                N_LAYERS,
                                N_DMRS_GRIDS_PER_PRB,
-                               N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
+                               N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
                 break;
              }
 
@@ -5669,7 +5672,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                 TCompute,
                                 N_LAYERS,
                                 N_DMRS_GRIDS_PER_PRB,
-                                N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
+                                N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
                  break;
              } // nLayers = 2,4
 
@@ -5681,7 +5684,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                 TCompute,
                                 N_LAYERS,
                                 N_DMRS_GRIDS_PER_PRB,
-                                N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
+                                N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
                  break;
              } // nLayers = 1
 
@@ -5705,7 +5708,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                 TCompute,
                                 N_LAYERS,
                                 N_DMRS_GRIDS_PER_PRB,
-                                N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
+                                N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
                  break;
              } // nLayers = 2,4
 
@@ -5717,7 +5720,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                 TCompute,
                                 N_LAYERS,
                                 N_DMRS_GRIDS_PER_PRB,
-                                N_DMRS_SYMS>(nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
+                                N_DMRS_SYMS>(enablePerPrgChEstPerUeg, nTotalDataPrb, nUeGrps, nBSAnts, enableDftSOfdm, chEstAlgo, enablePerPrgChEst, launchCfg);
                  break;
              } // nLayers = 1
 
@@ -5740,6 +5743,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                    uint8_t                         nLayers,
                                    uint8_t                         nDmrsSyms,
                                    uint8_t                         nDmrsGridsPerPrb,
+                                   uint8_t                         enablePerPrgChEstPerUeg,
                                    uint16_t                        nTotalDataPrb,
                                    uint8_t                         Nh,
                                    uint16_t                        nUeGrps,
@@ -5766,6 +5770,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                                          nLayers,
                                                          nDmrsSyms,
                                                          nDmrsGridsPerPrb,
+                                                         enablePerPrgChEstPerUeg,
                                                          nTotalDataPrb,
                                                          Nh,
                                                          nUeGrps,
@@ -5781,6 +5786,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                                          nLayers,
                                                          nDmrsSyms,
                                                          nDmrsGridsPerPrb,
+                                                         enablePerPrgChEstPerUeg,
                                                          nTotalDataPrb,
                                                          Nh,
                                                          nUeGrps,
@@ -5802,6 +5808,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                                      nLayers,
                                                      nDmrsSyms,
                                                      nDmrsGridsPerPrb,
+                                                     enablePerPrgChEstPerUeg,
                                                      nTotalDataPrb,
                                                      Nh,
                                                      nUeGrps,
@@ -6033,6 +6040,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                   drvdUeGrpPrms.nLayers,
                                   drvdUeGrpPrms.dmrsMaxLen,
                                   drvdUeGrpPrms.nDmrsGridsPerPrb,
+                                  drvdUeGrpPrms.enablePerPrgChEst,
                                   nPrb,
                                   1,
                                   nUeGrps,
@@ -6097,7 +6105,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
          // also note nRxAnt is not strictly needed
          bool newHetCfgFound = false;
          cuphyPuschRxChEstLaunchCfg_t launchCfg;
-         auto hashKey = std::make_tuple(drvdUeGrpPrms.nRxAnt, drvdUeGrpPrms.nLayers, drvdUeGrpPrms.dmrsMaxLen, drvdUeGrpPrms.nDmrsGridsPerPrb, nPrb);
+         auto hashKey = std::make_tuple(drvdUeGrpPrms.nRxAnt, drvdUeGrpPrms.nLayers, drvdUeGrpPrms.dmrsMaxLen, drvdUeGrpPrms.nDmrsGridsPerPrb, drvdUeGrpPrms.enablePerPrgChEst, nPrb);
          auto hashItr = m_ChEstHashTable.find(hashKey);
          if (hashItr == m_ChEstHashTable.end() )
          {
@@ -6107,6 +6115,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                                       drvdUeGrpPrms.nLayers,
                                       drvdUeGrpPrms.dmrsMaxLen,
                                       drvdUeGrpPrms.nDmrsGridsPerPrb,
+                                      drvdUeGrpPrms.enablePerPrgChEst,
                                       nPrb,
                                       1,
                                       nUeGrps,
@@ -6510,6 +6519,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                            drvdUeGrpPrms.nLayers,
                            drvdUeGrpPrms.dmrsMaxLen,
                            drvdUeGrpPrms.nDmrsGridsPerPrb,
+                           drvdUeGrpPrms.enablePerPrgChEst,
                            hetCfg.nMaxPrb,
                            1,
                            hetCfg.nUeGrps,
@@ -6540,7 +6550,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                     cuphyPuschRxUeGrpPrms_t & drvdUeGrpPrms = pDrvdUeGrpPrmsCpu[dynDescr.hetCfgUeGrpMap[k]];
                     const uint16_t nPrb = drvdUeGrpPrms.nPrb;
                     const uint16_t nLayers = drvdUeGrpPrms.nLayers;
-                    if(enablePerPrgChEst==1)
+                    if((enablePerPrgChEst==1)&&(drvdUeGrpPrms.enablePerPrgChEst==1))
                     {
                         uint16_t prgSize = drvdUeGrpPrms.prgSize;
                         
@@ -6622,7 +6632,7 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                     }
                 }
 
-                uint16_t CUPHY_PUSCH_RX_CH_EST_DELAY_EST_PRB_CLUSTER_SIZE = (enablePerPrgChEst==1) ? CUPHY_PUSCH_RX_CH_EST_PRG_DELAY_EST_PRB_CLUSTER_SIZE : CUPHY_PUSCH_RX_CH_EST_NON_PRG_DELAY_EST_PRB_CLUSTER_SIZE;
+                uint16_t CUPHY_PUSCH_RX_CH_EST_DELAY_EST_PRB_CLUSTER_SIZE = ((enablePerPrgChEst==1)&&(drvdUeGrpPrms.enablePerPrgChEst==1)) ? CUPHY_PUSCH_RX_CH_EST_PRG_DELAY_EST_PRB_CLUSTER_SIZE : CUPHY_PUSCH_RX_CH_EST_NON_PRG_DELAY_EST_PRB_CLUSTER_SIZE;
                 CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = launchCfg.kernelNodeParamsDriver;
                 kernelNodeParamsDriver.gridDimX = div_round_up(static_cast<int>(nMaxPrb), static_cast<int>(CUPHY_PUSCH_RX_CH_EST_DELAY_EST_PRB_CLUSTER_SIZE));
                 kernelNodeParamsDriver.gridDimY = nMaxRxAnt;
@@ -6704,10 +6714,10 @@ __global__ void puschRkhsChEstKernel(puschRxChEstStatDescr_t* pStatDescr, puschR
                 {
                     //configure wait and DGL kernels for sub-slot
                     pStartKernels->setWaitKernelParams(pWaitKernelLaunchCfgsPreSubSlot, CUPHY_PUSCH_SUB_SLOT_PATH, &kernelArgs.pStatDescr, &kernelArgs.pDynDescr);
-                    pStartKernels->setDeviceGraphLaunchKernelParams(pDglKernelLaunchCfgsPreSubSlot, enableDeviceGraphLaunch, &kernelArgs.pDynDescr, pSubSlotDeviceGraphExec);
+                    pStartKernels->setDeviceGraphLaunchKernelParams(pDglKernelLaunchCfgsPreSubSlot, enableDeviceGraphLaunch, CUPHY_PUSCH_SUB_SLOT_PATH, &kernelArgs.pDynDescr, pSubSlotDeviceGraphExec);
                     //configure wait and DGL kernels for full-slot (the wait kernel is used only if sub-slot processing is enabled)
                     pStartKernels->setWaitKernelParams(pWaitKernelLaunchCfgsPostSubSlot, CUPHY_PUSCH_FULL_SLOT_PATH, &kernelArgs.pStatDescr, &kernelArgs.pDynDescr);
-                    pStartKernels->setDeviceGraphLaunchKernelParams(pDglKernelLaunchCfgsPostSubSlot, enableDeviceGraphLaunch, &kernelArgs.pDynDescr, pFullSlotDeviceGraphExec);
+                    pStartKernels->setDeviceGraphLaunchKernelParams(pDglKernelLaunchCfgsPostSubSlot, enableDeviceGraphLaunch, CUPHY_PUSCH_FULL_SLOT_PATH, &kernelArgs.pDynDescr, pFullSlotDeviceGraphExec);
                }
             }
         }

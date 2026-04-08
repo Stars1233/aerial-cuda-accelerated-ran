@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -83,7 +83,13 @@ statisChanModel<Tscalar, Tcomplex>::statisChanModel(
             ) * m_sim_config->center_freq_hz / 3e8;  // Calculate max Doppler from velocity
             
             // Simulation parameters from sim_config
-            m_tdl_chan_cfg->f_samp = m_sim_config->bandwidth_hz;  // Use bandwidth as sampling freq
+            if (m_sim_config->fft_size <= 0 || m_sim_config->sc_spacing_hz <= 0.0f) {
+                throw ChannelModelError(
+                    "Invalid sampling config for TDL: fft_size and sc_spacing_hz must be positive. "
+                    "Got fft_size=" + std::to_string(m_sim_config->fft_size) +
+                    ", sc_spacing_hz=" + std::to_string(m_sim_config->sc_spacing_hz));
+            }
+            m_tdl_chan_cfg->f_samp = m_sim_config->fft_size * m_sim_config->sc_spacing_hz;  // Sampling frequency = N_FFT * SCS
             m_tdl_chan_cfg->nCell = 1;  // Default for link-level simulation
             m_tdl_chan_cfg->nUe = 1;    // Default for link-level simulation
             
@@ -107,7 +113,7 @@ statisChanModel<Tscalar, Tcomplex>::statisChanModel(
             m_tdl_chan_cfg->delay = m_link_level_config->delay;
             
             // Signal processing parameters
-            m_tdl_chan_cfg->sigLenPerAnt = m_sim_config->fft_size;  // Use FFT size as signal length
+            m_tdl_chan_cfg->sigLenPerAnt = m_sim_config->fft_size;  // Use FFT size as signal length, can be set to different value if needed
             m_tdl_chan_cfg->N_sc = m_sim_config->n_prb * 12;  // Total subcarriers
             m_tdl_chan_cfg->N_sc_Prbg = m_sim_config->n_prbg * 12;  // Subcarriers per PRB group
             m_tdl_chan_cfg->scSpacingHz = m_sim_config->sc_spacing_hz;
@@ -144,7 +150,13 @@ statisChanModel<Tscalar, Tcomplex>::statisChanModel(
             ) * m_sim_config->center_freq_hz / 3e8;  // Calculate max Doppler from velocity
             
             // Simulation parameters from sim_config
-            m_cdl_chan_cfg->f_samp = m_sim_config->bandwidth_hz;  // Use bandwidth as sampling freq
+            if (m_sim_config->fft_size <= 0 || m_sim_config->sc_spacing_hz <= 0.0f) {
+                throw ChannelModelError(
+                    "Invalid sampling config for CDL: fft_size and sc_spacing_hz must be positive. "
+                    "Got fft_size=" + std::to_string(m_sim_config->fft_size) +
+                    ", sc_spacing_hz=" + std::to_string(m_sim_config->sc_spacing_hz));
+            }
+            m_cdl_chan_cfg->f_samp = m_sim_config->fft_size * m_sim_config->sc_spacing_hz;  // Sampling frequency = N_FFT * SCS
             m_cdl_chan_cfg->nCell = 1;  // Default for link-level simulation
             m_cdl_chan_cfg->nUe = 1;    // Default for link-level simulation
             
@@ -160,9 +172,9 @@ statisChanModel<Tscalar, Tcomplex>::statisChanModel(
                     m_cdl_chan_cfg->bsAntSize.assign({
                         static_cast<uint16_t>(bs_panel.antSize[0]),  // M_g
                         static_cast<uint16_t>(bs_panel.antSize[1]),  // N_g
-                        static_cast<uint16_t>(bs_panel.antSize[2]),  // P
-                        static_cast<uint16_t>(bs_panel.antSize[3]),  // M
-                        static_cast<uint16_t>(bs_panel.antSize[4])   // N
+                        static_cast<uint16_t>(bs_panel.antSize[2]),  // M
+                        static_cast<uint16_t>(bs_panel.antSize[3]),  // N
+                        static_cast<uint16_t>(bs_panel.antSize[4])   // P
                     });
 
                     // Use proper vector assignment for bsAntSpacing
@@ -189,9 +201,9 @@ statisChanModel<Tscalar, Tcomplex>::statisChanModel(
                     m_cdl_chan_cfg->ueAntSize.assign({
                         static_cast<uint16_t>(ue_panel.antSize[0]),  // M_g
                         static_cast<uint16_t>(ue_panel.antSize[1]),  // N_g
-                        static_cast<uint16_t>(ue_panel.antSize[2]),  // P
-                        static_cast<uint16_t>(ue_panel.antSize[3]),  // M
-                        static_cast<uint16_t>(ue_panel.antSize[4])   // N
+                        static_cast<uint16_t>(ue_panel.antSize[2]),  // M
+                        static_cast<uint16_t>(ue_panel.antSize[3]),  // N
+                        static_cast<uint16_t>(ue_panel.antSize[4])   // P
                     });
 
                     // Use proper vector assignment for ueAntSpacing
@@ -212,14 +224,14 @@ statisChanModel<Tscalar, Tcomplex>::statisChanModel(
                 }
             } else {
                 // Default BS antenna configuration
-                m_cdl_chan_cfg->bsAntSize.assign({1, 2, 2, 1, 1});
-                m_cdl_chan_cfg->bsAntSpacing.assign({0.5f, 0.5f, 1.0f, 1.0f});
+                m_cdl_chan_cfg->bsAntSize.assign({1, 1, 1, 2, 2});
+                m_cdl_chan_cfg->bsAntSpacing.assign({1.0f, 1.0f, 0.5f, 0.5f});
                 m_cdl_chan_cfg->bsAntPolarAngles.assign({45.0f, -45.0f});
                 m_cdl_chan_cfg->bsAntPattern = 1;
                 
                 // Default UE antenna configuration
-                m_cdl_chan_cfg->ueAntSize.assign({2, 2, 1, 1, 1});
-                m_cdl_chan_cfg->ueAntSpacing.assign({0.5f, 0.5f, 1.0f, 1.0f});
+                m_cdl_chan_cfg->ueAntSize.assign({1, 1, 2, 2, 1});
+                m_cdl_chan_cfg->ueAntSpacing.assign({1.0f, 1.0f, 0.5f, 0.5f});
                 m_cdl_chan_cfg->ueAntPolarAngles.assign({0.0f, 90.0f});
                 m_cdl_chan_cfg->ueAntPattern = 0;
             }
@@ -245,7 +257,7 @@ statisChanModel<Tscalar, Tcomplex>::statisChanModel(
             m_cdl_chan_cfg->delay = m_link_level_config->delay;
             
             // Signal processing parameters
-            m_cdl_chan_cfg->sigLenPerAnt = m_sim_config->fft_size;  // Use FFT size as signal length
+            m_cdl_chan_cfg->sigLenPerAnt = m_sim_config->fft_size;  // Use FFT size as signal length, can be set to different value if needed
             m_cdl_chan_cfg->N_sc = m_sim_config->n_prb * 12;  // Total subcarriers
             m_cdl_chan_cfg->N_sc_Prbg = m_sim_config->n_prbg * 12;  // Subcarriers per PRB group
             m_cdl_chan_cfg->scSpacingHz = m_sim_config->sc_spacing_hz;
@@ -348,12 +360,22 @@ void statisChanModel<Tscalar, Tcomplex>::dump_los_nlos_stats(float* lost_nlos_st
 }
 
 template <typename Tscalar, typename Tcomplex>
-void statisChanModel<Tscalar, Tcomplex>::dump_pathloss_shadowing_stats(
-    float* pathloss_shadowing,
+void statisChanModel<Tscalar, Tcomplex>::dump_pl_sf_stats(
+    float* pl_sf,
     const std::vector<uint16_t>& activeCell,
     const std::vector<uint16_t>& activeUt) {
-    if (m_sls_chan && pathloss_shadowing) {
-        m_sls_chan->dump_pathloss_shadowing_stats(pathloss_shadowing, activeCell, activeUt);
+    if (m_sls_chan && pl_sf) {
+        m_sls_chan->dump_pl_sf_stats(pl_sf, activeCell, activeUt);
+    }
+}
+
+template <typename Tscalar, typename Tcomplex>
+void statisChanModel<Tscalar, Tcomplex>::dump_pl_sf_ant_gain_stats(
+    float* pl_sf_ant_gain,
+    const std::vector<uint16_t>& activeCell,
+    const std::vector<uint16_t>& activeUt) {
+    if (m_sls_chan && pl_sf_ant_gain) {
+        m_sls_chan->dump_pl_sf_ant_gain_stats(pl_sf_ant_gain, activeCell, activeUt);
     }
 }
 

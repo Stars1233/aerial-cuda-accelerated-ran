@@ -1,0 +1,28 @@
+# Aerial PostProc Dependencies
+# Core data processing
+pandas==1.5.2
+numpy==1.24.0
+
+# Plotting (exact version to maintain compatibility with render_mode)
+bokeh==2.4.3
+holoviews==1.15.2
+
+# Storage formats (optional - for parquet/hdf5 output formats, not used by CI/CD default)
+h5py==3.7.0
+pyarrow==12.0.1
+tables==3.7.0
+
+# Parsing
+pyparsing==3.0.9
+pyyaml==6.0
+
+# Utilities
+colorama==0.4.6
+cxxfilt
+
+# Power scripts
+ntplib
+
+# Dashboard upload (NVIDIA internal)
+# Dashboard scripts have their own separate venv with additional dependencies
+# See scripts/dashboard/README.md for setup instructions

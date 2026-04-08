@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -109,6 +109,7 @@ DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, c
                 ueGrpPrmsVec[globalUeGrpIdx].dmrsSymLocBmsk = ueGrpCfg.get_value_as<uint16_t>("dmrsSymLocBmsk");
                 ueGrpPrmsVec[globalUeGrpIdx].rssiSymLocBmsk = ueGrpCfg.get_value_as<uint16_t>("rssiSymLocBmsk");
                 ueGrpPrmsVec[globalUeGrpIdx].prgSize        = ueGrpCfg.get_value_as<uint16_t>("prgSize");
+                ueGrpPrmsVec[globalUeGrpIdx].enablePerPrgChEstPerUeg = ueGrpCfg.get_value_as<uint8_t>("enablePerPrgChEst");
                 ueGrpToUeIdxs[globalUeGrpIdx].resize(ueGrpPrmsVec[globalUeGrpIdx].nUes);
                 ueGrpPrmsVec[globalUeGrpIdx].pUePrmIdxs = ueGrpToUeIdxs[globalUeGrpIdx].data();
                 localToGlobalUeGrpIdx[ueGrpIdx]             = globalUeGrpIdx;
@@ -155,6 +156,8 @@ DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, c
                 uePrmsVec[globalUeIdx].qamModOrder                = tbConfig.get_value_as<uint8_t>("qamModOrder");
                 uePrmsVec[globalUeIdx].TBSize                     = tbConfig.get_value_as<uint32_t>("nTbByte");
                 uePrmsVec[globalUeIdx].foForgetCoeff              = tbConfig.get_value_as<float>("foForgetCoeff");
+                uePrmsVec[globalUeIdx].ldpcEarlyTerminationPerUe  = tbConfig.get_value_as<uint8_t>("ldpcEarlyTerminationPerUe");
+                uePrmsVec[globalUeIdx].ldpcMaxNumItrPerUe         = tbConfig.get_value_as<uint8_t>("ldpcMaxNumItrPerUe");
                 try
                 {
                     uePrmsVec[globalUeIdx].ndi = tbConfig.get_value_as<uint8_t>("ndi");
@@ -955,6 +958,8 @@ StaticApiDataset::StaticApiDataset(const std::vector<std::string>& inputFileName
     puschStatPrms.enableDeviceGraphLaunch  = 0; // since compute-sanitizer (as of version 2023.3.1.0) for synccheck causes crash in the app when enableDeviceGraphLaunch=1, keep it disabled for now
     puschStatPrms.enableDebugEqOutput      = 0; // disable post-eq debugging output by default
     puschStatPrms.enableBatchedMemcpy      = 1; //FIXME decide on an appropriate default value
+    puschStatPrms.nMaxLdpcHetConfigs       = 32; // default number LDPC config nodes to some nominal value
+    puschStatPrms.nMaxTbPerNode            = CUPHY_LDPC_DECODE_DESC_MAX_TB; // Use maximum number of transport blocks per node
 
     if(apiTVflag == 0)
     {
@@ -1038,6 +1043,10 @@ StaticApiDataset::StaticApiDataset(const std::vector<std::string>& inputFileName
             case 1:
             puschStatPrms.ldpcMaxNumItrAlgo = LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT;
             break;
+
+            case 2:
+            puschStatPrms.ldpcMaxNumItrAlgo = LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE;
+            break;
         }
         puschStatPrms.fixedMaxNumLdpcItrs = gnbConfig.get_value_as<uint8_t>("ldpcMaxNumItr");
 
@@ -1108,13 +1117,14 @@ StaticApiDataset::StaticApiDataset(const std::vector<std::string>& inputFileName
         }
         
         puschStatPrms.enablePerPrgChEst= gnbConfig.get_value_as<uint8_t>("enablePerPrgChEst");
+                
+        //printf("file[%s]enablePerPrgChEst[%d]\n", inputFileNameVec[0].c_str(), puschStatPrms.enablePerPrgChEst);
 
         puschStatPrms.nMaxCells        = inputFileNameVec.size();
         puschStatPrms.nMaxCellsPerSlot = puschPrms ? puschPrms->maxNCellsPerSlot : puschStatPrms.nMaxCells;
         puschStatPrms.pCellStatPrms    = &cellStatPrmVec[0];
         puschStatPrms.pDbg             = &dbgPrm;
         puschStatPrms.nMaxCells        = cellStatPrmVec.size();
-        puschStatPrms.nMaxLdpcHetConfigs = 32;  //32 is used for cuPHY standalone test.
 
         // CSI-P2 FAPIv3 API paramaters
         puschStatPrms.enableCsiP2Fapiv3 = gnbConfig.get_value_as<uint8_t>("enableCsiP2Fapiv3");
@@ -1278,7 +1288,6 @@ StaticApiDataset::StaticApiDataset(const std::vector<std::string>& inputFileName
         puschStatPrms.pCellStatPrms    = &cellStatPrmVec[0];
         puschStatPrms.pDbg             = &dbgPrm;
         puschStatPrms.nMaxCells        = cellStatPrmVec.size();
-
     }
 }
 
@@ -4882,7 +4891,7 @@ srsDynApiDataset::srsDynApiDataset(const std::vector<std::string>& inputFileName
             ueSrsPrmVec[ueIdx_within_cellGrp].Tsrs                   = ueSrsPrm.get_value_as<uint16_t>("Tsrs");
             ueSrsPrmVec[ueIdx_within_cellGrp].Toffset                = ueSrsPrm.get_value_as<uint16_t>("Toffset");
             ueSrsPrmVec[ueIdx_within_cellGrp].groupOrSequenceHopping = ueSrsPrm.get_value_as<uint8_t>("groupOrSequenceHopping");
-            ueSrsPrmVec[ueIdx_within_cellGrp].prgSize                = ueSrsPrm.get_value_as<uint8_t>("prgSize");
+            ueSrsPrmVec[ueIdx_within_cellGrp].prgSize                = ueSrsPrm.get_value_as<uint16_t>("prgSize");
             ueSrsPrmVec[ueIdx_within_cellGrp].RNTI                   = ueSrsPrm.get_value_as<uint16_t>("RNTI");
             ueSrsPrmVec[ueIdx_within_cellGrp].chEstBuffIdx           = ueIdx_within_cellGrp;
 
@@ -5666,7 +5675,7 @@ bfwStaticApiDataset::bfwStaticApiDataset(const std::vector<std::string>& inputFi
     bfwStatPrms.nMaxPrbGrps      = nMaxPrbGrps;
     bfwStatPrms.compressBitwidth = 9;
     bfwStatPrms.nMaxUeGrps       = CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS;
-    bfwStatPrms.nMaxTotalLayers  = CUPHY_BFW_COEF_COMP_N_MAX_TOTAL_LAYERS;
+    bfwStatPrms.nMaxTotalLayers  = CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS * MAX_DL_LAYERS; //MAX_DL_LAYERS = 32
     bfwStatPrms.pStatDbg         = &statDbgPrm;
 
     // GPU memory footprint tracking

@@ -305,6 +305,27 @@ public:
     int                                                                           waitUplanePrepDone(int num_uplane_prep_tasks);
 
     /**
+     * @brief Marks C-plane as done for a specific task number.
+     *
+     * Sets the corresponding bit in atom_cplane_done_mask. Used for
+     * synchronization when DL affinity is disabled.
+     *
+     * @param task_num Task number (0-31)
+     */
+    void                                                                          setCplaneDoneForTask(int task_num);
+
+    /**
+     * @brief Waits for C-plane to complete for a specific task number.
+     *
+     * Waits until the corresponding bit in atom_cplane_done_mask is set.
+     * Used for synchronization when DL affinity is disabled.
+     *
+     * @param task_num Task number (0-31)
+     * @return 0 on success, -1 on timeout (2x GENERIC_WAIT_THRESHOLD_NS)
+     */
+    int                                                                           waitCplaneDoneForTask(int task_num);
+
+    /**
      * @brief Waits for all threads to reach C-plane processing stage.
      *
      * Synchronization barrier for multi-threaded C-plane start.
@@ -465,6 +486,7 @@ private:
     std::array<std::atomic<bool>, DL_MAX_CELLS_PER_SLOT>     atom_cell_fhcb_done; ///< Atomic flags: fronthaul callback completed per cell
     std::atomic<int>                                         atom_dlc_done;       ///< Atomic counter: DL C-plane tasks completed (synchronized via waitDLCDone() in mMIMO mode)
     std::atomic<int>                                         atom_uplane_prep_done; ///< Atomic counter: U-plane preparation tasks completed
+    std::atomic<uint32_t>                                    atom_cplane_done_mask; ///< Atomic bitmask: C-plane done per task_num (bit N = task_num N done)
 
     std::atomic<int>                                         atom_dl_cplane_start; ///< Atomic counter: threads started C-plane processing
     std::atomic<int>                                         atom_dl_end_threads;  ///< Atomic counter: threads finished slot processing

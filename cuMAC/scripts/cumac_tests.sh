@@ -1,5 +1,6 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +28,7 @@ while getopts ":t:T:l:L:g:G:m:M:" opt; do
       test=$OPTARG
       ;;
     l|L)
-      log=$OPTARG
+      log=${OPTARG%/}  # Remove trailing slash if present
       ;;
     g|G)
       gpu=$OPTARG
@@ -52,7 +53,7 @@ script_folder="${cuBB_SDK}/cuMAC/scripts"
 if [[ -z "$test" || -z "$log" ]]; then
    echo "test and log are required parameters."
    echo "Usage: $script_name -t <test> -l <log> -g <gpu> -m <true|false>"
-   echo "   test: 4t4r, tdl, cdl, drl, srs, 64tr, 4t4r_fast_fading"
+   echo "   test: 4t4r, tdl, cdl, drl, srs, 64tr, 4t4r_fast_fading, pfmsort"
    echo "   log: log folder"
    echo "   gpu: gpu device id, if not provided,then will be 0"
    echo "   smoke (-m/-M): enable smoke test, true|false, if not provided,then will be false, which runs exhaustive sanity tests, but will consume more time. Used only for 4t4r and 64tr tests"
@@ -129,7 +130,7 @@ elif [[ "$test" == "tdl" || "$test" == "cdl" ]]; then
       done
    done
 elif [[ "$test" == "drl" ]];then
-   tv_folder="${cuBB_SDK}/cuMAC/testVectors/mlSim"
+   tv_folder="${cuBB_SDK}/cuMAC/examples/ml/testVectors/drlMcsSelection"
    case="0001"
    cd "$script_folder" && $test_cmd -o "$test" -l "${log}/${test}" -i "$case" -tv "$tv_folder"
 
@@ -144,4 +145,13 @@ elif [[ "$test" == "64tr" ]];then
 elif [[ "$test" == "srs" ]];then
    echo "Start to run cumac $test test with default config file ..."
    cd $script_folder && $test_cmd -o $test -l ${log}/${test} -i all
+
+elif [[ "$test" == "pfmsort" ]];then
+   echo "Start to run cumac $test test ..."
+   if [[ "$smoke" == "true" ]]; then
+      # with smoke, seeds are reduced to [0, 1, 2]
+      cd "$script_folder" && $test_cmd -o $test -l ${log}/${test} -i all --smoke
+   else
+      cd "$script_folder" && $test_cmd -o $test -l ${log}/${test} -i all
+   fi
 fi

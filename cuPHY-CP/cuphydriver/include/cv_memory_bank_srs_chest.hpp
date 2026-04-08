@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,7 +51,18 @@ typedef struct _CVSrsChestBuff
          * 
          * @param bdev  GPU device buffer pointer
          */
-        _CVSrsChestBuff(dev_buf * bdev)
+        _CVSrsChestBuff(dev_buf* bdev) :
+            srs_chest_buff_state(slot_command_api::SRS_CHEST_BUFF_NONE),
+            rnti(CV_INVALID_RNTI),
+            buffer_idx(CV_INVALID_CESHT_BUF_INDEX),
+            cell_id(0),
+            srs_chest_buff_usage(0),
+            sfn(0xFFFF),
+            slot(0xFFFF),
+            srsPrgSize(0),
+            srsStartPrg(0),
+            srsStartValidPrg(0),
+            srsNValidPrg(0)
         {
             buffer.reset(bdev);
             buffer->clear();

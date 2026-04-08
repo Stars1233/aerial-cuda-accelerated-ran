@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,10 @@
 #include "utils.hpp"
 #include "queue.hpp"
 #include "aerial-fh-driver/fh_mutex.hpp"
+
+#ifndef TAG_PEER_HPP
+#define TAG_PEER_HPP (NVLOG_TAG_BASE_FH_DRIVER + 1) // "FH.PEER"
+#endif
 
 namespace aerial_fh
 {
@@ -77,7 +81,9 @@ private:
 public:
     /**
      * Default constructor - initializes empty array
+     * mbufs_ elements are only accessed via operator[]/data() within [0, size_), so uninit is safe.
      */
+    // coverity[uninit_ctor]
     MbufArray() : size_(0) {}
 
     /**
@@ -122,7 +128,9 @@ public:
      * @return Const mbuf pointer at index
      */
     rte_mbuf* operator[](size_t index) const {
-        assert(index < size_);
+        if(index >= size_) {
+            NVLOGF_FMT(TAG_PEER_HPP, AERIAL_ORAN_FH_EVENT, "MbufArray index out of bounds: {} >= {}", index, size_);
+        }
         return mbufs_[index];
     }
 
@@ -132,7 +140,9 @@ public:
      * @return Reference to mbuf pointer at index
      */
     rte_mbuf*& operator[](size_t index) {
-        assert(index < size_);
+        if(index >= size_) {
+            NVLOGF_FMT(TAG_PEER_HPP, AERIAL_ORAN_FH_EVENT, "MbufArray index out of bounds: {} >= {}", index, size_);
+        }
         return mbufs_[index];
     }
 
@@ -141,7 +151,10 @@ public:
      * @param[in] mbuf Mbuf pointer to add
      */
     void push_back(rte_mbuf* mbuf) {
-        assert(size_ < kMaxMbufsPerArray);
+        if(size_ >= kMaxMbufsPerArray) {
+            NVLOGF_FMT(TAG_PEER_HPP, AERIAL_ORAN_FH_EVENT, "MbufArray size exceeds capacity: {} >= {}", size_, kMaxMbufsPerArray);
+            return;
+        }
         mbufs_[size_++] = mbuf;
     }
 
@@ -162,7 +175,9 @@ private:
      * Validate array state
      */
     void check_valid() const {
-        assert(size_ <= kMaxMbufsPerArray && "MbufArray size exceeds capacity");
+        if(size_ > kMaxMbufsPerArray) {
+            NVLOGF_FMT(TAG_PEER_HPP, AERIAL_ORAN_FH_EVENT, "MbufArray size exceeds capacity: {} > {}", size_, kMaxMbufsPerArray);
+        }
     }
 };
 

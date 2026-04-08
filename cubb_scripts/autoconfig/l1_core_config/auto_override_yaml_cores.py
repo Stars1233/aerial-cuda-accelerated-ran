@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -67,6 +67,7 @@ config_mappings = {
     },
     "ru_emulator": {
         "tbonly_re_ul_threads": ["ru_emulator", "ul_core_list"],
+        "tbonly_re_ul_srs_threads": ["ru_emulator", "ul_srs_core_list"],
         "tbonly_re_dl_threads": ["ru_emulator", "dl_core_list"],
         "tbonly_re_all_low_priority_threads": ["ru_emulator", "low_priority_core"],
         "tbonly_re_dpdk_thread": ["ru_emulator", "aerial_fh_dpdk_thread"],

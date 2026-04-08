@@ -23,7 +23,7 @@
 
 #pragma once
 
-static constexpr uint32_t F3_CG_SIZE = 128; // Rounded up to next power of 2 from N_TONES_PER_PRB
+static constexpr uint32_t F3_CG_SIZE = 96;
 static constexpr uint32_t F3_MAX_SYMS = 14;
 static constexpr uint32_t F3_MAX_PRBS = CUPHY_PUCCH_F3_MAX_PRBS;
 static constexpr uint32_t MAX_DATA_SYMS_F3 = 12;
@@ -99,6 +99,15 @@ typedef struct
     pucchF3RxDynDescr_t*  pDynDescr;  
 } pucchF3KernelArgs_t;
 
+struct UciShape
+{
+    int nPrb;
+    int nSymDmrs;
+    int nSymData;
+    int nAnt;
+};
+typedef UciShape UciShape_t;
+
 // Class implementation of PUCCH F3 reciver 
 class pucchF3Rx : public cuphyPucchF3Rx 
 {
@@ -132,7 +141,7 @@ public:
                cudaStream_t               strm);                           // stream to perform copy
 
     void kernelSelect(uint16_t                   nUcis,
-                      pucchF3RxDynDescr_t*       pCpuDynDesc, 
+                      UciShape_t&                maxUshape,
                       cuphyPucchF3RxLaunchCfg_t* pLaunchCfg);
 
     static void getDescrInfo(size_t& dynDescrSizeBytes, size_t& dynDescrAlignBytes);

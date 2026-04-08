@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
  */
 
 #pragma once
+#include <concepts>
 #include <unordered_map>
 
 #include "slot_command/slot_command.hpp"
@@ -210,6 +211,28 @@ namespace scf_5g_fapi {
 
 
     /**
+     * Calculate the DMRS port mask from port bitmask, scrambling ID, and layer extension
+     * 
+     * This function computes the final DMRS port mask by applying bit shifts based on:
+     * - Scrambling ID (scid): shifts by 0 or 8 bits (for scid 0 or 1)
+     * - Layer extension (nlAbove16): shifts by 0 or 16 bits (for layers <=16 or >16)
+     * 
+     * @param[in] dmrsPortBmsk DMRS port bitmask (12-bit value for Type 1)
+     * @param[in] scid Scrambling ID (0 or 1)
+     * @param[in] nlAbove16 Indicator for layers above 16 (0 or 1)
+     * @return Calculated DMRS port mask with applied shifts
+     */
+    inline uint64_t calculate_dmrs_port_mask(
+        const uint16_t dmrsPortBmsk,
+        const uint8_t scid,
+        const uint8_t nlAbove16)
+    {
+        // Apply shifts in sequence: first scid shift, then nlAbove16 shift
+        // Parentheses added for clarity (left-to-right associativity ensures correct order)
+        return (static_cast<uint64_t>(dmrsPortBmsk) << (scid * 8)) << (16 * nlAbove16);
+    }
+
+    /**
      * @brief Tracks DMRS port bitmask positions and updates ap_index for UE groups
      * 
      * This template function works with both PDSCH and PUSCH UE parameter types.
@@ -229,11 +252,7 @@ namespace scf_5g_fapi {
     {
         // Create shifted mask based on UE's scid (spatial correlation ID)
         // Each UE can have scid 0 or 1, which shifts the DMRS port bitmask by 0 or 8 bits
-#ifdef ENABLE_32DL
-        uint64_t tempMask = static_cast<uint64_t>(ue.dmrsPortBmsk) << (ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-        uint64_t tempMask = static_cast<uint64_t>(ue.dmrsPortBmsk) << (ue.scid * 8);
-#endif
+        uint64_t tempMask = calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
         
         while (tempMask != 0) {
             // Find the position of the least significant set bit (trailing zeros + 1)
@@ -268,7 +287,7 @@ namespace scf_5g_fapi {
             }
             else
             {
-                prbs.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                prbs.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                 if(mmimo_enabled)
                 {
                     //NVLOGD_FMT(SCF_SLTCMD_TAG, "{}:{} update_pm_weights_fh: ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
@@ -380,89 +399,94 @@ namespace scf_5g_fapi {
         prb.beams_array_size2 = prb.beams_array_size;        
     }
 
-    void check_bf_pc_params(int numPrg, int numDigBFI, bool mmimo_enabled);
+    /**
+     * @brief Check if the beamforming parameters are valid
+     * @param numPrg Number of PRGs
+     * @param numDigBFI Number of DigBFIs
+     * @param mmimo_enabled Whether MIMO is enabled
+     * @return True if the beamforming parameters are valid, false otherwise
+     */
+    bool check_bf_pc_params(int numPrg, int numDigBFI, bool mmimo_enabled);
+
     void check_prb_info_size(size_t& prb_info_size);
     void update_beam_list(beamid_array_t& array, size_t& array_size, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, bool mmimo_enabled, prb_info_t& prb_info, int32_t cell_idx);
     void update_beam_list_uniq(beamid_array_t& array, size_t& array_size, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, prb_info_t& prb_info, bool mmimo_enabled, int32_t cell_idx);
-    void update_beam_list(beamid_array_t& array, size_t& array_size, scf_fapi_rx_beamforming_t& pmi_bf_pdu, bool mmimo_enabled, prb_info_t& prb_info, int32_t cell_idx);
-    /* This function is used to update the static beamforming weights for the Tx Precoding and Beamforming PDU when MU-MIMO is enabled.
-     * This function is called when the Tx Precoding and Beamforming PDU is received from L2.
-     * The function is called for the paired UE's and channels for which L2 wants to use static beamforming.
-     * The function is called for the non-paired UE's and channels for which L2 wants to use static beamforming.
-     */
-    inline void update_static_bf_wt(int32_t cell_index, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, prb_info_t& prb_info, uint16_t beam_id)
-    {
-        uint16_t offset = 0;
-        offset = sizeof(scf_fapi_tx_precoding_beamforming_t);
-        nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-        if ((pmi_bf_pdu.dig_bf_interfaces != 0) && phyDriver.l1_staticBFWConfigured(cell_index))
-        {
-            NVLOGD_FMT(SCF_SLTCMD_TAG, "num_prgs={}, dig_bf_interfaces={}", reinterpret_cast<uint16_t>(pmi_bf_pdu.num_prgs), reinterpret_cast<uint8_t>(pmi_bf_pdu.dig_bf_interfaces));
-            /* This flag is used to detemine whether static beamforming weights should be sent once per cell i.e. very 1st time or needs to be sent every time for all static beamId's. */
-            if(!phyDriver.l1_get_send_static_bfw_wt_all_cplane())
-            {
-                /* This flag is used to detemine whether static beamforming weights have already been sent for this beam. */
-                if(!phyDriver.l1_getBeamWeightsSentFlag(cell_index, beam_id))
-                {
-                    phyDriver.l1_setBeamWeightsSentFlag(cell_index, beam_id);
-                }
-                else
-                {
-                    return;
-                }
-            }
-            NVLOGD_FMT(SCF_SLTCMD_TAG, "Beamidx={} entry available in DBT PDU IQ sent using extType=11 prb_info={}", beam_id, reinterpret_cast<void*>(&prb_info.common));
-            prb_info.common.extType = 11;
-            prb_info.common.isStaticBfwEncoded = true;
-            prb_info.static_bfwCoeff_buf_info.num_prgs = pmi_bf_pdu.num_prgs;
-            prb_info.static_bfwCoeff_buf_info.prg_size = pmi_bf_pdu.prg_size;
-            prb_info.static_bfwCoeff_buf_info.dig_bf_interfaces = pmi_bf_pdu.dig_bf_interfaces;
-            //prb_info.static_bfwCoeff_buf_info.nGnbAnt = pmi_bf_pdu.nGnbAnt;
-        }
-        else
-        {
-            NVLOGD_FMT(SCF_SLTCMD_TAG, "{} Static Beamforming is disabled for this PDU prb_info={}",__func__, reinterpret_cast<void*>(&prb_info.common));
-        }
-    }
+    void update_beam_list(beamid_array_t& array, size_t& array_size, const scf_fapi_rx_beamforming_t& pmi_bf_pdu, bool mmimo_enabled, prb_info_t& prb_info, int32_t cell_idx);
 
-    /* This function is used to update the static beamforming weights for the Rx Beamforming PDU when MU-MIMO is enabled.
-     * This function is called when the Rx Beamforming PDU is received from L2.
-     * The function is called for the paired UE's and channels for which L2 wants to use static beamforming.
-     * The function is called for the non-paired UE's and channels for which L2 wants to use static beamforming except for SRS and PRACH.
+    /**
+     * @brief C++20 concept constraining types for update_static_bf_wt template
+     *
+     * Requires types to have three fields with exact types to prevent narrowing:
+     * - num_prgs (uint16_t)
+     * - prg_size (uint16_t)
+     * - dig_bf_interfaces (uint8_t)
      */
-    inline void update_static_bf_wt(int32_t cell_index, scf_fapi_rx_beamforming_t& bf_pdu, prb_info_t& prb_info, uint16_t beam_id)
+    template<typename T>
+    concept BeamformingPduType = requires(T t) {
+        { t.num_prgs } -> std::same_as<uint16_t&>;
+        { t.prg_size } -> std::same_as<uint16_t&>;
+        { t.dig_bf_interfaces } -> std::same_as<uint8_t&>;
+    };
+
+    /**
+     * @brief Update static beamforming weights for a beamforming PDU
+     *
+     * This function is called when a Tx Precoding/Beamforming or Rx Beamforming PDU is received from L2
+     * for UEs and channels where L2 requests static beamforming.
+     *
+     * @tparam BeamformingPdu Beamforming PDU type; must satisfy BeamformingPduType
+     * @param[in]     cell_index Logical cell index associated with the PDU
+     * @param[in]     bf_pdu     Beamforming PDU providing num_prgs, prg_size, and dig_bf_interfaces
+     * @param[in,out] prb_info   PRB info structure to be updated with static beamforming buffer metadata
+     * @param[in]     beam_id    Beam identifier used to look up static DBT entries
+     */
+    template<BeamformingPduType BeamformingPdu>
+    inline void update_static_bf_wt(const int32_t cell_index,
+                                    const BeamformingPdu& bf_pdu,
+                                    prb_info_t& prb_info,
+                                    const uint16_t beam_id)
     {
-        uint16_t offset = 0;
-        offset = sizeof(scf_fapi_rx_beamforming_t);
         nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-        if ((bf_pdu.dig_bf_interfaces != 0) && phyDriver.l1_staticBFWConfigured(cell_index))
+        if ((bf_pdu.dig_bf_interfaces == 0) || !phyDriver.l1_staticBFWConfigured(cell_index))
         {
-            NVLOGD_FMT(SCF_SLTCMD_TAG, "num_prgs={}, dig_bf_interfaces={}", reinterpret_cast<uint16_t>(bf_pdu.num_prgs), reinterpret_cast<uint8_t>(bf_pdu.dig_bf_interfaces));
-            /* This flag is used to detemine whether static beamforming weights should be sent once per cell i.e. very 1st time or needs to be sent every time for all static beamId's. */
-            if(!phyDriver.l1_get_send_static_bfw_wt_all_cplane())
+            NVLOGD_FMT(SCF_SLTCMD_TAG, "{} Static Beamforming is disabled for this PDU prb_info={}", __func__, reinterpret_cast<void*>(&prb_info.common));
+            return;
+        }
+
+        NVLOGD_FMT(SCF_SLTCMD_TAG, "num_prgs={}, dig_bf_interfaces={}", static_cast<uint16_t>(bf_pdu.num_prgs), static_cast<uint8_t>(bf_pdu.dig_bf_interfaces));
+
+        // Check if beamId is part of static DBT table
+        // Return values: -1 = not in DBT table (predefined beam), 0 = in DBT table but not sent, 1 = in DBT table and sent
+        const int isbeamInDBT = phyDriver.l1_getBeamWeightsSentFlag(cell_index, beam_id);
+
+        if (isbeamInDBT == -1)
+        {
+            NVLOGD_FMT(SCF_SLTCMD_TAG, "Beamidx={} is a predefined beam ID (not in static DBT table)", beam_id);
+            return;
+        }
+
+        NVLOGD_FMT(SCF_SLTCMD_TAG, "Beamidx={} is in static DBT table", beam_id);
+
+        // Check if static beamforming weights should be sent once per cell (first time only) or every time
+        const bool sendOncePerBeam = !phyDriver.l1_get_send_static_bfw_wt_all_cplane();
+        if (sendOncePerBeam)
+        {
+            if (isbeamInDBT == 1)
             {
-                /* This flag is used to detemine whether static beamforming weights have already been sent for this beam. */
-                if(!phyDriver.l1_getBeamWeightsSentFlag(cell_index, beam_id))
-                {
-                    phyDriver.l1_setBeamWeightsSentFlag(cell_index, beam_id);
-                }
-                else
-                {
-                    return;
-                }
+                // Beam weights already sent, skip
+                return;
             }
-            NVLOGD_FMT(SCF_SLTCMD_TAG, "Beamidx={} entry available in DBT PDU IQ sent using extType=11 prb_info={}", beam_id, reinterpret_cast<void*>(&prb_info.common));
-            prb_info.common.extType = 11;
-            prb_info.common.isStaticBfwEncoded = true;
-            prb_info.static_bfwCoeff_buf_info.num_prgs = bf_pdu.num_prgs;
-            prb_info.static_bfwCoeff_buf_info.prg_size = bf_pdu.prg_size;
-            prb_info.static_bfwCoeff_buf_info.dig_bf_interfaces = bf_pdu.dig_bf_interfaces;
-            //prb_info.static_bfwCoeff_buf_info.nGnbAnt = bf_pdu.nGnbAnt;
+            // Beam weights not sent yet (isbeamInDBT == 0), mark as sent
+            phyDriver.l1_setBeamWeightsSentFlag(cell_index, beam_id);
         }
-        else
-        {
-            NVLOGD_FMT(SCF_SLTCMD_TAG, "{} Static Beamforming is disabled for this PDU prb_info={}",__func__, reinterpret_cast<void*>(&prb_info.common));
-        }
+
+        NVLOGD_FMT(SCF_SLTCMD_TAG, "Beamidx={} entry available in DBT PDU IQ sent using extType=11 prb_info={}", beam_id, reinterpret_cast<void*>(&prb_info.common));
+        prb_info.common.extType = 11;
+        prb_info.common.isStaticBfwEncoded = true;
+        prb_info.static_bfwCoeff_buf_info.num_prgs = bf_pdu.num_prgs;
+        prb_info.static_bfwCoeff_buf_info.prg_size = bf_pdu.prg_size;
+        prb_info.static_bfwCoeff_buf_info.dig_bf_interfaces = bf_pdu.dig_bf_interfaces;
+        //prb_info.static_bfwCoeff_buf_info.nGnbAnt = bf_pdu.nGnbAnt;
     }
 
     inline void print_sym_prb_info(int sfn, int slot, const slot_info_t* slot_info, int cell_idx)
@@ -496,9 +520,9 @@ namespace scf_5g_fapi {
     }
 
     inline comp_method get_comp_method(int32_t cell_index) {
-        nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-        if (&phyDriver != nullptr && phyDriver.driver_exist()) {
-            const auto & mplane_info = phyDriver.getMPlaneConfig(cell_index);
+        auto* phyDriver = nv::PHYDriverProxy::getInstancePtr();
+        if (phyDriver && phyDriver->driver_exist()) {
+            const auto & mplane_info = phyDriver->getMPlaneConfig(cell_index);
             return mplane_info.dl_comp_meth;
         }
         return comp_method::BLOCK_FLOATING_POINT;

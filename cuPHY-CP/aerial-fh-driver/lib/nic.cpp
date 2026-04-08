@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -77,7 +77,7 @@ Nic::Nic(Fronthaul* fhi, NicInfo const* info) :
     setup_rx_queues();
     start();
     setup_tx_queues_gpu();
-    print_link_info();
+    check_physical_link_status();
     metrics_.cache_metric_ids();
     warm_up_txqs();
 
@@ -241,11 +241,17 @@ void Nic::doca_probe_device()
             devargs_builder << "tx_pp=" << accu_tx_sched_res_ns << ",";
     }
 
-    devargs_builder << "txq_inline_max=0"; //,dv_flow_en=2"; //HWS
+    devargs_builder << "txq_inline_max=0,dv_flow_en=2"; //HWS
     auto devargs = std::string(devargs_builder);
 
     NVLOGI_FMT(TAG, "DOCA hotplug-adding NIC {} with following devargs: {}", name, devargs.c_str());
 
+
+    //Explicitly enable DPDK steering here (should be done before port probe)
+    if(rte_pmd_mlx5_driver_enable_steering()<0)
+    {
+        THROW_FH(rte_errno, StringBuilder() << "Failed to enable DPDK steering");
+    }
 
     ret_doca = doca_dpdk_port_probe(ddev_, devargs.c_str());
     if (ret_doca != DOCA_SUCCESS)
@@ -584,7 +590,7 @@ void Nic::create_tx_request_cplane_pool()
     tx_request_cplane_pool_.reset(mp);
 }
 
-void Nic::print_link_info() const
+void Nic::check_physical_link_status() const
 {
     rte_eth_link link{};
     char         link_status_text[RTE_ETH_LINK_MAX_STR_LEN];
@@ -597,6 +603,11 @@ void Nic::print_link_info() const
 
     std::string link_status = link.link_status == RTE_ETH_LINK_DOWN ? "DOWN" : "UP";
     std::string link_duplex = link.link_duplex == RTE_ETH_LINK_FULL_DUPLEX ? "full-duplex" : "half-duplex";
+
+    if(link.link_status == RTE_ETH_LINK_DOWN)
+    {
+        NVLOGF_FMT(TAG, AERIAL_DPDK_API_EVENT, "NIC {} has no physical Ethernet link (cable unplugged or peer port down)", info_.name);
+    }
 
     NVLOGI_FMT(TAG, "NIC {} link status: {}, {}, {}",
         info_.name.c_str(), link_status.c_str(), rte_eth_link_speed_to_str(link.link_speed), link_duplex);

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -160,6 +160,7 @@ struct cell_mplane_info
     uint16_t                pusch_nMaxRx;                       ///< Maximum number of receive antennas for PUSCH
     uint16_t                section_3_time_offset;              ///< Section type 3 time offset for ORAN C-plane
     uint8_t                 pusch_ldpc_max_num_itr_algo_type;   ///< LDPC max iteration algorithm type (0=static, 1=dynamic based on SNR)
+    uint8_t                 dlc_core_index;                     ///< DL C-plane core index for fixed packing scheme (scheme=1)
     uint8_t                 pusch_fixed_max_num_ldpc_itrs;      ///< Fixed maximum number of LDPC iterations (when algo_type=0)
     uint8_t                 pusch_ldpc_n_iterations;            ///< Target number of LDPC iterations
     uint8_t                 pusch_ldpc_early_termination;       ///< Enable LDPC early termination (0=disabled, 1=enabled)
@@ -239,6 +240,7 @@ struct h2d_copy_prepone_info{
     uint8_t ** gpu_buff_ref;                                    ///< Reference to GPU buffer pointer
     uint32_t tb_len;                                            ///< Transport block length in bytes
     uint8_t slot_index;                                         ///< Slot index within circular buffer
+    uint16_t sfn;                                               ///< System Frame Number, used to detect batch boundaries
 };
 
 struct h2d_copy_thread_config{
@@ -263,12 +265,14 @@ struct mod_compression_params{
     QamPrbParam prb_params_per_list[API_MAX_ANTENNAS][ORAN_ALL_SYMBOLS][MAX_SECTIONS_PER_UPLANE_SYMBOL]; ///< RE mask of PRBs per section
 };
 
+/// Number of entries in the aerial_fh::UserDataCompressionMethod enum
+static constexpr std::size_t NUM_USER_DATA_COMPRESSION_METHODS = 7;
+
 struct compression_params{
     uint8_t comp_meth[MAX_NUM_CELLS_PER_DEVICE];               ///< Compression method per cell
     uint8_t bit_width[MAX_NUM_CELLS_PER_DEVICE];               ///< Compressed bit width per cell
     uint8_t  *input_ptrs[MAX_NUM_CELLS_PER_DEVICE];            ///< Input buffer pointers per cell
     uint8_t **prb_ptrs[MAX_NUM_CELLS_PER_DEVICE];              ///< Per-PRB buffer pointers per cell
-    uint8_t *output_ptrs[MAX_NUM_CELLS_PER_DEVICE];            ///< Output buffer pointers per cell (only when GPU comms disabled)
     int     num_prbs[MAX_NUM_CELLS_PER_DEVICE];                ///< Number of PRBs per cell
     float   beta[MAX_NUM_CELLS_PER_DEVICE];                    ///< Beta scaling factor per cell
     uint16_t max_num_prb_per_symbol[MAX_NUM_CELLS_PER_DEVICE]; ///< Maximum PRBs per symbol per cell
@@ -327,7 +331,7 @@ struct context_config
     std::vector<uint8_t> ul_cores;                              ///< CPU cores for UL worker threads
     std::vector<uint8_t> dl_cores;                              ///< CPU cores for DL worker threads
     int16_t debug_worker;                                       ///< CPU core for debug worker thread (-1=disabled)
-    int16_t datalake_core;                                      ///< CPU core for datalake thread (-1=disabled)
+    int16_t data_core;                                          ///< CPU core for datalake thread (-1=disabled)
     uint8_t datalake_db_write_enable;                           ///< Enable database write operations for datalake (0=disabled, 1=enabled)
     uint32_t datalake_samples;                                  ///< Number of samples to capture for datalake
     std::string datalake_address;                               ///< Datalake server address
@@ -338,12 +342,13 @@ struct context_config
     uint32_t num_rows_pusch;                                    ///< Number of rows per batch for PUSCH datalake ingestion
     uint32_t num_rows_hest;                                     ///< Number of rows per batch for channel estimation datalake ingestion
     uint8_t e3_agent_enabled;                                   ///< Enable E3 agent for RIC integration (0=disabled, 1=enabled)
-    uint16_t e3_pub_port;                                       ///< E3 agent publish port number
     uint16_t e3_rep_port;                                       ///< E3 agent reply port number
+    uint16_t e3_pub_port;                                       ///< E3 agent publish port number
     uint16_t e3_sub_port;                                       ///< E3 agent subscribe port number
     uint8_t datalake_drop_tables;                               ///< Drop existing datalake tables on startup (0=keep, 1=drop)
                        
     uint8_t  use_green_contexts;                                ///< Use CUDA green contexts (0=disabled, 1=enabled)
+    uint8_t  use_gc_workqueues;                                 ///< Use green contexts' workqueue feature (0=disabled, 1=enabled), if green contexts enabled  
     uint8_t  use_batched_memcpy;                                ///< Use batched memory copy operations for efficiency (0=disabled, 1=enabled)
     uint32_t mps_sm_pusch;                                      ///< MPS (Multi-Process Service) SM percentage for PUSCH (0-100)
     uint32_t mps_sm_pucch;                                      ///< Maximum number of SMs allocated for PUCCH processing
@@ -386,6 +391,9 @@ struct context_config
 
     uint8_t enable_cpu_task_tracing;                            ///< Enable CPU task tracing (0=disabled, 1=enabled)
     uint8_t enable_prepare_tracing;                             ///< Enable preparation phase tracing (0=disabled, 1=enabled)
+    uint8_t cupti_enable_tracing;                               ///< Enable CUPTI tracing (0=disabled, 1=enabled)
+    uint64_t cupti_buffer_size;                                 ///< CUPTI buffer size in bytes (default: 2GB)
+    uint16_t cupti_num_buffers;                                 ///< Number of CUPTI buffers (default: 2)
     uint8_t disable_empw;                                       ///< Disable Enhanced Multi-packet write WQE feature (0=enabled, 1=disabled)
     uint8_t enable_dl_cqe_tracing;                              ///< Enable DL completion queue entry tracing (0=disabled, 1=enabled)
     uint64_t cqe_trace_cell_mask;                               ///< Cell mask for CQE tracing (bit per cell)
@@ -402,6 +410,8 @@ struct context_config
 
     uint8_t mMIMO_enable;                                       ///< Enable massive MIMO (mMIMO) processing (0=disabled, 1=enabled)
     uint8_t enable_srs;                                         ///< Enable SRS (Sounding Reference Signal) processing (0=disabled, 1=enabled)
+    uint8_t enable_dl_core_affinity;                            ///< Enable DL core affinity for task distribution (0=disabled, 1=enabled)
+    uint8_t dlc_core_packing_scheme;                            ///< DL C-plane core packing scheme (0=default, 1=fixed per-cell, 2=dynamic workload-based)
     uint8_t ue_mode;                                            ///< Enable User Equipment emulation mode (0=gNodeB, 1=UE mode)
     std::vector<uint8_t> dl_validation_cores;                   ///< CPU cores for DL validation worker threads
     uint32_t aggr_obj_non_avail_th;                             ///< Aggregation object non-availability threshold (ns)
@@ -413,6 +423,7 @@ struct context_config
     uint32_t sendCPlane_dlbfw_backoff_th_ns;                    ///< C-plane DL beamforming backoff threshold from deadline (ns)
     uint16_t forcedNumCsi2Bits;                                 ///< Force CSI part 2 to specific number of bits (0=use actual)
     uint32_t pusch_nMaxLdpcHetConfigs;                          ///< Maximum number of heterogeneous LDPC configurations for PUSCH
+    uint8_t pusch_nMaxTbPerNode;                                ///< Maximum number of transport blocks per node for PUSCH
     uint8_t mCh_segment_proc_enable;                            ///< Enable tracking and validating of the processing timeline of PHY channels (0=disabled, 1=enabled)
     uint8_t pusch_aggr_per_ctx;                                 ///< Number of PUSCH aggregation objects per context
     uint8_t prach_aggr_per_ctx;                                 ///< Number of PRACH aggregation objects per context
@@ -1084,7 +1095,7 @@ void l1_copy_TB_to_gpu_buf(phydriver_handle pdh, uint16_t phy_cell_id, uint8_t *
  *
  * @sa ::l1_copy_TB_to_gpu_buf, ::l1_copy_TB_to_gpu_buf_thread_func
  */
-void l1_copy_TB_to_gpu_buf_thread_offload(phydriver_handle pdh, uint16_t phy_cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref, uint32_t tb_len, uint8_t slot_index);
+void l1_copy_TB_to_gpu_buf_thread_offload(phydriver_handle pdh, uint16_t phy_cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref, uint32_t tb_len, uint8_t slot_index, uint16_t sfn = 0);
 
 /******************************************************************/ /**
  * @brief H2D copy thread function

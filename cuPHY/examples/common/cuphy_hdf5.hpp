@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -546,9 +546,7 @@ inline void read_ue_pars_from_file(cuphyPdschUePrm_t* pdsch_ue_params,
         hdf5hpp::hdf5_dataset_elem ue_config = pdsch_ues_dataset[ue_id];
         pdsch_ue_params[ue_id].scid = ue_config["scid"].as<uint8_t>();
         pdsch_ue_params[ue_id].dmrsScrmId = ue_config["dmrsScramId"].as<uint16_t>();
-#ifdef ENABLE_32DL
         pdsch_ue_params[ue_id].nlAbove16 = ue_config["nlAbove16"].as<uint8_t>();
-#endif
         pdsch_ue_params[ue_id].nUeLayers = ue_config["nUeLayers"].as<uint8_t>();
         try
         {
@@ -613,9 +611,7 @@ inline void read_ue_pars_from_file(cuphyPdschUePrm_t* pdsch_ue_params,
             NVLOGC_FMT(NVLOG_PDSCH, "---------------------");
             NVLOGC_FMT(NVLOG_PDSCH, "scid:         {:4d}", pdsch_ue_params[ue_id].scid);
             NVLOGC_FMT(NVLOG_PDSCH, "dmrsScrmId:   {:4d}", pdsch_ue_params[ue_id].dmrsScrmId);
-#ifdef ENABLE_32DL
             NVLOGC_FMT(NVLOG_PDSCH, "nlAbove16:    {:4d}", pdsch_ue_params[ue_id].nlAbove16);
-#endif
             NVLOGC_FMT(NVLOG_PDSCH, "nUeLayers:    {:4d}", pdsch_ue_params[ue_id].nUeLayers);
             NVLOGC_FMT(NVLOG_PDSCH, "dmrsPortBmsk  {:#x}", pdsch_ue_params[ue_id].dmrsPortBmsk);
             NVLOGC_FMT(NVLOG_PDSCH, "refPoint:     {:4d}", pdsch_ue_params[ue_id].refPoint);

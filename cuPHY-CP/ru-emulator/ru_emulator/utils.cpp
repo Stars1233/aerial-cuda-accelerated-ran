@@ -676,7 +676,7 @@ void print_header_info(struct oran_packet_header_info& header_info)
 }
 
 
-ul_cell_cpu_assignment_array get_cell_cpu_assignment(int num_cells, int num_cores, bool enable_mmimo, bool is_srs)
+ul_cell_cpu_assignment_array get_cell_cpu_assignment(int num_cells, int num_cores, bool enable_mmimo, bool is_srs, int min_cores_per_cell_mmimo)
 {
     NVLOGC_FMT(NVLOG_TAG_BASE_RU_EMULATOR, "get_cell_cpu_assignment: num_cells: {}, num_cores: {}", num_cells, num_cores);
     ul_cell_cpu_assignment_array ul_cell_cpu_assignment;
@@ -689,10 +689,10 @@ ul_cell_cpu_assignment_array get_cell_cpu_assignment(int num_cells, int num_core
 
     if(enable_mmimo && !is_srs)
     {
-        if(num_cores / num_cells < MIN_UL_CORES_PER_CELL_MMIMO)
+        if(num_cores / num_cells < min_cores_per_cell_mmimo)
         {
-            NVLOGW_FMT(NVLOG_TAG_BASE_RU_EMULATOR, "WARNING: num UL cores given less than desirable for mmimo case, it will not be performant for peak patterns. num_cores: {}, num_cells: {}", num_cores, num_cells);
-            do_throw(fmt::format("num UL cores given less than desirable for mmimo case, it will not be performant for peak patterns. num_cores: {}, num_cells: {}", num_cores, num_cells));
+            NVLOGW_FMT(NVLOG_TAG_BASE_RU_EMULATOR, "WARNING: num UL cores given less than desirable for mmimo case, it will not be performant for peak patterns. num_cores: {}, num_cells: {}, min_cores_per_cell: {}", num_cores, num_cells, min_cores_per_cell_mmimo);
+            do_throw(fmt::format("num UL cores given less than desirable for mmimo case, it will not be performant for peak patterns. num_cores: {}, num_cells: {}, min_cores_per_cell: {}", num_cores, num_cells, min_cores_per_cell_mmimo));
         }
     }
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -64,7 +64,11 @@ static uint64_t convert_mac_addr(std::string mac_str)
 static std::string get_inet_ntoa(const in_addr &in)
 {
     char buff[INET_ADDRSTRLEN];
-    return std::string(inet_ntop(AF_INET, (void *)&in.s_addr, buff, sizeof(buff)));
+    const char* result = inet_ntop(AF_INET, (void *)&in.s_addr, buff, sizeof(buff));
+    if (result == nullptr) {
+        THROW_FH(errno, StringBuilder() << "inet_ntop failed for address conversion");
+    }
+    return std::string(result);
 }
 
 static rmax_status_t get_ip_from_ifface(std::string mac_address, struct sockaddr_in* sockh)

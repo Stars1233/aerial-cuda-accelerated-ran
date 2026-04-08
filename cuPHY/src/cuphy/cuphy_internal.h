@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,7 @@
 #include <algorithm>
 #include "nvlog.hpp"
 #include "common_utils.hpp"
+#include "memfoot_global.h"
 
 #if USE_NVTX
 #include "nvtx3/nvToolsExt.h"
@@ -286,7 +287,7 @@ struct alignas(8) half2x2_u64
 {
     union
     {
-        __hf2x2   hf;
+        __hf2x2   hf2;
         uint64_t  u64;
     };
 };
@@ -748,6 +749,8 @@ public:
       texObj_(mipArray_.get(), texDesc),
       numLevels_(numLevels)
     {
+        // The dimension w and h should not be 0 together. If one dimension is 0, size equals to the other dimension.
+        gpu_size_alloc = (w == 0 ? 1 : w) * (h == 0 ? 1 : h);
     }
     //------------------------------------------------------------------
     // tex_obj()
@@ -812,14 +815,45 @@ public:
             throw cuda_exception(e);
         }
     }
+
+    // Returns the GPU size allocated for this object
+    size_t get_gpu_size_alloc() const { return gpu_size_alloc; }
+
 private:
     //------------------------------------------------------------------
     // Data
     unique_mipmapped_array_ptr mipArray_;
     texture_object             texObj_;
     unsigned int               numLevels_;
+    size_t                     gpu_size_alloc;
 };
 
 } // namespace cuphy_i
+
+////////////////////////////////////////////////////////////////////////
+/**
+ * Calculate the actual layer ID from PDSCH DMRS port configuration
+ * 
+ * This function implements the layer ID calculation formula used across PDSCH
+ * processing kernels (rate matching, DMRS generation, modulation mapping) and
+ * host-side code.
+ * 
+ * The formula accounts for:
+ * - Base port ID (0-11 for Type 1, 0-5 for Type 2)
+ * - Scrambling ID offset (n_scid: 0 or 1, adds 0 or 8)
+ * - Extended layer support (nlAbove16: 0 or 1, adds 0 or 16 for 32-layer support)
+ * 
+ * @param[in] port_id DMRS port ID value
+ * @param[in] n_scid Scrambling ID (0 or 1)
+ * @param[in] nlAbove16 Indicator for layers above 16 (0 or 1)
+ * @return Calculated layer ID for tensor indexing
+ */
+CUDA_BOTH_INLINE int calculate_layer_id(
+    const int port_id,
+    const uint8_t n_scid,
+    const uint8_t nlAbove16)
+{
+    return port_id + 8 * n_scid + 16 * nlAbove16;
+}
 
 #endif // !defined(CUPHY_INTERNAL_H_INCLUDED_)

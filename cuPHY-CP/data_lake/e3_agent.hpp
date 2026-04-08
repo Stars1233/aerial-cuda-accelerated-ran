@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,66 +42,73 @@ class DataLake;
 struct fhInfo_t;
 struct puschInfo_t;
 struct hestInfo_t;
-typedef int16_t fhDataType;
-typedef float2 hestDataType;
-
 using json = nlohmann::json;
 
 // E3 Protocol definitions
 namespace e3 {
 
-enum class MessageType : uint16_t {
-    E3_SETUP_REQUEST = 0x01,
-    E3_SETUP_RESPONSE = 0x02,
-    E3_SUBSCRIPTION_REQUEST = 0x03,
-    E3_SUBSCRIPTION_RESPONSE = 0x04,
-    E3_INDICATION = 0x05,
-    E3_CONTROL = 0x06,
-    PHY_DATA_NOTIFICATION = 0x10  // Custom notification type
-};
-
-enum class DataType : uint32_t {
-    IQ_SAMPLES = 0x01,
-    CHANNEL_ESTIMATES = 0x02,
-    CSI_DATA = 0x04,
-    BEAM_WEIGHTS = 0x08,
-    CQI_REPORTS = 0x10,
-    ALL_DATA = 0xFFFFFFFF
-};
-
 /**
- * Stream types as bit flags for efficient stream processing
+ * E3AP Telemetry stream types as bit flags for efficient internal processing.
+ *
+ * Telemetry ID = bit_position + 1 (e.g. IQ_SAMPLES = bit 0 -> telemetry ID 1).
+ *
+ * DO NOT reorder or remove. IDs are stable wire protocol values
+ * used in E3-SubscriptionRequest telemetryIdentifierList and E3-RanFunctionDefinition.
+ * New entries go at the end only.
  */
 enum class StreamType : uint64_t {
     NONE                  = 0,
     IQ_SAMPLES            = 1ULL << 0,
     PDU_DATA              = 1ULL << 1,
     H_ESTIMATES           = 1ULL << 2,
-    SFN                   = 1ULL << 3,
-    SLOT                  = 1ULL << 4,
-    CELL_ID               = 1ULL << 5,
-    N_RX_ANT              = 1ULL << 6,
-    N_RX_ANT_SRS          = 1ULL << 7,
-    N_CELLS               = 1ULL << 8,
-    N_BS_ANTS             = 1ULL << 9,
-    N_LAYERS              = 1ULL << 10,
-    N_SUBCARRIERS         = 1ULL << 11,
-    N_DMRS_ESTIMATES      = 1ULL << 12,
-    DMRS_SYMB_POS         = 1ULL << 13,
-    TB_CRC_FAIL           = 1ULL << 14,
-    CB_ERRORS             = 1ULL << 15,
-    RSRP                  = 1ULL << 16,
-    CQI                   = 1ULL << 17,
-    CB_COUNT              = 1ULL << 18,
-    RSSI                  = 1ULL << 19,
-    QAM_MOD_ORDER         = 1ULL << 20,
-    MCS_INDEX             = 1ULL << 21,
-    MCS_TABLE_INDEX       = 1ULL << 22,
-    RB_START              = 1ULL << 23,
-    RB_SIZE               = 1ULL << 24,
-    START_SYMBOL_INDEX    = 1ULL << 25,
-    NR_OF_SYMBOLS         = 1ULL << 26
+    TIMESTAMP             = 1ULL << 3,
+    SFN                   = 1ULL << 4,
+    SLOT                  = 1ULL << 5,
+    CELL_ID               = 1ULL << 6,
+    N_RX_ANT              = 1ULL << 7,
+    N_RX_ANT_SRS          = 1ULL << 8,
+    N_CELLS               = 1ULL << 9,
+    N_BS_ANTS             = 1ULL << 10,
+    N_LAYERS              = 1ULL << 11,
+    N_SUBCARRIERS         = 1ULL << 12,
+    N_DMRS_ESTIMATES      = 1ULL << 13,
+    DMRS_SYMB_POS         = 1ULL << 14,
+    TB_CRC_FAIL           = 1ULL << 15,
+    CB_ERRORS             = 1ULL << 16,
+    RSRP                  = 1ULL << 17,
+    CQI                   = 1ULL << 18,
+    CB_COUNT              = 1ULL << 19,
+    RSSI                  = 1ULL << 20,
+    QAM_MOD_ORDER         = 1ULL << 21,
+    MCS_INDEX             = 1ULL << 22,
+    MCS_TABLE_INDEX       = 1ULL << 23,
+    RB_START              = 1ULL << 24,
+    RB_SIZE               = 1ULL << 25,
+    START_SYMBOL_INDEX    = 1ULL << 26,
+    NR_OF_SYMBOLS         = 1ULL << 27
 };
+
+constexpr uint32_t STREAM_TYPE_COUNT = 28;
+
+/** E3AP protocol version supported by this agent implementation */
+constexpr std::string_view E3AP_PROTOCOL_VERSION = "1.0.0";
+/** RAN identifier used in E3 Setup messages */
+constexpr std::string_view RAN_IDENTIFIER = "NVIDIA_L1";
+/** RAN function ID for NVIDIA KPM (Key Performance Monitoring) */
+constexpr uint32_t RAN_FUNCTION_ID_NVIDIA_KPM = 2;
+
+/**
+ * Convert telemetry ID (1-based) to StreamType.
+ *
+ * @param[in] id Telemetry identifier (1-based, valid range 1 to STREAM_TYPE_COUNT).
+ *               IDs of 0 or greater than STREAM_TYPE_COUNT are treated as invalid.
+ * @return Corresponding StreamType bitfield value, or StreamType::NONE for invalid IDs.
+ */
+constexpr StreamType telemetryIdToStreamType(uint32_t id) noexcept
+{
+    if (id == 0 || id > STREAM_TYPE_COUNT) return StreamType::NONE;
+    return static_cast<StreamType>(1ULL << (id - 1));
+}
 
 /**
  * Converts string stream name to StreamType enum
@@ -114,6 +121,7 @@ constexpr StreamType streamNameToType(const std::string_view stream_name) noexce
     if (stream_name == "iq_samples") return StreamType::IQ_SAMPLES;
     if (stream_name == "pdu_data") return StreamType::PDU_DATA;
     if (stream_name == "h_estimates") return StreamType::H_ESTIMATES;
+    if (stream_name == "timestamp") return StreamType::TIMESTAMP;
     if (stream_name == "sfn") return StreamType::SFN;
     if (stream_name == "slot") return StreamType::SLOT;
     if (stream_name == "cell_id") return StreamType::CELL_ID;
@@ -201,8 +209,8 @@ class E3Agent {
 public:
     E3Agent(
         DataLake* dataLake,
-        const uint16_t e3PubPort,
         const uint16_t e3RepPort,
+        const uint16_t e3PubPort,
         const uint16_t e3SubPort,
         const int numRowsToInsertFh,
         const int numRowsToInsertPusch,
@@ -234,8 +242,8 @@ private:
     static constexpr std::string_view E3_AGENT_ID = "e3-agent-gh200";
     static constexpr std::string_view E3_AGENT_VERSION = "1.0.0";
     static constexpr std::string_view E3_SHARED_MEMORY_KEY = "/e3_ran_buffers";
-    uint16_t e3PubPort;
     uint16_t e3RepPort;
+    uint16_t e3PubPort;
     uint16_t e3SubPort;
     int numRowsToInsertFh;
     int numRowsToInsertPusch;
@@ -245,8 +253,9 @@ private:
 
     // ZMQ components
     zmq::context_t zmq_context;
-    zmq::socket_t e3_pub_socket;  // Agent → Manager (indications)
     zmq::socket_t e3_rep_socket;  // Manager → Agent (REQ-REP)
+    zmq::socket_t e3_pub_socket;  // Agent → Manager (indications)
+    std::mutex e3_pub_socket_mutex_;
     zmq::socket_t e3_sub_socket;  // Manager → Agent (PUB-SUB commands)
 
     // Thread management
@@ -259,15 +268,16 @@ private:
 
     // Active subscriptions
     struct E3Subscription {
-        std::string subscription_id;
+        uint32_t subscription_id;
         uint32_t dapp_id;
-        std::vector<std::string> granted_streams;
-        e3::StreamType stream_bitfield;  //!< Bitfield representation of granted_streams
-        uint32_t interval_ms;
+        uint32_t ran_function_id;
+        std::vector<uint32_t> telemetry_ids;      // Granted telemetry IDs (wire protocol values)
+        e3::StreamType stream_bitfield;           // Internal bitfield for indication processing
+        uint32_t periodicity_us;
         std::chrono::steady_clock::time_point last_update;
-        bool active;
+        std::chrono::steady_clock::time_point expiry_time;  // time_point::max() = indefinite
     };
-    std::unordered_map<std::string, E3Subscription> e3_subscriptions;
+    std::unordered_map<uint32_t, E3Subscription> e3_subscriptions;
     std::mutex e3_subscriptions_mutex;
 
     // Connected dApp managers
@@ -288,17 +298,77 @@ private:
     void reapTimedOutDapps();
     void managerSubscriptionThread();
 
-    // Request handlers
+    /** Handle E3 Setup request (REQ-REP)
+     *
+     * @param[in] request JSON request containing dApp setup parameters
+     * @param[out] response JSON response with dAppIdentifier and available streams
+     */
     void handleSetupRequest(const json& request, std::string& response);
+
+    /** Handle subscription request from dApp (PUB-SUB)
+     *
+     * @param[in] request JSON request with telemetryIdentifierList and ranFunctionIdentifier
+     * @param[out] response JSON response with responseCode (positive/negative)
+     */
     void handleSubscriptionRequest(const json& request, std::string& response);
-    void handleUnsubscriptionRequest(const json& request, std::string& response);
+
+    /** Handle subscription deletion request from dApp (PUB-SUB)
+     *
+     * @param[in] request JSON request containing subscriptionId
+     * @param[out] response JSON response with responseCode (positive/negative)
+     */
+    void handleSubscriptionDelete(const json& request, std::string& response);
+
+    /** Handle control action from dApp (PUB-SUB) - placeholder, no control dispatch yet
+     *
+     * @param[in] request JSON request containing dAppControlAction fields
+     * @param[out] response JSON ack with responseCode
+     */
     void handleControlMessage(const json& request, std::string& response);
+
+    /** Dispatch incoming PUB-SUB messages by type
+     *
+     * @param[in] message Parsed JSON message from the dApp PUB socket
+     */
     void handleManagerMessage(const json& message);
 
-    // E3AP Message helpers
-    std::string generateResponseMessageId(const std::string& prefix);
-    std::string generateTimestamp();
-    std::string generateSubscriptionId(const uint32_t dapp_id);
+    /** Release a dApp connection and clean up associated subscriptions
+     *
+     * @param[in] dapp_id Identifier of the dApp to release
+     */
+    void releaseDapp(uint32_t dapp_id);
+
+    /** Update last activity time for a connected dApp
+     *
+     * @param[in] dapp_id Identifier of the dApp
+     * @return true if dApp exists and was updated, false if not found
+     */
+    bool updateDappActivity(uint32_t dapp_id);
+
+    /** Broadcast E3 release message for the specified dApp
+     *
+     * @param[in] dapp_id Identifier of the dApp being released
+     * @return true if message was sent successfully, false otherwise
+     */
+    bool sendRelease(uint32_t dapp_id);
+
+    /** Generate a unique message identifier for E3AP messages
+     *
+     * @return Unique uint32_t message identifier
+     */
+    uint32_t generateMessageId();
+
+    /** Generate a unique dApp identifier for new connections
+     *
+     * @return Unique uint32_t dApp identifier
+     */
+    uint32_t generateDappId();
+
+    /** Generate a unique subscription identifier
+     *
+     * @return Unique uint32_t subscription identifier
+     */
+    uint32_t generateSubscriptionId();
     
     // Stream creation helpers
     json createIndicationPayloadDelivery(const std::string& stream_id) const;

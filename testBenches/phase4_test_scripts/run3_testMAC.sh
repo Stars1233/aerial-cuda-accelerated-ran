@@ -1,5 +1,6 @@
 #!/bin/bash -e
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,6 +37,7 @@ show_usage() {
   echo "  --config_dir <path>       Specify the path to the directory containing config files. (default: "\$cuBB_SDK")"
   echo "                            the testBenches scripts will modify configuration files and write output files to this location"
   echo "  --timeout <seconds>       Kill test_mac after seconds"
+  echo "  --gdb_script <script>     Specify the gdb script to use."
   echo "  --ml2 <0|1>               Select Multi-L2 instance: 0 for first instance (ML2_CELL_MASK0), 1 for second (ML2_CELL_MASK1 + TESTMAC1_YAML)"
   echo "  -h, --help                Show this help message."
   echo
@@ -50,6 +52,7 @@ show_usage() {
 }
 
 TIMEOUT=0
+GDB_SCRIPT=""
 CELL_MASK=""
 CONFIG_YAML=""
 ML2_INSTANCE=""
@@ -94,6 +97,19 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       TIMEOUT="$2"
+      shift 2
+      ;;
+    --gdb_script=*)
+      GDB_SCRIPT="${1#*=}"
+      shift
+      ;;
+    --gdb_script)
+      if [[ -z "$2" || "$2" == -* ]]; then
+        echo "Error: Missing value for --gdb_script option"
+        show_usage
+        exit 1
+      fi
+      GDB_SCRIPT="$2"
       shift 2
       ;;
     --ml2=*)
@@ -227,11 +243,11 @@ fi
 #-------------------------------------------------------------------------------------------------------
 if [[ "$CONTROLLER_MODE" == *nrSim_SCF* ]]; then
     NRSIM_TC=$(echo "$CONTROLLER_MODE" | sed -E 's/nrSim_SCF_(CG1_)?//')
-    echo "$WITH_TIMEOUT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac nrSim $NRSIM_TC" "${CHANNELS[@]}" "$CELL_MASK" "$CONFIG_YAML"
-    { sudo -E LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT stdbuf --output=L "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" nrSim $NRSIM_TC "${CHANNELS[@]}" $CELL_MASK $CONFIG_YAML; RET=$?; } || true
+    echo "$WITH_TIMEOUT stdbuf --output=L $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac nrSim $NRSIM_TC" "${CHANNELS[@]}" "$CELL_MASK" "$CONFIG_YAML"
+    { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT stdbuf --output=L $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" nrSim $NRSIM_TC "${CHANNELS[@]}" $CELL_MASK $CONFIG_YAML; RET=$?; } || true
 else
-    echo "$WITH_TIMEOUT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac F08 $NUM_CELLS $PATTERN" "${CHANNELS[@]}" "$CELL_MASK" "$CONFIG_YAML"
-    { sudo -E LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT stdbuf --output=L "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" F08 $NUM_CELLS $PATTERN "${CHANNELS[@]}" $CELL_MASK $CONFIG_YAML; RET=$?; } || true
+    echo "$WITH_TIMEOUT stdbuf --output=L $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac F08 $NUM_CELLS $PATTERN" "${CHANNELS[@]}" "$CELL_MASK" "$CONFIG_YAML"
+    { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT stdbuf --output=L $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" F08 $NUM_CELLS $PATTERN "${CHANNELS[@]}" $CELL_MASK $CONFIG_YAML; RET=$?; } || true
 fi
 exit $RET
 

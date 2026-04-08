@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +16,8 @@
 """pyAerial library - DMRS transmitter."""
 from typing import Generic
 from typing import List
+from typing import Optional
 
-import cuda.bindings.runtime as cudart  # type: ignore
 import cupy as cp  # type: ignore
 import numpy as np
 
@@ -25,7 +25,7 @@ from aerial import pycuphy  # type: ignore
 from aerial.phy5g.api import Array
 from aerial.phy5g.config import PdschDmrsConfig
 from aerial.phy5g.config import PdschConfig
-from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 
 
 class DmrsTx(Generic[Array]):
@@ -40,7 +40,7 @@ class DmrsTx(Generic[Array]):
                  num_bwp_prbs: int = 273,
                  max_num_cells: int = 1,
                  max_num_tbs: int = 1,
-                 cuda_stream: int = None):
+                 cuda_stream: Optional[CudaStream] = None):
         """Initialize DMRS transmitter.
 
         Args:
@@ -49,14 +49,14 @@ class DmrsTx(Generic[Array]):
                 for this many cells.
             max_num_tbs (int): Maximum number of transport blocks per cell group. Memory will be
                 allocated for this many transport blocks.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
         self.num_bwp_prbs = num_bwp_prbs
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
-        self.dmrs_tx = pycuphy.DmrsTx(cuda_stream, max_num_cells, max_num_tbs)
+        self.dmrs_tx = pycuphy.DmrsTx(self._cuda_stream.handle, max_num_cells, max_num_tbs)
 
     def run(self,
             slot: int,
@@ -93,12 +93,12 @@ class DmrsTx(Generic[Array]):
                 dmrs_params += PdschDmrsConfig.from_pdsch_config(pdsch_config, self.num_bwp_prbs)
 
         cpu_copy = isinstance(tx_buffers[0], np.ndarray)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tx_buffers = [cp.array(tx_buf, order='F', dtype=cp.complex64) for tx_buf in tx_buffers]
 
         tx_buffers = [pycuphy.CudaArrayComplexFloat(tx_buf) for tx_buf in tx_buffers]
         self.dmrs_tx.run(tx_buffers, slot, dmrs_params)
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             tx_buffers = [cp.array(tx_buf) for tx_buf in tx_buffers]
             if cpu_copy:
                 tx_buffers = [tx_buf.get(order='F') for tx_buf in tx_buffers]

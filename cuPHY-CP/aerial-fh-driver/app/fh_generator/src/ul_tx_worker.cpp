@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -153,6 +153,10 @@ void fronthaul_generator_ul_tx_worker(Worker* worker)
                 if(uplane_msg.section_num > 0)
                 {
                     auto txq_index = uplane_msg.radio_app_hdr.symbolId + uplane_msg.radio_app_hdr.slotId * ORAN_ALL_SYMBOLS;
+                    if (txq_index >= num_txqs) {
+                        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "txq_index {} out of bounds, max {}", txq_index, num_txqs - 1);
+                        continue;
+                    }
                     aerial_fh::prepare_uplane_with_preallocated_tx_request(context.ul_tx_worker_context.peers[i], &uplane_msg, tx_complete_notification, &tx_request, txq_index);
                     auto tx_cnt = aerial_fh::send_uplane_without_freeing_tx_request(tx_request, txqs[txq_index]);
                     uplane_msg.section_num = 0;

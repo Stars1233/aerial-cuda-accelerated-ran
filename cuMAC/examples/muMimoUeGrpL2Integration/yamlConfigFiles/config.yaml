@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# mMIMO scheduler testbench configuration file
+---
+# thread core config
+CUMAC_MAIN_THREAD_CORE: 3
+L2_MAIN_THREAD_CORE: 4
+L1_MAIN_THREAD_CORE: 5
+L2_CUMAC_RECV_THREAD_CORE: 6
+L1_L2_RECV_THREAD_CORE: 7
+CUMAC_L2_RECV_THREAD_CORE: 8
+CUMAC_L1_RECV_THREAD_CORE: 9
+
+# GPU device ID
+CUDA_DEVICE_ID: 0
+
+# enable L1/L2 memory sharing
+ENABLE_L1_L2_MEM_SHARING: true
+
+# print UE pairing solution
+PRINT_UE_PAIRING_SOLUTION: true
+
+# CUDA kernel launch flags
+KERNEL_LAUNCH_FLAGS: 0x03 # 0x01: channel correlation computation kernel, 0x02: UE pairing algorithm kernel
+
+# config constants
+NUM_TIME_SLOTS: 5
+TDD_PATTERN: "SDDDS"
+NUM_CELL: 1                           # number of cells jointly scheduled by cuMAC
+NUM_UE_ANT_PORT: 4                    # number of antenna ports per UE
+NUM_BS_ANT_PORT: 64                   # number of antenna ports per RU
+NUM_PRG_PER_CELL: 136                 # number of PRGs per cell
+PRG_SIZE: 2                           # size of each PRG (number of PRBs per PRG)
+NUM_SUBBAND: 4                        # number of subbands
+NUM_PRG_SAMP_PER_SUBBAND: 1           # number of per-PRG SRS channel estimate samples per subband
+NUM_SRS_UE_PER_CELL: 256              # total number of SRS enabled UEs per cell
+NUM_SRS_UE_PER_SLOT: 32               # number of SRS UEs scheduled per S-slot per cell
+MAX_NUM_UE_SCHEDULED_PER_CELL_TTI: 16 # maximum number of scheduled UEs /cell/TTI
+MAX_NUM_UE_FOR_GRP_PER_CELL: 32       # maximum number of UE groups per cell
+
+SRS_CHAN_EST_COEFF_VAR: 1e-3
+SCS: 30000
+
+#SLOT_INTERVAL_NS: 500
+SLOT_INTERVAL_NS: 1000000000      # Time slot interval in nanoseconds. Set to 1 second for debugging
+
+# CUDA kernel config
+NUM_BLOCKS_PER_ROW_CHAN_OR_MAT: 8 # number of blocks per row of channel orthogonality matrix, optimal value is 2 for V1 kernel, 8 for V2 kernel
+# NUM_BLOCKS_PER_ROW_CHAN_OR_MAT must be no greater than NUM_SRS_UE_PER_CELL
+
+# SRS memory bank test configuration
+srs_mem_bank_config:
+  # Test scenario parameters
+  is_contiguous_gpu_mem: true     # True if the buffers are contiguous in GPU memory
+  num_srs_buffers_per_cell: 1024  # Total number of SRS buffers to allocate per cell
+  rnti_base: 100                  # Base RNTI for test UEs
+  cell_id_base: 0                 # Base cell ID for multi-cell tests
+  
+  # SRS PRB configuration
+  srs_start_prg: 0                # Starting PRB group index
+  srs_start_valid_prg: 0          # First valid PRB group
+  srs_n_valid_prg: 136            # Number of valid PRB groups
+  
+  # FAPI allocation request type
+  alloc_request: 0x02        # Test allocation request type (SCF_FAPI_CONFIG_REQUEST)

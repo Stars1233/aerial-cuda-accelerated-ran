@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -88,6 +88,8 @@ int pdcchReverseBitInByte(uint8_t* inputByte, uint8_t* outputByte, uint32_t Nbyt
     return 0;
 }
 
+// pdcchPrintByte was never used in the codebase
+/*VCAST_DONT_INSTRUMENT_START*/
 int pdcchPrintByte(uint8_t* inputByte, uint32_t Nbyte, bool rev_bits, int payload_bits)
 {
     for(int idxByte = 0; idxByte < Nbyte; idxByte++)
@@ -103,6 +105,7 @@ int pdcchPrintByte(uint8_t* inputByte, uint32_t Nbyte, bool rev_bits, int payloa
     }
     return 0;
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 // generate CRC bits for pdcch payload
 // Same as src/cuphy/crc/crc.hpp except this one can handle sizeBit which is not devisible by 8
@@ -133,10 +136,14 @@ uintCRC_t computePdcchCRC(const uint8_t* input,
         {
             input_val = (i < (extra_bytes * stride)) ? 0xffu : input[i - extra_bytes * stride];
         }
+        // Not covered via public API: computePdcchCRC() is called with include_crc_ones=false in production path, so extra_bytes>0 and this branch is not reached.
+        /*VCAST_DONT_INSTRUMENT_START*/
         else
         {
             input_val = input[i];
         }
+        /*VCAST_DONT_INSTRUMENT_END*/
+
         //printf("i %d input_val %x\n", i, input_val);
         crc ^= static_cast<uintCRC_t>(input_val << (uintCRCBitLength - 8));
         for(int b = 0; b < 8; b++)
@@ -163,6 +170,8 @@ void pdcchAddCrc(uint8_t* dci_payload, uint32_t& dci_crc, const uint32_t rnti_cr
 }
 
 // generate gold sequence with given init state and length
+// pdcchGenGoldSeq was never used in the codebase
+/*VCAST_DONT_INSTRUMENT_START*/
 void pdcchGenGoldSeq(uint32_t c_init, uint32_t len, uint32_t* x1, uint32_t* x2, uint32_t* c)
 {
     for(int i = 0; i < 32; i++)
@@ -190,8 +199,11 @@ void pdcchGenGoldSeq(uint32_t c_init, uint32_t len, uint32_t* x1, uint32_t* x2, 
         c[i >> 5] = val;
     }
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 // PDCCH scrambling sequence x_scramSeq used to be generated on the host in cuphyPdcchPipelinePrepare. Now it is done during Run
+// genPdcchScramSeq was never used in the codebase
+/*VCAST_DONT_INSTRUMENT_START*/
 void genPdcchScramSeq(uint32_t dmrs_id, uint32_t rnti_bits, uint32_t Nscram, uint32_t* x_scramSeq)
 {
     uint32_t cinit = ((rnti_bits << 16) + dmrs_id) & 0x7fffffffU;
@@ -201,6 +213,7 @@ void genPdcchScramSeq(uint32_t dmrs_id, uint32_t rnti_bits, uint32_t Nscram, uin
 
     pdcchGenGoldSeq(cinit, Nscram, x1, x2, x_scramSeq);
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 template <typename TComplex, typename Block>
 __device__ void generate_dmrs(TComplex* __restrict__ dmrs_seqs, // 3 * n_rb
@@ -533,6 +546,8 @@ __global__ void genPdcchTfSignalKernel(
     }
 }
 
+// dbg_print was never used in the codebase
+/*VCAST_DONT_INSTRUMENT_START*/
 void dbg_print(PdcchParams* h_coreset_params, cuphyPdcchDciPrm_t* h_dci_params, int num_coresets, int num_dcis)
 {
     for(int coreset_idx = 0; coreset_idx < num_coresets; coreset_idx++)
@@ -628,6 +643,7 @@ void dbg_print(PdcchParams* h_coreset_params, cuphyPdcchDciPrm_t* h_dci_params, 
         }
     }
 }
+/*VCAST_DONT_INSTRUMENT_END*/
 
 void kernelSelectGenScramblingSeq(cuphyGenScramblingSeqLaunchCfg_t* pLaunchCfg,
                                   uint32_t                          num_DCIs)

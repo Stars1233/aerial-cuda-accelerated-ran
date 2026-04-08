@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -483,7 +483,7 @@ ofdmDeModulate<Tscalar, Tcomplex>::ofdmDeModulate(cuphyCarrierPrms_t * cuphyCarr
 
     CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pLaunchCfg->kernelNodeParamsDriver;
     
-    CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, reinterpret_cast<void*>(kernelPtr)));
+    CHECK_CUDAERROR(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, reinterpret_cast<void*>(kernelPtr)));
     kernelNodeParamsDriver.blockDimX = block_dim.x;
     kernelNodeParamsDriver.blockDimY = block_dim.y;
     kernelNodeParamsDriver.blockDimZ = block_dim.z;

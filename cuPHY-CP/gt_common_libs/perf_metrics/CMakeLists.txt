@@ -19,6 +19,7 @@
 set(SOURCES
     src/perf_metrics_accumulator.cpp
     src/perf_metrics_utils.cpp
+    src/percentile_tracker.cpp
 )
 
 # Header files
@@ -26,6 +27,7 @@ set(HEADERS
     include/perf_metrics/perf_metrics_accumulator.hpp
     include/perf_metrics/perf_metrics_logging.hpp
     include/perf_metrics/perf_metrics_utils.hpp
+    include/perf_metrics/percentile_tracker.hpp
 )
 
 # Create the library (now with implementation)

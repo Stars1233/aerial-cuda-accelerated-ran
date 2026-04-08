@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+# Transport settings for cuMAC/L2 communication / primary NVIPC for cuMAC
+transport:
+  type: shm
+  shm_config:
+    primary: 0
+    prefix: l2_cumac
+    cuda_device_id: -1
+    ring_len: 8192
+    mempool_size:
+      cpu_msg:
+        buf_size: 8192
+        pool_len: 4096
+      cpu_data:
+        buf_size: 20480000
+        pool_len: 64
+      cuda_data:
+        buf_size: 307200
+        pool_len: 0
+      gpu_data:
+        buf_size: 576000
+        pool_len: 0
+
+nvipc_log:
+  # Log level: 0 - NONE, 1 - FATAL, 2 - ERROR, 3 - CONSOLE, 4 - WARNING, 5 - INFO, 6 - DEBUG, 7 - VERBOSE
+  log_level: 3 # Can set to 5 when debug, but set to <=3 in production.
+
+  # Below are FMT log configurations. Only available when NVIPC_FMTLOG_ENABLE=ON
+  # Log file path and file name prefix
+  fmt_log_path: "/var/log/aerial"
+  fmt_log_name: "cumac_l2_muUeGrp_test"
+  # Maximum FMT log file size. Unit: MB.
+  fmt_log_max_size: 128
+
+...

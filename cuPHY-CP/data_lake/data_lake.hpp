@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +51,7 @@ struct E3BufferInfo {
 	uint32_t fh_write_index{};
 	uint32_t pusch_write_index{};
 	uint32_t hest_write_index{};
+	uint32_t hest_data_size{};  // Actual size of written H estimates data (in elements)
 	uint16_t sfn{};
 	uint16_t slot{};
 	uint64_t timestamp_ns{};
@@ -311,16 +312,16 @@ class DataLake {
 		const int numRowsToInsertPusch = 400, // Try to not have these have a common multiple
 		const int numRowsToInsertHest = 200, // H estimates buffer size
 		const bool e3AgentEnabled = false, // E3 Agent runtime enable flag
-		const uint16_t e3PubPort = 5555, // E3 publisher port
-		const uint16_t e3RepPort = 5556, // E3 reply port
-		const uint16_t e3SubPort = 5560, // E3 subscriber port
+		const uint16_t e3RepPort = 5555, // E3 reply port
+		const uint16_t e3PubPort = 5556, // E3 publisher port
+		const uint16_t e3SubPort = 5557, // E3 subscriber port
 		const bool dropTables = false
     ):
 		numSamples_(numSamples),
 		numRowsToInsertHest(numRowsToInsertHest),
 		e3AgentEnabled(e3AgentEnabled),
-		e3PubPort(e3PubPort),
 		e3RepPort(e3RepPort),
+		e3PubPort(e3PubPort),
 		e3SubPort(e3SubPort),
 		dbAddress(dbAddress),
 		dbEngine(dbEngine),
@@ -359,7 +360,14 @@ class DataLake {
 		initMem();
 		initThreads(numThreads);
 		if (enableDbInsert) {
-			dbInit(dbAddress,dbEngine,dropTables);
+			try {
+				dbInit(dbAddress,dbEngine,dropTables);
+			} catch (const std::exception& e) {
+				NVLOGF_FMT(TAG_DATALAKE, AERIAL_CONFIG_EVENT,
+					"ClickHouse connection failed at '{}': {}. "
+					"Start the ClickHouse DB container or disable Data Lake by setting datalake_db_write_enable: 0.",
+					dbAddress, e.what());
+			}
 		}
 	}
 	~DataLake(void);
@@ -460,8 +468,8 @@ class DataLake {
 
 		// E3 Agent configuration
 		uint8_t e3AgentEnabled;
-		uint16_t e3PubPort;
 		uint16_t e3RepPort;
+		uint16_t e3PubPort;
 		uint16_t e3SubPort;
 		
 		// E3 buffer tracking (accessed by DataLake::collect and E3Agent)

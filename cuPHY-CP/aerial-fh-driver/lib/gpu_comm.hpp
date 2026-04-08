@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,12 +129,13 @@ struct PacketCopyParams {
 
 using num_packets_per_flow_t = std::array<uint32_t,kMaxFlows>;
 
-void launch_memset_kernel(void* d_buffers_addr, int num_cells, size_t max_buffer_size, CleanupParams &params, cudaStream_t strm);
+void launch_memset_kernel(int num_cells, size_t max_buffer_size, CleanupParams &params, cudaStream_t strm);
 int gpu_comm_warmup(cudaStream_t cstream);
 int gpucomm_pre_prepare_send(PrepareParams &params, cudaStream_t cstream);
 void launch_packet_memcpy_kernel(PacketCopyParams, int num_cells, cudaStream_t strm);
 int gpucomm_prepare_send(PrepareParams &params, cudaStream_t cstream);
 int gpucomm_trigger_send(TriggerParams &params, cudaStream_t cstream, bool cx6);
+int gpucomm_ring_doorbell_for_cells(doca_gpu_eth_txq** d_txq_handlers, const uint32_t* d_wqe_indices, const uint32_t num_cells, cudaStream_t cstream);
 void force_loading_gpu_comm_kernels();
 
 class GpuComm {
@@ -159,11 +160,9 @@ protected:
     std::array<cudaEvent_t,ORAN_ALL_SYMBOLS>         trigger_end;
     void*               bf_db_dev_;
     volatile uint64_t*  bf_db_host_;
-    CleanupDlBufInfo* h_buffers_addr;
-    CleanupDlBufInfo* d_buffers_addr;
     uint32_t pkt_counts_flow[API_MAX_NUM_CELLS][kMaxFlows];
     uint32_t*           host_pinned_error_flag;
-    std::array<PacketStartDebugInfo*, MAX_DL_UPLANE_QUEUES> pkt_start_debug;
+    std::array<PacketStartDebugInfo*, API_MAX_NUM_CELLS> pkt_start_debug;
     std::array<uint64_t,MAX_DL_SLOTS_TRIGGER_TIME> dl_slot_trigger_ts;
 };
 

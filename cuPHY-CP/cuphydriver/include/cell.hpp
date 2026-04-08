@@ -204,6 +204,7 @@ public:
      */
     int                    setNicName(std::string nic_name);
     uint32_t               getNicIndex() const;                   ///< Get NIC interface index
+    uint8_t                getDlcCoreIndex() const;               ///< Get DL C-plane core index for fixed packing scheme
     
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //// Buffer and Resource Management
@@ -517,6 +518,7 @@ private:
     std::string        name;                                      ///< Cell name (for logging/debugging)
     std::string        nic_name;                                  ///< Network interface card name (e.g., "eth0")
     uint32_t           nic_index;                                 ///< NIC interface index
+    uint8_t            dlc_core_index;                            ///< DL C-plane core index for fixed packing scheme
     
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //// PHY Layer Configuration

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,13 +18,397 @@
 #include "test_config.hpp" // for cuphy::test_config
 #include "cuphy_testWrkr.hpp"
 #include "cumac_testWrkr.hpp"
-#include <unordered_map>
 
 #define CURRENT_MAX_GREEN_CTXS 10 // excessive but ok; currently 6 are used
 // #define CUBB_GPU_TESTBENCH_POWER_ITERATION_BATCHING // to control power iteration mode
 
 // NOTE: cannot define vectors of cuPHYTestWorker or cuMACTestWorker yet (need copy constructors). Until then, need use separate function to finish simulation after creation.
 typedef std::vector<std::vector<std::vector<std::string>>> string3Dvec_t;
+
+// Global start-delay config (defaults from testbench_common.hpp; overridden from vectors YAML if provided).
+start_delay_cfg_us g_start_delay_cfg_us;
+
+// Global TV parameter override config (optional; overridden from vectors YAML if provided).
+tv_override_cfg g_tv_override_cfg;
+
+static std::optional<int64_t> parse_i64_loose(const yaml::node& n);
+static std::optional<ul_anchor_mode_t> parse_ul_anchor_mode(const yaml::node& n);
+
+/** Read optional cumac_options from YAML (root["cumac_options"] or root["config"]["cumac_options"]). Leaves out unchanged on absence. */
+static void apply_cumac_options_from_yaml(const yaml::node& root, CumacOptions& out)
+{
+    auto parse_cumac = [&out](const yaml::node& co) {
+        auto read_uint8_arr = [&co](const char* key, uint8_t* arr, size_t n) {
+            try {
+                for(size_t i = 0; i < n; i++) {
+                    yaml::node elem = co[key][i];
+                    arr[i] = static_cast<uint8_t>(elem.as<int>());
+                }
+            } catch(...) {}
+        };
+        auto read_int_arr = [&co](const char* key, int* arr, size_t n) {
+            try {
+                for(size_t i = 0; i < n; i++) {
+                    yaml::node elem = co[key][i];
+                    arr[i] = elem.as<int>();
+                }
+            } catch(...) {}
+        };
+        auto read_float_arr = [&co](const char* key, float* arr, size_t n) {
+            try {
+                for(size_t i = 0; i < n; i++) {
+                    yaml::node elem = co[key][i];
+                    arr[i] = elem.as<float>();
+                }
+            } catch(...) {}
+        };
+        read_uint8_arr("modules_called", out.modules_called, 4);
+        read_int_arr("cumac_light_weight_flag", out.cumac_light_weight_flag, kMaxMacSlotsPerPattern);
+        read_float_arr("perc_sm_num_thrd_blk", out.perc_sm_num_thrd_blk, kMaxMacSlotsPerPattern);
+        try {
+            yaml::node seq = co["cumac_light_weight_flag"];
+            auto len = seq.length();
+            if (len > kMaxMacSlotsPerPattern) {
+                NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT, "ERROR: cumac_light_weight_flag array length ({}) exceeds kMaxMacSlotsPerPattern ({})", len, kMaxMacSlotsPerPattern);
+                exit(1);
+            }
+            out.config_slot_count = static_cast<uint8_t>(len);
+
+            if (co.has_key("perc_sm_num_thrd_blk")) {
+                auto pLen = co["perc_sm_num_thrd_blk"].length();
+                if (pLen != len) {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT, "ERROR: perc_sm_num_thrd_blk length ({}) does not match cumac_light_weight_flag length ({})", pLen, len);
+                    exit(1);
+                }
+            }
+        } catch(...) {}
+        try { out.half_precision = static_cast<uint8_t>(co["half_precision"].template as<int>()); } catch(...) {}
+        try { out.sch_alg = static_cast<uint8_t>(co["sch_alg"].template as<int>()); } catch(...) {}
+        try { out.hetero_ue_sel_cells = static_cast<uint8_t>(co["hetero_ue_sel_cells"].template as<int>()); } catch(...) {}
+    };
+    try
+    {
+        if(root.has_key("cumac_options"))
+            parse_cumac(root["cumac_options"]);
+        else if(root.has_key("config"))
+        {
+            yaml::node cfg = root["config"];
+            if(cfg.has_key("cumac_options"))
+                parse_cumac(cfg["cumac_options"]);
+        }
+    }
+    catch(...)
+    {}
+}
+
+static void apply_start_delay_overrides_from_yaml(const yaml::node& root)
+{
+    try
+    {
+        yaml::node sd = root["start_delay"];
+
+        auto set_u32 = [&](const char* k, uint32_t& dst) {
+            try
+            {
+                dst = sd[k].as<unsigned int>();
+            }
+            catch(...)
+            {}
+        };
+        auto set_i32 = [&](const char* k, int32_t& dst) {
+            try
+            {
+                auto opt = parse_i64_loose(sd[k]);
+                if(opt.has_value())
+                    dst = static_cast<int32_t>(*opt);
+            }
+            catch(...)
+            {}
+        };
+        auto set_ul_anchor = [&](const char* k, ul_anchor_mode_t& dst) {
+            try
+            {
+                auto opt = parse_ul_anchor_mode(sd[k]);
+                if(opt.has_value())
+                {
+                    dst = *opt;
+                    g_start_delay_cfg_us.ul_anchor_from_yaml = true;
+                }
+            }
+            catch(...)
+            {}
+        };
+
+        // Generic keys (apply to both u5/u6 where applicable)
+        set_u32("SRS", g_start_delay_cfg_us.srs_u5);
+        g_start_delay_cfg_us.srs_u6 = g_start_delay_cfg_us.srs_u5;
+        set_u32("SRS2", g_start_delay_cfg_us.srs2_u5);
+        g_start_delay_cfg_us.srs2_u6 = g_start_delay_cfg_us.srs2_u5;
+        set_ul_anchor("UL_ANCHOR", g_start_delay_cfg_us.ul_anchor_mode);
+
+        // Keys matching phase3_test_config.yaml conventions
+        set_i32("PUSCH1", g_start_delay_cfg_us.pusch_u5);
+        g_start_delay_cfg_us.pusch_u6 = g_start_delay_cfg_us.pusch_u5;
+        set_u32("PUCCH1", g_start_delay_cfg_us.pucch_u5);
+        g_start_delay_cfg_us.pucch_u6 = g_start_delay_cfg_us.pucch_u5;
+        if(sd.has_key("PRACH"))
+        {
+            set_u32("PRACH", g_start_delay_cfg_us.prach_u5);
+            g_start_delay_cfg_us.prach_u6 = g_start_delay_cfg_us.prach_u5;
+            g_start_delay_cfg_us.prach_delay_from_yaml = true;
+        }
+        set_i32("PUSCH2", g_start_delay_cfg_us.pusch2_u5);
+        g_start_delay_cfg_us.pusch2_u6 = g_start_delay_cfg_us.pusch2_u5;
+        set_i32("PUCCH2", g_start_delay_cfg_us.pucch2_u6);
+        set_u32("PDSCH_DLBFW", g_start_delay_cfg_us.dlbfw_slot0_u5);
+        g_start_delay_cfg_us.dlbfw_u6 = g_start_delay_cfg_us.dlbfw_slot0_u5;
+        set_u32("PDSCH", g_start_delay_cfg_us.pdsch_no_bfw_u6);
+        set_i32("PDCCH", g_start_delay_cfg_us.pdcch_u6);
+        set_i32("PDCCH_CSIRS", g_start_delay_cfg_us.pdcch_csirs_u6);
+        set_u32("SSB", g_start_delay_cfg_us.ssb_u5);
+        g_start_delay_cfg_us.ssb_u6 = g_start_delay_cfg_us.ssb_u5;
+
+        // Optional explicit u6-only keys
+        set_u32("ULBFW", g_start_delay_cfg_us.ulbfw_u6);
+        set_u32("ULBFW2", g_start_delay_cfg_us.ulbfw2_u6);
+        set_u32("DLBFW", g_start_delay_cfg_us.dlbfw_u6);
+    }
+    catch(...)
+    {
+        // start_delay not present: keep defaults
+    }
+}
+
+static std::optional<int64_t> parse_i64_loose(const yaml::node& n)
+{
+    try
+    {
+        return static_cast<int64_t>(const_cast<yaml::node&>(n).as<int>());
+    }
+    catch(...)
+    {}
+    try
+    {
+        std::string s = const_cast<yaml::node&>(n).as<std::string>();
+        std::string sl = s;
+        for(size_t idx = 0; idx < sl.size(); ++idx)
+        {
+            if(sl[idx] >= 'A' && sl[idx] <= 'Z')
+                sl[idx] = static_cast<char>(sl[idx] - 'A' + 'a');
+        }
+        if(sl == "true")
+            return 1;
+        if(sl == "false")
+            return 0;
+
+        size_t start = 0;
+        while(start < s.size() && (s[start] == ' ' || s[start] == '\t'))
+            ++start;
+        size_t end = s.size();
+        while(end > start && (s[end - 1] == ' ' || s[end - 1] == '\t'))
+            --end;
+        if(start >= end)
+            return std::nullopt;
+
+        try
+        {
+            return std::stoll(s.substr(start, end - start));
+        }
+        catch(const std::invalid_argument&)
+        {
+            return std::nullopt;
+        }
+        catch(const std::out_of_range&)
+        {
+            return std::nullopt;
+        }
+    }
+    catch(...)
+    {
+        return std::nullopt;
+    }
+}
+
+static std::optional<ul_anchor_mode_t> parse_ul_anchor_mode(const yaml::node& n)
+{
+    try
+    {
+        std::string s = const_cast<yaml::node&>(n).as<std::string>();
+        for(size_t idx = 0; idx < s.size(); ++idx)
+        {
+            if(s[idx] >= 'a' && s[idx] <= 'z')
+                s[idx] = static_cast<char>(s[idx] - 'a' + 'A');
+        }
+        size_t start = 0;
+        while(start < s.size() && (s[start] == ' ' || s[start] == '\t'))
+            ++start;
+        size_t end = s.size();
+        while(end > start && (s[end - 1] == ' ' || s[end - 1] == '\t'))
+            --end;
+        if(start >= end)
+            return std::nullopt;
+
+        std::string mode = s.substr(start, end - start);
+        if(mode == "PUSCH")
+            return ul_anchor_mode_t::PUSCH;
+        if(mode == "PRACH")
+            return ul_anchor_mode_t::PRACH;
+        if(mode == "PUCCH")
+            return ul_anchor_mode_t::PUCCH;
+    }
+    catch(...)
+    {}
+    return std::nullopt;
+}
+
+static void print_tv_overrides_config()
+{
+    if(!g_tv_override_cfg.enable)
+    {
+        NVLOGI_FMT(NVLOG_TESTBENCH_PHY, "[TV-OVERRIDE] disabled");
+        return;
+    }
+
+    NVLOGI_FMT(NVLOG_TESTBENCH_PHY, "[TV-OVERRIDE] enabled");
+    auto print_u8 = [](const char* chan, const char* key, bool has, uint8_t v) {
+        if(has) NVLOGI_FMT(NVLOG_TESTBENCH_PHY, "[TV-OVERRIDE][{}] {}={}", chan, key, static_cast<unsigned int>(v));
+    };
+    auto print_u16 = [](const char* chan, const char* key, bool has, uint16_t v) {
+        if(has) NVLOGI_FMT(NVLOG_TESTBENCH_PHY, "[TV-OVERRIDE][{}] {}={}", chan, key, static_cast<unsigned int>(v));
+    };
+    auto print_u32 = [](const char* chan, const char* key, bool has, uint32_t v) {
+        if(has) NVLOGI_FMT(NVLOG_TESTBENCH_PHY, "[TV-OVERRIDE][{}] {}={}", chan, key, static_cast<unsigned int>(v));
+    };
+
+    const auto& po = g_tv_override_cfg.pusch;
+    print_u8("PUSCH", "list_length", po.has_polar_list_length, po.polar_list_length);
+    print_u8("PUSCH", "enable_cfo_correction", po.has_enable_cfo_correction, po.enable_cfo_correction);
+    print_u8("PUSCH", "enable_weighted_average_cfo", po.has_enable_weighted_average_cfo, po.enable_weighted_average_cfo);
+    print_u8("PUSCH", "enable_to_estimation", po.has_enable_to_estimation, po.enable_to_estimation);
+    print_u8("PUSCH", "tdi_mode", po.has_tdi_mode, po.tdi_mode);
+    print_u8("PUSCH", "enable_dft_sofdm", po.has_enable_dft_sofdm, po.enable_dft_sofdm);
+    print_u8("PUSCH", "enable_rssi_measurement", po.has_enable_rssi_measurement, po.enable_rssi_measurement);
+    print_u8("PUSCH", "enable_sinr_measurement", po.has_enable_sinr_measurement, po.enable_sinr_measurement);
+    print_u8("PUSCH", "enable_static_dynamic_beamforming", po.has_enable_static_dynamic_beamforming, po.enable_static_dynamic_beamforming);
+    print_u8("PUSCH", "enable_early_harq", po.has_enable_early_harq, po.enable_early_harq);
+    print_u8("PUSCH", "ldpc_early_termination", po.has_ldpc_early_termination, po.ldpc_early_termination);
+    print_u16("PUSCH", "ldpc_algorithm_index", po.has_ldpc_algorithm_index, po.ldpc_algorithm_index);
+    print_u32("PUSCH", "ldpc_flags", po.has_ldpc_flags, po.ldpc_flags);
+    print_u8("PUSCH", "ldpc_use_half", po.has_ldpc_use_half, po.ldpc_use_half);
+    print_u8("PUSCH", "ldpc_max_num_iterations", po.has_ldpc_max_num_iterations, po.ldpc_max_num_iterations);
+    print_u8("PUSCH", "ldpc_max_num_iterations_algorithm_index", po.has_ldpc_max_num_iterations_algorithm_index, po.ldpc_max_num_iterations_algorithm_index);
+    print_u8("PUSCH", "dmrs_channel_estimation_algorithm_index", po.has_dmrs_channel_estimation_algorithm_index, po.dmrs_channel_estimation_algorithm_index);
+    print_u8("PUSCH", "enable_per_prg_channel_estimation", po.has_enable_per_prg_channel_estimation, po.enable_per_prg_channel_estimation);
+    print_u8("PUSCH", "eq_coefficient_algorithm_index", po.has_eq_coefficient_algorithm_index, po.eq_coefficient_algorithm_index);
+
+    const auto& co = g_tv_override_cfg.pucch;
+    print_u8("PUCCH", "list_length", co.has_polar_list_length, co.polar_list_length);
+
+    const auto& so = g_tv_override_cfg.srs;
+    print_u8("SRS", "chEst_alg_selector", so.has_chest_alg_index, so.chest_alg_index);
+}
+
+template<typename T>
+static void read_uint(const yaml::node& parent, const char* key, bool& has, T& dst)
+{
+    has = false;
+    try
+    {
+        auto opt = parse_i64_loose(parent[key]);
+        if(!opt.has_value() || *opt == -1)
+            return;
+        dst = static_cast<T>(*opt);
+        has = true;
+    }
+    catch(...)
+    {}
+}
+
+/**
+ * @brief Apply optional test-vector field overrides from YAML into global override state.
+ *
+ * Reads the `override_test_vectors` section from @p root and updates `g_tv_override_cfg`
+ * only for fields explicitly set to values other than `-1`. Missing fields or sentinel
+ * `-1` values are treated as no-op, parse failures are ignored, and existing try/catch
+ * boundaries keep behavior non-fatal for malformed or absent override content.
+ *
+ * @param root Root YAML node parsed from the input vectors/config file.
+ */
+static void apply_tv_overrides_from_yaml(const yaml::node& root)
+{
+    try
+    {
+        yaml::node ov = root["override_test_vectors"];
+        try
+        {
+            auto opt = parse_i64_loose(ov["enable_override"]);
+            g_tv_override_cfg.enable = (opt.has_value() && *opt != 0);
+        }
+        catch(...)
+        {
+            g_tv_override_cfg.enable = false;
+        }
+
+        if(!g_tv_override_cfg.enable)
+        {
+            print_tv_overrides_config();
+            return;
+        }
+
+        // PUSCH
+        try
+        {
+            yaml::node p = ov["PUSCH"];
+            read_uint<uint8_t>(p, "list_length", g_tv_override_cfg.pusch.has_polar_list_length, g_tv_override_cfg.pusch.polar_list_length);
+            read_uint<uint8_t>(p, "enable_cfo_correction", g_tv_override_cfg.pusch.has_enable_cfo_correction, g_tv_override_cfg.pusch.enable_cfo_correction);
+            read_uint<uint8_t>(p, "enable_weighted_average_cfo", g_tv_override_cfg.pusch.has_enable_weighted_average_cfo, g_tv_override_cfg.pusch.enable_weighted_average_cfo);
+            read_uint<uint8_t>(p, "enable_to_estimation", g_tv_override_cfg.pusch.has_enable_to_estimation, g_tv_override_cfg.pusch.enable_to_estimation);
+            read_uint<uint8_t>(p, "tdi_mode", g_tv_override_cfg.pusch.has_tdi_mode, g_tv_override_cfg.pusch.tdi_mode);
+            read_uint<uint8_t>(p, "enable_dft_sofdm", g_tv_override_cfg.pusch.has_enable_dft_sofdm, g_tv_override_cfg.pusch.enable_dft_sofdm);
+            read_uint<uint8_t>(p, "enable_rssi_measurement", g_tv_override_cfg.pusch.has_enable_rssi_measurement, g_tv_override_cfg.pusch.enable_rssi_measurement);
+            read_uint<uint8_t>(p, "enable_sinr_measurement", g_tv_override_cfg.pusch.has_enable_sinr_measurement, g_tv_override_cfg.pusch.enable_sinr_measurement);
+            read_uint<uint8_t>(p, "enable_static_dynamic_beamforming", g_tv_override_cfg.pusch.has_enable_static_dynamic_beamforming, g_tv_override_cfg.pusch.enable_static_dynamic_beamforming);
+            read_uint<uint8_t>(p, "enable_early_harq", g_tv_override_cfg.pusch.has_enable_early_harq, g_tv_override_cfg.pusch.enable_early_harq);
+
+            read_uint<uint8_t>(p, "ldpc_early_termination", g_tv_override_cfg.pusch.has_ldpc_early_termination, g_tv_override_cfg.pusch.ldpc_early_termination);
+            read_uint<uint16_t>(p, "ldpc_algorithm_index", g_tv_override_cfg.pusch.has_ldpc_algorithm_index, g_tv_override_cfg.pusch.ldpc_algorithm_index);
+            read_uint<uint32_t>(p, "ldpc_flags", g_tv_override_cfg.pusch.has_ldpc_flags, g_tv_override_cfg.pusch.ldpc_flags);
+            read_uint<uint8_t>(p, "ldpc_use_half", g_tv_override_cfg.pusch.has_ldpc_use_half, g_tv_override_cfg.pusch.ldpc_use_half);
+            read_uint<uint8_t>(p, "ldpc_max_num_iterations", g_tv_override_cfg.pusch.has_ldpc_max_num_iterations, g_tv_override_cfg.pusch.ldpc_max_num_iterations);
+            read_uint<uint8_t>(p, "ldpc_max_num_iterations_algorithm_index", g_tv_override_cfg.pusch.has_ldpc_max_num_iterations_algorithm_index, g_tv_override_cfg.pusch.ldpc_max_num_iterations_algorithm_index);
+
+            read_uint<uint8_t>(p, "dmrs_channel_estimation_algorithm_index", g_tv_override_cfg.pusch.has_dmrs_channel_estimation_algorithm_index, g_tv_override_cfg.pusch.dmrs_channel_estimation_algorithm_index);
+            read_uint<uint8_t>(p, "enable_per_prg_channel_estimation", g_tv_override_cfg.pusch.has_enable_per_prg_channel_estimation, g_tv_override_cfg.pusch.enable_per_prg_channel_estimation);
+            read_uint<uint8_t>(p, "eq_coefficient_algorithm_index", g_tv_override_cfg.pusch.has_eq_coefficient_algorithm_index, g_tv_override_cfg.pusch.eq_coefficient_algorithm_index);
+        }
+        catch(...)
+        {}
+
+        // PUCCH
+        try
+        {
+            yaml::node p = ov["PUCCH"];
+            read_uint<uint8_t>(p, "list_length", g_tv_override_cfg.pucch.has_polar_list_length, g_tv_override_cfg.pucch.polar_list_length);
+        }
+        catch(...)
+        {}
+
+        // SRS
+        try
+        {
+            yaml::node p = ov["SRS"];
+            read_uint<uint8_t>(p, "chEst_alg_selector", g_tv_override_cfg.srs.has_chest_alg_index, g_tv_override_cfg.srs.chest_alg_index);
+        }
+        catch(...)
+        {}
+
+        print_tv_overrides_config();
+    }
+    catch(...)
+    {
+        // No overrides present.
+    }
+}
 
 // finishPschSim for run with uldl = 4
 void finishPschSim(std::vector<cuPHYTestWorker*>& pCuphyTestWorkers, string3Dvec_t& inCtxFileNamesPuschRx, string3Dvec_t& inCtxFileNamesPdschTx, uint32_t nTimingItrs, uint32_t nPowerItrs, uint32_t num_patterns, uint32_t nCtxts, uint32_t nCuphyCtxts, bool printCbErrors, cuphy::stream& mainStream, int32_t gpuId, uint32_t delayUs, uint32_t powerDelayUs, bool ref_check_pdsch, bool identical_ldpc_configs, cuphyPdschProcMode_t pdsch_proc_mode, uint64_t pusch_proc_mode, uint32_t fp16Mode, int descramblingOn, uint32_t nCellsPerCtxt, uint32_t nStrmsPerCtxt, uint32_t nPschItrsPerStrm, cuphy::event_timer& slotPatternTimer, float tot_slotPattern_time, float avg_slotPattern_time_us, std::shared_ptr<cuphy::buffer<uint32_t, cuphy::pinned_alloc>>& shPtrGpuStartSyncFlag, std::map<std::string, int>& cuStrmPrioMap, uint32_t syncUpdateIntervalCnt, bool enableLdpcThroughputMode, bool printCellMetrics, bool pdsch_group_cells, uint32_t pdsch_cells_per_stream, bool pusch_group_cells, maxPDSCHPrms pdschPrms, maxPUSCHPrms puschPrms, uint32_t ldpcLaunchMode, uint32_t pdsch_nItrsPerStrm, uint8_t* pdschSlotRunFlag, uint8_t* puschSubslotProcFlag);
@@ -135,6 +519,7 @@ void usage()
     printf("    --c <ch_name_1,...,ch_name_N> enable reference checks for channels whose names are provided as a comma separated list\n");
     printf("    --b                    [Deprecated] Inter-cell batching for PDSCH. No effect as inter-cell batching is always enabled with --G\n");
     printf("    -n                     Use green contexts\n");
+    printf("    -v                     Enable cudaProfilerStart/Stop around each pattern run\n");
 }
 
 //----------------------------------------------------------------------------------------------------------
@@ -244,6 +629,7 @@ int main(int argc, char* argv[])
         bool                 pdsch_inter_cell_batching = true; // deprecated
         uint32_t             mode                      = 0; // 0 is mode A (default), 1 is mode B
         bool                 useGreenContexts          = false; // Set if '-n' is used
+        bool                 enableNvprof              = false;
 
         // mac paramters
         bool                 macCtx                    = false; // enable subcontext for first MAC workload
@@ -403,6 +789,10 @@ int main(int argc, char* argv[])
                         NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,  "ERROR: Invalid debug message level {}, disabling debug messages", dbgMsgLevel);
                         dbgMsgLevel = 0;
                     }
+                    ++iArg;
+                    break;
+                case 'v':
+                    enableNvprof = true;
                     ++iArg;
                     break;
                 case 'n':
@@ -691,6 +1081,27 @@ int main(int argc, char* argv[])
         // testCfg.print();
         uint32_t cells_per_slot   = static_cast<uint32_t>(testCfg.num_cells());
         uint32_t num_slots        = static_cast<uint32_t>(testCfg.num_slots());
+        uint32_t slotsPerPatternFromYaml = 0;
+        CumacOptions cumacOptions;
+
+        // Optional YAML start-delay overrides (generated by perf Python scripts).
+        {
+            yaml::file_parser fp(inputFileName.c_str());
+            yaml::document    d = fp.next_document();
+            yaml::node        r = d.root();
+            apply_start_delay_overrides_from_yaml(r);
+            apply_tv_overrides_from_yaml(r);
+            apply_cumac_options_from_yaml(r, cumacOptions);
+            if(r.has_key("slots_per_pattern"))
+            {
+                slotsPerPatternFromYaml = r["slots_per_pattern"].as<unsigned int>();
+                if(slotsPerPatternFromYaml == 0)
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,  "Error! slots_per_pattern in YAML must be greater than zero");
+                    exit(1);
+                }
+            }
+        }
 
         uint32_t nPUSCHCells      = 0;
         uint32_t nUlbfwCells      = 0;
@@ -730,14 +1141,18 @@ int main(int argc, char* argv[])
             }
 
             case 5: {
-                if(num_slots % 8 != 0)
+                nSlotsPerPattern = (slotsPerPatternFromYaml > 0) ? slotsPerPatternFromYaml : 10;
+                if(slotsPerPatternFromYaml == 0)
                 {
-                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,  "Error! For DDDSUUDDDD mode (u = 5) the number of slots in YAML must be a multiple of eight");
+                    NVLOGW_FMT(NVLOG_TAG_BASE_TESTBENCH, "Warning! slots_per_pattern is not provided for u=5; using default 10-slot DDDSUUDDDD pattern");
+                }
+                if(num_slots % nSlotsPerPattern != 0)
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,  "Error! For DDDSUUDDDD mode (u = 5) the number of slots in YAML must be a multiple of slots_per_pattern ({})", nSlotsPerPattern);
                     exit(1);
                 }
 
-                num_patterns            = num_slots / 8;
-                nSlotsPerPattern        = 8;
+                num_patterns            = num_slots / nSlotsPerPattern;
                 break;
             }
 
@@ -2323,7 +2738,13 @@ int main(int argc, char* argv[])
             // cuMAC
             if(macCtx)
             {
+                if(cumacOptions.config_slot_count != 0 && static_cast<uint32_t>(cumacOptions.config_slot_count) != nSlotsPerPattern)
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT, "Error! cumac_options per-slot array length ({}) does not match total slot config length ({}). Set cumac_light_weight_flag and perc_sm_num_thrd_blk length to {} or omit cumac_options to use defaults.", cumacOptions.config_slot_count, nSlotsPerPattern, nSlotsPerPattern);
+                    exit(1);
+                }
                 cumacTestWorkerVec[macWorkerMap["MAC"]].init(nStrmsMac, nMacItrsPerStrm, nTimingItrs, cuStrmPrioMap, shPtrGpuStartSyncFlag, true /*waitRsp*/, patternMode[0], macInternalTimer, 0 /*lightWeightFlagOffset*/); // init cumac worker
+                cumacTestWorkerVec[macWorkerMap["MAC"]].setCumacOptions(cumacOptions);
 
                 cumacTestWorkerVec[macWorkerMap["MAC"]].macInit(inFileNamesMac[0], nMacSlots, ref_check_mac, true /* waitRsp */); // init cumac worker
             }
@@ -2391,7 +2812,12 @@ int main(int argc, char* argv[])
                     std::vector<uint8_t> macSlotConfig(macSlotRunFlag, macSlotRunFlag + nSlotsPerPattern);
                     cumacTestWorkerVec[macWorkerMap["MAC2"]].macSetup(inFileNamesMac2[patternIdx], macSlotConfig); // cumac2 worker setup, using per timeslot parameter
                 }
-
+                // start profiler after setup so capture range excludes setup
+                if(enableNvprof)
+                {
+                    cudaProfilerStart();
+                    NVLOGI_FMT(NVLOG_TAG_BASE_TESTBENCH, "Profiler started");
+                }
 #if USE_NVTX
                 nvtxRangePush("PATTERN");
 #endif
@@ -2418,7 +2844,7 @@ int main(int argc, char* argv[])
                     }
 
                     // Launch delay kernel on main stream on every iteration to ensure timeline is preserved
-                    gpu_us_delay(delayUs, gpuId, mainStream.handle(), 0);
+                    gpu_us_delay(delayUs, gpuId, mainStream.handle(), 1);
 
                     // Drop event on main stream for kernels to queue behind
                     startEvent.record(mainStream.handle());
@@ -2433,22 +2859,85 @@ int main(int argc, char* argv[])
 
                     if(pdcchCtx)
                     {
-                        cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].pdschTxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PDCCH"]], true, nullptr, cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr());
+                        cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].pdschTxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PDCCH"]], true, nullptr, cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr());
                     }
 
-                    if(puschCtx)
+                    if(g_start_delay_cfg_us.ul_anchor_from_yaml)
                     {
-                        cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUSCH"]]);
-                    }
+                        if(g_start_delay_cfg_us.ul_anchor_mode == ul_anchor_mode_t::PRACH)
+                        {
+                            if(prachCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], startEvent.handle());
 
-                    if(prachCtx)
-                    {
-                        cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent());
-                    }
+                            cudaEvent_t anchorEvt = (prachCtx && cuphyTestWorkerVec[channelWorkerMap["PRACH"]].getPrachStartEvent())
+                                ? cuphyTestWorkerVec[channelWorkerMap["PRACH"]].getPrachStartEvent()
+                                : startEvent.handle();
 
-                    if(pucchCtx)
+                            if(puschCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(anchorEvt, shPtrStopEvents[channelWorkerMap["PUSCH"]]);
+                            if(pucchCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], anchorEvt, anchorEvt);
+                        }
+                        else if(g_start_delay_cfg_us.ul_anchor_mode == ul_anchor_mode_t::PUCCH)
+                        {
+                            if(pucchCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], startEvent.handle(), startEvent.handle());
+
+                            cudaEvent_t anchorEvt = (pucchCtx && cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].getPucchStartEvent())
+                                ? cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].getPucchStartEvent()
+                                : startEvent.handle();
+
+                            if(puschCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(anchorEvt, shPtrStopEvents[channelWorkerMap["PUSCH"]]);
+                            if(prachCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], anchorEvt);
+                        }
+                        else
+                        {
+                            if(puschCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUSCH"]]);
+
+                            cudaEvent_t puschStartEvt = (puschCtx && cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent())
+                                ? cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent()
+                                : startEvent.handle();
+                            cudaEvent_t puschPucch2Evt = (puschCtx && cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent())
+                                ? cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent()
+                                : puschStartEvt;
+
+                            if(prachCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], puschStartEvt);
+                            if(pucchCtx)
+                                cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], puschPucch2Evt, puschStartEvt);
+                        }
+                    }
+                    else
                     {
-                        cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent(), cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent());
+                        if(puschCtx)
+                        {
+                            cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUSCH"]]);
+                        }
+
+                        if(prachCtx)
+                        {
+                            // If PRACH delay from YAML: relative to PUSCH1 start; else relative to PUSCH1 end
+                            cudaEvent_t prachStart = startEvent.handle();
+                            if(puschCtx)
+                            {
+                                cudaEvent_t puschEvent = g_start_delay_cfg_us.prach_delay_from_yaml
+                                    ? cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent()
+                                    : cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPusch1EndEvent();
+                                if(puschEvent)
+                                {
+                                    prachStart = puschEvent;
+                                }
+                            }
+                            cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], prachStart);
+                        }
+
+                        if(pucchCtx)
+                        {
+                            cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent(), cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent());
+                        }
                     }
 
                     if(srsCtx)
@@ -2458,13 +2947,13 @@ int main(int argc, char* argv[])
 
                     if(ssbCtx)
                     {
-                        cuphyTestWorkerVec[channelWorkerMap["SSB"]].pdschTxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["SSB"]], true /*waitRsp*/, nullptr, uldl == 3 ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr() /*uldl == 5:  start at 5th slot*/);
+                        cuphyTestWorkerVec[channelWorkerMap["SSB"]].pdschTxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["SSB"]], true /*waitRsp*/, nullptr, uldl == 3 ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr() /*uldl == 5:  start at 5th slot*/);
                     }
 
                     // cuMAC run scheduler
                     if(macCtx)
                     {
-                        cumacTestWorkerVec[macWorkerMap["MAC"]].macRun(startEvent.handle(), shPtrStopEvents[macWorkerMap["MAC"] + nCuphyCtxts], true /*waitRsp*/, (uldl == 3 || macInternalTimer) ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr()); // cumac run scheduler
+                        cumacTestWorkerVec[macWorkerMap["MAC"]].macRun(startEvent.handle(), shPtrStopEvents[macWorkerMap["MAC"] + nCuphyCtxts], true /*waitRsp*/, (uldl == 3 || macInternalTimer) ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr()); // cumac run scheduler
                         // if uldl == 3 or macInternalTimer = true, use internal timer for sync on 500
                         // else use pdsch interslot for sync on 500 us
                     }
@@ -2477,7 +2966,7 @@ int main(int argc, char* argv[])
                                 auto macEventVecOpt = cumacTestWorkerVec[macWorkerMap["MAC"]].getMacInterSlotEventVecPtr();
                                 eventVecPtr = macEventVecOpt.has_value() ? *macEventVecOpt : nullptr;
                             } else {
-                                eventVecPtr = cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr();
+                                eventVecPtr = cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr();
                             }
                         }
                         cumacTestWorkerVec[macWorkerMap["MAC2"]].macRun(startEvent.handle(), shPtrStopEvents[macWorkerMap["MAC2"] + nCuphyCtxts], true /*waitRsp*/, eventVecPtr); // cumac2 run scheduler
@@ -2525,6 +3014,12 @@ int main(int argc, char* argv[])
                     if(mac2Ctx)
                         cumacTestWorkerVec[macWorkerMap["MAC2"]].eval();
 
+                }
+                // stop profiler
+                if(enableNvprof)
+                {
+                    cudaProfilerStop();
+                    NVLOGI_FMT(NVLOG_TAG_BASE_TESTBENCH, "Profiler stopped");
                 }
                 
                 // NOTE: The txt log will be used in python scripts for performance analysis. Changes to the log format below may also need to be propagated to:
@@ -2937,7 +3432,7 @@ void finishPschSim(std::vector<cuPHYTestWorker*>& pCuphyTestWorkers, string3Dvec
 
                 for(uint32_t powerItrIdx = 1; powerItrIdx <= nPowerItrs; ++powerItrIdx)
                 {
-                    if(powerDelayUs > 0) gpu_us_delay(powerDelayUs, gpuId, mainStream.handle(), 0);
+                    if(powerDelayUs > 0) gpu_us_delay(powerDelayUs, gpuId, mainStream.handle(), 1);
                     pschRunCore(pCuphyTestWorkers, nCuphyCtxts, mainStream, startEvent, shPtrStopEvents);
 
                     // **BATCHING LOGIC** - Periodically synchronize CPU-GPU execution every syncUpdateIntervalCnt iterations to prevent CPU being too far ahead of the GPU
@@ -2971,7 +3466,7 @@ void finishPschSim(std::vector<cuPHYTestWorker*>& pCuphyTestWorkers, string3Dvec
             else
             {
                 // Launch delay kernel on main stream
-                gpu_us_delay(delayUs, gpuId, mainStream.handle(), 0);
+                gpu_us_delay(delayUs, gpuId, mainStream.handle(), 1);
             }
 
             // start timer
@@ -3080,7 +3575,7 @@ void runPowerIterations(
     for(uint32_t powerItrIdx = 1; powerItrIdx <= nPowerItrs; ++powerItrIdx) {
         
         // Always signal startEvent for CPU-GPU sync coordination
-        gpu_us_delay(powerDelayUs, gpuId, mainStream.handle(), 0);
+        gpu_us_delay(powerDelayUs, gpuId, mainStream.handle(), 1);
         startEvent.record(mainStream.handle());
         
         // run pipeline
@@ -3094,22 +3589,89 @@ void runPowerIterations(
             cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].pdschTxRun(
                 startEvent.handle(), shPtrStopEvents[channelWorkerMap["PDCCH"]], 
                 true, nullptr, 
-                cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr());
+                cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr());
         }
-        if(puschCtx) {
-            cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(
-                startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUSCH"]]);
-        }
-        if(prachCtx) {
-            cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(
-                startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], 
-                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent());
-        }
-        if(pucchCtx) {
-            cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(
-                startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], 
-                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent(), 
-                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent());
+        if(g_start_delay_cfg_us.ul_anchor_from_yaml) {
+            if(g_start_delay_cfg_us.ul_anchor_mode == ul_anchor_mode_t::PRACH) {
+                if(prachCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(
+                        startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], startEvent.handle());
+                }
+                cudaEvent_t anchorEvt = (prachCtx && cuphyTestWorkerVec[channelWorkerMap["PRACH"]].getPrachStartEvent())
+                    ? cuphyTestWorkerVec[channelWorkerMap["PRACH"]].getPrachStartEvent()
+                    : startEvent.handle();
+
+                if(puschCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(
+                        anchorEvt, shPtrStopEvents[channelWorkerMap["PUSCH"]]);
+                }
+                if(pucchCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(
+                        startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], anchorEvt, anchorEvt);
+                }
+            } else if(g_start_delay_cfg_us.ul_anchor_mode == ul_anchor_mode_t::PUCCH) {
+                if(pucchCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(
+                        startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], startEvent.handle(), startEvent.handle());
+                }
+                cudaEvent_t anchorEvt = (pucchCtx && cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].getPucchStartEvent())
+                    ? cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].getPucchStartEvent()
+                    : startEvent.handle();
+
+                if(puschCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(
+                        anchorEvt, shPtrStopEvents[channelWorkerMap["PUSCH"]]);
+                }
+                if(prachCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(
+                        startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], anchorEvt);
+                }
+            } else {
+                if(puschCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(
+                        startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUSCH"]]);
+                }
+                cudaEvent_t puschStartEvt = (puschCtx && cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent())
+                    ? cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent()
+                    : startEvent.handle();
+                cudaEvent_t puschPucch2Evt = (puschCtx && cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent())
+                    ? cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent()
+                    : puschStartEvt;
+
+                if(prachCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(
+                        startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], puschStartEvt);
+                }
+                if(pucchCtx) {
+                    cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(
+                        startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], puschPucch2Evt, puschStartEvt);
+                }
+            }
+        } else {
+            if(puschCtx) {
+                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxRun(
+                    startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUSCH"]]);
+            }
+            if(prachCtx) {
+                // If PRACH delay from YAML: relative to PUSCH1 start; else relative to PUSCH1 end
+                cudaEvent_t prachStart = startEvent.handle();
+                if(puschCtx) {
+                    cudaEvent_t puschEvent = g_start_delay_cfg_us.prach_delay_from_yaml
+                        ? cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent()
+                        : cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPusch1EndEvent();
+                    if(puschEvent) {
+                        prachStart = puschEvent;
+                    }
+                }
+                cuphyTestWorkerVec[channelWorkerMap["PRACH"]].puschRxRun(
+                    startEvent.handle(), shPtrStopEvents[channelWorkerMap["PRACH"]], prachStart);
+            }
+            if(pucchCtx) {
+                cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].puschRxRun(
+                    startEvent.handle(), shPtrStopEvents[channelWorkerMap["PUCCH"]], 
+                    cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPucch2DelayStopEvent(), 
+                    cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getPuschStartEvent());
+            }
         }
         if(srsCtx) {
             cuphyTestWorkerVec[channelWorkerMap["SRS"]].puschRxRun(
@@ -3119,7 +3681,7 @@ void runPowerIterations(
             cuphyTestWorkerVec[channelWorkerMap["SSB"]].pdschTxRun(
                 startEvent.handle(), shPtrStopEvents[channelWorkerMap["SSB"]], 
                 true /*waitRsp*/, nullptr, 
-                uldl == 3 ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr());
+                uldl == 3 ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr());
         }
         
         // cuMAC run scheduler
@@ -3127,7 +3689,7 @@ void runPowerIterations(
             cumacTestWorkerVec[macWorkerMap["MAC"]].macRun(
                 startEvent.handle(), shPtrStopEvents[macWorkerMap["MAC"] + nCuphyCtxts], 
                 true /*waitRsp*/, 
-                (uldl == 3 || macInternalTimer) ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr());
+                (uldl == 3 || macInternalTimer) ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr());
         }
         
         // cuMAC2 run scheduler
@@ -3138,7 +3700,7 @@ void runPowerIterations(
                     auto macEventVecOpt = cumacTestWorkerVec[macWorkerMap["MAC"]].getMacInterSlotEventVecPtr();
                     eventVecPtr = macEventVecOpt.has_value() ? *macEventVecOpt : nullptr;
                 } else {
-                    eventVecPtr = cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr();
+                    eventVecPtr = cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr();
                 }
             }
             cumacTestWorkerVec[macWorkerMap["MAC2"]].macRun(
@@ -3182,7 +3744,7 @@ void runPowerIterations(
         // set sync event before launching next pattern
         cudaEvent_t syncEvent = nullptr;
         if(pdschCtx) { // if PDSCH run, use the middle slot for sync
-            auto temp = cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getPdschInterSlotEventVecPtr();
+            auto temp = cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr();
             syncEvent = (*temp)[nSlotsPerPattern / 2].handle();
         }
         else if(puschCtx) { // if PUSCH run, use the end of PUSCH1 for sync

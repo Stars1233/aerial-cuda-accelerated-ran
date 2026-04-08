@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -445,7 +445,7 @@ void YamlParser::parse_cplane_tx_info(yaml::node cplane_tx_list, std::vector<CPl
         CPlaneTxInfo tx_info{
             .slot_id       = node[kTxSlotIdYaml].as<uint8_t>(),
             .symbol_id     = node[kTxSymbolIdYaml].as<uint8_t>(),
-            .section_count = node[kTxSectionCount].as<uint8_t>(),
+            .section_count = node[kTxSectionCount].as<uint16_t>(),
             .direction     = node[kTxDataDirectionYaml].as<std::string>(),
         };
         auto section_count = tx_info.section_count;
@@ -463,9 +463,10 @@ void YamlParser::parse_cplane_tx_info(yaml::node cplane_tx_list, std::vector<CPl
             tx_info.section_list.emplace_back(section_info);
         }
 
-        if((section_count == 0) || (section_count >= kMaxSectionCount))
+        if((section_count == 0) || (section_count > kMaxSectionNum))
         {
-            THROW(StringBuilder() << "Invalid C-plane section count: " << section_count);
+            THROW(StringBuilder() << "Invalid C-plane section count: " << section_count
+                                  << " (valid range: 1-" << kMaxSectionNum << ")");
         }
 
         cplane_tx_info.push_back(tx_info);

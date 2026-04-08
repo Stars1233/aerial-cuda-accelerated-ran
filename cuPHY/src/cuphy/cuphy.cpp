@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -3089,6 +3089,7 @@ cuphyStatus_t CUPHYWINAPI cuphySetupSrsChEst(   cuphySrsChEstHndl_t          srs
                                                  uint32_t*                     h_rbSnrBuffOffsets,
                                                  cuphySrsReport_t*             d_pSrsReports,
                                                  cuphySrsChEstBuffInfo_t*      h_chEstBuffInfo,
+                                                 void**                        d_addrsChEstToL2InnerBuff,
                                                  void**                        d_addrsChEstToL2Buff,
                                                  cuphySrsChEstToL2_t*          h_chEstToL2,
                                                  void*                         d_workspace,
@@ -3099,7 +3100,7 @@ cuphyStatus_t CUPHYWINAPI cuphySetupSrsChEst(   cuphySrsChEstHndl_t          srs
                                                  cuphySrsChEstNormalizationLaunchCfg_t* pNormalizationLaunchCfg,
                                                  cudaStream_t                  strm)
 {
-    if(!srsChEstHndl || !h_srsUePrms || !h_srsCellPrms || !d_rbSnrBuff || !h_rbSnrBuffOffsets || !d_addrsChEstToL2Buff || !h_chEstToL2 || !d_pSrsReports || !h_chEstBuffInfo || !pCpuDynDesc || !pGpuDynDesc || !pLaunchCfg || !pNormalizationLaunchCfg)
+    if(!srsChEstHndl || !h_srsUePrms || !h_srsCellPrms || !d_rbSnrBuff || !h_rbSnrBuffOffsets || !d_addrsChEstToL2InnerBuff || !d_addrsChEstToL2Buff || !h_chEstToL2 || !d_pSrsReports || !h_chEstBuffInfo || !pCpuDynDesc || !pGpuDynDesc || !pLaunchCfg || !pNormalizationLaunchCfg)
     {
         return CUPHY_STATUS_INVALID_ARGUMENT;
     }
@@ -3117,6 +3118,7 @@ cuphyStatus_t CUPHYWINAPI cuphySetupSrsChEst(   cuphySrsChEstHndl_t          srs
                             h_rbSnrBuffOffsets,
                             d_pSrsReports,
                             h_chEstBuffInfo,
+                            d_addrsChEstToL2InnerBuff,
                             d_addrsChEstToL2Buff,
                             h_chEstToL2,
                             d_workspace,

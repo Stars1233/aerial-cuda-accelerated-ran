@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -111,13 +111,15 @@ function saveCarrierChanPars(h5File, SimCtrl, carrier, prachInd)
         end
     elseif (chan_pars.chanType == 2)
         chan_pars.numRay = 20;
-        chan_pars.ueAntSize = uint16(SimCtrl.channel_info.Chan_UL{1}.UE_AntArraySize);
-        chan_pars.ueAntSpacing = single(SimCtrl.channel_info.Chan_UL{1}.UE_AntSpacing); 
+        % Convert MATLAB 3-parameter antenna config to cuPHY CDL 3GPP format:
+        % AntSize: [M_g, N_g, M, N, P], AntSpacing: [d_g_h, d_g_v, d_h, d_v]
+        chan_pars.ueAntSize = uint16(toCdlAntSize5(SimCtrl.channel_info.Chan_UL{1}.UE_AntArraySize));
+        chan_pars.ueAntSpacing = single(toCdlAntSpacing4(SimCtrl.channel_info.Chan_UL{1}.UE_AntSpacing)); 
         chan_pars.ueAntPolarAngles = single(SimCtrl.channel_info.Chan_UL{1}.UE_AntPolarizationAngles); 
         chan_pars.ueAntPattern = findAntPatternMap(SimCtrl.channel_info.Chan_UL{1}.UE_AntPattern); 
 
-        chan_pars.bsAntSize = uint16(SimCtrl.channel_info.Chan_UL{1}.gNB_AntArraySize);
-        chan_pars.bsAntSpacing = single(SimCtrl.channel_info.Chan_UL{1}.gNB_AntSpacing); 
+        chan_pars.bsAntSize = uint16(toCdlAntSize5(SimCtrl.channel_info.Chan_UL{1}.gNB_AntArraySize));
+        chan_pars.bsAntSpacing = single(toCdlAntSpacing4(SimCtrl.channel_info.Chan_UL{1}.gNB_AntSpacing)); 
         chan_pars.bsAntPolarAngles = single(SimCtrl.channel_info.Chan_UL{1}.gNB_AntPolarizationAngles);
         chan_pars.bsAntPattern = findAntPatternMap(SimCtrl.channel_info.Chan_UL{1}.gNB_AntPattern);
 
@@ -156,5 +158,29 @@ function [DelayProfile, DelaySpread, MaximumDopplerShift, MIMOCorrelation] = der
     else
         % Handle invalid input format
         error('Invalid chanType format. Expected format: TDL<Profile><DelaySpread>-<DopplerShift>-<MIMOCorrelation>');
+    end
+end
+
+function antSize5 = toCdlAntSize5(antSizeIn)
+    antSizeIn = double(antSizeIn(:).');
+    if numel(antSizeIn) == 5
+        antSize5 = antSizeIn;
+    elseif numel(antSizeIn) == 3
+        % Legacy MATLAB format: [M, N, P] -> [M_g, N_g, M, N, P], with single panel groups.
+        antSize5 = [1, 1, antSizeIn(1), antSizeIn(2), antSizeIn(3)];
+    else
+        error('Invalid antenna size length %d. Expected 3 ([M,N,P]) or 5 ([M_g,N_g,M,N,P]).', numel(antSizeIn));
+    end
+end
+
+function antSpacing4 = toCdlAntSpacing4(antSpacingIn)
+    antSpacingIn = double(antSpacingIn(:).');
+    if numel(antSpacingIn) == 4
+        antSpacing4 = antSpacingIn;
+    elseif numel(antSpacingIn) == 2
+        % Legacy MATLAB format: [d_v, d_h] -> [d_g_h, d_g_v, d_h, d_v], with single panel groups.
+        antSpacing4 = [1.0, 1.0, antSpacingIn(2), antSpacingIn(1)];
+    else
+        error('Invalid antenna spacing length %d. Expected 2 or 4.', numel(antSpacingIn));
     end
 end

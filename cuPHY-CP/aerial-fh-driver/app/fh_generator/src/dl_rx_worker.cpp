@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -97,6 +97,13 @@ void fronthaul_generator_dl_rx_worker(Worker* worker)
             auto subframeId = oran_cmsg_get_subframe_id(buffer);
             auto slotId = oran_cmsg_get_slot_id(buffer);
             auto symbolId = oran_cmsg_get_startsymbol_id(buffer);
+            // Validate symbol ID to prevent buffer overrun
+            if(unlikely(symbolId >= ORAN_ALL_SYMBOLS))
+            {
+                NVLOGW_FMT(TAG, "Invalid symbolId {} in packet from peer {}, F{}S{}S{}, skipping",
+                           symbolId, peer_index, frameId, subframeId, slotId);
+                continue;
+            }
             auto msgType = oran_msg_get_message_type(buffer);
             auto dir = oran_msg_get_data_direction(buffer);
             packet_time = info[i].rx_timestamp;

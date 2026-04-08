@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +38,8 @@
 #include <nvtx3/nvToolsExt.h> // NVTX CUDA profiler annotations
 #include <type_traits>
 #include <optional>
+#include <cuda_profiler_api.h> // cudaProfilerStart / cudaProfilerStop
+#include <unordered_map>
 
 #include "cuphy.hpp" // NOTE: dependences of the following required in test workers:
 // cuda related:   cuphy::stream, cuphy::event, cuphy::cudaContext, cuphy::cuda_exception
@@ -607,5 +609,128 @@ constexpr uint32_t pdschStartDelayNoBfwUsU6_ = dlbfwStartDelayUsU6_ + 150 + pdsc
 // |<- 17 ->|<- 150 ->|<- 58 ->|<- 200 ->|<- 75 ->| 
 // SSB + PDCCH + CSI-RS starts to run at the same time of PDSCH
 // If PDSCH runs in a slot, there is always a DLBFW running before it
+
+/**
+ * @brief Selects the UL timeline anchor channel used by start-delay scheduling.
+ *
+ * This mode is parsed from start_delay.UL_ANCHOR and consumed by the test bench
+ * UL scheduler to interpret PUSCH/PRACH/PUCCH start delays relative to a chosen
+ * anchor event.
+ *
+ * @note Underlying type is uint8_t for compact config storage and stable values.
+ */
+enum class ul_anchor_mode_t : uint8_t
+{
+    PUSCH = 0, ///< Use PUSCH as UL anchor (default/legacy-aligned timeline behavior).
+    PRACH = 1, ///< Use PRACH as UL anchor for relative UL channel start delays.
+    PUCCH = 2  ///< Use PUCCH as UL anchor for relative UL channel start delays.
+};
+
+// Runtime-configurable start delays (YAML overrides optional).
+// Defaults match the constexpr values above.
+struct start_delay_cfg_us
+{
+    uint32_t srs_u5        = srsStartDelayUsU5_;
+    uint32_t srs2_u5       = srs2StartDelayUsU5_;
+    int32_t  pusch_u5      = -1;
+    int32_t  pusch2_u5     = -1;
+    uint32_t pucch_u5      = puschStartDelayUsU5_;
+    uint32_t prach_u5      = 0;
+    ul_anchor_mode_t ul_anchor_mode = ul_anchor_mode_t::PUSCH; //!< UL anchor selection mode (PUSCH/PRACH/PUCCH) for start-delay scheduling.
+    bool     ul_anchor_from_yaml = false; //!< True when UL anchor mode is explicitly provided by YAML start_delay.UL_ANCHOR.
+    bool     prach_delay_from_yaml = false;  // if true, PRACH delay is relative to PUSCH1 start; else relative to PUSCH1 end for backward compatibility
+    uint32_t dlbfw_slot0_u5 = dlbfwStartSlot0DelayUsU5_;
+    uint32_t ssb_u5        = 0;
+
+    uint32_t srs_u6        = srsStartDelayUsU6_;
+    uint32_t srs2_u6       = srs2StartDelayUsU6_;
+    uint32_t ulbfw_u6      = ulbfwStartDelayUsU6_;
+    uint32_t ulbfw2_u6     = ulbfw2StartDelayUsU6_;
+    int32_t  pusch_u6      = -1;
+    int32_t  pusch2_u6     = -1;
+    uint32_t pucch_u6      = puschStartDelayUsU6_;
+    int32_t  pucch2_u6     = -1;
+    uint32_t prach_u6      = pucch2StartDelayUsU6_;
+
+    uint32_t dlbfw_u6      = dlbfwStartDelayUsU6_;
+    int32_t  pdcch_u6      = -1;
+    int32_t  pdcch_csirs_u6 = -1;
+    uint32_t ssb_u6        = pdschStartDelayNoBfwUsU6_;
+    uint32_t pdsch_after_bfw_u6 = pdschStartDelayAfterBfwUsU6_;
+    uint32_t pdsch_no_bfw_u6    = pdschStartDelayNoBfwUsU6_;
+};
+
+extern start_delay_cfg_us g_start_delay_cfg_us;
+
+// Runtime-configurable per-channel test-vector parameter overrides (optional).
+// These override parameters loaded from the H5 TV files, and should be applied
+// before pipeline creation. If not provided, the H5 defaults are used.
+struct tv_override_cfg
+{
+    bool enable = false;
+
+    struct pusch_cfg
+    {
+        bool has_polar_list_length = false;
+        uint8_t polar_list_length = 0;
+
+        bool has_enable_cfo_correction = false;
+        uint8_t enable_cfo_correction = 0;
+        bool has_enable_weighted_average_cfo = false;
+        uint8_t enable_weighted_average_cfo = 0;
+        bool has_enable_to_estimation = false;
+        uint8_t enable_to_estimation = 0;
+        bool has_tdi_mode = false;
+        uint8_t tdi_mode = 0;
+        bool has_enable_dft_sofdm = false;
+        uint8_t enable_dft_sofdm = 0;
+        bool has_enable_rssi_measurement = false;
+        uint8_t enable_rssi_measurement = 0;
+        bool has_enable_sinr_measurement = false;
+        uint8_t enable_sinr_measurement = 0;
+        bool has_enable_static_dynamic_beamforming = false;
+        uint8_t enable_static_dynamic_beamforming = 0;
+        bool has_enable_early_harq = false;
+        uint8_t enable_early_harq = 0;
+
+        bool has_ldpc_early_termination = false;
+        uint8_t ldpc_early_termination = 0;
+        bool has_ldpc_algorithm_index = false;
+        uint16_t ldpc_algorithm_index = 0;
+        bool has_ldpc_flags = false;
+        uint32_t ldpc_flags = 0;
+        bool has_ldpc_use_half = false;
+        uint8_t ldpc_use_half = 0;
+        bool has_ldpc_max_num_iterations = false;
+        uint8_t ldpc_max_num_iterations = 0;
+        bool has_ldpc_max_num_iterations_algorithm_index = false;
+        uint8_t ldpc_max_num_iterations_algorithm_index = 0;
+
+        bool has_dmrs_channel_estimation_algorithm_index = false;
+        uint8_t dmrs_channel_estimation_algorithm_index = 0;
+        bool has_enable_per_prg_channel_estimation = false;
+        uint8_t enable_per_prg_channel_estimation = 0;
+        bool has_eq_coefficient_algorithm_index = false;
+        uint8_t eq_coefficient_algorithm_index = 0;
+    };
+
+    struct pucch_cfg
+    {
+        bool has_polar_list_length = false;
+        uint8_t polar_list_length = 0;
+    };
+
+    struct srs_cfg
+    {
+        bool has_chest_alg_index = false;
+        uint8_t chest_alg_index = 0;
+    };
+
+    pusch_cfg pusch;
+    pucch_cfg pucch;
+    srs_cfg srs;
+};
+
+extern tv_override_cfg g_tv_override_cfg;
 
 #endif // !defined(TESTBENCH_COMMON_HPP_INCLUDED_)

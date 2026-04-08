@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -203,7 +203,17 @@ static std::string generate_filename(PcapLoggerType type)
 
     gettimeofday(&tv, NULL);
     timeinfo = localtime(&tv.tv_sec);
-    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", timeinfo);
+    // Check for null pointer from localtime
+    if(unlikely(timeinfo == nullptr))
+    {
+        // Fallback: use raw timestamp
+        snprintf(timestamp, sizeof(timestamp), "%" PRId64, static_cast<int64_t>(tv.tv_sec));
+    }
+    else
+    {
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", timeinfo);
+    }
+
     uint64_t counter = 0;
 
     char filename[512];

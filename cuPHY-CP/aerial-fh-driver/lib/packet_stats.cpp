@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -287,6 +287,11 @@ void Packet_Statistics::flush_counters_file(int num_cells, std::string filename)
     FILE *fp;
 
     fp = fopen(filename.c_str(), "w+");
+    if(unlikely(fp == nullptr))
+    {
+        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "flush_counters_file: Failed to open file {}", filename);
+        return;
+    }
 
     buffer_index = 0;
     buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "slot,");

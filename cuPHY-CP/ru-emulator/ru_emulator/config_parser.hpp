@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,7 @@
 #define YAML_RU_EMULATOR        "ru_emulator"                    //!< Root key for RU emulator configuration section
 #define YAML_NIC_INTERFACE      "nic_interface"                  //!< Network interface card name (e.g., "enp1s0f0")
 #define YAML_UL_CORE_LIST       "ul_core_list"                   //!< CPU core list for uplink processing threads
+#define YAML_UL_SRS_CORE_LIST   "ul_srs_core_list"              //!< CPU core list for SRS uplink processing threads
 #define YAML_DL_CORE_LIST       "dl_core_list"                   //!< CPU core list for downlink processing threads
 #define YAML_DL_RX_CORE_LIST    "dl_rx_core_list"                //!< CPU core list for downlink RX worker threads
 #define YAML_STANDALONE_CORE_ID "standalone_core_id"             //!< CPU core ID for standalone mode operation
@@ -44,6 +45,8 @@
 #define YAML_MAX_SECT_STATS     "max_sect_stats"                 //!< Maximum number of section statistics to track
 #define YAML_DL_BFW_VALIDATION  "dl_bfw_validation"              //!< Enable downlink beamforming weight validation
 #define YAML_UL_BFW_VALIDATION  "ul_bfw_validation"              //!< Enable uplink beamforming weight validation
+#define YAML_BEAMID_VALIDATION  "beamid_validation"              //!< Enable 4T4R beam ID validation against test vectors
+#define YAML_SECTIONID_VALIDATION "sectionid_validation"          //!< Enable C-plane/U-plane sectionId cross-validation
 #define YAML_C_INTERVAL         "c_interval"                     //!< C-plane message transmission interval
 #define YAML_C_PLANE_PER_SYMBOL "c_plane_per_symbol"             //!< Number of C-plane messages per OFDM symbol
 #define YAML_PRACH_C_PLANE_PER_SYMBOL "prach_c_plane_per_symbol" //!< Number of PRACH C-plane messages per symbol
@@ -80,6 +83,7 @@
 #define YAML_FOREVER            "forever"                        //!< Run indefinitely (ignore num_slots limit)
 #define YAML_VALIDATE_TIMING    "validate_dl_timing"             //!< Enable downlink packet timing validation
 #define YAML_DL_WARMUP_SLOTS    "dl_warmup_slots"                //!< Number of warmup slots before starting DL validation
+#define YAML_UL_WARMUP_SLOTS    "ul_warmup_slots"                //!< Number of warmup slots before starting UL validation
 #define YAML_TIMING_HISTOGRAM   "timing_histogram"               //!< Enable timing histogram collection
 #define YAML_TIMING_HISTOGRAM_BIN_SIZE "timing_histogram_bin_size" //!< Histogram bin size in nanoseconds
 #define YAML_DL_COMPRESS_BITS   "dl_compress_bits"               //!< Downlink compression bit width
@@ -100,6 +104,7 @@
 #define YAML_PDCCH_DL_VALIDATION "pdcch_dl_validation"           //!< Enable PDCCH DL grant validation
 #define YAML_DL_APPROX_VALIDATION "dl_approx_validation"         //!< Enable approximate IQ comparison for DL (with tolerance)
 #define YAML_ENABLE_MMIMO "enable_mmimo"                         //!< Enable massive MIMO mode (multi-core per cell)
+#define YAML_MIN_UL_CORES_PER_CELL_MMIMO "min_ul_cores_per_cell_mmimo" //!< Minimum number of UL cores per cell for mMIMO
 #define YAML_ENABLE_BEAM_FORMING "enable_beam_forming"           //!< Enable beamforming weight processing
 #define YAML_ENABLE_CPLANE_WORKER_TRACING "enable_cplane_worker_tracing" //!< Enable detailed C-plane worker thread tracing
 #define YAML_DROP_PACKET_EVERY_TEN_SECS "drop_packet_every_ten_secs" //!< Intentionally drop packets every 10 seconds (for testing)
@@ -107,6 +112,7 @@
 #define YAML_ENABLE_DL_PROC_MT "enable_dl_proc_mt"               //!< Enable multi-threaded downlink processing
 #define YAML_SPLIT_SRS_TXQ "split_srs_txq"                       //!< Use split TX queues for SRS symbols
 #define YAML_UL_ONLY "ul_only"                                   //!< Uplink-only mode (no DL processing)
+#define YAML_ENABLE_PRECOMPUTED_TX "enable_precomputed_tx"       //!< Pre-compute UL TX messages from launch pattern
 #define YAML_ENABLE_SRS_EAXCID_PACING  "enable_srs_eaxcid_pacing" //!< Enable SRS eAxC ID pacing to limit simultaneous transmissions
 #define YAML_SRS_PACING_S3_SRS_SYMBOLS "srs_pacing_s3_srs_symbols" //!< Number of SRS symbols for scenario 3 pacing
 #define YAML_SRS_PACING_S4_SRS_SYMBOLS "srs_pacing_s4_srs_symbols" //!< Number of SRS symbols for scenario 4 pacing
@@ -195,6 +201,15 @@ void yaml_assign_cell_configs(yaml::node root, std::vector<struct cell_config>& 
  * @param[in] DL_proc Whether this is for DL processing cores
  */
 void yaml_assign_core_list(yaml::node root, std::vector<int>& core_list, bool UL,bool DL_proc);
+
+/**
+ * Assign core list from YAML using a custom key
+ *
+ * @param[in] root YAML root node
+ * @param[out] core_list Vector to populate with core IDs
+ * @param[in] key YAML key to look up
+ */
+void yaml_assign_core_list(yaml::node root, std::vector<int>& core_list, const char* key);
 
 /**
  * Assign test vector paths from YAML (legacy method from config.yaml)

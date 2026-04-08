@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,298 @@
  */
 
 #include "cuphy_testWrkr.hpp"
+
+#include <atomic>
+
+namespace
+{
+std::atomic<bool> g_logged_pusch_tv_override_apply{false};
+std::atomic<bool> g_logged_pucch_tv_override_apply{false};
+std::atomic<bool> g_logged_srs_tv_override_apply{false};
+
+void apply_pusch_tv_overrides(cuphyPuschStatPrms_t& p)
+{
+    if(!g_tv_override_cfg.enable)
+        return;
+
+    uint32_t applied_count = 0;
+    auto log_applied = [&](const char* key, uint32_t value) {
+        if(!g_logged_pusch_tv_override_apply.load(std::memory_order_relaxed))
+        {
+            NVLOGI_FMT(NVLOG_PUSCH, "[TV-OVERRIDE][PUSCH][APPLIED] {}={}", key, value);
+        }
+        ++applied_count;
+    };
+
+    const auto& o = g_tv_override_cfg.pusch;
+
+    if(o.has_polar_list_length)
+    {
+        p.polarDcdrListSz = o.polar_list_length;
+        log_applied("list_length", o.polar_list_length);
+    }
+    if(o.has_enable_cfo_correction)
+    {
+        p.enableCfoCorrection = o.enable_cfo_correction;
+        log_applied("enable_cfo_correction", o.enable_cfo_correction);
+    }
+    if(o.has_enable_weighted_average_cfo)
+    {
+        p.enableWeightedAverageCfo = o.enable_weighted_average_cfo;
+        log_applied("enable_weighted_average_cfo", o.enable_weighted_average_cfo);
+    }
+    if(o.has_enable_to_estimation)
+    {
+        p.enableToEstimation = o.enable_to_estimation;
+        log_applied("enable_to_estimation", o.enable_to_estimation);
+    }
+    if(o.has_tdi_mode)
+    {
+        p.enablePuschTdi = (o.tdi_mode == 1);
+        log_applied("tdi_mode", o.tdi_mode);
+    }
+    if(o.has_enable_dft_sofdm)
+    {
+        p.enableDftSOfdm = o.enable_dft_sofdm;
+        log_applied("enable_dft_sofdm", o.enable_dft_sofdm);
+    }
+    if(o.has_enable_rssi_measurement)
+    {
+        p.enableRssiMeasurement = o.enable_rssi_measurement;
+        log_applied("enable_rssi_measurement", o.enable_rssi_measurement);
+    }
+    if(o.has_enable_sinr_measurement)
+    {
+        p.enableSinrMeasurement = o.enable_sinr_measurement;
+        log_applied("enable_sinr_measurement", o.enable_sinr_measurement);
+    }
+    if(o.has_enable_static_dynamic_beamforming)
+    {
+        p.enableMassiveMIMO = o.enable_static_dynamic_beamforming;
+        log_applied("enable_static_dynamic_beamforming", o.enable_static_dynamic_beamforming);
+    }
+    if(o.has_enable_early_harq)
+    {
+        p.enableEarlyHarq = o.enable_early_harq;
+        log_applied("enable_early_harq", o.enable_early_harq);
+    }
+
+    if(o.has_ldpc_early_termination)
+    {
+        p.ldpcEarlyTermination = o.ldpc_early_termination;
+        log_applied("ldpc_early_termination", o.ldpc_early_termination);
+    }
+    if(o.has_ldpc_algorithm_index)
+    {
+        p.ldpcAlgoIndex = o.ldpc_algorithm_index;
+        log_applied("ldpc_algorithm_index", o.ldpc_algorithm_index);
+    }
+    if(o.has_ldpc_flags)
+    {
+        p.ldpcFlags = o.ldpc_flags;
+        log_applied("ldpc_flags", o.ldpc_flags);
+    }
+    if(o.has_ldpc_use_half)
+    {
+        p.ldpcUseHalf = o.ldpc_use_half;
+        log_applied("ldpc_use_half", o.ldpc_use_half);
+    }
+
+    if(o.has_ldpc_max_num_iterations)
+    {
+        p.fixedMaxNumLdpcItrs = o.ldpc_max_num_iterations;
+        log_applied("ldpc_max_num_iterations", o.ldpc_max_num_iterations);
+    }
+    if(o.has_ldpc_max_num_iterations_algorithm_index)
+    {
+        bool valid = false;
+        switch(o.ldpc_max_num_iterations_algorithm_index)
+        {
+            case 0:
+                p.ldpcMaxNumItrAlgo = LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED;
+                valid = true;
+                break;
+            case 1:
+                p.ldpcMaxNumItrAlgo = LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT;
+                valid = true;
+                break;
+            case 2:
+                p.ldpcMaxNumItrAlgo = LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE;
+                valid = true;
+                break;
+            default:
+                break;
+        }
+        if(valid)
+            log_applied("ldpc_max_num_iterations_algorithm_index", o.ldpc_max_num_iterations_algorithm_index);
+        else
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "[TV-OVERRIDE][PUSCH] invalid ldpc_max_num_iterations_algorithm_index={}", static_cast<unsigned int>(o.ldpc_max_num_iterations_algorithm_index));
+    }
+
+    if(o.has_eq_coefficient_algorithm_index)
+    {
+        bool valid = false;
+        switch(o.eq_coefficient_algorithm_index)
+        {
+            case 0:
+                p.eqCoeffAlgo = PUSCH_EQ_ALGO_TYPE_RZF;
+                valid = true;
+                break;
+            case 1:
+                p.eqCoeffAlgo = PUSCH_EQ_ALGO_TYPE_NOISE_DIAG_MMSE;
+                valid = true;
+                break;
+            case 2:
+                p.eqCoeffAlgo = PUSCH_EQ_ALGO_TYPE_MMSE_IRC;
+                valid = true;
+                break;
+            case 3:
+                p.eqCoeffAlgo = PUSCH_EQ_ALGO_TYPE_MMSE_IRC_SHRINK_RBLW;
+                valid = true;
+                break;
+            case 4:
+                p.eqCoeffAlgo = PUSCH_EQ_ALGO_TYPE_MMSE_IRC_SHRINK_OAS;
+                valid = true;
+                break;
+            default:
+                break;
+        }
+        if(valid)
+            log_applied("eq_coefficient_algorithm_index", o.eq_coefficient_algorithm_index);
+        else
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "[TV-OVERRIDE][PUSCH] invalid eq_coefficient_algorithm_index={}", static_cast<unsigned int>(o.eq_coefficient_algorithm_index));
+    }
+
+    if(o.has_dmrs_channel_estimation_algorithm_index)
+    {
+        bool valid = false;
+        switch(o.dmrs_channel_estimation_algorithm_index)
+        {
+            case 0:
+                p.chEstAlgo = PUSCH_CH_EST_ALGO_TYPE_LEGACY_MMSE;
+                valid = true;
+                break;
+            case 1:
+                p.chEstAlgo = PUSCH_CH_EST_ALGO_TYPE_MULTISTAGE_MMSE_WITH_DELAY_EST;
+                valid = true;
+                break;
+            case 2:
+                p.chEstAlgo = PUSCH_CH_EST_ALGO_TYPE_RKHS;
+                valid = true;
+                break;
+            default:
+                break;
+        }
+        if(valid)
+            log_applied("dmrs_channel_estimation_algorithm_index", o.dmrs_channel_estimation_algorithm_index);
+        else
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "[TV-OVERRIDE][PUSCH] invalid dmrs_channel_estimation_algorithm_index={}", static_cast<unsigned int>(o.dmrs_channel_estimation_algorithm_index));
+    }
+
+    if(o.has_enable_per_prg_channel_estimation)
+    {
+        p.enablePerPrgChEst = o.enable_per_prg_channel_estimation;
+        log_applied("enable_per_prg_channel_estimation", o.enable_per_prg_channel_estimation);
+    }
+
+    if(applied_count > 0 && !g_logged_pusch_tv_override_apply.load(std::memory_order_relaxed))
+    {
+        NVLOGI_FMT(NVLOG_PUSCH, "[TV-OVERRIDE][PUSCH] applied {} override field(s)", applied_count);
+        NVLOGI_FMT(
+            NVLOG_PUSCH,
+            "[TV-OVERRIDE][PUSCH][SUMMARY] applied={}, ldpcEarlyTermination={}, ldpcAlgoIndex={}, "
+            "ldpcFlags={}, ldpcUseHalf={}, fixedMaxNumLdpcItrs={}, eqCoeffAlgo={}",
+            applied_count,
+            static_cast<unsigned int>(p.ldpcEarlyTermination),
+            static_cast<unsigned int>(p.ldpcAlgoIndex),
+            static_cast<unsigned int>(p.ldpcFlags),
+            static_cast<unsigned int>(p.ldpcUseHalf),
+            static_cast<unsigned int>(p.fixedMaxNumLdpcItrs),
+            static_cast<unsigned int>(p.eqCoeffAlgo));
+        NVLOGI_FMT(
+            NVLOG_PUSCH,
+            "[TV-OVERRIDE][PUSCH][EFFECTIVE] polarDcdrListSz={} enableCfoCorrection={} "
+            "enableWeightedAverageCfo={} enableToEstimation={} enablePuschTdi={} enableDftSOfdm={} "
+            "enableRssiMeasurement={} enableSinrMeasurement={} enableMassiveMIMO={} enableEarlyHarq={} "
+            "ldpcEarlyTermination={} ldpcAlgoIndex={} ldpcFlags={} ldpcUseHalf={} fixedMaxNumLdpcItrs={} "
+            "ldpcMaxNumItrAlgo={} eqCoeffAlgo={} chEstAlgo={} enablePerPrgChEst={}",
+            static_cast<unsigned int>(p.polarDcdrListSz),
+            static_cast<unsigned int>(p.enableCfoCorrection),
+            static_cast<unsigned int>(p.enableWeightedAverageCfo),
+            static_cast<unsigned int>(p.enableToEstimation),
+            static_cast<unsigned int>(p.enablePuschTdi),
+            static_cast<unsigned int>(p.enableDftSOfdm),
+            static_cast<unsigned int>(p.enableRssiMeasurement),
+            static_cast<unsigned int>(p.enableSinrMeasurement),
+            static_cast<unsigned int>(p.enableMassiveMIMO),
+            static_cast<unsigned int>(p.enableEarlyHarq),
+            static_cast<unsigned int>(p.ldpcEarlyTermination),
+            static_cast<unsigned int>(p.ldpcAlgoIndex),
+            static_cast<unsigned int>(p.ldpcFlags),
+            static_cast<unsigned int>(p.ldpcUseHalf),
+            static_cast<unsigned int>(p.fixedMaxNumLdpcItrs),
+            static_cast<unsigned int>(p.ldpcMaxNumItrAlgo),
+            static_cast<unsigned int>(p.eqCoeffAlgo),
+            static_cast<unsigned int>(p.chEstAlgo),
+            static_cast<unsigned int>(p.enablePerPrgChEst));
+        g_logged_pusch_tv_override_apply.store(true, std::memory_order_relaxed);
+    }
+}
+
+void apply_pucch_tv_overrides(cuphyPucchStatPrms_t& p)
+{
+    if(!g_tv_override_cfg.enable)
+        return;
+
+    const auto& o = g_tv_override_cfg.pucch;
+    if(o.has_polar_list_length)
+    {
+        p.polarDcdrListSz = o.polar_list_length;
+        if(!g_logged_pucch_tv_override_apply.load(std::memory_order_relaxed))
+        {
+            NVLOGI_FMT(NVLOG_PUCCH, "[TV-OVERRIDE][PUCCH][APPLIED] list_length={}", static_cast<unsigned int>(o.polar_list_length));
+            NVLOGI_FMT(NVLOG_PUCCH, "[TV-OVERRIDE][PUCCH] applied 1 override field(s)");
+            printf("[TV-OVERRIDE][PUCCH][EFFECTIVE] polarDcdrListSz=%u\n", static_cast<unsigned int>(p.polarDcdrListSz));
+            g_logged_pucch_tv_override_apply.store(true, std::memory_order_relaxed);
+        }
+    }
+}
+
+void apply_srs_tv_overrides(cuphySrsStatPrms_t& p)
+{
+    if(!g_tv_override_cfg.enable)
+        return;
+    const auto& o = g_tv_override_cfg.srs;
+    if(!o.has_chest_alg_index)
+        return;
+    bool valid = false;
+    switch(o.chest_alg_index)
+    {
+        case 0:
+            p.chEstAlgo = SRS_CH_EST_ALGO_TYPE_MMSE;
+            valid = true;
+            break;
+        case 1:
+            p.chEstAlgo = SRS_CH_EST_ALGO_TYPE_RKHS;
+            valid = true;
+            break;
+        default:
+            break;
+    }
+    if(valid)
+    {
+        if(!g_logged_srs_tv_override_apply.load(std::memory_order_relaxed))
+        {
+            NVLOGI_FMT(NVLOG_SRS, "[TV-OVERRIDE][SRS][APPLIED] chEst_alg_selector={}", static_cast<unsigned int>(o.chest_alg_index));
+            NVLOGI_FMT(NVLOG_SRS, "[TV-OVERRIDE][SRS] applied 1 override field(s)");
+            printf("[TV-OVERRIDE][SRS][EFFECTIVE] chEstAlgo=%u\n", static_cast<unsigned int>(p.chEstAlgo));
+            g_logged_srs_tv_override_apply.store(true, std::memory_order_relaxed);
+        }
+    }
+    else
+        NVLOGE_FMT(NVLOG_SRS, AERIAL_CUPHY_EVENT, "[TV-OVERRIDE][SRS] invalid chest_alg_index={}", static_cast<unsigned int>(o.chest_alg_index));
+}
+} // namespace
 
 cuPHYTestWorker::cuPHYTestWorker(std::string const& name, uint32_t workerId, int cpuId, int gpuId, int cpuThrdSchdPolicy, int cpuThrdPrio, uint32_t mpsSubctxSmCount, std::shared_ptr<testWrkrCmdQ>& cmdQ, std::shared_ptr<testWrkrRspQ>& rspQ, int uldlMode, uint32_t debugMessageLevel, bool useGreenContexts, const cuphy::cudaGreenContext& greenCtx) :
     testWorker(name, workerId, cpuId, gpuId, cpuThrdSchdPolicy, cpuThrdPrio, mpsSubctxSmCount, cmdQ, rspQ, uldlMode, debugMessageLevel, useGreenContexts),
@@ -572,6 +864,7 @@ void cuPHYTestWorker::pucchRxInitHandler(std::shared_ptr<void>& shPtrPayload)
             CUDA_CHECK(cudaStreamSynchronize(m_cuStrmsPucch[strmIdx].handle()));
 
             m_pucchStaticDatasetVec[strmIdx].emplace_back(tempInput, m_cuStrmsPucch[strmIdx].handle(), outputFilename); // empty output filename for now
+            apply_pucch_tv_overrides(m_pucchStaticDatasetVec[strmIdx][i].pucchStatPrms);
 
             m_pucchRxPipes[strmIdx].emplace_back(m_pucchStaticDatasetVec[strmIdx][i].pucchStatPrms, m_cuStrmsPucch[strmIdx].handle());
         }
@@ -760,8 +1053,6 @@ void cuPHYTestWorker::puschRxInitHandler(std::shared_ptr<void>& shPtrPayload)
         for(uint32_t i = 0; i < m_nItrsPerStrm; ++i)
         {
             // uint32_t cellIdx = strmIdx + i * m_nStrms;
-
-            // load static
             if(m_pusch_group_cells)
             {
                 tempInput.assign(inFileNamesPuschRx.begin() + i * (inFileNamesPuschRx.size() / m_nStrms), inFileNamesPuschRx.begin() + (i + 1) * (inFileNamesPuschRx.size() / m_nStrms));
@@ -774,6 +1065,8 @@ void cuPHYTestWorker::puschRxInitHandler(std::shared_ptr<void>& shPtrPayload)
                 m_puschRxStaticApiDataSets[strmIdx].emplace_back(tempInput, m_cuStrmsPusch[strmIdx].handle(), std::string(), 1, 0, initMsgPayload.enableLdpcThroughputMode, &initMsgPayload.puschPrms,
                                                                  static_cast<cuphyPuschLdpcKernelLaunch_t>(m_ldpc_kernel_launch_mode));
             }
+            // load static
+            apply_pusch_tv_overrides(m_puschRxStaticApiDataSets[strmIdx][i].puschStatPrms);
 
             CUDA_CHECK(cudaStreamSynchronize(m_cuStrmsPusch[strmIdx].handle()));
 
@@ -818,11 +1111,13 @@ void cuPHYTestWorker::srsInitHandler(std::shared_ptr<void>& shPtrPayload)
 
     m_srsStaticApiDatasetVec.resize(1);
     m_srsStaticApiDatasetVec[0].emplace_back(inFileNamesSRS1, m_cuStrmsSrs[0].handle());
+    apply_srs_tv_overrides(m_srsStaticApiDatasetVec[0][0].srsStatPrms);
 
     if(m_runSRS2)
     {
         m_srsStaticApiDatasetVec2.resize(1);
         m_srsStaticApiDatasetVec2[0].emplace_back(inFileNamesSRS2, m_cuStrmsSrs[0].handle());
+        apply_srs_tv_overrides(m_srsStaticApiDatasetVec2[0][0].srsStatPrms);
     }
 
     CUDA_CHECK(cudaStreamSynchronize(m_cuStrmsSrs[0].handle()));
@@ -948,7 +1243,7 @@ void cuPHYTestWorker::pdschTxInitHandler(std::shared_ptr<void>& shPtrPayload)
         
         m_timePdschSlotEndEvents.resize(m_pdsch_nItrsPerStrm);
         m_pdschInterSlotStartEventVec.resize(m_nSlotsPerPattern); // PDSCH events are always provisioned by m_nSlotsPerPattern since it may serve as a timer for the testbench
-        m_SlotBoundaryEventVec.resize(m_longPattern > 6 ? m_nSlotsPerPattern : 0);
+        m_SlotBoundaryEventVec.resize(m_nSlotsPerPattern); // 500 us slot boundaries (no PDSCH delay); used by PDCCH/SSB
         m_totRunTimePdschItr.resize(m_pdsch_nItrsPerStrm);
         m_totPdschSlotStartTime.resize(m_pdsch_nItrsPerStrm);
         // resize
@@ -1612,11 +1907,21 @@ void cuPHYTestWorker::runPUCCH_U5_U6(const cudaEvent_t& startEvent, const cudaEv
 {
     uint32_t pucch2SyncStrmId = m_nStrms_pucch / 2;
     uint64_t procModeBmsk     = m_pucch_proc_mode;
+    uint32_t pucch1DelayUs    = (m_uldlMode == 6) ? g_start_delay_cfg_us.pucch_u6 : g_start_delay_cfg_us.pucch_u5;
+    auto resolve_delay_us = [](int32_t yaml_delay_us, uint32_t default_delay_us) -> uint32_t {
+        return yaml_delay_us >= 0 ? static_cast<uint32_t>(yaml_delay_us) : default_delay_us;
+    };
+    const uint32_t pucch2AfterPucch1DelayUs = resolve_delay_us(g_start_delay_cfg_us.pucch2_u6, 0);
+    const bool nonPuschAnchor = g_start_delay_cfg_us.ul_anchor_from_yaml
+        && g_start_delay_cfg_us.ul_anchor_mode != ul_anchor_mode_t::PUSCH;
+    const bool puschCascaded = (m_longPattern > 3) && (m_longPattern != 7);
 
     // PUCCH1
     for(uint32_t strmIdx = 0; strmIdx < pucch2SyncStrmId; ++strmIdx)
     {
         CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPucch[strmIdx].handle(), startEvent, 0));
+        if(pucch1DelayUs)
+            gpu_us_delay(pucch1DelayUs, 0, m_cuStrmsPucch[strmIdx].handle(), 1);
     }
 
     CUDA_CHECK(cudaEventRecord(m_uqPtrTimePUCCHStartEvent->handle(), m_cuStrmsPucch[0].handle()));
@@ -1671,13 +1976,31 @@ void cuPHYTestWorker::runPUCCH_U5_U6(const cudaEvent_t& startEvent, const cudaEv
     CUDA_CHECK(cudaEventRecord(m_PUCCHStopEvents[0].handle(), m_cuStrmsPucch[0].handle()));
 
     // PUCCH2
-    // wait for delay
-    for(uint32_t strmIdx = pucch2SyncStrmId; strmIdx < m_nStrms_pucch; ++strmIdx)
+    if(nonPuschAnchor && puschCascaded)
     {
-        CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPucch[strmIdx].handle(), startEvent2, 0));
+        // Non-PUSCH anchor + cascaded PUSCH: PUCCH2 delay is relative to PUCCH1 completion.
+        CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPucch[pucch2SyncStrmId].handle(), m_uqPtrTimePUCCHEndEvent->handle(), 0));
+        if(pucch2AfterPucch1DelayUs > 0)
+            gpu_us_delay(pucch2AfterPucch1DelayUs, 0, m_cuStrmsPucch[pucch2SyncStrmId].handle(), 1);
+        CUDA_CHECK(cudaEventRecord(m_uqPtrTimePUCCH2StartEvent->handle(), m_cuStrmsPucch[pucch2SyncStrmId].handle()));
+        for(uint32_t strmIdx = pucch2SyncStrmId; strmIdx < m_nStrms_pucch; ++strmIdx)
+        {
+            CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPucch[strmIdx].handle(), m_uqPtrTimePUCCH2StartEvent->handle(), 0));
+        }
+    }
+    else
+    {
+        // Non-cascaded PUSCH: PUCCH2 remains relative to anchor start.
+        // Legacy/default PUSCH anchor: keep startEvent2 behavior from PUSCH timeline.
+        for(uint32_t strmIdx = pucch2SyncStrmId; strmIdx < m_nStrms_pucch; ++strmIdx)
+        {
+            CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPucch[strmIdx].handle(), startEvent2, 0));
+        }
+        if(nonPuschAnchor && pucch2AfterPucch1DelayUs > 0)
+            gpu_us_delay(pucch2AfterPucch1DelayUs, 0, m_cuStrmsPucch[pucch2SyncStrmId].handle(), 1);
+        CUDA_CHECK(cudaEventRecord(m_uqPtrTimePUCCH2StartEvent->handle(), m_cuStrmsPucch[pucch2SyncStrmId].handle()));
     }
 
-    CUDA_CHECK(cudaEventRecord(m_uqPtrTimePUCCH2StartEvent->handle(), m_cuStrmsPucch[pucch2SyncStrmId].handle()));
     // Note: m_nItrsPerStrm  represents the # of cells processed per slot sequentially
     // Note: m_nStrms represents the # of cells processed per slot concurrently
 
@@ -1713,10 +2036,13 @@ void cuPHYTestWorker::runPUCCH_U5_U6(const cudaEvent_t& startEvent, const cudaEv
 }
 void cuPHYTestWorker::runPRACH(const cudaEvent_t& startEvent)
 {
+    uint32_t prachDelayUs = (m_uldlMode == 6) ? g_start_delay_cfg_us.prach_u6 : g_start_delay_cfg_us.prach_u5;
     // wait for start event
     for(uint32_t strmIdx = 0; strmIdx < m_nStrms_prach; ++strmIdx)
     {
         CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPrach[strmIdx].handle(), startEvent, 0));
+        if(prachDelayUs)
+            gpu_us_delay(prachDelayUs, 0, m_cuStrmsPrach[strmIdx].handle(), 1);
     }
 
     CUDA_CHECK(cudaEventRecord(m_uqPtrTimePRACHStartEvent->handle(), m_cuStrmsPrach[0].handle()));
@@ -1773,8 +2099,8 @@ void cuPHYTestWorker::runSRS1(const cudaEvent_t& startEvent)
 
     CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsSrs[0].handle(), startEvent, 0));
     
-    // SRS always start after srsStartDelayUs
-    gpu_us_delay(m_uldlMode == 6 ? srsStartDelayUsU6_ : srsStartDelayUsU5_, m_gpuId, m_cuStrmsSrs[0].handle(), 1);
+    // SRS always start after srsStartDelayUs (YAML-overridable).
+    gpu_us_delay(m_uldlMode == 6 ? g_start_delay_cfg_us.srs_u6 : g_start_delay_cfg_us.srs_u5, m_gpuId, m_cuStrmsSrs[0].handle(), 1);
     
     CUDA_CHECK(cudaEventRecord(m_uqPtrSRSDelayStopEvent->handle(), m_cuStrmsSrs[0].handle()));
 
@@ -1829,8 +2155,8 @@ void cuPHYTestWorker::runSRS2()
     uint32_t nSRS2Strms = 1;
     // wait for start event
 
-    // SRS always start after srsStartDelayUs
-    gpu_us_delay(m_uldlMode == 6 ? srs2StartDelayUsU6_ : srs2StartDelayUsU5_, m_gpuId, m_cuStrmsSrs[0].handle(), 1);
+    // SRS always start after srsStartDelayUs (YAML-overridable).
+    gpu_us_delay(m_uldlMode == 6 ? g_start_delay_cfg_us.srs2_u6 : g_start_delay_cfg_us.srs2_u5, m_gpuId, m_cuStrmsSrs[0].handle(), 1);
 
     for(uint32_t strmIdx = 0; strmIdx < nSRS2Strms; ++strmIdx)
     {
@@ -1881,6 +2207,16 @@ void cuPHYTestWorker::runPUSCH_U5_U6(const cudaEvent_t& startEvent)
     uint32_t pusch2SyncStrmId   = m_nStrms / 2;
     uint32_t timelineSyncStrmId = m_longPattern > 6 ? 0 : pusch2SyncStrmId;
     uint64_t procModeBmsk       = m_pusch_proc_mode;
+    auto resolve_delay_us = [](int32_t yaml_delay_us, uint32_t default_delay_us) -> uint32_t {
+        return yaml_delay_us >= 0 ? static_cast<uint32_t>(yaml_delay_us) : default_delay_us;
+    };
+    const uint32_t configuredPusch1DelayUs = resolve_delay_us(g_start_delay_cfg_us.pusch_u5, puschStartDelayUsU5_);
+    const uint32_t configuredPusch2DelayUs = resolve_delay_us(g_start_delay_cfg_us.pusch2_u5, 0);
+    const uint32_t configuredPusch1DelayU6Us = resolve_delay_us(g_start_delay_cfg_us.pusch_u6, puschStartDelayUsU6_);
+    const uint32_t configuredPusch2DelayU6Us = resolve_delay_us(g_start_delay_cfg_us.pusch2_u6, pusch2StartDelayUsU6_);
+    const uint32_t configuredPusch2AfterPusch1DelayU6Us = resolve_delay_us(g_start_delay_cfg_us.pusch2_u6, 0);
+    const uint32_t configuredPucch2DelayU6Us = resolve_delay_us(g_start_delay_cfg_us.pucch2_u6, pucch2StartDelayUsU6_);
+    const uint32_t configuredPucch2DelayShortUs = resolve_delay_us(g_start_delay_cfg_us.pucch2_u6, 0);
     uint32_t delay1Us;
     uint32_t delay2Us;
 
@@ -1911,17 +2247,23 @@ void cuPHYTestWorker::runPUSCH_U5_U6(const cudaEvent_t& startEvent)
         delay2Us = 0;
         break;
     case 7:
-        delay1Us = ulbfwStartDelayUsU6_;
+        delay1Us = g_start_delay_cfg_us.ulbfw_u6;
         delay2Us = 0;
         break;
     case 8:
-        delay1Us = ulbfwStartDelayUsU6_;
+        delay1Us = g_start_delay_cfg_us.ulbfw_u6;
         delay2Us = 0;
         break;
     default:
         delay1Us = 0;
         delay2Us = 0;
     }
+    if(g_start_delay_cfg_us.pusch_u5 >= 0)
+        delay1Us = configuredPusch1DelayUs;
+    if(g_start_delay_cfg_us.pusch2_u5 >= 0)
+        delay2Us = configuredPusch2DelayUs;
+    const bool puschCascaded = (m_longPattern > 3) && (m_longPattern != 7);
+
     // hold all PUSCH streams until start event
     for(uint32_t strmIdx = 0; strmIdx < m_nStrms; ++strmIdx)
     {
@@ -1964,7 +2306,7 @@ void cuPHYTestWorker::runPUSCH_U5_U6(const cudaEvent_t& startEvent)
         // delay between ULBFW1 start and ULBFW2 start
         if(m_longPattern > 6)
         {
-            gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(ulbfw2StartDelayUsU6_) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
+            gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(g_start_delay_cfg_us.ulbfw2_u6) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
             CUDA_CHECK(cudaEventRecord(m_uqPtrUlbfw2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
             CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsUlbfw[0].handle(), m_uqPtrUlbfw2DelayStopEvent->handle(), 0));
         }
@@ -1995,7 +2337,7 @@ void cuPHYTestWorker::runPUSCH_U5_U6(const cudaEvent_t& startEvent)
     // wait for delay
     if(m_longPattern > 6)
     {
-        gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(puschStartDelayUsU6_) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
+        gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(configuredPusch1DelayU6Us) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
     }    
     
     CUDA_CHECK(cudaEventRecord(m_uqPtrPuschDelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));  
@@ -2038,33 +2380,58 @@ void cuPHYTestWorker::runPUSCH_U5_U6(const cudaEvent_t& startEvent)
     CUDA_CHECK(cudaEventRecord(m_stopEvents[0].handle(), m_cuStrmsPusch[0].handle()));
 
     // PUSCH2
-    // wait for delay    
     if(m_longPattern > 6)
     {
-        // for PUCCH2 and PRACH in the middle of PUSCH1
-        gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(pucch2StartDelayUsU6_) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
-        CUDA_CHECK(cudaEventRecord(m_uqPtrPucch2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
-
-        if(m_longPattern == 7) // PUSCH2 do not need to wait until PUSCH1 ends, only wait for delay ends
+        // Keep legacy PUCCH2 anchor event behavior when anchor is PUSCH/default.
+        const bool legacyPuschAnchor = !g_start_delay_cfg_us.ul_anchor_from_yaml
+            || g_start_delay_cfg_us.ul_anchor_mode == ul_anchor_mode_t::PUSCH;
+        if(legacyPuschAnchor)
         {
-            gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(pusch2StartDelayUsU6_) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
-            CUDA_CHECK(cudaEventRecord(m_uqPtrPusch2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
+            gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(configuredPucch2DelayU6Us) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
+            CUDA_CHECK(cudaEventRecord(m_uqPtrPucch2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
         }
-        else // PUSCH2 must wait until PUSCH1 ends and delay stops
+        else
         {
             CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPusch[timelineSyncStrmId].handle(), m_uqPtrTimePUSCHEndEvent->handle(), 0));
-            gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(pusch2StartDelayUsU6_) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
-            CUDA_CHECK(cudaEventRecord(m_uqPtrPusch2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
+            CUDA_CHECK(cudaEventRecord(m_uqPtrPucch2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
         }
+
+        if(puschCascaded)
+        {
+            // Cascaded: PUSCH2 delay is after PUSCH1 completion.
+            CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPusch[timelineSyncStrmId].handle(), m_uqPtrTimePUSCHEndEvent->handle(), 0));
+            if(configuredPusch2AfterPusch1DelayU6Us > 0)
+                gpu_us_delay(configuredPusch2AfterPusch1DelayU6Us, 0, m_cuStrmsPusch[timelineSyncStrmId].handle(), 1);
+        }
+        else
+        {
+            // Non-cascaded: PUSCH2 delay is relative to anchor start.
+            gpu_ns_delay_until(m_GPUtimeUl_d.addr(), static_cast<uint64_t>(configuredPusch2DelayU6Us) * NS_PER_US, m_cuStrmsPusch[timelineSyncStrmId].handle());
+        }
+        CUDA_CHECK(cudaEventRecord(m_uqPtrPusch2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
     }
     else
     {
-        if(delay2Us)
-            gpu_us_delay(delay2Us, 0, m_cuStrmsPusch[pusch2SyncStrmId].handle(), 1);
-        if(m_longPattern > 3)  // corresponding to mode = 1 (--pusch_cascaded in Python)
+        if(puschCascaded)
         {
+            // Cascaded: PUSCH2 delay is after PUSCH1 completion.
             CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPusch[timelineSyncStrmId].handle(), m_uqPtrTimePUSCHEndEvent->handle(), 0));
+            if(delay2Us)
+                gpu_us_delay(delay2Us, 0, m_cuStrmsPusch[timelineSyncStrmId].handle(), 1);
         }
+        else
+        {
+            // Non-cascaded: PUSCH2 delay remains relative to anchor start.
+            if(delay2Us)
+                gpu_us_delay(delay2Us, 0, m_cuStrmsPusch[pusch2SyncStrmId].handle(), 1);
+        }
+
+        // Keep legacy PUCCH2 anchor event behavior when anchor is PUSCH/default.
+        const bool legacyPuschAnchor = !g_start_delay_cfg_us.ul_anchor_from_yaml
+            || g_start_delay_cfg_us.ul_anchor_mode == ul_anchor_mode_t::PUSCH;
+        if(legacyPuschAnchor && g_start_delay_cfg_us.pucch2_u6 >= 0 && configuredPucch2DelayShortUs > 0)
+            gpu_us_delay(configuredPucch2DelayShortUs, 0, m_cuStrmsPusch[timelineSyncStrmId].handle(), 1);
+
         CUDA_CHECK(cudaEventRecord(m_uqPtrPucch2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
         CUDA_CHECK(cudaEventRecord(m_uqPtrPusch2DelayStopEvent->handle(), m_cuStrmsPusch[timelineSyncStrmId].handle()));
     }
@@ -2233,7 +2600,19 @@ void cuPHYTestWorker::puschRxRunHandler(std::shared_ptr<void>& shPtrPayload)
         {
             if(m_runPUSCH)
             {
-                runPRACH(getPucch2DelayStopEvent());
+                // External schedulers may explicitly provide PRACH anchor event.
+                if(puschRxRunMsgPayload.prachStartEvent)
+                {
+                    runPRACH(puschRxRunMsgPayload.prachStartEvent);
+                }
+                // If PRACH delay from YAML: relative to PUSCH1 start; else relative to PUSCH1 end
+                else if(g_start_delay_cfg_us.prach_delay_from_yaml)
+                {
+                    auto puschStartEvt = getPuschStartEvent();
+                    runPRACH(puschStartEvt ? puschStartEvt : puschRxRunMsgPayload.startEvent);
+                }
+                else
+                    runPRACH(getPusch1EndEvent());
             }
             else
             {
@@ -2333,10 +2712,21 @@ void cuPHYTestWorker::pschTxRxRunHandlerNoStrmPrio(std::shared_ptr<void>& shPtrP
 
 void cuPHYTestWorker::runPDCCHItr(const cudaEvent_t& pdcchSlotStartEvent, uint32_t itrIdx)
 {
+    uint32_t pdcchDelayUs = 0;
+    if(g_start_delay_cfg_us.pdcch_u6 >= 0)
+    {
+        pdcchDelayUs = static_cast<uint32_t>(g_start_delay_cfg_us.pdcch_u6);
+    }
+    else if(m_longPattern > 6)
+    {
+        pdcchDelayUs = pdschStartDelayNoBfwUsU6_;
+    }
     for(uint32_t strmIdx = 0; strmIdx < m_nStrms_pdcch; ++strmIdx)
     {
         // hold all the streams (i.e cells) until startEvent for the slot
         CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdcch[strmIdx].handle(), pdcchSlotStartEvent, 0));
+        if(pdcchDelayUs > 0)
+            gpu_us_delay(pdcchDelayUs, 0, m_cuStrmsPdcch[strmIdx].handle(), 1);
     }
 
     if(m_pdcchSlotRunFlag[itrIdx])
@@ -2386,11 +2776,36 @@ void cuPHYTestWorker::runPDCCHItr(const cudaEvent_t& pdcchSlotStartEvent, uint32
         nvtxRangePush("CSI-RS");
 #endif
         int nCSIRSObjects = m_pdsch_group_cells ? 1 : m_nCSIRSCells;
+        const bool hasPdcchCsirsOverride = (g_start_delay_cfg_us.pdcch_csirs_u6 >= 0);
+        const uint32_t pdcchCsirsGapUs = hasPdcchCsirsOverride ? static_cast<uint32_t>(g_start_delay_cfg_us.pdcch_csirs_u6) : 0;
         for(uint32_t strmIdx = 0; strmIdx < nCSIRSObjects; ++strmIdx)
         {
-            // hold all the streams (i.e cells) until startEvent for the slot
-            // CSI-RS can start with PDCCH at the same time in mMIMO pattern; otherwise it must wait for PDCCH completion
-            CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsCsirs[strmIdx].handle(), (m_longPattern > 6) ? pdcchSlotStartEvent : m_PDCCHStopEvents[0].handle(), 0));
+            // If explicitly configured, apply requested behavior regardless of pattern:
+            // 0 => start with PDCCH slot start, >0 => start after PDCCH plus extra gap.
+            if(hasPdcchCsirsOverride)
+            {
+                if(pdcchCsirsGapUs == 0)
+                {
+                    CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsCsirs[strmIdx].handle(), pdcchSlotStartEvent, 0));
+                }
+                else
+                {
+                    CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsCsirs[strmIdx].handle(), m_PDCCHStopEvents[0].handle(), 0));
+                    gpu_us_delay(pdcchCsirsGapUs, 0, m_cuStrmsCsirs[strmIdx].handle(), 1);
+                }
+            }
+            else
+            {
+                // Legacy default behavior when not configured from YAML.
+                if(m_longPattern > 6)
+                {
+                    CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsCsirs[strmIdx].handle(), pdcchSlotStartEvent, 0));
+                }
+                else
+                {
+                    CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsCsirs[strmIdx].handle(), m_PDCCHStopEvents[0].handle(), 0));
+                }
+            }
 
             if(strmIdx == 0) // if PDCCH is run standalone record start event here
             {
@@ -2455,7 +2870,7 @@ void cuPHYTestWorker::runPDSCH_U5_3_6(std::shared_ptr<void>& shPtrPayload)
         CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsDlbfw[0].handle(), pdschTxRunMsgPayload.startEvent, 0));
         get_gpu_time(m_GPUtimeDl_d.addr(), m_cuStrmsPdsch[0].handle()); // record start of time slot
         CUDA_CHECK(cudaEventRecord(m_uqPtrTimeStartEvent->handle(), m_cuStrmsPdsch[0].handle()));
-        gpu_us_delay(dlbfwStartSlot0DelayUsU5_, 0, m_cuStrmsDlbfw[0].handle(), 1); // delay for first DLBFW
+        gpu_us_delay(g_start_delay_cfg_us.dlbfw_slot0_u5, 0, m_cuStrmsDlbfw[0].handle(), 1); // delay for first DLBFW (YAML-overridable)
 #if USE_NVTX
         nvtxRangePush("DLBFW");
 #endif
@@ -2476,9 +2891,15 @@ void cuPHYTestWorker::runPDSCH_U5_3_6(std::shared_ptr<void>& shPtrPayload)
 #endif
         // wait for DLBFW then var. delay
         CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), m_timeDlbfwSlotEndEvents[0].handle(), 0));
-        uint64_t           gpu_slot_start_time_offset_ns = static_cast<uint64_t>(0 + 1) * (time_slot_duration * NS_PER_US);
-        gpu_ns_delay_until(m_GPUtimeDl_d.addr(), gpu_slot_start_time_offset_ns, m_cuStrmsPdsch[0].handle());
         get_gpu_time(m_GPUtimeDl_d.addr(), m_cuStrmsPdsch[0].handle());
+        CUDA_CHECK(cudaEventRecord(m_SlotBoundaryEventVec[0].handle(), m_cuStrmsPdsch[0].handle())); // slot 0 boundary at t=0
+        // First 500 us slot boundary, then PDSCH delay, then record PDSCH slot start
+        uint64_t           gpu_slot_start_time_offset_ns = static_cast<uint64_t>(0 + 1) * time_slot_duration * NS_PER_US;
+        gpu_ns_delay_until(m_GPUtimeDl_d.addr(), gpu_slot_start_time_offset_ns, m_cuStrmsPdsch[0].handle());
+        CUDA_CHECK(cudaEventRecord(m_SlotBoundaryEventVec[1].handle(), m_cuStrmsPdsch[0].handle())); // slot 1 boundary at 500 us
+        get_gpu_time(m_GPUtimeDl_d.addr(), m_cuStrmsPdsch[0].handle());
+        if(g_start_delay_cfg_us.pdsch_no_bfw_u6 > 0)
+            gpu_us_delay(static_cast<uint32_t>(g_start_delay_cfg_us.pdsch_no_bfw_u6), 0, m_cuStrmsPdsch[0].handle(), 1);
         // record start of time slot
         CUDA_CHECK(cudaEventRecord(m_pdschInterSlotStartEventVec[0].handle(), m_cuStrmsPdsch[0].handle()));
 
@@ -2544,7 +2965,7 @@ void cuPHYTestWorker::runPDSCH_U5_3_6(std::shared_ptr<void>& shPtrPayload)
             // wait for PDSCH cells to be processed 
             if(m_runPDCCH)
             {
-                runPDCCHItr(m_pdschInterSlotStartEventVec[itrIdx].handle(), itrIdx);
+                runPDCCHItr(m_SlotBoundaryEventVec[itrIdx].handle(), itrIdx);
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), m_PDCCHStopEvents[0].handle(), 0));
             }
             else if(pdschTxRunMsgPayload.pdcchStopEventVec)
@@ -2552,12 +2973,15 @@ void cuPHYTestWorker::runPDSCH_U5_3_6(std::shared_ptr<void>& shPtrPayload)
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), (*pdschTxRunMsgPayload.pdcchStopEventVec)[itrIdx].handle(), 0));
             }
 
-            // timer for next slot boundary
+            // timer for next slot boundary (500 us), then record slot boundary, then PDSCH delay, then record next PDSCH slot start
             // added for the last slot to preserve timeline in power measurement mode
-            uint64_t           gpu_slot_start_time_offset_ns = static_cast<uint64_t>(itrIdx + 1) * (time_slot_duration * NS_PER_US);
+            gpu_slot_start_time_offset_ns = static_cast<uint64_t>(itrIdx + 1) * time_slot_duration * NS_PER_US;
             gpu_ns_delay_until(m_GPUtimeDl_d.addr(), gpu_slot_start_time_offset_ns, m_cuStrmsPdsch[0].handle());
-            if(itrIdx != m_nSlotsPerPattern - 1) 
+            if(itrIdx != m_nSlotsPerPattern - 1)
             {
+                CUDA_CHECK(cudaEventRecord(m_SlotBoundaryEventVec[itrIdx + 1].handle(), m_cuStrmsPdsch[0].handle()));
+                if(g_start_delay_cfg_us.pdsch_no_bfw_u6 > 0)
+                    gpu_us_delay(static_cast<uint32_t>(g_start_delay_cfg_us.pdsch_no_bfw_u6), 0, m_cuStrmsPdsch[0].handle(), 1);
                 CUDA_CHECK(cudaEventRecord(m_pdschInterSlotStartEventVec[itrIdx + 1].handle(), m_cuStrmsPdsch[0].handle()));
             }
 
@@ -2599,7 +3023,7 @@ void cuPHYTestWorker::runPDSCH_U6(std::shared_ptr<void>& shPtrPayload)
             {
                 // wait for 500 us slot boundary
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsDlbfw[0].handle(), m_SlotBoundaryEventVec[itrIdx].handle(), 0));
-                gpu_us_delay(dlbfwStartDelayUsU6_, 0, m_cuStrmsDlbfw[0].handle(), 1); // delay for DLBFW
+                gpu_us_delay(g_start_delay_cfg_us.dlbfw_u6, 0, m_cuStrmsDlbfw[0].handle(), 1); // delay for DLBFW (YAML-overridable)
 #if USE_NVTX
                 nvtxRangePush("DLBFW");
 #endif
@@ -2625,8 +3049,11 @@ void cuPHYTestWorker::runPDSCH_U6(std::shared_ptr<void>& shPtrPayload)
 
             // record PDSCH stat time regardless of whether PDSCH is running or not
             // this event will be used to synchronize the start of PDCCH/CSI-RS/SSB
-            uint64_t           gpu_slot_start_time_offset_ns = (pdschStartDelayNoBfwUsU6_ + static_cast<uint64_t>(itrIdx) * time_slot_duration) * NS_PER_US;
+            // First wait for 500 us slot boundary, then add PDSCH delay, then record PDSCH slot start
+            uint64_t           gpu_slot_start_time_offset_ns = static_cast<uint64_t>(itrIdx) * time_slot_duration * NS_PER_US;
             gpu_ns_delay_until(m_GPUtimeDl_d.addr(), gpu_slot_start_time_offset_ns, m_cuStrmsPdsch[0].handle());
+            if(g_start_delay_cfg_us.pdsch_no_bfw_u6 > 0)
+                gpu_us_delay(static_cast<uint32_t>(g_start_delay_cfg_us.pdsch_no_bfw_u6), 0, m_cuStrmsPdsch[0].handle(), 1);
             CUDA_CHECK(cudaEventRecord(m_pdschInterSlotStartEventVec[itrIdx].handle(), m_cuStrmsPdsch[0].handle()));
 
             // run PDSCH
@@ -2660,7 +3087,7 @@ void cuPHYTestWorker::runPDSCH_U6(std::shared_ptr<void>& shPtrPayload)
             // wait for PDSCH cells to be processed 
             if(m_runPDCCH)
             {
-                runPDCCHItr(m_pdschInterSlotStartEventVec[itrIdx].handle(), itrIdx);
+                runPDCCHItr(m_SlotBoundaryEventVec[itrIdx].handle(), itrIdx);
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), m_PDCCHStopEvents[0].handle(), 0));
             }
             else if(pdschTxRunMsgPayload.pdcchStopEventVec)
@@ -2788,6 +3215,9 @@ void cuPHYTestWorker::runSSB(std::shared_ptr<void>& shPtrPayload)
                 {
                     CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsSsb[i].handle(), (*pdschTxRunMsgPayload.pdschInterSlotEventVec)[itrIdx].handle(), 0));
                 }
+                uint32_t ssbDelayUs = (m_uldlMode == 6) ? g_start_delay_cfg_us.ssb_u6 : g_start_delay_cfg_us.ssb_u5;
+                if(ssbDelayUs)
+                    gpu_us_delay(ssbDelayUs, 0, m_cuStrmsSsb[i].handle(), 1);
             }
 
             CUDA_CHECK(cudaEventRecord(m_timeSSBSlotStartEvents[m_pbchRunSlotIdx].handle(), m_cuStrmsSsb[0].handle()));
@@ -2845,7 +3275,11 @@ void cuPHYTestWorker::runPDSCH_U3_U5_1_2_4_5(std::shared_ptr<void>& shPtrPayload
         // find time slot duration in us
         CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), pdschTxRunMsgPayload.startEvent, 0));
         get_gpu_time(m_GPUtimeDl_d.addr(), m_cuStrmsPdsch[0].handle()); 
-        CUDA_CHECK(cudaEventRecord(m_uqPtrTimeStartEvent->handle(), m_cuStrmsPdsch[0].handle()));        
+        CUDA_CHECK(cudaEventRecord(m_uqPtrTimeStartEvent->handle(), m_cuStrmsPdsch[0].handle()));
+        CUDA_CHECK(cudaEventRecord(m_SlotBoundaryEventVec[0].handle(), m_cuStrmsPdsch[0].handle())); // slot 0 boundary at t=0
+        // Slot 0: then add PDSCH delay, then record PDSCH slot start
+        if(g_start_delay_cfg_us.pdsch_no_bfw_u6 > 0)
+            gpu_us_delay(static_cast<uint32_t>(g_start_delay_cfg_us.pdsch_no_bfw_u6), 0, m_cuStrmsPdsch[0].handle(), 1);
         // record start of time slot
         CUDA_CHECK(cudaEventRecord(m_pdschInterSlotStartEventVec[0].handle(), m_cuStrmsPdsch[0].handle()));
 
@@ -2914,7 +3348,7 @@ void cuPHYTestWorker::runPDSCH_U3_U5_1_2_4_5(std::shared_ptr<void>& shPtrPayload
 
             if(m_runPDCCH || m_runCSIRS)
             {
-                runPDCCHItr(m_pdschInterSlotStartEventVec[itrIdx].handle(), itrIdx);
+                runPDCCHItr(m_SlotBoundaryEventVec[itrIdx].handle(), itrIdx);
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), m_PDCCHStopEvents[0].handle(), 0));
             }
             else if(pdschTxRunMsgPayload.pdcchStopEventVec)
@@ -2922,12 +3356,15 @@ void cuPHYTestWorker::runPDSCH_U3_U5_1_2_4_5(std::shared_ptr<void>& shPtrPayload
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), (*pdschTxRunMsgPayload.pdcchStopEventVec)[itrIdx].handle(), 0));
             }
 
-            // timer for next slot boundary
+            // timer for next slot boundary (500 us), then record slot boundary, then PDSCH delay, then record next PDSCH slot start
             // added for the last slot to preserve timeline in power measurement mode
-            uint64_t           gpu_slot_start_time_offset_ns = static_cast<uint64_t>(itrIdx + 1) * (time_slot_duration * NS_PER_US);
+            uint64_t           gpu_slot_start_time_offset_ns = static_cast<uint64_t>(itrIdx + 1) * time_slot_duration * NS_PER_US;
             gpu_ns_delay_until(m_GPUtimeDl_d.addr(), gpu_slot_start_time_offset_ns, m_cuStrmsPdsch[0].handle());
-            if(itrIdx != m_nSlotsPerPattern - 1) 
+            if(itrIdx != m_nSlotsPerPattern - 1)
             {
+                CUDA_CHECK(cudaEventRecord(m_SlotBoundaryEventVec[itrIdx + 1].handle(), m_cuStrmsPdsch[0].handle()));
+                if(g_start_delay_cfg_us.pdsch_no_bfw_u6 > 0)
+                    gpu_us_delay(static_cast<uint32_t>(g_start_delay_cfg_us.pdsch_no_bfw_u6), 0, m_cuStrmsPdsch[0].handle(), 1);
                 CUDA_CHECK(cudaEventRecord(m_pdschInterSlotStartEventVec[itrIdx + 1].handle(), m_cuStrmsPdsch[0].handle()));
             }
 
@@ -4584,6 +5021,14 @@ cudaEvent_t cuPHYTestWorker::getPucch2DelayStopEvent()
         return m_uqPtrPusch2DelayStopEvent->handle();
     }
 }
+cudaEvent_t cuPHYTestWorker::getPrachStartEvent()
+{
+    return m_uqPtrTimePRACHStartEvent->handle();
+}
+cudaEvent_t cuPHYTestWorker::getPucchStartEvent()
+{
+    return m_uqPtrTimePUCCHStartEvent->handle();
+}
 std::vector<cuphy::event>* cuPHYTestWorker::getpdcchCsirsInterSlotEndEventVec()
 {
     return &m_pdcchCsirsInterSlotEndEventVec;
@@ -4595,5 +5040,5 @@ std::vector<cuphy::event>* cuPHYTestWorker::getPdschInterSlotEventVecPtr()
 
 std::vector<cuphy::event>* cuPHYTestWorker::getSlotBoundaryEventVecPtr()
 {
-    return (m_longPattern > 6 ? &m_SlotBoundaryEventVec : &m_pdschInterSlotStartEventVec);
+    return (!m_SlotBoundaryEventVec.empty() ? &m_SlotBoundaryEventVec : &m_pdschInterSlotStartEventVec);
 }

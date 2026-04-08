@@ -106,6 +106,19 @@ int cuda_get_device_count(void)
     }
 }
 
+// Check if a CPU memory buffer is host pinned memory: 1 if yes, 0 if no
+int cuda_is_host_pinned_memory(void* phost)
+{
+    cudaPointerAttributes input_attributes;
+    if(cudaPointerGetAttributes(&input_attributes, phost) != cudaSuccess)
+    {
+        checkLastCudaError();
+        return 0;
+    }
+
+    return (input_attributes.type == cudaMemoryTypeHost) ? 1 : 0;
+}
+
 int cuda_page_lock(void* phost, size_t size)
 {
     if(cuda_version_check() < 0)

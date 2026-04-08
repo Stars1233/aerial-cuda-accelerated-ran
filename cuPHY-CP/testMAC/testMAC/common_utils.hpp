@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,9 @@
 #ifndef _COMMON_UTILS_HPP_
 #define _COMMON_UTILS_HPP_
 
-// Path and directory configuration
+#include <vector>
+#include "nvlog_fmt.hpp"
+
 #define MAX_PATH_LEN 1024 //!< Maximum path length for file operations
 
 #ifndef CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM
@@ -49,5 +51,15 @@
  * @return String name of the message type
  */
 const char* get_scf_fapi_msg_name(uint8_t msg_id);
+
+/**
+ * Check if the application is exiting
+ *
+ * @return True if the application is exiting, false otherwise
+ */
+static inline bool is_app_exiting()
+{
+    return pExitHandler.test_exit_in_flight();
+}
 
 #endif /* _COMMON_UTILS_HPP_ */

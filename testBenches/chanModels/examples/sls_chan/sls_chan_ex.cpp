@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -83,10 +83,38 @@ void test_SLS(const std::string& config_file, const std::string& file_ending = "
     
     // Print configuration information
     std::printf("Configuration:\n");
+    std::printf("  Scenario: %s\n", 
+                system_config.scenario == Scenario::UMa ? "UMa" :
+                system_config.scenario == Scenario::UMi ? "UMi" :
+                system_config.scenario == Scenario::RMa ? "RMa" : "Other");
+    std::printf("  Sites: %u, Sectors/site: %u, UTs: %u\n", 
+                system_config.n_site, system_config.n_sector_per_site, system_config.n_ut);
     std::printf("  Internal memory mode: %u (0=external CIR/CFR, 1=internal CIR/external CFR, 2=internal CIR/CFR)\n", 
                 sim_config.internal_memory_mode);
     std::printf("  Run mode: %u\n", sim_config.run_mode);
     std::printf("  Number of TTIs: %u\n", tb_config.nTti);
+    
+    // Print ISAC configuration if enabled
+    if (system_config.isac_type > 0) {
+        std::printf("  ISAC Mode: %s (type=%u)\n", 
+                    system_config.isac_type == 1 ? "MONOSTATIC" : "BISTATIC",
+                    system_config.isac_type);
+        std::printf("    Sensing Targets: %u\n", system_config.n_st);
+        std::printf("    Target Type: %s (type=%u)\n",
+                    system_config.st_target_type == SensingTargetType::UAV ? "UAV" :
+                    system_config.st_target_type == SensingTargetType::AUTOMOTIVE ? "AUTOMOTIVE" :
+                    system_config.st_target_type == SensingTargetType::HUMAN ? "HUMAN" :
+                    system_config.st_target_type == SensingTargetType::AGV ? "AGV" : 
+                    system_config.st_target_type == SensingTargetType::HAZARD ? "HAZARD" : "UNKNOWN",
+                    static_cast<unsigned int>(system_config.st_target_type));
+        std::printf("    RCS Model: %u (%s)\n", 
+                    system_config.st_rcs_model,
+                    system_config.st_rcs_model == 1 ? "deterministic monostatic" : "angular dependent");
+        std::printf("    ST Horizontal Speed Range: [%.1f, %.1f] m/s\n",
+                    system_config.st_horizontal_speed[0], system_config.st_horizontal_speed[1]);
+    } else {
+        std::printf("  ISAC Mode: DISABLED (communication only)\n");
+    }
     
     if (enable_debug) {
         std::printf("  Debug output: ENABLED (via -d flag)\n");
@@ -145,9 +173,19 @@ void test_SLS(const std::string& config_file, const std::string& file_ending = "
         }
         
         try {
-            // Run channel model with error handling
+            // Run channel model with error handling, all links
             slsChanTest->run(ttiIdx * ttiLen, tb_config.continuous_fading);
-            // Alternative: explicit per-cell mode
+            // Alternative: explicit active links mode
+            // Set active cells and UTs dynamically based on configuration
+            // std::vector<uint16_t> activeCell = {0};
+
+            // // Generate active UTs from 0 to n_ut-1
+            // std::vector<uint16_t> utList{};
+            // utList.reserve(system_config.n_ut);
+            // for (uint16_t utIdx = 0; utIdx < system_config.n_ut; ++utIdx) {
+            //     utList.push_back(utIdx);
+            // }
+            // std::vector<std::vector<uint16_t>> activeUt = {utList};
             // slsChanTest->run(ttiIdx * ttiLen, tb_config.continuous_fading, activeCell, activeUt);
             
             // Ensure GPU operations complete before continuing (GPU mode)

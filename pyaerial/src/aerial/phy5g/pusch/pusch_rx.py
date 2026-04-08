@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ import numpy as np
 
 from aerial import pycuphy  # type: ignore
 from aerial.util.cuda import check_cuda_errors
+from aerial.util.cuda import CudaStream
 from aerial.phy5g.api import Array
 from aerial.phy5g.api import Pipeline
 from aerial.phy5g.api import PipelineFactory
@@ -47,13 +48,15 @@ class PuschRxPipelineFactory(PipelineFactory[AerialPuschRxConfig]):
 
     def create(self,
                config: AerialPuschRxConfig,
-               cuda_stream: int,
+               cuda_stream: CudaStream,
                **kwargs: Any) -> Pipeline:
         """Create the pipeline.
 
         Args:
             config (AerialPuschRxConfig): Pipeline configuration object.
-            cuda_stream (int): CUDA stream used to run the pipeline.
+            cuda_stream (CudaStream): CUDA stream used to run the pipeline.
+                Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
 
         Returns:
             PuschRx: A `PuschRx` pipeline object.
@@ -96,7 +99,7 @@ class PuschRx(PuschRxPipeline[PuschConfig, Array]):
         enable_ul_rx_bf: int = 0,
         ldpc_kernel_launch: PuschLdpcKernelLaunch = PuschLdpcKernelLaunch.PUSCH_RX_ENABLE_DRIVER_LDPC_LAUNCH,  # noqa: E501 # pylint: disable=line-too-long
         chest_factory_settings_filename: Optional[str] = None,
-        cuda_stream: int = None
+        cuda_stream: Optional[CudaStream] = None
     ) -> None:
         """Initialize PuschRx.
 
@@ -134,6 +137,8 @@ class PuschRx(PuschRxPipeline[PuschConfig, Array]):
                 - 0 - ZF.
                 - 1 - MMSE (default).
                 - 2 - MMSE-IRC.
+                - 3 - MMSE-IRC with RBLW-based covariance shrinkage.
+                - 4 - MMSE-IRC with OAS-based covariance shrinkage.
 
             enable_per_prg_chest (int): Enable/disable PUSCH per-PRG channel estimation.
 
@@ -147,11 +152,11 @@ class PuschRx(PuschRxPipeline[PuschConfig, Array]):
 
             ldpc_kernel_launch (PuschLdpcKernelLaunch): LDPC kernel launch method.
             chest_factory_settings_filename (str): The chest factory settings filename.
-            cuda_stream (int): The CUDA stream. If not given, one will be created.
+            cuda_stream (Optional[CudaStream]): CUDA stream. If not given, a new CudaStream is
+                created. Use ``with stream:`` to scope work; call ``stream.synchronize()``
+                explicitly when sync is needed.
         """
-        if cuda_stream is None:
-            cuda_stream = check_cuda_errors(cudart.cudaStreamCreate())
-        self.cuda_stream = cuda_stream
+        self._cuda_stream = CudaStream() if cuda_stream is None else cuda_stream
 
         self.num_tx_ant = num_tx_ant
         self.num_rx_ant = num_rx_ant
@@ -175,7 +180,7 @@ class PuschRx(PuschRxPipeline[PuschConfig, Array]):
             chest_factory_settings_filename=chest_factory_settings_filename,
             ldpc_kernel_launch=ldpc_kernel_launch
         )
-        self.pusch_pipeline = pycuphy.PuschPipeline(self.pusch_rx_stat_prms, self.cuda_stream)
+        self.pusch_pipeline = pycuphy.PuschPipeline(self.pusch_rx_stat_prms, self._cuda_stream.handle)
 
     def __call__(self,
                  slot: int,
@@ -291,7 +296,7 @@ class PuschRx(PuschRxPipeline[PuschConfig, Array]):
 
             - *List[Array]*: Transport blocks, one per UE, without CRC.
         """
-        with cp.cuda.ExternalStream(int(self.cuda_stream)):
+        with self._cuda_stream:
             rx_slot = cp.array(rx_slot, dtype=cp.complex64, order='F')
 
         if pusch_configs is None:
@@ -323,7 +328,7 @@ class PuschRx(PuschRxPipeline[PuschConfig, Array]):
             )
 
         pusch_rx_dyn_params = _pusch_config_to_cuphy(
-            cuda_stream=self.cuda_stream,
+            cuda_stream=self._cuda_stream,
             rx_data=[rx_slot],
             slot=slot,
             pusch_configs=pusch_configs
@@ -346,10 +351,10 @@ class PuschRx(PuschRxPipeline[PuschConfig, Array]):
             harq_buffer = check_cuda_errors(cudart.cudaMalloc(harq_buffer_size))
             check_cuda_errors(
                 cudart.cudaMemsetAsync(
-                    harq_buffer, 0, harq_buffer_size * 1, self.cuda_stream
+                    harq_buffer, 0, harq_buffer_size * 1, self._cuda_stream.handle
                 )
             )
-            check_cuda_errors(cudart.cudaStreamSynchronize(self.cuda_stream))
+            self._cuda_stream.synchronize()
             harq_buffers.append(harq_buffer)
 
         pusch_rx_dyn_params = get_pusch_dyn_prms_phase_2(

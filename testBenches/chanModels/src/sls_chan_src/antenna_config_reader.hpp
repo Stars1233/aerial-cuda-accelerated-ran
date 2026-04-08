@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +31,7 @@ private:
     static AntPanelConfig parsePanelConfig(const YAML::Node& panel_node) {
         AntPanelConfig panel;
         
-        panel.nAnt = panel_node["nAnt"].as<uint32_t>();
+        panel.nAnt = panel_node["nAnt"].as<uint16_t>();
         
         // Read antSize array
         const YAML::Node& antSize = panel_node["antSize"];
@@ -39,7 +39,7 @@ private:
             throw std::runtime_error("antSize must have exactly 5 elements");
         }
         for (int i = 0; i < 5; ++i) {
-            panel.antSize[i] = antSize[i].as<uint32_t>();
+            panel.antSize[i] = antSize[i].as<uint16_t>();
         }
         
         // Read antSpacing array

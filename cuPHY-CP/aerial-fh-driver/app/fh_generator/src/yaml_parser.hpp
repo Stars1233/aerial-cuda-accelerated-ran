@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -67,11 +67,11 @@ using CPlaneSectionList = std::vector<CPlaneSection>;
 
 struct CPlaneTxInfo
 {
-    uint8_t     slot_id;
-    uint8_t     symbol_id;
-    uint8_t     section_count;
-    std::string direction;
-    CPlaneSectionList     section_list;
+    uint8_t           slot_id;
+    uint8_t           symbol_id;
+    uint16_t          section_count;
+    std::string       direction;
+    CPlaneSectionList section_list;
 };
 
 struct UPlaneSection

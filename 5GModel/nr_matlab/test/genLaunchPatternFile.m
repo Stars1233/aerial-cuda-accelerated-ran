@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -299,59 +299,59 @@ switch caseNum
         nCell = 1;
         LP = [];
         LP.Cell_Configs = {'TVnr_0204_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0612_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{3}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{6}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{7}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0612_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0613_gNB_FAPI_s0.h5'};
+        LP.SCHED{6}.config{1}.channels = {'TVnr_0614_gNB_FAPI_s0.h5'};
+        LP.SCHED{7}.config{1}.channels = {'TVnr_0615_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0616_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0617_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0618_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{13}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{14}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{16}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{17}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
+        LP.SCHED{16}.config{1}.channels = {'TVnr_0654_gNB_FAPI_s0.h5'};
+        LP.SCHED{17}.config{1}.channels = {'TVnr_0655_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0656_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0657_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0658_gNB_FAPI_s0.h5'};
     case 25 % DDSUUUUUUU, multi-slot single-cell w/ S-slot, POC2_1C_00
         nCell = 1;
         LP = [];
         LP.Cell_Configs = {'TVnr_0204_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0612_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{3}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{6}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{7}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0612_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0613_gNB_FAPI_s0.h5'};
+        LP.SCHED{6}.config{1}.channels = {'TVnr_0614_gNB_FAPI_s0.h5'};
+        LP.SCHED{7}.config{1}.channels = {'TVnr_0615_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0616_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0617_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0618_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{13}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{14}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{16}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{17}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
+        LP.SCHED{16}.config{1}.channels = {'TVnr_0654_gNB_FAPI_s0.h5'};
+        LP.SCHED{17}.config{1}.channels = {'TVnr_0655_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0656_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0657_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0658_gNB_FAPI_s0.h5'};
     case 26 % DDSUUUUUUU, multi-slot 2-cell w/ S-slot, POC2_2C_00
         nCell = 2;
         LP = [];
         LP.Cell_Configs = {'TVnr_0204_gNB_FAPI_s0.h5', 'TVnr_0205_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0603_gNB_FAPI_s0.h5','TVnr_0604_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0612_gNB_FAPI_s0.h5','TVnr_0612_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{1}.config{2}.channels = {'TVnr_0205_gNB_FAPI_s0.h5'};
@@ -359,20 +359,20 @@ switch caseNum
         LP.SCHED{2}.config{2}.channels = {'TVnr_0205_gNB_FAPI_s0.h5'};
         LP.SCHED{3}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{3}.config{2}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{6}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{6}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{7}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{7}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0612_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{2}.channels = {'TVnr_0612_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0613_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{2}.channels = {'TVnr_0613_gNB_FAPI_s0.h5'};
+        LP.SCHED{6}.config{1}.channels = {'TVnr_0614_gNB_FAPI_s0.h5'};
+        LP.SCHED{6}.config{2}.channels = {'TVnr_0614_gNB_FAPI_s0.h5'};
+        LP.SCHED{7}.config{1}.channels = {'TVnr_0615_gNB_FAPI_s0.h5'};
+        LP.SCHED{7}.config{2}.channels = {'TVnr_0615_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0616_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{2}.channels = {'TVnr_0616_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0617_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{2}.channels = {'TVnr_0617_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0618_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{2}.channels = {'TVnr_0618_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{2}.channels = {'TVnr_0229_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
@@ -380,117 +380,117 @@ switch caseNum
         LP.SCHED{13}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{13}.config{2}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{14}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{14}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{14}.config{2}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
         LP.SCHED{15}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{16}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{16}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{17}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{17}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
+        LP.SCHED{16}.config{1}.channels = {'TVnr_0654_gNB_FAPI_s0.h5'};
+        LP.SCHED{16}.config{2}.channels = {'TVnr_0654_gNB_FAPI_s0.h5'};
+        LP.SCHED{17}.config{1}.channels = {'TVnr_0655_gNB_FAPI_s0.h5'};
+        LP.SCHED{17}.config{2}.channels = {'TVnr_0655_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0656_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{2}.channels = {'TVnr_0656_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0657_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{2}.channels = {'TVnr_0657_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0658_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{2}.channels = {'TVnr_0658_gNB_FAPI_s0.h5'};
     case 27 % DDUUU, multi-slot single-cell, POC2_1C_00
         nCell = 1;
         LP = [];
         LP.Cell_Configs = {'TVnr_0204_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0612_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
-        LP.SCHED{3}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_0612_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0613_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0614_gNB_FAPI_s0.h5'};
         LP.SCHED{6}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{7}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0615_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0616_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0617_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{13}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{14}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{14}.config{1}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0654_gNB_FAPI_s0.h5'};
         LP.SCHED{16}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{17}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0655_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0656_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0657_gNB_FAPI_s0.h5'};
     case 28 % DSUUU, multi-slot single-cell, POC2_1C_00
         nCell = 1;
         LP = [];
         LP.Cell_Configs = {'TVnr_0204_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0612_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{3}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_0612_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0613_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0614_gNB_FAPI_s0.h5'};
         LP.SCHED{6}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{7}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0615_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0616_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0617_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{13}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{14}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{14}.config{1}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0654_gNB_FAPI_s0.h5'};
         LP.SCHED{16}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{17}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0655_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0656_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0657_gNB_FAPI_s0.h5'};
     case 29 % DSUUU, multi-slot 2-cell, POC2_2C_00
         nCell = 2;
         LP = [];
         LP.Cell_Configs = {'TVnr_0204_gNB_FAPI_s0.h5', 'TVnr_0205_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0603_gNB_FAPI_s0.h5','TVnr_0604_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0612_gNB_FAPI_s0.h5','TVnr_0612_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{1}.config{2}.channels = {'TVnr_0205_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{2}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{3}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{3}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_0612_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{2}.channels = {'TVnr_0612_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0613_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{2}.channels = {'TVnr_0613_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0614_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{2}.channels = {'TVnr_0614_gNB_FAPI_s0.h5'};
         LP.SCHED{6}.config{1}.channels = {'TVnr_0204_gNB_FAPI_s0.h5'};
         LP.SCHED{6}.config{2}.channels = {'TVnr_0205_gNB_FAPI_s0.h5'};
         LP.SCHED{7}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{7}.config{2}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0603_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{2}.channels = {'TVnr_0604_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0615_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{2}.channels = {'TVnr_0615_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0616_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{2}.channels = {'TVnr_0616_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0617_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{2}.channels = {'TVnr_0617_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{2}.channels = {'TVnr_0229_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{2}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{13}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{13}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{14}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{13}.config{2}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
+        LP.SCHED{14}.config{1}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
         LP.SCHED{14}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0654_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{2}.channels = {'TVnr_0654_gNB_FAPI_s0.h5'};
         LP.SCHED{16}.config{1}.channels = {'TVnr_0228_gNB_FAPI_s0.h5'};
         LP.SCHED{16}.config{2}.channels = {'TVnr_0229_gNB_FAPI_s0.h5'};
         LP.SCHED{17}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
         LP.SCHED{17}.config{2}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0652_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{2}.channels = {'TVnr_0653_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0655_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{2}.channels = {'TVnr_0655_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0656_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{2}.channels = {'TVnr_0656_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0657_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{2}.channels = {'TVnr_0657_gNB_FAPI_s0.h5'};
     case 30 % Mix of modcomp and BFP
         nCell = 2;
         LP = [];
@@ -859,7 +859,7 @@ switch caseNum
         LP.SCHED{18}.config{1}.channels = {'TVnr_7250_gNB_FAPI_s0.h5'};
         LP.SCHED{19}.config{1}.channels = {'TVnr_7250_gNB_FAPI_s0.h5'};
         LP.SCHED{20}.config{1}.channels = {'TVnr_7250_gNB_FAPI_s0.h5'};  
-    case 64 % DSUUU, multi-slot single-cell, 8 UEs
+    case 64 % DSUUU, multi-slot single-cell, 8 UEs ~ 16 UEs
         nCell = 1;
         LP = [];
         LP.Cell_Configs = {'TVnr_3201_gNB_FAPI_s0.h5'};
@@ -867,102 +867,102 @@ switch caseNum
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{3}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
-        LP.SCHED{4}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'}; % 8 UEs
+        LP.SCHED{4}.config{1}.channels = {'TVnr_7328_gNB_FAPI_s0.h5'}; % 8 UEs
+        LP.SCHED{5}.config{1}.channels = {'TVnr_7329_gNB_FAPI_s0.h5'}; % 16 UEs
         LP.SCHED{6}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{7}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'}; % 8 UEs
+        LP.SCHED{9}.config{1}.channels = {'TVnr_7328_gNB_FAPI_s0.h5'}; % 8 UEs
+        LP.SCHED{10}.config{1}.channels = {'TVnr_7329_gNB_FAPI_s0.h5'}; % 16 UEs
         LP.SCHED{11}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{13}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
-        LP.SCHED{14}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
+        LP.SCHED{13}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'}; % 8 UEs
+        LP.SCHED{14}.config{1}.channels = {'TVnr_7328_gNB_FAPI_s0.h5'}; % 8 UEs
+        LP.SCHED{15}.config{1}.channels = {'TVnr_7329_gNB_FAPI_s0.h5'}; % 16 UEs
         LP.SCHED{16}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{17}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'};   
+        LP.SCHED{18}.config{1}.channels = {'TVnr_7327_gNB_FAPI_s0.h5'}; % 8 UEs
+        LP.SCHED{19}.config{1}.channels = {'TVnr_7328_gNB_FAPI_s0.h5'}; % 8 UEs
+        LP.SCHED{20}.config{1}.channels = {'TVnr_7329_gNB_FAPI_s0.h5'}; % 16 UEs  
     case 65 % DSUUU, multi-slot single-cell, 1 UE, multi-UL-channel
         nCell = 1;
         LP = [];
         LP.Cell_Configs = {'TVnr_3201_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0537_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0508_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{3}.config{1}.channels = {'TVnr_0537_gNB_FAPI_s0.h5'}; % PRACH
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_0508_gNB_FAPI_s0.h5'}; % PRACH
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0509_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0510_gNB_FAPI_s0.h5'};
         LP.SCHED{6}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{7}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0511_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0512_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0513_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{13}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
-        LP.SCHED{14}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
+        LP.SCHED{13}.config{1}.channels = {'TVnr_0514_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{14}.config{1}.channels = {'TVnr_0515_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0516_gNB_FAPI_s0.h5'};
         LP.SCHED{16}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{17}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0517_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0518_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0519_gNB_FAPI_s0.h5'};
     case 66 % DSUUU, multi-slot single-cell, 2 UEs, multi-UL-channel
         nCell = 1;
         LP = [];
         LP.Cell_Configs = {'TVnr_3201_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0539_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0619_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{3}.config{1}.channels = {'TVnr_0539_gNB_FAPI_s0.h5'}; % PRACH
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_0619_gNB_FAPI_s0.h5'}; % PRACH
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0620_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0621_gNB_FAPI_s0.h5'};
         LP.SCHED{6}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{7}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
-        LP.SCHED{9}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0622_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0623_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0624_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{13}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
-        LP.SCHED{14}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
+        LP.SCHED{13}.config{1}.channels = {'TVnr_0625_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{14}.config{1}.channels = {'TVnr_0626_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0627_gNB_FAPI_s0.h5'};
         LP.SCHED{16}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{17}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};   
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0628_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0629_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0630_gNB_FAPI_s0.h5'};   
     case 67 % DSUUU, multi-slot single-cell, 4 UEs, multi-UL-channel
         nCell = 1;
         LP = [];
         LP.Cell_Configs = {'TVnr_3201_gNB_FAPI_s0.h5'};
-        LP.UL_Cell_Configs = {'TVnr_0541_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_0536_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{2}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{3}.config{1}.channels = {'TVnr_0541_gNB_FAPI_s0.h5'}; % PRACH
-        LP.SCHED{4}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_0536_gNB_FAPI_s0.h5'}; % PRACH
+        LP.SCHED{4}.config{1}.channels = {'TVnr_0537_gNB_FAPI_s0.h5'};
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0538_gNB_FAPI_s0.h5'};
         LP.SCHED{6}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{7}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{8}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0539_gNB_FAPI_s0.h5'}; 
         LP.SCHED{9}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
-        LP.SCHED{10}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0541_gNB_FAPI_s0.h5'};
         LP.SCHED{11}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{12}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{13}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
-        LP.SCHED{14}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
+        LP.SCHED{13}.config{1}.channels = {'TVnr_0542_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{14}.config{1}.channels = {'TVnr_0543_gNB_FAPI_s0.h5'};
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0544_gNB_FAPI_s0.h5'};
         LP.SCHED{16}.config{1}.channels = {'TVnr_3201_gNB_FAPI_s0.h5'};
         LP.SCHED{17}.config{1}.channels = {'TVnr_3212_gNB_FAPI_s0.h5', 'TVnr_7258_gNB_FAPI_s0.h5'};
-        LP.SCHED{18}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
-        LP.SCHED{19}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnr_0540_gNB_FAPI_s0.h5'};  
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0545_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0546_gNB_FAPI_s0.h5'}; 
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0547_gNB_FAPI_s0.h5'};  
     case 68 % multi-slot single-cell HARQ 4-rx TC-7711
         nCell = 1;
         LP = [];
@@ -1899,7 +1899,44 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         LP.SCHED{4}.config{1}.channels = {'TVnrPUSCH_HARQ4_7897_gNB_FAPI_s0.h5'};
         LP.SCHED{10}.config{1}.channels = {'TVnrPUSCH_HARQ4_7897_gNB_FAPI_s1.h5'};
         LP.SCHED{15}.config{1}.channels = {'TVnrPUSCH_HARQ4_7897_gNB_FAPI_s2.h5'};
-        LP.SCHED{20}.config{1}.channels = {'TVnrPUSCH_HARQ4_7897_gNB_FAPI_s3.h5'};  
+        LP.SCHED{20}.config{1}.channels = {'TVnrPUSCH_HARQ4_7897_gNB_FAPI_s3.h5'}; 
+
+    case 166 %%40 slot pattern: 64TR SRS (PRG size = 16) + BFW (PRG size = 16) + PDSCH
+        nCell = 1;
+        LP = [];
+        nSlot = 40;
+        LP.Cell_Configs = {'TVnr_9308_gNB_FAPI_s0.h5'};
+        LP = init_launchPattern(LP, nSlot, nCell);
+        %Subframe 0
+        LP.SCHED{4}.config{1}.channels = {'TVnr_8046_gNB_FAPI_s0.h5'};
+        %Subframe 2
+        LP.SCHED{21}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{22}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{23}.config{1}.channels = {                            'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{26}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5'};
+        LP.SCHED{27}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{28}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{29}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{30}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        %Subframe 3
+        LP.SCHED{31}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{32}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{33}.config{1}.channels = {                            'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{36}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5'};
+        LP.SCHED{37}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{38}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{39}.config{1}.channels = {'TVnr_9308_gNB_FAPI_s0.h5', 'TVnr_3869_gNB_FAPI_s0.h5'};
+        LP.SCHED{40}.config{1}.channels = {                            'TVnr_3869_gNB_FAPI_s0.h5'};
+
+    case 167 % PUSCH-only; the mix of 64TR and 4TR with pusch_enable_perprgchest enabled
+        nCell = 3;
+        LP = [];
+        LP.Cell_Configs = {'TVnr_7889_gNB_FAPI_s0.h5', 'TVnr_7889_gNB_FAPI_s0.h5', 'TVnr_7889_gNB_FAPI_s0.h5'};
+        LP = init_launchPattern(LP, nSlot, nCell);
+        LP.SCHED{1}.config{1}.channels = {'TVnr_7869_gNB_FAPI_s0.h5'}; % 64TR   wideband BF 
+        LP.SCHED{1}.config{2}.channels = {'TVnr_7204_gNB_FAPI_s0.h5'}; % 4TR          no BF
+        LP.SCHED{1}.config{3}.channels = {'TVnr_7889_gNB_FAPI_s0.h5'}; % 64TR narrowband BF per-PRG CHEST
+
     case 190
         nCell = 1;
         LP = [];
@@ -2096,21 +2133,16 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         LP.Cell_Configs = {'bug4185251_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{1}.channels = {'bug4185251_gNB_FAPI_s0.h5'};
-    case 506 % negative test cases
+    case 506 % negative test cases using negTV.enable = 1
         nCell = 2;
         nSlot = 40;
         LP = [];
-        LP.Cell_Configs = {'TVnr_0605_gNB_FAPI_s4.h5','TVnr_0502_gNB_FAPI_s0.h5'};
+        LP.Cell_Configs = {'TVnr_0609_gNB_FAPI_s24.h5','TVnr_0502_gNB_FAPI_s0.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{1}.config{2}.channels = {'TVnr_0502_gNB_FAPI_s0.h5'};
-        LP.SCHED{5}.config{1}.channels = {'TVnr_0605_gNB_FAPI_s4.h5'};
-        LP.SCHED{6}.config{1}.channels = {'TVnr_0606_gNB_FAPI_s5.h5'};
         LP.SCHED{7}.config{1}.channels = {'TVnr_0500_gNB_FAPI_s6.h5'};
         LP.SCHED{8}.config{1}.channels = {'TVnr_0501_gNB_FAPI_s7.h5'};
-        LP.SCHED{15}.config{1}.channels = {'TVnr_0607_gNB_FAPI_s14.h5'};
-        LP.SCHED{16}.config{1}.channels = {'TVnr_0608_gNB_FAPI_s15.h5'};
         LP.SCHED{25}.config{1}.channels = {'TVnr_0609_gNB_FAPI_s24.h5'};
-        LP.SCHED{26}.config{1}.channels = {'TVnr_0610_gNB_FAPI_s25.h5'};
         LP.SCHED{35}.config{1}.channels = {'TVnr_0611_gNB_FAPI_s34.h5'};
     case 507 % bug 5098017
         nCell = 1;
@@ -4272,12 +4304,12 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         end
 
         % irregular slots 60,61,63
-        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_20914_gNB_FAPI_s0.h5'};  % using 20874 instead of 20890
-        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_20915_gNB_FAPI_s1.h5'};  % using 20875 instead of 20891
+        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_20914_gNB_FAPI_s0.h5'};  % using 20874 instead of 20930
+        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_20915_gNB_FAPI_s1.h5'};  % using 20875 instead of 20931
         if caseNum == 649 || caseNum == 651
-            LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_20924_gNB_FAPI_s3.h5','TVnr_ULMIX_21713_gNB_FAPI_s3.h5'};  % using 20924 instead of 20933
+            LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_20924_gNB_FAPI_s3.h5','TVnr_ULMIX_21713_gNB_FAPI_s3.h5'};  % using 20924 instead of 20933 or 20934
         else
-            LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_20924_gNB_FAPI_s3.h5','TVnr_ULMIX_21733_gNB_FAPI_s3.h5'};  % using 20924 instead of 20933
+            LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_20924_gNB_FAPI_s3.h5','TVnr_ULMIX_21733_gNB_FAPI_s3.h5'};  % using 20924 instead of 20933 or 20934
         end
 
     case 653  % % 64TR test case Ph4 'column B', srsPrgSize = 4 and bfwPrgSize = 16, 80 slot pattern
@@ -4496,6 +4528,11 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
             % Second 20 slots (frame 1)
             LP.SCHED{twoSubFrameIdx * 40 + 21}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21050_gNB_FAPI_s0.h5'};
             LP.SCHED{twoSubFrameIdx * 40 + 22}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21051_gNB_FAPI_s1.h5'};
+            if twoSubFrameIdx == 0
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {'TVnr_DLMIX_21052_gNB_FAPI_s2.h5'};  % only CSI-RS and SRS in slot 23 (next)
+            else
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21052_gNB_FAPI_s2.h5'};  % has PDSCH in slot 63 (next)
+            end
             LP.SCHED{twoSubFrameIdx * 40 + 27}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21056_gNB_FAPI_s6.h5'};
             LP.SCHED{twoSubFrameIdx * 40 + 28}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21057_gNB_FAPI_s7.h5'};
             LP.SCHED{twoSubFrameIdx * 40 + 29}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21058_gNB_FAPI_s8.h5'};
@@ -4512,22 +4549,27 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         % S/U/U config
         for subframeIdx = 0:3
             dlmixTvSlot3 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s3.h5', 21033 + mod(subframeIdx, 2) * 20);
-            if subframeIdx == 1  % slot 23 with CSI-RS + SRS
-                dlmixTvSlot3 = 'TVnr_DLMIX_21053_gNB_FAPI_s3.h5';
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21793_gNB_FAPI_s3.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21806_gNB_FAPI_s3.h5'};
             end
-            LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21793_gNB_FAPI_s3.h5'};
             LP.SCHED{subframeIdx * 20 + 5}.config{1}.channels = {bfwTvNames{3},'TVnr_ULMIX_21794_gNB_FAPI_s4.h5'};
             LP.SCHED{subframeIdx * 20 + 6}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21795_gNB_FAPI_s5.h5'};
             dlmixTvSlot13 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s13.h5', 21043 + mod(subframeIdx, 2) * 20);
-            LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21803_gNB_FAPI_s13.h5'};
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21803_gNB_FAPI_s13.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21807_gNB_FAPI_s13.h5'};
+            end
             LP.SCHED{subframeIdx * 20 + 15}.config{1}.channels = {bfwTvNames{5},'TVnr_ULMIX_21804_gNB_FAPI_s14.h5'};
             LP.SCHED{subframeIdx * 20 + 16}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21805_gNB_FAPI_s15.h5'};
         end
 
         % irregular slots 60,61,63
-        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21034_gNB_FAPI_s0.h5'};  % using 21034 instead of 21070
-        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21035_gNB_FAPI_s1.h5'};  % using 21035 instead of 21071
-        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21044_gNB_FAPI_s3.h5','TVnr_ULMIX_21793_gNB_FAPI_s3.h5'};  % using 21044 instead of 21073
+        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21034_gNB_FAPI_s0.h5'};  % using 21034 instead of 21050
+        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21035_gNB_FAPI_s1.h5'};  % using 21035 instead of 21051
+        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21044_gNB_FAPI_s3.h5','TVnr_ULMIX_21793_gNB_FAPI_s3.h5'};  % using 21044 instead of 21053
 
     case 656  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 100 MHz light
         nCell = 1;
@@ -4564,6 +4606,11 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
             % Second 20 slots (frame 1)
             LP.SCHED{twoSubFrameIdx * 40 + 21}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21090_gNB_FAPI_s0.h5'};
             LP.SCHED{twoSubFrameIdx * 40 + 22}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21091_gNB_FAPI_s1.h5'};
+            if twoSubFrameIdx == 0
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {'TVnr_DLMIX_21092_gNB_FAPI_s2.h5'};  % only CSI-RS and SRS in slot 23 (next)
+            else
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21092_gNB_FAPI_s2.h5'};  % has PDSCH in slot 63 (next)
+            end
             LP.SCHED{twoSubFrameIdx * 40 + 27}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21096_gNB_FAPI_s6.h5'};
             LP.SCHED{twoSubFrameIdx * 40 + 28}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21097_gNB_FAPI_s7.h5'};
             LP.SCHED{twoSubFrameIdx * 40 + 29}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21098_gNB_FAPI_s8.h5'};
@@ -4580,22 +4627,27 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         % S/U/U config
         for subframeIdx = 0:3
             dlmixTvSlot3 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s3.h5', 21073 + mod(subframeIdx, 2) * 20);
-            if subframeIdx == 1  % slot 23 with CSI-RS + SRS
-                dlmixTvSlot3 = 'TVnr_DLMIX_21093_gNB_FAPI_s3.h5';
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21813_gNB_FAPI_s3.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21826_gNB_FAPI_s3.h5'};
             end
-            LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21813_gNB_FAPI_s3.h5'};
             LP.SCHED{subframeIdx * 20 + 5}.config{1}.channels = {bfwTvNames{3},'TVnr_ULMIX_21814_gNB_FAPI_s4.h5'};
             LP.SCHED{subframeIdx * 20 + 6}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21815_gNB_FAPI_s5.h5'};
             dlmixTvSlot13 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s13.h5', 21083 + mod(subframeIdx, 2) * 20);
-            LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21823_gNB_FAPI_s13.h5'};
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21823_gNB_FAPI_s13.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21827_gNB_FAPI_s13.h5'};
+            end
             LP.SCHED{subframeIdx * 20 + 15}.config{1}.channels = {bfwTvNames{5},'TVnr_ULMIX_21824_gNB_FAPI_s14.h5'};
             LP.SCHED{subframeIdx * 20 + 16}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21825_gNB_FAPI_s15.h5'};
         end
 
         % irregular slots 60,61,63
-        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21074_gNB_FAPI_s0.h5'};  % using 21074 instead of 21110
-        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21075_gNB_FAPI_s1.h5'};  % using 21075 instead of 21111
-        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21084_gNB_FAPI_s3.h5','TVnr_ULMIX_21813_gNB_FAPI_s3.h5'};  % using 21084 instead of 21113
+        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21074_gNB_FAPI_s0.h5'};  % using 21074 instead of 21090
+        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21075_gNB_FAPI_s1.h5'};  % using 21075 instead of 21091
+        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21084_gNB_FAPI_s3.h5','TVnr_ULMIX_21813_gNB_FAPI_s3.h5'};  % using 21084 instead of 21093
 
     case 657  % % 64TR test case 25-3 'column E', 80 slot pattern, 32DL, 192 SRS per 40ms
     % 657: 2 SRS symbols in S slot
@@ -4670,6 +4722,392 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_20954_gNB_FAPI_s0.h5'};  % using 20954 instead of 20970
         LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_20955_gNB_FAPI_s1.h5'};  % using 20955 instead of 20971
         LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_20964_gNB_FAPI_s3.h5','TVnr_ULMIX_21753_gNB_FAPI_s3.h5'};  % using 20964 instead of 20973
+
+    case 658  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz heavy
+        nCell = 1;
+        LP = [];
+        nSlot = 80;
+        LP.Cell_Configs = {'TVnr_DLMIX_21110_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_ULMIX_21835_gNB_FAPI_s5.h5'};
+        bfwTvNames = {
+            'TVnr_9469_gNB_FAPI_s0.h5',
+            'TVnr_9470_gNB_FAPI_s0.h5',
+            'TVnr_9471_gNB_FAPI_s0.h5',
+            'TVnr_9472_gNB_FAPI_s0.h5',
+            'TVnr_9473_gNB_FAPI_s0.h5',
+            'TVnr_9474_gNB_FAPI_s0.h5'
+        };
+        LP.config_static_harq_proc_id = 1; % add for HARQ cases
+        LP = init_launchPattern(LP, nSlot, nCell);
+        for twoSubFrameIdx = 0:1  % per 40 slots
+            % First 20 slots (frame 0)
+            LP.SCHED{twoSubFrameIdx * 40 +  1}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21110_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  2}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21111_gNB_FAPI_s1.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  3}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21112_gNB_FAPI_s2.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  7}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21116_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  8}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21117_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  9}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21118_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 10}.config{1}.channels = {bfwTvNames{6},'TVnr_DLMIX_21119_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 11}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21120_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 12}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21121_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 13}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21122_gNB_FAPI_s12.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 17}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21126_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 18}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21127_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 19}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21128_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 20}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21129_gNB_FAPI_s19.h5'};
+            % Second 20 slots (frame 1)
+            LP.SCHED{twoSubFrameIdx * 40 + 21}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21130_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 22}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21131_gNB_FAPI_s1.h5'};
+            if twoSubFrameIdx == 0
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {'TVnr_DLMIX_21132_gNB_FAPI_s2.h5'};  % only CSI-RS and SRS in slot 23 (next)
+            else
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21132_gNB_FAPI_s2.h5'};  % has PDSCH in slot 63 (next)
+            end
+            LP.SCHED{twoSubFrameIdx * 40 + 27}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21136_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 28}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21137_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 29}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21138_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 30}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21139_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 31}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21140_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 32}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21141_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 33}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21142_gNB_FAPI_s12.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 37}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21146_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 38}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21147_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 39}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21148_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 40}.config{1}.channels = {bfwTvNames{2},'TVnr_DLMIX_21149_gNB_FAPI_s19.h5'};
+        end
+
+        % S/U/U config
+        for subframeIdx = 0:3
+            dlmixTvSlot3 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s3.h5', 21113 + mod(subframeIdx, 2) * 20);
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21833_gNB_FAPI_s3.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21846_gNB_FAPI_s3.h5'};
+            end
+            LP.SCHED{subframeIdx * 20 + 5}.config{1}.channels = {bfwTvNames{3},'TVnr_ULMIX_21834_gNB_FAPI_s4.h5'};
+            LP.SCHED{subframeIdx * 20 + 6}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21835_gNB_FAPI_s5.h5'};
+            dlmixTvSlot13 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s13.h5', 21123 + mod(subframeIdx, 2) * 20);
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21843_gNB_FAPI_s13.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21847_gNB_FAPI_s13.h5'};
+            end
+            LP.SCHED{subframeIdx * 20 + 15}.config{1}.channels = {bfwTvNames{5},'TVnr_ULMIX_21844_gNB_FAPI_s14.h5'};
+            LP.SCHED{subframeIdx * 20 + 16}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21845_gNB_FAPI_s15.h5'};
+        end
+
+        % irregular slots 60,61,63
+        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21114_gNB_FAPI_s0.h5'};  % using 21114 instead of 21130
+        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21115_gNB_FAPI_s1.h5'};  % using 21115 instead of 21131
+        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21124_gNB_FAPI_s3.h5','TVnr_ULMIX_21833_gNB_FAPI_s3.h5'};  % using 21124 instead of 21133
+
+    case 659  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 90 MHz light
+        nCell = 1;
+        LP = [];
+        nSlot = 80;
+        LP.Cell_Configs = {'TVnr_DLMIX_21150_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_ULMIX_21855_gNB_FAPI_s5.h5'};
+        bfwTvNames = {
+            'TVnr_9475_gNB_FAPI_s0.h5',
+            'TVnr_9476_gNB_FAPI_s0.h5',
+            'TVnr_9477_gNB_FAPI_s0.h5',
+            'TVnr_9478_gNB_FAPI_s0.h5',
+            'TVnr_9479_gNB_FAPI_s0.h5',
+            'TVnr_9480_gNB_FAPI_s0.h5'
+        };
+        LP.config_static_harq_proc_id = 1; % add for HARQ cases
+        LP = init_launchPattern(LP, nSlot, nCell);
+        for twoSubFrameIdx = 0:1  % per 40 slots
+            % First 20 slots (frame 0)
+            LP.SCHED{twoSubFrameIdx * 40 +  1}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21150_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  2}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21151_gNB_FAPI_s1.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  3}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21152_gNB_FAPI_s2.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  7}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21156_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  8}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21157_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  9}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21158_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 10}.config{1}.channels = {bfwTvNames{6},'TVnr_DLMIX_21159_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 11}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21160_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 12}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21161_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 13}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21162_gNB_FAPI_s12.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 17}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21166_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 18}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21167_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 19}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21168_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 20}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21169_gNB_FAPI_s19.h5'};
+            % Second 20 slots (frame 1)
+            LP.SCHED{twoSubFrameIdx * 40 + 21}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21170_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 22}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21171_gNB_FAPI_s1.h5'};
+            if twoSubFrameIdx == 0
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {'TVnr_DLMIX_21172_gNB_FAPI_s2.h5'};  % only CSI-RS and SRS in slot 23 (next)
+            else
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21172_gNB_FAPI_s2.h5'};  % has PDSCH in slot 63 (next)
+            end
+            LP.SCHED{twoSubFrameIdx * 40 + 27}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21176_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 28}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21177_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 29}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21178_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 30}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21179_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 31}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21180_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 32}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21181_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 33}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21182_gNB_FAPI_s12.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 37}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21186_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 38}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21187_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 39}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21188_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 40}.config{1}.channels = {bfwTvNames{2},'TVnr_DLMIX_21189_gNB_FAPI_s19.h5'};
+        end
+
+        % S/U/U config
+        for subframeIdx = 0:3
+            dlmixTvSlot3 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s3.h5', 21153 + mod(subframeIdx, 2) * 20);
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21853_gNB_FAPI_s3.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21866_gNB_FAPI_s3.h5'};
+            end
+            LP.SCHED{subframeIdx * 20 + 5}.config{1}.channels = {bfwTvNames{3},'TVnr_ULMIX_21854_gNB_FAPI_s4.h5'};
+            LP.SCHED{subframeIdx * 20 + 6}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21855_gNB_FAPI_s5.h5'};
+            dlmixTvSlot13 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s13.h5', 21163 + mod(subframeIdx, 2) * 20);
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21863_gNB_FAPI_s13.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21867_gNB_FAPI_s13.h5'};
+            end
+            LP.SCHED{subframeIdx * 20 + 15}.config{1}.channels = {bfwTvNames{5},'TVnr_ULMIX_21864_gNB_FAPI_s14.h5'};
+            LP.SCHED{subframeIdx * 20 + 16}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21865_gNB_FAPI_s15.h5'};
+        end
+
+        % irregular slots 60,61,63
+        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21154_gNB_FAPI_s0.h5'};  % using 21154 instead of 21170
+        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21155_gNB_FAPI_s1.h5'};  % using 21155 instead of 21171
+        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21164_gNB_FAPI_s3.h5','TVnr_ULMIX_21853_gNB_FAPI_s3.h5'};  % using 21164 instead of 21173
+
+    case 660  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz heavy
+        nCell = 1;
+        LP = [];
+        nSlot = 80;
+        LP.Cell_Configs = {'TVnr_DLMIX_21190_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_ULMIX_21875_gNB_FAPI_s5.h5'};
+        bfwTvNames = {
+            'TVnr_9481_gNB_FAPI_s0.h5',
+            'TVnr_9482_gNB_FAPI_s0.h5',
+            'TVnr_9483_gNB_FAPI_s0.h5',
+            'TVnr_9484_gNB_FAPI_s0.h5',
+            'TVnr_9485_gNB_FAPI_s0.h5',
+            'TVnr_9486_gNB_FAPI_s0.h5'
+        };
+        LP.config_static_harq_proc_id = 1; % add for HARQ cases
+        LP = init_launchPattern(LP, nSlot, nCell);
+        for twoSubFrameIdx = 0:1  % per 40 slots
+            % First 20 slots (frame 0)
+            LP.SCHED{twoSubFrameIdx * 40 +  1}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21190_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  2}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21191_gNB_FAPI_s1.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  3}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21192_gNB_FAPI_s2.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  7}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21196_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  8}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21197_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  9}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21198_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 10}.config{1}.channels = {bfwTvNames{6},'TVnr_DLMIX_21199_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 11}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21200_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 12}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21201_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 13}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21202_gNB_FAPI_s12.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 17}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21206_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 18}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21207_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 19}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21208_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 20}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21209_gNB_FAPI_s19.h5'};
+            % Second 20 slots (frame 1)
+            LP.SCHED{twoSubFrameIdx * 40 + 21}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21210_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 22}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21211_gNB_FAPI_s1.h5'};
+            if twoSubFrameIdx == 0
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {'TVnr_DLMIX_21212_gNB_FAPI_s2.h5'};  % only CSI-RS and SRS in slot 23 (next)
+            else
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21212_gNB_FAPI_s2.h5'};  % has PDSCH in slot 63 (next)
+            end
+            LP.SCHED{twoSubFrameIdx * 40 + 27}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21216_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 28}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21217_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 29}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21218_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 30}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21219_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 31}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21220_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 32}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21221_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 33}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21222_gNB_FAPI_s12.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 37}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21226_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 38}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21227_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 39}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21228_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 40}.config{1}.channels = {bfwTvNames{2},'TVnr_DLMIX_21229_gNB_FAPI_s19.h5'};
+        end
+
+        % S/U/U config
+        for subframeIdx = 0:3
+            dlmixTvSlot3 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s3.h5', 21193 + mod(subframeIdx, 2) * 20);
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21873_gNB_FAPI_s3.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21886_gNB_FAPI_s3.h5'};
+            end
+            LP.SCHED{subframeIdx * 20 + 5}.config{1}.channels = {bfwTvNames{3},'TVnr_ULMIX_21874_gNB_FAPI_s4.h5'};
+            LP.SCHED{subframeIdx * 20 + 6}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21875_gNB_FAPI_s5.h5'};
+            dlmixTvSlot13 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s13.h5', 21203 + mod(subframeIdx, 2) * 20);
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21883_gNB_FAPI_s13.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21887_gNB_FAPI_s13.h5'};
+            end
+            LP.SCHED{subframeIdx * 20 + 15}.config{1}.channels = {bfwTvNames{5},'TVnr_ULMIX_21884_gNB_FAPI_s14.h5'};
+            LP.SCHED{subframeIdx * 20 + 16}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21885_gNB_FAPI_s15.h5'};
+        end
+
+        % irregular slots 60,61,63
+        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21194_gNB_FAPI_s0.h5'};  % using 21194 instead of 21210
+        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21195_gNB_FAPI_s1.h5'};  % using 21195 instead of 21211
+        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21204_gNB_FAPI_s3.h5','TVnr_ULMIX_21873_gNB_FAPI_s3.h5'};  % using 21204 instead of 21213
+
+    case 661  % 64TR MU-MIMO realistic traffic with Center/Middle/Edge, 60 MHz light
+        nCell = 1;
+        LP = [];
+        nSlot = 80;
+        LP.Cell_Configs = {'TVnr_DLMIX_21230_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_ULMIX_21895_gNB_FAPI_s5.h5'};
+        bfwTvNames = {
+            'TVnr_9487_gNB_FAPI_s0.h5',
+            'TVnr_9488_gNB_FAPI_s0.h5',
+            'TVnr_9489_gNB_FAPI_s0.h5',
+            'TVnr_9490_gNB_FAPI_s0.h5',
+            'TVnr_9491_gNB_FAPI_s0.h5',
+            'TVnr_9492_gNB_FAPI_s0.h5'
+        };
+        LP.config_static_harq_proc_id = 1; % add for HARQ cases
+        LP = init_launchPattern(LP, nSlot, nCell);
+        for twoSubFrameIdx = 0:1  % per 40 slots
+            % First 20 slots (frame 0)
+            LP.SCHED{twoSubFrameIdx * 40 +  1}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21230_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  2}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21231_gNB_FAPI_s1.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  3}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21232_gNB_FAPI_s2.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  7}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21236_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  8}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21237_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  9}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21238_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 10}.config{1}.channels = {bfwTvNames{6},'TVnr_DLMIX_21239_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 11}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21240_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 12}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21241_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 13}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21242_gNB_FAPI_s12.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 17}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21246_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 18}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21247_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 19}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21248_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 20}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21249_gNB_FAPI_s19.h5'};
+            % Second 20 slots (frame 1)
+            LP.SCHED{twoSubFrameIdx * 40 + 21}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21250_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 22}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21251_gNB_FAPI_s1.h5'};
+            if twoSubFrameIdx == 0
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {'TVnr_DLMIX_21252_gNB_FAPI_s2.h5'};  % only CSI-RS and SRS in slot 23 (next)
+            else
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21252_gNB_FAPI_s2.h5'};  % has PDSCH in slot 63 (next)
+            end
+            LP.SCHED{twoSubFrameIdx * 40 + 27}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21256_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 28}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21257_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 29}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21258_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 30}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21259_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 31}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21260_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 32}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21261_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 33}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21262_gNB_FAPI_s12.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 37}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21266_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 38}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21267_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 39}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21268_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 40}.config{1}.channels = {bfwTvNames{2},'TVnr_DLMIX_21269_gNB_FAPI_s19.h5'};
+        end
+
+        % S/U/U config
+        for subframeIdx = 0:3
+            dlmixTvSlot3 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s3.h5', 21233 + mod(subframeIdx, 2) * 20);
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21893_gNB_FAPI_s3.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21906_gNB_FAPI_s3.h5'};
+            end
+            LP.SCHED{subframeIdx * 20 + 5}.config{1}.channels = {bfwTvNames{3},'TVnr_ULMIX_21894_gNB_FAPI_s4.h5'};
+            LP.SCHED{subframeIdx * 20 + 6}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21895_gNB_FAPI_s5.h5'};
+            dlmixTvSlot13 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s13.h5', 21243 + mod(subframeIdx, 2) * 20);
+            if subframeIdx == 0 || subframeIdx == 2
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21903_gNB_FAPI_s13.h5'};
+            else
+                LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot13,'TVnr_ULMIX_21907_gNB_FAPI_s13.h5'};
+            end
+            LP.SCHED{subframeIdx * 20 + 15}.config{1}.channels = {bfwTvNames{5},'TVnr_ULMIX_21904_gNB_FAPI_s14.h5'};
+            LP.SCHED{subframeIdx * 20 + 16}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21905_gNB_FAPI_s15.h5'};
+        end
+
+        % irregular slots 60,61,63
+        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21234_gNB_FAPI_s0.h5'};  % using 21234 instead of 21250
+        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21235_gNB_FAPI_s1.h5'};  % using 21235 instead of 21251
+        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21244_gNB_FAPI_s3.h5','TVnr_ULMIX_21893_gNB_FAPI_s3.h5'};  % using 21244 instead of 21253
+
+    case 662  % % 64TR test case 25-3 'column D', 80 slot pattern, 24DL, 192 SRS per 40ms
+    % 662: 2 SRS symbols in S slot
+        nCell = 1;
+        LP = [];
+        nSlot = 80;
+        LP.Cell_Configs = {'TVnr_DLMIX_21270_gNB_FAPI_s0.h5'};
+        LP.UL_Cell_Configs = {'TVnr_ULMIX_21915_gNB_FAPI_s5.h5'};
+        bfwTvNames = {
+                'TVnr_9493_gNB_FAPI_s0.h5',
+                'TVnr_9494_gNB_FAPI_s0.h5',
+                'TVnr_9495_gNB_FAPI_s0.h5',
+                'TVnr_9496_gNB_FAPI_s0.h5',
+                'TVnr_9497_gNB_FAPI_s0.h5',
+                'TVnr_9498_gNB_FAPI_s0.h5',
+                'TVnr_9499_gNB_FAPI_s0.h5'
+            };
+        LP.config_static_harq_proc_id = 1; % add for HARQ cases
+        LP = init_launchPattern(LP, nSlot, nCell);
+        for twoSubFrameIdx = 0:1  % per 40 slots
+            LP.SCHED{twoSubFrameIdx * 40 +  1}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21270_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  2}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21271_gNB_FAPI_s1.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  3}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21272_gNB_FAPI_s2.h5'};
+            % S/U/U configured below
+            LP.SCHED{twoSubFrameIdx * 40 +  7}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21276_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  8}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21277_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 +  9}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21278_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 10}.config{1}.channels = {bfwTvNames{6},'TVnr_DLMIX_21279_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 11}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21280_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 12}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21281_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 13}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21282_gNB_FAPI_s12.h5'};
+            % S/U/U configured below
+            LP.SCHED{twoSubFrameIdx * 40 + 17}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21286_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 18}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21287_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 19}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21288_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 20}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21289_gNB_FAPI_s19.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 21}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21290_gNB_FAPI_s0.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 22}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21291_gNB_FAPI_s1.h5'};
+            if twoSubFrameIdx == 0
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {'TVnr_DLMIX_21292_gNB_FAPI_s2.h5'};  % only CSI-RS and SRS in slot 23 (next)
+            else
+                LP.SCHED{twoSubFrameIdx * 40 + 23}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21292_gNB_FAPI_s2.h5'};  % has PDSCH in slot 63 (next)
+            end
+            % S/U/U configured below
+            LP.SCHED{twoSubFrameIdx * 40 + 27}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21296_gNB_FAPI_s6.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 28}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21297_gNB_FAPI_s7.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 29}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21298_gNB_FAPI_s8.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 30}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21299_gNB_FAPI_s9.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 31}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21300_gNB_FAPI_s10.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 32}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21301_gNB_FAPI_s11.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 33}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21302_gNB_FAPI_s12.h5'};
+            % S/U/U configured below
+            LP.SCHED{twoSubFrameIdx * 40 + 37}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21306_gNB_FAPI_s16.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 38}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21307_gNB_FAPI_s17.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 39}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21308_gNB_FAPI_s18.h5'};
+            LP.SCHED{twoSubFrameIdx * 40 + 40}.config{1}.channels = {bfwTvNames{2},'TVnr_DLMIX_21309_gNB_FAPI_s19.h5'};   
+        end
+
+        % S/U/U config
+        for subframeIdx = 0:3
+            dlmixTvSlot3 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s3.h5', 21273 + mod(subframeIdx, 2) * 20);
+            LP.SCHED{subframeIdx * 20 + 4}.config{1}.channels = {bfwTvNames{1},dlmixTvSlot3,'TVnr_ULMIX_21753_gNB_FAPI_s3.h5'};
+            LP.SCHED{subframeIdx * 20 + 5}.config{1}.channels = {bfwTvNames{3},'TVnr_ULMIX_21914_gNB_FAPI_s4.h5'};
+            LP.SCHED{subframeIdx * 20 + 6}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21915_gNB_FAPI_s5.h5'};
+            dlmixTvSlot13 = sprintf('TVnr_DLMIX_%d_gNB_FAPI_s13.h5', 21283 + mod(subframeIdx, 2) * 20);
+            LP.SCHED{subframeIdx * 20 + 14}.config{1}.channels = {bfwTvNames{5},dlmixTvSlot13,'TVnr_ULMIX_21763_gNB_FAPI_s13.h5'};
+            LP.SCHED{subframeIdx * 20 + 15}.config{1}.channels = {bfwTvNames{7},'TVnr_ULMIX_21924_gNB_FAPI_s14.h5'};
+            LP.SCHED{subframeIdx * 20 + 16}.config{1}.channels = {bfwTvNames{4},'TVnr_ULMIX_21925_gNB_FAPI_s15.h5'};
+        end
+
+        % irregular slots 60,61,63
+        LP.SCHED{61}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21274_gNB_FAPI_s0.h5'};  % using 21274 instead of 21290
+        LP.SCHED{62}.config{1}.channels = {bfwTvNames{4},'TVnr_DLMIX_21275_gNB_FAPI_s1.h5'};  % using 21275 instead of 21291
+        LP.SCHED{64}.config{1}.channels = {bfwTvNames{1},'TVnr_DLMIX_21284_gNB_FAPI_s3.h5','TVnr_ULMIX_21753_gNB_FAPI_s3.h5'};  % using 21284 instead of 21293
 
     case 700 % multi-cell: SRS only in consecutive slots
         % S slot: 3, 13, 23, 33
@@ -4749,7 +5187,7 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         nCell = 2;
         nSlot = 40;
         LP = [];
-        LP.Cell_Configs = {'TVnr_ULMIX_4324_gNB_FAPI_s3.h5', 'TVnr_ULMIX_4324_gNB_FAPI_s3.h5'};
+        LP.Cell_Configs = {'TVnr_ULMIX_4324_gNB_FAPI_s3.h5', 'TVnr_ULMIX_4327_gNB_FAPI_s13.h5'};
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{4}.config{1}.channels = {'TVnr_ULMIX_4324_gNB_FAPI_s3.h5'};
         LP.SCHED{5}.config{1}.channels = {'TVnr_ULMIX_4325_gNB_FAPI_s4.h5'};
@@ -4761,11 +5199,11 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         LP.SCHED{25}.config{2}.channels = {'TVnr_ULMIX_4331_gNB_FAPI_s24.h5'};
         LP.SCHED{26}.config{1}.channels = {'TVnr_ULMIX_4332_gNB_FAPI_s25.h5'};
         LP.SCHED{34}.config{1}.channels = {'TVnr_ULMIX_4333_gNB_FAPI_s33.h5'};
-        LP.SCHED{34}.config{2}.channels = {'TVnr_ULMIX_4333_gNB_FAPI_s33.h5'};
+        LP.SCHED{34}.config{2}.channels = {'TVnr_ULMIX_4327_gNB_FAPI_s13.h5'};
         LP.SCHED{35}.config{1}.channels = {'TVnr_ULMIX_4334_gNB_FAPI_s34.h5'};
-        LP.SCHED{35}.config{2}.channels = {'TVnr_ULMIX_4334_gNB_FAPI_s34.h5'};
+        LP.SCHED{35}.config{2}.channels = {'TVnr_ULMIX_4328_gNB_FAPI_s14.h5'};
         LP.SCHED{36}.config{1}.channels = {'TVnr_ULMIX_4335_gNB_FAPI_s35.h5'};
-        LP.SCHED{36}.config{2}.channels = {'TVnr_ULMIX_4335_gNB_FAPI_s35.h5'};
+        LP.SCHED{36}.config{2}.channels = {'TVnr_ULMIX_4329_gNB_FAPI_s15.h5'};
 
     case 704 % multi-cell: SRS only, SRS + PRACH, SRS + PUCCH, SRS + PUSCH, SRS + PUSCH + PUCCH + PRACH in consecutive slots
         % S slot: 3, 13, 23, 33
@@ -4783,26 +5221,26 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         LP.SCHED{4}.config{1}.channels = {'TVnr_ULMIX_3920_gNB_FAPI_s3.h5'};
         LP.SCHED{4}.config{2}.channels = {'TVnr_ULMIX_3921_gNB_FAPI_s3.h5'};
         LP.SCHED{5}.config{1}.channels = {'TVnr_ULMIX_3926_gNB_FAPI_s4.h5'};
-        LP.SCHED{5}.config{2}.channels = {'TVnr_ULMIX_3926_gNB_FAPI_s4.h5'};
+        LP.SCHED{5}.config{2}.channels = {'TVnr_ULMIX_3940_gNB_FAPI_s4.h5'};
         LP.SCHED{6}.config{1}.channels = {'TVnr_ULMIX_3927_gNB_FAPI_s5.h5'};
-        LP.SCHED{6}.config{2}.channels = {'TVnr_ULMIX_3927_gNB_FAPI_s5.h5'};
+        LP.SCHED{6}.config{2}.channels = {'TVnr_ULMIX_3941_gNB_FAPI_s5.h5'};
         % 13~15: mix
         LP.SCHED{14}.config{1}.channels = {'TVnr_ULMIX_4315_gNB_FAPI_s13.h5'};
         LP.SCHED{14}.config{2}.channels = {'TVnr_ULMIX_4303_gNB_FAPI_s13.h5'};
         LP.SCHED{15}.config{1}.channels = {'TVnr_ULMIX_4316_gNB_FAPI_s14.h5'};
         LP.SCHED{15}.config{2}.channels = {'TVnr_ULMIX_3932_gNB_FAPI_s14.h5'};
-        LP.SCHED{16}.config{1}.channels = {'TVnr_ULMIX_4317_gNB_FAPI_s15.h5'};
+        LP.SCHED{16}.config{1}.channels = {'TVnr_ULMIX_4326_gNB_FAPI_s5.h5'};
         LP.SCHED{16}.config{2}.channels = {'TVnr_ULMIX_4329_gNB_FAPI_s15.h5'};
         % 23~25: mix
         LP.SCHED{24}.config{1}.channels = {'TVnr_ULMIX_3934_gNB_FAPI_s23.h5'};
         LP.SCHED{24}.config{2}.channels = {'TVnr_ULMIX_4318_gNB_FAPI_s23.h5'};
-        LP.SCHED{25}.config{1}.channels = {'TVnr_ULMIX_4331_gNB_FAPI_s24.h5'};
-        LP.SCHED{25}.config{2}.channels = {'TVnr_ULMIX_4319_gNB_FAPI_s24.h5'};
+        LP.SCHED{25}.config{1}.channels = {'TVnr_ULMIX_4325_gNB_FAPI_s4.h5'};
+        LP.SCHED{25}.config{2}.channels = {'TVnr_ULMIX_4328_gNB_FAPI_s14.h5'};
         LP.SCHED{26}.config{1}.channels = {'TVnr_ULMIX_4308_gNB_FAPI_s25.h5'};
         LP.SCHED{26}.config{2}.channels = {'TVnr_ULMIX_4320_gNB_FAPI_s25.h5'};
         % 33~35: mix
         LP.SCHED{34}.config{1}.channels = {'TVnr_ULMIX_4333_gNB_FAPI_s33.h5'};
-        LP.SCHED{34}.config{2}.channels = {'TVnr_ULMIX_4321_gNB_FAPI_s33.h5'};
+        LP.SCHED{34}.config{2}.channels = {'TVnr_ULMIX_4336_gNB_FAPI_s33.h5'};
         LP.SCHED{35}.config{1}.channels = {'TVnr_ULMIX_4322_gNB_FAPI_s34.h5'};
         LP.SCHED{35}.config{2}.channels = {'TVnr_ULMIX_4310_gNB_FAPI_s34.h5'};
         LP.SCHED{36}.config{1}.channels = {'TVnr_ULMIX_4323_gNB_FAPI_s35.h5'};

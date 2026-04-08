@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,11 +104,9 @@ typedef struct UplanePrbBoxInfo {
  */
 typedef struct UplaneSymbolPacketInfo {
     uintptr_t hdr_addr;                             //!< Header address
+    uint64_t hdr_addr_tx;                           //!< Header address for transmission
     uint32_t hdr_stride;                            //!< Header stride in bytes
-    struct doca_gpu_buf_arr *comm_buf;              //!< DOCA GPU buffer array for communication
-    struct doca_gpu_buf *buf;                       //!< DOCA GPU buffer
-    struct doca_buf_arr *cpu_comms_comm_buf;        //!< CPU communication buffer array
-    struct doca_gpu_buf_arr *cpu_comms_gpu_comm_buf; //!< GPU communication buffer array (CPU comms mode)
+    uint32_t pkt_buff_mkey;                         //!< mkey value of the buffer
 
     uint16_t  start_prbu;                           //!< Starting PRB
     uint16_t  num_prbu;                             //!< Number of PRBs
@@ -254,9 +252,12 @@ typedef struct UplaneSlotInfo {
 } UplaneSlotInfo_t;
 
 struct FlowPtrInfo {
-    struct doca_gpu_buf_arr *comm_buf;
-    struct doca_gpu_buf_arr *cpu_comm_gpu_comm_buf;
-    uint32_t hdr_stride;
+    uint8_t *gpu_pkt_addr;			//!< GPU memory address of the buffer
+    uint8_t *cpu_pkt_addr;			//!< CPU memory address of the buffer    
+    uint32_t pkt_buff_mkey;        //!< mkey value of the buffer
+    uint32_t cpu_comms_pkt_buff_mkey; //!< mkey value of the CPU comms buffer
+    uint32_t max_pkt_sz;           //!< maximum packet size
+    uint32_t hdr_stride;           //!< header stride
 };
 
 struct TxRequestUplaneGpuComm

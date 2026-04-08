@@ -359,6 +359,21 @@ int main(int argc, char* argv[])
                                                     kernelNodeParamsDriver.kernelParams,
                                                     kernelNodeParamsDriver.extra);
         if(CUDA_SUCCESS != rateMatchRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
+
+        const CUDA_KERNEL_NODE_PARAMS& clampKernelNodeParamsDriver = puschRmLaunchCfg.clampKernelNodeParamsDriver;
+        CUresult clampRateMatchRunStatus = cuLaunchKernel(clampKernelNodeParamsDriver.func,
+                                                    clampKernelNodeParamsDriver.gridDimX,
+                                                    clampKernelNodeParamsDriver.gridDimY,
+                                                    clampKernelNodeParamsDriver.gridDimZ,
+                                                    clampKernelNodeParamsDriver.blockDimX,
+                                                    clampKernelNodeParamsDriver.blockDimY,
+                                                    clampKernelNodeParamsDriver.blockDimZ,
+                                                    clampKernelNodeParamsDriver.sharedMemBytes,
+                                                    static_cast<CUstream>(cuStrmMain.handle()),
+                                                    clampKernelNodeParamsDriver.kernelParams,
+                                                    clampKernelNodeParamsDriver.extra);
+
+        if(CUDA_SUCCESS != clampRateMatchRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
         cudaStreamSynchronize(cuStrmMain.handle()); // synch to make sure kernel finishes
 
        evalDataset.evalPuschRm(ppRmOut.addr(), pTbPrmsCpu, cuStrmMain.handle());

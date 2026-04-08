@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -233,6 +233,7 @@ def get_pusch_stat_prms(  # pylint: disable=too-many-arguments
         fixedMaxNumLdpcItrs=np.uint8(10),
         ldpcClampValue=np.float32(128.0),
         polarDcdrListSz=np.uint8(8),
+        nMaxTbPerNode=np.uint8(32),
         chEstAlgo=PuschChEstAlgoType(ch_est_algo),
         enablePerPrgChEst=np.uint8(enable_per_prg_chest),
         eqCoeffAlgo=eq_coeff_algo,
@@ -259,6 +260,7 @@ def get_pusch_stat_prms(  # pylint: disable=too-many-arguments
         enableEarlyHarq=np.uint8(0),
         earlyHarqProcNodePriority=np.int32(0),
         workCancelMode=PuschWorkCancelMode.PUSCH_NO_WORK_CANCEL,  # update as needed
+        enableBatchedMemcpy=np.uint8(0),
         chestFactorySettingsFilename=chest_factory_settings_filename,
     )
 

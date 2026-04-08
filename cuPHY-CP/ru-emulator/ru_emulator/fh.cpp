@@ -18,7 +18,7 @@
 #include "fh.hpp"
 
 void RU_Emulator::open_fh_driver(){
-    aerial_fh::FronthaulInfo fh_info;
+    aerial_fh::FronthaulInfo fh_info{};
     fh_info.dpdk_thread            = opt_afh_dpdk_thread;
     fh_info.accu_tx_sched_res_ns   = opt_afh_accu_tx_sched_res_ns;
     fh_info.pdump_client_thread    = opt_afh_pdump_client_thread;
@@ -263,7 +263,7 @@ void RU_Emulator::add_flows(){
         for(int flow_idx = 0; flow_idx < cell_configs[i].eAxC_DL.size(); ++flow_idx)
         {
             aerial_fh::FlowHandle flow;
-            aerial_fh::FlowInfo flowinfo;
+            aerial_fh::FlowInfo flowinfo{};
             aerial_fh::VlanTci vlan_tci;
             vlan_tci.tci = cell_configs[i].vlan;
             flowinfo.flow_rx_mode = aerial_fh::FlowRxApiMode::TXANDRX;

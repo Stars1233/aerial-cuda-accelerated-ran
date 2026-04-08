@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,27 +49,13 @@ fapi_validate::fapi_validate()
     log_count  = 0;
 }
 
-fapi_validate::fapi_validate(int _enable, int _log_opt)
+fapi_validate::fapi_validate(int _enable, int _log_opt) : fapi_validate()
 {
     // 0 - disabled; 1 - report error level; 2 - report error and warning level
     enable = _enable;
 
     // validate_log_opt: 0 - no print; 1 - print per MSG; 2 - print per PDU; 3 - force print all
     log_opt = _log_opt;
-
-    fapi_req = nullptr;
-    thrput   = nullptr;
-    cell_id  = 0;
-    sfn      = 0;
-    slot     = 0;
-    offset   = 0;
-    msg_id   = 0;
-
-    err_count  = 0;
-    err_pdu    = 0;
-    warn_count = 0;
-    warn_pdu   = 0;
-    log_count  = 0;
 }
 
 fapi_validate::~fapi_validate()

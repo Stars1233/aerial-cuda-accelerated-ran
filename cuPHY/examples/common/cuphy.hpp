@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 
 #include "cuphy.h"
 #include "cuphy_api.h"
+#include "memfoot_global.hpp"
 #include "nvlog.hpp"
 #include "util.hpp"
 #include "type_convert.hpp"
@@ -73,31 +74,12 @@
 inline uint32_t format_as(const CUresult e) { return fmt::underlying(e); }
 inline uint32_t format_as(const CUmoduleLoadingMode_enum m) { return fmt::underlying(m); }
 
-namespace cuphy
-{
-/**
- * @brief Converts an enum class value to its underlying type
- * 
- * @tparam EnumType The enum class type to convert from
- * @param e The enum value to convert
- * @return The underlying integral type of the enum class
- *
- * This is a constexpr helper function that safely converts a strongly-typed enum 
- * (enum class) value to its underlying integral type using static_cast.
- */
-template <typename EnumType>
-constexpr auto to_underlying(EnumType e) -> std::underlying_type_t<EnumType>
-{
-    return static_cast<std::underlying_type_t<EnumType>>(e);
-}
-}
-
 ////////////////////////////////////////////////////////////////////////////
 // cuphyMemoryFootprint
-class cuphyMemoryFootprint
+class cuphyMemoryFootprint : public MemFootBase
 {
 public:
-    cuphyMemoryFootprint():gpu_allocated_bytes(0)
+    cuphyMemoryFootprint():MemFootBase(MF_MODULE_CUPHY), gpu_allocated_bytes(0)
     {}
 
     void addGpuAllocation(size_t bytes)
@@ -111,6 +93,7 @@ public:
     }
     void printMemoryFootprint(void* channel_ptr=nullptr, std::string channel_name="") const
     {
+        name = channel_name;
         if (!channel_ptr)
         {
             //printf("cuphyMemoryFootprint - GPU allocation: %.3f MiB.\n", gpu_allocated_bytes * 1.0f/ (1024 * 1024));
@@ -122,7 +105,23 @@ public:
             NVLOGC_FMT(NVLOG_MEMFOOT, "cuphyMemoryFootprint - GPU allocation: {:.3f} MiB for cuPHY {} channel object ({:p}).", gpu_allocated_bytes * 1.0f/ (1024 * 1024), channel_name, channel_ptr);
         }
     }
+
+    void setName(const std::string& name)
+    {
+        this->name = name;
+    }
+
+    std::string getName() override
+    {
+        return name;
+    }
+
+    size_t getGpuSize() override
+    {
+        return gpu_allocated_bytes;
+    }
 private:
+    mutable std::string name = "";
     size_t gpu_allocated_bytes;
 };
 
@@ -410,7 +409,7 @@ public:
     cudaGreenContext& operator=(const cudaGreenContext&) = delete;
 
 #if CUDA_VERSION >= 12040
-    void create(int gpuId, CUdevResource* resources)
+    void create(int gpuId, const CUdevResource* resources, bool print_resources=false, bool use_workqueues=false, unsigned int wq_concurrency_limit=2)
     {
         if (resources == nullptr) {
             printf("Cannot call cudaGreenContext create with null CUdevResource ptr!\n");
@@ -424,8 +423,24 @@ public:
         // printf("GPU ordinal %d gpuId %d\n", static_cast<int>(device), gpuId);
 
         // Generate a descriptor from the provided resource
-        const unsigned int num_resources = 1;
-        CU_CHECK_EXCEPTION(cuDevResourceGenerateDesc(&m_cuResourceDesc, resources, num_resources));
+#if CUDA_VERSION >= 13010
+        if (!use_workqueues) {
+            const unsigned int num_resources = 1;
+            m_resources[0]      = resources[0];
+            CU_CHECK_EXCEPTION(cuDevResourceGenerateDesc(&m_cuResourceDesc, &m_resources[0], num_resources));
+        } else {
+            const unsigned int num_resources = 2;
+            m_resources[0]      = resources[0];
+            m_resources[1].type = CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG;
+            m_resources[1].wqConfig = {.device = device, .wqConcurrencyLimit = wq_concurrency_limit, .sharingScope = CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED};
+
+            CU_CHECK_EXCEPTION(cuDevResourceGenerateDesc(&m_cuResourceDesc, &m_resources[0], num_resources));
+        }
+#else
+            const unsigned int num_resources = 1;
+            m_resources[0]      = resources[0];
+            CU_CHECK_EXCEPTION(cuDevResourceGenerateDesc(&m_cuResourceDesc, &m_resources[0], num_resources));
+#endif
 
         unsigned int default_ctx_creation_flags = CU_GREEN_CTX_DEFAULT_STREAM;
         // Create a green context for this resource descriptor
@@ -435,6 +450,11 @@ public:
         CU_CHECK_EXCEPTION(cuCtxFromGreenCtx(&m_cuCtx, m_cuGreenCtx));
 
         m_ctxCreated = true;
+
+        if (print_resources)
+        {
+            printResources();
+        }
     }
 #endif
 
@@ -500,18 +520,79 @@ public:
     }
     //----------------------------------------------------------------------
     //getResources()
-    void getResources(CUdevResource* resource) const
+    void getResources(CUdevResource* resource, CUdevResourceType resource_type=CU_DEV_RESOURCE_TYPE_SM) const
     {
         if (!m_ctxCreated) {
             printf("Cannot call cudaGreenContext getResources() before a context has been created\n");
             return;
         }
-        CUresult result = cuGreenCtxGetDevResource(m_cuGreenCtx, resource,  CU_DEV_RESOURCE_TYPE_SM);
+        CUresult result = cuGreenCtxGetDevResource(m_cuGreenCtx, resource,  resource_type);
         if(CUDA_SUCCESS != result)
         {
             throw cuphy::cuda_driver_exception(result, "cuGreenCtxGetDevResource()");
         }
     }
+
+    //----------------------------------------------------------------------
+    //printDevResourceInfo()
+
+    void printDevResourceInfo(CUdevResource dev_resource)
+    {
+
+        if (dev_resource.type == CU_DEV_RESOURCE_TYPE_INVALID) {
+            NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "device resource has invalid type ({})", CU_DEV_RESOURCE_TYPE_INVALID);
+        } else if (dev_resource.type == CU_DEV_RESOURCE_TYPE_SM) {
+#if CUDA_VERSION >= 13010
+            NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "device resource with CU_DEV_RESOURCE_TYPE_SM ({}) type has {} SM count, {} minSmPartitionSize and {} smCoscheduledAlignment and {} flags",
+                   CU_DEV_RESOURCE_TYPE_SM, dev_resource.sm.smCount, dev_resource.sm.minSmPartitionSize, dev_resource.sm.smCoscheduledAlignment, dev_resource.sm.flags);
+#else
+            NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "device resource with CU_DEV_RESOURCE_TYPE_SM ({}) type has {} SM count",
+                   CU_DEV_RESOURCE_TYPE_SM, dev_resource.sm.smCount);
+#endif
+        }
+#if CUDA_VERSION >= 13010
+        else if (dev_resource.type == CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG)
+        {
+            NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "device resource with CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG ({}) type has {} wqConcurrencyLimit and {} sharingScope",
+                   CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG, dev_resource.wqConfig.wqConcurrencyLimit, dev_resource.wqConfig.sharingScope);
+        }
+        else if (dev_resource.type == CU_DEV_RESOURCE_TYPE_WORKQUEUE)
+        {
+            NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "device resource with CU_DEV_RESOURCE_TYPE_WORKQUEUE ({}) type",
+                  CU_DEV_RESOURCE_TYPE_WORKQUEUE);
+        }
+#endif
+        else
+        {
+            NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT, "device resource with unexpected {} type", dev_resource.type);
+        }
+    }
+
+
+    //----------------------------------------------------------------------
+    //printResources()
+    void printResources()
+    {
+        if (!m_ctxCreated) {
+            NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT, "Cannot call cudaGreenContext printResources() before a context has been created");
+            return;
+        }
+
+        CUdevResource sm_resource = {};
+        CU_CHECK(cuGreenCtxGetDevResource(m_cuGreenCtx, &sm_resource, CU_DEV_RESOURCE_TYPE_SM));
+        printDevResourceInfo(sm_resource);
+
+#if CUDA_VERSION >= 13010
+        CUdevResource wq_config_resource = {};
+        CU_CHECK(cuGreenCtxGetDevResource(m_cuGreenCtx, &wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
+        printDevResourceInfo(wq_config_resource);
+
+        CUdevResource wq_resource = {};
+        CU_CHECK(cuGreenCtxGetDevResource(m_cuGreenCtx, &wq_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE));
+        printDevResourceInfo(wq_resource);
+#endif
+    }
+
 #endif
 
 
@@ -529,6 +610,7 @@ private:
 #if CUDA_VERSION >= 12040
     CUgreenCtx   m_cuGreenCtx;
     CUdevResourceDesc m_cuResourceDesc; //not needed, could remove
+    CUdevResource  m_resources[2] = {{}, {}}; // device resources
 #endif
     int          m_SMcount = 0;
 };

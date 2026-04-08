@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -45,6 +45,8 @@ namespace channel_eq
 // #define ENABLE_PROFILING
 // #define ENABLE_DEBUG
 // #define ENABLE_DEBUG_SOFT_DEMAP
+
+#define SHARED_MEMORY_SIZE_LIMIT 49152 // 48 KiB by default
 
 #define ENABLE_MULTI_SYMBS_PER_THRD_BLK  (2)  // (0) single symbol per slot
                                               // (1) NUM_SYMBOLS_PER_SLOT per slot
@@ -467,7 +469,7 @@ __device__ __forceinline__ void computePamLlr(int32_t                           
     for(int32_t i = 0; i < nPamBits; ++i)
     {
         // noiseInv (i.e. ReeInv) is the inverse of QAM noise variance: noiseInv = 1/qamNoiseVariance
-        // Since qamNoiseVariance = 2*pamNoiseVariance        
+        // Since qamNoiseVariance = 2*pamNoiseVariance
         // (minDist2 - minDist1)/(2*pamNoiseVariance) = (minDist2 - minDist1)/(qamNoiseVariance) = (minDist2 - minDist1)*noiseInv
         TCompute llr = ((pMinDist2[i] - minDist1) * noiseInv);
         // if(pSoftBits[i] < cuGet<TCompute>(0)) llr = -llr;
@@ -528,9 +530,9 @@ eqMmseCoefCompHighMimoKernel_v1(puschRxChEqStatDescr_t* pStatDescr, const puschR
     // processed by this thread block does not exist in the UE group
     const uint32_t PRB_IDX = blockIdx.y;
     const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];
-    
+
     cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
-    
+
     const uint16_t nPrb = drvdUeGrpPrms.nPrb;
     if(PRB_IDX >= nPrb) return;
 
@@ -912,7 +914,7 @@ eqMmseCoefCompHighMimoKernel_v2(puschRxChEqStatDescr_t* pStatDescr, const puschR
     // The grid is sized to process the max # of PRBs in a given heterogenous config. Exit if the PRB to be
     // processed by this thread block does not exist in the UE group
     const uint32_t PRB_IDX = blockIdx.y;
-    const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];    
+    const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];
 
     cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
 
@@ -1033,18 +1035,18 @@ eqMmseCoefCompHighMimoKernel_v2(puschRxChEqStatDescr_t* pStatDescr, const puschR
     const uint32_t N_ITER_TO_WR_C       = div_round_up(N_COLS_C, N_COLS_C_WR_PER_ITER);
 
 #ifdef ENABLE_DEBUG
- 
+
     if((0 == blockIdx.x) && (0 == blockIdx.y) && (0 == blockIdx.z) && (0 == threadIdx.x) && (0 == threadIdx.y) && (0 == threadIdx.z))
     {
         printf("Addr: tH %lp  tReeDiagInv %lp tCoef %lp\n", tH.addr, tReeDiagInv.addr, tCoef.addr);
- 
+
         printf("nPrb     : %d \n", nPrb);
         printf("tH          : addr %lp strides[0] %d strides[1] %d strides[2] %d strides[3] %d\n", static_cast<const TComplexStorageIn*>(tH.addr)     , tH.strides[0]         , tH.strides[1]         , tH.strides[2]         , tH.strides[3]         );
         printf("tReeDiagInv : addr %lp strides[0] %d strides[1] %d strides[2] %d strides[3] %d\n", static_cast<TStorageOut*>(tReeDiagInv.addr)        , tReeDiagInv.strides[0], tReeDiagInv.strides[1], tReeDiagInv.strides[2], tReeDiagInv.strides[3]);
         printf("tCoef       : addr %lp strides[0] %d strides[1] %d strides[2] %d strides[3] %d\n", static_cast<TComplexStorageOut*>(tCoef.addr)       , tCoef.strides[0]      , tCoef.strides[1]      , tCoef.strides[2]      , tCoef.strides[3]      );
         // printf("tDbg    strides[0] %d strides[1] %d strides[2] %d\n", tDbg.strides[0], tDbg.strides[1], tDbg.strides[2]);
     }
-#endif   
+#endif
 
     //--------------------------------------------------------------------------------------------------------
     // Shared memory allocation
@@ -1088,7 +1090,7 @@ eqMmseCoefCompHighMimoKernel_v2(puschRxChEqStatDescr_t* pStatDescr, const puschR
     auto& shRee = shLinv;
     auto& shC   = shF;
 
-    bool enableTdi = (0 != drvdUeGrpPrms.enablePuschTdi) ? true : false;    
+    bool enableTdi = (0 != drvdUeGrpPrms.enablePuschTdi) ? true : false;
 
     //--------------------------------------------------------------------------------------------------------
     // Stage1: Load inputs
@@ -1269,7 +1271,7 @@ eqMmseCoefCompHighMimoKernel_v2(puschRxChEqStatDescr_t* pStatDescr, const puschR
                 }
                 else {
                     tCoef(iCol, FREQ_IDX, ROW_IDX_C, PRB_IDX) =
-                        type_convert<TComplexStorageOut>(shC(ROW_IDX_C, iCol) * lambda);              
+                        type_convert<TComplexStorageOut>(shC(ROW_IDX_C, iCol) * lambda);
                 }
             }
         }
@@ -1330,7 +1332,7 @@ eqMmseCoefCompHighMimoKernel_v3(puschRxChEqStatDescr_t* pStatDescr, const puschR
     // The grid is sized to process the max # of PRBs in a given heterogenous config. Exit if the PRB to be
     // processed by this thread block does not exist in the UE group
     const uint32_t PRB_IDX = blockIdx.y;
-    const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];    
+    const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];
 
     cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
 
@@ -1460,8 +1462,8 @@ eqMmseCoefCompHighMimoKernel_v3(puschRxChEqStatDescr_t* pStatDescr, const puschR
 
     constexpr uint32_t N_SMEM_BLK1_ELEMS =
         ((N_ROWS_H + 1) * N_COLS_H * N_INST) * N_TONES_PER_ITER; // (N_ROWS_H + 1) for SMEM padding to avoid bank conflicts
-    
-    constexpr uint32_t N_SMEM_BLK2_ELEMS = 
+
+    constexpr uint32_t N_SMEM_BLK2_ELEMS =
         (N_ROWS_A + 1) * N_COLS_A * N_TONES_PER_ITER;
 
     // Two smem block, one for fp16 another for fp32
@@ -1785,7 +1787,7 @@ eqMmseCoefCompMassiveMimoKernel_v1(puschRxChEqStatDescr_t* pStatDescr, const __g
     // The grid is sized to process the max # of PRBs in a given heterogenous config. Exit if the PRB to be
     // processed by this thread block does not exist in the UE group
     const uint32_t PRB_IDX = blockIdx.y;
-    const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];    
+    const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];
 
     cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
 
@@ -1883,7 +1885,7 @@ eqMmseCoefCompMassiveMimoKernel_v1(puschRxChEqStatDescr_t* pStatDescr, const __g
     const uint32_t THRD_BLK_ABS_START_FREQ_IDX = PRB_IDX * CUPHY_N_TONES_PER_PRB;
 
     const uint32_t chEqTimeInstIdx = dynDescr.chEqTimeInstIdx;
-    
+
     // const uint32_t ROW_IDX_RWW = THREAD_IDX % N_ROWS_RWW;
     // const uint32_t COL_IDX_RWW = THREAD_IDX / N_ROWS_RWW; // COL_IDX_RWW needs a bounds check (since N_THREADS > # of Rww elements)
 
@@ -1911,12 +1913,12 @@ eqMmseCoefCompMassiveMimoKernel_v1(puschRxChEqStatDescr_t* pStatDescr, const __g
 
     // Shared memory contents as processing progresses:
     // A = [ G | I | M ] -> [ U | Linv | F ] -> [ U | Ree | C ]
-    
-    constexpr uint32_t N_SMEM_ELEMS = 
+
+    constexpr uint32_t N_SMEM_ELEMS =
         (((N_ROWS_H + 1) * N_COLS_H * N_INST) + // (N_ROWS_H + 1) for SMEM padding to avoid bank conflicts
          (N_ROWS_A + 1) * N_COLS_A) *
         N_TONES_PER_ITER;
-    
+
     typedef typename complex_from_scalar<TCompute>::type    TComplexCompute;
     typedef typename complex_from_scalar<TStorageIn>::type  TComplexStorageIn;
     typedef typename complex_from_scalar<TStorageOut>::type TComplexStorageOut;
@@ -2222,7 +2224,7 @@ eqLegacyMmseCoefCompLowMimoKernel(const puschRxChEqStatDescr_t* pStatDescr, cons
     // processed by this thread block does not exist in the UE group
     const uint32_t PRB_IDX = blockIdx.x;
     const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.y];
-    
+
     cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
 
     const uint16_t nPrb = drvdUeGrpPrms.nPrb;
@@ -2387,7 +2389,7 @@ eqLegacyMmseCoefCompLowMimoKernel(const puschRxChEqStatDescr_t* pStatDescr, cons
     auto& shDU = shG; // G and DU have the same dimension
 
     bool     enableCfoCorrection = (0 != drvdUeGrpPrms.enableCfoCorrection) ? true : false;
-    uint8_t* pUeGrpLayerToUeIdx  = drvdUeGrpPrms.ueGrpLayerToUeIdx;    
+    uint8_t* pUeGrpLayerToUeIdx  = drvdUeGrpPrms.ueGrpLayerToUeIdx;
     const uint16_t dmrsMaxLen = drvdUeGrpPrms.dmrsMaxLen;
 
     // Overlays on A: A = [I | M] -> [J | K] -> [Ree | C]
@@ -2413,14 +2415,14 @@ eqLegacyMmseCoefCompLowMimoKernel(const puschRxChEqStatDescr_t* pStatDescr, cons
      if((0 == blockIdx.x) && (0 == blockIdx.y) && (0 == blockIdx.z) && (0 == threadIdx.x) && (0 == threadIdx.y) && (0 == threadIdx.z))
      {
          printf("Addr: tH %lp tReeDiagInv %lp tCoef %lp\n", tH.addr, tReeDiagInv.addr, tCoef.addr);
-  
+
          printf("nPrb     : %d \n", nPrb);
          printf("tH          : addr %lp strides[0] %d strides[1] %d strides[2] %d strides[3] %d\n", static_cast<const TComplexStorageIn*>(tH.addr)     , tH.strides[0]         , tH.strides[1]         , tH.strides[2]         , tH.strides[3]         );
          printf("tReeDiagInv : addr %lp strides[0] %d strides[1] %d strides[2] %d strides[3] %d\n", static_cast<TStorageOut*>(tReeDiagInv.addr)        , tReeDiagInv.strides[0], tReeDiagInv.strides[1], tReeDiagInv.strides[2], tReeDiagInv.strides[3]);
          printf("tCoef       : addr %lp strides[0] %d strides[1] %d strides[2] %d strides[3] %d\n", static_cast<TComplexStorageOut*>(tCoef.addr)       , tCoef.strides[0]      , tCoef.strides[1]      , tCoef.strides[2]      , tCoef.strides[3]      );
          // printf("tDbg    strides[0] %d strides[1] %d strides[2] %d\n", tDbg.strides[0], tDbg.strides[1], tDbg.strides[2]);
      }
-#endif     
+#endif
 
     //--------------------------------------------------------------------------------------------------------
     // 1. Prefetch H into shared memory
@@ -2438,7 +2440,7 @@ eqLegacyMmseCoefCompLowMimoKernel(const puschRxChEqStatDescr_t* pStatDescr, cons
         block_2D<TComplexCompute*, N_ROWS_H + 1, N_COLS_H> shH(&smemBlk[SMEM_START_OFFSET_H]);
 
         if(COL_IDX_H < N_COLS_H)
-        {             
+        {
             // If needed, scale channel estimates by CFO correction
             if(enableCfoCorrection && (chEqTimeInstIdx > 0))
             {
@@ -2831,7 +2833,7 @@ eqMmseIrcCoefCompLowMimoKernel(const puschRxChEqStatDescr_t* pStatDescr, const p
     // processed by this thread block does not exist in the UE group
     const uint32_t PRB_IDX = blockIdx.x;
     const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.y];
-    
+
     cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
 
     const uint16_t nPrb = drvdUeGrpPrms.nPrb;
@@ -2982,7 +2984,7 @@ eqMmseIrcCoefCompLowMimoKernel(const puschRxChEqStatDescr_t* pStatDescr, const p
     auto& shDU = shG; // G and DU have the same dimension
 
     bool     enableCfoCorrection = (0 != drvdUeGrpPrms.enableCfoCorrection) ? true : false;
-    uint8_t* pUeGrpLayerToUeIdx  = drvdUeGrpPrms.ueGrpLayerToUeIdx;    
+    uint8_t* pUeGrpLayerToUeIdx  = drvdUeGrpPrms.ueGrpLayerToUeIdx;
     const uint16_t dmrsMaxLen = drvdUeGrpPrms.dmrsMaxLen;
 
     // Overlays on A: A = [I | M] -> [J | K] -> [Ree | C]
@@ -3345,7 +3347,7 @@ eqMmseCoefCompLowMimoKernel(const puschRxChEqStatDescr_t *pStatDescr, const __gr
     }
     else
     {
-        eqLegacyMmseCoefCompLowMimoKernel<TStorageIn, 
+        eqLegacyMmseCoefCompLowMimoKernel<TStorageIn,
                                          TStorageOut,
                                          TCompute,
                                          N_BS_ANTS,
@@ -3516,7 +3518,7 @@ __device__ void ch_eq_soft_demapper_tex(const int                               
 {
     // Only 1 thread performs soft demapping
     // TODO: Refactor calling kernel to have per-thread dot product + soft demapping
-    
+
     if(0 == PER_LAYER_THRD_IDX)
     {
         typedef soft_demapper::soft_demapper_any<TCompute, TStorageOut> soft_demapper_t;
@@ -3897,13 +3899,13 @@ eqMmseSoftDemapKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRx
         tensor_ref<TComplexCompute>         tDataEqDft  (drvdUeGrpPrms.tInfoDataEqDft.pAddr      , drvdUeGrpPrms.tInfoDataEqDft.strides); // (NF*ND)
         tDataEqDft(GMEM_ABS_WR_FREQ_IDX + DATA_SYMB_ABS_IDX*nPrb*CUPHY_N_TONES_PER_PRB) = softEst;
     }
-#ifdef ENABLE_DEBUG
+
     // FixMe update comments related to enableDebugEqOutput
     if (pStatDescr->enableDebugEqOutput) {
         // Pick one of the N_BS_ANTS threads to store the resulting soft estimate
         tDataEq(layerIdx, GMEM_ABS_WR_FREQ_IDX, DATA_SYMB_ABS_IDX) = type_convert<TComplexStorageOut>(softEst);
     }
-#endif
+
 } //eqMmseSoftDemapKernel_v4
 
 template <class FFT,
@@ -3914,14 +3916,14 @@ template <class FFT,
           uint16_t SYMBOL_BITMASK>
 __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr, puschRxChEqSoftDemapDynDescr_t* pDynDescr)
 {
-    puschRxChEqSoftDemapDynDescr_t& dynDescr = *(pDynDescr); 
+    puschRxChEqSoftDemapDynDescr_t& dynDescr = *(pDynDescr);
     const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];
     cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
     uint8_t  enableTfPrcd       = drvdUeGrpPrms.enableTfPrcd;
 
     if(enableTfPrcd!=1) return;
     if(blockIdx.x>=drvdUeGrpPrms.nDataSym) return;
-    
+
     uint8_t *dataSymLoc = drvdUeGrpPrms.dataSymLoc;
     if((SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK) || (SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
     {
@@ -3930,9 +3932,9 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
             return;
         }
     }
-    
+
     using namespace cufftdx;
-    uint8_t locBluesteinWorkspace = 0; 
+    uint8_t locBluesteinWorkspace = 0;
     uint16_t blue_fft_size = size_of<FFT>::value;
     uint16_t DFTSize = CUPHY_N_TONES_PER_PRB*drvdUeGrpPrms.nPrb;
     if(blue_fft_size==FFT128)
@@ -3987,7 +3989,7 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
     }
     else if(blue_fft_size==FFT512)
     {
-        if(DFTSize==144)  
+        if(DFTSize==144)
         {
             locBluesteinWorkspace = 9;
         }
@@ -4011,7 +4013,7 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
         {
             return;
         }
-    
+
     }
     else if(blue_fft_size==FFT1024)
     {
@@ -4047,7 +4049,7 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
         {
             return;
         }
-    
+
     }
     else if(blue_fft_size==FFT2048)
     {
@@ -4095,7 +4097,7 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
         {
             return;
         }
-    
+
     }
     else if(blue_fft_size==FFT4096)
     {
@@ -4203,23 +4205,23 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
     {
         return;
     }
-    
+
     puschRxChEqIdftStatDescr_t& idftStatDescr = *(pIdftStatDescr);
-    
+
     extern __shared__ unsigned char shared_mem[];
     typedef typename complex_from_scalar<TCompute>::type    TComplexCompute;
-    tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceTime  (idftStatDescr.tInfoDftBluesteinWorkspaceTime.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceTime.strides); 
-    tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceFreq  (idftStatDescr.tInfoDftBluesteinWorkspaceFreq.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceFreq.strides); 
+    tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceTime  (idftStatDescr.tInfoDftBluesteinWorkspaceTime.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceTime.strides);
+    tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceFreq  (idftStatDescr.tInfoDftBluesteinWorkspaceFreq.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceFreq.strides);
     tensor_ref<TComplexCompute>         tDataEqDft                  (drvdUeGrpPrms.tInfoDataEqDft.pAddr, drvdUeGrpPrms.tInfoDataEqDft.strides);                                 //(NF*ND)
-    
+
     using complex_type = typename FFT::value_type;
     const unsigned int stride = size_of<FFT>::value / FFT::elements_per_thread;
     complex_type input[FFT::storage_size];
-    
+
     assert(stride == FFT::max_threads_per_block);
 
     // SR - was Idft_1
-    
+
     int indexIn = threadIdx.x + DFTSize * blockIdx.x;
     int indexWorkspaceTime = threadIdx.x;
 
@@ -4237,7 +4239,7 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
 	input[i].y = 0.0f;
       }
     }
-    
+
     FFT().execute(input, shared_mem);
 
     int indexOut = threadIdx.x + size_of<FFT>::value * blockIdx.x;
@@ -4251,8 +4253,8 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
     FFT().execute(input, shared_mem);
 
     const double dftscale = 1.0/TCompute((size_of<FFT>::value)*sqrt(DFTSize));            // the compiler would do this just as well ... but looks cleaner this way.
-    
-    //////////////////////////////////////////////////////////////////////////////// 
+
+    ////////////////////////////////////////////////////////////////////////////////
     // We can limit the last loop to just max_meaningful_ept, other values are not needed.
     unsigned int max_meaningful_ept = (DFTSize + (stride - 1)) / stride;
     indexOut = threadIdx.x + DFTSize * blockIdx.x;
@@ -4278,7 +4280,7 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
       }
 
     }
-    
+
 }
 
 // Per PRB equalizer coefficient application fused with soft demap
@@ -4306,17 +4308,17 @@ eqMmseSoftDemapAfterDftKernel_v2(puschRxChEqStatDescr_t* pStatDescr, puschRxChEq
     // processed by this thread block does not exist in the UE group
     const uint32_t PRB_IDX  = blockIdx.x;
     const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];
-    
+
     cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
     const uint32_t N_LAYERS = drvdUeGrpPrms.nLayers;
 
     uint8_t  enableTfPrcd       = drvdUeGrpPrms.enableTfPrcd;
-    
+
     if(enableTfPrcd!=1) return;
 
     const uint16_t nPrb = drvdUeGrpPrms.nPrb;
     if(PRB_IDX >= nPrb) return;
-    
+
     const uint16_t nDataSym = drvdUeGrpPrms.nDataSym;
     const uint16_t dmrsMaxLen = drvdUeGrpPrms.dmrsMaxLen;
     const uint16_t nDmrsSym   = drvdUeGrpPrms.nDmrsSyms / dmrsMaxLen;
@@ -4330,7 +4332,7 @@ eqMmseSoftDemapAfterDftKernel_v2(puschRxChEqStatDescr_t* pStatDescr, puschRxChEq
     typedef typename complex_from_scalar<TStorageIn>::type  TComplexStorageIn;
     typedef typename complex_from_scalar<TStorageOut>::type TComplexStorageOut;
 
-    typedef typename std::conditional<std::is_same<TStorageOut, __half>::value, float2, float4>::type TLlr; 
+    typedef typename std::conditional<std::is_same<TStorageOut, __half>::value, float2, float4>::type TLlr;
     // static_assert(sizeof(TLlr) == sizeof(float4));
     bool enableTdi = (0 != drvdUeGrpPrms.enablePuschTdi) ? true : false;
     if((SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK) || (SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
@@ -4343,7 +4345,7 @@ eqMmseSoftDemapAfterDftKernel_v2(puschRxChEqStatDescr_t* pStatDescr, puschRxChEq
     tensor_ref<TStorageOut>             tLlr        (drvdUeGrpPrms.tInfoLLR.pAddr            , drvdUeGrpPrms.tInfoLLR.strides            ); // (N_LLR, N_LAYERS, NF, ND)
     tensor_ref<TComplexStorageOut>      tDbg        (drvdUeGrpPrms.tInfoChEqSoftDempDbg.pAddr, drvdUeGrpPrms.tInfoChEqSoftDempDbg.strides);
     // clang-format on
-    
+
 
     thread_block const& thisThrdBlk = this_thread_block();
 
@@ -4380,7 +4382,7 @@ eqMmseSoftDemapAfterDftKernel_v2(puschRxChEqStatDescr_t* pStatDescr, puschRxChEq
     const uint32_t DATA_SYMB_ABS_IDX       = DATA_SYMB_ABS_START_IDX + DATA_SYMB_IDX;
 
     if (DATA_SYMB_ABS_IDX >= nDataSym) return;
-    
+
     if((SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK) || (SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
     {
         if(!((SYMBOL_BITMASK>>dataSymLoc[DATA_SYMB_ABS_IDX])&1))
@@ -4408,7 +4410,7 @@ eqMmseSoftDemapAfterDftKernel_v2(puschRxChEqStatDescr_t* pStatDescr, puschRxChEq
 //        /////DFT for DFT-s-OFDM/////
 //        TComplexCompute softEst = cuGet<TComplexCompute>(0);
 //        uint32_t sizeDft = nPrb*CUPHY_N_TONES_PER_PRB;
-//        
+//
 //        for(uint32_t idxDft = 0; idxDft < sizeDft; idxDft++)
 //        {
 //            TComplexCompute coeffDft;
@@ -4418,8 +4420,8 @@ eqMmseSoftDemapAfterDftKernel_v2(puschRxChEqStatDescr_t* pStatDescr, puschRxChEq
 //        }
 //        softEst.x *= (TCompute)(1/sqrt(sizeDft));
 //        softEst.y *= (TCompute)(1/sqrt(sizeDft));
-        ////////////////////////////////////////////////    
-        
+        ////////////////////////////////////////////////
+
         if(pamBitLen == 0)
         {
             // for pi/2 BPSK (cuphy_api.h: qamModOrder Value: 2,4,6,8 if transform precoding is disabled; 1,2,4,6,8 if transform precoding is enabled)
@@ -4508,7 +4510,7 @@ eqMmseSoftDemapKernel_v3(puschRxChEqStatDescr_t* pStatDescr, const puschRxChEqSo
     typedef typename complex_from_scalar<TStorageIn>::type  TComplexStorageIn;
     typedef typename complex_from_scalar<TStorageOut>::type TComplexStorageOut;
 
-    typedef typename std::conditional<std::is_same<TStorageOut, __half>::value, float2, float4>::type TLlr; 
+    typedef typename std::conditional<std::is_same<TStorageOut, __half>::value, float2, float4>::type TLlr;
     // static_assert(sizeof(TLlr) == sizeof(float4));
 
     // clang-format off
@@ -4743,7 +4745,7 @@ template <typename TStorageIn,
           typename TStorageOut,
           typename TCompute,
           uint32_t N_BS_ANTS,            // # of BS antenna (# of cols of C matrix)
-          uint16_t SYMBOL_BITMASK>       
+          uint16_t SYMBOL_BITMASK>
 __launch_bounds__(CUPHY_N_TONES_PER_PRB * OFDM_SYMBOLS_PER_SLOT)
 __global__ void
 eqMmseSoftDemapKernel(puschRxChEqStatDescr_t *pStatDescr, const __grid_constant__ puschRxChEqSoftDemapDynDescr_t dynDescr)
@@ -4778,7 +4780,7 @@ eqMmseSoftDemapAfterDftKernel(puschRxChEqStatDescr_t* pStatDescr, puschRxChEqSof
                            blockDim.x, blockDim.y, blockDim.z,
                            N_BS_ANTS,
                            N_SYMBS_PER_THRD_BLK);
-                           
+
     eqMmseSoftDemapAfterDftKernel_v2<TStorageIn,
                                      TDataRx,
                                      TStorageOut,
@@ -4874,7 +4876,7 @@ puschRxChEq::eqMmseCoefCompMassiveMimo(uint16_t                     nPrb,
     kernelNodeParamsDriver.gridDimX = gridDim.x;
     kernelNodeParamsDriver.gridDimY = gridDim.y;
     kernelNodeParamsDriver.gridDimZ = gridDim.z;
-    
+
     kernelNodeParamsDriver.extra          = nullptr;
 
     kernelNodeParamsDriver.sharedMemBytes = 0;
@@ -4942,7 +4944,7 @@ puschRxChEq::eqMmseCoefCompHighMimo(uint16_t                     nPrb,
     kernelNodeParamsDriver.blockDimX = blockDim.x;
     kernelNodeParamsDriver.blockDimY = blockDim.y;
     kernelNodeParamsDriver.blockDimZ = blockDim.z;
-    
+
     kernelNodeParamsDriver.gridDimX = gridDim.x;
     kernelNodeParamsDriver.gridDimY = gridDim.y;
     kernelNodeParamsDriver.gridDimZ = gridDim.z;
@@ -4988,7 +4990,7 @@ puschRxChEq::eqMmseCoefCompLowMimo(uint16_t                     nPrb,
                                                                            N_BS_ANTS,
                                                                            N_LAYERS,
                                                                            N_FREQ_BINS_PER_ITER>);
-    
+
     CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = launchCfg.kernelNodeParamsDriver;
     {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
 
@@ -5000,7 +5002,7 @@ puschRxChEq::eqMmseCoefCompLowMimo(uint16_t                     nPrb,
     kernelNodeParamsDriver.blockDimX = blockDim.x;
     kernelNodeParamsDriver.blockDimY = blockDim.y;
     kernelNodeParamsDriver.blockDimZ = blockDim.z;
-    
+
     kernelNodeParamsDriver.gridDimX = gridDim.x;
     kernelNodeParamsDriver.gridDimY = gridDim.y;
     kernelNodeParamsDriver.gridDimZ = gridDim.z;
@@ -5084,7 +5086,7 @@ puschRxChEq::eqMmseSoftDemap(uint8_t                      Nd,
                              cuphyPuschRxChEqLaunchCfg_t& launchCfg)
 {
     CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = launchCfg.kernelNodeParamsDriver;
-    
+
     if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)
     {
         static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK;
@@ -5128,7 +5130,7 @@ puschRxChEq::eqMmseSoftDemap(uint8_t                      Nd,
     kernelNodeParamsDriver.blockDimX = blockDim.x;
     kernelNodeParamsDriver.blockDimY = blockDim.y;
     kernelNodeParamsDriver.blockDimZ = blockDim.z;
-    
+
     kernelNodeParamsDriver.gridDimX = gridDim.x;
     kernelNodeParamsDriver.gridDimY = gridDim.y;
     kernelNodeParamsDriver.gridDimZ = gridDim.z;
@@ -5141,39 +5143,39 @@ template <typename TStorageIn,
           typename TDataRx,
           typename TStorageOut,
           typename TCompute,
-          unsigned int FftSize, 
+          unsigned int FftSize,
           uint Arch>
 void* getIdftFFT(uint16_t symbolBitmask, dim3& block_dim, uint& shared_memory_size)
 {
     using namespace cufftdx;
-    
+
     using FFT = decltype(Size<FftSize>() + Precision<float>() + Type<fft_type::c2c>()
                         + Direction<fft_direction::inverse>() + FFTsPerBlock<1>()
                         + ElementsPerThread<16>() + SM<Arch>() + Block());
-                                  
+
     block_dim = FFT::block_dim;
-    
+
     shared_memory_size = FFT::shared_memory_size;
-    
+
 #ifdef ENABLE_DEBUG
     NVLOGI_FMT(NVLOG_PUSCH, "{}: workspace[{}]FFT::max_threads_per_block[{}][{} {} {}]FFT::storage_size[{}]FFT::elements_per_thread[{}]grid_dim[{} {} {}]", __FUNCTION__, (int)FFT::requires_workspace, FFT::max_threads_per_block, block_dim.x, block_dim.y, block_dim.z, FFT::storage_size, FFT::elements_per_thread, grid_dim.x, grid_dim.y, grid_dim.z);
 #endif
     if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK)
-    {   
+    {
         static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK;
         return reinterpret_cast<void*>(bluestein_Idft_kernel<FFT, TStorageIn, TDataRx, TStorageOut, TCompute, SYMBOL_BITMASK>);
     }
     else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS)
-    {   
+    {
         static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS;
         return reinterpret_cast<void*>(bluestein_Idft_kernel<FFT, TStorageIn, TDataRx, TStorageOut, TCompute, SYMBOL_BITMASK>);
     }
     else //if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)
-    {   
+    {
         static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK;
         return reinterpret_cast<void*>(bluestein_Idft_kernel<FFT, TStorageIn, TDataRx, TStorageOut, TCompute, SYMBOL_BITMASK>);
     }
-    
+
 }
 
 template <typename TStorageIn,
@@ -5183,7 +5185,7 @@ template <typename TStorageIn,
 void puschRxChEq::eqMmseSoftDemapIdft(uint8_t                      Nd,
                                       uint16_t                     nPrb,
                                       uint16_t                     nUeGrps,
-                                      uint16_t                     symbolBitmask, 
+                                      uint16_t                     symbolBitmask,
                                       uint                         cudaDeviceArch,
                                       cuphyPuschRxChEqLaunchCfg_t& launchCfg)
 {
@@ -5218,7 +5220,7 @@ void puschRxChEq::eqMmseSoftDemapIdft(uint8_t                      Nd,
         case 800:
             selectFftAndKernel(std::integral_constant<uint, 800>{});
             break;
-        case 900: 
+        case 900:
             selectFftAndKernel(std::integral_constant<uint, 900>{});
             break;
         case 1000:
@@ -5238,6 +5240,12 @@ void puschRxChEq::eqMmseSoftDemapIdft(uint8_t                      Nd,
     if(kernelPtr)
     {
         {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&launchCfg.kernelNodeParamsDriver.func, kernelPtr));}
+        
+        if(shared_memory_size > SHARED_MEMORY_SIZE_LIMIT)
+        {
+            CU_CHECK(cuFuncSetAttribute(launchCfg.kernelNodeParamsDriver.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_memory_size));
+        }
+        
         launchCfg.kernelNodeParamsDriver.blockDimX = block_dim.x;
         launchCfg.kernelNodeParamsDriver.blockDimY = block_dim.y;
         launchCfg.kernelNodeParamsDriver.blockDimZ = block_dim.z;
@@ -5305,7 +5313,7 @@ void puschRxChEq::eqMmseSoftDemapAfterDft(uint8_t                      Nd,
     kernelNodeParamsDriver.blockDimX = blockDim.x;
     kernelNodeParamsDriver.blockDimY = blockDim.y;
     kernelNodeParamsDriver.blockDimZ = blockDim.z;
-    
+
     kernelNodeParamsDriver.gridDimX = gridDim.x;
     kernelNodeParamsDriver.gridDimY = gridDim.y;
     kernelNodeParamsDriver.gridDimZ = gridDim.z;
@@ -5343,7 +5351,7 @@ puschRxChEq::eqMmseSoftDemap_64R(uint8_t                      Nd,
     kernelNodeParamsDriver.blockDimX = blockDim.x;
     kernelNodeParamsDriver.blockDimY = blockDim.y;
     kernelNodeParamsDriver.blockDimZ = blockDim.z;
-    
+
     kernelNodeParamsDriver.gridDimX = gridDim.x;
     kernelNodeParamsDriver.gridDimY = gridDim.y;
     kernelNodeParamsDriver.gridDimZ = gridDim.z;
@@ -5367,7 +5375,7 @@ void puschRxChEq::coefCompKernelSelectL0(uint16_t                     nBSAnts,
         // nBSAnts == 8
         case 8: {
             constexpr uint32_t N_BS_ANTS = 8; // # of BS antenna (# of rows in H matrix)
-            
+
             switch(nLayers)
             {
             // nLayers == 8
@@ -5461,7 +5469,7 @@ void puschRxChEq::coefCompKernelSelectL0(uint16_t                     nBSAnts,
         // nBSAnts == 7
         case 7: {
             constexpr uint32_t N_BS_ANTS = 7; // # of BS antenna (# of rows in H matrix)
-            
+
             switch(nLayers)
             {
             // nLayers == 7
@@ -5542,11 +5550,11 @@ void puschRxChEq::coefCompKernelSelectL0(uint16_t                     nBSAnts,
 
             break;
         }
-        
+
         // nBSAnts == 6
         case 6: {
             constexpr uint32_t N_BS_ANTS = 6; // # of BS antenna (# of rows in H matrix)
-            
+
             switch(nLayers)
             {
             // nLayers == 6
@@ -5617,11 +5625,11 @@ void puschRxChEq::coefCompKernelSelectL0(uint16_t                     nBSAnts,
 
             break;
         }
-        
+
         // nBSAnts == 5
         case 5: {
             constexpr uint32_t N_BS_ANTS = 5; // # of BS antenna (# of rows in H matrix)
-            
+
             switch(nLayers)
             {
             // nLayers == 5
@@ -5682,7 +5690,7 @@ void puschRxChEq::coefCompKernelSelectL0(uint16_t                     nBSAnts,
 
             break;
         }
-        
+
 
         // nBSAnts == 4
         case 4: {
@@ -5741,7 +5749,7 @@ void puschRxChEq::coefCompKernelSelectL0(uint16_t                     nBSAnts,
 
             break;
         }
-        
+
         // nBSAnts == 3
         case 3: {
             constexpr uint32_t N_BS_ANTS = 3; // # of BS antenna (# of rows in H matrix)
@@ -6074,7 +6082,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
         break;
     }
-    
+
     // nBsAnts == 7
     case 7: {
         constexpr uint32_t N_BS_ANTS = 7; // # of BS antenna (# of rows in H matrix)
@@ -6086,7 +6094,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
         break;
     }
-    
+
     // nBsAnts == 6
     case 6: {
         constexpr uint32_t N_BS_ANTS = 6; // # of BS antenna (# of rows in H matrix)
@@ -6098,7 +6106,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
         break;
     }
-    
+
     // nBsAnts == 5
     case 5: {
         constexpr uint32_t N_BS_ANTS = 5; // # of BS antenna (# of rows in H matrix)
@@ -6122,7 +6130,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
         break;
     }
-    
+
     // nBsAnts == 3
     case 3: {
         constexpr uint32_t N_BS_ANTS = 3; // # of BS antenna (# of rows in H matrix)
@@ -6173,7 +6181,7 @@ void puschRxChEq::softDemapIdftKernelSelectL0( uint8_t                      Nd,
                                                uint16_t                     nPrb,
                                                uint16_t                     nUeGrps,
                                                uint16_t                     symbolBitmask,
-                                               uint                         cudaDeviceArch,   
+                                               uint                         cudaDeviceArch,
                                                cuphyPuschRxChEqLaunchCfg_t& launchCfg)
 {
     eqMmseSoftDemapIdft<TStorageIn,
@@ -6323,7 +6331,7 @@ void puschRxChEq::coefCompKernelSelectL1(uint16_t                     nBSAnts,
                                          uint8_t                      nLayers,
                                          uint16_t                     nPrb,
                                          uint16_t                     nUeGrps,
-                                         cuphyDataType_t              hEstType,                                         
+                                         cuphyDataType_t              hEstType,
                                          cuphyDataType_t              coefType,
                                          cuphyPuschRxChEqLaunchCfg_t& launchCfg)
 {
@@ -6351,7 +6359,7 @@ void puschRxChEq::coefCompKernelSelectL1(uint16_t                     nBSAnts,
                                                                         nUeGrps,
                                                                         launchCfg);
         }
-#endif        
+#endif
         else
         {
             NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (1)", __FUNCTION__);
@@ -6378,7 +6386,7 @@ void puschRxChEq::coefCompKernelSelectL1(uint16_t                     nBSAnts,
                                                                   nUeGrps,
                                                                   launchCfg);
     }
-#endif    
+#endif
     else
     {
         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (2)", __FUNCTION__);
@@ -6413,7 +6421,7 @@ void puschRxChEq::softDemapKernelSelectL1(uint16_t                     nBSAnts,
                                                                                 nUeGrps,
                                                                                 symbolBitmask,
                                                                                 launchCfg);
-        }        
+        }
 #ifdef ASIM_CUPHY_FP32
         else if(CUPHY_C_32F == dataRxType)
         {
@@ -6435,7 +6443,7 @@ void puschRxChEq::softDemapKernelSelectL1(uint16_t                     nBSAnts,
                 NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (1)", __FUNCTION__);
             }
         }
-#endif        
+#endif
         else
         {
             NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (2)", __FUNCTION__);
@@ -6457,7 +6465,7 @@ void puschRxChEq::softDemapKernelSelectL1(uint16_t                     nBSAnts,
                                                                             symbolBitmask,
                                                                             launchCfg);
     }
-#endif    
+#endif
     else
     {
         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (3)", __FUNCTION__);
@@ -6470,7 +6478,7 @@ void puschRxChEq::softDemapIdftKernelSelectL1(uint8_t                      Nd,
                                               uint16_t                     nPrb,
                                               uint16_t                     nUeGrps,
                                               uint16_t                     symbolBitmask,
-                                              uint                         cudaDeviceArch,   
+                                              uint                         cudaDeviceArch,
                                               cuphyDataType_t              coefType,
                                               cuphyDataType_t              dataRxType,
                                               cuphyDataType_t              llrType,
@@ -6487,7 +6495,7 @@ void puschRxChEq::softDemapIdftKernelSelectL1(uint8_t                      Nd,
             using TDataRx     = scalar_from_complex<data_type_traits<CUPHY_C_16F>::type>::type;
             using TStorageOut = scalar_from_complex<data_type_traits<CUPHY_C_16F>::type>::type;
             softDemapIdftKernelSelectL0<TStorageIn, TDataRx, TStorageOut, TCompute>(Nd, nPrb, nUeGrps, symbolBitmask, cudaDeviceArch, launchCfg);
-        }        
+        }
 #if 0  // Disabling unused types to reduce compile time
         else if(CUPHY_C_32F == dataRxType)
         {
@@ -6515,7 +6523,7 @@ void puschRxChEq::softDemapIdftKernelSelectL1(uint8_t                      Nd,
             using TStorageOut = scalar_from_complex<data_type_traits<CUPHY_C_32F>::type>::type;
             softDemapIdftKernelSelectL0<TStorageIn, TDataRx, TStorageOut, TCompute>(Nd, nPrb, nUeGrps, symbolBitmask, cudaDeviceArch, launchCfg);
         }
-#endif        
+#endif
         else
         {
             NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (2)", __FUNCTION__);
@@ -6531,7 +6539,7 @@ void puschRxChEq::softDemapIdftKernelSelectL1(uint8_t                      Nd,
 
         softDemapIdftKernelSelectL0<TStorageIn, TDataRx, TStorageOut, TCompute>(Nd, nPrb, nUeGrps, symbolBitmask, cudaDeviceArch, launchCfg);
     }
-#endif    
+#endif
     else
     {
         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (3)", __FUNCTION__);
@@ -6566,7 +6574,7 @@ void puschRxChEq::softDemapAfterDftKernelSelectL1(uint16_t                     n
                                                                                 nUeGrps,
                                                                                 symbolBitmask,
                                                                                 launchCfg);
-        }        
+        }
 #if 0  // Disabling unused types to reduce compile time
         else if(CUPHY_C_32F == dataRxType)
         {
@@ -6612,7 +6620,7 @@ void puschRxChEq::softDemapAfterDftKernelSelectL1(uint16_t                     n
                                                                                 symbolBitmask,
                                                                                 launchCfg);
         }
-#endif        
+#endif
         else
         {
             NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (2)", __FUNCTION__);
@@ -6634,7 +6642,7 @@ void puschRxChEq::softDemapAfterDftKernelSelectL1(uint16_t                     n
                                                                             symbolBitmask,
                                                                             launchCfg);
     }
-#endif    
+#endif
     else
     {
         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type (3)", __FUNCTION__);
@@ -6642,7 +6650,7 @@ void puschRxChEq::softDemapAfterDftKernelSelectL1(uint16_t                     n
 } // puschRxChEq::softDemapAfterDftKernelSelectL1
 //#endif
 
-template <class FFT, typename TCompute> 
+template <class FFT, typename TCompute>
 __global__ void bluestein_workspace_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr)
 {
     using namespace cufftdx;
@@ -6699,37 +6707,37 @@ __global__ void bluestein_workspace_kernel(puschRxChEqIdftStatDescr_t* pIdftStat
     // static uint16_t dft_cache = 0;
 
     // if the size of the cached tDftBluesteinWorkspaceTime/Freq is correct, then don't bother re-generating.
-    // if ( DFTSize != dft_cache ) 
+    // if ( DFTSize != dft_cache )
     {
-      
+
       extern __shared__ unsigned char shared_mem[];
-      
+
       typedef typename complex_from_scalar<TCompute>::type    TComplexCompute;
-      tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceTime  (idftStatDescr.tInfoDftBluesteinWorkspaceTime.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceTime.strides); 
-      tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceFreq  (idftStatDescr.tInfoDftBluesteinWorkspaceFreq.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceFreq.strides); 
-            
+      tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceTime  (idftStatDescr.tInfoDftBluesteinWorkspaceTime.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceTime.strides);
+      tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceFreq  (idftStatDescr.tInfoDftBluesteinWorkspaceFreq.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceFreq.strides);
+
       /////////////////////////////blue workspace/////////////////////////////////////////////////////////////////////////////
       using blue_complex_type = typename FFT::value_type;
-      
+
       blue_complex_type input[FFT::storage_size];
-      
+
       // Generate w_time signal and store
       const unsigned int stride        = blue_fft_size / FFT::elements_per_thread;
       unsigned int       index         = threadIdx.x;
       unsigned int       compute_index = index;
-      
+
       for (unsigned int i = 0; i < FFT::elements_per_thread; i++) {
-	
+
 	if (index >= DFTSize) {
 	  compute_index = blue_fft_size - index;
         }
-	
+
         blue_complex_type b_n = {0, 0};
-	
+
         if (compute_index < DFTSize) {
 	  // SR - the only reason to perform modulus here is to prevent a very large theta from reducing the accuracy of the subsequent sin and cos.
 	  //      it doesn't seem to get THAT large - so removing since costly.  takes the kernel time (TVnr_7541) from 10us to 12us.
-	  
+
 	  const float theta = M_PI/DFTSize * ((compute_index * compute_index));  // % (2 * DFTSize));
 	  b_n.x              = __cosf(theta); // SR - ensure that hardware intrinsics are being used.
 	  b_n.y              = __sinf(theta); //      switching from (double precision) to (single precision plus intrinsics) dropped time from 18 us to 10 us.
@@ -6741,17 +6749,17 @@ __global__ void bluestein_workspace_kernel(puschRxChEqIdftStatDescr_t* pIdftStat
         index += stride;
         compute_index = index;
       }
-      
+
       // Calculate w_freq
       FFT().execute(input, shared_mem);
-      
+
       // Store w_freq
       index = threadIdx.x;
       for (unsigned int i = 0; i < FFT::elements_per_thread; i++) {
-	tDftBluesteinWorkspaceFreq(locBluesteinWorkspace, index) = (TComplexCompute){TCompute(input[i].x), TCompute(input[i].y)}; 
+	tDftBluesteinWorkspaceFreq(locBluesteinWorkspace, index) = (TComplexCompute){TCompute(input[i].x), TCompute(input[i].y)};
 	index += stride;
       }
-      
+
       // dft_cache = DFTSize;
 
     }  // if ( DFTSize != dft_cache ) {
@@ -6759,24 +6767,24 @@ __global__ void bluestein_workspace_kernel(puschRxChEqIdftStatDescr_t* pIdftStat
 }
 
 template <typename TCompute,
-          unsigned int FftSize, 
+          unsigned int FftSize,
           uint Arch>
 void* getBluesteinWorkspaceFFT(dim3& block_dim, uint& shared_memory_size)
 {
     using namespace cufftdx;
-    
+
     using FFT = decltype(Size<FftSize>() + Precision<float>() + Type<fft_type::c2c>()
                         + Direction<fft_direction::inverse>() + FFTsPerBlock<1>()
                         + ElementsPerThread<16>() + SM<Arch>() + Block());
-                                  
+
     block_dim = FFT::block_dim;
-    
+
     shared_memory_size = FFT::shared_memory_size;
-    
+
 #ifdef ENABLE_DEBUG
-    NVLOGI_FMT(NVLOG_PUSCH, "{}: workspace[{}]FFT::max_threads_per_block[{}][{} {} {}]FFT::storage_size[{}]FFT::elements_per_thread[{}]grid_dim[{} {} {}]", __FUNCTION__, (int)FFT::requires_workspace, FFT::max_threads_per_block, block_dim.x, block_dim.y, block_dim.z, FFT::storage_size, FFT::elements_per_thread, grid_dim.x, grid_dim.y, grid_dim.z);
+    NVLOGC_FMT(NVLOG_PUSCH, "{}: FFT size {} workspace[{}]FFT::max_threads_per_block[{}][{} {} {}]FFT::storage_size[{}]FFT::shared_memory_size {} FFT::elements_per_thread[{}]", __FUNCTION__, FftSize, (int)FFT::requires_workspace, FFT::max_threads_per_block, block_dim.x, block_dim.y, block_dim.z, FFT::storage_size, FFT::shared_memory_size, FFT::elements_per_thread);
 #endif
-    
+
     return reinterpret_cast<void*>(bluestein_workspace_kernel<FFT, TCompute>);
 }
 
@@ -6806,7 +6814,7 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
         for(auto& kernelArgs : m_coefCompKernelArgsArr[chEqTimeInstIdx])
         {
             kernelArgs.pStatDescr = static_cast<puschRxChEqStatDescr_t*>(ppStatDescrsGpu[chEqTimeInstIdx]);
-        }        
+        }
 
         if(enableCpuToGpuDescrAsyncCpy)
         {
@@ -6824,22 +6832,22 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
         }
     }
     m_softDemapHetCfgVec.fill({CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0}});
-    
+
     if(enableDftSOfdm==1)
     {
-    
+
         puschRxChEqIdftStatDescr_t& idftStatDescrCpu = *(static_cast<puschRxChEqIdftStatDescr_t*>(ppIdftStatDescrsCpu[0]));
         idftStatDescrCpu.tInfoDftBluesteinWorkspaceTime = tInfoDftBluesteinWorkspaceTime;
         idftStatDescrCpu.tInfoDftBluesteinWorkspaceFreq = tInfoDftBluesteinWorkspaceFreq;
 
         for(int32_t idx = 0; idx < 2; ++idx)
-        {   
+        {
             for(auto& kernelArgs : m_softDemapIdftKernelArgsArr[idx])
             {
                 kernelArgs.pStatDescr     = static_cast<puschRxChEqStatDescr_t*>(ppStatDescrsGpu[0]);
                 kernelArgs.pIdftStatDescr = static_cast<puschRxChEqIdftStatDescr_t*>(ppIdftStatDescrsGpu[0]);
             }
-        
+
             for(auto& kernelArgs : m_softDemapAfterDftKernelArgsArr[idx])
             {
                 kernelArgs.pStatDescr = static_cast<puschRxChEqStatDescr_t*>(ppStatDescrsGpu[0]);
@@ -6848,12 +6856,12 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
 
         CUDA_CHECK(cudaMemcpyAsync(ppIdftStatDescrsGpu[0], ppIdftStatDescrsCpu[0], sizeof(puschRxChEqIdftStatDescr_t), cudaMemcpyHostToDevice, strm));
         cudaStreamSynchronize(strm);
-        
+
         using TCompute = float;
         void *kernelArgs[1] = {(void *)&(m_softDemapIdftKernelArgsArr[0][0].pIdftStatDescr)};
         dim3  block_dim;
         uint  shared_memory_size;
-          
+
         std::map<int, dim3> fftConfigs = {
             {FFT128,  dim3(5, 1, 1)},
             {FFT256,  dim3(4, 1, 1)},
@@ -6888,8 +6896,17 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
                     NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: cudaDeviceArch {} is not supported", __FUNCTION__, cudaDeviceArch);
                     return CUPHY_STATUS_INTERNAL_ERROR;
             }
-            cudaError_t err = cudaLaunchKernel(reinterpret_cast<void*>(kernelPtr), 
-                                            fftConfigs[fftSize], block_dim, 
+            
+            
+            if(shared_memory_size > SHARED_MEMORY_SIZE_LIMIT)
+            {
+                CUfunction driverFunc;
+                {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&driverFunc, kernelPtr));}
+                CU_CHECK(cuFuncSetAttribute(driverFunc, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_memory_size));
+            }
+            
+            cudaError_t err = cudaLaunchKernel(reinterpret_cast<void*>(kernelPtr),
+                                            fftConfigs[fftSize], block_dim,
                                             (void**)(kernelArgs), shared_memory_size, strm);
             if(cudaSuccess != err) {
                 NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: The failure of cudaLaunchKernel for bluestein_workspace_kernel() FFT{}", __FUNCTION__, fftSize);
@@ -6906,11 +6923,11 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
         if (launchFftKernel(std::integral_constant<int, FFT2048>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
         if (launchFftKernel(std::integral_constant<int, FFT4096>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
         if (launchFftKernel(std::integral_constant<int, FFT8192>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
-        
+
         m_softDemapIdftHetCfgVec.fill({CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0}});
-        m_softDemapAfterDftHetCfgVec.fill({CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0}}); 
+        m_softDemapAfterDftHetCfgVec.fill({CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0}});
     }
-    
+
     return CUPHY_STATUS_SUCCESS;
 }
 
@@ -6926,7 +6943,7 @@ void puschRxChEq::getDescrInfo(size_t& statDescrSizeBytes,
 {
     statDescrSizeBytes  = sizeof(puschRxChEqStatDescr_t);
     statDescrAlignBytes = alignof(puschRxChEqStatDescr_t);
-    
+
     idftStatDescrSizeBytes  = sizeof(puschRxChEqIdftStatDescr_t);
     idftStatDescrAlignBytes = alignof(puschRxChEqIdftStatDescr_t);
 
@@ -6960,7 +6977,7 @@ cuphyStatus_t puschRxChEq::batchEqCoefComp(uint32_t                          chE
             }
         }
 
-        // Exhausted all heterogenous configs possible 
+        // Exhausted all heterogenous configs possible
         if(hetCfgs.size() == hetCfgIdx) hetCfgIdx = -1;
     };
 #else
@@ -6968,7 +6985,7 @@ cuphyStatus_t puschRxChEq::batchEqCoefComp(uint32_t                          chE
 #endif
 
     // Initialize the batch config data structure
-    puschRxChEqCoefCompHetCfgVec_t& hetCfgs = m_coefCompHetCfgsVecArr[chEqTimeInstIdx];        
+    puschRxChEqCoefCompHetCfgVec_t& hetCfgs = m_coefCompHetCfgsVecArr[chEqTimeInstIdx];
     std::fill(hetCfgs.begin(), hetCfgs.end(), puschRxChEqCoefCompHetCfg_t{nullptr, 0, 0});
 
 #ifdef ENABLE_DEBUG
@@ -7165,7 +7182,7 @@ cuphyStatus_t puschRxChEq::setupCoefCompute(cuphyPuschRxUeGrpPrms_t*      pDrvdU
         {
             // Skip rest of the setup if there are no UE groups corresponding to the channel equalizer instance and hetCfg
             if(0 == m_coefCompHetCfgsVecArr[chEqTimeInstIdx][hetCfgIdx].nUeGrps) continue;
-            
+
             // Setup descriptor in CPU memory
             puschRxChEqCoefCompDynDescr_t&  dynDescr    = dynDescrVecCpu[hetCfgIdx];
             puschRxChEqCoefCompHetCfg_t const& hetCfg   = m_coefCompHetCfgsVecArr[chEqTimeInstIdx][hetCfgIdx];
@@ -7185,7 +7202,7 @@ cuphyStatus_t puschRxChEq::setupCoefCompute(cuphyPuschRxUeGrpPrms_t*      pDrvdU
 
             // TODO: Optimize function to determine kernel selection and launch geometry separately
             int32_t ueGrpIdx = dynDescr.hetCfgUeGrpMap[0];
-            cuphyPuschRxUeGrpPrms_t const& drvdUeGrpPrms = pDrvdUeGrpPrmsCpu[ueGrpIdx];                
+            cuphyPuschRxUeGrpPrms_t const& drvdUeGrpPrms = pDrvdUeGrpPrmsCpu[ueGrpIdx];
             coefCompKernelSelectL1(drvdUeGrpPrms.nRxAnt,
                                    drvdUeGrpPrms.nLayers,
                                    hetCfg.nMaxPrb,
@@ -7198,9 +7215,9 @@ cuphyStatus_t puschRxChEq::setupCoefCompute(cuphyPuschRxUeGrpPrms_t*      pDrvdU
             {
                NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Kernel function mismatch", __FUNCTION__);
                return CUPHY_STATUS_INTERNAL_ERROR;
-            }                                   
+            }
 
-            kernelArgs.pDynDescr    = &dynDescrVecGpu[hetCfgIdx];            
+            kernelArgs.pDynDescr    = &dynDescrVecGpu[hetCfgIdx];
             launchCfg.kernelArgs[0] = &kernelArgs.pStatDescr;
             launchCfg.kernelArgs[1] = &dynDescr;
 
@@ -7231,26 +7248,26 @@ cuphyStatus_t puschRxChEq::batchEqSoftDemap(cuphyPuschRxUeGrpPrms_t*           p
                 break;
             }
         }
-        
-         // Exhausted all heterogenous configs possible 
+
+         // Exhausted all heterogenous configs possible
          if(hetCfgs.size() == hetCfgIdx) hetCfgIdx = -1;
     };
 #else
     m_chEqSoftDmpHashTable.clear();
 #endif
 
-    // Initialize the batch config data structure    
+    // Initialize the batch config data structure
     puschRxChEqSoftDemapHetCfgVec_t& hetCfgs = (symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK) ? m_softDemapHetCfgVec[0]:m_softDemapHetCfgVec[1];
     std::fill(hetCfgs.begin(), hetCfgs.end(), puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0});
 
 #if 0
-    // Debug code to initialize hetCfgUeGrpMap with -1s   
+    // Debug code to initialize hetCfgUeGrpMap with -1s
     for(puschRxChEqSoftDemapDynDescr_t& dynDescrCpu : dynDescrVecCpu)
     {
         std::fill(std::begin(dynDescrCpu.hetCfgUeGrpMap), std::end(dynDescrCpu.hetCfgUeGrpMap), -1);
     }
-#endif    
-    
+#endif
+
 
 #ifdef ENABLE_DEBUG
     NVLOGI_FMT(NVLOG_PUSCH, "{}: # of UE groups {}", __FUNCTION__, nUeGrps);
@@ -7420,7 +7437,7 @@ cuphyStatus_t puschRxChEq::batchEqSoftDemap(cuphyPuschRxUeGrpPrms_t*           p
 cuphyStatus_t puschRxChEq::batchEqSoftDemapIdft(cuphyPuschRxUeGrpPrms_t*           pDrvdUeGrpPrms,
                                                 uint16_t                           nUeGrps,
                                                 uint16_t                           symbolBitmask,
-                                                uint                               cudaDeviceArch,   
+                                                uint                               cudaDeviceArch,
                                                 uint32_t&                          nHetCfgs,
                                                 puschRxChEqSoftDemapDynDescrVec_t& dynDescrVecCpu)
 {
@@ -7439,26 +7456,26 @@ cuphyStatus_t puschRxChEq::batchEqSoftDemapIdft(cuphyPuschRxUeGrpPrms_t*        
                 break;
             }
         }
-        
-         // Exhausted all heterogenous configs possible 
+
+         // Exhausted all heterogenous configs possible
          if(hetCfgs.size() == hetCfgIdx) hetCfgIdx = -1;
     };
 #else
     m_chEqSoftDmpHashTable.clear();
 #endif
 
-    // Initialize the batch config data structure    
+    // Initialize the batch config data structure
     puschRxChEqSoftDemapHetCfgVec_t& hetCfgs = (symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK) ? m_softDemapIdftHetCfgVec[0]:m_softDemapIdftHetCfgVec[1];
     std::fill(hetCfgs.begin(), hetCfgs.end(), puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0});
 
 #if 0
-    // Debug code to initialize hetCfgUeGrpMap with -1s   
+    // Debug code to initialize hetCfgUeGrpMap with -1s
     for(puschRxChEqSoftDemapDynDescr_t& dynDescrCpu : dynDescrVecCpu)
     {
         std::fill(std::begin(dynDescrCpu.hetCfgUeGrpMap), std::end(dynDescrCpu.hetCfgUeGrpMap), -1);
     }
-#endif    
-    
+#endif
+
 
 #ifdef ENABLE_DEBUG
     NVLOGI_FMT(NVLOG_PUSCH, "{}: # of UE groups {}", __FUNCTION__, nUeGrps);
@@ -7487,7 +7504,7 @@ cuphyStatus_t puschRxChEq::batchEqSoftDemapIdft(cuphyPuschRxUeGrpPrms_t*        
         // Check if the heterognous configuration already exists
         int32_t hetCfgIdx = 0;
         findKernelFunc(hetCfgs, launchCfg.kernelNodeParamsDriver.func, hetCfgIdx);
-        
+
         // If a heterogenous configuration already exists then increment the # of UE groups for that config
         if(-1 != hetCfgIdx)
         {
@@ -7613,26 +7630,26 @@ cuphyStatus_t puschRxChEq::batchEqSoftDemapAfterDft(cuphyPuschRxUeGrpPrms_t*    
                 break;
             }
         }
-        
-         // Exhausted all heterogenous configs possible 
+
+         // Exhausted all heterogenous configs possible
          if(hetCfgs.size() == hetCfgIdx) hetCfgIdx = -1;
     };
 #else
     m_chEqSoftDmpHashTable.clear();
 #endif
 
-    // Initialize the batch config data structure    
+    // Initialize the batch config data structure
     puschRxChEqSoftDemapHetCfgVec_t& hetCfgs = (symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK) ? m_softDemapAfterDftHetCfgVec[0]:m_softDemapAfterDftHetCfgVec[1];
     std::fill(hetCfgs.begin(), hetCfgs.end(), puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0});
 
 #if 0
-    // Debug code to initialize hetCfgUeGrpMap with -1s   
+    // Debug code to initialize hetCfgUeGrpMap with -1s
     for(puschRxChEqSoftDemapDynDescr_t& dynDescrCpu : dynDescrVecCpu)
     {
         std::fill(std::begin(dynDescrCpu.hetCfgUeGrpMap), std::end(dynDescrCpu.hetCfgUeGrpMap), -1);
     }
-#endif    
-    
+#endif
+
 
 #ifdef ENABLE_DEBUG
     NVLOGI_FMT(NVLOG_PUSCH, "{}: # of UE groups {}", __FUNCTION__, nUeGrps);
@@ -7784,7 +7801,7 @@ cuphyStatus_t puschRxChEq::setupSoftDemap(cuphyPuschRxUeGrpPrms_t*           pDr
                                           cudaStream_t                       strm)
 {
     if(!pDrvdUeGrpPrmsCpu || !pDrvdUeGrpPrmsGpu || !pDynDescrsGpu || !pLaunchCfgs) return CUPHY_STATUS_INVALID_ARGUMENT;
-    
+
     if((symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)&&(symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK)&&(symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
     {
         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Invalid symbolBitmask {}", __FUNCTION__, symbolBitmask);
@@ -7797,7 +7814,7 @@ cuphyStatus_t puschRxChEq::setupSoftDemap(cuphyPuschRxUeGrpPrms_t*           pDr
                                             symbolBitmask,
                                             launchCfgs.nCfgs,
                                             dynDescrVecCpu);
-    
+
     if(CUPHY_STATUS_SUCCESS != status)
     {
         return status;
@@ -7844,8 +7861,8 @@ cuphyStatus_t puschRxChEq::setupSoftDemap(cuphyPuschRxUeGrpPrms_t*           pDr
         {
            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Kernel function mismatch", __FUNCTION__);
            return CUPHY_STATUS_INTERNAL_ERROR;
-        }          
-                                
+        }
+
         kernelArgs.pDynDescr    = &dynDescrVecGpu[hetCfgIdx];
         launchCfg.kernelArgs[0] = &kernelArgs.pStatDescr;
         launchCfg.kernelArgs[1] = &dynDescr;
@@ -7859,7 +7876,7 @@ cuphyStatus_t puschRxChEq::setupSoftDemapIdft(cuphyPuschRxUeGrpPrms_t*          
                                               cuphyPuschRxUeGrpPrms_t*           pDrvdUeGrpPrmsGpu,
                                               uint16_t                           nUeGrps,
                                               uint16_t                           nMaxPrb,
-                                              uint                               cudaDeviceArch,   
+                                              uint                               cudaDeviceArch,
                                               uint8_t                            enableCfoCorrection,
                                               uint8_t                            enablePuschTdi,
                                               uint16_t                           symbolBitmask,
@@ -7871,18 +7888,18 @@ cuphyStatus_t puschRxChEq::setupSoftDemapIdft(cuphyPuschRxUeGrpPrms_t*          
 {
 //#ifndef FAST_COMPILE
     if(!pDrvdUeGrpPrmsCpu || !pDrvdUeGrpPrmsGpu || !pDynDescrsGpu || !pLaunchCfgs) return CUPHY_STATUS_INVALID_ARGUMENT;
-    
+
     if((symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)&&(symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK)&&(symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
     {
         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Invalid symbolBitmask {}", __FUNCTION__, symbolBitmask);
         return CUPHY_STATUS_INVALID_ARGUMENT;
     }
-    
+
     cuphyPuschRxChEqLaunchCfgs_t& launchCfgs = *pLaunchCfgs;
     cuphyStatus_t status = batchEqSoftDemapIdft(pDrvdUeGrpPrmsCpu,
                                                  nUeGrps,
                                                  symbolBitmask,
-                                                 cudaDeviceArch,   
+                                                 cudaDeviceArch,
                                                  launchCfgs.nCfgs,
                                                  dynDescrVecCpu);
     if(CUPHY_STATUS_SUCCESS != status)
@@ -7926,7 +7943,7 @@ cuphyStatus_t puschRxChEq::setupSoftDemapIdft(cuphyPuschRxUeGrpPrms_t*          
                                      hetCfg.nMaxPrb,
 				                             hetCfg.nUeGrps,
                                      symbolBitmask,
-                                     cudaDeviceArch,   
+                                     cudaDeviceArch,
 			                               drvdUeGrpPrms.tInfoEqCoef.elemType,
 				                             drvdUeGrpPrms.tInfoDataRx.elemType,
 				                             drvdUeGrpPrms.tInfoLLR.elemType,
@@ -7936,8 +7953,8 @@ cuphyStatus_t puschRxChEq::setupSoftDemapIdft(cuphyPuschRxUeGrpPrms_t*          
         {
            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Kernel function mismatch", __FUNCTION__);
            return CUPHY_STATUS_INTERNAL_ERROR;
-        }          
-                                
+        }
+
         kernelArgs.pDynDescr    = &dynDescrVecGpu[hetCfgIdx];
         launchCfg.kernelArgs[0] = &kernelArgs.pIdftStatDescr;;
         launchCfg.kernelArgs[1] = &kernelArgs.pDynDescr;
@@ -7963,7 +7980,7 @@ cuphyStatus_t puschRxChEq::setupSoftDemapAfterDft(cuphyPuschRxUeGrpPrms_t*      
 {
 //#ifndef FAST_COMPILE
     if(!pDrvdUeGrpPrmsCpu || !pDrvdUeGrpPrmsGpu || !pDynDescrsGpu || !pLaunchCfgs) return CUPHY_STATUS_INVALID_ARGUMENT;
-    
+
     if((symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)&&(symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK)&&(symbolBitmask!=CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
     {
         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Invalid symbolBitmask {}", __FUNCTION__, symbolBitmask);
@@ -8029,8 +8046,8 @@ cuphyStatus_t puschRxChEq::setupSoftDemapAfterDft(cuphyPuschRxUeGrpPrms_t*      
         {
            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Kernel function mismatch", __FUNCTION__);
            return CUPHY_STATUS_INTERNAL_ERROR;
-        }          
-                                
+        }
+
         kernelArgs.pDynDescr    = &dynDescrVecGpu[hetCfgIdx];
         launchCfg.kernelArgs[0] = &kernelArgs.pStatDescr;
         launchCfg.kernelArgs[1] = &kernelArgs.pDynDescr;

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -211,9 +211,13 @@ def read_full_core_config(input_yaml):
             print(exc)
             return False
 
+    # Check if this is a LOOPBACK configuration
+    is_loopback = 'LOOPBACK' in os.path.basename(input_yaml).upper()
+    conditional_print("is_loopback=%s"%is_loopback, args.quiet)
+
     #Determine which keys are for each category
     testmac_keys = [aa for aa in yaml_data.keys() if aa.lower().startswith("tbonly_tm_")]
-    ru_emulator_keys = [aa for aa in yaml_data.keys() if (aa.lower().startswith("tbonly_re_") and aa not in ["tbonly_re_offset"])]
+    ru_emulator_keys = [aa for aa in yaml_data.keys() if (aa.lower().startswith("tbonly_re_"))]
     l1_keys = [aa for aa in yaml_data.keys() if aa not in testmac_keys and aa not in ru_emulator_keys]
     all_keys = l1_keys+testmac_keys+ru_emulator_keys
     conditional_print("l1_keys=%s"%l1_keys, args.quiet)
@@ -232,19 +236,28 @@ def read_full_core_config(input_yaml):
         else:
             core_list = [val]
 
-        #Append to DU if L1 or testmac key
-        if key in l1_keys+testmac_keys:
+        # For LOOPBACK configs, put all keys in DU map (so RU shares cores with DU)
+        # For non-LOOPBACK configs, separate DU and RU
+        if is_loopback:
+            # Put everything in DU map for loopback
             du_logical_core_map[key] = []
             for core in core_list:
                 ltuple = yamlcore2logicaltuple(core)
                 du_logical_core_map[key].append(ltuple)
-        
-        #Append to RU if ru_emulator key
-        if key in ru_emulator_keys:
-            ru_logical_core_map[key] = []
-            for core in core_list:
-                ltuple = yamlcore2logicaltuple(core)
-                ru_logical_core_map[key].append(ltuple)
+        else:
+            #Append to DU if L1 or testmac key
+            if key in l1_keys+testmac_keys:
+                du_logical_core_map[key] = []
+                for core in core_list:
+                    ltuple = yamlcore2logicaltuple(core)
+                    du_logical_core_map[key].append(ltuple)
+
+            #Append to RU if ru_emulator key
+            if key in ru_emulator_keys:
+                ru_logical_core_map[key] = []
+                for core in core_list:
+                    ltuple = yamlcore2logicaltuple(core)
+                    ru_logical_core_map[key].append(ltuple)
     return du_logical_core_map,ru_logical_core_map,yaml_data
 
 def allocate_physical_cores(input_yaml,output_yaml,map_ru_emulator=False):
@@ -260,14 +273,9 @@ def allocate_physical_cores(input_yaml,output_yaml,map_ru_emulator=False):
 
     conditional_print("yaml_data=%s"%yaml_data, args.quiet)
 
-    offset = 0
-    #Check if tbonly_re_offset exists
-    if map_ru_emulator:
-        if 'tbonly_re_offset' in yaml_data:
-            conditional_print("✓ tbonly_re_offset exists with value: %s"%yaml_data['tbonly_re_offset'], args.quiet)
-            offset = yaml_data['tbonly_re_offset']
-        else:
-            conditional_print("✗ tbonly_re_offset does not exist", args.quiet)
+    # Check if this is a LOOPBACK configuration
+    is_loopback = 'LOOPBACK' in os.path.basename(input_yaml).upper()
+    conditional_print("is_loopback=%s"%is_loopback, args.quiet)
 
     #Determine number of numas
     du_numas = list(set([aa[2] for key in du_logical_core_map.keys() for aa in du_logical_core_map[key]]))
@@ -276,7 +284,7 @@ def allocate_physical_cores(input_yaml,output_yaml,map_ru_emulator=False):
     conditional_print("ru_numas=%s"%ru_numas, args.quiet)
 
     #Determine which keys we are keeping, which keys we are removing
-    if(not map_ru_emulator):
+    if(not map_ru_emulator or is_loopback):
         logical_core_map = du_logical_core_map
         numas = du_numas
     else:
@@ -297,11 +305,6 @@ def allocate_physical_cores(input_yaml,output_yaml,map_ru_emulator=False):
         #Determine number of physical cores required, excluding any negative one values
         num_physical_cores_desired = len(list(set([aa[0] for aa in logical_tuple_list if aa[2] == numa and aa[0] >= 0])))
         physical_core_list = get_available_physical_cores(numa)
-        if map_ru_emulator:
-            if offset > len(physical_core_list):
-                print("ERROR:: tbonly_re_offset is greater than the number of physical cores on numa %s.  offset=%s, physical_core_list=%s"%(numa,offset,physical_core_list))
-                return False
-            physical_core_list = physical_core_list[offset:]
 
         conditional_print("physical_core_list=%s"%physical_core_list, args.quiet)
         conditional_print("numa=%s, desired_core_count=%s, physical_core_count=%s"%(numa,num_physical_cores_desired,len(physical_core_list)), args.quiet)

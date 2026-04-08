@@ -21,7 +21,11 @@
 extern "C" {
 #endif /* defined(__cplusplus) */
 
-void cuphy_cupti_helper_init();
+// Recommended defaults: 2GiB buffer size with 2 buffers. We buffer up as much data as possible and dump
+// results to log.  If run is appropriate length the log dump will occur after run is complete, minimizing impact
+// to the system.
+// Note: Currently CUPTI limits to 2GiB per buffer.  This will likely be fixed in future CUPTI versions.
+void cuphy_cupti_helper_init(uint64_t buffer_size = 2ULL * 1024 * 1024 * 1024, uint16_t num_buffers = 2);
 void cuphy_cupti_helper_stop();
 void cuphy_cupti_helper_flush();
 void cuphy_cupti_helper_push_external_id(uint64_t id);

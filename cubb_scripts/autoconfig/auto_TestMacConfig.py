@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -73,6 +74,10 @@ def generate_testmac_config_file(output_file_path, template_file, test_case, pla
                 test_mac_yaml_file["indicationPerSlot"]["uciIndPerSlot"] = 0
             if test_case == "90629": # temporarily for Rel-25-2
                 test_mac_yaml_file["indicationPerSlot"]["uciIndPerSlot"] = 0
+            if test_case in ("90628", "90629", "90636"):
+                test_mac_yaml_file['builder_thread_enable'] = 1
+                test_mac_yaml_file['schedule_total_time'] = 450000
+                test_mac_yaml_file['fapi_delay_bit_mask'] = HexInt(255)
             if test_case[:2] == '90':
                 yaml_file = None
                 lpname = "launch_pattern_nrSim_" + test_case +".yaml"

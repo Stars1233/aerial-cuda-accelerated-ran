@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +19,7 @@
 
 #include <string>
 #include <vector>
-#include <cmath>      // For math functions like log10, pow, exp
+#include <cmath>      // For math functions like log10, pow, exp, fmod, clamp
 #include <cuda_runtime.h>
 #include <cuda/std/complex>
 #include <cuda_fp16.h>  // for __half and __half2
@@ -32,10 +32,34 @@
 #include "sls_table.h"
 #include "../chanModelsDataset.hpp"
 #include "../fastFadingCommon.cuh"
+#include "sls_chan_isac.hpp"
+
+#include <algorithm>  // for std::clamp
 
 #define N_MAX_TAPS 24
 // #define SLS_DEBUG_  // for debugging output
 // #define CALIBRATION_CFG_  // for calibration config (min BS-UT is 0, diff generation of d_2d_in)
+// #define SHOW_TRAJECTORY  // for showing UE and ST trajectory
+
+// Angle wrapping helpers shared by channel components
+inline float wrapAzimuth(const float phi) {
+    float wrapped = std::fmod(phi + 180.0f, 360.0f);
+    if (wrapped < 0.0f) {
+        wrapped += 360.0f;
+    }
+    return wrapped - 180.0f;
+}
+
+inline float wrapZenith(const float theta) {
+    float wrapped = std::fmod(theta, 360.0f);
+    if (wrapped < 0.0f) {
+        wrapped += 360.0f;
+    }
+    if (wrapped > 180.0f) {
+        wrapped = 360.0f - wrapped;
+    }
+    return wrapped;
+}
 
 // Topology parameters
 struct TopologyParam {
@@ -50,10 +74,14 @@ struct TopologyParam {
     float minBsUeDist2d;  // Minimum 2D distance between base station and user terminal
     float maxBsUeDist2dIndoor;  // Maximum 2D distance between base station and user terminal in indoor
     float indoorUtPercent;  // Percentage of user terminals in indoor
+    
+    // ISAC (Integrated Sensing and Communications) parameters
+    uint32_t nST;  // Number of sensing targets
+    std::vector<StParam> stParams;  // Sensing target parameters
 };
 
 // Link parameters
-// 81 bytes
+// 85 bytes (was 81 bytes, +4 for delta_tau)
 struct LinkParams {
     float d2d;  // 2D distance between BS and UT in meters
     float d2d_in;  // 2D distance in indoor environment in meters
@@ -77,6 +105,7 @@ struct LinkParams {
     float mu_offset_ZOD; // Mean of offset of ZOD
     float ZSD; // Zenith Spread of Departure in degrees
     float ZSA; // Zenith Spread of Arrival in degrees
+    float delta_tau; // Excess delay per 3GPP TR 38.901 Table 7.6.9-1 (0 for LOS, lognormal for NLOS, in seconds)
 };
 
 // Common link parameters
@@ -124,8 +153,8 @@ struct CmnLinkParams {
     float sqrtCorrMatO2i[O2I_MATRIX_SIZE * O2I_MATRIX_SIZE];
 
     uint32_t nLink;  // Number of links from a Site to a UE
-    uint32_t nUeAnt; // Max number of UE antennas. TODO: should be the same for all UEs
-    uint32_t nBsAnt; // Max number of BS antennas. TODO: should be the same for all BSs
+    uint16_t nUeAnt; // Max number of UE antennas (must be <= 65535); TODO: should be the same for all UEs
+    uint16_t nBsAnt; // Max number of BS antennas (must be <= 65535); TODO: should be the same for all BSs
     float lambda_0;  // Wavelength in meters
     
     // Subcluster ray definitions (3GPP Table 7.5-5)
@@ -391,6 +420,11 @@ public:
      */
     void generateTopology() {
         bsUeDropping();  // Call the private implementation
+        
+        // Drop sensing targets if ISAC is enabled
+        if (m_sysConfig->isac_type == 1 || m_sysConfig->isac_type == 2) {
+            stDropping();
+        }
     }
 
     /**
@@ -424,22 +458,70 @@ public:
     /**
      * @brief Dump pathloss and shadowing statistics (negative value in dB)
      * 
-     * @param pathloss_shadowing Pointer to array for storing pathloss+shadowing stats (required)
+     * @param pl_sf Pointer to array for storing pathloss+shadowing stats (required)
      *                          If activeCell and activeUt are provided: dimension [activeCell.size(), activeUt.size()]
      *                          If activeCell or activeUt are empty: use dimension n_sector*n_site or n_ut for the empty one
      *                          Values are total loss = - (pathloss - shadow_fading) in dB
      * @param activeCell Vector of active cell IDs (optional, empty vector dumps all cells)
      * @param activeUt Vector of active UT IDs (optional, empty vector dumps all UEs)
      */
-    void dump_pathloss_shadowing_stats(float* pathloss_shadowing,
-                                     const std::vector<uint16_t>& activeCell = {},
-                                     const std::vector<uint16_t>& activeUt = {});
+    void dump_pl_sf_stats(float* pl_sf,
+                          const std::vector<uint16_t>& activeCell = {},
+                          const std::vector<uint16_t>& activeUt = {});
+
+    /**
+     * @brief Dump pathloss, shadowing and antenna gain statistics
+     *
+     * Outputs total channel gain in dB = antGain - pathloss + SF, so it can replace
+     * antGain is per antenna element only (no 10*log10(nAnt) array gain); downstream may add array/beamforming gain.
+     *
+     * @param pl_sf_ant_gain Pointer to array for storing gain stats (required)
+     *                                    Same dimension rules as dump_pl_sf_stats.
+     *                                    Values are total channel gain in dB = antGain - pathloss + SF.
+     * @param activeCell Vector of active cell IDs (optional, empty vector dumps all cells)
+     * @param activeUt Vector of active UT IDs (optional, empty vector dumps all UEs)
+     */
+    void dump_pl_sf_ant_gain_stats(float* pl_sf_ant_gain,
+                                   const std::vector<uint16_t>& activeCell = {},
+                                   const std::vector<uint16_t>& activeUt = {});
 
     /**
      * @brief Save SLS channel data to H5 file for debugging
      * @param filenameEnding Optional string to append to filename
      */
     void saveSlsChanToH5File(std::string_view filenameEnding = "");
+
+    /**
+     * @brief Generate sensing channel for ISAC (Integrated Sensing and Communications)
+     * 
+     * Generates sensing channel based on ISAC type:
+     * - Type 1 (Monostatic): BS -> ST -> BS (round-trip)
+     * - Type 2 (Bistatic): BS_TX -> ST -> BS_RX or UE (one-way)
+     * 
+     * The sensing channel includes:
+     * - RCS-weighted reflection from sensing targets
+     * - Doppler shift for moving targets
+     * - Multi-SPST support for complex targets (automotive/AGV)
+     */
+    void generateSensingChannel();
+
+    /**
+     * @brief Calculate RCS (Radar Cross Section) for sensing targets
+     * 
+     * Implements 3GPP TR 38.901 Section 7.9.2 RCS models:
+     * - Model 1: Deterministic monostatic RCS (n_spst = 1)
+     * - Model 2: Angular dependent RCS (n_spst >= 1)
+     * 
+     * @param stConfig Sensing target parameters
+     * @param incidentAngle Incident angle (theta_i, phi_i)
+     * @param scatteredAngle Scattered angle (theta_s, phi_s)
+     * @param bistaticBeta Bistatic angle in degrees
+     * @return float RCS value in linear scale (not dB)
+     */
+    float calculateRCS(const StParam& stConfig, 
+                      float incidentTheta, float incidentPhi,
+                      float scatteredTheta, float scatteredPhi,
+                      float bistaticBeta);
 
     const SystemLevelConfig * m_sysConfig;
     const SimConfig * m_simConfig;
@@ -462,6 +544,21 @@ private:
     void bsUeDropping();
 
     /**
+     * @brief Perform sensing target (ST) dropping for ISAC
+     * 
+     * This function handles the spatial distribution of sensing targets (STs) for 
+     * ISAC (Integrated Sensing and Communications) simulations per 3GPP TR 38.901.
+     * It ensures STs are placed at minimum 3D distances from all BS/UE positions to
+     * guarantee valid sensing geometries. Called when isac_type is 1 or 2.
+     * 
+     * The function:
+     * - Generates n_st sensing targets according to distribution options
+     * - Ensures minimum separation from all STX/SRX (BS/UE) positions
+     * - Populates m_topology.stParams with generated sensing targets
+     */
+    void stDropping();
+
+    /**
      * @brief Initialize antenna panel configuration
      */
     void initializeAntPanelConfig();
@@ -477,17 +574,12 @@ private:
      * - K-factor
      * These parameters are correlated according to 3GPP specifications.
      */
-    inline void calLsp(scenario_t scenario, bool isLos, float fc, bool optionalPlInd,
-                      float d_2d, float d_3d, float d_2d_in, float d_3d_in,
-                      float h_bs, float h_ut, float phi_los_aod, float phi_los_aoa,
-                      float theta_los_zod, float theta_los_zoa,
-                      std::mt19937& gen, std::normal_distribution<float>& normalDist,
-                      float& ds, float& asd, float& asa, float& sf, float& k,
-                      float& zsd, float& zsa, bool isSameSite = false, bool isSameFloor = false,
-                      float utX = 0.0f, float utY = 0.0f,
-                      const corrDist_t& corrDist = {50.0f, 50.0f, 50.0f, 37.0f, 12.0f, 50.0f, 50.0f},
-                      const std::vector<std::vector<std::vector<float>>>& crn = {},
-                      float maxX = 0.0f, float minX = 0.0f, float maxY = 0.0f, float minY = 0.0f);
+    void calIsacLsp(scenario_t scenario, bool isLos, bool isIndoor, float fc,
+                    float d_2d, float d_3d,
+                    float h_bs, float h_ut,
+                    float utX, float utY,
+                    float& ds, float& asd, float& asa, float& sf, float& k, float& zsd, float& zsa, float& delta_tau,
+                    uint32_t crnSiteIdx = 0, bool is_aerial = false);
 
     /**
      * @brief Calculate cluster and ray parameters
@@ -501,6 +593,108 @@ private:
      * - Initial phases
      */
     void calClusterRay();
+
+    /**
+     * @brief Calculate shadow fading standard deviation
+     * 
+     * Computes the standard deviation of shadow fading (σ_SF) according to 3GPP specifications,
+     * with support for aerial UE/targets as per TR 36.777.
+     * 
+     * @param scenario Deployment scenario (UMa, UMi, RMa)
+     * @param isLos Line-of-sight indicator (true for LOS, false for NLOS)
+     * @param fc Carrier frequency in Hz
+     * @param optionalPlInd Optional pathloss indicator
+     * @param d_2d 2D distance in meters
+     * @param h_bs Base station height in meters
+     * @param h_ut User terminal/target height in meters
+     * @param is_aerial Whether the UT/target is aerial (for TR 36.777 aerial UE model)
+     * @return Shadow fading standard deviation in dB
+     */
+    static float calSfStd(scenario_t scenario, bool isLos, float fc, bool optionalPlInd,
+                          float d_2d, float h_bs, float h_ut, bool is_aerial = false);
+
+    /**
+     * @brief Generate cluster angles for multipath propagation
+     * 
+     * Generates azimuth and zenith angles for each cluster according to 3GPP TR 38.901
+     * specifications. Applies LOS/NLOS-specific scaling factors and adjustments.
+     * 
+     * @param nCluster Number of clusters
+     * @param C_ASA Cluster ASA parameter
+     * @param C_ASD Cluster ASD parameter
+     * @param C_phi_NLOS Azimuth cluster angle scaling for NLOS
+     * @param C_phi_LOS Azimuth cluster angle scaling for LOS
+     * @param c_phi_O2I Azimuth cluster angle scaling for O2I
+     * @param C_theta_LOS Zenith cluster angle scaling for LOS
+     * @param C_theta_NLOS Zenith cluster angle scaling for NLOS
+     * @param C_theta_O2I Zenith cluster angle scaling for O2I
+     * @param ASA Azimuth spread of arrival in degrees
+     * @param ASD Azimuth spread of departure in degrees
+     * @param ZSA Zenith spread of arrival in degrees
+     * @param ZSD Zenith spread of departure in degrees
+     * @param phi_LOS_AOA LOS azimuth angle of arrival in degrees
+     * @param phi_LOS_AOD LOS azimuth angle of departure in degrees
+     * @param theta_LOS_ZOA LOS zenith angle of arrival in degrees
+     * @param theta_LOS_ZOD LOS zenith angle of departure in degrees
+     * @param mu_offset_ZOD Zenith offset for departure angles
+     * @param losInd Line-of-sight indicator
+     * @param outdoor_ind Outdoor indicator (1: outdoor, 0: indoor)
+     * @param K K-factor in dB for Ricean fading
+     * @param powers Cluster powers array
+     * @param phi_n_AoA Output: cluster azimuth angles of arrival
+     * @param phi_n_AoD Output: cluster azimuth angles of departure
+     * @param theta_n_ZOD Output: cluster zenith angles of departure
+     * @param theta_n_ZOA Output: cluster zenith angles of arrival
+     * @param gen Random number generator
+     * @param uniformDist Uniform distribution for random generation
+     * @param normalDist Normal distribution for random generation
+     */
+    static void genClusterAngle(uint8_t nCluster,
+                                float C_ASA, float C_ASD,
+                                float C_phi_NLOS, float C_phi_LOS, float c_phi_O2I,
+                                float C_theta_LOS, float C_theta_NLOS, float C_theta_O2I,
+                                float ASA, float ASD, float ZSA, float ZSD,
+                                float phi_LOS_AOA, float phi_LOS_AOD,
+                                float theta_LOS_ZOA, float theta_LOS_ZOD, float mu_offset_ZOD,
+                                bool losInd, bool outdoor_ind, float K,
+                                float* powers,
+                                float* phi_n_AoA, float* phi_n_AoD,
+                                float* theta_n_ZOD, float* theta_n_ZOA,
+                                std::mt19937& gen,
+                                std::uniform_real_distribution<float>& uniformDist,
+                                std::normal_distribution<float>& normalDist);
+
+    /**
+     * @brief Generate ray angles within clusters
+     * 
+     * Generates individual ray angles within each cluster according to 3GPP specifications.
+     * Uses standardized ray offset angles and random permutations.
+     * 
+     * @param nCluster Number of clusters
+     * @param nRayPerCluster Number of rays per cluster
+     * @param phi_n_AoA Cluster azimuth angles of arrival
+     * @param phi_n_AoD Cluster azimuth angles of departure
+     * @param theta_n_ZOD Cluster zenith angles of departure
+     * @param theta_n_ZOA Cluster zenith angles of arrival
+     * @param phi_n_m_AoA Output: ray azimuth angles of arrival
+     * @param phi_n_m_AoD Output: ray azimuth angles of departure
+     * @param theta_n_m_ZOD Output: ray zenith angles of departure
+     * @param theta_n_m_ZOA Output: ray zenith angles of arrival
+     * @param C_ASA Cluster ASA scaling
+     * @param C_ASD Cluster ASD scaling
+     * @param C_ZSA Cluster ZSA scaling
+     * @param C_ZSD Cluster ZSD scaling
+     * @param gen Random number generator
+     * @param uniformDist Uniform distribution for random permutation
+     */
+    static void genRayAngle(uint8_t nCluster, uint16_t nRayPerCluster,
+                            const float* phi_n_AoA, const float* phi_n_AoD,
+                            const float* theta_n_ZOD, const float* theta_n_ZOA,
+                            float* phi_n_m_AoA, float* phi_n_m_AoD,
+                            float* theta_n_m_ZOD, float* theta_n_m_ZOA,
+                            float C_ASA, float C_ASD, float C_ZSA, float C_ZSD,
+                            std::mt19937& gen,
+                            std::uniform_real_distribution<float>& uniformDist);
 
     /**
      * @brief Generate Common Random Numbers (CRN) for correlated LSP generation
@@ -520,6 +714,104 @@ private:
     void generateCFR();
 
     /**
+     * ISAC call flow (reference):
+     * 1) initializeIsacParams() → initializeMonostaticRefPoints() / initializeBistaticLinks()
+     * 2) calculateAllTargetLinkParams() builds per-link LSPs:
+     *    calculateIncidentPath() / calculateScatteredPath(), calculateBistaticAngle(),
+     *    calculateRCS(), calculateTargetDoppler()
+     * 3) generateTargetCIR() with calculateTargetReflectionCoefficient()
+     * 4) combineBackgroundAndTargetCIR() merges background + target CIR using IsacCirConfig tap sizing
+     * Utilities: transformSpstToGCS(), updateAllTargetLocations() when mobility is applied.
+     */
+    // ISAC initialization (monostatic RPs or bistatic links)
+    void initializeIsacParams();
+    void initializeMonostaticRefPoints();
+    void generateRpClusters();  //!< Generate LSP/clusters for RPs (must be called after generateCRN)
+    void initializeBistaticLinks();
+    void generateMonostaticReferencePoints(
+        const Coordinate& stx_srx_loc,
+        const MonostaticRpGammaParams& params,
+        const float stx_srx_orientation[3],
+        const float stx_srx_velocity[3],
+        MonostaticReferencePoint rps[3]);
+    void generateMonostaticBackgroundCIR(
+        const MonostaticBackgroundParams& bgParams,
+        const AntPanelConfig& txAntConfig,
+        const AntPanelConfig& rxAntConfig,
+        float fc, float lambda_0,
+        uint32_t nSnapshots,
+        float currentTime,
+        float sampleRate,
+        TargetCIR& backgroundCIR);
+    void calculateIncidentPath(
+        const Coordinate& tx_loc,
+        const Coordinate& target_loc,
+        const StParam& target,
+        float fc, Scenario scenario,
+        TargetIncidentPath& incident,
+        uint32_t crnSiteIdx = 0);
+    void calculateScatteredPath(
+        const Coordinate& target_loc,
+        const Coordinate& rx_loc,
+        const StParam& target,
+        float fc, Scenario scenario,
+        TargetScatteredPath& scattered,
+        bool is_monostatic,
+        const TargetIncidentPath* incident_path,
+        uint32_t crnSiteIdx = 0);
+    float calculateRcsSigmaS(float sigma_sigma_s_db);
+    float calculateUavXpr();
+    float calculateRCS(const StParam& st, uint32_t spst_idx,
+                       float theta_incident, float phi_incident,
+                       float theta_scattered, float phi_scattered,
+                       float bistatic_angle);
+    void calculateAngles3D(const Coordinate& loc1, const Coordinate& loc2,
+                           float& theta_ZOD, float& phi_AOD);
+    float calculateBistaticAngle(float theta_incident, float phi_incident,
+                                 float theta_scattered, float phi_scattered);
+    float calculateTargetDoppler(const float target_velocity[3],
+                                 float theta_incident, float phi_incident,
+                                 float theta_scattered, float phi_scattered,
+                                 float lambda_0);
+    float calculateIsacLosProb(float d_2d, float h_target, const StParam& target, Scenario scenario);
+    void calculateAllTargetLinkParams();
+    void generateTargetCIR(const std::vector<TargetLinkParams>& targetLinks,
+                           const AntPanelConfig& txAntConfig,
+                           const AntPanelConfig& rxAntConfig,
+                           uint32_t nSnapshots,
+                           float currentTime,
+                           float lambda_0,
+                           float sampleRate,
+                           const IsacCirConfig& isacConfig,
+                           TargetCIR& targetCIR);
+        void genTargetClustersFromLsp(float delay_spread,
+                                      float asd, float asa,
+                                      float zsd, float zsa,
+                                      float ricean_k,
+                                      float phi_AOA, float phi_AOD,
+                                      float theta_ZOA, float theta_ZOD,
+                                      bool los,
+                                      TargetClusterParams& out);
+    cuComplex calculateTargetReflectionCoefficient(
+        const AntPanelConfig& txAntConfig, uint32_t txAntIdx,
+        const AntPanelConfig& rxAntConfig, uint32_t rxAntIdx,
+        const TargetLinkParams& targetLink,
+        float currentTime, float lambda_0);
+    Coordinate transformSpstToGCS(const Coordinate& spst_loc_lcs,
+                                  const Coordinate& target_loc_gcs,
+                                  const float target_orientation[2]);
+    void updateAllTargetLocations(std::vector<StParam>& targets,
+                                  float current_time, float ref_time);
+    void combineBackgroundAndTargetCIR(
+        const cuComplex* cirCoe_bg, const uint16_t* cirNormDelay_bg, const uint16_t* cirNtaps_bg,
+        const cuComplex* cirCoe_tgt, const uint16_t* cirNormDelay_tgt, const uint16_t* cirNtaps_tgt,
+        cuComplex* cirCoe_combined, uint16_t* cirNormDelay_combined, uint16_t* cirNtaps_combined,
+        uint32_t nRxAnt, uint32_t nTxAnt, uint32_t nSnapshots,
+        const IsacCirConfig& isacConfig);
+    MonostaticRpGammaParams getTrpMonostaticGammaParams(Scenario scenario);
+    MonostaticRpGammaParams getUtMonostaticGammaParams(Scenario scenario, float h_ut, bool is_aerial);
+
+    /**
      * @brief Process transmitted samples
      * 
      * Handles the processing of transmitted signal samples through the channel.
@@ -533,6 +825,7 @@ private:
      */
     void allocateStaticGpuMem();
     void allocateDynamicGpuMem(uint32_t nLink);
+    uint32_t getEffectiveMaxTaps() const;
     
     /**
      * @brief Copy data from contiguous internal storage to per-cell external arrays
@@ -586,6 +879,26 @@ private:
     void generateCRNGPU();
 
     /**
+     * @brief Generate sensing channel on GPU for ISAC
+     * 
+     * GPU implementation of sensing channel generation including:
+     * - RCS calculation for all SPSTs
+     * - Path computation (BS->ST->BS or BS_TX->ST->BS_RX or BS_TX->ST->UE)
+     * - Doppler shift for moving targets
+     */
+    void generateSensingChannelGPU();
+
+    /**
+     * @brief Calculate RCS on GPU for all sensing targets and SPSTs
+     * 
+     * Parallel RCS computation for:
+     * - Multiple sensing targets
+     * - Multiple SPSTs per target (up to 5 for automotive/AGV)
+     * - Both RCS Model 1 (deterministic) and Model 2 (angular dependent)
+     */
+    void calculateRCSGPU();
+
+    /**
      * @brief Update active link indices based on active cells and UTs
      * 
      * @param activeCell Vector of active cell indices
@@ -602,10 +915,20 @@ private:
     // Add topology parameters
     topologyParam_t m_topology;  // Network topology parameters
     
+    // ISAC target channel parameters
+    TargetChannelParams m_targetChannelParams;  // Target channel parameters for sensing
+    TargetCIR m_targetCIR;                       // Target CIR storage (reused per link)
+    TargetCIR m_monostaticBackgroundCIR;         // Monostatic background CIR (BS->RPs)
+    
     // Internal data structures
     size_t m_lastAllocatedLinks;
     size_t m_lastAllocatedActiveLinks;  // Track allocated active link memory
-    float m_refTime;  // reference time for CIR and CFR generation
+    uint32_t m_lastAllocatedMaxTaps{N_MAX_TAPS}; // Track tap budget used for current allocations
+    uint32_t m_effectiveBsAnt{0}; // Effective BS antennas used for allocations (comm vs ISAC)
+    uint32_t m_effectiveUeAnt{0}; // Effective UE antennas used for allocations (comm vs ISAC)
+    float m_refTime{0.0f};       // reference time for CIR and CFR generation
+    float m_prevRefTime{0.0f};   // previous ref time (for mobility delta_t)
+    bool m_hasPrevRefTime{false};
     
     /** Memory ownership clarification */
     
@@ -699,4 +1022,199 @@ private:
     // Universal curandState array for consistent random number generation across kernel launches
     curandState* m_d_curandStates;  // OWNING: Pre-initialized curandState array for all threads
     uint32_t m_maxCurandStates;     // Maximum number of curandState elements allocated
+    
+    // ISAC (Integrated Sensing and Communications) GPU buffers
+    StParam* m_d_stParams;       // OWNING: Sensing target parameters on GPU
+    SpstParam* m_d_spstParams;   // OWNING: Flattened SPST parameters on GPU (for all STs)
+    uint32_t* m_d_spstOffsets;      // OWNING: Offset indices for accessing SPSTs per ST
+    float* m_d_sensingChannelRCS;   // OWNING: Computed RCS values for each ST-BS pair
+    uint32_t m_totalSpstCount;      // Total number of SPSTs across all sensing targets
 };
+
+// UE Mobility Helper Functions (implemented in sls_chan_ue_mobility.cpp)
+
+/**
+ * Calculate 3D distance between two coordinates
+ * 
+ * @param[in] loc1 First coordinate
+ * @param[in] loc2 Second coordinate
+ * @return Distance in meters
+ */
+inline float calculateDistance3D(const Coordinate& loc1, const Coordinate& loc2) {
+    const float dx = loc1.x - loc2.x;
+    const float dy = loc1.y - loc2.y;
+    const float dz = loc1.z - loc2.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/**
+ * Calculate 2D distance between two coordinates (ignoring z)
+ * 
+ * @param[in] loc1 First coordinate
+ * @param[in] loc2 Second coordinate
+ * @return Distance in meters
+ */
+inline float calculateDistance2D(const Coordinate& loc1, const Coordinate& loc2) {
+    const float dx = loc1.x - loc2.x;
+    const float dy = loc1.y - loc2.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+/**
+ * Get unique site locations from cell configuration
+ * 
+ * @param[in] cells Vector of cell parameters
+ * @return Vector of unique site locations
+ */
+std::vector<Coordinate> getUniqueSiteLocations(const std::vector<CellParam>& cells);
+
+/**
+ * Calculate speed (magnitude of velocity vector)
+ * 
+ * @param[in] velocity Velocity vector [vx, vy, vz]
+ * @return Speed in m/s
+ */
+float calculateSpeed(const float velocity[3]);
+
+/**
+ * Generate new random velocity direction with same speed
+ * Uses uniform distribution on sphere for 3D or circle for 2D (vz=0)
+ * 
+ * @param[in,out] velocity Velocity vector to update [vx, vy, vz]
+ * @param[in,out] rng Random number generator
+ */
+void generateRandomDirection(float velocity[3], std::mt19937& rng);
+
+/**
+ * Check if UE is too close to any site and needs redirection
+ * Uses 2D distance (horizontal plane) per 3GPP specification
+ * 
+ * @param[in] ut_loc UE location
+ * @param[in] site_locations Vector of site locations
+ * @param[in] min_distance Minimum allowed 2D distance to site in meters (minBsUeDist2d)
+ * @return True if UE is too close to any site
+ */
+bool isUtTooCloseToSite(const Coordinate& ut_loc, const std::vector<Coordinate>& site_locations, 
+                        float min_distance);
+
+/**
+ * Update single UE location based on velocity and time
+ * Redirects UE if it gets too close to any site (uses 2D distance check per 3GPP)
+ * 
+ * @param[in,out] ut UE parameter to update
+ * @param[in] current_time Current simulation time in seconds
+ * @param[in] ref_time Reference time (time0) in seconds
+ * @param[in] site_locations Vector of site locations
+ * @param[in] min_distance Minimum allowed 2D distance to site in meters (minBsUeDist2d)
+ * @param[in,out] rng Random number generator for direction changes
+ */
+void updateUtLocation(UtParam& ut, float current_time, float ref_time, 
+                      const std::vector<Coordinate>& site_locations, float min_distance,
+                      std::mt19937& rng);
+
+/**
+ * Update all UE locations based on velocity and time
+ * 
+ * @param[in,out] uts Vector of UE parameters to update
+ * @param[in] current_time Current simulation time in seconds
+ * @param[in] ref_time Reference time (time0) in seconds
+ * @param[in] cells Vector of cell parameters (to extract site locations)
+ * @param[in] min_distance Minimum allowed 2D distance to site in meters (minBsUeDist2d)
+ * @param[in] seed Random seed for direction changes (default: 0 for time-based seed)
+ */
+void updateAllUtLocations(std::vector<UtParam>& uts, float current_time, float ref_time,
+                          const std::vector<CellParam>& cells, float min_distance,
+                          uint32_t seed = 0);
+
+// Wrap-Around Helper Functions (hexagonal cellular network wrap-around per 3GPP)
+// NOTE: Wrap-around only supports 1, 7, or 19 sites (0, 1, or 2 tiers)
+
+/**
+ * Calculate minimum 2D distance to site considering wrap-around
+ * Implements hexagonal wrap-around by checking 7 positions (original + 6 wrapped)
+ * 
+ * @param[in] ut_loc UE location
+ * @param[in] site_loc Site location
+ * @param[in] num_tiers Number of tiers in hexagonal network (0, 1, or 2)
+ * @param[in] isd Inter-site distance in meters
+ * @param[in] enable Enable wrap-around (if false, returns direct distance)
+ * @return Minimum 2D distance considering wrap-around in meters
+ */
+float calculateMinDistance2DWithWrapAround(const Coordinate& ut_loc, const Coordinate& site_loc,
+                                            uint32_t num_tiers, float isd, bool enable);
+
+/**
+ * Check if UE is too close to any site with wrap-around
+ * Uses hexagonal wrap-around to check distance to all sites and their wrapped copies
+ * 
+ * @param[in] ut_loc UE location
+ * @param[in] site_locations Vector of site locations
+ * @param[in] min_distance Minimum allowed 2D distance in meters
+ * @param[in] num_tiers Number of tiers in hexagonal network (0, 1, or 2)
+ * @param[in] isd Inter-site distance in meters
+ * @param[in] enable Enable wrap-around (if false, uses non-wrap distance check)
+ * @return True if UE is too close to any site (including wrapped copies)
+ */
+bool isUtTooCloseToSiteWithWrapAround(const Coordinate& ut_loc, 
+                                       const std::vector<Coordinate>& site_locations,
+                                       float min_distance,
+                                       uint32_t num_tiers, float isd, bool enable);
+
+/**
+ * Apply wrap-around to UE location
+ * Wraps UE back into simulation area based on hexagonal network geometry
+ * 
+ * @param[in,out] ut_loc UE location to wrap
+ * @param[in] num_tiers Number of tiers in hexagonal network (0, 1, or 2)
+ * @param[in] isd Inter-site distance in meters
+ * @param[in] enable Enable wrap-around (if false, no action)
+ */
+void applyWrapAroundToUe(Coordinate& ut_loc, uint32_t num_tiers, float isd, bool enable);
+
+/**
+ * Apply wrap-around to all UE locations
+ * 
+ * @param[in,out] uts Vector of UE parameters
+ * @param[in] num_tiers Number of tiers in hexagonal network (0, 1, or 2)
+ * @param[in] isd Inter-site distance in meters
+ * @param[in] enable Enable wrap-around (if false, no action)
+ */
+void applyWrapAroundToAllUes(std::vector<UtParam>& uts, uint32_t num_tiers, float isd, bool enable);
+
+/**
+ * Update single UE location with wrap-around support
+ * 
+ * @param[in,out] ut UE parameter to update
+ * @param[in] current_time Current simulation time in seconds
+ * @param[in] ref_time Reference time (time0) in seconds
+ * @param[in] site_locations Vector of site locations
+ * @param[in] min_distance Minimum allowed 2D distance in meters
+ * @param[in] num_tiers Number of tiers in hexagonal network (0, 1, or 2)
+ * @param[in] isd Inter-site distance in meters
+ * @param[in] enable Enable wrap-around (if false, uses non-wrap update)
+ * @param[in,out] rng Random number generator for direction changes
+ */
+void updateUtLocationWithWrapAround(UtParam& ut, float current_time, float ref_time,
+                                     const std::vector<Coordinate>& site_locations,
+                                     float min_distance,
+                                     uint32_t num_tiers, float isd, bool enable,
+                                     std::mt19937& rng);
+
+/**
+ * Update all UE locations with wrap-around support
+ * 
+ * @param[in,out] uts Vector of UE parameters to update
+ * @param[in] current_time Current simulation time in seconds
+ * @param[in] ref_time Reference time (time0) in seconds
+ * @param[in] cells Vector of cell parameters (to extract site locations)
+ * @param[in] min_distance Minimum allowed 2D distance in meters
+ * @param[in] num_tiers Number of tiers in hexagonal network (0, 1, or 2)
+ * @param[in] isd Inter-site distance in meters
+ * @param[in] enable Enable wrap-around (if false, uses non-wrap update)
+ * @param[in] seed Random seed for direction changes (default: 0 for time-based seed)
+ */
+void updateAllUtLocationsWithWrapAround(std::vector<UtParam>& uts, float current_time, float ref_time,
+                                         const std::vector<CellParam>& cells,
+                                         float min_distance,
+                                         uint32_t num_tiers, float isd, bool enable,
+                                         uint32_t seed = 0);

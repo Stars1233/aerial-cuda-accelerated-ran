@@ -25,8 +25,8 @@
 #include <chrono>
 #include <thread>
 
-// Use a known NVLOG tag for testing - NVIPC.TIMING tag
-#define TAG_TEST_PERF 54
+// Use DRV.PERF_METRICS tag for testing (NVLOG_TAG_BASE_CUPHY_DRIVER + 48)
+#define TAG_PERF_METRICS 248
 
 void test_basic_functionality() {
     std::cout << "\n=== Testing Basic Functionality ===" << std::endl;
@@ -47,12 +47,12 @@ void test_basic_functionality() {
     
     // Log the accumulated durations
     std::cout << "Logging durations with INFO level:" << std::endl;
-    pma.logDurations<TAG_TEST_PERF, perf_metrics::LogLevel::INFO>();
+    pma.logDurations<TAG_PERF_METRICS, perf_metrics::LogLevel::INFO>();
     
     // Reset and verify empty state
     std::cout << "\nAfter reset:" << std::endl;
     pma.reset();
-    pma.logDurations<TAG_TEST_PERF, perf_metrics::LogLevel::INFO>();
+    pma.logDurations<TAG_PERF_METRICS, perf_metrics::LogLevel::INFO>();
 }
 
 void test_error_handling() {
@@ -85,16 +85,16 @@ void test_different_log_levels() {
     pma.stopSection("Test Section");
     
     std::cout << "Testing VERBOSE level:" << std::endl;
-    pma.logDurations<TAG_TEST_PERF, perf_metrics::LogLevel::VERBOSE>();
+    pma.logDurations<TAG_PERF_METRICS, perf_metrics::LogLevel::VERBOSE>();
     
     std::cout << "Testing DEBUG level:" << std::endl;
-    pma.logDurations<TAG_TEST_PERF, perf_metrics::LogLevel::DEBUG>();
+    pma.logDurations<TAG_PERF_METRICS, perf_metrics::LogLevel::DEBUG>();
     
     std::cout << "Testing WARN level:" << std::endl;
-    pma.logDurations<TAG_TEST_PERF, perf_metrics::LogLevel::WARN>();
+    pma.logDurations<TAG_PERF_METRICS, perf_metrics::LogLevel::WARN>();
     
     std::cout << "Testing ERROR level:" << std::endl;
-    pma.logDurations<TAG_TEST_PERF, perf_metrics::LogLevel::ERROR>();
+    pma.logDurations<TAG_PERF_METRICS, perf_metrics::LogLevel::ERROR>();
 }
 
 int main() {

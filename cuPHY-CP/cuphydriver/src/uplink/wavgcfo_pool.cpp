@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,6 +44,7 @@ bool WAvgCfoCache::allocate(const uint16_t rnti, const uint16_t cell_id, WAvgCfo
     std::lock_guard<Mutex> lock(mutex_);
     const uint32_t key = makeKey(rnti, cell_id);
     
+    MemtraceDisableScope md; // Disable dynamic memory allocation check temporarily
     // Use insert to avoid overwriting existing entries
     const auto result = cache_.insert({key, buffer});
     return result.second; // true if inserted, false if key already existed
@@ -85,6 +86,7 @@ bool WAvgCfoCache::empty() const {
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
 WAvgCfoPool::WAvgCfoPool(GpuDevice* _gDev, FronthaulHandle _fhi_handle)
     :
+    gpuMemSize(0),
     gDev(_gDev)
 {
     char * ring_name{};
@@ -95,6 +97,9 @@ WAvgCfoPool::WAvgCfoPool(GpuDevice* _gDev, FronthaulHandle _fhi_handle)
     gDev->setDevice();
 
     ring_name = static_cast<char*>(calloc(256, sizeof(char)));
+    if(ring_name == nullptr)
+        PHYDRIVER_THROW_EXCEPTIONS(ENOMEM, "Failed to allocate ring name");
+
     snprintf(ring_name, 256, "WAVGCFO_POOL_%u", WAVGCFO_BUFFER_SIZE);
     ring_info.count = WAVGCFO_POOL_SIZE;
     ring_info.socket_id = AERIAL_SOCKET_ID_ANY;
@@ -112,7 +117,9 @@ WAvgCfoPool::WAvgCfoPool(GpuDevice* _gDev, FronthaulHandle _fhi_handle)
     // Create WAvgCfo set of free buffers (fixed array size)
     for(std::size_t i = 0; i < WAVGCFO_POOL_SIZE - 1; i++)
     {
-        wavgcfo_list[i] = std::make_unique<WAvgCfoBuffer>(new dev_buf(WAVGCFO_BUFFER_SIZE * sizeof(uint8_t), gDev), WAVGCFO_BUFFER_SIZE);
+        dev_buf* _dev_buf = new dev_buf(WAVGCFO_BUFFER_SIZE, gDev);
+        gpuMemSize += _dev_buf->size_alloc;
+        wavgcfo_list[i] = std::make_unique<WAvgCfoBuffer>(_dev_buf, WAVGCFO_BUFFER_SIZE);
         // Push all the WAvgCfo buffers in the ring
         if(aerial_fh::ring_enqueue(wavgcfo_ring, static_cast<void*>(wavgcfo_list[i].get())))
         {
@@ -139,6 +146,10 @@ size_t WAvgCfoPool::getSize() const {
 
 size_t WAvgCfoPool::countElements() const {
     return WAVGCFO_POOL_SIZE - (static_cast<int>(aerial_fh::ring_free_count(wavgcfo_ring)));
+}
+
+size_t WAvgCfoPool::getGpuMemSize() const {
+    return gpuMemSize;
 }
 
 // Allocate a buffer from FH rte_ring
@@ -226,13 +237,13 @@ WAvgCfoPoolManager::WAvgCfoPoolManager(phydriver_handle _pdh, GpuDevice* _gDev, 
 {
     // Initialize memory footprint tracking
     mf.init(_pdh, std::string("WAvgCfoPoolManager"), sizeof(WAvgCfoPoolManager));
-    
+
     // Track GPU memory for buffer pool
-    mf.addGpuRegularSize(WAVGCFO_BUFFER_SIZE * WAVGCFO_POOL_SIZE);
-    
+    mf.addGpuRegularSize(pool_->getGpuMemSize());
+
     // Track CPU memory for cache structure
     mf.addCpuRegularSize(sizeof(WAvgCfoCache));
-    
+
     NVLOGI_FMT_EVT(TAG, AERIAL_CUPHYDRV_API_EVENT, "WAvgCfoPoolManager created");
 }
 

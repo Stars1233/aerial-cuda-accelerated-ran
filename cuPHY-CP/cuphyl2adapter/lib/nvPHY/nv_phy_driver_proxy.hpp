@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,6 +44,13 @@ public:
      * @return Reference to the PHYDriverProxy singleton
      */
     static PHYDriverProxy& getInstance();
+
+    /**
+     * @brief Get pointer to the singleton instance (safe, no UB)
+     * @return Pointer to the PHYDriverProxy singleton, or nullptr if not initialized
+     * @note Use this when you need to check if the proxy exists before using it
+     */
+    static PHYDriverProxy* getInstancePtr();
 
     /**
      * @brief Create and initialize the singleton with a PHY driver handle
@@ -210,7 +217,7 @@ public:
      * @param tb_len Transport block length in bytes
      * @param slot_index Slot index for buffer management
      */
-    void  l1_copy_TB_to_gpu_buf(uint16_t cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref, uint32_t tb_len, uint8_t slot_index);
+    void  l1_copy_TB_to_gpu_buf(uint16_t cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref, uint32_t tb_len, uint8_t slot_index, uint16_t sfn = 0);
     int l1_cv_mem_bank_update(uint32_t cell_id,uint16_t rnti, uint16_t buffer_idx, uint16_t reportType, uint16_t startPrbGrp,uint32_t srsPrbGrpSize,uint16_t numPrgs,
         uint8_t nGnbAnt,uint8_t nUeAnt,uint32_t offset, uint8_t* srsChEsts, uint16_t startValidPrg, uint16_t nValidPrg);
     int l1_cv_mem_bank_retrieve_buffer(uint32_t cell_id,uint16_t rnti, uint16_t buffer_idx, uint16_t reportType, uint8_t *pSrsPrgSize, uint16_t* pSrsStartPrg, uint16_t* pSrsStartValidPrg, uint16_t* pSrsNValidPrg, cuphyTensorDescriptor_t* descr, uint8_t** ptr);

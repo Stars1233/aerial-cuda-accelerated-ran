@@ -493,13 +493,20 @@ public:
      * @return Buffer size in bytes
      */
     size_t getSize() const;
-    
+
     /**
      * @brief Count available free buffers
      *
      * @return Number of free buffers in pool
      */
     size_t countElements() const;
+
+    /**
+     * @brief Get total GPU memory size allocated by this pool for memory footprint
+     *
+     * @return Total GPU memory size allocated by this pool in bytes
+     */
+    size_t getGpuMemSize() const;
 
     /**
      * @brief Pull free buffer from pool
@@ -523,6 +530,7 @@ protected:
     int                                         totRingElems;  ///< Total number of ring elements (should match sizePool)
     size_t                                      size;          ///< Size of each buffer in bytes
     size_t                                      sizePool;      ///< Total number of buffers in this pool
+    size_t                                      gpuMemSize;    ///< Total GPU memory size allocated by this pool in bytes
     GpuDevice*                                  gDev;          ///< GPU device pointer for memory operations
 };
 

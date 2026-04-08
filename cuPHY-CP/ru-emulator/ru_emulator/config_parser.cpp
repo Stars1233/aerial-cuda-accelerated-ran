@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,8 @@ void RU_Emulator::set_default_configs()
     opt_max_sect_stats = 0;
     opt_bfw_dl_validation = 1;
     opt_bfw_ul_validation = 1;
+    opt_beamid_validation = RE_DISABLED;
+    opt_sectionid_validation = RE_DISABLED;
     opt_num_slots_ul = 25;
     opt_num_slots_dl = 100;
     opt_c_interval_us = 0;
@@ -41,7 +43,8 @@ void RU_Emulator::set_default_configs()
     opt_send_slot = RE_DISABLED;
     opt_forever = RE_ENABLED;
     opt_validate_dl_timing = RE_DISABLED;
-    opt_dl_warmup_slots = 500;
+    opt_dl_warmup_slots = 512;
+    opt_ul_warmup_slots = 128;
     opt_timing_histogram = RE_DISABLED;
     opt_timing_histogram_bin_size = 1000;
 
@@ -59,11 +62,13 @@ void RU_Emulator::set_default_configs()
     opt_dl_enabled = RE_ENABLED;
     opt_dlc_tb = RE_DISABLED;
     opt_mod_comp_enabled = RE_DISABLED;
+    opt_non_mod_comp_enabled = RE_DISABLED;
 
     opt_enable_dl_proc_mt=0;
     opt_beamforming = RE_DISABLED;
     opt_dl_approx_validation = RE_DISABLED;
     opt_enable_mmimo = RE_DISABLED;
+    opt_min_ul_cores_per_cell_mmimo = MIN_UL_CORES_PER_CELL_MMIMO;
     opt_enable_beam_forming = RE_DISABLED;
     opt_enable_cplane_worker_tracing = RE_DISABLED;
     // opt_pdsch_validation = RE_ENABLED;
@@ -386,6 +391,8 @@ void RU_Emulator::parse_yaml(std::string yaml_file)
     try_yaml_assign_int(root, YAML_MAX_SECT_STATS, opt_max_sect_stats);
     try_yaml_assign_int(root, YAML_DL_BFW_VALIDATION, opt_bfw_dl_validation);
     try_yaml_assign_int(root, YAML_UL_BFW_VALIDATION, opt_bfw_ul_validation);
+    try_yaml_assign_int(root, YAML_BEAMID_VALIDATION, opt_beamid_validation);
+    try_yaml_assign_int(root, YAML_SECTIONID_VALIDATION, opt_sectionid_validation);
     try_yaml_assign_int(root, YAML_TIMER_LEVEL, opt_timer_level);
     try_yaml_assign_int(root, YAML_TIMER_OFFSET_US, opt_timer_offset_us);
     try_yaml_assign_int(root, YAML_SYMBOL_OFFSET_US, opt_symbol_offset_us);
@@ -396,6 +403,7 @@ void RU_Emulator::parse_yaml(std::string yaml_file)
     try_yaml_assign_int(root, YAML_PRACH_C_PLANE_PER_SYMBOL, opt_prach_c_plane_per_symbol);
     try_yaml_assign_int(root, YAML_VALIDATE_TIMING, opt_validate_dl_timing);
     try_yaml_assign_int(root, YAML_DL_WARMUP_SLOTS, opt_dl_warmup_slots);
+    try_yaml_assign_int(root, YAML_UL_WARMUP_SLOTS, opt_ul_warmup_slots);
     try_yaml_assign_int(root, YAML_TIMING_HISTOGRAM, opt_timing_histogram);
     try_yaml_assign_int(root, YAML_TIMING_HISTOGRAM_BIN_SIZE, opt_timing_histogram_bin_size);
 
@@ -418,11 +426,13 @@ void RU_Emulator::parse_yaml(std::string yaml_file)
     selective_tv_load = (opt_oam_cell_ctrl_cmd != RE_ENABLED && opt_dl_approx_validation != RE_ENABLED);
 
     try_yaml_assign_int(root, YAML_ENABLE_MMIMO, opt_enable_mmimo);
+    try_yaml_assign_int(root, YAML_MIN_UL_CORES_PER_CELL_MMIMO, opt_min_ul_cores_per_cell_mmimo);
     try_yaml_assign_int(root, YAML_ENABLE_BEAM_FORMING, opt_enable_beam_forming);
     try_yaml_assign_int(root, YAML_ENABLE_CPLANE_WORKER_TRACING, opt_enable_cplane_worker_tracing);
     try_yaml_assign_int(root, YAML_DROP_PACKET_EVERY_TEN_SECS, opt_drop_packet_every_ten_secs);
     try_yaml_assign_int(root, YAML_SPLIT_SRS_TXQ, opt_split_srs_txq);
     try_yaml_assign_int(root, YAML_UL_ONLY, opt_ul_only);
+    try_yaml_assign_int(root, YAML_ENABLE_PRECOMPUTED_TX, opt_enable_precomputed_tx);
     try_yaml_assign_int(root, YAML_ENABLE_SRS_EAXCID_PACING, opt_enable_srs_eaxcid_pacing);
     
     // SRS Pacing parameters
@@ -710,6 +720,17 @@ void RU_Emulator::parse_yaml(std::string yaml_file)
         do_throw(sb() << "Error in UL core list parsing\n");
     }
 
+    // Assign SRS core list (required when SRS is enabled)
+    try
+    {
+        yaml_assign_core_list(root, ul_srs_core_list, YAML_UL_SRS_CORE_LIST);
+    }
+    catch(const std::exception& e)
+    {
+        re_info("{}", e.what());
+        // SRS core list is optional when SRS Channel is disabled - validation happens later when enable_srs is known
+    }
+
     try
     {
         yaml_assign_core_list(root, dl_core_list, false,true);
@@ -768,7 +789,10 @@ void RU_Emulator::parse_yaml(std::string yaml_file)
             if (cc.dl_comp_meth == aerial_fh::UserDataCompressionMethod::MODULATION_COMPRESSION)
             {
                 opt_mod_comp_enabled = RE_ENABLED;
-                break;
+            }
+            else
+            {
+                opt_non_mod_comp_enabled = RE_ENABLED;
             }
         }
     }
@@ -1086,6 +1110,12 @@ void RU_Emulator::parse_launch_pattern(std::string yaml_file)
         opt_num_cells = root[YAML_LP_CELL_CONFIGS].length();
     }
 
+    if (opt_num_cells < 1 || opt_num_cells > MAX_CELLS_PER_SLOT)
+    {
+        do_throw(sb() << "opt_num_cells (" << opt_num_cells
+                       << ") out of valid range [1, " << MAX_CELLS_PER_SLOT << "]\n");
+    }
+
     yaml::node sched = root[YAML_LP_SCHED];
 
     opt_launch_pattern_version = root.has_key(YAML_LP_TV) ? 1 : 2;
@@ -1323,10 +1353,18 @@ void RU_Emulator::apply_configs()
         opt_bfw_ul_validation = RE_DISABLED;
     }
 
+    section_id_trackers = std::make_unique<SectionIdTrackerStorage>();
+    sectionid_validation_init();
 }
 
 void RU_Emulator::verify_configs()
 {
+    if (opt_num_cells < 1 || opt_num_cells > MAX_CELLS_PER_SLOT)
+    {
+        do_throw(sb() << "opt_num_cells (" << opt_num_cells
+                       << ") out of valid range [1, " << MAX_CELLS_PER_SLOT << "]\n");
+    }
+
     int pdsch_slots = 0;
     int pusch_slots = 0;
     int prach_slots = 0;
@@ -1615,6 +1653,12 @@ void RU_Emulator::print_configs()
     NVLOGI_FMT(TAG, "\tUL Core list: {}", core_list_str.c_str());
 
     core_list_str = "";
+    for (int i: ul_srs_core_list) {
+        core_list_str += std::to_string(i) + ' ';
+    }
+    NVLOGI_FMT(TAG, "\tUL SRS Core list: {}", core_list_str.c_str());
+
+    core_list_str = "";
     for (int i: dl_core_list) {
         core_list_str += std::to_string(i) + ' ';
     }
@@ -1673,6 +1717,8 @@ void RU_Emulator::print_configs()
     }
     NVLOGI_FMT(TAG, "\tDL Approx Validation: {}", opt_dl_approx_validation == RE_ENABLED ? "ENABLED" : "DISABLED");
     NVLOGI_FMT(TAG, "\tmMIMO : {}", opt_enable_mmimo == RE_ENABLED ? "ENABLED" : "DISABLED");
+    NVLOGI_FMT(TAG, "\tMin UL Cores Per Cell (mMIMO): {}", opt_min_ul_cores_per_cell_mmimo);
+    NVLOGI_FMT(TAG, "\tPre-computed TX : {}", opt_enable_precomputed_tx == RE_ENABLED ? "ENABLED" : "DISABLED");
     NVLOGI_FMT(TAG, "\tBeam forming : {}", opt_enable_beam_forming == RE_ENABLED ? "ENABLED" : "DISABLED");
     NVLOGI_FMT(TAG, "\tCPlane Worker Tracing : {}", opt_enable_cplane_worker_tracing == RE_ENABLED ? "ENABLED" : "DISABLED");
     NVLOGI_FMT(TAG, "\tDL Drop packet every 10 seconds: {}", opt_drop_packet_every_ten_secs == RE_ENABLED ? "ENABLED" : "DISABLED");
@@ -1692,6 +1738,8 @@ void RU_Emulator::print_configs()
     NVLOGI_FMT(TAG, "\topt_max_sect_stats: {}", opt_max_sect_stats);
     NVLOGI_FMT(TAG, "\topt_bfw_dl_validation: {}", opt_bfw_dl_validation);
     NVLOGI_FMT(TAG, "\topt_bfw_ul_validation: {}", opt_bfw_ul_validation);
+    NVLOGI_FMT(TAG, "\topt_beamid_validation: {}", opt_beamid_validation);
+    NVLOGI_FMT(TAG, "\topt_sectionid_validation: {}", opt_sectionid_validation);
 
     NVLOGI_FMT(TAG_TV_CONFIGS, "\tPUSCH TVs:");
     for (int i = 0; i < pusch_object.tv_names.size(); ++i)
@@ -2232,6 +2280,17 @@ void yaml_assign_core_list(yaml::node root, std::vector<int>& core_list, bool UL
     }
 }
 
+void yaml_assign_core_list(yaml::node root, std::vector<int>& core_list, const char* key)
+{
+    yaml::node config_core_list = root[key];
+
+    for(int i = 0; i < config_core_list.length(); ++i)
+    {
+        int core = static_cast<int>(config_core_list[i]);
+        core_list.push_back(core);
+    }
+}
+
 void RU_Emulator::yaml_assign_launch_pattern(yaml::node root, std::string channel, launch_pattern_matrix& launch_pattern, std::unordered_map<std::string, int>& tv_map, int num_cells)
 {
     std::string tv;
@@ -2241,9 +2300,18 @@ void RU_Emulator::yaml_assign_launch_pattern(yaml::node root, std::string channe
     int tv_index;
     try
     {
-        launch_pattern = launch_pattern_matrix(root.length());
+        int root_length = root.length();
 
-        for(int slot_idx = 0; slot_idx < root.length(); ++slot_idx)
+        // Early return if root is empty to avoid division by zero
+        if (root_length == 0)
+        {
+            re_cons("Launch pattern root is empty");
+            return;
+        }
+
+        launch_pattern = launch_pattern_matrix(root_length);
+
+        for(int slot_idx = 0; slot_idx < root_length; ++slot_idx)
         {
             slot_num = static_cast<int>(root[slot_idx][YAML_LP_SLOT]);
             yaml::node config_node = root[slot_idx][YAML_LP_CONFIG];
@@ -2277,7 +2345,7 @@ void RU_Emulator::yaml_assign_launch_pattern(yaml::node root, std::string channe
                                 tv_index = tv_map[channel_to_tv_map[channel_type][tv_name]];
                                 if(channel == YAML_LP_BFW_DL || channel == YAML_LP_BFW_UL)
                                 {
-                                    launch_pattern[(slot_num + 1) % root.length()][cell_index] = tv_index;
+                                    launch_pattern[(slot_num + 1) % root_length][cell_index] = tv_index;
                                 }
                                 else
                                 {
@@ -2299,7 +2367,7 @@ void RU_Emulator::yaml_assign_launch_pattern(yaml::node root, std::string channe
 
                             if(channel == YAML_LP_BFW_DL || channel == YAML_LP_BFW_UL)
                             {
-                                launch_pattern[(slot_num + 1) % root.length()][cell_index] = tv_index;
+                                launch_pattern[(slot_num + 1) % root_length][cell_index] = tv_index;
                             }
                             else
                             {

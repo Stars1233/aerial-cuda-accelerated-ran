@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -72,7 +72,7 @@ public:
     cuphy::tensor_device*   getTensor();                                                               ///< Get cuPHY tensor descriptor for this buffer
     struct umsg_fh_tx_msg&  getTxMsgContainer();                                                       ///< Get fronthaul TX message container for U-plane packets
     int                     txUplaneSlot();                                                            ///< Transmit U-plane data for this slot (returns 0 on success)
-    int                     runCompression(compression_params &params, MpsCtx * mpsCtx, cudaStream_t stream); ///< Run compression kernel on GPU (returns 0 on success)
+    int                     runCompression(const std::array<compression_params, NUM_USER_DATA_COMPRESSION_METHODS>& cparams_array, MpsCtx * mpsCtx, cudaStream_t stream); ///< Run compression kernel on GPU for all compression methods (returns 0 on success)
     mod_compression_params* getModCompressionConfig(){return mod_comp_params_per_cell;};              ///< Get modulation compression configuration
     mod_compression_params* getModCompressionTempConfig(){return mod_comp_config_temp.get();};        ///< Get temporary modulation compression configuration
     int                     waitEventNonBlocking(cudaEvent_t event);                                   ///< Non-blocking wait for CUDA event (returns 0 if complete, -1 if not ready)

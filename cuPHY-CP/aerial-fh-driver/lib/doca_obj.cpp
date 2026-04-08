@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -102,7 +102,7 @@ doca_init_logger(void)
 }
 
 doca_error_t
-doca_create_rx_queue(struct doca_rx_items *item, struct doca_gpu *gpu_dev, struct doca_dev *ddev, int ndescr, enum doca_gpu_mem_type mtype, int max_pkt_size, int num_pkts)
+doca_create_rx_queue(struct doca_rx_items *item, struct doca_gpu *gpu_dev, struct doca_dev *ddev, int ndescr, enum doca_gpu_mem_type mtype, int max_pkt_size, int num_pkts, uint8_t enable_gpu_comm_via_cpu)
 {
 	doca_error_t result;
 	uint32_t cyclic_buffer_size = 0;
@@ -128,7 +128,11 @@ doca_create_rx_queue(struct doca_rx_items *item, struct doca_gpu *gpu_dev, struc
 		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed doca_eth_rxq_set_type: {}", doca_error_get_descr(result));
 		return DOCA_ERROR_BAD_STATE;
 	}
-
+	result = doca_eth_rxq_gpu_set_rq_mem_type(item->eth_rxq_cpu, mtype);
+	if (result != DOCA_SUCCESS) {
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed doca_eth_rxq_gpu_set_rq_mem_type: {}", doca_error_get_descr(result));
+		return DOCA_ERROR_BAD_STATE;
+	}
 	result = doca_eth_rxq_estimate_packet_buf_size(DOCA_ETH_RXQ_TYPE_CYCLIC, 0, 0, max_pkt_size, num_pkts, 0,  0,  0, &cyclic_buffer_size);
 	if (result != DOCA_SUCCESS) {
 		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to get eth_rxq cyclic buffer size: {}", doca_error_get_descr(result));
@@ -158,28 +162,38 @@ doca_create_rx_queue(struct doca_rx_items *item, struct doca_gpu *gpu_dev, struc
 		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to allocate gpu memory {}", doca_error_get_descr(result));
 		return DOCA_ERROR_BAD_STATE;
 	}
+	memfoot_add_gpu_size(MF_TAG_FH_DOCA_RX, cyclic_buffer_size);
 
-	/* Map GPU memory buffer used to receive packets with DMABuf */
-	result = doca_gpu_dmabuf_fd(item->gpu_dev, item->gpu_pkt_addr, cyclic_buffer_size, &(item->dmabuf_fd));
-	if (result != DOCA_SUCCESS) {
-		NVLOGI_FMT(TAG, "Mapping receive queue buffer ({} size {}B) with nvidia-peermem mode",
-				(void*)item->gpu_pkt_addr, cyclic_buffer_size);
+	if (!enable_gpu_comm_via_cpu) {
+		/* Map GPU memory buffer used to receive packets with DMABuf */
+		result = doca_gpu_dmabuf_fd(item->gpu_dev, item->gpu_pkt_addr, cyclic_buffer_size, &(item->dmabuf_fd));
+		if (result != DOCA_SUCCESS) {
+			NVLOGI_FMT(TAG, "Mapping receive queue buffer ({} size {}B) with nvidia-peermem mode",
+					(void*)item->gpu_pkt_addr, cyclic_buffer_size);
 
-		/* If failed, use nvidia-peermem legacy method */
-		result = doca_mmap_set_memrange(item->pkt_buff_mmap, item->gpu_pkt_addr, cyclic_buffer_size);
+			/* If failed, use nvidia-peermem legacy method */
+			result = doca_mmap_set_memrange(item->pkt_buff_mmap, item->gpu_pkt_addr, cyclic_buffer_size);
+			if (result != DOCA_SUCCESS) {
+				NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to set memrange for mmap {}", doca_error_get_descr(result));
+				return result;
+			}
+		} else {
+			NVLOGI_FMT(TAG, "Mapping receive queue buffer ({} size {}B dmabuf fd {}) with dmabuf mode",
+				(void*)item->gpu_pkt_addr, cyclic_buffer_size, item->dmabuf_fd);
+
+			result = doca_mmap_set_dmabuf_memrange(item->pkt_buff_mmap, item->dmabuf_fd, item->gpu_pkt_addr, 0, cyclic_buffer_size);
+			if (result != DOCA_SUCCESS) {
+				NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to set dmabuf memrange for mmap {}", doca_error_get_descr(result));
+				return result;
+			}
+		}		
+	}
+	else {
+		result = doca_mmap_set_memrange(item->pkt_buff_mmap, item->cpu_pkt_addr, cyclic_buffer_size);
 		if (result != DOCA_SUCCESS) {
 			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to set memrange for mmap {}", doca_error_get_descr(result));
 			return result;
-		}
-	} else {
-		NVLOGI_FMT(TAG, "Mapping receive queue buffer ({} size {}B dmabuf fd {}) with dmabuf mode",
-			(void*)item->gpu_pkt_addr, cyclic_buffer_size, item->dmabuf_fd);
-
-		result = doca_mmap_set_dmabuf_memrange(item->pkt_buff_mmap, item->dmabuf_fd, item->gpu_pkt_addr, 0, cyclic_buffer_size);
-		if (result != DOCA_SUCCESS) {
-			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to set dmabuf memrange for mmap {}", doca_error_get_descr(result));
-			return result;
-		}
+		}	
 	}
 
 	result = doca_mmap_set_permissions(item->pkt_buff_mmap, DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
@@ -224,10 +238,64 @@ doca_create_rx_queue(struct doca_rx_items *item, struct doca_gpu *gpu_dev, struc
 		return DOCA_ERROR_BAD_STATE;
 	}
 
-	result = doca_eth_rxq_get_flow_queue_id(item->eth_rxq_cpu, &item->dpdk_queue_idx);
+	//Get the HW queue index from DOCA here
+	result = doca_eth_rxq_get_hw_queue_num(item->eth_rxq_cpu, &(item->hw_queue_idx));
 	if (result != DOCA_SUCCESS) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed doca_eth_rxq_get_gpu_handle: {}", doca_error_get_descr(result));
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed doca_eth_rxq_get_hw_queue_num: {}", doca_error_get_descr(result));
 		return DOCA_ERROR_BAD_STATE;
+	}	
+
+	return DOCA_SUCCESS;
+}
+
+/**
+ * Free device memory for aerial_fh_gpu_semaphore_gpu structure
+ *
+ * @param[in] sem_gpu_aerial_fh Device pointer to aerial_fh_gpu_semaphore_gpu structure to free
+ *
+ * @return DOCA_SUCCESS on success, DOCA_ERROR_** otherwise
+ */
+static doca_error_t
+free_aerial_fh_semaphore_gpu(struct doca_gpu *gpu_dev, struct aerial_fh_gpu_semaphore_gpu *sem_gpu_aerial_fh)
+{
+	doca_error_t result;
+
+	if (sem_gpu_aerial_fh == NULL) {
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Invalid parameters for aerial_fh semaphore free");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+	result = doca_gpu_mem_free(gpu_dev, sem_gpu_aerial_fh);
+	if (result != DOCA_SUCCESS) {
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to free aerial_fh_gpu_semaphore_gpu: {}", doca_error_get_descr(result));
+		return result;
+	}
+
+	return DOCA_SUCCESS;
+}
+
+/**
+ * Allocate device memory for aerial_fh_gpu_semaphore_gpu structure
+ *
+ * @param[out] sem_gpu_aerial_fh Device pointer to allocated aerial_fh_gpu_semaphore_gpu structure
+ * @param[in] nitems Number of items for packet info array
+ *
+ * @return DOCA_SUCCESS on success, DOCA_ERROR_** otherwise
+ */
+static doca_error_t
+allocate_aerial_fh_semaphore_gpu(struct doca_gpu *gpu_dev, struct aerial_fh_gpu_semaphore_gpu **sem_gpu_aerial_fh, const int nitems)
+{
+	doca_error_t result;
+
+	if (sem_gpu_aerial_fh == NULL || nitems <= 0) {
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Invalid parameters for aerial_fh semaphore allocation");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+	result = doca_gpu_mem_alloc(gpu_dev, sizeof(struct aerial_fh_gpu_semaphore_gpu), sysconf(_SC_PAGESIZE), DOCA_GPU_MEM_TYPE_GPU, (void **)sem_gpu_aerial_fh, nullptr);	
+	if (result != DOCA_SUCCESS) {
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to allocate device memory for aerial_fh_gpu_semaphore_gpu: {}", doca_error_get_descr(result));
+		return result;
 	}
 
 	return DOCA_SUCCESS;
@@ -275,6 +343,16 @@ doca_destroy_rx_queue(struct doca_rx_items *item)
 			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to free cpu memory: {}", doca_error_get_descr(result));
 			return DOCA_ERROR_BAD_STATE;
 		}
+	}
+
+	// Free device memory for aerial_fh GPU semaphore structure
+	if (item->sem_gpu_aerial_fh != NULL) {
+		result = free_aerial_fh_semaphore_gpu(item->gpu_dev, item->sem_gpu_aerial_fh);
+		if (result != DOCA_SUCCESS) {
+			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to free aerial_fh_gpu_semaphore_gpu: {}", doca_error_get_descr(result));
+			return DOCA_ERROR_BAD_STATE;
+		}
+		item->sem_gpu_aerial_fh = NULL;
 	}
 
 	return DOCA_SUCCESS;
@@ -335,6 +413,13 @@ doca_create_semaphore(struct doca_rx_items *item, struct doca_gpu *gpu_dev, int 
 		return DOCA_ERROR_BAD_STATE;
 	}
 
+	// Allocate device memory for aerial_fh GPU semaphore structure
+	result = allocate_aerial_fh_semaphore_gpu(gpu_dev,&(item->sem_gpu_aerial_fh), nitems);
+	if (result != DOCA_SUCCESS) {
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to allocate aerial_fh_gpu_semaphore_gpu: {}", doca_error_get_descr(result));
+		return DOCA_ERROR_BAD_STATE;
+	}
+
 	return DOCA_SUCCESS;
 }
 
@@ -371,7 +456,8 @@ doca_create_tx_buf(struct doca_tx_buf *buf, struct doca_gpu *gpu_dev, struct doc
 	doca_error_t status;
 
 	if (buf == NULL || gpu_dev == NULL || ddev == NULL || num_packets == 0 || max_pkt_sz == 0) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Invalid input arguments");
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Invalid input arguments. Args are: buf {:p}, gpu_dev {:p}, ddev {:p}, num_packets {}, max_pkt_sz {}",
+                                                            (void*)buf, (void*)gpu_dev, (void*)ddev, num_packets, max_pkt_sz);
 		return DOCA_ERROR_INVALID_VALUE;
 	}
 
@@ -394,86 +480,69 @@ doca_create_tx_buf(struct doca_tx_buf *buf, struct doca_gpu *gpu_dev, struct doc
 		return status;
 	}
 	if(enable_gpu_comm_via_cpu==1){
-		status = doca_gpu_mem_alloc(buf->gpu_dev, size , 4096, buf->mtype, (void **)&(buf->gpu_pkt_addr), (void **)&(buf->cpu_pkt_addr));
+		status = doca_gpu_mem_alloc(buf->gpu_dev, size , sysconf(_SC_PAGESIZE), buf->mtype, (void **)&(buf->gpu_pkt_addr), (void **)&(buf->cpu_pkt_addr));
 	}
 	else
 	{
-		status = doca_gpu_mem_alloc(buf->gpu_dev, size , 4096, buf->mtype, (void **)&(buf->gpu_pkt_addr), NULL);
+		status = doca_gpu_mem_alloc(buf->gpu_dev, size , sysconf(_SC_PAGESIZE), buf->mtype, (void **)&(buf->gpu_pkt_addr), NULL);
 	}
 	if ((status != DOCA_SUCCESS) || (buf->gpu_pkt_addr == NULL)) {
 		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Unable to alloc txbuf: failed to allocate gpu memory");
 		return status;
 	}
+	memfoot_add_gpu_size(MF_TAG_FH_DOCA_TX, size);
 
-	/* Map GPU memory buffer used to receive packets with DMABuf */
-#if 0   // Set to 1, if you want to temporarily force nvidia-peermem path
-	//status = doca_gpu_dmabuf_fd(buf->gpu_dev, buf->gpu_pkt_addr, size, &(buf->dmabuf_fd));
-	if (true) {
-#else
-	status = doca_gpu_dmabuf_fd(buf->gpu_dev, buf->gpu_pkt_addr, size, &(buf->dmabuf_fd));
-        NVLOGC_FMT(TAG, "doca_gpu_dmabuf_fd returned {} (DOCA_SUCCESS is {})", +status, +DOCA_SUCCESS);
-	if (status != DOCA_SUCCESS) {
-#endif
-		NVLOGC_FMT(TAG, "Mapping transmit queue buffer ({:p} size {}B) with nvidia-peermem mode",
-				(void*)buf->gpu_pkt_addr, size);
 
-		/* If failed, use nvidia-peermem legacy method */
-		status = doca_mmap_set_memrange(buf->mmap, buf->gpu_pkt_addr, size);
+	if(!enable_gpu_comm_via_cpu)
+	{
+		/* Map GPU memory buffer used to receive packets with DMABuf */
+		#if 0   // Set to 1, if you want to temporarily force nvidia-peermem path
+		//status = doca_gpu_dmabuf_fd(buf->gpu_dev, buf->gpu_pkt_addr, size, &(buf->dmabuf_fd));
+		if (true) {
+	#else
+		status = doca_gpu_dmabuf_fd(buf->gpu_dev, buf->gpu_pkt_addr, size, &(buf->dmabuf_fd));
+			NVLOGC_FMT(TAG, "doca_gpu_dmabuf_fd returned {} (DOCA_SUCCESS is {})", +status, +DOCA_SUCCESS);
 		if (status != DOCA_SUCCESS) {
-			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to set memrange for mmap {}", doca_error_get_descr(status));
+	#endif
+			NVLOGC_FMT(TAG, "Mapping transmit queue buffer ({:p} size {}B) with nvidia-peermem mode",
+					(void*)buf->gpu_pkt_addr, size);
+
+			/* If failed, use nvidia-peermem legacy method */
+			status = doca_mmap_set_memrange(buf->mmap, buf->gpu_pkt_addr, size);
+			if (status != DOCA_SUCCESS) {
+				NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to set memrange for mmap {}", doca_error_get_descr(status));
+				return status;
+			}
+		} else {
+			NVLOGC_FMT(TAG, "Mapping transmit queue buffer ({:p} size {}B dmabuf fd {}) with dmabuf mode",
+				(void*)buf->gpu_pkt_addr, size, buf->dmabuf_fd);
+
+			status = doca_mmap_set_dmabuf_memrange(buf->mmap, buf->dmabuf_fd, buf->gpu_pkt_addr, 0, size);
+			if (status != DOCA_SUCCESS) {
+				NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to set dmabuf memrange for mmap {}", doca_error_get_descr(status));
+				return status;
+			}
+		}
+
+		status = doca_mmap_set_permissions(buf->mmap, DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
+		if (status != DOCA_SUCCESS) {
+			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_mmap_set_permissions error");
 			return status;
 		}
-	} else {
-		NVLOGC_FMT(TAG, "Mapping transmit queue buffer ({:p} size {}B dmabuf fd {}) with dmabuf mode",
-			(void*)buf->gpu_pkt_addr, size, buf->dmabuf_fd);
 
-		status = doca_mmap_set_dmabuf_memrange(buf->mmap, buf->dmabuf_fd, buf->gpu_pkt_addr, 0, size);
+		status = doca_mmap_start(buf->mmap);
 		if (status != DOCA_SUCCESS) {
-			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to set dmabuf memrange for mmap {}", doca_error_get_descr(status));
+			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_mmap_start error");
 			return status;
 		}
-	}
 
-	status = doca_mmap_set_permissions(buf->mmap, DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
-	if (status != DOCA_SUCCESS) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_mmap_set_permissions error");
-		return status;
-	}
-
-	status = doca_mmap_start(buf->mmap);
-	if (status != DOCA_SUCCESS) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_mmap_start error");
-		return status;
-	}
-
-	status = doca_buf_arr_create(buf->num_packets, &buf->buf_arr);
-	if (status != DOCA_SUCCESS) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_create error");
-		return status;
-	}
-
-	status = doca_buf_arr_set_target_gpu(buf->buf_arr, buf->gpu_dev);
-	if (status != DOCA_SUCCESS) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_set_target_gpu error");
-		return status;
-	}
-
-	status = doca_buf_arr_set_params(buf->buf_arr, buf->mmap, buf->max_pkt_sz, 0);
-	if (status != DOCA_SUCCESS) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_set_params error");
-		return status;
-	}
-
-	status = doca_buf_arr_start(buf->buf_arr);
-	if (status != DOCA_SUCCESS) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_start error {}", doca_error_get_descr(status));
-		return status;
-	}
-
-	status = doca_buf_arr_get_gpu_handle(buf->buf_arr, &(buf->buf_arr_gpu));
-	if (status != DOCA_SUCCESS) {
-		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_get_gpu_handle {}", doca_error_get_descr(status));
-		return status;
+		status = doca_mmap_get_mkey(buf->mmap, buf->ddev, &buf->pkt_buff_mkey);
+		if (status != DOCA_SUCCESS) {
+			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to get mmap mkey %s", doca_error_get_descr(status));
+			return status;
+		}
+		// N.B. mkey must be in network byte order
+		buf->pkt_buff_mkey = htobe32(buf->pkt_buff_mkey);	
 	}
 
 
@@ -490,11 +559,12 @@ doca_create_tx_buf(struct doca_tx_buf *buf, struct doca_gpu *gpu_dev, struct doc
 			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Unable to add dev to buf: doca mmap internal error");
 			return status;
 		}
-		status = doca_gpu_mem_alloc(buf->gpu_dev, size , 4096, DOCA_GPU_MEM_TYPE_CPU_GPU, (void **)&(buf->cpu_comms_gpu_pkt_addr), (void **)&(buf->cpu_comms_cpu_pkt_addr));
+		status = doca_gpu_mem_alloc(buf->gpu_dev, size , sysconf(_SC_PAGESIZE), DOCA_GPU_MEM_TYPE_CPU_GPU, (void **)&(buf->cpu_comms_gpu_pkt_addr), (void **)&(buf->cpu_comms_cpu_pkt_addr));
 		if ((status != DOCA_SUCCESS) || (buf->cpu_comms_gpu_pkt_addr == NULL)) {
 			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Unable to alloc txbuf: failed to allocate cpu memory");
 			return status;
 		}
+		memfoot_add_gpu_size(MF_TAG_FH_DOCA_TX, size);
 
 		/* If failed, use nvidia-peermem legacy method */
 		status = doca_mmap_set_memrange(buf->cpu_comms_mmap, buf->cpu_comms_cpu_pkt_addr, size);
@@ -515,42 +585,20 @@ doca_create_tx_buf(struct doca_tx_buf *buf, struct doca_gpu *gpu_dev, struct doc
 			return status;
 		}
 
-		status = doca_buf_arr_create(buf->num_packets, &buf->cpu_comms_buf_arr);
+		status = doca_mmap_get_mkey(buf->cpu_comms_mmap, buf->ddev, &buf->cpu_comms_pkt_buff_mkey);
 		if (status != DOCA_SUCCESS) {
-			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_create error");
+			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to get mmap mkey %s", doca_error_get_descr(status));
 			return status;
 		}
-
-		status = doca_buf_arr_set_target_gpu(buf->cpu_comms_buf_arr, buf->gpu_dev);
-		if (status != DOCA_SUCCESS) {
-			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_set_target_gpu error");
-			return status;
-		}
-
-		status = doca_buf_arr_set_params(buf->cpu_comms_buf_arr, buf->cpu_comms_mmap, buf->max_pkt_sz, 0);
-		if (status != DOCA_SUCCESS) {
-			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_set_params error");
-			return status;
-		}
-
-		status = doca_buf_arr_start(buf->cpu_comms_buf_arr);
-		if (status != DOCA_SUCCESS) {
-			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_start error {}", doca_error_get_descr(status));
-			return status;
-		}
-
-		status = doca_buf_arr_get_gpu_handle(buf->cpu_comms_buf_arr, &(buf->cpu_comms_buf_arr_gpu));
-		if (status != DOCA_SUCCESS) {
-			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "doca_buf_arr_get_gpu_handle {}", doca_error_get_descr(status));
-			return status;
-		}
+		// N.B. mkey must be in network byte order
+		buf->cpu_comms_pkt_buff_mkey = htobe32(buf->cpu_comms_pkt_buff_mkey);		
 	}
 
 	return DOCA_SUCCESS;
 }
 
 doca_error_t
-doca_create_tx_queue(struct doca_tx_items *item, struct doca_gpu *gpu_dev, struct doca_dev *ddev, int ndescr, int txq_id)
+doca_create_tx_queue(struct doca_tx_items *item, struct doca_gpu *gpu_dev, struct doca_dev *ddev, int ndescr, int txq_id, enum doca_gpu_mem_type mtype)
 {
 	doca_error_t result;
 	uint32_t cyclic_buffer_size = 0;
@@ -574,6 +622,20 @@ doca_create_tx_queue(struct doca_tx_items *item, struct doca_gpu *gpu_dev, struc
 		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed doca_eth_txq_create: {}", doca_error_get_descr(result));
 		return DOCA_ERROR_BAD_STATE;
 	}
+
+	result = doca_eth_txq_gpu_set_sq_mem_type(item->eth_txq_cpu, mtype);
+	if (result != DOCA_SUCCESS) {
+		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed doca_eth_txq_gpu_set_sq_mem_type: {}", doca_error_get_descr(result));
+		return DOCA_ERROR_BAD_STATE;
+	}
+
+	if (mtype == DOCA_GPU_MEM_TYPE_CPU_GPU) {
+		result = doca_eth_txq_gpu_set_uar_on_cpu(item->eth_txq_cpu);
+		if (result != DOCA_SUCCESS) {
+			NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed doca_eth_txq_gpu_set_uar_on_cpu: {}", doca_error_get_descr(result));
+			return DOCA_ERROR_BAD_STATE;
+		}
+	}	
 
 	result = doca_eth_txq_set_wait_on_time_offload(item->eth_txq_cpu);
 	if (result != DOCA_SUCCESS) {

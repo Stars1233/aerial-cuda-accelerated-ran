@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -156,7 +156,7 @@ int main(int argc, char* argv[])
         size_t max_cells          =  CUPHY_SRS_MAX_N_USERS / 8; // NOTE: assuming 8 activate UEs per cell to calculate max buffer size
         size_t max_rbSnr_mem      =  CUPHY_SRS_MAX_N_USERS * 273 * sizeof(float);
         size_t max_srsReport_mem  =  CUPHY_SRS_MAX_N_USERS * sizeof(cuphySrsReport_t);
-        size_t max_chEstToL2_mem  =  max_cells * 273 * 128 * 16 * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL; // MAX_N_SRS_CELL * max_prbs * max_ants * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL
+        size_t max_chEstToL2_mem  =  max_cells * 273 * 128 * 16 * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL * 2; // MAX_N_SRS_CELL * max_prbs * max_ants * CUPHY_SRS_MAX_FULL_BAND_SRS_ANT_PORTS_SLOT_PER_CELL
         size_t max_mem            =  max_rbSnr_mem + max_srsReport_mem + max_chEstToL2_mem;
 
         cuphy::linear_alloc<128, cuphy::device_alloc> linearAlloc(max_mem);
@@ -213,6 +213,7 @@ int main(int argc, char* argv[])
         uint32_t            rbSnrBufferSize = nSrsUes * 273;
         float*              d_rbSnrBuffer   = static_cast<float*>(linearAlloc.alloc(sizeof(float) * rbSnrBufferSize));
         cuphySrsReport_t*   d_srsReports    = static_cast<cuphySrsReport_t*>(linearAlloc.alloc(sizeof(cuphySrsReport_t) * nSrsUes));
+        std::vector<void*>  addrGpuChEstToL2InnerVec(nSrsUes);
         std::vector<void*>  addrGpuChEstToL2Vec(nSrsUes);
         // since cuphySrsReport_t has few parameters that need to be initialized to 0, perform the following copy
         // ToDo?? any better approach?
@@ -232,6 +233,7 @@ int main(int argc, char* argv[])
         
         for(int ueIdx = 0; ueIdx < nSrsUes; ++ueIdx){
             size_t maxChEstSize = 273*128*4*sizeof(float2);
+            addrGpuChEstToL2InnerVec[ueIdx] = linearAlloc.alloc(maxChEstSize);
             addrGpuChEstToL2Vec[ueIdx] = linearAlloc.alloc(maxChEstSize);
         }
 
@@ -314,6 +316,7 @@ int main(int argc, char* argv[])
                                                             rbSnrBuffOffsetsVec.data(),
                                                             d_srsReports,
                                                             pChEstBuffInfo,
+                                                            addrGpuChEstToL2InnerVec.data(),
                                                             addrGpuChEstToL2Vec.data(),
                                                             pSrsChEstToL2,
                                                             d_workspace,

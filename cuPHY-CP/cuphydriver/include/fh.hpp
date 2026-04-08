@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -68,19 +68,6 @@ enum fh_msg_info_type
     BFW_MSG_INFO = 1,                                                  ///< Message contains beamforming weights
     NUM_MSG_INFO_TYPES                                                 ///< Total number of message info types
 }; 
-
-/**
- * @brief Convert strongly-typed enum to its underlying integer type
- *
- * @tparam EnumType - Enum class type to convert
- * @param e         - Enum value to convert
- * @return Underlying integer value of the enum
- */
-template <typename EnumType>
-constexpr auto to_underlying(EnumType e) -> std::underlying_type_t<EnumType>
-{
-    return static_cast<std::underlying_type_t<EnumType>>(e);
-}
 
 /**
  * @brief C-plane send error type codes
@@ -251,8 +238,8 @@ using FhStaticBfwStorage = std::unordered_map<uint16_t, StaticBfwMap>;    ///< M
 struct DynamicSectionExt11Params final {
     slot_command_api::prb_info_t& prb_info;                            ///< Reference to PRB allocation information (input/output)
     fhproxy_cmsg_section& section_info;                                ///< Reference to C-plane section info (output)
-    fhproxy_cmsg_section_ext* section_ext_infos{nullptr};              ///< Array of section extension structures (output)
-    fhproxy_cmsg_section_ext_11_bundle_info* section_ext_11_bundle_infos{nullptr}; ///< Array of section ext 11 bundle info (output)
+    std::array<fhproxy_cmsg_section_ext,MAX_CPLANE_SECTIONS_EXT_PER_SLOT> &section_ext_infos;              ///< Array of section extension structures (output)
+    std::array<fhproxy_cmsg_section_ext_11_bundle_info,MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT> &section_ext_11_bundle_infos; ///< Array of section ext 11 bundle info (output)
     size_t& section_ext_index;                                         ///< Current section extension array index (input/output)
     size_t& section_ext_11_bundle_index;                               ///< Current section ext 11 bundle array index (input/output)
 
@@ -290,7 +277,37 @@ struct csirs_section_id_info_t {
     uint16_t start_prb;                                                ///< Starting PRB index for this CSI-RS resource
     uint16_t num_prb;                                                  ///< Number of PRBs allocated for this CSI-RS resource
     uint16_t symbol;                                                   ///< OFDM symbol index for this CSI-RS resource
+    uint16_t section_id_lookback_index;                                ///< Section ID lookback index for CSI-RS compact signaling
 };
+
+struct cplane_buffer_t {
+    
+    // fhproxy_cmsg message_infos_[fh_msg_info_type::NUM_MSG_INFO_TYPES][MAX_CPLANE_MSGS_PER_SLOT]
+    std::array<std::array<fhproxy_cmsg, MAX_CPLANE_MSGS_PER_SLOT>, fh_msg_info_type::NUM_MSG_INFO_TYPES> message_infos_{}; 
+
+    // fhproxy_cmsg_section section_infos_[fh_msg_info_type::NUM_MSG_INFO_TYPES][MAX_AP_PER_SLOT_SRS][MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP];
+    std::array<std::array<std::array<fhproxy_cmsg_section, MAX_CPLANE_SECTIONS_PER_SLOT_PER_AP>, MAX_AP_PER_SLOT_SRS>,fh_msg_info_type::NUM_MSG_INFO_TYPES> section_infos_{};
+
+    // uint16_t section_id_per_ant_[MAX_AP_PER_SLOT_SRS];
+    std::array<uint16_t,MAX_AP_PER_SLOT_SRS> section_id_per_ant_{};
+
+    // uint16_t start_section_id_srs_per_ant_[MAX_AP_PER_SLOT_SRS];
+    std::array<uint16_t,MAX_AP_PER_SLOT_SRS> start_section_id_srs_per_ant_{};
+
+    // uint16_t start_section_id_prach_per_ant_[MAX_AP_PER_SLOT_SRS];
+    std::array<uint16_t,MAX_AP_PER_SLOT_SRS> start_section_id_prach_per_ant_{};
+
+    // uint16_t message_index_[fh_msg_info_type::NUM_MSG_INFO_TYPES]; Indexes into message_infos_[][] array
+    std::array<uint16_t,fh_msg_info_type::NUM_MSG_INFO_TYPES> message_index_{};
+    static_assert(MAX_CPLANE_MSGS_PER_SLOT <= std::numeric_limits<decltype(message_index_)::value_type>::max()); 
+
+    // fhproxy_cmsg_section_ext section_ext_infos_[MAX_CPLANE_SECTIONS_EXT_PER_SLOT]; 
+    std::array<fhproxy_cmsg_section_ext, MAX_CPLANE_SECTIONS_EXT_PER_SLOT> section_ext_infos_{};
+
+    // fhproxy_cmsg_section_ext_11_bundle_info section_ext_11_bundle_infos_[MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT];
+    std::array<fhproxy_cmsg_section_ext_11_bundle_info, MAX_CPLANE_EXT_11_BUNDLES_PER_SLOT> section_ext_11_bundle_infos_{};
+}; 
+
 
 /**
  * @brief Fronthaul proxy manager class
@@ -533,11 +550,10 @@ public:
      * @param bfw_header           - Array of beamforming weight headers
      * @param start_ch_task_time   - Channel task start time (for timing validation)
      * @param prevSlotBfwCompStatus - Previous slot beamforming weight completion status
-     * @param cplane_info_for_uplane_rdy_count - Atomic counter for C-plane/U-plane synchronization
      * @param ti_info              - Task instrumentation info for profiling
      * @return 0 on success, negative error code on failure
      */
-    int sendCPlane(
+    int prepareCPlaneInfo(
         uint32_t cell_id,
         ru_type ru,
         peer_id_t peer_id,
@@ -554,9 +570,28 @@ public:
         uint8_t** bfw_header,
         t_ns start_ch_task_time,
         int  prevSlotBfwCompStatus,
-        std::atomic<int>& cplane_info_for_uplane_rdy_count,
         ti_subtask_info &ti_info);
-
+    
+    /**
+     * @brief Prepare MMIMO MBUF C-Plane packets & queue into the NIC
+     *
+     * Constructs and transmits ORAN C-plane MBUF containing resource allocation,
+     * beamforming weights, and timing information for the specified slot.
+     *
+     * @param is_bfw - Boolean flag denoting whether to invoke BFW packet processing or non-BFW packet processing
+     * @param cell_id              - Cell identifier
+     * @param peer_id              - Peer identifier
+     * @param direction            - Packet direction (uplink or downlink)
+     * @param ti_info              - Task instrumentation info for profiling
+     * @return 0 on success, negative error code on failure
+     */
+    int sendCPlaneMMIMO(
+        bool is_bfw,
+        uint32_t cell_id,
+        peer_id_t peer_id,
+        oran_pkt_dir direction,
+        ti_subtask_info &ti_info);
+    
     /**
      * @brief Prepare U-plane packets for downlink transmission
      *

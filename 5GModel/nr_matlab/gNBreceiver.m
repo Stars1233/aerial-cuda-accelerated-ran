@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -502,6 +502,11 @@ switch pduType
         if(isfield(pusch,'prgSize'))
             pdu.prgSize         = pusch.prgSize;
         end
+        if(isfield(pusch,'enable_prg_chest'))
+            pdu.enable_prg_chest = pusch.enable_prg_chest;
+        else
+            pdu.enable_prg_chest = 0;
+        end
 
         % static beamforming
         if SimCtrl.enable_static_dynamic_beamforming && pusch.digBFInterfaces
@@ -521,6 +526,18 @@ switch pduType
             pdu.foCompensationBuffer = pusch.foCompensationBuffer;
         else
             pdu.foCompensationBuffer = 1.0;
+        end
+
+        if(isfield(pusch,'ldpcEarlyTerminationPerUe'))
+            pdu.ldpcEarlyTerminationPerUe = pusch.ldpcEarlyTerminationPerUe;
+        else
+            pdu.ldpcEarlyTerminationPerUe = 0;
+        end
+
+        if(isfield(pusch,'ldpcMaxNumItrPerUe'))
+            pdu.ldpcMaxNumItrPerUe = pusch.ldpcMaxNumItrPerUe;
+        else
+            pdu.ldpcMaxNumItrPerUe = 10;
         end
 
     case 'srs'
@@ -881,6 +898,7 @@ for idxPdu = 1:nPdu
             
             if SimCtrl.forceRxZero
                 Xtf_prach{idxPrach} = Xtf_prach{idxPrach} * 0;
+                Xtf_prach_uncomp{idxPrach}  = Xtf_prach{idxPrach};
             end
             if pdu.lastPrachPdu
                 payloadList = detPrach(prachPduList, prachConfigList, table, carrier, Xtf_prach);

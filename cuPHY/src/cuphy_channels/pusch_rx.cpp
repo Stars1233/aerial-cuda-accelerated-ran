@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -925,6 +925,7 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     m_LDPCdecoder(m_ctx),
     m_ldpcStreamPool(0),
     m_LDPCkernelLaunchMode(pStatPrms->ldpcKernelLaunch),
+    m_LDPCDecodeDescSet(pStatPrms->nMaxTbPerNode),
     m_kernelStatDescr("PuschStatDescr"),
     m_kernelDynDescr("PuschDynDescr"),
     m_earlyHarqModeEnabled(true),
@@ -1030,6 +1031,15 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     m_G2streamPool.resize(4 , priority);
 #endif
 
+#if CUDA_VERSION >= 12040
+    // Determine if green context is used
+    // Will use that to modify the m_preSubSlotGraph and m_preFullSlotGraph, so the event record node and its preceding
+    // symbol wait kernel are moved outside the corresponding graph, if GC is used.
+    CUgreenCtx green_ctx{};
+    CU_CHECK(cuStreamGetGreenCtx(cuStream, &green_ctx));
+    m_useGreenContext = (green_ctx != nullptr);
+#endif
+
     // Resize (not reserve) front end tensors to avoid constructor/destructor calls later. Unused
     // tensors are OK.
     m_tRefDataRx.resize(pStatPrms->nMaxCellsPerSlot);
@@ -1091,14 +1101,14 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
 
 
     m_ldpcLaunchCfgs.resize(m_chEstSettings.nMaxLdpcHetConfigs);
-    m_ldpcDecoderNodes.resize(cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES, std::vector<CUgraphNode>(m_chEstSettings.nMaxLdpcHetConfigs));
+    m_ldpcDecoderNodes.resize(CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES, std::vector<CUgraphNode>(m_chEstSettings.nMaxLdpcHetConfigs));
     m_LDPCDecodeDescSet.resize(m_chEstSettings.nMaxLdpcHetConfigs);
 
     // store number of launch config state; to be used in updateGraph() to reduce CUDA api calls
     m_noiseIntfEstNodesEnabled.resize(CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
     m_cfoTaEstNodesEnabled.resize(CUPHY_PUSCH_RX_CFO_EST_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
     m_chEqCoefCompNodesEnabled.resize(CUPHY_PUSCH_RX_MAX_N_TIME_CH_EST, std::vector<uint8_t>(CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max()));
-    for(int idx = 0; idx < cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES; idx++)
+    for(int idx = 0; idx < CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES; idx++)
     {
         m_chEqSoftDemapNodesEnabled[idx].resize(CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
         if(m_chEstSettings.enableDftSOfdm==1)
@@ -1178,8 +1188,8 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     createComponents(cuStream, rmFPconfig, descrmOn);
 
     // create (device) graph for full-slot processing in PUSCH
-    createFullSlotGraph(cuphyPuschFullSlotProcMode_t::PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraph, m_emptyFullSlotRootNode, m_fullSlotGraphCondInfo);
-    createFullSlotGraph(cuphyPuschFullSlotProcMode_t::PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraph, m_emptyFrontLoadedDmrsFullSlotRootNode, m_frontLoadedDmrsFullSlotGraphCondInfo);
+    createFullSlotGraph(PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraph, m_emptyFullSlotRootNode, m_fullSlotGraphCondInfo);
+    createFullSlotGraph(PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraph, m_emptyFrontLoadedDmrsFullSlotRootNode, m_frontLoadedDmrsFullSlotGraphCondInfo);
     if(m_deviceGraphLaunchEnabled)
     {
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_fullSlotGraphExec, m_fullSlotGraph, CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
@@ -1190,8 +1200,8 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_fullSlotGraphExec, m_fullSlotGraph, 0));
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraph, 0));
     }
-    updateFullSlotGraph(true, cuphyPuschFullSlotProcMode_t::PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);     //initially disable all nodes
-    updateFullSlotGraph(true, cuphyPuschFullSlotProcMode_t::PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);  //initially disable all nodes
+    updateFullSlotGraph(true, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);     //initially disable all nodes
+    updateFullSlotGraph(true, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);  //initially disable all nodes
 
     //CU_CHECK_EXCEPTION(cuGraphUpload(m_deviceGraphExec, cuStream));
 
@@ -1316,7 +1326,7 @@ cuphyStatus_t PuschRx::setupCmnPhase1(cuphyPuschDynPrms_t* pDynPrm)
     {
         earlyHarqSoftDemapperSymbolUpperBound += 1;
     }
-    
+
     for(int ueIdx = 0; ueIdx < m_cuphyPuschCellGrpDynPrm.nUes; ++ueIdx)
     {
         if(pUePrms[ueIdx].pduBitmap & 2)
@@ -2516,22 +2526,30 @@ cuphyStatus_t PuschRx::setupComponents(bool enableCpuToGpuDescrAsyncCpy, cuphyPu
 void PuschRx::createLaunchGraph(CUgraph &graph,
                                 CUgraphNode & graphWaitNode, CUgraphNode &graphEventNode, CUgraphNode &graphDglNode,
                                 cuphyPuschRxWaitLaunchCfg_t &waitCfg, cuphyPuschRxDglLaunchCfg_t &dglCfg,
-                                uint8_t puschRxProcMode,
+                                uint8_t puschRxFullSlotMode,
                                 CUevent waitEndEvent, bool enableDeviceGraphLaunch)
 {
     CU_CHECK_EXCEPTION(cuGraphCreate(&graph, 0));
     // StatDesc, DynDescr - nullptrs
-    m_chest->startKernels().setWaitKernelParams(&waitCfg, puschRxProcMode, nullptr, nullptr);
+    m_chest->startKernels().setWaitKernelParams(&waitCfg, puschRxFullSlotMode, nullptr, nullptr);
     // DynDescr, DeviceGraph - nullptrs
-    m_chest->startKernels().setDeviceGraphLaunchKernelParams(&dglCfg, enableDeviceGraphLaunch, nullptr,
-        nullptr);
+    m_chest->startKernels().setDeviceGraphLaunchKernelParams(&dglCfg, enableDeviceGraphLaunch, puschRxFullSlotMode, nullptr, nullptr);
 
-    // add wait kernel node to wait for arrival of required number of symbols before starting the PUSCH pipeline
-    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&graphWaitNode, graph, nullptr, 0, &waitCfg.kernelNodeParamsDriver));
-    // event node is to notify the end of the wait time and start of the PUSCH pipeline
-    CU_CHECK_EXCEPTION(cuGraphAddEventRecordNode(&graphEventNode, graph, &graphWaitNode, 1, waitEndEvent));
-    // add kernel node for device graph launch (only enabled when DGL is allowed)
-    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&graphDglNode, graph, &graphEventNode, 1, &dglCfg.kernelNodeParamsDriver));
+    if(m_useGreenContext)
+    {
+        // Only add kernel node for device graph launch (only enabled when DGL is allowed)
+        // Symbol wait kernel and event record will no longer be part of that graph
+       CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&graphDglNode, graph, nullptr, 0, &dglCfg.kernelNodeParamsDriver));
+    }
+    else
+    {
+        // add wait kernel node to wait for arrival of required number of symbols before starting the PUSCH pipeline
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&graphWaitNode, graph, nullptr, 0, &waitCfg.kernelNodeParamsDriver));
+        // event node is to notify the end of the wait time and start of the PUSCH pipeline
+        CU_CHECK_EXCEPTION(cuGraphAddEventRecordNode(&graphEventNode, graph, &graphWaitNode, 1, waitEndEvent));
+        // add kernel node for device graph launch (only enabled when DGL is allowed)
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&graphDglNode, graph, &graphEventNode, 1, &dglCfg.kernelNodeParamsDriver));
+    }
 }
 //===============================================================================================================================
 
@@ -2848,12 +2866,1018 @@ CUresult PuschRx::addGraphNodeHelper(CUgraphNode* phGraphNode, CUgraph hGraph, c
 #endif
 }
 
-void PuschRx::createFullSlotGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo& condInfo)
+//=================================================================================================//
+//                                FULL-SLOT Graph Helper Functions                                 //
+//=================================================================================================//
+StageResult PuschRx::buildSoftDemapStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                         CUgraph*                        pGraph,
+                                         const std::vector<CUgraphNode>& eqCoefDeps,
+                                         void*&                          arg)
+{
+    StageResult result;
+
+    // Start from the dependencies coming out of EQ-coefficient compute
+    std::vector<CUgraphNode> currDeps = eqCoefDeps;
+    std::vector<CUgraphNode> nextDeps;
+    nextDeps.clear();
+
+    //==========================================================================================/
+    // add m_chEqSoftDemapNodes, parent node(s) : m_chEqCoefCompNodes                           /
+    //                           sibling node(s): other m_chEqSoftDemapNodes                    /
+    //==========================================================================================/
+    for (int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+    {
+        CUDA_KERNEL_NODE_PARAMS chEqSoftDemapParamsDriver;
+        channel_eq::puschRxChEqSoftDemapDynDescr_t soft_demap_arg;
+        void* kernelParams[] = { &arg, &soft_demap_arg };
+        const int numPtrArgs = 1;
+
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(
+            &chEqSoftDemapParamsDriver,
+            &kernelParams[0],
+            numPtrArgs,
+            sizeof(channel_eq::puschRxChEqSoftDemapDynDescr_t)));
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(
+            &m_chEqSoftDemapNodes[fullSlotProcMode][hetCfgIdx],
+            *pGraph,
+            currDeps.data(),
+            currDeps.size(),
+            &chEqSoftDemapParamsDriver));
+
+        nextDeps.emplace_back(m_chEqSoftDemapNodes[fullSlotProcMode][hetCfgIdx]);
+    }
+
+    //------------------------------------------------------------------------------
+    // Optional DFT-S-OFDM path
+    //------------------------------------------------------------------------------
+    if (m_chEstSettings.enableDftSOfdm == 1)
+    {
+        //==========================================================================================/
+        // add m_chEqSoftDemapIdftNodes, parent node(s) : m_chEqSoftDemapNodes                      /
+        //                               sibling node(s): other m_chEqSoftDemapIdftNodes            /
+        //==========================================================================================/
+        currDeps = nextDeps;
+        nextDeps.clear();
+
+        for (int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(
+                &m_chEqSoftDemapIdftNodes[fullSlotProcMode][hetCfgIdx],
+                *pGraph,
+                currDeps.data(),
+                currDeps.size(),
+                &m_emptyNode2paramsDriver));
+
+            nextDeps.emplace_back(m_chEqSoftDemapIdftNodes[fullSlotProcMode][hetCfgIdx]);
+        }
+
+        //==============================================================================================/
+        // add m_chEqSoftDemapAfterDftNodes, parent node(s) : m_chEqSoftDemapIdftNodes                  /
+        //                                   sibling node(s): other m_chEqSoftDemapAfterDftNodes        /
+        //==============================================================================================/
+        currDeps = nextDeps;
+        nextDeps.clear();
+
+        for (int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(
+                &m_chEqSoftDemapAfterDftNodes[fullSlotProcMode][hetCfgIdx],
+                *pGraph,
+                currDeps.data(),
+                currDeps.size(),
+                &m_emptyNode2paramsDriver));
+
+            nextDeps.emplace_back(m_chEqSoftDemapAfterDftNodes[fullSlotProcMode][hetCfgIdx]);
+        }
+    }
+
+    // If DFT-S-OFDM is disabled, nextDeps is the set of m_chEqSoftDemapNodes.
+    // If enabled, nextDeps is the set of m_chEqSoftDemapAfterDftNodes.
+    result.terminalNodes = std::move(nextDeps);
+    return result;
+}
+
+StageResult PuschRx::buildSchBackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                          CUgraph*                        pGraph,
+                                          const std::vector<CUgraphNode>& schParents)
+{
+    StageResult result;
+
+    std::vector<CUgraphNode> currDeps = schParents;
+    std::vector<CUgraphNode> nextDeps;
+    nextDeps.clear();
+
+    //==================================================================================================================/
+    // add m_resetRateMatchNode followed by m_rateMatchNode and then m_clampRateMatchNode, parent node(s) : schParents  /
+    //                     sibling node(s): m_uciOnPuschCsi2rmDecoderNode, m_uciOnPuschCsi2simplexDecoderNode           /
+    //==================================================================================================================/
+
+    // m_resetRateMatchNode
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_resetRateMatchNode[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    currDeps.clear();
+    currDeps.emplace_back(m_resetRateMatchNode[fullSlotProcMode]);
+
+    // m_rateMatchNode
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rateMatchNode[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    currDeps.clear();
+    currDeps.emplace_back(m_rateMatchNode[fullSlotProcMode]);
+
+    // m_clampRateMatchNode
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_clampRateMatchNode[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    nextDeps.clear();
+    nextDeps.emplace_back(m_clampRateMatchNode[fullSlotProcMode]);
+
+    //==========================================================================================================/
+    // add m_ldpcDecoderNodes, parent node(s) : m_clampRateMatchNode                                            /
+    //                         sibling node(s): other m_ldpcDecNodes                                            /
+    //==========================================================================================================/
+    currDeps = nextDeps;
+    nextDeps.clear();
+
+    for (int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ldpcDecoderNodes[fullSlotProcMode][i],
+                                                *pGraph,
+                                                currDeps.data(),
+                                                currDeps.size(),
+                                                &m_emptyNode2paramsDriver));
+
+        nextDeps.emplace_back(m_ldpcDecoderNodes[fullSlotProcMode][i]);
+    }
+
+    //==========================================================================================================/
+    // CRC nodes                                                                                                /
+    //==========================================================================================================/
+    {
+        CUDA_KERNEL_NODE_PARAMS crcDecodeParamsDriver;
+        puschRxCrcDecodeDescr_t crc_arg;
+        void* kernelParams[] = { &crc_arg };
+        const int numPtrArgs = 0;
+
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&crcDecodeParamsDriver,
+                                                                     &kernelParams[0],
+                                                                     numPtrArgs,
+                                                                     sizeof(puschRxCrcDecodeDescr_t)));
+
+        //======================================================================================================/
+        // add m_crcNodes[0], parent node(s) : m_ldpcDecoderNodes                                               /
+        //                    sibling node(s): none                                                             /
+        //======================================================================================================/
+        currDeps = nextDeps;
+        nextDeps.clear();
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_crcNodes[fullSlotProcMode][0],
+                                                *pGraph,
+                                                currDeps.data(),
+                                                currDeps.size(),
+                                                &crcDecodeParamsDriver));
+
+        nextDeps.emplace_back(m_crcNodes[fullSlotProcMode][0]);
+
+        //======================================================================================================/
+        // add m_crcNodes[1], parent node(s) : m_crcNodes[0]                                                    /
+        //                    sibling node(s): none                                                             /
+        //======================================================================================================/
+        currDeps = nextDeps;
+        // nextDeps is not used after this locally, but we keep the final node for completeness
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_crcNodes[fullSlotProcMode][1],
+                                                *pGraph,
+                                                currDeps.data(),
+                                                currDeps.size(),
+                                                &crcDecodeParamsDriver));
+
+        // terminal node of SCH backend
+        result.terminalNodes.clear();
+        result.terminalNodes.emplace_back(m_crcNodes[fullSlotProcMode][1]);
+    }
+
+    return result;
+}
+
+StageResult PuschRx::buildFrontEndStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                        CUgraph*                        pGraph,
+                                        const std::vector<CUgraphNode>& initialParents,
+                                        void*&                          arg)
+{
+    StageResult result;
+
+    // Local dependency sets
+    std::vector<CUgraphNode> currDeps   = initialParents;
+    std::vector<CUgraphNode> chEstNodes;
+    std::vector<CUgraphNode> tmpDeps;
+
+    //==============================================================================================/
+    // add m_chEstNodes, parent node  : m_emptyRootNode                                             /
+    //                   sibling nodes: other m_chEstNodes                                          /
+    //==============================================================================================/
+    m_chest->chestGraph().addKernelNodeToGraph(*pGraph,
+                                               currDeps,
+                                               chEstNodes,
+                                               m_emptyNode2paramsDriver);
+
+    //==============================================================================
+    // Branch on enableWeightedAverageCfo
+    //==============================================================================
+    if (m_chEstSettings.enableWeightedAverageCfo != 1)
+    {
+        //--------------------------------------------------------------------------
+        // Path A: NO weighted-average CFO
+        //
+        // Equalizer coefficient compute depends on:
+        //   - channel estimation
+        //   - noise & interference estimation (if enabled)
+        //   - CFO/TA estimation (if enabled)
+        //--------------------------------------------------------------------------
+
+        // eqParents := {chEstNodes} + (noiseIntfEst nodes, if any) + (CFO nodes, if any)
+        std::vector<CUgraphNode> eqParents = chEstNodes;
+
+        // Noise & interference estimation
+        if (m_chEstSettings.enableSinrMeasurement || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo))
+        {
+            CUDA_KERNEL_NODE_PARAMS noiseIntfEstParamsDriver;
+            pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t descr;
+            void* kernelParams[] = { &descr };
+            const int numPtrArgs = 0;
+
+            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&noiseIntfEstParamsDriver,
+                                                                         &kernelParams[0],
+                                                                         numPtrArgs,
+                                                                         sizeof(pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t)));
+
+            //==========================================================================================/
+            // add m_noiseIntfEstNodes, parent node(s) : m_chEstNodes/m_chEstSecondNodes                /
+            //                          sibling node(s): m_cfoTaEstNodes, other m_noiseIntfEstNodes     /
+            //==========================================================================================/
+            // Noise-interference estimation depends on all channel estimations.
+            for (int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS; hetCfgIdx++)
+            {
+                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_noiseIntfEstNodes[hetCfgIdx],
+                                                        *pGraph,
+                                                        chEstNodes.data(),
+                                                        chEstNodes.size(),
+                                                        &noiseIntfEstParamsDriver));
+
+                eqParents.emplace_back(m_noiseIntfEstNodes[hetCfgIdx]);
+            }
+        }
+
+        // CFO / TA estimation
+        if (m_chEstSettings.enableCfoCorrection || m_chEstSettings.enableToEstimation)
+        {
+            CUDA_KERNEL_NODE_PARAMS cfoTaEstParamsDriver;
+            cfo_ta_est::puschRxCfoTaEstDynDescr_t descr;
+            void* kernelParams[] = { &descr };
+            const int numPtrArgs = 0;
+
+            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&cfoTaEstParamsDriver,
+                                                                         &kernelParams[0],
+                                                                         numPtrArgs,
+                                                                         sizeof(cfo_ta_est::puschRxCfoTaEstDynDescr_t)));
+            //=====================================================================================/
+            // add m_cfoTaEstNodes, parent node(s) : m_chEstNodes                                  /
+            //                      sibling node(s): m_noiseIntfEstNodes, other m_cfoTaEstNodes    /
+            //=====================================================================================/
+            // CFO/TA calculation depends on all channel estimations.
+            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CFO_EST_N_MAX_HET_CFGS; ++hetCfgIdx)
+            {
+                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_cfoTaEstNodes[hetCfgIdx],
+                                                        *pGraph,
+                                                        chEstNodes.data(),
+                                                        chEstNodes.size(),
+                                                        &cfoTaEstParamsDriver));
+
+                eqParents.emplace_back(m_cfoTaEstNodes[hetCfgIdx]);
+            }
+        }
+
+        // Equalizer coefficient compute
+        int32_t bound = 1;
+        if (m_chEstSettings.enablePuschTdi)
+        {
+            bound = CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ;
+        }
+
+        result.terminalNodes.clear();
+
+        for(int32_t chEqTimeInstIdx = 0; chEqTimeInstIdx < bound; ++chEqTimeInstIdx)
+        {
+            CUDA_KERNEL_NODE_PARAMS                   chEqCoefCompParamsDriver;
+            channel_eq::puschRxChEqCoefCompDynDescr_t coef_comp_arg;
+            void*                                     kernelParams[] = {&arg, &coef_comp_arg};
+            const int                                 numPtrArgs     = 1;
+
+            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqCoefCompParamsDriver,
+                                                                         &kernelParams[0],
+                                                                         numPtrArgs,
+                                                                         sizeof(channel_eq::puschRxChEqCoefCompDynDescr_t)));
+            //=================================================================================================================/
+            // add m_chEqCoefCompNodes, parent node(s) : m_chEstNodes (and conditionally m_noiseIntfEstNodes, m_cfoTaEstNodes) /
+            //                          sibling node(s): other m_chEqCoefCompNodes                                             /
+            //=================================================================================================================/
+            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+            {
+                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_chEqCoefCompNodes[chEqTimeInstIdx][hetCfgIdx],
+                                                        *pGraph,
+                                                        eqParents.data(),
+                                                        eqParents.size(),
+                                                        &chEqCoefCompParamsDriver));
+
+                result.terminalNodes.emplace_back(m_chEqCoefCompNodes[chEqTimeInstIdx][hetCfgIdx]);
+            }
+        }
+    }
+    else
+    {
+        //----------------------------------------------------------------------
+        // Path B: WITH weighted-average CFO
+        //
+        // Chain:
+        //   chEst -> noiseIntfEst -> RSRP -> CFO/TA -> EQ coef
+        //----------------------------------------------------------------------
+
+        std::vector<CUgraphNode> stageParents = chEstNodes;
+        std::vector<CUgraphNode> stageOutputs;
+
+        // Noise & interference estimation
+        if(m_chEstSettings.enableSinrMeasurement || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo))
+        {
+            CUDA_KERNEL_NODE_PARAMS                             noiseIntfEstParamsDriver;
+            pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t descr;
+            void*                                               kernelParams[] = {&descr};
+            const int                                           numPtrArgs     = 0;
+
+            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&noiseIntfEstParamsDriver,
+                                                                         &kernelParams[0],
+                                                                         numPtrArgs,
+                                                                         sizeof(pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t)));
+
+            stageOutputs.clear();
+
+            //==========================================================================================/
+            // add m_noiseIntfEstNodes, parent node(s) : m_chEstNodes/m_chEstSecondNodes                /
+            //                          sibling node(s): other m_noiseIntfEstNodes                      /
+            //==========================================================================================/
+            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS; ++hetCfgIdx)
+            {
+                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_noiseIntfEstNodes[hetCfgIdx],
+                                                        *pGraph,
+                                                        stageParents.data(),
+                                                        stageParents.size(),
+                                                        &noiseIntfEstParamsDriver));
+
+                stageOutputs.emplace_back(m_noiseIntfEstNodes[hetCfgIdx]);
+            }
+
+            stageParents = stageOutputs;
+        }
+
+        // RSRP nodes (front-end SINR measurements)
+        if(m_chEstSettings.enableSinrMeasurement)
+        {
+            stageOutputs.clear();
+
+            //==========================================================================================/
+            // add m_rsrpNodes, parent node(s) : m_noiseIntfEstNodes                                    /
+            //                  sibling node(s): other m_rsrpNodes                                      /
+            //==========================================================================================/
+            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
+            {
+                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rsrpNodes[fullSlotProcMode][hetCfgIdx],
+                                                        *pGraph,
+                                                        stageParents.data(),
+                                                        stageParents.size(),
+                                                        &m_emptyNode1paramDriver));
+
+                stageOutputs.emplace_back(m_rsrpNodes[fullSlotProcMode][hetCfgIdx]);
+            }
+
+            stageParents = stageOutputs;
+        }
+
+        // CFO / TA estimation
+        if(m_chEstSettings.enableCfoCorrection || m_chEstSettings.enableToEstimation)
+        {
+            CUDA_KERNEL_NODE_PARAMS               cfoTaEstParamsDriver;
+            cfo_ta_est::puschRxCfoTaEstDynDescr_t descr;
+            void*                                 kernelParams[] = {&descr};
+            const int                             numPtrArgs     = 0;
+
+            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&cfoTaEstParamsDriver,
+                                                                         &kernelParams[0],
+                                                                         numPtrArgs,
+                                                                         sizeof(cfo_ta_est::puschRxCfoTaEstDynDescr_t)));
+
+            stageOutputs.clear();
+
+            //==========================================================================================/
+            // add m_cfoTaEstNodes, parent node(s) : m_rsrpNodes                                        /
+            //                      sibling node(s): other m_cfoTaEstNodes                              /
+            //==========================================================================================/
+            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CFO_EST_N_MAX_HET_CFGS; ++hetCfgIdx)
+            {
+                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_cfoTaEstNodes[hetCfgIdx],
+                                                        *pGraph,
+                                                        stageParents.data(),
+                                                        stageParents.size(),
+                                                        &cfoTaEstParamsDriver));
+
+                stageOutputs.emplace_back(m_cfoTaEstNodes[hetCfgIdx]);
+            }
+
+            stageParents = stageOutputs;
+        }
+
+        // Equalizer coefficient compute
+        int32_t bound = 1;
+        if (m_chEstSettings.enablePuschTdi)
+        {
+            bound = CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ;
+        }
+
+        result.terminalNodes.clear();
+
+        for(int32_t chEqTimeInstIdx = 0; chEqTimeInstIdx < bound; ++chEqTimeInstIdx)
+        {
+            CUDA_KERNEL_NODE_PARAMS                   chEqCoefCompParamsDriver;
+            channel_eq::puschRxChEqCoefCompDynDescr_t coef_comp_arg;
+            void*                                     kernelParams[] = {&arg, &coef_comp_arg};
+            const int                                 numPtrArgs     = 1;
+
+            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqCoefCompParamsDriver,
+                                                                         &kernelParams[0],
+                                                                         numPtrArgs,
+                                                                         sizeof(channel_eq::puschRxChEqCoefCompDynDescr_t)));
+
+            //==========================================================================================/
+            // add m_chEqCoefCompNodes, parent node(s) : m_cfoTaEstNodes)                               /
+            //                          sibling node(s): other m_chEqCoefCompNodes                      /
+            //==========================================================================================/
+            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+            {
+                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(
+                    &m_chEqCoefCompNodes[chEqTimeInstIdx][hetCfgIdx],
+                    *pGraph,
+                    stageParents.data(),
+                    stageParents.size(),
+                    &chEqCoefCompParamsDriver));
+
+                result.terminalNodes.emplace_back(m_chEqCoefCompNodes[chEqTimeInstIdx][hetCfgIdx]);
+            }
+        }
+    }
+
+    return result;
+}
+
+StageResult PuschRx::buildUciP1BackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                            CUgraph*                        pGraph,
+                                            const std::vector<CUgraphNode>& softDemapParents)
+{
+    StageResult result;
+
+    // Local dep vectors
+    std::vector<CUgraphNode> currDeps = softDemapParents;
+    std::vector<CUgraphNode> tmpDeps;
+    std::vector<CUgraphNode> compCwDeps;
+
+    //======================================================================================================/
+    // m_compCwTreeTypesNode, parent node(s): soft demap / after-DFT nodes                                  /
+    //                        sibling node(s): m_rssiNodes, m_uciSegLLRs0Node, m_rsrpNodes                  /
+    //======================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_compCwTreeTypesNode[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    compCwDeps.clear();
+    compCwDeps.emplace_back(m_compCwTreeTypesNode[fullSlotProcMode]);
+
+    //=======================================================================================================/
+    // m_rsrpNodes, parent node(s): soft demap nodes                                                         /
+    //              sibling node(s): m_rssiNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode                   /
+    //=======================================================================================================/
+    if((m_chEstSettings.enableSinrMeasurement) && ((m_chEstSettings.enableWeightedAverageCfo != 1) ||
+                                                   (fullSlotProcMode == PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC)))
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(
+                &m_rsrpNodes[fullSlotProcMode][hetCfgIdx],
+                *pGraph,
+                currDeps.data(),
+                currDeps.size(),
+                &m_emptyNode1paramDriver));
+        }
+    }
+
+    //=======================================================================================================/
+    // m_rssiNodes, parent node(s): m_chEqSoftDemapNodes                                                     /
+    //              sibling node(s): m_rsrpNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode                   /
+    //=======================================================================================================/
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rssiNodes[fullSlotProcMode][hetCfgIdx],
+                                                    *pGraph,
+                                                    currDeps.data(),
+                                                    currDeps.size(),
+                                                    &m_emptyNode1paramDriver));
+        }
+    }
+
+    //==========================================================================================================/
+    // m_uciSegLLRs0Node, parent node(s): soft demap nodes                                                      /
+    //                    sibling node(s): m_rsrpNodes, m_rssiNodes, m_compCwTreeTypesNode                      /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciSegLLRs0Node[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    CUgraphNode uciSegNode = m_uciSegLLRs0Node[fullSlotProcMode];
+
+    //==========================================================================================================/
+    // UCI P1 decoders: Simplex and RM, parents: m_uciSegLLRs0Node                                              /
+    //==========================================================================================================/
+
+    result.terminalNodes.clear();
+
+    //==========================================================================================================/
+    // add m_simplexDecoderNode, parent node(s) : m_uciSegLLRs0Node                                             /
+    //                       sibling node(s): m_rmDecoderNode, m_compCwTreeTypesNode                            /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_simplexDecoderNode[fullSlotProcMode],
+                                            *pGraph,
+                                            &uciSegNode,
+                                            1,
+                                            &m_emptyNode1paramDriver));
+
+    result.terminalNodes.emplace_back(m_simplexDecoderNode[fullSlotProcMode]);
+
+    //==========================================================================================================/
+    // add m_rmDecoderNode, parent node(s) : m_uciSegLLRs0Node                                                  /
+    //                  sibling node(s): m_simplexDecoderNode, m_compCwTreeTypesNode                            /
+    //==========================================================================================================/
+    {
+        CUDA_KERNEL_NODE_PARAMS rmDecoderParamsDriver;
+        rmDecoderDynDescr_t     arg;
+        void*                   kernelParams[] = {&arg};
+        const int               numPtrArgs     = 0;
+
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&rmDecoderParamsDriver,
+                                                                     &kernelParams[0],
+                                                                     numPtrArgs,
+                                                                     sizeof(rmDecoderDynDescr_t)));
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rmDecoderNode[fullSlotProcMode],
+                                                *pGraph,
+                                                &uciSegNode,
+                                                1,
+                                                &rmDecoderParamsDriver));
+
+        result.terminalNodes.emplace_back(m_rmDecoderNode[fullSlotProcMode]);
+    }
+
+    // Polar path
+    tmpDeps.clear();
+    tmpDeps.insert(tmpDeps.end(), compCwDeps.begin(), compCwDeps.end());
+    tmpDeps.emplace_back(uciSegNode);
+
+    //==========================================================================================================/
+    // add m_polSegDeRmDeItlNode, parent node(s) : m_uciSegLLRs0Node + m_compCwTreeTypesNode                    /
+    //                            sibling node(s): none                                                         /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_polSegDeRmDeItlNode[fullSlotProcMode],
+                                            *pGraph,
+                                            tmpDeps.data(),
+                                            tmpDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    CUgraphNode polSegNode = m_polSegDeRmDeItlNode[fullSlotProcMode];
+
+    //==========================================================================================================/
+    // add m_polarDecoderNode, parent node(s) : m_polSegDeRmDeItlNode                                           /
+    //                         sibling node(s): none                                                            /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_polarDecoderNode[fullSlotProcMode],
+                                            *pGraph,
+                                            &polSegNode,
+                                            1,
+                                            &m_emptyNode1paramDriver));
+
+    result.terminalNodes.emplace_back(m_polarDecoderNode[fullSlotProcMode]);
+
+    return result;
+}
+
+StageResult PuschRx::buildCsiP2BackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                            CUgraph*                        pGraph,
+                                            const std::vector<CUgraphNode>& uciP1Parents,
+                                            bool                            useCondIfOrDglC2)
+{
+    StageResult result;
+
+    std::vector<CUgraphNode> currDeps;
+    std::vector<CUgraphNode> tmpDeps;
+
+    //==============================================================================
+    // CSI-P2 control node
+    // Parents:
+    //   - if !useCondIfOrDglC2: UCI-P1 decoders (simplex, RM, polar)
+    //   - if  useCondIfOrDglC2: none (control becomes root of conditional/device graph)
+    //==============================================================================
+    if(!useCondIfOrDglC2)
+    {
+        currDeps = uciP1Parents; // simplex, rm, polar in CSI-P1
+    }
+    else
+    {
+        currDeps.clear(); // no parents for C2-gated path
+    }
+
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2CtrlNode[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    CUgraphNode csi2CtrlNode = m_uciOnPuschCsi2CtrlNode[fullSlotProcMode];
+
+    // From here on, CSI-P2 nodes depend on Csi2Ctrl
+    currDeps.clear();
+    currDeps.emplace_back(csi2CtrlNode);
+
+    //==========================================================================================================/
+    // add m_uciOnPuschCsi2CompCwTreeTypesNode, parent node(s) : m_uciOnPuschCsi2CtrlNode                       /
+    //                                          sibling node(s): m_uciOnPuschCsi2SegLLRs2Node                   /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    CUgraphNode compCw2Node = m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode];
+
+    //==========================================================================================================/
+    // add m_uciOnPuschCsi2SegLLRs2Node, parent node(s) : m_uciOnPuschCsi2CtrlNode                              /
+    //                                   sibling node(s): none                                                  /
+    //==========================================================================================================/
+    // CSI-P2 control kernel (Csi2Ctrl) calculates SCH rate-matched bits which is used by SegLLRs2 for demux
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    CUgraphNode seg2Node = m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode];
+
+    //========================================================================================================================/
+    // add m_uciOnPuschCsi2rmDecoderNode, parent node(s) : m_uciOnPuschCsi2SegLLRs2Node                                       /
+    //                                    sibling node(s): m_uciOnPuschCsi2simplexDecoderNode, m_rateMatchNode                /
+    //========================================================================================================================/
+    {
+        CUDA_KERNEL_NODE_PARAMS rmDecoderParamsDriver;
+        rmDecoderDynDescr_t     arg;
+        void*                   kernelParams[] = {&arg};
+        const int               numPtrArgs     = 0;
+
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&rmDecoderParamsDriver,
+                                                                     &kernelParams[0],
+                                                                     numPtrArgs,
+                                                                     sizeof(rmDecoderDynDescr_t)));
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode],
+                                                *pGraph,
+                                                &seg2Node,
+                                                1,
+                                                &rmDecoderParamsDriver));
+    }
+
+    //======================================================================================================================================/
+    // add m_uciOnPuschCsi2simplexDecoderNode, parent node(s) : m_uciOnPuschCsi2SegLLRs2Node, m_uciOnPuschCsi2CompCwTreeTypesNode           /
+    //                               sibling node(s): m_uciOnPuschCsi2rmDecoderNode, m_uciOnPuschCsi2CompCwTreeTypesNode, m_rateMatchNode   /
+    //======================================================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode],
+                                            *pGraph,
+                                            &seg2Node,
+                                            1,
+                                            &m_emptyNode1paramDriver));
+
+    //==============================================================================================================================/
+    // add m_uciOnPuschCsi2PolSegDeRmDeItlNode, parent node(s) : m_uciOnPuschCsi2SegLLRs2Node, m_uciOnPuschCsi2CompCwTreeTypesNode  /
+    //                                          sibling node(s): none                                                               /
+    //==============================================================================================================================/
+    tmpDeps.clear();
+    tmpDeps.emplace_back(seg2Node);
+    tmpDeps.emplace_back(compCw2Node);
+
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode],
+                                            *pGraph,
+                                            tmpDeps.data(),
+                                            tmpDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    CUgraphNode polSeg2Node = m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode];
+
+    //==========================================================================================================/
+    // add m_uciOnPuschCsi2PolarDecoderNode, parent node(s) : m_uciOnPuschCsi2PolSegDeRmDeItlNode               /
+    //                                       sibling node(s): none                                              /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode],
+                                            *pGraph,
+                                            &polSeg2Node,
+                                            1,
+                                            &m_emptyNode1paramDriver));
+
+    // For the SCH backend, the relevant parent is SegLLRs2 (not the P2 decoders).
+    result.terminalNodes.clear();
+    result.terminalNodes.emplace_back(seg2Node);
+
+    return result;
+}
+
+//=================================================================================================//
+//                               Conditional Graph Helper Functions                                //
+//=================================================================================================//
+CondStage PuschRx::enterConditionalStage0(CUgraph&       fullSlotGraph,
+                                          CUgraphNode&   emptyRootNode,   // Used only when no conditional C0 node is created; becomes the root of the main graph
+                                          condGraphInfo& condInfo,
+                                          CUcontext      current_context,
+                                          unsigned int   cond_handle_flags,
+                                          const std::vector<CUgraphNode>& initialParents // List of parent nodes before C0 is created
+                                         )
+{
+    CondStage stage;
+
+    // Second part of the OR-condition only relevant if we want to partially enable C0 //FIXME worth maintaining?
+    bool no_cond_C0_node = (m_workCancelMode == PUSCH_NO_WORK_CANCEL) || ((m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C0 == 0));
+
+    if(no_cond_C0_node)
+    {
+        // Use empty node as a root
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&emptyRootNode,
+                                                fullSlotGraph,
+                                                initialParents.data(),
+                                                initialParents.size(),
+                                                &m_emptyNode0paramDriver));
+
+        condInfo.m_pGraph[0] = &fullSlotGraph;
+
+        stage.pGraph = condInfo.m_pGraph[0];
+        stage.parents.emplace_back(emptyRootNode);
+    }
+    else if(m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        // Device-graphs mode: create a separate graph[0]; parents are empty
+        CU_CHECK_EXCEPTION(cuGraphCreate(&condInfo.m_graph[0], 0));
+        condInfo.m_pGraph[0] = &condInfo.m_graph[0]; //FIXME
+
+        stage.pGraph = condInfo.m_pGraph[0];
+    }
+    else
+    {
+        // Conditional-IF node with C0 enabled (PUSCH_COND_IF_NODES_W_KERNEL)
+#if CUDA_VERSION >= 12040
+        // Create conditional handle on the FULL slot graph
+        CU_CHECK_EXCEPTION(cuGraphConditionalHandleCreate(&condInfo.m_conditional_node_C0_handle,
+                                                          fullSlotGraph,
+                                                          current_context,
+                                                          DEFAULT_COND_VAL,
+                                                          cond_handle_flags));
+
+        if(m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL)
+        {
+            // Add kernel node that sets condition for conditional node C0
+            void* pKArgs[2] = {&m_workCancelPtr, &condInfo.m_conditional_node_C0_handle};
+
+            CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C0_node_params,
+                                                           &pKArgs[0],
+                                                           0));
+
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&condInfo.m_graph_G0_init_cond_node,
+                                                    fullSlotGraph,
+                                                    nullptr,
+                                                    0,
+                                                    &condInfo.m_init_C0_node_params));
+
+            // Add conditional node C0 to the fullSlotGraph G0
+            condInfo.m_conditional_node_C0_params.conditional.handle = condInfo.m_conditional_node_C0_handle;
+            condInfo.m_conditional_node_C0_params.conditional.type   = CU_GRAPH_COND_TYPE_IF;
+            condInfo.m_conditional_node_C0_params.conditional.size   = 1;
+            condInfo.m_conditional_node_C0_params.conditional.ctx    = current_context; // context is obligatory otherwise one could get invalid arg error
+
+            CU_CHECK_EXCEPTION(addGraphNodeHelper(&condInfo.m_graph_G0_cond_node,
+                                                  fullSlotGraph,
+                                                  &condInfo.m_graph_G0_init_cond_node,
+                                                  1,
+                                                  &condInfo.m_conditional_node_C0_params));
+        }
+
+        // Subsequent PUSCH nodes for stage 0 go into the conditional subgraph
+        condInfo.m_pGraph[0] = &condInfo.m_conditional_node_C0_params.conditional.phGraph_out[0];
+
+        stage.pGraph = condInfo.m_pGraph[0];
+#endif
+    }
+
+    return stage;
+}
+
+CondStage PuschRx::enterConditionalStage1(condGraphInfo&                  condInfo,
+                                          CUcontext                       current_context,
+                                          unsigned int                    cond_handle_flags,
+                                          const std::vector<CUgraphNode>& parents,
+                                          std::vector<CUgraphNode>&       dglParentsOut)
+{
+    CondStage stage;
+
+    const bool use_cond_if_node_c1 = (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C1 == 1);
+
+    if(m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        // Device-graphs mode: create a separate graph[1] and stash parents for DGL launch.
+        CU_CHECK_EXCEPTION(cuGraphCreate(&condInfo.m_graph[1], 0));
+        condInfo.m_pGraph[1] = &condInfo.m_graph[1];
+
+        stage.pGraph = condInfo.m_pGraph[1];
+
+        // Store original parents for later device-graph launch wiring.
+        dglParentsOut = parents;
+
+        // Inside the device graph, there are no parents yet.
+        stage.parents.clear();
+    }
+    else if(use_cond_if_node_c1)
+    {
+#if CUDA_VERSION >= 12040
+        // C1 is a conditional node living in the graph of stage 0 (m_pGraph[0]).
+        CUgraph& baseGraph = *condInfo.m_pGraph[0];
+
+        CU_CHECK_EXCEPTION(cuGraphConditionalHandleCreate(&condInfo.m_conditional_node_C1_handle,
+                                                          baseGraph,
+                                                          current_context,
+                                                          DEFAULT_COND_VAL,
+                                                          cond_handle_flags));
+
+        // Kernel that sets the conditional value for C1, with dependencies on 'parents'
+        void* pKArgs_C1[2] = {&m_workCancelPtr, &condInfo.m_conditional_node_C1_handle};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C1_node_params,
+                                                       &pKArgs_C1[0],
+                                                       0));
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&condInfo.m_graph_G1_init_cond_node,
+                                                baseGraph,
+                                                parents.data(),
+                                                parents.size(),
+                                                &condInfo.m_init_C1_node_params));
+
+        // Conditional node C1 itself.
+        condInfo.m_conditional_node_C1_params.conditional.handle = condInfo.m_conditional_node_C1_handle;
+        condInfo.m_conditional_node_C1_params.conditional.type   = CU_GRAPH_COND_TYPE_IF;
+        condInfo.m_conditional_node_C1_params.conditional.size   = 1;
+        condInfo.m_conditional_node_C1_params.conditional.ctx    = current_context; // context is obligatory otherwise one could get invalid arg error
+
+        CU_CHECK_EXCEPTION(addGraphNodeHelper(&condInfo.m_graph_G1_cond_node,
+                                              baseGraph,
+                                              &condInfo.m_graph_G1_init_cond_node,
+                                              1,
+                                              &condInfo.m_conditional_node_C1_params));
+
+        condInfo.m_pGraph[1] = &condInfo.m_conditional_node_C1_params.conditional.phGraph_out[0];
+
+        stage.pGraph = condInfo.m_pGraph[1];
+        stage.parents.clear(); // inside conditional graph we start from its root
+#endif
+    }
+    else
+    {
+        // No C1: just forward graph and parents from stage 0.
+        condInfo.m_pGraph[1] = condInfo.m_pGraph[0];
+
+        stage.pGraph  = condInfo.m_pGraph[1];
+        stage.parents = parents; // direct parents for the next stage
+    }
+
+    return stage;
+}
+
+CondStage PuschRx::enterConditionalStage2(condGraphInfo&                  condInfo,
+                                          CUcontext                       current_context,
+                                          unsigned int                    cond_handle_flags,
+                                          bool                            use_cond_if_node_c2,
+                                          const std::vector<CUgraphNode>& parentsForC2,
+                                          std::vector<CUgraphNode>&       dglParentsOut)
+{
+    CondStage stage;
+
+    if(m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        // Device-graphs mode: create a separate graph[2] and stash parents for DGL launch
+        CU_CHECK_EXCEPTION(cuGraphCreate(&condInfo.m_graph[2], 0));
+        condInfo.m_pGraph[2] = &condInfo.m_graph[2];
+
+        stage.pGraph = condInfo.m_pGraph[2];
+
+        // Store parents (UCI P1 decoders) for later device-graph launch.
+        dglParentsOut = parentsForC2;
+
+        // Inside device graph there are no parents yet.
+        stage.parents.clear();
+    }
+    else if(use_cond_if_node_c2)
+    {
+#if CUDA_VERSION >= 12040
+        // C2 conditional node lives in the graph of stage 1 (m_pGraph[1]).
+        CUgraph& baseGraph = *condInfo.m_pGraph[1];
+
+        CU_CHECK_EXCEPTION(cuGraphConditionalHandleCreate(&condInfo.m_conditional_node_C2_handle,
+                                                          baseGraph,
+                                                          current_context,
+                                                          DEFAULT_COND_VAL,
+                                                          cond_handle_flags));
+
+        // Kernel that sets the conditional value for C2, depending on parentsForC2.
+        void* pKArgs_C2[2] = {&m_workCancelPtr, &condInfo.m_conditional_node_C2_handle};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C2_node_params,
+                                                       &pKArgs_C2[0],
+                                                       0));
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&condInfo.m_graph_G2_init_cond_node,
+                                                baseGraph,
+                                                parentsForC2.data(),
+                                                parentsForC2.size(),
+                                                &condInfo.m_init_C2_node_params));
+
+        // Conditional node C2 itself
+        condInfo.m_conditional_node_C2_params.conditional.handle = condInfo.m_conditional_node_C2_handle;
+        condInfo.m_conditional_node_C2_params.conditional.type   = CU_GRAPH_COND_TYPE_IF;
+        condInfo.m_conditional_node_C2_params.conditional.size   = 1;
+        condInfo.m_conditional_node_C2_params.conditional.ctx    = current_context; // context is obligatory otherwise one could get invalid arg error
+
+        CU_CHECK_EXCEPTION(addGraphNodeHelper(&condInfo.m_graph_G2_cond_node,
+                                              baseGraph,
+                                              &condInfo.m_graph_G2_init_cond_node,
+                                              1,
+                                              &condInfo.m_conditional_node_C2_params));
+
+        condInfo.m_pGraph[2] = &condInfo.m_conditional_node_C2_params.conditional.phGraph_out[0];
+
+        stage.pGraph = condInfo.m_pGraph[2];
+        stage.parents.clear(); // inside the conditional graph we start from its root
+#endif
+    }
+    else
+    {
+        // No C2: directly reuse graph and parents from stage 1.
+        condInfo.m_pGraph[2] = condInfo.m_pGraph[1];
+
+        stage.pGraph  = condInfo.m_pGraph[2];
+        stage.parents = parentsForC2; // UCI P1 decoders are direct parents
+    }
+
+    return stage;
+}
+
+//==================================================================================================
+
+void PuschRx::createFullSlotGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode,
+                                  CUgraph&                     fullSlotGraph,
+                                  CUgraphNode&                 emptyRootNode,
+                                  condGraphInfo&               condInfo)
 {
     CU_CHECK_EXCEPTION(cuGraphCreate(&fullSlotGraph, 0));
 
-    std::vector<CUgraphNode> currNodeDeps[2], nextNodeDeps[2];
-    std::vector<CUgraphNode> dgl_currNodeDeps[2];
+    // Dependency vectors (xParents = inputs to stage x)
+    std::vector<CUgraphNode> rootParents;       // inputs to Front-end (after C0)
+    std::vector<CUgraphNode> softDemapParents;  // inputs to Soft-demapper (EQ-coef outputs)
+    std::vector<CUgraphNode> uciP1Parents;      // inputs to UCI-P1 (Soft-demapper outputs)
+    std::vector<CUgraphNode> csiP2Parents;      // inputs to CSI-P2 (UCI-P1 decoders' outputs)
+    std::vector<CUgraphNode> schParents;        // inputs to SCH backend (SegLLRs2)
+
+    // For device-graphs, stash parents per stage
+    std::vector<CUgraphNode> dglParentsC1;      // parents for C1 device graph launch
+    std::vector<CUgraphNode> dglParentsC2;      // parents for C2 device graph launch
 
     void* arg;
     void* kernelParams[2] = {&arg, &arg};
@@ -2866,631 +3890,189 @@ void PuschRx::createFullSlotGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode,
     // Only useful if at least any one of USE_COND_GRAPH_NODE_C[0-2] is set to 1
     CUcontext current_context;
     CU_CHECK_EXCEPTION(cuCtxGetCurrent(&current_context));
-    unsigned int cond_handle_flags = 0; // Relevant for cond. handle creation in PUSCH_COND_IF_NODES_W_KERNEL mode. Alternative: CU_GRAPH_COND_ASSIGN_DEFAULT.
+    unsigned int cond_handle_flags = 0; // Relevant for cond. handle creation in PUSCH_COND_IF_NODES_W_KERNEL mode.
 
-    // Second part of the OR condition only relevant if we want to partially enable some cond. IF nodes (requires recompilation). FIXME worth maintaining?
-    bool no_cond_C0_node = (m_workCancelMode == PUSCH_NO_WORK_CANCEL) || \
-                           ((m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C0 == 0));
-
-    // The second part of the OR condition is only relevant if we want to maintain the ability to partially enable some cond. IF nodes  (requires recompilation)
-    if(no_cond_C0_node)
+    // C0: root conditional / graph selection stage
     {
-        // Use empty node as a root
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&emptyRootNode, fullSlotGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode0paramDriver));
-        condInfo.m_pGraph[0] = &fullSlotGraph;
+        CondStage c0Stage = enterConditionalStage0(fullSlotGraph,
+                                                   emptyRootNode,
+                                                   condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   rootParents); // initial parents, currently empty
 
-        currNodeDeps[0].emplace_back(emptyRootNode);
-    }
-    else if(m_workCancelMode == PUSCH_DEVICE_GRAPHS)
-    {
-        CU_CHECK_EXCEPTION(cuGraphCreate(&condInfo.m_graph[0], 0));
-        condInfo.m_pGraph[0] = &condInfo.m_graph[0]; //FIXME
-    }
-    else
-    {   // Conditional-IF node with C0 enabled (i.e., (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL))
-        // Create initial condition node
-
-        // Create conditional handle
-#if CUDA_VERSION >= 12040
-        CU_CHECK_EXCEPTION(cuGraphConditionalHandleCreate(&condInfo.m_conditional_node_C0_handle, fullSlotGraph, current_context, DEFAULT_COND_VAL, cond_handle_flags));
-        //printf("conditional handle created with flags %d and default launch value %d (relevant if flags != 0)\n", cond_handle_flags, DEFAULT_COND_VAL);
-
-       if(m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL)
-       {
-           // Add kernel node that sets condition for conditional node
-           void * pKArgs[2] = {&m_workCancelPtr, &condInfo.m_conditional_node_C0_handle};
-           CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C0_node_params, &pKArgs[0], 0));
-           CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&condInfo.m_graph_G0_init_cond_node, fullSlotGraph, NULL, 0, &condInfo.m_init_C0_node_params));
-           //printf("added node that sets condition to graph graph_G0\n");
-
-           // Add conditional node C0 to G0
-           condInfo.m_conditional_node_C0_params.conditional.handle = condInfo.m_conditional_node_C0_handle;
-           condInfo.m_conditional_node_C0_params.conditional.type  = CU_GRAPH_COND_TYPE_IF;
-           condInfo.m_conditional_node_C0_params.conditional.size  = 1;
-           condInfo.m_conditional_node_C0_params.conditional.ctx   = current_context; // providing a context is obligatory; there is an invalid arg. error otherwise.
-
-           CU_CHECK_EXCEPTION(addGraphNodeHelper(&condInfo.m_graph_G0_cond_node, fullSlotGraph, &condInfo.m_graph_G0_init_cond_node, 1, &condInfo.m_conditional_node_C0_params));
-       }
-       condInfo.m_pGraph[0] = &condInfo.m_conditional_node_C0_params.conditional.phGraph_out[0];
-#endif
-    }
-
-    if(fullSlotProcMode == cuphyPuschFullSlotProcMode_t::PUSCH_LEGACY_FULL_SLOT_PROC)
-    {
-        //==========================================================================================================/
-        // add m_chEstNodes, parent node  : m_emptyRootNode                                                         /
-        //                   sibling nodes: other m_chEstNodes                                                      /
-        //==========================================================================================================/
-
-        m_chest->chestGraph().addKernelNodeToGraph(*condInfo.m_pGraph[0],
-                                                       currNodeDeps[0],
-                                                       nextNodeDeps[0],
-                                                       m_emptyNode2paramsDriver);
-        if(m_chEstSettings.enableWeightedAverageCfo!=1)
-        {
-        //==========================================================================================================/
-        // add m_noiseIntfEstNodes, parent node(s) : m_chEstNodes/m_chEstSecondNodes                                /
-        //                          sibling node(s): m_cfoTaEstNodes, other m_noiseIntfEstNodes                     /
-        //==========================================================================================================/
-        // At minimum equalizer coefficient compute depends on channel estimation. Additionally, if noise-interference estimation and CFO estimation
-        // are enabled then it depends on them as well
-        nextNodeDeps[1] = nextNodeDeps[0];
-
-        if(m_chEstSettings.enableSinrMeasurement || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo))
-        {
-            CUDA_KERNEL_NODE_PARAMS noiseIntfEstParamsDriver;
-            pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t descr;
-            void* kernelParams[] = {&descr};
-            const int numPtrArgs = 0;
-            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&noiseIntfEstParamsDriver, &kernelParams[0], numPtrArgs, sizeof(pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t)));
-
-            // Noise-interference estimation depends on all channel estimations
-            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS; ++hetCfgIdx)
-            {
-                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_noiseIntfEstNodes[hetCfgIdx], *condInfo.m_pGraph[0], nextNodeDeps[0].data(), nextNodeDeps[0].size(), &noiseIntfEstParamsDriver));
-                nextNodeDeps[1].emplace_back(m_noiseIntfEstNodes[hetCfgIdx]);
-            }
-        }
-
-        //==========================================================================================================/
-        // add m_cfoTaEstNodes, parent node(s) : m_chEstNodes                                                       /
-        //                      sibling node(s): m_noiseIntfEstNodes, other m_cfoTaEstNodes                         /
-        //==========================================================================================================/
-        if(m_chEstSettings.enableCfoCorrection || m_chEstSettings.enableToEstimation)
-        {
-            CUDA_KERNEL_NODE_PARAMS cfoTaEstParamsDriver;
-            cfo_ta_est::puschRxCfoTaEstDynDescr_t descr;
-            void* kernelParams[] = {&descr};
-            const int numPtrArgs = 0;
-            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&cfoTaEstParamsDriver, &kernelParams[0], numPtrArgs, sizeof(cfo_ta_est::puschRxCfoTaEstDynDescr_t)));
-
-            // CFO calculation depends on all channel estimations
-            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CFO_EST_N_MAX_HET_CFGS; ++hetCfgIdx)
-            {
-                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_cfoTaEstNodes[hetCfgIdx], *condInfo.m_pGraph[0], nextNodeDeps[0].data(), nextNodeDeps[0].size(), &cfoTaEstParamsDriver));
-                nextNodeDeps[1].emplace_back(m_cfoTaEstNodes[hetCfgIdx]);
-            }
-        }
-
-        //=================================================================================================================/
-        // add m_chEqCoefCompNodes, parent node(s) : m_chEstNodes (and conditionally m_noiseIntfEstNodes, m_cfoTaEstNodes) /
-        //                          sibling node(s): other m_chEqCoefCompNodes                                             /
-        //=================================================================================================================/
-        // Since equalizer coefficient compute depends on channel, noise-interference and CFO estimation when enabled, soft demap need only depend on
-        // equalizer coefficient compute
-        nextNodeDeps[0].clear();
-        int32_t bound = 1;
-        if(m_chEstSettings.enablePuschTdi)
-        {
-            bound = CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ;
-        }
-
-        for(int32_t chEqTimeInstIdx = 0; chEqTimeInstIdx < bound; ++chEqTimeInstIdx)
-        {
-            CUDA_KERNEL_NODE_PARAMS chEqCoefCompParamsDriver;
-            channel_eq::puschRxChEqCoefCompDynDescr_t coef_comp_arg;
-            void* kernelParams[] = {&arg, &coef_comp_arg};
-            const int numPtrArgs = 1;
-            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqCoefCompParamsDriver, &kernelParams[0], numPtrArgs, sizeof(channel_eq::puschRxChEqCoefCompDynDescr_t)));
-            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
-            {
-                CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_chEqCoefCompNodes[chEqTimeInstIdx][hetCfgIdx], *condInfo.m_pGraph[0], nextNodeDeps[1].data(), nextNodeDeps[1].size(), &chEqCoefCompParamsDriver));
-                nextNodeDeps[0].emplace_back(m_chEqCoefCompNodes[chEqTimeInstIdx][hetCfgIdx]);
-            }
-        }
-
-        }
-        else // m_chEstSettings.enableWeightedAverageCfo == 1
-        {
-            //==========================================================================================================/
-            // add m_noiseIntfEstNodes, parent node(s) : m_chEstNodes/m_chEstSecondNodes                                /
-            //                          sibling node(s): other m_noiseIntfEstNodes                                      /
-            //==========================================================================================================/
-            // At minimum equalizer coefficient compute depends on channel estimation. Additionally, if noise-interference estimation and CFO estimation
-            // are enabled then it depends on them as well
-            currNodeDeps[0] = nextNodeDeps[0];
-            nextNodeDeps[0].clear();
-            if(m_chEstSettings.enableSinrMeasurement || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo))
-            {
-                CUDA_KERNEL_NODE_PARAMS noiseIntfEstParamsDriver;
-                pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t descr;
-                void* kernelParams[] = {&descr};
-                const int numPtrArgs = 0;
-                CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&noiseIntfEstParamsDriver, &kernelParams[0], numPtrArgs, sizeof(pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t)));
-    
-                // Noise-interference estimation depends on all channel estimations
-                for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS; ++hetCfgIdx)
-                {
-                    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_noiseIntfEstNodes[hetCfgIdx], *condInfo.m_pGraph[0], currNodeDeps[0].data(), currNodeDeps[0].size(), &noiseIntfEstParamsDriver));
-                    nextNodeDeps[0].emplace_back(m_noiseIntfEstNodes[hetCfgIdx]);
-                }
-            }
-            //==========================================================================================================/
-            // add m_rsrpNodes, parent node(s) : m_noiseIntfEstNodes                                                    /
-            //                  sibling node(s): other m_rsrpNodes                                                      /
-            //==========================================================================================================/
-            currNodeDeps[0] = nextNodeDeps[0];
-            nextNodeDeps[0].clear();
-            if(m_chEstSettings.enableSinrMeasurement)
-            {
-                for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
-                {
-                    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rsrpNodes[fullSlotProcMode][hetCfgIdx], *condInfo.m_pGraph[0], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-                    nextNodeDeps[0].emplace_back(m_rsrpNodes[fullSlotProcMode][hetCfgIdx]);
-                }
-            }
-            //==========================================================================================================/
-            // add m_cfoTaEstNodes, parent node(s) : m_rsrpNodes                                                        /
-            //                      sibling node(s): other m_cfoTaEstNodes                                              /
-            //==========================================================================================================/
-            currNodeDeps[0] = nextNodeDeps[0];
-            nextNodeDeps[0].clear();
-            if(m_chEstSettings.enableCfoCorrection || m_chEstSettings.enableToEstimation)
-            {
-                CUDA_KERNEL_NODE_PARAMS cfoTaEstParamsDriver;
-                cfo_ta_est::puschRxCfoTaEstDynDescr_t descr;
-                void* kernelParams[] = {&descr};
-                const int numPtrArgs = 0;
-                CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&cfoTaEstParamsDriver, &kernelParams[0], numPtrArgs, sizeof(cfo_ta_est::puschRxCfoTaEstDynDescr_t)));
-    
-                // CFO calculation depends on all channel estimations
-                for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CFO_EST_N_MAX_HET_CFGS; ++hetCfgIdx)
-                {
-                    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_cfoTaEstNodes[hetCfgIdx], *condInfo.m_pGraph[0], currNodeDeps[0].data(), currNodeDeps[0].size(), &cfoTaEstParamsDriver));
-                    nextNodeDeps[0].emplace_back(m_cfoTaEstNodes[hetCfgIdx]);
-                }
-            }
-    
-            //=================================================================================================================/
-            // add m_chEqCoefCompNodes, parent node(s) : m_cfoTaEstNodes)                                                      /
-            //                          sibling node(s): other m_chEqCoefCompNodes                                             /
-            //=================================================================================================================/
-            // Since equalizer coefficient compute depends on channel, noise-interference and CFO estimation when enabled, soft demap need only depend on
-            // equalizer coefficient compute
-            currNodeDeps[0] = nextNodeDeps[0];
-            nextNodeDeps[0].clear();
-            int32_t bound = 1;
-            if(m_chEstSettings.enablePuschTdi)
-            {
-                bound = CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ;
-            }
-    
-            for(int32_t chEqTimeInstIdx = 0; chEqTimeInstIdx < bound; ++chEqTimeInstIdx)
-            {
-                CUDA_KERNEL_NODE_PARAMS chEqCoefCompParamsDriver;
-                channel_eq::puschRxChEqCoefCompDynDescr_t coef_comp_arg;
-                void* kernelParams[] = {&arg, &coef_comp_arg};
-                const int numPtrArgs = 1;
-                CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqCoefCompParamsDriver, &kernelParams[0], numPtrArgs, sizeof(channel_eq::puschRxChEqCoefCompDynDescr_t)));
-                for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
-                {
-                    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_chEqCoefCompNodes[chEqTimeInstIdx][hetCfgIdx], *condInfo.m_pGraph[0], currNodeDeps[0].data(), currNodeDeps[0].size(), &chEqCoefCompParamsDriver));
-                    nextNodeDeps[0].emplace_back(m_chEqCoefCompNodes[chEqTimeInstIdx][hetCfgIdx]);
-                }
-            }
-        } // if(m_chEstSettings.enableWeightedAverageCfo!=1)
-    }
-    //==========================================================================================================/
-    // add m_chEqSoftDemapNodes, parent node(s) : m_chEqCoefCompNodes                                           /
-    //                           sibling node(s): other m_chEqSoftDemapNodes                                    /
-    //==========================================================================================================/
-    currNodeDeps[0] = nextNodeDeps[0];
-    nextNodeDeps[0].clear();
-
-    for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
-    {
-        CUDA_KERNEL_NODE_PARAMS chEqSoftDemapParamsDriver;
-        channel_eq::puschRxChEqSoftDemapDynDescr_t soft_demap_arg;
-        void* kernelParams[] = {&arg, &soft_demap_arg};
-        const int numPtrArgs = 1;
-        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqSoftDemapParamsDriver, &kernelParams[0], numPtrArgs, sizeof(channel_eq::puschRxChEqSoftDemapDynDescr_t)));
-
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_chEqSoftDemapNodes[fullSlotProcMode][hetCfgIdx], *condInfo.m_pGraph[0], currNodeDeps[0].data(), currNodeDeps[0].size(), &chEqSoftDemapParamsDriver));
-        nextNodeDeps[0].emplace_back(m_chEqSoftDemapNodes[fullSlotProcMode][hetCfgIdx]);
-    }
-
-    if(m_chEstSettings.enableDftSOfdm==1)
-    {
-        //==========================================================================================================/
-        // add m_chEqSoftDemapIdftNodes, parent node(s) : m_chEqSoftDemapNodes                                      /
-        //                               sibling node(s): other m_chEqSoftDemapIdftNodes                            /
-        //==========================================================================================================/
-        currNodeDeps[0] = nextNodeDeps[0];
-        nextNodeDeps[0].clear();
-        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
-        {
-            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_chEqSoftDemapIdftNodes[fullSlotProcMode][hetCfgIdx], *condInfo.m_pGraph[0], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode2paramsDriver));
-            nextNodeDeps[0].emplace_back(m_chEqSoftDemapIdftNodes[fullSlotProcMode][hetCfgIdx]);
-        }
-
-        //==========================================================================================================/
-        // add m_chEqSoftDemapAfterDftNodes, parent node(s) : m_chEqSoftDemapDft2Nodes                              /
-        //                                   sibling node(s): other m_chEqSoftDemapAfterDftNodes                    /
-        //==========================================================================================================/
-        currNodeDeps[0] = nextNodeDeps[0];
-        nextNodeDeps[0].clear();
-        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
-        {
-            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_chEqSoftDemapAfterDftNodes[fullSlotProcMode][hetCfgIdx], *condInfo.m_pGraph[0], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode2paramsDriver));
-            nextNodeDeps[0].emplace_back(m_chEqSoftDemapAfterDftNodes[fullSlotProcMode][hetCfgIdx]);
-        }
-
-    }
-
-    // SCH backend and UCI backend kernels can start after soft demap
-    currNodeDeps[0] = nextNodeDeps[0];
-    nextNodeDeps[0].clear();
-    nextNodeDeps[1].clear();
-    currNodeDeps[1].clear();
-
-    bool use_cond_if_node_c1 = (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C1 == 1);
-
-    if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
-    {
-        //printf("trying DGL for C1\n");
-        CU_CHECK_EXCEPTION(cuGraphCreate(&condInfo.m_graph[1], 0));
-        condInfo.m_pGraph[1] = &condInfo.m_graph[1];
-        dgl_currNodeDeps[0] = currNodeDeps[0];
-        currNodeDeps[0].clear();
-    }
-    else if (use_cond_if_node_c1)
-    {
-        //create C1 with parents (both the m_chEqSOftDemapNodes and) the m_chEqSoftDemapAfterDftNodes
-#if CUDA_VERSION >= 12040
-        CU_CHECK_EXCEPTION(cuGraphConditionalHandleCreate(&condInfo.m_conditional_node_C1_handle, *condInfo.m_pGraph[0], current_context, DEFAULT_COND_VAL, cond_handle_flags));
-        //printf("conditional handle C1 created with flags %d and default launch value %d (relevant if flags != 0)\n", cond_handle_flags, DEFAULT_COND_VAL);
-
-        if(m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL)
-        {
-            // Add kernel node that sets condition for conditional node
-            void * pKArgs_C1[2] = {&m_workCancelPtr, &condInfo.m_conditional_node_C1_handle};
-            CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C1_node_params, &pKArgs_C1[0], 0));
-            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&condInfo.m_graph_G1_init_cond_node, *condInfo.m_pGraph[0], currNodeDeps[0].data(), currNodeDeps[0].size(), &condInfo.m_init_C1_node_params));
-            //printf("added node that sets condition to graph graph_G1\n");
-
-            // Add conditional node C1 to G1
-            condInfo.m_conditional_node_C1_params.conditional.handle = condInfo.m_conditional_node_C1_handle;
-            condInfo.m_conditional_node_C1_params.conditional.type  = CU_GRAPH_COND_TYPE_IF;
-            condInfo.m_conditional_node_C1_params.conditional.size  = 1;
-            condInfo.m_conditional_node_C1_params.conditional.ctx   = current_context; // context is obligatory otherwise one could get invalid arg error
-            CU_CHECK_EXCEPTION(addGraphNodeHelper(&condInfo.m_graph_G1_cond_node, *condInfo.m_pGraph[0], &condInfo.m_graph_G1_init_cond_node, 1, &condInfo.m_conditional_node_C1_params));
-        }
-        //printf("added conditional node to graph G\n");
-
-        currNodeDeps[0].clear(); // Clear prior dependencies, if we're using conditional graphs
-
-        condInfo.m_pGraph[1] = &condInfo.m_conditional_node_C1_params.conditional.phGraph_out[0];
-#endif
-    }
-    else
-    {
-        condInfo.m_pGraph[1] = condInfo.m_pGraph[0];
-    }
-
-
-    //==========================================================================================================/
-    // add m_compCwTreeTypesNode, parent node(s) : m_chEqSoftDemapAfterDftNodes                                 /
-    //                            sibling node(s): m_rssiNodes, m_uciSegLLRs0Node, m_rsrpNodes                  /
-    //==========================================================================================================/
-    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_compCwTreeTypesNode[fullSlotProcMode], *condInfo.m_pGraph[1], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-    currNodeDeps[1].emplace_back(m_compCwTreeTypesNode[fullSlotProcMode]);
-
-    //==========================================================================================================/
-    // add m_rsrpNodes, parent node(s) : m_chEqSoftDemapNodes                                                   /
-    //                  sibling node(s): m_rssiNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode                  /
-    //==========================================================================================================/
-    // SINR and RSSI estimation can go in parallel with SCH backend and UCI backend kernels
-    if((m_chEstSettings.enableSinrMeasurement)&&((m_chEstSettings.enableWeightedAverageCfo!=1)||(fullSlotProcMode == cuphyPuschFullSlotProcMode_t::PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC)))
-    {
-        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
-        {
-            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rsrpNodes[fullSlotProcMode][hetCfgIdx], *condInfo.m_pGraph[1], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        }
+        // Subsequent stages (front-end, soft demap, etc.) use this graph and parents.
+        condInfo.m_pGraph[0] = c0Stage.pGraph;
+        rootParents          = std::move(c0Stage.parents);
     }
 
     //==========================================================================================================/
-    // add m_rssiNodes, parent node(s) : m_chEqSoftDemapNodes                                                   /
-    //                  sibling node(s): m_rsrpNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode                  /
+    // Front-end stage: ChEst + (optional) noise/intf, RSRP, CFO/TA + EQ coefficient compute                    /
     //==========================================================================================================/
-    if(m_chEstSettings.enableRssiMeasurement)
+    if (fullSlotProcMode == PUSCH_LEGACY_FULL_SLOT_PROC)
     {
-        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS; ++hetCfgIdx)
-        {
-            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rssiNodes[fullSlotProcMode][hetCfgIdx], *condInfo.m_pGraph[1], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        }
+        StageResult frontEndStage = buildFrontEndStage(fullSlotProcMode,
+                                                       condInfo.m_pGraph[0],
+                                                       rootParents,
+                                                       arg);
+
+        // EQ-coefficient compute nodes become the parents for the soft-demapper stage.
+        softDemapParents = std::move(frontEndStage.terminalNodes);
     }
 
     //==========================================================================================================/
-    // add m_uciSegLLRs0Node, parent node(s) : m_chEqSoftDemapNodes                                             /
-    //                        sibling node(s): m_rsrpNodes, m_rssiNodes, m_compCwTreeTypesNode                  /
+    // Soft-demapper stage (incl. optional DFT-S-OFDM)                                                          /
     //==========================================================================================================/
-    // Most of these kernels are run optionally, and calling the setup function here during graph creation can cause issues
-    // if there's nothing to set up. Instead, we just use the null kernel here and update the nodes during updateGraph().
-    //if(m_nUciUes > 0)
     {
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciSegLLRs0Node[fullSlotProcMode], *condInfo.m_pGraph[1], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        nextNodeDeps[0].emplace_back(m_uciSegLLRs0Node[fullSlotProcMode]);
+        // For legacy mode, softDemapParents holds all m_chEqCoefCompNodes at this point.
+        // For other modes, this will follow the existing behavior (empty parents unless set elsewhere).
+        StageResult softDemapStage = buildSoftDemapStage(fullSlotProcMode,
+                                                         condInfo.m_pGraph[0],
+                                                         softDemapParents,
+                                                         arg);
 
-        // We have a dependency on the CSI-P1 control kernel for the next 3 kernels: simplex, RM and polar
-        // Simplex, RM and polar run in parallel
-        currNodeDeps[0] = nextNodeDeps[0];
-    }
-
-    //==========================================================================================================/
-    // add m_simplexDecoderNode, parent node(s) : m_uciSegLLRs0Node                                             /
-    //                       sibling node(s): m_rmDecoderNode, m_compCwTreeTypesNode                            /
-    //==========================================================================================================/
-    //if(m_nSpxCws > 0)
-    {
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_simplexDecoderNode[fullSlotProcMode], *condInfo.m_pGraph[1], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        nextNodeDeps[1].emplace_back(m_simplexDecoderNode[fullSlotProcMode]);
+        // UCI backend kernels can start after soft demap.
+        uciP1Parents = std::move(softDemapStage.terminalNodes);
     }
 
     //==========================================================================================================/
-    // add m_rmDecoderNode, parent node(s) : m_uciSegLLRs0Node                                                  /
-    //                  sibling node(s): m_simplexDecoderNode, m_compCwTreeTypesNode                            /
+    // C1: optional conditional/device graph stage after soft demap                                             /
     //==========================================================================================================/
-    //if(m_nRmCws > 0)
     {
-        CUDA_KERNEL_NODE_PARAMS rmDecoderParamsDriver;
-        rmDecoderDynDescr_t arg;
-        void* kernelParams[] = {&arg};
-        const int numPtrArgs = 0;
-        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&rmDecoderParamsDriver, &kernelParams[0], numPtrArgs, sizeof(rmDecoderDynDescr_t)));
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rmDecoderNode[fullSlotProcMode], *condInfo.m_pGraph[1], currNodeDeps[0].data(), currNodeDeps[0].size(), &rmDecoderParamsDriver));
-        nextNodeDeps[1].emplace_back(m_rmDecoderNode[fullSlotProcMode]);
+        CondStage c1Stage = enterConditionalStage1(condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   uciP1Parents, // parents = soft-demap (or after-DFT) nodes
+                                                   dglParentsC1);
+
+        condInfo.m_pGraph[1] = c1Stage.pGraph;
+        uciP1Parents         = std::move(c1Stage.parents); // inputs to UCI-P1 (post-C1)
     }
 
-    //if(m_nPolUciSegs > 0)
+    //==========================================================================================================/
+    // Post-soft-demap fan-out: compute UCI metrics and launch UCI-P1 decoders (Simplex, RM, Polar)             /
+    //==========================================================================================================/
     {
-        //==========================================================================================================/
-        // add m_polSegDeRmDeItlNode, parent node(s) : m_uciSegLLRs0Node, m_compCwTreeTypesNode                     /
-        //                            sibling node(s): none                                                         /
-        //==========================================================================================================/
-        currNodeDeps[1].insert(currNodeDeps[1].end(), currNodeDeps[0].begin(), currNodeDeps[0].end());
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_polSegDeRmDeItlNode[fullSlotProcMode], *condInfo.m_pGraph[1], currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
-        currNodeDeps[1].clear();
-        currNodeDeps[1].emplace_back(m_polSegDeRmDeItlNode[fullSlotProcMode]);
+        StageResult uciP1Stage = buildUciP1BackendStage(fullSlotProcMode,
+                                                        condInfo.m_pGraph[1],
+                                                        uciP1Parents);
 
-        //==========================================================================================================/
-        // add m_polarDecoderNode, parent node(s) : m_polSegDeRmDeItlNode                                           /
-        //                         sibling node(s): none                                                            /
-        //==========================================================================================================/
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_polarDecoderNode[fullSlotProcMode], *condInfo.m_pGraph[1], currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
-        nextNodeDeps[1].emplace_back(m_polarDecoderNode[fullSlotProcMode]);
+        // The three UCI P1 decoders (Simplex, RM, Polar) become the parents for
+        // the CSI-P2 control / C2 conditional-graph logic that follows.
+        csiP2Parents = std::move(uciP1Stage.terminalNodes); // inputs to CSI-P2
     }
 
-    // Create either C2 conditional-IF node or 3rd DGL or continue with existing graph otherwise
-    bool use_cond_if_node_c2 = (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C2 == 1);
-    bool use_cond_if_or_dgl_node_c2 = (m_workCancelMode != PUSCH_NO_WORK_CANCEL) && (USE_COND_GRAPH_NODE_C2 == 1);
-    if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
-    //if ((m_workCancelMode == PUSCH_DEVICE_GRAPHS) && (USE_COND_GRAPH_NODE_C2 == 1))
+    //==========================================================================================================/
+    // C2: optional conditional/device graph stage between UCI-P1 and CSI-P2/SCH                                /
+    //==========================================================================================================/
+    bool use_cond_if_node_c2 =
+        (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C2 == 1);
+    bool use_cond_if_or_dgl_node_c2 =
+        (m_workCancelMode != PUSCH_NO_WORK_CANCEL) && (USE_COND_GRAPH_NODE_C2 == 1);
+
     {
-        //printf("trying DGL for C2\n");
-        CU_CHECK_EXCEPTION(cuGraphCreate(&condInfo.m_graph[2], 0));
-        condInfo.m_pGraph[2] = &condInfo.m_graph[2];
-        dgl_currNodeDeps[1] = nextNodeDeps[1];
-    }
-    else if (use_cond_if_node_c2)
-    {
-#if CUDA_VERSION >= 12040
-        CU_CHECK_EXCEPTION(cuGraphConditionalHandleCreate(&condInfo.m_conditional_node_C2_handle, *condInfo.m_pGraph[1], current_context, DEFAULT_COND_VAL, cond_handle_flags));
-        //printf("conditional handle C2 created with flags %d and default launch value %d (relevant if flags != 0)\n", cond_handle_flags, DEFAULT_COND_VAL);
+        // csiP2Parents currently holds the UCI-P1 decoder nodes.
+        CondStage c2Stage = enterConditionalStage2(condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   use_cond_if_node_c2,
+                                                   csiP2Parents,  // parents for C2
+                                                   dglParentsC2);
 
-        currNodeDeps[0] = nextNodeDeps[1];
-
-        if(m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL)
-        {
-            // Add kernel node that sets condition for conditional node C2
-            void * pKArgs_C2[2] = {&m_workCancelPtr, &condInfo.m_conditional_node_C2_handle};
-            CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C2_node_params, &pKArgs_C2[0], 0));
-            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&condInfo.m_graph_G2_init_cond_node, *condInfo.m_pGraph[1], currNodeDeps[0].data(), currNodeDeps[0].size(), &condInfo.m_init_C2_node_params));
-            //printf("added node that sets condition to graph graph_G2\n");
-
-            // Add conditional node C2 to G2
-            condInfo.m_conditional_node_C2_params.conditional.handle = condInfo.m_conditional_node_C2_handle;
-            condInfo.m_conditional_node_C2_params.conditional.type  = CU_GRAPH_COND_TYPE_IF;
-            condInfo.m_conditional_node_C2_params.conditional.size  = 1;
-            condInfo.m_conditional_node_C2_params.conditional.ctx   = current_context; //FIXME context is obligatory otherwise one could get invalid arg error
-
-            CU_CHECK_EXCEPTION(addGraphNodeHelper(&condInfo.m_graph_G2_cond_node, *condInfo.m_pGraph[1], &condInfo.m_graph_G2_init_cond_node, 1, &condInfo.m_conditional_node_C2_params));
-        }
-        //printf("added conditional node to graph G2\n");
-
-        condInfo.m_pGraph[2] = &condInfo.m_conditional_node_C2_params.conditional.phGraph_out[0];
-#endif
-    }
-    else
-    {
-        condInfo.m_pGraph[2] = condInfo.m_pGraph[1];
+        condInfo.m_pGraph[2] = c2Stage.pGraph;
+        // We intentionally do NOT override csiP2Parents here:
+        // buildCsiP2BackendStage() still needs these parents.
+        // Whether they are used as actual parents for CSI-P2 control is governed
+        // by use_cond_if_or_dgl_node_c2 (passed to buildCsiP2BackendStage).
     }
 
     //===================================== CSI-P2 =======================================
 
     //if(m_nCsi2Ues > 0) // If this gets uncommented, then the conditional graph node code above also has to be updated
     {
-        //==========================================================================================================/
-        // add m_uciOnPuschCsi2CtrlNode, parent node(s) : m_simplexDecoderNode, m_rmDecoderNode, m_polarDecoderNode /
-        //                               sibling node(s): none                                                      /
-        //==========================================================================================================/
-        // CSI-P2 control kernel depends on CSI-P1 kernels (simplex, RM and polar) completion
-//#if !TRY_COND_GRAPH_NODES
-        if (!use_cond_if_or_dgl_node_c2)
-        {
-            currNodeDeps[0] = nextNodeDeps[1];
-        }
-        else
-        {
-            currNodeDeps[0].clear();
-        }
-        nextNodeDeps[0].clear();
-        nextNodeDeps[1].clear();
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        nextNodeDeps[0].emplace_back(m_uciOnPuschCsi2CtrlNode[fullSlotProcMode]);
+        // CSI-P2 backend (control + UCI decoders) built off UCI-P1 decoder outputs.
+        // csiP2Parents currently holds [simplexP1, rmP1, polarP1].
+        StageResult csi2Stage = buildCsiP2BackendStage(fullSlotProcMode,
+                                                       condInfo.m_pGraph[2],
+                                                       csiP2Parents,
+                                                       use_cond_if_or_dgl_node_c2);
 
-
-        //==========================================================================================================/
-        // add m_uciOnPuschCsi2CompCwTreeTypesNode, parent node(s) : m_uciOnPuschCsi2CtrlNode                       /
-        //                            sibling node(s): m_uciOnPuschCsi2SegLLRs2Node                                 /
-        //==========================================================================================================/
-
-        currNodeDeps[0] = nextNodeDeps[0];
-        currNodeDeps[1].clear();
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        currNodeDeps[1].emplace_back(m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode]);
-
-        //==========================================================================================================/
-        // add m_uciOnPuschCsi2SegLLRs2Node, parent node(s) : m_uciOnPuschCsi2CtrlNode                              /
-        //                               sibling node(s): none                                                      /
-        //==========================================================================================================/
-        // CSI-P2 control kernel (Csi2Ctrl) calculates SCH rate-matched bits which is used by SegLLRs2 for demux
-        currNodeDeps[0] = nextNodeDeps[0];
-        nextNodeDeps[0].clear();
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        nextNodeDeps[0].emplace_back(m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode]);
-
-        //========================================================================================================================/
-        // add m_uciOnPuschCsi2rmDecoderNode, parent node(s) : m_uciOnPuschCsi2SegLLRs2Node                                       /
-        //                      sibling node(s): m_uciOnPuschCsi2simplexDecoderNode, m_rateMatchNode                              /
-        //========================================================================================================================/
-        currNodeDeps[0] = nextNodeDeps[0];
-        nextNodeDeps[0].clear();
-        {
-            CUDA_KERNEL_NODE_PARAMS rmDecoderParamsDriver;
-            rmDecoderDynDescr_t arg;
-            void* kernelParams[] = {&arg};
-            const int numPtrArgs = 0;
-            CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&rmDecoderParamsDriver, &kernelParams[0], numPtrArgs, sizeof(rmDecoderDynDescr_t)));
-            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &rmDecoderParamsDriver));
-        }
-        nextNodeDeps[0].emplace_back(m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode]);
-
-        //======================================================================================================================================/
-        // add m_uciOnPuschCsi2simplexDecoderNode, parent node(s) : m_uciOnPuschCsi2SegLLRs2Node, m_uciOnPuschCsi2CompCwTreeTypesNode           /
-        //                               sibling node(s): m_uciOnPuschCsi2rmDecoderNode, m_uciOnPuschCsi2CompCwTreeTypesNode, m_rateMatchNode   /
-        //======================================================================================================================================/
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        nextNodeDeps[0].emplace_back(m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode]);
-
-        //==============================================================================================================================/
-        // add m_uciOnPuschCsi2PolSegDeRmDeItlNode, parent node(s) : m_uciOnPuschCsi2SegLLRs2Node, m_uciOnPuschCsi2CompCwTreeTypesNode  /
-        //                                          sibling node(s): none                                                               /
-        //==============================================================================================================================/
-        currNodeDeps[1].insert(currNodeDeps[1].end(), currNodeDeps[0].begin(), currNodeDeps[0].end());
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
-        currNodeDeps[1].clear();
-        currNodeDeps[1].emplace_back(m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode]);
-
-        //==========================================================================================================/
-        // add m_uciOnPuschCsi2PolarDecoderNode, parent node(s) : m_uciOnPuschCsi2PolSegDeRmDeItlNode               /
-        //                                       sibling node(s): none                                              /
-        //==========================================================================================================/
-
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
-        nextNodeDeps[0].emplace_back(m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode]);
-
+        // For SCH backend, we need SegLLRs2 as the parent.
+        schParents = std::move(csi2Stage.terminalNodes);
     }
 
-    //if(m_nSchUes > 0) {
+    //===================================== SCH backend (LDPC + CRC) ===========================================/
+
+    // if (m_nSchUes > 0)
     {
-        //==========================================================================================================/
-        // add m_resetRateMatchNode followed by m_rateMatchNode, parent node(s) : m_uciOnPuschCsi2SegLLRs2Node      /
-        //                     sibling node(s): m_uciOnPuschCsi2rmDecoderNode, m_uciOnPuschCsi2simplexDecoderNode   /
-        //==========================================================================================================/
-        // SCH backend (derate-match, LDPC, CRC) of CSI-P2 UEs needs to wait until CSI-P2/SCH demux (SegLLRs2) occurs.
-        // @todo: SCH backend of CSI-P1 UEs can run right after PUSCH soft-demap completion (but this is not supported by pipeline yet)
-        nextNodeDeps[0].clear();
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_resetRateMatchNode[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        currNodeDeps[0].clear();
-        currNodeDeps[0].emplace_back(m_resetRateMatchNode[fullSlotProcMode]);
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rateMatchNode[fullSlotProcMode], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
-        nextNodeDeps[0].emplace_back(m_rateMatchNode[fullSlotProcMode]);
+        // SCH backend (derate-match, LDPC, CRC) of CSI-P2 UEs needs to wait until
+        // CSI-P2/SCH demux (SegLLRs2) occurs. schParents currently holds m_uciOnPuschCsi2SegLLRs2Node.
+        StageResult schStage = buildSchBackendStage(fullSlotProcMode,
+                                                    condInfo.m_pGraph[2],
+                                                    schParents);
 
-        //==========================================================================================================/
-        // add m_ldpcDecoderNodes, parent node(s) : m_rateMatchNode                                                 /
-        //                    sibling node(s): other m_ldpcDecNodes                                                 /
-        //==========================================================================================================/
-        currNodeDeps[0] = nextNodeDeps[0];
-        nextNodeDeps[0].clear();
-
-        for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
-        {
-            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ldpcDecoderNodes[fullSlotProcMode][i], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode2paramsDriver));
-            nextNodeDeps[0].emplace_back(m_ldpcDecoderNodes[fullSlotProcMode][i]);
-        }
-
-        {
-        CUDA_KERNEL_NODE_PARAMS crcDecodeParamsDriver;
-        puschRxCrcDecodeDescr_t crc_arg;
-        void* kernelParams[] = {&crc_arg};
-        const int numPtrArgs = 0;
-        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&crcDecodeParamsDriver, &kernelParams[0], numPtrArgs, sizeof(puschRxCrcDecodeDescr_t)));
-        //==========================================================================================================/
-        // add m_crcNodes[0], parent node(s) : m_ldpcDecoderNodes                                                   /
-        //                    sibling node(s): none                                                                 /
-        //==========================================================================================================/
-        currNodeDeps[0] = nextNodeDeps[0];
-        nextNodeDeps[0].clear();
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_crcNodes[fullSlotProcMode][0], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &crcDecodeParamsDriver));
-        nextNodeDeps[0].emplace_back(m_crcNodes[fullSlotProcMode][0]);
-
-        //==========================================================================================================/
-        // add m_crcNodes[1], parent node(s) : m_crcNodes[0]                                                        /
-        //                    sibling node(s): none                                                                 /
-        //==========================================================================================================/
-        currNodeDeps[0] = nextNodeDeps[0];
-        //nextNodeDeps[0].clear();
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_crcNodes[fullSlotProcMode][1], *condInfo.m_pGraph[2], currNodeDeps[0].data(), currNodeDeps[0].size(), &crcDecodeParamsDriver));
-        //nextNodeDeps[0].emplace_back(m_crcNodes[1]);
-        }
+        // No further graph nodes depend on SCH backend in this function today,
+        // but keep / move the terminal nodes if needed for future extensions.
+        schParents = std::move(schStage.terminalNodes);
     }
+
+    //===================================== Device-graph launch wiring (DGL) ===================================/
 
     if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
     {
-        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[2], *condInfo.m_pGraph[2], CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
-        void * pKArgs_node_c2[2] = {&m_workCancelPtr, &condInfo.m_graphExec[2]}; // at this point we haven't yet initialized or uploaded the device graph
-        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C2_node_params, &pKArgs_node_c2[0], 1 /* device graph launch */));
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G2_init_cond_node), condInfo.m_graph[1], dgl_currNodeDeps[1].data(), dgl_currNodeDeps[1].size(), &(condInfo.m_init_C2_node_params)));
+        // C2 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[2],
+                                              *condInfo.m_pGraph[2],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c2[2] = {&m_workCancelPtr, &condInfo.m_graphExec[2]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C2_node_params,
+                                                       &pKArgs_node_c2[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G2_init_cond_node),
+                                                condInfo.m_graph[1],
+                                                dglParentsC2.data(),
+                                                dglParentsC2.size(),
+                                                &(condInfo.m_init_C2_node_params)));
 
-        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[1], *condInfo.m_pGraph[1], CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
-        void * pKArgs_node_c1[2] = {&m_workCancelPtr, &condInfo.m_graphExec[1]}; // at this point we haven't yet initialized or uploaded the device graph
-        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C1_node_params, &pKArgs_node_c1[0], 1 /* device graph launch */));
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G1_init_cond_node), condInfo.m_graph[0], dgl_currNodeDeps[0].data(), dgl_currNodeDeps[0].size(), &(condInfo.m_init_C1_node_params)));
+        // C1 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[1],
+                                              *condInfo.m_pGraph[1],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c1[2] = {&m_workCancelPtr, &condInfo.m_graphExec[1]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C1_node_params,
+                                                       &pKArgs_node_c1[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G1_init_cond_node),
+                                                condInfo.m_graph[0],
+                                                dglParentsC1.data(),
+                                                dglParentsC1.size(),
+                                                &(condInfo.m_init_C1_node_params)));
 
-        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[0], *condInfo.m_pGraph[0], CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
-        void * pKArgs_node_c0[2] = {&m_workCancelPtr, &condInfo.m_graphExec[0]}; // at this point we haven't yet initialized or uploaded the device graph
-        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C0_node_params, &pKArgs_node_c0[0], 1 /* device graph launch */));
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G0_init_cond_node), fullSlotGraph, nullptr, 0, &(condInfo.m_init_C0_node_params)));
-        //need to explicitly upload to the device before launching the graph
+        // C0 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[0],
+                                              *condInfo.m_pGraph[0],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c0[2] = {&m_workCancelPtr, &condInfo.m_graphExec[0]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C0_node_params,
+                                                       &pKArgs_node_c0[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G0_init_cond_node),
+                                                fullSlotGraph,
+                                                nullptr,
+                                                0,
+                                                &(condInfo.m_init_C0_node_params)));
+        // Need to explicitly upload to the device before launching the graph
     }
-
 }
 
 void PuschRx::updateLaunchGraph(CUgraphExec &graphExec, CUgraphNode & graphWaitNode, CUgraphNode &graphDglNode,
                                 cuphyPuschRxWaitLaunchCfg_t& waitCfg, cuphyPuschRxDglLaunchCfg_t& dglCfg, bool enableDeviceGraphLaunch)
 {
     //CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graphExec, graphWaitNode, 1));
-    CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graphExec, graphWaitNode, &(waitCfg.kernelNodeParamsDriver)));
+    if(!m_useGreenContext)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graphExec, graphWaitNode, &(waitCfg.kernelNodeParamsDriver)));
+    }
     if (enableDeviceGraphLaunch)
     {
         if (m_DeviceGraphLaunchNodeEnabled != 1)
@@ -3515,8 +4097,11 @@ void PuschRx::updateEarlyHarqGraph(bool disableAllNodes /*=false*/)
             ch_est::ChestCudaUtils::toDisableAllNodes(disableAllNodes),
             m_ehqGraphExec);
 
-    int nCfgs = disableAllNodes? 0 : m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
-    cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqNoiseIntfEstNodesEnabled, m_ehqNoiseIntfEstNodes, m_ehqGraphExec);
+    int nCfgs{};
+    if(m_chEstSettings.enableSinrMeasurement || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo)) {
+        nCfgs = disableAllNodes? 0 : m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqNoiseIntfEstNodesEnabled, m_ehqNoiseIntfEstNodes, m_ehqGraphExec);
+    }
 
     nCfgs = disableAllNodes? 0 : m_chEqCoefCompLaunchCfgs[0].nCfgs;
     cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqCoefCompLaunchCfgs[0].cfgs, m_ehqChEqCoefCompNodesEnabled, m_ehqChEqCoefCompNodes, m_ehqGraphExec);
@@ -3644,8 +4229,11 @@ void PuschRx::updateFrontLoadedDmrsGraph(bool disableAllNodes /*=false*/)
     m_chest->frontDmrsGraph().setNodeStatus(ch_est::ChestCudaUtils::toDisableAllNodes(disableAllNodes),
                                                 m_frontLoadedDmrsGraphExec);
 
-    int nCfgs = disableAllNodes? 0 : m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
-    cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs, m_frontLoadedDmrsNoiseIntfEstNodesEnabled, m_frontLoadedDmrsNoiseIntfEstNodes, m_frontLoadedDmrsGraphExec);
+    int nCfgs{};
+    if(m_chEstSettings.enableSinrMeasurement || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo)) {
+        nCfgs = disableAllNodes? 0 : m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs, m_frontLoadedDmrsNoiseIntfEstNodesEnabled, m_frontLoadedDmrsNoiseIntfEstNodes, m_frontLoadedDmrsGraphExec);
+    }
 
     nCfgs = disableAllNodes? 0 : m_chEqCoefCompLaunchCfgs[0].nCfgs;
     cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqCoefCompLaunchCfgs[0].cfgs, m_frontLoadedDmrsChEqCoefCompNodesEnabled, m_frontLoadedDmrsChEqCoefCompNodes, m_frontLoadedDmrsGraphExec);
@@ -3670,7 +4258,7 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
     // disable that first kernel here to avoid accumulating contributions of the first
     // DMRS symbol to the delay mean estimation twice.
 
-    if(fullSlotProcMode == cuphyPuschFullSlotProcMode_t::PUSCH_LEGACY_FULL_SLOT_PROC)
+    if(fullSlotProcMode == PUSCH_LEGACY_FULL_SLOT_PROC)
     {
         // disable channel estimation kernel nodes for instance index 0
         m_chest->chestGraph().disableNodes0Slot(graph_exec[0]);
@@ -3846,14 +4434,16 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
 
     if(m_nSchUes > 0 && !disableAllNodes)
     {
-        // Both reset and main rate match nodes are always enabled/disabled together
+        // reset, clamp and the main rate match nodes are always enabled/disabled together
         CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.resetKernelNodeParamsDriver)));
         CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_rateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.clampKernelNodeParamsDriver)));
         if (m_rateMatchNodeEnabled[fullSlotProcMode] != 1)
         {
             m_rateMatchNodeEnabled[fullSlotProcMode] = 1;
             CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 1));
             CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 1));
         }
 
         {
@@ -3896,6 +4486,7 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
             m_rateMatchNodeEnabled[fullSlotProcMode] = 0;
             CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 0));
             CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
         }
 
         for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
@@ -3933,7 +4524,7 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
                             m_rsrpLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
                             m_rsrpNodesEnabled[fullSlotProcMode],
                             m_rsrpNodes[fullSlotProcMode],
-                            ((fullSlotProcMode == cuphyPuschFullSlotProcMode_t::PUSCH_LEGACY_FULL_SLOT_PROC)&&(m_chEstSettings.enableWeightedAverageCfo==1)) ? graph_exec[0] : graph_exec[1]);
+                            ((fullSlotProcMode == PUSCH_LEGACY_FULL_SLOT_PROC)&&(m_chEstSettings.enableWeightedAverageCfo==1)) ? graph_exec[0] : graph_exec[1]);
     }
 
     if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
@@ -3954,9 +4545,7 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
     }
     else
     {
-#if CUDA_VERSION < 13000 // temp. change
         if (!disableAllNodes)
-#endif
         {
             MemtraceDisableScope md; // Disable dynamic memory allocation check temporarily
             CU_CHECK_EXCEPTION(cuGraphUpload(graphExec, phase1Stream));
@@ -4038,22 +4627,22 @@ cuphyStatus_t PuschRx::setup(cuphyPuschDynPrms_t* pDynPrm)
             if((m_earlyHarqModeEnabled) && (m_subSlotProcessingFrontLoadedDmrsEnabled))
             {
                 updateEarlyHarqGraph();
-                updateFullSlotGraph(false, cuphyPuschFullSlotProcMode_t::PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
+                updateFullSlotGraph(false, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
             }
             else if((m_earlyHarqModeEnabled) && (!m_subSlotProcessingFrontLoadedDmrsEnabled))
             {
                 updateEarlyHarqGraph();
-                updateFullSlotGraph(false, cuphyPuschFullSlotProcMode_t::PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                updateFullSlotGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
             }
             else if((!m_earlyHarqModeEnabled) && (m_subSlotProcessingFrontLoadedDmrsEnabled))
             {
                 updateFrontLoadedDmrsGraph();
-                updateFullSlotGraph(false, cuphyPuschFullSlotProcMode_t::PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
+                updateFullSlotGraph(false, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
             }
         }
         else
         {
-            updateFullSlotGraph(false, cuphyPuschFullSlotProcMode_t::PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+            updateFullSlotGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
         }
     }
 
@@ -4289,7 +4878,7 @@ cuphyStatus_t PuschRx::copyOutputToCPU(cudaStream_t cuStrm)
     {
         const auto& tensor = m_tRefHEstVec[0];  // First UE group only
         const size_t tensorSizeInBytes = tensor.desc().get_size_in_bytes();
-        
+
         // Copy H matrix for first UE group
         m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(
             m_outputPrms.pChannelEstsHost,
@@ -4297,7 +4886,7 @@ cuphyStatus_t PuschRx::copyOutputToCPU(cudaStream_t cuStrm)
             tensorSizeInBytes,
             cudaMemcpyDeviceToHost,
             cuStrm);
-        
+
         // Store the size in elements (float2 complex pairs)
         m_outputPrms.pChannelEstSizesHost[0] = tensorSizeInBytes / sizeof(float2);
     }
@@ -5072,7 +5661,7 @@ void PuschRx::fullSlotKernelLaunch()
             }
         }
     }
-    
+
     if((m_chEstSettings.enableSinrMeasurement) && (m_chEstSettings.enableWeightedAverageCfo))
     {
         for(uint32_t hetCfgIdx = 0; hetCfgIdx < m_rsrpLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs; ++hetCfgIdx)
@@ -5286,15 +5875,14 @@ void PuschRx::fullSlotKernelLaunch()
         // Launch reset buffer kernel first
         const CUDA_KERNEL_NODE_PARAMS& resetKernelNodeParamsDriver = m_rateMatchLaunchCfg.resetKernelNodeParamsDriver;
         CU_CHECK_EXCEPTION(launch_kernel(resetKernelNodeParamsDriver, stream));
-        
+
         // Launch main de_rate_matching_global2 kernel
         const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_rateMatchLaunchCfg.kernelNodeParamsDriver;
         CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver, stream));
-        {
-            MemtraceDisableScope md;
-            m_rateMatchEvent.record(stream);
-            cudaError_t e = cudaStreamWaitEvent(phase1Stream, m_rateMatchEvent.handle(), 0);
-        }
+
+        // Launch clamp buffer kernel after derate matching
+        const CUDA_KERNEL_NODE_PARAMS& clampKernelNodeParamsDriver = m_rateMatchLaunchCfg.clampKernelNodeParamsDriver;
+        CU_CHECK_EXCEPTION(launch_kernel(clampKernelNodeParamsDriver, stream));
 
 #ifdef PUSCH_RX_ENABLE_MULTI_STREAM_LAUNCH
         {
@@ -5419,14 +6007,23 @@ cuphyStatus_t PuschRx::run(cuphyPuschRunPhase_t runPhase)
             {
                 MemtraceDisableScope md; //FixMe do we need to disable here?
 
+                // Move wait kernel and event record outside of the graph in green context mode
+                if(m_useGreenContext)
+                {
+                    CU_CHECK_EXCEPTION(launch_kernel(m_preSubSlotWaitCfgs.kernelNodeParamsDriver, phase1Stream));
+                    // notify cuPHY-CP of the start of sub-slot processing
+                    CUDA_CHECK_EXCEPTION(cudaEventRecord(m_cuphyPuschStatPrms.waitCompletedSubSlotEvent, phase1Stream));
+                }
+
                 if (m_deviceGraphLaunchEnabled)
                 {
-                    // m_preSubSlotGraphExec will launch a kernel that does 2 things: 1) waits until sub-slot symbols are received, 2) then proceed to launch sub-slot device graph
+                    // m_preSubSlotGraphExec does 3 things: 1) waits until sub-slot symbols are received, 2) records waitCompletedSubSlotEvent, 3) proceeds to launch sub-slot device graph
+                    // Only (3) occurs if m_useGreenContext is set.
                     CUDA_CHECK_EXCEPTION(cudaGraphLaunch(m_preSubSlotGraphExec, phase1Stream));
                 }
                 else
                 {
-                    // m_preSubSlotGraphExec will launch the kernel that only waits until sub-slot symbols are received
+                    // m_preSubSlotGraphExec will launch the kernel that only waits until sub-slot symbols are received, if m_useGreenContext is not set
                     CUDA_CHECK_EXCEPTION(cudaGraphLaunch(m_preSubSlotGraphExec, phase1Stream));
                     // launch sub-slot graph from host
                     CUgraphExec& ssgx = m_earlyHarqModeEnabled? m_ehqGraphExec : m_frontLoadedDmrsGraphExec;
@@ -5475,7 +6072,15 @@ cuphyStatus_t PuschRx::run(cuphyPuschRunPhase_t runPhase)
             {
                 if (m_earlyHarqModeEnabled || m_subSlotProcessingFrontLoadedDmrsEnabled)
                 {
+                    if(m_useGreenContext)
+                    {
+                        //launch wait kernel to wait until all OFDM symbols are ready
+                        CU_CHECK_EXCEPTION(launch_kernel(m_postSubSlotWaitCfgs.kernelNodeParamsDriver, phase1Stream));
+                        // notify cuPHY-CP of the start of full-slot processing
+                        CUDA_CHECK_EXCEPTION(cudaEventRecord(m_cuphyPuschStatPrms.waitCompletedFullSlotEvent, phase1Stream));
+                    }
                     // m_preFullSlotGraphExec does 3 things: 1) waits until all symbols for the full-slot are received, 2) records waitCompletedFullSlotEvent, 3) proceed to launch full-slot device graph
+                    // Only (3) occurs if m_useGreenContext is set.
                     CUDA_CHECK_EXCEPTION(cudaGraphLaunch(m_preFullSlotGraphExec, phase1Stream));
                 } else
                 {
@@ -5488,7 +6093,14 @@ cuphyStatus_t PuschRx::run(cuphyPuschRunPhase_t runPhase)
             {
                 if((m_earlyHarqModeEnabled) || (m_subSlotProcessingFrontLoadedDmrsEnabled))
                 {
-                    // run a kernel to wait until all OFDM symbols for the full-slot are ready, and record waitCompletedFullSlotEvent
+                    if(m_useGreenContext)
+                    {
+                        //launch wait kernel to wait until all OFDM symbols are ready
+                        CU_CHECK_EXCEPTION(launch_kernel(m_postSubSlotWaitCfgs.kernelNodeParamsDriver, phase1Stream));
+                        // record event to notify cuPHY-CP of the start of full-slot processing
+                        CUDA_CHECK_EXCEPTION(cudaEventRecord(m_cuphyPuschStatPrms.waitCompletedFullSlotEvent, phase1Stream));
+                    }
+                    // If m_useGreenContext is not set, the following graph will run a kernel to wait until all OFDM symbols for the full-slot are ready, and record waitCompletedFullSlotEvent
                     CUDA_CHECK_EXCEPTION(cudaGraphLaunch(m_preFullSlotGraphExec, phase1Stream));
                     // launch full-slot graph from host
                     CUgraphExec& fsgx =m_subSlotProcessingFrontLoadedDmrsEnabled? m_frontLoadedDmrsFullSlotGraphExec : m_fullSlotGraphExec;
@@ -5549,11 +6161,11 @@ cuphyStatus_t PuschRx::run(cuphyPuschRunPhase_t runPhase)
                 CUDA_CHECK_EXCEPTION(cudaEventRecord(copyStartEvent, phase2Stream));
 
                 cuphyStatus_t copy_output_to_cpu_status = copyOutputToCPU(phase2Stream);
-                
+
                 CUDA_CHECK_EXCEPTION(cudaEventRecord(copyEndEvent, phase2Stream));
                 // Synchronize the stream to ensure all D2H copies are complete before proceeding
                 CUDA_CHECK_EXCEPTION(cudaStreamSynchronize(phase2Stream));
-                
+
                 float copyTimeMs = 0.0f;
                 CUDA_CHECK_EXCEPTION(cudaEventElapsedTime(&copyTimeMs, copyStartEvent, copyEndEvent));
                 NVLOGD_FMT(NVLOG_PUSCH, "D2H Copy (Op #1) execution time: {:.3f} ms", copyTimeMs);
@@ -5681,9 +6293,10 @@ void PuschRx::prepareLDPCStreamsTB()
         const int16_t BG         = m_pTbPrmsCpu[ueIdx].bg;          // base graph
         const int     Z          = m_pTbPrmsCpu[ueIdx].Zc;          // lifting value
         const int     NUM_PARITY = LDPC_params.parityNodesArray[ueIdx]; // num parity nodes
+        const uint8_t ldpcMaxNumItrPerUe = m_pTbPrmsCpu[ueIdx].ldpcMaxNumItrPerUe;
         //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
         // Find/allocate a descriptor with a matching configuration
-        cuphy::LDPC_decode_desc& desc = m_LDPCDecodeDescSet.find(BG, Z, NUM_PARITY);
+        cuphy::LDPC_decode_desc& desc = m_LDPCDecodeDescSet.find(BG, Z, NUM_PARITY, m_cuphyPuschStatPrms.ldpcMaxNumItrAlgo, ldpcMaxNumItrPerUe);
         //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
         // Populate the descriptor configuration fields for the first
         // transport block in the descriptor. (BG, Z, and NUM_PARITY
@@ -5695,28 +6308,37 @@ void PuschRx::prepareLDPCStreamsTB()
 
             switch(m_cuphyPuschStatPrms.ldpcMaxNumItrAlgo)
             {
-                case LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED : {
-                    desc.config.max_iterations = LDPC_params.fixedMaxNumItrs;
-                    break;
+                case LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED :
+                    {
+                        desc.config.max_iterations = LDPC_params.fixedMaxNumItrs;
+                        break;
                     }
-                case LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT : {
-                    cuphyPuschUePrm_t& uePrms = m_cuphyPuschDynPrms.pCellGrpDynPrm->pUePrms[ueIdx];
-                    float spectralEfficency   = static_cast<float>(uePrms.qamModOrder) * static_cast<float>(uePrms.targetCodeRate) / static_cast<float>(10240);
-                    if(spectralEfficency > 7.2)
+                case LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT :
                     {
-                        desc.config.max_iterations = 7;
-                    }else if(spectralEfficency < 0.4)
+                        cuphyPuschUePrm_t& uePrms = m_cuphyPuschDynPrms.pCellGrpDynPrm->pUePrms[ueIdx];
+                        float spectralEfficency   = static_cast<float>(uePrms.qamModOrder) * static_cast<float>(uePrms.targetCodeRate) / static_cast<float>(10240);
+                        if(spectralEfficency > 7.2)
+                        {
+                            desc.config.max_iterations = 7;
+                        }
+                        else if(spectralEfficency < 0.4)
+                        {
+                            desc.config.max_iterations = 20;
+                        }
+                        else
+                        {
+                            desc.config.max_iterations = 10;
+                        }
+                        break;
+                    }
+                case LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE:
                     {
-                        desc.config.max_iterations = 20;
-                    }else
+                        break;
+                    }
+                default :
                     {
                         desc.config.max_iterations = 10;
                     }
-                    break;
-                }
-                default : {
-                    desc.config.max_iterations = 10;
-                }
             }
 
             // TEMPORARY HACK FOR TESTING NUM_ITERATIONS
@@ -6175,7 +6797,7 @@ void PuschRx::allocateDeviceMemory(cuphyPuschDynPrms_t* pDynPrm)
     m_outputPrms.pTbCrcsDevice               = static_cast<uint32_t*>(m_LinearAlloc.alloc(m_outputPrms.totNumTbs * sizeof(uint32_t)));
     finalOffset = m_LinearAlloc.offset();
     CUDA_CHECK(cudaMemsetAsync(initAddr, 0xFF, finalOffset - initOffset, phase1Stream));
-    
+
     m_outputPrms.pCbCrcsDevice               = static_cast<uint32_t*>(m_LinearAlloc.alloc(m_outputPrms.totNumCbs * sizeof(uint32_t)));
     m_outputPrms.pTbPayloadsDevice           = static_cast<uint8_t*>(m_LinearAlloc.alloc(m_outputPrms.totNumPayloadBytes));
 
@@ -7024,14 +7646,21 @@ uint32_t PuschRx::expandFrontEndParameters(cuphyPuschDynPrms_t* pDynPrm,
         pDrvdUeGrpPrms[iterator].dmrsSymLocBmsk = ueGrpPrms->dmrsSymLocBmsk;
 
         pDrvdUeGrpPrms[iterator].prgSize = ueGrpPrms->prgSize;
-        pDrvdUeGrpPrms[iterator].enablePerPrgChEst = pStatPrm->enablePerPrgChEst;
+        if(pStatPrm->enablePerPrgChEst==1)
+        {
+            pDrvdUeGrpPrms[iterator].enablePerPrgChEst = ueGrpPrms->enablePerPrgChEstPerUeg;
+        }
+        else
+        {
+            pDrvdUeGrpPrms[iterator].enablePerPrgChEst = 0;
+        }
 
         // initialization/constants
         pDrvdUeGrpPrms[iterator].nLayers            = 0;
         pDrvdUeGrpPrms[iterator].nUes               = ueGrpPrms->nUes;
         uint16_t                  groupDmrsPortBmsk = 0;
         static constexpr uint16_t GRP_DMRS_PORT_MSK = (1U << 12) - 1; // DMRS port info in bit 0 to bit 11
-        
+
         pDrvdUeGrpPrms[iterator].enableWeightedAverageCfo = pStatPrm->enableCfoCorrection ? pStatPrm->enableWeightedAverageCfo : 0;
 
         uint8_t arrDmrsPorts[MAX_N_LAYERS_PUSCH][2];
@@ -7041,7 +7670,7 @@ uint32_t PuschRx::expandFrontEndParameters(cuphyPuschDynPrms_t* pDynPrm,
         {
             uint16_t ueIdx                     = ueGrpPrms->pUePrmIdxs[i];
             pDrvdUeGrpPrms[iterator].ueIdxs[i] = ueIdx;
-            
+
             if(pDrvdUeGrpPrms[iterator].enableWeightedAverageCfo==1)
             {
                 /// Weighted average CFO estimation
@@ -7535,12 +8164,11 @@ cuphyStatus_t PuschRx::expandBackEndParameters(cuphyPuschDynPrms_t* pDynPrm,
         }
         pPerTbPrms[i].Ncb = Ncb;
 
+        uint32_t k0 = 0;
         if(pPerTbPrms[i].bg == 1)
         {
             uint32_t rv  = pPerTbPrms[i].rv;
             uint32_t Zc  = pPerTbPrms[i].Zc;
-            uint32_t Ncb = pPerTbPrms[i].Ncb;
-            uint32_t k0 = 0;
             if(rv == 0)
             {
                 k0 = 0;
@@ -7571,8 +8199,6 @@ cuphyStatus_t PuschRx::expandBackEndParameters(cuphyPuschDynPrms_t* pDynPrm,
         {
             uint32_t rv  = pPerTbPrms[i].rv;
             uint32_t Zc  = pPerTbPrms[i].Zc;
-            uint32_t Ncb = pPerTbPrms[i].Ncb;
-            uint32_t k0 = 0;
             if(rv == 0)
             {
                 k0 = 0;
@@ -7599,6 +8225,7 @@ cuphyStatus_t PuschRx::expandBackEndParameters(cuphyPuschDynPrms_t* pDynPrm,
             ldpcPrms.parityNodesArray[i] = std::max<uint32_t>(4, std::min<uint32_t>(CUPHY_LDPC_MAX_BG2_PARITY_NODES, nPairtyNodes));
             DEBUG_PRINTF("BG=%u encodedSize=%u Zc=%u Ncb=%u k0=%u num_CBs=%u Kd=%u parityNodes=%u Ncb_forparity=%u\n",pPerTbPrms[i].bg,pPerTbPrms[i].encodedSize,Zc,Ncb,k0,pPerTbPrms[i].num_CBs,Kd,ldpcPrms.parityNodesArray[i],Ncb_forparity);
         }
+        pPerTbPrms[i].k0 = k0;
 
         uint32_t nZpBitsPerCb = (ldpcPrms.parityNodesArray[i] * pPerTbPrms[i].Zc) + pPerTbPrms[i].K;
         pPerTbPrms[i].nZpBitsPerCb = nZpBitsPerCb;
@@ -7620,6 +8247,9 @@ cuphyStatus_t PuschRx::expandBackEndParameters(cuphyPuschDynPrms_t* pDynPrm,
 
         totBitSize += decodedTbSize * 8;
         rate_match_seq_len(pPerTbPrms[i], uePrmsArray[i], *pCellDynPrm, *pUeGrpPrm, codeRateArray[i], drvdUeGrpPrms->dataCnt, drvdUeGrpPrms->dataSymLoc, drvdUeGrpPrms->dmrsCnt, drvdUeGrpPrms->dmrsSymLoc, drvdUeGrpPrms->nDmrsCdmGrpsNoData, enableCsiP2Fapiv3);
+
+        pPerTbPrms[i].ldpcEarlyTerminationPerUe = uePrmsArray[i].ldpcEarlyTerminationPerUe;
+        pPerTbPrms[i].ldpcMaxNumItrPerUe        = uePrmsArray[i].ldpcMaxNumItrPerUe;
 
         // Flag if uci on pusch present
         pPerTbPrms[i].uciOnPuschFlag = static_cast<uint8_t>((uePrmsArray[i].pduBitmap >> 1) & 1);

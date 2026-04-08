@@ -1,5 +1,6 @@
 #!/usr/bin/python3 -u
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -333,8 +334,11 @@ class Thrput:
         # If time stamp not change, it means the log was stopped
         if (self.timestamp == last.timestamp):
             ret |= 1 << MacErr.TimeStamp
-        if (negative_test and (self.error < low_limit.error or self.error > high_limit.error)):
-            ret |= 1 << MacErr.ERR_IND
+        if (negative_test):
+            if (self.error < low_limit.error or self.error > high_limit.error):
+                ret |= 1 << MacErr.ERR_IND
+            if (self.invalid < low_limit.invalid or self.invalid > high_limit.invalid):
+                ret |= 1 << MacErr.Invalid
         else:
             # Check PDSCH, PUSCH slot count in test_mac
             if (self.slots[CHANNEL_ID_PDSCH] < low_limit.slots[CHANNEL_ID_PDSCH] or self.slots[CHANNEL_ID_PDSCH] > high_limit.slots[CHANNEL_ID_PDSCH]):

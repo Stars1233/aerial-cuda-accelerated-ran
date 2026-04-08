@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -147,6 +147,27 @@ int mMimoNetwork::loadConfigYaml(const std::string& configFilePath)
         m_nMaxUegPerCellDl = root["nMaxUegPerCellDl"].as<uint8_t>();
         m_nMaxUegPerCellUl = root["nMaxUegPerCellUl"].as<uint8_t>();
         m_nCell = root["nCell"].as<uint16_t>();
+        m_activeCellIds.clear();
+        if (root["activeCellIds"]) {
+            const YAML::Node activeCellIdsNode = root["activeCellIds"];
+            std::unordered_set<uint16_t> seenCell;
+            if (activeCellIdsNode.IsNull()) {
+                // Treat empty/null as [] -> use all cells [0..nCell-1].
+            } else if (activeCellIdsNode.IsScalar()) {
+                const uint16_t cid = activeCellIdsNode.as<uint16_t>();
+                seenCell.insert(cid);
+                m_activeCellIds.push_back(cid);
+            } else if (activeCellIdsNode.IsSequence()) {
+                for (std::size_t idx = 0; idx < activeCellIdsNode.size(); ++idx) {
+                    const uint16_t cid = activeCellIdsNode[idx].as<uint16_t>();
+                    if (seenCell.insert(cid).second) {
+                        m_activeCellIds.push_back(cid);
+                    }
+                }
+            } else {
+                throw std::runtime_error("activeCellIds must be null, a single number, or a sequence");
+            }
+        }
         m_nActiveUe = m_nActiveUePerCell*m_nCell;
         m_nPrbGrp = root["nPrbGrp"].as<uint16_t>();
         m_nBsAnt = root["nBsAnt"].as<uint8_t>();
@@ -259,6 +280,33 @@ void mMimoNetwork::readChannelConfig(const YAML::Node& channelConfigNode)
 {
     // Read fading type
     m_fadingType = channelConfigNode["fading_type"].as<uint8_t>();
+    m_dumpChanSlots.clear();
+    if (channelConfigNode["dump_chan_slots"]) {
+        const YAML::Node dumpSlotsNode = channelConfigNode["dump_chan_slots"];
+        if (dumpSlotsNode.IsNull()) {
+            // Treat empty/null as [].
+        } else if (dumpSlotsNode.IsScalar()) {
+            const int slotIdx = dumpSlotsNode.as<int>();
+            if (slotIdx < 0) {
+                throw std::runtime_error("channel_config.dump_chan_slots must contain non-negative slot indices");
+            }
+            m_dumpChanSlots.push_back(static_cast<uint32_t>(slotIdx));
+        } else if (dumpSlotsNode.IsSequence()) {
+            for (std::size_t i = 0; i < dumpSlotsNode.size(); ++i) {
+                const int slotIdx = dumpSlotsNode[i].as<int>();
+                if (slotIdx < 0) {
+                    throw std::runtime_error("channel_config.dump_chan_slots must contain non-negative slot indices");
+                }
+                m_dumpChanSlots.push_back(static_cast<uint32_t>(slotIdx));
+            }
+        } else {
+            throw std::runtime_error("channel_config.dump_chan_slots must be null, a single number, or a sequence");
+        }
+    }
+    if (m_fadingType != 1 && !m_dumpChanSlots.empty()) {
+        std::printf("Warning: channel_config.dump_chan_slots is ignored when fading_type != 1\n");
+        m_dumpChanSlots.clear();
+    }
     
     // If using SLS channel model, parse the embedded SLS configuration
     if (m_fadingType == 1) {
@@ -268,10 +316,61 @@ void mMimoNetwork::readChannelConfig(const YAML::Node& channelConfigNode)
     printf("Successfully loaded channel configuration: fading_type = %u\n", m_fadingType);
     
     // System-level parameters derived from cuMAC config
-    int8_t nSectorPerSite = 3;  // assume three sectors per site
-    m_sysConfig.n_site = m_nCell / nSectorPerSite;
+    constexpr uint8_t nSectorPerSite = 3;  // assume three sectors per site
     m_sysConfig.n_sector_per_site = nSectorPerSite;
     m_sysConfig.n_ut = m_nActiveUePerCell * m_nCell;
+    m_sysConfig.n_ut_drop_cells = 0;
+    if (m_nCell > SystemLevelConfig::kMaxUtDropCells) {
+        throw std::runtime_error("nCell exceeds maximum supported ut_drop_cells capacity");
+    }
+
+    const uint32_t maxSupportedCellId = SystemLevelConfig::kMaxUtDropCells;
+    std::vector<uint16_t> activeCellPool;
+    if (m_activeCellIds.empty()) {
+        activeCellPool.reserve(m_nCell);
+        for (uint32_t cid = 0; cid < m_nCell; ++cid) {
+            activeCellPool.push_back(static_cast<uint16_t>(cid));
+        }
+        m_sysConfig.n_site = (m_nCell + nSectorPerSite - 1) / nSectorPerSite;
+    } else {
+        uint16_t maxActiveCellId = 0;
+        if (m_activeCellIds.size() != m_nCell) {
+            throw std::runtime_error("activeCellIds length (" + std::to_string(m_activeCellIds.size()) +
+                                     ") must equal nCell (" + std::to_string(m_nCell) + ")");
+        }
+        activeCellPool.reserve(m_activeCellIds.size());
+        for (const uint16_t cid : m_activeCellIds) {
+            if (cid >= maxSupportedCellId) {
+                throw std::runtime_error("activeCellIds contains cell id " + std::to_string(cid) +
+                                         " which exceeds the maximum supported (" + std::to_string(maxSupportedCellId - 1) + ")");
+            }
+            activeCellPool.push_back(cid);
+            maxActiveCellId = std::max(maxActiveCellId, cid);
+        }
+        m_sysConfig.n_site = (maxActiveCellId + 1 + nSectorPerSite - 1) / nSectorPerSite;  // maxActiveCellId is 0-indexed
+    }
+
+    if (m_utDropCellIds.empty()) {
+        for (const uint16_t cid : activeCellPool) {
+            m_sysConfig.ut_drop_cells[m_sysConfig.n_ut_drop_cells++] = cid;
+        }
+    } else {
+        std::unordered_set<uint16_t> activeCellSet(activeCellPool.begin(), activeCellPool.end());
+        for (const uint16_t cid : m_utDropCellIds) {
+            if (cid >= maxSupportedCellId) {
+                throw std::runtime_error("ut_drop_cells contains cell id " + std::to_string(cid) +
+                                         " which exceeds the maximum supported (" + std::to_string(maxSupportedCellId - 1) + ")");
+            }
+            if (!activeCellSet.count(cid)) {
+                throw std::runtime_error("ut_drop_cells contains cell id " + std::to_string(cid) +
+                                         " that is not in activeCellIds");
+            }
+            if (m_sysConfig.n_ut_drop_cells >= SystemLevelConfig::kMaxUtDropCells) {
+                throw std::runtime_error("ut_drop_cells exceeds max supported entries (" + std::to_string(SystemLevelConfig::kMaxUtDropCells) + ")");
+            }
+            m_sysConfig.ut_drop_cells[m_sysConfig.n_ut_drop_cells++] = cid;
+        }
+    }
     
     // Some simulation parameters derived from cuMAC config  
     m_simConfig.sc_spacing_hz = m_scs;
@@ -313,6 +412,42 @@ void mMimoNetwork::parseEmbeddedSlsConfig(const YAML::Node& config)
             
             // Read only the fields that exist in our simplified config
             if (sl["isd"]) m_sysConfig.isd = sl["isd"].as<float>();
+            if (sl["ut_drop_option"]) {
+                const uint8_t utDropOption = sl["ut_drop_option"].as<std::uint8_t>();
+                if (utDropOption > 2) {
+                    throw std::runtime_error("Invalid ut_drop_option in channel_config.system_level: must be 0, 1, or 2");
+                }
+                m_sysConfig.ut_drop_option = utDropOption;
+            }
+            // m_utDropCellIds is populated here; clear before parsing to avoid stale state.
+            if (sl["ut_drop_cells"]) {
+                m_utDropCellIds.clear();
+                const YAML::Node utDropCellsNode = sl["ut_drop_cells"];
+                std::unordered_set<uint16_t> seenCell;
+                if (utDropCellsNode.IsNull()) {
+                    // Treat empty/null as [] -> use active cells.
+                } else if (utDropCellsNode.IsScalar()) {
+                    const uint16_t cid = utDropCellsNode.as<uint16_t>();
+                    seenCell.insert(cid);
+                    m_utDropCellIds.push_back(cid);
+                } else if (utDropCellsNode.IsSequence()) {
+                    for (std::size_t idx = 0; idx < utDropCellsNode.size(); ++idx) {
+                        const uint16_t cid = utDropCellsNode[idx].as<uint16_t>();
+                        if (seenCell.insert(cid).second) {
+                            m_utDropCellIds.push_back(cid);
+                        }
+                    }
+                } else {
+                    throw std::runtime_error("ut_drop_cells must be null, a single number, or a sequence");
+                }
+            }
+            if (sl["ut_cell_2d_dist"] && sl["ut_cell_2d_dist"].IsSequence()) {
+                if (sl["ut_cell_2d_dist"].size() != 2) {
+                    throw std::runtime_error("ut_cell_2d_dist must contain exactly 2 values: [min, max]");
+                }
+                m_sysConfig.ut_cell_2d_dist[0] = sl["ut_cell_2d_dist"][0].as<float>();
+                m_sysConfig.ut_cell_2d_dist[1] = sl["ut_cell_2d_dist"][1].as<float>();
+            }
             if (sl["optional_pl_ind"]) m_sysConfig.optional_pl_ind = sl["optional_pl_ind"].as<std::uint8_t>();
             if (sl["o2i_building_penetr_loss_ind"]) m_sysConfig.o2i_building_penetr_loss_ind = sl["o2i_building_penetr_loss_ind"].as<std::uint8_t>();
             if (sl["o2i_car_penetr_loss_ind"]) m_sysConfig.o2i_car_penetr_loss_ind = sl["o2i_car_penetr_loss_ind"].as<std::uint8_t>();
@@ -891,7 +1026,7 @@ void mMimoNetwork::genLSFading()
             float PL = 32.4+20.0*log10(netData->carrierFreq)+30.0*log10(distanceBsUe_3D);
             float SF=10.0*log10(ln_distribution(randomEngine));
 
-            netData->chanGainDB[cIdx*m_nActiveUe + uIdx] = antGain - PL - SF;
+            netData->chanGainDB[cIdx*m_nActiveUe + uIdx] = antGain - PL + SF;
 
             if (floor(uIdx/m_nActiveUePerCell) == cIdx) {
                 snrDBAssoc[cIdx][uIdx%m_nActiveUePerCell] = 10.0*log10(netData->bsTxPowerPerPrg/netData->noiseVar) + netData->chanGainDB[cIdx*m_nActiveUe + uIdx];
@@ -988,14 +1123,24 @@ void mMimoNetwork::genSlsChannelData(int slotIdx)
         
         // Run SLS model with external CFR buffers
         // This will populate our mMIMO channel buffers directly
-        // TODO: config activeCells and activeUts to not generate all links
-        std::vector<uint16_t> activeCells;
+        std::vector<uint16_t> activeCells(netData->numCell);
         std::vector<std::vector<uint16_t>> activeUts(netData->numCell);
-        
-        for (uint16_t cellIdx = 0; cellIdx < netData->numCell; cellIdx++) {
-            activeCells.push_back(cellIdx);
-            for (uint16_t ueIdx = 0; ueIdx < m_nActiveUe; ueIdx++) {
-                activeUts[cellIdx].push_back(ueIdx);
+
+        if (m_activeCellIds.empty()) {
+            for (uint16_t cellIdx = 0; cellIdx < netData->numCell; cellIdx++) {
+                activeCells[cellIdx] = cellIdx;
+                activeUts[cellIdx].resize(m_nActiveUe);
+                for (uint16_t ueIdx = 0; ueIdx < m_nActiveUe; ueIdx++) {
+                    activeUts[cellIdx][ueIdx] = ueIdx;
+                }
+            }
+        } else {
+            for (uint16_t cellIdx = 0; cellIdx < netData->numCell; cellIdx++) {
+                activeCells[cellIdx] = m_activeCellIds[cellIdx];
+                activeUts[cellIdx].resize(m_nActiveUe);
+                for (uint16_t ueIdx = 0; ueIdx < m_nActiveUe; ueIdx++) {
+                    activeUts[cellIdx][ueIdx] = ueIdx;
+                }
             }
         }
 
@@ -1014,8 +1159,13 @@ void mMimoNetwork::genSlsChannelData(int slotIdx)
         m_slsChannelModel->run(refTime, continuous_fading, activeCells, activeUts, 
                               {}, {}, {}, {}, {}, {}, m_genChanPtrArr);
         
-        // dump pathloss for adding channel estimation error
-        m_slsChannelModel->dump_pathloss_shadowing_stats(netData->chanGainDB.data(), activeCells, fullActiveUts);
+        // dump SLS channel data to H5 file
+        if (std::find(m_dumpChanSlots.begin(), m_dumpChanSlots.end(), static_cast<uint32_t>(slotIdx)) != m_dumpChanSlots.end()) {
+            m_slsChannelModel->saveSlsChanToH5File("_cuMAC_slot" + std::to_string(slotIdx));
+        }
+        
+        // dump pathloss, shadowing and antenna gain for channel estimation error (aligned with chanGainDB = antGain - PL + SF)
+        m_slsChannelModel->dump_pl_sf_ant_gain_stats(netData->chanGainDB.data(), activeCells, fullActiveUts);
         CUDA_CHECK_ERR(cudaMemcpyAsync(netData->chanGainDBGpu, netData->chanGainDB.data(), netData->numCell*m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
 
         // Apply channel estimation error to the generated channel data

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -106,14 +106,14 @@ void ru_emulator_oam_init(void* ru_emulator)
     get_ru_emulator(ru_emulator)->oam_init();
 }
 
-void ru_emulator_verify_dl_cplane_content(void* ru_emulator, uint8_t *mbuf_payload, int cell_index) 
+void ru_emulator_verify_dl_cplane_content(void* ru_emulator, uint8_t *mbuf_payload, size_t buffer_length, int cell_index)
 {
-
     oran_c_plane_info_t c_plane_info{};
     aerial_fh::MsgReceiveInfo msg_info{};
+    msg_info.buffer_length = buffer_length;
 
     // First parse the C-Plane message to construct the c_plane_info
-    get_ru_emulator(ru_emulator)->parse_c_plane(c_plane_info, 0 /* nb_rx */, 0 /* index_rx */, 0 /* rte_rx_time */, mbuf_payload, cell_index);
+    get_ru_emulator(ru_emulator)->parse_c_plane(c_plane_info, 0 /* nb_rx */, 0 /* index_rx */, 0 /* rte_rx_time */, mbuf_payload, buffer_length, cell_index);
     get_ru_emulator(ru_emulator)->verify_dl_cplane_content(c_plane_info, cell_index, mbuf_payload, msg_info, fss_pdsch_prb_seen);
 
 }
@@ -124,9 +124,20 @@ void ru_emulator_construct_bfw(void* ru_emulator, int sfn, int slot, int cell_id
     int lp_slot = sfn * 20 + slot; 
 
     auto &tv_object = get_ru_emulator(ru_emulator)->get_bfw_dl_obj(); 
+
+    if (lp_slot >= static_cast<int>(tv_object.launch_pattern.size()))
+        return;
+
     auto &map = tv_object.launch_pattern[lp_slot];
 
+    if (map.find(cell_idx) == map.end())
+        return;
+
     auto tv_idx = map.at(cell_idx); 
+
+    if (tv_idx >= tv_object.tv_info.size())
+        return;
+
     auto &tv_info = tv_object.tv_info[tv_idx];
 
     for (int i = 0; i < tv_info.bfw_infos.size() /* # BFW PDUs */; ++i) {

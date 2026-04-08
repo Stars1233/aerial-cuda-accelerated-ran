@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,7 +30,7 @@ namespace scf_5g_fapi {
     static void prepare_ra_type0_info(pdsch_params* info, cuphyPdschUeGrpPrm_t& grp, uint32_t ue_grp_index);
     inline void update_pm_weights_cuphy(cuphyPdschUePrm_t& ue, cuphyPdschCellGrpDynPrm_t& cell_grp,
         prc_weights_list_t& list, const pm_weight_map_t & pm_weight_map,
-        prc_weights_idx_list_t& cache, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu,
+        prc_weights_idx_list_t& cache, const scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu,
         int32_t cell_index);
     inline void update_fh_params_csirs(const cuphyCsirsRrcDynPrm_t& csirs_inst, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, bool bf_enabled = false, enum ru_type ru = OTHER_MODE, nv::slot_detail_t* slot_detail = nullptr, int32_t cell_index = 0);
     inline void update_pm_weights_prbs(cuphyPdschUePrm_t& ue, cuphyPdschCellGrpDynPrm_t& cell_grp,
@@ -38,7 +38,7 @@ namespace scf_5g_fapi {
         prc_weights_idx_list_t& cache, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu,
         prb_info_common_t& prbs, int32_t cell_index);
 
-    inline void csirs_all_sym_ru_handler(cell_sub_command* cell_cmd, nv::slot_detail_t* slot_detail, uint16_t num_dl_prb);
+    inline void csirs_all_sym_ru_handler(slot_info_t* sym_prbs, nv::slot_detail_t* slot_detail, uint16_t num_dl_prb);
     inline void add_beam_id_csirs(beamid_array_t& array, size_t& array_size, tx_precoding_beamforming_t& pmi_bf_pdu, prb_info_t& prb_info, uint16_t beam_id, int32_t cell_idx);
 #ifdef ENABLE_L2_SLT_RSP
     void reset_pdsch_cw_offset()
@@ -48,14 +48,20 @@ namespace scf_5g_fapi {
 #endif
 
    template <bool modcomp_enabled = false>
-   void update_non_overlapping_csirs(cell_sub_command& cell_cmd)
+   void update_non_overlapping_csirs(slot_info_t* slot_info)
     {
-        auto slot_info{cell_cmd.sym_prb_info()};
         auto& alt_csirs_prb_info_list{slot_info->alt_csirs_prb_info_list};
         auto& alt_csirs_prb_info_idx_list{slot_info->alt_csirs_prb_info_idx_list};
         auto& prbs{slot_info->prbs};
         for(int symbol_id = 0 ; symbol_id < OFDM_SYMBOLS_PER_SLOT; symbol_id++)
         {
+    
+            prb_info_idx_list_t &csirs_prb_index_info = slot_info->symbols[symbol_id][slot_command_api::channel_type::CSI_RS];
+            auto csirs_size = csirs_prb_index_info.size();
+            if (csirs_size == 0) {
+                continue; 
+            }
+
             uint8_t rb_map[MAX_N_PRBS_SUPPORTED] = {0};
             prb_info_idx_list_t &prb_index_info = slot_info->symbols[symbol_id][slot_command_api::channel_type::PDSCH_CSIRS];
             auto size = prb_index_info.size();
@@ -74,9 +80,8 @@ namespace scf_5g_fapi {
                     }
                 }
             }
-            prb_info_idx_list_t &csirs_prb_index_info = slot_info->symbols[symbol_id][slot_command_api::channel_type::CSI_RS];
-            size = csirs_prb_index_info.size();
-            for(int index = 0; index < size; ++index)
+            
+            for(int index = 0; index < csirs_size; ++index)
             {
                 int prb_index = csirs_prb_index_info[index];
                 auto& csirs_prb_info{prbs[prb_index]};
@@ -122,16 +127,14 @@ namespace scf_5g_fapi {
                             if (modcomp_enabled) 
                             {
                                 prb_info.comp_info.bwScaler = csirs_prb_info.comp_info.bwScaler;
-                                prb_info.comp_info.common.extType = csirs_prb_info.comp_info.common.extType.get();
-                                prb_info.comp_info.common.nSections = csirs_prb_info.comp_info.common.nSections.get();
-                                prb_info.comp_info.common.udIqWidth = csirs_prb_info.comp_info.common.udIqWidth.get();
+                                prb_info.comp_info.common.extType = csirs_prb_info.comp_info.common.extType;
+                                prb_info.comp_info.common.nSections = csirs_prb_info.comp_info.common.nSections;
+                                prb_info.comp_info.common.udIqWidth = csirs_prb_info.comp_info.common.udIqWidth;
                                 for (int i = 0; i < prb_info.comp_info.common.nSections; i++)
                                 {
                                     auto& csirssection = csirs_prb_info.comp_info.sections[i];
                                     auto& prbsection = prb_info.comp_info.sections[i];
-                                    prb_info.comp_info.sections[i].csf = csirs_prb_info.comp_info.sections[i].csf.get();
-                                    prb_info.comp_info.sections[i].mcScaleOffset = csirs_prb_info.comp_info.sections[i].mcScaleOffset.get();
-                                    prb_info.comp_info.sections[i].mcScaleReMask = csirs_prb_info.comp_info.sections[i].mcScaleReMask.get();
+                                    prbsection = csirssection; 
                                     prb_info.comp_info.modCompScalingValue[i] = csirs_prb_info.comp_info.modCompScalingValue[i];
                                 }
                             }
@@ -179,17 +182,16 @@ namespace scf_5g_fapi {
                             }
                            if (modcomp_enabled) 
                             {
+                                // Copy mod-comp common (value types) and sections; prbsection = csirssection copies all section fields.
                                 prb_info.comp_info.bwScaler = csirs_prb_info.comp_info.bwScaler;
-                                prb_info.comp_info.common.extType = csirs_prb_info.comp_info.common.extType.get();
-                                prb_info.comp_info.common.nSections = csirs_prb_info.comp_info.common.nSections.get();
-                                prb_info.comp_info.common.udIqWidth = csirs_prb_info.comp_info.common.udIqWidth.get();
+                                prb_info.comp_info.common.extType = csirs_prb_info.comp_info.common.extType;
+                                prb_info.comp_info.common.nSections = csirs_prb_info.comp_info.common.nSections;
+                                prb_info.comp_info.common.udIqWidth = csirs_prb_info.comp_info.common.udIqWidth;
                                 for (int i = 0; i < prb_info.comp_info.common.nSections; i++)
                                 {
                                     auto& csirssection = csirs_prb_info.comp_info.sections[i];
                                     auto& prbsection = prb_info.comp_info.sections[i];
-                                    prb_info.comp_info.sections[i].csf = csirs_prb_info.comp_info.sections[i].csf.get();
-                                    prb_info.comp_info.sections[i].mcScaleOffset = csirs_prb_info.comp_info.sections[i].mcScaleOffset.get();
-                                    prb_info.comp_info.sections[i].mcScaleReMask = csirs_prb_info.comp_info.sections[i].mcScaleReMask.get();
+                                    prbsection = csirssection;
                                     prb_info.comp_info.modCompScalingValue[i] = csirs_prb_info.comp_info.modCompScalingValue[i];
                                 }
                             }
@@ -202,7 +204,7 @@ namespace scf_5g_fapi {
             }
         }
     }
-    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, scf_fapi_pdsch_pdu_t& msg, uint8_t testMode, slot_indication& slotinfo,
+    bool update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_pdsch_pdu_t& msg, uint8_t testMode, slot_indication& slotinfo,
                                         int32_t cell_index, pm_weight_map_t& pm_map, bool pm_enabled, bool bf_enabled, uint16_t num_dl_prb, bfw_coeff_mem_info_t *bfwCoeff_mem_info,
                                         bool mmimo_enabled, nv::slot_detail_t*  slot_detail)
     {
@@ -213,7 +215,7 @@ namespace scf_5g_fapi {
         if (info == nullptr)
         {
             NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "no pdsch command");
-            return;
+            return false;
         }
 
         auto pdsch_ue_idx = info->cell_grp_info.nUes;
@@ -223,9 +225,9 @@ namespace scf_5g_fapi {
         // SCF FAPI sticks a variable-length structure in the middle of the struct. Capture the data we need
         // from this struct and move the pointer past it.
         ue.nCw = msg.num_codewords;
-        uint8_t *ptr = reinterpret_cast<uint8_t*>(&msg.codewords[0]);
+        const uint8_t *ptr = reinterpret_cast<const uint8_t*>(&msg.codewords[0]);
         for (uint8_t cw = 0; cw < msg.num_codewords; cw++) {
-            scf_fapi_pdsch_codeword_t *p_cw = reinterpret_cast<scf_fapi_pdsch_codeword_t*>(ptr);
+            const scf_fapi_pdsch_codeword_t *p_cw = reinterpret_cast<const scf_fapi_pdsch_codeword_t*>(ptr);
             auto& ue_cw = info->ue_cw_info[pdsch_cw_idx];
             ue_cw.pUePrm = &ue;
             ue_cw.mcsIndex       = p_cw->mcs_index; // value only used for optional TB size check in cuPHY
@@ -253,19 +255,15 @@ namespace scf_5g_fapi {
         }
 
         // We're past the variable-length part
-        scf_fapi_pdsch_pdu_end_t *end = reinterpret_cast<scf_fapi_pdsch_pdu_end_t*>(ptr);
+        const scf_fapi_pdsch_pdu_end_t *end = reinterpret_cast<const scf_fapi_pdsch_pdu_end_t*>(ptr);
 
         ue.BWPStart = msg.bwp.bwp_start;
         ue.scid = end->sc_id;
         ue.dmrsScrmId = end->dl_dmrs_scrambling_id;
         ue.rnti = msg.rnti;
         ue.nUeLayers = end->num_of_layers;
-#ifdef ENABLE_32DL
         ue.dmrsPortBmsk = static_cast<uint16_t>(end->dmrs_ports & 0xFFF);
         ue.nlAbove16 = static_cast<uint8_t>((end->dmrs_ports >> PDSCH_ABOVE_16_LAYERS_DMRSPORTS_BIT_LOC) & 0x1);
-#else
-        ue.dmrsPortBmsk = end->dmrs_ports;
-#endif
 #if 0
         if (ue.rnti == UINT16_MAX) {
             ue.nUeLayers = 2;
@@ -387,24 +385,50 @@ namespace scf_5g_fapi {
             #endif
         }
 
-        auto& cell_grp_info = info->cell_grp_info;
-        cell_grp_info.nUes++;
-        info->tb_data.pBufferType = cuphyPdschDataIn_t::CPU_BUFFER;
-
         /// Skip Ptrs
-        scf_fapi_tx_precoding_beamforming_t* pm_bf = nullptr;
+        const scf_fapi_tx_precoding_beamforming_t* pm_bf = nullptr;
         if (msg.pdu_bitmap & 0x1)
         {
-            scf_fapi_pdsch_ptrs_t& ptrs = *reinterpret_cast<scf_fapi_pdsch_ptrs_t*>(end->next);
-            pm_bf = reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(ptrs.next);
+            const scf_fapi_pdsch_ptrs_t& ptrs = *reinterpret_cast<const scf_fapi_pdsch_ptrs_t*>(end->next);
+            pm_bf = reinterpret_cast<const scf_fapi_tx_precoding_beamforming_t*>(ptrs.next);
         } else {
-            pm_bf = reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(end->next);
+            pm_bf = reinterpret_cast<const scf_fapi_tx_precoding_beamforming_t*>(end->next);
         }
 
         uint16_t numPRGs = pm_bf->num_prgs;
         uint16_t prgSize = pm_bf->prg_size;
         uint8_t digBFInterfaces = pm_bf->dig_bf_interfaces;
-        uint8_t *next = reinterpret_cast<uint8_t*>(pm_bf);
+
+        if(!check_bf_pc_params(numPRGs, digBFInterfaces, mmimo_enabled))
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: check_bf_pc_params failed: numPRGs={} digBFInterfaces={} mmimo_enabled={}",
+                __FUNCTION__, __LINE__, static_cast<uint16_t>(numPRGs), static_cast<uint16_t>(digBFInterfaces), mmimo_enabled);
+            /* Rollback state to keep pdsch_params and pdsch_fh_params consistent */
+            ue_grp.nUes--;
+            for (uint8_t cw = 0; cw < msg.num_codewords; cw++) {
+                next_pdsch_cw_offset -= info->ue_cw_info[pdsch_cw_idx - 1 - cw].tbSize;
+                info->cell_grp_info.nCws--;
+            }
+            if (newUeGrp) {
+                --info->cell_grp_info.nUeGrps;
+                --info->nue_grps_per_cell[cell_index];
+                /* Rollback cell addition (done in on_dl_tti_request) when rolling back the only UE group */
+                if (info->cell_grp_info.nUeGrps == 0 && info->cell_grp_info.nCells > 0) {
+                    --info->cell_grp_info.nCells;
+                    if (!info->cell_index_list.empty())
+                        info->cell_index_list.pop_back();
+                    if (!info->phy_cell_index_list.empty())
+                        info->phy_cell_index_list.pop_back();
+                }
+            }
+            return false;
+        }
+
+        auto& cell_grp_info = info->cell_grp_info;
+        cell_grp_info.nUes++;
+        info->tb_data.pBufferType = cuphyPdschDataIn_t::CPU_BUFFER;
+
+        const uint8_t *next = reinterpret_cast<const uint8_t*>(pm_bf);
         uint16_t bf_size = 0;
         if (mmimo_enabled == 0 || digBFInterfaces != 0)
         {
@@ -426,7 +450,7 @@ namespace scf_5g_fapi {
         }
         next = next + bf_size;
 
-        scf_fapi_tx_power_info_t* tx_power_info = reinterpret_cast<scf_fapi_tx_power_info_t*>(next);
+        const scf_fapi_tx_power_info_t* tx_power_info = reinterpret_cast<const scf_fapi_tx_power_info_t*>(next);
         ue.beta_qam = std::pow(10.0, ((tx_power_info->power_control_offset - 8) + (tx_power_info->power_control_offset_ss - 1)*3.0)/20.0);
         ue.beta_dmrs = std::pow(10.0, ((tx_power_info->power_control_offset - 8) + (tx_power_info->power_control_offset_ss - 1)*3.0)/20.0);
 
@@ -440,11 +464,11 @@ namespace scf_5g_fapi {
             cell_grp_cmd->fh_params.start_index_pdsch_fh_params.at(cell_index) = cell_grp_cmd->fh_params.total_num_pdsch_pdus;
         }
         auto& pdsch_fh_param = cell_grp_cmd->fh_params.pdsch_fh_params.at(cell_grp_cmd->fh_params.total_num_pdsch_pdus);
+        auto& pc_bf = cell_grp_cmd->fh_params.pc_bf_arr.at(cell_grp_cmd->fh_params.total_num_pdsch_pdus);
+
         ++cell_grp_cmd->fh_params.num_pdsch_fh_params.at(cell_index); 
         ++cell_grp_cmd->fh_params.total_num_pdsch_pdus;
 
-        pdsch_fh_param.info = cell_grp_cmd->get_pdsch_params();
-        pdsch_fh_param.cell_grp_info = &pdsch_fh_param.info->cell_grp_info;
         pdsch_fh_param.grp = &ue_grp;
         pdsch_fh_param.is_new_grp = newUeGrp;
         pdsch_fh_param.ue = &ue;
@@ -452,7 +476,6 @@ namespace scf_5g_fapi {
         pdsch_fh_param.bf_enabled = bf_enabled;
         pdsch_fh_param.pm_enabled = pm_enabled;
         pdsch_fh_param.mmimo_enabled = mmimo_enabled;
-        pdsch_fh_param.csirs_info = cell_grp_cmd->csirs.get();
         pdsch_fh_param.cell_index = cell_index;
         pdsch_fh_param.num_dl_prb = num_dl_prb;
         pdsch_fh_param.ue_grp_index = ueGrpIndex;
@@ -460,20 +483,22 @@ namespace scf_5g_fapi {
         pdsch_fh_param.bfwCoeff_mem_info = bfwCoeff_mem_info;
 
         ue.enablePrcdBf = pm_enabled;
-        pdsch_fh_param.pc_bf.num_prgs = numPRGs;
-        pdsch_fh_param.pc_bf.prg_size = prgSize;
-        pdsch_fh_param.pc_bf.dig_bf_interfaces = digBFInterfaces;
-        check_bf_pc_params(numPRGs, digBFInterfaces,mmimo_enabled);
+
+        pdsch_fh_param.pc_bf = &pc_bf;
+        pdsch_fh_param.pc_bf->num_prgs = numPRGs;
+        pdsch_fh_param.pc_bf->prg_size = prgSize;
+        pdsch_fh_param.pc_bf->dig_bf_interfaces = digBFInterfaces;
+
         if (mmimo_enabled == 0 || digBFInterfaces != 0)
         {
-            memcpy(pdsch_fh_param.pc_bf.pm_idx_and_beam_idx, pm_bf->pm_idx_and_beam_idx, sizeof(uint16_t) * (numPRGs + numPRGs * digBFInterfaces));
+            memcpy(pdsch_fh_param.pc_bf->pm_idx_and_beam_idx, pm_bf->pm_idx_and_beam_idx, sizeof(uint16_t) * (numPRGs + numPRGs * digBFInterfaces));
         }
         if (likely(!pm_enabled)) {}
         else
         {
             update_pm_weights_cuphy(ue, info->cell_grp_info, info->pm_info, pm_map, info->pmw_idx_cache, *pm_bf, cell_index);
         }
-        return;
+        return true;
     }
 
    static void prepare_ra_type0_info(pdsch_params* info, cuphyPdschUeGrpPrm_t& grp, uint32_t ue_grp_index)
@@ -556,7 +581,7 @@ namespace scf_5g_fapi {
 
     inline void update_pm_weights_cuphy(cuphyPdschUePrm_t& ue, cuphyPdschCellGrpDynPrm_t& cell_grp,
         prc_weights_list_t& list, const pm_weight_map_t & pm_weight_map,
-        prc_weights_idx_list_t& cache, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu,
+        prc_weights_idx_list_t& cache, const scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu,
         int32_t cell_index
         )
     {
@@ -644,11 +669,7 @@ namespace scf_5g_fapi {
             }
             else
             {
-#ifdef ENABLE_32DL
-                prb_info.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                 if(mmimo_enabled)
                 {
                     //NVLOGD_FMT(TAG, "{}:{} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
@@ -661,22 +682,16 @@ namespace scf_5g_fapi {
         }
     }
 
-    void update_prc_fh_params_pdsch_with_csirs_mod_comp(const pm_weight_map_t & pm_map, pdsch_fh_prepare_params& pdsch_fh_param, nv::slot_detail_t* slot_detail, ru_type ru, comp_method dl_comp_method, uint8_t num_csirs_eaxcids) {
-        auto& grp = *pdsch_fh_param.grp;
-        bool is_new_grp = pdsch_fh_param.is_new_grp;
-        auto & ue = *pdsch_fh_param.ue;
-        auto& cell_cmd =  *pdsch_fh_param.cell_cmd;
-        uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb;
-        auto cell_index = pdsch_fh_param.cell_index;
+    void update_prc_fh_params_pdsch_with_csirs_mod_comp(const pm_weight_map_t & pm_map, const IFhCallbackContext& fh_context, const PdschFhParamsView& pdsch_fh_param, nv::slot_detail_t* slot_detail, ru_type ru, comp_method dl_comp_method, uint8_t num_csirs_eaxcids, bool csirs_compact_mode) {
+        auto& grp = pdsch_fh_param.grp();
+        bool is_new_grp = pdsch_fh_param.is_new_grp();
+        auto & ue = pdsch_fh_param.ue();
+        uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb();
+        auto cell_index = pdsch_fh_param.cell_index();
 
-        auto csirs_info =  pdsch_fh_param.csirs_info;
         auto numSym = grp.nPdschSym;
         auto pdschSym = grp.pdschStartSym;
-        auto sym_prbs{cell_cmd.sym_prb_info()};
-        auto tempPdschSym = pdschSym;
-        auto tempPdschNum = 0;
-        auto prevChanType = channel_type::NONE;
-        auto currentChanType = channel_type::NONE;
+        auto sym_prbs{pdsch_fh_param.sym_prb_info()};
 
         if (!is_new_grp) {
             return ;
@@ -684,23 +699,23 @@ namespace scf_5g_fapi {
 
         switch(ru) {
             case ru_type::SINGLE_SECT_MODE:
-                pdsch_csirs_all_sym_handler(sym_prbs, slot_detail, is_new_grp, grp, ue, num_dl_prb, pdsch_fh_param.mmimo_enabled);
+                pdsch_csirs_all_sym_handler(sym_prbs, slot_detail, is_new_grp, grp, ue, num_dl_prb, pdsch_fh_param.mmimo_enabled());
                 break;
             case ru_type::MULTI_SECT_MODE:
             case ru_type::OTHER_MODE: {
  
                 uint16_t pdschSymMask = ((1 << numSym) - 1) << pdschSym;
                 uint16_t pdschOnlySymMask = pdschSymMask & ~grp.dmrsSymLocBmsk;
-                uint16_t csirsOnlySymMask = csirs_info->symbolMapArray[cell_index];
+                uint16_t csirsOnlySymMask = fh_context.csirs_symbol_map(cell_index);
                 pdschOnlySymMask &= ~csirsOnlySymMask;
 
                 ru_type ru = ru_type::OTHER_MODE;
                 auto channel = channel_type::NONE;
                 NVLOGD_FMT(TAG, "{} pdschSymMask {} pdschOnlySymMask {} csirsOnlySymMask {} dmrsSymLocBmsk {} \n", __FUNCTION__, pdschSymMask, pdschOnlySymMask, csirsOnlySymMask, grp.dmrsSymLocBmsk);
-                auto func = [&pm_map, sym_prbs, &pdsch_fh_param, &slot_detail, &ru, &channel](uint16_t start, uint16_t length ) {
+                auto func = [&pm_map, sym_prbs, &fh_context, &pdsch_fh_param, &slot_detail, &ru, &channel](uint16_t start, uint16_t length ) {
                     auto startPrbIndex = get_current_prb_index(sym_prbs);
                     auto endPrbIndex = startPrbIndex;
-                    handleNewPdschSegment(start, length, pm_map, pdsch_fh_param, slot_detail, ru, channel);
+                    handleNewPdschSegment(start, length, pm_map, fh_context, pdsch_fh_param, slot_detail, ru, channel);
                     endPrbIndex = get_current_prb_index(sym_prbs);
                     if (endPrbIndex != startPrbIndex && startPrbIndex == MAX_PRB_INFO) { 
                         startPrbIndex = 0;
@@ -713,8 +728,8 @@ namespace scf_5g_fapi {
                     }
                 };
 
-                auto func_pdsch_csirs = [&pm_map, sym_prbs, &pdsch_fh_param, &slot_detail, &ru, &channel, num_csirs_eaxcids](uint16_t start, uint16_t length ) {
-                    handleNewPdschCsirsSegment(start, length, pm_map, pdsch_fh_param, slot_detail, ru, channel, num_csirs_eaxcids);
+                auto func_pdsch_csirs = [&pm_map, sym_prbs, &fh_context, &pdsch_fh_param, &slot_detail, &ru, &channel, num_csirs_eaxcids, csirs_compact_mode](uint16_t start, uint16_t length ) {
+                    handleNewPdschCsirsSegment(start, length, pm_map, fh_context, pdsch_fh_param, slot_detail, ru, channel, num_csirs_eaxcids, csirs_compact_mode);
                 };
 
                 switch (dl_comp_method)
@@ -745,27 +760,26 @@ namespace scf_5g_fapi {
         }
     }
 
-    inline void update_prc_fh_params_pdsch_mod_comp(const pm_weight_map_t & pm_map, pdsch_fh_prepare_params& pdsch_fh_param, nv::slot_detail_t* slot_detail, ru_type ru, comp_method dl_comp_method) {
+    inline void update_prc_fh_params_pdsch_mod_comp(const pm_weight_map_t & pm_map, const IFhCallbackContext& fh_context, const PdschFhParamsView& pdsch_fh_param, nv::slot_detail_t* slot_detail, ru_type ru, comp_method dl_comp_method) {
 
-        cuphyPdschUeGrpPrm_t& grp = *pdsch_fh_param.grp;
-        bool is_new_grp = pdsch_fh_param.is_new_grp;
-        cuphyPdschUePrm_t& ue = *pdsch_fh_param.ue;
-        cell_sub_command& cell_cmd =  *pdsch_fh_param.cell_cmd;
-        uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb;
+        cuphyPdschUeGrpPrm_t& grp = pdsch_fh_param.grp();
+        bool is_new_grp = pdsch_fh_param.is_new_grp();
+        cuphyPdschUePrm_t& ue = pdsch_fh_param.ue();
+        uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb();
 
         if (!is_new_grp) {
             return ;
         }
         auto numSym = grp.nPdschSym;
         auto pdschSym = grp.pdschStartSym;
-        auto sym_prbs{cell_cmd.sym_prb_info()};
+        auto sym_prbs{pdsch_fh_param.sym_prb_info()};
         auto tempPdschSym = pdschSym;
         auto tempPdschNum = 0;
         auto prevChanType = channel_type::NONE;
         auto currentChanType = channel_type::NONE;
         switch(ru) {
             case ru_type::SINGLE_SECT_MODE:
-                pdsch_csirs_all_sym_handler(sym_prbs, slot_detail, is_new_grp, grp, ue, num_dl_prb, pdsch_fh_param.mmimo_enabled);
+                pdsch_csirs_all_sym_handler(sym_prbs, slot_detail, is_new_grp, grp, ue, num_dl_prb, pdsch_fh_param.mmimo_enabled());
                 break;
             case ru_type::MULTI_SECT_MODE:
             case ru_type::OTHER_MODE: {
@@ -775,10 +789,10 @@ namespace scf_5g_fapi {
                 
                 auto channel = channel_type::PDSCH_DMRS;
                 NVLOGD_FMT(TAG, " {} pdschSymMask {} pdschOnlySymMask {} csirsOnlySymMask {}\n", __FUNCTION__, pdschSymMask, pdschOnlySymMask, csirsOnlySymMask);
-                auto func = [&pm_map, sym_prbs, &pdsch_fh_param, &slot_detail, &ru, &channel](uint16_t start, uint16_t length ) {
+                auto func = [&pm_map, sym_prbs, &fh_context, &pdsch_fh_param, &slot_detail, &ru, &channel](uint16_t start, uint16_t length ) {
                     auto startPrbIndex = get_current_prb_index(sym_prbs);
                     auto endPrbIndex = startPrbIndex;
-                    handleNewPdschSegment(start, length, pm_map, pdsch_fh_param, slot_detail, ru, channel);
+                    handleNewPdschSegment(start, length, pm_map, fh_context, pdsch_fh_param, slot_detail, ru, channel);
                     endPrbIndex = get_current_prb_index(sym_prbs);
                     if (endPrbIndex != startPrbIndex && startPrbIndex == MAX_PRB_INFO) { 
                         startPrbIndex = 0;
@@ -814,14 +828,14 @@ namespace scf_5g_fapi {
     }
 
     template <bool mplane_configured_ru_type>
-    void update_prc_fh_params_pdsch(const pm_weight_map_t & pm_map, pdsch_fh_prepare_params& pdsch_fh_param, nv::slot_detail_t* slot_detail)
+    void update_prc_fh_params_pdsch(const pm_weight_map_t & pm_map, const IFhCallbackContext& fh_context, const PdschFhParamsView& pdsch_fh_param, nv::slot_detail_t* slot_detail)
     {
         ru_type ru;
         aerial_fh::UserDataCompressionMethod dl_comp_method = aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT;
         if (mplane_configured_ru_type)
         {
             nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-            const auto & mplane_info = phyDriver.getMPlaneConfig(pdsch_fh_param.cell_index);
+            const auto & mplane_info = phyDriver.getMPlaneConfig(pdsch_fh_param.cell_index());
             dl_comp_method = mplane_info.dl_comp_meth;
             ru = mplane_info.ru;
         }
@@ -832,26 +846,24 @@ namespace scf_5g_fapi {
 
         switch (dl_comp_method) {
             case comp_method::MODULATION_COMPRESSION:
-                update_prc_fh_params_pdsch_mod_comp(pm_map, pdsch_fh_param, slot_detail, ru, comp_method::MODULATION_COMPRESSION);
+                update_prc_fh_params_pdsch_mod_comp(pm_map, fh_context, pdsch_fh_param, slot_detail, ru, comp_method::MODULATION_COMPRESSION);
                 break;
             case comp_method::NO_COMPRESSION:
             case comp_method::BLOCK_FLOATING_POINT: {
-            pdsch_params* info = pdsch_fh_param.info;
-            cuphyPdschCellGrpDynPrm_t& cell_grp_info = *pdsch_fh_param.cell_grp_info;
-            cuphyPdschUeGrpPrm_t& grp = *pdsch_fh_param.grp;
-            bool is_new_grp = pdsch_fh_param.is_new_grp;
-            cuphyPdschUePrm_t& ue = *pdsch_fh_param.ue;
-            scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu =  *(reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(&pdsch_fh_param.pc_bf));
+            cuphyPdschUeGrpPrm_t& grp = pdsch_fh_param.grp();
+            bool is_new_grp = pdsch_fh_param.is_new_grp();
+            cuphyPdschUePrm_t& ue = pdsch_fh_param.ue();
+            auto& pmi_bf_pdu = pdsch_fh_param.pc_bf();
             // pm_weight_map_t & pm_map = pm_map
-            cell_sub_command& cell_cmd =  *pdsch_fh_param.cell_cmd;
-            bool bf_enabled = pdsch_fh_param.bf_enabled;
-            bool pm_enabled = pdsch_fh_param.pm_enabled;
-            bool mmimo_enabled = pdsch_fh_param.mmimo_enabled;
-            int32_t cell_index = pdsch_fh_param.cell_index;
-            uint32_t ue_grp_index = pdsch_fh_param.ue_grp_index;
-            uint32_t ue_grp_bfw_index_per_cell = pdsch_fh_param.ue_grp_bfw_index_per_cell;
-            bfw_coeff_mem_info_t* bfwCoeff_mem_info = pdsch_fh_param.bfwCoeff_mem_info;
-            uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb;
+            auto& slot_3gpp = pdsch_fh_param.slot_3gpp();
+            bool bf_enabled = pdsch_fh_param.bf_enabled();
+            bool pm_enabled = pdsch_fh_param.pm_enabled();
+            bool mmimo_enabled = pdsch_fh_param.mmimo_enabled();
+            int32_t cell_index = pdsch_fh_param.cell_index();
+            uint32_t ue_grp_index = pdsch_fh_param.ue_grp_index();
+            uint32_t ue_grp_bfw_index_per_cell = pdsch_fh_param.ue_grp_bfw_index_per_cell();
+            bfw_coeff_mem_info_t* bfwCoeff_mem_info = pdsch_fh_param.bfw_coeff_mem_info();
+            uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb();
 
             // NVLOGC_FMT(TAG, "pdsch_params* info {}, cuphyPdschCellGrpDynPrm_t& cell_grp_info {},"
             // "cuphyPdschUeGrpPrm_t& grp {}, bool is_new_grp {}, cuphyPdschUePrm_t& ue {},"
@@ -862,7 +874,7 @@ namespace scf_5g_fapi {
             // &pmi_bf_pdu, &pm_map,
             // &cell_cmd, bf_enabled?1:0, pm_enabled?1:0, cell_index);
 
-            slot_info_t *sym_prbs = cell_cmd.sym_prb_info(); 
+            slot_info_t *sym_prbs = pdsch_fh_param.sym_prb_info();
             prb_info_t (&prbs)[MAX_PRB_INFO] = sym_prbs->prbs; 
 
             if(ru == SINGLE_SECT_MODE)
@@ -899,17 +911,13 @@ namespace scf_5g_fapi {
                         prb_info.common.numSymbols = (slot_detail == nullptr || slot_detail->max_dl_symbols == 0 ? OFDM_SYMBOLS_PER_SLOT: slot_detail->max_dl_symbols);
                     }
                     if (likely(!pm_enabled)) {
-                        if(ue.rnti == UINT16_MAX && !pdsch_fh_param.mmimo_enabled)  // For 4T4R O-RUs, SI-RNTI date with a single layer transmission will be replicated for the second antenna
+                        if(ue.rnti == UINT16_MAX && !pdsch_fh_param.mmimo_enabled())  // For 4T4R O-RUs, SI-RNTI date with a single layer transmission will be replicated for the second antenna
                         {
                             prb_info.common.portMask |= (1 << (2 * ue.nUeLayers)) - 1;
                         }
                         else
                         {
-#ifdef ENABLE_32DL
-                            prb_info.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                            prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                            prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                             if(mmimo_enabled)
                             {
                                 //NVLOGD_FMT(TAG, "{}:{} is_new_grp {} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, (is_new_grp)?1:0, ue.rnti, ue.dmrsPortBmsk, ue.scid);
@@ -923,7 +931,7 @@ namespace scf_5g_fapi {
                         update_beam_list(prb_info.beams_array, prb_info.beams_array_size, pmi_bf_pdu, mmimo_enabled, prb_info, cell_index);
                         if (bfwCoeff_mem_info != NULL)
                         {
-                            NVLOGD_FMT(TAG, "Header {} SFN {} SLOT {} BFW_SFN {} BFW_SLOT {}", *bfwCoeff_mem_info->header, cell_cmd.slot.slot_3gpp.sfn_, cell_cmd.slot.slot_3gpp.slot_, bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot);
+                            NVLOGD_FMT(TAG, "Header {} SFN {} SLOT {} BFW_SFN {} BFW_SLOT {}", *bfwCoeff_mem_info->header, slot_3gpp.sfn_, slot_3gpp.slot_, bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot);
                         }
                         else
                         {
@@ -931,11 +939,11 @@ namespace scf_5g_fapi {
                         }
                         if (bfwCoeff_mem_info != NULL && *bfwCoeff_mem_info->header == BFW_COFF_MEM_BUSY)
                         {
-                            if ((is_latest_bfw_coff_avail(cell_cmd.slot.slot_3gpp.sfn_ , cell_cmd.slot.slot_3gpp.slot_,
+                            if ((is_latest_bfw_coff_avail(slot_3gpp.sfn_ , slot_3gpp.slot_,
                                     bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot)) && (pmi_bf_pdu.dig_bf_interfaces==0))
                             {
                                 NVLOGD_FMT(TAG, "PDSCH new Grp :: Header {} SFN {} SLOT {} BFW_SFN {} BFW_SLOT {}",
-                                                *bfwCoeff_mem_info->header, cell_cmd.slot.slot_3gpp.sfn_, cell_cmd.slot.slot_3gpp.slot_,
+                                                *bfwCoeff_mem_info->header, slot_3gpp.sfn_, slot_3gpp.slot_,
                                                 bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot);
                                 prb_info.common.extType = 11;
                                 //prb_info.common.portMask = (1 << pmi_bf_pdu.dig_bf_interfaces) -1;
@@ -1018,11 +1026,11 @@ namespace scf_5g_fapi {
                     //for(uint32_t i=0; i < MAX_RBMASK_BYTE_SIZE; i++)
                         //NVLOGD_FMT(TAG, "{}: rbBitmap[{}]=0x{:x}",__func__,i, grp.rbBitmap[i]);
                     //prepare_ra_type0_info(info,grp,ue_grp_index);
-                    for(uint32_t i=0; i < info->num_ra_type0_info[ue_grp_index]; i++)
+                    for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                     {
                         check_prb_info_size(sym_prbs->prbs_size);
                         prbs[sym_prbs->prbs_size] =
-                            prb_info_t(info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb, info->ra_type0_info[i][ue_grp_index].num_prb);
+                            prb_info_t(fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb, fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb);
                         sym_prbs->prbs_size++;
 
                         std::size_t index{sym_prbs->prbs_size - 1};
@@ -1030,17 +1038,13 @@ namespace scf_5g_fapi {
                         prb_info.common.direction = fh_dir_t::FH_DIR_DL;
                         prb_info.common.numApIndices = 0;
                         if (likely(!pm_enabled)) {
-                            if(ue.rnti == UINT16_MAX && !pdsch_fh_param.mmimo_enabled)  // For 4T4R O-RUs, SI-RNTI date with a single layer transmission will be replicated for the second antenna
+                            if(ue.rnti == UINT16_MAX && !pdsch_fh_param.mmimo_enabled())  // For 4T4R O-RUs, SI-RNTI date with a single layer transmission will be replicated for the second antenna
                             {
                                 prb_info.common.portMask |= (1 << (2 * ue.nUeLayers)) - 1;
                             }
                             else
                             {
-#ifdef ENABLE_32DL
-                                prb_info.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                 if(mmimo_enabled)
                                 {
                                     //NVLOGD_FMT(TAG, "{}:{} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
@@ -1107,11 +1111,7 @@ namespace scf_5g_fapi {
                         auto& prb{prbs[*iter]};
                         if (likely(!pm_enabled)) {
                                 //NVLOGD_FMT(TAG, "{}:{} old prb.common.portMask {}", __FILE__, __LINE__, ue.rnti, static_cast<uint32_t>(prb.common.portMask), static_cast<uint64_t>(ue.dmrsPortBmsk), ue.scid);
-#ifdef ENABLE_32DL
-                                prb.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                 if(mmimo_enabled)
                                 {
                                     //NVLOGD_FMT(TAG, "{}:{} not pm_enabled ue.rnti {} prb_info.common.portMask {}, ue.dmrsPortBmsk {}, ue.scid {}", __FILE__, __LINE__, ue.rnti, static_cast<uint32_t>(prb.common.portMask), static_cast<uint64_t>(ue.dmrsPortBmsk), ue.scid);
@@ -1127,10 +1127,10 @@ namespace scf_5g_fapi {
                 else
                 {
                     auto& idxlist{sym_prbs->symbols[grp.pdschStartSym][channel_type::PDSCH]};
-                    for(uint32_t i=0; i < info->num_ra_type0_info[ue_grp_index]; i++)
+                    for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                     {
-                        uint32_t startPrb = info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb;
-                        uint32_t nPrb = info->ra_type0_info[i][ue_grp_index].num_prb;
+                        uint32_t startPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb;
+                        uint32_t nPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb;
                         auto iter = std::find_if(idxlist.begin(), idxlist.end(),[&sym_prbs, &prbs, startPrb, nPrb](const auto& e){
                             bool retval = (e < sym_prbs->prbs_size);
                             if (retval) {
@@ -1143,11 +1143,7 @@ namespace scf_5g_fapi {
                         if (iter != idxlist.end()){
                             auto& prb{prbs[*iter]};
                             if (likely(!pm_enabled)) {
-#ifdef ENABLE_32DL
-                                prb.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                 if(mmimo_enabled)
                                 {
                                     //NVLOGD_FMT(TAG, "{}:{} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
@@ -1165,55 +1161,136 @@ namespace scf_5g_fapi {
         }
     }
 
-    void update_static_bf_wt_csi_rs(int32_t cell_index, tx_precoding_beamforming_t& pdu, prb_info_t& prb_info, uint16_t beam_id)
+    /**
+     * @brief Encode static beamforming weights for a CSI-RS beam into prb_info.
+     *
+     * Checks the DBT (dynamic beamforming table) for the given beam_id and, if
+     * present, populates the static BFW coefficient metadata in prb_info.  When
+     * sendOncePerBeam is true the beam-sent flag is set so that subsequent calls
+     * for the same beam are skipped.  In per-port iteration mode
+     * (modcomp_enabled == true) the flag is deferred until the last port to
+     * avoid premature skipping of later ports.
+     *
+     * @param[in]     cell_index           Cell index.
+     * @param[in]     pdu                  Precoding / beamforming PDU.
+     * @param[in,out] prb_info             PRB info to update with BFW metadata.
+     * @param[in]     beam_id              Beam identifier to look up in DBT.
+     * @param[in]     modcomp_enabled      True when per-port sent-flag gating is needed.
+     * @param[in]     phyDriver            PHY driver proxy reference.
+     * @param[in]     static_bfw_configured Whether static BFW is configured.
+     * @param[in]     sendOncePerBeam      If true, mark beam as sent after encoding.
+     */
+    inline void update_static_bf_wt_csi_rs_impl(int32_t cell_index, tx_precoding_beamforming_t& pdu, prb_info_t& prb_info, uint16_t beam_id, bool modcomp_enabled,
+        nv::PHYDriverProxy& phyDriver, bool static_bfw_configured, bool sendOncePerBeam)
     {
-        nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-        if ((pdu.dig_bf_interfaces != 0) && phyDriver.l1_staticBFWConfigured(cell_index))
+        if (!static_bfw_configured)
         {
-            NVLOGD_FMT(TAG, "num_prgs={}, dig_bf_interfaces={}", reinterpret_cast<uint16_t>(pdu.num_prgs), reinterpret_cast<uint8_t>(pdu.dig_bf_interfaces));
-            if(!phyDriver.l1_get_send_static_bfw_wt_all_cplane())
-            {
-                if(!phyDriver.l1_getBeamWeightsSentFlag(cell_index, beam_id))
-                {
-                    phyDriver.l1_setBeamWeightsSentFlag(cell_index, beam_id);
-                }
-                else
-                {
-                    return;
-                }
-            }
-            NVLOGD_FMT(TAG, "Beamidx={} entry available in DBT PDU IQ sent using extType=11 prb_info={}", beam_id, reinterpret_cast<void*>(&prb_info.common));
-            prb_info.common.extType = 11;
-            prb_info.common.isStaticBfwEncoded = true;
-            prb_info.static_bfwCoeff_buf_info.num_prgs = pdu.num_prgs;
-            prb_info.static_bfwCoeff_buf_info.prg_size = pdu.prg_size;
-            prb_info.static_bfwCoeff_buf_info.dig_bf_interfaces = pdu.dig_bf_interfaces;
+            NVLOGD_FMT(TAG, "{} Static Beamforming is disabled for this PDU prb_info={}", __func__, reinterpret_cast<void*>(&prb_info.common));
+            return;
         }
-        else
+
+        NVLOGD_FMT(TAG, "num_prgs={}, dig_bf_interfaces={}", static_cast<uint16_t>(pdu.num_prgs), static_cast<uint8_t>(pdu.dig_bf_interfaces));
+
+        // Check if beamId is part of static DBT table
+        // Return values: -1 = not in DBT table (predefined beam), 0 = in DBT table but not sent, 1 = in DBT table and sent
+        const int isbeamInDBT = phyDriver.l1_getBeamWeightsSentFlag(cell_index, beam_id);
+
+        if (isbeamInDBT == -1)
         {
-            NVLOGD_FMT(TAG, "{} Static Beamforming is disabled for this PDU prb_info={}",__func__, reinterpret_cast<void*>(&prb_info.common));
+            NVLOGD_FMT(TAG, "Beamidx={} is a predefined beam ID (not in static DBT table)", beam_id);
+            return;
+        }
+
+        if (sendOncePerBeam && (isbeamInDBT == 1))
+        {
+            // Beam weights already sent, skip
+            return;
+        }
+
+        NVLOGD_FMT(TAG, "Beamidx={} entry available in DBT PDU IQ sent using extType=11 prb_info={}", beam_id, reinterpret_cast<void*>(&prb_info.common));
+        prb_info.common.extType = 11;
+        prb_info.common.isStaticBfwEncoded = true;
+        prb_info.static_bfwCoeff_buf_info.num_prgs = pdu.num_prgs;
+        prb_info.static_bfwCoeff_buf_info.prg_size = pdu.prg_size;
+        prb_info.static_bfwCoeff_buf_info.dig_bf_interfaces = pdu.dig_bf_interfaces;
+
+        if (!sendOncePerBeam)
+        {
+            return;
+        }
+
+        if (!modcomp_enabled)
+        {
+            phyDriver.l1_setBeamWeightsSentFlag(cell_index, beam_id);
+            return;
+        }
+
+        // In the case of ModComp, this function is called per-port; if we mark sent on the first port,
+        // all beam IDs are treated as sent and later ports would skip static BFW encoding.
+        // Gate "mark sent" on the last port.
+        const uint64_t last_port_mask = (1ULL << (pdu.dig_bf_interfaces - 1U));
+        if (prb_info.common.portMask == last_port_mask)
+        {
+            NVLOGD_FMT(TAG, "CSI-RS BFW gate: mark sent beam_id={} portMask=0x{:x}",
+                beam_id,
+                static_cast<uint64_t>(prb_info.common.portMask));
+            // Mark as sent once the final CSI-RS port is processed
+            phyDriver.l1_setBeamWeightsSentFlag(cell_index, beam_id);
         }
     }
 
-   template <bool mplane_configured_ru_type>
-    void update_prc_fh_params_pdsch_with_csirs(const pm_weight_map_t & pm_map, pdsch_fh_prepare_params& pdsch_fh_param, nv::slot_detail_t* slot_detail, bool csirs_compact_mode)
+    /**
+     * @brief Convenience wrapper for update_static_bf_wt_csi_rs_impl.
+     *
+     * Fetches PHY driver state (static BFW config flag, sendOncePerBeam policy)
+     * and delegates to update_static_bf_wt_csi_rs_impl.
+     *
+     * @param[in]     cell_index       Cell index.
+     * @param[in]     pdu              Precoding / beamforming PDU.
+     * @param[in,out] prb_info         PRB info to update with BFW metadata.
+     * @param[in]     beam_id          Beam identifier to look up in DBT.
+     * @param[in]     modcomp_enabled  True when per-port sent-flag gating is needed.
+     */
+    void update_static_bf_wt_csi_rs(int32_t cell_index, tx_precoding_beamforming_t& pdu, prb_info_t& prb_info, uint16_t beam_id, bool modcomp_enabled)
     {
-        if(pdsch_fh_param.mmimo_enabled)
-            update_prc_fh_params_pdsch_with_csirs<mplane_configured_ru_type>(pm_map, pdsch_fh_param, slot_detail, pdsch_fh_param.mmimo_enabled, csirs_compact_mode);
+        if (pdu.dig_bf_interfaces == 0U)
+        {
+            NVLOGD_FMT(TAG, "{} Static Beamforming is disabled for this PDU prb_info={}", __func__, reinterpret_cast<void*>(&prb_info.common));
+            return;
+        }
+        nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+        const bool static_bfw_configured = phyDriver.l1_staticBFWConfigured(cell_index);
+        const bool sendOncePerBeam = !phyDriver.l1_get_send_static_bfw_wt_all_cplane();
+        update_static_bf_wt_csi_rs_impl(cell_index, pdu, prb_info, beam_id, modcomp_enabled, phyDriver, static_bfw_configured, sendOncePerBeam);
+    }
+
+   template <bool mplane_configured_ru_type>
+    void update_prc_fh_params_pdsch_with_csirs(const pm_weight_map_t & pm_map, const IFhCallbackContext& fh_context, const PdschFhParamsView& pdsch_fh_param, nv::slot_detail_t* slot_detail, bool csirs_compact_mode)
+    {
+        if(pdsch_fh_param.mmimo_enabled())
+            update_prc_fh_params_pdsch_with_csirs_mmimo<mplane_configured_ru_type>(pm_map, fh_context, pdsch_fh_param, slot_detail, csirs_compact_mode);
         else
-            update_prc_fh_params_pdsch_with_csirs<mplane_configured_ru_type>
-            (pdsch_fh_param.info, *pdsch_fh_param.cell_grp_info, *pdsch_fh_param.grp, pdsch_fh_param.is_new_grp, *pdsch_fh_param.ue, *(reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(&pdsch_fh_param.pc_bf)),
-            pm_map, *pdsch_fh_param.cell_cmd, pdsch_fh_param.bf_enabled, pdsch_fh_param.pm_enabled, pdsch_fh_param.csirs_info, pdsch_fh_param.cell_index, pdsch_fh_param.num_dl_prb,pdsch_fh_param.ue_grp_index,
-            pdsch_fh_param.ue_grp_bfw_index_per_cell, pdsch_fh_param.bfwCoeff_mem_info, slot_detail, csirs_compact_mode);
+            update_prc_fh_params_pdsch_with_csirs_nonmmimo<mplane_configured_ru_type>(pm_map, fh_context, pdsch_fh_param, slot_detail, csirs_compact_mode);
     }
 
     // non mimo_enabled case
     template <bool mplane_configured_ru_type>
-    void update_prc_fh_params_pdsch_with_csirs(pdsch_params* pdsch_info, cuphyPdschCellGrpDynPrm_t& cell_grp_info,
-        cuphyPdschUeGrpPrm_t& grp, bool is_new_grp, cuphyPdschUePrm_t& ue,
-        scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, const pm_weight_map_t & pm_map,
-        cell_sub_command& cell_cmd, bool bf_enabled, bool pm_enabled, csirs_params* csirs_info, int32_t cell_index,
-        uint16_t num_dl_prb,uint32_t ue_grp_index,  uint32_t ue_grp_bfw_index_per_cell, bfw_coeff_mem_info_t* bfwCoeff_mem_info, nv::slot_detail_t* slot_detail,  bool csirs_compact_mode) {
+    void update_prc_fh_params_pdsch_with_csirs_nonmmimo(const pm_weight_map_t & pm_map, const IFhCallbackContext& fh_context, const PdschFhParamsView& pdsch_fh_param, nv::slot_detail_t *slot_detail, bool csirs_compact_mode) 
+    {
+    
+        const cuphyPdschCellGrpDynPrm_t& cell_grp_info = fh_context.pdsch_cell_grp_info();
+        cuphyPdschUeGrpPrm_t& grp = pdsch_fh_param.grp(); 
+        bool is_new_grp = pdsch_fh_param.is_new_grp(); 
+        cuphyPdschUePrm_t& ue = pdsch_fh_param.ue();
+        auto& pmi_bf_pdu = pdsch_fh_param.pc_bf();
+        auto& slot_3gpp = pdsch_fh_param.slot_3gpp();
+        bool bf_enabled = pdsch_fh_param.bf_enabled();
+        bool pm_enabled = pdsch_fh_param.pm_enabled(); 
+        int32_t cell_index = pdsch_fh_param.cell_index();
+        uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb();
+        uint32_t ue_grp_index = pdsch_fh_param.ue_grp_index();
+        uint32_t ue_grp_bfw_index_per_cell = pdsch_fh_param.ue_grp_bfw_index_per_cell();
+        bfw_coeff_mem_info_t* bfwCoeff_mem_info = pdsch_fh_param.bfw_coeff_mem_info();
 
         ru_type ru;
         aerial_fh::UserDataCompressionMethod dl_comp_method = aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT;
@@ -1236,11 +1313,12 @@ namespace scf_5g_fapi {
         // &grp, (is_new_grp)?1:0, &ue,
         // &pmi_bf_pdu, &pm_map,
         // &cell_cmd, bf_enabled?1:0, pm_enabled?1:0, cell_index, csirs_info, num_dl_prb);
-        auto sym_prbs{cell_cmd.sym_prb_info()};
+        auto sym_prbs{pdsch_fh_param.sym_prb_info()};
         auto& prbs{sym_prbs->prbs};
         //slot_command_api::prb_info_common_t * csi_rs_prb_common = nullptr;
         int  prb_index= 0;
         uint64_t csirs_portMask = 0;
+        const uint16_t csirs_symbol_map = fh_context.csirs_symbol_map(cell_index);
         //TI_GENERIC_INIT("pdsch_with_csirs",15);
 
         if (is_new_grp)
@@ -1258,7 +1336,7 @@ namespace scf_5g_fapi {
             while(numSym--) {
                 uint32_t mask = 1 << pdschSym;
                 //NVLOGD_FMT(TAG, "upate_fh_params_pdsch_with_csirs: cell_index={} numSym={} mask=0x{:x} csirs-symbolMap=0x{:x} start rb {} num rb {}",cell_index,numSym,mask,static_cast<uint16_t>(csirs_info->symbolMapArray[cell_index]),grp.startPrb,grp.nPrb );
-                if(mask & csirs_info->symbolMapArray[cell_index])
+                if ((mask & csirs_symbol_map) != 0U)
                 {
                     //TI_GENERIC_ADD("pdsch_csirs symbol");
                     ++index;
@@ -1268,15 +1346,15 @@ namespace scf_5g_fapi {
                     if(grp.resourceAlloc == 1) //RA type 1
                     {
                         uint16_t rb_idx = grp.startPrb;
-                        uint16_t csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF;
-                        bool use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                        uint16_t csirs_remap = fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & 0xFFF;
+                        bool use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                         uint32_t tempnPrb = 0;
                         uint32_t tempStartPrb = rb_idx;
                         uint32_t counter = grp.nPrb;
                         bool isPdschSplitAcrossPrbInfo = false;
                         while(counter) {
-                            while(((csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF)) ||
-                                (use_alt_prb && (csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx + 1] & 0xFFF))))
+                            while(((csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & 0xFFF)) ||
+                                (use_alt_prb && (csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx + 1) & 0xFFF))))
                                 && (counter > 0)) {
                                     //NVLOGD_FMT(TAG, "csirs_remap={} csirs_info->reMap={}",csirs_remap, (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF));
                                 tempnPrb++; rb_idx++; counter--;
@@ -1301,7 +1379,7 @@ namespace scf_5g_fapi {
                             prb_info.common.useAltPrb = use_alt_prb;
                             prb_info.common.isPdschSplitAcrossPrbInfo = isPdschSplitAcrossPrbInfo;
                             if (likely(!pm_enabled)) {
-                                prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                                prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                             } else {
                                 update_pm_weights_fh(ue, pm_map, pmi_bf_pdu, prb_info.common, cell_index, false);
                             }
@@ -1311,9 +1389,9 @@ namespace scf_5g_fapi {
                                 if (bfwCoeff_mem_info != NULL && *bfwCoeff_mem_info->header == BFW_COFF_MEM_BUSY)
                                 {
                                     NVLOGD_FMT(TAG, "PDSCH with CSI-RS new Grp :: Header {} SFN {} SLOT {} BFW_SFN {} BFW_SLOT {}",
-                                                *bfwCoeff_mem_info->header, cell_cmd.slot.slot_3gpp.sfn_, cell_cmd.slot.slot_3gpp.slot_,
+                                                *bfwCoeff_mem_info->header, slot_3gpp.sfn_, slot_3gpp.slot_,
                                                 bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot);
-                                    if ((is_latest_bfw_coff_avail(cell_cmd.slot.slot_3gpp.sfn_ , cell_cmd.slot.slot_3gpp.slot_,
+                                    if ((is_latest_bfw_coff_avail(slot_3gpp.sfn_ , slot_3gpp.slot_,
                                             bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot) && (pmi_bf_pdu.dig_bf_interfaces==0)))
                                     {
                                         prb_info.common.extType = 11;
@@ -1367,8 +1445,8 @@ namespace scf_5g_fapi {
 
                             tempStartPrb = rb_idx;
                             tempnPrb = 0;
-                            csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF;
-                            use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                            csirs_remap = fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & 0xFFF;
+                            use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
             #if 0
                             //DMRS
                             uint16_t bitmap = grp.dmrsSymLocBmsk >> grp.pdschStartSym;
@@ -1393,17 +1471,17 @@ namespace scf_5g_fapi {
                     } // RA type 1
                     else
                     { // RA type 0
-                        for(uint32_t i=0; i < pdsch_info->num_ra_type0_info[ue_grp_index]; i++)
+                        for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                         {
-                            uint16_t rb_idx = pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb;
-                            uint16_t csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF;
-                            bool use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                            uint16_t rb_idx = fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb;
+                            uint16_t csirs_remap = fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & 0xFFF;
+                            bool use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                             uint32_t tempnPrb = 0;
                             uint32_t tempStartPrb = rb_idx;
-                            uint32_t counter = pdsch_info->ra_type0_info[i][ue_grp_index].num_prb;
+                            uint32_t counter = fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb;
                             while(counter) {
-                                while(((csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF)) ||
-                                (use_alt_prb && (csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx + 1] & 0xFFF))))
+                                while(((csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF)) ||
+                                (use_alt_prb && (csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx + 1) & 0xFFF))))
                                 && (counter > 0)){
                                     tempnPrb++; rb_idx++; counter--;
                                     continue;
@@ -1420,7 +1498,7 @@ namespace scf_5g_fapi {
                                 prb_info.common.reMask = ~csirs_remap;
                                 prb_info.common.useAltPrb = use_alt_prb;
                                 if (likely(!pm_enabled)) {
-                                    prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                                    prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                 } else {
                                     update_pm_weights_fh(ue, pm_map, pmi_bf_pdu, prb_info.common, cell_index, false);
                                 }
@@ -1465,8 +1543,8 @@ namespace scf_5g_fapi {
                                 }
                                 tempStartPrb = rb_idx;
                                 tempnPrb = 0;
-                                csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF ;
-                                use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                                csirs_remap = fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF;
+                                use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                 #if 0
                                 //DMRS
                                 uint16_t bitmap = grp.dmrsSymLocBmsk >> grp.pdschStartSym;
@@ -1525,7 +1603,7 @@ namespace scf_5g_fapi {
                     }
                     else
                     {
-                        prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                        prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                     }
                 } else {
                     update_pm_weights_fh(ue, pm_map, pmi_bf_pdu, prb_info.common, cell_index, false);
@@ -1535,11 +1613,11 @@ namespace scf_5g_fapi {
 
                     if (bfwCoeff_mem_info != NULL && *bfwCoeff_mem_info->header == BFW_COFF_MEM_BUSY)
                     {
-                        if ((is_latest_bfw_coff_avail(cell_cmd.slot.slot_3gpp.sfn_ , cell_cmd.slot.slot_3gpp.slot_,
+                        if ((is_latest_bfw_coff_avail(slot_3gpp.sfn_ , slot_3gpp.slot_,
                             bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot)) && (pmi_bf_pdu.dig_bf_interfaces==0))
                             {
                                 NVLOGD_FMT(TAG, "PDSCH with CSI-RS new Grp :: Header {} SFN {} SLOT {} BFW_SFN {} BFW_SLOT {}",
-                                    *bfwCoeff_mem_info->header, cell_cmd.slot.slot_3gpp.sfn_, cell_cmd.slot.slot_3gpp.slot_,
+                                    *bfwCoeff_mem_info->header, slot_3gpp.sfn_, slot_3gpp.slot_,
                                     bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot);
                                     //prb_info.common.numApIndices = pmi_bf_pdu.dig_bf_interfaces;
                                     //prb_info.common.portMask = (1 << pmi_bf_pdu.dig_bf_interfaces) -1;
@@ -1572,11 +1650,11 @@ namespace scf_5g_fapi {
             }//RA type 1
             else
             { // RA type 0
-                for(uint32_t i=0; i < pdsch_info->num_ra_type0_info[ue_grp_index]; i++)
+                for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                 {
                     check_prb_info_size(sym_prbs->prbs_size);
                     prbs[sym_prbs->prbs_size] =
-                    prb_info_t(pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb, pdsch_info->ra_type0_info[i][ue_grp_index].num_prb);
+                    prb_info_t(fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb, fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb);
                     sym_prbs->prbs_size++;
                     std::size_t index_pdsch_only{sym_prbs->prbs_size - 1};
                     prb_info_t& prb_info{prbs[index_pdsch_only]};
@@ -1589,7 +1667,7 @@ namespace scf_5g_fapi {
                         }
                         else
                         {
-                            prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                            prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                         }
                     } else {
                         update_pm_weights_fh(ue, pm_map, pmi_bf_pdu, prb_info.common, cell_index, false);
@@ -1605,8 +1683,8 @@ namespace scf_5g_fapi {
                         {
                             update_prb_sym_list(*sym_prbs, index_pdsch_only, (pdsch_only[j]&0x00FF0000)>>16, (pdsch_only[j]&0xFFFF), channel_type::PDSCH, ru);
                             NVLOGD_FMT(TAG, "PDSCH new Grp : RA Type-0 : at symbol={} added index={} startPrb={} nPrb={} numSym={} prb_info={}",
-                            (pdsch_only[j]&0x00FF0000)>>16, index_pdsch_only, pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb,
-                            pdsch_info->ra_type0_info[i][ue_grp_index].num_prb, (pdsch_only[j]&0xFFFF), static_cast<void *>(&prb_info.common));
+                            (pdsch_only[j]&0x00FF0000)>>16, index_pdsch_only, fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb,
+                            fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb, (pdsch_only[j]&0xFFFF), static_cast<void *>(&prb_info.common));
                         }
                         j++;
                     }
@@ -1639,7 +1717,7 @@ namespace scf_5g_fapi {
                     if (iter != idxlist.end()){
                         auto& prb{prbs[*iter]};
                             if (likely(!pm_enabled)) {
-                            prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                            prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                             //NVLOGD_FMT(TAG, "##### prb_info={}, portMask = {}", static_cast<void *>(&prb), static_cast<uint64_t>(prb.common.portMask));
                         } else {
                             update_pm_weights_fh(ue, pm_map, pmi_bf_pdu, prb.common, cell_index, false);
@@ -1649,10 +1727,10 @@ namespace scf_5g_fapi {
                 else
                 {// RA type 0
                     auto& idxlist{sym_prbs->symbols[grp.pdschStartSym][channel_type::PDSCH]};
-                    for(uint32_t i=0; i < pdsch_info->num_ra_type0_info[ue_grp_index]; i++)
+                    for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                     {
-                        uint32_t startPrb = pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb;
-                        uint32_t nPrb = pdsch_info->ra_type0_info[i][ue_grp_index].num_prb;
+                        uint32_t startPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb;
+                        uint32_t nPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb;
 
                         auto iter = std::find_if(idxlist.begin(), idxlist.end(),[&sym_prbs, &prbs, startPrb, nPrb](const auto& e){
                             bool retval = (e < sym_prbs->prbs_size);
@@ -1665,7 +1743,7 @@ namespace scf_5g_fapi {
                         if (iter != idxlist.end()){
                             auto& prb{prbs[*iter]};
                             if (likely(!pm_enabled)) {
-                                prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                                prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                             } else {
                                 update_pm_weights_fh(ue, pm_map, pmi_bf_pdu, prb.common, cell_index, false);
                             }
@@ -1678,8 +1756,9 @@ namespace scf_5g_fapi {
     }
 
     template <bool mplane_configured_ru_type>
-    void update_prc_fh_params_pdsch_with_csirs(const pm_weight_map_t & pm_map, pdsch_fh_prepare_params& pdsch_fh_param, nv::slot_detail_t* slot_detail, bool mmimo_enabled, bool csirs_compact_mode) {
-        int32_t cell_index = pdsch_fh_param.cell_index;
+    void update_prc_fh_params_pdsch_with_csirs_mmimo(const pm_weight_map_t & pm_map, const IFhCallbackContext& fh_context, const PdschFhParamsView& pdsch_fh_param, nv::slot_detail_t* slot_detail, bool csirs_compact_mode) {
+        bool mmimo_enabled = true; 
+        int32_t cell_index = pdsch_fh_param.cell_index();
 
         uint8_t num_csirs_eaxcids = 0;
         aerial_fh::UserDataCompressionMethod dl_comp_method = aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT;
@@ -1692,7 +1771,6 @@ namespace scf_5g_fapi {
             dl_comp_method = mplane_info.dl_comp_meth;
             ru = mplane_info.ru;
             num_eaxcids = mplane_info.eAxC_ids[slot_command_api::channel_type::CSI_RS].size();
-            pdsch_fh_param.csirs_compact_mode = csirs_compact_mode;
         }
         else
         {
@@ -1703,25 +1781,23 @@ namespace scf_5g_fapi {
         }
         switch (dl_comp_method) {
             case comp_method::MODULATION_COMPRESSION:
-                    update_prc_fh_params_pdsch_with_csirs_mod_comp(pm_map, pdsch_fh_param, slot_detail, ru_type::OTHER_MODE, comp_method::MODULATION_COMPRESSION, num_eaxcids);
+                    update_prc_fh_params_pdsch_with_csirs_mod_comp(pm_map, fh_context, pdsch_fh_param, slot_detail, ru_type::OTHER_MODE, comp_method::MODULATION_COMPRESSION, num_eaxcids, csirs_compact_mode);
                 break;
             case comp_method::NO_COMPRESSION:
             case comp_method::BLOCK_FLOATING_POINT: {
-                pdsch_params* pdsch_info = pdsch_fh_param.info;
-                cuphyPdschCellGrpDynPrm_t& cell_grp_info = *pdsch_fh_param.cell_grp_info;
-                cuphyPdschUeGrpPrm_t& grp = *pdsch_fh_param.grp;
-                bool is_new_grp = pdsch_fh_param.is_new_grp;
-                cuphyPdschUePrm_t& ue = *pdsch_fh_param.ue;
-                scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu =  *(reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(&pdsch_fh_param.pc_bf));
+                const cuphyPdschCellGrpDynPrm_t& cell_grp_info = fh_context.pdsch_cell_grp_info();
+                cuphyPdschUeGrpPrm_t& grp = pdsch_fh_param.grp();
+                bool is_new_grp = pdsch_fh_param.is_new_grp();
+                cuphyPdschUePrm_t& ue = pdsch_fh_param.ue();
+                auto& pmi_bf_pdu = pdsch_fh_param.pc_bf();
                 // pm_weight_map_t & pm_map = pm_map
-                cell_sub_command& cell_cmd =  *pdsch_fh_param.cell_cmd;
-                bool bf_enabled = pdsch_fh_param.bf_enabled;
-                bool pm_enabled = pdsch_fh_param.pm_enabled;
-                uint32_t ue_grp_index = pdsch_fh_param.ue_grp_index;
-                uint32_t ue_grp_bfw_index_per_cell = pdsch_fh_param.ue_grp_bfw_index_per_cell;
-                bfw_coeff_mem_info_t* bfwCoeff_mem_info = pdsch_fh_param.bfwCoeff_mem_info;
-                uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb;
-                auto csirs_info =  pdsch_fh_param.csirs_info;
+                auto& slot_3gpp = pdsch_fh_param.slot_3gpp();
+                bool bf_enabled = pdsch_fh_param.bf_enabled();
+                bool pm_enabled = pdsch_fh_param.pm_enabled();
+                uint32_t ue_grp_index = pdsch_fh_param.ue_grp_index();
+                uint32_t ue_grp_bfw_index_per_cell = pdsch_fh_param.ue_grp_bfw_index_per_cell();
+                bfw_coeff_mem_info_t* bfwCoeff_mem_info = pdsch_fh_param.bfw_coeff_mem_info();
+                uint16_t num_dl_prb = pdsch_fh_param.num_dl_prb();
 
                 // NVLOGC_FMT(TAG, "pdsch_params* pdsch_info {}, cuphyPdschCellGrpDynPrm_t& cell_grp_info {},"
                 // "cuphyPdschUeGrpPrm_t& grp {}, bool is_new_grp {}, cuphyPdschUePrm_t& ue {},"
@@ -1731,11 +1807,12 @@ namespace scf_5g_fapi {
                 // &grp, (is_new_grp)?1:0, &ue,
                 // &pmi_bf_pdu, &pm_map,
                 // &cell_cmd, bf_enabled?1:0, pm_enabled?1:0, cell_index, csirs_info, num_dl_prb);
-                auto sym_prbs{cell_cmd.sym_prb_info()};
+                auto sym_prbs{pdsch_fh_param.sym_prb_info()};
                 auto& prbs{sym_prbs->prbs};
                 //slot_command_api::prb_info_common_t * csi_rs_prb_common = nullptr;
                 int  prb_index= 0;
                 uint64_t csirs_portMask = 0;
+                const uint16_t csirs_symbol_map = fh_context.csirs_symbol_map(cell_index);
 
                 if (is_new_grp) {
                     uint32_t numSym = grp.nPdschSym;
@@ -1748,7 +1825,7 @@ namespace scf_5g_fapi {
                     while(numSym--) {
                         uint32_t mask = 1 << pdschSym;
                         //NVLOGD_FMT(TAG, "upate_fh_params_pdsch_with_csirs: cell_index={} numSym={} mask=0x{:x} csirs-symbolMap=0x{:x} start rb {} num rb {}",cell_index,numSym,mask,static_cast<uint16_t>(csirs_info->symbolMapArray[cell_index]),grp.startPrb,grp.nPrb );
-                        if(!(mask & csirs_info->symbolMapArray[cell_index]))
+                        if ((mask & csirs_symbol_map) == 0U)
                         {
                             //NVLOGD_FMT(TAG, "upate_fh_params_pdsch_with_csirs: cell_index={} numSym={} mask=0x{:x} csirs {} csirs-symbolMap=0x{:x} start rb {} num rb {} no match",cell_index,numSym,mask,static_cast<void *>(csirs_info),static_cast<uint16_t>(csirs_info->symbolMapArray[cell_index]),grp.startPrb,grp.nPrb );
                             if(grp.resourceAlloc == 1) // RA type 1
@@ -1762,17 +1839,13 @@ namespace scf_5g_fapi {
                                 prb_info.common.direction = fh_dir_t::FH_DIR_DL;
                                 prb_info.common.numApIndices = 0;
                                 if (likely(!pm_enabled)) {
-                                    if(ue.rnti == UINT16_MAX && !pdsch_fh_param.mmimo_enabled)  // For 4T4R O-RUs, SI-RNTI date with a single layer transmission will be replicated for the second antenna
+                                    if(ue.rnti == UINT16_MAX && !pdsch_fh_param.mmimo_enabled())  // For 4T4R O-RUs, SI-RNTI date with a single layer transmission will be replicated for the second antenna
                                     {
                                         prb_info.common.portMask |= (1 << (2 * ue.nUeLayers)) - 1;
                                     }
                                     else
                                     {
-#ifdef ENABLE_32DL
-                                        prb_info.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                        prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                        prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                         //NVLOGD_FMT(TAG, "{}:{} is_new_grp={} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}",
                                         //    __FILE__, __LINE__, is_new_grp, ue.rnti, ue.dmrsPortBmsk, ue.scid);
                                         track_eaxcids_fh(ue, prb_info.common);
@@ -1785,11 +1858,11 @@ namespace scf_5g_fapi {
 
                                     if (bfwCoeff_mem_info != NULL && *bfwCoeff_mem_info->header == BFW_COFF_MEM_BUSY)
                                     {
-                                        if ((is_latest_bfw_coff_avail(cell_cmd.slot.slot_3gpp.sfn_ , cell_cmd.slot.slot_3gpp.slot_,
+                                        if ((is_latest_bfw_coff_avail(slot_3gpp.sfn_ , slot_3gpp.slot_,
                                                 bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot)) && (pmi_bf_pdu.dig_bf_interfaces==0))
                                         {
                                             NVLOGD_FMT(TAG, "PDSCH with CSI-RS new Grp :: Header {} SFN {} SLOT {} BFW_SFN {} BFW_SLOT {}",
-                                                        *bfwCoeff_mem_info->header, cell_cmd.slot.slot_3gpp.sfn_, cell_cmd.slot.slot_3gpp.slot_,
+                                                        *bfwCoeff_mem_info->header, slot_3gpp.sfn_, slot_3gpp.slot_,
                                                         bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot);
                                             //prb_info.common.numApIndices = pmi_bf_pdu.dig_bf_interfaces;
                                             //prb_info.common.portMask = (1 << pmi_bf_pdu.dig_bf_interfaces) -1;
@@ -1812,7 +1885,7 @@ namespace scf_5g_fapi {
                                     tempPdschSym = pdschSym;
                                     // Incrementing it by 1 because the outer while loop decrements it. We need to adjust the symbols to combine them for muMIMO ORU.
                                     numSym++;
-                                    while(!(mask & csirs_info->symbolMapArray[cell_index]))
+                                    while ((mask & csirs_symbol_map) == 0U)
                                     {
                                         tempNumSym++;
                                         tempPdschSym++;
@@ -1837,21 +1910,15 @@ namespace scf_5g_fapi {
                                     pdschSym = tempPdschSym - 1;
                                     tempNumSym = 0;
                                 }
-                                else // Dead code
-                                {
-                                    update_prb_sym_list(*sym_prbs, index_pdsch_only, pdschSym, 1, channel_type::PDSCH, ru);
-
-                                    NVLOGD_FMT(TAG, "PDSCH new Grp : RA Type-1 : at symbol={} added index={} startPrb={} nPrb={} numSym=1 prb_info={}",
-                                            pdschSym, index_pdsch_only, grp.startPrb, grp.nPrb, static_cast<void *>(&prb_info.common));
-                                }
+                                
                             }//RA type 1
                             else
                             { // RA type 0
-                                for(uint32_t i=0; i < pdsch_info->num_ra_type0_info[ue_grp_index]; i++)
+                                for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                                 {
                                     check_prb_info_size(sym_prbs->prbs_size);
                                     prbs[sym_prbs->prbs_size] =
-                                        prb_info_t(pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb, pdsch_info->ra_type0_info[i][ue_grp_index].num_prb);
+                                        prb_info_t(fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb, fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb);
                                     sym_prbs->prbs_size++;
                                     std::size_t index_pdsch_only{sym_prbs->prbs_size - 1};
                                     prb_info_t& prb_info{prbs[index_pdsch_only]};
@@ -1859,17 +1926,13 @@ namespace scf_5g_fapi {
                                     prb_info.common.numApIndices = 0;
                                     prb_info.common.ap_index = 0; //Init AP_INDEX as this is the first UE in the new UE-Group
                                     if (likely(!pm_enabled)) {
-                                        if(ue.rnti == UINT16_MAX && !pdsch_fh_param.mmimo_enabled)  // For 4T4R O-RUs, SI-RNTI date with a single layer transmission will be replicated for the second antenna
+                                        if(ue.rnti == UINT16_MAX && !pdsch_fh_param.mmimo_enabled())  // For 4T4R O-RUs, SI-RNTI date with a single layer transmission will be replicated for the second antenna
                                         {
                                             prb_info.common.portMask |= (1 << (2 * ue.nUeLayers)) - 1;
                                         }
                                         else
                                         {
-#ifdef ENABLE_32DL
-                                            prb_info.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                            prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                            prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                             if(mmimo_enabled)
                                             {
                                                 //NVLOGC_FMT(TAG, "{}:{} RA Type-0: ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
@@ -1884,8 +1947,8 @@ namespace scf_5g_fapi {
                                     }
                                     update_prb_sym_list(*sym_prbs, index_pdsch_only, pdschSym, 1, channel_type::PDSCH, ru);
                                     NVLOGD_FMT(TAG, "PDSCH new Grp : RA Type-0 : at symbol={} added index={} startPrb={} nPrb={} numSym=1 prb_info={}",
-                                        pdschSym, index_pdsch_only,pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb,
-                                        pdsch_info->ra_type0_info[i][ue_grp_index].num_prb, static_cast<void *>(&prb_info.common));
+                                        pdschSym, index_pdsch_only,fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb,
+                                        fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb, static_cast<void *>(&prb_info.common));
                                 }//for num_ra_type0_info
                             } // RA type 0
                         } //PDSCH only
@@ -1897,15 +1960,15 @@ namespace scf_5g_fapi {
                             if(grp.resourceAlloc == 1) //RA type 1
                             {
                                 uint16_t rb_idx = grp.startPrb;
-                                uint16_t csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF;
-                                bool use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                                uint16_t csirs_remap = fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF;
+                                bool use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                                 uint32_t tempnPrb = 0;
                                 uint32_t tempStartPrb = rb_idx;
                                 uint32_t counter = grp.nPrb;
                                 bool isPdschSplitAcrossPrbInfo = false;
                                 while(counter) {
-                                    while(((csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF)) ||
-                                        (use_alt_prb && (csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx + 1] & 0xFFF))))
+                                while(((csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & 0xFFF)) ||
+                                (use_alt_prb && (csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx + 1) & 0xFFF))))
                                         && (counter > 0)) {
                                             //NVLOGD_FMT(TAG, "csirs_remap={} csirs_info->reMap={}",csirs_remap, (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF));
                                         tempnPrb++; rb_idx++; counter--;
@@ -1931,11 +1994,7 @@ namespace scf_5g_fapi {
                                     prb_info.common.isPdschSplitAcrossPrbInfo = isPdschSplitAcrossPrbInfo;
                                     prb_info.common.ap_index = 0; //Init AP_INDEX as this is the first UE in the new UE-Group
                                     if (likely(!pm_enabled)) {
-#ifdef ENABLE_32DL
-                                        prb_info.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                        prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                        prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                         if(mmimo_enabled)
                                         {
                                             //NVLOGD_FMT(TAG, "{}:{} is_new_grp={} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, is_new_grp, ue.rnti, ue.dmrsPortBmsk, ue.scid);
@@ -1950,9 +2009,9 @@ namespace scf_5g_fapi {
                                         if (bfwCoeff_mem_info != NULL && *bfwCoeff_mem_info->header == BFW_COFF_MEM_BUSY)
                                         {
                                             NVLOGD_FMT(TAG, "PDSCH with CSI-RS new Grp :: Header {} SFN {} SLOT {} BFW_SFN {} BFW_SLOT {}",
-                                                        *bfwCoeff_mem_info->header, cell_cmd.slot.slot_3gpp.sfn_, cell_cmd.slot.slot_3gpp.slot_,
+                                                        *bfwCoeff_mem_info->header, slot_3gpp.sfn_, slot_3gpp.slot_,
                                                         bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot);
-                                            if ((is_latest_bfw_coff_avail(cell_cmd.slot.slot_3gpp.sfn_ , cell_cmd.slot.slot_3gpp.slot_,
+                                            if ((is_latest_bfw_coff_avail(slot_3gpp.sfn_ , slot_3gpp.slot_,
                                                     bfwCoeff_mem_info->sfn, bfwCoeff_mem_info->slot) && (pmi_bf_pdu.dig_bf_interfaces==0)))
                                             {
                                                 prb_info.common.extType = 11;
@@ -2020,8 +2079,8 @@ namespace scf_5g_fapi {
 
                                     tempStartPrb = rb_idx;
                                     tempnPrb = 0;
-                                    csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF;
-                                    use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                                    csirs_remap = fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF;
+                                    use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                     #if 0
                                     //DMRS
                                     uint16_t bitmap = grp.dmrsSymLocBmsk >> grp.pdschStartSym;
@@ -2046,17 +2105,17 @@ namespace scf_5g_fapi {
                             } // RA type 1
                             else
                             { // RA type 0
-                                for(uint32_t i=0; i < pdsch_info->num_ra_type0_info[ue_grp_index]; i++)
+                                for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                                 {
-                                    uint16_t rb_idx = pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb;
-                                    uint16_t csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF;
-                                    bool use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                                    uint16_t rb_idx = fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb;
+                                    uint16_t csirs_remap = fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF;
+                                    bool use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                                     uint32_t tempnPrb = 0;
                                     uint32_t tempStartPrb = rb_idx;
-                                    uint32_t counter = pdsch_info->ra_type0_info[i][ue_grp_index].num_prb;
+                                    uint32_t counter = fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb;
                                     while(counter) {
-                                        while(((csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF)) ||
-                                        (use_alt_prb && (csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx + 1] & 0xFFF))))
+                                        while(((csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF)) ||
+                                        (use_alt_prb && (csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx + 1) & 0xFFF))))
                                         && (counter > 0)){
                                             tempnPrb++; rb_idx++; counter--;
                                             continue;
@@ -2073,7 +2132,7 @@ namespace scf_5g_fapi {
                                         prb_info.common.reMask = ~csirs_remap;
                                         prb_info.common.useAltPrb = use_alt_prb;
                                         if (likely(!pm_enabled)) {
-                                            prb_info.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
+                                            prb_info.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                             //NVLOGD_FMT(TAG, "line {} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
                                             track_eaxcids_fh(ue, prb_info.common);
                                         } else {
@@ -2120,8 +2179,8 @@ namespace scf_5g_fapi {
                                         }
                                         tempStartPrb = rb_idx;
                                         tempnPrb = 0;
-                                        csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF ;
-                                        use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                                csirs_remap = fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & 0xFFF;
+                                use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym * num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                         #if 0
                                         //DMRS
                                         uint16_t bitmap = grp.dmrsSymLocBmsk >> grp.pdschStartSym;
@@ -2182,13 +2241,8 @@ namespace scf_5g_fapi {
                                         auto& prb{prbs[*iter]};
                                         //NVLOGD_FMT(TAG, "{}:{} ap_index={}", __FILE__, __LINE__, static_cast<uint32_t>(prb.common.ap_index));
                                         if (likely(!pm_enabled)) {
-#ifdef ENABLE_32DL
-                                        prb.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-                                        prb.common.pdschPortMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                        prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-                                        prb.common.pdschPortMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                        prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
+                                        prb.common.pdschPortMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                         //Avoid updating the same PRB info multiple times
                                         if((p_prb_info_ref == nullptr) || (&prb != p_prb_info_ref))
                                         {
@@ -2205,10 +2259,10 @@ namespace scf_5g_fapi {
                             else
                             {// RA type 0
                                 auto& idxlist{sym_prbs->symbols[grp.pdschStartSym][channel_type::PDSCH]};
-                                for(uint32_t i=0; i < pdsch_info->num_ra_type0_info[ue_grp_index]; i++)
+                                for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                                 {
-                                    uint32_t startPrb = pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb;
-                                    uint32_t nPrb = pdsch_info->ra_type0_info[i][ue_grp_index].num_prb;
+                                    uint32_t startPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb;
+                                    uint32_t nPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb;
 
                                     auto iter = std::find_if(idxlist.begin(), idxlist.end(),[&sym_prbs, &prbs, startPrb, nPrb](const auto& e){
                                         bool retval = (e < sym_prbs->prbs_size);
@@ -2221,13 +2275,8 @@ namespace scf_5g_fapi {
                                     if (iter != idxlist.end()){
                                         auto& prb{prbs[*iter]};
                                         if (likely(!pm_enabled)) {
-#ifdef ENABLE_32DL
-                                            prb.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-                                            prb.common.pdschPortMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                            prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-                                            prb.common.pdschPortMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                            prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
+                                            prb.common.pdschPortMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                             //NVLOGD_FMT(TAG, "{}:{} RA Type-0: ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
                                             track_eaxcids_fh(ue, prb.common);
                                         } else {
@@ -2241,14 +2290,14 @@ namespace scf_5g_fapi {
                                 auto& idxlist{sym_prbs->symbols[pdschSym][channel_type::PDSCH_CSIRS]};
 
                                 uint16_t rb_idx = grp.startPrb;
-                                uint16_t csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF;
-                                bool use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                                uint16_t csirs_remap = fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF;
+                                bool use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                                 uint32_t tempnPrb = 0;
                                 uint32_t tempStartPrb = rb_idx;
                                 uint32_t counter = grp.nPrb;
                                 while(counter) {
-                                    while(((csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF)) ||
-                                        (use_alt_prb && (csirs_remap == (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx + 1] & 0xFFF))))
+                                    while(((csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF)) ||
+                                        (use_alt_prb && (csirs_remap == (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx + 1) & 0xFFF))))
                                         && (counter > 0)) {
                                         tempnPrb++; rb_idx++; counter--;
                                         continue;
@@ -2274,13 +2323,8 @@ namespace scf_5g_fapi {
                                     if (iter != idxlist.end()){
                                         auto& prb{prbs[*iter]};
                                             if (likely(!pm_enabled)) {
-#ifdef ENABLE_32DL
-                                            prb.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-                                            prb.common.pdschPortMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                            prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-                                            prb.common.pdschPortMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                            prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
+                                            prb.common.pdschPortMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                             //NVLOGD_FMT(TAG, "{}:{} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
                                             track_eaxcids_fh(ue, prb.common);
                                             //NVLOGD_FMT(TAG, "##### channel_type=PDSCH_CSIRS prb_info={}, portMask = {}", static_cast<void *>(&prb), static_cast<uint64_t>(prb.common.portMask));
@@ -2290,17 +2334,17 @@ namespace scf_5g_fapi {
                                     }
                                     tempStartPrb = rb_idx;
                                     tempnPrb = 0;
-                                    csirs_remap = csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & 0xFFF ;
-                                    use_alt_prb = (csirs_info->reMap[cell_index][pdschSym*num_dl_prb + rb_idx] & (1 << 15))? true : false;
+                                    csirs_remap = fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & 0xFFF;
+                                    use_alt_prb = (fh_context.csirs_remap(cell_index, pdschSym*num_dl_prb + rb_idx) & (1 << 15)) ? true : false;
                                 }
                             }
                             else
                             {// RA type 0
                                 auto& idxlist{sym_prbs->symbols[grp.pdschStartSym][channel_type::PDSCH_CSIRS]};
-                                for(uint32_t i=0; i < pdsch_info->num_ra_type0_info[ue_grp_index]; i++)
+                                for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                                 {
-                                    uint32_t startPrb = pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb;
-                                    uint32_t nPrb = pdsch_info->ra_type0_info[i][ue_grp_index].num_prb;
+                                    uint32_t startPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb;
+                                    uint32_t nPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb;
 
                                     auto iter = std::find_if(idxlist.begin(), idxlist.end(),[&sym_prbs, &prbs, startPrb, nPrb](const auto& e){
                                         bool retval = (e < sym_prbs->prbs_size);
@@ -2313,13 +2357,8 @@ namespace scf_5g_fapi {
                                     if (iter != idxlist.end()){
                                         auto& prb{prbs[*iter]};
                                         if (likely(!pm_enabled)) {
-#ifdef ENABLE_32DL
-                                            prb.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-                                            prb.common.pdschPortMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                            prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-                                            prb.common.pdschPortMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                            prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
+                                            prb.common.pdschPortMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                             //NVLOGC_FMT(TAG, "{}:{} RA Type-0: ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
                                             track_eaxcids_fh(ue, prb.common);
                                         } else {
@@ -2355,11 +2394,7 @@ namespace scf_5g_fapi {
                             if (iter != idxlist.end()){
                                 auto& prb{prbs[*iter]};
                                     if (likely(!pm_enabled)) {
-#ifdef ENABLE_32DL
-                                    prb.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                    prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                    prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                     //NVLOGD_FMT(TAG, "{}:{} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
                                     track_eaxcids_fh(ue, prb.common);
                                     //NVLOGD_FMT(TAG, "##### prb_info={}, portMask = {}", static_cast<void *>(&prb), static_cast<uint64_t>(prb.common.portMask));
@@ -2371,10 +2406,10 @@ namespace scf_5g_fapi {
                         else
                         {// RA type 0
                             auto& idxlist{sym_prbs->symbols[grp.pdschStartSym][channel_type::PDSCH]};
-                            for(uint32_t i=0; i < pdsch_info->num_ra_type0_info[ue_grp_index]; i++)
+                            for(uint32_t i=0; i < fh_context.pdsch_num_ra_type0_info(ue_grp_index); i++)
                             {
-                                uint32_t startPrb = pdsch_info->ra_type0_info[i][ue_grp_index].start_prb+grp.startPrb;
-                                uint32_t nPrb = pdsch_info->ra_type0_info[i][ue_grp_index].num_prb;
+                                uint32_t startPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).start_prb + grp.startPrb;
+                                uint32_t nPrb = fh_context.pdsch_ra_type0_info(i, ue_grp_index).num_prb;
 
                                 auto iter = std::find_if(idxlist.begin(), idxlist.end(),[&sym_prbs, &prbs, startPrb, nPrb](const auto& e){
                                     bool retval = (e < sym_prbs->prbs_size);
@@ -2387,11 +2422,7 @@ namespace scf_5g_fapi {
                                 if (iter != idxlist.end()){
                                     auto& prb{prbs[*iter]};
                                     if (likely(!pm_enabled)) {
-#ifdef ENABLE_32DL
-                                        prb.common.portMask |= (static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8)<<(16 * ue.nlAbove16);
-#else
-                                        prb.common.portMask |= static_cast<uint64_t>(ue.dmrsPortBmsk) << ue.scid * 8;
-#endif
+                                        prb.common.portMask |= calculate_dmrs_port_mask(ue.dmrsPortBmsk, ue.scid, ue.nlAbove16);
                                         //NVLOGD_FMT(TAG, "{}:{} ue.rnti {} ue.dmrsPortBmsk {} ue.scid {}", __FILE__, __LINE__, ue.rnti, ue.dmrsPortBmsk, ue.scid);
                                         track_eaxcids_fh(ue, prb.common);
                                     } else {
@@ -2413,8 +2444,7 @@ namespace scf_5g_fapi {
     };
 
 
-    inline void csirs_all_sym_ru_handler(cell_sub_command* cell_cmd, nv::slot_detail_t* slot_detail, uint16_t num_dl_prb) {
-        auto sym_prbs{cell_cmd->sym_prb_info()};
+    inline void csirs_all_sym_ru_handler(slot_info_t* sym_prbs, nv::slot_detail_t* slot_detail, uint16_t num_dl_prb) {
         auto& prbs{sym_prbs->prbs};
         bool value = ifAnySymbolPresent(sym_prbs->symbols, DL_CHANNEL_MASK);
         if (value)
@@ -2434,20 +2464,25 @@ namespace scf_5g_fapi {
         update_prb_sym_list(*sym_prbs, index, start_symbol, prb_info.common.numSymbols, channel_type::CSI_RS, ru_type::SINGLE_SECT_MODE);
     }
 
-    inline void updateCsirsReSymbMap(uint16_t num_dl_prb, csirs_params* params, uint16_t cell_idx, uint16_t csirs_idx, uint8_t l,  uint16_t reMask, uint16_t startRb, uint16_t nRB, uint8_t rbInc) {
+    inline void updateCsirsReSymbMap(uint16_t num_dl_prb, uint16_t* reMapRow, uint16_t& symbolMap, uint8_t l, uint16_t reMask, uint16_t startRb, uint16_t nRB, uint8_t rbInc) {
         uint32_t reMapIndex = l*num_dl_prb + startRb;
-         NVLOGD_FMT(TAG, "CSIRS reMap start [{}][{}] 0x{:x} rbInc {}", cell_idx, reMapIndex, params->reMap[cell_idx][reMapIndex], rbInc);
-        for (int idxRb = startRb; idxRb <  startRb + nRB; idxRb+=rbInc)
-        {
-            params->reMap[cell_idx][reMapIndex] |= reMask;
-            //freqdensity  0.5 is a special case use the most significant bit to
-            //convey to PDSCH channel that alternative RBs are to be used.
-            if(rbInc == 2)
-                params->reMap[cell_idx][reMapIndex] |= 1 << 15;
-            reMapIndex += rbInc;
+        NVLOGD_FMT(TAG, "CSIRS reMap start [{}] 0x{:x} rbInc {}", reMapIndex, reMapRow[reMapIndex], rbInc);
+        
+        // Hot-path split: rbInc=1 is the common case; rbInc=2 handles density 0.5 bit.
+        auto* reMapPtr = &reMapRow[reMapIndex];
+        const int endRb = startRb + nRB;
+        if (likely(rbInc == 1)) {
+            for (int idxRb = startRb; idxRb < endRb; idxRb++) {
+                *reMapPtr++ |= reMask;
+            }
+        } else {
+            const uint16_t combinedMask = reMask | (1 << 15);
+            for (int idxRb = startRb; idxRb < endRb; idxRb += 2) {
+                *reMapPtr |= combinedMask;
+                reMapPtr += 2;
+            }
         }
-        NVLOGD_FMT(TAG, "CSIRS reMap end [{}][{}] 0x{:x} rbInc {}", cell_idx, reMapIndex, params->reMap[cell_idx][reMapIndex - 1], rbInc);
-        params->symbolMapArray[cell_idx] |= 1 << l;
+        symbolMap |= static_cast<uint16_t>(1U << l);
     }
 
     template <typename Func, typename ...Args>
@@ -2459,155 +2494,224 @@ namespace scf_5g_fapi {
         auto& prbs{sym_prbs->prbs};
 
         check_prb_info_size(sym_prbs->prbs_size);
-        if(rbInc == 2)
-        {
-            prbs[sym_prbs->prbs_size] = prb_info_t(startRb, ((nRB + 1) >> 1)) ;
-        }
-        else
-        {
-            prbs[sym_prbs->prbs_size] = prb_info_t(startRb, nRB);
-        }
-
-        sym_prbs->prbs_size++;
-        std::size_t index{sym_prbs->prbs_size - 1};
+        
+        // Optimization: Branchless calculation for 32-port CSI-RS hot path
+        const uint16_t nRB_adjusted = (rbInc == 2) ? ((nRB + 1) >> 1) : nRB;
+        
+        prbs[sym_prbs->prbs_size] = prb_info_t(startRb, nRB_adjusted);
+        
+        const std::size_t index = sym_prbs->prbs_size++;
         prb_info_t& prb_info{prbs[index]};
         prb_info.common.direction = fh_dir_t::FH_DIR_DL;
         prb_info.common.reMask = reMask;
         prb_info.common.useAltPrb = rbInc - 1;
     }
 
-    inline void csirs_bfp_compress_fh_helper(csirs_params* params, const cuphyCsirsRrcDynPrm_t *csi_rs_params, const pm_group* pm_grp, uint16_t cell_idx, uint16_t csirs_idx, slot_info_t* sym_prbs,
-        bool config_options_precoding_enabled, bool config_options_bf_enabled, bool bf_enabled, int pc_and_bf_idx,
-        const csirs_lookup_api::CsirsPortData* csirs_port_data, uint16_t num_dl_prb, uint16_t startRb, uint16_t nRB, uint8_t rbInc, bool mmimo_enabled) {
+    inline void csirs_bfp_compress_fh_helper(
+        uint16_t*                              reMapRow,
+        uint16_t&                              symbolMap,
+        tx_precoding_beamforming_t&            pc_and_bf,
+        const cuphyCsirsRrcDynPrm_t&           csirs_param,
+        const pm_group*                        pm_grp,
+        uint16_t                               cell_idx,
+        slot_info_t*                           sym_prbs,
+        bool                                   config_options_precoding_enabled,
+        bool                                   config_options_bf_enabled,
+        bool                                   bf_enabled,
+        const csirs_lookup_api::CsirsPortData* csirs_port_data,
+        uint16_t                               num_dl_prb,
+        uint16_t                               startRb,
+        uint16_t                               nRB,
+        uint8_t                                rbInc,
+        bool                                   mmimo_enabled)
+    {
         auto& prbs{sym_prbs->prbs};
-        uint8_t num_ports = csirs_port_data->num_ports;
+        const uint8_t num_ports = csirs_port_data->num_ports;
         uint16_t reMask = 0;
         uint16_t l_mask = 0;
+        
+        // Optimization: Cache CSI-RS parameter reference
+        const bool is_zp_csirs = (csirs_param.csiType == cuphyCsiType_t::ZP_CSI_RS);
+        
         for(uint8_t port = 0; port < num_ports; port++) {
             reMask |= csirs_port_data->port_tx_locations[port].re_mask;
             l_mask |= csirs_port_data->port_tx_locations[port].symbol_mask;
         }
+        const uint16_t validSymbolMask = static_cast<uint16_t>((1U << OFDM_SYMBOLS_PER_SLOT) - 1U);
+        l_mask &= validSymbolMask;
+
+        uint8_t num_ap_indices = num_ports;
+        uint64_t port_mask = (1ULL << num_ports) - 1ULL;
+        if (config_options_precoding_enabled && csirs_param.enablePrcdBf)
+        {
+            num_ap_indices = pm_grp->csirs_list[csirs_param.pmwPrmIdx].nPorts;
+            port_mask = (1ULL << num_ap_indices) - 1ULL;
+        }
+        else if (config_options_bf_enabled)
+        {
+            const uint8_t dig_bf_interfaces = pc_and_bf.dig_bf_interfaces;
+            num_ap_indices = dig_bf_interfaces;
+            port_mask = (1ULL << dig_bf_interfaces) - 1ULL;
+        }
  
-        for(uint8_t l = 0; (l < OFDM_SYMBOLS_PER_SLOT) && (l_mask != 0); l++) {
-            if((l_mask & (1 << l)) == 0)
-            {
-                continue;
+        if (unlikely(is_zp_csirs)) {
+            // ZP-CSI-RS still requires reMap/symbolMap updates, but no prb_info/beam work.
+            while (l_mask != 0) {
+                const uint8_t l = static_cast<uint8_t>(__builtin_ctz(static_cast<unsigned int>(l_mask)));
+                l_mask &= static_cast<uint16_t>(l_mask - 1);
+                updateCsirsReSymbMap(num_dl_prb, reMapRow, symbolMap, l, reMask, startRb, nRB, rbInc);
             }
-            l_mask &= ~(1 << l);
+            return;
+        }
 
-            updateCsirsReSymbMap(num_dl_prb, params, cell_idx, csirs_idx, l, reMask, startRb, nRB, rbInc);
+        while (l_mask != 0) {
+            const uint8_t l = static_cast<uint8_t>(__builtin_ctz(static_cast<unsigned int>(l_mask)));
+            l_mask &= static_cast<uint16_t>(l_mask - 1);
+            updateCsirsReSymbMap(num_dl_prb, reMapRow, symbolMap, l, reMask, startRb, nRB, rbInc);
 
-            // Only create the prb_info entry we aren't ZP-CSI-RS
-            if(csi_rs_params[csirs_idx].csiType == cuphyCsiType_t::ZP_CSI_RS)
-                continue;
             createCsiRsPrbInfo(sym_prbs, startRb, nRB, rbInc, reMask, l);
             std::size_t index{sym_prbs->prbs_size - 1};
             prb_info_t& prb_info{prbs[index]};
-
-            auto func = [config_options_precoding_enabled, config_options_bf_enabled, &prb_info](csirs_params* params, const cuphyCsirsRrcDynPrm_t *csi_rs_params, const pm_group* pm_grp, uint16_t csirs_idx, int pc_and_bf_idx, uint8_t num_ports){
-                if (config_options_precoding_enabled && csi_rs_params[csirs_idx].enablePrcdBf)
-                {
-                    NVLOGD_FMT(TAG, "CSI-RS 1");
-                    prb_info.common.numApIndices = pm_grp->csirs_list[csi_rs_params[csirs_idx].pmwPrmIdx].nPorts; //params->pcAndBf[csirs_idx].dig_bf_interfaces;
-                    prb_info.common.portMask = (1 << prb_info.common.numApIndices) -1;
-                }
-                else if (config_options_bf_enabled)
-                {
-                    NVLOGD_FMT(TAG, "CSI-RS 2");
-                    prb_info.common.numApIndices = params->pcAndBf[pc_and_bf_idx].dig_bf_interfaces;
-                    prb_info.common.portMask = (1 << params->pcAndBf[pc_and_bf_idx].dig_bf_interfaces) -1;
-                }
-                else
-                {
-                    NVLOGD_FMT(TAG, "CSI-RS 3");
-                    prb_info.common.numApIndices = num_ports;
-                    prb_info.common.portMask = (1<<num_ports) -1;
-                }
-                NVLOGD_FMT(TAG, "CSI-RS new Grp dig_bf_interfaces={}, prb_info.common.portMask {}",
-                            params->pcAndBf[pc_and_bf_idx].dig_bf_interfaces, static_cast<uint32_t>(prb_info.common.portMask));  
-            };
-            updateCsirsPortApIndexes(func , params, csi_rs_params, pm_grp, csirs_idx, pc_and_bf_idx, num_ports);
-
+            prb_info.common.numApIndices = num_ap_indices;
+            prb_info.common.portMask = port_mask;
+            NVLOGD_FMT(TAG, "CSI-RS new Grp dig_bf_interfaces={}, prb_info.common.portMask {}",
+                        pc_and_bf.dig_bf_interfaces, static_cast<uint32_t>(prb_info.common.portMask));
             //if(csi_rs_params[csirs_idx].csiType == cuphyCsiType_t::TRS)
             //    prb_info.common.numApIndices *= 2;
             update_prb_sym_list(*sym_prbs, index, l, 1, channel_type::CSI_RS, OTHER_MODE);
             if (bf_enabled)
             {
-                update_beam_list_csirs(prb_info.beams_array, prb_info.beams_array_size, params->pcAndBf[pc_and_bf_idx], prb_info, cell_idx, mmimo_enabled);
+                const bool modcomp_enabled = false;
+                update_beam_list_csirs(prb_info.beams_array, prb_info.beams_array_size, pc_and_bf, prb_info, cell_idx, mmimo_enabled, modcomp_enabled);
             }
         }
     }
 
-    inline void csirs_mod_compress_fh_helper(csirs_params* params, const cuphyCsirsRrcDynPrm_t *csi_rs_params, const pm_group* pm_grp, uint16_t cell_idx, uint16_t csirs_idx, slot_info_t* sym_prbs,
-        bool config_options_precoding_enabled, bool config_options_bf_enabled, bool bf_enabled, int pc_and_bf_idx,
-        const csirs_lookup_api::CsirsPortData* csirs_port_data, uint16_t num_dl_prb, uint16_t startRb, uint16_t nRB, uint8_t rbInc, bool mmimo_enabled, aerial_fh::UserDataCompressionMethod dl_comp_method, uint8_t num_eaxcids) {
+    template <bool config_options_bf_enabled>
+    inline void csirs_mod_compress_fh_helper(uint16_t* reMapRow, uint16_t& symbolMap, tx_precoding_beamforming_t& pc_and_bf, const cuphyCsirsRrcDynPrm_t &csirs_param, uint16_t cell_idx, slot_info_t* sym_prbs,
+        bool bf_enabled,
+        const csirs_lookup_api::CsirsPortData* csirs_port_data, uint16_t num_dl_prb, uint16_t startRb, uint16_t nRB, uint8_t rbInc, bool mmimo_enabled, aerial_fh::UserDataCompressionMethod dl_comp_method, float bw_scaler = 0.0f) {
         
         auto& prbs{sym_prbs->prbs};
-        uint8_t num_ports = csirs_port_data->num_ports;
+        const uint8_t num_ports = csirs_port_data->num_ports;
+        
+        // Optimization: Cache bw_scaler to avoid repeated function calls (critical for 32-port CSI-RS)
+        const float bw_scaler_val = (bw_scaler > 0.0f) ? bw_scaler : getBwScaler(num_dl_prb);
+        
+        // Optimization: Cache CSI-RS parameter and check modcomp once
+        const bool is_zp_csirs = (csirs_param.csiType == cuphyCsiType_t::ZP_CSI_RS);
 
-        for (uint8_t port = 0; port < num_ports; port++) {
-            uint16_t symbolMask = csirs_port_data->port_tx_locations[port].symbol_mask;
-            uint16_t reMask = csirs_port_data->port_tx_locations[port].re_mask;
-            auto func = [config_options_bf_enabled, port](prb_info_t& prb_info) {
-                    if (config_options_bf_enabled)
+        const bool is_modcomp = (dl_comp_method == comp_method::MODULATION_COMPRESSION);
+        if (unlikely(!is_modcomp)) {
+            NVLOGD_FMT(TAG, "Do not update mod comp info for {} dl_comp_method {}", __func__, static_cast<uint32_t>(dl_comp_method));
+        }
+
+        // Optimization: Cache port location array pointer to reduce indirection
+        const auto* port_tx_locations = csirs_port_data->port_tx_locations;
+        const uint16_t validSymbolMask = static_cast<uint16_t>((1U << OFDM_SYMBOLS_PER_SLOT) - 1U);
+
+        if (unlikely(is_zp_csirs)) {
+            // ZP-CSI-RS still requires reMap/symbolMap updates, but no prb_info/beam/modcomp work.
+            for (uint8_t port = 0; port < num_ports; port++) {
+                uint16_t symbolMask = static_cast<uint16_t>(port_tx_locations[port].symbol_mask & validSymbolMask);
+                const uint16_t reMask = port_tx_locations[port].re_mask;
+
+                while (symbolMask != 0)
+                {
+                    const uint8_t l = static_cast<uint8_t>(__builtin_ctz(static_cast<unsigned int>(symbolMask)));
+                    symbolMask &= static_cast<uint16_t>(symbolMask - 1);
+                    updateCsirsReSymbMap(num_dl_prb, reMapRow, symbolMap, l, reMask, startRb, nRB, rbInc);
+                }
+            }
+            return;
+        }
+
+        // Performance: Split modcomp/non-modcomp branches to avoid per-iteration branching
+        // in the hot inner loop (per-port x per-symbol). The modcomp path calls
+        // update_mod_comp_info_common/section which the non-modcomp path skips entirely.
+        if (likely(is_modcomp)) {
+            for (uint8_t port = 0; port < num_ports; port++) {
+                uint16_t symbolMask = static_cast<uint16_t>(port_tx_locations[port].symbol_mask & validSymbolMask);
+                const uint16_t reMask = port_tx_locations[port].re_mask;
+                
+                while (symbolMask != 0)
+                {
+                    const uint8_t l = static_cast<uint8_t>(__builtin_ctz(static_cast<unsigned int>(symbolMask)));
+                    symbolMask &= static_cast<uint16_t>(symbolMask - 1);
+                    updateCsirsReSymbMap(num_dl_prb, reMapRow, symbolMap, l, reMask, startRb, nRB, rbInc);
+                    createCsiRsPrbInfo(sym_prbs, startRb, nRB, rbInc, reMask, l);
+                    const std::size_t index = sym_prbs->prbs_size - 1;
+                    prb_info_t& prb_info{prbs[index]};
+                    overlap_csirs_port_info_t& overlap_csirs_port_info = sym_prbs->overlap_csirs_port_info[index];
+                    overlap_csirs_port_info.num_ports = num_ports;
+                    
+                    if constexpr (config_options_bf_enabled)
                     {
-                        NVLOGD_FMT(TAG, "CSI-RS 2");
                         prb_info.common.numApIndices = 1;
-                        prb_info.common.portMask = static_cast<uint64_t>((0x1ULL << port));
+                        prb_info.common.portMask = static_cast<uint64_t>(0x1ULL << port);
+                        prb_info.common.ap_index = port;
                     }
-                };
-            for (uint8_t l = 0; symbolMask != 0 && l < OFDM_SYMBOLS_PER_SLOT; l++) 
-            {
-                if((symbolMask & (1 << l)) == 0) 
-                {
-                    continue;
+                    
+                    update_prb_sym_list(*sym_prbs, index, l, 1, channel_type::CSI_RS, OTHER_MODE);
+                    if (bf_enabled)
+                    {
+                        const bool modcomp_enabled = true;
+                        update_beam_list_csirs(prb_info.beams_array, prb_info.beams_array_size, pc_and_bf, prb_info, cell_idx, mmimo_enabled, modcomp_enabled);
+                    }
+                    update_mod_comp_info_common(prb_info, bw_scaler_val);
+                    update_mod_comp_info_section(prb_info, reMask, csirs_param.beta, CUPHY_QAM_4, DEFAULT_CSF); // QPSK
                 }
-                symbolMask &= ~(1 << l);
-                updateCsirsReSymbMap(num_dl_prb, params, cell_idx, csirs_idx, l, reMask, startRb, nRB, rbInc);
-                // Only create the prb_info entry we aren't ZP-CSI-RS
-                if(csi_rs_params[csirs_idx].csiType == cuphyCsiType_t::ZP_CSI_RS)
-                    continue;
-                createCsiRsPrbInfo(sym_prbs, startRb, nRB, rbInc, reMask, l);
-                std::size_t index{sym_prbs->prbs_size - 1};
-                prb_info_t& prb_info{prbs[index]};
-                updateCsirsPortApIndexes(func, prb_info);
-                //TODO: AI 4 create a for loop to fill all the symbols associated with the same port.
-                update_prb_sym_list(*sym_prbs, index, l, 1, channel_type::CSI_RS, OTHER_MODE);
-                if (bf_enabled)
+            }
+        } else {
+            for (uint8_t port = 0; port < num_ports; port++) {
+                uint16_t symbolMask = static_cast<uint16_t>(port_tx_locations[port].symbol_mask & validSymbolMask);
+                const uint16_t reMask = port_tx_locations[port].re_mask;
+                
+                while (symbolMask != 0)
                 {
-                    update_beam_list_csirs(prb_info.beams_array, prb_info.beams_array_size, params->pcAndBf[pc_and_bf_idx], prb_info, cell_idx, mmimo_enabled);
-                }
-                //This check has been added because this helper function is used to support compact CSI-RS signalling
-                //Even compression method is not MODULATION_COMPRESSION
-                if(dl_comp_method == comp_method::MODULATION_COMPRESSION)
-                {
-                    update_mod_comp_info_common(prb_info, getBwScaler(num_dl_prb));
-                    update_mod_comp_info_section(prb_info, reMask, csi_rs_params[csirs_idx].beta, CUPHY_QAM_4, DEFAULT_CSF); // QPSK
-                }
-                else
-                {
-                    NVLOGC_FMT(TAG, "Do not update mod comp info for {} dl_comp_method {}", __func__, static_cast<uint32_t>(dl_comp_method));
+                    const uint8_t l = static_cast<uint8_t>(__builtin_ctz(static_cast<unsigned int>(symbolMask)));
+                    symbolMask &= static_cast<uint16_t>(symbolMask - 1);
+                    updateCsirsReSymbMap(num_dl_prb, reMapRow, symbolMap, l, reMask, startRb, nRB, rbInc);
+                    createCsiRsPrbInfo(sym_prbs, startRb, nRB, rbInc, reMask, l);
+                    const std::size_t index = sym_prbs->prbs_size - 1;
+                    prb_info_t& prb_info{prbs[index]};
+                    overlap_csirs_port_info_t& overlap_csirs_port_info = sym_prbs->overlap_csirs_port_info[index];
+                    overlap_csirs_port_info.num_ports = num_ports;
+                    
+                    if constexpr (config_options_bf_enabled)
+                    {
+                        prb_info.common.numApIndices = 1;
+                        prb_info.common.portMask = static_cast<uint64_t>(0x1ULL << port);
+                        prb_info.common.ap_index = port;
+                    }
+                    
+                    update_prb_sym_list(*sym_prbs, index, l, 1, channel_type::CSI_RS, OTHER_MODE);
+                    if (bf_enabled)
+                    {
+                        // Even in non-modcomp data compression, this function uses per-port
+                        // iteration (portMask = 1 port), so modcomp_enabled=true is required
+                        // to defer beam-sent marking until the last port.
+                        const bool modcomp_enabled = true;
+                        update_beam_list_csirs(prb_info.beams_array, prb_info.beams_array_size, pc_and_bf, prb_info, cell_idx, mmimo_enabled, modcomp_enabled);
+                    }
                 }
             }
         }
     }
 
    template <bool mplane_configured_ru_type, bool config_options_precoding_enabled, bool config_options_bf_enabled>
-    void update_fh_params_csirs_remap(cell_group_command* cell_grp_cmd, nv::slot_detail_t* slot_detail, csirs_fh_prepare_params &csirs_fh_params, bool &csirs_compact_mode)
+    void update_fh_params_csirs_remap(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail, const CsirsFhParamsView& csirs_fh_params, bool &csirs_compact_mode)
     {
-        cell_sub_command* cell_cmd     =  csirs_fh_params.cell_cmd;
-        uint32_t cell_idx              =  csirs_fh_params.cell_idx; 
-        int32_t cuphy_params_cell_idx  =  csirs_fh_params.cuphy_params_cell_idx;
-        bool bf_enabled                =  csirs_fh_params.bf_enabled;
-        uint16_t num_dl_prb            =  csirs_fh_params.num_dl_prb; 
-        bool mmimo_enabled             =  csirs_fh_params.mmimo_enabled;
+        uint32_t cell_idx              = csirs_fh_params.cell_idx();
+        int32_t cuphy_params_cell_idx  = csirs_fh_params.cuphy_params_cell_idx();
+        bool bf_enabled                = csirs_fh_params.bf_enabled();
+        uint16_t num_dl_prb            = csirs_fh_params.num_dl_prb();
+        bool mmimo_enabled             = csirs_fh_params.mmimo_enabled();
 
-        csirs_params* params = cell_grp_cmd->csirs.get();
-        pdsch_params* pdsch_info = cell_grp_cmd->get_pdsch_params();
         uint32_t num_params = 0;
         uint32_t csirs_params_offset =  0;
         csirs_lookup_api::CsirsLookup& lookup = csirs_lookup_api::CsirsLookup::getInstance();
-        cuphyCsirsRrcDynPrm_t *csi_rs_params = NULL;
+        const cuphyCsirsRrcDynPrm_t *csi_rs_params = NULL;
         ru_type ru;
         aerial_fh::UserDataCompressionMethod dl_comp_method = aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT;
         uint8_t num_eaxcids = 0;
@@ -2625,107 +2729,116 @@ namespace scf_5g_fapi {
             ru = OTHER_MODE;
         }
 
+        // Optimization: Cache cell index list reference for loop
         uint32_t cell_info_idx = 0;
-
-        while(cell_info_idx < params->cell_index_list.size() && params->cell_index_list[cell_info_idx] != cell_idx)
+        const auto& cell_idx_list = fh_context.csirs_cell_index_list();
+        const size_t cell_list_size = cell_idx_list.size();
+        
+        while(cell_info_idx < cell_list_size && cell_idx_list[cell_info_idx] != cell_idx)
             ++cell_info_idx;
 
 
         if(cuphy_params_cell_idx != -1)
         {
-            csi_rs_params = pdsch_info->cell_grp_info.pCsiRsPrms;
-            num_params = pdsch_info->cell_grp_info.pCellPrms[cuphy_params_cell_idx].nCsiRsPrms;
-            csirs_params_offset =  pdsch_info->cell_dyn_info[cuphy_params_cell_idx].csiRsPrmsOffset;
+            csi_rs_params = fh_context.pdsch_csirs_rrc_dyn_params();
+            num_params = fh_context.pdsch_cell_num_csirs_params(cuphy_params_cell_idx);
+            csirs_params_offset = fh_context.pdsch_cell_csirs_params_offset(cuphy_params_cell_idx);
             NVLOGD_FMT(TAG, "{}:Looking for CSI-RS RrcDynPrms in PDSCH - cell-idx={} cell_dyn_indx={} num CSI-RS params={} CSI-RS offset={}",
                 __func__,cell_idx,cuphy_params_cell_idx,num_params,csirs_params_offset);
         }
         else
         {
-            csi_rs_params = params->csirsDynPrms.pRrcDynPrm;
-            num_params = params->cellInfo[cell_info_idx].nRrcParams;
-            csirs_params_offset = params->cellInfo[cell_info_idx].rrcParamsOffset;
+            csi_rs_params = fh_context.csirs_rrc_dyn_params();
+            num_params = fh_context.csirs_cell_num_rrc_params(cell_info_idx);
+            csirs_params_offset = fh_context.csirs_cell_rrc_params_offset(cell_info_idx);
             NVLOGD_FMT(TAG, "{}:Looking for CSI-RS RrcDynPrms in CSI-RS cell-idx={} num CSI-RS params={} CSI-RS offset={}",__func__,cell_idx,num_params,csirs_params_offset);
         }
 
-        auto pm_grp = cell_grp_cmd->get_pm_group();
-        auto sym_prbs{cell_cmd->sym_prb_info()};
+        auto pm_grp = fh_context.pm_group_ptr();
+        auto* csirs_remap_row = fh_context.csirs_remap_row(cell_idx);
+        auto& csirs_symbol_map_ref = fh_context.csirs_symbol_map_ref(cell_idx);
+        auto sym_prbs{csirs_fh_params.sym_prb_info()};
         auto& prbs{sym_prbs->prbs};
         //pc_and_bf_idx gets incremented only when csirs type is not ZP_CSI_RS
-        int pc_and_bf_idx = params->cellInfo[cell_info_idx].rrcParamsOffset;
+        int pc_and_bf_idx = fh_context.csirs_cell_rrc_params_offset(cell_info_idx);
         switch (ru) {
             case SINGLE_SECT_MODE:
-                csirs_all_sym_ru_handler(cell_cmd, slot_detail, num_dl_prb);
+                csirs_all_sym_ru_handler(sym_prbs, slot_detail, num_dl_prb);
             break;
             case MULTI_SECT_MODE:
             case OTHER_MODE:
             default: {
+                    // Optimization: Pre-compute BW scaler for 32-port CSI-RS (common case)
+                    const float bw_scaler_cached = getBwScaler(num_dl_prb);
+                    
+                    // Hoist loop-invariant values for 32-port optimization
+                    const bool is_multi_sect = (ru == MULTI_SECT_MODE);
+                    const bool use_bfp_helper = (dl_comp_method == comp_method::NO_COMPRESSION) ||
+                        (dl_comp_method == comp_method::BLOCK_FLOATING_POINT);
+                    const bool use_modcomp_helper = (dl_comp_method == comp_method::MODULATION_COMPRESSION);
+                    
                     for(int j = 0; j < num_params; j++)
                     {
-                        uint16_t csirs_idx = csirs_params_offset + j;
+                        const uint16_t csirs_idx = csirs_params_offset + j;
                         NVLOGD_FMT(TAG, "CSI-RS parameter {} of {} , offset {}, csirs_idx {}", j, num_params, csirs_params_offset, csirs_idx);
 
-                        if(csi_rs_params[csirs_idx].row > CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH)
+                        // Optimization: Cache CSI-RS parameter access to reduce pointer indirection
+                        const auto& csirs_param = csi_rs_params[csirs_idx];
+                        
+                        if(csirs_param.row > CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH)
                         {
-                            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "row {}  > CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH", csi_rs_params[csirs_idx].row);
+                            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "row {}  > CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH", csirs_param.row);
                             return;
                         }
                         const csirs_lookup_api::CsirsPortData *csirs_port_data = nullptr;
 
-                        if(false == lookup.getPortInfo(csi_rs_params[csirs_idx].row, csi_rs_params[csirs_idx].freqDomain, csi_rs_params[csirs_idx].symbL0, csi_rs_params[csirs_idx].symbL1, csirs_port_data))
+                        if(false == lookup.getPortInfo(csirs_param.row, csirs_param.freqDomain, csirs_param.symbL0, csirs_param.symbL1, csirs_port_data))
                         {
-                            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} getPortInfo failed for row={} freqDomain={} symbL0={} symbL1={}", __func__, csi_rs_params[csirs_idx].row, csi_rs_params[csirs_idx].freqDomain, csi_rs_params[csirs_idx].symbL0, csi_rs_params[csirs_idx].symbL1);
+                            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} getPortInfo failed for row={} freqDomain={} symbL0={} symbL1={}", __func__, csirs_param.row, csirs_param.freqDomain, csirs_param.symbL0, csirs_param.symbL1);
                             return;
                         }
                         
-                        uint8_t genEvenRb = (csi_rs_params[csirs_idx].freqDensity == 0) ? 1 : 0;
-                        // float rho_vals[4] = {0.5f, 0.5f, 1, 3};
-                        float rho = CsirsFhMetaData::rho_vals[csi_rs_params[csirs_idx].freqDensity & 0x3];
-                        uint8_t num_ports = csirs_port_data->num_ports;
-                        uint16_t nRB = csi_rs_params[csirs_idx].nRb;
+                        const uint8_t num_ports = csirs_port_data->num_ports;
+                        uint16_t nRB = csirs_param.nRb;
                         num_eaxcids = num_eaxcids == 0? num_ports : num_eaxcids;
-                        uint16_t startRb = csi_rs_params[csirs_idx].startRb;
+                        uint16_t startRb = csirs_param.startRb;
                         
-
                         // Adjust startRb/nRB if generating odd RBs but startRb is even, or generating even RBs but startRb is odd.
-                        uint8_t rbInc = 1;
-                        if (((csi_rs_params[csirs_idx].freqDensity == 1) && ((startRb & 0x1) == 0)) ||
-                            ((csi_rs_params[csirs_idx].freqDensity == 0) && ((startRb & 0x1) == 1)))
+                        // Optimization: Hoist frequency density check for better branch prediction
+                        const uint8_t freq_density = csirs_param.freqDensity;
+                        const bool startRb_is_odd = (startRb & 0x1);
+                        uint8_t rbInc = (freq_density < 2) ? 2 : 1;
+                        
+                        if (((freq_density == 1) && !startRb_is_odd) ||
+                            ((freq_density == 0) && startRb_is_odd))
                         {
                             startRb += 1;
                             nRB -= 1;
                         }
-
-                        if(csi_rs_params[csirs_idx].freqDensity < 2)
-                            rbInc = 2;
                         // Separate KBar and LBar loops.
                         // Note: this only works due to the structure of 38.211 Table 7.4.1.5.3-1.
-                        // uint16_t reMask = 0;
-                        if((num_ports > num_eaxcids) && (ru == MULTI_SECT_MODE))
+                        auto& csirs_pc_and_bf = fh_context.csirs_pc_and_bf(pc_and_bf_idx);
+                        if((num_ports > num_eaxcids) && is_multi_sect)
                         {
                             csirs_compact_mode = true;
-                            csirs_mod_compress_fh_helper(params, csi_rs_params, pm_grp, cell_idx, csirs_idx, sym_prbs,
-                                    config_options_precoding_enabled, config_options_bf_enabled, bf_enabled, pc_and_bf_idx,
-                                    csirs_port_data, num_dl_prb, startRb, nRB, rbInc, mmimo_enabled, dl_comp_method, num_eaxcids);
+                            csirs_mod_compress_fh_helper<config_options_bf_enabled>(csirs_remap_row, csirs_symbol_map_ref, csirs_pc_and_bf, csirs_param, cell_idx, sym_prbs,
+                                    bf_enabled,
+                                    csirs_port_data, num_dl_prb, startRb, nRB, rbInc, mmimo_enabled, dl_comp_method, bw_scaler_cached);
                         }
                         else
                         {
-                            switch (dl_comp_method) {
-                                case comp_method::NO_COMPRESSION:
-                                case comp_method::BLOCK_FLOATING_POINT:
-                                    csirs_bfp_compress_fh_helper(params, csi_rs_params, pm_grp, cell_idx, csirs_idx, sym_prbs,
-                                        config_options_precoding_enabled, config_options_bf_enabled, bf_enabled, pc_and_bf_idx, 
-                                        csirs_port_data, num_dl_prb, startRb, nRB, rbInc,  mmimo_enabled);
-                                break;
-                                case comp_method::MODULATION_COMPRESSION: {
-                                        csirs_mod_compress_fh_helper(params, csi_rs_params, pm_grp, cell_idx, csirs_idx, sym_prbs,
-                                        config_options_precoding_enabled, config_options_bf_enabled, bf_enabled, pc_and_bf_idx,
-                                        csirs_port_data, num_dl_prb, startRb, nRB, rbInc, mmimo_enabled,dl_comp_method, num_eaxcids);
-                                }
-                                default:
-                                    break;
+                            if (use_bfp_helper) {
+                                csirs_bfp_compress_fh_helper(csirs_remap_row, csirs_symbol_map_ref, csirs_pc_and_bf, csirs_param, pm_grp, cell_idx, sym_prbs,
+                                    config_options_precoding_enabled, config_options_bf_enabled, bf_enabled, 
+                                    csirs_port_data, num_dl_prb, startRb, nRB, rbInc,  mmimo_enabled);
+                            } else if (use_modcomp_helper) {
+                                csirs_mod_compress_fh_helper<config_options_bf_enabled>(csirs_remap_row, csirs_symbol_map_ref, csirs_pc_and_bf, csirs_param, cell_idx, sym_prbs,
+                                    bf_enabled,
+                                    csirs_port_data, num_dl_prb, startRb, nRB, rbInc, mmimo_enabled,dl_comp_method, bw_scaler_cached);
                             }
                         }
-                        if(csi_rs_params[csirs_idx].csiType != cuphyCsiType_t::ZP_CSI_RS)
+                        // Increment only for non-ZP CSI-RS (use cached parameter)
+                        if(likely(csirs_param.csiType != cuphyCsiType_t::ZP_CSI_RS))
                         {
                             pc_and_bf_idx++;
                         }
@@ -2735,40 +2848,67 @@ namespace scf_5g_fapi {
         }
     }
 
+    /**
+     * @brief Append a beam ID to the CSI-RS beam list and update static BFW weights.
+     *
+     * @param[in,out] array       Beam ID array to append to.
+     * @param[in,out] array_size  Current size of the array; incremented on return.
+     * @param[in]     pmi_bf_pdu  Precoding / beamforming PDU.
+     * @param[in,out] prb_info    PRB info to update with BFW metadata.
+     * @param[in]     beam_id     Beam identifier to store and look up.
+     * @param[in]     cell_idx    Cell index.
+     */
     inline void add_beam_id_csirs(beamid_array_t& array, size_t& array_size, tx_precoding_beamforming_t& pmi_bf_pdu, prb_info_t& prb_info, uint16_t beam_id, int32_t cell_idx) {
-        array[array_size++] = beam_id;
-        update_static_bf_wt_csi_rs(cell_idx, pmi_bf_pdu, prb_info, beam_id);
+        array[array_size] = beam_id;
+        ++array_size;
+        update_static_bf_wt_csi_rs(cell_idx, pmi_bf_pdu, prb_info, beam_id, false);
     }
 
-    void update_beam_list_csirs(beamid_array_t& array, size_t& array_size, tx_precoding_beamforming_t& pmi_bf_pdu, prb_info_t& prb_info, int32_t cell_idx, bool mmimo_enabled) {
+    void update_beam_list_csirs(beamid_array_t& array, size_t& array_size, tx_precoding_beamforming_t& pmi_bf_pdu, prb_info_t& prb_info, int32_t cell_idx, bool mmimo_enabled, bool modcomp_enabled) {
         //NVLOGI_FMT(TAG, "{} TX BeamForming PDU num_prgs = {} dig_bf_interfaces ={}", __FUNCTION__, pmi_bf_pdu.num_prgs, pmi_bf_pdu.dig_bf_interfaces);
-        if(mmimo_enabled)
+        
+        // Optimization: Hoist invariants and branch once (mmimo_enabled is constant per call)
+        const uint32_t num_prgs = static_cast<uint32_t>(pmi_bf_pdu.num_prgs);
+        const uint32_t dig_bf_interfaces = static_cast<uint32_t>(pmi_bf_pdu.dig_bf_interfaces);
+        if (unlikely((num_prgs == 0U) || (dig_bf_interfaces == 0U)))
         {
-            for (uint i = 0; i < pmi_bf_pdu.num_prgs*(pmi_bf_pdu.dig_bf_interfaces+1);)
-            {
-                uint16_t pmi = pmi_bf_pdu.pm_idx_and_beam_idx[i++];
-                //NVLOGI_FMT(TAG, "{} pmi= {}", __FUNCTION__, pmi);
-                for (int j = 0; j < pmi_bf_pdu.dig_bf_interfaces; j++) {
-                    uint16_t beam_id = pmi_bf_pdu.pm_idx_and_beam_idx[i++];
-                    //NVLOGD_FMT(TAG, "beam-id = {}", beam_id);
-                    array[array_size++] = beam_id;
-                    update_static_bf_wt_csi_rs(cell_idx, pmi_bf_pdu, prb_info, beam_id);
+            return;
+        }
+        uint32_t idx = 0U;
+
+        if (mmimo_enabled) {
+            nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+            const bool static_bfw_configured = phyDriver.l1_staticBFWConfigured(cell_idx);
+            const bool sendOncePerBeam = !phyDriver.l1_get_send_static_bfw_wt_all_cplane();
+            if (likely(static_bfw_configured)) {
+                for (uint32_t prg = 0U; prg < num_prgs; ++prg) {
+                    ++idx; // Skip PMI entry
+                    for (uint32_t j = 0U; j < dig_bf_interfaces; ++j) {
+                        const uint16_t beam_id = pmi_bf_pdu.pm_idx_and_beam_idx[idx++];
+                        array[array_size] = beam_id;
+                        ++array_size;
+                        update_static_bf_wt_csi_rs_impl(cell_idx, pmi_bf_pdu, prb_info, beam_id, modcomp_enabled, phyDriver, static_bfw_configured, sendOncePerBeam);
+                    }
+                }
+            } else {
+                for (uint32_t prg = 0U; prg < num_prgs; ++prg) {
+                    ++idx; // Skip PMI entry
+                    for (uint32_t j = 0U; j < dig_bf_interfaces; ++j) {
+                        array[array_size] = pmi_bf_pdu.pm_idx_and_beam_idx[idx++];
+                        ++array_size;
+                    }
+                }
+            }
+        } else {
+            for (uint32_t prg = 0U; prg < num_prgs; ++prg) {
+                ++idx; // Skip PMI entry
+                for (uint32_t j = 0U; j < dig_bf_interfaces; ++j) {
+                    array[array_size] = pmi_bf_pdu.pm_idx_and_beam_idx[idx++];
+                    ++array_size;
                 }
             }
         }
-        else
-        {
-            for (uint i = 0; i < pmi_bf_pdu.num_prgs*(pmi_bf_pdu.dig_bf_interfaces+1);)
-            {
-                uint16_t pmi = pmi_bf_pdu.pm_idx_and_beam_idx[i++];
-                //NVLOGI_FMT(TAG, "{} pmi= {}", __FUNCTION__, pmi);
-                for (int j = 0; j < pmi_bf_pdu.dig_bf_interfaces; j++) {
-                    uint16_t beam_id = pmi_bf_pdu.pm_idx_and_beam_idx[i++];
-                    //NVLOGD_FMT(TAG, "beam-id = {}", beam_id);
-                    array[array_size++] = beam_id;
-                }
-            }
-        }
+        
 #if 0
         NVLOGI_FMT(TAG, "{} TX BeamForming beam list size = {}", __FUNCTION__, array_size);
         for (std::size_t i = 0; i < array_size; i++) {
@@ -2889,8 +3029,8 @@ namespace scf_5g_fapi {
         }
     }
 
-    inline void update_new_csirs_pm(scf_fapi_csi_rsi_pdu_t& msg_csirs, cuphyCsirsRrcDynPrm_t& csirs_rrc_dyn_params,  pm_group* prec_group, const pm_weight_map_t& pm_map,  nv::phy_config_option& config_options, int32_t cell_index) {
-        auto& pdu = *reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(&msg_csirs.pc_and_bf);
+    inline void update_new_csirs_pm(const scf_fapi_csi_rsi_pdu_t& msg_csirs, cuphyCsirsRrcDynPrm_t& csirs_rrc_dyn_params,  pm_group* prec_group, const pm_weight_map_t& pm_map,  nv::phy_config_option& config_options, int32_t cell_index) {
+        const auto& pdu = *reinterpret_cast<const scf_fapi_tx_precoding_beamforming_t*>(&msg_csirs.pc_and_bf);
         csirs_rrc_dyn_params.enablePrcdBf = config_options.precoding_enabled;
 
         auto default_values = [&csirs_rrc_dyn_params]() {
@@ -2940,7 +3080,7 @@ namespace scf_5g_fapi {
         }
     }
 
-    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_cmd, scf_fapi_csi_rsi_pdu_t& msg, slot_indication & slotinfo, int32_t cell_index, cuphyCellStatPrm_t cell_params, 
+    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_cmd, const scf_fapi_csi_rsi_pdu_t& msg, slot_indication & slotinfo, int32_t cell_index, cuphyCellStatPrm_t cell_params,
                                 nv::phy_config_option& config_option, pm_weight_map_t& pm_map,uint32_t csirs_offset, bool pdsch_exist, uint16_t cell_stat_prm_idx, bool mmimo_enabled, nv::slot_detail_t*  slot_detail)
     {
 
@@ -3000,6 +3140,13 @@ namespace scf_5g_fapi {
 
         if(csi_type != cuphyCsiType_t::ZP_CSI_RS)
         {
+            if(!check_bf_pc_params(msg.pc_and_bf.num_prgs, msg.pc_and_bf.dig_bf_interfaces, mmimo_enabled))
+            {
+                NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: check_bf_pc_params failed: numPRGs={} digBFInterfaces={} mmimo_enabled={}",
+                    __FUNCTION__, __LINE__, static_cast<uint16_t>(msg.pc_and_bf.num_prgs), static_cast<uint16_t>(msg.pc_and_bf.dig_bf_interfaces), mmimo_enabled);
+                return;
+            }
+
             cell_grp_cmd->create_if(channel_type::CSI_RS);
             csirs_params* csirs_params = cell_grp_cmd->csirs.get();
             if (csirs_params == nullptr)
@@ -3068,7 +3215,6 @@ namespace scf_5g_fapi {
             pcBf->num_prgs = msg.pc_and_bf.num_prgs;
             pcBf->prg_size = msg.pc_and_bf.prg_size;
             pcBf->dig_bf_interfaces = msg.pc_and_bf.dig_bf_interfaces;
-            check_bf_pc_params(pcBf->num_prgs, pcBf->dig_bf_interfaces, mmimo_enabled);
             uint16_t bf_size = 0;
             bf_size = pcBf->num_prgs * (pcBf->dig_bf_interfaces+1);
             std::memcpy(&(pcBf->pm_idx_and_beam_idx[0]),msg.pc_and_bf.pm_idx_and_beam_idx,bf_size*sizeof(uint16_t));
@@ -3082,74 +3228,72 @@ namespace scf_5g_fapi {
 
 
     template <bool mplane_configured_ru_type, bool config_options_precoding_enabled, bool config_options_bf_enabled>
-    void fh_callback(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell_index)
+    void fh_callback(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail)
     {
         //TI_GENERIC_INIT("fh_callback",15);
         //TI_GENERIC_ADD("remap");
-        const bool is_csirs_cell = grp_cmd->fh_params.is_csirs_cell[cell_index];
-        const int num_pdsch_params = grp_cmd->fh_params.num_pdsch_fh_params[cell_index];
-        auto& csirs_fh_params = grp_cmd->fh_params.csirs_fh_params[cell_index];
+        const bool is_csirs_cell = fh_context.is_csirs_cell();
+        const int num_pdsch_params = fh_context.num_pdsch_fh_params();
+        auto csirs_fh_params = fh_context.csirs_fh_params_view();
 
         bool csirs_compact_mode = false;
         if (unlikely(is_csirs_cell)) {
             update_fh_params_csirs_remap<mplane_configured_ru_type,config_options_precoding_enabled,config_options_bf_enabled>(
-                grp_cmd, slot_detail, csirs_fh_params, csirs_compact_mode);
+                fh_context, slot_detail, csirs_fh_params, csirs_compact_mode);
         }
-
         //TI_GENERIC_ADD("pdsch_with_csirs");
-        //NVLOGC_FMT(TAG, "fh_callback: slot info: sfn={}, slot={}", grp_cmd->slot.slot_3gpp.sfn_, grp_cmd->slot.slot_3gpp.slot_);
-        auto csirs = grp_cmd->csirs.get();
-        if (csirs && num_pdsch_params > 0) {
-            uint32_t start_index = grp_cmd->fh_params.start_index_pdsch_fh_params[cell_index];
+        //NVLOGC_FMT(TAG, "fh_callback: slot info: sfn={}, slot={}", fh_context.fh_slot_indication().sfn_, fh_context.fh_slot_indication().slot_);
+        if (fh_context.has_csirs_params() && num_pdsch_params > 0) {
+            uint32_t start_index = fh_context.start_index_pdsch_fh_params();
             uint32_t end_index = start_index + num_pdsch_params;
             const auto& pm_map = nv::PHY_module::pm_map();
-            if (csirs->symbolMapArray[cell_index] == 0) {
+            if (fh_context.csirs_symbol_map() == 0) {
                 for (int i = start_index; i < end_index; ++i) {
-                    update_prc_fh_params_pdsch<mplane_configured_ru_type>(pm_map, grp_cmd->fh_params.pdsch_fh_params[i], slot_detail);
+                    update_prc_fh_params_pdsch<mplane_configured_ru_type>(pm_map, fh_context, fh_context.pdsch_fh_params_view(i), slot_detail);
                 }
             } else {
                 for (int i = start_index; i < end_index; ++i) {
-                    update_prc_fh_params_pdsch_with_csirs<mplane_configured_ru_type>(pm_map, grp_cmd->fh_params.pdsch_fh_params[i], slot_detail, csirs_compact_mode);
+                    update_prc_fh_params_pdsch_with_csirs<mplane_configured_ru_type>(pm_map, fh_context, fh_context.pdsch_fh_params_view(i), slot_detail, csirs_compact_mode);
                 }
             }
         }
         //TI_GENERIC_ADD("non-overlapping csirs");
         if (unlikely(is_csirs_cell)) {
-            if(get_comp_method(csirs_fh_params.cell_idx) == comp_method::MODULATION_COMPRESSION) {
-                update_non_overlapping_csirs<true>(*csirs_fh_params.cell_cmd);
+            if(get_comp_method(csirs_fh_params.cell_idx()) == comp_method::MODULATION_COMPRESSION) {
+                update_non_overlapping_csirs<true>(csirs_fh_params.sym_prb_info());
             } else {
-                update_non_overlapping_csirs<false>(*csirs_fh_params.cell_cmd);
+                update_non_overlapping_csirs<false>(csirs_fh_params.sym_prb_info());
             }
         }
         //TI_GENERIC_ADD("fh callback end");
         //TI_GENERIC_ALL_NVLOGW(TAG);
 #ifdef DEBUG_SYM_PRB_INFO_STRUCT
-        for(int i = 0; i < grp_cmd->fh_params.num_csirs_cells; ++i)
+        if (is_csirs_cell)
         {
-            print_sym_prb_info(grp_cmd->slot.slot_3gpp.sfn_, grp_cmd->slot.slot_3gpp.slot_, grp_cmd->fh_params.csirs_fh_params[i].cell_cmd->sym_prb_info(), i);
+            print_sym_prb_info(fh_context.slot_sfn(), fh_context.slot_slot(), fh_context.csirs_fh_params_view().sym_prb_info(), 0);
         }
 
-        if(grp_cmd->fh_params.num_csirs_cells == 0)
+        if(!is_csirs_cell)
         {
             slot_command_api::slot_info_* prev_cmd = nullptr;
-            for(int i = 0; i < grp_cmd->fh_params.num_pdsch_pdus; ++i)
+            for(int i = 0; i < fh_context.total_num_pdsch_pdus(); ++i)
             {
-                if(grp_cmd->fh_params.pdsch_fh_params[i].cell_cmd->sym_prb_info() != prev_cmd)
+                if(fh_context.pdsch_fh_params_view(i).sym_prb_info() != prev_cmd)
                 {
-                    print_sym_prb_info(grp_cmd->slot.slot_3gpp.sfn_, grp_cmd->slot.slot_3gpp.slot_, grp_cmd->fh_params.pdsch_fh_params[i].cell_cmd->sym_prb_info(), i);
+                    print_sym_prb_info(fh_context.slot_sfn(), fh_context.slot_slot(), fh_context.pdsch_fh_params_view(i).sym_prb_info(), i);
                 }
-                prev_cmd = grp_cmd->fh_params.pdsch_fh_params[i].cell_cmd->sym_prb_info();
+                prev_cmd = fh_context.pdsch_fh_params_view(i).sym_prb_info();
             }
         }
 #endif
     }
-    template void fh_callback<false,false,false>(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell);
-    template void fh_callback<false,false,true>(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell);
-    template void fh_callback<false,true,false>(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell);
-    template void fh_callback<false,true,true>(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell);
-    template void fh_callback<true,false,false>(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell);
-    template void fh_callback<true,false,true>(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell);
-    template void fh_callback<true,true,false>(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell);
-    template void fh_callback<true,true,true>(slot_command_api::cell_group_command* grp_cmd, nv::slot_detail_t* slot_detail, uint8_t cell);
+    template void fh_callback<false,false,false>(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
+    template void fh_callback<false,false,true>(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
+    template void fh_callback<false,true,false>(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
+    template void fh_callback<false,true,true>(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
+    template void fh_callback<true,false,false>(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
+    template void fh_callback<true,false,true>(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
+    template void fh_callback<true,true,false>(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
+    template void fh_callback<true,true,true>(IFhCallbackContext& fh_context, nv::slot_detail_t* slot_detail);
 
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,8 @@
 #pragma nv_diag_suppress 177 // warning #177-D: variable "wqe_id" was declared but never referenced
 #pragma nv_diag_suppress 550 // #550-D: variable "wqe_id_last" was set but never used
 #include <doca_gpunetio.h>
-#include <doca_gpunetio_dev_src_eth.cuh>
+#include <doca_gpunetio_dev_eth_rxq.cuh>
+#include <doca_gpunetio_dev_sem.cuh>
 #pragma nv_diag_default 177
 #pragma nv_diag_default 550
 
@@ -99,7 +100,7 @@ __global__ void _kernel_receive_persistent_(
     struct doca_gpu_eth_rxq* rxq_info_gpu_cell=*(rxq_info_gpu+cell_idx);
     while (DOCA_GPUNETIO_VOLATILE(*(exit_flag)) == 0) {
         if (threadIdx.x == 0) {
-            ret = doca_gpu_dev_eth_rxq_receive_thread(rxq_info_gpu_cell, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
+            ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_THREAD,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(rxq_info_gpu_cell,max_rx_pkts,timeout_ns,&rx_buf_idx,&rx_pkt_num,NULL);
             /* If any thread returns receive error, the whole execution stops */
             if (ret != DOCA_SUCCESS) {
                 printf("Exit from rx kernel block %d threadIdx %d ret %d\n",
@@ -162,8 +163,6 @@ __global__ void _kernel_receive_slot_(
     doca_error_t ret;
     struct doca_gpu_eth_rxq* doca_rxq_cell=*(doca_rxq+cell_idx);
     struct doca_gpu_semaphore_gpu* sem_gpu_cell=*(sem_gpu+cell_idx);
-    struct doca_gpu_buf *buf_ptr;
-    uintptr_t rx_pkt_addr;
     uint16_t ecpri_payload_length;
     uint8_t* section_buf;
     uint16_t num_prb = 0;
@@ -279,22 +278,19 @@ __global__ void _kernel_receive_slot_(
         if (threadIdx.x == 0)
         {
             current_time = __globaltimer();
-            if ((current_time - kernel_start) > 8000000)
+            if ((current_time - kernel_start) > 3000000)
             {
                 DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_TIMEOUT_NO_PKT;
                 printf("Exit from rx kernel block %d threadIdx %d rx timeout\n", blockIdx.x, threadIdx.x);
             }
-            ret = doca_gpu_dev_eth_rxq_receive_thread(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_pkt_num, &rx_buf_idx);
-            /* If any thread returns receive error, the whole execution stops */
-            if (ret != DOCA_SUCCESS)
-            {
-                printf("Exit from rx kernel block %d threadIdx %d ret %d\n", blockIdx.x, threadIdx.x, ret);
-                DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
-            }
+        }    
+        ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, nullptr);
+        /* If any thread returns receive error, the whole execution stops */
+        if (ret != DOCA_SUCCESS)
+        {
+            printf("Exit from rx kernel block %d threadIdx %d ret %d\n", blockIdx.x, threadIdx.x, ret);
+            DOCA_GPUNETIO_VOLATILE(*exit_cond_d_cell) = ORDER_KERNEL_EXIT_ERROR_LEGACY;
         }
-
-        __threadfence();
-        __syncthreads();
 
         if (DOCA_GPUNETIO_VOLATILE(rx_pkt_num) > 0)
         {
@@ -306,9 +302,7 @@ __global__ void _kernel_receive_slot_(
 
             for(uint32_t pkt_idx=threadIdx.x;pkt_idx<rx_pkt_num;pkt_idx+=blockDim.x)
             {
-                doca_gpu_dev_eth_rxq_get_buf(doca_rxq_cell, rx_buf_idx+pkt_idx, &buf_ptr);
-                doca_gpu_dev_buf_get_addr(buf_ptr, &rx_pkt_addr);
-                pkt_thread = (uint8_t*)rx_pkt_addr;
+                pkt_thread = (uint8_t*)doca_gpu_dev_eth_rxq_get_pkt_addr(doca_rxq_cell, rx_buf_idx + pkt_idx);
                 section_buf = oran_umsg_get_first_section_buf(pkt_thread);
                 ecpri_payload_length = min(oran_umsg_get_ecpri_payload(pkt_thread),ORAN_ECPRI_MAX_PAYLOAD_LEN);
                 // Network endianness to CPU endianness
@@ -317,7 +311,13 @@ __global__ void _kernel_receive_slot_(
                 pkt_subframe_id = oran_umsg_get_subframe_id(pkt_thread);
                 pkt_slot_id     = oran_umsg_get_slot_id(pkt_thread);
                 pkt_sym_id      = oran_umsg_get_symbol_id(pkt_thread);
-                doca_gpu_dev_eth_rxq_get_buf_timestamp(doca_rxq_cell, rx_buf_idx+pkt_idx, &rx_timestamp);
+                // Validate symbol ID to prevent buffer overrun
+                if (unlikely(pkt_sym_id >= ORAN_ALL_SYMBOLS))
+                {
+                    printf("pkt_sym_id %d out of bounds, max %d\n", pkt_sym_id, ORAN_ALL_SYMBOLS - 1);
+                    continue;
+                }
+                rx_timestamp=doca_gpu_dev_eth_rxq_get_pkt_ts(doca_rxq_cell, rx_buf_idx + pkt_idx);
                 if(pkt_frame_id == frame_id && pkt_subframe_id == subframe_id && pkt_slot_id == slot_id)
                 {
                     uint16_t section_buf_size = 0;
@@ -334,7 +334,7 @@ __global__ void _kernel_receive_slot_(
                         atomicAdd(&num_prb_rx,num_prb);
                         pkt_num_prb += num_prb;
                         __threadfence_block();
-                        section_buf_size = compressed_prb_size * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
+                        section_buf_size = static_cast<uint32_t>(compressed_prb_size) * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
                         current_length += section_buf_size;
                         section_buf += section_buf_size;
                         ++num_sections;
@@ -379,7 +379,7 @@ __global__ void _kernel_receive_slot_(
                         atomicAdd(&next_slot_num_prb_rx,num_prb);
                         pkt_num_prb += num_prb;
                         __threadfence_block();
-                        section_buf_size = compressed_prb_size * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
+                        section_buf_size = static_cast<uint32_t>(compressed_prb_size) * num_prb + ORAN_IQ_UNCOMPRESSED_SECTION_OVERHEAD;
                         current_length += section_buf_size;
                         section_buf += section_buf_size;
                         ++num_sections;
@@ -486,7 +486,7 @@ doca_error_t kernel_receive_slot(cudaStream_t stream, orderKernelConfigParams_t*
 {
     cudaError_t result = cudaSuccess;
     int cuda_blocks = params->num_cells;
-    _kernel_receive_slot_<<<cuda_blocks, 128, 0, stream>>>(
+    _kernel_receive_slot_<<<cuda_blocks, 320, 0, stream>>>(
         params->rxq_info_gpu,
         params->sem_gpu,
         params->exit_flag_d,
