@@ -47,7 +47,7 @@ switch compTvMode
 end
 
 selected_TC = [7201:7999];
-disabled_TC = [7226, 7339, 7348, 7349, 7356, 7374, 7440, 7433:7443, 7599:7600, 7623:7624, 7903, 7904];
+disabled_TC = [7226, 7339, 7349, 7356, 7374, 7440, 7433:7443, 7599:7600, 7623:7624, 7903, 7904];
 [~,TcIdx] = ismember(disabled_TC, selected_TC);
 selected_TC(TcIdx) = [];
 
@@ -3722,7 +3722,7 @@ parfor n = 1:NallTest
 
         testPass = 1;
         % bypass compliance test for HARQ and Precoding
-        if ismember(caseNum, [7251:7257, 7324:7326, 7910, 7354:7357, 7710:7711, 7713, 7895, 7897, 7898, 7899]) % 7710:7711 are invalid TV based on Cfgs from 7324
+        if ismember(caseNum, [7225, 7251:7257, 7264, 7267, 7270, 7320, 7324:7326, 7910, 7354:7357, 7710:7711, 7713, 7895, 7897, 7898, 7899]) % 7710:7711 are invalid TV based on Cfgs from 7324
             bypassCompTest = 1;
         else
             bypassCompTest = 0;

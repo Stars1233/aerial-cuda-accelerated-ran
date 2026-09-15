@@ -331,6 +331,62 @@ int RU_Emulator::start()
             srs_cell_cpu_assignment = get_cell_cpu_assignment(opt_num_cells, num_core_srs, opt_enable_mmimo, true, opt_min_ul_cores_per_cell_mmimo);
         }
 
+        // Determine which cells have multiple worker threads and therefore
+        // require mutex protection for per-eAxC PRB tracker access.
+        // Both UL and SRS threads run cplane_core() and access the same
+        // tracker arrays, so the combined thread count must be checked.
+        prb_tracker_needs_lock_.fill(false);
+        if (opt_prb_dup_check == RE_ENABLED)
+        {
+            ul_prb_trackers_ = std::make_unique<UlPrbTrackerArray>();
+            ul_eaxc_to_tracker_idx_ = std::make_unique<UlEaxcLookupArray>();
+
+            std::array<int, MAX_CELLS_PER_SLOT> ul_threads_per_cell{};
+            for (int i = 0; i < num_core_ul; ++i)
+            {
+                int start = ul_cell_cpu_assignment[i].start_cell_index;
+                int ncells = ul_cell_cpu_assignment[i].num_cells_per_core;
+                for (int c = start; c < start + ncells && c < opt_num_cells; ++c)
+                    ++ul_threads_per_cell[c];
+            }
+            std::array<int, MAX_CELLS_PER_SLOT> srs_threads_per_cell{};
+            for (int i = 0; i < num_core_srs; ++i)
+            {
+                int start = srs_cell_cpu_assignment[i].start_cell_index;
+                int ncells = srs_cell_cpu_assignment[i].num_cells_per_core;
+                for (int c = start; c < start + ncells && c < opt_num_cells; ++c)
+                    ++srs_threads_per_cell[c];
+            }
+            for (int c = 0; c < opt_num_cells; ++c)
+            {
+                prb_tracker_needs_lock_[c] = ((ul_threads_per_cell[c] + srs_threads_per_cell[c]) > 1);
+                if (prb_tracker_needs_lock_[c])
+                    re_cons("PRB tracker: cell {} has {} UL + {} SRS worker threads — will use mutex",
+                            c, ul_threads_per_cell[c], srs_threads_per_cell[c]);
+            }
+
+            for (int c = 0; c < opt_num_cells; ++c)
+            {
+                auto& map = (*ul_eaxc_to_tracker_idx_)[c];
+                uint16_t idx = 0;
+                for (auto eAxC : cell_configs[c].eAxC_UL)
+                    if (map.find(eAxC) == map.end()) map[static_cast<uint16_t>(eAxC)] = idx++;
+                for (auto eAxC : cell_configs[c].eAxC_PRACH_list)
+                    if (map.find(eAxC) == map.end()) map[static_cast<uint16_t>(eAxC)] = idx++;
+                for (auto eAxC : cell_configs[c].eAxC_SRS_list)
+                    if (map.find(eAxC) == map.end()) map[static_cast<uint16_t>(eAxC)] = idx++;
+                if (idx > MAX_UL_EAXC_UNIFIED)
+                    re_warn("Cell {} has {} unique UL eAxC IDs, exceeds MAX_UL_EAXC_UNIFIED ({})",
+                            c, idx, MAX_UL_EAXC_UNIFIED);
+                else
+                    re_cons("PRB tracker: cell {} mapped {} unique UL eAxC IDs (UL:{} PRACH:{} SRS:{})",
+                            c, idx,
+                            cell_configs[c].eAxC_UL.size(),
+                            cell_configs[c].eAxC_PRACH_list.size(),
+                            cell_configs[c].eAxC_SRS_list.size());
+            }
+        }
+
         for(int i = 0; i < num_core_srs; ++i)
         {
             const int thread_index = num_core_ul + i;
@@ -708,6 +764,15 @@ int RU_Emulator::finalize_dlc_tb()
         buffer_index = snprintf(buffer, MAX_PRINT_LOG_LENGTH, "| UL BeamID Err Mismatch ");
         generate_results_string(buffer, beamid_ul_error_counters);
         print_divider(opt_num_cells);
+    }
+
+    if (opt_dlc_tb)
+    {
+        for (int i = 0; i < opt_num_cells; ++i)
+        {
+            const std::lock_guard lk(distinct_prach_slots_mtx[i]);
+            distinct_prach_slots_seen[i].clear();
+        }
     }
 
     return RE_OK;
@@ -1107,6 +1172,12 @@ void RU_Emulator::reset_cell_counters(uint16_t cell_index)
         oran_packet_counters.ul_c_plane[cell_index].ontime_slot.store(0);
         oran_packet_counters.ul_c_plane[cell_index].early_slot.store(0);
         oran_packet_counters.ul_c_plane[cell_index].late_slot.store(0);
+    }
+
+    if (opt_dlc_tb)
+    {
+        const std::lock_guard lk(distinct_prach_slots_mtx[cell_index]);
+        distinct_prach_slots_seen[cell_index].clear();
     }
 }
 

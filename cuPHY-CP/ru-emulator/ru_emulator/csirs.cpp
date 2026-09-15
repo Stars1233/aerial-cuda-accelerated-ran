@@ -455,7 +455,11 @@ int RU_Emulator::validate_csirs(uint8_t cell_index, const struct oran_packet_hea
             ++tv_object->throughput_slot_counters[cell_index];
             ++tv_object->good_slot_counters[cell_index];
         }
-        ++tv_object->total_slot_counters[cell_index];
+        // Test-bench mode: only count an error-free slot as completed.
+        if (!opt_dlc_tb || !tv_object->invalid_flag[cell_index][launch_pattern_slot])
+        {
+            ++tv_object->total_slot_counters[cell_index];
+        }
         tv_object->invalid_flag[cell_index][launch_pattern_slot] = false;
         return 1;
     }

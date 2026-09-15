@@ -20,6 +20,8 @@
 #include "shm_logger.h"
 #include "perf_metrics/perf_metrics_accumulator.hpp"
 #include "utils.hpp"
+#include <atomic>
+#include <array>
 // #define RU_EM_UL_TIMERS_ENABLE 1
 
 #define HALFBW (-(100 * 1000)/2)
@@ -89,6 +91,183 @@ static void validate_beamids(const std::vector<uint16_t>& expected_beam_ids,
             }
         }
     }
+}
+
+// Paired PDSCH/CSI-RS reMask validation is order-independent. These helpers
+// bucket mismatch diagnostics and track each section/PRB pair so subset masks,
+// duplicate same-side masks, and missing counterparts are handled consistently.
+enum class RemaskChannel : std::size_t
+{
+    Pdsch = 0,
+    CsiRs,
+    Count,
+};
+
+enum class RemaskMismatchField : std::size_t
+{
+    SectionId = 0,
+    ExpectedMask,
+    WireMask,
+    Count,
+};
+
+static constexpr std::size_t REMASK_CHANNEL_BUCKET_COUNT = static_cast<std::size_t>(RemaskChannel::Count);
+static constexpr std::size_t REMASK_MISMATCH_FIELD_COUNT = static_cast<std::size_t>(RemaskMismatchField::Count);
+
+struct RemaskPairState final
+{
+    uint16_t section_id{};
+    uint16_t start_prb{};
+    uint16_t num_prb{};
+    uint16_t pdsch_seen{};
+    uint16_t csirs_seen{};
+    int first_sec_idx{-1};
+    bool used{false};
+};
+
+using RemaskMismatchRecord = std::array<uint16_t, REMASK_MISMATCH_FIELD_COUNT>;
+using RemaskMismatchLog =
+    std::array<std::array<RemaskMismatchRecord, MAX_NUM_SECTIONS_PER_C_PLANE>, REMASK_CHANNEL_BUCKET_COUNT>;
+using RemaskPairStates = std::array<RemaskPairState, MAX_NUM_SECTIONS_PER_C_PLANE>;
+
+static constexpr std::size_t remask_channel_index(RemaskChannel channel)
+{
+    return static_cast<std::size_t>(channel);
+}
+
+static constexpr std::size_t remask_mismatch_field_index(RemaskMismatchField field)
+{
+    return static_cast<std::size_t>(field);
+}
+
+static inline void record_remask_mismatch(
+    oran_c_plane_info_t& c_plane_info,
+    RemaskMismatchLog& invalid_sections,
+    RemaskChannel channel,
+    uint32_t& count,
+    int sec_idx,
+    uint16_t expected,
+    uint16_t wire)
+{
+    const uint32_t slot = count++;
+    if (slot < MAX_NUM_SECTIONS_PER_C_PLANE)
+    {
+        auto& record = invalid_sections[remask_channel_index(channel)][slot];
+        record[remask_mismatch_field_index(RemaskMismatchField::SectionId)] =
+            c_plane_info.section_infos[sec_idx].section_id;
+        record[remask_mismatch_field_index(RemaskMismatchField::ExpectedMask)] = expected;
+        record[remask_mismatch_field_index(RemaskMismatchField::WireMask)] = wire;
+    }
+
+    c_plane_info.section_infos[sec_idx].error_status = -1;
+}
+
+static inline bool remask_pair_matches(const RemaskPairState& pair,
+                                       uint16_t section_id,
+                                       uint16_t start_prb,
+                                       uint16_t num_prb)
+{
+    return pair.used &&
+           pair.section_id == section_id &&
+           pair.start_prb == start_prb &&
+           pair.num_prb == num_prb;
+}
+
+static inline void update_remask_pair_side(
+    oran_c_plane_info_t& c_plane_info,
+    RemaskMismatchLog& invalid_sections,
+    RemaskPairState& pair,
+    bool pdsch_remask_valid,
+    uint32_t& pdsch_remask_mismatch,
+    uint32_t& csirs_remask_mismatch,
+    int sec_idx,
+    uint16_t expected_pdsch_remask,
+    uint16_t expected_csirs_remask,
+    uint16_t wire_remask)
+{
+    auto& seen_mask = pdsch_remask_valid ? pair.pdsch_seen : pair.csirs_seen;
+    auto& mismatch_count = pdsch_remask_valid ? pdsch_remask_mismatch : csirs_remask_mismatch;
+    const auto channel = pdsch_remask_valid ? RemaskChannel::Pdsch : RemaskChannel::CsiRs;
+    const uint16_t expected_remask = pdsch_remask_valid ? expected_pdsch_remask : expected_csirs_remask;
+
+    if (seen_mask & wire_remask)
+    {
+        record_remask_mismatch(
+            c_plane_info,
+            invalid_sections,
+            channel,
+            mismatch_count,
+            sec_idx,
+            expected_remask,
+            wire_remask);
+    }
+    seen_mask |= wire_remask;
+}
+
+static inline void record_invalid_paired_remask(
+    oran_c_plane_info_t& c_plane_info,
+    RemaskMismatchLog& invalid_sections,
+    bool pdsch_section,
+    bool csirs_section,
+    uint32_t& pdsch_remask_mismatch,
+    uint32_t& csirs_remask_mismatch,
+    int sec_idx,
+    uint16_t expected_pdsch_remask,
+    uint16_t expected_csirs_remask,
+    uint16_t wire_remask)
+{
+    if (!csirs_section && !pdsch_section)
+    {
+        return;
+    }
+
+    const bool use_csirs_bucket = csirs_section;
+    const auto channel = use_csirs_bucket ? RemaskChannel::CsiRs : RemaskChannel::Pdsch;
+    auto& mismatch_count = use_csirs_bucket ? csirs_remask_mismatch : pdsch_remask_mismatch;
+    const uint16_t expected_remask = use_csirs_bucket ? expected_csirs_remask : expected_pdsch_remask;
+
+    record_remask_mismatch(
+        c_plane_info,
+        invalid_sections,
+        channel,
+        mismatch_count,
+        sec_idx,
+        expected_remask,
+        wire_remask);
+}
+
+static inline RemaskPairState& find_or_add_remask_pair(
+    RemaskPairStates& pairs,
+    uint32_t& pair_count,
+    int& last_pair_idx,
+    uint16_t section_id,
+    uint16_t start_prb,
+    uint16_t num_prb,
+    int sec_idx)
+{
+    if (last_pair_idx >= 0 &&
+        remask_pair_matches(pairs[last_pair_idx], section_id, start_prb, num_prb))
+    {
+        return pairs[last_pair_idx];
+    }
+
+    for (uint32_t i = 0; i < pair_count; ++i)
+    {
+        if (remask_pair_matches(pairs[i], section_id, start_prb, num_prb))
+        {
+            last_pair_idx = static_cast<int>(i);
+            return pairs[i];
+        }
+    }
+
+    RemaskPairState& pair = pairs[pair_count++];
+    pair.used = true;
+    pair.section_id = section_id;
+    pair.start_prb = start_prb;
+    pair.num_prb = num_prb;
+    pair.first_sec_idx = sec_idx;
+    last_pair_idx = static_cast<int>(pair_count - 1);
+    return pair;
 }
 #define TAG_UL_LATE_TX (NVLOG_TAG_BASE_RU_EMULATOR + 8) // "RU.UL_LATE_TX"
 #define TAG_CP_WORKER_TRACING (NVLOG_TAG_BASE_RU_EMULATOR + 9) // "RU.CP_WORKER_TRACING"
@@ -167,6 +346,48 @@ inline void generate_pcap_file(uint8_t cell_id, aerial_fh::MsgReceiveInfo* info,
 }
 
 
+// Ensure prb_rx_counters is zeroed for cur_frame before any concurrent fetch_add.
+// Winner: TRANSITIONING → store(0, release) → publish cur_frame (release).
+// Others: spin while TRANSITIONING, then acquire-load of cur_frame sees the zero.
+// Advance only on unset→first or modular forward steps < half the 8-bit frame space so a
+// late old-frame packet cannot zero an in-flight counter (that delayed UL TX / ulutx_*).
+// RU restart re-inits slots to PRB_RX_FRAME_UNSET, so the first post-restart frame always
+// advances without needing a long-gap half-space exception.
+static void sync_prb_rx_counter_frame(std::atomic<uint16_t>& frame_slot,
+                                      std::atomic<uint32_t>& counter,
+                                      const uint16_t cur_frame)
+{
+    static constexpr uint8_t MAX_FORWARD_FRAME_DELTA = 128;
+    for (;;)
+    {
+        auto prev_frame = frame_slot.load(std::memory_order_acquire);
+        if (prev_frame == cur_frame)
+        {
+            return;
+        }
+        if (prev_frame == PRB_RX_FRAME_TRANSITIONING)
+        {
+            continue;
+        }
+        if (prev_frame != PRB_RX_FRAME_UNSET)
+        {
+            const auto delta = static_cast<uint8_t>(
+                static_cast<uint8_t>(cur_frame) - static_cast<uint8_t>(prev_frame));
+            if (delta == 0 || delta >= MAX_FORWARD_FRAME_DELTA)
+            {
+                return;
+            }
+        }
+        if (frame_slot.compare_exchange_weak(prev_frame, PRB_RX_FRAME_TRANSITIONING,
+                                             std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            counter.store(0, std::memory_order_release);
+            frame_slot.store(cur_frame, std::memory_order_release);
+            return;
+        }
+    }
+}
+
 void RU_Emulator::increment_section_rx_counter(oran_c_plane_info_t& c_plane_info, uint16_t cell_index, int sym)
 {
     if(c_plane_info.valid_eaxcId)
@@ -185,6 +406,13 @@ void RU_Emulator::increment_section_rx_counter(oran_c_plane_info_t& c_plane_info
                 continue;
             }
             auto sec_channel = c_plane_info.is_mixed_channel ? section_info.channel_type : c_plane_info.channel_type;
+            // Test-bench only: PRACH is counted once per distinct (frame,subframe,slot)
+            // tuple in verify_ul_cplane_content's section-type-3 case. Skip the PRB-based
+            // path here to avoid double-counting. Guarded on opt_dlc_tb so production
+            // RU and non-test-bench consumers see unchanged behavior.
+            if (opt_dlc_tb && sec_channel == ul_channel::PRACH) {
+                continue;
+            }
             section_info.tv_index = tv_object->launch_pattern[c_plane_info.launch_pattern_slot][cell_index];
             auto & tv_info = tv_object->tv_info[section_info.tv_index];
 
@@ -208,22 +436,25 @@ void RU_Emulator::increment_section_rx_counter(oran_c_plane_info_t& c_plane_info
 
             bool complete = false;
             {
-                // Atomically increment and get the previous value
+                // Drop leftover counts when this subframe/slot recurs in a new
+                // radio frame (common after an RU restart that joined mid-slot).
+                // Zero the counter before publishing cur_frame so concurrent
+                // fetch_adds cannot observe a stale prev_count from the prior frame.
+                sync_prb_rx_counter_frame(
+                    tv_object->prb_rx_counter_frame[cell_index][counter_index],
+                    tv_object->prb_rx_counters[cell_index][counter_index],
+                    c_plane_info.fss.frameId);
+
+                // First thread to reach/cross expected_prbs wins completion. Concurrent
+                // in-flight adds (and mid-join leftovers) may overshoot — that is not an
+                // overflow error; the winner resets the counter.
+                const uint32_t expected = static_cast<uint32_t>(expected_prbs);
                 const uint32_t prev_count = tv_object->prb_rx_counters[cell_index][counter_index].fetch_add(
                     numPrb, std::memory_order_acq_rel);
-                const uint32_t new_count = prev_count + numPrb;
-                
-                // Check if we reached the expected threshold
-                if (new_count == expected_prbs)
+                if (prev_count < expected && (prev_count + numPrb) >= expected)
                 {
                     tv_object->prb_rx_counters[cell_index][counter_index].store(0, std::memory_order_release);
                     complete = true;
-                }
-                else if (new_count > expected_prbs)
-                {
-                    re_warn("PRB counter overflow: cell_index={}, counter_index={}, new_count={}, expected_prbs={}",
-                            cell_index, counter_index, new_count, expected_prbs);
-                    tv_object->prb_rx_counters[cell_index][counter_index].store(0, std::memory_order_release);
                 }
             }
             if(complete)
@@ -259,13 +490,8 @@ void RU_Emulator::increment_section_rx_counter_v2(oran_c_plane_info_t& c_plane_i
             {
                 numPrb = cell_configs[cell_index].ru_type == ru_type::SINGLE_SECT_MODE ? (int)tv_object->tv_info[section_info.tv_index].numPrb : std::min((int)tv_object->tv_info[section_info.tv_index].numPrb, cell_configs[cell_index].ulGridSize);
             }
-            if (cell_configs[cell_index].ru_type != ru_type::SINGLE_SECT_MODE)
-            {
-                numPrb *= section_info.numSymbol;
-            }
             int counter_index = c_plane_info.fss.subframeId * ORAN_MAX_SLOT_ID +
                     c_plane_info.fss.slotId;
-            tv_object->prb_rx_counters[cell_index][counter_index] += numPrb;
 
             ++tv_object->c_plane_rx[cell_index];
             ++tv_object->c_plane_rx_tot[cell_index];
@@ -277,13 +503,40 @@ void RU_Emulator::increment_section_rx_counter_v2(oran_c_plane_info_t& c_plane_i
             {
                 expected_prbs = prb_num;
             }
-            if(tv_object->prb_rx_counters[cell_index][counter_index].load() == expected_prbs)
+
+            bool complete = false;
+            {
+                if (cell_configs[cell_index].ru_type != ru_type::SINGLE_SECT_MODE)
+                {
+                    numPrb *= section_info.numSymbol;
+                }
+                // Drop leftover counts when this subframe/slot recurs in a new
+                // radio frame (common after an RU restart that joined mid-slot).
+                // Zero the counter before publishing cur_frame so concurrent
+                // fetch_adds cannot observe a stale prev_count from the prior frame.
+                sync_prb_rx_counter_frame(
+                    tv_object->prb_rx_counter_frame[cell_index][counter_index],
+                    tv_object->prb_rx_counters[cell_index][counter_index],
+                    c_plane_info.fss.frameId);
+
+                // First thread to reach/cross expected_prbs wins completion. Concurrent
+                // in-flight adds (and mid-join leftovers) may overshoot — that is not an
+                // overflow error; the winner resets the counter.
+                const uint32_t expected = static_cast<uint32_t>(expected_prbs);
+                const uint32_t prev_count = tv_object->prb_rx_counters[cell_index][counter_index].fetch_add(
+                    numPrb, std::memory_order_acq_rel);
+                if (prev_count < expected && (prev_count + numPrb) >= expected)
+                {
+                    tv_object->prb_rx_counters[cell_index][counter_index].store(0, std::memory_order_release);
+                    complete = true;
+                }
+            }
+            if (complete)
             {
                 ++tv_object->throughput_slot_counters[cell_index];
                 ++tv_object->total_slot_counters[cell_index];
                 tv_object->throughput_counters[cell_index] += tv_object->tv_info[section_info.tv_index].tb_size;
                 tv_object->section_rx_counters[cell_index][counter_index].store(0);
-                tv_object->prb_rx_counters[cell_index][counter_index].store(0);
             }
         }
     }
@@ -321,6 +574,12 @@ void RU_Emulator::prepare_cplane_info(ul_tv_object& pusch_object, const std::vec
         c_plane_info.rx_time = next_slot_time + tv_info.startSym * (opt_tti_us * NS_X_US / ORAN_ALL_SYMBOLS);
         c_plane_info.numberOfSections = tv_info.pdu_infos.size();
         c_plane_info.valid_eaxcId = true;
+        if (unlikely(tv_info.pdu_infos.size() > MAX_NUM_SECTIONS_PER_C_PLANE))
+        {
+            do_throw(sb() << "UL c-plane pdu_infos " << tv_info.pdu_infos.size()
+                << " exceeds max sections " << MAX_NUM_SECTIONS_PER_C_PLANE
+                << ", cell " << cell_index << " eAxC ID " << c_plane_info.eaxcId);
+        }
         for(const auto& pdu_info: tv_info.pdu_infos)
         {
             auto& section_info = c_plane_info.section_infos[c_plane_info.section_infos_size];
@@ -580,26 +839,37 @@ inline void RU_Emulator::update_ul_throughput_counters(oran_c_plane_info_t& c_pl
  *        (mMIMO, per-symbol) or handle_sect1_c_plane_v2() (non-mMIMO)
  *        when no cache match exists.
  *
- *  **Phase 1 – Cache resolution.**  Iterates over all UL section-type-1
- *  C-Plane info entries in @p slot_tx and looks up
- *  precomputed_tx_cache[launch_pattern_slot][cell] for a matching
- *  PrecomputedEaxcTx (by channel_type and eaxcId_index).  Matched entries
- *  are collected into a fixed-size buffer; unmatched entries are sent
- *  immediately via the appropriate legacy handler.
+ *  **Phase 1 – Cache resolution.**  Iterates over all UL C-Plane info
+ *  entries in @p slot_tx.  Section-type-1 entries (PUSCH/PUCCH/SRS) are
+ *  looked up in precomputed_tx_cache[launch_pattern_slot][cell] for a
+ *  matching PrecomputedEaxcTx (by channel_type and eaxcId_index); matched
+ *  entries are collected into a fixed-size buffer, unmatched entries are
+ *  sent immediately via the appropriate legacy handler.  Section-type-3
+ *  (PRACH) entries are tracked in a separate buffer when mMIMO is on so
+ *  they can be enqueued per-symbol in Phase 2; if the buffer overflows
+ *  (>= kMaxPrachCpis), the CPI falls back to immediate per-symbol
+ *  handle_sect3_c_plane() send + bookkeeping (analogous to ST1's
+ *  send_via_legacy fallback) so PRACH is never silently dropped.
+ *  Non-mMIMO leaves PRACH to the caller post-loop (handle_sect3_c_plane_v2).
  *
  *  **Phase 2 – Mode-dependent transmit ordering.**  When mMIMO is
  *  enabled, uses sym-outer / CPI-inner ordering matching legacy
- *  tx_slot(enable_mmimo=true) so all channel types (PUSCH, PUCCH, SRS)
- *  for a given symbol are sent before the next symbol.  When mMIMO is
- *  disabled, uses CPI-outer / sym-inner ordering matching legacy
- *  handle_sect1_c_plane_v2() which completes all symbols per CPI.
- *  Each CPI is prepared and sent individually (no cross-CPI batching)
- *  to keep NIC TX burst sizes small.
+ *  tx_slot(enable_mmimo=true) so all channel types (PUSCH, PUCCH, SRS,
+ *  PRACH) for a given symbol are sent before the next symbol.  PRACH is
+ *  enqueued via handle_sect3_c_plane(...,sym) immediately after the ST1
+ *  inner pass for the same symbol so PRACH and its PUSCH/PUCCH peers
+ *  share the same TXQ window.  When mMIMO is disabled, uses CPI-outer /
+ *  sym-inner ordering matching legacy handle_sect1_c_plane_v2() which
+ *  completes all symbols per CPI.  Each CPI is prepared and sent
+ *  individually (no cross-CPI batching) to keep NIC TX burst sizes small.
  *
  *  **Phase 3 – Deferred counter update.**  After all symbols are sent,
- *  accumulates u_plane_tx / u_plane_tx_tot on each matched CPI's
+ *  accumulates u_plane_tx / u_plane_tx_tot on each matched ST1 CPI's
  *  tv_object, logs TAG_TX_TIMINGS_SUM, and calls
- *  update_ul_throughput_counters().
+ *  update_ul_throughput_counters().  For mMIMO, also updates PRACH
+ *  bookkeeping (u_plane_tx, c_plane_rx += ORAN_ALL_SYMBOLS - startSym,
+ *  section_rx_counters with throughput_slot_counters/total_slot_counters
+ *  threshold check on num_valid_PRACH_flows) for each tracked ST3 CPI.
  *
  *  **Phase 4 – BFW extension verification.**  Iterates over all C-Plane
  *  info entries and calls verify_extensions() (mMIMO) or
@@ -636,6 +906,7 @@ inline void RU_Emulator::update_ul_throughput_counters(oran_c_plane_info_t& c_pl
  * @see precompute_ul_tx_cache
  * @see handle_sect1_c_plane
  * @see handle_sect1_c_plane_v2
+ * @see handle_sect3_c_plane
  * @see ul_channel
  * @see get_txq_index
  */
@@ -657,6 +928,18 @@ int RU_Emulator::tx_slot_precomputed(slot_tx_info& slot_tx, int cell_index,
     CPlaneInfoMatch matched_buf[kMaxMatchedCpis];
     int num_matched = 0;
 
+    // PRACH (Section Type 3) tracking for mMIMO interleaved-per-symbol enqueue.
+    // PRACH is not precomputed (per-RX freqOffset / prach_pdu_index lookup
+    // must happen at RX time), but we still call handle_sect3_c_plane(...,sym)
+    // inside the Phase 2 sym-outer loop so PRACH packets land on TXQ[14+sym]
+    // in the same symbol as their PUSCH/PUCCH peers, matching legacy
+    // tx_slot() mMIMO ordering. Non-mMIMO continues to handle ST3 in the
+    // caller post-loop via handle_sect3_c_plane_v2().
+    constexpr int kMaxPrachCpis = 8;
+    int    prach_idx_buf[kMaxPrachCpis] = {};
+    size_t prach_nb_tx[kMaxPrachCpis]   = {};
+    int num_prach = 0;
+
     /// Fallback: transmit one C-Plane info entry through the legacy
     /// (non-precomputed) handler and update total_tx / per-TV counters.
     /// Uses handle_sect1_c_plane (per-symbol) for mMIMO, or
@@ -676,11 +959,95 @@ int RU_Emulator::tx_slot_precomputed(slot_tx_info& slot_tx, int cell_index,
         return nb;
     };
 
+    /// PRACH per-CPI counter bookkeeping for the mMIMO precomputed path.
+    /// Mirrors the legacy tx_slot() mMIMO ST3 block (Phase 2 per-symbol
+    /// u_plane_tx/c_plane_rx accumulation + Phase 3 section_rx_counters
+    /// atomic update). Shared by the Phase 3 buffered path and the
+    /// kMaxPrachCpis-overflow fallback so counter semantics stay identical.
+    auto prach_bookkeeping_mmimo = [&](oran_c_plane_info_t& cpi, size_t prach_tx)
+    {
+        total_tx += prach_tx;
+        auto& tv_object = cpi.tv_object;
+        tv_object->u_plane_tx[cell_index]     += prach_tx;
+        tv_object->u_plane_tx_tot[cell_index] += prach_tx;
+
+        const int n = ORAN_ALL_SYMBOLS - cpi.startSym;
+        tv_object->c_plane_rx[cell_index]     += n;
+        tv_object->c_plane_rx_tot[cell_index] += n;
+
+        if (cpi.valid_eaxcId)
+        {
+            int counter_index = cpi.fss.subframeId * ORAN_MAX_SLOT_ID + cpi.fss.slotId;
+            const uint16_t prev_count = tv_object->section_rx_counters[cell_index][counter_index].fetch_add(
+                1, std::memory_order_acq_rel);
+            const uint16_t new_count = prev_count + 1;
+            const uint16_t expected_count = cell_configs[cell_index].num_valid_PRACH_flows;
+            if (new_count == expected_count)
+            {
+                tv_object->section_rx_counters[cell_index][counter_index].store(0, std::memory_order_release);
+                ++tv_object->throughput_slot_counters[cell_index];
+                ++tv_object->total_slot_counters[cell_index];
+            }
+            else if (new_count > expected_count)
+            {
+                re_warn("Section counter overflow: cell_index={}, counter_index={}, new_count={}, expected_count={}",
+                        cell_index, counter_index, new_count, expected_count);
+                tv_object->section_rx_counters[cell_index][counter_index].store(0, std::memory_order_release);
+            }
+        }
+    };
+
+    /// PRACH overflow fallback for the mMIMO precomputed path.
+    /// Mirrors send_via_legacy() (ST1 overflow) but for ST3: enqueues the
+    /// CPI synchronously via handle_sect3_c_plane(...,sym) for each symbol
+    /// at/after startSym, then runs the same counter bookkeeping as the
+    /// buffered path. Used when num_prach >= kMaxPrachCpis so a CPI is
+    /// still sent (with worse interleaving than buffered) instead of being
+    /// silently dropped. Only valid when opt_enable_mmimo is true.
+    auto send_prach_via_legacy_mmimo = [&](oran_c_plane_info_t& cpi)
+    {
+        size_t nb = 0;
+        for (int sym = cpi.startSym; sym < ORAN_ALL_SYMBOLS; ++sym)
+            nb += handle_sect3_c_plane(cpi, cell_index, timers, txqs, tx_request, sym);
+        prach_bookkeeping_mmimo(cpi, nb);
+    };
+
     for (int i = 0; i < slot_tx.c_plane_infos_size; ++i)
     {
         auto& c_plane_info = slot_tx.c_plane_infos[i];
         if (c_plane_info.dir == DIRECTION_DOWNLINK)
             continue;
+
+        // ST3 (PRACH): collect for in-Phase-2 per-symbol enqueue when mMIMO
+        // is on. For non-mMIMO, leave the caller post-loop to handle it.
+        if (c_plane_info.section_type == ORAN_CMSG_SECTION_TYPE_3)
+        {
+            if (opt_enable_mmimo)
+            {
+                if (num_prach < kMaxPrachCpis)
+                {
+                    prach_idx_buf[num_prach] = i;
+                    prach_nb_tx[num_prach]   = 0;
+                    ++num_prach;
+                }
+                else
+                {
+                    // Multiple C-plane worker threads can hit this branch
+                    // concurrently (utils.hpp: tx_slot_precomputed runs on
+                    // multiple threads per cell), so use an atomic
+                    // test-and-set to ensure exactly one thread emits the
+                    // warning over the process lifetime.
+                    static std::atomic<bool> warned{false};
+                    if (!warned.exchange(true, std::memory_order_relaxed)) {
+                        re_warn("Precomputed TX PRACH-CPI overflow ({}/{}), falling back to legacy",
+                                num_prach, kMaxPrachCpis);
+                    }
+                    send_prach_via_legacy_mmimo(c_plane_info);
+                }
+            }
+            continue;
+        }
+
         if (c_plane_info.section_type != ORAN_CMSG_SECTION_TYPE_1)
             continue;
         if (c_plane_info.eaxcId_index < 0)
@@ -722,11 +1089,11 @@ int RU_Emulator::tx_slot_precomputed(slot_tx_info& slot_tx, int cell_index,
         }
         else
         {
-            static bool warned = false;
-            if (!warned) {
+            // Same concurrent-worker rationale as the ST3 overflow above.
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
                 re_warn("Precomputed TX matched-CPI overflow ({}/{}), falling back to legacy",
                         num_matched, kMaxMatchedCpis);
-                warned = true;
             }
             send_via_legacy(c_plane_info);
         }
@@ -863,10 +1230,23 @@ int RU_Emulator::tx_slot_precomputed(slot_tx_info& slot_tx, int cell_index,
     if (opt_enable_mmimo)
     {
         // sym-outer, CPI-inner — matches legacy mMIMO tx_slot() so all
-        // channel types for a given symbol are sent before the next symbol.
+        // channel types (PUSCH/PUCCH/SRS first, then PRACH) for a given
+        // symbol are sent before the next symbol. This keeps PRACH enqueued
+        // on TXQ[14+sym] in the same window as its PUSCH/PUCCH peers.
         for (int sym = 0; sym < ORAN_ALL_SYMBOLS; ++sym)
+        {
             for (int mc = 0; mc < num_matched; ++mc)
                 send_one_cpi_symbol(mc, sym);
+
+            for (int p = 0; p < num_prach; ++p)
+            {
+                auto& prach_cpi = slot_tx.c_plane_infos[prach_idx_buf[p]];
+                if (prach_cpi.startSym > sym)
+                    continue;
+                prach_nb_tx[p] += handle_sect3_c_plane(prach_cpi, cell_index,
+                                                       timers, txqs, tx_request, sym);
+            }
+        }
     }
     else
     {
@@ -884,10 +1264,13 @@ int RU_Emulator::tx_slot_precomputed(slot_tx_info& slot_tx, int cell_index,
         size_t nb_tx = matched_buf[mc].nb_tx;
 
         auto now = get_ns();
-        NVLOGI_FMT(TAG_TX_TIMINGS_SUM, "[ST1] {} F{}S{}S{} Cell {} Enqueue Time {}",
+        // Include the actual per-slot-instance U-plane TX packet count (nb_tx) so a
+        // single SUM line per slot is conclusive for RU app-miss vs fronthaul loss
+        // triage, without needing the verbose per-section TAG_TX_TIMINGS enabled.
+        NVLOGI_FMT(TAG_TX_TIMINGS_SUM, "[ST1] {} F{}S{}S{} Cell {} Enqueue Time {} Num Packets {}",
                     ul_channel_to_string(c_plane_info.channel_type),
                     c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
-                    cell_index, now);
+                    cell_index, now, nb_tx);
 
         total_tx += nb_tx;
 
@@ -895,6 +1278,21 @@ int RU_Emulator::tx_slot_precomputed(slot_tx_info& slot_tx, int cell_index,
         c_plane_info.tv_object->u_plane_tx_tot[cell_index] += nb_tx;
 
         update_ul_throughput_counters(c_plane_info, cell_index);
+    }
+
+    // PRACH bookkeeping for mMIMO precomputed path (mirrors legacy tx_slot()
+    // ST3 block at cplane_rx_cores.cpp:3509-3582 and the previous caller-side
+    // post-loop). c_plane_rx is incremented once per symbol where startSym
+    // <= sym, i.e. (ORAN_ALL_SYMBOLS - startSym) times per CPI. The same
+    // counter logic is reused via prach_bookkeeping_mmimo() by the
+    // kMaxPrachCpis-overflow fallback in Phase 1.
+    if (opt_enable_mmimo)
+    {
+        for (int p = 0; p < num_prach; ++p)
+        {
+            auto& cpi = slot_tx.c_plane_infos[prach_idx_buf[p]];
+            prach_bookkeeping_mmimo(cpi, prach_nb_tx[p]);
+        }
     }
 
     // --- Phase 4: BFW extension verification ---
@@ -1041,7 +1439,54 @@ bool RU_Emulator::validate_modulation_compression(const oran_c_plane_info_t& c_p
     bool found = false;
     int matched_msg_idx = -1;
     tv_mod_comp_object* matched_mod_comp = nullptr;
+    dl_tv_object* matched_tv_obj = nullptr;
     uint32_t matched_tv_reMask = 0;
+    std::vector<int> covering_msg_idxs;
+
+    // A consolidated wire section (e.g. full-band CSI-RS) can be described by several
+    // PRB-fragmented TV modcomp records under one mask. Accumulate those records until
+    // their union tiles the section's [start, start+num) PRB span with no gaps, filling
+    // `msgs` with the covering fragments' msg indices. Returns false if a gap remains.
+    auto cover_span = [](const auto& entries, uint32_t start, uint32_t num,
+                         std::vector<int>& msgs) -> bool {
+        const uint32_t end = start + num;
+        msgs.clear();
+        // Greedily verify the wire span [start,end) is fully backed by TV records that
+        // overlap it (handles a fragmented TV under a wideband wire section, and a single
+        // TV record that contains a narrower wire section).
+        uint32_t covered = start;
+        bool progress = true;
+        while (covered < end && progress)
+        {
+            progress = false;
+            for (const auto& e : entries)
+            {
+                const uint32_t a = static_cast<uint32_t>(e[0]);
+                const uint32_t b = a + static_cast<uint32_t>(e[1]);
+                if (a < end && a <= covered && b > covered)
+                {
+                    covered = b;
+                    progress = true;
+                }
+            }
+        }
+        if (covered < end)
+        {
+            return false;
+        }
+        // Collect every TV record overlapping the wire span as candidates for presence
+        // validation of the wire's mcScaleReMask groups.
+        for (const auto& e : entries)
+        {
+            const uint32_t a = static_cast<uint32_t>(e[0]);
+            const uint32_t b = a + static_cast<uint32_t>(e[1]);
+            if (a < end && b > start)
+            {
+                msgs.push_back(static_cast<int>(e[2]));
+            }
+        }
+        return true;
+    };
 
     for (auto tv_obj_p : dl_tv_objs)
     {
@@ -1073,30 +1518,24 @@ bool RU_Emulator::validate_modulation_compression(const oran_c_plane_info_t& c_p
                         {
                             auto &mask_map = port_it->second;
 
-                            // Fast path: exact mask match
+                            // Fast path: exact mask match. The wire section is matched
+                            // when this mask's TV records (one or PRB-fragmented) tile its
+                            // full PRB span, so every wire RB is backed by a TV record.
                             const auto exact_it = mask_map.find(section_reMask);
-                            if (exact_it != mask_map.end())
+                            if (exact_it != mask_map.end() &&
+                                cover_span(exact_it->second, section_info.startPrbc,
+                                           section_info.numPrbc, covering_msg_idxs))
                             {
-                                for (const auto &e : exact_it->second)
-                                {
-                                    if (section_info.startPrbc >= e[0] &&
-                                        section_info.startPrbc + section_info.numPrbc <= e[0] + e[1])
-                                    {
-                                        found = true;
-                                        matched_msg_idx = e[2];
-                                        matched_mod_comp = &mod_comp_data;
-                                        matched_tv_reMask = section_reMask;
-                                        break;
-                                    }
-                                }
-
-                                if (found)
-                                {
-                                    break;
-                                }
+                                found = true;
+                                matched_msg_idx = covering_msg_idxs.front();
+                                matched_mod_comp = &mod_comp_data;
+                                matched_tv_obj = tv_obj_p;
+                                matched_tv_reMask = section_reMask;
+                                break;
                             }
 
-                            // Fallback: allow matches where tv_reMask is a superset of section_reMask
+                            // Fallback: allow a tv_reMask that is a superset of
+                            // section_reMask, with the same union-coverage requirement.
                             for (const auto &mask_entry : mask_map)
                             {
                                 const std::uint32_t tv_reMask = mask_entry.first;
@@ -1113,21 +1552,14 @@ bool RU_Emulator::validate_modulation_compression(const oran_c_plane_info_t& c_p
                                     continue;
                                 }
 
-                                for (const auto &e : mask_entry.second)
+                                if (cover_span(mask_entry.second, section_info.startPrbc,
+                                               section_info.numPrbc, covering_msg_idxs))
                                 {
-                                    if (section_info.startPrbc >= e[0] &&
-                                        section_info.startPrbc + section_info.numPrbc <= e[0] + e[1])
-                                    {
-                                        found = true;
-                                        matched_msg_idx = e[2];
-                                        matched_mod_comp = &mod_comp_data;
-                                        matched_tv_reMask = tv_reMask;
-                                        break;
-                                    }
-                                }
-
-                                if (found)
-                                {
+                                    found = true;
+                                    matched_msg_idx = covering_msg_idxs.front();
+                                    matched_mod_comp = &mod_comp_data;
+                                    matched_tv_obj = tv_obj_p;
+                                    matched_tv_reMask = tv_reMask;
                                     break;
                                 }
                             }
@@ -1286,21 +1718,72 @@ bool RU_Emulator::validate_modulation_compression(const oran_c_plane_info_t& c_p
         }
     }
 
-    // --- TV-based comparison of SE4/SE5 extension values ---
-    if (matched_mod_comp == nullptr || matched_msg_idx < 0)
+    // --- TV-based comparison of SE4/SE5 extension values (presence semantics) ---
+    // A wire section can be wider than the per-region TV records that tile it (e.g. a
+    // wideband CSI-RS section vs PRB-fragmented TV modcomp), and the legacy TV csf is a
+    // per-region relative flag. The wire carries one (scaler, csf) per group, so a group
+    // is validated by PRESENCE: its (reMask, scaler, csf) must equal the corresponding
+    // mcScaleReMask entry in at least one covering TV record. A single-region section has
+    // exactly one covering record, so this stays an exact check there.
+    if (matched_mod_comp == nullptr || covering_msg_idxs.empty())
         return true;
 
-    auto tv_it = matched_mod_comp->global_msg_idx_to_tv_idx.find(matched_msg_idx);
-    if (tv_it == matched_mod_comp->global_msg_idx_to_tv_idx.end())
+    const char* chan = (matched_tv_obj != nullptr) ? dl_channel_string[matched_tv_obj->channel_type].c_str() : "?";
+
+    using McExtInfo = std::decay_t<decltype(matched_mod_comp->mod_comp_ext_info[0])>;
+    std::vector<const McExtInfo*> cov_exts;
+    for (int cov_msg_idx : covering_msg_idxs)
+    {
+        auto tv_it = matched_mod_comp->global_msg_idx_to_tv_idx.find(cov_msg_idx);
+        if (tv_it == matched_mod_comp->global_msg_idx_to_tv_idx.end())
+            continue;
+        int internal_idx = tv_it->second;
+        if (internal_idx < 0 || internal_idx >= static_cast<int>(matched_mod_comp->mod_comp_ext_info.size()))
+            continue;
+        const auto& e = matched_mod_comp->mod_comp_ext_info[internal_idx];
+        if (e.valid)
+            cov_exts.push_back(&e);
+    }
+    if (cov_exts.empty())
         return true;
 
-    int internal_idx = tv_it->second;
-    if (internal_idx < 0 || internal_idx >= static_cast<int>(matched_mod_comp->mod_comp_ext_info.size()))
-        return true;
-
-    const auto& expected = matched_mod_comp->mod_comp_ext_info[internal_idx];
-    if (!expected.valid)
-        return true;
+    // An SE5 wire group is present if some covering record carries a matching
+    // (reMask, offset, csf). An SE4 TV record has no per-group mask, so its [0] entry
+    // matches on (offset, csf) alone.
+    auto se5_group_present = [&cov_exts](uint16_t re_mask, uint16_t offset, uint32_t csf) {
+        for (const auto* e : cov_exts)
+        {
+            if (e->ext_type == ORAN_CMSG_SECTION_EXT_TYPE_4)
+            {
+                if (e->mc_scale_offset_encoded[0] == offset && e->csf[0] == csf)
+                    return true;
+                continue;
+            }
+            for (uint32_t t = 0; t < e->n_mask && t < 2; t++)
+                if (e->mc_scale_re_mask[t] == re_mask &&
+                    e->mc_scale_offset_encoded[t] == offset && e->csf[t] == csf)
+                    return true;
+        }
+        return false;
+    };
+    // A wire SE4 (no reMask field; effective mask = section reMask) is present if some
+    // covering record carries matching (offset, csf) under a mask covering section_reMask.
+    auto se4_present = [&cov_exts, section_reMask](uint16_t scaler, uint32_t csf) {
+        for (const auto* e : cov_exts)
+        {
+            if (e->ext_type == ORAN_CMSG_SECTION_EXT_TYPE_4)
+            {
+                if (e->mc_scale_offset_encoded[0] == scaler && e->csf[0] == csf)
+                    return true;
+                continue;
+            }
+            for (uint32_t t = 0; t < e->n_mask && t < 2; t++)
+                if ((e->mc_scale_re_mask[t] & section_reMask) == section_reMask &&
+                    e->mc_scale_offset_encoded[t] == scaler && e->csf[t] == csf)
+                    return true;
+        }
+        return false;
+    };
 
     bool comparison_ok = true;
 
@@ -1308,30 +1791,22 @@ bool RU_Emulator::validate_modulation_compression(const oran_c_plane_info_t& c_p
     {
         const auto& ext = section_info.ext_infos[ei];
 
-        if (ext.ext_type == ORAN_CMSG_SECTION_EXT_TYPE_4 && expected.ext_type == ORAN_CMSG_SECTION_EXT_TYPE_4)
+        if (ext.ext_type == ORAN_CMSG_SECTION_EXT_TYPE_4)
         {
             auto* se4_hdr = reinterpret_cast<oran_cmsg_sect_ext_type_4*>(ext.ext_ptr + sizeof(oran_cmsg_ext_hdr));
-            uint16_t wire_scaler = se4_hdr->modCompScalor.get();
-            uint16_t wire_csf = se4_hdr->csf.get();
-
-            if (wire_scaler != expected.mc_scale_offset_encoded[0])
+            const uint16_t wire_scaler = se4_hdr->modCompScalor.get();
+            const uint32_t wire_csf = se4_hdr->csf.get();
+            if (!se4_present(wire_scaler, wire_csf))
             {
-                re_cons("F{}S{}S{} Sym {} eAxCID {} SE4 modCompScaler mismatch: wire=0x{:04x} TV=0x{:04x}",
-                        c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
-                        c_plane_info.startSym, c_plane_info.eaxcId,
-                        wire_scaler, expected.mc_scale_offset_encoded[0]);
-                comparison_ok = false;
-            }
-            if (wire_csf != expected.csf[0])
-            {
-                re_cons("F{}S{}S{} Sym {} eAxCID {} SE4 csf mismatch: wire={} TV={}",
-                        c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
-                        c_plane_info.startSym, c_plane_info.eaxcId,
-                        wire_csf, expected.csf[0]);
+                re_cons("[{}] F{}S{}S{} Sym {} eAxCID {} sec {} prbc[{}+{}] SE4 modcomp not present in TV (reMask=0x{:03x}): wire scaler=0x{:04x} csf={}",
+                        chan, c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
+                        c_plane_info.startSym, c_plane_info.eaxcId, section_info.section_id,
+                        section_info.startPrbc, section_info.numPrbc, (uint32_t)section_reMask,
+                        wire_scaler, wire_csf);
                 comparison_ok = false;
             }
         }
-        else if (ext.ext_type == ORAN_CMSG_SECTION_EXT_TYPE_5 && expected.ext_type == ORAN_CMSG_SECTION_EXT_TYPE_5)
+        else if (ext.ext_type == ORAN_CMSG_SECTION_EXT_TYPE_5)
         {
             oran_cmsg_sect_ext_type_5 se5_copy;
             memcpy(&se5_copy, ext.ext_ptr + sizeof(oran_cmsg_ext_hdr), sizeof(oran_cmsg_sect_ext_type_5));
@@ -1342,47 +1817,38 @@ bool RU_Emulator::validate_modulation_compression(const oran_c_plane_info_t& c_p
 #endif
             memcpy(reinterpret_cast<uint8_t*>(&se5_copy) + sizeof(se5_copy.extLen), &se5_bitfield_val, sizeof(uint64_t));
 
-            struct {
-                uint16_t re_mask;
-                uint16_t offset;
-                uint32_t csf;
-            } wire_groups[2] = {
+            struct { uint16_t re_mask; uint16_t offset; uint32_t csf; } wire_groups[2] = {
                 {static_cast<uint16_t>(se5_copy.mcScaleReMask_1), static_cast<uint16_t>(se5_copy.mcScaleOffset_1), static_cast<uint32_t>(se5_copy.csf_1)},
                 {static_cast<uint16_t>(se5_copy.mcScaleReMask_2), static_cast<uint16_t>(se5_copy.mcScaleOffset_2), static_cast<uint32_t>(se5_copy.csf_2)}
             };
 
-            for (uint32_t g = 0; g < expected.n_mask && g < 2; g++)
+            for (uint32_t g = 0; g < 2; g++)
             {
-                if (wire_groups[g].re_mask != expected.mc_scale_re_mask[g])
+                if (wire_groups[g].re_mask == 0)
+                    continue; // empty SE5 slot (single-mask section)
+                if (!se5_group_present(wire_groups[g].re_mask, wire_groups[g].offset, wire_groups[g].csf))
                 {
-                    re_cons("F{}S{}S{} Sym {} eAxCID {} SE5 mcScaleReMask_{} mismatch: wire=0x{:03x} TV=0x{:03x}",
-                            c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
-                            c_plane_info.startSym, c_plane_info.eaxcId, g + 1,
-                            wire_groups[g].re_mask, expected.mc_scale_re_mask[g]);
-                    comparison_ok = false;
-                }
-
-                if (wire_groups[g].offset != expected.mc_scale_offset_encoded[g])
-                {
-                    re_cons("F{}S{}S{} Sym {} eAxCID {} SE5 mcScaleOffset_{} mismatch: wire=0x{:04x} TV=0x{:04x}",
-                            c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
-                            c_plane_info.startSym, c_plane_info.eaxcId, g + 1,
-                            wire_groups[g].offset, expected.mc_scale_offset_encoded[g]);
-                    comparison_ok = false;
-                }
-
-                if (wire_groups[g].csf != expected.csf[g])
-                {
-                    re_cons("F{}S{}S{} Sym {} eAxCID {} SE5 csf_{} mismatch: wire={} TV={}",
-                            c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
-                            c_plane_info.startSym, c_plane_info.eaxcId, g + 1,
-                            wire_groups[g].csf, expected.csf[g]);
+                    re_cons("[{}] F{}S{}S{} Sym {} eAxCID {} sec {} prbc[{}+{}] SE5 group not present in TV (reMask=0x{:03x}): wire off=0x{:04x} csf={}",
+                            chan, c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
+                            c_plane_info.startSym, c_plane_info.eaxcId, section_info.section_id,
+                            section_info.startPrbc, section_info.numPrbc, wire_groups[g].re_mask,
+                            wire_groups[g].offset, wire_groups[g].csf);
                     comparison_ok = false;
                 }
             }
         }
-        // When wire and TV use different extension types (SE4 vs SE5), the
-        // scaler computation semantics differ, so value comparison is skipped.
+    }
+
+    // Flag the slot bad on the channel that owns this section so the channel's
+    // good/error verdict (computed later in validate_pdsch/pdcch/csirs from
+    // invalid_flag) does not credit a slot whose modcomp SE4/SE5 mismatched.
+    // Without this the per-channel counter reports a channel as fully "good"
+    // even though its modcomp sections failed. error_status is still set by the
+    // caller for the global DL section error tally.
+    if (!comparison_ok && matched_tv_obj != nullptr &&
+        c_plane_info.launch_pattern_slot < matched_tv_obj->invalid_flag[cell_index].size())
+    {
+        matched_tv_obj->invalid_flag[cell_index][c_plane_info.launch_pattern_slot] = true;
     }
 
     return comparison_ok;
@@ -1404,7 +1870,7 @@ bool RU_Emulator::validate_modulation_compression(const oran_c_plane_info_t& c_p
  */
 void RU_Emulator::validate_remask(oran_c_plane_info_t& c_plane_info, int cell_index, bool is_pdsch_included)
 {
-    uint32_t csirs_remask_mismatch = 0, pdsch_remask_mismatch = 0, missing_pdsch_section = 0;
+    uint32_t csirs_remask_mismatch = 0, pdsch_remask_mismatch = 0;
     uint16_t expected_reMask = 0xFFF;
 
     int remask_idx_base = c_plane_info.startSym * cell_configs[cell_index].ulGridSize;
@@ -1450,7 +1916,11 @@ void RU_Emulator::validate_remask(oran_c_plane_info_t& c_plane_info, int cell_in
             {
                 auto pdsch_tv_index = pdsch_object.launch_pattern[c_plane_info.launch_pattern_slot][cell_index];
                 auto &pdsch_tv_info = pdsch_object.tv_info[pdsch_tv_index];
-                uint16_t invalid_sections[2][10][3]; // channel_type:invalid_sect_num:invalid_info
+                RemaskMismatchLog invalid_sections{};
+                RemaskPairStates remask_pairs{};
+                uint32_t remask_pair_count = 0;
+                uint32_t missing_pdsch_section = 0;
+                int last_remask_pair_idx = -1;
 
                 for (int sec_idx = 0; sec_idx < c_plane_info.section_infos_size; sec_idx++)
                 {
@@ -1462,38 +1932,64 @@ void RU_Emulator::validate_remask(oran_c_plane_info_t& c_plane_info, int cell_in
                     bool pdsch_section = pdsch_tv_info.prb_num_flow_map[c_plane_info.startSym][start_prb] & ((uint64_t)1 << c_plane_info.eaxcId_index);
                     bool csirs_section = csirs_object.tv_info[tv_idx].prb_map[c_plane_info.startSym][start_prb];
 
-                    if (csirs_section)
-                    {
-                        // CSIRS section validation -- subset match for per-port modcomp reMasks
-                        uint16_t wire_csirs = c_plane_info.section_infos[sec_idx].reMask;
-                        if (wire_csirs == 0 || (wire_csirs & expected_reMask) != wire_csirs)
-                        {
-                            invalid_sections[1][csirs_remask_mismatch][0] = c_plane_info.section_infos[sec_idx].section_id;
-                            invalid_sections[1][csirs_remask_mismatch][1] = expected_reMask;
-                            invalid_sections[1][csirs_remask_mismatch][2] = wire_csirs;
-                            csirs_remask_mismatch++;
-                            c_plane_info.section_infos[sec_idx].error_status = -1;
-                        }
-                        if (pdsch_section && (sec_idx + 1 >= c_plane_info.section_infos_size || c_plane_info.section_infos[sec_idx].section_id != c_plane_info.section_infos[sec_idx + 1].section_id))
-                        {
-                            missing_pdsch_section++;
-                        }
-                        else if(pdsch_section)
-                        {
-                            sec_idx++;
-                        }
-                    }
+                    // When PDSCH and CSI-RS overlap, classify each section by
+                    // the mask it carries instead of assuming section order.
+                    const uint16_t wire_remask = c_plane_info.section_infos[sec_idx].reMask;
+                    const uint16_t expected_pdsch_reMask = ((~expected_reMask) & 0xFFF);
+                    const bool csirs_remask_valid = csirs_section &&
+                        wire_remask != 0 && (wire_remask & expected_reMask) == wire_remask;
+                    const bool pdsch_remask_valid = pdsch_section &&
+                        wire_remask != 0 && (wire_remask & expected_pdsch_reMask) == wire_remask;
 
-                    if (pdsch_section)
+                    if (pdsch_section && csirs_section &&
+                        (pdsch_remask_valid || csirs_remask_valid))
                     {
-                        // PDSCH section validation
-                        if (c_plane_info.section_infos[sec_idx].reMask != ((~expected_reMask) & 0xFFF))
+                        auto& pair = find_or_add_remask_pair(
+                            remask_pairs,
+                            remask_pair_count,
+                            last_remask_pair_idx,
+                            c_plane_info.section_infos[sec_idx].section_id,
+                            start_prb,
+                            num_prbs,
+                            sec_idx);
+
+                        update_remask_pair_side(
+                            c_plane_info,
+                            invalid_sections,
+                            pair,
+                            pdsch_remask_valid,
+                            pdsch_remask_mismatch,
+                            csirs_remask_mismatch,
+                            sec_idx,
+                            expected_pdsch_reMask,
+                            expected_reMask,
+                            wire_remask);
+                    }
+                    else if (!csirs_remask_valid && !pdsch_remask_valid)
+                    {
+                        record_invalid_paired_remask(
+                            c_plane_info,
+                            invalid_sections,
+                            pdsch_section,
+                            csirs_section,
+                            pdsch_remask_mismatch,
+                            csirs_remask_mismatch,
+                            sec_idx,
+                            expected_pdsch_reMask,
+                            expected_reMask,
+                            wire_remask);
+                    }
+                }
+
+                for (uint32_t pair_idx = 0; pair_idx < remask_pair_count; ++pair_idx)
+                {
+                    const auto& pair = remask_pairs[pair_idx];
+                    if (pair.csirs_seen != 0 && pair.pdsch_seen == 0)
+                    {
+                        ++missing_pdsch_section;
+                        if (pair.first_sec_idx >= 0)
                         {
-                            invalid_sections[0][pdsch_remask_mismatch][0] = c_plane_info.section_infos[sec_idx].section_id;
-                            invalid_sections[0][pdsch_remask_mismatch][1] = ((~expected_reMask) & 0xFFF);
-                            invalid_sections[0][pdsch_remask_mismatch][2] = c_plane_info.section_infos[sec_idx].reMask;
-                            pdsch_remask_mismatch++;
-                            c_plane_info.section_infos[sec_idx].error_status = -1;
+                            c_plane_info.section_infos[pair.first_sec_idx].error_status = -1;
                         }
                     }
                 }
@@ -1502,13 +1998,27 @@ void RU_Emulator::validate_remask(oran_c_plane_info_t& c_plane_info, int cell_in
                 {
                     re_cons("pdsch_remask_mismatch: {}, csirs_remask_mismatch: {}, missing_pdsch_section: {}", pdsch_remask_mismatch, csirs_remask_mismatch, missing_pdsch_section);
                     re_cons("cell_index: {}, symbol: {}, c_plane_info.tv_index {} , remask_idx_base {} ", cell_index, c_plane_info.startSym, c_plane_info.tv_index, remask_idx_base);
-                    for (int i = 0; i < pdsch_remask_mismatch; i++)
+                    const uint32_t pdsch_logged = std::min(
+                        pdsch_remask_mismatch,
+                        static_cast<uint32_t>(MAX_NUM_SECTIONS_PER_C_PLANE));
+                    const uint32_t csirs_logged = std::min(
+                        csirs_remask_mismatch,
+                        static_cast<uint32_t>(MAX_NUM_SECTIONS_PER_C_PLANE));
+                    for (uint32_t i = 0; i < pdsch_logged; i++)
                     {
-                        re_cons("section_id: {}, expected pdsch_remask 0x{:x}, received pdsch_remask 0x{:x} ", invalid_sections[0][i][0], invalid_sections[0][i][1], invalid_sections[0][i][2]);
+                        const auto& record = invalid_sections[remask_channel_index(RemaskChannel::Pdsch)][i];
+                        re_cons("section_id: {}, expected pdsch_remask 0x{:x}, received pdsch_remask 0x{:x} ",
+                            record[remask_mismatch_field_index(RemaskMismatchField::SectionId)],
+                            record[remask_mismatch_field_index(RemaskMismatchField::ExpectedMask)],
+                            record[remask_mismatch_field_index(RemaskMismatchField::WireMask)]);
                     }
-                    for (int i = 0; i < csirs_remask_mismatch; i++)
+                    for (uint32_t i = 0; i < csirs_logged; i++)
                     {
-                        re_cons("section_id: {}, expected csirs_remask 0x{:x}, received csirs_remask 0x{:x} ", invalid_sections[1][i][0], invalid_sections[1][i][1], invalid_sections[1][i][2]);
+                        const auto& record = invalid_sections[remask_channel_index(RemaskChannel::CsiRs)][i];
+                        re_cons("section_id: {}, expected csirs_remask 0x{:x}, received csirs_remask 0x{:x} ",
+                            record[remask_mismatch_field_index(RemaskMismatchField::SectionId)],
+                            record[remask_mismatch_field_index(RemaskMismatchField::ExpectedMask)],
+                            record[remask_mismatch_field_index(RemaskMismatchField::WireMask)]);
                     }
                     for (int sec_idx = 0; sec_idx < c_plane_info.section_infos_size; sec_idx++)
                     {
@@ -1561,35 +2071,77 @@ void RU_Emulator::validate_remask(oran_c_plane_info_t& c_plane_info, int cell_in
         // mMIMO disabled scenarios
         if (is_pdsch_included)
         {
-            // PDSCH with CSIRS pairing
+            // PDSCH with CSIRS — classify each section by reMask
             if (c_plane_info.section_infos_size > 1)
             {
-                for (int sec_idx = 0; sec_idx < c_plane_info.section_infos_size; sec_idx += 2)
+                uint32_t remask_mismatch = 0;
+                RemaskMismatchLog invalid_sections{};
+                RemaskPairStates remask_pairs{};
+                uint32_t remask_pair_count = 0;
+                int last_remask_pair_idx = -1;
+                for (int sec_idx = 0; sec_idx < c_plane_info.section_infos_size; sec_idx++)
                 {
-                    int remask_idx = remask_idx_base + c_plane_info.section_infos[sec_idx + 1].startPrbc;
+                    int remask_idx = remask_idx_base + c_plane_info.section_infos[sec_idx].startPrbc;
                     expected_reMask = tv_info.csirsREMaskArray[remask_idx];
-                    if (c_plane_info.section_infos[sec_idx].reMask != ((~expected_reMask) & 0xFFF))
+                    uint16_t pdsch_expected = (~expected_reMask) & 0xFFF;
+                    auto reMask = c_plane_info.section_infos[sec_idx].reMask;
+                    const bool csirs_remask_valid =
+                        reMask != 0 && (reMask & expected_reMask) == reMask;
+                    const bool pdsch_remask_valid =
+                        reMask != 0 && (reMask & pdsch_expected) == reMask;
+
+                    if (csirs_remask_valid || pdsch_remask_valid)
                     {
-                        pdsch_remask_mismatch++;
-                        c_plane_info.section_infos[sec_idx].error_status = -1;
+                        auto& pair = find_or_add_remask_pair(
+                            remask_pairs,
+                            remask_pair_count,
+                            last_remask_pair_idx,
+                            c_plane_info.section_infos[sec_idx].section_id,
+                            c_plane_info.section_infos[sec_idx].startPrbc,
+                            c_plane_info.section_infos[sec_idx].numPrbc,
+                            sec_idx);
+
+                        update_remask_pair_side(
+                            c_plane_info,
+                            invalid_sections,
+                            pair,
+                            pdsch_remask_valid,
+                            pdsch_remask_mismatch,
+                            csirs_remask_mismatch,
+                            sec_idx,
+                            pdsch_expected,
+                            expected_reMask,
+                            reMask);
                     }
-                    // Subset match for per-port modcomp reMasks
-                    uint16_t wire_csirs = c_plane_info.section_infos[sec_idx + 1].reMask;
-                    if (wire_csirs == 0 || (wire_csirs & expected_reMask) != wire_csirs)
+                    else
                     {
-                        csirs_remask_mismatch++;
-                        c_plane_info.section_infos[sec_idx + 1].error_status = -1;
+                        // Unexpected reMask — neither CSI-RS nor PDSCH expected
+                        record_remask_mismatch(
+                            c_plane_info,
+                            invalid_sections,
+                            RemaskChannel::CsiRs,
+                            csirs_remask_mismatch,
+                            sec_idx,
+                            expected_reMask,
+                            reMask);
                     }
                 }
-                if (csirs_remask_mismatch || pdsch_remask_mismatch)
+                remask_mismatch = pdsch_remask_mismatch + csirs_remask_mismatch;
+                if (remask_mismatch)
                 {
-                    re_cons("pdsch_remask_mismatch: {}, csirs_remask_mismatch: {}", pdsch_remask_mismatch, csirs_remask_mismatch);
+                    re_cons("remask_mismatch: {}", remask_mismatch);
                     re_cons("cell_index: {}, symbol: {}, c_plane_info.tv_index {} , remask_idx_base {} ", cell_index, c_plane_info.startSym, c_plane_info.tv_index, remask_idx_base);
-                    for (int sec_idx = 0; sec_idx < c_plane_info.section_infos_size; sec_idx += 2)
+                    for (int sec_idx = 0; sec_idx < c_plane_info.section_infos_size; sec_idx++)
                     {
-                        int remask_idx = remask_idx_base + c_plane_info.section_infos[sec_idx + 1].startPrbc;
+                        int remask_idx = remask_idx_base + c_plane_info.section_infos[sec_idx].startPrbc;
                         expected_reMask = tv_info.csirsREMaskArray[remask_idx];
-                        re_cons("section_id: {}, startPrbc: {}, numPrbc: {}, expected csirs_remask 0x{:x}, received csirs_remask 0x{:x}, expected pdsch_remask 0x{:x}, received pdsch_remask 0x{:x} ", c_plane_info.section_infos[sec_idx + 1].section_id, c_plane_info.section_infos[sec_idx + 1].startPrbc, c_plane_info.section_infos[sec_idx + 1].numPrbc, expected_reMask, c_plane_info.section_infos[sec_idx + 1].reMask, ((~expected_reMask) & 0xFFF), c_plane_info.section_infos[sec_idx].reMask);
+                        re_cons("section_id: {}, startPrbc: {}, numPrbc: {}, reMask 0x{:x}, expected csirs 0x{:x}, expected pdsch 0x{:x}",
+                            c_plane_info.section_infos[sec_idx].section_id,
+                            c_plane_info.section_infos[sec_idx].startPrbc,
+                            c_plane_info.section_infos[sec_idx].numPrbc,
+                            c_plane_info.section_infos[sec_idx].reMask,
+                            expected_reMask,
+                            ((~expected_reMask) & 0xFFF));
                     }
                 }
             }
@@ -1889,6 +2441,38 @@ void RU_Emulator::verify_dl_cplane_content(oran_c_plane_info_t& c_plane_info,
             next += verify_extensions(c_plane_info, section_info, cell_index);
         }
 
+        if (opt_prb_dup_check == RE_ENABLED && c_plane_info.valid_eaxcId &&
+            c_plane_info.eaxcId_index >= 0 &&
+            c_plane_info.eaxcId_index < MAX_FLOWS_PER_DL_CORE)
+        {
+            auto& state = dl_cplane_prb_trackers[cell_index][c_plane_info.eaxcId_index];
+            std::unique_lock<aerial_fh::FHMutex> lock(state.mtx, std::defer_lock);
+            if (prb_tracker_needs_lock_[cell_index])
+                lock.lock();
+            const uint32_t fss_key = fss_to_key(c_plane_info.fss);
+            if (state.current_fss_key != fss_key)
+            {
+                state.tracker.reset();
+                state.current_fss_key = fss_key;
+            }
+            for (int sym = c_plane_info.startSym;
+                 sym < c_plane_info.startSym + section_info.numSymbol; ++sym)
+            {
+                bool had_dups_before = state.tracker.has_duplicates;
+                state.tracker.mark_received(static_cast<uint8_t>(sym),
+                                            section_info.startPrbc,
+                                            section_info.numPrbc,
+                                            section_info.reMask);
+                if (!had_dups_before && state.tracker.has_duplicates)
+                {
+                    re_warn("DL C-plane duplicate REs: cell {} eAxC {} F{}S{}S{} sec {} sym {} startPrbc {} numPrbc {} reMask 0x{:03X}",
+                            cell_index, c_plane_info.eaxcId,
+                            c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
+                            sec_idx, sym, section_info.startPrbc, section_info.numPrbc, section_info.reMask);
+                }
+            }
+        }
+
         if(opt_dlc_tb)
         {
             if(sec_idx && section_info.section_id == c_plane_info.section_infos[sec_idx-1].section_id)
@@ -1940,7 +2524,7 @@ void RU_Emulator::verify_dl_cplane_content(oran_c_plane_info_t& c_plane_info,
     // DL section-header beam ID validation (4T4R and mMIMO non-SE11 sections).
     // Handles three message types:
     //   1. non-CSI-RS (all reMask == 0xFFF): validate all sections against PDSCH/PBCH/PDCCH TV
-    //   2. Paired PDSCH+CSI-RS (even=PDSCH, odd=CSI-RS): validate each section against its channel's TV
+    //   2. Paired PDSCH+CSI-RS (classify by reMask): validate each section against its channel's TV
     //   3. Only CSI-RS (all reMask != 0xFFF, no PDSCH): validate all sections against CSI-RS TV
     //
     // In mMIMO mode, sections carrying SE11 extensions use beamId=0x7FFF as a
@@ -1982,7 +2566,8 @@ void RU_Emulator::verify_dl_cplane_content(oran_c_plane_info_t& c_plane_info,
         // Multiple non-ZP CSI-RS types (TRS, NZP) may coexist in a single TV,
         // each with different beam IDs. Store all sets for multi-set validation.
         const std::vector<std::vector<uint16_t>>* csirs_beam_id_sets = nullptr;
-        if (has_csirs_sections && c_plane_channel_type_checking(c_plane_info, cell_index, csirs_object))
+        bool csirs_channel_matched = has_csirs_sections && c_plane_channel_type_checking(c_plane_info, cell_index, csirs_object);
+        if (csirs_channel_matched)
         {
             int tv_idx = csirs_object.launch_pattern[c_plane_info.launch_pattern_slot].at(cell_index);
             if (tv_idx < csirs_object.tv_info.size() && !csirs_object.tv_info[tv_idx].csirs_beam_id_sets.empty())
@@ -1998,6 +2583,14 @@ void RU_Emulator::verify_dl_cplane_content(oran_c_plane_info_t& c_plane_info,
         size_t num_dl_flows = cell_configs[cell_index].eAxC_DL.size();
 
         // Per-section beam ID validation
+        int remask_idx_base = c_plane_info.startSym * cell_configs[cell_index].ulGridSize;
+        int csirs_tv_idx = 0;
+        bool csirs_tv_valid = false;
+        if (is_paired && csirs_channel_matched)
+        {
+            csirs_tv_idx = csirs_object.launch_pattern[c_plane_info.launch_pattern_slot].at(cell_index);
+            csirs_tv_valid = (csirs_tv_idx < static_cast<int>(csirs_object.tv_info.size()));
+        }
         for (int sec_idx = 0; sec_idx < c_plane_info.numberOfSections; ++sec_idx)
         {
             // In mMIMO, skip SE11 sections — their beam IDs live inside the
@@ -2007,14 +2600,30 @@ void RU_Emulator::verify_dl_cplane_content(oran_c_plane_info_t& c_plane_info,
                 continue;
             }
 
-            // Determine if this section is CSI-RS based on channel ownership
+            // Determine if this section is CSI-RS by reMask classification
             bool is_csirs_section = false;
             if (!has_csirs_sections)
+            {
                 is_csirs_section = false;
-            else if (is_paired)
-                is_csirs_section = (sec_idx % 2 != 0);
+            }
+            else if (is_paired && !csirs_tv_valid)
+            {
+                re_cons("beam_id: CSI-RS TV not found for cell {} eAxC {} F{}S{}S{} sym {} lp_slot {} sec_idx {}",
+                    cell_index, c_plane_info.eaxcId,
+                    c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
+                    c_plane_info.startSym, c_plane_info.launch_pattern_slot, sec_idx);
+            }
+            else if (is_paired && csirs_tv_valid)
+            {
+                int remask_idx = remask_idx_base + c_plane_info.section_infos[sec_idx].startPrbc;
+                auto csirs_expected = csirs_object.tv_info[csirs_tv_idx].csirsREMaskArray[remask_idx];
+                auto reMask = c_plane_info.section_infos[sec_idx].reMask;
+                is_csirs_section = (reMask != 0 && (reMask & csirs_expected) == reMask);
+            }
             else
+            {
                 is_csirs_section = true;
+            }
 
             if (is_csirs_section)
             {
@@ -2090,6 +2699,24 @@ void RU_Emulator::verify_ul_cplane_content(oran_c_plane_info_t& c_plane_info,
         case ORAN_CMSG_SECTION_TYPE_3:
         {
             next += ORAN_CMSG_SECT3_FIELDS_OFFSET;
+            // Test-bench-only PRACH completion counter: count once per distinct
+            // (frame,subframe,slot) tuple so prach_object.total_slot_counters matches
+            // PUSCH's "one per actual slot" semantic. Gated on opt_dlc_tb so the
+            // production RU path is unchanged (it has its own PRACH counter elsewhere).
+            if (opt_dlc_tb
+                && c_plane_info.valid_eaxcId
+                && cell_index < static_cast<int>(MAX_CELLS_PER_SLOT)
+                && c_plane_info.tv_object != nullptr)
+            {
+                const uint32_t key = (static_cast<uint32_t>(c_plane_info.fss.frameId)    << 16) |
+                                     (static_cast<uint32_t>(c_plane_info.fss.subframeId) <<  8) |
+                                      static_cast<uint32_t>(c_plane_info.fss.slotId);
+                const std::lock_guard lk(distinct_prach_slots_mtx[cell_index]);
+                if (distinct_prach_slots_seen[cell_index].insert(key).second) {
+                    ++c_plane_info.tv_object->total_slot_counters[cell_index];
+                    ++c_plane_info.tv_object->throughput_slot_counters[cell_index];
+                }
+            }
         }
         break;
         default:
@@ -2137,6 +2764,50 @@ void RU_Emulator::verify_ul_cplane_content(oran_c_plane_info_t& c_plane_info,
         for(int sym = 0; sym < ORAN_ALL_SYMBOLS; ++sym)
         {
             increment_section_rx_counter(c_plane_info, cell_index, sym);
+        }
+    }
+
+    if (opt_prb_dup_check == RE_ENABLED &&
+        c_plane_info.section_type == ORAN_CMSG_SECTION_TYPE_1)
+    {
+        auto it = (*ul_eaxc_to_tracker_idx_)[cell_index].find(c_plane_info.eaxcId);
+        if (it != (*ul_eaxc_to_tracker_idx_)[cell_index].end() &&
+            it->second < MAX_UL_EAXC_UNIFIED)
+        {
+            auto& state = (*ul_prb_trackers_)[cell_index][it->second];
+            std::unique_lock<aerial_fh::FHMutex> lock(state.mtx, std::defer_lock);
+            if (prb_tracker_needs_lock_[cell_index])
+                lock.lock();
+            const uint32_t fss_key = fss_to_key(c_plane_info.fss);
+            if (state.current_fss_key != fss_key)
+            {
+                state.tracker.reset();
+                state.current_fss_key = fss_key;
+            }
+            for (int sec = 0; sec < c_plane_info.section_infos_size; ++sec)
+            {
+                auto& si = c_plane_info.section_infos[sec];
+                uint16_t numPrbc = si.numPrbc;
+                if (numPrbc == 0)
+                    numPrbc = static_cast<uint16_t>(cell_configs[cell_index].ulGridSize);
+                for (int sym = c_plane_info.startSym;
+                     sym < c_plane_info.startSym + si.numSymbol; ++sym)
+                {
+                    bool had_dups = state.tracker.has_duplicates;
+                    state.tracker.mark_received(
+                        static_cast<uint8_t>(sym), si.startPrbc, numPrbc);
+                    if (!had_dups && state.tracker.has_duplicates)
+                    {
+                        re_warn("UL C-plane duplicate PRBs: cell {} eAxC {} "
+                                "F{}S{}S{} sym {} startPrbc {} numPrbc {}",
+                                cell_index, c_plane_info.eaxcId,
+                                c_plane_info.fss.frameId,
+                                c_plane_info.fss.subframeId,
+                                c_plane_info.fss.slotId,
+                                sym, si.startPrbc, numPrbc);
+                    }
+                }
+            }
         }
     }
 
@@ -3052,13 +3723,16 @@ int RU_Emulator::handle_sect1_c_plane_v2(oran_c_plane_info_t &c_plane_info, uint
         }
     }
     auto now = get_ns();
-    NVLOGI_FMT(TAG_TX_TIMINGS_SUM,"[ST1] {} F{}S{}S{} Cell {} Enqueue Time {}",
+    // Include the actual per-slot-instance U-plane TX packet count (nb_tx) so a
+    // single SUM line per slot is conclusive for RU app-miss vs fronthaul loss
+    // triage, without needing the verbose per-section TAG_TX_TIMINGS enabled.
+    NVLOGI_FMT(TAG_TX_TIMINGS_SUM,"[ST1] {} F{}S{}S{} Cell {} Enqueue Time {} Num Packets {}",
                ul_channel_to_string(c_plane_info.channel_type),
                tx_symbol_info.fss.frameId,
                tx_symbol_info.fss.subframeId,
                tx_symbol_info.fss.slotId,
                cell_index,
-               now);
+               now, nb_tx);
 
     timers.counter_inc_start_t = fine_timers_get_ns();
 
@@ -3802,6 +4476,234 @@ int RU_Emulator::verify_extensions(oran_c_plane_info_t &c_plane_info, oran_c_pla
     return total_ext_len;
 }
 
+void RU_Emulator::reset_dyn_bfw_beamid_slot_refs_and_ts(int cell_index, int eaxc_index, int slot)
+{
+    if (cell_index < 0 || eaxc_index < 0 || slot < 0 ||
+        cell_index >= static_cast<int>(MAX_CELLS_PER_SLOT) ||
+        eaxc_index >= static_cast<int>(MAX_AP_PER_SLOT) ||
+        slot >= static_cast<int>(MAX_LAUNCH_PATTERN_SLOTS))
+    {
+        return;
+    }
+    if (fss_disabled_bfw_dyn_bfw_beam_id_cnt_ptr)
+    {
+        for (auto& sym : (*fss_disabled_bfw_dyn_bfw_beam_id_cnt_ptr)[cell_index][eaxc_index][slot])
+        {
+            sym.store(0, std::memory_order_relaxed);
+        }
+    }
+    if (fss_dyn_bfw_beam_id_last_validation_ts_ptr)
+    {
+        (*fss_dyn_bfw_beam_id_last_validation_ts_ptr)[cell_index][eaxc_index][slot].store(
+            0, std::memory_order_relaxed);
+    }
+}
+
+void RU_Emulator::reset_dyn_bfw_beamid_slot_cache(int cell_index, int eaxc_index, int slot)
+{
+    if (cell_index < 0 || eaxc_index < 0 || slot < 0 ||
+        cell_index >= static_cast<int>(MAX_CELLS_PER_SLOT) ||
+        eaxc_index >= static_cast<int>(MAX_AP_PER_SLOT) ||
+        slot >= static_cast<int>(MAX_LAUNCH_PATTERN_SLOTS))
+    {
+        return;
+    }
+    // Clear full-BW set before publishing epoch 0 so a concurrent Done-phase validator
+    // cannot treat stale full-BW entries as primed after this key is invalidated.
+    if (cell_index < static_cast<int>(cell_configs.size()))
+    {
+        cell_configs[cell_index].dyn_bfw_beam_id_with_full_bw[eaxc_index][slot].clear();
+    }
+    reset_dyn_bfw_beamid_slot_refs_and_ts(cell_index, eaxc_index, slot);
+    // Mark this key not-live without bumping the global epoch (other keys stay Done).
+    if (fss_dyn_bfw_beam_id_slot_epoch_ptr_)
+    {
+        (*fss_dyn_bfw_beam_id_slot_epoch_ptr_)[cell_index][eaxc_index][slot].store(
+            0, std::memory_order_release);
+    }
+}
+
+bool RU_Emulator::dyn_bfw_beamid_slot_cache_live(int cell_index, int eaxc_index, int slot) const
+{
+    if (!fss_dyn_bfw_beam_id_slot_epoch_ptr_ || cell_index < 0 || eaxc_index < 0 || slot < 0 ||
+        cell_index >= static_cast<int>(MAX_CELLS_PER_SLOT) ||
+        eaxc_index >= static_cast<int>(MAX_AP_PER_SLOT) ||
+        slot >= static_cast<int>(MAX_LAUNCH_PATTERN_SLOTS))
+    {
+        return false;
+    }
+    const uint32_t epoch = dyn_bfw_beamid_cache_epoch_.load(std::memory_order_acquire);
+    const uint32_t slot_epoch =
+        (*fss_dyn_bfw_beam_id_slot_epoch_ptr_)[cell_index][eaxc_index][slot].load(
+            std::memory_order_acquire);
+    return slot_epoch != 0 && slot_epoch == epoch;
+}
+
+void RU_Emulator::dyn_bfw_beamid_mark_slot_cache_live(int cell_index, int eaxc_index, int slot)
+{
+    if (!fss_dyn_bfw_beam_id_slot_epoch_ptr_ || cell_index < 0 || eaxc_index < 0 || slot < 0 ||
+        cell_index >= static_cast<int>(MAX_CELLS_PER_SLOT) ||
+        eaxc_index >= static_cast<int>(MAX_AP_PER_SLOT) ||
+        slot >= static_cast<int>(MAX_LAUNCH_PATTERN_SLOTS))
+    {
+        return;
+    }
+    (*fss_dyn_bfw_beam_id_slot_epoch_ptr_)[cell_index][eaxc_index][slot].store(
+        dyn_bfw_beamid_cache_epoch_.load(std::memory_order_relaxed), std::memory_order_release);
+}
+
+RU_Emulator::DynBfwBeamIdWarmupGate RU_Emulator::dyn_bfw_beamid_warmup_gate(int cell_index,
+                                                                            int eaxc_index,
+                                                                            int launch_pattern_slot,
+                                                                            uint8_t frameId,
+                                                                            uint8_t subframeId,
+                                                                            uint8_t slotId)
+{
+    using Phase = DynBfwBeamIdWarmupPhase;
+
+    constexpr DynBfwBeamIdWarmupGate k_done_gate{false, false}; // save + delayed validate
+    if (!fss_dyn_bfw_beamid_warmup_phase_ptr_ || !fss_dyn_bfw_beamid_warmup_visit_ptr_ ||
+        cell_index < 0 || eaxc_index < 0 || launch_pattern_slot < 0 ||
+        cell_index >= static_cast<int>(MAX_CELLS_PER_SLOT) ||
+        eaxc_index >= static_cast<int>(MAX_AP_PER_SLOT) ||
+        launch_pattern_slot >= static_cast<int>(MAX_LAUNCH_PATTERN_SLOTS))
+    {
+        return k_done_gate;
+    }
+
+    auto& phase_atomic =
+        (*fss_dyn_bfw_beamid_warmup_phase_ptr_)[cell_index][eaxc_index][launch_pattern_slot];
+    auto& visit_atomic =
+        (*fss_dyn_bfw_beamid_warmup_visit_ptr_)[cell_index][eaxc_index][launch_pattern_slot];
+
+    const auto is_barrier = [](Phase p) {
+        return p == Phase::Resetting || p == Phase::Finishing;
+    };
+    const auto load_phase = [&]() {
+        return static_cast<Phase>(phase_atomic.load(std::memory_order_acquire));
+    };
+    const auto gate_for_phase = [](Phase p) -> DynBfwBeamIdWarmupGate {
+        if (p == Phase::Done)
+        {
+            return {false, false};
+        }
+        if (p == Phase::Prime)
+        {
+            return {false, true}; // save, skip validate
+        }
+        // Observe or barrier
+        return {true, true};
+    };
+
+    Phase phase = load_phase();
+    if (phase == Phase::Done)
+    {
+        return k_done_gate;
+    }
+    if (is_barrier(phase))
+    {
+        return {true, true};
+    }
+
+    // One visit = one distinct radio FSS for this key. Same abs_slot → stay in phase
+    // for the whole Ext11 burst (no mid-slot Observe→Prime wipe).
+    const uint64_t slots_per_subframe = static_cast<uint64_t>(max_slot_id) + 1;
+    const uint64_t slots_per_frame =
+        static_cast<uint64_t>(ORAN_MAX_SUBFRAME_ID) * slots_per_subframe;
+    const uint64_t abs_slot = static_cast<uint64_t>(frameId) * slots_per_frame +
+                              static_cast<uint64_t>(subframeId) * slots_per_subframe +
+                              static_cast<uint64_t>(slotId);
+    const uint64_t visit_marker = abs_slot + 1; // 0 remains unset
+
+    uint64_t last_marker = visit_atomic.load(std::memory_order_acquire);
+    if (last_marker == 0)
+    {
+        uint64_t expected = 0;
+        if (visit_atomic.compare_exchange_strong(
+                expected, visit_marker, std::memory_order_acq_rel, std::memory_order_acquire))
+        {
+            re_dbg("BFW beamId observe: Cell {} Flow {} slot_id {} F{}S{}S{}",
+                   cell_index, eaxc_index, launch_pattern_slot, frameId, subframeId, slotId);
+            return {true, true}; // first visit starts in Observe
+        }
+        last_marker = expected;
+    }
+
+    if (last_marker == visit_marker)
+    {
+        // Same radio slot occurrence — keep current phase for the whole burst.
+        return gate_for_phase(load_phase());
+    }
+
+    // New radio-slot visit: exactly one thread advances the phase for this key.
+    if (!visit_atomic.compare_exchange_strong(
+            last_marker, visit_marker, std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+        // Lost the visit CAS — another core owns the transition; follow published phase.
+        phase = load_phase();
+        if (is_barrier(phase))
+        {
+            return {true, true};
+        }
+        return gate_for_phase(phase);
+    }
+
+    phase = load_phase();
+    if (phase == Phase::Done)
+    {
+        return k_done_gate;
+    }
+    if (is_barrier(phase))
+    {
+        return {true, true};
+    }
+
+    if (phase == Phase::Observe)
+    {
+        uint8_t expected = static_cast<uint8_t>(Phase::Observe);
+        if (phase_atomic.compare_exchange_strong(
+                expected, static_cast<uint8_t>(Phase::Resetting), std::memory_order_acq_rel,
+                std::memory_order_acquire))
+        {
+            re_dbg("BFW beamId observe complete: Cell {} Flow {} slot_id {} F{}S{}S{}; starting prime",
+                   cell_index, eaxc_index, launch_pattern_slot, frameId, subframeId, slotId);
+            reset_dyn_bfw_beamid_slot_cache(cell_index, eaxc_index, launch_pattern_slot);
+            phase_atomic.store(static_cast<uint8_t>(Phase::Prime), std::memory_order_release);
+            // Skip save on the first packet of the Prime visit so writes start clean.
+            return {true, true};
+        }
+        phase = load_phase();
+        if (is_barrier(phase))
+        {
+            return {true, true};
+        }
+        return gate_for_phase(phase);
+    }
+
+    if (phase == Phase::Prime)
+    {
+        uint8_t expected = static_cast<uint8_t>(Phase::Prime);
+        if (phase_atomic.compare_exchange_strong(
+                expected, static_cast<uint8_t>(Phase::Finishing), std::memory_order_acq_rel,
+                std::memory_order_acquire))
+        {
+            re_dbg("BFW beamId prime complete: Cell {} Flow {} slot_id {} F{}S{}S{}; enabling validation",
+                   cell_index, eaxc_index, launch_pattern_slot, frameId, subframeId, slotId);
+            reset_dyn_bfw_beamid_slot_refs_and_ts(cell_index, eaxc_index, launch_pattern_slot);
+            phase_atomic.store(static_cast<uint8_t>(Phase::Done), std::memory_order_release);
+            return {true, true};
+        }
+        phase = load_phase();
+        if (is_barrier(phase))
+        {
+            return {true, true};
+        }
+        return gate_for_phase(phase);
+    }
+
+    return k_done_gate;
+}
+
 inline void RU_Emulator::dynamic_beamid_validation(oran_c_plane_info_t &c_plane_info, int cell_index)
 {
     auto eaxcId_index =  c_plane_info.eaxcId_index;
@@ -3813,6 +4715,32 @@ inline void RU_Emulator::dynamic_beamid_validation(oran_c_plane_info_t &c_plane_
     }
     auto &disabled_bfw_dyn_bfw_beam_id = fss_disabled_bfw_dyn_bfw_beam_id[cell_index][eaxcId_index][slot_3gpp];
     auto &beam_id_cache = fss_dyn_bfw_beam_id[cell_index][eaxcId_index][slot_3gpp];
+    const bool cache_live = dyn_bfw_beamid_slot_cache_live(cell_index, eaxcId_index, slot_3gpp);
+
+    // Slot-local prime only (live beam_id_cache epoch and per-slot full-BW set).
+    const bool cache_primed = cache_live && [&]() {
+        for (int prb = 0; prb < ORAN_MAX_PRB_X_SLOT; prb++)
+        {
+            if (beam_id_cache[prb][0] >= oran_beam_id_info.dynamic_beam_id_start)
+            {
+                return true;
+            }
+        }
+        return false;
+    }();
+    const bool full_bw_primed =
+        cache_live &&
+        !cell_configs[cell_index].dyn_bfw_beam_id_with_full_bw[eaxcId_index][slot_3gpp].empty();
+    if (!cache_primed && !full_bw_primed)
+    {
+        re_cons("Skipping dynamic beamId validation (cold cache): Cell {} Flow {} F{}S{}S{} slot_3gpp {} - waiting for disableBFWs=0 prime",
+                cell_index, eaxcId_index, c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId, slot_3gpp);
+        for (int sym = 0; sym < SLOT_NUM_SYMS; sym++)
+        {
+            fss_disabled_bfw_dyn_bfw_beam_id_cnt[cell_index][eaxcId_index][slot_3gpp][sym].store(0);
+        }
+        return;
+    }
 
     bool dump = false;
     for (int sym = 0; sym < SLOT_NUM_SYMS; sym++)
@@ -3820,18 +4748,34 @@ inline void RU_Emulator::dynamic_beamid_validation(oran_c_plane_info_t &c_plane_
         if (dump)
             break;
         auto &beam_id_cnt = fss_disabled_bfw_dyn_bfw_beam_id_cnt[cell_index][eaxcId_index][slot_3gpp][sym];
-        for (int i = 0; i < beam_id_cnt.load(); i++)
+        const int loaded_refs = beam_id_cnt.load();
+        const int ref_count =
+            (loaded_refs < static_cast<int>(ORAN_MAX_PRB_X_SLOT)) ? loaded_refs
+                                                                  : static_cast<int>(ORAN_MAX_PRB_X_SLOT);
+        for (int i = 0; i < ref_count; i++)
         {
-            auto cur_prb = disabled_bfw_dyn_bfw_beam_id[sym][i][0];
+            const auto cur_prb_u = disabled_bfw_dyn_bfw_beam_id[sym][i][0];
             auto beamId = disabled_bfw_dyn_bfw_beam_id[sym][i][1];
+            if (cur_prb_u >= ORAN_MAX_PRB_X_SLOT)
+            {
+                re_cons("Dynamic beamId ref out of range: Cell {} Flow {} F{}S{}S{} slot_3gpp {} Symbol {} cur_prb {} - dropping refs",
+                        cell_index, eaxcId_index, c_plane_info.fss.frameId, c_plane_info.fss.subframeId,
+                        c_plane_info.fss.slotId, slot_3gpp, sym, cur_prb_u);
+                for (int s = 0; s < SLOT_NUM_SYMS; s++)
+                {
+                    fss_disabled_bfw_dyn_bfw_beam_id_cnt[cell_index][eaxcId_index][slot_3gpp][s].store(0);
+                }
+                return;
+            }
+            const int cur_prb = static_cast<int>(cur_prb_u);
             bool found = false;
             uint16_t expected_beam_id = 0;
-            if (beam_id_cache[cur_prb][0] >= oran_beam_id_info.dynamic_beam_id_start)
+            if (cache_live && beam_id_cache[cur_prb][0] >= oran_beam_id_info.dynamic_beam_id_start)
             {
                 found = true;
                 expected_beam_id = beam_id_cache[cur_prb][0];
             }
-            else
+            else if (cache_live)
             {
                 for (int prb = 0; prb < ORAN_MAX_PRB_X_SLOT; prb++)
                 {
@@ -3849,12 +4793,45 @@ inline void RU_Emulator::dynamic_beamid_validation(oran_c_plane_info_t &c_plane_
 
             if (!found)
             {
-                auto &beam_id_set_full_bw = cell_configs[cell_index].dyn_bfw_beam_id_with_full_bw[eaxcId_index];
+                auto &beam_id_set_full_bw =
+                    cell_configs[cell_index].dyn_bfw_beam_id_with_full_bw[eaxcId_index][slot_3gpp];
                 if (beam_id_set_full_bw.count(beamId))
                 {
                     found = true;
                     expected_beam_id = beamId;
                 }
+            }
+
+            // In-range but not found, or found-but-mismatch: disableBFWs=1 / disableBFWs=0
+            // from different successive launch-pattern cycles after an RU mid-stream restart.
+            // Soft-clear refs and adopt the received id into this PRB so the cache catches
+            // up to the DU (clear-only left the cache one generation behind forever
+            // on slot_3gpp 16 — see F44/F46/F48 oscillation). Do not wipe the whole slot
+            // cache (that caused the ru_02 storm). Out-of-range IDs still hard-fail below.
+            const bool in_range =
+                (beamId >= oran_beam_id_info.dynamic_beam_id_start) &&
+                (beamId <= oran_beam_id_info.dynamic_beam_id_end);
+            if (in_range && (!found || expected_beam_id != beamId))
+            {
+                if (!found)
+                {
+                    re_dbg("Dynamic beamId not in cache yet (disableBFWs=1 before prime): Cell {} Flow {} F{}S{}S{} slot_3gpp {} Symbol {} cur_prb {} beamId {} - adopting",
+                            cell_index, eaxcId_index, c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
+                            slot_3gpp, sym, cur_prb, beamId);
+                }
+                else
+                {
+                    re_dbg("Dynamic beamId epoch desync (RU restart): Cell {} Flow {} F{}S{}S{} slot_3gpp {} Symbol {} cur_prb {} expected {} received {} - adopting",
+                            cell_index, eaxcId_index, c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
+                            slot_3gpp, sym, cur_prb, expected_beam_id, beamId);
+                }
+                beam_id_cache[cur_prb][0] = static_cast<uint16_t>(beamId);
+                dyn_bfw_beamid_mark_slot_cache_live(cell_index, eaxcId_index, slot_3gpp);
+                for (int s = 0; s < SLOT_NUM_SYMS; s++)
+                {
+                    fss_disabled_bfw_dyn_bfw_beam_id_cnt[cell_index][eaxcId_index][slot_3gpp][s].store(0);
+                }
+                return;
             }
 
             if (beamId < oran_beam_id_info.dynamic_beam_id_start || !found || expected_beam_id != beamId)
@@ -3885,7 +4862,11 @@ inline void RU_Emulator::dynamic_beamid_validation(oran_c_plane_info_t &c_plane_
         for (int sym = 0; sym < SLOT_NUM_SYMS; sym++)
         {
             auto &beam_id_cnt = fss_disabled_bfw_dyn_bfw_beam_id_cnt[cell_index][eaxcId_index][slot_3gpp][sym];
-            for (int i = 0; i < beam_id_cnt.load(); i++)
+            const int loaded_refs = beam_id_cnt.load();
+            const int ref_count =
+                (loaded_refs < static_cast<int>(ORAN_MAX_PRB_X_SLOT)) ? loaded_refs
+                                                                      : static_cast<int>(ORAN_MAX_PRB_X_SLOT);
+            for (int i = 0; i < ref_count; i++)
             {
                 auto cur_prb = disabled_bfw_dyn_bfw_beam_id[sym][i][0];
                 auto beamId = disabled_bfw_dyn_bfw_beam_id[sym][i][1];
@@ -3960,21 +4941,49 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
             }
         }
 
-        static const uint64_t delayed_ns = static_cast<uint64_t>(NS_X_US) * opt_tti_us * (launch_pattern_slot_size - 5);
-        auto last_validation_ts = fss_dyn_bfw_beam_id_last_validation_ts[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot].load();
-        if (last_validation_ts != 0 && (get_ns() - last_validation_ts) > delayed_ns)
+        const auto beamid_gate = dyn_bfw_beamid_warmup_gate(
+            cell_index, c_plane_info.eaxcId_index, c_plane_info.launch_pattern_slot,
+            c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId);
+        const bool skip_beamid_save = beamid_gate.skip_save;
+        const bool skip_beamid_validate = beamid_gate.skip_validate;
+
+        // Delayed-validation cadence matches develop, but only after this
+        // (cell, eAxC, launch_pattern_slot) warmup reaches Done. Timestamp is per-key;
+        // Ext11 for a given pattern slot arrives once per pattern period so the delay
+        // elapses and validation runs under the beam-ID mutex once per cycle.
+        if (!skip_beamid_validate)
         {
-            const std::lock_guard<aerial_fh::FHMutex> lock(fss_dyn_bfw_beam_id_mtx[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot]);
-            last_validation_ts = fss_dyn_bfw_beam_id_last_validation_ts[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot].load();
+            static const uint64_t delayed_ns =
+                static_cast<uint64_t>(NS_X_US) * opt_tti_us *
+                static_cast<uint64_t>(
+                    (launch_pattern_slot_size > 5) ? (launch_pattern_slot_size - 5) : 1);
+            auto last_validation_ts =
+                FSS_DYN_BFW_BEAM_ID_LAST_VALIDATION_TS[cell_index][c_plane_info.eaxcId_index]
+                                                     [c_plane_info.launch_pattern_slot]
+                                                         .load();
             if (last_validation_ts != 0 && (get_ns() - last_validation_ts) > delayed_ns)
             {
-                dynamic_beamid_validation(c_plane_info, cell_index);
+                const std::lock_guard<aerial_fh::FHMutex> lock(
+                    FSS_DYN_BFW_BEAM_ID_MTX[cell_index][c_plane_info.eaxcId_index]
+                                           [c_plane_info.launch_pattern_slot]);
+                last_validation_ts =
+                    FSS_DYN_BFW_BEAM_ID_LAST_VALIDATION_TS[cell_index][c_plane_info.eaxcId_index]
+                                                         [c_plane_info.launch_pattern_slot]
+                                                             .load();
+                if (last_validation_ts != 0 && (get_ns() - last_validation_ts) > delayed_ns)
+                {
+                    dynamic_beamid_validation(c_plane_info, cell_index);
+                }
+                FSS_DYN_BFW_BEAM_ID_LAST_VALIDATION_TS[cell_index][c_plane_info.eaxcId_index]
+                                                     [c_plane_info.launch_pattern_slot]
+                                                         .store(get_ns());
             }
-            fss_dyn_bfw_beam_id_last_validation_ts[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot].store(get_ns());
-        }
-        else
-        {
-            fss_dyn_bfw_beam_id_last_validation_ts[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot].store(get_ns());
+            else
+            {
+                FSS_DYN_BFW_BEAM_ID_LAST_VALIDATION_TS[cell_index][c_plane_info.eaxcId_index]
+                                                     [c_plane_info.launch_pattern_slot]
+                                                         .store(get_ns());
+            }
         }
 
         auto &tv_info = tv_object->tv_info[c_plane_info.tv_index];
@@ -4007,6 +5016,11 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
             }
             auto &startPrbc = section_info.startPrbc;
             auto numPrbc = section_info.numPrbc;
+
+            // Full-carrier wideband tiling: numPrbc=all PRBs with numBundPrb at the
+            // 255 cap tiles one beam across the lead bundle + orphan, sharing a beam ID.
+            const bool wideband_tiling = (numPrbc == cell_configs[cell_index].dlGridSize && numBundPrb == 255);
+
             if(numPrbc == 0) //all PRBs are used
             {
                 numPrbc = cell_configs[cell_index].dlGridSize;
@@ -4022,6 +5036,9 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
                 uint8_t *packet_bundle_ptr = curr_ptr;
                 int numPrbBundles = (numPrbc + numBundPrb - 1) / numBundPrb;
                 auto seen = cell_configs[cell_index].dbt_cfg.static_beamIdx_seen;
+                // Only wideband full-carrier tiling shares a beam ID across its
+                // consecutive bundles; every other config must flag a repeated beam ID.
+                int prev_beam_id = -1;
 
                 for (int i = 0; i < numPrbBundles; ++i)
                 {
@@ -4033,7 +5050,8 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
                     uint16_t beam_id = bfwCompParam_ptr->beamId.get();
                     packet_bundle_ptr += 2;
 
-                    if (seen.find(beam_id) != seen.end())
+                    if (!(wideband_tiling && static_cast<int>(beam_id) == prev_beam_id) &&
+                        seen.find(beam_id) != seen.end())
                     {
 
                         if (opt_dlc_tb)
@@ -4048,6 +5066,7 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
                         }
                     }
                     seen[beam_id] = true;
+                    prev_beam_id = beam_id;
 
                     for (int j = 0; j < L_TRX; j++)
                     {
@@ -4204,9 +5223,63 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
             offset += start_bundle_index * (bundleIQByteSize + 1); // + 1 for exponent
             uint8_t *tv_bundle_ptr = &slot_buf[offset];
 
+            // Cache saves under the same slot mutex as dynamic_beamid_validation(), then
+            // unlock before IQ compares (holding the lock across memcmp/fixedpt regresses
+            // 64TR UL ontime). Header-only walk is cheap vs IQ.
+            if (!skip_beamid_save)
+            {
+                const std::lock_guard<aerial_fh::FHMutex> beamid_save_lock(
+                    FSS_DYN_BFW_BEAM_ID_MTX[cell_index][c_plane_info.eaxcId_index]
+                                           [c_plane_info.launch_pattern_slot]);
+                uint8_t *save_ptr = curr_ptr;
+                int save_prb = startPrbc;
+                bool saved_any = false;
+                bool hit_oob_beam_id = false;
+                for (int i = 0; i < numPrbBundles; ++i)
+                {
+                    auto bfwCompParam_ptr =
+                        reinterpret_cast<oran_cmsg_sect_ext_type_11_disableBFWs_0_bfp_compressed_bundle_hdr *>(
+                            save_ptr);
+                    const uint16_t beamId = bfwCompParam_ptr->beamId.get();
+                    if ((beamId < oran_beam_id_info.dynamic_beam_id_start) ||
+                        (beamId > oran_beam_id_info.dynamic_beam_id_end))
+                    {
+                        // Range errors are reported in the IQ loop below.
+                        hit_oob_beam_id = true;
+                        break;
+                    }
+                    if (bfwPrbGrpSize == MAX_NUM_PRBS_PER_SYMBOL)
+                    {
+                        cell_configs[cell_index]
+                            .dyn_bfw_beam_id_with_full_bw[c_plane_info.eaxcId_index]
+                                                        [c_plane_info.launch_pattern_slot]
+                            .insert(beamId);
+                        saved_any = true;
+                    }
+                    else if (save_prb < ORAN_MAX_PRB_X_SLOT)
+                    {
+                        fss_dyn_bfw_beam_id[cell_index][c_plane_info.eaxcId_index]
+                                          [c_plane_info.launch_pattern_slot][save_prb][0] = beamId;
+                        fss_dyn_bfw_beam_id[cell_index][c_plane_info.eaxcId_index]
+                                          [c_plane_info.launch_pattern_slot][save_prb][1] =
+                            static_cast<uint16_t>(bfwPrbGrpSize);
+                        saved_any = true;
+                    }
+                    save_prb += numBundPrb;
+                    save_ptr += 1 + 2 + bundleIQByteSize;
+                }
+                // Publish live only after a clean save. An OOB break (or empty save) must
+                // not flip the slot epoch: invalidate is epoch-only and leaves per-PRB
+                // entries, so a live mark would expose stale PRBs to Done-phase validation.
+                if (saved_any && !hit_oob_beam_id)
+                {
+                    dyn_bfw_beamid_mark_slot_cache_live(
+                        cell_index, c_plane_info.eaxcId_index, c_plane_info.launch_pattern_slot);
+                }
+            }
+
             uint8_t *packet_bundle_ptr = curr_ptr;
 
-            auto cur_prb = startPrbc;
             for (int i = 0; i < numPrbBundles; ++i)
             {
                 // todo validate bfwCompParam
@@ -4233,18 +5306,6 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
                         do_throw(sb() << "Erroneous dynamic beam Id detected, 'disableBFWs = 0 !");
                     }
                 }
-
-                if (bfwPrbGrpSize == MAX_NUM_PRBS_PER_SYMBOL)
-                {
-                    cell_configs[cell_index].dyn_bfw_beam_id_with_full_bw[c_plane_info.eaxcId_index].insert(beamId);
-                }
-                else
-                {
-                    fss_dyn_bfw_beam_id[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot][cur_prb][0] = beamId;
-                    fss_dyn_bfw_beam_id[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot][cur_prb][1] = (uint16_t)bfwPrbGrpSize;
-                }
-
-                cur_prb += numBundPrb;
 
                 bfwCompParam_ptr = reinterpret_cast<oran_cmsg_sect_ext_type_11_disableBFWs_0_bfp_compressed_bundle_hdr *>(tv_bundle_ptr);
                 uint8_t tv_exp = bfwCompParam_ptr->bfwCompParam.exponent.get();
@@ -4322,28 +5383,55 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
 
             auto & disabled_bfw_dyn_bfw_beam_id = fss_disabled_bfw_dyn_bfw_beam_id[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot][c_plane_info.startSym];
             auto cur_prb = startPrbc;
+            auto& beam_id_cnt = fss_disabled_bfw_dyn_bfw_beam_id_cnt[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot][c_plane_info.startSym];
+            // Same slot mutex as dynamic_beamid_validation(): write tuple then publish cnt
+            // so the validator never observes a new count with an uninitialized entry.
+            std::unique_lock<aerial_fh::FHMutex> lock(
+                FSS_DYN_BFW_BEAM_ID_MTX[cell_index][c_plane_info.eaxcId_index]
+                                       [c_plane_info.launch_pattern_slot],
+                std::defer_lock);
+            if (!skip_beamid_save)
             {
-                const std::lock_guard<aerial_fh::FHMutex> lock(fss_dyn_bfw_beam_id_mtx[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot]);
-                auto& beam_id_cnt = fss_disabled_bfw_dyn_bfw_beam_id_cnt[cell_index][c_plane_info.eaxcId_index][c_plane_info.launch_pattern_slot][c_plane_info.startSym];
-                for (int i = 0; i < numPrbBundles; ++i)
+                lock.lock();
+            }
+            for (int i = 0; i < numPrbBundles; ++i)
+            {
+                auto bundle_ptr = reinterpret_cast<oran_cmsg_sect_ext_type_11_disableBFWs_1_bundle *>(packet_bundle_ptr);
+                packet_bundle_ptr += sizeof(oran_cmsg_sect_ext_type_11_disableBFWs_1_bundle);
+
+                if (unlikely(bundle_ptr->reserved.get()))
                 {
-                    auto bundle_ptr = reinterpret_cast<oran_cmsg_sect_ext_type_11_disableBFWs_1_bundle *>(packet_bundle_ptr);
-                    packet_bundle_ptr += sizeof(oran_cmsg_sect_ext_type_11_disableBFWs_1_bundle);
-
-                    if (unlikely(bundle_ptr->reserved.get()))
-                    {
-                        re_warn("Ext11 header(disableBFWs_1) reserved bits not set to 0. F{}S{}S{} Sym {} eAxC ID {} ", c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId, c_plane_info.startSym, c_plane_info.eaxcId);
-                    }
-
-                    auto beamId = bundle_ptr->beamId.get();
-
-                    int cnt = beam_id_cnt.fetch_add(1);
-                    disabled_bfw_dyn_bfw_beam_id[cnt][0] = cur_prb;
-                    disabled_bfw_dyn_bfw_beam_id[cnt][1] = beamId;
-                    //disabled_bfw_dyn_bfw_beam_id[cnt][2] = get_ns();
-                    //disabled_bfw_dyn_bfw_beam_id[cnt][3] = cnt;
-                    cur_prb += numBundPrb;
+                    re_warn("Ext11 header(disableBFWs_1) reserved bits not set to 0. F{}S{}S{} Sym {} eAxC ID {} ", c_plane_info.fss.frameId, c_plane_info.fss.subframeId, c_plane_info.fss.slotId, c_plane_info.startSym, c_plane_info.eaxcId);
                 }
+
+                auto beamId = bundle_ptr->beamId.get();
+
+                if (!skip_beamid_save)
+                {
+                    // Ref table is sized ORAN_MAX_PRB_X_SLOT; overflowing corrupts adjacent
+                    // heap (can smash shared PDSCH modComp TV payloads → multi-cell
+                    // Invalid byte-match). Stop the counter at the table limit.
+                    int cnt = static_cast<int>(beam_id_cnt.load(std::memory_order_relaxed));
+                    if (cnt < ORAN_MAX_PRB_X_SLOT)
+                    {
+                        disabled_bfw_dyn_bfw_beam_id[cnt][0] = cur_prb;
+                        disabled_bfw_dyn_bfw_beam_id[cnt][1] = beamId;
+                        beam_id_cnt.store(cnt + 1, std::memory_order_relaxed);
+                    }
+                    else if (cnt == ORAN_MAX_PRB_X_SLOT)
+                    {
+                        // Advance once past full so we only warn on the first excess ref.
+                        if (beam_id_cnt.compare_exchange_strong(
+                                cnt, cnt + 1, std::memory_order_relaxed, std::memory_order_relaxed))
+                        {
+                            re_warn("Ext11 disableBFWs=1 beamId ref table full: Cell {} Flow {} F{}S{}S{} Sym {} - dropping excess refs",
+                                    cell_index, c_plane_info.eaxcId_index, c_plane_info.fss.frameId,
+                                    c_plane_info.fss.subframeId, c_plane_info.fss.slotId,
+                                    c_plane_info.startSym);
+                        }
+                    }
+                }
+                cur_prb += numBundPrb;
             }
 
             return extLen;
@@ -4376,7 +5464,11 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
                 ++tv_object->throughput_slot_counters[cell_index];
                 ++tv_object->good_slot_counters[cell_index];
             }
-            ++tv_object->total_slot_counters[cell_index];
+            // Test-bench mode: only count an error-free slot as completed.
+            if (!opt_dlc_tb || !tv_object->invalid_flag[cell_index][c_plane_info.launch_pattern_slot])
+            {
+                ++tv_object->total_slot_counters[cell_index];
+            }
             tv_object->invalid_flag[cell_index][c_plane_info.launch_pattern_slot] = false;
         }
     }
@@ -4580,7 +5672,11 @@ int RU_Emulator::verify_extType11(uint8_t *section_ptr, oran_c_plane_info_t &c_p
                 ++tv_object->throughput_slot_counters[cell_index];
                 ++tv_object->good_slot_counters[cell_index];
             }
-            ++tv_object->total_slot_counters[cell_index];
+            // Test-bench mode: only count an error-free slot as completed.
+            if (!opt_dlc_tb || !tv_object->invalid_flag[cell_index][c_plane_info.launch_pattern_slot])
+            {
+                ++tv_object->total_slot_counters[cell_index];
+            }
             tv_object->invalid_flag[cell_index][c_plane_info.launch_pattern_slot] = false;
         }
     }
@@ -4866,6 +5962,16 @@ void RU_Emulator::parse_c_plane(oran_c_plane_info_t& c_plane_info, int nb_rx, in
     }
 
     c_plane_info.section_infos_size = 0;
+    if (unlikely(c_plane_info.numberOfSections > MAX_NUM_SECTIONS_PER_C_PLANE))
+    {
+        do_throw(sb() << "CPlane numberOfSections " << (int)c_plane_info.numberOfSections
+            << " exceeds max " << MAX_NUM_SECTIONS_PER_C_PLANE
+            << ", F" << (int)c_plane_info.fss.frameId
+            << "S" << (int)c_plane_info.fss.subframeId
+            << "S" << (int)c_plane_info.fss.slotId
+            << " Sym " << (int)c_plane_info.startSym
+            << " eAxC ID " << c_plane_info.eaxcId);
+    }
     for(int i = 0; i < c_plane_info.numberOfSections; ++i)
     {
         oran_c_plane_section_info_t& section_info = c_plane_info.section_infos[c_plane_info.section_infos_size++];
@@ -5242,57 +6348,28 @@ void* RU_Emulator::cplane_core(void *arg) {
                     num_tx_pkts = tx_slot_precomputed(slot_tx, cell_index,
                                                      timers, txqs.data(), &tx_request, profiler_ptr);
 
-                    // PRACH (section type 3) is not precomputed; handle via original path
-                    for (int ci = 0; ci < slot_tx.c_plane_infos_size; ++ci) {
-                        auto& cpi = slot_tx.c_plane_infos[ci];
-                        if (cpi.dir == DIRECTION_DOWNLINK || cpi.section_type != ORAN_CMSG_SECTION_TYPE_3)
-                            continue;
-                        int prach_tx = 0;
-                        if (opt_enable_mmimo) {
-                            for (int sym = 0; sym < ORAN_ALL_SYMBOLS; ++sym)
-                                prach_tx += handle_sect3_c_plane(cpi, cell_index, timers, txqs.data(), &tx_request, sym);
-                        } else {
-                            prach_tx = handle_sect3_c_plane_v2(cpi, cell_index, timers, txqs.data(), &tx_request);
-                        }
-                        num_tx_pkts += prach_tx;
-                        auto& tv_object = cpi.tv_object;
-                        tv_object->u_plane_tx[cell_index] += prach_tx;
-                        tv_object->u_plane_tx_tot[cell_index] += prach_tx;
-                        if (opt_enable_mmimo) {
-                            // Legacy mMIMO tx_slot() increments once per symbol
-                            // iteration; the sym loop skips when startSym > sym.
-                            const int n = ORAN_ALL_SYMBOLS - cpi.startSym;
-                            tv_object->c_plane_rx[cell_index] += n;
-                            tv_object->c_plane_rx_tot[cell_index] += n;
-                        } else {
+                    // PRACH (section type 3) for non-mMIMO precomputed path:
+                    // still handled here. The mMIMO precomputed path now
+                    // interleaves PRACH per symbol inside tx_slot_precomputed()
+                    // so PRACH lands on the same TXQ as PUSCH/PUCCH for that
+                    // symbol (matching legacy tx_slot() mMIMO ordering).
+                    if (!opt_enable_mmimo)
+                    {
+                        for (int ci = 0; ci < slot_tx.c_plane_infos_size; ++ci) {
+                            auto& cpi = slot_tx.c_plane_infos[ci];
+                            if (cpi.dir == DIRECTION_DOWNLINK || cpi.section_type != ORAN_CMSG_SECTION_TYPE_3)
+                                continue;
+                            int prach_tx = handle_sect3_c_plane_v2(cpi, cell_index, timers, txqs.data(), &tx_request);
+                            num_tx_pkts += prach_tx;
+                            auto& tv_object = cpi.tv_object;
+                            tv_object->u_plane_tx[cell_index] += prach_tx;
+                            tv_object->u_plane_tx_tot[cell_index] += prach_tx;
                             ++tv_object->c_plane_rx[cell_index];
                             ++tv_object->c_plane_rx_tot[cell_index];
-                        }
 
-                        if (cpi.valid_eaxcId)
-                        {
-                            int counter_index = cpi.fss.subframeId * ORAN_MAX_SLOT_ID + cpi.fss.slotId;
-                            if (opt_enable_mmimo)
+                            if (cpi.valid_eaxcId)
                             {
-                                const uint16_t prev_count = tv_object->section_rx_counters[cell_index][counter_index].fetch_add(
-                                    1, std::memory_order_acq_rel);
-                                const uint16_t new_count = prev_count + 1;
-                                const uint16_t expected_count = cell_configs[cell_index].num_valid_PRACH_flows;
-                                if (new_count == expected_count)
-                                {
-                                    tv_object->section_rx_counters[cell_index][counter_index].store(0, std::memory_order_release);
-                                    ++tv_object->throughput_slot_counters[cell_index];
-                                    ++tv_object->total_slot_counters[cell_index];
-                                }
-                                else if (new_count > expected_count)
-                                {
-                                    re_warn("Section counter overflow: cell_index={}, counter_index={}, new_count={}, expected_count={}",
-                                            cell_index, counter_index, new_count, expected_count);
-                                    tv_object->section_rx_counters[cell_index][counter_index].store(0, std::memory_order_release);
-                                }
-                            }
-                            else
-                            {
+                                int counter_index = cpi.fss.subframeId * ORAN_MAX_SLOT_ID + cpi.fss.slotId;
                                 ++tv_object->section_rx_counters[cell_index][counter_index];
                                 if (tv_object->section_rx_counters[cell_index][counter_index].load() == cell_configs[cell_index].num_valid_PRACH_flows)
                                 {

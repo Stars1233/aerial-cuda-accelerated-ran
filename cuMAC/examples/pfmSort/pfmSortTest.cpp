@@ -203,7 +203,7 @@ uint16_t pfm_data_manage_t::get_ue_idx_in_list(const uint16_t cell_id, uint16_t 
 
 ue_id_rnti_t pfm_data_manage_t::get_ue_id_rnti(const uint16_t cell_id, uint16_t ue_idx) { // get the cuMAC 0-based ID and RNTI of a UE
     if (ue_idx >= ue_list[cell_id].size()) {
-        printf("UE index %d is out of range in the UE list for PFM sorting of cell %d. Current number of UEs for PFM sorting: %d\n", ue_idx, cell_id, ue_list[cell_id].size());
+        printf("UE index %d is out of range in the UE list for PFM sorting of cell %d. Current number of UEs for PFM sorting: %zu\n", ue_idx, cell_id, ue_list[cell_id].size());
         return ue_id_rnti_t(0xFFFF, 0xFFFF);
     }
     return ue_list[cell_id][ue_idx];
@@ -742,7 +742,7 @@ bool pfm_data_manage_t::pfm_load_tv_H5(const std::string& tv_name, std::vector<c
         int num_cell = pfm_cell_info.size();
 
         if (num_cell != pfm_output_cell_info.size()) {
-            printf("ERROR: PFM sorting - number of cells in the output cell info array and the input cell info array are different: %d vs %d\n", num_cell, pfm_output_cell_info.size());
+            printf("ERROR: PFM sorting - number of cells in the output cell info array and the input cell info array are different: %d vs %zu\n", num_cell, pfm_output_cell_info.size());
             return false;
         }
 

@@ -17,4 +17,4 @@ add_executable(eigenMatOp)
 target_sources(eigenMatOp PRIVATE test.cpp)
 
 target_include_directories(eigenMatOp PRIVATE ${CMAKE_SOURCE_DIR} ${HDF5_CXX_INCLUDE_DIRS})
-target_link_libraries(eigenMatOp PRIVATE cumac CUDA::cudart CUDA::cuda_driver ${CUDA_cusolver_LIBRARY} ${HDF5_CXX_LIBRARIES})
+target_link_libraries(eigenMatOp PRIVATE cumac CUDA::cudart CUDA::cuda_driver CUDA::cusolver ${HDF5_CXX_LIBRARIES})

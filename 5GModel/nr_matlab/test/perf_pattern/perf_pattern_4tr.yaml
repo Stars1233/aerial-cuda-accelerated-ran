@@ -1,0 +1,587 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 4TR PERF/POC2 pattern definitions.
+# Includes active 4TR patterns 59-65 plus 101+.
+patterns:
+- id: '59'
+  pattern: 59
+  description: 4TR 7-beams 100 MHz L2SA baseline.
+  comment: '4TR 7-beams 100 MHz L2SA baseline. POC2 7beams full_cells=20, compact_cells=20, config_cells=20, channel=channels_L. TV ranges: DLMIX 7072-7471; ULMIX 3040-3119.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [3040, 3119]
+    DLMIX:
+      tvs:
+      - main: [7072, 7471]
+  config_cells: 20
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams
+  channel: channels_L
+- id: 59a
+  pattern: 59.1
+  description: 4TR 7-beams 100 MHz 59a variant.
+  comment: '4TR 7-beams 100 MHz 59a variant. POC2 7beams full_cells=1, compact_cells=0, config_cells=20, channel=channels_L. TV ranges: DLMIX 7072-7471; ULMIX 3200-3279.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '59'
+    tvs: [7072, 7471]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [3200, 3279]
+    DLMIX:
+      tvs:
+      - main: [7072, 7471]
+  config_cells: 20
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 7beams
+  channel: channels_L
+- id: 59b
+  pattern: 59.2
+  description: 4TR 7-beams 100 MHz 59b variant.
+  comment: '4TR 7-beams 100 MHz 59b variant. POC2 7beams full_cells=2, compact_cells=2, config_cells=20, channel=channels_L. TV ranges: DLMIX 7072-7471; ULMIX 3760-3839.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '59'
+    tvs: [7072, 7471]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [3760, 3839]
+    DLMIX:
+      tvs:
+      - main: [7072, 7471]
+  config_cells: 20
+  full_cells: 2
+  compact_cells: 2
+  pattern_type: 7beams
+  channel: channels_L
+- id: 59c
+  pattern: 59.3
+  description: 4TR 7-beams 100 MHz 40-cell 59c variant.
+  comment: '4TR 7-beams 100 MHz 40-cell 59c variant. POC2 7beams full_cells=20, compact_cells=20, config_cells=40, channel=channels_L. TV ranges: DLMIX 9472-10271; ULMIX 4471-4630.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [4471, 4630]
+    DLMIX:
+      tvs:
+      - main: [9472, 10271]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams
+  channel: channels_L
+- id: 59d
+  pattern: 59.4
+  description: 4TR 7-beams 100 MHz 59d variant.
+  comment: '4TR 7-beams 100 MHz 59d variant. POC2 7beams full_cells=20, compact_cells=20, config_cells=20, channel=channels_L. TV ranges: DLMIX 7072-7471; ULMIX 3520-3599.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '59'
+    tvs: [7072, 7471]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [3520, 3599]
+    DLMIX:
+      tvs:
+      - main: [7072, 7471]
+  config_cells: 20
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams
+  channel: channels_L
+- id: 59e
+  pattern: 59.5
+  description: 4TR 7-beams 100 MHz 40-cell 59e variant.
+  comment: '4TR 7-beams 100 MHz 40-cell 59e variant. POC2 7beams full_cells=20, compact_cells=20, config_cells=40, channel=channels_L. TV ranges: DLMIX 9472-10271; ULMIX 4631-4790.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: 59c
+    tvs: [9472, 10271]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [4631, 4790]
+    DLMIX:
+      tvs:
+      - main: [9472, 10271]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams
+  channel: channels_L
+- id: 59f
+  pattern: 59.6
+  description: Negative TV variant reusing pattern 59c.
+  comment: 'Negative TV variant reusing pattern 59c. POC2 7beams full_cells=1, compact_cells=0, config_cells=40, channel=channels_L. TV ranges: DLMIX 9472-10271; ULMIX 3840, 4471-4630.
+    has override TV mapping.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: 59c
+    tvs: [9472, 10271]
+  - side: ULMIX
+    from: 59c
+    tvs: [4471, 4630]
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 3840
+      - main: [4471, 4630]
+    DLMIX:
+      tvs:
+      - main: [9472, 10271]
+  config_cells: 40
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 7beams
+  channel: channels_L
+  overrides:
+  - base_pattern: 59.3
+    cell_idx: 2
+    tv: 3840
+    tv_increments: 0
+    slot: 15
+    tv_name_slot: 0
+    mix_tv: 1
+    target_dl: 0
+    verbose: 1
+- id: '60'
+  pattern: 60
+  description: 4TR 7-beams 100 MHz OAM baseline.
+  comment: '4TR 7-beams 100 MHz OAM baseline. POC2 7beams full_cells=20, compact_cells=20, config_cells=40, channel=channels_L. TV ranges: DLMIX 10452-11251; ULMIX 3600-3759.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [3600, 3759]
+    DLMIX:
+      tvs:
+      - main: [10452, 11251]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams
+  channel: channels_L
+- id: 60a
+  pattern: 60.1
+  description: 4TR 7-beams 100 MHz 60a variant.
+  comment: '4TR 7-beams 100 MHz 60a variant. TV ranges: DLMIX 10452-11251; ULMIX 3280-3359.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '60'
+    tvs: [10452, 11251]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [3280, 3359]
+    DLMIX:
+      tvs:
+      - main: [10452, 11251]
+  config_cells: 40
+  full_cells: 1
+  compact_cells: 0
+- id: 60b
+  pattern: 60.2
+  description: 4TR 7-beams 100 MHz 60b variant.
+  comment: '4TR 7-beams 100 MHz 60b variant. POC2 7beams full_cells=1, compact_cells=0, config_cells=40, channel=channels_L. TV ranges: DLMIX 10452-11251; ULMIX 4911-5070.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '60'
+    tvs: [10452, 11251]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [4911, 5070]
+    DLMIX:
+      tvs:
+      - main: [10452, 11251]
+  config_cells: 40
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 7beams
+  channel: channels_L
+- id: 60c
+  pattern: 60.3
+  description: 4TR 7-beams 100 MHz 40-cell 60c variant.
+  comment: '4TR 7-beams 100 MHz 40-cell 60c variant. POC2 7beams full_cells=20, compact_cells=20, config_cells=40, channel=channels_L. TV ranges: DLMIX 10452-11251; ULMIX 5071-5230.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '60'
+    tvs: [10452, 11251]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [5071, 5230]
+    DLMIX:
+      tvs:
+      - main: [10452, 11251]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams
+  channel: channels_L
+- id: 60d
+  pattern: 60.4
+  description: 4TR 7-beams 100 MHz 40-cell 60d variant.
+  comment: '4TR 7-beams 100 MHz 40-cell 60d variant. POC2 7beams full_cells=20, compact_cells=20, config_cells=40, channel=channels_L. TV ranges: DLMIX 10452-11251; ULMIX 5231-5390.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '60'
+    tvs: [10452, 11251]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [5231, 5390]
+    DLMIX:
+      tvs:
+      - main: [10452, 11251]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams
+  channel: channels_L
+- id: 60e
+  pattern: 60.5
+  description: 4TR 7-beams 100 MHz 60e variant.
+  comment: '4TR 7-beams 100 MHz 60e variant. TV ranges: DLMIX 10452-11251; ULMIX 4220-4299.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '60'
+    tvs: [10452, 11251]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [4220, 4299]
+    DLMIX:
+      tvs:
+      - main: [10452, 11251]
+  config_cells: 40
+  full_cells: 1
+  compact_cells: 0
+- id: '61'
+  pattern: 61
+  description: 4TR 7-beams 20-cell pattern.
+  comment: '4TR 7-beams 20-cell pattern. POC2 7beams full_cells=20, compact_cells=0, config_cells=20, channel=channels_I. TV ranges: DLMIX 7872-8271; ULMIX 3360-3439.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [3360, 3439]
+    DLMIX:
+      tvs:
+      - main: [7872, 8271]
+  config_cells: 20
+  full_cells: 20
+  compact_cells: 0
+  pattern_type: 7beams
+  channel: channels_I
+- id: '62.2'
+  pattern: 62.2
+  description: POC2 pattern 62.2.
+  comment: 'POC2 pattern 62.2. TV ranges: ULMIX 4040-4079.'
+  base_tv_only: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [4040, 4079]
+  config_cells: 40
+  full_cells: 1
+  compact_cells: 0
+- id: 62c
+  pattern: 62.3
+  description: 4TR 7-beams S-slot variant reusing pattern 59c.
+  comment: '4TR 7-beams S-slot variant reusing pattern 59c. POC2 7beams_sslot full_cells=20, compact_cells=20, config_cells=40, channel=channels_J. TV ranges: DLMIX 9472-10271; ULMIX
+    4471-4630, 4040-4079. has S-slot TV config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: 59c
+    tvs: [9472, 10271]
+  - side: ULMIX
+    from: 59c
+    tvs: [4471, 4630]
+  - side: ULMIX
+    from: '62.2'
+    tvs: [4040, 4079]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [4471, 4630]
+      - additional: [4040, 4079]
+    DLMIX:
+      tvs:
+      - main: [9472, 10271]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams_sslot
+  channel: channels_J
+  s_slot:
+    tv: 4040
+- id: '63.2'
+  pattern: 63.2
+  description: POC2 pattern 63.2.
+  comment: 'POC2 pattern 63.2. TV ranges: ULMIX 5391-5430.'
+  base_tv_only: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [5391, 5430]
+  config_cells: 40
+  full_cells: 1
+  compact_cells: 0
+- id: 63c
+  pattern: 63.3
+  description: 4TR 7-beams S-slot variant reusing pattern 60c.
+  comment: '4TR 7-beams S-slot variant reusing pattern 60c. POC2 7beams_sslot full_cells=20, compact_cells=20, config_cells=40, channel=channels_J. TV ranges: DLMIX 10452-11251; ULMIX
+    5071-5230, 5391-5430. has S-slot TV config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '60'
+    tvs: [10452, 11251]
+  - side: ULMIX
+    from: 60c
+    tvs: [5071, 5230]
+  - side: ULMIX
+    from: '63.2'
+    tvs: [5391, 5430]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [5071, 5230]
+      - additional: [5391, 5430]
+    DLMIX:
+      tvs:
+      - main: [10452, 11251]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams_sslot
+  channel: channels_J
+  s_slot:
+    tv: 5391
+- id: '65'
+  pattern: 65
+  description: POC2 pattern 65.
+  comment: 'POC2 pattern 65. TV ranges: DLMIX 11432-12231.'
+  base_tv_only: true
+  ranges:
+    DLMIX:
+      tvs:
+      - main: [11432, 12231]
+  config_cells: 40
+  full_cells: 1
+  compact_cells: 0
+- id: 65a
+  pattern: 65.1
+  description: 4TR 7-beams pattern 65a PUSCH-only U variant.
+  comment: '4TR 7-beams pattern 65a PUSCH-only U variant. POC2 7beams_puschOnlyU full_cells=20, compact_cells=20, config_cells=40, channel=channels_N. TV ranges: DLMIX 11432-12231;
+    ULMIX 5971-6010.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '65'
+    tvs: [11432, 12231]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [5971, 6010]
+    DLMIX:
+      tvs:
+      - main: [11432, 12231]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams_puschOnlyU
+  channel: channels_N
+- id: 65b
+  pattern: 65.2
+  description: 4TR 7-beams pattern 65b PUSCH-only U variant.
+  comment: '4TR 7-beams pattern 65b PUSCH-only U variant. POC2 7beams_puschOnlyU full_cells=20, compact_cells=20, config_cells=40, channel=channels_N. TV ranges: DLMIX 11432-12231;
+    ULMIX 6011-6050.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '65'
+    tvs: [11432, 12231]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6011, 6050]
+    DLMIX:
+      tvs:
+      - main: [11432, 12231]
+  config_cells: 40
+  full_cells: 20
+  compact_cells: 20
+  pattern_type: 7beams_puschOnlyU
+  channel: channels_N
+- id: 65c
+  pattern: 65.3
+  description: 4TR 7-beams pattern 65c variant.
+  comment: '4TR 7-beams pattern 65c variant. POC2 7beams full_cells=17, compact_cells=17, config_cells=40, channel=channels_L. TV ranges: DLMIX 11432-12231; ULMIX 6051-6210.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '65'
+    tvs: [11432, 12231]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6051, 6210]
+    DLMIX:
+      tvs:
+      - main: [11432, 12231]
+  config_cells: 40
+  full_cells: 17
+  compact_cells: 17
+  pattern_type: 7beams
+  channel: channels_L
+- id: 65d
+  pattern: 65.4
+  description: 4TR 7-beams pattern 65d variant.
+  comment: '4TR 7-beams pattern 65d variant. POC2 7beams full_cells=17, compact_cells=17, config_cells=40, channel=channels_L. TV ranges: DLMIX 11432-12231; ULMIX 6211-6370.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '65'
+    tvs: [11432, 12231]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6211, 6370]
+    DLMIX:
+      tvs:
+      - main: [11432, 12231]
+  config_cells: 40
+  full_cells: 17
+  compact_cells: 17
+  pattern_type: 7beams
+  channel: channels_L
+- id: '101'
+  pattern: 101
+  description: 4TR PDSCH-only 24-cell pattern.
+  comment: '4TR PDSCH-only 24-cell pattern. POC2 4TR_pusch_prach full_cells=24, compact_cells=24, config_cells=24, channel=channels_V. TV ranges: DLMIX 7472-7495; ULMIX 4375-4470.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [4375, 4470]
+    DLMIX:
+      tvs:
+      - main: [7472, 7495]
+  config_cells: 24
+  full_cells: 24
+  compact_cells: 24
+  pattern_type: 4TR_pusch_prach
+  channel: channels_V
+- id: 101a
+  pattern: 101.1
+  description: 4TR PUSCH/PRACH 101a launch-pattern variant.
+  comment: '4TR PUSCH/PRACH 101a launch-pattern variant. POC2 4TR_pusch_prach full_cells=24, compact_cells=24, config_cells=24, channel=channels_V. TV ranges: DLMIX 7472-7495; ULMIX
+    8268-8363.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '101'
+    tvs: [7472, 7495]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [8268, 8363]
+    DLMIX:
+      tvs:
+      - main: [7472, 7495]
+  config_cells: 24
+  full_cells: 24
+  compact_cells: 24
+  pattern_type: 4TR_pusch_prach
+  channel: channels_V
+- id: '102'
+  pattern: 102
+  description: 4TR PDSCH reduced-PRB 24-cell pattern.
+  comment: '4TR PDSCH reduced-PRB 24-cell pattern. POC2 4TR_pusch_prach full_cells=1, compact_cells=1, config_cells=24, channel=channels_V. TV ranges: DLMIX 7496-7519; ULMIX 8364-8459.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [8364, 8459]
+    DLMIX:
+      tvs:
+      - main: [7496, 7519]
+  config_cells: 24
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 4TR_pusch_prach
+  channel: channels_V
+- id: 102a
+  pattern: 102.1
+  description: 4TR PUSCH/PRACH 102a launch-pattern variant.
+  comment: '4TR PUSCH/PRACH 102a launch-pattern variant. POC2 4TR_pusch_prach full_cells=1, compact_cells=1, config_cells=24, channel=channels_V. TV ranges: DLMIX 7496-7519; ULMIX
+    8460-8555.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '102'
+    tvs: [7496, 7519]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [8460, 8555]
+    DLMIX:
+      tvs:
+      - main: [7496, 7519]
+  config_cells: 24
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 4TR_pusch_prach
+  channel: channels_V
+- id: '103'
+  pattern: 103
+  description: 4TR multichannel DL/UL 24-cell pattern 103.
+  comment: '4TR multichannel DL/UL 24-cell pattern 103. POC2 4TR_allChan_103 full_cells=24, compact_cells=24, config_cells=24, channel=channels_103. TV ranges: DLMIX 7520-7591; ULMIX
+    8556-8651.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [8556, 8651]
+    DLMIX:
+      tvs:
+      - main: [7520, 7591]
+  config_cells: 24
+  full_cells: 24
+  compact_cells: 24
+  pattern_type: 4TR_allChan_103
+  channel: channels_103

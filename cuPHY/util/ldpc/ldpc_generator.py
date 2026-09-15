@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,7 +48,7 @@ def generate_row_degree_hist(hist_bg1, hist_bg2):
     plt.rcParams['figure.facecolor'] = 'white'
     hist_bg2_extended = hist_bg2 + [0] * (len(hist_bg1) - len(hist_bg2))
     cum_hist = [t[0] + t[1] for t in zip(hist_bg1, hist_bg2_extended)]
-    
+
     fig = plt.figure(figsize=(5,8))
 
     #itertools.accumulate in Python 3
@@ -100,7 +100,7 @@ def generate_row_degree_hist(hist_bg1, hist_bg2):
     plt.xlim([0, 20])
     plt.ylabel('BG2')
     plt.text(14, 20, 'median = %d\nmean = %.1f' % (median_degree, float(num_edges) / num_rows), bbox=dict(facecolor='white'))
-       
+
     ax  = fig.add_subplot(313)
     plt.bar(range(len(cum_hist)), height = cum_hist, align='center')
     ax.grid(zorder=0)
@@ -109,11 +109,11 @@ def generate_row_degree_hist(hist_bg1, hist_bg2):
     plt.yticks(range(0, 30, 2))
     plt.xlim([0, 20])
     plt.ylabel('BG1 + BG2')
-    
+
     plt.show(block=False)
     plt.savefig('row_degree_histogram.png')
     plt.close(fig)
-    
+
 #def generate_plots():
     #import matplotlib.pyplot as plt
     # Set the default background color to white
@@ -178,7 +178,7 @@ class BaseGraph(object):
             for col in row:
                 #print('Adding row %d to col %d\n' % (row, col))
                 self.col_list[col].append(row_idx)
-        # Column index list: A list of lists, one for each column. 
+        # Column index list: A list of lists, one for each column.
         # List elements are tuples, with the first value being the
         # row of the element in that column, and the second value
         # being the index of that element within its row. For example:
@@ -411,7 +411,7 @@ def load_from_files(path = 'NR_5G_LDPC_BaseGraphs.tar.gz'):
         BG_dict[BG] = BaseGraph(BG, BG_row_list)
         SG_dict[BG] = [SetBaseGraph(BG, idx, row_list) for (idx, row_list) in enumerate(BG_set_list)]
     return (BG_dict, SG_dict)
-    
+
 (BG, SG) = load_from_files()
 
 #print(type(BG_dict[1][0]).__name__)
@@ -426,7 +426,7 @@ print(SG[2][0])
 #generate_plots()
 
 nv_copyright = """/*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -681,7 +681,7 @@ def write_shift_for_each_Z_column(f, desc):
 #print(BG[1].row_degree_hist)
 #print(BG[2].row_degree_hist)
 #generate_row_degree_hist(BG[1].row_degree_hist, BG[2].row_degree_hist)
-    
+
 Z_all = [ Z for Z_row in Z_iLS for Z in Z_row ]
 max_Z = max(Z_all)
 # To conserve constant memory, we don't generate a table for
@@ -840,7 +840,7 @@ define_1D_array(fSource, {'type'         : '__device__  int16_t',
                           'num_elements' : 'BG1_N + 1',
                           'format'       : '%4d',
                           'data'         : BG[1].get_csc_col_array()})
-# Unused at the moment 
+# Unused at the moment
 #write_rows(fSource, {'type'         : '__device__  int16_t',
 #                     'name'         : 'bg1_csc_row_array',
 #                     'num_elements' : 'BG1_NNZ',
@@ -1060,6 +1060,51 @@ define_2D_array(fSource3, {'type'       : '__device__  int32_t',
 #                            'data'         : SG[1][iLS] })
 
 ########################################################################
+# Determine the trailing zero shift count (TZSC) for each row. We do this
+# by examining the shift values for all 8 lifting size sets, and using
+# the minimum count that is common to all lifting size sets.
+# We can simplify APP address calculation for zero shift values by
+# avoiding the per-thread comparison with the shift value.
+#
+# (init TZSC with an empty array so we can index later by BG 1/2 instead
+# of 0/1)
+TZSC = [[]]
+for BG_idx in [1, 2]:
+    row_TZSC_list = []
+    # For each row of the base graph
+    for row_idx in range(BG[BG_idx].num_rows):
+        # Create a set to hold the different trailing counts across the
+        # different lifting size sets.
+        trailing_count = set()
+        # For each lifting size set
+        for iLS_idx in range(len(Z_iLS)):
+            #print('iLS_idx = %i' % iLS_idx)
+            set_row_list = SG[BG_idx][iLS_idx].set_row_list[row_idx]
+            #print(set_row_list)
+            current_count = 0
+            for col_shift_pair in reversed(set_row_list):
+                if col_shift_pair[1] == 0:
+                    #print(col_shift_pair)
+                    current_count = current_count + 1
+                else:
+                    break
+            trailing_count.add(current_count)
+        #print(row_idx, min(trailing_count))
+        row_TZSC_list.append(min(trailing_count));
+    # Append values for this base graph (1 or 2)
+    TZSC.append(row_TZSC_list)
+
+#print(TZSC)
+# For each base graph (1,2)
+#for BG_idx in [1, 2]:
+#    # For each row of the base graph
+#    for row_idx in range(BG[BG_idx].num_rows):
+#        row        = BG[BG_idx].row(row_idx)
+#        row_degree = len(row)
+#        nzs_row_degree = row_degree - TZSC[BG_idx][row_idx]
+#        print("[%i][%i] row_degree = %i, nzs_row_degree = %i" % (BG_idx, row_idx, row_degree, nzs_row_degree))
+
+########################################################################
 # Write a source file with C++ templates, to avoid using constant memory
 
 fSource4 = open('nrLDPC_templates.cuh', 'w')
@@ -1155,6 +1200,20 @@ for BG_idx in [1, 2]:
     fSource4.write('\n')
 
 fSource4.write("""////////////////////////////////////////////////////////////////////////
+// nzs_row_degree
+// Provides the number of nonzero shifted permutation matrices with non-zero shifts as
+// a function of base graph and check node row. (Address calculations for zero shift
+// values are simpler and can be more efficient.)
+// See Tables 5.3.2-2 and 5.3.2-3, 3GPP 38.212
+template <int BG, int ROW_INDEX> struct nzs_row_degree;
+""")
+for BG_idx in [1, 2]:
+    for row_idx, row in enumerate(BG[BG_idx].row_list):
+        nzs_row_degree = len(row) - TZSC[BG_idx][row_idx]
+        fSource4.write('template <> struct nzs_row_degree<%d, %d> { static const int value = %d; };\n' % (BG_idx, row_idx, nzs_row_degree))
+    fSource4.write('\n')
+
+fSource4.write("""////////////////////////////////////////////////////////////////////////
 // isolated_edge_count
 // "Isolated" edges are base graph edges that are used by only 1 parity
 // check node. As such, we do not need to update the stored values. (Use
@@ -1194,7 +1253,7 @@ for BG_idx in [1, 2]:
             fSource4.write('template <> struct vnode_index<%d, %d, %d> { static const int value = %d; };\n' % (BG_idx, row_idx, val_idx, val))
     fSource4.write('\n')
 fSource4.write('\n')
-    
+
 fSource4.write("""////////////////////////////////////////////////////////////////////////
 // vnode_shift
 // Variable node shift values as a function of base graph,
@@ -1273,7 +1332,7 @@ template <int BG, int Z, int CHECK_NODE, int INDEX> struct wrap_index
 
 fSource4.write("""////////////////////////////////////////////////////////////////////////
 // vnode_shift_offset
-// Provides (vnode_colum * Z) + shift_mod for given values of the
+// Provides (vnode_column * Z) + shift_mod for given values of the
 // base graph (BG), lifting size (Z), CHECK_NODE, and row index INDEX.
 template <int BG, int Z, int CHECK_NODE, int INDEX> struct vnode_shift_offset
 {
@@ -1453,26 +1512,25 @@ fSource4.write('} // namespace ldpc2\n')
 fSource4.write('#endif // ifndef(NRLDPC_TEMPLATES_CUH_INCLUDED_)\n')
 
 ########################################################################
-# Write base graph descriptors for half kernels to ldpc2_bg_desc.cpp
-fSource5 = open('ldpc2_bg_desc.cpp', 'w')
+# Write base graph descriptors for 16-bit addresses to ldpc2_bg_desc_16.cpp
+fSource5 = open('ldpc2_bg_desc_16.cpp', 'w')
 fSource5.write(nv_copyright)
 fSource5.write("""
 #include "ldpc2_bg_desc.hpp"
-#include <cuda_fp16.h>
 
 namespace ldpc2
 {
 
 """)
 
-def write_desc_row(f, BG_idx, Z, row_idx):
+def write_desc_row(f, BG_idx, Z, row_idx, bytes_per_elem):
     row        = BG[BG_idx].row(row_idx)
     row_degree = len(row)
     num_pairs  = int(math.floor(row_degree + 1) / 2)
     # print('Writing row %d, degree = %d' % (row_idx, row_degree))
     for iPair in range(num_pairs):
-        format_str = "        {{ vnode_shift_mod_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx}>::value, vnode_base_offset_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx}>::value * sizeof(__half) }}"
-        f.write(format_str.format(BG=BG_idx, Z=Z, pair_idx=iPair, row_idx=row_idx))
+        format_str = "        {{ vnode_shift_mod_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx}>::value, vnode_base_offset_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx}>::value * {num_bytes} }}"
+        f.write(format_str.format(BG=BG_idx, Z=Z, pair_idx=iPair, row_idx=row_idx, num_bytes=bytes_per_elem))
         if (row_idx != (BG[BG_idx].num_rows-1)) or (iPair != (num_pairs-1)):
             f.write(',')
         if 0 == iPair:
@@ -1486,19 +1544,56 @@ Z_temp = Z_ge_32
 Z_temp.sort()
 for BG_idx in [1, 2]:
     for Z in Z_temp:
-        fSource5.write('const BG%d_desc_t BG%d_desc_Z%d_half =\n{\n    {\n' % (BG_idx, BG_idx, Z))
+        fSource5.write('const BG%d_desc_t BG%d_desc_Z%d_16 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
         for iRow in range(BG[BG_idx].num_rows):
-            write_desc_row(fSource5, BG_idx, Z, iRow)
+            write_desc_row(fSource5, BG_idx, Z, iRow, 2)
         fSource5.write('    }\n};\n\n')
 
-def write_adj_desc_row(f, BG_idx, Z, row_idx, datatype):
+fSource5.write('\n} // namespace ldpc2\n')
+
+########################################################################
+# Write base graph descriptors for 8-bit addresses to ldpc2_bg_desc_8.cpp
+fSource6 = open('ldpc2_bg_desc_8.cpp', 'w')
+fSource6.write(nv_copyright)
+fSource6.write("""
+#include "ldpc2_bg_desc.hpp"
+
+namespace ldpc2
+{
+
+""")
+
+Z_temp = Z_ge_32
+Z_temp.sort()
+for BG_idx in [1, 2]:
+    for Z in Z_temp:
+        fSource6.write('const BG%d_desc_t BG%d_desc_Z%d_8 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
+        for iRow in range(BG[BG_idx].num_rows):
+            write_desc_row(fSource6, BG_idx, Z, iRow, 1)
+        fSource6.write('    }\n};\n\n')
+
+fSource6.write('\n} // namespace ldpc2\n')
+
+########################################################################
+# Write base graph descriptors for adjusted 16-bit addresses to ldpc2_bg_adj_desc_16.cpp
+fSource7 = open('ldpc2_bg_adj_desc_16.cpp', 'w')
+fSource7.write(nv_copyright)
+fSource7.write("""
+#include "ldpc2_bg_desc.hpp"
+
+namespace ldpc2
+{
+
+""")
+
+def write_adj_desc_row(f, BG_idx, Z, row_idx, bytes_per_elem):
     row        = BG[BG_idx].row(row_idx)
     row_degree = len(row)
     num_pairs  = int(math.floor(row_degree + 1) / 2)
     # print('Writing row %d, degree = %d' % (row_idx, row_degree))
     for iPair in range(num_pairs):
-        format_str = "        {{ wrap_index_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx}>::value, vnode_adj_shift_offset<{BG}, {Z:3d}, {row_idx:2d}, {idx0}>::value * static_cast<int>(sizeof({dtype})),  vnode_adj_shift_offset_if<{BG}, {Z:3d}, {row_idx:2d}, {idx1}>::value * static_cast<int>(sizeof({dtype}))}}"
-        f.write(format_str.format(BG=BG_idx, Z=Z, pair_idx=iPair, idx0=(iPair*2), idx1=(iPair*2)+1, row_idx=row_idx, dtype=datatype))
+        format_str = "        {{ wrap_index_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx}>::value, vnode_adj_shift_offset<{BG}, {Z:3d}, {row_idx:2d}, {idx0}>::value * {num_bytes},  vnode_adj_shift_offset_if<{BG}, {Z:3d}, {row_idx:2d}, {idx1}>::value * {num_bytes}}}"
+        f.write(format_str.format(BG=BG_idx, Z=Z, pair_idx=iPair, idx0=(iPair*2), idx1=(iPair*2)+1, row_idx=row_idx, num_bytes=bytes_per_elem))
         if (row_idx != (BG[BG_idx].num_rows-1)) or (iPair != (num_pairs-1)):
             f.write(',')
         if 0 == iPair:
@@ -1514,20 +1609,19 @@ Z_temp.sort()
 #for BG_idx in [1]:
 for BG_idx in [1, 2]:
     for Z in Z_temp:
-        fSource5.write('const BG%d_adj_desc_t BG%d_adj_desc_Z%d_half =\n{\n    {\n' % (BG_idx, BG_idx, Z))
+        fSource7.write('const BG%d_adj_desc_t BG%d_adj_desc_Z%d_16 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
         for iRow in range(BG[BG_idx].num_rows):
-            write_adj_desc_row(fSource5, BG_idx, Z, iRow, '__half')
-        fSource5.write('    }\n};\n\n')
-fSource5.write('\n} // namespace ldpc2\n')
+            write_adj_desc_row(fSource7, BG_idx, Z, iRow, 2)
+        fSource7.write('    }\n};\n\n')
+fSource7.write('\n} // namespace ldpc2\n')
 
 ########################################################################
-# Write base graph descriptors for half2 (x2) kernels to
-# ldpc2_bg_desc_half2.cpp
-fSource6 = open('ldpc2_bg_desc_half2.cpp', 'w')
-fSource6.write(nv_copyright)
-fSource6.write("""
+# Write adjusted base graph descriptors for 32-bit addresses to
+# ldpc2_bg_adj_desc_32.cpp
+fSource8 = open('ldpc2_bg_adj_desc_32.cpp', 'w')
+fSource8.write(nv_copyright)
+fSource8.write("""
 #include "ldpc2_bg_desc.hpp"
-#include <cuda_fp16.h>
 
 namespace ldpc2
 {
@@ -1539,9 +1633,162 @@ Z_temp = Z_ge_32
 Z_temp.sort()
 for BG_idx in [1, 2]:
     for Z in Z_temp:
-        fSource6.write('const BG%d_adj_desc_t BG%d_adj_desc_Z%d_half2 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
+        fSource8.write('const BG%d_adj_desc_t BG%d_adj_desc_Z%d_32 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
         for iRow in range(BG[BG_idx].num_rows):
-            write_adj_desc_row(fSource6, BG_idx, Z, iRow, '__half2')
-        fSource6.write('    }\n};\n\n')
+            write_adj_desc_row(fSource8, BG_idx, Z, iRow, 4)
+        fSource8.write('    }\n};\n\n')
 
-fSource6.write('\n} // namespace ldpc2\n')
+fSource8.write('\n} // namespace ldpc2\n')
+
+########################################################################
+# Write adjusted base graph descriptors for 8-bit addresses to
+# ldpc2_bg_adj_desc_8.cpp
+fSource9 = open('ldpc2_bg_adj_desc_8.cpp', 'w')
+fSource9.write(nv_copyright)
+fSource9.write("""
+#include "ldpc2_bg_desc.hpp"
+
+namespace ldpc2
+{
+
+""")
+
+# Skip small Z for now
+Z_temp = Z_ge_32
+Z_temp.sort()
+for BG_idx in [1, 2]:
+    for Z in Z_temp:
+        fSource9.write('const BG%d_adj_desc_t BG%d_adj_desc_Z%d_8 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
+        for iRow in range(BG[BG_idx].num_rows):
+            write_adj_desc_row(fSource9, BG_idx, Z, iRow, 1)
+        fSource9.write('    }\n};\n\n')
+
+fSource9.write('\n} // namespace ldpc2\n')
+
+########################################################################
+# Write base graph descriptors for nonzero shift address generators
+# for half kernels to ldpc2_bg_desc_nzs_16.cpp
+fSource10 = open('ldpc2_bg_desc_nzs_16.cpp', 'w')
+fSource10.write(nv_copyright)
+fSource10.write("""
+#include "ldpc2_bg_desc.hpp"
+
+namespace ldpc2
+{
+
+""")
+
+def write_nzs_desc_row(f, BG_idx, Z, row_idx, bytes_per_elem):
+    row            = BG[BG_idx].row(row_idx)
+    row_degree     = len(row)
+    nzs_row_degree = row_degree - TZSC[BG_idx][row_idx]
+    num_full_pairs = nzs_row_degree // 2
+    nzs_deg_is_odd = num_full_pairs * 2 != nzs_row_degree
+    num_pairs      = int(math.floor(row_degree + 1) / 2)
+    # print('Writing row %d, degree = %d' % (row_idx, row_degree))
+    for iPair in range(num_full_pairs):
+        format_str = "        {{ vnode_shift_mod_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx:2d}>::value, vnode_base_offset_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx:2d}>::value * {num_bytes} }}"
+        f.write(format_str.format(BG=BG_idx, Z=Z, pair_idx=iPair, row_idx=row_idx, num_bytes=bytes_per_elem))
+        if ((iPair != (num_full_pairs-1)) or nzs_deg_is_odd or (row_idx != (BG[BG_idx].num_rows-1))):
+            f.write(',')
+        if 0 == iPair:
+            f.write(" // Row {row_idx}, degree = {row_degree}, nzs_row_degree = {nzs_row_degree}".format(row_idx=row_idx, row_degree=row_degree, nzs_row_degree=nzs_row_degree))
+        f.write('\n')
+    if nzs_deg_is_odd:
+        col_idx = nzs_row_degree - 1
+        format_str = "        {{ vnode_shift_mod     <{BG}, {Z:3d}, {row_idx:2d}, {col_idx:2d}>::value, vnode_base_offset     <{BG}, {Z:3d}, {row_idx:2d}, {col_idx:2d}>::value * {num_bytes} }}"
+        f.write(format_str.format(BG=BG_idx, Z=Z, col_idx=col_idx, row_idx=row_idx, num_bytes=bytes_per_elem))
+        if (row_idx != (BG[BG_idx].num_rows-1)):
+            f.write(',')
+        f.write('\n')
+
+    # Add a blank line to separate rows
+    if row_idx != (BG[BG_idx].num_rows-1):
+        f.write('\n')
+
+#Z_temp = [384]
+Z_temp = Z_ge_32
+Z_temp.sort()
+for BG_idx in [1, 2]:
+    for Z in Z_temp:
+        fSource10.write('const BG%d_nzs_desc_t BG%d_nzs_desc_Z%d_16 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
+        for iRow in range(BG[BG_idx].num_rows):
+            write_nzs_desc_row(fSource10, BG_idx, Z, iRow, 2)
+        fSource10.write('    }\n};\n\n')
+
+fSource10.write('\n} // namespace ldpc2\n')
+
+def write_nzs_adj_desc_row(f, BG_idx, Z, row_idx, bytes_per_elem):
+    row        = BG[BG_idx].row(row_idx)
+    row_degree = len(row)
+    nzs_row_degree = row_degree - TZSC[BG_idx][row_idx]
+    num_full_pairs = nzs_row_degree // 2
+    nzs_deg_is_odd = num_full_pairs * 2 != nzs_row_degree
+    num_pairs  = int(math.floor(row_degree + 1) / 2)
+    # print('Writing row %d, degree = %d' % (row_idx, row_degree))
+    for iPair in range(num_full_pairs):
+        format_str = "        {{ wrap_index_pair<{BG}, {Z:3d}, {row_idx:2d}, {pair_idx}>::value, vnode_adj_shift_offset<{BG}, {Z:3d}, {row_idx:2d}, {idx0}>::value * {num_bytes},  vnode_adj_shift_offset_if<{BG}, {Z:3d}, {row_idx:2d}, {idx1}>::value * {num_bytes} }}"
+        f.write(format_str.format(BG=BG_idx, Z=Z, pair_idx=iPair, idx0=(iPair*2), idx1=(iPair*2)+1, row_idx=row_idx, num_bytes=bytes_per_elem))
+        if (row_idx != (BG[BG_idx].num_rows-1)) or (iPair != (num_pairs-1)):
+            f.write(',')
+        if 0 == iPair:
+            f.write(" // Row {row_idx}, degree = {row_degree}, nzs_row_degree = {nzs_row_degree}".format(row_idx=row_idx, row_degree=row_degree, nzs_row_degree=nzs_row_degree))
+        f.write('\n')
+    if nzs_deg_is_odd:
+        col_idx = nzs_row_degree - 1
+        # Adjusted node has three words in the node descriptor, so we append an
+        # extra zero
+        format_str = "        {{ vnode_shift_mod     <{BG}, {Z:3d}, {row_idx:2d}, {col_idx:2d}>::value, vnode_base_offset     <{BG}, {Z:3d}, {row_idx:2d}, {col_idx:2d}>::value * {num_bytes}, 0 }}"
+        f.write(format_str.format(BG=BG_idx, Z=Z, col_idx=col_idx, row_idx=row_idx, num_bytes=bytes_per_elem))
+        if (row_idx != (BG[BG_idx].num_rows-1)):
+            f.write(',')
+        f.write('\n')
+
+    if row_idx != (BG[BG_idx].num_rows-1):
+        f.write('\n')
+
+fSource11 = open('ldpc2_bg_adj_desc_nzs_16.cpp', 'w')
+fSource11.write(nv_copyright)
+fSource11.write("""
+#include "ldpc2_bg_desc.hpp"
+
+namespace ldpc2
+{
+
+""")
+
+Z_temp = [384]
+#Z_temp = Z_ge_32
+#Z_temp = Z_all
+Z_temp.sort()
+#for BG_idx in [1]:
+for BG_idx in [1, 2]:
+    for Z in Z_temp:
+        fSource11.write('const BG%d_adj_nzs_desc_t BG%d_adj_nzs_desc_Z%d_16 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
+        for iRow in range(BG[BG_idx].num_rows):
+            write_nzs_adj_desc_row(fSource11, BG_idx, Z, iRow, 2)
+        fSource11.write('    }\n};\n\n')
+fSource11.write('\n} // namespace ldpc2\n')
+
+fSource12 = open('ldpc2_bg_adj_desc_nzs_32.cpp', 'w')
+fSource12.write(nv_copyright)
+fSource12.write("""
+#include "ldpc2_bg_desc.hpp"
+
+namespace ldpc2
+{
+
+""")
+
+#Z_temp = [384]
+Z_temp = Z_ge_32
+#Z_temp = Z_all
+Z_temp.sort()
+#for BG_idx in [1]:
+for BG_idx in [1, 2]:
+    for Z in Z_temp:
+        fSource12.write('const BG%d_adj_nzs_desc_t BG%d_adj_nzs_desc_Z%d_32 =\n{\n    {\n' % (BG_idx, BG_idx, Z))
+        for iRow in range(BG[BG_idx].num_rows):
+            write_nzs_adj_desc_row(fSource12, BG_idx, Z, iRow, 4)
+        fSource12.write('    }\n};\n\n')
+fSource12.write('\n} // namespace ldpc2\n')

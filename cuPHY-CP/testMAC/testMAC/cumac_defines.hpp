@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +32,8 @@
 #include "common_defines.hpp"
 #include "cumac_msg.h"
 // #include "api.h"
+
+static constexpr uint32_t TESTMAC_CUMAC_TASK_MASK_4T4R{(static_cast<uint32_t>(1U) << CUMAC_TASK_PFM_SORT) - 1U};
 
 // Buffer pointers for SCH_TTI.req
 typedef struct cumac_tti_req_buf_ptrs
@@ -66,6 +68,12 @@ typedef struct cumac_tti_req_buf_ptrs
     uint8_t*    layerSelSolLastTxActUe; // Layer selection solution for the last transmissions of all active UEs in the cell
     int8_t*     cqiActUe; // CQI values of all active UEs in the cell
     cumac_pfm_cell_info_t* pfmCellInfo; // PFM sorting input buffer
+
+    //! MU-MIMO UE pairing / muUeGrp request from HDF5 task_in_buf (per cell); nullptr if not loaded
+    cumac_muUeGrp_req_info_t* muUeGrpInfo; // cumac_muUeGrp_req_info_t
+    size_t                    muUeGrpReqDataLen;
+    bool                      muUeGrpIsMemSharing;
+
 } cumac_tti_req_tv_t;
 
 // Buffer pointers for SCH_TTI.resp
@@ -76,6 +84,7 @@ typedef struct
     uint8_t*    layerSelSol; // Layer selection solution for all active UEs in the cell
     int16_t*    mcsSelSol; // MCS selection solution for all active UEs in the cell
     cumac_pfm_output_cell_info_t* pfmSortSol; // PFM sorting output buffer
+    cumac_muUeGrp_resp_info_t* muUeGrpSol;     // Expected muUeGrp output for this cell (from *_solution.h5)
 } cumac_tti_resp_tv_t;
 
 typedef cumac_config_req_payload_t cumac_cell_configs_t;
@@ -106,6 +115,8 @@ static inline const char* get_task_name(int task_type)
         return "MCS_SEL";
     case CUMAC_TASK_PFM_SORT:
         return "PFM_SORT";
+    case CUMAC_TASK_MU_UE_GRP:
+        return "MU_UE_GRP";
     default:
         return "INVALID";
     }

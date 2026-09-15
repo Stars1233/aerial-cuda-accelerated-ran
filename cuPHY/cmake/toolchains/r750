@@ -2,3 +2,14 @@ set(CMAKE_C_COMPILER   x86_64-linux-gnu-gcc)
 set(CMAKE_CXX_COMPILER x86_64-linux-gnu-g++)
 
 set(AERIAL_ARCH_TUNE_FLAGS -march=icelake-server)
+
+# Declare hardening level explicitly so codegen is stable regardless of
+# compiler provenance. Ubuntu-packaged GCC enables _FORTIFY_SOURCE=3,
+# -fstack-protector-strong, and -fstack-clash-protection by default;
+# upstream/vanilla GCC enables none of them. Pinning here keeps the two
+# code-generation-equivalent. Default (0/none) reproduces the upstream GCC
+# baseline. Override at configure time with -DAERIAL_FORTIFY_LEVEL=3 etc.
+set(AERIAL_FORTIFY_LEVEL   "0"    CACHE STRING "_FORTIFY_SOURCE level (0 disables)")
+set(AERIAL_STACK_PROTECTOR "none" CACHE STRING "Stack protector: none | strong")
+
+include("${CMAKE_CURRENT_LIST_DIR}/hardening.cmake")

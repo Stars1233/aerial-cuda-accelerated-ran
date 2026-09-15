@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -408,6 +408,13 @@ public:
      * @return 1 if early HARQ present, 0 otherwise
      */
     uint8_t                                                                       getIsEarlyHarqPresent(){return isEarlyHarqPresent;}
+
+    /**
+     * Checks if early SCH codeblock decoding is present in this slot.
+     *
+     * @return 1 if early SCH codeblock decoding is present, 0 otherwise
+     */
+    uint8_t                                                                       getIsEarlySchCbDecodePresent(){return isEarlySchCbDecodePresent;}
     
     /**
      * @brief Checks if front-loaded DMRS is present in this slot.
@@ -415,6 +422,13 @@ public:
      * @return 1 if front-loaded DMRS present, 0 otherwise
      */
     uint8_t                                                                       getIsFrontLoadedDmrsPresent(){return isFrontLoadedDmrsPresent;}
+
+    /**
+     * Checks whether PUSCH has work in the subslot processing phase.
+     *
+     * @return true if early HARQ, early SCH codeblock decoding, or front-loaded DMRS processing is present
+     */
+    bool                                                                          hasPuschSubSlotWork(){return isEarlyHarqPresent || isEarlySchCbDecodePresent || isFrontLoadedDmrsPresent;}
     
     /**
      * @brief Sets whether early HARQ is present.
@@ -422,6 +436,13 @@ public:
      * @param val 1 if present, 0 otherwise
      */
     void                                                                          setIsEarlyHarqPresent(uint8_t val){isEarlyHarqPresent=val;}
+
+    /**
+     * Sets whether early SCH codeblock decoding is present.
+     *
+     * @param val 1 if present, 0 otherwise
+     */
+    void                                                                          setIsEarlySchCbDecodePresent(uint8_t val){isEarlySchCbDecodePresent=val;}
     
     /**
      * @brief Sets whether front-loaded DMRS is present.
@@ -460,6 +481,73 @@ public:
     slot_command_api::slot_info_t* aggr_slot_info[UL_MAX_CELLS_PER_SLOT]; ///< Slot info (PRB/symbol allocations) per cell
     std::atomic<int>   atom_ul_cplane_info_for_uplane_rdy_count; ///< Atomic counter for C-plane to U-plane readiness synchronization
 
+    /**
+     * @brief Path-aware count of UL C-plane contributors for this slot.
+     *
+     * Legacy path: number of @c TaskUL1AggrCplane tasks pushed by
+     * @c l1_enqueue_phy_work (= @c get_num_ulc_tasks(num_ul_workers)).  Set
+     * once by @c l1_enqueue_phy_work after it computes the worker-formula value.
+     *
+     * Framework path (@c SKIP_UL_CPLANE): number of @c task_work_fn_cplane_batch
+     * invocations actually fired by @c PHY_module::fire_cplane_batch for this
+     * slot — i.e., the running batch_count.  Updated by @c fire_cplane_batch as
+     * each batch is scheduled; final value is established by EOM.
+     *
+     * Read by UL task bodies (Order Kernel, PUCCH+PUSCH, Early UCI Ind, UL3) in
+     * place of the legacy @c get_num_ulc_tasks(pdctx->getNumULWorkers()) call so
+     * that bodies are path-aware without per-call branching.
+     *
+     * Reset to 0 in @c release().
+     *
+     * @return Path-aware UL C-plane contributor count for the current slot.
+     *         Valid only after the producer (l1_enqueue_phy_work for legacy,
+     *         fire_cplane_batch for framework) has populated it.
+     */
+    [[nodiscard]] int getNumUlcTasks() const noexcept { return numUlcTasks_; }
+
+    /**
+     * @brief Sets the path-aware UL C-plane contributor count.
+     * @param v New count.  See @c getNumUlcTasks() for semantics.
+     */
+    void setNumUlcTasks(int v) noexcept { numUlcTasks_ = v; }
+
+    /**
+     * UL slot reference timestamp (L2A slot tick + 1 slot).
+     *
+     * Dedicated slot-reference time, kept separate from @c tasks_ts_exec so that
+     * task dispatch timing is not conflated with the reference time. Consumers
+     * that need the "L2A slot tick + 1" reference (Order Kernel body, framework
+     * @c send_ul_cplane) read this via @c getSlotRefTs() instead of
+     * @c getTaskTsExec(0): on the
+     * framework (SKIP_UL_CPLANE) path the compacted layout no longer places the
+     * reference value at index 0. Set by the UL producer
+     * (@c l1_enqueue_phy_work / @c l1_setup_early_cplane_slot_maps).
+     *
+     * @return Slot reference timestamp stored in @c slotRefTs_.
+     *         Return value must be checked.
+     */
+    [[nodiscard]] t_ns getSlotRefTs() const noexcept { return slotRefTs_; }
+
+    /**
+     * Sets the UL slot reference timestamp. See @c getSlotRefTs().
+     *
+     * @param[in] v Slot reference timestamp to store.
+     */
+    void setSlotRefTs(t_ns v) noexcept { slotRefTs_ = v; }
+
+    /**
+     * Total UL task count for this slot (the @c waitSlotEndTask target).
+     *
+     * Published by @c l1_enqueue_phy_work via @c setTasksTs() before the tasks are
+     * pushed to the UL task list, so it is visible to task bodies once they run
+     * (the task-list lock provides the happens-before).  UL3 / UL3-SRS read this
+     * instead of carrying the count in their @c init() argument.
+     *
+     * @return Total UL task count from @c tasks_num.
+     *         Return value must be checked.
+     */
+    [[nodiscard]] int getNumTasks() const noexcept { return tasks_num; }
+
 private:
     ////////////////////////////////////////////
     //// Private Members
@@ -471,6 +559,8 @@ private:
     std::atomic<int>                                         atom_ul_channel_end_threads; ///< Atomic counter: threads finished channel processing
     std::atomic<int>                                         atom_ul_end_threads;         ///< Atomic counter: threads finished slot processing
     std::atomic<int>                                         atom_ulc_tasks_complete;     ///< Atomic counter: UL C-plane tasks completed
+    int                                                      numUlcTasks_                = 0; ///< Path-aware UL C-plane contributor count: legacy = num_ulc_tasks (workers), framework = batch_count. See getNumUlcTasks().
+    t_ns                                                     slotRefTs_{};                ///< UL slot reference time (L2A tick + 1 slot). See getSlotRefTs().
     std::atomic<bool>                                        run_order_done;              ///< Atomic flag: symbol ordering completed
     std::atomic<bool>                                        early_uci_task_done;         ///< Atomic flag: early UCI processing completed
     std::atomic<bool>                                        ulbfw_task_done;             ///< Atomic flag: UL beamforming processing completed
@@ -481,9 +571,9 @@ private:
     std::array<std::pair<t_ns, t_ns>, TASK_MAX_PER_SLOT + 1> tasks_ts_record;            ///< Task timestamp records (start/end pairs)
     std::atomic<bool>                                        atom_active;                 ///< Atomic flag: slot map is active/reserved
     std::atomic<int>                                         atom_num_cells;              ///< Atomic counter: number of cells processed
-    int                                                      num_active_cells;            ///< Number of active cells in this slot
     struct slot_command_api::slot_indication                 slot_3gpp;                   ///< 3GPP slot indication (SFN, slot number)
     uint8_t                                                  isEarlyHarqPresent;          ///< Flag: early HARQ present in this slot (1=yes, 0=no)
+    uint8_t                                                  isEarlySchCbDecodePresent;   ///< Flag: early SCH codeblock decoding present in this slot (1=yes, 0=no)
     uint8_t                                                  isFrontLoadedDmrsPresent;    ///< Flag: front-loaded DMRS present in this slot (1=yes, 0=no)
     
 };

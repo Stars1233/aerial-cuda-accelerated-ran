@@ -323,7 +323,7 @@ namespace cumac {
             __syncthreads(); 
         }
     }
-    __global__ void muUePairChanCorrKernel_memSharing(muUePairChanCorrDynDescr* pDynDescr)
+    static __global__ void muUePairChanCorrKernel_memSharing(muUePairChanCorrDynDescr* pDynDescr)
     {
         uint16_t cellId = blockIdx.x / pDynDescr->num_blocks_per_cell;
 /*
@@ -356,6 +356,10 @@ namespace cumac {
         cumac_muUeGrp_req_ue_info_t* ueInfo_ptr = (cumac_muUeGrp_req_ue_info_t*) (srsInfo_msh_ptr + req_info_ptr->numSrsInfo);
 
         if (srs_info_idx >= req_info_ptr->numSrsInfo) {
+            return;
+        }
+
+        if (srsInfo_msh_ptr[srs_info_idx].id >= MAX_NUM_SRS_UE_PER_CELL) {
             return;
         }
 
@@ -423,8 +427,16 @@ namespace cumac {
                     if ((flags_ue_info & 0x01) > 0 && (flags_ue_info & 0x04) > 0) { // is a valid UE info and SRS chanEst available
                         uint16_t real_ue_id = ueInfo_ptr[real_uIdx_in_block + first_ue_info_idx_in_block].id;
 
+                        if (real_ue_id >= MAX_NUM_SRS_UE_PER_CELL) {
+                            continue;
+                        }
+
                         if ((flags_ue_info & 0x08) > 0) { // has updated SRS info in the current slot
                             uint16_t srsInfoIdx = ueInfo_ptr[real_uIdx_in_block + first_ue_info_idx_in_block].srsInfoIdx;
+
+                            if (srsInfoIdx >= req_info_ptr->numSrsInfo) {
+                                continue;
+                            }
 
                             __half2* srsChanEst_srsInfoIdx = pDynDescr->cubb_srs_gpu_buf + srsInfo_msh_ptr[srsInfoIdx].realBuffIdx * pDynDescr->num_prg * pDynDescr->num_bs_ant_port * MAX_NUM_UE_ANT_PORT;
                             if (row_idx_chanOrtMat == 0) {
@@ -460,18 +472,28 @@ namespace cumac {
 
                         corrVal = sqrt(innerProduct.x*innerProduct.x + innerProduct.y*innerProduct.y);
                 
-                        if (row_idx >= col_idx) {
-                            gpu_srsChanOrt_ptr[row_idx * (row_idx + 1) / 2 + col_idx] = corrVal;
-                        } else {
-                            gpu_srsChanOrt_ptr[col_idx * (col_idx + 1) / 2 + row_idx] = corrVal;
-                        }    
+                        // Deterministic-writer election for the triangular corr matrix: a UE pair
+                        // (row_ue, col_ue) is visited by two blocks (one with row_ue as srsInfo and
+                        // col_ue as iterated UE, and the symmetric one). Both blocks compute the
+                        // same |<h_a, h_b>| magnitude (FMA is commutative in its multiplicand
+                        // arguments), so a write-write race is value-benign, but we skip the
+                        // redundant upper-triangular store whenever the column UE is fresh this
+                        // slot (0x08) so each entry is written exactly once in the fresh case.
+                        if (!(row_idx < col_idx && (flags_ue_info & 0x08)))
+                        {
+                            if (row_idx >= col_idx) {
+                                gpu_srsChanOrt_ptr[row_idx * (row_idx + 1) / 2 + col_idx] = corrVal;
+                            } else {
+                                gpu_srsChanOrt_ptr[col_idx * (col_idx + 1) / 2 + row_idx] = corrVal;
+                            }
+                        }
                     } 
                 }
             }
         }
     }
 
-    __global__ void muUePairChanCorrKernel(muUePairChanCorrDynDescr* pDynDescr)
+    static __global__ void muUePairChanCorrKernel(muUePairChanCorrDynDescr* pDynDescr)
     {
         uint16_t cellId = blockIdx.x / pDynDescr->num_blocks_per_cell;
         uint16_t blockInd_in_cell = blockIdx.x - cellId*pDynDescr->num_blocks_per_cell;
@@ -489,6 +511,10 @@ namespace cumac {
         cumac_muUeGrp_req_ue_info_t* ueInfo_ptr = (cumac_muUeGrp_req_ue_info_t*) (srsInfo_ptr + req_info_ptr->numSrsInfo);
 
         if (srs_info_idx >= req_info_ptr->numSrsInfo) {
+            return;
+        }
+
+        if (srsInfo_ptr[srs_info_idx].id >= MAX_NUM_SRS_UE_PER_CELL) {
             return;
         }
 
@@ -544,8 +570,16 @@ namespace cumac {
                     if ((flags_ue_info & 0x01) > 0 && (flags_ue_info & 0x04) > 0) { // is a valid UE info and SRS chanEst available
                         uint16_t real_ue_id = ueInfo_ptr[real_uIdx_in_block + first_ue_info_idx_in_block].id;
 
+                        if (real_ue_id >= MAX_NUM_SRS_UE_PER_CELL) {
+                            continue;
+                        }
+
                         if ((flags_ue_info & 0x08) > 0) { // has updated SRS info in the current slot
                             uint16_t srsInfoIdx = ueInfo_ptr[real_uIdx_in_block + first_ue_info_idx_in_block].srsInfoIdx;
+
+                            if (srsInfoIdx >= req_info_ptr->numSrsInfo) {
+                                continue;
+                            }
 
                             if (row_idx_chanOrtMat == 0) {
                                 for (int idx = 0; idx < pDynDescr->num_bs_ant_port; idx++) {
@@ -580,18 +614,28 @@ namespace cumac {
 
                         corrVal = sqrt(innerProduct.x*innerProduct.x + innerProduct.y*innerProduct.y);
                 
-                        if (row_idx >= col_idx) {
-                            gpu_srsChanOrt_ptr[row_idx * (row_idx + 1) / 2 + col_idx] = corrVal;
-                        } else {
-                            gpu_srsChanOrt_ptr[col_idx * (col_idx + 1) / 2 + row_idx] = corrVal;
-                        }    
+                        // Deterministic-writer election for the triangular corr matrix: a UE pair
+                        // (row_ue, col_ue) is visited by two blocks (one with row_ue as srsInfo and
+                        // col_ue as iterated UE, and the symmetric one). Both blocks compute the
+                        // same |<h_a, h_b>| magnitude (FMA is commutative in its multiplicand
+                        // arguments), so a write-write race is value-benign, but we skip the
+                        // redundant upper-triangular store whenever the column UE is fresh this
+                        // slot (0x08) so each entry is written exactly once in the fresh case.
+                        if (!(row_idx < col_idx && (flags_ue_info & 0x08)))
+                        {
+                            if (row_idx >= col_idx) {
+                                gpu_srsChanOrt_ptr[row_idx * (row_idx + 1) / 2 + col_idx] = corrVal;
+                            } else {
+                                gpu_srsChanOrt_ptr[col_idx * (col_idx + 1) / 2 + row_idx] = corrVal;
+                            }
+                        }
                     } 
                 }
             }
         }
     }
 
-    __global__ void muUePairAlgKernel(muUePairAlgDynDescr* pDynDescr)
+    static __global__ void muUePairAlgKernel(muUePairAlgDynDescr* pDynDescr)
     {
         uint32_t                        cellId                  = blockIdx.x;
         cumac_muUeGrp_req_info_t*       req_info_ptr            = (cumac_muUeGrp_req_info_t*) (pDynDescr->task_in_buf + cellId*pDynDescr->task_in_buf_len_per_cell);
@@ -617,28 +661,31 @@ namespace cumac {
         if (threadIdx.x < req_info_ptr->numUeInfo) {
             uint8_t flags   = ueInfo_ptr[threadIdx.x].flags;
             uint16_t ue_id  = ueInfo_ptr[threadIdx.x].id;
-            nUeAnt[ue_id]   = ueInfo_ptr[threadIdx.x].nUeAnt;
-            ueRnti[ue_id]   = ueInfo_ptr[threadIdx.x].rnti;
-            if ((flags & 0x01) > 0 && ueInfo_ptr[threadIdx.x].bufferSize > 0) { // valid UE info
-                weights[threadIdx.x] = powf(__uint_as_float(ueInfo_ptr[threadIdx.x].currRate), __uint_as_float(req_info_ptr->betaCoeff))/__uint_as_float(ueInfo_ptr[threadIdx.x].avgRate);
-                ueIds[threadIdx.x] = ue_id;
 
-                if ((flags & 0x02) > 0) { // new TX indication
-                    if ((flags & 0x04) > 0) { // SRS chanEst available
-                        if (pDynDescr->srs_snr_buf[cellId*MAX_NUM_SRS_UE_PER_CELL + ue_id] >= __uint_as_float(req_info_ptr->srsSnrThr)) {
-                            muMimoInd[ue_id] = 1;
-                            weights[threadIdx.x] *= __uint_as_float(req_info_ptr->muCoeff);
+            if (ue_id < MAX_NUM_SRS_UE_PER_CELL) {
+                nUeAnt[ue_id]   = ueInfo_ptr[threadIdx.x].nUeAnt;
+                ueRnti[ue_id]   = ueInfo_ptr[threadIdx.x].rnti;
+                if ((flags & 0x01) > 0 && ueInfo_ptr[threadIdx.x].bufferSize > 0) { // valid UE info
+                    weights[threadIdx.x] = powf(__uint_as_float(ueInfo_ptr[threadIdx.x].currRate), __uint_as_float(req_info_ptr->betaCoeff))/__uint_as_float(ueInfo_ptr[threadIdx.x].avgRate);
+                    ueIds[threadIdx.x] = ue_id;
+
+                    if ((flags & 0x02) > 0) { // new TX indication
+                        if ((flags & 0x04) > 0) { // SRS chanEst available
+                            if (pDynDescr->srs_snr_buf[cellId*MAX_NUM_SRS_UE_PER_CELL + ue_id] >= __uint_as_float(req_info_ptr->srsSnrThr)) {
+                                muMimoInd[ue_id] = 1;
+                                weights[threadIdx.x] *= __uint_as_float(req_info_ptr->muCoeff);
+                            } else {
+                                muMimoInd[ue_id] = 0;
+                            }
                         } else {
                             muMimoInd[ue_id] = 0;
                         }
-                    } else {
+                    } else { // re-TX
                         muMimoInd[ue_id] = 0;
                     }
-                } else { // re-TX
+                } else {
                     muMimoInd[ue_id] = 0;
                 }
-            } else {
-                muMimoInd[ue_id] = 0;
             }
         }
         __syncthreads();
@@ -840,28 +887,31 @@ namespace cumac {
         if (threadIdx.x < req_info_ptr->numUeInfo) {
             uint8_t flags   = ueInfo_ptr[threadIdx.x].flags;
             uint16_t ue_id  = ueInfo_ptr[threadIdx.x].id;
-            nUeAnt[ue_id]   = ueInfo_ptr[threadIdx.x].nUeAnt;
-            ueRnti[ue_id]   = ueInfo_ptr[threadIdx.x].rnti;
-            if ((flags & 0x01) > 0 && ueInfo_ptr[threadIdx.x].bufferSize > 0) { // valid UE info
-                weights[threadIdx.x] = powf(__uint_as_float(ueInfo_ptr[threadIdx.x].currRate), __uint_as_float(req_info_ptr->betaCoeff))/__uint_as_float(ueInfo_ptr[threadIdx.x].avgRate);
-                ueIds[threadIdx.x] = ue_id;
 
-                if ((flags & 0x02) > 0) { // new TX indication
-                    if ((flags & 0x04) > 0) { // SRS chanEst available
-                        if (pDynDescr->srs_snr_buf[cellId*MAX_NUM_SRS_UE_PER_CELL + ue_id] >= __uint_as_float(req_info_ptr->srsSnrThr)) {
-                            muMimoInd[ue_id] = 1;
-                            weights[threadIdx.x] *= __uint_as_float(req_info_ptr->muCoeff);
+            if (ue_id < MAX_NUM_SRS_UE_PER_CELL) {
+                nUeAnt[ue_id]   = ueInfo_ptr[threadIdx.x].nUeAnt;
+                ueRnti[ue_id]   = ueInfo_ptr[threadIdx.x].rnti;
+                if ((flags & 0x01) > 0 && ueInfo_ptr[threadIdx.x].bufferSize > 0) { // valid UE info
+                    weights[threadIdx.x] = powf(__uint_as_float(ueInfo_ptr[threadIdx.x].currRate), __uint_as_float(req_info_ptr->betaCoeff))/__uint_as_float(ueInfo_ptr[threadIdx.x].avgRate);
+                    ueIds[threadIdx.x] = ue_id;
+
+                    if ((flags & 0x02) > 0) { // new TX indication
+                        if ((flags & 0x04) > 0) { // SRS chanEst available
+                            if (pDynDescr->srs_snr_buf[cellId*MAX_NUM_SRS_UE_PER_CELL + ue_id] >= __uint_as_float(req_info_ptr->srsSnrThr)) {
+                                muMimoInd[ue_id] = 1;
+                                weights[threadIdx.x] *= __uint_as_float(req_info_ptr->muCoeff);
+                            } else {
+                                muMimoInd[ue_id] = 0;
+                            }
                         } else {
                             muMimoInd[ue_id] = 0;
                         }
-                    } else {
+                    } else { // re-TX
                         muMimoInd[ue_id] = 0;
                     }
-                } else { // re-TX
+                } else {
                     muMimoInd[ue_id] = 0;
                 }
-            } else {
-                muMimoInd[ue_id] = 0;
             }
         }
         __syncthreads();
@@ -1057,10 +1107,15 @@ namespace cumac {
                 float* gpu_srsChanOrt_ptr = pDynDescr->chan_orth_mat_buf + (cellId*pDynDescr->num_subband*pDynDescr->num_prg_samp_per_subband + prgIdx)*MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT*(MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT+1)/2;
                 
                 for (uint16_t srs_info_idx = 0; srs_info_idx < req_info_ptr->numSrsInfo; srs_info_idx++) {
+                    if (srsInfo_msh_ptr[srs_info_idx].id >= MAX_NUM_SRS_UE_PER_CELL) {
+                        continue;
+                    }
+
                     uint16_t num_ue_ant_port = srsInfo_msh_ptr[srs_info_idx].nUeAnt;
 
                     float snr_f;
                     std::memcpy(&snr_f, &(srsInfo_msh_ptr[srs_info_idx].srsWbSnr), sizeof(float));
+
                     pDynDescr->srs_snr_buf[cellId*MAX_NUM_SRS_UE_PER_CELL + srsInfo_msh_ptr[srs_info_idx].id] = snr_f;
 
                     __half2* srsChanEst_srs_info = pDynDescr->cubb_srs_gpu_buf + srsInfo_msh_ptr[srs_info_idx].realBuffIdx * pDynDescr->num_prg * pDynDescr->num_bs_ant_port * MAX_NUM_UE_ANT_PORT;
@@ -1074,6 +1129,10 @@ namespace cumac {
                         uint16_t row_idx = srsInfo_msh_ptr[srs_info_idx].id*MAX_NUM_UE_ANT_PORT + srs_info_ant_port;
 
                         for (uint16_t uIdx = 0; uIdx < req_info_ptr->numUeInfo; uIdx++) {
+                            if (ueInfo_ptr[uIdx].id >= MAX_NUM_SRS_UE_PER_CELL) {
+                                continue;
+                            }
+
                             uint16_t num_ue_ant_port_real_uIdx = ueInfo_ptr[uIdx].nUeAnt;
                             uint8_t flags_ue_info = ueInfo_ptr[uIdx].flags;
                             for (uint16_t tx_port_idx = 0; tx_port_idx < num_ue_ant_port_real_uIdx; tx_port_idx++) {
@@ -1085,6 +1144,10 @@ namespace cumac {
 
                                     if ((flags_ue_info & 0x08) > 0) { // has updated SRS info in the current slot
                                         uint16_t srsInfoIdx = ueInfo_ptr[uIdx].srsInfoIdx;
+
+                                        if (srsInfoIdx >= req_info_ptr->numSrsInfo) {
+                                            continue;
+                                        }
 
                                         __half2* srsChanEst_srsInfoIdx = pDynDescr->cubb_srs_gpu_buf + srsInfo_msh_ptr[srsInfoIdx].realBuffIdx * pDynDescr->num_prg * pDynDescr->num_bs_ant_port * MAX_NUM_UE_ANT_PORT;
 
@@ -1111,11 +1174,16 @@ namespace cumac {
 
                                     corrVal = sqrt(innerProduct.x*innerProduct.x + innerProduct.y*innerProduct.y);
                 
-                                    if (row_idx >= col_idx) {
-                                        gpu_srsChanOrt_ptr[row_idx * (row_idx + 1) / 2 + col_idx] = corrVal;
-                                    } else {
-                                        gpu_srsChanOrt_ptr[col_idx * (col_idx + 1) / 2 + row_idx] = corrVal;
-                                    }    
+                                    // Deterministic-writer election for the triangular corr matrix:
+                                    // see the sibling chan-corr kernel variant for rationale.
+                                    if (!(row_idx < col_idx && (flags_ue_info & 0x08)))
+                                    {
+                                        if (row_idx >= col_idx) {
+                                            gpu_srsChanOrt_ptr[row_idx * (row_idx + 1) / 2 + col_idx] = corrVal;
+                                        } else {
+                                            gpu_srsChanOrt_ptr[col_idx * (col_idx + 1) / 2 + row_idx] = corrVal;
+                                        }
+                                    }
                                 } 
                             }
                         }
@@ -1140,6 +1208,10 @@ namespace cumac {
                 float* gpu_srsChanOrt_ptr = pDynDescr->chan_orth_mat_buf + (cellId*pDynDescr->num_subband*pDynDescr->num_prg_samp_per_subband + prgIdx)*MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT*(MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT+1)/2;
                 
                 for (uint16_t srs_info_idx = 0; srs_info_idx < req_info_ptr->numSrsInfo; srs_info_idx++) {
+                    if (srsInfo_ptr[srs_info_idx].id >= MAX_NUM_SRS_UE_PER_CELL) {
+                        continue;
+                    }
+
                     uint16_t num_ue_ant_port = srsInfo_ptr[srs_info_idx].nUeAnt;
 
                     float snr_f;
@@ -1155,6 +1227,10 @@ namespace cumac {
                         uint16_t row_idx = srsInfo_ptr[srs_info_idx].id*MAX_NUM_UE_ANT_PORT + srs_info_ant_port;
                         
                         for (uint16_t uIdx = 0; uIdx < req_info_ptr->numUeInfo; uIdx++) {
+                            if (ueInfo_ptr[uIdx].id >= MAX_NUM_SRS_UE_PER_CELL) {
+                                continue;
+                            }
+
                             uint16_t num_ue_ant_port_real_uIdx = ueInfo_ptr[uIdx].nUeAnt;
                             uint8_t flags_ue_info = ueInfo_ptr[uIdx].flags;
                             for (uint16_t tx_port_idx = 0; tx_port_idx < num_ue_ant_port_real_uIdx; tx_port_idx++) {
@@ -1166,6 +1242,10 @@ namespace cumac {
 
                                     if ((flags_ue_info & 0x08) > 0) { // has updated SRS info in the current slot
                                         uint16_t srsInfoIdx = ueInfo_ptr[uIdx].srsInfoIdx;
+
+                                        if (srsInfoIdx >= req_info_ptr->numSrsInfo) {
+                                            continue;
+                                        }
 
                                         for (int idx = 0; idx < pDynDescr->num_bs_ant_port; idx++) {
                                             __half2 tmp1 = srsInfo_ptr[srsInfoIdx].srsChanEst[prgIdx*num_ue_ant_port_real_uIdx*pDynDescr->num_bs_ant_port + tx_port_idx*pDynDescr->num_bs_ant_port + idx];
@@ -1190,11 +1270,16 @@ namespace cumac {
 
                                     corrVal = sqrt(innerProduct.x*innerProduct.x + innerProduct.y*innerProduct.y);
                 
-                                    if (row_idx >= col_idx) {
-                                        gpu_srsChanOrt_ptr[row_idx * (row_idx + 1) / 2 + col_idx] = corrVal;
-                                    } else {
-                                        gpu_srsChanOrt_ptr[col_idx * (col_idx + 1) / 2 + row_idx] = corrVal;
-                                    }    
+                                    // Deterministic-writer election for the triangular corr matrix:
+                                    // see the sibling chan-corr kernel variant for rationale.
+                                    if (!(row_idx < col_idx && (flags_ue_info & 0x08)))
+                                    {
+                                        if (row_idx >= col_idx) {
+                                            gpu_srsChanOrt_ptr[row_idx * (row_idx + 1) / 2 + col_idx] = corrVal;
+                                        } else {
+                                            gpu_srsChanOrt_ptr[col_idx * (col_idx + 1) / 2 + row_idx] = corrVal;
+                                        }
+                                    }
                                 } 
                             }
                         }
@@ -1237,6 +1322,10 @@ namespace cumac {
             for (size_t i = 0; i < req_info_ptr->numUeInfo; i++) {
                 uint8_t flags   = ueInfo_ptr[i].flags;
                 uint16_t ue_id  = ueInfo_ptr[i].id;
+                if (ue_id >= MAX_NUM_SRS_UE_PER_CELL) {
+                    continue;
+                }
+
                 nUeAnt[ue_id]   = ueInfo_ptr[i].nUeAnt;
                 ueRnti[ue_id]   = ueInfo_ptr[i].rnti;
                 if ((flags & 0x01) > 0 && ueInfo_ptr[i].bufferSize > 0) { // valid UE info
@@ -1462,6 +1551,11 @@ namespace cumac {
             for (size_t i = 0; i < req_info_ptr->numUeInfo; i++) {
                 uint8_t flags   = ueInfo_ptr[i].flags;
                 uint16_t ue_id  = ueInfo_ptr[i].id;
+
+                if (ue_id >= MAX_NUM_SRS_UE_PER_CELL) {
+                    continue;
+                }
+
                 nUeAnt[ue_id]   = ueInfo_ptr[i].nUeAnt;
                 ueRnti[ue_id]   = ueInfo_ptr[i].rnti;
                 if ((flags & 0x01) > 0 && ueInfo_ptr[i].bufferSize > 0) { // valid UE info

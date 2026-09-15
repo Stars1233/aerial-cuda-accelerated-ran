@@ -17,13 +17,13 @@
 
 #include "cuphy_testWrkr.hpp"
 
-#include <atomic>
-
 namespace
 {
 std::atomic<bool> g_logged_pusch_tv_override_apply{false};
 std::atomic<bool> g_logged_pucch_tv_override_apply{false};
 std::atomic<bool> g_logged_srs_tv_override_apply{false};
+std::atomic<bool> g_logged_pdsch_tv_override_apply{false};
+std::atomic<bool> g_logged_pdcch_tv_override_apply{false};
 
 void apply_pusch_tv_overrides(cuphyPuschStatPrms_t& p)
 {
@@ -35,6 +35,7 @@ void apply_pusch_tv_overrides(cuphyPuschStatPrms_t& p)
         if(!g_logged_pusch_tv_override_apply.load(std::memory_order_relaxed))
         {
             NVLOGI_FMT(NVLOG_PUSCH, "[TV-OVERRIDE][PUSCH][APPLIED] {}={}", key, value);
+            printf("[TV-OVERRIDE][PUSCH][APPLIED] %s=%u\n", key, value);
         }
         ++applied_count;
     };
@@ -210,9 +211,61 @@ void apply_pusch_tv_overrides(cuphyPuschStatPrms_t& p)
         log_applied("enable_per_prg_channel_estimation", o.enable_per_prg_channel_estimation);
     }
 
+    if(o.has_open_ran_functional_split)
+    {
+        if(o.open_ran_functional_split < PUSCH_MAX_SPLIT_MODES)  // 0=7.2a, 1=7.2e
+        {
+            p.openRanFunctionalSplitOption = o.open_ran_functional_split;
+            log_applied("open_ran_functional_split", o.open_ran_functional_split);
+        }
+        else
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "[TV-OVERRIDE][PUSCH] invalid open_ran_functional_split={} (valid: 0=7.2a, 1=7.2e)", static_cast<unsigned int>(o.open_ran_functional_split));
+        }
+    }
+
+    if(o.has_kernel_sel_option)
+    {
+        if(o.kernel_sel_option < PUSCH_MAX_KERNEL_SEL_MODES)  // 0=ALL, 1=NO_FEC, 2=NO_DERATE_MATCHING_FEC, 3=NO_SD_DERATE_MATCHING_FEC
+        {
+            p.kernelSelOption = o.kernel_sel_option;
+            log_applied("kernel_sel_option", o.kernel_sel_option);
+        }
+        else
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "[TV-OVERRIDE][PUSCH] invalid kernel_sel_option={} (valid: 0-3)", static_cast<unsigned int>(o.kernel_sel_option));
+        }
+    }
+    
+    if(o.has_uci_kernel_sel_option)
+    {
+        if(o.uci_kernel_sel_option < PUSCH_MAX_UCI_KERNEL_SEL_MODES)  // 0=ALL, 1=NO_POLAR, 2=NO_UCI_WITH_SEG, 3=NO_UCI
+        {
+            p.uciKernelSelOption = o.uci_kernel_sel_option;
+            log_applied("uci_kernel_sel_option", o.uci_kernel_sel_option);
+        }
+        else
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "[TV-OVERRIDE][PUSCH] invalid uci_kernel_sel_option={} (valid: 0-3)", static_cast<unsigned int>(o.uci_kernel_sel_option));
+        }
+    }
+
+    if(o.has_delay_us)
+    {
+        p.delayUs = o.delay_us;  // 0 = no delay kernel launch for full-slot processing; non-negative
+        log_applied("delay_us", o.delay_us);
+    }
+    
+    if(o.has_sub_slot_delay_us)
+    {
+        p.subSlotDelayUs = o.sub_slot_delay_us;  // 0 = no delay kernel launch for sub-slot processing; non-negative
+        log_applied("sub_slot_delay_us", o.sub_slot_delay_us);
+    }
+
     if(applied_count > 0 && !g_logged_pusch_tv_override_apply.load(std::memory_order_relaxed))
     {
         NVLOGI_FMT(NVLOG_PUSCH, "[TV-OVERRIDE][PUSCH] applied {} override field(s)", applied_count);
+        printf("[TV-OVERRIDE][PUSCH] applied %u override field(s)\n", applied_count);
         NVLOGI_FMT(
             NVLOG_PUSCH,
             "[TV-OVERRIDE][PUSCH][SUMMARY] applied={}, ldpcEarlyTermination={}, ldpcAlgoIndex={}, "
@@ -224,6 +277,15 @@ void apply_pusch_tv_overrides(cuphyPuschStatPrms_t& p)
             static_cast<unsigned int>(p.ldpcUseHalf),
             static_cast<unsigned int>(p.fixedMaxNumLdpcItrs),
             static_cast<unsigned int>(p.eqCoeffAlgo));
+        printf("[TV-OVERRIDE][PUSCH][SUMMARY] applied=%u, ldpcEarlyTermination=%u, ldpcAlgoIndex=%u, "
+               "ldpcFlags=%u, ldpcUseHalf=%u, fixedMaxNumLdpcItrs=%u, eqCoeffAlgo=%u\n",
+               applied_count,
+               static_cast<unsigned int>(p.ldpcEarlyTermination),
+               static_cast<unsigned int>(p.ldpcAlgoIndex),
+               static_cast<unsigned int>(p.ldpcFlags),
+               static_cast<unsigned int>(p.ldpcUseHalf),
+               static_cast<unsigned int>(p.fixedMaxNumLdpcItrs),
+               static_cast<unsigned int>(p.eqCoeffAlgo));
         NVLOGI_FMT(
             NVLOG_PUSCH,
             "[TV-OVERRIDE][PUSCH][EFFECTIVE] polarDcdrListSz={} enableCfoCorrection={} "
@@ -250,6 +312,30 @@ void apply_pusch_tv_overrides(cuphyPuschStatPrms_t& p)
             static_cast<unsigned int>(p.eqCoeffAlgo),
             static_cast<unsigned int>(p.chEstAlgo),
             static_cast<unsigned int>(p.enablePerPrgChEst));
+        printf("[TV-OVERRIDE][PUSCH][EFFECTIVE] polarDcdrListSz=%u enableCfoCorrection=%u "
+               "enableWeightedAverageCfo=%u enableToEstimation=%u enablePuschTdi=%u enableDftSOfdm=%u "
+               "enableRssiMeasurement=%u enableSinrMeasurement=%u enableMassiveMIMO=%u enableEarlyHarq=%u "
+               "ldpcEarlyTermination=%u ldpcAlgoIndex=%u ldpcFlags=%u ldpcUseHalf=%u fixedMaxNumLdpcItrs=%u "
+               "ldpcMaxNumItrAlgo=%u eqCoeffAlgo=%u chEstAlgo=%u enablePerPrgChEst=%u\n",
+               static_cast<unsigned int>(p.polarDcdrListSz),
+               static_cast<unsigned int>(p.enableCfoCorrection),
+               static_cast<unsigned int>(p.enableWeightedAverageCfo),
+               static_cast<unsigned int>(p.enableToEstimation),
+               static_cast<unsigned int>(p.enablePuschTdi),
+               static_cast<unsigned int>(p.enableDftSOfdm),
+               static_cast<unsigned int>(p.enableRssiMeasurement),
+               static_cast<unsigned int>(p.enableSinrMeasurement),
+               static_cast<unsigned int>(p.enableMassiveMIMO),
+               static_cast<unsigned int>(p.enableEarlyHarq),
+               static_cast<unsigned int>(p.ldpcEarlyTermination),
+               static_cast<unsigned int>(p.ldpcAlgoIndex),
+               static_cast<unsigned int>(p.ldpcFlags),
+               static_cast<unsigned int>(p.ldpcUseHalf),
+               static_cast<unsigned int>(p.fixedMaxNumLdpcItrs),
+               static_cast<unsigned int>(p.ldpcMaxNumItrAlgo),
+               static_cast<unsigned int>(p.eqCoeffAlgo),
+               static_cast<unsigned int>(p.chEstAlgo),
+               static_cast<unsigned int>(p.enablePerPrgChEst));
         g_logged_pusch_tv_override_apply.store(true, std::memory_order_relaxed);
     }
 }
@@ -266,10 +352,61 @@ void apply_pucch_tv_overrides(cuphyPucchStatPrms_t& p)
         if(!g_logged_pucch_tv_override_apply.load(std::memory_order_relaxed))
         {
             NVLOGI_FMT(NVLOG_PUCCH, "[TV-OVERRIDE][PUCCH][APPLIED] list_length={}", static_cast<unsigned int>(o.polar_list_length));
+            printf("[TV-OVERRIDE][PUCCH][APPLIED] list_length=%u\n", static_cast<unsigned int>(o.polar_list_length));
             NVLOGI_FMT(NVLOG_PUCCH, "[TV-OVERRIDE][PUCCH] applied 1 override field(s)");
+            printf("[TV-OVERRIDE][PUCCH] applied 1 override field(s)\n");
+            NVLOGI_FMT(NVLOG_PUCCH, "[TV-OVERRIDE][PUCCH][EFFECTIVE] polarDcdrListSz={}", static_cast<unsigned int>(p.polarDcdrListSz));
             printf("[TV-OVERRIDE][PUCCH][EFFECTIVE] polarDcdrListSz=%u\n", static_cast<unsigned int>(p.polarDcdrListSz));
             g_logged_pucch_tv_override_apply.store(true, std::memory_order_relaxed);
         }
+    }
+    if(o.has_pipeline_processing_mode)
+    {
+        bool applied = false;
+        switch(o.pipeline_processing_mode)
+        {
+            case 0:
+                p.pipelineMode = PUCCH_PIPELINE_FULL;
+                applied = true;
+                break;
+            case 1:
+                p.pipelineMode = PUCCH_PIPELINE_SKIP_POLAR;
+                applied = true;
+                break;
+            case 2:
+                p.pipelineMode = PUCCH_PIPELINE_SKIP_BACKEND;
+                applied = true;
+                break;
+            default:
+                NVLOGE_FMT(NVLOG_PUCCH,
+                           AERIAL_CUPHY_EVENT,
+                           "[TV-OVERRIDE][PUCCH] invalid pipeline_processing_mode={}",
+                           static_cast<unsigned int>(o.pipeline_processing_mode));
+                break;
+        }
+        if(applied)
+        {
+            NVLOGI_FMT(NVLOG_PUCCH,
+                       "[TV-OVERRIDE][PUCCH][APPLIED] pipeline_processing_mode={} -> pipelineMode={}",
+                       o.pipeline_processing_mode,
+                       static_cast<unsigned int>(p.pipelineMode));
+            printf("[TV-OVERRIDE][PUCCH][APPLIED] pipeline_processing_mode=%u -> pipelineMode=%u\n",
+                   o.pipeline_processing_mode,
+                   static_cast<unsigned int>(p.pipelineMode));
+            NVLOGI_FMT(NVLOG_PUCCH,
+                       "[TV-OVERRIDE][PUCCH][EFFECTIVE] pipeline_processing_mode={} -> pipelineMode={}",
+                       o.pipeline_processing_mode,
+                       static_cast<unsigned int>(p.pipelineMode));
+            printf("[TV-OVERRIDE][PUCCH][EFFECTIVE] pipeline_processing_mode=%u -> pipelineMode=%u\n", o.pipeline_processing_mode, static_cast<unsigned int>(p.pipelineMode));
+        }
+    }
+    if(o.has_delay_us)
+    {
+        p.pipelineDelayUs = static_cast<uint32_t>(o.delay_us);
+        NVLOGI_FMT(NVLOG_PUCCH, "[TV-OVERRIDE][PUCCH][APPLIED] delay_us={}", o.delay_us);
+        printf("[TV-OVERRIDE][PUCCH][APPLIED] delay_us=%u\n", static_cast<unsigned int>(o.delay_us));
+        NVLOGI_FMT(NVLOG_PUCCH, "[TV-OVERRIDE][PUCCH][EFFECTIVE] pipelineDelayUs={}", p.pipelineDelayUs);
+        printf("[TV-OVERRIDE][PUCCH][EFFECTIVE] pipelineDelayUs=%u\n", static_cast<unsigned int>(p.pipelineDelayUs));
     }
 }
 
@@ -299,7 +436,10 @@ void apply_srs_tv_overrides(cuphySrsStatPrms_t& p)
         if(!g_logged_srs_tv_override_apply.load(std::memory_order_relaxed))
         {
             NVLOGI_FMT(NVLOG_SRS, "[TV-OVERRIDE][SRS][APPLIED] chEst_alg_selector={}", static_cast<unsigned int>(o.chest_alg_index));
+            printf("[TV-OVERRIDE][SRS][APPLIED] chEst_alg_selector=%u\n", static_cast<unsigned int>(o.chest_alg_index));
             NVLOGI_FMT(NVLOG_SRS, "[TV-OVERRIDE][SRS] applied 1 override field(s)");
+            printf("[TV-OVERRIDE][SRS] applied 1 override field(s)\n");
+            NVLOGI_FMT(NVLOG_SRS, "[TV-OVERRIDE][SRS][EFFECTIVE] chEstAlgo={}", static_cast<unsigned int>(p.chEstAlgo));
             printf("[TV-OVERRIDE][SRS][EFFECTIVE] chEstAlgo=%u\n", static_cast<unsigned int>(p.chEstAlgo));
             g_logged_srs_tv_override_apply.store(true, std::memory_order_relaxed);
         }
@@ -307,6 +447,93 @@ void apply_srs_tv_overrides(cuphySrsStatPrms_t& p)
     else
         NVLOGE_FMT(NVLOG_SRS, AERIAL_CUPHY_EVENT, "[TV-OVERRIDE][SRS] invalid chest_alg_index={}", static_cast<unsigned int>(o.chest_alg_index));
 }
+void apply_pdsch_tv_overrides(cuphyPdschStatPrms_t& p)
+{
+    if(!g_tv_override_cfg.enable)
+    {
+        return;
+    }
+
+    const auto& o = g_tv_override_cfg.pdsch;
+    uint32_t applied_count = 0;
+
+    if(o.has_pipeline_processing_mode)
+    {
+        if(o.pipeline_processing_mode > static_cast<uint8_t>(PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING))
+        {
+            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,
+                "[TV-OVERRIDE][PDSCH] invalid pipeline_processing_mode={} (expected 0=FULL, 1=AAS, 2=POST_FEC, 3=POST_FEC_RM_SCRAMBLING); ignoring",
+                static_cast<unsigned int>(o.pipeline_processing_mode));
+        }
+        else
+        {
+            p.pipeline_processing_mode = static_cast<cuphyPdschPipelineMode_t>(o.pipeline_processing_mode);
+            NVLOGI_FMT(NVLOG_PDSCH, "[TV-OVERRIDE][PDSCH][APPLIED] pipeline_processing_mode={}",
+                static_cast<unsigned int>(o.pipeline_processing_mode));
+            ++applied_count;
+        }
+    }
+    if(o.has_delay_us)
+    {
+        p.delayUs = o.delay_us;
+        NVLOGI_FMT(NVLOG_PDSCH, "[TV-OVERRIDE][PDSCH][APPLIED] delay_us={}",
+            static_cast<unsigned int>(o.delay_us));
+        if(p.pipeline_processing_mode != PDSCH_POST_FEC_PROCESSING &&
+           p.pipeline_processing_mode != PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING)
+        {
+            NVLOGW_FMT(NVLOG_PDSCH,
+                "[TV-OVERRIDE][PDSCH] delay_us applied but effective pipeline_processing_mode={} is not a post-FEC mode; "
+                "cuPHY ignores delayUs outside POST_FEC/POST_FEC_RM_SCRAMBLING modes",
+                static_cast<unsigned int>(p.pipeline_processing_mode));
+        }
+        ++applied_count;
+    }
+
+    if(applied_count > 0 && !g_logged_pdsch_tv_override_apply.load(std::memory_order_relaxed))
+    {
+        NVLOGI_FMT(NVLOG_PDSCH, "[TV-OVERRIDE][PDSCH] applied {} override field(s)", applied_count);
+        NVLOGI_FMT(NVLOG_PDSCH,
+            "[TV-OVERRIDE][PDSCH][EFFECTIVE] pipeline_processing_mode={} delayUs={}",
+            static_cast<unsigned int>(p.pipeline_processing_mode),
+            static_cast<unsigned int>(p.delayUs));
+        g_logged_pdsch_tv_override_apply.store(true, std::memory_order_relaxed);
+    }
+}
+
+void apply_pdcch_tv_overrides(cuphyPdcchStatPrms_t& p)
+{
+    if(!g_tv_override_cfg.enable)
+        return;
+
+    const auto& o = g_tv_override_cfg.pdcch;
+    uint32_t applied_count = 0;
+
+    if(o.has_kernel_sel_option)
+    {
+        p.kernelSelOption = o.kernel_sel_option;
+        NVLOGI_FMT(NVLOG_PDCCH, "[TV-OVERRIDE][PDCCH][APPLIED] kernel_sel_option={}",
+            static_cast<unsigned int>(o.kernel_sel_option));
+        ++applied_count;
+    }
+    if(o.has_delay_us)
+    {
+        p.delayUs = o.delay_us;
+        NVLOGI_FMT(NVLOG_PDCCH, "[TV-OVERRIDE][PDCCH][APPLIED] delay_us={}",
+            static_cast<unsigned int>(o.delay_us));
+        ++applied_count;
+    }
+
+    if(applied_count > 0 && !g_logged_pdcch_tv_override_apply.load(std::memory_order_relaxed))
+    {
+        NVLOGI_FMT(NVLOG_PDCCH, "[TV-OVERRIDE][PDCCH] applied {} override field(s)", applied_count);
+        NVLOGI_FMT(NVLOG_PDCCH,
+            "[TV-OVERRIDE][PDCCH][EFFECTIVE] kernelSelOption={} delayUs={}",
+            static_cast<unsigned int>(p.kernelSelOption),
+            static_cast<unsigned int>(p.delayUs));
+        g_logged_pdcch_tv_override_apply.store(true, std::memory_order_relaxed);
+    }
+}
+
 } // namespace
 
 cuPHYTestWorker::cuPHYTestWorker(std::string const& name, uint32_t workerId, int cpuId, int gpuId, int cpuThrdSchdPolicy, int cpuThrdPrio, uint32_t mpsSubctxSmCount, std::shared_ptr<testWrkrCmdQ>& cmdQ, std::shared_ptr<testWrkrRspQ>& rspQ, int uldlMode, uint32_t debugMessageLevel, bool useGreenContexts, const cuphy::cudaGreenContext& greenCtx) :
@@ -367,6 +594,9 @@ cuPHYTestWorker::cuPHYTestWorker(std::string const& name, uint32_t workerId, int
     m_totPUSCH2StartTime(0),
     m_totPUSCH2SubslotProcRunTime(0),
     m_totPUSCH2RunTime(0),
+    m_totUciOnPuschRunTime(0),
+    m_totUciOnPusch2RunTime(0),
+    m_uciTiming(false),
     m_totPUCCHStartTime(0),
     m_totPUCCHRunTime(0),
     m_totPUCCH2StartTime(0),
@@ -1049,6 +1279,16 @@ void cuPHYTestWorker::puschRxInitHandler(std::shared_ptr<void>& shPtrPayload)
             m_cuStrmsPusch.emplace_back(cudaStreamNonBlocking, m_cuStrmPrioPusch);
         }
 
+        // The PUSCH O-RAN functional split selects which TV tensors the dataset loads
+        // (7.2a raw IQ via DataRx vs 7.2e equalizer inputs via X_72e/Ree_inv_72e). It must be
+        // passed to the dataset constructor, not just patched onto the static prms afterward:
+        // applying it only to the static struct leaves the dynamic 7.2e input tensors null and
+        // crashes PuschRx::allocateDeviceMemory. Use the YAML override when present, else 7.2a.
+        const uint8_t splitMode =
+            (g_tv_override_cfg.enable && g_tv_override_cfg.pusch.has_open_ran_functional_split)
+                ? g_tv_override_cfg.pusch.open_ran_functional_split
+                : static_cast<uint8_t>(PUSCH_7_2_A);
+
         // loop over stream iterations
         for(uint32_t i = 0; i < m_nItrsPerStrm; ++i)
         {
@@ -1057,16 +1297,30 @@ void cuPHYTestWorker::puschRxInitHandler(std::shared_ptr<void>& shPtrPayload)
             {
                 tempInput.assign(inFileNamesPuschRx.begin() + i * (inFileNamesPuschRx.size() / m_nStrms), inFileNamesPuschRx.begin() + (i + 1) * (inFileNamesPuschRx.size() / m_nStrms));
                 m_puschRxStaticApiDataSets[strmIdx].emplace_back(tempInput, m_cuStrmsPusch[strmIdx].handle(), std::string(), 1, 0, initMsgPayload.enableLdpcThroughputMode, &initMsgPayload.puschPrms,
-                                                                 static_cast<cuphyPuschLdpcKernelLaunch_t>(m_ldpc_kernel_launch_mode));
+                                                                 static_cast<cuphyPuschLdpcKernelLaunch_t>(m_ldpc_kernel_launch_mode), splitMode);
             }
             else
             {
                 tempInput.assign(1, inFileNamesPuschRx[strmIdx]);
                 m_puschRxStaticApiDataSets[strmIdx].emplace_back(tempInput, m_cuStrmsPusch[strmIdx].handle(), std::string(), 1, 0, initMsgPayload.enableLdpcThroughputMode, &initMsgPayload.puschPrms,
-                                                                 static_cast<cuphyPuschLdpcKernelLaunch_t>(m_ldpc_kernel_launch_mode));
+                                                                 static_cast<cuphyPuschLdpcKernelLaunch_t>(m_ldpc_kernel_launch_mode), splitMode);
             }
             // load static
             apply_pusch_tv_overrides(m_puschRxStaticApiDataSets[strmIdx][i].puschStatPrms);
+
+            // TensorRT PUSCH channel estimator (set via --E), independent of tv_override:
+            // a non-empty path selects TrtEnginePuschRxChEst in the cuPHY chest factory.
+            // c_str() is safe - g_pusch_trt_chest_config lives for the process lifetime.
+            if(!g_pusch_trt_chest_config.empty())
+            {
+                m_puschRxStaticApiDataSets[strmIdx][i].puschStatPrms.puschrxChestFactorySettingsFilename = g_pusch_trt_chest_config.c_str();
+                static std::atomic<bool> logged{false};
+                bool expected = false;
+                if(logged.compare_exchange_strong(expected, true))
+                {
+                    NVLOGC_FMT(NVLOG_PUSCH, "[PUSCH][TRT] chest engine enabled via --E: {}", g_pusch_trt_chest_config);
+                }
+            }
 
             CUDA_CHECK(cudaStreamSynchronize(m_cuStrmsPusch[strmIdx].handle()));
 
@@ -1207,6 +1461,8 @@ void cuPHYTestWorker::pdcchTxInitHandler(std::shared_ptr<void>& shPtrPayload)
                         ; //cumulatively update m_pdcchTxStatApiDataSets[strmIdx][itrIdx] Nothing to update for now.
                     }*/
                 }
+                
+                apply_pdcch_tv_overrides(m_pdcchTxStaticApiDataSets[strmIdx][itrIdx].pdcchStatPrms);
 
                 // intialize pipeline
                 m_pdcchTxPipes[strmIdx].emplace_back(m_pdcchTxStaticApiDataSets[strmIdx][itrIdx].pdcchStatPrms);
@@ -1279,7 +1535,7 @@ void cuPHYTestWorker::pdschTxInitHandler(std::shared_ptr<void>& shPtrPayload)
                     std::string outFileName = std::string();
                     if(cellPerStrmIdx == 0)
                     {
-                        m_pdschTxStaticApiDataSets[strmIdx].emplace_back(inFileNamesPdschTx[cellIdx], outFileName, m_ref_check_pdsch, m_identical_ldpc_configs, m_cuStrmPrioPdsch, initMsgPayload.pdschPrms.maxNCbsPerTb, initMsgPayload.pdschPrms.maxNTbs, initMsgPayload.pdschPrms.maxNPrbs);
+                        m_pdschTxStaticApiDataSets[strmIdx].emplace_back(inFileNamesPdschTx[cellIdx], outFileName, m_ref_check_pdsch, m_identical_ldpc_configs, m_cuStrmPrioPdsch, m_nCellsPerStrm_pdsch, initMsgPayload.pdschPrms.maxNCbsPerTb, initMsgPayload.pdschPrms.maxNTbs, initMsgPayload.pdschPrms.maxNPrbs, false /*use batched memcpy*/, cuphyPdschPipelineMode_t::PDSCH_FULL_PROCESSING /* processing mode */, false /* read TB CRC */, 0 /* delay_usec only relevant in post-fec processing mode */);
                     }
                     else
                     {
@@ -1292,6 +1548,8 @@ void cuPHYTestWorker::pdschTxInitHandler(std::shared_ptr<void>& shPtrPayload)
 
                 // DBG print static parameters
                 //m_pdschTxStaticApiDataSets[strmIdx][itrIdx].print();
+
+                apply_pdsch_tv_overrides(m_pdschTxStaticApiDataSets[strmIdx][itrIdx].pdschStatPrms);
 
                 // intialize pipeline
                 m_pdschTxPipes[strmIdx].emplace_back(m_pdschTxStaticApiDataSets[strmIdx][itrIdx].pdschStatPrms);
@@ -1700,6 +1958,13 @@ void cuPHYTestWorker::puschRxSetupHandler(std::shared_ptr<void>& shPtrPayload)
         m_puschRxEvalDataSets.resize(m_nStrms);
 
         cuphyPuschBatchPrmHndl_t batchPrmHndl = nullptr;
+        // The dynamic dataset only loads the 7.2e input tensors (X_72e/Ree_inv_72e) when built
+        // with the 7.2e split mode; otherwise pTX_72e/pTReeInv_72e stay null and PuschRx crashes
+        // in 7.2e mode. Keep this consistent with the static dataset / override (see puschRxInitHandler).
+        const uint8_t splitMode =
+            (g_tv_override_cfg.enable && g_tv_override_cfg.pusch.has_open_ran_functional_split)
+                ? g_tv_override_cfg.pusch.open_ran_functional_split
+                : static_cast<uint8_t>(PUSCH_7_2_A);
         // loop over streams
         for(uint32_t strmIdx = 0; strmIdx < m_nStrms; ++strmIdx)
         {
@@ -1716,14 +1981,14 @@ void cuPHYTestWorker::puschRxSetupHandler(std::shared_ptr<void>& shPtrPayload)
                 if(m_pusch_group_cells)
                 {
                     tempInput.assign(inFileNamesPuschRx.begin() + itrIdx * (inFileNamesPuschRx.size() / m_nStrms), inFileNamesPuschRx.begin() + (itrIdx + 1) * (inFileNamesPuschRx.size() / m_nStrms));
-                    m_puschRxDynamicApiDataSets[strmIdx].emplace_back(tempInput, m_cuStrmsPusch[strmIdx].handle(), m_pusch_proc_mode | procModeSubslotProcFlag, false, m_fp16Mode);
+                    m_puschRxDynamicApiDataSets[strmIdx].emplace_back(tempInput, m_cuStrmsPusch[strmIdx].handle(), m_pusch_proc_mode | procModeSubslotProcFlag, false, m_fp16Mode, /*apiTVflag*/0, /*drmDebug*/false, splitMode);
                     m_puschRxEvalDataSets[strmIdx].emplace_back(tempInput, m_cuStrmsPusch[strmIdx].handle());
                 }
                 else
                 {
                     std::vector<std::string> v;
                     v.push_back(inFileNamesPuschRx[cellIdx]);
-                    m_puschRxDynamicApiDataSets[strmIdx].emplace_back(v, m_cuStrmsPusch[strmIdx].handle(), m_pusch_proc_mode | procModeSubslotProcFlag, false, m_fp16Mode);
+                    m_puschRxDynamicApiDataSets[strmIdx].emplace_back(v, m_cuStrmsPusch[strmIdx].handle(), m_pusch_proc_mode | procModeSubslotProcFlag, false, m_fp16Mode, /*apiTVflag*/0, /*drmDebug*/false, splitMode);
                     m_puschRxEvalDataSets[strmIdx].emplace_back(v, m_cuStrmsPusch[strmIdx].handle());
                 }
                 CUDA_CHECK(cudaStreamSynchronize(m_cuStrmsPusch[strmIdx].handle()));
@@ -1807,7 +2072,7 @@ void cuPHYTestWorker::pdschTxSetupHandler(std::shared_ptr<void>& shPtrPayload)
                     //if(cellPerStrmIdx == 0)
                     if(cellPerStrmIdx == 0)
                     {
-                        m_pdschTxDynamicApiDataSets[strmIdx].emplace_back(inFileNamesPdschTx[cellIdx], m_nCellsPerStrm_pdsch, cuStrmsPdsch[strmIdx].handle(), m_pdsch_proc_mode, m_pdschTxStaticApiDataSets[strmIdx][itrIdx].pdschStatPrms);
+                        m_pdschTxDynamicApiDataSets[strmIdx].emplace_back(inFileNamesPdschTx[cellIdx], m_nCellsPerStrm_pdsch, cuStrmsPdsch[strmIdx].handle(), m_pdsch_proc_mode, m_pdschTxStaticApiDataSets[strmIdx][itrIdx].pdschStatPrms, false /* PDSCH TB input buffers not on GPU */, 1 /* forced TB byte alignment*/, m_pdschTxStaticApiDataSets[strmIdx][itrIdx].getEmax());
                     }
                     else
                     {
@@ -1914,6 +2179,23 @@ void cuPHYTestWorker::runPUCCH_U5_U6(const cudaEvent_t& startEvent, const cudaEv
     const uint32_t pucch2AfterPucch1DelayUs = resolve_delay_us(g_start_delay_cfg_us.pucch2_u6, 0);
     const bool nonPuschAnchor = g_start_delay_cfg_us.ul_anchor_from_yaml
         && g_start_delay_cfg_us.ul_anchor_mode != ul_anchor_mode_t::PUSCH;
+    // Cascade scheduling summary (pusch_cascaded / pucch_cascaded x UL_ANCHOR):
+    // Note: every trigger event can be offset by an optional YAML-configured delay.
+    //
+    // pusch_cas / pucch_cas | UL_ANCHOR          | PUSCH2 starts after       | PUCCH2 starts after
+    // ----------------------|--------------------|---------------------------|-----------------------------
+    //  0 / 0                | PUSCH (default)    | anchor start              | anchor start (startEvent2)
+    //  0 / 0                | PRACH or PUCCH     | anchor start              | anchor start (startEvent2)
+    //  0 / 1                | PUSCH (default)    | anchor start              | anchor start (startEvent2)
+    //  0 / 1                | PRACH or PUCCH     | anchor start              | PUCCH1 completion
+    //  1 / 0                | PUSCH (default)    | PUSCH1 completion         | anchor start (startEvent2)
+    //  1 / 0                | PRACH or PUCCH     | PUSCH1 completion         | PUCCH1 completion
+    //  1 / 1                | PUSCH (default)    | PUSCH1 completion         | anchor start (startEvent2)
+    //  1 / 1                | PRACH or PUCCH     | PUSCH1 completion         | PUCCH1 completion
+    //
+    // "anchor start" = absolute time delay from UL origin (gpu_ns_delay_until / startEvent2).
+    // PUCCH2 cascades only when nonPuschAnchor && (puschCascaded || g_pucchCascaded).
+    // With a PUSCH/default anchor, PUCCH2 always uses startEvent2 regardless of cascade flags.
     const bool puschCascaded = (m_longPattern > 3) && (m_longPattern != 7);
 
     // PUCCH1
@@ -1976,7 +2258,7 @@ void cuPHYTestWorker::runPUCCH_U5_U6(const cudaEvent_t& startEvent, const cudaEv
     CUDA_CHECK(cudaEventRecord(m_PUCCHStopEvents[0].handle(), m_cuStrmsPucch[0].handle()));
 
     // PUCCH2
-    if(nonPuschAnchor && puschCascaded)
+    if(nonPuschAnchor && (puschCascaded || g_pucchCascaded))
     {
         // Non-PUSCH anchor + cascaded PUSCH: PUCCH2 delay is relative to PUCCH1 completion.
         CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPucch[pucch2SyncStrmId].handle(), m_uqPtrTimePUCCHEndEvent->handle(), 0));
@@ -2262,6 +2544,23 @@ void cuPHYTestWorker::runPUSCH_U5_U6(const cudaEvent_t& startEvent)
         delay1Us = configuredPusch1DelayUs;
     if(g_start_delay_cfg_us.pusch2_u5 >= 0)
         delay2Us = configuredPusch2DelayUs;
+    // Cascade scheduling summary (pusch_cascaded / pucch_cascaded x UL_ANCHOR):
+    // Note: every trigger event can be offset by an optional YAML-configured delay.
+    //
+    // pusch_cas / pucch_cas | UL_ANCHOR          | PUSCH2 starts after       | PUCCH2 starts after
+    // ----------------------|--------------------|---------------------------|-----------------------------
+    //  0 / 0                | PUSCH (default)    | anchor start              | anchor start (startEvent2)
+    //  0 / 0                | PRACH or PUCCH     | anchor start              | anchor start (startEvent2)
+    //  0 / 1                | PUSCH (default)    | anchor start              | anchor start (startEvent2)
+    //  0 / 1                | PRACH or PUCCH     | anchor start              | PUCCH1 completion
+    //  1 / 0                | PUSCH (default)    | PUSCH1 completion         | anchor start (startEvent2)
+    //  1 / 0                | PRACH or PUCCH     | PUSCH1 completion         | PUCCH1 completion
+    //  1 / 1                | PUSCH (default)    | PUSCH1 completion         | anchor start (startEvent2)
+    //  1 / 1                | PRACH or PUCCH     | PUSCH1 completion         | PUCCH1 completion
+    //
+    // "anchor start" = absolute time delay from UL origin (gpu_ns_delay_until / startEvent2).
+    // PUCCH2 cascades only when nonPuschAnchor && (puschCascaded || g_pucchCascaded).
+    // With a PUSCH/default anchor, PUCCH2 always uses startEvent2 regardless of cascade flags.
     const bool puschCascaded = (m_longPattern > 3) && (m_longPattern != 7);
 
     // hold all PUSCH streams until start event
@@ -2796,15 +3095,8 @@ void cuPHYTestWorker::runPDCCHItr(const cudaEvent_t& pdcchSlotStartEvent, uint32
             }
             else
             {
-                // Legacy default behavior when not configured from YAML.
-                if(m_longPattern > 6)
-                {
-                    CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsCsirs[strmIdx].handle(), pdcchSlotStartEvent, 0));
-                }
-                else
-                {
-                    CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsCsirs[strmIdx].handle(), m_PDCCHStopEvents[0].handle(), 0));
-                }
+                // Always wait for PDCCH to finish before starting CSI-RS.
+                CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsCsirs[strmIdx].handle(), m_PDCCHStopEvents[0].handle(), 0));
             }
 
             if(strmIdx == 0) // if PDCCH is run standalone record start event here
@@ -2965,7 +3257,8 @@ void cuPHYTestWorker::runPDSCH_U5_3_6(std::shared_ptr<void>& shPtrPayload)
             // wait for PDSCH cells to be processed 
             if(m_runPDCCH)
             {
-                runPDCCHItr(m_SlotBoundaryEventVec[itrIdx].handle(), itrIdx);
+                cudaEvent_t pdcchAnchorEvt = selectDlAnchorEvent(itrIdx);
+                runPDCCHItr(pdcchAnchorEvt, itrIdx);
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), m_PDCCHStopEvents[0].handle(), 0));
             }
             else if(pdschTxRunMsgPayload.pdcchStopEventVec)
@@ -3087,7 +3380,8 @@ void cuPHYTestWorker::runPDSCH_U6(std::shared_ptr<void>& shPtrPayload)
             // wait for PDSCH cells to be processed 
             if(m_runPDCCH)
             {
-                runPDCCHItr(m_SlotBoundaryEventVec[itrIdx].handle(), itrIdx);
+                cudaEvent_t pdcchAnchorEvt = selectDlAnchorEvent(itrIdx);
+                runPDCCHItr(pdcchAnchorEvt, itrIdx);
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), m_PDCCHStopEvents[0].handle(), 0));
             }
             else if(pdschTxRunMsgPayload.pdcchStopEventVec)
@@ -3348,7 +3642,8 @@ void cuPHYTestWorker::runPDSCH_U3_U5_1_2_4_5(std::shared_ptr<void>& shPtrPayload
 
             if(m_runPDCCH || m_runCSIRS)
             {
-                runPDCCHItr(m_SlotBoundaryEventVec[itrIdx].handle(), itrIdx);
+                cudaEvent_t pdcchAnchorEvt = selectDlAnchorEvent(itrIdx);
+                runPDCCHItr(pdcchAnchorEvt, itrIdx);
                 CUDA_CHECK(cudaStreamWaitEvent(m_cuStrmsPdsch[0].handle(), m_PDCCHStopEvents[0].handle(), 0));
             }
             else if(pdschTxRunMsgPayload.pdcchStopEventVec)
@@ -3506,6 +3801,16 @@ void cuPHYTestWorker::evalHandler(std::shared_ptr<void>& shPtrPayload)
 
             m_totPUSCHStartTime += elapsedTimeMs;
         }
+        
+        if(m_uciTiming)
+        {
+            elapsedTimeMs = 0.0f;
+            e             = cudaEventElapsedTime(&elapsedTimeMs,
+                                     m_uqPtrTimeStartEvent->handle(),
+                                     m_puschRxStaticApiDataSets[0][0].puschStatPrms.uciOnPuschCompletedEvent);
+            if(cudaSuccess != e) throw cuphy::cuda_exception(e);
+            m_totUciOnPuschRunTime += elapsedTimeMs;
+        }
 
         if(m_longPattern)
         {
@@ -3536,6 +3841,16 @@ void cuPHYTestWorker::evalHandler(std::shared_ptr<void>& shPtrPayload)
             if(cudaSuccess != e) throw cuphy::cuda_exception(e);
 
             m_totPUSCH2StartTime += elapsedTimeMs;
+            
+            if(m_uciTiming)
+            {
+                elapsedTimeMs = 0.0f;
+                e             = cudaEventElapsedTime(&elapsedTimeMs,
+                                         m_uqPtrTimeStartEvent->handle(),
+                                         m_puschRxStaticApiDataSets[1][0].puschStatPrms.uciOnPuschCompletedEvent);
+                if(cudaSuccess != e) throw cuphy::cuda_exception(e);
+                m_totUciOnPusch2RunTime += elapsedTimeMs;
+            }
         }
     }
 
@@ -3931,46 +4246,6 @@ void cuPHYTestWorker::resetEvalHandler(std::shared_ptr<void>& shPtrPayload)
     }
 }
 
-void cuPHYTestWorker::pdschTxCleanHandler(std::shared_ptr<void>& shPtrPayload)
-{
-    DEBUG_TRACE("%s id %d [tid %s][wrkrCtxId 0x%0lx currCtxId 0x%0lx]: pdschTxCleanHandler\n", m_name.c_str(), m_wrkrId, getThreadIdStr().c_str(), getCuCtxId(), getCurrCuCtxId());
-    cuPHYTestPdschTxCleanMsgPayload& pdschTxCleanMsgPayload = *std::static_pointer_cast<cuPHYTestPdschTxCleanMsgPayload>(shPtrPayload);
-
-    if(m_runPDSCH)
-    {
-        for(uint32_t strmIdx = 0; strmIdx < m_nStrms_pdsch; ++strmIdx)
-        {
-            for(uint32_t itrIdx = 0; itrIdx < m_nItrsPerStrm; ++itrIdx)
-            {
-                cuphy::pdsch_tx& pdschTxPipe = m_pdschTxPipes[strmIdx][itrIdx];
-
-                PdschTx*                         pipeline_ptr = static_cast<PdschTx*>(pdschTxPipe.handle());
-                const cuphyPdschCellGrpDynPrm_t* cell_group   = pipeline_ptr->dynamic_params->pCellGrpDynPrm;
-
-                for(int ue_group_id = 0; ue_group_id < cell_group->nUeGrps; ue_group_id++)
-                {
-                    delete[] cell_group->pUeGrpPrms[ue_group_id].pUePrmIdxs;
-                    delete[] cell_group->pUeGrpPrms[ue_group_id].pDmrsDynPrm;
-                }
-
-                for(int ue_id = 0; ue_id < cell_group->nUes; ue_id++)
-                {
-                    delete[] cell_group->pUePrms[ue_id].pCwIdxs;
-                }
-            }
-        }
-    }
-    if(pdschTxCleanMsgPayload.rsp)
-    {
-        // Send run completion response
-        auto shPtrRspPayload      = std::make_shared<commnTestRspMsgPayload>();
-        shPtrRspPayload->workerId = m_wrkrId;
-
-        auto shPtrRsp = std::make_shared<testWrkrRspMsg>(CUPHY_TEST_WRKR_RSP_MSG_PDSCH_CLEAN, m_wrkrId, shPtrRspPayload);
-        m_shPtrRspQ->send(shPtrRsp);
-    }
-}
-
 void cuPHYTestWorker::setWaitValHandler(std::shared_ptr<void>& shPtrPayload)
 {
     DEBUG_TRACE("%s id %d [tid %s][wrkrCtxId 0x%0lx currCtxId 0x%0lx]: setWaitValHandler\n", m_name.c_str(), m_wrkrId, getThreadIdStr().c_str(), getCuCtxId(), getCurrCuCtxId());
@@ -4044,7 +4319,6 @@ void cuPHYTestWorker::msgProcess(std::shared_ptr<testWrkrCmdMsg>& shPtrMsg)
          {CUPHY_TEST_WRKR_CMD_MSG_PUSCH_RUN, &cuPHYTestWorker::puschRxRunHandler},
          {CUPHY_TEST_WRKR_CMD_MSG_PDSCH_RUN, &cuPHYTestWorker::pdschTxRunHandler},
          {CUPHY_TEST_WRKR_CMD_MSG_PSCH_RUN, &cuPHYTestWorker::pschTxRxRunHandler},
-         {CUPHY_TEST_WRKR_CMD_MSG_PDSCH_CLEAN, &cuPHYTestWorker::pdschTxCleanHandler},
          {CUPHY_TEST_WRKR_CMD_MSG_DEINIT, &cuPHYTestWorker::deinitHandler},
          {CUPHY_TEST_WRKR_CMD_MSG_DLBFW_INIT, &cuPHYTestWorker::dlbfwInitHandler},
          {CUPHY_TEST_WRKR_CMD_MSG_DLBFW_SETUP, &cuPHYTestWorker::dlbfwSetupHandler},
@@ -4194,7 +4468,7 @@ void cuPHYTestWorker::pdcchTxInit(std::vector<std::string> inFileNamesPdcchTx, u
     }
 }
 
-void cuPHYTestWorker::puschRxInit(std::vector<std::string> inFileNamesPuschRx, uint32_t fp16Mode, int puschRxDescramblingOn, bool printCbErrors, uint64_t pusch_proc_mode, bool enableLdpcThroughputMode, bool groupCells, maxPUSCHPrms puschPrms, uint32_t ldpcLaunchMode, uint8_t* puschSubslotProcFlag, bool waitRsp)
+void cuPHYTestWorker::puschRxInit(std::vector<std::string> inFileNamesPuschRx, uint32_t fp16Mode, int puschRxDescramblingOn, bool printCbErrors, uint64_t pusch_proc_mode, bool enableLdpcThroughputMode, bool groupCells, maxPUSCHPrms puschPrms, uint32_t ldpcLaunchMode, uint8_t* puschSubslotProcFlag, bool uciTiming, bool waitRsp)
 {
     // pusch configuration
     if(inFileNamesPuschRx.size() == 0)
@@ -4211,6 +4485,7 @@ void cuPHYTestWorker::puschRxInit(std::vector<std::string> inFileNamesPuschRx, u
     m_pusch_group_cells       = groupCells;
     m_puschProcModeSubslotProcFlag  = puschSubslotProcFlag[0];
     m_pusch2ProcModeSubslotProcFlag = puschSubslotProcFlag[1]; // if there is no PUSCH2, this indicator is not used
+    m_uciTiming               = uciTiming;
 
     // Send initialization message
     auto shPtrPayload                      = std::make_shared<cuPHYTestPuschRxInitMsgPayload>();
@@ -4849,23 +5124,6 @@ void cuPHYTestWorker::getPschTxRxRunRsp(std::shared_ptr<testWrkrRspMsg>& shPtrRs
     m_shPtrRspQ->receive(shPtrRsp, CUPHY_TEST_WRKR_RSP_MSG_PSCH_RUN, m_wrkrId);
 }
 
-void cuPHYTestWorker::pdschTxClean(bool waitRsp)
-{
-    auto shPtrPayload = std::make_shared<cuPHYTestPdschTxCleanMsgPayload>();
-    shPtrPayload->rsp = waitRsp;
-
-    auto shPtrMsg = std::make_shared<testWrkrCmdMsg>(CUPHY_TEST_WRKR_CMD_MSG_PDSCH_CLEAN, m_wrkrId, shPtrPayload);
-    DEBUG_TRACE("MainThread [tid %s][currCtxId 0x%0lx]: Sending message: %s\n", getThreadIdStr().c_str(), getCurrCuCtxId(), TEST_WRKR_CMD_MSG_TO_STR[shPtrMsg->type]);
-
-    m_shPtrCmdQ->send(shPtrMsg);
-
-    if(waitRsp)
-    {
-        std::shared_ptr<testWrkrRspMsg> shPtrRsp;
-        m_shPtrRspQ->receive(shPtrRsp, CUPHY_TEST_WRKR_RSP_MSG_PDSCH_CLEAN, m_wrkrId);
-    }
-}
-
 std::vector<float> cuPHYTestWorker::getDlbfwIterStartTimes()
 {
     return m_totDlbfwIterStartTime;
@@ -4954,6 +5212,26 @@ float cuPHYTestWorker::getTotPusch2RunTime()
 {
     return m_totPUSCH2RunTime;
 }
+float cuPHYTestWorker::getTotUciOnPuschRunTime()
+{
+    return m_totUciOnPuschRunTime;
+}
+float cuPHYTestWorker::getTotUciOnPusch2RunTime()
+{
+    return m_totUciOnPusch2RunTime;
+}
+void cuPHYTestWorker::resetSlotEvents()
+{
+    CUDA_CHECK(cudaEventRecord(m_puschRxStaticApiDataSets[0][0].puschStatPrms.subSlotCompletedEvent, m_cuStrms[0].handle()));
+    if(m_longPattern)
+        CUDA_CHECK(cudaEventRecord(m_puschRxStaticApiDataSets[1][0].puschStatPrms.subSlotCompletedEvent, m_cuStrms[0].handle()));
+    if(m_uciTiming)
+    {
+        CUDA_CHECK(cudaEventRecord(m_puschRxStaticApiDataSets[0][0].puschStatPrms.uciOnPuschCompletedEvent, m_cuStrms[0].handle()));
+        if(m_longPattern)
+            CUDA_CHECK(cudaEventRecord(m_puschRxStaticApiDataSets[1][0].puschStatPrms.uciOnPuschCompletedEvent, m_cuStrms[0].handle()));
+    }
+}
 float cuPHYTestWorker::getTotPucchStartTime()
 {
     return m_totPUCCHStartTime;
@@ -5041,4 +5319,28 @@ std::vector<cuphy::event>* cuPHYTestWorker::getPdschInterSlotEventVecPtr()
 std::vector<cuphy::event>* cuPHYTestWorker::getSlotBoundaryEventVecPtr()
 {
     return (!m_SlotBoundaryEventVec.empty() ? &m_SlotBoundaryEventVec : &m_pdschInterSlotStartEventVec);
+}
+
+cudaEvent_t cuPHYTestWorker::selectDlAnchorEvent(uint32_t const itrIdx) noexcept
+{
+    // PDCCH/SSB anchor: pick the vector named by the user-selected DL_ANCHOR mode.
+    // Both m_pdschInterSlotStartEventVec and m_SlotBoundaryEventVec are resized to
+    // m_nSlotsPerPattern in pdschTxInitHandler when PDSCH is enabled and are populated
+    // by every runPDSCH_* variant, so the bounds check on one is sufficient.
+    // effective_dl_anchor() returns SLOT_BOUNDARY when no DL_ANCHOR override was given
+    // in YAML (the pre-MR behavior).
+    auto& vec = (g_start_delay_cfg_us.effective_dl_anchor() == dl_anchor_mode_t::PDSCH)
+                  ? m_pdschInterSlotStartEventVec
+                  : m_SlotBoundaryEventVec;
+    assert(itrIdx < vec.size());
+    if(itrIdx < vec.size())
+    {
+        return vec[itrIdx].handle();
+    }
+    // Unreachable under the documented invariant; logged so a future regression
+    // surfaces with test-bench context instead of an opaque CUDA invalid-handle error.
+    NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,
+        "[DL-ANCHOR] selectDlAnchorEvent: itrIdx={} >= vec.size()={}; returning nullptr",
+        itrIdx, vec.size());
+    return nullptr;
 }

@@ -46,7 +46,7 @@ GpuMempool::GpuMempool(Gpu* gpu, Nic* nic,bool host_pinned) :
 
     if(host_pinned)
     {
-        ASSERT_CUDA_FH(cudaMallocHost((void**)&host_buf_ptr, buffer_size));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemAllocHost(reinterpret_cast<void**>(&host_buf_ptr), buffer_size));
         gpu_mem_ = {host_buf_ptr, RTE_BAD_IOVA, buffer_size, droom_sz};
     }
     else
@@ -112,7 +112,7 @@ GpuMempool::~GpuMempool()
 
     if(host_pinned_)
     {
-        ASSERT_CUDA_FH(cudaFreeHost(gpu_mem_.buf_ptr));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(gpu_mem_.buf_ptr));
     }
     else
     {

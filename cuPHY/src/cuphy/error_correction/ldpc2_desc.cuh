@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,29 @@
 #include "nrLDPC_templates.cuh"
 #include "ldpc2_llr_loader.cuh"
 #include "ldpc2_dec_output.cuh"
+
+////////////////////////////////////////////////////////////////////////
+// prepare_ldpc_tb_pair_index()
+//
+// algo103 is a hard-output-only specialization, so its copied descriptor does
+// not otherwise consume llr_output[].  Use the two scalar layout fields as a
+// call-local derived index: stride_elements is the first two-CW CTA belonging
+// to the TB, while num_codewords is the exclusive CTA end.
+// This is rebuilt once on the host for every direct or graph decode call and
+// works identically for every descriptor count.
+inline void prepare_ldpc_tb_pair_index(cuphyLDPCDecodeDesc_t& decode_desc)
+{
+    int32_t block_begin = 0;
+    for(int i = 0; i < CUPHY_LDPC_DECODE_DESC_MAX_TB; ++i)
+    {
+        const int32_t num_codewords = (i < decode_desc.num_tbs)
+                                          ? decode_desc.llr_input[i].num_codewords
+                                          : 0;
+        decode_desc.llr_output[i].stride_elements = block_begin;
+        block_begin += (num_codewords + 1) / 2;
+        decode_desc.llr_output[i].num_codewords = block_begin;
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Base graph descriptor LDPC decoder kernels

@@ -1,0 +1,12 @@
+# C-Plane Test Bench - mMIMO Test Patterns
+# Format: pattern_num (one per line, commas optional)
+# Lines starting with # are comments and will be ignored
+
+# mMIMO patterns
+79
+69
+69b
+89
+87
+81c
+81d

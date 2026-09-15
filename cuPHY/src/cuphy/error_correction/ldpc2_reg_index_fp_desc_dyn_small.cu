@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,7 @@
 #include "ldpc2_reg_index_fp_desc_dyn_small.hpp"
 #include "ldpc2_schedule_dynamic_desc.cuh"
 #include "ldpc2_c2v_cache_register.cuh"
+#include "ldpc2_crc_dispatch.cuh"
 
 using namespace ldpc2;
 
@@ -43,7 +44,7 @@ namespace
     typedef ldpc2::sign_store_policy_split_dst<__half, ldpc2::split_sign_update_bit_ops, false> sign_dst_bit_t;
     typedef ldpc2::sign_store_policy_split_src<__half, ldpc2::split_sign_update_fp,      false> sign_src_fp_t;
     typedef ldpc2::sign_store_policy_split_src<__half, ldpc2::split_sign_update_bit_ops, false> sign_src_bit_t;
-    
+
     // Sign updates with FP unit A couple of microseconds faster on V100...
     typedef sign_dst_fp_t                                                                       sign_mgr_t;
 
@@ -74,7 +75,7 @@ namespace
         static constexpr int MAX_PARITY_ROWS = ldpc2::max_parity_nodes<BG>::value;
 
         typedef TKernelParams                   kernel_params_t;
-        
+
         // We use the "checked" variants of app_loader and app_writer, since we may
         // have extra threads that are not participating in a valid codeword.
         typedef cC2V_index<__half,
@@ -105,6 +106,164 @@ namespace
                                                   MIN_PARITY_ROWS,
                                                   MAX_PARITY_ROWS> sched_t;
     };
+
+    __device__ __forceinline__
+    tb_token small_decode_desc_token_from_global_cw(const cuphyLDPCDecodeDesc_t& decodeDesc, int global_cw)
+    {
+        int cw = global_cw;
+        #pragma unroll
+        for(int tb = 0; tb < CUPHY_LDPC_DECODE_DESC_MAX_TB; ++tb)
+        {
+            if(tb < decodeDesc.num_tbs)
+            {
+                const int num_cw = decodeDesc.llr_input[tb].num_codewords;
+                if(cw < num_cw)
+                {
+                    return to_token_partial(tb, cw, false);
+                }
+                cw -= num_cw;
+            }
+        }
+        return to_token_partial(0, 0, false);
+    }
+
+    __device__ __forceinline__
+    uint32_t small_codeword_thread_mask(int Z, int thread_codeword_index)
+    {
+        return (Z == 32) ? 0xFFFFFFFFu : (((1u << Z) - 1u) << (thread_codeword_index * Z));
+    }
+
+    struct small_crc_layout
+    {
+        static constexpr bool needs_app_read_barrier = false;
+
+        int total_bits_;
+        int thread_codeword_index;
+        int thread_sub_index;
+        int Z;
+
+        __device__ __forceinline__ int total_bits() const
+        {
+            return total_bits_;
+        }
+
+        __device__ __forceinline__ int total_words() const
+        {
+            return (total_bits_ + 31) >> 5;
+        }
+
+        __device__ __forceinline__ int word_index() const
+        {
+            return thread_sub_index;
+        }
+
+        __device__ __forceinline__ bool active_word() const
+        {
+            return word_index() < total_words();
+        }
+
+        __device__ __forceinline__ uint32_t group_mask() const
+        {
+            return small_codeword_thread_mask(Z, thread_codeword_index);
+        }
+
+        __device__ __forceinline__ bool any_bit_flip(bool bit_flip) const
+        {
+            return __any_sync(group_mask(), bit_flip);
+        }
+
+        template <cuphyLDPCCrcType_t CRCVariant, uint32_t T, uint64_t QPLUSCRC, uint32_t GSTAR>
+        __device__ __forceinline__ uint32_t reduce_crc(uint32_t packed_word,
+                                                        bool     active_word,
+                                                        int      word_idx) const
+        {
+            uint32_t partial_crc = 0u;
+            if(active_word)
+            {
+                partial_crc = crc_word_partial<CRCVariant, T, QPLUSCRC, GSTAR>(packed_word,
+                                                                                crc_static_lut_value<CRCVariant>(word_idx));
+            }
+            return __reduce_xor_sync(group_mask(), partial_crc);
+        }
+    };
+
+    template <cuphyLDPCCrcType_t CRCVariant, int BG>
+    __device__ __forceinline__
+    uint32_t small_crc_after_bitflip_gate(const __half* apps,
+                                          int           iter,
+                                          uint32_t&     prev_packed_word,
+                                          int           Z,
+                                          int           num_info_nodes,
+                                          int           thread_codeword_index,
+                                          int           thread_sub_index,
+                                          bool          force_crc,
+                                          bool          force_bit_flip)
+    {
+        (void)BG;
+        const small_crc_layout layout{num_info_nodes * Z, thread_codeword_index, thread_sub_index, Z};
+        return crc_after_bitflip_gate<CRCVariant>(apps, iter, prev_packed_word, layout, force_crc, force_bit_flip);
+    }
+
+    template <int BG>
+    __device__ __forceinline__
+    uint32_t small_should_terminate_early_crc(const cuphyLDPCDecodeDesc_t& decodeDesc,
+                                              tb_token                     tok,
+                                              const __half*                apps,
+                                              int                          iter,
+                                              uint32_t&                    prev_packed_word,
+                                              int                          thread_codeword_index,
+                                              int                          thread_sub_index)
+    {
+        const bool final_iteration = (iter >= (decodeDesc.config.max_iterations - 1));
+        const bool et_latency_debug = (0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_ET_LATENCY_DEBUG));
+        const bool force_crc = final_iteration;
+        const bool force_bit_flip = et_latency_debug && !final_iteration;
+
+        switch(decode_desc_crc_type(decodeDesc, tok, 0))
+        {
+            case CUPHY_LDPC_CRC_16:
+                return small_crc_after_bitflip_gate<CUPHY_LDPC_CRC_16, BG>(apps, iter, prev_packed_word, decodeDesc.config.Z, decodeDesc.config.Kb,
+                                                                                                  thread_codeword_index,
+                                                                                                  thread_sub_index,
+                                                                                                  force_crc,
+                                                                                                  force_bit_flip);
+            case CUPHY_LDPC_CRC_24A:
+                return small_crc_after_bitflip_gate<CUPHY_LDPC_CRC_24A, BG>(apps, iter, prev_packed_word, decodeDesc.config.Z, decodeDesc.config.Kb,
+                                                                                                  thread_codeword_index,
+                                                                                                  thread_sub_index,
+                                                                                                  force_crc,
+                                                                                                  force_bit_flip);
+            case CUPHY_LDPC_CRC_24B:
+                return small_crc_after_bitflip_gate<CUPHY_LDPC_CRC_24B, BG>(apps, iter, prev_packed_word, decodeDesc.config.Z, decodeDesc.config.Kb,
+                                                                                                  thread_codeword_index,
+                                                                                                  thread_sub_index,
+                                                                                                  force_crc,
+                                                                                                  force_bit_flip);
+            case CUPHY_LDPC_CRC_NONE:
+            default:
+                return CRC_FAILURE_WORD;
+        }
+    }
+
+    __device__ __forceinline__
+    void small_ldpc_dec_crc_output(const cuphyLDPCDecodeDesc_t& decodeDesc, tb_token tok, uint32_t crc)
+    {
+        uint32_t* addr = decode_desc_crc_addr(decodeDesc, tok, 0);
+        if(addr != nullptr)
+        {
+            *addr = crc;
+        }
+    }
+
+    __device__ __forceinline__
+    void small_ldpc_dec_iter_output(const cuphyLDPCDecodeDesc_t& decodeDesc, tb_token tok, int32_t iter)
+    {
+        int32_t* addr = decode_desc_iter_output_addr(decodeDesc, tok, 0);
+        if(addr != nullptr)
+        {
+            *addr = iter;
+        }
+    }
 } // namespace
 
 
@@ -177,7 +336,7 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_small(LDPC_kernel_params params, app_loc_t<
 {
     // Shared memory is allocated dynamically
     extern __shared__ char smem[];
-    
+
     //------------------------------------------------------------------
     // Kernel configuration template
     typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
@@ -233,8 +392,9 @@ extern "C"
 __global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
 void ldpc2_BG1_reg_index_fp_desc_dyn_small_tb(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<1>::bg_desc_t bgdesc)
 {
-    // Shared memory is allocated dynamically
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = true;
     extern __shared__ char smem[];
+    // Shared memory is allocated dynamically
 
     //------------------------------------------------------------------
     // Kernel configuration template
@@ -267,9 +427,36 @@ void ldpc2_BG1_reg_index_fp_desc_dyn_small_tb(cuphyLDPCDecodeDesc_t decodeDesc, 
     //------------------------------------------------------------------
     // Perform iterations
     kernel_config_t::sched_t sched(decodeDesc.config, bgdesc, SMEM_OFFSET, mconfig.thread_sub_index);
-    for(int iter = 0; iter < decodeDesc.config.max_iterations; ++iter)
+    int32_t iter = 0;
+    uint32_t crc = CRC_FAILURE_WORD;
+    uint32_t prev_packed_word = 0u;
+    while(iter < decodeDesc.config.max_iterations)
     {
         sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            bool cw_crc_pass = false;
+            if(mconfig.thread_codeword_index < mconfig.cta_codeword_count)
+            {
+                const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+                const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+                const __half* cw_apps = reinterpret_cast<const __half*>(smem + (mconfig.thread_codeword_index * LLR_STRIDE_BYTES));
+                crc = small_should_terminate_early_crc<kernel_config_t::BG>(decodeDesc,
+                                                                            tok,
+                                                                            cw_apps,
+                                                                            iter - 1,
+                                                                            prev_packed_word,
+                                                                            mconfig.thread_codeword_index,
+                                                                            mconfig.thread_sub_index);
+                cw_crc_pass = (mconfig.thread_sub_index == 0) && (crc == 0u);
+            }
+            if(__syncthreads_count(cw_crc_pass) == mconfig.cta_codeword_count)
+            {
+                break;
+            }
+        }
     }
 
     //------------------------------------------------------------------
@@ -277,9 +464,121 @@ void ldpc2_BG1_reg_index_fp_desc_dyn_small_tb(cuphyLDPCDecodeDesc_t decodeDesc, 
     ldpc_dec_output_variable_multi(decodeDesc,
                                    reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
                                    mconfig);
+    if((mconfig.thread_codeword_index < mconfig.cta_codeword_count) &&
+       (mconfig.thread_sub_index == 0))
+    {
+        const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+        const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            small_ldpc_dec_crc_output(decodeDesc, tok, crc);
+        }
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+        {
+            small_ldpc_dec_iter_output(decodeDesc, tok, iter);
+        }
+    }
     //------------------------------------------------------------------
     // Write soft outputs if the caller requested
-    if(0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    {
+        ldpc_dec_soft_output_multi(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem), mconfig);
+    }
+}
+
+extern "C"
+__global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
+void ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_no_accessories(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<1>::bg_desc_t bgdesc)
+{
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = false;
+    extern __shared__ char smem[];
+    // Shared memory is allocated dynamically
+
+    //------------------------------------------------------------------
+    // Kernel configuration template
+    typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<1,
+                                                      cuphyLDPCDecodeConfigDesc_t,
+                                                      __half,
+                                                      ldpc2::llr_loader_variable_batch> kernel_config_t;
+
+    //------------------------------------------------------------------
+    // Determine which codewords this block and this thread are assigned
+    // to.
+    multi_codeword_config mconfig(decodeDesc.config, blockIdx.x, get_num_codewords(decodeDesc));
+
+    //------------------------------------------------------------------
+    // Load LLR data from global to shared memory
+    kernel_config_t::llr_loader_t::load_sync_multi(smem, decodeDesc, mconfig);
+
+    //------------------------------------------------------------------
+    // Determine the shared memory offset of the LLR data for this
+    // thread. "Unused" threads will have a negative offset, and the
+    // "checked" APP loader and writer will prevent reads/writes beyond
+    // the shared memory allocation.
+    const int LLR_STRIDE_BYTES = round_up_to_next(get_num_LLRs(decodeDesc) * sizeof(__half),
+                                                  sizeof(ldpc_traits<__half>::llr_sts_t));
+    const int SMEM_OFFSET      = (mconfig.thread_codeword_index < mconfig.cta_codeword_count) ?
+                                 (static_cast<int>(__cvta_generic_to_shared(smem)) +
+                                 (mconfig.thread_codeword_index * LLR_STRIDE_BYTES))          :
+                                 -1;
+
+    //------------------------------------------------------------------
+    // Perform iterations
+    kernel_config_t::sched_t sched(decodeDesc.config, bgdesc, SMEM_OFFSET, mconfig.thread_sub_index);
+    int32_t iter = 0;
+    uint32_t crc = CRC_FAILURE_WORD;
+    uint32_t prev_packed_word = 0u;
+    while(iter < decodeDesc.config.max_iterations)
+    {
+        sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            bool cw_crc_pass = false;
+            if(mconfig.thread_codeword_index < mconfig.cta_codeword_count)
+            {
+                const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+                const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+                const __half* cw_apps = reinterpret_cast<const __half*>(smem + (mconfig.thread_codeword_index * LLR_STRIDE_BYTES));
+                crc = small_should_terminate_early_crc<kernel_config_t::BG>(decodeDesc,
+                                                                            tok,
+                                                                            cw_apps,
+                                                                            iter - 1,
+                                                                            prev_packed_word,
+                                                                            mconfig.thread_codeword_index,
+                                                                            mconfig.thread_sub_index);
+                cw_crc_pass = (mconfig.thread_sub_index == 0) && (crc == 0u);
+            }
+            if(__syncthreads_count(cw_crc_pass) == mconfig.cta_codeword_count)
+            {
+                break;
+            }
+        }
+    }
+
+    //------------------------------------------------------------------
+    // Write hard output based on APP values
+    ldpc_dec_output_variable_multi(decodeDesc,
+                                   reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                                   mconfig);
+    if((mconfig.thread_codeword_index < mconfig.cta_codeword_count) &&
+       (mconfig.thread_sub_index == 0))
+    {
+        const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+        const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            small_ldpc_dec_crc_output(decodeDesc, tok, crc);
+        }
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+        {
+            small_ldpc_dec_iter_output(decodeDesc, tok, iter);
+        }
+    }
+    //------------------------------------------------------------------
+    // Write soft outputs if the caller requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
     {
         ldpc_dec_soft_output_multi(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem), mconfig);
     }
@@ -292,9 +591,10 @@ extern "C"
 __global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
 void ldpc2_BG2_reg_index_fp_desc_dyn_small_tb(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<2>::bg_desc_t bgdesc)
 {
-    // Shared memory is allocated dynamically
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = true;
     extern __shared__ char smem[];
-    
+    // Shared memory is allocated dynamically
+
     //------------------------------------------------------------------
     // Kernel configuration template
     typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
@@ -326,9 +626,36 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_small_tb(cuphyLDPCDecodeDesc_t decodeDesc, 
     //------------------------------------------------------------------
     // Perform iterations
     kernel_config_t::sched_t sched(decodeDesc.config, bgdesc, SMEM_OFFSET, mconfig.thread_sub_index);
-    for(int iter = 0; iter < decodeDesc.config.max_iterations; ++iter)
+    int32_t iter = 0;
+    uint32_t crc = CRC_FAILURE_WORD;
+    uint32_t prev_packed_word = 0u;
+    while(iter < decodeDesc.config.max_iterations)
     {
         sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            bool cw_crc_pass = false;
+            if(mconfig.thread_codeword_index < mconfig.cta_codeword_count)
+            {
+                const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+                const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+                const __half* cw_apps = reinterpret_cast<const __half*>(smem + (mconfig.thread_codeword_index * LLR_STRIDE_BYTES));
+                crc = small_should_terminate_early_crc<kernel_config_t::BG>(decodeDesc,
+                                                                            tok,
+                                                                            cw_apps,
+                                                                            iter - 1,
+                                                                            prev_packed_word,
+                                                                            mconfig.thread_codeword_index,
+                                                                            mconfig.thread_sub_index);
+                cw_crc_pass = (mconfig.thread_sub_index == 0) && (crc == 0u);
+            }
+            if(__syncthreads_count(cw_crc_pass) == mconfig.cta_codeword_count)
+            {
+                break;
+            }
+        }
     }
 
     //------------------------------------------------------------------
@@ -336,9 +663,121 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_small_tb(cuphyLDPCDecodeDesc_t decodeDesc, 
     ldpc_dec_output_variable_multi(decodeDesc,
                                    reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
                                    mconfig);
+    if((mconfig.thread_codeword_index < mconfig.cta_codeword_count) &&
+       (mconfig.thread_sub_index == 0))
+    {
+        const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+        const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            small_ldpc_dec_crc_output(decodeDesc, tok, crc);
+        }
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+        {
+            small_ldpc_dec_iter_output(decodeDesc, tok, iter);
+        }
+    }
     //------------------------------------------------------------------
     // Write soft outputs if the caller requested
-    if(0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    {
+        ldpc_dec_soft_output_multi(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem), mconfig);
+    }
+}
+
+extern "C"
+__global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
+void ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_no_accessories(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<2>::bg_desc_t bgdesc)
+{
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = false;
+    extern __shared__ char smem[];
+    // Shared memory is allocated dynamically
+
+    //------------------------------------------------------------------
+    // Kernel configuration template
+    typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
+                                                      cuphyLDPCDecodeConfigDesc_t,
+                                                      __half,
+                                                      ldpc2::llr_loader_variable_batch> kernel_config_t;
+
+    //------------------------------------------------------------------
+    // Determine which codewords this block and this thread are assigned
+    // to.
+    multi_codeword_config mconfig(decodeDesc.config, blockIdx.x, get_num_codewords(decodeDesc));
+
+    //------------------------------------------------------------------
+    // Load LLR data from global to shared memory
+    kernel_config_t::llr_loader_t::load_sync_multi(smem, decodeDesc, mconfig);
+
+    //------------------------------------------------------------------
+    // Determine the shared memory offset of the LLR data for this
+    // thread. "Unused" threads will have a negative offset, and the
+    // "checked" APP loader and writer will prevent reads/writes beyond
+    // the shared memory allocation.
+    const int LLR_STRIDE_BYTES = round_up_to_next(get_num_LLRs(decodeDesc) * sizeof(__half),
+                                                  sizeof(ldpc_traits<__half>::llr_sts_t));
+    const int SMEM_OFFSET       = (mconfig.thread_codeword_index < mconfig.cta_codeword_count) ?
+                                  (static_cast<int>(__cvta_generic_to_shared(smem)) +
+                                  (mconfig.thread_codeword_index * LLR_STRIDE_BYTES))          :
+                                  -1;
+
+    //------------------------------------------------------------------
+    // Perform iterations
+    kernel_config_t::sched_t sched(decodeDesc.config, bgdesc, SMEM_OFFSET, mconfig.thread_sub_index);
+    int32_t iter = 0;
+    uint32_t crc = CRC_FAILURE_WORD;
+    uint32_t prev_packed_word = 0u;
+    while(iter < decodeDesc.config.max_iterations)
+    {
+        sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            bool cw_crc_pass = false;
+            if(mconfig.thread_codeword_index < mconfig.cta_codeword_count)
+            {
+                const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+                const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+                const __half* cw_apps = reinterpret_cast<const __half*>(smem + (mconfig.thread_codeword_index * LLR_STRIDE_BYTES));
+                crc = small_should_terminate_early_crc<kernel_config_t::BG>(decodeDesc,
+                                                                            tok,
+                                                                            cw_apps,
+                                                                            iter - 1,
+                                                                            prev_packed_word,
+                                                                            mconfig.thread_codeword_index,
+                                                                            mconfig.thread_sub_index);
+                cw_crc_pass = (mconfig.thread_sub_index == 0) && (crc == 0u);
+            }
+            if(__syncthreads_count(cw_crc_pass) == mconfig.cta_codeword_count)
+            {
+                break;
+            }
+        }
+    }
+
+    //------------------------------------------------------------------
+    // Write hard output based on APP values
+    ldpc_dec_output_variable_multi(decodeDesc,
+                                   reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                                   mconfig);
+    if((mconfig.thread_codeword_index < mconfig.cta_codeword_count) &&
+       (mconfig.thread_sub_index == 0))
+    {
+        const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+        const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            small_ldpc_dec_crc_output(decodeDesc, tok, crc);
+        }
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+        {
+            small_ldpc_dec_iter_output(decodeDesc, tok, iter);
+        }
+    }
+    //------------------------------------------------------------------
+    // Write soft outputs if the caller requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
     {
         ldpc_dec_soft_output_multi(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem), mconfig);
     }
@@ -411,7 +850,7 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_small_fp32(LDPC_kernel_params params, app_l
 {
     // Shared memory is allocated dynamically
     extern __shared__ char smem[];
-    
+
     //------------------------------------------------------------------
     // Kernel configuration template
     typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
@@ -468,6 +907,7 @@ extern "C"
 __global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
 void ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<1>::bg_desc_t bgdesc)
 {
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = true;
     // Shared memory is allocated dynamically
     extern __shared__ char smem[];
 
@@ -502,9 +942,36 @@ void ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32(cuphyLDPCDecodeDesc_t decodeD
     //------------------------------------------------------------------
     // Perform iterations
     kernel_config_t::sched_t sched(decodeDesc.config, bgdesc, SMEM_OFFSET, mconfig.thread_sub_index);
-    for(int iter = 0; iter < decodeDesc.config.max_iterations; ++iter)
+    int32_t iter = 0;
+    uint32_t crc = CRC_FAILURE_WORD;
+    uint32_t prev_packed_word = 0u;
+    while(iter < decodeDesc.config.max_iterations)
     {
         sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            bool cw_crc_pass = false;
+            if(mconfig.thread_codeword_index < mconfig.cta_codeword_count)
+            {
+                const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+                const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+                const __half* cw_apps = reinterpret_cast<const __half*>(smem + (mconfig.thread_codeword_index * LLR_STRIDE_BYTES));
+                crc = small_should_terminate_early_crc<kernel_config_t::BG>(decodeDesc,
+                                                                            tok,
+                                                                            cw_apps,
+                                                                            iter - 1,
+                                                                            prev_packed_word,
+                                                                            mconfig.thread_codeword_index,
+                                                                            mconfig.thread_sub_index);
+                cw_crc_pass = (mconfig.thread_sub_index == 0) && (crc == 0u);
+            }
+            if(__syncthreads_count(cw_crc_pass) == mconfig.cta_codeword_count)
+            {
+                break;
+            }
+        }
     }
 
     //------------------------------------------------------------------
@@ -512,9 +979,121 @@ void ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32(cuphyLDPCDecodeDesc_t decodeD
     ldpc_dec_output_variable_multi(decodeDesc,
                                    reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
                                    mconfig);
+    if((mconfig.thread_codeword_index < mconfig.cta_codeword_count) &&
+       (mconfig.thread_sub_index == 0))
+    {
+        const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+        const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            small_ldpc_dec_crc_output(decodeDesc, tok, crc);
+        }
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+        {
+            small_ldpc_dec_iter_output(decodeDesc, tok, iter);
+        }
+    }
     //------------------------------------------------------------------
     // Write soft outputs if the caller requested
-    if(0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    {
+        ldpc_dec_soft_output_multi(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem), mconfig);
+    }
+}
+
+extern "C"
+__global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
+void ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32_no_accessories(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<1>::bg_desc_t bgdesc)
+{
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = false;
+    // Shared memory is allocated dynamically
+    extern __shared__ char smem[];
+
+    //------------------------------------------------------------------
+    // Kernel configuration template
+    typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<1,
+                                                      cuphyLDPCDecodeConfigDesc_t,
+                                                      float,
+                                                      ldpc2::llr_loader_variable_batch_convert> kernel_config_t;
+
+    //------------------------------------------------------------------
+    // Determine which codewords this block and this thread are assigned
+    // to.
+    multi_codeword_config mconfig(decodeDesc.config, blockIdx.x, get_num_codewords(decodeDesc));
+
+    //------------------------------------------------------------------
+    // Load LLR data from global to shared memory
+    kernel_config_t::llr_loader_t::load_sync_multi(smem, decodeDesc, mconfig);
+
+    //------------------------------------------------------------------
+    // Determine the shared memory offset of the LLR data for this
+    // thread. "Unused" threads will have a negative offset, and the
+    // "checked" APP loader and writer will prevent reads/writes beyond
+    // the shared memory allocation.
+    const int LLR_STRIDE_BYTES = round_up_to_next(get_num_LLRs(decodeDesc) * sizeof(__half),
+                                                  sizeof(ldpc_traits<__half>::llr_sts_t));
+    const int SMEM_OFFSET       = (mconfig.thread_codeword_index < mconfig.cta_codeword_count) ?
+                                 (static_cast<int>(__cvta_generic_to_shared(smem)) +
+                                 (mconfig.thread_codeword_index * LLR_STRIDE_BYTES))           :
+                                 -1;
+
+    //------------------------------------------------------------------
+    // Perform iterations
+    kernel_config_t::sched_t sched(decodeDesc.config, bgdesc, SMEM_OFFSET, mconfig.thread_sub_index);
+    int32_t iter = 0;
+    uint32_t crc = CRC_FAILURE_WORD;
+    uint32_t prev_packed_word = 0u;
+    while(iter < decodeDesc.config.max_iterations)
+    {
+        sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            bool cw_crc_pass = false;
+            if(mconfig.thread_codeword_index < mconfig.cta_codeword_count)
+            {
+                const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+                const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+                const __half* cw_apps = reinterpret_cast<const __half*>(smem + (mconfig.thread_codeword_index * LLR_STRIDE_BYTES));
+                crc = small_should_terminate_early_crc<kernel_config_t::BG>(decodeDesc,
+                                                                            tok,
+                                                                            cw_apps,
+                                                                            iter - 1,
+                                                                            prev_packed_word,
+                                                                            mconfig.thread_codeword_index,
+                                                                            mconfig.thread_sub_index);
+                cw_crc_pass = (mconfig.thread_sub_index == 0) && (crc == 0u);
+            }
+            if(__syncthreads_count(cw_crc_pass) == mconfig.cta_codeword_count)
+            {
+                break;
+            }
+        }
+    }
+
+    //------------------------------------------------------------------
+    // Write hard output based on APP values
+    ldpc_dec_output_variable_multi(decodeDesc,
+                                   reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                                   mconfig);
+    if((mconfig.thread_codeword_index < mconfig.cta_codeword_count) &&
+       (mconfig.thread_sub_index == 0))
+    {
+        const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+        const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            small_ldpc_dec_crc_output(decodeDesc, tok, crc);
+        }
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+        {
+            small_ldpc_dec_iter_output(decodeDesc, tok, iter);
+        }
+    }
+    //------------------------------------------------------------------
+    // Write soft outputs if the caller requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
     {
         ldpc_dec_soft_output_multi(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem), mconfig);
     }
@@ -527,9 +1106,10 @@ extern "C"
 __global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
 void ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<2>::bg_desc_t bgdesc)
 {
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = true;
     // Shared memory is allocated dynamically
     extern __shared__ char smem[];
-    
+
     //------------------------------------------------------------------
     // Kernel configuration template
     typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
@@ -561,9 +1141,36 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32(cuphyLDPCDecodeDesc_t decodeD
     //------------------------------------------------------------------
     // Perform iterations
     kernel_config_t::sched_t sched(decodeDesc.config, bgdesc, SMEM_OFFSET, mconfig.thread_sub_index);
-    for(int iter = 0; iter < decodeDesc.config.max_iterations; ++iter)
+    int32_t iter = 0;
+    uint32_t crc = CRC_FAILURE_WORD;
+    uint32_t prev_packed_word = 0u;
+    while(iter < decodeDesc.config.max_iterations)
     {
         sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            bool cw_crc_pass = false;
+            if(mconfig.thread_codeword_index < mconfig.cta_codeword_count)
+            {
+                const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+                const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+                const __half* cw_apps = reinterpret_cast<const __half*>(smem + (mconfig.thread_codeword_index * LLR_STRIDE_BYTES));
+                crc = small_should_terminate_early_crc<kernel_config_t::BG>(decodeDesc,
+                                                                            tok,
+                                                                            cw_apps,
+                                                                            iter - 1,
+                                                                            prev_packed_word,
+                                                                            mconfig.thread_codeword_index,
+                                                                            mconfig.thread_sub_index);
+                cw_crc_pass = (mconfig.thread_sub_index == 0) && (crc == 0u);
+            }
+            if(__syncthreads_count(cw_crc_pass) == mconfig.cta_codeword_count)
+            {
+                break;
+            }
+        }
     }
 
     //------------------------------------------------------------------
@@ -571,9 +1178,121 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32(cuphyLDPCDecodeDesc_t decodeD
     ldpc_dec_output_variable_multi(decodeDesc,
                                    reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
                                    mconfig);
+    if((mconfig.thread_codeword_index < mconfig.cta_codeword_count) &&
+       (mconfig.thread_sub_index == 0))
+    {
+        const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+        const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            small_ldpc_dec_crc_output(decodeDesc, tok, crc);
+        }
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+        {
+            small_ldpc_dec_iter_output(decodeDesc, tok, iter);
+        }
+    }
     //------------------------------------------------------------------
     // Write soft outputs if the caller requested
-    if(0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    {
+        ldpc_dec_soft_output_multi(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem), mconfig);
+    }
+}
+
+extern "C"
+__global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
+void ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32_no_accessories(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<2>::bg_desc_t bgdesc)
+{
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = false;
+    // Shared memory is allocated dynamically
+    extern __shared__ char smem[];
+
+    //------------------------------------------------------------------
+    // Kernel configuration template
+    typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
+                                                      cuphyLDPCDecodeConfigDesc_t,
+                                                      float,
+                                                      ldpc2::llr_loader_variable_batch_convert> kernel_config_t;
+
+    //------------------------------------------------------------------
+    // Determine which codewords this block and this thread are assigned
+    // to.
+    multi_codeword_config mconfig(decodeDesc.config, blockIdx.x, get_num_codewords(decodeDesc));
+
+    //------------------------------------------------------------------
+    // Load LLR data from global to shared memory
+    kernel_config_t::llr_loader_t::load_sync_multi(smem, decodeDesc, mconfig);
+
+    //------------------------------------------------------------------
+    // Determine the shared memory offset of the LLR data for this
+    // thread. "Unused" threads will have a negative offset, and the
+    // "checked" APP loader and writer will prevent reads/writes beyond
+    // the shared memory allocation.
+    const int LLR_STRIDE_BYTES = round_up_to_next(get_num_LLRs(decodeDesc) * sizeof(__half),
+                                                  sizeof(ldpc_traits<__half>::llr_sts_t));
+    const int SMEM_OFFSET      = (mconfig.thread_codeword_index < mconfig.cta_codeword_count) ?
+                                 (static_cast<int>(__cvta_generic_to_shared(smem)) +
+                                 (mconfig.thread_codeword_index * LLR_STRIDE_BYTES))          :
+                                 -1;
+
+    //------------------------------------------------------------------
+    // Perform iterations
+    kernel_config_t::sched_t sched(decodeDesc.config, bgdesc, SMEM_OFFSET, mconfig.thread_sub_index);
+    int32_t iter = 0;
+    uint32_t crc = CRC_FAILURE_WORD;
+    uint32_t prev_packed_word = 0u;
+    while(iter < decodeDesc.config.max_iterations)
+    {
+        sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            bool cw_crc_pass = false;
+            if(mconfig.thread_codeword_index < mconfig.cta_codeword_count)
+            {
+                const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+                const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+                const __half* cw_apps = reinterpret_cast<const __half*>(smem + (mconfig.thread_codeword_index * LLR_STRIDE_BYTES));
+                crc = small_should_terminate_early_crc<kernel_config_t::BG>(decodeDesc,
+                                                                            tok,
+                                                                            cw_apps,
+                                                                            iter - 1,
+                                                                            prev_packed_word,
+                                                                            mconfig.thread_codeword_index,
+                                                                            mconfig.thread_sub_index);
+                cw_crc_pass = (mconfig.thread_sub_index == 0) && (crc == 0u);
+            }
+            if(__syncthreads_count(cw_crc_pass) == mconfig.cta_codeword_count)
+            {
+                break;
+            }
+        }
+    }
+
+    //------------------------------------------------------------------
+    // Write hard output based on APP values
+    ldpc_dec_output_variable_multi(decodeDesc,
+                                   reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                                   mconfig);
+    if((mconfig.thread_codeword_index < mconfig.cta_codeword_count) &&
+       (mconfig.thread_sub_index == 0))
+    {
+        const int global_cw = mconfig.cta_start_index + mconfig.thread_codeword_index;
+        const tb_token tok = small_decode_desc_token_from_global_cw(decodeDesc, global_cw);
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            small_ldpc_dec_crc_output(decodeDesc, tok, crc);
+        }
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+        {
+            small_ldpc_dec_iter_output(decodeDesc, tok, iter);
+        }
+    }
+    //------------------------------------------------------------------
+    // Write soft outputs if the caller requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
     {
         ldpc_dec_soft_output_multi(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem), mconfig);
     }
@@ -607,7 +1326,7 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode(ldpc::decoder&                
     LDPC_kernel_params params(config, tLLR, tDst, optSoftOutputs);
 
     cuphyStatus_t s = CUPHY_STATUS_NOT_SUPPORTED;
-    
+
     //------------------------------------------------------------------
     // Determine the dynamic amount of shared memory, which is the same
     // for both fp16 and fp32 (after conversion).
@@ -615,8 +1334,8 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode(ldpc::decoder&                
                                                                               params.Z,             // lifting size
                                                                               sizeof(__half)),      // element size
                                                         static_cast<unsigned int>(sizeof(ldpc_traits<__half>::llr_sts_t)));
-    const uint32_t SHMEM_SIZE = CW_PER_CTA * SHMEM_SIZE_PER_CW;
-                                                                   
+    const uint32_t SHMEM_SIZE = shmem_size_with_et_context(CW_PER_CTA * SHMEM_SIZE_PER_CW);
+
     //printf("grdDim = (%u), blkDim = (%u), CW_PER_CTA = %i, SHMEM_SIZE = %u, SHMEM_SIZE_PER_CW = %u, NUM_VAR_NODES = %i, func = %i, size = %u, test = %i\n",
     //       grdDim.x,
     //       blkDim.x,
@@ -627,7 +1346,7 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode(ldpc::decoder&                
     //       shmem_llr_buffer_size(params.num_var_nodes, params.Z, sizeof(__half)),
     //       static_cast<unsigned int>(sizeof(ldpc_traits<__half>::llr_sts_t)),
     //       ((68 * 2 + 15) / 16) * 16);
-    
+
     if(llrType == CUPHY_R_16F)
     {
         switch(config.BG)
@@ -638,9 +1357,9 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode(ldpc::decoder&                
                 // Retrieve the base graph descriptor
                 const app_loc_t<1>::bg_desc_t* bgdesc = app_loc_t<1>::get_bg_desc_small(params.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG1_reg_index_fp_desc_dyn_small, blkDim, SHMEM_SIZE);
-                
+
                 //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
                 // Launch the kernel
                 ldpc2_BG1_reg_index_fp_desc_dyn_small<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(params, *bgdesc);
@@ -656,7 +1375,7 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode(ldpc::decoder&                
                 if(!bgdesc) break;
 
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG2_reg_index_fp_desc_dyn_small, blkDim, SHMEM_SIZE);
-                
+
                 //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
                 // Launch the kernel
                 ldpc2_BG2_reg_index_fp_desc_dyn_small<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(params, *bgdesc);
@@ -677,9 +1396,9 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode(ldpc::decoder&                
                 // Retrieve the base graph descriptor
                 const app_loc_t<1>::bg_desc_t* bgdesc = app_loc_t<1>::get_bg_desc_small(params.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG1_reg_index_fp_desc_dyn_small_fp32, blkDim, SHMEM_SIZE);
-                
+
                 //------------------------------------------------------------------
                 // Launch the kernel
                 ldpc2_BG1_reg_index_fp_desc_dyn_small_fp32<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(params, *bgdesc);
@@ -694,7 +1413,7 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode(ldpc::decoder&                
                 if(!bgdesc) break;
 
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG2_reg_index_fp_desc_dyn_small_fp32, blkDim, SHMEM_SIZE);
-                
+
                 //------------------------------------------------------------------
                 // Launch the kernel
                 ldpc2_BG2_reg_index_fp_desc_dyn_small_fp32<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(params, *bgdesc);
@@ -705,7 +1424,7 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode(ldpc::decoder&                
             break;
         }
     }
-    
+
     if(CUPHY_STATUS_SUCCESS != s)
     {
         return s;
@@ -725,7 +1444,7 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode_tb(ldpc::decoder&             
                                                      const cuphyLDPCDecodeDesc_t& decodeDesc,
                                                      cudaStream_t                 strm)
 {
-    DEBUG_PRINTF("ldpc2::reg_index_fp_desc_dyn_small::decode_tb()\n");    
+    DEBUG_PRINTF("ldpc2::reg_index_fp_desc_dyn_small::decode_tb()\n");
     cuphyStatus_t s = CUPHY_STATUS_NOT_SUPPORTED;
     //------------------------------------------------------------------
     // Make sure that at least the first output pointer is non-NULL if
@@ -745,13 +1464,13 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode_tb(ldpc::decoder&             
     // for both fp16 and fp32 (after conversion).
     const int      NUM_VAR_NODES = decodeDesc.config.num_parity_nodes +
                                    ((1 == decodeDesc.config.BG) ? max_info_nodes<1>::value : max_info_nodes<2>::value);
-    const uint32_t SHMEM_SIZE    = CW_PER_CTA * round_up_to_next(shmem_llr_buffer_size(NUM_VAR_NODES,       // num shared memory nodes
+    const uint32_t SHMEM_SIZE    = shmem_size_with_et_context(CW_PER_CTA * round_up_to_next(shmem_llr_buffer_size(NUM_VAR_NODES,       // num shared memory nodes
                                                                                        decodeDesc.config.Z, // lifting size
                                                                                        sizeof(__half)),     // element size
-                                                                 static_cast<unsigned int>(sizeof(ldpc2::ldpc_traits<__half>::llr_sts_t)));
+                                                                 static_cast<unsigned int>(sizeof(ldpc2::ldpc_traits<__half>::llr_sts_t))));
 
     //printf("grdDim = (%u), blkDim = (%u), CW_PER_CTA = %i, SHMEM_SIZE = %u, NUM_VAR_NODES = %i\n", grdDim.x, blkDim.x, CW_PER_CTA, SHMEM_SIZE, NUM_VAR_NODES);
-    
+
     if(decodeDesc.config.llr_type == CUPHY_R_16F)
     {
         switch(decodeDesc.config.BG)
@@ -762,12 +1481,13 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode_tb(ldpc::decoder&             
                 // Retrieve the base graph descriptor
                 const app_loc_t<1>::bg_desc_t* bgdesc = app_loc_t<1>::get_bg_desc_small(decodeDesc.config.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG1_reg_index_fp_desc_dyn_small_tb, blkDim, SHMEM_SIZE);
 
                 //------------------------------------------------------------------
                 // Launch the kernel
-                ldpc2_BG1_reg_index_fp_desc_dyn_small_tb<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(decodeDesc, *bgdesc);
+                LDPC_LAUNCH_TB_KERNEL(ldpc2_BG1_reg_index_fp_desc_dyn_small_tb, decodeDesc.config.flags,
+                    grdDim, blkDim, SHMEM_SIZE, strm, decodeDesc, *bgdesc);
                 s = CUPHY_STATUS_SUCCESS;
             }
             break;
@@ -777,12 +1497,13 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode_tb(ldpc::decoder&             
                 // Retrieve the base graph descriptor
                 const app_loc_t<2>::bg_desc_t* bgdesc = app_loc_t<2>::get_bg_desc_small(decodeDesc.config.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG2_reg_index_fp_desc_dyn_small_tb, blkDim, SHMEM_SIZE);
-                
+
                 //------------------------------------------------------------------
                 // Launch the kernel
-                ldpc2_BG2_reg_index_fp_desc_dyn_small_tb<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(decodeDesc, *bgdesc);
+                LDPC_LAUNCH_TB_KERNEL(ldpc2_BG2_reg_index_fp_desc_dyn_small_tb, decodeDesc.config.flags,
+                    grdDim, blkDim, SHMEM_SIZE, strm, decodeDesc, *bgdesc);
                 s = CUPHY_STATUS_SUCCESS;
             }
             break;
@@ -800,12 +1521,12 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode_tb(ldpc::decoder&             
                 // Retrieve the base graph descriptor
                 const app_loc_t<1>::bg_desc_t* bgdesc = app_loc_t<1>::get_bg_desc_small(decodeDesc.config.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32, blkDim, SHMEM_SIZE);
 
                 //------------------------------------------------------------------
                 // Launch the kernel
-                ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(decodeDesc, *bgdesc);
+                LDPC_LAUNCH_TB_KERNEL(ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32, decodeDesc.config.flags, grdDim, blkDim, SHMEM_SIZE, strm, decodeDesc, *bgdesc);
                 s = CUPHY_STATUS_SUCCESS;
             }
             break;
@@ -815,12 +1536,12 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::decode_tb(ldpc::decoder&             
                 // Retrieve the base graph descriptor
                 const app_loc_t<2>::bg_desc_t* bgdesc = app_loc_t<2>::get_bg_desc_small(decodeDesc.config.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32, blkDim, SHMEM_SIZE);
-                
+
                 //------------------------------------------------------------------
                 // Launch the kernel
-                ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(decodeDesc, *bgdesc);
+                LDPC_LAUNCH_TB_KERNEL(ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32, decodeDesc.config.flags, grdDim, blkDim, SHMEM_SIZE, strm, decodeDesc, *bgdesc);
                 s = CUPHY_STATUS_SUCCESS;
             }
             break;
@@ -875,7 +1596,7 @@ reg_index_fp_desc_dyn_small::reg_index_fp_desc_dyn_small(ldpc::decoder& desc)
     // MAX_LLR_PER_CODEWORD: 68 * Z (BG1)
     //                       52 * Z (BG2)
     // MAX_SHMEM_PER_CTA = round_up(MAX_LLR_PER_CODEWORD, sizeof(sts_type)) * MAX_CODEWORDS_PER_CTA
-    
+
     // BG1: 32 * sizeof(half) * 68 = 4352 bytes
     // BG2: 32 * sizeof(half) * 52 = 3328 bytes
     const uint32_t MAX_VAR_NODES_BG1 = ldpc2::max_variable_nodes<1>::value;
@@ -883,22 +1604,36 @@ reg_index_fp_desc_dyn_small::reg_index_fp_desc_dyn_small(ldpc::decoder& desc)
     //------------------------------------------------------------------
     // Determine the maximum amount of shared memory that could be used
     // by a kernel
-    const int MAX_BG1_SHMEM_SIZE = static_cast<int>(shmem_llr_buffer_size(MAX_VAR_NODES_BG1, // num shared memory nodes
+    const int MAX_BG1_SHMEM_SIZE = static_cast<int>(shmem_size_with_et_context(shmem_llr_buffer_size(MAX_VAR_NODES_BG1, // num shared memory nodes
                                                                           32,                // lifting size
-                                                                          sizeof(__half)));  // element size
-    const int MAX_BG2_SHMEM_SIZE = static_cast<int>(shmem_llr_buffer_size(MAX_VAR_NODES_BG2, // num shared memory nodes
+                                                                          sizeof(__half)))); // element size
+    const int MAX_BG2_SHMEM_SIZE = static_cast<int>(shmem_size_with_et_context(shmem_llr_buffer_size(MAX_VAR_NODES_BG2, // num shared memory nodes
                                                                           32,                // lifting size
-                                                                          sizeof(__half)));  // element size
+                                                                          sizeof(__half)))); // element size
+    const int MAX_BG1_SHMEM_SIZE_FP32 = static_cast<int>(shmem_size_with_et_context(shmem_llr_buffer_size(MAX_VAR_NODES_BG1,
+                                                                               32,
+                                                                               sizeof(float))));
+    const int MAX_BG2_SHMEM_SIZE_FP32 = static_cast<int>(shmem_size_with_et_context(shmem_llr_buffer_size(MAX_VAR_NODES_BG2,
+                                                                               32,
+                                                                               sizeof(float))));
 
     //------------------------------------------------------------------
     // For each kernel, set the maximum dynamic shared memory size
     typedef std::pair<const void*, int> func_attr_t;
-    std::array<func_attr_t, 4> func_attrs =
+    std::array<func_attr_t, 12> func_attrs =
     {
-        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_small,    MAX_BG1_SHMEM_SIZE),
-        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_small,    MAX_BG2_SHMEM_SIZE),
-        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_small_tb, MAX_BG1_SHMEM_SIZE),
-        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_small_tb, MAX_BG2_SHMEM_SIZE)
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_small,         MAX_BG1_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_small,         MAX_BG2_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_small_fp32,    MAX_BG1_SHMEM_SIZE_FP32),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_small_fp32,    MAX_BG2_SHMEM_SIZE_FP32),
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_small_tb,      MAX_BG1_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_no_accessories, MAX_BG1_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_small_tb,      MAX_BG2_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_no_accessories, MAX_BG2_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32, MAX_BG1_SHMEM_SIZE_FP32),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32, MAX_BG2_SHMEM_SIZE_FP32),
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_small_tb_fp32_no_accessories, MAX_BG1_SHMEM_SIZE_FP32),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_small_tb_fp32_no_accessories, MAX_BG2_SHMEM_SIZE_FP32)
     };
     for(func_attr_t f_a : func_attrs)
     {
@@ -934,10 +1669,10 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::get_launch_config(const ldpc::decoder
                                                                        NUM_PARITY_NODES);
     const int CW_PER_CTA       = THREADS_PER_CTA / Z;
 
-    const uint32_t SHMEM_SIZE  = CW_PER_CTA * round_up_to_next(shmem_llr_buffer_size(NUM_VAR_NODES,   // num shared memory nodes
+    const uint32_t SHMEM_SIZE  = shmem_size_with_et_context(CW_PER_CTA * round_up_to_next(shmem_llr_buffer_size(NUM_VAR_NODES,   // num shared memory nodes
                                                                                      Z,               // lifting size
                                                                                      sizeof(__half)), // element size
-                                                               static_cast<unsigned int>(sizeof(ldpc2::ldpc_traits<__half>::llr_sts_t)));
+                                                               static_cast<unsigned int>(sizeof(ldpc2::ldpc_traits<__half>::llr_sts_t))));
 
     //------------------------------------------------------------------
     // Validate input arguments
@@ -963,12 +1698,16 @@ cuphyStatus_t reg_index_fp_desc_dyn_small::get_launch_config(const ldpc::decoder
     launchConfig.kernel_node_params_driver.extra          = nullptr;
     launchConfig.kernel_node_params_driver.kernelParams   = launchConfig.kernel_args;
     launchConfig.kernel_node_params_driver.sharedMemBytes = SHMEM_SIZE;
+    launchConfig.kernel_node_params_driver.sharedMemBytes =
+        shmem_size_for_selected_kernel(
+            launchConfig.kernel_node_params_driver.sharedMemBytes,
+            launchConfig.decode_desc.config.flags);
 
     cudaFunction_t deviceFunction;
     MemtraceDisableScope md;
-    cudaError_t    e = (BG == 1) ?  cudaGetFuncBySymbol(&deviceFunction, (void*)ldpc2_BG1_reg_index_fp_desc_dyn_small_tb): 
-                                    cudaGetFuncBySymbol(&deviceFunction, (void*)ldpc2_BG2_reg_index_fp_desc_dyn_small_tb);
-    if (e != cudaSuccess) 
+    cudaError_t    e = (BG == 1) ?  LDPC_GET_TB_KERNEL_FUNCTION(deviceFunction, ldpc2_BG1_reg_index_fp_desc_dyn_small_tb, launchConfig.decode_desc.config.flags):
+                                    LDPC_GET_TB_KERNEL_FUNCTION(deviceFunction, ldpc2_BG2_reg_index_fp_desc_dyn_small_tb, launchConfig.decode_desc.config.flags);
+    if (e != cudaSuccess)
     {
         return CUPHY_STATUS_INTERNAL_ERROR;
     }

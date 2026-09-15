@@ -51,6 +51,8 @@ gen_notebook notebooks/channel_estimation/channel_estimation.ipynb
 gen_notebook notebooks/datalake_channel_estimation.ipynb
 gen_notebook notebooks/datalake_pusch_decoding.ipynb
 gen_notebook notebooks/datalake_pusch_multicell.ipynb
+gen_notebook notebooks/datalake_hest_per_ue.ipynb
+gen_notebook notebooks/datalake_srs_per_ue.ipynb
 
 # Finished
 echo $SCRIPT finished

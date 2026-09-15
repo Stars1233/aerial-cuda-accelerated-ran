@@ -19,6 +19,11 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdio>
 #include <initializer_list>
 #include <set>
 #include <stdexcept>
@@ -95,12 +100,13 @@ void parse_cpu(const YAML::Node& n, CpuCfg& c) {
 	if (c.feeder_core < -1) fail("cpu.feeder_core: must be -1 (no pinning) or a core index");
 }
 
-void parse_synth(const YAML::Node& n, SynthCfg& s) {
-	only(n, "synth", {"slot_tick_us", "tdd_pattern", "srs_periodicity_ms", "duration_slots"});
+void parse_synth(const YAML::Node& n, SynthCfg& s, const RowsCfg& rows) {
+	only(n, "synth", {"slot_tick_us", "tdd_pattern", "srs_periodicity_ms", "duration_slots", "n_cells"});
 	s.slot_tick_us = scalar_or<uint32_t>(n, "synth", "slot_tick_us", s.slot_tick_us);
 	s.tdd_pattern = scalar_or<std::string>(n, "synth", "tdd_pattern", s.tdd_pattern);
 	s.srs_periodicity_ms = scalar_or<uint32_t>(n, "synth", "srs_periodicity_ms", s.srs_periodicity_ms);
 	s.duration_slots = scalar_or<uint64_t>(n, "synth", "duration_slots", s.duration_slots);
+	s.n_cells = scalar_or<uint16_t>(n, "synth", "n_cells", s.n_cells);
 
 	if (!s.slot_tick_us) fail("synth.slot_tick_us: must be non-zero");
 	if (s.tdd_pattern.empty()) fail("synth.tdd_pattern: must be non-empty");
@@ -116,6 +122,22 @@ void parse_synth(const YAML::Node& n, SynthCfg& s) {
 	if ((uint64_t(s.srs_periodicity_ms) * 1000u) % s.slot_tick_us != 0) {
 		fail("synth.srs_periodicity_ms: must be an integer number of slots (multiple of slot_tick_us)");
 	}
+
+	if (!s.n_cells || s.n_cells > kMaxSynthCells) {
+		fail("synth.n_cells: must be 1.." + std::to_string(kMaxSynthCells));
+	}
+	// A slot writes n_cells rows into every per-cell ring; require room for one
+	// slot and warn under two slots of headroom. Assumes one UE per cell; the
+	// per-UE rings (hest, srs_hest, srs) would need n_cells*n_ue if that grows.
+	const uint32_t min_rows = std::min({rows.fh, rows.pusch, rows.hest, rows.srs_iq, rows.srs, rows.srs_hest});
+	if (s.n_cells > min_rows) {
+		fail("synth.n_cells (" + std::to_string(s.n_cells) + ") exceeds smallest rows depth (" +
+		     std::to_string(min_rows) + ")");
+	}
+	if (uint32_t(s.n_cells) * 2u > min_rows) {
+		std::fprintf(stderr, "config: synth.n_cells=%u leaves under two slots of ring headroom "
+		             "(min rows=%u)\n", s.n_cells, min_rows);
+	}
 }
 
 void parse_replay(const YAML::Node& n, ReplayCfg& r) {
@@ -123,6 +145,10 @@ void parse_replay(const YAML::Node& n, ReplayCfg& r) {
 	r.path = scalar<std::string>(n, "replay", "path");
 	r.loops = scalar_or<uint64_t>(n, "replay", "loops", r.loops);
 	if (r.path.empty()) fail("replay.path: must be non-empty");
+	struct stat st{};
+	if (stat(r.path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || access(r.path.c_str(), R_OK) != 0) {
+		fail("replay.path: not a readable file '" + r.path + "'");
+	}
 }
 
 } // namespace
@@ -153,9 +179,9 @@ Config Config::load(const std::string& path) {
 
 	// synth is required in synth mode, optional (fill source) in replay.
 	if (c.mode == Mode::Synth) {
-		parse_synth(require(root, "root", "synth"), c.synth);
+		parse_synth(require(root, "root", "synth"), c.synth, c.rows);
 	} else if (root["synth"]) {
-		parse_synth(root["synth"], c.synth);
+		parse_synth(root["synth"], c.synth, c.rows);
 	}
 
 	// replay is required in replay mode, optional in synth.

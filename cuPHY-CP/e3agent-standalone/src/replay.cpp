@@ -97,6 +97,10 @@ struct Cursor {
 struct PuschRings { Accum fh, pusch, hest; };
 struct SrsRings   { Accum iq, hest, rb; };
 
+// A slot assembled from cells sharing one ts_tai; hdr_n_cells is advisory.
+struct PendingPusch { E3BufferInfo bi; bool active = false; uint16_t hdr_n_cells = 0; };
+struct PendingSrs   { E3SrsBufferInfo si; bool active = false; uint16_t hdr_n_cells = 0; };
+
 // Sequential reader over the trace: validates the file header once, then
 // yields one (tag + body) per next(). Returns false at clean EOF or truncation.
 class TraceReader {
@@ -146,13 +150,27 @@ private:
 	FILE* f_ = nullptr;
 };
 
-bool writePusch(DataLake& dl, E3Agent& agent, const RowsCfg& rows, PuschRings& r,
-                const uint8_t* body, size_t len) {
+// A slot with more cells than the shallowest per-cell ring would wrap and clobber
+// earlier cells still pending; fail fast so rows.* is sized to max cells-per-slot.
+bool ringOverflow(size_t have, uint32_t cap, const char* kind, std::atomic<bool>& stop) {
+	if (have < cap) return false;
+	e3shim::log(e3shim::ERR, "ERR", 0, fmt::format(
+		"replay: {} slot exceeds ring depth {}; increase rows.* to the capture's "
+		"max cells-per-slot", kind, cap));
+	stop.store(true);
+	return true;
+}
+
+// Parse one PUSCH record, stage its blobs in SHM, and append its cell to the slot.
+bool accumulatePusch(DataLake& dl, const RowsCfg& rows, PuschRings& r,
+                     PendingPusch& pend, const uint8_t* body, size_t len, std::atomic<bool>& stop) {
 	Cursor c{body, body + len};
 	rt::PuschSlotHeader hdr{};
 	if (!c.get(hdr)) return false;
 	std::vector<rt::PuschUeMetrics> ue(hdr.n_ue);
 	for (auto& u : ue) if (!c.get(u)) return false;
+	if (pend.active && ringOverflow(pend.bi.cells.size(), std::min({rows.fh, rows.pusch, rows.hest}), "PUSCH", stop))
+		return false;
 	rt::BlobHeader hb{}, fb{};
 	if (!c.get(fb)) return false;
 	const uint8_t* fd = c.take(fb.len);
@@ -188,56 +206,78 @@ bool writePusch(DataLake& dl, E3Agent& agent, const RowsCfg& rows, PuschRings& r
 	if (hd && hb.len) std::memcpy(hi.hestData[r.hest.row], hd, hb.len);
 	hi.writeOffsetBytes += hb.len;
 
-	{
-		std::lock_guard<std::mutex> lk(dl.e3_buffer_mutex);
-		E3BufferInfo& bi = dl.e3_buffer_info;
-		bi = {};
-		bi.current_fh_buffer = r.fh.half;       bi.fh_write_index = r.fh.row;
-		bi.current_pusch_buffer = r.pusch.half; bi.pusch_write_index = r.pusch.row;
-		bi.current_hest_buffer = r.hest.half;   bi.hest_write_index = r.hest.row;
-		bi.hest_row_byte_offset = rowbase;
-		bi.sfn = hdr.sfn;
-		bi.slot = hdr.slot;
-		bi.timestamp_ns = hdr.timestamp_ns;
-		bi.timestamp_tai_ns = hdr.timestamp_tai_ns;
-		bi.cell_id = hdr.cell_id;
-		bi.n_rx_ant = hdr.n_rx_ant;
-		bi.n_rx_ant_srs = hdr.n_rx_ant_srs;
-		bi.n_cells = hdr.n_cells;
-		bi.n_bs_ants = hdr.n_bs_ants;
-		bi.n_ue = hdr.n_ue;
-		bi.ue_metrics.resize(hdr.n_ue);
-		for (uint16_t i = 0; i < hdr.n_ue; ++i) {
-			const rt::PuschUeMetrics& s = ue[i];
-			E3UeMetrics& m = bi.ue_metrics[i];
-			m.rnti = s.rnti; m.tb_crc_fail = s.tb_crc_fail; m.cb_errors = s.cb_errors;
-			m.rsrp = s.rsrp; m.noise_var = s.noise_var; m.sinr = s.sinr; m.cb_count = s.cb_count;
-			m.rssi = s.rssi; m.qam_mod_order = s.qam_mod_order; m.mcs_index = s.mcs_index;
-			m.mcs_table_index = s.mcs_table_index; m.rb_start = s.rb_start; m.rb_size = s.rb_size;
-			m.start_symbol_index = s.start_symbol_index; m.nr_of_symbols = s.nr_of_symbols;
-			m.tb_size = s.tb_size; m.pdu_len = s.pdu_len; m.target_code_rate = s.target_code_rate;
-			m.new_data_indicator = s.new_data_indicator; m.n_layers = s.n_layers;
-			m.layer_offset = s.layer_offset; m.ue_grp_idx = s.ue_grp_idx;
-			m.h_offset = s.h_offset; m.h_size = s.h_size; m.n_subcarriers = s.n_subcarriers;
-			m.n_dmrs_estimates = s.n_dmrs_estimates; m.dmrs_symb_pos = s.dmrs_symb_pos;
-			m.timing_advance = s.timing_advance; m.cfo_hz = s.cfo_hz;
-			m.harq_process_id = s.harq_process_id; m.rv_index = s.rv_index;
-		}
+	if (!pend.active) {  // first cell fixes the slot-level fields
+		pend.bi = {};
+		pend.bi.sfn = hdr.sfn;
+		pend.bi.slot = hdr.slot;
+		pend.bi.timestamp_ns = hdr.timestamp_ns;
+		pend.bi.timestamp_tai_ns = hdr.timestamp_tai_ns;
+		pend.hdr_n_cells = hdr.n_cells;
+		pend.active = true;
 	}
-	agent.notifyDataReady();
+
+	pend.bi.cells.emplace_back();
+	E3CellInfo& cell = pend.bi.cells.back();
+	cell.current_fh_buffer = r.fh.half;       cell.fh_write_index = r.fh.row;
+	cell.current_pusch_buffer = r.pusch.half; cell.pusch_write_index = r.pusch.row;
+	cell.current_hest_buffer = r.hest.half;   cell.hest_write_index = r.hest.row;
+	cell.hest_row_byte_offset = rowbase;
+	cell.cell_id = hdr.cell_id;
+	cell.n_rx_ant = hdr.n_rx_ant;
+	cell.n_rx_ant_srs = hdr.n_rx_ant_srs;
+	cell.n_bs_ants = hdr.n_bs_ants;
+	cell.n_ue = hdr.n_ue;
+	cell.ues.resize(hdr.n_ue);
+	for (uint16_t i = 0; i < hdr.n_ue; ++i) {
+		const rt::PuschUeMetrics& s = ue[i];
+		E3UeMetrics& m = cell.ues[i];
+		m.rnti = s.rnti; m.tb_crc_fail = s.tb_crc_fail; m.cb_errors = s.cb_errors;
+		m.rsrp = s.rsrp; m.noise_var = s.noise_var; m.sinr = s.sinr; m.cb_count = s.cb_count;
+		m.rssi = s.rssi; m.qam_mod_order = s.qam_mod_order; m.mcs_index = s.mcs_index;
+		m.mcs_table_index = s.mcs_table_index; m.rb_start = s.rb_start; m.rb_size = s.rb_size;
+		m.start_symbol_index = s.start_symbol_index; m.nr_of_symbols = s.nr_of_symbols;
+		m.tb_size = s.tb_size; m.pdu_len = s.pdu_len; m.target_code_rate = s.target_code_rate;
+		m.new_data_indicator = s.new_data_indicator; m.n_layers = s.n_layers;
+		m.layer_offset = s.layer_offset; m.ue_grp_idx = s.ue_grp_idx;
+		m.h_offset = s.h_offset; m.h_size = s.h_size; m.n_subcarriers = s.n_subcarriers;
+		m.n_dmrs_estimates = s.n_dmrs_estimates; m.dmrs_symb_pos = s.dmrs_symb_pos;
+		m.timing_advance = s.timing_advance; m.cfo_hz = s.cfo_hz;
+		m.harq_process_id = s.harq_process_id; m.rv_index = s.rv_index;
+	}
+
 	r.fh.advance(rows.fh);
 	r.pusch.advance(rows.pusch);
 	r.hest.advance(rows.hest);
 	return true;
 }
 
-bool writeSrs(DataLake& dl, E3Agent& agent, const RowsCfg& rows, SrsRings& r,
-              const uint8_t* body, size_t len) {
+// Publish the accumulated PUSCH slot and reset the pending buffer.
+void publishPusch(DataLake& dl, E3Agent& agent, PendingPusch& pend, bool& warn) {
+	pend.bi.n_cells = uint16_t(pend.bi.cells.size());
+	if (warn && pend.hdr_n_cells && pend.hdr_n_cells != pend.bi.n_cells) {
+		e3shim::log(e3shim::WRN, "WRN", 0, fmt::format(
+			"replay: PUSCH slot n_cells hdr={} != {} accumulated", pend.hdr_n_cells, pend.bi.n_cells));
+		warn = false;
+	}
+	{
+		std::lock_guard<std::mutex> lk(dl.e3_buffer_mutex);
+		dl.e3_buffer_info = std::move(pend.bi);
+	}
+	agent.notifyDataReady();
+	pend.bi = {};
+	pend.active = false;
+}
+
+// Parse one SRS record, stage its blobs in SHM, and append its cell to the slot.
+bool accumulateSrs(DataLake& dl, const RowsCfg& rows, SrsRings& r,
+                   PendingSrs& pend, const uint8_t* body, size_t len, std::atomic<bool>& stop) {
 	Cursor c{body, body + len};
 	rt::SrsSlotHeader hdr{};
 	if (!c.get(hdr)) return false;
 	std::vector<rt::SrsUeMetrics> ue(hdr.n_srs_ue);
 	for (auto& u : ue) if (!c.get(u)) return false;
+	if (pend.active && ringOverflow(pend.si.cells.size(), std::min({rows.srs_iq, rows.srs_hest, rows.srs}), "SRS", stop))
+		return false;
 
 	rt::BlobHeader iqb{};
 	if (!c.get(iqb)) return false;
@@ -285,47 +325,66 @@ bool writeSrs(DataLake& dl, E3Agent& agent, const RowsCfg& rows, SrsRings& r,
 		srs_rb_snr_advance(&ri, r.rb.row, ub[i].rd, ub[i].rb.len);
 	}
 
-	{
-		std::lock_guard<std::mutex> lk(dl.e3_srs_buffer_mutex);
-		E3SrsBufferInfo& si = dl.e3_srs_buffer_info;
-		si = {};
-		si.current_srs_iq_buffer = r.iq.half;       si.srs_iq_write_index = r.iq.row + 1;
-		si.current_srs_hest_buffer = r.hest.half;   si.srs_hest_write_index = r.hest.row + 1;
-		si.current_srs_rb_snr_buffer = r.rb.half;   si.srs_rb_snr_write_index = r.rb.row + 1;
-		si.srs_iq_row_byte_offset = iq_off;
-		si.sfn = hdr.sfn;
-		si.slot = hdr.slot;
-		si.timestamp_ns = hdr.timestamp_ns;
-		si.timestamp_tai_ns = hdr.timestamp_tai_ns;
-		si.cell_id = hdr.cell_id;
-		si.n_cells = hdr.n_cells;
-		si.n_rx_ant_srs = hdr.n_rx_ant_srs;
-		si.srs_cell_start_sym = hdr.srs_cell_start_sym;
-		si.srs_cell_n_srs_sym = hdr.srs_cell_n_srs_sym;
-		si.n_srs_ue = hdr.n_srs_ue;
-		si.ue_metrics.resize(hdr.n_srs_ue);
-		for (uint16_t i = 0; i < hdr.n_srs_ue; ++i) {
-			const rt::SrsUeMetrics& s = ue[i];
-			E3SrsUeMetrics& m = si.ue_metrics[i];
-			m.rnti = s.rnti; m.wideband_snr = s.wideband_snr; m.signal_energy = s.signal_energy;
-			m.noise_energy = s.noise_energy; m.toa_us = s.toa_us; m.hd_ant_flag = s.hd_ant_flag;
-			m.sc_corr_re = s.sc_corr_re; m.sc_corr_im = s.sc_corr_im; m.cs_corr_ratio_db = s.cs_corr_ratio_db;
-			m.n_ant_ports = s.n_ant_ports; m.n_syms = s.n_syms; m.n_repetitions = s.n_repetitions;
-			m.comb_size = s.comb_size; m.comb_offset = s.comb_offset; m.start_sym = s.start_sym;
-			m.cyclic_shift = s.cyclic_shift; m.frequency_position = s.frequency_position;
-			m.frequency_shift = s.frequency_shift; m.frequency_hopping = s.frequency_hopping;
-			m.resource_type = s.resource_type; m.t_srs = s.t_srs; m.t_offset = s.t_offset;
-			m.usage = s.usage; m.n_valid_prg = s.n_valid_prg; m.prg_size = s.prg_size;
-			m.n_prb_grps = s.n_prb_grps;
-			m.srs_hest_offset = hest_off[i];   m.srs_hest_size = ub[i].hb.len;
-			m.srs_rb_snr_offset = rb_off[i];   m.srs_rb_snr_size = ub[i].rb.len;
-		}
+	if (!pend.active) {  // first cell fixes the slot-level fields
+		pend.si = {};
+		pend.si.sfn = hdr.sfn;
+		pend.si.slot = hdr.slot;
+		pend.si.timestamp_ns = hdr.timestamp_ns;
+		pend.si.timestamp_tai_ns = hdr.timestamp_tai_ns;
+		pend.hdr_n_cells = hdr.n_cells;
+		pend.active = true;
 	}
-	agent.notifySrsDataReady();
+
+	pend.si.cells.emplace_back();
+	E3SrsCellInfo& cell = pend.si.cells.back();
+	cell.current_srs_iq_buffer = r.iq.half;       cell.srs_iq_write_index = r.iq.row + 1;
+	cell.current_srs_hest_buffer = r.hest.half;   cell.srs_hest_write_index = r.hest.row + 1;
+	cell.current_srs_rb_snr_buffer = r.rb.half;   cell.srs_rb_snr_write_index = r.rb.row + 1;
+	cell.srs_iq_row_byte_offset = iq_off;
+	cell.cell_id = hdr.cell_id;
+	cell.n_rx_ant_srs = hdr.n_rx_ant_srs;
+	cell.srs_cell_start_sym = hdr.srs_cell_start_sym;
+	cell.srs_cell_n_srs_sym = hdr.srs_cell_n_srs_sym;
+	cell.n_srs_ue = hdr.n_srs_ue;
+	cell.ues.resize(hdr.n_srs_ue);
+	for (uint16_t i = 0; i < hdr.n_srs_ue; ++i) {
+		const rt::SrsUeMetrics& s = ue[i];
+		E3SrsUeMetrics& m = cell.ues[i];
+		m.rnti = s.rnti; m.wideband_snr = s.wideband_snr; m.signal_energy = s.signal_energy;
+		m.noise_energy = s.noise_energy; m.toa_us = s.toa_us; m.hd_ant_flag = s.hd_ant_flag;
+		m.sc_corr_re = s.sc_corr_re; m.sc_corr_im = s.sc_corr_im; m.cs_corr_ratio_db = s.cs_corr_ratio_db;
+		m.n_ant_ports = s.n_ant_ports; m.n_syms = s.n_syms; m.n_repetitions = s.n_repetitions;
+		m.comb_size = s.comb_size; m.comb_offset = s.comb_offset; m.start_sym = s.start_sym;
+		m.cyclic_shift = s.cyclic_shift; m.frequency_position = s.frequency_position;
+		m.frequency_shift = s.frequency_shift; m.frequency_hopping = s.frequency_hopping;
+		m.resource_type = s.resource_type; m.t_srs = s.t_srs; m.t_offset = s.t_offset;
+		m.usage = s.usage; m.n_valid_prg = s.n_valid_prg; m.prg_size = s.prg_size;
+		m.n_prb_grps = s.n_prb_grps;
+		m.srs_hest_offset = hest_off[i];   m.srs_hest_size = ub[i].hb.len;
+		m.srs_rb_snr_offset = rb_off[i];   m.srs_rb_snr_size = ub[i].rb.len;
+	}
+
 	r.iq.advance(rows.srs_iq);
 	r.hest.advance(rows.srs_hest);
 	r.rb.advance(rows.srs);
 	return true;
+}
+
+// Publish the accumulated SRS slot and reset the pending buffer.
+void publishSrs(DataLake& dl, E3Agent& agent, PendingSrs& pend, bool& warn) {
+	pend.si.n_cells = uint16_t(pend.si.cells.size());
+	if (warn && pend.hdr_n_cells && pend.hdr_n_cells != pend.si.n_cells) {
+		e3shim::log(e3shim::WRN, "WRN", 0, fmt::format(
+			"replay: SRS slot n_cells hdr={} != {} accumulated", pend.hdr_n_cells, pend.si.n_cells));
+		warn = false;
+	}
+	{
+		std::lock_guard<std::mutex> lk(dl.e3_srs_buffer_mutex);
+		dl.e3_srs_buffer_info = std::move(pend.si);
+	}
+	agent.notifySrsDataReady();
+	pend.si = {};
+	pend.active = false;
 }
 
 } // namespace
@@ -334,7 +393,7 @@ Replay::Replay(DataLake& dl, E3Agent& agent, const ReplayCfg& cfg, const CpuCfg&
                const RowsCfg& rows)
 	: dl_(dl), agent_(agent), cfg_(cfg), cpu_(cpu), rows_(rows) {}
 
-void Replay::run(std::atomic<bool>& stop) {
+bool Replay::run(std::atomic<bool>& stop) {
 	pinThread(cpu_.feeder_core);
 	// Rings persist across loops, mirroring a continuous live stream
 	PuschRings pr;
@@ -342,14 +401,16 @@ void Replay::run(std::atomic<bool>& stop) {
 	for (uint64_t pass = 0; (cfg_.loops == 0 || pass < cfg_.loops) && !stop.load(); ++pass) {
 		TraceReader rd;
 		if (!rd.open(cfg_.path)) {
-			e3shim::log(e3shim::ERR, "ERR", 0, fmt::format("replay: no readable trace {}", cfg_.path));
-			return;
+			e3shim::log(e3shim::ERR, "ERR", 0, fmt::format("replay: invalid or unreadable trace {}", cfg_.path));
+			return false;
 		}
 
 		timespec next;
 		clock_gettime(CLOCK_MONOTONIC, &next);
-		uint64_t prev_tai = 0, emitted = 0;
-		bool have_prev = false;
+		uint64_t last_tai = 0, emitted = 0;
+		bool have_last = false, warn_pusch = true, warn_srs = true;
+		PendingPusch pp;
+		PendingSrs sp;
 
 		uint16_t tag = 0;
 		std::vector<uint8_t> buf;
@@ -357,26 +418,37 @@ void Replay::run(std::atomic<bool>& stop) {
 			if (buf.size() < sizeof(uint64_t) * 2) continue;  // need timestamp fields
 			uint64_t tai;
 			std::memcpy(&tai, buf.data() + sizeof(uint64_t), sizeof(tai));  // timestamp_tai_ns
-			if (have_prev) {
-				int64_t d = int64_t(tai - prev_tai);
+
+			// ts_tai advanced: the prior slot is complete. Flush before pacing
+			// so each slot publishes at its own capture time.
+			if (have_last && tai != last_tai) {
+				if (pp.active) { publishPusch(dl_, agent_, pp, warn_pusch); ++emitted; }
+				if (sp.active) { publishSrs(dl_, agent_, sp, warn_srs); ++emitted; }
+			}
+			if (have_last) {
+				int64_t d = int64_t(tai - last_tai);
 				if (d < 0) d = 0;
 				if (d > MAX_PACE_NS) d = MAX_PACE_NS;
 				if (d > 0) addNs(next, uint64_t(d));
 			}
-			have_prev = true;
-			prev_tai = tai;
+			have_last = true;
+			last_tai = tai;
 			clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
 
-			bool ok = false;
-			if (tag == rt::TAG_PUSCH) ok = writePusch(dl_, agent_, rows_, pr, buf.data(), buf.size());
-			else if (tag == rt::TAG_SRS) ok = writeSrs(dl_, agent_, rows_, sr, buf.data(), buf.size());
-			if (ok) ++emitted;
+			if (tag == rt::TAG_PUSCH) accumulatePusch(dl_, rows_, pr, pp, buf.data(), buf.size(), stop);
+			else if (tag == rt::TAG_SRS) accumulateSrs(dl_, rows_, sr, sp, buf.data(), buf.size(), stop);
+		}
+		// Flush the trailing slot (EOF or end of this pass). On stop, skip the partial.
+		if (!stop.load(std::memory_order_relaxed)) {
+			if (pp.active) { publishPusch(dl_, agent_, pp, warn_pusch); ++emitted; }
+			if (sp.active) { publishSrs(dl_, agent_, sp, warn_srs); ++emitted; }
 		}
 		rd.close();
 		e3shim::log(e3shim::INF, "INF", 0,
-			fmt::format("replay: pass {} emitted {} records", pass, emitted));
-		if (emitted == 0) return;  // empty/garbage trace: don't spin forever
+			fmt::format("replay: pass {} emitted {} slots", pass, emitted));
+		if (emitted == 0) return true;  // empty/garbage trace: don't spin forever
 	}
+	return true;
 }
 
 } // namespace e3sa

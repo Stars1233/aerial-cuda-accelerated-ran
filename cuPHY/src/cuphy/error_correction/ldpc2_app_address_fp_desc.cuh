@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -122,6 +122,9 @@ namespace ldpc2
 template <typename T, int BG>
 struct app_loc_address_fp_desc
 {
+    // We are storing addresses in 16-bit values. This address generator
+    // should not be used for half2.
+    static_assert(sizeof(T) <= 2);
     //------------------------------------------------------------------
     // Base graph descriptor type used by this app address calculator
     typedef BG_desc<BG> bg_desc_t;

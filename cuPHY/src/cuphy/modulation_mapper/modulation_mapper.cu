@@ -730,6 +730,9 @@ __global__ void sym_mod_util(const tensor_layout_any tDstLayout,
         case 6:  mod_QAM64_t::modulate (symAddr, SYM_ADDR_END, block_src, tbl_QAM64);  break;
         case 8:  mod_QAM256_t::modulate(symAddr, SYM_ADDR_END, block_src, tbl_QAM256); break;
         }
+        // Ensure all threads have finished reading block_src before the next
+        // loop iteration overwrites it.
+        __syncthreads();
         //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
         // Advance to the next batch
         blockAddr += (THREADS_PER_CTA * WORDS_PER_THREAD);

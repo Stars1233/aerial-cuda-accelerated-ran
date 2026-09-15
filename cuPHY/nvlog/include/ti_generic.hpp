@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,9 +54,9 @@ if(ti_subtask_count < ti_max_subtasks) { \
 #define TI_GENERIC_PERCENTAGE_NVLOG(LOG_LEVEL,TAG) \
 char ti_subtask_results1[4096]; \
 int ti_offset1=0; \
-double ti_total1=(ti_times[ti_subtask_count-1]-ti_times[0]).count()/1e3; \
+double ti_total1=static_cast<double>((ti_times[ti_subtask_count-1]-ti_times[0]).count())/1e3; \
 for(int ii=0; ii<ti_subtask_count-1; ii++) { \
-    double ti_percentage = 100.0*((ti_times[ii+1]-ti_times[ii]).count()/1e3)/ti_total1; \
+    double ti_percentage = 100.0*(static_cast<double>((ti_times[ii+1]-ti_times[ii]).count())/1e3)/ti_total1; \
     ti_offset1 += sprintf(&ti_subtask_results1[ti_offset1], "%s:%.1f,", ti_subtask_names[ii], ti_percentage); \
 } \
 ti_offset1 += sprintf(&ti_subtask_results1[ti_offset1], " (total: %.1fus),", ti_total1); \
@@ -74,7 +74,7 @@ NVLOG_FMT(LOG_LEVEL,TAG,"{{TI PERCENTAGE}} <{}> {}\n", ti_task_name, ti_subtask_
 char ti_subtask_results2[4096]; \
 int ti_offset2=0; \
 for(int ii=0; ii<ti_subtask_count-1; ii++) { \
-    ti_offset2 += sprintf(&ti_subtask_results2[ti_offset2], "%s:%.3f,", ti_subtask_names[ii], (ti_times[ii+1]-ti_times[ii]).count()/1e3); \
+    ti_offset2 += sprintf(&ti_subtask_results2[ti_offset2], "%s:%.3f,", ti_subtask_names[ii], static_cast<double>((ti_times[ii+1]-ti_times[ii]).count())/1e3); \
 } \
 NVLOG_FMT(LOG_LEVEL,TAG,"{{TI DURATION}} <{}> {}\n", ti_task_name, ti_subtask_results2);
 
@@ -90,7 +90,7 @@ NVLOG_FMT(LOG_LEVEL,TAG,"{{TI DURATION}} <{}> {}\n", ti_task_name, ti_subtask_re
 char ti_subtask_results3[4096]; \
 int ti_offset3=0; \
 for(int ii=0; ii<ti_subtask_count; ii++) { \
-    ti_offset3 += sprintf(&ti_subtask_results3[ti_offset3], "%s:%lu,", ti_subtask_names[ii], ti_times[ii].count()); \
+    ti_offset3 += sprintf(&ti_subtask_results3[ti_offset3], "%s:%ld,", ti_subtask_names[ii], ti_times[ii].count()); \
 } \
 NVLOG_FMT(LOG_LEVEL,TAG,"{{TI TIMESTAMPS}} <{}> {}\n", ti_task_name, ti_subtask_results3);
 

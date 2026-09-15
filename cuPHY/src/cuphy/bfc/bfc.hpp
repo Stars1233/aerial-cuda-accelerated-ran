@@ -32,16 +32,6 @@ struct cuphyBfwCoefComp
 
 namespace bfw_coefComp
 {
-void bfcCoefCompute(uint32_t           nBSAnts,
-                    uint32_t           nLayers,
-                    uint32_t           Nprb,
-                    const_tensor_pair& tH,
-                    const_tensor_pair& tLambda,
-                    tensor_pair&       tCoef,
-                    tensor_pair&       tDbg,
-                    cudaStream_t       strm);
-
-
 typedef struct _bfwCoefCompKernelBfLayerPrm
 {
     uint8_t             ueLayerIdx;        // Layer index of a UE

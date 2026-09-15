@@ -24,7 +24,12 @@
 #ifndef PHYDRIVER_API_H
 #define PHYDRIVER_API_H
 
+#include <chrono>
 #include <cstdint>
+#include <memory>
+#include <span>
+#include <stop_token>
+#include <string_view>
 #include <vector>
 #include <array>
 #include <tuple>
@@ -35,6 +40,7 @@
 #include "aerial-fh-driver/api.hpp"
 #include "constant.hpp"
 #include <QAM_param.cuh>
+#include "compression_types.hpp"  // compression_params, mod_compression_params, MAX_NUM_CELLS_PER_DEVICE
 
 /**
  * @defgroup Handlers Exposed Opaque handlers
@@ -62,6 +68,38 @@ typedef void* phydriverwrk_handle;
  *
  */
 typedef uint64_t worker_id;
+
+/** @brief Sentinel value meaning "no worker affinity" — task may run on any worker. */
+inline constexpr worker_id INVALID_WORKER_ID = 0;
+
+/** Forward declaration: opaque task handle used in l1_push_task_* API. */
+class Task;
+
+/** Forward declaration: worker type used by task work functions. */
+class Worker;
+#ifdef ENABLE_FAPI_STORE_REPLAY
+class SlotMapDl;
+class SlotMapUl;
+#endif
+
+/** Forward declaration: PMU counter summarizer from task_instrumentation. */
+class PMUDeltaSummarizer;
+
+namespace nv {
+enum class CplaneBatchDirection : uint8_t;
+}
+
+/**
+ * @brief Work-function signature for DL/UL task lists, used by Task::init().
+ *
+ * @param worker     Pointer to the Worker executing this task.
+ * @param arg        Opaque per-task argument (cast to the concrete context type).
+ * @param first_cell Index of the first cell assigned to this task invocation.
+ * @param num_cells  Number of cells assigned to this task invocation.
+ * @param num_tasks  Total number of tasks in the task list.
+ * @return           0 on success, non-zero on error.
+ */
+using l1_task_work_fn_t = int(*)(Worker*, void*, int, int, int);
 
 /******************************************************************/ /**
  * @brief Format of a worker routine
@@ -100,11 +138,70 @@ struct cell_phy_info
     ::cuphyPrachCellStatPrms_t prachStatParams;                 ///< PRACH cell-level static parameters
     std::vector<::cuphyPrachOccaStatPrms_t> prach_configs;      ///< PRACH occasion configurations (multiple occasions per cell)
     bool is_early_harq_detection_enabled;                       ///< Enable early HARQ-ACK detection before full decoding completes
+
+    // CPlaneGenerator plumbing: fields populated by l2adapter and consumed by cuphydriver
+    std::array<int32_t, 8> prach_freq_offsets{};                ///< ORAN C-plane freqOffset per FD occasion (already-converted values)
+    uint8_t prach_seq_length{};                                 ///< PRACH sequence length (0=long L_RA=839, 1=short L_RA=139)
+    uint32_t dl_freq_abs_a_khz{};                               ///< Absolute frequency of DL Point A in kHz (CONFIG_TLV_DL_FREQ)
+
+    /**
+     * @brief Precoding matrix metadata for one PMI index.
+     */
+    struct pmi_entry {
+        uint16_t pmi_idx{};                                     ///< Precoding matrix index
+        uint8_t  num_ant_ports{};                               ///< Number of antenna ports for this PMI
+    };
+    std::vector<pmi_entry> pmi_entries{};                        ///< PMI-to-port-count mapping (empty if precoding not enabled)
+    std::vector<std::vector<uint8_t>> bfw_dbt_pdu_payloads{};    ///< Static BFW DBT PDU payloads from CONFIG.request (mMIMO only)
+
     cuphySrsChEstAlgoType_t srs_chest_algo_type;                ///< SRS channel estimation algorithm type selector
     uint8_t srs_chest_tol2_normalization_algo_type;             ///< SRS to L2 normalization algorithm type (0=disabled, 1=constant scaler, 2=auto)
     float srs_chest_tol2_constant_scaler;                       ///< Constant scaling factor for SRS to L2 normalization (when type=1)
     uint8_t bfw_power_normalization_alg_selector;               ///< Beamforming weights power normalization algorithm selector
     uint8_t pusch_aggr_factor;                                  ///< Number of TTI slots aggregated for PUSCH bundling
+};
+
+/// Maximum UE-antenna layers carried in a single direct BFW CVI record.
+inline constexpr uint8_t DIRECT_BFW_MAX_LAYERS = 16;
+/// IQ bit width for dynamic BFW coefficients (9-bit signed I/Q).
+inline constexpr uint8_t DIRECT_BFW_DYNAMIC_IQ_BITWIDTH = 9;
+
+/// Direction of a direct BFW CVI record (selects the DL or UL record store).
+enum class direct_bfw_direction : uint8_t {
+    dl,
+    ul,
+};
+
+/**
+ * One UE-group BFW completion produced by the L2 producer in slot N-1 and consumed by the
+ * framework C-plane generator in slot N.
+ *
+ * Built by the BFW slot-command path (legacy serial or offload aggr) and recorded
+ * via l1_recordDirectBfwCviRecord. Plain data-transport struct: no invariants.
+ */
+struct direct_bfw_cvi_record final {
+    direct_bfw_direction direction{};   ///< DL or UL record store selector.
+    uint16_t sfn{};                     ///< 3GPP frame where BFW was computed (0-1023).
+    uint16_t slot{};                    ///< 3GPP slot where BFW was computed.
+
+    uint16_t target_pdu_index{};        ///< PDSCH/PUSCH PDU ordinal this group beamforms.
+    uint16_t rnti{};                    ///< UE RNTI from the CVI request.
+    uint16_t rb_start{};                ///< CVI PRB range start index.
+    uint16_t rb_size{};                 ///< CVI PRB range size in PRBs.
+    uint16_t num_prgs{};                ///< Number of PRG bundles in the coefficient buffer.
+    uint16_t prg_size{};                ///< PRBs per PRG bundle.
+
+    std::array<uint8_t, DIRECT_BFW_MAX_LAYERS> ue_layer_indices{}; ///< UE-local to group-layer map; first num_layers entries are valid.
+    uint8_t layer_base{};               ///< First group-layer index owned by this UE.
+    uint8_t num_layers{};               ///< Active UE layers; must be <= DIRECT_BFW_MAX_LAYERS.
+    uint8_t group_num_layers{};         ///< Total layers across the shared BFW group.
+
+    uint8_t* host_bfws{};               ///< Non-owning host coefficient buffer; valid until C-plane consume completes.
+    uint8_t* device_bfws{};             ///< Non-owning device coefficient buffer for GPU chaining; null when unused.
+    uint8_t* header{};                  ///< Non-owning BFW_COFF_MEM header; released BUSY->FREE after consume.
+    uint16_t slot_dynamic_beam_id_start{}; ///< Absolute dynamic beam-ID base for the slot; 0 means unused.
+    uint16_t n_gnb_ant{};               ///< gNB antenna count (L_TRX) used to compute the weights.
+    uint8_t bfw_iq_bitwidth{DIRECT_BFW_DYNAMIC_IQ_BITWIDTH}; ///< BFP IQ bit width; only DIRECT_BFW_DYNAMIC_IQ_BITWIDTH is accepted.
 };
 
 extern phydriver_handle l1_pdh;                                 ///< Global cuPHYDriver handle for signal handlers and exit routines
@@ -254,36 +351,6 @@ struct h2d_copy_thread_config{
  */
 typedef struct h2d_copy_prepone_info h2d_copy_prepone_info_t;
 
-static constexpr uint32_t MAX_NUM_CELLS_PER_DEVICE = DL_MAX_CELLS_PER_SLOT;  ///< Maximum number of cells per GPU device
-
-struct mod_compression_params{
-    float2  scaling[API_MAX_ANTENNAS][ORAN_ALL_SYMBOLS][MAX_SECTIONS_PER_UPLANE_SYMBOL];         ///< Scaling factors per antenna/symbol/section
-    uint16_t nprbs_per_list[API_MAX_ANTENNAS][ORAN_ALL_SYMBOLS][MAX_SECTIONS_PER_UPLANE_SYMBOL]; ///< Number of PRBs per section (range 0-273)
-    uint16_t prb_start_per_list[API_MAX_ANTENNAS][ORAN_ALL_SYMBOLS][MAX_SECTIONS_PER_UPLANE_SYMBOL]; ///< Starting PRB index per section (range 0-273)
-    uint8_t num_messages_per_list[API_MAX_ANTENNAS][ORAN_ALL_SYMBOLS];                           ///< Number of sections per antenna/symbol (range 0-MAX_SECTIONS_PER_UPLANE_SYMBOL)
-    QamListParam params_per_list[API_MAX_ANTENNAS][ORAN_ALL_SYMBOLS][MAX_SECTIONS_PER_UPLANE_SYMBOL];  ///< QAM modulation parameters per section (IQ width, CSF, etc.)
-    QamPrbParam prb_params_per_list[API_MAX_ANTENNAS][ORAN_ALL_SYMBOLS][MAX_SECTIONS_PER_UPLANE_SYMBOL]; ///< RE mask of PRBs per section
-};
-
-/// Number of entries in the aerial_fh::UserDataCompressionMethod enum
-static constexpr std::size_t NUM_USER_DATA_COMPRESSION_METHODS = 7;
-
-struct compression_params{
-    uint8_t comp_meth[MAX_NUM_CELLS_PER_DEVICE];               ///< Compression method per cell
-    uint8_t bit_width[MAX_NUM_CELLS_PER_DEVICE];               ///< Compressed bit width per cell
-    uint8_t  *input_ptrs[MAX_NUM_CELLS_PER_DEVICE];            ///< Input buffer pointers per cell
-    uint8_t **prb_ptrs[MAX_NUM_CELLS_PER_DEVICE];              ///< Per-PRB buffer pointers per cell
-    int     num_prbs[MAX_NUM_CELLS_PER_DEVICE];                ///< Number of PRBs per cell
-    float   beta[MAX_NUM_CELLS_PER_DEVICE];                    ///< Beta scaling factor per cell
-    uint16_t max_num_prb_per_symbol[MAX_NUM_CELLS_PER_DEVICE]; ///< Maximum PRBs per symbol per cell
-    uint8_t num_antennas[MAX_NUM_CELLS_PER_DEVICE];            ///< Number of antennas per cell
-    uint8_t num_cells;                                          ///< Total number of active cells
-    bool    gpu_comms;                                          ///< GPU direct communication enabled (true=enabled, false=via CPU)
-
-    //The following is needed if mod compression is enabled    
-    mod_compression_params *mod_compression_config[MAX_NUM_CELLS_PER_DEVICE];  ///< Modulation compression config per cell (null if disabled)
-};
-
 /******************************************************************/ /**
  * @brief Configure a new instance of cuPHYDriver
  *
@@ -296,6 +363,9 @@ struct context_config
     bool standalone;                                            ///< Standalone mode (no external L2 integration)
     bool validation;                                            ///< Enable validation mode for testing
     bool cplane_disable;                                        ///< Disable C-plane processing (U-plane only mode)
+    bool fapi_to_cplane_direct{};                                  ///< FAPI to C-plane direct path (bypass FH Callback; C-Plane/GPU Prepare no-op; direct PartialUplaneSlotInfo fill)
+    uint16_t cplane_processing_dl_batch_size{};                 ///< EOM DL C-plane batch size (cells per batch), 0/invalid means single batch
+    uint16_t cplane_processing_ul_batch_size{};                 ///< EOM UL C-plane batch size (cells per batch), 0/invalid means single batch
 
     std::vector<struct cell_mplane_info> cell_mplane_list;      ///< List of cell management plane configurations
 
@@ -320,6 +390,7 @@ struct context_config
 
     uint32_t ul_order_timeout_gpu_ns;                           ///< UL packet ordering GPU timeout in nanoseconds
     uint32_t ul_srs_aggr3_task_launch_offset_ns;                ///< SRS aggregation task 3 launch offset from T0 (ns)
+    uint32_t ul_srs_task1_order_launch_offset_ns{};           ///< SRS task1 order/channel launch offset from T0 (ns), gpu_init_comms_via_cpu path
     uint32_t ul_order_timeout_gpu_srs_ns;                       ///< UL packet ordering GPU timeout for SRS in nanoseconds
     uint32_t ul_order_timeout_cpu_ns;                           ///< UL packet ordering CPU timeout in nanoseconds
     uint32_t ul_order_timeout_log_interval_ns;                  ///< Logging interval for UL ordering timeouts (ns)
@@ -413,6 +484,8 @@ struct context_config
 
     uint8_t mMIMO_enable;                                       ///< Enable massive MIMO (mMIMO) processing (0=disabled, 1=enabled)
     uint8_t enable_srs;                                         ///< Enable SRS (Sounding Reference Signal) processing (0=disabled, 1=enabled)
+    uint16_t max_ul_antenna_ports{0};                         ///< Max UL antenna ports = max(PUSCH,PUCCH,PRACH,SRS) eAxC count over cells (from YAML)
+    uint16_t max_dl_antenna_ports{0};                         ///< Max DL antenna ports = max(PDCCH,PDSCH,CSI_RS,PBCH) eAxC count over cells (from YAML)
     uint8_t enable_dl_core_affinity;                            ///< Enable DL core affinity for task distribution (0=disabled, 1=enabled)
     uint8_t dlc_core_packing_scheme;                            ///< DL C-plane core packing scheme (0=default, 1=fixed per-cell, 2=dynamic workload-based)
     uint8_t ue_mode;                                            ///< Enable User Equipment emulation mode (0=gNodeB, 1=UE mode)
@@ -727,21 +800,258 @@ int get_num_dlc_tasks(int num_workers,bool commViaCpu, uint8_t mMIMO_enable);
 
 /** @} */ /* END TASK CALCULATION */
 
-/******************************************************************/ /**
- * @brief Create a new Uplink or Downlink L1 pipeline for the current slot
+/**
+ * @brief Bitmask controlling which task categories l1_enqueue_phy_work() excludes.
  *
- * This should be used by L2 Adapter to enqueue new UL/DL tasks for cells foreach slot.
+ * Passing @c SKIP_NONE (0) is identical to the original behaviour — all task categories
+ * are scheduled. Each bit removes the corresponding tasks from both the task-count budget
+ * and the enqueue loop. Bits may be OR-combined when multiple categories must be skipped.
  *
- * Returns ::0 on success, -1 otherwise
- * 
- * @param[in] pdh cuPHYDriver handler.
- * @param[in] sc List of phy channels to be executed per cell during the current slot
- *
- * @return
- * \p 0 on success, -1 otherwise
- *
+ * @par Extensibility
+ * New @c SKIP_* bits can be added here and gated inside l1_enqueue_phy_work() as more
+ * task categories are moved to parallel paths.  Examples of future bits:
+ * - @c SKIP_UL_CPLANE — exclude @c TaskUL1AggrCplane when ULC is made parallel.
+ * - @c SKIP_PDSCH / @c SKIP_PDCCH — per-channel extraction (independent submission).
  */
-int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_command* sc);
+enum class EnqueueSkipMask : uint32_t
+{
+    SKIP_NONE                 = 0,        ///< Run all task categories — identical to the original behaviour.
+    SKIP_DL_CPLANE            = 1U << 0,  ///< Exclude @c TaskDL1AggrCplane and @c TaskDL2AggrPrepare.
+                                          ///< Used by the store-and-replay path where DL C-plane is sent
+                                          ///< by @c task_dlc (build_and_send_dl_cplane()) before EOM.
+    SKIP_UL_CPLANE            = 1U << 1,  ///< Exclude @c TaskUL1AggrCplane.
+                                          ///< Used when UL C-plane has already been sent by @c task_ulc
+                                          ///< (build_and_send_ul_cplane()) before EOM.
+                                          ///< When set under the fapi-to-cplane-direct path,
+                                          ///< @c l1_signal_ul_cplane_batch_done emits the
+                                          ///< @c addULCTasksComplete + @c addSlotEndTask signals
+                                          ///< that @c TaskUL1AggrCplane would normally emit, and
+                                          ///< @c ul_task_count is bumped by +1 to account for
+                                          ///< that batch-done @c addSlotEndTask virtual task.
+    SKIP_DL_FHCB              = 1U << 2,  ///< Exclude @c TaskDLFHCb.
+                                          ///< Used by the fapi-to-cplane-direct path where the FHCB
+                                          ///< done signals (setCellFHCBDone, setFHCBDone) are emitted
+                                          ///< by @c l1_signal_dl_cplane_batch_done after the batched
+                                          ///< C-plane task completes. No fh_prepare_callback is invoked.
+                                          ///< Also acts as the key controlling the DL batch-done
+                                          ///< virtual-task bump: when set, @c dl_task_count gains +1
+                                          ///< to account for the @c addSlotEndTask emitted by
+                                          ///< @c l1_signal_dl_cplane_batch_done, so that
+                                          ///< @c task_work_function_dl_aggr_3_buf_cleanup's
+                                          ///< @c waitSlotEndTask explicitly waits for the
+                                          ///< framework-path C-plane batch to complete before
+                                          ///< running the DL buffer memset.
+    SKIP_DL_GPU_COMM_PREPARE  = 1U << 3,  ///< Exclude @c TaskDL2AggrGpuCommPrepare.
+                                          ///< Used by the fapi-to-cplane-direct path where U-plane GPU
+                                          ///< comm is prepared by setupUPlaneGpuComm() inside the
+                                          ///< framework C-plane path; incUplanePrepDone is emitted by
+                                          ///< @c l1_signal_dl_cplane_batch_done (the single
+                                          ///< @c addSlotEndTask contribution is accounted for via the
+                                          ///< @c SKIP_DL_FHCB bit's virtual-task bump — see above).
+    // SKIP_PDSCH             = 1U << 4,  ///< Future: per-channel extraction.
+    // SKIP_PDCCH             = 1U << 5,  ///< Future: per-channel extraction.
+};
+
+/// @name EnqueueSkipMask bitwise operators
+/// Compose or test skip masks without casting to the underlying type.
+/// Example: @c SKIP_DL_CPLANE | SKIP_UL_CPLANE
+/// @{
+constexpr EnqueueSkipMask operator|(EnqueueSkipMask a, EnqueueSkipMask b) noexcept
+{
+    return static_cast<EnqueueSkipMask>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+constexpr EnqueueSkipMask operator&(EnqueueSkipMask a, EnqueueSkipMask b) noexcept
+{
+    return static_cast<EnqueueSkipMask>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+constexpr EnqueueSkipMask operator~(EnqueueSkipMask a) noexcept
+{
+    return static_cast<EnqueueSkipMask>(~static_cast<uint32_t>(a));
+}
+/// @}
+
+/**
+ * @brief Enqueue PHY work for the current slot.
+ *
+ * Schedules UL and DL task pipelines (channel aggregation, compression, U-plane TX,
+ * and optionally C-plane tasks) for all cells in the slot command.
+ * This is the standard entry point used by the L2 adapter.
+ *
+ * @param[in] pdh       cuPHYDriver handler.
+ * @param[in] sc        Slot command containing the PHY work to enqueue.
+ * @param[in] skip_mask Bitmask of EnqueueSkipMask bits controlling which task categories
+ *                      to exclude. Defaults to @c EnqueueSkipMask::SKIP_NONE (full pipeline).
+ *                      Pass @c EnqueueSkipMask::SKIP_DL_CPLANE when C-plane work has already
+ *                      been performed by the store-and-replay path (task_dlc before EOM).
+ * @param[in] use_bound_early_maps   (@c ENABLE_FAPI_STORE_REPLAY only) When @c true, use the
+ *                      caller-supplied early slot maps below instead of the driver-context
+ *                      early maps (@c getEarlySlotMapDl / @c getEarlySlotMapUl). Lets the
+ *                      direct C-plane path bind the maps it already set up for this slot.
+ * @param[in] bound_early_slot_map_dl (@c ENABLE_FAPI_STORE_REPLAY only) Caller-bound early DL
+ *                      slot map; consulted iff @p use_bound_early_maps. May be null.
+ * @param[in] bound_early_slot_map_ul (@c ENABLE_FAPI_STORE_REPLAY only) Caller-bound early UL
+ *                      slot map; consulted iff @p use_bound_early_maps. May be null.
+ *
+ * @return 0 on success, non-zero on error; return value must be checked.
+ */
+[[nodiscard]] int l1_enqueue_phy_work(phydriver_handle pdh,
+                                      slot_command_api::slot_command* sc,
+                                      EnqueueSkipMask skip_mask = EnqueueSkipMask::SKIP_NONE
+#ifdef ENABLE_FAPI_STORE_REPLAY
+                                      ,
+                                      bool use_bound_early_maps = false,
+                                      SlotMapDl* bound_early_slot_map_dl = nullptr,
+                                      SlotMapUl* bound_early_slot_map_ul = nullptr
+#endif
+                                      );
+
+
+/**
+ * @brief Return the worker_id for DL worker at the given index.
+ *
+ * Returns INVALID_WORKER_ID (0) if worker affinity is disabled or the
+ * index is out of range.
+ *
+ * @param[in] pdh          cuPHYDriver handler.
+ * @param[in] worker_index Zero-based DL worker index.
+ *
+ * @return worker_id for use in Task::init(); return value must be checked.
+ */
+[[nodiscard]] worker_id l1_get_dl_worker_id(phydriver_handle pdh, int worker_index);
+
+/**
+ * @brief Return the worker_id for UL worker at the given index.
+ *
+ * @param[in] pdh          cuPHYDriver handler.
+ * @param[in] worker_index Zero-based UL worker index.
+ *
+ * @return worker_id for use in Task::init(); return value must be checked.
+ */
+[[nodiscard]] worker_id l1_get_ul_worker_id(phydriver_handle pdh, int worker_index);
+
+/**
+ * @brief Get the configured CPU task tracing mode for this driver context.
+ *
+ * Returns the raw @c enable_cpu_task_tracing value as set in the cuphycontroller
+ * YAML. Cast to @c TracingMode at the call site so this public API header stays
+ * free of the @c task_instrumentation_v3.hpp dependency.
+ *
+ * @param[in] pdh cuPHYDriver handler.
+ *
+ * @return The configured tracing-mode value, or 0 (DISABLED) when @p pdh
+ *         resolves to a null @c PhyDriverCtx.
+ */
+[[nodiscard]] uint8_t l1_get_cpu_task_tracing_mode(phydriver_handle pdh);
+
+/**
+ * @brief Extract the PMU delta summarizer from a worker thread context.
+ *
+ * Thin accessor so callers that only have a forward-declared @c Worker* can
+ * obtain the @c PMUDeltaSummarizer without including @c worker.hpp (which
+ * brings heavy transitive includes via @c mps.hpp / @c fh.hpp).
+ *
+ * @param[in] worker  Worker pointer received by the task work function,
+ *                    or @c nullptr.
+ *
+ * @return The worker's PMU summarizer, or @c nullptr when @p worker is null.
+ */
+[[nodiscard]] PMUDeltaSummarizer* l1_get_worker_pmu(Worker* worker);
+
+/**
+ * @brief Allocate, initialise, and enqueue one DL task.
+ *
+ * Convenience wrapper around l1_get_next_task() + Task::init() + l1_push_task_dl().
+ *
+ * @param[in] pdh         cuPHYDriver handler.
+ * @param[in] ts_exec_ns  Task execution timestamp (nanoseconds).
+ * @param[in] name        Task name for diagnostics.
+ * @param[in] fn          Work function pointer.
+ * @param[in] arg         Opaque argument passed to work function.
+ * @param[in] first_cell  Forwarded to Task::init().
+ * @param[in] num_cells   Forwarded to Task::init().
+ * @param[in] num_tasks   Forwarded to Task::init().
+ * @param[in] desired_wid Worker affinity (INVALID_WORKER_ID for any).
+ *
+ * @return true on success, false if no task object was available; return value must be checked.
+ */
+[[nodiscard]] bool l1_push_new_dl_task(phydriver_handle pdh, uint64_t ts_exec_ns, const char* name,
+                                       l1_task_work_fn_t fn, void* arg,
+                                       int first_cell, int num_cells, int num_tasks,
+                                       worker_id desired_wid);
+
+/**
+ * @brief Allocate, initialise, and enqueue one UL task.
+ *
+ * Convenience wrapper around l1_get_next_task() + Task::init() + l1_push_task_ul().
+ * Mirrors l1_push_new_dl_task() for the UL worker pool so that UL tasks run on
+ * UL workers and do not compete with DL tasks for DL worker slots.
+ *
+ * @param[in] pdh         cuPHYDriver handler.
+ * @param[in] ts_exec_ns  Task execution timestamp (nanoseconds).
+ * @param[in] name        Task name for diagnostics.
+ * @param[in] fn          Work function pointer.
+ * @param[in] arg         Opaque argument passed to work function.
+ * @param[in] first_cell  Forwarded to Task::init().
+ * @param[in] num_cells   Forwarded to Task::init().
+ * @param[in] num_tasks   Forwarded to Task::init().
+ * @param[in] desired_wid Worker affinity (INVALID_WORKER_ID for any).
+ *
+ * @return true on success, false if no task object was available; return value must be checked.
+ */
+[[nodiscard]] bool l1_push_new_ul_task(phydriver_handle pdh, uint64_t ts_exec_ns, const char* name,
+                                       l1_task_work_fn_t fn, void* arg,
+                                       int first_cell, int num_cells, int num_tasks,
+                                       worker_id desired_wid);
+
+/**
+ * @brief Per-task descriptor for l1_push_new_dl/ul_tasks_bulk().
+ *
+ * Aggregates all per-task parameters so that a batch of tasks can be
+ * allocated, initialised, and pushed under a single TaskList lock.
+ */
+struct TaskSpec final {
+    std::string_view  name;           ///< Human-readable task name (diagnostics).
+    l1_task_work_fn_t fn   = nullptr; ///< Work function pointer.
+    void*             arg  = nullptr; ///< Opaque argument passed to the work function.
+    worker_id         wid  = INVALID_WORKER_ID; ///< Worker affinity; INVALID_WORKER_ID for any.
+    int               first_cell = 0; ///< Index of the first cell this task covers.
+    int               num_cells  = 1; ///< Number of cells this task covers.
+    int               num_tasks  = 1; ///< Total task count in the slot (for dependency tracking).
+
+    /// Maximum number of specs (and internal ready-task slots) accepted by
+    /// l1_push_new_dl/ul_tasks_bulk().  Callers must ensure n_specs <= this value.
+    inline static constexpr int BULK_MAX = 16;
+};
+
+/**
+ * @brief Allocate, initialise, and push up to @p specs.size() DL tasks under a single
+ * TaskList lock (one lock/unlock for the entire batch vs. one per task).
+ *
+ * All tasks share the same @p ts_exec_ns execution timestamp; individual
+ * @c Task::init() calls still record their own creation time internally.
+ *
+ * Pool exhaustion or init() failure causes the remaining tasks to be skipped
+ * with an NVLOGW; the caller is responsible for calling
+ * @c on_slot_channel_task_complete() for each task not returned in the count.
+ *
+ * @param pdh         cuPHYDriver handle.
+ * @param ts_exec_ns  Shared execution timestamp (nanoseconds, from system_clock).
+ * @param specs       Non-owning view of task descriptors; size must be <= TaskSpec::BULK_MAX.
+ * @return            Number of tasks successfully pushed; must be checked.
+ */
+[[nodiscard]] int l1_push_new_dl_tasks_bulk(phydriver_handle pdh, uint64_t ts_exec_ns,
+                                             std::span<const TaskSpec> specs);
+
+/**
+ * @brief Mirrors l1_push_new_dl_tasks_bulk() for the UL worker pool.
+ *
+ * @param pdh         cuPHYDriver handle.
+ * @param ts_exec_ns  Shared execution timestamp (nanoseconds, from system_clock).
+ * @param specs       Non-owning view of task descriptors; size must be <= TaskSpec::BULK_MAX.
+ * @return            Number of tasks successfully pushed; must be checked.
+ */
+[[nodiscard]] int l1_push_new_ul_tasks_bulk(phydriver_handle pdh, uint64_t ts_exec_ns,
+                                             std::span<const TaskSpec> specs);
 
 /******************************************************************/ /**
  * @brief Set the output callback for UL and DL
@@ -943,6 +1253,17 @@ int l1_cell_update_cell_config(phydriver_handle pdh, uint16_t mplane_id, std::un
 int l1_cell_update_attenuation(phydriver_handle pdh, uint16_t mplane_id, float attenuation_dB);
 
 /******************************************************************/ /**
+ * @brief Bind the calling thread to the PHY driver's CUDA primary context
+ *
+ * Worker threads call GpuDevice::setDevice() at startup; auxiliary threads
+ * (for example OAM cell update) must attach the same context before any CUDA
+ * or fronthaul path that assumes a current context.
+ *
+ * @param[in] pdh cuPHYDriver handler
+ */
+void l1_bind_thread_to_phy_cuda_context(phydriver_handle pdh);
+
+/******************************************************************/ /**
  * @brief Update GPS timing parameters
  *
  * Updates the GPS alpha and beta parameters used for timing synchronization.
@@ -978,6 +1299,42 @@ using CellUpdateCallBackFn = std::function<void(int32_t, uint8_t)>;
  * \p 0 on success, -1 otherwise
  */
 int l1_cell_update_cell_config(phydriver_handle pdh, struct cell_phy_info& cell_pinfo, ::CellUpdateCallBackFn& callback);
+
+/******************************************************************/ /**
+ * @brief Update cell configuration without spawning CONFIG helper threads.
+ *
+ * Single caller-runs entry point. If other cells are active it routes to the offload
+ * PRACH handover (ENABLE_FAPI_STORE_REPLAY builds), reconfiguring without disrupting
+ * them; otherwise it runs the synchronous in-place reconfig. The active? decision is
+ * internal (was previously two separate C APIs dispatched by the caller).
+ *
+ * @param[in] pdh cuPHYDriver handler
+ * @param[in] cell_pinfo Cell PHY information structure with new configuration
+ * @return 0 on success, -1 on error.
+ */
+[[nodiscard]] int l1_cell_update_cell_config_caller_runs(phydriver_handle pdh, cell_phy_info& cell_pinfo);
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+/******************************************************************/ /**
+ * @brief Slot-boundary drain for the offload PRACH reconfig handover.
+ *
+ * Call once per SLOT.INDICATION on the message-processing thread. Lock-free no-op
+ * unless a handover is armed; otherwise swaps each idle pending PRACH aggregator
+ * to its new handle and commits the handover when all have drained.
+ *
+ * @param[in] pdh cuPHYDriver handler
+ */
+void l1_try_commit_prach_offload_handover(phydriver_handle pdh);
+#endif // ENABLE_FAPI_STORE_REPLAY
+
+/**
+ * @brief Check if the phyCellId can't be updated successfully
+ * @param pdh cuPHYDriver handler
+ * @param mplane_id M-plane identifier of the cell to update
+ * @param new_phy_cell_id New phyCellId
+ * @return true if the phyCellId can't be updated successfully
+ */
+bool l1_phy_cell_id_mismatch(phydriver_handle pdh, uint16_t mplane_id, uint16_t new_phy_cell_id);
 
 /******************************************************************/ /**
  * @brief Get PRACH starting RO (Resource Occasion) index
@@ -1104,17 +1461,69 @@ void l1_copy_TB_to_gpu_buf_thread_offload(phydriver_handle pdh, uint16_t phy_cel
  * @brief H2D copy thread function
  *
  * Thread function that processes transport block copy requests from the queue.
- * Runs continuously until context finalization, copying transport blocks from
- * host to device memory and recording completion events.
+ * Runs until the supplied @c std::stop_token is signalled (typically by
+ * @c PdschH2DCopyManager::stopThread() during teardown), copying transport
+ * blocks from host to device memory and recording completion events.
  *
- * @param[in] arg cuPHYDriver handler (phydriver_handle) passed as void*
- *
- * @return
- * \p nullptr on thread exit
+ * @param[in] pdh cuPHYDriver handle.
+ * @param[in] st  Cooperative-cancellation token from the owning @c std::jthread.
+ *                The loop exits cleanly when @c st.stop_requested() becomes true,
+ *                allowing the destructor to tear down the CUDA stream / events
+ *                without use-after-free.
  *
  * @sa ::l1_copy_TB_to_gpu_buf_thread_offload
  */
-void* l1_copy_TB_to_gpu_buf_thread_func(void* arg);
+void l1_copy_TB_to_gpu_buf_thread_func(phydriver_handle pdh, std::stop_token st);
+
+/******************************************************************/ /**
+ * @brief Phase 1 — stage one TB H2D descriptor (CPU-side batch accumulation).
+ *
+ * Resolves the PDSCH TB GPU pointer, sets @c enable_prepone_h2d_cpy, and appends
+ * a host-to-device copy descriptor via @c PhyDriverCtx::updateBatchedMemcpyInfo().
+ * No CUDA stream work is submitted; safe on the L2 message thread.
+ *
+ * @param[in]  pdh          Driver handle.
+ * @param[in]  phy_cell_id  Physical cell id (same as @c l1_copy_TB_to_gpu_buf_thread_offload).
+ * @param[in]  shm_src      Host pointer (nvipc @c data_buf); must remain valid until DMA completes.
+ * @param[in]  len          Length in bytes.
+ * @param[in]  slot_index   @c slot_in_frame % PDSCH_MAX_GPU_BUFFS (TB ring index).
+ * @param[out] gpu_buf_out  Written with the destination GPU pointer on success.
+ * @return @c CUPHY_STATUS_SUCCESS (0), or @c CUPHY_STATUS_INVALID_ARGUMENT if the cell or buffer is invalid (same encoding as @c cuphyStatus_t).
+ *         Return value must be checked.
+ */
+[[nodiscard]] int l1_stage_tb_h2d(phydriver_handle pdh,
+                                  uint16_t         phy_cell_id,
+                                  const uint8_t*   shm_src,
+                                  uint32_t         len,
+                                  uint8_t          slot_index,
+                                  uint8_t**        gpu_buf_out);
+
+/******************************************************************/ /**
+ * @brief Phase 2 — enqueue batched TB H2D on the driver H2D stream and record completion.
+ *
+ * Sequence: @c setCtx(), record start event, @c performBatchedMemcpy(),
+ * @c resetBatchedMemcpyBatches(), record complete event.
+ * The completion event is the same one @c phypdsch_aggr waits on before launching PDSCH kernels.
+ *
+ * @note On @c performBatchedMemcpy() failure the complete event is intentionally **not** recorded.
+ *       This allows the downstream @c cudaStreamWaitEvent in @c phypdsch_aggr to time out,
+ *       surfacing the true root cause rather than letting PDSCH run with corrupt TB data.
+ *
+ * @param[in] pdh            Driver handle.
+ * @param[in] slot_in_frame  Slot index within the radio frame (same as @c slot_indication::slot_).
+ * @return 0 (@c CUPHY_STATUS_SUCCESS) on success; non-zero @c cuphyStatus_t on DMA failure.
+ *         Return value must be checked.
+ */
+[[nodiscard]] int l1_launch_tb_h2d(phydriver_handle pdh, uint16_t slot_in_frame);
+
+/******************************************************************/ /**
+ * @brief Query whether the dedicated H2D copy thread is enabled (YAML @c enable_h2d_copy_thread).
+ *
+ * @param[in] pdh  Driver handle (resolved to @c PhyDriverCtx via @c StaticConversion).
+ * @return @c true if the legacy copy thread path is active; @c false if batched memcpy is driven inline,
+ *         or if @c pdctx is null. Return value must be checked.
+ */
+[[nodiscard]] bool l1_get_h2d_copy_thread_enable(phydriver_handle pdh);
 
 /******************************************************************/ /**
  * @brief Set H2D copy completion flag for current slot
@@ -1338,6 +1747,30 @@ int l1_get_ch_segment_proc_enable_info(phydriver_handle pdh, uint8_t* ch_seg_pro
  * \p Weighted average CFO enable flag (0=disabled, 1=enabled)
  */
 uint8_t l1_get_enable_weighted_average_cfo(phydriver_handle pdh);
+
+/******************************************************************/ /**
+ * @brief Get configured DL C-plane batch size (cells per batch)
+ *
+ * Retrieves the context-configured DL C-plane batch size from cuphydriver.
+ *
+ * @param[in] pdh cuPHYDriver handler
+ *
+ * @return
+ * \p DL C-plane batch size (0 means invalid/sentinel -> one batch behavior)
+ */
+[[nodiscard]] uint8_t l1_get_cplane_processing_dl_batch_size(phydriver_handle pdh);
+
+/******************************************************************/ /**
+ * @brief Get configured UL C-plane batch size (cells per batch)
+ *
+ * Retrieves the context-configured UL C-plane batch size from cuphydriver.
+ *
+ * @param[in] pdh cuPHYDriver handler
+ *
+ * @return
+ * \p UL C-plane batch size (0 means invalid/sentinel -> one batch behavior)
+ */
+[[nodiscard]] uint8_t l1_get_cplane_processing_ul_batch_size(phydriver_handle pdh);
 
 /******************************************************************/ /**
  * @brief Get DL TX notification enable status
@@ -1671,4 +2104,257 @@ int l1_bfw_coeff_retrieve_buffer(phydriver_handle pdh, uint32_t cell_id, struct 
  * \p true if split UL CUDA streams enabled, false otherwise
  */
 bool l1_get_split_ul_cuda_streams(phydriver_handle pdh);
+
+/******************************************************************/ /**
+ * @brief Initialize the CPlaneGenerator
+ *
+ * Constructs a CPlaneGenerator from all configured cells' parameters.
+ * Must be called after all cells are created and configured.
+ * Only active when fapi_to_cplane_direct is true.
+ *
+ * @param[in] pdh cuPHYDriver handler
+ * @param[in] bf_enabled Beamforming enabled flag
+ * @param[in] precoding_enabled Precoding enabled flag
+ *
+ * @return
+ * \p 0 on success, non-zero on error; return value must be checked.
+ */
+[[nodiscard]] int l1_init_cplane_generator(phydriver_handle pdh,
+                                           bool bf_enabled,
+                                           bool precoding_enabled);
+
+/******************************************************************/ /**
+ * Record one prior-slot direct BFW CVI completion for C-plane consumption.
+ *
+ * Routes a producer-built BFW completion record into the FrameworkCPlaneService
+ * per-cell DL/UL record store. Consumed the following slot by send_dl/ul_cplane.
+ * Only meaningful when mMIMO + fapi_to_cplane_direct are enabled.
+ *
+ * @param[in] pdh     cuPHYDriver handle.
+ * @param[in] cell_id SDK cell index the record belongs to.
+ * @param[in] record  Producer-built BFW completion record.
+ *
+ * @return
+ * \p 0 on success, non-zero on error; return value must be checked.
+ */
+[[nodiscard]] int l1_recordDirectBfwCviRecord(phydriver_handle pdh,
+                                              uint16_t cell_id,
+                                              const direct_bfw_cvi_record& record);
+
+namespace nv { struct phy_mac_msg_desc; }
+class SlotMapDl;
+class SlotMapUl;
+
+/**
+ * @brief Build and send DL C-plane from stored FAPI messages.
+ *
+ * @param[in] pdh cuPHYDriver handle.
+ * @param[in] dl_tti Stored DL_TTI.request descriptor; must be non-null.
+ * @param[in] ul_dci Stored UL_DCI.request descriptor; may be null.
+ * @param[in] transaction_id C-plane generator transaction id for this batch.
+ * @param[in] slot_map_dl Slot map used for DL C-plane completion accounting; may be null.
+ *
+ * @return
+ * \p 0 on success, non-zero on error; return value must be checked.
+ */
+[[nodiscard]] int l1_send_dl_cplane_from_stored_msg(phydriver_handle pdh,
+                                                     const nv::phy_mac_msg_desc* dl_tti,
+                                                     const nv::phy_mac_msg_desc* ul_dci,
+                                                     std::size_t transaction_id,
+                                                     SlotMapDl* slot_map_dl);
+
+/**
+ * @brief Build and send UL C-plane from a stored FAPI message.
+ *
+ * @param[in] pdh cuPHYDriver handle.
+ * @param[in] ul_tti Stored UL_TTI.request descriptor; must be non-null.
+ * @param[in] transaction_id C-plane generator transaction id for this batch.
+ * @param[in] slot_map_ul Slot map used for UL C-plane completion accounting; may be null.
+ *
+ * @return
+ * \p 0 on success, non-zero on error; return value must be checked.
+ */
+[[nodiscard]] int l1_send_ul_cplane_from_stored_msg(phydriver_handle pdh,
+                                                     const nv::phy_mac_msg_desc* ul_tti,
+                                                     std::size_t transaction_id,
+                                                     SlotMapUl* slot_map_ul);
+
+/**
+ * @brief Report whether direct FAPI-to-C-plane mode is enabled.
+ *
+ * @param[in] pdh cuPHYDriver handle.
+ *
+ * @return
+ * \p true when direct FAPI-to-C-plane mode is enabled, \p false otherwise.
+ */
+[[nodiscard]] bool l1_is_fapi_to_cplane_direct(phydriver_handle pdh);
+
+/**
+ * @brief Signal completion of one DL C-plane batch contribution.
+ *
+ * @param[in] slot_map_dl_ptr Opaque pointer to the slot's `SlotMapDl`; may be null.
+ * @param[in] batch_id        0-based batch index within this DL slot.
+ * @param[in] total_batches   Total planned DL batches for this slot.
+ * @param[in] n_cells_in_batch Number of cells processed by this batch.
+ * @param[in] direction       Direction marker from caller; expected @c CplaneBatchDirection::DOWNLINK.
+ * @return
+ * \p void.
+ */
+void l1_signal_dl_cplane_batch_done(void* slot_map_dl_ptr,
+                                    uint8_t batch_id,
+                                    uint8_t total_batches,
+                                    uint8_t n_cells_in_batch,
+                                    nv::CplaneBatchDirection direction);
+
+/**
+ * @brief Signal completion of one UL C-plane batch contribution.
+ *
+ * @param[in] slot_map_ul_ptr Opaque pointer to the slot's `SlotMapUl`; may be null.
+ * @param[in] batch_id        0-based batch index within this UL slot.
+ * @param[in] total_batches   Total planned UL batches for this slot.
+ * @param[in] n_cells_in_batch Number of cells processed by this batch.
+ * @param[in] direction       Direction marker from caller; expected @c CplaneBatchDirection::UPLINK.
+ * @return
+ * \p void.
+ */
+void l1_signal_ul_cplane_batch_done(void* slot_map_ul_ptr,
+                                    uint8_t batch_id,
+                                    uint8_t total_batches,
+                                    uint8_t n_cells_in_batch,
+                                    nv::CplaneBatchDirection direction);
+
+/**
+ * @brief Direction-specific batch-end error handler — UL.
+ *
+ * Invoked by @c task_work_fn_cplane_batch when one or more cells in a UL
+ * C-plane batch returned a non-zero code from @c process_cell (e.g., a
+ * timing-window failure from @c framework_cplane_service::send_ul_cplane).
+ *
+ *   1. Reach @c PhyDriverCtx via @c SlotMapUl::getPhyDriverHandler().
+ *   2. Fetch @c ul_slot_callbacks; call @c ul_tx_error_fn() with the failed
+ *      cell-ID list and @c SCF_ERROR_CODE_L1_UL_CPLANE_TX_ERROR so L2 can
+ *      drop the in-flight UL_TTI.req.
+ *   3. Call @c SlotMapUl::abortTasks() so downstream pipeline waits unblock.
+ *
+ * @note Abort-state lifecycle invariant: @c abortTasks() sets the slot map's
+ *       @c task_current_number atomic to -1; only @c SlotMapUl::release()
+ *       resets it (back to 0) at slot teardown. @c release() is invoked from
+ *       @c task_work_function_ul_aggr_3_srs only after @c waitSlotEndTask()
+ *       drains all downstream UL end-task signals. Because the framework
+ *       C-plane batch is queued from the same EOM entry point as the legacy
+ *       UL aggregator chain (see @c enqueue_channel_tasks) and contributes
+ *       its own end-task signal via @c l1_signal_ul_cplane_batch_done's
+ *       @c addSlotEndTask(), @c release() cannot run before the abort has
+ *       been observed by every downstream waiter. Reordering the framework
+ *       batch to run after @c release() in a future change would invalidate
+ *       this guarantee.
+ *
+ * Wired into @c CplaneBatchTaskArg::on_batch_error via
+ * @c PHY_module::UlcBatchPolicy::on_batch_error_fn().
+ *
+ * Safe to call with @c slot_map_ul_ptr == nullptr or @c err_count == 0 (no-op).
+ *
+ * @param[in] slot_map_ul_ptr Opaque pointer cast to @c SlotMapUl* internally.
+ * @param[in] err_cell_ids    Failing cell IDs from the dispatcher's stack-local array.
+ */
+void l1_handle_ul_cplane_batch_error(void* slot_map_ul_ptr,
+                                     std::span<const uint32_t> err_cell_ids);
+
+/**
+ * @brief Direction-specific batch-end error handler — DL.
+ *
+ * Invoked by @c task_work_fn_cplane_batch when one or more cells in a DL
+ * C-plane batch returned a non-zero code from @c process_cell (e.g., a
+ * timing-window failure from @c framework_cplane_service::send_dl_cplane).
+ *
+ * @note No @c abortTasks() step in the DL path: @c SlotMapDl exposes no
+ *       such facility, and legacy DL cleanup likewise omits it - L2
+ *       notification only.
+ *
+ * Wired into @c CplaneBatchTaskArg::on_batch_error via
+ * @c PHY_module::DlcBatchPolicy::on_batch_error_fn().
+ *
+ * Safe to call with @c slot_map_dl_ptr == nullptr or @c err_count == 0 (no-op).
+ *
+ * @param[in] slot_map_dl_ptr Opaque pointer cast to @c SlotMapDl* internally.
+ * @param[in] err_cell_ids    Failing cell IDs from the dispatcher's stack-local array.
+ */
+void l1_handle_dl_cplane_batch_error(void* slot_map_dl_ptr,
+                                     std::span<const uint32_t> err_cell_ids);
+
+/**
+ * @brief Stash the path-aware DL C-plane contributor count on a slot map.
+ *
+ * Called by @c PHY_module::fire_cplane_batch each time it schedules a DL batch
+ * task — passes the running @c batch_count for that ring slot.  After the
+ * final batch fires (at EOM-flush), the slot map holds the total number of
+ * batches that will run for the slot, which DL task bodies read via
+ * @c SlotMapDl::getNumDlcTasks().
+ *
+ * Pattern mirrors @c l1_signal_dl_cplane_batch_done — opaque @c void* in,
+ * type-cast inside cuphydriver_api so that @c PHY_module does not depend on
+ * the cuphydriver-side @c SlotMapDl header.
+ *
+ * Safe to call with @c slot_map_dl_ptr == nullptr (no-op).
+ *
+ * @param slot_map_dl_ptr  Opaque pointer cast to @c SlotMapDl* internally.
+ * @param count            Path-aware DL C-plane contributor count.
+ */
+void l1_set_num_dlc_tasks_for_slot(void* slot_map_dl_ptr, int count);
+
+/**
+ * @brief Stash the path-aware UL C-plane contributor count on a slot map.
+ *
+ * UL twin of @c l1_set_num_dlc_tasks_for_slot.  Called by
+ * @c PHY_module::fire_cplane_batch each time it schedules a UL batch task.
+ * UL task bodies read via @c SlotMapUl::getNumUlcTasks().
+ *
+ * Safe to call with @c slot_map_ul_ptr == nullptr (no-op).
+ */
+void l1_set_num_ulc_tasks_for_slot(void* slot_map_ul_ptr, int count);
+
+/**
+ * @brief Early-reserved DL/UL C-plane slot-map pointers for one slot.
+ *
+ * `dl` and `ul` are null when the corresponding direction is not reserved.
+ */
+struct EarlyCplaneSlotMaps {
+    SlotMapDl* dl{};   //!< Early-reserved DL slot map, or nullptr if no DL cells / feature disabled
+    SlotMapUl* ul{};   //!< Early-reserved UL slot map, or nullptr if no UL cells / feature disabled
+};
+
+/**
+ * Reserve and pre-populate DL/UL SlotMaps for the fapi-to-cplane-direct path.
+ *
+ * For each bit set in dl_cell_bitmap / ul_cell_bitmap (indexed by Cell::getIdx()),
+ * pulls the next slot map from the pool, stamps it with the 3GPP slot (sfn, slot, t0),
+ * registers the cell in aggr_cell_list, and seeds a single task timestamp at
+ * tick_original for DL and tick_original + tti_ns for UL (tick_original derived
+ * from t0 and slot_advance). Every DL cell reserves its next DL output buffer;
+ * this is also required for UL_DCI-only cells because PDCCH produces downlink IQ.
+ * UL additionally resizes per-cell aggr_ulbuf_* / num_prach_occa vectors to the
+ * UL cell count. The reserved maps are published via
+ * PhyDriverCtx::setEarlySlotMapDl / setEarlySlotMapUl for downstream consumption
+ * by l1_enqueue_phy_work.
+ *
+ * No-op (returns {nullptr, nullptr}) when pdh is invalid or
+ * PhyDriverCtx::isFapiToCplaneDirect() is false.
+ *
+ * @param[in] pdh            cuPHYDriver handle.
+ * @param[in] sfn            System frame number for this slot.
+ * @param[in] slot           Slot index within the frame.
+ * @param[in] t0             T0 timing reference (absolute nanoseconds).
+ * @param[in] dl_cell_bitmap Bitmask of DL C-plane active cells (bit N corresponds to cell index N).
+ * @param[in] ul_cell_bitmap Bitmask of UL-active cells (bit N corresponds to cell index N).
+ * @return EarlyCplaneSlotMaps; dl/ul pointers are non-null only when the
+ *         corresponding bitmap is non-zero and a slot map was successfully
+ *         reserved; return value must be checked.
+ */
+[[nodiscard]] EarlyCplaneSlotMaps l1_setup_early_cplane_slot_maps(
+    phydriver_handle pdh,
+    uint16_t sfn, uint16_t slot,
+    std::chrono::nanoseconds t0,
+    uint64_t dl_cell_bitmap,
+    uint64_t ul_cell_bitmap);
+
 #endif

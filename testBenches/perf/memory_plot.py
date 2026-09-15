@@ -66,6 +66,8 @@ import argparse
 import numpy as np
 import os
 
+from util import to_float, to_int, well_formed_samples
+
 base = argparse.ArgumentParser()
 base.add_argument(
     "--filenames",
@@ -109,68 +111,76 @@ for filename in args.filenames:
             except json.JSONDecodeError as e:
                 print(f"Error parsing JSON from {filename}: {e}")
                 continue
-            
-            gpu_freq.extend([int(x[0]) for x in data[cells]])
-            mem_freq.extend([int(x[1]) for x in data[cells]])
-            mem_used.extend([float(x[3]) for x in data[cells]])
-            
+
+            samples = data.get(cells)
+            if samples is None:
+                print(f"  [{filename}] missing cell key '{cells}', skipping")
+                continue
+
+            well_formed, skipped = well_formed_samples(samples, min_fields=4)
+            if skipped:
+                print(f"  [{filename}] {skipped} malformed sample row(s) skipped (need >=4 fields)")
+
+            raw_gpu_freq = [to_int(x[0]) for x in well_formed]
+            raw_mem_freq = [to_int(x[1]) for x in well_formed]
+            na_gpu = sum(1 for v in raw_gpu_freq if v is None)
+            na_mem = sum(1 for v in raw_mem_freq if v is None)
+            if na_gpu:
+                print(f"  [{filename}] {na_gpu} GPU freq sample(s) reported N/A")
+            if na_mem:
+                print(f"  [{filename}] {na_mem} mem freq sample(s) reported N/A")
+
+            gpu_freq.extend([v for v in raw_gpu_freq if v is not None])
+            mem_freq.extend([v for v in raw_mem_freq if v is not None])
+            mem_used.extend([to_float(x[3]) for x in well_formed])
+
             # Add test config once per file, not for each data point
             testConfig.append(data['testConfig']['gpuName'] + ' ' + str(data['testConfig']['sweeps']) + ' slots')
-            
+
     except IOError as e:
         print(f"Error opening file {filename}: {e}")
         continue
 
-# Validate that we have data before computing statistics
-if not mem_used:
-    print("Warning: No memory usage data loaded. Skipping memory statistics.")
-    max_mem_used = 0
-else:
-    max_mem_used = np.max(mem_used)
+valid_mem_used = [v for v in mem_used if not np.isnan(v)]
+max_mem_used = np.max(valid_mem_used) if valid_mem_used else None
+std_mem_freq = np.std(mem_freq) if mem_freq else None
 
-if not mem_freq:
-    print("Warning: No memory frequency data loaded. Skipping frequency statistics.")
-    std_mem_freq = 0
-else:
-    std_mem_freq = np.std(mem_freq)
+if max_mem_used is not None or std_mem_freq is not None:
+    parts = []
+    parts.append(f"Maximum memory used: {max_mem_used} MiB" if max_mem_used is not None else "Maximum memory used: N/A")
+    parts.append(f"Memory frequency std.: {std_mem_freq}" if std_mem_freq is not None else "Memory frequency std.: N/A")
+    print(", ".join(parts))
 
-# Only print statistics if we have data
-if mem_used or mem_freq:
-    print(f"Maximum memory used: {max_mem_used} MiB, Memory frequency std.: {std_mem_freq}")
-else:
-    print("No data was successfully loaded from any files.")
+if mem_freq or valid_mem_used:
+    plt.subplots(1, 2, figsize=(2 * 7.2, 4.8))
+    plt.subplot(1, 2, 1)
+    if mem_freq:
+        y, x = np.histogram(mem_freq, bins=1000)
+        cy = np.cumsum(y) / len(mem_freq)
+        plt.plot(x[1:], cy)
+        folder, _ = os.path.split(args.filenames[0])
+        if folder.split("/")[-1].isnumeric():
+            plt.legend(["Mem. Freq. capped at " + folder.split("/")[-1] + " MHz"])
+    else:
+        plt.text(0.5, 0.5, "N/A", ha="center", va="center", transform=plt.gca().transAxes)
+    plt.grid(True)
+    plt.xlabel("Memory Frequency Cont. Load [MHz]")
+    plt.ylabel("CDF")
 
-plt.subplots(1, 2, figsize=(2 * 7.2, 4.8))
-plt.subplot(1, 2, 1)
-y, x = np.histogram(mem_freq, bins=1000)
-if len(mem_freq) > 0:
-    cy = np.cumsum(y) / len(mem_freq)
-else:
-    cy = np.array([])
+    plt.subplot(1, 2, 2)
+    plt.grid(True)
+    valid_mem_points = [(i, v) for i, v in enumerate(mem_used) if not np.isnan(v)]
+    if valid_mem_points:
+        idx = [i for i, _ in valid_mem_points]
+        vals = [v for _, v in valid_mem_points]
+        plt.plot(np.array(idx) * 1e-3, vals)
+    else:
+        plt.text(0.5, 0.5, "N/A", ha="center", va="center", transform=plt.gca().transAxes)
+    plt.xlabel("Time [s]")
+    plt.ylabel("Memory Used [MiB]")
 
-plt.plot(x[1:], cy)
-plt.grid(True)
-plt.xlabel("Memory Frequency Cont. Load [MHz]")
-plt.ylabel("CDF")
+    if not args.is_short_legend:
+        plt.legend(testConfig)
 
-folder, _ = os.path.split(args.filenames[0])
-if folder.split("/")[-1].isnumeric():
-    plt.legend(["Mem. Freq. capped at " + folder.split("/")[-1] + " MHz"])
-
-plt.subplot(1, 2, 2)
-plt.grid(True)
-plt.plot(np.arange(0, len(mem_used)) * 1e-3, mem_used)
-plt.xlabel("Time [s]")
-plt.ylabel("Memory Used [MiB]")
-
-if not args.is_short_legend:
-    plt.legend(testConfig) # add info for each data
-    
-# plt.figure()
-# plt.grid(True)
-# plt.plot(np.arange(0, len(gpu_freq)) * 10e-3, gpu_freq)
-# plt.xlabel("Time [s]")
-# plt.ylabel("GPU Frequency [MHz]")
-
-plt.savefig("memory.png")
-# plt.show()
+    plt.savefig("memory.png")
+    # plt.show()

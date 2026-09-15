@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -90,9 +90,9 @@ soft_demapper_context::soft_demapper_context() :
 
 ////////////////////////////////////////////////////////////////////////
 // soft_demapper_kernel()
-template <typename TSymbol, typename TLLR>
+template <typename TNoise, typename TLLR, typename TSymbol>
 __global__ void soft_demapper_kernel(cudaTextureObject_t                   texObj,
-                                     float                                 noiseInv,
+                                     TNoise                                PAM_noise_inv,
                                      int                                   QAM_bits,
                                      tensor_ref_t_contig_2D<TLLR>          tLLR,
                                      tensor_ref_t_contig_2D<const TSymbol> tSym)
@@ -100,7 +100,6 @@ __global__ void soft_demapper_kernel(cudaTextureObject_t                   texOb
     typedef typename scalar_from_complex<TSymbol>::type             symbol_scalar_t;
     typedef soft_demapper::soft_demapper_any<symbol_scalar_t, TLLR> soft_demapper_t;
     typedef soft_demapper::LLR_group<TLLR, 8>                       llr_group_t;
-    typedef soft_demapper::noise_type_map<TLLR>                     noise_type_map_t;
 
     // LLR output structure. Up to 8 LLRs may be required (for QAM256).
     llr_group_t grp;
@@ -118,15 +117,14 @@ __global__ void soft_demapper_kernel(cudaTextureObject_t                   texOb
     // noiseInv input is the inverse of the (complex, QAM) noise variance
     // PAM_variance = QAM_variance / 2
     // 1 / PAM_variance = inv_PAM_variance = 2 / QAM_variance = 2 * inv_QAM_variance
-    soft_demapper_t::symbol_to_LLR_group(grp,                                     // LLR output
-                                         softEst,                                 // symbol input
-                                         noise_type_map_t::scale(noiseInv, 2.0f), // PAM noise var inverse
-                                         QAM_bits,                                // QAM bits
-                                         texObj);                                 // CUDA texture object
-    KERNEL_PRINT_GRID_ONCE("LLR_tex = (%f, %f), noiseInv = %f --> (%f %f %f %f  %f %f %f %f)\n",
+    soft_demapper_t::symbol_to_LLR_group(grp,           // LLR output
+                                         softEst,       // symbol input
+                                         PAM_noise_inv, // PAM noise var inverse
+                                         QAM_bits,      // QAM bits
+                                         texObj);       // CUDA texture object
+    KERNEL_PRINT_GRID_ONCE("LLR_tex = (%f, %f) --> (%f %f %f %f  %f %f %f %f)\n",
                            (float)softEst.x,
                            (float)softEst.y,
-                           noiseInv,
                            grp[0],
                            grp[1],
                            grp[2],
@@ -135,8 +133,7 @@ __global__ void soft_demapper_kernel(cudaTextureObject_t                   texOb
                            grp[5],
                            grp[6],
                            grp[7]);
-    // Write to output (global) memory. Note that as written below, this writes
-    // all 8 values, whether valid for the given QAM or not.
+    // Write to output (global) memory.
     grp.write(tLLR.addr() + tLLR.layout().offset({SYMBOL_IDX * QAM_bits, COLUMN_IDX}), QAM_bits);
 
 }
@@ -170,11 +167,18 @@ cuphyStatus_t launch_soft_demapper_kernel(const dim3&         grdDim,
         return CUPHY_STATUS_UNSUPPORTED_LAYOUT;
     }
     //------------------------------------------------------------------
-    soft_demapper_kernel<symbol_t, llr_t><<<grdDim, blkDim, 0, strm>>>(texObj,               // texture object
-                                                                       1.0f / noiseVariance, // inv_QAM_variance
-                                                                       log2_QAM,             // QAM_bits
-                                                                       tLLROpt.value(),      // LLR tensor
-                                                                       tSymOpt.value());     // symbols tensor
+    // noiseInv input is the inverse of the (complex, QAM) noise variance
+    // PAM_variance = QAM_variance / 2
+    // 1 / PAM_variance = inv_PAM_variance = 2 / QAM_variance = 2 * inv_QAM_variance
+    float inv_QAM_variance = 1.0f / noiseVariance;
+    float inv_PAM_variance = 2.0f * inv_QAM_variance;
+    //------------------------------------------------------------------
+    //soft_demapper_kernel<symbol_t, llr_t><<<grdDim, blkDim, 0, strm>>>(texObj,               // texture object
+    soft_demapper_kernel<<<grdDim, blkDim, 0, strm>>>(texObj,           // texture object
+                                                      inv_PAM_variance, // inv_PAM_variance
+                                                      log2_QAM,         // QAM_bits
+                                                      tLLROpt.value(),  // LLR tensor
+                                                      tSymOpt.value()); // symbols tensor
                                                                        
     cudaError_t err = cudaGetLastError();
     if(err != cudaSuccess)
@@ -271,6 +275,64 @@ cuphyStatus_t soft_demap(context&     ctx,
                                                                    log2_QAM,
                                                                    noiseVariance,
                                                                    strm);
+        }
+    }
+    else if(CUPHY_R_8F_E4M3 == tLLR.type())
+    {
+        if(CUPHY_C_16F == tSym.type())
+        {
+            s = launch_soft_demapper_kernel<__half2, __nv_fp8_e4m3>(grdDim,
+                                                                    blkDim,
+                                                                    ctx.soft_demapper_ctx().QAM_tex().tex_obj().handle(),
+                                                                    tLLR,
+                                                                    pLLR,
+                                                                    tSym,
+                                                                    pSym,
+                                                                    log2_QAM,
+                                                                    noiseVariance,
+                                                                    strm);
+        }
+        else if(CUPHY_C_32F == tSym.type())
+        {
+            s = launch_soft_demapper_kernel<cuFloatComplex, __nv_fp8_e4m3>(grdDim,
+                                                                           blkDim,
+                                                                           ctx.soft_demapper_ctx().QAM_tex().tex_obj().handle(),
+                                                                           tLLR,
+                                                                           pLLR,
+                                                                           tSym,
+                                                                           pSym,
+                                                                           log2_QAM,
+                                                                           noiseVariance,
+                                                                           strm);
+        }
+    }
+    else if(CUPHY_R_8F_E5M2 == tLLR.type())
+    {
+        if(CUPHY_C_16F == tSym.type())
+        {
+            s = launch_soft_demapper_kernel<__half2, __nv_fp8_e5m2>(grdDim,
+                                                                    blkDim,
+                                                                    ctx.soft_demapper_ctx().QAM_tex().tex_obj().handle(),
+                                                                    tLLR,
+                                                                    pLLR,
+                                                                    tSym,
+                                                                    pSym,
+                                                                    log2_QAM,
+                                                                    noiseVariance,
+                                                                    strm);
+        }
+        else if(CUPHY_C_32F == tSym.type())
+        {
+            s = launch_soft_demapper_kernel<cuFloatComplex, __nv_fp8_e5m2>(grdDim,
+                                                                           blkDim,
+                                                                           ctx.soft_demapper_ctx().QAM_tex().tex_obj().handle(),
+                                                                           tLLR,
+                                                                           pLLR,
+                                                                           tSym,
+                                                                           pSym,
+                                                                           log2_QAM,
+                                                                           noiseVariance,
+                                                                           strm);
         }
     }
     if(CUPHY_STATUS_SUCCESS != s)

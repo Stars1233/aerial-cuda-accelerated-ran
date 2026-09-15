@@ -25,7 +25,9 @@
 #include "app_config.hpp"
 #include "app_utils.hpp"
 #include "constant.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "context.hpp"
+#include "framework_cplane_service.hpp"
 #include "time.hpp"
 #include "task.hpp"
 #include "cell.hpp"
@@ -39,6 +41,7 @@
 #include "nvlog.hpp"
 #include "cuphyoam.hpp"
 #include "oran_utils/conversion.hpp"
+#include "aerial/casts/casts.hpp"  // aerial::casts::assume_cast (alignment-checked)
 #include <cuda_profiler_api.h>
 #include <unistd.h>
 #include "scf_5g_fapi.h"
@@ -47,6 +50,19 @@
 
 #include "ptp_service_status_checking.hpp"
 #include "rhocp_ptp_event_consumer.hpp"
+#include "enum_utils.hpp"
+#include <algorithm>
+#include <range/v3/view/enumerate.hpp>
+
+// Verify that the manually duplicated constant in compression_types.hpp stays in sync with
+// the UserDataCompressionMethod enum in aerial-fh-driver/api.hpp.
+// RESERVED (0b0111 = 7) is the first invalid enumerator, so its value equals the count of
+// valid compression methods. If a new method is inserted before RESERVED, this fires.
+static_assert(
+    NUM_USER_DATA_COMPRESSION_METHODS ==
+        static_cast<std::size_t>(aerial_fh::UserDataCompressionMethod::RESERVED),
+    "NUM_USER_DATA_COMPRESSION_METHODS in compression_types.hpp is out of sync with "
+    "UserDataCompressionMethod in aerial-fh-driver/api.hpp - update both together");
 
 #define COMBINE_DL_TASKS_WITH_GPU_INIT_COMMS 0
 
@@ -349,24 +365,984 @@ int get_num_dlc_tasks(int num_workers,bool commViaCpu, uint8_t mMIMO_enable) {
         return num_workers-1;
 }
 
-int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_command* sc)
+/// Returns true when @p flag is set in @p mask (i.e. that task category should be skipped).
+/// @c EnqueueSkipMask is defined in cuphydriver_api.hpp (public API header).
+[[nodiscard]] static bool skip_flag(EnqueueSkipMask mask, EnqueueSkipMask flag) noexcept
+{
+    return (to_underlying(mask) & to_underlying(flag)) != 0;
+}
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Enqueue helper types (TU-private): per-slot aggregator-pointer bundles, the
+// DL layout bundle, and the shared timing+enqueue TaskRegistry.  Used only by the
+// UL/DL emit helpers and enqueue_{ul,dl}_tasks below.
+// ---------------------------------------------------------------------------
+
+/// UL aggregator pointers for a slot (nullptr when that channel is not scheduled).
+/// Collated so the UL emit helpers take one argument instead of five.
+struct UlAggrPtrs final
+{
+    PhyPuschAggr* pusch = nullptr;
+    PhyPucchAggr* pucch = nullptr;
+    PhyPrachAggr* prach = nullptr;
+    PhySrsAggr*   srs   = nullptr;
+    PhyUlBfwAggr* ulbfw = nullptr;
+
+    /// True when SRS is the only scheduled UL channel.
+    [[nodiscard]] bool isSrsOnly() const noexcept
+    {
+        return srs != nullptr && pusch == nullptr && pucch == nullptr && prach == nullptr;
+    }
+};
+
+/// DL aggregator pointers for a slot (nullptr when that channel is not scheduled).
+/// Collated so the DL emit helpers take one argument instead of six.
+struct DlAggrPtrs final
+{
+    PhyPdschAggr* pdsch    = nullptr;
+    PhyPdcchAggr* pdcch_dl = nullptr;
+    PhyPdcchAggr* pdcch_ul = nullptr;
+    PhyPbchAggr*  pbch     = nullptr;
+    PhyCsiRsAggr* csirs    = nullptr;
+    PhyDlBfwAggr* dlbfw    = nullptr;
+
+    /// True when DL BFW is the only scheduled DL work.
+    [[nodiscard]] bool dlbfwOnly() const noexcept
+    {
+        return dlbfw != nullptr && !(pdsch || pdcch_dl || pdcch_ul || pbch || csirs);
+    }
+    /// True when any control-plane DL channel (PDCCH DL/UL or PBCH) is scheduled.
+    [[nodiscard]] bool hasControl() const noexcept
+    {
+        return pdcch_dl || pdcch_ul || pbch;
+    }
+};
+
+/// DL worker/layout configuration for a slot (collated to keep emit args small).
+/// gpu_via_cpu/mMIMO/gpu_dl cache the corresponding PhyDriverCtx flags once per
+/// slot so the emit helpers and set_dl_wait_counts don't re-read them through the
+/// (out-of-line) accessors on every use.
+struct DlLayout final
+{
+    int  num_cells        = 0;
+    int  num_dlc_tasks    = 0;
+    int  num_dl_workers   = 0;
+    int  dl_worker_offset = 0;
+    int  dlbfw_core_index = 0;
+    bool single_dl_worker = false;
+    bool enable_affinity  = false;
+    bool gpu_via_cpu      = false;
+    bool mMIMO            = false;
+    bool gpu_dl           = false;
+};
+
+/**
+ * @brief Co-locates task timing with task creation for a UL or DL slot map.
+ *
+ * One @c addTask() assigns the task's launch timestamp into @c task_ts_exec AND
+ * creates+inits the task with that timestamp, then advances @c task_index — so
+ * the timing and the enqueue for a task live at one call site.  Direction-specific
+ * behaviour is expressed via defaulted args rather than separate types:
+ *   - @p w is the worker affinity (0 = none, the UL default).
+ *   - @p offset_by_index selects the usual per-task stagger (ts + task_index) vs.
+ *     a raw timestamp (used by TaskDL3Aggr).
+ * Task counts are published on the slot map (setTasksTs) and read by task bodies
+ * via SlotMap{Ul,Dl}::getNumTasks(), so the init's third int is the vestigial
+ * count slot.  Instantiated as @c UlTaskRegistry / @c DlTaskRegistry below.
+ */
+template <typename SlotMapT>
+struct TaskRegistry final
+{
+    PhyDriverCtx* pdctx    = nullptr;                       // non-owning observer (Task pool owner)
+    SlotMapT*     slot_map = nullptr;                       // non-owning observer
+    // +1 vs task_ptr_list to match SlotMap{Ul,Dl}::setTasksTs() / the slot map's
+    // tasks_ts_exec (std::array<t_ns, TASK_MAX_PER_SLOT + 1>), into which it is copied
+    // wholesale; only [0..task_index) is ever populated.
+    std::array<t_ns, TASK_MAX_PER_SLOT + 1> task_ts_exec;   // owned: per-task launch timestamps (published via setTasksTs)
+    std::array<Task*, TASK_MAX_PER_SLOT>    task_ptr_list;  // owned: per-task pointers, drained to the TaskList after emission
+    int           task_index = 0;
+
+    /// The working arrays are intentionally left uninitialized; only [0..task_index) is written/read.
+    TaskRegistry(PhyDriverCtx* p, SlotMapT* sm) : pdctx(p), slot_map(sm) {}
+
+    // Single-use, drained once into the TaskList; non-owning Task* must not be duplicated.
+    TaskRegistry(const TaskRegistry&)            = delete;
+    TaskRegistry& operator=(const TaskRegistry&) = delete;
+    TaskRegistry(TaskRegistry&&)                 = delete;
+    TaskRegistry& operator=(TaskRegistry&&)      = delete;
+
+    template <typename Fn>
+    [[nodiscard]] bool addTask(t_ns ts, const char* name, Fn work_fn, int a, int b, int c,
+                            worker_id w = 0, bool offset_by_index = true)
+    {
+        if (task_index >= TASK_MAX_PER_SLOT) [[unlikely]]
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds TASK_MAX_PER_SLOT! Unable to enqueue {} task", name);
+            return false;
+        }
+        task_ts_exec[task_index]  = ts;
+        task_ptr_list[task_index] = pdctx->getNextTask();
+        const t_ns dispatch = offset_by_index ? ts + static_cast<t_ns>(task_index) : ts;
+        task_ptr_list[task_index]->init(dispatch, name, work_fn, static_cast<void*>(slot_map), a, b, c, w);
+        ++task_index;
+        return true;
+    }
+};
+
+using UlTaskRegistry = TaskRegistry<SlotMapUl>;
+using DlTaskRegistry = TaskRegistry<SlotMapDl>;
+
+/// Format "<prefix><idx>" into @p buf (NUL-terminated) for a per-task name.
+template <std::size_t N>
+void format_indexed_task_name(char (&buf)[N], std::string_view prefix, int idx)
+{
+    // format_to_n writes at most N-1 chars and returns .out one past the last char
+    // written; reserve the final byte for the NUL. Over-long names truncate silently,
+    // which is acceptable for trace-only task names.
+    *fmt::format_to_n(buf, N - 1, "{}{}", prefix, idx).out = '\0';
+}
+
+/// Emit UL C-plane tasks (legacy path only).  Skipped under SKIP_UL_CPLANE
+/// (the fapi_to_cplane_direct path emits UL C-plane via fire_cplane_batch).
+[[nodiscard]] bool emit_ul_cplane(
+    UlTaskRegistry& b, slot_command_api::slot_command* const sc,
+    const bool skip_ul_cplane, const int num_ulc_tasks)
+{
+    if (skip_ul_cplane)
+    {
+        return true;
+    }
+
+    const t_ns cplane_ts = sc->tick_original + t_ns(Cell::getTtiNsFromMu(MU_SUPPORTED));
+    for (int c = 0; c < num_ulc_tasks; c++)
+    {
+        char buf[32];
+        format_indexed_task_name(buf, "TaskUL1AggrCplane", c + 1);
+        if (!b.addTask(cplane_ts, buf, task_work_function_ul_aggr_1_cplane, c, 0, num_ulc_tasks))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Order-kernel path when OK testbench mode is enabled: single Order Kernel only.
+[[nodiscard]] bool emit_ul_order_kernel_tb(
+    UlTaskRegistry& b, const uint64_t t0_slot, const UlAggrPtrs& aggr)
+{
+    const t_ns ok_ts = t_ns(t0_slot - UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
+    return b.addTask(ok_ts, "TaskUL1AggrOrderkernel1",
+                     task_work_function_ul_aggr_1_orderKernel, 0, 1, aggr.isSrsOnly() ? 1 : 0);
+}
+
+/// Order-kernel path for normal (non-TB) operation: one or two Order Kernel tasks.
+[[nodiscard]] bool emit_ul_order_kernel(
+    UlTaskRegistry& b, PhyDriverCtx* const pdctx, const uint64_t t0_slot,
+    const ru_type ru_type_for_srs_proc, const UlAggrPtrs& aggr)
+{
+    const bool isSrsOnly = aggr.isSrsOnly();
+    const t_ns ok_nonsrs = t_ns(t0_slot - UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
+    const t_ns ok_srs    = pdctx->gpuCommEnabledViaCpu()
+                               ? t_ns(t0_slot + pdctx->getUlSrsTask1OrderLaunchOffsetNs())
+                               : t_ns(t0_slot + UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
+
+    if (aggr.srs && (ru_type_for_srs_proc != SINGLE_SECT_MODE))
+    {
+        if (isSrsOnly)
+        {
+            // Single SRS only OK
+            return b.addTask(ok_srs, "TaskUL1AggrOrderkernel1",
+                             task_work_function_ul_aggr_1_orderKernel, 0, 1 /* OK Task # */, 1 /* isSRS */);
+        }
+        // If other channels are present along with SRS, enqueue a non-SRS OK along with SRS OK as two
+        // separate tasks. 
+        if (!b.addTask(ok_nonsrs, "TaskUL1AggrOrderkernel1",
+                       task_work_function_ul_aggr_1_orderKernel, 0, 1 /* OK Task # */, 0 /* isSRS */))
+        {
+            return false;
+        }
+        return b.addTask(ok_srs, "TaskUL1AggrOrderkernel2",
+                         task_work_function_ul_aggr_1_orderKernel, 0, 2 /* OK Task # */, 1 /* isSRS */);
+    }
+    // Single non-SRS OK (or combined under SINGLE_SECT_MODE)
+    return b.addTask(ok_nonsrs, "TaskUL1AggrOrderkernel1",
+                     task_work_function_ul_aggr_1_orderKernel, 0, 1 /* OK Task # */, isSrsOnly ? 1 : 0);
+}
+
+/// Emit the UL channel tasks (non-orderKernel-TB path): PUCCH/PUSCH, UL2, Early-UCI,
+/// UL BFW, PRACH, SRS.  @p num_cells == slot_map_ul->getNumCells().
+[[nodiscard]] bool emit_ul_channel_tasks(
+    UlTaskRegistry& b, PhyDriverCtx* const pdctx, slot_command_api::slot_command* const sc,
+    const uint64_t t0_slot, const int num_cells, const UlAggrPtrs& aggr)
+{
+    if (aggr.pucch || aggr.pusch)
+    {
+        if (!b.addTask(t_ns(t0_slot - UL_TASK1_PUCCH_LAUNCH_OFFSET_FROM_T0_NS),
+                    "TaskUL1AggrPucchPusch", task_work_function_ul_aggr_1_pucch_pusch, 0, num_cells, 0))
+        {
+            return false;
+        }
+    }
+    if (pdctx->cpuCommEnabled())
+    {
+        if (!b.addTask(t_ns(t0_slot + UL_TASK2_OFFSET_FROM_T0_NS),
+                    "TaskUL2Aggr", task_work_function_ul_aggr_2, 0, num_cells, 0))
+        {
+            return false;
+        }
+    }
+    if (aggr.pusch)
+    {
+        // Early UCI
+        const t_ns early_uci_ts = t_ns(t0_slot + UL_TASK3_EARLY_UCI_IND_TASK_LAUNCH_OFFSET_FROM_T0_NS);
+
+        if (!b.addTask(early_uci_ts, "TaskUL3AggrEarlyUciInd", task_work_function_ul_aggr_3_early_uci_ind,
+                    0, num_cells, 0))
+        {
+            return false;
+        }
+    }
+    if (aggr.ulbfw)
+    {
+        // BFW: immediate action time; then UL3 BFW before T0.
+        if (!b.addTask(sc->tick_original, "TaskULAggrUlBfw", task_work_function_ul_aggr_bfw, 0, num_cells, 0))
+        {
+            return false;
+        }
+        if (!b.addTask(t_ns(t0_slot - UL_AGGR3_ULBFW_OFFSET_FROM_T0_NS),
+                    "TaskUL3AggrUlBfw", task_work_function_ul_aggr_3_ulbfw, 0, num_cells, 0))
+        {
+            return false;
+        }
+    }
+    if (aggr.prach)
+    {
+        if (!b.addTask(t_ns(t0_slot + Cell::getTtiNsFromMu(MU_SUPPORTED)),
+                    "TaskUL1AggrPrach", task_work_function_ul_aggr_1_prach, 0, num_cells, 0))
+        {
+            return false;
+        }
+    }
+    if (aggr.srs)
+    {
+        const t_ns srs_ts = pdctx->gpuCommEnabledViaCpu()
+            ? t_ns(t0_slot + pdctx->getUlSrsTask1OrderLaunchOffsetNs())
+            : t_ns(t0_slot + Cell::getTtiNsFromMu(MU_SUPPORTED));
+        if (!b.addTask(srs_ts, "TaskUL1AggrSrs", task_work_function_ul_aggr_1_srs, 0, num_cells, 0))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Emit UL3 wait/callback tasks (do-while over cell groups).
+[[nodiscard]] bool emit_ul_aggr3(
+    UlTaskRegistry& b, SlotMapUl* const slot_map_ul, const uint64_t t0_slot, const int num_cells)
+{
+    const t_ns ul3_ts = t_ns(t0_slot + UL_TASK3_AGGR3_OFFSET_FROM_T0_NS);
+    int first_cell = 0;
+    do
+    {
+        if (!b.addTask(ul3_ts, "TaskUL3Aggr", task_work_function_ul_aggr_3, first_cell, num_cells, 0))
+        {
+            return false;
+        }
+        first_cell += num_cells;
+    } while (first_cell < slot_map_ul->getNumCells() && b.task_index < TASK_MAX_PER_SLOT);
+    return true;
+}
+
+/// Emit UL3-SRS wait task (FX RU: dedicated AGGR3 awaiting SRS completion).
+[[nodiscard]] bool emit_ul_aggr3_srs(
+    UlTaskRegistry& b, PhyDriverCtx* const pdctx, SlotMapUl* const slot_map_ul,
+    const uint64_t t0_slot, const int num_cells)
+{
+    uint32_t task_offset_from_t0 =
+        (pdctx->getUlSrsAggr3TaskLaunchOffsetNs() > UL_TASK3_AGGR3_MAX_BACKOFF_FROM_SRS_COMPLETION_TH_NS)
+            ? UL_TASK3_AGGR3_MAX_BACKOFF_FROM_SRS_COMPLETION_TH_NS
+            : pdctx->getUlSrsAggr3TaskLaunchOffsetNs();
+    task_offset_from_t0 = SRS_COMPLETION_TH_FROM_T0_NS - task_offset_from_t0;
+    const t_ns ul3srs_ts = t_ns(t0_slot + task_offset_from_t0);
+    int first_cell = 0;
+    do
+    {
+        if (!b.addTask(ul3srs_ts, "TaskUL3AggrSrs", task_work_function_ul_aggr_3_srs, first_cell, num_cells, 0))
+        {
+            return false;
+        }
+        first_cell += num_cells;
+    } while (first_cell < slot_map_ul->getNumCells() && b.task_index < TASK_MAX_PER_SLOT);
+    return true;
+}
+
+} // namespace
+
+/**
+ * @brief UL phase of l1_enqueue_phy_work: emit (timestamp + create + enqueue) UL tasks.
+ *
+ * Single-pass co-location via UlTaskRegistry: each task's launch timestamp is
+ * assigned together with its creation/init (see emit_ul_* helpers).  The total
+ * UL task count is derived from the emission — @c task_index plus the fapi_to_cplane_direct
+ * virtual C-plane batch-done contributors (num_ulc_tasks under SKIP_UL_CPLANE) —
+ * and published via @c setTasksTs() before the tasks are pushed; UL3 / UL3-SRS
+ * read it via @c SlotMapUl::getNumTasks().  @p ul_task_count (the legacy
+ * pre-accumulated budget) is no longer used here.
+ *
+ * @return 0 on success; non-zero to request the caller's cleanup_err path.
+ */
+[[nodiscard]] static int enqueue_ul_tasks(
+    PhyDriverCtx* const                      pdctx,
+    SlotMapUl* const                         slot_map_ul,
+    slot_command_api::slot_command* const    sc,
+    const uint64_t                           t0_slot,
+    const EnqueueSkipMask                    skip_mask,
+    const bool                               en_orderKernel_tb,
+    const ru_type                            ru_type_for_srs_proc,
+    const UlAggrPtrs&                        aggr,
+    slot_params_aggr* const                  current_slot_params_aggr,
+    [[maybe_unused]] const int               ul_task_count)
+{
+    // UL slot reference time (L2A tick + 1 slot); see SlotMapUl::getSlotRefTs().
+    slot_map_ul->setSlotRefTs(sc->tick_original + t_ns(Cell::getTtiNsFromMu(MU_SUPPORTED)));
+
+    const bool skip_ul_cplane = skip_flag(skip_mask, EnqueueSkipMask::SKIP_UL_CPLANE);
+    
+    // In the non-FAPI to CplaneDirect path, the # of ULC tasks are to be recorded in the
+    // newly allocated slot_map. In the FAPI to CplaneDirect path, this is done by 
+    // l1_set_num_ulc_tasks_for_slot
+    if (!pdctx->isFapiToCplaneDirect())
+    {
+        slot_map_ul->setNumUlcTasks(get_num_ulc_tasks(pdctx->getNumULWorkers()));
+    }
+
+    const int num_ulc_tasks = slot_map_ul->getNumUlcTasks();
+
+    if (!(slot_map_ul->getNumCells() > 0 || aggr.ulbfw))
+    {
+        return 1;
+    }
+
+    if (slot_map_ul->aggrSetPhy(aggr.pusch, aggr.pucch, aggr.prach, aggr.srs, aggr.ulbfw, current_slot_params_aggr))
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SlotMapUL aggrSetPhy");
+        return 1;
+    }
+    // Skip enqueue if an L1 exit is in flight.
+    if (pExitHandler.test_exit_in_flight())
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "L1 Exit in flight during Slot Map {}", slot_map_ul->getId());
+        return 1;
+    }
+
+    const t_ns map_ul_start = Time::nowNs();
+    PUSH_RANGE_PHYDRV("SLOT_UL", 4);
+    const int num_cells = slot_map_ul->getNumCells();
+
+    UlTaskRegistry b{pdctx, slot_map_ul};
+
+    if (en_orderKernel_tb) [[unlikely]]
+    {
+        // OK testbench: C-plane + single Order Kernel + UL3 only.
+        if (!emit_ul_cplane(b, sc, skip_ul_cplane, num_ulc_tasks))
+        {
+            return 1;
+        }
+        if (!emit_ul_order_kernel_tb(b, t0_slot, aggr))
+        {
+            return 1;
+        }
+        if (!emit_ul_aggr3(b, slot_map_ul, t0_slot, num_cells))
+        {
+            return 1;
+        }
+    }
+    else
+    {
+        // Normal path: C-Plane + Order Kernel(s), channel tasks, then UL3 + optional UL3-SRS.
+        if (!emit_ul_cplane(b, sc, skip_ul_cplane, num_ulc_tasks))
+        {
+            return 1;
+        }
+        if (!emit_ul_order_kernel(b, pdctx, t0_slot, ru_type_for_srs_proc, aggr))
+        {
+            return 1;
+        }
+        if (!emit_ul_channel_tasks(b, pdctx, sc, t0_slot, num_cells, aggr))
+        {
+            return 1;
+        }
+        if (!emit_ul_aggr3(b, slot_map_ul, t0_slot, num_cells))
+        {
+            return 1;
+        }
+        if (aggr.srs && ru_type_for_srs_proc != SINGLE_SECT_MODE)
+        {
+            if (!emit_ul_aggr3_srs(b, pdctx, slot_map_ul, t0_slot, num_cells))
+            {
+                return 1;
+            }
+        }
+    }
+    
+
+    // Authoritative UL task count = emitted driver tasks + fapi_to_cplane_direct virtual UL
+    // C-plane batch-done signals (num_ulc_tasks under SKIP_UL_CPLANE).  Publish on
+    // the slot map before pushing; UL3 / UL3-SRS read it via getNumTasks().
+    const int ul_task_count_actual = b.task_index + (skip_ul_cplane ? num_ulc_tasks : 0);
+    slot_map_ul->setTasksTs(ul_task_count_actual, b.task_ts_exec, Time::nowNs());
+
+    // Push the emitted (non-virtual) tasks under a single lock; bound by task_index
+    // (the fapi_to_cplane_direct path's batch-done contributors are counted but not pushed).
+    TaskList* tListUl = pdctx->getTaskListUl();
+    const int ul_pushed = tListUl->push_bulk(
+        std::span<Task* const>{b.task_ptr_list.data(), static_cast<std::size_t>(b.task_index)});
+    if (ul_pushed != b.task_index) [[unlikely]]
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "UL push_bulk enqueued {}/{} tasks for Map {}",
+                   ul_pushed, b.task_index, slot_map_ul->getId());
+        POP_RANGE
+        return 1;
+    }
+
+    POP_RANGE
+    const t_ns map_ul_end = Time::nowNs();
+    NVLOGI_FMT(TAG, "Enqueue UL tasks START: {} END: {} DURATION: {} us", map_ul_start.count(), map_ul_end.count(), Time::NsToUs(map_ul_end - map_ul_start).count());
+    return 0;
+}
+
+namespace {
+
+/// DL worker-ID assignment using the same abstraction as the legacy code:
+/// gated by DL core affinity, delegating to PhyDriverCtx::getDLWorkerID.
+[[nodiscard]] inline worker_id dl_worker(PhyDriverCtx* const pdctx, const bool enable_affinity, const int worker_index)
+{
+    return enable_affinity ? pdctx->getDLWorkerID(worker_index) : 0;
+}
+
+/**
+ * Number of DL channel-task workers available in this layout.
+ *
+ * Single-worker mode collapses every channel role onto worker 0; standard
+ * mode advertises @c num_dl_workers minus the reserved offset (the trailing
+ * TX / doorbell workers).
+ *
+ * @param[in] lay  The DL layout for the current slot.
+ * @return         @c 1 when @c lay.single_dl_worker is set, otherwise
+ *                 @c lay.num_dl_workers - @c lay.dl_worker_offset.
+ */
+[[nodiscard]] inline int dl_channel_worker_count(const DlLayout& lay)
+{
+    return lay.single_dl_worker ? 1 : lay.num_dl_workers - lay.dl_worker_offset;
+}
+
+/**
+ * Resolve the @c worker_id for a DL task from a layout + logical index.
+ *
+ * Routes the requested @c worker_index to worker 0 in single-worker mode, and
+ * to @c dl_worker(pdctx, enable_affinity, worker_index) otherwise. Callers use
+ * this instead of @c dl_worker directly so single-worker deployments do not
+ * model a non-existent second worker.
+ *
+ * @param[in] pdctx         Driver context (never null on the DL emit paths).
+ * @param[in] lay           The DL layout for the current slot.
+ * @param[in] worker_index  Logical worker index the caller would use in the
+ *                          non-single-worker path.
+ * @return                  Concrete @c worker_id for the task.
+ */
+[[nodiscard]] inline worker_id dl_layout_worker(
+    PhyDriverCtx* const pdctx, const DlLayout& lay, const int worker_index)
+{
+    return dl_worker(pdctx, lay.enable_affinity, lay.single_dl_worker ? 0 : worker_index);
+}
+
+/// Task1 channel tasks: FH callback, PDSCH, control (PDCCH/PBCH/CSI-RS).
+/// Caller emits these only on a non-DLBFW-only slot (gating lives in enqueue_dl_tasks).
+[[nodiscard]] bool emit_dl_channel_tasks(
+    DlTaskRegistry& b, const t_ns base_ts, const DlLayout& lay, const EnqueueSkipMask skip_mask, const DlAggrPtrs& aggr)
+{
+    PhyDriverCtx* const pdctx = b.pdctx;
+    // FH callback — excluded under SKIP_DL_FHCB (the fapi_to_cplane_direct path emits FHCB-done via batch).
+    if (!skip_flag(skip_mask, EnqueueSkipMask::SKIP_DL_FHCB))
+    {
+        if (!b.addTask(base_ts, "TaskDLFHCb", task_work_function_dl_fh_cb, 0, lay.num_cells, 0,
+                    dl_layout_worker(pdctx, lay, dl_channel_worker_count(lay))))
+        {
+            return false;
+        }
+    }
+    if (aggr.pdsch)
+    {
+        const int wi = lay.mMIMO ? (lay.num_dl_workers - lay.dl_worker_offset) : 0;
+        if (!b.addTask(base_ts, "TaskDL1AggrPdsch", task_work_function_dl_aggr_1_pdsch, 0, lay.num_cells, 0,
+                    dl_layout_worker(pdctx, lay, wi)))
+        {
+            return false;
+        }
+    }
+    if (aggr.hasControl() || aggr.csirs)
+    {
+        const int wi = lay.mMIMO ? lay.dlbfw_core_index : 1;
+        if (!b.addTask(base_ts, "TaskDL1AggrControl", task_work_function_dl_aggr_control, 0, lay.num_cells, 0,
+                    dl_layout_worker(pdctx, lay, wi)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// DL BFW task.  Emitted whenever DL BFW is scheduled (alone, or alongside channel tasks).
+[[nodiscard]] bool emit_dl_bfw(DlTaskRegistry& b, const t_ns base_ts, const DlLayout& lay)
+{
+    return b.addTask(base_ts, "TaskDLAggrDlBfw", task_work_function_dl_aggr_bfw, 0, lay.num_cells, 0,
+                  dl_layout_worker(b.pdctx, lay, lay.dlbfw_core_index));
+}
+
+/// Task2 part A: U-plane prepare + TX (GPU comm) or DL2 aggregate, then DL C-plane
+/// (with per-DLC mMIMO U-plane prepare).  Caller ensures !dlbfwOnly().
+[[nodiscard]] bool emit_dl_uplane_and_cplane(
+    DlTaskRegistry& b, const t_ns base_ts, const DlLayout& lay, const EnqueueSkipMask skip_mask)
+{
+    PhyDriverCtx* const pdctx = b.pdctx;
+    const worker_id w_txcore = dl_layout_worker(pdctx, lay, dl_channel_worker_count(lay));
+
+    if (lay.gpu_dl)
+    {
+        // Non-mMIMO GPU-comm prepare (excluded under SKIP_DL_GPU_COMM_PREPARE).
+        if (!lay.mMIMO && !skip_flag(skip_mask, EnqueueSkipMask::SKIP_DL_GPU_COMM_PREPARE))
+        {
+            for (int c = lay.num_dlc_tasks - 1; c >= 0; c--)
+            {
+                char buf[32];
+                format_indexed_task_name(buf, "TaskDL2AggrPrepare", c + 1);
+                if (!b.addTask(base_ts, buf, task_work_function_dl_aggr_2_gpu_comm_prepare, c, 0, lay.num_dlc_tasks, w_txcore))
+                {
+                    return false;
+                }
+            }
+        }
+        if (!b.addTask(base_ts, "TaskDL2AggrTx", task_work_function_dl_aggr_2_gpu_comm_tx, 0, lay.num_cells, lay.num_dlc_tasks, w_txcore))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        if (!b.addTask(base_ts, "TaskDL2Aggr", task_work_function_dl_aggr_2, 0, lay.num_cells, 0, w_txcore))
+        {
+            return false;
+        }
+    }
+
+    // DL C-plane (+ per-DLC mMIMO U-plane prepare).
+    if (!skip_flag(skip_mask, EnqueueSkipMask::SKIP_DL_CPLANE))
+    {
+        for (int c = lay.num_dlc_tasks - 1; c >= 0; c--)
+        {
+            char buf[32];
+            format_indexed_task_name(buf, "TaskDL1AggrCplane", c + 1);
+            const int affinity_worker_index = c % dl_channel_worker_count(lay);
+            if (!b.addTask(base_ts, buf, task_work_function_cplane, c, 0, lay.num_dlc_tasks,
+                        dl_layout_worker(pdctx, lay, affinity_worker_index)))
+            {
+                return false;
+            }
+            if (lay.mMIMO && !skip_flag(skip_mask, EnqueueSkipMask::SKIP_DL_GPU_COMM_PREPARE))
+            {
+                format_indexed_task_name(buf, "TaskDL2AggrPrepare", c + 1);
+                if (!b.addTask(base_ts, buf, task_work_function_dl_aggr_2_gpu_comm_prepare, c, 0, lay.num_dlc_tasks,
+                            dl_layout_worker(pdctx, lay, affinity_worker_index)))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/// Task2 part B: Compression, then CPU doorbell (gpuCommEnabledViaCpu).
+/// Caller ensures !dlbfwOnly().
+[[nodiscard]] bool emit_dl_compress_and_doorbell(
+    DlTaskRegistry& b, const t_ns base_ts, const DlLayout& lay, const DlAggrPtrs& aggr)
+{
+    PhyDriverCtx* const pdctx = b.pdctx;
+    const int comp_wi = aggr.dlbfw ? lay.dlbfw_core_index : (lay.num_dl_workers - lay.dl_worker_offset);
+    if (!b.addTask(base_ts, "TaskDL1AggrCompression", task_work_function_dl_aggr_1_compression, 0, lay.num_cells, 0,
+                dl_layout_worker(pdctx, lay, comp_wi)))
+    {
+        return false;
+    }
+
+    if (lay.gpu_via_cpu)
+    {
+        if (!b.addTask(base_ts, "TaskDL2RingCpuDoorbell", task_work_function_dl_aggr_2_ring_cpu_doorbell, 0, lay.num_cells, 0,
+                    dl_layout_worker(pdctx, lay, lay.num_dl_workers - 1)))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// DL3 buffer-cleanup task (always scheduled).  Launches at T0 + 1 slot with a raw
+/// timestamp (no per-index offset).
+[[nodiscard]] bool emit_dl_aggr3(DlTaskRegistry& b, const uint64_t t0_slot, const DlLayout& lay)
+{
+    return b.addTask(t_ns(t0_slot + Cell::getTtiNsFromMu(MU_SUPPORTED)), "TaskDL3Aggr",
+                  task_work_function_dl_aggr_3_buf_cleanup, 0, lay.num_cells, 0,
+                  dl_layout_worker(b.pdctx, lay, dl_channel_worker_count(lay)),
+                  /*offset_by_index=*/false);
+}
+
+/// Publish the DL2Tx / buf-cleanup wait targets on the slot map (read by the
+/// compression and buf-cleanup task bodies).  No-op for DLBFW-only slots.
+void set_dl_wait_counts(
+    SlotMapDl* const slot_map_dl, const DlLayout& lay, const EnqueueSkipMask skip_mask,
+    const int num_dlc_tasks, const DlAggrPtrs& aggr, const int dl_task_count)
+{
+    if (aggr.dlbfwOnly())
+    {
+        return;
+    }
+    const bool skip_fhcb    = skip_flag(skip_mask, EnqueueSkipMask::SKIP_DL_FHCB);
+    const bool skip_prepare = skip_flag(skip_mask, EnqueueSkipMask::SKIP_DL_GPU_COMM_PREPARE);
+    // U-plane prepare tasks are emitted by emit_dl_uplane_and_cplane only when !skip_prepare AND
+    // (mMIMO || gpuCommDlEnabled).  dl_task_count is emission-derived, so the ignore-list must use
+    // the same predicate (not the legacy budget's unconditional num_dlc_tasks); otherwise in the
+    // non-GPU-comm-DL config it would over-subtract num_dlc_tasks and under-count the wait target.
+    const bool prepare_emitted = !skip_prepare && (lay.mMIMO || lay.gpu_dl);
+
+    // Compression wait: ignore DLBFW + Compression + CPU-Doorbell(iff gpu_via_cpu)
+    // + BufCleanup + FHCB + DLC + UPlane-prepare + batch-done.
+    // Uses waitSlotChannelEnd (atom_dl_channel_end_threads counter), which the batch-done
+    // virtual task does NOT contribute to — it is therefore added to the ignore list so
+    // numTasksWaitDl2Tx stays invariant under the fapi_to_cplane_direct path.
+    // Ignore-list: DLBFW + Compression(1) + CPU-Doorbell(iff gpu_via_cpu) + BufCleanup(1) + FHCB + DLC + UPlane prepare(iff emitted) + batch-done(iff fapi_to_cplane_direct).
+    //   Identity (SKIP_NONE, dl_batch_done_w=0, prepare emitted = N):
+    //     gpu_via_cpu=true,  dlbfw_present=true:  1 + 1 + 1 + 1 + 1 + N + N + 0 = 5 + 2N  → num_dl_tasks - (5 + 2N)
+    //     gpu_via_cpu=true,  dlbfw_present=false: 0 + 1 + 1 + 1 + 1 + N + N + 0 = 4 + 2N  → num_dl_tasks - (4 + 2N)
+    //     gpu_via_cpu=false, dlbfw_present=true:  1 + 1 + 0 + 1 + 1 + N + N + 0 = 4 + 2N  → num_dl_tasks - (4 + 2N)
+    //     gpu_via_cpu=false, dlbfw_present=false: 0 + 1 + 0 + 1 + 1 + N + N + 0 = 3 + 2N  → num_dl_tasks - (3 + 2N)
+    const int dl_ignore_compress =
+          (aggr.dlbfw ? 1 : 0)
+        + 1                                         // Compression
+        + (lay.gpu_via_cpu ? 1 : 0)                 // CPU Doorbell
+        + 1                                         // DL3 Buf Cleanup
+        + (skip_fhcb    ? 0 : 1)                    // when FhCb is skipped, no need to wait for it
+        + num_dlc_tasks                             // C-Plane tasks (either fapi_to_cplane direct path or not, shall emit num_dlc_tasks signals). 
+        + (prepare_emitted ? num_dlc_tasks : 0);    // U-plane prepare: only ignore when actually emitted (see prepare_emitted above).
+    slot_map_dl->setNumTasksWaitDl2Tx(dl_task_count - dl_ignore_compress);
+
+    // Buf-cleanup wait: ignore dl_fixed + DLC.
+    const int dl_fixed = lay.gpu_via_cpu ? 4 : 3;
+    const int dl_ignore_buf_cleanup = dl_fixed + num_dlc_tasks;
+    slot_map_dl->setNumTasksWaitBufCleanup(dl_task_count - dl_ignore_buf_cleanup);
+}
+
+} // namespace
+
+/**
+ * @brief DL phase of l1_enqueue_phy_work: emit (timestamp + create + enqueue) DL tasks.
+ *
+ * Single-pass co-location via DlTaskRegistry (mirrors the UL path).  The total DL
+ * task count is derived from the emission — @c task_index plus the fapi_to_cplane_direct
+ * virtual C-plane batch-done contributors (num_dlc_tasks under SKIP_DL_FHCB) —
+ * published via @c setTasksTs() before the tasks are pushed; the compression and
+ * buf-cleanup bodies read it via @c SlotMapDl::getNumTasks(), and their wait
+ * targets via getNumTasksWaitDl2Tx()/BufCleanup().  @p dl_task_count (legacy
+ * pre-accumulated budget) and @p dl_from_early are no longer used here
+ * (dl_from_early's index-0 value equals sc->tick_original on this path).
+ *
+ * @return 0 on success; non-zero to request the caller's cleanup_err path.
+ */
+[[nodiscard]] static int enqueue_dl_tasks(
+    PhyDriverCtx* const                      pdctx,
+    SlotMapDl* const                         slot_map_dl,
+    slot_command_api::slot_command* const    sc,
+    const uint64_t                           t0_slot,
+    const EnqueueSkipMask                    skip_mask,
+    [[maybe_unused]] const bool              dl_from_early,
+    const DlAggrPtrs&                        aggr,
+    slot_params_aggr* const                  current_slot_params_aggr,
+    [[maybe_unused]] const int               dl_task_count)
+{
+
+    // DL slot reference time (L2A tick); see SlotMapDl::getSlotRefTs().
+    // In fapi_to_cplane_direct the early-cplane setup already set SlotRefTs to this same value,
+    // so skip the redundant rewrite: it lets the direct C-plane send (send_dl_cplane) read
+    // SlotRefTs off the shared early map without racing this write. Mirrors the existing
+    // !dl_from_early guard on setSlot3GPP.
+    if (!dl_from_early)
+    {
+        slot_map_dl->setSlotRefTs(sc->tick_original);
+    }
+
+    // Cache PhyDriverCtx flags once per slot (out-of-line accessors; values are
+    // slot-invariant). Used here, threaded into DlLayout, and consumed by the emit
+    // helpers / set_dl_wait_counts.
+    const bool fapi_direct    = pdctx->isFapiToCplaneDirect();
+    const bool gpu_via_cpu    = pdctx->gpuCommEnabledViaCpu();
+    const bool mMIMO          = pdctx->getmMIMO_enable();
+    const bool gpu_dl         = pdctx->gpuCommDlEnabled();
+    const int  num_dl_workers = pdctx->getNumDLWorkers();
+
+    // Store/replay supports the non-mMIMO GPU-communication graph on one DL
+    // worker. All DL roles map to worker 0 and the layout retains one real
+    // C-plane contributor rather than modelling a nonexistent second worker.
+    const bool single_dl_worker =
+#ifdef ENABLE_FAPI_STORE_REPLAY
+        num_dl_workers == 1 && !mMIMO && !gpu_via_cpu;
+#else
+        false;
+#endif
+
+    // In the non-FAPI to CplaneDirect path, the # of DLC tasks are to be recorded in the
+    // newly allocated slot_map. In the FAPI to CplaneDirect path, this is done by 
+    // l1_set_num_dlc_tasks_for_slot
+    if (!fapi_direct)
+    {
+        slot_map_dl->setNumDlcTasks(
+            single_dl_worker ? 1 : get_num_dlc_tasks(num_dl_workers, gpu_via_cpu, mMIMO));
+    }
+
+    const int num_dlc_tasks = slot_map_dl->getNumDlcTasks();
+
+    const int dl_worker_offset = gpu_via_cpu ? 2 : 1;
+    int dlbfw_core_index;
+    if (mMIMO && gpu_via_cpu)
+    {
+        if (num_dl_workers < 3)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Insufficient DL workers ({}) for mMIMO with GPU comm via CPU", num_dl_workers);
+            return 1;
+        }
+        dlbfw_core_index = num_dl_workers - 3;
+    }
+    else
+    {
+        if (num_dl_workers < 2 && !single_dl_worker)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Insufficient DL workers ({})", num_dl_workers);
+            return 1;
+        }
+        dlbfw_core_index = single_dl_worker ? 0 : num_dl_workers - 2;
+    }
+
+    if (!(slot_map_dl->getNumCells() > 0 || aggr.dlbfw))
+    {
+        return 1;
+    }
+
+    if (slot_map_dl->aggrSetPhy(aggr.pdsch, aggr.pdcch_dl, aggr.pdcch_ul, aggr.pbch, aggr.csirs, aggr.dlbfw, current_slot_params_aggr))
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SlotMapDL aggrSetPhy");
+        return 1;
+    }
+    // Skip enqueue if an L1 exit is in flight.
+    if (pExitHandler.test_exit_in_flight())
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "L1 Exit in flight during Slot Map {}", slot_map_dl->getId());
+        return 1;
+    }
+
+    const t_ns map_dl_start = Time::nowNs();
+    PUSH_RANGE_PHYDRV("SLOT_DL", 5);
+    const int  num_cells  = slot_map_dl->getNumCells();
+    const t_ns dl_base_ts = sc->tick_original;
+
+    const DlLayout lay{.num_cells        = num_cells,
+                       .num_dlc_tasks    = num_dlc_tasks,
+                       .num_dl_workers   = num_dl_workers,
+                       .dl_worker_offset = dl_worker_offset,
+                       .dlbfw_core_index = dlbfw_core_index,
+                       .single_dl_worker = single_dl_worker,
+                       .enable_affinity  = (pdctx->get_enable_dl_core_affinity() != 0),
+                       .gpu_via_cpu      = gpu_via_cpu,
+                       .mMIMO            = mMIMO,
+                       .gpu_dl           = gpu_dl};
+    DlTaskRegistry b{pdctx, slot_map_dl};
+
+    // DL task layout, gated in one place: a slot with real channel work emits the
+    // full pipeline (channels, optional BFW, U-plane/C-plane, compression/doorbell);
+    // a BFW-only slot emits just BFW; DL3 buffer-cleanup is always emitted last.
+    // Emission order is preserved exactly (dispatch time = ts + task_index).
+    if (!aggr.dlbfwOnly())
+    {
+        if (!emit_dl_channel_tasks(b, dl_base_ts, lay, skip_mask, aggr))
+        {
+            return 1;
+        }
+        if (aggr.dlbfw && !emit_dl_bfw(b, dl_base_ts, lay))
+        {
+            return 1;
+        }
+        if (!emit_dl_uplane_and_cplane(b, dl_base_ts, lay, skip_mask))
+        {
+            return 1;
+        }
+        if (!emit_dl_compress_and_doorbell(b, dl_base_ts, lay, aggr))
+        {
+            return 1;
+        }
+    }
+    else
+    {
+        // dlbfwOnly() implies aggr.dlbfw != nullptr.
+        if (!emit_dl_bfw(b, dl_base_ts, lay))
+        {
+            return 1;
+        }
+    }
+    if (!emit_dl_aggr3(b, t0_slot, lay))
+    {
+        return 1;
+    }
+
+    // Authoritative DL task count = emitted driver tasks + fapi_to_cplane_direct virtual DL
+    // C-plane batch-done signals (num_dlc_tasks under SKIP_DL_FHCB).  Publish on
+    // the slot map and derive the wait targets before pushing; the compression and
+    // buf-cleanup bodies read getNumTasks() / getNumTasksWaitDl2Tx()/BufCleanup().
+    const bool skip_fhcb = skip_flag(skip_mask, EnqueueSkipMask::SKIP_DL_FHCB);
+    const int dl_task_count_actual = b.task_index + (skip_fhcb ? num_dlc_tasks : 0);
+    set_dl_wait_counts(slot_map_dl, lay, skip_mask, num_dlc_tasks, aggr, dl_task_count_actual);
+    slot_map_dl->setTasksTs(dl_task_count_actual, b.task_ts_exec, Time::nowNs());
+    NVLOGI_FMT(TAG, "Map {} dl_task_count {} dlbfw_only {}", slot_map_dl->getId(), dl_task_count_actual, aggr.dlbfwOnly());
+
+    // Push the emitted tasks under a single lock; bound by task_index (scheduled tasks),
+    // not the count — the fapi_to_cplane_direct path's virtual batch-done contributors are
+    // counted but not pushed.
+    TaskList* tListDl = pdctx->getTaskListDl();
+    const int dl_pushed = tListDl->push_bulk(
+        std::span<Task* const>{b.task_ptr_list.data(), static_cast<std::size_t>(b.task_index)});
+    if (dl_pushed != b.task_index) [[unlikely]]
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "DL push_bulk enqueued {}/{} tasks for Map {}",
+                   dl_pushed, b.task_index, slot_map_dl->getId());
+        POP_RANGE
+        return 1;
+    }
+
+    if (pdctx->debug_worker_enabled())
+    {
+        auto debug_task = pdctx->getNextTask();
+        debug_task->init(dl_base_ts, "Debug", task_work_function_debug, static_cast<void*>(slot_map_dl),
+                         0, num_cells, dl_task_count_actual, 0);
+        auto dl = pdctx->getTaskListDebug();
+        dl->lock();
+        dl->push(debug_task);
+        dl->unlock();
+    }
+    POP_RANGE
+    const t_ns map_dl_end = Time::nowNs();
+    NVLOGI_FMT(TAG, "Enqueue DL tasks START: {} END: {} DURATION: {} us", map_dl_start.count(), map_dl_end.count(), Time::NsToUs(map_dl_end - map_dl_start).count());
+    return 0;
+}
+
+namespace {
+
+/**
+ * Resolve the next OrderEntity for the UL slot.
+ *
+ * Under @c ENABLE_FAPI_STORE_REPLAY, cell ordinals must match SlotMap
+ * (@c aggr_cell_list). Otherwise use channel-arrival @p cell_ul_list.
+ * The store/replay vs production selection stays inside this helper so
+ * @c l1_enqueue_phy_work call sites stay free of @c #ifdef noise.
+ *
+ * Named to match the legacy @c getNextOrderEntity style in this path.
+ *
+ * @param[in] pdctx            Driver context used to allocate/lookup the entity.
+ * @param[in] slot_map_ul      UL SlotMap; used under store/replay for SlotMap order.
+ * @param[in] cell_ul_list     Channel-arrival UL cell phy-id list (non-store/replay).
+ * @param[in] cell_ul_list_idx Number of valid entries in @p cell_ul_list.
+ * @param[in] existing         Existing OrderEntity for this slot, or nullptr.
+ * @param[in] create_new       If true, request a new OrderEntity when needed.
+ * @return Pointer to OrderEntity, or nullptr on allocation/lookup failure.
+ *         Return value must be checked.
+ */
+[[nodiscard]] OrderEntity* getNextUlOrderEntity(PhyDriverCtx* const pdctx,
+                                               [[maybe_unused]] SlotMapUl* const slot_map_ul,
+                                               [[maybe_unused]] int32_t* const cell_ul_list,
+                                               [[maybe_unused]] const uint8_t cell_ul_list_idx,
+                                               OrderEntity* const existing,
+                                               const bool create_new)
+{
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    std::array<int32_t, UL_MAX_CELLS_PER_SLOT> order_cell_list{};
+    const auto order_cell_count =
+        static_cast<uint8_t>(slot_map_ul->aggr_cell_list.size());
+    for (uint8_t order_cell_idx = 0; order_cell_idx < order_cell_count; ++order_cell_idx)
+    {
+        order_cell_list[order_cell_idx] =
+            slot_map_ul->aggr_cell_list[order_cell_idx]->getPhyId();
+    }
+    return pdctx->getNextOrderEntity(
+        order_cell_list.data(), order_cell_count, existing, create_new);
+#else
+    return pdctx->getNextOrderEntity(
+        cell_ul_list, cell_ul_list_idx, existing, create_new);
+#endif
+}
+
+} // namespace
+
+/**
+ * @brief Enqueue PHY work for the current slot.
+ *
+ * Schedules UL and DL task pipelines for all cells in @p sc. The @p skip_mask controls
+ * which task categories are excluded — see EnqueueSkipMask in cuphydriver_api.hpp for the
+ * full contract and extensibility notes.
+ *
+ * Six sites inside this function are gated by @p skip_mask:
+ *  1. @c dl_task_count budget (non-mMIMO path) — C-plane task slots omitted when
+ *     @c SKIP_DL_CPLANE is set.
+ *  2. @c dl_task_count budget (mMIMO path) — same omission.
+ *  3. @c TaskDL1AggrCplane / @c TaskDL2AggrPrepare enqueue loop — skipped entirely when
+ *     @c SKIP_DL_CPLANE is set.
+ *  4. @c ul_task_count budget (orderKernel path) — ULC task slots omitted when
+ *     @c SKIP_UL_CPLANE is set.
+ *  5. @c ul_task_count budget (non-orderKernel paths) — same omission.
+ *  6. @c TaskUL1AggrCplane enqueue loop — skipped entirely when @c SKIP_UL_CPLANE is set.
+ *
+ * @param pdh       cuPHYDriver handler; must be non-null.
+ * @param sc        Slot command containing UL/DL channel parameters for all cells.
+ * @param skip_mask Bitmask of categories to exclude; see EnqueueSkipMask. Callers that
+ *                  use the default (SKIP_NONE) receive the original full-pipeline behaviour.
+ * @param use_bound_early_maps   (ENABLE_FAPI_STORE_REPLAY only) When true, use the
+ *                  caller-supplied early slot maps below instead of the driver-context
+ *                  early maps (getEarlySlotMapDl / getEarlySlotMapUl).
+ * @param bound_early_slot_map_dl (ENABLE_FAPI_STORE_REPLAY only) Caller-bound early DL slot
+ *                  map; consulted iff use_bound_early_maps. May be null.
+ * @param bound_early_slot_map_ul (ENABLE_FAPI_STORE_REPLAY only) Caller-bound early UL slot
+ *                  map; consulted iff use_bound_early_maps. May be null.
+ *
+ * @return 0 on success, non-zero on error; return value must be checked.
+ */
+[[nodiscard]] int l1_enqueue_phy_work(phydriver_handle pdh,
+                                      slot_command_api::slot_command* sc,
+                                      EnqueueSkipMask skip_mask
+#ifdef ENABLE_FAPI_STORE_REPLAY
+                                      ,
+                                      bool use_bound_early_maps,
+                                      SlotMapDl* bound_early_slot_map_dl,
+                                      SlotMapUl* bound_early_slot_map_ul
+#endif
+                                      )
 {
     PhyDriverCtx*                           pdctx       = nullptr;
     SlotMapUl*                              slot_map_ul = nullptr;
     SlotMapDl*                              slot_map_dl = nullptr;
     int                                     tentative = 0, mu = 0, num_cells = 0, first_cell = 0, task_index = 0, max_ul_uc_delay = 0, min_slot_ahead = 100,dl_task_count=0,ul_task_count=0;
     bool pucch_or_pusch_found = false;
-    TaskList*                               tListUl = nullptr;
-    TaskList*                               tListDl = nullptr;
-    std::array<t_ns, TASK_MAX_PER_SLOT + 1> task_ts_exec;
     std::array<t_ns, TASK_MAX_PER_SLOT + 1> task_ts_enq;
     t_ns                                    waitns(10 * 1000);
     t_ns                                    t0, t1, t2, t3, t4, t5, t6;
     t_ns                                    start_task;
     struct slot_params*                     current_slot_params = nullptr;
     struct slot_params_aggr*                current_slot_params_aggr = nullptr;
-    std::array<Task*, TASK_MAX_PER_SLOT>    task_dl_ptr_list;
-    std::array<Task*, TASK_MAX_PER_SLOT>    task_ul_ptr_list;
     bool                                    ulbuffer_st1_needed = true;
     std::array<ULInputBuffer*, PRACH_MAX_OCCASIONS> ulbuf_st3_v = {nullptr};
     int rach_occasion = 0;
@@ -427,6 +1403,17 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
     aggr_obj_error_info_t* errorInfoDl = pdctx->getAggrObjErrInfo(true);
     aggr_obj_error_info_t* errorInfoUl = pdctx->getAggrObjErrInfo(false);
 
+    const bool direct_cplane = pdctx->isFapiToCplaneDirect();
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    const bool dl_from_early = direct_cplane &&
+        (use_bound_early_maps ? bound_early_slot_map_dl != nullptr : pdctx->getEarlySlotMapDl() != nullptr);
+    const bool ul_from_early = direct_cplane &&
+        (use_bound_early_maps ? bound_early_slot_map_ul != nullptr : pdctx->getEarlySlotMapUl() != nullptr);
+#else
+    const bool dl_from_early = direct_cplane && pdctx->getEarlySlotMapDl() != nullptr;
+    const bool ul_from_early = direct_cplane && pdctx->getEarlySlotMapUl() != nullptr;
+#endif
+
     min_slot_ahead = pdctx->get_slot_advance();
     en_orderKernel_tb = pdctx->enableOKTb();
 
@@ -450,7 +1437,7 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
         slot.slot_3gpp.t0_ = t0_slot;
         slot.slot_3gpp.t0_valid_ = true;
 
-        NVLOGI_FMT(TAG,"SFN {}.{} L2A tick {} correct tick {} error {}, gps_alpha={}, gps_beta={}",
+        NVLOGD_FMT(TAG,"SFN {}.{} L2A tick {} correct tick {} error {}, gps_alpha={}, gps_beta={}",
                slot.slot_3gpp.sfn_,
                slot.slot_3gpp.slot_,
                sc->tick_original.count(),
@@ -464,6 +1451,7 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
             sc->tick_original = t_ns(correct_tick);
         }
     }
+    NVLOGD_FMT(TAG, "[LEGACY_TICK] sfn={} slot={} tick_original={}", slot.slot_3gpp.sfn_, slot.slot_3gpp.slot_, sc->tick_original.count());
 
     uint64_t t0_slot = slot.slot_3gpp.t0_valid_ ? slot.slot_3gpp.t0_ : (sc->tick_original + t_ns(min_slot_ahead * Cell::getTtiNsFromMu(MU_SUPPORTED))).count();
 
@@ -490,18 +1478,34 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
             {
                 if(slot_map_dl == nullptr)
                 {
-                    slot_map_dl = pdctx->getNextSlotMapDl();
+                    if (dl_from_early) {
+#ifdef ENABLE_FAPI_STORE_REPLAY
+                        slot_map_dl = use_bound_early_maps ? bound_early_slot_map_dl : pdctx->getEarlySlotMapDl();
+                        if (!use_bound_early_maps)
+                        {
+                            pdctx->setEarlySlotMapDl(nullptr);
+                        }
+#else
+                        slot_map_dl = pdctx->getEarlySlotMapDl();
+                        pdctx->setEarlySlotMapDl(nullptr);
+#endif
+                        slot_map_dl->setDynBeamIdOffset(pdctx->getFhProxy()->getDynamicBeamIdOffsetOfPrevSlot());
+                    } else {
+                        slot_map_dl = pdctx->getNextSlotMapDl();
+                    }
                     if(slot_map_dl == nullptr)
                     {
-                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SFN {}.{} SlotMap UL error", sc->cell_groups.slot.slot_3gpp.sfn_, sc->cell_groups.slot.slot_3gpp.slot_);
+                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SFN {}.{} SlotMap DL error", sc->cell_groups.slot.slot_3gpp.sfn_, sc->cell_groups.slot.slot_3gpp.slot_);
                         goto cleanup_err;
                     }
                     else
                         NVLOGI_FMT(TAG, "SFN {}.{} Map {} direction DL at {}", static_cast<unsigned>(sc->cell_groups.slot.slot_3gpp.sfn_), static_cast<unsigned>(sc->cell_groups.slot.slot_3gpp.slot_), slot_map_dl->getId(), Time::nowNs().count());
 
-                    slot_map_dl->setSlot3GPP(*current_slot_params_aggr->si);
-                    auto dyn_beam_id_offset = pdctx->getFhProxy()->getDynamicBeamIdOffsetOfPrevSlot();
-                    slot_map_dl->setDynBeamIdOffset(dyn_beam_id_offset);
+                    if (!dl_from_early) {
+                        slot_map_dl->setSlot3GPP(*current_slot_params_aggr->si);
+                        auto dyn_beam_id_offset = pdctx->getFhProxy()->getDynamicBeamIdOffsetOfPrevSlot();
+                        slot_map_dl->setDynBeamIdOffset(dyn_beam_id_offset);
+                    }
                 }
 
                 phy_cell_index_list = nullptr;
@@ -523,11 +1527,11 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
 #if 0 
                      if ((sc->cell_groups.slot.slot_3gpp.sfn_ == 0) && (sc->cell_groups.slot.slot_3gpp.slot_ == 7)) {
                         NVLOGC(TAG, "Starting profiler");
-                        cudaProfilerStart();
+                        CUDA_DRIVER_CHECK(cuProfilerStart());
                     }
                      if ((sc->cell_groups.slot.slot_3gpp.sfn_ == 1) && (sc->cell_groups.slot.slot_3gpp.slot_ == 2)) {
                         NVLOGC(TAG, "Stopping profiler");
-                        cudaProfilerStop();
+                        CUDA_DRIVER_CHECK(cuProfilerStop());
                     }
  
 #endif
@@ -590,22 +1594,30 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                         // Assume homogeneous cells
                         mu = cell_ptr->getMu();
 
-                        dlbuf = cell_ptr->getNextDlBuffer();
-                        if(dlbuf == nullptr)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SFN {}.{} No available DL output buffers for cell {}", sc->cell_groups.slot.slot_3gpp.sfn_, sc->cell_groups.slot.slot_3gpp.slot_, cell_ptr->getPhyId());
-                            isUlDlBufAvail=false;
-                            goto cleanup_err;
-                        }
-                        else
-                            NVLOGI_FMT(TAG, "SFN {}.{} Map {} Cell {} with MU {} DLBuffer {} at {}",
-                                        static_cast<unsigned>(sc->cell_groups.slot.slot_3gpp.sfn_), static_cast<unsigned>(sc->cell_groups.slot.slot_3gpp.slot_),
-                                        slot_map_dl->getId(), cell_ptr->getPhyId(), mu, dlbuf->getId(), Time::nowNs().count());
-
-                        if(slot_map_dl->aggrSetCells(cell_ptr, &sc->cells[(*cell_index_list)[cell_index]].params, dlbuf))
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SlotMap DL can't set another cell");
-                            goto cleanup_err;
+                        if (dl_from_early) {
+                            for (int j = 0, n = static_cast<int>(slot_map_dl->aggr_cell_list.size()); j < n; ++j) {
+                                if (slot_map_dl->aggr_cell_list[j] == cell_ptr) {
+                                    slot_map_dl->aggr_slot_info[j] =
+                                        sc->cells[(*cell_index_list)[cell_index]].params.sym_prb_info.get();
+                                    break;
+                                }
+                            }
+                        } else {
+                            dlbuf = cell_ptr->getNextDlBuffer();
+                            if(dlbuf == nullptr)
+                            {
+                                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SFN {}.{} No available DL output buffers for cell {}", sc->cell_groups.slot.slot_3gpp.sfn_, sc->cell_groups.slot.slot_3gpp.slot_, cell_ptr->getPhyId());
+                                isUlDlBufAvail=false;
+                                goto cleanup_err;
+                            }
+                            else
+                                NVLOGI_FMT(TAG, "SFN {}.{} Map {} Cell {} with MU {} DLBuffer {} at {}",
+                                            static_cast<unsigned>(sc->cell_groups.slot.slot_3gpp.sfn_), static_cast<unsigned>(sc->cell_groups.slot.slot_3gpp.slot_),
+                                            slot_map_dl->getId(), cell_ptr->getPhyId(), mu, dlbuf->getId(), Time::nowNs().count());
+                            if (slot_map_dl->aggrSetCells(cell_ptr, &sc->cells[(*cell_index_list)[cell_index]].params, dlbuf)) {
+                                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SlotMap DL can't set another cell");
+                                goto cleanup_err;
+                            }
                         }
 
                         // Avoid to waste UL thread time starting it too early
@@ -625,7 +1637,21 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
             {
                 if(slot_map_ul == nullptr)
                 {
-                    slot_map_ul = pdctx->getNextSlotMapUl();
+                    if (ul_from_early) {
+#ifdef ENABLE_FAPI_STORE_REPLAY
+                        slot_map_ul = use_bound_early_maps ? bound_early_slot_map_ul : pdctx->getEarlySlotMapUl();
+                        if (!use_bound_early_maps)
+                        {
+                            pdctx->setEarlySlotMapUl(nullptr);
+                        }
+#else
+                        slot_map_ul = pdctx->getEarlySlotMapUl();
+                        pdctx->setEarlySlotMapUl(nullptr);
+#endif
+                        slot_map_ul->setDynBeamIdOffset(pdctx->getFhProxy()->getDynamicBeamIdOffsetOfPrevSlot());
+                    } else {
+                        slot_map_ul = pdctx->getNextSlotMapUl();
+                    }
                     if(slot_map_ul == nullptr)
                     {
                         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SFN {}.{} SlotMap UL error", sc->cell_groups.slot.slot_3gpp.sfn_, sc->cell_groups.slot.slot_3gpp.slot_);
@@ -634,11 +1660,15 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                     else
                         NVLOGI_FMT(TAG, "SFN {}.{} Map {} direction UL at {}", static_cast<unsigned>(sc->cell_groups.slot.slot_3gpp.sfn_), static_cast<unsigned>(sc->cell_groups.slot.slot_3gpp.slot_), slot_map_ul->getId(), Time::nowNs().count());
 
-                    auto dyn_beam_id_offset = pdctx->getFhProxy()->getDynamicBeamIdOffsetOfPrevSlot();
-                    slot_map_ul->setDynBeamIdOffset(dyn_beam_id_offset);
+                    if (!ul_from_early) {
+                        auto dyn_beam_id_offset = pdctx->getFhProxy()->getDynamicBeamIdOffsetOfPrevSlot();
+                        slot_map_ul->setDynBeamIdOffset(dyn_beam_id_offset);
+                    }
                 }
 
-                slot_map_ul->setSlot3GPP(*current_slot_params_aggr->si);
+                if (!ul_from_early) {
+                    slot_map_ul->setSlot3GPP(*current_slot_params_aggr->si);
+                }
 
                 int cell_index=0;
                 /*By default */
@@ -953,10 +1983,24 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                             ulbuf_pcap_capture = cell_ptr->getUlBufferPcap();
                             ulbuf_pcap_capture_ts = cell_ptr->getUlBufferPcapTs();
                         }
-                        //FIXME: When PUSCH + PDSCH, should move cells params at the beginning into one place, not cell by cell per channel
-                        if(slot_map_ul->aggrSetCells(cell_ptr, &sc->cells[(*cell_index_list)[cell_index]].params,
-                                                    ulbuf_st1,ulbuf_st2,ulbuf_st3_v, rach_occasion, ulbuf_pcap_capture, ulbuf_pcap_capture_ts))
-                        {
+                        if (ul_from_early) {
+                            for (int j = 0, n = static_cast<int>(slot_map_ul->aggr_cell_list.size()); j < n; ++j) {
+                                if (slot_map_ul->aggr_cell_list[j] == cell_ptr) {
+                                    slot_map_ul->aggr_slot_info[j] =
+                                        sc->cells[(*cell_index_list)[cell_index]].params.sym_prb_info.get();
+                                    slot_map_ul->aggr_ulbuf_st1[j] = ulbuf_st1;
+                                    slot_map_ul->aggr_ulbuf_st2[j] = ulbuf_st2;
+                                    slot_map_ul->aggr_ulbuf_pcap_capture[j] = ulbuf_pcap_capture;
+                                    slot_map_ul->aggr_ulbuf_pcap_capture_ts[j] = ulbuf_pcap_capture_ts;
+                                    slot_map_ul->num_prach_occa[j] = rach_occasion;
+                                    for (int ro = 0; ro < rach_occasion; ++ro) {
+                                        slot_map_ul->aggr_ulbuf_st3.push_back(ulbuf_st3_v[ro]);
+                                    }
+                                    break;
+                                }
+                            }
+                        } else if (slot_map_ul->aggrSetCells(cell_ptr, &sc->cells[(*cell_index_list)[cell_index]].params,
+                                                    ulbuf_st1,ulbuf_st2,ulbuf_st3_v, rach_occasion, ulbuf_pcap_capture, ulbuf_pcap_capture_ts)) {
                             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SlotMap UL can't set another cell");
                             goto cleanup_err;
                         }
@@ -972,7 +2016,9 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                     //Single order kernel entity per slot
                     if(!order_entity_set)
                     {
-                        oentity_ptr = pdctx->getNextOrderEntity(cell_ul_list,cell_ul_list_idx,nullptr,true);
+                        oentity_ptr = getNextUlOrderEntity(
+                            pdctx, slot_map_ul, &cell_ul_list[0], cell_ul_list_idx,
+                            nullptr, true);
                         if(oentity_ptr == nullptr)
                         {
                             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "No available Order Kernel object for SFN {}.{} Map {} ", sc->cell_groups.slot.slot_3gpp.sfn_, sc->cell_groups.slot.slot_3gpp.slot_, slot_map_ul->getId());
@@ -988,7 +2034,9 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                     }
                     else
                     {
-                        oentity_ptr = pdctx->getNextOrderEntity(cell_ul_list,cell_ul_list_idx, slot_map_ul->aggrGetOrderEntity(),false);
+                        oentity_ptr = getNextUlOrderEntity(
+                            pdctx, slot_map_ul, &cell_ul_list[0], cell_ul_list_idx,
+                            slot_map_ul->aggrGetOrderEntity(), false);
                         if(oentity_ptr!=slot_map_ul->aggrGetOrderEntity())
                         {
                             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Order entity cannot be different for the same slot");
@@ -1134,27 +2182,51 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
                             mu, aggr_pdsch_ptr->getId(), Time::nowNs().count()
                         );
                 dl_task_count++;
-                if(pdctx->enable_prepone_h2d_cpy)
+                // When prepone TB H2D is enabled and the dedicated H2D copy thread is off, this
+                // block runs the same sequence as l1_launch_tb_h2d (setCtx, start event,
+                // performBatchedMemcpy, reset batches, complete event) on the slot-command path.
+                //
+                // isBatchLaunchedForSlot() is true when l1_launch_tb_h2d (split-phase path)
+                // already executed the memcpy and recorded events for this slot — skip to
+                // avoid double-submitting the DMA and overwriting the events.
                 {
-                    if(!pdctx->h2d_copy_thread_enable)
+                    auto* h2dMgr = pdctx->getH2DCopyManager();
+                    const uint8_t slot = sc->cell_groups.slot.slot_3gpp.slot_;
+                    if(h2dMgr->isPreponeEnabled() && !h2dMgr->isBatchLaunchedForSlot(slot))
                     {
-                        pdctx->getPdschMpsCtx()->setCtx();
-
-                        CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_start(sc->cell_groups.slot.slot_3gpp.slot_), pdctx->getH2DCpyStream()));
-
-                        // If there is no seperate copy thread, launch the copy here. The information about the copy batches is filled in in the offload funciton.
-                        cuphyStatus_t batched_memcpy_status = pdctx->performBatchedMemcpy(); // still a no-op if yaml flag is 0
-                        if (batched_memcpy_status != CUPHY_STATUS_SUCCESS)
+                        if(!h2dMgr->isThreadEnabled())
                         {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Error! cuMemcpyBatchAsync returned {}!", batched_memcpy_status);
-                        }
-                        pdctx->resetBatchedMemcpyBatches(); // reset batches count to 0
+                            h2dMgr->setCtx();
 
-                        CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_complete(sc->cell_groups.slot.slot_3gpp.slot_), pdctx->getH2DCpyStream()));
+                            CUDA_CHECK(cudaEventRecord(h2dMgr->getStartEvent(slot), h2dMgr->getStream()));
+
+                            cuphyStatus_t batched_memcpy_status = h2dMgr->performBatchedMemcpy();
+                            h2dMgr->resetBatchedMemcpyBatches();
+
+                            if (batched_memcpy_status != CUPHY_STATUS_SUCCESS) [[unlikely]]
+                            {
+                                // Do NOT record the complete event — a downstream
+                                // cudaStreamWaitEvent would otherwise proceed even
+                                // though the DMA failed (silent data corruption).
+                                // Matches l1_launch_tb_h2d's failure handling.
+                                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                                           "l1_enqueue_phy_work inline H2D: performBatchedMemcpy failed st={} slot={} - "
+                                           "complete event NOT recorded; PDSCH will time out",
+                                           static_cast<int>(batched_memcpy_status), slot);
+                            }
+                            else
+                            {
+                                CUDA_CHECK(cudaEventRecord(h2dMgr->getCompleteEvent(slot), h2dMgr->getStream()));
+                            }
+                        }
+                        else
+                        {
+                            l1_set_h2d_copy_done_cur_slot_flag(pdh,(int)slot);
+                        }
                     }
-                    else
+                    else if(h2dMgr->isBatchLaunchedForSlot(slot))
                     {
-                        l1_set_h2d_copy_done_cur_slot_flag(pdh,(int)sc->cell_groups.slot.slot_3gpp.slot_); //Set h2d copy done for current slot flag
+                        h2dMgr->clearBatchLaunched(slot);
                     }
                 }
             }
@@ -1226,687 +2298,29 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
         }
     }
 
-    task_ts_exec[0] = sc->tick_original;
-
     ////////////////////////////////////////////////////////////////////////
     //// CreateMap + CreateTask + EnqueueTask()
     ////////////////////////////////////////////////////////////////////////
 
     if(slot_map_ul != nullptr)
     {
-        auto num_cells = slot_map_ul->getNumCells();
-        int num_ul_workers = pdctx->getNumULWorkers();
-        int num_ulc_tasks = get_num_ulc_tasks(num_ul_workers);
-        bool launch_second_order_kernel_task = false;
-        bool isSrsOnly = ((aggr_srs_ptr != nullptr) && (aggr_pusch_ptr==nullptr) && (aggr_pucch_ptr==nullptr) && (aggr_prach_ptr==nullptr));
-
-
-        if(num_cells > 0 || aggr_ulbfw_ptr)
+        const UlAggrPtrs ul_aggr{aggr_pusch_ptr, aggr_pucch_ptr, aggr_prach_ptr, aggr_srs_ptr, aggr_ulbfw_ptr};
+        if(enqueue_ul_tasks(pdctx, slot_map_ul, sc, t0_slot, skip_mask,
+                            en_orderKernel_tb, ru_type_for_srs_proc,
+                            ul_aggr, current_slot_params_aggr, ul_task_count) != 0)
         {
-            if(slot_map_ul->aggrSetPhy(aggr_pusch_ptr,aggr_pucch_ptr,aggr_prach_ptr, aggr_srs_ptr,aggr_ulbfw_ptr,current_slot_params_aggr))
-            {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SlotMapUL aggrSetPhy");
-                goto cleanup_err;
-            }
-            //Check for Exit handler in flight and skip enqueing of UL tasks accordingly
-            if(pExitHandler.test_exit_in_flight())
-            {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "L1 Exit in flight during Slot Map {}",slot_map_ul->getId());
-                goto cleanup_err;
-            }
-
-            t_ns map_ul_start = Time::nowNs();
-            /*
-             * Ref times for ops within the task.
-             */
-            PUSH_RANGE_PHYDRV("SLOT_UL", 4);
-            num_cells = slot_map_ul->getNumCells();
-
-            if(en_orderKernel_tb)
-            {
-                ul_task_count=2+num_ulc_tasks;//Cplane+Order kernel+UL3
-                // task_index == 0..num_ulc_tasks-1: CPlane - launch at tick + 1 slot
-                for(task_index=0;task_index<(num_ulc_tasks);task_index++)
-                {
-                    task_ts_exec[task_index]= sc->tick_original + ((1) * t_ns(Cell::getTtiNsFromMu(MU_SUPPORTED)));
-                }
-                // Order kernel
-                task_ts_exec[task_index]= t_ns(t0_slot - UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
-                task_index++;
-            }
-            else
-            {
-                if(pdctx->cpuCommEnabled())
-                    ul_task_count+=3+num_ulc_tasks;//Cplane+Order kernel+UL2+UL3
-                else
-                    ul_task_count+=2+num_ulc_tasks;//Cplane+Order kernel+UL3
-                    
-                // task_index == 0..num_ulc_tasks-1: CPlane - launch at tick + 1 slot
-                for(task_index=0;task_index<(num_ulc_tasks);task_index++)
-                {
-                    task_ts_exec[task_index]= sc->tick_original + ((1) * t_ns(Cell::getTtiNsFromMu(MU_SUPPORTED)));
-                }
-
-                if(aggr_srs_ptr && (ru_type_for_srs_proc != SINGLE_SECT_MODE))
-                {
-                    if(isSrsOnly)
-                    {
-                        // Launch only SRS UL Order kernel
-                        if(pdctx->gpuCommEnabledViaCpu())
-                        {
-                            task_ts_exec[task_index]= t_ns(t0_slot + UL_TASK1_SRS_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
-                        }
-                        else
-                        {
-                            task_ts_exec[task_index]= t_ns(t0_slot + UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
-                        }
-                        task_index++;
-                    }
-                    else
-                    {
-                        // Launch both SRS and non-SRS UL Order kernel
-                        task_ts_exec[task_index]= t_ns(t0_slot - UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
-                        task_index++;
-                        if(pdctx->gpuCommEnabledViaCpu())
-                        {
-                            task_ts_exec[task_index]= t_ns(t0_slot + UL_TASK1_SRS_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
-                        }
-                        else
-                        {
-                            task_ts_exec[task_index]= t_ns(t0_slot + UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
-                        }
-                        task_index++;
-                        ul_task_count+=1;      
-                        launch_second_order_kernel_task = true;
-                    }
-                }
-                else
-                {
-                    // Launch only non-SRS UL Order kernel, or combined if ru_type::SINGLE_SECT_MODE
-                    task_ts_exec[task_index]= t_ns(t0_slot - UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS);
-                    task_index++;
-                }
-
-                if(aggr_pucch_ptr || aggr_pusch_ptr)
-                {
-                    //PUCCH and PUSCH task
-                    task_ts_exec[task_index]= t_ns(t0_slot - UL_TASK1_PUCCH_LAUNCH_OFFSET_FROM_T0_NS);
-                    task_index++;
-                }
-
-                if(pdctx->cpuCommEnabled())
-                {
-                    task_ts_exec[task_index]= t_ns(t0_slot + UL_TASK2_OFFSET_FROM_T0_NS);
-                    task_index++;                
-                }
-
-                if(aggr_pusch_ptr)
-                {
-                    //Early UCI task
-                    task_ts_exec[task_index]= t_ns(t0_slot + UL_TASK3_EARLY_UCI_IND_TASK_LAUNCH_OFFSET_FROM_T0_NS);
-                    task_index++;
-                }
-                if(aggr_ulbfw_ptr) 
-                {
-                    task_ts_exec[task_index]= sc->tick_original; //Immediate action time for BFW
-                    task_index++;
-                    task_ts_exec[task_index]= t_ns(t0_slot - UL_AGGR3_ULBFW_OFFSET_FROM_T0_NS); //Launch UL_AGGR3_ULBFW task at UL_AGGR3_ULBFW_OFFSET_FROM_T0_NS before T0
-                    task_index++;                    
-                }
-                int task_index_loop_limit;
-
-                if(ru_type_for_srs_proc == SINGLE_SECT_MODE) {
-                    task_index_loop_limit = ul_task_count-1;
-                } else {
-                   // No SRS : task_index num_ulc_tasks+1..ul_task_count-2 : Channel tasks, launch at T0 slot boundary + 1
-                   // With SRS : task_index num_ulc_tasks+1..ul_task_count-3 : Channel tasks, launch at T0 slot boundary + 1
-                   task_index_loop_limit = (aggr_srs_ptr) ? ul_task_count-2 : ul_task_count-1;
-                }
-                for(task_index=task_index;task_index<(task_index_loop_limit);task_index++)
-                {
-                    //Set all UL channel tasks except PUSCH  to launch at the same time (T0+500us)
-                    task_ts_exec[task_index]= t_ns(t0_slot + Cell::getTtiNsFromMu(MU_SUPPORTED));
-                }
-            }
-            // TaskUL3Aggr - launch 1 slot after the channel tasks
-            task_ts_exec[task_index] = t_ns(t0_slot + UL_TASK3_AGGR3_OFFSET_FROM_T0_NS);
-
-            // TaskUL3AggrSrs - launch at Yaml configured offset from T0
-            if(aggr_srs_ptr && !en_orderKernel_tb && ru_type_for_srs_proc != SINGLE_SECT_MODE) //FX RU requires awaiting for SRS completion in the same AGGR3 task as non-SRS
-            {
-                uint32_t task_offset_from_t0= (pdctx->getUlSrsAggr3TaskLaunchOffsetNs() > UL_TASK3_AGGR3_MAX_BACKOFF_FROM_SRS_COMPLETION_TH_NS) ? UL_TASK3_AGGR3_MAX_BACKOFF_FROM_SRS_COMPLETION_TH_NS : pdctx->getUlSrsAggr3TaskLaunchOffsetNs();
-                task_offset_from_t0 = SRS_COMPLETION_TH_FROM_T0_NS - task_offset_from_t0;
-                task_ts_exec[task_index+1] = t_ns(t0_slot + task_offset_from_t0);
-                task_index++;
-            }
-            slot_map_ul->setTasksTs(ul_task_count, task_ts_exec, Time::nowNs());
-            task_index = 0;
-
-            ///////////////////////////////////////////////////////////////////////
-            //// Task1: C-plane & CUDA tasks
-            ///////////////////////////////////////////////////////////////////////
-
-            first_cell = 0;
-            {
-                if(task_index>=ul_task_count)
-                {
-                    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds UL task count");
-                    goto cleanup_err;
-                }
-                else
-                {
-                    for (int c = 0; c < num_ulc_tasks; c++) {
-                        task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                        char buf[32];
-                        sprintf(buf, "TaskUL1AggrCplane%d", c + 1);
-                        task_ul_ptr_list[task_index]->init(task_ts_exec[task_index] + (t_ns)task_index, buf, task_work_function_ul_aggr_1_cplane, static_cast<void*>(slot_map_ul),
-                                                            c, first_cell, num_ulc_tasks, 0);
-                        task_index++;
-                    }
-                }
-                if(task_index>=ul_task_count)
-                {
-                    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds UL task count");
-                    goto cleanup_err;
-                }
-                else
-                {
-                    task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                    int o=1;
-                    char buf[32];
-                    sprintf(buf, "TaskUL1AggrOrderkernel%d", o);                    
-                    task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), buf, task_work_function_ul_aggr_1_orderKernel, static_cast<void*>(slot_map_ul),
-                                                       first_cell,o,(isSrsOnly)?1:0, 0);
-                    task_index++;
-                    if(launch_second_order_kernel_task)
-                    {
-                        task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                        o++;
-                        sprintf(buf, "TaskUL1AggrOrderkernel%d", o);                    
-                        task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), buf, task_work_function_ul_aggr_1_orderKernel, static_cast<void*>(slot_map_ul),
-                                                           first_cell,o,1, 0);
-                        task_index++;
-                    }
-                }
-                if(!en_orderKernel_tb)
-                {
-                    if(aggr_pusch_ptr || aggr_pucch_ptr)
-                    {
-                        if(task_index>=ul_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds UL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                            task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskUL1AggrPucchPusch", task_work_function_ul_aggr_1_pucch_pusch, static_cast<void*>(slot_map_ul),
-                                                            first_cell, num_cells, ul_task_count, 0);
-                            task_index++;
-                        }
-                    }
-                    if(pdctx->cpuCommEnabled())
-                    {
-                        if(task_index>=ul_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds UL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                            task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskUL2Aggr", task_work_function_ul_aggr_2, static_cast<void*>(slot_map_ul),
-                                                            first_cell, num_cells, ul_task_count, 0);
-                            task_index++;
-                        }                
-                    }
-                    if(aggr_pusch_ptr) {
-                        if(task_index>=ul_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds UL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                            task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskUL3AggrEarlyUciInd", task_work_function_ul_aggr_3_early_uci_ind, static_cast<void*>(slot_map_ul),
-                                                            first_cell, num_cells, ul_task_count, 0);
-                            task_index++;
-                        }
-                    }
-                    if(aggr_ulbfw_ptr)
-                    {
-                        if(task_index>=ul_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds UL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                            task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskULAggrUlBfw", task_work_function_ul_aggr_bfw, static_cast<void*>(slot_map_ul),
-                                                            first_cell, num_cells, ul_task_count, 0);
-                            task_index++;
-                            task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                            task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskUL3AggrUlBfw", task_work_function_ul_aggr_3_ulbfw, static_cast<void*>(slot_map_ul),
-                                                            first_cell, num_cells, ul_task_count, 0);
-                            task_index++;
-                        }
-                    }
-                    if(aggr_prach_ptr)
-                    {
-                        if(task_index>=ul_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds UL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                            task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskUL1AggrPrach", task_work_function_ul_aggr_1_prach, static_cast<void*>(slot_map_ul),
-                                                            first_cell, num_cells, ul_task_count, 0);
-                            task_index++;
-                        }
-                    }
-                    if(aggr_srs_ptr)
-                    {
-                        if(task_index>=ul_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds UL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_ul_ptr_list[task_index] = pdctx->getNextTask();
-                            if(pdctx->gpuCommEnabledViaCpu())
-                            {
-                                task_ts_exec[task_index]= t_ns(t0_slot + UL_TASK1_SRS_LAUNCH_OFFSET_FROM_T0_NS);
-                            }
-                            task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskUL1AggrSrs", task_work_function_ul_aggr_1_srs, static_cast<void*>(slot_map_ul),
-                                                            first_cell, num_cells, ul_task_count, 0);
-                            task_index++;
-                        }
-                    }
-                }
-            }
-            ///////////////////////////////////////////////////////////////////////
-            //// Task3: Wait & L2 Callback
-            ///////////////////////////////////////////////////////////////////////
-            num_cells = slot_map_ul->getNumCells();
-
-            first_cell = 0;
-            do
-            {
-                task_ul_ptr_list[task_index] = pdctx->getNextTask();
-
-                task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskUL3Aggr", task_work_function_ul_aggr_3, static_cast<void*>(slot_map_ul),
-                                                   first_cell, num_cells, ul_task_count, 0);
-
-                first_cell += num_cells;
-                task_index++;
-            } while(first_cell < slot_map_ul->getNumCells() && task_index < TASK_MAX_PER_SLOT);
-
-            if(aggr_srs_ptr && !en_orderKernel_tb && ru_type_for_srs_proc != SINGLE_SECT_MODE) //FX RU requires awaiting for SRS completion in the same AGGR3 task as non-SRS
-            {
-                first_cell = 0;
-                do
-                {
-                    task_ul_ptr_list[task_index] = pdctx->getNextTask();
-
-                    task_ul_ptr_list[task_index]->init(task_ts_exec[task_index]+(t_ns)(task_index), "TaskUL3AggrSrs", task_work_function_ul_aggr_3_srs, static_cast<void*>(slot_map_ul),
-                                                    first_cell, num_cells, ul_task_count, 0);
-
-                    first_cell += num_cells;
-                    task_index++;
-                } while(first_cell < slot_map_ul->getNumCells() && task_index < TASK_MAX_PER_SLOT);                
-            }
-
-            ///////////////////////////////////////////////////////////////////////
-            //// Enqueue tasks in the list
-            ///////////////////////////////////////////////////////////////////////
-            tListUl = pdctx->getTaskListUl();
-            tListUl->lock();
-            for(int tIndex = 0; tIndex < task_index; tIndex++)
-                tListUl->push(task_ul_ptr_list[tIndex]);
-            tListUl->unlock();
-
-            POP_RANGE
-            t_ns map_ul_end = Time::nowNs();
-
-            NVLOGI_FMT(TAG, "Enqueue UL tasks START: {} END: {} DURATION: {} us", map_ul_start.count(), map_ul_end.count(), Time::NsToUs(map_ul_end - map_ul_start).count());
-        }
-        else
             goto cleanup_err;
+        }
     }
-
-    task_ts_exec[0] = sc->tick_original; //Re-assign for DL
 
     if(slot_map_dl != nullptr)
     {
-        auto num_cells = slot_map_dl->getNumCells();
-        int num_dl_workers = pdctx->getNumDLWorkers();
-        int num_dlc_tasks = get_num_dlc_tasks(num_dl_workers,pdctx->gpuCommEnabledViaCpu(), pdctx->getmMIMO_enable());
-        int dl_worker_offset;
-        int dlbfw_core_index = 0;
-        const bool ENABLE_DL_AFFINITY = (pdctx->get_enable_dl_core_affinity() != 0);
-
-        if(pdctx->getmMIMO_enable() && pdctx->gpuCommEnabledViaCpu())
+        const DlAggrPtrs dl_aggr{aggr_pdsch_ptr, aggr_pdcch_dl_ptr, aggr_pdcch_ul_ptr, aggr_pbch_ptr, aggr_csirs_ptr, aggr_dlbfw_ptr};
+        if(enqueue_dl_tasks(pdctx, slot_map_dl, sc, t0_slot, skip_mask, dl_from_early,
+                            dl_aggr, current_slot_params_aggr, dl_task_count) != 0)
         {
-            if(num_dl_workers < 3) {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Insufficient DL workers ({}) for mMIMO with GPU comm via CPU", num_dl_workers);
-                goto cleanup_err;
-            }
-            dlbfw_core_index = num_dl_workers - 3;
-        }
-        else
-        {
-            if(num_dl_workers < 2) {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Insufficient DL workers ({})", num_dl_workers);
-                goto cleanup_err;
-            }
-            dlbfw_core_index = num_dl_workers - 2;
-        }
-
-        if(num_cells > 0 || aggr_dlbfw_ptr)
-        {
-            if(slot_map_dl->aggrSetPhy(aggr_pdsch_ptr, aggr_pdcch_dl_ptr, aggr_pdcch_ul_ptr, aggr_pbch_ptr, aggr_csirs_ptr,aggr_dlbfw_ptr,current_slot_params_aggr))
-            {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SlotMapDL aggrSetPhy");
-                goto cleanup_err;
-            }
-
-            //Check for Exit handler in flight and skip enqueing of DL tasks accordingly
-            if(pExitHandler.test_exit_in_flight())
-            {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "L1 Exit in flight during Slot Map {}",slot_map_dl->getId());
-                goto cleanup_err;
-            }
-
-            t_ns map_dl_start = Time::nowNs();
-
-            PUSH_RANGE_PHYDRV("SLOT_DL", 5);
-            num_cells = slot_map_dl->getNumCells();
-            first_cell = 0;
-            bool dlbfw_only = ((aggr_dlbfw_ptr!=nullptr) && !(aggr_pdsch_ptr || aggr_pdcch_dl_ptr || aggr_pdcch_ul_ptr || aggr_pbch_ptr || aggr_csirs_ptr));
-
-            if(pdctx->gpuCommEnabledViaCpu()){
-                if(dlbfw_only) //Test for only DLBFW presence
-                {
-                    //Account for only DLBFW + DL Task 3 Buf clean up tasks
-                    dl_task_count+=1;    
-                }
-                else
-                {
-                    dl_task_count+= 5 + (num_dlc_tasks<<1); //Add Compression Task + DL Task 2 (Tx) + DL Task 3 + C-Plane Tasks (x2 to factor in UPlane prepare) + FHCB + CPU Door bell task
-                }                
-                dl_worker_offset=2;
-            }
-            else
-            {
-                if(dlbfw_only) //Test for only DLBFW presence
-                {
-                    //Account for only DLBFW + DL Task 3 Buf clean up tasks
-                    dl_task_count+=1;    
-                }
-                else
-                {
-                    dl_task_count+= 4 + (num_dlc_tasks<<1); //Add Compression Task + DL Task 2 (Tx) + DL Task 3 + C-Plane Tasks (x2 to factor in UPlane prepare) + FHCB
-                }                
-                dl_worker_offset=1;
-            }
-            NVLOGI_FMT(TAG, "Map {} dl_task_count {} dlbfw_only {}", slot_map_dl->getId(),dl_task_count,dlbfw_only);
-
-            if(dl_task_count>=TASK_MAX_PER_SLOT)
-                goto cleanup_err;
-            for(task_index=1;task_index<dl_task_count;task_index++)
-                task_ts_exec[task_index]=task_ts_exec[0];
-            slot_map_dl->setTasksTs(dl_task_count, task_ts_exec, Time::nowNs());
-            task_index = 0;
-
-            ///////////////////////////////////////////////////////////////////////
-            //// Task1: C-plane & CUDA tasks
-            ///////////////////////////////////////////////////////////////////////
-            //Push Parallelized DL Task 1s into Task queue
-            {
-                if(!dlbfw_only) //Do not schedule the below DL tasks if DLBFW is the only DL work scheduled 
-                {
-                    // FH callback
-                    if(task_index>=dl_task_count)
-                    {
-                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count");
-                        goto cleanup_err;
-                    }
-                    else
-                    {
-                        task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                        if (!pdctx->getmMIMO_enable())
-                        {
-                            task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDLFHCb", task_work_function_dl_fh_cb, static_cast<void*>(slot_map_dl),
-                                                            first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(num_dl_workers-dl_worker_offset) : 0);
-                        }
-                        else
-                        {
-                            task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDLFHCb", task_work_function_dl_fh_cb, static_cast<void*>(slot_map_dl),
-                                                            first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(num_dl_workers-dl_worker_offset) : 0);
-                        }
-                        task_index++;
-                    }
-
-                    if(aggr_pdsch_ptr)
-                    {
-                        if(task_index>=dl_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                            if (!pdctx->getmMIMO_enable())
-                            {
-                                task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDL1AggrPdsch", task_work_function_dl_aggr_1_pdsch, static_cast<void*>(slot_map_dl),
-                                first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(0) : 0);
-                            }
-                            else
-                            {
-                                task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDL1AggrPdsch", task_work_function_dl_aggr_1_pdsch, static_cast<void*>(slot_map_dl),
-                                first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(num_dl_workers-dl_worker_offset) : 0);
-                            }
-                            task_index++;
-                        }
-                    }
-
-                    if(aggr_pdcch_dl_ptr || aggr_pdcch_ul_ptr || aggr_pbch_ptr || aggr_csirs_ptr)
-                    {
-                        if(task_index >= dl_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                            if (!pdctx->getmMIMO_enable())
-                            {
-                                task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDL1AggrControl", task_work_function_dl_aggr_control, static_cast<void*>(slot_map_dl),
-                                first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(1) : 0);
-                            }
-                            else
-                            {
-                                task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDL1AggrControl", task_work_function_dl_aggr_control, static_cast<void*>(slot_map_dl),
-                                first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(dlbfw_core_index) : 0);
-                            }
-                            task_index++;
-                        }
-                    }
-                }
-
-                if(aggr_dlbfw_ptr)
-                {
-                    if(task_index>=dl_task_count)
-                    {
-                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count\n");
-                        goto cleanup_err;
-                    }
-                    else
-                    {
-                        task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                        task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDLAggrDlBfw", task_work_function_dl_aggr_bfw, static_cast<void*>(slot_map_dl),
-                                                        first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(dlbfw_core_index) : 0);
-                        task_index++;
-                    }
-                }                                    
-
-                if(!dlbfw_only) //Do not schedule the below DL tasks if DLBFW is the only DL work scheduled
-                {
-                    ///////////////////////////////////////////////////////////////////////
-                    //// Task2: Prepare U-plane, wait DL channels, TX U-plane pkts
-                    ///////////////////////////////////////////////////////////////////////
-                    // /* Only 1 thread with GComm per DL slot */
-                    // if(!pdctx->gpuCommEnabled()) {
-                    if(!pdctx->gpuCommDlEnabled() || (pdctx->gpuCommDlEnabled() && COMBINE_DL_TASKS_WITH_GPU_INIT_COMMS == 0)) {
-                        num_cells = slot_map_dl->getNumCells();
-
-                        first_cell = 0;
-
-                    }
-                    if(task_index>=dl_task_count)
-                    {
-                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count");
-                        goto cleanup_err;
-                    }
-                    else
-                    {
-                        
-                        if(pdctx->gpuCommDlEnabled())
-                        {
-                            if(!pdctx->getmMIMO_enable()) //Only schedule GPU Comm Prepare tasks on GPU Comms Tx core if mMIMO is disabled
-                            {
-                                for (int c = num_dlc_tasks-1; c >= 0; c--) 
-                                {
-                                    char buf[32];
-                                    task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                                    sprintf(buf, "TaskDL2AggrPrepare%d", c + 1);
-                                    task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, buf, task_work_function_dl_aggr_2_gpu_comm_prepare, static_cast<void*>(slot_map_dl),
-                                                                    c,first_cell,num_dlc_tasks, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(num_dl_workers-dl_worker_offset) : 0);
-                                    task_index++;
-                                }                                
-                            }
-                            task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                            task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDL2AggrTx", task_work_function_dl_aggr_2_gpu_comm_tx, static_cast<void*>(slot_map_dl),
-                                                            first_cell, num_cells, num_dlc_tasks, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(num_dl_workers-dl_worker_offset) : 0);
-                        }
-                        else
-                        {
-                            task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                            task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDL2Aggr", task_work_function_dl_aggr_2, static_cast<void*>(slot_map_dl),
-                                                            first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(num_dl_workers-dl_worker_offset) : 0);
-                        }
-                        task_index++;
-                    }
-
-                    if(task_index>=dl_task_count)
-                    {
-                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count");
-                        goto cleanup_err;
-                    }
-                    else
-                    {
-                        for (int c = num_dlc_tasks-1; c >= 0; c--) {
-                            task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                            char buf[32];
-                            sprintf(buf, "TaskDL1AggrCplane%d", c + 1);
-                            int affinity_worker_index = c % (num_dl_workers-dl_worker_offset);//Use all workers except last one (which is reserved for fhcb/comms/compression)
-                            task_dl_ptr_list[task_index]->init(task_ts_exec[task_index] + (t_ns)task_index, buf, task_work_function_cplane, static_cast<void*>(slot_map_dl),
-                                                                c, first_cell, num_dlc_tasks, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(affinity_worker_index) : 0);
-                            task_index++;
-                            if(pdctx->getmMIMO_enable()) //Only schedule GPU Comm Prepare tasks on DLC cores if mMIMO is enabled
-                            {
-                                task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                                sprintf(buf, "TaskDL2AggrPrepare%d", c + 1);
-                                task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, buf, task_work_function_dl_aggr_2_gpu_comm_prepare, static_cast<void*>(slot_map_dl),
-                                                                c,first_cell,num_dlc_tasks, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(affinity_worker_index) : 0);
-                                task_index++;
-                            }
-                        }
-                    }
-
-                    if(task_index>=dl_task_count)
-                    {
-                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count");
-                        goto cleanup_err;
-                    }
-                    else
-                    {
-                        worker_id dl_compression_worker_id = 0;
-                        if (ENABLE_DL_AFFINITY)
-                        {
-                            dl_compression_worker_id = ((aggr_dlbfw_ptr)?pdctx->getDLWorkerID(dlbfw_core_index):pdctx->getDLWorkerID(num_dl_workers-dl_worker_offset));
-                        }
-                        task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                        task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDL1AggrCompression", task_work_function_dl_aggr_1_compression, static_cast<void*>(slot_map_dl),
-                                                        first_cell, num_cells, dl_task_count, dl_compression_worker_id);
-                        task_index++;
-                    }
-
-                    if(pdctx->gpuCommEnabledViaCpu())
-                    {
-                        if(task_index>=dl_task_count)
-                        {
-                            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count");
-                            goto cleanup_err;
-                        }
-                        else
-                        {
-                            task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                            // We use slot_advance + 1 to guarantee that the packets in the buffer are no longer used and the packets have been transmitted
-                            task_dl_ptr_list[task_index]->init(task_ts_exec[task_index]+ (t_ns)task_index, "TaskDL2RingCpuDoorbell", task_work_function_dl_aggr_2_ring_cpu_doorbell, static_cast<void*>(slot_map_dl),
-                                                                    first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(num_dl_workers-1) : 0);
-                            task_index++;
-                        }
-                    }
-                }
-            }
-
-            if(task_index>=dl_task_count)
-            {
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task index exceeds DL task count");
-                goto cleanup_err;
-            }
-            else
-            {
-                task_dl_ptr_list[task_index] = pdctx->getNextTask();
-                // We use slot_advance + 1 to guarantee that the packets in the buffer are no longer used and the packets have been transmitted
-                task_dl_ptr_list[task_index]->init(t_ns(t0_slot + Cell::getTtiNsFromMu(MU_SUPPORTED)), "TaskDL3Aggr", task_work_function_dl_aggr_3_buf_cleanup, static_cast<void*>(slot_map_dl),
-                                                        first_cell, num_cells, dl_task_count, (ENABLE_DL_AFFINITY) ? pdctx->getDLWorkerID(num_dl_workers-dl_worker_offset) : 0);
-                task_index++;
-            }
-            ///////////////////////////////////////////////////////////////////////
-            //// Enqueue tasks in the list
-            ///////////////////////////////////////////////////////////////////////
-            tListDl = pdctx->getTaskListDl();
-            tListDl->lock();
-            for(int tIndex = 0; tIndex < dl_task_count; tIndex++)
-                tListDl->push(task_dl_ptr_list[tIndex]);
-            tListDl->unlock();
-
-            if (pdctx->debug_worker_enabled()) {
-                auto debug_task = pdctx->getNextTask();
-                debug_task->init(task_ts_exec[0], "Debug", task_work_function_debug, static_cast<void*>(slot_map_dl),
-                                 first_cell, num_cells, dl_task_count, 0);
-                auto dl = pdctx->getTaskListDebug();
-                dl->lock();
-                dl->push(debug_task);
-                dl->unlock();
-            }
-            POP_RANGE
-
-            t_ns map_dl_end = Time::nowNs();
-
-            NVLOGI_FMT(TAG, "Enqueue DL tasks START: {} END: {} DURATION: {} us",map_dl_start.count() , map_dl_end.count() ,Time::NsToUs(map_dl_end - map_dl_start).count());
-        }
-        else
             goto cleanup_err;
+        }
     }
 
 
@@ -1932,6 +2346,14 @@ int l1_enqueue_phy_work(phydriver_handle pdh, struct slot_command_api::slot_comm
 
 cleanup_err:
     // NVSLOGE(TAG, AERIAL_CUPHYDRV_API_EVENT) << "Exit error";
+
+    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[ENQ_ERR] SFN {}.{} cleanup_err: slot_map_ul_id={} slot_map_dl_id={} aggr_pusch={} aggr_pucch={} aggr_prach={} aggr_srs={} aggr_pdsch={} aggr_ulbfw={} isAggrObjAvail={} isUlDlBufAvail={} isOKobjAvail={}",
+               sc->cell_groups.slot.slot_3gpp.sfn_, sc->cell_groups.slot.slot_3gpp.slot_,
+               slot_map_ul ? slot_map_ul->getId() : -1,
+               slot_map_dl ? slot_map_dl->getId() : -1,
+               aggr_pusch_ptr != nullptr, aggr_pucch_ptr != nullptr, aggr_prach_ptr != nullptr,
+               aggr_srs_ptr != nullptr, aggr_pdsch_ptr != nullptr, aggr_ulbfw_ptr != nullptr,
+               isAggrObjAvail, isUlDlBufAvail, isOKobjAvail);
 
     pdctx->getFhProxy()->updateDynamicBeamIdOffset();
 
@@ -1997,6 +2419,279 @@ cleanup_err:
 }
 
 
+
+namespace {
+
+// RAII guard for TaskList::lock() / TaskList::unlock().
+// TaskList::lock/unlock return int, so std::lock_guard<TaskList> does not
+// satisfy BasicLockable (which requires void return).  This minimal wrapper
+// provides the same exception-safety guarantee without any extra dependencies.
+// Precondition: list must be non-null.  Callers (l1_push_task_dl/ul) guarantee
+/// RAII lock/unlock guard for TaskList.
+/// Callers must guarantee @p list is non-null before constructing this guard:
+/// null-check pdctx before calling getTaskListDl/Ul(), and null-check tlist
+/// before constructing the guard (see l1_push_task_generic).
+struct TaskListLockGuard final
+{
+    TaskList* list = nullptr;
+    explicit TaskListLockGuard(TaskList* l) : list(l) { list->lock(); }
+    ~TaskListLockGuard()                               { list->unlock(); }
+    TaskListLockGuard(const TaskListLockGuard&)            = delete;
+    TaskListLockGuard& operator=(const TaskListLockGuard&) = delete;
+    TaskListLockGuard(TaskListLockGuard&&)                 = delete;
+    TaskListLockGuard& operator=(TaskListLockGuard&&)      = delete;
+};
+
+void l1_push_task_dl(phydriver_handle pdh, Task* task)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_task_dl: null pdctx; task dropped");
+        return;
+    }
+    TaskList* tList = pdctx->getTaskListDl();
+    if (tList == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_task_dl: null tList; task dropped");
+        return;
+    }
+    TaskListLockGuard guard(tList);
+    tList->push(task);
+}
+
+void l1_push_task_ul(phydriver_handle pdh, Task* task)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_task_ul: null pdctx; task dropped");
+        return;
+    }
+    TaskList* tList = pdctx->getTaskListUl();
+    if (tList == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_task_ul: null tList; task dropped");
+        return;
+    }
+    TaskListLockGuard guard(tList);
+    tList->push(task);
+}
+
+void l1_push_task_generic([[maybe_unused]] phydriver_handle pdh, Task* task, TaskList* tlist)
+{
+    if (tlist == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_task_generic: null tlist; task dropped");
+        return;
+    }
+    TaskListLockGuard guard(tlist);
+    tlist->push(task);
+}
+
+[[nodiscard]] Task* l1_get_next_task(phydriver_handle pdh)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_get_next_task: null pdctx; returning nullptr");
+        return nullptr;
+    }
+    return pdctx->getNextTask();
+}
+
+// Shared implementation for l1_push_new_dl_tasks_bulk and l1_push_new_ul_tasks_bulk.
+// Callers are responsible for the pdctx null check and for selecting the correct tList;
+// tList null is handled internally.
+[[nodiscard]] int push_tasks_bulk_impl(PhyDriverCtx* pdctx, TaskList* tList,
+                                       uint64_t ts_exec_ns,
+                                       std::span<const TaskSpec> specs,
+                                       const char* fn_name)
+{
+    if (tList == nullptr)
+    {
+        NVLOGW_FMT(TAG, "{}: null tList; {} tasks dropped", fn_name, specs.size());
+        return 0;
+    }
+
+    // Allocate and init all tasks before acquiring the lock so that the
+    // critical section only contains pushes (no heap allocation inside).
+
+    // Runtime bounds check: clamp to prevent a stack buffer overflow of ready[].
+    if (specs.size() > static_cast<std::size_t>(TaskSpec::BULK_MAX))
+    {
+        NVLOGW_FMT(TAG, "{}: specs.size()={} exceeds BULK_MAX={}; clamping to BULK_MAX",
+                   fn_name, specs.size(), TaskSpec::BULK_MAX);
+        specs = specs.first(TaskSpec::BULK_MAX);
+    }
+
+    Task* ready[TaskSpec::BULK_MAX]{};
+    int   n_ready = 0;
+    const t_ns ts{ static_cast<t_ns::rep>(ts_exec_ns) };
+
+    for (auto&& [i, spec] : ranges::views::enumerate(specs))
+    {
+        Task* task = pdctx->getNextTask();
+        if (task == nullptr)
+        {
+            NVLOGW_FMT(TAG, "{}: task pool exhausted at spec[{}] '{}'; "
+                       "{} of {} tasks skipped", fn_name, i, spec.name,
+                       specs.size() - static_cast<std::size_t>(i), specs.size());
+            break;
+        }
+        // l1_task_work_fn_t and task_work_function are identical types — no cast required.
+        if (task->init(ts, spec.name.data(), spec.fn, spec.arg,
+                       spec.first_cell, spec.num_cells, spec.num_tasks,
+                       spec.wid) != 0)
+        {
+            NVLOGW_FMT(TAG, "{}: task->init() failed for '{}'; skipped", fn_name, spec.name);
+            // Slot consumed from the ring; reused on next wrap-around.
+            continue;
+        }
+        ready[n_ready++] = task;
+    }
+
+    // Single lock/unlock for the entire batch.
+    return tList->push_bulk(std::span<Task* const>{ready, static_cast<std::size_t>(n_ready)});
+}
+
+} // namespace
+
+worker_id l1_get_dl_worker_id(phydriver_handle pdh, int worker_index)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_get_dl_worker_id: null pdctx; returning INVALID_WORKER_ID");
+        return INVALID_WORKER_ID;
+    }
+    return pdctx->getDLWorkerID(worker_index);
+}
+
+worker_id l1_get_ul_worker_id(phydriver_handle pdh, int worker_index)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_get_ul_worker_id: null pdctx; returning INVALID_WORKER_ID");
+        return INVALID_WORKER_ID;
+    }
+    return pdctx->getULWorkerID(worker_index);
+}
+
+uint8_t l1_get_cpu_task_tracing_mode(phydriver_handle pdh)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_get_cpu_task_tracing_mode: null pdctx; returning DISABLED (0)");
+        return 0;
+    }
+    return pdctx->enableCPUTaskTracing();
+}
+
+PMUDeltaSummarizer* l1_get_worker_pmu(Worker* worker)
+{
+    return worker != nullptr ? worker->getPMU() : nullptr;
+}
+
+[[nodiscard]] bool l1_push_new_dl_task(phydriver_handle pdh, uint64_t ts_exec_ns, const char* name,
+                                       l1_task_work_fn_t fn, void* arg,
+                                       int first_cell, int num_cells, int num_tasks,
+                                       worker_id desired_wid)
+{
+    if (StaticConversion<PhyDriverCtx>(pdh).get() == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "l1_push_new_dl_task: null pdh; task '{}' dropped", name);
+        return false;
+    }
+    Task* task = l1_get_next_task(pdh);
+    if (task == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_new_dl_task: task pool exhausted, dropping task '{}' "
+                   "(first_cell={}, num_cells={}, ts_ns={})",
+                   name, first_cell, num_cells, ts_exec_ns);
+        return false;
+    }
+
+    // l1_task_work_fn_t and task_work_function are identical types
+    // (int(*)(Worker*, void*, int, int, int)) — no cast required.
+    if (task->init(t_ns(static_cast<t_ns::rep>(ts_exec_ns)), name,
+                   fn, arg, first_cell, num_cells, num_tasks, desired_wid) != 0)
+    {
+        NVLOGW_FMT(TAG, "l1_push_new_dl_task: task->init() failed for '{}'; task dropped", name);
+        // NOTE: the slot is consumed from the ring (TASK_ITEM_NUM=2048) but not
+        // pushed — it is reused naturally when task_item_index next wraps around.
+        // init() failure is not observed in practice; if it becomes frequent,
+        // add an l1_return_task() API to recycle the slot immediately.
+        return false;
+    }
+    l1_push_task_dl(pdh, task);
+    return true;
+}
+
+[[nodiscard]] bool l1_push_new_ul_task(phydriver_handle pdh, uint64_t ts_exec_ns, const char* name,
+                                       l1_task_work_fn_t fn, void* arg,
+                                       int first_cell, int num_cells, int num_tasks,
+                                       worker_id desired_wid)
+{
+    if (StaticConversion<PhyDriverCtx>(pdh).get() == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "l1_push_new_ul_task: null pdh; task '{}' dropped", name);
+        return false;
+    }
+    Task* task = l1_get_next_task(pdh);
+    if (task == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_new_ul_task: task pool exhausted, dropping task '{}' "
+                   "(first_cell={}, num_cells={}, ts_ns={})",
+                   name, first_cell, num_cells, ts_exec_ns);
+        return false;
+    }
+
+    // l1_task_work_fn_t and task_work_function are identical types
+    // (int(*)(Worker*, void*, int, int, int)) — no cast required.
+    if (task->init(t_ns(static_cast<t_ns::rep>(ts_exec_ns)), name,
+                   fn, arg, first_cell, num_cells, num_tasks, desired_wid) != 0)
+    {
+        NVLOGW_FMT(TAG, "l1_push_new_ul_task: task->init() failed for '{}'; task dropped", name);
+        // NOTE: the slot is consumed from the ring (TASK_ITEM_NUM=2048) but not
+        // pushed — it is reused naturally when task_item_index next wraps around.
+        // init() failure is not observed in practice; if it becomes frequent,
+        // add an l1_return_task() API to recycle the slot immediately.
+        return false;
+    }
+    l1_push_task_ul(pdh, task);
+    return true;
+}
+
+[[nodiscard]] int l1_push_new_dl_tasks_bulk(phydriver_handle pdh, uint64_t ts_exec_ns,
+                                            std::span<const TaskSpec> specs)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_new_dl_tasks_bulk: null pdctx; {} tasks dropped", specs.size());
+        return 0;
+    }
+    return push_tasks_bulk_impl(pdctx, pdctx->getTaskListDl(),
+                                ts_exec_ns, specs,
+                                "l1_push_new_dl_tasks_bulk");
+}
+
+[[nodiscard]] int l1_push_new_ul_tasks_bulk(phydriver_handle pdh, uint64_t ts_exec_ns,
+                                            std::span<const TaskSpec> specs)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        NVLOGW_FMT(TAG, "l1_push_new_ul_tasks_bulk: null pdctx; {} tasks dropped", specs.size());
+        return 0;
+    }
+    return push_tasks_bulk_impl(pdctx, pdctx->getTaskListUl(),
+                                ts_exec_ns, specs,
+                                "l1_push_new_ul_tasks_bulk");
+}
 
 int l1_cell_create(phydriver_handle pdh, struct cell_phy_info& cell_pinfo)
 {
@@ -2223,6 +2918,27 @@ int l1_cell_update_attenuation(phydriver_handle pdh, uint16_t mplane_id, float a
     PHYDRIVER_CATCH_EXCEPTIONS();
 
     return 0;
+}
+
+void l1_bind_thread_to_phy_cuda_context(phydriver_handle pdh)
+{
+    if(pdh == nullptr)
+    {
+        return;
+    }
+    try
+    {
+        PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+        GpuDevice* gpu = pdctx->getFirstGpu();
+        if(gpu == nullptr)
+        {
+            NVLOGW_FMT(TAG, "{}: no GPU device", __func__);
+            return;
+        }
+        gpu->setDevice();
+        NVLOGC_FMT(TAG, "{}: thread bound to PHY CUDA primary context", __func__);
+    }
+    PHYDRIVER_CATCH_EXCEPTIONS_VOID();
 }
 
 int l1_update_gps_alpha_beta(phydriver_handle pdh,uint64_t alpha,int64_t beta)
@@ -2712,6 +3428,23 @@ int l1_cell_update_cell_config(phydriver_handle pdh, uint16_t mplane_id, std::un
     return 0;
 }
 
+bool l1_phy_cell_id_mismatch(phydriver_handle pdh, uint16_t mplane_id, uint16_t new_phy_cell_id)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if(pdctx == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: failed to get PhyDriverCtx", __func__);
+        return true;
+    }
+
+    Cell* cell_ptr = pdctx->getCellByMplaneId(mplane_id);
+    if (cell_ptr == nullptr) {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: failed to getCellByMplaneId {}", __func__ , mplane_id);
+        return true;
+    }
+    return pdctx->phyCellIdMismatch(cell_ptr->getPhyId(), new_phy_cell_id, cell_ptr->getId());
+}
+
 int l1_cell_update_cell_config(phydriver_handle pdh, struct cell_phy_info& cell_pinfo, CellUpdateCallBackFn& callback)
 {
     PhyDriverCtx* pdctx = nullptr;
@@ -2780,6 +3513,147 @@ int l1_cell_update_cell_config(phydriver_handle pdh, struct cell_phy_info& cell_
     return 0;
 }
 
+namespace {
+
+[[nodiscard]] int update_cell_static_config(PhyDriverCtx& pdctx, Cell& cell, cell_phy_info& cell_pinfo)
+{
+    if(cell.getPhyId() != cell_pinfo.phy_stat.phyCellId)
+    {
+        const int ret = pdctx.setCellPhyId(cell.getPhyId(), cell_pinfo.phy_stat.phyCellId, cell.getId());
+        if(ret)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}:setCellPhyId error {}", __func__ , ret);
+            return ret;
+        }
+    }
+
+    const int ret = cell.setPhyStatic(cell_pinfo);
+    if(ret)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}:setPhyStaticInfo error {}", __func__ , ret);
+    }
+    return ret;
+}
+
+[[nodiscard]] int finish_prach_update_caller_runs(PhyDriverCtx& pdctx)
+{
+    if(pdctx.createPrachObjects() != 0)
+    {
+        return -1;
+    }
+    return pdctx.replacePrachObjectsCallerRuns();
+}
+
+// Resolved (PhyDriverCtx, Cell) pair for a cell reconfiguration request; both null on
+// either lookup failure (already logged).
+struct ResolvedCellCtx
+{
+    PhyDriverCtx* pdctx;
+    Cell*         cell;
+};
+
+// Shared preamble for the caller-runs reconfig entry: phydriver_handle + mplane_id ->
+// (PhyDriverCtx&, Cell&), logging and returning {nullptr, nullptr} on failure.
+[[nodiscard]] ResolvedCellCtx resolve_cell_ctx(phydriver_handle pdh, const cell_phy_info& cell_pinfo, const char* caller)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if(pdctx == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: failed to get PhyDriverCtx", caller);
+        return {nullptr, nullptr};
+    }
+    Cell* cell = pdctx->getCellByMplaneId(cell_pinfo.mplane_id);
+    if(cell == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: could not get cell for mplane_id {}", caller, cell_pinfo.mplane_id);
+        return {nullptr, nullptr};
+    }
+    return {pdctx, cell};
+}
+
+} // namespace
+
+int l1_cell_update_cell_config_caller_runs(phydriver_handle pdh, cell_phy_info& cell_pinfo)
+{
+    const ResolvedCellCtx ctx = resolve_cell_ctx(pdh, cell_pinfo, __func__);
+    if(ctx.pdctx == nullptr)
+    {
+        return -1;
+    }
+
+    // Single entry point; the active? branch lives here rather than in the caller. The
+    // decision uses cuphydriver's own active-cell state (hasActiveCells) -- the same truth
+    // the inactive path already gated on, and the one the cuPHY PRACH handles depend on.
+    if(ctx.pdctx->hasActiveCells())
+    {
+#ifdef ENABLE_FAPI_STORE_REPLAY
+        // Other cells are running: reconfigure without disrupting them via the offload
+        // PRACH handover. reconfigure() owns the stage -> create -> static-config ->
+        // commit -> arm ordering and the rollback; the live vectors publish and the
+        // per-aggregator cuPHY handle swap then drains at slot boundaries with no blocking
+        // wait (mirrors legacy cell_update_config_func + getNextPrachAggr).
+        NVLOGI_FMT(TAG, "Offload active-cell PRACH reconfig for PCI {} new PCI {}",
+            ctx.cell->getPhyId(), cell_pinfo.phy_stat.phyCellId);
+
+        PrachOffloadReconfig&        reconfig = ctx.pdctx->prachOffloadReconfig();
+        const PrachReconfigOutcome   outcome  = reconfig.reconfigure(
+            *ctx.cell, cell_pinfo,
+            [&]() -> int { return update_cell_static_config(*ctx.pdctx, *ctx.cell, cell_pinfo); });
+
+        if(outcome != PrachReconfigOutcome::Committed)
+        {
+            // The failing step logs its own cause; this is the summary (outcome value
+            // included for correlation).
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                "{}: active-cell PRACH reconfig failed for PCI {} (outcome={})",
+                __func__, ctx.cell->getPhyId(), static_cast<int>(outcome));
+            return -1;
+        }
+        return 0;
+#else
+        NVLOGW_FMT(TAG, "{}: active-cell caller-runs reconfig is not supported", __func__);
+        return -1;
+#endif
+    }
+
+    // No active cells: synchronous caller-runs reconfig (legacy). Static config first,
+    // then the PRACH objects are (re)created and swapped all at once -- safe while idle.
+    NVLOGI_FMT(TAG, "Caller-runs update cell config received for PCI {} new PCI {}",
+        ctx.cell->getPhyId(), cell_pinfo.phy_stat.phyCellId);
+
+    const int ret = update_cell_static_config(*ctx.pdctx, *ctx.cell, cell_pinfo);
+    if(ret != 0)
+    {
+        return ret;
+    }
+
+    const int update_ret = ctx.pdctx->updateCellConfig(ctx.cell->getId(), cell_pinfo);
+    if(update_ret == -1)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "updateCellConfig failed");
+        return update_ret;
+    }
+    if(update_ret == 1)
+    {
+        return finish_prach_update_caller_runs(*ctx.pdctx);
+    }
+    NVLOGI_FMT(TAG, "Successful caller-runs update of cell config. Return 0");
+    return 0;
+}
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+void l1_try_commit_prach_offload_handover(phydriver_handle pdh)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if(pdctx != nullptr)
+    {
+        // Lock-free no-op unless an offload PRACH handover is armed; otherwise
+        // drains one incremental per-aggregator handle swap for this slot.
+        pdctx->prachOffloadReconfig().tryCommit();
+    }
+}
+#endif // ENABLE_FAPI_STORE_REPLAY
+
 uint8_t l1_get_prach_start_ro_index(phydriver_handle pdh, uint16_t phyCellId)
 {
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
@@ -2826,71 +3700,75 @@ bool l1_deAllocSrsChesBuffPool(phydriver_handle pdh, uint16_t phyCellId)
 void l1_copy_TB_to_gpu_buf(phydriver_handle pdh, uint16_t phy_cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref, uint32_t tb_len, uint8_t slot_index)
 {
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    auto* mgr = pdctx->getH2DCopyManager();
     Cell* c = pdctx->getCellByPhyId(phy_cell_id);
     (*gpu_buff_ref) = (uint8_t *)c->get_pdsch_tb_buffer(slot_index);
-    /*All cuda operation should happen in PDSCH context*/
-    pdctx->enable_prepone_h2d_cpy = true;
+    mgr->setPreponeEnabled(true);
     NVLOGI_FMT(TAG, "l1_copy_TB_to_gpu_buf pdh={} cell_id={} tb_buff={} gpu_buff_ref={} tb_len={} slot_index={}",(void*)pdh,phy_cell_id,(void*)tb_buff,(void*)gpu_buff_ref,tb_len,slot_index);
-    pdctx->getPdschMpsCtx()->setCtx();
-    
-    if(pdctx->num_pdsch_buff_copy == 0)
-    {
-        CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_start(slot_index), pdctx->getH2DCpyStream()));
-    }
-    
-    CUDA_CHECK(cudaMemcpyAsync((uint32_t*)(* gpu_buff_ref),
-                                            tb_buff,
-                                            tb_len,
-                                            cudaMemcpyHostToDevice,
-                                            pdctx->getH2DCpyStream()));
-    if(++(pdctx->num_pdsch_buff_copy) == pdctx->getCellNum())
-    {
-        pdctx->num_pdsch_buff_copy = 0;
+    mgr->setCtx();
 
-        CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_complete(slot_index), pdctx->getH2DCpyStream()));
+    if(mgr->getBuffCopyCount() == 0)
+    {
+        CUDA_CHECK(cudaEventRecord(mgr->getStartEvent(slot_index), mgr->getStream()));
     }
 
+    CUDA_CHECK(cudaMemcpyAsync(aerial::casts::assume_cast<uint32_t>(*gpu_buff_ref),
+                               tb_buff,
+                               tb_len,
+                               cudaMemcpyHostToDevice,
+                               mgr->getStream()));
+    if(mgr->incBuffCopyCount() == pdctx->getCellNum())
+    {
+        mgr->setBuffCopyCount(0);
+        CUDA_CHECK(cudaEventRecord(mgr->getCompleteEvent(slot_index), mgr->getStream()));
+    }
 }
 
-void* l1_copy_TB_to_gpu_buf_thread_func(void* arg)
+void l1_copy_TB_to_gpu_buf_thread_func(phydriver_handle pdh, std::stop_token st)
 {
     NVLOGI_FMT(TAG,"l1_copy_TB_to_gpu_buf_thread_func Entry");
-    phydriver_handle pdh = reinterpret_cast<phydriver_handle>(arg);
     PhyDriverCtx* pdctx =  StaticConversion<PhyDriverCtx>(pdh).get();
-    h2d_copy_prepone_info_t h2d_cpy_info;
-    Cell* c;
-    uint16_t h2d_read_idx,h2d_write_idx;
-    int h2d_copy_done_cur_slot_idx;
+    auto* mgr = pdctx->getH2DCopyManager();
+    h2d_copy_prepone_info_t h2d_cpy_info{};
+    Cell*    c{nullptr};
+    uint16_t h2d_ri{};
+    uint16_t h2d_wi{};
+    int      h2d_done_slot_idx{-1};
 
     std::vector<cuphyBatchedMemcpyHelper> batched_memcpy_helper;
     batched_memcpy_helper.reserve(PDSCH_MAX_GPU_BUFFS);
     std::generate_n(std::back_inserter(batched_memcpy_helper), PDSCH_MAX_GPU_BUFFS,
-        [pdctx]() { 
-            return cuphyBatchedMemcpyHelper(DL_MAX_CELLS_PER_SLOT, batchedMemcpySrcHint::srcIsHost, batchedMemcpyDstHint::dstIsDevice, (CUPHYDRIVER_PDSCH_USE_BATCHED_COPY == 1) && (pdctx->getUseBatchedMemcpy() == 1)); 
+        [mgr]() {
+            return cuphyBatchedMemcpyHelper(DL_MAX_CELLS_PER_SLOT, batchedMemcpySrcHint::srcIsHost, batchedMemcpyDstHint::dstIsDevice, (CUPHYDRIVER_PDSCH_USE_BATCHED_COPY == 1) && mgr->getUseBatchedMemcpy());
         });
-    std::for_each(batched_memcpy_helper.begin(), batched_memcpy_helper.end(), 
+    std::for_each(batched_memcpy_helper.begin(), batched_memcpy_helper.end(),
         [](auto& helper) { helper.reset(); });
 
-    //NVLOGE(TAG, AERIAL_CUPHYDRV_API_EVENT, "Thread func has CUPHYDRIVER_PDSCH_USE_BATCHED_COPY=%d and BATCHING_GRANULARITY %d for CUDA_VERSION %d\n",
-    //           CUPHYDRIVER_PDSCH_USE_BATCHED_COPY, BATCHED_COPY_THREAD_COPY_GRANULARITY, CUDA_VERSION);
-
-    //bool do_batched_memcpy = (CUPHYDRIVER_PDSCH_USE_BATCHED_COPY == 1) && (pdctx->getUseBatchedMemcpy() == 1) && (CUDA_VERSION >= 12080);
-    cudaStream_t h2d_copy_stream = pdctx->getH2DCpyStream();
+    cudaStream_t h2d_copy_stream = mgr->getStream();
     std::array<int32_t, PDSCH_MAX_GPU_BUFFS> active_batch_sfn;
     active_batch_sfn.fill(-1);
 
-    while(1)
+    // Set context on this thread once at startup, so any overhead when running through
+    // tools, e.g., for the first CUDA API call like cuCtxSetCurrent, is paid here and not
+    // on the critical path later.
+    mgr->setCtx();
+
+    // Cooperative shutdown via std::jthread's built-in stop_token:
+    // PdschH2DCopyManager::stopThread() calls request_stop() and joins.
+    // st.stop_requested() flips to true on the next iteration; the loop
+    // exits and the destructor tears down the CUDA stream/events without
+    // use-after-free on the captured `mgr`/`pdctx`.
+    while (!st.stop_requested())
     {
-            h2d_read_idx=pdctx->h2d_read_idx;
-            h2d_write_idx=pdctx->h2d_write_idx;
-            h2d_copy_done_cur_slot_idx=pdctx->h2d_copy_done_cur_slot_idx[pdctx->h2d_copy_done_cur_slot_read_idx].load(std::memory_order_acquire);
-            if(h2d_read_idx!=h2d_write_idx)
+            h2d_ri = mgr->readIdx();
+            h2d_wi = mgr->writeIdx();
+            h2d_done_slot_idx = mgr->doneCurSlotIdx()[mgr->doneCurSlotReadIdx()].load(std::memory_order_acquire);
+            if(h2d_ri != h2d_wi)
             {
-                h2d_cpy_info=(h2d_copy_prepone_info_t)(*pdctx->get_h2d_copy_prepone_info(pdctx->h2d_read_idx));
+                h2d_cpy_info = (h2d_copy_prepone_info_t)(*mgr->getPreponeInfo(mgr->readIdx()));
                 c = pdctx->getCellByPhyId(h2d_cpy_info.phy_cell_id);
-                NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_func pdh={} cell_id={} tb_buff={} gpu_buff_ref={} tb_len={} slot_index={} h2d_read_idx={} h2d_write_idx={}",pdh,h2d_cpy_info.phy_cell_id,(void*)h2d_cpy_info.tb_buff,(void*)h2d_cpy_info.gpu_buff_ref,h2d_cpy_info.tb_len,h2d_cpy_info.slot_index,h2d_read_idx,h2d_write_idx);
-                /*All cuda operation should happen in PDSCH context*/
-                pdctx->getPdschMpsCtx()->setCtx();
+                NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_func pdh={} cell_id={} tb_buff={} gpu_buff_ref={} tb_len={} slot_index={} h2d_read_idx={} h2d_write_idx={}",pdh,h2d_cpy_info.phy_cell_id,(void*)h2d_cpy_info.tb_buff,(void*)h2d_cpy_info.gpu_buff_ref,h2d_cpy_info.tb_len,h2d_cpy_info.slot_index,h2d_ri,h2d_wi);
+                mgr->setCtx();
 
                 uint8_t si = h2d_cpy_info.slot_index;
                 if (batched_memcpy_helper[si].getMemcpyCount() > 0 &&
@@ -2904,69 +3782,75 @@ void* l1_copy_TB_to_gpu_buf_thread_func(void* arg)
                 }
                 active_batch_sfn[si] = static_cast<int32_t>(h2d_cpy_info.sfn);
 
-                // orig memcpy had a (uint32_t*)(c->get_pdsch_tb_buffer(h2d_cpy_info.slot_index))
                 batched_memcpy_helper[h2d_cpy_info.slot_index].updateMemcpy((uint32_t*)c->get_pdsch_tb_buffer(h2d_cpy_info.slot_index),
                                                    h2d_cpy_info.tb_buff,
                                                    h2d_cpy_info.tb_len,
                                                    cudaMemcpyHostToDevice,
                                                    h2d_copy_stream);
 
-    /*
-                if(++(pdctx->num_pdsch_buff_copy) == pdctx->getCellNum())
-                {
-                    pdctx->num_pdsch_buff_copy = 0;
-
-                    CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_complete(), pdctx->getH2DCpyStream()));
-                    pdctx->h2d_copy_cuda_event_rec_done=true; //now an array; did not update commented out code
-                }
-    */
-                pdctx->h2d_read_idx=(pdctx->h2d_read_idx+1)%(DL_MAX_CELLS_PER_SLOT*PDSCH_MAX_GPU_BUFFS);
-                NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_func cell_id={},h2d_read_idx={},h2d_write_idx={}", h2d_cpy_info.phy_cell_id,(int)h2d_read_idx,(int)h2d_write_idx);
+                mgr->readIdx() = (mgr->readIdx() + 1) % (DL_MAX_CELLS_PER_SLOT * PDSCH_MAX_GPU_BUFFS);
+                NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_func cell_id={},h2d_read_idx={},h2d_write_idx={}", h2d_cpy_info.phy_cell_id,(int)h2d_ri,(int)h2d_wi);
             }
-            if(h2d_copy_done_cur_slot_idx>=0)
+            if(h2d_done_slot_idx >= 0)
             {
-                uint8_t slot_index = h2d_copy_done_cur_slot_idx % PDSCH_MAX_GPU_BUFFS;
-                h2d_cpy_info=(h2d_copy_prepone_info_t)(*pdctx->get_h2d_copy_prepone_info(pdctx->h2d_read_idx));
-                if ((slot_index == h2d_cpy_info.slot_index) && (h2d_read_idx!=h2d_write_idx))
+                uint8_t slot_index = h2d_done_slot_idx % PDSCH_MAX_GPU_BUFFS;
+                h2d_cpy_info = (h2d_copy_prepone_info_t)(*mgr->getPreponeInfo(mgr->readIdx()));
+                if ((slot_index == h2d_cpy_info.slot_index) && (h2d_ri != h2d_wi))
                 {
-                    continue; //We do not yet want to launch the batched memcpy if the slot index is the same as the one we are currently updating the batched memcpy object with (yet to transition to the next slot) OR if the h2d_read_idx and h2d_write_idx are the same (read index yet to catch up with write index)
+                    continue;
                 }
-                pdctx->getPdschMpsCtx()->setCtx();
+                mgr->setCtx();
 
+                cuphyStatus_t launch_status = CUPHY_STATUS_SUCCESS;
                 if (batched_memcpy_helper[slot_index].getMemcpyCount() != 0)
                 {
-                    CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_start(h2d_copy_done_cur_slot_idx), pdctx->getH2DCpyStream()));
-                    
+                    CUDA_CHECK(cudaEventRecord(mgr->getStartEvent(h2d_done_slot_idx), mgr->getStream()));
+
                     NVLOGI_FMT(TAG, "Launching batched memcpy with {} copies for slot {} ", batched_memcpy_helper[slot_index].getMemcpyCount(), slot_index);
-                    cuphyStatus_t status = batched_memcpy_helper[slot_index].launchBatchedMemcpy(h2d_copy_stream);
-                    if (status != CUPHY_STATUS_SUCCESS)
+                    launch_status = batched_memcpy_helper[slot_index].launchBatchedMemcpy(h2d_copy_stream);
+                    if (launch_status != CUPHY_STATUS_SUCCESS) [[unlikely]]
                     {
-                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: Launching batched memcpy returned an error", __func__);
-                        // not throwing an exception just logging an error as the only side-effect is that PDSCH will process invalid data, but this will not cause any other issues
+                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                                   "{}: launchBatchedMemcpy failed st={} slot={} - "
+                                   "complete event NOT recorded; PDSCH will time out",
+                                   __func__, static_cast<int>(launch_status), slot_index);
                     }
                     batched_memcpy_helper[slot_index].reset();
                 }
                 active_batch_sfn[slot_index] = -1;
 
-                NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_func triggering cudaEventRecord h2d_read_idx={},h2d_write_idx={}",(int)h2d_read_idx,(int)h2d_write_idx);
-                CUDA_CHECK(cudaEventRecord(pdctx->get_event_pdsch_tb_cpy_complete(h2d_copy_done_cur_slot_idx), pdctx->getH2DCpyStream()));
-                pdctx->h2d_copy_cuda_event_rec_done[slot_index].store(true,std::memory_order_relaxed);
-                pdctx->h2d_copy_done_cur_slot_idx[pdctx->h2d_copy_done_cur_slot_read_idx].store(-1,std::memory_order_relaxed);
-                pdctx->h2d_copy_done_cur_slot_read_idx = (pdctx->h2d_copy_done_cur_slot_read_idx + 1) % PDSCH_MAX_GPU_BUFFS;
+                NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_func triggering cudaEventRecord h2d_read_idx={},h2d_write_idx={}",(int)h2d_ri,(int)h2d_wi);
+                // Only record complete event on launch success — otherwise a
+                // downstream cudaStreamWaitEvent would proceed even though the
+                // DMA never completed, producing silent data corruption. The
+                // flag below is still set so the consumer's spin exits and
+                // PDSCH fails fast with a clear "TB never arrived" symptom.
+                if (launch_status == CUPHY_STATUS_SUCCESS) [[likely]]
+                {
+                    CUDA_CHECK(cudaEventRecord(mgr->getCompleteEvent(h2d_done_slot_idx), mgr->getStream()));
+                }
+                // Release: synchronizes-with the acquire-load in
+                // waitH2dCopyCudaEventRec (phypdsch_aggr.cpp). The consumer
+                // then issues cudaStreamWaitEvent on the just-recorded
+                // complete event — that ordering must be observable on ARM
+                // (Grace), where a relaxed store would allow reordering of
+                // the cudaEventRecord after the flag write.
+                mgr->cudaEventRecDone()[slot_index].store(true, std::memory_order_release);
+                mgr->doneCurSlotIdx()[mgr->doneCurSlotReadIdx()].store(-1, std::memory_order_relaxed);
+                mgr->doneCurSlotReadIdx() = (mgr->doneCurSlotReadIdx() + 1) % PDSCH_MAX_GPU_BUFFS;
             }
             else
             {
                 std::this_thread::sleep_for(std::chrono::nanoseconds(5000));
             }
     }
-    return nullptr;
 }
 
 void l1_copy_TB_to_gpu_buf_thread_offload(phydriver_handle pdh, uint16_t phy_cell_id, uint8_t * tb_buff, uint8_t ** gpu_buff_ref, uint32_t tb_len, uint8_t slot_index, uint16_t sfn)
 {
     h2d_copy_prepone_info_t h2d_cpy_info;
-    h2d_copy_prepone_info_t* h2d_cpy_info_pdctx;
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    auto* mgr = pdctx->getH2DCopyManager();
     h2d_cpy_info.pdh=pdh;
     h2d_cpy_info.phy_cell_id=phy_cell_id;
     h2d_cpy_info.tb_buff=tb_buff;
@@ -2976,32 +3860,119 @@ void l1_copy_TB_to_gpu_buf_thread_offload(phydriver_handle pdh, uint16_t phy_cel
     h2d_cpy_info.sfn=sfn;
     Cell* c = pdctx->getCellByPhyId(phy_cell_id);
     (*gpu_buff_ref) = (uint8_t *)c->get_pdsch_tb_buffer(slot_index);
-    pdctx->enable_prepone_h2d_cpy = true;
-    NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_offload pdh={} cell_id={} tb_buff={} gpu_buff_ref={} tb_len={} slot_index={} h2d_copy_thread_enable={}",(void*)pdh,phy_cell_id,(void*)tb_buff,(void*)gpu_buff_ref,tb_len,slot_index,pdctx->h2d_copy_thread_enable);
-    if(!pdctx->h2d_copy_thread_enable)
+    mgr->setPreponeEnabled(true);
+    NVLOGD_FMT(TAG, "l1_copy_TB_to_gpu_buf_thread_offload pdh={} cell_id={} tb_buff={} gpu_buff_ref={} tb_len={} slot_index={} h2d_copy_thread_enable={}",(void*)pdh,phy_cell_id,(void*)tb_buff,(void*)gpu_buff_ref,tb_len,slot_index,mgr->isThreadEnabled());
+    if(!mgr->isThreadEnabled())
     {
-        // This is not taking into consideration BATCHED_COPY_THREAD_COPY_GRANULARITY.
-        pdctx->updateBatchedMemcpyInfo((uint32_t*)c->get_pdsch_tb_buffer(h2d_cpy_info.slot_index),
+        mgr->updateBatchedMemcpyInfo((uint32_t*)c->get_pdsch_tb_buffer(h2d_cpy_info.slot_index),
                                 h2d_cpy_info.tb_buff,
                                 h2d_cpy_info.tb_len);
-
     }
     else
     {
-        uint16_t h2d_widx=pdctx->h2d_write_idx;
-        h2d_cpy_info_pdctx=pdctx->get_h2d_copy_prepone_info(h2d_widx);
-        *h2d_cpy_info_pdctx=h2d_cpy_info;
-        h2d_widx=(h2d_widx+1)%(DL_MAX_CELLS_PER_SLOT*PDSCH_MAX_GPU_BUFFS);
-        pdctx->h2d_write_idx=h2d_widx;
+        uint16_t h2d_widx = mgr->writeIdx();
+        h2d_copy_prepone_info_t* h2d_cpy_info_mgr = mgr->getPreponeInfo(h2d_widx);
+        *h2d_cpy_info_mgr = h2d_cpy_info;
+        h2d_widx = (h2d_widx + 1) % (DL_MAX_CELLS_PER_SLOT * PDSCH_MAX_GPU_BUFFS);
+        mgr->writeIdx() = h2d_widx;
     }
 }
 
 void l1_set_h2d_copy_done_cur_slot_flag(phydriver_handle pdh,int slot_idx)
 {
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
-    pdctx->h2d_copy_done_cur_slot_idx[pdctx->h2d_copy_done_cur_slot_write_idx].store(slot_idx,std::memory_order_release);
-    pdctx->h2d_copy_done_cur_slot_write_idx = (pdctx->h2d_copy_done_cur_slot_write_idx + 1) % PDSCH_MAX_GPU_BUFFS;
+    auto* mgr = pdctx->getH2DCopyManager();
+    mgr->doneCurSlotIdx()[mgr->doneCurSlotWriteIdx()].store(slot_idx, std::memory_order_release);
+    mgr->doneCurSlotWriteIdx() = (mgr->doneCurSlotWriteIdx() + 1) % PDSCH_MAX_GPU_BUFFS;
     NVLOGD_FMT(TAG, "l1_set_h2d_copy_done_cur_slot_flag Set h2d_copy_done_cur_slot to true for slot_idx(%d)",slot_idx);
+}
+
+int l1_stage_tb_h2d(const phydriver_handle pdh,
+                    const uint16_t         phy_cell_id,
+                    const uint8_t*         shm_src,
+                    const uint32_t         len,
+                    const uint8_t          slot_index,
+                    uint8_t**              gpu_buf_out)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr || shm_src == nullptr || gpu_buf_out == nullptr || len == 0U)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                   "l1_stage_tb_h2d: invalid args pdctx=0x{:x} shm_src=0x{:x} gpu_buf_out=0x{:x} len={}",
+                   reinterpret_cast<uintptr_t>(pdctx), reinterpret_cast<uintptr_t>(shm_src),
+                   reinterpret_cast<uintptr_t>(gpu_buf_out), len);
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    auto* mgr = pdctx->getH2DCopyManager();
+    Cell* c = pdctx->getCellByPhyId(phy_cell_id);
+    if (c == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                   "l1_stage_tb_h2d: cell not found cell_id={}", phy_cell_id);
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    void* const gpu = c->get_pdsch_tb_buffer(slot_index);
+    if (gpu == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                   "l1_stage_tb_h2d: null GPU buffer cell_id={} slot_index={}", phy_cell_id, slot_index);
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    *gpu_buf_out = static_cast<uint8_t*>(gpu);
+    mgr->setPreponeEnabled(true);
+    mgr->updateBatchedMemcpyInfo(aerial::casts::assume_cast<uint32_t>(gpu),
+                                 shm_src,
+                                 static_cast<std::size_t>(len));
+    NVLOGD_FMT(TAG,
+               "l1_stage_tb_h2d: OK cell_id={} len={} slot_index={} gpu=0x{:x}",
+               phy_cell_id, len, slot_index, reinterpret_cast<uintptr_t>(gpu));
+    return CUPHY_STATUS_SUCCESS;
+}
+
+int l1_launch_tb_h2d(const phydriver_handle pdh, const uint16_t slot_in_frame)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        return static_cast<int>(CUPHY_STATUS_INVALID_ARGUMENT);
+    }
+    auto* mgr = pdctx->getH2DCopyManager();
+    const uint8_t ev_slot = static_cast<uint8_t>(slot_in_frame);
+    mgr->setCtx();
+    CUDA_CHECK(cudaEventRecord(mgr->getStartEvent(ev_slot), mgr->getStream()));
+    cuphyStatus_t const st = mgr->performBatchedMemcpy();
+    mgr->resetBatchedMemcpyBatches();
+    if (st != CUPHY_STATUS_SUCCESS)
+    {
+        NVLOGE_FMT(TAG,
+                   AERIAL_CUPHYDRV_API_EVENT,
+                   "l1_launch_tb_h2d: performBatchedMemcpy failed st={} slot={} - "
+                   "TB H2D complete event NOT recorded; PDSCH will time out",
+                   static_cast<int>(st),
+                   ev_slot);
+        return static_cast<int>(st);
+    }
+    CUDA_CHECK(cudaEventRecord(mgr->getCompleteEvent(ev_slot), mgr->getStream()));
+    // The buffer-ring index is semantically independent from SLOTS_PER_FRAME
+    // even though both happen to be 20 today, so wrap explicitly to match
+    // what the copy-thread path at L3570 does.
+    const uint8_t buf_slot = ev_slot % PDSCH_MAX_GPU_BUFFS;
+    // Release: synchronizes-with the acquire-load in waitH2dCopyCudaEventRec
+    // (phypdsch_aggr.cpp). Mirrors the copy-thread path; required on Grace.
+    mgr->cudaEventRecDone()[buf_slot].store(true, std::memory_order_release);
+    mgr->markBatchLaunched(buf_slot);
+    return static_cast<int>(st);
+}
+
+bool l1_get_h2d_copy_thread_enable(const phydriver_handle pdh)
+{
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr)
+    {
+        return false;
+    }
+    auto* mgr = pdctx->getH2DCopyManager();
+    return mgr->isThreadEnabled();
 }
 
 int l1_cv_mem_bank_update(phydriver_handle pdh,uint32_t cell_id,uint16_t rnti,uint16_t buffer_idx,uint16_t reportType,uint16_t startPrbGrp,uint32_t srsPrbGrpSize ,uint16_t numPrgs,
@@ -3019,7 +3990,7 @@ int l1_cv_mem_bank_update(phydriver_handle pdh,uint32_t cell_id,uint16_t rnti,ui
     NVLOGD_FMT(TAG, "cell_id {} rnti {} startPrbGrp {} srsPrbGrpSize{} ",cell_id,rnti,startPrbGrp,srsPrbGrpSize);
 
     CVSrsChestBuff *buffer = nullptr;
-    if(cv->preAllocateBuffer(cell_id, rnti, buffer_idx, reportType, &buffer))
+    if(cv->preAllocateBuffer(cell_id, rnti, buffer_idx, reportType, &buffer, nullptr))
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{}: allocateBuffer returned error", __func__);
         return -1;
@@ -3045,7 +4016,7 @@ int l1_cv_mem_bank_update(phydriver_handle pdh,uint32_t cell_id,uint16_t rnti,ui
             uint32_t addrOffset=size_of_half2 * (i*nGnbAnt*numPrgs + j*numPrgs + k);
             dst = buffer->getAddr() + addrOffset;
             // TODO replace w/ 3D memcopy
-            CUDA_CHECK(cudaMemcpy(dst,srsChEsts+offset+addrOffset,size_of_half2*numPrgs,cudaMemcpyHostToDevice));
+            CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(dst), srsChEsts + offset + addrOffset, size_of_half2 * numPrgs));
         }
     }
     return 0;
@@ -3436,13 +4407,25 @@ bool l1_check_cuphy_objects_status(phydriver_handle pdh)
 void l1_resetBatchedMemcpyBatches(phydriver_handle pdh)
 {
     auto* pdctx =  StaticConversion<PhyDriverCtx>(pdh).get();
-    pdctx->resetBatchedMemcpyBatches();
+    pdctx->getH2DCopyManager()->resetBatchedMemcpyBatches();
 }
 
 uint8_t l1_get_enable_weighted_average_cfo(phydriver_handle pdh)
 {
     auto* pdctx =  StaticConversion<PhyDriverCtx>(pdh).get();
     return pdctx->getEnableWeightedAverageCfo();
+}
+
+uint8_t l1_get_cplane_processing_dl_batch_size(phydriver_handle pdh)
+{
+    auto* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    return pdctx->getCplaneProcessingDlBatchSize();
+}
+
+uint8_t l1_get_cplane_processing_ul_batch_size(phydriver_handle pdh)
+{
+    auto* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    return pdctx->getCplaneProcessingUlBatchSize();
 }
 
 bool l1_get_split_ul_cuda_streams(phydriver_handle pdh)
@@ -3455,4 +4438,331 @@ bool l1_get_dl_tx_notification(phydriver_handle pdh)
 {
     auto* pdctx =  StaticConversion<PhyDriverCtx>(pdh).get();
     return pdctx->getEnableTxNotification();
+}
+
+[[nodiscard]] int l1_init_cplane_generator(phydriver_handle pdh,
+                                           bool bf_enabled,
+                                           bool precoding_enabled)
+{
+    if (!pdh) return 0;
+    auto* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    auto* svc = pdctx->getFrameworkCPlaneService();
+    if (!svc) return 0;
+    return svc->init(pdctx, pdctx->getSortedCells(), bf_enabled, precoding_enabled);
+}
+
+[[nodiscard]] int l1_recordDirectBfwCviRecord(const phydriver_handle pdh,
+                                              const uint16_t cell_id,
+                                              const direct_bfw_cvi_record& record)
+{
+    if (!pdh) {
+        return -1;
+    }
+    auto* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (pdctx == nullptr) {
+        return -1;
+    }
+    return pdctx->recordDirectBfwCviRecord(cell_id, record);
+}
+
+[[nodiscard]] int l1_send_dl_cplane_from_stored_msg(phydriver_handle pdh,
+                                                     const nv::phy_mac_msg_desc* dl_tti,
+                                                     const nv::phy_mac_msg_desc* ul_dci,
+                                                     std::size_t transaction_id,
+                                                     SlotMapDl* slot_map_dl)
+{
+    if (!pdh) return 0;
+    auto* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    auto* svc = pdctx->getFrameworkCPlaneService();
+    if (!svc || !svc->is_active()) return 0;
+    return svc->send_dl_cplane(dl_tti, ul_dci, transaction_id, slot_map_dl);
+}
+
+[[nodiscard]] int l1_send_ul_cplane_from_stored_msg(phydriver_handle pdh,
+                                                     const nv::phy_mac_msg_desc* ul_tti,
+                                                     std::size_t transaction_id,
+                                                     SlotMapUl* slot_map_ul)
+{
+    if (!pdh) return 0;
+    auto* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    auto* svc = pdctx->getFrameworkCPlaneService();
+    if (!svc || !svc->is_active()) return 0;
+    return svc->send_ul_cplane(ul_tti, transaction_id, slot_map_ul);
+}
+
+bool l1_is_fapi_to_cplane_direct(phydriver_handle pdh)
+{
+    if (!pdh) return false;
+    auto* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    return pdctx && pdctx->isFapiToCplaneDirect();
+}
+
+void l1_signal_dl_cplane_batch_done(void* slot_map_dl_ptr,
+                                    uint8_t batch_id,
+                                    uint8_t total_batches,
+                                    uint8_t n_cells_in_batch,
+                                    nv::CplaneBatchDirection direction)
+{
+    auto* slot_map = static_cast<SlotMapDl*>(slot_map_dl_ptr);
+    if (!slot_map) {
+        NVLOGW_FMT(TAG, "[DL_BATCH_DONE] slot_map=NULL batch_id={} total_batches={} n_cells={} direction={} - skipping signals",
+                   batch_id, total_batches, n_cells_in_batch, static_cast<int>(direction));
+        return;
+    }
+    NVLOGD_FMT(TAG, "[DL_BATCH_DONE] slot_map_id={} batch_id={} total_batches={} n_cells={} direction={}",
+               slot_map->getId(), batch_id, total_batches, n_cells_in_batch, static_cast<int>(direction));
+    // Each batch-done invocation = one DL C-plane contributor for this slot.  Across
+    // the slot's k batches the handler is called k times, producing k contributions
+    // to each counter.  Consumers' wait targets are slot_map_dl->getNumDlcTasks(),
+    // which equals k after PHY_module::fire_cplane_batch has populated it.
+    //
+    // Signals emitted per call:
+    //   - incDLCDone           — consumed by task_work_function_dl_aggr_3_buf_cleanup's
+    //                            waitDLCDone(slot_map->getNumDlcTasks()) on the mMIMO path.
+    //   - incUplanePrepDone    — consumed by task_work_function_dl_aggr_2_gpu_comm_tx's
+    //                            waitUplanePrepDone(slot_map->getNumDlcTasks()).
+    //   - addSlotEndTask       — consumed by task_work_function_dl_aggr_3_buf_cleanup's
+    //                            waitSlotEndTask(dl_task_count).
+    //
+    // FHCB-done signals (setCellFHCBDone / setFHCBDone) are intentionally NOT emitted
+    // here under the fapi_to_cplane_direct path: the only legacy callers of waitFHCBDone are
+    // task_work_function_dl_aggr_2_gpu_comm and _gpu_comm_prepare, both of which are
+    // skipped in the fapi_to_cplane_direct path (SKIP_DL_GPU_COMM_PREPARE / split-TX routing).
+    slot_map->incDLCDone();
+    slot_map->incUplanePrepDone();
+    slot_map->addSlotEndTask();
+}
+
+void l1_signal_ul_cplane_batch_done(void* slot_map_ul_ptr,
+                                    uint8_t batch_id,
+                                    uint8_t total_batches,
+                                    uint8_t n_cells_in_batch,
+                                    nv::CplaneBatchDirection direction)
+{
+    auto* slot_map = static_cast<SlotMapUl*>(slot_map_ul_ptr);
+    if (!slot_map) {
+        NVLOGW_FMT(TAG, "[UL_BATCH_DONE] slot_map=NULL batch_id={} total_batches={} n_cells={} direction={} - skipping signals",
+                   batch_id, total_batches, n_cells_in_batch, static_cast<int>(direction));
+        return;
+    }
+    NVLOGD_FMT(TAG, "[UL_BATCH_DONE] slot_map_id={} batch_id={} total_batches={} n_cells={} direction={}",
+               slot_map->getId(), batch_id, total_batches, n_cells_in_batch, static_cast<int>(direction));
+    // Each batch-done invocation = one UL C-plane contributor for this slot.  Across
+    // the slot's k batches the handler is called k times, producing k contributions to
+    // each counter.  Consumers' wait targets are slot_map_ul->getNumUlcTasks(), which
+    // equals k after PHY_module::fire_cplane_batch has populated it.
+    //
+    // Signals emitted per call:
+    //   - addULCTasksComplete  — consumed by waitULCTasksComplete(getNumUlcTasks()) in
+    //                            Order Kernel, PUCCH+PUSCH, Early UCI Ind, UL3 task bodies.
+    //   - addSlotEndTask       — consumed by UL3's waitSlotEndTask(ul_task_count).
+    slot_map->addULCTasksComplete();
+    slot_map->addSlotEndTask();
+}
+
+// ---------------------------------------------------------------------------
+// fapi_to_cplane_direct C-plane batch error handlers.
+//
+// Invoked by task_work_fn_cplane_batch (nv_cplane_batch_tasks.cpp) when one
+// or more cells in a batch returned a non-zero code from process_cell.
+//
+// Wired into CplaneBatchTaskArg::on_batch_error via the per-direction
+// Policy::on_batch_error_fn() method.
+// ---------------------------------------------------------------------------
+
+void l1_handle_ul_cplane_batch_error(void* slot_map_ul_ptr,
+                                     std::span<const uint32_t> err_cell_ids)
+{
+    if (!slot_map_ul_ptr || err_cell_ids.empty()) {
+        return;
+    }
+    auto* slot_map = static_cast<SlotMapUl*>(slot_map_ul_ptr);
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    slot_map->abortTasks();
+#endif
+
+    auto* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
+
+    slot_command_api::ul_slot_callbacks ul_cb;
+    if (pdctx && pdctx->getUlCb(ul_cb) && ul_cb.ul_tx_error_fn != nullptr) {
+        std::array<uint32_t, UL_MAX_CELLS_PER_SLOT> err_arr{};
+        const auto copy_n = std::min(err_cell_ids.size(), static_cast<std::size_t>(UL_MAX_CELLS_PER_SLOT));
+        std::copy_n(err_cell_ids.begin(), copy_n, err_arr.begin());
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                   "Calling ul_tx_error_fn ({} failed cells, slot_map_id={})",
+                   copy_n, slot_map->getId());
+        ul_cb.ul_tx_error_fn(ul_cb.ul_tx_error_fn_context,
+                             slot_map->getSlot3GPP(),
+                             SCF_FAPI_UL_TTI_REQUEST,
+                             SCF_ERROR_CODE_L1_UL_CPLANE_TX_ERROR,
+                             err_arr,
+                             static_cast<uint8_t>(copy_n),
+                             false);
+    }
+#ifndef ENABLE_FAPI_STORE_REPLAY
+    slot_map->abortTasks();
+#endif
+}
+
+void l1_handle_dl_cplane_batch_error(void* slot_map_dl_ptr,
+                                     std::span<const uint32_t> err_cell_ids)
+{
+    if (!slot_map_dl_ptr || err_cell_ids.empty()) {
+        return;
+    }
+    auto* slot_map = static_cast<SlotMapDl*>(slot_map_dl_ptr);
+
+    auto* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
+
+    slot_command_api::dl_slot_callbacks dl_cb;
+    if (pdctx && pdctx->getDlCb(dl_cb) && dl_cb.dl_tx_error_fn != nullptr) {
+        // dl_tx_error_fn expects std::array<uint32_t, DL_MAX_CELLS_PER_SLOT>&
+        // and no trailing bool (asymmetric with ul_tx_error_fn).
+        std::array<uint32_t, DL_MAX_CELLS_PER_SLOT> err_arr{};
+        const auto copy_n = std::min(err_cell_ids.size(), static_cast<std::size_t>(DL_MAX_CELLS_PER_SLOT));
+        std::copy_n(err_cell_ids.begin(), copy_n, err_arr.begin());
+        // fapi_to_cplane_direct C-plane batch fires from SLOT.resp arrival, BEFORE the legacy
+        // DL aggregation populates slot_map->aggr_pdcch_ul / aggr_dlbfw. Those
+        // pointers are guaranteed null at this point, so the legacy three-branch
+        // selection (task_function_dl_aggr.cpp:1158-1168) cannot be faithfully
+        // mirrored here. Collapse to DL_TTI_REQUEST: the fapi_to_cplane_direct batch is always
+        // entered from a DL_TTI flow, and the cell-id list + error code carry the
+        // actionable information for L2.
+        const uint16_t msg_id = static_cast<uint16_t>(SCF_FAPI_DL_TTI_REQUEST);
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                   "Calling dl_tx_error_fn ({} failed cells, slot_map_id={}, msg_id={:#x})",
+                   copy_n, slot_map->getId(), msg_id);
+        dl_cb.dl_tx_error_fn(dl_cb.dl_tx_error_fn_context,
+                             slot_map->getSlot3GPP(),
+                             msg_id,
+                             SCF_ERROR_CODE_L1_DL_CPLANE_TX_ERROR,
+                             err_arr,
+                             static_cast<uint8_t>(copy_n));
+    }
+}
+
+void l1_set_num_dlc_tasks_for_slot(void* slot_map_dl_ptr, int count)
+{
+    auto* slot_map = static_cast<SlotMapDl*>(slot_map_dl_ptr);
+    if (!slot_map) {
+        return;
+    }
+    slot_map->setNumDlcTasks(count);
+}
+
+void l1_set_num_ulc_tasks_for_slot(void* slot_map_ul_ptr, int count)
+{
+    auto* slot_map = static_cast<SlotMapUl*>(slot_map_ul_ptr);
+    if (!slot_map) {
+        return;
+    }
+    slot_map->setNumUlcTasks(count);
+}
+
+[[nodiscard]] EarlyCplaneSlotMaps l1_setup_early_cplane_slot_maps(
+    phydriver_handle pdh,
+    uint16_t sfn, uint16_t slot,
+    std::chrono::nanoseconds t0,
+    uint64_t dl_cell_bitmap,
+    uint64_t ul_cell_bitmap)
+{
+    EarlyCplaneSlotMaps result{};
+    if (!pdh) return result;
+    auto* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    if (!pdctx || !pdctx->isFapiToCplaneDirect()) {
+        return result;
+    }
+
+    slot_command_api::slot_indication si(sfn, slot, 0);
+    si.t0_ = t0.count();
+    si.t0_valid_ = true;
+
+    const int slot_advance = pdctx->get_slot_advance();
+    const int64_t tti_ns = static_cast<int64_t>(Cell::getTtiNsFromMu(MU_SUPPORTED));
+    const t_ns tick_original = t_ns(t0.count() - slot_advance * tti_ns);
+    // Direct C-plane consumes these maps before l1_enqueue_phy_work(), which
+    // normally initializes this field. Set the same previous-slot base here
+    // so a recycled map cannot expose its stale dynamic-BFW offset.
+    const auto dynamic_beam_id_offset = static_cast<int16_t>(
+        pdctx->getFhProxy()->getDynamicBeamIdOffsetOfPrevSlot());
+
+    uint32_t active_count{};
+    Cell* clist[DL_MAX_CELLS_PER_SLOT]{};
+    pdctx->getCellList(clist, &active_count);
+    std::sort(clist, clist + active_count,
+              [](const Cell* a, const Cell* b) { return a->getIdx() < b->getIdx(); });
+
+    if (dl_cell_bitmap != 0) {
+        auto* sm = pdctx->getNextSlotMapDl();
+        if (sm) {
+            bool dl_buffer_exhausted = false;
+            sm->setSlot3GPP(si);
+            sm->setDynBeamIdOffset(dynamic_beam_id_offset);
+            for (uint32_t i = 0; i < active_count; ++i) {
+                if (!clist[i] || !clist[i]->isActive()) continue;
+                uint32_t idx = static_cast<uint32_t>(clist[i]->getIdx());
+                if (!(dl_cell_bitmap & (uint64_t{1} << idx))) continue;
+                DLOutputBuffer* dlbuf = clist[i]->getNextDlBuffer();
+                if (dlbuf == nullptr) {
+                    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                        "l1_setup_early_cplane_slot_maps: SFN {}.{} map={} "
+                        "DL output buffer unavailable for cell_idx={} phy_id={}",
+                        sfn, slot, sm->getId(), idx, clist[i]->getPhyId());
+                    dl_buffer_exhausted = true;
+                    break;
+                }
+                sm->aggr_cell_list.push_back(clist[i]);
+                sm->aggr_dlbuf_list.push_back(dlbuf);
+            }
+            if (dl_buffer_exhausted) {
+                sm->release(static_cast<int>(sm->aggr_cell_list.size()));
+            } else {
+                std::array<t_ns, TASK_MAX_PER_SLOT + 1> ts_exec{};
+                ts_exec[0] = tick_original;
+                sm->setTasksTs(1, ts_exec, Time::nowNs());
+                // fapi_to_cplane_direct send_dl_cplane reads this before l1_enqueue_phy_work runs.
+                sm->setSlotRefTs(tick_original);
+                // Freeze waitPeerUpdateDone to this early-map cell count.
+                sm->set_num_dl_cplane_peer_ready_targets(static_cast<int>(sm->aggr_cell_list.size()));
+                result.dl = sm;
+            }
+        }
+    }
+
+    if (ul_cell_bitmap != 0) {
+        auto* sm = pdctx->getNextSlotMapUl();
+        if (sm) {
+            sm->setSlot3GPP(si);
+            sm->setDynBeamIdOffset(dynamic_beam_id_offset);
+            for (uint32_t i = 0; i < active_count; ++i) {
+                if (!clist[i] || !clist[i]->isActive()) continue;
+                uint32_t idx = static_cast<uint32_t>(clist[i]->getIdx());
+                if (!(ul_cell_bitmap & (uint64_t{1} << idx))) continue;
+                sm->aggr_cell_list.push_back(clist[i]);
+            }
+            uint32_t ul_count = static_cast<uint32_t>(sm->aggr_cell_list.size());
+            sm->aggr_ulbuf_st1.resize(ul_count, nullptr);
+            sm->aggr_ulbuf_st2.resize(ul_count, nullptr);
+            sm->aggr_ulbuf_pcap_capture.resize(ul_count, nullptr);
+            sm->aggr_ulbuf_pcap_capture_ts.resize(ul_count, nullptr);
+            sm->num_prach_occa.resize(ul_count, 0);
+            std::array<t_ns, TASK_MAX_PER_SLOT + 1> ts_exec{};
+            const t_ns ul_task_ts = tick_original + t_ns(tti_ns);
+            const int ul_ts_count = static_cast<int>(std::min<uint32_t>(
+                ul_count, static_cast<uint32_t>(TASK_MAX_PER_SLOT + 1)));
+            for (int i = 0; i < ul_ts_count; ++i) {
+                ts_exec[static_cast<std::size_t>(i)] = ul_task_ts;
+            }
+            sm->setTasksTs((ul_ts_count > 0) ? ul_ts_count : 1, ts_exec, Time::nowNs());
+            // fapi_to_cplane_direct send_ul_cplane reads this before l1_enqueue_phy_work runs.
+            sm->setSlotRefTs(ul_task_ts);
+            result.ul = sm;
+        }
+    }
+
+    pdctx->setEarlySlotMapDl(result.dl);
+    pdctx->setEarlySlotMapUl(result.ul);
+
+    return result;
 }

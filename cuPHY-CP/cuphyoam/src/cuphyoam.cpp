@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -171,6 +171,14 @@ int CuphyOAM::init_cell_config_ring()
         return -1;
     }
 
+    sprintf(s,"R_cell_ctrl");
+    cell_ctrl_requests = nv_ring_create(s, 16, 0);
+    if (cell_ctrl_requests == 0)
+    {
+        printf("error on ring %s create\n",s);
+        return -1;
+    }
+
     sprintf(s,"R_generic_async_test");
     if ((generic_async_requests = nv_ring_create(s, 16, 0)) == 0)
     {
@@ -296,7 +304,7 @@ CuphyOAMCellConfig* CuphyOAM::get_cell_config()
 
 int CuphyOAM::put_cell_ctrl_cmd(CuphyOAMCellCtrlCmd* config)
 {
-    return nv_ring_enqueue(cell_reconfig_requests, config);
+    return nv_ring_enqueue(cell_ctrl_requests, config);
 }
 
 int CuphyOAM::free_cell_ctrl_cmd(CuphyOAMCellCtrlCmd* config)
@@ -401,7 +409,7 @@ bool simulated_cpu_stall_checkpoint(int32_t thread_id, int32_t task_id)
 CuphyOAMCellCtrlCmd* CuphyOAM::get_cell_ctrl_cmd()
 {
     CuphyOAMCellCtrlCmd* config;
-    if (nv_ring_dequeue(cell_reconfig_requests, reinterpret_cast<void**>(&config)))
+    if (nv_ring_dequeue(cell_ctrl_requests, reinterpret_cast<void**>(&config)))
     {
         return nullptr;
     }

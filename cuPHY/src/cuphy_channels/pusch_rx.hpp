@@ -21,10 +21,13 @@
 #include "pusch_utils.hpp"
 #include <vector>
 #include <string>
+#include <variant>
 
 #include <gsl-lite/gsl-lite.hpp>
 
 #include "ldpc/ldpc_api.hpp"
+#include "ldpc/ldpc_cb_kernel_api.h"
+#include "rate_matching/rate_matching.hpp"
 #include "cuphy_hdf5.hpp"
 #include "cuphy.hpp"
 #include "tensor_desc.hpp"
@@ -58,7 +61,7 @@
                            // Not currently exercised, but needs to be passed to conditional handle creation call.
 
 #define PUSCH_USE_BATCHED_MEMCPY 1 // enables batched async memcpy along with static parameter field
-#define PUSCH_MAX_OUTPUT_TO_CPU_COPIES 17 // runtime check present, if batched memcpy enabled
+#define PUSCH_MAX_OUTPUT_TO_CPU_COPIES (17 + MAX_CELLS_PER_SLOT - 1 + MAX_N_USER_GROUPS_SUPPORTED) // GT-11677 Phase 2: per-cell TB D2H (up to MAX_CELLS_PER_SLOT) + per-UE-group H-est D2H (up to MAX_N_USER_GROUPS_SUPPORTED)
 
 static constexpr unsigned int BYTES_PER_WORD               = sizeof(uint32_t) / sizeof(uint8_t);
 
@@ -108,6 +111,210 @@ struct StageResult
     std::vector<CUgraphNode> terminalNodes;  // Last nodes of this stage
 };
 
+/** State for the transport-block LDPC decoder path. */
+struct TbLdpcState
+{
+    std::unique_ptr<cuphy::LDPC_decoder>       decoder;          ///< TB decoder instance.
+    cuphy::LDPC_decode_desc_set                decode_desc_set;  ///< Reusable TB decode descriptors.
+    std::vector<cuphyLDPCDecodeLaunchConfig_t> launch_configs;   ///< Per-TB launch configurations.
+    cuphy::stream_pool                         stream_pool;      ///< Streams used by the TB decoder.
+    std::vector<std::vector<CUgraphNode>>      decoder_nodes;    ///< Graph nodes for decoder launches.
+    std::vector<uint8_t> decoder_nodes_enabled[CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];  ///< Node-enable flags by mode.
+
+    /**
+     * Constructs TB decoder state with descriptor capacity for the requested number of transport blocks.
+     *
+     * @param[in] ctx cuPHY context that owns the decoder resources.
+     * @param[in] maxTbsPerDesc Maximum transport blocks represented by one decode descriptor.
+     */
+    TbLdpcState(cuphy::context& ctx, uint8_t maxTbsPerDesc)
+        : decoder(std::make_unique<cuphy::LDPC_decoder>(ctx))
+        , decode_desc_set(maxTbsPerDesc)
+        , stream_pool()
+    {}
+
+    /**
+     * Moves TB decoder state.
+     *
+     * @param[in] other State whose resources are transferred to this object.
+     */
+    TbLdpcState(TbLdpcState&& other) = default;
+    /**
+     * Replaces this object with moved TB decoder state.
+     *
+     * @param[in] other State whose resources are transferred to this object.
+     * @return This object after the assignment.
+     */
+    TbLdpcState& operator=(TbLdpcState&& other) = default;
+    TbLdpcState(const TbLdpcState&) = delete;
+    TbLdpcState& operator=(const TbLdpcState&) = delete;
+};
+
+/** State for the codeblock-centric LDPC decoder path. */
+struct CbLdpcState
+{
+    /** Per-phase set of prepared codeblock decoder launches. */
+    struct CbDecodeBatch
+    {
+        /** Storage and placement for one group of codeblocks with an equivalent kernel choice. */
+        struct Config
+        {
+            cuphyLdpcCbSubgroupKey_t key{};             ///< Kernel-selection attributes for the group.
+            uint16_t                 num_cb = 0;        ///< Number of codeblocks in the group.
+            size_t                   data_offset = 0;   ///< Offset into @ref cb_data.
+            uint16_t                 partition_id = 0;  ///< Separates otherwise-equivalent groups when required.
+        };
+
+        std::vector<Config>                                configs;            ///< Group configurations.
+        std::vector<cuphyLdpcCbData_t>                     cb_data;            ///< Flattened CB data by group.
+        std::vector<std::vector<cuphyLdpcCbData_t>>         cb_data_by_config;  ///< CB data retained per group.
+        std::vector<std::vector<cuphyLdpcCbBufferSpan_t>>   span_storage;       ///< Backing span storage per group.
+        std::vector<cuphyLdpcCbSubgroupDesc_t>             subgroups;          ///< Subgroup descriptors per group.
+        std::vector<cuphyLdpcCbLaunchBatchDesc_t>          batch_descs;        ///< Prepared-launch batch descriptors.
+        std::vector<cuphyLdpcCbLaunchFamily_t>             families;           ///< Launch family selected per group.
+        std::vector<cuphyLdpcCbPreparedLaunch_t>           prepared_launches;  ///< Prepared launch handles.
+        std::vector<std::vector<uint8_t>>                  launch_workspaces;  ///< Aligned backing workspace per group.
+        std::vector<CUDA_KERNEL_NODE_PARAMS>               node_params;        ///< CUDA graph node parameters per group.
+        uint16_t                                           total_cb_count = 0;  ///< Total codeblocks in this batch.
+
+        /** Releases every prepared-launch handle owned by this batch. */
+        void deinitLaunches()
+        {
+            for (auto& launch : prepared_launches)
+            {
+                if (launch != nullptr)
+                {
+                    cuphyLdpcCbPreparedLaunchDeinit(launch);
+                    launch = nullptr;
+                }
+            }
+        }
+
+        /**
+         * Preallocates per-group storage for the maximum expected batch shape.
+         *
+         * @param[in] max_configs Maximum number of kernel-choice groups.
+         * @param[in] max_codeblocks Maximum codeblocks retained by each group.
+         * @param[in] max_workspace_bytes Maximum workspace bytes required by one group.
+         * @param[in] workspace_alignment_bytes Additional bytes reserved for workspace alignment.
+         */
+        void reserve(const size_t max_configs,
+                     const size_t max_codeblocks,
+                     const size_t max_workspace_bytes,
+                     const size_t workspace_alignment_bytes)
+        {
+            configs.reserve(max_configs);
+            cb_data.reserve(max_codeblocks);
+            cb_data_by_config.resize(max_configs);
+            span_storage.resize(max_configs);
+            subgroups.resize(max_configs);
+            batch_descs.resize(max_configs);
+            families.resize(max_configs);
+            prepared_launches.resize(max_configs, nullptr);
+            launch_workspaces.resize(max_configs);
+            node_params.resize(max_configs);
+
+            const size_t workspace_capacity = max_workspace_bytes + workspace_alignment_bytes;
+            for (size_t idx = 0; idx < max_configs; ++idx)
+            {
+                cb_data_by_config[idx].reserve(max_codeblocks);
+                span_storage[idx].reserve(max_codeblocks);
+                launch_workspaces[idx].resize(workspace_capacity);
+            }
+        }
+
+        /** Clears setup-specific data while retaining preallocated capacity. */
+        void resetForSetup()
+        {
+            deinitLaunches();
+            configs.clear();
+            cb_data.clear();
+            for (auto& per_config_data : cb_data_by_config)
+            {
+                per_config_data.clear();
+            }
+            total_cb_count = 0;
+        }
+    };
+
+    struct CachedChoice
+    {
+        cuphyLdpcCbSubgroupKey_t  key{};     ///< Attributes used for kernel selection.
+        cuphyLdpcCbKernelChoice_t choice{};  ///< Selected kernel implementation.
+        cuphyLdpcCbLaunchFamily_t family{};  ///< Launch family for @ref choice.
+    };
+
+    cuphyLdpcCbLaunchPreparer_t                preparer;      ///< API object that prepares CB launches.
+    CbDecodeBatch                              full_batch;    ///< Full-slot CB decode batch.
+    CbDecodeBatch                              early_batch;   ///< Early-SCH CB decode batch.
+    std::vector<CachedChoice>                  choice_cache;  ///< Intra-slot selection cache.
+    std::vector<std::vector<CUgraphNode>>      full_nodes;    ///< Graph nodes for full-slot batches.
+    std::vector<CUgraphNode>                   early_nodes;   ///< Graph nodes for early-SCH batches.
+
+    /** Constructs empty codeblock decoder state. */
+    CbLdpcState()
+        : preparer(nullptr)
+    {
+    }
+
+    /** Releases prepared launches and the launch preparer. */
+    ~CbLdpcState()
+    {
+        full_batch.deinitLaunches();
+        early_batch.deinitLaunches();
+        if (preparer)
+        {
+            cuphyDestroyLdpcCbLaunchPreparer(preparer);
+            preparer = nullptr;
+        }
+    }
+
+    /**
+     * Moves codeblock decoder state, transferring ownership of the preparer.
+     *
+     * @param[in] other State whose resources are transferred to this object.
+     */
+    CbLdpcState(CbLdpcState&& other) noexcept
+        : preparer(other.preparer)
+        , full_batch(std::move(other.full_batch))
+        , early_batch(std::move(other.early_batch))
+        , choice_cache(std::move(other.choice_cache))
+        , full_nodes(std::move(other.full_nodes))
+        , early_nodes(std::move(other.early_nodes))
+    {
+        other.preparer = nullptr;
+    }
+
+    /**
+     * Replaces this object with moved codeblock decoder state.
+     *
+     * @param[in] other State whose resources are transferred to this object.
+     * @return This object after the assignment.
+     */
+    CbLdpcState& operator=(CbLdpcState&& other) noexcept
+    {
+        if (this != &other)
+        {
+            full_batch.deinitLaunches();
+            early_batch.deinitLaunches();
+            if (preparer != nullptr)
+            {
+                cuphyDestroyLdpcCbLaunchPreparer(preparer);
+            }
+            preparer = other.preparer;
+            full_batch = std::move(other.full_batch);
+            early_batch = std::move(other.early_batch);
+            choice_cache = std::move(other.choice_cache);
+            full_nodes = std::move(other.full_nodes);
+            early_nodes = std::move(other.early_nodes);
+            other.preparer = nullptr;
+        }
+        return *this;
+    }
+
+    CbLdpcState(const CbLdpcState&) = delete;
+    CbLdpcState& operator=(const CbLdpcState&) = delete;
+};
 
 class PuschRx : public cuphyPuschRx {
 public:
@@ -120,7 +327,8 @@ public:
         PUSCH_CH_EQ_IDFT                    = PUSCH_CH_EQ_SOFT_DEMAP + 1,
         PUSCH_CH_EQ_AFTER_IDFT              = PUSCH_CH_EQ_IDFT + 1,
         PUSCH_RATE_MATCH                    = PUSCH_CH_EQ_AFTER_IDFT + 1,
-        PUSCH_LDPC_DEC                      = PUSCH_RATE_MATCH + 1,
+        PUSCH_RATE_MATCH_EARLY              = PUSCH_RATE_MATCH + 1,
+        PUSCH_LDPC_DEC                      = PUSCH_RATE_MATCH_EARLY + 1,
         PUSCH_CRC                           = PUSCH_LDPC_DEC + 1,
         PUSCH_CFO_TA_EST                    = PUSCH_CRC + 1,
         PUSCH_RSSI                          = PUSCH_CFO_TA_EST + 1,
@@ -228,6 +436,11 @@ public:
 
         cuphyUciOnPuschOutOffsets_t* pUciOnPuschOutOffsets;
 
+        uint32_t                     nPerCellTbDests{}; //!< Number of per-cell D2H TB payload destinations (GT-11677 Phase 2)
+        uint8_t*                     pPerCellTbPayloadsHost[MAX_CELLS_PER_SLOT]{}; //!< Per-cell host destination pointers for batched D2H
+        uint32_t                     perCellTbPayloadOffset[MAX_CELLS_PER_SLOT]{}; //!< Byte offset of each cell's TB data in device buffer
+        uint32_t                     perCellTbPayloadSize[MAX_CELLS_PER_SLOT]{}; //!< Byte size of each cell's TB payload
+
         // output parameters
         bool                         debugOutputFlag;
         hdf5hpp::hdf5_file           outHdf5File;
@@ -305,7 +518,7 @@ private:
 
     // setup functions
     cuphyStatus_t   setupCmnPhase1(cuphyPuschDynPrms_t* pDynPrm);
-    void   setupCmnPhase2(cuphyPuschDynPrms_t* pDynPrm);
+    cuphyStatus_t   setupCmnPhase2(cuphyPuschDynPrms_t* pDynPrm);
     void   allocateDeviceMemory(cuphyPuschDynPrms_t* pDynPrm);
     void   allocateDescr(void);
     void   allocateInputBuf(uint32_t nMaxTbs, uint32_t maxNumTbsSupported);
@@ -338,7 +551,20 @@ private:
     void destroyComponents();
 
     // LDPC component functions
+    [[nodiscard]] uint16_t computeLdpcMaxIters(uint16_t ueIdx) const;
     void prepareLDPCStreamsTB();
+    void computeEarlyHarqCbDecodePlan();
+    cuphyStatus_t prepareCbLdpcBatches(bool prepareEarlyHarqBatch);
+    void addCbLdpcNodes(CUgraph graph,
+                        const std::vector<CUgraphNode>& parents,
+                        std::vector<CUgraphNode>& nodes);
+    void updateCbLdpcNodes(CUgraphExec graphExec,
+                           const std::vector<CUgraphNode>& nodes,
+                           const std::vector<CUDA_KERNEL_NODE_PARAMS>& params,
+                           size_t activeParamCount,
+                           std::vector<uint8_t>& enabled,
+                           bool enableNodes);
+    void launchLDPCStreamsCB(cudaStream_t strm);
     void launchLDPCStreamsTensor(cudaStream_t strm);
     void launchLDPCStreamsTB(cudaStream_t strm);
 
@@ -360,6 +586,10 @@ private:
     StageResult buildUciP1BackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
                                        CUgraph*                        pGraph,
                                        const std::vector<CUgraphNode>& softDemapParents);
+                                       
+    StageResult buildUciP1OffloadingBackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                                 CUgraph*                        pGraph,
+                                                 const std::vector<CUgraphNode>& softDemapParents);
 
     StageResult buildCsiP2BackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
                                        CUgraph*                        pGraph,
@@ -390,10 +620,37 @@ private:
 
     // graph functions
     void createFullSlotGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo& condInfo);
+    void createFullSlotOffloadingGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo& condInfo);
     void updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraphExec graphExec, condGraphInfo& condInfo);
+    void updateFullSlotOffloadingGraph(bool disableAllNodes, cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraphExec graphExec, condGraphInfo& condInfo);
+    
+    /// Creates the CUDA graph for 72e full-slot processing mode.
+    /// `@param`[in,out] fullSlotGraph The CUDA graph to populate
+    /// `@param`[in,out] emptyRootNode Root node for the graph
+    /// `@param`[in,out] condInfo Conditional graph information
+    void create72eFullSlotGraph(CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo& condInfo);
+    void create72eFullSlotOffloadingGraph(CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo& condInfo);
+    /// Updates the CUDA graph for 72e full-slot processing mode.
+    /// `@param`[in] disableAllNodes Whether to disable all nodes in the graph
+    /// `@param`[in] fullSlotProcMode Full slot processing mode
+    /// `@param`[in,out] graphExec Executable graph to update
+    /// `@param`[in,out] condInfo Conditional graph information
+    void update72eFullSlotGraph(bool disableAllNodes,  cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraphExec graphExec, condGraphInfo& condInfo);
+    void update72eFullSlotOffloadingGraph(bool disableAllNodes,  cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraphExec graphExec, condGraphInfo& condInfo);
 
     void createEarlyHarqGraph();  // for early-HARQ portion of PUSCH pipeline
+    void createEarlyHarqOffloadingGraph(); 
     void updateEarlyHarqGraph(bool disableAllNodes = false);
+    void updateEarlyHarqOffloadingGraph(bool disableAllNodes = false);
+    
+    /// Creates the CUDA graph for 72e early HARQ processing mode.
+    void create72eEarlyHarqGraph();
+    void create72eEarlyHarqOffloadingGraph();
+    /// Updates the CUDA graph for 72e early HARQ processing mode.
+    /// `@param`[in] disableAllNodes Whether to disable all nodes in the graph (default: false)
+    void update72eEarlyHarqGraph(bool disableAllNodes = false);
+    void update72eEarlyHarqOffloadingGraph(bool disableAllNodes = false);
+    
     void createFrontLoadedDmrsGraph();  // for front-loaded DMRS portion of PUSCH pipeline
     void updateFrontLoadedDmrsGraph(bool disableAllNodes =false);
 
@@ -498,6 +755,11 @@ private:
     // SCH-on-PUSCH parameters
     uint16_t m_nSchUes;
     std::vector<uint16_t> m_schUserIdxsVec;
+    std::vector<uint16_t> m_earlyDecodedCbCountPerTb;
+    std::vector<cuphyPuschRxRateMatchCbRange_t> m_rateMatchCbRangesEarly;
+    std::vector<cuphyPuschRxRateMatchCbRange_t> m_rateMatchCbRangesFull;
+    uint32_t              m_nEarlyDecodedSchCbs{};
+    uint32_t              m_nFullSlotRemainingSchCbs{};
 
     // UCI-on-PUSCH LLR seg parameters.
     uint8_t               m_enableCsiP2Fapiv3;
@@ -590,9 +852,8 @@ private:
     // LDPC decoder
     size_t                                   m_ldpcWorkspaceSize;
     cuphy::context                           m_ctx;
-    cuphy::LDPC_decoder                      m_LDPCdecoder;
-    //cuphy::buffer<char, cuphy::device_alloc> m_ldpcWorkspaceBuffer;
-    cuphy::stream_pool                       m_ldpcStreamPool; // Use a pool of CUDA streams to launch LDPC kernels (one per transport block)
+    bool                                     m_useCbLdpc;
+    std::variant<TbLdpcState, CbLdpcState>   m_ldpcState;
     cuphyPuschLdpcKernelLaunch_t             m_LDPCkernelLaunchMode;
 
     // kernel launch configurationsen
@@ -607,7 +868,7 @@ private:
     cuphyPuschRxChEqLaunchCfgs_t         m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_MAX_PUSCH_EXECUTION_PATHS];
     cuphyPuschRxCfoTaEstLaunchCfgs_t     m_cfoTaEstLaunchCfgs;
     cuphyPuschRxRateMatchLaunchCfg_t     m_rateMatchLaunchCfg;
-    std::vector<cuphyLDPCDecodeLaunchConfig_t> m_ldpcLaunchCfgs;
+    cuphyPuschRxRateMatchLaunchCfg_t     m_rateMatchLaunchCfgEarly;
     cuphyPuschRxCrcDecodeLaunchCfg_t     m_crcLaunchCfgs[2]; // CB CRC + TB CRC
     cuphyPuschRxRssiLaunchCfgs_t         m_rssiLaunchCfgs[CUPHY_MAX_PUSCH_EXECUTION_PATHS];
     cuphyPuschRxRsrpLaunchCfgs_t         m_rsrpLaunchCfgs[CUPHY_MAX_PUSCH_EXECUTION_PATHS];
@@ -632,7 +893,6 @@ private:
     cuphyPolarDecoderLaunchCfg_t         m_polarDecoderLaunchCfg_early;
 
     // kernel descriptors
-    cuphy::LDPC_decode_desc_set m_LDPCDecodeDescSet; // descriptors for LDPC (TB interface only)
     cuphy::kernelDescrs<N_PUSCH_DESCR_TYPES>         m_kernelStatDescr;
     cuphy::kernelDescrs<N_PUSCH_DESCR_TYPES>         m_kernelDynDescr;
 
@@ -678,7 +938,7 @@ private:
     CUgraphNode     m_resetRateMatchNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     CUgraphNode     m_clampRateMatchNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     CUgraphNode     m_rateMatchNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
-    std::vector<std::vector<CUgraphNode>>     m_ldpcDecoderNodes;
+    CUgraphNode     m_subSlotDelayNode, m_fullSlotDelayNode;
     CUgraphNode     m_crcNodes[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES][2];  // CB CRC + TB CRC
     CUgraphNode     m_uciSegLLRs0Node[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     CUgraphNode     m_simplexDecoderNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
@@ -694,6 +954,7 @@ private:
     CUgraphNode     m_uciOnPuschCsi2CompCwTreeTypesNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     CUgraphNode     m_uciOnPuschCsi2PolSegDeRmDeItlNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     CUgraphNode     m_uciOnPuschCsi2PolarDecoderNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
+    CUgraphNode     m_uciOnPuschCompletedEventNode[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     //
     CUgraphNode     m_rssiNodes[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES][CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS];
     CUgraphNode     m_rsrpNodes[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES][CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS];
@@ -707,7 +968,8 @@ private:
     std::vector<uint8_t>                 m_chEqSoftDemapIdftNodesEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     std::vector<uint8_t>                 m_chEqSoftDemapAfterDftNodesEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     uint8_t                              m_rateMatchNodeEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
-    std::vector<uint8_t>                 m_ldpcDecoderNodesEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
+    std::vector<uint8_t>                 m_cbLdpcNodesEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
+    std::vector<uint8_t>                 m_ehqCbLdpcNodesEnabled;
     uint8_t                              m_crcNodesEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     uint8_t                              m_uciSegLLRs0NodeEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     uint8_t                              m_simplexDecoderNodeEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
@@ -716,6 +978,8 @@ private:
     uint8_t                              m_csi2NodeEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES]; // used for all csi2 nodes
     std::vector<uint8_t>                 m_rssiNodesEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
     std::vector<uint8_t>                 m_rsrpNodesEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
+    uint8_t                              m_fullSlotDelayNodeEnabled[cuphyPuschFullSlotProcMode_t::CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES];
+    uint8_t                              m_subSlotDelayNodeEnabled;
 
     // nodes used in launch graphs
     CUgraphNode     m_preSubSlotWaitNode;
@@ -735,6 +999,9 @@ private:
     CUgraphNode     m_ehqChEqSoftDemapIdftNodes[CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS];
     CUgraphNode     m_ehqChEqSoftDemapAfterDftNodes[CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS];
     CUgraphNode     m_ehqUciSegLLRs0Node;
+    CUgraphNode     m_ehqResetRateMatchNode;
+    CUgraphNode     m_ehqRateMatchNode;
+    CUgraphNode     m_ehqClampRateMatchNode;
     CUgraphNode     m_ehqSimplexDecoderNode;
     CUgraphNode     m_ehqRmDecoderNode;
     CUgraphNode     m_ehqCompCwTreeTypesNode;
@@ -755,6 +1022,8 @@ private:
     std::vector<uint8_t> m_ehqChEqSoftDemapIdftNodesEnabled;
     std::vector<uint8_t> m_ehqChEqSoftDemapAfterDftNodesEnabled;
     uint8_t              m_ehqUciSegLLRs0NodeEnabled;
+    uint8_t              m_ehqRateMatchNodeEnabled;
+    uint8_t              m_ehqCbDecoderNodeEnabled;
     uint8_t              m_ehqSimplexDecoderNodeEnabled;
     uint8_t              m_ehqRmDecoderNodeEnabled;
     uint8_t              m_ehqPolarNodeEnabled;     // used for m_ehqCompCwTreeTypesNode, m_ehqPolSegDeRmDeItlNode and m_ehqPolarDecoderNode
@@ -821,6 +1090,20 @@ private:
 
     // Determine from PuschRx ctor passed stream if green context is used
     bool m_useGreenContext{};
+    
+    // Open RAN Functional Splits Option for PUSCH
+    uint8_t m_openRanFunctionalSplitOption{};
+    uint8_t m_kernelSelOption{};
+    uint8_t m_uciKernelSelOption{};
+    uint32_t m_delayUs{};
+    uint32_t m_subSlotDelayUs{};
+    
+    void*    m_subSlotDelayKernelArgs[1];
+    CUDA_KERNEL_NODE_PARAMS m_subSlotDelayKernelParamsDriver;
+    
+    void*    m_fullSlotDelayKernelArgs[1];
+    CUDA_KERNEL_NODE_PARAMS m_fullSlotDelayKernelParamsDriver;
+
 };
 
 #endif // !defined(PUSCH_RX_HPP_INCLUDED_)

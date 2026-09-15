@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@
 #define CUPHY_KERNEL_UTIL_CUH_INCLUDED_
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include "cuphy_internal.h"
 
 // clang-format off
@@ -191,14 +192,16 @@ __device__ void block_copy_pair_sync(T* dst0, T* dst1, const T* devSource, int s
 
 // clang-format off
 template <typename T> struct printer;
-template <>           struct printer<int32_t>  { static CUDA_INLINE void print(const int32_t& i)  { KERNEL_PRINT("%4i ", static_cast<int>(i)); } };
-template <>           struct printer<int16_t>  { static CUDA_INLINE void print(const int16_t& i)  { KERNEL_PRINT("%4i ", static_cast<int>(i)); } };
-template <>           struct printer<uint32_t> { static CUDA_INLINE void print(const uint32_t& u) { KERNEL_PRINT("%4u ", static_cast<unsigned int>(u)); } };
-template <>           struct printer<uint16_t> { static CUDA_INLINE void print(const uint16_t& u) { KERNEL_PRINT("%4u ", static_cast<unsigned int>(u)); } };
-template <>           struct printer<int8_t>   { static CUDA_INLINE void print(const int8_t& i)   { KERNEL_PRINT("%4i ", static_cast<int>(i)); } };
-template <>           struct printer<float>    { static CUDA_INLINE void print(const float& f)    { KERNEL_PRINT("%.4f ", f);                  } };
-template <>           struct printer<__half>   { static CUDA_INLINE void print(const __half& h)   { KERNEL_PRINT("%.4f ", __half2float(h));    } };
-template <>           struct printer<__half2>  { static CUDA_INLINE void print(const __half2& h)  { KERNEL_PRINT("[%.4f, %.4f] ", __low2float(h), __high2float(h)); } };
+template <>           struct printer<int32_t>       { static CUDA_INLINE void print(const int32_t& i)       { KERNEL_PRINT("%4i ", static_cast<int>(i)); } };
+template <>           struct printer<int16_t>       { static CUDA_INLINE void print(const int16_t& i)       { KERNEL_PRINT("%4i ", static_cast<int>(i)); } };
+template <>           struct printer<uint32_t>      { static CUDA_INLINE void print(const uint32_t& u)      { KERNEL_PRINT("%4u ", static_cast<unsigned int>(u)); } };
+template <>           struct printer<uint16_t>      { static CUDA_INLINE void print(const uint16_t& u)      { KERNEL_PRINT("%4u ", static_cast<unsigned int>(u)); } };
+template <>           struct printer<int8_t>        { static CUDA_INLINE void print(const int8_t& i)        { KERNEL_PRINT("%4i ", static_cast<int>(i)); } };
+template <>           struct printer<float>         { static CUDA_INLINE void print(const float& f)         { KERNEL_PRINT("%.4f ", f);                  } };
+template <>           struct printer<__half>        { static CUDA_INLINE void print(const __half& h)        { KERNEL_PRINT("%.4f ", __half2float(h));    } };
+template <>           struct printer<__half2>       { static CUDA_INLINE void print(const __half2& h)       { KERNEL_PRINT("[%.4f, %.4f] ", __low2float(h), __high2float(h)); } };
+template <>           struct printer<__nv_fp8_e5m2> { static CUDA_INLINE void print(const __nv_fp8_e5m2& q) { KERNEL_PRINT("%.4f ", static_cast<float>(q)); } };
+template <>           struct printer<__nv_fp8_e4m3> { static CUDA_INLINE void print(const __nv_fp8_e4m3& q) { KERNEL_PRINT("%.4f ", static_cast<float>(q)); } };
 // clang-format on
 
 template <typename T>

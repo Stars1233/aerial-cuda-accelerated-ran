@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,12 +58,10 @@ set(SOURCES_CPP pybind11/cuda_array_interface.cpp
                 pybind11/pycuphy_crc_encode.cpp
                 pybind11/pycuphy_crc_check.cpp
                 pybind11/pycuphy_util.cpp
-                pybind11/pycuphy_debug.cpp
-                pybind11/pycuphy_chan_model.cpp)
+                pybind11/pycuphy_debug.cpp)
 add_library(pycuphycpp ${SOURCES_CPP})
-target_link_libraries(pycuphycpp PUBLIC cuphy_channels cuphy chanModels ${Python3_LIBRARIES})
-target_include_directories(pycuphycpp PRIVATE ../cuPHY/examples/common
-                                              ../testBenches/chanModels/src)
+target_link_libraries(pycuphycpp PUBLIC cuphy_channels cuphy ${Python3_LIBRARIES})
+target_include_directories(pycuphycpp PRIVATE ../cuPHY/examples/common)
 
 set(SOURCES pybind11/cuda_array_interface.cpp
             pybind11/pycuphy_pybind.cpp
@@ -93,7 +91,6 @@ set(SOURCES pybind11/cuda_array_interface.cpp
             pybind11/pycuphy_crc_check.cpp
             pybind11/pycuphy_trt_engine.cpp
             pybind11/pycuphy_rsrp.cpp
-            pybind11/pycuphy_chan_model.cpp
             pybind11/pycuphy_debug.cpp
             ../cuPHY/src/cuphy/tensor_desc.cpp
 )
@@ -105,33 +102,61 @@ endif()
 find_package(gsl-lite REQUIRED)
 find_package(pybind11 REQUIRED)
 pybind11_add_module(_pycuphy ${SOURCES})
-target_link_libraries(_pycuphy PUBLIC cuphy_channels cuphy chanModels gsl-lite::gsl-lite CUDA::cudart)
-target_include_directories(_pycuphy PRIVATE ../cuPHY/examples/common ../testBenches/chanModels/src)
+target_link_libraries(_pycuphy PUBLIC cuphy_channels cuphy gsl-lite::gsl-lite CUDA::cudart)
+target_include_directories(_pycuphy PRIVATE ../cuPHY/examples/common)
 
-# EXAMPLE_VERSION_INFO is defined by setup.py and passed into the C++ code as a
-# define (VERSION_INFO) here.
-target_compile_definitions(_pycuphy PUBLIC VERSION_INFO=${EXAMPLE_VERSION_INFO})
+set(PYAERIAL_PYCUPHY_PKG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/aerial/pycuphy")
+set(PYAERIAL_EXTENSION_STAMP "${CMAKE_CURRENT_BINARY_DIR}/pyaerial_extension.stamp")
+set(PYAERIAL_CLEAN_STAGED_LIBS_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CleanStagedLibs.cmake")
 
-# Copy the necessary libraries to the output directory for pip install
-function(copy_to_pycuphy_output_dir tgt)
-    add_custom_command(TARGET _pycuphy POST_BUILD
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:${tgt}>" "${CMAKE_CURRENT_SOURCE_DIR}/src/aerial/pycuphy/"
+# Copy the compiled extension into the Python package tree before pip setup.
+# Triggered automatically via pyaerial_extension.stamp when building
+# pyaerial_setup (no separate CMake target). For editable installs the
+# extension RPATH already points at the build tree, so the private shared
+# libraries are resolved from there.
+add_custom_command(
+    OUTPUT "${PYAERIAL_EXTENSION_STAMP}"
+    COMMAND "${CMAKE_COMMAND}"
+        -DPYAERIAL_PYCUPHY_PKG_DIR="${PYAERIAL_PYCUPHY_PKG_DIR}"
+        -P "${PYAERIAL_CLEAN_STAGED_LIBS_SCRIPT}"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "$<TARGET_FILE:_pycuphy>"
+        "${PYAERIAL_PYCUPHY_PKG_DIR}/$<TARGET_FILE_NAME:_pycuphy>"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${PYAERIAL_EXTENSION_STAMP}"
+    DEPENDS _pycuphy
+    COMMENT "Staging _pycuphy extension into pyaerial/src/aerial/pycuphy/"
+)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PythonEnv.cmake)
+if(NOT TARGET gpu3gppchan_wheel)
+    if(NOT TARGET gpu3gppchan)
+        message(FATAL_ERROR
+            "pyAerial requires the existing gpu3gppchan native target"
+        )
+    endif()
+    add_subdirectory(
+        "${CMAKE_CURRENT_LIST_DIR}/../testBenches/gpu3GPPChan/python"
+        "${CMAKE_CURRENT_BINARY_DIR}/gpu3gppchan-python"
     )
-endfunction()
-
-# Remove any existing dynamic libraries from pycuphy output directory
-# to avoid confusion if building with static libraries only
-function(clean_up_pycuphy_output_dir)
-    add_custom_command(TARGET _pycuphy POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E echo "Cleaning up pyaerial output directory"
-        && "${CMAKE_COMMAND}" -E remove -f "${CMAKE_CURRENT_SOURCE_DIR}/src/aerial/pycuphy/*.so*")
-endfunction()
-
-clean_up_pycuphy_output_dir()
-copy_to_pycuphy_output_dir(_pycuphy)
-
-if (BUILD_SHARED_LIBS)
-    copy_to_pycuphy_output_dir(cuphy)
-    copy_to_pycuphy_output_dir(nvlog)
-    copy_to_pycuphy_output_dir(chanModels)
 endif()
+get_target_property(
+    GPU3GPPCHAN_WHEEL_STAMP gpu3gppchan_wheel GPU3GPPCHAN_WHEEL_STAMP
+)
+get_target_property(
+    GPU3GPPCHAN_WHEEL_DIR gpu3gppchan_wheel GPU3GPPCHAN_WHEEL_DIR
+)
+get_target_property(
+    GPU3GPPCHAN_PYTHON_VENV gpu3gppchan_python_setup GPU3GPPCHAN_PYTHON_VENV
+)
+if(NOT GPU3GPPCHAN_WHEEL_STAMP OR NOT GPU3GPPCHAN_WHEEL_DIR OR
+   NOT GPU3GPPCHAN_PYTHON_VENV)
+    message(FATAL_ERROR "pyAerial requires the gpu3gppchan_wheel artifact target")
+endif()
+pyaerial_add_python_env_targets(
+    "${PYAERIAL_EXTENSION_STAMP}"
+    "${PYAERIAL_PYCUPHY_PKG_DIR}"
+    "${PYAERIAL_CLEAN_STAGED_LIBS_SCRIPT}"
+    "${GPU3GPPCHAN_WHEEL_STAMP}"
+    "${GPU3GPPCHAN_WHEEL_DIR}"
+    "${GPU3GPPCHAN_PYTHON_VENV}"
+)

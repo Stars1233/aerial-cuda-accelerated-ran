@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -137,6 +138,7 @@ protected:
     UniqueOrderEntities         order_entities;
     CellList                    cells;
     FHGenResources              resources_to_free_;
+    std::optional<PrimaryCtxGuard> ctx_guard_;  //!< Primary context RAII guard (DU mode only)
     bool                        start_ul_tx_ = false;
     bool                        cuphy_pti_initialized_ = false;
     std::atomic<bool>           exit_signal_{false};

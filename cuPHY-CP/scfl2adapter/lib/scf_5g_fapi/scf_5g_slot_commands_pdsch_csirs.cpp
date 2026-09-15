@@ -17,6 +17,8 @@
 
 #include "scf_5g_slot_commands_pdsch_csirs.hpp"
 
+#include <algorithm>
+
 #include "nvlog.h"
 //#include "ti_generic.hpp"
 #include "nv_phy_module.hpp"
@@ -205,8 +207,8 @@ namespace scf_5g_fapi {
         }
     }
     bool update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_pdsch_pdu_t& msg, uint8_t testMode, slot_indication& slotinfo,
-                                        int32_t cell_index, pm_weight_map_t& pm_map, bool pm_enabled, bool bf_enabled, uint16_t num_dl_prb, bfw_coeff_mem_info_t *bfwCoeff_mem_info,
-                                        bool mmimo_enabled, nv::slot_detail_t*  slot_detail)
+                                        int32_t cell_index, pm_weight_map_t& pm_map, bool pm_enabled, bool bf_enabled, uint16_t num_dl_prb, uint16_t num_dl_ant,
+                                        bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t*  slot_detail)
     {
         // cell_sub_cmd.create_if(channel_type::PDSCH);
         cell_sub_cmd.slot.type = SLOT_DOWNLINK;
@@ -242,7 +244,7 @@ namespace scf_5g_fapi {
             NVLOGD_FMT(TAG, "{}: SFN {}.{} cell_id={} DL_TTI.req: PDU {}-{}-{} tb_size={} pdu_offset={}",
                     __func__, slotinfo.sfn_, slotinfo.slot_, cell_index, pdsch_cw_idx, msg.num_codewords, cw, ue_cw.tbSize, ue_cw.tbStartOffset);
 
-            ue_cw.maxLayers = 4;
+            ue_cw.maxLayers = static_cast<uint8_t>(std::min<uint16_t>(num_dl_ant, 4));
             ue_cw.maxQm = p_cw->mcs_table == 1 ? 8 : 6; // We are assuming the MCS table value in the FAPI PDU is valid and so we can use it in maxQm computation
             ue_cw.n_PRB_LBRM = compute_N_prb_lbrm(msg.bwp.bwp_size);
 
@@ -489,9 +491,19 @@ namespace scf_5g_fapi {
         pdsch_fh_param.pc_bf->prg_size = prgSize;
         pdsch_fh_param.pc_bf->dig_bf_interfaces = digBFInterfaces;
 
-        if (mmimo_enabled == 0 || digBFInterfaces != 0)
+        // Defense in depth: this should be unreachable when check_bf_pc_params
+        // above remains in sync with the destination array shape.
+        if (!copy_pm_idx_and_beam_idx(*pdsch_fh_param.pc_bf, *pm_bf, mmimo_enabled))
         {
-            memcpy(pdsch_fh_param.pc_bf->pm_idx_and_beam_idx, pm_bf->pm_idx_and_beam_idx, sizeof(uint16_t) * (numPRGs + numPRGs * digBFInterfaces));
+            NVLOGE_FMT(TAG,
+                       AERIAL_L2ADAPTER_EVENT,
+                       "{} line {}: PM/beam list copy rejected: numPRGs={} digBFInterfaces={} mmimo_enabled={}",
+                       __FUNCTION__,
+                       __LINE__,
+                       static_cast<uint16_t>(numPRGs),
+                       static_cast<uint16_t>(digBFInterfaces),
+                       mmimo_enabled);
+            return false;
         }
         if (likely(!pm_enabled)) {}
         else
@@ -1201,9 +1213,13 @@ namespace scf_5g_fapi {
             return;
         }
 
+        // In send-once mode with the beam already in the RU's DBT, return without
+        // setting extType=11 or any BFW fields. Setting extType=11 would cause fh.cpp
+        // to emit an SE11 wire header with a static beam Id, which the RU rejects
+        // ("Erroneous dynamic beam Id detected"). Cached-beam sections must go out
+        // without SE11, exactly as they did before the send-once cache path was added.
         if (sendOncePerBeam && (isbeamInDBT == 1))
         {
-            // Beam weights already sent, skip
             return;
         }
 
@@ -2549,9 +2565,10 @@ namespace scf_5g_fapi {
         }
         else if (config_options_bf_enabled)
         {
+            // TEMPORARY(csirs-fh-aggr-path): fall back to num_ports when dig_bf_interfaces is 0
             const uint8_t dig_bf_interfaces = pc_and_bf.dig_bf_interfaces;
-            num_ap_indices = dig_bf_interfaces;
-            port_mask = (1ULL << dig_bf_interfaces) - 1ULL;
+            num_ap_indices = dig_bf_interfaces > 0 ? dig_bf_interfaces : num_ports;
+            port_mask = (1ULL << num_ap_indices) - 1ULL;
         }
  
         if (unlikely(is_zp_csirs)) {
@@ -3215,9 +3232,20 @@ namespace scf_5g_fapi {
             pcBf->num_prgs = msg.pc_and_bf.num_prgs;
             pcBf->prg_size = msg.pc_and_bf.prg_size;
             pcBf->dig_bf_interfaces = msg.pc_and_bf.dig_bf_interfaces;
-            uint16_t bf_size = 0;
-            bf_size = pcBf->num_prgs * (pcBf->dig_bf_interfaces+1);
-            std::memcpy(&(pcBf->pm_idx_and_beam_idx[0]),msg.pc_and_bf.pm_idx_and_beam_idx,bf_size*sizeof(uint16_t));
+            // Defense in depth: this should be unreachable when check_bf_pc_params
+            // above remains in sync with the destination array shape.
+            if (!copy_pm_idx_and_beam_idx(*pcBf, msg.pc_and_bf, mmimo_enabled))
+            {
+                NVLOGE_FMT(TAG,
+                           AERIAL_L2ADAPTER_EVENT,
+                           "{} line {}: CSI-RS PM/beam list copy rejected: numPRGs={} digBFInterfaces={} mmimo_enabled={}",
+                           __FUNCTION__,
+                           __LINE__,
+                           static_cast<uint16_t>(msg.pc_and_bf.num_prgs),
+                           static_cast<uint16_t>(msg.pc_and_bf.dig_bf_interfaces),
+                           mmimo_enabled);
+                return;
+            }
             NVLOGD_FMT(TAG, "CSI-RS with cell group: pcAndBf[{}].num_prgs:{} prg_size:{} dig_bf_interfaces:{}",csirs_params->numPcBf,
                 static_cast<unsigned short>(csirs_params->pcAndBf[csirs_params->numPcBf].num_prgs),static_cast<unsigned short>(csirs_params->pcAndBf[csirs_params->numPcBf].prg_size),
                 static_cast<unsigned short>(csirs_params->pcAndBf[csirs_params->numPcBf].dig_bf_interfaces));

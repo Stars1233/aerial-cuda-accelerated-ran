@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -80,10 +80,10 @@ struct dl_slot_timings {
     t_ns end_t_dl_compression_cuda;                            ///< End of CUDA compression
     t_ns start_t_dl_compression_compl;                         ///< Start of compression completion
     t_ns end_t_dl_compression_compl;                           ///< End of compression completion
-    float prepare_execution_duration1[MAX_NUM_OF_NIC_SUPPORTED];  ///< GPU packet preparation phase 1: setup and memory copy per NIC (microseconds, GPU direct comm only)
-    float prepare_execution_duration2[MAX_NUM_OF_NIC_SUPPORTED];  ///< GPU packet preparation phase 2: pre-preparation kernel per NIC (microseconds, GPU direct comm only)
-    float prepare_execution_duration3[MAX_NUM_OF_NIC_SUPPORTED];  ///< GPU packet preparation phase 3: final preparation kernel per NIC (microseconds, GPU direct comm only)
-    float prePrepare_to_compression_gap[MAX_NUM_OF_NIC_SUPPORTED]; ///< CPU-measured wall-clock gap between pre-preparation completion and compression start per NIC (microseconds)
+    float prepare_execution_duration1[MAX_NUM_OF_NIC_PORT_SUPPORTED];  ///< GPU packet preparation phase 1: setup and memory copy per NIC port (microseconds, GPU direct comm only)
+    float prepare_execution_duration2[MAX_NUM_OF_NIC_PORT_SUPPORTED];  ///< GPU packet preparation phase 2: pre-preparation kernel per NIC port (microseconds, GPU direct comm only)
+    float prepare_execution_duration3[MAX_NUM_OF_NIC_PORT_SUPPORTED];  ///< GPU packet preparation phase 3: final preparation kernel per NIC port (microseconds, GPU direct comm only)
+    float prePrepare_to_compression_gap[MAX_NUM_OF_NIC_PORT_SUPPORTED]; ///< CPU-measured wall-clock gap between pre-preparation completion and compression start per NIC port (microseconds)
     float channel_to_compression_gap;                          ///< Gap between channel processing and compression (microseconds)
     float compression_execution_duration;                      ///< Compression execution duration (microseconds)
     float packet_mem_copy_per_symbol_dur_us[ORAN_MAX_SYMBOLS]; ///< Packet memory copy duration per OFDM symbol (microseconds)
@@ -443,7 +443,129 @@ public:
      * @return Reference to batched memcpy helper
      */
     cuphyBatchedMemcpyHelper&                                                     getBatchedMemcpyHelper(){ return m_batchedMemcpyHelper; }
-    
+
+    /**
+     * @brief Gets the precomputed num_tasks_to_wait value used by the DL2Tx aggregator.
+     *
+     * Set by @c l1_enqueue_phy_work based on the actually-scheduled task set
+     * (honours @c EnqueueSkipMask). Task functions read this rather than
+     * recomputing, so they remain skip-mask-agnostic.
+     *
+     * @return Precomputed wait count. Valid only after the enqueuing driver has populated it.
+     */
+    [[nodiscard]] int getNumTasksWaitDl2Tx() const { return numTasksWaitDl2Tx_; }
+
+    /**
+     * @brief Gets the precomputed num_tasks_to_wait value used by the DL buffer-cleanup task.
+     *
+     * Set by @c l1_enqueue_phy_work based on the actually-scheduled task set
+     * (honours @c EnqueueSkipMask).
+     *
+     * @return Precomputed wait count. Valid only after the enqueuing driver has populated it.
+     */
+    [[nodiscard]] int getNumTasksWaitBufCleanup() const { return numTasksWaitBufCleanup_; }
+
+    /**
+     * @brief Sets the precomputed num_tasks_to_wait value used by the DL2Tx aggregator.
+     * @param v Precomputed value from @c l1_enqueue_phy_work.
+     */
+    void setNumTasksWaitDl2Tx(int v) { numTasksWaitDl2Tx_ = v; }
+
+    /**
+     * @brief Sets the precomputed num_tasks_to_wait value used by the DL buffer-cleanup task.
+     * @param v Precomputed value from @c l1_enqueue_phy_work.
+     */
+    void setNumTasksWaitBufCleanup(int v) { numTasksWaitBufCleanup_ = v; }
+
+    /**
+     * @brief Path-aware count of DL C-plane contributors for this slot.
+     *
+     * Legacy path: number of @c TaskDL1AggrCplane tasks pushed by
+     * @c l1_enqueue_phy_work (= @c get_num_dlc_tasks(workers, …)).  Set once by
+     * @c l1_enqueue_phy_work after it computes the worker-formula value.
+     *
+     * Framework path (@c SKIP_DL_FHCB): number of @c task_work_fn_cplane_batch
+     * invocations actually fired by @c PHY_module::fire_cplane_batch for this
+     * slot — i.e., the running batch_count.  Updated by @c fire_cplane_batch as
+     * each batch is scheduled; final value is established by EOM.
+     *
+     * Read by DL task bodies (Compression, GPU Comm TX, BufCleanup, Debug) in
+     * place of the legacy @c get_num_dlc_tasks(pdctx->getNumDLWorkers(), …)
+     * call so that bodies are path-aware without per-call branching.
+     *
+     * Reset to 0 in @c release().
+     *
+     * @return Path-aware DL C-plane contributor count for the current slot.
+     *         Valid only after the producer (l1_enqueue_phy_work for legacy,
+     *         fire_cplane_batch for framework) has populated it.
+     */
+    [[nodiscard]] int getNumDlcTasks() const noexcept { return numDlcTasks_; }
+
+    /**
+     * @brief Sets the path-aware DL C-plane contributor count.
+     * @param v New count.  See @c getNumDlcTasks() for semantics.
+     */
+    void setNumDlcTasks(int v) noexcept { numDlcTasks_ = v; }
+
+    /**
+     * Direct DL C-plane cell completions expected by U-plane.
+     *
+     * In the framework direct-C-plane path, peer-ready is signaled once per
+     * processed cell, while @c numDlcTasks_ counts batches. Capture the cell
+     * target when the early slot map is built so later channel registration does
+     * not change the wait condition.
+     *
+     * @return Frozen peer-ready cell target for the current slot.
+     */
+    [[nodiscard]] int get_num_dl_cplane_peer_ready_targets() const noexcept
+    {
+        return num_dl_cplane_peer_ready_targets_;
+    }
+
+    /**
+     * Sets the direct DL C-plane peer-ready cell target.
+     *
+     * @param[in] v New peer-ready cell target. See
+     *              @c get_num_dl_cplane_peer_ready_targets().
+     */
+    void set_num_dl_cplane_peer_ready_targets(int v) noexcept
+    {
+        num_dl_cplane_peer_ready_targets_ = v;
+    }
+
+    /**
+     * DL slot reference timestamp (L2A slot tick).
+     *
+     * Dedicated slot-reference time, kept separate from @c tasks_ts_exec so that
+     * task dispatch timing is not conflated with the reference time. Consumers
+     * that need the "L2A slot tick" reference (DL task bodies, framework
+     * @c send_dl_cplane) read this via @c getSlotRefTs() instead of
+     * @c getTaskTsExec(0). Set by the DL producer
+     * (@c l1_enqueue_phy_work / @c l1_setup_early_cplane_slot_maps).
+     *
+     * @return Slot reference timestamp stored in @c slotRefTs_.
+     *         Return value must be checked.
+     */
+    [[nodiscard]] t_ns getSlotRefTs() const noexcept { return slotRefTs_; }
+
+    /**
+     * Sets the DL slot reference timestamp. See @c getSlotRefTs().
+     *
+     * @param[in] v Slot reference timestamp to store.
+     */
+    void setSlotRefTs(t_ns v) noexcept { slotRefTs_ = v; }
+
+    /**
+     * Total DL task count for this slot (published via @c setTasksTs()).
+     *
+     * Symmetric with @c SlotMapUl::getNumTasks(); available for DL task bodies
+     * that need the slot's task count without carrying it in @c init().
+     *
+     * @return Total DL task count from @c tasks_num.
+     *         Return value must be checked.
+     */
+    [[nodiscard]] int getNumTasks() const noexcept { return tasks_num; }
+
     ////////////////////////////////////////////
     //// Public Members
     ////////////////////////////////////////////
@@ -459,7 +581,7 @@ public:
     PhyDlBfwAggr * aggr_ulbfw;                                  ///< UL beamforming weight aggregator pointer (currently unused)
     std::vector<Cell *> aggr_cell_list;                         ///< List of cells scheduled in this slot
     std::vector<DLOutputBuffer *> aggr_dlbuf_list;              ///< List of DL output buffers (one per cell)
-    TxRequestGpuPercell tx_v_for_slot_map[MAX_NUM_OF_NIC_SUPPORTED];  ///< TX request structures per NIC
+    TxRequestGpuPercell tx_v_for_slot_map[MAX_NUM_OF_NIC_PORT_SUPPORTED];  ///< TX request structures per NIC port
     slot_command_api::slot_info_t* aggr_slot_info[DL_MAX_CELLS_PER_SLOT];  ///< Slot info (PRB/symbol allocations) per cell
     slot_params_aggr * aggr_slot_params;                        ///< Aggregated slot parameters for all channels
     bool               pdsch_cb_done;                           ///< Flag indicating PDSCH callback completion
@@ -494,9 +616,13 @@ private:
     std::atomic<bool>                                        atom_dl_gpu_comm_end; ///< Atomic flag: DL GPU communication ended
     std::atomic<bool>                                        atom_dl_cpu_door_bell_task_done; ///< Atomic flag: DL CPU doorbell task done
     std::atomic<bool>                                        atom_dl_comp_end;     ///< Atomic flag: DL compression ended
-    int                                                      num_active_cells;     ///< Number of active cells in this slot
     struct slot_command_api::slot_indication                 slot_3gpp;            ///< 3GPP slot indication (SFN, slot number)
     cuphyBatchedMemcpyHelper                                 m_batchedMemcpyHelper; ///< Batched memcpy helper object
+    int                                                      numTasksWaitDl2Tx_      = 0; ///< Precomputed num_tasks_to_wait for DL2Tx aggregator (see l1_enqueue_phy_work; honours EnqueueSkipMask).
+    int                                                      numTasksWaitBufCleanup_ = 0; ///< Precomputed num_tasks_to_wait for DL buffer cleanup (see l1_enqueue_phy_work; honours EnqueueSkipMask).
+    int                                                      numDlcTasks_            = 0; ///< Path-aware DL C-plane contributor count: legacy = num_dlc_tasks (workers), framework = batch_count. See getNumDlcTasks().
+    int                                                      num_dl_cplane_peer_ready_targets_ = 0; ///< Direct DL C-plane cell completions expected by U-plane.
+    t_ns                                                     slotRefTs_{};                ///< DL slot reference time (L2A tick). See getSlotRefTs().
 };
 
 #endif

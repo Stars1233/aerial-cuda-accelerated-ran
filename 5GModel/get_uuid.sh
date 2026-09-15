@@ -33,5 +33,6 @@ non_uuid="${non_uuid}|5GModel/aerial_mcore/aerial_pkg"
 non_uuid="${non_uuid}|5GModel/nr_matlab/CompilerSDKOutput"
 non_uuid="${non_uuid}|5GModel/nr_matlab/scripts"
 non_uuid="${non_uuid}|5GModel/documents"
+non_uuid="${non_uuid}|5GModel/(.*/)?internal/"
 
 find 5GModel -type f -exec md5sum {} \; | egrep -v "$non_uuid" | sort -fid -k 2 | md5sum - | awk '{ print $1 }'

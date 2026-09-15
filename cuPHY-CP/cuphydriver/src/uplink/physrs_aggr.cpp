@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 39) // "DRV.SRS"
 
 #include "physrs_aggr.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -79,9 +80,9 @@ PhySrsAggr::PhySrsAggr(
         {
 
             #if 0
-            srsChEstBuffInfo[i] = std::move(cuphy::tensor_device(nullptr, CUPHY_C_32F, CV_NUM_PRBG, 
-                                                            CV_NUM_GNB_ANT,
-                                                            CV_NUM_UE_LAYER, 
+            srsChEstBuffInfo[i] = std::move(cuphy::tensor_device(nullptr, CUPHY_C_32F, CV_NUM_PRBG,
+                                                            MAX_AP_PER_SLOT_SRS,
+                                                            CV_NUM_UE_LAYER,
                                                             cuphy::tensor_flags::align_tight));
             DataOut.pChEstBuffInfo[i].tChEstBuffer.desc = srsChEstBuffInfo[i].desc().handle();
             #endif
@@ -103,11 +104,12 @@ PhySrsAggr::PhySrsAggr(
 
         DataIn.pTDataRx = (cuphyTensorPrm_t*) calloc(UL_SRS_MAX_CELLS_PER_SLOT, sizeof(cuphyTensorPrm_t));
 
-        // Data IN
+        // Data IN: antenna dimension matches config max UL ports (e.g. 4 for 4T4R, not always 64).
+        const int srs_rx_ant_dim = static_cast<int>(pdctx->getMaxSrsAntennaPorts());
         for(int idx = 0; idx < UL_SRS_MAX_CELLS_PER_SLOT; idx++)
         {
             tDataRxInput[idx] = std::move(cuphy::tensor_device(CUPHY_C_16F, ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB,
-                                                                ORAN_MAX_SRS_SYMBOLS, MAX_AP_PER_SLOT_SRS, /*Change this  to actual number of SRS eAxC IDs used in the test if SRS_H5DUMP is enabled*/
+                                                                ORAN_MAX_SRS_SYMBOLS, srs_rx_ant_dim,
                                                                 cuphy::tensor_flags::align_tight));
             mf.addGpuRegularSize(tDataRxInput[idx].desc().get_size_in_bytes());
             DataIn.pTDataRx[idx].desc = tDataRxInput[idx].desc().handle();
@@ -116,7 +118,7 @@ PhySrsAggr::PhySrsAggr(
         dyn_params.pDataIn = &DataIn;
 
         // SRS IQ host buffer: copies buf_st_2 GPU->host (mirrors PUSCH bDataRx pattern)
-        int totSrsIqSize = (ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB) * ORAN_MAX_SRS_SYMBOLS * MAX_AP_PER_SLOT * UL_SRS_MAX_CELLS_PER_SLOT;
+        int totSrsIqSize = (ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB) * ORAN_MAX_SRS_SYMBOLS * srs_rx_ant_dim * UL_SRS_MAX_CELLS_PER_SLOT;
         if(pdctx->datalake_enabled()) {
             bDataRxSrs  = std::move(cuphy::buffer<__half2, cuphy::pinned_alloc>(totSrsIqSize));
             DataOut.pDataRxSrs = bDataRxSrs.addr();
@@ -135,9 +137,9 @@ PhySrsAggr::PhySrsAggr(
     static_params_cell.clear();
     cell_id_list.clear();
 
-    launch_kernel_warmup(s_channel);
-    launch_kernel_order(s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
-    launch_kernel_order(s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_warmup(warmup_kernel_func_, s_channel);
+    launch_kernel_order(pdctx->getOrderKernelFunctions().kernel_order_srs, s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_order(pdctx->getOrderKernelFunctions().kernel_order_srs, s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
     gDev->synchronizeStream(s_channel);
 
     procModeBmsk = SRS_PROC_MODE_FULL_SLOT;
@@ -151,10 +153,10 @@ PhySrsAggr::~PhySrsAggr()
     if(srsRxHndl)
         cuphyDestroySrsRx(srsRxHndl);
 
-    //cudaFreeHost(DataInOut.pHarqBuffersInOut);
+    // cuMemFreeHost(DataInOut.pHarqBuffersInOut);
 
-    //CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_setup));
-    //CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_setup));
+    // CUDA_DRIVER_CHECK(cuEventDestroy(start_setup));
+    // CUDA_DRIVER_CHECK(cuEventDestroy(end_setup));
 
     free(cellGrpDynPrm.pCellPrms);
     free(cellGrpDynPrm.pUeSrsPrms);
@@ -167,7 +169,7 @@ void PhySrsAggr::tvStatPrms(const char* tv_h5, int cell_idx)
 
     fInput = hdf5hpp::hdf5_file::open(tv_h5);
     
-    cudaStreamSynchronize(s_channel);
+    CUDA_DRIVER_CHECK(cuStreamSynchronize(s_channel));
     if(read_tv == true)
         return;
     // load filters (currently hardcoded to FP32). Load true TB data
@@ -245,7 +247,7 @@ void PhySrsAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     mf.addGpuRegularSize(tPrmSrsRkhs_secondStageTwiddleFactors_grid2.desc().get_size_in_bytes());
 
 
-    cudaStreamSynchronize(s_channel);
+    CUDA_DRIVER_CHECK(cuStreamSynchronize(s_channel));
 
     std::memset(&static_params, 0, sizeof(static_params));
     static_params.srsFilterPrms.tPrmFocc_table.desc  = tPrmFocc_table.desc().handle();
@@ -352,8 +354,6 @@ int PhySrsAggr::createPhyObj()
     setCtx();
     /* Cleanup previous obj and re-create the cuPHY obj */
     CvSrsChestMemBank = pdctx->getCvSrsChestMemoryBank();
-    if(CvSrsChestMemBank == nullptr)
-        PHYDRIVER_THROW_EXCEPTIONS(-1, "CvSrsChestMemBank is null");
 
     pdctx->getCellList(cell_list,&cellCount);
     if(cellCount == 0)
@@ -428,7 +428,7 @@ int PhySrsAggr::createPhyObj()
         static_params.chEstToL2ConstantScaler = pdctx->get_srs_chest_tol2_constant_scaler();
         static_params.enableBatchedMemcpy = pdctx->getUseBatchedMemcpy();
         int cuda_strm_prio = 0;
-        CUDA_CHECK_PHYDRIVER(cudaStreamGetPriority(s_channel, &cuda_strm_prio));
+        CUDA_DRIVER_CHECK(cuStreamGetPriority(s_channel, &cuda_strm_prio));
 
         cuphyStatus_t createStatus = cuphyCreateSrsRx(&srsRxHndl, &static_params, s_channel);
         std::string cuphy_ch_create_name = "cuphyCreateSrsRx";            
@@ -526,6 +526,14 @@ int PhySrsAggr::setup(
             if(count != -1)
             {
                 DataIn.pTDataRx[count].pAddr = aggr_ulbuf_st2[idx]->getBufD();
+                // Match order-kernel IQ layout: (srs_prb_stride * tones, srs symbols, nRxAntSrs)
+                srs_data_rx_desc[count].set(
+                    CUPHY_C_16F,
+                    static_cast<int>(aggr_cell_list[idx]->getSrsPrbStride() * CUPHY_N_TONES_PER_PRB),
+                    static_cast<int>(ORAN_MAX_SRS_SYMBOLS),
+                    static_cast<int>(aggr_cell_list[idx]->getRxAntSrs()),
+                    cuphy::tensor_flags::align_tight);
+                DataIn.pTDataRx[count].desc = srs_data_rx_desc[count].handle();
                 aggr_cell_list[idx]->setSrsDynPrmIndex(count);
             }
             //else
@@ -548,11 +556,29 @@ int PhySrsAggr::setup(
     dyn_params.procModeBmsk = procModeBmsk;
     dyn_params.pDynDbg = &srsDynDbgPrms;
     dyn_params.pDynDbg->enableApiLogging=0;
+    if (!CvSrsChestMemBank)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "SRS setup skipped: CvSrsChestMemoryBank is null");
+        return -1;
+    }
     uint8_t countCell = 0;
     uint8_t countSrsUes = 1;
+    const uint32_t srs_info_pool_len_per_slot = MAX_NUM_UE_SRS_INFO_PER_SLOT * MAX_CELLS_PER_SLOT;
+    const uint32_t srs_info_slot_base = ((static_cast<uint32_t>(si->sfn_) & 0xFU) * SLOTS_PER_FRAME
+                                        + static_cast<uint32_t>(si->slot_)) * srs_info_pool_len_per_slot;
     for (int k=0; k < dyn_params.pCellGrpDynPrm->nSrsUes; k++)
     {
         uint32_t cell_idx = pparms->srs_ue_per_cell[countCell].cell_idx;
+
+        SrsInfoUpdate* srsInfoBuf = CvSrsChestMemBank->getSrsIpcManager()->get_srs_info_update_buf(srs_info_slot_base + k);
+        if (srsInfoBuf == nullptr)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "get_srs_info_update_buf({}) returned null", srs_info_slot_base + k);
+            return -1;
+        }
+        srsInfoBuf->srs_info_idx = static_cast<uint16_t>(countSrsUes - 1);
+        srsInfoBuf->cell_idx     = static_cast<uint16_t>(cell_idx);
+
         if (pparms->srs_ue_per_cell[countCell].num_srs_ues == countSrsUes)
         {
             countCell++;
@@ -563,6 +589,8 @@ int PhySrsAggr::setup(
             countSrsUes++;
         }
         uint32_t rnti = dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].rnti;
+        srsInfoBuf->rnti      = static_cast<uint16_t>(rnti);
+        srsInfoBuf->_reserved = 0;
         uint32_t bufferIdx = dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].srsChestBufferIndexL2;
         uint32_t usage = dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].usage;
         cv_ptr = nullptr;
@@ -571,69 +599,69 @@ int PhySrsAggr::setup(
                                         rnti,
                                         bufferIdx,
                                         usage,
-                                        (CVSrsChestBuff**)&cv_ptr))
+                                        (CVSrsChestBuff**)&cv_ptr,
+                                        &srsInfoBuf->real_buff_idx))
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "bucketAllocateBuffer returned error ");
             return -1;
         }
-        else
+        uint16_t prgSize = dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].prgSize;
+        if(prgSize > 4)
         {
-            uint16_t prgSize = dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].prgSize;
-            if(prgSize > 4)
-            {
-                prgSize = 2; 
-            }
-            cv_ptr->configSrsInfo(pparms->dl_ul_bwp_max_prg[cell_idx],
-                                  pparms->nGnbAnt, 
-                                  CV_NUM_UE_LAYER, 
-                                  prgSize, 
-                                  dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].srsStartPrg,
-                                  dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].startValidPrg,
-                                  dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].nValidPrg);
+            prgSize = 2;
+        }
+        cv_ptr->configSrsInfo(pparms->dl_ul_bwp_max_prg[cell_idx],
+                              pparms->nGnbAnt,
+                              CV_NUM_UE_LAYER,
+                              prgSize,
+                              dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].srsStartPrg,
+                              dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].startValidPrg,
+                              dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].nValidPrg);
 
-            DataOut.pChEstBuffInfo[k].tChEstBuffer.desc  = cv_ptr->getSrsDescr();
-            DataOut.pChEstBuffInfo[k].tChEstBuffer.pAddr = cv_ptr->getAddr();
-            dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].chEstBuffIdx = k; 
+        DataOut.pChEstBuffInfo[k].tChEstBuffer.desc  = cv_ptr->getSrsDescr();
+        DataOut.pChEstBuffInfo[k].tChEstBuffer.pAddr = cv_ptr->getAddr();
+        dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].chEstBuffIdx = k;
 
 
 #if 0
-            cuphyDataType_t dtype;
-            int rank;
-            vec<int, CUPHY_DIM_MAX> dimensions;
-            vec<int, CUPHY_DIM_MAX> strides;
-            cuphyStatus_t s = cuphyGetTensorDescriptor(DataOut.pChEstBuffInfo[k].tChEstBuffer.desc,
-                                                    CUPHY_DIM_MAX,
-                                                    &dtype,
-                                                    &rank,
-                                                    dimensions.begin(),
-                                                    strides.begin());
+        cuphyDataType_t dtype;
+        int rank;
+        vec<int, CUPHY_DIM_MAX> dimensions;
+        vec<int, CUPHY_DIM_MAX> strides;
+        cuphyStatus_t s = cuphyGetTensorDescriptor(DataOut.pChEstBuffInfo[k].tChEstBuffer.desc,
+                                                        CUPHY_DIM_MAX,
+                                                        &dtype,
+                                                        &rank,
+                                                        dimensions.begin(),
+                                                        strides.begin());
 
-            NVLOGD_FMT(TAG, "{}:dimensions[0]={}, dimensions[1]={}, dimensions[2]={}, strides[0]={}, strides[1]={}, strides[2]={}",
+        NVLOGD_FMT(TAG, "{}:dimensions[0]={}, dimensions[1]={}, dimensions[2]={}, strides[0]={}, strides[1]={}, strides[2]={}",
                                 __func__, dimensions[0], dimensions[1], dimensions[2], strides[0], strides[1], strides[2]);
 #endif
-            NVLOGD_FMT(TAG, "PhySRSAggr{}: SFN {}.{} allocated CV buffer {} {} {} rnti {} usage {} srsPrgSize {} srsStartPrg {} cell_id {} bufferIdx {}",
-                this_id, si->sfn_, si->slot_,
-                k, reinterpret_cast<void*>(cv_ptr), dyn_params.pDataOut->pChEstBuffInfo[k].tChEstBuffer.pAddr,
-                rnti,
-                usage,
-                dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].prgSize,
-                dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].srsStartPrg,
-                cell_idx,
-                bufferIdx
-            );
-        }
+        NVLOGD_FMT(TAG, "PhySRSAggr{}: SFN {}.{} allocated CV buffer {} {} {} rnti {} srs_info_idx={} real_buff_idx={} usage {} srsPrgSize {} srsStartPrg {} cell_id {} bufferIdx {}",
+            this_id, si->sfn_, si->slot_,
+            k, reinterpret_cast<void*>(cv_ptr), dyn_params.pDataOut->pChEstBuffInfo[k].tChEstBuffer.pAddr,
+            rnti,
+            srsInfoBuf->srs_info_idx,
+            srsInfoBuf->real_buff_idx,
+            usage,
+            dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].prgSize,
+            dyn_params.pCellGrpDynPrm->pUeSrsPrms[k].srsStartPrg,
+            cell_idx,
+            bufferIdx
+        );
         dyn_params.pDataOut->pSrsChEstToL2[k].pChEstCpuBuff = pparms->srs_chest_buffer[k];
         //NVLOGD_FMT(TAG, "PhySrsAggr pSrsChEstToL2[{}]={}",k,dyn_params.pDataOut->pSrsChEstToL2[k].pChEstCpuBuff); 
     }
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, s_channel));
+    CUDA_DRIVER_CHECK(cuEventRecord(start_setup, s_channel));
     setupStatus = cuphySetupSrsRx(srsRxHndl, &(dyn_params), batchPrmHndl);
     if(setupStatus != CUPHY_STATUS_SUCCESS)
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphySetupSrshRx returned error {}", static_cast<int>(setupStatus));
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
         return -1;
     }
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+    CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
 
     NVLOGD_FMT(TAG, "PhySrsAggr{} SFN {}.{} setup", this_id, si->sfn_, si->slot_);
     //printStaticApiPrms(&static_params);
@@ -648,10 +676,10 @@ int PhySrsAggr::run()
     setCtx();
 
     #ifdef PUSCH_INPUT_BUFFER_DEBUG
-        CUDA_CHECK_PHYDRIVER(cudaMemcpyAsync(buf_h, buf_d, buf_sz, cudaMemcpyDefault, s_channel));
+        CUDA_DRIVER_CHECK(cuMemcpyDtoHAsync(buf_h, reinterpret_cast<CUdeviceptr>(buf_d), buf_sz, s_channel));
     #endif
 
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, s_channel));
+    CUDA_DRIVER_CHECK(cuEventRecord(start_run, s_channel));
     if((getSetupStatus() == CH_SETUP_DONE_NO_ERROR))
     {
         cuphyStatus_t runStatus = cuphyRunSrsRx(srsRxHndl, procModeBmsk);
@@ -663,7 +691,7 @@ int PhySrsAggr::run()
     }
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, s_channel));
     }
 
     t_ns t3 = Time::nowNs();
@@ -741,14 +769,14 @@ int PhySrsAggr::validate()
     {
         NVLOGC_FMT(TAG, "SFN {}.{} Generating H5 Debug SRS file {}", aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, std::to_string(id).c_str());
         auto& stream = s_channel;
-        cudaStreamSynchronize(stream);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
         cuphyStatus_t debugStatus = cuphyWriteDbgBufSynchSrs(srsRxHndl, stream);
         if(debugStatus != CUPHY_STATUS_SUCCESS)
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphyWriteDbgBufSynchSrs returned error {}", debugStatus);
             return -1;
         }
-        cudaStreamSynchronize(stream);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
         debugFileH.get()->close();
         debugFileH.reset();
 /*        
@@ -794,6 +822,13 @@ int PhySrsAggr::callback(const std::array<bool,UL_MAX_CELLS_PER_SLOT>& srs_order
 
         // Only for compilation to run pass actual cuphySrsDataOut_t* struct
         ul_cb.srs_cb_fn(ul_cb.srs_cb_context, msg, *(aggr_slot_params->si), *srs, &DataOut, &static_params, srs_order_cell_timeout_list);
+    }
+
+    // Dump the SRS memory pools to H5 file if dumping is enabled
+    if (CvSrsChestMemBank != nullptr)
+    {
+        const uint32_t active_num_cells = static_cast<uint32_t>(dyn_params.pCellGrpDynPrm->nCells);
+        CvSrsChestMemBank->getSrsIpcManager()->dump_h5(si->sfn_, si->slot_, active_num_cells);
     }
 
     return 0;

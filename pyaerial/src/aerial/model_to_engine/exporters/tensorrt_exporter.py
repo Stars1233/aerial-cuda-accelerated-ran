@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,18 +55,46 @@ class TensorRTExporter:
                precision: str = "fp16",
                onnx_path: Optional[str] = None,
                **kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Export the model to TensorRT format.
+        """Export the model to TensorRT format.
 
         Args:
-            output_path: Path to save the TensorRT engine
-            precision: Precision mode ("fp32", "fp16", "tf32", "int8")
-            onnx_path: Path to an existing ONNX model, if available
-            **kwargs: Additional parameters for TensorRT conversion
+            output_path: Path to save the TensorRT engine. The ``.engine``
+                suffix is appended automatically if absent.
+            precision: Precision mode. One of ``"fp32"``, ``"fp16"``,
+                ``"bf16"``, ``"tf32"``, or ``"mixed"``.
+            onnx_path: Path to an existing ONNX model. If ``None``, the model
+                is first exported to ONNX alongside the engine output.
+            **kwargs: Additional parameters. Supports ``onnx`` key whose value
+                is forwarded to :meth:`ONNXExporter.export`.
 
         Returns:
-            Dictionary with export results
+            Dictionary with keys ``format``, ``path``, ``export_time``,
+            ``precision``, and optionally ``benchmarks``.
+
+        Raises:
+            NotImplementedError: If ``precision`` is ``"int8"`` (requires an
+                INT8 calibrator that is not implemented).
+            ValueError: If ``precision`` is not one of the supported modes.
+
+        Examples:
+            >>> exporter = TensorRTExporter(algorithm)
+            >>> result = exporter.export("model.engine", precision="fp16")
+            >>> print(result["format"])
+            tensorrt
         """
+        supported_precisions = {"fp32", "fp16", "bf16", "tf32", "mixed"}
+        if precision == "int8":
+            raise NotImplementedError(
+                "INT8 precision is not supported: it requires an INT8 calibrator "
+                "and calibration cache that are not implemented. Supported modes: "
+                "fp32, fp16, bf16, tf32, mixed."
+            )
+        if precision not in supported_precisions:
+            raise ValueError(
+                f"Unsupported precision '{precision}'. "
+                "Supported modes: fp32, fp16, bf16, tf32, mixed."
+            )
+
         if not output_path.endswith('.engine'):
             output_path += '.engine'
 
@@ -86,8 +114,8 @@ class TensorRTExporter:
         # Start timing
         start_time = time.time()
 
-        # Use direct TensorRT API
-        result = self._convert_with_trt_api(
+        # Use trtexec subprocess to avoid Python API segfaults in TRT 10.x
+        result = self._convert_with_trtexec(
             onnx_path, output_path, precision
         )
 
@@ -107,6 +135,98 @@ class TensorRTExporter:
             result["benchmarks"] = benchmark_results
 
         return result
+
+    def _convert_with_trtexec(self, onnx_path: str,
+                              output_path: str,
+                              precision: str) -> Dict[str, Any]:
+        """
+        Convert ONNX model to TensorRT engine using trtexec subprocess.
+
+        Uses trtexec instead of the TRT Python API to avoid segfaults in
+        TRT 10.x Python bindings when building engines with dynamic shapes.
+
+        Args:
+            onnx_path: Path to the ONNX model
+            output_path: Path to save the TensorRT engine
+            precision: Precision mode
+
+        Returns:
+            Dictionary with conversion results
+        """
+        try:
+            import tensorrt as trt  # type: ignore
+            logger.info(f"Converting {onnx_path} to TensorRT engine with "
+                        f"{precision} precision using trtexec")
+            logger.info(f"TensorRT version: {trt.__version__}")
+        except ImportError:
+            pass
+
+        # Build shape args from input specs
+        input_specs = self.algorithm.get_input_specs()
+        shape_args = []
+        for spec in input_specs:
+            # Mirror _convert_with_trt_api: build separate min/opt/max ranges so
+            # the trtexec path produces the same engine profile as the TRT-API
+            # path. Fixed (int) dims are used as-is; dynamic axes fall back to
+            # 1/1/4; constant symbolic dims fall back to 1. All values are ints.
+            min_shape, opt_shape, max_shape = [], [], []
+            for i, dim in enumerate(spec.shape):
+                if isinstance(dim, int):
+                    min_v = opt_v = max_v = dim
+                elif spec.is_dynamic and i in spec.dynamic_axes:
+                    min_v, opt_v, max_v = 1, 1, 4
+                else:
+                    min_v = opt_v = max_v = 1
+                min_shape.append(min_v)
+                opt_shape.append(opt_v)
+                max_shape.append(max_v)
+            shape_args.append(f"--minShapes={spec.name}:{'x'.join(map(str, min_shape))}")
+            shape_args.append(f"--optShapes={spec.name}:{'x'.join(map(str, opt_shape))}")
+            shape_args.append(f"--maxShapes={spec.name}:{'x'.join(map(str, max_shape))}")
+
+        # Build precision flag
+        precision_flags = []
+        if precision in ["fp16", "mixed"]:
+            precision_flags.append("--fp16")
+        if precision in ["tf32", "mixed"]:
+            precision_flags.append("--tf32")
+        if precision == "bf16":
+            precision_flags.append("--bf16")
+
+        cmd = (
+            ["trtexec",
+             f"--onnx={onnx_path}",
+             f"--saveEngine={output_path}",
+             "--memPoolSize=workspace:3072"]
+            + precision_flags
+            + shape_args
+        )
+
+        logger.info("Running: %s", ' '.join(cmd))
+        try:
+            result = subprocess.run(
+                cmd, text=True, capture_output=True, timeout=600, check=False
+            )
+        except FileNotFoundError:
+            return {"status": "error",
+                    "message": "trtexec not found; ensure TensorRT is installed and in PATH"}
+        except subprocess.TimeoutExpired:
+            return {"status": "error",
+                    "message": "trtexec timed out after 600 seconds"}
+
+        if result.returncode != 0:
+            logger.error(f"trtexec conversion failed:\n{result.stderr}")
+            return {"status": "error",
+                    "message": f"trtexec failed: {result.stderr[-500:]}"}
+
+        if not os.path.exists(output_path):
+            return {"status": "error",
+                    "message": "trtexec succeeded but engine file not found"}
+
+        logger.info(f"Engine saved to {output_path} "
+                    f"({os.path.getsize(output_path)} bytes)")
+        return {"status": "success",
+                "message": "Conversion successful using trtexec"}
 
     def _convert_with_trt_api(self, onnx_path: str,
                               output_path: str,
@@ -133,11 +253,9 @@ class TensorRTExporter:
             trt_logger = trt.Logger(trt.Logger.INFO)
 
             # Create builder and network
+            # TRT 10+ removed EXPLICIT_BATCH flag; all networks are explicit batch by default
             builder = trt.Builder(trt_logger)
-            network_flags = (
-                1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-            )
-            network = builder.create_network(network_flags)
+            network = builder.create_network(0)
 
             # Parse ONNX model
             parser = trt.OnnxParser(network, trt_logger)
@@ -152,51 +270,49 @@ class TensorRTExporter:
             builder_config = builder.create_builder_config()
 
             # Set precision flags
-            builder_config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
-
             if precision == "bf16":
                 builder_config.set_flag(trt.BuilderFlag.BF16)
-            if precision in ["fp16", "mixed", "int8"]:
+            if precision in ["fp16", "mixed"]:
                 builder_config.set_flag(trt.BuilderFlag.FP16)
             if precision in ["tf32", "mixed"]:
                 builder_config.set_flag(trt.BuilderFlag.TF32)
 
             # Create optimization profile for dynamic dimensions
-            profile = builder.create_optimization_profile()
-
-            # Set input shape constraints based on algorithm specs
             input_specs = self.algorithm.get_input_specs()
-            for spec in input_specs:
-                if spec.is_dynamic:
-                    # Create shape for min, opt, max dimensions
-                    min_shape = []
-                    opt_shape = []
-                    max_shape = []
+            has_dynamic = any(spec.is_dynamic for spec in input_specs)
 
-                    for i, dim in enumerate(spec.shape):
-                        if isinstance(dim, str):
-                            # Dynamic dimension
-                            if i in spec.dynamic_axes:
-                                min_val = 1  # Default min
-                                opt_val = 1  # Default optimal
-                                max_val = 4  # Default max
+            if has_dynamic:
+                profile = builder.create_optimization_profile()
+
+                # Set input shape constraints based on algorithm specs
+                for spec in input_specs:
+                    if spec.is_dynamic:
+                        # Create shape for min, opt, max dimensions
+                        min_shape = []
+                        opt_shape = []
+                        max_shape = []
+
+                        for i, dim in enumerate(spec.shape):
+                            if (isinstance(dim, int)
+                                    and (not spec.is_dynamic
+                                         or i not in spec.dynamic_axes)):
+                                min_val = opt_val = max_val = dim
+                            elif spec.is_dynamic and i in spec.dynamic_axes:
+                                min_val = 1
+                                opt_val = 1
+                                max_val = 4
                             else:
-                                # Constant dimension with a string name
                                 min_val = opt_val = max_val = 1
-                        else:
-                            # Fixed dimension
-                            min_val = opt_val = max_val = dim
 
-                        min_shape.append(min_val)
-                        opt_shape.append(opt_val)
-                        max_shape.append(max_val)
+                            min_shape.append(min_val)
+                            opt_shape.append(opt_val)
+                            max_shape.append(max_val)
 
-                    profile.set_shape(
-                        spec.name, min_shape, opt_shape, max_shape
-                    )
+                        profile.set_shape(
+                            spec.name, min_shape, opt_shape, max_shape
+                        )
 
-            # Add profile to config
-            builder_config.add_optimization_profile(profile)
+                builder_config.add_optimization_profile(profile)
 
             # Set workspace size (3 GB)
             builder_config.set_memory_pool_limit(

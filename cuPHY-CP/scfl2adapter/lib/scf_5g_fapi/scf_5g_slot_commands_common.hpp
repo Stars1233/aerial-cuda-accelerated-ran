@@ -17,6 +17,7 @@
 
 #pragma once
 #include <concepts>
+#include <cstring>
 #include <unordered_map>
 
 #include "slot_command/slot_command.hpp"
@@ -30,9 +31,14 @@ using namespace slot_command_api;
 #include "cuphy_internal.h"
 
 #include "nv_phy_driver_proxy.hpp"
+#include "nvlog_fmt.hpp"
 
 #define SCF_SLTCMD_TAG (NVLOG_TAG_BASE_SCF_L2_ADAPTER + 4) // "SCF.SLOTCMD"
 namespace scf_5g_fapi {
+
+    static_assert((sizeof(static_cast<slot_command_api::tx_precoding_beamforming_t*>(nullptr)->pm_idx_and_beam_idx) / sizeof(uint16_t)) ==
+                      (MAX_NUM_PRGS * (1 + MAX_NUM_DIGBFI)),
+                  "tx_precoding_beamforming_t::pm_idx_and_beam_idx capacity must match MAX_NUM_PRGS and MAX_NUM_DIGBFI");
 
     using pm_weight_map_t = std::unordered_map<uint32_t, slot_command_api::pm_weights_t>;
     using static_digBeam_weight_map_t = std::unordered_map<uint16_t, slot_command_api::digBeam_t>;
@@ -403,10 +409,100 @@ namespace scf_5g_fapi {
      * @brief Check if the beamforming parameters are valid
      * @param numPrg Number of PRGs
      * @param numDigBFI Number of DigBFIs
-     * @param mmimo_enabled Whether MIMO is enabled
-     * @return True if the beamforming parameters are valid, false otherwise
+     * @param mmimo_enabled Whether mMIMO is enabled (relaxes PRG / DigBFI limits).
+     * @return @c true if the beamforming parameters are within the allowed limits.
      */
-    bool check_bf_pc_params(int numPrg, int numDigBFI, bool mmimo_enabled);
+    [[nodiscard]] inline bool check_bf_pc_params(const int  numPrg,
+                                                 const int  numDigBFI,
+                                                 const bool mmimo_enabled)
+    {
+        if (numDigBFI > MAX_NUM_DIGBFI)
+        {
+            NVLOGE_FMT(SCF_SLTCMD_TAG, AERIAL_L2ADAPTER_EVENT,
+                       "Num DigBFIs received {} larger than MAX {} DigBFIs allocated",
+                       numDigBFI, MAX_NUM_DIGBFI);
+            return false;
+        }
+
+        const bool is_mmimo_dynamic_bfw = mmimo_enabled && (numDigBFI == 0);
+
+        // mMIMO dynamic-BFW uses digBFI == 0 and does not copy a static
+        // PM/beam list into tx_precoding_beamforming_t::pm_idx_and_beam_idx.
+        // Every path that does copy that list must fit the fixed MAX_NUM_PRGS
+        // destination shape.
+        if (!is_mmimo_dynamic_bfw && (numPrg > MAX_NUM_PRGS))
+        {
+            NVLOGE_FMT(SCF_SLTCMD_TAG, AERIAL_L2ADAPTER_EVENT,
+                       "Num PRG received {} larger than MAX {} prgs allocated",
+                       numPrg, MAX_NUM_PRGS);
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Bounds-checked copy of the PM/beam index list from a FAPI Tx
+     *        precoding/beamforming PDU into a slot-command @c tx_precoding_beamforming_t.
+     *
+     * Encapsulates the memcpy behind an independent bounds check that must hold
+     * even if @c check_bf_pc_params drifts out of sync with the destination
+     * array shape (defense in depth for CWE-787). Layout:
+     *   - Short-circuits on the mmimo dynamic-BFW path (@c dig_bf_interfaces == 0)
+     *     — nothing to copy.
+     *   - Rejects @c num_prgs > @c MAX_NUM_PRGS or @c dig_bf_interfaces >
+     *     @c MAX_NUM_DIGBFI (matches @c check_bf_pc_params bounds).
+     *   - Rejects when the total entry count
+     *     @c num_prgs * (1 + @c dig_bf_interfaces) exceeds the destination
+     *     capacity derived at compile time from
+     *     @c sizeof(dst.pm_idx_and_beam_idx).
+     *   - On rejection, logs via @c NVLOGE_FMT with the offending params and
+     *     drops the copy entirely — a partial copy would leave the receiver
+     *     with inconsistent PM/beam state.
+     *
+     * @param[out] dst           Destination slot-command PM/beam struct.
+     * @param[in]  src           Source FAPI PDU carrying @c num_prgs,
+     *                           @c dig_bf_interfaces, and @c pm_idx_and_beam_idx.
+     * @param[in]  mmimo_enabled Runtime mMIMO flag (governs the dynamic-BFW skip).
+     * @return @c true on successful copy or when the mmimo dynamic-BFW path
+     *         legitimately skips the copy; @c false if any bounds check
+     *         rejects the input (caller must check — attribute
+     *         @c [[nodiscard]]).
+     */
+    [[nodiscard]] inline bool copy_pm_idx_and_beam_idx(slot_command_api::tx_precoding_beamforming_t& dst,
+                                                       const scf_fapi_tx_precoding_beamforming_t& src,
+                                                       const bool mmimo_enabled)
+    {
+        if (mmimo_enabled && src.dig_bf_interfaces == 0u)
+        {
+            return true;
+        }
+        if ((src.num_prgs > MAX_NUM_PRGS) || (src.dig_bf_interfaces > MAX_NUM_DIGBFI))
+        {
+            NVLOGE_FMT(SCF_SLTCMD_TAG,
+                       AERIAL_L2ADAPTER_EVENT,
+                       "PM/beam list params exceed limits: num_prgs={} max_num_prgs={} dig_bf_interfaces={} max_dig_bf_interfaces={}",
+                       src.num_prgs,
+                       MAX_NUM_PRGS,
+                       static_cast<uint16_t>(src.dig_bf_interfaces),
+                       MAX_NUM_DIGBFI);
+            return false;
+        }
+
+        const std::size_t n_entries = static_cast<std::size_t>(src.num_prgs) *
+                                      (1u + static_cast<std::size_t>(src.dig_bf_interfaces));
+        constexpr std::size_t dst_capacity = sizeof(dst.pm_idx_and_beam_idx) / sizeof(dst.pm_idx_and_beam_idx[0]);
+        if (n_entries > dst_capacity)
+        {
+            NVLOGE_FMT(SCF_SLTCMD_TAG, AERIAL_L2ADAPTER_EVENT,
+                       "PM/beam list entries {} exceed destination capacity {}",
+                       n_entries, dst_capacity);
+            return false;
+        }
+
+        std::memcpy(dst.pm_idx_and_beam_idx, src.pm_idx_and_beam_idx, n_entries * sizeof(uint16_t));
+        return true;
+    }
 
     void check_prb_info_size(size_t& prb_info_size);
     void update_beam_list(beamid_array_t& array, size_t& array_size, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, bool mmimo_enabled, prb_info_t& prb_info, int32_t cell_idx);
@@ -467,17 +563,19 @@ namespace scf_5g_fapi {
 
         NVLOGD_FMT(SCF_SLTCMD_TAG, "Beamidx={} is in static DBT table", beam_id);
 
-        // Check if static beamforming weights should be sent once per cell (first time only) or every time
         const bool sendOncePerBeam = !phyDriver.l1_get_send_static_bfw_wt_all_cplane();
-        if (sendOncePerBeam)
+
+        // In send-once mode, when the beam is already in the RU's DBT, do NOT set
+        // extType=11 or touch any BFW-related fields on prb_info. Setting extType=11
+        // would (a) route the section into the BFW C-plane queue AND (b) cause fh.cpp
+        // to write an SE11 wire header. The RU parser only accepts DYNAMIC beam Ids
+        // in SE11 (per oran_beam_id_info.dynamic_beam_id_start), so a static beam Id
+        // in an SE11 header is rejected as "Erroneous dynamic beam Id detected". The
+        // cached-beam section must go out without SE11, exactly as it did before the
+        // send-once cache path was added.
+        if (sendOncePerBeam && (isbeamInDBT == 1))
         {
-            if (isbeamInDBT == 1)
-            {
-                // Beam weights already sent, skip
-                return;
-            }
-            // Beam weights not sent yet (isbeamInDBT == 0), mark as sent
-            phyDriver.l1_setBeamWeightsSentFlag(cell_index, beam_id);
+            return;
         }
 
         NVLOGD_FMT(SCF_SLTCMD_TAG, "Beamidx={} entry available in DBT PDU IQ sent using extType=11 prb_info={}", beam_id, reinterpret_cast<void*>(&prb_info.common));
@@ -486,6 +584,11 @@ namespace scf_5g_fapi {
         prb_info.static_bfwCoeff_buf_info.num_prgs = bf_pdu.num_prgs;
         prb_info.static_bfwCoeff_buf_info.prg_size = bf_pdu.prg_size;
         prb_info.static_bfwCoeff_buf_info.dig_bf_interfaces = bf_pdu.dig_bf_interfaces;
+
+        if (sendOncePerBeam)
+        {
+            phyDriver.l1_setBeamWeightsSentFlag(cell_index, beam_id);
+        }
         //prb_info.static_bfwCoeff_buf_info.nGnbAnt = bf_pdu.nGnbAnt;
     }
 

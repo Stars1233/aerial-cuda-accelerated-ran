@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 7) // "DRV.GPUDEV"
 
 #include "gpudevice.hpp"
+#include <cstddef>
 #include "context.hpp"
 #include "exceptions.hpp"
 #include "nvlog.hpp"
@@ -28,17 +29,25 @@ GpuDevice::GpuDevice(
     bool             _init_gdr) :
     pdh(_pdh),
     id(_id),
+    primary_ctx(nullptr),
     init_gdr(_init_gdr)
 {
-    CUDA_CHECK_PHYDRIVER(cudaGetDeviceCount(&tot_devs));
-    if(id > tot_devs)
+    CUDA_DRIVER_CHECK(cuDeviceGetCount(&tot_devs));
+    if(id >= tot_devs)
         PHYDRIVER_THROW_EXCEPTIONS(-1, "Device not found in the system");
 
-    CUDA_CHECK_PHYDRIVER(cudaGetDeviceProperties(&deviceProp, id)); // can also consider getting attributes individually via cudaDeviceGetAttribute
-    CUDA_CHECK_PHYDRIVER(cudaDeviceGetAttribute(&device_attr_clock_rate, cudaDevAttrClockRate, id)); // get attribute directly; marked as deprecated in cudaDeviceProp
-    CUDA_CHECK_PHYDRIVER(cudaDeviceGetAttribute(&device_is_direct_rdma_supported, cudaDevAttrGPUDirectRDMASupported, id)); // get attribute directly; unavailable in cudaDeviceProp
+    CUdevice device;
+    CUDA_DRIVER_CHECK(cuDeviceGet(&device, static_cast<int>(id)));
+    CUDA_DRIVER_CHECK(cuDeviceGetName(deviceProp.name, sizeof(deviceProp.name), device));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&deviceProp.pciBusID, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, device));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&deviceProp.pciDeviceID, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, device));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&deviceProp.pciDomainID, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, device));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&device_attr_clock_rate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, device));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&device_is_direct_rdma_supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, device));
 
-    setDevice();
+    /* Retain primary context once; setDevice() will only call cuCtxSetCurrent. */
+    CUDA_DRIVER_CHECK(cuDevicePrimaryCtxRetain(&primary_ctx, device));
+    CUDA_DRIVER_CHECK(cuCtxSetCurrent(primary_ctx));
 
     /*
     * Create a handle to the gdrcopy library
@@ -48,7 +57,7 @@ GpuDevice::GpuDevice(
     //Maybe constructor can take as input a GDRCopy descriptor
 
     gdrc_h = nullptr;
-    if(init_gdr == true && device_is_direct_rdma_supported == 1)
+    if(init_gdr == true && device_is_direct_rdma_supported != 0)
     {
         gdrc_h = gdr_open();
         if(gdrc_h == nullptr)
@@ -66,23 +75,37 @@ GpuDevice::~GpuDevice()
         if(gdrc_h != nullptr)
             gdr_close(gdrc_h);
     }
-};
+    CUdevice device;
+    CUresult r = cuDeviceGet(&device, static_cast<int>(id));
+    if (r == CUDA_SUCCESS) {
+        CUDA_DRIVER_CHECK_NON_FATAL(cuDevicePrimaryCtxRelease(device));
+    }
+    else {
+        NVLOGW_FMT(TAG,"[{}:{}] cuDeviceGet failed in ~GpuDevice (result {}), skipping PrimaryCtxRelease",
+                   __FILE__, __LINE__, static_cast<unsigned>(r));
+    }
+    
+}
 
 gdr_t* GpuDevice::getGDRhandler()
 {
     return &gdrc_h;
 }
 
-struct gpinned_buffer* GpuDevice::newGDRbuf(size_t size)
+[[nodiscard]] struct gpinned_buffer* GpuDevice::newGDRbuf(const std::size_t size)
 {
-    return new gpinned_buffer{&gdrc_h, size, device_is_direct_rdma_supported == 1};
+    // Use GDR device-memory path only when GDRCopy is open; CUDA may report RDMA support
+    // while init_gdr is false, in which case we must use the pinned-host fallback.
+    const bool use_gdr_path =
+        (device_is_direct_rdma_supported != 0) && (gdrc_h != nullptr);
+    return new gpinned_buffer{&gdrc_h, size, use_gdr_path};
 }
 
-int GpuDevice::runWarmup(int n, cudaStream_t s)
+int GpuDevice::runWarmup(CUfunction warmup_func, int n, CUstream s)
 {
     for(int i = 0; i < n; i++)
     {
-        launch_kernel_warmup(s);
+        launch_kernel_warmup(warmup_func, s);
     }
 
     return 0;
@@ -95,7 +118,7 @@ phydriver_handle GpuDevice::getPhyDriverHandler(void) const
 
 void GpuDevice::setDevice()
 {
-    CUDA_CHECK_PHYDRIVER(cudaSetDevice(id));
+    CUDA_DRIVER_CHECK(cuCtxSetCurrent(primary_ctx));
 }
 
 uint32_t GpuDevice::getId()
@@ -109,7 +132,7 @@ void GpuDevice::print_info()
     // Hz=int64_t(device_attr_clock_rate) * 1000;
 }
 
-void GpuDevice::synchronizeStream(cudaStream_t stream)
+void GpuDevice::synchronizeStream(CUstream stream)
 {
-    CUDA_CHECK_PHYDRIVER(cudaStreamSynchronize(stream));
+    CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
 }

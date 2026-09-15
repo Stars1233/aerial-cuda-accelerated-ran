@@ -280,6 +280,7 @@ def write_summary(
         lines.append(total_row)
     lines.append("")
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,6 +71,11 @@ struct app_num_words<__half, BG, CHECK_IDX> { static const int value = div_round
 // number of words in this case is equal to the row degree.
 template <int BG, int CHECK_IDX>
 struct app_num_words<__half2, BG, CHECK_IDX> { static const int value = row_degree<BG, CHECK_IDX>::value; };
+template <int BG, int CHECK_IDX>
+struct app_num_words<__nv_fp8_e4m3, BG, CHECK_IDX> { static const int value = div_round_up_t<row_degree<BG, CHECK_IDX>::value, 4>::value; };
+template <int BG, int CHECK_IDX>
+struct app_num_words<__nv_fp8_e5m2, BG, CHECK_IDX> { static const int value = div_round_up_t<row_degree<BG, CHECK_IDX>::value, 4>::value; };
+
 
 ////////////////////////////////////////////////////////////////////////
 // row_num_words
@@ -85,6 +90,10 @@ template <int ROW_DEGREE>
 struct row_num_words<__half, ROW_DEGREE>  { static const int value = div_round_up_t<ROW_DEGREE, 2>::value; };
 template <int ROW_DEGREE>
 struct row_num_words<__half2, ROW_DEGREE> { static const int value = ROW_DEGREE; };
+template <int ROW_DEGREE>
+struct row_num_words<__nv_fp8_e5m2, ROW_DEGREE>  { static const int value = div_round_up_t<ROW_DEGREE, 4>::value; };
+template <int ROW_DEGREE>
+struct row_num_words<__nv_fp8_e4m3, ROW_DEGREE>  { static const int value = div_round_up_t<ROW_DEGREE, 4>::value; };
 
 ////////////////////////////////////////////////////////////////////////
 // signbit
@@ -106,10 +115,69 @@ int llr_hard_decision(__half h)
     // h < 0    => 1
     return signbit(h);
 #else
+    // We choose to interpret a zero value as a 1 bit so that the LDPC decoder
+    // does not have all zero hard outputs for degenerate cases of all zero
+    // inputs.
     // h > 0    => 0
     // h <= 0   => 1
     return (h > static_cast<__half>(0.0)) ? 0 : 1;
 #endif
+}
+
+////////////////////////////////////////////////////////////////////////
+// llr_hard_decision
+__device__ inline
+int llr_hard_decision(__nv_fp8_e5m2 q)
+{
+    // q > 0    => 0
+    // q <= 0   => 1
+    // zero representation: S.00000.00
+    // In the absence of an instruction to compare an fp8 value to zero,
+    // we interpret the storage as a signed integer. Negative values
+    // and zero will have a 1 for the hard decision.
+    // The fp8 storage type is unsigned char, and converting to a signed
+    // value when the destination type cannot hold the value is
+    // implementation defined. Instead or relying on what is probably
+    // the most common implementation (i.e. keeping the same 2s complement
+    // representation), we copy to a signed integer and rely on the
+    // compiler to make this efficient. (Tests with compiler explorer
+    // confirm that the generated code is efficient.)
+    static_assert(sizeof(q.__x) == sizeof(int8_t));
+    int8_t i;
+    memcpy(&i, &q.__x, sizeof(i));
+    return (i > 0) ? 0 : 1;
+}
+
+////////////////////////////////////////////////////////////////////////
+// llr_hard_decision
+__device__ inline
+int llr_hard_decision(__nv_fp8_e4m3 q)
+{
+    // q > 0    => 0
+    // q <= 0   => 1
+    // zero representation: S.0000.000
+    // In the absence of an instruction to compare an fp8 value to zero,
+    // we interpret the storage as a signed integer. Negative values
+    // and zero will have a 1 for the hard decision.
+    // The fp8 storage type is unsigned char, and converting to a signed
+    // value when the destination type cannot hold the value is
+    // implementation defined. Instead or relying on what is probably
+    // the most common implementation (i.e. keeping the same 2s complement
+    // representation), we copy to a signed integer and rely on the
+    // compiler to make this efficient. (Tests with compiler explorer
+    // confirm that the generated code is efficient.)
+    static_assert(sizeof(q.__x) == sizeof(int8_t));
+    int8_t i;
+    memcpy(&i, &q.__x, sizeof(i));
+    return (i > 0) ? 0 : 1;
+}
+
+////////////////////////////////////////////////////////////////////////
+// llr_hard_decision
+__device__ inline
+int llr_hard_decision(int8_t i)
+{
+    return (i > 0) ? 0 : 1;
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -194,7 +262,7 @@ void write_shared_int2(int2 i2, int offset)
     };
     u val;
     val.i2 = i2;
-    LDPC2_ASM_VOLATILE("st.shared.b64 [%0], %1;\n" :: "r"(offset), "l"(val.u64));
+    LDPC2_ASM_VOLATILE("st.shared.b64 [%0], %1;\n" :: "r"(offset), "l"(val.u64) : "memory");
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -202,7 +270,7 @@ void write_shared_int2(int2 i2, int offset)
 __device__ inline
 void write_shared_int4(int4 i4, int offset)
 {
-    LDPC2_ASM_VOLATILE("st.shared.v4.s32 [%0], { %1, %2, %3, %4 };\n" :: "r"(offset), "r"(i4.x), "r"(i4.y), "r"(i4.z), "r"(i4.w));
+    LDPC2_ASM_VOLATILE("st.shared.v4.s32 [%0], { %1, %2, %3, %4 };\n" :: "r"(offset), "r"(i4.x), "r"(i4.y), "r"(i4.z), "r"(i4.w) : "memory");
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -210,7 +278,7 @@ void write_shared_int4(int4 i4, int offset)
 __device__ inline
 void write_shared_word(word_t w, int offset)
 {
-    LDPC2_ASM_VOLATILE("st.shared.b32 [%0], %1;\n" :: "r"(offset), "r"(w.u32));
+    LDPC2_ASM_VOLATILE("st.shared.b32 [%0], %1;\n" :: "r"(offset), "r"(w.u32) : "memory");
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -220,7 +288,7 @@ void write_shared_word_low(word_t w, int offset)
 {
     half_word_t wh;
     wh.u16 = w.u32;
-    LDPC2_ASM_VOLATILE("st.shared.b16 [%0], %1;\n" :: "r"(offset), "h"(wh.u16));
+    LDPC2_ASM_VOLATILE("st.shared.b16 [%0], %1;\n" :: "r"(offset), "h"(wh.u16) : "memory");
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -230,7 +298,26 @@ void write_shared_word_high(word_t w, int offset)
 {
     half_word_t wh;
     wh.u16 = w.u32 >> 16;
-    LDPC2_ASM_VOLATILE("st.shared.b16 [%0], %1;\n" :: "r"(offset), "h"(wh.u16));
+    LDPC2_ASM_VOLATILE("st.shared.b16 [%0], %1;\n" :: "r"(offset), "h"(wh.u16) : "memory");
+}
+
+__device__ inline
+//void write_shared_uchar(unsigned char c, int offset)
+void write_shared_uchar(uint32_t u, int offset)
+{
+#if 1
+    //uint32_t u = c;
+    // Passing an unsigned char and casting to a 32-bit value (for use with
+    // inline assembly) can cause the compiler to emit AND with 0xFF before
+    // writing to shared memory.
+    // TODO: Stop using integer shared memory offsets and use proper
+    // shared memory pointers.
+    LDPC2_ASM_VOLATILE("st.shared.u8 [%0], %1;\n" :: "r"(offset), "r"(u) : "memory");
+#else
+    intptr_t i = offset;
+    unsigned char* dst = (unsigned char*)__cvta_generic_to_shared((void*)i);
+    *dst = c;
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -346,6 +433,23 @@ word_t hset2_bf_ge(word_t inA, word_t inB)
 {
     word_t ret;
     LDPC2_ASM("set.ge.f16x2.f16x2 %0, %1, %2;"
+              : "=r"(ret.u32)                // outputs
+              : "r"(inA.u32), "r"(inB.u32)); // inputs
+    return ret;
+}
+
+////////////////////////////////////////////////////////////////////////
+// hset2_bf_eq()
+// fp16 pairwise 'equal' comparison, with (fp16)1.0 output for true
+// and (fp16)0.0 output for false. (".bf" => boolean-float result, as
+// opposed to the ".bm" bitmask variants.) Used to build a 1.0/0.0
+// selector for an FMA-based leave-one-out reconstruction, keeping the
+// per-column magnitude select off the saturated integer/LOP3 pipe.
+__device__ inline
+word_t hset2_bf_eq(word_t inA, word_t inB)
+{
+    word_t ret;
+    LDPC2_ASM("set.equ.f16x2.f16x2 %0, %1, %2;"
               : "=r"(ret.u32)                // outputs
               : "r"(inA.u32), "r"(inB.u32)); // inputs
     return ret;
@@ -505,8 +609,13 @@ uint32_t update_signs_fp_pair(uint32_t s_input, word_t value_pair, int idx_pair)
     word_t A, B, C, z, res;
     z.u32 = 0;
     C.u32 = s_input;
+    // Sets word_t A to have a pair of fp16 values:
+    // - 1.0 if the hi/lo value is less than zero
+    // - 0.0 otherwise
     A = hset2_bf_le(value_pair, z);
     B.u32 = 0x00010001 << idx_pair;
+    // Perform multiplication with B as a denormalized float, and add the
+    // result to the input value C.
     res = hfma2(A, B, C);
     return res.u32;
 }
@@ -607,6 +716,32 @@ __device__ uint32_t dp_signs_spread(word_t a0, word_t a1)
     return result;
 }
 
+// Function to generate a lop3 PTX instruction, performing
+// a logical operation on 3 inputs.
+template <int LUT>
+__device__
+word_t lop3(word_t a, word_t b, word_t c)
+{
+    word_t out;
+    LDPC2_ASM("lop3.b32 %0, %1, %2, %3, %4;\n" :
+              "=r"(out.u32) :
+              "r"(a.u32), "r"(b.u32), "r"(c.u32), "n"(LUT));
+    return out;
+}
+
+// Function to generate a lop3 PTX instruction, performing
+// a logical operation on 3 inputs.
+template <int LUT>
+__device__
+uint32_t lop3(uint32_t a, uint32_t b, uint32_t c)
+{
+    uint32_t out;
+    LDPC2_ASM("lop3.b32 %0, %1, %2, %3, %4;\n" :
+              "=r"(out) :
+              "r"(a), "r"(b), "r"(c), "n"(LUT));
+    return out;
+}
+
 
 ////////////////////////////////////////////////////////////////////////
 // select_from_mask()
@@ -618,9 +753,29 @@ __device__ uint32_t dp_signs_spread(word_t a0, word_t a1)
 // 0x0000 for each high and low 16-bit value in the word.
 static inline __device__ word_t select_from_mask(word_t mask, word_t a, word_t b)
 {
+#if 1
+    // Slightly better performance observed in some cases with the C
+    // version, compared to the LOP3 version. Unclear why...
     word_t wOut;
     wOut.u32 = (a.u32 & mask.u32) | (b.u32 & ~mask.u32);
     return wOut;
+#else
+    // LOP3 for masked select
+    // (Note that equivalent C code, in some cases, does not seem to
+    // result in a single LOP3 instruction. Unclear why...)
+    //  A   B   C | (A & C) | (B & ~C)
+    // ---+---+---+-------------------
+    //  0   0   0 |   0       C is not set: choose B
+    //  0   0   1 |   0       C is set:     choose A
+    //  0   1   0 |   1       C is not set: choose B
+    //  0   1   1 |   0       C is set:     choose A
+    //  1   0   0 |   0       C is not set: choose B
+    //  1   0   1 |   1       C is set:     choose A
+    //  1   1   0 |   1       C is not set: choose B
+    //  1   1   1 |   1       C is set:     choose A
+    // 11100100 --> 0xE4
+    return lop3<0xE4>(a, b, mask);
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -757,6 +912,14 @@ word_t extract_high_low(word_t a, word_t b)
 {
     word_t wOut;
     LDPC2_ASM("prmt.b32 %0, %1, %2, 0x3254;\n" : "=r"(wOut.u32) : "r"(a.u32), "r"(b.u32));
+    return wOut;
+}
+
+__device__ inline
+word_t rotate_right_8b(word_t a)
+{
+    word_t wOut;
+    LDPC2_ASM("prmt.b32 %0, %1, %1, 0x0321;\n" : "=r"(wOut.u32) : "r"(a.u32), "r"(a.u32));
     return wOut;
 }
 
@@ -1070,25 +1233,25 @@ template <>           inline __device__ int2 smem_address_as(int oset)
         uint64_t u64;
     };
     u val;
-    LDPC2_ASM_VOLATILE("ld.shared.b64 %0, [%1];\n" : "=l"(val.u64) : "r"(oset));
+    LDPC2_ASM_VOLATILE("ld.shared.b64 %0, [%1];\n" : "=l"(val.u64) : "r"(oset) : "memory");
     return val.i2;
 }
 template <>           inline __device__ float smem_address_as(int oset)
 {
     float f;
-    LDPC2_ASM_VOLATILE("ld.shared.f32 %0, [%1];\n" : "=f"(f) : "r"(oset));
+    LDPC2_ASM_VOLATILE("ld.shared.f32 %0, [%1];\n" : "=f"(f) : "r"(oset) : "memory");
     return f;
 }
 template <>           inline __device__ word_t smem_address_as(int oset)
 {
     word_t w;
-    LDPC2_ASM_VOLATILE("ld.shared.u32 %0, [%1];\n" : "=r"(w.u32) : "r"(oset));
+    LDPC2_ASM_VOLATILE("ld.shared.u32 %0, [%1];\n" : "=r"(w.u32) : "r"(oset) : "memory");
     return w;
 }
 template <>           inline __device__ half_word_t smem_address_as(int oset)
 {
     half_word_t w;
-    LDPC2_ASM_VOLATILE("ld.shared.b16 %0, [%1];\n" : "=h"(w.u16) : "r"(oset));
+    LDPC2_ASM_VOLATILE("ld.shared.b16 %0, [%1];\n" : "=h"(w.u16) : "r"(oset) : "memory");
     return w;
 }
 template <>           inline __device__ int4 smem_address_as(int oset)
@@ -1096,8 +1259,22 @@ template <>           inline __device__ int4 smem_address_as(int oset)
     int4     i4;
     LDPC2_ASM_VOLATILE("ld.shared.b64 {%0, %1, %2, %3}, [%4];\n"      :
                        "=r"(i4.x), "=r"(i4.y), "=r"(i4.z), "=r"(i4.w) :
-                       "r"(oset));
+                       "r"(oset)                                      :
+                       "memory");
     return i4;
+}
+template <>           inline __device__ __nv_fp8_storage_t smem_address_as(int oset)
+{
+    uint32_t           u;
+    // Note: There is no constraint letter for 8-bit wide PTX registers. PTX
+    // instructions accepting 8-bit wide types permit operands to be wider than
+    // the instruction type size.
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#restricted-use-of-sub-word-sizes
+    LDPC2_ASM_VOLATILE("ld.shared.u8 %0, [%1];\n"      :
+                       "=r"(u) :
+                       "r"(oset) :
+                       "memory");
+    return static_cast<__nv_fp8_storage_t>(u);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -1108,19 +1285,19 @@ template <typename T> inline __device__ T gmem_address_as(const char* base, int 
 template <>           inline __device__ float gmem_address_as(const char* base, int oset)
 {
     float f;
-    LDPC2_ASM_VOLATILE("ld.global.f32 %0, [%1];\n" : "=f"(f) : "l"(base + oset));
+    LDPC2_ASM_VOLATILE("ld.global.f32 %0, [%1];\n" : "=f"(f) : "l"(base + oset) : "memory");
     return f;
 }
 template <>           inline __device__ word_t gmem_address_as(const char* base, int oset)
 {
     word_t w;
-    LDPC2_ASM_VOLATILE("ld.global.u32 %0, [%1];\n" : "=r"(w.u32) : "l"(base + oset));
+    LDPC2_ASM_VOLATILE("ld.global.u32 %0, [%1];\n" : "=r"(w.u32) : "l"(base + oset) : "memory");
     return w;
 }
 template <>           inline __device__ half_word_t gmem_address_as(const char* base, int oset)
 {
     half_word_t w;
-    LDPC2_ASM_VOLATILE("ld.global.u16 %0, [%1];\n" : "=h"(w.u16) : "l"(base + oset));
+    LDPC2_ASM_VOLATILE("ld.global.u16 %0, [%1];\n" : "=h"(w.u16) : "l"(base + oset) : "memory");
     return w;
 }
 
@@ -1138,7 +1315,8 @@ template <>           inline __device__ void smem_increment(int oset, float inc)
                        "st.shared.f32 [%0], smem_value;\n\t"
                        "}\n"
                        :
-                       : "r"(oset), "f"(inc));
+                       : "r"(oset), "f"(inc)
+                       : "memory");
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -1155,7 +1333,8 @@ template <>           inline __device__ void smem_decrement(int oset, float valu
                        "st.shared.f32 [%0], smem_value;\n\t"
                        "}\n"
                        :
-                       : "r"(oset), "f"(value));
+                       : "r"(oset), "f"(value)
+                       : "memory");
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -1192,22 +1371,26 @@ template <typename T> struct ldpc_traits;
 // ldpc_traits<float>
 template <>           struct ldpc_traits<float>
 {
-    typedef float4 llr_ldg_t;  // Type used for LDG instructions to load LLR values
-    typedef uint2  llr_sts_t;  // Type used for STS instructions to store LLR values
-    typedef float  llr_src_t;  // Type of source LLR data
-    typedef __half app_buf_t;  // Type of shared memory APP buffer data access
-    typedef __half app_elem_t; // Underlying APP element arithmetic type
+    typedef float4 llr_ldg_t;    // Type used for LDG instructions to load LLR values
+    typedef uint2  llr_sts_t;    // Type used for STS instructions to store LLR values
+    typedef float  llr_src_t;    // Type of source LLR data
+    typedef __half app_buf_t;    // Type of shared memory APP buffer data access
+    typedef __half app_elem_t;   // Underlying APP element arithmetic type
+    typedef float  word_union_t; // Type of value(s) (one or more) in word_t union
+    static constexpr int values_per_word = 1;
 };
 
 ////////////////////////////////////////////////////////////////////////
 // ldpc_traits<__half>
 template <>           struct ldpc_traits<__half>
 {
-    typedef uint4  llr_ldg_t;  // Type used for LDG instructions to load LLR values
-    typedef uint4  llr_sts_t;  // Type used for STS instructions to store LLR values
-    typedef __half llr_src_t;  // Type of source LLR data
-    typedef __half app_buf_t;  // Type of shared memory APP buffer data access
-    typedef __half app_elem_t; // Underlying APP element arithmetic type
+    typedef uint4   llr_ldg_t;    // Type used for LDG instructions to load LLR values
+    typedef uint4   llr_sts_t;    // Type used for STS instructions to store LLR values
+    typedef __half  llr_src_t;    // Type of source LLR data
+    typedef __half  app_buf_t;    // Type of shared memory APP buffer data access
+    typedef __half  app_elem_t;   // Underlying APP element arithmetic type
+    typedef __half2 word_union_t; // Type of value(s) (one or more) in word_t union
+    static constexpr int values_per_word = 2;
 };
 
 ////////////////////////////////////////////////////////////////////////
@@ -1216,19 +1399,149 @@ template <>           struct ldpc_traits<__half>
 // decode two codewords at a time.
 template <> struct ldpc_traits<__half2>
 {
-    typedef  uint2  llr_ldg_t;  // Type used for LDG instructions to load LLR values
-    typedef  uint4  llr_sts_t;  // Type used for STS instructions to store LLR values
-    typedef __half  llr_src_t;  // Type of source LLR data
-    typedef __half2 app_buf_t;  // Type of shared memory APP buffer data access
-    typedef __half  app_elem_t; // Underlying APP element arithmetic type
+    typedef  uint2  llr_ldg_t;    // Type used for LDG instructions to load LLR values
+    typedef  uint4  llr_sts_t;    // Type used for STS instructions to store LLR values
+    typedef __half  llr_src_t;    // Type of source LLR data
+    typedef __half2 app_buf_t;    // Type of shared memory APP buffer data access
+    typedef __half  app_elem_t;   // Underlying APP element arithmetic type
+    typedef __half2 word_union_t; // Type of value(s) (one or more) in word_t union
+    static constexpr int values_per_word = 1;
 };
 
+////////////////////////////////////////////////////////////////////////
+// ldpc_traits<__nv_fp8_e5m2>
+template <>           struct ldpc_traits<__nv_fp8_e5m2>
+{
+    typedef uint2           llr_ldg_t;    // Type used for LDG instructions to load LLR values
+    typedef uint2           llr_sts_t;    // Type used for STS instructions to store LLR values
+    typedef __nv_fp8_e5m2   llr_src_t;    // Type of source LLR data
+    typedef __nv_fp8_e5m2   app_buf_t;    // Type of shared memory APP buffer data access
+    typedef __nv_fp8_e5m2   app_elem_t;   // Underlying APP element arithmetic type
+    typedef __nv_fp8x4_e5m2 word_union_t; // Type of value(s) (one or more) in word_t union
+    static constexpr int values_per_word = 4;
+};
+
+////////////////////////////////////////////////////////////////////////
+// ldpc_traits<__nv_fp8_e4m3>
+template <>           struct ldpc_traits<__nv_fp8_e4m3>
+{
+    typedef uint2           llr_ldg_t;    // Type used for LDG instructions to load LLR values
+    typedef uint2           llr_sts_t;    // Type used for STS instructions to store LLR values
+    typedef __nv_fp8_e4m3   llr_src_t;    // Type of source LLR data
+    typedef __nv_fp8_e4m3   app_buf_t;    // Type of shared memory APP buffer data access
+    typedef __nv_fp8_e4m3   app_elem_t;   // Underlying APP element arithmetic type
+    typedef __nv_fp8x4_e4m3 word_union_t; // Type of value(s) (one or more) in word_t union
+    static constexpr int values_per_word = 4;
+};
+
+// Returns a half2 value containing the result of conversion to __half of the
+// first pair of fp8 values of the given fp8x4 argument.
+// See operator float4() in cuda_fp8.hpp for the float version.
+inline
+__host__ __device__
+__half2 fp8x4_to_half2_low(__nv_fp8x4_e4m3 fp8x4)
+{
+    const __nv_fp8x2_storage_t slo = static_cast<__nv_fp8x2_storage_t>(fp8x4.__x);
+    return static_cast<__half2>(__nv_cvt_fp8x2_to_halfraw2(slo, __NV_E4M3));
+}
+
+// Returns a half2 value containing the result of conversion to __half of the
+// second pair of fp8 values of the given fp8x4 argument.
+// See operator float4() in cuda_fp8.hpp for the float version.
+inline
+__host__ __device__
+__half2 fp8x4_to_half2_high(__nv_fp8x4_e4m3 fp8x4)
+{
+    const __nv_fp8x2_storage_t shi = static_cast<__nv_fp8x2_storage_t>(fp8x4.__x >> 16U);
+    return static_cast<__half2>(__nv_cvt_fp8x2_to_halfraw2(shi, __NV_E4M3));
+}
+
+// Returns a half2 value containing the result of conversion to __half of the
+// first pair of fp8 values of the given fp8x4 argument.
+// See operator float4() in cuda_fp8.hpp for the float version.
+inline
+__host__ __device__
+__half2 fp8x4_to_half2_low(__nv_fp8x4_e5m2 fp8x4)
+{
+    const __nv_fp8x2_storage_t slo = static_cast<__nv_fp8x2_storage_t>(fp8x4.__x);
+    return static_cast<__half2>(__nv_cvt_fp8x2_to_halfraw2(slo, __NV_E5M2));
+}
+
+// Returns a half2 value containing the result of conversion to __half of the
+// second pair of fp8 values of the given fp8x4 argument.
+// See operator float4() in cuda_fp8.hpp for the float version.
+inline
+__host__ __device__
+__half2 fp8x4_to_half2_high(__nv_fp8x4_e5m2 fp8x4)
+{
+    const __nv_fp8x2_storage_t shi = static_cast<__nv_fp8x2_storage_t>(fp8x4.__x >> 16U);
+    return static_cast<__half2>(__nv_cvt_fp8x2_to_halfraw2(shi, __NV_E5M2));
+}
+
+template <class TElem>
+__device__
+void print_word_values_as(const word_t& w);
+
+template <>
+__device__ inline
+void print_word_values_as<float>(const word_t& w)
+{
+    printf("%7.3f ", w.f32);
+}
+template <>
+__device__ inline
+void print_word_values_as<__half>(const word_t& w)
+{
+    float2 f = __half22float2(w.f16x2);
+    printf("%7.3f %7.3f ", f.x, f.y);
+}
+template <>
+__device__ inline
+void print_word_values_as<__nv_fp8_e4m3>(const word_t& w)
+{
+    word_t low, high;
+    low.f16x2  = fp8x4_to_half2_low(w.fp8x4_e4m3);
+    print_word_values_as<__half>(low);
+    high.f16x2 = fp8x4_to_half2_high(w.fp8x4_e4m3);
+    print_word_values_as<__half>(high);
+}
+template <>
+__device__ inline
+void print_word_values_as<__nv_fp8_e5m2>(const word_t& w)
+{
+    word_t low, high;
+    low.f16x2  = fp8x4_to_half2_low(w.fp8x4_e5m2);
+    print_word_values_as<__half>(low);
+    high.f16x2 = fp8x4_to_half2_high(w.fp8x4_e5m2);
+    print_word_values_as<__half>(high);
+}
+template <>
+__device__ inline
+void print_word_values_as<uint32_t>(const word_t& w)
+{
+    printf("0x%08X ", w.u32);
+}
+template <>
+__device__ inline
+void print_word_values_as<uint16_t>(const word_t& w)
+{
+    printf(" 0x%04X  0x%04X ", w.u16x2.x, w.u16x2.y);
+}
 
 ////////////////////////////////////////////////////////////////////////
 // interleave_llr()
 inline __device__
 uint4 interleave_llr(uint2 llr0, uint2 llr1)
 {
+    //                7/6   5/4 | 3/2  1/0  (bytes)
+    //                    y     |     x
+    // input:   llr0   h3   h2  |  h1   h0
+    //          llr1   h7   h6  |  h5   h4
+    //                 high  low
+    // output:     x   h4    h0
+    //             y   h5    h1
+    //             z   h6    h2
+    //             w   h7    h3
     uint4 d;
     LDPC2_ASM("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(d.x) : "r"(llr0.x), "r"(llr1.x));
     LDPC2_ASM("prmt.b32 %0, %1, %2, 0x7632;\n" : "=r"(d.y) : "r"(llr0.x), "r"(llr1.x));
@@ -1239,11 +1552,189 @@ uint4 interleave_llr(uint2 llr0, uint2 llr1)
 
 class unused {};
 
+template <typename T> struct is_fp8 : std::bool_constant<false> {};
+template <> struct is_fp8<__nv_fp8_e5m2> : std::bool_constant<true> {};
+template <> struct is_fp8<__nv_fp8_e4m3> : std::bool_constant<true> {};
+
+// Default LLR values are used:
+// - as LLR values in structures that group multiple LLR values when
+//   the number of values is not a multiple of the group size. For
+//   example, when the row degree is odd, and we store 32-bit words
+//   with 2 16-bit values each, the last value will have the default
+//   value.
+// - as LLR values when writing hard outputs where the total number
+//   of values is not a multiple of the 32-bit integer word size.
+//
+// As such, default values should:
+// - Have a zero sign bit (i.e. be greater than zero) so that they do not
+//   contribute to the parity count for a row
+// - Have large values (e.g. Inf when possible) so that they do not modify
+//   the min-sum determination of the valid LLR values.
+template <typename T>
+struct default_llr_value;
+
+template <>
+struct default_llr_value<__half>
+{
+    __device__
+    static __half value()
+    {
+        // Infinity representation in the fp16 type is 0x7C00
+        __half_raw inf_h_raw{0x7C00};
+        return __half{inf_h_raw};
+    }
+};
+
+template <>
+struct default_llr_value<__nv_fp8_e5m2>
+{
+    // https://arxiv.org/pdf/2209.05433
+    // e5m2 infinity: S.11111.00 = 0x7C
+    static constexpr __nv_fp8_storage_t storage_value = 0x7C;
+    __device__
+    static __nv_fp8_e5m2 value()
+    {
+        return __nv_fp8_e5m2{storage_value};
+    }
+};
+
+template <>
+struct default_llr_value<__nv_fp8_e4m3>
+{
+    // https://arxiv.org/pdf/2209.05433
+    // e4m3 does not have an infinity representation.
+    // Max normal value: S.1111.110 = 1.75x2^8 = 448
+    // Hex encoding of max normal value: 0x7E
+    static constexpr __nv_fp8_storage_t storage_value = 0x7E;
+    __device__
+    static __nv_fp8_e4m3 value()
+    {
+        return __nv_fp8_e4m3{storage_value};
+    }
+};
+
+// Convert an array of fp8x4 source values to a (larger) array of fp16x2 values.
+// We leave the source array size unconstrained because we may pad C2V storage
+// sizes to the maximum for any row, and rely on the compiler to perform dead
+// code elimination to remove references to storage that is not read.
+template <class TSrc,
+          int   NUM_VALUES,
+          int   NUM_SRC_VALUES>
+__host__ __device__
+void fp8x4_to_half2_array(word_t (&dst)[div_round_up_t<NUM_VALUES, 2>::value],
+                          word_t (&src)[NUM_SRC_VALUES])
+{
+    static_assert(NUM_SRC_VALUES >= div_round_up_t<NUM_VALUES, 4>::value);
+
+    // Determine the word union type (__nv_fp8x4_e5m2 or __nv_fp8x4_e4m3)
+    // corresponding to the source fp8 type (__nv_fp8_e5m2 or __nv_fp8_e4m3).
+    using fp8_word_t = typename ldpc_traits<TSrc>::word_union_t;
+
+    #pragma unroll
+    for(int i = 0; i < div_round_up_t<NUM_VALUES, 2>::value; ++i)
+    {
+        if(0 == (i % 2))
+        {
+            dst[i].f16x2 = fp8x4_to_half2_low(word_t_as<fp8_word_t>(src[i >> 1]));
+        }
+        else
+        {
+            dst[i].f16x2 = fp8x4_to_half2_high(word_t_as<fp8_word_t>(src[i >> 1]));
+        }
+    }
+}
+
+// Convert an array of fp16x2 source values to a (smaller) array of fp8x4 values.
+// Extra values in the destination array of words will be set to zero.
+// Note that this function uses the constructors for the __nv_fp8x4_e4m3 and
+// __nv_fp8x5_e5m2 structs, which saturate to the largest non-inf, non-NaN value
+// representable by the fp8 type when the input __half is larger than the fp8
+// type can represent.
+template <class TDst,
+          int   NUM_VALUES,
+          int   NUM_DST_VALUES>
+__host__ __device__
+void half2_to_fp8x4_array(word_t (&dst)[NUM_DST_VALUES],
+                          word_t (&src)[div_round_up_t<NUM_VALUES, 2>::value])
+{
+    static_assert(NUM_DST_VALUES >= div_round_up_t<NUM_VALUES, 4>::value);
+
+    // Determine the word union type (__nv_fp8x4_e5m2 or __nv_fp8x4_e4m3)
+    // corresponding to the source fp8 type (__nv_fp8_e5m2 or __nv_fp8_e4m3).
+    using fp8_word_t = typename ldpc_traits<TDst>::word_union_t;
+
+    #pragma unroll
+    for(int i = 0; i < div_round_up_t<NUM_VALUES, 4>::value; ++i)
+    {
+        if((i * 2 + 1) > (div_round_up_t<NUM_VALUES, 2>::value - 1))
+        {
+            word_t_as<fp8_word_t>(dst[i]) = fp8_word_t(src[i * 2].f16x2,
+                                                       __float2half2_rn(0.0f));
+        }
+        else
+        {
+            word_t_as<fp8_word_t>(dst[i]) = fp8_word_t(src[i * 2].f16x2,
+                                                       src[i * 2 + 1].f16x2);
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////
 // app_loader
 // Loads APP values from shared memory, given an array of shared memory
 // addresses.
-template <typename T, int ROW_DEGREE> struct app_loader;
+template <typename T, int ROW_DEGREE, class Enable = void> struct app_loader;
+
+template <int   ROW_DEGREE,
+          class TAPP>
+struct app_loader<TAPP, ROW_DEGREE, std::enable_if_t<is_fp8<TAPP>::value>>
+{
+    using fp8_t = TAPP;
+    __device__
+    static void load(word_t (&app)     [row_num_words<fp8_t, ROW_DEGREE>::value],
+                     int    (&app_addr)[ROW_DEGREE],
+                     int    smem_offset)
+    {
+        //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+        // Fetch app values
+        #pragma unroll
+        for(int i = 0; i < round_up_t<ROW_DEGREE, 4>::value; ++i)
+        {
+              __nv_fp8_storage_t s;
+            //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+            // Load channel APP from given address
+            if(i >= ROW_DEGREE)
+            {
+                /* use a maximum positive value for values outside the row degree */
+                s = default_llr_value<fp8_t>::storage_value;
+            }
+            else
+            {
+                s  = smem_address_as<__nv_fp8_storage_t>(smem_offset + app_addr[i]);
+                //if(0 == threadIdx.x)
+                //    printf("Loaded %f (0x%X) at offset %u\n", __half2float(__half(TAPP{s})), (unsigned int)(s), app_addr[i]);
+            }
+            //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
+            // Load 8-bit value into the correct part of the APP word
+            if(0 == (i%4))
+            {
+                app[i >> 2].u32 = s;
+            }
+            else if(1 == (i%4))
+            {
+                app[i >> 2].u32 |= (s << 8);
+            }
+            else if(2 == (i%4))
+            {
+                app[i >> 2].u32 |= (s << 16);
+            }
+            else
+            {
+                app[i >> 2].u32 |= (s << 24);
+            }
+        }
+    }
+};
 
 template <int ROW_DEGREE>
 struct app_loader<__half, ROW_DEGREE>
@@ -1254,7 +1745,7 @@ struct app_loader<__half, ROW_DEGREE>
                      int    smem_offset)
     {
         //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-        // Fetch app values and update the min0/min1/address fields
+        // Fetch app values
         #pragma unroll
         for(int i = 0; i < round_up_t<ROW_DEGREE, 2>::value; ++i)
         {
@@ -1268,6 +1759,8 @@ struct app_loader<__half, ROW_DEGREE>
             else
             {
                 happ  = smem_address_as<half_word_t>(smem_offset + app_addr[i]);
+                //if(0 == threadIdx.x)
+                //    printf("Loaded %f at offset %u\n", __half2float(happ.f16), app_addr[i]);
             }
             //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
             // Load half word into lo or hi part of the APP word
@@ -1291,8 +1784,6 @@ struct app_loader<__half2, ROW_DEGREE>
                      int    (&app_addr)[ROW_DEGREE],
                      int    smem_offset)
     {
-        //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-        // Fetch app values and update the min0/min1/address fields
         #pragma unroll
         for(int i = 0; i < ROW_DEGREE; ++i)
         {
@@ -1359,7 +1850,10 @@ struct app_loader_checked<__half, ROW_DEGREE>
 // app_writer
 // Writes (non-extension) APP values to shared memory, given the APP
 // values and an array of shared memory addresses.
-template <typename T, int ROW_DEGREE, int UPDATE_ROW_DEGREE> struct app_writer;
+template <typename T,
+          int ROW_DEGREE,
+          int UPDATE_ROW_DEGREE,
+          class TEnable = void> struct app_writer;
 
 template <int ROW_DEGREE, int UPDATE_ROW_DEGREE>
 struct app_writer<__half, ROW_DEGREE, UPDATE_ROW_DEGREE>
@@ -1384,6 +1878,32 @@ struct app_writer<__half, ROW_DEGREE, UPDATE_ROW_DEGREE>
             }
         }
     }
+
+    __device__
+    static bool write_non_ext_sign_change(word_t (&app)     [row_num_words<__half, ROW_DEGREE>::value],
+                                          int    (&app_addr)[ROW_DEGREE],
+                                          int    smem_offset)
+    {
+        bool sign_change = false;
+        #pragma unroll
+        for(int i = 0; i < UPDATE_ROW_DEGREE; ++i)
+        {
+            const int         addr     = smem_offset + app_addr[i];
+            const half_word_t old_app  = smem_address_as<half_word_t>(addr);
+            const uint32_t    app_word = app[i >> 1].u32;
+            const uint32_t    new_app  = (0 == (i & 1)) ? (app_word & 0xffffu) : (app_word >> 16);
+            sign_change |= 0u != ((static_cast<uint32_t>(old_app.u16) ^ new_app) & 0x8000u);
+            if(0 == (i & 1))
+            {
+                write_shared_word_low(app[i >> 1], addr);
+            }
+            else
+            {
+                write_shared_word_high(app[i >> 1], addr);
+            }
+        }
+        return sign_change;
+    }
 };
 
 template <int ROW_DEGREE, int UPDATE_ROW_DEGREE>
@@ -1400,6 +1920,68 @@ struct app_writer<__half2, ROW_DEGREE, UPDATE_ROW_DEGREE>
         for(int i = 0; i < UPDATE_ROW_DEGREE; ++i)
         {
             write_shared_word(app[i], smem_offset + app_addr[i]);
+        }
+    }
+
+    __device__
+    static bool write_non_ext_sign_change(word_t (&app)     [row_num_words<__half2, ROW_DEGREE>::value],
+                                          int    (&app_addr)[ROW_DEGREE],
+                                          int    smem_offset)
+    {
+        bool sign_change = false;
+        #pragma unroll
+        for(int i = 0; i < UPDATE_ROW_DEGREE; ++i)
+        {
+            const int    addr    = smem_offset + app_addr[i];
+            const word_t old_app = smem_address_as<word_t>(addr);
+            sign_change |= 0u != ((old_app.u32 ^ app[i].u32) & 0x80008000u);
+            write_shared_word(app[i], addr);
+        }
+        return sign_change;
+    }
+};
+
+// Specialization for fp8 types
+template <typename T, int ROW_DEGREE, int UPDATE_ROW_DEGREE>
+struct app_writer<T, ROW_DEGREE, UPDATE_ROW_DEGREE, std::enable_if_t<is_fp8<T>::value>>
+{
+    __device__
+    static void write_non_ext(word_t (&app)     [row_num_words<T, ROW_DEGREE>::value],
+                              int    (&app_addr)[ROW_DEGREE],
+                              int    smem_offset)
+    {
+        //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+        // Write output values
+        #pragma unroll
+        for(int i = 0; i < UPDATE_ROW_DEGREE; ++i)
+        {
+            // Passing an unsigned char (i.e. __nv_fp8_storage_t) and casting
+            // to a 32-bit value (for use with inline assembly inside the
+            // write_shared_uchar() function) can cause the compiler to emit
+            // a bitwise AND with 0xFF before writing to shared memory.
+            // Therefore, we use uint32_t as the type for s below instead of
+            // __nv_fp8_storage_t.
+            // TODO: Stop using integer shared memory offsets as required by
+            // write_shared_uchar() and use proper shared memory pointers.
+            //__nv_fp8_storage_t s;
+            uint32_t s;
+            if(0 == (i % 4))
+            {
+                s = app[i >> 2].u32;
+            }
+            else if(1 == (i % 4))
+            {
+                s = (app[i >> 2].u32 >> 8);
+            }
+            else if(2 == (i % 4))
+            {
+                s = (app[i >> 2].u32 >> 16);
+            }
+            else
+            {
+                s = (app[i >> 2].u32 >> 24);
+            }
+            write_shared_uchar(s, smem_offset + app_addr[i]);
         }
     }
 };

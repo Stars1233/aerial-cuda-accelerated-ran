@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,7 +19,8 @@
 #define AERIAL_FH_DEFAULTS_HPP__
 
 #include "aerial-fh-driver/api.hpp"
-
+#include "app_config.hpp"
+#include "dpdk.hpp"
 
 namespace aerial_fh
 {
@@ -64,6 +65,7 @@ constexpr char kMlxAuxDriverName[] = "mlx5_auxiliary"; //!< Mellanox auxiliary d
 constexpr size_t   pageSizeAlign   = 128;                     //!< Page size alignment in bytes
 constexpr int      kMaxPktsFlow    = 2048;                    //!< Max packets per flow
 constexpr int      kMaxFlows       = MAX_DL_EAXCIDS;          //!< Max flows (multi-cell MIMO support)
+static_assert(PARTIAL_UPLANE_MAX_FLOWS == kMaxFlows, "partial_uplane_slot_info must match defaults");
 
 // Section limits
 constexpr int kMaxULUPSections = 20;  //!< Max uplink U-plane sections
@@ -77,11 +79,33 @@ constexpr uint64_t GPUCOMM_HOST_PAGE_MASK = (~(GPUCOMM_HOST_PAGE_OFF));     //!<
 // Slot and symbol configuration
 constexpr uint32_t kPeerSlotsInfo = 16;                      //!< Number of slots per peer
 constexpr uint32_t kPeerSymbolsInfo = 14;                    //!< Number of OFDM symbols per slot
+static_assert(PARTIAL_UPLANE_SYMBOLS_PER_SLOT == kPeerSymbolsInfo, "partial_uplane_slot_info must match defaults");
 constexpr uint32_t THREAD_PER_PACKET_PRB_PHASE = 4;          //!< Threads per packet PRB phase
 constexpr uint32_t THREAD_PER_PACKET_COPY = 8;               //!< Threads per packet copy operation
 constexpr uint32_t kThreadSymbol = 16;                       //!< Threads per symbol
 constexpr uint32_t kPeerSymbolPrbBox = 16 * 32;              //!< PRB boxes per symbol (16 AP × 32 boxes)
-constexpr uint32_t kGpuCommSendPeers = API_MAX_NUM_CELLS;    //!< Max GPU comm send peers (cells)
+
+/**
+ * GPU-comm peer count for DOCA TX buffer sizing (init path).
+ *
+ * cell_group_num from YAML, rounded up to the next power of 2 (DOCA ring
+ * requirement), capped at API_MAX_NUM_CELLS. Used at Nic/Flow init and for
+ * hot-path bound checks. Per-slot stack arrays in GpuComm must stay sized to
+ * API_MAX_NUM_CELLS — never use this value as a VLA bound.
+ */
+[[nodiscard]] inline uint32_t getGpuCommSendPeers()
+{
+    const uint32_t cellGroupNum = AppConfig::getInstance().getCellGroupNum();
+    if(cellGroupNum == 0)
+    {
+        // Called before setCellGroupNum(); fall back so init does not size a 0-length ring.
+        return API_MAX_NUM_CELLS;
+    }
+
+    const uint32_t peers =
+        (rte_is_power_of_2(cellGroupNum) == 0) ? rte_align32pow2(cellGroupNum) : cellGroupNum;
+    return (peers > API_MAX_NUM_CELLS) ? API_MAX_NUM_CELLS : peers;
+}
 
 // PRB split info size
 constexpr uint32_t kPrbSplitInfo = kPeerSlotsInfo * kPeerSymbolsInfo * 32 * 273;  //!< Total PRB split info entries

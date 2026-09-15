@@ -408,7 +408,12 @@ int RU_Emulator::validate_pdsch(uint8_t cell_index, const struct oran_packet_hea
             re_dbg("PDSCH added Received REs {} current total {}", pdsch_object.tv_info[tv_index].numOverlappingCsirs * dl_tv_info.numFlows, csirs_object.fss_atomic_received_res[cell_index][fss.frameId][fss.subframeId * ORAN_MAX_SLOT_ID + fss.slotId].load());
         }
 
-        ++pdsch_object.total_slot_counters[cell_index];
+        // Test-bench mode: only count a slot as completed when it was error-free,
+        // so a channel that suffered any section mismatch shows completed < expected.
+        if (!opt_dlc_tb || !pdsch_object.invalid_flag[cell_index][launch_pattern_slot])
+        {
+            ++pdsch_object.total_slot_counters[cell_index];
+        }
         pdsch_object.invalid_flag[cell_index][launch_pattern_slot] = false;
         complete = false;
         if (pdsch_object.init_slot_counters[cell_index].load() <= pdsch_object.total_slot_counters[cell_index].load())

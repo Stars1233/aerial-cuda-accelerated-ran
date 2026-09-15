@@ -72,4 +72,22 @@ int get_root_path(char* path, int cubb_root_path_relative_num);
  */
 int get_full_path_file(char* dest_buf, const char* relative_path, const char* file_name, int cubb_root_dir_relative_num);
 
+/**
+ * Get the cuBB root path
+ *
+ * @param[out] dst_buf Destination buffer for the cuBB root path
+ * @return The length of the cuBB root path
+ */
+int get_cubb_root_path(char* dst_buf);
+
+/**
+ * Get the cuBB full path
+ *
+ * @param[out] dest_buf Destination buffer for the cuBB full path
+ * @param[in] relative_path Relative path to the cuBB root
+ * @param[in] file_name File name
+ * @return The length of the cuBB full path
+ */
+int get_cubb_full_path(char* dest_buf, const char* relative_path, const char* file_name);
+
 #endif /* _NVLOG_HPP_ */

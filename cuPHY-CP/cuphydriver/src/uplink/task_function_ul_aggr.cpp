@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 25) // "DRV.FUNC_UL"
 
 #include "cuphydriver_api.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "app_config.hpp"
 #include "constant.hpp"
 #include "context.hpp"
@@ -29,11 +30,12 @@
 #include "nvlog.hpp"
 #include "exceptions.hpp"
 #include "order_entity.hpp"
+#include <algorithm>
 #include <unordered_map>
 #include "aerial-fh-driver/oran.hpp"
 #include <sched.h>
-#include "task_instrumentation_v3.hpp"
-#include "task_instrumentation_v3_factories.hpp"
+#include "task_instrumentation/task_instrumentation_v3.hpp"
+#include "task_instrumentation/factories/task_instrumentation_v3_factories.hpp"
 #include "memtrace.h"
 #include "nvlog_fmt.hpp"
 #include "cuphy_pti.hpp"
@@ -164,7 +166,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
 
     //Only run after ULC tasks have completed
     ti.add("ULC Tasks Complete Wait");
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -272,6 +274,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
             {
                 pusch->setSetupStatus(CH_SETUP_DONE_NO_ERROR);
                 slot_map->setIsEarlyHarqPresent(pusch->getPuschDynParams()->pDataOut->isEarlyHarqPresent);
+                slot_map->setIsEarlySchCbDecodePresent(pusch->getPuschDynParams()->pDataOut->isEarlySchCbDecodePresent);
                 slot_map->setIsFrontLoadedDmrsPresent(pusch->getPuschDynParams()->pDataOut->isFrontLoadedDmrsPresent);
             }
 
@@ -293,8 +296,8 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
 
     ti.add("PUSCH Stream Wait");
     if(pusch != nullptr) {
-            //Wait on Order kernel completion done event if there is no early-HARQ UEs or no front-loaded DM-RS UEs
-            if(slot_map->getIsEarlyHarqPresent()==0 && slot_map->getIsFrontLoadedDmrsPresent()==0){
+            // Wait on Order kernel completion when PUSCH has no subslot work.
+            if(!slot_map->hasPuschSubSlotWork()){
                 oentity = slot_map->aggr_order_entity;
                 pusch->waitToStartGPUEvent(oentity->getRunCompletionEvt(), phase1_stream);
             }
@@ -320,7 +323,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
             //PUSCH_RUN_ALL_PHASES       = 4, // PUSCH_RUN_EARLY_HARQ_PROC + PUSCH_RUN_FULL_SLOT_PROC + PUSCH_RUN_FULL_SLOT_COPY
             //                                Note - this phase is just running all PUSCH run phases on both streams
             //                                PUSCH_RUN_EARLY_HARQ_PROC and PUSCH_RUN_FULL_SLOT_PROC still run on phase1_stream, PUSCH_RUN_FULL_SLOT_COPY still runs on phase2_stream
-            if((slot_map->getIsEarlyHarqPresent()==1) || (slot_map->getIsFrontLoadedDmrsPresent()==1))
+            if(slot_map->hasPuschSubSlotWork())
             {
                 if(pusch->run(cuphyPuschRunPhase_t::PUSCH_RUN_SUB_SLOT_PROC))
                 {
@@ -358,7 +361,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
             //If pusch eh enabled, have pucch stream wait on pusch eh
             if(serialize_pucch_pusch && pusch != nullptr)
             {
-                if(slot_map->getIsEarlyHarqPresent() == 1 || slot_map->getIsFrontLoadedDmrsPresent() == 1)
+                if(slot_map->hasPuschSubSlotWork())
                 {
                     pucch->waitToStartGPUEvent(pusch->getPuschStatParams()->subSlotCompletedEvent,pucch_stream);
                 }
@@ -402,7 +405,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
                 pusch->waitToStartGPUEvent(pucch->getRunCompletionEvent(),phase1_stream);
             }
 
-            if((slot_map->getIsEarlyHarqPresent()==1) || (slot_map->getIsFrontLoadedDmrsPresent()==1))
+            if(slot_map->hasPuschSubSlotWork())
             {
 
                 //NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Is this hit?");
@@ -465,7 +468,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
                 }
             }
 
-            if((slot_map->getIsEarlyHarqPresent()==0) && (slot_map->getIsFrontLoadedDmrsPresent()==1))
+            if((slot_map->getIsEarlyHarqPresent()==0) && slot_map->hasPuschSubSlotWork())
             {
                 if(pusch->run(cuphyPuschRunPhase_t::PUSCH_RUN_FULL_SLOT_COPY))
                 {
@@ -491,7 +494,7 @@ int task_work_function_ul_aggr_1_pucch_pusch(Worker* worker, void* param, int fi
             }
 
 #ifdef EARLY_UCI_CUBB_CALLFLOW_TEST
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(pusch->getPuschStatParams()->subSlotCompletedEvent,phase1_stream));
+            CUDA_DRIVER_CHECK(cuEventRecord(pusch->getPuschStatParams()->subSlotCompletedEvent, phase1_stream));
 #endif
         }
         PHYDRIVER_CATCH_EXCEPTIONS_FATAL_EXIT()
@@ -543,7 +546,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
 
     //Only run after ULC tasks have completed
     ti.add("ULC Tasks Complete Wait");
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -636,6 +639,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
             {
                 pusch->setSetupStatus(CH_SETUP_DONE_NO_ERROR);
                 slot_map->setIsEarlyHarqPresent(pusch->getPuschDynParams()->pDataOut->isEarlyHarqPresent);
+                slot_map->setIsEarlySchCbDecodePresent(pusch->getPuschDynParams()->pDataOut->isEarlySchCbDecodePresent);
                 slot_map->setIsFrontLoadedDmrsPresent(pusch->getPuschDynParams()->pDataOut->isFrontLoadedDmrsPresent);
             }
 
@@ -651,8 +655,8 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
             }
 
             ti.add("Wait To Start GPU");
-            //Wait on Order kernel completion done event if there is no early-HARQ UEs or no front-loaded DM-RS UEs
-            if(slot_map->getIsEarlyHarqPresent()==0 && slot_map->getIsFrontLoadedDmrsPresent()==0){
+            // Wait on Order kernel completion when PUSCH has no subslot work.
+            if(!slot_map->hasPuschSubSlotWork()){
                 oentity = slot_map->aggr_order_entity;
                 pusch->waitToStartGPUEvent(oentity->getRunCompletionEvt(), phase1_stream);
             }
@@ -668,7 +672,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
             //PUSCH_RUN_FULL_SLOT_COPY   = 3, // copying output of PUSCH_RUN_FULL_SLOT_PROC from GPU to CPU
             //                                  Note - runs on phase2_stream
             //PUSCH_RUN_ALL_PHASES       = 4, // PUSCH_RUN_EARLY_HARQ_PROC + PUSCH_RUN_FULL_SLOT_PROC + PUSCH_RUN_FULL_SLOT_COPY
-            if((slot_map->getIsEarlyHarqPresent()==0) && (slot_map->getIsFrontLoadedDmrsPresent()==0))
+            if(!slot_map->hasPuschSubSlotWork())
             {
                 if(pusch->run(cuphyPuschRunPhase_t::PUSCH_RUN_ALL_PHASES))
                 {
@@ -726,7 +730,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
                     pusch->setRunStatus(CH_RUN_DONE_NO_ERROR);
             }
 
-            if((slot_map->getIsEarlyHarqPresent()==0) && (slot_map->getIsFrontLoadedDmrsPresent()==1))
+            if((slot_map->getIsEarlyHarqPresent()==0) && slot_map->hasPuschSubSlotWork())
             {
                 if(pusch->run(cuphyPuschRunPhase_t::PUSCH_RUN_FULL_SLOT_COPY))
                 {
@@ -752,7 +756,7 @@ int task_work_function_ul_aggr_1_pusch(Worker* worker, void* param, int first_ce
             }
 
 #ifdef EARLY_UCI_CUBB_CALLFLOW_TEST
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(pusch->getPuschStatParams()->subSlotCompletedEvent,phase1_stream));
+            CUDA_DRIVER_CHECK(cuEventRecord(pusch->getPuschStatParams()->subSlotCompletedEvent, phase1_stream));
 #endif
         }
         PHYDRIVER_CATCH_EXCEPTIONS_FATAL_EXIT()
@@ -806,7 +810,7 @@ int task_work_function_ul_aggr_1_pucch(Worker* worker, void* param, int first_ce
 
     //Only run after ULC tasks have completed
     ti.add("ULC Tasks Complete Wait");
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -988,7 +992,7 @@ int task_work_function_ul_aggr_1_prach(Worker* worker, void* param, int first_ce
 
     //Only run after ULC tasks have completed
     ti.add("ULC Tasks Complete Wait");
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -1161,6 +1165,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
     std::array<uint32_t,UL_MAX_CELLS_PER_SLOT> cell_idx_list={};
     int cell_count=0;
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
+    bool phy_range_pushed = false;
 
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
@@ -1171,7 +1176,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
 
     //Only run after ULC tasks have completed
     ti.add("ULC Tasks Complete Wait");
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -1218,6 +1223,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
 
 
     PUSH_RANGE_PHYDRV("UL_CUPHY_SRS", 1);
+    phy_range_pushed = true;
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     ///////// cuPHY UL SRS Channel
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1284,6 +1290,7 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
     }
     slot_map->timings.end_t_ul_srs_cuda[0] = Time::nowNs();
     POP_RANGE_PHYDRV
+    phy_range_pushed = false;
 
     ti.add("Signal Channel End Task");
     slot_map->addChannelEndTask();
@@ -1295,14 +1302,22 @@ int task_work_function_ul_aggr_1_srs(Worker* worker, void* param, int first_cell
     return 0;
 
     error_next:
-    ////////////////////////////////////////////////////////////////////////
-    ///// Currently we do not support pipeline recovery from CUDA/FH errors
-    ////////////////////////////////////////////////////////////////////////
-    NVLOGF_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "{} line {}: pipeline failed, exit", __func__, __LINE__);
-    EXIT_L1(EXIT_FAILURE);
-
+    // Do not terminate L1 on SRS FH/CUDA errors. RU/link loss may abort the
+    // SRS pipeline while other cells are still healthy; mirror the PUSCH/PUCCH
+    // graceful degradation path and let the completion task release the slot.
+    if (phy_range_pushed)
+    {
+        POP_RANGE_PHYDRV
+        phy_range_pushed = false;
+    }
     slot_map->abortTasks();
     NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Task ul_aggr_1_srs aborted the tasklist for an error");
+
+    ti.add("Signal Channel End Task");
+    slot_map->addChannelEndTask();
+    slot_map->addSlotEndTask();
+
+    ti.add("End Task");
     return -1;
 }
 
@@ -1371,7 +1386,7 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
                     t_ns current_time = Time::nowNs();
                     cell_ptr = slot_map->aggr_cell_list[task_num];
                     int exec_slot_ahead = cell_ptr->getSlotAhead() - 1;
-                    start_tx = slot_map->getTaskTsExec(0) + t_ns(Cell::getTtiNsFromMu(cell_ptr->getMu()) * exec_slot_ahead) - t_ns(cell_ptr->getT1aMaxCpUlNs());
+                    start_tx = slot_map->getSlotRefTs() + t_ns(Cell::getTtiNsFromMu(cell_ptr->getMu()) * exec_slot_ahead) - t_ns(cell_ptr->getT1aMaxCpUlNs());
                     t_ns deadline_time = start_tx - t_ns(pdctx->getSendCPlane_ulbfw_backoff_th_ns());
                     prevSlotUlBfwCompStatus = pdctx->queryUlBFWCompletion(previous_slot);
                     while(!prevSlotUlBfwCompStatus)
@@ -1396,7 +1411,7 @@ int task_work_function_ul_aggr_1_cplane(Worker* worker, void* param,int task_num
 
                     // The exec time is already 1 slot ahead (see cuphydriver_api.cpp) so account for that here.
                     int exec_slot_ahead = cell_ptr->getSlotAhead() - 1;
-                    start_tx = slot_map->getTaskTsExec(0) + t_ns(Cell::getTtiNsFromMu(cell_ptr->getMu()) * exec_slot_ahead) - t_ns(cell_ptr->getT1aMaxCpUlNs());
+                    start_tx = slot_map->getSlotRefTs() + t_ns(Cell::getTtiNsFromMu(cell_ptr->getMu()) * exec_slot_ahead) - t_ns(cell_ptr->getT1aMaxCpUlNs());
                     slot_map->timings.start_t_ul_cplane[i] = Time::nowNs();
                     uint8_t frameStruct = 0;
 
@@ -1545,7 +1560,7 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
     struct slot_command_api::ul_slot_callbacks ul_cb;
     uint8_t isEarlyUciDetComplete=0;
     t_ns timeout_thresh_t(5 * NS_X_MS);
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
 
     sfn = slot_map->getSlot3GPP().sfn_;
     slot = slot_map->getSlot3GPP().slot_;
@@ -1599,6 +1614,16 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
             bool pucch_timeout;
             start_t = Time::nowNs();
             do {
+#ifdef ENABLE_FAPI_STORE_REPLAY
+                if(slot_map->tasksAborted())
+                {
+                    NVLOGW_FMT(TAG, "{} Task aborted while waiting for PUCCH run completion, Slot Map {}", __func__, slot_map->getId());
+                    slot_map->setEarlyUciEndTask();
+                    slot_map->addSlotEndTask();
+                    ti.add("End Task");
+                    return 0;
+                }
+#endif
                 pucch_finished = (pucch->waitRunCompletionEventNonBlocking()==1);
                 pucch_timeout = (Time::nowNs() - start_t > timeout_thresh_t);
             } while(!pucch_finished && !pucch_timeout);
@@ -1613,12 +1638,32 @@ int task_work_function_ul_aggr_3_early_uci_ind(Worker* worker, void* param,int f
         start_t = Time::nowNs();
         while(!isEarlyUciDetComplete)
         {
+#ifdef ENABLE_FAPI_STORE_REPLAY
+            if(slot_map->tasksAborted())
+            {
+                NVLOGW_FMT(TAG, "{} Task aborted while waiting for UCI detected event, Slot Map {}", __func__, slot_map->getId());
+                slot_map->setEarlyUciEndTask();
+                slot_map->addSlotEndTask();
+                ti.add("End Task");
+                return 0;
+            }
+#endif
             isEarlyUciDetComplete=pusch->waitEventNonBlocking(pusch->getPuschStatParams()->subSlotCompletedEvent);
             if(isEarlyUciDetComplete)
             {
                 if(pusch->getPreEarlyHarqWaitKernelStatus()==PUSCH_RX_WAIT_KERNEL_STATUS_TIMEOUT)
                 {
+#ifdef ENABLE_FAPI_STORE_REPLAY
+                    NVLOGE_FMT(TAG,AERIAL_CUPHY_API_EVENT,
+                               "SFN {}.{} Slot Map {} PUSCH Pre Early Harq Wait kernel timeout! "
+                               "setup_status={} run_status={} pre_wait_status={} post_wait_status={}",
+                               sfn,slot,slot_map->getId(),
+                               pusch->getSetupStatus(), pusch->getRunStatus(),
+                               +pusch->getPreEarlyHarqWaitKernelStatus(),
+                               +pusch->getPostEarlyHarqWaitKernelStatus());
+#else
                     NVLOGE_FMT(TAG,AERIAL_CUPHY_API_EVENT,"SFN {}.{} Slot Map {} PUSCH Pre Early Harq Wait kernel timeout!",sfn,slot,slot_map->getId());
+#endif
                 }
                 NVLOGI_FMT(TAG,"Triggering Early UCI Indication Callback to L2A for Slot Map {}",slot_map->getId());
                 if(pdctx->getUlCb(ul_cb))
@@ -1719,7 +1764,7 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
     PhyPucchAggr* pucch= slot_map->aggr_pucch;
     PhyPrachAggr* prach= slot_map->aggr_prach;
     PhySrsAggr* srs = slot_map->aggr_srs;
-    std::array<uint8_t,UL_MAX_CELLS_PER_SLOT> srs_start_symbol;
+    std::array<uint8_t,UL_MAX_CELLS_PER_SLOT> srs_start_symbol{};
     t_ns t1, t2, t3,t_start_ul_channel_tasks;
     uint32_t cpu;
     uint32_t srsMask = 0;
@@ -1734,7 +1779,7 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
 
     //Only run after ULC tasks have completed
     ti.add("ULC Tasks Complete Wait");
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
     ret = slot_map->waitULCTasksComplete(num_ulc_tasks);
     if(ret != 0)
     {
@@ -1820,9 +1865,29 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
                     nonSrsUlMask |= (1 << i);
                 }
             }
-            if(srs_pparms != nullptr)
+            //SRS cell_dyn_info is packed over cells with SRS this slot, so slot-map index i is not a valid index.
+            //Map by phy cell id. Skip cells that are not ordering SRS; mixed-slot non-SRS order kernel
+            //only needs this for SINGLE_SECT_MODE, where PUSCH and SRS share the same kernel.
+            const bool needsSrsStartSymbol =
+                (srsMask & (1u << i)) ||
+                (cell_ptr != nullptr && cell_ptr->getRUType() == SINGLE_SECT_MODE);
+            if(needsSrsStartSymbol && srs_pparms != nullptr && cell_ptr != nullptr)
             {
-                srs_start_symbol[i]=srs_pparms->cell_dyn_info[i].srsStartSym;
+                const auto& srs_phy_cells = srs_pparms->phy_cell_index_list;
+                const auto it = std::find(srs_phy_cells.begin(), srs_phy_cells.end(),
+                                          static_cast<int32_t>(cell_ptr->getPhyId()));
+                if(it != srs_phy_cells.end())
+                {
+                    srs_start_symbol[i] = srs_pparms->cell_dyn_info[it - srs_phy_cells.begin()].srsStartSym;
+                }
+                else if((srsMask & (1u << i)) ||
+                        (cell_ptr->getRUType() == SINGLE_SECT_MODE && ulbuf_st2 != nullptr))
+                {
+                    //Cell has SRS this slot but L2 sent no matching SRS cell params. Bounds check will drop the PRBs.
+                    //srsMask covers the dedicated SRS kernel; SINGLE_SECT uses the same kernel as PUSCH so it never sets srsMask.
+                    NVLOGW_FMT(TAG,"SFN {}.{} Task UL {} Map {} Cell {} has no SRS dynamic params entry, using srs_start_symbol 0",
+                        sfn, slot, task_num, slot_map->getId(), cell_ptr->getPhyId());
+                }
             }
 
             if(cell_ptr == nullptr || (ulbuf_st1 == nullptr &&  ulbuf_st2 == nullptr && ulbuf_st3_v.size() == 0))
@@ -1865,7 +1930,7 @@ int task_work_function_ul_aggr_1_orderKernel(Worker* worker, void* param, int fi
 
                 NVLOGI_FMT(TAG, "SFN {}.{} Task UL {} Map {} Cell {} requesting {} PUSCH/PUCCH {} PRACH {} SRS PRBs", sfn, slot, task_num,slot_map->getId(),cell_ptr->getPhyId(),numPrbPuschPucch[i], numPrbPrach[i],numPrbSrs[i]);
             }
-            slot_start[i]=slot_map->getTaskTsExec(0) + t_ns(AppConfig::getInstance().getTaiOffset()) + t_ns(Cell::getTtiNsFromMu(cell_ptr->getMu()) * (cell_ptr->getSlotAhead()-1)); //-1 since slot_map->getTaskTsExec(0) is already at L2A slot tick + 1
+            slot_start[i]=slot_map->getSlotRefTs() + t_ns(AppConfig::getInstance().getTaiOffset()) + t_ns(Cell::getTtiNsFromMu(cell_ptr->getMu()) * (cell_ptr->getSlotAhead()-1)); //getSlotRefTs() is L2A slot tick + 1
             ta4_min_ns[i]=cell_ptr->getTa4MinNs();
             ta4_max_ns[i]=cell_ptr->getTa4MaxNs();
             ta4_min_ns_srs[i]=cell_ptr->getTa4MinNsSrs();
@@ -1968,7 +2033,7 @@ int task_work_function_ul_aggr_2(Worker* worker, void* param, int first_cell, in
     PhyPucchAggr*                                                                pucch = slot_map->aggr_pucch;
     PhyPrachAggr*                                                                prach = slot_map->aggr_prach;
     OrderEntity*                                                                 oentity  = slot_map->aggr_order_entity;
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
 
     /////////////////////////////////////////////////////////////////////////////////////
     //// Wait completion previous task
@@ -2204,6 +2269,9 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
     int                                                                          task_num = 3, ret_task = 0;
     SlotMapUl*                                                                     slot_map = (SlotMapUl*)param;
     PhyDriverCtx*                                                                pdctx    = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
+    // Total UL task count is published on the slot map (setTasksTs) before tasks
+    // are pushed; read it here rather than relying on the init() argument.
+    num_ul_tasks = slot_map->getNumTasks();
     PhyPuschAggr * pusch = nullptr;
     PhyPucchAggr * pucch = nullptr;
     PhyPrachAggr * prach = nullptr;
@@ -2240,7 +2308,7 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
     int                                                                          printed  = 0;
     t_ms                                                                         thresholdms_t(1);
     int                                                                          sfn = 0, slot = 0, ret = 0;
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
     int num_ul_tasks_to_wait;
     bool en_orderKernel_tb=pdctx->enableOKTb();
     int srs_task_offset = 0;
@@ -2344,6 +2412,7 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
         }
     }
 
+
     if(pdctx->gpuCommEnabledViaCpu())
     {
         order_wait_thresh_t = t_ns(6*NS_X_MS);
@@ -2351,7 +2420,7 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
     
     if(!en_orderKernel_tb)
     {
-        /*The channel end waits are now needed to ensure cuda event recording for channel run completion is called before cudaEventSynchronize*/
+        /*The channel end waits are now needed to ensure cuda event recording for channel run completion is called before cuEventSynchronize*/
         ti.add("Wait Channel End Task");
         if(slot_map->waitChannelEndTask(num_ul_tasks_to_wait) < 0) {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitChannelEndTask returned error for Slot Map {} num_ul_tasks={} num_ulc_tasks={} num_ul_tasks_to_wait={}",slot_map->getId(),num_ul_tasks,num_ulc_tasks,num_ul_tasks_to_wait);
@@ -2368,6 +2437,15 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
     slot_map->timings.start_t_ul_srs_compl[0] = Time::nowNs();
     do {
         wait_action wa;
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+        if(slot_map->tasksAborted())
+        {
+            NVLOGW_FMT(TAG, "{} Task aborted while waiting for PHY channels, Slot Map {}", __func__, slot_map->getId());
+            ret_task=-1;
+            goto cleanup;
+        }
+#endif
 
         if(!(pdctx->cpuCommEnabled()) && (pusch||pucch||prach))
         {
@@ -2472,7 +2550,17 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
                         if(isWaitFullSlotComplete){
                             if(pusch->getPostEarlyHarqWaitKernelStatus()==PUSCH_RX_WAIT_KERNEL_STATUS_TIMEOUT) {
                                 //Set force CRC error flag to true
+#ifdef ENABLE_FAPI_STORE_REPLAY
+                                NVLOGE_FMT(TAG,AERIAL_CUPHY_API_EVENT,
+                                           "SFN {}.{} Slot Map {} PUSCH Post Early Harq Wait kernel timeout! "
+                                           "setup_status={} run_status={} pre_wait_status={} post_wait_status={}",
+                                           sfn,slot,slot_map->getId(),
+                                           pusch->getSetupStatus(), pusch->getRunStatus(),
+                                           +pusch->getPreEarlyHarqWaitKernelStatus(),
+                                           +pusch->getPostEarlyHarqWaitKernelStatus());
+#else
                                 NVLOGE_FMT(TAG,AERIAL_CUPHY_API_EVENT,"SFN {}.{} Slot Map {} PUSCH Post Early Harq Wait kernel timeout!",sfn,slot,slot_map->getId());
+#endif
                                 gpu_early_harq_timeout = true;
                             } else {
                                 gpu_early_harq_timeout = false;
@@ -2484,7 +2572,6 @@ int task_work_function_ul_aggr_3(Worker* worker, void* param, int first_cell, in
                     }
                 }
             }
-
 
             //PUSCH Wait Processing - (only check completion if early UCI task is complete)
             if(pusch_waiter.getState() != WAIT_STATE_STARTED || (pusch_waiter.getState() == WAIT_STATE_STARTED && early_uci_task_complete)) {
@@ -2733,7 +2820,8 @@ Example output log (last entry for 100K slots):
         ti.add("Wait Slot End Task");
         if(slot_map->waitSlotEndTask(num_ul_tasks) < 0)
         {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitSlotEnd returned error");
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "waitSlotEnd returned error Map {} target={}",
+                       slot_map->getId(), num_ul_tasks);
             if(pdctx->getUlCb(ul_cb))
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Calling ul_tx_error_fn {}\n",__LINE__);
@@ -2763,6 +2851,9 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
 
     SlotMapUl* slot_map = (SlotMapUl*)param;
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(slot_map->getPhyDriverHandler()).get();
+    // Total UL task count is published on the slot map (setTasksTs) before tasks
+    // are pushed; read it here rather than relying on the init() argument.
+    num_ul_tasks = slot_map->getNumTasks();
     PhySrsAggr* srs = slot_map->aggr_srs;
     OrderEntity* oentity = nullptr;
     int ret_task = 0;
@@ -2772,7 +2863,7 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
     t_ns timeout_thresh_t(10*NS_X_MS); //10ms wait on the UL cuPHY pipelines
     t_ns start_t;
     int sfn = 0, slot = 0, ret = 0;
-    int num_ulc_tasks = get_num_ulc_tasks(pdctx->getNumULWorkers());
+    int num_ulc_tasks = slot_map->getNumUlcTasks();
 
     if(srs) {
         oentity = slot_map->aggr_order_entity;
@@ -2828,6 +2919,14 @@ int task_work_function_ul_aggr_3_srs(Worker* worker, void* param, int first_cell
     
     do {
         wait_action wa;
+
+        // SRS task 1 can abort on FH loss before launching/recording events.
+        // Exit promptly so the slot map can be released by cleanup.
+        if(slot_map->tasksAborted()) {
+            NVLOGW_FMT(TAG,"task_work_function_ul_aggr_3_srs Task aborted while waiting for Slot Map {}",slot_map->getId());
+            ret_task=-1;
+            goto cleanup;
+        }
 
         if(!(pdctx->cpuCommEnabled()) && srs) {
             wa = order_waiter_srs.checkAction(true);
@@ -3029,4 +3128,3 @@ cleanup:
 
     return ret;
 }
-

@@ -19,6 +19,8 @@
 #if !defined(SLOT_COMMAND_API_HPP_INCLUDED_)
 #define SLOT_COMMAND_API_HPP_INCLUDED_
 
+#include <gsl-lite/gsl-lite.hpp>
+#include <array>
 #include <chrono>
 #include <vector>
 #include <cstdint>
@@ -108,12 +110,11 @@ inline constexpr int IQ_REPR_FP32_COMPLEX = 2;  ///< IQ representation FP32 comp
  * Up to 4 UL layers (8 layers not supported)
  * Up to 4 layers/UE DL (or UL) SU-MIMO
  */
-#ifdef ENABLE_32DL
+// Compile-time worst-case; dynamic sizing uses max_dl_antenna_ports at use sites.
 inline constexpr int MAX_MU_MIMO_LAYERS = 32;
-#else
-inline constexpr int MAX_MU_MIMO_LAYERS = 16;
-#endif
- inline constexpr int MAX_PORTS_FOR_STATIC_BF = 32;   ///< Maximum ports for static beamforming
+/** Compile-time maximum BFW coefficient layers per UE group. Runtime sizing uses PhyDriverCtx::getMaxDlAntennaPorts() / getMaxUlAntennaPorts(). */
+inline constexpr int BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP = 32;
+inline constexpr int MAX_PORTS_FOR_STATIC_BF = 32;   ///< Maximum ports for static beamforming
 inline constexpr int MAX_DL_UL_BF_UE_PER_TTI = 8;    ///< Maximum DL/UL beamforming UE per TTI
 inline constexpr int MAX_DL_UL_BF_UE_GROUPS = CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS;  ///< Maximum DL/UL BF UE groups
 inline constexpr int MAX_B_SRS_INDEX = 4;             ///< Maximum B SRS index
@@ -330,6 +331,9 @@ struct slot_info
 {
     slot_type type;             ///< Slot type (UL/DL/special)
     slot_indication slot_3gpp;  ///< 3GPP slot timing information
+
+    void set_downlink(const slot_indication& si) { type = SLOT_DOWNLINK; slot_3gpp = si; }
+    void set_uplink(const slot_indication& si)   { type = SLOT_UPLINK;   slot_3gpp = si; }
 };
 
 /**
@@ -403,7 +407,8 @@ struct pusch_params : public ch_params
         scf_ul_tti_handle_list.reserve(MAX_PUSCH_UE_GROUPS*MAX_PUSCH_UE_PER_TTI);
     }
 
-    void reset() {
+    void reset() noexcept
+    {
         cell_grp_info.nUeGrps = 0;
         cell_grp_info.nCells = 0;
         cell_grp_info.nUes = 0;
@@ -458,6 +463,12 @@ struct ra_type0_info_t_
 
 struct pdsch_params : public ch_params
 {
+    /// Parallel DL aggregation (EOM): @c process_aggr_pdsch_channel should own PDSCH PDU
+    /// fields (UE/group/codeword params, RB maps, PM caches tied to PDSCH PDUs only).
+    /// @c process_aggr_csirs_channel owns CSI-RS side effects: @c cell_grp_info.nCsiRsPrms,
+    /// @c pCsiRsPrms, @c num_csirs_info when CSI-RS mirrors into PDSCH, and the
+    /// @c csirs_params channel object. Do not split writes to those CSI-RS-related fields
+    /// across both tasks; one writer per field family to avoid races on @c cell_group_command.
     cuphyPdschCellGrpDynPrm_t cell_grp_info;
     cuphyPdschCellAerialMetrics_t cell_metrics_info[MAX_CELLS_PER_CELL_GROUP];
     cuphyPdschCellDynPrm_t cell_dyn_info[MAX_PDSCH_UE_PER_TTI];
@@ -549,11 +560,13 @@ struct pdsch_params : public ch_params
         tb_data.pTbInput = &ue_tb_ptr[0];
         pmw_idx_cache.reserve(PDSCH_MAX_UES_PER_CELL_GROUP);
         pm_info.reserve(PDSCH_MAX_UES_PER_CELL_GROUP);
+        pm_info.resize(PDSCH_MAX_UES_PER_CELL_GROUP);
         cell_index_list.reserve(MAX_CELLS_PER_CELL_GROUP);
         phy_cell_index_list.reserve(MAX_CELLS_PER_CELL_GROUP);
     }
 
-    void reset() {
+    void reset() noexcept
+    {
         cell_ue_group_idx_start = 0;
         cell_grp_info.nCells = 0;
         cell_grp_info.nUes = 0;
@@ -663,7 +676,8 @@ struct pdcch_group_params: public ch_params {
         phy_cell_index_list.reserve(MAX_PDCCH_PDUS_PER_CELL * MAX_CELLS_PER_CELL_GROUP);
     }
 
-    void reset() {
+    void reset() noexcept
+    {
         csets_group.nCoresets = 0;
         csets_group.nDcis = 0;
         cell_index_list.clear();
@@ -728,7 +742,8 @@ struct pbch_group_params : public ch_params
         phy_cell_index_list.reserve(MAX_CELLS_PER_CELL_GROUP * MAX_SSB_BLOCKS_PER_SLOT);
     }
 
-    void reset() {
+    void reset() noexcept
+    {
         nSsbBlocks = 0;
         ncells = 0;
         cell_index_list.clear();
@@ -773,7 +788,8 @@ struct pucch_params : public ch_params
         phy_cell_index_list.reserve(CUPHY_PUCCH_F3_MAX_UCI);
     }
 
-    void reset() {
+    void reset() noexcept
+    {
         grp_dyn_pars.nCells = 0;
         grp_dyn_pars.nF0Ucis = 0;
         grp_dyn_pars.nF1Ucis = 0;
@@ -806,7 +822,7 @@ struct prach_params : public ch_params
 	  	cell_index_list.reserve(MAX_PRACH_OCCASIONS_PER_SLOT);
 	       	phy_cell_index_list.reserve(MAX_PRACH_OCCASIONS_PER_SLOT);
         }
-    void reset()
+    void reset() noexcept
     {
         cell_index_list.clear();
         phy_cell_index_list.clear();
@@ -871,7 +887,7 @@ struct srs_params : public ch_params
             }
         }
     }
-    void reset()
+    void reset() noexcept
     {
         cell_grp_info.nCells = 0;
         cell_grp_info.nSrsUes = 0;
@@ -908,7 +924,7 @@ struct bfw_params : public ch_params
     uint8_t* pBfwCoefH[MAX_CELLS_MU_MIMO_ENABLE * MAX_DL_UL_BF_UE_GROUPS];
     uint8_t* pBfwCoefD[MAX_CELLS_MU_MIMO_ENABLE * MAX_DL_UL_BF_UE_GROUPS];
     cuphyBfwUeGrpPrm_t ue_grp_info[MAX_CELLS_MU_MIMO_ENABLE * MAX_DL_UL_BF_UE_GROUPS];
-    cuphyBfwLayerPrm_t pBfLayerPrm[MAX_CELLS_MU_MIMO_ENABLE * MAX_DL_UL_BF_UE_GROUPS * CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP];
+    cuphyBfwLayerPrm_t pBfLayerPrm[MAX_CELLS_MU_MIMO_ENABLE * MAX_DL_UL_BF_UE_GROUPS * BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP];
     uint16_t prevUeGrpChEstInfoBufIdx;
     uint16_t prevUeGrpPerLayerInfoBufIdx;
     bfw_type bfw_cvi_type;
@@ -933,7 +949,7 @@ struct bfw_params : public ch_params
     {
         bfw_dyn_info.nUeGrps = 0;
         for(uint32_t i=0; i < (MAX_CELLS_MU_MIMO_ENABLE * MAX_DL_UL_BF_UE_GROUPS); i++)
-            ue_grp_info[i].pBfLayerPrm = &pBfLayerPrm[i*CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP];
+            ue_grp_info[i].pBfLayerPrm = &pBfLayerPrm[i*BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP];
         bfw_dyn_info.pUeGrpPrms = ue_grp_info;
         dataIn.pChEstInfo = chEstInfo;
         dataOutH.pBfwCoef = pBfwCoefH;
@@ -944,7 +960,7 @@ struct bfw_params : public ch_params
             dl_ul_bwp_max_prg[cellIdx] = 0;
         }
     }
-    void reset()
+    void reset() noexcept
     {
         bfw_dyn_info.nUeGrps = 0;
         prevUeGrpChEstInfoBufIdx = 0;
@@ -1038,7 +1054,7 @@ struct csirs_params_: public ch_params
         csirsDynPrms.pRrcDynPrm = csirsList;
         csirsDynPrms.pCellParam = cellInfo;
     }
-    void reset()
+    void reset() noexcept
     {
         std::memset(pcAndBf, 0, numPcBf*sizeof(tx_precoding_beamforming_t));
         for(int i=0 ; i < numPcBf; i++)
@@ -1265,10 +1281,14 @@ using prb_info_t = prb_info_t_;
 struct overlap_csirs_port_info_t {
     uint8_t num_ports;
     uint8_t num_overlap_ports;
+    // Index into slot_info.prbs for the overlapping CSI-RS prb_info (static ext11 metadata).
+    // Invalid when no CSI-RS overlaps this PDSCH prb_info.
+    uint16_t csirs_prb_idx;
     std::array<std::pair<uint16_t, uint8_t>, MAX_CSIRS_PORTS_MAPPED_TO_SINGLE_FLOW> reMask_ap_idx_pairs;
     overlap_csirs_port_info_t() {
         num_ports = 0;
         num_overlap_ports = 0;
+        csirs_prb_idx = MAX_PRB_INFO;
         reMask_ap_idx_pairs.fill(std::make_pair(0, 0));
     }
 };
@@ -1309,7 +1329,7 @@ struct slot_info_
         section_id_ready.store(false);
     }
 
-    void reset()
+    void reset() noexcept
     {
         for(int i = 0; i < OFDM_SYMBOLS_PER_SLOT; ++i)
         {
@@ -1330,6 +1350,7 @@ struct slot_info_
         {
             overlap_csirs_port_info[i].num_ports = 0;
             overlap_csirs_port_info[i].num_overlap_ports = 0;
+            overlap_csirs_port_info[i].csirs_prb_idx = MAX_PRB_INFO;
         }
     }
 };
@@ -1357,7 +1378,7 @@ struct phy_slot_params
         reset();
     }
 
-    void reset()
+    void reset() noexcept
     {
         // pusch.reset();
         // pdsch.reset();
@@ -1552,9 +1573,9 @@ struct cell_sub_command
     cell_sub_command(cell_sub_command&&) = default;
     cell_sub_command& operator=(cell_sub_command&&) = default;
 
-    void reset()
+    void reset() noexcept
     {
-       for (auto& idx: channel_idx)
+        for (auto& idx: channel_idx)
         {
             idx = channel_type::NONE;
         }
@@ -1618,10 +1639,11 @@ struct fh_prepare_callback_params
     std::array<uint8_t, DL_MAX_CELLS_PER_SLOT> is_csirs_cell = {};
 
     uint32_t num_csirs_cell = {};
-    void reset()
+    void reset() noexcept
     {
-        for (int idx = 0; idx < total_num_pdsch_pdus; ++idx) {
-            auto &params = pc_bf_arr.at(idx);
+        gsl_Expects(total_num_pdsch_pdus <= pc_bf_arr.size());
+        for (uint32_t idx = 0; idx < total_num_pdsch_pdus; ++idx) {
+            auto &params = pc_bf_arr[idx];
             params.num_prgs = 0;
             params.dig_bf_interfaces = 0;
         }
@@ -1653,6 +1675,21 @@ struct pm_group {
     uint16_t nPmPdcch;
     uint16_t nPmPbch;
     uint16_t nPmCsirs;
+    /// DEPRECATED -- do not add new users.
+    ///
+    /// A single counter cannot correctly index the three *_pmw_idx_cache arrays above:
+    /// they have three different capacities (MAX_SSB_BLOCKS_PER_SLOT, MAX_PDSCH_UE_PER_TTI,
+    /// MAX_CSIRS_OCCASIONS_PER_SLOT, each x MAX_CELLS_PER_CELL_GROUP), and the channel
+    /// aggregation tasks that fill them run in parallel against the same pm_group instance.
+    /// Each cache must be indexed by its own per-channel counter above.
+    ///
+    /// Converted: SSB -> nPmPbch (GT-12948); CSI-RS helper path -> nPmCsirs.
+    /// Remaining writers, both reachable only from the legacy scf_5g_fapi_phy.cpp handlers:
+    ///   - scf_5g_slot_commands_pdcch.cpp      (update_new_dci_pm)      -> nPmPdcch
+    ///   - scf_5g_slot_commands_pdsch_csirs.cpp (update_cell_command)   -> nPmCsirs
+    /// Convert each in the MR that migrates its channel to the parser path -- that migration
+    /// is what puts a second live writer on this counter and makes it actively harmful --
+    /// then delete this field.
     uint16_t nCacheEntries;
     bool precoding_enabled;
 
@@ -1668,7 +1705,8 @@ struct pm_group {
     }
 
 
-    void reset() {
+    void reset() noexcept
+    {
         if (precoding_enabled) {
             nPmPdcch = 0;
             nPmPbch = 0;
@@ -1677,7 +1715,6 @@ struct pm_group {
             ssb_pmw_idx_cache.fill({.pmwIdx = UINT32_MAX, .nIndex = UINT32_MAX});
             pdcch_pmw_idx_cache.fill({.pmwIdx = UINT32_MAX, .nIndex = UINT32_MAX});
             csirs_pmw_idx_cache.fill({.pmwIdx = UINT32_MAX, .nIndex = UINT32_MAX});
-
         }
     }
 
@@ -1722,58 +1759,172 @@ struct cell_group_command
     cell_group_command(cell_group_command&&) = default;
     cell_group_command& operator=(cell_group_command&&) = default;
 
-    [[nodiscard]] pusch_params* get_pusch_params()
+    /**
+     * @brief Registers @c channel_type::PUSCH and returns the @c pusch_params.
+     *
+     * @return Non-null non-owning pointer to the @c pusch_params for this slot
+     *         command; @c [[nodiscard]] — return value must not be discarded.
+     * @note Invokes @c create_if(channel_type::PUSCH) to populate
+     *       @c channel_idx[PUSCH] if not already set.
+     */
+    [[nodiscard]] pusch_params* get_pusch_params() noexcept
     {
         create_if(channel_type::PUSCH);
         return pusch.get();
     }
 
-    [[nodiscard]] pdsch_params* get_pdsch_params()
+    /**
+     * @brief Registers @c channel_type::PDSCH and returns the @c pdsch_params.
+     *
+     * @return Non-null non-owning pointer to the @c pdsch_params for this slot
+     *         command; @c [[nodiscard]] — return value must not be discarded.
+     * @note Invokes @c create_if(channel_type::PDSCH) to populate
+     *       @c channel_idx[PDSCH] if not already set.
+     */
+    [[nodiscard]] pdsch_params* get_pdsch_params() noexcept
     {
         create_if(channel_type::PDSCH);
         return pdsch.get();
     }
 
-    [[nodiscard]] pucch_params* get_pucch_params()
+    /**
+     * @brief Registers @c channel_type::PUCCH and returns the @c pucch_params.
+     *
+     * @return Non-null non-owning pointer to the @c pucch_params for this slot
+     *         command; @c [[nodiscard]] — return value must not be discarded.
+     * @note Invokes @c create_if(channel_type::PUCCH) to populate
+     *       @c channel_idx[PUCCH] if not already set.
+     */
+    [[nodiscard]] pucch_params* get_pucch_params() noexcept
     {
         create_if(channel_type::PUCCH);
         return pucch.get();
     }
 
-    [[nodiscard]] csirs_params* get_csirs_params()
+    /**
+     * @brief Registers @c channel_type::CSI_RS and returns the @c csirs_params.
+     *
+     * @return Non-null non-owning pointer to the @c csirs_params for this slot
+     *         command; @c [[nodiscard]] — return value must not be discarded.
+     * @note Invokes @c create_if(channel_type::CSI_RS) to populate
+     *       @c channel_idx[CSI_RS] if not already set.
+     */
+    [[nodiscard]] csirs_params* get_csirs_params() noexcept
     {
         create_if(channel_type::CSI_RS);
         return csirs.get();
     }
 
-    [[nodiscard]] pdcch_group_params * get_pdcch_params() {
-        create_if(channel_type::PDCCH_DL);
+    /**
+     * @brief Registers @c channel_type::PDCCH_DL and returns the shared
+     *        @c pdcch_group_params.
+     *
+     * Convenience overload; equivalent to
+     * @c get_pdcch_params(channel_type::PDCCH_DL).
+     *
+     * @return Non-null pointer to the @c pdcch_group_params shared by both
+     *         PDCCH_DL and PDCCH_UL; @c channel_idx[PDCCH_DL] is populated
+     *         as a side effect.
+     */
+    [[nodiscard]] pdcch_group_params* get_pdcch_params() noexcept
+    {
+        return get_pdcch_params(channel_type::PDCCH_DL);
+    }
+
+    /**
+     * @brief Registers @p ch in @c channel_idx[] and returns the shared
+     *        @c pdcch_group_params.
+     *
+     * PDCCH_DL and PDCCH_UL share one @c pdcch_group_params object; separate
+     * @c channel_idx entries let task dispatch distinguish them.  To register
+     * both variants, call this function once per @c channel_type value.
+     *
+     * @note Invokes @c create_if(ch) to populate @c channel_idx[ch] if not
+     *       already set.
+     *
+     * @param[in] ch  Must be @c channel_type::PDCCH_DL or
+     *                @c channel_type::PDCCH_UL; any other value is a precondition
+     *                violation.
+     * @return Non-null pointer to the @c pdcch_group_params instance.
+     */
+    [[nodiscard]] pdcch_group_params* get_pdcch_params(channel_type ch) noexcept
+    {
+        ensure_pdcch_params(ch);
         return pdcch.get();
     }
 
-    [[nodiscard]] prach_params* get_prach_params() {
+    /**
+     * Registers @p ch in @c channel_idx[] without returning the params.
+     *
+     * Command form of @c get_pdcch_params(ch) for callers that need only the
+     * registration / pre-allocation side effect — e.g. priming slot-command
+     * storage on the message thread before a worker writes to it. Avoids
+     * discarding the @c [[nodiscard]] pointer at such call sites.
+     *
+     * @param[in] ch  Must be @c channel_type::PDCCH_DL or @c channel_type::PDCCH_UL;
+     *                any other value is a precondition violation.
+     */
+    void ensure_pdcch_params(channel_type ch) noexcept
+    {
+        gsl_Expects(ch == channel_type::PDCCH_DL || ch == channel_type::PDCCH_UL);
+        create_if(ch);
+    }
+
+    /**
+     * @brief Registers @c channel_type::PRACH and returns the @c prach_params.
+     *
+     * @return Non-null non-owning pointer to the @c prach_params for this slot
+     *         command; @c [[nodiscard]] — return value must not be discarded.
+     * @note Invokes @c create_if(channel_type::PRACH) to populate
+     *       @c channel_idx[PRACH] if not already set.
+     */
+    [[nodiscard]] prach_params* get_prach_params() noexcept {
         create_if(channel_type::PRACH);
         return prach.get();
     }
 
-    [[nodiscard]] pbch_group_params * get_pbch_params() {
+    /**
+     * @brief Registers @c channel_type::PBCH and returns the @c pbch_group_params.
+     *
+     * @return Non-null non-owning pointer to the @c pbch_group_params for this
+     *         slot command; @c [[nodiscard]] — return value must not be discarded.
+     * @note Invokes @c create_if(channel_type::PBCH) to populate
+     *       @c channel_idx[PBCH] if not already set.
+     */
+    [[nodiscard]] pbch_group_params* get_pbch_params() noexcept {
         create_if(channel_type::PBCH);
         return pbch.get();
     }
 
-    [[nodiscard]] srs_params* get_srs_params()
+    /**
+     * @brief Registers @c channel_type::SRS and returns the @c srs_params.
+     *
+     * @return Non-null non-owning pointer to the @c srs_params for this slot
+     *         command; @c [[nodiscard]] — return value must not be discarded.
+     * @note Invokes @c create_if(channel_type::SRS) to populate
+     *       @c channel_idx[SRS] if not already set.
+     */
+    [[nodiscard]] srs_params* get_srs_params() noexcept
     {
         create_if(channel_type::SRS);
         return srs.get();
     }
 
-    [[nodiscard]] bfw_params* get_bfw_params()
+    /**
+     * @brief Registers @c channel_type::BFW and returns the @c bfw_params.
+     *
+     * @return Non-null non-owning pointer to the @c bfw_params for this slot
+     *         command; @c [[nodiscard]] — return value must not be discarded.
+     * @note Invokes @c create_if(channel_type::BFW) to populate
+     *       @c channel_idx[BFW] if not already set.
+     */
+    [[nodiscard]] bfw_params* get_bfw_params() noexcept
     {
         create_if(channel_type::BFW);
         return bfw.get();
     }
 
-    void create_if(const channel_type chType)
+    void create_if(channel_type chType) noexcept
     {
         auto index = channel_idx[chType];
         if (index == channel_type::NONE)
@@ -1787,7 +1938,8 @@ struct cell_group_command
         }
     }
 
-    void reset() {
+    void reset() noexcept
+    {
         channel_array_size = 0;
         channels.fill(channel_type::NONE);
         channel_idx[channel_type::PUSCH] = channel_type::NONE;
@@ -1841,6 +1993,27 @@ struct slot_command
     cell_commands cells;
     cell_group_command cell_groups;
     nanoseconds tick_original;
+
+    /// Reset all sub-commands and tick_original so this slot_command entry can be reused.
+    ///
+    /// Release fence: all reset writes above are ordered before any subsequent
+    /// load that a future message-processing thread performs on this
+    /// slot_command_array entry when the ring slot is reused, ensuring a clean
+    /// slate on weakly-ordered aarch64/Grace CPUs.
+    ///
+    /// The acquire side is the tasks_in_flight.fetch_sub(1, memory_order_acq_rel)
+    /// in PHY_module::on_slot_channel_task_complete()
+    /// (cuphyl2adapter/lib/nvPHY/nv_phy_slot_dispatch.cpp) that gates this call.
+    void reset() noexcept
+    {
+        cell_groups.reset();
+        for (auto& cell : cells)
+        {
+            cell.reset();
+        }
+        tick_original = nanoseconds{};
+        std::atomic_thread_fence(std::memory_order_release);
+    }
 };
 
 struct ul_output_msg_buffer
@@ -1856,6 +2029,25 @@ struct ul_output_msg_buffer
     uint32_t numTB;
     // array of offset
     std::vector<uint32_t> tb_offset;
+
+    uint32_t num_cells{}; //!< Number of cells with pre-allocated nvIPC messages (GT-11677 Phase 2)
+    std::array<nv_ipc_msg_t, UL_MAX_CELLS_PER_SLOT> cell_ipc_msgs{}; /*!< Per-cell nvIPC message handles.
+                                                                           cell_ipc_msgs[0] mirrors ipc_msg/data_buf for cell 0;
+                                                                           cell_ipc_msgs[1..num_cells-1] hold pre-allocated messages for other cells. */
+    bool zero_copy{}; //!< True when L1 D2H wrote directly into the nvIPC data buffer(s)
+
+    void reset()
+    {
+        cookie      = nullptr;
+        ipc_msg     = {};
+        data_buf    = nullptr;
+        total_bytes = 0;
+        numTB       = 0;
+        tb_offset.clear();
+        num_cells   = 0;
+        cell_ipc_msgs.fill({});
+        zero_copy   = false;
+    }
 };
 
 using ul_alloc_buffer = void (*)(void* context, ul_output_msg_buffer&, const pusch_params&);
@@ -1973,6 +2165,8 @@ using dl_tx_error = void (*)(void* context,
 
 using l1_exit_error = std::function<void(uint16_t,uint16_t,std::array<uint32_t,DL_MAX_CELLS_PER_SLOT>&,uint8_t)>;
 
+using tx_data_release_callback = void(*)(void* context, uint16_t sfn, uint8_t slot);
+
 struct dl_slot_callbacks
 {
     dl_slot_callback callback_fn;
@@ -1986,6 +2180,8 @@ struct dl_slot_callbacks
     dl_tx_error dl_tx_error_fn;
     void* dl_tx_error_fn_context{};  //!< Context pointer for dl_tx_error_fn
     l1_exit_error l1_exit_error_fn;
+    tx_data_release_callback tx_data_release_fn{};
+    void* tx_data_release_fn_context{};  //!< Context pointer for tx_data_release_fn
 };
 
 struct callbacks {

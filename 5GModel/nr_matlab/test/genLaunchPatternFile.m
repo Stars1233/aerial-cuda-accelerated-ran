@@ -1936,6 +1936,79 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         LP.SCHED{1}.config{1}.channels = {'TVnr_7869_gNB_FAPI_s0.h5'}; % 64TR   wideband BF 
         LP.SCHED{1}.config{2}.channels = {'TVnr_7204_gNB_FAPI_s0.h5'}; % 4TR          no BF
         LP.SCHED{1}.config{3}.channels = {'TVnr_7889_gNB_FAPI_s0.h5'}; % 64TR narrowband BF per-PRG CHEST
+        
+    case 168 % 4T4R SRS + UL (SU-MIMO) case 41 + FAPI 10.02 with SRS 10.04
+        nCell = 1;
+        LP = [];
+        LP.Cell_Configs = {'TVnr_0530_gNB_FAPI_s0.h5'};
+        LP = init_launchPattern(LP, nSlot, nCell);
+        LP.SCHED{4}.config{1}.channels = {'TVnr_8301_gNB_FAPI_s0.h5'}; % SRS placeholder
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0531_gNB_FAPI_s0.h5'};
+        LP.SCHED{6}.config{1}.channels = {'TVnr_0530_gNB_FAPI_s0.h5'}; % PRACH
+        LP.SCHED{14}.config{1}.channels = {'TVnr_8302_gNB_FAPI_s0.h5'}; % SRS placeholder
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0531_gNB_FAPI_s0.h5'};
+        LP.SCHED{16}.config{1}.channels = {'TVnr_0531_gNB_FAPI_s0.h5'};
+    case 169 % 4T4R SRS + UL + DL (SU-MIMO) case 42 + FAPI 10.02 with SRS 10.04
+        nCell = 1;
+        LP = [];
+        LP.Cell_Configs = {'TVnr_0530_gNB_FAPI_s0.h5'};
+        LP = init_launchPattern(LP, nSlot, nCell);
+        LP.SCHED{1}.config{1}.channels = {'TVnr_0130_gNB_FAPI_s0.h5'}; % SSB
+        LP.SCHED{2}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{1}.channels = {'TVnr_8301_gNB_FAPI_s0.h5'}; % SRS placeholder
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0531_gNB_FAPI_s0.h5'};
+        LP.SCHED{6}.config{1}.channels = {'TVnr_0530_gNB_FAPI_s0.h5'}; % PRACH
+        LP.SCHED{7}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{11}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{12}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{13}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{14}.config{1}.channels = {'TVnr_8302_gNB_FAPI_s0.h5'}; % SRS placeholder
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0531_gNB_FAPI_s0.h5'};
+        LP.SCHED{16}.config{1}.channels = {'TVnr_0531_gNB_FAPI_s0.h5'};
+        LP.SCHED{17}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0131_gNB_FAPI_s0.h5'};
+    case 170 % 4T4R SRS +  UL(MU-MIMO 4L) case 43 + FAPI 10.02 with SRS 10.04
+        nCell = 1;
+        LP = [];
+        LP.Cell_Configs = {'TVnr_0532_gNB_FAPI_s0.h5'};
+        LP = init_launchPattern(LP, nSlot, nCell);
+        LP.SCHED{4}.config{1}.channels = {'TVnr_8301_gNB_FAPI_s0.h5'}; % SRS placeholder
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0533_gNB_FAPI_s0.h5'};
+        LP.SCHED{6}.config{1}.channels = {'TVnr_0532_gNB_FAPI_s0.h5'}; % PRACH
+        LP.SCHED{14}.config{1}.channels = {'TVnr_8302_gNB_FAPI_s0.h5'}; % SRS placeholder
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0533_gNB_FAPI_s0.h5'};
+        LP.SCHED{16}.config{1}.channels = {'TVnr_0533_gNB_FAPI_s0.h5'};
+    case 171 % 4T4R SRS +  UL(MU-MIMO 4L) + DL(MU-MIMO 4L) case 44 + FAPI 10.02 with SRS 10.04
+        nCell = 1;
+        LP = [];
+        LP.Cell_Configs = {'TVnr_0532_gNB_FAPI_s0.h5'};
+        LP = init_launchPattern(LP, nSlot, nCell);
+        LP.SCHED{1}.config{1}.channels = {'TVnr_0132_gNB_FAPI_s0.h5'}; % SSB
+        LP.SCHED{2}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{3}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{4}.config{1}.channels = {'TVnr_8301_gNB_FAPI_s0.h5'}; % SRS placeholder
+        LP.SCHED{5}.config{1}.channels = {'TVnr_0533_gNB_FAPI_s0.h5'};
+        LP.SCHED{6}.config{1}.channels = {'TVnr_0532_gNB_FAPI_s0.h5'}; % PRACH
+        LP.SCHED{7}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{8}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{9}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{10}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{11}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{12}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{13}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{14}.config{1}.channels = {'TVnr_8302_gNB_FAPI_s0.h5'}; % SRS placeholder
+        LP.SCHED{15}.config{1}.channels = {'TVnr_0533_gNB_FAPI_s0.h5'};
+        LP.SCHED{16}.config{1}.channels = {'TVnr_0533_gNB_FAPI_s0.h5'};
+        LP.SCHED{17}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{18}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{19}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
+        LP.SCHED{20}.config{1}.channels = {'TVnr_0133_gNB_FAPI_s0.h5'};
 
     case 190
         nCell = 1;
@@ -2047,6 +2120,15 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         params.neg_slot = [14];
         params.neg_cell = [1];
         LP = buildMixedCellPattern(params)
+    case 202  % MIXBW-equivalent 2-cell launch pattern
+        nCell = 2;
+        LP = [];
+        nSlot = 20;
+        LP.data_buf_opt = 0;
+        LP.Cell_Configs = {'TVnr_5202_gNB_FAPI_s1.h5', 'TVnr_5205_gNB_FAPI_s1.h5'};
+        LP = init_launchPattern(LP, nSlot, nCell);
+        LP.SCHED{2}.config{1}.channels = {'TVnr_5202_gNB_FAPI_s1.h5'};
+        LP.SCHED{2}.config{2}.channels = {'TVnr_5205_gNB_FAPI_s1.h5'};
 
     % 903XX is for P5G patterns
     case 300 % P5G_PRACH
@@ -2152,6 +2234,14 @@ case 109 %%40 slot pattern: 64TR SRS + BFW + PDSCH/PUSCH on all slots (DDDSUUDDD
         LP = init_launchPattern(LP, nSlot, nCell);
         LP.SCHED{16}.config{1}.channels = {'bug5098017_PUSCH_sfn943_15_gNB_FAPI_s15.h5'};
         LP.SCHED{36}.config{1}.channels = {'bug5098017_PUSCH_sfn944_15_gNB_FAPI_s15.h5'};
+    case 508 % bug 5714275
+        nCell = 1;
+        nSlot = 20;
+        LP = [];
+        LP.Cell_Configs = {'bug5714275_PUSCH_gNB_FAPI_s14.h5'};
+        LP = init_launchPattern(LP, nSlot, nCell);
+        LP.SCHED{15}.config{1}.channels = {'bug5714275_PUSCH_gNB_FAPI_s14.h5'};
+
     case 601 % multi-channel DL (HARQ disabled)
         nCell = 1;
         LP = [];

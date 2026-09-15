@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,10 +60,13 @@ def measure(base, args):
             run_TDD(args, sms)
 
     finally:
-        if not args.is_no_mps and args.debug_mode not in ["ncu"]:
+        if not args.is_no_mps:
             # quit MPS server
             os.system(
-                f"echo quit | CUDA_VISIBLE_DEVICES={args.gpu} CUDA_MPS_PIPE_DIRECTORY=. CUDA_LOG_DIRECTORY=. nvidia-cuda-mps-control"
+                "if pgrep -f '(^|/)nvidia-cuda-mps-control -d$' >/dev/null; then "
+                f"echo quit | CUDA_VISIBLE_DEVICES={args.gpu} "
+                "CUDA_MPS_PIPE_DIRECTORY=. CUDA_LOG_DIRECTORY=. "
+                "nvidia-cuda-mps-control; fi"
             )
         # no need to reset GPU
         # os.system(f"{sudo}nvidia-smi -i {args.gpu} -rgc")

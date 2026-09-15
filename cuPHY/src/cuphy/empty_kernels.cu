@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,7 @@
 #include <iostream>
 #endif
 
-#include "ldpc.hpp"
+#include "error_correction/ldpc.hpp"
 #include "crc_encode.hpp"
 #include "rm_decoder.hpp"
 #include "cfo_ta_est.hpp"
@@ -288,6 +288,55 @@ cuphyStatus_t CUPHYWINAPI internalCuphySetWorkCancelKernelNodeParams(CUDA_KERNEL
     pNodeParams->kernelParams   = pKernelParams;
     pNodeParams->sharedMemBytes = 0;
     pNodeParams->extra          = nullptr;
+
+    return (cudaSuccess != e) ? CUPHY_STATUS_INTERNAL_ERROR : CUPHY_STATUS_SUCCESS;
+}
+
+
+__device__ __forceinline__ unsigned long long __globaltimer()
+{
+    unsigned long long globaltimer;
+    // 64-bit global nanosecond timer
+    asm volatile("mov.u64 %0, %globaltimer;"
+                 : "=l"(globaltimer));
+    return globaltimer;
+}
+
+__global__ void delay_kernel_us(uint32_t delay_us)
+{
+    // 64-bit global nanosecond timer
+    constexpr uint64_t NS_PER_US = 1000UL;
+
+    uint64_t start_time = __globaltimer();
+    uint64_t end_time   = start_time + (delay_us * NS_PER_US);
+
+    // 64-bit timer has a long range so skipping wrap around check
+    while(__globaltimer() < end_time)
+    {
+    };
+}
+
+cuphyStatus_t CUPHYWINAPI internalCuphySetDelayKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, void** pKernelParams)
+{
+
+    if((pNodeParams == nullptr) || (pKernelParams == nullptr) || (pKernelParams[0] == nullptr))
+    {
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    MemtraceDisableScope md;
+    cudaError_t e               = cudaGetFuncBySymbol(&pNodeParams->func, reinterpret_cast<void*>(delay_kernel_us));
+
+    pNodeParams->gridDimX       = 1;
+    pNodeParams->gridDimY       = 1;
+    pNodeParams->gridDimZ       = 1;
+    pNodeParams->blockDimX      = 32; // 1 (single thread) would be fine too
+    pNodeParams->blockDimY      = 1;
+    pNodeParams->blockDimZ      = 1;
+    pNodeParams->kernelParams   = pKernelParams;
+    pNodeParams->sharedMemBytes = 0;
+    pNodeParams->extra          = nullptr;
+    pNodeParams->kern           = nullptr;
+    pNodeParams->ctx            = nullptr;
 
     return (cudaSuccess != e) ? CUPHY_STATUS_INTERNAL_ERROR : CUPHY_STATUS_SUCCESS;
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -214,9 +214,9 @@ namespace nv {
     }
 
     /**
-     * @brief Convert numerology (mu) to number of slots per subframe
+     * @brief Convert numerology (mu) to number of slots per radio frame
      * @param mu Numerology value (0-4)
-     * @return Number of slots per 1ms subframe
+     * @return Number of slots per 10ms radio frame (= 10 * 2^mu)
      * @throws std::runtime_error if mu > 4
      */
     inline uint16_t mu_to_slot_in_sf(uint8_t mu) {

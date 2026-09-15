@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Sweep scope for the LDPC per-iteration APP validation harnesses.
+#
+# This file says WHAT THE SWEEPS SHOULD COVER. It is deliberately not a decoder
+# capability registry: a decoder decides at run time whether it can take a
+# config (can_decode_config() compares shared-memory need against the device
+# maximum), so capability is device-dependent and cannot be stated statically
+# here. A point the decoder refuses is reported by the harness as out of range,
+# never silently skipped -- so this file cannot hide a decoder regression.
+#
+# Consumed by llr_check_sweep.py. Not read by any C++: cuphy_ex_ldpc and
+# cuphy_ex_ldpc_rm take -a / -g / -Z / -p on the command line.
+#
+# p = number of parity nodes (num_parity_nodes).
+
+# Decoders carrying an ET-free _dumpApp twin, i.e. the ones --llr_check and
+# --llr_diff can validate. Requires -DCUPHY_LDPC_SPLIT_DUMP_KERNELS=ON (OFF by
+# default); without it the twins are not compiled and a capture comes back
+# empty, which the harness reports as an error rather than a pass.
+#
+# Decoders with no twin (e.g. algo55, algo56) cannot be validated by these
+# harnesses at all -- their capture would be empty. Add a decoder here only
+# when its own MR adds the twin.
+llr_check_sweep:
+  z384:
+    Z:  384
+    BG: 1
+    # p coverage to attempt, not a capability claim. Measured 4..46 for all
+    # three at Z=384 on GH200; the decoder gates each point itself.
+    algos:
+      - algo: 35
+        name: split_index_fp_x2_desc_dyn
+        p_min: 4
+        p_max: 46
+      - algo: 40
+        name: reg_box_plus_fp
+        role: reference
+        p_min: 4
+        p_max: 46
+        note: "box-plus reference for --llr_diff"
+      - algo: 41
+        name: reg_box_plus_fp_dp
+        p_min: 4
+        p_max: 46

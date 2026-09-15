@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,26 +26,26 @@ class AppConfig
 public:
     static AppConfig &getInstance();
     void setLowPriorityCore(uint8_t low_priority_core);
-    const uint8_t getLowPriorityCore() const;
+    uint8_t getLowPriorityCore() const;
     void setNicTputAlertThreshold(uint32_t nic_tput_alert_threshold);
-    const uint32_t getNicTputAlertThreshold() const;
+    uint32_t getNicTputAlertThreshold() const;
     void setCellGroupNum(uint8_t cell_group_num);
-    const uint8_t getCellGroupNum() const;
-    const bool isCellActive(uint16_t mplane_id) const;
+    uint8_t getCellGroupNum() const;
+    bool isCellActive(uint16_t mplane_id) const;
     void cellActivated(uint16_t mplane_id);
     void cellDeactivated(uint16_t mplane_id);
     void setCUSPortFailover(bool failover);
     bool isCUSPortFailoverEnabled() const;
-    const uint64_t getTaiOffset() const;
+    uint64_t getTaiOffset() const;
     void setTaiOffset();
 
     void enablePtpSvcMonitoring(bool enable_ptp_svc_monitoring);
-    const bool isPtpSvcMonitoringEnabled() const;
+    bool isPtpSvcMonitoringEnabled() const;
     void setPtpRmsThreshold(uint8_t ptp_rms_threshold);
-    const uint8_t getPtpRmsThreshold() const;
+    uint8_t getPtpRmsThreshold() const;
 
     void enableRhocpPtpEventsMonitoring(bool enable_rhocp_ptp_events_monitoring);
-    const bool isRhocpPtpEventsMonitoringEnabled() const;
+    bool isRhocpPtpEventsMonitoringEnabled() const;
     void setRhocpPtpPublisher(const std::string& rhocp_ptp_publisher);
     void setRhocpPtpNodeName(const std::string& rhocp_ptp_node_name);
     void setRhocpPtpConsumer(const std::string& rhocp_ptp_consumer);

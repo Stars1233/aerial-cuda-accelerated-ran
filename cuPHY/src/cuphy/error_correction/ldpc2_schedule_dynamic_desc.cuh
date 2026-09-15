@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -121,6 +121,7 @@ struct ldpc_schedule_dynamic_desc_base
         // output function tolerate blockDims that are not a multiple
         // of 32.
         //if(threadIdx.x < params.Z)
+        if constexpr(CHECK_IDX <= (MAX_PARITY_ROWS-1))
         {
             // Generate APP locations/address
             app_addr_gen.template generate<CHECK_IDX>(app_addr);
@@ -128,6 +129,18 @@ struct ldpc_schedule_dynamic_desc_base
             c2v_cache.process_row<CHECK_IDX>(params, app, app_addr, smem_offset);
         }
     }
+
+    template <int CHECK_IDX>
+    __device__
+    bool process_row_sign_change()
+    {
+        int    app_addr[row_degree<BG, CHECK_IDX>::value];      // shared memory (byte) addresses
+        word_t app[app_num_words<app_t, BG, CHECK_IDX>::value]; // APP values
+
+        app_addr_gen.template generate<CHECK_IDX>(app_addr);
+        return c2v_cache.process_row_sign_change<CHECK_IDX>(params, app, app_addr, smem_offset);
+    }
+
     template <int CHECK_IDX>
     __device__
     bool iter_sync_check_done()
@@ -283,6 +296,46 @@ struct ldpc_schedule_dynamic_desc<1,
         (*this).template process_row<44>(); if((*this).template iter_sync_check_done<44>()) return;
         (*this).template process_row<45>(); __syncthreads();
     }
+
+    template <int CHECK_IDX>
+    __device__
+    bool do_rows_first4_sign_change()
+    {
+        bool sign_change = false;
+        if constexpr(CHECK_IDX < 4)
+        {
+            sign_change |= (*this).template process_row_sign_change<CHECK_IDX>();
+        }
+        else
+        {
+            (*this).template process_row<CHECK_IDX>();
+        }
+
+        bool done = false;
+        if constexpr(CHECK_IDX < 3)
+        {
+            __syncthreads();
+        }
+        else
+        {
+            done = (*this).template iter_sync_check_done<CHECK_IDX>();
+        }
+
+        if constexpr((CHECK_IDX + 1) < MAX_PARITY_ROWS)
+        {
+            if(!done)
+            {
+                sign_change |= do_rows_first4_sign_change<CHECK_IDX + 1>();
+            }
+        }
+        return sign_change;
+    }
+
+    __device__
+    bool do_iteration_first4_sign_change()
+    {
+        return do_rows_first4_sign_change<0>();
+    }
 };
 
 // ldpc_schedule_dynamic_desc specialization for base graph 2
@@ -377,6 +430,170 @@ struct ldpc_schedule_dynamic_desc<2,
         (*this).template process_row<39>(); if((*this).template iter_sync_check_done<39>()) return;
         (*this).template process_row<40>(); if((*this).template iter_sync_check_done<40>()) return;
         (*this).template process_row<41>(); __syncthreads();
+    }
+};
+
+////////////////////////////////////////////////////////////////////////
+// ldpc_schedule_dynamic_desc_reverse
+// Runtime-parity dynamic schedule that processes rows from highest to lowest.
+// Rows above params.num_parity_nodes are skipped, and reverse mode deliberately
+// synchronizes after every processed row instead of using the forward schedule's
+// precomputed sync points.
+template <int                  BG,
+          class                TAPPLoc,
+          class                TC2VCache,
+          class                TKernelParams,
+          class                BGDesc,
+          int                  MIN_PARITY_ROWS,
+          int                  MAX_PARITY_ROWS>
+struct ldpc_schedule_dynamic_desc_reverse :
+    ldpc_schedule_dynamic_desc<BG,
+                               TAPPLoc,
+                               TC2VCache,
+                               TKernelParams,
+                               BGDesc,
+                               MIN_PARITY_ROWS,
+                               MAX_PARITY_ROWS>
+{
+    typedef ldpc_schedule_dynamic_desc<BG,
+                                       TAPPLoc,
+                                       TC2VCache,
+                                       TKernelParams,
+                                       BGDesc,
+                                       MIN_PARITY_ROWS,
+                                       MAX_PARITY_ROWS> inherited_t;
+    typedef BGDesc bg_desc_t;
+
+    __device__
+    ldpc_schedule_dynamic_desc_reverse(const TKernelParams& params,
+                                       const bg_desc_t&     bg_desc,
+                                       int                  soffset,
+                                       unsigned int         t_idx) : inherited_t(params, bg_desc, soffset, t_idx)
+    {
+    }
+
+    __device__
+    ldpc_schedule_dynamic_desc_reverse(char*                smem,
+                                       const TKernelParams& params,
+                                       const bg_desc_t&     bg_desc,
+                                       int                  soffset,
+                                       unsigned int         t_idx) : inherited_t(smem, params, bg_desc, soffset, t_idx)
+    {
+    }
+
+    template <int CHECK_IDX>
+    __device__
+    void process_reverse_row()
+    {
+        if(this->params.num_parity_nodes > CHECK_IDX)
+        {
+            (*this).template process_row<CHECK_IDX>();
+            __syncthreads();
+        }
+        if constexpr(CHECK_IDX > 0)
+        {
+            process_reverse_row<CHECK_IDX - 1>();
+        }
+    }
+
+    __device__
+    void do_iteration()
+    {
+        process_reverse_row<MAX_PARITY_ROWS - 1>();
+    }
+};
+
+////////////////////////////////////////////////////////////////////////
+// ldpc_schedule_dynamic_desc_lowp
+//
+// Bounded low-p schedule: unrolls ONLY rows 0..MAX_PARITY_ROWS-1. Unlike the
+// full ldpc_schedule_dynamic_desc (which hard-unrolls all 46/42 rows), it never
+// instantiates process_row<> beyond the small parity range, so a kernel using
+// an all-register C2V cache (c2v_cache_register) can size that cache to
+// MAX_PARITY_ROWS instead of the worst-case 46/42 — collapsing register
+// pressure enough to fit 2 CTAs/SM. The recursive do_rows<> unroll reproduces
+// the full schedule's per-row sync/termination semantics (via
+// iter_sync_check_done, which is identical for BG1 and BG2 in this row range),
+// so numerical behavior matches the full schedule for the covered p. Same
+// template signature as ldpc_schedule_dynamic_desc so it can be swapped in as a
+// template-template argument.
+template <int                  BG,
+          class                TAPPLoc,
+          class                TC2VCache,
+          class                TKernelParams,
+          class                BGDesc,
+          int                  MIN_PARITY_ROWS,
+          int                  MAX_PARITY_ROWS>
+struct ldpc_schedule_dynamic_desc_lowp :
+    ldpc_schedule_dynamic_desc_base<BG,
+                                    TAPPLoc,
+                                    TC2VCache,
+                                    TKernelParams,
+                                    BGDesc,
+                                    MIN_PARITY_ROWS,
+                                    MAX_PARITY_ROWS>
+{
+    typedef ldpc_schedule_dynamic_desc_base<BG,
+                                            TAPPLoc,
+                                            TC2VCache,
+                                            TKernelParams,
+                                            BGDesc,
+                                            MIN_PARITY_ROWS,
+                                            MAX_PARITY_ROWS> inherited_t;
+    typedef BGDesc bg_desc_t;
+    //------------------------------------------------------------------
+    __device__
+    ldpc_schedule_dynamic_desc_lowp(const TKernelParams& params,
+                                    const bg_desc_t&     bg_desc,
+                                    int                  soffset,
+                                    unsigned int         t_idx) : inherited_t(params, bg_desc, soffset, t_idx)
+    {
+    }
+    //------------------------------------------------------------------
+    // do_rows(): recursively unroll rows IDX..MAX_PARITY_ROWS-1. For each row,
+    // iter_sync_check_done<IDX> performs the required __syncthreads() and
+    // returns true at the runtime last row (IS_LAST_ROW) or the compile-time
+    // max row, terminating the iteration. This matches the full schedule's
+    // per-row semantics while instantiating process_row<> only up to
+    // MAX_PARITY_ROWS-1.
+    template <int IDX>
+    __device__
+    void do_rows()
+    {
+        (*this).template process_row<IDX>();
+        const bool done = (*this).template iter_sync_check_done<IDX>();
+        if constexpr((IDX + 1) < MAX_PARITY_ROWS)
+        {
+            if(!done) { do_rows<IDX + 1>(); }
+        }
+    }
+    //------------------------------------------------------------------
+    // do_rows_reverse(): reverse row order for experiments. Rows above the
+    // runtime parity count are skipped, and every processed row synchronizes.
+    template <int IDX>
+    __device__
+    void do_rows_reverse()
+    {
+        if(this->params.num_parity_nodes > IDX)
+        {
+            (*this).template process_row<IDX>();
+            __syncthreads();
+        }
+        if constexpr(IDX > 0)
+        {
+            do_rows_reverse<IDX - 1>();
+        }
+    }
+    //------------------------------------------------------------------
+    // do_iteration()
+    __device__
+    void do_iteration()
+    {
+#if CUPHY_LDPC_REVERSE_ROWS
+        do_rows_reverse<MAX_PARITY_ROWS - 1>();
+#else
+        do_rows<0>();
+#endif
     }
 };
 

@@ -23,6 +23,7 @@ import sys
 from collections import OrderedDict
 
 from cicd_threshold_generate import generate_thresholds
+from aerial_postproc.cicd_variants import absolute_template_candidates
 from aerial_postproc.logparse import parse_tc_info
 
 MMIMO_PATTERNS = [
@@ -37,17 +38,21 @@ MMIMO_PATTERNS = [
 
 def find_matching_template(template_dir, pattern, contains_eh):
     """
-    Find the matching generic perf_requirements template from the absolute/ directory.
+    Find the matching perf_requirements template from the absolute/ directory.
 
-    Selects based on mMIMO (determined by pattern) and EH status.
+    Prefers a variant-specific template when the pattern maps to a known variant
+    (via ABSOLUTE_THRESHOLD_VARIANT_MAP in aerial_postproc.cicd_variants), then
+    falls back to the generic mMIMO x EH template. This mirrors the runtime
+    absolute-file selection in parse_test_config_params.py so generated
+    gating/warning files match the absolute reference.
     """
     mmimo = pattern.lower() in MMIMO_PATTERNS
     tr_suffix = "64tr" if mmimo else "4tr"
     eh_suffix = "eh" if contains_eh else "noneh"
-    filename = f"perf_requirements_{tr_suffix}_{eh_suffix}.csv"
-    filepath = os.path.join(template_dir, filename)
-    if os.path.exists(filepath):
-        return filepath
+    for filename in absolute_template_candidates(tr_suffix, eh_suffix, pattern):
+        filepath = os.path.join(template_dir, filename)
+        if os.path.exists(filepath):
+            return filepath
     return None
 
 

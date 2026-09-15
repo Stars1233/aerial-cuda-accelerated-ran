@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,7 +37,7 @@ if [[ "$RUN_COMPUTE_SANITIZER" == 1 ]]; then
    # Print version used
    echo -n "compute-sanitizer: "
    $COMPUTE_SANITIZER_EXEC -v  | grep "Version"
-   compute_sanitizer_cmd_prefix="${COMPUTE_SANITIZER_EXEC} --error-exitcode 1 --tool memcheck --leak-check full"
+   compute_sanitizer_cmd_prefix="${COMPUTE_SANITIZER_EXEC} --error-exitcode 1 --tool memcheck --leak-check full --report-api-errors=explicit"
 else
    compute_sanitizer_cmd_prefix=""
 fi

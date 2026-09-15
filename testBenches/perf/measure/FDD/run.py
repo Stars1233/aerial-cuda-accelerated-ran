@@ -16,12 +16,27 @@
 import json
 import numpy as np
 import os
+import subprocess
 import uuid
 import sys
+from typing import Optional
 
 from .traffic import traffic_avg, traffic_het
 from .execute import run
 from .properties import auto_het_subs, auto_avg_subs
+
+
+def _git_commit_id(short_len: int = 8) -> Optional[str]:
+    """Return the aerial_sdk HEAD commit id truncated to short_len chars, or None if unavailable."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    return out[:short_len] if out else None
 
 
 def run_FDD(args, sms, mig=None):
@@ -81,7 +96,15 @@ def run_FDD(args, sms, mig=None):
 
             system = f"CUDA_VISIBLE_DEVICES={mig} CUDA_MPS_PIPE_DIRECTORY={mig_gpu} CUDA_LOG_DIRECTORY={mig_gpu}"
 
-        system = " ".join([system, "nvidia-cuda-mps-control -d"])
+        if not args.is_use_green_contexts:
+            system = " ".join([system, "nvidia-cuda-mps-control -d"])
+        elif args.is_enable_mps_for_green_contexts:
+            system = " ".join([system, "nvidia-cuda-mps-control -d"])
+        else:
+            system = (
+                "if pgrep -f '(^|/)nvidia-cuda-mps-control -d$' >/dev/null; then "
+                f"echo quit | {system} nvidia-cuda-mps-control; fi"
+            )
 
         os.system(system)
 
@@ -95,6 +118,11 @@ def run_FDD(args, sms, mig=None):
         d = dict(vars(args))
         d.pop("inline_config_obj", None)
         d.pop("inline_uc_obj", None)
+        commit = _git_commit_id()
+        if not commit:
+            print("Warning: could not resolve aerial_sdk git commit id; recording git_commit=unknown", file=sys.stderr)
+            commit = "unknown"
+        d["git_commit"] = commit
         return d
 
     if args.is_power:

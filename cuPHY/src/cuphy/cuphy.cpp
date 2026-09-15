@@ -27,10 +27,6 @@
 #include "channel_eq.hpp"
 #include "channel_est.hpp"
 #include "pusch_rssi.hpp"
-#include "rate_matching.hpp"
-#include "crc_encode.hpp"
-#include "dl_rate_matching.hpp"
-#include "ldpc.hpp"
 #include "modulation_mapper.hpp"
 #include "pdsch_dmrs.hpp"
 #include "polar_encoder.hpp"
@@ -63,55 +59,6 @@
 
 #include <vector>
 
-
-////////////////////////////////////////////////////////////////////////
-// cuphyBfcCoefCompute()
-cuphyStatus_t CUPHYWINAPI cuphyBfcCoefCompute(unsigned int            nBSAnts,
-                                              unsigned int            nLayers,
-                                              unsigned int            Nprb,
-                                              cuphyTensorDescriptor_t tDescH,
-                                              const void*             HAddr,
-                                              cuphyTensorDescriptor_t tDescLambda,
-                                              const void*             lambdaAddr,
-                                              cuphyTensorDescriptor_t tDescCoef,
-                                              void*                   coefAddr,
-                                              cuphyTensorDescriptor_t tDescDbg,
-                                              void*                   dbgAddr,
-                                              cudaStream_t            strm)
-{
-    //------------------------------------------------------------------
-    // Validate inputs
-    if(!tDescH ||
-       !HAddr ||
-       !tDescLambda ||
-       !lambdaAddr ||
-       !tDescCoef ||
-       !coefAddr ||
-       !tDescDbg ||
-       !dbgAddr)
-    {
-        return CUPHY_STATUS_INVALID_ARGUMENT;
-    }
-
-    //------------------------------------------------------------------
-    // clang-format off
-    const_tensor_pair tPairH       (static_cast<const tensor_desc&>(*tDescH)     ,  HAddr);
-    const_tensor_pair tPairLambda  (static_cast<const tensor_desc&>(*tDescLambda),  lambdaAddr);
-    tensor_pair       tPairCoef    (static_cast<const tensor_desc&>(*tDescCoef)  ,  coefAddr);
-    tensor_pair       tPairDbg     (static_cast<const tensor_desc&>(*tDescDbg)   ,  dbgAddr);
-    // clang-format on
-
-    bfw_coefComp::bfcCoefCompute(static_cast<uint32_t>(nBSAnts),
-                        static_cast<uint32_t>(nLayers),
-                        static_cast<uint32_t>(Nprb),
-                        tPairH,
-                        tPairLambda,
-                        tPairCoef,
-                        tPairDbg,
-                        strm);
-
-    return CUPHY_STATUS_SUCCESS;
-}
 
 ////////////////////////////////////////////////////////////////////////
 // cuphyCreateBfwCoefComp()
@@ -720,6 +667,8 @@ cuphyStatus_t CUPHYWINAPI cuphySetupPuschRxChEqSoftDemap(cuphyPuschRxChEqHndl_t 
                                                          uint16_t                      nMaxPrb,
                                                          uint8_t                       enableCfoCorrection,
                                                          uint8_t                       enablePuschTdi,
+                                                         uint8_t                       openRanFunctionalSplitOption,
+                                                         uint8_t                       kernelSelOption,
                                                          uint16_t                      symbolBitmask,
                                                          uint8_t                       enableCpuToGpuDescrAsyncCpy,
                                                          void*                         pDynDescrsCpu,
@@ -740,6 +689,8 @@ cuphyStatus_t CUPHYWINAPI cuphySetupPuschRxChEqSoftDemap(cuphyPuschRxChEqHndl_t 
                                  nMaxPrb,
                                  enableCfoCorrection,
                                  enablePuschTdi,
+                                 openRanFunctionalSplitOption,
+                                 kernelSelOption,
                                  symbolBitmask,
                                  (0 != enableCpuToGpuDescrAsyncCpy) ? true : false,
                                  dynDescrVecCpu,
@@ -1014,65 +965,6 @@ cuphyStatus_t CUPHYWINAPI cuphyRunPolarEncRateMatchSSBs(
     CUresult e = launch_kernel(pEncdRmSSBCfg->kernelNodeParamsDriver, strm);
     return (e == CUDA_SUCCESS) ? CUPHY_STATUS_SUCCESS : CUPHY_STATUS_INTERNAL_ERROR;
 
-}
-
-////////////////////////////////////////////////////////////////////////
-// cuphyCrcEncodeGetDescrInfo()
-
-cuphyStatus_t CUPHYWINAPI cuphyCrcEncodeGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes)
-{
-    if(!pDescrSizeBytes || !pDescrAlignBytes)
-    {
-        return CUPHY_STATUS_INVALID_ARGUMENT;
-    }
-    *pDescrSizeBytes  = sizeof(crcEncodeDescr_t);
-    *pDescrAlignBytes = alignof(crcEncodeDescr_t);
-    return CUPHY_STATUS_SUCCESS;
-}
-
-////////////////////////////////////////////////////////////////////////
-// cuphyPrepareCrcEncodeGetDescrInfo()
-
-cuphyStatus_t CUPHYWINAPI cuphyPrepareCrcEncodeGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes)
-{
-    if(!pDescrSizeBytes || !pDescrAlignBytes)
-    {
-        return CUPHY_STATUS_INVALID_ARGUMENT;
-    }
-    *pDescrSizeBytes  = sizeof(prepareCrcEncodeDescr_t);
-    *pDescrAlignBytes = alignof(prepareCrcEncodeDescr_t);
-    return CUPHY_STATUS_SUCCESS;
-}
-
-////////////////////////////////////////////////////////////////////////
-// cuphyLDPCEncodeGetDescrInfo()
-
-cuphyStatus_t CUPHYWINAPI cuphyLDPCEncodeGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes, uint16_t maxUEs, size_t* pWorkspaceBytes)
-{
-    if(!pDescrSizeBytes || !pDescrAlignBytes || !pWorkspaceBytes)
-    {
-        return CUPHY_STATUS_INVALID_ARGUMENT;
-    }
-    //*pDescrSizeBytes = sizeof(ldpcEncodeDescr_t);
-    //*pDescrAlignBytes = alignof(ldpcEncodeDescr_t);
-    *pDescrSizeBytes  = sizeof(ldpcEncodeDescr_t_array);
-    *pDescrAlignBytes = alignof(ldpcEncodeDescr_t_array);
-    *pWorkspaceBytes  = 2 * maxUEs * sizeof(LDPC_output_t); // 2x because it includes output and input
-    return CUPHY_STATUS_SUCCESS;
-}
-
-////////////////////////////////////////////////////////////////////////
-// cuphyDlRateMatchingGetDescrInfo()
-
-cuphyStatus_t CUPHYWINAPI cuphyDlRateMatchingGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes)
-{
-    if(!pDescrSizeBytes || !pDescrAlignBytes)
-    {
-        return CUPHY_STATUS_INVALID_ARGUMENT;
-    }
-    *pDescrSizeBytes  = sizeof(dlRateMatchingDescr_t);
-    *pDescrAlignBytes = alignof(dlRateMatchingDescr_t);
-    return CUPHY_STATUS_SUCCESS;
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -1634,6 +1526,20 @@ cuphyStatus_t CUPHYWINAPI cuphySetupPucchF3Rx(cuphyPucchF3RxHndl_t       pucchF3
     {
         return CUPHY_STATUS_INVALID_ARGUMENT;
     }
+
+    const uint16_t nF3UcisToValidate = std::min<uint16_t>(nF3Ucis, CUPHY_PUCCH_F3_MAX_UCI);
+    for(uint16_t uciIdx = 0; uciIdx < nF3UcisToValidate; ++uciIdx)
+    {
+        if(pF3UciPrms[uciIdx].groupHopFlag && pF3UciPrms[uciIdx].sequenceHopFlag)
+        {
+            NVLOGE_FMT(NVLOG_PUCCH,
+                       AERIAL_CUPHY_EVENT,
+                       "Invalid PUCCH F3 hopping config for UCI {}: groupHopFlag and sequenceHopFlag are mutually exclusive",
+                       uciIdx);
+            return CUPHY_STATUS_INVALID_ARGUMENT;
+        }
+    }
+
     pucchF3Rx* pPucchF3Rx = static_cast<pucchF3Rx*>(pucchF3RxHndl);
 
     pPucchF3Rx->setup(pDataRx,
@@ -2017,6 +1923,13 @@ cuphyStatus_t cuphyDemodulateSymbol(cuphyContext_t          context,
                                     float                   noiseVariance,
                                     cudaStream_t            strm)
 {
+    std::array<cuphyDataType_t, 4> valid_llr_types =
+    {
+        CUPHY_R_16F,
+        CUPHY_R_32F,
+        CUPHY_R_8F_E4M3,
+        CUPHY_R_8F_E5M2
+    };
     //------------------------------------------------------------------
     // Validate inputs
     if(!context ||
@@ -2032,15 +1945,16 @@ cuphyStatus_t cuphyDemodulateSymbol(cuphyContext_t          context,
     }
     tensor_desc& tLLRDesc = static_cast<tensor_desc&>(*tLLR);
     tensor_desc& tSymDesc = static_cast<tensor_desc&>(*tSym);
-    if((tLLRDesc.type() != CUPHY_R_32F) &&
-       (tLLRDesc.type() != CUPHY_R_16F))
+    if(valid_llr_types.end() == std::find(valid_llr_types.begin(),
+                                          valid_llr_types.end(),
+                                          tLLRDesc.type()))
     {
-        return CUPHY_STATUS_UNSUPPORTED_CONFIG;
+        return CUPHY_STATUS_UNSUPPORTED_TYPE;
     }
     if((tSymDesc.type() != CUPHY_C_32F) &&
        (tSymDesc.type() != CUPHY_C_16F))
     {
-        return CUPHY_STATUS_UNSUPPORTED_CONFIG;
+        return CUPHY_STATUS_UNSUPPORTED_TYPE;
     }
     //------------------------------------------------------------------
     cuphy_i::context& ctx = static_cast<cuphy_i::context&>(*context);
@@ -2068,6 +1982,11 @@ cuphyStatus_t CUPHYWINAPI cuphySetGenericEmptyKernelNodeParams(CUDA_KERNEL_NODE_
 cuphyStatus_t CUPHYWINAPI cuphySetEmptyKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams)
 {
     return internalCuphySetEmptyKernelNodeParams(pNodeParams);
+}
+
+cuphyStatus_t CUPHYWINAPI cuphySetDelayKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, void** pKernelParams)
+{
+    return internalCuphySetDelayKernelNodeParams(pNodeParams, pKernelParams);
 }
 
 void CUPHYWINAPI cuphySetD2HMemcpyNodeParams(CUDA_MEMCPY3D *memcpyParams, void* src_d, void* dst_h, size_t size_in_bytes) {

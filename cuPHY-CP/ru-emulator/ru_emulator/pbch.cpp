@@ -326,7 +326,11 @@ int RU_Emulator::validate_pbch(uint8_t cell_index, const struct oran_packet_head
             ++pbch_object.throughput_slot_counters[cell_index];
         }
         prev_pbch_time = curr_pbch_time;
-        ++pbch_object.total_slot_counters[cell_index];
+        // Test-bench mode: only count an error-free slot as completed.
+        if (!opt_dlc_tb || !pbch_object.invalid_flag[cell_index][launch_pattern_slot])
+        {
+            ++pbch_object.total_slot_counters[cell_index];
+        }
         pbch_object.invalid_flag[cell_index][launch_pattern_slot] = false;
         if(pbch_object.init_slot_counters[cell_index].load() <= pbch_object.total_slot_counters[cell_index].load())
         {

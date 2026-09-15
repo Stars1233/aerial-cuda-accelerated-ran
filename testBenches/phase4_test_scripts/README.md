@@ -10,12 +10,17 @@ The recommended way to run tests is using the test configuration parser, which a
 
 1. **Reserve and log into a pair of lockable systems** (DU and RU nodes)
 2. **Ensure codebase is on shared NFS** - All nodes must have access to the same `$cuBB_SDK` directory via shared network filesystem
-3. **Deploy containers:**
+3. **Configure and verify the PTP roles:**
+   - These Phase-4 scripts do not install or reconfigure PTP.
+   - The Aerial host installer defaults to `PTP_ROLE=client`, which configures the node as the PTP slave/timeReceiver for use with an external grandmaster.
+   - For a direct DU/RU-emulator pair without an external grandmaster, provision the DU as `client` and the RU-emulator host as `master`. Pass the role through the platform-specific `make install` commands in [`cubb_scripts/install/README.md`](../../cubb_scripts/install/README.md).
+   - Verify that both nodes are PTP synchronized before running the test.
+4. **Deploy containers:**
    - DU node: Either two containers (DU1 for main operations, DU2 for testMAC) OR one container with two sessions
    - RU node: One container (RU)
-4. **Prepare test information:**
+5. **Prepare test information:**
    - Test case string (e.g., `F08_6C_79_MODCOMP_STT480000_EH_1P`)
-   - Host configuration (e.g., `CG1_R750`, `CG1_CG1`, or `GL4_R750`)
+   - Host configuration (e.g., `CG1_R750`, `CG1_CG1`, `GL4_R750`, or `MGX1_MGX1`)
 
 ### Test Configuration and Setup
 
@@ -46,12 +51,47 @@ The recommended way to run tests is using the test configuration parser, which a
 | DU1 | `$cuBB_SDK/testBenches/phase4_test_scripts/run2_cuPHYcontroller.sh $RUN2_CUPHYCONTROLLER_PARAMS` | Start cuPHY controller |
 | DU2 | `source test_params.sh`<br>`$cuBB_SDK/testBenches/phase4_test_scripts/run3_testMAC.sh $RUN3_TESTMAC_PARAMS` | Start testMAC (separate container on DU) |
 
+#### Speeding up RU-emulator startup (local TV staging)
+
+When `$cuBB_SDK` (and therefore `testVectors/`) is on a shared NFS mount, `ru_emulator`'s
+`load_tvs()` step reads the full test-vector working set over NFS on every cold run. For a
+typical case this is multiple GiB and dominates startup (e.g. F08 6C/79 = 110 files / ~4.2 GiB,
+~37 s at ~112 MiB/s NFS).
+
+`run1_RU.sh --stage-local` copies that working set to fast local storage once, then runs the
+emulator against the local copy (reads at RAM/NVMe speed, ~40× faster). Staging is **idempotent**:
+repeat runs of the same test re-stage nothing (a few hundred ms), so the NFS read cost is paid
+only the first time (or when the TVs change).
+
+```bash
+# Stage to RAM (default: /dev/shm/cubb_tv_stage tmpfs), then run:
+$cuBB_SDK/testBenches/phase4_test_scripts/run1_RU.sh $RUN1_RU_PARAMS --stage-local
+
+# Stage to a specific local path instead (e.g. local NVMe scratch). Implies --stage-local:
+$cuBB_SDK/testBenches/phase4_test_scripts/run1_RU.sh $RUN1_RU_PARAMS --stage-dir /host/scratch/cubb_tv_stage
+```
+
+- `--stage-local` alone stages to `${TV_STAGE_DIR:-/dev/shm/cubb_tv_stage}` (RAM).
+- `--stage-dir <path>` stages to `<path>` (use for very large working sets where RAM is tight); it
+  enables staging on its own, so `--stage-local` is not also required.
+- Add `--stage-local` to `RUN1_RU_PARAMS` to make staging the default for a test.
+- `/dev/shm` is cleared on reboot, so the first run after a reboot re-stages automatically.
+
+The working set can also be staged independently of the run via
+`stage_tvs_local.sh` (run with `-h` for options); it prints the `TV_BASE_PATH` to pass to
+`run1_RU.sh --tv-base-path`.
+
 ## Test Case String Format
 
-Format: `F08_<cells>C_<pattern>_<modifiers>`
+Use one of the following formats:
+
+- Standard patterns: `F08_<total-cells>C_<pattern>_<modifiers>`
+- Carrier aggregation patterns: `F08_<group-1-cells>C_<group-2-cells>C[_<additional-group-cells>C...]_<pattern>_<modifiers>`
 
 - `F08` - Required prefix for performance test cases
-- `<cells>C` - Number of cells (e.g., `6C`, `20C`)
+- Cell topology:
+  - Standard patterns use one total cell count (e.g., `6C`, `20C`).
+  - Carrier aggregation patterns use one cell count per carrier group (e.g., `1C_2C`).
 - `<pattern>` - Pattern number (e.g., `69`, `59c`)
 - `<modifiers>` - Optional modifiers in any order:
   - `BFP9` or `BFP14` - BFP compression with specified bits
@@ -65,6 +105,7 @@ Format: `F08_<cells>C_<pattern>_<modifiers>`
   - `NICD` - Enable NIC timing logs
   - `RUWT` - Enable RU C-plane worker tracing logs
   - `NOPOST` - Enable reduced logging mode (disables detailed tracing and processing time logs)
+  - `PERF` - Enable automatic perf recording of DL/UL worker threads (syscall tracing via `perf_trace_workers.sh`; output to `$cuBB_SDK/perf/`)
 
 ### Host Configuration
 
@@ -74,7 +115,16 @@ Valid combinations:
 - `CG1_R750` - Grace (CG1) DU with x86 (R750) RU
 - `CG1_CG1` - Grace DU with Grace RU
 - `GL4_R750` - Grace+L4 (GL4) DU with x86 RU
+- `MGX1_MGX1` - MGX ARC Pro DU with MGX ARC Pro RU
 
+### Carrier Aggregation Patterns
+
+Patterns `52a`, `52b`, and `52c` require two cell-count groups. Pattern `52d` requires three groups. The total number of cells is the sum of the groups.
+
+Examples:
+
+- `F08_4C_4C_52a_BFP9_STT455000_EH_1P` selects `launch_pattern_F08_4C_4C_52a.yaml` and runs 8 total cells.
+- `F08_1C_1C_2C_52d_BFP9_STT455000_EH_1P` selects `launch_pattern_F08_1C_1C_2C_52d.yaml` and runs 4 total cells.
 
 ## Parser Examples
 
@@ -93,6 +143,11 @@ $cuBB_SDK/testBenches/phase4_test_scripts/parse_test_config_params.sh "F08_20C_5
 $cuBB_SDK/testBenches/phase4_test_scripts/parse_test_config_params.sh "F08_6C_79_MODCOMP_STT480000_EH_NICD_RUWT_1P" "CG1_R750" test_params.sh
 ```
 
+### With perf syscall tracing on DL/UL workers:
+```bash
+$cuBB_SDK/testBenches/phase4_test_scripts/parse_test_config_params.sh "F08_6C_79_MODCOMP_STT480000_EH_1P_PERF" "CG1_R750" test_params.sh
+```
+
 ### With custom build directories:
 
 By default, the parsing scripts will determine which preset configuration to run the test with and the build artifacts will be in build.$PRESET.$(uname -m).
@@ -101,6 +156,12 @@ However, if desired, the --custom-build-dir flag can be used, which will tell al
 ```bash
 $cuBB_SDK/testBenches/phase4_test_scripts/parse_test_config_params.sh "F08_6C_79_MODCOMP_STT480000_EH_1P" "CG1_R750" test_params.sh \
     --custom-build-dir custom
+```
+
+### Carrier aggregation with a 4-cell + 4-cell topology:
+
+```bash
+$cuBB_SDK/testBenches/phase4_test_scripts/parse_test_config_params.sh "F08_4C_4C_52a_BFP9_STT455000_EH_1P" "CG1_CG1" test_params.sh
 ```
 
 ## Environment Variables Set by Parser
@@ -120,10 +181,13 @@ $cuBB_SDK/testBenches/phase4_test_scripts/parse_test_config_params.sh "F08_6C_79
 - `PARSE_LOGS_PARAMS` - Parameters for post_processing_parse.sh
 - `POST_PROCESSING_PERF_PARAMS` - Parameters for post_processing_analyze.sh --perf-metrics
 - `POST_PROCESSING_COMPARE_PARAMS` - Parameters for post_processing_analyze.sh --compare-logs
+- `POST_PROCESSING_CPU_TIMELINE_PARAMS` - Parameters for post_processing_analyze.sh --cpu-timeline
+- `POST_PROCESSING_THRESHOLD_SUMMARY_PARAMS` - Parameters for post_processing_analyze.sh --threshold-summary
 - `POST_PROCESSING_GATING_PARAMS` - Parameters for post_processing_analyze.sh --gating-threshold
 - `POST_PROCESSING_WARNING_PARAMS` - Parameters for post_processing_analyze.sh --warning-threshold
 - `POST_PROCESSING_ABSOLUTE_PARAMS` - Parameters for post_processing_analyze.sh --absolute-threshold
 - `POST_PROCESSING_LATENCY_PARAMS` - Parameters for post_processing_analyze.sh --latency-summary (NICD only)
+- `POST_PROCESSING_LATENCY_TIMELINE_PARAMS` - Parameters for post_processing_analyze.sh --latency-timeline (NICD only)
 
 ## MUMIMO Patterns
 
@@ -143,6 +207,13 @@ $cuBB_SDK/testBenches/phase4_test_scripts/test_config.sh 69 --compression=4 --nu
 $cuBB_SDK/testBenches/phase4_test_scripts/run1_RU.sh
 $cuBB_SDK/testBenches/phase4_test_scripts/run2_cuPHYcontroller.sh
 $cuBB_SDK/testBenches/phase4_test_scripts/run3_testMAC.sh
+```
+
+For carrier aggregation, pass the exact topology to the copy and configuration steps:
+
+```bash
+$cuBB_SDK/testBenches/phase4_test_scripts/copy_test_files.sh 52a --cell-topology 4C_4C
+$cuBB_SDK/testBenches/phase4_test_scripts/test_config.sh 52a --num-cells=8 --cell-topology=4C_4C
 ```
 
 ## Multi-L2 test
@@ -249,6 +320,8 @@ Three scripts are provided for post-processing test results:
 - **post_processing_analyze.sh** - Runs downstream processing on already-parsed binary data
 - **post_processing_cicd.sh** - CICD wrapper that runs the full sequence with proper return codes
 
+Timing windows (max-duration, ignore-duration) and the default number of parallel processes are defined in **post_processing_defaults.cfg**. This file is the single source of truth shared by `post_processing_parse.sh` and `post_processing_analyze.sh`. Each script automatically applies the correct defaults for its mode (e.g., shorter windows for timeline plots, longer windows for performance metrics). Users can still override with explicit `--max-duration` / `--ignore-duration` flags.
+
 ### Using Post-Processing with Generated Parameters
 
 **CICD Workflow (Simple - Recommended):**
@@ -257,6 +330,12 @@ source test_params.sh
 ./post_processing_cicd.sh phy.log testmac.log ru.log ./output $POST_PROCESSING_CICD_PARAMS
 exit $?
 ```
+
+For PERF test cases, `$POST_PROCESSING_CICD_PARAMS` automatically expands to
+`--skip-log-analysis --perf-trace-dir $cuBB_SDK/perf`. This skips log parsing / metric
+extraction (steps 1-4) and runs only the futex/CUDA analysis steps (11-12). Since the
+parser also omits threshold flags, gating checks are naturally skipped. The PERF modifier
+changes worker thread scheduling to `SCHED_OTHER`, which invalidates normal latency metrics.
 
 **Developer Workflow (Granular):**
 ```bash
@@ -268,13 +347,16 @@ source test_params.sh
 # Step 2: Run individual post-processing as needed
 ./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_PERF_PARAMS
 ./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_COMPARE_PARAMS
+./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_CPU_TIMELINE_PARAMS
+./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_THRESHOLD_SUMMARY_PARAMS
+./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_ABSOLUTE_PARAMS
 ./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_GATING_PARAMS
 ./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_WARNING_PARAMS
-./post_processing_analyze.sh ./output/binary ./output $POST_PROCESSING_ABSOLUTE_PARAMS
 
 # NICD only (if POST_PROCESSING_LATENCY_PARAMS is set)
 if [[ -n "$POST_PROCESSING_LATENCY_PARAMS" ]]; then
     ./post_processing_analyze.sh ./output/binary_ls ./output $POST_PROCESSING_LATENCY_PARAMS
+    ./post_processing_analyze.sh ./output/binary_ls ./output $POST_PROCESSING_LATENCY_TIMELINE_PARAMS
 fi
 ```
 
@@ -297,7 +379,7 @@ Runs the expensive cicd_parse.py step to generate binary output folders.
 ```
 
 #### post_processing_analyze.sh
-Runs downstream processing on already-parsed binary data.
+Runs downstream processing on already-parsed binary data. Timing defaults are mode-dependent (from `post_processing_defaults.cfg`) and can be overridden with `--max-duration` / `--ignore-duration`.
 
 ```bash
 # Performance metrics extraction (creates perf.csv)
@@ -305,6 +387,13 @@ Runs downstream processing on already-parsed binary data.
 
 # Compare logs visualization
 ./post_processing_analyze.sh ./output/binary ./output --compare-logs --label "my_test" --mmimo
+
+# CPU timeline visualization
+./post_processing_analyze.sh ./output/binary ./output --cpu-timeline --label "my_test"
+
+# Threshold summary (informational, compares perf.csv against multiple requirement files)
+# NOTE: --threshold-summary must be the LAST flag; it consumes all remaining arguments
+./post_processing_analyze.sh ./output/binary ./output --threshold-summary /path/to/gating.csv /path/to/warning.csv -l gating warning
 
 # Gating threshold check
 ./post_processing_analyze.sh ./output/binary ./output --gating-threshold /path/to/gating_perf_requirements.csv
@@ -317,6 +406,9 @@ Runs downstream processing on already-parsed binary data.
 
 # Latency summary visualization (NICD)
 ./post_processing_analyze.sh ./output/binary_ls ./output --latency-summary --mmimo
+
+# Latency timeline visualization (NICD)
+./post_processing_analyze.sh ./output/binary_ls ./output --latency-timeline --label "my_test" --mmimo
 ```
 
 #### post_processing_cicd.sh
@@ -331,10 +423,22 @@ CICD wrapper that runs the full post-processing sequence with proper return code
     --mmimo --label my_test
 ```
 
+```bash
+# Perf trace workflow (for PERF test cases -- skip log analysis, no threshold gating)
+./post_processing_cicd.sh phy.log testmac.log ru.log ./output \
+    --skip-log-analysis --perf-trace-dir /opt/nvidia/cuBB/perf
+```
+
+`--skip-log-analysis` skips steps 1-4 (log parsing, metrics extraction, visualizations).
+`--perf-trace-dir` adds steps 11-12: `futex_cuda_summary_multi_thread.py` for per-thread
+futex/CUDA API attribution, and `futex_cuda_runs_summary.py` for cross-run collation.
+These flags are composable -- threshold gating and latency analysis are controlled
+independently by their own flags.
+
 Return codes:
-- 0 = All gating/absolute thresholds passed
+- 0 = All steps passed
 - 1 = Gating threshold failed OR absolute threshold failed OR processing error
-- Warning threshold failure does NOT cause return 1 (prints warning instead)
+- 2 = All steps passed, but warning threshold exceeded (for Slack notification)
 
 ## Additional Notes
 

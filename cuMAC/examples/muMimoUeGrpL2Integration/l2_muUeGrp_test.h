@@ -32,9 +32,6 @@ constexpr const char* YAML_L2_L1_NVIPC_CONFIG_PATH = "./cuMAC/examples/muMimoUeG
 
 constexpr int MAX_PATH_LEN = 1024; // maximum path length
 
-// Log TAG configured in nvlog
-constexpr int MU_TEST_TAG = (NVLOG_TAG_BASE_NVIPC + 0);
-
 constexpr uint16_t MAX_NUM_RNTI_PER_CELL = 65535; // max number of RNTIs per cell
 constexpr uint16_t MIN_RNTI = 1; // min C-RNTI
 constexpr uint16_t MAX_RNTI = 65535; // max C-RNTI
@@ -139,7 +136,7 @@ class l2_connected_ue_list_t {
 
         uint16_t get_num_connected_srs_ue() { // get the number of connected SRS UEs
             if (srs_ue_list.size() != m_num_srs_ue || srs_schedule_queue.size() != m_num_srs_ue) {
-                NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT, "L2-MAIN: %s: Number of SRS UEs in the connected UE list of cell %d is not consistent with the number of SRS UEs in the SRS schedule queue. Current number of SRS UEs connected: %d, number of SRS UEs in the SRS schedule queue: %d", __func__, m_cell_id, srs_ue_list.size(), srs_schedule_queue.size());
+                NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT, "L2-MAIN: %s: Number of SRS UEs in the connected UE list of cell %d is not consistent with the number of SRS UEs in the SRS schedule queue. Current number of SRS UEs connected: %zu, number of SRS UEs in the SRS schedule queue: %zu", __func__, m_cell_id, srs_ue_list.size(), srs_schedule_queue.size());
                 return 0xFFFF;
             }
             return srs_ue_list.size();
@@ -212,7 +209,7 @@ class l2_connected_ue_list_t {
 
         ue_id_rnti_t get_ue_id_rnti(uint16_t ue_idx) { // get the cuMAC 0-based ID and RNTI of a UE
             if (ue_idx >= srs_ue_list.size()) {
-                NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT, "L2-MAIN: %s: UE index %d is out of range in the connected UE list of cell %d. Current number of SRS UEs connected: %d", __func__, ue_idx, m_cell_id, srs_ue_list.size());
+                NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT, "L2-MAIN: %s: UE index %d is out of range in the connected UE list of cell %d. Current number of SRS UEs connected: %zu", __func__, ue_idx, m_cell_id, srs_ue_list.size());
                 return ue_id_rnti_t(0xFFFF, 0xFFFF, 0xFFFF, 0xFF);
             }
             return srs_ue_list[ue_idx];

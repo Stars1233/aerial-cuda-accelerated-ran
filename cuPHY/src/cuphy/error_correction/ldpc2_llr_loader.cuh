@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,8 +79,8 @@ tb_token warp_find_block_tb_token(const cuphyLDPCDecodeDesc_t& decode_desc,
 // input_codeword_addr
 // Provides the input LLR address for a given index for the tensor-
 // based LDPC decoder interface. It is expected that the index will be
-// blockIdx.x for 1 codeword at a time, and blockIdx.x * 2 for 2
-// 2 codewords at a time.
+// blockIdx.x for 1 codeword at a time, blockIdx.x * 2 for 2
+// 2 codewords at a time, blockIdx.x * 4 for 4 codewords at a time.
 template <typename T>
 struct input_codeword_addr
 {
@@ -631,6 +631,45 @@ template <> struct llr_op_clamp<__half, uint2>
     }
 };
 
+template <> struct llr_op_clamp<__nv_fp8_e4m3, uint4>
+{
+    __device__
+    static uint2 apply(const uint4& src, float clamp_value)
+    {
+        __half2 clampValue = __float2half2_rn(clamp_value);
+
+        word_t in_h[4];
+        in_h[0].u32 = src.x;
+        in_h[1].u32 = src.y;
+        in_h[2].u32 = src.z;
+        in_h[3].u32 = src.w;
+        word_t clamped_h[4];
+        clamped_h[0].f16x2 = clamp_signed(in_h[0].f16x2, clampValue);
+        clamped_h[1].f16x2 = clamp_signed(in_h[1].f16x2, clampValue);
+        clamped_h[2].f16x2 = clamp_signed(in_h[2].f16x2, clampValue);
+        clamped_h[3].f16x2 = clamp_signed(in_h[3].f16x2, clampValue);
+
+        word_t cvt[2];
+        half2_to_fp8x4_array<__nv_fp8_e4m3, 8>(cvt, clamped_h);
+
+        //if(0 == threadIdx.x)
+        //{
+        //    word_t out_h[4];
+        //    fp8x4_to_half2_array<__nv_fp8_e4m3, 4, 8>(out_h, cvt);
+        //    printf("in: %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f, out: %.3f %.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
+        //    __high2float(in_h[3].f16x2), __low2float(in_h[3].f16x2), __high2float(in_h[2].f16x2), __low2float(in_h[2].f16x2),
+        //    __high2float(in_h[1].f16x2), __low2float(in_h[1].f16x2), __high2float(in_h[0].f16x2), __low2float(in_h[0].f16x2),
+        //    __high2float(out_h[3].f16x2), __low2float(out_h[3].f16x2), __high2float(out_h[2].f16x2), __low2float(out_h[2].f16x2),
+        //    __high2float(out_h[1].f16x2), __low2float(out_h[1].f16x2), __high2float(out_h[0].f16x2), __low2float(out_h[0].f16x2));
+
+        //}
+        uint2 res;
+        res.x = cvt[0].u32;
+        res.y = cvt[1].u32;
+        return res;
+    }
+};
+
 ////////////////////////////////////////////////////////////////////////
 // llr_loader_variable_batch
 // Structure to load data from global to shared memory, when amount of
@@ -708,6 +747,32 @@ public:
     {
         ldpc_dec_loader_params<T> params(smem, kernelParams, decodeIndex);
         load_sync(params);
+    }
+    //------------------------------------------------------------------
+    // load_sync_token()
+    // Load LLR data and return a token that locates the CTA codeword,
+    // and can be used to locate decoder output.
+    __device__
+    static tb_token load_sync_token(char*                        smem,
+                                    const cuphyLDPCDecodeDesc_t& decodeDesc,
+                                    int                          decodeIndex,
+                                    tb_token*                    pToken)
+    {
+        // Threads in the first warp (only) will determine which codeword
+        // to process.
+        if(0 == (threadIdx.x / 32))
+        {
+            warp_find_block_tb_token<1>(decodeDesc, decodeIndex, pToken);
+        }
+        // Synchronize so that all threads in the CTA can access the
+        // token (in shared memory) stored by a thread in the first warp.
+        __syncthreads();
+        tb_token tok = *pToken;
+        ldpc_dec_loader_params<T> params(smem,
+                                         decodeDesc,
+                                         loader_token(tok));
+        load_sync(params);
+        return tok;
     }
     //------------------------------------------------------------------
     // load_sync_multi()
@@ -898,6 +963,142 @@ struct llr_loader_variable_batch_convert
             ldpc_dec_loader_params<T> params(smem + (i * LLR_STRIDE_BYTES),
                                              decodeDesc,
                                              cwConfig.cta_start_index + i);
+            load_sync(params);
+        }
+    }
+};
+
+////////////////////////////////////////////////////////////////////////
+// llr_loader_variable_batch_pre_convert
+// Structure to load data from global to shared memory, when amount of
+// data is not known until runtime. Conversion to a different APP type
+// is performed (e.g. converting from float to fp16). The provided
+// operator is applied to loaded data and is responsible for any clamp
+// or other modifications as well as conversion to the destination type.
+// Note that the destination type is determined from the ldpc_traits
+// for the TDst template parameter, and is typically a type appropriate
+// for vectorized loads (e.g. uint3 or uint4).
+// Example use:
+//
+// typedef llr_loader_variable_batch_pre_convert llr_loader_t;
+// extern __shared__ char smem[];
+// ldpc_dec_loader_params params;
+// llr_loader_t::load_sync(params);
+//
+// TDst:         type of LLR data to store in shared memory
+// TSrc:         type of LLR data loaded from global memory
+// BATCH_SIZE:   number of unrolled batched global loads
+// TLLROperator: operator to apply to loaded value (after conversion)
+template <typename TDst,
+          typename TSrc,
+          int BATCH_SIZE,
+          template <typename, typename> class TLLROperator>
+struct llr_loader_variable_batch_pre_convert
+{
+    using llr_ldg_t  = typename ldpc_traits<TSrc>::llr_ldg_t;  // The type to load LLR.
+    using llr_sts_t  = typename ldpc_traits<TDst>::llr_sts_t;  // The type to store LLR to shared memory.
+    using llr_src_t  = TSrc;                                   // LLR source data type
+    using llr_dst_t  = TDst;
+    using app_elem_t = TSrc;                                   // The source APP element type
+    using app_buf_t  = TDst;                                   // The APP type for the shared memory buffer
+
+    enum { LLR_BYTES_PER_THREAD_PER_LDG = sizeof(llr_ldg_t) };                               // Number of bytes loaded by each thread per LDG -- we use LDG.128.
+    enum { LLR_BYTES_PER_THREAD_PER_STS = sizeof(llr_sts_t) };                               // Number of bytes stored by each thread per STS
+    enum { LLR_ELEM_PER_THREAD_PER_LDG = LLR_BYTES_PER_THREAD_PER_LDG / sizeof(llr_src_t) }; // Number of elements loaded by each thread per LDG.
+    //------------------------------------------------------------------
+    // load_sync()
+    __device__
+    static void load_sync(const ldpc_dec_loader_params<llr_src_t>& params)
+    {
+        llr_ldg_t llr_[BATCH_SIZE]; // Register storage (GLOBAL --> REG --> SHMEM)
+
+        const char* gmem_c                          = static_cast<const char*>(params.src_gmem);
+        const int   LLR_BYTES_PER_CTA_PER_LDG       = LLR_BYTES_PER_THREAD_PER_LDG * blockDim.x;
+        const int   LLR_BYTES_PER_CTA_PER_STS       = LLR_BYTES_PER_THREAD_PER_STS * blockDim.x;
+        const int   LLR_LDG_BYTES_PER_CTA_PER_BATCH = LLR_BYTES_PER_CTA_PER_LDG * BATCH_SIZE;
+        const int   LLR_STS_BYTES_PER_CTA_PER_BATCH = LLR_BYTES_PER_CTA_PER_STS * BATCH_SIZE;
+        int         batchLoadOffset                 = threadIdx.x * LLR_BYTES_PER_THREAD_PER_LDG;
+        int         batchStoreOffset                = threadIdx.x * LLR_BYTES_PER_THREAD_PER_STS;
+        const int   LOAD_OFFSET_END                 = params.num_cw_elements * sizeof(llr_src_t);
+        while(batchLoadOffset < LOAD_OFFSET_END)
+        {
+            #pragma unroll
+            for(int ii = 0; ii < BATCH_SIZE; ++ii)
+            {
+                int loadOffset = batchLoadOffset + (ii * LLR_BYTES_PER_CTA_PER_LDG);
+                if(loadOffset < LOAD_OFFSET_END)
+                {
+                    int storeOffset = batchStoreOffset + (ii * LLR_BYTES_PER_CTA_PER_STS);
+                    llr_[ii]        = *reinterpret_cast<const llr_ldg_t*>(gmem_c + loadOffset);
+                    // Perform an operation on the LLR value (clamp, "None", ...) BEFORE conversion
+                    llr_sts_t storeValue = TLLROperator<llr_dst_t, llr_ldg_t>::apply(llr_[ii], params.clamp_value);
+                    *reinterpret_cast<llr_sts_t*>(params.dst_smem + storeOffset) = storeValue;
+                }
+            }
+            batchLoadOffset  += LLR_LDG_BYTES_PER_CTA_PER_BATCH;
+            batchStoreOffset += LLR_STS_BYTES_PER_CTA_PER_BATCH;
+        }
+        //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+        // Make sure the data is in shared memory.
+        __syncthreads();
+    }
+    //------------------------------------------------------------------
+    // load_sync()
+    __device__
+    static void load_sync(char*                     smem,
+                          const LDPC_kernel_params& kernelParams,
+                          int                       decodeIndex)
+    {
+        ldpc_dec_loader_params<llr_src_t> params(smem, kernelParams, decodeIndex);
+        load_sync(params);
+    }
+    //------------------------------------------------------------------
+    // load_sync_multi()
+    // Multiple codewords per CTA (small Z)
+    // All threads cooperate to load data for each codeword, one at a
+    // time.
+    __device__
+    static void load_sync_multi(char*                        smem,
+                                const LDPC_kernel_params&    kernelParams,
+                                const multi_codeword_config& cwConfig)
+    {
+        const int LLR_DST_STRIDE_BYTES = round_up_to_next(get_num_LLRs(kernelParams) * sizeof(llr_dst_t),
+                                                          sizeof(ldpc_traits<llr_dst_t>::llr_sts_t));
+        for(int i = 0; i < cwConfig.cta_codeword_count; ++i)
+        {
+            ldpc_dec_loader_params<llr_src_t> params(smem + (i * LLR_DST_STRIDE_BYTES),
+                                                     kernelParams,
+                                                     cwConfig.cta_start_index + i);
+            load_sync(params);
+        }
+    }
+    //------------------------------------------------------------------
+    // load_sync()
+    __device__
+    static void load_sync(char*                        smem,
+                          const cuphyLDPCDecodeDesc_t& decodeDesc,
+                          int                          decodeIndex)
+    {
+        ldpc_dec_loader_params<llr_src_t> params(smem, decodeDesc, decodeIndex);
+        load_sync(params);
+    }
+    //------------------------------------------------------------------
+    // load_sync_multi()
+    // Multiple codewords per CTA (small Z)
+    // All threads cooperate to load data for each codeword, one at a
+    // time.
+    __device__
+    static void load_sync_multi(char*                        smem,
+                                const cuphyLDPCDecodeDesc_t& decodeDesc,
+                                const multi_codeword_config& cwConfig)
+    {
+        const int LLR_DST_STRIDE_BYTES = round_up_to_next(get_num_LLRs(decodeDesc) * sizeof(llr_dst_t),
+                                                          sizeof(ldpc_traits<llr_dst_t>::llr_sts_t));
+        for(int i = 0; i < cwConfig.cta_codeword_count; ++i)
+        {
+            ldpc_dec_loader_params<llr_src_t> params(smem + (i * LLR_DST_STRIDE_BYTES),
+                                                     decodeDesc,
+                                                     cwConfig.cta_start_index + i);
             load_sync(params);
         }
     }

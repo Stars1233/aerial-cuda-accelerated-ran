@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -163,7 +163,8 @@ template <int NUM_WORDS_> struct C2V_storage_t<__half, NUM_WORDS_>
 template <typename T,
           class    TSignMgr,
           class    TMinSumUpdate,
-          class    TC2VStorage> class cC2V_row_context;
+          class    TC2VStorage,
+          class    TEnable = void> class cC2V_row_context;
 
 template <class TSignMgr, class TMinSumUpdate, class TC2VStorage>
 class cC2V_row_context<__half, TSignMgr, TMinSumUpdate, TC2VStorage>
@@ -388,7 +389,7 @@ public:
     C2V_row_proc() = default;
     //------------------------------------------------------------------
     // process_row()
-    template <int CHECK_IDX, class TKernelParams, class TC2VStorage>
+    template <int CHECK_IDX, class TKernelParams, class TC2VStorage, bool IS_FIRST = false, bool IS_LAST = false>
     __device__
     void process_row(const TKernelParams& params,
                      word_t               (&app)[app_num_words<T, BG, CHECK_IDX>::value],
@@ -412,11 +413,182 @@ public:
         // Perform row processing:
         // - update the given APP values
         // - update C2V storage to be used for the next iteration
+        // IS_FIRST routes to the row processor's first-iteration path (skip the
+        // still-zero previous-C2V subtract/decompress); IS_LAST routes to its
+        // final-iteration path (skip the now-dead C2V store/pack). At most one
+        // is ever true (first != last for >1 iteration). The if constexpr keeps
+        // the extra template args out of every interior instantiation.
+        if constexpr (IS_FIRST)
+        {
+            row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE, true, false>(app,
+                                                                        c2v_storage,
+                                                                        params.norm.f16x2);
+        }
+        else if constexpr (IS_LAST)
+        {
+            row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE, false, true>(app,
+                                                                        c2v_storage,
+                                                                        params.norm.f16x2);
+        }
+        else
+        {
+            row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE>(app,
+                                                                        c2v_storage,
+                                                                        params.norm.f16x2);
+        }
+        //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+        // Write output values to shared_memory
+        typedef TAPPWriter<T, ROW_DEGREE, UPDATE_ROW_DEGREE> app_writer_t;
+        app_writer_t::write_non_ext(app, app_addr, smem_offset);
+    }
+
+    template <int CHECK_IDX, class TKernelParams, class TC2VStorage>
+    __device__
+    bool process_row_sign_change(const TKernelParams& params,
+                                 word_t               (&app)[app_num_words<T, BG, CHECK_IDX>::value],
+                                 int                  (&app_addr)[row_degree<BG, CHECK_IDX>::value],
+                                 TC2VStorage&         c2v_storage,
+                                 int                  smem_offset)
+    {
+        const int ROW_DEGREE        = row_degree<BG, CHECK_IDX>::value;
+        const int UPDATE_ROW_DEGREE = update_row_degree<BG, CHECK_IDX>::value;
+        typedef typename TRowMap<BG, CHECK_IDX, TC2VStorage>::row_proc_t row_proc_t;
+
+        typedef TAPPLoader<T, ROW_DEGREE> app_loader_t;
+        app_loader_t::load(app, app_addr, smem_offset);
+
         row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE>(app,
                                                                         c2v_storage,
                                                                         params.norm.f16x2);
-        //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-        // Write output values to shared_memory
+
+        typedef TAPPWriter<T, ROW_DEGREE, UPDATE_ROW_DEGREE> app_writer_t;
+        return app_writer_t::write_non_ext_sign_change(app, app_addr, smem_offset);
+    }
+    //------------------------------------------------------------------
+    // Phase-split process_row(): load_app / compute_app / write_app expose the
+    // three steps of process_row() separately, so a caller can hoist a row's
+    // shared-memory load across the preceding barrier (the split C2V cache's
+    // cross-barrier APP preload) or defer its write-back.
+    // process_row() runs load -> compute -> write as one block, which pins all
+    // three to the same barrier interval. The arithmetic and its order are
+    // byte-for-byte identical to process_row() -- only the load and the write
+    // are pulled out so a caller can move THEM (not the math). compute_app is
+    // IS_FIRST/IS_LAST-aware so a caller that peels the first or last iteration
+    // keeps the boundary-iteration C2V subtract/store elision.
+    //------------------------------------------------------------------
+    // load_app(): shared-memory load of a row's APP values.
+    template <int CHECK_IDX>
+    __device__
+    void load_app(word_t (&app)     [app_num_words<T, BG, CHECK_IDX>::value],
+                  int    (&app_addr)[row_degree<BG, CHECK_IDX>::value],
+                  int    smem_offset)
+    {
+        const int ROW_DEGREE = row_degree<BG, CHECK_IDX>::value;
+        typedef TAPPLoader<T, ROW_DEGREE> app_loader_t;
+        app_loader_t::load(app, app_addr, smem_offset);
+    }
+    //------------------------------------------------------------------
+    // compute_app(): register-only check-node update on an already-loaded APP
+    // (updates APP + C2V storage). No shared-memory traffic -> two disjoint
+    // rows' compute_app() calls are alias-free and free to interleave.
+    template <int CHECK_IDX, class TKernelParams, class TC2VStorage,
+              bool IS_FIRST = false, bool IS_LAST = false
+#if LDPC2_C2V_SELECTIVE_WRITEBACK
+              , bool ORDERED_STORE = false
+#endif
+              >
+    __device__
+    void compute_app(const TKernelParams& params,
+                     word_t       (&app)[app_num_words<T, BG, CHECK_IDX>::value],
+                     TC2VStorage&   c2v_storage)
+    {
+        const int ROW_DEGREE        = row_degree<BG, CHECK_IDX>::value;
+        const int UPDATE_ROW_DEGREE = update_row_degree<BG, CHECK_IDX>::value;
+        typedef typename TRowMap<BG,
+                                 CHECK_IDX,
+                                 TC2VStorage>::row_proc_t row_proc_t;
+        if constexpr (IS_FIRST)
+        {
+#if LDPC2_C2V_SELECTIVE_WRITEBACK
+            if constexpr(ORDERED_STORE)
+            {
+                row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE,
+                                                 true, false, TC2VStorage,
+                                                 true>(app,
+                                                       c2v_storage,
+                                                       params.norm.f16x2);
+            }
+            else
+            {
+                row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE,
+                                                 true, false>(app,
+                                                              c2v_storage,
+                                                              params.norm.f16x2);
+            }
+#else
+            row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE, true, false>(app,
+                                                                        c2v_storage,
+                                                                        params.norm.f16x2);
+#endif
+        }
+        else if constexpr (IS_LAST)
+        {
+#if LDPC2_C2V_SELECTIVE_WRITEBACK
+            if constexpr(ORDERED_STORE)
+            {
+                row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE,
+                                                 false, true, TC2VStorage,
+                                                 true>(app,
+                                                       c2v_storage,
+                                                       params.norm.f16x2);
+            }
+            else
+            {
+                row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE,
+                                                 false, true>(app,
+                                                              c2v_storage,
+                                                              params.norm.f16x2);
+            }
+#else
+            row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE, false, true>(app,
+                                                                        c2v_storage,
+                                                                        params.norm.f16x2);
+#endif
+        }
+        else
+        {
+#if LDPC2_C2V_SELECTIVE_WRITEBACK
+            if constexpr(ORDERED_STORE)
+            {
+                row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE,
+                                                 false, false, TC2VStorage,
+                                                 true>(app,
+                                                       c2v_storage,
+                                                       params.norm.f16x2);
+            }
+            else
+            {
+                row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE>(app,
+                                                                                c2v_storage,
+                                                                                params.norm.f16x2);
+            }
+#else
+            row_proc_t::template process_row<ROW_DEGREE, UPDATE_ROW_DEGREE>(app,
+                                                                        c2v_storage,
+                                                                        params.norm.f16x2);
+#endif
+        }
+    }
+    //------------------------------------------------------------------
+    // write_app(): shared-memory write-back of the updated APP values.
+    template <int CHECK_IDX>
+    __device__
+    void write_app(word_t (&app)     [app_num_words<T, BG, CHECK_IDX>::value],
+                   int    (&app_addr)[row_degree<BG, CHECK_IDX>::value],
+                   int    smem_offset)
+    {
+        const int ROW_DEGREE        = row_degree<BG, CHECK_IDX>::value;
+        const int UPDATE_ROW_DEGREE = update_row_degree<BG, CHECK_IDX>::value;
         typedef TAPPWriter<T, ROW_DEGREE, UPDATE_ROW_DEGREE> app_writer_t;
         app_writer_t::write_non_ext(app, app_addr, smem_offset);
     }
@@ -441,7 +613,9 @@ public:
     //__device__ static void init(storage_t& s) { s.init(); }
     //------------------------------------------------------------------
     // process_row()
-    template <int ROW_DEGREE, int UPDATE_ROW_DEGREE, class TStorage>
+    template <int ROW_DEGREE,
+              int UPDATE_ROW_DEGREE,
+              class TStorage>
     __device__
     static void process_row(word_t          (&app)[row_num_words<__half, ROW_DEGREE>::value],
                             TStorage&       row_storage,
@@ -480,7 +654,9 @@ private:
     }
     //------------------------------------------------------------------
     // app_update()
-    template <int ROW_DEGREE, int UPDATE_ROW_DEGREE, class TStorage>
+    template <int ROW_DEGREE,
+              int UPDATE_ROW_DEGREE,
+              class TStorage>
     __device__
     static void app_update(TStorage&            row_storage,
                            const __half2&       norm,
@@ -514,11 +690,59 @@ private:
     }
 };
 
+// Print at least NUM_VALUES from the word_t array a, assuming that each word
+// holds one or more value of type TElem.
+// The printing loop rounds up the number of values printed such that entire
+// words are printed. For example, if NUM_VALUES is odd, this function will
+// print the "extra" value in the high part of the final word.
+template <int NUM_VALUES, class TElem, int ARRAY_DIM>
+__host__ __device__
+void print_word_array_count(int tIdx, const char* label, const word_t (&a)[ARRAY_DIM], const char* suffix = nullptr)
+{
+    if(threadIdx.x == tIdx)
+    {
+        constexpr int VALUES_PER_WORD = ldpc_traits<TElem>::values_per_word;
+        printf("%s: ", label);
+        for(int i = 0; i < div_round_up_t<NUM_VALUES, VALUES_PER_WORD>::value; ++i)
+        {
+            print_word_values_as<TElem>(a[i]);
+        }
+        printf("\n");
+        if(suffix)
+        {
+            printf(suffix);
+        }
+    }
+}
+
+template <class TElem, int ARRAY_DIM>
+__device__
+void print_word_array(int tIdx, const char* label, const word_t (&a)[ARRAY_DIM], const char* suffix = nullptr)
+{
+    if(threadIdx.x == tIdx)
+    {
+        printf("%s: ", label);
+        for(int i = 0; i < ARRAY_DIM; ++i)
+        {
+            print_word_values_as<TElem>(a[i]);
+        }
+        printf("\n");
+        if(suffix)
+        {
+            printf(suffix);
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////
 // box_plus_row_proc
 // Row processor for a box plus implementation
+template <class TBoxPlusOp, class TLLR, class TEnable = void> class box_plus_row_proc;
+
+
+// Specialization for __half LLR type
 template <class TBoxPlusOp>
-class box_plus_row_proc
+class box_plus_row_proc<TBoxPlusOp, __half>
 {
 public:
     //typedef TC2VStorage storage_t;
@@ -527,7 +751,9 @@ public:
     //__device__ static void init(storage_t& s) { s.init(); }
     //------------------------------------------------------------------
     // process_row()
-    template <int ROW_DEGREE, int UPDATE_ROW_DEGREE, class TStorage>
+    template <int ROW_DEGREE,
+              int UPDATE_ROW_DEGREE,
+              class TStorage>
     __device__
     static void process_row(word_t          (&app)[row_num_words<__half, ROW_DEGREE>::value],
                             TStorage&       row_storage,
@@ -544,6 +770,9 @@ private:
     static void app_sub_prev_iter(word_t          (&app)[row_num_words<__half, ROW_DEGREE>::value],
                                   const TStorage& row_storage)
     {
+        //print_word_array_count<ROW_DEGREE, __half>(0, "APP", app);
+        //print_word_array<__half>                  (0, "C2V", row_storage.v.w);
+
         #pragma unroll
         for(int i = 0; i < div_round_up_t<UPDATE_ROW_DEGREE, 2>::value; ++i)
         {
@@ -551,10 +780,13 @@ private:
             // set to zero in the storage structure.
             app[i].f16x2 = __hsub2(app[i].f16x2, row_storage.v.w[i].f16x2);
         }
+        //print_word_array_count<ROW_DEGREE, __half>(0, "SUB", app);
     }
     //------------------------------------------------------------------
     // app_update()
-    template <int ROW_DEGREE, int UPDATE_ROW_DEGREE, class TStorage>
+    template <int ROW_DEGREE,
+              int UPDATE_ROW_DEGREE,
+              class TStorage>
     __device__
     static void app_update(TStorage&            row_storage,
                            const __half2&       norm,
@@ -565,6 +797,8 @@ private:
         typedef box_plus_seq_gen<__half, TBoxPlusOp, ROW_DEGREE, UPDATE_ROW_DEGREE> box_plus_seq_gen_t;
         
         box_plus_seq_gen_t::generate(bp_update_seq, app);
+        //print_word_array_count<UPDATE_ROW_DEGREE, __half>(0, "SEQ", bp_update_seq);
+
         #pragma unroll
         for(int i = 0; i < div_round_up_t<UPDATE_ROW_DEGREE, 2>::value; ++i)
         {
@@ -574,6 +808,7 @@ private:
             //app[i].f16x2 = __hfma2(bp_update_seq[i].f16x2, norm, app[i].f16x2);
             app[i].f16x2 = __hadd2(row_storage.v.w[i].f16x2, app[i].f16x2);
         }
+        //print_word_array_count<UPDATE_ROW_DEGREE, __half>(0, "NEW", app, "----\n");
     }
 };
 

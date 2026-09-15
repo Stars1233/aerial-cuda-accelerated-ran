@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -399,6 +399,9 @@ void SimulatePhyDriver::phy_driver_thread_func()
     SlotTask* task;
     while(sem_wait(&sem) == 0)
     {
+        if (stop_.load(std::memory_order_acquire)) {
+            break;
+        }
         while((task = dequeue_task()) != nullptr)
         {
             onSlotTask(task);
@@ -407,8 +410,29 @@ void SimulatePhyDriver::phy_driver_thread_func()
     }
 }
 
+SimulatePhyDriver::~SimulatePhyDriver()
+{
+    // Signal the worker thread to exit and wake it. Joining before any member
+    // destruction prevents std::thread::~thread() from terminating the program
+    // when the program reaches exit() (e.g. via l2sa_exit_handler).
+    stop_.store(true, std::memory_order_release);
+    sem_post(&sem);
+    if (thread.joinable()) {
+        thread.join();
+    }
+    sem_destroy(&sem);
+
+    // Drain any leftover queued tasks so we don't leak SlotTask*.
+    std::lock_guard<std::mutex> lk(queue_mutex);
+    while (!task_queue.empty()) {
+        delete task_queue.front();
+        task_queue.pop();
+    }
+}
+
 SimulatePhyDriver::SimulatePhyDriver(nv::thread_config* cfg)
 {
+    puschDataOut.isEarlySchCbDecodePresent = 0;
     memset(zero_u8, 0, sizeof(zero_u8));
     memset(zero_u32, 0, sizeof(zero_u32));
     memset(zero_float, 0, sizeof(zero_float));

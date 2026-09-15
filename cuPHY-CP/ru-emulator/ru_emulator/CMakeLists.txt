@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,24 +15,33 @@
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/helper.cmake)
 
-set(SOURCES main.cpp
-            ${SOURCES}
-            )
+add_library(ru_emulator_common STATIC ${RU_EMULATOR_COMMON_SOURCES})
+link_target(ru_emulator_common)
+
+# Mode-specific variants keep pre-refactor semantics where compile definitions
+# apply to all RU emulator translation units for each executable.
+add_library(ru_emulator_standalone_common STATIC ${RU_EMULATOR_COMMON_SOURCES})
+target_compile_definitions(ru_emulator_standalone_common PUBLIC STANDALONE=1)
+link_target(ru_emulator_standalone_common)
+
+add_library(ru_emulator_debug_common STATIC ${RU_EMULATOR_COMMON_SOURCES})
+target_compile_definitions(ru_emulator_debug_common PUBLIC RU_EM_UL_TIMERS_ENABLE=1)
+link_target(ru_emulator_debug_common)
 
 set(TARGET ru_emulator)
-add_executable(${TARGET} ${SOURCES})
+add_executable(${TARGET} main.cpp)
+target_link_libraries(${TARGET} PRIVATE ru_emulator_common)
 link_target(${TARGET})
 
 # ----------------------------------------------------------------------
 # Functional test
 # ----------------------------------------------------------------------
 set(STANDALONE ru_standalone)
-add_executable(${STANDALONE} ${SOURCES})
+add_executable(${STANDALONE} main.cpp)
+target_link_libraries(${STANDALONE} PRIVATE ru_emulator_standalone_common)
 link_target(${STANDALONE})
-target_compile_definitions(${STANDALONE} PRIVATE STANDALONE=1)
-
 
 set(DEBUG ru_debug)
-add_executable(${DEBUG} ${SOURCES})
+add_executable(${DEBUG} main.cpp)
+target_link_libraries(${DEBUG} PRIVATE ru_emulator_debug_common)
 link_target(${DEBUG})
-target_compile_definitions(${DEBUG} PRIVATE RU_EM_UL_TIMERS_ENABLE=1)

@@ -187,8 +187,8 @@ public:
     int                 waitToStartCPU(uint32_t * wait_addr_h);                        ///< CPU polling wait on host memory flag
     int                 waitToStartGPU(uint32_t * wait_addr_d);                        ///< Insert GPU stream wait on device memory flag (channel's stream)
     int                 waitToStartGPU(uint32_t * wait_addr_d, cudaStream_t stream_);  ///< Insert GPU stream wait on device memory flag (specified stream)
-    int                 waitToStartGPUEvent(cudaEvent_t event);                        ///< Insert GPU stream wait on CUDA event (channel's stream)
-    int                 waitToStartGPUEvent(cudaEvent_t event, cudaStream_t stream_);  ///< Insert GPU stream wait on CUDA event (specified stream)
+    int                 waitToStartGPUEvent(cudaEvent_t event);                        ///< Insert GPU stream wait on event (channel's stream; cuStreamWaitEvent)
+    int                 waitToStartGPUEvent(cudaEvent_t event, cudaStream_t stream_);  ///< Insert GPU stream wait on event (specified stream; cuStreamWaitEvent)
 
     //Completion signaling
     int                 signalRunCompletion();                                              ///< Signal run completion via host pinned buffer and GDR flag (optionally with host buffer write)
@@ -197,8 +197,8 @@ public:
     cudaEvent_t         getRunCompletionEvent() {return run_completion;};                   ///< Get CUDA event for run completion synchronization
 
     //Generic event waiting functions
-    int                 waitEvent(cudaEvent_t event);                               ///< CPU blocking wait on CUDA event
-    int                 waitEventNonBlocking(cudaEvent_t event);                    ///< CPU non-blocking query on CUDA event
+    int                 waitEvent(cudaEvent_t event);                               ///< CPU blocking wait on CUDA event (cuEventSynchronize)
+    int                 waitEventNonBlocking(cudaEvent_t event);                    ///< CPU non-blocking query on CUDA event (cuEventQuery)
 
     //CPU waiting function specific to start_run event
     int                 waitStartRunEvent();                                        ///< CPU blocking wait for start_run event
@@ -208,10 +208,10 @@ public:
     int                 waitRunCompletion(int wait_ns);                             ///< CPU polling wait for run completion flag with timeout
     int                 waitRunCompletionEvent();                                   ///< CPU blocking wait for run_completion event
     int                 waitRunCompletionEventNonBlocking();                        ///< CPU non-blocking query for run_completion event
-    int                 waitRunCompletionGPU(cudaStream_t stream_, MpsCtx * mpsCtx_);      ///< Insert GPU stream wait for run completion GDR flag
+    int                 waitRunCompletionGPU(CUfunction wait_eq_func, cudaStream_t stream_); ///< Insert GPU stream wait for run completion GDR flag (caller's context)
     int                 waitRunCompletionGPUEvent(cudaStream_t stream_, MpsCtx * mpsCtx_); ///< Insert GPU stream wait for run_completion event
 
-    cudaStream_t        getStream() const;                                          ///< Get CUDA stream for this channel
+    cudaStream_t        getStream() const;                                          ///< Get GPU stream for this channel
     int                 reserve(uint8_t * _buf_d, uint8_t * _buf_h, size_t _buf_sz);   ///< Reserve GPU/host buffers for channel processing
     int                 reserve(uint8_t * _buf_d, size_t _buf_sz, cuphy::tensor_device* _tx_tensor); ///< Reserve GPU buffer with tensor for TX processing
     int                 reserveCellGroup();                                         ///< Reserve resources for cell group processing
@@ -250,9 +250,12 @@ protected:
     cuphyCellStatPrm_t             cellStatPrm;                ///< cuPHY cell static parameters
     hdf5hpp::hdf5_file             fInput;                     ///< HDF5 file handle for input data (testing/debugging)
     MpsCtx*                        mpsCtx;                     ///< MPS or green context for GPU resource partitioning
+    CUfunction                     kernel_write_func_    = nullptr;  ///< Per-context CUfunction for kernel_write
+    CUfunction                     kernel_wait_eq_func_  = nullptr;  ///< Per-context CUfunction for kernel_wait_eq
+    CUfunction                     warmup_kernel_func_   = nullptr;  ///< Per-context CUfunction for warmup_kernel
     std::unique_ptr<host_buf>      channel_complete_h;         ///< Host pinned buffer for completion signaling
     std::unique_ptr<struct gpinned_buffer> channel_complete_gdr;  ///< GDR buffer for GPU-CPU completion signaling
-    cudaStream_t                   s_channel;                  ///< CUDA stream for this channel
+    cudaStream_t                   s_channel;                  ///< GPU stream for this channel
     cudaEvent_t                    start_setup;                ///< CUDA event marking setup phase start
     cudaEvent_t                    end_setup;                  ///< CUDA event marking setup phase end
     cudaEvent_t                    start_run;                  ///< CUDA event marking run phase start

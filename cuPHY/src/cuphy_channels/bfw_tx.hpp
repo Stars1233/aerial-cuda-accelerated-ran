@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -123,6 +123,10 @@ private:
     cudaGraph_t     m_graph{};
     cudaGraphExec_t m_graphExec{};
 
+#if CUDA_VERSION >= 13020
+    // Attribute value for kernel nodes that may need dynamic shared memory opt-in
+    CUkernelNodeAttrValue m_kernelNodeAttrValue{.sharedMemoryMode = CU_SHARED_MEMORY_MODE_ALLOW_NON_PORTABLE};
+#endif
     CUgraphNode m_bfwCoefCompNodes[CUPHY_BFW_COEF_COMP_N_MAX_HET_CFGS]{};
     int32_t m_prevBfwCoefCompNodesCfgs{};
     // Batched memcpy helper object

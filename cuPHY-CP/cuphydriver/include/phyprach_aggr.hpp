@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,8 +20,16 @@
 
 #include "phychannel.hpp"
 #include "cell.hpp"
+#include "prach_stage_error.hpp"
+
+#include <cstdint>
+#include <optional>
+
+#include <tl/expected.hpp>
 
 #define PRACH_USE_BATCHED_MEMCPY 1 ///< Enable batched memcpy for the 4 D2H memcpy calls after PRACH run
+
+struct cell_phy_info;
 
 /**
  * @class PhyPrachAggr
@@ -156,7 +164,7 @@ public:
      * @return Always returns 0
      */
     int          deleteTempPhyObj();
-    
+
     /**
      * @brief Swaps the active and temporary PRACH handles.
      *
@@ -165,6 +173,47 @@ public:
      * dynamic reconfiguration.
      */
     void         changePhyObj();
+
+    // ---- Offload (nonslot_lp) CONFIG reconfiguration ----
+    // Additive PRACH-specific staging used by PrachOffloadReconfig. The legacy
+    // getNextPrachAggr() path does not use these.
+
+    /// Result of stageConfig(): on success the new occasion start index (nullopt on the
+    /// in-place path); PrachStageError::StageRejected on failure. The failure cause (cell
+    /// not present here, or invalid PRACH params) is also logged at the source in
+    /// applyPrachUpdate; the typed error lets callers name the failure instead of a bare
+    /// false. The tl::expected separates failure from the success-side optional.
+    using StageConfigResult = tl::expected<std::optional<std::uint16_t>, PrachStageError>;
+
+    /**
+     * Stages a new PRACH configuration without altering live state.
+     *
+     * @param[in] cell_id    Cell being reconfigured.
+     * @param[in] cell_pinfo New cell PHY configuration.
+     * @return On success, the new occasion start index (nullopt when the in-place path
+     *         leaves it unchanged); tl::unexpected(PrachStageError::StageRejected) on failure.
+     */
+    [[nodiscard]] StageConfigResult stageConfig(std::uint16_t cell_id, const cell_phy_info& cell_pinfo);
+
+    /**
+     * Creates the temporary (PONG) PRACH object from the staged config.
+     *
+     * @return Empty on success; tl::unexpected(PrachStageError::TempCreateFailed) if
+     *         cuphyCreatePrachRx failed to build the temp handle.
+     */
+    [[nodiscard]] tl::expected<void, PrachStageError> createNewPhyObjFromStagedConfig();
+
+    /** Commits the staged PRACH config into live state. */
+    void               commitStagedConfig();
+
+    /**
+     * Discards the staged PRACH config (pre-arm rollback).
+     *
+     * Idempotent: safe to call on an aggregator that was never staged (no-op),
+     * since the orchestrator's failure path discards every aggregator regardless
+     * of how far staging progressed.
+     */
+    void               discardStagedConfig();
     
     /**
      * @brief Updates PRACH configuration for a specific cell.
@@ -248,6 +297,50 @@ protected:
     std::vector<cuphyPrachOccaStatPrms_t> prachOccaStatVec;    ///< Per-occasion static parameters (root sequences, zero-correlation zones)
     std::vector<cell_id_t> cell_id_list;                       ///< List of physical cell IDs being processed (built during createPhyObj)
     std::unordered_map<cell_id_t,uint32_t>prachCellStatIndex; ///< Map from cell_id to index in prachCellStatVec (for fast lookup)
+
+    /**
+     * Genuinely staged PRACH static config for the offload reconfig handover.
+     *
+     * Holds copies of the live cell/occasion vectors with the requested update
+     * applied, so the new (PONG) handle can be built and validated without
+     * mutating live state until the handover commits.
+     */
+    struct PrachAggrStagedConfig final
+    {
+        std::vector<cuphyPrachCellStatPrms_t> cell_stat;     //!< Staged copy of prachCellStatVec.
+        std::vector<cuphyPrachOccaStatPrms_t> occa_stat;     //!< Staged copy of prachOccaStatVec.
+        bool                                  active{false}; //!< True between stageConfig and commit/discard.
+
+        void reset()
+        {
+            cell_stat.clear();
+            occa_stat.clear();
+            active = false;
+        }
+    };
+    PrachAggrStagedConfig staged_;  ///< Offload-only staged PRACH config (single-threaded: nonslot_lp worker).
+
+    /**
+     * Applies the @p cell_pinfo PRACH update to the given cell/occasion vectors.
+     *
+     * Shared core of the legacy in-place updateConfig() and the offload staged
+     * stageConfig(): validates the incoming params, then either updates occasions
+     * in place (count unchanged/shrunk) or appends the grown occasion set. Does NOT
+     * touch live Cell state or prach_params_static; the caller commits those.
+     *
+     * @param[in]     cell_id        Cell being reconfigured.
+     * @param[in]     cell_pinfo     New cell PHY configuration.
+     * @param[in,out] cell_stat      Cell-stat vector to update (live or staged copy).
+     * @param[in,out] occa_stat      Occasion-stat vector to update (live or staged copy).
+     * @param[out]    occa_start_idx Set to the cell's new occasion start index when the
+     *                               occasion set grew (append path); left unset otherwise.
+     * @return 0 on success, -1 on validation/lookup failure.
+     */
+    [[nodiscard]] int applyPrachUpdate(cell_id_t                              cell_id,
+                                       const cell_phy_info&                   cell_pinfo,
+                                       std::vector<cuphyPrachCellStatPrms_t>& cell_stat,
+                                       std::vector<cuphyPrachOccaStatPrms_t>& occa_stat,
+                                       std::optional<std::uint16_t>&          occa_start_idx);
     size_t prach_workspace_size;                               ///< Size of cuPHY workspace buffer in bytes
     cuphy::buffer<float, cuphy::device_alloc> prach_workspace_buffer;  ///< cuPHY workspace buffer for intermediate calculations
     cuphy::tensor_device gpu_num_detectedPrmb;                 ///< GPU tensor: number of detected preambles per occasion

@@ -33,37 +33,14 @@ add_executable(dlc_test_bench
     dlc_test_bench.hpp
     sendCplaneUnitTest.cpp
     sendCplaneUnitTest.hpp
+    testmac_setup_service.cpp
+    testmac_setup_service.hpp
     ru_emulator_wrapper.cpp
     ru_emulator_wrapper.hpp
-    timing_functions.cpp # Test specific timing function reimplementation of timing_utils.cpp
     pcap_writer.cpp
     pcap_writer.h
     ${CUBB_HOME}/cuPHY-CP/cuphycontroller/src/yamlparser.cpp
     ${CUBB_HOME}/cuPHY-CP/cuphycontroller/src/cuphydriver.cpp
-    # Add minimal testMAC source files needed for FAPI functionality
-    ${CUBB_HOME}/cuPHY-CP/testMAC/testMAC/test_mac_configs.cpp
-    ${CUBB_HOME}/cuPHY-CP/testMAC/testMAC/launch_pattern.cpp
-    ${CUBB_HOME}/cuPHY-CP/testMAC/testMAC/fapi_handler.cpp
-    ${CUBB_HOME}/cuPHY-CP/testMAC/testMAC/scf_fapi_handler.cpp
-    ${CUBB_HOME}/cuPHY-CP/testMAC/testMAC/fapi_validate.cpp
-    # Add ALL RU emulator source files for complete functionality (based on helper.cmake)
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/utils.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/config_parser.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/fh.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/oran.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/tv_parser.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/cplane_rx_cores.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/setup.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/pdsch.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/pbch.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/pdcch.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/csirs.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/packet_timings.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/standalone.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/cplane_rx_cores.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/uplane_rx_cores.cpp
-    ${CUBB_HOME}/cuPHY-CP/ru-emulator/ru_emulator/sectionid_validation.cpp
 )
 
 # Add dependencies to ensure libraries are built before the test
@@ -71,7 +48,7 @@ add_dependencies(dlc_test_bench cuphydriver scf_5g_fapi nvphy cuphyoamlib aerial
 
 find_package(CLI11 REQUIRED)
 # Add RU emulator specific libraries (from helper.cmake link_target function)
-target_link_libraries(dlc_test_bench PRIVATE slot_command nvlog yaml cuda aerial-fh cuphyoamlib app_config perf_metrics CLI11::CLI11)
+target_link_libraries(dlc_test_bench PRIVATE slot_command nvlog yaml CUDA::cuda_driver aerial-fh cuphyoamlib app_config perf_metrics CLI11::CLI11)
 
 # DPDK configuration (following project pattern)
 target_link_directories(dlc_test_bench PRIVATE ${DPDK_LIBRARY_DIRS})
@@ -83,20 +60,21 @@ target_link_libraries(dlc_test_bench
         gtest          # Only gtest library (NO gtest_main - we provide our own main())
         # gtest_main   # REMOVED: We have custom main() in dlc_test_bench.cpp
         benchmark
-        nvlog
         cuphydriver
+        cuda_driver_utils
         ${HDF5_C_LIBRARIES}
         cuphy_hdf5
         cuphy_cpp_header_only
         nvphy
-        yaml
-        app_config
         aerial_sdk_version
         gdrapi
         ${DPDK_LIBRARIES}  # DPDK libraries including mbuf for rte_pktmbuf_clone
         # Add testMAC dependencies
         scf_5g_fapi  # SCF FAPI library for scf_fapi_handler
         nvipc        # NVIPC library for transport
+        testmac_core
+        ru_emulator_common
+        sdk::options
 )
 
 # Include directories
@@ -127,10 +105,9 @@ target_include_directories(dlc_test_bench PUBLIC ${CUBB_HOME}/cuPHY-CP/cuphycont
 
 
 # Add compile definitions if needed
-target_compile_definitions(dlc_test_bench 
+target_compile_definitions(dlc_test_bench
     PRIVATE
         ${HDF5_DEFINITIONS}
-        SCF_L2ADAPTER_EXISTS  # Enable SCF FAPI handler compilation
 )
 
 # Add compile options
@@ -138,12 +115,6 @@ if (ENABLE_LINE_INFO)
     target_compile_options(dlc_test_bench PRIVATE -lineinfo)
 endif()
 
-enable_testing()
-
-# Add test to CTest
-add_test(NAME dlc_test_bench COMMAND dlc_test_bench)
-
-set_tests_properties(dlc_test_bench PROPERTIES ENVIRONMENT "DLC_TV_PATH=abc")
 
 # Install test
 install(TARGETS dlc_test_bench

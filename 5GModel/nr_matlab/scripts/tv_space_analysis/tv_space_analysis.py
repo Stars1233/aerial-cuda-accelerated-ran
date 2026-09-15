@@ -26,36 +26,227 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
 
-# Pattern ranges (aligned with 5GModel/nr_matlab/test/genPerfPattern.m)
-PATTERNS = [
-    ("48", "Pattern 48", [(3720, 4039)], [(2080, 2143)]),
-    ("49", "Pattern 49", [(4040, 4439)], [(2144, 2223)]),
-    ("50", "Pattern 50", [(4440, 4759)], [(2224, 2287)]),
-    ("51", "Pattern 51", [(4760, 5159)], [(2416, 2495)]),
-    ("59", "Pattern 59, 59a, 59b, 59d", [(7072, 7471)], [(3040, 3119), (3200, 3279), (3760, 3839), (3520, 3599)]),
-    ("59c", "Pattern 59c, 59e, 59f, 62c", [(9472, 10271)], [(4471, 4630), (4631, 4790), (3840, 3840), (4040, 4079)]),
-    ("60", "Pattern 60, 60a-e, 63c", [(10452, 11251)], [(3600, 3759), (3280, 3359), (4911, 5070), (5071, 5230), (5231, 5390), (4220, 4299), (5391, 5430)]),
-    ("61", "Pattern 61", [(7872, 8271)], [(3360, 3439)]),
-    ("65", "Pattern 65a-d", [(11432, 12231)], [(5971, 6010), (6011, 6050), (6051, 6210), (6211, 6370)]),
-    ("66", "Pattern 66a-d", [(11252, 11341)], [(833, 833), (5431, 5445), (5446, 5460), (5461, 5580), (5581, 5700)]),
-    ("67", "Pattern 67, 67a-e", [(11342, 11431)], [(833, 833), (4791, 4910), (5701, 5715), (5716, 5730), (5731, 5850), (5851, 5970), (6996, 6996)]),
-    ("69", "Pattern 69, 69a-e, 71", [(12232, 12441)], [(6621, 6695), (6696, 6770), (6771, 6845), (6371, 6445), (6846, 6920), (7260, 7364), (6446, 6520)]),
-    ("73", "Pattern 73", [(12442, 12721)], [(6521, 6620)]),
-    ("75", "Pattern 75", [(12722, 12931)], [(6921, 6995)]),
-    ("77", "Pattern 77", [(12932, 13066)], [(7050, 7154)]),
-    ("79", "Pattern 79, 79a, 79b", [(13067, 13216)], [(7155, 7259), (7953, 8057), (8058, 8162)]),
-    ("81a", "Pattern 81a, 81b", [(13217, 13366)], [(7365, 7469), (7470, 7574)]),
-    ("81c", "Pattern 81c, 81d", [(13217, 13321), (13337, 13381)], [(7365, 7469), (7470, 7574)]),
-    ("83a", "Pattern 83a, 83b", [(13382, 13531)], [(7575, 7679), (7680, 7784)]),
-    ("83c", "Pattern 83c, 83d", [(13382, 13486), (13502, 13546)], [(7575, 7679), (7680, 7784)]),
-    ("85", "Pattern 85", [(13547, 13696)], [(7785, 7889)]),
-    ("87", "Pattern 87", [(13067, 13171), (13187, 13216), (13697, 13711)], [(7155, 7259)]),
-    ("89", "Pattern 89", [(13712, 13801)], [(7890, 7952)]),
-    ("91", "Pattern 91", [(13802, 13951)], [(8163, 8267)]),
-    ("101", "Pattern 101, 101a", [(7472, 7495)], [(4375, 4470), (8268, 8363)]),
-    ("102", "Pattern 102, 102a", [(7496, 7519)], [(8364, 8459), (8460, 8555)]),
-]
+PatternRow = Tuple[str, str, List[Tuple[int, int]], List[Tuple[int, int]]]
+AnalysisGroup = Tuple[str, str, Tuple[str, ...]]
+NRSIM_TV_MIN = 20000
+
+
+def _range_entries_to_ranges(entries) -> List[Tuple[int, int]]:
+    """Convert YAML scalar/list range entries into inclusive (start, end) tuples."""
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        entries = [entries]
+
+    ranges = []
+    for entry in entries:
+        if isinstance(entry, bool):
+            raise ValueError("range entries must be numeric TVs, not booleans")
+        if isinstance(entry, (int, float)):
+            if int(entry) != entry:
+                raise ValueError(f"single TV range entry must be integral: {entry}")
+            start = int(entry)
+            end = int(entry)
+        elif isinstance(entry, (list, tuple)):
+            if len(entry) == 1:
+                start = int(entry[0])
+                end = int(entry[0])
+            elif len(entry) == 2:
+                start = int(entry[0])
+                end = int(entry[1])
+            else:
+                raise ValueError(f"range list entries must be [start, end], got {entry!r}")
+        elif isinstance(entry, dict):
+            entry_value = (
+                entry.get("main")
+                if "main" in entry
+                else entry.get("additional")
+                if "additional" in entry
+                else entry.get("tv")
+                if "tv" in entry
+                else entry.get("range")
+            )
+            if entry_value is not None:
+                if isinstance(entry_value, (list, tuple)):
+                    if len(entry_value) == 1:
+                        start = int(entry_value[0])
+                        end = start
+                    elif len(entry_value) == 2:
+                        start = int(entry_value[0])
+                        end = int(entry_value[1])
+                    else:
+                        raise ValueError(f"range mapping entries must use scalar or [start, end], got {entry!r}")
+                else:
+                    start = int(entry_value)
+                    end = start
+            elif "start_tv" in entry and "end_tv" in entry:
+                start = int(entry["start_tv"])
+                end = int(entry["end_tv"])
+            else:
+                raise ValueError(f"unsupported range mapping entry: {entry!r}")
+        else:
+            raise ValueError(f"unsupported range entry: {entry!r}")
+        if end < start:
+            raise ValueError(f"range end {end} is smaller than start {start}")
+        ranges.append((start, end))
+    return ranges
+
+
+def _side_ranges(ranges_cfg: Dict, side: str) -> List[Tuple[int, int]]:
+    if not ranges_cfg:
+        return []
+    if not isinstance(ranges_cfg, dict):
+        raise ValueError("pattern ranges must be a mapping")
+    side_cfg = ranges_cfg.get(side, ranges_cfg.get(side.lower()))
+    if isinstance(side_cfg, dict):
+        side_cfg = side_cfg.get("tvs", [])
+    return _range_entries_to_ranges(side_cfg)
+
+
+def _unique_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """De-dupe exact ranges while preserving the YAML/report order."""
+    unique = []
+    seen = set()
+    for range_pair in ranges:
+        if range_pair in seen:
+            continue
+        unique.append(range_pair)
+        seen.add(range_pair)
+    return unique
+
+
+def _pattern_ranges(entry: Dict, lp_id: str) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    ranges_cfg = entry.get("ranges", {})
+    try:
+        dlmix_ranges = _side_ranges(ranges_cfg, "DLMIX")
+        ulmix_ranges = _side_ranges(ranges_cfg, "ULMIX")
+    except ValueError as exc:
+        raise ValueError(f"Pattern '{lp_id}': invalid ranges: {exc}") from exc
+    return dlmix_ranges, ulmix_ranges
+
+
+def _load_analysis_groups(cfg: Dict) -> List[AnalysisGroup]:
+    groups_cfg = cfg.get("analysis_groups") or []
+    if not isinstance(groups_cfg, list):
+        raise ValueError("Config 'analysis_groups' must be a list")
+
+    groups = []
+    for group_cfg in groups_cfg:
+        if not isinstance(group_cfg, dict):
+            raise ValueError("Each analysis group entry must be a mapping")
+        group_id = str(group_cfg.get("id", "")).strip()
+        if not group_id:
+            raise ValueError("analysis group entry missing 'id'")
+        label = str(group_cfg.get("label", f"Pattern {group_id}")).strip()
+        pattern_ids_cfg = group_cfg.get("patterns")
+        if pattern_ids_cfg is None:
+            pattern_ids_cfg = [group_id]
+        elif not isinstance(pattern_ids_cfg, list):
+            pattern_ids_cfg = [pattern_ids_cfg]
+        pattern_ids = tuple(str(pattern_id).strip() for pattern_id in pattern_ids_cfg)
+        if not pattern_ids or any(not pattern_id for pattern_id in pattern_ids):
+            raise ValueError(f"Analysis group '{group_id}' must list at least one pattern id")
+        groups.append((group_id, label, pattern_ids))
+    return groups
+
+
+def _load_patterns_from_yaml(config_path: Path) -> Tuple[List[PatternRow], Dict[str, PatternRow]]:
+    """Load report-grouped and individual pattern ranges from YAML."""
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to load config. Install with: pip install pyyaml")
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError("Config root must be a dict")
+
+    analysis_groups = _load_analysis_groups(cfg)
+
+    root_patterns = cfg.get("patterns", [])
+    if not isinstance(root_patterns, list):
+        raise ValueError("Config 'patterns' must be a list")
+    patterns_cfg = list(root_patterns)
+    pattern_files = cfg.get("pattern_files") or []
+    if pattern_files:
+        if not isinstance(pattern_files, list):
+            raise ValueError("Config 'pattern_files' must be a list")
+        for pattern_file in pattern_files:
+            child_path = config_path.parent / str(pattern_file)
+            with open(child_path, "r", encoding="utf-8") as f:
+                child_cfg = yaml.safe_load(f)
+            if not isinstance(child_cfg, dict) or not isinstance(child_cfg.get("patterns"), list):
+                raise ValueError(f"Pattern file must have a 'patterns' list: {child_path}")
+            patterns_cfg.extend(child_cfg["patterns"])
+    patterns_cfg.sort(key=lambda entry: float(entry.get("pattern", float("inf"))))
+
+    individual_patterns = {}
+    genperf_ids = []
+    for entry in patterns_cfg:
+        if not isinstance(entry, dict):
+            raise ValueError("Each pattern entry must be a mapping")
+        lp_id = str(entry.get("id", "")).strip()
+        if not lp_id:
+            raise ValueError("pattern entry missing 'id'")
+        dlmix_ranges, ulmix_ranges = _pattern_ranges(entry, lp_id)
+        individual_patterns[lp_id] = (lp_id, f"Pattern {lp_id}", dlmix_ranges, ulmix_ranges)
+        if entry.get("genperf"):
+            genperf_ids.append(lp_id)
+
+    grouped_patterns = []
+    grouped_ids = set()
+    for group_id, label, pattern_ids in analysis_groups:
+        dlmix_ranges = []
+        ulmix_ranges = []
+        missing_ids = []
+        for lp_id in pattern_ids:
+            pattern = individual_patterns.get(lp_id)
+            if pattern is None:
+                missing_ids.append(lp_id)
+                continue
+            dlmix_ranges.extend(pattern[2])
+            ulmix_ranges.extend(pattern[3])
+        if missing_ids:
+            missing = ", ".join(missing_ids)
+            raise ValueError(f"Analysis pattern group '{label}' references missing pattern id(s): {missing}")
+        grouped_patterns.append((group_id, label, _unique_ranges(dlmix_ranges), _unique_ranges(ulmix_ranges)))
+        grouped_ids.update(pattern_ids)
+
+    for lp_id in genperf_ids:
+        if lp_id not in grouped_ids:
+            grouped_patterns.append(individual_patterns[lp_id])
+
+    return grouped_patterns, individual_patterns
+
+
+def _find_config_path() -> Path:
+    """Resolve path to perf_pattern/perf_pattern_helper.yaml in nr_matlab/test."""
+    script_dir = Path(__file__).resolve().parent
+    nr_matlab = script_dir.parent.parent
+    return nr_matlab / "test" / "perf_pattern" / "perf_pattern_helper.yaml"
+
+
+# Pattern ranges loaded lazily from 5GModel/nr_matlab/test/perf_pattern/perf_pattern_helper.yaml
+PATTERNS = None
+INDIVIDUAL_PATTERNS = None
+
+
+def _ensure_patterns_loaded() -> None:
+    """Load PATTERNS from YAML once. Idempotent after first successful load."""
+    global PATTERNS, INDIVIDUAL_PATTERNS
+    if PATTERNS is not None:
+        return
+    config_path = _find_config_path()
+    if not config_path.exists():
+        msg = (
+            f"Pattern config not found: {config_path}. "
+            "Run from repo or ensure 5GModel/nr_matlab/test/perf_pattern/perf_pattern_helper.yaml exists."
+        )
+        raise FileNotFoundError(msg)
+    PATTERNS, INDIVIDUAL_PATTERNS = _load_patterns_from_yaml(config_path)
 
 
 def parse_size(size_val: str, size_unit: str):
@@ -190,8 +381,9 @@ def run_ls_alh(dir_path: Path) -> List[str]:
     """
     result = subprocess.run(
         ["ls", "-alh", str(dir_path.resolve())],
-        capture_output=True,
-        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
         check=False,
     )
     if result.returncode != 0:
@@ -226,8 +418,13 @@ def count_in_ranges_dedupe(ranges, testtype: str, file_type: str, counted_set: S
     return count, size
 
 
+def _add_count_size(total: Tuple[int, float], count: int, size_mb: float) -> Tuple[int, float]:
+    return total[0] + count, total[1] + size_mb
+
+
 def run_report(all_files: Dict, other_tvnr: Dict, non_tvnr: List, parse_errors: List, skipped_lines: int) -> None:
     """Print the full table and summary to stdout."""
+    _ensure_patterns_loaded()
     accounted_tcs = set()
     counted_for_total = set()
 
@@ -291,20 +488,45 @@ def run_report(all_files: Dict, other_tvnr: Dict, non_tvnr: List, parse_errors: 
     other_ulmix_fapi = (0, 0.0)
     other_ulmix_cuphy = (0, 0.0)
     other_ulmix_other = (0, 0.0)
+    nrsim_dlmix_fapi = (0, 0.0)
+    nrsim_dlmix_cuphy = (0, 0.0)
+    nrsim_dlmix_other = (0, 0.0)
+    nrsim_ulmix_fapi = (0, 0.0)
+    nrsim_ulmix_cuphy = (0, 0.0)
+    nrsim_ulmix_other = (0, 0.0)
     for (testtype, tc_num, file_type), (count, size_mb) in all_files.items():
         if (testtype, tc_num) not in accounted_tcs:
+            is_nrsim_tv = tc_num >= NRSIM_TV_MIN
             if testtype == "DLMIX" and file_type == "FAPI":
-                other_dlmix_fapi = (other_dlmix_fapi[0] + count, other_dlmix_fapi[1] + size_mb)
+                if is_nrsim_tv:
+                    nrsim_dlmix_fapi = _add_count_size(nrsim_dlmix_fapi, count, size_mb)
+                else:
+                    other_dlmix_fapi = _add_count_size(other_dlmix_fapi, count, size_mb)
             elif testtype == "DLMIX" and file_type == "CUPHY":
-                other_dlmix_cuphy = (other_dlmix_cuphy[0] + count, other_dlmix_cuphy[1] + size_mb)
+                if is_nrsim_tv:
+                    nrsim_dlmix_cuphy = _add_count_size(nrsim_dlmix_cuphy, count, size_mb)
+                else:
+                    other_dlmix_cuphy = _add_count_size(other_dlmix_cuphy, count, size_mb)
             elif testtype == "DLMIX" and file_type == "OTHER":
-                other_dlmix_other = (other_dlmix_other[0] + count, other_dlmix_other[1] + size_mb)
+                if is_nrsim_tv:
+                    nrsim_dlmix_other = _add_count_size(nrsim_dlmix_other, count, size_mb)
+                else:
+                    other_dlmix_other = _add_count_size(other_dlmix_other, count, size_mb)
             elif testtype == "ULMIX" and file_type == "FAPI":
-                other_ulmix_fapi = (other_ulmix_fapi[0] + count, other_ulmix_fapi[1] + size_mb)
+                if is_nrsim_tv:
+                    nrsim_ulmix_fapi = _add_count_size(nrsim_ulmix_fapi, count, size_mb)
+                else:
+                    other_ulmix_fapi = _add_count_size(other_ulmix_fapi, count, size_mb)
             elif testtype == "ULMIX" and file_type == "CUPHY":
-                other_ulmix_cuphy = (other_ulmix_cuphy[0] + count, other_ulmix_cuphy[1] + size_mb)
+                if is_nrsim_tv:
+                    nrsim_ulmix_cuphy = _add_count_size(nrsim_ulmix_cuphy, count, size_mb)
+                else:
+                    other_ulmix_cuphy = _add_count_size(other_ulmix_cuphy, count, size_mb)
             elif testtype == "ULMIX" and file_type == "OTHER":
-                other_ulmix_other = (other_ulmix_other[0] + count, other_ulmix_other[1] + size_mb)
+                if is_nrsim_tv:
+                    nrsim_ulmix_other = _add_count_size(nrsim_ulmix_other, count, size_mb)
+                else:
+                    other_ulmix_other = _add_count_size(other_ulmix_other, count, size_mb)
 
     other_total_count = (
         other_dlmix_fapi[0] + other_dlmix_cuphy[0] + other_dlmix_other[0]
@@ -314,31 +536,55 @@ def run_report(all_files: Dict, other_tvnr: Dict, non_tvnr: List, parse_errors: 
         other_dlmix_fapi[1] + other_dlmix_cuphy[1] + other_dlmix_other[1]
         + other_ulmix_fapi[1] + other_ulmix_cuphy[1] + other_ulmix_other[1]
     )
+    nrsim_total_count = (
+        nrsim_dlmix_fapi[0] + nrsim_dlmix_cuphy[0] + nrsim_dlmix_other[0]
+        + nrsim_ulmix_fapi[0] + nrsim_ulmix_cuphy[0] + nrsim_ulmix_other[0]
+    )
+    nrsim_total_size = (
+        nrsim_dlmix_fapi[1] + nrsim_dlmix_cuphy[1] + nrsim_dlmix_other[1]
+        + nrsim_ulmix_fapi[1] + nrsim_ulmix_cuphy[1] + nrsim_ulmix_other[1]
+    )
 
     print("-" * 190)
+    ns_fapi_s = f"{nrsim_dlmix_fapi[1] / 1024:.1f}GB" if nrsim_dlmix_fapi[1] > 0 else "-"
+    ns_cuphy_s = f"{nrsim_dlmix_cuphy[1] / 1024:.1f}GB" if nrsim_dlmix_cuphy[1] > 0 else "-"
+    ns_ul_fapi_s = f"{nrsim_ulmix_fapi[1] / 1024:.1f}GB" if nrsim_ulmix_fapi[1] > 0 else "-"
+    ns_ul_cuphy_s = f"{nrsim_ulmix_cuphy[1] / 1024:.1f}GB" if nrsim_ulmix_cuphy[1] > 0 else "-"
+    ns_st_str = f"{nrsim_total_size / 1024:.1f}GB" if nrsim_total_size > 0 else "-"
+    ns_total_str = f"{nrsim_total_size / 1024:.2f} GB" if nrsim_total_size > 0 else "-"
+    print(f"{'nrSim DLMIX/ULMIX TV>=20000':<30} | {nrsim_dlmix_fapi[0]:>8} {ns_fapi_s:>10} | {nrsim_dlmix_cuphy[0]:>8} {ns_cuphy_s:>10} | {nrsim_ulmix_fapi[0]:>8} {ns_ul_fapi_s:>10} | {nrsim_ulmix_cuphy[0]:>8} {ns_ul_cuphy_s:>10} | {nrsim_total_count:>8} {ns_st_str:>10} | {ns_total_str:>15}")
+
     o_fapi_s = f"{other_dlmix_fapi[1] / 1024:.1f}GB" if other_dlmix_fapi[1] > 0 else "-"
     o_cuphy_s = f"{other_dlmix_cuphy[1] / 1024:.1f}GB" if other_dlmix_cuphy[1] > 0 else "-"
     o_ul_fapi_s = f"{other_ulmix_fapi[1] / 1024:.1f}GB" if other_ulmix_fapi[1] > 0 else "-"
     o_ul_cuphy_s = f"{other_ulmix_cuphy[1] / 1024:.1f}GB" if other_ulmix_cuphy[1] > 0 else "-"
-    print(f"{'Other DLMIX/ULMIX (no pattern)':<30} | {other_dlmix_fapi[0]:>8} {o_fapi_s:>10} | {other_dlmix_cuphy[0]:>8} {o_cuphy_s:>10} | {other_ulmix_fapi[0]:>8} {o_ul_fapi_s:>10} | {other_ulmix_cuphy[0]:>8} {o_ul_cuphy_s:>10} | {other_total_count:>8} {other_total_size / 1024:.1f}GB   | {other_total_size / 1024:.2f} GB")
+    o_st_str = f"{other_total_size / 1024:.1f}GB" if other_total_size > 0 else "-"
+    o_total_str = f"{other_total_size / 1024:.2f} GB" if other_total_size > 0 else "-"
+    print(f"{'Other DLMIX/ULMIX TV<20000':<30} | {other_dlmix_fapi[0]:>8} {o_fapi_s:>10} | {other_dlmix_cuphy[0]:>8} {o_cuphy_s:>10} | {other_ulmix_fapi[0]:>8} {o_ul_fapi_s:>10} | {other_ulmix_cuphy[0]:>8} {o_ul_cuphy_s:>10} | {other_total_count:>8} {o_st_str:>10} | {o_total_str:>15}")
 
     dlmix_ulmix_total_count = (
         totals["dlmix_fapi"][0] + totals["dlmix_cuphy"][0] + totals["dlmix_other"][0]
         + totals["ulmix_fapi"][0] + totals["ulmix_cuphy"][0] + totals["ulmix_other"][0]
-        + other_total_count
+        + nrsim_total_count + other_total_count
     )
     dlmix_ulmix_total_size = (
         totals["dlmix_fapi"][1] + totals["dlmix_cuphy"][1] + totals["dlmix_other"][1]
         + totals["ulmix_fapi"][1] + totals["ulmix_cuphy"][1] + totals["ulmix_other"][1]
-        + other_total_size
+        + nrsim_total_size + other_total_size
     )
 
     print("─" * 190)
-    st_d_fapi = (totals["dlmix_fapi"][1] + other_dlmix_fapi[1]) / 1024
-    st_d_cuphy = (totals["dlmix_cuphy"][1] + other_dlmix_cuphy[1]) / 1024
-    st_u_fapi = (totals["ulmix_fapi"][1] + other_ulmix_fapi[1]) / 1024
-    st_u_cuphy = (totals["ulmix_cuphy"][1] + other_ulmix_cuphy[1]) / 1024
-    print(f"{'SUBTOTAL: DLMIX/ULMIX Files':<30} | {totals['dlmix_fapi'][0] + other_dlmix_fapi[0]:>8} {st_d_fapi:.1f}GB     | {totals['dlmix_cuphy'][0] + other_dlmix_cuphy[0]:>8} {st_d_cuphy:.1f}GB     | {totals['ulmix_fapi'][0] + other_ulmix_fapi[0]:>8} {st_u_fapi:.1f}GB     | {totals['ulmix_cuphy'][0] + other_ulmix_cuphy[0]:>8} {st_u_cuphy:.1f}GB     | {dlmix_ulmix_total_count:>8} {dlmix_ulmix_total_size / 1024:.1f}GB     | {dlmix_ulmix_total_size / 1024:>12.2f} GB")
+    st_d_fapi = (totals["dlmix_fapi"][1] + nrsim_dlmix_fapi[1] + other_dlmix_fapi[1]) / 1024
+    st_d_cuphy = (totals["dlmix_cuphy"][1] + nrsim_dlmix_cuphy[1] + other_dlmix_cuphy[1]) / 1024
+    st_u_fapi = (totals["ulmix_fapi"][1] + nrsim_ulmix_fapi[1] + other_ulmix_fapi[1]) / 1024
+    st_u_cuphy = (totals["ulmix_cuphy"][1] + nrsim_ulmix_cuphy[1] + other_ulmix_cuphy[1]) / 1024
+    st_d_fapi_str = f"{st_d_fapi:.1f}GB"
+    st_d_cuphy_str = f"{st_d_cuphy:.1f}GB"
+    st_u_fapi_str = f"{st_u_fapi:.1f}GB"
+    st_u_cuphy_str = f"{st_u_cuphy:.1f}GB"
+    st_all_str = f"{dlmix_ulmix_total_size / 1024:.1f}GB"
+    st_total_str = f"{dlmix_ulmix_total_size / 1024:.2f} GB"
+    print(f"{'SUBTOTAL: DLMIX/ULMIX Files':<30} | {totals['dlmix_fapi'][0] + nrsim_dlmix_fapi[0] + other_dlmix_fapi[0]:>8} {st_d_fapi_str:>10} | {totals['dlmix_cuphy'][0] + nrsim_dlmix_cuphy[0] + other_dlmix_cuphy[0]:>8} {st_d_cuphy_str:>10} | {totals['ulmix_fapi'][0] + nrsim_ulmix_fapi[0] + other_ulmix_fapi[0]:>8} {st_u_fapi_str:>10} | {totals['ulmix_cuphy'][0] + nrsim_ulmix_cuphy[0] + other_ulmix_cuphy[0]:>8} {st_u_cuphy_str:>10} | {dlmix_ulmix_total_count:>8} {st_all_str:>10} | {st_total_str:>15}")
 
     print("─" * 190)
     other_tvnr_fapi_c = sum(d.get("FAPI", [0, 0])[0] for d in other_tvnr.values())
@@ -352,7 +598,9 @@ def run_report(all_files: Dict, other_tvnr: Dict, non_tvnr: List, parse_errors: 
 
     ot_fapi_str = f"{other_tvnr_fapi_s / 1024:.1f}GB" if other_tvnr_fapi_s > 0 else "-"
     ot_cuphy_str = f"{other_tvnr_cuphy_s / 1024:.1f}GB" if other_tvnr_cuphy_s > 0 else "-"
-    print(f"{'Other TVnr_ (not DLMIX/ULMIX)':<30} | {other_tvnr_fapi_c:>8} {ot_fapi_str:>10} | {other_tvnr_cuphy_c:>8} {ot_cuphy_str:>10} | {'-':>8} {'-':>10} | {'-':>8} {'-':>10} | {other_tvnr_count:>8} {other_tvnr_total / 1024:.1f}GB     | {other_tvnr_total / 1024:>12.2f} GB")
+    ot_st_str = f"{other_tvnr_total / 1024:.1f}GB" if other_tvnr_total > 0 else "-"
+    ot_total_str = f"{other_tvnr_total / 1024:.2f} GB" if other_tvnr_total > 0 else "-"
+    print(f"{'Other TVnr_ (not DLMIX/ULMIX)':<30} | {other_tvnr_fapi_c:>8} {ot_fapi_str:>10} | {other_tvnr_cuphy_c:>8} {ot_cuphy_str:>10} | {'-':>8} {'-':>10} | {'-':>8} {'-':>10} | {other_tvnr_count:>8} {ot_st_str:>10} | {ot_total_str:>15}")
 
     non_tvnr_count = len(non_tvnr)
     non_tvnr_size = sum(s for _, s in non_tvnr)
@@ -370,8 +618,11 @@ def run_report(all_files: Dict, other_tvnr: Dict, non_tvnr: List, parse_errors: 
     print("   " + "═" * 60)
     print(f"   {'Category':<35} {'Files':>10} {'Size':>15}")
     print("   " + "─" * 60)
-    print(f"   {'DLMIX/ULMIX in Defined Patterns:':<35} {dlmix_ulmix_total_count - other_total_count:>10} {(dlmix_ulmix_total_size - other_total_size) / 1024:>13.2f} GB")
-    print(f"   {'DLMIX/ULMIX not in Patterns:':<35} {other_total_count:>10} {other_total_size / 1024:>13.2f} GB")
+    pattern_total_count = dlmix_ulmix_total_count - nrsim_total_count - other_total_count
+    pattern_total_size = dlmix_ulmix_total_size - nrsim_total_size - other_total_size
+    print(f"   {'DLMIX/ULMIX in Defined Patterns:':<35} {pattern_total_count:>10} {pattern_total_size / 1024:>13.2f} GB")
+    print(f"   {f'nrSim DLMIX/ULMIX TV >= {NRSIM_TV_MIN}:':<35} {nrsim_total_count:>10} {nrsim_total_size / 1024:>13.2f} GB")
+    print(f"   {f'Other DLMIX/ULMIX TV < {NRSIM_TV_MIN}:':<35} {other_total_count:>10} {other_total_size / 1024:>13.2f} GB")
     print(f"   {'Other TVnr_ files:':<35} {other_tvnr_count:>10} {other_tvnr_total / 1024:>13.2f} GB")
     print(f"   {'Non-TVnr_ .h5 files:':<35} {non_tvnr_count:>10} {non_tvnr_size / 1024:>13.2f} GB")
     print("   " + "─" * 60)
@@ -395,8 +646,13 @@ def run_report(all_files: Dict, other_tvnr: Dict, non_tvnr: List, parse_errors: 
 
 def run_report_lp(all_files: Dict, lp_ids: List, parse_errors: List, skipped_lines: int) -> bool:
     """Print report for one or more LPs (patterns): size of all child TVs. Returns False if any LP unknown."""
+    _ensure_patterns_loaded()
     valid_ids = [p[0] for p in PATTERNS]
     patterns_by_id = {p[0]: p for p in PATTERNS}
+    for lp_id, pattern in INDIVIDUAL_PATTERNS.items():
+        if lp_id not in patterns_by_id:
+            valid_ids.append(lp_id)
+            patterns_by_id[lp_id] = pattern
     for lp_id in lp_ids:
         if lp_id not in patterns_by_id:
             print(f"Error: Unknown LP '{lp_id}'. Valid LP IDs: {', '.join(valid_ids)}", file=sys.stderr)
@@ -528,6 +784,8 @@ Examples:
         help="Optional: analyze only these LP(s) and report size of their child TVs. Multiple IDs separated by commas, e.g. 81a,81c or 59c,102.",
     )
     args = parser.parse_args()
+
+    _ensure_patterns_loaded()
 
     dir_path = args.dir.resolve()
     if not dir_path.is_dir():

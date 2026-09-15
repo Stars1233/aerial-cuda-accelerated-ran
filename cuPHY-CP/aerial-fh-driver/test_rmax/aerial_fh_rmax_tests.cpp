@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +35,7 @@ static void user_cb(void* addr, void* opaque) {}
 TEST(RmaxTest, Open)
 {
     FronthaulInfo fronthaul_info{2, 500, 1, false, false, "unit_tests", {0}, true};
+    fronthaul_info.max_dl_antenna_ports = static_cast<uint16_t>(kMaxFlows);
     EXPECT_EQ(0, open(&fronthaul_info, &fhi));
     EXPECT_LE(0, rte_mbuf_dynflag_lookup(RTE_MBUF_DYNFLAG_TX_TIMESTAMP_NAME, nullptr));
     EXPECT_LE(0, rte_mbuf_dynfield_lookup(RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, nullptr));

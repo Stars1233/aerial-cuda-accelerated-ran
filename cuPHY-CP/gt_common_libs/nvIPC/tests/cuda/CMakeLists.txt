@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,11 +21,12 @@ set(CMAKE_CUDA_STANDARD 17)
 
 set(SOURCES test_cuda.cu)
 add_library(cudaipctest STATIC ${SOURCES})
-target_link_libraries(cudaipctest nvipc)
+target_link_libraries(cudaipctest nvipc cuda_driver_utils)
 
 set(SOURCES test_memcpy.cu)
 add_executable(test_memcopy ${SOURCES})
+target_link_libraries(test_memcopy CUDA::cuda_driver cuda_driver_utils nvlog)
 
 set (SOURCES cuda_ipc.cu)
 add_executable(cuda_ipc ${SOURCES})
-target_link_libraries(cuda_ipc nvipc cudaipctest -pthread)
+target_link_libraries(cuda_ipc nvipc cudaipctest cuda_driver_utils -pthread)

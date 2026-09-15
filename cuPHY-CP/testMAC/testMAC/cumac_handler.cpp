@@ -17,6 +17,8 @@
 
 #include <iostream>
 #include <fstream>
+#include <algorithm>
+#include <cstddef>
 
 #include "app_config.hpp"
 #include "nv_ipc_ring.h"
@@ -337,7 +339,11 @@ static void* cumac_tick_thread_func(void* arg)
 
         // Call TTI handler to send SLOT.indication
         sched_info.ts = ts_expected.tv_sec * 1e9 + ts_expected.tv_nsec;
-        _cumac_handler->on_tick_event(sched_info);
+        if(_cumac_handler->on_tick_event(sched_info) == 0)
+        {
+            // Get next SFN/SLOT if tick was handled
+            sched_info.ss = _cumac_handler->get_next_sfn_slot(sched_info.ss);
+        }
 
         // Add time interval to next expected slot
         ts_expected.tv_nsec += SLOT_INTERVAL;
@@ -346,7 +352,6 @@ static void* cumac_tick_thread_func(void* arg)
             ts_expected.tv_sec++;
             ts_expected.tv_nsec -= 1e9;
         }
-        sched_info.ss = _cumac_handler->get_next_sfn_slot(sched_info.ss);
     }
 
     return nullptr;
@@ -688,7 +693,7 @@ int cumac_handler::schedule_cell_update(uint64_t slot_counter)
             for (cell_param_t param : cmd.cell_params)
             {
                 char top_dir[1024];
-                get_root_path(top_dir, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+                get_cubb_root_path(top_dir);
 
                 char sys_cmd[2048];
                 int offset = snprintf(sys_cmd, 1024, "cd %s/build/cuPHY-CP/cuphyoam && ", top_dir);
@@ -913,6 +918,10 @@ void cumac_handler::print_cumac_thrput(uint64_t slot_counter)
             offset += snprintf(output + offset, sizeof(output) - offset,
                               " PFM_SORT %3u |", cumac_thrput.task_slots[CUMAC_TASK_PFM_SORT].load());
         }
+        if (task_bitmask & (0x1 << CUMAC_TASK_MU_UE_GRP)) {
+            offset += snprintf(output + offset, sizeof(output) - offset,
+                              " MU_UE_GRP %3u |", cumac_thrput.task_slots[CUMAC_TASK_MU_UE_GRP].load());
+        }
 
         // Add error, invalid and slots counters
         offset += snprintf(output + offset, sizeof(output) - offset,
@@ -930,18 +939,26 @@ void cumac_handler::print_cumac_thrput(uint64_t slot_counter)
     }
 }
 
-void cumac_handler::on_tick_event(sched_info_t sched_info)
+int cumac_handler::on_tick_event(sched_info_t sched_info)
 {
     if (is_app_exiting())
     {
         // Wake up cumac_sched thread to exit the loop
         sem_post(&cumac_scheduler_sem);
-        return;
+        return -1;
     }
 
     if (configured_cell_num < cell_num) {
-        NVLOGI_FMT(TAG, "SFN {}.{} on_tick_event ts={} skipped before cumac_cp init finishing", sched_info.ss.u16.sfn, sched_info.ss.u16.slot, sched_info.ts);
-        return;
+        NVLOGD_FMT(TAG, "SFN {}.{} on_tick_event ts={} skipped before cumac_cp init finishing", sched_info.ss.u16.sfn, sched_info.ss.u16.slot, sched_info.ts);
+        return -1;
+    }
+
+    // If builder thread is enabled, build next slot in advance and start scheduling from next tick
+    if (first_slot && cumac_build_in_advance != 0) {
+        sfn_slot_t ss_next = get_cumac_configs()->cumac_cp_standalone ? sched_info.ss : get_next_sfn_slot(sched_info.ss);
+        build_first_slot(ss_next);
+        first_slot = false;
+        return -1;
     }
 
     NVLOGI_FMT(TAG, "SFN {}.{} STATE: tick received: ts={}", sched_info.ss.u16.sfn, sched_info.ss.u16.slot, sched_info.ts);
@@ -954,6 +971,7 @@ void cumac_handler::on_tick_event(sched_info_t sched_info)
     {
         NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "Error: testCUMAC scheduler is full, please check SLOT.ind sending frequency");
     }
+    return 0;
 }
 
 void cumac_handler::on_msg(nv::phy_mac_msg_desc& msg)
@@ -987,8 +1005,6 @@ void cumac_handler::on_msg(nv::phy_mac_msg_desc& msg)
             // Successfully CONFIG.resp received, current cell CONFIG was done
             NVLOGC_FMT(TAG, "cell_config: cell_id={} OK", cell_id);
 
-            configured_cell_num ++;
-
             if(first_init[cell_id] == 1)
             {
                 first_init[cell_id] = 0;
@@ -999,37 +1015,7 @@ void cumac_handler::on_msg(nv::phy_mac_msg_desc& msg)
                 cell_start(cell_id);
             }
 
-            if(testmac_configs->cell_config_wait < 0)
-            {
-                // No wait for CONFIG.resp, skip
-                break;
-            }
-
-            if(current_config_cell_id.load() != cell_id)
-            {
-                NVLOGC_FMT(TAG, "cell_config: got cell_id={} response when current cell_id={}", current_config_cell_id.load(), cell_id);
-                // Skip, do not interrupt current cell config procedure
-                break;
-            }
-
-            config_retry_counter.store(0);
-            stop_reconfig_timer(cell_id);
-
-            if(testmac_configs->cell_config_wait > 0)
-            {
-                // Start the timer to wait for <cell_config_wait> ms then config next cell if exist
-                start_reconfig_timer(cell_id, testmac_configs->cell_config_wait);
-            }
-            else
-            {
-                // Immediately config next pending cell if exist
-                current_config_cell_id.store(-1);
-                int next_pending_cell = get_pending_config_cell_id();
-                if(next_pending_cell >= 0)
-                {
-                    send_config_request(next_pending_cell);
-                }
-            }
+            configured_cell_num ++;
         }
         else
         {
@@ -1119,7 +1105,7 @@ int cumac_handler::handle_sch_tti_response(nv::phy_mac_msg_desc& msg_desc, cumac
     vald.set_cumac_req(req);
     uint32_t nUeSchd = resp->nUeSchd;   // Actual scheduled UEs this TTI (may be < nMaxSchUePerCell)
 
-    if(cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_UE_SELECTION))
+    if(resp->taskBitMask & (0x1 << CUMAC_TASK_UE_SELECTION))
     {
         // Output data buffers
         uint16_t* setSchdUePerCellTTI = reinterpret_cast<uint16_t*>(buf_home + resp->offsets.setSchdUePerCellTTI);
@@ -1136,7 +1122,7 @@ int cumac_handler::handle_sch_tti_response(nv::phy_mac_msg_desc& msg_desc, cumac
         cumac_thrputs[msg_desc.cell_id].task_slots[CUMAC_TASK_UE_SELECTION]++;
     }
 
-    if(cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_PRB_ALLOCATION))
+    if(resp->taskBitMask & (0x1 << CUMAC_TASK_PRB_ALLOCATION))
     {
         int16_t* allocSol     = reinterpret_cast<int16_t*>(buf_home + resp->offsets.allocSol);
         uint32_t  allocSol_num = cell_cfg.allocType == 0 ? req->tv_data->req.nPrbGrp : 2 * nUeSchd;
@@ -1152,7 +1138,7 @@ int cumac_handler::handle_sch_tti_response(nv::phy_mac_msg_desc& msg_desc, cumac
         cumac_thrputs[msg_desc.cell_id].task_slots[CUMAC_TASK_PRB_ALLOCATION]++;
     }
 
-    if(cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_LAYER_SELECTION))
+    if(resp->taskBitMask & (0x1 << CUMAC_TASK_LAYER_SELECTION))
     {
         // Output data buffers
         uint8_t* layerSelSol = reinterpret_cast<uint8_t*>(buf_home + resp->offsets.layerSelSol);
@@ -1169,7 +1155,7 @@ int cumac_handler::handle_sch_tti_response(nv::phy_mac_msg_desc& msg_desc, cumac
         cumac_thrputs[msg_desc.cell_id].task_slots[CUMAC_TASK_LAYER_SELECTION]++;
     }
 
-    if(cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_MCS_SELECTION))
+    if(resp->taskBitMask & (0x1 << CUMAC_TASK_MCS_SELECTION))
     {
         // Output data buffers
         int16_t* mcsSelSol = reinterpret_cast<int16_t*>(buf_home + resp->offsets.mcsSelSol);
@@ -1200,7 +1186,7 @@ int cumac_handler::handle_sch_tti_response(nv::phy_mac_msg_desc& msg_desc, cumac
         cumac_thrputs[msg_desc.cell_id].task_slots[CUMAC_TASK_MCS_SELECTION]++;
     }
 
-    if(cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_PFM_SORT))
+    if(resp->taskBitMask & (0x1 << CUMAC_TASK_PFM_SORT))
     {
         // Output data buffers
         cumac_pfm_output_cell_info_t* pfmSortSol = reinterpret_cast<cumac_pfm_output_cell_info_t*>(buf_home + resp->offsets.pfmSortSol);
@@ -1216,9 +1202,50 @@ int cumac_handler::handle_sch_tti_response(nv::phy_mac_msg_desc& msg_desc, cumac
         cumac_thrputs[msg_desc.cell_id].task_slots[CUMAC_TASK_PFM_SORT]++;
     }
 
+    if(resp->taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        cumac_muUeGrp_resp_info_t* muUeGrpSol = reinterpret_cast<cumac_muUeGrp_resp_info_t*>(buf_home + resp->offsets.muUeGrpSol);
+        cumac_muUeGrp_resp_info_t* tv_muUeGrpSol = req->tv_data->resp.muUeGrpSol;
+
+        CUMAC_VALIDATE_U32_ERR(&vald, muUeGrpSol->numSchdUeg, tv_muUeGrpSol->numSchdUeg);
+
+        uint32_t numSchdUeg = std::min(muUeGrpSol->numSchdUeg, tv_muUeGrpSol->numSchdUeg);
+        for(uint32_t i = 0; i < numSchdUeg; i++)
+        {
+            cumac_muUeGrp_resp_ueg_info_t* schdUegInfo = &muUeGrpSol->schdUegInfo[i];
+            cumac_muUeGrp_resp_ueg_info_t* tv_schdUegInfo = &tv_muUeGrpSol->schdUegInfo[i];
+            CUMAC_VALIDATE_U8_ERR(&vald, schdUegInfo->numUeInGrp, tv_schdUegInfo->numUeInGrp);
+            CUMAC_VALIDATE_I16_ERR(&vald, schdUegInfo->allocPrgStart, tv_schdUegInfo->allocPrgStart);
+            CUMAC_VALIDATE_I16_ERR(&vald, schdUegInfo->allocPrgEnd, tv_schdUegInfo->allocPrgEnd);
+            CUMAC_VALIDATE_U8_ERR(&vald, schdUegInfo->flags, tv_schdUegInfo->flags);
+
+            uint32_t numUeInGrp = std::min(schdUegInfo->numUeInGrp, tv_schdUegInfo->numUeInGrp);
+            for(uint32_t j = 0; j < numUeInGrp; j++)
+            {
+                cumac_muUeGrp_resp_ue_info_t* ueInfo = &schdUegInfo->ueInfo[j];
+                cumac_muUeGrp_resp_ue_info_t* tv_ueInfo = &tv_schdUegInfo->ueInfo[j];
+                CUMAC_VALIDATE_U16_ERR(&vald, ueInfo->rnti, tv_ueInfo->rnti);
+                CUMAC_VALIDATE_U16_ERR(&vald, ueInfo->id, tv_ueInfo->id);
+                CUMAC_VALIDATE_U8_ERR(&vald, ueInfo->layerSel, tv_ueInfo->layerSel);
+                CUMAC_VALIDATE_U8_ERR(&vald, ueInfo->ueOrderInGrp, tv_ueInfo->ueOrderInGrp);
+                CUMAC_VALIDATE_U8_ERR(&vald, ueInfo->nSCID, tv_ueInfo->nSCID);
+                CUMAC_VALIDATE_U8_ERR(&vald, ueInfo->flags, tv_ueInfo->flags);
+            }
+        }
+
+        // Validate muUeGrpSol buffer
+        // CUMAC_VALIDATE_BYTES_ERR(&vald, muUeGrpSol, req->tv_data->resp.muUeGrpSol, sizeof(cumac_muUeGrp_resp_info_t));
+        if(cumac_configs->debug_option & 0x2)
+        {
+            print_array(msg_desc, "muUeGrpSol", reinterpret_cast<uint8_t*>(muUeGrpSol), sizeof(cumac_muUeGrp_resp_info_t));
+        }
+        cumac_thrputs[msg_desc.cell_id].task_slots[CUMAC_TASK_MU_UE_GRP]++;
+    }
+
     int vald_ret = vald.msg_ended();
 
-    NVLOGI_FMT(TAG_CUMAC, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} {} VALD={}", resp->sfn, resp->slot, msg_desc.cell_id, msg_desc.msg_id, get_cumac_msg_name(msg_desc.msg_id), vald_ret ? "FAIL" : "OK");
+    NVLOGI_FMT(TAG_CUMAC, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} {} task=0x{:02X} VALD={}",
+        resp->sfn, resp->slot, msg_desc.cell_id, msg_desc.msg_id, get_cumac_msg_name(msg_desc.msg_id), resp->taskBitMask, vald_ret ? "FAIL" : "OK");
 
     // Increases the slot number in cumac_thrput
     cumac_thrputs[msg_desc.cell_id].cumac_slots++;
@@ -1256,11 +1283,6 @@ void cumac_handler::receiver_thread_func()
     catch(std::exception& e)
     {
         NVLOGE_FMT(TAG, AERIAL_NVIPC_API_EVENT, "IPC send failed, please check whether cumac_cp is running properly", e.what());
-    }
-
-    if(cumac_build_in_advance != 0)
-    {
-        build_first_slot();
     }
 
     nv::phy_mac_msg_desc msg_desc;
@@ -1335,13 +1357,12 @@ void cumac_handler::scheduler_thread_func()
     NVLOGC_FMT(TAG, "[cumac_sched] thread exiting");
 }
 
-void cumac_handler::build_first_slot()
+void cumac_handler::build_first_slot(sfn_slot_t ss)
 {
-    NVLOGC_FMT(TAG, "{}: BUILD SFN 0.0 in advance", __func__);
+    NVLOGC_FMT(TAG, "{}: BUILD SFN {}.{} in advance", __func__, ss.u16.sfn, ss.u16.slot);
 
-    // Build SFN 0.0 CUMAC messages
-    sfn_slot_t ss = {.u32 = 0};
-    schedule_cumac_reqs({.u32 = 0}, -500 * 1000);
+    // Build the first slot CUMAC messages
+    schedule_cumac_reqs(ss, -500 * 1000);
 
     NVLOGI_FMT(TAG, "SFN {}.{} STATE: build ready: cell_num={}", ss.u16.sfn, ss.u16.slot, cell_num);
     sem_post(&cumac_sched_ready);
@@ -1460,31 +1481,6 @@ int cumac_handler::send_config_request(int cell_id)
     if(!cell_id_sanity_check(cell_id))
     {
         return -1;
-    }
-
-    if (testmac_configs->cell_config_wait >= 0)
-    {
-        int32_t cas_expected = -1;
-        bool cas_result = current_config_cell_id.compare_exchange_strong(cas_expected, cell_id);
-        if (cas_result == true)
-        {
-            // New config, send CONFIG.req
-            config_retry_counter.store(testmac_configs->cell_config_retry);
-        }
-        else if (cas_expected == cell_id)
-        {
-            // Current cell CONFIG is on going, retry config by re-send CONFIG.req
-            config_retry_counter.fetch_sub(1);
-        }
-        else
-        {
-            // Another cell config is ongoing, set this cell to pending and return
-            cumac_cell_data[cell_id].pending_config.store(1);
-            return 0;
-        }
-
-        // Start timer to check no CONFIG.resp when timeout
-        start_reconfig_timer(cell_id, testmac_configs->cell_config_timeout);
     }
 
     nv::phy_mac_msg_desc msg_desc;
@@ -1645,7 +1641,10 @@ int cumac_handler::build_sch_tti_request(int cell_id, vector<cumac_req_t*>& cuma
         cumac_tti_req_tv_t& tv = cumac_req->tv_data->req;
         cumac_tti_req_payload_t& req = head.payload;
 
-        req.taskBitMask = cumac_configs->task_bitmask;
+        // Per-slot taskBitMask is set by cumac_pattern::parse_tv_file: starts
+        // from cumac_configs->task_bitmask, with bit CUMAC_TASK_MU_UE_GRP
+        // cleared on slots whose muUePairTV file is missing.
+        req.taskBitMask = tv.taskBitMask;
         req.cellID = cell_id; // Ignore cellID from TV
         req.ULDLSch = tv.ULDLSch;
         req.nActiveUe = tv.nActiveUe;
@@ -1666,10 +1665,12 @@ int cumac_handler::build_sch_tti_request(int cell_id, vector<cumac_req_t*>& cuma
 
         cumac_cell_configs_t& cell_cfg = lp->get_cumac_cell_configs(msg_desc.cell_id);
 
-        // CRNTI is not needed for cuMAC-CP
-        copy_to_ipc_buf(msg_desc, tv.prgMsk, "prgMsk", req.offsets.prgMsk, offset, tv.nPrbGrp);
-        copy_to_ipc_buf(msg_desc, tv.wbSinr, "wbSinr", req.offsets.wbSinr, offset, tv.nActiveUe * tv.nUeAnt);
-        copy_to_ipc_buf(msg_desc, tv.avgRatesActUe, "avgRatesActUe", req.offsets.avgRatesActUe, offset, tv.nActiveUe);
+        if(req.taskBitMask & (0x1 << CUMAC_TASK_UE_SELECTION)) // multiCellUeSelection buffers
+        {
+            copy_to_ipc_buf(msg_desc, tv.prgMsk, "prgMsk", req.offsets.prgMsk, offset, tv.nPrbGrp);
+            copy_to_ipc_buf(msg_desc, tv.wbSinr, "wbSinr", req.offsets.wbSinr, offset, tv.nActiveUe * tv.nUeAnt);
+            copy_to_ipc_buf(msg_desc, tv.avgRatesActUe, "avgRatesActUe", req.offsets.avgRatesActUe, offset, tv.nActiveUe);
+        }
 
         if(req.taskBitMask & (0x1 << CUMAC_TASK_PRB_ALLOCATION)) // multiCellScheduler buffers
         {
@@ -1704,13 +1705,70 @@ int cumac_handler::build_sch_tti_request(int cell_id, vector<cumac_req_t*>& cuma
             copy_to_ipc_buf<cumac_pfm_cell_info_t, uint8_t>(msg_desc, tv.pfmCellInfo, "pfmCellInfo", req.offsets.pfmCellInfo, offset, 1);
         }
 
+        if(req.taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP)) // muUeGrp buffers (cumac_muUeGrp_req_info_t + payload)
+        {
+            if (ue_group_started.load(std::memory_order_acquire))
+            {
+                // cuMAC-CP SRS info
+                cumac_muUeGrp_req_srs_info_msh_t* srsInfoMsh = reinterpret_cast<cumac_muUeGrp_req_srs_info_msh_t*>(tv.muUeGrpInfo->payload);
+                uint32_t cumac_num_ue = tv.muUeGrpInfo->numSrsInfo;
+                for(uint32_t i = 0; i < cumac_num_ue && i < MAX_SRS_UE_PER_CELL_DEBUG; i++)
+                {
+                    cumac_cell_data[cell_id].cumac_rnti[i] = srsInfoMsh[i].rnti;
+                }
+                print_array(msg_desc, "cumac_rnti", cumac_cell_data[cell_id].cumac_rnti, cumac_num_ue);
+
+                // Validate cuPHY-CP and cuMAC-CP input data
+                if (_fapi_handler != nullptr)
+                {
+                    uint32_t slot_idx = get_slot_in_frame(head.sfn, head.slot);
+                    uint32_t cuphy_slot_idx = (slot_idx + SFN_SLOT_NUM_MAX - cumac_configs->srs_slot_lag) % SFN_SLOT_NUM_MAX;
+                    sfn_slot_t ss_cuphy;
+                    ss_cuphy.u16.sfn = cuphy_slot_idx / slots_per_frame;
+                    ss_cuphy.u16.slot = cuphy_slot_idx % slots_per_frame;
+                    fapi_req_t* fapi_req = _fapi_handler->get_fapi_req_data(cell_id, ss_cuphy.u16.sfn, ss_cuphy.u16.slot, channel_type_t::SRS);
+                    if (fapi_req != nullptr)
+                    {
+                        // Compare RNTI between cuPHY-CP and cuMAC-CP
+                        const test_vector_t& cuphy_tv = *fapi_req->tv_data;
+                        uint32_t cuphy_num_ue = cuphy_tv.srs_tv.data.size();
+                        for(uint32_t i = 0; i < cuphy_num_ue && i < MAX_SRS_UE_PER_CELL_DEBUG; i++)
+                        {
+                            const srs_tv_data_t& srs_tv_data = cuphy_tv.srs_tv.data[i];
+                            cumac_cell_data[cell_id].cuphy_rnti[i] = srs_tv_data.RNTI;
+                        }
+                        print_array(msg_desc, "cuphy_rnti", cumac_cell_data[cell_id].cuphy_rnti, cuphy_num_ue);
+
+                        // Compare
+                        if (cuphy_num_ue != cumac_num_ue)
+                        {
+                            NVLOGI_FMT(TAG, "SFN {}.{}: rnti number mismatch: cell_id={} cuphy_num_ue={} cumac_num_ue={}",
+                                head.sfn, head.slot, cell_id, cuphy_num_ue, cumac_num_ue);
+                        }
+                    }
+                    else
+                    {
+                        NVLOGW_FMT(TAG, "SFN {}.{}: RNTI: cell_id={} SRS FAPI TV not found", head.sfn, head.slot, cell_id);
+                    }
+                }
+
+                copy_to_ipc_buf<uint8_t, uint8_t>(msg_desc, reinterpret_cast<uint8_t*>(tv.muUeGrpInfo), "muUeGrpInfo", req.offsets.muUeGrpInfo, offset, tv.muUeGrpReqDataLen);
+            }
+            else
+            {
+                req.taskBitMask &= ~(0x1 << CUMAC_TASK_MU_UE_GRP);
+                NVLOGI_FMT(TAG, "SFN {}.{}: cell_id={} SKIP MU UE GROUP for SCH_TTI.req because first_ue_group_slot={}",
+                    head.sfn, head.slot, cell_id, lp->get_first_ue_group_slot());
+            }
+        }
+
         msg_desc.msg_len = sizeof(cumac_sch_tti_req_t);
         msg_desc.data_len = offset;
 
         clock_gettime(CLOCK_MONOTONIC, &ts_end);
         int64_t build_time = nvlog_timespec_interval(&ts_start, &ts_end);
-        NVLOGI_FMT(TAG, "SFN {}.{}: BUILD: SCH_TTI.req cell_id={} cellID={} ULDLSch={} nActiveUe={} nBsAnt={} nUeAnt={} msg_len={} data_len={} time={}ns",
-                head.sfn, head.slot, cell_id, req.cellID, req.ULDLSch, req.nActiveUe, req.nBsAnt, req.nUeAnt, msg_desc.msg_len, msg_desc.data_len, build_time);
+        NVLOGI_FMT(TAG, "SFN {}.{}: BUILD: SCH_TTI.req cell_id={} task=0x{:X} cellID={} ULDLSch={} nActiveUe={} nBsAnt={} nUeAnt={} msg_len={} data_len={} time={}ns",
+                head.sfn, head.slot, cell_id, req.taskBitMask, req.cellID, req.ULDLSch, req.nActiveUe, req.nBsAnt, req.nUeAnt, msg_desc.msg_len, msg_desc.data_len, build_time);
     }
 
     if(offset > cumac_configs->get_max_data_size())
@@ -1760,16 +1818,44 @@ int cumac_handler::schedule_cumac_request(int cell_id, sfn_slot_t ss, cumac_grou
 
         switch(group_id)
         {
-            case CUMAC_SCH_TTI_REQ: { //TODO
+            case CUMAC_SCH_TTI_REQ: {
+                if (cumac_reqs[0]->tv_data == nullptr)
+                {
+                    NVLOGI_FMT(TAG, "SFN {}.{} cell_id={} tv_data=nullptr", ss.u16.sfn, ss.u16.slot, cell_id);
+                    return 0;
+                }
+
+                uint32_t bitmask = cumac_reqs[0]->tv_data->req.taskBitMask;
+                if(bitmask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+                {
+                    if (!ue_group_started.load(std::memory_order_acquire))
+                    {
+                        int first_ue_group_slot = lp->get_first_ue_group_slot();
+                        int slot_index = get_slot_in_frame(ss) % lp->get_sched_slot_num();
+                        if (first_ue_group_slot < 0 || slot_index >= first_ue_group_slot)
+                        {
+                            ue_group_started.store(true, std::memory_order_release);
+                        }
+                    }
+                    if (!ue_group_started.load(std::memory_order_acquire))
+                    {
+                        bitmask &= ~(0x1 << CUMAC_TASK_MU_UE_GRP);
+                    }
+                }
+                if (bitmask == 0)
+                {
+                    NVLOGI_FMT(TAG, "SFN {}.{} cell_id={} taskBitMask=0", ss.u16.sfn, ss.u16.slot, cell_id);
+                    return 0;
+                }
+
                 if(data_buf_opt == 1)
                 {
                     msg_desc.data_pool = NV_IPC_MEMPOOL_CPU_DATA;
                 }
                 else if(data_buf_opt == 2)
                 {
-                    NVLOGI_FMT(TAG, "Cannot use GPU pools for TX DATA yet");
-                    msg_desc.data_pool = NV_IPC_MEMPOOL_CUDA_DATA;
-                    return -1;
+                    NVLOGI_FMT(TAG, "Using CPU_LARGE pool for CUMAC SCH TTI (fapi_tb_loc=2)");
+                    msg_desc.data_pool = NV_IPC_MEMPOOL_CPU_LARGE;
                 }
                 else if(data_buf_opt == 3)
                 {
@@ -1858,7 +1944,7 @@ int cumac_handler::send_tti_end(int cell_id, sfn_slot_t& ss)
 
     transport().tx_send(msg_desc);
 
-    if(notify_mode == IPC_SYNC_PER_MSG)
+    if(notify_mode == IPC_SYNC_PER_MSG || notify_mode == IPC_SYNC_PER_CELL)
     {
         // Notify once every CUMAC message
         transport().notify(1);
@@ -1933,12 +2019,6 @@ int cumac_handler::schedule_cumac_reqs(sfn_slot_t ss, int ts_offset, int specifi
             total_count += cumac_count;
         }
 
-        if (notify_mode == IPC_SYNC_PER_CELL && cumac_stt > 0 && cell_id == (cell_num-1) && ts_offset > 0)
-        {
-            NVLOGI_FMT(TAG, "SFN {}.{} NOTIFY: cell_id={} cumac_build_num={} cumac_sent_num={}", ss.u16.sfn, ss.u16.slot, cell_id, cumac_sched.cumac_build_num, cumac_sched.cumac_sent_num);
-            // Trigger the last sync event after sleeping to ts_offset
-            transport().notify(cumac_sched.cumac_sent_num);
-        }
     }
     return total_count;
 }

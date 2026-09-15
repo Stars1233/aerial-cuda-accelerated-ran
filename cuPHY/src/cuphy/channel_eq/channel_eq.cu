@@ -26,6 +26,7 @@
 #include "cuda_fp16.h"
 #include <cooperative_groups.h>
 #include "channel_eq.hpp"
+#include "dft_s_ofdm_bluestein_workspace.hpp"
 #include "type_convert.hpp"
 #include <cstddef>
 #include <vector>
@@ -57,6 +58,7 @@ namespace channel_eq
 #endif
 
 #define LEGACY_LLR_SCALE
+#define MAX_LAYERS_PER_SPLIT_72E_SOFT_DEMAP_LAYER_GROUP (2)
 #define EQ_COEF_COMP_H_MIMO_VER (2)
 // Set 0 to use the explicit demapper, 1 to use the texture based demapper, 2 to use the simplified soft demapper
 // note: if EQ_SOFT_DEMAP_USE_TEX is set to 0, i.e. using legacy demapper, it works only for single symbol per slot (ENABLE_MULTI_SYMBS_PER_THRD_BLK = 0)
@@ -3463,7 +3465,6 @@ __device__ void ch_eq_simplified_soft_demapper(const int                        
     {
         typedef soft_demapper::soft_demapper_simplified<TCompute, TStorageOut> soft_demapper_t;
         typedef soft_demapper::LLR_group<TStorageOut, 8>                       llr_group_t;
-        typedef soft_demapper::noise_type_map<TStorageOut>                     noise_type_map_t;
 
         // LLR output structure. Up to 8 LLRs may be required (for QAM256).
         llr_group_t grp;
@@ -3471,20 +3472,20 @@ __device__ void ch_eq_simplified_soft_demapper(const int                        
 
         if(nPamBits==0)
         {
-            soft_demapper_t::symbol_to_LLR_group(grp,                                           // LLR output
-                                                 softEst,                                       // symbol input
-                                                 noise_type_map_t::scale(noiseInv, 1.0f),       // PAM noise var inverse  //TODO
-                                                 1);                                            // pi/2 BPSK
+            soft_demapper_t::symbol_to_LLR_group(grp,             // LLR output
+                                                 softEst,         // symbol input
+                                                 noiseInv * 2.0f, // PAM noise var inverse
+                                                 1);              // pi/2 BPSK
         }
         else
         {
             // noiseInv input is the inverse of the (complex, QAM) noise variance
             // PAM_variance = QAM_variance / 2
             // 1 / PAM_variance = inv_PAM_variance = 2 / QAM_variance = 2 * inv_QAM_variance
-            soft_demapper_t::symbol_to_LLR_group(grp,                                     // LLR output
-                                             softEst,                                     // symbol input
-                                             noise_type_map_t::scale(noiseInv, 2.0f),     // PAM noise var inverse
-                                             nPamBits * 2);                               // QAM bits
+            soft_demapper_t::symbol_to_LLR_group(grp,         // LLR output
+                                             softEst,         // symbol input
+                                             noiseInv * 2.0f, // PAM noise var inverse
+                                             nPamBits * 2);   // QAM bits
         }
         KERNEL_PRINT_GRID_ONCE("LLR_tex = (%f %f %f %f  %f %f %f %f)\n",
                                grp[0],
@@ -3523,7 +3524,6 @@ __device__ void ch_eq_soft_demapper_tex(const int                               
     {
         typedef soft_demapper::soft_demapper_any<TCompute, TStorageOut> soft_demapper_t;
         typedef soft_demapper::LLR_group<TStorageOut, 8>                llr_group_t;
-        typedef soft_demapper::noise_type_map<TStorageOut>              noise_type_map_t;
 
         // LLR output structure. Up to 8 LLRs may be required (for QAM256).
         llr_group_t grp;
@@ -3531,22 +3531,22 @@ __device__ void ch_eq_soft_demapper_tex(const int                               
 
         if(nPamBits==0)
         {
-            soft_demapper_t::symbol_to_LLR_group(grp,                                       // LLR output
-                                             softEst,                                       // symbol input
-                                             noise_type_map_t::scale(noiseInv, 1.0f),       // PAM noise var inverse  //TODO
-                                             1,                                             // pi/2 BPSK
-                                             texObj);                                       // CUDA texture object
+            soft_demapper_t::symbol_to_LLR_group(grp,         // LLR output
+                                             softEst,         // symbol input
+                                             noiseInv * 2.0f, // PAM noise var inverse
+                                             1,               // pi/2 BPSK
+                                             texObj);         // CUDA texture object
         }
         else
         {
             // noiseInv input is the inverse of the (complex, QAM) noise variance
             // PAM_variance = QAM_variance / 2
             // 1 / PAM_variance = inv_PAM_variance = 2 / QAM_variance = 2 * inv_QAM_variance
-            soft_demapper_t::symbol_to_LLR_group(grp,                                     // LLR output
-                                             softEst,                                     // symbol input
-                                             noise_type_map_t::scale(noiseInv, 2.0f),     // PAM noise var inverse
-                                             nPamBits * 2,                                // QAM bits
-                                             texObj);                                     // CUDA texture object
+            soft_demapper_t::symbol_to_LLR_group(grp,             // LLR output
+                                                 softEst,         // symbol input
+                                                 noiseInv * 2.0f, // PAM noise var inverse
+                                                 nPamBits * 2,    // QAM bits
+                                                 texObj);         // CUDA texture object
         }
         KERNEL_PRINT_GRID_ONCE("LLR_tex = (%f %f %f %f  %f %f %f %f)\n",
                                grp[0],
@@ -3574,9 +3574,396 @@ template <typename TStorageIn,
           typename TStorageOut,
           typename TCompute,
           uint32_t N_BS_ANTS,            // # of BS antenna (# of cols of C matrix) [difficult to remove as this is used by cooperative groups.]
+          uint16_t SYMBOL_BITMASK,
+          bool enableDebugEqOutput,
+          bool enableTfPrcd,
+          bool enableTdi,
+          bool enableCfoCorrection>
+__device__ void
+eqMmseSoftDemapKernel_v4(const puschRxChEqStatDescr_t *pStatDescr,
+                         const cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms,
+                         bool (&smem_is_dmrs_symbol)[OFDM_SYMBOLS_PER_SLOT],
+                         int (&smem_llr_addr_offset)[OFDM_SYMBOLS_PER_SLOT],
+                         typename complex_from_scalar<TCompute>::type (&sC)[N_BS_ANTS][N_MAX_DMRS_SYMS][CUPHY_N_TONES_PER_PRB + 1])
+{
+    // Early exit check
+    // The grid is sized to process the max # of PRBs in a given heterogenous config. Exit if the PRB to be
+    // processed by this thread block does not exist in the UE group
+    const uint32_t PRB_IDX  = blockIdx.x;
+
+    const uint16_t nPrb = drvdUeGrpPrms.nPrb;
+    if(PRB_IDX >= nPrb) return;
+    const uint32_t N_LAYERS = drvdUeGrpPrms.nLayers;
+    const uint32_t layerIdx = blockIdx.y;
+    if (layerIdx >= N_LAYERS) return;
+
+    uint16_t nDataSym = drvdUeGrpPrms.nDataSym;
+    const uint8_t nDmrsCdmGrpsNoData = drvdUeGrpPrms.nDmrsCdmGrpsNoData;
+    if(nDmrsCdmGrpsNoData==1)
+    {
+        nDataSym += drvdUeGrpPrms.nDmrsSyms;
+    }
+
+    const uint16_t dmrsMaxLen  = drvdUeGrpPrms.dmrsMaxLen;
+    const uint16_t nDmrsSym    = drvdUeGrpPrms.nDmrsSyms / dmrsMaxLen;
+
+    //--------------------------------------------------------------------------------------------------------
+    typedef typename complex_from_scalar<TCompute>::type    TComplexCompute;
+    typedef typename complex_from_scalar<TDataRx>::type     TComplexDataRx;
+    typedef typename complex_from_scalar<TStorageIn>::type  TComplexStorageIn;
+    typedef typename complex_from_scalar<TStorageOut>::type TComplexStorageOut;
+
+    // clang-format off
+    uint16_t startPrb           = drvdUeGrpPrms.startPrb;
+    const uint8_t *dataSymLoc         = drvdUeGrpPrms.dataSymLoc;
+    const uint8_t *dmrsSymLoc         = drvdUeGrpPrms.dmrsSymLoc;
+    const uint8_t *qam                = drvdUeGrpPrms.qam;
+    const uint8_t *pUeGrpLayerToUeIdx = drvdUeGrpPrms.ueGrpLayerToUeIdx;
+
+    const int3 tDataRxStrides = make_int3(
+        drvdUeGrpPrms.tInfoDataRx.strides[0],
+        drvdUeGrpPrms.tInfoDataRx.strides[1],
+        drvdUeGrpPrms.tInfoDataRx.strides[2]);
+
+    tensor_ref<const TComplexStorageIn> tCoef       (drvdUeGrpPrms.tInfoEqCoef.pAddr         , drvdUeGrpPrms.tInfoEqCoef.strides         ); // (N_LAYERS, N_BS_ANTS, NF, NH)
+    tensor_ref<const TStorageIn>        tReeDiagInv (drvdUeGrpPrms.tInfoReeDiagInv.pAddr     , drvdUeGrpPrms.tInfoReeDiagInv.strides     ); // (N_LAYERS, NF, NH)
+    tensor_ref<const TComplexDataRx>    tDataRx     (drvdUeGrpPrms.tInfoDataRx.pAddr         , drvdUeGrpPrms.tInfoDataRx.strides         ); // (NF, ND, N_BS_ANTS)
+    tensor_ref<TStorageOut>             tLlr        (drvdUeGrpPrms.tInfoLLR.pAddr            , drvdUeGrpPrms.tInfoLLR.strides            ); // (N_LLR, N_LAYERS, NF, ND)
+    tensor_ref<TStorageOut>             tLlrCdm1    (drvdUeGrpPrms.tInfoLLRCdm1.pAddr        , drvdUeGrpPrms.tInfoLLRCdm1.strides        ); // (N_LLR, N_LAYERS, NF, ND)
+#ifdef ENABLE_DEBUG
+    tensor_ref<TComplexStorageOut>      tDbg        (drvdUeGrpPrms.tInfoChEqSoftDempDbg.pAddr, drvdUeGrpPrms.tInfoChEqSoftDempDbg.strides);
+#endif
+    // clang-format on
+
+    thread_block const& thisThrdBlk = this_thread_block();
+    if constexpr (!enableTfPrcd)
+    {
+        if ((nDataSym > 0) && (nDmrsCdmGrpsNoData==1)) {
+            constexpr uint32_t WARP_SIZE = 32;
+            const uint32_t tid = thisThrdBlk.thread_rank();
+            const uint32_t warp_id = tid / WARP_SIZE;
+
+            if (warp_id == 0) {
+                for (uint32_t t = tid; t < OFDM_SYMBOLS_PER_SLOT; t += WARP_SIZE) {
+                    smem_is_dmrs_symbol[t] = false;
+                    smem_llr_addr_offset[t] = 0;
+                }
+
+                __syncwarp();
+
+                for (uint8_t dmrs_idx=tid; dmrs_idx<drvdUeGrpPrms.nDmrsSyms; dmrs_idx += WARP_SIZE) {
+                    smem_is_dmrs_symbol[dmrsSymLoc[dmrs_idx]] = true;
+                }
+
+                __syncwarp();
+
+                const int addr_accum_per_data_sym = tLlr.strides[3];
+                const int addr_accum_per_dmrs_sym = (tLlr.strides[3]>>1);
+                for (uint32_t t = dataSymLoc[0]+1+tid; t < OFDM_SYMBOLS_PER_SLOT; t += WARP_SIZE) {
+                    smem_llr_addr_offset[t] = (smem_is_dmrs_symbol[t-1] ? addr_accum_per_dmrs_sym : addr_accum_per_data_sym);
+                }
+
+                __syncwarp();
+
+                if (tid == 0) {
+                    // This prefix sum could be done more efficiently in parallel. The maximum length is
+                    // OFDM_SYMBOLS_PER_SLOT (=14) and the current implementation is ~1.5% of the
+                    // executed instrutions of the kernel for one profile.
+                    for (int i = dataSymLoc[0]+1; i < OFDM_SYMBOLS_PER_SLOT; i++) {
+                        smem_llr_addr_offset[i] += smem_llr_addr_offset[i-1];
+                    }
+                }
+            }
+
+            __syncthreads();
+        }
+    }
+
+    //--------------------------------------------------------------------------------------------------------
+
+    const uint32_t FREQ_IDX = threadIdx.x;
+    const uint32_t DATA_SYMB_ABS_IDX = threadIdx.y;
+
+    if (DATA_SYMB_ABS_IDX >= nDataSym) return;
+
+    const uint32_t GMEM_WR_FREQ_IDX = FREQ_IDX;
+
+    // PRB index processed by this thread
+    const uint32_t THRD_BLK_ABS_START_FREQ_IDX = PRB_IDX * CUPHY_N_TONES_PER_PRB;
+
+    // Subcarrier sample location in global memory
+    const uint32_t GMEM_ABS_WR_FREQ_IDX = THRD_BLK_ABS_START_FREQ_IDX + GMEM_WR_FREQ_IDX;
+    const uint32_t GMEM_ABS_RD_FREQ_IDX = GMEM_ABS_WR_FREQ_IDX + 12 * startPrb;
+
+    // Cache commonly used index once
+    const uint8_t symIdx = dataSymLoc[DATA_SYMB_ABS_IDX];
+
+    if((SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK) || (SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
+    {
+        if(!((SYMBOL_BITMASK>>symIdx)&1))
+        {
+            return;
+        }
+    }
+
+    static_assert(EQ_SOFT_DEMAP_USE_TEX == 1 || EQ_SOFT_DEMAP_USE_TEX == 2, "v4 soft demapper kernel assumes EQ_SOFT_DEMAP_USE_TEX == 1 or 2");
+
+    //--------------------------------------------------------------------------------------------------------
+    // Compute interpolated equalizer coefficients
+    TCompute alpha1;
+    TCompute alpha2;
+    uint32_t dmrsIdx = 1;
+
+    if constexpr (enableTdi)
+    {
+         while ((dmrsIdx<(nDmrsSym-1))&&(dmrsSymLoc[(dmrsIdx+1) * dmrsMaxLen-1] < symIdx))
+         {
+             dmrsIdx++;
+         }
+
+        alpha1 = (dmrsSymLoc[dmrsIdx*dmrsMaxLen] - static_cast<uint8_t>(symIdx)) / static_cast<TCompute>(dmrsSymLoc[dmrsIdx*dmrsMaxLen] - dmrsSymLoc[(dmrsIdx-1)*dmrsMaxLen]);
+        alpha2 = (static_cast<uint8_t>(symIdx) - dmrsSymLoc[(dmrsIdx-1)*dmrsMaxLen]) / static_cast<TCompute>(dmrsSymLoc[dmrsIdx*dmrsMaxLen] - dmrsSymLoc[(dmrsIdx-1)*dmrsMaxLen]);
+    }
+
+    //--------------------------------------------------------------------------------------------------------
+    // Process
+
+    // Load QAM info for each layer
+    const uint8_t pamBitLen = qam[layerIdx] / 2;
+
+    TComplexCompute softEst = cuGet<TComplexCompute>(0.f);
+
+    // cache tCoef into shared mem to avoid repeated access to gmem
+
+    if constexpr (enableTdi)
+    {
+        // TDI path -------------------------------------------------------------------
+        // Cooperatively load into shared mem
+        // Store all dIdx planes so each thread can use its own dmrsIdx
+        if (threadIdx.y < nDmrsSym)
+        {
+            const int32_t strideAnt = tCoef.strides[0];
+            const int32_t strideH   = tCoef.strides[4];
+            const int dIdx  = threadIdx.y;
+            int32_t coefOff = tCoef.offset(0, FREQ_IDX, layerIdx, PRB_IDX) + dIdx * strideH;
+
+            #pragma unroll
+            for (int ant = 0; ant < (int)N_BS_ANTS; ++ant)
+            {
+                sC[ant][dIdx][FREQ_IDX] = type_convert<TComplexCompute>(tCoef.addr[coefOff]);
+                coefOff += strideAnt;
+            }
+        }
+        __syncthreads();
+
+        if constexpr (N_BS_ANTS <= 4) {
+            // For small antenna counts, use per-antenna registers to increase ILP
+            TComplexDataRx Y_reg[N_BS_ANTS];
+            TComplexCompute C_reg[N_BS_ANTS];
+
+            const int rxOffset = GMEM_ABS_RD_FREQ_IDX * tDataRxStrides.x + symIdx * tDataRxStrides.y;
+            const int rxStride = tDataRxStrides.z;
+            #pragma unroll
+            for (int ant = 0; ant < N_BS_ANTS; ant++) {
+                C_reg[ant] = (sC[ant][dmrsIdx - 1][FREQ_IDX] * alpha1 + sC[ant][dmrsIdx][FREQ_IDX] * alpha2);
+                Y_reg[ant] = tDataRx.addr[rxOffset + ant * rxStride];
+            }
+
+            // We see better performance with this loop not merged into the previous loop.
+            // We want the loads followed by compute rather than to have the two intermixed.
+            #pragma unroll
+            for (int ant = 0; ant < N_BS_ANTS; ant++) {
+                softEst = cuCma(C_reg[ant], type_convert<TComplexCompute>(Y_reg[ant]), softEst);
+            }
+        } else {
+            TComplexCompute Cnext;
+            TComplexCompute Ynext;
+
+            // prefetch; Each thread uses its own dmrsIdx
+            Cnext = (sC[0][dmrsIdx - 1][FREQ_IDX] * alpha1 + sC[0][dmrsIdx][FREQ_IDX] * alpha2);
+            const int rxOffset = GMEM_ABS_RD_FREQ_IDX * tDataRxStrides.x + symIdx * tDataRxStrides.y;
+            Ynext = type_convert<TComplexCompute>(tDataRx.addr[rxOffset]);
+
+            #pragma unroll
+            for (int ant = 0; ant + 1 < (int)N_BS_ANTS; ant++) {
+                softEst = cuCma(Cnext, Ynext, softEst);
+                // prefetch next
+                Cnext = (sC[ant + 1][dmrsIdx - 1][FREQ_IDX] * alpha1 + sC[ant + 1][dmrsIdx][FREQ_IDX] * alpha2);
+                Ynext = type_convert<TComplexCompute>(tDataRx.addr[rxOffset + (ant + 1) * tDataRxStrides.z]);
+            }
+            // tail
+            softEst = cuCma(Cnext, Ynext, softEst);
+        }
+    }
+    else
+    {
+        // non-TDI path ---------------------------------------------------------------
+        if constexpr (N_BS_ANTS <= 4) {
+            // For small antenna counts, avoid the use of shared memory and load directly
+            // into registers. Use per-antenna registers to increase ILP.
+            TComplexDataRx Y_reg[N_BS_ANTS];
+            TComplexCompute C_reg[N_BS_ANTS];
+
+            const int rxOffset = GMEM_ABS_RD_FREQ_IDX * tDataRxStrides.x + symIdx * tDataRxStrides.y;
+            const int coefBase = tCoef.offset(0, FREQ_IDX, layerIdx, PRB_IDX);
+            const int coefStride = tCoef.strides[0];
+            const int rxStride = tDataRx.strides[2];
+            #pragma unroll
+            for (int ant = 0; ant < N_BS_ANTS; ant++) {
+                C_reg[ant] = type_convert<TComplexCompute>(tCoef.addr[coefBase + ant * coefStride]);
+                Y_reg[ant] = tDataRx.addr[rxOffset + ant * rxStride];
+            }
+
+            // We see better performance with this loop not merged into the previous loop.
+            // We want the loads followed by compute rather than to have the two intermixed.
+            #pragma unroll
+            for (int ant = 0; ant < N_BS_ANTS; ant++) {
+                softEst = cuCma(C_reg[ant], type_convert<TComplexCompute>(Y_reg[ant]), softEst);
+            }
+        } else {
+            // Load once for DATA_SYMB_ABS_IDX = 0 (threadIdx.y==0) into shared and reuse
+            if (0 == threadIdx.y) {
+                #pragma unroll 1
+                for (int ant = 0; ant < N_BS_ANTS; ant++) {
+                    const int32_t coefOff = tCoef.offset(ant, FREQ_IDX, layerIdx, PRB_IDX);
+                    sC[ant][0][FREQ_IDX] = type_convert<TComplexCompute>(tCoef.addr[coefOff]);
+                }
+            }
+            __syncthreads();
+
+            // prefetch
+            TComplexCompute Cnext = sC[0][0][FREQ_IDX];
+            const int rxOffset = GMEM_ABS_RD_FREQ_IDX * tDataRxStrides.x + symIdx * tDataRxStrides.y;
+            TComplexCompute Ynext = type_convert<TComplexCompute>(tDataRx.addr[rxOffset]);
+
+            #pragma unroll
+            for (int ant = 0; ant + 1 < (int)N_BS_ANTS; ant++) {
+                softEst = cuCma(Cnext, Ynext, softEst);
+                // prefetch next
+                Cnext = sC[ant + 1][0][FREQ_IDX];
+                Ynext = type_convert<TComplexCompute>(tDataRx.addr[rxOffset + (ant + 1) * tDataRxStrides.z]);
+            }
+            // tail
+            softEst = cuCma(Cnext, Ynext, softEst);
+        }
+    }
+
+    if constexpr (enableCfoCorrection)
+    {
+        tensor_ref<const TComplexStorageIn> tCfoEst(drvdUeGrpPrms.tInfoCfoEst.pAddr, drvdUeGrpPrms.tInfoCfoEst.strides); // (MAX_ND_SUPPORTED, N_LAYERS)
+        softEst = cuCmul(softEst, type_convert<TComplexCompute>(tCfoEst(symIdx, pUeGrpLayerToUeIdx[layerIdx])));
+    }
+
+    if constexpr (!enableTfPrcd)
+    {
+        // Determine the output LLR address
+        TStorageOut* LLRdst = tLlr.addr + tLlr.offset(0,
+                                                      layerIdx,
+                                                      GMEM_ABS_WR_FREQ_IDX,
+                                                      DATA_SYMB_ABS_IDX);
+        // Perform the soft demapping operation
+        TStorageOut* LLRCdm1dst;
+        uint8_t write_flag = 0;
+        if(nDmrsCdmGrpsNoData==1)
+        {
+            const uint8_t dmrs_flag = smem_is_dmrs_symbol[dataSymLoc[DATA_SYMB_ABS_IDX]];
+            int addr_offset = smem_llr_addr_offset[dataSymLoc[DATA_SYMB_ABS_IDX]];
+
+            if(dmrs_flag)
+            {
+                if(GMEM_ABS_WR_FREQ_IDX%2)
+                {
+                    addr_offset += (tLlr.strides[1]*layerIdx+tLlr.strides[2]*(GMEM_ABS_WR_FREQ_IDX>>1));
+                    write_flag = 1;
+                }
+                else
+                {
+                    write_flag = 0;
+                }
+            }
+            else
+            {
+                addr_offset += (tLlr.strides[1]*layerIdx+tLlr.strides[2]*GMEM_ABS_WR_FREQ_IDX);
+                write_flag = 1;
+            }
+            LLRCdm1dst = tLlrCdm1.addr + addr_offset;
+        }
+
+        // Load noiseInv for each layer
+        TCompute reeDiagInv;
+        if (enableTdi && symIdx > dmrsSymLoc[dmrsMaxLen - 1]) {
+            reeDiagInv = type_convert<TCompute>(tReeDiagInv(FREQ_IDX, layerIdx, PRB_IDX, dmrsIdx));
+        } else {
+            reeDiagInv = type_convert<TCompute>(tReeDiagInv(FREQ_IDX, layerIdx, PRB_IDX, 0));
+        }
+
+#if(EQ_SOFT_DEMAP_USE_TEX == 2)
+        ch_eq_simplified_soft_demapper<TStorageOut, TCompute>(0,        // PER_LAYER_THRD_IDX
+                                                              pamBitLen,                 // nPamBits
+                                                              reeDiagInv,                // noiseInv
+                                                              softEst,                   // softEst
+                                                              LLRdst);                   // LLR_output address
+
+        if(write_flag)
+        {
+            ch_eq_simplified_soft_demapper<TStorageOut, TCompute>(0,     // PER_LAYER_THRD_IDX
+                                                                  pamBitLen,              // nPamBits
+                                                                  reeDiagInv,             // noiseInv
+                                                                  softEst,                // softEst
+                                                                  LLRCdm1dst);            // LLR_output address
+        }
+#elif(EQ_SOFT_DEMAP_USE_TEX == 1)
+
+        ch_eq_soft_demapper_tex<TStorageOut, TCompute>(0,        // PER_LAYER_THRD_IDX
+                                                       pamBitLen,              // nPamBits
+                                                       reeDiagInv,             // noiseInv
+                                                       softEst,                   // softEst
+                                                       LLRdst,                    // LLR_output address
+                                                       statDescr->demapper_tex); // texture object
+
+        if(write_flag)
+        {
+            ch_eq_soft_demapper_tex<TStorageOut, TCompute>(0,        // PER_LAYER_THRD_IDX
+                                                           pamBitLen,              // nPamBits
+                                                           reeDiagInv,             // noiseInv
+                                                           softEst,                   // softEst
+                                                           LLRCdm1dst,                // LLR_output address
+                                                           statDescr->demapper_tex); // texture object
+        }
+#else
+    #error "Unsupported EQ_SOFT_DEMAP_USE_TEX value"
+#endif
+
+
+    }
+    else
+    {
+        tensor_ref<TComplexCompute>         tDataEqDft  (drvdUeGrpPrms.tInfoDataEqDft.pAddr      , drvdUeGrpPrms.tInfoDataEqDft.strides); // (NF*ND)
+        tDataEqDft(GMEM_ABS_WR_FREQ_IDX + DATA_SYMB_ABS_IDX*nPrb*CUPHY_N_TONES_PER_PRB) = softEst;
+    }
+
+    // FixMe update comments related to enableDebugEqOutput
+    if constexpr (enableDebugEqOutput) {
+        // Pick one of the N_BS_ANTS threads to store the resulting soft estimate
+        tensor_ref<TComplexStorageOut> tDataEq(drvdUeGrpPrms.tInfoDataEq.pAddr, drvdUeGrpPrms.tInfoDataEq.strides); // (N_LAYERS, NF, ND)
+        tDataEq(layerIdx, GMEM_ABS_WR_FREQ_IDX, DATA_SYMB_ABS_IDX) = type_convert<TComplexStorageOut>(softEst);
+    }
+
+} //eqMmseSoftDemapKernel_v4
+
+// Per PRB equalizer coefficient application fused with soft demap
+// Inputs and outputs assumed to be column major
+// dimBlock: (N_PRB_TONES, BLK_DATA_SYMBS)
+// dimGrid : (N_PRB, N_LAYERS, N_UE_GRPS)
+// Note: NF = N_PRB_TONES * N_PRB
+template <typename TStorageIn,
+          typename TDataRx,
+          typename TStorageOut,
+          typename TCompute,
+          uint32_t N_BS_ANTS,            // # of BS antenna (# of cols of C matrix) [difficult to remove as this is used by cooperative groups.]
           uint16_t SYMBOL_BITMASK>
 __device__ void
-eqMmseSoftDemapKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRxChEqSoftDemapDynDescr_t &dynDescr)
+eqMmseEqualizationKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRxChEqSoftDemapDynDescr_t &dynDescr)
 {
     // Early exit check
     // The grid is sized to process the max # of PRBs in a given heterogenous config. Exit if the PRB to be
@@ -3620,64 +4007,17 @@ eqMmseSoftDemapKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRx
     uint16_t startPrb           = drvdUeGrpPrms.startPrb;
     uint8_t *dataSymLoc         = drvdUeGrpPrms.dataSymLoc;
     uint8_t *dmrsSymLoc         = drvdUeGrpPrms.dmrsSymLoc;
-    uint8_t *qam                = drvdUeGrpPrms.qam;
     uint8_t *pUeGrpLayerToUeIdx = drvdUeGrpPrms.ueGrpLayerToUeIdx;
-    uint8_t enableTfPrcd        = drvdUeGrpPrms.enableTfPrcd;
+    //uint8_t enableTfPrcd        = drvdUeGrpPrms.enableTfPrcd;
 
     tensor_ref<const TComplexStorageIn> tCoef       (drvdUeGrpPrms.tInfoEqCoef.pAddr         , drvdUeGrpPrms.tInfoEqCoef.strides         ); // (N_LAYERS, N_BS_ANTS, NF, NH)
     tensor_ref<const TComplexStorageIn> tCfoEst     (drvdUeGrpPrms.tInfoCfoEst.pAddr         , drvdUeGrpPrms.tInfoCfoEst.strides         ); // (MAX_ND_SUPPORTED, N_LAYERS)
     tensor_ref<const TStorageIn>        tReeDiagInv (drvdUeGrpPrms.tInfoReeDiagInv.pAddr     , drvdUeGrpPrms.tInfoReeDiagInv.strides     ); // (N_LAYERS, NF, NH)
     tensor_ref<const TComplexDataRx>    tDataRx     (drvdUeGrpPrms.tInfoDataRx.pAddr         , drvdUeGrpPrms.tInfoDataRx.strides         ); // (NF, ND, N_BS_ANTS)
     tensor_ref<TComplexStorageOut>      tDataEq     (drvdUeGrpPrms.tInfoDataEq.pAddr         , drvdUeGrpPrms.tInfoDataEq.strides         ); // (N_LAYERS, NF, ND)
-    tensor_ref<TStorageOut>             tLlr        (drvdUeGrpPrms.tInfoLLR.pAddr            , drvdUeGrpPrms.tInfoLLR.strides            ); // (N_LLR, N_LAYERS, NF, ND)
-    tensor_ref<TStorageOut>             tLlrCdm1    (drvdUeGrpPrms.tInfoLLRCdm1.pAddr        , drvdUeGrpPrms.tInfoLLRCdm1.strides        ); // (N_LLR, N_LAYERS, NF, ND)
 #ifdef ENABLE_DEBUG
     tensor_ref<TComplexStorageOut>      tDbg        (drvdUeGrpPrms.tInfoChEqSoftDempDbg.pAddr, drvdUeGrpPrms.tInfoChEqSoftDempDbg.strides);
 #endif
-    // clang-format on
-
-    thread_block const& thisThrdBlk = this_thread_block();
-    __shared__ bool smem_is_dmrs_symbol[OFDM_SYMBOLS_PER_SLOT];
-    __shared__ int  smem_llr_addr_offset[OFDM_SYMBOLS_PER_SLOT];
-    if ((nDataSym > 0) && (enableTfPrcd==0) && (nDmrsCdmGrpsNoData==1)) {
-        constexpr uint32_t WARP_SIZE = 32;
-        const uint32_t tid = thisThrdBlk.thread_rank();
-        const uint32_t warp_id = tid / WARP_SIZE;
-
-        if (warp_id == 0) {
-            for (uint32_t t = tid; t < OFDM_SYMBOLS_PER_SLOT; t += WARP_SIZE) {
-                smem_is_dmrs_symbol[t] = false;
-                smem_llr_addr_offset[t] = 0;
-            }
-
-            __syncwarp();
-
-            for (uint8_t dmrs_idx=tid; dmrs_idx<drvdUeGrpPrms.nDmrsSyms; dmrs_idx += WARP_SIZE) {
-                smem_is_dmrs_symbol[dmrsSymLoc[dmrs_idx]] = true;
-            }
-
-            __syncwarp();
-
-            const int addr_accum_per_data_sym = tLlr.strides[3];
-            const int addr_accum_per_dmrs_sym = (tLlr.strides[3]>>1);
-            for (uint32_t t = dataSymLoc[0]+1+tid; t < OFDM_SYMBOLS_PER_SLOT; t += WARP_SIZE) {
-                smem_llr_addr_offset[t] = (smem_is_dmrs_symbol[t-1] ? addr_accum_per_dmrs_sym : addr_accum_per_data_sym);
-            }
-
-            __syncwarp();
-
-            if (tid == 0) {
-                // This prefix sum could be done more efficiently in parallel. The maximum length is
-                // OFDM_SYMBOLS_PER_SLOT (=14) and the current implementation is ~1.5% of the
-                // executed instrutions of the kernel for one profile.
-                for (int i = dataSymLoc[0]+1; i < OFDM_SYMBOLS_PER_SLOT; i++) {
-                    smem_llr_addr_offset[i] += smem_llr_addr_offset[i-1];
-                }
-            }
-        }
-
-        __syncthreads();
-    }
 
     //--------------------------------------------------------------------------------------------------------
 
@@ -3727,9 +4067,6 @@ eqMmseSoftDemapKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRx
 
     //--------------------------------------------------------------------------------------------------------
     // Process
-
-    // Load QAM info for each layer
-    const uint8_t pamBitLen = qam[layerIdx] / 2;
 
     TComplexCompute softEst = cuGet<TComplexCompute>(0.f);
 
@@ -3812,47 +4149,158 @@ eqMmseSoftDemapKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRx
         softEst = cuCmul(softEst, type_convert<TComplexCompute>(tCfoEst(symIdx, pUeGrpLayerToUeIdx[layerIdx])));
     }
 
-    if(enableTfPrcd==0)
+    tDataEq(layerIdx, GMEM_ABS_WR_FREQ_IDX, DATA_SYMB_ABS_IDX) = type_convert<TComplexStorageOut>(softEst);
+
+} //eqMmseEqualizationKernel_v4
+
+
+// Per PRB equalizer coefficient application fused with soft demap
+// Inputs and outputs assumed to be column major
+// dimBlock: (N_PRB_TONES, BLK_DATA_SYMBS)
+// dimGrid : (N_PRB, N_LAYERS, N_UE_GRPS)
+// Note: NF = N_PRB_TONES * N_PRB
+template <typename TStorageIn,
+          typename TDataRx,
+          typename TStorageOut,
+          typename TCompute,
+          uint32_t N_BS_ANTS,            // # of BS antenna (# of cols of C matrix) [difficult to remove as this is used by cooperative groups.]
+          uint16_t SYMBOL_BITMASK>
+__device__ void
+eqMmseSoftDemap72eKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRxChEqSoftDemapDynDescr_t &dynDescr)
+{
+    // In 7.2e split, equalization is performed externally (by the O-RU or a
+    // preceding pipeline stage), so tDataEq and tReeDiagInv are externally
+    // provided (pTX_72e / pTReeInv_72e).  Their layouts differ from the
+    // internally-allocated 7.2a tensors:
+    //   tDataEq:      (NF_cell, ND, N_LAYERS) full-cell frequency axis,
+    //                  indexed with cell-global subcarrier offset.
+    //   tReeDiagInv:  (N_SC, N_LAYERS, N_PRB_cell, NH) cell-global PRB
+    //                  dimension, hence accessed as (PRB_IDX + startPrb).
+    // Early exit check
+    // The grid is sized to process the max # of PRBs in a given heterogenous config. Exit if the PRB to be
+    // processed by this thread block does not exist in the UE group
+    const uint32_t PRB_IDX  = blockIdx.x;
+
+    const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];
+
+    cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
+    const uint16_t nPrb = drvdUeGrpPrms.nPrb;
+    if(PRB_IDX >= nPrb) return;
+    const uint32_t N_LAYERS = drvdUeGrpPrms.nLayers;
+    const uint32_t layerIdx = blockIdx.y * blockDim.y + threadIdx.y;
+    if (layerIdx >= N_LAYERS) return;
+    const uint8_t enableTfPrcd        = drvdUeGrpPrms.enableTfPrcd;
+
+    uint16_t nDataSym = drvdUeGrpPrms.nDataSym;
+    const uint8_t nDmrsCdmGrpsNoData = drvdUeGrpPrms.nDmrsCdmGrpsNoData;
+    if(nDmrsCdmGrpsNoData==1)
     {
-        // Determine the output LLR address
-        TStorageOut* LLRdst = tLlr.addr + tLlr.offset(0,
-                                                      layerIdx,
-                                                      GMEM_ABS_WR_FREQ_IDX,
-                                                      DATA_SYMB_ABS_IDX);
-        // Perform the soft demapping operation
-        TStorageOut* LLRCdm1dst;
-        uint8_t write_flag = 0;
-        if(nDmrsCdmGrpsNoData==1)
+        nDataSym += drvdUeGrpPrms.nDmrsSyms;
+    }
+
+    const uint16_t dmrsMaxLen  = drvdUeGrpPrms.dmrsMaxLen;
+    const uint16_t nDmrsSym    = drvdUeGrpPrms.nDmrsSyms / dmrsMaxLen;
+
+    //--------------------------------------------------------------------------------------------------------
+    typedef typename complex_from_scalar<TCompute>::type    TComplexCompute;
+    typedef typename complex_from_scalar<TDataRx>::type     TComplexDataRx;
+    typedef typename complex_from_scalar<TStorageIn>::type  TComplexStorageIn;
+    typedef typename complex_from_scalar<TStorageOut>::type TComplexStorageOut;
+
+    bool enableCfoCorrection = (0 != drvdUeGrpPrms.enableCfoCorrection);
+    bool enableTdi = (0 != drvdUeGrpPrms.enablePuschTdi) && nDmrsSym > 1;
+    if constexpr ((SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK) || (SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
+    {
+        enableCfoCorrection = false;
+        enableTdi = false;
+    }
+
+    // clang-format off
+    uint16_t startPrb           = drvdUeGrpPrms.startPrb;
+    uint8_t *dataSymLoc         = drvdUeGrpPrms.dataSymLoc;
+    uint8_t *dmrsSymLoc         = drvdUeGrpPrms.dmrsSymLoc;
+    uint8_t *qam                = drvdUeGrpPrms.qam;
+    //uint8_t *pUeGrpLayerToUeIdx = drvdUeGrpPrms.ueGrpLayerToUeIdx;
+
+
+    // 7.2e uses externally-provided tensors (pTReeInv_72e / pTX_72e) with different
+    // layouts than the internally-allocated 7.2a tensors:
+    //  - tReeDiagInv: (N_SC, N_LAYERS, N_PRB_cell, NH) with cell-global PRB indexing,
+    //    so accesses use (PRB_IDX + startPrb) rather than local PRB_IDX.
+    //  - tDataEq: (NF_cell, ND, N_LAYERS) NF spans the full cell BW, read via
+    //    GMEM_ABS_RD_FREQ_IDX = local_freq + 12 * startPrb.
+    tensor_ref<const TStorageIn>        tReeDiagInv (drvdUeGrpPrms.tInfoReeDiagInv.pAddr     , drvdUeGrpPrms.tInfoReeDiagInv.strides     ); // (N_SC, N_LAYERS, N_PRB_cell, NH) cell-global PRB dim
+    tensor_ref<const TComplexDataRx>    tDataEq     (drvdUeGrpPrms.tInfoDataEq.pAddr         , drvdUeGrpPrms.tInfoDataEq.strides         ); // (NF_cell, ND, N_LAYERS)
+    tensor_ref<TStorageOut>             tLlr        (drvdUeGrpPrms.tInfoLLR.pAddr            , drvdUeGrpPrms.tInfoLLR.strides            ); // (N_LLR, N_LAYERS, NF, ND)
+
+    // Cache tReeDiagInv strides in registers to hoist common base offset above TDI branch.
+    const int32_t reeDiagInvStride0 = drvdUeGrpPrms.tInfoReeDiagInv.strides[0];
+    const int32_t reeDiagInvStride1 = drvdUeGrpPrms.tInfoReeDiagInv.strides[1];
+    const int32_t reeDiagInvStride2 = drvdUeGrpPrms.tInfoReeDiagInv.strides[2];
+    const int32_t reeDiagInvStride3 = drvdUeGrpPrms.tInfoReeDiagInv.strides[3];
+
+    //--------------------------------------------------------------------------------------------------------
+
+    const uint32_t FREQ_IDX = threadIdx.x;
+    const uint32_t DATA_SYMB_ABS_IDX = threadIdx.z;
+
+    if (DATA_SYMB_ABS_IDX >= nDataSym) return;
+
+    const uint32_t GMEM_WR_FREQ_IDX = FREQ_IDX;
+
+    // PRB index processed by this thread
+    const uint32_t THRD_BLK_ABS_START_FREQ_IDX = PRB_IDX * CUPHY_N_TONES_PER_PRB;
+
+    // Subcarrier sample location in global memory
+    const uint32_t GMEM_ABS_WR_FREQ_IDX = THRD_BLK_ABS_START_FREQ_IDX + GMEM_WR_FREQ_IDX;
+    const uint32_t GMEM_ABS_RD_FREQ_IDX = GMEM_ABS_WR_FREQ_IDX + 12 * startPrb;
+
+    // tDataEq is laid out as (NF_cell, ND, N_LAYERS): read with cell-global freq index.
+    TComplexCompute softEst = type_convert<TComplexCompute>(tDataEq(GMEM_ABS_RD_FREQ_IDX, DATA_SYMB_ABS_IDX, layerIdx));
+
+    // Hoist symIdx-independent computations to overlap with softEst GMEM latency
+    const uint8_t pamBitLen = qam[layerIdx] / 2;
+    TStorageOut* LLRdst = tLlr.addr + tLlr.offset(0,
+                                                  layerIdx,
+                                                  GMEM_ABS_WR_FREQ_IDX,
+                                                  DATA_SYMB_ABS_IDX);
+    // tReeDiagInv uses cell-global PRB indexing (PRB_IDX + startPrb) because
+    // pTReeInv_72e is provided over the full cell bandwidth, not per-UE-group.
+    const int32_t reeDiagInvBaseOff = reeDiagInvStride0 * FREQ_IDX
+                                    + reeDiagInvStride1 * layerIdx
+                                    + reeDiagInvStride2 * (PRB_IDX + startPrb);
+
+    // Cache commonly used index once
+    const uint8_t symIdx = dataSymLoc[DATA_SYMB_ABS_IDX];
+
+    if constexpr ((SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK) || (SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
+    {
+        if(!((SYMBOL_BITMASK>>symIdx)&1))
         {
-            const uint8_t dmrs_flag = smem_is_dmrs_symbol[dataSymLoc[DATA_SYMB_ABS_IDX]];
-            int addr_offset = smem_llr_addr_offset[dataSymLoc[DATA_SYMB_ABS_IDX]];
-
-            if(dmrs_flag)
-            {
-                if(GMEM_ABS_WR_FREQ_IDX%2)
-                {
-                    addr_offset += (tLlr.strides[1]*layerIdx+tLlr.strides[2]*(GMEM_ABS_WR_FREQ_IDX>>1));
-                    write_flag = 1;
-                }
-                else
-                {
-                    write_flag = 0;
-                }
-            }
-            else
-            {
-                addr_offset += (tLlr.strides[1]*layerIdx+tLlr.strides[2]*GMEM_ABS_WR_FREQ_IDX);
-                write_flag = 1;
-            }
-            LLRCdm1dst = tLlrCdm1.addr + addr_offset;
+            return;
         }
+    }
 
+    static_assert(EQ_SOFT_DEMAP_USE_TEX == 1 || EQ_SOFT_DEMAP_USE_TEX == 2, "v4 soft demapper kernel assumes EQ_SOFT_DEMAP_USE_TEX == 1 or 2");
+
+    uint32_t dmrsIdx = 1;
+
+    if (enableTdi)
+    {
+         while ((dmrsIdx<(nDmrsSym-1))&&(dmrsSymLoc[(dmrsIdx+1) * dmrsMaxLen-1] < symIdx))
+         {
+             dmrsIdx++;
+         }
+    }
+
+    if(!enableTfPrcd)
+    {
         // Load noiseInv for each layer
         TCompute reeDiagInv;
         if (enableTdi && symIdx > dmrsSymLoc[dmrsMaxLen - 1]) {
-            reeDiagInv = type_convert<TCompute>(tReeDiagInv(FREQ_IDX, layerIdx, PRB_IDX, dmrsIdx));
+            reeDiagInv = type_convert<TCompute>(tReeDiagInv.addr[reeDiagInvBaseOff + reeDiagInvStride3 * dmrsIdx]);
         } else {
-            reeDiagInv = type_convert<TCompute>(tReeDiagInv(FREQ_IDX, layerIdx, PRB_IDX, 0));
+            reeDiagInv = type_convert<TCompute>(tReeDiagInv.addr[reeDiagInvBaseOff]);
         }
 
 #if(EQ_SOFT_DEMAP_USE_TEX == 2)
@@ -3861,15 +4309,6 @@ eqMmseSoftDemapKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRx
                                                               reeDiagInv,                // noiseInv
                                                               softEst,                   // softEst
                                                               LLRdst);                   // LLR_output address
-
-        if(write_flag)
-        {
-            ch_eq_simplified_soft_demapper<TStorageOut, TCompute>(0,     // PER_LAYER_THRD_IDX
-                                                                  pamBitLen,              // nPamBits
-                                                                  reeDiagInv,             // noiseInv
-                                                                  softEst,                // softEst
-                                                                  LLRCdm1dst);            // LLR_output address
-        }
 #elif(EQ_SOFT_DEMAP_USE_TEX == 1)
 
         ch_eq_soft_demapper_tex<TStorageOut, TCompute>(0,        // PER_LAYER_THRD_IDX
@@ -3878,35 +4317,139 @@ eqMmseSoftDemapKernel_v4(const puschRxChEqStatDescr_t *pStatDescr, const puschRx
                                                        softEst,                   // softEst
                                                        LLRdst,                    // LLR_output address
                                                        statDescr->demapper_tex); // texture object
-
-        if(write_flag)
-        {
-            ch_eq_soft_demapper_tex<TStorageOut, TCompute>(0,        // PER_LAYER_THRD_IDX
-                                                           pamBitLen,              // nPamBits
-                                                           reeDiagInv,             // noiseInv
-                                                           softEst,                   // softEst
-                                                           LLRCdm1dst,                // LLR_output address
-                                                           statDescr->demapper_tex); // texture object
-        }
 #else
     #error "Unsupported EQ_SOFT_DEMAP_USE_TEX value"
 #endif
 
 
     }
-    else if(enableTfPrcd==1)
+    else
     {
+        if (layerIdx != 0) return;
         tensor_ref<TComplexCompute>         tDataEqDft  (drvdUeGrpPrms.tInfoDataEqDft.pAddr      , drvdUeGrpPrms.tInfoDataEqDft.strides); // (NF*ND)
         tDataEqDft(GMEM_ABS_WR_FREQ_IDX + DATA_SYMB_ABS_IDX*nPrb*CUPHY_N_TONES_PER_PRB) = softEst;
     }
 
-    // FixMe update comments related to enableDebugEqOutput
-    if (pStatDescr->enableDebugEqOutput) {
-        // Pick one of the N_BS_ANTS threads to store the resulting soft estimate
-        tDataEq(layerIdx, GMEM_ABS_WR_FREQ_IDX, DATA_SYMB_ABS_IDX) = type_convert<TComplexStorageOut>(softEst);
+} //eqMmseSoftDemap72eKernel_v4
+
+// Device copies of host DFT-s-OFDM tables. Host constexpr storage is not safe to index from
+// kernels; populate via Driver API (cuMemcpyHtoD) before IDFT / workspace init (per CUDA device).
+__constant__ uint8_t  c_cuphyPuschDftSOfdmNprbToRow[cuphy::CUPHY_PUSCH_DFT_S_OFDM_NPRB_TO_ROW_SIZE];
+__constant__ uint16_t c_cuphyPuschDftSOfdmDftSizes[cuphy::CUPHY_PUSCH_DFT_S_OFDM_NUM_BLUESTEIN_ROWS];
+
+// Resolve a host-compiled __constant__ symbol and copy host bytes with cuMemcpyHtoD (CE.1).
+// cudaGetSymbolAddress is the runtime bridge for symbols in this translation unit, analogous to
+// cudaGetFuncBySymbol for kernel handles.
+static cuphyStatus_t copyHostToDeviceConstantSymbol(const void* hostSrc,
+                                                    const void* symbol,
+                                                    size_t      copyBytes,
+                                                    const char* symbolName)
+{
+    void*       devSymbolPtr = nullptr;
+    size_t      symbolSize   = 0;
+    cudaError_t cudaErr      = cudaGetSymbolAddress(&devSymbolPtr, symbol);
+    if(cudaErr != cudaSuccess)
+    {
+        NVLOGE_FMT(NVLOG_PUSCH,
+                   AERIAL_CUPHY_EVENT,
+                   "{}: cudaGetSymbolAddress({}) failed: {}",
+                   __FUNCTION__,
+                   symbolName,
+                   cudaGetErrorString(cudaErr));
+        return CUPHY_STATUS_INTERNAL_ERROR;
+    }
+    cudaErr = cudaGetSymbolSize(&symbolSize, symbol);
+    if(cudaErr != cudaSuccess)
+    {
+        NVLOGE_FMT(NVLOG_PUSCH,
+                   AERIAL_CUPHY_EVENT,
+                   "{}: cudaGetSymbolSize({}) failed: {}",
+                   __FUNCTION__,
+                   symbolName,
+                   cudaGetErrorString(cudaErr));
+        return CUPHY_STATUS_INTERNAL_ERROR;
+    }
+    if(copyBytes > symbolSize)
+    {
+        NVLOGE_FMT(NVLOG_PUSCH,
+                   AERIAL_CUPHY_EVENT,
+                   "{}: {} copy size {} exceeds symbol size {}",
+                   __FUNCTION__,
+                   symbolName,
+                   copyBytes,
+                   symbolSize);
+        return CUPHY_STATUS_INTERNAL_ERROR;
     }
 
-} //eqMmseSoftDemapKernel_v4
+    const CUresult cuErr = cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(devSymbolPtr), hostSrc, copyBytes);
+    if(cuErr != CUDA_SUCCESS)
+    {
+        const char* errStr = nullptr;
+        cuGetErrorString(cuErr, &errStr);
+        NVLOGE_FMT(NVLOG_PUSCH,
+                   AERIAL_CUPHY_EVENT,
+                   "{}: cuMemcpyHtoD({}) failed: {}",
+                   __FUNCTION__,
+                   symbolName,
+                   errStr ? errStr : "unknown");
+        return CUPHY_STATUS_INTERNAL_ERROR;
+    }
+    return CUPHY_STATUS_SUCCESS;
+}
+
+// __constant__ memory is per device and the copy targets the calling thread's current device,
+// so the tables are seeded on every init instead of being cached: a cache shared across the
+// PuschRx instances that cuBB creates concurrently would need locking, and skipping the copy for
+// a device that was never seeded leaves the tables zero-filled (every nPrb would map to row 0).
+// init() is not on the slot critical path and the two tables are a few hundred bytes.
+static cuphyStatus_t syncDftSOfdmConstantTables()
+{
+    const auto& hostNprbToRow = cuphy::getDftSOfdmNprbToRowTable();
+    {
+        // Full table copy includes INVALID (0xFF) for unsupported nPrb - fail closed after sync.
+        const cuphyStatus_t status =
+            copyHostToDeviceConstantSymbol(hostNprbToRow.data(),
+                                           c_cuphyPuschDftSOfdmNprbToRow,
+                                           hostNprbToRow.size() * sizeof(uint8_t),
+                                           "c_cuphyPuschDftSOfdmNprbToRow");
+        if(status != CUPHY_STATUS_SUCCESS)
+        {
+            return status;
+        }
+    }
+    const auto& hostDftSizes = cuphy::CUPHY_PUSCH_DFT_S_OFDM_DFT_SIZES;
+    {
+        const cuphyStatus_t status =
+            copyHostToDeviceConstantSymbol(hostDftSizes.data(),
+                                           c_cuphyPuschDftSOfdmDftSizes,
+                                           hostDftSizes.size() * sizeof(uint16_t),
+                                           "c_cuphyPuschDftSOfdmDftSizes");
+        if(status != CUPHY_STATUS_SUCCESS)
+        {
+            return status;
+        }
+    }
+
+    return CUPHY_STATUS_SUCCESS;
+}
+
+// Map (nPrb, Bluestein FFT size) -> workspace row. Returns INVALID if unsupported or FFT mismatch
+// (preserves the early-return semantics of the previous DFTSize if/else ladder).
+__device__ __forceinline__ uint8_t cuphyPuschDftSOfdmBluesteinRow(uint16_t nPrb, uint16_t blueFftSize)
+{
+    if(nPrb >= cuphy::CUPHY_PUSCH_DFT_S_OFDM_NPRB_TO_ROW_SIZE)
+    {
+        return cuphy::CUPHY_PUSCH_DFT_S_OFDM_INVALID_ROW;
+    }
+    const uint8_t row = c_cuphyPuschDftSOfdmNprbToRow[nPrb];
+    if(row == cuphy::CUPHY_PUSCH_DFT_S_OFDM_INVALID_ROW)
+    {
+        return cuphy::CUPHY_PUSCH_DFT_S_OFDM_INVALID_ROW;
+    }
+    return (cuphy::getDftSOfdmBluesteinFftWidthForRow(row) == blueFftSize)
+               ? row
+               : cuphy::CUPHY_PUSCH_DFT_S_OFDM_INVALID_ROW;
+}
 
 template <class FFT,
           typename TStorageIn,
@@ -3934,274 +4477,15 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
     }
 
     using namespace cufftdx;
-    uint8_t locBluesteinWorkspace = 0;
-    uint16_t blue_fft_size = size_of<FFT>::value;
-    uint16_t DFTSize = CUPHY_N_TONES_PER_PRB*drvdUeGrpPrms.nPrb;
-    if(blue_fft_size==FFT128)
+    const uint16_t blue_fft_size = size_of<FFT>::value;
+    const uint16_t DFTSize = CUPHY_N_TONES_PER_PRB * drvdUeGrpPrms.nPrb;
+    const uint8_t locBluesteinWorkspace = cuphyPuschDftSOfdmBluesteinRow(drvdUeGrpPrms.nPrb, blue_fft_size);
+    if(locBluesteinWorkspace == cuphy::CUPHY_PUSCH_DFT_S_OFDM_INVALID_ROW)
     {
-        if(DFTSize==12)
-        {
-            locBluesteinWorkspace = 0;
-        }
-        else if(DFTSize==24)
-        {
-            locBluesteinWorkspace = 1;
-        }
-        else if(DFTSize==36)
-        {
-            locBluesteinWorkspace = 2;
-        }
-        else if(DFTSize==48)
-        {
-            locBluesteinWorkspace = 3;
-        }
-        else if(DFTSize==60)
-        {
-            locBluesteinWorkspace = 4;
-        }
-        else
-        {
-            return;
-        }
+        return;
     }
-    else if(blue_fft_size==FFT256)
-    {
-        if(DFTSize==72)
-        {
-            locBluesteinWorkspace = 5;
-        }
-        else if(DFTSize==96)
-        {
-            locBluesteinWorkspace = 6;
-        }
-        else if(DFTSize==108)
-        {
-            locBluesteinWorkspace = 7;
-        }
-        else if(DFTSize==120)
-        {
-            locBluesteinWorkspace = 8;
-        }
-        else
-        {
-            return;
-        }
-    }
-    else if(blue_fft_size==FFT512)
-    {
-        if(DFTSize==144)
-        {
-            locBluesteinWorkspace = 9;
-        }
-        else if(DFTSize==180)
-        {
-            locBluesteinWorkspace = 10;
-        }
-        else if(DFTSize==192)
-        {
-            locBluesteinWorkspace = 11;
-        }
-        else if(DFTSize==216)
-        {
-            locBluesteinWorkspace = 12;
-        }
-        else if(DFTSize==240)
-        {
-            locBluesteinWorkspace = 13;
-        }
-        else
-        {
-            return;
-        }
 
-    }
-    else if(blue_fft_size==FFT1024)
-    {
-        if(DFTSize==288)
-        {
-            locBluesteinWorkspace = 14;
-        }
-        else if(DFTSize==300)
-        {
-            locBluesteinWorkspace = 15;
-        }
-        else if(DFTSize==324)
-        {
-            locBluesteinWorkspace = 16;
-        }
-        else if(DFTSize==360)
-        {
-            locBluesteinWorkspace = 17;
-        }
-        else if(DFTSize==384)
-        {
-            locBluesteinWorkspace = 18;
-        }
-        else if(DFTSize==432)
-        {
-            locBluesteinWorkspace = 19;
-        }
-        else if(DFTSize==480)
-        {
-            locBluesteinWorkspace = 20;
-        }
-        else
-        {
-            return;
-        }
-
-    }
-    else if(blue_fft_size==FFT2048)
-    {
-        if(DFTSize==540)
-        {
-            locBluesteinWorkspace = 21;
-        }
-        else if(DFTSize==576)
-        {
-            locBluesteinWorkspace = 22;
-        }
-        else if(DFTSize==600)
-        {
-            locBluesteinWorkspace = 23;
-        }
-        else if(DFTSize==648)
-        {
-            locBluesteinWorkspace = 24;
-        }
-        else if(DFTSize==720)
-        {
-            locBluesteinWorkspace = 25;
-        }
-        else if(DFTSize==768)
-        {
-            locBluesteinWorkspace = 26;
-        }
-        else if(DFTSize==864)
-        {
-            locBluesteinWorkspace = 27;
-        }
-        else if(DFTSize==900)
-        {
-            locBluesteinWorkspace = 28;
-        }
-        else if(DFTSize==960)
-        {
-            locBluesteinWorkspace = 29;
-        }
-        else if(DFTSize==972)
-        {
-            locBluesteinWorkspace = 30;
-        }
-        else
-        {
-            return;
-        }
-
-    }
-    else if(blue_fft_size==FFT4096)
-    {
-        if(DFTSize==1080)
-        {
-            locBluesteinWorkspace = 31;
-        }
-        else if(DFTSize==1152)
-        {
-            locBluesteinWorkspace = 32;
-        }
-        else if(DFTSize==1200)
-        {
-            locBluesteinWorkspace = 33;
-        }
-        else if(DFTSize==1296)
-        {
-            locBluesteinWorkspace = 34;
-        }
-        else if(DFTSize==1440)
-        {
-            locBluesteinWorkspace = 35;
-        }
-        else if(DFTSize==1500)
-        {
-            locBluesteinWorkspace = 36;
-        }
-        else if(DFTSize==1536)
-        {
-            locBluesteinWorkspace = 37;
-        }
-        else if(DFTSize==1620)
-        {
-            locBluesteinWorkspace = 38;
-        }
-        else if(DFTSize==1728)
-        {
-            locBluesteinWorkspace = 39;
-        }
-        else if(DFTSize==1800)
-        {
-            locBluesteinWorkspace = 40;
-        }
-        else if(DFTSize==1920)
-        {
-            locBluesteinWorkspace = 41;
-        }
-        else if(DFTSize==1944)
-        {
-            locBluesteinWorkspace = 42;
-        }
-        else
-        {
-            return;
-        }
-    }
-    else if(blue_fft_size==FFT8192)
-    {
-        if(DFTSize==2160)
-        {
-            locBluesteinWorkspace = 43;
-        }
-        else if(DFTSize==2304)
-        {
-            locBluesteinWorkspace = 44;
-        }
-        else if(DFTSize==2400)
-        {
-            locBluesteinWorkspace = 45;
-        }
-        else if(DFTSize==2592)
-        {
-            locBluesteinWorkspace = 46;
-        }
-        else if(DFTSize==2700)
-        {
-            locBluesteinWorkspace = 47;
-        }
-        else if(DFTSize==2880)
-        {
-            locBluesteinWorkspace = 48;
-        }
-        else if(DFTSize==2916)
-        {
-            locBluesteinWorkspace = 49;
-        }
-        else if(DFTSize==3000)
-        {
-            locBluesteinWorkspace = 50;
-        }
-        else if(DFTSize==3072)
-        {
-            locBluesteinWorkspace = 51;
-        }
-        else if(DFTSize==3240)
-        {
-            locBluesteinWorkspace = 52;
-        }
-        else
-        {
-            return;
-        }
-    }
-    else
+    if(locBluesteinWorkspace >= pIdftStatDescr->nBluesteinWorkspaceRows)
     {
         return;
     }
@@ -4221,29 +4505,37 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
     assert(stride == FFT::max_threads_per_block);
 
     // SR - was Idft_1
+    // Cache time-domain Bluestein chirps: reused after the second FFT (saves a second GMEM pass).
+    complex_type chirpTime[FFT::elements_per_thread];
 
     int indexIn = threadIdx.x + DFTSize * blockIdx.x;
     int indexWorkspaceTime = threadIdx.x;
 
+#pragma unroll
     for (int i = 0; i < FFT::elements_per_thread; ++i){
 
       if((threadIdx.x + i * stride) < DFTSize) {
-	// swap real<->imag for inverse FFT
-	input[i].y = tDataEqDft(indexIn + i * stride).x;
-	input[i].x = tDataEqDft(indexIn + i * stride).y;
-        input[i] *= tDftBluesteinWorkspaceTime(locBluesteinWorkspace, indexWorkspaceTime);
+        const auto chirp = tDftBluesteinWorkspaceTime(locBluesteinWorkspace, indexWorkspaceTime);
+        chirpTime[i].x = chirp.x;
+        chirpTime[i].y = chirp.y;
+        // swap real<->imag for inverse FFT
+        input[i].y = tDataEqDft(indexIn + i * stride).x;
+        input[i].x = tDataEqDft(indexIn + i * stride).y;
+        input[i] *= chirpTime[i];
         indexWorkspaceTime += stride;
       }
       else {
-	input[i].x = 0.0f;
-	input[i].y = 0.0f;
+        chirpTime[i].x = 0.0f;
+        chirpTime[i].y = 0.0f;
+        input[i].x = 0.0f;
+        input[i].y = 0.0f;
       }
     }
 
     FFT().execute(input, shared_mem);
 
-    int indexOut = threadIdx.x + size_of<FFT>::value * blockIdx.x;
     int indexWorkspaceFreq = threadIdx.x;
+#pragma unroll
     for (unsigned int i = 0; i < FFT::elements_per_thread; ++i) {
         input[i] *= tDftBluesteinWorkspaceFreq(locBluesteinWorkspace, indexWorkspaceFreq);
         input[i].y = -input[i].y; // conjugate
@@ -4252,23 +4544,23 @@ __global__ void bluestein_Idft_kernel(puschRxChEqIdftStatDescr_t* pIdftStatDescr
 
     FFT().execute(input, shared_mem);
 
-    const double dftscale = 1.0/TCompute((size_of<FFT>::value)*sqrt(DFTSize));            // the compiler would do this just as well ... but looks cleaner this way.
+    // Keep FP32 scale in the hot path (avoid FP64 muls on each element).
+    const TCompute dftscale = static_cast<TCompute>(
+        1.0 / (static_cast<double>(size_of<FFT>::value) * sqrt(static_cast<double>(DFTSize))));
 
     ////////////////////////////////////////////////////////////////////////////////
     // We can limit the last loop to just max_meaningful_ept, other values are not needed.
-    unsigned int max_meaningful_ept = (DFTSize + (stride - 1)) / stride;
-    indexOut = threadIdx.x + DFTSize * blockIdx.x;
-    indexWorkspaceTime = threadIdx.x;
-    for (unsigned int i = 0; i < max_meaningful_ept; ++i) {
+    const unsigned int max_meaningful_ept = (DFTSize + (stride - 1)) / stride;
+    const int indexOut = threadIdx.x + DFTSize * blockIdx.x;
+#pragma unroll
+    for (unsigned int i = 0; i < FFT::elements_per_thread; ++i) {
 
-      if((threadIdx.x + i * stride) < DFTSize) {
+      if(i < max_meaningful_ept && (threadIdx.x + i * stride) < DFTSize) {
 
         input[i].y = -input[i].y * dftscale; // conjugate and scale
-        input[i].x = input[i].x*dftscale;
+        input[i].x = input[i].x * dftscale;
 
-        input[i] *= tDftBluesteinWorkspaceTime(locBluesteinWorkspace, indexWorkspaceTime);
-
-        indexWorkspaceTime += stride;
+        input[i] *= chirpTime[i];
 
         // Make swap real<->imag for inverse FFT
         const auto tmp = input[i].x;
@@ -4745,7 +5037,8 @@ template <typename TStorageIn,
           typename TStorageOut,
           typename TCompute,
           uint32_t N_BS_ANTS,            // # of BS antenna (# of cols of C matrix)
-          uint16_t SYMBOL_BITMASK>
+          uint16_t SYMBOL_BITMASK,
+          bool enableDebugEqOutput>
 __launch_bounds__(CUPHY_N_TONES_PER_PRB * OFDM_SYMBOLS_PER_SLOT)
 __global__ void
 eqMmseSoftDemapKernel(puschRxChEqStatDescr_t *pStatDescr, const __grid_constant__ puschRxChEqSoftDemapDynDescr_t dynDescr)
@@ -4755,7 +5048,131 @@ eqMmseSoftDemapKernel(puschRxChEqStatDescr_t *pStatDescr, const __grid_constant_
                            gridDim.x, gridDim.y, gridDim.z,
                            blockDim.x, blockDim.y, blockDim.z,
                            N_BS_ANTS);
-    eqMmseSoftDemapKernel_v4<TStorageIn,
+    const uint32_t UE_GRP_IDX = dynDescr.hetCfgUeGrpMap[blockIdx.z];
+    const cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = dynDescr.pDrvdUeGrpPrms[UE_GRP_IDX];
+    using TComplexCompute = typename complex_from_scalar<TCompute>::type;
+    __shared__ bool smem_is_dmrs_symbol[OFDM_SYMBOLS_PER_SLOT];
+    __shared__ int  smem_llr_addr_offset[OFDM_SYMBOLS_PER_SLOT];
+    __shared__ __align__(16) TComplexCompute sC[N_BS_ANTS][N_MAX_DMRS_SYMS][CUPHY_N_TONES_PER_PRB + 1];
+    const bool enableTfPrcd = (0 != drvdUeGrpPrms.enableTfPrcd);
+
+    #define CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION) \
+        do { \
+            eqMmseSoftDemapKernel_v4<TStorageIn, \
+                TDataRx, \
+                TStorageOut, \
+                TCompute, \
+                N_BS_ANTS, \
+                SYMBOL_BITMASK, \
+                enableDebugEqOutput, \
+                ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION>(pStatDescr, drvdUeGrpPrms, smem_is_dmrs_symbol, smem_llr_addr_offset, sC); \
+        } while (0);
+
+    if constexpr ((SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK) || (SYMBOL_BITMASK==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS))
+    {
+        constexpr bool ENABLE_TDI = false;
+        constexpr bool ENABLE_CFO_CORRECTION = false;
+        if (enableTfPrcd) {
+            constexpr bool ENABLE_TF_PRCD = true;
+            CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+        } else {
+            constexpr bool ENABLE_TF_PRCD = false;
+            CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+        }
+    } else {
+        const bool enableCfoCorrection = (0 != drvdUeGrpPrms.enableCfoCorrection);
+        // drvdUeGrpPrms.dmrsMaxLen is 1 or 2, so the below is equivalent to:
+        //   (drvdUeGrpPrms.nDmrsSyms / drvdUeGrpPrms.dmrsMaxLen) > 1
+        // without the integer division.
+        const bool nDmrsSymGt1 = drvdUeGrpPrms.nDmrsSyms >= 2 * drvdUeGrpPrms.dmrsMaxLen;
+        const bool enableTdi = (0 != drvdUeGrpPrms.enablePuschTdi) && nDmrsSymGt1;
+        if (enableTfPrcd) {
+            constexpr bool ENABLE_TF_PRCD = true;
+            if (enableTdi) {
+                constexpr bool ENABLE_TDI = true;
+                if (enableCfoCorrection) {
+                    constexpr bool ENABLE_CFO_CORRECTION = true;
+                    CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+                } else {
+                    constexpr bool ENABLE_CFO_CORRECTION = false;
+                    CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+                }
+            } else {
+                constexpr bool ENABLE_TDI = false;
+                if (enableCfoCorrection) {
+                    constexpr bool ENABLE_CFO_CORRECTION = true;
+                    CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+                } else {
+                    constexpr bool ENABLE_CFO_CORRECTION = false;
+                    CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+                }
+            }
+        } else {
+            constexpr bool ENABLE_TF_PRCD = false;
+            if (enableTdi) {
+                constexpr bool ENABLE_TDI = true;
+                if (enableCfoCorrection) {
+                    constexpr bool ENABLE_CFO_CORRECTION = true;
+                    CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+                } else {
+                    constexpr bool ENABLE_CFO_CORRECTION = false;
+                    CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+                }
+            } else {
+                constexpr bool ENABLE_TDI = false;
+                if (enableCfoCorrection) {
+                    constexpr bool ENABLE_CFO_CORRECTION = true;
+                    CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+                } else {
+                    constexpr bool ENABLE_CFO_CORRECTION = false;
+                    CALL_SOFT_DEMAP_V4(ENABLE_TF_PRCD, ENABLE_TDI, ENABLE_CFO_CORRECTION);
+                }
+            }
+        }
+    }
+    #undef CALL_SOFT_DEMAP_V4
+}
+
+template <typename TStorageIn,
+          typename TDataRx,
+          typename TStorageOut,
+          typename TCompute,
+          uint32_t N_BS_ANTS,            // # of BS antenna (# of cols of C matrix)
+          uint16_t SYMBOL_BITMASK>
+__launch_bounds__(CUPHY_N_TONES_PER_PRB * OFDM_SYMBOLS_PER_SLOT)
+__global__ void
+eqMmseEqualizationKernel(puschRxChEqStatDescr_t *pStatDescr, const __grid_constant__ puschRxChEqSoftDemapDynDescr_t dynDescr)
+{
+    KERNEL_PRINT_GRID_ONCE("%s\n grid = (%u %u %u), block = (%u %u %u), N_BS_ANTS = %u\n",
+                           __PRETTY_FUNCTION__,
+                           gridDim.x, gridDim.y, gridDim.z,
+                           blockDim.x, blockDim.y, blockDim.z,
+                           N_BS_ANTS);
+    eqMmseEqualizationKernel_v4<TStorageIn,
+                             TDataRx,
+                             TStorageOut,
+                             TCompute,
+                             N_BS_ANTS,
+                             SYMBOL_BITMASK>(pStatDescr, dynDescr);
+}
+
+
+template <typename TStorageIn,
+          typename TDataRx,
+          typename TStorageOut,
+          typename TCompute,
+          uint32_t N_BS_ANTS,            // # of BS antenna (# of cols of C matrix)
+          uint16_t SYMBOL_BITMASK>
+__launch_bounds__(CUPHY_N_TONES_PER_PRB * MAX_LAYERS_PER_SPLIT_72E_SOFT_DEMAP_LAYER_GROUP * OFDM_SYMBOLS_PER_SLOT)
+__global__ void
+eqMmseSoftDemap72eKernel(puschRxChEqStatDescr_t *pStatDescr, const __grid_constant__ puschRxChEqSoftDemapDynDescr_t dynDescr)
+{
+    KERNEL_PRINT_GRID_ONCE("%s\n grid = (%u %u %u), block = (%u %u %u), N_BS_ANTS = %u\n",
+                           __PRETTY_FUNCTION__,
+                           gridDim.x, gridDim.y, gridDim.z,
+                           blockDim.x, blockDim.y, blockDim.z,
+                           N_BS_ANTS);
+    eqMmseSoftDemap72eKernel_v4<TStorageIn,
                              TDataRx,
                              TStorageOut,
                              TCompute,
@@ -4982,7 +5399,7 @@ puschRxChEq::eqMmseCoefCompLowMimo(uint16_t                     nPrb,
                                    uint16_t                     nUeGrps,
                                    cuphyPuschRxChEqLaunchCfg_t& launchCfg)
 {
-    constexpr uint32_t N_FREQ_BINS_PER_ITER = 4; // 12;
+    constexpr uint32_t N_FREQ_BINS_PER_ITER = (N_BS_ANTS <= 4) ? 12 : 4;
 
     void* kernelFunc = reinterpret_cast<void*>(eqMmseCoefCompLowMimoKernel<TStorageIn,
                                                                            TStorageOut,
@@ -5015,11 +5432,26 @@ void puschRxChEq::softDemapKernelLaunchGeo(uint8_t  Nd,
                                            uint16_t nPrb,
                                            uint16_t nLayers,
                                            uint16_t nUeGrps,
+                                           uint8_t  openRanFunctionalSplitOption,
                                            dim3&    gridDim,
                                            dim3&    blockDim)
 {
-    gridDim = dim3(nPrb, nLayers, nUeGrps);
-    blockDim = dim3(CUPHY_N_TONES_PER_PRB, Nd);
+    if(openRanFunctionalSplitOption!=PUSCH_7_2_E)
+    {
+        gridDim = dim3(nPrb, nLayers, nUeGrps);
+        blockDim = dim3(CUPHY_N_TONES_PER_PRB, Nd);
+    }
+    else
+    {
+        if(Nd > OFDM_SYMBOLS_PER_SLOT)
+        {
+            NVLOGF_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: 7.2e soft-demap Nd ({}) exceeds OFDM_SYMBOLS_PER_SLOT ({}), would violate kernel launch bounds", __FUNCTION__, Nd,  OFDM_SYMBOLS_PER_SLOT);
+        }
+        const uint16_t maxLayersPerCta = (nLayers >= MAX_LAYERS_PER_SPLIT_72E_SOFT_DEMAP_LAYER_GROUP) ? MAX_LAYERS_PER_SPLIT_72E_SOFT_DEMAP_LAYER_GROUP : nLayers;
+        const uint16_t layerGroups = (nLayers + maxLayersPerCta - 1) / maxLayersPerCta;
+        gridDim = dim3(nPrb, layerGroups, nUeGrps);
+        blockDim = dim3(CUPHY_N_TONES_PER_PRB, maxLayersPerCta, Nd);
+    }
 
 #ifdef ENABLE_DEBUG
     NVLOGI_FMT(NVLOG_PUSCH, "{}: blockDim ({},{},{}), gridDim ({},{},{})", __FUNCTION__, blockDim.x, blockDim.y, blockDim.z, gridDim.x, gridDim.y, gridDim.z);
@@ -5082,50 +5514,146 @@ puschRxChEq::eqMmseSoftDemap(uint8_t                      Nd,
                              uint16_t                     nPrb,
                              uint16_t                     nLayers,
                              uint16_t                     nUeGrps,
+                             uint8_t                      openRanFunctionalSplitOption,
+                             uint8_t                      kernelSelOption,
                              uint16_t                     symbolBitmask,
                              cuphyPuschRxChEqLaunchCfg_t& launchCfg)
 {
     CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = launchCfg.kernelNodeParamsDriver;
 
-    if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)
-    {
-        static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK;
-        void* kernelFunc = reinterpret_cast<void*>(eqMmseSoftDemapKernel<TStorageIn,
-                                                                         TDataRx,
-                                                                         TStorageOut,
-                                                                         TCompute,
-                                                                         N_BS_ANTS,
-                                                                         SYMBOL_BITMASK>); //full-slot processing
+    #define SOFT_DEMAP_KERNEL_SELECTION_INNER(SYMBOL_BITMASK, ENABLE_DEBUG_EQ_OUTPUT) \
+        do { \
+            void* kernelFunc = reinterpret_cast<void*>(eqMmseSoftDemapKernel<TStorageIn, \
+                                                                         TDataRx, \
+                                                                         TStorageOut, \
+                                                                         TCompute, \
+                                                                         N_BS_ANTS, \
+                                                                         SYMBOL_BITMASK, \
+                                                                         ENABLE_DEBUG_EQ_OUTPUT>); \
+            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));} \
+        } while (0);
 
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
-    }
-    else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK)
-    {
-        static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK;
-        void* kernelFunc = reinterpret_cast<void*>(eqMmseSoftDemapKernel<TStorageIn,
-                                                                         TDataRx,
-                                                                         TStorageOut,
-                                                                         TCompute,
-                                                                         N_BS_ANTS,
-                                                                         SYMBOL_BITMASK>); //early-HARQ processing
+    #define SOFT_DEMAP_KERNEL_SELECTION(SYMBOL_BITMASK) \
+        do { \
+            if (this->m_enableDebugEqOutput) { \
+                constexpr bool ENABLE_DEBUG_EQ_OUTPUT = true; \
+                SOFT_DEMAP_KERNEL_SELECTION_INNER(SYMBOL_BITMASK, ENABLE_DEBUG_EQ_OUTPUT); \
+            } else { \
+                constexpr bool ENABLE_DEBUG_EQ_OUTPUT = false; \
+                SOFT_DEMAP_KERNEL_SELECTION_INNER(SYMBOL_BITMASK, ENABLE_DEBUG_EQ_OUTPUT); \
+            } \
+        } while (0);
 
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
-    }
-    else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS)
+    if(openRanFunctionalSplitOption!=PUSCH_7_2_E)
     {
-        static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS;
-        void* kernelFunc = reinterpret_cast<void*>(eqMmseSoftDemapKernel<TStorageIn,
-                                                                         TDataRx,
-                                                                         TStorageOut,
-                                                                         TCompute,
-                                                                         N_BS_ANTS,
-                                                                         SYMBOL_BITMASK>); //early-HARQ processing
+        if(kernelSelOption!=PUSCH_NO_SD_DERATE_MATCHING_FEC)
+        {
+            if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)
+            {
+                static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK;
+                SOFT_DEMAP_KERNEL_SELECTION(SYMBOL_BITMASK); //full-slot processing
+            }
+            else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK)
+            {
+                static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK;
+                SOFT_DEMAP_KERNEL_SELECTION(SYMBOL_BITMASK); //early-HARQ processing
+            }
+            else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS)
+            {
+                static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS;
+                SOFT_DEMAP_KERNEL_SELECTION(SYMBOL_BITMASK); //early-HARQ processing
+            }
+        }
+        else
+        {
+            if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)
+            {
+                static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK;
+                void* kernelFunc = reinterpret_cast<void*>(eqMmseEqualizationKernel<TStorageIn,
+                                                                                    TDataRx,
+                                                                                    TStorageOut,
+                                                                                    TCompute,
+                                                                                    N_BS_ANTS,
+                                                                                    SYMBOL_BITMASK>); //full-slot processing
 
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
+                {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
+            }
+            else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK)
+            {
+                static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK;
+                void* kernelFunc = reinterpret_cast<void*>(eqMmseEqualizationKernel<TStorageIn,
+                                                                                    TDataRx,
+                                                                                    TStorageOut,
+                                                                                    TCompute,
+                                                                                    N_BS_ANTS,
+                                                                                    SYMBOL_BITMASK>); //early-HARQ processing
+
+                {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
+            }
+            else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS)
+            {
+                static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS;
+                void* kernelFunc = reinterpret_cast<void*>(eqMmseEqualizationKernel<TStorageIn,
+                                                                                    TDataRx,
+                                                                                    TStorageOut,
+                                                                                    TCompute,
+                                                                                    N_BS_ANTS,
+                                                                                    SYMBOL_BITMASK>); //early-HARQ processing
+
+                {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
+            }
+        }
     }
+    else
+    {
+        if(this->m_enableDebugEqOutput)
+        {
+            NVLOGW_FMT(NVLOG_PUSCH, "WARNING: enableDebugEqOutput is set but 7.2e soft-demap kernel does not support debug EQ output; debug output will be skipped.");
+        }
+
+        if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK)
+        {
+            static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK;
+            void* kernelFunc = reinterpret_cast<void*>(eqMmseSoftDemap72eKernel<TStorageIn,
+                                                                             TDataRx,
+                                                                             TStorageOut,
+                                                                             TCompute,
+                                                                             N_BS_ANTS,
+                                                                             SYMBOL_BITMASK>); //full-slot processing
+
+            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
+        }
+        else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK)
+        {
+            static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK;
+            void* kernelFunc = reinterpret_cast<void*>(eqMmseSoftDemap72eKernel<TStorageIn,
+                                                                             TDataRx,
+                                                                             TStorageOut,
+                                                                             TCompute,
+                                                                             N_BS_ANTS,
+                                                                             SYMBOL_BITMASK>); //early-HARQ processing
+
+            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
+        }
+        else if(symbolBitmask==CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS)
+        {
+            static constexpr uint16_t SYMBOL_BITMASK    = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS;
+            void* kernelFunc = reinterpret_cast<void*>(eqMmseSoftDemap72eKernel<TStorageIn,
+                                                                             TDataRx,
+                                                                             TStorageOut,
+                                                                             TCompute,
+                                                                             N_BS_ANTS,
+                                                                             SYMBOL_BITMASK>); //early-HARQ processing
+
+            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&kernelNodeParamsDriver.func, kernelFunc));}
+        }
+    }
+
+    #undef SOFT_DEMAP_KERNEL_SELECTION
+    #undef SOFT_DEMAP_KERNEL_SELECTION_INNER
 
     dim3 blockDim, gridDim;
-    softDemapKernelLaunchGeo(Nd, nPrb, nLayers, nUeGrps, gridDim, blockDim);
+    softDemapKernelLaunchGeo(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, gridDim, blockDim);
 
     kernelNodeParamsDriver.blockDimX = blockDim.x;
     kernelNodeParamsDriver.blockDimY = blockDim.y;
@@ -5219,6 +5747,9 @@ void puschRxChEq::eqMmseSoftDemapIdft(uint8_t                      Nd,
     {
         case 800:
             selectFftAndKernel(std::integral_constant<uint, 800>{});
+            break;
+        case 890:
+            selectFftAndKernel(std::integral_constant<uint, 890>{});
             break;
         case 900:
             selectFftAndKernel(std::integral_constant<uint, 900>{});
@@ -6037,6 +6568,8 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                                           uint8_t                      Nd,
                                           uint16_t                     nPrb,
                                           uint16_t                     nUeGrps,
+                                          uint8_t                      openRanFunctionalSplitOption,
+                                          uint8_t                      kernelSelOption,
                                           uint16_t                     symbolBitmask,
                                           cuphyPuschRxChEqLaunchCfg_t& launchCfg)
 {
@@ -6067,7 +6600,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         TDataRx,
                         TStorageOut,
                         TCompute,
-                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
         break;
     }
 
@@ -6079,7 +6612,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         TDataRx,
                         TStorageOut,
                         TCompute,
-                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
         break;
     }
 
@@ -6091,7 +6624,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         TDataRx,
                         TStorageOut,
                         TCompute,
-                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
         break;
     }
 
@@ -6103,7 +6636,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         TDataRx,
                         TStorageOut,
                         TCompute,
-                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
         break;
     }
 
@@ -6115,7 +6648,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         TDataRx,
                         TStorageOut,
                         TCompute,
-                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
         break;
     }
 
@@ -6127,7 +6660,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         TDataRx,
                         TStorageOut,
                         TCompute,
-                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
         break;
     }
 
@@ -6139,7 +6672,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                         TDataRx,
                         TStorageOut,
                         TCompute,
-                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+                        N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
         break;
     }
 
@@ -6151,7 +6684,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
                     TDataRx,
                     TStorageOut,
                     TCompute,
-                    N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+                    N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
         break;
     }
 
@@ -6163,7 +6696,7 @@ void puschRxChEq::softDemapKernelSelectL0(uint16_t                     nBSAnts,
 		      TDataRx,
 		      TStorageOut,
 		      TCompute,
-		      N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, symbolBitmask, launchCfg);
+		      N_BS_ANTS>(Nd, nPrb, nLayers, nUeGrps, openRanFunctionalSplitOption, kernelSelOption, symbolBitmask, launchCfg);
       break;
     }
 
@@ -6399,6 +6932,8 @@ void puschRxChEq::softDemapKernelSelectL1(uint16_t                     nBSAnts,
                                           uint8_t                      Nd,
                                           uint16_t                     nPrb,
                                           uint16_t                     nUeGrps,
+                                          uint8_t                      openRanFunctionalSplitOption,
+                                          uint8_t                      kernelSelOption,
                                           uint16_t                     symbolBitmask,
                                           cuphyDataType_t              coefType,
                                           cuphyDataType_t              dataRxType,
@@ -6419,6 +6954,8 @@ void puschRxChEq::softDemapKernelSelectL1(uint16_t                     nBSAnts,
                                                                                 Nd,
                                                                                 nPrb,
                                                                                 nUeGrps,
+                                                                                openRanFunctionalSplitOption,
+                                                                                kernelSelOption,
                                                                                 symbolBitmask,
                                                                                 launchCfg);
         }
@@ -6435,6 +6972,8 @@ void puschRxChEq::softDemapKernelSelectL1(uint16_t                     nBSAnts,
                                                                                     Nd,
                                                                                     nPrb,
                                                                                     nUeGrps,
+                                                                                    openRanFunctionalSplitOption,
+                                                                                    kernelSelOption,
                                                                                     symbolBitmask,
                                                                                     launchCfg);
             }
@@ -6462,6 +7001,8 @@ void puschRxChEq::softDemapKernelSelectL1(uint16_t                     nBSAnts,
                                                                             Nd,
                                                                             nPrb,
                                                                             nUeGrps,
+                                                                            openRanFunctionalSplitOption,
+                                                                            kernelSelOption,
                                                                             symbolBitmask,
                                                                             launchCfg);
     }
@@ -6656,63 +7197,24 @@ __global__ void bluestein_workspace_kernel(puschRxChEqIdftStatDescr_t* pIdftStat
     using namespace cufftdx;
     puschRxChEqIdftStatDescr_t& idftStatDescr = *(pIdftStatDescr);
 
-    // 1-D array of DFT sizes indexed by locBluesteinWorkspace
-    static constexpr uint16_t DFT_SIZES[] = {
-        // FFT128
-        12, 24, 36, 48, 60,
-        // FFT256
-        72, 96, 108, 120,
-        // FFT512
-        144, 180, 192, 216, 240,
-        // FFT1024
-        288, 300, 324, 360, 384, 432, 480,
-        // FFT2048
-        540, 576, 600, 648, 720, 768, 864, 900, 960, 972,
-        // FFT4096
-        1080, 1152, 1200, 1296, 1440, 1500, 1536, 1620, 1728, 1800, 1920, 1944,
-        // FFT8192
-        2160, 2304, 2400, 2592, 2700, 2880, 2916, 3000, 3072, 3240
-    };
-    struct FftOffset {
-        uint8_t  offset;
-        uint8_t  count;
-    };
-    static constexpr FftOffset FFT_OFFSETS[] = {
-        {0,  5}, // FFT128
-        {5,  4}, // FFT256
-        {9,  5}, // FFT512
-        {14, 7}, // FFT1024
-        {21, 10}, // FFT2048
-        {31, 12}, // FFT4096
-        {43, 10}  // FFT8192
-    };
-
-    uint16_t blue_fft_size = size_of<FFT>::value;
-    // Helper to get FFT offset index
-    auto get_fft_offset_index = [](uint16_t blue_fft_size) -> int {
-        if (blue_fft_size < 128 || blue_fft_size > 8192) return -1;
-        if (blue_fft_size & (blue_fft_size - 1)) return -1; // not a power of two
-        int idx = __ffs(blue_fft_size) - 8; // __ffs is 1-based
-        if (idx < 0 || idx > 6) return -1;
-        return idx;
-    };
-    int fft_idx = get_fft_offset_index(blue_fft_size);
-    if (fft_idx < 0) return;
-    const auto& entry = FFT_OFFSETS[fft_idx];
-    if (blockIdx.x >= entry.count) return;
-    uint8_t locBluesteinWorkspace = entry.offset + blockIdx.x;
-    uint16_t DFTSize = DFT_SIZES[locBluesteinWorkspace];
-
-    // caches current size of tDftBluesteinWorkspaceTime/Freq.  Initialized to zero.
-    // static uint16_t dft_cache = 0;
-
-    // if the size of the cached tDftBluesteinWorkspaceTime/Freq is correct, then don't bother re-generating.
-    // if ( DFTSize != dft_cache )
+    // Row range for this FFT width comes from the shared DFT_SIZES / FftWidthForRow mapping -
+    // the same source of truth bluestein_Idft_kernel uses via cuphyPuschDftSOfdmBluesteinRow.
+    const uint16_t blue_fft_size = size_of<FFT>::value;
+    const auto     rowRange      = cuphy::getDftSOfdmBluesteinRowRangeForFftWidth(blue_fft_size);
+    if((rowRange.count == 0U) || (blockIdx.x >= rowRange.count))
     {
+        return;
+    }
+    const uint8_t locBluesteinWorkspace = static_cast<uint8_t>(rowRange.offset + blockIdx.x);
+    if(locBluesteinWorkspace >= idftStatDescr.nBluesteinWorkspaceRows)
+    {
+        return;
+    }
+    const uint16_t DFTSize = c_cuphyPuschDftSOfdmDftSizes[locBluesteinWorkspace];
 
-      extern __shared__ unsigned char shared_mem[];
+    extern __shared__ unsigned char shared_mem[];
 
-      typedef typename complex_from_scalar<TCompute>::type    TComplexCompute;
+    typedef typename complex_from_scalar<TCompute>::type    TComplexCompute;
       tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceTime  (idftStatDescr.tInfoDftBluesteinWorkspaceTime.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceTime.strides);
       tensor_ref<TComplexCompute>         tDftBluesteinWorkspaceFreq  (idftStatDescr.tInfoDftBluesteinWorkspaceFreq.pAddr, idftStatDescr.tInfoDftBluesteinWorkspaceFreq.strides);
 
@@ -6759,11 +7261,6 @@ __global__ void bluestein_workspace_kernel(puschRxChEqIdftStatDescr_t* pIdftStat
 	tDftBluesteinWorkspaceFreq(locBluesteinWorkspace, index) = (TComplexCompute){TCompute(input[i].x), TCompute(input[i].y)};
 	index += stride;
       }
-
-      // dft_cache = DFTSize;
-
-    }  // if ( DFTSize != dft_cache ) {
-
 }
 
 template <typename TCompute,
@@ -6801,6 +7298,7 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
                                 void**                  ppIdftStatDescrsGpu,
                                 cudaStream_t            strm)
 {
+    this->m_enableDebugEqOutput = enableDebugEqOutput != 0;
     for(int32_t chEqTimeInstIdx = 0; chEqTimeInstIdx < CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ; ++chEqTimeInstIdx)
     {
         puschRxChEqStatDescr_t& statDescrCpu = *(static_cast<puschRxChEqStatDescr_t*>(ppStatDescrsCpu[chEqTimeInstIdx]));
@@ -6835,10 +7333,45 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
 
     if(enableDftSOfdm==1)
     {
+        if(syncDftSOfdmConstantTables() != CUPHY_STATUS_SUCCESS)
+        {
+            return CUPHY_STATUS_INTERNAL_ERROR;
+        }
 
         puschRxChEqIdftStatDescr_t& idftStatDescrCpu = *(static_cast<puschRxChEqIdftStatDescr_t*>(ppIdftStatDescrsCpu[0]));
         idftStatDescrCpu.tInfoDftBluesteinWorkspaceTime = tInfoDftBluesteinWorkspaceTime;
         idftStatDescrCpu.tInfoDftBluesteinWorkspaceFreq = tInfoDftBluesteinWorkspaceFreq;
+        // A caller that leaves both fields at zero gets the full table (the pre-shrink behavior).
+        if((idftStatDescrCpu.nBluesteinWorkspaceRows == 0U) && (idftStatDescrCpu.bluesteinWorkspaceFftWidth == 0U))
+        {
+            idftStatDescrCpu.nBluesteinWorkspaceRows    = static_cast<uint16_t>(cuphy::CUPHY_PUSCH_DFT_S_OFDM_NUM_BLUESTEIN_ROWS);
+            idftStatDescrCpu.bluesteinWorkspaceFftWidth = FFT8192;
+        }
+
+        // The workspace-init kernels write row r at column [0, fftWidth) of the caller's tensor, so
+        // an inconsistent (rows, fftWidth) pair means writing outside the allocation. Reject it here
+        // rather than corrupting device memory: both fields must describe the same tensor the caller
+        // allocated with getDftSOfdmBluesteinWorkspaceDims().
+        const uint16_t nWorkspaceRows    = idftStatDescrCpu.nBluesteinWorkspaceRows;
+        const uint16_t workspaceFftWidth = idftStatDescrCpu.bluesteinWorkspaceFftWidth;
+        if((nWorkspaceRows == 0U) || (nWorkspaceRows > cuphy::CUPHY_PUSCH_DFT_S_OFDM_NUM_BLUESTEIN_ROWS) ||
+           (workspaceFftWidth != cuphy::getDftSOfdmBluesteinFftWidthForNumRows(nWorkspaceRows)))
+        {
+            NVLOGE_FMT(NVLOG_PUSCH,
+                       AERIAL_CUPHY_EVENT,
+                       "{}: inconsistent Bluestein workspace dimensions: nRows {} fftWidth {}",
+                       __FUNCTION__,
+                       nWorkspaceRows,
+                       workspaceFftWidth);
+            return CUPHY_STATUS_INVALID_ARGUMENT;
+        }
+
+        const int maxFftKernelIdx = cuphy::getDftSOfdmBluesteinMaxFftKernelIndex(workspaceFftWidth);
+        if(maxFftKernelIdx < 0)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: invalid bluesteinWorkspaceFftWidth {}", __FUNCTION__, workspaceFftWidth);
+            return CUPHY_STATUS_INVALID_ARGUMENT;
+        }
 
         for(int32_t idx = 0; idx < 2; ++idx)
         {
@@ -6862,23 +7395,22 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
         dim3  block_dim;
         uint  shared_memory_size;
 
-        std::map<int, dim3> fftConfigs = {
-            {FFT128,  dim3(5, 1, 1)},
-            {FFT256,  dim3(4, 1, 1)},
-            {FFT512,  dim3(5, 1, 1)},
-            {FFT1024, dim3(7, 1, 1)},
-            {FFT2048, dim3(10, 1, 1)},
-            {FFT4096, dim3(12, 1, 1)},
-            {FFT8192, dim3(10, 1, 1)}
-        };
-
         // Templated lambda for kernel selection and launch
         auto launchFftKernel = [&](auto fftSizeC) -> cuphyStatus_t {
             constexpr int fftSize = fftSizeC;
+            // grid.x == number of DFT_SIZES rows that use this Bluestein FFT width
+            // (same range bluestein_workspace_kernel derives via getDftSOfdmBluesteinRowRangeForFftWidth).
+            constexpr auto rowRange = cuphy::getDftSOfdmBluesteinRowRangeForFftWidth(static_cast<uint32_t>(fftSize));
+            static_assert(rowRange.count > 0U, "DFT-s-OFDM Bluestein FFT width must map to at least one row");
+            const dim3 grid_dim(rowRange.count, 1, 1);
+
             void* kernelPtr = nullptr;
             switch(cudaDeviceArch) {
                 case 800:
                     kernelPtr = getBluesteinWorkspaceFFT<TCompute, fftSize, 800>(block_dim, shared_memory_size);
+                    break;
+                case 890:
+                    kernelPtr = getBluesteinWorkspaceFFT<TCompute, fftSize, 890>(block_dim, shared_memory_size);
                     break;
                 case 900:
                     kernelPtr = getBluesteinWorkspaceFFT<TCompute, fftSize, 900>(block_dim, shared_memory_size);
@@ -6906,7 +7438,7 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
             }
             
             cudaError_t err = cudaLaunchKernel(reinterpret_cast<void*>(kernelPtr),
-                                            fftConfigs[fftSize], block_dim,
+                                            grid_dim, block_dim,
                                             (void**)(kernelArgs), shared_memory_size, strm);
             if(cudaSuccess != err) {
                 NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: The failure of cudaLaunchKernel for bluestein_workspace_kernel() FFT{}", __FUNCTION__, fftSize);
@@ -6915,14 +7447,14 @@ cuphyStatus_t puschRxChEq::init(cuphyContext_t          hctx,
             return CUPHY_STATUS_SUCCESS;
         };
 
-        // Call the lambda for each FFT size
-        if (launchFftKernel(std::integral_constant<int, FFT128>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
-        if (launchFftKernel(std::integral_constant<int, FFT256>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
-        if (launchFftKernel(std::integral_constant<int, FFT512>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
-        if (launchFftKernel(std::integral_constant<int, FFT1024>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
-        if (launchFftKernel(std::integral_constant<int, FFT2048>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
-        if (launchFftKernel(std::integral_constant<int, FFT4096>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
-        if (launchFftKernel(std::integral_constant<int, FFT8192>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
+        // Call the lambda for each FFT size required by the shrunk workspace tensor
+        if(maxFftKernelIdx >= 0 && launchFftKernel(std::integral_constant<int, FFT128>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
+        if(maxFftKernelIdx >= 1 && launchFftKernel(std::integral_constant<int, FFT256>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
+        if(maxFftKernelIdx >= 2 && launchFftKernel(std::integral_constant<int, FFT512>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
+        if(maxFftKernelIdx >= 3 && launchFftKernel(std::integral_constant<int, FFT1024>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
+        if(maxFftKernelIdx >= 4 && launchFftKernel(std::integral_constant<int, FFT2048>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
+        if(maxFftKernelIdx >= 5 && launchFftKernel(std::integral_constant<int, FFT4096>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
+        if(maxFftKernelIdx >= 6 && launchFftKernel(std::integral_constant<int, FFT8192>{}) != CUPHY_STATUS_SUCCESS) return CUPHY_STATUS_INTERNAL_ERROR;
 
         m_softDemapIdftHetCfgVec.fill({CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0}});
         m_softDemapAfterDftHetCfgVec.fill({CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, puschRxChEqSoftDemapHetCfg_t{nullptr, 0, 0, 0}});
@@ -7229,6 +7761,8 @@ cuphyStatus_t puschRxChEq::setupCoefCompute(cuphyPuschRxUeGrpPrms_t*      pDrvdU
 
 cuphyStatus_t puschRxChEq::batchEqSoftDemap(cuphyPuschRxUeGrpPrms_t*           pDrvdUeGrpPrms,
                                             uint16_t                           nUeGrps,
+                                            uint8_t                            openRanFunctionalSplitOption,
+                                            uint8_t                            kernelSelOption,
                                             uint16_t                           symbolBitmask,
                                             uint32_t&                          nHetCfgs,
                                             puschRxChEqSoftDemapDynDescrVec_t& dynDescrVecCpu)
@@ -7293,6 +7827,8 @@ cuphyStatus_t puschRxChEq::batchEqSoftDemap(cuphyPuschRxUeGrpPrms_t*           p
                                 nDataSym,
                                 nPrb,
                                 nUeGrps,
+                                openRanFunctionalSplitOption,
+                                kernelSelOption,
                                 symbolBitmask,
                                 drvdUeGrpPrms.tInfoEqCoef.elemType,
                                 drvdUeGrpPrms.tInfoDataRx.elemType,
@@ -7362,6 +7898,8 @@ cuphyStatus_t puschRxChEq::batchEqSoftDemap(cuphyPuschRxUeGrpPrms_t*           p
                                     nDataSym,
                                     nPrb,
                                     nUeGrps,
+                                    openRanFunctionalSplitOption,
+                                    kernelSelOption,
                                     symbolBitmask,
                                     drvdUeGrpPrms.tInfoEqCoef.elemType,
                                     drvdUeGrpPrms.tInfoDataRx.elemType,
@@ -7793,6 +8331,8 @@ cuphyStatus_t puschRxChEq::setupSoftDemap(cuphyPuschRxUeGrpPrms_t*           pDr
                                           uint16_t                           nMaxPrb,
                                           uint8_t                            enableCfoCorrection,
                                           uint8_t                            enablePuschTdi,
+                                          uint8_t                            openRanFunctionalSplitOption,
+                                          uint8_t                            kernelSelOption,
                                           uint16_t                           symbolBitmask,
                                           bool                               enableCpuToGpuDescrAsyncCpy,
                                           puschRxChEqSoftDemapDynDescrVec_t& dynDescrVecCpu,
@@ -7811,6 +8351,8 @@ cuphyStatus_t puschRxChEq::setupSoftDemap(cuphyPuschRxUeGrpPrms_t*           pDr
     cuphyPuschRxChEqLaunchCfgs_t& launchCfgs = *pLaunchCfgs;
     cuphyStatus_t status = batchEqSoftDemap(pDrvdUeGrpPrmsCpu,
                                             nUeGrps,
+                                            openRanFunctionalSplitOption,
+                                            kernelSelOption,
                                             symbolBitmask,
                                             launchCfgs.nCfgs,
                                             dynDescrVecCpu);
@@ -7851,6 +8393,8 @@ cuphyStatus_t puschRxChEq::setupSoftDemap(cuphyPuschRxUeGrpPrms_t*           pDr
                                 hetCfg.nMaxDataSym,
                                 hetCfg.nMaxPrb,
                                 hetCfg.nUeGrps,
+                                openRanFunctionalSplitOption,
+                                kernelSelOption,
                                 symbolBitmask,
                                 drvdUeGrpPrms.tInfoEqCoef.elemType,
                                 drvdUeGrpPrms.tInfoDataRx.elemType,

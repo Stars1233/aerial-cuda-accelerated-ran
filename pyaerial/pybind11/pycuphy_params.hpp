@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -157,6 +157,7 @@ private:
     cudaEvent_t                                     m_subSlotCompletedEvent;
     cudaEvent_t                                     m_waitCompletedSubSlotEvent;
     cudaEvent_t                                     m_waitCompletedFullSlotEvent;
+    cudaEvent_t                                     m_uciOnPuschCompletedEvent;
 
     cuphyTensorPrm_t m_tPrmWFreq, m_tPrmWFreq4, m_tPrmWFreqSmall, m_tPrmShiftSeq, m_tPrmUnShiftSeq, m_tPrmShiftSeq4, m_tPrmUnShiftSeq4;
     cuphy::tensor_device m_tWFreq, m_tWFreq4, m_tWFreqSmall, m_tShiftSeq, m_tUnshiftSeq, m_tShiftSeq4, m_tUnshiftSeq4;

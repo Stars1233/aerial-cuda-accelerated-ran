@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,6 +43,7 @@ struct ldpc_decode_test_vec_config
     float               R;      // Code rate
     const char*         QAM;    // Modulation description
     LLR_puncture_status punc;   // 2Z info bits puncture status
+    uint32_t            crc_type; // CRC type
 };
 
 ////////////////////////////////////////////////////////////////////////
@@ -52,12 +53,13 @@ class ldpc_decode_test_vec
 public:
     virtual                              ~ldpc_decode_test_vec() {}
     cuphyDataType_t                      LLR_type()              { return LLRtype_; }
-    virtual const char*                  desc() const = 0;
+    [[nodiscard]] virtual const char*    desc() const = 0;
     const ldpc_decode_test_vec_config&   config() const          { return config_; }
     void                                 print_config() const;
     const cuphy::tensor_desc&            LLR_desc() const { return LLR_desc_; }
     void*                                LLR_addr() const { return tLLR_.addr(); }
     const cuphy::tensor_device&          src_bits() const { return tSrcData_; }
+    cuphy::tensor_ref                    src_bits_view() { return cuphy::tensor_ref(src_bits_desc_, tSrcData_.addr()); }
     virtual void                         generate() = 0;
     void                                 export_hdf5(hdf5hpp::hdf5_file& f, cudaStream_t strm = 0);
 protected:
@@ -85,6 +87,7 @@ protected:
     //------------------------------------------------------------------
     // set_LLR_desc()
     void set_LLR_desc(const cuphy::tensor_desc desc) { LLR_desc_ = desc; }
+    void set_src_bits_desc(const cuphy::tensor_desc desc) { src_bits_desc_ = desc; }
     //------------------------------------------------------------------
     // Data
     cuphyDataType_t               LLRtype_;      // Data type for LLR inputs
@@ -93,6 +96,7 @@ protected:
     ldpc_decode_test_vec_config   config_;
 private:
     cuphy::tensor_desc            LLR_desc_;     // raw tensor descriptor handle
+    cuphy::tensor_desc            src_bits_desc_;
 };
 
 #endif // !defined(LDPC_DECODE_TEST_VEC_HPP_INCLUDED_)

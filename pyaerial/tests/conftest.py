@@ -47,8 +47,7 @@ def clear_session():
 def pytest_configure():
     """Configure pytest."""
     pycuphy.set_nvlog_level(0)
-    pytest.TEST_VECTOR_DIR = os.environ.get(
-        "TEST_VECTOR_DIR",
+    pytest.TEST_VECTOR_DIR = os.environ.get("TEST_VECTOR_DIR") or (
         "/mnt/cicd_tvs/develop/GPU_test_input/"
     )
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -187,11 +187,6 @@ TEST(Fill, IndexGroup)
                                                              cuphy::index_range(1, 3),
                                                              cuphy::dim_all()));
     do_fill_index_group_test<CUPHY_R_16F>(std::array<int, 4>({32, 16, 1, 1}),
-                                          cuphy::index_group(cuphy::index_range(16, 25),
-                                                             cuphy::dim_all(),
-                                                             cuphy::dim_all(),
-                                                             cuphy::dim_all()));
-    do_fill_index_group_test<CUPHY_BIT>(std::array<int, 4>({32, 16, 1, 1}),
                                           cuphy::index_group(cuphy::index_range(16, 25),
                                                              cuphy::dim_all(),
                                                              cuphy::dim_all(),

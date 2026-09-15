@@ -33,21 +33,37 @@ ENABLE_L1_L2_MEM_SHARING: true
 # print UE pairing solution
 PRINT_UE_PAIRING_SOLUTION: true
 
+# Enable TV save/load round-trip test mode for verifying muMimoUserPairing HDF5 test vectors
+ENABLE_TV_TEST_MODE: false
+
+# TV slot save mode: true = save TVs for all slots, false = save TVs for last slot only
+TV_SAVE_ALL_SLOTS: false
+
 # CUDA kernel launch flags
 KERNEL_LAUNCH_FLAGS: 0x03 # 0x01: channel correlation computation kernel, 0x02: UE pairing algorithm kernel
 
 # config constants
 NUM_TIME_SLOTS: 5
 TDD_PATTERN: "SDDDS"
+
+# SCHEDULE_SLOT_IDS lists the slot indices (within one period)
+SCHEDULE_SLOT_IDS: [13, 23, 33, 3]   # SRS slots in cuBB test
+SCHEDULE_SLOT_PERIOD: 40             # Schedule pattern period in slots
+
+# Configuration for cuphydriver-dumped `cubb_srs_buffers_<dump_idx>_SFN_<sfn>.<slot>.h5` files input
+ENABLE_CUBB_TV_INPUT: false
+CUBB_TV_INPUT_DIR: "/tmp"
+CUBB_CUMAC_SRS_SLOT_LAG: 0
+
 NUM_CELL: 1                           # number of cells jointly scheduled by cuMAC
 NUM_UE_ANT_PORT: 4                    # number of antenna ports per UE
 NUM_BS_ANT_PORT: 64                   # number of antenna ports per RU
-NUM_PRG_PER_CELL: 136                 # number of PRGs per cell
+NUM_PRG_PER_CELL: 273                 # number of PRGs per cell
 PRG_SIZE: 2                           # size of each PRG (number of PRBs per PRG)
 NUM_SUBBAND: 4                        # number of subbands
 NUM_PRG_SAMP_PER_SUBBAND: 1           # number of per-PRG SRS channel estimate samples per subband
 NUM_SRS_UE_PER_CELL: 256              # total number of SRS enabled UEs per cell
-NUM_SRS_UE_PER_SLOT: 32               # number of SRS UEs scheduled per S-slot per cell
+NUM_SRS_UE_PER_SLOT: 8                # number of SRS UEs scheduled per S-slot per cell
 MAX_NUM_UE_SCHEDULED_PER_CELL_TTI: 16 # maximum number of scheduled UEs /cell/TTI
 MAX_NUM_UE_FOR_GRP_PER_CELL: 32       # maximum number of UE groups per cell
 
@@ -72,7 +88,7 @@ srs_mem_bank_config:
   # SRS PRB configuration
   srs_start_prg: 0                # Starting PRB group index
   srs_start_valid_prg: 0          # First valid PRB group
-  srs_n_valid_prg: 136            # Number of valid PRB groups
+  srs_n_valid_prg: 273            # Number of valid PRB groups
   
   # FAPI allocation request type
   alloc_request: 0x02        # Test allocation request type (SCF_FAPI_CONFIG_REQUEST)

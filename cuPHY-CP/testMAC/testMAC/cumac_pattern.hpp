@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -126,19 +126,49 @@ public:
         return index * slots_per_frame + slot;
     }
 
+    int get_first_ue_group_slot()
+    {
+        return first_ue_group_slot;
+    }
+
 private:
     int parse_tv_pdcch(hdf5hpp::hdf5_file& file, cumac_req_t* req);
 
     int parse_tv_file(cumac_req_t* req);
 
+    /**
+     * @brief Load 4T4R test-vector datasets into req->tv_data.
+     * @param[in,out] req Request whose tv_data is populated on success.
+     * @return 0 on success, -1 on error.
+     */
+    [[nodiscard]] int load_4t4r_tv(cumac_req_t* req);
+
     int load_pfm_sorting_tv(cumac_req_t* req);
+
+    /** Load MU UE pairing TV files. Returns 0 on success, -1 if no TV file
+     *  exists for the slot/cell (caller should clear MU_UE_GRP bit in
+     *  taskBitMask). */
+    int load_mu_ue_grp_tv(cumac_req_t* req);
+
+    /** Probe the cuMAC TV directory for the schedule_slot_period H5 attribute.
+     *  Returns the period if any muUePairTV file exposes it, otherwise 0.
+     *  Called once at the start of cumac_pattern_parsing when MU_UE_GRP is
+     *  enabled in the YAML task_bitmask. */
+    int probe_schedule_slot_period();
+
+    /** Probe the cuMAC TV directory for the TV with first_slot=1.
+     *  Returns the tv_slot_id (after srs_slot_lag) of the first TV, or -1 if
+     *  no TV carries the first_slot attribute.
+     *  Requires sched_slot_num > 0 before calling. */
+    int probe_first_ue_group_slot();
 
     int load_h5_config_params(int cell_id, const char* config_params_h5_file);
     int update_expected_values(int cell_id, cumac_req_t* req);
 
     void parse_slots(yaml::node& slot_list, cumac_slot_pattern_t& slots_data);
 
-private:
+    void free_test_vector(cumac_test_vector_t* tv);
+
     int cumac_type;
     int channel_mask;
 
@@ -146,10 +176,10 @@ private:
 
     int cell_num;
     int sched_slot_num;
+    int first_ue_group_slot{-1}; // tv_slot_id of the TV marked first_slot=1; -1 if none
     int init_slot_num;
     int slots_per_frame;
     int config_static_harq_proc_id;
-    int prach_reconfig_flag;
 
     bool using_init_patterns;
 

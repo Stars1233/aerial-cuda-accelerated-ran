@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,18 +17,188 @@
 
 #include <unistd.h>
 
+#include <cuda_runtime_api.h>
+
 #include "api.h"
 #include "cumac_task.hpp"
 
 #include "hdf5hpp.hpp"
+#include "hdf5.h"
 #include "cuphy_hdf5.hpp"
 #include "nvlog.hpp"
 
 #include "cumac_cp_tv.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <string>
+#include <utility>
+#include <vector>
 
 #define TAG (NVLOG_TAG_BASE_CUMAC_CP + 2) // "CUMCP.CFG"
+
+inline constexpr int  MAX_SRS_CHEST_BUFFERS_PER_CELL = 1024;
+inline constexpr int  MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL = 256;
+// TBD: Change to max cells once we support mutiple Cells with MU-MIMO
+inline constexpr uint32_t MAX_CELLS_MU_MIMO_ENABLE = 9;
+inline constexpr uint32_t MAX_SRS_PDU_PER_SLOT = 128;
+inline constexpr uint32_t MAX_SRS_CHEST_BUFFERS = MAX_CELLS_MU_MIMO_ENABLE * MAX_SRS_CHEST_BUFFERS_PER_CELL;
+inline constexpr uint32_t num_srs_buffers_per_cell = 1024;
+
+void ue_pair_tv_release_mu_host_buffers(ue_pair_tv_t &t)
+{
+    if (t.srs_chan_est_host != nullptr)
+    {
+        cudaFreeHost(t.srs_chan_est_host);
+    }
+    t.srs_chan_est_host = nullptr;
+    t.srs_chan_est_size = 0;
+
+    if (t.srs_snr_host != nullptr)
+    {
+        cudaFreeHost(t.srs_snr_host);
+    }
+    t.srs_snr_host = nullptr;
+    t.srs_snr_size = 0;
+
+    if (t.chan_orth_host != nullptr)
+    {
+        cudaFreeHost(t.chan_orth_host);
+    }
+    t.chan_orth_host = nullptr;
+    t.chan_orth_size = 0;
+
+    if (t.cubb_srs_buf_host != nullptr)
+    {
+        cudaFreeHost(t.cubb_srs_buf_host);
+    }
+    t.cubb_srs_buf_host = nullptr;
+    t.cubb_srs_buf_size = 0;
+
+    if (t.task_in_buf_group_host != nullptr)
+    {
+        cudaFreeHost(t.task_in_buf_group_host);
+    }
+    t.task_in_buf_group_host = nullptr;
+    t.task_in_buf_group_size = 0;
+}
+
+ue_pair_tv::~ue_pair_tv()
+{
+    ue_pair_tv_release_mu_host_buffers(*this);
+}
+
+ue_pair_tv::ue_pair_tv(ue_pair_tv &&o) noexcept
+    : mu_ue_pair_tv_loaded(o.mu_ue_pair_tv_loaded),
+      num_prg(o.num_prg),
+      num_subband(o.num_subband),
+      num_prg_samp_per_subband(o.num_prg_samp_per_subband),
+      num_bs_ant(o.num_bs_ant),
+      num_ue_ant(o.num_ue_ant),
+      num_srs_ue_per_slot_cell(o.num_srs_ue_per_slot_cell),
+      num_blocks_per_row_chanOrtMat(o.num_blocks_per_row_chanOrtMat),
+      kernel_launch_flags(o.kernel_launch_flags),
+      is_mem_sharing(o.is_mem_sharing),
+      muUeGrpSol(std::move(o.muUeGrpSol)),
+      srs_chan_est_host(o.srs_chan_est_host),
+      srs_chan_est_size(o.srs_chan_est_size),
+      srs_snr_host(o.srs_snr_host),
+      srs_snr_size(o.srs_snr_size),
+      chan_orth_host(o.chan_orth_host),
+      chan_orth_size(o.chan_orth_size),
+      cubb_srs_buf_host(o.cubb_srs_buf_host),
+      cubb_srs_buf_size(o.cubb_srs_buf_size),
+      task_in_buf_group_host(o.task_in_buf_group_host),
+      task_in_buf_group_size(o.task_in_buf_group_size)
+{
+    o.mu_ue_pair_tv_loaded = false;
+    o.num_ue_ant = 0;
+    o.srs_chan_est_host = nullptr;
+    o.srs_chan_est_size = 0;
+    o.srs_snr_host = nullptr;
+    o.srs_snr_size = 0;
+    o.chan_orth_host = nullptr;
+    o.chan_orth_size = 0;
+    o.cubb_srs_buf_host = nullptr;
+    o.cubb_srs_buf_size = 0;
+    o.task_in_buf_group_host = nullptr;
+    o.task_in_buf_group_size = 0;
+}
+
+ue_pair_tv &ue_pair_tv::operator=(ue_pair_tv &&o) noexcept
+{
+    if (this == &o)
+    {
+        return *this;
+    }
+    ue_pair_tv_release_mu_host_buffers(*this);
+    mu_ue_pair_tv_loaded = o.mu_ue_pair_tv_loaded;
+    num_prg = o.num_prg;
+    num_subband = o.num_subband;
+    num_prg_samp_per_subband = o.num_prg_samp_per_subband;
+    num_bs_ant = o.num_bs_ant;
+    num_ue_ant = o.num_ue_ant;
+    num_srs_ue_per_slot_cell = o.num_srs_ue_per_slot_cell;
+    num_blocks_per_row_chanOrtMat = o.num_blocks_per_row_chanOrtMat;
+    kernel_launch_flags = o.kernel_launch_flags;
+    is_mem_sharing = o.is_mem_sharing;
+    muUeGrpSol = std::move(o.muUeGrpSol);
+    srs_chan_est_host = o.srs_chan_est_host;
+    srs_chan_est_size = o.srs_chan_est_size;
+    srs_snr_host = o.srs_snr_host;
+    srs_snr_size = o.srs_snr_size;
+    chan_orth_host = o.chan_orth_host;
+    chan_orth_size = o.chan_orth_size;
+    cubb_srs_buf_host = o.cubb_srs_buf_host;
+    cubb_srs_buf_size = o.cubb_srs_buf_size;
+    task_in_buf_group_host = o.task_in_buf_group_host;
+    task_in_buf_group_size = o.task_in_buf_group_size;
+
+    o.mu_ue_pair_tv_loaded = false;
+    o.num_ue_ant = 0;
+    o.srs_chan_est_host = nullptr;
+    o.srs_chan_est_size = 0;
+    o.srs_snr_host = nullptr;
+    o.srs_snr_size = 0;
+    o.chan_orth_host = nullptr;
+    o.chan_orth_size = 0;
+    o.cubb_srs_buf_host = nullptr;
+    o.cubb_srs_buf_size = 0;
+    o.task_in_buf_group_host = nullptr;
+    o.task_in_buf_group_size = 0;
+    return *this;
+}
+
+namespace {
+
+static void load_mu_ue_pair_fail(ue_pair_tv_t &u)
+{
+    u.mu_ue_pair_tv_loaded = false;
+    u.muUeGrpSol.clear();
+    ue_pair_tv_release_mu_host_buffers(u);
+}
+
+static int mu_pin_alloc(void **p, size_t *out_bytes, size_t nbytes)
+{
+    *p = nullptr;
+    *out_bytes = 0;
+    if (nbytes == 0)
+    {
+        return 0;
+    }
+    if (cudaMallocHost(p, nbytes) != cudaSuccess)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "cudaMallocHost failed ({} bytes)", nbytes);
+        return -1;
+    }
+    *out_bytes = nbytes;
+    return 0;
+}
+
+} // namespace
 
 #define CHECK_VALUE_EQUAL_ERR(v1, v2)                                                                                              \
     do                                                                                                                             \
@@ -40,15 +210,117 @@
     } while (0);
 
 #define CONFIG_CUMAC_TV_PATH "testVectors/cumac/"
+#define CONFIG_MU_UE_PAIR_TV_FORMAT "muUePairTV_sfn%d_slot%d"
 
 using namespace std;
-using namespace std::chrono;
 
-static cumac_cp_tv_t *tv_ptr = nullptr;
-cumac_cp_tv_t *get_cumac_tv_ptr()
+namespace {
+
+template <typename T>
+static bool h5_read_attr_scalar(hid_t loc_id, const char* name, hid_t mem_type, T* out)
 {
-    return tv_ptr;
+    if (H5Aexists(loc_id, name) <= 0)
+        return false;
+    hid_t a = H5Aopen(loc_id, name, H5P_DEFAULT);
+    if (a < 0)
+        return false;
+    herr_t st = H5Aread(a, mem_type, out);
+    H5Aclose(a);
+    return st >= 0;
 }
+
+//! Matches slot_command_api::MAX_SRS_CHEST_BUFFERS used in cumac_muUeGrp_test.cu for total_num_buffers cap.
+constexpr uint32_t kMuTvMaxSrsChestBuffers = 6u * 1024u;
+
+//! Expected srs_chan_est_buf byte count (cumac_muUeGrp_test.cu srs_chan_est_buf_total_size).
+static size_t mu_tv_expected_srs_chan_est_bytes(uint16_t n_bs_ant, uint16_t n_sub, uint16_t n_prg_samp, int cell_num)
+{
+    const uint64_t v = static_cast<uint64_t>(sizeof(__half2)) * static_cast<uint64_t>(n_bs_ant)
+        * static_cast<uint64_t>(MAX_NUM_UE_ANT_PORT) * static_cast<uint64_t>(n_sub)
+        * static_cast<uint64_t>(n_prg_samp) * static_cast<uint64_t>(MAX_NUM_SRS_UE_PER_CELL)
+        * static_cast<uint64_t>(cell_num);
+    return static_cast<size_t>(v);
+}
+
+//! Expected srs_snr_buf byte count (cumac_muUeGrp_test.cu srs_snr_buf_total_size).
+static size_t mu_tv_expected_srs_snr_bytes(int cell_num)
+{
+    const uint64_t v = static_cast<uint64_t>(sizeof(float)) * static_cast<uint64_t>(MAX_NUM_SRS_UE_PER_CELL)
+        * static_cast<uint64_t>(cell_num);
+    return static_cast<size_t>(v);
+}
+
+//! Expected chan_orth_mat_buf byte count (cumac_muUeGrp_test.cu chan_orth_mat_buf_total_size).
+static size_t mu_tv_expected_chan_orth_bytes(uint16_t n_sub, uint16_t n_prg_samp, int cell_num)
+{
+    const uint64_t n_pair = static_cast<uint64_t>(MAX_NUM_SRS_UE_PER_CELL) * static_cast<uint64_t>(MAX_NUM_UE_ANT_PORT);
+    const uint64_t tri = n_pair * (n_pair + 1u) / 2u;
+    const uint64_t v = static_cast<uint64_t>(sizeof(float)) * tri * static_cast<uint64_t>(n_sub)
+        * static_cast<uint64_t>(n_prg_samp) * static_cast<uint64_t>(cell_num);
+    return static_cast<size_t>(v);
+}
+
+static bool mu_tv_check_dataset_bytes(const char *ds_name, size_t actual, size_t expected)
+{
+    if (actual == expected)
+        return true;
+    NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT,
+               "load_mu_ue_pair_group_tv: {} size mismatch: TV has {} bytes, expected {} bytes "
+               "(same formula as cuMAC/examples/muMimoUeGrpL2Integration/cumac_muUeGrp_test.cu)",
+               ds_name, actual, expected);
+    return false;
+}
+
+//! cubb_srs_gpu_buf_total_size = buffer_size * total_num_buffers with buffer_size = num_prg * num_gnb_ant * num_ue_layer * sizeof(uint32_t).
+static bool mu_tv_validate_cubb_srs_gpu_buf_size(size_t dim, uint16_t n_prg, uint8_t n_bs_ant, int32_t num_ue_ant_port_from_tv,
+                                                  bool has_num_ue_ant_tv, bool has_num_srs_buffers, int32_t num_srs_buffers)
+{
+    const uint32_t ue_layers =
+        (has_num_ue_ant_tv && num_ue_ant_port_from_tv > 0) ? static_cast<uint32_t>(num_ue_ant_port_from_tv) : MAX_NUM_UE_ANT_PORT;
+    const uint64_t buffer_size = static_cast<uint64_t>(n_prg) * static_cast<uint64_t>(n_bs_ant)
+        * static_cast<uint64_t>(ue_layers) * sizeof(uint32_t);
+    if (buffer_size == 0)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT,
+                   "load_mu_ue_pair_group_tv: cubb_srs_gpu_buf derived buffer_size is 0 (n_prg={} n_bs_ant={} ue_layers={})",
+                   n_prg, static_cast<unsigned>(n_bs_ant), ue_layers);
+        return false;
+    }
+    if (dim % buffer_size != 0)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT,
+                   "load_mu_ue_pair_group_tv: cubb_srs_gpu_buf {} bytes is not a multiple of per-buffer size {} "
+                   "(num_prg*num_bs_ant*num_ue_layer*sizeof(uint32_t), cf. cumac_muUeGrp_test.cu)",
+                   dim, buffer_size);
+        return false;
+    }
+    const uint64_t nbuf = dim / buffer_size;
+    if (nbuf > kMuTvMaxSrsChestBuffers)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT,
+                   "load_mu_ue_pair_group_tv: cubb_srs_gpu_buf implies {} SRS chest buffers, exceeds cap {}",
+                   nbuf, kMuTvMaxSrsChestBuffers);
+        return false;
+    }
+    if (has_num_srs_buffers)
+    {
+        const int64_t capped =
+            std::min(static_cast<int64_t>(num_srs_buffers), static_cast<int64_t>(kMuTvMaxSrsChestBuffers));
+        if (capped < 0 || static_cast<uint64_t>(capped) != nbuf)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT,
+                       "load_mu_ue_pair_group_tv: cubb_srs_gpu_buf implies {} buffers; expected {} = "
+                       "min(num_srs_buffers HDF5 attr={}, kMuTvMaxSrsChestBuffers={})",
+                       nbuf, capped, num_srs_buffers, kMuTvMaxSrsChestBuffers);
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+using namespace std::chrono;
 
 // Current parsing cell_id, slot_id, channel and TV file name for debug log
 static int curr_cell;
@@ -342,7 +614,7 @@ int calculate_buf_num(struct cumac::cumacSchedulerParam &param, cumac_buf_num_t 
     return 0;
 }
 
-int parse_tv_file(cumac_cp_tv_t &tv, std::string tv_file)
+int parse_4t4r_tv(cumac_cp_tv_t &tv, std::string tv_file)
 {
     char file_path[MAX_PATH_LEN];
     get_full_path_file(file_path, CONFIG_CUMAC_TV_PATH, tv_file.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
@@ -403,7 +675,6 @@ int parse_tv_file(cumac_cp_tv_t &tv, std::string tv_file)
         h5dset_try_read_array(hdf5file, "allocSol", &tv.allocSol, tv.buf_num.allocSol);                                  // Dataset {12}
 
         tv.parsed = 1;
-        tv_ptr = &tv;
 
         struct cumac::cumacSchedulerParam &p = tv.params;
         NVLOGC_FMT(TAG, "Parsed TV: cumacSchedulerParam-1: nUe={} nCell={} totNumCell={} nPrbGrp={} nBsAnt={} nUeAnt={} W={} sigmaSqrd={} maxNumUePerCell={} nMaxSchdUePerRnd={} betaCoeff={}",
@@ -712,29 +983,281 @@ bool pfm_validate_tv_h5(const std::string& tv_name, const std::vector<cumac_pfm_
     return true;
 }
 
-int parse_group_tv(cumac_cp_tv_t &tv, const int cell_num)
+int load_mu_ue_pair_group_tv(ue_pair_tv_t &ue_pair_tv, const int cell_num, const int sfn, const int slot, const bool enable_gpu_share)
 {
-    // Construct old TV filename based on cell count
+    ue_pair_tv.mu_ue_pair_tv_loaded = false;
+    ue_pair_tv_release_mu_host_buffers(ue_pair_tv);
+    ue_pair_tv.muUeGrpSol.clear();
+    ue_pair_tv.num_prg = 0;
+    ue_pair_tv.num_subband = 0;
+    ue_pair_tv.num_prg_samp_per_subband = 0;
+    ue_pair_tv.num_bs_ant = 0;
+    ue_pair_tv.num_ue_ant = 0;
+    ue_pair_tv.num_srs_ue_per_slot_cell = 0;
+    ue_pair_tv.num_blocks_per_row_chanOrtMat = 0;
+    ue_pair_tv.kernel_launch_flags = 0;
+    ue_pair_tv.is_mem_sharing = enable_gpu_share;
+
+    char tv_base[128];
+    snprintf(tv_base, sizeof(tv_base), CONFIG_MU_UE_PAIR_TV_FORMAT, sfn, slot);
+
+    char path0[MAX_PATH_LEN];
+    char fname0[256];
+    snprintf(fname0, sizeof(fname0), "%s_cell0.h5", tv_base);
+    get_full_path_file(path0, CONFIG_CUMAC_TV_PATH, fname0, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    if (access(path0, F_OK) != 0) {
+        NVLOGW_FMT(TAG, "MU UE pair TV not found ({}), skipping CP GPU TV staging", fname0);
+        return -1;
+    }
+
+    try {
+        bool cubb_loaded = false;
+        size_t expected_sz = 0;
+        int32_t tv_num_ue_ant_port = 0;
+        bool tv_has_num_ue_ant = false;
+        int32_t tv_num_srs_buffers = 0;
+        bool tv_has_num_srs_buffers = false;
+        for (int c = 0; c < cell_num; c++) {
+            char fname[256];
+            snprintf(fname, sizeof(fname), "%s_cell%d.h5", tv_base, c);
+            char fpath[MAX_PATH_LEN];
+            get_full_path_file(fpath, CONFIG_CUMAC_TV_PATH, fname, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+
+            hdf5hpp::hdf5_file file = hdf5hpp::hdf5_file::open(fpath);
+            hid_t fid = file.id();
+
+            if (c == 0) {
+                uint8_t tv_is_mem_sharing = 0;
+                h5_read_attr_scalar(fid, "is_mem_sharing", H5T_NATIVE_UINT8, &tv_is_mem_sharing);
+                if (static_cast<bool>(tv_is_mem_sharing) != ue_pair_tv.is_mem_sharing)
+                {
+                    NVLOGW_FMT(TAG,
+                               "load_mu_ue_pair_group_tv: HDF5 is_mem_sharing={} differs from enable_gpu_share={} (using "
+                               "config for layout)",
+                               tv_is_mem_sharing, enable_gpu_share ? 1 : 0);
+                }
+
+                uint16_t srs_ue = 0;
+                h5_read_attr_scalar(fid, "num_srs_ue_per_slot_cell", H5T_NATIVE_UINT16, &srs_ue);
+                ue_pair_tv.num_srs_ue_per_slot_cell = srs_ue;
+
+                uint8_t flags = 0;
+                h5_read_attr_scalar(fid, "kernel_launch_flags", H5T_NATIVE_UINT8, &flags);
+                ue_pair_tv.kernel_launch_flags = flags;
+
+                int32_t blocks_per_row = 0;
+                h5_read_attr_scalar(fid, "num_blocks_per_row_chanOrtMat", H5T_NATIVE_INT32, &blocks_per_row);
+                ue_pair_tv.num_blocks_per_row_chanOrtMat = static_cast<uint16_t>(blocks_per_row);
+
+                tv_has_num_ue_ant = h5_read_attr_scalar(fid, "num_ue_ant_port", H5T_NATIVE_INT32, &tv_num_ue_ant_port);
+                tv_has_num_srs_buffers = h5_read_attr_scalar(fid, "num_srs_buffers", H5T_NATIVE_INT32, &tv_num_srs_buffers);
+
+                expected_sz = cumac_muUeGrp_req_info_size(ue_pair_tv.is_mem_sharing);
+                if (mu_pin_alloc(reinterpret_cast<void **>(&ue_pair_tv.task_in_buf_group_host),
+                                 &ue_pair_tv.task_in_buf_group_size, expected_sz * static_cast<size_t>(cell_num)) != 0)
+                {
+                    load_mu_ue_pair_fail(ue_pair_tv);
+                    return -1;
+                }
+            }
+
+            hdf5hpp::hdf5_dataset ds_t = file.open_dataset("task_in_buf");
+            const size_t tbytes = ds_t.get_buffer_size_bytes();
+            if (tbytes != expected_sz)
+            {
+                NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT,
+                    "load_mu_ue_pair_group_tv: cell {} task_in_buf bytes {} != expected_size {}", c, tbytes, expected_sz);
+                load_mu_ue_pair_fail(ue_pair_tv);
+                return -1;
+            }
+
+            uint8_t *const task_dst = ue_pair_tv.task_in_buf_group_host + expected_sz * static_cast<size_t>(c);
+            ds_t.read(task_dst);
+
+            // Serialized layout uses inline payload; pointers are not valid across processes (see testMAC cumac_pattern).
+            cumac_muUeGrp_req_info_t *req_info = reinterpret_cast<cumac_muUeGrp_req_info_t *>(task_dst);
+            req_info->srsInfo = nullptr;
+            req_info->srsInfoMsh = nullptr;
+            req_info->ueInfo = nullptr;
+
+            // Shared buffers (srs_chan_est, srs_snr, chan_orth_mat) are only in cell 0 file
+            // These are shared across all cells, so only load them once
+            if (c == 0) {
+                ue_pair_tv.num_prg = req_info->nPrbGrp;
+                ue_pair_tv.num_subband = req_info->numSubband;
+                ue_pair_tv.num_prg_samp_per_subband = req_info->numPrgSampPerSubband;
+                ue_pair_tv.num_bs_ant = req_info->nBsAnt;
+
+                // Read num_ue_ant_port from TV file
+                int32_t num_ue_ant_port = 0;
+                h5_read_attr_scalar(fid, "num_ue_ant_port", H5T_NATIVE_INT32, &num_ue_ant_port);
+                ue_pair_tv.num_ue_ant = static_cast<uint16_t>(num_ue_ant_port);
+
+                {
+                    hdf5hpp::hdf5_dataset ds = file.open_dataset("chan_orth_mat_buf");
+                    const size_t b = ds.get_buffer_size_bytes();
+                    const size_t exp_orth =
+                        mu_tv_expected_chan_orth_bytes(ue_pair_tv.num_subband, ue_pair_tv.num_prg_samp_per_subband, cell_num);
+                    if (!mu_tv_check_dataset_bytes("chan_orth_mat_buf", b, exp_orth))
+                    {
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    if (mu_pin_alloc(reinterpret_cast<void **>(&ue_pair_tv.chan_orth_host), &ue_pair_tv.chan_orth_size, b) != 0)
+                    {
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    ds.read(reinterpret_cast<uint8_t *>(ue_pair_tv.chan_orth_host));
+                }
+                {
+                    hdf5hpp::hdf5_dataset ds = file.open_dataset("srs_chan_est_buf");
+                    const size_t dim = ds.get_buffer_size_bytes();
+                    const size_t exp_ce = mu_tv_expected_srs_chan_est_bytes(
+                        ue_pair_tv.num_bs_ant, ue_pair_tv.num_subband, ue_pair_tv.num_prg_samp_per_subband, cell_num);
+                    if (!mu_tv_check_dataset_bytes("srs_chan_est_buf", dim, exp_ce))
+                    {
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    if (mu_pin_alloc(reinterpret_cast<void **>(&ue_pair_tv.srs_chan_est_host), &ue_pair_tv.srs_chan_est_size, dim) != 0)
+                    {
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    ds.read(ue_pair_tv.srs_chan_est_host);
+                }
+                {
+                    hdf5hpp::hdf5_dataset ds = file.open_dataset("srs_snr_buf");
+                    const size_t b = ds.get_buffer_size_bytes();
+                    const size_t exp_snr = mu_tv_expected_srs_snr_bytes(cell_num);
+                    if (!mu_tv_check_dataset_bytes("srs_snr_buf", b, exp_snr))
+                    {
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    if (mu_pin_alloc(reinterpret_cast<void **>(&ue_pair_tv.srs_snr_host), &ue_pair_tv.srs_snr_size, b) != 0)
+                    {
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    ds.read(reinterpret_cast<uint8_t *>(ue_pair_tv.srs_snr_host));
+                }
+
+                // cubb_srs_gpu_buf: only allocate and load if the dataset is present in this TV.
+                // When absent (TV generated without CUBB dump), cubb_srs_buf_size stays 0 and
+                // ue_pair_cubb_gpu_ keeps its cudaMemset-zero value from handler init.
+                if (!cubb_loaded && H5Lexists(fid, "cubb_srs_gpu_buf", H5P_DEFAULT) > 0)
+                {
+                    size_t total_num_buffers =
+                        std::min(static_cast<size_t>(num_srs_buffers_per_cell) * cell_num, static_cast<size_t>(MAX_SRS_CHEST_BUFFERS));
+                    size_t buffer_size =
+                        sizeof(uint32_t) * ue_pair_tv.num_prg * ue_pair_tv.num_bs_ant * ue_pair_tv.num_ue_ant;
+                    ue_pair_tv.cubb_srs_buf_size = total_num_buffers * buffer_size;
+                    NVLOGI_FMT(TAG, "TV: {} cubb_srs_gpu_buf_total_size: {} * {} = {}",
+                        fname, buffer_size, total_num_buffers, ue_pair_tv.cubb_srs_buf_size);
+                    if (ue_pair_tv.cubb_srs_buf_size == 0)
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "cubb_srs_gpu_buf_size is 0 (num_prg={} num_bs_ant={} num_ue_ant={})",
+                                   ue_pair_tv.num_prg, ue_pair_tv.num_bs_ant, ue_pair_tv.num_ue_ant);
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    if (mu_pin_alloc(reinterpret_cast<void **>(&ue_pair_tv.cubb_srs_buf_host), &ue_pair_tv.cubb_srs_buf_size,
+                                     ue_pair_tv.cubb_srs_buf_size) != 0)
+                    {
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    hdf5hpp::hdf5_dataset ds = file.open_dataset("cubb_srs_gpu_buf");
+                    const size_t dim = ds.get_buffer_size_bytes();
+                    if (dim != ue_pair_tv.cubb_srs_buf_size)
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "cubb_srs_gpu_buf size {} != expected {}", dim,
+                                   ue_pair_tv.cubb_srs_buf_size);
+                        load_mu_ue_pair_fail(ue_pair_tv);
+                        return -1;
+                    }
+                    ds.read(ue_pair_tv.cubb_srs_buf_host);
+                    cubb_loaded = true;
+                }
+
+                NVLOGC_FMT(TAG, "SFN {}.{} UE_PAIR_TV: {} size: task_in_buf={} srs_chan_est={} srs_snr={} chan_orth={} cubb_srs={}", sfn, slot, fname,
+                    expected_sz, ue_pair_tv.srs_chan_est_size, ue_pair_tv.srs_snr_size, ue_pair_tv.chan_orth_size, ue_pair_tv.cubb_srs_buf_size);
+            }
+        }
+
+        char solname[256];
+        snprintf(solname, sizeof(solname), "%s_solution.h5", tv_base);
+        char solpath[MAX_PATH_LEN];
+        get_full_path_file(solpath, CONFIG_CUMAC_TV_PATH, solname, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+        if (access(solpath, F_OK) != 0)
+        {
+            NVLOGW_FMT(TAG, "MU UE pair solution TV not found: {}", solname);
+            load_mu_ue_pair_fail(ue_pair_tv);
+            return -1;
+        }
+        hdf5hpp::hdf5_file sfile = hdf5hpp::hdf5_file::open(solpath);
+        hdf5hpp::hdf5_dataset ds_sol = sfile.open_dataset("solution");
+        const size_t sol_bytes = ds_sol.get_buffer_size_bytes();
+        const size_t need = sizeof(cumac_muUeGrp_resp_info_t) * static_cast<size_t>(cell_num);
+        if (sol_bytes < need)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "MU UE pair solution bytes {} < expected {}", sol_bytes, need);
+            load_mu_ue_pair_fail(ue_pair_tv);
+            return -1;
+        }
+        ue_pair_tv.muUeGrpSol.resize(cell_num);
+        if (ds_sol.get_buffer_size_bytes() != sizeof(cumac_muUeGrp_resp_info_t) * cell_num)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "MU UE pair solution bytes {} != expected {}", ds_sol.get_buffer_size_bytes(), sizeof(cumac_muUeGrp_resp_info_t) * cell_num);
+            load_mu_ue_pair_fail(ue_pair_tv);
+            return -1;
+        }
+        ds_sol.read(reinterpret_cast<uint8_t *>(ue_pair_tv.muUeGrpSol.data()));
+
+        ue_pair_tv.mu_ue_pair_tv_loaded = true;
+        NVLOGC_FMT(TAG, "TV: {} size: solution={}", solname, need);
+        return 0;
+    }
+    catch (const std::exception &e)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "load_mu_ue_pair_group_tv: {}", e.what());
+        load_mu_ue_pair_fail(ue_pair_tv);
+        return -1;
+    }
+}
+
+int parse_group_tv(cumac_cp_tv_t &tv, const int cell_num, const bool enable_gpu_share, const int srs_slot_lag, const uint32_t task_bitmask)
+{
     char file_path[MAX_PATH_LEN];
-    const std::string old_tv_file = "TV_cumac_F08-MC-CC-" + std::to_string(cell_num) + "PC_DL.h5";
-    get_full_path_file(file_path, CONFIG_CUMAC_TV_PATH, old_tv_file.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    bool any_tv_loaded = false;
 
-    if (access(file_path, F_OK) != 0)
+    if ((task_bitmask & CUMAC_CP_TASK_MASK_4T4R) != 0U)
     {
-        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Old TV file not found: {}", old_tv_file.c_str());
-        return -1;
+        const std::string tv_4t4r_file = std::string("TV_cumac_F08-MC-CC-") + std::to_string(cell_num) + "PC_DL.h5";
+        get_full_path_file(file_path, CONFIG_CUMAC_TV_PATH, tv_4t4r_file.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+
+        if (access(file_path, F_OK) != 0)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Old TV file not found: {}", tv_4t4r_file.c_str());
+            return -1;
+        }
+
+        NVLOGC_FMT(TAG, "Found old TV file: {} with {} cells", tv_4t4r_file.c_str(), cell_num);
+
+        if (parse_4t4r_tv(tv, tv_4t4r_file) != 0)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to parse 4T4R TV file: {}", tv_4t4r_file.c_str());
+            return -1;
+        }
+        any_tv_loaded = true;
+    }
+    else
+    {
+        NVLOGC_FMT(TAG, "parse_group_tv: task_bitmask=0x{:X} has no 4T4R tasks, skipping 4T4R TV", task_bitmask);
     }
 
-    NVLOGC_FMT(TAG, "Found old TV file: {} with {} cells", old_tv_file.c_str(), cell_num);
-
-    // Parse the old TV file
-    if (parse_tv_file(tv, old_tv_file) != 0)
-    {
-        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to parse old TV file: {}", old_tv_file.c_str());
-        return -1;
-    }
-
-    // Construct PFM TV filename based on cell count
     const std::string pfm_tv_file = "PFM_SORT_TV_" + std::to_string(cell_num) + "CELLS_SLOT_1000.h5";
     get_full_path_file(file_path, CONFIG_CUMAC_TV_PATH, pfm_tv_file.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
 
@@ -742,14 +1265,12 @@ int parse_group_tv(cumac_cp_tv_t &tv, const int cell_num)
     {
         NVLOGC_FMT(TAG, "Found PFM TV file: {}", pfm_tv_file.c_str());
 
-        // Initialize PFM vectors
         tv.pfmCellInfo.resize(cell_num);
         std::memset(tv.pfmCellInfo.data(), 0, sizeof(cumac_pfm_cell_info_t) * cell_num);
 
         tv.pfmSortSol.resize(cell_num);
         std::memset(tv.pfmSortSol.data(), 0, sizeof(cumac_pfm_output_cell_info_t) * cell_num);
 
-        // Load PFM TV data
         if (!pfm_load_tv_H5(pfm_tv_file, tv.pfmCellInfo, tv.pfmSortSol))
         {
             NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to load PFM TV file: {}", pfm_tv_file.c_str());
@@ -757,12 +1278,110 @@ int parse_group_tv(cumac_cp_tv_t &tv, const int cell_num)
         }
 
         NVLOGC_FMT(TAG, "Successfully loaded PFM TV file: {}", pfm_tv_file.c_str());
+        any_tv_loaded = true;
     }
     else
     {
         NVLOGW_FMT(TAG, "PFM TV file not found: {}, skipping PFM TV loading", pfm_tv_file.c_str());
     }
 
-    NVLOGC_FMT(TAG, "Successfully parsed group TV files for {} cells", cell_num);
+    // Discover MU UE pair TVs by scanning the TV directory. Each TV file is
+    // named muUePairTV_sfn<S>_slot<N>_cell0.h5; (SFN,slot) pairs collected
+    // here drive both the schedule_slot_period probe (read from the first
+    // matching file's H5 attribute) and per-slot loading.
+    namespace fs = std::filesystem;
+    const std::string tv_prefix = "muUePairTV_sfn";
+    const std::string cell0_sfx = "_cell0.h5";
+    std::vector<std::pair<int,int>> sfn_slots;
+    {
+        char probe_path[MAX_PATH_LEN];
+        get_full_path_file(probe_path, CONFIG_CUMAC_TV_PATH, "probe", CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+        const fs::path tv_dir = fs::path(probe_path).parent_path();
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(tv_dir, ec))
+        {
+            if (!entry.is_regular_file()) continue;
+            const std::string fname = entry.path().filename().string();
+            if (fname.rfind(tv_prefix, 0) != 0) continue;
+            if (fname.size() <= cell0_sfx.size()) continue;
+            if (fname.compare(fname.size() - cell0_sfx.size(), cell0_sfx.size(), cell0_sfx) != 0) continue;
+            int fsfn = 0, fslot = 0;
+            if (sscanf(fname.c_str() + tv_prefix.size(), "%d_slot%d_cell0", &fsfn, &fslot) != 2) continue;
+            sfn_slots.push_back({fsfn, fslot});
+        }
+        if (ec)
+        {
+            NVLOGW_FMT(TAG, "parse_group_tv: TV directory scan error ({}): {}", tv_dir.string(), ec.message());
+        }
+        std::sort(sfn_slots.begin(), sfn_slots.end());
+    }
+
+    // Read schedule_slot_period from the first TV file (default to the legacy
+    // size when the attribute is missing).
+    size_t schedule_slot_period = SLOT_NUM_PER_FRAME;
+    if (!sfn_slots.empty())
+    {
+        char fname[256];
+        snprintf(fname, sizeof(fname), "muUePairTV_sfn%d_slot%d_cell0.h5",
+                 sfn_slots.front().first, sfn_slots.front().second);
+        char fpath[MAX_PATH_LEN];
+        get_full_path_file(fpath, CONFIG_CUMAC_TV_PATH, fname, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+        try
+        {
+            hdf5hpp::hdf5_file probe = hdf5hpp::hdf5_file::open(fpath);
+            int32_t period_attr = 0;
+            if (h5_read_attr_scalar(probe.id(), "schedule_slot_period", H5T_NATIVE_INT32, &period_attr) && period_attr > 0)
+            {
+                schedule_slot_period = static_cast<size_t>(period_attr);
+            }
+        }
+        catch (const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "parse_group_tv: probe of '{}' failed: {}; using default period {}",
+                       fname, e.what(), schedule_slot_period);
+        }
+    }
+
+    NVLOGC_FMT(TAG, "UE_PAIR_TV schedule_slot_period={} scheduled_slots={} srs_slot_lag={}", schedule_slot_period, sfn_slots.size(), srs_slot_lag);
+
+    tv.ue_pair.resize(schedule_slot_period);
+    int num_slot_loaded = 0;
+    for (const auto& [fsfn, fslot] : sfn_slots)
+    {
+        const size_t idx = (fsfn * SLOT_NUM_PER_FRAME + fslot + srs_slot_lag) % schedule_slot_period;
+        if (tv.ue_pair[idx].mu_ue_pair_tv_loaded)
+        {
+            NVLOGW_FMT(TAG, "SFN {}.{} UE_PAIR_TV idx={} already loaded; ignoring duplicate slot", fsfn, fslot, idx);
+            continue;
+        }
+        if (load_mu_ue_pair_group_tv(tv.ue_pair[idx], cell_num, fsfn, fslot, enable_gpu_share) == 0)
+        {
+            num_slot_loaded++;
+            any_tv_loaded = true;
+        }
+    }
+
+    // Surface every unfilled slot index at INFO level so partial-period
+    // schedules are visible without flooding the log.
+    for (size_t s = 0; s < schedule_slot_period; ++s)
+    {
+        if (!tv.ue_pair[s].mu_ue_pair_tv_loaded)
+        {
+            NVLOGI_FMT(TAG, "UE_PAIR_TV missing for slot idx={} (period={})", s, schedule_slot_period);
+        }
+    }
+
+    if (num_slot_loaded > 0)
+    {
+        NVLOGC_FMT(TAG, "UE_PAIR_TV loaded for {} / {} scheduled slots ({} cells)",
+                   num_slot_loaded, schedule_slot_period, cell_num);
+    }
+    else
+    {
+        NVLOGW_FMT(TAG, "UE_PAIR_TV not loaded for any slot (optional)");
+    }
+
+    tv.parsed = any_tv_loaded ? 1U : 0U;
+    NVLOGC_FMT(TAG, "Parsed group TV files for {} cells", cell_num);
     return 0;
 }

@@ -168,77 +168,6 @@ typedef struct UplaneSymbolInfoHost {
     uint32_t wqebbs_per_cell[14];           //!< WQEBBs per cell per symbol
 } UplaneSlotInfoHost_t;
 
-#define TMP_MAX_MESSAGES_PER_SYMBOL 240  //!< Maximum messages per symbol (temporary, needs optimization)
-
-/**
- * Partial section info per symbol
- *
- * Summary information for a symbol's sections, used for partial slot info.
- */
-typedef struct PartialSectionInfoPerSymbol {
-    uint32_t wci;                     //!< WQE control information
-    uint16_t num_messages;            //!< Number of messages in symbol
-    uint64_t ptp_ts;                  //!< PTP timestamp
-    uint64_t ts;                      //!< System timestamp
-    uint16_t num_packets;             //!< Number of packets
-    uint16_t cumulative_packets;      //!< Cumulative packet count
-} PartialSectionInfoPerSymbol_t;
-
-/**
- * Modulation compression parameters per message per symbol
- */
-typedef struct ModCompPartialSectionInfoPerMessagePerSymbol {
-    uint8_t prb_size_upl[TMP_MAX_MESSAGES_PER_SYMBOL];      //!< PRB size per message
-    uint8_t mod_comp_enabled[TMP_MAX_MESSAGES_PER_SYMBOL];  //!< Modulation compression enabled flag per message
-} ModCompPartialSectionInfoPerMessagePerSymbol_t;
-
-/**
- * Partial section info per message per symbol
- *
- * Detailed section information for each message within a symbol.
- */
-typedef struct PartialSectionInfoPerMessagePerSymbol {
-    uint16_t num_prbu[TMP_MAX_MESSAGES_PER_SYMBOL];         //!< Number of PRBs per message
-    uint16_t start_prbu[TMP_MAX_MESSAGES_PER_SYMBOL];       //!< Starting PRB per message
-    uint16_t rb[TMP_MAX_MESSAGES_PER_SYMBOL];               //!< Resource block indicator per message
-    uint16_t section_id[TMP_MAX_MESSAGES_PER_SYMBOL];       //!< Section ID per message
-    uint16_t num_packets[TMP_MAX_MESSAGES_PER_SYMBOL];      //!< Packet count per message
-    uint16_t num_bytes[TMP_MAX_MESSAGES_PER_SYMBOL];        //!< Byte count per message
-    uint16_t flow_index_info[TMP_MAX_MESSAGES_PER_SYMBOL];  //!< Flow index (eAxC ID) per message
-    ModCompPartialSectionInfoPerMessagePerSymbol_t *mod_comp_params; //!< Modulation compression params (nullptr if disabled)
-} PartialSectionInfoPerMessagePerSymbol_t;
-
-/**
- * Partial flow info per slot
- *
- * Tracks flow-level packet counts per slot and symbol.
- */
-typedef struct PartialFlowInfoPerSlot{
-    cuda::std::array<int,kMaxFlows> flow_eaxcid;                                 //!< eAxC ID per flow
-    cuda::std::array<int,kMaxFlows> flow_packet_count;                            //!< Total packet count per flow
-    cuda::std::array<cuda::std::array<int, 14>, kMaxFlows> sym_flow_packet_count; //!< Per-symbol packet count per flow
-    cuda::std::array<cuda::std::array<int, 14>, kMaxFlows> cumulative_sym_flow_packet_count; //!< Cumulative per-symbol count per flow
-    uint32_t num_flows;                                                           //!< Number of flows
-}PartialFlowInfoPerSlot_t;
-
-/**
- * Partial U-plane slot information
- *
- * Lightweight slot info optimized for GPU access.
- * Contains timing, section, and flow information without full symbol details.
- */
-typedef struct PartialUplaneSlotInfo {
-    uint32_t frame_8b_subframe_4b_slot_6b;                       //!< Packed frame/subframe/slot ID
-    uint32_t qp_clock_id;                                        //!< QP clock ID (common for all symbols)
-    uint32_t ttl_pkts;                                           //!< Total packets in slot
-    uint32_t total_num_flows;                                    //!< Total number of flows
-    uint16_t syms_with_packets;                                  //!< Symbols containing packets
-    uint16_t last_sym_with_packets;                              //!< Last symbol with packets
-    PartialSectionInfoPerSymbol_t section_info[kPeerSymbolsInfo]; //!< Per-symbol section info
-    PartialSectionInfoPerMessagePerSymbol_t message_info[kPeerSymbolsInfo]; //!< Per-symbol message info
-    PartialFlowInfoPerSlot_t flowInfo_slot;                      //!< Flow info for slot
-} PartialUplaneSlotInfo_t;
-
 /**
  * Full U-plane slot information
  *
@@ -275,9 +204,20 @@ struct TxRequestUplaneGpuComm
     uint32_t* flow_sym_d_info;
     uint32_t* block_count;
     FlowPtrInfo* flow_hdr_size_info;
+    // GPU device-side buffer holding the same (static) flow header info as
+    // flow_hdr_size_info above; written at flow setup and read by the GPU-comms
+    // kernels. The host-pinned pointer above is retained for CPU-side consumers
+    // (e.g. compute_cell_base_pkts()).
+    FlowPtrInfo* d_flow_hdr_size_info;
     uint32_t* flow_d_ecpri_seq_id;
     uint32_t* flow_d_hdr_template_info;
     uint16_t  max_num_prb_per_symbol;
+    // Stable per-cell key for GpuComm ring state (pkt_counts_flow[],
+    // pkt_start_debug[]); decoupled from the request-array position which
+    // shifts across slots in multi-cell scenarios. Stamped by the producer via
+    // aerial_fh::set_gpu_request_cell_idx(); UINT8_MAX default makes unstamped
+    // requests fail GpuComm validation instead of aliasing cell 0.
+    uint8_t   m_cell_idx{UINT8_MAX};
 };
 
 typedef struct docaGpuParams

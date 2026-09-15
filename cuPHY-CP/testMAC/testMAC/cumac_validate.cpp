@@ -294,7 +294,7 @@ void cumac_validate::log_value(int level, const char* name1, const char* name2, 
     }
 }
 
-void cumac_validate::log_bytes(int level, const char* name1, const char* name2, void* buf1, void* buf2, vald_result_t result)
+void cumac_validate::log_bytes(int level, const char* name1, const char* name2, void* buf1, void* buf2, vald_result_t result, size_t nbytes)
 {
     if(offset < VALD_LOG_BUF_SIZE)
     {
@@ -317,7 +317,24 @@ void cumac_validate::log_bytes(int level, const char* name1, const char* name2, 
             }
             else
             {
-                offset += snprintf(errbuf + offset, VALD_LOG_BUF_SIZE - offset, "bytes differ: %s[0]=0x%02X %s[0]=0x%02X]", name1, *(uint8_t*)buf1, name2, *(uint8_t*)buf2);
+                if (nbytes == 0)
+                {
+                    offset += snprintf(errbuf + offset, VALD_LOG_BUF_SIZE - offset, "nbytes=0 for %s and %s", name1, name2);
+                    return;
+                }
+
+                // Find first mismatch byte
+                size_t mismatch_offset = 0;
+                uint8_t* b1 = (uint8_t*)buf1;
+                uint8_t* b2 = (uint8_t*)buf2;
+                for (mismatch_offset = 0; mismatch_offset < nbytes - 1 && mismatch_offset < 100; mismatch_offset++) {  // Limit search to first 100 bytes
+                    if (b1[mismatch_offset] != b2[mismatch_offset]) {
+                        break;
+                    }
+                }
+
+                offset += snprintf(errbuf + offset, VALD_LOG_BUF_SIZE - offset, "bytes differ %s[%zu]=0x%02X %s[%zu]=0x%02X]",
+                                   name1, mismatch_offset, b1[mismatch_offset], name2, mismatch_offset, b2[mismatch_offset]);
             }
         }
     }

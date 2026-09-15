@@ -62,9 +62,8 @@ Example (Statistical Channel):
 """
 # pylint: disable=no-name-in-module
 
-# Statistical channel configs (re-exported from C++ bindings)
-# These are documented in pybind11
-from aerial.pycuphy import (
+# Channel-model bindings are owned by the standalone gpu3gppchan component.
+from gpu3gppchan import (
     Scenario,
     SensingTargetType,
     UeType,
@@ -78,13 +77,18 @@ from aerial.pycuphy import (
     SystemLevelConfig,
     LinkLevelConfig,
     ExternalConfig,
+    StatisChanModel,
+    LinkParams,
+    ClusterParams,
+    CarrierParams,
+    OfdmModulate,
+    OfdmDeModulate,
 )
 
-from .fading_channel import FadingChannel
-from .statistical_channel import (
-    StatisticalChannel,
-)
-from .channel_config import (
+from gpu3gppchan.fading_channel import FadingChannel
+from gpu3gppchan.statistical_channel import StatisticalChannel
+from gpu3gppchan.channel_config import (
+    Array,
     # Fading channel configs (Python classes)
     FadingChannelConfig,
     TdlChannelConfig,
@@ -101,6 +105,9 @@ __all__ = [
     "CdlChannelConfig",
     # Statistical channel
     "StatisticalChannel",
+    "StatisChanModel",
+    "LinkParams",
+    "ClusterParams",
     "Scenario",
     "SensingTargetType",
     "UeType",
@@ -114,6 +121,11 @@ __all__ = [
     "SystemLevelConfig",
     "LinkLevelConfig",
     "ExternalConfig",
+    "Array",
+    # Low-level OFDM compatibility
+    "CarrierParams",
+    "OfdmModulate",
+    "OfdmDeModulate",
     # Helper functions
     "create_antenna_pattern",
 ]

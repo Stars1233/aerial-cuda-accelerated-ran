@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -452,7 +452,7 @@ int layer_mapped_post_processing(const std::vector<uint32_t>& h_output, const st
                 gpu_computed_rm_output[expected_index] = (tmp_val >> bit_id) & 0x1ULL;
                 if (gpu_computed_rm_output[expected_index] != expected_output[layer_id][cpu_expected_index]) {
                     if (gpu_mismatch == 0) {
-                        NVLOGE_FMT(NVLOG_BFW, AERIAL_CUPHY_EVENT, "First mismatch @ {}, CPU expected index {} Layer id {} TB_id {} CB_id {}, Er_bit {}: gpu {} vs. expected {} intra layer index {}", expected_index, cpu_expected_index, layer_id, TB_id, CB_id, Er_layer_bit, (uint32_t) gpu_computed_rm_output[expected_index], (uint32_t) expected_output[layer_id][cpu_expected_index], intra_layer_index);
+                        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "First mismatch @ {}, CPU expected index {} Layer id {} TB_id {} CB_id {}, Er_bit {}: gpu {} vs. expected {} intra layer index {}", expected_index, cpu_expected_index, layer_id, TB_id, CB_id, Er_layer_bit, (uint32_t) gpu_computed_rm_output[expected_index], (uint32_t) expected_output[layer_id][cpu_expected_index], intra_layer_index);
                     }
                     gpu_mismatch += 1;
                 }
@@ -605,6 +605,7 @@ void test_rm_config(TestParams & test_params, int & gpu_mismatch) {
                                       0, /* no precoding for any of the TBs*/ 
                                       false,
                                       false,
+                                      false,
                                       h_workspace,
                                       config_workspace.get(), // d_workspace - Explicit H2D copy as part of setup
                                       kernel_params.data(), // h_params
@@ -637,39 +638,24 @@ void test_rm_config(TestParams & test_params, int & gpu_mismatch) {
         const int num_iterations = 20;
         uint32_t time_kernel = 1;
 
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
+        cuphy::event_timer cuphy_timer;
 
-        float time1 = 0.0;
-        cudaEventRecord(start);
-
+        cuphy_timer.record_begin();
         for (int iter = 0; iter < num_iterations; iter++) {
 
             // launch kernel on default stream; run for num_iterations and report the average time.
-            launch_kernel(rm_hndl.get()->m_kernelNodeParams[0], strm);
-
+            CU_CHECK_EXCEPTION(launch_kernel_ex(rm_hndl.get()->m_kernelNodeParams[0], strm, true));
         }
+        cuphy_timer.record_end();
+        cuphy_timer.synchronize();
 
-        cudaError_t cuda_error = cudaGetLastError();
-        if (cuda_error != cudaSuccess) {
-            std::cout << "CUDA Error " << cudaGetErrorString(cuda_error) << std::endl;
-        }
-
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&time1, start, stop);
-
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-
-        time1 /= num_iterations;
+        float time1 = cuphy_timer.elapsed_time_ms() / num_iterations;
 
         if (time_kernel) {
             printf("DL Rate Matching Kernel: %.2f us (avg. over %d iterations)\n", time1 * 1000, num_iterations);
         }
 
-        cudaDeviceSynchronize();
+        CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(h_rate_matching_output.data(), d_rate_matching_output.get(), output_elements * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
 	// Expectation: GPU computed data will have been copied back to h_rate_matching_output

@@ -28,9 +28,10 @@ SCRIPT_DIR=$(dirname $SCRIPT)
 
 cuBB_SDK=${cuBB_SDK:-$(realpath $SCRIPT_DIR/../..)}
 
-# Default values
-MAX_DURATION=300
-NUM_PROC=32
+# Load shared defaults
+source "$SCRIPT_DIR/post_processing_defaults.cfg"
+
+MAX_DURATION=$PERFMETRICS_MAX_DURATION
 MMIMO_FLAG=""
 PERF_METRICS=0
 LATENCY_SUMMARY=0

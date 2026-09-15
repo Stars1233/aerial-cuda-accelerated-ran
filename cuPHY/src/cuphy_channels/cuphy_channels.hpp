@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -156,6 +156,8 @@ public:
                                                    &staticParams);
         if(CUPHY_STATUS_SUCCESS != s)
         {
+            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Error! cuphyCreatePdschTx() returned {}",
+                       cuphyGetErrorString(s));
             throw cuphy::cuphy_exception(s);
         }
         tx_ptr_.reset(tx);
@@ -171,6 +173,8 @@ public:
                                             batchPrmHndl);
         if(CUPHY_STATUS_SUCCESS != s)
         {
+            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Error! cuphySetupPdschTx() returned {}",
+                       cuphyGetErrorString(s));
             throw cuphy::cuphy_exception(s);
         }
     }
@@ -182,6 +186,8 @@ public:
                                          procModeBmsk);
         if(CUPHY_STATUS_SUCCESS != s)
         {
+            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Error! cuphyRunPdschTx() returned {}",
+                       cuphyGetErrorString(s));
             throw cuphy::cuphy_exception(s);
         }
     }
@@ -229,7 +235,7 @@ public:
                                                    &staticParams);
         if(CUPHY_STATUS_SUCCESS != s)
         {
-            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Error! cuphyCreatePdcchTx()");
+            NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT, "Error! cuphyCreatePdcchTx()");
             throw cuphy::cuphy_exception(s);
         }
         tx_ptr_.reset(tx);

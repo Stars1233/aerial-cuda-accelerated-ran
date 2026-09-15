@@ -193,12 +193,16 @@ done
 all_worker_tids=("${dl_tids[@]%%:*}" "${ul_tids[@]%%:*}")
 
 if [ "$EXPORT_VARS" -eq 1 ]; then
+  # Write atomically (temp + mv) so a concurrent reader -- e.g. perf and bpftrace
+  # wrappers both launching at L1 readiness -- never sources a half-written file.
+  env_tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
   {
     echo "CUPHY_PID=$pid"
     echo "CUPHY_DL_TIDS=(${dl_tids[*]%%:*})"
     echo "CUPHY_UL_TIDS=(${ul_tids[*]%%:*})"
     echo "CUPHY_ALL_WORKER_TIDS=(${all_worker_tids[*]})"
-  } > "$ENV_FILE"
+  } > "$env_tmp"
+  mv -f "$env_tmp" "$ENV_FILE"
   echo ""
   echo "Exported to $ENV_FILE (source it to use CUPHY_PID, CUPHY_DL_TIDS, CUPHY_UL_TIDS, CUPHY_ALL_WORKER_TIDS)"
 fi

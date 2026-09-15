@@ -371,16 +371,6 @@ Updated to:
     commit='3bb9240cb15459768adb3e7d963a20e1523a6294'
 
 
-# ldpc_decoder_cubin
-
-[submodule "cuPHY/src/cuphy/error_correction/ldpc_decoder_cubin"]
-	path = cuPHY/src/cuphy/error_correction/ldpc_decoder_cubin
-	#url = ssh://git@gitlab-master.nvidia.com:12051/gputelecom/ldpc_decoder_cubin.git
-	url = ../ldpc_decoder_cubin.git
-	branch = develop
-
- 251252f7c6be6489df4ad88e387f583b3d618f58 cuPHY/src/cuphy/error_correction/ldpc_decoder_cubin (QA_VER_d1_0.0.135-10-g251252f)
-
 # modeling
 
 [submodule "cuPHY-CP/external/modeling"]

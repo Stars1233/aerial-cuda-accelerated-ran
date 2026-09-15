@@ -16,11 +16,7 @@
  */
 
 #include "pfmSort.cuh"
-
-// #define SCHEDULER_KERNEL_TIME_MEASURE_ 
-#ifdef SCHEDULER_KERNEL_TIME_MEASURE_
-constexpr uint16_t numRunSchKnlTimeMsr = 1000;
-#endif
+#include "common/schedulerTimeMeasure.h"
 
 // cuMAC namespace
 namespace cumac {
@@ -220,6 +216,10 @@ namespace cumac {
 
                 uint32_t id_in_main_buff = cell_data_task->ue_info[ue_idx].id;
 
+                if (id_in_main_buff >= CUMAC_PFM_MAX_NUM_UE_PER_CELL) {
+                    continue;
+                }
+
                 if (((cell_data_task->ue_info[ue_idx].flags & 0x01) > 0) && 
                     ((cell_data_task->ue_info[ue_idx].dl_lc_info[lc_idx].flags & 0x01) > 0) && 
                     (cell_data_task->ue_info[ue_idx].dl_lc_info[lc_idx].qos_type == qosType)) {
@@ -248,6 +248,10 @@ namespace cumac {
                 uint32_t lcg_idx = idx - ue_idx*CUMAC_PFM_MAX_NUM_LCG_PER_UE;
 
                 uint32_t id_in_main_buff = cell_data_task->ue_info[ue_idx].id;
+
+                if (id_in_main_buff >= CUMAC_PFM_MAX_NUM_UE_PER_CELL) {
+                    continue;
+                }
 
                 if (((cell_data_task->ue_info[ue_idx].flags & 0x02) > 0) && 
                     ((cell_data_task->ue_info[ue_idx].ul_lcg_info[lcg_idx].flags & 0x01) > 0) && 

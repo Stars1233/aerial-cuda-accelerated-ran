@@ -42,7 +42,10 @@
     // inverse matrix A 
     // ToFix: Current implemention has precision issue
     static void matInverse(cuComplex* A, int A_D, cuComplex* Result);
+    // inverse matrix A using Eigen
+    static void matInverseEigen(cuComplex* A, int A_D, cuComplex* Result);
 
+    
     // row-major matrix access
     // multiply matrices A and B
     static void matMultiplication_ab_rm(cuComplex* A, int A_R, int A_C, cuComplex* B, int B_C, cuComplex* Result);
@@ -57,9 +60,19 @@
     // inverse matrix A 
     // ToFix: Current implemention has precision issue
     static void matInverse_rm(cuComplex* A, int A_D, cuComplex* Result);
-
     // inverse matrix A using Eigen
-    static void matInverseEigen(cuComplex* A, int A_D, cuComplex* Result);
+    static void matInverseEigen_rm(cuComplex* A, int A_D, cuComplex* Result);
+
+    // compute a condensed row-major matrix of A(:, A_C_st:(A_C_st+A_nCondensedCols)) with contiguous element address, given a row-major sparse matrix A with full size (A_R, A_C)
+    static void matCondense_rm(cuComplex* A, int A_R, int A_C, int A_C_st, int A_nCondensedCols, cuComplex* Result);
+    // multiply matrices A and B(:, B_C_st:(B_C_st+B_nCondensedCols))
+    // bCondensedScratch must hold at least A_C * B_nCondensedCols elements (caller-owned, no heap alloc inside)
+    static void matMultiplication_acondensedb_rm(cuComplex* A, int A_R, int A_C, cuComplex* B, int B_C, int B_C_st, int B_nCondensedCols, cuComplex* bCondensedScratch, cuComplex* Result);
+    // multiply matrices A^H and B(:, B_C_st:(B_C_st+B_nCondensedCols))
+    // bCondensedScratch must hold at least A_R * B_nCondensedCols elements (caller-owned, no heap alloc inside)
+    static void matMultiplication_aHcondensedb_rm(cuComplex* A, int A_R, int A_C, cuComplex* B, int B_C, int B_C_st, int B_nCondensedCols, cuComplex* bCondensedScratch, cuComplex* Result);
+
+
  private:
 
  };

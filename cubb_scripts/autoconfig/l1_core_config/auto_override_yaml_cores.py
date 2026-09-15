@@ -36,6 +36,7 @@ config_mappings = {
     "l2adapter": {
         "l2a_timer_thread": ["timer_thread_config", "cpu_affinity"],
         "l2a_message_processing_thread": ["message_thread_config", "cpu_affinity"],
+        "l2a_nonslot_lp_thread": ["nonslot_lp_thread_config", "cpu_affinity"],
         "l2a_pcap_capture_thread": (
             ["transport", "app_config", "pcap_shm_caching_cpu_core"],
             ["transport", "app_config", "pcap_file_saving_cpu_core"],

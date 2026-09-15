@@ -34,7 +34,7 @@ using namespace cuphy;
 // Dataset holds dynamic api parameters/data
 
 // Construct dataset from h5 file
-DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, cudaStream_t cuStrm, uint64_t procMode, bool cpuCopyOn, uint32_t fp16Mode, int apiTVflag, int drmDebug)
+DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, cudaStream_t cuStrm, uint64_t procMode, bool cpuCopyOn, uint32_t fp16Mode, int apiTVflag, int drmDebug, uint8_t openRanFunctionalSplitMode)
 {
     cellDynPrmVec.resize(inputFileNameVec.size());
     dbgPrm.enableApiLogging = 0;
@@ -43,6 +43,11 @@ DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, c
     CUDA_CHECK(cudaHostAlloc((void **)&(pPostEarlyHarqWaitKernelStatus), sizeof(uint8_t), cudaHostAllocPortable | cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer((void **)&(DataOut.pPreEarlyHarqWaitKernelStatusGpu), (void *)(pPreEarlyHarqWaitKernelStatus), 0));
     CUDA_CHECK(cudaHostGetDevicePointer((void **)&(DataOut.pPostEarlyHarqWaitKernelStatusGpu), (void *)(pPostEarlyHarqWaitKernelStatus), 0));
+    
+    if((!(procMode & PUSCH_PROC_MODE_FULL_SLOT_GRAPHS)) && (openRanFunctionalSplitMode == PUSCH_7_2_E))
+    {
+        NVLOGF_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "cuPHY cannot support PUSCH 7.2e O-RAN functional split in the CUDA strem mode!");
+    }
 
     if(apiTVflag == 0) // legacy test-vector
     {
@@ -73,9 +78,19 @@ DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, c
         calcCsi2PrmsVec.resize(cellGrpDynPrm.nUes * CUPHY_MAX_N_CSI2_REPORTS_PER_UE);
         ueGrpToUeIdxs.resize(cellGrpDynPrm.nUeGrps);
         cuphyCalcCsi2SizePrm_t* pCalcCsi2SizePrms = calcCsi2PrmsVec.data();
-
+        
         tDataRxVec.resize(inputFileNameVec.size());
         tPrmDataRxVec.resize(inputFileNameVec.size());
+
+        if(openRanFunctionalSplitMode == PUSCH_7_2_E)
+        {
+            tXVec.resize(inputFileNameVec.size());
+            tPrmXVec.resize(inputFileNameVec.size());
+            
+            tReeInvVec.resize(inputFileNameVec.size());
+            tPrmReeInvVec.resize(inputFileNameVec.size());
+        }
+        
         uint32_t              globalUeGrpIdx = 0;
         uint32_t              globalUeIdx    = 0;
         std::vector<uint32_t> numUesInUeGrp;
@@ -281,9 +296,21 @@ DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, c
             cuphyDataType_t cplxTypeDataRx = fp16Mode ? CUPHY_C_16F : CUPHY_C_32F;
             tDataRxVec[i]                    = cuphy::tensor_from_dataset(fInput.open_dataset("DataRx"), cplxTypeDataRx, cuphy::tensor_flags::align_tight, cuStrm);
             cudaStreamSynchronize(cuStrm);
-
             tPrmDataRxVec[i].desc  = tDataRxVec[i].desc().handle();
             tPrmDataRxVec[i].pAddr = tDataRxVec[i].addr();
+            
+            if(openRanFunctionalSplitMode == PUSCH_7_2_E)
+            {
+                tXVec[i]                    = cuphy::tensor_from_dataset(fInput.open_dataset("X_72e_input_fp16"), CUPHY_C_16F, cuphy::tensor_flags::align_tight, cuStrm);
+                cudaStreamSynchronize(cuStrm);
+                tPrmXVec[i].desc  = tXVec[i].desc().handle();
+                tPrmXVec[i].pAddr = tXVec[i].addr();
+            
+                tReeInvVec[i]                = cuphy::tensor_from_dataset(fInput.open_dataset("Ree_inv_72e_input"), CUPHY_R_32F, cuphy::tensor_flags::align_tight, cuStrm);
+                cudaStreamSynchronize(cuStrm);
+                tPrmReeInvVec[i].desc  = tReeInvVec[i].desc().handle();
+                tPrmReeInvVec[i].pAddr = tReeInvVec[i].addr();
+            }
         } // for inputfilename
 
         //Tying everything together now - set the cellGrpDynPrm and DataIn pointers
@@ -292,7 +319,8 @@ DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, c
         cellGrpDynPrm.pUeGrpPrms = &ueGrpPrmsVec[0];
         cellGrpDynPrm.pUePrms    = &uePrmsVec[0];
         DataIn.pTDataRx          = &tPrmDataRxVec[0];
-
+        DataIn.pTX_72e           = (openRanFunctionalSplitMode == PUSCH_7_2_E) ? &tPrmXVec[0] : nullptr;
+        DataIn.pTReeInv_72e      = (openRanFunctionalSplitMode == PUSCH_7_2_E) ? &tPrmReeInvVec[0] : nullptr;
         /*----------------------------- DataOut parameters ----------------------------------------*/
         globalUeIdx      = 0;
         uint32_t nUciUes = 0;
@@ -459,6 +487,8 @@ DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, c
         DataOut.pUciCrcFlags            = bUciCrcFlags.addr();
         DataOut.pUciOnPuschOutOffsets   = bUciOnPuschOutOffsets.addr();
         DataOut.pNumCsi2Bits            = bNumCsi2Bits.addr();
+        DataOut.nPerCellTbDests         = 0;
+        memset(DataOut.pPerCellTbPayloads, 0, sizeof(DataOut.pPerCellTbPayloads));
 
         if((procMode & PUSCH_PROC_MODE_SUB_SLOT) && (totNumUes > 0) && (nUciSegs > 0))
         {
@@ -629,6 +659,8 @@ DynApiDataset::DynApiDataset(const std::vector<std::string>& inputFileNameVec, c
             DataOut.HarqDetectionStatus    = bHarqDetectionStatus.addr();
             DataOut.CsiP1DetectionStatus   = bCsiP1DetectionStatus.addr();
             DataOut.CsiP2DetectionStatus   = bCsiP2DetectionStatus.addr();
+            DataOut.nPerCellTbDests        = 0;
+            memset(DataOut.pPerCellTbPayloads, 0, sizeof(DataOut.pPerCellTbPayloads));
 
             // input parameters
             cuphyDataType_t cplxTypeDataRx = fp16Mode ? CUPHY_C_16F : CUPHY_C_32F;
@@ -667,6 +699,8 @@ DynApiDataset::DynApiDataset() :
     DataIn{},
     tPrmDataRxVec{},
     tDataRxVec{},
+    tXVec{},
+    tReeInvVec{},
     bCbCrcs{},
     bTbCrcs{},
     bTbPayloads{},
@@ -693,6 +727,18 @@ void DynApiDataset::ResetPointers()
     {
         tPrmDataRxVec[i].pAddr = tDataRxVec[i].addr();
         tPrmDataRxVec[i].desc  = tDataRxVec[i].desc().handle();
+    }
+    
+    for(uint32_t i = 0; i < tPrmXVec.size(); i++)
+    {
+        tPrmXVec[i].pAddr = tXVec[i].addr();
+        tPrmXVec[i].desc  = tXVec[i].desc().handle();
+    }
+        
+    for(uint32_t i = 0; i < tPrmReeInvVec.size(); i++)
+    {
+        tPrmReeInvVec[i].pAddr = tReeInvVec[i].addr();
+        tPrmReeInvVec[i].desc  = tReeInvVec[i].desc().handle();
     }
 
     for(int i = 0; i < cellGrpDynPrm.nUeGrps; ++i)
@@ -728,7 +774,9 @@ void DynApiDataset::ResetPointers()
     DataOut.pStartOffsetsTbCrc     = bStartOffsetsTbCrc.addr();
     DataOut.pStartOffsetsTbPayload = bStartOffsetsTbPayload.addr();
 
-    DataIn.pTDataRx   = &tPrmDataRxVec[0];
+    DataIn.pTDataRx     = &tPrmDataRxVec[0];
+    DataIn.pTX_72e      = tPrmXVec.empty()      ? nullptr : &tPrmXVec[0];
+    DataIn.pTReeInv_72e = tPrmReeInvVec.empty() ? nullptr : &tPrmReeInvVec[0];
 }
 
 void DynApiDataset::EasyAllocHarqBuffers(cudaStream_t strm)
@@ -762,6 +810,10 @@ DynApiDataset& DynApiDataset::operator=(DynApiDataset&& dynApiDataset)
 {
     tDataRxVec             = std::move(dynApiDataset.tDataRxVec);
     tPrmDataRxVec          = std::move(dynApiDataset.tPrmDataRxVec);
+    tXVec                  = std::move(dynApiDataset.tXVec);
+    tPrmXVec               = std::move(dynApiDataset.tPrmXVec);
+    tReeInvVec             = std::move(dynApiDataset.tReeInvVec);
+    tPrmReeInvVec          = std::move(dynApiDataset.tPrmReeInvVec);
     bCbCrcs                = std::move(dynApiDataset.bCbCrcs);
     bTbCrcs                = std::move(dynApiDataset.bTbCrcs);
     bTbPayloads            = std::move(dynApiDataset.bTbPayloads);
@@ -798,7 +850,11 @@ DynApiDataset::DynApiDataset(const DynApiDataset& dynApiDataset) :
     DataOut(dynApiDataset.DataOut),
     DataIn(dynApiDataset.DataIn),
     tPrmDataRxVec(dynApiDataset.tPrmDataRxVec),
+    tPrmXVec(dynApiDataset.tPrmXVec),
+    tPrmReeInvVec(dynApiDataset.tPrmReeInvVec),
     tDataRxVec(dynApiDataset.tDataRxVec),
+    tXVec(dynApiDataset.tXVec),
+    tReeInvVec(dynApiDataset.tReeInvVec),
     bCbCrcs(dynApiDataset.bCbCrcs),
     bTbCrcs(dynApiDataset.bTbCrcs),
     bTbPayloads(dynApiDataset.bTbPayloads),
@@ -919,7 +975,7 @@ void StaticApiDataset::setWorkCancelValue(uint8_t work_cancellation)
 // construct from h5 file
 StaticApiDataset::StaticApiDataset(const std::vector<std::string>& inputFileNameVec, cudaStream_t cuStrm, std::string outputFileName,
                                    int descramblingOn, int apiTVflag, bool enableLdpcThroughputMode, const maxPUSCHPrms* puschPrms,
-                                   cuphyPuschLdpcKernelLaunch_t ldpcLaunchMode)
+                                   cuphyPuschLdpcKernelLaunch_t ldpcLaunchMode, uint8_t openRanFunctionalSplitMode, uint8_t kernelSelMode, uint8_t uciKernelSelMode, uint32_t delayUs, uint32_t subSlotDelayUs)
 {
     puschInitCellStatPrm(inputFileNameVec, apiTVflag, cuStrm, puschPrms);
     // load h5 file
@@ -953,13 +1009,84 @@ StaticApiDataset::StaticApiDataset(const std::vector<std::string>& inputFileName
     puschStatPrms.subSlotCompletedEvent = subSlotCompletedEvent.handle();
     puschStatPrms.waitCompletedSubSlotEvent = waitCompletedSubSlotEvent.handle();
     puschStatPrms.waitCompletedFullSlotEvent = waitCompletedFullSlotEvent.handle();
+    puschStatPrms.uciOnPuschCompletedEvent = uciOnPuschCompletedEvent.handle();
 
     puschStatPrms.enableEarlyHarq          = 1;
+    puschStatPrms.useCbLdpcDecoder          = 0;
+    puschStatPrms.earlySchCbDecodeMode     = PUSCH_EARLY_SCH_CB_DECODE_DISABLED;
     puschStatPrms.enableDeviceGraphLaunch  = 0; // since compute-sanitizer (as of version 2023.3.1.0) for synccheck causes crash in the app when enableDeviceGraphLaunch=1, keep it disabled for now
     puschStatPrms.enableDebugEqOutput      = 0; // disable post-eq debugging output by default
     puschStatPrms.enableBatchedMemcpy      = 1; //FIXME decide on an appropriate default value
     puschStatPrms.nMaxLdpcHetConfigs       = 32; // default number LDPC config nodes to some nominal value
     puschStatPrms.nMaxTbPerNode            = CUPHY_LDPC_DECODE_DESC_MAX_TB; // Use maximum number of transport blocks per node
+    
+    if(openRanFunctionalSplitMode==0)
+    {
+        puschStatPrms.openRanFunctionalSplitOption = PUSCH_7_2_A;
+        NVLOGC_FMT(NVLOG_PUSCH, "PUSCH 7.2a O-RAN functional split.");
+    }
+    else if(openRanFunctionalSplitMode==1)
+    {
+        puschStatPrms.openRanFunctionalSplitOption = PUSCH_7_2_E;
+        NVLOGC_FMT(NVLOG_PUSCH, "PUSCH 7.2e O-RAN functional split.");
+    }
+    else
+    {
+        NVLOGF_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported PUSCH O-RAN functional split mode {}.", openRanFunctionalSplitMode);
+    }
+    
+    if(kernelSelMode==0)
+    {
+        puschStatPrms.kernelSelOption = PUSCH_ALL;
+        NVLOGC_FMT(NVLOG_PUSCH, "run PUSCH pipeline.");
+    }
+    else if(kernelSelMode==1)
+    {
+        puschStatPrms.kernelSelOption = PUSCH_NO_FEC;
+        NVLOGC_FMT(NVLOG_PUSCH, "run PUSCH pipeline without FEC.");
+    }
+    else if(kernelSelMode==2)
+    {
+        puschStatPrms.kernelSelOption = PUSCH_NO_DERATE_MATCHING_FEC;
+        NVLOGC_FMT(NVLOG_PUSCH, "run PUSCH pipeline without de-rate match and FEC.");
+    }
+    else if(kernelSelMode==3)
+    {
+        puschStatPrms.kernelSelOption = PUSCH_NO_SD_DERATE_MATCHING_FEC;
+        NVLOGC_FMT(NVLOG_PUSCH, "run PUSCH pipeline without soft-demapper, de-rate match, and FEC.");
+    }
+    else
+    {
+        NVLOGF_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported PUSCH kernel selection mode {}.", kernelSelMode);
+    }
+    
+    if(uciKernelSelMode==0)
+    {
+        puschStatPrms.uciKernelSelOption = PUSCH_UCI_ALL;
+        NVLOGC_FMT(NVLOG_PUSCH, "run PUSCH pipeline with UCI-on-PUSCH.");
+    }
+    else if(uciKernelSelMode==1)
+    {
+        puschStatPrms.uciKernelSelOption = PUSCH_UCI_NO_POLAR;
+        NVLOGC_FMT(NVLOG_PUSCH, "run PUSCH pipeline with UCI-on-PUSCH but without Polar decoder.");
+    }
+    else if(uciKernelSelMode==2)
+    {
+        puschStatPrms.uciKernelSelOption = PUSCH_UCI_NO_UCI_WITH_SEG;
+        NVLOGC_FMT(NVLOG_PUSCH, "run PUSCH pipeline without UCI-on-PUSCH but LLR SEG.");
+    }
+    else if(uciKernelSelMode==3)
+    {
+        puschStatPrms.uciKernelSelOption = PUSCH_UCI_NO_UCI;
+        NVLOGC_FMT(NVLOG_PUSCH, "run PUSCH pipeline without UCI-on-PUSCH.");
+    }
+    else
+    {
+        NVLOGF_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported PUSCH UCI kernel selection mode {}.", uciKernelSelMode);
+    }
+    
+    puschStatPrms.delayUs = delayUs;
+    puschStatPrms.subSlotDelayUs = subSlotDelayUs;
 
     if(apiTVflag == 0)
     {
@@ -1615,15 +1742,22 @@ EvalDataset::EvalDataset(const std::vector<std::string>& inputFileNameVec, cudaS
 
                 if(gnbConfig.get_value_as<uint8_t>("dmrsChEstAlgIdx") == PUSCH_CH_EST_ALGO_TYPE_MULTISTAGE_MMSE_WITH_DELAY_EST)
                 {
+                    // These refs exist only for the cells using the delay-estimation
+                    // algorithm, but are looked up by UE group index. Pad the entries of
+                    // any skipped group so this group's ref lands at globalUeGrpIdx. A
+                    // padded entry stays default-constructed (null addr) and consumers
+                    // must treat it as "no reference available".
                     datasetName                    = "reference_ChEst_w_delay_est_H_LS_est_save" + std::to_string(ueGrpIdx);
                     cuphy::tensor_pinned refChEstLS = cuphy::tensor_from_dataset(fInput.open_dataset(datasetName.c_str()), cuphy::tensor_flags::align_tight, cuStrm);
+                    tRefChEstLSHest.resize(globalUeGrpIdx);
                     tRefChEstLSHest.emplace_back(refChEstLS.layout());
-                    tRefChEstLSHest[globalUeGrpIdx] = refChEstLS;
+                    tRefChEstLSHest.back() = refChEstLS;
 
                     datasetName                    = "reference_ChEst_w_delay_est_delay_mean" + std::to_string(ueGrpIdx);
                     cuphy::tensor_pinned refDelayMean = cuphy::tensor_from_dataset(fInput.open_dataset(datasetName.c_str()), cuphy::tensor_flags::align_tight, cuStrm);
+                    tRefChEstDelayMean.resize(globalUeGrpIdx);
                     tRefChEstDelayMean.emplace_back(refDelayMean.layout());
-                    tRefChEstDelayMean[globalUeGrpIdx] = refDelayMean;
+                    tRefChEstDelayMean.back() = refDelayMean;
                 }
                 
                 datasetName = "reference_H_est" + std::to_string(ueGrpIdx);
@@ -1728,8 +1862,10 @@ EvalDataset::EvalDataset(const std::vector<std::string>& inputFileNameVec, cudaS
             {
                 datasetName                           = "reference_taEstMicroSecPerUe";
                 cuphy::tensor_pinned refToEstMicroSecPerUe = cuphy::tensor_from_dataset(fInput.open_dataset(datasetName.c_str()), cuphy::tensor_flags::align_tight, cuStrm);
+                // Loaded only for the cells that enable TO estimation, so the entry
+                // just appended is not necessarily at index i.
                 tRefToEstMicroSecPerUe.emplace_back(refToEstMicroSecPerUe.layout());
-                tRefToEstMicroSecPerUe[i] = refToEstMicroSecPerUe;
+                tRefToEstMicroSecPerUe.back() = refToEstMicroSecPerUe;
             }
 
             if(m_drmDebug && (nSchUes > 0))
@@ -2592,7 +2728,7 @@ uint32_t EvalDataset::computeNumCbErrors(DynApiDataset const& dynApiDataset)
 //-------------------------------------------------------------------------------------
 // Function computes number of UCI codeblock errors
 
-void EvalDataset::computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool evalEarlyHarqFlag)
+void EvalDataset::computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool evalEarlyHarqFlag, uint8_t openRanFunctionalSplitOption)
 {
     if(evalEarlyHarqFlag && (dynApiDataset.DataOut.isEarlyHarqPresent != 1))
         return;
@@ -2654,8 +2790,8 @@ void EvalDataset::computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool
                 {
                     bool     harqPayloadCheck = true;
                     uint16_t HarqDetectionStatusOffset = pUciOnPuschOutOffsets[ueIdx].HarqDetectionStatusOffset;
-                    uint8_t  cuphyHarqDetStatus        = *(HarqDetectionStatus + HarqDetectionStatusOffset);
                     uint8_t  refHarqDetStatus          = *(pRefUciHarqDetStatus+ HarqDetectionStatusOffset - nAccumTbs);
+                    uint8_t  cuphyHarqDetStatus        = (openRanFunctionalSplitOption==PUSCH_7_2_E) ? refHarqDetStatus : *(HarqDetectionStatus + HarqDetectionStatusOffset);
                     bool     mismatchHarqDetStatus     = (cuphyHarqDetStatus != refHarqDetStatus);
                     if(uePrmsVec[ueIdx].pUciPrms->nBitsHarq <= CUPHY_N_MAX_UCI_BITS_RM)
                     {
@@ -2692,7 +2828,10 @@ void EvalDataset::computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool
                         uint32_t refHarqOffset   = ueRefBuffOffsetsVec[ueIdx].harqPayloadByteOffset;
                         uint32_t cuphyHarqOffset = pUciOnPuschOutOffsets[ueIdx].harqPayloadByteOffset;
                         int cbErrorFlag = memcmp(pRefUciPayloadBytes + refHarqOffset, pUciPayloads + cuphyHarqOffset, nHarqBytes);
-
+                        if(openRanFunctionalSplitOption==PUSCH_7_2_E)
+                        {
+                            NVLOGC_FMT(NVLOG_PUSCH, "Check HARQ Payload for O-RAN 7.2e split: cbErrorFlag {}", cbErrorFlag);
+                        }
                         if(cbErrorFlag != 0)
                         {
                             nUciCbErrors     += 1;
@@ -2720,8 +2859,8 @@ void EvalDataset::computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool
                 {
                     bool     csi1PayloadCheck           = true;
                     uint16_t CsiP1DetectionStatusOffset = pUciOnPuschOutOffsets[ueIdx].CsiP1DetectionStatusOffset;
-                    uint8_t  cuphyCsiP1DetStatus        = *(CsiP1DetectionStatus + CsiP1DetectionStatusOffset);
                     uint8_t  refCsiP1DetStatus          = *(pRefUciCsi1DetStatus + CsiP1DetectionStatusOffset - nAccumTbs);
+                    uint8_t  cuphyCsiP1DetStatus        = (openRanFunctionalSplitOption==PUSCH_7_2_E) ? refCsiP1DetStatus : *(CsiP1DetectionStatus + CsiP1DetectionStatusOffset);
                     bool     mismatchCsiP1DetStatus     = (cuphyCsiP1DetStatus!=refCsiP1DetStatus);
                     if(uePrmsVec[ueIdx].pUciPrms->nBitsCsi1 <= CUPHY_N_MAX_UCI_BITS_RM)
                     {
@@ -2758,6 +2897,10 @@ void EvalDataset::computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool
                         uint32_t refCsi1Offset   = ueRefBuffOffsetsVec[ueIdx].csi1PayloadByteOffset;
                         uint32_t cuphyCsi1Offset = pUciOnPuschOutOffsets[ueIdx].csi1PayloadByteOffset;
                         int cbErrorFlag = memcmp(pRefUciPayloadBytes + refCsi1Offset, pUciPayloads + cuphyCsi1Offset, nCsi1Bytes);
+                        if(openRanFunctionalSplitOption==PUSCH_7_2_E)
+                        {
+                            NVLOGC_FMT(NVLOG_PUSCH, "Check CSI-P1 Payload for O-RAN 7.2e split: cbErrorFlag {}", cbErrorFlag);
+                        }
                         if(cbErrorFlag != 0)
                         {
                             nUciCbErrors     += 1;
@@ -2783,8 +2926,8 @@ void EvalDataset::computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool
                     bool csi2PayloadCheck = true;
                     uint16_t CsiP2DetectionStatusOffset = pUciOnPuschOutOffsets[ueIdx].CsiP2DetectionStatusOffset;
                     uint16_t refCsiP2DtxOffset          = cuphyUciDtxTypes_t::N_UCI_DTX*(ueIdx-nAccumTbs)+cuphyUciDtxTypes_t::UCI_CSI2_DTX;
-                    uint8_t  cuphyCsiP2DetStatus        = *(CsiP2DetectionStatus + CsiP2DetectionStatusOffset);
                     uint8_t  refCsiP2DetStatus          = *(pRefUciCsi2DetStatus + CsiP2DetectionStatusOffset - nAccumTbs);
+                    uint8_t  cuphyCsiP2DetStatus        = (openRanFunctionalSplitOption==PUSCH_7_2_E) ? refCsiP2DetStatus : *(CsiP2DetectionStatus + CsiP2DetectionStatusOffset);
                     uint8_t  refCsiP2Dtx                = *(pRefUciDTXs+refCsiP2DtxOffset);
                     bool     mismatchCsi2DetStatus      = (cuphyCsiP2DetStatus != refCsiP2DetStatus);
                     if(mismatchCsi2DetStatus||((cuphyCsiP2DetStatus==CUPHY_FAPI_DTX)&&(refCsiP2Dtx==0))||((cuphyCsiP2DetStatus==CUPHY_FAPI_NO_DTX)&&(refCsiP2Dtx==1)))
@@ -2803,6 +2946,10 @@ void EvalDataset::computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool
                         uint32_t refCsi2Offset   = ueRefBuffOffsetsVec[ueIdx].csi2PayloadByteOffset;
                         uint32_t cuphyCsi2Offset = pUciOnPuschOutOffsets[ueIdx].csi2PayloadByteOffset;
                         int cbErrorFlag = memcmp(pRefUciPayloadBytes + refCsi2Offset, pUciPayloads + cuphyCsi2Offset, nCsi2Bytes);
+                        if(openRanFunctionalSplitOption==PUSCH_7_2_E)
+                        {
+                            NVLOGC_FMT(NVLOG_PUSCH, "Check CSI-P2 Payload for O-RAN 7.2e split: cbErrorFlag {}", cbErrorFlag);
+                        }
                         if(cbErrorFlag != 0)
                         {
                             nUciCbErrors     += 1;
@@ -3523,6 +3670,9 @@ pucchDynApiDataset::pucchDynApiDataset(const std::vector<std::string>& inputFile
     DataOut.CsiP1DetectionStatus = bCsiP1DetectionStatus.addr();
     bCsiP2DetectionStatus = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(MAX_N_F234_UCI));
     DataOut.CsiP2DetectionStatus = bCsiP2DetectionStatus.addr();
+    DataOut.pF2FrontEndLLRs = nullptr;
+    DataOut.pF3FrontEndLLRs = nullptr;
+    postPolarData = {};
     // if pNumCsi2Bits is used later, uncomment the following 2 lines
     //bNumCsi2Bits = std::move(cuphy::buffer<uint16_t, cuphy::pinned_alloc>(MAX_N_F234_UCI));
     //DataOut.pNumCsi2Bits = bNumCsi2Bits.addr();
@@ -3543,6 +3693,319 @@ pucchDynApiDataset::pucchDynApiDataset(const std::vector<std::string>& inputFile
 
     StatusOutput = {cuphyPucchStatusType_t::CUPHY_PUCCH_STATUS_SUCCESS_OR_UNTRACKED_ISSUE, MAX_UINT16, MAX_UINT16};
     pucchDynPrm.pStatusOut = &StatusOutput;
+}
+
+//----------------------------------------------------------------------------------------------------------
+const cuphyPucchPostPolarData_t* pucchDynApiDataset::enablePostPolarData(const char* h5path, cudaStream_t cuStrm)
+{
+    if((h5path == nullptr) || (h5path[0] == 0))
+    {
+        throw std::invalid_argument("enablePostPolarData(): h5path must be a non-empty path");
+    }
+
+    hdf5hpp::hdf5_file fInput = hdf5hpp::hdf5_file::open(h5path);
+    cuphy::cuphyHDF5_struct sizesH5 = cuphy::get_HDF5_struct(fInput, "sizes");
+    const uint16_t nPolUciSegs = sizesH5.get_value_as<uint16_t>("nPolUciSegs");
+    const uint16_t nPolCws     = sizesH5.get_value_as<uint16_t>("nPolCws");
+
+    tPostPolarCbEstVec.clear();
+    tPrmPostPolarCbEstVec.clear();
+    tPostPolarCbEstVec.reserve(nPolCws);
+
+    for(uint16_t cwIdx = 0; cwIdx < nPolCws; ++cwIdx)
+    {
+        const std::string dsetName = "cbEst" + std::to_string(cwIdx);
+        tPostPolarCbEstVec.emplace_back(cuphy::tensor_from_dataset(
+            fInput.open_dataset(dsetName.c_str()),
+            CUPHY_R_32U,
+            cuphy::tensor_flags::align_tight,
+            cuStrm));
+    }
+
+    tPrmPostPolarCbEstVec.resize(tPostPolarCbEstVec.size());
+    for(size_t cwIdx = 0; cwIdx < tPostPolarCbEstVec.size(); ++cwIdx)
+    {
+        tPrmPostPolarCbEstVec[cwIdx].desc  = tPostPolarCbEstVec[cwIdx].desc().handle();
+        tPrmPostPolarCbEstVec[cwIdx].pAddr = tPostPolarCbEstVec[cwIdx].addr();
+    }
+
+    tPostPolarCrcErrorFlags = cuphy::tensor_from_dataset(
+        fInput.open_dataset("crcErrorFlags"),
+        CUPHY_R_8U,
+        cuphy::tensor_flags::align_tight,
+        cuStrm);
+
+    postPolarData.nPolUciSegs = nPolUciSegs;
+    postPolarData.nPolCws = nPolCws;
+    postPolarData.pCbEsts = tPrmPostPolarCbEstVec.empty() ? nullptr : tPrmPostPolarCbEstVec.data();
+    postPolarData.crcErrorFlags.desc = tPostPolarCrcErrorFlags.desc().handle();
+    postPolarData.crcErrorFlags.pAddr = tPostPolarCrcErrorFlags.addr();
+
+    return &postPolarData;
+}
+
+//----------------------------------------------------------------------------------------------------------
+void pucchDynApiDataset::enableFrontEndLlrOutput(const char* h5path, cudaStream_t cuStrm)
+{
+    if((h5path == nullptr) || (h5path[0] == 0))
+    {
+        throw std::invalid_argument("enableFrontEndLlrOutput(): h5path must be a non-empty path");
+    }
+
+    hdf5hpp::hdf5_file fInput = hdf5hpp::hdf5_file::open(h5path);
+    cuphy::cuphyHDF5_struct sizesH5 = cuphy::get_HDF5_struct(fInput, "frontEndSizes");
+    const uint16_t nF2Ucis = sizesH5.get_value_as<uint16_t>("nF2Ucis");
+    const uint16_t nF3Ucis = sizesH5.get_value_as<uint16_t>("nF3Ucis");
+
+    tF2FrontEndLLRVec.clear();
+    tF3FrontEndLLRVec.clear();
+    tPrmF2FrontEndLLRVec.clear();
+    tPrmF3FrontEndLLRVec.clear();
+    tF2FrontEndLLRVec.reserve(nF2Ucis);
+    tF3FrontEndLLRVec.reserve(nF3Ucis);
+
+    auto allocateFromRef = [&](std::vector<cuphy::tensor_device>& tensors, const std::string& dsetPrefix, uint16_t nUcis) {
+        for(uint16_t uciIdx = 0; uciIdx < nUcis; ++uciIdx)
+        {
+            const std::string dsetName = dsetPrefix + std::to_string(uciIdx);
+            cuphy::tensor_pinned refTensor = cuphy::tensor_from_dataset(
+                fInput.open_dataset(dsetName.c_str()),
+                CUPHY_R_16F,
+                cuphy::tensor_flags::align_tight,
+                cuStrm);
+            tensors.emplace_back(CUPHY_R_16F, refTensor.layout(), cuphy::tensor_flags::align_tight);
+        }
+    };
+
+    allocateFromRef(tF2FrontEndLLRVec, "f2FrontEndLLRs", nF2Ucis);
+    allocateFromRef(tF3FrontEndLLRVec, "f3FrontEndLLRs", nF3Ucis);
+
+    tPrmF2FrontEndLLRVec.resize(tF2FrontEndLLRVec.size());
+    for(size_t uciIdx = 0; uciIdx < tF2FrontEndLLRVec.size(); ++uciIdx)
+    {
+        tPrmF2FrontEndLLRVec[uciIdx].desc  = tF2FrontEndLLRVec[uciIdx].desc().handle();
+        tPrmF2FrontEndLLRVec[uciIdx].pAddr = tF2FrontEndLLRVec[uciIdx].addr();
+    }
+
+    tPrmF3FrontEndLLRVec.resize(tF3FrontEndLLRVec.size());
+    for(size_t uciIdx = 0; uciIdx < tF3FrontEndLLRVec.size(); ++uciIdx)
+    {
+        tPrmF3FrontEndLLRVec[uciIdx].desc  = tF3FrontEndLLRVec[uciIdx].desc().handle();
+        tPrmF3FrontEndLLRVec[uciIdx].pAddr = tF3FrontEndLLRVec[uciIdx].addr();
+    }
+
+    DataOut.pF2FrontEndLLRs = tPrmF2FrontEndLLRVec.empty() ? nullptr : tPrmF2FrontEndLLRVec.data();
+    DataOut.pF3FrontEndLLRs = tPrmF3FrontEndLLRVec.empty() ? nullptr : tPrmF3FrontEndLLRVec.data();
+}
+
+//----------------------------------------------------------------------------------------------------------
+// Non-public PUCCH SKIP_BACKEND front-end reference check.
+cuphyStatus_t comparePucchFrontEndRefForBackendSkip(const cuphyPucchDataOut_t* pDataOut,
+                                                    const char*                h5path,
+                                                    float                      tolHalf,
+                                                    cudaStream_t               cuStream)
+{
+    if((pDataOut == nullptr) || (h5path == nullptr))
+    {
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    if(h5path[0] == 0)
+    {
+        NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                   "comparePucchFrontEndRefForBackendSkip(): h5path must be a non-empty path");
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    if(!std::isfinite(tolHalf) || (tolHalf < 0.0f))
+    {
+        NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                   "comparePucchFrontEndRefForBackendSkip(): tolHalf must be a finite non-negative value");
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+
+    return cuphy::tryCallableAndCatch([&] {
+        try
+        {
+            hdf5hpp::hdf5_file fInput = hdf5hpp::hdf5_file::open(h5path);
+
+            cuphy::cuphyHDF5_struct sizesH5 = cuphy::get_HDF5_struct(fInput, "frontEndSizes");
+            uint16_t fileNF2Ucis = sizesH5.get_value_as<uint16_t>("nF2Ucis");
+            uint16_t fileNF3Ucis = sizesH5.get_value_as<uint16_t>("nF3Ucis");
+
+            if((fileNF2Ucis > 0 && pDataOut->pF2FrontEndLLRs == nullptr) ||
+               (fileNF3Ucis > 0 && pDataOut->pF3FrontEndLLRs == nullptr))
+            {
+                NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                           "comparePucchFrontEndRefForBackendSkip: missing frontend LLR output descriptors (nF2Ucis={}, nF3Ucis={})",
+                           fileNF2Ucis, fileNF3Ucis);
+                return CUPHY_STATUS_INVALID_ARGUMENT;
+            }
+
+            uint64_t totalCompared    = 0;
+            uint16_t totalUcis        = 0;
+            uint16_t failedUcis       = 0;
+            float    worstNrmse       = 0.0f;
+            float    maxAbsDiffAll    = 0.0f;
+            double   totalDiffSq      = 0.0;
+            double   totalSignAgree   = 0.0;
+            double   totalSignCount   = 0.0;
+            constexpr float f2GpuNoiseBias = 3.0f / 1.75f;
+            constexpr float f3GpuNoiseBias = 1.1220184543019633f;
+
+            auto tensorNumElems = [](const cuphyTensorPrm_t& tensorPrm, const std::string& dsetName, uint64_t& nElems) -> cuphyStatus_t {
+                if((tensorPrm.desc == nullptr) || (tensorPrm.pAddr == nullptr))
+                {
+                    NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                               "comparePucchFrontEndRefForBackendSkip: {} output tensor is null", dsetName);
+                    return CUPHY_STATUS_INVALID_ARGUMENT;
+                }
+
+                cuphyDataType_t dataType = CUPHY_VOID;
+                int             rank     = 0;
+                int             dims[CUPHY_DIM_MAX]    = {};
+                int             strides[CUPHY_DIM_MAX] = {};
+                cuphyStatus_t status = cuphyGetTensorDescriptor(tensorPrm.desc, CUPHY_DIM_MAX, &dataType, &rank, dims, strides);
+                if(status != CUPHY_STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                if(dataType != CUPHY_R_16F)
+                {
+                    NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                               "comparePucchFrontEndRefForBackendSkip: {} output tensor type mismatch (actual={}, expected={})",
+                               dsetName, static_cast<int>(dataType), static_cast<int>(CUPHY_R_16F));
+                    return CUPHY_STATUS_INVALID_ARGUMENT;
+                }
+
+                nElems = 1;
+                for(int r = 0; r < rank; ++r)
+                {
+                    nElems *= static_cast<uint64_t>(dims[r]);
+                }
+                return CUPHY_STATUS_SUCCESS;
+            };
+
+            auto compareUci = [&](const std::string&        dsetPrefix,
+                                  size_t                    uciIdx,
+                                  const cuphyTensorPrm_t&   frontEndTensor,
+                                  float                     gpuNoiseBias) -> cuphyStatus_t {
+                std::string dsetName = dsetPrefix + std::to_string(uciIdx);
+                uint64_t frontEndLen = 0;
+                cuphyStatus_t status = tensorNumElems(frontEndTensor, dsetName, frontEndLen);
+                if(status != CUPHY_STATUS_SUCCESS)
+                {
+                    return status;
+                }
+                if(frontEndLen == 0)
+                {
+                    return CUPHY_STATUS_SUCCESS;
+                }
+
+                cuphy::tensor_pinned refTensor = cuphy::tensor_from_dataset(
+                    fInput.open_dataset(dsetName.c_str()),
+                    CUPHY_R_16F,
+                    cuphy::tensor_flags::align_tight,
+                    cuStream);
+
+                const auto& refLayout = refTensor.layout();
+                uint64_t    refLen    = 1;
+                for(int r = 0; r < refLayout.rank(); ++r)
+                {
+                    refLen *= static_cast<uint64_t>(refLayout.dimensions()[r]);
+                }
+                if(refLen != frontEndLen)
+                {
+                    NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                               "comparePucchFrontEndRefForBackendSkip: {} LLR length mismatch (actual={}, expected={})",
+                               dsetName, refLen, frontEndLen);
+                    return CUPHY_STATUS_INVALID_ARGUMENT;
+                }
+
+                cuphy::tensor_pinned frontEndCpu(CUPHY_R_16F, static_cast<int>(frontEndLen), cuphy::tensor_flags::align_tight);
+                CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(frontEndCpu.addr(),
+                                                     frontEndTensor.pAddr,
+                                                     frontEndLen * sizeof(__half),
+                                                     cudaMemcpyDeviceToHost,
+                                                     cuStream));
+                CUDA_CHECK_EXCEPTION(cudaStreamSynchronize(cuStream));
+
+                const __half* pGpu = static_cast<const __half*>(frontEndCpu.addr());
+                const __half* pRef = static_cast<const __half*>(refTensor.addr());
+                double   sumDiffSq = 0.0;
+                double   sumRefSq  = 0.0;
+                float    maxAbs    = 0.0f;
+                uint64_t signAgree = 0;
+                for(uint64_t i = 0; i < frontEndLen; ++i)
+                {
+                    float gpuVal = __half2float(pGpu[i]);
+                    float refVal = __half2float(pRef[i]) / gpuNoiseBias;
+                    float diff   = gpuVal - refVal;
+                    sumDiffSq += static_cast<double>(diff) * static_cast<double>(diff);
+                    sumRefSq  += static_cast<double>(refVal) * static_cast<double>(refVal);
+                    if(std::abs(diff) > maxAbs) maxAbs = std::abs(diff);
+                    if((gpuVal >= 0.0f) == (refVal >= 0.0f)) ++signAgree;
+                }
+                totalCompared += frontEndLen;
+                totalDiffSq += sumDiffSq;
+
+                const double rmsRef    = std::sqrt(sumRefSq / static_cast<double>(frontEndLen));
+                const double rmsDiff   = std::sqrt(sumDiffSq / static_cast<double>(frontEndLen));
+                constexpr double kEps  = 1e-12;
+                const double nrmse     = (rmsRef > kEps)
+                                           ? (rmsDiff / rmsRef)
+                                           : ((rmsDiff <= kEps) ? 0.0 : std::numeric_limits<double>::infinity());
+                const double signRatio = static_cast<double>(signAgree) / static_cast<double>(frontEndLen);
+
+                if(maxAbs > maxAbsDiffAll) maxAbsDiffAll = maxAbs;
+                if(static_cast<float>(nrmse) > worstNrmse) worstNrmse = static_cast<float>(nrmse);
+                totalSignAgree += static_cast<double>(signAgree);
+                totalSignCount += static_cast<double>(frontEndLen);
+                ++totalUcis;
+                const bool uciPass = (static_cast<float>(nrmse) <= tolHalf);
+                if(!uciPass) ++failedUcis;
+
+                NVLOGI_FMT(NVLOG_PUCCH,
+                           "{}: nElems={} refBias={:.4f} rmsRef={:.4f} rmsDiff={:.4f} NRMSE={:.4f} maxAbsDiff={:.4f} sign={:.4f} {}",
+                           dsetName, frontEndLen, gpuNoiseBias, rmsRef, rmsDiff, nrmse, maxAbs, signRatio,
+                           uciPass ? "PASS" : "FAIL");
+                return CUPHY_STATUS_SUCCESS;
+            };
+
+            cuphyStatus_t status = CUPHY_STATUS_SUCCESS;
+            for(size_t uciIdx = 0; uciIdx < fileNF2Ucis; ++uciIdx)
+            {
+                status = compareUci("f2FrontEndLLRs", uciIdx, pDataOut->pF2FrontEndLLRs[uciIdx], f2GpuNoiseBias);
+                if(status != CUPHY_STATUS_SUCCESS)
+                {
+                    return status;
+                }
+            }
+            for(size_t uciIdx = 0; uciIdx < fileNF3Ucis; ++uciIdx)
+            {
+                status = compareUci("f3FrontEndLLRs", uciIdx, pDataOut->pF3FrontEndLLRs[uciIdx], f3GpuNoiseBias);
+                if(status != CUPHY_STATUS_SUCCESS)
+                {
+                    return status;
+                }
+            }
+
+            const double overallSign = (totalSignCount > 0) ? totalSignAgree / totalSignCount : 1.0;
+            const double overallRmse = (totalCompared > 0)
+                                       ? std::sqrt(totalDiffSq / static_cast<double>(totalCompared))
+                                       : 0.0;
+            NVLOGC_FMT(NVLOG_PUCCH,
+                       "comparePucchFrontEndRefForBackendSkip: compared {} __half values across {} UCIs ({} F2 + {} F3), failedUcis={}/{} (nrmseTol={:.4f}), worstNRMSE={:.4f}, overallRMSE={:.4f}, signAgree={:.4f}, maxAbsDiff={:.4f}",
+                       totalCompared, totalUcis, fileNF2Ucis, fileNF3Ucis,
+                       failedUcis, totalUcis, tolHalf, worstNrmse, overallRmse, overallSign, maxAbsDiffAll);
+
+            return (failedUcis == 0) ? CUPHY_STATUS_SUCCESS : CUPHY_STATUS_INTERNAL_ERROR;
+        }
+        catch(const std::exception& e)
+        {
+            NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                       "comparePucchFrontEndRefForBackendSkip: failed reading {}: {}", h5path, e.what());
+            return CUPHY_STATUS_INTERNAL_ERROR;
+        }
+    });
 }
 
 //----------------------------------------------------------------------------------------------------------
@@ -3594,6 +4057,10 @@ pucchStaticApiDataset::pucchStaticApiDataset(const std::vector<std::string>& inp
     // dbgPrm.enableDynApiLogging  = 0;
     // dbgPrm.enableStatApiLogging = 0;
 
+    // Capture the first input TV path for mode-specific example/test checks.
+    // Pipeline reference data is parsed in this dataset/example layer.
+    refH5Path = inputFileNameVec.empty() ? std::string() : inputFileNameVec.front();
+
     // static pucch parameters
     pucchStatPrms.nMaxCells        = nCells;
     pucchStatPrms.nMaxCellsPerSlot = nCells;
@@ -3603,6 +4070,9 @@ pucchStaticApiDataset::pucchStaticApiDataset(const std::vector<std::string>& inp
     pucchStatPrms.polarDcdrListSz  = tempPolarDcdrListSz;
     pucchStatPrms.enableUlRxBf     = 0; //TODO
     pucchStatPrms.enableBatchedMemcpy = 1; //FIXME decide on appropriate default value. This will only be relevant for standalone cuPHY tests/examples
+    pucchStatPrms.pipelineMode        = PUCCH_PIPELINE_FULL;
+    pucchStatPrms.pipelineData.pPostPolarData = nullptr;
+    pucchStatPrms.pipelineDelayUs     = 0;
 }
 
 //----------------------------------------------------------------------------------------------------------
@@ -3631,6 +4101,14 @@ EvalPucchDataset::EvalPucchDataset(const std::vector<std::string>& inputFileName
         // load h5 file
         hdf5hpp::hdf5_file      fInput          = hdf5hpp::hdf5_file::open(inputFileNameVec[i].c_str());
         cuphy::cuphyHDF5_struct cellGrpDynPrmH5 = cuphy::get_HDF5_struct(fInput, "cellGrpDynPrm");
+        
+        // Numerology sets the PF1 TA unambiguous span (1e6/scs us, scs = 15kHz * 2^mu).
+        // Used for wrap-aware TA comparison; cells in a TV share the same mu.
+        {
+            cuphy::cuphyHDF5_struct cellStatPrmH5 = cuphy::get_HDF5_struct(fInput, "cellStatPrm");
+            uint8_t                 mu            = cellStatPrmH5.get_value_as<uint8_t>("mu");
+            taWrapSpanUs                          = 1.0e6f / (15000.0f * static_cast<float>(1u << mu));
+        }
 
         //PF0
         try
@@ -3675,12 +4153,11 @@ EvalPucchDataset::EvalPucchDataset(const std::vector<std::string>& inputFileName
             F1UcisOutRefVec.resize(nF1Ucis);
             pucchF1multiplexed.resize(nF1Ucis);
             std::unordered_map<uint32_t,uint8_t> uci_grp_counts;
-
-            // Count entries in each UCI group
+            
+            // Count PF1 UEs sharing each PRB/symbol group to flag multiplexed UCIs
             for(int uciIdx = 0; uciIdx < nF1UcisTmp; ++uciIdx)
             {
                 cuphy::cuphyHDF5_struct uciPrmsH5 = cuphy::get_HDF5_struct_index(F1UciPrms, uciIdx);
-                // Create a key for determining UCI multiplexing
                 uint32_t uci_prms    = uciPrmsH5.get_value_as<uint16_t>("BWPStart");
                 uci_prms            += uciPrmsH5.get_value_as<uint16_t>("startPrb");
                 uci_prms             = (uci_prms << 4) + uciPrmsH5.get_value_as<uint8_t>("startSym");
@@ -3702,14 +4179,12 @@ EvalPucchDataset::EvalPucchDataset(const std::vector<std::string>& inputFileName
                 F1UcisOutRefVec[uciIdx + offset].HarqValues[1]       = uciOutH5.get_value_as<uint8_t>("HarqValue1");
                 F1UcisOutRefVec[uciIdx + offset].SRconfidenceLevel   = uciOutH5.get_value_as<uint8_t>("SRconfidenceLevel");
                 F1UcisOutRefVec[uciIdx + offset].HarqconfidenceLevel = uciOutH5.get_value_as<uint8_t>("HarqconfidenceLevel");
-
+                
                 cuphy::cuphyHDF5_struct uciPrmsH5 = cuphy::get_HDF5_struct_index(F1UciPrms, uciIdx);
-                // Create a key for determining UCI multiplexing
                 uint32_t uci_prms    = uciPrmsH5.get_value_as<uint16_t>("BWPStart");
                 uci_prms            += uciPrmsH5.get_value_as<uint16_t>("startPrb");
                 uci_prms             = (uci_prms << 4) + uciPrmsH5.get_value_as<uint8_t>("startSym");
-                bool multiplexed_uci = uci_grp_counts[uci_prms] > 1;
-                pucchF1multiplexed[uciIdx + offset] = multiplexed_uci;
+                pucchF1multiplexed[uciIdx + offset] = uci_grp_counts[uci_prms] > 1;
             }
         }
         catch(const cuphy::cuphyHDF5_exception& e)
@@ -4248,19 +4723,38 @@ uint16_t EvalPucchDataset::compareF0F1UciOutput(uint16_t nUcis, cuphyPucchF0F1Uc
             errorFlag = 1;
         }
 
-        if(pucchFormatName=="pucchF1") // Only check PF1 TA estimation if not multiplexed (PF0 not currently implemented)
+        if(pucchFormatName=="pucchF1") // PF1 TA estimation check (PF0 TA not currently implemented)
         {
-            if(!pucchF1multiplexed[uciIdx])
+            float refTaEst   = uciOutRef[uciIdx].taEstMicroSec;
+            float measTaEst  = uciOutMeas[uciIdx].taEstMicroSec;
+            // TA is derived from an atan2 phase estimate whose unambiguous range wraps
+            // at +/-(taWrapSpanUs/2). Near that boundary (e.g. low-SNR / multiplexed PF1)
+            // fp precision differences between cuPHY and the reference can flip the phase
+            // across the +/-pi branch cut, so +max and -max are the same physical delay.
+            // Compare with circular (wrap-around) distance instead of a plain difference.
+            conf             = std::fabs(refTaEst - measTaEst);
+            if(taWrapSpanUs > 0.0f)
             {
-                float refTaEst   = uciOutRef[uciIdx].taEstMicroSec;
-                float measTaEst  = uciOutMeas[uciIdx].taEstMicroSec;
-                conf             = std::fabs(refTaEst - measTaEst);
-                if(((conf > 1.0) && (refSINR > -10.0)) || ((conf > 4.0) && (refSINR > -60.0)))
-                {
-                    NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "Timing Advance doesn't match for uci {}, expected={} != actual={}",
-                               uciIdx,uciOutRef[uciIdx].taEstMicroSec,uciOutMeas[uciIdx].taEstMicroSec);
-                    errorFlag = 1;
-                }
+                // Reduce into [0, span) before folding, so a difference that exceeds one
+                // full span cannot make (span - conf) negative and suppress the check.
+                conf = std::fmod(conf, taWrapSpanUs);
+                conf = std::min(conf, taWrapSpanUs - conf);
+            }
+            // Multiplexed PF1 TA is degraded by co-channel interference (multiple UEs
+            // sharing a PRB via cyclic shift + tOCC), so it is validated with a relaxed
+            // tolerance that still catches gross errors while tolerating the normal
+            // ~1-2 us multiplexing inaccuracy. Non-multiplexed UEs keep the tight check.
+            constexpr float TA_TIGHT_TOL_US = 1.0F;
+            constexpr float TA_LOOSE_TOL_US = 4.0F;
+            constexpr float SINR_TIGHT_DB   = -10.0F;
+            constexpr float SINR_LOOSE_DB   = -60.0F;
+            const bool multiplexed          = pucchF1multiplexed[uciIdx];
+            const float taTolerance         = multiplexed ? TA_LOOSE_TOL_US : TA_TIGHT_TOL_US;
+            if(((conf > taTolerance) && (refSINR > SINR_TIGHT_DB)) || ((conf > TA_LOOSE_TOL_US) && (refSINR > SINR_LOOSE_DB)))
+            {
+                NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "Timing Advance doesn't match for uci {}, expected={} != actual={}",
+                           uciIdx,uciOutRef[uciIdx].taEstMicroSec,uciOutMeas[uciIdx].taEstMicroSec);
+                errorFlag = 1;
             }
         }
 
@@ -5858,7 +6352,7 @@ void bfwEvalDataset::bfwEvalCoefs(bfwStaticApiDataset& statApiDataset, bfwDynApi
 // Dataset holds dynamic PDSCH API parameters/data
 
 // Construct dataset from HDF5 file
-pdschDynApiDataset::pdschDynApiDataset(const std::string& inputFileName, uint32_t cfg_max_cells, cudaStream_t cuStrm, cuphyPdschProcMode_t pdsch_proc_mode, cuphyPdschStatPrms_t& stat_params)
+pdschDynApiDataset::pdschDynApiDataset(const std::string& inputFileName, uint32_t cfg_max_cells, cudaStream_t cuStrm, cuphyPdschProcMode_t pdsch_proc_mode, cuphyPdschStatPrms_t& stat_params, bool cfg_pdsch_TB_input_on_GPU, int cfg_forced_TB_byte_alignment, int cfg_cell_grp_Emax)
 {
     // Output buffer allocation will happen based on the number of max cells.
     max_cells = cfg_max_cells;
@@ -5869,8 +6363,13 @@ pdschDynApiDataset::pdschDynApiDataset(const std::string& inputFileName, uint32_
     cell_grp_dyn_params.nCws               = 0;
     cell_grp_dyn_params.nCsiRsPrms         = 0;
     cell_grp_dyn_params.nPrecodingMatrices = 0;
+    pdsch_TB_input_on_GPU                  = cfg_pdsch_TB_input_on_GPU;
+    forced_TB_byte_alignment               = cfg_forced_TB_byte_alignment;
 
     max_UEs_per_cell_group = (stat_params.nMaxUesPerCellGroup == 0) ? PDSCH_MAX_UES_PER_CELL_GROUP : stat_params.nMaxUesPerCellGroup;
+    max_CBs_per_TB = (stat_params.nMaxCBsPerTB == 0) ? MAX_N_CBS_PER_TB_SUPPORTED : stat_params.nMaxCBsPerTB;
+    read_TB_CRC   = stat_params.read_TB_CRC;
+    pipeline_processing_mode = stat_params.pipeline_processing_mode;
 
     // Reserve space up front to avoid the need to update the parent pointers on every cumulative update.
     // If we exceed the reserved space, the various parent pointers will be incorrect.
@@ -5889,20 +6388,64 @@ pdschDynApiDataset::pdschDynApiDataset(const std::string& inputFileName, uint32_
     CUDA_CHECK(cudaMemsetAsync(large_buffer.get(), 0, max_cells * large_buffer_bytes, cuStrm)); // This is done in cuStrm
 
     crc_input_data_ptr = std::make_unique<uint8_t*[]>(max_cells);
-    crc_input_data.resize(max_cells);
+    if(pdsch_TB_input_on_GPU)
+    {
+        crc_input_data_device.resize(max_cells);
+        padded_crc_input_data_device.resize(max_cells);
+    }
+    else
+    {
+        crc_input_data_pinned.resize(max_cells);
+        padded_crc_input_data_pinned.resize(max_cells);
+    }
+    if(read_TB_CRC)
+    {
+        tb_crc_data_in_ptr = std::make_unique<uint8_t*[]>(max_cells);
+        tb_crc_input_data.resize(max_cells);
+    }
+    post_fec_data_in.resize(1); // single-entry intentional. Flat buffer covers all TBs across all cells in a cell group, to match what PDSCH does internally in non post-fec mode; individual TB offsets are tracked in post_fec_input_helper
+
     data_in.resize(max_cells);
     tb_crc_in.resize(max_cells);
     output_data.resize(max_cells);
-    output_status.resize(1);
+    output_status.resize(1); // single status for entire cell group; not per-cell
     output_tensorPrm.resize(max_cells);
     data_tx_tensor.resize(max_cells);
 
     PmwPrms.resize(max_UEs_per_cell_group);
 
     // OK to do the next two actions  here given overprovisioned allocations above.
-    pdsch_dyn_params                    = {cuStrm, pdsch_proc_mode, &cell_grp_dyn_params, data_in.data(), tb_crc_in.data(), output_data.data(), output_status.data()};
+    bool one_of_post_fec_modes = (pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING) ||  \
+                                 (pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING);
+    pdsch_dyn_params                    = {cuStrm, pdsch_proc_mode, &cell_grp_dyn_params, data_in.data(), tb_crc_in.data(), one_of_post_fec_modes ? post_fec_data_in.data() : nullptr, output_data.data(), output_status.data()};
     pdsch_dyn_params.pDataOut->pTDataTx = output_tensorPrm.data();
     output_status[0] = {cuphyPdschStatusType_t::CUPHY_PDSCH_STATUS_SUCCESS_OR_UNTRACKED_ISSUE, MAX_UINT16, MAX_UINT16};
+
+    cell_grp_Emax = cfg_cell_grp_Emax;
+
+    if(pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING)
+    {
+        // Proactively allocate large d_ldpc_workspace buffer that will be used to stitch multiple tb<i>_codedcbs datasets if post_fec_processing (static params) mode is exercised.
+        uint32_t max_N_per_CB   = MAX_ENCODED_CODE_BLOCK_BIT_SIZE;
+        size_t max_per_TB_LDPC_workspace_size = div_round_up<uint32_t>(max_N_per_CB, 8) * max_CBs_per_TB;
+        size_t max_LDPC_workspace_size = max_per_TB_LDPC_workspace_size * max_UEs_per_cell_group;  // UE count same as TB count in this context
+        d_ldpc_workspace  = make_unique_device<uint32_t>(div_round_up<uint32_t>(max_LDPC_workspace_size, sizeof(uint32_t)));
+
+        post_fec_data_in[0].pLdpcOutput = d_ldpc_workspace.get(); // single flat buffer for all TBs in all cells in a cell group
+        post_fec_data_in[0].pRmScramblingOutput = nullptr;        // not used
+        post_fec_input_helper.resize(max_UEs_per_cell_group);     // post_fec_input_helper tracks per-TB information: LDPC_dst_offset, etc.
+    }
+    else if(pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING)
+    {
+        // Proactively allocate large d_rm_scrambling_workspace buffer that will be used to stitch multiple tb<i>_scrambledcbs datasets if post_fec_rm_scrambling_processing (static params) mode is exercised.
+        //printf("max_CBs_per_TB %d, max_UEs_per_cell_group %d,  div_round_up<uint32_t>(PDSCH_MAX_ER_PER_CB_BITS, 32) %d, %d\n", max_CBs_per_TB, max_UEs_per_cell_group, div_round_up<uint32_t>(PDSCH_MAX_ER_PER_CB_BITS, 32), PDSCH_MAX_ER_PER_CB_BITS);
+        size_t max_rm_scrambling_workspace_size = max_CBs_per_TB * max_UEs_per_cell_group * div_round_up<uint32_t>(PDSCH_MAX_ER_PER_CB_BITS, 8); // in bytes
+        d_rm_scrambling_workspace  = make_unique_device<uint32_t>(div_round_up<uint32_t>(max_rm_scrambling_workspace_size, sizeof(uint32_t)));
+
+        post_fec_data_in[0].pLdpcOutput = nullptr; // not used
+        post_fec_data_in[0].pRmScramblingOutput = d_rm_scrambling_workspace.get(); //single flat buffer for all TBs in all cells in a cell group
+
+    }
 
     // Update dynamic parameters. This method will also be called to stitch together multiple one-cell TVs.
     cumulativeUpdate(inputFileName, cuStrm, pdsch_proc_mode);
@@ -5924,13 +6467,17 @@ void pdschDynApiDataset::cumulativeUpdate(const std::string& inputFileName, cuda
 
     if(num_cell_groups != 1)
     {
-        throw std::runtime_error("PDSCH: Only a single cell group is supported per pipeline!");
+        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "PDSCH: Only a single cell group is supported per pipeline!");
     }
     int                     cell_group_id       = 0;
     cuphy::cuphyHDF5_struct cell_grp_dyn_config = cuphy::get_HDF5_struct_index(cell_grp_dyn_pars_dataset, cell_group_id);
 
+    if((forced_TB_byte_alignment <= 0) || (forced_TB_byte_alignment > 32) || ((forced_TB_byte_alignment & (forced_TB_byte_alignment -1)) != 0))
+    {
+        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Unsupported TB byte alignment {}. Supported values are 1, 2, 4, 8, 16, 32", forced_TB_byte_alignment);
+    }
+
     //Read # cells, UE groups, UEs, and CWs and update the relevant fields in this cell group.
-    //FIXME Add precoding too.
     uint16_t num_cells = cell_grp_dyn_config.get_value_as<uint16_t>("nCells");
     cell_grp_dyn_params.nCells += num_cells;
     CellPrms.resize(cell_grp_dyn_params.nCells);
@@ -5940,7 +6487,7 @@ void pdschDynApiDataset::cumulativeUpdate(const std::string& inputFileName, cuda
 
     if(CellPrms.size() > max_cells)
     {
-        throw std::runtime_error("PDSCH: More max. # cells than expected!");
+        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "PDSCH more max cells {} than expected {}!", CellPrms.size(), max_cells);
     }
 
     uint16_t num_ue_groups = cell_grp_dyn_config.get_value_as<uint16_t>("nUeGrps");
@@ -5948,7 +6495,7 @@ void pdschDynApiDataset::cumulativeUpdate(const std::string& inputFileName, cuda
     UeGrpPrms.resize(current_UE_groups + num_ue_groups);
     pdsch_dmrs_pars.resize(current_UE_groups + num_ue_groups);
     cell_grp_dyn_params.pUeGrpPrms = UeGrpPrms.data();
-    NVLOGD_FMT(NVLOG_PDSCH, "pUeGrpPrms {:p}", static_cast<void*>(cell_grp_dyn_params.pUeGrpPrms));
+    //NVLOGD_FMT(NVLOG_PDSCH, "pUeGrpPrms {:p}", static_cast<void*>(cell_grp_dyn_params.pUeGrpPrms));
 
     uint16_t num_ues = cell_grp_dyn_config.get_value_as<uint16_t>("nUes");
     cell_grp_dyn_params.nUes += num_ues;
@@ -5956,6 +6503,10 @@ void pdschDynApiDataset::cumulativeUpdate(const std::string& inputFileName, cuda
     cell_grp_dyn_params.pUePrms = UePrms.data();
 
     uint16_t num_cws = cell_grp_dyn_config.get_value_as<uint16_t>("nCws");
+    if(num_cws == 0)
+    {
+        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Cannot have a cell with zero CWs!");
+    }
     cell_grp_dyn_params.nCws += num_cws;
     CwPrms.resize(cell_grp_dyn_params.nCws);
     cell_grp_dyn_params.pCwPrms = CwPrms.data();
@@ -5981,45 +6532,332 @@ void pdschDynApiDataset::cumulativeUpdate(const std::string& inputFileName, cuda
        (cell_grp_dyn_params.nUes > UePrms.capacity()) ||
        (cell_grp_dyn_params.nCws > CwPrms.capacity()))
     {
-        throw std::runtime_error("PDSCH: Expected  max. values exceeded. Parent pointers will be invalid!");
+        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "PDSCH: Expected max. values exceeded. Parent pointers will be invalid");
     }
 
-    // TODO The *v2 are versions of the functions from pdsch_tx.cpp that existin common/cuphy_hdf5.hpp. The former are still used by the cuPHY control plane, so will keep both until they remove them.  They are also used by some other cuPHY examples too.
-    // FIXME There may be small difference across them too.
     read_dmrs_pars_from_file(pdsch_dmrs_pars, fInput, current_UE_groups); //FIXME resizing pdsch_dmrs_pars
 
     // Populate arrays. Includes setting pointer to parent/children structs etc., so it should
     // happen *after* all previous mem. allocations.
     read_cell_dynamic_pars_from_file(&cell_grp_dyn_params.pCellPrms[current_cells], fInput, current_cells, current_CSIRS_params); // No allocations internally
 
-    //TODO remove comment  Allocations (new) of UE group's pUePrmIdxs and pDmrsDynPrm
+    //TODO remove comment  Allocations (new) of UE group's pUePrmIdxs, pDmrsDynPrm and rbBitMap
     read_ue_groups_pars_from_file(&cell_grp_dyn_params.pUeGrpPrms[current_UE_groups], fInput, &cell_grp_dyn_params.pCellPrms[current_cells], pdsch_dmrs_pars, current_UE_groups, current_UEs);
+
+    // Transfer ownership of new[]-allocated nested pointers into unique_ptrs so they are
+    // freed automatically on destruction and are safe across moves (unique_ptr nulls on move).
+    for(int i = current_UE_groups; i < (int)cell_grp_dyn_params.nUeGrps; i++) {
+        rb_bitmaps.emplace_back(cell_grp_dyn_params.pUeGrpPrms[i].rbBitmap);
+        ue_prm_idxs.emplace_back(cell_grp_dyn_params.pUeGrpPrms[i].pUePrmIdxs);
+        dmrs_prms.emplace_back(cell_grp_dyn_params.pUeGrpPrms[i].pDmrsDynPrm);
+    }
 
     //TODO remove comment  Allocations (new) of pCwIdxs
     read_ue_pars_from_file(&cell_grp_dyn_params.pUePrms[current_UEs], fInput, &cell_grp_dyn_params.pUeGrpPrms[current_UE_groups], cell_grp_dyn_params, current_UEs);
 
-    //TODO remove comment  No new allocations
+    for(int i = current_UEs; i < (int)cell_grp_dyn_params.nUes; i++) {
+        cw_idxs.emplace_back(cell_grp_dyn_params.pUePrms[i].pCwIdxs);
+    }
+
     read_cw_pars_from_file(&cell_grp_dyn_params.pCwPrms[current_CWs], fInput, &cell_grp_dyn_params.pUePrms[current_UEs], current_CWs);
 
-    // For dataset updates assuming single cell in each dataset (FIXME make consistent everywhere)
-    //Parse input dataset
-    hdf5hpp::hdf5_dataset crc_dataset = fInput.open_dataset("InputData");
-    //crc_input_data.emplace_back(typed_tensor_from_dataset<CUPHY_R_8U, pinned_alloc>(crc_dataset, cuphy::tensor_flags::align_default, cuStrm));
-    crc_input_data[current_cells]     = typed_tensor_from_dataset<CUPHY_R_8U, pinned_alloc>(crc_dataset, cuphy::tensor_flags::align_default, cuStrm);
-    crc_input_data_ptr[current_cells] = (uint8_t*)crc_input_data[current_cells].addr();
+    bool do_extra_padding_processing = (forced_TB_byte_alignment != 1); // Only do extra copies if alignment is different than the TVs.
 
-    data_in[current_cells]   = {&crc_input_data_ptr[current_cells], cuphyPdschDataIn_t::CPU_BUFFER};
-    tb_crc_in[current_cells] = {nullptr, cuphyPdschDataIn_t::CPU_BUFFER};
+    // At this point input parameters have been parsed for this cell. Print and update tbStartOffset and size
+    int total_CWs_so_far = current_CWs + num_cws; // num_cws can never be 0
+    for (int tmp_cw = current_CWs; do_extra_padding_processing && (tmp_cw < total_CWs_so_far); tmp_cw++)
+    {
+        /*NVLOGC_FMT(NVLOG_PDSCH, "Cell {}, TB {} has tbSize {} and tbStartOffset {}", current_cells, tmp_cw,
+                               cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize,
+                               cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset);*/
+
+        // no update needed for first TB in a cell
+        if (tmp_cw != current_CWs)
+        {
+            cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset = round_up_to_next<int>(cell_grp_dyn_params.pCwPrms[tmp_cw-1].tbStartOffset + cell_grp_dyn_params.pCwPrms[tmp_cw-1].tbSize, forced_TB_byte_alignment);
+            /*NVLOGC_FMT(NVLOG_PDSCH, "Update for {}-byte alignment: Cell {}, TB {} has tbSize {} and tbStartOffset {}",
+                              forced_TB_byte_alignment, current_cells, tmp_cw,
+                              cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize,
+                              cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset);*/
+        }
+    }
+    // No need for padding after the last TB in the cell
+    int total_cell_TB_buffer_size = (cell_grp_dyn_params.pCwPrms[total_CWs_so_far-1].tbStartOffset + cell_grp_dyn_params.pCwPrms[total_CWs_so_far-1].tbSize);
+    //NVLOGC_FMT(NVLOG_PDSCH, "Cell {} has buffer size {}", current_cells, total_cell_TB_buffer_size);
+
+    if(pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING)
+    {
+        // Reminder that UEs and CWs are used interchangeably
+        if (current_CWs + num_ues > post_fec_input_helper.size())
+        {
+            NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "POST_FEC: TB count would exceed post_fec_input_helper capacity");
+        }
+
+        // Stitch together multiple datasets to generate the input to the fused rate-matching and modulation component
+        // Code path will be different depending on whether this cell is in testing mode or not
+
+        static constexpr int BITS_PER_U32 = sizeof(uint32_t) * 8; // in bits
+        bool test_mode = cell_grp_dyn_params.pCellPrms[current_cells].testModel; // per-cell
+
+        for (int cell_TB_id = 0; cell_TB_id < num_ues; cell_TB_id++) {
+
+            // Parse dataset and N and num_CBs dimensions for this TB
+            // In test mode the codedcbs dataset is empty, so special handling is needed. In that case the variable naming is a bit of a misnomer
+            const std::string  TB_LDPC_out_dataset_name = "tb" + std::to_string(cell_TB_id) + ((test_mode) ? "_inputdata" : "_codedcbs");
+            hdf5hpp::hdf5_dataset tb_dataset  = fInput.open_dataset(TB_LDPC_out_dataset_name.c_str());
+            auto ldpc_ref_output  = typed_tensor_from_dataset<CUPHY_R_8U, pinned_alloc>(tb_dataset,  cuphy::tensor_flags::align_default, cuStrm);
+            int num_CBs = 0;
+            int N = 0;
+            int last_CB_N =  0;
+            if (test_mode) {
+                const int TB_LDPC_out_bits = tb_dataset.get_dataspace().get_dimensions()[1];
+                num_CBs = div_round_up<int>(TB_LDPC_out_bits, MAX_ENCODED_CODE_BLOCK_BIT_SIZE);
+                N = (num_CBs == 1) ?  TB_LDPC_out_bits: MAX_ENCODED_CODE_BLOCK_BIT_SIZE;
+                last_CB_N = TB_LDPC_out_bits - (num_CBs - 1)*MAX_ENCODED_CODE_BLOCK_BIT_SIZE;
+            }
+            else
+            {
+               num_CBs = ldpc_ref_output.layout().dimensions()[1];
+               N       = ldpc_ref_output.layout().dimensions()[0];
+               last_CB_N = N;
+            }
+            if(num_CBs > max_CBs_per_TB)
+            {
+                NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "POST_FEC: CB count {} for TB {} exceeds max_CBs_per_TB {} used for post_fec_input_helper capacity",
+                           num_CBs, cell_TB_id, max_CBs_per_TB);
+            }
+
+            int global_TB_id = current_CWs + cell_TB_id; // TB in cell group
+            post_fec_input_helper[global_TB_id].test_model = test_mode;
+            post_fec_input_helper[global_TB_id].num_CBs = num_CBs;
+            post_fec_input_helper[global_TB_id].N = N;
+            post_fec_input_helper[global_TB_id].tbSize = cell_grp_dyn_params.pCwPrms[current_CWs + cell_TB_id].tbSize;
+
+            if (global_TB_id == 0) {
+                post_fec_input_helper[global_TB_id].LDPC_dst_offset = 0;
+            } else {
+                const auto& prev = post_fec_input_helper[global_TB_id - 1];
+                uint32_t additional_TM_offset = ((prev.tbSize*8 + 31) >> 5)*sizeof(uint32_t); //in bytes
+                post_fec_input_helper[global_TB_id].LDPC_dst_offset  = prev.LDPC_dst_offset + \
+                                            ((!prev.test_model) ? (((prev.N + 31) >> 5)* sizeof(uint32_t) * prev.num_CBs) : \
+                                            additional_TM_offset); //in bytes
+            }
+
+
+            int per_TB_ldpc_out_dims[2]   = {round_up_to_next(N, BITS_PER_U32), num_CBs};
+            cuphy::tensor_desc tmp_tensor_desc = cuphy::tensor_desc(CUPHY_BIT, per_TB_ldpc_out_dims);
+
+            // Convert original host vector into expected format  (ideally that'd be a dataset)
+            typed_tensor<CUPHY_BIT, pinned_alloc> single_TB_h_ldpc_out_tensor(tmp_tensor_desc.get_info().layout());
+
+            for(int CB = 0; CB < num_CBs; CB += 1)
+            {
+                int current_N = ((test_mode) && (CB == (num_CBs - 1))) ? last_CB_N : N;
+                for(int element_start = 0; element_start < current_N; element_start += BITS_PER_U32)
+                {
+                    uint32_t ref_bits = 0;
+                    for(int offset = 0; offset < BITS_PER_U32; offset++)
+                    {
+                        if(element_start + offset < current_N)
+                        {
+                            uint32_t bit = (test_mode == 0) ? ldpc_ref_output(element_start + offset, CB) : ldpc_ref_output(element_start + offset + CB * N, 0);
+                            ref_bits |= (bit << offset);
+                        }
+                    }
+                    // Write to that other per-TB host-pinned tensor
+                    // This is for a given cell, cell_TB_id, CB, element id = element_start /BITS_PER_U32
+                    single_TB_h_ldpc_out_tensor(element_start / BITS_PER_U32, CB) = ref_bits;
+                }
+            }
+
+            // At this point single_TB_h_ldpc_out_tensor should have the correct data.
+            tensor_device temp_tensor = tensor_device((uint8_t*)d_ldpc_workspace.get() + post_fec_input_helper[global_TB_id].LDPC_dst_offset,
+                                         CUPHY_BIT,
+                                         per_TB_ldpc_out_dims[0],
+                                         per_TB_ldpc_out_dims[1],
+                                         cuphy::tensor_flags::align_tight);
+
+            CUPHY_CHECK(cuphyConvertTensor(temp_tensor.desc().handle(),
+                                           temp_tensor.addr(),
+                                           single_TB_h_ldpc_out_tensor.desc().handle(),
+                                           single_TB_h_ldpc_out_tensor.addr(),
+                                           cuStrm));
+
+            CUDA_CHECK(cudaStreamSynchronize(cuStrm));
+
+        }
+    }
+    else if(pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING)
+    {
+        // FIXME this is an initial layout to serve as a starting point; subject to change
+        // Stitch together multiple datasets to generate the input to the updated rate-matching and modulation component (post scrambling)
+        // Unlike the PDSCH_POST_FEC_PROCESSING mode above, this buffer is not affected by testing mode
+        static constexpr int BITS_PER_U32 = sizeof(uint32_t) * 8; // in bits
+
+        bool test_mode = cell_grp_dyn_params.pCellPrms[current_cells].testModel; // per-cell
+        for (int cell_TB_id = 0; cell_TB_id < num_ues; cell_TB_id++) {
+
+            // Parse dataset and N and num_CBs dimensions for this TB
+            const std::string  TB_rm_scrambling_dataset_name = "tb" + std::to_string(cell_TB_id) +  "_scramcbs";
+            hdf5hpp::hdf5_dataset tb_dataset  = fInput.open_dataset(TB_rm_scrambling_dataset_name.c_str());
+            auto scrambling_ref_output  = typed_tensor_from_dataset<CUPHY_R_8U, pinned_alloc>(tb_dataset,  cuphy::tensor_flags::align_default, cuStrm);
+
+            // Get G, Nl, Qm, C from TV
+            int G = scrambling_ref_output.layout().dimensions()[0];
+            int Qm = cell_grp_dyn_params.pCwPrms[current_CWs + cell_TB_id].qamModOrder;
+            int Nl = cell_grp_dyn_params.pUePrms[current_UEs + cell_TB_id].nUeLayers;
+
+            // In test mode the cbs dataset is empty, so special handling is needed. In that case the variable naming is a bit of a misnomer
+            const std::string CBs_dataset_name = "tb" + std::to_string(cell_TB_id) + ((test_mode) ? "_inputdata" :  "_cbs");
+            hdf5hpp::hdf5_dataset CBs_dataset      = fInput.open_dataset(CBs_dataset_name.c_str());
+            int  CBs_dataset_dim0   =  CBs_dataset.get_dataspace().get_dimensions()[(test_mode) ? 1 : 0];
+            int num_CBs = test_mode ? div_round_up<int>(CBs_dataset_dim0, MAX_ENCODED_CODE_BLOCK_BIT_SIZE) :  CBs_dataset_dim0;
+
+            //NVLOGC_FMT(NVLOG_PDSCH, "cell_TB {}: G {}, Qm {}, Nl {}, C {}", cell_TB_id, G, Qm, Nl, num_CBs);
+
+            int modulo_C = (!test_mode) ? (G / (Nl * Qm)) % num_CBs : 0; //split, if any, at C - modulo_C CB
+            int Er_0 = num_CBs - modulo_C;
+            int Er_1 = (!test_mode) ? (G / (Nl * Qm * num_CBs)) * Nl * Qm : MAX_ENCODED_CODE_BLOCK_BIT_SIZE;
+
+            int ref_bit = 0;
+
+            //NVLOGC_FMT(NVLOG_PDSCH, "cell_TB {}: CB split point (if any) {}, Er for CBs before split point {}", cell_TB_id, Er_0, Er_1);
+
+            auto Emax = cell_grp_Emax;
+            //printf("new Emax %d, max_CBs_per_TB %d\n", Emax, max_CBs_per_TB);
+
+            int per_TB_out_dims[2]   = {round_up_to_next(Emax, BITS_PER_U32), num_CBs};
+            cuphy::tensor_desc tmp_tensor_desc = cuphy::tensor_desc(CUPHY_BIT, per_TB_out_dims);
+            typed_tensor<CUPHY_BIT, pinned_alloc> single_TB_rm_scrambling_out_tensor(tmp_tensor_desc.get_info().layout());
+            // Proactively memset to 0, since only the Er_CB bits will be actually populated per CB below.
+            std::memset(single_TB_rm_scrambling_out_tensor.addr(),
+                        0,
+                        single_TB_rm_scrambling_out_tensor.desc().get_size_in_bytes());
+
+
+            // Store to new tensor where every CB starts at a 4-byte aligned boundary
+            for(int CB = 0; CB < num_CBs; CB++)
+            {
+                uint32_t Er_CB = Er_1 + ((CB < Er_0) ? 0 : Nl * Qm);
+                if(test_mode && (CB == num_CBs - 1)) 
+                {
+                    Er_CB =  G - CB*MAX_ENCODED_CODE_BLOCK_BIT_SIZE;
+                }
+                int rounded_up_Er_CB_element = ((Er_CB + 31) / 32);
+                for(int Er_element = 0; Er_element < rounded_up_Er_CB_element; Er_element++) {
+                    uint32_t value_to_write = 0;
+                    for(int Er_element_bit = 0; Er_element_bit < 32; Er_element_bit++) {
+                        int Er_bit = Er_element*32 + Er_element_bit;
+                        if (Er_bit < Er_CB) {
+                            uint32_t ref_value = scrambling_ref_output(ref_bit, 0);
+                            value_to_write |= ((ref_value & 0x1) << Er_element_bit);
+                            ref_bit += 1;
+                        }
+                    }
+                    // At this point write value_to_write to host-pinned tensor.
+                    single_TB_rm_scrambling_out_tensor(Er_element, CB) = value_to_write;
+                }
+            }
+
+            // At this point single_TB_rm_scrambling_out_tensor should have the correct data.
+            int global_TB_id = current_CWs + cell_TB_id; // TB in cell group
+            uint32_t dst_offset = global_TB_id * max_CBs_per_TB * div_round_up<uint32_t>(Emax, 8); // assumes max_CBs_per_TB  is computed via compute_max_values in static dataset; same for Emax
+            tensor_device temp_tensor = tensor_device((uint8_t*)d_rm_scrambling_workspace.get() + dst_offset,
+                                         CUPHY_BIT,
+                                         per_TB_out_dims[0],
+                                         per_TB_out_dims[1],
+                                         cuphy::tensor_flags::align_tight);
+
+
+            CUPHY_CHECK(cuphyConvertTensor(temp_tensor.desc().handle(),
+                                           temp_tensor.addr(),
+                                           single_TB_rm_scrambling_out_tensor.desc().handle(),
+                                           single_TB_rm_scrambling_out_tensor.addr(),
+                                           cuStrm));
+
+            CUDA_CHECK(cudaStreamSynchronize(cuStrm));
+        }
+    }
+    else
+    {
+        // For dataset updates assuming single cell in each dataset
+        // Parse input dataset
+        hdf5hpp::hdf5_dataset crc_dataset = fInput.open_dataset("InputData");
+
+        // Skipping all the extra copies for forced_TB_byte_alignment==1 (default from TVs)
+        if(pdsch_TB_input_on_GPU)
+        {
+            crc_input_data_device[current_cells]  = typed_tensor_from_dataset<CUPHY_R_8U, cuphy::device_alloc>(crc_dataset, cuphy::tensor_flags::align_default, cuStrm);
+            if(do_extra_padding_processing)
+            {
+                padded_crc_input_data_device[current_cells] = make_unique_device<uint8_t>(total_cell_TB_buffer_size);
+
+                // D to D copies
+                int cumulative_offset = 0;
+                for (int tmp_cw = current_CWs; tmp_cw < total_CWs_so_far; tmp_cw++) {
+                    CUDA_CHECK(cudaMemcpyAsync((uint8_t*)padded_crc_input_data_device[current_cells].get() + cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset, crc_input_data_device[current_cells].addr() + cumulative_offset, cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize, cudaMemcpyDeviceToDevice, cuStrm));
+                    //memset the padded buffer part to 0.
+                    int padded_bytes = ((tmp_cw == total_CWs_so_far-1) ?  total_cell_TB_buffer_size : cell_grp_dyn_params.pCwPrms[tmp_cw+1].tbStartOffset)
+                                               - cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset - cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize;
+                    CUDA_CHECK(cudaMemsetAsync((uint8_t*)(padded_crc_input_data_device[current_cells].get() + cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset + cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize), 0,  padded_bytes, cuStrm));
+                    cumulative_offset += cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize;
+                }
+                crc_input_data_ptr[current_cells]     = (uint8_t*)padded_crc_input_data_device[current_cells].get();
+            }
+            else
+            {
+                crc_input_data_ptr[current_cells]     = (uint8_t*)crc_input_data_device[current_cells].addr();
+            }
+        }
+        else
+        {
+            crc_input_data_pinned[current_cells]  = typed_tensor_from_dataset<CUPHY_R_8U, cuphy::pinned_alloc>(crc_dataset, cuphy::tensor_flags::align_default, cuStrm);
+            if (do_extra_padding_processing)
+            {
+                padded_crc_input_data_pinned[current_cells] = make_unique_pinned<uint8_t>(total_cell_TB_buffer_size);
+                // H to H copies
+                int cumulative_offset = 0;
+                for (int tmp_cw = current_CWs; tmp_cw < total_CWs_so_far; tmp_cw++) {
+                    std::memcpy((uint8_t*)padded_crc_input_data_pinned[current_cells].get() + cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset, crc_input_data_pinned[current_cells].addr() + cumulative_offset, cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize);
+                    //memset the padded buffer part to 0.
+                    int padded_bytes = ((tmp_cw == total_CWs_so_far-1) ?  total_cell_TB_buffer_size : cell_grp_dyn_params.pCwPrms[tmp_cw+1].tbStartOffset)
+                                               - cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset - cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize;
+                    std::memset((uint8_t*)(padded_crc_input_data_pinned[current_cells].get() + cell_grp_dyn_params.pCwPrms[tmp_cw].tbStartOffset + cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize), 0,  padded_bytes);
+                    cumulative_offset += cell_grp_dyn_params.pCwPrms[tmp_cw].tbSize;
+                }
+                crc_input_data_ptr[current_cells]     = (uint8_t*)padded_crc_input_data_pinned[current_cells].get();
+            }
+            else
+            {
+                crc_input_data_ptr[current_cells]     = (uint8_t*)crc_input_data_pinned[current_cells].addr();
+            }
+        }
+
+        data_in[current_cells]   = {&crc_input_data_ptr[current_cells],
+                                    pdsch_TB_input_on_GPU ? cuphyPdschDataIn_t::GPU_BUFFER : cuphyPdschDataIn_t::CPU_BUFFER};
+
+        if(read_TB_CRC)
+        {
+            hdf5hpp::hdf5_dataset tb_crc_dataset = fInput.open_dataset("tbCrcBuffer");
+            tb_crc_input_data[current_cells] = typed_tensor_from_dataset<CUPHY_R_32U, cuphy::pinned_alloc>(tb_crc_dataset, cuphy::tensor_flags::align_default, cuStrm);
+
+            tb_crc_data_in_ptr[current_cells] = (uint8_t*)tb_crc_input_data[current_cells].addr();
+            tb_crc_in[current_cells] = {&tb_crc_data_in_ptr[current_cells], cuphyPdschDataIn_t::CPU_BUFFER};
+        }
+        else
+        {
+            tb_crc_in[current_cells] = {nullptr, cuphyPdschDataIn_t::CPU_BUFFER};
+        }
+    }
 
     int num_REs                   = cuphy::get_HDF5_dataset_info(fInput.open_dataset("Xtf")).layout().dimensions()[0];
     data_tx_tensor[current_cells] = tensor_device(large_buffer.get() + current_cells * large_buffer_elements, CUPHY_C_16F, num_REs, OFDM_SYMBOLS_PER_SLOT, MAX_DL_PORTS, cuphy::tensor_flags::align_tight);
-    pdsch_dyn_params.pDataOut->pTDataTx[current_cells].desc  = data_tx_tensor[current_cells].desc().handle();
 
     pdsch_dyn_params.pDataOut->pTDataTx[current_cells].desc  = data_tx_tensor[current_cells].desc().handle();
     pdsch_dyn_params.pDataOut->pTDataTx[current_cells].pAddr = data_tx_tensor[current_cells].addr();
     //NVLOGC_FMT(NVLOG_PDSCH, "addr() {:p}", (void*)data_tx_tensor[current_cells].addr());
 
-    CUDA_CHECK(cudaStreamSynchronize(cuStrm)); // ensure crc_input_data is ready FIXME?
+    CUDA_CHECK(cudaStreamSynchronize(cuStrm)); // ensure crc_input_data is ready
 }
 
 void pdschDynApiDataset::print()
@@ -6041,99 +6879,206 @@ pdschDynApiDataset::pdschDynApiDataset() :
     UePrms{},
     CwPrms{},
     pdsch_dmrs_pars{},
+    CsirsPrms{},
+    PmwPrms{},
     cell_grp_dyn_params{},
     pdsch_dyn_params{},
     data_in{},
+    tb_crc_in{},
     output_data{},
+    output_status{},
     output_tensorPrm{},
-    max_cells(1)
+    max_cells(1),
+    max_UEs_per_cell_group(0),
+    max_CBs_per_TB(0),
+    pdsch_TB_input_on_GPU(false),
+    forced_TB_byte_alignment(1),
+    read_TB_CRC(false),
+    large_buffer_elements(0),
+    large_buffer_bytes(0)
 {}
 
-// reset pointers after a copy or move
+
+// reset pointers after a move
 void pdschDynApiDataset::ResetPointers()
 {
     NVLOGC_FMT(NVLOG_PDSCH, "PDSCH dynamic dataset: reset pointers");
-    cell_grp_dyn_params.pCellPrms  = CellPrms.data();
-    cell_grp_dyn_params.pCellMetrics  = CellMetrics.data();
-    cell_grp_dyn_params.pUeGrpPrms = UeGrpPrms.data();
-    cell_grp_dyn_params.pUePrms    = UePrms.data();
-    cell_grp_dyn_params.pCwPrms    = CwPrms.data();
+    cell_grp_dyn_params.pCellPrms    = CellPrms.data();
+    cell_grp_dyn_params.pCellMetrics = CellMetrics.data();
+    cell_grp_dyn_params.pUeGrpPrms   = UeGrpPrms.data();
+    cell_grp_dyn_params.pUePrms      = UePrms.data();
+    cell_grp_dyn_params.pCwPrms      = CwPrms.data();
+    cell_grp_dyn_params.pCsiRsPrms   = CsirsPrms.data();
+    cell_grp_dyn_params.pPmwPrms     = PmwPrms.data();
+
+    pdsch_dyn_params.pCellGrpDynPrm = &cell_grp_dyn_params;
+
+    bool one_of_post_fec_modes = (pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING) ||  \
+                                 (pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING);
+    pdsch_dyn_params.pPostFecDataIn = (one_of_post_fec_modes) ? post_fec_data_in.data() : nullptr;
 }
 
-// move operator
-pdschDynApiDataset& pdschDynApiDataset::operator=(pdschDynApiDataset&& pdschdynApiDataset)
+// move assignment operator
+pdschDynApiDataset& pdschDynApiDataset::operator=(pdschDynApiDataset&& other) noexcept
 {
-    NVLOGC_FMT(NVLOG_PDSCH, "PDSCH dynamic dataset: move");
-    CellPrms            = std::move(pdschdynApiDataset.CellPrms);
-    CellMetrics   = std::move(pdschdynApiDataset.CellMetrics);
-    UeGrpPrms           = std::move(pdschdynApiDataset.UeGrpPrms);
-    UePrms              = std::move(pdschdynApiDataset.UePrms);
-    CwPrms              = std::move(pdschdynApiDataset.CwPrms);
-    pdsch_dmrs_pars     = std::move(pdschdynApiDataset.pdsch_dmrs_pars);
-    cell_grp_dyn_params = std::move(pdschdynApiDataset.cell_grp_dyn_params);
-    pdsch_dyn_params    = std::move(pdschdynApiDataset.pdsch_dyn_params);
-    output_data         = std::move(pdschdynApiDataset.output_data);
-    output_tensorPrm    = std::move(pdschdynApiDataset.output_tensorPrm);
-    data_in             = std::move(pdschdynApiDataset.data_in);
+    NVLOGC_FMT(NVLOG_PDSCH, "PDSCH dynamic dataset: move assignment operator");
+
+    CellPrms                     = std::move(other.CellPrms);
+    CellMetrics                  = std::move(other.CellMetrics);
+    UeGrpPrms                    = std::move(other.UeGrpPrms);
+    UePrms                       = std::move(other.UePrms);
+    CwPrms                       = std::move(other.CwPrms);
+    pdsch_dmrs_pars              = std::move(other.pdsch_dmrs_pars);
+    CsirsPrms                    = std::move(other.CsirsPrms);
+    PmwPrms                      = std::move(other.PmwPrms);
+    cell_grp_dyn_params          = std::move(other.cell_grp_dyn_params);
+    pdsch_dyn_params             = std::move(other.pdsch_dyn_params);
+    data_in                      = std::move(other.data_in);
+    post_fec_data_in             = std::move(other.post_fec_data_in);
+    tb_crc_in                    = std::move(other.tb_crc_in);
+    output_data                  = std::move(other.output_data);
+    output_status                = std::move(other.output_status);
+    output_tensorPrm             = std::move(other.output_tensorPrm);
+    max_cells                    = other.max_cells;
+    max_UEs_per_cell_group       = other.max_UEs_per_cell_group;
+    max_CBs_per_TB               = other.max_CBs_per_TB;
+    large_buffer_elements        = other.large_buffer_elements;
+    large_buffer_bytes           = other.large_buffer_bytes;
+    pdsch_TB_input_on_GPU        = other.pdsch_TB_input_on_GPU;
+    forced_TB_byte_alignment     = other.forced_TB_byte_alignment;
+    read_TB_CRC                  = other.read_TB_CRC;
+    large_buffer                 = std::move(other.large_buffer);
+    data_tx_tensor               = std::move(other.data_tx_tensor);
+    crc_input_data_ptr           = std::move(other.crc_input_data_ptr);
+    tb_crc_data_in_ptr           = std::move(other.tb_crc_data_in_ptr);
+    crc_input_data_pinned        = std::move(other.crc_input_data_pinned);
+    padded_crc_input_data_pinned = std::move(other.padded_crc_input_data_pinned);
+    crc_input_data_device        = std::move(other.crc_input_data_device);
+    padded_crc_input_data_device = std::move(other.padded_crc_input_data_device);
+    tb_crc_input_data            = std::move(other.tb_crc_input_data);
+    rb_bitmaps                   = std::move(other.rb_bitmaps);
+    ue_prm_idxs                  = std::move(other.ue_prm_idxs);
+    dmrs_prms                    = std::move(other.dmrs_prms);
+    cw_idxs                      = std::move(other.cw_idxs);
+    d_ldpc_workspace             = std::move(other.d_ldpc_workspace);
+    pipeline_processing_mode     = other.pipeline_processing_mode;
+    post_fec_input_helper        = std::move(other.post_fec_input_helper);
+    d_rm_scrambling_workspace    = std::move(other.d_rm_scrambling_workspace);
+    cell_grp_Emax                = other.cell_grp_Emax;
+
     ResetPointers();
+
+    other.cell_grp_dyn_params = {};
+    other.pdsch_dyn_params.pCellGrpDynPrm = nullptr;
+
     return *this;
 }
 
-// copy constructor
-pdschDynApiDataset::pdschDynApiDataset(const pdschDynApiDataset& pdschdynApiDataset) :
-    CellPrms(pdschdynApiDataset.CellPrms),
-    CellMetrics(pdschdynApiDataset.CellMetrics),
-    UeGrpPrms(pdschdynApiDataset.UeGrpPrms),
-    UePrms(pdschdynApiDataset.UePrms),
-    CwPrms(pdschdynApiDataset.CwPrms),
-    pdsch_dmrs_pars(pdschdynApiDataset.pdsch_dmrs_pars),
-    cell_grp_dyn_params(pdschdynApiDataset.cell_grp_dyn_params),
-    pdsch_dyn_params(pdschdynApiDataset.pdsch_dyn_params),
-    data_in(pdschdynApiDataset.data_in),
-    output_data(pdschdynApiDataset.output_data),
-    output_tensorPrm(pdschdynApiDataset.output_tensorPrm)
+// move constructor
+pdschDynApiDataset::pdschDynApiDataset(pdschDynApiDataset&& other) noexcept :
+    CellPrms(std::move(other.CellPrms)),
+    CellMetrics(std::move(other.CellMetrics)),
+    UeGrpPrms(std::move(other.UeGrpPrms)),
+    UePrms(std::move(other.UePrms)),
+    CwPrms(std::move(other.CwPrms)),
+    pdsch_dmrs_pars(std::move(other.pdsch_dmrs_pars)),
+    CsirsPrms(std::move(other.CsirsPrms)),
+    PmwPrms(std::move(other.PmwPrms)),
+    cell_grp_dyn_params(other.cell_grp_dyn_params),
+    pdsch_dyn_params(other.pdsch_dyn_params),
+    post_fec_data_in(std::move(other.post_fec_data_in)),
+    data_in(std::move(other.data_in)),
+    tb_crc_in(std::move(other.tb_crc_in)),
+    output_data(std::move(other.output_data)),
+    output_status(std::move(other.output_status)),
+    output_tensorPrm(std::move(other.output_tensorPrm)),
+    max_cells(other.max_cells),
+    max_UEs_per_cell_group(other.max_UEs_per_cell_group),
+    max_CBs_per_TB(other.max_CBs_per_TB),
+    large_buffer(std::move(other.large_buffer)),
+    data_tx_tensor(std::move(other.data_tx_tensor)),
+    crc_input_data_ptr(std::move(other.crc_input_data_ptr)),
+    tb_crc_data_in_ptr(std::move(other.tb_crc_data_in_ptr)),
+    pdsch_TB_input_on_GPU(other.pdsch_TB_input_on_GPU),
+    forced_TB_byte_alignment(other.forced_TB_byte_alignment),
+    read_TB_CRC(other.read_TB_CRC),
+    crc_input_data_pinned(std::move(other.crc_input_data_pinned)),
+    padded_crc_input_data_pinned(std::move(other.padded_crc_input_data_pinned)),
+    crc_input_data_device(std::move(other.crc_input_data_device)),
+    padded_crc_input_data_device(std::move(other.padded_crc_input_data_device)),
+    tb_crc_input_data(std::move(other.tb_crc_input_data)),
+    large_buffer_elements(other.large_buffer_elements),
+    large_buffer_bytes(other.large_buffer_bytes),
+    rb_bitmaps(std::move(other.rb_bitmaps)),
+    ue_prm_idxs(std::move(other.ue_prm_idxs)),
+    dmrs_prms(std::move(other.dmrs_prms)),
+    cw_idxs(std::move(other.cw_idxs)),
+    d_ldpc_workspace(std::move(other.d_ldpc_workspace)),
+    pipeline_processing_mode(other.pipeline_processing_mode),
+    post_fec_input_helper(std::move(other.post_fec_input_helper)),
+    d_rm_scrambling_workspace(std::move(other.d_rm_scrambling_workspace)),
+    cell_grp_Emax(other.cell_grp_Emax)
 {
-    NVLOGC_FMT(NVLOG_PDSCH, "PDSCH dynamic dataset: copy");
-    // synch default stream, used to copy
-    CUDA_CHECK(cudaStreamSynchronize(0));
-
-    // update pointers
+    NVLOGC_FMT(NVLOG_PDSCH, "PDSCH dynamic dataset: move ctor");
     ResetPointers();
+
+    other.cell_grp_dyn_params = {};
+    other.pdsch_dyn_params.pCellGrpDynPrm = nullptr;
 }
 
 //----------------------------------------------------------------------------------------------------------
 //  Dataset holds static api parameters/data
 
 // construct from h5 file
-pdschStaticApiDataset::pdschStaticApiDataset(const std::string& inputFileName, std::string outputFileName, bool ref_check, bool identical_ldpc_configs, int stream_priority, uint32_t max_CBs_per_TB, uint32_t max_UEs_per_cell_group, uint32_t max_PRBs)
+pdschStaticApiDataset::pdschStaticApiDataset(const std::string& inputFileName, std::string outputFileName, bool ref_check, bool identical_ldpc_configs, int stream_priority, uint32_t max_cells, uint32_t max_CBs_per_TB, uint32_t max_UEs_per_cell_group, uint32_t max_PRBs, bool use_batched_memcpy, cuphyPdschPipelineMode_t pipeline_processing_mode, bool read_TB_CRC, uint32_t delay_usec)
 {
+
+    cellStatPrm.resize(max_cells);
+    dbgPrm.resize(PDSCH_MAX_CELLS_PER_CELL_GROUP); // Using PDSCH_MAX_CELLS_PER_CELL_GROUP so as not to modify updateRefCheckMultipleCells code. Could switch to max_cells otherwise
+    CfgFileName.reserve(max_cells);
+
+    pdschTracker.pMemoryFootprint      = nullptr;
+
+    pdschStatPrms.pOutInfo             = &pdschTracker;
     pdschStatPrms.nCells               = 0;
-    pdschStatPrms.read_TB_CRC          = false;
-    pdschStatPrms.full_slot_processing = true;
+    pdschStatPrms.pCellStatPrms        = cellStatPrm.data(); // stable: no further reallocation
+    pdschStatPrms.pDbg                 = dbgPrm.data();
+    pdschStatPrms.read_TB_CRC          = read_TB_CRC;
+    pdschStatPrms.pipeline_processing_mode = pipeline_processing_mode;
+    pdschStatPrms.delayUs                  = delay_usec;
 
-    pdschStatPrms.nMaxUesPerCellGroup = max_UEs_per_cell_group;
-    pdschStatPrms.nMaxCBsPerTB        = max_CBs_per_TB;
-    pdschStatPrms.nMaxPrb             = max_PRBs;
+    pdschStatPrms.stream_priority      = stream_priority;
 
-    pdschStatPrms.stream_priority = stream_priority;
-    compute_max_values            = false;
+    pdschStatPrms.nMaxCellsPerSlot     = max_cells;
+    pdschStatPrms.nMaxUesPerCellGroup  = max_UEs_per_cell_group;
+    pdschStatPrms.nMaxCBsPerTB         = max_CBs_per_TB;
+    pdschStatPrms.nMaxPrb              = max_PRBs;
+    pdschStatPrms.enableBatchedMemcpy  = use_batched_memcpy;
 
-    pdschTracker.pMemoryFootprint = nullptr;
-    pdschStatPrms.pOutInfo        = &pdschTracker;
-    pdschStatPrms.enableBatchedMemcpy = 0; // update as needed
+    // compute_max_values not configurable right now
+    // If set to true, the following fields will be updated: nMaxUesPerCellGroup, nMaxCBsPerTB
+    // Currently forcing to true in case of POST_FEC_RM_SCRAMBLING_PROCESSING mode; false otherwise.
+    compute_max_values                 = (pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING);
+
+    cell_grp_Emax = 0;
 
     cumulativeUpdate(inputFileName, outputFileName, ref_check, identical_ldpc_configs);
 }
 
 void pdschStaticApiDataset::cumulativeUpdate(const std::string& inputFileName, std::string outputFileName, bool ref_check, bool identical_ldpc_configs)
 {
-    int current_static_cells = cellStatPrm.size();
+    int current_static_cells = pdschStatPrms.nCells; // cellStatPrm.size() == max_cells after ctor pre-sizing
 
     hdf5hpp::hdf5_file    fInput              = hdf5hpp::hdf5_file::open(inputFileName.c_str());
     hdf5hpp::hdf5_dataset cell_static_dataset = fInput.open_dataset("cellStat_pars");
     int                   num_cells           = cell_static_dataset.get_dataspace().get_dimensions()[0];
 
-    cellStatPrm.resize(current_static_cells + num_cells);
+    if(current_static_cells + num_cells > static_cast<int>(cellStatPrm.size()))
+    {
+       throw std::runtime_error("cumulativeUpdate: cell count exceeds max_cells capacity");
+    }
+
+
     uint16_t max_PRBs_from_TV = 0;
     read_cell_static_pars_from_file(cellStatPrm.data() + current_static_cells, cell_static_dataset, num_cells, current_static_cells, max_PRBs_from_TV);
     if((pdschStatPrms.nMaxPrb != 0) && (max_PRBs_from_TV > pdschStatPrms.nMaxPrb))
@@ -6144,22 +7089,17 @@ void pdschStaticApiDataset::cumulativeUpdate(const std::string& inputFileName, s
     CfgFileName.push_back(inputFileName);
     int j = CfgFileName.size() - 1;
 
-    dbgPrm.resize(current_static_cells + num_cells);
     for(int i = 0; i < num_cells; i++)
     {
         dbgPrm[current_static_cells + i].pCfgFileName            = CfgFileName[j].empty() ? nullptr : CfgFileName[j].c_str();
+        dbgPrm[current_static_cells + i].checkTbSize             = 1; //FIXME
         dbgPrm[current_static_cells + i].refCheck                = ref_check;
         dbgPrm[current_static_cells + i].cfgIdenticalLdpcEncCfgs = identical_ldpc_configs;
     }
 
     pdschStatPrms.nCells += num_cells;
-    pdschStatPrms.pCellStatPrms = cellStatPrm.data();
-    pdschStatPrms.pDbg          = dbgPrm.data();
 
-    // Max. parameters. Set to 0 if you want to use default time constants
-    pdschStatPrms.nMaxCellsPerSlot = pdschStatPrms.nCells;
-
-    if(compute_max_values)
+    if(compute_max_values) // currently false by default
     {
         // Currently number of UEs is the same as number of CWs. Update when 2 CW per UE are supported.
         hdf5hpp::hdf5_dataset      cell_grp_dataset    = fInput.open_dataset("cellGrpDyn_pars");
@@ -6186,8 +7126,79 @@ void pdschStaticApiDataset::cumulativeUpdate(const std::string& inputFileName, s
             uint16_t              num_CBs_for_TB   = (cell_testing_mode == 0) ? CBs_dataset.get_dataspace().get_dimensions()[0] : \
                                                      (div_round_up<int>(CBs_dataset.get_dataspace().get_dimensions()[1], MAX_ENCODED_CODE_BLOCK_BIT_SIZE));
             pdschStatPrms.nMaxCBsPerTB             = std::max(pdschStatPrms.nMaxCBsPerTB, num_CBs_for_TB);
+
+            const std::string  TB_rm_scrambling_dataset_name = "tb" + std::to_string(UE_idx) +  "_scramcbs";
+            hdf5hpp::hdf5_dataset tb_dataset  = fInput.open_dataset(TB_rm_scrambling_dataset_name.c_str());
+            int actual_G = tb_dataset.get_dataspace().get_dimensions()[1]; // not what is used if CSIRS is present for Emax computation in cuphySetupDlRateMatching function, later passed to the kernel
+
+            if (cell_testing_mode == 0) {
+    
+                //FIXME compute emax too - expensive and duplicating work and ideally shouldn't happen
+                // This is done so we keep Emax as expected by fused_post_rm_scrambling kernel re alginment/allocation (same as in the orig. fused_dl_rm_modulation kernel), so initial changes are minimal. Could alternatively change that in that kernel or adapt layout for PDSCH input buffer in that case.
+
+                // Please note that fused_post_rm_scrambling kernel is always exercised in PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING mode for simplicity.
+                // TODO can extend code to also add support to the fast fused kernel, if relevant.
+                hdf5hpp::hdf5_dataset  ue_dataset    = fInput.open_dataset("ue_pars");
+                hdf5hpp::hdf5_dataset_elem ue_config = ue_dataset[UE_idx];
+                int Nl = ue_config["nUeLayers"].as<uint8_t>();
+                int ueGrpIdx = ue_config["ueGrpIdx"].as<uint16_t>();
+    
+                hdf5hpp::hdf5_dataset  cw_dataset    = fInput.open_dataset("cw_pars");
+                hdf5hpp::hdf5_dataset_elem cw_config = cw_dataset[UE_idx]; // UE_idx same as cw_idx
+                int Qm = cw_config["qamModOrder"].as<uint8_t>();
+    
+                hdf5hpp::hdf5_dataset  ue_grp_dataset    = fInput.open_dataset("ueGrp_pars");
+                hdf5hpp::hdf5_dataset_elem ue_grp_config = ue_grp_dataset[ueGrpIdx];
+                uint8_t num_PDSCH_symbols = ue_grp_config["nPdschSym"].as<uint8_t>();
+    
+                uint16_t dmrs_bitmask = ue_grp_config["dmrsSymLocBmsk"].as<uint16_t>();
+                int num_dmrs_symbols =  __builtin_popcount(dmrs_bitmask); // Assumes that all set DMRS bits are after the start symbol.
+    
+                uint32_t num_symbols = (int)num_PDSCH_symbols -  num_dmrs_symbols;
+                uint32_t num_PRBs = ue_grp_config["nPrb"].as<uint16_t>();
+    
+                int dmrs_idx = ue_grp_config["dmrsIdx"].as<uint16_t>();
+                hdf5hpp::hdf5_dataset  dmrs_dataset    = fInput.open_dataset("dmrs_pars");
+                hdf5hpp::hdf5_dataset_elem dmrs_config = dmrs_dataset[dmrs_idx];
+                int n_dmrs_cdm_grps_no_data = dmrs_config["nDmrsCdmGrpsNoData"].as<uint8_t>();
+                int num_dmrs_CdmGrpsNoData1_symbols = (n_dmrs_cdm_grps_no_data == 1) ? num_dmrs_symbols : 0;
+                // DMRS symbols when CdmGrpsNoData is 1 also contribute to max_REs below but only half the REs in a PRB (i.e., 6).
+                int max_REs = (num_symbols * CUPHY_N_TONES_PER_PRB  + num_dmrs_CdmGrpsNoData1_symbols * (CUPHY_N_TONES_PER_PRB / 2)) * num_PRBs;
+                int G = max_REs * Qm * Nl;
+    
+                int num_CBs = num_CBs_for_TB;
+                int modulo_C = (G / (Nl * Qm)) % num_CBs; //split, if any, at C - modulo_C CB
+                int Er_0 = num_CBs - modulo_C;
+                int Er_1 = (G / (Nl * Qm * num_CBs)) * Nl * Qm;
+    
+                auto max_Er = (modulo_C == 0) ? Er_1 : Er_1 + Nl*Qm;
+                auto Emax = ((max_Er + 31) / 32)*32;
+
+                //printf("Emax %d\n", Emax);
+                if (Emax > cell_grp_Emax)
+                {
+                   cell_grp_Emax = Emax;
+                }
+            }
+            else
+            {
+                auto max_Er = (num_CBs_for_TB == 1) ? actual_G : MAX_ENCODED_CODE_BLOCK_BIT_SIZE;
+                auto Emax = ((max_Er + 31) / 32)*32;
+
+                //printf("Emax %d\n", Emax);
+
+                if (Emax > cell_grp_Emax)
+                {
+                    cell_grp_Emax = Emax;
+                }
+           }
         }
     }
+}
+
+int pdschStaticApiDataset::getEmax() const
+{
+    return cell_grp_Emax;
 }
 
 void pdschStaticApiDataset::print()
@@ -6198,53 +7209,67 @@ void pdschStaticApiDataset::print()
 // default constructor
 pdschStaticApiDataset::pdschStaticApiDataset() :
     pdschStatPrms{},
+    pdschTracker{},
     dbgPrm{},
     cellStatPrm{},
     CfgFileName{},
-    compute_max_values(false)
+    compute_max_values(false),
+    cell_grp_Emax(0)
 {}
 
 // Reset pointers after a move or copy
 void pdschStaticApiDataset::ResetPointers()
 {
     NVLOGC_FMT(NVLOG_PDSCH, "PDSCH static dataset: resetPointers");
-#if 0
-    pdschStatPrms.pCellStatPrms = &cellStatPrm;
-    pdschStatPrms.pDbg          = &dbgPrm;
-    dbgPrm.pCfgFileName = CfgFileName.empty() ? nullptr : CfgFileName.c_str();
-#else
     pdschStatPrms.pCellStatPrms = cellStatPrm.data();
     pdschStatPrms.pDbg          = dbgPrm.data();
+    pdschStatPrms.pOutInfo      = &pdschTracker;
     //dbgPrm.pCfgFileName = CfgFileName.empty() ? nullptr : CfgFileName.c_str(); //FIXME Why??
-#endif
 }
 
 // move operator
-pdschStaticApiDataset& pdschStaticApiDataset::operator=(pdschStaticApiDataset&& pdschstaticApiDataset)
+pdschStaticApiDataset& pdschStaticApiDataset::operator=(pdschStaticApiDataset&& other) noexcept
 {
     NVLOGC_FMT(NVLOG_PDSCH, "PDSCH static dataset: move");
-    pdschStatPrms      = std::move(pdschstaticApiDataset.pdschStatPrms);
-    dbgPrm             = std::move(pdschstaticApiDataset.dbgPrm);
-    cellStatPrm        = std::move(pdschstaticApiDataset.cellStatPrm);
-    CfgFileName        = std::move(pdschstaticApiDataset.CfgFileName);
-    compute_max_values = pdschstaticApiDataset.compute_max_values;
+    pdschStatPrms      = std::move(other.pdschStatPrms);
+    pdschTracker       = other.pdschTracker;
+    dbgPrm             = std::move(other.dbgPrm);
+    cellStatPrm        = std::move(other.cellStatPrm);
+    CfgFileName        = std::move(other.CfgFileName);
+    compute_max_values = other.compute_max_values;
+    cell_grp_Emax      = other.cell_grp_Emax;
 
     ResetPointers();
     return *this;
 }
 
 // copy constructor
-pdschStaticApiDataset::pdschStaticApiDataset(const pdschStaticApiDataset& pdschstaticApiDataset) :
-    pdschStatPrms(pdschstaticApiDataset.pdschStatPrms),
-    dbgPrm(pdschstaticApiDataset.dbgPrm),
-    cellStatPrm(pdschstaticApiDataset.cellStatPrm),
-    CfgFileName(pdschstaticApiDataset.CfgFileName)
+pdschStaticApiDataset::pdschStaticApiDataset(const pdschStaticApiDataset& other) :
+    pdschStatPrms(other.pdschStatPrms),
+    pdschTracker(other.pdschTracker),
+    dbgPrm(other.dbgPrm),
+    cellStatPrm(other.cellStatPrm),
+    CfgFileName(other.CfgFileName),
+    compute_max_values(other.compute_max_values),
+    cell_grp_Emax(other.cell_grp_Emax)
 {
     NVLOGC_FMT(NVLOG_PDSCH, "PDSCH static dataset: copy");
-    // synch default stream, used to copy
-    CUDA_CHECK(cudaStreamSynchronize(0));
 
     // update pointers
+    ResetPointers();
+}
+
+// move constructor
+pdschStaticApiDataset::pdschStaticApiDataset(pdschStaticApiDataset&& other) noexcept :
+    pdschStatPrms(std::move(other.pdschStatPrms)),
+    pdschTracker(other.pdschTracker),
+    dbgPrm(std::move(other.dbgPrm)),
+    cellStatPrm(std::move(other.cellStatPrm)),
+    CfgFileName(std::move(other.CfgFileName)),
+    compute_max_values(other.compute_max_values),
+    cell_grp_Emax(other.cell_grp_Emax)
+{
+    NVLOGC_FMT(NVLOG_PDSCH, "PDSCH static dataset: move ctor");
     ResetPointers();
 }
 
@@ -6254,6 +7279,11 @@ pdschStaticApiDataset::pdschStaticApiDataset(const pdschStaticApiDataset& pdschs
 pdcchStaticApiDataset::pdcchStaticApiDataset(int cfg_max_cells_per_slot)
 {
     pdcchStatPrms.nMaxCellsPerSlot = cfg_max_cells_per_slot; // Should be specified. Currently no fallback if 0.
+    // Explicitly select the kernel mode / delay so graph selection is deterministic.
+    // Without this these fields are garbage, which routes PDCCH into the offloading
+    // (delay) graph and injects a bogus per-slot delay. TV overrides may change these later.
+    pdcchStatPrms.kernelSelOption  = PDCCH_ALL;
+    pdcchStatPrms.delayUs          = 0;
     pdcchTracker.pMemoryFootprint  = nullptr;
     pdcchStatPrms.pOutInfo         = &pdcchTracker;
 }
@@ -6297,7 +7327,14 @@ pdcchDynApiDataset::pdcchDynApiDataset(const std::string& inputFileName, uint32_
 
     int input_dims[2] = {CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES, (int) dci_params.capacity()};
     input_data.emplace_back(cuphy::tensor_layout(2, input_dims, nullptr));
-    data_in[0] = {input_data[0].addr(), cuphyPdcchDataIn_t::CPU_BUFFER};
+    
+    int x_input_dims[1] = {CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_BYTE_LEN * (int)dci_params.capacity()};
+    x_input_data.emplace_back(cuphy::tensor_layout(1, x_input_dims, nullptr));
+    
+    int c_input_dims[1] = {CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_WORD_LEN * (int)dci_params.capacity()};
+    c_input_data.emplace_back(cuphy::tensor_layout(1, c_input_dims, nullptr));
+    
+    data_in[0] = {input_data[0].addr(), x_input_data[0].addr(), c_input_data[0].addr(), cuphyPdcchDataIn_t::CPU_BUFFER};
 
     // OK to do the next two actions  here given overprovisioned allocations above.
 #if 0
@@ -6310,6 +7347,7 @@ pdcchDynApiDataset::pdcchDynApiDataset(const std::string& inputFileName, uint32_
     pdcch_dyn_params.pDataOut     = output_data.data();
     pdcch_dyn_params.pDataOut->pTDataTx = output_tensorPrm.data();
     pdcch_dyn_params.cuStream     = cuStrm;
+    
 
     // Update dynamic parameters. This method will also be called to stitch together multiple one-cell TVs.
     cumulativeUpdate(inputFileName, cuStrm);
@@ -6341,7 +7379,6 @@ void pdcchDynApiDataset::cumulativeUpdate(const std::string& inputFileName, cuda
     cuphy::read_pdcch_coreset_dyn_params_from_file_v2(coreset_params, fInput, current_coresets, current_dci, current_cells);
 
     bool use_new_dset = fInput.is_valid_dataset("DciPayload_coreset_0_dci_0");
-
     int cumulative_dci = current_dci;
     for (int i = 0; i < num_coresets; i++) {
         //Figure out nDCIs of this TV; Resize dci_params; read them; update nDci
@@ -6410,6 +7447,36 @@ void pdcchDynApiDataset::cumulativeUpdate(const std::string& inputFileName, cuda
             memset(&input_data[0](dci_bytes, cumulative_dci + dci_idx), 0xff, CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES - dci_bytes);
         }
         cumulative_dci += num_dci;
+     }
+     
+     if(fInput.is_valid_dataset("x_rm_bytes") && fInput.is_valid_dataset("c_scram_ints"))
+     {
+         cuphy::typed_tensor<CUPHY_R_8U, cuphy::pinned_alloc> x_rm_bytes = cuphy::typed_tensor_from_dataset<CUPHY_R_8U, cuphy::pinned_alloc>(fInput.open_dataset("x_rm_bytes"));
+         const int new_dci_count = cumulative_dci - current_dci;
+         if(x_rm_bytes.layout().dimensions()[0] != CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_BYTE_LEN * new_dci_count)
+         {
+             NVLOGF_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT, "x_rm_bytes size mismatch: expected {}, got {}", CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_BYTE_LEN * new_dci_count, x_rm_bytes.layout().dimensions()[0]);
+         }
+         for(int dci_idx = current_dci; dci_idx < cumulative_dci; dci_idx++)
+         {
+             for(int byte_idx = 0; byte_idx < CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_BYTE_LEN; byte_idx++)
+             {
+                 x_input_data[0](dci_idx * CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_BYTE_LEN + byte_idx) =  x_rm_bytes((dci_idx-current_dci) * CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_BYTE_LEN + byte_idx);
+             }
+         }
+    
+         cuphy::typed_tensor<CUPHY_R_32U, cuphy::pinned_alloc> c_ints = cuphy::typed_tensor_from_dataset<CUPHY_R_32U, cuphy::pinned_alloc>(fInput.open_dataset("c_scram_ints"));
+         if(c_ints.layout().dimensions()[0] != CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_WORD_LEN * new_dci_count)
+         {
+             NVLOGF_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT, "c_scram_ints size mismatch: expected {}, got {}", CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_WORD_LEN * new_dci_count, c_ints.layout().dimensions()[0]);
+         }
+         for(int dci_idx = current_dci; dci_idx < cumulative_dci; dci_idx++)
+         {
+             for(int int_idx = 0; int_idx < CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_WORD_LEN; int_idx++)
+             {
+                 c_input_data[0](dci_idx * CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_WORD_LEN + int_idx) =  c_ints((dci_idx-current_dci) * CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_WORD_LEN + int_idx);
+             }
+         }
      }
 
      //Update p pointers

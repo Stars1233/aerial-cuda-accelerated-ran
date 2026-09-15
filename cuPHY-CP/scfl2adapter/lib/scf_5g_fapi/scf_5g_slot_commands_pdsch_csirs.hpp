@@ -40,8 +40,15 @@ namespace scf_5g_fapi {
      * @param slot The slot information, including SFN, slot, and tick
      * @param cell_index The cell index
      * @param pm_map The PM map
+     * @param[in] pm_enabled Whether precoding matrix (PM) is enabled
+     * @param[in] bf_enabled Whether beamforming is enabled
+     * @param[in] num_dl_prb Number of DL PRBs (BWP size)
+     * @param[in] num_dl_ant Number of DL antenna ports from CONFIG.request (nTxAnt)
+     * @param[in] bfwCoeff_mem_info Beamforming weight coefficient memory info
+     * @param[in] mmimo_enabled Whether mMIMO is enabled
+     * @param[in] slot_detail Per-slot TDD detail (nullable)
      * @return true if PDSCH was accepted, false if rejected (e.g. check_bf_pc_params failed). */
-    bool update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_pdsch_pdu_t& cmd, uint8_t testMode, slot_indication& slot, int32_t cell_index, pm_weight_map_t& pm_map, bool pm_enabled, bool bf_enabled, uint16_t num_dl_prb, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t* slot_detail);
+    bool update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_pdsch_pdu_t& cmd, uint8_t testMode, slot_indication& slot, int32_t cell_index, pm_weight_map_t& pm_map, bool pm_enabled, bool bf_enabled, uint16_t num_dl_prb, uint16_t num_dl_ant, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t* slot_detail);
 
     void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_cmd, const scf_fapi_csi_rsi_pdu_t& msg, slot_indication & slotinfo, int32_t cell_index, cuphyCellStatPrm_t cell_params,nv::phy_config_option& config_option, pm_weight_map_t& pm_map, uint32_t csirs_offset, bool pdsch_exist, uint16_t cell_stat_prm_idx, bool mmimo_enabled, nv::slot_detail_t* slot_detail);
 #ifdef ENABLE_L2_SLT_RSP

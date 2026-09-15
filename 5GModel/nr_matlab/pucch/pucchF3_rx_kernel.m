@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -437,13 +437,17 @@ for uciIdx = 1:numUcis
     else
         crcErrorFlag = 0;
         global SimCtrl
+        % Collect polar intermediate buffers (seg1 first, then seg2 below when present)
+        % so the TV generator can emit an `_uciPolarDebug.h5` sidecar.
+        pUciF3{uciOutputIdx}.polarInterBuffers = {};
         if SimCtrl.alg.useNrUCIDecode
             decodedUciSeg1 = nrUCIDecode(descrmLLRSeq1, A_seg1);
         else
             listLength = SimCtrl.alg.listLength;
             [decodedUciSeg1, crcErrorFlag, interBuffers] = uciSegPolarDecode(A_seg1, E_seg1, listLength, descrmLLRSeq1);
+            pUciF3{uciOutputIdx}.polarInterBuffers{end+1} = interBuffers;
         end
-        
+
         % determine detection status
         pUciF3{uciOutputIdx}.HarqDetectionStatus     = 2; % default
         pUciF3{uciOutputIdx}.CsiPart1DetectionStatus = 2; % default
@@ -451,7 +455,7 @@ for uciIdx = 1:numUcis
         if BitLenHarq > 0
             pUciF3{uciOutputIdx}.HarqDetectionStatus = 1 + crcErrorFlag;
         end
-        if BitLenCsiPart1 > 0 
+        if BitLenCsiPart1 > 0
             pUciF3{uciOutputIdx}.CsiPart1DetectionStatus = 1 + crcErrorFlag;
         end
     end
@@ -479,8 +483,12 @@ for uciIdx = 1:numUcis
             else
                 listLength = SimCtrl.alg.listLength;
                 [decodedUciSeg2, crcErrorFlag, interBuffers] = uciSegPolarDecode(A_seg2, E_seg2, listLength, descrmLLRSeq2);
+                if ~isfield(pUciF3{uciOutputIdx}, 'polarInterBuffers')
+                    pUciF3{uciOutputIdx}.polarInterBuffers = {};
+                end
+                pUciF3{uciOutputIdx}.polarInterBuffers{end+1} = interBuffers;
             end
-            
+
             % determine detection status
             pUciF3{uciOutputIdx}.CsiPart2DetectionStatus = 1 + crcErrorFlag;
         end

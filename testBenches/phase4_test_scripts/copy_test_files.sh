@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +30,7 @@ DIR=$PWD
 SRC=""
 DST="$cuBB_SDK/testVectors"
 MAX_CELLS="20"
+CELL_TOPOLOGY=""
 
 UUID=$(${cuBB_SDK}/5GModel/get_uuid.sh)
 
@@ -45,6 +46,7 @@ show_usage() {
   echo "  --src <source_directory>        Specify the full path for the source directory (default: auto-detected using get_uuid.sh)"
   echo "  --dst <destination_directory>   Specify the full path for the destination directory (default: $DST)"
   echo "  --max_cells <max_cells>         Specify the maximum number of cells you will run (default: $MAX_CELLS)"
+  echo "  --cell-topology <topology>      Select a carrier aggregation topology (for example: 1C_2C)"
   echo "  -h, --help                      Show this help message and exit"
   echo
   echo "Examples:"
@@ -66,6 +68,9 @@ show_usage() {
   echo
   echo "  # Copy pattern 67a test vectors with all custom options:"
   echo "  $0 67a --src /data/test_vectors --dst /app/vectors --max_cells 15"
+  echo
+  echo "  # Copy carrier aggregation pattern 52a for a 4-cell + 4-cell topology:"
+  echo "  $0 52a --cell-topology 4C_4C"
   exit 1
 }
 
@@ -104,6 +109,18 @@ while [[ $# -gt 0 ]]; do
             MAX_CELLS="$2"
             shift 2
             ;;
+        --cell-topology=*)
+            CELL_TOPOLOGY="${1#*=}"
+            shift
+            ;;
+        --cell-topology)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for --cell-topology option"
+                exit 1
+            fi
+            CELL_TOPOLOGY="$2"
+            shift 2
+            ;;
         --help|-h)
             show_usage
             exit 0
@@ -123,6 +140,11 @@ done
 if [[ -z "${pattern_name}" ]]; then
   echo "Error: pattern argument missing"
   show_usage
+  exit 1
+fi
+
+if [[ -n "$CELL_TOPOLOGY" && ! "$CELL_TOPOLOGY" =~ ^[1-9][0-9]*C(_[1-9][0-9]*C)*$ ]]; then
+  echo "Error: Invalid cell topology '$CELL_TOPOLOGY'. Expected a value such as 1C_2C."
   exit 1
 fi
 
@@ -173,6 +195,13 @@ copy_files() {
   local current_file=0
   local total_files=0
   local temp_launch_pattern=""
+  local f08_launch_pattern=""
+
+  if [[ -n "$CELL_TOPOLOGY" ]]; then
+    f08_launch_pattern="$SRC/launch_pattern_F08_${CELL_TOPOLOGY}_${pattern_name}.yaml"
+  else
+    f08_launch_pattern="$SRC/launch_pattern_F08_${MAX_CELLS}C_${pattern_name}.yaml"
+  fi
 
   # Check if pattern_name is valid by either:
   # 1. Being in the predefined valid_patterns array, or
@@ -216,22 +245,31 @@ copy_files() {
       echo "Copying test vectors from nrSim launch pattern file launch_pattern_nrSim_$pattern_name.yaml to "$DST"/ ..."
   
   # If not nrSim, check for F08 pattern
-  elif [ -e "$SRC"/launch_pattern_F08_"$MAX_CELLS"C_"$pattern_name".yaml ]; then
-      # Copy the F08 launch pattern YAML file(s) for all cell counts
-      cp "$SRC"/launch_pattern_F08*_"$pattern_name".yaml "$DST"/multi-cell/.
+  elif [ -e "$f08_launch_pattern" ]; then
+      if [[ -n "$CELL_TOPOLOGY" ]]; then
+          # A carrier aggregation topology selects one exact launch pattern.
+          cp "$f08_launch_pattern" "$DST"/multi-cell/.
+      else
+          # Preserve the existing behavior for standard patterns by copying all cell counts.
+          cp "$SRC"/launch_pattern_F08*_"$pattern_name".yaml "$DST"/multi-cell/.
+      fi
 
-      # Get list of TVs from the launch pattern file with the max. cell count
-      total_files_list=`grep -Eo $pattern "$SRC"/launch_pattern_F08_"$MAX_CELLS"C_"$pattern_name".yaml | sort -u`
+      # Get the TVs referenced by the selected launch pattern.
+      total_files_list=`grep -Eo $pattern "$f08_launch_pattern" | sort -u`
       total_files=`echo $total_files_list | wc -w`
       
-      echo "Copying test vectors from F08 launch pattern file launch_pattern_F08_$MAX_CELLS""C_$pattern_name.yaml to "$DST"/ ..."
+      echo "Copying test vectors from F08 launch pattern file $(basename "$f08_launch_pattern") to "$DST"/ ..."
   
   else
       echo "Error: No matching launch pattern file found for pattern '$pattern_name'"
       echo "Looked for:"
       echo "  - launch_pattern_nrSim_$pattern_name.yaml"
-      echo "  - launch_pattern_F08_$MAX_CELLS""C_$pattern_name.yaml"
-      echo "Consider using the --max_cells option with a different value (current value: $MAX_CELLS)."
+      echo "  - $(basename "$f08_launch_pattern")"
+      if [[ -n "$CELL_TOPOLOGY" ]]; then
+          echo "Omit --cell-topology for standard patterns, or verify the topology for a carrier aggregation pattern."
+      else
+          echo "Consider using the --max_cells option with a different value (current value: $MAX_CELLS)."
+      fi
       show_usage
   fi
 

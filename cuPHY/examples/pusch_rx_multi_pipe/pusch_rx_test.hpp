@@ -25,15 +25,29 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <string>
+#include <utility>
 
 #include <chrono>
 #include "pusch_rx.hpp"
 #include "cuphy_channels.hpp"
 #include "datasets.hpp"
+#include "timing.hpp"
 
 
 using Clock     = std::chrono::high_resolution_clock;
 using TimePoint = std::chrono::time_point<Clock>;
+
+/** Optional PUSCH receiver test features configured at construction. */
+struct PuschRxTestOptions
+{
+    /** Enables code-block LDPC decoding instead of transport-block decoding. */
+    uint8_t useCbLdpc{0};
+    /** Selects the early-SCH code-block decoding mode. */
+    cuphyPuschEarlySchCbDecodeMode_t earlySchCbDecodeMode{PUSCH_EARLY_SCH_CB_DECODE_DISABLED};
+    /** Writes timing samples to this JSON path when nonempty. */
+    std::string timingJsonPath{};
+};
 
 class PuschRxTest {
 public:
@@ -62,10 +76,15 @@ public:
     void WaitForCompletion();
     void DisplayMetricsApi(bool debug = false, bool throughput = false, bool bler = true, bool execTime = true);
 
+    /**
+     * Constructs a multi-pipeline PUSCH receiver test.
+     *
+     * @param[in] options Optional code-block decoding and timing-report settings.
+     */
     PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool useCuCtxs, cudaStream_t& delayCuStrm, std::vector<int>& cuStrmPrios,
                 bool& startSyncPt, std::mutex& cvStartSyncPtMutex, std::condition_variable& cvStartSyncPt, std::atomic<std::uint32_t>& atmSyncPtWaitCnt,
                 std::vector<uint32_t>& mpsActiveThrdPcts, uint32_t harq_attempts, uint32_t ldpcLaunchMode, uint32_t nMaxLdpcHetConfigs, bool drmDebug,
-                bool debug, bool debugEqualizer, bool useGreenCtx, uint8_t nMaxTbPerNode);
+                bool debug, bool debugEqualizer, bool useGreenCtx, uint8_t nMaxTbPerNode, uint8_t openRanFunctionalSplitMode, uint8_t kernelSelMode, uint8_t uciKernelSelMode, uint32_t delayUs, uint32_t subSlotDelayUs, PuschRxTestOptions options = {});
     PuschRxTest(PuschRxTest const&) = delete;
     PuschRxTest& operator=(PuschRxTest const&) = delete;
     ~PuschRxTest();
@@ -76,7 +95,10 @@ private:
     void SpawnPipelineWrkrThrds(const std::string& trtYamlInput, const cuphy::cudaGreenContext& greenCtx);
     void runTest(uint32_t instIdx, uint32_t transmission, uint32_t iterIdx, cuphy::pusch_rx &puschRxPipe, StaticApiDataset &staticApiDataset, DynApiDataset &dynApiDataset);
 
-    void DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t nBytes, bool debug = false, bool throughput = true, bool execTime = true);
+    /** Records and optionally displays one pipeline timing sample. */
+    void DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t transmissionIdx, uint32_t nBytes, bool debug = false, bool throughput = true, bool execTime = true);
+    /** Writes accumulated timing samples in the configured JSON format. */
+    void WriteTimingJson() const;
 
     std::string                               m_name;
     std::vector<std::vector<std::string>>     m_inputFileNameVec;
@@ -109,6 +131,8 @@ private:
     cuphyPuschLdpcKernelLaunch_t m_ldpcLaunchMode;
     uint32_t m_nMaxLdpcHetConfigs;
     uint8_t  m_nMaxTbPerNode   = 1;
+    uint8_t  m_useCbLdpc       = 0;
+    cuphyPuschEarlySchCbDecodeMode_t m_earlySchCbDecodeMode = PUSCH_EARLY_SCH_CB_DECODE_DISABLED;
 
     bool     m_debug           = false;
     bool     m_enableNvProf    = false;
@@ -132,6 +156,12 @@ private:
     
     std::vector<cuphy::buffer<float, cuphy::device_alloc>> m_foCompensationBuffer;
 
+    struct TimingSeriesRecord
+    {
+        cuphy::examples::timing::SampleSeries              series;  ///< Recorded samples for one timing metric.
+        std::vector<std::pair<std::string, std::string>>   tags;    ///< Stable tags associated with @ref series.
+    };
+
     template <typename T, typename unit>
     using duration = std::chrono::duration<T, unit>;
     
@@ -147,6 +177,16 @@ private:
     std::vector<std::vector<std::array<float, PUSCH_RUN_MAX_PHASES>>> m_elapsedEvtTimeUsRun;
     std::vector<std::vector<std::array<float, PUSCH_SETUP_MAX_PHASES>>> m_elapsedTimesUsSetup;
     std::vector<std::vector<std::array<float, PUSCH_RUN_MAX_PHASES>>> m_elapsedTimesUsRun;
+    
+    // for O-RAN functional split mode
+    std::uint8_t m_openRanFunctionalSplitMode{};
+    std::uint8_t m_kernelSelMode{};
+    std::uint8_t m_uciKernelSelMode{};
+    std::uint32_t m_delayUs{};
+    std::uint32_t m_subSlotDelayUs{};
+
+    std::vector<std::vector<TimingSeriesRecord>> m_timingSeriesRecords;
+    std::string m_timingJsonPath;
 
     // For debug
     std::vector<TimePoint> m_dbgStartTimePt;
@@ -155,7 +195,7 @@ private:
     std::unique_ptr<hdf5hpp::hdf5_file> m_debugFile;
 };
 
-void DisplayBler(EvalDataset& evalDataset, DynApiDataset const& dynApiDataset, uint32_t instIdx = 0, bool debug = false, bool drmDebug = false);
+void DisplayBler(EvalDataset& evalDataset, StaticApiDataset const& staticApiDataset, DynApiDataset const& dynApiDataset, uint32_t instIdx = 0, bool debug = false, bool drmDebug = false);
 
 
 

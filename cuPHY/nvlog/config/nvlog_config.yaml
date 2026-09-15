@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,7 @@
 # log files stored at /tmp directory (default)
 # log file path can be customized using environment variable $AERIAL_LOG_PATH
 # Log levels: 0 - NONE, 1 - FATAL, 2 - ERROR, 3 - CONSOLE, 4 - WARNING, 5 - INFO, 6 - DEBUG, 7 - VERBOSE
-aerial_sdk_version: 26-1-cubb
+aerial_sdk_version: 26-2-cubb
 nvlog:
   shm_log_level: 4 # SHM log level
   max_file_size_bytes: 50000000000 # Size in bytes The rotating log files in /tmp (default)
@@ -71,6 +71,7 @@ nvlog:
     - 59: "PHY"
     - 60: "MAC"
     - 61: "NVIPC.PCAP"
+    - 62: "NVIPC.TESTMEMCPY"
 
     - 80: "UTIL"      # aerial_utils
     - 81: "UTIL.MEMFOOT"
@@ -166,6 +167,10 @@ nvlog:
       #shm_level: 5
     - 312: "L2A.TICK_TIMES"
       #shm_level: 5
+    - 313: "L2A.DL_CHANNELS"
+      #shm_level: 6
+    - 314: "L2A.UL_CHANNELS"
+      #shm_level: 6
 
     - 330: "SCF"        # scfl2adapter
     - 331: "SCF.MAC"
@@ -269,6 +274,8 @@ nvlog:
     - 654: "FHGEN.ORAN_SLOT_ITER"
 
     - 700: "COMP"       # compression_decompression
+    - 701: "COMP.QAMTEST"
+    - 702: "COMP.MODTEST"
 
     - 800: "OAM"              # cuphyoam
     - 801: "OAM.YMMGR"        # cuphyoam YANG Model Manager

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include "cuphy_hdf5.hpp"
 #include "cuphy.hpp"
 #include "datasets.hpp"
+#include "polar_decoder/polar_cw_tree_layout.hpp"
 
 #include <cstring>
 #include <iostream>
@@ -96,7 +97,7 @@ int main(int argc, char* argv[])
 
         size_t max_PolUciSegPrms_mem = sizeof(cuphyPolarUciSegPrm_t) * CUPHY_MAX_N_POL_UCI_SEGS;
         size_t max_N                 = 1024;
-        size_t max_cwTreeTypes_mem   = sizeof(uint8_t) * (2 * max_N) * CUPHY_MAX_N_POL_UCI_SEGS;
+        size_t max_cwTreeTypes_mem   = cuphy::polar::PolarCwTreeLayout::sizeBytes(max_N) * CUPHY_MAX_N_POL_UCI_SEGS;
         size_t max_mem               = max_PolUciSegPrms_mem + max_cwTreeTypes_mem;
 
         cuphy::linear_alloc<128, cuphy::device_alloc> linearAlloc(max_mem);
@@ -128,7 +129,7 @@ int main(int argc, char* argv[])
         for(uint16_t segIdx = 0; segIdx < nPolUciSegs; ++segIdx)
         {
             uint16_t N_cw              = pPolUciSegPrmsCpu[segIdx].N_cw;
-            cwTreeTypesAddrVec[segIdx] = static_cast<uint8_t*>(linearAlloc.alloc(2 * N_cw));
+            cwTreeTypesAddrVec[segIdx] = static_cast<uint8_t*>(linearAlloc.alloc(cuphy::polar::PolarCwTreeLayout::sizeBytes(N_cw)));
         }
 
         //------------------------------------------------------------------

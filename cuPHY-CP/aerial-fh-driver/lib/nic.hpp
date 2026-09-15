@@ -135,6 +135,12 @@ public:
     uint16_t       get_mtu() const;
 
     /**
+     * Number of DL flows used for GPU comm DOCA TX ring sizing (capped by kMaxFlows; see set_flow_comm_buf).
+     * @return Number of downstream flows
+     */
+    [[nodiscard]] int get_num_dl_flows() const;
+
+    /**
      * Get next available flow index
      * @return Flow index for flow steering
      */
@@ -157,6 +163,12 @@ public:
      * @return Pointer to DPDK mempool for TX
      */
     rte_mempool*   get_cpu_tx_mbuf_pool() const;
+
+    /**
+     * Get CPU C-plane mbuf memory pool (no ext_shinfo, standard IOVA)
+     * @return Pointer to DPDK mempool, or nullptr if not created
+     */
+    [[nodiscard]] rte_mempool*   get_cpu_cplane_mbuf_pool() const;
 
     /**
      * Get RX mbuf memory pool
@@ -375,6 +387,7 @@ protected:
     QueueManager     queue_manager_;                                 //!< TX/RX queue manager
     MempoolUnique    cpu_mbuf_pool_{nullptr, &rte_mempool_free};     //!< CPU mbuf memory pool
     MempoolUnique    cpu_tx_mbuf_pool_{nullptr, &rte_mempool_free};  //!< CPU TX mbuf memory pool
+    MempoolUnique    cpu_cplane_mbuf_pool_{nullptr, &rte_mempool_free}; //!< CPU C-plane mbuf pool (no ext_shinfo)
     GpuMempoolUnique gpu_mbuf_pool_;                                 //!< GPU mbuf memory pool
     GpuMempoolUnique cpu_pinned_mbuf_pool_;                          //!< CPU-pinned mbuf memory pool
     MempoolUnique    tx_request_pool_{nullptr, &rte_mempool_free};   //!< TX request pool (U-plane)
@@ -383,6 +396,9 @@ protected:
     struct doca_tx_buf flow_tx_buf;   //!< Flow TX buffer
     size_t packet_size_rnd;           //!< Rounded packet size
     int num_packets;                  //!< Number of packets
+    //!< Derived from FronthaulInfo::max_dl_antenna_ports; duplicated here because Nic owns
+    //!< buffer allocation and GpuComm queries it per-launch for PacketCopyParams::num_dl_flows_cap.
+    int num_dl_flows_{kMaxFlows};
 
     // Initialization and configuration methods
     void doca_probe_device();                      //!< Probe for DOCA device
@@ -395,6 +411,7 @@ protected:
     void setup_tx_queues_gpu();                    //!< Setup GPU-accelerated TX queues
     void setup_rx_queues();                        //!< Setup RX queues
     void create_cpu_mbuf_pool();                   //!< Create CPU mbuf memory pool
+    void create_cpu_cplane_mbuf_pool();            //!< Create CPU C-plane mbuf pool (no ext_shinfo)
     void create_gpu_mbuf_pool();                   //!< Create GPU mbuf memory pool
     void create_cpu_pinned_mbuf_pool();            //!< Create CPU-pinned mbuf memory pool
     void create_tx_request_uplane_pool();          //!< Create TX request pool for U-plane

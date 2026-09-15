@@ -25,10 +25,30 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${AERIAL_POSTPROC_VENV:-$HOME/.aerial_postproc_venv}"
 
+# Pinned dependencies require Python 3.8–3.10 (matches CI/CD containers on Ubuntu 22.04).
+# Override with: PYTHON=python3.10 ./venv_create.sh
+if [ -z "$PYTHON" ]; then
+    for candidate in python3.10 python3.9 python3.8; do
+        if which "$candidate" >/dev/null 2>&1; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$PYTHON" ]; then
+    echo "ERROR: No compatible Python (3.8–3.10) found on PATH."
+    echo "  macOS:         brew install python@3.10"
+    echo "  Ubuntu/Debian: sudo apt install python3.10"
+    echo "  Or specify directly: PYTHON=python3.10 $0"
+    exit 1
+fi
+
+echo "Using $PYTHON ($($PYTHON --version))"
 echo "Creating aerial_postproc virtual environment at: $VENV_DIR"
 
 # Create the virtual environment
-python3 -m venv "$VENV_DIR"
+"$PYTHON" -m venv "$VENV_DIR"
 
 # Upgrade pip
 "$VENV_DIR/bin/pip" install --upgrade pip

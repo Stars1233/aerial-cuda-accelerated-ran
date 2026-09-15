@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -222,8 +222,9 @@ int64_t run_duplex_tasks(void* (*send_func)(void*), void* (*recv_func)(void*), v
         task_info.send_threads[i].count = total_count / task_info.send_threads_num;
         task_info.send_threads[i].cpu_core = task_info.cpu_cores[i];
 
-        // Thread name length has to be <= 15 characters
-        snprintf(task_info.send_threads[i].name, 16, "task_send_%02d", i);
+        // Thread name length has to be <= 15 characters; i % 10000 keeps
+        // the suffix to at most 4 digits, well within any realistic core count.
+        snprintf(task_info.send_threads[i].name, 16, "task_send_%d", i % 10000);
     }
     if (task_info.send_threads_num > 0) {
         task_info.send_threads[0].count += total_count % task_info.send_threads_num;
@@ -237,8 +238,9 @@ int64_t run_duplex_tasks(void* (*send_func)(void*), void* (*recv_func)(void*), v
         task_info.recv_threads[i].count = total_count / task_info.recv_threads_num;
         task_info.recv_threads[i].cpu_core = task_info.cpu_cores[send_threads_num + i];
 
-        // Thread name length has to be <= 15 characters
-        snprintf(task_info.recv_threads[i].name, 16, "task_recv_%02d", i);
+        // Thread name length has to be <= 15 characters; i % 10000 keeps
+        // the suffix to at most 4 digits, well within any realistic core count.
+        snprintf(task_info.recv_threads[i].name, 16, "task_recv_%d", i % 10000);
     }
     if (task_info.recv_threads_num > 0) {
         task_info.recv_threads[0].count += total_count % task_info.recv_threads_num;

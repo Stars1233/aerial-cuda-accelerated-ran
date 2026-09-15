@@ -191,6 +191,6 @@ class SeparablePuschRx(PuschRxPipeline[PuschConfig, Array]):
             tb_crcs = [crc.get(order='F') for crc in tb_crcs]
 
         # To comply with the API.
-        tb_crcs = np.concatenate(tb_crcs)
+        tb_crcs_arr = np.concatenate(tb_crcs)
 
-        return tb_crcs, tbs  # type: ignore
+        return tb_crcs_arr, tbs

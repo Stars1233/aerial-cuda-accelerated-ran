@@ -61,6 +61,7 @@ void RU_Emulator::set_default_configs()
     opt_pusch_enabled = RE_ENABLED;
     opt_dl_enabled = RE_ENABLED;
     opt_dlc_tb = RE_DISABLED;
+    opt_prb_dup_check = RE_DISABLED;
     opt_mod_comp_enabled = RE_DISABLED;
     opt_non_mod_comp_enabled = RE_DISABLED;
 
@@ -414,6 +415,7 @@ void RU_Emulator::parse_yaml(std::string yaml_file)
     try_yaml_assign_int(root, YAML_SRS_ENABLED, opt_srs_enabled);
     try_yaml_assign_int(root, YAML_DL_ENABLED, opt_dl_enabled);
     try_yaml_assign_int(root, YAML_DLC_TB, opt_dlc_tb);
+    try_yaml_assign_int(root, YAML_PRB_DUP_CHECK, opt_prb_dup_check);
     try_yaml_assign_int(root, YAML_FOREVER, opt_forever);
 
     try_yaml_assign_int(root, YAML_LOW_PRIORITY_CORE, opt_low_priority_core);

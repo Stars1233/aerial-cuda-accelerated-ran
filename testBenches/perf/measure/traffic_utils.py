@@ -65,6 +65,42 @@ def drop_minus_one_overrides(node: Any) -> Any:
     return node
 
 
+_PER_CELL_LATENCY_KEYS = ("delay_us", "sub_slot_delay_us")
+
+
+def apply_per_cell_latency(overrides: dict[str, Any], cell_counts: dict[str, int]) -> None:
+    """Scale surviving delay overrides by each channel's own cell count, in place.
+
+    Args:
+        overrides: Pruned override_test_vectors tree mapping channel names to
+            per-channel override dicts (e.g. ``{"PUCCH": {"delay_us": 10}}``).
+            Only the keys in ``_PER_CELL_LATENCY_KEYS`` of channels listed in
+            ``cell_counts`` are touched; non-numeric or negative values are
+            left as-is.
+        cell_counts: Channel name -> that channel's configured cell count
+            (e.g. ``{"PUSCH": 4, "PDSCH": 4}``). A channel with 0 cells
+            leaves its delays unscaled (never multiply by 0).
+
+    Returns:
+        None. ``overrides`` is mutated in place.
+
+    Examples:
+        >>> data = {"PUSCH": {"delay_us": 10}, "PDSCH": {"delay_us": 5}}
+        >>> apply_per_cell_latency(data, {"PUSCH": 2, "PDSCH": 4})
+        >>> data["PUSCH"]["delay_us"], data["PDSCH"]["delay_us"]
+        (20, 20)
+    """
+    for channel, cells in cell_counts.items():
+        section = overrides.get(channel)
+        if not isinstance(section, dict) or cells <= 0:
+            continue
+        for key in _PER_CELL_LATENCY_KEYS:
+            delay = section.get(key)
+            if not isinstance(delay, (int, float)) or isinstance(delay, bool) or delay < 0:
+                continue
+            section[key] = delay * cells
+
+
 def is_truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -77,15 +113,16 @@ def is_truthy(value: Any) -> bool:
 
 def load_tdd_yaml_overrides(
     yaml_path: str | None, logger: logging.Logger
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
-    """Load optional TDD YAML overrides for priorities/start_delay/tv_overrides/cumac_options."""
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """Load optional TDD YAML overrides for priorities/start_delay/tv_overrides/cumac_options/green_context_sm_alloc."""
     priorities = None
     start_delay = None
     tv_overrides = None
     cumac_options = None
+    gc_sm_alloc = None
 
     if not yaml_path:
-        return priorities, start_delay, tv_overrides, cumac_options
+        return priorities, start_delay, tv_overrides, cumac_options, gc_sm_alloc
 
     try:
         with open(yaml_path, "r", encoding="utf-8") as f:
@@ -110,6 +147,11 @@ def load_tdd_yaml_overrides(
                 cumac_options = ycfg["cumac_options"]
             elif isinstance(ycfg.get("config"), dict) and isinstance(ycfg["config"].get("cumac_options"), dict):
                 cumac_options = ycfg["config"]["cumac_options"]
+
+            if isinstance(ycfg.get("green_context_sm_alloc"), dict):
+                gc_sm_alloc = ycfg["green_context_sm_alloc"]
+            elif isinstance(ycfg.get("config"), dict) and isinstance(ycfg["config"].get("green_context_sm_alloc"), dict):
+                gc_sm_alloc = ycfg["config"]["green_context_sm_alloc"]
     except (yaml.YAMLError, FileNotFoundError) as e:
         logger.warning(
             "YAML config %r failed to load: %s; falling back to JSON priorities.",
@@ -125,5 +167,5 @@ def load_tdd_yaml_overrides(
             exc_info=False,
         )
 
-    return priorities, start_delay, tv_overrides, cumac_options
+    return priorities, start_delay, tv_overrides, cumac_options, gc_sm_alloc
 

@@ -106,6 +106,11 @@ test_mac_configs::test_mac_configs(yaml::node config_node) :
 
     const bool has_dummy_tti_node = config_node.has_key("enable_dummy_tti");
     is_dummy_tti_enabled = has_dummy_tti_node ? (config_node["enable_dummy_tti"].as<int>() != 0) : false;
+    enable_empty_slot_resp = config_node.has_key("enable_empty_slot_resp") ? config_node["enable_empty_slot_resp"].as<int>() : 0;
+    if (enable_empty_slot_resp != 0 && enable_empty_slot_resp != 1)
+    {
+        NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Invalid config: enable_empty_slot_resp = {} (must be 0 or 1)", enable_empty_slot_resp);
+    }
 
     oam_cell_ctrl_cmd = config_node["oam_cell_ctrl_cmd"].as<int>();
 

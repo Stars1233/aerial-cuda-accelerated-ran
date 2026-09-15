@@ -16,7 +16,7 @@
 # limitations under the License.
 
 if [ ! -v AERIAL_VERSION_TAG ]; then
-   AERIAL_VERSION_TAG="26-1-cubb"
+   AERIAL_VERSION_TAG="26-2-cubb"
 fi
 
 if [ ! -v AERIAL_REPO ]; then

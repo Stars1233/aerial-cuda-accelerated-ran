@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,14 +18,18 @@
 #ifndef CUMAC_TASK_HPP_
 #define CUMAC_TASK_HPP_
 
+#include <atomic>
 #include <cstdint>
+#include <cstddef>
 #include <semaphore.h>
+#include <vector>
 
 #include "cumac_app.hpp"
 #include "cumac_cp_tv.hpp"
 #include "cumac.h"
 #include "api.h"
 #include "cumac_msg.h"
+#include "muMimoUserPairing/muMimoUserPairing.cuh"
 
 #include "nv_phy_mac_transport.hpp"
 
@@ -35,25 +39,64 @@ static constexpr uint32_t DBG_OPT_PRINT_CUMAC_BUF{0x1};
 static constexpr uint32_t DBG_OPT_PRINT_NVIPC_BUF{0x2}; 
 //! Debug option: Compare group test vector buffer
 static constexpr uint32_t DBG_OPT_COMPARE_GROUP_TV_BUF{0x4};
+//! Debug option: Dump MU UE-pair GPU buffers (chan_est, snr, chan_orth) to HDF5 per slot
+static constexpr uint32_t DBG_OPT_DUMP_UE_PAIR_H5{0x8};
 //! Debug option: Workaround to copy group test vector
 static constexpr uint32_t DBG_OPT_WAR_COPY_GROUP_TV{0x80};
 
 //! Maximum buffer size for cuMAC task data (1 MB)
 static constexpr std::size_t CUMAC_TASK_BUF_MAX_SIZE{1024 * 1024};
 //! Maximum buffer size for debug logging (10 MB)
-static constexpr std::size_t CUMAC_TASK_DEBUG_BUF_MAX_SIZE{1024 * 1024 * 10};
+static constexpr std::size_t CUMAC_TASK_DEBUG_BUF_MAX_SIZE{1024 * 1024 * 100};
 
 class cumac_cp_handler;
+class cumac_task;
+
+/**
+ * Orders GPU-side task processing in enqueue FIFO across multiple worker threads.
+ *
+ * Maintains one POSIX semaphore per worker thread laid out in a ring. Each enqueued
+ * task is assigned the current and next semaphore for the sequence; workers call
+ * sem_wait(current) before setup and sem_post(next) after GPU work completes so only
+ * one ordered slot uses shared GPU resources at a time while workers can still dequeue
+ * in any order.
+ */
+class order_sem
+{
+public:
+    /**
+     * @param num_worker_threads Number of worker threads (and ring semaphores); if 0, uses 1.
+     */
+    explicit order_sem(std::size_t num_worker_threads);
+
+    ~order_sem();
+
+    order_sem(const order_sem&)            = delete;
+    order_sem& operator=(const order_sem&) = delete;
+
+    /**
+     * Set cumac_task ordering semaphores for the next enqueue. No-op (nullptrs) when
+     * slot_concurrent_enable is set on the task or when this object has no semaphores.
+     */
+    void assign_for_enqueue(cumac_task& task);
+
+    std::size_t chain_depth() const noexcept { return sems_.size(); }
+
+private:
+    std::vector<sem_t> sems_{};
+    std::atomic<uint64_t> next_seq_{0};
+};
 
 /**
  * Cell descriptor structure
  *
  * Contains per-cell buffer pointers and offsets for cuMAC processing
  */
-typedef struct
+typedef struct _cell_desc
 {
     uint8_t *home{}; //!< Pointer to cell's home buffer in GPU memory
     cumac_tti_req_buf_offsets_t offsets{}; //!< Buffer offsets for TTI request data
+    uint32_t muUeGrpReqCopyLen{}; //!< Bytes valid at offsets.muUeGrpReqInfo (<= per-cell stride) for group-buf scatter
 } cell_desc_t;
 
 /**
@@ -61,13 +104,14 @@ typedef struct
  *
  * Stores group-level parameters and scheduling solutions for GPU processing
  */
-typedef struct
+typedef struct _cumac_task_info
 {
     cumac::cumacCellGrpUeStatus ueStatus{}; //!< UE status for cell group
     cumac::cumacSchdSol schdSol{}; //!< Scheduling solution for cell group
     cumac::cumacCellGrpPrms grpPrms{}; //!< Cell group parameters
     cumac_buf_num_t data_num{}; //!< Data buffer element counts
     cumac_pfm_cell_info_t *pfmCellInfo{}; //!< PFM sorting input buffer
+    cumac_muUeGrp_req_info_t *muUeGrpInfo{}; //!< MU UE group input buffer
 } cumac_task_info_t;
 
 /**
@@ -179,8 +223,15 @@ public:
     //! cuMAC task bitmask: b0 - multiCellUeSelection; b1 - multiCellScheduler; b2 - multiCellLayerSel; b3 - mcsSelectionLUT
     uint32_t taskBitMask{};
 
+    //! Module-level bitmask set from CONFIG.request: controls which modules are initialized (bits 0-3 = 4T4R, bit 4 = PFM SORT, bit 5 = MU UE GRP)
+    uint32_t module_bitmask{CUMAC_CP_TASK_MASK_DEFAULT};
+
     uint32_t run_in_cpu{}; //!< Flag: 1 to run in CPU, 0 to run in GPU
     uint32_t slot_concurrent_enable{}; //!< Flag: Enable concurrent processing of multiple slots
+
+    //! When slot_concurrent_enable==0: assigned by order_sem at enqueue; setup waits, callback posts.
+    sem_t* order_wait_sem{};
+    sem_t* order_post_sem{};
 
     uint32_t task_id{}; //!< Unique task instance identifier
     uint32_t cell_num{}; //!< Number of cells in this task
@@ -283,6 +334,13 @@ public:
     cumac::pfmSortTask pfmSortTask{}; //!< PFM sorting task structure
     cumac_pfm_cell_info_t *pfmCellInfo{}; //!< PFM sorting input buffer
     cumac_pfm_output_cell_info_t *output_pfmSortSol{}; //!< PFM sorting output buffer (host-pinned memory)
+
+    //! MU-MIMO UE grouping
+    cumac::muMimoUserPairing* muMimoUserPairingGpu{}; //!< GPU MU-MIMO UE grouping module
+    cumac_muUeGrp_req_info_t *muUeGrpInfo{}; //!< MU-MIMO UE grouping input buffer (GPU memory)
+    cumac_muUeGrp_resp_info_t *muUeGrpSol{}; //!< MU-MIMO UE grouping output buffer (GPU memory)
+    cumac_muUeGrp_resp_info_t *output_muUeGrpSol{}; //!< MU-MIMO UE grouping output buffer (host-pinned memory)
+    uint16_t max_num_srs_info{}; //!< Maximum number of SRS UEs per slot per cell
 
     cumac_task_type_t task_type{}; //!< Task type identifier
     cudaStream_t strm{}; //!< CUDA stream for async operations

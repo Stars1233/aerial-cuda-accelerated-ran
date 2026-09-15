@@ -1,0 +1,168 @@
+---
+Checks: "*,
+        -abseil-*,
+        -altera-*,
+        -android-*,
+        -fuchsia-*,
+        -google-*,
+        -llvm*,
+        -modernize-use-trailing-return-type,
+        -zircon-*,
+        -readability-else-after-return,
+        -readability-static-accessed-through-instance,
+        -readability-avoid-const-params-in-decls,
+        -cppcoreguidelines-non-private-member-variables-in-classes,
+        -misc-non-private-member-variables-in-classes,
+        -misc-no-recursion,
+        -misc-use-anonymous-namespace,
+        -misc-use-internal-linkage,
+        -misc-include-cleaner,
+        -performance-enum-size,
+        -readability-identifier-length,
+        -boost-use-ranges,
+        -bugprone-implicit-widening-of-multiplication-result"
+# bugprone-implicit-widening-of-multiplication-result is disabled due to a clang-tidy crash
+# (LLVM 18.x) when processing quill's bundled fmt headers. Fixed in LLVM 19+.
+# See: https://github.com/llvm/llvm-project/issues/89515
+WarningsAsErrors: '*'
+HeaderFilterRegex: '^.*/aerial_sdk/(aerial_common|cuPHY|cuPHY-CP|cuMAC|cuMAC-CP)/.*\.(h|hpp|hxx)$'
+FormatStyle: none
+
+CheckOptions:
+  - key: readability-identifier-length.IgnoredVariableNames
+    value: 'x|y|z'
+  - key: readability-identifier-length.IgnoredParameterNames
+    value: 'x|y|z'
+  - key: readability-function-cognitive-complexity.IgnoreMacros
+    value: true
+  - key: bugprone-easily-swappable-parameters.MinimumLength
+    value: '3'
+  # =============================================================================
+  # TYPES - PascalCase (Rust-like)
+  # =============================================================================
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.UnionCase
+    value: CamelCase
+  - key: readability-identifier-naming.TypedefCase
+    value: CamelCase
+  - key: readability-identifier-naming.TypeAliasCase
+    value: CamelCase
+  - key: readability-identifier-naming.UsingCase
+    value: CamelCase
+
+  # =============================================================================
+  # FUNCTIONS AND METHODS - snake_case (Rust-like)
+  # =============================================================================
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.MethodCase
+    value: lower_case
+  - key: readability-identifier-naming.ClassMethodCase
+    value: lower_case
+  - key: readability-identifier-naming.StaticMethodCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMethodCase
+    value: lower_case
+  - key: readability-identifier-naming.PublicMethodCase
+    value: lower_case
+  - key: readability-identifier-naming.ProtectedMethodCase
+    value: lower_case
+  - key: readability-identifier-naming.ConstexprFunctionCase
+    value: lower_case
+
+  # =============================================================================
+  # VARIABLES AND MEMBERS - snake_case (Rust-like)
+  # =============================================================================
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.LocalVariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.StaticVariableCase
+    value: lower_case
+  - key: readability-identifier-naming.GlobalVariableCase
+    value: lower_case
+  - key: readability-identifier-naming.MemberCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberCase
+    value: lower_case
+  - key: readability-identifier-naming.PublicMemberCase
+    value: lower_case
+  - key: readability-identifier-naming.ProtectedMemberCase
+    value: lower_case
+
+  # =============================================================================
+  # CONSTANTS - SCREAMING_SNAKE_CASE (Rust-like)
+  # Note: Parameters are NOT treated as constants even when const-qualified
+  # Note: Local const variables use lower_case, only true constants use UPPER_CASE
+  # =============================================================================
+  - key: readability-identifier-naming.ConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.GlobalConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.StaticConstantCase
+    value: lower_case  # Static const variables use lower_case (modern C++ style)
+  - key: readability-identifier-naming.ClassConstantCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.ConstantMemberCase
+    value: lower_case  # Const member variables use lower_case
+  - key: readability-identifier-naming.ConstantMemberSuffix
+    value: '_'
+  - key: readability-identifier-naming.LocalConstantCase
+    value: lower_case  # Local const variables use lower_case
+  - key: readability-identifier-naming.ConstexprVariableCase
+    value: UPPER_CASE
+  - key: readability-identifier-naming.StaticConstexprVariableCase
+    value: UPPER_CASE  # static constexpr variables use UPPER_CASE
+  - key: readability-identifier-naming.EnumConstantCase
+    value: CamelCase  # Rust enum variants are PascalCase
+  - key: readability-identifier-naming.ScopedEnumConstantCase
+    value: CamelCase  # enum class constants should also be CamelCase
+
+  # =============================================================================
+  # PARAMETER CONSTANTS - Allow lowercase for const parameters
+  # =============================================================================
+  - key: readability-identifier-naming.ConstantParameterCase
+    value: lower_case
+
+  # =============================================================================
+  # TEMPLATES AND MODERN C++ - PascalCase
+  # =============================================================================
+  - key: readability-identifier-naming.TemplateParameterCase
+    value: CamelCase
+  - key: readability-identifier-naming.TemplateTemplateParameterCase
+    value: CamelCase
+  - key: readability-identifier-naming.ConceptCase
+    value: CamelCase
+  - key: readability-identifier-naming.ParameterPackCase
+    value: lower_case
+  - key: readability-identifier-naming.ValueTemplateParameterCase
+    value: UPPER_CASE
+
+  # =============================================================================
+  # NAMESPACES - snake_case (Rust-like)
+  # =============================================================================
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: readability-identifier-naming.InlineNamespaceCase
+    value: lower_case
+
+  # =============================================================================
+  # MACROS - SCREAMING_SNAKE_CASE
+  # =============================================================================
+  - key: readability-identifier-naming.MacroCase
+    value: UPPER_CASE
+
+  # =============================================================================
+  # SPECIAL SUFFIXES/PREFIXES
+  # =============================================================================
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: '_'
+  - key: readability-identifier-naming.ProtectedMemberSuffix
+    value: '_'

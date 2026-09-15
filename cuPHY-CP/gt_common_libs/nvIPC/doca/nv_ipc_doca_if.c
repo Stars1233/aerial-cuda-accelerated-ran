@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -306,6 +306,83 @@ static inline packet_info_t* get_rx_packet_info(priv_data_t* priv_data, int pkt_
     return priv_data->rx_pkt_infos + pkt_id;
 }
 
+static inline int nvipc_pkt_has_data_payload(const packet_info_t* pkt)
+{
+    return pkt != NULL
+        && pkt->data_pool > NV_IPC_MEMPOOL_CPU_MSG
+        && pkt->data_pool < NV_IPC_MEMPOOL_NUM
+        && pkt->data_len > 0;
+}
+
+/**
+ * Validate peer-supplied packet_info_t indices and payload sizes against local pools.
+ *
+ * @param[in] priv_data Transport private data (ring length, buffer sizes).
+ * @param[in] pkt       Peer packet metadata to validate.
+ * @param[in] pools     Mempool table indexed by nv_ipc_mempool_id_t.
+ * @param[in] context   Caller tag for error logs.
+ * @return 0 on success, -1 on validation failure.
+ */
+static int validate_packet_info_indices(priv_data_t* priv_data, const packet_info_t* pkt,
+        nv_ipc_mempool_t** pools, const char* context)
+{
+    if(pkt == NULL)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: NULL packet", context);
+        return -1;
+    }
+    if(pkt->msg_index < 0 || pkt->msg_index >= priv_data->ring_len)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid msg_index=%d ring_len=%d",
+                context, pkt->msg_index, priv_data->ring_len);
+        return -1;
+    }
+    if(pkt->msg_len < 0 || pkt->msg_len > priv_data->msg_buf_size)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid msg_len=%d msg_buf_size=%d",
+                context, pkt->msg_len, priv_data->msg_buf_size);
+        return -1;
+    }
+
+    if(pkt->data_len < 0)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_len=%d", context, pkt->data_len);
+        return -1;
+    }
+
+    if(!nvipc_pkt_has_data_payload(pkt))
+    {
+        return 0;
+    }
+
+    if(pools == NULL || pools[pkt->data_pool] == NULL)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: DATA pool %d is not configured", context,
+                pkt->data_pool);
+        return -1;
+    }
+
+    nv_ipc_mempool_t* datapool = pools[pkt->data_pool];
+    int32_t           pool_len = datapool->get_pool_len(datapool);
+    int32_t           buf_size = datapool->get_buf_size(datapool);
+
+    if(pkt->data_index < 0 || pkt->data_index >= pool_len)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_index=%d pool_len=%d", context,
+                pkt->data_index, pool_len);
+        return -1;
+    }
+
+    if(pkt->data_len > buf_size)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_len=%d buf_size=%d", context,
+                pkt->data_len, buf_size);
+        return -1;
+    }
+
+    return 0;
+}
+
 // 1 - started; 0 - stopped
 static int get_forward_started(priv_data_t* priv_data)
 {
@@ -438,7 +515,7 @@ static int dma_read_start(priv_data_t *priv_data, packet_info_t *pkt) {
         pool1->inflight ++;
     }
 
-    if (pkt->data_pool > NV_IPC_MEMPOOL_CPU_MSG && pkt->data_len > 0) {
+    if (nvipc_pkt_has_data_payload(pkt)) {
         atomic_fetch_or(&job1->status_mask, 0x2);
         dma_info_t *pool2 = &priv_data->dma_pools.rx_pools[pkt->data_pool];
         dma_job_t *job2 = pool2->jobs + pkt->data_index;
@@ -480,7 +557,7 @@ static int dma_write_start(priv_data_t *priv_data, packet_info_t *pkt) {
         pool1->inflight ++;
     }
 
-    if (pkt->data_pool > NV_IPC_MEMPOOL_CPU_MSG && pkt->data_len > 0) {
+    if (nvipc_pkt_has_data_payload(pkt)) {
         atomic_fetch_or(&job1->status_mask, 0x2);
         dma_info_t *pool2 = &priv_data->dma_pools.tx_pools[pkt->data_pool];
         dma_job_t *job2 = pool2->jobs + pkt->data_index;
@@ -531,11 +608,18 @@ static int poll_dma_status(dma_info_t* pool, dma_job_t* job_base) {
         NVLOGD(TAG, "%s: DMA DONE: pkt_id=%d pool_id=%d buf_id=%d inflight=%d", __func__,
                 ipc_buf.i32.pkt_id, ipc_buf.i32.pool_id, ipc_buf.i32.buf_id, pool->inflight);
 
+        if (ipc_buf.i32.pool_id < 0 || ipc_buf.i32.pool_id >= NV_IPC_MEMPOOL_NUM) {
+            NVLOGE_NO(TAG, AERIAL_DOCA_API_EVENT, "%s: invalid pool_id=%d buf_id=%d", __func__,
+                    ipc_buf.i32.pool_id, ipc_buf.i32.buf_id);
+            return -1;
+        }
+
         dma_job_t* job = job_base + ipc_buf.i32.pkt_id;
         if (ipc_buf.i32.pool_id == NV_IPC_MEMPOOL_CPU_MSG) {
             pool->inflight --;
             atomic_fetch_and(&job->status_mask, 0x2); // Set bit_0 to 0
-        } else if (ipc_buf.i32.pool_id > NV_IPC_MEMPOOL_CPU_MSG) {
+        } else if (ipc_buf.i32.pool_id > NV_IPC_MEMPOOL_CPU_MSG
+                && ipc_buf.i32.pool_id < NV_IPC_MEMPOOL_NUM) {
             pool->inflight --;
             atomic_fetch_and(&job->status_mask, 0x1); // Set bit_1 to 0
         } else {
@@ -601,6 +685,10 @@ static int doca_poll_tasks(priv_data_t* priv_data)
                 NVLOGD(TAG, "DOCA_CC RECV: type=%d len=%d msg_id=0x%02X msg_index=%d", cmsg->type,
                         cmsg->len, pkt->msg_id, pkt->msg_index);
                 // UL step 4: received CC message, enqueue to rx_msg queue and write an event_fd event
+                if (validate_packet_info_indices(priv_data, pkt, priv_data->rxpools, __func__) != 0)
+                {
+                    break;
+                }
                 packet_info_t * ul_rx_pkt = get_rx_packet_info(priv_data, pkt->msg_index);
                 memcpy(ul_rx_pkt, pkt, sizeof(packet_info_t));
                 enqueue_incoming_packet(priv_data, ul_rx_pkt);
@@ -612,6 +700,10 @@ static int doca_poll_tasks(priv_data_t* priv_data)
                         cmsg->len, pkt->msg_id, pkt->msg_index);
                 // DL step 2: HOST -> DPU IPC message is ready, DPU to start DMA read
 
+                if (validate_packet_info_indices(priv_data, pkt, priv_data->rxpools, __func__) != 0)
+                {
+                    break;
+                }
                 packet_info_t *dl_rx_pkt = get_rx_packet_info(priv_data, pkt->msg_index);
                 memcpy(dl_rx_pkt, pkt, sizeof(packet_info_t));
                 dma_read_start(priv_data, dl_rx_pkt);
@@ -628,8 +720,16 @@ static int doca_poll_tasks(priv_data_t* priv_data)
                 msg.msg_len = pkt->msg_len;
                 msg.data_len = pkt->data_len;
                 msg.data_pool = pkt->data_pool;
+                if (validate_packet_info_indices(priv_data, pkt, priv_data->txpools, __func__) != 0)
+                {
+                    break;
+                }
                 msg.msg_buf = get_ipc_buf_addr(priv_data->txpools[NV_IPC_MEMPOOL_CPU_MSG], pkt->msg_index);
-                msg.data_buf = get_ipc_buf_addr(priv_data->txpools[pkt->data_pool],  pkt->data_index);
+                msg.data_buf = NULL;
+                if(nvipc_pkt_has_data_payload(pkt))
+                {
+                    msg.data_buf = get_ipc_buf_addr(priv_data->txpools[pkt->data_pool], pkt->data_index);
+                }
                 tx_buf_free(priv_data, &msg);
                 break;
             default:
@@ -982,7 +1082,7 @@ static int ipc_rx_recv(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
     IPC_DUMPING_CHECK(priv_data)
 
     int32_t msg_index = priv_data->rx_msg->dequeue(priv_data->rx_msg);
-    if(msg_index < 0 || msg_index > priv_data->ring_len)
+    if(msg_index < 0 || msg_index >= priv_data->ring_len)
     {
         return -1;
     }
@@ -996,8 +1096,19 @@ static int ipc_rx_recv(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
         if(info->data_pool > 0 && info->data_pool < NV_IPC_MEMPOOL_NUM)
         {
             nv_ipc_mempool_t* datapool = priv_data->rxpools[info->data_pool];
-            msg->data_pool             = info->data_pool;
-            msg->data_buf              = datapool->get_addr(datapool, info->data_index);
+            if(datapool == NULL)
+            {
+                // Should never run to here
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_pool %d", __func__, info->data_pool);
+            }
+            msg->data_pool = info->data_pool;
+            msg->data_buf  = datapool->get_addr(datapool, info->data_index);
+            if(msg->data_buf == NULL)
+            {
+                // Should never run to here
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_index %d for pool %d",
+                        __func__, info->data_index, info->data_pool);
+            }
         }
         else
         {
@@ -1126,9 +1237,16 @@ static int recv_doca_comm_connect(nv_ipc_t* ipc, void* buf)
 
     int count = 0;
 
-    size_t size;
+    size_t size = NVIPC_DOCA_CC_MAX_MSG_SIZE;
     if (doca_comm_recv(&priv_data->doca_info, buf, &size) == 0) {
         nv_ipc_msg_t *msg = (nv_ipc_msg_t*) buf;
+        if(msg->msg_len < (int32_t)sizeof(nv_ipc_msg_t)
+                || msg->msg_len > (int32_t)NVIPC_DOCA_CC_MAX_MSG_SIZE)
+        {
+            NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid connect msg_len=%d", __func__,
+                    msg->msg_len);
+            return -1;
+        }
         msg->msg_buf = buf;
 
         struct timespec *p_ts_send = (struct timespec*) ((uint8_t*) msg->msg_buf + msg->msg_len
@@ -1169,17 +1287,16 @@ static int send_doca_comm_connect(nv_ipc_t* ipc, void* buf)
 static int doca_comm_connect(nv_ipc_t* ipc)
 {
     priv_data_t *priv_data = get_private_data(ipc);
-    char buffer[1024];
 
     int count = 0;
-    nv_ipc_msg_t msg;
+    uint8_t connect_buf[NVIPC_DOCA_CC_MAX_MSG_SIZE];
     if (priv_data->primary) {
         NVLOGC(TAG, "local_pci: %s representor_pci: %s wait for connect ...",
                 priv_data->doca_info.dev_pci_str, priv_data->doca_info.rep_pci_str);
 
         while (count < CONNECT_TEST_COUNT) {
-            if (recv_doca_comm_connect(ipc, &msg) == 0) {
-                send_doca_comm_connect(ipc, &msg);
+            if (recv_doca_comm_connect(ipc, connect_buf) == 0) {
+                send_doca_comm_connect(ipc, connect_buf);
             }
             count++;
             NVLOGI(TAG, "received message: count=%d ts_diff=%ld", count, ts_diff);
@@ -1194,8 +1311,8 @@ static int doca_comm_connect(nv_ipc_t* ipc)
         struct timespec start, end;
         while (count < CONNECT_TEST_COUNT) {
             nvlog_gettime_rt(&start);
-            send_doca_comm_connect(ipc, &msg);
-            while (recv_doca_comm_connect(ipc, &msg) != 0) {
+            send_doca_comm_connect(ipc, connect_buf);
+            while (recv_doca_comm_connect(ipc, connect_buf) != 0) {
             }
             count++;
             nvlog_gettime_rt(&end);
@@ -1621,6 +1738,13 @@ static int doca_info_init(nv_ipc_t* ipc, const nv_ipc_config_doca_t* cfg) {
 
 static int debug_get_msg(priv_data_t* priv_data, nv_ipc_msg_t* msg, int msg_index, int tx)
 {
+    if(msg_index < 0 || msg_index >= priv_data->ring_len)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid msg_index=%d ring_len=%d", __func__,
+                msg_index, priv_data->ring_len);
+        return -1;
+    }
+
     nv_ipc_mempool_t** mempools = tx ? priv_data->txpools : priv_data->rxpools;
     nv_ipc_mempool_t* msgpool = mempools[NV_IPC_MEMPOOL_CPU_MSG];
     if((msg->msg_buf = msgpool->get_addr(msgpool, msg_index)) == NULL)
@@ -1636,10 +1760,40 @@ static int debug_get_msg(priv_data_t* priv_data, nv_ipc_msg_t* msg, int msg_inde
     msg->data_len      = info->data_len;
     msg->data_pool     = info->data_pool;
 
-    if(msg->data_pool > 0)
+    if(msg->msg_len < 0 || msg->msg_len > priv_data->msg_buf_size)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid msg_len=%d", __func__, msg->msg_len);
+        return -1;
+    }
+
+    if(msg->data_pool > 0 && msg->data_pool < NV_IPC_MEMPOOL_NUM)
     {
         nv_ipc_mempool_t* datapool = mempools[msg->data_pool];
-        msg->data_buf              = datapool->get_addr(datapool, info->data_index);
+        if(datapool != NULL)
+        {
+            msg->data_buf = datapool->get_addr(datapool, info->data_index);
+            if(msg->data_buf == NULL)
+            {
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_index %d for pool %d",
+                        __func__, info->data_index, msg->data_pool);
+                return -1;
+            }
+            if(msg->data_len < 0 || msg->data_len > datapool->get_buf_size(datapool))
+            {
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_len=%d", __func__,
+                        msg->data_len);
+                return -1;
+            }
+        }
+        else
+        {
+            return -1;
+        }
+    }
+    else
+    {
+        msg->data_pool = NV_IPC_MEMPOOL_CPU_MSG;
+        msg->data_buf  = NULL;
     }
     return 0;
 }
@@ -1649,6 +1803,14 @@ static int debug_dump_queue(priv_data_t *priv_data, array_queue_t *queue, int32_
     char *queue_name = queue->get_name(queue);
     int32_t count = queue->get_count(queue);
     int32_t max_length = queue->get_max_length(queue);
+    if(count < 0)
+    {
+        count = 0;
+    }
+    else if(count > max_length)
+    {
+        count = max_length;
+    }
     int32_t base = -1, counter = 0;
     NVLOGC(TAG, "%s: count=%d max_length=%d", info, count, max_length);
 
@@ -1678,6 +1840,14 @@ static int debug_dump_mempools(priv_data_t *priv_data, nv_ipc_mempool_t *mempool
     char*   queue_name = queue->get_name(queue);
     int32_t count      = queue->get_count(queue);
     int32_t max_length = queue->get_max_length(queue);
+    if(count < 0)
+    {
+        count = 0;
+    }
+    else if(count > max_length)
+    {
+        count = max_length;
+    }
     int32_t base = -1, counter = 0;
 
     NVLOGC(TAG, "%s: mempool_size=%d free_count=%d max_length=%d", info, mempool_size, count, max_length);

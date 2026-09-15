@@ -84,6 +84,7 @@ def generate_thresholds(perf_csvs, requirements_csv, gating_output, warning_outp
     mean_worsts = []
     min_worsts = []
     max_worsts = []
+    kept_indices = []
 
     for idx, row in req_df.iterrows():
         metric = row['metric_name']
@@ -102,15 +103,10 @@ def generate_thresholds(perf_csvs, requirements_csv, gating_output, warning_outp
                 worst_cases.append(worst)
 
         if len(worst_cases) == 0:
-            print(f"WARNING: No valid data for {metric}, keeping original headroom")
-            gating_headrooms.append(row['headroom'])
-            warning_headrooms.append(row['headroom'])
-            mean_worsts.append(np.nan)
-            min_worsts.append(np.nan)
-            max_worsts.append(np.nan)
-            gating_mean_hr_values.append(gating_mean_hr)
-            warning_mean_hr_values.append(warning_mean_hr)
+            print(f"Note: dropping {metric} (no baseline data in perf.csv - channel not scheduled)")
             continue
+
+        kept_indices.append(idx)
 
         mean_worst = np.mean(worst_cases)
         precision = 4 if is_percentage_metric(metric) else 1
@@ -137,6 +133,11 @@ def generate_thresholds(perf_csvs, requirements_csv, gating_output, warning_outp
 
         gating_headrooms.append(g_headroom)
         warning_headrooms.append(w_headroom)
+
+    # Drop metrics with no baseline data (unscheduled channels). Filtering to the
+    # kept rows and resetting the index keeps req_df aligned positionally with the
+    # parallel lists used to build the output frames and the summary print loop.
+    req_df = req_df.loc[kept_indices].reset_index(drop=True)
 
     output_cols = ['metric_name', 'required_value', 'headroom', 'slots', 'mean_worst', 'mean_headroom']
 

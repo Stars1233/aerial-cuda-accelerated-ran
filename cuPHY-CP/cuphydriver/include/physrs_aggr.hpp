@@ -178,6 +178,7 @@ public:
 
 protected:
     cuphy::tensor_device tDataRxInput[UL_SRS_MAX_CELLS_PER_SLOT];                  ///< Input tensor descriptors for received SRS data (per-cell)
+    cuphy::tensor_desc   srs_data_rx_desc[UL_SRS_MAX_CELLS_PER_SLOT];              ///< Per-cell DataRx layout (updated each setup to match srs_prb_stride)
     cuphy::buffer<__half2, cuphy::pinned_alloc> bDataRxSrs;                         ///< Pinned host buffer for raw SRS IQ (GPU->host, gated on DataLake)
     cuphy::buffer<cuphySrsReport_t, cuphy::pinned_alloc> srsReport;                 ///< Pinned host buffer for SRS processing reports (timing, SNR, status)
     cuphy::buffer<cuphySrsChEstToL2_t, cuphy::pinned_alloc> srsChEstToL2;          ///< Pinned host buffer for channel estimation metadata passed to L2

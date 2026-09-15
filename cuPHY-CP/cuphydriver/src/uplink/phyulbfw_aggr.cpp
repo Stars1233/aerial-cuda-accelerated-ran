@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 34) // "DRV.ULBFW"
 
 #include "phychannel.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -50,7 +51,7 @@ PhyUlBfwAggr::PhyUlBfwAggr(
     {
         #if 0
         ulBfwChEstBuffInfo[i] = std::move(cuphy::tensor_device(nullptr, CUPHY_C_32F, CV_NUM_PRBG, 
-                                                        CV_NUM_GNB_ANT,
+                                                        MAX_AP_PER_SLOT_SRS,
                                                         CV_NUM_UE_LAYER, 
                                                         cuphy::tensor_flags::align_tight));
         data_in.pChEstInfo[i].tChEstBuffer.desc = ulBfwChEstBuffInfo[i].desc().handle();
@@ -85,9 +86,10 @@ int PhyUlBfwAggr::createPhyObj()
 
     //TODO : Change the constant values for BFW once available
     stat_params.lambda = 0;
-    stat_params.nMaxGnbAnt = CV_NUM_GNB_ANT;
+    stat_params.nMaxGnbAnt = MAX_AP_PER_SLOT_SRS;
     stat_params.nMaxPrbGrps = slot_command_api::MAX_NUM_PRGS_DBF;
-    stat_params.nMaxTotalLayers = slot_command_api::MAX_PUSCH_UE_GROUPS * CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP;
+    // BFW per-UE-group MIMO-layer cap is static (cuPHY validates against the same value); see bfc.cu.
+    stat_params.nMaxTotalLayers = slot_command_api::MAX_PUSCH_UE_GROUPS * slot_command_api::BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP;
     stat_params.nMaxUeGrps = slot_command_api::MAX_PUSCH_UE_GROUPS;
     stat_params.compressBitwidth = 9;
     stat_params.beta = pdctx->get_bfw_beta_prescaler();
@@ -170,24 +172,26 @@ int PhyUlBfwAggr::setup(std::vector<Cell *>& aggr_cell_list)
         data_in.pChEstInfo[i].nValidPrg         =pparms->dataIn.pChEstInfo[i].nValidPrg;
     }
     dyn_params.pDataIn = &data_in;
-    dyn_params.pDataOut = &pparms->dataOutH;
+    // Under GPU chaining the FH driver DMAs the UL-BFW IQ directly from GPU memory, so cuPHY
+    // must emit the coefficients into the device buffer. All other modes source from host.
+    dyn_params.pDataOut = (pdctx->getFhProxy()->getBfwCPlaneChainingMode() == aerial_fh::BfwCplaneChainingMode::GPU_CHAINING) ? &pparms->dataOutD : &pparms->dataOutH;
     dyn_params.pDynDbg = &ulBfwDynDbgPrms;
     dyn_params.pDynDbg->enableApiLogging=0;
     dyn_params.procModeBmsk=pdctx->getEnableDlCuphyGraphs() ? BFW_PROC_MODE_WITH_GRAPH : BFW_PROC_MODE_NO_GRAPH;
     //TODO : Populate Input and Output buffers
     
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, s_channel));
+    CUDA_DRIVER_CHECK(cuEventRecord(start_setup, s_channel));
     //if(dyn_params_num > 0)
     {
         status = cuphySetupBfwTx(*handle, &dyn_params);
         if(status != CUPHY_STATUS_SUCCESS)
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "{}:cuphySetupBfwTx(): {}",__FUNCTION__, cuphyGetErrorString(status));
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+            CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
             return -1;
         }
     }
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+    CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
     struct slot_command_api::slot_indication* si = aggr_slot_params->si;
     NVLOGD_FMT(TAG, "UL PhyBfwAggr{} SFN {}.{} setup", this_id, si->sfn_, si->slot_);
 
@@ -199,7 +203,7 @@ int PhyUlBfwAggr::run()
     cuphyStatus_t status;
     int ret=0;
     
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, s_channel));
+    CUDA_DRIVER_CHECK(cuEventRecord(start_run, s_channel));
     //if(dyn_params_num > 0)
     if(getSetupStatus() == CH_SETUP_DONE_NO_ERROR)
     {
@@ -213,7 +217,7 @@ int PhyUlBfwAggr::run()
     }
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, s_channel));
     }
     struct slot_command_api::slot_indication* si = aggr_slot_params->si;
     NVLOGD_FMT(TAG, "UL PhyBfwAggr{} SFN {}.{} run", this_id, si->sfn_, si->slot_);
@@ -237,14 +241,14 @@ int PhyUlBfwAggr::validate() {
     {
         NVLOGC_FMT(TAG, "SFN {}.{} Generating H5 Debug ULBFW file {}", aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, std::to_string(id).c_str());
         auto& stream = s_channel;
-        cudaStreamSynchronize(stream);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
         cuphyStatus_t debugStatus = cuphyWriteDbgBufSynchBfw(*(handle.get()), stream);
         if(debugStatus != CUPHY_STATUS_SUCCESS)
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphyWriteDbgBufSynchBfw returned error {}", debugStatus);
             return -1;
         }
-        cudaStreamSynchronize(stream);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
         debugFileH.get()->close();
         debugFileH.reset();
         EXIT_L1(EXIT_FAILURE);

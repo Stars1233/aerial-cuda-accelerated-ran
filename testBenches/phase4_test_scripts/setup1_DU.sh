@@ -28,7 +28,7 @@ cuBB_SDK=$(realpath $SCRIPT_DIR/../..)
 CONFIG_DIR=$cuBB_SDK
 CONFIG_DIR_SET=false
 
-valid_yamls=("F08" "F08_BF3" "F08_CG1" "F08_GL4" "F08_R750" "nrSim_SCF_.+" "nrSim_SCF_CG1_.+")
+valid_yamls=("F08" "F08_BF3" "F08_CG1" "F08_GL4" "F08_MGX1" "F08_R750" "nrSim_SCF_.+" "nrSim_SCF_CG1_.+" "nrSim_SCF_SPRK_.+" "nrSim_SCF_MGX1_.+")
 #ToDo: add 2-port yamls to the list once scripts are extended to support 2-port config
 #valid_yamls=("F08_BF3" "F08_CG1" "F08_CG1_2_PORT" "F08_GL4" "F08_R750" "F08_R750_2_PORT")
 
@@ -37,14 +37,22 @@ if [[ "$(arch)" == "aarch64" ]]; then
         CPU_MODEL=
     fi
     # BlueField models:
-    # * BlueField-2 ==> A72
-    # * BlueField-3 ==> A78
-    if [[ "$CPU_MODEL" == *"A72"* ]]; then
+    # * BlueField-2 ==> Cortex-A72
+    # * BlueField-3 ==> Cortex-A78
+    if [[ "$CPU_MODEL" =~ Cortex-A72([^0-9]|$) ]]; then
         CUPHY_HOST_TYPE="bf2-arm"
-    elif [[ "$CPU_MODEL" == *"A78"* ]]; then
+    elif [[ "$CPU_MODEL" =~ Cortex-A78([^0-9]|$) ]]; then
         CUPHY_HOST_TYPE="_BF3"
     else
-        CUPHY_HOST_TYPE="_CG1"
+        if nvidia-smi | grep -q "NVIDIA RTX PRO 4500"; then
+            CUPHY_HOST_TYPE="_MGX1"
+        elif nvidia-smi | grep -q "NVIDIA L4"; then
+            CUPHY_HOST_TYPE="_GL4" 
+        elif [[ "$(nproc --all)" -lt 32 ]]; then
+            CUPHY_HOST_TYPE="_SPRK"
+        else
+            CUPHY_HOST_TYPE="_CG1"
+        fi
     fi
 else
     NUMA_NODES=$(lscpu | grep "NUMA node(s)" | awk '{print $3}')
@@ -56,10 +64,14 @@ else
 fi
 
 
+# Maximum number of NIC ports supported (must match MAX_NUM_OF_NIC_PORT_SUPPORTED).
+# MGX ARC Pro: up to 3x CX8 NICs × 8 ports/NIC = 24 ports.
+MAX_PORTS=24
+
 #==============================================================
 # Default Values
 #==============================================================
-# Network interface defaults
+# Network interface defaults (supports up to MAX_PORTS)
 DU_ETH_INTERFACE_0="aerial00"
 DU_ETH_INTERFACE_1="aerial01"
 
@@ -70,12 +82,7 @@ RU_HOST_TYPE="_R750"
 MUMIMO="OFF"
 CONTROLLER_MODE=F08$CUPHY_HOST_TYPE
 
-if [[ "$CUPHY_HOST_TYPE" == "_CG1" ]]; then
-    if nvidia-smi | grep -q "NVIDIA L4"; then
-        CONTROLLER_MODE=F08_GL4
-        CUPHY_HOST_TYPE="_GL4" #Override CUPHY_HOST_TYPE for GL4 case
-    fi
-fi
+DU_GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 2>/dev/null)
 
 # Multi-L2 enable status default
 MULTI_L2=false
@@ -93,11 +100,9 @@ show_usage() {
     echo "  --cubb-sdk=PATH                   Set cuBB SDK path"
     echo "                                    Default: auto-detect (../../ from script dir)"
     echo
-    echo "  --du-eth0=INTERFACE               Set first DU network interface name"
-    echo "                                    Default: aerial00"
-    echo
-    echo "  --du-eth1=INTERFACE               Set second DU network interface name"
-    echo "                                    Default: aerial01"
+    echo "  --du-ethN=INTERFACE              Set DU network interface for port N (N=0..$((MAX_PORTS-1)))"
+    echo "                                    Default: aerial00 (N=0), aerial01 (N=1)"
+    echo "                                    e.g. --du-eth0=aerial00 --du-eth1=aerial01 --du-eth2=aerial02"
     echo "  --ru-host-type=TYPE               Set RU host type for core configuration"
     echo "                                    Default: _R750"
     echo
@@ -216,31 +221,33 @@ while [[ $# -gt 0 ]]; do
           cuBB_SDK="$2"
           shift 2
           ;;
-        --du-eth0=*)
-          DU_ETH_INTERFACE_0="${1#*=}"
-          shift
-          ;;
-        --du-eth0)
-          if [[ -z "$2" || "$2" == -* ]]; then
-            echo "Error: Missing value for $1 option"
+        --du-eth[0-9]*)
+          if [[ "$1" =~ ^--du-eth([0-9]+)=(.+)$ ]]; then
+            idx=$((10#${BASH_REMATCH[1]}))
+            if [[ "$idx" -ge "$MAX_PORTS" ]]; then
+              echo "Error: Port index $idx exceeds maximum ($MAX_PORTS)"
+              exit 1
+            fi
+            declare "DU_ETH_INTERFACE_${idx}=${BASH_REMATCH[2]}"
+          elif [[ "$1" =~ ^--du-eth([0-9]+)$ ]]; then
+            idx=$((10#${BASH_REMATCH[1]}))
+            if [[ "$idx" -ge "$MAX_PORTS" ]]; then
+              echo "Error: Port index $idx exceeds maximum ($MAX_PORTS)"
+              exit 1
+            fi
+            if [[ -z "$2" || "$2" == -* ]]; then
+              echo "Error: Missing value for $1 option"
+              show_usage
+              exit 1
+            fi
+            eval "DU_ETH_INTERFACE_${idx}=\"$2\""
+            shift
+          else
+            echo "Error: Malformed option $1. Expected format: --du-ethN=INTERFACE or --du-ethN INTERFACE (N=0..$((MAX_PORTS-1)))"
             show_usage
             exit 1
           fi
-          DU_ETH_INTERFACE_0="$2"
-          shift 2
-          ;;
-        --du-eth1=*)
-          DU_ETH_INTERFACE_1="${1#*=}"
           shift
-          ;;
-        --du-eth1)
-          if [[ -z "$2" || "$2" == -* ]]; then
-            echo "Error: Missing value for $1 option"
-            show_usage
-            exit 1
-          fi
-          DU_ETH_INTERFACE_1="$2"
-          shift 2
           ;;
         --ru-host-type=*)
           RU_HOST_TYPE="${1#*=}"
@@ -274,27 +281,41 @@ fi
 #---------------------------------------------------------------
 # Check network interfaces and gather information
 #---------------------------------------------------------------
-# Check first interface and get info if available
-if [ ! -d "/sys/class/net/${DU_ETH_INTERFACE_0}" ]; then
-    echo "Warning: Network interface ${DU_ETH_INTERFACE_0} not found in /sys/class/net/"
-    echo "         PCIe and MAC address information will not be available for interface 0"
-    DU_PCIE_0=""
-    DU_MAC_ADDRESS_0=""
-else
-    DU_PCIE_0=$(ethtool -i ${DU_ETH_INTERFACE_0} | grep bus-info | awk '{print $2}')
-    DU_MAC_ADDRESS_0=$(cat /sys/class/net/"${DU_ETH_INTERFACE_0}"/address)
-fi
+# Determine number of configured interfaces (highest index + 1)
+DU_NUM_PORTS=2
+for ((i=MAX_PORTS-1; i>=2; i--)); do
+    var_name="DU_ETH_INTERFACE_${i}"
+    if [[ -n "${!var_name}" ]]; then
+        DU_NUM_PORTS=$((i + 1))
+        break
+    fi
+done
 
-# Check second interface and get info if available
-if [ ! -d "/sys/class/net/${DU_ETH_INTERFACE_1}" ]; then
-    echo "Warning: Network interface ${DU_ETH_INTERFACE_1} not found in /sys/class/net/"
-    echo "         PCIe and MAC address information will not be available for interface 1"
-    DU_PCIE_1=""
-    DU_MAC_ADDRESS_1=""
-else
-    DU_PCIE_1=$(ethtool -i ${DU_ETH_INTERFACE_1} | grep bus-info | awk '{print $2}')
-    DU_MAC_ADDRESS_1=$(cat /sys/class/net/"${DU_ETH_INTERFACE_1}"/address)
-fi
+# Validate no gaps in port configuration
+for ((i=0; i<DU_NUM_PORTS; i++)); do
+    var_name="DU_ETH_INTERFACE_${i}"
+    if [[ -z "${!var_name}" ]]; then
+        echo "Error: Port configuration has a gap at index $i. Please configure ports 0..$((DU_NUM_PORTS-1)) contiguously."
+        exit 1
+    fi
+done
+
+# Check each interface and get info
+for ((i=0; i<DU_NUM_PORTS; i++)); do
+    var_name="DU_ETH_INTERFACE_${i}"
+    iface="${!var_name}"
+    if [ ! -d "/sys/class/net/${iface}" ]; then
+        echo "Warning: Network interface ${iface} not found in /sys/class/net/"
+        echo "         PCIe and MAC address information will not be available for interface $i"
+        eval "DU_PCIE_${i}=\"\""
+        eval "DU_MAC_ADDRESS_${i}=\"\""
+    else
+        pcie=$(ethtool -i "${iface}" 2>/dev/null | grep bus-info | awk '{print $2}')
+        mac=$(cat /sys/class/net/"${iface}"/address 2>/dev/null)
+        eval "DU_PCIE_${i}=\"${pcie}\""
+        eval "DU_MAC_ADDRESS_${i}=\"${mac}\""
+    fi
+done
 
 # Check if suffix for cuPHY-controller yaml file name is valid
 valid=false
@@ -311,17 +332,16 @@ if [[ "$valid" == false ]]; then
 fi
 
 #For nrSim cases, we set MUMIMO flag based on the auto-generated cuphycontroller yaml file
-if [[ "$CONTROLLER_MODE" == *nrSim_SCF* ]]; then
-    if [[ "$CONTROLLER_MODE" == *SCF_CG1* ]]; then
-        NRSIM_TC=${CONTROLLER_MODE#*SCF_CG1_}
-    else
-        NRSIM_TC=${CONTROLLER_MODE#*SCF_}
-    fi
+if [[ "$CONTROLLER_MODE" == nrSim_SCF_* ]]; then
+    # CONTROLLER_MODE always looks like nrSim_SCF_$HOST_$NRSIM_TC - strip to last _ to get NRSIM_TC
+    NRSIM_TC=${CONTROLLER_MODE##*_}
+
     echo $NRSIM_TC
     if [[ -v NRSIM_TC ]]; then
         pushd $cuBB_SDK > /dev/null
-	SCRIPT_ARGS="-c $NRSIM_TC"
-	[[ "$CONFIG_DIR_SET" == "true" ]] && SCRIPT_ARGS="$SCRIPT_ARGS -b $CONFIG_DIR"
+        SCRIPT_ARGS="-c $NRSIM_TC"
+        [[ "$CONFIG_DIR_SET" == "true" ]] && SCRIPT_ARGS="$SCRIPT_ARGS -b $CONFIG_DIR"
+        SCRIPT_ARGS="$SCRIPT_ARGS -t cuphycontroller_nrSim_SCF_${CUPHY_HOST_TYPE#_}.yaml -p ${CUPHY_HOST_TYPE#_}"
         ./cubb_scripts/autoconfig/auto_AllConfig.py $SCRIPT_ARGS
         ret=$?
         if [ $ret -ne 0 ]; then
@@ -412,7 +432,12 @@ NUM_DL_WORKERS=$(yq '.cuphydriver_config.workers_dl | length' $CUPHY_YAML)
 echo "NUM_DL_WORKERS from CUPHY YAML: $NUM_DL_WORKERS"
 
 # Write variables to the test_config_summary.sh
-VARS="VARS CUPHY_HOST_TYPE RU_HOST_TYPE CONTROLLER_MODE DU_PCIE_0 DU_PCIE_1 DU_ETH_INTERFACE_0 DU_ETH_INTERFACE_1 DU_MAC_ADDRESS_0 DU_MAC_ADDRESS_1 DU_HYPER_THREADED MUMIMO CUPHY_YAML TESTMAC_YAML L2A_YAML NVLOG_YAML NRSIM_TC DU_SETUP_COMPLETE MULTI_L2 NUM_DL_WORKERS"
+# Build DU port variables dynamically
+DU_PORT_VARS=""
+for ((i=0; i<DU_NUM_PORTS; i++)); do
+    DU_PORT_VARS="$DU_PORT_VARS DU_PCIE_${i} DU_ETH_INTERFACE_${i} DU_MAC_ADDRESS_${i}"
+done
+VARS="VARS CUPHY_HOST_TYPE RU_HOST_TYPE CONTROLLER_MODE${DU_PORT_VARS} DU_NUM_PORTS DU_GPU_NAME DU_HYPER_THREADED MUMIMO CUPHY_YAML TESTMAC_YAML L2A_YAML NVLOG_YAML NRSIM_TC DU_SETUP_COMPLETE MULTI_L2 NUM_DL_WORKERS"
 > "$TEST_CONFIG_FILE"  # Clear the file before writing
 for var in ${VARS}; do
     echo "$var=\"${!var}\"" >> "$TEST_CONFIG_FILE"

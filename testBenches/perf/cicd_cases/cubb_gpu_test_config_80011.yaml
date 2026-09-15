@@ -1,0 +1,200 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Aerial GPU Benchmark CICD case.
+# Case: 80011
+# Long name: perf103_72a_dl200_pusch1250_o00000_eh650
+# Description: 72a full-GPU case with early HARQ enabled and 650 us EH budget.
+# Delta: Adds EH650 to 80001 while keeping both PUSCH and PUCCH cascaded.
+# Defaults:
+#   test_pattern: perf103
+#   lls_split: 72a
+#   dl_offset_us: 200
+#   pusch_budget_us: 1250
+#   offload_digits: o00000
+#   early_harq: eh650
+#   mac: off
+#   pusch_cascaded: true
+#   pucch_cascaded: true
+#
+# Offload digit order: PUSCH, UCI-on-PUSCH, PDSCH, PUCCH, PDCCH.
+# Digit 0 means full GPU/no offload for these cases.
+#
+# The freq/power/target defaults in the config block below are the RTX PRO
+# 4500 operating point -- RTX PRO 4500 is the default GPU for direct
+# measure.py runs. CICD overrides freq/power/target per detected GPU from
+# cicd_cases.json; check these values before running on a different GPU.
+config:
+  usecase: F08                                # Use case for auto-generated config/uc JSON (F08/F09/F14)
+  testbench_folder: /opt/nvidia/cuBB/build.aarch64/testBenches  # Built cubb_gpu_test_bench folder (--cuphy)
+  testvectors_folder: /opt/nvidia/cuBB/testVectors  # testVectors directory (--vector_folder)
+  vector_files:                               # Per-channel test-vector (TV) lists; round-robin per cell index (tv_idx = cell_idx % len)
+    PDSCH:
+    - TVnr_DLMIX_7551_PDSCH_gNB_CUPHY_s0p5.h5
+    PUSCH:
+    - TVnr_ULMIX_8605_PUSCH_gNB_CUPHY_s0p7.h5
+    PRACH:
+    - TVnr_ULMIX_8648_PRACH_gNB_CUPHY_s0p0.h5
+    PDCCH:
+    - TVnr_DLMIX_7578_PDCCH_gNB_CUPHY_s0p2.h5
+    PUCCH:
+    - TVnr_ULMIX_8576_PUCCH_F1_gNB_CUPHY_s0p39.h5
+    CSIRS:
+    - TVnr_DLMIX_7529_CSIRS_gNB_CUPHY_s0p2.h5
+  gpu: 0                                      # GPU index for the run (--gpu)
+  freq: 1610                                  # Target GPU graphics clock MHz (--freq)
+  power: 165                                  # GPU power limit W (--power)
+  target: ["8", "8", "8", "20", "46"]         # SM allocation per isolated sub-context (--target); order: PRACH, PDCCH, PUCCH, PDSCH, PUSCH[, SSB, SRS, MAC]
+  tdd_priorities:                             # Traffic-generator priorities (lower scheduled first); overrides JSON when present
+    PUSCH: 3
+    PUSCH2: 3
+    ULBFW: 3
+    PUCCH: 2
+    PUCCH2: 2
+    PRACH: 2
+    UL_ORDER: 0
+    UL_SRS_ORDER: 0
+    SRS: 3
+    PDSCH: 1
+    DLBFW: 2
+    PDCCH: 1
+    CSIRS: 1
+    GPU_CMN: 0
+    MAC2: 0
+  tdd_pattern: dddsuudddd                     # TDD pattern (--tdd_pattern): dddsu / dddsuudddd / dddsuudddd_8slot / dddsuudddd_mMIMO
+  tdd_slot_config:                            # Per-slot run enable/disable mask keyed by TDD pattern
+    dddsuudddd:
+      PDSCH: [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+      PDCCH: [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+      CSIRS: [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+      PBCH: [0, 0, 0, 0, 1, 1, 1, 0, 0, 0]
+      MAC: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+  start: 20                                   # Minimum cell count to sweep (--start)
+  cap: 20                                     # Maximum cell count to sweep (--cap)
+  step_size: 1                                # Cell-count step when sweeping (--step_size)
+  iterations: 1                               # Averaging iterations per sweep point (--iterations)
+  slots: 40                                   # Iterations per pattern after one setup (--slots); multiple of pattern length
+  delay: 10000                                # Delay-kernel us between setup and run (--delay); 10000 for latency, 0 for power
+  graph: true                                 # CUDA graphs instead of streams (--graph); true = lower latency
+  save_buffers: true                          # Save intermediate buffers (--save_buffers)
+  test: false                                 # Test mode: emit yaml+CLI only, do not run (--test)
+  measure_power: false                        # Power-measurement mode (--measure_power)
+  enable_ref_check: false                     # Reference checks for all channels (--enable_ref_check); skews latency/power, do not combine
+  use_green_contexts: false                   # Green contexts instead of MPS (--use_green_contexts)
+  enable_mps_for_green_contexts: false        # Keep MPS enabled for green contexts (--enable_mps_for_green_contexts)
+  enable_nvprof: false                        # Profiler start/stop inside testbench (--enable_nvprof)
+  enable_gpu_metric: true                     # Add --gpu-metrics-devices to nsys (--enable_gpu_metric)
+  enable_sqlite: false                        # Export sqlite file in nsys (--enable_sqlite)
+  debug: false                                # Debug mode for trace capture (--debug)
+  debug_mode: nsys                            # Debug mode: nsys/ncu/nsys_simple (--debug_mode)
+  nsys_use_cuda_sw: true                      # nsys --trace cuda-sw legacy trace instead of HES (--nsys_use_cuda_sw)
+  no_pdsch: false                             # Disable PDSCH workload (--no_pdsch)
+  no_pusch: false                             # Disable PUSCH workload (--no_pusch)
+  prach: true                                 # Include PRACH workload (--prach)
+  prach_isolate: true                         # Run PRACH in its own sub-CTX (--prach_isolate)
+  pdcch: true                                 # Include PDCCH workload (--pdcch)
+  pdcch_isolate: true                         # Run PDCCH in its own sub-CTX (--pdcch_isolate)
+  pucch: true                                 # Include PUCCH workload (--pucch)
+  pucch_isolate: true                         # Run PUCCH in its own sub-CTX (--pucch_isolate)
+  ssb: false                                  # Include SSB workload (--ssb)
+  ssb_isolate: false                          # Run SSB in its own sub-CTX (--ssb_isolate)
+  csirs: true                                 # Include CSI-RS workload (--csirs)
+  rec_bf: false                               # Reciprocal beamforming option (--rec_bf)
+  srs_isolate: false                          # Run SRS in its own sub-CTX (--srs_isolate)
+  mac: false                                  # Run cuMAC workload in a dedicated sub-CTX (--mac)
+  mac2: false                                 # Second MAC workload mode (--mac2)
+  mac_timer: false                            # MAC uses internal timer (--mac_timer)
+  uci_timing: false                           # Report UCI-on-PUSCH timing separately
+  fix_ul_cell_count: -1                       # Fix UL channels at N cells; -1 = vary with sweep
+  fix_dl_cell_count: -1                       # Fix DL channels at N cells; -1 = vary with sweep
+  groups_dl: true                             # DL cell groups (--groups_dl); true = lower latency
+  pack_pdsch: true                            # Packed DL cell groups for PDSCH (--pack_pdsch); true = lower latency
+  groups_pusch: true                          # UL cell groups for PUSCH (--groups_pusch); true = lower latency
+  ldpc_parallel: true                         # Run LDPC decoder TBs in parallel (--ldpc_parallel); true = lower latency
+  pusch_cascaded: true                        # Cascade 2nd UL slot after 1st completes (--pusch_cascaded)
+  pucch_cascaded: true                        # Cascade PUCCH2 after PUCCH1 completes (--pucch_cascaded)
+  pusch_subslot_proc: '11'                    # PUSCH sub-slot processing per-PUSCH (--pusch_subslot_proc): "0"/"1"/"00".."11"; 0=disable 1=enable
+  2cb_per_sm: true                            # Enable 2 CB/SM, GA100 feature flag (--2cb_per_sm)
+  GH200: false                                # Force GH200 mode, skip auto-detect (--GH200)
+  unsafe: false                               # Power measurement without timeouts (--unsafe)
+  check_traffic: false                        # Check functional errors in traffic (--check_traffic)
+  numa: 0                                     # NUMA node selection (--numa)
+override_test_vectors:
+  enable_override: true                       # Apply overrides below; per field -1 = keep TV default (no overwrite)
+  PUSCH:
+    enable_early_harq: 1                      # Early HARQ decode path enable (0/1; -1=keep TV default)
+    enable_cfo_correction: -1                 # Carrier frequency offset correction enable (0/1)
+    enable_weighted_average_cfo: -1           # Weighted-average CFO estimation enable (0/1)
+    enable_to_estimation: -1                  # Timing offset estimation enable (0/1)
+    tdi_mode: -1                              # TDI mode selector (0=off, 1=on)
+    enable_dft_sofdm: -1                      # DFT-s-OFDM processing enable (0/1)
+    enable_rssi_measurement: -1               # RSSI measurement enable (0/1)
+    enable_sinr_measurement: -1               # SINR measurement enable (0/1)
+    enable_static_dynamic_beamforming: -1     # Static/dynamic beamforming control (0/1)
+    ldpc_early_termination: -1                # LDPC early termination enable (0/1)
+    ldpc_algorithm_index: -1                  # LDPC decoder algorithm selector
+    ldpc_flags: -1                            # LDPC decoder flags bitmask
+    ldpc_use_half: -1                         # LDPC half-precision path enable (0/1)
+    ldpc_max_num_iterations: -1               # Fixed maximum LDPC iterations
+    ldpc_max_num_iterations_algorithm_index: -1  # LDPC max-iteration strategy (0=fixed,1=LUT,2=per-UE)
+    dmrs_channel_estimation_algorithm_index: -1  # DMRS channel estimation algorithm selector
+    enable_per_prg_channel_estimation: -1     # Per-PRG channel estimation enable (0/1)
+    eq_coefficient_algorithm_index: -1        # Equalizer coefficient algorithm selector
+    list_length: -1                           # Polar decoder list size
+    open_ran_functional_split: 0              # O-RAN functional split: 0 = 7.2a, 1 = 7.2e
+    kernel_sel_option: -1                     # PUSCH kernel selection option
+    uci_kernel_sel_option: -1                 # UCI-on-PUSCH kernel selection option
+    delay_us: -1                              # PUSCH-pipeline GPU busy-wait us latency proxy (-1 = no override)
+  PUCCH:
+    list_length: -1                           # Polar list size -> polarDcdrListSz
+    pipeline_processing_mode: -1              # 0 = full decode, 1 = skip polar -> polarDecoderMode
+    delay_us: -1                              # Polar-decoder latency proxy: PUCCH GPU busy-wait us (-1 = no override)
+  SRS:
+    chEst_alg_selector: -1                    # SRS channel estimation algorithm selector
+  PDSCH:
+    pipeline_processing_mode: -1              # PDSCH pipeline processing mode
+    delay_us: -1                              # PDSCH-pipeline GPU busy-wait us latency proxy (-1 = no override)
+start_delay:
+  DL_ANCHOR: PDSCH                            # DL anchor channel for timeline semantics
+  UL_ANCHOR: PUSCH                            # UL anchor channel [PUSCH/PRACH/PUCCH]; anchor delay absolute, others relative to it
+  PUSCH1: 796                                 # PUSCH slot-1 start us (relative to UL anchor; absolute when UL_ANCHOR==PUSCH)
+  PUSCH2: 0                                   # PUSCH slot-2 start us (after PUSCH1 completion if pusch_cascaded; default 0)
+  PUCCH1: 0                                   # PUCCH slot-1 start us (relative to UL anchor start)
+  PUCCH2: 0                                   # PUCCH slot-2 start us
+  PRACH: 704                                  # PRACH start us (relative to UL anchor start)
+  PDSCH: 200                                  # PDSCH delay us applied after each 500 us slot boundary
+  PDCCH: 0                                    # PDCCH delay us relative to slot boundary
+  PDCCH_CSIRS: -1                             # Delay us after PDCCH end before CSI-RS (default 0)
+  PDSCH_DLBFW: 0                              # Delay us from slot start before DLBFW runs
+  SSB: 0                                      # SSB delay us relative to slot boundary (last 4 slots)
+  MAC: 0                                      # MAC slot-aligned delay us (like PDSCH)
+  MAC2: 0                                     # MAC2 slot-aligned delay us
+latency_budget:
+  PUSCH1: 1250                                # PUSCH slot-1 latency budget us
+  PUSCH1_SUBSLOT_PROC: 650                    # PUSCH slot-1 sub-slot processing budget us
+  PUSCH1_UCI: 650                             # PUSCH slot-1 UCI-on-PUSCH budget us
+  PUSCH2: 1250                                # PUSCH slot-2 latency budget us
+  PUSCH2_SUBSLOT_PROC: 650                    # PUSCH slot-2 sub-slot processing budget us
+  PUSCH2_UCI: 650                             # PUSCH slot-2 UCI-on-PUSCH budget us
+  PUCCH1: 650                                 # PUCCH slot-1 latency budget us
+  PUCCH2: 650                                 # PUCCH slot-2 latency budget us
+  PRACH: 1196                                 # PRACH latency budget us
+  PDSCH: 300                                  # PDSCH latency budget us
+  PDCCH: 300                                  # PDCCH latency budget us
+  PDCCH_CSIRS: 300                            # PDCCH + CSI-RS latency budget us
+  PDSCH_DLBFW: 300                            # PDSCH DLBFW latency budget us
+  SSB: 300                                    # SSB latency budget us
+  MAC: 500                                    # MAC latency budget us
+  MAC2: 500                                   # MAC2 latency budget us

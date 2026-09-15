@@ -401,32 +401,44 @@ def main() -> int:
         return 1
 
     run_folders = discover_run_folders(parent)
-    if not run_folders:
-        print("Error: no subfolders found under", parent, file=sys.stderr)
-        return 1
 
     runs_data: list[tuple[str, dict[str, int]]] = []
     runs_tracer_data: list[dict[str, int] | None] | None = None
     if args.include_tracer_log:
         runs_tracer_data = []
 
-    for folder in run_folders:
-        summary_path = find_summary_in_folder(folder, args.summary_name)
-        if not summary_path:
-            sys.stderr.write(f"Skipping {folder.name}: no summary file found (tried {args.summary_name}, then any file with 'summary' in name)\n")
-            continue
-        data = parse_summary_file(summary_path)
-        if data is None:
-            continue
-        runs_data.append((folder.name, data))
+    if run_folders:
+        # Multi-run mode: each subfolder is one test run
+        for folder in run_folders:
+            summary_path = find_summary_in_folder(folder, args.summary_name)
+            if not summary_path:
+                sys.stderr.write(f"Skipping {folder.name}: no summary file found (tried {args.summary_name}, then any file with 'summary' in name)\n")
+                continue
+            data = parse_summary_file(summary_path)
+            if data is None:
+                continue
+            runs_data.append((folder.name, data))
 
-        if args.include_tracer_log and runs_tracer_data is not None:
-            tracer_path = find_tracer_log_in_folder(folder, args.tracer_log_name)
-            if tracer_path:
-                tracer_dict = parse_tracer_log(tracer_path)
-                runs_tracer_data.append(tracer_dict)  # None if parse failed
-            else:
-                runs_tracer_data.append(None)
+            if args.include_tracer_log and runs_tracer_data is not None:
+                tracer_path = find_tracer_log_in_folder(folder, args.tracer_log_name)
+                if tracer_path:
+                    tracer_dict = parse_tracer_log(tracer_path)
+                    runs_tracer_data.append(tracer_dict)  # None if parse failed
+                else:
+                    runs_tracer_data.append(None)
+
+    # Fall back to single-run mode: check the parent folder itself for a summary
+    # file. This covers cases where the parent contains both non-run subfolders
+    # (e.g. "binary/") and a summary file at the top level.
+    if not runs_data:
+        summary_path = find_summary_in_folder(parent, args.summary_name)
+        if summary_path:
+            data = parse_summary_file(summary_path)
+            if data is not None:
+                runs_data.append((parent.name, data))
+                if args.include_tracer_log and runs_tracer_data is not None:
+                    tracer_path = find_tracer_log_in_folder(parent, args.tracer_log_name)
+                    runs_tracer_data.append(parse_tracer_log(tracer_path) if tracer_path else None)
 
     if not runs_data:
         print("Error: no run summary files could be parsed.", file=sys.stderr)

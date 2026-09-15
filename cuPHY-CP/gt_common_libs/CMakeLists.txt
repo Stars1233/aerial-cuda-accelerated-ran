@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -148,7 +148,9 @@ if(BUILD_NVIPC_ONLY)
     if (NOT TARGET nvlog)
         add_subdirectory(nvlog)
     endif()
-
+    if (NVIPC_CUDA_ENABLE AND NOT TARGET cuda_driver_utils)
+        add_subdirectory(cuda_driver_utils)
+    endif()
     if (NOT TARGET nvipc)
         message(STATUS "including nvipc")
         add_subdirectory(nvIPC)
@@ -217,7 +219,27 @@ if (NOT TARGET slot_command)
     add_subdirectory(slot_command)
 endif()
 
+if (NOT TARGET cuda_driver_utils)
+    message(STATUS "including cuda_driver_utils")
+    add_subdirectory(cuda_driver_utils)
+endif()
+
 if (NOT TARGET perf_metrics)
     message(STATUS "including perf_metrics")
     add_subdirectory(perf_metrics)
+endif()
+
+if (NOT TARGET pmu_reader)
+    message(STATUS "including pmu_reader")
+    add_subdirectory(pmu_reader)
+endif()
+
+if (NOT TARGET task_instrumentation)
+    message(STATUS "including task_instrumentation")
+    add_subdirectory(task_instrumentation)
+endif()
+
+# Optional perf benchmark (separate executable; does not affect task_instrumentation link interface).
+if(ENABLE_TESTS)
+    add_subdirectory(task_instrumentation/benchmark)
 endif()

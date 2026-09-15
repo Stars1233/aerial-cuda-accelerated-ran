@@ -16,20 +16,26 @@
 # limitations under the License.
 
 import argparse
-import pandas as pd
-import sys
+from datetime import datetime
+import json
 import os
 from os import path
-from aerial_postproc.parsenator import Parsenator
-from aerial_postproc.config_yaml_utils import get_sm_provisioning_from_scenario_folder
-from aerial_postproc.monitor_cpu_cores_parsing import read_phy_cpu_consumption
-import numpy as np
-import json
-from datetime import datetime
 import subprocess
-from aerial_postproc.logparse import get_ref_t0
-from aerial_postproc.logparse import parse_testmac_expected_throughput, parse_testmac_observed_throughput_per_second
-from aerial_postproc.logparse import parse_ru_observed_throughput_per_second
+import sys
+
+import numpy as np
+import pandas as pd
+
+from aerial_postproc.config_yaml_utils import get_sm_provisioning_from_scenario_folder
+from aerial_postproc.logparse import (
+    get_ref_t0,
+    parse_ru_observed_throughput_per_second,
+    parse_tc_info,
+    parse_testmac_expected_throughput,
+    parse_testmac_observed_throughput_per_second,
+)
+from aerial_postproc.monitor_cpu_cores_parsing import read_phy_cpu_consumption
+from aerial_postproc.parsenator import Parsenator
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -96,18 +102,20 @@ def read_jenkins_test_information(scenario_folder, phase):
     
     phase_info = dict()
     try:
-        tc_name_tokens = tc_name.split("_")
+        tc_name_core = tc_name.split(',', 1)[0]
+        tc_name_tokens = tc_name_core.split("_")
         if phase == 'phase_2':
             # channel_tv_params            
             phase_info['channel'] = tc_name_tokens[0].replace('run','')
             phase_info['tv'] = '_'.join(tc_name_tokens[1:])
         elif phase == 'phase_4':
-            phase_info['cell_count'] = int(tc_name_tokens[2].replace("C",""))
-            phase_info['pattern'] = tc_name_tokens[3]
-            phase_info['bfp'] = int(tc_name_tokens[4].replace("BFP",""))
+            cell_count, pattern, bfp, _modcomp, eh, _swdisableeh, gc = parse_tc_info(tc_name_core)
+            phase_info['cell_count'] = cell_count
+            phase_info['pattern'] = pattern
+            phase_info['bfp'] = bfp
             phase_info['dual_port'] = int(tc_name_tokens[-1].replace("P", "")) > 1
-            phase_info['eh'] = tc_name.find("_EH") >= 0
-            phase_info['gc'] = tc_name.find("_GC") >= 0
+            phase_info['eh'] = eh
+            phase_info['gc'] = gc
     except Exception as e:
         raise ValueError(f'Test case improper format: {tc_name}. Error: {e}')
     
@@ -177,7 +185,7 @@ def read_jenkins_test_information(scenario_folder, phase):
     jenkins_info = {
         'jenkins_pipeline': pipeline,
         'jenkins_id': jenkins_id,
-        'test_name': tc_name,
+        'test_name': tc_name_core,
         'gpu_platform': platform,
         'jenkins_run_datetime':formatted_datetime,
         **phase_info

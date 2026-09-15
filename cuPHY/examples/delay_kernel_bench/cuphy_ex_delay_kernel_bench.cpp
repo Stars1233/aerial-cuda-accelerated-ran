@@ -30,6 +30,7 @@
 #include <CLI/CLI.hpp>
 
 #include "cuphy.hpp"
+#include "timing.hpp"
 #include "util.hpp"
 // Delay-kernel implementation reference:
 // - gpu_us_delay(...) is defined in cuPHY/examples/common/util.cu
@@ -102,6 +103,7 @@ int main(int argc, char** argv)
     int launch_mode = LAUNCH_MODE_SINGLE_BLOCK;
     int requested_sm_count = DEFAULT_REQUESTED_SM_COUNT;
     bool enable_event_timing = false;
+    std::string timing_json_path;
 
     CLI::App app{"Delay kernel benchmark"};
     app.footer(
@@ -129,7 +131,8 @@ int main(int argc, char** argv)
     app.add_option("-s,--sm-count", requested_sm_count, "If provided and >0, request MPS subcontext with this SM count")
         ->default_val(DEFAULT_REQUESTED_SM_COUNT)
         ->check(CLI::NonNegativeNumber);
-    app.add_flag("-e,--event-timing", enable_event_timing, "Enable CUDA event timing summary (min/mean/max kernel duration)");
+    app.add_flag("-e,--event-timing", enable_event_timing, "Enable CUDA event timing summary (min/mean/p90/p99/max kernel duration)");
+    app.add_option("--timing-json", timing_json_path, "Write timing summary and histogram JSON to the specified file");
 
     try
     {
@@ -138,6 +141,11 @@ int main(int argc, char** argv)
     catch(const CLI::ParseError& e)
     {
         return app.exit(e);
+    }
+
+    if(!timing_json_path.empty())
+    {
+        enable_event_timing = true;
     }
 
     CUDA_CHECK(cudaSetDevice(gpu_id));
@@ -165,6 +173,10 @@ int main(int argc, char** argv)
                (launch_mode == LAUNCH_MODE_ALL_BLOCKS ? " (multi-SM/all blocks)" : " (single block/~1 SM)"));
     NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "  mps_subctx_sm_count: {}", requested_sm_count);
     NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "  event_timing: {}", (enable_event_timing ? "enabled" : "disabled"));
+    if(!timing_json_path.empty())
+    {
+        NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "  timing_json: {}", timing_json_path);
+    }
     if(enable_event_timing)
     {
         NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY,
@@ -181,16 +193,12 @@ int main(int argc, char** argv)
     }
 
     const bool single_thrd_blk = (launch_mode == LAUNCH_MODE_SINGLE_BLOCK);
-    cudaEvent_t evt_start = nullptr;
-    cudaEvent_t evt_stop = nullptr;
-    double kernel_ms_sum = 0.0;
-    float kernel_ms_min = std::numeric_limits<float>::max();
-    float kernel_ms_max = 0.0f;
+    std::unique_ptr<cuphy::examples::timing::GpuEventTimer> kernel_timer;
+    cuphy::examples::timing::SampleSeries kernel_duration_us("gpu.kernel_duration");
 
     if(enable_event_timing)
     {
-        CUDA_CHECK(cudaEventCreateWithFlags(&evt_start, cudaEventDefault));
-        CUDA_CHECK(cudaEventCreateWithFlags(&evt_stop, cudaEventDefault));
+        kernel_timer = std::make_unique<cuphy::examples::timing::GpuEventTimer>();
     }
 
     using steady_clock = std::chrono::steady_clock;
@@ -204,18 +212,14 @@ int main(int argc, char** argv)
             nvtx3::scoped_range launch_range{"gpu_us_delay_launch"};
             if(enable_event_timing)
             {
-                CUDA_CHECK(cudaEventRecord(evt_start, stream));
+                kernel_timer->record_begin(stream);
             }
             gpu_us_delay(static_cast<uint32_t>(delay_us), gpu_id, stream, single_thrd_blk);
             if(enable_event_timing)
             {
-                CUDA_CHECK(cudaEventRecord(evt_stop, stream));
-                CUDA_CHECK(cudaEventSynchronize(evt_stop));
-                float kernel_ms = 0.0f;
-                CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, evt_start, evt_stop));
-                kernel_ms_sum += static_cast<double>(kernel_ms);
-                kernel_ms_min = std::min(kernel_ms_min, kernel_ms);
-                kernel_ms_max = std::max(kernel_ms_max, kernel_ms);
+                kernel_timer->record_end(stream);
+                kernel_timer->synchronize();
+                kernel_duration_us.add_sample(kernel_timer->elapsed_us());
             }
 
             if(period_us > 0)
@@ -232,20 +236,50 @@ int main(int argc, char** argv)
     const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
 
     CUDA_CHECK(cudaStreamDestroy(stream));
-    if(enable_event_timing)
-    {
-        CUDA_CHECK(cudaEventDestroy(evt_start));
-        CUDA_CHECK(cudaEventDestroy(evt_stop));
-    }
 
     NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "Completed {} launches in {} us.", num_launches, total_us);
-    NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "Average launch spacing observed: {} us.",
+    NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "Average launch spacing observed: {:.3f} us.",
                (static_cast<double>(total_us) / num_launches));
     if(enable_event_timing)
     {
-        const double kernel_ms_mean = kernel_ms_sum / static_cast<double>(num_launches);
-        NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "Kernel duration (CUDA events): min={} ms, mean={} ms, max={} ms.",
-                   kernel_ms_min, kernel_ms_mean, kernel_ms_max);
+        const cuphy::examples::timing::SummaryStats kernel_stats = kernel_duration_us.summary();
+        NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "Kernel duration usec (CUDA events):");
+        for(const std::string& line : cuphy::examples::timing::format_phase_summary_table_lines({{"Kernel", kernel_stats}}))
+        {
+            NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "  {}", line);
+        }
+    }
+
+    if(!timing_json_path.empty())
+    {
+        cuphy::examples::timing::TimingReport report("cuphy_ex_delay_kernel_bench");
+        report.add_metadata("iterations", num_launches);
+        report.add_metadata("delay_us", delay_us);
+        report.add_metadata("period_us", period_us);
+        report.add_metadata("launch_mode", launch_mode);
+        report.add_metadata("requested_sm_count", requested_sm_count);
+        report.add_metadata("applied_sm_count", applied_sm_count);
+        report.add_metadata("event_timing", enable_event_timing);
+        if(enable_event_timing)
+        {
+            report.add_series(kernel_duration_us,
+                              {{"backend", "cuda_event"},
+                               {"phase", "kernel_duration"},
+                               {"launch", (launch_mode == LAUNCH_MODE_ALL_BLOCKS ? "all_blocks" : "single_block")}});
+        }
+        try
+        {
+            report.write_json(timing_json_path, cuphy::examples::timing::ReportOptions{});
+        }
+        catch(const std::exception& error)
+        {
+            NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY,
+                        AERIAL_CUPHY_EVENT,
+                        "Failed to write timing JSON '{}': {}",
+                        timing_json_path,
+                        error.what());
+            return EXIT_FAILURE;
+        }
     }
 
     return EXIT_SUCCESS;

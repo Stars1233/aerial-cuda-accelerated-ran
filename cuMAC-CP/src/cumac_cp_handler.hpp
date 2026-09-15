@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,8 @@
 #include <semaphore.h>
 
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 #include "cumac.h"
@@ -41,6 +43,12 @@
 #include "nv_lockfree.hpp"
 #include "cumac_task.hpp"
 #include "cumac_cp_tv.hpp"
+#include "muMimoUserPairing/muMimoUserPairing.cuh"
+
+struct _CVSrsChestBuff;
+typedef struct _CVSrsChestBuff CVSrsChestBuff;
+struct _SrsInfoUpdate;
+typedef struct _SrsInfoUpdate SrsInfoUpdate;
 
 /**
  * Number of slot buffers for pipelined processing
@@ -54,7 +62,7 @@
 #define MAX_MSG_NUM_PER_CELL 4
 
 //! Type alias for cuMAC cell configuration structure
-typedef struct cumac::MAC_SCH_CONFIG_REQUEST cumac_cell_configs_t;
+typedef cumac_config_req_payload_t cumac_cell_configs_t;
 
 /**
  * Throughput statistics tracker
@@ -421,7 +429,54 @@ public:
         return buf_num;
     }
 
-    sem_t gpu_sem; //!< Semaphore for GPU synchronization
+    uint8_t* get_ue_pair_task_out() { return ue_pair_task_out_; }
+
+    /**
+     * Load MU UE pair TV static buffers
+     *
+     * @param ss SFN/slot identifier
+     * @param strm CUDA stream
+     * @return 0 on success or no-op, negative on error
+     */
+    int load_ue_pair_static_buffers(sfn_slot_t ss, cudaStream_t strm);
+
+    int load_ue_pair_shared_memory(sfn_slot_t ss, std::vector<struct nv::phy_mac_msg_desc>& tti_reqs);
+
+    float* chan_orth_mat_buf() { return ue_pair_chan_orth_; }
+    float* get_srs_snr_buf() { return ue_pair_srs_snr_; }
+    uint8_t* get_srs_chan_est_buf() { return ue_pair_srs_chan_est_; }
+    uint8_t* get_task_out_buf() { return ue_pair_task_out_; }
+    __half2* get_cubb_srs_buf() { return ue_pair_cubb_gpu_; }
+
+    /** Pointer to loaded group test vector, or nullptr if not parsed */
+    cumac_cp_tv_t* get_group_tv_ptr() { return group_tv.parsed ? &group_tv : nullptr; }
+
+    void init_ue_pair_gpu_resources();
+
+    /**
+     * Snapshot the three MU UE-pair GPU buffers (`ue_pair_srs_chan_est_`,
+     * `ue_pair_srs_snr_`, `ue_pair_chan_orth_`) and asynchronously write a
+     * single `cumac_ue_pair_buffers_<i>_SFN_<sfn>.<slot>.h5` file.
+     *
+     * Mirrors the cuphydriver `SrsIpcManager::dump_h5()` two-phase design:
+     * phase 1 is a synchronous device-to-host snapshot into pre-pinned
+     * staging buffers (runs in the caller's worker thread); phase 2 is a
+     * detached `SCHED_OTHER` worker that writes the HDF5 file so disk I/O
+     * cannot preempt the RT data path.
+     *
+     * Gated by `DBG_OPT_DUMP_UE_PAIR_H5` in `cumac_cp.yaml debug_option`
+     * (caller checks the bit). The per-process cap equals the number of
+     * loaded MU UE-pair TV slots; each unique `tv_slot_idx` is dumped at
+     * most once. No-op if the GPU buffers are not yet allocated, no TV
+     * is loaded for this slot, or this `tv_slot_idx` has already been
+     * captured.
+     *
+     * @param sfn        System Frame Number (filename + log).
+     * @param slot       Slot index            (filename + log).
+     * @param outputDir  Output directory; defaults to "/tmp".
+     * @return 0 on success / no-op / cap-hit; -1 on snapshot failure.
+     */
+    int dump_ue_pair_h5(uint16_t sfn, uint16_t slot, const char* outputDir = "/tmp");
 
 private:
     /**
@@ -463,6 +518,12 @@ private:
     template <typename T>
     int malloc_cumac_buf(cumac_task *task, T **ptr, uint32_t* num_save, uint32_t num, uint32_t force_host_mem = 0);
 
+    /**
+     * Bytes required for one task's carve-out of group_buf (GPU path + group_buf_enabled),
+     * matching initiate_cumac_task allocation order and alignment.
+     */
+    uint32_t compute_group_buf_need_bytes() const;
+
     uint64_t global_tick{}; //!< Global tick counter
 
     std::atomic<sfn_slot_t> ss_curr{}; //!< Current SFN/slot being processed
@@ -487,6 +548,81 @@ private:
     cumac_cp_tv_t group_tv{}; //!< Test vector data for group validation
 
     std::vector<cumac_cp_thrput_t> thrputs{}; //!< Per-cell throughput statistics
+
+    void free_mu_ue_pair_gpu();
+
+    cumac::muMimoUserPairing* mu_ue_pair_gpu_{nullptr};
+
+    // Static GPU buffers for muMimoUserPairing: shared across all slots/tasks
+    uint8_t* ue_pair_srs_chan_est_{nullptr};
+    float* ue_pair_srs_snr_{nullptr};
+    float* ue_pair_chan_orth_{nullptr};
+    __half2* ue_pair_cubb_gpu_{nullptr};
+    uint8_t* ue_pair_task_out_{nullptr};
+
+    // Shared GPU/CPU memory pools for muMimoUserPairing when enable_cubb=1
+    std::unique_ptr<nv::lock_free_mem_pool<uint8_t>>        cubb_gpu_pool_{};
+    std::unique_ptr<nv::lock_free_mem_pool<CVSrsChestBuff>> chest_buf_pool_{};
+    std::unique_ptr<nv::lock_free_mem_pool<SrsInfoUpdate>>  srs_info_pool_{};
+
+    // Buffer sizes and geometry for per-task TV allocation
+    uint32_t ue_pair_num_prg_samp_per_subband_{0}; //!< Set by init_ue_pair_gpu_resources
+    uint32_t ue_pair_num_subband_{0};              //!< Set by init_ue_pair_gpu_resources
+    uint32_t ue_pair_num_ue_ant_port_{0};          //!< Set by init_ue_pair_gpu_resources
+    uint32_t ue_pair_num_bs_ant_{0};               //!< Set by init_ue_pair_gpu_resources
+    size_t ue_pair_chan_est_bytes_{0};
+    size_t ue_pair_snr_bytes_{0};
+    size_t ue_pair_orth_bytes_{0};
+    size_t ue_pair_cubb_bytes_{0};
+    size_t ue_pair_task_in_bytes_{0};
+    size_t ue_pair_out_bytes_{0};
+
+    uint16_t num_srs_info_{0}; //!< Number of SRS UEs per slot per cell
+    int first_ue_pair_tv_id{-1}; //!< First slot index in UE pair TV ID. Set -1 to auto-detect the first UE pair slot scheduled from L2.
+
+    //! Enqueue-FIFO GPU serialization across worker threads (see order_sem).
+    order_sem task_order_sem_;
+
+    uint32_t moduleBitMask{0}; //!< Indicate which cuMAC modules should be enabled. Each bit represent 1 type defined in cumac_module_type_t
+
+    uint32_t last_thrput_print_slot{0}; //!< Last slot index in a frame for throughput print
+
+    //========================================================================
+    // MU UE-pair H5 dump state (DBG_OPT_DUMP_UE_PAIR_H5)
+    //
+    // Per-process cap = number of loaded MU UE-pair TV slots
+    // (`mu_ue_pair_tv_loaded == true` in `group_tv.ue_pair`). Each unique
+    // tv_slot_idx is dumped at most once so the file set captures one
+    // snapshot per scheduled MU UE-pair slot in the TV pattern.
+    //========================================================================
+    //! Pinned-host staging triple shadowing the three GPU buffers.
+    //! Borrowed (not owned) by detached H5 writer threads.
+    struct UePairH5Staging
+    {
+        uint8_t* chan_est_host{nullptr};
+        uint8_t* snr_host{nullptr};
+        uint8_t* chan_orth_host{nullptr};
+    };
+
+    std::vector<UePairH5Staging> ue_pair_h5_staging_{}; //!< Sized to ue_pair_h5_max_slots_ on init
+    std::vector<uint8_t>         ue_pair_h5_dumped_tv_slot_{}; //!< 1 == tv_slot_idx already dumped; size == group_tv.ue_pair.size()
+    uint32_t                     ue_pair_h5_max_slots_{0}; //!< Count of loaded MU UE-pair TV slots; 0 == dumping disabled
+    std::atomic<uint32_t>        ue_pair_h5_dump_count_{0}; //!< 0..ue_pair_h5_max_slots_
+    std::atomic<bool>            ue_pair_h5_staging_ready_{false}; //!< Set once after first successful allocate
+    std::mutex                   ue_pair_h5_init_mtx_{}; //!< Guards lazy staging allocation
+    std::mutex                   ue_pair_h5_claim_mtx_{}; //!< Guards tv_slot dedup, staging-slot assignment, and thread tracking
+    std::vector<std::thread>     ue_pair_h5_threads_{};   //!< Writer threads joined in free_ue_pair_h5_staging()
+
+    //! Allocate one staging triple per loaded MU UE-pair TV slot, sized to
+    //! the current ue_pair buffer geometry. Idempotent; called under
+    //! `ue_pair_h5_init_mtx_`. Returns false if no MU UE-pair TVs are
+    //! loaded (dumping stays disabled) or any allocation fails.
+    bool allocate_ue_pair_h5_staging();
+
+    //! Free every staging triple in `ue_pair_h5_staging_` and reset the
+    //! dedup bookkeeping. Idempotent. Called from `free_mu_ue_pair_gpu()`
+    //! so staging lifetime matches the GPU buffers it shadows.
+    void free_ue_pair_h5_staging();
 };
 
 #endif /* _CUMAC_CP_HANDLER_HPP_ */

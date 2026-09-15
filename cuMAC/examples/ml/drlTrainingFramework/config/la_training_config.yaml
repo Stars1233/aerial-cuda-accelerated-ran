@@ -1,0 +1,117 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Teacher-cloning-only training for DRL link adaptation.
+#
+# Section names are organizational only. Every leaf key maps directly to a
+# LaTrainingConfig field.
+#
+# This file trains phase 1 only. Use la_staged_training_config.yaml, which
+# inherits from this one, for the complete four-phase curriculum; a cloned
+# actor is an initialization, not a deployable policy.
+
+runtime:
+  training_mode: clone
+  seed: 17
+  device: null              # Null lets the simulator choose its own device
+  output_dir: runs/drl_la_clone
+  resume_checkpoint: null
+  log_every: 100
+
+clone:
+  clone_updates: 10000
+  clone_learning_rate: 0.0003
+  clone_weight_decay: 0.01
+  # Gaussian soft labels over the MCS index. Adjacent MCS differ by a fraction
+  # of a dB of required SINR, so a one-hot target would penalize an off-by-one
+  # choice as hard as an off-by-ten one.
+  clone_label_smoothing_sigma: 1.0
+  # Within one slot every UE shares a channel realization and a resource
+  # allocation, so an on-policy batch is far less diverse than its size
+  # suggests. Replay decorrelates the batch from the slot it came from.
+  clone_replay_capacity: 262144
+  clone_batch_size: 2048
+  clone_collect_steps_per_update: 1
+  # Slots between collections. A simulator slot is typically orders of
+  # magnitude more expensive than a gradient step, so the default of 1 spends
+  # essentially all of cloning inside the simulator. Raise this (and the
+  # simulator's env count with it) to train many times off each labelled slot;
+  # the replay buffer already decorrelates the batch from its slot.
+  clone_collect_every: 1
+
+bootstrap:
+  bootstrap_enabled: false
+  bootstrap_updates: 2000
+  bootstrap_learning_rate: 0.0001
+  bootstrap_entropy_coef: 0.005
+  bootstrap_advantage_clip: 5.0
+
+critic:
+  critic_warmup_enabled: true
+  critic_warmup_updates: 500
+  critic_warmup_learning_rate: 0.0003
+  critic_warmup_horizon: 32
+  critic_warmup_epochs: 4
+  critic_warmup_replay_capacity: 131072
+  critic_warmup_batch_size: 2048
+  freeze_actor_during_critic_warmup: true
+
+ppo:
+  ppo_enabled: true
+  ppo_updates: 10000
+  ppo_horizon: 32
+  ppo_epochs: 4
+  ppo_minibatch_size: 2048
+  ppo_learning_rate: 0.0003
+  # Contextual bandit. The MCS chosen for one UE in one slot does not move the
+  # next state: the channel, the resource allocation and the scheduler's own
+  # weights all evolve independently of it. The one cross-slot coupling, the
+  # sliding BLER window, is already priced inside the reward.
+  gamma: 0.0
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  value_clip_coef: 0.5
+  value_loss_coef: 0.25
+  entropy_coef: 0.005
+  max_grad_norm: 1.0
+  advantage_normalization: true
+  reward_normalization: true
+  reward_norm_epsilon: 0.000001
+  target_kl: 0.05
+
+checkpointing:
+  # Shared cadence, plus a per-phase override for each phase that wants one.
+  checkpoint_every: 1000
+  clone_checkpoint_every: 2500
+  bootstrap_checkpoint_every: 500
+  critic_checkpoint_every: 250
+  ppo_checkpoint_every: 500
+  # Zero disables between-phase selection. Cloning loss keeps falling while the
+  # closed-loop BLER window drifts, so the lowest-loss checkpoint is routinely
+  # not the one with the best delivered throughput.
+  checkpoint_selection_steps: 0
+  checkpoint_selection_seed: null
+  checkpoint_selection_metric: expected_cell_spectral_eff
+
+validation:
+  # Zero disables. Each validation runs five matched rollouts (student, teacher,
+  # OLLA, ILLA, genie), so it costs five times its step count.
+  validation_every: 0
+  validation_steps: 100
+  validation_seed: 10001
+  # reset() synchronizes every UE's feedback age to zero and restarts the outer
+  # loop at its initial offset, neither of which happens in operation. See the
+  # note in la_staged_training_config.yaml for how to size this.
+  validation_warmup_slots: 0

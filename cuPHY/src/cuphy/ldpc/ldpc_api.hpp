@@ -168,6 +168,34 @@ public:
                           const tensor_desc& softOutputsTensorDesc,
                           void*              softOutputsAddr);
     //------------------------------------------------------------------
+    // add_tensor_as_tb()
+    // Use the address and layout of the given tensors as if they belong
+    // to a single transport block. This overload is used when the caller
+    // wants to enable early termination and/or iteration count tracking.
+    // Parameters:
+    //   crcType     - Array of CRC types per codeblock, or nullptr
+    //   crcOutput   - Array to receive CRC results (0=pass), or nullptr
+    //   iterOutput  - Array to receive iteration counts, or nullptr
+    void add_tensor_as_tb(const tensor_desc& llrTensorDesc,
+                          void*              llrAddr,
+                          const tensor_desc& decodeTensorDesc,
+                          void*              decodeAddr,
+                          uint32_t*          crcType,
+                          uint32_t*          crcOutput,
+                          int32_t*           iterOutput);
+    //------------------------------------------------------------------
+    // add_tensor_as_tb()
+    // Full overload with soft outputs, early termination, and iteration tracking.
+    void add_tensor_as_tb(const tensor_desc& llrTensorDesc,
+                          void*              llrAddr,
+                          const tensor_desc& decodeTensorDesc,
+                          void*              decodeAddr,
+                          const tensor_desc& softOutputsTensorDesc,
+                          void*              softOutputsAddr,
+                          uint32_t*          crcType,
+                          uint32_t*          crcOutput,
+                          int32_t*           iterOutput);
+    //------------------------------------------------------------------
     // reset()
     // Sets the number of valid transport blocks to zero
     void reset() { num_tbs = 0; }
@@ -176,7 +204,7 @@ public:
     [[nodiscard]] bool has_config(const int16_t BG_, const int Z_, const int parity_nodes, const cuphyLdpcMaxItrAlgoType_t ldpcMaxNumItrAlgo, const uint8_t ldpcMaxNumItrPerUe) const
     {   if(ldpcMaxNumItrAlgo == LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE)
             return ((BG_ == config.BG) && (Z_ == config.Z) && (parity_nodes == config.num_parity_nodes) && (ldpcMaxNumItrPerUe == config.max_iterations));
-        return ((BG_ == config.BG) && (Z_ == config.Z) && (parity_nodes == config.num_parity_nodes)); 
+        return ((BG_ == config.BG) && (Z_ == config.Z) && (parity_nodes == config.num_parity_nodes));
     }
     //------------------------------------------------------------------
     // is_full()

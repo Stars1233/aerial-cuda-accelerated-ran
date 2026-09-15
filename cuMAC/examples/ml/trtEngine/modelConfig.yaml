@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Synthetic DNN model specification for the cuMAC trtEngine latency benchmark.
+#
+# `gen_models.py` reads this file and, for every entry under `models`, builds a
+# randomly-initialized MLP with the *exact* actor-critic layout that the bundled
+# `pt_to_onnx.py` exporter (and therefore the trtEngine benchmark) expects, then
+# writes one `<name>.pt` checkpoint per model into `output_dir`.
+#
+# Each model is a feed-forward MLP whose activation is selectable per model via
+# `activation` (silu | relu):
+#   input[input_dim] -> hidden_layers (Linear + activation, LayerNorm after the
+#                       trunk) -> output[output_dim]
+# i.e. `mlp_4x512` below is: 512 -> [512, 512, 512, 512] -> 32.
+#
+# Paths are resolved relative to the directory containing THIS file.
+
+# Directory for the generated .pt checkpoints (and companion infConfig files).
+output_dir: generatedModels
+
+# Also emit a ready-to-run infConfig.<name>.yaml next to each .pt, so the model
+# can be benchmarked immediately with:
+#   ./trtEngine -c <output_dir>/<name>.infConfig.yaml
+emit_inf_config: true
+
+# Pre-export the cached <name>.onnx next to each .pt (using this host's onnx).
+# The benchmark reuses this cache and skips its own .pt -> ONNX conversion, so it
+# runs even where its python lacks the 'onnx' package (e.g. the build container).
+emit_onnx: true
+
+# Write a single 'model_summary.pdf' in output_dir summarizing every generated
+# model (layer structure, activation type, per-layer and total trainable
+# parameter counts). Needs the 'reportlab' or 'matplotlib' package; if neither
+# is present the PDF is skipped with a warning (the other artifacts are fine).
+emit_pdf: true
+
+# Defaults applied to every model unless the model entry overrides the key.
+defaults:
+  # Fold a (randomized) running-observation normalizer into the saved graph.
+  obs_normalize: false
+  # Hidden-layer activation function: silu | relu. SiLU (x*sigmoid(x)) matches
+  # the DRL trainer. ReLU is offered because TensorRT fuses ReLU directly into
+  # the preceding GEMM (one kernel per layer), whereas SiLU stays a separate
+  # kernel -- so ReLU lowers the trtEngine kernel count and inference latency
+  # for this MLP. Can be overridden per model below.
+  activation: silu
+  # Base RNG seed. Each model uses (seed + its index) for reproducible weights.
+  seed: 0
+  # --- knobs baked into each emitted infConfig (all influence measured latency) ---
+  precision: fp16          # fp32 | fp16
+  use_cuda_graph: true
+  workspace_mib: 1024
+  batch_size: 20
+  max_batch_size: 24
+  warmup_iters: 200
+  timing_iters: 2000
+  copy_input_each_iter: false
+
+# Models to generate. `hidden_layers` lists the width of every hidden layer.
+# Shorthand: instead of `hidden_layers`, you may give `hidden` + `depth`
+# (expands to [hidden] * depth). Advanced: override the actor-critic split with
+# explicit `encoder_layers` + `actor_head_layers` (default: all hidden layers go
+# to the encoder trunk and the actor is a single output projection).
+models:
+  # SiLU vs ReLU comparison on the deployed actor's graph
+  # (487 -> [512 x5] -> LayerNorm -> 28): the same 6-GEMM + LayerNorm structure
+  # as the trained phyMacGpuShareBenchmark model. Only the activation differs, so
+  # any latency delta is purely the kernel-count effect -- ReLU fuses into the
+  # GEMM epilogue, while SiLU's x*sigmoid(x) stays a separate kernel per layer.
+
+  # The headline example: 512 -> [512, 512, 512, 512] -> 32.
+  - name: mlp_4x512_relu
+    input_dim: 512
+    hidden_layers: [512, 512, 512, 512]
+    output_dim: 32
+    activation: relu      

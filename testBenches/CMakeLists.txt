@@ -153,4 +153,4 @@ add_custom_target(testbenches_examples
 
 # test benches 
 add_subdirectory(cubb_gpu_test_bench)  # phase-3 test bench (supports conditional cuMAC)
-add_subdirectory(chanModels)
+add_subdirectory(gpu3GPPChan)

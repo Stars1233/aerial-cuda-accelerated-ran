@@ -21,7 +21,7 @@
 #   - linuxptp package (ptp4l, phc2sys)
 #   - PTP configuration and services
 #   - nvidia.service for GPU and system optimizations
-#   - cpu-latency.service for low-latency operation
+#   - cpu-latency.service for low-latency operation (DGX-Spark only)
 #   - ethtool TX timestamping optimizations
 #
 # Usage: ./install_services.sh [--dry-run] [--verbose] [--interface <name>] [--detect-ptp] [--status] [--check-sync]
@@ -29,11 +29,18 @@
 # Reference: https://docs.nvidia.com/aerial/cuda-accelerated-ran/aerial_cubb/cubb_install/aerial_system_scripts.html
 #
 
+# Suppress interactive apt dialogs
+export DEBIAN_FRONTEND=noninteractive
+
 # Source common functions
 _SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 [[ -f "$_SCRIPT_DIR/includes.sh" ]] && source "$_SCRIPT_DIR/includes.sh" || { echo "ERROR: includes.sh not found: $_SCRIPT_DIR/includes.sh" >&2; exit 1; }
 
-FH_INTERFACE="aerial00"
+FH_INTERFACE="${FH_INTERFACE:-aerial00}"
+PTP_INTERFACE_OVERRIDE="${PTP_INTERFACE:-}"
+PTP_ROLE_EXPLICIT=0
+[[ -n "${PTP_ROLE+x}" ]] && PTP_ROLE_EXPLICIT=1
+PTP_ROLE="${PTP_ROLE:-${PTP_ROLE_DEFAULT:-client}}"
 DETECT_PTP_ONLY=0
 STATUS_ONLY=0
 CHECK_SYNC_ONLY=0
@@ -47,6 +54,7 @@ usage() {
     echo "  --dry-run           Show commands without executing"
     echo "  --verbose           Print commands before executing"
     echo "  --interface=NAME    Specify fronthaul interface (default: aerial00)"
+    echo "  PTP_ROLE            client or master (default: ${PTP_ROLE_DEFAULT:-client})"
     echo "  --detect-ptp        Detect PTP traffic and exit"
     echo "  --status            Show service status and exit"
     echo "  --check-sync        Check PTP sync status and exit"
@@ -72,6 +80,20 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1"; usage 1 ;;
     esac
 done
+
+if [[ $PTP_ROLE_EXPLICIT -eq 0 && ( $STATUS_ONLY -eq 1 || $CHECK_SYNC_ONLY -eq 1 ) && -f /etc/ptp.conf ]]; then
+    installed_ptp_role=$(awk -F: '/^# Role:/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' /etc/ptp.conf)
+    [[ -n "$installed_ptp_role" ]] && PTP_ROLE="$installed_ptp_role"
+fi
+
+if [[ "$PTP_ROLE" != "client" && "$PTP_ROLE" != "master" ]]; then
+    echo "ERROR: PTP_ROLE must be client or master (got '$PTP_ROLE')" >&2
+    exit 1
+fi
+
+ptp_interface() {
+    printf '%s\n' "${PTP_INTERFACE_OVERRIDE:-${PTP_INTERFACE_DEFAULT:-$FH_INTERFACE}}"
+}
 
 # Disable NTP to prevent conflicts with PTP
 disable_ntp() {
@@ -149,6 +171,11 @@ install_linuxptp() {
     fi
 
     hash -r # Refresh bash hash
+    if [[ $DRYRUN -eq 1 ]]; then
+        echo_and_log "[DRY-RUN] Would verify linuxptp ${LINUXPTP_VERSION} after install"
+        return 0
+    fi
+
     if command -v ptp4l &>/dev/null; then
         echo_and_log "[INFO] linuxptp installed: $(ptp4l -v) at $(command -v ptp4l)"
     else
@@ -162,6 +189,12 @@ install_linuxptp() {
 # Runs tcpdump with PTP filter for 2 seconds on each interface
 # Sets PTP_INTERFACE to the first interface with PTP traffic
 detect_ptp_traffic() {
+    if [[ -n "${PTP_INTERFACE_OVERRIDE}" ]]; then
+        PTP_INTERFACE="$PTP_INTERFACE_OVERRIDE"
+        echo_and_log "[INFO] Using PTP interface override: ${PTP_INTERFACE}"
+        return 0
+    fi
+
     echo_and_log "[INFO] Detecting PTP traffic on aerial interfaces (2 second timeout per interface)..."
 
     # Find all aerial0x interfaces
@@ -176,7 +209,6 @@ detect_ptp_traffic() {
 
     PTP_INTERFACE=""
     local ptp_interfaces=""
-
     for IFACE in $AERIAL_INTERFACES; do
         echo_and_log -n "[INFO] Checking ${IFACE}... "
 
@@ -201,7 +233,6 @@ detect_ptp_traffic() {
                 if [[ -z $PTP_INTERFACE ]]; then
                     PTP_INTERFACE="$IFACE"
                 fi
-                ptp_interfaces="$ptp_interfaces $IFACE"
             else
                 echo_and_log "no PTP traffic"
             fi
@@ -210,7 +241,6 @@ detect_ptp_traffic() {
 
     echo ""
     if [[ -n $PTP_INTERFACE ]]; then
-        echo_and_log "[INFO] PTP traffic detected on:$ptp_interfaces"
         echo_and_log "[INFO] Using ${PTP_INTERFACE} for PTP configuration"
         return 0
     else
@@ -222,13 +252,14 @@ detect_ptp_traffic() {
 
 # Create PTP configuration file
 create_ptp_conf() {
-    # Use detected PTP_INTERFACE if available, otherwise fall back to FH_INTERFACE
-    local ptp_iface="${PTP_INTERFACE:-$FH_INTERFACE}"
-    echo_and_log "[INFO] Creating /etc/ptp.conf for interface ${ptp_iface}..."
+    echo_and_log "[INFO] Creating /etc/ptp.conf for ${PTP_INTERFACE} (role: $PTP_ROLE)..."
+
+    local client_only="clientOnly                      0"
+    [[ "$PTP_ROLE" == "client" ]] && client_only="clientOnly                      1"
 
     write_file /etc/ptp.conf << EOF
 # PTP configuration for NVIDIA Aerial
-# Optimized for DGX Spark with ConnectX-7 NIC
+# Role: ${PTP_ROLE}
 
 [global]
 dataset_comparison              G.8275.x
@@ -241,7 +272,7 @@ G.8275.portDS.localPriority     128
 network_transport               L2
 domainNumber                    24
 tx_timestamp_timeout            30
-clientOnly                      1
+${client_only}
 
 clock_servo pi
 step_threshold 1.0
@@ -249,7 +280,7 @@ egressLatency 28
 pi_proportional_const 4.65
 pi_integral_const 0.1
 
-[${ptp_iface}]
+[${PTP_INTERFACE}]
 announceReceiptTimeout 3
 delay_mechanism E2E
 network_transport L2
@@ -274,7 +305,6 @@ EOF
 
 # Create ptp4l systemd service
 create_ptp4l_service() {
-    local ptp_iface="${PTP_INTERFACE:-$FH_INTERFACE}"
     echo_and_log "[INFO] Creating /etc/systemd/system/ptp4l.service..."
 
     if [[ -f /lib/systemd/system/ptp4l.service ]]; then
@@ -293,6 +323,14 @@ create_ptp4l_service() {
 
     local ptp_cpu_affinity_line=""
     [[ -n "${PTP_CPU_AFFINITY:-}" ]] && ptp_cpu_affinity_line="CPUAffinity=${PTP_CPU_AFFINITY}"
+
+    local prestart_interfaces="${AERIAL_FH_INTERFACES:-$PTP_INTERFACE}"
+    local prestart_lines="" iface
+    for iface in $prestart_interfaces; do
+        prestart_lines+="ExecStartPre=/usr/sbin/ifconfig ${iface} up"$'\n'
+        prestart_lines+="ExecStartPre=/usr/sbin/ethtool --set-priv-flags ${iface} tx_port_ts on"$'\n'
+        prestart_lines+="ExecStartPre=/usr/sbin/ethtool -A ${iface} rx off tx off"$'\n'
+    done
     write_file /etc/systemd/system/ptp4l.service << EOF
 [Unit]
 Description=Precision Time Protocol (PTP) service
@@ -304,6 +342,7 @@ ConditionPathExistsGlob=/dev/ptp*
 Restart=always
 RestartSec=5s
 Type=simple
+${prestart_lines}
 ExecStart=/usr/sbin/ptp4l -f /etc/ptp.conf
 ${ptp_cpu_affinity_line}
 [Install]
@@ -315,9 +354,9 @@ EOF
 
 # Create phc2sys systemd service
 create_phc2sys_service() {
-    # Use detected PTP_INTERFACE if available, otherwise fall back to FH_INTERFACE
-    local ptp_iface="${PTP_INTERFACE:-$FH_INTERFACE}"
-    echo_and_log "[INFO] Creating /etc/systemd/system/phc2sys.service for interface ${ptp_iface}..."
+    echo_and_log "[INFO] Creating /etc/systemd/system/phc2sys.service for ${PTP_INTERFACE}..."
+
+    local phc2sys_command="/usr/sbin/phc2sys -s ${PTP_INTERFACE} -c CLOCK_REALTIME -n 24 -O 0 -R 256 -u 256"
 
     local ptp_cpu_affinity_line=""
     [[ -n "${PTP_CPU_AFFINITY:-}" ]] && ptp_cpu_affinity_line="CPUAffinity=${PTP_CPU_AFFINITY}"
@@ -334,7 +373,7 @@ RestartSec=5s
 Type=simple
 # Gives ptp4l a chance to stabilize
 ExecStartPre=sleep 2
-ExecStart=/bin/sh -c "/usr/sbin/phc2sys -s ${ptp_iface} -c CLOCK_REALTIME -n 24 -O 0 -R 256 -u 256"
+ExecStart=/bin/sh -c "${phc2sys_command}"
 ${ptp_cpu_affinity_line}
 
 [Install]
@@ -345,8 +384,8 @@ EOF
 }
 
 # Install nvidia.sh script for GPU and system optimizations.
-# nvidia.sh is a template; platform-specific commands are substituted before
-# writing it to /usr/local/bin/nvidia.sh.
+# nvidia.sh is a template; @GPU_CLOCK_CMD@ and @GPU_MIG_CMD@ are substituted with
+# platform-specific commands before writing to /usr/local/bin/nvidia.sh.
 install_nvidia_script() {
     echo_and_log "[INFO] Installing /usr/local/bin/nvidia.sh..."
 
@@ -356,35 +395,37 @@ install_nvidia_script() {
     local SRC_FILE="${SCRIPT_DIR}/nvidia.sh"
     local DST_FILE="/usr/local/bin/nvidia.sh"
 
-    local gpu_clock_cmd mig_mode_cmd cpu_latency_cmd
+    local gpu_clock_cmd gpu_mig_cmd="true"
     case "${PLATFORM:-}" in
-        Supermicro_ARS-111GL-NHR)
-            # GH200 requires --mode=1 to unlock the full clock range; query the hardware
-            # maximum dynamically. Validate numeric result before calling -lgc.
+        SMC-GraceHopper|MGX-ARC-Pro)
+            # GH200 and MGX ARC Pro require --mode=1 to unlock the full clock range;
+            # query the hardware maximum dynamically. Validate it before calling -lgc.
             gpu_clock_cmd='{ _max_clk=$(nvidia-smi -i 0 --query-gpu=clocks.max.graphics --format=csv,noheader,nounits 2>/dev/null) && [[ "$_max_clk" =~ ^[0-9]+$ ]] && nvidia-smi -i 0 -lgc "$_max_clk" --mode=1; }'
-            mig_mode_cmd='nvidia-smi -mig 0 || { echo "[ERROR] Failed to disable MIG mode"; FAILED=1; }'
-            ;;
-        NVIDIA_DGX_Spark_P4242)
-            gpu_clock_cmd='nvidia-smi -lgc 2000'
-            cpu_latency_cmd='systemctl start cpu-latency.service || { echo "[ERROR] Failed to start cpu-latency.service"; FAILED=1; }'
             ;;
         *)
-            gpu_clock_cmd='nvidia-smi -lgc 2000'
+            if [[ "$INSTALL_GPU" == "1" ]]; then
+                gpu_clock_cmd='nvidia-smi -lgc 2000'
+            else
+                gpu_clock_cmd='true'
+            fi
             ;;
     esac
 
+    if [[ -n "${MIG_MODE:-}" ]]; then
+        gpu_mig_cmd="nvidia-smi -mig ${MIG_MODE}"
+    fi
+
     echo_and_log "[INFO] GPU clock command: ${gpu_clock_cmd}"
+    echo_and_log "[INFO] GPU MIG command: ${gpu_mig_cmd}"
     if [[ $DRYRUN -eq 1 ]]; then
-        echo_and_log "[DRY-RUN] Would install platform-specific GPU and service commands in $DST_FILE"
+        echo_and_log "[DRY-RUN] Would install $DST_FILE with @GPU_CLOCK_CMD@ -> ${gpu_clock_cmd}"
+        echo_and_log "[DRY-RUN] Would install $DST_FILE with @GPU_MIG_CMD@ -> ${gpu_mig_cmd}"
     else
         # Escape sed replacement metacharacters (& means "matched text" in sed replacement)
-        local escaped_cmd="${gpu_clock_cmd//&/\\&}"
-        local escaped_mig_cmd="${mig_mode_cmd//&/\\&}"
-        local escaped_cpu_latency_cmd="${cpu_latency_cmd//&/\\&}"
-        sed -e "s#@GPU_CLOCK_CMD@#${escaped_cmd}#" \
-            -e "s#@MIG_MODE_CMD@#${escaped_mig_cmd}#" \
-            -e "s#@CPU_LATENCY_CMD@#${escaped_cpu_latency_cmd}#" \
-            "$SRC_FILE" | sudo tee "$DST_FILE" > /dev/null
+        local escaped_clock_cmd="${gpu_clock_cmd//&/\\&}"
+        local escaped_mig_cmd="${gpu_mig_cmd//&/\\&}"
+        sed -e "s#@GPU_CLOCK_CMD@#${escaped_clock_cmd}#" \
+            -e "s#@GPU_MIG_CMD@#${escaped_mig_cmd}#" "$SRC_FILE" | sudo tee "$DST_FILE" > /dev/null
         sudo chmod +x "$DST_FILE"
         echo_and_log "  [install_nvidia_script] $DST_FILE"
     fi
@@ -395,11 +436,17 @@ install_nvidia_script() {
 create_nvidia_service() {
     echo_and_log "[INFO] Creating nvidia.service..."
 
-    write_file /etc/systemd/system/nvidia.service << 'EOF'
+    local rdma_dependencies=""
+    if [[ "$INSTALL_DOCA_OFED" == "1" ]]; then
+        rdma_dependencies=$'After=network.target openibd.service\nRequires=openibd.service'
+    else
+        rdma_dependencies="After=network.target"
+    fi
+
+    write_file /etc/systemd/system/nvidia.service << EOF
 [Unit]
 Description=NVIDIA GPU and System Optimizations for Aerial
-After=network.target openibd.service
-Requires=openibd.service
+${rdma_dependencies}
 
 [Service]
 Type=oneshot
@@ -456,6 +503,16 @@ EOF
     echo_and_log "[INFO] Created cpu-latency.service"
 }
 
+# Preserve the site.yaml common-role reservation for local gRPC ports.
+create_aerial_sysctl_config() {
+    echo_and_log "[INFO] Reserving Aerial local gRPC ports..."
+
+    write_file /etc/sysctl.d/99-aerial.conf << 'EOF'
+net.ipv4.ip_local_reserved_ports=50052-50053
+EOF
+    execute sudo sysctl --system
+}
+
 # Enable and start services
 enable_services() {
     echo "[INFO] Enabling and starting services..."
@@ -464,17 +521,22 @@ enable_services() {
 
     # Restart RDMA/IB service first so nvidia.sh runs against a fresh, consistent module set.
     # Unload rpcrdma before restart so openibd's stop can unload rdma_cm (avoids "Module rdma_cm is in use by: rpcrdma").
-    execute sudo modprobe -r rpcrdma 2>/dev/null || true
-    execute sudo systemctl restart openibd.service
+    if [[ "$INSTALL_DOCA_OFED" == "1" ]]; then
+        execute sudo modprobe -r rpcrdma 2>/dev/null || true
+        execute sudo systemctl restart openibd.service
+    fi
 
     # Enable and start nvidia service (GPU and system optimizations)
     execute sudo systemctl enable nvidia.service
     execute sudo systemctl restart nvidia.service
-    execute sudo systemctl enable nvidia-persistenced.service
-    execute sudo systemctl restart nvidia-persistenced.service
+    if [[ "$INSTALL_GPU" == "1" ]]; then
+        execute sudo systemctl enable nvidia-persistenced.service
+        execute sudo systemctl restart nvidia-persistenced.service
+    fi
 
 
-    if [[ $PLATFORM == "NVIDIA_DGX_Spark_P4242" ]]; then
+    # Enable and start CPU latency service (DGX-Spark only)
+    if [[ "$PLATFORM" == "DGX-Spark" ]]; then
         execute sudo systemctl enable cpu-latency.service
         execute sudo systemctl restart cpu-latency.service
     fi
@@ -493,6 +555,11 @@ enable_services() {
 
 # Display service status
 show_status() {
+    if [[ $DRYRUN -eq 1 ]]; then
+        echo_and_log "[DRY-RUN] Would verify nvidia, ptp4l, phc2sys, and linuxptp status (cpu-latency on DGX-Spark only)"
+        return 0
+    fi
+
     echo ""
     echo_and_log "[INFO] nvidia service status:"
     systemctl status nvidia.service --no-pager --full || {
@@ -500,7 +567,7 @@ show_status() {
         FAILED=1
     }
 
-    if [[ $PLATFORM == "NVIDIA_DGX_Spark_P4242" ]]; then
+    if [[ "$PLATFORM" == "DGX-Spark" ]]; then
         echo ""
         echo_and_log "[INFO] cpu-latency service status:"
         systemctl status cpu-latency.service --no-pager --full || {
@@ -552,7 +619,7 @@ extract_rms_value() {
 
 extract_delay_value() {
     local log_line="$1"
-    echo "$log_line" | grep -oP 'delay\s+\K[0-9]+'
+    echo "$log_line" | grep -oP 'delay\s+\K-?[0-9]+'
 }
 
 # Check if a service is running
@@ -598,7 +665,7 @@ get_service_logs() {
 
     # Wait for sufficient logs
     while [[ $elapsed -lt $max_wait ]]; do
-        logs=$(journalctl _SYSTEMD_INVOCATION_ID="$invocation_id" --no-pager 2>/dev/null)
+        logs=$(sudo journalctl _SYSTEMD_INVOCATION_ID="$invocation_id" --no-pager 2>/dev/null)
         log_count=$(echo "$logs" | wc -l)
 
         if [[ $log_count -ge $min_lines ]]; then
@@ -658,12 +725,14 @@ check_service_timing_values() {
         return 1
     fi
 
-    # Compare against threshold
-    if [[ $rms_val -lt $threshold_rms && $delay_val -lt $threshold_delay ]]; then
+    # Delay can legitimately be negative; compare its magnitude to the limit.
+    local delay_abs="${delay_val#-}"
+    if [[ $rms_val -lt $threshold_rms && $delay_abs -lt $threshold_delay ]]; then
         echo_and_log "[INFO] Current $service locked: rms: ${rms_val}ns delay: ${delay_val}ns)"
         return 0
     else
         echo_and_log "[WARN] Current $service rms: ${rms_val}ns delay: ${delay_val}ns (expected < ${threshold_rms}ns rms and < ${threshold_delay}ns delay when locked)"
+        FAILED=1
         return 1
     fi
 }
@@ -688,6 +757,18 @@ check_ptp4l_master_selection() {
     fi
 }
 
+check_ptp4l_grandmaster_role() {
+    local logs="$1"
+    if echo "$logs" | grep -q "assuming the grand master role"; then
+        echo_and_log "[INFO] Local PTP clock is operating as grandmaster"
+        return 0
+    fi
+    echo_and_log "[WARN] ptp4l did not enter the grandmaster role"
+    echo_and_log "[WARN] Check logs: journalctl -u ptp4l -f"
+    FAILED=1
+    return 1
+}
+
 # Check PTP sync status
 check_ptp_sync() {
     echo_and_log "[INFO] Checking PTP synchronization status..."
@@ -696,8 +777,19 @@ check_ptp_sync() {
     check_service_running "ptp4l" || return
 
     local ptp4l_logs
-    ptp4l_logs=$(get_service_logs "ptp4l" 20 30)
+    if [[ "$PTP_ROLE" == "master" ]]; then
+        ptp4l_logs=$(get_service_logs "ptp4l" 7 30)
+        if [[ -n $ptp4l_logs ]]; then
+            check_ptp4l_grandmaster_role "$ptp4l_logs" || return
+        else
+            echo_and_log "[ERROR] Could not retrieve ptp4l logs"
+            FAILED=1
+        fi
+        check_service_running "phc2sys" || return
+        return
+    fi
 
+    ptp4l_logs=$(get_service_logs "ptp4l" 20 30)
     if [[ -n $ptp4l_logs ]]; then
         check_ptp4l_master_selection "$ptp4l_logs"
         check_service_timing_values "ptp4l" "$ptp4l_logs" 100 150
@@ -747,12 +839,18 @@ main() {
 
     disable_ntp
     install_linuxptp
+    create_aerial_sysctl_config
 
-    # Detect which interface has PTP traffic
-    detect_ptp_traffic || {
-        echo_and_log "[WARN] Continuing with default interface: ${FH_INTERFACE}"
-        PTP_INTERFACE="$FH_INTERFACE"
-    }
+    # A client can discover its upstream grandmaster. A master has no upstream
+    # traffic to discover, so use the requested/platform-default interface.
+    if [[ "$PTP_ROLE" == "master" ]]; then
+        PTP_INTERFACE="$(ptp_interface)"
+    else
+        detect_ptp_traffic || {
+            PTP_INTERFACE="$(ptp_interface)"
+            echo_and_log "[WARN] Continuing with default interface: ${PTP_INTERFACE}"
+        }
+    fi
     echo_and_log "[INFO] Using PTP interface: ${PTP_INTERFACE}"
     echo ""
 
@@ -761,8 +859,10 @@ main() {
     create_phc2sys_service
     install_nvidia_script
     create_nvidia_service
-    install_nvidia_persistenced
-    if [[ $PLATFORM == "NVIDIA_DGX_Spark_P4242" ]]; then
+    if [[ "$INSTALL_GPU" == "1" ]]; then
+        install_nvidia_persistenced
+    fi
+    if [[ "$PLATFORM" == "DGX-Spark" ]]; then
         create_cpu_latency_service
     fi
     enable_services

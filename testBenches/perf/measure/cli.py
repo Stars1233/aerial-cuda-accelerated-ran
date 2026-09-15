@@ -21,11 +21,19 @@ import re
 from pathlib import Path
 
 from .FDD.properties import avg_subs, het_subs
+from .channel_only import configure_channel_only, validate_channel_only
 
 
 def arguments():
 
     base = argparse.ArgumentParser()
+    try:
+        from ._debug_mode_extensions import register_cli as register_debug_cli
+    except ModuleNotFoundError as error:
+        optional_module = f"{__package__}._debug_mode_extensions"
+        if error.name != optional_module:
+            raise
+        register_debug_cli = None
     base.add_argument(
         "--yaml",
         type=str,
@@ -153,12 +161,6 @@ def arguments():
         help="Specifies the number of sub-CTXs to use",
     )
     base.add_argument(
-        "--force",
-        type=int,
-        dest="force",
-        help="Specifies the number of connections to use",
-    )
-    base.add_argument(
         "--priority",
         action="store_true",
         dest="is_priority",
@@ -221,11 +223,23 @@ def arguments():
         help="Enable --export sqlite in nsys profile command",
     )
     base.add_argument(
+        "--nsys_use_cuda_sw",
+        action="store_true",
+        dest="is_nsys_use_cuda_sw",
+        default=False,
+        help="Use --trace cuda-sw (software based legacy trace) instead of --trace cuda (Hardware Event System for Blackwell)",
+    )
+    debug_modes = ["nsys", "ncu", "nsys_simple"]
+    validate_debug_cli = None
+    if register_debug_cli is not None:
+        debug_modes, validate_debug_cli = register_debug_cli(base, debug_modes)
+
+    base.add_argument(
         "--debug_mode",
         type=str,
         dest="debug_mode",
-        choices=["cta", "triage", "nsys", "ncu", "incu", "nsys_simple"],
-        default="cta",
+        choices=debug_modes,
+        default="nsys",
         help="Specifies which debug mode to use",
     )
     base.add_argument(
@@ -233,6 +247,20 @@ def arguments():
         action="store_true",
         dest="is_rec_bf",
         help="Specifies whether the use case involves reciprocal beamforming",
+    )
+    # Phase-3 channel-only (GT-12714): only modes --rec_bf cannot express.
+    # PUSCH/PDSCH isolation uses existing --no_pusch / --no_pdsch (via YAML).
+    base.add_argument(
+        "--dl_bf_only",
+        action="store_true",
+        dest="is_dl_bf_only",
+        help="Run DL beamforming only (PDSCH context + DLBFW; no PUSCH/SRS/ULBFW)",
+    )
+    base.add_argument(
+        "--srs_only",
+        action="store_true",
+        dest="is_srs_only",
+        help="Run SRS only (isolated SRS context; no PDSCH/PUSCH)",
     )
     base.add_argument(
         "--prach",
@@ -359,12 +387,12 @@ def arguments():
         dest="is_pusch_cascaded",
         help="Specifies whether for, DDDSUUDDDD, the second UL slot needs to be processed after the first",
     )
-    base.add_argument("--triage_start", type=int, dest="triage_start", help="Internal")
-    base.add_argument("--triage_end", type=int, dest="triage_end", help="Internal")
     base.add_argument(
-        "--triage_sample", type=int, default=1024, dest="triage_sample", help="Internal"
+        "--pucch_cascaded",
+        action="store_true",
+        dest="is_pucch_cascaded",
+        help="Specifies whether PUCCH2 cascades after PUCCH1 completion (independent of pusch_cascaded)",
     )
-
     base.add_argument(
         "--ldpc_parallel",
         action="store_true",
@@ -408,12 +436,35 @@ def arguments():
         dest="is_mac_timer",
         help="Specifies whether MAC workload use its internal timer",
     )
+
+    base.add_argument(
+        "--fix_ul_cell_count",
+        type=int,
+        default=-1,
+        dest="fix_ul_cell_count",
+        help="Fix UL channels (PUSCH/PRACH/PUCCH/SRS/ULBFW) at exactly this many cells regardless of sweep; -1 = vary with sweep (default)",
+    )
+
+    base.add_argument(
+        "--fix_dl_cell_count",
+        type=int,
+        default=-1,
+        dest="fix_dl_cell_count",
+        help="Fix DL channels (PDSCH/PDCCH/CSIRS/SSB/DLBFW) at exactly this many cells regardless of sweep; -1 = vary with sweep (default)",
+    )
         
     base.add_argument(
         "--GH200",
         action="store_true",
         dest="is_GH200", # true to overwrite; false will auto detect
         help="Specifies whether the hardware is GH200; automatically set if not overwrite by input",
+    )
+
+    base.add_argument(
+        "--device_max_connections",
+        type=int,
+        dest="device_max_connections",
+        help="Control value of CUDA_DEVICE_MAX_CONNECTIONS env. variable; if set, it will be set in cubb_gpu_testbench.cpp",
     )
     
     base.add_argument(
@@ -431,12 +482,45 @@ def arguments():
     )
 
     base.add_argument(
+        "--setup_once",
+        action="store_true",
+        dest="is_setup_once",
+        help="Skip per-pattern re-setup; reuse first pattern's TVs for all iterations (faster latency sweeps)",
+    )
+
+    base.add_argument(
         "--pusch_subslot_proc",
         type=str,
         dest="pusch_subslot_proc",
         choices=["0", "1", "00", "01", "10", "11"],
         default="0",
         help="Specifies the subslot processing setting for PUSCH",
+    )
+
+    base.add_argument(
+        "--trt_chest_config",
+        type=str,
+        dest="trt_chest_config",
+        default="",
+        help="Path to a chest_trt YAML enabling the TensorRT AI/ML PUSCH channel estimator "
+             "(translated to the test bench's --E flag). Empty = disabled (legacy chest). "
+             "Independent of override_test_vectors.",
+    )
+
+    base.add_argument(
+        "--enable_gpu_metric",
+        action="store_true",
+        dest="is_enable_gpu_metric",
+        default=False,
+        help="Add --gpu-metrics-devices to nsys profile command",
+    )
+
+    base.add_argument(
+        "--gpu_metric_set",
+        type=str,
+        dest="gpu_metric_set",
+        default=None,
+        help="GPU metrics config file path for nsys --gpu-metrics-set=file:<path> (implies --enable_gpu_metric)",
     )
 
     base.add_argument(
@@ -641,6 +725,8 @@ def arguments():
             "start_delay",
             "latency_budget",
             "override_test_vectors",
+            "cumac_options",
+            "green_context_sm_alloc",
         }
 
         ignored_yaml_keys: list[str] = []
@@ -681,6 +767,11 @@ def arguments():
 
     # Parse YAML-expanded argv first, then append CLI argv (CLI wins on repeated flags).
     args = base.parse_args(injected_argv + remaining_argv)
+    # Map --dl_bf_only / --srs_only to existing disable flags; no-op when unset.
+    try:
+        configure_channel_only(args)
+    except ValueError as exc:
+        base.error(str(exc))
     # Preserve YAML path for downstream modules that consume extra YAML-only sections
     # (e.g., tdd_priorities/start_delay/override_test_vectors/latency_budget).
     args.yaml = yaml_args.yaml
@@ -699,6 +790,16 @@ def arguments():
         base.error(
             "The minimum number of cells to try cannot be higher than the maximum"
         )
+
+    for opt_name, opt_val in {
+        "fix_ul_cell_count": args.fix_ul_cell_count,
+        "fix_dl_cell_count": args.fix_dl_cell_count,
+    }.items():
+        if opt_val < -1 or opt_val == 0:
+            base.error(f"--{opt_name} must be -1 (sweep) or a positive integer (>=1)")
+
+    if args.gpu_metric_set:
+        args.is_enable_gpu_metric = True
 
     if args.is_no_mps:
         args.is_no_mps = False
@@ -745,6 +846,9 @@ def arguments():
     else:
         raise NotImplementedError
 
+    # Reject invalid combinations (e.g. channel-only + --rec_bf) before run_TDD().
+    validate_channel_only(base, args)
+
     if args.is_rec_bf:
         if (
             "TDD" not in args.uc
@@ -788,14 +892,8 @@ def arguments():
                     "This is a released version of the performance scripts, and debug mode cannot be enabled."
                 )
 
-    if args.is_debug:
-        if args.debug_mode == "triage":
-            if (
-                args.triage_start is None
-                or args.triage_end is None
-                or args.triage_sample is None
-            ):
-                base.error("Triage mode is not supported without all of its parameters")
+    if args.is_debug and validate_debug_cli is not None:
+        validate_debug_cli(base, args)
 
     if args.is_power:
         if args.is_debug:

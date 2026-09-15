@@ -22,7 +22,7 @@ find_package(CUDAToolkit REQUIRED)
 find_package(gsl-lite REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(WiseEnum REQUIRED)
-find_package(mathdx REQUIRED COMPONENTS cufftdx CONFIG PATHS "/usr/local/nvidia/mathdx/25.06/")
+find_package(mathdx REQUIRED COMPONENTS cufftdx CONFIG PATHS "/usr/local/nvidia/mathdx/26.03/")
 
 # Generation of compile time LUTs for CRC
 
@@ -85,6 +85,9 @@ set(CUPHY_LDPC_SOURCES
     cuphy_common.cpp
     ldpc/ldpc_api.cpp
     ldpc/ldpc_api.hpp
+    ldpc/ldpc_cb_kernel_api.h
+    ldpc/ldpc_cb_kernel_spi.cpp
+    ldpc/ldpc_cb_prepare_launch.cpp
 
     cuphy_context.hpp
     cuphy_context.cpp
@@ -114,8 +117,14 @@ set(CUPHY_LDPC_SOURCES
     error_correction/ldpc2_dec_output.cuh
     error_correction/ldpc.cpp
     error_correction/ldpc2.hpp
-    error_correction/ldpc2_bg_desc.cpp
-    error_correction/ldpc2_bg_desc_half2.cpp
+    error_correction/ldpc2_bg_desc_8.cpp
+    error_correction/ldpc2_bg_desc_16.cpp
+    error_correction/ldpc2_bg_desc_nzs_16.cpp
+    error_correction/ldpc2_bg_adj_desc_8.cpp
+    error_correction/ldpc2_bg_adj_desc_16.cpp
+    error_correction/ldpc2_bg_adj_desc_nzs_16.cpp
+    error_correction/ldpc2_bg_adj_desc_nzs_32.cpp
+    error_correction/ldpc2_bg_adj_desc_32.cpp
     error_correction/ldpc2_bg_desc.hpp
     error_correction/ldpc2_c2v_cache_register.cuh
     error_correction/ldpc2_c2v_cache_global.cuh
@@ -129,6 +138,7 @@ set(CUPHY_LDPC_SOURCES
     error_correction/ldpc2_app_address_fp.cuh
     error_correction/ldpc2_app_address_fp_desc.cuh
     error_correction/ldpc2_app_address_fp_dp_desc.cuh
+    error_correction/ldpc2_app_address_nzs_util.cuh
     error_correction/ldpc2_reg_index_fp_desc_dyn.hpp
     error_correction/ldpc2_reg_index_fp_desc_dyn.cu
     error_correction/ldpc2_reg_index_fp_desc_dyn_small.hpp
@@ -141,10 +151,51 @@ set(CUPHY_LDPC_SOURCES
     error_correction/ldpc2_reg_index_fp_dp_desc_dyn_row_dep.cu
     error_correction/ldpc2_shm_index_fp_desc_dyn.hpp
     error_correction/ldpc2_shm_index_fp_desc_dyn.cu
+    error_correction/ldpc2_index_fp_x2_allreg.hpp
+    error_correction/ldpc2_index_fp_x2_allreg.cu
+    error_correction/ldpc2_index_fp_x2_allreg_regapp.hpp
+    error_correction/ldpc2_index_fp_x2_allreg_regapp.cu
+    error_correction/ldpc2_split_index_bp_x2_desc_dyn.hpp
+    error_correction/ldpc2_split_index_bp_x2_desc_dyn.cu
+    error_correction/ldpc2_index_bp_x2_lowp.hpp
+    error_correction/ldpc2_index_bp_x2_lowp.cu
+    # Band decoders: the BG1 / p=4 / Z=384 point kernel and the four
+    # consolidated Z >= 256 band kernels.
+    error_correction/ldpc2_algo103.hpp
+    error_correction/ldpc2_algo103.cuh
+    error_correction/ldpc2_algo103.cu
+    error_correction/ldpc2_algo201.hpp
+    error_correction/ldpc2_algo201.cu
+    error_correction/ldpc2_algo202.hpp
+    error_correction/ldpc2_algo202.cu
+    error_correction/ldpc2_algo203.hpp
+    error_correction/ldpc2_algo203.cu
+    error_correction/ldpc2_algo204.hpp
+    error_correction/ldpc2_algo204.cu
+    error_correction/ldpc2_c2v_cache_split_band.cuh
+    error_correction/ldpc2_app_address_dp_z_imm.cuh
+    error_correction/ldpc2_box_plus_x2.cuh
+    error_correction/ldpc2_split_index_dp_x2_desc_dyn.hpp
+    error_correction/ldpc2_split_index_dp_x2_desc_dyn.cu
+    error_correction/ldpc2_split_index_p_x2_desc_dyn.hpp
+    error_correction/ldpc2_split_index_p_x2_desc_dyn.cu
     error_correction/ldpc2_split_index_fp_x2_desc_dyn.hpp
     error_correction/ldpc2_split_index_fp_x2_desc_dyn.cu
-    error_correction/ldpc2_reg_box_plus.hpp
-    error_correction/ldpc2_reg_box_plus.cu
+    error_correction/ldpc2_split_index_fp_dp_x2_desc_dyn.hpp
+    error_correction/ldpc2_split_index_fp_dp_x2_desc_dyn.cu
+    error_correction/ldpc2_reg_box_plus_fp.hpp
+    error_correction/ldpc2_reg_box_plus_fp.cu
+    error_correction/ldpc2_reg_box_plus_fp_dp.hpp
+    error_correction/ldpc2_reg_box_plus_fp_dp.cu
+    error_correction/ldpc2_reg_box_plus_fp8_fp.hpp
+    error_correction/ldpc2_reg_box_plus_fp8_fp.cu
+    error_correction/ldpc2_reg_box_plus_fp8_fp_dp.hpp
+    error_correction/ldpc2_reg_box_plus_fp8_fp_dp.cu
+    error_correction/ldpc2_reg_box_plus_spec.hpp
+    error_correction/ldpc2_reg_box_plus_spec.cu
+    error_correction/ldpc2_reg_box_plus_spec_high.hpp
+    error_correction/ldpc2_reg_box_plus_spec_high.cu
+    error_correction/ldpc2_c2v_fp8.cuh
     error_correction/ldpc2_c2v_x2.cuh
     error_correction/ldpc2.cuh
     error_correction/ldpc2.cpp
@@ -153,11 +204,13 @@ set(CUPHY_LDPC_SOURCES
 
     rate_matching/rate_matching.cu
 
+    dl_rate_matching/dl_rate_matching.cuh
+    dl_rate_matching/dl_rate_matching.cu
+
     crc/crc.cu
 )
 
 add_library(cuphy
-    ${CUPHY_LDPC_SOURCES}
     cuphy_err.hpp
     cuphy_utils.hpp
     cuphy.cpp
@@ -198,8 +251,6 @@ add_library(cuphy
     cfo_ta_est/cfo_ta_est.hpp
     cfo_ta_est/cfo_ta_est.cu
     channel_eq/channel_eq.cu
-    dl_rate_matching/dl_rate_matching.cuh
-    dl_rate_matching/dl_rate_matching.cu
     descrambling/descrambling.cu
     pusch_rssi/pusch_rssi.cu
     pucch_receiver/pucch_receiver.cu
@@ -210,6 +261,7 @@ add_library(cuphy
     prach_receiver/prach_receiver.cu
     modulation_mapper/modulation_mapper.cu
     pdcch/embed_pdcch_tf_signal.cu
+    pdcch/pdcch_fused_tx.cu
     pdsch_dmrs/pdsch_dmrs.cu
     ss/ss.cu
     trt_engine/trt_engine.cpp
@@ -360,8 +412,8 @@ target_include_directories(cuphy PRIVATE crc
 set(CUPHY_OPTS ${CUPHY_PTXAS_OPTIONS} --cudart static ${CUPHY_NVCC_FLAGS} --threads 0 --expt-relaxed-constexpr)
 
 target_compile_options(cuphy PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUPHY_OPTS}>)
+target_compile_definitions(cuphy PRIVATE CUPHY_CLMAD_BUILD_ENABLED=${CUPHY_CLMAD_BUILD_ENABLED})
 
-set_source_files_properties(error_correction/ldpc_ms_cta_shmem_layered.cu PROPERTIES COMPILE_FLAGS --use_fast_math)
 set_source_files_properties(pucch_receiver/pucch_receiver.cu PROPERTIES COMPILE_FLAGS --use_fast_math)
 set_source_files_properties(prach_receiver/prach_receiver.cu PROPERTIES COMPILE_FLAGS --use_fast_math)
 set_source_files_properties(ss/ss.cu PROPERTIES COMPILE_FLAGS --use_fast_math)
@@ -386,36 +438,7 @@ endif()
 target_link_libraries(cuphy PUBLIC cuda CUDA::nvtx3 ${NVLOG_LIB} ${NVINFER} gsl-lite::gsl-lite yaml-cpp mathdx::cufftdx)
 target_link_libraries(cuphy PUBLIC aerial_utils)
 target_link_libraries(cuphy PUBLIC CUDA::cupti)
-
-# Function to setup LDPC decoder cubins for a target
-function(setup_ldpc_cubins TARGET_NAME)
-    set(LDPC_WRAPPER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/error_correction/ldpc_cubin_wrappers")
-    set(LDPC_CUBIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/error_correction/ldpc_decoder_cubin")
-
-    if (ENABLE_CUPHY_INTERNAL_LDPC_DECODER)
-        include(../../../../internal/cuPHY/src/cuphy/cuphy_lib_internal.cmake)
-        target_include_directories(${TARGET_NAME} PRIVATE ${LDPC_WRAPPER_DIR})
-        target_compile_definitions(${TARGET_NAME} PRIVATE USE_LDPC_CUBIN)
-    else()
-        if (EXISTS "${LDPC_WRAPPER_DIR}" AND EXISTS "${LDPC_CUBIN_DIR}/ldpc_decoder_cubin.s")
-            target_sources(${TARGET_NAME} PRIVATE "${LDPC_CUBIN_DIR}/ldpc_decoder_cubin.s")
-            target_sources(${TARGET_NAME} PRIVATE
-                "${LDPC_WRAPPER_DIR}/ldpc2_reg_index_fp_desc_dyn_sm80.cu"
-                "${LDPC_WRAPPER_DIR}/ldpc2_reg_index_fp_desc_dyn_row_dep_sm80.cu"
-                "${LDPC_WRAPPER_DIR}/ldpc2_reg_index_fp_desc_dyn_row_dep_sm86.cu"
-                "${LDPC_WRAPPER_DIR}/ldpc2_reg_index_fp_desc_dyn_row_dep_sm90.cu"
-                "${LDPC_WRAPPER_DIR}/ldpc2_split_index_fp_x2_desc_dyn_sm86.cu"
-                "${LDPC_WRAPPER_DIR}/ldpc2_split_index_fp_x2_desc_dyn_sm90.cu")
-
-            target_include_directories(${TARGET_NAME} PRIVATE ${LDPC_WRAPPER_DIR} ${LDPC_CUBIN_DIR})
-            target_compile_definitions(${TARGET_NAME} PRIVATE USE_LDPC_CUBIN)
-        endif()
-    endif()
-
-endfunction()
-
-# Setup LDPC decoder cubins for cuphy
-setup_ldpc_cubins(cuphy)
+target_link_libraries(cuphy PUBLIC cuphy_ldpc)
 
 # Header-only INTERFACE library for cuPHY
 add_library(cuphy_h INTERFACE)
@@ -432,7 +455,11 @@ target_compile_features(cuphy_h INTERFACE cxx_std_20)
 # Stripped down cuphy_ldpc library
 # ----------------------------------------------------------------------
 
-add_library(cuphy_ldpc ${CUPHY_LDPC_SOURCES} ${LDPC_CUDA_SOURCES})
+add_library(cuphy_ldpc ${CUPHY_LDPC_SOURCES})
+target_compile_definitions(cuphy_ldpc PRIVATE CUPHY_CLMAD_BUILD_ENABLED=${CUPHY_CLMAD_BUILD_ENABLED})
+if(CUPHY_LDPC_REVERSE_ROWS)
+    target_compile_definitions(cuphy_ldpc PRIVATE CUPHY_LDPC_REVERSE_ROWS=1)
+endif()
 add_library(cuphy::cuphy_ldpc ALIAS cuphy_ldpc)
 
 add_dependencies(cuphy_ldpc CRCLUTGEN)
@@ -445,8 +472,8 @@ target_include_directories(cuphy_ldpc
     PRIVATE
         ../../nvlog
         error_correction
-        error_correction/ldpc_decoder_cubin
         rate_matching
+        dl_rate_matching
         descrambling
         crc
         "${CMAKE_CURRENT_BINARY_DIR}/LUTS"
@@ -463,5 +490,5 @@ target_compile_options(cuphy_ldpc PRIVATE
                        ${AERIAL_ARCH_TUNE_FLAGS}
                        $<$<COMPILE_LANGUAGE:CUDA>:${CUPHY_OPTS}>)
 
-# Setup LDPC decoder cubins for cuphy_ldpc
-setup_ldpc_cubins(cuphy_ldpc)
+target_compile_definitions(cuphy_ldpc PRIVATE
+    CUPHY_LDPC_SPLIT_DUMP_KERNELS=$<BOOL:${CUPHY_LDPC_SPLIT_DUMP_KERNELS}>)

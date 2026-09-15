@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +33,8 @@ struct polarDecoderDynDescr
     uint32_t**         polCbEstAddrs;
     bool**             listPolScratchAddrs;
     uint8_t*           pPolCrcErrorFlags;
+    uint16_t           nPolCws;            //!< number of codewords in this launch
+    uint16_t           scSharedSliceBytes; //!< per-warp dynamic shared-memory slice of the SC decoder
 };
 typedef struct polarDecoderDynDescr polarDecoderDynDescr_t;
 

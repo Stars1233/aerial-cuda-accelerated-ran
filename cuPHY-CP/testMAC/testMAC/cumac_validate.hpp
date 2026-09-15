@@ -74,7 +74,7 @@ public:
     void log_value(int level, const char* name1, const char* name2, int8_t val1, int8_t val2);
     void log_value(int level, const char* name1, const char* name2, float val1, float val2);
     void log_value(int level, const char* name1, const char* name2, float2* val1, float2* val2, uint len);
-    void log_bytes(int level, const char* name1, const char* name2, void* buf1, void* buf2, vald_result_t result);
+    void log_bytes(int level, const char* name1, const char* name2, void* buf1, void* buf2, vald_result_t result, size_t nbytes = 0);
 
     // Check whether to log per configuration
     bool should_log(vald_result_t result)
@@ -222,7 +222,7 @@ public:
 
         if(should_log(check_result))
         {
-            log_bytes(level, name1, name2, buf1, buf2, check_result);
+            log_bytes(level, name1, name2, buf1, buf2, check_result, nbytes);
         }
 
         return check_result == VALD_OK ? 0 : report(level);

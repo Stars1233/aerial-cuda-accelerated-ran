@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,7 +37,19 @@ target_compile_options(${TARGET_SCF} PRIVATE ${AERIAL_ARCH_TUNE_FLAGS})
 # required in case of nvtx
 target_link_directories(${TARGET_SCF} PRIVATE "${CUDA_TOOLKIT_ROOT_DIR}/lib64")
 
-target_link_libraries(${TARGET_SCF} yaml cuphydriver scf_5g_fapi nvphy nvlog cuphyoamlib mimalloc app_config aerial_sdk_version app_utils CUDA::cudart)
+target_link_libraries(${TARGET_SCF}
+    yaml
+    cuphydriver
+    cuda_driver_utils
+    # scf_5g_fapi and nvphy have circular static-archive refs; rescan resolves both.
+    "$<LINK_GROUP:RESCAN,scf_5g_fapi,nvphy>"
+    nvlog
+    cuphyoamlib
+    mimalloc
+    app_config
+    aerial_sdk_version
+    app_utils
+    CUDA::cudart)
 
 if (AERIAL_METRICS)
     target_link_libraries(${TARGET_SCF} aerial_metrics)
@@ -45,7 +57,7 @@ endif()
 
 #Add path to DOCA GPU DPDK libraries
 target_link_directories(${TARGET_SCF} PRIVATE ${DPDK_LIBRARY_DIRS})
-target_link_directories(${TARGET_SCF} PRIVATE ${DPDK_LIBRARY_DIRS}/dpdk/pmds-23.0)
+target_link_dpdk_pmd_directories(${TARGET_SCF})
 
 # To aviod /usr/lib/aarch64-linux-gnu/libcrypto.so and /usr/local/lib/libcrypto.so coexist conflict
 target_link_libraries(${TARGET_SCF} OpenSSL::Crypto OpenSSL::SSL)

@@ -28,6 +28,7 @@
 #include <mutex>
 #include <queue>
 #include <list>
+#include <span>
 #include "nv_mac.hpp"
 #include "nv_phy_epoll_context.hpp"
 #include "nvlog.hpp"
@@ -47,7 +48,7 @@ using namespace nv;
 #define END_REQUEST_PER_SLOT (1)
 #define END_REQUEST_PER_CELL (2)
 
-#define FAPI_MAX_UE 64 
+#define FAPI_MAX_UE 64
 #define FAPI_MAX_UL_HARQ_ID 16 // Refer to SCF 222, harqProcessID value range: 0 -> 15
 #define FAPI_MAX_HARQ_RETX 3
 
@@ -116,6 +117,7 @@ public:
     {
         fapi_build_num = 0;
         fapi_sent_num = 0;
+        slot_resp_sent = false;
         for (int i = 0; i < FAPI_REQ_SIZE; i++)
         {
             fapi_msg_cache[i].reset();
@@ -124,6 +126,7 @@ public:
 
     int32_t fapi_build_num;
     int32_t fapi_sent_num;
+    bool slot_resp_sent{false};  // true if SLOT.resp was sent for this sched (avoids double-send when fapi_tx_deadline_enable)
     std::vector<int32_t> zero_target_ts_offsets;
     std::vector<int32_t> *target_ts_offsets[FAPI_REQ_SIZE];
 
@@ -192,10 +195,38 @@ typedef struct
     stat_log_t* stat_diff; // Statistic for difference between the expected scheduling end time and actual end time
 } stt_estimate_t;
 
+/**
+ * Base class for SCF FAPI scheduling, validation, and IPC-backed TX/RX.
+ *
+ * The handler does not own nv::phy_mac_transport; register it with set_transport() before runtime
+ * send/receive paths (tx_alloc, tx_send, rx_recv, etc.). The scf_fapi_handler prebuild path encodes into
+ * standalone host buffers sized from test_mac_configs and does not call transport().
+ */
 class fapi_handler {
 public:
-    fapi_handler(phy_mac_transport& transport, test_mac_configs* configs, launch_pattern* lp, ch8_conformance_test_stats* conformance_test_stats);
+    /**
+     * @param[in] configs                 Parsed test MAC / FAPI configuration (not owned).
+     * @param[in] lp                      Launch pattern for schedule and per-slot FAPI groups (not owned).
+     * @param[in] conformance_test_stats Optional throughput / conformance stats sink; may be nullptr.
+     */
+    fapi_handler(test_mac_configs* configs, launch_pattern* lp, ch8_conformance_test_stats* conformance_test_stats);
     virtual ~fapi_handler();
+
+    fapi_handler(const fapi_handler&) = delete;
+    fapi_handler& operator=(const fapi_handler&) = delete;
+    fapi_handler(fapi_handler&&) = delete;
+    fapi_handler& operator=(fapi_handler&&) = delete;
+
+    /**
+     * Register the MAC-PHY NVIPC transport used at runtime for allocation and send/receive.
+     * Does not take ownership of @p transport.
+     *
+     * @param[in] transport Live transport instance, or nullptr to clear the registered pointer.
+     */
+    void set_transport(phy_mac_transport* transport);
+
+    /** @return Registered transport, or nullptr if set_transport() has not been called yet. */
+    [[nodiscard]] phy_mac_transport* get_transport() const { return transport_; }
 
     virtual void cell_init(int cell_id)       = 0;
     virtual void cell_start(int cell_id)      = 0;
@@ -221,6 +252,31 @@ public:
     virtual int send_start_request(int cell_id)  = 0;
     virtual int send_stop_request(int cell_id)   = 0;
 
+    /**
+     * Serialize CONFIG.req and scheduled-slot downlink FAPI messages into cached host buffers.
+     *
+     * @return 0 on success, negative on fatal build/alloc failure (implementation-defined).
+     * @note At most one successful run per handler instance; a second call returns -1 without reallocating.
+     */
+    [[nodiscard]] virtual int prebuild_downlink_messages() = 0;
+
+    /**
+     * @param[in] cell_id Logical MAC cell index (after cell_id_map remapping).
+     * @return Address of the cached CONFIG descriptor for that cell, or nullptr if @p cell_id is out of range
+     *         or prebuild was not run (@ref prebuild_downlink_messages).
+     * @note The returned pointer aliases internal storage; do not free and do not use after the handler is destroyed.
+     */
+    [[nodiscard]] const nv::phy_mac_msg_desc* get_prebuilt_config_req(int cell_id) const;
+
+    /**
+     * @param[in] cell_id Logical MAC cell index.
+     * @param[in] ss      SFN/slot used to pick the repeating launch-pattern row.
+     * @return View over the per-cell prebuilt slot messages for that pattern index, or an empty span if @p cell_id is invalid
+     *         or prebuild was not run (@ref prebuild_downlink_messages).
+     * @note The returned span aliases internal storage; do not use after the handler is destroyed.
+     */
+    [[nodiscard]] std::span<const nv::phy_mac_msg_desc> get_prebuilt_slot_messages(int cell_id, sfn_slot_t ss) const;
+
     void update_dl_thrput(uint32_t sfn, uint32_t slot, uint64_t slot_counter);
     void print_thrput(uint64_t slot_counter);
 
@@ -235,7 +291,7 @@ public:
     // OAM negative test
     int set_fapi_delay(int cell_id, int slot, int fapi_mask, int delay_us);
 
-    int get_cell_num()
+    int get_cell_num() const
     {
         return cell_num;
     }
@@ -302,13 +358,13 @@ public:
         return next;
     }
 
-    uint32_t get_slot_in_frame(sfn_slot_t& ss)
+    uint32_t get_slot_in_frame(const sfn_slot_t& ss) const
     {
         uint32_t index = ss.u16.sfn; // extend to uint32_t
         return index * slots_per_frame + ss.u16.slot;
     }
 
-    uint32_t get_slot_in_frame(uint16_t sfn, uint16_t slot)
+    uint32_t get_slot_in_frame(uint16_t sfn, uint16_t slot) const
     {
         uint32_t index = sfn; // extend to uint32_t
         return index * slots_per_frame + slot;
@@ -344,11 +400,14 @@ public:
     bool isIdxInMapBfwSrsChestBufIdxList(uint32_t cell_id, uint16_t srsChestBufferIndex);
     void removeIdxInMapBfwSrsChestBufIdxList(uint32_t cell_id, uint16_t srsChestBufferIndex);
 
+    fapi_req_t* get_fapi_req_data(int cell_id, uint16_t sfn, uint16_t slot, channel_type_t channel);
+
 protected:
-    phy_mac_transport& transport()
-    {
-        return _transport;
-    }
+    /**
+     * @return Reference to the transport registered with set_transport().
+     * @throws std::runtime_error if no transport has been set.
+     */
+    phy_mac_transport& transport();
 
     void slot_indication_handler(uint32_t sfn, uint32_t slot, uint64_t slot_counter);
     void static_ul_dl_scheduler(uint32_t sfn, uint32_t slot, uint64_t slot_counter);
@@ -362,8 +421,6 @@ protected:
 
     vector<fapi_req_t*>& get_fapi_req_list(int cell_id, sfn_slot_t ss, fapi_group_t group_id);
 
-    fapi_req_t* get_fapi_req_data(int cell_id, uint16_t sfn, uint16_t slot, channel_type_t channel);
-
     pusch_tv_data_t* get_pusch_tv_pdu(fapi_req_t* pusch_req, int pdu_id, int bitmap);
     pucch_tv_data_t* get_pucch_tv_pdu(fapi_req_t* pucch_req, int pdu_id);
     pucch_tv_data_t* get_pucch_tv_pf234_pdu(fapi_req_t* pucch_req, int pdu_id);
@@ -374,7 +431,7 @@ protected:
 
     int set_restart_timer(int cell_id, int interval);
 
-    int data_buf_opt = 1; //!< Data buffer option: 0=msg_buf, 1=CPU_DATA, 2=CUDA_DATA, 3=GPU_DATA
+    int data_buf_opt = 1; //!< Data pool option: 0=msg_buf/inline, 1=CPU_DATA, 2=CPU_LARGE, 3=GPU_DATA
 
     int cell_num = 0;
 
@@ -416,7 +473,7 @@ protected:
 
     test_mac_configs*  configs = nullptr;
     launch_pattern*    lp = nullptr;
-    phy_mac_transport& _transport;
+    phy_mac_transport* transport_ = nullptr;
 
     //For OAM cell re-attaching to different RUs test, the idea is to replace current cell FAPIs with these of the target cell
 
@@ -431,7 +488,7 @@ protected:
     std::unordered_map<uint32_t, std::unordered_map<uint32_t,uint16_t>> mapOfRntiToSrsChestBufIdx{};
     std::unordered_map<uint32_t, std::unordered_map<uint32_t,uint16_t>> mapOfSrsReqToIndRntiToSrsChestBufIdx{};
     std::unordered_map<uint32_t, std::list<uint16_t>> mapBfwSrsChestBufIdxList{};
-    
+
 
     // Timer for restart all cells
     timer_t restart_timer = nullptr;
@@ -463,8 +520,16 @@ protected:
     int rnti_test_mode = 0; // 0 - default, normal mode; 1 - negative test
 
     ul_harq_handle_t ul_harq_handle[MAX_CELLS_PER_SLOT][FAPI_MAX_UE][FAPI_MAX_UL_HARQ_ID];
-    uint8_t ul_dci_freq_domain_bits = 0; 
+    uint8_t ul_dci_freq_domain_bits = 0;
     std::map<uint16_t, uint16_t> rnti_2_ueid_map;
+
+    // Pre-built slot messages. Dimension: slot, cell, phy_mac_msg_desc;
+    std::vector<std::vector<std::vector<nv::phy_mac_msg_desc>>> slot_msgs;
+    // Pre-built CONFIG.req. Dimension: cell;
+    std::vector<nv::phy_mac_msg_desc> config_reqs;
+
+    /** Set when @ref prebuild_downlink_messages completes successfully; prevents a second prebuild. */
+    bool prebuild_downlink_done{false};
 };
 
 fapi_handler* get_fapi_handler_instance();

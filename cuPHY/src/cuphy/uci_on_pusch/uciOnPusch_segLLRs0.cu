@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,8 +17,12 @@
 
  #include "uciOnPusch_segLLRs0.hpp"
  #include "descrambling.cuh"
+ #include <cassert>
 
 using namespace cuphy_i;
+
+static constexpr int LLRS_BANK_CONFLICT_OFFSET = 0;
+static constexpr int THREAD_STRIDE_HALFS = ((MAX_BITS_PER_RE + LLRS_BANK_CONFLICT_OFFSET + 7) & ~7);
 
  __global__ void
  //__launch_bounds__(168, 6) // 168 = 12 * 14 is maximum CTA size //disabled, since occupancy is not the limiting factor here, but using LB may result in register spills
@@ -68,6 +72,31 @@ using namespace cuphy_i;
    __half* pCsi1LLRs = pDesc->pUePrmsGpu[ueIdx].d_csi1LLRs;
    __half* pSchLLRs  = pDesc->pUePrmsGpu[ueIdx].d_schAndCsi2LLRs;
 
+   // Preload pLayerMap before any early return; otherwise the later block-wide
+   // sync could deadlock for threads that remain active.
+   static_assert(N_SC_PER_PRB >= MAX_N_LAYERS_PUSCH,
+                 "pLayerMap SMEM preload requires at least MAX_N_LAYERS_PUSCH threads");
+   __shared__ uint32_t sh_pLayerMap[MAX_N_LAYERS_PUSCH];
+   // Narrow reGrid preload for the .nRes conditionals:
+   // both are uint16 fields read on every active thread out of a global
+   // reGrid_t struct. Cache them into 28 B each (14 × 2 B). Loaded
+   // cooperatively in the existing pLayerMap-preload region so the cost
+   // is ≤2 extra LDGs per (tid < nSym) lane, hidden behind the existing
+   // __syncthreads.
+   __shared__ uint16_t sh_csi1NRes      [MAX_ND_SUPPORTED];
+   __shared__ uint16_t sh_rvdHarqNRes   [MAX_ND_SUPPORTED];
+   __shared__ uint32_t sh_descramOffsets[MAX_ND_SUPPORTED];
+   const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+   if(tid < MAX_N_LAYERS_PUSCH) {
+      sh_pLayerMap[tid] = pLayerMap[tid];
+   }
+   if(tid < nSym) {
+      sh_csi1NRes[tid]       = perUciPrms.csi1ReGrids[tid].nRes;
+      sh_rvdHarqNRes[tid]    = perUciPrms.rvdHarqReGrids[tid].nRes;
+      sh_descramOffsets[tid] = pDescramOffsets[tid];
+   }
+   __syncthreads();
+
    // check for early exit
    if((symIdx >= nSym) || (prbIdx >= nPrb)){
       return;
@@ -76,44 +105,48 @@ using namespace cuphy_i;
       return;
    }
 
-   // Loads LLRs to be assigned HARQ, CSI-P2, or SCH
-   __half reLLRs[MAX_BITS_PER_RE];
+   // Compute RE descrambling sequence early to overlap ALU work with subsequent LLR global loads
+   uint32_t reDescSeq = 0;
+   const uint32_t descramOffset = sh_descramOffsets[symIdx];
+   if(dmrsFlag){
+      reDescSeq = descrambling::gold32n(cinit, descramOffset + reIdx/2*nBitsPerRe);
+   }else{
+      reDescSeq = descrambling::gold32n(cinit, descramOffset + reIdx*nBitsPerRe);
+   }
+
+   // Loads LLRs to be assigned HARQ, CSI-P2, or SCH. Non-contiguous layouts
+   // keep the shared-memory fallback; contiguous layouts store directly below.
+   extern __shared__ __half sh_buff[];
+   __half* reLLRs = nullptr;
 
    auto tEqOutLLRsAdr = tEqOutLLRs.addr();
    auto layout        = tEqOutLLRs.layout();
    int  s0            = layout.strides[0];
    int  s1            = layout.strides[1];
    int  idx0          = layout.strides[2] * reIdx + layout.strides[3] * symIdx;
+   bool directEqStore  = (s0 == 1);
 
-   if(s0 == 1)
+   if(!directEqStore)
    {
-       // vectorize LD/ST
-       copyLLRsVec(tEqOutLLRsAdr, s1, idx0, reLLRs, nBitsPerQam, nLayers, pLayerMap);
-   }
-   else
-   {
-       for(uint8_t layerIdx = 0; layerIdx < nLayers; ++layerIdx)
-       {
-           int idx1 = pLayerMap[layerIdx] * s1 + idx0;
-           for(uint8_t bitIdx = 0; bitIdx < nBitsPerQam; ++bitIdx)
-           {
-               reLLRs[bitIdx + layerIdx * nBitsPerQam] = tEqOutLLRsAdr[bitIdx * s0 + idx1];
-           }
-       }
-   }
-
-   // RE descrambling sequence
-   uint32_t reDescSeq = 0;
-   if(dmrsFlag){
-      reDescSeq = descrambling::gold32n(cinit, pDescramOffsets[symIdx] + reIdx/2*nBitsPerRe);
-   }else{
-      reDescSeq = descrambling::gold32n(cinit, pDescramOffsets[symIdx] + reIdx*nBitsPerRe);
+      reLLRs = sh_buff + THREAD_STRIDE_HALFS * tid;
+      for(uint8_t layerIdx = 0; layerIdx < nLayers; ++layerIdx)
+      {
+         int idx1 = sh_pLayerMap[layerIdx] * s1 + idx0;
+         for(uint8_t bitIdx = 0; bitIdx < nBitsPerQam; ++bitIdx)
+         {
+            reLLRs[bitIdx + layerIdx * nBitsPerQam] = tEqOutLLRsAdr[bitIdx * s0 + idx1];
+         }
+      }
    }
 
    // If DMRS symbol, descramble and store the LLR
    if(dmrsFlag){
       __half* pRmLLRBuff = pSchLLRs + schRmBuffOffset + reIdx / 2 * nBitsPerRe;
-      descramAndStoreLLRs(reDescSeq, 0, pRmLLRBuff, nBitsPerRe, reLLRs);
+      if(directEqStore) {
+         descramAndStoreLLRsFromGlobal(reDescSeq, 0, pRmLLRBuff, tEqOutLLRsAdr, s1, idx0, nBitsPerQam, nLayers, sh_pLayerMap);
+      } else {
+         descramAndStoreLLRs(reDescSeq, 0, pRmLLRBuff, nBitsPerRe, reLLRs);
+      }
       return;
    }
 
@@ -124,7 +157,7 @@ using namespace cuphy_i;
    uint16_t cumltNumAssignedRes = 0;
    bool     thisReIsPunctFlag   = false;
 
-   if(rvdHarqReGrid.nRes > 0)
+   if(sh_rvdHarqNRes[symIdx] > 0)
    {
       // check if RE reserved to HARQ. Compute the number of REs
       // reserved to HARQ < reIdx
@@ -145,7 +178,11 @@ using namespace cuphy_i;
          if(assignFlag)
          {
             __half* pRmLLRBuff = pHarqLLRs + harqReGrid.rmBufferOffset + cumltNumAssignedRes * nBitsPerRe;
-            descramAndStoreLLRs(reDescSeq, harqSpx1Flag, pRmLLRBuff, nBitsPerRe, reLLRs);
+            if(directEqStore) {
+               descramAndStoreLLRsFromGlobal(reDescSeq, harqSpx1Flag, pRmLLRBuff, tEqOutLLRsAdr, s1, idx0, nBitsPerQam, nLayers, sh_pLayerMap);
+            } else {
+               descramAndStoreLLRs(reDescSeq, harqSpx1Flag, pRmLLRBuff, nBitsPerRe, reLLRs);
+            }
 
             if(harqPunctFlag)
             {
@@ -167,7 +204,7 @@ using namespace cuphy_i;
       return;
    }
 
-   if((csi1ReGrid.nRes > 0) && (!rvdHarqReFlag))
+   if((sh_csi1NRes[symIdx] > 0) && (!rvdHarqReFlag))
    {
       // Check if RE assigend to CSI-P1. Compute the number of CSI-P1 REs
       // assigned < reIdx.
@@ -178,7 +215,11 @@ using namespace cuphy_i;
       if(assignFlag)
       {         
          __half* pRmLLRBuff = pCsi1LLRs + csi1ReGrid.rmBufferOffset + cumltNumAssignedRes * nBitsPerRe;
-         descramAndStoreLLRs(reDescSeq, 0, pRmLLRBuff, nBitsPerRe, reLLRs);
+         if(directEqStore) {
+            descramAndStoreLLRsFromGlobal(reDescSeq, 0, pRmLLRBuff, tEqOutLLRsAdr, s1, idx0, nBitsPerQam, nLayers, sh_pLayerMap);
+         } else {
+            descramAndStoreLLRs(reDescSeq, 0, pRmLLRBuff, nBitsPerRe, reLLRs);
+         }
          return;
       }else
       {
@@ -204,19 +245,34 @@ using namespace cuphy_i;
    {
       if(thisReIsPunctFlag) // If punctured the bits belong to HARQ, set RE LLRs to zero
       {
-         for(uint8_t bitIdx = 0; bitIdx < nBitsPerRe; ++bitIdx)
+         if(!directEqStore)
          {
-            reLLRs[bitIdx] = 0;
+            for(uint8_t bitIdx = 0; bitIdx < nBitsPerRe; ++bitIdx)
+            {
+               reLLRs[bitIdx] = 0;
+            }
          }
       }
 
       __half* pRmBuffer = pSchLLRs + schRmBuffOffset + virtualReIdx * nBitsPerRe;
-      descramAndStoreLLRs(reDescSeq, 0, pRmBuffer, nBitsPerRe, reLLRs);
+      if(directEqStore) {
+         if(thisReIsPunctFlag) {
+            descramAndStoreZeroLLRs(reDescSeq, 0, pRmBuffer, nBitsPerRe);
+         } else {
+            descramAndStoreLLRsFromGlobal(reDescSeq, 0, pRmBuffer, tEqOutLLRsAdr, s1, idx0, nBitsPerQam, nLayers, sh_pLayerMap);
+         }
+      } else {
+         descramAndStoreLLRs(reDescSeq, 0, pRmBuffer, nBitsPerRe, reLLRs);
+      }
    }
 }
 
 
-void kernelSelect(uint16_t nUciUes, uciToUserMap_t* pUciToUserMap, cuphyPuschRxUeGrpPrms_t*  pUeGrpPrmsCpu, cuphyUciOnPuschSegLLRs0LaunchCfg_t* pLaunchCfg)
+void kernelSelect(uint16_t nUciUes,
+                  uciToUserMap_t* pUciToUserMap,
+                  cuphyPuschRxUeGrpPrms_t*  pUeGrpPrmsCpu,
+                  bool allSelectedDirectEqStore,
+                  cuphyUciOnPuschSegLLRs0LaunchCfg_t* pLaunchCfg)
 {
    // determine max number of PRBs and OFDM symbols
    uint16_t MAX_N_PRBS = 0;
@@ -243,7 +299,16 @@ void kernelSelect(uint16_t nUciUes, uciToUserMap_t* pUciToUserMap, cuphyPuschRxU
    //printf("MAX_N_DATA_SYMS[%d]\n", MAX_N_DATA_SYMS);
    // launch geometry
    dim3 blockDim(N_SC_PER_PRB, MAX_N_SYMS);  // One thread block covers one entire PRB: 12 subcarriers x MAX_N_DATA_SYMS
-   dim3 gridDim(MAX_N_PRBS, nUciUes);  
+   dim3 gridDim(MAX_N_PRBS, nUciUes);
+
+   // The kernel's cooperative `tid < nSym` SMEM preloads (sh_pLayerMap,
+   // sh_csi1NRes, sh_rvdHarqNRes, sh_descramOffsets) require the block to
+   // contain at least `nSym` threads. Per-UE nSym is bounded above by
+   // MAX_N_SYMS (computed in the loop above), so this check guards future
+   // changes to blockDim that might shrink it below that bound.
+   assert(blockDim.x * blockDim.y >= MAX_N_SYMS &&
+          "uciOnPuschSegLLRs0Kernel: blockDim.x * blockDim.y must be >= MAX_N_SYMS "
+          "(per-symbol cooperative preloads rely on tid covering [0, nSym))");
 
    // kernel (only one kernel option for now)
    void* kernelFunc = reinterpret_cast<void*>(uciOnPuschSegLLRs0Kernel);
@@ -261,7 +326,9 @@ void kernelSelect(uint16_t nUciUes, uciToUserMap_t* pUciToUserMap, cuphyPuschRxU
    kernelNodeParamsDriver.gridDimZ = gridDim.z;
 
    kernelNodeParamsDriver.extra          = nullptr;
-   kernelNodeParamsDriver.sharedMemBytes = 0;
+   kernelNodeParamsDriver.sharedMemBytes = allSelectedDirectEqStore
+                                             ? 0
+                                             : blockDim.x * blockDim.y * THREAD_STRIDE_HALFS * sizeof(__half);
 }
 
 
@@ -540,6 +607,20 @@ void  uciOnPuschSegLLRs0::setup( uint16_t                             nUciUes,
       }
    }
 
+   // Dynamic shared memory is launch-wide, so keep the fallback allocation if
+   // any selected UE group has a non-contiguous EQ LLR bit stride.
+   bool allSelectedDirectEqStore = true;
+   for(int uciIdx = 0; uciIdx < nSelectedUciUes; ++uciIdx)
+   {
+      const uint16_t ueGrpIdx = pCpuDynDesc->uciToUserMap[uciIdx].ueGrpIdx;
+      auto layout = pCpuDynDesc->tEqOutLLRs[ueGrpIdx].layout();
+      if(layout.strides[0] != 1)
+      {
+         allSelectedDirectEqStore = false;
+         break;
+      }
+   }
+
    // save pointer to GPU descriptor
    uciOnPuschSegLLRs0KernelArgs_t& kernelArgs = m_kernelArgs;
    kernelArgs.pDynDescr = reinterpret_cast<uciOnPuschSegLLRs0DynDescr_t*>(pGpuDynDesc);
@@ -551,7 +632,7 @@ void  uciOnPuschSegLLRs0::setup( uint16_t                             nUciUes,
    }
 
    // select kernel (includes launch geometry). Populate launchCfg.
-   kernelSelect(nSelectedUciUes, pCpuDynDesc->uciToUserMap, pUeGrpPrmsCpu, pLaunchCfg);
+   kernelSelect(nSelectedUciUes, pCpuDynDesc->uciToUserMap, pUeGrpPrmsCpu, allSelectedDirectEqStore, pLaunchCfg);
    
 
    pLaunchCfg->kernelArgs[0]                       = &m_kernelArgs.pDynDescr;

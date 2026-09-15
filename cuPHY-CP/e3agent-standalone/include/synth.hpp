@@ -24,12 +24,13 @@
 
 namespace e3sa::synth {
 
-// Fill placeholder PUSCH scalars (cell + per-UE metrics). Structural fields
-// (sfn/slot/timestamp/indices) are set by the feeder.
-void fillPusch(E3BufferInfo& bi);
+// Fill placeholder PUSCH scalars: n_cells cells, each with per-UE metrics.
+// Slot fields (sfn/slot/timestamp) and per-cell SHM indices are set by the feeder.
+void fillPusch(E3BufferInfo& bi, uint16_t n_cells);
 
-// Fill placeholder SRS scalars (per-UE metrics).
-void fillSrs(E3SrsBufferInfo& si);
+// Fill placeholder SRS scalars: n_cells cells, each with per-UE metrics.
+// Slot fields and per-cell SHM indices are set by the feeder.
+void fillSrs(E3SrsBufferInfo& si, uint16_t n_cells);
 
 // Write one FH IQ row (numFhSamples int16, fp16 bit-patterns) as a per-PRB
 // amplitude ramp (ant, sym, prb, sc, IQ). scale (0..1) modulates the level.

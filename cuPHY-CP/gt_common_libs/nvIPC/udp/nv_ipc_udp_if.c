@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,6 +61,13 @@ typedef struct
 static inline priv_data_t* get_private_data(nv_ipc_t* ipc)
 {
     return (priv_data_t*)((int8_t*)ipc + sizeof(nv_ipc_t));
+}
+
+static int udp_peer_addr_match(const struct sockaddr_in* from, const struct sockaddr_in* expected)
+{
+    return from != NULL && expected != NULL && from->sin_family == AF_INET
+        && from->sin_addr.s_addr == expected->sin_addr.s_addr
+        && from->sin_port == expected->sin_port;
 }
 
 static int setnonblocking(int sockfd)
@@ -144,9 +151,17 @@ static int udp_ipc_init(nv_ipc_t* ipc, nv_ipc_config_udp_t* udp_config)
 
     set_sockaddr_in(&priv_data->local_addr, udp_config->local_addr, udp_config->local_port);
     set_sockaddr_in(&priv_data->remote_addr, udp_config->remote_addr, udp_config->remote_port);
-    priv_data->local_sock = create_udp_socket(0, udp_config->local_port);
+    priv_data->local_sock = create_udp_socket(0, 0);
     if(priv_data->local_sock < 0)
     {
+        return -1;
+    }
+
+    if(bind(priv_data->local_sock, (struct sockaddr*)&priv_data->local_addr, sizeof(priv_data->local_addr)) < 0)
+    {
+        NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "%s bind socket failed: addr=%s port=%d", __func__,
+                udp_config->local_addr, udp_config->local_port);
+        close(priv_data->local_sock);
         return -1;
     }
 
@@ -294,15 +309,47 @@ static int udp_rx_recv_msg(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
     msg->msg_buf     = buf;
     msg->data_buf    = buf + priv_data->msg_buf_size;
 
-    int size     = recvfrom(priv_data->local_sock, msg->msg_buf, max_size, 0, (struct sockaddr*)&from_addr, &addr_len);
-    int data_len = size - get_msg_size(ipc, msg);
+    int size = recvfrom(priv_data->local_sock, msg->msg_buf, max_size, 0, (struct sockaddr*)&from_addr,
+            &addr_len);
 
-    NVLOGV(TAG, "%s: total_len=%d msg_len=%d data_len=%d", __func__, size, msg->msg_len, msg->data_len);
+    if(size < 0)
+    {
+        free(buf);
+        return size;
+    }
+
+    if(!udp_peer_addr_match(&from_addr, &priv_data->remote_addr))
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: datagram from unauthorized peer", __func__);
+        free(buf);
+        return -1;
+    }
+
+    int msg_hdr_size = get_msg_size(ipc, msg);
+    if(size < msg_hdr_size)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: datagram too short: size=%d msg_hdr_size=%d", __func__,
+                size, msg_hdr_size);
+        free(buf);
+        return -1;
+    }
+
+    int data_len = size - msg_hdr_size;
+    msg->msg_len = msg_hdr_size;
+
+    NVLOGV(TAG, "%s: total_len=%d msg_len=%d data_len=%d", __func__, size, msg->msg_len, data_len);
 
     if(data_len > 0)
     {
-        msg->data_len = 0;
-        msg->data_buf = (int8_t*)msg->msg_buf + get_msg_size(ipc, msg);
+        if(data_len > priv_data->data_buf_size)
+        {
+            NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: data_len %d exceeds buffer %d", __func__, data_len,
+                    priv_data->data_buf_size);
+            free(buf);
+            return -1;
+        }
+        msg->data_len = data_len;
+        msg->data_buf = (int8_t*)msg->msg_buf + msg_hdr_size;
     }
     else
     {
@@ -310,15 +357,7 @@ static int udp_rx_recv_msg(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
         msg->data_buf = NULL;
     }
 
-    if(size < 0)
-    {
-        free(buf);
-        return size;
-    }
-    else
-    {
-        return 0;
-    }
+    return 0;
 }
 
 static int udp_get_fd(nv_ipc_t* ipc)

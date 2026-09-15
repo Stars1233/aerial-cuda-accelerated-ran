@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,7 +58,7 @@ public:
     virtual cuphyStatus_t get_launch_config(const ldpc::decoder&           dec,
                                             cuphyLDPCDecodeLaunchConfig_t& launchConfig) override;
 };
-    
+
 } // namespace ldpc2
 
 #endif // !defined(LDPC2_SPLIT_INDEX_FP_X2_DESC_DYN_HPP_INCLUDED_)

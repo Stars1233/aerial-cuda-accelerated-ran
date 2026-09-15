@@ -52,7 +52,7 @@
  * 1. Update the version number if NVIPC has significant change which requires L2 sync NVIPC accordingly.
  * 2. If partner L2 doesn't sync the same nvipc version, will see "NVIPC lib version doesn't match" log at NVIPC initialization.
  */
-#define LIBRARY_VERSION (2530) // 25.3.0
+#define LIBRARY_VERSION (2610) // 26.1.0
 
 #define CONFIG_LOG_ALLOCATE_TIME 1
 #define CONFIG_LOG_SEND_TIME 1
@@ -858,8 +858,7 @@ int nv_ipc_dump_config(nv_ipc_config_t *cfg)
         nv_ipc_config_shm_t *transp_cfg = &cfg->transport_config.shm;
         prefix = transp_cfg->prefix;
         mempool = transp_cfg->mempool_size;
-        NVLOGC(TAG, "[%s]: transport=%d ring_len=%d cuda_device_id=%d",
-                prefix, cfg->ipc_transport, transp_cfg->ring_len, transp_cfg->cuda_device_id);
+        NVLOGC(TAG, "[%s]: transport=%d cuda_device_id=%d", prefix, cfg->ipc_transport, transp_cfg->cuda_device_id);
     }
     else if (cfg->ipc_transport == NV_IPC_TRANSPORT_DPDK)
     {
@@ -1353,7 +1352,7 @@ static int ipc_debug_alloc_hook(nv_ipc_debug_t* ipc_debug, nv_ipc_msg_t* msg, in
 
 sfn_slot_t nv_ipc_get_sfn_slot(nv_ipc_msg_t* msg)
 {
-    if(fapi_type == SCF_FAPI && msg->msg_id > SCF_FAPI_RESV_1_END)
+    if(fapi_type == SCF_FAPI && (msg->msg_id > SCF_FAPI_RESV_1_END || msg->msg_id == SCF_FAPI_ERROR_INDICATION))
     {
         scf_fapi_slot_header_t* header = msg->msg_buf;
         return header->sfn_slot;
@@ -1539,6 +1538,11 @@ static int ipc_debug_send_hook(nv_ipc_debug_t* ipc_debug, nv_ipc_msg_t* msg, int
 
 static int ipc_debug_recv_hook(nv_ipc_debug_t* ipc_debug, nv_ipc_msg_t* msg, int32_t buf_index)
 {
+    if(msg == NULL || buf_index < 0 || buf_index >= ipc_debug->msg_pool_len)
+    {
+        return -1;
+    }
+
     if(ipc_debug->debug_configs.debug_timing)
     {
         msg_timing_t* msg_timing = ipc_debug->msg_timing + buf_index;
@@ -1550,6 +1554,12 @@ static int ipc_debug_recv_hook(nv_ipc_debug_t* ipc_debug, nv_ipc_msg_t* msg, int
     {
         // Check forward enable status from atomic variable in shared memory for both primary app in synchronized save mode
         if (atomic_load(ipc_debug->p_forward_started) == 0)
+        {
+            return 0;
+        }
+
+        if (msg->cell_id < 0 || msg->cell_id >= NVIPC_MAX_CELL_ID
+                || msg->msg_id < 0 || msg->msg_id >= NVIPC_MAX_MSG_ID)
         {
             return 0;
         }
@@ -1594,7 +1604,15 @@ static int ipc_debug_fw_free_hook(nv_ipc_debug_t* ipc_debug, nv_ipc_msg_t* msg, 
 int nv_ipc_dump_msg(nv_ipc_debug_t* ipc_debug, nv_ipc_msg_t* msg, int32_t buf_index, const char* info)
 {
     char log_buf[1024];
-    int  offset = snprintf(log_buf, 128, "%s:", info);
+    int  offset = 0;
+    if(info != NULL)
+    {
+        offset = snprintf(log_buf, sizeof(log_buf), "%.127s:", info);
+    }
+    else
+    {
+        offset = snprintf(log_buf, sizeof(log_buf), "unknown:");
+    }
 
     if(fapi_type == SCF_FAPI)
     {

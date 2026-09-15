@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,11 +55,13 @@ int main(int argc, char* argv[])
         uint64_t procModeBmsk   = SRS_PROC_MODE_FULL_SLOT; // default stream mode
         int32_t  totalIters     = 1000;
         uint32_t                 SMsPerGreenCtx = 0;
+        bool                     skipEval       = false;
         std::ignore = app.add_option("-i", inputFilename, "Input HDF5 or YAML filename")->required();
         std::ignore = app.add_option("-m", procModeBmsk, "SRS processing mode: streams(0x0), graphs (0x1) (default = 0x0)");
         std::ignore = app.add_option("-r", totalIters, "# of iterations, Number of run iterations to run (default = 1000)");
         std::ignore = app.add_option("-o", outputFilename, "Output HDFS debug file");
         std::ignore = app.add_option("--G", SMsPerGreenCtx, "Use green contexts (GC) with specified SM count per context (default = 0; GC disabled)");
+        std::ignore = app.add_flag("--skip-eval", skipEval, "Skip reference evaluation (for TVs without a valid golden, e.g. live captures)");
         CLI11_PARSE(app, argc, argv)
 
         if (totalIters <= 0) {
@@ -285,7 +287,40 @@ int main(int argc, char* argv[])
             // Evaluate results    
 
             cudaStreamSynchronize(cuStrm);
-            srsEvalDataset.evalSrsRx(srsDynApiDataset.srsDynPrm, srsDynApiDataset.tSrsChEstVec, srsDynApiDataset.dataOut.pRbSnrBuffer, srsDynApiDataset.dataOut.pSrsReports, cuStrm);
+            if(!skipEval)
+            {
+                srsEvalDataset.evalSrsRx(srsDynApiDataset.srsDynPrm, srsDynApiDataset.tSrsChEstVec, srsDynApiDataset.dataOut.pRbSnrBuffer, srsDynApiDataset.dataOut.pSrsReports, cuStrm);
+            }
+            else
+            {
+                // No golden reference (e.g. live capture): report chEst NaN%/max|H|
+                // directly so numeric issues (e.g. FP16 overflow) can be spotted
+                // without eval. Allocate hHest with align_tight so it is contiguous
+                // regardless of the source layout's strides (convert() is stride-aware),
+                // which makes the linear p[2*i] traversal below valid by construction.
+                for(size_t ue = 0; ue < srsDynApiDataset.tSrsChEstVec.size(); ++ue)
+                {
+                    cuphy::typed_tensor<CUPHY_C_32F, cuphy::pinned_alloc> hHest(srsDynApiDataset.tSrsChEstVec[ue].layout(), cuphy::tensor_flags::align_tight);
+                    hHest.convert(srsDynApiDataset.tSrsChEstVec[ue], cuStrm);
+                    cudaStreamSynchronize(cuStrm);
+
+                    const auto& dims = hHest.layout().dimensions();
+                    size_t nElem = 1;
+                    for(int d = 0; d < hHest.layout().rank(); ++d) { nElem *= static_cast<size_t>(dims[d]); }
+                    const float* p     = reinterpret_cast<const float*>(hHest.addr());
+                    size_t nBad = 0;
+                    float  maxMag = 0.f;
+                    for(size_t i = 0; i < nElem; ++i)
+                    {
+                        const float re = p[2*i], im = p[2*i + 1];
+                        if(std::isnan(re) || std::isnan(im) || std::isinf(re) || std::isinf(im)) { ++nBad; continue; }
+                        const float mag = std::sqrt(re*re + im*im);
+                        if(mag > maxMag) maxMag = mag;
+                    }
+                    printf("[skip-eval] chEst UE %zu: elems %zu, NaN/Inf %zu (%.2f%%), max|H| %.3f\n",
+                           ue, nElem, nBad, nElem ? 100.0 * double(nBad) / double(nElem) : 0.0, maxMag);
+                }
+            }
             
             //------------------------------------------------------------------
             // Write debug output

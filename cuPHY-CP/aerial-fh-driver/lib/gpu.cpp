@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,9 +47,12 @@ std::string Gpu::get_pci_bus_id() const
 
 std::string Gpu::cuda_device_id_to_pci_bus_id(GpuId cuda_device_id)
 {
+    CUdevice dev;
+    CHECK_CU_THROW(cuDeviceGet(&dev, cuda_device_id));
+
     constexpr size_t                         kGpuPciBusIdBufferSize = 32;
     std::array<char, kGpuPciBusIdBufferSize> buffer;
-    CHECK_CUDA_THROW(cudaDeviceGetPCIBusId(buffer.data(), kGpuPciBusIdBufferSize, cuda_device_id));
+    CHECK_CU_THROW(cuDeviceGetPCIBusId(buffer.data(), static_cast<int>(kGpuPciBusIdBufferSize), dev));
 
     auto pci_bus_id = std::string(buffer.data());
     std::transform(pci_bus_id.begin(), pci_bus_id.end(), pci_bus_id.begin(), [](unsigned char c) { return std::tolower(c); });

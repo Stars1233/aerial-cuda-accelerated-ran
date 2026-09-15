@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 9) // "DRV.TASK"
 
 #include "task.hpp"
+#include <gsl-lite/gsl-lite.hpp>
 
 ////////////////////////////////////////////////////////////////////////////////
 //Implementation of PhyWaiter class
@@ -300,6 +301,23 @@ int TaskList::push(Task* t)
         }
         return -1;  // Generic queue is full
     }
+}
+
+int TaskList::push_bulk(std::span<Task* const> tasks)
+{
+    if (tasks.empty()) { return 0; }
+
+    // gsl_lite::finally handles unlock even if push() throws.
+    // std::lock_guard cannot be used directly: Mutex::lock() returns int, not void.
+    lock();
+    auto _ = gsl_lite::finally([this] { unlock(); });
+
+    int pushed = 0;
+    for (Task* const t : tasks)
+    {
+        if (t != nullptr && push(t) == 0) { ++pushed; }
+    }
+    return pushed;
 }
 
 Task* TaskList::get_task(worker_id requesting_wid, t_ns time_threshold_ns)

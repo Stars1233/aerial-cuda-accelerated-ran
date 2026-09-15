@@ -268,38 +268,29 @@ def timeline_plot_generic(input_df,y_key,title="",height=600,width=1600,x_range=
 
     return fig1
 
-def plot_all_tasks_cpu_timeline(ti_subtask_df, l2_df, tick_df, testmac_df, x_range=None, traces_only=False, cpu_only=False, crosshair_tool=None, ul_only=False):
+def prepare_cpu_timeline_row_frames(ti_subtask_df, l2_df, tick_df, testmac_df, ul_only=False):
+    """Build per-row DataFrames and lane (yy) layout shared by Bokeh and Perfetto.
+
+    Lifts the row-shaping logic out of ``plot_all_tasks_cpu_timeline`` so the
+    Chrome Trace Event Format exporter can consume the same lanes that the
+    Bokeh plot draws. Pure data shaping; no Bokeh references.
+
+    Args:
+        ti_subtask_df: TI subtask rows for one run (df_ti_subtask).
+        l2_df: L2A processing rows for the same run; may be empty.
+        tick_df: Slot tick rows for the same run; may be empty.
+        testmac_df: Testmac FAPI send rows; may be empty.
+        ul_only: When True, drop all rows whose ``task`` does not start with
+            ``"UL Task"``.
+
+    Returns:
+        Dict with keys ``temp_df``, ``task_df``, ``cpus`` (sorted physical CPU
+        ids), ``lines_per_cpu``, ``sequence_nums``, ``enable_l2``,
+        ``enable_tick``, ``enable_testmac``, ``dl_task_df``, ``ul_task_df``,
+        ``debug_task_df``, ``dl_comms_df``, ``dl_comp_df``, ``l2_copy_df``,
+        ``tick_copy_df``, ``testmac_copy_df``. Empty DataFrames (not ``None``)
+        for disabled lanes.
     """
-    Generates a timeline plot that includes CPU utilization estimates
-
-    trace_only - Generates only traces
-                Note: traces can lead to large/slow html files
-    cpu_only - Generates only CPU utilization graphs
-                Note: cpu utilization calculation is not very fast (needs work)
-
-    Note: if both traces_only and cpu_only are set, traces_only overrides
-
-    Returns a bokeh column containing the plots
-    """
-    # For timeline plot
-    TOOLTIPS = [
-        ("task", "@task"),
-        ("subtask", "@subtask"),
-        ("(sfn,slot)", "(@sfn, @slot)"),
-        ("log_timestamp", "@log_timestamp"),
-        ("t0 timestamp", "@t0_formatted"),
-        ("duration (us)", "@duration"),
-        ("cpu", "@cpu"),
-    ]
-
-    if(not cpu_only):
-        fig1 = figure(title="CPU Timeline view",
-                    x_axis_type="datetime",
-                    tooltips=TOOLTIPS,
-                    tools="tap,crosshair,hover,xwheel_zoom,ywheel_zoom,xwheel_pan,ywheel_pan,box_zoom,reset",
-                    plot_width=1600, plot_height=600,
-                    x_range=x_range)
-        
     if(ul_only):
         temp_df = ti_subtask_df[ti_subtask_df.task.str.startswith("UL Task")]
     else:
@@ -312,14 +303,18 @@ def plot_all_tasks_cpu_timeline(ti_subtask_df, l2_df, tick_df, testmac_df, x_ran
     enable_l2 = len(l2_df) > 0
     if(enable_l2):
         l2_copy_df = l2_df.copy(deep=True)
+    else:
+        l2_copy_df = pd.DataFrame()
     enable_tick = len(tick_df) > 0
     if(enable_tick):
         tick_copy_df = tick_df.copy(deep=True)
+    else:
+        tick_copy_df = pd.DataFrame()
     enable_testmac = len(testmac_df) > 0
     if(enable_testmac):
         testmac_copy_df = testmac_df.copy(deep=True)
-
-
+    else:
+        testmac_copy_df = pd.DataFrame()
 
     # Determine cpu options
     cpus = list(temp_df.cpu.unique())
@@ -331,15 +326,6 @@ def plot_all_tasks_cpu_timeline(ti_subtask_df, l2_df, tick_df, testmac_df, x_ran
     sequence_nums = list(set(sequence_nums))
     sequence_nums.sort()
     lines_per_cpu = 1+len(sequence_nums)
-
-    DL_TASK_COLOR = 'red'
-    UL_TASK_COLOR = 'green'
-    DL_COMMS_COLOR = 'blue'
-    DL_COMP_COLOR = 'yellow'
-    DL_DEBUG_TASK_COLOR = 'pink'
-    L2_COLOR = 'orange'
-    TICK_COLOR = 'black'
-    TESTMAC_COLOR = 'brown'
 
     # Set yy values for tasks
     task_df["yy"] = [cpus.index(aa) for aa in task_df.cpu]
@@ -363,6 +349,91 @@ def plot_all_tasks_cpu_timeline(ti_subtask_df, l2_df, tick_df, testmac_df, x_ran
     # Set yy value for comms tasks
     dl_comms_df['yy'] = [(cpus.index(aa)*lines_per_cpu + 1 + sequence_nums.index(bb))/lines_per_cpu for aa,bb in zip(dl_comms_df.cpu, dl_comms_df.sequence)]
     dl_comp_df['yy'] = [(cpus.index(aa)*lines_per_cpu + 1 + sequence_nums.index(bb))/lines_per_cpu for aa,bb in zip(dl_comp_df.cpu, dl_comp_df.sequence)]
+
+    return {
+        "temp_df":         temp_df,
+        "task_df":         task_df,
+        "cpus":            cpus,
+        "lines_per_cpu":   lines_per_cpu,
+        "sequence_nums":   sequence_nums,
+        "enable_l2":       enable_l2,
+        "enable_tick":     enable_tick,
+        "enable_testmac":  enable_testmac,
+        "dl_task_df":      dl_task_df,
+        "ul_task_df":      ul_task_df,
+        "debug_task_df":   debug_task_df,
+        "dl_comms_df":     dl_comms_df,
+        "dl_comp_df":      dl_comp_df,
+        "l2_copy_df":      l2_copy_df,
+        "tick_copy_df":    tick_copy_df,
+        "testmac_copy_df": testmac_copy_df,
+    }
+
+
+def plot_all_tasks_cpu_timeline(ti_subtask_df, l2_df, tick_df, testmac_df, x_range=None, traces_only=False, cpu_only=False, crosshair_tool=None, ul_only=False, prep=None):
+    """
+    Generates a timeline plot that includes CPU utilization estimates
+
+    trace_only - Generates only traces
+                Note: traces can lead to large/slow html files
+    cpu_only - Generates only CPU utilization graphs
+                Note: cpu utilization calculation is not very fast (needs work)
+
+    Note: if both traces_only and cpu_only are set, traces_only overrides
+
+    prep - Optional pre-computed dict from prepare_cpu_timeline_row_frames.
+           When supplied, the row-shaping step is skipped (used by callers that
+           also need the same layout for the Perfetto trace exporter; see
+           aerial_postproc.perfetto_trace).
+
+    Returns a bokeh column containing the plots
+    """
+    # For timeline plot
+    TOOLTIPS = [
+        ("task", "@task"),
+        ("subtask", "@subtask"),
+        ("(sfn,slot)", "(@sfn, @slot)"),
+        ("log_timestamp", "@log_timestamp"),
+        ("t0 timestamp", "@t0_formatted"),
+        ("duration (us)", "@duration"),
+        ("cpu", "@cpu"),
+    ]
+
+    if(not cpu_only):
+        fig1 = figure(title="CPU Timeline view",
+                      x_axis_type="datetime",
+                      tooltips=TOOLTIPS,
+                      tools="tap,crosshair,hover,xwheel_zoom,ywheel_zoom,xwheel_pan,ywheel_pan,box_zoom,reset",
+                      plot_width=1600, plot_height=600,
+                      x_range=x_range)
+
+    if prep is None:
+        prep = prepare_cpu_timeline_row_frames(ti_subtask_df, l2_df, tick_df, testmac_df, ul_only)
+    task_df         = prep["task_df"]
+    lines_per_cpu   = prep["lines_per_cpu"]
+    enable_l2       = prep["enable_l2"]
+    enable_tick     = prep["enable_tick"]
+    enable_testmac  = prep["enable_testmac"]
+    dl_task_df      = prep["dl_task_df"]
+    ul_task_df      = prep["ul_task_df"]
+    debug_task_df   = prep["debug_task_df"]
+    dl_comms_df     = prep["dl_comms_df"]
+    dl_comp_df      = prep["dl_comp_df"]
+    if enable_l2:
+        l2_copy_df = prep["l2_copy_df"]
+    if enable_tick:
+        tick_copy_df = prep["tick_copy_df"]
+    if enable_testmac:
+        testmac_copy_df = prep["testmac_copy_df"]
+
+    DL_TASK_COLOR = 'red'
+    UL_TASK_COLOR = 'green'
+    DL_COMMS_COLOR = 'blue'
+    DL_COMP_COLOR = 'yellow'
+    DL_DEBUG_TASK_COLOR = 'pink'
+    L2_COLOR = 'orange'
+    TICK_COLOR = 'black'
+    TESTMAC_COLOR = 'brown'
 
     if(not cpu_only):
         # Create the figure with both tasks and dl comms

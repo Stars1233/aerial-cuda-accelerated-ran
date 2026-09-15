@@ -210,7 +210,7 @@ int unix_sock_listen_and_accept(int listen_fd, struct sockaddr_un* client_addr)
     socklen_t addr_len = sizeof(struct sockaddr_un);
     if((sock_fd = accept(listen_fd, (struct sockaddr*)client_addr, &addr_len)) < 0)
     {
-        NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "Accept error");
+        NVLOGW(TAG, "Accept error");
         return -1;
     }
     else

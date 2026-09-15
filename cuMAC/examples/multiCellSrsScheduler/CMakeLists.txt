@@ -14,6 +14,6 @@
 # limitations under the License.
 
 add_executable(multiCellSrsScheduler)
-target_sources(multiCellSrsScheduler PRIVATE main.cpp)
-target_link_libraries(multiCellSrsScheduler PRIVATE cumac ${HDF5_CXX_LIBRARIES} chanModels)
-target_include_directories(multiCellSrsScheduler PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${CHAN_MODELS_SRC_INCLUDE_DIR})
+target_sources(multiCellSrsScheduler PRIVATE main.cpp ../parameters.cpp)
+target_link_libraries(multiCellSrsScheduler PRIVATE cumac ${HDF5_CXX_LIBRARIES} gpu3gppchan yaml-cpp)
+target_include_directories(multiCellSrsScheduler PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${GPU3GPPCHAN_SRC_INCLUDE_DIR})

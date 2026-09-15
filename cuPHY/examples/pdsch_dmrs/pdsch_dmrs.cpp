@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -97,7 +97,7 @@ int main(int argc, char* argv[]) {
 
     std::vector<cuphyPdschCellGrpDynPrm_t> pdsch_cell_grp_dyn_params(1); //hardcoded to 1 cell group
     cuphy::read_cell_group_dynamic_pars_from_file(pdsch_cell_grp_dyn_params, *input_file);
-    cuphyPdschDynPrms_t dyn_params = {0, 0, pdsch_cell_grp_dyn_params.data(), nullptr, nullptr, &output_data};
+    cuphyPdschDynPrms_t dyn_params = {0, 0, pdsch_cell_grp_dyn_params.data(), nullptr, nullptr, nullptr, &output_data, nullptr};
 /*
     cuphyPdschDataOut_t output_data = {new cuphyTensorPrm_t[1]};
     cuphyPdschDynPrms_t dyn_params = {0, 0, pdsch_cell_grp_dyn_params.data(), nullptr, nullptr, &output_data};

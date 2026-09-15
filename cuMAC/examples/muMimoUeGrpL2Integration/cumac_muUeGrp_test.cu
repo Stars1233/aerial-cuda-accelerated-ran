@@ -17,6 +17,8 @@
 
 #include "cumac_muUeGrp_test.h"
 #include <csignal>
+#include <cstdio>
+#include <sys/stat.h>
 
 // #define CUMAC_L1_MEM_SHARE_TEST
 
@@ -133,27 +135,38 @@ int main(int argc, char** argv)
 
     uint32_t total_num_buffers = std::min(config.num_srs_buffers, static_cast<uint32_t>(slot_command_api::MAX_SRS_CHEST_BUFFERS));
     uint32_t buffer_size = config.num_prg * config.num_gnb_ant * config.num_ue_layer * sizeof(uint32_t);
+    const size_t cubb_srs_gpu_buf_total_size = static_cast<size_t>(buffer_size) * total_num_buffers;
+    NVLOGC(MU_TEST_TAG, "cuMAC-MAIN: cubb_srs_gpu_buf_total_size: %u * %u = %lu", buffer_size, total_num_buffers, cubb_srs_gpu_buf_total_size);
 
     nv_ipc_sem_t* l1_cumac_sem = nv_ipc_sem_open(CUMAC_L1_SECONDARY_PROCESS, L1_SEM_NAME);
 
-    // Create shared memory pool in GPU
-    nv_ipc_mempool_t* cpu_mem_pool = nv_ipc_mempool_open(CUMAC_L1_SECONDARY_PROCESS, L1_CPU_MEM_POOL_NAME, (sizeof(CVSrsChestBuff_contMemAlloc)*total_num_buffers + sizeof(l1_cumac_message_t)*MAX_NUM_UE_SRS_INFO_PER_SLOT*NUM_CELL), 1, NV_IPC_MEMPOOL_NO_CUDA_DEV); // CPU memory pool to be shared between L1 and cuMAC
-    nv_ipc_mempool_t* gpu_mem_pool = nv_ipc_mempool_open(CUMAC_L1_SECONDARY_PROCESS, L1_GPU_MEM_POOL_NAME, buffer_size, total_num_buffers, config.cuda_device_id); // GPU memory pool to be shared between L1 and cuMAC
-    
-    // Get CPU/GPU shared memory pool start address
-    void* cpu_pool_start_addr = cpu_mem_pool->get_addr(cpu_mem_pool, 0); 
-    void* gpu_pool_start_addr = gpu_mem_pool->get_addr(gpu_mem_pool, 0);
+    // Open shared memory pools as the secondary side. One typed pool per object kind,
+    // matching the cuphydriver layout (chest buffers, SRS info messages, GPU buffers).
+    nv::lock_free_mem_pool<CVSrsChestBuff>* chest_buf_pool = new nv::lock_free_mem_pool<CVSrsChestBuff>(
+        total_num_buffers, LOCK_FREE_OPT_SHM_SECONDARY, L1_CHEST_BUF_POOL_NAME);
+    nv::lock_free_mem_pool<SrsInfoUpdate>* msg_mem_pool = new nv::lock_free_mem_pool<SrsInfoUpdate>(
+        MAX_NUM_UE_SRS_INFO_PER_SLOT * NUM_CELL, LOCK_FREE_OPT_SHM_SECONDARY, L1_MSG_MEM_POOL_NAME);
+    nv::lock_free_mem_pool<uint8_t>* gpu_mem_pool = new nv::lock_free_mem_pool<uint8_t>(
+        total_num_buffers, LOCK_FREE_OPT_SHM_SECONDARY, L1_GPU_MEM_POOL_NAME, config.cuda_device_id, buffer_size);
 
-    if (!is_aligned_for_type<__half2>(gpu_pool_start_addr)) {
+    // Get shared memory pool start addresses
+    CVSrsChestBuff* arr_cv_srs_chest_buff_base_addr = chest_buf_pool->get_buf_addr(0);
+    SrsInfoUpdate* arr_l1_cumac_msg = msg_mem_pool->get_buf_addr(0);
+    __half2* cubb_srs_gpu_buff_base_addr = reinterpret_cast<__half2*>(gpu_mem_pool->get_buf_addr(0));
+
+    if (arr_cv_srs_chest_buff_base_addr == nullptr || arr_l1_cumac_msg == nullptr) {
+        throw std::runtime_error("CPU IPC memory pool returned null base address");
+    }
+
+    if (!is_aligned_for_type<__half2>(cubb_srs_gpu_buff_base_addr)) {
         throw std::runtime_error("GPU memory base address is not aligned for __half2");
     }
-    __half2* cubb_srs_gpu_buff_base_addr = reinterpret_cast<__half2*>(gpu_pool_start_addr);
-
-    if (!is_aligned_for_type<CVSrsChestBuff_contMemAlloc>(cpu_pool_start_addr)) {
-        throw std::runtime_error("CPU memory base address is not aligned for CVSrsChestBuff_contMemAlloc");
+    if (!is_aligned_for_type<CVSrsChestBuff>(arr_cv_srs_chest_buff_base_addr)) {
+        throw std::runtime_error("CPU memory base address is not aligned for CVSrsChestBuff");
     }
-    CVSrsChestBuff_contMemAlloc* arr_cv_srs_chest_buff_base_addr = reinterpret_cast<CVSrsChestBuff_contMemAlloc*>(cpu_pool_start_addr);
-    l1_cumac_message_t* arr_l1_cumac_msg = reinterpret_cast<l1_cumac_message_t*>(arr_cv_srs_chest_buff_base_addr + total_num_buffers);
+    if (!is_aligned_for_type<SrsInfoUpdate>(arr_l1_cumac_msg)) {
+        throw std::runtime_error("CPU memory base address is not aligned for SrsInfoUpdate");
+    }
 
     // cuMAC worker (sender) thread
     NVLOGC(MU_TEST_TAG, "cuMAC-MAIN: parameter config YAML file: %s", YAML_PARAM_CONFIG_PATH);
@@ -192,6 +205,12 @@ int main(int argc, char** argv)
     CHECK_CUDA_ERR(cudaMalloc(&gpu_out_buf, out_buf_len_per_cell*sys_param.num_cell));
     CHECK_CUDA_ERR(cudaMallocHost(&gpu_sol_buf_host, out_buf_len_per_cell*sys_param.num_cell));
 
+    // Zero-initialize persistent GPU buffers to avoid denormalized floats / NaN
+    // from uninitialized cudaMalloc contents affecting kernel behavior
+    CHECK_CUDA_ERR(cudaMemset(srs_chan_est_buf, 0, sizeof(__half2)*sys_param.num_bs_ant_port*MAX_NUM_UE_ANT_PORT*sys_param.num_subband*sys_param.num_prg_samp_per_subband*MAX_NUM_SRS_UE_PER_CELL*sys_param.num_cell));
+    CHECK_CUDA_ERR(cudaMemset(srs_snr_buf, 0, sizeof(float)*MAX_NUM_SRS_UE_PER_CELL*sys_param.num_cell));
+    CHECK_CUDA_ERR(cudaMemset(chan_orth_mat_buf, 0, sizeof(float)*MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT*(MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT+1)/2*sys_param.num_subband*sys_param.num_prg_samp_per_subband*sys_param.num_cell));
+
     // Initialize CPU buffers for verification
     uint8_t*    srs_chan_est_buf_host;
     float*      srs_snr_buf_host;
@@ -204,8 +223,12 @@ int main(int argc, char** argv)
     CHECK_CUDA_ERR(cudaMallocHost(&srs_snr_buf_host, sizeof(float)*MAX_NUM_SRS_UE_PER_CELL*sys_param.num_cell));
     CHECK_CUDA_ERR(cudaMallocHost(&chan_orth_mat_buf_host, sizeof(float)*MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT*(MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT+1)/2*sys_param.num_subband*sys_param.num_prg_samp_per_subband*sys_param.num_cell));
     CHECK_CUDA_ERR(cudaMallocHost(&cpu_out_buf_host, out_buf_len_per_cell*sys_param.num_cell));
-    CHECK_CUDA_ERR(cudaMallocHost(&cubb_srs_gpu_buff_host_copy_base_addr, buffer_size*total_num_buffers));
+    CHECK_CUDA_ERR(cudaMallocHost(&cubb_srs_gpu_buff_host_copy_base_addr, cubb_srs_gpu_buf_total_size));
     CHECK_CUDA_ERR(cudaMallocHost(&task_in_buf_host, task_in_buf_size*sys_param.num_cell));
+
+    memset(srs_chan_est_buf_host, 0, sizeof(__half2)*sys_param.num_bs_ant_port*MAX_NUM_UE_ANT_PORT*sys_param.num_subband*sys_param.num_prg_samp_per_subband*MAX_NUM_SRS_UE_PER_CELL*sys_param.num_cell);
+    memset(srs_snr_buf_host, 0, sizeof(float)*MAX_NUM_SRS_UE_PER_CELL*sys_param.num_cell);
+    memset(chan_orth_mat_buf_host, 0, sizeof(float)*MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT*(MAX_NUM_SRS_UE_PER_CELL*MAX_NUM_UE_ANT_PORT+1)/2*sys_param.num_subband*sys_param.num_prg_samp_per_subband*sys_param.num_cell);
 
     // Initialize lock-free ring pool for tasks
     test_task_ring = new nv::lock_free_ring_pool<test_task_t>("test_task", LEN_LOCKFREE_RING_POOL, sizeof(test_task_t));
@@ -254,6 +277,91 @@ int main(int argc, char** argv)
     muMimoUserPairingTaskCpu->strm = cuStrmCumac;
     muMimoUserPairingTaskCpu->is_mem_sharing = sys_param.enable_l1_l2_mem_sharing;
 
+    const uint32_t srs_chan_est_buf_total_size = static_cast<uint32_t>(
+        sizeof(__half2) * sys_param.num_bs_ant_port * MAX_NUM_UE_ANT_PORT
+        * sys_param.num_subband * sys_param.num_prg_samp_per_subband
+        * MAX_NUM_SRS_UE_PER_CELL * sys_param.num_cell);
+    const uint32_t srs_snr_buf_total_size = static_cast<uint32_t>(
+        sizeof(float) * MAX_NUM_SRS_UE_PER_CELL * sys_param.num_cell);
+    const uint32_t chan_orth_mat_buf_total_size = static_cast<uint32_t>(
+        sizeof(float) * MAX_NUM_SRS_UE_PER_CELL * MAX_NUM_UE_ANT_PORT
+        * (MAX_NUM_SRS_UE_PER_CELL * MAX_NUM_UE_ANT_PORT + 1) / 2
+        * sys_param.num_subband * sys_param.num_prg_samp_per_subband
+        * sys_param.num_cell);
+    if (sys_param.enable_tv_test_mode) {
+        mkdir("./tv", 0755);
+        NVLOGC(MU_TEST_TAG, "cuMAC-MAIN: TV test mode ENABLED (save_all_slots=%s)",
+               sys_param.tv_save_all_slots ? "true" : "false");
+    }
+
+    if (!sys_param.schedule_slot_ids.empty()) {
+        std::string sched_str;
+        for (size_t i = 0; i < sys_param.schedule_slot_ids.size(); ++i) {
+            if (i) sched_str += ",";
+            sched_str += std::to_string(sys_param.schedule_slot_ids[i]);
+        }
+        NVLOGC(MU_TEST_TAG, "cuMAC-MAIN: TV slot scheduling enabled: SCHEDULE_SLOT_PERIOD=%d, SCHEDULE_SLOT_IDS=[%s], num_slot=%d",
+               sys_param.schedule_slot_period, sched_str.c_str(), sys_param.num_time_slots);
+        if (sys_param.schedule_slot_ids.size() != sys_param.num_time_slots)
+        {
+            NVLOGW(MU_TEST_TAG, "NUM_TIME_SLOTS and SCHEDULE_SLOT_IDS length don't match");
+        }
+    }
+
+    // cuBB->cuMAC replay mode: validate that the cubb dump's saved
+    // geometry attributes match the cuMAC YAML configuration. realBuffIdx
+    // indexing depends on byte-exact agreement between the producer's
+    // gpu_buf_size / pool length and cuMAC's pool view; any mismatch
+    // would silently corrupt SRS data, so refuse to start. We check the
+    // first cubb file as a representative — `SrsIpcManager::dump_h5` always
+    // dumps with the same geometry within a run.
+    if (sys_param.enable_cubb_tv_input) {
+        const uint32_t expected_gpu_pool_len = total_num_buffers;
+        const uint32_t expected_gpu_buf_size = buffer_size;
+        const uint32_t expected_num_prg      = static_cast<uint32_t>(config.num_prg);
+        const uint32_t expected_num_gnb_ant  = static_cast<uint32_t>(config.num_gnb_ant);
+        const uint32_t expected_num_ue_layer = static_cast<uint32_t>(config.num_ue_layer);
+        const uint32_t expected_cell_num     = static_cast<uint32_t>(sys_param.num_cell);
+        CubbTvAttrs    cubb_attrs{};
+
+        int validate_result = validate_cubb_tv_attrs(sys_param.cubb_tv_files[0].path,
+            expected_gpu_pool_len, expected_gpu_buf_size, expected_num_prg,
+            expected_num_gnb_ant, expected_num_ue_layer, expected_cell_num, &cubb_attrs);
+
+        NVLOGC(MU_TEST_TAG,
+            "  Attribute     |  cubb h5 (actual)  |  cuMAC YAML (expected)\n"
+            "  --------------+--------------------+-----------------------\n"
+            "  gpu_pool_len  |  %16u  |  %u  (NUM_CELL * num_srs_buffers_per_cell = total_num_buffers)\n"
+            "  gpu_buf_size  |  %16u  |  %u  (per-buffer GPU bytes; depends on num_prg/num_gnb_ant/num_ue_layer)\n"
+            "  num_prg       |  %16u  |  %u  (NUM_PRG_PER_CELL)\n"
+            "  num_gnb_ant   |  %16u  |  %u  (NUM_BS_ANT_PORT)\n"
+            "  num_ue_layer  |  %16u  |  %u  (NUM_UE_ANT_PORT)\n"
+            "  cell_num      |  %16u  |  %u  (NUM_CELL)\n"
+            "Adjust NUM_CELL / NUM_PRG_PER_CELL / NUM_BS_ANT_PORT / NUM_UE_ANT_PORT / "
+            "num_srs_buffers_per_cell in the cuMAC YAML so they match the cubb dump.",
+            cubb_attrs.gpu_pool_len, expected_gpu_pool_len,
+            cubb_attrs.gpu_buf_size, expected_gpu_buf_size,
+            cubb_attrs.num_prg,      expected_num_prg,
+            cubb_attrs.num_gnb_ant,  expected_num_gnb_ant,
+            cubb_attrs.num_ue_layer, expected_num_ue_layer,
+            cubb_attrs.cell_num,     expected_cell_num);
+
+        if (validate_result != 0) {
+            NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT,
+                "cuMAC-MAIN: cuBB replay: input TV %s does not match YAML config; aborting.\n",
+                sys_param.cubb_tv_files[0].path.c_str());
+            return -1;
+        }
+    }
+
+    if (sys_param.enable_cubb_tv_input) {
+        NVLOGC(MU_TEST_TAG,
+               "cuMAC-MAIN: cuBB replay mode ENABLED: dir='%s', files=%zu, slot_lag=%d",
+               sys_param.cubb_tv_input_dir.c_str(),
+               sys_param.cubb_tv_files.size(),
+               sys_param.cubb_cumac_srs_slot_lag);
+    }
+
     int if_failed_task = 0;
     int task_count = 0;
     while(task_count < NUM_TIME_SLOTS && !g_shutdown) {
@@ -270,6 +378,18 @@ int main(int argc, char** argv)
             // No task to process
             NVLOGI(MU_TEST_TAG, "%s: no task to process", __func__);
             continue;
+        }
+
+        if (!sys_param.schedule_slot_ids.empty()) {
+            uint32_t sched_index = task_count % sys_param.schedule_slot_ids.size();
+            uint32_t slot_id = sys_param.schedule_slot_ids[sched_index];
+            uint32_t sfn = (slot_id / MU_TEST_SLOTS_PER_FRAME) % MU_TEST_MAX_SFN;
+            uint32_t slot = slot_id % MU_TEST_SLOTS_PER_FRAME;
+
+            // Overwrite SFN/SLOT for TV generation
+            NVLOGC(MU_TEST_TAG, "Overwrite for TV generation: index=%d SFN %u.%u -> SFN %u.%u", task_count, task->sfn, task->slot, sfn, slot);
+            task->sfn = sfn;
+            task->slot = slot; 
         }
 
         // update task structure for the MU-MIMO user pairing module
@@ -318,12 +438,41 @@ int main(int argc, char** argv)
         // Wait for L1 semaphore signal to notify cuMAC that the SRS channel estimation is done
         l1_cumac_sem->sem_wait(l1_cumac_sem);
 
-        // for CPU verification
-        CHECK_CUDA_ERR(cudaMemcpy(cubb_srs_gpu_buff_host_copy_base_addr, cubb_srs_gpu_buff_base_addr, buffer_size*total_num_buffers, cudaMemcpyDeviceToHost));
+        // cuBB replay: overwrite the three shared SRS pools with the
+        // captured contents for this slot. Done after L1's per-slot
+        // populate signaled via l1_cumac_sem and before
+        // update_req_srs_info_msh / kernel launches consume the data.
+        if (sys_param.enable_cubb_tv_input) {
+            const CubbTvFile& f = sys_param.cubb_tv_files[task_count];
+            NVLOGC(MU_TEST_TAG,
+                   "cuMAC-MAIN: cuBB replay slot %d/%d: file=%s "
+                   "(cubb SFN.slot=%d.%d, cuMAC SFN.slot=%u.%u via slot_lag=%d)",
+                   task_count + 1, NUM_TIME_SLOTS, f.path.c_str(),
+                   f.sfn, f.slot, task->sfn, task->slot,
+                   sys_param.cubb_cumac_srs_slot_lag);
+            if (load_cubb_pools_from_h5(f.path, gpu_mem_pool,
+                                        chest_buf_pool, msg_mem_pool) != 0) {
+                NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT,
+                       "cuMAC-MAIN: cuBB replay: failed to load %s, aborting",
+                       f.path.c_str());
+                if_failed_task = 1;
+                g_shutdown = 1;
+                break;
+            }
+        }
 
-        // Update SRS info structures in the request messages based on the shared L1 SRS memory bank
-        update_req_srs_info_msh(arr_cv_srs_chest_buff_base_addr, arr_l1_cumac_msg, task->recv_msg, task->num_srs_ue);
-  
+        // for CPU verification
+        CHECK_CUDA_ERR(cudaMemcpy(cubb_srs_gpu_buff_host_copy_base_addr, cubb_srs_gpu_buff_base_addr, cubb_srs_gpu_buf_total_size, cudaMemcpyDeviceToHost));
+
+        // Update SRS info structures in the request messages based on the shared L1 SRS memory bank.
+        // Only valid when L1/L2 memory sharing is enabled: in non-mem-sharing mode the srsInfo array
+        // has a different (larger) stride (cumac_muUeGrp_req_srs_info_t embeds srsChanEst), so
+        // indexing through srsInfoMsh here would write at the wrong offsets and corrupt srsInfo[0]
+        // (notably srsInfo[0].rnti / srsInfo[0].id via the realBuffIdx u32 at offset 4).
+        if (sys_param.enable_l1_l2_mem_sharing) {
+            update_req_srs_info_msh(arr_cv_srs_chest_buff_base_addr, arr_l1_cumac_msg, task->recv_msg, task->num_srs_ue);
+        }
+
         // Copy data from NVIPC buffer to GPU buffer
         // Create CUDA events
         cudaEvent_t startCopyH2D, stopCopyH2D;
@@ -336,6 +485,45 @@ int main(int argc, char** argv)
         }
         cudaEventRecord(stopCopyH2D);
 
+        if (sys_param.enable_tv_test_mode) {
+            CHECK_CUDA_ERR(cudaStreamSynchronize(task->strm));
+
+            std::string tvBase = std::string("./tv/muUePairTV_sfn")
+                + std::to_string(task->sfn) + "_slot" + std::to_string(task->slot);
+
+            create_h5_tv(tvBase, task->sfn, task->slot, sys_param,
+                         muMimoUserPairingTask,
+                         srs_chan_est_buf, srs_chan_est_buf_total_size,
+                         srs_snr_buf, srs_snr_buf_total_size,
+                         chan_orth_mat_buf, chan_orth_mat_buf_total_size,
+                         cubb_srs_gpu_buff_base_addr, cubb_srs_gpu_buf_total_size,
+                         /*is_first_slot=*/task_count == 0);
+
+            uint16_t tv_sfn, tv_slot;
+            load_h5_tv(tvBase, sys_param.num_cell, tv_sfn, tv_slot,
+                       muMimoUserPairingTask,
+                       srs_chan_est_buf, srs_chan_est_buf_total_size,
+                       srs_snr_buf, srs_snr_buf_total_size,
+                       chan_orth_mat_buf, chan_orth_mat_buf_total_size,
+                       cubb_srs_gpu_buff_base_addr, cubb_srs_gpu_buf_total_size);
+
+            NVLOGC(MU_TEST_TAG, "cuMAC-MAIN: TV save/load round-trip done for SFN=%u.%u",
+                   task->sfn, task->slot);
+        }
+
+        // Snapshot pre-kernel persistent GPU buffers to host before the GPU
+        // kernel mutates them, so the CPU reference kernel runs on byte-identical
+        // inputs and its independent state evolution stays in sync with the GPU.
+        CHECK_CUDA_ERR(cudaMemcpy(srs_chan_est_buf_host, srs_chan_est_buf,
+                                  srs_chan_est_buf_total_size,
+                                  cudaMemcpyDeviceToHost));
+        CHECK_CUDA_ERR(cudaMemcpy(srs_snr_buf_host, srs_snr_buf,
+                                  srs_snr_buf_total_size,
+                                  cudaMemcpyDeviceToHost));
+        CHECK_CUDA_ERR(cudaMemcpy(chan_orth_mat_buf_host, chan_orth_mat_buf,
+                                  chan_orth_mat_buf_total_size,
+                                  cudaMemcpyDeviceToHost));
+
         // setup and run MU-MIMO UE pairing algorithm
         muMimoUserPairingObj->setup(muMimoUserPairingTask);
 
@@ -346,6 +534,22 @@ int main(int argc, char** argv)
 
         if (sys_param.print_ue_pairing_solution) {
             print_ue_pairing_sol("cuMAC", task->sfn, task->slot, gpu_sol_buf_host, task->num_cell);
+        }
+
+        if (sys_param.enable_tv_test_mode) {
+            std::string tvBase = std::string("./tv/muUePairTV_sfn")
+                + std::to_string(task->sfn) + "_slot" + std::to_string(task->slot);
+            create_h5_solution_tv(tvBase, task->sfn, task->slot,
+                                  task->num_cell, gpu_sol_buf_host);
+
+            if (!sys_param.tv_save_all_slots && task_count < NUM_TIME_SLOTS - 1) {
+                for (int c = 0; c < task->num_cell; c++) {
+                    std::remove((tvBase + "_cell" + std::to_string(c) + ".h5").c_str());
+                }
+                std::remove((tvBase + "_solution.h5").c_str());
+                NVLOGC(MU_TEST_TAG, "cuMAC-MAIN: deleted intermediate TVs for SFN=%u.%u",
+                       task->sfn, task->slot);
+            }
         }
 
         // for CPU verification
@@ -449,8 +653,9 @@ int main(int argc, char** argv)
     ipc_cumac_l2->ipc_destroy(ipc_cumac_l2);
 
     l1_cumac_sem->close(l1_cumac_sem);
-    cpu_mem_pool->close(cpu_mem_pool);
-    gpu_mem_pool->close(gpu_mem_pool);
+    delete chest_buf_pool;
+    delete msg_mem_pool;
+    delete gpu_mem_pool;
 
     NVLOGC(MU_TEST_TAG, "cuMAC-MAIN: test completed successfully, ENABLE_L1_L2_MEM_SHARING: %s", (sys_param.enable_l1_l2_mem_sharing ? "true" : "false"));
 

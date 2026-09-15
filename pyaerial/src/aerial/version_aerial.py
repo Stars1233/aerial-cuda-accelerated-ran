@@ -17,20 +17,11 @@
 import os
 
 # Check if BUILD_ID environment variable exists - from Jenkins
-BUILD_ID = os.environ.get("BUILD_ID")
-if BUILD_ID is None:
-    raise RuntimeError("Environment variable BUILD_ID must be set")
-
-BUILD_TYPE = os.environ.get("BUILD_TYPE")
-if BUILD_TYPE is None:
-    BUILD_TYPE = "dev"
-
-if BUILD_TYPE == "rel":
-    BUILD_TYPE = ""  # don't use 'rel' in the build string
+BUILD_ID = os.environ.get("BUILD_ID") or "1"
 
 # The short X.Y version
-VERSION = "2026.1"  # pylint: disable=invalid-name
+VERSION = "2026.2"  # pylint: disable=invalid-name
 
 # Create release version according to https://www.python.org/dev/peps/pep-0440/
-# The full version, including alpha/beta/rc tags
-RELEASE = f"{VERSION}.{BUILD_TYPE}{BUILD_ID}"
+# Local version segment (+build.N) tags each CI build.
+RELEASE = f"{VERSION}+build.{BUILD_ID}"

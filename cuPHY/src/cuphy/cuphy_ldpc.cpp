@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,8 @@
 #include "ldpc.hpp"
 #include "rate_matching.hpp"
 #include "crc_decode.hpp"
+#include "crc_encode.hpp"
+#include "dl_rate_matching.hpp"
 
 
 ////////////////////////////////////////////////////////////////////////
@@ -69,8 +71,9 @@ cuphyStatus_t CUPHYWINAPI cuphyErrorCorrectionLDPCDecode(cuphyLDPCDecoder_t     
     if(tensorDescSoftOutputs)
     {
         const tensor_desc& tdesc = static_cast<const tensor_desc&>(*tensorDescSoftOutputs) ;
-        // Check for the correct soft output type (currently only FP16 is supported)
-        if(tdesc.type() != CUPHY_R_16F)
+        // Check that the soft output type matches the input type, which
+        // is currently required by kernel implementations.
+        if(tdesc.type() != tLLR.first.get().type())
         {
             return CUPHY_STATUS_INVALID_ARGUMENT;
         }
@@ -223,6 +226,21 @@ cuphyStatus_t CUPHYWINAPI cuphyErrorCorrectionLDPCDecodeGetLaunchDescriptor(cuph
 
 
 ////////////////////////////////////////////////////////////////////////
+// cuphyErrorCorrectionLDPCGetAlgoRequirements()
+cuphyStatus_t CUPHYWINAPI cuphyErrorCorrectionLDPCGetAlgoRequirements(cuphyLDPCDecoder_t decoder,
+                                                                      int                algo,
+                                                                      uint32_t*          requirements)
+{
+    if(!decoder || !requirements)
+    {
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    const ldpc::decoder& d = static_cast<const ldpc::decoder&>(*decoder);
+    *requirements          = d.algo_requirements(algo);
+    return CUPHY_STATUS_SUCCESS;
+}
+
+////////////////////////////////////////////////////////////////////////
 // cuphyPuschRxRateMatchGetDescrInfo()
 
 cuphyStatus_t CUPHYWINAPI cuphyPuschRxRateMatchGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes)
@@ -367,14 +385,15 @@ cuphyStatus_t CUPHYWINAPI cuphySetupPuschRxCrcDecode(cuphyPuschRxCrcDecodeHndl_t
                                                      cuphyPuschRxCrcDecodeLaunchCfg_t* pTbCrcLaunchCfg,
                                                      cudaStream_t                      strm)
 {
-    if(!puschRxCrcDecodeHndl || !pOutputCBCRCs || !pOutputTBs || !pInputCodeBlocks || !pOutputTBCRCs || !pTbPrmsCpu || !pTbPrmsGpu || !pCpuDesc || !pGpuDesc || !pCbCrcLaunchCfg || !pTbCrcLaunchCfg || !pSchUserIdxsCpu)
+    if(!puschRxCrcDecodeHndl || !pOutputCBCRCs || !pOutputTBs || !pInputCodeBlocks || !pOutputTBCRCs ||
+       !pTbPrmsCpu || !pTbPrmsGpu || !pCpuDesc || !pGpuDesc || !pCbCrcLaunchCfg ||
+       !pTbCrcLaunchCfg || !pSchUserIdxsCpu) [[unlikely]]
     {
         return CUPHY_STATUS_INVALID_ARGUMENT;
     }
 
     puschRxCrcDecode* pCrcDecode = static_cast<puschRxCrcDecode*>(puschRxCrcDecodeHndl);
-    pCrcDecode->setup(nSchUes, pSchUserIdxsCpu, pOutputCBCRCs, pOutputTBs, pInputCodeBlocks, pOutputTBCRCs, pTbPrmsCpu, pTbPrmsGpu, pCpuDesc, pGpuDesc, enableCpuToGpuDescrAsyncCpy, pCbCrcLaunchCfg, pTbCrcLaunchCfg, strm);
-    return CUPHY_STATUS_SUCCESS;
+    return pCrcDecode->setup(nSchUes, pSchUserIdxsCpu, pOutputCBCRCs, pOutputTBs, pInputCodeBlocks, pOutputTBCRCs, pTbPrmsCpu, pTbPrmsGpu, pCpuDesc, pGpuDesc, enableCpuToGpuDescrAsyncCpy, pCbCrcLaunchCfg, pTbCrcLaunchCfg, strm);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -388,5 +407,62 @@ cuphyStatus_t CUPHYWINAPI cuphyDestroyPuschRxCrcDecode(cuphyPuschRxCrcDecodeHndl
     }
     puschRxCrcDecode* pCrcDecode = static_cast<puschRxCrcDecode*>(puschRxCrcDecodeHndl);
     delete pCrcDecode;
+    return CUPHY_STATUS_SUCCESS;
+}
+
+////////////////////////////////////////////////////////////////////////
+// cuphyCrcEncodeGetDescrInfo()
+
+cuphyStatus_t CUPHYWINAPI cuphyCrcEncodeGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes)
+{
+    if(!pDescrSizeBytes || !pDescrAlignBytes)
+    {
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    *pDescrSizeBytes  = sizeof(crcEncodeDescr_t);
+    *pDescrAlignBytes = alignof(crcEncodeDescr_t);
+    return CUPHY_STATUS_SUCCESS;
+}
+
+////////////////////////////////////////////////////////////////////////
+// cuphyPrepareCrcEncodeGetDescrInfo()
+
+cuphyStatus_t CUPHYWINAPI cuphyPrepareCrcEncodeGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes)
+{
+    if(!pDescrSizeBytes || !pDescrAlignBytes)
+    {
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    *pDescrSizeBytes  = sizeof(prepareCrcEncodeDescr_t);
+    *pDescrAlignBytes = alignof(prepareCrcEncodeDescr_t);
+    return CUPHY_STATUS_SUCCESS;
+}
+
+////////////////////////////////////////////////////////////////////////
+// cuphyLDPCEncodeGetDescrInfo()
+
+cuphyStatus_t CUPHYWINAPI cuphyLDPCEncodeGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes, uint16_t maxUEs, size_t* pWorkspaceBytes)
+{
+    if(!pDescrSizeBytes || !pDescrAlignBytes || !pWorkspaceBytes)
+    {
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    *pDescrSizeBytes  = sizeof(ldpcEncodeDescr_t_array);
+    *pDescrAlignBytes = alignof(ldpcEncodeDescr_t_array);
+    *pWorkspaceBytes  = 2 * maxUEs * sizeof(LDPC_output_t); // 2x because it includes output and input
+    return CUPHY_STATUS_SUCCESS;
+}
+
+////////////////////////////////////////////////////////////////////////
+// cuphyDlRateMatchingGetDescrInfo()
+
+cuphyStatus_t CUPHYWINAPI cuphyDlRateMatchingGetDescrInfo(size_t* pDescrSizeBytes, size_t* pDescrAlignBytes)
+{
+    if(!pDescrSizeBytes || !pDescrAlignBytes)
+    {
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    *pDescrSizeBytes  = sizeof(dlRateMatchingDescr_t);
+    *pDescrAlignBytes = alignof(dlRateMatchingDescr_t);
     return CUPHY_STATUS_SUCCESS;
 }

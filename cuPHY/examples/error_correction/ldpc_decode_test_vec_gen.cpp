@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,19 @@
 #include "hdf5hpp.hpp"
 #include "cuphy_hdf5.hpp"
 #include "ldpc_decode_test_vec_gen.hpp"
+#include "ldpc_decode_test_vec_gen_kernels.hpp"
 #include "ldpc/ldpc_api.hpp"
+
+static const char* generated_crc_type_name(uint32_t crc_type)
+{
+    switch(crc_type)
+    {
+        case CUPHY_LDPC_CRC_16:  return "CRC-16";
+        case CUPHY_LDPC_CRC_24A: return "CRC-24A";
+        case CUPHY_LDPC_CRC_24B: return "CRC-24B";
+        default:                 return "CRC-NONE";
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////
 // ldpc_decode_test_vec_gen::ldpc_decode_test_vec_gen()
@@ -38,22 +50,29 @@ ldpc_decode_test_vec_gen::ldpc_decode_test_vec_gen(cuphy::context&            ct
     // Populate LDPC "configuration" data using input parameters
     populate_config(gparams);
     //------------------------------------------------------------------
-    // Generate random data for input to the encoder. We will work with
-    // scalar values instead of bits so that we can leverage the cuPHY
-    // fill function for filler bits.
+    // Generate data for input to the encoder with CRC-24B appended.
+    // We work with scalar values (1 bit per byte) so we can leverage
+    // the cuPHY fill function for filler bits.
     cuphy::tensor_device tSrcWithFiller(CUPHY_R_8U, config_.K);
     rng_gen.uniform(tSrcWithFiller, 0, 1, 0);
-    // Set filler bits to 0 before encoding
-    if(config_.F > 0)
+
+    // Apply CRC to the codeword and set filler bits to zero
     {
-        cuphy::index_group grp(cuphy::index_range(config_.K - config_.F,
-                                                  config_.K));
-        cuphy::tensor_ref  tSrcF = tSrcWithFiller.subset(grp);
-        cuphy::tensor_fill(tSrcF, 0);
+        cuphyTensorDescriptor_t tDescriptor = tSrcWithFiller.desc().handle();
+        tensor_desc& tDesc = static_cast<tensor_desc&>(*tDescriptor);
+        create_codeword_with_crc(tDesc.layout(),
+                                 static_cast<uint8_t*>(tSrcWithFiller.addr()),
+                                 config_.K,
+                                 config_.F,
+                                 config_.crc_type,
+                                 true, // Use existing info bits not including CRC
+                                 true);  // MSB first
     }
+
     //------------------------------------------------------------------
     // Populate the source data tensor with only the source bits
     tSrcData_ = cuphy::tensor_device(CUPHY_BIT, config_.B);
+    set_src_bits_desc(tSrcData_.desc());
     {
         cuphy::index_group grp(cuphy::index_range(0, config_.B));
         cuphy::tensor_ref  tSrcB = tSrcWithFiller.subset(grp);
@@ -73,6 +92,14 @@ ldpc_decode_test_vec_gen::ldpc_decode_test_vec_gen(cuphy::context&            ct
                        tSrcWithFillerBits,
                        config_.BG,
                        config_.Z);
+
+    if (0) {
+        cuphyTensorDescriptor_t tDescriptor = tEncode.desc().handle();
+        tensor_desc&  tDesc = static_cast<tensor_desc&>(*tDescriptor);
+        const tensor_layout_any& tLayout = tDesc.layout();
+        print_codeword(tDesc.layout(), static_cast<uint8_t*>(tEncode.addr()), config_.K, config_.N, true);
+    }
+
     //------------------------------------------------------------------
     // Modulate (bits to complex values)
     const int            V               = config_.mb + ((1 == config_.BG) ? 22 : 10);
@@ -167,9 +194,41 @@ void ldpc_decode_test_vec_gen::populate_config(const test_vec_gen_params& gparam
         update_config_modulated_bits();
         config_.R = static_cast<float>(config_.B) / static_cast<float>(config_.N);
     }
+    // mb must fit the base graph. generate() allocates the encode output as
+    // Z*MAXV bits but the modulation source spans Z*(mb + 22|10); an mb past the
+    // base-graph maximum therefore reads off the end of that allocation inside
+    // the modulation mapper (compute-sanitizer memcheck: invalid __global__ read
+    // in sym_mod_util). Reject it here instead of letting it reach the GPU.
+    {
+        const int maxVar    = (1 == config_.BG) ? CUPHY_LDPC_MAX_BG1_VAR_NODES
+                                                 : CUPHY_LDPC_MAX_BG2_VAR_NODES;
+        const int kbNominal = (1 == config_.BG) ? 22 : 10;  // matches V in generate()
+        const int maxMb     = maxVar - kbNominal;            // BG1 46, BG2 42
+        if(config_.mb > maxMb)
+        {
+            throw std::runtime_error(
+                std::string("Invalid parity node count for BG") + std::to_string(config_.BG) +
+                ": mb=" + std::to_string(config_.mb) + " exceeds the base graph maximum " +
+                std::to_string(maxMb));
+        }
+    }
+
     config_.K    = config_.B + config_.F;
     config_.QAM  = get_QAM_desc(gparams.log2_QAM);
     config_.punc = gparams.puncture ? LLR_PUNCTURE_STATUS_ENABLED :  LLR_PUNCTURE_STATUS_DISABLED;
+    config_.crc_type = gparams.crc_type;
+
+    const int crc_len = (config_.crc_type == CUPHY_LDPC_CRC_16)  ? 16 :
+                        (config_.crc_type == CUPHY_LDPC_CRC_24A) ? 24 :
+                        (config_.crc_type == CUPHY_LDPC_CRC_24B) ? 24 : 0;
+    if((crc_len > 0) && (config_.B <= crc_len))
+    {
+        throw ldpc_invalid_crc_config(
+            std::string("Requested CRC type ") + generated_crc_type_name(config_.crc_type) +
+            " requires more than " + std::to_string(crc_len) +
+            " information bits, but B=" + std::to_string(config_.B) +
+            ". This generated LDPC test-vector configuration is invalid; skipping run.");
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -226,13 +285,30 @@ void ldpc_decode_test_vec_gen::generate()
         cuphy::tensor_fill(tLLR_f, std::numeric_limits<float>::infinity());
     }
 #if 0
-    //------------------------------------------------------------------
+    // For debugging, convert to FP8 and back
+    if(CUPHY_R_16F == tLLR_.type())
     {
-        cuphy::tensor_device tEncodeDebug(CUPHY_R_8U, config_.Z * MAXV);
-        cuphy::tensor_convert(tEncodeDebug, tEncode);
+        const int NUM_LLR = tLLR_.dimensions()[0];
+        cuphy::tensor_device tQuant(CUPHY_R_8F_E4M3, NUM_LLR, config_.num_cw);
+        cuphy::tensor_convert(tQuant, tLLR_);
+        cuphy::tensor_convert(tLLR_, tQuant);
+    }
+#endif
+#if 0
+    //------------------------------------------------------------------
+    // Enable this code for debugging purposes, to write an HDF5 file
+    // with the generated data.
+    {
+        const int            MAXV = (1 == config_.BG)            ?
+                                    CUPHY_LDPC_MAX_BG1_VAR_NODES :
+                                    CUPHY_LDPC_MAX_BG2_VAR_NODES;
+
+        // TODO: make tEncode a member instead of local scope in the constructor
+        //cuphy::tensor_device tEncodeDebug(CUPHY_R_8U, config_.Z * MAXV);
+        //cuphy::tensor_convert(tEncodeDebug, tEncode);
 
         cuphy::tensor_device tSymbolsDebug(CUPHY_C_32F, NUM_SYMBOLS);
-        cuphy::tensor_convert(tSymbolsDebug, tSymbols);
+        cuphy::tensor_convert(tSymbolsDebug, tSymbols_);
 
         cuphy::tensor_device tNoiseDebug(CUPHY_C_32F, NUM_SYMBOLS, config_.num_cw);
         cuphy::tensor_convert(tNoiseDebug, tNoise);
@@ -240,13 +316,14 @@ void ldpc_decode_test_vec_gen::generate()
         cuphy::tensor_device tSymbolsPlusNoiseDebug(CUPHY_C_32F, NUM_SYMBOLS, config_.num_cw);
         cuphy::tensor_convert(tSymbolsPlusNoiseDebug, tSymbolsPlusNoise);
 
+        const int NUM_LLR = tLLR_.dimensions()[0];
         cuphy::tensor_device tLLRDebug(CUPHY_R_32F, NUM_LLR, config_.num_cw);
         cuphy::tensor_convert(tLLRDebug, tLLR_);
 
         cudaStreamSynchronize(0);
         hdf5hpp::hdf5_file f = hdf5hpp::hdf5_file::create("debug_gen.h5");
-        cuphy::write_HDF5_dataset(f, tSrcWithFiller,         "srcWithFiller",     0);
-        cuphy::write_HDF5_dataset(f, tEncodeDebug,           "tEncode",           0);
+        //cuphy::write_HDF5_dataset(f, tSrcWithFiller,         "srcWithFiller",     0);
+        //cuphy::write_HDF5_dataset(f, tEncodeDebug,           "tEncode",           0);
         cuphy::write_HDF5_dataset(f, tSymbolsDebug,          "tSymbols",          0);
         cuphy::write_HDF5_dataset(f, tNoiseDebug,            "tNoise",            0);
         cuphy::write_HDF5_dataset(f, tSymbolsPlusNoiseDebug, "tSymbolsPlusNoise", 0);

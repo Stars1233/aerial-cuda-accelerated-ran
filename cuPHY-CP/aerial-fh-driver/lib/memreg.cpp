@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,11 +27,12 @@
 namespace aerial_fh
 {
 inline bool is_gpu_memory(const void* ptr) {
-    cudaPointerAttributes attr;
-    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+    unsigned int memType = 0;
+    CUresult res = cuPointerGetAttribute(&memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, reinterpret_cast<CUdeviceptr>(ptr));
+    if (res != CUDA_SUCCESS) {
         return false;
     }
-    return (attr.type == cudaMemoryTypeDevice);
+    return (memType == CU_MEMORYTYPE_DEVICE);
 }
 
 MemReg::MemReg(Fronthaul* fhi, MemRegInfo const* info) :

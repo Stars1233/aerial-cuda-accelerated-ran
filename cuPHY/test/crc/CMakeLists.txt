@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(crcTest "${PROJECT_SOURCE_DIR}/src/cuphy/crc/crc.cu" "${PROJECT_SOURCE_DIR}/src/cuphy/crc/crcTest.cu")
-#add_executable(crcTime "${PROJECT_SOURCE_DIR}/src/cuphy/crc/crcTime.cu")
-add_executable(prepareCrcBuffersTest "${PROJECT_SOURCE_DIR}/src/cuphy/crc/prepareCrcBuffersTest.cu")
+add_executable(crcTest crcTest.cu)
+add_executable(crcTime EXCLUDE_FROM_ALL crcTime.cu)
+add_executable(prepareCrcBuffersTest prepareCrcBuffersTest.cu)
 target_link_libraries(crcTest cuphy)
-#target_link_libraries(crcTime cuphy)
+target_link_libraries(crcTime PRIVATE cuphy sdk::options sdk::warnings)
 target_link_libraries(prepareCrcBuffersTest cuphy)
 target_link_libraries(crcTest gtest gtest_main)
 target_link_libraries(prepareCrcBuffersTest gtest gtest_main)

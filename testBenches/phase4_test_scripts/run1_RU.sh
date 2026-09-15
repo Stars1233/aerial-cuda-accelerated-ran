@@ -40,6 +40,10 @@ show_usage() {
   echo "  --gdb_script <script>             Specify the gdb script to use."
   echo "  --timeout <seconds>               Kill ru_emulator after seconds"
   echo "  --tv-base-path <path>, -t <path>  Specify the full path to the directory where test vectors are stored."
+  echo "  --stage-local                     Stage this test's TV working set onto fast local storage (default"
+  echo "                                    /dev/shm) before running, so load_tvs() reads locally instead of NFS."
+  echo "                                    Idempotent: repeat runs of the same test re-stage nothing."
+  echo "  --stage-dir <path>                Local staging directory for --stage-local (default: \${TV_STAGE_DIR:-/dev/shm/cubb_tv_stage})."
   echo "  -h, --help                        Show this help message."
   echo
   echo "Example:"
@@ -52,6 +56,8 @@ show_usage() {
 
 GDB_SCRIPT=""
 TIMEOUT=0
+STAGE_LOCAL=0
+STAGE_DIR=""
 
 # Parse additional options
 while [[ $# -gt 0 ]]; do
@@ -120,6 +126,30 @@ while [[ $# -gt 0 ]]; do
       TV_BASE_PATH="$2"
       shift 2
       ;;
+    --stage-local)
+      STAGE_LOCAL=1
+      shift
+      ;;
+    --stage-dir=*)
+      STAGE_DIR="${1#*=}"
+      if [[ -z "$STAGE_DIR" ]]; then
+        echo "Error: Missing value for --stage-dir option"
+        show_usage
+        exit 1
+      fi
+      STAGE_LOCAL=1
+      shift
+      ;;
+    --stage-dir)
+      if [[ -z "$2" || "$2" == -* ]]; then
+        echo "Error: Missing value for --stage-dir option"
+        show_usage
+        exit 1
+      fi
+      STAGE_DIR="$2"
+      STAGE_LOCAL=1
+      shift 2
+      ;;
     -h|--help)
       show_usage
       exit 0
@@ -159,28 +189,50 @@ if [[ ! -v TEST_CONFIG_DONE ]]; then
 fi
 
 #-------------------------------------------------------------------------------------------------------
-#verify if setup2_RU.sh has been run before running RU-emulator
-# Check first interface (always required)
-ACTUAL_RU_MAC_ADDRESS_0=$(cat /sys/class/net/"${RU_ETH_INTERFACE_0}"/address)
-if [ "$ACTUAL_RU_MAC_ADDRESS_0" != "$RU_MAC_ADDRESS_0" ]; then
-    echo "Error: MAC addresses do not match for interface 0. Expected $ACTUAL_RU_MAC_ADDRESS_0, but reading $RU_MAC_ADDRESS_0 from logs. Please ensure to run setup1_DU.sh and setup2_RU.sh before running run1_RU.sh"
-    env | grep ADDR
-    exit 1
-fi
-
-# Check second interface if running in 2-port mode
-if [ "${NUM_PORTS:-1}" -eq 2 ]; then
-    ACTUAL_RU_MAC_ADDRESS_1=$(cat /sys/class/net/"${RU_ETH_INTERFACE_1}"/address)
-    if [ "$ACTUAL_RU_MAC_ADDRESS_1" != "$RU_MAC_ADDRESS_1" ]; then
-        echo "Error: MAC addresses do not match for interface 1. Expected $ACTUAL_RU_MAC_ADDRESS_1, but reading $RU_MAC_ADDRESS_1 from logs. Please ensure to run setup1_DU.sh and setup2_RU.sh before running run1_RU.sh"
-        env | grep ADDR
+# Optionally stage the TV working set onto fast local storage so ru_emulator's
+# load_tvs() reads from local RAM/NVMe instead of the (~1Gbps-capped) NFS mount.
+# PATTERN and NUM_CELLS come from test_config_summary.sh sourced above.
+if [[ "$STAGE_LOCAL" -eq 1 ]]; then
+    STAGE_ARGS=(--pattern "$PATTERN" --num-cells "$NUM_CELLS")
+    [[ -n "$STAGE_DIR" ]] && STAGE_ARGS+=(--stage-dir "$STAGE_DIR")
+    echo "Staging test vectors to local storage for faster load_tvs()..."
+    if ! STAGE_OUT=$("$SCRIPT_DIR/stage_tvs_local.sh" "${STAGE_ARGS[@]}"); then
+        echo "$STAGE_OUT"
+        echo "Error: TV staging failed."
         exit 1
     fi
+    echo "$STAGE_OUT"
+    TV_BASE_PATH=$(echo "$STAGE_OUT" | sed -n 's/^TV_BASE_PATH=//p' | tail -1)
+    if [[ -z "$TV_BASE_PATH" || ! -d "$TV_BASE_PATH/multi-cell" ]]; then
+        echo "Error: staging did not produce a usable TV base path."
+        exit 1
+    fi
+    echo "Using staged TV base path: $TV_BASE_PATH"
 fi
 
 #-------------------------------------------------------------------------------------------------------
-# pattern, channels and number of cells from test_config_summary.sh
-NUM_CELLS="${NUM_CELLS}C"
+#verify if setup2_RU.sh has been run before running RU-emulator
+for ((p=0; p<${NUM_PORTS:-1}; p++)); do
+    iface_var="RU_ETH_INTERFACE_${p}"
+    mac_var="RU_MAC_ADDRESS_${p}"
+    iface="${!iface_var}"
+    expected_mac="${!mac_var}"
+    if [[ -z "$iface" || -z "$expected_mac" ]]; then
+        echo "Error: RU_ETH_INTERFACE_$p or RU_MAC_ADDRESS_$p not set. Please ensure setup1_DU.sh and setup2_RU.sh completed successfully."
+        exit 1
+    fi
+    actual_mac=$(cat /sys/class/net/"${iface}"/address)
+    if [ "$actual_mac" != "$expected_mac" ]; then
+        echo "Error: MAC addresses do not match for interface $p. Expected $expected_mac (from config), but interface reports $actual_mac. Please ensure to run setup1_DU.sh and setup2_RU.sh before running run1_RU.sh"
+        env | grep ADDR
+        exit 1
+    fi
+done
+
+#-------------------------------------------------------------------------------------------------------
+# Pattern, channels, and cell topology from test_config_summary.sh.
+CELL_TOPOLOGY="${CELL_TOPOLOGY:-${NUM_CELLS}C}"
+IFS='_' read -ra CELL_TOPOLOGY_ARGS <<< "$CELL_TOPOLOGY"
 if [ "$CHANNELS" == "all" ]; then
     CHANNELS=()
 else
@@ -197,17 +249,20 @@ fi
 # use user-defined base path for for test vectors (if specified)
 EXTRA_ARGS=()
 if [[ -n "$TV_BASE_PATH" ]]; then
-  EXTRA_ARGS+=(--tv "$TV_BASE_PATH" --lp "$TV_BASE_PATH/multi-cell/")
+  # ru_emulator concatenates --tv verbatim with each TV filename (config_parser.cpp:
+  # `user_defined_tv_base_path + tv_path`), so the base path MUST end with a slash or
+  # it looks for e.g. /dev/shm/cubb_tv_stageTVnr_*.h5. Normalize to exactly one.
+  EXTRA_ARGS+=(--tv "${TV_BASE_PATH%/}/" --lp "${TV_BASE_PATH%/}/multi-cell/")
 fi
 #-------------------------------------------------------------------------------------------------------
 BASE_RU_YAML=$(basename "$RU_YAML")
 if [[ "$CONTROLLER_MODE" == *nrSim_SCF* ]]; then
-    NRSIM_TC=$(echo "$CONTROLLER_MODE" | sed -E 's/nrSim_SCF_(CG1_)?//')
+    NRSIM_TC=$(echo "$CONTROLLER_MODE" | sed -E 's/nrSim_SCF_(CG1_|SPRK_|MGX1_)?//')
     echo "$WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator nrSim $NRSIM_TC" "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"
     { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator" nrSim $NRSIM_TC --config $BASE_RU_YAML "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"; RET=$?; } || true
 else
-    echo "$WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator F08 $NUM_CELLS $PATTERN --config $BASE_RU_YAML" "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"
+    echo "$WITH_TIMEOUT $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator F08 ${CELL_TOPOLOGY_ARGS[*]} $PATTERN --config $BASE_RU_YAML" "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"
     # shellcheck disable=SC1073
-    { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator" F08 $NUM_CELLS $PATTERN --config $BASE_RU_YAML "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"; RET=$?; } || true
+    { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/ru-emulator/ru_emulator/ru_emulator" F08 "${CELL_TOPOLOGY_ARGS[@]}" "$PATTERN" --config "$BASE_RU_YAML" "${CHANNELS[@]}" "${EXTRA_ARGS[@]}"; RET=$?; } || true
 fi
 exit $RET

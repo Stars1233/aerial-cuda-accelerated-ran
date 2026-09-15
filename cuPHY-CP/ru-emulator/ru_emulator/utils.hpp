@@ -98,16 +98,14 @@
 #define MAX_NUM_PACKETS_PER_C_PLANE_PER_SYM 273  //!< Maximum packets per C-plane message per symbol
 
 // OFDM and resource block configuration
-#ifdef ENABLE_32DL
-#define MAX_FLOWS_PER_DL_CORE       32  //!< Maximum number of flows per DL processing core
-#else
-#define MAX_FLOWS_PER_DL_CORE       16  //!< Maximum number of flows per DL processing core
-#endif
+// Compile-time cap for fixed arrays; runtime usage capped by YAML eAxC_DL count.
+#define MAX_FLOWS_PER_DL_CORE       32  //!< Maximum number of flows per DL processing core (worst case)
 #define OFDM_SYMBOLS_PER_SLOT       14    //!< Number of OFDM symbols per slot
 #define MAX_DL_LAYERS_PER_TB        4     //!< Maximum number of DL layers per transport block
 #define SUBCARRIERS_PER_PRB         12    //!< Number of subcarriers per physical resource block
 #define IQ_SAMPLE_ELEM_SIZE         4     //!< Size of IQ sample element in bytes
 #define MAX_NUM_ANTENNAS            16    //!< Maximum number of antenna ports
+#define MAX_UL_EAXC_UNIFIED  (MAX_NUM_ANTENNAS + MAX_NUM_ANTENNAS + SRS_MAX_EAXCIDS_PER_SYMBOL)  //!< Max unique UL eAxC IDs per cell (UL + PRACH + SRS worst case = 96)
 
 // Channel configuration
 #define MAX_UL_CHANNELS             5     //!< Maximum number of uplink channel types
@@ -335,7 +333,8 @@ struct cell_config
     int ulGridSize;             //!< Uplink resource grid size (PRBs)
     char uplink_oran_hdr_template[ORAN_IQ_HDR_SZ];  //!< Uplink ORAN header template
     dbt_md_t dbt_cfg;           //!< Dynamic beamforming table configuration
-    std::array<std::unordered_set<uint16_t>, MAX_AP_PER_SLOT> dyn_bfw_beam_id_with_full_bw;  //!< Dynamic beamforming beam IDs with full bandwidth per antenna port
+    std::array<std::array<std::unordered_set<uint16_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_AP_PER_SLOT>
+        dyn_bfw_beam_id_with_full_bw{};  //!< Full-BW dynamic beam IDs [eAxC][launch_pattern_slot]; slot-local so one slot cannot prime another after RU restart
 };
 
 struct _cuphyPdcchDciDynPrm;
@@ -641,7 +640,7 @@ struct dl_tv_info : tv_info
     uint16_t csirsNumREs = 0;   //!< Total number of CSI-RS REs
     uint8_t csirsMaxPortNum = 0;  //!< Maximum CSI-RS port number
 
-    std::array<uint8_t, 14> numFlowsArray;  //!< Number of flows per symbol
+    std::array<uint8_t, 14> numFlowsArray{};  //!< Number of flows per symbol
     uint32_t csirsExpectedNumREs = 0;  //!< Expected number of CSI-RS REs
 
     //PDSCH + NON OVERLAPPING CSI_RS
@@ -667,7 +666,39 @@ struct ul_cell_cpu_assignment
 using ul_cell_cpu_assignment_array = std::array<ul_cell_cpu_assignment, MAX_RU_THREADS>;  //!< Array of CPU assignments for UL cells
 
 /**
- * Calculate CPU assignment for uplink cells
+ * @brief Compute the cell-to-thread assignment for UL C-plane worker cores.
+ *
+ * Maps @p num_cores worker threads onto @p num_cells cells.  The relationship
+ * between core count and cell count determines the threading topology and has
+ * direct implications for data-structure synchronisation inside each worker.
+ *
+ * Three assignment modes exist:
+ *
+ * | Condition                | Mode                        | Result                                                         |
+ * |--------------------------|-----------------------------|----------------------------------------------------------------|
+ * | num_cores > num_cells    | Multi-thread-per-cell       | Some cells are served by **multiple** threads (see below).     |
+ * | num_cores == num_cells   | One-thread-per-cell         | Exactly one thread per cell; no shared-cell concurrency.       |
+ * | num_cores < num_cells    | Multi-cell-per-thread       | Each thread round-robins over several cells (sequential).      |
+ *
+ * @par Multi-thread-per-cell mode (num_cores > num_cells)
+ *
+ * Cores are distributed as evenly as possible.  With @em C = ceil(num_cores /
+ * num_cells) cores per cell, the first (num_cores mod num_cells) cells receive
+ * @em C threads and the remaining cells receive @em C-1 threads.
+ *
+ * Every thread assigned to the same cell calls `aerial_fh::receive()` on the
+ * **same** peer handle, so each thread dequeues a different subset of C-plane
+ * messages for that cell.  The threads then execute `tx_slot()` (or
+ * `tx_slot_precomputed()`) **concurrently**, which means the per-slot counter
+ * structures in @c ul_tv_object — in particular @c prb_rx_counters —
+ * can be mutated from multiple threads simultaneously.
+ *
+ * @par Typical CI/CD configurations
+ *
+ * | Configuration       | enable_mmimo | num_cells | num_cores (UL) | Threads per cell          |
+ * |---------------------|-------------|-----------|----------------|---------------------------|
+ * | Non-mMIMO 20-cell   | 0           | 20        | 21             | Cell 0 gets 2; rest get 1 |
+ * | mMIMO               | 1           | varies    | >= 3 per cell  | Multiple per cell         |
  *
  * @param[in] num_cells Number of cells to assign
  * @param[in] num_cores Number of CPU cores available
@@ -675,6 +706,10 @@ using ul_cell_cpu_assignment_array = std::array<ul_cell_cpu_assignment, MAX_RU_T
  * @param[in] is_srs Whether this is for SRS processing
  * @param[in] min_cores_per_cell_mmimo Minimum cores per cell for mMIMO (default: 3)
  * @return Array of CPU assignments per thread
+ *
+ * @see RU_Emulator::cplane_core
+ * @see RU_Emulator::increment_section_rx_counter
+ * @see RU_Emulator::increment_section_rx_counter_v2
  */
 ul_cell_cpu_assignment_array get_cell_cpu_assignment(int num_cells, int num_cores, bool enable_mmimo, bool is_srs, int min_cores_per_cell_mmimo = 3);
 
@@ -1083,6 +1118,190 @@ struct ULSectionIdTrackerSet
     }
 };
 
+/** Sentinel value for uninitialized launch-pattern slot trackers (UL and DL). */
+constexpr uint8_t PRB_TRACKER_SLOT_UNUSED = 0xFF;
+
+/** Sentinel for uninitialized FSS-key slot trackers (PRB duplicate detection). */
+constexpr uint32_t FSS_KEY_UNUSED = 0xFFFFFFFF;
+
+/**
+ * Pack Frame/Subframe/Slot into a unique 32-bit key for PRB duplicate tracker
+ * reset detection.  Unlike @c fss_to_launch_pattern_slot this preserves the
+ * full frameId so that consecutive frames with the same subframe/slot pattern
+ * are correctly distinguished.
+ */
+inline uint32_t fss_to_key(const struct fssId& fss)
+{
+    return (static_cast<uint32_t>(fss.frameId) << 16) |
+           (static_cast<uint32_t>(fss.subframeId) << 8) |
+            static_cast<uint32_t>(fss.slotId);
+}
+
+/**
+ * Per-symbol PRB bitmap tracker for UL C-plane duplicate/missing PRB detection.
+ *
+ * Replaces summation-counter approaches (prb_rx_counters += numPrb) with
+ * individual PRB tracking so that duplicate announcements are detected.
+ *
+ * Operates at PRB granularity (1 bit per PRB) using a raw uint64_t word
+ * array for direct word-level operations.  Setting a contiguous range of
+ * N PRBs touches at most ceil(N/64)+1 words instead of N individual bit
+ * operations, and the overlap check is done inline per-word with no
+ * separate full-bitmap scan.
+ *
+ * Suitable for UL channels where each section within a single eAxC flow
+ * occupies distinct PRBs.  One instance should be maintained per
+ * (cell, eAxC, slot).
+ *
+ * @see CplaneRePrbTracker for DL RE-level tracking
+ */
+struct CplanePrbTracker
+{
+    static constexpr int PRB_WORDS = (MAX_NUM_PRBS_PER_SYMBOL + 63) / 64;  //!< Number of 64-bit words per symbol bitmap
+
+    using PrbBitmap = std::array<uint64_t, PRB_WORDS>;  //!< Word-level bitmap: 1 bit per PRB
+
+    std::array<PrbBitmap, OFDM_SYMBOLS_PER_SLOT> symbols{};  //!< Per-symbol PRB allocation bitmaps (default: all zero)
+    bool has_duplicates{false}; //!< Set to true when any PRB is marked more than once
+
+    /** @brief Clear all bitmaps and reset state. */
+    void reset()
+    {
+        for (auto& sym : symbols)
+            sym.fill(0);
+        has_duplicates = false;
+    }
+
+    /**
+     * @brief Mark PRBs [startPrb, startPrb+numPrb) as received for a symbol.
+     *
+     * Uses word-level bulk operations: for a contiguous PRB range, only
+     * the first and last 64-bit words require partial masks; all
+     * intermediate words are set to all-ones.  Overlap detection is
+     * performed inline per-word (bitwise AND with existing bits).
+     *
+     * @param[in] symbol   OFDM symbol index (0-based); values >= OFDM_SYMBOLS_PER_SLOT are ignored.
+     * @param[in] startPrb First PRB index in the range.
+     * @param[in] numPrb   Number of contiguous PRBs to mark.
+     */
+    void mark_received(uint8_t symbol, uint16_t startPrb, uint16_t numPrb)
+    {
+        if (symbol >= OFDM_SYMBOLS_PER_SLOT)
+            return;
+        const uint16_t endPrb = std::min<uint16_t>(startPrb + numPrb, MAX_NUM_PRBS_PER_SYMBOL);
+        if (startPrb >= endPrb)
+            return;
+
+        auto& bm = symbols[symbol];
+
+        const int first_word = startPrb >> 6;          // startPrb / 64
+        const int last_word  = (endPrb - 1) >> 6;     // (endPrb-1) / 64
+        const int first_bit  = startPrb & 63;         // startPrb % 64
+        const int last_bit   = (endPrb - 1) & 63;     // (endPrb-1) % 64
+
+        if (first_word == last_word)
+        {
+            const uint64_t mask = ((last_bit == 63) ? ~uint64_t{0} : (uint64_t{1} << (last_bit + 1)) - 1)
+                                & ~((uint64_t{1} << first_bit) - 1);
+            if (bm[first_word] & mask)
+                has_duplicates = true;
+            bm[first_word] |= mask;
+        }
+        else
+        {
+            const uint64_t first_mask = ~((uint64_t{1} << first_bit) - 1);
+            if (bm[first_word] & first_mask)
+                has_duplicates = true;
+            bm[first_word] |= first_mask;
+
+            for (int w = first_word + 1; w < last_word; ++w)
+            {
+                if (bm[w])
+                    has_duplicates = true;
+                bm[w] = ~uint64_t{0};
+            }
+
+            const uint64_t last_mask = (last_bit == 63) ? ~uint64_t{0} : (uint64_t{1} << (last_bit + 1)) - 1;
+            if (bm[last_word] & last_mask)
+                has_duplicates = true;
+            bm[last_word] |= last_mask;
+        }
+    }
+};
+
+/**
+ * Per-symbol RE-level PRB tracker for DL C-plane duplicate/missing detection.
+ *
+ * Stores a 12-bit RE allocation mask (one bit per subcarrier) for every PRB
+ * in every OFDM symbol.  This allows channels that share PRBs with
+ * orthogonal reMask values (e.g. PDSCH and CSI-RS) to coexist without
+ * being flagged as duplicates.  A true duplicate is detected only when the
+ * incoming reMask overlaps with an already-recorded mask on the same PRB.
+ *
+ * One instance should be maintained per (cell, eAxC).
+ *
+ * @see CplanePrbTracker for UL PRB-level tracking
+ */
+struct CplaneRePrbTracker
+{
+    std::array<std::array<uint16_t, MAX_NUM_PRBS_PER_SYMBOL>, OFDM_SYMBOLS_PER_SLOT> symbols{};  //!< Per-symbol array of 12-bit RE allocation masks, one uint16_t per PRB (default: all zero)
+    uint32_t total_unique_prbs{0};  //!< Running count of PRBs that transitioned from empty (0) to non-empty across all symbols
+    bool     has_duplicates{false}; //!< Set to true when any incoming reMask overlaps with an already-recorded mask on the same PRB
+
+    /** @brief Clear all RE masks and reset counters to their initial state. */
+    void reset()
+    {
+        for (auto& sym : symbols)
+        {
+            sym.fill(0);
+        }
+        total_unique_prbs = 0;
+        has_duplicates = false;
+    }
+
+    /**
+     * @brief Mark REs within PRBs [startPrb, startPrb+numPrb) for a symbol.
+     *
+     * Iterates over the PRB range (clamped to [0, MAX_NUM_PRBS_PER_SYMBOL))
+     * and ORs @p reMask into each PRB's stored mask.  If any bit in @p reMask
+     * was already set in the existing mask, @c has_duplicates is set to true
+     * (a true RE-level collision).  PRBs whose mask transitions from 0 to
+     * non-zero are counted as newly unique.
+     *
+     * @param[in] symbol   OFDM symbol index (0-based); values >= OFDM_SYMBOLS_PER_SLOT are ignored.
+     * @param[in] startPrb First PRB index in the range.
+     * @param[in] numPrb   Number of contiguous PRBs to mark.
+     * @param[in] reMask   12-bit RE allocation mask indicating which subcarriers are used.
+     * @return Number of newly-unique PRBs added (0 if all were already non-zero or symbol is out of range).
+     */
+    uint32_t mark_received(uint8_t symbol, uint16_t startPrb, uint16_t numPrb,
+                           uint16_t reMask)
+    {
+        if (symbol >= OFDM_SYMBOLS_PER_SLOT)
+        {
+            return 0;
+        }
+        auto& sym_data = symbols[symbol];
+        uint32_t new_unique = 0;
+        uint16_t endPrb = std::min<uint16_t>(startPrb + numPrb, MAX_NUM_PRBS_PER_SYMBOL);
+        for (uint16_t p = startPrb; p < endPrb; ++p)
+        {
+            if ((sym_data[p] & reMask) != 0)
+            {
+                has_duplicates = true;
+            }
+            bool was_empty = (sym_data[p] == 0);
+            sym_data[p] |= reMask;
+            if (was_empty)
+            {
+                ++new_unique;
+            }
+        }
+        total_unique_prbs += new_unique;
+        return new_unique;
+    }
+};
+
 /**
  * ORAN C-plane message information (aggregated from multiple sections)
  */
@@ -1247,12 +1466,16 @@ struct dl_tv_object : tv_object
     std::array<aerial_fh::FHMutex, MAX_CELLS_PER_SLOT> mtx;  //!< Mutex per cell for thread safety
 };
 
+// Sentinels for ul_tv_object::prb_rx_counter_frame (outside O-RAN 8-bit frameId).
+static constexpr uint16_t PRB_RX_FRAME_UNSET = 0xFFFF;
+static constexpr uint16_t PRB_RX_FRAME_TRANSITIONING = 0xFFFE;
+
 /**
  * Uplink test vector object (extends tv_object)
  */
 struct ul_tv_object : tv_object
 {
-    ul_tv_object() : blank_prbs(nullptr, aerial_fh::free_memory),channel_type(ul_channel::NONE) {};  //!< Constructor
+    ul_tv_object() : blank_prbs(nullptr, aerial_fh::free_memory),channel_type(ul_channel::NONE) {}
     std::array<std::vector<Slot>, IQ_DATA_FMT_MAX> slots;  //!< UL slot data indexed by IQ format type
     std::array<std::vector<std::vector<Slot> >, IQ_DATA_FMT_MAX> prach_slots;  //!< PRACH slot data [fmt][occasion][preamble]
 
@@ -1263,9 +1486,9 @@ struct ul_tv_object : tv_object
     std::array<std::atomic<uint16_t>, MAX_CELLS_PER_SLOT> u_plane_tx{};  //!< U-plane packets transmitted per cell
     std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> c_plane_rx_tot{};  //!< Total C-plane packets received
     std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT> u_plane_tx_tot{};  //!< Total U-plane packets transmitted
-    std::array<std::array<std::atomic<uint16_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> section_rx_counters{};  //!< Section RX counters [cell][slot]
-    std::array<std::array<std::atomic<uint32_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> prb_rx_counters{};  //!< PRB RX counters [cell][slot]
-    std::array<std::array<aerial_fh::FHMutex, MAX_LAUNCH_PATTERN_SLOTS>, MAX_CELLS_PER_SLOT> rx_counters_mtx{};  //!< RX counter mutexes [cell][slot]
+    std::array<std::array<std::atomic<uint16_t>, SLOT_3GPP>, MAX_CELLS_PER_SLOT> section_rx_counters{};  //!< Section RX counters [cell][slot]
+    std::array<std::array<std::atomic<uint32_t>, SLOT_3GPP>, MAX_CELLS_PER_SLOT> prb_rx_counters{};  //!< PRB RX counters [cell][slot] (summation-counter path)
+    std::array<std::array<std::atomic<uint16_t>, SLOT_3GPP>, MAX_CELLS_PER_SLOT> prb_rx_counter_frame{};  //!< Last frameId for prb_rx_counters (PRB_RX_FRAME_UNSET / PRB_RX_FRAME_TRANSITIONING, else O-RAN frameId); drops leftover counts on radio-frame rollover after RU mid-slot join
 };
 
 // ---------------------------------------------------------------------------

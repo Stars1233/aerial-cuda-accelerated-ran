@@ -32,8 +32,10 @@
 #include "nic.hpp"
 #include "utils.hpp"
 #include "cuphy_pti.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+#include "cuda_driver_utils/cuda_kernel_utils.cuh"
 
-#define TAG "FH.DOCA"
+#define TAG (NVLOG_TAG_BASE_FH_DRIVER + 18) // "FH.DOCA"
 
 #define FENCE_DEV() do { __threadfence(); } while(0)
 #define FENCE_SYS() do { __threadfence_system(); } while(0)
@@ -66,6 +68,28 @@ namespace cg = cooperative_groups;
 namespace aerial_fh
 {
 
+// NOTE: CUfunction handles are CUDA-context-specific. This TU-global assumes a
+// single CUDA context for all GpuComm instances. If multiple CUDA contexts are
+// used, move this struct into GpuComm as a per-instance member.
+namespace {
+struct GpuCommKernels {
+    CUfunction warmup                            = nullptr;
+    CUfunction memset_kernel                     = nullptr;
+    CUfunction packet_memcpy_kernel              = nullptr;
+    CUfunction pre_prepare_send_cpu              = nullptr;  // <true>
+    CUfunction pre_prepare_send_gpu              = nullptr;  // <false>
+    CUfunction prepare_send_gpu_noTrace          = nullptr;  // <false, false>
+    CUfunction prepare_send_gpu_trace            = nullptr;  // <false, true>
+    CUfunction prepare_send_cpu_noTrace          = nullptr;  // <true, false>
+    CUfunction prepare_send_cpu_trace            = nullptr;  // <true, true>
+    CUfunction prepare_send_nonEmpw              = nullptr;
+    CUfunction trigger_send_cx6                  = nullptr;
+    CUfunction trigger_send_cx7                  = nullptr;
+    CUfunction trigger_send_nonEmpw_cx7          = nullptr;
+};
+GpuCommKernels s_gpu_comm_kernels;
+} // anonymous namespace
+
 __device__ __forceinline__ unsigned long long __globaltimer()
 {
     unsigned long long globaltimer;
@@ -83,13 +107,8 @@ __global__ void warmup()
 
 int gpu_comm_warmup(cudaStream_t cstream)
 {
-    cudaError_t result = cudaSuccess;
-
-    warmup<<<2, 512, 0, cstream>>>();
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching warmup kernel failed with {}", __FILE__, __LINE__, cudaGetErrorString(result));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuLaunchKernel(s_gpu_comm_kernels.warmup,
+        2, 1, 1, 512, 1, 1, 0, cstream, nullptr, nullptr));
     return 0;
 }
 __global__ void memset_kernel(CleanupParams params) {
@@ -126,12 +145,10 @@ __global__ void memset_kernel(CleanupParams params) {
 void launch_memset_kernel(int num_cells, size_t max_buffer_size, CleanupParams& cleanup, cudaStream_t strm) {
 
     int num_threads = 1024;
-    // max_buffer_size is in bytes
     int blocks = (max_buffer_size + sizeof(uint4)*num_threads - 1) / (sizeof(uint4)*num_threads);
-    memset_kernel<<<dim3(blocks, num_cells), num_threads, 0, strm>>>(cleanup);
-    cudaError_t result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching memset kernel failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = { &cleanup };
+    CUDA_DRIVER_CHECK_NON_FATAL(cuLaunchKernel(s_gpu_comm_kernels.memset_kernel,
+        blocks, num_cells, 1, num_threads, 1, 1, 0, strm, args, nullptr));
 }
 
 
@@ -139,6 +156,10 @@ __global__ void packet_memcpy_kernel(PacketCopyParams params) {
     int cell = blockIdx.z;
     int flow_num = blockIdx.y;
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (flow_num >= static_cast<int>(params.num_dl_flows_cap)) {
+        return;
+    }
 
     if (tid < ((params.cell_params[cell].num_pkts_per_flow[flow_num]*params.pkt_size) >> 4)) {
             const int offset = (params.cell_params[cell].pkt_offset[flow_num]*params.pkt_size + sizeof(uint4)*tid) % (kMaxPktsFlow * params.pkt_size); // 16 bytes per load/store
@@ -159,12 +180,15 @@ __global__ void packet_memcpy_kernel(PacketCopyParams params) {
 void launch_packet_memcpy_kernel(PacketCopyParams params, int num_cells, cudaStream_t strm)
 {
     int num_threads = 512;
-    // max_buffer_size is in bytes
     int blocks = (params.max_pkts*params.pkt_size + sizeof(uint4)*num_threads - 1) / (sizeof(uint4)*num_threads);
-    packet_memcpy_kernel<<<dim3(blocks,kMaxFlows,num_cells), num_threads, 0, strm>>>(params);
-    cudaError_t result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    int flow_y = static_cast<int>(params.num_dl_flows_cap);
+    if (flow_y < 1 || flow_y > kMaxFlows) {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "Invalid num_dl_flows_cap {} (must be 1..{})", flow_y, kMaxFlows);
+        return;
+    }
+    void* args[] = { &params };
+    CUDA_DRIVER_CHECK_NON_FATAL(cuLaunchKernel(s_gpu_comm_kernels.packet_memcpy_kernel,
+        blocks, flow_y, num_cells, num_threads, 1, 1, 0, strm, args, nullptr));
 }
 
 /* DOCA Tx comm from here */
@@ -486,30 +510,19 @@ __global__ void gpu_comm_pre_prepare_send_doca(PrepareParams params, struct cuph
 
 int gpucomm_pre_prepare_send(PrepareParams &params, cudaStream_t cstream)
 {
-    cudaError_t result = cudaSuccess;
-
     struct cuphy_pti_activity_stats_t activity_stats;
     cuphy_pti_get_record_activity(activity_stats,CUPHY_PTI_ACTIVITY_PREPREP);
-    if(params.enable_gpu_comm_via_cpu == 1)
-    {
-        const bool enable_gpu_comm_via_cpu = true;
-        gpu_comm_pre_prepare_send_doca<enable_gpu_comm_via_cpu><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-            params,
-            activity_stats);
-    }
-    else
-    {
-        const bool enable_gpu_comm_via_cpu = false;
-        gpu_comm_pre_prepare_send_doca<enable_gpu_comm_via_cpu><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-            params,
-            activity_stats);
-    }
 
-    result = cudaGetLastError();
-    if(cudaSuccess != result) {
-                NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching pre_prepare_send* kernel failed with {}", __FILE__, __LINE__, cudaGetErrorString(result));
-                return 1;
-        }
+    CUfunction func = (params.enable_gpu_comm_via_cpu == 1)
+        ? s_gpu_comm_kernels.pre_prepare_send_cpu
+        : s_gpu_comm_kernels.pre_prepare_send_gpu;
+
+    void* args[] = { &params, &activity_stats };
+    CUresult cu_res = cuLaunchKernel(func,
+        params.num_cells, kPeerSymbolsInfo, 1, 128, 1, 1, 0, cstream, args, nullptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cu_res);
+    if (cu_res != CUDA_SUCCESS)
+        return 1;
 
     return 0;
 }
@@ -869,99 +882,32 @@ __global__ void gpu_comm_prepare_send_doca_nonEmpw(PrepareParams params, struct 
 
 int gpucomm_prepare_send(PrepareParams &params, cudaStream_t cstream)
 {
-    cudaError_t result = cudaSuccess;
-
     struct cuphy_pti_activity_stats_t activity_stats;
     cuphy_pti_get_record_activity(activity_stats,CUPHY_PTI_ACTIVITY_PREP);
-    if(!params.payload_info.disable_empw){
-        if(params.enable_gpu_comm_via_cpu == 1)
-        {
-            const bool enable_gpu_comm_via_cpu = true;
-            if(params.payload_info.enable_dl_cqe_tracing)
-            {
-                const bool enable_dl_cqe_tracing = true;
-                gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu, enable_dl_cqe_tracing><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-                    params,
-                    activity_stats);
-            }
-            else
-            {
-                const bool enable_dl_cqe_tracing = false;
-                gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu, enable_dl_cqe_tracing><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-                    params,
-                    activity_stats);
-            }
+
+    CUfunction func;
+    if (!params.payload_info.disable_empw) {
+        if (params.enable_gpu_comm_via_cpu == 1) {
+            func = params.payload_info.enable_dl_cqe_tracing
+                ? s_gpu_comm_kernels.prepare_send_cpu_trace
+                : s_gpu_comm_kernels.prepare_send_cpu_noTrace;
+        } else {
+            func = params.payload_info.enable_dl_cqe_tracing
+                ? s_gpu_comm_kernels.prepare_send_gpu_trace
+                : s_gpu_comm_kernels.prepare_send_gpu_noTrace;
         }
-        else
-        {
-            const bool enable_gpu_comm_via_cpu = false;
-            if(params.payload_info.enable_dl_cqe_tracing)
-            {
-                const bool enable_dl_cqe_tracing = true;
-                gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu, enable_dl_cqe_tracing><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-                    params,
-                    activity_stats);
-            }
-            else
-            {
-                const bool enable_dl_cqe_tracing = false;
-                gpu_comm_prepare_send_doca<enable_gpu_comm_via_cpu, enable_dl_cqe_tracing><<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-                    params,
-                    activity_stats);
-            }
-        }
-    }
-    else
-    {
-        gpu_comm_prepare_send_doca_nonEmpw<<<dim3(params.num_cells, kPeerSymbolsInfo), 128, 0, cstream>>>(
-               params,
-               activity_stats);
+    } else {
+        func = s_gpu_comm_kernels.prepare_send_nonEmpw;
     }
 
-    result = cudaGetLastError();
-    if(cudaSuccess != result) {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching gpu_comm_prepare* kernel failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = { &params, &activity_stats };
+    CUresult cu_res = cuLaunchKernel(func,
+        params.num_cells, kPeerSymbolsInfo, 1, 128, 1, 1, 0, cstream, args, nullptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cu_res);
+    if (cu_res != CUDA_SUCCESS)
         return -1;
-    }
     return 0;
 }
-// Simple kernel to ring doorbell for each cell
-// Each thread handles one cell based on threadIdx.x
-__global__ void gpucomm_ring_doorbell_per_cell(doca_gpu_eth_txq** txq_handlers, const uint32_t* wqe_indices, const uint32_t num_cells)
-{
-    const uint32_t cell_id = threadIdx.x;
-    
-    if (cell_id < num_cells) {
-        doca_gpu_dev_eth_txq_submit_proxy<DOCA_GPUNETIO_ETH_RESOURCE_SHARING_MODE_GPU,DOCA_GPUNETIO_ETH_SYNC_SCOPE_CTA>(txq_handlers[cell_id], wqe_indices[cell_id]);
-        //printf("gpucomm_ring_doorbell_per_cell cell_id %d wqe_indices[cell_id] %d\n", cell_id, wqe_indices[cell_id]);
-    }
-}
-
-// Host function to launch the ring doorbell kernel
-int gpucomm_ring_doorbell_for_cells(doca_gpu_eth_txq** d_txq_handlers, const uint32_t* d_wqe_indices, const uint32_t num_cells, cudaStream_t cstream)
-{
-    if (num_cells == 0) {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] num_cells is 0", __FILE__, __LINE__);
-        return -1;
-    }
-    
-    if (num_cells > 1024) {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] num_cells {} exceeds maximum block size", __FILE__, __LINE__, num_cells);
-        return -1;
-    }
-    
-    // Launch with 1 block and num_cells threads (CTA size based on number of cells)
-    gpucomm_ring_doorbell_per_cell<<<1, num_cells, 0, cstream>>>(d_txq_handlers, d_wqe_indices, num_cells);
-    
-    const cudaError_t result = cudaGetLastError();
-    if (cudaSuccess != result) {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching gpucomm_ring_doorbell_per_cell kernel failed with {}", __FILE__, __LINE__, cudaGetErrorString(result));
-        return -1;
-    }
-    
-    return 0;
-}
-
 __global__ void gpu_comm_trigger_send_doca_cx6(TriggerParams params, const uint32_t ncells, uint32_t *wait_flag, const uint32_t wait_val,struct cuphy_pti_activity_stats_t activity_stats)
 {
     CuphyPtiRecordStartStopTimeScope scoped_record_start_stop_time(activity_stats);
@@ -1041,73 +987,46 @@ __global__ void gpu_comm_trigger_send_doca_nonEmpw_cx7(TriggerParams params, con
 
 int gpucomm_trigger_send(TriggerParams &params, cudaStream_t cstream, bool cx6)
 {
-    cudaError_t result = cudaSuccess;
     struct cuphy_pti_activity_stats_t activity_stats;
     cuphy_pti_get_record_activity(activity_stats,CUPHY_PTI_ACTIVITY_TRIGGER);
-    if (cx6 == true)
-        gpu_comm_trigger_send_doca_cx6<<<1, params.num_cells, 0, cstream>>>(
-            params,
-            params.num_cells,
-            params.ready_flag,
-            params.wait_val,
-            activity_stats);
-    else
-    {
-        if(!params.disable_empw)
-        {
-            gpu_comm_trigger_send_doca_cx7<<<1, params.num_cells, 0, cstream>>>(
-                params,
-                params.num_cells,
-                params.ready_flag,
-                params.wait_val,
-                activity_stats);
-        }
-        else
-        {
-            gpu_comm_trigger_send_doca_nonEmpw_cx7<<<1, params.num_cells, 0, cstream>>>(
-                params,
-                params.num_cells,
-                params.ready_flag,
-                params.wait_val,
-                activity_stats);
-        }
-    }
 
-    result = cudaGetLastError();
-    if(cudaSuccess != result) {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] launching gpu_comm_trigger* kernel failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    CUfunction func;
+    if (cx6)
+        func = s_gpu_comm_kernels.trigger_send_cx6;
+    else if (!params.disable_empw)
+        func = s_gpu_comm_kernels.trigger_send_cx7;
+    else
+        func = s_gpu_comm_kernels.trigger_send_nonEmpw_cx7;
+
+    uint32_t num_cells_arg = params.num_cells;
+    uint32_t* ready_flag_arg = params.ready_flag;
+    uint32_t wait_val_arg = params.wait_val;
+    void* args[] = { &params, &num_cells_arg, &ready_flag_arg, &wait_val_arg, &activity_stats };
+    CUresult cu_res = cuLaunchKernel(func,
+        1, 1, 1, params.num_cells, 1, 1, 0, cstream, args, nullptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cu_res);
+    if (cu_res != CUDA_SUCCESS)
         return -1;
-    }
     return 0;
 }
 
-void force_loading_gpu_comm_kernels()
+[[nodiscard]] bool resolve_gpu_comm_kernels()
 {
-    std::array<void*, 14> gpu_comm_kernels = {
-     (void*)warmup,
-     (void*)memset_kernel,
-     (void*)packet_memcpy_kernel,
-     (void*)gpu_comm_pre_prepare_send_doca<true>,
-     (void*)gpu_comm_pre_prepare_send_doca<false>,
-     (void*)gpu_comm_prepare_send_doca<false, false>,
-     (void*)gpu_comm_prepare_send_doca<false, true>,
-     (void*)gpu_comm_prepare_send_doca<true, false>,
-     (void*)gpu_comm_prepare_send_doca<true, true>,
-     (void*)gpu_comm_prepare_send_doca_nonEmpw,
-     (void*)gpucomm_ring_doorbell_per_cell,
-     (void*)gpu_comm_trigger_send_doca_cx6,
-     (void*)gpu_comm_trigger_send_doca_cx7,
-     (void*)gpu_comm_trigger_send_doca_nonEmpw_cx7};
-
-     for(auto& gpu_comm_kernel : gpu_comm_kernels)
-     {
-         cudaFuncAttributes attr;
-         cudaError_t e = cudaFuncGetAttributes(&attr, static_cast<const void*>(gpu_comm_kernel));
-         if(cudaSuccess != e)
-         {
-             NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cudaFuncGetAttributes call failed with {} ", __FILE__, __LINE__, cudaGetErrorString(e));
-         }
-     }
+    bool ok = true;
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.warmup,                 reinterpret_cast<const void*>(warmup),                                      "warmup");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.memset_kernel,           reinterpret_cast<const void*>(memset_kernel),                                "memset_kernel");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.packet_memcpy_kernel,    reinterpret_cast<const void*>(packet_memcpy_kernel),                         "packet_memcpy_kernel");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.pre_prepare_send_cpu,    reinterpret_cast<const void*>(gpu_comm_pre_prepare_send_doca<true>),          "gpu_comm_pre_prepare_send_doca<true>");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.pre_prepare_send_gpu,    reinterpret_cast<const void*>(gpu_comm_pre_prepare_send_doca<false>),         "gpu_comm_pre_prepare_send_doca<false>");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.prepare_send_gpu_noTrace,reinterpret_cast<const void*>(gpu_comm_prepare_send_doca<false, false>),      "gpu_comm_prepare_send_doca<false,false>");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.prepare_send_gpu_trace,  reinterpret_cast<const void*>(gpu_comm_prepare_send_doca<false, true>),       "gpu_comm_prepare_send_doca<false,true>");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.prepare_send_cpu_noTrace,reinterpret_cast<const void*>(gpu_comm_prepare_send_doca<true, false>),       "gpu_comm_prepare_send_doca<true,false>");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.prepare_send_cpu_trace,  reinterpret_cast<const void*>(gpu_comm_prepare_send_doca<true, true>),        "gpu_comm_prepare_send_doca<true,true>");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.prepare_send_nonEmpw,    reinterpret_cast<const void*>(gpu_comm_prepare_send_doca_nonEmpw),            "gpu_comm_prepare_send_doca_nonEmpw");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.trigger_send_cx6,        reinterpret_cast<const void*>(gpu_comm_trigger_send_doca_cx6),                "gpu_comm_trigger_send_doca_cx6");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.trigger_send_cx7,        reinterpret_cast<const void*>(gpu_comm_trigger_send_doca_cx7),                "gpu_comm_trigger_send_doca_cx7");
+    ok &= resolve_kernel_func<TAG>(&s_gpu_comm_kernels.trigger_send_nonEmpw_cx7,reinterpret_cast<const void*>(gpu_comm_trigger_send_doca_nonEmpw_cx7),       "gpu_comm_trigger_send_doca_nonEmpw_cx7");
+    return ok;
 }
 
 

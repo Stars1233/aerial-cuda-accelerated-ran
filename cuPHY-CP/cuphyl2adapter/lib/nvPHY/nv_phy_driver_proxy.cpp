@@ -115,16 +115,89 @@ int PHYDriverProxy::l1_cell_stop(uint16_t cell_id)
     }
 }
 
-int PHYDriverProxy::l1_enqueue_phy_work(slot_command& command)
+int PHYDriverProxy::l1_enqueue_phy_work(slot_command& command, EnqueueSkipMask skip_mask)
 {
-    if(driver_ != nullptr)
+    if (driver_ != nullptr)
     {
-        return ::l1_enqueue_phy_work(driver_, &command);
+        return ::l1_enqueue_phy_work(driver_, &command, skip_mask);
+    }
+    else
+    {
+        // Standalone/test mode — no real driver; fall back to simulated enqueue.
+        // skip_mask is intentionally ignored in simulation (no C-plane tasks to skip).
+        return sSimulateDrv->enqueue_phy_work(command);
+    }
+}
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+// Store-replay overload: forwards caller-bound DL/UL early slot maps to
+// ::l1_enqueue_phy_work (use_bound_early_maps). Docs on the declaration.
+int PHYDriverProxy::l1_enqueue_phy_work(slot_command& command,
+                                        EnqueueSkipMask skip_mask,
+                                        void* bound_early_slot_map_dl,
+                                        void* bound_early_slot_map_ul)
+{
+    if (driver_ != nullptr)
+    {
+        static constexpr bool use_bound_early_maps = true;
+        return ::l1_enqueue_phy_work(driver_,
+                                     &command,
+                                     skip_mask,
+                                     use_bound_early_maps,
+                                     static_cast<SlotMapDl*>(bound_early_slot_map_dl),
+                                     static_cast<SlotMapUl*>(bound_early_slot_map_ul));
     }
     else
     {
         return sSimulateDrv->enqueue_phy_work(command);
     }
+}
+#endif
+
+bool PHYDriverProxy::l1_push_new_dl_task(uint64_t ts_exec_ns, const char* name,
+                                          l1_task_work_fn_t fn, void* arg,
+                                          int fc, int nc, int nt, worker_id wid)
+{
+    if (driver_ == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "l1_push_new_dl_task: driver_ is null, task '{}' dropped", name);
+        return false;
+    }
+    return ::l1_push_new_dl_task(driver_, ts_exec_ns, name, fn, arg, fc, nc, nt, wid);
+}
+
+bool PHYDriverProxy::l1_push_new_ul_task(uint64_t ts_exec_ns, const char* name,
+                                          l1_task_work_fn_t fn, void* arg,
+                                          int fc, int nc, int nt, worker_id wid)
+{
+    if (driver_ == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "l1_push_new_ul_task: driver_ is null, task '{}' dropped", name);
+        return false;
+    }
+    return ::l1_push_new_ul_task(driver_, ts_exec_ns, name, fn, arg, fc, nc, nt, wid);
+}
+
+int PHYDriverProxy::l1_push_new_dl_tasks_bulk(uint64_t ts_exec_ns,
+                                               std::span<const TaskSpec> specs)
+{
+    if (driver_ == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "l1_push_new_dl_tasks_bulk: driver_ is null, {} task(s) dropped", specs.size());
+        return 0;
+    }
+    return ::l1_push_new_dl_tasks_bulk(driver_, ts_exec_ns, specs);
+}
+
+int PHYDriverProxy::l1_push_new_ul_tasks_bulk(uint64_t ts_exec_ns,
+                                               std::span<const TaskSpec> specs)
+{
+    if (driver_ == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "l1_push_new_ul_tasks_bulk: driver_ is null, {} task(s) dropped", specs.size());
+        return 0;
+    }
+    return ::l1_push_new_ul_tasks_bulk(driver_, ts_exec_ns, specs);
 }
 
 int PHYDriverProxy::l1_set_output_callback(callbacks& cb)
@@ -274,6 +347,14 @@ int PHYDriverProxy::l1_cell_update_attenuation(uint16_t mplane_id, float attenua
     }
 }
 
+void PHYDriverProxy::l1_bind_thread_to_phy_cuda_context()
+{
+    if(driver_ != nullptr)
+    {
+        ::l1_bind_thread_to_phy_cuda_context(driver_);
+    }
+}
+
 int PHYDriverProxy::l1_update_gps_alpha_beta(uint64_t alpha,int64_t beta)
 {
     if(driver_ != nullptr)
@@ -298,6 +379,46 @@ int PHYDriverProxy::l1_cell_update_cell_config(struct cell_phy_info& cell_pinfo,
         // l2_adapter standalone mode
         return 0;
     }
+}
+
+int PHYDriverProxy::l1_cell_update_cell_config_caller_runs(cell_phy_info& cell_pinfo)
+{
+    if(driver_ != nullptr)
+    {
+        return ::l1_cell_update_cell_config_caller_runs(driver_, cell_pinfo);
+    }
+    // l2_adapter standalone mode: no L1 driver, nothing to update
+    NVLOGD_FMT(TAG, "{}: driver_ is null, no-op in l2_adapter standalone mode", __func__);
+    return 0;
+}
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+void PHYDriverProxy::l1_try_commit_prach_offload_handover()
+{
+    if(driver_ != nullptr)
+    {
+        ::l1_try_commit_prach_offload_handover(driver_);
+    }
+    // l2_adapter standalone mode: no L1 driver, nothing to drain.
+}
+#endif // ENABLE_FAPI_STORE_REPLAY
+
+bool PHYDriverProxy::l1_phy_cell_id_mismatch(int cell_id, uint16_t new_phy_cell_id)
+{
+    // Set default to false for l2_adapter standalone mode
+    bool mismatch = false;
+
+    if (driver_ != nullptr)
+    {
+        try {
+            uint16_t mplane_id = getMPlaneConfig(cell_id).mplane_id;
+            mismatch = ::l1_phy_cell_id_mismatch(driver_, mplane_id, new_phy_cell_id);
+        } catch (const std::exception& e) {
+            NVLOGW_FMT(TAG, "{}: failed to get cell by cell_id={}: {}", __func__, cell_id, e.what());
+            mismatch = true;
+        }
+    }
+    return mismatch;
 }
 
 int PHYDriverProxy::l1_lock_update_cell_config_mutex()
@@ -403,6 +524,37 @@ void PHYDriverProxy:: l1_copy_TB_to_gpu_buf(uint16_t phy_cell_id, uint8_t * tb_b
     //::l1_copy_TB_to_gpu_buf(driver_, phy_cell_id, tb_buff, gpu_buff_ref, tb_len, slot_index);
     ::l1_copy_TB_to_gpu_buf_thread_offload(driver_, phy_cell_id, tb_buff, gpu_buff_ref, tb_len, slot_index, sfn);
     return;
+}
+
+int PHYDriverProxy::l1_stage_tb_h2d(const uint16_t phy_cell_id,
+                                    const uint8_t* shm_src,
+                                    const uint32_t len,
+                                    const uint8_t  slot_index,
+                                    uint8_t**      gpu_buf_out)
+{
+    if (driver_ == nullptr)
+    {
+        return static_cast<int>(CUPHY_STATUS_INVALID_ARGUMENT);
+    }
+    return ::l1_stage_tb_h2d(driver_, phy_cell_id, shm_src, len, slot_index, gpu_buf_out);
+}
+
+int PHYDriverProxy::l1_launch_tb_h2d(const uint16_t slot_in_frame)
+{
+    if (driver_ == nullptr)
+    {
+        return static_cast<int>(CUPHY_STATUS_INVALID_ARGUMENT);
+    }
+    return ::l1_launch_tb_h2d(driver_, slot_in_frame);
+}
+
+bool PHYDriverProxy::l1_get_h2d_copy_thread_enable() const noexcept
+{
+    if (driver_ == nullptr)
+    {
+        return false;
+    }
+    return ::l1_get_h2d_copy_thread_enable(driver_);
 }
 
 int PHYDriverProxy::l1_cv_mem_bank_update(uint32_t cell_id,uint16_t rnti, uint16_t buffer_idx, uint16_t reportType, uint16_t startPrbGrp,uint32_t srsPrbGrpSize,uint16_t numPrgs,
@@ -529,8 +681,8 @@ int PHYDriverProxy::l1_storeDBTPdu(uint16_t cell_id, void* data_buf)
     }
     else
     {
-        // l2_adapter standalone mode
-        return -1;
+        // l2_adapter standalone mode, do nothing and return success
+        return 0;
     }
 }
 
@@ -542,8 +694,8 @@ int PHYDriverProxy::l1_storeDBTPdu(uint16_t cell_id, void* data_buf)
     }
     else
     {
-        // l2_adapter standalone mode
-        return -1;
+        // l2_adapter standalone mode, do nothing and return success
+        return 0;
     }
 }
 
@@ -578,6 +730,32 @@ int16_t PHYDriverProxy::l1_getDynamicBeamIdOffset(uint16_t cell_id)
     if(driver_ != nullptr)
     {
         return ::l1_getDynamicBeamIdOffset(driver_, cell_id);
+    }
+    else
+    {
+        // l2_adapter standalone mode
+        return -1;
+    }
+}
+
+bool PHYDriverProxy::l1_isFapiToCplaneDirect()
+{
+    if(driver_ != nullptr)
+    {
+        return ::l1_is_fapi_to_cplane_direct(driver_);
+    }
+    else
+    {
+        // l2_adapter standalone mode
+        return false;
+    }
+}
+
+int PHYDriverProxy::l1_recordDirectBfwCviRecord(uint16_t cell_id, const direct_bfw_cvi_record& record)
+{
+    if(driver_ != nullptr)
+    {
+        return ::l1_recordDirectBfwCviRecord(driver_, cell_id, record);
     }
     else
     {
@@ -622,6 +800,20 @@ uint8_t PHYDriverProxy::l1_get_enable_weighted_average_cfo()
         return 0;
 }
 
+uint8_t PHYDriverProxy::l1_get_cplane_processing_dl_batch_size()
+{
+    if (driver_ != nullptr)
+        return ::l1_get_cplane_processing_dl_batch_size(driver_);
+    return static_cast<uint8_t>(MAX_CELLS_PER_SLOT);
+}
+
+uint8_t PHYDriverProxy::l1_get_cplane_processing_ul_batch_size()
+{
+    if (driver_ != nullptr)
+        return ::l1_get_cplane_processing_ul_batch_size(driver_);
+    return static_cast<uint8_t>(MAX_CELLS_PER_SLOT);
+}
+
 bool PHYDriverProxy::l1_get_split_ul_cuda_streams()
 {
     if(driver_ != nullptr)
@@ -637,4 +829,44 @@ bool PHYDriverProxy::l1_get_dl_tx_notification() const noexcept
         return false;
 }
 
+worker_id PHYDriverProxy::l1_get_dl_worker_id(int worker_index)
+{
+    if (driver_ != nullptr)
+        return ::l1_get_dl_worker_id(driver_, worker_index);
+    return INVALID_WORKER_ID;
+}
+
+worker_id PHYDriverProxy::l1_get_ul_worker_id(int worker_index)
+{
+    if (driver_ != nullptr)
+        return ::l1_get_ul_worker_id(driver_, worker_index);
+    return INVALID_WORKER_ID;
+}
+
+uint8_t PHYDriverProxy::l1_get_cpu_task_tracing_mode() const noexcept
+{
+    if (driver_ != nullptr)
+        return ::l1_get_cpu_task_tracing_mode(driver_);
+    return 0;
+}
+
 } // namespace nv
+
+// ---------------------------------------------------------------------------
+// nv::detail::l2a_cpu_tracing_mode — declared in nv_l2a_task_tracing.hpp,
+// defined here so the header stays free of cuphydriver / proxy includes.
+// ---------------------------------------------------------------------------
+#include "task_instrumentation/task_instrumentation_v3.hpp"
+
+namespace nv::detail
+{
+
+TracingMode l2a_cpu_tracing_mode() noexcept
+{
+    auto* proxy = PHYDriverProxy::getInstancePtr();
+    if (!proxy)
+        return TracingMode::DISABLED;
+    return static_cast<TracingMode>(proxy->l1_get_cpu_task_tracing_mode());
+}
+
+} // namespace nv::detail

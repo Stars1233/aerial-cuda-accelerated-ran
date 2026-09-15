@@ -23,7 +23,7 @@ SCRIPT=$(readlink -f $0)
 SCRIPT_DIR=$(dirname $SCRIPT)
 echo $SCRIPT starting...
 cd $SCRIPT_DIR
-source ./setup.sh
+source ./versions.sh
 
 if [[ "$AERIAL_VERSION_TAG" == "$(unset AERIAL_VERSION_TAG && source ./setup.sh && echo $AERIAL_VERSION_TAG)" ]]
 then
@@ -44,6 +44,8 @@ case "$TARGETARCH" in
         exit 1
         ;;
 esac
+
+export_container_build_versions
 
 hpccm --recipe aerial_build_devel_recipe.py --cpu-target $CPU_TARGET --format docker --userarg AERIAL_REPO=$AERIAL_REPO AERIAL_VERSION_TAG=$AERIAL_VERSION_TAG > Dockerfile_tmp
 if [[ -n "$AERIAL_BUILDER" ]]

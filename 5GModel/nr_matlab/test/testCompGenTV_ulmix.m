@@ -61,7 +61,9 @@ switch compTvMode
         error('compTvMode is not supported...\n');
 end
 
-selected_TC = [500:999, 1000:8555, 20000:29999];
+% performance pattern table
+[perf_pattern_table, compact_TV_perf_pattern_cuBB_gpu, perfTvRanges, full_gpu_tvs] = perfPatternTvYaml('tv_table', 'ulmix');
+selected_TC = [500:999, 1000:perfTvRanges.selected_high, 20000:29999];
 disabled_TC = [];
 % These are tests that are run from elsewhere.  Generating them explicity
 % should work but we don't want them generated as part of selected TCs
@@ -74,85 +76,8 @@ selected_TC(TcIdx) = [];
 
 HARQ_TC = [550:589];
 
-% performance pattern table
-% columns: pattern#, start_tv, end_tv, n_cell, n_cell_to_gen
-% n_cell_to_gen: min(total_cells, 21) for 4TR (pattern#<=65), min(total_cells, 7) for 64TR (pattern#>65)
-%                set to 1 if not main perf patterns
-% TV configs are for n_cell but only generate n_cell_to_gen cells for compact set
-perf_pattern_table = [
-% pattern     start_tv  end_tv  n_cell, n_cell_to_gen
-    39,         1632,    1695,    16,     1;  % 39
-    40,         1696,    1743,    12,     1;  % 40
-    41,         1744,    1791,    12,     1;  % 41
-    41.1,       2304,    2351,    12,     1;  % 41a
-    41.2,       2640,    2687,    12,     1;  % 41b
-    41.3,       2688,    2735,    12,     1;  % 41c
-    42,         1792,    1839,    12,     1;  % 42
-    43,         1840,    1903,    16,     1;  % 43, 44
-    44.1,       2352,    2415,    16,     1;  % 44a
-    44.2,       2736,    2799,    16,     1;  % 44b
-    44.3,       2800,    2863,    16,     1;  % 44c
-    45,         1904,    1967,    16,     1;  % 45
-    46,         1968,    2015,    12,     1;  % 46
-    47,         2016,    2079,    16,     1;  % 47
-    48,         2080,    2143,    16,    16;  % 48
-    49,         2144,    2223,    20,    20;  % 49
-    50,         2224,    2287,    16,    16;  % 50
-    51,         2416,    2495,    20,    20;  % 51
-    53,         2496,    2559,    16,     1;  % 53
-    54,         2560,    2639,    20,     1;  % 54
-    55,         2896,    2959,    16,     1;  % 55
-    56,         2960,    3039,    20,     1;  % 56
-    57,         2864,    2895,     8,     1;  % 57
-    59,         3040,    3119,    20,    20;  % 59 (L2SA)
-    59.2,       3760,    3839,    20,    20;  % 59b
-    59.3,       4471,    4630,    40,    20;  % 59c
-    59.4,       3520,    3599,    20,    20;  % 59d    
-    59.5,       4631,    4790,    40,    20;  % 59e
-    60,         3600,    3759,    40,    21;  % 60 (OAM)
-    60.3,       5071,    5230,    40,    21;  % 60c
-    60.4,       5231,    5390,    40,    21;  % 60d
-    61,         3360,    3439,    20,     1;  % 61
-    62.2,       4040,    4079,    20,    20;  % 62c (also needs 4471:4630 from 59c)
-    63.2,       5391,    5430,    20,    20;  % 63c (also needs 5071:5230 from 60c)
-    65.1,       5971,    6010,    40,    21;  % 65a
-    65.2,       6011,    6050,    40,    21;  % 65b
-    65.3,       6051,    6210,    40,    21;  % 65c
-    65.4,       6211,    6370,    40,    21;  % 65d
-    66.1,       5431,    5445,    15,     7;  % 66a
-    66.2,       5446,    5460,    15,     7;  % 66b
-    66.3,       5461,    5580,    15,     7;  % 66c
-    66.4,       5581,    5700,    15,     7;  % 66d
-    67,         4791,    4910,    15,     7;  % 67
-    67.1,       5701,    5715,    15,     7;  % 67a
-    67.2,       5716,    5730,    15,     7;  % 67b
-    67.3,       5731,    5850,    15,     7;  % 67c
-    67.4,       5851,    5970,    15,     7;  % 67d    
-    69,         6621,    6695,    15,     7;  % 69
-    69.1,       6696,    6770,    15,     7;  % 69a
-    69.2,       6771,    6845,    15,     7;  % 69b
-    69.3,       6371,    6445,    15,     7;  % 69c
-    69.4,       6846,    6920,    15,     7;  % 69d
-    69.5,       7260,    7364,    15,     7;  % 69e
-    71,         6446,    6520,    15,     7;  % 71
-    73,         6521,    6620,    20,    10;  % 73
-    75,         6921,    6995,    15,     7;  % 75
-    79,         7155,    7259,    15,     7;  % 79
-    81.1,       7365,    7469,    15,     7;  % 81a, 81c
-    81.2,       7470,    7574,    15,     7;  % 81b, 81d
-    83.1,       7575,    7679,    15,     7;  % 83a, 83c
-    83.2,       7680,    7784,    15,     7;  % 83b, 83d
-    85,         7785,    7889,    15,     7;  % 85
-    % 87 reuse the ULMIX TVs from pattern 85
-    89,         7890,    7952,     9,     9;  % 89
-    79.1,       7953,    8057,    15,     6;  % 79a
-    79.2,       8058,    8162,    15,     6;  % 79b
-    91,         8163,    8267,    15,     7;  % 91
-    101,        4375,    4470,    24,    24;  % 101
-    101.1,      8268,    8363,    24,    24;  % 101a
-    102,        8364,    8459,    24,    24;  % 102
-    102.1,      8460,    8555,    24,    24;  % 102a
-];
+% PERF pattern TV ranges, config strides, and compact-cell counts come from
+% perf_pattern/perf_pattern_helper.yaml so DLMIX, ULMIX, genPerfPattern, and POC2 use one source.
 
 % generate compact TV list from performance patterns
 compact_TV_perf_pattern = [];
@@ -165,20 +90,9 @@ for i = 1:size(perf_pattern_table, 1)
     n_tv_set = (end_tv - start_tv + 1) / n_cell;
     compact_TV_perf_pattern = [compact_TV_perf_pattern, repelem(start_tv:n_cell:end_tv, n_cell_to_gen) + repmat(0:(n_cell_to_gen - 1), 1, n_tv_set)];
 end
+compact_TV_perf_pattern = unique(compact_TV_perf_pattern);
 
-% non-performance pattern compact TVs
-compact_TV_non_perf_pattern = [508:519, 530:547, 550:589, 590, 603, 605, 606, 607, 608, 609, 610, 611, 612:618, 619:630, 636, 637, 644, 645, 652:658, 660, 661, 700:879, ...
-                                3920:3927, ... % ULMIX TVs with PRACH + PUCCH + PUSCH + SRS
-                                3928:3941, ... % SRS in consecutive slots with SRS + PUCCH
-                                4300:4336, ... % SRS in consecutive slots with SRS + other channels
-                                3840, 6996, ... % negative TC
-                                20000:29999]; % mMIMO, multi-cell % negative TC
-
-% combine both compact TV sets
-compact_TC = [compact_TV_non_perf_pattern, compact_TV_perf_pattern];
-compact_TC = unique(compact_TC);
-
-% only generate FAPI TV in this set for per-MR cicd
+% only generate FAPI TV in this set
 % keep cuPHY TVs for one of each kind
 % generate from perf_pattern_table using setdiff(start:end, start:n_cell:end)
 compact_TV_FAPI_only = [];
@@ -193,20 +107,49 @@ for i = 1:size(perf_pattern_table, 1)
     fapi_only_tvs = setdiff(all_tvs, cuphy_tvs);
     compact_TV_FAPI_only = [compact_TV_FAPI_only, fapi_only_tvs];
 end
+compact_TV_FAPI_only = unique(compact_TV_FAPI_only);
 
-% performance pattern compact TVs required for cuBB GPU test bench
-compact_TV_perf_pattern_cuBB_gpu = [
-    4544, 4548, 4566, ... % from 59c
-    4382, 4417, ... % from 101
-    8310, 8337, ... % from 101a
-    8375, 8393, ... % from 102
-];
 compact_TV_FAPI_only = setdiff(compact_TV_FAPI_only, compact_TV_perf_pattern_cuBB_gpu);  % exclude cuBB GPU test bench TVs from FAPI-only set, will generate both cuPHY and FAPI TVs
 
-full_TC = [500:999, 1000:8555, 20000:29999];
+% non-performance pattern compact TVs
+compact_TV_non_perf_pattern = [508:519, 530:547, 550:589, 590, 603, 605, 606, 607, 608, 609, 610, 611, 612:618, 619:630, 636, 637, 644, 645, 652:658, 660, 661, 700:879, ...
+                                3920:3927, ... % ULMIX TVs with PRACH + PUCCH + PUSCH + SRS
+                                3928:3941, ... % SRS in consecutive slots with SRS + PUCCH
+                                4300:4336, ... % SRS in consecutive slots with SRS + other channels
+                                3840, 6996, ... % negative TC
+                                20000:29999]; % mMIMO, multi-cell % negative TC
 
-MIMO_64TR_TC = [590, 700:879, 3920:3941, 4300:4336, 4791:4910, 5431:5970, 6371:6445, 6446:6520, 6521:6620, 6621:6695, 6696:6770, 6771:6845, 6846:6920, 6921:6995, 6996, 7050:7952, 8163:8267, 21000:29999];
+% build compact TC set
+compact_TC = [compact_TV_non_perf_pattern, compact_TV_perf_pattern];
+compact_TC = unique(compact_TC);
 
+% full set: for each perf pattern only generate full_cells cells per config
+% block (column 6 of perf_pattern_table). This mirrors the compact-set keep
+% above but with full_cells instead of compact_cells. Built as an additive
+% keep set (not a skip set) so reused/overlapping TV ranges take the most
+% generous full_cells of any pattern that claims the range.
+full_TV_perf_pattern = [];
+full_TV_perf_range   = [];
+for i = 1:size(perf_pattern_table, 1)
+    start_tv     = perf_pattern_table(i, 2);
+    end_tv       = perf_pattern_table(i, 3);
+    n_cell       = perf_pattern_table(i, 4);  % config_cells
+    n_cell_full  = perf_pattern_table(i, 6);  % full_cells
+
+    n_tv_set = (end_tv - start_tv + 1) / n_cell;
+    full_TV_perf_pattern = [full_TV_perf_pattern, repelem(start_tv:n_cell:end_tv, n_cell_full) + repmat(0:(n_cell_full - 1), 1, n_tv_set)];
+    full_TV_perf_range   = [full_TV_perf_range, start_tv:end_tv];
+end
+full_TV_perf_pattern = unique(full_TV_perf_pattern);
+full_TV_perf_range   = unique(full_TV_perf_range);
+
+% build full TC set
+full_TC = [500:999, 1000:perfTvRanges.full_high, 20000:29999];
+full_TC = setdiff(full_TC, full_TV_perf_range);                                  % drop every perf-pattern cell from the blanket range
+full_TC = unique([full_TC, full_TV_perf_pattern, compact_TV_perf_pattern_cuBB_gpu, full_gpu_tvs]);  % add back the full_cells subset, cuBB GPU TVs, and FAPI-only full_gpu_tvs
+
+% special TCs for different use cases
+MIMO_64TR_TC = [590, 700:879, 3920:3941, 4300:4336, 4791:4910, 5431:5970, 6371:6445, 6446:6520, 6521:6620, 6621:6695, 6696:6770, 6771:6845, 6846:6920, 6921:6995, 6996, 7050:7952, 8163:8267, 8652:8711, 21000:29999];
 negative_TC = [605, 606, 607, 608, 609, 610, 611, 3840, 6996];
 
 if isnumeric(caseSet)
@@ -233,6 +176,9 @@ if strcmp(caseSet, 'compact') || strcmp(caseSet, 'full')
     TcFapiOnly = compact_TV_FAPI_only;
 else
     TcFapiOnly = [];
+end
+if strcmp(caseSet, 'full')
+    TcFapiOnly = [TcFapiOnly, full_gpu_tvs];  % full_gpu_tvs are extra config-block cells: FAPI only, no cuPHY
 end
 TcFapiOnly = [TcFapiOnly, negative_TC];
 
@@ -4485,6 +4431,101 @@ srsRntiStartMap(int32(21907)) = 79;
         UciOnPuschMap(i) = "7beams_4_37_5";
     end
     % end pattern 102a: 1 UE SU-MIMO, 2 layers, MCS 27, 256QAM table, PUSCH (reduced PRB) + PRACH + UCI-on-PUSCH, 24C
+
+    %% pattern 103: multichannel, 8 UE FDM, 2 layers, MCS 27, 256QAM, PUSCH + PUCCH + PRACH + UCI-on-PUSCH, 10 fixed LDPC iterations, 24C
+    % PUSCH: cfg 1053:1060 (slot 4), 1061:1068 (slot 5), 1069:1076 (slot 14), 1077:1084 (slot 15)
+    % PUCCH: cfg 107 (PF1 HARQ 16UE), 108 (PF1 SR 16UE), 109 (PF3 HARQ 3UE), 110 (PF3 CSI 4UE)
+    % PRACH: cfg 84 (PRB 261, zcz 0)
+    % UCI-on-PUSCH: "4TR_4_21or8_0or11"
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {4}, no prach
+    for i = 8556:8579
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {107,108,109,110}   num2cell(1053:1060)   {}};
+        CellIdxInPatternMap(i) = mod(i-8556, 24);
+        UciOnPuschMap(i) = "4TR_4_21or8_0or11";
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {5}, prach
+    for i = 8580:8603
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {84}       {107,108,109,110}   num2cell(1061:1068)   {}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-8556, 24);
+        UciOnPuschMap(i) = "4TR_4_21or8_0or11";
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {14}, no prach
+    for i = 8604:8627
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {}         {107,108,109,110}   num2cell(1069:1076)   {}};
+        CellIdxInPatternMap(i) = mod(i-8556, 24);
+        UciOnPuschMap(i) = "4TR_4_21or8_0or11";
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {15}, prach
+    for i = 8628:8651
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          2        {84}       {107,108,109,110}   num2cell(1077:1084)   {}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-8556, 24);
+        UciOnPuschMap(i) = "4TR_4_21or8_0or11";
+        enableOtaMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % end pattern 103: multichannel, 8 UE FDM, 2 layers, MCS 27, 256QAM, PUSCH + PUCCH + PRACH + UCI-on-PUSCH, 24C
+
+    %% pattern 201: 4 UE MU-MIMO, 2 layers per UE, MCS 27, 256QAM table, PUSCH + PRACH, type-A, cdm group 2, 10 data symbols, 10 fixed LDPC iterations, 15C
+    % PUSCH: cfg 2369:2372 (slot 4), cfg 2373:2376 (slot 5 with PRACH), cfg 2377:2380 (slot 14), cfg 2381:2384 (slot 15)
+    % PRACH: cfg 82
+                            % TC#   slotIdx   cell     prach     pucch      pusch      srs
+    row_count = length(CFG);
+    % slot {4}
+    for i = 8652:8666
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          11        {}         {}        num2cell(2369:2372)     {}};
+        CellIdxInPatternMap(i) = mod(i-8652, 15);
+        enableOtaMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        puschDynamicBfMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {5}, prach
+    for i = 8667:8681
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          11        {82}       {}        num2cell(2373:2376)     {}};
+        PrachBeamIdxMap(i) = [0 1];
+        CellIdxInPatternMap(i) = mod(i-8652, 15);
+        enableOtaMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        puschDynamicBfMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {14}
+    for i = 8682:8696
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          11        {}         {}        num2cell(2377:2380)     {}};
+        CellIdxInPatternMap(i) = mod(i-8652, 15);
+        enableOtaMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        puschDynamicBfMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % slot {15}
+    for i = 8697:8711
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0          11        {}         {}        num2cell(2381:2384)     {}};
+        CellIdxInPatternMap(i) = mod(i-8652, 15);
+        enableOtaMap(i) = 1;
+        enableUlRxBfMap(i) = 1;
+        puschDynamicBfMap(i) = 1;
+        ldpcFixMaxIterMap(int32(i)) = 10;
+    end
+    % end pattern 201: 4 UE MU-MIMO, 2 layers per UE, MCS 27, 256QAM table, PUSCH + PRACH, 15C
                             
     % NOTE: use getLargestTvNum(CFG, threshold) to see the current largest ULMIX TV numbers for <threshold and >= threshold
     %       Search for "available for future ULMIX TVs" to find the avaiable ULMIX TV numbers smaller than that
@@ -4641,6 +4682,9 @@ CFG_PRACH = {...
     82,        1,  1, 158,     0,        0,    5,     0,   261;
     % 4TR one PRACH occasion at PRB 42
     83,        1,  1, 158,     0,        0,    5,     0,   42;
+ % cfg#   duplex  mu  cfg restrictSet  root  zone  prmbIdx  RA0
+    % 4TR one PRACH occasion at PRB 261, zcz 0, 12 PRBs from end (pattern 103)
+    84,        1,  1, 158,     0,        0,    0,     0,   261;
     };
 
 CFG_PUCCH = {...
@@ -4894,6 +4938,25 @@ CFG_PUCCH = {...
    floor(mod(0:95,12)/2)*2 ...%cs0
    mod(0:95,2) ...%tOCCidx
     0      0      0     0    0   1;    
+% cfg# N_UE    Nb format   f0      f1  Nf t0  Nt cs0  tOCCidx freqH groupH SRFlag posSR DTX thr
+% pattern 103: PF1 HARQ, 16 UEs on 10 PRBs (0-9), 14 OFDM symbols, 2 per PRB on PRBs 0-5
+  107   16     1    1 ...
+   [0 0 1 1 2 2 3 3 4 4 5 5 6 7 8 9] ... % f0
+    0   1  0  14 ... % f1 Nf t0 Nt
+   [0 6 0 6 0 6 0 6 0 6 0 6 0 0 0 0] ...%cs0
+   [0 1 0 1 0 1 0 1 0 1 0 1 0 0 0 0] ...%tOCCidx
+    0      0      0     0    0   1;
+% pattern 103: PF1 SR, 16 UEs on 4 PRBs (10-13), 14 OFDM symbols
+  108   16     0    1 ...
+   repelem(10:13, 4) ... % f0
+    0   1  0  14 ... % f1 Nf t0 Nt
+   repmat([0 6 0 6], 1, 4) ...%cs0
+   repmat([0 0 1 1], 1, 4) ...%tOCCidx
+    0      0      1     1    0   1;
+% pattern 103: PF3 HARQ, 3 UEs on 3 PRBs (14-16), 14 OFDM symbols, 1-bit HARQ
+  109    3     1    3    [14:16]       0   1  0  14   0     0       0      0      0     0    0   1;
+% pattern 103: PF3 CSI, 4 UEs on 4 PRBs (17-20), 14 OFDM symbols, 64-bit CSI payload
+  110    4     64   3    [17:20]       0   1  0  14   0     0       0      0      0     0    0   1;
    };
 
 CFG_PUSCH = {...
@@ -6153,6 +6216,47 @@ CFG_PUSCH = {...
    1050,  1,        27,  2,   0,    42, 0,       14,     0,    0,    273,    8,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 5
    1051,  1,        27,  2,   0,    54, 0,       14,     0,    0,    273,    9,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 14
    1052,  1,        27,  2,   0,    54, 0,       14,     0,    0,    273,   10,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, slot 15
+    % pattern 103: 8 UE FDM, 2 layers, MCS 27, 256QAM, 14 OFDM symbols, 2 DMRS symbols
+    % PUCCH on PRBs 0-20, PRACH on PRBs 261-272 (12 PRBs from end)
+    % non-PRACH slots: PUSCH PRBs 21-272, 252 total, pattern 31+32+32+32+32+32+30+31, even PRB boundaries
+    % PRACH slots:     PUSCH PRBs 21-260, 240 total, pattern 29+30+30+30+30+30+30+31, even PRB boundaries
+% TC#   mcsTable  mcs  nl  rb0     Nrb  sym0   Nsym  SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+    % slot 4 (RNTI 7-14), no PRACH, PRBs 21-272 (31+34+34+30+30+30+30+33=252, all Zc=384; UE0 odd Nrb aligns starts to even PRB, UE1-6 even Nrb, last UE free)
+   1053,  1,        27,  2,  21,    31, 0,       14,     0,    0,    273,    7,    0,     41,     2,      1,     1,     41,      2,   0,   0;
+   1054,  1,        27,  2,  52,    34, 0,       14,     0,    0,    273,    8,    0,     41,     2,      1,     1,     41,      2,   0,   1;
+   1055,  1,        27,  2,  86,    34, 0,       14,     0,    0,    273,    9,    0,     41,     2,      1,     1,     41,      2,   0,   2;
+   1056,  1,        27,  2, 120,    30, 0,       14,     0,    0,    273,   10,    0,     41,     2,      1,     1,     41,      2,   0,   3;
+   1057,  1,        27,  2, 150,    30, 0,       14,     0,    0,    273,   11,    0,     41,     2,      1,     1,     41,      2,   0,   4;
+   1058,  1,        27,  2, 180,    30, 0,       14,     0,    0,    273,   12,    0,     41,     2,      1,     1,     41,      2,   0,   5;
+   1059,  1,        27,  2, 210,    30, 0,       14,     0,    0,    273,   13,    0,     41,     2,      1,     1,     41,      2,   0,   6;
+   1060,  1,        27,  2, 240,    33, 0,       14,     0,    0,    273,   14,    0,     41,     2,      1,     1,     41,      2,   0,   7;
+    % slot 5 (RNTI 15-22), PRACH, PRBs 21-260 (27+30+30+30+30+30+30+33=240, all Zc=384; UE0 odd Nrb aligns starts to even PRB, UE1-6 even Nrb, last UE free)
+   1061,  1,        27,  2,  21,    27, 0,       14,     0,    0,    273,   15,    0,     41,     2,      1,     1,     41,      2,   0,   0;
+   1062,  1,        27,  2,  48,    30, 0,       14,     0,    0,    273,   16,    0,     41,     2,      1,     1,     41,      2,   0,   1;
+   1063,  1,        27,  2,  78,    30, 0,       14,     0,    0,    273,   17,    0,     41,     2,      1,     1,     41,      2,   0,   2;
+   1064,  1,        27,  2, 108,    30, 0,       14,     0,    0,    273,   18,    0,     41,     2,      1,     1,     41,      2,   0,   3;
+   1065,  1,        27,  2, 138,    30, 0,       14,     0,    0,    273,   19,    0,     41,     2,      1,     1,     41,      2,   0,   4;
+   1066,  1,        27,  2, 168,    30, 0,       14,     0,    0,    273,   20,    0,     41,     2,      1,     1,     41,      2,   0,   5;
+   1067,  1,        27,  2, 198,    30, 0,       14,     0,    0,    273,   21,    0,     41,     2,      1,     1,     41,      2,   0,   6;
+   1068,  1,        27,  2, 228,    33, 0,       14,     0,    0,    273,   22,    0,     41,     2,      1,     1,     41,      2,   0,   7;
+    % slot 14 (RNTI 23-30), no PRACH, PRBs 21-272 (31+34+34+30+30+30+30+33=252, all Zc=384; UE0 odd Nrb aligns starts to even PRB, UE1-6 even Nrb, last UE free)
+   1069,  1,        27,  2,  21,    31, 0,       14,     0,    0,    273,   23,    0,     41,     2,      1,     1,     41,      2,   0,   0;
+   1070,  1,        27,  2,  52,    34, 0,       14,     0,    0,    273,   24,    0,     41,     2,      1,     1,     41,      2,   0,   1;
+   1071,  1,        27,  2,  86,    34, 0,       14,     0,    0,    273,   25,    0,     41,     2,      1,     1,     41,      2,   0,   2;
+   1072,  1,        27,  2, 120,    30, 0,       14,     0,    0,    273,   26,    0,     41,     2,      1,     1,     41,      2,   0,   3;
+   1073,  1,        27,  2, 150,    30, 0,       14,     0,    0,    273,   27,    0,     41,     2,      1,     1,     41,      2,   0,   4;
+   1074,  1,        27,  2, 180,    30, 0,       14,     0,    0,    273,   28,    0,     41,     2,      1,     1,     41,      2,   0,   5;
+   1075,  1,        27,  2, 210,    30, 0,       14,     0,    0,    273,   29,    0,     41,     2,      1,     1,     41,      2,   0,   6;
+   1076,  1,        27,  2, 240,    33, 0,       14,     0,    0,    273,   30,    0,     41,     2,      1,     1,     41,      2,   0,   7;
+    % slot 15 (RNTI 31-38), PRACH, PRBs 21-260 (27+30+30+30+30+30+30+33=240, all Zc=384; UE0 odd Nrb aligns starts to even PRB, UE1-6 even Nrb, last UE free)
+   1077,  1,        27,  2,  21,    27, 0,       14,     0,    0,    273,   31,    0,     41,     2,      1,     1,     41,      2,   0,   0;
+   1078,  1,        27,  2,  48,    30, 0,       14,     0,    0,    273,   32,    0,     41,     2,      1,     1,     41,      2,   0,   1;
+   1079,  1,        27,  2,  78,    30, 0,       14,     0,    0,    273,   33,    0,     41,     2,      1,     1,     41,      2,   0,   2;
+   1080,  1,        27,  2, 108,    30, 0,       14,     0,    0,    273,   34,    0,     41,     2,      1,     1,     41,      2,   0,   3;
+   1081,  1,        27,  2, 138,    30, 0,       14,     0,    0,    273,   35,    0,     41,     2,      1,     1,     41,      2,   0,   4;
+   1082,  1,        27,  2, 168,    30, 0,       14,     0,    0,    273,   36,    0,     41,     2,      1,     1,     41,      2,   0,   5;
+   1083,  1,        27,  2, 198,    30, 0,       14,     0,    0,    273,   37,    0,     41,     2,      1,     1,     41,      2,   0,   6;
+   1084,  1,        27,  2, 228,    33, 0,       14,     0,    0,    273,   38,    0,     41,     2,      1,     1,     41,      2,   0,   7;
    % 610,  1,         2,  2, 100,   40,   0,   14,     0,    0,    273,     1,    0,     41,     2,      2,    1,     41,      2,   0,    0; 
    % 611,  1,         2,  2, 100,   40,   0,   14,     0,    0,    273,     2,    0,     41,     2,      2,    1,     41,      2,   2,    0; 
    % 612,  1,         2,  2, 100,   40,   0,   14,     0,    0,    273,     3,    0,     41,     2,      2,    1,     41,      2,   4,    0; 
@@ -6601,6 +6705,58 @@ cfgUeg.nl = 1;
 CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
 
+% 64TR MU-MIMO, 1 UEG, 4 UEs per UEG, 2 layers per UE, PUSCH prb 0~272, 14 OFDM symbols (for pattern 201 slot 4), CFG 2369~2372
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.startRnti = 7;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 4;
+cfgUeg.Nsym = 14;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 272;
+cfgUeg.nl = 2;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 4 UEs per UEG, 2 layers per UE, PUSCH prb 0~260, 14 OFDM symbols (for pattern 201 slot 5), CFG 2373~2376
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.startRnti = 11;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 4;
+cfgUeg.Nsym = 14;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 260;
+cfgUeg.nl = 2;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 4 UEs per UEG, 2 layers per UE, PUSCH prb 0~272, 14 OFDM symbols (for pattern 201 slot 14), CFG 2377~2380
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.startRnti = 15;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 4;
+cfgUeg.Nsym = 14;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 272;
+cfgUeg.nl = 2;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 4 UEs per UEG, 2 layers per UE, PUSCH prb 0~272, 14 OFDM symbols (for pattern 201 slot 15), CFG 2381~2384
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PUSCH{end, 1} + 1;
+cfgUeg.startRnti = 19;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 4;
+cfgUeg.Nsym = 14;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 272;
+cfgUeg.nl = 2;
+CFG_PUSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PUSCH = [CFG_PUSCH; CFG_PUSCH_temp];
+
 % Check if first column (pxsch_cfg_idx) values are unique
 first_col = cell2mat(CFG_PUSCH(:,1));
 if length(unique(first_col)) ~= length(first_col)
@@ -6709,7 +6865,7 @@ parfor n = 1:NallTest
             rng(500);
         elseif ismember(caseNum, [1128, 2107, 2451, 2453, 2487, 2519, 2524, 2525, 3589, 3630, 4254, 4358, 5397])
             rng(600);
-        elseif ismember(caseNum, [1198, 1221, 1223, 1300, 1341, 1359, 1392, 1810, 2116, 2462, 2571, 2237, 2446, 2217, 2474, 2453, 2885, 3307, 3413, 4316, 4342, 4382, 4242, 4573, 5225, 5534, 5794, 5812, 6140, 21845])
+        elseif ismember(caseNum, [1198, 1221, 1223, 1300, 1341, 1359, 1392, 1810, 2116, 2462, 2571, 2237, 2446, 2217, 2474, 2453, 2885, 3307, 3413, 4316, 4342, 4382, 4242, 4573, 5225, 5534, 5794, 5812, 6140, 8621, 21845])
             rng(caseNum + 100);
         else
             rng(caseNum);
@@ -7105,6 +7261,12 @@ parfor n = 1:NallTest
             
                 if length(CFG_PUCCH{idxCfg, 17})==1 pucchTemp.DTXthreshold = CFG_PUCCH{idxCfg, 17}; ...
                 else pucchTemp.DTXthreshold = CFG_PUCCH{idxCfg, 17}(idxUe); end
+
+                % move payload from BitLenHarq to BitLenCsiPart1
+                if cfg{idx} == 110
+                    pucchTemp.BitLenCsiPart1 = pucchTemp.BitLenHarq;
+                    pucchTemp.BitLenHarq = 0;
+                end
                 
                 pucchTemp.RNTI = idxUe - 1;
                 if ismember(caseNum, [522 : 537]) 
@@ -7604,6 +7766,33 @@ parfor n = 1:NallTest
                 SysPar.pusch{idx}.rankBitOffset   = 0;
                 SysPar.pusch{idx}.rankBitSize     = 2;
             end % end F08 7beams UCI
+
+            % Pattern 103 multichannel: mixed UCI per UE
+            % UEs 1-4: P-CSI (4 HARQ + 21 CSI-P1)
+            % UEs 5-8: A-CSI (4 HARQ + 8 CSI-P1 + 11 CSI-P2)
+            if (UciOnPuschMap.isKey(caseNum) && UciOnPuschMap(caseNum) == "4TR_4_21or8_0or11")
+                SysPar.pusch{idx}.pduBitmap = 2^0 + 2^1 + 2^5;
+                SysPar.pusch{idx}.harqAckBitLength = 4;
+                SysPar.SimCtrl.enable_multi_csiP2_fapiv3 = 1;
+                if idx <= 4
+                    SysPar.pusch{idx}.csiPart1BitLength = 21;
+                    SysPar.pusch{idx}.flagCsiPart2 = 0;
+                else
+                    SysPar.pusch{idx}.csiPart1BitLength = 8;
+                    SysPar.pusch{idx}.nCsi2Reports = 1;
+                    SysPar.pusch{idx}.flagCsiPart2 = 65535;
+                    calcCsi2Size_csi2MapIdx(1) = 1;
+                    calcCsi2Size_nPart1Prms(1) = 1;
+                    calcCsi2Size_prmOffsets(1,1) = 0;
+                    calcCsi2Size_prmSizes(1,1) = 6;
+                    calcCsi2Size_prmValues(1,1) = 5;
+                    % Legacy paramaters for computing CSI-P2 size:
+                    SysPar.pusch{idx}.alphaScaling      = 3;
+                    SysPar.pusch{idx}.betaOffsetHarqAck = 11;
+                    SysPar.pusch{idx}.betaOffsetCsi1    = 13;
+                    SysPar.pusch{idx}.betaOffsetCsi2    = 13;
+                end
+            end % end pattern 103 UCI
 
             % F08 7beams: 0+37+5 UCI (for 24 PUCCH UCIs)
             if ismember(caseNum, [3520:3599]) ...

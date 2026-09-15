@@ -43,13 +43,6 @@ Flow::Flow(Peer* peer, FlowInfo* info) :
         flow_type_.c_str(), info_.eAxC, static_cast<unsigned short>(info_.vlan_tag.vid), peer_addr.bytes[0], peer_addr.bytes[1],
         peer_addr.bytes[2], peer_addr.bytes[3], peer_addr.bytes[4], peer_addr.bytes[5]);
 
-    if(info->type == FlowType::UPLANE && info_.direction == FlowDir::DL)
-    {
-        auto flow_num=peer_->getTotalNumFlows();
-        flow_num+=1;
-        peer_->setTotalNumFlows(flow_num);
-    }
-
     TI_GENERIC_ADD("FH settings check");
     rxq_ = nullptr;
     if(get_fronthaul()->rmax_enabled() && peer_->get_info().rx_mode != RxApiMode::TXONLY)
@@ -59,9 +52,9 @@ Flow::Flow(Peer* peer, FlowInfo* info) :
     GPU_device_count = 0;
     if(!(get_fronthaul()->get_info().cuda_device_ids.empty()))
     {
-        cudaError_t error = cudaGetDeviceCount(&GPU_device_count);
-        if (error != cudaSuccess) {
-            NVLOGI_FMT(TAG, "cudaGetDeviceCount returned {}", +error);
+        CUresult cuResult = cuDeviceGetCount(&GPU_device_count);
+        if (cuResult != CUDA_SUCCESS) {
+            NVLOGI_FMT(TAG, "cuDeviceGetCount returned {}", +cuResult);
         }
     }
     flow_number = -1;
@@ -276,21 +269,46 @@ void Flow::setup_packet_header_template()
                 0,
                 1);
 
-    if ((GPU_device_count > 0) && (info_.type == FlowType::UPLANE) && info_.direction == FlowDir::DL)  { // Only update the following for DL U-plane
+    if ((GPU_device_count > 0) && (get_nic()->get_info().cuda_device >= 0) &&
+        (info_.type == FlowType::UPLANE) && info_.direction == FlowDir::DL)  { // Only update the following for DL U-plane
        int eaxcid = info_.eAxC;
        auto& dlu_eaxcid_idx_mp = peer_->get_dlu_eaxcid_idx_mp();
        int eaxcid_idx = dlu_eaxcid_idx_mp[info_.eAxC];
        if(eaxcid_idx >= MAX_DL_EAXCIDS)
        {
-           NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "Exceeding max excid number {}", eaxcid_idx, MAX_DL_EAXCIDS);
+           THROW_FH(EINVAL, StringBuilder() << "Exceeding max eAxC index " << eaxcid_idx
+                                            << " (MAX_DL_EAXCIDS=" << MAX_DL_EAXCIDS << ")");
        }
+       // Peer setup stream (non-blocking): avoids GpuComm stall; CU_STREAM_PER_THREAD
+       // is invalid with FH driver CUDA contexts (CUDA_ERROR_INVALID_HANDLE).
+       // Device slot stores 8 uint32_t words; host copy skips the first 4 bytes of the
+       // PacketHeaderTemplate (src MAC start) to match the GPU layout.
+       constexpr size_t kGpuHdrTemplateWords           = 8;
+       constexpr size_t kGpuHdrTemplateBytes           = kGpuHdrTemplateWords * sizeof(uint32_t);
+       constexpr size_t kGpuHdrTemplateSrcOffsetBytes  = 4;
+       CUstream setup_stream = peer_->get_setup_stream();
+       const auto* hdr_template_src =
+           reinterpret_cast<const char*>(get_header_template()) + kGpuHdrTemplateSrcOffsetBytes;
        for (int i = 0; i < kPeerSlotsInfo; i++) {
-           uint32_t* d_hdr_template_info = peer_->get_hdr_template_info() + (i * MAX_DL_EAXCIDS + eaxcid_idx)*8;
-           ASSERT_CUDA_FH(cudaMemcpy(d_hdr_template_info, (char*)get_header_template() + 4, 32, cudaMemcpyHostToDevice)); // other synchronous calls elsewhere too at this time
+           uint32_t* d_hdr_template_info =
+               peer_->get_hdr_template_info() + (i * MAX_DL_EAXCIDS + eaxcid_idx) * kGpuHdrTemplateWords;
+           if(setup_stream != nullptr)
+           {
+               CUDA_DRIVER_CHECK_NON_FATAL(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(d_hdr_template_info),
+                                                             hdr_template_src,
+                                                             kGpuHdrTemplateBytes,
+                                                             setup_stream));
+           }
+           else
+           {
+               CUDA_DRIVER_CHECK_NON_FATAL(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(d_hdr_template_info),
+                                                        hdr_template_src,
+                                                        kGpuHdrTemplateBytes));
+           }
            /*printf("peer %s, eaxcid %d, peer's hdr_info %p, d_hdr_template_info %p\n", peer_->get_mac_address().c_str(), eaxcid, peer_->get_hdr_template_info(), d_hdr_template_info);
            if (i == 0) {
-               for (int j = 0; j < 32; j++)
-               printf("peer %s, eaxcid %d, header[%d] == %x\n", peer_->get_mac_address().c_str(), eaxcid, j, (*(((char*)get_header_template()) + 4 + j) & 0xFF));
+               for (int j = 0; j < static_cast<int>(kGpuHdrTemplateBytes); j++)
+               printf("peer %s, eaxcid %d, header[%d] == %x\n", peer_->get_mac_address().c_str(), eaxcid, j, (*(hdr_template_src + j) & 0xFF));
            }*/
        }
     }
@@ -316,7 +334,10 @@ void Flow::setup_packet_header_gpu()
 {
     TI_GENERIC_INIT("setup_packet_header_gpu",15);
     TI_GENERIC_ADD("Start Task");
-    constexpr int total_packets_across_all_flows = kGpuCommSendPeers*kMaxFlows*kMaxPktsFlow;
+    // Requires Nic::set_flow_comm_buf() to have run first (sets num_dl_flows_).
+    // Guaranteed by FH init sequence: open() -> set_flow_comm_buf() -> setup_packet_header_gpu().
+    const auto total_packets_across_all_flows =
+        static_cast<int>(getGpuCommSendPeers()) * get_nic()->get_num_dl_flows() * kMaxPktsFlow;
 
     TI_GENERIC_ADD("nic get_info");
     if(get_nic()->get_info().cuda_device < 0)
@@ -397,7 +418,17 @@ void Flow::setup_packet_header_gpu()
 
     TI_GENERIC_ADD("cudaMemcpy");
     if (GPU_device_count > 0) {
-        ASSERT_CUDA_FH(cudaMemcpy(pkt_hdr_gpu_, pkt_hdr_cpu, kMaxPktsFlow * packet_size_rnd_local, cudaMemcpyDefault));
+        CUstream setup_stream = peer_->get_setup_stream();
+        if(setup_stream != nullptr)
+        {
+            CUDA_DRIVER_CHECK_NON_FATAL(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(pkt_hdr_gpu_), pkt_hdr_cpu, kMaxPktsFlow * packet_size_rnd_local, setup_stream));
+            // Host template must stay live until the async copy completes.
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamSynchronize(setup_stream));
+        }
+        else
+        {
+            CUDA_DRIVER_CHECK_NON_FATAL(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(pkt_hdr_gpu_), pkt_hdr_cpu, kMaxPktsFlow * packet_size_rnd_local));
+        }
     }
     TI_GENERIC_ADD("free_memory");
     free_memory(pkt_hdr_cpu);
@@ -422,6 +453,10 @@ void Flow::setup_packet_header_gpu()
             flow_ptr_info->cpu_pkt_addr = get_nic()->get_flow_comm_buf()->cpu_comms_cpu_pkt_addr;            
            //printf("Flow %p: eaxcid %d, peerslot %d, flow_ptr_info %p, pkt_hdr_gpu %p, rnd %d lkey %u\n", this, eaxcid, i, flow_ptr_info, pkt_hdr_gpu_, packet_size_rnd, pkt_hdr_gpu_lkey_);
         }
+        // Copy the freshly-populated static flow header info to the peer's device-side
+        // buffer so the GPU-comms kernels read it from device memory. Setup-time only,
+        // and also covers reconfiguration when re-entered through Flow::update().
+        peer_->sync_flow_hdr_size_info_to_device();
      }
 
      TI_GENERIC_ADD("End Task");

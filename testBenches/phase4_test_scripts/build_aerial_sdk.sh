@@ -43,7 +43,7 @@ CUDA_ARCHITECTURES=""
 DEFAULT_CUDA_ARCHITECTURES="80;90;100;120;121"
 
 valid_tc_files=("bf3" "devkit" "grace-cross" "native" "r750" "x86-64")
-valid_presets=("perf" "10_02" "10_04" "10_04_32dl")
+valid_presets=("perf" "10_02" "10_04" "10_04_TM" "10_04_low_memory" "10_02_SRS_10_04")
 
 show_usage() {
   echo "Usage: $0 [options]"
@@ -66,10 +66,12 @@ show_usage() {
   echo "                                Example: --targets target1 target2"
   echo
   echo "  --preset, -p                  Preset build options:"
-  echo "                                perf       - Performance build (default)"
-  echo "                                10_02      - FAPI 10_02"
-  echo "                                10_04      - FAPI 10_04"
-  echo "                                10_04_32dl - FAPI 10_04 with 32 DL layers"
+  echo "                                perf             - Performance build (default)"
+  echo "                                10_02            - FAPI 10_02"
+  echo "                                10_04            - FAPI 10_04"
+  echo "                                10_04_TM         - FAPI 10_04 with conformance test mode (PDSCH/PDCCH TM)"
+  echo "                                10_04_low_memory - FAPI 10_04 with -DENABLE_20C=OFF"
+  echo "                                10_02_SRS_10_04  - FAPI 10_02 with SRS FAPI 10_04"
   echo
   echo "  --dry-run, -d                 Display the CMake command without executing it"
   echo
@@ -209,6 +211,14 @@ if [[ -z "$CUDA_ARCHITECTURES" ]]; then
   CUDA_ARCHITECTURES="$DEFAULT_CUDA_ARCHITECTURES"
 fi
 
+# Use $ORIGIN-relative RPATH so shared libraries are found at runtime
+# regardless of the absolute path of the build directory (e.g. build.aarch64
+# vs build.perf.aarch64, local vs CI container). Without this, CMake embeds
+# the absolute build-time path into the binary's RUNPATH, which breaks when
+# the binary is run from a container where the build directory is at a
+# different absolute path.
+COMMON_CMAKE_FLAGS="-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
+
 if [[ "$PRESET" == "perf" ]]; then
   CMAKE_FLAGS="-GNinja \
     --log-level=debug \
@@ -217,6 +227,7 @@ if [[ "$PRESET" == "perf" ]]; then
     -DSCF_FAPI_10_04=ON \
     -DENABLE_CONFORMANCE_TM_PDSCH_PDCCH=ON \
     -DENABLE_20C=ON \
+    $COMMON_CMAKE_FLAGS \
     ${extra_cmake_options[@]}"
 elif [[ "$PRESET" == "10_02" ]]; then
   CMAKE_FLAGS="-GNinja \
@@ -224,6 +235,7 @@ elif [[ "$PRESET" == "10_02" ]]; then
     -DCMAKE_TOOLCHAIN_FILE=\"$TOOLCHAIN_FILE\" \
     -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHITECTURES\" \
     -DSCF_FAPI_10_04=OFF \
+    $COMMON_CMAKE_FLAGS \
     ${extra_cmake_options[@]}"
 elif [[ "$PRESET" == "10_04" ]]; then
   CMAKE_FLAGS="-GNinja \
@@ -231,16 +243,35 @@ elif [[ "$PRESET" == "10_04" ]]; then
     -DCMAKE_TOOLCHAIN_FILE=\"$TOOLCHAIN_FILE\" \
     -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHITECTURES\" \
     -DSCF_FAPI_10_04=ON \
-    -DENABLE_CONFORMANCE_TM_PDSCH_PDCCH=ON \
+    $COMMON_CMAKE_FLAGS \
     ${extra_cmake_options[@]}"
-elif [[ "$PRESET" == "10_04_32dl" ]]; then
+elif [[ "$PRESET" == "10_04_TM" ]]; then
   CMAKE_FLAGS="-GNinja \
     --log-level=debug \
     -DCMAKE_TOOLCHAIN_FILE=\"$TOOLCHAIN_FILE\" \
     -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHITECTURES\" \
     -DSCF_FAPI_10_04=ON \
     -DENABLE_CONFORMANCE_TM_PDSCH_PDCCH=ON \
-    -DENABLE_32DL=ON \
+    $COMMON_CMAKE_FLAGS \
+    ${extra_cmake_options[@]}"
+elif [[ "$PRESET" == "10_04_low_memory" ]]; then
+  CMAKE_FLAGS="-GNinja \
+    --log-level=debug \
+    -DCMAKE_TOOLCHAIN_FILE=\"$TOOLCHAIN_FILE\" \
+    -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHITECTURES\" \
+    -DSCF_FAPI_10_04=ON \
+    -DENABLE_CONFORMANCE_TM_PDSCH_PDCCH=ON \
+    -DENABLE_20C=OFF \
+    $COMMON_CMAKE_FLAGS \
+    ${extra_cmake_options[@]}"
+elif [[ "$PRESET" == "10_02_SRS_10_04" ]]; then
+  CMAKE_FLAGS="-GNinja \
+    --log-level=debug \
+    -DCMAKE_TOOLCHAIN_FILE=\"$TOOLCHAIN_FILE\" \
+    -DCMAKE_CUDA_ARCHITECTURES=\"$CUDA_ARCHITECTURES\" \
+    -DSCF_FAPI_10_04=OFF \
+    -DSCF_FAPI_10_04_SRS=ON \
+    $COMMON_CMAKE_FLAGS \
     ${extra_cmake_options[@]}"
 else
   echo "ERROR: Unknown preset - $PRESET"
@@ -269,6 +300,31 @@ fi
 
 # Execute or display based on dry-run
 if [[ -z "${DRY_RUN:-}" || "$DRY_RUN" != "1" ]]; then
+
+  # Detect and clear a stale CMakeCache.  This check runs even in --build-only
+  # mode because cmake --build invokes Ninja, which automatically tries to
+  # re-run cmake when build.ninja is stale.  If the cache references a source
+  # path that no longer exists (e.g. a Docker image built by a CI agent at
+  # /home/jenkins/...) that automatic re-run fails fatally.  When a stale
+  # cache is found in --build-only mode we fall back to a full configure+build
+  # so cmake can regenerate build.ninja against the current source directory. 
+  if [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
+    cached_src=$(grep "^CMAKE_HOME_DIRECTORY:INTERNAL=" "${BUILD_DIR}/CMakeCache.txt" \
+                 | sed 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//')
+    current_src="$(realpath "$cuBB_SDK")"
+    if [[ "${cached_src}" != "${current_src}" ]]; then
+      echo "Stale CMakeCache detected."
+      echo "  Cache was built at: ${cached_src}"
+      echo "  Current source dir: ${current_src}"
+      echo "  Clearing ${BUILD_DIR}/CMakeCache.txt and CMakeFiles/ for a clean reconfigure..."
+      rm -f  "${BUILD_DIR}/CMakeCache.txt"
+      rm -rf "${BUILD_DIR}/CMakeFiles"
+      if [[ "$BUILD_ONLY" == "1" ]]; then
+        echo "  --build-only cannot be honoured with a stale cache; falling back to configure+build."
+        BUILD_CMD="cmake -B$BUILD_DIR $CMAKE_FLAGS && $BUILD_CMD"
+      fi
+    fi
+  fi
 
   eval $BUILD_CMD
   # Check if build succeeded

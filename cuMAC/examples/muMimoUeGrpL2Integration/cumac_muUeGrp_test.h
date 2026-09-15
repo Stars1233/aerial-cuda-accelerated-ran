@@ -34,31 +34,6 @@ constexpr const char* YAML_CUMAC_L1_NVIPC_CONFIG_PATH = "./cuMAC/examples/muMimo
 
 #define CUMAC_L1_SECONDARY_PROCESS 0
 
-#define CHECK_CUDA_ERR(stmt)                                                                                                                                     \
-    do                                                                                                                                                           \
-    {                                                                                                                                                            \
-        cudaError_t result1 = (stmt);                                                                                                                            \
-        if (cudaSuccess != result1)                                                                                                                              \
-        {                                                                                                                                                        \
-            NVLOGW(MU_TEST_TAG, "[%s:%d] cuda failed with result1 %s", __FILE__, __LINE__, cudaGetErrorString(result1));                                            \
-            cudaError_t result2 = cudaGetLastError();                                                                                                            \
-            if (cudaSuccess != result2)                                                                                                                          \
-            {                                                                                                                                                    \
-                NVLOGW(MU_TEST_TAG, "[%s:%d] cuda failed with result2 %s result1 %s", __FILE__, __LINE__, cudaGetErrorString(result2), cudaGetErrorString(result1)); \
-                cudaError_t result3 = cudaGetLastError(); /*check for stickiness*/                                                                               \
-                if (cudaSuccess != result3)                                                                                                                      \
-                {                                                                                                                                                \
-                    NVLOGE(MU_TEST_TAG, AERIAL_CUDA_API_EVENT, "[%s:%d] cuda failed with result3 %s result2 %s result1 %s",                                          \
-                               __FILE__,                                                                                                                         \
-                               __LINE__,                                                                                                                         \
-                               cudaGetErrorString(result3),                                                                                                      \
-                               cudaGetErrorString(result2),                                                                                                      \
-                               cudaGetErrorString(result1));                                                                                                     \
-                }                                                                                                                                                \
-            }                                                                                                                                                    \
-        }                                                                                                                                                        \
-    } while (0)
-
 struct test_task_t {
     uint32_t        sfn;
     uint32_t        slot;
@@ -84,16 +59,18 @@ struct test_task_t {
     }
 };
 
-inline void update_req_srs_info_msh(CVSrsChestBuff_contMemAlloc* arr_cv_srs_chest_buff_base_addr, l1_cumac_message_t* arr_l1_cumac_msg, nv_ipc_msg_t* recv_msg, uint16_t num_srs_ue) {
+inline void update_req_srs_info_msh(CVSrsChestBuff* arr_cv_srs_chest_buff_base_addr, SrsInfoUpdate* arr_srs_info, nv_ipc_msg_t* recv_msg, uint16_t num_srs_ue) {
     for (int srs_ue_idx = 0; srs_ue_idx < num_srs_ue; srs_ue_idx++) {
-        uint16_t cIdx = arr_l1_cumac_msg[srs_ue_idx].cell_idx;
-        uint16_t srs_info_idx = arr_l1_cumac_msg[srs_ue_idx].srs_info_idx;
-        uint32_t real_buff_idx = arr_l1_cumac_msg[srs_ue_idx].real_buff_idx;
-        
+        uint16_t cIdx = arr_srs_info[srs_ue_idx].cell_idx;
+        uint16_t srs_info_idx = arr_srs_info[srs_ue_idx].srs_info_idx;
+        uint32_t real_buff_idx = arr_srs_info[srs_ue_idx].real_buff_idx;
+        uint16_t rnti = arr_srs_info[srs_ue_idx].rnti;
+
         cumac_muUeGrp_req_info_t* req_ptr = (cumac_muUeGrp_req_info_t*) recv_msg[cIdx].data_buf;
         req_ptr->srsInfoMsh[srs_info_idx].realBuffIdx = real_buff_idx;
+        req_ptr->srsInfoMsh[srs_info_idx].rnti = rnti;
 
-        CVSrsChestBuff_contMemAlloc* ue_buffer = arr_cv_srs_chest_buff_base_addr + real_buff_idx;
+        CVSrsChestBuff* ue_buffer = arr_cv_srs_chest_buff_base_addr + real_buff_idx;
         uint16_t srsStartPrg;
         uint16_t srsStartValidPrg;
         uint16_t srsNValidPrg;
@@ -103,6 +80,8 @@ inline void update_req_srs_info_msh(CVSrsChestBuff_contMemAlloc* arr_cv_srs_ches
         req_ptr->srsInfoMsh[srs_info_idx].srsStartValidPrg = srsStartValidPrg;
         req_ptr->srsInfoMsh[srs_info_idx].srsNValidPrg = srsNValidPrg;
         req_ptr->srsInfoMsh[srs_info_idx].flags = 0x01; // valid
+        NVLOGC(MU_TEST_TAG, "Updated srsInfoMsh[%u] for cell %u srs_ue_idx %u rnti %u real_buff_idx %u srsStartPrg %u srsStartValidPrg %u srsNValidPrg %u",
+                    srs_info_idx, cIdx, srs_ue_idx, rnti, real_buff_idx, srsStartPrg, srsStartValidPrg, srsNValidPrg);
     }
 }
 

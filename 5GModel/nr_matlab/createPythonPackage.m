@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,12 @@
 clear all;
 close all;
 startup();
+generatedDirs = {'bin','CompilerSDKOutput'};
+for k = 1:length(generatedDirs)
+    if isfolder(generatedDirs{k})
+        rmpath(genpath(generatedDirs{k}));
+    end
+end
 
 functionPattern = {
     dir('genCfgTemplate.m'),
@@ -70,12 +76,12 @@ end
 display(' ');
 
 additionalPattern = {
-    dir('yamlmatlab/external/snakeyaml-2.5.jar'),
     dir('test/*.txt'),
     dir('test/*.xlsm'),
     dir('test/*.xlsx'),
     dir('test/*.yaml'),
-    dir('test/*.json')
+    dir('test/*.json'),
+    dir('test/perf_pattern/*.yaml')
 };
 
 display('Including additional data files in package:');

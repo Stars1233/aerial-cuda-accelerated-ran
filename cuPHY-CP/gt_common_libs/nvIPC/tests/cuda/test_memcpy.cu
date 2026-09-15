@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,28 +15,27 @@
  * limitations under the License.
  */
 
-// #include "../common/book.h"
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include <cuda.h>
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
+#include <cuda_runtime_api.h>
+
+#define TAG "NVIPC.TESTMEMCPY"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+
 #define SIZE (64 * 1024 * 1024)
 
-#define HANDLE_ERROR(x)                                                                 \
-    do                                                                                  \
-    {                                                                                   \
-        if((x) != cudaSuccess) { printf("Error %s line%d\n", __FUNCTION__, __LINE__); } \
-    } while(0)
-#define HANDLE_NULL(x)
 
 float cuda_malloc_test(int size, bool up)
 {
     cudaEvent_t start, stop;
-    int *       a = NULL, *dev_a = NULL;
+    int *       a = NULL;
+    CUdeviceptr dev_a = 0;
     float       elapsedTime;
 
-    HANDLE_ERROR(cudaEventCreate(&start));
-    HANDLE_ERROR(cudaEventCreate(&stop));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start, 0));
+    CUDA_DRIVER_CHECK(cuEventCreate(&stop, 0));
 
     a = (int*)malloc(size * sizeof(*a));
     if (a == NULL)
@@ -44,27 +43,26 @@ float cuda_malloc_test(int size, bool up)
         return 0.0;
     }
     memset(a, 0, size * sizeof(*a));
-    HANDLE_NULL(a);
-    HANDLE_ERROR(cudaMalloc((void**)&dev_a, size * sizeof(*dev_a)));
+    CUDA_DRIVER_CHECK(cuMemAlloc(&dev_a, size * sizeof(*a)));
 
-    HANDLE_ERROR(cudaEventRecord(start, 0));
+    CUDA_DRIVER_CHECK(cuEventRecord(start, 0));
     for(int i = 0; i < 100; i++)
     {
         if(up)
-            HANDLE_ERROR(
-                cudaMemcpy(dev_a, a, size * sizeof(*dev_a), cudaMemcpyHostToDevice));
+            CUDA_DRIVER_CHECK(
+                cuMemcpyHtoD(dev_a, a, size * sizeof(*a)));
         else
-            HANDLE_ERROR(
-                cudaMemcpy(a, dev_a, size * sizeof(*dev_a), cudaMemcpyDeviceToHost));
+            CUDA_DRIVER_CHECK(
+                cuMemcpyDtoH(a, dev_a, size * sizeof(*a)));
     }
-    HANDLE_ERROR(cudaEventRecord(stop, 0));
-    HANDLE_ERROR(cudaEventSynchronize(stop));
-    HANDLE_ERROR(cudaEventElapsedTime(&elapsedTime, start, stop));
+    CUDA_DRIVER_CHECK(cuEventRecord(stop, 0));
+    CUDA_DRIVER_CHECK(cuEventSynchronize(stop));
+    CUDA_DRIVER_CHECK(cuEventElapsedTime(&elapsedTime, start, stop));
 
     free(a);
-    HANDLE_ERROR(cudaFree(dev_a));
-    HANDLE_ERROR(cudaEventDestroy(start));
-    HANDLE_ERROR(cudaEventDestroy(stop));
+    CUDA_DRIVER_CHECK(cuMemFree(dev_a));
+    CUDA_DRIVER_CHECK(cuEventDestroy(start));
+    CUDA_DRIVER_CHECK(cuEventDestroy(stop));
 
     return elapsedTime;
 }
@@ -72,11 +70,12 @@ float cuda_malloc_test(int size, bool up)
 float cuda_host_register_test(int size, bool up)
 {
     cudaEvent_t start, stop;
-    int *       a, *dev_a;
+    int *       a;
+    CUdeviceptr dev_a = 0;
     float       elapsedTime;
 
-    HANDLE_ERROR(cudaEventCreate(&start));
-    HANDLE_ERROR(cudaEventCreate(&stop));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start, 0));
+    CUDA_DRIVER_CHECK(cuEventCreate(&stop, 0));
 
     a = (int*)malloc(size * sizeof(*a));
     if (a == NULL)
@@ -84,31 +83,30 @@ float cuda_host_register_test(int size, bool up)
         return 0.0;
     }
     memset(a, 0, size * sizeof(*a));
-    HANDLE_NULL(a);
 
-    int flag = cudaHostRegisterPortable | cudaHostRegisterMapped;
-    HANDLE_ERROR(cudaHostRegister(a, size * sizeof(*a), flag));
+    unsigned int flag = CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP;
+    CUDA_DRIVER_CHECK(cuMemHostRegister(a, size * sizeof(*a), flag));
 
-    HANDLE_ERROR(cudaMalloc((void**)&dev_a, size * sizeof(*dev_a)));
+    CUDA_DRIVER_CHECK(cuMemAlloc(&dev_a, size * sizeof(*a)));
 
-    HANDLE_ERROR(cudaEventRecord(start, 0));
+    CUDA_DRIVER_CHECK(cuEventRecord(start, 0));
     for(int i = 0; i < 100; i++)
     {
         if(up)
-            HANDLE_ERROR(
-                cudaMemcpy(dev_a, a, size * sizeof(*dev_a), cudaMemcpyHostToDevice));
+            CUDA_DRIVER_CHECK(
+                cuMemcpyHtoD(dev_a, a, size * sizeof(*a)));
         else
-            HANDLE_ERROR(
-                cudaMemcpy(a, dev_a, size * sizeof(*dev_a), cudaMemcpyDeviceToHost));
+            CUDA_DRIVER_CHECK(
+                cuMemcpyDtoH(a, dev_a, size * sizeof(*a)));
     }
-    HANDLE_ERROR(cudaEventRecord(stop, 0));
-    HANDLE_ERROR(cudaEventSynchronize(stop));
-    HANDLE_ERROR(cudaEventElapsedTime(&elapsedTime, start, stop));
-    HANDLE_ERROR(cudaHostUnregister(a));
+    CUDA_DRIVER_CHECK(cuEventRecord(stop, 0));
+    CUDA_DRIVER_CHECK(cuEventSynchronize(stop));
+    CUDA_DRIVER_CHECK(cuEventElapsedTime(&elapsedTime, start, stop));
+    CUDA_DRIVER_CHECK(cuMemHostUnregister(a));
     free(a);
-    HANDLE_ERROR(cudaFree(dev_a));
-    HANDLE_ERROR(cudaEventDestroy(start));
-    HANDLE_ERROR(cudaEventDestroy(stop));
+    CUDA_DRIVER_CHECK(cuMemFree(dev_a));
+    CUDA_DRIVER_CHECK(cuEventDestroy(start));
+    CUDA_DRIVER_CHECK(cuEventDestroy(stop));
 
     return elapsedTime;
 }
@@ -116,67 +114,67 @@ float cuda_host_register_test(int size, bool up)
 float cuda_host_alloc_test(int size, bool up)
 {
     cudaEvent_t start, stop;
-    int *       a, *dev_a;
+    void *      a = NULL;
+    CUdeviceptr dev_a = 0;
     float       elapsedTime;
 
-    HANDLE_ERROR(cudaEventCreate(&start));
-    HANDLE_ERROR(cudaEventCreate(&stop));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start, 0));
+    CUDA_DRIVER_CHECK(cuEventCreate(&stop, 0));
 
-    HANDLE_ERROR(
-        cudaHostAlloc((void**)&a, size * sizeof(*a), cudaHostAllocDefault));
-    HANDLE_ERROR(cudaMalloc((void**)&dev_a, size * sizeof(*dev_a)));
+    CUDA_DRIVER_CHECK(cuMemAllocHost(&a, size * sizeof(int)));
+    CUDA_DRIVER_CHECK(cuMemAlloc(&dev_a, size * sizeof(int)));
 
-    HANDLE_ERROR(cudaEventRecord(start, 0));
+    CUDA_DRIVER_CHECK(cuEventRecord(start, 0));
     for(int i = 0; i < 100; i++)
     {
         if(up)
-            HANDLE_ERROR(
-                cudaMemcpy(dev_a, a, size * sizeof(*a), cudaMemcpyHostToDevice));
+            CUDA_DRIVER_CHECK(
+                cuMemcpyHtoD(dev_a, a, size * sizeof(int)));
         else
-            HANDLE_ERROR(
-                cudaMemcpy(a, dev_a, size * sizeof(*a), cudaMemcpyDeviceToHost));
+            CUDA_DRIVER_CHECK(
+                cuMemcpyDtoH(a, dev_a, size * sizeof(int)));
     }
-    HANDLE_ERROR(cudaEventRecord(stop, 0));
-    HANDLE_ERROR(cudaEventSynchronize(stop));
-    HANDLE_ERROR(cudaEventElapsedTime(&elapsedTime, start, stop));
+    CUDA_DRIVER_CHECK(cuEventRecord(stop, 0));
+    CUDA_DRIVER_CHECK(cuEventSynchronize(stop));
+    CUDA_DRIVER_CHECK(cuEventElapsedTime(&elapsedTime, start, stop));
 
-    HANDLE_ERROR(cudaFreeHost(a));
-    HANDLE_ERROR(cudaFree(dev_a));
-    HANDLE_ERROR(cudaEventDestroy(start));
-    HANDLE_ERROR(cudaEventDestroy(stop));
+    CUDA_DRIVER_CHECK(cuMemFreeHost(a));
+    CUDA_DRIVER_CHECK(cuMemFree(dev_a));
+    CUDA_DRIVER_CHECK(cuEventDestroy(start));
+    CUDA_DRIVER_CHECK(cuEventDestroy(stop));
 
     return elapsedTime;
 }
 
 int main(void)
 {
+    PrimaryCtxGuard ctx_guard(0);
+
     float elapsedTime;
     float MB = (float)100 * SIZE * sizeof(int) / 1024 / 1024;
 
-    // try it with cudaMalloc
     elapsedTime = cuda_malloc_test(SIZE, true);
-    printf("Time using cudaMalloc:  %3.1f ms", elapsedTime);
+    printf("Time using cuMemAlloc:  %3.1f ms", elapsedTime);
     printf("\tMB/s during copy up:  %3.1f\n", MB / (elapsedTime / 1000));
 
     elapsedTime = cuda_malloc_test(SIZE, false);
-    printf("Time using cudaMalloc:  %3.1f ms", elapsedTime);
+    printf("Time using cuMemAlloc:  %3.1f ms", elapsedTime);
     printf("\tMB/s during copy down:  %3.1f\n", MB / (elapsedTime / 1000));
 
-    // now try it with cudaHostAlloc
     elapsedTime = cuda_host_alloc_test(SIZE, true);
-    printf("Time using cudaHostAlloc:  %3.1f ms", elapsedTime);
+    printf("Time using cuMemAllocHost:  %3.1f ms", elapsedTime);
     printf("\tMB/s during copy up:  %3.1f\n", MB / (elapsedTime / 1000));
 
     elapsedTime = cuda_host_alloc_test(SIZE, false);
-    printf("Time using cudaHostAlloc:  %3.1f ms", elapsedTime);
+    printf("Time using cuMemAllocHost:  %3.1f ms", elapsedTime);
     printf("\tMB/s during copy down:  %3.1f\n", MB / (elapsedTime / 1000));
 
-    // try it with cudaMalloc
     elapsedTime = cuda_host_register_test(SIZE, true);
-    printf("Time using cudaHostRegister:  %3.1f ms", elapsedTime);
+    printf("Time using cuMemHostRegister:  %3.1f ms", elapsedTime);
     printf("\tMB/s during copy up:  %3.1f\n", MB / (elapsedTime / 1000));
 
     elapsedTime = cuda_host_register_test(SIZE, false);
-    printf("Time using cudaHostRegister:  %3.1f ms", elapsedTime);
+    printf("Time using cuMemHostRegister:  %3.1f ms", elapsedTime);
     printf("\tMB/s during copy down:  %3.1f\n", MB / (elapsedTime / 1000));
+
 }

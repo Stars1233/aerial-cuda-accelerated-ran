@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -119,7 +119,8 @@ __device__ inline void compress_blockScaling(int4 *input, unsigned char *output,
             // We can choose blockScale as the inverse of the next power of 2 >= maxV.
             // This way, the scaling is done with a simple shift, and blockScaler has a single bit set.
             // Find the left shift that will bring the maxV to 16 bits
-            int shift = min(7, __clz(maxV) - 17);
+            // __clz return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems, thus the explicit cast
+            int shift = min(7, (int)__clz(maxV) - 17);
 
             // Shift all the values left, round to nearest,
             // then shift right to meet the required number of bits

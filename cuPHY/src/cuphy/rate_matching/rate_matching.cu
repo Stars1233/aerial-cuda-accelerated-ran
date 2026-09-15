@@ -236,7 +236,26 @@ struct SmemCliParams {
     uint32_t uciOnPuschFlag;  // stored as uint32_t for alignment
 };
 
-template <typename T_IN, typename T_OUT, int Qm, bool ndi>
+template <bool useCbRange>
+__device__ __forceinline__ bool resolveCodeBlockIndex(const puschRxRateMatchDescr_t& rmDesc,
+                                                       uint32_t                       tbIdx,
+                                                       uint32_t&                      cbIdx)
+{
+    cbIdx = blockIdx.y;
+    if constexpr(useCbRange)
+    {
+        const uint32_t cbRangeBegin = rmDesc.cbBegin[tbIdx];
+        const uint32_t cbRangeEnd   = rmDesc.cbEnd[tbIdx];
+        if(cbRangeBegin >= cbRangeEnd || blockIdx.y >= (cbRangeEnd - cbRangeBegin))
+        {
+            return false;
+        }
+        cbIdx += cbRangeBegin;
+    }
+    return true;
+}
+
+template <typename T_IN, typename T_OUT, int Qm, bool ndi, bool useCbRange>
 __device__ __forceinline__ void deRateMatchingKernelInner(puschRxRateMatchDescr_t* pRmDesc)
 {
     using T_OUT_PAIR = typename std::conditional<std::is_same<T_OUT, __half>::value, __half2, float2>::type;
@@ -248,14 +267,16 @@ __device__ __forceinline__ void deRateMatchingKernelInner(puschRxRateMatchDescr_
     puschRxRateMatchDescr_t& rmDesc = *pRmDesc;
     const uint32_t nFracCbs = gridDim.x;
     const uint32_t fracCbIdx = blockIdx.x;
-    const uint32_t cbIdx = blockIdx.y;
     const uint32_t tbIdx = blockIdx.z;
     const uint16_t ueIdx = rmDesc.schUserIdxs[tbIdx];
+    uint32_t cbIdx;
+    if(!resolveCodeBlockIndex<useCbRange>(rmDesc, tbIdx, cbIdx))
+    {
+        return;
+    }
 
     // Output tensor
-    // @todo: rmDesc.out which holds an array of pointers to HARQ buffers (in GPU memory) lives in host pinned memory,
-    // check performance impact of accessing this memory
-    T_OUT* out = static_cast<T_OUT*>(rmDesc.out[ueIdx]);
+    T_OUT* __restrict__ out = static_cast<T_OUT*>(rmDesc.out[ueIdx]);
 
     // Array of transport block parameters structs
     const PerTbParams& tbPrms = rmDesc.tbPrmsArray[ueIdx];
@@ -275,7 +296,7 @@ __device__ __forceinline__ void deRateMatchingKernelInner(puschRxRateMatchDescr_
     // Enable/Disable descrambling (combined with uciOnPuschFlag check)
     const uint8_t descramblingOn = rmDesc.descramblingOn && !uciOnPuschFlag;
     // Input LLR tensor
-    const T_IN* llr_vec_in = static_cast<const T_IN*>(rmDesc.llr_vec_in[tbIdx]);
+    const T_IN* __restrict__ llr_vec_in = static_cast<const T_IN*>(rmDesc.llr_vec_in[tbIdx]);
 
     //******** The following parameters are invariant for all CTAs working on the same transport block*******/
     // They only vary along the y-dimension of the grid, namely across transport blocks
@@ -553,8 +574,10 @@ __device__ __forceinline__ void deRateMatchingKernelInner(puschRxRateMatchDescr_
             const int  tileBase = tid0 - static_cast<int>(threadIdx.x);
             const bool fullTile = (tileBase + tileSpan) <= maxIndex;
 
-            if (fullTile && (Qm > 1))
+            if constexpr (Qm > 1 && (DERM_BLK_DIM % Qm == 0))
             {
+              if (fullTile)
+              {
                 // Shared-memory transpose: remap thread→LLR so consecutive
                 // threadIdx.x values target the same kIdx group, producing
                 // contiguous outIdx for coalesced global stores.
@@ -565,11 +588,7 @@ __device__ __forceinline__ void deRateMatchingKernelInner(puschRxRateMatchDescr_
 
                 {
                     constexpr int TPG = DERM_BLK_DIM / Qm; // threads per kIdx group
-                    static_assert(DERM_BLK_DIM % Qm == 0, "DERM_BLK_DIM must be divisible by Qm");
 
-                    // Original thread layout (kIdx = threadIdx.x % Qm):
-                    //   Within a 32-lane warp and Qm=8, lanes {0,8,16,24} share kIdx=0
-                    //   but are 8 apart, hence 8 scattered mini-bursts of 4 elements each.
                     // After transpose (kIdx = threadIdx.x / TPG, TPG = DERM_BLK_DIM/Qm):
                     //   threads 0..TPG-1 all have kIdx=0 with consecutive jIdx
                     //   contiguous outIdx, hence single coalesced burst per kIdx group.
@@ -596,10 +615,28 @@ __device__ __forceinline__ void deRateMatchingKernelInner(puschRxRateMatchDescr_
                 }
 
                 __syncthreads(); // flush complete — safe to overwrite smem on next iter
+              }
+              else
+              {
+                // Partial tile — use scalar path (no barriers).
+                const uint32_t jIdx0 = static_cast<uint32_t>(tid0) / Qm;
+                const uint32_t kIdx0 = static_cast<uint32_t>(tid0) - jIdx0 * Qm;
+                processOneLLR<T_OUT, ndi>(jIdx0, kIdx0, llr_pair.x, EoverQm,
+                                          Kd, F, k0, Ncb, potentialRaceIfPositive,
+                                          LLR_CLAMP_MIN, LLR_CLAMP_MAX, out);
+                const int tid1 = tid0 + static_cast<int>(blockDim.x);
+                if (tid1 < maxIndex) {
+                    const uint32_t jIdx1 = static_cast<uint32_t>(tid1) / Qm;
+                    const uint32_t kIdx1 = static_cast<uint32_t>(tid1) - jIdx1 * Qm;
+                    processOneLLR<T_OUT, ndi>(jIdx1, kIdx1, llr_pair.y, EoverQm,
+                                              Kd, F, k0, Ncb, potentialRaceIfPositive,
+                                              LLR_CLAMP_MIN, LLR_CLAMP_MAX, out);
+                }
+              }
             }
             else
             {
-                // Scalar path: Qm==1 (always), or Qm>1 tail tile (partial — no barriers).
+                // Scalar path: Qm==1 or DERM_BLK_DIM % Qm != 0 (e.g. Qm=6 with block=256).
                 const uint32_t jIdx0 = static_cast<uint32_t>(tid0) / Qm;
                 const uint32_t kIdx0 = static_cast<uint32_t>(tid0) - jIdx0 * Qm;
                 processOneLLR<T_OUT, ndi>(jIdx0, kIdx0, llr_pair.x, EoverQm,
@@ -685,8 +722,8 @@ __device__ __forceinline__ void deRateMatchingKernelInner(puschRxRateMatchDescr_
     }
 }
 
-template <typename T_IN, typename T_OUT>
-__global__ void __launch_bounds__(DERM_BLK_DIM, 16) de_rate_matching_global2(puschRxRateMatchDescr_t* pRmDesc)
+template <typename T_IN, typename T_OUT, bool useCbRange>
+__global__ void __launch_bounds__(DERM_BLK_DIM, 6) de_rate_matching_global2(puschRxRateMatchDescr_t* pRmDesc)
 {
     // PUSCH kernel descriptor
     puschRxRateMatchDescr_t& rmDesc = *pRmDesc;
@@ -718,62 +755,66 @@ __global__ void __launch_bounds__(DERM_BLK_DIM, 16) de_rate_matching_global2(pus
     {
         if(Qm == 1)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 1, true>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 1, true, useCbRange>(pRmDesc);
         }
         else if(Qm == 2)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 2, true>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 2, true, useCbRange>(pRmDesc);
         }
         else if(Qm == 4)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 4, true>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 4, true, useCbRange>(pRmDesc);
         }
         else if(Qm == 6)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 6, true>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 6, true, useCbRange>(pRmDesc);
         }
         else if(Qm == 8)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 8, true>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 8, true, useCbRange>(pRmDesc);
         }
     }
     else // ndi false: LLR combining (retransmission)
     {
         if(Qm == 1)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 1, false>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 1, false, useCbRange>(pRmDesc);
         }
         else if(Qm == 2)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 2, false>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 2, false, useCbRange>(pRmDesc);
         }
         else if(Qm == 4)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 4, false>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 4, false, useCbRange>(pRmDesc);
         }
         else if(Qm == 6)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 6, false>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 6, false, useCbRange>(pRmDesc);
         }
         else if(Qm == 8)
         {
-            deRateMatchingKernelInner<T_IN, T_OUT, 8, false>(pRmDesc);
+            deRateMatchingKernelInner<T_IN, T_OUT, 8, false, useCbRange>(pRmDesc);
         }
     }
 
 }
 
 // this kernel partially resets HARQ buffer
-template <typename T_OUT>
-__global__ void __launch_bounds__(DERM_BLK_DIM, 10) de_rate_matching_reset_buffer(puschRxRateMatchDescr_t* pRmDesc)
+template <typename T_OUT, bool useCbRange>
+__global__ void __launch_bounds__(DERM_BLK_DIM, 4) de_rate_matching_reset_buffer(puschRxRateMatchDescr_t* pRmDesc)
 {
     // PUSCH kernel descriptor
     puschRxRateMatchDescr_t& rmDesc = *pRmDesc;
     const uint32_t nFracCbs = gridDim.x;
     const uint32_t fracCbIdx = blockIdx.x;
-    const uint32_t cbIdx = blockIdx.y;
     const uint32_t tbIdx = blockIdx.z;
     const uint16_t ueIdx = rmDesc.schUserIdxs[tbIdx];
+    uint32_t cbIdx;
+    if(!resolveCodeBlockIndex<useCbRange>(rmDesc, tbIdx, cbIdx))
+    {
+        return;
+    }
 
 
     // Array of transport block parameters structs
@@ -868,16 +909,20 @@ __global__ void __launch_bounds__(DERM_BLK_DIM, 10) de_rate_matching_reset_buffe
 }
 
 // this kernel partially clamps HARQ buffer //ToDo: is clamping absolutely needed?
-template <typename T_OUT>
-__global__ void __launch_bounds__(DERM_BLK_DIM, 10) de_rate_matching_clamp_buffer(puschRxRateMatchDescr_t* pRmDesc)
+template <typename T_OUT, bool useCbRange>
+__global__ void __launch_bounds__(DERM_BLK_DIM, 4) de_rate_matching_clamp_buffer(puschRxRateMatchDescr_t* pRmDesc)
 {
     // PUSCH kernel descriptor
     puschRxRateMatchDescr_t& rmDesc = *pRmDesc;
     const uint32_t nFracCbs = gridDim.x;
     const uint32_t fracCbIdx = blockIdx.x;
-    const uint32_t cbIdx = blockIdx.y;
     const uint32_t tbIdx = blockIdx.z;
     const uint16_t ueIdx = rmDesc.schUserIdxs[tbIdx];
+    uint32_t cbIdx;
+    if(!resolveCodeBlockIndex<useCbRange>(rmDesc, tbIdx, cbIdx))
+    {
+        return;
+    }
 
     // Array of transport block parameters structs
     const PerTbParams& tbPrms = rmDesc.tbPrmsArray[ueIdx];
@@ -990,16 +1035,33 @@ void puschRxRateMatch::setup(uint16_t                          nSchUes,         
                              void*                             pGpuDesc,                    // pointer to descriptor in gpu
                              uint8_t                           enableCpuToGpuDescrAsyncCpy, // option to copy cpu descriptors from cpu to gpu
                              cuphyPuschRxRateMatchLaunchCfg_t* pLaunchCfg,                  // pointer to rate matching launch configuration
-                             cudaStream_t                      strm)                        // stream to perform copy
+                             cudaStream_t                      strm,                        // stream to perform copy
+                             const cuphyPuschRxRateMatchCbRange_t* pCbRangesCpu)            // optional per-SCH-UE CB ranges
 {
     // setup CPU descriptor
-    puschRxRateMatchDescr_t& desc    = *(static_cast<puschRxRateMatchDescr_t*>(pCpuDesc));
-    uint16_t                 nUciUes = 0;
+    puschRxRateMatchDescr_t& desc       = *(static_cast<puschRxRateMatchDescr_t*>(pCpuDesc));
+    uint16_t                 nUciUes    = 0;
+    const bool               useCbRange = pCbRangesCpu != nullptr;
 
     for(uint32_t i = 0; i < nSchUes; ++i)
     {
         uint16_t ueIdx      = pSchUserIdxsCpu[i];
         desc.schUserIdxs[i] = ueIdx;
+        desc.out[ueIdx]     = ppRmOut[ueIdx];
+        const uint16_t numCbs = static_cast<uint16_t>(pTbPrmsCpu[ueIdx].num_CBs);
+        uint16_t cbBegin = 0;
+        uint16_t cbEnd = numCbs;
+        if(pCbRangesCpu != nullptr)
+        {
+            cbBegin = (pCbRangesCpu[i].cbBegin < numCbs) ? pCbRangesCpu[i].cbBegin : numCbs;
+            cbEnd = (pCbRangesCpu[i].cbEnd < numCbs) ? pCbRangesCpu[i].cbEnd : numCbs;
+            if(cbEnd < cbBegin)
+            {
+                cbEnd = cbBegin;
+            }
+        }
+        desc.cbBegin[i] = cbBegin;
+        desc.cbEnd[i] = cbEnd;
 #ifndef NDEBUG
         {
             const uint32_t Qm = pTbPrmsCpu[ueIdx].Qm;
@@ -1025,7 +1087,6 @@ void puschRxRateMatch::setup(uint16_t                          nSchUes,         
             }
         }
     }
-    desc.out            = ppRmOut;
     desc.tbPrmsArray    = pTbPrmsGpu;
     desc.descramblingOn = m_descramblingOn;
 
@@ -1042,10 +1103,17 @@ void puschRxRateMatch::setup(uint16_t                          nSchUes,         
     for(uint32_t i = 0; i < nSchUes; ++i)
     {
         uint16_t ueIdx = pSchUserIdxsCpu[i];
-        CMax           = CMax < pTbPrmsCpu[ueIdx].num_CBs ? pTbPrmsCpu[ueIdx].num_CBs : CMax;
+        const uint32_t rangeCbCount = static_cast<uint32_t>(desc.cbEnd[i] - desc.cbBegin[i]);
+        CMax           = CMax < rangeCbCount ? rangeCbCount : CMax;
+        if(rangeCbCount == 0 || pTbPrmsCpu[ueIdx].num_CBs == 0)
+        {
+            continue;
+        }
         uint32_t Eh    = pTbPrmsCpu[ueIdx].Nl * pTbPrmsCpu[ueIdx].Qm * ceilf(float(pTbPrmsCpu[ueIdx].encodedSize) / float(pTbPrmsCpu[ueIdx].Nl * pTbPrmsCpu[ueIdx].Qm * pTbPrmsCpu[ueIdx].num_CBs));
         EMax           = EMax < Eh ? Eh : EMax;
     }
+    CMax = (CMax == 0) ? 1 : CMax;
+    EMax = (EMax == 0) ? 1 : EMax;
 
     // using larger block size could result in load imbalance in some cases and lower occupancy
     dim3 gridDim(div_round_up(EMax, DERM_BLK_DIM * NUM_LLRS_PROCESSED_PER_THRD), CMax, nSchUes);
@@ -1062,7 +1130,7 @@ void puschRxRateMatch::setup(uint16_t                          nSchUes,         
     pLaunchCfg->kernelNodeParamsDriver.blockDimX      = blockDim.x;
     pLaunchCfg->kernelNodeParamsDriver.blockDimY      = blockDim.y;
     pLaunchCfg->kernelNodeParamsDriver.blockDimZ      = blockDim.z;
-    pLaunchCfg->kernelNodeParamsDriver.func           = m_kernelFunc;
+    pLaunchCfg->kernelNodeParamsDriver.func           = useCbRange ? m_cbRangeKernelFunc : m_kernelFunc;
     pLaunchCfg->kernelNodeParamsDriver.kernelParams   = &(pLaunchCfg->kernelArgs[0]);
     // Dynamic shared memory: layer_map_array + smem_llr + SmemCliParams
     constexpr uint32_t sharedMemBytes = MAX_N_LAYERS_PUSCH * sizeof(uint32_t)
@@ -1078,7 +1146,8 @@ void puschRxRateMatch::setup(uint16_t                          nSchUes,         
     pLaunchCfg->resetKernelNodeParamsDriver.blockDimX      = blockDim.x;
     pLaunchCfg->resetKernelNodeParamsDriver.blockDimY      = blockDim.y;
     pLaunchCfg->resetKernelNodeParamsDriver.blockDimZ      = blockDim.z;
-    pLaunchCfg->resetKernelNodeParamsDriver.func           = m_resetBufferKernelFunc;
+    pLaunchCfg->resetKernelNodeParamsDriver.func           = useCbRange ? m_cbRangeResetBufferKernelFunc
+                                                                        : m_resetBufferKernelFunc;
     pLaunchCfg->resetKernelNodeParamsDriver.kernelParams   = &(pLaunchCfg->kernelArgs[0]);
     pLaunchCfg->resetKernelNodeParamsDriver.sharedMemBytes = 0;
     pLaunchCfg->resetKernelNodeParamsDriver.extra          = nullptr;
@@ -1090,7 +1159,8 @@ void puschRxRateMatch::setup(uint16_t                          nSchUes,         
     pLaunchCfg->clampKernelNodeParamsDriver.blockDimX      = blockDim.x;
     pLaunchCfg->clampKernelNodeParamsDriver.blockDimY      = blockDim.y;
     pLaunchCfg->clampKernelNodeParamsDriver.blockDimZ      = blockDim.z;
-    pLaunchCfg->clampKernelNodeParamsDriver.func           = m_clampBufferKernelFunc;
+    pLaunchCfg->clampKernelNodeParamsDriver.func           = useCbRange ? m_cbRangeClampBufferKernelFunc
+                                                                        : m_clampBufferKernelFunc;
     pLaunchCfg->clampKernelNodeParamsDriver.kernelParams   = &(pLaunchCfg->kernelArgs[0]);
     pLaunchCfg->clampKernelNodeParamsDriver.sharedMemBytes = 0;
     pLaunchCfg->clampKernelNodeParamsDriver.extra          = nullptr;
@@ -1107,27 +1177,39 @@ void puschRxRateMatch::init(int rmFPconfig,     // 0: FP32 in, FP32 out; 1: FP16
     switch(rmFPconfig)
     {
     case 0:
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_kernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<float, float>)));}
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_resetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<float>)));}
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_clampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<float>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_kernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<float, float, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_resetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<float, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_clampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<float, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeKernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<float, float, true>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeResetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<float, true>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeClampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<float, true>)));}
         break;
 
     case 1:
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_kernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<__half, float>)));}
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_resetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<float>)));}
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_clampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<float>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_kernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<__half, float, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_resetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<float, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_clampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<float, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeKernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<__half, float, true>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeResetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<float, true>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeClampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<float, true>)));}
         break;
 
     case 2:
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_kernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<float, __half>)));}
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_resetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<__half>)));}
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_clampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<__half>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_kernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<float, __half, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_resetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<__half, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_clampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<__half, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeKernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<float, __half, true>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeResetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<__half, true>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeClampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<__half, true>)));}
         break;
 
     case 3:
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_kernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<__half, __half>)));}
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_resetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<__half>)));}
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_clampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<__half>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_kernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<__half, __half, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_resetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<__half, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_clampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<__half, false>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeKernelFunc, reinterpret_cast<void*>(de_rate_matching_global2<__half, __half, true>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeResetBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_reset_buffer<__half, true>)));}
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_cbRangeClampBufferKernelFunc, reinterpret_cast<void*>(de_rate_matching_clamp_buffer<__half, true>)));}
         break;
     default:
         break;

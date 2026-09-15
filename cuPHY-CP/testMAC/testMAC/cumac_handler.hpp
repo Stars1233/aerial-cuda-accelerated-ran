@@ -36,6 +36,7 @@
 #include "cumac_pattern.hpp"
 #include "test_mac_stats.hpp"
 #include "cumac_validate.hpp"
+#include "fapi_handler.hpp"
 #include "stat_log.h"
 #include "nv_ipc_ring.h"
 
@@ -48,6 +49,8 @@ using namespace nv;
 #define END_REQUEST_NONE (0)     //!< No end request sent
 #define END_REQUEST_PER_SLOT (1) //!< Send end request per slot
 #define END_REQUEST_PER_CELL (2) //!< Send end request per cell
+
+#define MAX_SRS_UE_PER_CELL_DEBUG (1024)
 
 /**
  * cuMAC cell state enumeration
@@ -162,6 +165,9 @@ public:
     cumac_sched_t cumac_scheds[CUMAC_SCHED_BUFFER_SIZE]; //!< Ring buffer of scheduling data
 
     std::vector<slot_timing_t> slot_timing; //!< Timing information per slot
+
+    uint32_t cuphy_rnti[MAX_SRS_UE_PER_CELL_DEBUG]; //!< For debug, RNTI from cuPHY-CP
+    uint32_t cumac_rnti[MAX_SRS_UE_PER_CELL_DEBUG]; //!< For debug, RNTI from cuMAC-CP
 };
 
 /**
@@ -234,8 +240,9 @@ public:
      * Handle tick event for slot scheduling
      * 
      * @param[in] sched_info Scheduling information with SFN/slot and timestamp
+     * @return 0 if tick was handled, -1 if tick was skipped
      */
-    void on_tick_event(sched_info_t sched_info);
+    int on_tick_event(sched_info_t sched_info);
 
     /**
      * Schedule all cuMAC messages for a slot
@@ -284,7 +291,7 @@ public:
 
     int poll_build_task();
 
-    void build_first_slot();
+    void build_first_slot(sfn_slot_t ss);
 
     int build_sch_tti_request(int cell_id, vector<cumac_req_t*>& cumac_reqs, cumac_sch_tti_req_t& req, phy_mac_msg_desc& msg_desc);
 
@@ -325,6 +332,11 @@ public:
     void setTransport(phy_mac_transport* transport)
     {
         _transport = transport;
+    }
+
+    void set_fapi_handler(fapi_handler* handler)
+    {
+        _fapi_handler = handler;
     }
 
     test_cumac_configs* get_cumac_configs() {
@@ -428,12 +440,14 @@ protected:
 
     int copy_complex_to_ipc_buf(phy_mac_msg_desc& msg_desc, cuComplex* src, const char* debug_info, uint32_t& src_offset, uint32_t& dst_offset, uint32_t num);
 
-    int data_buf_opt = 1; //!< Data buffer option: 0=msg_buf, 1=CPU_DATA, 2=CUDA_DATA, 3=GPU_DATA
+    int data_buf_opt = 1; //!< Data pool option: 0=msg_buf/inline, 1=CPU_DATA, 2=CPU_LARGE, 3=GPU_DATA
 
     int cell_num = 0;            //!< Total number of cells
-    int configured_cell_num = 0; //!< Number of cells successfully configured
+    std::atomic<int> configured_cell_num = 0; //!< Number of cells successfully configured
 
     int notify_mode = 0; //!< IPC notification mode: per-cell, per-TTI, or per-message
+
+    bool first_slot = true; //!< First slot flag
 
     uint16_t slots_per_frame = 0; //!< Number of slots per frame (depends on numerology)
 
@@ -484,7 +498,11 @@ protected:
     std::unordered_map<int, int> cell_id_map_tmp;
     std::unordered_map<int, bool> cell_remap_event;
 
+    std::atomic<bool> ue_group_started{false};
+
     int cumac_build_in_advance;
+
+    fapi_handler* _fapi_handler = nullptr;
 
     // Worker thread inscreasing index and synchronization semaphore
     std::atomic<int> cumac_worker_id = 0;

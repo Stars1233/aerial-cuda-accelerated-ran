@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,8 @@
  */
 
 #include "scf_5g_fapi_dl_validate.hpp"
+#include <aerial/casts/casts.hpp>
+#include <climits>
 
 #define TAG (NVLOG_TAG_BASE_SCF_L2_ADAPTER + 10) // "SCF.DL_FAPI_VALIDATE"
 
@@ -262,6 +264,17 @@ int validate_pdcch_pdu(scf_fapi_pdcch_pdu_t& pdcch_pdu)
         }
 
         
+        // Bound the DCI count before any iteration over the DCI list below; num_dl_dci is
+        // L2-supplied (uint16_t) and an oversized value would drive the loops past the buffer.
+        if (pdcch_pdu.num_dl_dci > CUPHY_PDCCH_MAX_DCIS_PER_CORESET) [[unlikely]]
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                "PDCCH num_dl_dci={} exceeds max {} per coreset; rejecting PDU",
+                static_cast<int>(pdcch_pdu.num_dl_dci),
+                static_cast<int>(CUPHY_PDCCH_MAX_DCIS_PER_CORESET));
+            return INVALID_FAPI_PDU;
+        }
+
         auto ptr_dci = reinterpret_cast<scf_fapi_dl_dci_t*>(&pdcch_pdu.dl_dci[0]);
 
         for (uint8_t dci_idx = 0; dci_idx < pdcch_pdu.num_dl_dci; dci_idx++)
@@ -290,6 +303,34 @@ int validate_pdcch_pdu(scf_fapi_pdcch_pdu_t& pdcch_pdu)
                 return INVALID_FAPI_PDU;
             }
         }
+
+        // Variable-stride walk to validate per-DCI payload_size_bits (CWE-787).
+        // Each DCI entry layout: scf_fapi_dl_dci_t | bf_size bytes | tx_power_info | scf_fapi_pdcch_dci_payload_t | payload bytes
+        const uint8_t* dci_ptr = reinterpret_cast<const uint8_t*>(&pdcch_pdu.dl_dci[0]);
+        for (uint16_t dci_idx = 0; dci_idx < pdcch_pdu.num_dl_dci; ++dci_idx)
+        {
+            const auto& msg_dci    = *aerial::casts::assume_cast<scf_fapi_dl_dci_t>(dci_ptr);
+            const auto& bf         = *aerial::casts::assume_cast<scf_fapi_tx_precoding_beamforming_t>(&msg_dci.payload[0]);
+            const uint32_t bf_size = static_cast<uint32_t>(bf.num_prgs) * sizeof(uint16_t)
+                                   + static_cast<uint32_t>(bf.num_prgs) * bf.dig_bf_interfaces * sizeof(uint16_t)
+                                   + sizeof(bf);
+            const auto tx_pwr_size = sizeof(scf_fapi_pdcch_tx_power_info_t);
+            const auto& dci_end    = *aerial::casts::assume_cast<scf_fapi_pdcch_dci_payload_t>(
+                                         &msg_dci.payload[bf_size + tx_pwr_size]);
+            if (dci_end.payload_size_bits > CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT) [[unlikely]]
+            {
+                NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                    "PDCCH DCI[{}] payload_size_bits={} exceeds max {} bits; rejecting PDU",
+                    static_cast<int>(dci_idx),
+                    static_cast<int>(dci_end.payload_size_bits),
+                    CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT);
+                return INVALID_FAPI_PDU;
+            }
+            const auto dci_payload_len = (static_cast<uint32_t>(dci_end.payload_size_bits) + (CHAR_BIT - 1U)) / CHAR_BIT;
+            dci_ptr += sizeof(scf_fapi_dl_dci_t) + bf_size + tx_pwr_size
+                     + sizeof(scf_fapi_pdcch_dci_payload_t) + dci_payload_len;
+        }
+
     return VALID_FAPI_PDU;
 }
 

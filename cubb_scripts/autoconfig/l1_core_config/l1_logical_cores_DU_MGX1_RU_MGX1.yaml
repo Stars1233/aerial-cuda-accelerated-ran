@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+
+#This file specifies the logical cores for each L1 Aerial component.  These are only logical cores - mapping to
+#  physical cores performed by assign_physical_cores.py
+#
+# Each core specification is represented as <logical core>.<logical HT sibling>.<numa>
+#  Both logical HT sibling and numa are optional (i.e. for nonHT case on numa 0, only logical core needs to be specified)
+#
+# Example 1 (non-HT on numa 0) - the following would allocate threads 1 and 2 to the same physical core,
+#   while thread 3 and 4 would recieve their own cores (Total Physical Cores = 3)
+# thread1: 0
+# thread2: 0
+# thread3: 1
+# thread4: 2
+#
+# Example 2 (HT on numa 0) - the following would allocate threads 1 and 2 on HT siblings (same physical core),
+#   while thread 3 and 4 would recieve their own cores (Total Physical Cores = 3)
+# thread1: 0.0
+# thread2: 0.1
+# thread3: 1.0
+# thread4: 2.0
+#
+# Example 2 (HT on numas 0 and 1) - the following would allocate threads 1 and 2 on HT siblings (same physical core, numa 0),
+#   while thread 3 and 4 are on HT siblings for numa 1 (Total Physical Cores = 2)
+# thread1: 0.0.0
+# thread2: 0.1.0
+# thread3: 0.0.1
+# thread4: 0.1.1
+#
+# You can also set core value to -1 to indicate disabling of thread
+#   (available only for threads that contain that feature, noted below)
+
+## L1 Core Allocation (cuphycontroller)
+all_low_priority_threads: 0
+dpdk_thread: 0
+fh_stats_dump_thread: -1 #Note: set to -1 to disable
+h2d_copy_thread: 1
+ul_worker_threads: [2,3]
+dl_worker_threads: [4,5,6]
+l2a_timer_thread: 4
+l2a_message_processing_thread: 7
+dl_debug_thread: 8 #Note: set to -1 to disable
+l2a_pcap_capture_thread: 9
+
+##Test Bench Only (testmac)
+tbonly_tm_all_low_priority_threads: 10
+tbonly_tm_schedule_thread: 11
+tbonly_tm_receive_thread: 12
+tbonly_tm_builder_thread: 13
+tbonly_worker_threads: []
+
+##Test Bench Only (ru_emulator)
+#Note: ru_emulator logical cores are on separate machine, and will not conflict with cuphycontroller/testmac
+tbonly_re_ul_threads: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30]
+tbonly_re_ul_srs_threads: []
+tbonly_re_dl_threads: [31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58]
+tbonly_re_all_low_priority_threads: 59
+tbonly_re_dpdk_thread: 60
+tbonly_re_pdump_client_thread: -1

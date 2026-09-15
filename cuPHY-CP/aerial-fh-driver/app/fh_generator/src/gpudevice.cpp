@@ -16,6 +16,7 @@
  */
 
 #include "gpudevice.hpp"
+#include <cstddef>
 
 namespace fh_gen
 {
@@ -25,14 +26,19 @@ GpuDevice::GpuDevice(
     id(_id),
     init_gdr(_init_gdr)
 {
-    CUDA_CHECK(cudaGetDeviceCount(&tot_devs));
-    if(id > tot_devs)
+    CUDA_DRIVER_CHECK(cuDeviceGetCount(&tot_devs));
+    if(id >= static_cast<uint32_t>(tot_devs))
         THROW("Device not found in the system");
 
-    CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, id)); // can also consider getting attributes individually via cudaDeviceGetAttribute
-    CUDA_CHECK(cudaDeviceGetAttribute(&device_attr_clock_rate, cudaDevAttrClockRate, id)); // get attribute directly; marked as deprecated in cudaDeviceProp
-    CUDA_CHECK(cudaDeviceGetAttribute(&device_is_direct_rdma_supported, cudaDevAttrGPUDirectRDMASupported, id)); // get attribute directly; unavailable in cudaDeviceProp
-    
+    CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice_, id));
+    CUDA_DRIVER_CHECK(cuDeviceGetName(deviceName_, sizeof(deviceName_), cuDevice_));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&devicePciBusId_, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, cuDevice_));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&devicePciDeviceId_, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, cuDevice_));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&devicePciDomainId_, CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID, cuDevice_));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&device_attr_clock_rate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, cuDevice_));
+    CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&device_is_direct_rdma_supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, cuDevice_));
+
+    CUDA_DRIVER_CHECK(cuDevicePrimaryCtxRetain(&cuCtx_, cuDevice_));
     setDevice();
 
     /*
@@ -43,7 +49,7 @@ GpuDevice::GpuDevice(
     //Maybe constructor can take as input a GDRCopy descriptor
 
     gdrc_h = nullptr;
-    if(init_gdr == true && device_is_direct_rdma_supported == 1)
+    if(init_gdr == true && device_is_direct_rdma_supported != 0)
     {
         gdrc_h = gdr_open();
         if(gdrc_h == nullptr)
@@ -59,11 +65,12 @@ GpuDevice::~GpuDevice()
         if(gdrc_h != nullptr)
             gdr_close(gdrc_h);
     }
+    CUDA_DRIVER_CHECK_NON_FATAL(cuDevicePrimaryCtxRelease(cuDevice_));
 };
 
 void GpuDevice::setDevice()
 {
-    CUDA_CHECK(cudaSetDevice(id));
+    CUDA_DRIVER_CHECK(cuCtxSetCurrent(cuCtx_));
 }
 
 gdr_t* GpuDevice::getGDRhandler()
@@ -71,15 +78,16 @@ gdr_t* GpuDevice::getGDRhandler()
     return &gdrc_h;
 }
 
-struct gpinned_buffer* GpuDevice::newGDRbuf(size_t size)
+[[nodiscard]] struct gpinned_buffer* GpuDevice::newGDRbuf(const std::size_t size)
 {
-    return new gpinned_buffer{&gdrc_h, size, device_is_direct_rdma_supported == 1};
+    const bool use_gdr_path =
+        (device_is_direct_rdma_supported != 0) && (gdrc_h != nullptr);
+    return new gpinned_buffer{&gdrc_h, size, use_gdr_path};
 }
 
 void GpuDevice::print_info()
 {
-    NVLOGI_FMT(TAG, "Using GPU {} {}:{}:{} {} kHz isRDMASupported:{}",deviceProp.name,deviceProp.pciBusID, deviceProp.pciDeviceID,deviceProp.pciDomainID, device_attr_clock_rate, device_is_direct_rdma_supported);
-    // Hz=int64_t(device_attr_clock_rate) * 1000;
+    NVLOGI_FMT(TAG, "Using GPU {} {}:{}:{} {} kHz isRDMASupported:{}", deviceName_, devicePciBusId_, devicePciDeviceId_, devicePciDomainId_, device_attr_clock_rate, device_is_direct_rdma_supported);
 }
 
 

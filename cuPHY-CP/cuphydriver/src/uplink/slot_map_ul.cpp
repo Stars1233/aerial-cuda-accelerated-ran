@@ -60,8 +60,6 @@ SlotMapUl::SlotMapUl(phydriver_handle _pdh, uint64_t _id) :
         aggr_slot_info[i]=nullptr;
     }
 
-    num_active_cells = 0;
-
     cleanupTimes();
     task_current_number     = 0;
     atom_active             = false;
@@ -72,10 +70,13 @@ SlotMapUl::SlotMapUl(phydriver_handle _pdh, uint64_t _id) :
     atom_ul_channel_end_threads=0;
     atom_ul_end_threads     = 0;
     atom_ulc_tasks_complete = 0;
+    numUlcTasks_            = 0;
+    slotRefTs_            = t_ns{};
     tasks_num=0;
     tasks_ts_exec={};
     tasks_ts_enq={};
     isEarlyHarqPresent=0;
+    isEarlySchCbDecodePresent=0;
     isFrontLoadedDmrsPresent=0;
     atom_ul_cplane_info_for_uplane_rdy_count.store(0);
 
@@ -104,15 +105,16 @@ int SlotMapUl::release(int num_cells, bool enable_task_run_times)
     //////////////////////////////////////////////////////////////////
     //// Only last thread releases the slot map objects
     //////////////////////////////////////////////////////////////////
+    int n_active = static_cast<int>(aggr_cell_list.size());
     int prev_cells = std::atomic_fetch_add(&(atom_num_cells), num_cells);
-    if((num_active_cells > 0) && (prev_cells + num_cells < num_active_cells))
+    if((n_active > 0) && (prev_cells + num_cells < n_active))
         return 0;
 
     bool isSrs = false;
     bool isNonSrsUl = false;
     bool ulBfwPrinted = false;
 
-    if(num_active_cells > 0)
+    if(n_active > 0)
     {
         if(enable_task_run_times)
         {
@@ -217,7 +219,6 @@ int SlotMapUl::release(int num_cells, bool enable_task_run_times)
 
         aggr_cell_list.clear();
         aggr_slot_params = nullptr;
-        num_active_cells = 0;
     }
 
     if(aggr_ulbfw != nullptr){
@@ -240,7 +241,10 @@ int SlotMapUl::release(int num_cells, bool enable_task_run_times)
     atom_ul_channel_end_threads=0;
     atom_ul_end_threads     = 0;
     atom_ulc_tasks_complete = 0;
+    numUlcTasks_            = 0;
+    slotRefTs_            = t_ns{};
     isEarlyHarqPresent=0;
+    isEarlySchCbDecodePresent=0;
     isFrontLoadedDmrsPresent=0;
     atom_ul_cplane_info_for_uplane_rdy_count.store(0);
     return 0;
@@ -262,7 +266,7 @@ int SlotMapUl::aggrSetCells(Cell* c, slot_command_api::phy_slot_params * _phy_sl
     if(c == nullptr || (ulbuf_st1 == nullptr && ulbuf_st2 == nullptr && rach_occasion == 0))
         return EINVAL;
 
-    if(num_active_cells >= UL_MAX_CELLS_PER_SLOT)
+    if(static_cast<int>(aggr_cell_list.size()) >= UL_MAX_CELLS_PER_SLOT)
         return ENOMEM;
 
     aggr_ulbuf_st1.push_back(ulbuf_st1);
@@ -280,9 +284,7 @@ int SlotMapUl::aggrSetCells(Cell* c, slot_command_api::phy_slot_params * _phy_sl
     aggr_cell_list.push_back(c);
     // slot_params* curr_slot_params
     // aggr_slot_params.push_back(curr_slot_params);
-    aggr_slot_info[num_active_cells] = _phy_slot_params->sym_prb_info.get();
-    // aggr_slot_oran_ind.push_back(si);
-    num_active_cells++;
+    aggr_slot_info[aggr_cell_list.size() - 1] = _phy_slot_params->sym_prb_info.get();
 
     return 0;
 }
@@ -316,7 +318,7 @@ int SlotMapUl::aggrSetPhy(PhyPuschAggr* pusch, PhyPucchAggr* pucch, PhyPrachAggr
 
 int SlotMapUl::getNumCells()
 {
-    return num_active_cells;
+    return static_cast<int>(aggr_cell_list.size());
 }
 
 phydriver_handle SlotMapUl::getPhyDriverHandler(void) const
@@ -441,7 +443,8 @@ int SlotMapUl::waitULCTasksComplete(int num_tasks) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGW_FMT(TAG, "waitULCTasksComplete for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGW_FMT(TAG, "waitULCTasksComplete for Map {} is taking more than {} ns (target={} current={})",
+                       getId(), (GENERIC_WAIT_THRESHOLD_NS * 2), num_tasks, atom_ulc_tasks_complete.load());
             return -1;
         }
     } while(atom_ulc_tasks_complete != num_tasks);
@@ -462,7 +465,8 @@ int SlotMapUl::waitSlotEndTask(int num_tasks) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait UL threads for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait UL threads for Map {} is taking more than {} ns (target={} current={})",
+                       getId(), (GENERIC_WAIT_THRESHOLD_NS * 2), num_tasks, atom_ul_end_threads.load());
             return -1;
         }
     } while(atom_ul_end_threads != num_tasks);

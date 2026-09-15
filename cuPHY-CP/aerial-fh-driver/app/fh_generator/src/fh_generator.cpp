@@ -44,8 +44,7 @@ FhGenerator::FhGenerator(const std::string& config_file, FhGenType type) :
     initialize_random_number_generator();
     if(fh_gen_type_ == FhGenType::DU)
     {
-        cudaFree(0);
-        CUDA_CHECK(cudaSetDevice(0));
+        ctx_guard_.emplace(0);
     }
     setup_fh_driver();
 
@@ -501,15 +500,18 @@ void FhGenerator::add_iq_data_buffers()
         else
         {
             NVLOGI_FMT(TAG, "Allocating GPU memory from CUDA device {} for IQ data buffer #{} of size {}", cuda_device_id , id , len);
-            CHECK_CUDA_THROW(cudaSetDevice(cuda_device_id));
-            CHECK_CUDA_THROW(cudaMalloc(&addr, len));
+            PrimaryCtxGuard alloc_ctx_guard(cuda_device_id);
+
+            CUdeviceptr dptr;
+            CHECK_CU_THROW(cuMemAlloc(&dptr, len));
+            addr = reinterpret_cast<void*>(dptr);
 
             NVLOGI_FMT(TAG, "Filling IQ data buffer #{} with byte value 0x{:x}", id , kGpuIqBufferMagicChar);
-            CHECK_CUDA_THROW(cudaMemset(addr, kGpuIqBufferMagicChar, len));
+            CHECK_CU_THROW(cuMemsetD8(dptr, kGpuIqBufferMagicChar, len));
 
             if(send_utc_anchor)
             {
-                CHECK_CUDA_THROW(cudaMemcpy(addr, &utc_anchor, sizeof(UtcAnchor), cudaMemcpyHostToDevice));
+                CHECK_CU_THROW(cuMemcpyHtoD(dptr, &utc_anchor, sizeof(UtcAnchor)));
             }
 
             resources_to_free_.gpu_buffers.emplace_back(addr, cuda_deallocator);
@@ -1225,7 +1227,7 @@ void FhGenerator::create_ru_workers()
 
 void cuda_deallocator(void* addr)
 {
-    CHECK_CUDA_THROW(cudaFree(addr));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(addr)));
 }
 
 void FhGenerator::initialize_random_number_generator()

@@ -1,0 +1,31 @@
+# C-Plane Test Bench - nrSim Test Patterns
+# Format: pattern_num (one per line)
+# Lines starting with # are comments and will be ignored
+#
+# NOTE: FapiTestMacSource::is_nrsim() returns true only for 90000-99999 (numeric-range
+# check). Patterns below 90000 in this list will be loaded via the non-nrSim config
+# path in cplane_test_fixture.cpp — if that is not intended, move them to
+# test_patterns_4t4r.csv instead.
+
+# Sub-90xxx patterns
+0103
+0554
+2036
+3296
+3354
+3355
+7272
+7292
+7293
+7295
+7336
+7358
+7541
+8001
+
+# nrSim (90xxx) patterns
+90041
+90043
+90060
+#90601 (need to fix in framework code)
+#90603 (need to fix in framework code)

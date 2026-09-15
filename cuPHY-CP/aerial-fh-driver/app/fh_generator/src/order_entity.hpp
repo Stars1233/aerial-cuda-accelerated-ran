@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -143,6 +143,10 @@ extern "C" {
 #endif
 void launch_kernel_write(cudaStream_t stream, uint32_t* addr, uint32_t value);
 doca_error_t kernel_receive_slot(cudaStream_t stream, orderKernelConfigParams_t* params);
+/// Resolve CUfunction handles for fh_generator CUDA kernels via cudaGetFuncBySymbol.
+/// Must be called once before any kernel launch; thread-safe via std::call_once.
+/// @return true if all kernels resolved successfully, false otherwise.
+[[nodiscard]] bool resolve_fhgen_cuda_kernels();
 #ifdef __cplusplus
 }
 #endif

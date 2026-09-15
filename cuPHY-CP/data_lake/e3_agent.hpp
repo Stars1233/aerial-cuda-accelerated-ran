@@ -140,10 +140,11 @@ enum class StreamType : __uint128_t {
     SRS_USAGE             = __uint128_t(1) << 74,
     SRS_N_VALID_PRG       = __uint128_t(1) << 75,
     SRS_PRG_SIZE          = __uint128_t(1) << 76,
-    TIMESTAMP_TAI         = __uint128_t(1) << 77
+    TIMESTAMP_TAI         = __uint128_t(1) << 77,
+    PDU_OFFSET            = __uint128_t(1) << 78
 };
 
-constexpr uint32_t STREAM_TYPE_COUNT = 78;
+constexpr uint32_t STREAM_TYPE_COUNT = 79;
 
 /** E3AP protocol version supported by this agent implementation */
 constexpr std::string_view E3AP_PROTOCOL_VERSION = "1.0.0";
@@ -204,6 +205,7 @@ constexpr StreamType streamNameToType(const std::string_view stream_name) noexce
     if (stream_name == "nr_of_symbols") return StreamType::NR_OF_SYMBOLS;
     if (stream_name == "tb_size") return StreamType::TB_SIZE;
     if (stream_name == "pdu_len") return StreamType::PDU_LEN;
+    if (stream_name == "pdu_offset") return StreamType::PDU_OFFSET;
     if (stream_name == "target_code_rate") return StreamType::TARGET_CODE_RATE;
     if (stream_name == "new_data_indicator") return StreamType::NEW_DATA_INDICATOR;
     if (stream_name == "rnti") return StreamType::RNTI;
@@ -298,6 +300,7 @@ constexpr StreamType PER_UE_STREAMS =
     StreamType::MCS_TABLE_INDEX | StreamType::RB_START | StreamType::RB_SIZE |
     StreamType::START_SYMBOL_INDEX | StreamType::NR_OF_SYMBOLS |
     StreamType::N_LAYERS | StreamType::TB_SIZE | StreamType::PDU_LEN |
+    StreamType::PDU_OFFSET |
     StreamType::TARGET_CODE_RATE | StreamType::NEW_DATA_INDICATOR |
     StreamType::LAYER_OFFSET | StreamType::UE_GRP_IDX |
     StreamType::N_SUBCARRIERS | StreamType::N_DMRS_ESTIMATES |
@@ -343,6 +346,7 @@ constexpr StreamType PUSCH_PROVIDABLE_STREAMS =
     StreamType::MCS_TABLE_INDEX | StreamType::RB_START | StreamType::RB_SIZE |
     StreamType::START_SYMBOL_INDEX | StreamType::NR_OF_SYMBOLS |
     StreamType::N_LAYERS | StreamType::TB_SIZE | StreamType::PDU_LEN |
+    StreamType::PDU_OFFSET |
     StreamType::TARGET_CODE_RATE | StreamType::NEW_DATA_INDICATOR |
     StreamType::LAYER_OFFSET | StreamType::UE_GRP_IDX |
     StreamType::N_SUBCARRIERS | StreamType::N_DMRS_ESTIMATES |

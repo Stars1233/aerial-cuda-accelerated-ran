@@ -102,18 +102,23 @@ def main(args):
 
     metric_groups = build_metric_group_order(req_dfs)
 
+    # The reference file (first, typically the absolute requirements) defines the
+    # full set of metric groups. Other files (gating/warning) may legitimately be a
+    # SUBSET - e.g. unscheduled channels like PUCCH on 101/101a are dropped from the
+    # generated gating/warning files but still listed in the absolute template.
+    # Only a file with EXTRA groups beyond the reference is an error; missing groups
+    # are tolerated and rendered as blank cells.
     ref_groups = set(build_metric_group_order([req_dfs[0]]))
     for i in range(1, len(req_dfs)):
         file_groups = set(build_metric_group_order([req_dfs[i]]))
-        if file_groups != ref_groups:
-            extra = file_groups - ref_groups
-            missing = ref_groups - file_groups
-            print(f"ERROR: Requirements file '{req_files[i]}' has different metric groups than '{req_files[0]}'")
-            if extra:
-                print(f"  Extra:   {sorted(extra)}")
-            if missing:
-                print(f"  Missing: {sorted(missing)}")
+        extra = file_groups - ref_groups
+        if extra:
+            print(f"ERROR: Requirements file '{req_files[i]}' has metric groups not present in reference '{req_files[0]}'")
+            print(f"  Extra:   {sorted(extra)}")
             return 1
+        missing = ref_groups - file_groups
+        if missing:
+            print(f"Note: Requirements file '{req_files[i]}' is missing metric groups present in '{req_files[0]}' (shown blank): {sorted(missing)}")
 
     effective_slots = build_effective_slot_groups(req_dfs[0], all_slots)
     effective_slots_lookup = {}

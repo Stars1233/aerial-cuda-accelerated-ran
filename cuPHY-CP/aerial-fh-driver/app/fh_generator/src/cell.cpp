@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,18 +31,18 @@ Cell::~Cell()
 void Cell::allocate_buffers()
 {
     next_slot_on_time_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
-    cudaMemset((uint32_t*)next_slot_on_time_rx_packets->addr(), 0, sizeof(uint32_t));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_on_time_rx_packets->addr()), 0, 1));
     next_slot_early_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
-    cudaMemset((uint32_t*)next_slot_early_rx_packets->addr(), 0, sizeof(uint32_t));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_early_rx_packets->addr()), 0, 1));
     next_slot_late_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
-    cudaMemset((uint32_t*)next_slot_late_rx_packets->addr(), 0, sizeof(uint32_t));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_late_rx_packets->addr()), 0, 1));
 
     next_slot_rx_packets_ts.reset(new dev_buf(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM * ORAN_ALL_SYMBOLS * sizeof(uint64_t), gDev));
-    cudaMemset((uint64_t*)next_slot_rx_packets_ts->addr(), 0, ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM * ORAN_ALL_SYMBOLS * sizeof(uint64_t));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_packets_ts->addr()), 0, ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM * ORAN_ALL_SYMBOLS * (sizeof(uint64_t) / sizeof(uint32_t))));
     next_slot_rx_packets_count.reset(new dev_buf(ORAN_ALL_SYMBOLS * sizeof(uint32_t), gDev));
-    cudaMemset((uint32_t*)next_slot_rx_packets_count->addr(), 0, ORAN_ALL_SYMBOLS * sizeof(uint32_t));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_packets_count->addr()), 0, ORAN_ALL_SYMBOLS));
     next_slot_num_prb.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
-    cudaMemset((uint32_t*)next_slot_num_prb->addr(), 0, sizeof(uint32_t));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_num_prb->addr()), 0, 1));
 }
 
 }

@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +35,62 @@ PucchDataOut = cuphyPucchDynPrms.cuphyPucchDataOut;
 idxSlot = carrier.idxSlotInFrame;
 if SimCtrl.genTV.enable && SimCtrl.genTV.cuPHY && ismember(idxSlot, SimCtrl.genTV.slotIdx)
     TVname = [SimCtrl.genTV.TVname, '_PUCCH_F', num2str(pucchPduList{1}.FormatType), '_gNB_CUPHY_s', num2str(carrier.idxSlotInFrame), 'p', num2str(pucchPduList{end}.pucchPduIdx)];
-    saveTV_pucch_cuphy(SimCtrl.genTV.tvDirName, TVname, cuphyCellStatPrm, cuphyPucchDynPrms, Xtf, PucchDataOut, carrier);
+
+    % Collect polar intermediate buffers in cuPHY's polar-seg order: F2 UCIs
+    % first, then F3 UCIs; within each UCI, seg1 then (when present) seg2
+    % (CSI2). Written inline into the main PUCCH TV by saveTV_pucch_cuphy
+    % and consumed by PucchRx::loadPolarRefForSkip on --skip-polar runs.
+    polarBuffers = {};
+    if isfield(PucchDataOut, 'pUciF2')
+        for fIdx = 1:length(PucchDataOut.pUciF2)
+            uci = PucchDataOut.pUciF2{fIdx};
+            if isstruct(uci) && isfield(uci, 'polarInterBuffers')
+                for s = 1:length(uci.polarInterBuffers)
+                    polarBuffers{end+1} = uci.polarInterBuffers{s};
+                end
+            end
+        end
+    end
+    if isfield(PucchDataOut, 'pUciF3')
+        for fIdx = 1:length(PucchDataOut.pUciF3)
+            uci = PucchDataOut.pUciF3{fIdx};
+            if isstruct(uci) && isfield(uci, 'polarInterBuffers')
+                for s = 1:length(uci.polarInterBuffers)
+                    polarBuffers{end+1} = uci.polarInterBuffers{s};
+                end
+            end
+        end
+    end
+
+    % Collect raw per-UCI front-end LLR refs in cuPHY allocation order:
+    % all F2 (0..nF2-1), then all F3 (0..nF3-1). For F2 this is descrmLLR
+    % (length E_seg1, no seg2). For F3 this is post-demux descrmLLRSeq1
+    % (length E_seg1). PucchRx::compareFrontEndRefForBackendSkip applies
+    % the cuPHY-only front-end noise-bias scale when comparing against GPU
+    % m_F{2,3}seg1LLRaddrsVec.
+    frontEndBuffers = struct('f2', {{}}, 'f3', {{}});
+    if isfield(PucchDataOut, 'pUciF2')
+        for fIdx = 1:length(PucchDataOut.pUciF2)
+            uci = PucchDataOut.pUciF2{fIdx};
+            if isstruct(uci) && isfield(uci, 'descrmLLR')
+                frontEndBuffers.f2{end+1} = reshape(uci.descrmLLR, 1, []);
+            else
+                frontEndBuffers.f2{end+1} = [];
+            end
+        end
+    end
+    if isfield(PucchDataOut, 'pUciF3')
+        for fIdx = 1:length(PucchDataOut.pUciF3)
+            uci = PucchDataOut.pUciF3{fIdx};
+            if isstruct(uci) && isfield(uci, 'descrmLLRSeq1')
+                frontEndBuffers.f3{end+1} = reshape(uci.descrmLLRSeq1, 1, []);
+            else
+                frontEndBuffers.f3{end+1} = [];
+            end
+        end
+    end
+
+    saveTV_pucch_cuphy(SimCtrl.genTV.tvDirName, TVname, cuphyCellStatPrm, cuphyPucchDynPrms, Xtf, PucchDataOut, carrier, polarBuffers, frontEndBuffers);
 %     saveTV_pusch_cuphy(SimCtrl.genTV.tvDirName, TVname, UegList, pusch_payload_list, PuschParamsList, ...
 %         Xtf, carrier, rxDataList, puschTable);
 
@@ -670,12 +725,18 @@ end
 
 end
 
-function saveTV_pucch_cuphy(tvDirName, TVname, cellStatPrm, cuphyPucchDynPrms, Xtf, PucchDataOut, carrier)
+function saveTV_pucch_cuphy(tvDirName, TVname, cellStatPrm, cuphyPucchDynPrms, Xtf, PucchDataOut, carrier, polarBuffers, frontEndBuffers)
+    if nargin < 8
+        polarBuffers = {};
+    end
+    if nargin < 9
+        frontEndBuffers = struct('f2', {{}}, 'f3', {{}});
+    end
 
     global SimCtrl;
-    
+
     %%create h5 file
-    [status,msg] = mkdir(tvDirName); 
+    [status,msg] = mkdir(tvDirName);
     h5File       = H5F.create([tvDirName filesep TVname '.h5'], 'H5F_ACC_TRUNC', 'H5P_DEFAULT', 'H5P_DEFAULT');
     
     global SimCtrl
@@ -1314,5 +1375,112 @@ function saveTV_pucch_cuphy(tvDirName, TVname, cellStatPrm, cuphyPucchDynPrms, X
     end
     if SimCtrl.genTV.enable_logging_carrier_and_channel_info
         saveCarrierChanPars(h5File, SimCtrl, carrier);
+    end
+
+    % --- Inline polar-decoder reference outputs (consumed by
+    % PucchRx::loadPolarRefForSkip when running with --skip-polar).
+    % Schema matches the standalone polar TV (sizes / polarUciSegPrms /
+    % cbEst{N} / crcErrorFlags) so existing UciPolarDataset code reads
+    % these unchanged. Dataset names don't collide with any other field
+    % currently written to the main PUCCH TV.
+    nPolUciSegs = length(polarBuffers);
+    if nPolUciSegs > 0
+        polarUciSegPrms = [];
+        nCbs            = 0;
+        crcErrorFlags   = [];
+        for segIdx = 0 : (nPolUciSegs - 1)
+            prms = polarBuffers{segIdx + 1}.polarUciSegPrms;
+            polarUciSegPrms(segIdx + 1).nCbs           = uint8(prms.nCbs);
+            polarUciSegPrms(segIdx + 1).K_cw           = uint16(prms.K_cw);
+            polarUciSegPrms(segIdx + 1).E_cw           = uint32(prms.E_cw);
+            polarUciSegPrms(segIdx + 1).zeroInsertFlag = uint8(prms.zeroInsertFlag);
+            polarUciSegPrms(segIdx + 1).n_cw           = uint8(prms.n_cw);
+            polarUciSegPrms(segIdx + 1).N_cw           = uint16(prms.N_cw);
+            polarUciSegPrms(segIdx + 1).E_seg          = uint32(prms.E_seg);
+            polarUciSegPrms(segIdx + 1).nCrcBits       = uint8(prms.nCrcBits);
+        end
+        hdf5_write_nv_exp(h5File, 'polarUciSegPrms', polarUciSegPrms);
+
+        for segIdx = 0 : (nPolUciSegs - 1)
+            prms = polarUciSegPrms(segIdx + 1);
+            for i = 1 : prms.nCbs
+                cbEst_bits  = polarBuffers{segIdx + 1}.cbEsts(:, i);
+                nBitsCb     = length(cbEst_bits);
+                nWordsCb    = ceil(nBitsCb / 32);
+                cbEst_words = zeros(nWordsCb, 1);
+                for w = 0 : (nWordsCb - 1)
+                    for j = 0 : 31
+                        b = w*32 + j;
+                        if b >= nBitsCb
+                            break;
+                        end
+                        cbEst_words(w + 1) = cbEst_words(w + 1) + cbEst_bits(b + 1) * 2^j;
+                    end
+                end
+                hdf5_write_nv(h5File, ['cbEst', num2str(nCbs)], uint32(cbEst_words));
+                crcErrorFlags = [crcErrorFlags; polarBuffers{segIdx + 1}.cbCrcErrorFlags(i)];
+                nCbs          = nCbs + 1;
+            end
+        end
+        hdf5_write_nv(h5File, 'crcErrorFlags', uint8(crcErrorFlags));
+
+        sizes = [];
+        sizes.nPolCws     = uint16(nCbs);
+        sizes.nPolUciSegs = uint16(nPolUciSegs);
+        hdf5_write_nv_exp(h5File, 'sizes', sizes);
+    end
+
+    % --- Per-UCI front-end LLR references (consumed by
+    % PucchRx::compareFrontEndRefForBackendSkip in PUCCH_PIPELINE_SKIP_BACKEND runs).
+    % Schema: frontEndSizes{nF2Ucis, nF3Ucis} + f{2,3}FrontEndLLRs{N}
+    % (CUPHY_R_16F, length E_seg1, raw MATLAB LLRs written via fp16nv).
+    nF2FE = 0;
+    nF3FE = 0;
+    if isstruct(frontEndBuffers)
+        if isfield(frontEndBuffers, 'f2')
+            nF2FE = length(frontEndBuffers.f2);
+        end
+        if isfield(frontEndBuffers, 'f3')
+            nF3FE = length(frontEndBuffers.f3);
+        end
+    end
+    % Sanity: the aggregator above appends one cell per F2/F3 UCI in
+    % PucchDataOut. If a UCI is missing descrmLLR / descrmLLRSeq1 it
+    % appends []. Reject those cases now rather than silently writing
+    % malformed refs that fail later in compareFrontEndRefForBackendSkip.
+    nF2Ucis = 0;
+    if isfield(PucchDataOut, 'pUciF2')
+        nF2Ucis = length(PucchDataOut.pUciF2);
+    end
+    nF3Ucis = 0;
+    if isfield(PucchDataOut, 'pUciF3')
+        nF3Ucis = length(PucchDataOut.pUciF3);
+    end
+    if (nF2FE ~= nF2Ucis) || (nF3FE ~= nF3Ucis)
+        error(['saveTV_pucch_cuphy: front-end ref count mismatch: expected ', ...
+               num2str(nF2Ucis), ' F2 + ', num2str(nF3Ucis), ' F3, got ', ...
+               num2str(nF2FE), ' + ', num2str(nF3FE), '.']);
+    end
+
+    frontEndSizes = [];
+    frontEndSizes.nF2Ucis = uint16(nF2FE);
+    frontEndSizes.nF3Ucis = uint16(nF3FE);
+    hdf5_write_nv_exp(h5File, 'frontEndSizes', frontEndSizes);
+
+    for uciIdx = 0 : (nF2FE - 1)
+        llrs = frontEndBuffers.f2{uciIdx + 1};
+        llrs = llrs(:);
+        if isempty(llrs)
+            error(['saveTV_pucch_cuphy: missing F2 front-end LLR ref for UCI ', num2str(uciIdx), '.']);
+        end
+        hdf5_write_nv_exp(h5File, ['f2FrontEndLLRs', num2str(uciIdx)], fp16nv(llrs, SimCtrl.fp16AlgoSel));
+    end
+    for uciIdx = 0 : (nF3FE - 1)
+        llrs = frontEndBuffers.f3{uciIdx + 1};
+        llrs = llrs(:);
+        if isempty(llrs)
+            error(['saveTV_pucch_cuphy: missing F3 front-end LLR ref for UCI ', num2str(uciIdx), '.']);
+        end
+        hdf5_write_nv_exp(h5File, ['f3FrontEndLLRs', num2str(uciIdx)], fp16nv(llrs, SimCtrl.fp16AlgoSel));
     end
 end

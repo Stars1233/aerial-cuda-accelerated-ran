@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 13) // "DRV.PBCH"
 #include "phypbch_aggr.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -139,7 +140,7 @@ int PhyPbchAggr::setup(const std::vector<DLOutputBuffer *>& aggr_dlbuf, const st
     setCtx();
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup, s_channel));
     }
 
     slot_command_api::pbch_group_params* group_params = getDynParams();
@@ -194,14 +195,14 @@ int PhyPbchAggr::setup(const std::vector<DLOutputBuffer *>& aggr_dlbuf, const st
         NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "SFN {}, slot {}: Error in cuphySetupSsbTx(): {}. Will not call cuphyRunSsbTx(). May be L2 misconfiguration.", sfn, slot, cuphyGetErrorString(status));
         {
             MemtraceDisableScope md;
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+            CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
         }
         return -1;
     }
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
     }
     return 0;
 }
@@ -212,7 +213,7 @@ int PhyPbchAggr::run()
     int ret=0;
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run, s_channel));
     }
     if((getSetupStatus() == CH_SETUP_DONE_NO_ERROR))
     {
@@ -225,7 +226,7 @@ int PhyPbchAggr::run()
     }
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, s_channel));
     }
     return ret;
 }

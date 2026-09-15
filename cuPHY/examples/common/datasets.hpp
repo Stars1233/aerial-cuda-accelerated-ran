@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -83,9 +83,11 @@ public:
 
     // input tensor parameters:
     std::vector<cuphyTensorPrm_t> tPrmDataRxVec;
+    std::vector<cuphyTensorPrm_t> tPrmXVec;
+    std::vector<cuphyTensorPrm_t> tPrmReeInvVec;
 
     DynApiDataset();
-    DynApiDataset(const std::vector<std::string>& inputFileNameVec, cudaStream_t cuStrm, uint64_t procModeBmsk = 0, bool cpuCopyOn = false, uint32_t fp16Mode = 1, int apiTVflag = 0, int drmDebug = false); // construct dataset from h5 file
+    DynApiDataset(const std::vector<std::string>& inputFileNameVec, cudaStream_t cuStrm, uint64_t procModeBmsk = 0, bool cpuCopyOn = false, uint32_t fp16Mode = 1, int apiTVflag = 0, int drmDebug = false, uint8_t openRanFunctionalSplitMode = PUSCH_7_2_A); // construct dataset from h5 file
     DynApiDataset(const DynApiDataset& dynApiDataset);
     ~DynApiDataset();
     DynApiDataset&        operator=(DynApiDataset&& dynApiDataset);
@@ -105,7 +107,7 @@ public:
 
     // buffers containing dynamic data
 private:
-    std::vector<cuphy::tensor_device>                               tDataRxVec;
+    std::vector<cuphy::tensor_device>                               tDataRxVec, tXVec, tReeInvVec;
     cuphy::buffer<uint32_t, cuphy::pinned_alloc>                    bCbCrcs;
     cuphy::buffer<uint32_t, cuphy::pinned_alloc>                    bTbCrcs;
     cuphy::buffer<uint8_t, cuphy::pinned_alloc>                     bTbPayloads, bHarqDetectionStatus, bCsiP1DetectionStatus, bCsiP2DetectionStatus, bEvalHarqDetectionStatus;
@@ -145,7 +147,7 @@ public:
     StaticApiDataset();
     StaticApiDataset(const std::vector<std::string>& inputFileNameVec, cudaStream_t cuStrm, std::string outFileName = std::string(), int descramblingOn = 1,
                      int apiTVflag = 0, bool enableLdpcThroughputMode = false, const maxPUSCHPrms* puschPrms = nullptr,
-                     cuphyPuschLdpcKernelLaunch_t ldpcLaunchMode = PUSCH_RX_LDPC_STREAM_POOL); // construct dataset from h5 file
+                     cuphyPuschLdpcKernelLaunch_t ldpcLaunchMode = PUSCH_RX_LDPC_STREAM_POOL, uint8_t openRanFunctionalSplitMode = PUSCH_7_2_A, uint8_t kernelSelMode = PUSCH_ALL, uint8_t uciKernelSelMode = PUSCH_UCI_ALL, uint32_t delayUs = 0, uint32_t subSlotDelayUs = 0); // construct dataset from h5 file
     StaticApiDataset(const StaticApiDataset& staticApiDataset);
     void              ResetPointers();
     StaticApiDataset& operator=(StaticApiDataset&& staticApiDatatset);
@@ -161,6 +163,7 @@ private:
     cuphy::event         subSlotCompletedEvent;
     cuphy::event         waitCompletedSubSlotEvent;
     cuphy::event         waitCompletedFullSlotEvent;
+    cuphy::event         uciOnPuschCompletedEvent;
 
     cuphy::tensor_device corr_half_nZpDmrsScTable[MAX_N_PRBS_SUPPORTED];
     cuphy::tensor_device eigVecCobTable[MAX_N_PRBS_SUPPORTED];
@@ -292,7 +295,7 @@ struct EvalDataset
     double   evalRsrpDiff(tensor_pinned_R_32F& tRsrpRef, cuphy::tensor_pinned& tRsrpRes, cudaStream_t cuStrm, bool verbose = false);
     double   evalSinr(tensor_pinned_R_32F& tSinrRef, cuphy::tensor_pinned& tSinrRes, cudaStream_t cuStrm, bool verbose = false);
     double   evalNoiseIntfVar(tensor_pinned_R_32F& tNoiseIntfRef, cuphy::tensor_pinned& tNoiseIntfRes, cudaStream_t cuStrm, bool verbose = false);
-    void     computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool evalEarlyHarqFlag);
+    void     computeNumUciCbErrors(DynApiDataset const& dynApiDataset, bool evalEarlyHarqFlag, uint8_t openRanFunctionalSplitOption = PUSCH_7_2_A);
     uint32_t computeNumCbErrors(DynApiDataset const& dynApiDataset);
     void     evalPuschCrc(uint32_t* pTbCrc, uint32_t* pCbCrc, uint8_t* pTbPayload, cudaStream_t cuStrm);
     void     evalUciRmSizes(PerTbParams* pTbPrmsCuphy, PerTbParams* pTbPrmsRef, cuphyPuschUePrm_t* pUePuschPrms, uint16_t nUes);
@@ -328,10 +331,20 @@ public:
 
     //pucchDynApiDataset();
     pucchDynApiDataset(const std::vector<std::string>& inputFileNameVec, cudaStream_t cuStrm, uint64_t procModeBmsk = 0);  // construct dataset from h5 file
+    [[nodiscard]] const cuphyPucchPostPolarData_t* enablePostPolarData(const char* h5path, cudaStream_t cuStrm);
+    void enableFrontEndLlrOutput(const char* h5path, cudaStream_t cuStrm);
 
     // buffers containing dynamic data
 private:
     std::vector<cuphy::tensor_device>                              tDataRxVec;
+    std::vector<cuphy::tensor_pinned>                              tPostPolarCbEstVec;
+    cuphy::tensor_pinned                                           tPostPolarCrcErrorFlags;
+    std::vector<cuphyTensorPrm_t>                                  tPrmPostPolarCbEstVec;
+    cuphyPucchPostPolarData_t                                      postPolarData;
+    std::vector<cuphy::tensor_device>                              tF2FrontEndLLRVec;
+    std::vector<cuphy::tensor_device>                              tF3FrontEndLLRVec;
+    std::vector<cuphyTensorPrm_t>                                  tPrmF2FrontEndLLRVec;
+    std::vector<cuphyTensorPrm_t>                                  tPrmF3FrontEndLLRVec;
     cuphy::buffer<cuphyPucchF0F1UciOut_t, cuphy::pinned_alloc>     bF0UciOut;
     cuphy::buffer<cuphyPucchF0F1UciOut_t, cuphy::pinned_alloc>     bF1UciOut;
     cuphy::buffer<cuphyPucchF234OutOffsets_t, cuphy::pinned_alloc> bF2OutOffsets;
@@ -366,6 +379,9 @@ public:
     cuphyPucchDbgPrms_t             dbgPrm;
     std::vector<cuphyCellStatPrm_t> cellStatPrm;
     cuphyPucchCellStatPrm_t         pucchCellStatPrm;
+    // Owning storage for the input TV path. Mode-specific example checks parse
+    // this file in the dataset layer, not inside the PUCCH API.
+    std::string                     refH5Path;
 
     pucchStaticApiDataset(const std::vector<std::string>& inputFileNameVec, cudaStream_t cuStrm, std::string outFileName = std::string());  // construct dataset from h5 file
 
@@ -373,6 +389,12 @@ private:
     // buffers containing static data
     std::string bOutputFileName;
 };
+
+// Non-public PUCCH test/example helper for SKIP_BACKEND front-end reference checking.
+[[nodiscard]] cuphyStatus_t comparePucchFrontEndRefForBackendSkip(const cuphyPucchDataOut_t* pDataOut,
+                                                                  const char*                h5path,
+                                                                  float                      tolHalf,
+                                                                  cudaStream_t               cuStream);
 
 //-------------------------------------------------------------------------------
 // EvalPucchDataset
@@ -421,7 +443,9 @@ struct EvalPucchDataset
     uint16_t                            nF3Ucis;
     std::vector<pucchF234bufferOffsets> pucchF3bufferOffsetsVec;
 
-    std::vector<bool>                   pucchF1multiplexed;
+    float taWrapSpanUs{}; //!< Unambiguous PF1 TA span in microseconds (1e6/scs), used for wrap-aware TA comparison; set from cell numerology (mu) at construction.
+    
+    std::vector<bool> pucchF1multiplexed; //!< Per-PF1-UCI flag for PRB/symbol sharing (cyclic shift + tOCC); TA checks use relaxed tolerance under multiplexing interference.
 
     // Buffers holding format 2,3,4 data
     std::vector<cuphy::typed_tensor<CUPHY_R_8U, cuphy::pinned_alloc>>  tRefHarqDetStat;
@@ -677,6 +701,15 @@ private:
 // pdschDynApiDataset
 // Contains dynamic api parameters and data for a single PdschTxPipeline
 
+struct postFecLdpcOutputHelper_t
+{
+    uint32_t LDPC_dst_offset;
+    bool     test_model;
+    uint32_t num_CBs;
+    uint32_t N;
+    uint32_t tbSize;
+};
+
 struct pdschDynApiDataset
 {
 public:
@@ -692,6 +725,7 @@ public:
     cuphyPdschCellGrpDynPrm_t           cell_grp_dyn_params;
     cuphyPdschDynPrms_t                 pdsch_dyn_params;
 
+    std::vector<cuphyPdschPostFecDataIn_t>  post_fec_data_in;
     std::vector<cuphyPdschDataIn_t>  data_in;
     std::vector<cuphyPdschDataIn_t>  tb_crc_in;
     std::vector<cuphyPdschDataOut_t> output_data;
@@ -699,9 +733,11 @@ public:
     std::vector<cuphyTensorPrm_t>    output_tensorPrm;
 
     pdschDynApiDataset();
-    pdschDynApiDataset(const std::string& inputFileName, uint32_t max_cells, cudaStream_t cuStrm, cuphyPdschProcMode_t pdsch_proc_mode, cuphyPdschStatPrms_t& stat_params);
-    pdschDynApiDataset(const pdschDynApiDataset& pdschdynApiDataset);
-    pdschDynApiDataset& operator=(pdschDynApiDataset&& pdschdynApiDataset);
+    pdschDynApiDataset(const std::string& inputFileName, uint32_t max_cells, cudaStream_t cuStrm, cuphyPdschProcMode_t pdsch_proc_mode, cuphyPdschStatPrms_t& stat_params, bool cfg_pdsch_TB_input_on_GPU=false, int cfg_forced_TB_byte_alignment=1, int cell_grp_Emax=PDSCH_MAX_ER_PER_CB_BITS /* computed in PDSCH static dataset, only relevant in POST_FEC_RM_SCRAMBLING_PROCESSING mode*/);
+    pdschDynApiDataset(const pdschDynApiDataset&) = delete; // deep copy for GPU memory buffers not implemented
+    pdschDynApiDataset& operator=(const pdschDynApiDataset&) = delete;
+    pdschDynApiDataset(pdschDynApiDataset&& other) noexcept;
+    pdschDynApiDataset& operator=(pdschDynApiDataset&& other) noexcept;
     void                ResetPointers();
     void                cumulativeUpdate(const std::string& inputFileName, cudaStream_t cuStrm, cuphyPdschProcMode_t pdsch_proc_mode);
     void                print();
@@ -711,12 +747,34 @@ public:
 private:
     uint32_t                                 max_cells;
     uint32_t                                 max_UEs_per_cell_group;
+    uint32_t                                 max_CBs_per_TB; // across all TBs in cell group
     cuphy::unique_device_ptr<__half2>        large_buffer; // Allocated during constructor and covers max_cells max. configured PDSCH output tensors
     std::vector<cuphy::tensor_device>        data_tx_tensor;
     std::unique_ptr<uint8_t*[]>              crc_input_data_ptr;
+    std::unique_ptr<uint8_t*[]>              tb_crc_data_in_ptr;
+    bool                                     pdsch_TB_input_on_GPU;
+    int                                      forced_TB_byte_alignment;
+    bool                                     read_TB_CRC;
 
-    std::vector<cuphy::typed_tensor<CUPHY_R_8U, cuphy::pinned_alloc>> crc_input_data;
+    std::vector<cuphy::typed_tensor<CUPHY_R_8U, cuphy::pinned_alloc>> crc_input_data_pinned;
+    std::vector<cuphy::unique_pinned_ptr<uint8_t>> padded_crc_input_data_pinned;
+    std::vector<cuphy::typed_tensor<CUPHY_R_8U, cuphy::device_alloc>> crc_input_data_device;
+    std::vector<cuphy::unique_device_ptr<uint8_t>> padded_crc_input_data_device;
+    std::vector<cuphy::typed_tensor<CUPHY_R_32U, cuphy::pinned_alloc>> tb_crc_input_data;
     uint32_t                                                          large_buffer_elements, large_buffer_bytes;
+
+    // RAII ownership of nested new[] allocations made by read_ue_groups_pars_from_file() / read_ue_pars_from_file() in cuphy_hdf5.hpp
+    std::vector<std::unique_ptr<uint8_t[]>>               rb_bitmaps;
+    std::vector<std::unique_ptr<uint16_t[]>>              ue_prm_idxs;
+    std::vector<std::unique_ptr<cuphyPdschDmrsPrm_t[]>>   dmrs_prms;
+    std::vector<std::unique_ptr<uint16_t[]>>              cw_idxs;
+
+    cuphy::unique_device_ptr<uint32_t> d_ldpc_workspace;
+    cuphyPdschPipelineMode_t pipeline_processing_mode{cuphyPdschPipelineMode_t::PDSCH_FULL_PROCESSING};
+    std::vector<postFecLdpcOutputHelper_t> post_fec_input_helper;
+
+    cuphy::unique_device_ptr<uint32_t> d_rm_scrambling_workspace;
+    int cell_grp_Emax; // computed in PDSCH static dataset
 };
 
 //-------------------------------------------------------------------------------
@@ -733,17 +791,22 @@ public:
     std::vector<cuphyCellStatPrm_t>  cellStatPrm;
 
     pdschStaticApiDataset();
-    pdschStaticApiDataset(const std::string& inputFileName, std::string outputFileName, bool ref_check, bool identical_ldpc_configs, int stream_priority, uint32_t max_CBs_per_TB = 0, uint32_t max_UEs_per_cell_group = 0, uint32_t max_PRBs = 0); // construct dataset from h5 file
-    pdschStaticApiDataset(const pdschStaticApiDataset& pdschstaticApiDataset);
+    pdschStaticApiDataset(const std::string& inputFileName, std::string outputFileName, bool ref_check, bool identical_ldpc_configs, int stream_priority, uint32_t max_cells, uint32_t max_CBs_per_TB = 0, uint32_t max_UEs_per_cell_group = 0, uint32_t max_PRBs = 0, bool use_batched_memcpy=false, cuphyPdschPipelineMode_t pipeline_processing_mode=cuphyPdschPipelineMode_t::PDSCH_FULL_PROCESSING, bool read_TB_CRC=false, uint32_t delay_usec=0); // construct dataset from h5 file
+    pdschStaticApiDataset(const pdschStaticApiDataset& other);
     void                   ResetPointers();
-    pdschStaticApiDataset& operator=(pdschStaticApiDataset&& pdschstaticApiDataset);
+    pdschStaticApiDataset& operator=(pdschStaticApiDataset&& other) noexcept;
+    pdschStaticApiDataset(pdschStaticApiDataset&& other) noexcept;
+    pdschStaticApiDataset& operator=(const pdschStaticApiDataset&) = delete;
 
     void cumulativeUpdate(const std::string& inputFileName, std::string outputFileName, bool ref_check, bool identical_ldpc_configs);
     void print();
 
+    [[nodiscard]] int getEmax() const;
+
 private:
     std::vector<std::string> CfgFileName;
     bool                     compute_max_values;
+    int                      cell_grp_Emax;
 };
 
 //-------------------------------------------------------------------------------
@@ -788,6 +851,8 @@ private:
     std::vector<cuphy::tensor_device> data_tx_tensor;
     uint32_t large_buffer_elements, large_buffer_bytes;
     std::vector<cuphy::typed_tensor<CUPHY_R_8U, cuphy::pinned_alloc>>  input_data;
+    std::vector<cuphy::typed_tensor<CUPHY_R_8U, cuphy::pinned_alloc>>  x_input_data;
+    std::vector<cuphy::typed_tensor<CUPHY_R_32U, cuphy::pinned_alloc>>  c_input_data;
     std::vector<std::string> CfgFileName;
 };
 

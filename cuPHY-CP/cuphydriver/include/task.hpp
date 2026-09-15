@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 
 #include <queue>
 #include <chrono>
+#include <span>
 #include "locks.hpp"
 #include "time.hpp"
 #include "memfoot.hpp"
@@ -476,7 +477,15 @@ public:
      * @return 0 on success
      */
     int              push(Task* t);
-    
+
+    /**
+     * @brief Pushes multiple pre-allocated tasks under a single lock acquisition.
+     *
+     * @param[in] tasks Non-owning view of Task pointers to push.
+     * @return Number of tasks successfully pushed; must be checked for partial failures.
+     */
+    [[nodiscard]] int push_bulk(std::span<Task* const> tasks);
+
     /**
      * @brief Gets the next ready task for a worker.
      * 

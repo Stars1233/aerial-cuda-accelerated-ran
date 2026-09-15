@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 14) // "DRV.PDCCH_DL"
 
 #include "phypdcch_aggr.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -58,6 +59,8 @@ PhyPdcchAggr::PhyPdcchAggr(
 
     std::memset(&static_params, 0, sizeof(cuphyPdcchStatPrms_t));
     static_params.pOutInfo = &cuphy_tracker;
+    static_params.kernelSelOption = PDCCH_ALL;
+    static_params.delayUs = 0;
 
     handle = nullptr;
 };
@@ -222,7 +225,7 @@ int PhyPdcchAggr::setup(const std::vector<Cell *> &aggr_cell_list, const std::ve
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup, s_channel));
     }
 
     status = cuphySetupPdcchTx(handle, &dyn_params);
@@ -230,13 +233,13 @@ int PhyPdcchAggr::setup(const std::vector<Cell *> &aggr_cell_list, const std::ve
         const int sfn  = aggr_slot_params->si->sfn_;
         const int slot = aggr_slot_params->si->slot_;
         NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "SFN {}, slot {}: Error in cuphySetupPdcchTx(): {}. Will not call cuphyRunPdcchTx(). May be L2 misconfiguration.", sfn, slot, cuphyGetErrorString(status));
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
         return -1;
     }
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
     }
 
     return 0;
@@ -252,7 +255,7 @@ int PhyPdcchAggr::run()
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run, s_channel));
     }
     if ((getSetupStatus() == CH_SETUP_DONE_NO_ERROR)) {
         status = cuphyRunPdcchTx(handle, 0);
@@ -263,7 +266,7 @@ int PhyPdcchAggr::run()
     }
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, s_channel));
     }
 
     NVLOGD_FMT(TAG, "{} run finished", channel_name.c_str());

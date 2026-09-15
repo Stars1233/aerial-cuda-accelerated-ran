@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+---
+# Unit test configuration for test_testmac_core.
+#
+# patterns:  list of launch patterns to run.  Set enabled: false to skip one
+#            without removing it from the file.
+#
+# disabled_tests: list of test-case names to skip globally (all patterns).
+#   Example:
+#     disabled_tests:
+#       - PrebuildIsIdempotent
+
+patterns:
+  - name: F08_1C_60
+    file: launch_pattern_F08_1C_60.yaml
+    cell_mask: 0
+    channel_mask: 0x7FF   # (1 << CHANNEL_MAX) - 1  =  all 11 channels
+    enabled: 1
+
+  - name: F08_20C_60
+    file: launch_pattern_F08_20C_60.yaml
+    cell_mask: 0
+    channel_mask: 0x7FF
+    enabled: 1
+
+  - name: F08_3C_66c
+    file: launch_pattern_F08_3C_66c.yaml
+    cell_mask: 0
+    channel_mask: 0x7FF
+    enabled: 1
+
+  - name: F08_1C_60_PBCH
+    file: launch_pattern_F08_1C_60.yaml
+    cell_mask: 1
+    channel_mask: 0x10    # 1 << channel_type_t::PBCH
+    enabled: 1
+
+  - name: F08_3C_66c_PBCH
+    file: launch_pattern_F08_3C_66c.yaml
+    cell_mask: 0       # 0 = all cells in this launch pattern
+    channel_mask: 0x10    # 1 << channel_type_t::PBCH
+    enabled: 1
+
+  - name: F08_1C_60_PDCCH_UL
+    file: launch_pattern_F08_1C_60.yaml
+    cell_mask: 1
+    channel_mask: 0x04    # 1 << channel_type_t::PDCCH_UL
+    enabled: 1
+
+  - name: F08_3C_66c_PDCCH_UL
+    file: launch_pattern_F08_3C_66c.yaml
+    cell_mask: 0       # 0 = all cells in this launch pattern
+    channel_mask: 0x04    # 1 << channel_type_t::PDCCH_UL
+    enabled: 1
+
+  - name: F08_1C_60_PUCCH
+    file: launch_pattern_F08_1C_60.yaml
+    cell_mask: 1
+    channel_mask: 0x20    # 1 << channel_type_t::PUCCH
+    enabled: 1
+
+  - name: F08_3C_66c_PUCCH
+    file: launch_pattern_F08_3C_66c.yaml
+    cell_mask: 0       # 0 = all cells in this launch pattern
+    channel_mask: 0x20    # 1 << channel_type_t::PUCCH
+    enabled: 1
+
+  # Additional patterns — disabled by default; flip enabled: true to activate.
+  - name: F08_8C_60
+    file: launch_pattern_F08_8C_60.yaml
+    cell_mask: 0
+    channel_mask: 0x7FF
+    enabled: 0
+
+disabled_tests: []

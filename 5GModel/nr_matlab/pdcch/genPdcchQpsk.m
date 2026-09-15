@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 % See the License for the specific language governing permissions and
 % limitations under the License.
 
-function x_qpsk = genPdcchQpsk(payload, Npayload, rntiBits, rntiCrc, dmrsId, aggrL, testModel)
+function [x_qpsk,x_rm_bytes, c_scram_int] = genPdcchQpsk(payload, Npayload, rntiBits, rntiCrc, dmrsId, aggrL, testModel)
 
 A = Npayload;                 % control channel payload size (bits)
 
@@ -43,9 +43,21 @@ else
     % step 3:
     x_rm = polar_rate_match(x_encoded,N,K,E);
 end
-
+% Pad x_rm to a multiple of 8 bits so bit2int can pack full bytes
+rem8 = mod(length(x_rm), 8);
+x_rm_temp = x_rm;
+if rem8 ~= 0
+    x_rm_temp = [x_rm; zeros(8 - rem8, 1)];
+end
+x_rm_bytes = bit2int(x_rm_temp, 8, false);
 % step 4:
-x_scram = pdcch_scrambling(x_rm,E,rntiBits,dmrsId);
+[x_scram, c_scram] = pdcch_scrambling(x_rm,E,rntiBits,dmrsId);
+rem32 = mod(length(c_scram), 32);
+c_scram_temp = c_scram;
+if rem32 ~= 0
+    c_scram_temp = [c_scram; zeros(32 - rem32, 1)];
+end
+c_scram_int = bit2int(c_scram_temp, 32, true);
 
 % step 5:
 x_qpsk = qpsk_modulate(x_scram,E);

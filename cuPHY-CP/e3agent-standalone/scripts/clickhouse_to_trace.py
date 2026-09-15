@@ -19,11 +19,11 @@
 
 Emits the self-describing binary trace consumed by e3agent-standalone replay
 mode (see include/replay_format.hpp, the byte-layout source of truth). One record
-per E3 indication, ordered by TsTaiNs with PUSCH before SRS on ties. Any blob may
-be absent => len 0 (zero-filled on replay); when hest is absent the per-UE
-h_offset/h_size are zeroed so consumers read no estimate. Blobs are the raw row
-bytes: hest float32, fh/iq/srs_hest int16, srs rb_snr float32; little-endian,
-same-arch as the replay host.
+per (E3 indication, cell), ordered by TsTaiNs with PUSCH before SRS on ties and a
+slot's cells consecutive; replay regroups cells sharing a TsTaiNs into one
+multi-cell indication. Any blob may be absent => len 0 (zero-filled on replay).
+Blobs are the raw row bytes: hest float32, fh/iq/srs_hest int16, srs rb_snr
+float32; little-endian, same-arch as the replay host.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ import argparse
 import re
 import struct
 import sys
+import time
+from collections import defaultdict
 from collections.abc import Iterator
 from typing import Any, BinaryIO
 
@@ -70,7 +72,7 @@ def to_bytes(arr: object, dtype: Any) -> bytes:
 
 
 class BlobStream:
-    """Server-side streamed (tai_ns, blob) rows ordered by TsTaiNs."""
+    """Server-side streamed (tai, CellId, blob) rows ordered by (TsTaiNs, CellId)."""
 
     def __init__(self, client: Any, sql: str, dtype: Any) -> None:
         self.dtype = dtype
@@ -83,32 +85,32 @@ class BlobStream:
             for block in stream:
                 yield from block
 
-    def fetch(self, tai: int) -> bytes | None:
-        """Row bytes for exactly tai, advancing past anything older; else None."""
-        while self._cur is not None and self._cur[0] < tai:
+    def fetch(self, tai: int, cell: int) -> bytes | None:
+        """Row bytes for exactly (tai, cell), advancing past anything older; else None."""
+        while self._cur is not None and (self._cur[0], self._cur[1]) < (tai, cell):
             self._cur = next(self._gen, None)
-        if self._cur is not None and self._cur[0] == tai:
-            b = to_bytes(self._cur[1], self.dtype)
+        if self._cur is not None and self._cur[0] == tai and self._cur[1] == cell:
+            b = to_bytes(self._cur[2], self.dtype)
             self._cur = next(self._gen, None)
             return b
         return None
 
 
 class GroupedBlobStream:
-    """Per-UE streamed (tai, rnti, blob) rows ordered by (tai, rnti); fetch(tai)
-    returns {rnti: bytes} for the slot (srs_hest has N rows per slot)."""
+    """Per-UE streamed (tai, CellId, rnti, blob) rows ordered by (tai, CellId, rnti);
+    fetch(tai, cell) returns {rnti: bytes} for that cell (srs_hest has N rows per cell)."""
 
     def __init__(self, client: Any, sql: str, dtype: Any) -> None:
         self.dtype = dtype
         self._gen = BlobStream._rows(client, sql)
         self._cur = next(self._gen, None)
 
-    def fetch(self, tai: int) -> dict:
-        while self._cur is not None and self._cur[0] < tai:
+    def fetch(self, tai: int, cell: int) -> dict:
+        while self._cur is not None and (self._cur[0], self._cur[1]) < (tai, cell):
             self._cur = next(self._gen, None)
         group = {}
-        while self._cur is not None and self._cur[0] == tai:
-            group[self._cur[1]] = to_bytes(self._cur[2], self.dtype)
+        while self._cur is not None and self._cur[0] == tai and self._cur[1] == cell:
+            group[self._cur[2]] = to_bytes(self._cur[3], self.dtype)
             self._cur = next(self._gen, None)
         return group
 
@@ -165,8 +167,8 @@ def write_record(f: BinaryIO, tag: int, body: bytes) -> None:
 
 
 def emit_srs(f: BinaryIO, s: dict, iq_st: BlobStream | None, hest_st: GroupedBlobStream | None) -> None:
-    iq = iq_st.fetch(s['tai']) if iq_st else None
-    grp = hest_st.fetch(s['tai']) if hest_st else {}
+    iq = iq_st.fetch(s['tai'], s['CellId']) if iq_st else None
+    grp = hest_st.fetch(s['tai'], s['CellId']) if hest_st else {}
     ueb = [(grp.get(u['rnti'], b''), u['_rb']) for u in s['ue']]
     write_record(f, TAG_SRS, pack_srs(s, s['ue'], iq or b'', ueb))
 
@@ -178,19 +180,16 @@ def load_pusch(client: Any, where: str) -> dict:
             "StartSymbolIndex, NrOfSymbols, TBSize, pduLen, targetCodeRate, newDataIndicator, "
             "nrOfLayers, layerOffset, ueGrpIdx, hOffset, hSize, nSubcarriers, nDmrsEstimates, "
             "dmrsSymbPos, timingAdvance, cfoHz, harqProcessID, rvIndex")
-    names, data = rows(client, f"SELECT {cols} FROM fapi {where} ORDER BY tai, ueGrpIdx")
+    names, data = rows(client, f"SELECT {cols} FROM fapi {where} ORDER BY tai, CellId, ueGrpIdx")
     idx = {n: i for i, n in enumerate(names)}
     slots = {}
     for r in data:
-        tai = r[idx['tai']]
-        s = slots.get(tai)
+        key = (r[idx['tai']], r[idx['CellId']])            # one record per (timestamp, cell)
+        s = slots.get(key)
         if s is None:
-            s = slots[tai] = {'tai': tai, 'sw': r[idx['sw']], 'SFN': r[idx['SFN']],
+            s = slots[key] = {'tai': r[idx['tai']], 'sw': r[idx['sw']], 'SFN': r[idx['SFN']],
                               'Slot': r[idx['Slot']], 'CellId': r[idx['CellId']],
                               'nCells': r[idx['nCells']], 'nBsAnts': r[idx['nBsAnts']], 'ue': []}
-        elif r[idx['CellId']] != s['CellId']:              # single-cell only; multi-cell TBD
-            raise SystemExit(f"multi-cell PUSCH at tai={tai} (CellId {s['CellId']} and "
-                             f"{r[idx['CellId']]}); not supported")
         s['ue'].append({n: r[idx[n]] for n in names})
     return slots
 
@@ -202,22 +201,19 @@ def load_srs(client: Any, where: str, cellmap: dict) -> dict:
             "nAntPorts, nSyms, nRepetitions, combSize, combOffset, startSym, cyclicShift, "
             "frequencyPosition, frequencyShift, frequencyHopping, resourceType, tSrs, tOffset, "
             "usage, nValidPrg, prgSize, nPrbGrps, rbSnrData")
-    names, data = rows(client, f"SELECT {cols} FROM srs {where} ORDER BY tai, rnti")
+    names, data = rows(client, f"SELECT {cols} FROM srs {where} ORDER BY tai, CellId, rnti")
     idx = {n: i for i, n in enumerate(names)}
     slots = {}
     for r in data:
-        tai = r[idx['tai']]
-        s = slots.get(tai)
+        key = (r[idx['tai']], r[idx['CellId']])            # one record per (timestamp, cell)
+        s = slots.get(key)
         if s is None:
-            s = slots[tai] = {
-                'tai': tai, 'sw': r[idx['sw']], 'SFN': r[idx['SFN']], 'Slot': r[idx['Slot']],
+            s = slots[key] = {
+                'tai': r[idx['tai']], 'sw': r[idx['sw']], 'SFN': r[idx['SFN']], 'Slot': r[idx['Slot']],
                 'CellId': r[idx['CellId']], 'nCells': r[idx['nCells']],
                 'srsCellStartSym': r[idx['srsCellStartSym']],
                 'srsCellNSrsSym': r[idx['srsCellNSrsSym']],
                 'nRxAntSrs': cellmap.get(r[idx['CellId']], (0, 0))[1], 'ue': []}
-        elif r[idx['CellId']] != s['CellId']:              # single-cell only; multi-cell TBD
-            raise SystemExit(f"multi-cell SRS at tai={tai} (CellId {s['CellId']} and "
-                             f"{r[idx['CellId']]}); not supported")
         u = {n: r[idx[n]] for n in names}
         u['_rb'] = to_bytes(r[idx['rbSnrData']], np.float32)
         s['ue'].append(u)
@@ -236,6 +232,8 @@ def main() -> int:
                     help='cap to first N slot timestamps across selected pusch/srs streams; 0 = all')
     ap.add_argument('-s', '--streams', default='all',
                     help="comma-separated subset to include, default 'all': " + ', '.join(STREAMS))
+    ap.add_argument('-c', '--cells', default='all',
+                    help="comma-separated CellId subset to include, default 'all' (e.g. '1,2')")
     ap.add_argument('--since', help="window start on TsSwNs (wall clock), "
                     "'YYYY-MM-DD HH:MM:SS[.fff]' in the ClickHouse server timezone (typically UTC)")
     ap.add_argument('--until', help="window end on TsSwNs, same format as --since")
@@ -256,6 +254,21 @@ def main() -> int:
     if (sel & {'srs_iq', 'srs_hest'}) and 'srs' not in sel:
         print("note: srs_iq/srs_hest ride SRS records; ignored without 'srs'", file=sys.stderr)
 
+    cells = None
+    if args.cells.strip() != 'all':
+        try:
+            cells = sorted({int(c) for c in args.cells.split(',') if c.strip()})
+        except ValueError:
+            ap.error("--cells must be comma-separated CellId integers, e.g. '1,2'")
+        if not cells or cells[0] < 0:
+            ap.error("--cells must be non-negative CellId integers")
+
+    t0 = time.time()
+    print(f"clickhouse_to_trace -> {args.output} "
+          f"[{args.since or 'begin'} .. {args.until or 'end'}] "
+          f"streams={','.join(s for s in STREAMS if s in sel)} "
+          f"cells={'all' if cells is None else ','.join(map(str, cells))}", file=sys.stderr)
+
     client = clickhouse_connect.get_client(host=args.host, port=args.port,
                                            database=args.database, username=args.user,
                                            password=args.password,
@@ -266,6 +279,8 @@ def main() -> int:
         win.append(f"TsSwNs >= toDateTime64('{args.since}', 9)")
     if args.until:
         win.append(f"TsSwNs <= toDateTime64('{args.until}', 9)")
+    if cells is not None:
+        win.append(f"CellId IN ({','.join(map(str, cells))})")
 
     def build_where(*extra: str) -> str:
         preds = win + [p for p in extra if p]
@@ -286,49 +301,83 @@ def main() -> int:
             return 1
         where = build_where(f"toUnixTimestamp64Nano(TsTaiNs) <= {cut[-1][0]}")
 
-    cellmap = {r[0]: (r[1], r[2]) for r in
-               rows(client, "SELECT DISTINCT CellId, nRxAnt, nRxAntSrs FROM fh")[1]}
+    # nRxAnt/nRxAntSrs are static per cell; two values means the window spans runs.
+    def set_ant(cid: int, i: int, v: int) -> None:
+        e = cellmap.setdefault(cid, [0, 0])
+        if e[i] and e[i] != v:
+            sys.exit(f"cell {cid}: conflicting nRxAnt{'Srs' if i else ''} ({e[i]} vs {v}); "
+                     "window spans multiple runs, narrow --since/--until or --cells")
+        e[i] = v
 
-    pusch = {}
-    if 'pusch' in sel:
-        pusch = load_pusch(client, where)
-        for s in pusch.values():
-            s['nRxAnt'], s['nRxAntSrs'] = cellmap.get(s['CellId'], (0, 0))
-    srs = sorted(load_srs(client, where, cellmap).values(),
-                 key=lambda s: s['tai']) if 'srs' in sel else []
+    cellmap: dict = {}
+    for cid, nrx, nrxs in rows(client, f"SELECT DISTINCT CellId, nRxAnt, nRxAntSrs FROM fh {where}")[1]:
+        set_ant(cid, 0, nrx)
+        set_ant(cid, 1, nrxs)
+    if 'srs' in sel:                                       # SRS-only windows have no fh rows
+        for cid, n in rows(client, f"SELECT DISTINCT CellId, nRxAntSrs FROM srs_iq {where}")[1]:
+            set_ant(cid, 1, n)
 
-    hest_st = (BlobStream(client, f"SELECT toUnixTimestamp64Nano(TsTaiNs) AS tai, hestData "
-                                  f"FROM hest {where} ORDER BY tai", np.float32)
+    pusch = load_pusch(client, where) if 'pusch' in sel else {}
+    for s in pusch.values():
+        s['nRxAnt'], s['nRxAntSrs'] = cellmap.get(s['CellId'], (0, 0))
+    srs = load_srs(client, where, cellmap) if 'srs' in sel else {}
+
+    # Group per-cell records by timestamp; within a slot cells ascend by CellId
+    # and PUSCH precedes SRS (replay regroups them into one multi-cell indication).
+    pusch_by_tai: dict = defaultdict(list)
+    for s in pusch.values():
+        pusch_by_tai[s['tai']].append(s)
+    srs_by_tai: dict = defaultdict(list)
+    for s in srs.values():
+        srs_by_tai[s['tai']].append(s)
+    for lst in pusch_by_tai.values():
+        lst.sort(key=lambda s: s['CellId'])
+    for lst in srs_by_tai.values():
+        lst.sort(key=lambda s: s['CellId'])
+
+    hest_st = (BlobStream(client, f"SELECT toUnixTimestamp64Nano(TsTaiNs) AS tai, CellId, hestData "
+                                  f"FROM hest {where} ORDER BY tai, CellId", np.float32)
                if 'hest' in sel else None)
-    fh_st = (BlobStream(client, f"SELECT toUnixTimestamp64Nano(TsTaiNs) AS tai, fhData "
-                                f"FROM fh {where} ORDER BY tai", np.int16)
+    fh_st = (BlobStream(client, f"SELECT toUnixTimestamp64Nano(TsTaiNs) AS tai, CellId, fhData "
+                                f"FROM fh {where} ORDER BY tai, CellId", np.int16)
              if 'fh' in sel else None)
-    srs_iq_st = (BlobStream(client, f"SELECT toUnixTimestamp64Nano(TsTaiNs) AS tai, iqData "
-                                    f"FROM srs_iq {where} ORDER BY tai", np.int16)
+    srs_iq_st = (BlobStream(client, f"SELECT toUnixTimestamp64Nano(TsTaiNs) AS tai, CellId, iqData "
+                                    f"FROM srs_iq {where} ORDER BY tai, CellId", np.int16)
                  if 'srs_iq' in sel else None)
-    srs_hest_st = (GroupedBlobStream(client, f"SELECT toUnixTimestamp64Nano(TsTaiNs) AS tai, rnti, "
-                                             f"hestData FROM srs_hest {where} ORDER BY tai, rnti", np.int16)
+    srs_hest_st = (GroupedBlobStream(client, f"SELECT toUnixTimestamp64Nano(TsTaiNs) AS tai, CellId, rnti, "
+                                             f"hestData FROM srs_hest {where} ORDER BY tai, CellId, rnti", np.int16)
                    if 'srs_hest' in sel else None)
 
-    n_pusch = n_srs = j = 0
+    n_pusch = n_srs = 0
+    total = len(pusch) + len(srs)
+
+    def tick() -> None:
+        if not total:
+            return
+        d = n_pusch + n_srs
+        if d % 1000 == 0 or d == total:
+            sys.stderr.write(f"\r  {d}/{total} records ({100.0 * d / total:5.1f}%) "
+                             f"{time.time() - t0:6.1f}s")
+            sys.stderr.flush()
+
     with open(args.output, 'wb') as f:
         f.write(FILE_HDR.pack(MAGIC, VERSION, SHM_LAYOUT_VERSION, 0))
-        for tai in sorted(pusch):
-            while j < len(srs) and srs[j]['tai'] < tai:        # SRS strictly older first
-                emit_srs(f, srs[j], srs_iq_st, srs_hest_st)
+        for tai in sorted(set(pusch_by_tai) | set(srs_by_tai)):
+            for s in pusch_by_tai.get(tai, ()):
+                hb = hest_st.fetch(tai, s['CellId']) if hest_st else b''  # absent => empty, indices zeroed
+                fb = fh_st.fetch(tai, s['CellId']) if fh_st else b''
+                write_record(f, TAG_PUSCH, pack_pusch(s, s['ue'], hb or b'', fb or b''))
+                n_pusch += 1
+                tick()
+            for s in srs_by_tai.get(tai, ()):
+                emit_srs(f, s, srs_iq_st, srs_hest_st)
                 n_srs += 1
-                j += 1
-            hb = hest_st.fetch(tai) if hest_st else b''    # absent => empty blob, h_offset/h_size zeroed
-            fb = fh_st.fetch(tai) if fh_st else b''
-            write_record(f, TAG_PUSCH, pack_pusch(pusch[tai], pusch[tai]['ue'], hb or b'', fb or b''))
-            n_pusch += 1
-        while j < len(srs):                                    # trailing SRS
-            emit_srs(f, srs[j], srs_iq_st, srs_hest_st)
-            n_srs += 1
-            j += 1
+                tick()
+    if total:
+        sys.stderr.write("\n")
 
     print(f"wrote {args.output}: {n_pusch} PUSCH, {n_srs} SRS records "
-          f"[streams: {', '.join(s for s in STREAMS if s in sel)}]")
+          f"in {time.time() - t0:.1f}s [streams: {', '.join(s for s in STREAMS if s in sel)}]")
     return 0
 
 

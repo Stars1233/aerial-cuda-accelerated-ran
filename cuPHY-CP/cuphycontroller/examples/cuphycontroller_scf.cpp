@@ -23,8 +23,17 @@
 #include "scf_5g_fapi.hpp"
 #include "nv_phy_driver_proxy.hpp"
 #include "cuphyoam.hpp"
-#include <cuda_profiler_api.h>
+#include <cuda.h>
+#include <cudaProfiler.h>
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include <signal.h>
+#include <sys/mman.h>
+#include <cerrno>
+#include <charconv>
+#include <fstream>
+#include <optional>
+#include <string>
+#include <string_view>
 
 #include "nv_utils.h"
 #include "nvlog_fmt.hpp"
@@ -43,6 +52,46 @@ phydriver_handle pdh; //!< cuPHYDriver handle pointer
 
 static void l1_setPhydriverHandle();
 static void l1_setFmtLogThreadId(pthread_t id);
+
+/** Read a kB value from /proc/self/status (e.g. VmRSS, VmHWM). */
+static std::optional<long> read_proc_status_kb(std::string_view key)
+{
+    std::ifstream file{"/proc/self/status"};
+    if(!file)
+    {
+        return std::nullopt;
+    }
+
+    std::string line;
+    while(std::getline(file, line))
+    {
+        const std::string_view full_line{line};
+        if(!full_line.starts_with(key))
+        {
+            continue;
+        }
+
+        std::string_view value_part = full_line.substr(key.size());
+        if(!value_part.starts_with(':'))
+        {
+            continue;
+        }
+        value_part.remove_prefix(1);
+
+        while(!value_part.empty() && value_part.front() == ' ')
+        {
+            value_part.remove_prefix(1);
+        }
+
+        long value = -1;
+        const auto parse_result =
+            std::from_chars(value_part.data(),
+                            value_part.data() + value_part.size(),
+                            value);
+        return parse_result.ec == std::errc{} ? std::optional<long>{value} : std::nullopt;
+    }
+    return std::nullopt;
+}
 
 /**
  * The nvlog exit handler for L1 to cleanup and exit
@@ -74,7 +123,7 @@ static void signal_handler(int signum)
 
 int main(int argc,char* argv[]) {
 
-    TI_GENERIC_INIT("cuphycontroller main",15);
+    TI_GENERIC_INIT("cuphycontroller main",20);
 
     TI_GENERIC_ADD("Start Main");
 
@@ -209,7 +258,7 @@ int main(int argc,char* argv[]) {
     appConfig.setCellGroupNum(parser_cfg.get_cuphydriver_cell_group_num());
     parser_cfg.print_configs();
 
-    //If we are using green contexts, set CUDA_DEVICE_MAX_CONNECTIONS to 32 before the first CUDA call which will initialize the driver (e.g., cudaSetDevice below)
+    //If we are using green contexts, set CUDA_DEVICE_MAX_CONNECTIONS to 32 before the first CUDA call which will initialize the driver (e.g., cuInit below)
     // Note that if we set this to 32, we will not be able to switch to MPS later, e.g., in cuphydriver context.cpp
     if (parser_cfg.get_cuphydriver_use_green_contexts() != 0)
     {
@@ -223,7 +272,7 @@ int main(int argc,char* argv[]) {
 
 
     TI_GENERIC_ADD("Cuda Set Device");
-    cudaSetDevice(parser_cfg.get_cuphydriver_gpus()[0]);
+    PrimaryCtxGuard ctx_guard(parser_cfg.get_cuphydriver_gpus()[0]);
     TI_GENERIC_ADD("Cuphy PTI Init");
     cuphy_pti_init(parser_cfg.get_cuphydriver_nics()[0].address.c_str());
 
@@ -247,7 +296,7 @@ int main(int argc,char* argv[]) {
     }
     AppUtils::clock_sanity_check();
 
-    TI_GENERIC_ADD("Init PHYDriver");
+    TI_GENERIC_ADD("Build PHYDriver ctx_cfg");
     pthread_setname_np(pthread_self(), "phy_drv_init");
 
     // Create and populate the context_config struct
@@ -281,11 +330,24 @@ int main(int argc,char* argv[]) {
     ctx_cfg.ul_order_timeout_gpu_ns = parser_cfg.get_cuphydriver_timeout_gpu();
     ctx_cfg.ul_order_timeout_gpu_srs_ns = parser_cfg.get_cuphydriver_timeout_gpu_srs();
     ctx_cfg.ul_srs_aggr3_task_launch_offset_ns = parser_cfg.get_cuphydriver_ul_srs_aggr3_task_launch_offset_ns();
+    ctx_cfg.ul_srs_task1_order_launch_offset_ns = parser_cfg.get_cuphydriver_ul_srs_task1_order_launch_offset_ns();
     ctx_cfg.ul_order_timeout_log_interval_ns = parser_cfg.get_cuphydriver_timeout_log_interval();
     ctx_cfg.ul_order_timeout_gpu_log_enable = parser_cfg.get_cuphydriver_timeout_gpu_log_enable();
     ctx_cfg.ul_order_max_rx_pkts = parser_cfg.get_cuphydriver_order_kernel_max_rx_pkts();
     ctx_cfg.ul_order_rx_pkts_timeout_ns = parser_cfg.get_cuphydriver_order_kernel_rx_pkts_timeout();
     ctx_cfg.cplane_disable = parser_cfg.get_cplane_disable();
+    // Direct FAPI-to-C-plane is the only EOM dispatch path in store-replay builds,
+    // where the C-plane and per-channel work run as cuphydriver tasks. That path
+    // (nv_phy_slot_dispatch.cpp) compiles only under ENABLE_FAPI_STORE_REPLAY, so the
+    // flag is gated on the same macro; non-store-replay builds keep the legacy
+    // FH-callback path (flag off). It is no longer a YAML option.
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    ctx_cfg.fapi_to_cplane_direct = true;
+#else
+    ctx_cfg.fapi_to_cplane_direct = false;
+#endif
+    ctx_cfg.cplane_processing_dl_batch_size = parser_cfg.get_cplane_processing_dl_batch_size();
+    ctx_cfg.cplane_processing_ul_batch_size = parser_cfg.get_cplane_processing_ul_batch_size();
     ctx_cfg.cell_mplane_list = parser_cfg.get_mplane_configs();
     ctx_cfg.ul_cores = parser_cfg.get_cuphydriver_workers_ul();
     ctx_cfg.dl_cores = parser_cfg.get_cuphydriver_workers_dl();
@@ -380,6 +442,8 @@ int main(int argc,char* argv[]) {
     ctx_cfg.pusch_nMaxLdpcHetConfigs = parser_cfg.get_cuphydriver_pusch_nMaxLdpcHetConfigs();
     ctx_cfg.pusch_nMaxTbPerNode = parser_cfg.get_cuphydriver_pusch_nMaxTbPerNode();
     ctx_cfg.enable_srs = parser_cfg.get_cuphydriver_enable_srs();
+    ctx_cfg.max_ul_antenna_ports = parser_cfg.get_max_ul_antenna_ports();
+    ctx_cfg.max_dl_antenna_ports = parser_cfg.get_max_dl_antenna_ports();
     ctx_cfg.enable_dl_core_affinity = parser_cfg.get_cuphydriver_enable_dl_core_affinity();
     ctx_cfg.dlc_core_packing_scheme = parser_cfg.get_cuphydriver_dlc_core_packing_scheme();
     ctx_cfg.ue_mode = parser_cfg.get_cuphydriver_ue_mode();
@@ -420,18 +484,14 @@ int main(int argc,char* argv[]) {
     auto nics = parser_cfg.get_cuphydriver_nics();
     for (const auto& nic : nics) {
         auto txq_count_uplane = ctx_cfg.cell_group_num; // 1 UL U-Plane per cell
-        auto txq_count_cplane = ctx_cfg.cell_group_num; // 1 DL C-Plane per cell
-        txq_count_cplane += ctx_cfg.cell_group_num; // 1 UL C-Plane per cell
-
-        if (ctx_cfg.mMIMO_enable)
-        {
-            if (ctx_cfg.dlc_alloc_cplane_bfw_txq || ctx_cfg.dlc_bfw_enable_divide_per_cell)
-            {
-                txq_count_cplane += ctx_cfg.cell_group_num; // 1 DL BFW C-Plane per cell
+        // Legacy path: one TX queue per cell per direction
+        uint16_t txq_count_cplane = ctx_cfg.cell_group_num * 2; // DL + UL per cell
+        if (ctx_cfg.mMIMO_enable) {
+            if (ctx_cfg.dlc_alloc_cplane_bfw_txq || ctx_cfg.dlc_bfw_enable_divide_per_cell) {
+                txq_count_cplane += ctx_cfg.cell_group_num;
             }
-            if (ctx_cfg.ulc_alloc_cplane_bfw_txq || ctx_cfg.ulc_bfw_enable_divide_per_cell)
-            {
-                txq_count_cplane += ctx_cfg.cell_group_num; // 1 UL BFW C-Plane per cell
+            if (ctx_cfg.ulc_alloc_cplane_bfw_txq || ctx_cfg.ulc_bfw_enable_divide_per_cell) {
+                txq_count_cplane += ctx_cfg.cell_group_num;
             }
         }
 
@@ -461,6 +521,7 @@ int main(int argc,char* argv[]) {
     ctx_cfg.dynamic_beam_id_start = parser_cfg.get_dynamic_beam_id_start();
     ctx_cfg.dynamic_beam_id_end = parser_cfg.get_dynamic_beam_id_end();
     ctx_cfg.bfw_c_plane_chaining_mode = parser_cfg.get_bfw_c_plane_chaining_mode();
+    TI_GENERIC_ADD("pc_init_phydriver");
     ret = pc_init_phydriver(&pdh, ctx_cfg, workers_descr);
 
     l1_setPhydriverHandle();
@@ -473,6 +534,36 @@ int main(int argc,char* argv[]) {
 
     NVLOGC_FMT(TAG, "====> PhyDriver initialized!");
 
+    // Lock the entire process address space into RAM now that L1 init is done.
+    // MCL_CURRENT pre-faults and pins every page mapped during init; MCL_FUTURE
+    // pins any page mapped afterwards. This eliminates demand-paging page faults
+    // on the UL/DL worker threads during steady state. Requires CAP_IPC_LOCK
+    // (the controller runs as root in the privileged container, so the limit is
+    // bypassed); on an unprivileged run it may fail on RLIMIT_MEMLOCK, which we
+    // log as a warning and continue rather than aborting the controller.
+    TI_GENERIC_ADD("mlockall");
+    if(mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+    {
+        int mlock_errno = errno;
+        NVLOGW_FMT(TAG, "mlockall(MCL_CURRENT | MCL_FUTURE) failed: {} ({}); "
+                        "page faults may occur on worker threads",
+                   mlock_errno, strerror(mlock_errno));
+    }
+    else
+    {
+        NVLOGC_FMT(TAG, "====> Process memory locked (mlockall MCL_CURRENT | MCL_FUTURE)");
+    }
+
+    {
+        const auto vm_rss_kb = read_proc_status_kb("VmRSS");
+        const auto vm_hwm_kb = read_proc_status_kb("VmHWM");
+        if(vm_rss_kb && vm_hwm_kb)
+        {
+            NVLOGC_FMT(TAG_STARTUP_TIMES, "Post-mlock VmRSS={}kB VmHWM={}kB", *vm_rss_kb, *vm_hwm_kb);
+        }
+    }
+
+    TI_GENERIC_ADD("Post-mlock setup");
     pthread_setname_np(pthread_self(), "phy_drv_proxy");
 
     TI_GENERIC_ADD("Init cuphydriver");
@@ -550,9 +641,9 @@ int main(int argc,char* argv[]) {
         ////////////////////////////////////////////////////////////////////////////////////////////////
         if(parser_cfg.get_cuphydriver_profiler_sec() > 0)
         {
-            cudaProfilerStart();
+            cuProfilerStart();
             sleep(parser_cfg.get_cuphydriver_profiler_sec());
-            cudaProfilerStop();
+            cuProfilerStop();
         }
         else
         {

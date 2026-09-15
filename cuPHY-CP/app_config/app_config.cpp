@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +35,7 @@ void AppConfig::setLowPriorityCore(uint8_t low_priority_core)
     low_priority_core_ = low_priority_core;
 }
 
-const uint8_t AppConfig::getLowPriorityCore() const
+uint8_t AppConfig::getLowPriorityCore() const
 {
     return low_priority_core_;
 }
@@ -45,7 +45,7 @@ void AppConfig::setNicTputAlertThreshold(uint32_t nic_tput_alert_threshold)
     nic_tput_alert_threshold_ = nic_tput_alert_threshold;
 }
 
-const uint32_t AppConfig::getNicTputAlertThreshold() const
+uint32_t AppConfig::getNicTputAlertThreshold() const
 {
     return nic_tput_alert_threshold_;
 }
@@ -55,12 +55,12 @@ void AppConfig::setCellGroupNum(uint8_t cell_group_num)
     cell_group_num_ = cell_group_num;
 }
 
-const uint8_t AppConfig::getCellGroupNum() const
+uint8_t AppConfig::getCellGroupNum() const
 {
     return cell_group_num_;
 }
 
-const bool AppConfig::isCellActive(uint16_t mplane_id) const
+bool AppConfig::isCellActive(uint16_t mplane_id) const
 {
     return active_cell_bitmap_ & ((uint32_t)1 << mplane_id);
 }
@@ -85,7 +85,7 @@ bool AppConfig::isCUSPortFailoverEnabled() const
     return cus_port_failover_;
 }
 
-const uint64_t AppConfig::getTaiOffset() const
+uint64_t AppConfig::getTaiOffset() const
 {
     return tai_offset_;
 }
@@ -108,7 +108,7 @@ void AppConfig::enablePtpSvcMonitoring(bool enable_ptp_svc_monitoring)
     enable_ptp_svc_monitoring_ = enable_ptp_svc_monitoring;
 }
 
-const bool AppConfig::isPtpSvcMonitoringEnabled() const
+bool AppConfig::isPtpSvcMonitoringEnabled() const
 {
     return enable_ptp_svc_monitoring_;
 }
@@ -118,7 +118,7 @@ void AppConfig::setPtpRmsThreshold(uint8_t ptp_rms_threshold)
     ptp_rms_threshold_ = ptp_rms_threshold;
 }
 
-const uint8_t AppConfig::getPtpRmsThreshold() const
+uint8_t AppConfig::getPtpRmsThreshold() const
 {
     return ptp_rms_threshold_;
 }
@@ -128,7 +128,7 @@ void AppConfig::enableRhocpPtpEventsMonitoring(bool enable_rhocp_ptp_events_moni
     enable_rhocp_ptp_events_monitoring_ = enable_rhocp_ptp_events_monitoring;
 }
 
-const bool AppConfig::isRhocpPtpEventsMonitoringEnabled() const
+bool AppConfig::isRhocpPtpEventsMonitoringEnabled() const
 {
     return enable_rhocp_ptp_events_monitoring_;
 }

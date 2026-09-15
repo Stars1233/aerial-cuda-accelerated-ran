@@ -20,6 +20,7 @@
 #include <sys/time.h>
 #include <semaphore.h>
 #include <filesystem>
+#include <memory>
 
 #include "nv_mac_factory.hpp"
 #include "nvlog.hpp"
@@ -30,10 +31,10 @@
 
 #include "cuphyoam.hpp"
 #include "common_utils.hpp"
-#include "signal_handler.hpp"
 
 #include "nv_utils.h"
 #include "yaml_sdk_version.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 
 #ifdef AERIAL_CUMAC_ENABLE
 #include "cumac_pattern.hpp"
@@ -43,19 +44,6 @@ using namespace std;
 using namespace nv;
 
 #define TAG (NVLOG_TAG_BASE_TEST_MAC + 0) // "MAC"
-
-////////////////////////////////////////////////////////////////////////
-// Function to create an instance of the local MAC class above
-test_mac* create_test_mac(yaml::node node_config, uint32_t cell_num)
-{
-    struct timespec ts_start;
-    nvlog_gettime_rt(&ts_start);
-
-    NVLOGC_FMT(TAG, "create_test_mac start");
-    test_mac* mac = new test_mac(node_config, cell_num);
-    NVLOGC_FMT(TAG, "create_test_mac finished. time={}ms", nvlog_get_interval(&ts_start) / 1000 / 1000);
-    return mac;
-}
 
 void oam_init(std::string& server_addr)
 {
@@ -76,7 +64,9 @@ void usage()
     NVLOGC_FMT(TAG, "  --mode <mode>               Specify mode (0=static, 1=dynamic)");
     NVLOGC_FMT(TAG, "  --config <yaml_file>        Specify config YAML file");
     NVLOGC_FMT(TAG, "  --thrput                    Show throughput");
+    NVLOGC_FMT(TAG, "  --prebuild                  Run prebuild FAPI messages test");
     NVLOGC_FMT(TAG, "  --no-validation             Disable validation");
+    NVLOGC_FMT(TAG, "  --ru_emulator_host <host>   Specify RU emulator host for startup sync");
     NVLOGC_FMT(TAG, "  --help, -h                  Show this help message");
     NVLOGC_FMT(TAG, "");
     NVLOGC_FMT(TAG, "Example: test_mac F08 2C --channels PDSCH+PDCCH_DL+PDCCH_UL+PBCH");
@@ -225,10 +215,13 @@ int main(int argc, char* argv[])
 
     int ret = EXIT_SUCCESS;
     test_mac* testmac = nullptr;
+    test_mac_configs* configs = nullptr;
     try{
         // Parse input parameters
         int show_thrput = 0;
+        int prebuild_test = 0;
         int no_validation = 0;
+        std::string ru_emulator_host;
         uint64_t cell_mask           = 0;
         uint32_t channel_mask        = 0;
         uint64_t mode = 0;
@@ -274,9 +267,17 @@ int main(int argc, char* argv[])
                 // Parse channels
                 show_thrput = 1;
             }
+            else if(strncmp(argv[i], "--prebuild", strlen("--prebuild")) == 0)
+            {
+                prebuild_test = 1;
+            }
             else if(strncmp(argv[i], "--no-validation", strlen("--no-validation")) == 0)
             {
                 no_validation = 1;
+            }
+            else if(strncmp(argv[i], "--ru_emulator_host", strlen("--ru_emulator_host")) == 0 && i < argc - 1)
+            {
+                ru_emulator_host = std::string(argv[++i]);
             }
             else
             {
@@ -290,7 +291,7 @@ int main(int argc, char* argv[])
 
         char test_mac_yaml_array[MAX_PATH_LEN];
         std::string temp_path = std::string(CONFIG_TESTMAC_YAML_PATH).append(config_yaml);
-        get_full_path_file(test_mac_yaml_array, NULL, temp_path.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+        get_cubb_full_path(test_mac_yaml_array, NULL, temp_path.c_str());
         std::filesystem::path test_mac_yaml(test_mac_yaml_array);
         NVLOGC_FMT(TAG, "test_mac_yaml={}", test_mac_yaml.c_str());
 
@@ -318,8 +319,8 @@ int main(int argc, char* argv[])
         //std::string relative_path = std::string("../../../../").append(NVLOG_DEFAULT_CONFIG_FILE);
         //nv_get_absolute_path(yaml_file_array, relative_path.c_str());
         std::string relative_path(NVLOG_DEFAULT_CONFIG_FILE);
-        get_full_path_file(yaml_file_array, NULL, relative_path.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
-        std::filesystem::path yaml_file(yaml_file_array); 
+        get_cubb_full_path(yaml_file_array, NULL, relative_path.c_str());
+        std::filesystem::path yaml_file(yaml_file_array);
         NVLOGC_FMT(TAG, "nvlog config file={}", yaml_file.c_str());
 
         pthread_t bg_thread_id = nvlog_fmtlog_init(yaml_file.c_str(), log_name.c_str(), NULL);
@@ -355,12 +356,18 @@ int main(int argc, char* argv[])
 
         pthread_setname_np(pthread_self(), "mac_main");
 
-        test_mac_configs* configs = new test_mac_configs(yaml_root);
+        PrimaryCtxGuard ctx_guard(0);
+
+        testmac = new test_mac(test_mac_yaml_array);
+
+        // Update test_mac_configs per input parameters
+        configs = testmac->get_configs();
         if(no_validation)
         {
             configs->validate_enable = 0;
         }
         configs->app_mode = mode;
+        configs->ru_emulator_host = ru_emulator_host;
 
 #ifdef AERIAL_CUMAC_ENABLE
         yaml::file_parser* p_cumac_yaml_file = nullptr;
@@ -370,7 +377,7 @@ int main(int argc, char* argv[])
         if (yaml_root.has_key("test_cumac_config_file"))
         {
             std::string file_name = yaml_root["test_cumac_config_file"].as<std::string>();
-            if (file_name.length() != 0 && file_name.compare("null") != 0) {            
+            if (file_name.length() != 0 && file_name.compare("null") != 0) {
                 // test_mac app relative path: build/cuPHY-CP/testMAC/testMAC/test_mac
                 std::string relative_path = std::string("../../../../cuPHY-CP/testMAC/testMAC/").append(file_name.c_str());
                 if (yaml_root.has_key("test_cumac_config_path")) {
@@ -404,18 +411,37 @@ int main(int argc, char* argv[])
         }
 #endif
 
-        launch_pattern *lp = new launch_pattern(configs);
-        if(lp->launch_pattern_parsing(pattern_file.c_str(), channel_mask, cell_mask) < 0)
-        {
-            goto quit;
-        }
-
         int fapi_10_04 = 0;
 #ifdef SCF_FAPI_10_04
         fapi_10_04 = 1;
 #endif
+        if(testmac->load_launch_pattern(pattern_file.c_str(), cell_mask, channel_mask) < 0)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Launch pattern parsing failed");
+            ret = EXIT_FAILURE;
+            goto quit;
+        }
+
+        // For prebuild test, only prebuild FAPI messages and exit
+        if(prebuild_test == 1)
+        {
+            if(testmac->prebuild_fapi_messages() < 0)
+            {
+                NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Prebuild FAPI messages failed");
+                ret = EXIT_FAILURE;
+            }
+            else
+            {
+                testmac->print_prebuilt_fapi_messages();
+                NVLOGC_FMT(TAG, "Prebuild FAPI messages test completed successfully");
+            }
+            goto quit;
+        }
+
+        launch_pattern* lp = testmac->get_launch_pattern();
         NVLOGC_FMT(TAG, "testmac_init: cell_num={} negative_test={} show_thrput={} fapi_10_04={}",
                 lp->get_cell_num(), lp->get_negative_test(), show_thrput, fapi_10_04);
+
         if(show_thrput)
         {
             goto quit;
@@ -429,11 +455,12 @@ int main(int argc, char* argv[])
             goto quit;
         }
 
-        testmac = create_test_mac(doc.root(), lp->get_cell_num());
-
-        // Set the test_mac_config and launch_pattern pointer to test_mac
-        testmac->set_launch_pattern_and_configs(configs, lp);
-
+#ifdef AERIAL_CUMAC_ENABLE
+        if (_cumac_handler != nullptr)
+        {
+            _cumac_handler->set_fapi_handler(testmac->get_fapi_handler());
+        }
+#endif
         // Start the MAC thread
         testmac->start();
 

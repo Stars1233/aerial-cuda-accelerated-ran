@@ -59,7 +59,7 @@ message(VERBOSE "Order Kernel test bench Cmake DOCA Lib Dirs: ${DOCA_LIBRARY_DIR
 target_include_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${DOCA_INCLUDE_DIRS})
 target_include_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PUBLIC ${HDF5_INCLUDE_DIRS})
 
-target_link_libraries(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE CUDA::cudart CUDA::cuda_driver yaml nvlog gdrapi slot_command ${HDF5_C_LIBRARIES})
+target_link_libraries(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE CUDA::cudart CUDA::cuda_driver yaml nvlog gdrapi slot_command cuda_driver_utils ${HDF5_C_LIBRARIES})
 
 target_include_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${DPDK_INCLUDE_DIRS})
 target_include_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE /usr/local/gdrcopy/include)
@@ -74,5 +74,5 @@ target_include_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${CUBB_HOME
 target_link_libraries(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE -L${DOCA_LIBRARY_DIRS} -ldoca_gpunetio -ldoca_gpunetio_device -ldoca_common -ldoca_argp -ldoca_eth)
 
 target_link_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${DPDK_LIBRARY_DIRS})
-target_link_directories(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE ${DPDK_LIBRARY_DIRS}/dpdk/pmds-22.1)
-target_link_libraries(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE aerial_utils)
+target_link_dpdk_pmd_directories(${ORDER_KERNEL_TEST_BENCH_TARGET})
+target_link_libraries(${ORDER_KERNEL_TEST_BENCH_TARGET} PRIVATE aerial_utils nvipc)

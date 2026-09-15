@@ -141,6 +141,7 @@ CFG = {...
     8044   1     2    4     2    9     3     0    2     2        1      7   20   15      0    2     0      1      0       0; % grpSeqHopping = 2, 4 PRBs per PRBG
     8045   1     2    1     1    9    63     0    0     4        0      0    0    0      0    0     0      1      0       0; % 4 users wideband. Time multiplexed. Heterogeneous PRG size
     8046   30    4    1     1    9    63     1    0     4        1      0    0    0      0    0     0      1      0       0; % TC8512 + SRS PRG size = 16
+    8047   1     4    1     1    9    63     1    0     4        1      0    0    0      0    0     0      1      0       0; % 4 ant, 4 AP, BFP9 high input amplitude
    % Multiple parameters
    % TC#  rnti  Nap nSym  Nrep sym0 cfgIdx seqId bwIdx cmbSz cmbOffset cs  fPos fShift frqH grpH resType Tsrs  Toffset idxSlot
     8051  17     1    1     1   13     1     3    3     2        0      1    3    1      2    0     0      1      0       3;
@@ -310,7 +311,11 @@ CFG = {...
     %8419   48     4   1     1    9    63     1     0        4   1        0   0    0      0    0     0      1     0       0; % 8 users, 4 AP, time/comb muxed, updated RNTI
     8420   49     1   1     1    9    63     1     0        4   1        0   0    0      0    0     0      1     0       0; % 16 users, 1 AP, time/comb muxed, USAGE_BEAM_MGMT
     8421   50     1   1     1    9    63     1     0        4   1        0   0    0      0    0     0      1     0       0; % 16 users, time/comb muxed, MIX USAGE
-    
+    % comb2 wideband ch-est coverage at 32 antennas: 1 AP, comb2, c_SRS=60 (264-PRB wideband), no hopping; one TC per prgSize
+    8422   51     1   1     1    9    60     1     0        2   0        0   0    0      0    0     0      1     0       0; % 1 AP, comb2, wideband (c_SRS=60), prgSize=2 (default)
+    8423   52     1   1     1    9    60     1     0        2   0        0   0    0      0    0     0      1     0       0; % 1 AP, comb2, wideband (c_SRS=60), prgSize=1 (override below)
+    8424   53     1   1     1    9    60     1     0        2   0        0   0    0      0    0     0      1     0       0; % 1 AP, comb2, wideband (c_SRS=60), prgSize=4 (override below)
+
     % TC numbers 85XX reserved for 64 antennas TCs
     % TC#  rnti  Nap nSym  Nrep sym0 cfgIdx seqId bwIdx cmbSz cmbOffset cs  fPos fShift frqH grpH resType Tsrs  Toffset idxSlot
     8501   30     1   1     1    9    63     1     0        4   1        0   0    0      0    0     0      1     0       0; % 1 AP (base base)
@@ -379,6 +384,7 @@ CFG = {...
     8564   30     4   1     1    9    63     1     0        4   0        0   0    0      0    0     0      1     0       0; % SRS RKHS TEST CASE. 4 ant ports, prg = 1
     8565   30     1   1     1    9    63     1     0        4   0        0   0    0      0    0     0      1     0       0; % SRS RKHS TEST CASE. 1 ant ports, SNR = -30
     8566   30     1   1     1    9    63     1     0        4   0        0   0    0      0    0     0      1     0       0; % SRS RKHS TEST CASE. 1 ant ports, SNR = 30
+    8567   30     2   1     1    9    63     1     0        4   1        0   0    0      0    0     0      1     0       0; % 64 ant, 2 AP, BFP9 high input amplitude
 
 
    
@@ -646,10 +652,10 @@ parfor n = 1:NallTest
         elseif caseNum == 8034
             SysPar.carrier.SFN_start = 1; % skip the first frame, to be used with TC 8025
 
-        elseif ismember(caseNum, 8037:8040) % 1 PRB per PRBG
+        elseif ismember(caseNum, [8037:8040, 8423]) % 1 PRB per PRBG
             SysPar.srs{1}.prgSize = 1;
 
-        elseif ismember(caseNum, [8041:8044, 8531:8534, 8557]) % 4 PRBs per PRBG
+        elseif ismember(caseNum, [8041:8044, 8531:8534, 8557, 8424]) % 4 PRBs per PRBG
             SysPar.srs{1}.prgSize = 4;
 
         elseif ismember(caseNum, [8410,8412,8513,8514,8515:8524,8535,8537,8539,8540,8542:2:8556])
@@ -1228,7 +1234,7 @@ parfor n = 1:NallTest
             SysPar.srs{12}.RNTI = 3;
         end
 
-        if ismember(caseNum, [8401:8421])
+        if ismember(caseNum, [8401:8424])
             SysPar.carrier.Nant_gNB        = 32;
             SysPar.carrier.Nant_gNB_srs    = 32;
             SysPar.carrier.N_FhPort_DL     = 8;
@@ -1285,6 +1291,10 @@ parfor n = 1:NallTest
         end
         if ismember(caseNum, 8566)
             SysPar.Chan{1}.SNR = 30;
+        end
+        if ismember(caseNum, [8047 8567])
+            SysPar.SimCtrl.BFPforCuphy = 9;
+            SysPar.Chan{1}.gain = 400; % normal TV ~1.3 -> live-like ~520
         end
         if caseNum == 8058
             SysPar.testAlloc.srs = 2;

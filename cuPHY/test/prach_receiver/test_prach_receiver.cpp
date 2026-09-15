@@ -754,6 +754,23 @@ struct PrevPtrs
     uint16_t  nPrevOccaProc{0};
 };
 
+static std::vector<cudaGraphNode_t> getNodeDependencies(cudaGraphNode_t node)
+{
+    size_t depsCount = 0;
+    EXPECT_EQ(cudaSuccess, cudaGraphNodeGetDependencies(node, nullptr, nullptr, &depsCount));
+
+    std::vector<cudaGraphNode_t> deps(depsCount);
+    EXPECT_EQ(cudaSuccess, cudaGraphNodeGetDependencies(node, deps.data(), nullptr, &depsCount));
+    deps.resize(depsCount);
+    return deps;
+}
+
+static bool nodeDependsOn(cudaGraphNode_t node, cudaGraphNode_t dependency)
+{
+    const std::vector<cudaGraphNode_t> deps = getNodeDependencies(node);
+    return std::find(deps.begin(), deps.end(), dependency) != deps.end();
+}
+
 static void updateAndLaunchGraph(cudaGraphExec_t               graphExec,
                                  std::vector<cudaGraphNode_t>& nodes,
                                  GraphContextTwoOcc&           ctx,
@@ -1546,6 +1563,72 @@ TEST(GraphSuite, Create_Update_Launch_Succeeds)
     // Cleanup
     freeGraphOutputs(outs);
     freeGraphOutputs(outs2);
+    cudaFree(ctx.d_rx);
+}
+
+TEST(GraphSuite, SearchPdpDependsOnPdpAndRssi)
+{
+    PrachTestConfig cfg{};
+    cfg.L_RA           = 139;
+    cfg.Nfft           = 256;
+    cfg.N_rep          = 1;
+    cfg.N_CS           = 1;
+    cfg.uCount         = 1;
+    cfg.N_nc           = 1;
+    cfg.N_ant          = 1;
+    cfg.mu             = 0;
+    cfg.delta_f_RA     = 15000;
+    cfg.kBar           = 2;
+    cfg.enableUlRxBf   = false;
+    cfg.nUplinkStreams = 1;
+
+    GraphContextSingleOcc ctx = createGraphContextSingleOcc(cfg);
+    GraphOutputs          outs{};
+    allocGraphOutputs(outs, /*maxAnt=*/ctx.maxAntenna, /*prmbCap=*/64, /*occaCap=*/1);
+
+    cudaGraph_t                  graph{};
+    cudaGraphExec_t              graphExec{};
+    std::vector<cudaGraphNode_t> nodes;
+    nodes.resize(GraphNodeType::FFTNode + PRACH_NUM_SUPPORTED_FFT_SIZES);
+    std::vector<char> activeOcc(1, 1);
+
+    constexpr uint32_t maxFftsPerOccasion = MAX_N_ANTENNAS_SUPPORTED * PRACH_MAX_NUM_PREAMBLES * PRACH_NUM_NON_COHERENT_COMBINING_GROUPS;
+    auto h_fftPointers = cuphy::buffer<cuFloatComplex *, cuphy::pinned_alloc>(PRACH_NUM_SUPPORTED_FFT_SIZES * ctx.nMaxOccasions * maxFftsPerOccasion);
+    std::array<FftInfo, PRACH_NUM_SUPPORTED_FFT_SIZES> fftInfo;
+
+    ASSERT_EQ(cuphyPrachCreateGraph(&graph,
+                                    &graphExec,
+                                    nodes,
+                                    0,
+                                    ctx.d_dyn.addr(),
+                                    ctx.d_static.addr(),
+                                    &ctx.h_static,
+                                    h_fftPointers.addr(),
+                                    fftInfo,
+                                    outs.num,
+                                    outs.idx,
+                                    outs.dly,
+                                    outs.pwr,
+                                    outs.ant,
+                                    outs.rssi,
+                                    outs.interf,
+                                    ctx.nTotCellOcca,
+                                    ctx.nMaxOccasions,
+                                    ctx.maxAntenna,
+                                    ctx.max_l_oran_ant,
+                                    ctx.max_ant_u,
+                                    ctx.max_nfft,
+                                    ctx.max_zoneSizeExt,
+                                    activeOcc,
+                                    ctx.cudaArch),
+              CUPHY_STATUS_SUCCESS);
+
+    EXPECT_TRUE(nodeDependsOn(nodes[GraphNodeType::SearchPDPNode], nodes[GraphNodeType::ComputePDPNode]));
+    EXPECT_TRUE(nodeDependsOn(nodes[GraphNodeType::SearchPDPNode], nodes[GraphNodeType::ComputeRSSI]));
+
+    EXPECT_EQ(cudaSuccess, cudaGraphExecDestroy(graphExec));
+    EXPECT_EQ(cudaSuccess, cudaGraphDestroy(graph));
+    freeGraphOutputs(outs);
     cudaFree(ctx.d_rx);
 }
 

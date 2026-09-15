@@ -31,7 +31,7 @@ namespace cg = cooperative_groups;
 bool pucchF1Rx::isConstMemInited = false;
 std::mutex pucchF1Rx::m_mutexConstMemInit;
 
-// #define ENABLE_DEBUG_F1 
+// #define ENABLE_DEBUG_F1
 
 namespace pucch_F1
 {
@@ -332,7 +332,7 @@ static constexpr float ALPHA_R3R4R5  = 23.5f;
 static constexpr float MAX_SINR   = 65.6f; // Maximum reportable SINR
 static constexpr float MIN_SINR   =-65.6f; // Minimum reportable SINR
 
-static constexpr uint32_t PUCCH_F1_MIN_BLKS_PER_SM = 18; // this may change
+static constexpr uint32_t PUCCH_F1_MIN_BLKS_PER_SM = 14; // tuned for shmem aliasing (y_dmrs = dmrs_per_uci = h_est_iue)
 static __global__ __launch_bounds__(F1_CG_SIZE* F1_NUM_UCI_GRPS_PER_BLK, PUCCH_F1_MIN_BLKS_PER_SM)
 void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
 {
@@ -376,6 +376,12 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
            numRxAnt = pDynDescr->pCellPrms[cellIdx].nRxAnt;
        }
 
+      // Cache frequently-accessed group descriptor fields in registers
+      // to avoid repeated global memory loads (group_data-> is non-const,
+      // so the compiler must reload after each tile.sync() barrier)
+      const int gd_nSym_dmrs = group_data->nSym_dmrs;
+      const int gd_nSym_data = group_data->nSym_data;
+
       //===========================================================================
       // Dynamic shared memory allocation based on maxNAnt, maxNSymData, maxNSymDmrs
       // Layout MUST match kernelSelect() shared memory size computation
@@ -386,23 +392,22 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
       const int maxNSymDmrs = pDynDescr->maxNSymDmrs;
 
       // Compute per-group element counts for offset calculations
+      // y_dmrs now also serves as dmrs_per_uci and h_est_iue (triple alias):
+      //   - Phase 2 writes raw DMRS → y_dmrs
+      //   - Phase 5 transforms in-place → dmrs_per_uci (same memory, same indexing)
+      //   - Ch est overwrites with h_est → h_est_iue (same memory, register-resident wf_temp avoids conflict)
+      const int maxNSymMax          = (maxNSymDmrs > maxNSymData) ? maxNSymDmrs : maxNSymData;
       const int y_data_per_grp      = maxNSymData * N_TONES_PER_PRB * maxNAnt;
-      const int y_dmrs_per_grp      = maxNSymDmrs * N_TONES_PER_PRB * maxNAnt;
-      const int r_per_grp           = N_TONES_PER_PRB;
-      const int dmrs_per_uci_grp    = N_TONES_PER_PRB * maxNSymDmrs * maxNAnt;
-      const int data_per_uci_grp    = N_TONES_PER_PRB * maxNSymData * maxNAnt;
-      const int h_est_per_grp       = maxNSymData * N_TONES_PER_PRB * maxNAnt;
+      const int y_dmrs_per_grp      = maxNSymMax  * N_TONES_PER_PRB * maxNAnt;  // sized for max(dmrs, h_est)
 
       //===========================================================================
       // Dynamic shared memory carve-out: compute base pointers
+      // NOTE: data_per_uci is aliased to y_data (same size, y_data is dead after Phase 5 in-place transform)
+      // NOTE: dmrs_per_uci AND h_est_iue are aliased to y_dmrs (register-resident Wf*DMRS eliminates shmem intermediary)
       __half2* y_data       = sh_buff;                                                                          // [F1_NUM_UCI_GRPS_PER_BLK * y_data_per_grp]
       __half2* y_dmrs       = &y_data[F1_NUM_UCI_GRPS_PER_BLK * y_data_per_grp];                                 // [F1_NUM_UCI_GRPS_PER_BLK * y_dmrs_per_grp]
-      __half2* r1           = &y_dmrs[F1_NUM_UCI_GRPS_PER_BLK * y_dmrs_per_grp];                                 // [F1_NUM_UCI_GRPS_PER_BLK * r_per_grp]
-      __half2* r2           = &r1[F1_NUM_UCI_GRPS_PER_BLK * r_per_grp];                                          // [F1_NUM_UCI_GRPS_PER_BLK * r_per_grp]
-      __half2* dmrs_per_uci = &r2[F1_NUM_UCI_GRPS_PER_BLK * r_per_grp];                                          // [F1_NUM_UCI_GRPS_PER_BLK * dmrs_per_uci_grp]
-      __half2* data_per_uci = &dmrs_per_uci[F1_NUM_UCI_GRPS_PER_BLK * dmrs_per_uci_grp];                         // [F1_NUM_UCI_GRPS_PER_BLK * data_per_uci_grp]
-      __half2* h_est_iue    = &data_per_uci[F1_NUM_UCI_GRPS_PER_BLK * data_per_uci_grp];                         // [F1_NUM_UCI_GRPS_PER_BLK * h_est_per_grp]
-      uint32_t* cs_sh       = reinterpret_cast<uint32_t*>(&h_est_iue[F1_NUM_UCI_GRPS_PER_BLK * h_est_per_grp]);  // [F1_NUM_UCI_GRPS_PER_BLK * F1_MAX_SYMS]
+      // dmrs_per_uci, h_est_iue, and data_per_uci are all aliased to y_dmrs/y_data via per-group carveouts
+      uint32_t* cs_sh       = reinterpret_cast<uint32_t*>(&y_dmrs[F1_NUM_UCI_GRPS_PER_BLK * y_dmrs_per_grp]);    // [F1_NUM_UCI_GRPS_PER_BLK * F1_MAX_SYMS]
       // CTA-cooperative gold sequence cache: [grp][0]=groupHop, [grp][1..4]=csCommon gold words
       uint32_t* goldCache_sh = &cs_sh[F1_NUM_UCI_GRPS_PER_BLK * F1_MAX_SYMS];                                    // [F1_NUM_UCI_GRPS_PER_BLK * (1 + F1_MAX_CS_GOLD_WORDS)]
 
@@ -410,11 +415,9 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
       // Per-group shared memory carveouts
       __half2 *group_data_s            = &y_data[local_group * y_data_per_grp];
       __half2 *group_dmrs_s            = &y_dmrs[local_group * y_dmrs_per_grp];
-      __half2 *group_h_est_iue         = &h_est_iue[local_group * h_est_per_grp];
-      __half2 *group_r1                = &r1[local_group * r_per_grp];
-      __half2 *group_r2                = &r2[local_group * r_per_grp];
-      __half2 *group_dmrs_per_uci      = &dmrs_per_uci[local_group * dmrs_per_uci_grp];
-      __half2 *group_data_per_uci      = &data_per_uci[local_group * data_per_uci_grp];
+      __half2 *group_h_est_iue         = &y_dmrs[local_group * y_dmrs_per_grp];     // aliased to y_dmrs
+      __half2 *group_dmrs_per_uci      = &y_dmrs[local_group * y_dmrs_per_grp];     // aliased to y_dmrs
+      __half2 *group_data_per_uci      = &y_data[local_group * y_data_per_grp];         // aliased to y_data
       uint32_t *cs                     = &cs_sh[local_group * F1_MAX_SYMS];
       uint32_t *goldCache              = &goldCache_sh[local_group * (1 + F1_MAX_CS_GOLD_WORDS)];
       //===========================================================================
@@ -494,75 +497,91 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
        // an extra loop.
        //
        // Note that the data and DMRS symbols are separated here to make the processing easier later
-       for (int i = lane; i < N_TONES_PER_PRB * numRxAnt; i = i + tile.size())
-       {
-           int scIdx   = i / numRxAnt;
-           int antIdx  = i % numRxAnt;
+       // Fused Phase 2+3: load from global memory, apply rBase*d_s scaling inline, store to shmem.
+       // rBase comes from constant memory d_rBase[u][sc], eliminating a separate Phase 3 pass.
+       // Subcarrier pairs are loaded via 64-bit vectorized global reads (adjacent sc have stride-1 in gmem).
+       uint8_t u_hop1 = group_data->u[0];
+       uint8_t u_hop2 = (group_data->freqHopFlag && group_data->groupHopFlag) ? group_data->u[1] : group_data->u[0];
 
-           int firstHopSc = (group_data->startCrb)*CUPHY_N_TONES_PER_PRB + scIdx;
+       // Process subcarrier pairs: 6 pairs × 4 antennas = 24 work items per warp
+       for (int i = lane; i < (N_TONES_PER_PRB / 2) * numRxAnt; i = i + tile.size())
+       {
+           int scPair = (i / numRxAnt) * 2;  // 0, 2, 4, 6, 8, 10
+           int antIdx = i % numRxAnt;
+
+           __half2 rBase1_a  = d_rBase[u_hop1][scPair];
+           __half2 rBase1_b  = d_rBase[u_hop1][scPair + 1];
+           __half2 rBase1s_a = complex_mul(rBase1_a, d_s[scPair]);
+           __half2 rBase1s_b = complex_mul(rBase1_b, d_s[scPair + 1]);
+
+           int firstHopScBase = (group_data->startCrb) * CUPHY_N_TONES_PER_PRB + scPair;
            if (group_data->freqHopFlag) {
+               __half2 rBase2_a  = d_rBase[u_hop2][scPair];
+               __half2 rBase2_b  = d_rBase[u_hop2][scPair + 1];
+               __half2 rBase2s_a = complex_mul(rBase2_a, d_s[scPair]);
+               __half2 rBase2s_b = complex_mul(rBase2_b, d_s[scPair + 1]);
+
                for (int sym = group_data->startSym; sym < group_data->startSym + group_data->nSymFirstHop; sym++) {
+                   // 64-bit vectorized global load: 2 adjacent subcarriers
+                   uint2 pair = *reinterpret_cast<const uint2*>(&tDataRx.addr[tDataRx.offset(firstHopScBase, sym, antIdx)]);
+                   __half2 v0 = *reinterpret_cast<__half2*>(&pair.x);
+                   __half2 v1 = *reinterpret_cast<__half2*>(&pair.y);
                    if ((sym - group_data->startSym) & 1) {
-                       group_data_s[scIdx *group_data->nSym_data*numRxAnt +  (sym-group_data->startSym)/2*numRxAnt + antIdx] = tDataRx(firstHopSc, sym, antIdx);
-                   }
-                   else {
-                       tmp = tDataRx(firstHopSc, sym, antIdx);
-                       group_dmrs_s[scIdx *group_data->nSym_dmrs*numRxAnt +  (sym-group_data->startSym)/2*numRxAnt + antIdx] = tmp;
-                       rssi += __half2float(tmp.x*tmp.x + tmp.y*tmp.y);
+                       int symSlot = (sym - group_data->startSym) / 2;
+                       group_data_s[scPair * gd_nSym_data * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase1_a, v0);
+                       group_data_s[(scPair + 1) * gd_nSym_data * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase1_b, v1);
+                   } else {
+                       int symSlot = (sym - group_data->startSym) / 2;
+                       rssi += __half2float(v0.x * v0.x + v0.y * v0.y);
+                       rssi += __half2float(v1.x * v1.x + v1.y * v1.y);
+                       group_dmrs_s[scPair * gd_nSym_dmrs * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase1s_a, v0);
+                       group_dmrs_s[(scPair + 1) * gd_nSym_dmrs * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase1s_b, v1);
                    }
                }
 
-               int secondHopSc = (group_data->secondHopCrb)*CUPHY_N_TONES_PER_PRB + scIdx;
+               int secondHopScBase = (group_data->secondHopCrb) * CUPHY_N_TONES_PER_PRB + scPair;
                for (int sym = group_data->startSym + group_data->nSymFirstHop; sym < group_data->startSym + group_data->nSym; sym++) {
+                   uint2 pair = *reinterpret_cast<const uint2*>(&tDataRx.addr[tDataRx.offset(secondHopScBase, sym, antIdx)]);
+                   __half2 v0 = *reinterpret_cast<__half2*>(&pair.x);
+                   __half2 v1 = *reinterpret_cast<__half2*>(&pair.y);
                    if ((sym - group_data->startSym) & 1) {
-                       group_data_s[scIdx *group_data->nSym_data*numRxAnt + (sym-group_data->startSym)/2*numRxAnt + antIdx] = tDataRx(secondHopSc, sym, antIdx);
-                   }
-                   else {
-                       tmp = tDataRx(secondHopSc, sym, antIdx);
-                       group_dmrs_s[scIdx *group_data->nSym_dmrs*numRxAnt + (sym-group_data->startSym)/2*numRxAnt + antIdx] = tmp;
-                       rssi += __half2float(tmp.x*tmp.x + tmp.y*tmp.y);
+                       int symSlot = (sym - group_data->startSym) / 2;
+                       group_data_s[scPair * gd_nSym_data * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase2_a, v0);
+                       group_data_s[(scPair + 1) * gd_nSym_data * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase2_b, v1);
+                   } else {
+                       int symSlot = (sym - group_data->startSym) / 2;
+                       rssi += __half2float(v0.x * v0.x + v0.y * v0.y);
+                       rssi += __half2float(v1.x * v1.x + v1.y * v1.y);
+                       group_dmrs_s[scPair * gd_nSym_dmrs * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase2s_a, v0);
+                       group_dmrs_s[(scPair + 1) * gd_nSym_dmrs * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase2s_b, v1);
                    }
                }
            }
            else {
                for (int sym = group_data->startSym; sym < group_data->startSym + group_data->nSym; sym++) {
+                   // 64-bit vectorized global load: 2 adjacent subcarriers
+                   uint2 pair = *reinterpret_cast<const uint2*>(&tDataRx.addr[tDataRx.offset(firstHopScBase, sym, antIdx)]);
+                   __half2 v0 = *reinterpret_cast<__half2*>(&pair.x);
+                   __half2 v1 = *reinterpret_cast<__half2*>(&pair.y);
                    if ((sym - group_data->startSym) & 1) {
-                       group_data_s[scIdx *group_data->nSym_data*numRxAnt + (sym-group_data->startSym)/2*numRxAnt + antIdx] = tDataRx(firstHopSc, sym, antIdx);
-                   }
-                   else {
-                       tmp = tDataRx(firstHopSc, sym, antIdx);
-                       group_dmrs_s[scIdx *group_data->nSym_dmrs*numRxAnt + (sym-group_data->startSym)/2*numRxAnt + antIdx] = tmp;
-                       rssi += __half2float(tmp.x*tmp.x + tmp.y*tmp.y);
+                       int symSlot = (sym - group_data->startSym) / 2;
+                       group_data_s[scPair * gd_nSym_data * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase1_a, v0);
+                       group_data_s[(scPair + 1) * gd_nSym_data * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase1_b, v1);
+                   } else {
+                       int symSlot = (sym - group_data->startSym) / 2;
+                       rssi += __half2float(v0.x * v0.x + v0.y * v0.y);
+                       rssi += __half2float(v1.x * v1.x + v1.y * v1.y);
+                       group_dmrs_s[scPair * gd_nSym_dmrs * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase1s_a, v0);
+                       group_dmrs_s[(scPair + 1) * gd_nSym_dmrs * numRxAnt + symSlot * numRxAnt + antIdx] = complex_mul(rBase1s_b, v1);
                    }
                }
            }
        }
 
-       // Fetch rBase values for first and second hop
-       if (lane < N_TONES_PER_PRB) {
-           group_r1[lane] = d_rBase[group_data->u[0]][lane];
-
-           if (group_data->freqHopFlag && group_data->groupHopFlag) {
-               group_r2[lane] = d_rBase[group_data->u[1]][lane];
-           }
-           else {
-               group_r2[lane] = d_rBase[group_data->u[0]][lane];
-           }
-       }
-
        tile.sync();
 
-#ifdef ENABLE_DEBUG_F1
-       if (0 && (group_data->uciOutputIdx[0]==0)&&(lane < N_TONES_PER_PRB)){
-           __half2 tmp_group_r1 = group_r1[lane];
-           printf("group_r1=%f, lane=%d\n", __half2float(tmp_group_r1.y),lane);
-           __half2 tmp_d_s = d_s[lane];
-           printf("d_s=%f, lane=%d\n", __half2float(tmp_d_s.y),lane);
-       }
-#endif
-
        float rssi_linear = cg::reduce(tile, rssi, cg::plus<float>()) /
-                           static_cast<float>(group_data->nSym_dmrs);
+                           static_cast<float>(gd_nSym_dmrs);
        float rssi_dB = 10.0f * __log10f(rssi_linear);
        rssi_linear /= numRxAnt;
        rssi_linear /= N_TONES_PER_PRB;
@@ -576,44 +595,6 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
 
        // Precompute expensive power computation (constant for all UCIs in group)
        const float rssi_pow_alpha = __powf(rssi_linear, 1.88f) * alpha;
-
-       // Compute DMRS centered and scale the data symbols by rBase. We reuse the same shared memory since the original
-       // values are not needed anymore
-       if (group_data->freqHopFlag)
-       {
-           for(int i = lane; i < N_TONES_PER_PRB * numRxAnt * group_data->nSym_data; i += tile.size()) {
-               int scIdx = i / (numRxAnt * group_data->nSym_data);
-               int idx   = i % (numRxAnt * group_data->nSym_data);
-               tmp       = idx < numRxAnt * group_data->nSymDataFirstHop ? group_r1[scIdx] : group_r2[scIdx];
-               group_data_s[scIdx * numRxAnt * group_data->nSym_data + idx] =
-                   complex_mul(tmp, group_data_s[scIdx * numRxAnt * group_data->nSym_data + idx]);
-           }
-           for(int i = lane; i < N_TONES_PER_PRB * numRxAnt * group_data->nSym_dmrs; i += tile.size()) {
-               int scIdx = i / (numRxAnt * group_data->nSym_dmrs);
-               int idx   = i % (numRxAnt * group_data->nSym_dmrs);
-               tmp       = idx < numRxAnt * group_data->nSymDMRSFirstHop ? group_r1[scIdx] : group_r2[scIdx];
-               group_dmrs_s[scIdx * numRxAnt * group_data->nSym_dmrs + idx] =
-                   complex_mul(tmp, complex_mul(d_s[scIdx], group_dmrs_s[scIdx * numRxAnt * group_data->nSym_dmrs + idx]));
-           }
-       }
-       else // No hopping
-       {
-           for(int i = lane; i < N_TONES_PER_PRB * numRxAnt * group_data->nSym_data; i += tile.size()) {
-               int scIdx = i / (numRxAnt * group_data->nSym_data);
-               int idx   = i % (numRxAnt * group_data->nSym_data);
-               group_data_s[scIdx * numRxAnt * group_data->nSym_data + idx] =
-                   complex_mul(group_r1[scIdx], group_data_s[scIdx * numRxAnt * group_data->nSym_data + idx]);
-           }
-           for(int i = lane; i < N_TONES_PER_PRB * numRxAnt * group_data->nSym_dmrs; i += tile.size()) {
-               int scIdx = i / (numRxAnt * group_data->nSym_dmrs);
-               int idx   = i % (numRxAnt * group_data->nSym_dmrs);
-               group_dmrs_s[scIdx * numRxAnt * group_data->nSym_dmrs + idx] =
-                   complex_mul(group_r1[scIdx], complex_mul(d_s[scIdx], group_dmrs_s[scIdx * numRxAnt * group_data->nSym_dmrs + idx]));
-           }
-       }
-
-       tile.sync();
-
        // Pointers to LUTs based on number of symbols
        __half2 *tocc_tables[] = {(__half2*)d_tOCC_1, (__half2*)d_tOCC_2, (__half2*)d_tOCC_3, (__half2*)d_tOCC_4, (__half2*)d_tOCC_5, (__half2*)d_tOCC_6, (__half2*)d_tOCC_7};
 
@@ -662,58 +643,58 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                {
                    for(int sym = 0; sym < group_data->nSymDMRSFirstHop; sym++)
                    {
-                       group_dmrs_per_uci[scIdx * group_data->nSym_dmrs * numRxAnt + sym * numRxAnt + antIdx] =
+                       group_dmrs_per_uci[scIdx * gd_nSym_dmrs * numRxAnt + sym * numRxAnt + antIdx] =
                            complex_mul(
                                complex_mul(tocc_tables[group_data->nSymDMRSFirstHop - 1][group_data->timeDomainOccIdx[uci] * group_data->nSymDMRSFirstHop + sym],
                                            d_csPhaseRamp[scIdx][cs[2 * sym]]),
-                               group_dmrs_s[scIdx * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx]);
+                               group_dmrs_s[scIdx * numRxAnt * gd_nSym_dmrs + sym * numRxAnt + antIdx]);
                    }
 
                    for(int sym = 0; sym < group_data->nSymDataFirstHop; sym++)
                    {
-                       group_data_per_uci[scIdx * group_data->nSym_data * numRxAnt + sym * numRxAnt + antIdx] =
+                       group_data_per_uci[scIdx * gd_nSym_data * numRxAnt + sym * numRxAnt + antIdx] =
                            complex_mul(
                                complex_mul(tocc_tables[group_data->nSymDataFirstHop - 1][group_data->timeDomainOccIdx[uci] * group_data->nSymDataFirstHop + sym],
                                            d_csPhaseRamp[scIdx][cs[2 * sym + 1]]),
-                               group_data_s[scIdx * numRxAnt * group_data->nSym_data + sym * numRxAnt + antIdx]);
+                               group_data_s[scIdx * numRxAnt * gd_nSym_data + sym * numRxAnt + antIdx]);
                    }
 
-                   for(int sym = group_data->nSymDMRSFirstHop; sym < group_data->nSym_dmrs; sym++)
+                   for(int sym = group_data->nSymDMRSFirstHop; sym < gd_nSym_dmrs; sym++)
                    {
-                       group_dmrs_per_uci[scIdx * group_data->nSym_dmrs * numRxAnt + sym * numRxAnt + antIdx] =
+                       group_dmrs_per_uci[scIdx * gd_nSym_dmrs * numRxAnt + sym * numRxAnt + antIdx] =
                            complex_mul(
                                complex_mul(tocc_tables[group_data->nSymDMRSSecondHop - 1][group_data->timeDomainOccIdx[uci] * group_data->nSymDMRSSecondHop + (sym - group_data->nSymDMRSFirstHop)],
                                            d_csPhaseRamp[scIdx][cs[2 * sym]]),
-                               group_dmrs_s[scIdx * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx]);
+                               group_dmrs_s[scIdx * numRxAnt * gd_nSym_dmrs + sym * numRxAnt + antIdx]);
                    }
 
-                   for(int sym = group_data->nSymDataFirstHop; sym < group_data->nSym_data; sym++)
+                   for(int sym = group_data->nSymDataFirstHop; sym < gd_nSym_data; sym++)
                    {
-                       group_data_per_uci[scIdx * group_data->nSym_data * numRxAnt + sym * numRxAnt + antIdx] =
+                       group_data_per_uci[scIdx * gd_nSym_data * numRxAnt + sym * numRxAnt + antIdx] =
                            complex_mul(
                                complex_mul(tocc_tables[group_data->nSymDataSecondHop - 1][group_data->timeDomainOccIdx[uci] * group_data->nSymDataSecondHop + (sym - group_data->nSymDataFirstHop)],
                                            d_csPhaseRamp[scIdx][cs[2 * sym + 1]]),
-                               group_data_s[scIdx * numRxAnt * group_data->nSym_data + sym * numRxAnt + antIdx]);
+                               group_data_s[scIdx * numRxAnt * gd_nSym_data + sym * numRxAnt + antIdx]);
                    }
                }
                else
                {
-                   for(int sym = 0; sym < group_data->nSym_dmrs; sym++)
+                   for(int sym = 0; sym < gd_nSym_dmrs; sym++)
                    {
-                       group_dmrs_per_uci[scIdx * group_data->nSym_dmrs * numRxAnt + sym * numRxAnt + antIdx] =
+                       group_dmrs_per_uci[scIdx * gd_nSym_dmrs * numRxAnt + sym * numRxAnt + antIdx] =
                            complex_mul(
-                               complex_mul(tocc_tables[group_data->nSym_dmrs - 1][group_data->timeDomainOccIdx[uci] * group_data->nSym_dmrs + sym],
+                               complex_mul(tocc_tables[gd_nSym_dmrs - 1][group_data->timeDomainOccIdx[uci] * gd_nSym_dmrs + sym],
                                            d_csPhaseRamp[scIdx][cs[2 * sym]]),
-                               group_dmrs_s[scIdx * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx]);
+                               group_dmrs_s[scIdx * numRxAnt * gd_nSym_dmrs + sym * numRxAnt + antIdx]);
                    }
 
-                   for(int sym = 0; sym < group_data->nSym_data; sym++)
+                   for(int sym = 0; sym < gd_nSym_data; sym++)
                    {
-                       group_data_per_uci[scIdx * group_data->nSym_data * numRxAnt + sym * numRxAnt + antIdx] =
+                       group_data_per_uci[scIdx * gd_nSym_data * numRxAnt + sym * numRxAnt + antIdx] =
                            complex_mul(
-                               complex_mul(tocc_tables[group_data->nSym_data - 1][group_data->timeDomainOccIdx[uci] * group_data->nSym_data + sym],
+                               complex_mul(tocc_tables[gd_nSym_data - 1][group_data->timeDomainOccIdx[uci] * gd_nSym_data + sym],
                                            d_csPhaseRamp[scIdx][cs[2 * sym + 1]]),
-                               group_data_s[scIdx * numRxAnt * group_data->nSym_data + sym * numRxAnt + antIdx]);
+                               group_data_s[scIdx * numRxAnt * gd_nSym_data + sym * numRxAnt + antIdx]);
                    }
                }
            }
@@ -722,7 +703,7 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
 
            // Apply noise isolation filter to each symbol and sum results to compute noise energy
            float noiseEngAccum = 0.0f;
-           for(int i = lane; i < (group_data->nSym_dmrs * numRxAnt * NOISE_FILT_LEN); i += tile.size())
+           for(int i = lane; i < (gd_nSym_dmrs * numRxAnt * NOISE_FILT_LEN); i += tile.size())
            {
                int    sym     = i / (NOISE_FILT_LEN * numRxAnt);
                int    a       = (i / NOISE_FILT_LEN) % numRxAnt;
@@ -733,20 +714,20 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                {
                    element = complex_add(element,
                                          __half22float2(
-                                             real_mul(group_dmrs_per_uci[sc * group_data->nSym_dmrs * numRxAnt + sym * numRxAnt + a], d_W_noiseIso[b][sc])));
+                                             real_mul(group_dmrs_per_uci[sc * gd_nSym_dmrs * numRxAnt + sym * numRxAnt + a], d_W_noiseIso[b][sc])));
                }
                noiseEngAccum += element.x * element.x + element.y * element.y;
            }
 
            // Compute timing advance by correlating across subcarriers
            __half2 avg_sc_corr = __half2(0.0f, 0.0f);
-           for(int i = lane; i < (N_TA_EST_SC * group_data->nSym_dmrs * numRxAnt); i += tile.size())
+           for(int i = lane; i < (N_TA_EST_SC * gd_nSym_dmrs * numRxAnt); i += tile.size())
            {
-               int sc  = i / (group_data->nSym_dmrs * numRxAnt);
-               int sym = (i / numRxAnt) % group_data->nSym_dmrs;
+               int sc  = i / (gd_nSym_dmrs * numRxAnt);
+               int sym = (i / numRxAnt) % gd_nSym_dmrs;
                int a   = i % numRxAnt;
-               avg_sc_corr += complex_conjmul(complex_conjmul(group_dmrs_per_uci[(sc + 1) * group_data->nSym_dmrs * numRxAnt + sym * numRxAnt + a], d_s[sc + 1]),
-                                              complex_conjmul(group_dmrs_per_uci[sc * group_data->nSym_dmrs * numRxAnt + sym * numRxAnt + a], d_s[sc]));
+               avg_sc_corr += complex_conjmul(complex_conjmul(group_dmrs_per_uci[(sc + 1) * gd_nSym_dmrs * numRxAnt + sym * numRxAnt + a], d_s[sc + 1]),
+                                              complex_conjmul(group_dmrs_per_uci[sc * gd_nSym_dmrs * numRxAnt + sym * numRxAnt + a], d_s[sc]));
            }
            tile.sync();
 
@@ -755,7 +736,7 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
            uint32_t scs           = MU_0_HZ << pDynDescr->pCellPrms[cellIdx].mu;
            float    taEstMicroSec = -RAD_TO_USEC * angle / float(scs);
 
-           float avgNoiseAndIntEnergy = cg::reduce(tile, noiseEngAccum, cg::plus<float>()) / (group_data->nSym_dmrs * numRxAnt * NOISE_FILT_LEN);
+           float avgNoiseAndIntEnergy = cg::reduce(tile, noiseEngAccum, cg::plus<float>()) / (gd_nSym_dmrs * numRxAnt * NOISE_FILT_LEN);
            float avgSignalEnergy      = rssi_linear - avgNoiseAndIntEnergy;
            float interf_dB            = 10.0f * __log10f(avgNoiseAndIntEnergy);
            float sinr_dB              = 10.0f * __log10f(fabs(avgSignalEnergy)) - interf_dB;
@@ -796,11 +777,7 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
 
            if(group_data->freqHopFlag)
            {
-               // Zero out the initial shared memory to re-use for GEMM accumulators
-               for(int i = lane; i < h_est_per_grp; i += F1_CG_SIZE)
-               {
-                   group_h_est_iue[i] = __half2(0.0f, 0.0f);
-               }
+              // h_est_iue is aliased to dmrs_per_uci — no clear here (two-phase ch est uses direct writes)
 
               // calculate RSRP - precompute inverse scale factors to replace divisions with multiplications
               const float inv_scale_h1   = __frcp_rn(static_cast<float>(N_TONES_PER_PRB) * static_cast<float>(group_data->nSymDMRSFirstHop));
@@ -815,7 +792,7 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                   {
                       for(int sym = 0; sym < group_data->nSymDMRSFirstHop; sym++)
                       {
-                          temp_t_dmrs += group_dmrs_per_uci[lane * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx];
+                          temp_t_dmrs += group_dmrs_per_uci[lane * numRxAnt * gd_nSym_dmrs + sym * numRxAnt + antIdx];
                       }
                       temp_t_dmrs = complex_conjmul(temp_t_dmrs, d_s[lane]);
                   }
@@ -829,9 +806,9 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                   temp_t_dmrs = __half2(0.0f, 0.0f);
                   if(lane < N_TONES_PER_PRB)
                   {
-                      for(int sym = group_data->nSymDMRSFirstHop; sym < group_data->nSym_dmrs; sym++)
+                      for(int sym = group_data->nSymDMRSFirstHop; sym < gd_nSym_dmrs; sym++)
                       {
-                          temp_t_dmrs += group_dmrs_per_uci[lane * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx];
+                          temp_t_dmrs += group_dmrs_per_uci[lane * numRxAnt * gd_nSym_dmrs + sym * numRxAnt + antIdx];
                       }
                       temp_t_dmrs = complex_conjmul(temp_t_dmrs, d_s[lane]);
                   }
@@ -892,55 +869,75 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                default: break;
                }
 
-               for(int i = lane; i < N_TONES_PER_PRB * numRxAnt; i += tile.size())
+               // Register-resident channel estimation for freq-hop case:
+               // Wf*DMRS for ALL symbols computed in registers (no shmem intermediary),
+               // enabling dmrs_per_uci/h_est_iue to alias y_dmrs.
+               // wf registers survive through both hop h_est writes and QAM reads.
+               __half2 wf0_hop[MAX_DMRS_SYMS_F1], wf1_hop[MAX_DMRS_SYMS_F1];
                {
-                   int scIdx  = i / numRxAnt;
-                   int antIdx = i % numRxAnt;
-                   // To conserve memory, we need to do a double-GEMM here so that we don't have to store the intermediate results. See comment above
-                   for(int sym = 0; sym < group_data->nSymDMRSFirstHop; sym++)
-                   {
-                       __half2 accum(0.0f, 0.0f);
-                       #pragma unroll
-                       for(int j = 0; j < N_TONES_PER_PRB; j++)
-                       { // Cols of Wf. Each scIdx processes a single row
-                           accum = __hadd2(accum,
-                                           real_mul(group_dmrs_per_uci[j * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx], d_Wf[scIdx][j]));
+                   const int nSym_dmrs_total  = gd_nSym_dmrs;
+                   const int nSymDMRSFirstHop = group_data->nSymDMRSFirstHop;
+                   const int nSymDataFirstHop = group_data->nSymDataFirstHop;
+                   const int total_sc_ant = N_TONES_PER_PRB * numRxAnt;
+                   const int w0_sc  = lane / numRxAnt;
+                   const int w0_ant = lane % numRxAnt;
+                   const int w1     = lane + tile.size();
+                   const int w1_sc  = w1 / numRxAnt;
+                   const int w1_ant = w1 % numRxAnt;
+
+                   // Compute Wf*DMRS in registers for ALL symbols
+                   if (lane < total_sc_ant) {
+                       for (int sym = 0; sym < nSym_dmrs_total; sym++) {
+                           __half2 accum = __half2(0.0f, 0.0f);
+                           #pragma unroll
+                           for (int j = 0; j < N_TONES_PER_PRB; j++)
+                               accum = __hfma2(group_dmrs_per_uci[j * numRxAnt * nSym_dmrs_total + sym * numRxAnt + w0_ant],
+                                              __half2half2(d_Wf[w0_sc][j]), accum);
+                           wf0_hop[sym] = accum;
                        }
-#ifdef ENABLE_DEBUG_F1
-                       if(0 && (antIdx == 0) && (sym == 0) && (scIdx == 0))
-                       {
-                           int uci_idx = group_data->uciOutputIdx[0];
-                           printf("uci_idx=%d, accum_after_Wf=%f\n", uci_idx, __half2float(accum.x));
-                           if(uci_idx == 0)
-                           {
-                               for(int j = 0; j < N_TONES_PER_PRB; j++)
-                               {
-                                   __half2 tmp = group_dmrs_per_uci[j * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx];
-                                   printf("group_dmrs_per_uci[%d]=%f\n", i, __half2float(tmp.x));
-                               }
-                           }
+                   }
+                   if (w1 < total_sc_ant) {
+                       for (int sym = 0; sym < nSym_dmrs_total; sym++) {
+                           __half2 accum = __half2(0.0f, 0.0f);
+                           #pragma unroll
+                           for (int j = 0; j < N_TONES_PER_PRB; j++)
+                               accum = __hfma2(group_dmrs_per_uci[j * numRxAnt * nSym_dmrs_total + sym * numRxAnt + w1_ant],
+                                              __half2half2(d_Wf[w1_sc][j]), accum);
+                           wf1_hop[sym] = accum;
                        }
-#endif
-                       // Now we have the accumulated value from one cell in C = A*B. Now use that value to sweep over E = C*D. We also apply the element-wise
-                       // multiply by conj(s) here as well to avoid more loops
-                       for(int E_col = 0; E_col < group_data->nSymDataFirstHop; E_col++)
-                       {
-                           group_h_est_iue[scIdx * numRxAnt * group_data->nSymDataFirstHop + E_col * numRxAnt + antIdx] +=
-                               complex_conjmul(real_mul(accum, Wt_table_h1[sym * group_data->nSymDataFirstHop + E_col]), d_s[scIdx]);
+                   }
+
+                   tile.sync();  // All dmrs reads complete; h_est writes can proceed
+
+                   // Phase 2a: First hop h_est from wf[0..nSymDMRSFirstHop-1]
+                   if (lane < total_sc_ant) {
+                       for (int col = 0; col < nSymDataFirstHop; col++) {
+                           __half2 h = __half2(0.0f, 0.0f);
+                           for (int sym = 0; sym < nSymDMRSFirstHop; sym++)
+                               h = __hfma2(wf0_hop[sym], __half2half2(Wt_table_h1[sym * nSymDataFirstHop + col]), h);
+                           group_h_est_iue[w0_sc * numRxAnt * nSymDataFirstHop + col * numRxAnt + w0_ant] = complex_conjmul(h, d_s[w0_sc]);
+                       }
+                   }
+                   if (w1 < total_sc_ant) {
+                       for (int col = 0; col < nSymDataFirstHop; col++) {
+                           __half2 h = __half2(0.0f, 0.0f);
+                           for (int sym = 0; sym < nSymDMRSFirstHop; sym++)
+                               h = __hfma2(wf1_hop[sym], __half2half2(Wt_table_h1[sym * nSymDataFirstHop + col]), h);
+                           group_h_est_iue[w1_sc * numRxAnt * nSymDataFirstHop + col * numRxAnt + w1_ant] = complex_conjmul(h, d_s[w1_sc]);
                        }
                    }
                }
 
                tile.sync();
 
-               // Compute step 3 in the comment above
+               // QAM estimate for first hop data symbols
                for(int i = lane; i < N_TONES_PER_PRB * numRxAnt; i += tile.size())
                {
                    int scIdx  = i / numRxAnt;
                    int antIdx = i % numRxAnt;
                    for(int sym = 0; sym < group_data->nSymDataFirstHop; sym++)
                    {
-                       tmp = complex_conjmul(group_data_per_uci[scIdx * numRxAnt * group_data->nSym_data + sym * numRxAnt + antIdx],
+                       tmp = complex_conjmul(group_data_per_uci[scIdx * numRxAnt * gd_nSym_data + sym * numRxAnt + antIdx],
                                              group_h_est_iue[scIdx * numRxAnt * group_data->nSymDataFirstHop + sym * numRxAnt + antIdx]);
 
                        qam_est_x += __half2float(tmp.x);
@@ -948,76 +945,60 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                    }
                }
 
-               // Sync is needed since we blow away group_h_est_iue right after this
-               tile.sync();
-#ifdef ENABLE_DEBUG_F1
-               if(0 && (lane == 0))
-               {
-                   __half2 my_data     = group_data_per_uci[0];
-                   __half2 my_dmrs     = group_h_est_iue[0];
-                   __half2 my_ori_dmrs = group_dmrs_per_uci[0];
-                   printf("uci_idx=%d, group_data_per_uci=%f, group_h_est_iue=%f, group_dmrs_per_uci=%f\n", group_data->uciOutputIdx[0], __half2float(my_data.x), __half2float(my_dmrs.x), __half2float(my_ori_dmrs.x));
-                   printf("uci_idx=%d, qam_est_x=%f, qam_est_y=%f\n", group_data->uciOutputIdx[0], cg::reduce(tile, qam_est_x, cg::plus<float>()), cg::reduce(tile, qam_est_y, cg::plus<float>()));
-               }
-#endif
-               for(int i = lane; i < h_est_per_grp; i += F1_CG_SIZE)
-               {
-                   group_h_est_iue[i] = __half2(0.0f, 0.0f);
-               }
-
                tile.sync();
 
-               // Second hop
-               for(int i = lane; i < N_TONES_PER_PRB * numRxAnt; i += tile.size())
+               // Phase 2b: Second hop h_est from wf[nSymDMRSFirstHop..total-1]
                {
-                   int scIdx  = i / numRxAnt;
-                   int antIdx = i % numRxAnt;
-                   for(int sym = group_data->nSymDMRSFirstHop; sym < group_data->nSym_dmrs; sym++)
-                   {
-                       __half2 accum(0.0f, 0.0f);
-                       #pragma unroll
-                       for(int j = 0; j < N_TONES_PER_PRB; j++)
-                       { // Cols of Wf. Each scIdx processes a single row
-                           accum = __hadd2(accum,
-                                           real_mul(group_dmrs_per_uci[j * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx], d_Wf[scIdx][j]));
+                   const int nSymDMRSFirstHop  = group_data->nSymDMRSFirstHop;
+                   const int nSymDMRSSecondHop = gd_nSym_dmrs - nSymDMRSFirstHop;
+                   const int nSymDataSecondHop = group_data->nSymDataSecondHop;
+                   const int total_sc_ant = N_TONES_PER_PRB * numRxAnt;
+
+                   if (lane < total_sc_ant) {
+                       const int w0_sc  = lane / numRxAnt;
+                       const int w0_ant = lane % numRxAnt;
+                       for (int col = 0; col < nSymDataSecondHop; col++) {
+                           __half2 h = __half2(0.0f, 0.0f);
+                           for (int sym = 0; sym < nSymDMRSSecondHop; sym++)
+                               h = __hfma2(wf0_hop[sym + nSymDMRSFirstHop], __half2half2(Wt_table_h2[sym * nSymDataSecondHop + col]), h);
+                           group_h_est_iue[w0_sc * numRxAnt * nSymDataSecondHop + col * numRxAnt + w0_ant] = complex_conjmul(h, d_s[w0_sc]);
                        }
-
-                       // Now we have the accumulated value from one cell in C = A*B. Now use that value to sweep over E = C*D. We also apply the element-wise
-                       // multiply by conj(s) here as well to avoid more loops
-                       for(int E_col = 0; E_col < group_data->nSymDataSecondHop; E_col++)
-                       {
-                           group_h_est_iue[scIdx * numRxAnt * group_data->nSymDataSecondHop + E_col * numRxAnt + antIdx] +=
-                               complex_conjmul(real_mul(accum, Wt_table_h2[(sym - group_data->nSymDMRSFirstHop) * group_data->nSymDataSecondHop + E_col]), d_s[scIdx]);
+                   }
+                   const int w1 = lane + tile.size();
+                   if (w1 < total_sc_ant) {
+                       const int w1_sc  = w1 / numRxAnt;
+                       const int w1_ant = w1 % numRxAnt;
+                       for (int col = 0; col < nSymDataSecondHop; col++) {
+                           __half2 h = __half2(0.0f, 0.0f);
+                           for (int sym = 0; sym < nSymDMRSSecondHop; sym++)
+                               h = __hfma2(wf1_hop[sym + nSymDMRSFirstHop], __half2half2(Wt_table_h2[sym * nSymDataSecondHop + col]), h);
+                           group_h_est_iue[w1_sc * numRxAnt * nSymDataSecondHop + col * numRxAnt + w1_ant] = complex_conjmul(h, d_s[w1_sc]);
                        }
                    }
                }
 
                tile.sync();
 
+               // QAM estimate for second hop data symbols
                for(int i = lane; i < N_TONES_PER_PRB * numRxAnt; i += tile.size())
                {
                    int scIdx  = i / numRxAnt;
                    int antIdx = i % numRxAnt;
-                   for(int sym = group_data->nSymDataFirstHop; sym < group_data->nSym_data; sym++)
+                   for(int sym = group_data->nSymDataFirstHop; sym < gd_nSym_data; sym++)
                    {
-                       __half2 tmp = complex_conjmul(group_data_per_uci[scIdx * numRxAnt * group_data->nSym_data + sym * numRxAnt + antIdx],
+                       __half2 tmp = complex_conjmul(group_data_per_uci[scIdx * numRxAnt * gd_nSym_data + sym * numRxAnt + antIdx],
                                                      group_h_est_iue[scIdx * numRxAnt * group_data->nSymDataSecondHop + (sym - group_data->nSymDataFirstHop) * numRxAnt + antIdx]);
 
                        qam_est_x += __half2float(tmp.x);
                        qam_est_y += __half2float(tmp.y);
                    }
                }
-               //tile.sync();
            }
            else
            {
-               for(int i = lane; i < h_est_per_grp; i += F1_CG_SIZE)
-               {
-                   group_h_est_iue[i] = __half2(0.0f, 0.0f);
-               }
 
               // Precompute inverse scale factors to replace divisions with multiplications
-              const float inv_scale_dmrs = __frcp_rn(static_cast<float>(N_TONES_PER_PRB) * static_cast<float>(group_data->nSym_dmrs));
+              const float inv_scale_dmrs = __frcp_rn(static_cast<float>(N_TONES_PER_PRB) * static_cast<float>(gd_nSym_dmrs));
               const float inv_numRxAnt = __frcp_rn(static_cast<float>(numRxAnt));
 
               for(int antIdx = 0; antIdx < numRxAnt; antIdx++)
@@ -1025,9 +1006,9 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                   temp_t_dmrs = __half2(0.0f, 0.0f);
                   if(lane < N_TONES_PER_PRB)
                   {
-                      for(int sym = 0; sym < group_data->nSym_dmrs; sym++)
+                      for(int sym = 0; sym < gd_nSym_dmrs; sym++)
                       {
-                          temp_t_dmrs += group_dmrs_per_uci[lane * numRxAnt * group_data->nSym_dmrs + sym * numRxAnt + antIdx];
+                          temp_t_dmrs += group_dmrs_per_uci[lane * numRxAnt * gd_nSym_dmrs + sym * numRxAnt + antIdx];
                       }
                       temp_t_dmrs = complex_conjmul(temp_t_dmrs, d_s[lane]);
                   }
@@ -1055,55 +1036,63 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                default: break;
                }
 
-              // Two-phase channel estimation for better parallelism:
-              // Phase 1: Compute Wf * DMRS for all (sc, ant, sym) - store in temp buffer
-              // Phase 2: Apply Wt and sum over symbols for each (sc, ant, E_col)
-              // We reuse group_dmrs_s as temp buffer (no longer needed at this point)
+              // Register-resident channel estimation: Wf*DMRS computed in registers
+              // instead of shmem intermediary, enabling dmrs_per_uci/h_est_iue to alias y_dmrs.
+              // Each thread handles up to 2 (sc, ant) work items, computing all sym values in registers,
+              // then writing h_est after a sync ensures all dmrs reads are complete.
               {
-                  const int nSym_dmrs_local = group_data->nSym_dmrs;
-                  const int nSym_data_local = group_data->nSym_data;
-                  __half2* wf_temp = group_dmrs_s;  // Reuse as temp buffer
+                  const int nSym_dmrs_local = gd_nSym_dmrs;
+                  const int nSym_data_local = gd_nSym_data;
+                  const int total_sc_ant = N_TONES_PER_PRB * numRxAnt;
 
-                  // Phase 1: Compute wf_temp[sc, ant, sym] = Wf[sc, :] * DMRS[:, ant, sym]
-                  // Flatten across (sc, ant, sym) for full parallelism
-                  const int phase1_work = N_TONES_PER_PRB * numRxAnt * nSym_dmrs_local;
-                  for(int w = lane; w < phase1_work; w += tile.size())
-                  {
-                      const int scIdx  = w / (numRxAnt * nSym_dmrs_local);
-                      const int rem    = w % (numRxAnt * nSym_dmrs_local);
-                      const int antIdx = rem / nSym_dmrs_local;
-                      const int sym    = rem % nSym_dmrs_local;
+                  __half2 wf0[MAX_DMRS_SYMS_F1], wf1[MAX_DMRS_SYMS_F1];
+                  const int w0_sc  = lane / numRxAnt;
+                  const int w0_ant = lane % numRxAnt;
+                  const int w1     = lane + tile.size();
+                  const int w1_sc  = w1 / numRxAnt;
+                  const int w1_ant = w1 % numRxAnt;
 
-                      __half2 accum = __half2(0.0f, 0.0f);
-                      #pragma unroll
-                      for(int j = 0; j < N_TONES_PER_PRB; j++)
-                      {
-                          accum = __hadd2(accum, real_mul(group_dmrs_per_uci[j * numRxAnt * nSym_dmrs_local + sym * numRxAnt + antIdx], d_Wf[scIdx][j]));
+                  // Compute Wf*DMRS in registers for work item 0
+                  if (lane < total_sc_ant) {
+                      for (int sym = 0; sym < nSym_dmrs_local; sym++) {
+                          __half2 accum = __half2(0.0f, 0.0f);
+                          #pragma unroll
+                          for (int j = 0; j < N_TONES_PER_PRB; j++)
+                              accum = __hfma2(group_dmrs_per_uci[j * numRxAnt * nSym_dmrs_local + sym * numRxAnt + w0_ant],
+                                             __half2half2(d_Wf[w0_sc][j]), accum);
+                          wf0[sym] = accum;
                       }
-                      wf_temp[scIdx * numRxAnt * nSym_dmrs_local + antIdx * nSym_dmrs_local + sym] = accum;
+                  }
+                  // Compute Wf*DMRS in registers for work item 1
+                  if (w1 < total_sc_ant) {
+                      for (int sym = 0; sym < nSym_dmrs_local; sym++) {
+                          __half2 accum = __half2(0.0f, 0.0f);
+                          #pragma unroll
+                          for (int j = 0; j < N_TONES_PER_PRB; j++)
+                              accum = __hfma2(group_dmrs_per_uci[j * numRxAnt * nSym_dmrs_local + sym * numRxAnt + w1_ant],
+                                             __half2half2(d_Wf[w1_sc][j]), accum);
+                          wf1[sym] = accum;
+                      }
                   }
 
-                  tile.sync();
+                  tile.sync();  // All dmrs reads complete; h_est writes can now safely overwrite same memory
 
-                  // Phase 2: Compute h_est[sc, ant, E_col] = conj(s[sc]) * sum_sym(wf_temp[sc, ant, sym] * Wt[sym, E_col])
-                  // Flatten across (sc, ant, E_col) for full parallelism - each thread computes full sym sum
-                  const int phase2_work = N_TONES_PER_PRB * numRxAnt * nSym_data_local;
-                  for(int w = lane; w < phase2_work; w += tile.size())
-                  {
-                      const int scIdx  = w / (numRxAnt * nSym_data_local);
-                      const int rem    = w % (numRxAnt * nSym_data_local);
-                      const int antIdx = rem / nSym_data_local;
-                      const int E_col  = rem % nSym_data_local;
-
-                      __half2 h_est_accum = __half2(0.0f, 0.0f);
-                      for(int sym = 0; sym < nSym_dmrs_local; sym++)
-                      {
-                          h_est_accum = __hadd2(h_est_accum,
-                              real_mul(wf_temp[scIdx * numRxAnt * nSym_dmrs_local + antIdx * nSym_dmrs_local + sym],
-                                       Wt_table_h1[sym * nSym_data_local + E_col]));
+                  // Apply Wt and write h_est from register-cached Wf*DMRS
+                  if (lane < total_sc_ant) {
+                      for (int col = 0; col < nSym_data_local; col++) {
+                          __half2 h = __half2(0.0f, 0.0f);
+                          for (int sym = 0; sym < nSym_dmrs_local; sym++)
+                              h = __hfma2(wf0[sym], __half2half2(Wt_table_h1[sym * nSym_data_local + col]), h);
+                          group_h_est_iue[w0_sc * numRxAnt * nSym_data_local + col * numRxAnt + w0_ant] = complex_conjmul(h, d_s[w0_sc]);
                       }
-                      // Write final result with conj(s) applied
-                      group_h_est_iue[scIdx * numRxAnt * nSym_data_local + E_col * numRxAnt + antIdx] = complex_conjmul(h_est_accum, d_s[scIdx]);
+                  }
+                  if (w1 < total_sc_ant) {
+                      for (int col = 0; col < nSym_data_local; col++) {
+                          __half2 h = __half2(0.0f, 0.0f);
+                          for (int sym = 0; sym < nSym_dmrs_local; sym++)
+                              h = __hfma2(wf1[sym], __half2half2(Wt_table_h1[sym * nSym_data_local + col]), h);
+                          group_h_est_iue[w1_sc * numRxAnt * nSym_data_local + col * numRxAnt + w1_ant] = complex_conjmul(h, d_s[w1_sc]);
+                      }
                   }
               }
 
@@ -1113,12 +1102,12 @@ void pucchF1RxKernel(pucchF1RxDynDescr_t* pDynDescr)
                {
                    int scIdx  = i / numRxAnt;
                    int antIdx = i % numRxAnt;
-                   for(int sym = 0; sym < group_data->nSym_data; sym++)
+                   for(int sym = 0; sym < gd_nSym_data; sym++)
                    {
-                       __half2 tmp = complex_conjmul(group_data_per_uci[scIdx * numRxAnt * group_data->nSym_data + sym * numRxAnt + antIdx],
-                                                     group_h_est_iue[scIdx * numRxAnt * group_data->nSym_data + sym * numRxAnt + antIdx]);
+                       __half2 tmp = complex_conjmul(group_data_per_uci[scIdx * numRxAnt * gd_nSym_data + sym * numRxAnt + antIdx],
+                                                     group_h_est_iue[scIdx * numRxAnt * gd_nSym_data + sym * numRxAnt + antIdx]);
 
-                       group_h_est_iue[scIdx * numRxAnt * group_data->nSym_data + sym * numRxAnt + antIdx] = tmp;
+                       group_h_est_iue[scIdx * numRxAnt * gd_nSym_data + sym * numRxAnt + antIdx] = tmp;
                        qam_est_x += __half2float(tmp.x);
                        qam_est_y += __half2float(tmp.y);
                    }
@@ -1321,21 +1310,14 @@ void  pucchF1Rx::kernelSelect(uint32_t                   nUciGrps,
     const int maxNSymData = maxShape.nSymData;
     const int maxNSymDmrs = maxShape.nSymDmrs;
 
+    // y_dmrs now also serves as dmrs_per_uci and h_est_iue (triple alias via register-resident wf_temp)
+    const int maxNSymMax          = (maxNSymDmrs > maxNSymData) ? maxNSymDmrs : maxNSymData;
     const int y_data_per_grp      = maxNSymData * N_TONES_PER_PRB * maxNAnt;
-    const int y_dmrs_per_grp      = maxNSymDmrs * N_TONES_PER_PRB * maxNAnt;
-    const int r_per_grp           = N_TONES_PER_PRB;
-    const int dmrs_per_uci_grp    = N_TONES_PER_PRB * maxNSymDmrs * maxNAnt;
-    const int data_per_uci_grp    = N_TONES_PER_PRB * maxNSymData * maxNAnt;
-    const int h_est_per_grp       = maxNSymData * N_TONES_PER_PRB * maxNAnt;
+    const int y_dmrs_per_grp      = maxNSymMax  * N_TONES_PER_PRB * maxNAnt;  // sized for max(dmrs, h_est)
 
     int dyn_shared_sz = 0;
-    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * y_data_per_grp * sizeof(__half2);      // y_data
-    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * y_dmrs_per_grp * sizeof(__half2);      // y_dmrs
-    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * r_per_grp * sizeof(__half2);           // r1
-    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * r_per_grp * sizeof(__half2);           // r2
-    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * dmrs_per_uci_grp * sizeof(__half2);    // dmrs_per_uci
-    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * data_per_uci_grp * sizeof(__half2);    // data_per_uci
-    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * h_est_per_grp * sizeof(__half2);       // h_est_iue
+    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * y_data_per_grp * sizeof(__half2);      // y_data (also serves as data_per_uci)
+    dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * y_dmrs_per_grp * sizeof(__half2);      // y_dmrs (also serves as dmrs_per_uci / h_est_iue)
     dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * F1_MAX_SYMS * sizeof(uint32_t);        // cs_sh
     dyn_shared_sz += F1_NUM_UCI_GRPS_PER_BLK * (1 + F1_MAX_CS_GOLD_WORDS) * sizeof(uint32_t);  // goldCache_sh
 

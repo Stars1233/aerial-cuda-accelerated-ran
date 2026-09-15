@@ -40,23 +40,19 @@ if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 
 block()
-    # Remove -real and -virtual extensions from the native variable,
-    # which includes compile time native values
-    # strip "-real" and "-virtual" and rewrite it to CMAKE_CUDA_ARCHITECTURES_NO_EXT
-    # First take the list (semicolon separated values) and make it a string, replacing ';' -> ' '
-    # This is why "${CMAKE_CUDA_ARCHITECTURES}" is in quotes!
-    # strip virtual and real
-    # place back the ';' so it is a string that we can use IN_LIST
-    macro(cuda_arch_no_extensions)
-        string(REPLACE ";" " " CMAKE_CUDA_ARCHITECTURES_NO_EXT "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
-        string(REPLACE "-real" "" CMAKE_CUDA_ARCHITECTURES_NO_EXT ${CMAKE_CUDA_ARCHITECTURES_NO_EXT})
-        string(REPLACE "-virtual" "" CMAKE_CUDA_ARCHITECTURES_NO_EXT ${CMAKE_CUDA_ARCHITECTURES_NO_EXT})
-        string(REPLACE " " ";" CMAKE_CUDA_ARCHITECTURES_NO_EXT ${CMAKE_CUDA_ARCHITECTURES_NO_EXT})
+    # Remove -real and -virtual extensions from an architecture list and write
+    # the normalized values to CMAKE_CUDA_ARCHITECTURES_NO_EXT for IN_LIST
+    # comparisons. The input may be an explicit CMAKE_CUDA_ARCHITECTURES value
+    # or the architectures detected by CMake when using native.
+    macro(cuda_arch_no_extensions cuda_architectures)
+        set(CMAKE_CUDA_ARCHITECTURES_NO_EXT "${cuda_architectures}")
+        list(TRANSFORM CMAKE_CUDA_ARCHITECTURES_NO_EXT REPLACE "-(real|virtual)$" "")
     endmacro()
+
     if ("${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "native")
-        cuda_arch_no_extensions()
+        cuda_arch_no_extensions("${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
     else ()
-        set(CMAKE_CUDA_ARCHITECTURES_NO_EXT ${CMAKE_CUDA_ARCHITECTURES})
+        cuda_arch_no_extensions("${CMAKE_CUDA_ARCHITECTURES}")
     endif ()
 
     if (("86" IN_LIST CMAKE_CUDA_ARCHITECTURES_NO_EXT) OR
@@ -117,6 +113,7 @@ endif()
 
 add_subdirectory(trtEngine)
 add_subdirectory(drlMcsSelection)
+add_subdirectory(cumacAiranSubcontext)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${cumac_SOURCE_DIR}/examples/tools)
@@ -139,6 +136,10 @@ if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
         --expt-relaxed-constexpr
     >)
     target_compile_options(drlMcsSelection PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
+        --cudart static
+        --expt-relaxed-constexpr
+    >)
+    target_compile_options(cumacAiranSubcontext PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
         --cudart static
         --expt-relaxed-constexpr
     >)

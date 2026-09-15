@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .common import check, unpack
+from .common import _has_dl_bf, _has_srs, check, unpack
 
 
 def run(args, lines):
@@ -310,10 +310,13 @@ def run(args, lines):
             clat_dl.extend(pdsch)
             clat_cdl.extend(pdcch)
             clat_cr.extend(csirs)
-            if args.is_rec_bf:
+            # Split what is_rec_bf used to gate together: DL-BFW vs SRS vs UL-BFW.
+            if _has_dl_bf(args):
                 clat_dlbf.extend(dlbfw)
-                clat_ulbf1.append(ulbfw1)
-                clat_ulbf2.append(ulbfw2)
+                if args.is_rec_bf:
+                    clat_ulbf1.append(ulbfw1)
+                    clat_ulbf2.append(ulbfw2)
+            if _has_srs(args):
                 clat_sr1.append(srs1)
                 if srs2 > 0:
                     clat_sr2.append(srs2)
@@ -345,10 +348,13 @@ def run(args, lines):
         latencies["PUCCH1"] = clat_cul1
         latencies["PUCCH2"] = clat_cul2
 
-    if args.is_rec_bf:
+    # UL-BFW remains reciprocal-BF-only; DL-BFW/SRS also available in isolation modes.
+    if _has_dl_bf(args):
         latencies["DLBFW"] = clat_dlbf
+    if args.is_rec_bf:
         latencies["ULBFW1"] = clat_ulbf1
         latencies["ULBFW2"] = clat_ulbf2
+    if _has_srs(args):
         latencies["SRS1"] = clat_sr1
         latencies["SRS2"] = clat_sr2
 

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 ---
-aerial_sdk_version: 26-1-cubb
+aerial_sdk_version: 26-2-cubb
 #gnb_module
 msg_type: scf_5g_fapi
 phy_class: scf_5g_fapi
@@ -39,6 +39,14 @@ message_thread_config:
   cpu_affinity: 29
   # thread priority
   sched_priority: 95
+# Low-priority worker for offloaded non-slot CONFIG/START/STOP. cpu_affinity below is a
+# per-platform placeholder overridden by autoconfig (auto_override_yaml_cores.py via
+# l1_logical_cores_DU_*), the same convention timer_thread/message_thread follow;
+# priority kept below msg_processing (95) and timer (99) so it never preempts them.
+nonslot_lp_thread_config:
+  name: nonslot_lp
+  cpu_affinity: 4
+  sched_priority: 94
 # Lowest TTI for Ticking
 mu_highest: 1
 dl_tb_loc: 1
@@ -119,28 +127,26 @@ transport:
     prefix: nvipc
     # CUDA device ID for GPU memory operations. The cpu_data and cpu_large memory pools will be registered to host pinned memory when cuda_device_id >= 0
     cuda_device_id: 0
-    # Length of the ring buffer queue for message passing between processes
-    ring_len: 8192
-    # Memory pool size configuration for different buffer types
+    # Memory pool size configuration for different buffer types (per-cell pool length)
     mempool_size:
       # CPU message buffer pool: used for small control messages
       cpu_msg:
         # Size of each buffer in bytes
         buf_size: 15000
         # Number of buffers in the pool
-        pool_len: 4096
+        pool_len: 200
       # CPU data buffer pool: used for larger data payloads on CPU
       cpu_data:
         # Size of each buffer in bytes
         buf_size: 576000
         # Number of buffers in the pool
-        pool_len: 1024
+        pool_len: 50
       # CPU large buffer pool: used for very large data payloads on CPU
       cpu_large:
         # Size of each buffer in bytes
         buf_size: 4096000
         # Number of buffers in the pool
-        pool_len: 64
+        pool_len: 16
       # CUDA/GPU data buffer pool: used for GPU-accessible data buffers
       cuda_data:
         # Size of each buffer in bytes

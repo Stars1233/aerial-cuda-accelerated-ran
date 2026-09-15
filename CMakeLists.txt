@@ -39,6 +39,10 @@ message(STATUS "Using toolchain ${CMAKE_TOOLCHAIN_FILE}")
 include(cmake/cubb-utils.cmake)
 read_aerial_sdk_version_file(${CMAKE_CURRENT_SOURCE_DIR})
 
+# Make repo-local find modules (e.g. FindgRPC.cmake, used when gRPC comes from
+# the apt packages that ship no gRPCConfig.cmake) visible to find_package().
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+
 # Set default CMAKE_BUILD_TYPE=Release, can be overwritten by cmake .. -DCMAKE_BUILD_TYPE=Debug
 if(NOT DEFINED CMAKE_BUILD_TYPE)
     message(WARNING "Setting CMAKE_BUILD_TYPE to 'Release' as none was specified.")
@@ -102,6 +106,20 @@ endif()
 #
 project(cuphy_ctrl_plane LANGUAGES C CXX ASM CUDA)
 
+include(cmake/CompileOptions.cmake)
+include(cmake/Cuda.cmake)
+include(cmake/ClangFormat.cmake)
+include(cmake/CMakeFormat.cmake)
+
+# clang-tidy is opt-in and target-scoped; ordinary builds do not find or run it.
+option(ENABLE_CLANG_TIDY "Enable clang-tidy for explicitly opted-in C++ targets" OFF)
+option(ENABLE_CLANG_TIDY_CACHE "Cache clang-tidy results" ON)
+include(cmake/StaticAnalyzers.cmake)
+if (ENABLE_TESTS)
+    find_package(GTest     REQUIRED)
+    find_package(benchmark REQUIRED)
+endif()
+
 message(STATUS "Using GPU architectures ${CMAKE_CUDA_ARCHITECTURES}")
 
 # Now we have values in CMAKE_CUDA_ARCHITECTURES_NATIVE
@@ -148,12 +166,14 @@ OPTION(BUILD_DOCS "Build cuBB documentation" ON)
 OPTION(BUILD_NVIPC_ONLY "Build libnvipc.so only" OFF)
 OPTION(SCF_FAPI_10_04 "Set flag SCF_FAPI_10_04" OFF)
 OPTION(ENABLE_L2_SLT_RSP "Enable L2 Slot Response" ON)
+OPTION(ENABLE_FAPI_STORE_REPLAY "Enable FAPI store-replay. Requires ENABLE_L2_SLT_RSP." OFF)
 OPTION(SCF_FAPI_10_04_SRS "Set flag SCF_FAPI_10_04_SRS for 10.04 SRS Only" OFF)
 OPTION(CMAKE_CUDA_ARCHITECTURES "Set CUDA Architectures" OFF)
 # Having BUILD_SHARED_LIBS set to OFF resulted in significant increase in cuPHY build directory in cuBB builds
 OPTION(BUILD_SHARED_LIBS "Build Shared Libs" ON)
 OPTION(AERIAL_METRICS "Enable Aerial Metrics" ON)
 OPTION(ENABLE_PYAERIAL "Enable pyaerial Python bindings" ON)
+OPTION(ENABLE_GPU3GPPCHAN_PYTHON "Enable gpu3gppchan Python bindings and wheel" ON)
 OPTION(ENABLE_CELL_GROUP "Enable Cell Groups" ON)
 OPTION(DOCA_ALLOW_EXPERIMENTAL_API "Enable DOCA Experimental API without compiler warnings" ON)
 OPTION(NVIPC_FMTLOG_ENABLE "Enable nvIPC logging with fmtlog" ON)
@@ -166,7 +186,6 @@ OPTION(ENABLE_LINE_INFO "Add -lineinfo flag to compiler in release build" OFF)
 OPTION(ENABLE_CONFORMANCE_TM_PDSCH_PDCCH "Enable Test Model 38.141-1 4.9.2.2" OFF)
 OPTION(ENABLE_64C "Enable 64C" OFF)
 OPTION(ENABLE_CUMAC "Enable cuMAC support in test benches and applications" ON)
-OPTION(ENABLE_32DL "Enable 32-layer Downlink" OFF)
 OPTION(ENABLE_PUSCH_PER_UE_PREQ_NOISE_VAR "Enable PUSCH per-UE pre-EQ noise-interference power reporting" ON)
 
 if ("${ARCH}" STREQUAL "aarch64")
@@ -187,10 +206,6 @@ if(ENABLE_64C)
     add_definitions(-DENABLE_64C)
 endif()
 
-if(ENABLE_32DL)
-    add_definitions(-DENABLE_32DL)
-endif()
-
 if(SCF_FAPI_10_04)
     add_definitions(-DSCF_FAPI_10_04)
     add_definitions(-DSCF_FAPI_10_04_SRS)
@@ -203,6 +218,14 @@ endif()
 if(ENABLE_L2_SLT_RSP)
     add_definitions(-DENABLE_L2_SLT_RSP)
 endif()
+
+if(ENABLE_FAPI_STORE_REPLAY AND NOT ENABLE_L2_SLT_RSP)
+    message(FATAL_ERROR
+        "ENABLE_FAPI_STORE_REPLAY requires ENABLE_L2_SLT_RSP to be ON. "
+        "Please enable ENABLE_L2_SLT_RSP or disable ENABLE_FAPI_STORE_REPLAY.")
+endif()
+
+# Store-replay supports both FAPI versions.
 
 if(ENABLE_BLOCKING_LOGGER)
     add_definitions(-DFMTLOG_BLOCK)
@@ -247,16 +270,51 @@ find_package(CUDAToolkit)
 if (NOT ${CUDAToolkit_FOUND})
     message("CUDA_TOOLKIT_ROOT_DIR NOT FOUND")
 else ()
+    # Legacy compatibility: CUDA_INCLUDE_DIRS used by cuphydriver, fh_generator, order_kernel_test_bench, etc.
+    set(CUDA_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS} CACHE INTERNAL "CUDA include dirs (from CUDAToolkit)")
+    message(STATUS "CUDAToolkit_INCLUDE_DIRS: ${CUDAToolkit_INCLUDE_DIRS}")
+    message(STATUS "CUDA_INCLUDE_DIRS: ${CUDA_INCLUDE_DIRS}")
     include_directories(
         ${CUDAToolkit_INCLUDE_DIRS}
         ${CUDAToolkit_INCLUDE_DIRS}/cccl
     )
+
+    # Pin CUDA::cuda_driver to the toolkit's own libcuda stub. FindCUDAToolkit's
+    # find_library() will otherwise pick /usr/lib/x86_64-linux-gnu/libcuda.so when
+    # a host NVIDIA driver is installed in the build container — and if that driver
+    # predates the toolkit, it may be missing symbols and linking fails. The
+    # toolkit stub exports every symbol this toolkit version uses; at runtime the
+    # NVIDIA container runtime injects the real driver libcuda.
+    if (TARGET CUDA::cuda_driver)
+        find_library(_cubb_cuda_stub cuda
+            HINTS "${CUDAToolkit_LIBRARY_DIR}/stubs"
+            NO_DEFAULT_PATH)
+        if (_cubb_cuda_stub)
+            set_target_properties(CUDA::cuda_driver PROPERTIES
+                IMPORTED_LOCATION "${_cubb_cuda_stub}")
+            message(STATUS "CUDA::cuda_driver pinned to toolkit stub: ${_cubb_cuda_stub}")
+        else()
+            message(WARNING "Toolkit libcuda stub not found under ${CUDAToolkit_LIBRARY_DIR}/stubs; "
+                "CUDA::cuda_driver may resolve to a system libcuda that lacks newer driver APIs.")
+        endif()
+        unset(_cubb_cuda_stub CACHE)
+    endif()
 endif ()
 
 # ----------------------------------------------------------------------
 # nvidia gputelecom repos
 # ----------------------------------------------------------------------
+add_subdirectory(aerial_common)
 add_subdirectory(cuPHY)
+if (ENABLE_PYAERIAL)
+    # pyAerial consumes the gpu3gppchan wheel, so it always enables its producer.
+    set(ENABLE_GPU3GPPCHAN_PYTHON ON CACHE BOOL
+        "Enable gpu3gppchan Python bindings and wheel" FORCE)
+endif()
+if (ENABLE_GPU3GPPCHAN_PYTHON)
+    # Build gpu3gppchan's Python wheel from the native target created by cuPHY.
+    add_subdirectory(testBenches/gpu3GPPChan/python)
+endif()
 if (ENABLE_PYAERIAL)
     add_subdirectory(pyaerial)
 endif()
@@ -288,6 +346,14 @@ add_subdirectory(cuPHY-CP/gt_common_libs)
 add_subdirectory(cuPHY-CP/cuphyoam)
 add_subdirectory(cuPHY-CP/ru-emulator)
 add_subdirectory(cuPHY-CP/aerial-fh-driver)
+
+# Set BEFORE cuphydriver is added (cuphydriver gates sources on this).
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cuPHY-CP/external/aerial-framework/CMakeLists.txt)
+    set(AERIAL_FRAMEWORK_AVAILABLE ON CACHE INTERNAL "aerial-framework submodule present")
+else()
+    set(AERIAL_FRAMEWORK_AVAILABLE OFF CACHE INTERNAL "aerial-framework submodule present")
+endif()
+
 add_subdirectory(cuPHY-CP/cuphydriver)
 add_subdirectory(cuPHY-CP/data_lake)
 add_subdirectory(cuPHY-CP/cuphyl2adapter)
@@ -300,8 +366,26 @@ set(SCF_FAPI_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/cuPHY-CP/scfl2adapter/lib/scf_5
 set(CUPHY_COMMON_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/cuPHY/examples/common)
 add_subdirectory(cuPHY-CP/testMAC)
 
-# cuPHY-CP unit tests
-if (ENABLE_TESTS)
-    add_subdirectory(cuPHY-CP/tests)
+# Optional aerial-framework submodule (opt in via: git submodule update --init --checkout -- cuPHY-CP/external/aerial-framework)
+if(AERIAL_FRAMEWORK_AVAILABLE)
+    set(FRAMEWORK_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(FRAMEWORK_MAINTAINER_MODE OFF CACHE BOOL "" FORCE)
+    set(FRAMEWORK_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(FRAMEWORK_SKIP_ACAR_DOWNLOAD ON CACHE BOOL "" FORCE)
+    set(FRAMEWORK_ENABLE_RAN_PY OFF CACHE BOOL "" FORCE)
+    set(ACAR_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR} CACHE PATH "" FORCE)
+    set(ACAR_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR} CACHE PATH "" FORCE)
+    set(FRAMEWORK_USE_FMTLOG_BACKEND ON CACHE BOOL "" FORCE)
+    add_subdirectory(cuPHY-CP/external/aerial-framework EXCLUDE_FROM_ALL)
+else()
+    message(STATUS "aerial-framework submodule not present; providing empty ran::fapi / ran::oran stubs")
+    add_library(ran_fapi_stub INTERFACE)
+    add_library(ran::fapi ALIAS ran_fapi_stub)
+    add_library(ran_oran_stub INTERFACE)
+    add_library(ran::oran ALIAS ran_oran_stub)
 endif()
 
+# cuPHY-CP unit tests
+if (ENABLE_TESTS AND AERIAL_METRICS)
+    add_subdirectory(cuPHY-CP/tests)
+endif()

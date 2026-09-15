@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
+
 import numpy as np
+
+
+# --rec_bf bundles DL-BFW, SRS, and UL-BFW. Channel-only benchmarking needs
+# DL-BFW or SRS in isolation; getattr keeps non-cli.py callers backward-compatible.
+def _has_dl_bf(args: argparse.Namespace) -> bool:
+    return args.is_rec_bf or getattr(args, "is_dl_bf_only", False)
+
+
+def _has_srs(args: argparse.Namespace) -> bool:
+    return args.is_rec_bf or getattr(args, "is_srs_only", False)
 
 
 def check(
@@ -42,7 +54,7 @@ def check(
 
         offset = 0
 
-        if args.is_rec_bf:
+        if _has_dl_bf(args):
             offset = 1
 
         for idx, itm in enumerate(pdsch):
@@ -100,7 +112,7 @@ def unpack(
 
     if args.is_pusch_cascaded:
 
-        if args.is_rec_bf:
+        if _has_dl_bf(args):
 
             for idx, itm in enumerate(pdsch):
 
@@ -142,8 +154,8 @@ def unpack(
         # For better latency, we typically use the above is_pusch_cascaded = True
         # This avoids two PUSCH workloads to run together
         # For 4T4R (is_rec_bf = False) slot 0 doesn't have anything scheduled, simulation start at the begiing of slot 1; subtract 500 us for PUSCH2 delay
-        # For 32T32TR (is_rec_bf = True), slot 0 has workload, simulation start at the begiing of slot 0; subtract 500 us for PUSCH1 delay, subtract 1000 for PUSCH2 delay
-        if args.is_rec_bf:
+        # For 32T32TR (is_rec_bf or is_dl_bf_only) slot 0 has workload, simulation start at the begiing of slot 0; subtract 500 us for PUSCH1 delay, subtract 1000 for PUSCH2 delay
+        if _has_dl_bf(args):
 
             for idx, itm in enumerate(pdsch):
 

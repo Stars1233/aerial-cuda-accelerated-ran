@@ -200,19 +200,24 @@ run_tf_and_copy(PdcchParams coreset, const cuphyPdcchDciPrm_t& dci, const cuphyP
     // Launch TF kernel (optionally overlaunch gridDim.x to exercise early-exit path)
     cuphyGenPdcchTfSgnlLaunchCfg_t tfLaunch = tfCfg;
     if(selector_n_sym_override > 0) { tfLaunch.kernelNodeParamsDriver.gridDimX = selector_n_sym_override; }
-    void*                          args[6];
+    DeviceBuf<int>                 d_coreset_idx_of_dci(1);
+    const int                      h_idx0 = 0;
+    CUDA_CHECK(cudaMemcpy(d_coreset_idx_of_dci.ptr, &h_idx0, sizeof(int), cudaMemcpyHostToDevice));
+    void*                          args[7];
     uint8_t*                       d_x_tx_base      = d_x_tx.ptr;
     uint32_t*                      d_scram_seq_base = d_scram.ptr;
     uint32_t                       n_coresets_val   = 1;
     PdcchParams*                   d_coreset_base   = d_coreset.ptr;
     cuphyPdcchDciPrm_t*            d_dci_base       = d_dci_buf.ptr;
     cuphyPdcchPmWOneLayer_t*       d_pmw_base       = d_pmw_buf.ptr;
+    int*                           d_idx_base      = d_coreset_idx_of_dci.ptr;
     args[0]                                         = &d_x_tx_base;
     args[1]                                         = &d_scram_seq_base;
     args[2]                                         = &n_coresets_val;
     args[3]                                         = &d_coreset_base;
     args[4]                                         = &d_dci_base;
     args[5]                                         = &d_pmw_base;
+    args[6]                                         = &d_idx_base;
     tfLaunch.kernelNodeParamsDriver.kernelParams    = args;
     e                                               = cuLaunchKernel(
         tfLaunch.kernelNodeParamsDriver.func,
@@ -303,10 +308,12 @@ TEST(EmbedPdcchTfSignal_Host, PipelinePrepare_WritesCrcAndTmBits)
     uint8_t h_input_w_crc[CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES_W_CRC] = {};
     uint8_t h_input[CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES]             = {};
 
-    // payload 11 bits: 0b1010'1010'101 (LSB-first in input buffer per production expectations)
-    const int payload_bits = 11;
+    // payload 13 bits (>= CUPHY_PDCCH_POLAR_A_MIN = 12, non-byte-aligned to cover the
+    // partial-byte reversal path): 0b1010'1010'10101 (LSB-first in input buffer per
+    // production expectations)
+    const int payload_bits = 13;
     h_input[0]             = 0b1010'1010; // 8 bits
-    h_input[1]             = 0b0000'0101; // next 3 bits at LSB positions
+    h_input[1]             = 0b0001'0101; // next 5 bits at LSB positions
 
     PdcchParams coreset{};
     coreset.n_sym                = 1;
@@ -411,7 +418,7 @@ TEST(EmbedPdcchTfSignal_Host, PipelinePrepare_MaxPayloadErrorAndTmByteRoll)
     for(int i = 0; i < 9; ++i)
     {
         dcis[i]          = make_dci(/*dmrs_id*/ 1 + i, /*aggr*/ 1, /*cceIdx*/ 0, /*rntiCrc*/ 0x1, /*rntiBits*/ 0x1);
-        dcis[i].Npayload = 8; // valid small payload
+        dcis[i].Npayload = 12; // valid small payload (>= CUPHY_PDCCH_POLAR_A_MIN)
     }
 
     // First pass: 1 normal DCI (no TM), then 8 TM DCIs to roll the TM byte
@@ -700,13 +707,17 @@ TEST(EmbedPdcchTfSignal_Device, GenTfSignalKernel_CoversGenerateDmrs)
 
     // Select and launch genTfSignal kernel via pipeline-prepare launch config
     cuphyGenPdcchTfSgnlLaunchCfg_t tfLaunch = tfCfg;
-    void*                          args[6];
+    DeviceBuf<int>                 d_coreset_idx_of_dci(1);
+    const int                      h_idx0 = 0;
+    CUDA_CHECK(cudaMemcpy(d_coreset_idx_of_dci.ptr, &h_idx0, sizeof(int), cudaMemcpyHostToDevice));
+    void*                          args[7];
     uint8_t*                       d_x_tx_base      = d_x_tx.ptr;
     uint32_t*                      d_scram_seq_base = d_scram.ptr;
     uint32_t                       n_coresets_val   = 1;
     PdcchParams*                   d_coreset_base   = d_coreset.ptr;
     cuphyPdcchDciPrm_t*            d_dci_base       = d_dci_buf.ptr;
     cuphyPdcchPmWOneLayer_t*       d_pmw_base       = d_pmw_buf.ptr;
+    int*                           d_idx_base       = d_coreset_idx_of_dci.ptr;
 
     args[0]                                      = &d_x_tx_base;
     args[1]                                      = &d_scram_seq_base;
@@ -714,6 +725,7 @@ TEST(EmbedPdcchTfSignal_Device, GenTfSignalKernel_CoversGenerateDmrs)
     args[3]                                      = &d_coreset_base;
     args[4]                                      = &d_dci_base;
     args[5]                                      = &d_pmw_base;
+    args[6]                                      = &d_idx_base;
     tfLaunch.kernelNodeParamsDriver.kernelParams = args;
 
     e = cuLaunchKernel(
@@ -876,19 +888,24 @@ TEST(EmbedPdcchTfSignal_Device, GenTfSignalKernel_PrecodingPath_TwoPorts)
 
     // Launch TF kernel
     cuphyGenPdcchTfSgnlLaunchCfg_t tfLaunch = tfCfg;
-    void*                          args[6];
+    DeviceBuf<int>                 d_coreset_idx_of_dci(1);
+    const int                      h_idx0 = 0;
+    CUDA_CHECK(cudaMemcpy(d_coreset_idx_of_dci.ptr, &h_idx0, sizeof(int), cudaMemcpyHostToDevice));
+    void*                          args[7];
     uint8_t*                       d_x_tx_base      = d_x_tx.ptr;
     uint32_t*                      d_scram_seq_base = d_scram.ptr;
     uint32_t                       n_coresets_val   = 1;
     PdcchParams*                   d_coreset_base   = d_coreset.ptr;
     cuphyPdcchDciPrm_t*            d_dci_base       = d_dci_buf.ptr;
     cuphyPdcchPmWOneLayer_t*       d_pmw_base       = d_pmw_buf.ptr;
+    int*                           d_idx_base       = d_coreset_idx_of_dci.ptr;
     args[0]                                         = &d_x_tx_base;
     args[1]                                         = &d_scram_seq_base;
     args[2]                                         = &n_coresets_val;
     args[3]                                         = &d_coreset_base;
     args[4]                                         = &d_dci_base;
     args[5]                                         = &d_pmw_base;
+    args[6]                                         = &d_idx_base;
     tfLaunch.kernelNodeParamsDriver.kernelParams    = args;
     ASSERT_EQ(cuLaunchKernel(
                   tfLaunch.kernelNodeParamsDriver.func,

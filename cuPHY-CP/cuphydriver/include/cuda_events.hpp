@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,9 +21,11 @@
 #include <cstdint>
 #include <limits>
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #include "aerial_event_code.h"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 
 /**
  * @brief Calculate elapsed time between two CUDA events
@@ -45,30 +47,35 @@ inline float GetCudaEventElapsedTime(cudaEvent_t start, cudaEvent_t end, const c
     // This error could otherwise be replaced with cudaErrorInvalidResourceHandle if
     // one of the events has not been recorded, so at least log any pre-existing errors
     // to aid debugging.
-    cudaError_t ret = cudaGetLastError();  ///< Check for any pre-existing async CUDA errors
+    // NOTE: After driver API migration, cudaGetLastError() only clears the runtime
+    // sticky error state. Errors from driver API calls (cuMemAlloc, cuEventRecord, etc.)
+    // are NOT reported here. Remove once all runtime API usage is eliminated.
+
+    cudaError_t ret = cudaGetLastError();  ///< Check for any pre-existing async CUDA errors (Runtime; no Driver equivalent)
     if (ret != cudaSuccess) {
         NVLOGE_FMT(TAG,AERIAL_CUDA_API_EVENT,"{}: Async CUDA error: return status {}",func,cudaGetErrorString(ret));
     }
     float ms;  ///< Elapsed time in milliseconds (output)
-    ret = cudaEventElapsedTime(&ms, start, end);  ///< Calculate elapsed time between events
-    if (ret != cudaSuccess) {
+    CUresult cuRet = cuEventElapsedTime(&ms, start, end);  ///< Calculate elapsed time between events
+    if (cuRet != CUDA_SUCCESS) {
         // Query each event to collect additional information for debugging purposes. Note that since these
-        // queries are after the failure of cudaEventElapsedTime, they may no longer reflect the state at
-        // the time that cudaEventElapsedTime failed. For example, it is possible for an event to have
-        // completed in the time between the calls to cudaEventElapsedTime and cudaEventQuery.
-        const cudaError_t qRet1 = cudaEventQuery(start);   ///< Query start event status for debugging
-        const cudaError_t qRet2 = cudaEventQuery(end);     ///< Query end event status for debugging
+        // queries are after the failure of cuEventElapsedTime, they may no longer reflect the state at
+        // the time that cuEventElapsedTime failed. For example, it is possible for an event to have
+        // completed in the time between the calls to cuEventElapsedTime and cuEventQuery.
+        const CUresult qRet1 = cuEventQuery(start);   ///< Query start event status for debugging
+        const CUresult qRet2 = cuEventQuery(end);     ///< Query end event status for debugging
+        const char* cuRetStr = nullptr;
+        const char* qRet1Str = nullptr;
+        const char* qRet2Str = nullptr;
+        cuGetErrorString(cuRet, &cuRetStr);
+        cuGetErrorString(qRet1, &qRet1Str);
+        cuGetErrorString(qRet2, &qRet2Str);
         if (id != std::numeric_limits<uint64_t>::max()) {  ///< Log with object ID if provided
-            NVLOGW_FMT(TAG,"{}: cudaEventElapsedTime error {} follow-up cudaEventQuery ret1 {} ret2 {} for Obj {:x}",
-                func, cudaGetErrorString(ret), cudaGetErrorString(qRet1), cudaGetErrorString(qRet2), id);
+            NVLOGW_FMT(TAG,"{}: cuEventElapsedTime error {} follow-up cuEventQuery start {} end {} for Obj {:x}",
+                func, cuRetStr ? cuRetStr : "unknown", qRet1Str ? qRet1Str : "unknown", qRet2Str ? qRet2Str : "unknown", id);
         } else {  ///< Log without object ID
-            NVLOGW_FMT(TAG,"{}: cudaEventElapsedTime error {} follow-up cudaEventQuery ret1 {} ret2 {}",
-                func, cudaGetErrorString(ret), cudaGetErrorString(qRet1), cudaGetErrorString(qRet2));
-        }
-        if (ret != cudaErrorNotReady) {
-            // Errors other than cudaErrorNotReady or argument checking are saved, so
-            // pop them to prevent other code from reporting them.
-            cudaGetLastError();  ///< Clear the error to prevent propagation to other code
+            NVLOGW_FMT(TAG,"{}: cuEventElapsedTime error {} follow-up cuEventQuery start {} end {}",
+                func, cuRetStr ? cuRetStr : "unknown", qRet1Str ? qRet1Str : "unknown", qRet2Str ? qRet2Str : "unknown");
         }
         return 0.0f;  ///< Return 0 on error
     }

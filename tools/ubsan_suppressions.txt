@@ -1,0 +1,12 @@
+# Suppressions for false positives and third-party libraries
+
+# Quill TSC clock signed integer overflow on ARM64
+# The overflow occurs in resync logic (_resync_interval_ticks *= 2) and is non-critical
+signed-integer-overflow:*RdtscClock*
+
+# fmtlog ring buffer packs arguments as raw bytes and reconstructs objects without
+# proper alignment. The misalignment propagates through fmtlog.h, fmt headers, and
+# libstdc++ STL headers during formatting.
+alignment:*fmtlog*
+alignment:*fmt/*
+alignment:*bits/stl_*

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -381,6 +381,11 @@ cuphyStatus_t CsirsTx::expandParameters(cuphyCsirsDynPrms_t* dyn_params,
     if(numParams > (CUPHY_CSIRS_MAX_NUM_PARAMS * maxCellsPerSlot))
     {
         NVLOGE_FMT(NVLOG_CSIRS, AERIAL_CUPHY_EVENT, "Number of parameters passed in CSI-RS setup ({}) is more than {}.", numParams, CUPHY_CSIRS_MAX_NUM_PARAMS * maxCellsPerSlot);
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
+    if(dyn_params->nPrecodingMatrices > CUPHY_CSIRS_MAX_NUM_PARAMS * maxCellsPerSlot) [[unlikely]]
+    {
+        NVLOGE_FMT(NVLOG_CSIRS, AERIAL_CUPHY_EVENT, "{}: nPrecodingMatrices ({}) exceeds allocated capacity ({}).", __FUNCTION__, dyn_params->nPrecodingMatrices, CUPHY_CSIRS_MAX_NUM_PARAMS * maxCellsPerSlot);
         return CUPHY_STATUS_INVALID_ARGUMENT;
     }
     if(dyn_params->nPrecodingMatrices>0)

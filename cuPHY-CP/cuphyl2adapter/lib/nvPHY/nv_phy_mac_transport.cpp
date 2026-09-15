@@ -16,10 +16,14 @@
  */
 
 #include "nv_phy_mac_transport.hpp"
+#include <limits>
+#include <utility>
 #include <strings.h>
 #include "nv_ipc_utils.h"
+#include "ti_generic.hpp"
 
 #define TAG (NVLOG_TAG_BASE_L2_ADAPTER + 5) // "L2A.TRANSPORT"
+#define TAG_STARTUP_TIMES (NVLOG_TAG_BASE_CUPHY_CONTROLLER + 5) // "CTL.STARTUP_TIMES"
 
 namespace
 {
@@ -27,7 +31,7 @@ namespace
 // assign_char_array()
 // Copy a string into a fixed length char array, throwing an exception
 // if the length of the string is larger than the buffer.
-template <int NUM_BUF_CHAR>
+template <std::size_t NUM_BUF_CHAR>
 void assign_char_array(char (&buf)[NUM_BUF_CHAR], const std::string& str)
 {
     if(str.size() >= NUM_BUF_CHAR)
@@ -41,16 +45,6 @@ void assign_char_array(char (&buf)[NUM_BUF_CHAR], const std::string& str)
     // str.size() is less than bufsz, so we are guaranteed a
     // terminating NULL in buf.
     strncpy(buf, str.c_str(), NUM_BUF_CHAR);
-}
-
-////////////////////////////////////////////////////////////////////////
-// ipc_from_yaml()
-// Create an nv_ipc_t instance from a YAML node with the appropriate
-// fields
-nv_ipc_t* ipc_from_yaml(nv_ipc_config_t& config, yaml::node node_config, nv_ipc_module_t module_type)
-{
-    nv_ipc_parse_yaml_node(&config, &node_config, module_type);
-    return create_nv_ipc_interface(&config);
 }
 
 } // namespace
@@ -73,15 +67,16 @@ int transport_reset_callback(void* args)
 
 ////////////////////////////////////////////////////////////////////////
 // phy_mac_transport()
-phy_mac_transport::phy_mac_transport(nv_ipc_config_t& config) :
-    ipc_(create_nv_ipc_interface(&config), &cleanup_nv_ipc)
+phy_mac_transport::phy_mac_transport(nv_ipc_config_t& config, uint32_t cell_num_in) :
+    ipc_(create_nv_ipc_interface(&config), &cleanup_nv_ipc),
+    config_(config),
+    cell_num(cell_num_in)
 {
-    NVLOGC_FMT(TAG, "{} construct 1", __func__);
+    NVLOGC_FMT(TAG, "{} construct: cell_num={}", __func__, cell_num_in);
 
     transport_id = 0;
     mapped = false;
     started_cells_mask = 0;
-    config_ = config;
 
     if(!ipc_)
     {
@@ -91,9 +86,49 @@ phy_mac_transport::phy_mac_transport(nv_ipc_config_t& config) :
 
 ////////////////////////////////////////////////////////////////////////
 // phy_mac_transport()
-phy_mac_transport::phy_mac_transport(yaml::node node_config, nv_ipc_module_t module_type, uint32_t cell_num, int32_t transport_id, bool map_enable) :
-    ipc_(ipc_from_yaml(config_, node_config, module_type), &cleanup_nv_ipc)
+phy_mac_transport::phy_mac_transport(yaml::node node_config, nv_ipc_module_t module_type, uint32_t cell_num_in, int32_t transport_id_in, bool map_enable)
+    : ipc_(nullptr, &cleanup_nv_ipc)
 {
+    TI_GENERIC_INIT("nvipc transport init", 6);
+    TI_GENERIC_ADD("Start");
+
+    // Parse NVIPC configuration from YAML
+    TI_GENERIC_ADD("Parse YAML");
+    nv_ipc_parse_yaml_node(&config_, &node_config, module_type);
+
+    // For SHM IPC, the yaml configured memory pool length is per-cell requirement. Scale the memory pool size by cell number.
+    TI_GENERIC_ADD("Scale mempool");
+    if (is_module_primary(module_type) && config_.ipc_transport == NV_IPC_TRANSPORT_SHM)
+    {
+        size_t total_size = 0;
+        for (int pool_id = 0; pool_id < NV_IPC_MEMPOOL_NUM; pool_id++)
+        {
+            // Total memory pool size: pool_len = per_cell_length * cell_num_in
+            nv_ipc_mempool_size_t& mp = config_.transport_config.shm.mempool_size[pool_id];
+            if (mp.pool_len > 0)
+            {
+                const auto product = static_cast<int64_t>(mp.pool_len) * static_cast<int64_t>(cell_num_in);
+                if (product > std::numeric_limits<int32_t>::max()) {
+                    const auto msg = fmt::format(
+                        "pool_len overflow: pool[{}] len={} * cells={} = {} > INT32_MAX",
+                        pool_id, mp.pool_len, cell_num_in, product);
+                    NVLOGF_FMT(TAG, AERIAL_CONFIG_EVENT, "{}", msg);
+                    throw std::runtime_error(msg);
+                }
+                mp.pool_len = static_cast<int32_t>(product);
+                size_t pool_size = static_cast<size_t>(mp.buf_size) * static_cast<size_t>(mp.pool_len);
+                total_size += pool_size; // Total memory pool size for debug logging
+                NVLOGC_FMT(TAG, "NVIPC [{}] cell_num={} mempool[{}] size: {}B*{}={}B={:.2f}MB",
+                    config_.transport_config.shm.prefix, cell_num_in, pool_id, mp.buf_size, mp.pool_len, pool_size, static_cast<double>(pool_size) / 1024.0 / 1024.0);
+            }
+        }
+        NVLOGC_FMT(TAG, "NVIPC [{}] cell_num={} mempool_total: {}B={:.2f}MB",
+            config_.transport_config.shm.prefix, cell_num_in, total_size, static_cast<double>(total_size) / 1024.0 / 1024.0);
+    }
+
+    // Create NVIPC interface
+    TI_GENERIC_ADD("create_nv_ipc");
+    ipc_.reset(create_nv_ipc_interface(&config_));
     if(!ipc_)
     {
         throw std::runtime_error("Error returned from create_nv_ipc_interface()");
@@ -103,16 +138,17 @@ phy_mac_transport::phy_mac_transport(yaml::node node_config, nv_ipc_module_t mod
     nv_ipc_check_host_pinned_memory(ipc_.get());
 
     nv_ipc_set_reset_callback(ipc_.get(), transport_reset_callback, this);
+    TI_GENERIC_ADD("IPC post-create");
 
-    this->transport_id = transport_id;
-    this->cell_num = cell_num;
+    this->transport_id = transport_id_in;
+    this->cell_num = cell_num_in;
     mapped = map_enable;
     started_cells_mask = 0;
     if (node_config.has_key("phy_cells"))
     {
         yaml::node phy_cells = node_config["phy_cells"];
-        for (int mac_cell_id = 0; mac_cell_id < cell_num; mac_cell_id++) {
-            int phy_cell_id = phy_cells[mac_cell_id];
+        for (int mac_cell_id = 0; std::cmp_less(mac_cell_id, cell_num_in); mac_cell_id++) {
+            int phy_cell_id = phy_cells[static_cast<size_t>(mac_cell_id)];
             if (std::find_if(phy_cell_map.begin(), phy_cell_map.end(), [phy_cell_id](auto&& p) { return p.second == phy_cell_id; }) != std::end(phy_cell_map)) {
                 NVLOGF_FMT(TAG, AERIAL_CONFIG_EVENT, "duplicated cell_id configred in phy_cells list: phy_cells[{}]={}", mac_cell_id, phy_cell_id);
             }
@@ -121,10 +157,13 @@ phy_mac_transport::phy_mac_transport(yaml::node node_config, nv_ipc_module_t mod
         }
     }
 
-    NVLOGC_FMT(TAG, "{}[{}] created. phy_cell_map.size={} mac_cell_map.size={} mapped={} cell_num={}", __func__, transport_id, phy_cell_map.size(), mac_cell_map.size(), mapped, cell_num);
-    for (int mac_cell_id = 0; mac_cell_id < phy_cell_map.size(); mac_cell_id++) {
-        NVLOGI_FMT(TAG, "{}[{}] cell_id map: mac {} <-> phy {}", __func__, transport_id, mac_cell_id, phy_cell_map[mac_cell_id]);
+    NVLOGC_FMT(TAG, "{}[{}] created. phy_cell_map.size={} mac_cell_map.size={} mapped={} cell_num={}", __func__, transport_id_in, phy_cell_map.size(), mac_cell_map.size(), mapped, cell_num_in);
+    for (int mac_cell_id = 0; std::cmp_less(mac_cell_id, phy_cell_map.size()); mac_cell_id++) {
+        NVLOGI_FMT(TAG, "{}[{}] cell_id map: mac {} <-> phy {}", __func__, transport_id_in, mac_cell_id, phy_cell_map[mac_cell_id]);
     }
+
+    TI_GENERIC_ADD("Map cells");
+    TI_GENERIC_ALL_NVLOGI(TAG_STARTUP_TIMES);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -168,7 +207,7 @@ void phy_mac_transport::tx_copy(void* dst, const void* src, size_t size, int32_t
         //NVLOGI_FMT(TAG,"[{}]: dst = 0x{:x} src = 0x{:x} size = {}",__func__,dst,(void *)src,size);
         if(0 != ipc_->gdr_memcpy_to_device(ipc_.get(), dst,src,size))
         {
-            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: tx_copy() error: dst={} src={} size={}", __FUNCTION__, dst,(void *)src,size);
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: tx_copy() error: dst={} src={} size={}", __FUNCTION__, dst, const_cast<void*>(src), size);
             throw std::runtime_error("phy_mac_transport::tx_copy() failure");
         }
     }
@@ -186,7 +225,7 @@ void phy_mac_transport::tx_send(phy_mac_msg_desc& msg_desc)
     if (mapped) {
         // Convert L1 cell_id to L2 cell_id
         msg_desc.cell_id = get_mac_cell_id(msg_desc.cell_id);
-        nv_ipc_set_handle_id(&msg_desc, msg_desc.cell_id);
+        nv_ipc_set_handle_id(&msg_desc, static_cast<uint8_t>(msg_desc.cell_id));
     }
 
     if(0 != ipc_->tx_send_msg(ipc_.get(), &msg_desc))
@@ -261,7 +300,7 @@ int phy_mac_transport::rx_recv(phy_mac_msg_desc& msg_desc)
         return ret;
     }
 
-    if(msg_desc.cell_id < 0 || msg_desc.cell_id >= cell_num)
+    if(msg_desc.cell_id < 0 || std::cmp_greater_equal(msg_desc.cell_id, cell_num))
     {
         NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: invalid cell_id={} cell_num={} transport_id={} msg_id=0x{:02X}",
                 __func__, msg_desc.cell_id, cell_num, transport_id, msg_desc.msg_id);
@@ -271,7 +310,7 @@ int phy_mac_transport::rx_recv(phy_mac_msg_desc& msg_desc)
 
     if (mapped) {
         msg_desc.cell_id = get_phy_cell_id(msg_desc.cell_id);
-        nv_ipc_set_handle_id(&msg_desc, msg_desc.cell_id);
+        nv_ipc_set_handle_id(&msg_desc, static_cast<uint8_t>(msg_desc.cell_id));
     }
 
     return ret;
@@ -346,7 +385,7 @@ int phy_mac_transport::copy_from_data_buf(nv_ipc_msg_t& msg_desc, uint32_t src_o
     {
         if(0 != ipc_->gdr_memcpy_to_host(ipc_.get(), dst_buf, src_buf, size))
         {
-            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: error: data_pool={} dst={} src={} size={}", __func__, msg_desc.data_pool, dst_buf, (void*)src_buf, size);
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: error: data_pool={} dst={} src={} size={}", __func__, msg_desc.data_pool, dst_buf, static_cast<void*>(src_buf), size);
             return -1;
         }
     }
@@ -376,7 +415,7 @@ int phy_mac_transport::copy_to_data_buf(nv_ipc_msg_t& msg_desc, uint32_t dst_off
     {
         if(0 != ipc_->gdr_memcpy_to_device(ipc_.get(), dst_buf, src_buf, size))
         {
-            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: error: data_pool={} dst={} src={} size={}", __func__, msg_desc.data_pool, dst_buf, (void*)src_buf, size);
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: error: data_pool={} dst={} src={} size={}", __func__, msg_desc.data_pool, dst_buf, src_buf, size);
             return -1;
         }
     }
@@ -389,8 +428,8 @@ int phy_mac_transport::copy_to_data_buf(nv_ipc_msg_t& msg_desc, uint32_t dst_off
     return 0;
 }
 
-phy_mac_transport_wrapper::phy_mac_transport_wrapper(yaml::node node_config, nv_ipc_module_t module_type, uint32_t total_cell_num) {
-    this->total_cell_num = total_cell_num;
+phy_mac_transport_wrapper::phy_mac_transport_wrapper(yaml::node node_config, nv_ipc_module_t module_type, uint32_t total_cell_num_in) {
+    total_cell_num = total_cell_num_in;
 
     if (node_config.has_key("test_type")) {
         test_type = node_config["test_type"].as<int32_t>();
@@ -433,15 +472,15 @@ void phy_mac_transport_wrapper::init(yaml::node& node_config, nv_ipc_module_t mo
 
     yaml::node transport_node = node_config["transport"];
     if(transport_node.type() == YAML_SEQUENCE_NODE) {
-        int transport_cell_sum = 0;
+        uint32_t transport_cell_sum = 0;
         cell_map_enabled = true;
-        transport_num = transport_node.length();
+        transport_num = static_cast<uint32_t>(transport_node.length());
         for(size_t i = 0; i < transport_num; i++) {
-            if (transport_node[i]["transport_id"].as<int32_t>() != i) {
+            if (std::cmp_not_equal(transport_node[i]["transport_id"].as<int32_t>(), i)) {
                 NVLOGF_FMT(TAG, AERIAL_CONFIG_EVENT, "Please config transport_id in order and start from 0");
             }
-            uint32_t cell_num = transport_node[i]["phy_cells"].length();
-            phy_mac_transport* ptransport = new phy_mac_transport(transport_node[i], module_type, cell_num, i, true);
+            uint32_t cell_num = static_cast<uint32_t>(transport_node[i]["phy_cells"].length());
+            phy_mac_transport* ptransport = new phy_mac_transport(transport_node[i], module_type, cell_num, static_cast<int32_t>(i), true);
             transport_vec.push_back(ptransport);
             transport_cell_sum += cell_num;
         }
@@ -459,28 +498,28 @@ void phy_mac_transport_wrapper::init(yaml::node& node_config, nv_ipc_module_t mo
             NVLOGF_FMT(TAG, AERIAL_CONFIG_EVENT, "Check YAML config: total_cell_num={} for all L2 instances != transport_cell_sum={}", total_cell_num, transport_cell_sum);
         }
         transport_id_vec.resize(total_cell_num);
-        for (int transport_id = 0; transport_id < transport_vec.size(); transport_id++)
+        for (size_t transport_id = 0; transport_id < transport_vec.size(); transport_id++)
         {
             std::unordered_map<int32_t, int32_t>& cell_map = transport_vec[transport_id]->get_phy_cell_map();
             NVLOGC_FMT(TAG, "wrapper: transport_id {} size={}", transport_id, cell_map.size());
-            for (int mac_cell_id = 0; mac_cell_id < cell_map.size(); mac_cell_id++)
+            for (int32_t mac_cell_id = 0; std::cmp_less(mac_cell_id, cell_map.size()); mac_cell_id++)
             {
-                int phy_cell_id = cell_map[mac_cell_id];
+                int32_t phy_cell_id = cell_map[mac_cell_id];
 
                 // Validate cell_id config: phy_cell_id < total_cell_num
-                if (phy_cell_id >= total_cell_num) {
+                if (phy_cell_id < 0 || std::cmp_greater_equal(phy_cell_id, total_cell_num)) {
                     NVLOGF_FMT(TAG, AERIAL_CONFIG_EVENT, "cell_id exceeds range: transport_id={} phy_cells[{}]={} total_cell_num={}", transport_id, mac_cell_id, phy_cell_id, total_cell_num);
                 }
 
                 // Validate cell_id config: non duplicate cell_id in phy_cell_maps
-                for (int prev_transp_id = 0; prev_transp_id < transport_id; prev_transp_id++) {
+                for (size_t prev_transp_id = 0; prev_transp_id < transport_id; prev_transp_id++) {
                     std::unordered_map<int32_t, int32_t>& prev_phy_cell_map = transport_vec[prev_transp_id]->get_phy_cell_map();
                     if (std::find_if(prev_phy_cell_map.begin(), prev_phy_cell_map.end(), [phy_cell_id](auto&& p) { return p.second == phy_cell_id; }) != std::end(prev_phy_cell_map)) {
                         NVLOGF_FMT(TAG, AERIAL_CONFIG_EVENT, "duplicated cell_id: transport[{}].phy_cells[{}]={} already exists in transport[{}]", transport_id, mac_cell_id, phy_cell_id, prev_transp_id);
                     }
                 }
 
-                transport_id_vec[phy_cell_id] = transport_id;
+                transport_id_vec[static_cast<size_t>(phy_cell_id)] = static_cast<int32_t>(transport_id);
                 NVLOGC_FMT(TAG, "wrapper map: phy {} <-> transport {} - mac {}", phy_cell_id, transport_id, mac_cell_id);
             }
         }
@@ -503,8 +542,8 @@ int32_t phy_mac_transport_wrapper::get_transport_id(int32_t phy_cell_id) {
         return 0;
     }
 
-    if (phy_cell_id >= 0 && phy_cell_id < transport_id_vec.size()) {
-        return transport_id_vec[phy_cell_id];
+    if (phy_cell_id >= 0 && std::cmp_less(phy_cell_id, transport_id_vec.size())) {
+        return transport_id_vec[static_cast<size_t>(phy_cell_id)];
     } else {
         NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} wrapper: invalid phy_cell_id {}. transport_id_vec.size={} transport_num={}",
                 __FUNCTION__, phy_cell_id, transport_id_vec.size(), transport_num);
@@ -515,8 +554,8 @@ int32_t phy_mac_transport_wrapper::get_transport_id(int32_t phy_cell_id) {
 phy_mac_transport& phy_mac_transport_wrapper::get_transport(int phy_cell_id)
 {
     int32_t transport_id = get_transport_id(phy_cell_id);
-    if (transport_id >=0 && transport_id < transport_vec.size()) {
-        return *transport_vec[transport_id];
+    if (transport_id >= 0 && std::cmp_less(transport_id, transport_vec.size())) {
+        return *transport_vec[static_cast<size_t>(transport_id)];
     } else {
         NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} wrapper: invalid transport_id {}. phy_cell_id={} transport_num={} transport_vec.size={}",
                 __FUNCTION__, transport_id, phy_cell_id, transport_num, transport_vec.size());
@@ -563,8 +602,8 @@ int phy_mac_transport_wrapper::rx_recv(phy_mac_msg_desc& msg_desc) {
 void phy_mac_transport_wrapper::rx_release(phy_mac_msg_desc& msg_desc) {
     if (msg_desc.msg_buf != nullptr) {
         int32_t transport_id = get_transport_id(msg_desc.cell_id);
-        if (transport_id >= 0 && transport_id < transport_num) {
-            transport_vec[transport_id]->rx_release(msg_desc);
+        if (transport_id >= 0 && std::cmp_less(transport_id, transport_num)) {
+            transport_vec[static_cast<size_t>(transport_id)]->rx_release(msg_desc);
         } else {
             NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}[{}] wrapper: invalid transport_id. cell_id={} msg_id=0x{:02X} msg_buf={} data_buf={}",
                     __FUNCTION__, transport_id, msg_desc.cell_id, msg_desc.msg_id, msg_desc.msg_buf, msg_desc.data_buf);

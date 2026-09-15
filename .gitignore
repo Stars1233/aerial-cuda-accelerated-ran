@@ -7,5 +7,17 @@ testVectors/multi-cell/*.yaml
 .cache/
 .vscode/
 .idea/
+.venv/
 build*/
 cmake-build-*/
+5GModel/**/__pycache__/
+5GModel/aerial_mcore/aerial_pkg/dist/
+5GModel/aerial_mcore/aerial_pkg/src/
+5GModel/aerial_mcore/examples/GPU_test_input/
+5GModel/nr_matlab/GPU_test_input/
+5GModel/nr_matlab/run/
+5GModel/nr_matlab/bin/
+5GModel/nr_matlab/*.asv
+5GModel/nr_matlab/*/*.asv
+5GModel/nr_matlab/.vscode/*.*
+5GModel/nr_matlab/core.*

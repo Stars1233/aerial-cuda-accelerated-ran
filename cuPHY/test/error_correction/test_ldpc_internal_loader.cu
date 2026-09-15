@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,12 +129,12 @@ TEST(LDPCInternalLoader, Loader_fp16x2)
                                      mb,          // num parity nodes
                                      Z,           // lifting size
                                      10,          // num iterations
+                                     32.0f,       // clamp value
                                      Kb,          // num info nodes
                                      1.0f,        // normalization
                                      0,           // flags
                                      BG,          // base graph
                                      0,           // algorithm index
-                                     32.0f,       // clamp value
                                      nullptr);    // workspace
     LDPC_kernel_params params(config,               // LDPC config
                               tLLR.strides()[1],    // input_stride_elem
@@ -268,7 +268,7 @@ __global__ void kernel_tb_scan(cuphyLDPCDecodeDesc_t decode_desc,
 // LDPCInternalLoader.TransportBlockInterfaceScan
 TEST(LDPCInternalLoader, TransportBlockInterfaceScan)
 {
-    cuphyLDPCDecodeDesc_t                  decode_desc;
+    cuphyLDPCDecodeDesc_t                  decode_desc{};   // value-init: zero all optional/debug arrays
     std::mt19937                           rd;
     std::uniform_int_distribution<int32_t> dist(1, 32);
     std::vector<int32_t>                   tb_num_cw;

@@ -15,13 +15,16 @@
  * limitations under the License.
  */
 
+#include <chrono>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
 #include <iterator>
 #include <algorithm>
 #include <unordered_map>
 #include <exception>
+#include <filesystem>
 #include <inttypes.h>
 #include <signal.h>
 #include <string.h>
@@ -29,52 +32,39 @@
 
 #include "test_mac.hpp"
 #include "scf_fapi_handler.hpp"
-#include "signal_handler.hpp"
+#include "yaml_sdk_version.hpp"
+
+#include <grpcpp/grpcpp.h>
+#include "aerial_common.grpc.pb.h"
 
 #define TAG (NVLOG_TAG_BASE_TEST_MAC + 7) // "MAC.PROC"
 
 using namespace std;
 using namespace nv;
 
-test_mac::test_mac(yaml::node yaml_root, uint32_t cell_num) :
-        testmac_yaml(yaml_root) {
-
-    NVLOGC_FMT(TAG, "{} construct start", __func__);
-
-    _transport = new phy_mac_transport(yaml_root["transport"], NV_IPC_MODULE_MAC, cell_num);
-
-    configs = NULL; // Will be set later by set_launch_pattern_and_configs()
-    _fapi_handler = NULL; // Will be created later by set_launch_pattern_and_configs()
-
-    mac_recv_tid = 0; // MAC receiver thread ID, initialized to 0
-
-    NVLOGC_FMT(TAG, "{} construct finished", __func__);
-}
-
-test_mac::~test_mac()
+test_mac::test_mac(const char* config_yaml_path)
 {
-    delete _transport;
+    _fapi_handler = nullptr;
+
+    mac_recv_tid = 0;
+    mac_sched_tid = 0;
+
+    NVLOGC_FMT(TAG, "test_mac_config_yaml={}", config_yaml_path);
+
+    _config_yaml_parser = std::make_unique<yaml::file_parser>(config_yaml_path);
+    _config_yaml_document = _config_yaml_parser->next_document();
+    yaml::node yaml_root = _config_yaml_document.root();
+
+    aerial::check_yaml_version(yaml_root, config_yaml_path);
+
+    load_nv_ipc_yaml_config(&ipc_config, config_yaml_path, NV_IPC_MODULE_MAC);
+
+    _configs = std::make_unique<test_mac_configs>(yaml_root);
+    _configs->set_max_msg_size(default_max_msg_size);
+    _configs->set_max_data_size(default_max_data_size);
 }
 
-void test_mac::set_launch_pattern_and_configs(test_mac_configs* _configs, launch_pattern* _lp)
-{
-    configs = _configs;
-
-    // Query IPC buffer sizes from transport and update configuration
-    configs->set_max_msg_size(nv_ipc_get_buf_size(transport().get_nv_ipc_config(), NV_IPC_MEMPOOL_CPU_MSG));
-#ifdef ENABLE_32DL
-    configs->set_max_data_size(nv_ipc_get_buf_size(transport().get_nv_ipc_config(), NV_IPC_MEMPOOL_CPU_LARGE));
-#else
-    configs->set_max_data_size(nv_ipc_get_buf_size(transport().get_nv_ipc_config(), NV_IPC_MEMPOOL_CPU_DATA));
-#endif
-
-    int data_buf_opt = configs->get_fapi_tb_loc();
-    NVLOGC_FMT(TAG, "{}: create SCF FAPI interface. tb_loc={} max_msg_size={} max_data_size={} pdsch_align_bytes={}",
-            __FUNCTION__, data_buf_opt, configs->get_max_msg_size(), configs->get_max_data_size(), configs->pdsch_align_bytes);
-
-    // Create SCF FAPI handler with transport, configs, launch pattern, and conformance stats
-    _fapi_handler = new scf_fapi_handler(transport(), _configs, _lp, &conformance_test_stats);
-}
+test_mac::~test_mac() = default;
 
 void* oam_thread_func(void* arg)
 {
@@ -142,6 +132,8 @@ void* oam_thread_func(void* arg)
                 }
                 break;
             case 3: //Init config
+                // Disable CONFIG.req retry for OAM CONFIG command
+                _fapi_handler->get_configs()->cell_config_retry = 0;
                 // Always send CONFIG.req with full parameters for OAM CONFIG command
                 _fapi_handler->set_first_init_flag(cmd->cell_id, true);
                 _fapi_handler->cell_init(cmd->cell_id);
@@ -214,6 +206,38 @@ void* worker_thread_func(void* arg)
     return nullptr;
 }
 
+/// Wait until the RU emulator at @p host is reachable via gRPC, or @p timeout_secs elapses.
+/// @param host       Hostname (or host:port) of the RU emulator.
+/// @param timeout_secs  Maximum seconds to wait before continuing.
+static void wait_for_ru_emulator(const std::string& host, int timeout_secs)
+{
+    static constexpr const char* kRuEmulatorPort = "50052";
+    std::string address = (host.find(':') == std::string::npos) ? host + ":" + kRuEmulatorPort : host;
+    NVLOGC_FMT(TAG, "Waiting for RU emulator at {} (timeout={}s)", address, timeout_secs);
+
+    auto stub = aerial::Common::NewStub(
+        grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
+
+    aerial::GenericRequest request;
+    aerial::CpuUtilizationReply reply;
+
+    for(int elapsed = 0; elapsed < timeout_secs; elapsed++)
+    {
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        grpc::Status status = stub->GetCpuUtilization(&ctx, request, &reply);
+        if(status.ok())
+        {
+            NVLOGC_FMT(TAG, "RU emulator ready after {}s", elapsed);
+            return;
+        }
+        NVLOGC_FMT(TAG, "RU emulator not ready ({}s elapsed), retrying...", elapsed);
+        sleep(1);
+    }
+    NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT,
+        "RU emulator at {} not ready after {}s, continuing anyway", address, timeout_secs);
+}
+
 void* mac_recv_thread_func(void *arg)
 {
     nvlog_fmtlog_thread_init();
@@ -255,6 +279,12 @@ void* mac_recv_thread_func(void *arg)
 
     // Wait for IPC connection to be fully established before proceeding
     sleep(1);
+
+    if(!configs->ru_emulator_host.empty())
+    {
+        int timeout = 15 * (_fapi_handler->get_cell_num() + 1);
+        wait_for_ru_emulator(configs->ru_emulator_host, timeout);
+    }
 
     // Send OAM cell update message if configured at the first slot
     _fapi_handler->schedule_cell_update(0);
@@ -312,16 +342,70 @@ void* mac_recv_thread_func(void *arg)
     return nullptr;
 }
 
-void test_mac::start() {
-    NVLOGC_FMT(TAG, "test_mac::start");
+void test_mac::start(bool enable_uplink, bool enable_downlink) {
+    NVLOGC_FMT(TAG, "{}: enable_uplink={} enable_downlink={}", __func__, enable_uplink, enable_downlink);
 
-    if(pthread_create(&mac_sched_tid, NULL, scheduler_thread_func, get_fapi_handler()) !=  0)
-    {
-        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Create mac_sched thread failed");
+    if (enable_uplink == false && enable_downlink == true) {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Downlink thread depends on uplink thread, please set enable_uplink=true while enable_downlink=true");
+        return;
     }
 
-    if (pthread_create(&mac_recv_tid, NULL, mac_recv_thread_func, this) != 0) {
-        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Create mac_recv thread failed");
+    if (_fapi_handler == nullptr) {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Launch pattern is not loaded, please call load_launch_pattern first");
+        return;
+    }
+
+    if (!_transport) {
+        _transport = std::make_unique<phy_mac_transport>(ipc_config, _lp->get_cell_num());
+    }
+    _fapi_handler->set_transport(_transport.get());
+
+    // Query IPC buffer sizes from transport and update configuration (nv_ipc_get_buf_size returns -1 for unknown transport)
+    nv_ipc_config_t* ipc_cfg = transport().get_nv_ipc_config();
+    int msg_sz = nv_ipc_get_buf_size(ipc_cfg, NV_IPC_MEMPOOL_CPU_MSG);
+    if (msg_sz > 0)
+    {
+        _configs->set_max_msg_size(msg_sz);
+    }
+    else
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "nv_ipc_get_buf_size(NV_IPC_MEMPOOL_CPU_MSG) returned {}; keeping max_msg_size={}",
+            msg_sz, _configs->get_max_msg_size());
+    }
+    // TB data-pool sizing: 0/1 -> CPU_DATA, 2 -> CPU_LARGE, 3 -> GPU_DATA.
+    nv_ipc_mempool_id_t data_pool = NV_IPC_MEMPOOL_CPU_DATA;
+    if (_configs->get_fapi_tb_loc() == 2)
+    {
+        data_pool = NV_IPC_MEMPOOL_CPU_LARGE;
+    }
+    else if (_configs->get_fapi_tb_loc() == 3)
+    {
+        data_pool = NV_IPC_MEMPOOL_GPU_DATA;
+    }
+    int data_sz = nv_ipc_get_buf_size(ipc_cfg, data_pool);
+    if (data_sz > 0)
+    {
+        _configs->set_max_data_size(data_sz);
+    }
+    else
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "nv_ipc_get_buf_size(data pool) returned {}; keeping max_data_size={}",
+            data_sz, _configs->get_max_data_size());
+    }
+
+    if(enable_downlink)
+    {
+        if(pthread_create(&mac_sched_tid, NULL, scheduler_thread_func, get_fapi_handler()) !=  0)
+        {
+            NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Create mac_sched thread failed");
+        }
+    }
+
+    if(enable_uplink)
+    {
+        if (pthread_create(&mac_recv_tid, NULL, mac_recv_thread_func, this) != 0) {
+            NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "Create mac_recv thread failed");
+        }
     }
 }
 
@@ -336,4 +420,104 @@ void test_mac::join() {
     }
 
     NVLOGC_FMT(TAG, "test_mac: [mac_sched] and [mac_recv] threads joined");
+}
+
+int test_mac::load_launch_pattern(const char* launch_pattern_path, uint64_t cell_mask, uint32_t channel_mask)
+{
+    NVLOGC_FMT(TAG, "{}: launch_pattern_yaml={} cell_mask=0x{:X} channel_mask=0x{:X}", __func__, launch_pattern_path, cell_mask, channel_mask);
+
+    _lp = std::make_unique<launch_pattern>(_configs.get());
+    if(_lp->launch_pattern_parsing(launch_pattern_path, channel_mask, cell_mask) < 0)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Launch pattern parsing failed");
+        return -1;
+    }
+
+    _fapi_handler = std::make_unique<scf_fapi_handler>(_configs.get(), _lp.get(), &conformance_test_stats);
+    int data_buf_opt = _configs->get_fapi_tb_loc();
+    NVLOGC_FMT(TAG, "{}: create SCF FAPI interface. tb_loc={} max_msg_size={} max_data_size={} pdsch_align_bytes={}",
+            __FUNCTION__, data_buf_opt, _configs->get_max_msg_size(), _configs->get_max_data_size(), _configs->pdsch_align_bytes);
+
+    return 0;
+}
+
+int test_mac::prebuild_fapi_messages()
+{
+    if (_fapi_handler == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Launch pattern is not loaded, please call load_launch_pattern first");
+        return -1;
+    }
+
+    return _fapi_handler->prebuild_downlink_messages();
+}
+
+void test_mac::print_prebuilt_fapi_messages()
+{
+    if (_fapi_handler == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Launch pattern is not loaded, please call load_launch_pattern first");
+        return;
+    }
+
+    int slot_num = _lp->get_sched_slot_num();
+    int cell_num = _lp->get_cell_num();
+
+    // Print CONFIG.req for all cells
+    NVLOGC_FMT(TAG, "=============================================");
+    NVLOGC_FMT(TAG, "Print CONFIG.req for all cells");
+    NVLOGC_FMT(TAG, "---------------------------------------------");
+    for (int cell_id = 0; cell_id < cell_num; cell_id++)
+    {
+        const nv::phy_mac_msg_desc* config_req = get_prebuilt_config_req(cell_id);
+        if(config_req != nullptr)
+        {
+            NVLOGC_FMT(TAG, "Cell {} msg_id=0x{:02X} - {} msg_len={} data_len={}", cell_id, config_req->msg_id, get_scf_fapi_msg_name(config_req->msg_id), config_req->msg_len, config_req->data_len);
+        }
+    }
+
+    NVLOGC_FMT(TAG, "=============================================");
+    NVLOGC_FMT(TAG, "Print slot messages for all cells");
+    NVLOGC_FMT(TAG, "---------------------------------------------");
+    // Print slot messages for all cells
+    sfn_slot_t ss = {.u16 = {0, 0}};
+    for(int slot_idx = 0; slot_idx < slot_num; slot_idx++) {
+        for(int cell_id = 0; cell_id < cell_num; cell_id++) {
+            std::span<const nv::phy_mac_msg_desc> slot_msgs = get_prebuilt_slot_messages(cell_id, ss);
+            if(!slot_msgs.empty()) {
+                for(int msg_idx = 0; msg_idx < static_cast<int>(slot_msgs.size()); msg_idx++)
+                {
+                    const nv::phy_mac_msg_desc& m = slot_msgs[static_cast<size_t>(msg_idx)];
+                    NVLOGC_FMT(TAG, "Slot {} SFN {}.{} Cell {} msg_id=0x{:02X} - {} msg_len={} data_len={}",
+                        slot_idx, ss.u16.sfn, ss.u16.slot, cell_id, m.msg_id, get_scf_fapi_msg_name(m.msg_id), m.msg_len, m.data_len);
+                }
+            } else {
+                NVLOGE_FMT(TAG, AERIAL_TEST_MAC_EVENT, "Slot {} SFN {}.{} Cell {} has no messages",
+                    slot_idx, ss.u16.sfn, ss.u16.slot, cell_id);
+            }
+        }
+        // Get the next slot SFN/SLOT number
+        ss = _fapi_handler->get_next_sfn_slot(ss);
+    }
+    NVLOGC_FMT(TAG, "=============================================");
+}
+
+const nv::phy_mac_msg_desc* test_mac::get_prebuilt_config_req(int cell_id) const
+{
+    if (_fapi_handler == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Launch pattern is not loaded, please call load_launch_pattern first");
+        return nullptr;
+    }
+    return _fapi_handler->get_prebuilt_config_req(cell_id);
+}
+
+std::span<const nv::phy_mac_msg_desc> test_mac::get_prebuilt_slot_messages(int cell_id, sfn_slot_t ss) const
+{
+    if (_fapi_handler == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Launch pattern is not loaded, please call load_launch_pattern first");
+        return {};
+    }
+    return _fapi_handler->get_prebuilt_slot_messages(cell_id, ss);
 }

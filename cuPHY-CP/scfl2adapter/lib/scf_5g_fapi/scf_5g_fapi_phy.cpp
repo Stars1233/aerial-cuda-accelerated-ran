@@ -16,9 +16,13 @@
  */
 
 #include "scf_5g_fapi_phy.hpp"
+#include "scf_5g_fapi_config_decode.hpp"
+#include "aerial/casts/casts.hpp"
 #include "scf_5g_fapi_rx_msg.hpp"
 #include "scf_5g_slot_commands.hpp"
 #include "scf_5g_fapi_msg_helpers.hpp"
+#include "scf_5g_fapi_uci_config_parser.hpp"
+#include "scf_5g_fapi_slot_config_tlv_parser.hpp"
 #include "hdf5hpp.hpp"
 #include "cuphy_hdf5.hpp"
 #include "nv_phy_utils.hpp"
@@ -26,10 +30,70 @@
 #include "nv_phy_limit_errors.hpp"
 #include "cuphydriver_api.hpp"
 #include "memfoot_global.h"
+#include "memtrace.h"
+#include <array>
+#include <atomic>
 #include <cerrno>
+#include <cstddef>
+#include <cstring>
 #include <functional>
+#include <span>
+#include <tuple>
 
 #define TAG (NVLOG_TAG_BASE_SCF_L2_ADAPTER + 3) // "SCF.PHY"
+namespace {
+
+sfn_slot_t prev_sfn_slot(sfn_slot_t ss_curr, uint16_t slots_per_subframe) noexcept
+{
+    sfn_slot_t ss_prev;
+    if (ss_curr.u16.slot == 0) {
+        ss_prev.u16.sfn  = (ss_curr.u16.sfn == 0) ? uint16_t{1023u} : static_cast<uint16_t>(ss_curr.u16.sfn - 1);
+        ss_prev.u16.slot = static_cast<uint16_t>(slots_per_subframe - 1);
+    } else {
+        ss_prev.u16.sfn  = ss_curr.u16.sfn;
+        ss_prev.u16.slot = static_cast<uint16_t>(ss_curr.u16.slot - 1);
+    }
+    return ss_prev;
+}
+
+/**
+ * Copy a DBT PDU delivered in a CPU_LARGE buffer into cell_phy_info.
+ *
+ * The framework C-plane generator uses the captured payload to build its static beam table at
+ * init. mMIMO only; a null/empty buffer is a no-op.
+ *
+ * @param[in,out] info Cell config the payload is appended to.
+ * @param[in] dbt_data DBT PDU bytes.
+ * @return None.
+ */
+void append_dbt_payload_from_buffer(cell_phy_info& info, std::span<const uint8_t> dbt_data)
+{
+    if (dbt_data.data() == nullptr || dbt_data.empty()) {
+        return;
+    }
+    info.bfw_dbt_pdu_payloads.emplace_back(dbt_data.begin(), dbt_data.end());
+}
+
+/**
+ * Copy a DBT PDU delivered inline in a TLV into cell_phy_info.
+ *
+ * Counterpart to append_dbt_payload_from_buffer for the non-CPU_LARGE delivery path; a
+ * null/zero-length TLV is a no-op.
+ *
+ * @param[in,out] info Cell config the payload is appended to.
+ * @param[in] hdr TLV header immediately preceding the DBT bytes.
+ * @return None.
+ */
+void append_dbt_payload_from_inline_tlv(cell_phy_info& info, const scf_fapi_tl_t* hdr)
+{
+    if (hdr == nullptr || hdr->length == 0) {
+        return;
+    }
+    const auto* dbt_bytes = reinterpret_cast<const uint8_t*>(hdr) + sizeof(*hdr);
+    info.bfw_dbt_pdu_payloads.emplace_back(dbt_bytes, dbt_bytes + hdr->length);
+}
+
+}
 namespace scf_5g_fapi
 {
 
@@ -50,6 +114,19 @@ inline void reset_cell_stats(uint32_t cell_id)
     ul_crc_err[cell_id] = 0;
 }
  
+void phy::publish_dl_pdsch_stats(uint32_t cell_id, uint64_t bytes, uint32_t slots) noexcept
+{
+    if (cell_id >= MAX_CELLS_PER_SLOT) [[unlikely]] {
+        return;
+    }
+    if (bytes != 0U) {
+        dl_thrput[cell_id].fetch_add(bytes, std::memory_order_relaxed);
+    }
+    if (slots != 0U) {
+        dl_slot[cell_id].fetch_add(slots, std::memory_order_relaxed);
+    }
+}
+
 void phy::print_cell_stats(slot_command_api::slot_indication* slot_3gpp)
 {
     static constexpr double BYTES_TO_MBPS_FACTOR = 8.0 / 1000000.0;
@@ -75,10 +152,7 @@ void phy::print_cell_stats(slot_command_api::slot_indication* slot_3gpp)
 }
 
 bool phy::first_config_req = false;
-static constexpr uint16_t fake_phy_cell_id[MAX_CELLS_PER_SLOT] = {1008, 1009, 1010, 1011, 1012, 1013,
-                                                                  1014, 1015, 1016, 1017, 1018, 1019,
-                                                                  1020, 1021, 1022, 1023, 1024, 1025,
-                                                                  1026, 1027};
+// fake_phy_cell_id moved to scf_5g_fapi_phy.hpp (shared with the offload path).
 std::vector<uint32_t> phy::first_config_req_pmidxes = {};
 
 phy::phy(nv::PHY_module& phy_module, yaml::node node_config) :
@@ -160,6 +234,19 @@ void phy::reset_slot(bool partial_cmd)
     duplicate_ul_bfw_cvi_req = false;
 }
 
+void phy::on_store_replay_slot_complete()
+{
+    cur_dl_msg.reset();
+    dl_pdu_index_size = 0;
+    pdsch_rejected_ = false;
+    duplicate_dl_tti_req = false;
+    duplicate_ul_tti_req = false;
+    duplicate_tx_data_req = false;
+    duplicate_ul_dci_req = false;
+    duplicate_dl_bfw_cvi_req = false;
+    duplicate_ul_bfw_cvi_req = false;
+}
+
 // Reset PHY state and clean up resources when L2 reconnects
 int phy::reset()
 {
@@ -197,29 +284,29 @@ int phy::check_sfn_slot(int cell_id, int msg_id, sfn_slot_t ss_msg)
 {
     sfn_slot_t& ss_curr = phy_module().get_curr_sfn_slot();
 
-    if ((msg_id != SCF_FAPI_SLOT_INDICATION) && (ss_curr.u32 != ss_msg.u32))
-    {
-        // SFN/SLOT changed: process pending messages from previous slot
-        NVLOGW_FMT(TAG, "{}: SFN mismatch cell_id={} expected={}.{} received={}.{} msg_id=0x{:02X} dropped", __FUNCTION__, 
-                   cell_id, ss_curr.u16.sfn, ss_curr.u16.slot, ss_msg.u16.sfn, ss_msg.u16.slot, msg_id);
-
-        switch(msg_id)
-        {
-            case SCF_FAPI_DL_TTI_REQUEST:
-            case SCF_FAPI_UL_TTI_REQUEST:
-                send_error_indication(static_cast<scf_fapi_message_id_e>(msg_id), SCF_ERROR_CODE_SFN_OUT_OF_SYNC, ss_msg.u16.sfn, ss_msg.u16.slot);
-                break;
-            case SCF_FAPI_UL_DCI_REQUEST:
-            case SCF_FAPI_TX_DATA_REQUEST:
-                send_error_indication(static_cast<scf_fapi_message_id_e>(msg_id), SCF_ERROR_CODE_MSG_INVALID_SFN, ss_msg.u16.sfn, ss_msg.u16.slot);
-                break;
-            default:
-                break;
-        }
-        return -1;
-    }
-    else
+    if (msg_id == SCF_FAPI_SLOT_INDICATION)
         return 0;
+    if (ss_curr.u32 == ss_msg.u32)
+        return 0;
+
+    // SFN/SLOT mismatch: drop and send error
+    NVLOGW_FMT(TAG, "{}: SFN mismatch cell_id={} expected={}.{} received={}.{} msg_id=0x{:02X} dropped", __FUNCTION__,
+               cell_id, ss_curr.u16.sfn, ss_curr.u16.slot, ss_msg.u16.sfn, ss_msg.u16.slot, msg_id);
+
+    switch(msg_id)
+    {
+        case SCF_FAPI_DL_TTI_REQUEST:
+        case SCF_FAPI_UL_TTI_REQUEST:
+            send_error_indication(static_cast<scf_fapi_message_id_e>(msg_id), SCF_ERROR_CODE_SFN_OUT_OF_SYNC, ss_msg.u16.sfn, ss_msg.u16.slot);
+            break;
+        case SCF_FAPI_UL_DCI_REQUEST:
+        case SCF_FAPI_TX_DATA_REQUEST:
+            send_error_indication(static_cast<scf_fapi_message_id_e>(msg_id), SCF_ERROR_CODE_MSG_INVALID_SFN, ss_msg.u16.sfn, ss_msg.u16.slot);
+            break;
+        default:
+            break;
+    }
+    return -1;
 }
 #else
 int phy::check_sfn_slot(int cell_id, int msg_id, sfn_slot_t ss_msg)
@@ -286,7 +373,7 @@ inline void update_l1_recovery_cnts(sfn_slot_t& ss_msg) {
         nv::PHYDriverProxy::getInstance().l1_reset_all_obj_free_slots();
     }
  
-bool phy::on_msg(nv_ipc_msg_t& msg)
+bool phy::on_msg(nv_ipc_msg_t& msg, const FapiSkip mask)
 {
     bool ready_to_free = true;
     bool data_buf = (msg.data_pool ==  NV_IPC_MEMPOOL_CPU_DATA) &&
@@ -306,7 +393,7 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
         uint32_t body_len = body_hdr.length;
         if (msg.msg_len != head_len + body_len)
         {
-            NVLOGW_FMT(TAG, "{}: Incorrect msg length cell_id={} msg_id=0x{:02X} expected={} received={}", __FUNCTION__,
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "{}: Incorrect msg length cell_id={} msg_id=0x{:02X} expected={} received={}", __FUNCTION__,
                     msg.cell_id, msg.msg_id, head_len + body_len, msg.msg_len);
         }
 
@@ -315,13 +402,13 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
             metrics_.incr_rx_packet_count(static_cast<scf_fapi_message_id_e>(typeID));
         }
 
-        sfn_slot_t& ss_msg = *(reinterpret_cast<sfn_slot_t*>(body_hdr.data));
-        NVLOGI_FMT(TAG, "{}: SFN {}.{} received: cell_id={} msg_id=0x{:02X}", __FUNCTION__, ss_msg.u16.sfn, ss_msg.u16.slot, msg.cell_id, msg.msg_id);
+        sfn_slot_t ss_msg = nv_ipc_get_sfn_slot(&msg);
+        NVLOGI_FMT(TAG, "{}: SFN {}.{} cell_id={} msg_id=0x{:02X} {}", __FUNCTION__, ss_msg.u16.sfn, ss_msg.u16.slot, msg.cell_id, msg.msg_id, get_fapi_msg_name(msg.msg_id));
 
         scf_fapi_header_t *hdr = reinterpret_cast<scf_fapi_header_t*>(msg.msg_buf);
         if(hdr->handle_id != msg.cell_id || msg.cell_id < 0 || msg.cell_id >= MAX_CELLS_PER_SLOT)
         {
-            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "{}: Incorrect cell_id={} msg_id=0x{:02X} handle_id={} pool={}", __FUNCTION__, msg.cell_id, msg.msg_id, hdr->handle_id, msg.data_pool);
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "{}: Incorrect cell_id={} msg_id=0x{:02X} {} handle_id={} pool={}", __FUNCTION__, msg.cell_id, msg.msg_id, get_fapi_msg_name(msg.msg_id), hdr->handle_id, msg.data_pool);
             return ready_to_free;
         }
 
@@ -350,8 +437,8 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
         if(pExitHandler.get_l1_state() != exit_handler::l1_state::L1_RUNNING) {
 
             if(pExitHandler.get_l1_state() == exit_handler::l1_state::L1_EXIT || typeID != SCF_FAPI_SLOT_INDICATION) {
-                    NVLOGW_FMT(TAG, "{}: SFN {}.{} received: cell_id={} msg_id=0x{:02X}: L1 in recovery, drop msg", __FUNCTION__,
-                ss_msg.u16.sfn, ss_msg.u16.slot, msg.cell_id, msg.msg_id);
+                    NVLOGW_FMT(TAG, "{}: SFN {}.{} cell_id={} msg_id=0x{:02X} {}: L1 in recovery, drop msg", __FUNCTION__,
+                ss_msg.u16.sfn, ss_msg.u16.slot, msg.cell_id, msg.msg_id, get_fapi_msg_name(msg.msg_id));
 
                 return ready_to_free;
             }
@@ -402,9 +489,19 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
                 }
 
                 if (phy_module().transport_wrapper().get_all_cells_configured()) {
-                    phy_module().set_all_cells_configured(true);
-                    // Print memory info after all cells are configured
                     memfoot_global_print_all();
+
+                    // Build CPlaneGenerator before enabling slot ticks: init blocks
+                    // msg_processing (~170ms for 6 mMIMO cells) while the timer
+                    // thread would otherwise advance SFN and expire TX windows.
+                    if (l1_init_cplane_generator(phyDriver.get_driver(),
+                                                 config.bf_enabled,
+                                                 config.precoding_enabled) != 0) {
+                        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                            "l1_init_cplane_generator failed");
+                        return false;
+                    }
+                    phy_module().set_all_cells_configured(true);
                 }
             }
                 break;
@@ -426,7 +523,7 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
                     phy_module().new_slot(false);
                     phy_module().l2a_start_tick(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()));
                 }
-                on_dl_tti_request(reinterpret_cast<scf_fapi_dl_tti_req_t&>(body_hdr), msg, pdsch_pdu_valid_flag);
+                on_dl_tti_request(reinterpret_cast<scf_fapi_dl_tti_req_t&>(body_hdr), msg, pdsch_pdu_valid_flag, mask);
 #ifdef ENABLE_L2_SLT_RSP
                 auto& cell_error = phy_module().get_cell_limit_errors(get_carrier_id());
                 auto& group_error = phy_module().get_group_limit_errors();
@@ -448,7 +545,7 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
                     phy_module().new_slot(false);
                     phy_module().l2a_start_tick(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()));
                 }
-                on_ul_tti_request(reinterpret_cast<scf_fapi_ul_tti_req_t&>(body_hdr), msg);
+                on_ul_tti_request(reinterpret_cast<scf_fapi_ul_tti_req_t&>(body_hdr), msg, mask);
 #ifdef ENABLE_L2_SLT_RSP
                 auto& cell_error = phy_module().get_cell_limit_errors(get_carrier_id());
                 auto& group_error = phy_module().get_group_limit_errors();
@@ -462,6 +559,7 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
             break;
             case SCF_FAPI_UL_DCI_REQUEST:
             {
+                if (mask & FapiSkip::UL_DCI) { break; }
                 phy_module().last_fapi_msg_tick(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()));
                 phy_module().is_dl_slot(true);
                 if(phy_module().new_slot() == true)
@@ -481,6 +579,7 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
             }
             break;
             case SCF_FAPI_TX_DATA_REQUEST:
+                if (mask & FapiSkip::TX_DATA) { break; }
                 phy_module().last_fapi_msg_tick(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()));
                 if (on_phy_dl_tx_request(reinterpret_cast<scf_fapi_tx_data_req_t&>(body_hdr), msg, pdsch_pdu_valid_flag))
                 {
@@ -495,6 +594,7 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
              * for downlink transmission. Requires both SRS and mMIMO feature flags to be enabled in cuphycontroller_config_xxx.yaml. */
             case SCF_FAPI_DL_BFW_CVI_REQUEST:
             {
+                if (mask & FapiSkip::DL_BFW) { break; }
                 phy_module().last_fapi_msg_tick(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()));
                 phy_module().is_dl_slot(true);
                 if(phy_module().new_slot() == true)
@@ -518,6 +618,7 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
              * for uplink transmission. Requires both SRS and mMIMO feature flags to be enabled in cuphycontroller_config_xxx.yaml. */
             case SCF_FAPI_UL_BFW_CVI_REQUEST:
             {
+                if (mask & FapiSkip::UL_BFW) { break; }
                 phy_module().last_fapi_msg_tick(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()));
                 phy_module().is_ul_slot(true);
                 if(phy_module().new_slot() == true)
@@ -539,32 +640,25 @@ bool phy::on_msg(nv_ipc_msg_t& msg)
 #ifdef ENABLE_L2_SLT_RSP
             case SCF_FAPI_SLOT_INDICATION:
             {
-                auto fapi = reinterpret_cast<scf_fapi_slot_ind_t&>(body_hdr);
-                NVLOGI_FMT(TAG, "{}: Slot indication received SFN {}.{}", __FUNCTION__, static_cast<int>(fapi.sfn), static_cast<int>(fapi.slot));
-                sfn_slot_t ss_curr; ss_curr.u16.sfn = fapi.sfn; ss_curr.u16.slot = fapi.slot;
-                phy_module().set_curr_sfn_slot(ss_curr);
-                //phy_module().l1_slot_ind_tick(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()));
+                // Loopback SLOT.ind is handled by the PHY_module#recv_msg() rules, no need to handle here
                 break;
             }
             case SCF_FAPI_SLOT_RESPONSE:
             {
                 phy_module().last_fapi_msg_tick(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()));
-                auto fapi = reinterpret_cast<scf_fapi_slot_rsp_t&>(body_hdr);
-                NVLOGI_FMT(TAG, "{}: Slot response received SFN {}.{} cell_id={}", __FUNCTION__, static_cast<int>(fapi.sfn), static_cast<int>(fapi.slot), msg.cell_id);
+                // ss_curr monotonically increases, previous slot rollback is not needed.
                 sfn_slot_t& ss_curr = phy_module().get_curr_sfn_slot();
-                if(fapi.sfn == ss_curr.u16.sfn && fapi.slot == ss_curr.u16.slot)
+                if (ss_curr.u32 == ss_msg.u32) {
                     phy_module().update_eom_rcvd_bitmap(msg.cell_id);
+                }
                 break;
             }
             case SCF_FAPI_ERROR_INDICATION:
             {
                 auto fapi = reinterpret_cast<scf_fapi_error_ind_t&>(body_hdr);
-                NVLOGI_FMT(TAG, "{}: Late slot error SFN {}.{}", __FUNCTION__, static_cast<int>(fapi.sfn), static_cast<int>(fapi.slot));
-                sfn_slot_t ss_curr; ss_curr.u16.sfn = 1024; ss_curr.u16.slot = nv::mu_to_slot_in_sf(phy_cell_params.mu);
-                phy_module().set_curr_sfn_slot(ss_curr);
-                NVLOGI_FMT(TAG, "{}: Set curr SFN=1024 slot={}, clear slot command and keep dropping FAPI messages till next slot indication", __FUNCTION__,
-                    ss_curr.u16.slot);
-                on_slot_error_indication(reinterpret_cast<scf_fapi_error_ind_t&>(body_hdr), msg);
+                NVLOGI_FMT(TAG, "{}: cell_id={} SFN {}.{} ERR.ind error_code=0x{:02X} - late slot error",
+                    __FUNCTION__, msg.cell_id, ss_msg.u16.sfn, ss_msg.u16.slot, fapi.err_code);
+                // FAPI receiving tolerance is handled by the PHY_module#recv_msg() rules, no need to handle late slot error here
                 break;
             }
 #endif
@@ -814,6 +908,8 @@ bool phy::process_dl_tx_request()
 
 bool phy::on_phy_dl_tx_request(scf_fapi_tx_data_req_t& request, nv_ipc_msg_t& ipc_msg, uint8_t* pdsch_pdu_valid_flag)
 {
+    // Do NOT clear duplicate flags on "new slot" here: we can only hold one cur_dl_msg (TX_DATA) at a time.
+    // Clearing and accepting a new TX_DATA would release the previous slot's TX_DATA without giving it to process_phy_commands.
     if(duplicate_tx_data_req)
     {
         NVLOGW_FMT(TAG, "{}: Duplicate TX_DATA.req received SFN {}.{} cell_id={}", __FUNCTION__, static_cast<unsigned>(request.sfn), static_cast<unsigned>(request.slot), static_cast<unsigned>(ipc_msg.cell_id));
@@ -841,11 +937,22 @@ bool phy::on_phy_dl_tx_request(scf_fapi_tx_data_req_t& request, nv_ipc_msg_t& ip
     if(pdsch_pdu_valid_flag[phy_config.cell_config_.carrier_idx] == 1 || pdsch_rejected_)
     {
         NVLOGW_FMT(TAG, "{}: Dropping TX_DATA.req for cell_id={} since invalid/rejected PDSCH PDU for SFN {}.{}", __FUNCTION__, phy_config.cell_config_.carrier_idx, slot_ind.sfn_, slot_ind.slot_);
-        if(cur_dl_msg.data_buf != nullptr)
+        auto& ipc_desc = reinterpret_cast<nv::phy_mac_msg_desc&>(ipc_msg);
+        const bool ipc_buffers_same_as_cur = (cur_dl_msg.data_buf != nullptr
+                                              && cur_dl_msg.data_buf == ipc_desc.data_buf
+                                              && cur_dl_msg.msg_buf == ipc_desc.msg_buf);
+        if (cur_dl_msg.data_buf != nullptr)
         {
             phy_module().transport_wrapper().rx_release(cur_dl_msg);
             cur_dl_msg.reset();
         }
+        // Store-and-replay: ring TX_DATA lane still holds this descriptor — release it and
+        // null the entry so nothing dereferences a freed buffer before reset_for_slot().
+        if (ipc_desc.data_buf != nullptr && !ipc_buffers_same_as_cur)
+        {
+            phy_module().transport_wrapper().rx_release(ipc_desc);
+        }
+        ipc_desc.reset();
         return handled;
     }
     
@@ -853,7 +960,14 @@ bool phy::on_phy_dl_tx_request(scf_fapi_tx_data_req_t& request, nv_ipc_msg_t& ip
     {
         scf_fapi_header_t*      fapi_hdr = reinterpret_cast<scf_fapi_header_t*>(cur_dl_msg.msg_buf);
         scf_fapi_tx_data_req_t* last_req = reinterpret_cast<scf_fapi_tx_data_req_t*>(fapi_hdr->payload);
-        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: Last TX_DATA.req not released: SFN {}.{} cell_id={}", __FUNCTION__, static_cast<unsigned>(request.sfn), static_cast<unsigned>(request.slot), static_cast<unsigned>(last_req->sfn), static_cast<unsigned>(last_req->slot), cur_dl_msg.cell_id);
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+            "{}: Last TX_DATA.req not released: held SFN {}.{} cell_id={}, incoming SFN {}.{}",
+            __FUNCTION__,
+            static_cast<unsigned>(last_req->sfn),
+            static_cast<unsigned>(last_req->slot),
+            cur_dl_msg.cell_id,
+            static_cast<unsigned>(request.sfn),
+            static_cast<unsigned>(request.slot));
         phy_module().transport_wrapper().rx_release(cur_dl_msg);
         cur_dl_msg.reset();
     }
@@ -1013,7 +1127,7 @@ void phy::on_param_request()
     NVLOGW_FMT(TAG, "{}: PARAM.req is not supported yet", __FUNCTION__);
 }
 
-void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, uint8_t* pdsch_valid_flag)
+void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, uint8_t* pdsch_valid_flag, const FapiSkip mask)
 {
     if(duplicate_dl_tti_req)
     {
@@ -1077,17 +1191,17 @@ void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, u
     uint32_t cell_idx = 0;
     bool first_csirs = false;
     uint32_t csirs_offset = 0;
-    //If cell groups have to be disabled, set the flag to true so that it doesn't populate cell group parameters
-    if(!phy_module().cell_group())
-        pdsch = true;
-    else
-    {
-        cell_group_command* group_cmd = phy_module().group_command();
-        pdsch_params* pdsch_info = group_cmd->pdsch.get();
-        if(pdsch_info)
-        {
-            pdsch_info->cell_ue_group_idx_start = pdsch_info->cell_grp_info.nUeGrps;
-            pdsch_cw_idx_start = pdsch_info->cell_grp_info.nCws;
+    if(!(mask & FapiSkip::PDSCH)) {
+        if(!phy_module().cell_group()) {
+            pdsch = true;
+        } else {
+            cell_group_command* group_cmd = phy_module().group_command();
+            pdsch_params* pdsch_info = group_cmd->pdsch.get();
+            if(pdsch_info)
+            {
+                pdsch_info->cell_ue_group_idx_start = pdsch_info->cell_grp_info.nUeGrps;
+                pdsch_cw_idx_start = pdsch_info->cell_grp_info.nCws;
+            }
         }
     }
 
@@ -1098,6 +1212,7 @@ void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, u
         {
             case DL_TTI_PDU_TYPE_PDCCH:
             {
+                if (mask & FapiSkip::PDCCH) { break; }
                 auto &pdu_dat = *reinterpret_cast<scf_fapi_pdcch_pdu_t*>(&pdu.pdu_config[0]);
                 prepare_dl_slot_command(slot_ind, pdu_dat, testMode);
                 dci = true;
@@ -1105,6 +1220,7 @@ void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, u
             }
             case DL_TTI_PDU_TYPE_PDSCH:
             {
+                if (mask & FapiSkip::PDSCH) { break; }
                 auto& pdu_dat = *reinterpret_cast<scf_fapi_pdsch_pdu_t*>(&pdu.pdu_config[0]);
                 if(!pdsch)
                 {
@@ -1171,6 +1287,7 @@ void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, u
             }
             case DL_TTI_PDU_TYPE_SSB:
             {
+                if (mask & FapiSkip::SSB) { break; }
                 has_ssb_pdu = true;
                 auto &pdu_dat = *reinterpret_cast<scf_fapi_ssb_pdu_t*>(&pdu.pdu_config[0]);
                 prepare_dl_slot_command(slot_ind, pdu_dat);
@@ -1196,11 +1313,13 @@ void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, u
      * NZP CSI-RS + PDSCH - both PDSCH & CSI-RS look into RrcDynPrms. Both pipelines called indepedently
      * ZP CSI-RS - no pipeline called
      */
-    //Process CSI-RS at the end to identify if RrcDynPrms of PDSCH need to be updated or not
+    // CSI-RS is processed in a dedicated second pass (not in the main PDU switch
+    // above) so that PDSCH RrcDynPrms can be finalized first.  The FapiSkip guard
+    // here is the sole skip point for CSI-RS — there is no pre-loop setup to skip.
     for (uint16_t i = 0; i < numPDU; i++) {
         auto &pdu = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(data + offset));
 
-        if(pdu.pdu_type == DL_TTI_PDU_TYPE_CSI_RS)
+        if(pdu.pdu_type == DL_TTI_PDU_TYPE_CSI_RS && !(mask & FapiSkip::CSI_RS))
         {
             NVLOGD_FMT(TAG, "{}: Processing CSI-RS:PDU Type ={}, PDU Size={}, Offset={} cell_id ={}", __FUNCTION__, static_cast<int>(pdu.pdu_type), static_cast<int>(pdu.pdu_size), offset, get_carrier_id());
             auto &pdu_dat = *reinterpret_cast<scf_fapi_csi_rsi_pdu_t*>(&pdu.pdu_config[0]);
@@ -1270,7 +1389,7 @@ void phy::on_dl_tti_request(scf_fapi_dl_tti_req_t &msg, nv_ipc_msg_t& ipc_msg, u
     }
 }
 
-void phy::on_ul_tti_request(scf_fapi_ul_tti_req_t& msg, nv_ipc_msg_t& ipc_msg)
+void phy::on_ul_tti_request(scf_fapi_ul_tti_req_t& msg, nv_ipc_msg_t& ipc_msg, const FapiSkip mask)
 {
     if(duplicate_ul_tti_req)
     {
@@ -1349,6 +1468,7 @@ void phy::on_ul_tti_request(scf_fapi_ul_tti_req_t& msg, nv_ipc_msg_t& ipc_msg)
             }
             case UL_TTI_PDU_TYPE_PUCCH:
             {
+                if (mask & FapiSkip::PUCCH) { break; }
                 // Iterate through PDUs to identify the first PUCCH PDU of format 0, 1, 3, or 4 and extract its hopping_id for use in subsequent processing
                 // This is needed because hopping_id invalid for PUCCH FORMAT 2 per FAPI spec, so we need to extract it from the first PUCCH PDU of format 0, 1, 3, or 4.
                 if (!pucch_hopping_id_found) {
@@ -1377,7 +1497,11 @@ void phy::on_ul_tti_request(scf_fapi_ul_tti_req_t& msg, nv_ipc_msg_t& ipc_msg)
 
 #ifdef SCF_FAPI_10_04_SRS
     // SRS without PUSCH in SINGLE_SECT_MODE: send error indication once, then skip only SRS PDUs in the loop below (other PDUs still processed).
+#ifdef SCF_FAPI_10_04
+    if (ru == SINGLE_SECT_MODE && num_srs_pdus > 0 && msg.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUSCH] == 0) {
+#else
     if (ru == SINGLE_SECT_MODE && num_srs_pdus > 0 && msg.num_ulsch == 0) {
+#endif
         NVLOGI_FMT(TAG,
             "{}: SRS without PUSCH is not supported in SINGLE_SECT_MODE. SFN {}.{} cell_id={}",
             __FUNCTION__, static_cast<unsigned>(msg.sfn), static_cast<unsigned>(msg.slot), ipc_msg.cell_id);
@@ -1392,12 +1516,14 @@ void phy::on_ul_tti_request(scf_fapi_ul_tti_req_t& msg, nv_ipc_msg_t& ipc_msg)
         {
             case UL_TTI_PDU_TYPE_PRACH:
             {
+                if (mask & FapiSkip::PRACH) { break; }
                 auto &pdu_dat = *reinterpret_cast<scf_fapi_prach_pdu_t*>(&pdu.pdu_config[0]);
                 on_prach_pdu_info(pdu_dat, slot_ind);
                 break;
             }
             case UL_TTI_PDU_TYPE_PUSCH:
             {
+                if (mask & FapiSkip::PUSCH) { break; }
                 auto &pdu_dat = *reinterpret_cast<scf_fapi_pusch_pdu_t*>(&pdu.pdu_config[0]);
                 if (on_pusch_pdu_info(pdu_dat)) {
                     prepare_ul_slot_command(slot_ind, pdu_dat);
@@ -1408,18 +1534,24 @@ void phy::on_ul_tti_request(scf_fapi_ul_tti_req_t& msg, nv_ipc_msg_t& ipc_msg)
             }
             case UL_TTI_PDU_TYPE_PUCCH:
             {
+                if (mask & FapiSkip::PUCCH) { break; }
                 auto &pdu_dat = *reinterpret_cast<scf_fapi_pucch_pdu_t*>(&pdu.pdu_config[0]);
                 on_pucch_pdu_info(pdu_dat, slot_ind);
                 break;
             }
             case UL_TTI_PDU_TYPE_SRS:
             {
+                if (mask & FapiSkip::SRS) { break; }
 #ifndef SCF_FAPI_10_04_SRS
                 // Skip SRS PDU processing for SINGLE_SECT_MODE type, as some L2s do not support SRS.
                 if (ru == SINGLE_SECT_MODE) { break;}
 #else
                 // Skip only SRS PDUs when SRS without PUSCH in SINGLE_SECT_MODE (error already sent before this loop).
+#ifdef SCF_FAPI_10_04
+                if (ru == SINGLE_SECT_MODE && msg.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUSCH] == 0) { break; }
+#else
                 if (ru == SINGLE_SECT_MODE && msg.num_ulsch == 0) { break; }
+#endif
 #endif
                 if (!enable_srs_flag)
                 {
@@ -1659,7 +1791,6 @@ void phy::on_dl_bfw_request(scf_fapi_dl_bfw_cvi_request_t& msg, nv_ipc_msg_t& ip
     slot_command_api::slot_indication slot_ind;
     slot_ind.sfn_ = msg.sfn;
     slot_ind.slot_ = msg.slot;
-    uint16_t msg_len = 0;
     if (state != fapi_state_t::FAPI_STATE_RUNNING)
     {
         NVLOGW_FMT(TAG, "{}: DL_BFW_CVI.req rejected - FAPI state not RUNNING (current={})", __FUNCTION__, static_cast<uint32_t>(state.load()));
@@ -1679,7 +1810,17 @@ void phy::on_dl_bfw_request(scf_fapi_dl_bfw_cvi_request_t& msg, nv_ipc_msg_t& ip
         }
     }
 
-    msg_len += sizeof(scf_fapi_dl_bfw_cvi_request_t) + sizeof(scf_fapi_header_t);
+    constexpr std::size_t msg_fixed_bytes =
+        sizeof(scf_fapi_dl_bfw_cvi_request_t) + sizeof(scf_fapi_header_t);
+    if (ipc_msg.msg_len < 0 || static_cast<std::size_t>(ipc_msg.msg_len) < msg_fixed_bytes)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                   "{}: DL_BFW_CVI.req msg_len={} smaller than fixed header {}",
+                   __FUNCTION__, ipc_msg.msg_len, msg_fixed_bytes);
+        send_error_indication(static_cast<scf_fapi_message_id_e> (msg.msg_hdr.type_id), scf_fapi_error_codes_t::SCF_ERROR_CODE_MSG_SLOT_ERR, msg.sfn, msg.slot);
+        return;
+    }
+    const std::size_t available_bytes = static_cast<std::size_t>(ipc_msg.msg_len) - msg_fixed_bytes;
     auto& slot_cmd = phy_module().cell_sub_command(get_carrier_id());
 #ifndef ENABLE_L2_SLT_RSP
     reset_cell_command(slot_cmd, slot_ind, get_carrier_id(), phy_module().cell_group(), phy_module().group_command());
@@ -1689,13 +1830,31 @@ void phy::on_dl_bfw_request(scf_fapi_dl_bfw_cvi_request_t& msg, nv_ipc_msg_t& ip
     uint8_t* data = reinterpret_cast<uint8_t*>(msg.config_pdu);
     NVLOGD_FMT(TAG, "{}: DL_BFW_CVI.req received for SFN = {}, Slot ={} number of PDUs ={}", __FUNCTION__, slot_ind.sfn_, slot_ind.slot_, num_pdu_rx);
 
-    uint offset = 0;
+    std::size_t offset = 0;
     uint32_t droppedDlBFWPdu = 0;
+    constexpr std::size_t bfw_msg_fixed_bytes = sizeof(scf_fapi_dl_bfw_group_config_t);
     for (uint i = 0 ; i < num_pdu_rx; i++)
     {
+        if (offset > available_bytes || available_bytes - offset < bfw_msg_fixed_bytes)
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "{}: DL_BFW_CVI.req pdu[{}] header truncated offset={} available={} required={}",
+                       __FUNCTION__, i, offset, available_bytes, bfw_msg_fixed_bytes);
+            send_error_indication(static_cast<scf_fapi_message_id_e> (msg.msg_hdr.type_id), scf_fapi_error_codes_t::SCF_ERROR_CODE_MSG_SLOT_ERR, msg.sfn, msg.slot);
+            return;
+        }
         auto &pdu = *(reinterpret_cast<scf_fapi_dl_bfw_group_config_t*>(data + offset));
+        const uint16_t pdu_size = pdu.pdu_size;
+        if (pdu_size < bfw_msg_fixed_bytes || pdu_size > available_bytes - offset)
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "{}: DL_BFW_CVI.req pdu[{}] invalid pdu_size={} offset={} remaining={}",
+                       __FUNCTION__, i, pdu_size, offset, available_bytes - offset);
+            send_error_indication(static_cast<scf_fapi_message_id_e> (msg.msg_hdr.type_id), scf_fapi_error_codes_t::SCF_ERROR_CODE_MSG_SLOT_ERR, msg.sfn, msg.slot);
+            return;
+        }
         on_dl_bfw_pdu_info(pdu, slot_ind, droppedDlBFWPdu);
-        offset += pdu.pdu_size;
+        offset += pdu_size;
     }
     // Send ERROR IND for each dropped DL BFW PDU
     for(uint32_t i = 0; i < droppedDlBFWPdu; i++)
@@ -1716,7 +1875,6 @@ void phy::on_ul_bfw_request(scf_fapi_ul_bfw_cvi_request_t& msg, nv_ipc_msg_t& ip
     slot_command_api::slot_indication slot_ind;
     slot_ind.sfn_ = msg.sfn;
     slot_ind.slot_ = msg.slot;
-    uint16_t msg_len = 0;
     if (state != fapi_state_t::FAPI_STATE_RUNNING)
     {
         NVLOGW_FMT(TAG, "{}: UL_BFW_CVI.req rejected - FAPI state not RUNNING (current={})", __FUNCTION__, static_cast<uint32_t>(state.load()));
@@ -1736,7 +1894,17 @@ void phy::on_ul_bfw_request(scf_fapi_ul_bfw_cvi_request_t& msg, nv_ipc_msg_t& ip
         }
     }
 
-    msg_len += sizeof(scf_fapi_ul_bfw_cvi_request_t) + sizeof(scf_fapi_header_t);
+    constexpr std::size_t msg_fixed_bytes =
+        sizeof(scf_fapi_ul_bfw_cvi_request_t) + sizeof(scf_fapi_header_t);
+    if (ipc_msg.msg_len < 0 || static_cast<std::size_t>(ipc_msg.msg_len) < msg_fixed_bytes)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                   "{}: UL_BFW_CVI.req msg_len={} smaller than fixed header {}",
+                   __FUNCTION__, ipc_msg.msg_len, msg_fixed_bytes);
+        send_error_indication(static_cast<scf_fapi_message_id_e> (msg.msg_hdr.type_id), scf_fapi_error_codes_t::SCF_ERROR_CODE_MSG_SLOT_ERR, msg.sfn, msg.slot);
+        return;
+    }
+    const std::size_t available_bytes = static_cast<std::size_t>(ipc_msg.msg_len) - msg_fixed_bytes;
     auto& slot_cmd = phy_module().cell_sub_command(get_carrier_id());
 #ifndef ENABLE_L2_SLT_RSP
     reset_cell_command(slot_cmd, slot_ind, get_carrier_id(), phy_module().cell_group(), phy_module().group_command());
@@ -1746,14 +1914,32 @@ void phy::on_ul_bfw_request(scf_fapi_ul_bfw_cvi_request_t& msg, nv_ipc_msg_t& ip
     uint8_t* data = reinterpret_cast<uint8_t*>(msg.config_pdu);
     NVLOGD_FMT(TAG, "{}: UL_BFW_CVI.req received for SFN = {}, Slot ={} number of PDUs ={}", __FUNCTION__, slot_ind.sfn_, slot_ind.slot_, num_pdu_rx);
 
-    uint offset = 0;
+    std::size_t offset = 0;
     uint32_t droppedUlBFWPdu = 0;
+    constexpr std::size_t bfw_msg_fixed_bytes = sizeof(scf_fapi_ul_bfw_group_config_t);
 
     for (uint i = 0 ; i < num_pdu_rx; i++)
     {
+        if (offset > available_bytes || available_bytes - offset < bfw_msg_fixed_bytes)
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "{}: UL_BFW_CVI.req pdu[{}] header truncated offset={} available={} required={}",
+                       __FUNCTION__, i, offset, available_bytes, bfw_msg_fixed_bytes);
+            send_error_indication(static_cast<scf_fapi_message_id_e> (msg.msg_hdr.type_id), scf_fapi_error_codes_t::SCF_ERROR_CODE_MSG_SLOT_ERR, msg.sfn, msg.slot);
+            return;
+        }
         auto &pdu = *(reinterpret_cast<scf_fapi_ul_bfw_group_config_t*>(data + offset));
+        const uint16_t pdu_size = pdu.pdu_size;
+        if (pdu_size < bfw_msg_fixed_bytes || pdu_size > available_bytes - offset)
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "{}: UL_BFW_CVI.req pdu[{}] invalid pdu_size={} offset={} remaining={}",
+                       __FUNCTION__, i, pdu_size, offset, available_bytes - offset);
+            send_error_indication(static_cast<scf_fapi_message_id_e> (msg.msg_hdr.type_id), scf_fapi_error_codes_t::SCF_ERROR_CODE_MSG_SLOT_ERR, msg.sfn, msg.slot);
+            return;
+        }
         on_ul_bfw_pdu_info(pdu, slot_ind, droppedUlBFWPdu);
-        offset += pdu.pdu_size;
+        offset += pdu_size;
     }
     // Send ERROR IND for each dropped UL BFW PDU
     for(uint32_t i = 0; i < droppedUlBFWPdu; i++)
@@ -2091,7 +2277,7 @@ void phy::prepare_ul_slot_command(slot_command_api::slot_indication& slot_ind, s
 
     if(phy_module().cell_group())
     {
-        update_cell_command(grp_cmd, slot_cmd, pdu, get_carrier_id(), slot_ind, phy_module().staticPuschSlotNum(), phy_module().lbrm(), phy_module().bf_enabled(), (uint16_t) cell_stat_prm_idx, phy_module().dtx_thresholds_pusch(),bfwCoeff_mem_info, get_mMIMO_enable_info(), get_slot_detail(slot_ind), phy_cell_params.nPrbUlBwp);
+        update_cell_command(grp_cmd, slot_cmd, pdu, get_carrier_id(), slot_ind, phy_module().staticPuschSlotNum(), phy_module().lbrm(), phy_module().bf_enabled(), (uint16_t) cell_stat_prm_idx, phy_module().dtx_thresholds_pusch(),bfwCoeff_mem_info, get_mMIMO_enable_info(), get_slot_detail(slot_ind), phy_cell_params.nPrbUlBwp, phy_cell_params.nRxAnt);
     }
 }
 
@@ -2174,7 +2360,7 @@ bool phy::prepare_dl_slot_command(slot_command_api::slot_indication& slot_ind, s
             send_error_indication(SCF_FAPI_DL_TTI_REQUEST, SCF_ERROR_CODE_MSG_CAPACITY_EXCEEDED, slot_ind.sfn_, slot_ind.slot_);
             return false;
         }
-        return update_cell_command(grp_cmd, slot_cmd, pdu, testMode, slot_ind, get_carrier_id(), nv::PHY_module::pm_map(), phy_module().pm_enabled(), phy_module().bf_enabled(), phy_cell_params.nPrbDlBwp, bfwCoeff_mem_info, get_mMIMO_enable_info(), get_slot_detail(slot_ind));
+        return update_cell_command(grp_cmd, slot_cmd, pdu, testMode, slot_ind, get_carrier_id(), nv::PHY_module::pm_map(), phy_module().pm_enabled(), phy_module().bf_enabled(), phy_cell_params.nPrbDlBwp, phy_cell_params.nTxAnt, bfwCoeff_mem_info, get_mMIMO_enable_info(), get_slot_detail(slot_ind));
     }
     return true;
 }
@@ -2282,9 +2468,78 @@ void phy::on_dl_bfw_pdu_info(scf_fapi_dl_bfw_group_config_t &pdu_info, slot_comm
 }
 #endif
 
-void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const int32_t cell_id, uint8_t handle_id, nv_ipc_msg_t& ipc_msg)
+void phy::apply_dl_bfw_pdu(
+    const scf_fapi_dl_bfw_group_config_t& pdu,
+    slot_command_api::slot_indication& slot_ind,
+    slot_command_api::cell_group_command* grp_cmd,
+    slot_command_api::cell_sub_command& cell_cmd,
+    slot_command_api::bfw_coeff_mem_info_t* bfw_info,
+    uint32_t& droppedBFWPdu)
 {
-    NVLOGC_FMT(TAG, "{}: CONFIG.req received for cell_id={} numTLVs={} state={}", __FUNCTION__, cell_id, config_request.msg_body.num_tlvs, state.load());
+#ifdef SCF_FAPI_10_04
+    update_dl_bfw_cell_command(grp_cmd, cell_cmd, pdu, get_carrier_id(),
+                               slot_ind, phy_cell_params, bfw_info,
+                               get_slot_detail(slot_ind), droppedBFWPdu);
+#else
+    (void)pdu;
+    (void)slot_ind;
+    (void)grp_cmd;
+    (void)cell_cmd;
+    (void)bfw_info;
+    ++droppedBFWPdu;
+#endif
+}
+
+void phy::apply_ul_bfw_pdu(
+    const scf_fapi_ul_bfw_group_config_t& pdu,
+    slot_command_api::slot_indication& slot_ind,
+    slot_command_api::cell_group_command* grp_cmd,
+    slot_command_api::cell_sub_command& cell_cmd,
+    slot_command_api::bfw_coeff_mem_info_t* bfw_info,
+    uint32_t& droppedBFWPdu)
+{
+#ifdef SCF_FAPI_10_04
+    update_ul_bfw_cell_command(grp_cmd, cell_cmd, pdu, get_carrier_id(),
+                               slot_ind, phy_cell_params, bfw_info,
+                               get_slot_detail(slot_ind), droppedBFWPdu);
+#else
+    (void)pdu;
+    (void)slot_ind;
+    (void)grp_cmd;
+    (void)cell_cmd;
+    (void)bfw_info;
+    ++droppedBFWPdu;
+#endif
+}
+
+void phy::send_bfw_error_indications(uint16_t msg_type_id, uint16_t sfn, uint16_t slot, uint32_t dropped_count)
+{
+    for(uint32_t i = 0; i < dropped_count; i++)
+    {
+        send_error_indication(static_cast<scf_fapi_message_id_e>(msg_type_id), SCF_ERROR_CODE_SRS_CHEST_BUFF_BAD_STATE, sfn, slot);
+    }
+}
+
+/**
+ * Decode the full initial-config CONFIG.request TLV set into phy_config / phy_cell_params.
+ *
+ * Applies the SRS-chest / muMIMO default fixups. Shared verbatim by the serial
+ * (on_config_request) and offload (on_config_request_offload) fresh-config paths so the
+ * TLV decoder never diverges.
+ *
+ * @param[in,out] config_request CONFIG.request message to decode.
+ * @param[in] cell_id Cell being configured.
+ * @param[in] dbt_data DBT PDU data buffer (may be empty).
+ * @param[in] dbt_data_pool DBT PDU data pool id.
+ * @param[in] ssb_mask_mode SSB_MASK decode policy for this call.
+ * @return FAPI error code (SCF_ERROR_CODE_MSG_OK on success).
+ */
+uint8_t phy::decode_config_tlvs(scf_fapi_config_request_msg_t& config_request, int32_t cell_id, std::span<uint8_t> dbt_data, int32_t dbt_data_pool, SsbMaskDecode ssb_mask_mode)
+{
+    // Startup/control-plane decode runs on memtrace-armed threads (msg_processing /
+    // non-slot LP worker). Expected one-time allocations (SRS chest pools, ch_seg
+    // maps, precoding weights, etc.) must not trip the hot-path tripwire.
+    MemtraceDisableScope md;
 
     uint8_t *body_ptr = &config_request.msg_body.tlvs[0];
     auto tlvs = config_request.msg_body.num_tlvs;
@@ -2293,168 +2548,12 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
     uint8_t enable_srs_flag = get_enable_srs_info();
     uint32_t srsChest_buff_size = 0;
     uint8_t error_code = SCF_ERROR_CODE_MSG_OK;
-
-    if(state == fapi_state_t::FAPI_STATE_RUNNING)
-    {
-        NVLOGW_FMT(TAG, "{}: send CONFIG.res for cell_id={} - FAPI_STATE_RUNNING", __FUNCTION__, cell_id);
-        send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_INVALID_STATE);
-        return;
-    }
-
-    if(state == fapi_state_t::FAPI_STATE_CONFIGURED)
-    {
-        NVLOGC_FMT(TAG, "{}: CONFIG.req received for cell_id={} in CONFIGURED state", __FUNCTION__, cell_id);
-
-        /*Try to attain the PhyDriverCtx::updateCellConfigMutex. This lock protects running creation and deletion of PRACH objects
-          at the same time. If the lock is available, call l1_cell_update_cell_config. If this function returns 0, means PRACH
-          object are not yet created and config change is successful. Unlock the mutex in this condition. If this function returns 1
-          it means that new PRACH objects need to be created and older ones need to be destroyed. The mutex will be unlocked in the
-          thread that deletes the PRACH objects - see delete_prach_obj_func
-        */
-        if(phyDriver.l1_lock_update_cell_config_mutex() == false)
-        {
-            NVLOGC_FMT(TAG, "{}: send CONFIG.res for cell_id={} - try lock failed", __FUNCTION__, cell_id);
-            send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_INVALID_STATE);
-            state = fapi_state_t::FAPI_STATE_CONFIGURED;
-            return;
-        }
-
-        update_cells_stats(cell_id);
-        int32_t prach_fd_index = -1;
-        uint32_t prach_root_seq_unused_seq_index = 0;
-        while (tlvs)
-        {
-            scf_fapi_tl_t *hdr = reinterpret_cast<scf_fapi_tl_t*>(body_ptr);
-            switch(hdr->tag)
-            {
-                case CONFIG_TLV_DL_BANDWIDTH:
-                    cell_update_config.carrier_config_.dl_bandwidth = hdr->AsValue<uint16_t>();
-                    NVLOGI_FMT(TAG, "{} config request: Carrier DL Bandwidth (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.carrier_config_.dl_bandwidth);
-                    break;
-                case CONFIG_TLV_UL_BANDWIDTH:
-                    cell_update_config.carrier_config_.ul_bandwidth = hdr->AsValue<uint16_t>();
-                    NVLOGI_FMT(TAG, "{} config request: Carrier UL Bandwidth (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.carrier_config_.ul_bandwidth);
-                    break;
-                case CONFIG_TLV_PHY_CELL_ID:
-                    cell_update_config.cell_config_.phy_cell_id = hdr->AsValue<uint16_t>();
-                    NVLOGI_FMT(TAG, "{} config request: Physical Cell ID (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.cell_config_.phy_cell_id);
-                    break;
-                case CONFIG_TLV_NUM_PRACH_FD_OCCASIONS:
-                    cell_update_config.prach_config_.num_prach_fd_occasions = hdr->AsValue<uint8_t>();
-                    NVLOGI_FMT(TAG, "{} config request: Number of PRACH FD Occasions (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.num_prach_fd_occasions);
-                    break;
-                case CONFIG_TLV_PRACH_ROOT_SEQ_INDEX:
-                    prach_fd_index++;
-                    prach_root_seq_unused_seq_index = 0;
-                    if(prach_fd_index >= 0 && prach_fd_index < nv::NV_MAX_PRACH_FD_OCCASION_NUM)
-                    {
-                        cell_update_config.prach_config_.root_sequence[prach_fd_index].seq_index = hdr->AsValue<uint16_t>();
-                        NVLOGI_FMT(TAG, "{} config request: PRACH Root Sequence Index (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.root_sequence[prach_fd_index].seq_index);
-                    }
-                    break;
-                case CONFIG_TLV_NUM_ROOT_SEQ:
-                    if(prach_fd_index >= 0 && prach_fd_index < nv::NV_MAX_PRACH_FD_OCCASION_NUM)
-                    {
-                        cell_update_config.prach_config_.root_sequence[prach_fd_index].number_root_sequence = hdr->AsValue<uint8_t>();
-                        NVLOGI_FMT(TAG, "{} config request: Number of Root Sequence (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.root_sequence[prach_fd_index].number_root_sequence);
-                    }
-                    break;
-                case CONFIG_TLV_K1:
-                    if(prach_fd_index >= 0 && prach_fd_index < nv::NV_MAX_PRACH_FD_OCCASION_NUM)
-                    {
-                        cell_update_config.prach_config_.root_sequence[prach_fd_index].k1 = hdr->AsValue<uint16_t>();
-                        NVLOGI_FMT(TAG, "{} config request: Frequency Offset K1 (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.root_sequence[prach_fd_index].k1);
-                    }
-                    break;
-                case CONFIG_TLV_PRACH_ZERO_CORR_CONF:
-                    if(prach_fd_index >= 0 && prach_fd_index < nv::NV_MAX_PRACH_FD_OCCASION_NUM)
-                    {
-                        cell_update_config.prach_config_.root_sequence[prach_fd_index].zero_conf = hdr->AsValue<uint8_t>();
-                        NVLOGI_FMT(TAG, "{} config request: PRACH Zero Correlation Config (message ID {:X}) value {} prach_fd_index {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.root_sequence[prach_fd_index].zero_conf, prach_fd_index);
-                    }
-                    break;
-                case CONFIG_TLV_NUM_UNUSED_ROOT_SEQ:
-                    if(prach_fd_index >= 0 && prach_fd_index < nv::NV_MAX_PRACH_FD_OCCASION_NUM)
-                    {
-                        cell_update_config.prach_config_.root_sequence[prach_fd_index].number_unused_sequence = hdr->AsValue<uint16_t>();
-                        NVLOGI_FMT(TAG, "{} config request: Number of Unused Root Sequence (message ID {:X}) value {} prach_fd_index {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.root_sequence[prach_fd_index].number_unused_sequence, prach_fd_index);
-                    }
-                    break;
-                case CONFIG_TLV_UNUSED_ROOT_SEQ:
-                    if(prach_fd_index >= 0 && prach_fd_index < nv::NV_MAX_PRACH_FD_OCCASION_NUM && prach_root_seq_unused_seq_index < nv::NV_MAX_UNUSED_ROOT_SEQUENCE_NUM)
-                    {
-                        cell_update_config.prach_config_.root_sequence[prach_fd_index].unused_sequence[prach_root_seq_unused_seq_index] = hdr->AsValue<uint16_t>();
-                        NVLOGI_FMT(TAG, "{} config request: Unused Root Sequence (message ID {:X}) value {} prach_fd_index {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.root_sequence[prach_fd_index].unused_sequence[prach_root_seq_unused_seq_index], prach_fd_index);
-                    }
-                    prach_root_seq_unused_seq_index++;
-                    break;
-                case CONFIG_TLV_PRACH_CONFIG_INDEX:
-                    cell_update_config.prach_config_.prach_conf_index = hdr->AsValue<uint8_t>();
-                    NVLOGI_FMT(TAG, "{} config request: PRACH Config Index (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.prach_conf_index);
-                    break;
-                case CONFIG_TLV_RESTRICTED_SET_CONFIG:
-                    cell_update_config.prach_config_.restricted_set_config = hdr->AsValue<uint8_t>();
-                    NVLOGI_FMT(TAG, "{} config request: PRACH Restricted Set Config (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.prach_config_.restricted_set_config);
-                    break;
-                case CONFIG_TLV_VENDOR_DIGITAL_BEAM_TABLE_PDU:
-                {
-                    /* Handle DBT PDU during reconfiguration in CONFIGURED state */
-                    if (ipc_msg.data_pool == NV_IPC_MEMPOOL_CPU_LARGE && ipc_msg.data_buf != nullptr &&  phy_module().bf_enabled())
-                    {
-                        int ret = update_dbt_pdu_table_ptr(cell_id, ipc_msg.data_buf);
-                        if (ret != 0) {
-                            error_code = SCF_ERROR_CODE_BEAM_ID_OUT_OF_RANGE;
-                            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: Failed to store DBT PDU for cell_id={} in CONFIGURED state", __FUNCTION__, cell_id);
-                        }
-                    }
-                    else
-                    {
-                        NVLOGW_FMT(TAG, "{}: Beamforming not enabled or invalid buffer for DBT PDU in CONFIGURED state", __FUNCTION__);
-                    }
-                }
-                break;
-            }
-            // Round up TLV length to 4-byte boundary according to specs
-            body_ptr += sizeof(scf_fapi_tl_t) + ((hdr->length + 3) / 4) * 4;
-            tlvs--;
-        }
-
-        update_phy_driver_info_reconfig(phyDriver, cell_id);
-        MemtraceDisableScope md;
-        int32_t ret = phyDriver.l1_cell_update_cell_config(cell_reconfig_phy_driver_info, phy_module().cell_update_cb());
-
-        if (ret == 0)
-        {
-            //If l1_cell_update_cell_config returns 0 means operation is complete. Send CONFIG.resp
-            cell_update_success(phyDriver, cell_id);
-            send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_OK);
-            phyDriver.l1_unlock_update_cell_config_mutex();
-            phy_config.prach_config_.start_ro_index = phyDriver.l1_get_prach_start_ro_index(phy_cell_params.phyCellId);
-            cell_update_config.prach_config_.start_ro_index = phy_config.prach_config_.start_ro_index;
-        }
-        else if (ret == -1)
-        {
-            NVLOGW_FMT(TAG, "{}: Cell config update failed cell_id={}", __FUNCTION__, cell_id);
-            send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_INVALID_CONFIG);
-            phyDriver.l1_unlock_update_cell_config_mutex();
-            phy_config.prach_config_.start_ro_index = phyDriver.l1_get_prach_start_ro_index(phy_cell_params.phyCellId);
-            cell_update_config.prach_config_.start_ro_index = phy_config.prach_config_.start_ro_index;
-        }
-        else if (ret == 1) {
-            NVLOGI_FMT(TAG, "{}: l1_cell_update_cell_config returned 1 for carrier_id={}. CONFIG.res to be sent in another thread context", __FUNCTION__,
-                phy_config.cell_config_.carrier_idx);
-            cell_update_config.prach_config_.start_ro_index = phyDriver.l1_get_prach_start_ro_index(phy_cell_params.phyCellId);
-
-        }
-
-        NVLOGD_FMT(TAG, "{}: start_ro_index={}", __FUNCTION__, cell_update_config.prach_config_.start_ro_index);
-        return;
-    }
-
     phy_config.cell_config_.carrier_idx = cell_id;
     update_cells_stats(cell_id);
     // All starting points for TLVs that are part of a loop
     uint32_t slot_cfg_idx = 0;
+    uint32_t ssb_mask_index = 0;
+    constexpr uint32_t ssb_mask_count = sizeof(phy_config.ssb_table_.ssb_mask) / sizeof(phy_config.ssb_table_.ssb_mask[0]);
     int32_t prach_fd_index = -1;
     uint32_t prach_root_seq_unused_seq_index = 0;
 
@@ -2468,11 +2567,11 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
     bool rxPortTlvPresent = false;
 
     uint8_t mCh_segment_proc_enable = 0;
-    auto retval = phyDriver.l1_get_ch_segment_proc_enable_info(&mCh_segment_proc_enable);
+    (void)phyDriver.l1_get_ch_segment_proc_enable_info(&mCh_segment_proc_enable);
 
     while (tlvs)
     {
-        scf_fapi_tl_t *hdr = reinterpret_cast<scf_fapi_tl_t*>(body_ptr);
+        auto* hdr = aerial::casts::assume_cast<scf_fapi_tl_t>(body_ptr);
         switch(hdr->tag)
         {
             // CELL PARAMETERS
@@ -2494,15 +2593,7 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
                 break;
             case CONFIG_TLV_NUM_TX_ANT:
                 phy_config.carrier_config_.num_tx_ants = hdr->AsValue<uint16_t>();
-                if(!muMIMO_enable_flag && phy_config.carrier_config_.num_tx_ants > 4)
-                {
-                    NVLOGW_FMT(TAG, "{}: TX antennas {} exceeds 4T4R limit - setting to maximum supported value of 4", __FUNCTION__, phy_config.carrier_config_.num_tx_ants);
-                    phy_cell_params.nTxAnt = 4;
-                }
-                else
-                {
-                    phy_cell_params.nTxAnt = phy_config.carrier_config_.num_tx_ants;
-                }
+                phy_cell_params.nTxAnt = phy_config.carrier_config_.num_tx_ants;
                 NVLOGI_FMT(TAG, "{} config request: Number of TX Antennas (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.carrier_config_.num_tx_ants);
                 break;
             case CONFIG_TLV_UL_BANDWIDTH:
@@ -2523,15 +2614,7 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
                 break;
             case CONFIG_TLV_NUM_RX_ANT:
                 phy_config.carrier_config_.num_rx_ants = hdr->AsValue<uint16_t>();
-                 if(!muMIMO_enable_flag && phy_config.carrier_config_.num_rx_ants > 4)
-                {
-                    NVLOGW_FMT(TAG, "{}: RX antennas {} exceeds 4T4R limit - setting to maximum supported value of 4", __FUNCTION__, phy_config.carrier_config_.num_rx_ants);
-                    phy_cell_params.nRxAnt = 4;
-                }
-                else
-                {
-                    phy_cell_params.nRxAnt = phy_config.carrier_config_.num_rx_ants;
-                }
+                phy_cell_params.nRxAnt    = phy_config.carrier_config_.num_rx_ants;
                 phy_cell_params.nRxAntSrs = phy_config.carrier_config_.num_rx_ants;
                 phy_config.carrier_config_.num_rx_port = phy_config.carrier_config_.num_rx_ants;
                 NVLOGI_FMT(TAG, "{} config request: Number of RX Antennas (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.carrier_config_.num_rx_ants);
@@ -2656,18 +2739,34 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
                 NVLOGI_FMT(TAG, "{} config request: MIB Payload Byte 2 (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.ssb_table_.mib[2]);
                 break;
             case CONFIG_TLV_SSB_MASK:
-                static bool first = true;
-                if(first)
+                if(ssb_mask_mode == SsbMaskDecode::LegacyStaticToggle)
                 {
-                    phy_config.ssb_table_.ssb_mask[0] = hdr->AsValue<uint32_t>();
-                    NVLOGI_FMT(TAG, "{} config request: SSB Bit Mask(message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.ssb_table_.ssb_mask[0]);
+                    // Serial-path behavior preserved verbatim (incl. the cross-request
+                    // static persistence). Do NOT "fix" this here — see PerCallIndexed
+                    // below for the offload path's bounds-checked per-call variant.
+                    static bool first = true;
+                    if(first)
+                    {
+                        phy_config.ssb_table_.ssb_mask[0] = hdr->AsValue<uint32_t>();
+                        NVLOGI_FMT(TAG, "{} config request: SSB Bit Mask(message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.ssb_table_.ssb_mask[0]);
+                    }
+                    else
+                    {
+                        phy_config.ssb_table_.ssb_mask[1] = hdr->AsValue<uint32_t>();
+                        NVLOGI_FMT(TAG, "{} config request: SSB Bit Mask (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.ssb_table_.ssb_mask[1]);
+                    }
+                    first = false;
+                }
+                else if(ssb_mask_index < ssb_mask_count)
+                {
+                    phy_config.ssb_table_.ssb_mask[ssb_mask_index] = hdr->AsValue<uint32_t>();
+                    NVLOGI_FMT(TAG, "{} config request: SSB Bit Mask(message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.ssb_table_.ssb_mask[ssb_mask_index]);
+                    ssb_mask_index++;
                 }
                 else
                 {
-                    phy_config.ssb_table_.ssb_mask[1] = hdr->AsValue<uint32_t>();
-                    NVLOGI_FMT(TAG, "{} config request: SSB Bit Mask (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), phy_config.ssb_table_.ssb_mask[1]);
+                    NVLOGW_FMT(TAG, "{} config request: ignoring extra SSB Bit Mask TLV (message ID {:X})", __FUNCTION__, static_cast<int>(hdr->tag));
                 }
-                first = false;
                 break;
             case CONFIG_TLV_SSB_PBCH_MULT_CARRIERS_IN_BAND:
                 phy_config.ssb_table_.ss_pbch_multiple_carriers = hdr->AsValue<uint8_t>(); 
@@ -2683,46 +2782,21 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
                 break;
 
             case CONFIG_TLV_SLOT_CONFIG: {
-                    uint8_t* arrs = reinterpret_cast<uint8_t*>(hdr->val);
-                    auto mu = phy_config.ssb_config_.sub_c_common;
-                    auto tti = nv::mu_to_ns(phy_config.ssb_config_.sub_c_common);
-                    auto slot_duration =  std::chrono::microseconds(tti);
-                    auto num_slots = nv::get_duration(phy_config.tdd_table_.tdd_period_num)/std::chrono::duration<float, std::milli>(1);
-                    uint16_t valid_entries = (1 << phy_config.ssb_config_.sub_c_common) * num_slots;
-                    uint16_t k = 0;
-                    for (int i = 0; i < valid_entries; i++) {
-                        auto& slot_cfg = phy_config.tdd_table_.s_detail[i];
-                        slot_cfg.max_dl_symbols = 0;
-                        slot_cfg.max_ul_symbols = 0;
-                        slot_cfg.start_sym_dl = -1;
-                        slot_cfg.start_sym_ul = -1;
-                        for (int j = 0; j < OFDM_SYMBOLS_PER_SLOT; j++) {
-                            switch((arrs[k + j])) {
-                                case nv::SlotConfig::DL_SLOT:
-                                    slot_cfg.max_dl_symbols++;
-                                    if(slot_cfg.start_sym_dl == -1)
-                                        slot_cfg.start_sym_dl = j;
-                                    break;
-                                case nv::SlotConfig::UL_SLOT:
-                                    slot_cfg.max_ul_symbols++;
-                                    if(slot_cfg.start_sym_ul == -1)
-                                        slot_cfg.start_sym_ul = j;
-                                    break;
-                            }
-                        }
-                        if (slot_cfg.max_dl_symbols < OFDM_SYMBOLS_PER_SLOT && slot_cfg.max_ul_symbols < OFDM_SYMBOLS_PER_SLOT) {
-                            slot_cfg.type = nv::slot_type::SLOT_SPECIAL;
-                        } else if (slot_cfg.max_dl_symbols == OFDM_SYMBOLS_PER_SLOT) {
-                            slot_cfg.type = nv::slot_type::SLOT_DOWNLINK;
-                        } else if (slot_cfg.max_ul_symbols == OFDM_SYMBOLS_PER_SLOT) {
-                            slot_cfg.type = nv::slot_type::SLOT_UPLINK;
-                        } else {
-                            slot_cfg.type = nv::slot_type::SLOT_NONE;
-                        }
-                        NVLOGD_FMT(TAG, "{}: Slot type = {}, DL symbols = {}, UL symbols = {} Start DL = {} Start UL = {}", __FUNCTION__, +slot_cfg.type, slot_cfg.max_dl_symbols, slot_cfg.max_ul_symbols, slot_cfg.start_sym_dl, slot_cfg.start_sym_ul);
-                        k += OFDM_SYMBOLS_PER_SLOT;
+                    const auto parse_result = scf_5g_fapi::parse_slot_config_tlv(
+                        *hdr,
+                        phy_config.ssb_config_.sub_c_common,
+                        phy_config.tdd_table_.tdd_period_num,
+                        phy_config.tdd_table_.s_detail);
+                    const uint32_t tlv_length = hdr->length; // copy packed field; a reference cannot bind to it
+                    if (!parse_result.has_value()) [[unlikely]] {
+                        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} config request: Invalid SLOT_CONFIG TLV (mu={}, period={}, length={}): {}",
+                                   __FUNCTION__, phy_config.ssb_config_.sub_c_common, phy_config.tdd_table_.tdd_period_num,
+                                   tlv_length, wise_enum::to_string(parse_result.error()));
+                        error_code = SCF_ERROR_CODE_MSG_INVALID_CONFIG;
+                        return error_code; // stop walking peer TLVs once the config is known-invalid
                     }
-                } 
+                    NVLOGD_FMT(TAG, "{} config request: parsed {} TDD slot entries from {}-byte SLOT_CONFIG TLV", __FUNCTION__, parse_result.value(), tlv_length);
+                }
             break;
             case CONFIG_TLV_DL_GRID_SIZE:
             {
@@ -2760,20 +2834,36 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
                  * The DBT PDU is used for encoding the predetermined static beamforming weights for the Users that are not paired or for common channels. 
                  * For the non-paired UEs and channels for which L2 wants to use static beamforming, the beam IDs are indicated in Tx Precoding and Beamforming PDU 
                  * and corresponding weights are looked-up and encoded in the C-Plane message by the L1.*/
-                if (ipc_msg.data_pool == NV_IPC_MEMPOOL_CPU_LARGE && ipc_msg.data_buf!= nullptr &&  phy_module().bf_enabled())
+                // Select the payload source by the DELIVERY mechanism, not by
+                // bf_enabled(): when the DBT arrives in a CPU_LARGE buffer the
+                // bytes live in dbt_data, never inline after the TLV header.
+                // Treating a CPU_LARGE payload as inline reads hdr->length bytes
+                // (a large DBT PDU) past the TLV header, overreading the CONFIG
+                // body and recording the wrong bytes. bf_enabled() only gates
+                // whether we also program the HW beam table.
+                if (dbt_data_pool == NV_IPC_MEMPOOL_CPU_LARGE && dbt_data.data() != nullptr)
                 {
-                    // transferring the DBT info to FH
-                    // int ret = phyDriver.l1_storeDBTPdu(cell_id, ipc_msg.data_buf);
-                    // if(ret == -1)
-                    // {
-                    //     error_code = SCF_ERROR_CODE_BEAM_ID_OUT_OF_RANGE;
-                    //     break;
-                    // }
-                    int ret = update_dbt_pdu_table_ptr(cell_id, ipc_msg.data_buf);
-                    if (ret != 0) {
-                        error_code = SCF_ERROR_CODE_BEAM_ID_OUT_OF_RANGE;
-                        break;
+                    if (phy_module().bf_enabled())
+                    {
+                        // transferring the DBT info to FH
+                        // int ret = phyDriver.l1_storeDBTPdu(cell_id, dbt_data_buf);
+                        // if(ret == -1)
+                        // {
+                        //     error_code = SCF_ERROR_CODE_BEAM_ID_OUT_OF_RANGE;
+                        //     break;
+                        // }
+                        int ret = update_dbt_pdu_table_ptr(cell_id, dbt_data.data());
+                        if (ret != 0) {
+                            error_code = SCF_ERROR_CODE_BEAM_ID_OUT_OF_RANGE;
+                            break;
+                        }
                     }
+                    else
+                    {
+                        NVLOGW_FMT(TAG, "{}: Beamforming is not enabled. Hence not storing the DBT PDU for static Beamforming", __FUNCTION__);
+                    }
+                    // Capture DBT bytes for the framework C-plane static beam table (mMIMO).
+                    append_dbt_payload_from_buffer(phy_driver_info, dbt_data);
 #if 0
                     // Below code is added for validtion of unordered map if the is the values are stored properly in the map.
                     auto & dbt_static_weight_map_print = nv::PHY_module::static_digBeam_map();
@@ -2801,23 +2891,77 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
                 }
                 else
                 {
-                    NVLOGW_FMT(TAG, "{}: Beamforming is not enabled. Hence not storing the DBT PDU for static Beamforming", __FUNCTION__);
+                    // Genuinely inline TLV delivery (payload bytes follow the TLV
+                    // header): capture them so the framework generator can build
+                    // its table.
+                    append_dbt_payload_from_inline_tlv(phy_driver_info, hdr);
                 }
             }
             break;
             case CONFIG_TLV_VENDOR_PRECODING_MATRIX:
             {
+                // hdr->length is wire-controlled, so it must be validated against the fixed
+                // PM PDU header before pm_pdu is bound: the pmi_idx / num_layers /
+                // num_ant_ports reads below sit inside that header, and on a TLV shorter
+                // than it they already run past the CONFIG body.
+                constexpr std::size_t kPmPduHeaderBytes =
+                    offsetof(scf_fapi_pm_pdu_t, prc_wt_re_im);
+                const uint32_t tlv_length = hdr->length; // copy packed field
+                if (static_cast<std::size_t>(tlv_length) < kPmPduHeaderBytes) {
+                    NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                               "PM config rejected: tlv_length={} is shorter than the "
+                               "{}-byte PM PDU header",
+                               tlv_length, kPmPduHeaderBytes);
+                    error_code = SCF_ERROR_CODE_MSG_INVALID_CONFIG;
+                    break;
+                }
                 scf_fapi_pm_pdu_t& pm_pdu = *hdr->As<scf_fapi_pm_pdu_t*>();
 
                 if (phy_module().pm_enabled() && pm_pdu.pmi_idx != 0) {
                     uint32_t pmidx = pm_pdu.pmi_idx | cell_id << 16;
                     auto layers = pm_pdu.num_layers;
                     auto ports = pm_pdu.num_ant_ports;
+                    // num_layers / num_ant_ports come straight off the wire. The loop below
+                    // writes layers*ports elements into cuphyPmW_t::matrix, whose fixed
+                    // capacity is MAX_DL_LAYERS_PER_TB * MAX_DL_PORTS. Reject a malformed PDU
+                    // rather than overflow the matrix (and every downstream consumer that
+                    // copies out of it -- e.g. resolve_ssb_pmw_slot).
+                    if (layers == 0 || layers > MAX_DL_LAYERS_PER_TB
+                        || ports == 0 || ports > MAX_DL_PORTS) {
+                        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                                   "PM config rejected: pmi_idx=0x{:x} num_layers={} (max {}) "
+                                   "num_ant_ports={} (max {})",
+                                   static_cast<uint16_t>(pm_pdu.pmi_idx), layers,
+                                   MAX_DL_LAYERS_PER_TB, ports, MAX_DL_PORTS);
+                        error_code = SCF_ERROR_CODE_MSG_INVALID_CONFIG;
+                        break;
+                    }
+                    // Dimension check alone is insufficient: a short TLV still lets the
+                    // layers*ports loop read past the end of this TLV's declared payload.
+                    // (A genuine end-of-CONFIG-message bound is a separate ticket; this
+                    // only trusts hdr->length.) The header guard above already established
+                    // tlv_length >= kPmPduHeaderBytes.
+                    const std::size_t required_entries =
+                        static_cast<std::size_t>(layers) * static_cast<std::size_t>(ports);
+                    const std::size_t available_entries =
+                        (static_cast<std::size_t>(tlv_length) - kPmPduHeaderBytes)
+                        / sizeof(prc_wt_re_im_t);
+                    if (available_entries < required_entries) {
+                        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                                   "PM config rejected: pmi_idx=0x{:x} tlv_length={} "
+                                   "need {} weight entries (layers={} ports={}), have {}",
+                                   static_cast<uint16_t>(pm_pdu.pmi_idx), tlv_length,
+                                   required_entries, layers, ports, available_entries);
+                        error_code = SCF_ERROR_CODE_MSG_INVALID_CONFIG;
+                        break;
+                    }
                     prc_wt_re_im_t* pm_start = &pm_pdu.prc_wt_re_im[0];
                     auto & pm_weight_map = nv::PHY_module::pm_map();
                     // Disabling memtrace here to suppress dynamic allocation due to pm_weight_map.insert. This is only happening at the start up phase per cell per pmi index
                     MemtraceDisableScope md; // disable memtrace while this variable is in scope
                     pm_weight_map.insert(std::make_pair(pmidx, pm_weights_t{layers, ports, cuphyPmW_t()}));
+                    // Feeds CPlaneGenerator's PmiConfig at init time.
+                    phy_driver_info.pmi_entries.push_back({pm_pdu.pmi_idx, static_cast<uint8_t>(ports)});
                     auto& weights = pm_weight_map[pmidx];
                     weights.weights.nPorts = ports;
                     for ( uint16_t i = 0 ; i < layers ; i++) {
@@ -2903,31 +3047,18 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
             }
             break;
             case CONFIG_TLV_UCI_CONFIG: {
-                auto *uci_buf = hdr->As<uint8_t*>();
-                uint16_t numUci2Maps = *reinterpret_cast<uint16_t*>(uci_buf);
-                uci_buf+= sizeof(uint16_t);
-                auto offset = 0;
-                auto mapOffset = 0;
                 auto destMapBuf = static_cast<uint16_t*>(csi2MapCpuBuffer.get());
                 auto destMapParamBuf = static_cast<cuphyCsi2MapPrm_t*>(csi2MapParamsCpuBuffer.get());
-                for (uint16_t i = 0; i < numUci2Maps; i++) {
-                    uint8_t numPart1Params = *(uci_buf + offset);
-                    offset += sizeof(uint8_t);
-                    auto sizesPart1Part1Params = reinterpret_cast<uint8_t*>(uci_buf + offset);
-                    auto sigma = 0;
-                    sigma = std::accumulate(sizesPart1Part1Params, sizesPart1Part1Params + numPart1Params, 0);
-                    offset += sizeof(uint8_t) * numPart1Params;
-                    size_t uciMapSize = 1 << sigma;
-                    auto map = reinterpret_cast<uint16_t*>(uci_buf + offset);
-                    std::copy(map, map + uciMapSize, destMapBuf + mapOffset);
-                    destMapParamBuf[i].csi2MapSize = uciMapSize;
-                    destMapParamBuf[i].csi2MapStartIdx = mapOffset;
-                    NVLOGD_FMT(TAG, "{}: numUci2Maps {} i {} , numPart1Params {} sigma {} uciMapSize {} mapParams[ csi2MapSize {} csi2MapStartIdx {}] map[ first 0x{:04X} last 0x{:04X}] offset 0x{:02X}", __FUNCTION__, numUci2Maps, i, numPart1Params, sigma, uciMapSize, 
-                        destMapParamBuf[i].csi2MapSize, destMapParamBuf[i].csi2MapStartIdx, *(destMapBuf + destMapParamBuf[i].csi2MapStartIdx), *(destMapBuf+ destMapParamBuf[i].csi2MapSize - 1), offset ) ;
-                    mapOffset+= uciMapSize;
-                    offset+= sizeof(uint16_t) * uciMapSize;
+                const auto parseResult = parse_uci_config_tlv(*hdr, destMapBuf, destMapParamBuf);
+                const uint32_t tlvLength = hdr->length; // copy packed field; a reference cannot bind to it
+                if (!parseResult.ok) {
+                    NVLOGW_FMT(TAG, "{} config request: Invalid UCI config TLV length {}: {}", __FUNCTION__, tlvLength, parseResult.error);
+                    nCsi2Maps = 0U;
+                    error_code = SCF_ERROR_CODE_MSG_INVALID_CONFIG;
+                } else {
+                    nCsi2Maps = parseResult.nCsi2Maps;
+                    NVLOGD_FMT(TAG, "{} config request: parsed {} UCI CSI2 maps from {}-byte TLV", __FUNCTION__, nCsi2Maps, tlvLength);
                 }
-                nCsi2Maps = numUci2Maps;
             }
             break;
 #endif
@@ -3031,6 +3162,7 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
                 srsChest_buff_size = hdr->AsValue<uint32_t>();
                 NVLOGD_FMT(TAG, "{} config request: Number of SRS Chest Buffers (message ID {:X}) value {}", __FUNCTION__, static_cast<int>(hdr->tag), srsChest_buff_size);
 
+                /* CvSrsChestMemoryBank allocated whenever enable_srs is on (4T4R and muMIMO) */
                 if(!enable_srs_flag)
                 {
                     NVLOGW_FMT(TAG, "{}: cell_id={} received CONFIG_TLV_VENDOR_NUM_SRS_CHEST_BUFFERS while enable_srs_flag=false so no buffer allocation is done.", __func__, cell_id);
@@ -3038,13 +3170,13 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
                 }
 
                 NVLOGD_FMT(TAG, "SRS enabled and TLV present - proceeding with SRS chest buffer allocation");
-                
-                if ((!muMIMO_enable_flag) && (srsChest_buff_size > MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL))
+                /* 4T4R: clamp to max per cell; muMIMO: use user value for flexibility */
+                if(!muMIMO_enable_flag && srsChest_buff_size > MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL)
                 {
-                    NVLOGI_FMT(TAG, "{}: SRS chest buffer size {} exceeds maximum allowed {} for non-muMIMO configuration - clamping to maximum", __FUNCTION__, srsChest_buff_size, MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL);
+                    NVLOGI_FMT(TAG, "{}: SRS chest buffer size {} exceeds max {} for 4T4R - clamping", __FUNCTION__, srsChest_buff_size, MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL);
                     srsChest_buff_size = MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL;
                 }
-                
+
                 bool ret = phyDriver.allocSrsChesBuffPool(SCF_FAPI_CONFIG_REQUEST, cell_id, srsChest_buff_size);
                 if(!ret)
                 {
@@ -3102,7 +3234,7 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
              * These buffers are reserved for the entire cell life cycle and will be released on cell stop. */
             srsChest_buff_size = muMIMO_enable_flag ? MAX_SRS_CHEST_BUFFERS_PER_CELL : MAX_SRS_CHEST_BUFFERS_PER_4T4R_CELL;
             NVLOGI_FMT(TAG, "{}: SRS chest buffer size TLV absent - using default size {}", __FUNCTION__, srsChest_buff_size);
-            
+
             bool ret = phyDriver.allocSrsChesBuffPool(SCF_FAPI_CONFIG_REQUEST, cell_id, srsChest_buff_size);
             if (!ret)
             {
@@ -3131,6 +3263,111 @@ void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const
         phy_cell_params.nRxAnt = (phy_cell_params.nRxAnt > 4) ? NUM_RX_PORT : phy_cell_params.nRxAnt;
         NVLOGW_FMT(TAG, "{}: muMIMO flag is enabled but rxPortTlvPresent absent. Setting nRxAnt to {}", __FUNCTION__, phy_cell_params.nRxAnt);
     }
+
+    return error_code;
+}
+
+void phy::on_config_request(scf_fapi_config_request_msg_t& config_request, const int32_t cell_id, uint8_t handle_id, nv_ipc_msg_t& ipc_msg)
+{
+    NVLOGC_FMT(TAG, "{}: CONFIG.req received for cell_id={} numTLVs={} state={}", __FUNCTION__, cell_id, config_request.msg_body.num_tlvs, state.load());
+
+    nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+    uint8_t error_code = SCF_ERROR_CODE_MSG_OK;
+
+    if(state == fapi_state_t::FAPI_STATE_RUNNING)
+    {
+        NVLOGW_FMT(TAG, "{}: send CONFIG.res for cell_id={} - FAPI_STATE_RUNNING", __FUNCTION__, cell_id);
+        send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_INVALID_STATE);
+        return;
+    }
+
+    if(state == fapi_state_t::FAPI_STATE_CONFIGURED)
+    {
+        NVLOGC_FMT(TAG, "{}: CONFIG.req received for cell_id={} in CONFIGURED state", __FUNCTION__, cell_id);
+
+        /*Try to attain the PhyDriverCtx::updateCellConfigMutex. This lock protects running creation and deletion of PRACH objects
+          at the same time. If the lock is available, call l1_cell_update_cell_config. If this function returns 0, means PRACH
+          object are not yet created and config change is successful. Unlock the mutex in this condition. If this function returns 1
+          it means that new PRACH objects need to be created and older ones need to be destroyed. The mutex will be unlocked in the
+          thread that deletes the PRACH objects - see delete_prach_obj_func
+        */
+        if(phyDriver.l1_lock_update_cell_config_mutex() == false)
+        {
+            NVLOGC_FMT(TAG, "{}: send CONFIG.res for cell_id={} - try lock failed", __FUNCTION__, cell_id);
+            send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_INVALID_STATE);
+            state = fapi_state_t::FAPI_STATE_CONFIGURED;
+            return;
+        }
+
+        update_cells_stats(cell_id);
+        // Shared with the offload reconfig path; see scf_5g_fapi_config_decode.hpp.
+        const bool dbt_pdu_present = decode_reconfig_tlvs(config_request, cell_update_config);
+
+        // Check if phyCellId can be updated successfully first
+        if (phyDriver.l1_phy_cell_id_mismatch(cell_id, cell_update_config.cell_config_.phy_cell_id))
+        {
+            NVLOGW_FMT(TAG, "{}: cell_id={} can't be updated because phyCellId doesn't match: old={} new={}",
+                __FUNCTION__, cell_id, phy_driver_info.phy_stat.phyCellId, cell_update_config.cell_config_.phy_cell_id);
+            send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_INVALID_CONFIG);
+            phyDriver.l1_unlock_update_cell_config_mutex();
+            return;
+        }
+
+        if (dbt_pdu_present)
+        {
+            /* Handle DBT PDU during reconfiguration in CONFIGURED state */
+            if (ipc_msg.data_pool == NV_IPC_MEMPOOL_CPU_LARGE && ipc_msg.data_buf != nullptr &&  phy_module().bf_enabled())
+            {
+                int ret = update_dbt_pdu_table_ptr(cell_id, ipc_msg.data_buf);
+                if (ret != 0) {
+                    error_code = SCF_ERROR_CODE_BEAM_ID_OUT_OF_RANGE;
+                    NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{}: Failed to store DBT PDU for cell_id={} in CONFIGURED state", __FUNCTION__, cell_id);
+                }
+            }
+            else
+            {
+                NVLOGW_FMT(TAG, "{}: Beamforming not enabled or invalid buffer for DBT PDU in CONFIGURED state", __FUNCTION__);
+            }
+        }
+
+        update_phy_driver_info_reconfig(phyDriver, cell_id);
+        MemtraceDisableScope md;
+        int32_t ret = phyDriver.l1_cell_update_cell_config(cell_reconfig_phy_driver_info, phy_module().cell_update_cb());
+
+        if (ret == 0)
+        {
+            //If l1_cell_update_cell_config returns 0 means operation is complete. Send CONFIG.resp
+            cell_update_success(phyDriver, cell_id);
+            send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_OK);
+            phyDriver.l1_unlock_update_cell_config_mutex();
+            phy_config.prach_config_.start_ro_index = phyDriver.l1_get_prach_start_ro_index(phy_cell_params.phyCellId);
+            cell_update_config.prach_config_.start_ro_index = phy_config.prach_config_.start_ro_index;
+        }
+        else if (ret == -1)
+        {
+            NVLOGW_FMT(TAG, "{}: Cell config update failed cell_id={} phyCellId={}", __FUNCTION__, cell_id, cell_update_config.cell_config_.phy_cell_id);
+            send_cell_config_response(cell_id, SCF_ERROR_CODE_MSG_INVALID_CONFIG);
+            phyDriver.l1_unlock_update_cell_config_mutex();
+            phy_config.prach_config_.start_ro_index = phyDriver.l1_get_prach_start_ro_index(phy_cell_params.phyCellId);
+            cell_update_config.prach_config_.start_ro_index = phy_config.prach_config_.start_ro_index;
+        }
+        else if (ret == 1) {
+            NVLOGI_FMT(TAG, "{}: l1_cell_update_cell_config returned 1 for carrier_id={}. CONFIG.res to be sent in another thread context", __FUNCTION__,
+                phy_config.cell_config_.carrier_idx);
+            cell_update_config.prach_config_.start_ro_index = phyDriver.l1_get_prach_start_ro_index(phy_cell_params.phyCellId);
+
+        }
+
+        NVLOGD_FMT(TAG, "{}: start_ro_index={}", __FUNCTION__, cell_update_config.prach_config_.start_ro_index);
+        return;
+    }
+
+    // Shared with the offload fresh-config path; see decode_config_tlvs().
+    // LegacyStaticToggle preserves this serial path's original SSB_MASK behavior exactly.
+    error_code = decode_config_tlvs(config_request, cell_id,
+                                    std::span<uint8_t>{static_cast<uint8_t*>(ipc_msg.data_buf),
+                                                       (ipc_msg.data_len > 0) ? static_cast<std::size_t>(ipc_msg.data_len) : 0U},
+                                    ipc_msg.data_pool, SsbMaskDecode::LegacyStaticToggle);
 
     if(error_code == SCF_ERROR_CODE_MSG_OK)
     {
@@ -3182,9 +3419,12 @@ void phy::on_cell_start_request(const int32_t cell_id)
 #ifdef ENABLE_L2_SLT_RSP
     phy_module().set_active_cell_bitmap(phy_config.cell_config_.carrier_idx);
 #endif
-    bfw_buffer_info buffer_info;
-    phyDriver.l1_bfw_coeff_retrieve_buffer(cell_id, &buffer_info);
-    phy_module().set_bfw_coeff_buff_info(cell_id, &buffer_info);
+    if (get_mMIMO_enable_info())
+    {
+        bfw_buffer_info buffer_info;
+        phyDriver.l1_bfw_coeff_retrieve_buffer(cell_id, &buffer_info);
+        phy_module().set_bfw_coeff_buff_info(cell_id, &buffer_info);
+    }
 
     if(phyDriver.l1_staticBFWConfigured(cell_id))
     {
@@ -4475,20 +4715,27 @@ void phy::send_early_uci_indication(const slot_command_api::slot_indication& slo
 }
 
 /**
- * Static wrapper for UL alloc buffer callback - allows using function pointer instead of std::function
- * 
- * @param context Unused (nullptr)
- * @param buffer Output message buffer
- * @param params PUSCH parameters
+ * Static wrapper for UL alloc buffer callback - pre-allocates nvIPC TX message
+ * so that L1 can D2H directly into the IPC data buffer, eliminating a second
+ * CPU copy in send_rx_data_indication.
+ *
+ * @param context Pointer to phy instance
+ * @param buffer Output message buffer to populate with pre-allocated IPC buffer
+ * @param params PUSCH parameters (used for cell count / cell ID / sizing)
  */
 static void ul_alloc_buffer_wrapper(void* context,
                                      ul_output_msg_buffer& buffer,
                                      const slot_command_api::pusch_params& params)
 {
-    // Dummy allocation - currently unused
-    (void)context;
-    (void)buffer;
-    (void)params;
+    buffer.reset();
+
+    if (context == nullptr)
+    {
+        return;
+    }
+
+    auto* phy_instance = static_cast<scf_5g_fapi::phy*>(context);
+    phy_instance->alloc_ul_tb_buffer(buffer, params);
 }
 
 /**
@@ -4511,25 +4758,15 @@ static void ul_slot_callback_wrapper(void* context,
                                       ::cuphyPuschStatPrms_t const* puschStatPrms)
 {
     auto* phy_instance = static_cast<scf_5g_fapi::phy*>(context);
-    (void)nCrc;  // Unused parameter
-    (void)buffer;  // Unused parameter
-    
+    (void)nCrc;
+
+    slot_command_api::ul_output_msg_buffer* ext_buf_ptr =
+        (buffer.data_buf != nullptr || buffer.num_cells > 0) ? &buffer : nullptr;
+
     if (out != nullptr)
     {
-        //TODO:
-        auto crcFails = phy_instance->send_crc_indication(slot, params, out, puschStatPrms);
-        phy_instance->send_rx_data_indication(slot, params, out, puschStatPrms);
-        // bool allCrcFail{crcFails == params.cell_grp_info.nUes};
-        // if (!allCrcFail)
-        // {
-        //     phy_instance->send_rx_data_indication(slot, params, out, puschStatPrms);
-        // }
-        // else
-        // {
-        //     NVLOGI_FMT(TAG, "NO ULSCH Indication due to CRC {} errors", crcFails);
-        //     // ul_crc_err_total[params.cell_index_list[0]]+=crcFails;
-        //     // ul_crc_err[params.cell_index_list[0]]+=crcFails;
-        // }
+        std::ignore = phy_instance->send_crc_indication(slot, params, out, puschStatPrms);
+        phy_instance->send_rx_data_indication(slot, params, out, puschStatPrms, ext_buf_ptr);
 
         if(out->totNumUciSegs > 0)
         {
@@ -4542,6 +4779,12 @@ static void ul_slot_callback_wrapper(void* context,
     else
     {
         NVLOGD_FMT(TAG, "{}: No CRC or ULSCH indication", __FUNCTION__);
+
+        // Release pre-allocated nvIPC message(s) that were never consumed (setup error path)
+        if (buffer.ipc_msg.msg_buf != nullptr || buffer.num_cells > 0)
+        {
+            phy_instance->release_ul_tb_buffer(buffer, params);
+        }
     }
 }
 
@@ -4637,6 +4880,22 @@ static void dl_slot_callback_wrapper(void* context, const slot_command_api::pdsc
 }
 
 /**
+ * No-op DL slot callback used when split-phase TX_DATA H2D is active.
+ *
+ * TX_DATA nvipc buffer lifetime is managed by tx_data_release_fn
+ * (via FapiSlotMessageStorage::release_lane), not by dl_tbs_queue_.
+ * This stub keeps getDlCb() returning true so that all other DL
+ * callbacks (FH prepare, tx_data_release, dl_tx_error, l1_exit_error)
+ * remain functional.
+ *
+ * @param[in] context  Unused callback context (must be nullptr).
+ * @param[in] params   Unused PDSCH parameters for the completed DL slot.
+ */
+static void dl_slot_callback_noop(void* /*context*/, const slot_command_api::pdsch_params* /*params*/)
+{
+}
+
+/**
  * Static wrappers for FH prepare callbacks - different template instantiations
  * 
  * @param context Pointer to phy instance (casted from void*)
@@ -4684,7 +4943,11 @@ static void fh_prepare_callback_wrapper_ttt(void* context,
 static void fh_bfw_coeff_usage_done_wrapper(void* context, uint8_t* header_addr)
 {
     (void)context;
-    NVLOGD_FMT(TAG, "{}: callback_fn: fh_bfw_coeff_usage_done_fn {}", __FUNCTION__, *header_addr);
+    if (header_addr == nullptr)
+    {
+        return;
+    }
+
     *header_addr = BFW_COFF_MEM_FREE;
 }
 
@@ -4817,8 +5080,18 @@ void phy::fh_prepare_callback_wrapper_ttt(slot_command_api::cell_group_command* 
 
 void phy::create_ul_dl_callbacks(slot_command_api::callbacks &cb)
 {
-    cb.dl_cb.callback_fn = &dl_slot_callback_wrapper;
-    cb.dl_cb.callback_fn_context = this;
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    if (phy_module().use_split_phase_txdata_h2d())
+    {
+        cb.dl_cb.callback_fn = &dl_slot_callback_noop;
+        cb.dl_cb.callback_fn_context = nullptr;
+    }
+    else
+#endif
+    {
+        cb.dl_cb.callback_fn = &dl_slot_callback_wrapper;
+        cb.dl_cb.callback_fn_context = this;
+    }
 
     if ((!phy_module().config_options().precoding_enabled) && (!phy_module().config_options().bf_enabled))
     {
@@ -4850,6 +5123,11 @@ void phy::create_ul_dl_callbacks(slot_command_api::callbacks &cb)
     cb.dl_cb.dl_tx_error_fn = &dl_tx_error_wrapper;
     cb.dl_cb.dl_tx_error_fn_context = this;
 
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    cb.dl_cb.tx_data_release_fn = &nv::PHY_module::s_tx_data_release;
+    cb.dl_cb.tx_data_release_fn_context = &phy_module();
+#endif
+
     cb.dl_cb.l1_exit_error_fn = [this] (uint16_t msg_id,uint16_t error_id,std::array<uint32_t,DL_MAX_CELLS_PER_SLOT>& cell_idx_list,uint8_t num_cells)
     {
             sfn_slot_t& ss_curr = phy_module().get_curr_sfn_slot();
@@ -4861,7 +5139,7 @@ void phy::create_ul_dl_callbacks(slot_command_api::callbacks &cb)
 
     /// 1 TB need to revisit for multiple TB
     cb.ul_cb.alloc_fn = &ul_alloc_buffer_wrapper;
-    cb.ul_cb.alloc_fn_context = nullptr;  // Unused
+    cb.ul_cb.alloc_fn_context = this;
 
     cb.ul_cb.callback_fn = &ul_slot_callback_wrapper;
     cb.ul_cb.callback_fn_context = this;
@@ -5062,12 +5340,89 @@ uint16_t phy::send_crc_indication(const slot_command_api::slot_indication& slot,
     return nCrcFail;
 }
 
+void phy::alloc_ul_tb_buffer(slot_command_api::ul_output_msg_buffer& buffer,
+    const slot_command_api::pusch_params& params)
+{
+    const uint16_t nCells = params.cell_grp_info.nCells;
+    if (nCells < 1)
+    {
+        return;
+    }
+
+    buffer.num_cells = 0;
+
+    for (uint16_t c = 0; c < nCells; c++)
+    {
+        nv::phy_mac_transport& transport = phy_module().transport(params.cell_index_list[c]);
+        nv::phy_mac_msg_desc desc;
+        desc.data_pool = NV_IPC_MEMPOOL_CPU_DATA;
+        if (transport.tx_alloc(desc) < 0)
+        {
+            NVLOGW_FMT(TAG, "{}: tx_alloc failed for cell {} (index {}), releasing {} already allocated",
+                       __FUNCTION__, c, params.cell_index_list[c], buffer.num_cells);
+            release_ul_tb_buffer(buffer, params);
+            return;
+        }
+
+        buffer.cell_ipc_msgs[c].msg_buf   = desc.msg_buf;
+        buffer.cell_ipc_msgs[c].msg_len   = desc.msg_len;
+        buffer.cell_ipc_msgs[c].data_buf  = desc.data_buf;
+        buffer.cell_ipc_msgs[c].data_len  = desc.data_len;
+        buffer.cell_ipc_msgs[c].data_pool = desc.data_pool;
+        buffer.num_cells = c + 1;
+    }
+
+    buffer.ipc_msg   = buffer.cell_ipc_msgs[0];
+    buffer.data_buf  = static_cast<uint8_t*>(buffer.cell_ipc_msgs[0].data_buf);
+    buffer.cookie    = this;
+
+    nv::phy_mac_transport& transport0 = phy_module().transport(params.cell_index_list[0]);
+    const nv_ipc_config_t* ipc_cfg = transport0.get_nv_ipc_config();
+    buffer.total_bytes = nv_ipc_get_buf_size(ipc_cfg, NV_IPC_MEMPOOL_CPU_DATA);
+}
+
+void phy::release_ul_tb_buffer(slot_command_api::ul_output_msg_buffer& buffer,
+    const slot_command_api::pusch_params& params)
+{
+    if (buffer.num_cells == 0 && buffer.ipc_msg.msg_buf == nullptr)
+    {
+        return;
+    }
+
+    for (uint32_t c = 0; c < buffer.num_cells; c++)
+    {
+        if (buffer.cell_ipc_msgs[c].msg_buf == nullptr)
+        {
+            continue;
+        }
+        if (c >= static_cast<uint32_t>(params.cell_grp_info.nCells))
+        {
+            break;
+        }
+        nv::phy_mac_transport& transport = phy_module().transport(params.cell_index_list[c]);
+        nv::phy_mac_msg_desc desc;
+        desc.msg_buf   = buffer.cell_ipc_msgs[c].msg_buf;
+        desc.msg_len   = buffer.cell_ipc_msgs[c].msg_len;
+        desc.data_buf  = buffer.cell_ipc_msgs[c].data_buf;
+        desc.data_len  = buffer.cell_ipc_msgs[c].data_len;
+        desc.data_pool = buffer.cell_ipc_msgs[c].data_pool;
+        transport.tx_release(desc);
+        buffer.cell_ipc_msgs[c].msg_buf  = nullptr;
+        buffer.cell_ipc_msgs[c].data_buf = nullptr;
+    }
+
+    buffer.reset();
+
+    NVLOGD_FMT(TAG, "{}: Released unconsumed pre-allocated nvIPC buffer(s)", __FUNCTION__);
+}
+
 void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
     const slot_command_api::pusch_params& params,
-    ::cuphyPuschDataOut_t const* out, ::cuphyPuschStatPrms_t const* puschStatPrms)
+    ::cuphyPuschDataOut_t const* out, ::cuphyPuschStatPrms_t const* puschStatPrms,
+    slot_command_api::ul_output_msg_buffer* ext_buffer)
 {
     const uint32_t* tbSize = params.ue_tb_size;
-    uint16_t nUes = params.cell_grp_info.nUes;
+    const uint16_t nUes = params.cell_grp_info.nUes;
     auto& ue_prms = params.ue_info;
     uint8_t* tbdecoded = out->pTbPayloads;
     float* taEsts{out->pTaEsts};
@@ -5077,7 +5432,15 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
     float rssi;
     uint32_t start_ue_index = 0;
     uint32_t end_ue_index = 0;
-    NVLOGD_FMT(TAG, "{}: params.cell_grp_info.nCells {}", __FUNCTION__, params.cell_grp_info.nCells);
+
+    // Zero-copy detection via explicit flag set by acquireExternalTbBuffer:
+    // Single-cell (Phase 1): D2H wrote directly into the single nvIPC data_buf.
+    // Multi-cell (Phase 2): per-cell batched D2H into cell_ipc_msgs[c].data_buf.
+    const bool zero_copy = (ext_buffer != nullptr && ext_buffer->zero_copy);
+    const bool zero_copy_multi = (zero_copy && ext_buffer->num_cells > 1);
+
+    NVLOGD_FMT(TAG, "{}: params.cell_grp_info.nCells {} zero_copy={} multi={}",
+               __FUNCTION__, params.cell_grp_info.nCells, zero_copy, zero_copy_multi);
     for(int cell_index = 0; cell_index < params.cell_grp_info.nCells; ++cell_index)
     {
         bool found_crc = false;
@@ -5100,16 +5463,52 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
         }
         if(!found_crc)
         {
+            if (zero_copy && ext_buffer != nullptr && static_cast<uint32_t>(cell_index) < ext_buffer->num_cells)
+            {
+                nv_ipc_msg_t& skipped_msg = ext_buffer->cell_ipc_msgs[cell_index];
+                if (skipped_msg.msg_buf != nullptr)
+                {
+                    nv::phy_mac_transport& tr = phy_module().transport(params.cell_index_list[cell_index]);
+                    nv::phy_mac_msg_desc rel_desc;
+                    rel_desc.msg_buf   = skipped_msg.msg_buf;
+                    rel_desc.msg_len   = skipped_msg.msg_len;
+                    rel_desc.data_buf  = skipped_msg.data_buf;
+                    rel_desc.data_len  = skipped_msg.data_len;
+                    rel_desc.data_pool = skipped_msg.data_pool;
+                    tr.tx_release(rel_desc);
+                    skipped_msg.msg_buf  = nullptr;
+                    skipped_msg.data_buf = nullptr;
+                }
+            }
             continue;
         }
 
-        /// Start nvIPC message
         nv::phy_mac_transport& transport = phy_module().transport(params.cell_index_list[cell_index]);
         nv::phy_mac_msg_desc desc;
-        desc.data_pool = NV_IPC_MEMPOOL_CPU_DATA;
-        if(transport.tx_alloc(desc) < 0)
+
+        if (zero_copy && static_cast<uint32_t>(cell_index) < ext_buffer->num_cells)
         {
-            return;
+            // Reuse the pre-allocated nvIPC message from alloc_fn
+            nv_ipc_msg_t& cell_msg = (ext_buffer->num_cells <= 1)
+                ? ext_buffer->ipc_msg
+                : ext_buffer->cell_ipc_msgs[cell_index];
+            desc.msg_buf   = cell_msg.msg_buf;
+            desc.msg_len   = cell_msg.msg_len;
+            desc.data_buf  = cell_msg.data_buf;
+            desc.data_len  = cell_msg.data_len;
+            desc.data_pool = cell_msg.data_pool;
+        }
+        else
+        {
+            desc.data_pool = NV_IPC_MEMPOOL_CPU_DATA;
+            if(transport.tx_alloc(desc) < 0)
+            {
+                if (ext_buffer != nullptr)
+                {
+                    release_ul_tb_buffer(*ext_buffer, params);
+                }
+                return;
+            }
         }
 
         desc.cell_id = params.cell_index_list[cell_index];
@@ -5131,6 +5530,10 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
             break;
         }
         if (hdr_ptr == nullptr) {
+            if (ext_buffer != nullptr)
+            {
+                release_ul_tb_buffer(*ext_buffer, params);
+            }
             return;
         }
         auto &indication = *reinterpret_cast<scf_fapi_rx_data_ind_t*>(hdr_ptr);
@@ -5147,6 +5550,22 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
         uint8_t* next = reinterpret_cast<uint8_t*>(indication.pdus);
         uint32_t offset = 0;
         ul_slot[desc.cell_id] ++;
+
+        // For multi-cell zero-copy, find this cell's base offset in the original
+        // contiguous layout. This is the offset of the first ULSCH UE in this cell.
+        uint32_t cell_base_offset = 0;
+        if (zero_copy_multi)
+        {
+            for (uint32_t u = start_ue_index; u < end_ue_index; u++)
+            {
+                if (params.ue_info[u].pduBitmap & 0x1)
+                {
+                    cell_base_offset = out->pStartOffsetsTbPayload[u];
+                    break;
+                }
+            }
+        }
+
         for(int i = start_ue_index; i < end_ue_index; ++i)
         {
             if((params.ue_info[i].pduBitmap & 0x1) == 0)
@@ -5154,7 +5573,9 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
                 continue;
             }
             indication.num_pdus++;
-            uint8_t* tb_src = out->pTbPayloads + out->pStartOffsetsTbPayload[i];
+            uint8_t* const tb_src = zero_copy_multi
+                ? static_cast<uint8_t*>(desc.data_buf) + (out->pStartOffsetsTbPayload[i] - cell_base_offset)
+                : out->pTbPayloads + out->pStartOffsetsTbPayload[i];
             auto& ulschPdu = *(reinterpret_cast<scf_fapi_rx_data_pdu_t*>(next));
             ulschPdu.rnti = ue_prms[i].rnti;
             ulschPdu.handle = params.scf_ul_tti_handle_list[i];
@@ -5180,7 +5601,6 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
             if (!tbcrcStatus[offsetsTbCrc])
             {
                 data_len += tbSize[i];
-                //TODO FIXME PDU_LEN OVERFLOW
                 ulschPdu.pdu_len = tbSize[i];
 #ifdef SCF_FAPI_10_04
                 ulschPdu.pdu_tag = 1;
@@ -5193,17 +5613,31 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
                     case nv::dl_tb_loc::TB_LOC_INLINE:
                     {
                         NVLOGW_FMT(TAG, "{}: Inline RX data buffers are not supported in L2 adapter", __FUNCTION__);
-                    return;
+                        if (ext_buffer != nullptr)
+                        {
+                            release_ul_tb_buffer(*ext_buffer, params);
+                        }
+                        return;
                     }
                     break;
                     case nv::dl_tb_loc::TB_LOC_EXT_HOST_BUF:
                     {
-            // NOTE: For nvipc RX TB data is populated in separate data buffer, this doesn't conform to SCF 222
-            // Just ignore the ulschPdu.pdu[]
                 tb_dest = static_cast<uint8_t*>(desc.data_buf) + tb_dest_offset;
-            desc.data_len += tbSize[i];
-            std::copy(tb_src, tb_src + tbSize[i], tb_dest);
-            tb_dest_offset += tbSize[i];
+                desc.data_len += tbSize[i];
+                if (zero_copy && static_cast<uint32_t>(cell_index) < ext_buffer->num_cells)
+                {
+                    // Data was D2H'd directly into desc.data_buf by L1.
+                    // Compact in-place only if CRC-failed UEs created gaps.
+                    if (tb_src != tb_dest)
+                    {
+                        std::memmove(tb_dest, tb_src, tbSize[i]);
+                    }
+                }
+                else
+                {
+                    std::copy(tb_src, tb_src + tbSize[i], tb_dest);
+                }
+                tb_dest_offset += tbSize[i];
                     }
                 }
             }
@@ -5212,13 +5646,6 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
                 NVLOGD_FMT(TAG, "{}: Skipping UE Index {} RNTI {}", __FUNCTION__, i, ue_prms[i].rnti);
                 ulschPdu.pdu_len = 0;
             }
-            // reinterpret_cast<uint8_t*>(ulschPdu.pduData);
-            // // The inevitable memcopy
-            // // ptrdiff_t diff = tb_dest - data;
-            // // NVLOGD_FMT(TAG,"ptr diff ={}", diff);
-            // offset+= ULSCH_IND_FAPIMSG_OFFSET + ulschPdu.nPduLen;
-            // data += offset;
-            // hdr.msgLen+=offset;
 #if 0
             for (uint i = 0; i < 30; i+=5) {
                 NVLOGI_FMT(TAG, "{}: Data PDU[{}] = 0x{:2x} 0x{:2x} 0x{:2x} 0x{:2x} 0x{:2x}", __FUNCTION__, i, tb_dest[i],
@@ -5232,17 +5659,37 @@ void phy::send_rx_data_indication(const slot_command_api::slot_indication& slot,
         hdr_ptr->length += offset;
         desc.msg_len = hdr_ptr->length + sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
 
-        NVLOGI_FMT(TAG, "{}: RX data indication PHY cell_id={} SFN {}.{} numPDUs={} tb_size={}", __FUNCTION__, desc.cell_id,
+        NVLOGI_FMT(TAG, "{}: RX data indication PHY cell_id={} SFN {}.{} numPDUs={} tb_size={} zero_copy={}",
+                __FUNCTION__, desc.cell_id,
                 static_cast<int>(indication.sfn),
                 static_cast<int>(indication.slot),
                 static_cast<int>(indication.num_pdus),
-                tb_size);
+                tb_size,
+                (zero_copy && ext_buffer != nullptr && static_cast<uint32_t>(cell_index) < ext_buffer->num_cells));
 
         transport.tx_send(desc);
+        if (ext_buffer != nullptr && static_cast<uint32_t>(cell_index) < ext_buffer->num_cells)
+        {
+            ext_buffer->cell_ipc_msgs[cell_index].msg_buf  = nullptr;
+            ext_buffer->cell_ipc_msgs[cell_index].data_buf = nullptr;
+        }
         transport.notify(IPC_NOTIFY_VALUE);
         metrics_.incr_tx_packet_count(SCF_FAPI_RX_DATA_INDICATION);
         // Increment start_ue_index to end
         start_ue_index = end_ue_index;
+    }
+
+    if (ext_buffer != nullptr)
+    {
+        if (!zero_copy)
+        {
+            release_ul_tb_buffer(*ext_buffer, params);
+        }
+        else if (ext_buffer->num_cells > static_cast<uint32_t>(params.cell_grp_info.nCells))
+        {
+            NVLOGW_FMT(TAG, "{}: ext_buffer->num_cells ({}) > nCells ({}), surplus messages may leak",
+                       __FUNCTION__, ext_buffer->num_cells, params.cell_grp_info.nCells);
+        }
     }
 }
 
@@ -5339,8 +5786,8 @@ void phy::on_cv_mem_bank_config_request(cv_mem_bank_config_request_body_t * cv_m
         NVLOGW_FMT(TAG, "{}: CV_MEMBANK_CONFIG_REQUEST received in state={}", __FUNCTION__, static_cast<uint32_t>(state.load()));
     scf_fapi_error_codes_t ret_code = SCF_ERROR_CODE_MSG_OK;
     nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-    uint8_t muMIMO_enable_flag = get_mMIMO_enable_info();
     uint8_t enable_srs_flag = get_enable_srs_info();
+    uint8_t muMIMO_enable_flag = get_mMIMO_enable_info();
     
     if(enable_srs_flag && muMIMO_enable_flag)
     {
@@ -6112,6 +6559,8 @@ inline void phy::update_prach_configs_l1(nv::PHYDriverProxy& phyDriver) {
     auto cell_id = phy_config.cell_config_.carrier_idx;
     if(phyDriver.driver_exist()) {
         auto& prachStatParams =  phy_driver_info.prachStatParams;
+        phy_driver_info.prach_configs.clear();
+        phy_driver_info.prach_freq_offsets.fill(0);
         prachStatParams.nFdmOccasions = numPrachFdOccasions;
         prachStatParams.occaStartIdx = 0;
         prachStatParams.configurationIndex = phy_config.prach_config_.prach_conf_index;
@@ -6145,6 +6594,8 @@ inline void phy::update_prach_configs_l1(nv::PHYDriverProxy& phyDriver) {
             auto& prach_cuphy_params =  phy_driver_info.prach_configs.back();
             prach_cuphy_params.prachRootSequenceIndex = root_seq.seq_index;
             prach_cuphy_params.prachZeroCorrConf = root_seq.zero_conf;
+            // Feeds ORAN section-type-3 freqOffset per FD occasion.
+            phy_driver_info.prach_freq_offsets[i] = root_seq.freqOffset;
         NVLOGI_FMT(TAG, "{}: prachStatParams: prach_configs[{}] RootSeqIndex {} ZCC {} k1 {} freqOffset {}", __FUNCTION__, phy_driver_info.prach_configs.size()-1,
             prach_cuphy_params.prachRootSequenceIndex,prach_cuphy_params.prachZeroCorrConf, root_seq.k1, root_seq.freqOffset);
         }
@@ -6195,6 +6646,9 @@ inline void phy::update_phy_stat_configs_l1(nv::PHYDriverProxy& phyDriver) {
         phy_driver_info.slot_ahead = phy_module().get_slot_advance();
         phy_driver_info.mplane_id = mplane.mplane_id;
         phy_driver_info.pusch_aggr_factor = phy_config.vendor_config_.pusch_aggr_factor;
+        // Mirror FAPI-parsed fields into cell_phy_info for FrameworkCPlaneService.
+        phy_driver_info.dl_freq_abs_a_khz = phy_config.carrier_config_.dl_freq_abs_A;
+        phy_driver_info.prach_seq_length  = phy_config.prach_config_.prach_seq_length;
         NVLOGC_FMT(TAG, "{}: PHY Cell Id = {}, M-Plane Id= {}", __FUNCTION__, phy_driver_info.phy_stat.phyCellId, phy_driver_info.mplane_id);
     }
 }
@@ -6231,6 +6685,22 @@ inline void phy::update_prach_start_ro_index(nv::PHYDriverProxy& phyDriver) {
     NVLOGD_FMT(TAG, "{}: start_ro_index={}", __FUNCTION__, phy_config.prach_config_.start_ro_index);
 }
 
+uint8_t phy::get_mMIMO_enable_info()
+{
+    nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+    uint8_t mMIMO_enable = 0;
+    phyDriver.l1_mMIMO_enable_info(&mMIMO_enable);
+    return mMIMO_enable;
+}
+
+uint8_t phy::get_enable_srs_info()
+{
+    nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+    uint8_t enable_srs = 0;
+    phyDriver.l1_enable_srs_info(&enable_srs);
+    return enable_srs;
+}
+
 inline uint8_t phy::create_cell_l1(nv::PHYDriverProxy& phyDriver) {
     uint8_t error_code = 0;
    if(!cell_created)
@@ -6250,7 +6720,7 @@ inline uint8_t phy::create_cell_l1(nv::PHYDriverProxy& phyDriver) {
     return error_code;
 }
 
-inline uint8_t phy::create_cell_configs() {
+uint8_t phy::create_cell_configs() {
     uint8_t error_code = SCF_ERROR_CODE_MSG_OK;
     nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
     update_tx_rx_ants();
@@ -6286,8 +6756,10 @@ inline uint8_t phy::create_cell_configs() {
         }
         error_code = create_cell_l1(phyDriver);
 
-        phyDriver.l1_cell_update_cell_config(mplane.mplane_id, phy_cell_params.nPrbDlBwp, true);
-        phyDriver.l1_cell_update_cell_config(mplane.mplane_id, phy_cell_params.nPrbUlBwp, false);
+        if (error_code == SCF_ERROR_CODE_MSG_OK) {
+            phyDriver.l1_cell_update_cell_config(mplane.mplane_id, phy_cell_params.nPrbDlBwp, true);
+            phyDriver.l1_cell_update_cell_config(mplane.mplane_id, phy_cell_params.nPrbUlBwp, false);
+        }
     } else {
         update_cell_stat_prm_idx();
     }
@@ -6297,13 +6769,13 @@ inline uint8_t phy::create_cell_configs() {
     return error_code;
 }
 
-inline void phy::copy_phy_configs_from(nv::phy_config& phy_config_origin) {
+void phy::copy_phy_configs_from(nv::phy_config& phy_config_origin) {
     uint8_t* orig = reinterpret_cast<uint8_t*>(&phy_config_origin);
     uint8_t* dest = reinterpret_cast<uint8_t*>(&phy_config);
     std::copy(orig, orig + sizeof(nv::phy_config), dest);
 }
 
-inline void phy::copy_csi2_maps_from(uint16_t nCsi2MapsOther, uint16_t* csi2MapBufferOther, cuphyCsi2MapPrm_t * csi2MapParamsBufferOther) {
+void phy::copy_csi2_maps_from(uint16_t nCsi2MapsOther, uint16_t* csi2MapBufferOther, cuphyCsi2MapPrm_t * csi2MapParamsBufferOther) {
     if (!nCsi2MapsOther || !csi2MapBufferOther || !csi2MapParamsBufferOther) {
         return;
     }
@@ -6313,7 +6785,7 @@ inline void phy::copy_csi2_maps_from(uint16_t nCsi2MapsOther, uint16_t* csi2MapB
     std::copy(csi2MapParamsBufferOther, csi2MapParamsBufferOther + nCsi2Maps, csi2MapParamsCpuBuffer.get());
 }
 
-inline int phy::update_dbt_pdu_table_ptr(int32_t cell_id, void* dbt_pdu_table_ptr) {
+int phy::update_dbt_pdu_table_ptr(int32_t cell_id, void* dbt_pdu_table_ptr) {
     if (phy_module().bf_enabled() == false) {
         return -1;
     }
@@ -6326,7 +6798,7 @@ inline int phy::update_dbt_pdu_table_ptr(int32_t cell_id, void* dbt_pdu_table_pt
     return -1;
 }
 
-inline void phy::update_cell_state(fapi_state_t other_state) {
+void phy::update_cell_state(fapi_state_t other_state) {
     if (state != other_state) {
         state = other_state;
     }
@@ -6345,7 +6817,7 @@ inline void phy::update_tx_rx_ants() {
     }
 }
 
-inline void phy::update_cells_stats(int32_t cell_id) {
+void phy::update_cells_stats(int32_t cell_id) {
     if (cell_id >= total_cell_num) {
         total_cell_num = cell_id + 1;
     }
@@ -6354,7 +6826,7 @@ inline void phy::update_cells_stats(int32_t cell_id) {
     ul_crc_err_total[cell_id] = 0;
 }
 
-inline void phy::copy_precoding_configs_to(int32_t cell_id) {
+void phy::copy_precoding_configs_to(const int32_t cell_id) {
     auto pm_enabled = phy_module().pm_enabled();
     auto& pm_map = phy_module().pm_map();
     if (!pm_enabled || pm_map.empty()) {
@@ -6368,36 +6840,34 @@ inline void phy::copy_precoding_configs_to(int32_t cell_id) {
     }
 }
 
-inline uint8_t phy::get_mMIMO_enable_info(){
-    nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-    uint8_t mMIMO_enable = 0;
-    phyDriver.l1_mMIMO_enable_info(&mMIMO_enable);
-    return mMIMO_enable;
+bool phy::is_dl_bfw_cvi_feature_allowed() noexcept
+{
+    return get_enable_srs_info() != 0u && get_mMIMO_enable_info() != 0u;
 }
 
-inline uint8_t phy::get_enable_srs_info(){
-    nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-    uint8_t enable_srs = 0;
-    phyDriver.l1_enable_srs_info(&enable_srs);
-    return enable_srs;
+void phy::reject_dl_bfw_cvi_feature_disabled(uint16_t msg_type_id,
+                                             uint16_t sfn,
+                                             uint16_t slot) noexcept
+{
+    send_error_indication(static_cast<scf_fapi_message_id_e>(msg_type_id),
+                          scf_fapi_error_codes_t::SCF_ERROR_CODE_MSG_SLOT_ERR,
+                          sfn,
+                          slot);
 }
 
-inline ru_type phy::get_ru_type() {
-    nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-    auto cell_id = phy_config.cell_config_.carrier_idx;
-    ::cell_mplane_info& mplane = phyDriver.getMPlaneConfig(cell_id);
-    return mplane.ru;
+bool phy::is_ul_bfw_cvi_feature_allowed() noexcept
+{
+    return get_enable_srs_info() != 0u && get_mMIMO_enable_info() != 0u;
 }
 
-inline nv::slot_detail_t* phy::get_slot_detail(slot_command_api::slot_indication& slot) {
-    auto ru = get_ru_type();
-    if (ru == SINGLE_SECT_MODE) {
-        
-        auto repeat_slots = (1 << phy_config.ssb_config_.sub_c_common) *  (nv::get_duration(phy_config.tdd_table_.tdd_period_num)/std::chrono::duration<float, std::milli>(1));
-        auto slot_index = slot.slot_ % static_cast<int>(repeat_slots);
-        return &phy_config.tdd_table_.s_detail[slot_index];
-    }
-    return nullptr;
+void phy::reject_ul_bfw_cvi_feature_disabled(uint16_t msg_type_id,
+                                             uint16_t sfn,
+                                             uint16_t slot) noexcept
+{
+    send_error_indication(static_cast<scf_fapi_message_id_e>(msg_type_id),
+                          scf_fapi_error_codes_t::SCF_ERROR_CODE_MSG_SLOT_ERR,
+                          sfn,
+                          slot);
 }
 
 void phy::update_cell_reconfig_params() {
@@ -6449,6 +6919,8 @@ void phy::update_phy_driver_info_reconfig(nv::PHYDriverProxy& phyDriver, const i
         //prach_cuphy_params.cellPrmStatIdx should be filled by driver when it's creating cuphyPrachStatPrms_t for all cells
         prach_cuphy_params.prachRootSequenceIndex = root_seq.seq_index;
         prach_cuphy_params.prachZeroCorrConf = root_seq.zero_conf;
+        // Feeds ORAN section-type-3 freqOffset on PRACH reconfig.
+        cell_reconfig_phy_driver_info.prach_freq_offsets[i] = root_seq.freqOffset;
         NVLOGI_FMT(TAG, "{}: prachStatParams: prach_configs[{}] RootSeqIndex {} ZCC {} k1 {} = freqOffset {}", __FUNCTION__, cell_reconfig_phy_driver_info.prach_configs.size()-1,
             prach_cuphy_params.prachRootSequenceIndex,prach_cuphy_params.prachZeroCorrConf,root_seq.k1, root_seq.freqOffset );
     }
@@ -6482,4 +6954,73 @@ void phy::handle_cell_config_response(int32_t cell_id, uint8_t response_code) {
     }
     send_cell_config_response(cell_id, response_code);
 }
+/**
+ * @brief Send DL O-RAN Section Type 1 C-plane to RU for this cell.
+ *
+ * Called from task_work_fn_dlc() on a DL worker thread once all FAPI messages
+ * for a cell have been received (SLOT.response). Extracts the C-plane portion
+ * of the DL_TTI.request and, optionally, UL_DCI.request, then forwards it to
+ * the fronthaul via FhProxy::send_cplane_dl().
+ *
+ * @param[in] dl_tti  Stored DL_TTI.request message descriptor; must be non-null.
+ * @param[in] ul_dci  Stored UL_DCI.request message descriptor; may be null if
+ *                    no UL DCI PDUs are present in this slot.
+ * @param[in] slot_map_dl Slot map reserved for this slot's DL C-plane task
+ *                        accounting; may be null when early slot-map path is
+ *                        disabled.
+ * @return Result code from l1_send_dl_cplane_from_stored_msg
+ *         (SEND_CPLANE_NO_ERROR on success; non-zero on timing/send failure).
+ *         The caller in the framework batch dispatcher uses this to
+ *         accumulate per-cell failures for batch-end L2 error fan-out.
+ */
+int phy::build_and_send_dl_cplane(
+    const nv::phy_mac_msg_desc* dl_tti,
+    const nv::phy_mac_msg_desc* ul_dci,
+    std::size_t transaction_id,
+    SlotMapDl* slot_map_dl)
+{
+    auto& phyDriver = nv::PHYDriverProxy::getInstance();
+    const int send_result = l1_send_dl_cplane_from_stored_msg(
+        phyDriver.get_driver(), dl_tti, ul_dci, transaction_id, slot_map_dl);
+    if (send_result != 0) {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                   "{}: failed to send stored DL C-plane, ret={}",
+                   __FUNCTION__, send_result);
+    }
+    return send_result;
+}
+
+/**
+ * @brief Send UL O-RAN Section Type 3 C-plane to RU for this cell.
+ *
+ * Called from task_work_fn_ulc() on a UL worker thread immediately upon
+ * UL_TTI.request arrival for this cell. Extracts the C-plane portion of
+ * the UL_TTI.request and forwards it to the fronthaul via
+ * FhProxy::send_cplane_ul().
+ *
+ * @param[in] ul_tti  Stored UL_TTI.request message descriptor; must be non-null.
+ * @param[in] slot_map_ul Slot map reserved for this slot's UL C-plane task
+ *                        accounting; may be null when early slot-map path is
+ *                        disabled.
+ * @return Result code from l1_send_ul_cplane_from_stored_msg
+ *         (SEND_CPLANE_NO_ERROR on success; non-zero on timing/send failure).
+ *         The caller in the framework batch dispatcher uses this to
+ *         accumulate per-cell failures for batch-end L2 error fan-out.
+ */
+int phy::build_and_send_ul_cplane(
+    const nv::phy_mac_msg_desc* ul_tti,
+    std::size_t transaction_id,
+    SlotMapUl* slot_map_ul)
+{
+    auto& phyDriver = nv::PHYDriverProxy::getInstance();
+    const int send_result = l1_send_ul_cplane_from_stored_msg(
+        phyDriver.get_driver(), ul_tti, transaction_id, slot_map_ul);
+    if (send_result != 0) {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                   "{}: failed to send stored UL C-plane, ret={}",
+                   __FUNCTION__, send_result);
+    }
+    return send_result;
+}
+
 } // namespace scf_5g_fapi

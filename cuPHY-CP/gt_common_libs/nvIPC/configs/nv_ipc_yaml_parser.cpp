@@ -15,6 +15,11 @@
  * limitations under the License.
  */
 
+#include <climits>
+#include <cstring>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "nv_ipc.h"
 #include "nvlog.h"
 
@@ -22,6 +27,40 @@
 #include "nv_ipc.hpp"
 
 #define TAG "NVIPC:YAML"
+
+static int validate_yaml_config_path(const char* yaml_path, char* resolved_path, size_t resolved_size)
+{
+    if(yaml_path == nullptr || yaml_path[0] == '\0' || resolved_path == nullptr || resolved_size == 0)
+    {
+        return -1;
+    }
+
+    if(resolved_size < static_cast<size_t>(PATH_MAX))
+    {
+        return -1;
+    }
+
+    if(strstr(yaml_path, "/../") != nullptr)
+    {
+        NVLOGE_NO_FMT(TAG, AERIAL_CONFIG_EVENT, "YAML path contains '..': {}", yaml_path);
+        return -1;
+    }
+
+    if(realpath(yaml_path, resolved_path) == nullptr)
+    {
+        NVLOGE_NO_FMT(TAG, AERIAL_CONFIG_EVENT, "YAML path resolution failed: {}", yaml_path);
+        return -1;
+    }
+
+    struct stat path_stat;
+    if(stat(resolved_path, &path_stat) != 0 || !S_ISREG(path_stat.st_mode))
+    {
+        NVLOGE_NO_FMT(TAG, AERIAL_CONFIG_EVENT, "YAML path is not a regular file: {}", resolved_path);
+        return -1;
+    }
+
+    return 0;
+}
 
 static void parse_mempool_size(nv_ipc_mempool_size_t mempools[], yaml::node& cfg_node)
 {
@@ -77,10 +116,14 @@ int nv_ipc_parse_yaml_node(nv_ipc_config_t* cfg, yaml::node* yaml_node, nv_ipc_m
     }
     else
     {
-        NVLOGE_NO_FMT(TAG, AERIAL_CONFIG_EVENT, "Unexpected YAML transport type: {}", transport_type, transport_type.c_str());
+        NVLOGE_NO_FMT(TAG, AERIAL_CONFIG_EVENT, "Unexpected YAML transport type: {}", transport_type);
+        return -1;
     }
 
-    set_nv_ipc_default_config(cfg, module_type);
+    if(set_nv_ipc_default_config(cfg, module_type) != 0)
+    {
+        return -1;
+    }
 
     int pcap_max_msg_size = 8192;
     //------------------------------------------------------------------
@@ -130,8 +173,6 @@ int nv_ipc_parse_yaml_node(nv_ipc_config_t* cfg, yaml::node* yaml_node, nv_ipc_m
 
         // Parse all other parameters for primary process
         cfg->transport_config.shm.cuda_device_id = shm_config["cuda_device_id"].as<int>();
-        cfg->transport_config.shm.ring_len = shm_config["ring_len"].as<int32_t>();
-
         parse_mempool_size(cfg->transport_config.shm.mempool_size, shm_config);
 
         pcap_max_msg_size = cfg->transport_config.shm.mempool_size[NV_IPC_MEMPOOL_CPU_MSG].buf_size;
@@ -302,9 +343,17 @@ int nv_ipc_parse_yaml_node(nv_ipc_config_t* cfg, yaml::node* yaml_node, nv_ipc_m
 int load_nv_ipc_yaml_config(nv_ipc_config_t* cfg, const char* yaml_path, nv_ipc_module_t module_type)
 {
     NVLOGI_FMT(TAG, "{}: {}", __FUNCTION__, yaml_path);
+
+    char resolved_path[PATH_MAX];
+    if(validate_yaml_config_path(yaml_path, resolved_path, sizeof(resolved_path)) != 0)
+    {
+        NVLOGE_NO_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: YAML path validation failed: {}", __func__, yaml_path);
+        return -1;
+    }
+
     try
     {
-        yaml::file_parser fp(yaml_path);
+        yaml::file_parser fp(resolved_path);
         yaml::document    doc        = fp.next_document();
         yaml::node        yaml_root  = doc.root();
 
@@ -319,7 +368,11 @@ int load_nv_ipc_yaml_config(nv_ipc_config_t* cfg, const char* yaml_path, nv_ipc_
         }
 
         yaml::node nvipc_node = yaml_root["transport"];
-        nv_ipc_parse_yaml_node(cfg, &nvipc_node, module_type);
+        if(nv_ipc_parse_yaml_node(cfg, &nvipc_node, module_type) != 0)
+        {
+            NVLOGE_NO_FMT(TAG, AERIAL_YAML_PARSER_EVENT, "{}: YAML parsing failed: {}", __func__, yaml_path);
+            return -1;
+        }
         return 0;
     }
     catch(const YAML::BadFile& badFile)

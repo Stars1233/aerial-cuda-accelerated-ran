@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,8 +59,8 @@ int nv_assign_thread_cpu_core(int cpu_id)
     CPU_SET(cpu_id, &mask);
     int ret;
     if ((ret = pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask)) != 0) {
-        NVLOGE_NO(TAG, AERIAL_THREAD_API_EVENT, "%s: line %d ret=%d errno=%d: %s", __func__,
-                __LINE__, ret, errno, strerror(errno));
+        NVLOGE_NO(TAG, AERIAL_THREAD_API_EVENT, "%s: cpu_core=%d ret=%d errno=%d: %s", __func__,
+                cpu_id, ret, errno, strerror(errno));
         return -1;
     } else {
         NVLOGI(TAG, "%s: OK: thread=%ld cpu_id=%d", __func__, pthread_self(), cpu_id);

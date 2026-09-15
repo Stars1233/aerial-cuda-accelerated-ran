@@ -284,6 +284,8 @@ public:
 
     int tv_data_map_enable; //!< Enable FAPI test vector map to reuse duplicate PDU data
 
+    int enable_empty_slot_resp{}; //!< Enable SLOT.response for empty slots
+
     int builder_thread_enable; //!< Enable FAPI builder thread for pre-building messages
 
     int estimate_send_time; //!< Estimated time cost for L2 to send one message (nanoseconds)
@@ -296,6 +298,7 @@ public:
 
     int oam_cell_ctrl_cmd;      //!< Enable OAM cell control commands
     std::string oam_server_addr; //!< OAM server address
+    std::string ru_emulator_host{}; //!< RU emulator hostname for startup sync (empty = no wait)
 
     int fapi_delay_bit_mask; //!< Bit mask for which FAPI messages to delay
 
@@ -331,7 +334,7 @@ private:
 
     int restart_option = 0; //!< Cell restart behavior option
 
-    int fapi_tb_loc = 0; //!< Transport block data location (0=msg_buf, 1=CPU_DATA, 2=CUDA_DATA, 3=GPU_DATA)
+    int fapi_tb_loc = 0; //!< Data pool option (0=msg_buf/inline, 1=CPU_DATA, 2=CPU_LARGE, 3=GPU_DATA)
 
     // All cells restart test configuration
     int test_slots = 0;       //!< Total slots to run before restarting all cells

@@ -16,14 +16,10 @@
  */
 
 #include "cumac.h"
+#include "common/schedulerTimeMeasure.h"
 
 // cuMAC namespace
 namespace cumac {
-
-// #define CPU_SCHEDULER_TIME_MEASURE_ 
-#ifdef CPU_SCHEDULER_TIME_MEASURE_
-#define numRunSchKnlTimeMsr    1000
-#endif
 
 multiCellSchedulerCpu::multiCellSchedulerCpu(cumacCellGrpPrms* cellGrpPrms)
 {

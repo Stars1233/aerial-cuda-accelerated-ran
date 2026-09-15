@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,18 +57,6 @@
 #ifndef ACCESS_ONCE
     #define ACCESS_ONCE(x) (*(volatile typeof(x) *)&(x))
 #endif
-
-#define CHECK_CUDA_THROW(expr)                                                                                                                             \
-    do                                                                                                                                                     \
-    {                                                                                                                                                      \
-        cudaError_t err = (expr);                                                                                                                          \
-        if(err != cudaSuccess)                                                                                                                             \
-        {                                                                                                                                                  \
-            std::stringstream out;                                                                                                                         \
-            out << "CUDA call failed with " << err << "(" << cudaGetErrorName(err) << "):" << cudaGetErrorString(err) << ". Failed CUDA call: " STR(expr); \
-            throw out.str();                                                                                                                               \
-        }                                                                                                                                                  \
-    } while(0)
 
 #define FH_GEN_CATCH_EXCEPTIONS()                  \
     catch(std::exception const& e)                 \

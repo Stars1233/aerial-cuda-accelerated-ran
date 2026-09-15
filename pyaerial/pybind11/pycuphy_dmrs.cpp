@@ -214,6 +214,8 @@ void PyPdschDmrsTx::readDmrsParams(const std::vector<py::object>& dmrsParams, co
 
         m_dmrsParams[tbIdx].ueGrp_idx = 0; // Not used.
         m_dmrsParams[tbIdx].dmrsCdmGrpsNoData1 = (numDmrsCdmGrps == 1);
+        m_dmrsParams[tbIdx].su_mimo =
+            py::hasattr(dmrsParams[tbIdx], "su_mimo") ? dmrsParams[tbIdx].attr("su_mimo").cast<bool>() : false;
         m_dmrsParams[tbIdx].nlAbove16 = 0;
     }
 }

@@ -22,6 +22,7 @@
 
 #include "cuphy.hpp"
 #include "derate_matching_modulo.hpp"
+#include "rate_matching.hpp"
 #include <cuda_fp16.h>
 
 
@@ -68,6 +69,97 @@ static void launch_with_cfg(const cuphyPuschRxRateMatchLaunchCfg_t& cfg, CUstrea
     launch_kernel_node_params(cfg.kernelNodeParamsDriver, stream);
     launch_kernel_node_params(cfg.clampKernelNodeParamsDriver, stream);
     cuCheck(cuStreamSynchronize(stream));
+}
+
+static void run_rate_match_range_case(const PerTbParams&                    tbPrm,
+                                      const std::vector<float>&             hLlrs,
+                                      const cuphyPuschRxRateMatchCbRange_t& cbRange,
+                                      std::vector<float>&                   hOut,
+                                      cuphyPuschRxRateMatchLaunchCfg_t*     launchCfgOut = nullptr)
+{
+    ASSERT_EQ(hLlrs.size(), tbPrm.encodedSize);
+    const uint32_t totalOutFloats = tbPrm.num_CBs * tbPrm.Ncb_padded;
+    const float    sentinel       = -777.0f;
+
+    const uint32_t paddedLen = (tbPrm.encodedSize / tbPrm.Qm) * QAM_STRIDE;
+    std::vector<float> hPadded(paddedLen, 0.0f);
+    for(uint32_t i = 0; i < tbPrm.encodedSize; ++i)
+    {
+        const uint32_t j = i / tbPrm.Qm;
+        const uint32_t k = i % tbPrm.Qm;
+        hPadded[k + j * QAM_STRIDE] = hLlrs[i];
+    }
+
+    float* dIn  = nullptr;
+    float* dOut = nullptr;
+    cudaCheck(cudaMalloc(&dIn, hPadded.size() * sizeof(float)));
+    cudaCheck(cudaMalloc(&dOut, totalOutFloats * sizeof(float)));
+    cudaCheck(cudaMemcpy(dIn, hPadded.data(), hPadded.size() * sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<float> hInitial(totalOutFloats, sentinel);
+    cudaCheck(cudaMemcpy(dOut, hInitial.data(), hInitial.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    void** ppRmOut = nullptr;
+    cudaCheck(cudaHostAlloc(&ppRmOut, sizeof(void*), cudaHostAllocDefault));
+    ppRmOut[0] = dOut;
+
+    cuphyTensorPrm_t tRmIn[1]{};
+    cuphyTensorPrm_t tCdm1RmIn[1]{};
+    tRmIn[0].pAddr     = dIn;
+    tCdm1RmIn[0].pAddr = dIn;
+
+    PerTbParams* dTb = nullptr;
+    cudaCheck(cudaMalloc(&dTb, sizeof(PerTbParams)));
+    cudaCheck(cudaMemcpy(dTb, &tbPrm, sizeof(PerTbParams), cudaMemcpyHostToDevice));
+
+    size_t descrSizeBytes = 0;
+    size_t descrAlignBytes = 0;
+    ASSERT_EQ(cuphyPuschRxRateMatchGetDescrInfo(&descrSizeBytes, &descrAlignBytes), CUPHY_STATUS_SUCCESS);
+    void* cpuDesc = nullptr;
+    void* gpuDesc = nullptr;
+    cudaCheck(cudaHostAlloc(&cpuDesc, descrSizeBytes, cudaHostAllocDefault));
+    cudaCheck(cudaMalloc(&gpuDesc, descrSizeBytes));
+
+    cuphyPuschRxRateMatchHndl_t hndl = nullptr;
+    ASSERT_EQ(cuphyCreatePuschRxRateMatch(&hndl, 0, 0), CUPHY_STATUS_SUCCESS);
+
+    CUstream stream = nullptr;
+    cuCheck(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
+
+    uint16_t schUserIdxs[1] = {0};
+    cuphyPuschRxRateMatchLaunchCfg_t launchCfg{};
+    static_cast<puschRxRateMatch*>(hndl)->setup(1,
+                                                schUserIdxs,
+                                                &tbPrm,
+                                                dTb,
+                                                tRmIn,
+                                                tCdm1RmIn,
+                                                ppRmOut,
+                                                cpuDesc,
+                                                gpuDesc,
+                                                0,
+                                                &launchCfg,
+                                                stream,
+                                                &cbRange);
+
+    cudaCheck(cudaMemcpyAsync(gpuDesc, cpuDesc, descrSizeBytes, cudaMemcpyHostToDevice, stream));
+    launch_with_cfg(launchCfg, stream);
+    cuCheck(cuStreamSynchronize(stream));
+
+    hOut.resize(totalOutFloats);
+    cudaCheck(cudaMemcpy(hOut.data(), dOut, hOut.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    if(launchCfgOut != nullptr)
+    {
+        *launchCfgOut = launchCfg;
+    }
+
+    EXPECT_EQ(cuphyDestroyPuschRxRateMatch(hndl), CUPHY_STATUS_SUCCESS);
+    cuCheck(cuStreamDestroy(stream));
+    cudaCheck(cudaFreeHost(cpuDesc));
+    cudaCheck(cudaFree(gpuDesc));
+    cudaCheck(cudaFree(dTb));
+    cudaCheck(cudaFreeHost(ppRmOut));
+    cudaCheck(cudaFree(dOut));
+    cudaCheck(cudaFree(dIn));
 }
 
 // Builds minimal, self-consistent PerTbParams for a single UE/TB/CB
@@ -132,7 +224,8 @@ static void run_rate_match_case(const PerTbParams&        tbPrm,
                                 const std::vector<float>& h_llrs,
                                 std::vector<float>&       h_out,
                                 bool                      descramblingOn,
-                                bool                      enableCpuToGpuDescrAsyncCpy)
+                                bool                      enableCpuToGpuDescrAsyncCpy,
+                                cuphyPuschRxRateMatchLaunchCfg_t* launchCfgOut = nullptr)
 {
     ASSERT_EQ(h_llrs.size(), tbPrm.encodedSize);
     const uint32_t Ncb            = tbPrm.Ncb;
@@ -234,6 +327,10 @@ static void run_rate_match_case(const PerTbParams&        tbPrm,
     // Copy results back
     h_out.resize(Ncb);
     cudaCheck(cudaMemcpy(h_out.data(), d_out, Ncb * sizeof(float), cudaMemcpyDeviceToHost));
+    if(launchCfgOut != nullptr)
+    {
+        *launchCfgOut = launchCfg;
+    }
 
     // Cleanup
     EXPECT_EQ(cuphyDestroyPuschRxRateMatch(hndl), CUPHY_STATUS_SUCCESS);
@@ -526,6 +623,86 @@ TEST(PUSCH_RateMatch, ElEh_Split_ElseBranch_Coverage)
     // Invariants: non-zero outputs exist, values finite and within clamp bounds
     const size_t nz = count_nonzero_finite_bounded(h_out, -10000.0f, 10000.0f);
     EXPECT_GE(nz, static_cast<size_t>(1));
+}
+
+TEST(PUSCH_RateMatch, RangedSetupProcessesOnlyRequestedCodeBlock)
+{
+    const uint32_t Zc  = 2;
+    const uint32_t Ncb = 32;
+    const uint32_t Qm  = 2;
+    const uint32_t E   = 18;
+    const uint32_t K   = 20;
+    const uint32_t F   = 0;
+
+    PerTbParams tb = make_min_tb_params(Ncb, Zc, Qm, E, K, F, /*ndi*/ 1, /*nDmrs*/ 0);
+    tb.num_CBs      = 3;
+    tb.Ncb_padded   = ((Ncb + 2 * Zc + 7) / 8) * 8;
+
+    std::vector<float> hIn(E);
+    for(uint32_t i = 0; i < E; ++i)
+    {
+        hIn[i] = (i < 6) ? 11.0f : ((i < 12) ? 22.0f : 33.0f);
+    }
+
+    const cuphyPuschRxRateMatchCbRange_t cbRange{1, 2};
+    std::vector<float> hOut;
+    cuphyPuschRxRateMatchLaunchCfg_t launchCfg{};
+    run_rate_match_range_case(tb, hIn, cbRange, hOut, &launchCfg);
+
+    EXPECT_EQ(launchCfg.kernelNodeParamsDriver.gridDimY, 1U);
+    const float sentinel  = -777.0f;
+    const uint32_t cbStride = tb.Ncb_padded;
+    for(uint32_t i = 0; i < cbStride; ++i)
+    {
+        EXPECT_FLOAT_EQ(hOut[i], sentinel) << "CB0 was modified at " << i;
+    }
+
+    bool touchedSelectedCb = false;
+    for(uint32_t i = cbStride; i < 2 * cbStride; ++i)
+    {
+        touchedSelectedCb |= (hOut[i] != sentinel);
+    }
+    EXPECT_TRUE(touchedSelectedCb);
+
+    for(uint32_t i = 2 * cbStride; i < 3 * cbStride; ++i)
+    {
+        EXPECT_FLOAT_EQ(hOut[i], sentinel) << "CB2 was modified at " << i;
+    }
+}
+
+TEST(PUSCH_RateMatch, FullTbSetupUsesSpecializedKernels)
+{
+    const uint32_t Zc  = 2;
+    const uint32_t Ncb = 32;
+    const uint32_t Qm  = 2;
+    const uint32_t E   = 12;
+    const uint32_t K   = 20;
+    const uint32_t F   = 0;
+
+    PerTbParams tb = make_min_tb_params(Ncb, Zc, Qm, E, K, F, /*ndi*/ 1, /*nDmrs*/ 0);
+    std::vector<float> hIn(E, 3.0f);
+
+    std::vector<float>                     fullTbOut;
+    cuphyPuschRxRateMatchLaunchCfg_t fullTbLaunchCfg{};
+    run_rate_match_case(tb,
+                        hIn,
+                        fullTbOut,
+                        /*descramblingOn*/ false,
+                        /*enableCpuToGpuDescrAsyncCpy*/ false,
+                        &fullTbLaunchCfg);
+
+    const cuphyPuschRxRateMatchCbRange_t fullRange{0, 1};
+    std::vector<float>                     rangedOut;
+    cuphyPuschRxRateMatchLaunchCfg_t rangedLaunchCfg{};
+    run_rate_match_range_case(tb, hIn, fullRange, rangedOut, &rangedLaunchCfg);
+
+    EXPECT_EQ(fullTbOut, rangedOut);
+    EXPECT_NE(fullTbLaunchCfg.kernelNodeParamsDriver.func,
+              rangedLaunchCfg.kernelNodeParamsDriver.func);
+    EXPECT_NE(fullTbLaunchCfg.resetKernelNodeParamsDriver.func,
+              rangedLaunchCfg.resetKernelNodeParamsDriver.func);
+    EXPECT_NE(fullTbLaunchCfg.clampKernelNodeParamsDriver.func,
+              rangedLaunchCfg.clampKernelNodeParamsDriver.func);
 }
 
 TEST(PUSCH_RateMatch, Atomics_Clamp_DescramblingOn)

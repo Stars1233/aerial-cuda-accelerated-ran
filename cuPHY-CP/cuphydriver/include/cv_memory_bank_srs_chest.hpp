@@ -21,20 +21,22 @@
 #include <unordered_map>
 #include <queue>
 #include <iostream>
+#include <memory>
+#include <cstring>
 #include <typeinfo>
-#include <atomic>
 #include "gpudevice.hpp"
 #include "constant.hpp"
 #include "cuphydriver_api.hpp"
-#include "fh.hpp"
-#include "phychannel.hpp"
-
+#include <slot_command/slot_command.hpp>   // slot_command_api::*, MAX_AP_PER_SLOT_SRS
+#include "cuphy_api.h"                     // cuphyTensorDescriptor_t
+#include "cuphy.hpp"                       // cuphy::tensor_desc
+#include "srs_ipc_manager.hpp"
 
 #define CV_NUM_UE_LAYER MAX_UE_SRS_ANT_PORTS           ///< Number of UE layers for SRS channel estimates
-#define CV_NUM_GNB_ANT MAX_AP_PER_SLOT_SRS            ///< Number of gNodeB antennas for SRS processing per slot
 #define CV_NUM_PRBG ORAN_MAX_PRB                      ///< Number of Physical Resource Block Groups for channel estimates
 #define CV_INVALID_RNTI 65535                         ///< Invalid RNTI value
 #define CV_INVALID_CESHT_BUF_INDEX 65535              ///< Invalid channel estimate buffer index
+
 
 /**
  * @brief SRS Channel Estimate Buffer
@@ -49,9 +51,9 @@ typedef struct _CVSrsChestBuff
         /**
          * @brief Construct SRS channel estimate buffer
          * 
-         * @param bdev  GPU device buffer pointer
+         * @param bdev  IPC-backed GPU device buffer pointer
          */
-        _CVSrsChestBuff(dev_buf* bdev) :
+        _CVSrsChestBuff(ipc_dev_buf* bdev) :
             srs_chest_buff_state(slot_command_api::SRS_CHEST_BUFF_NONE),
             rnti(CV_INVALID_RNTI),
             buffer_idx(CV_INVALID_CESHT_BUF_INDEX),
@@ -206,10 +208,49 @@ typedef struct _CVSrsChestBuff
             sfn = 0xFFFF;
             slot = 0xFFFF;
         }
+
+        /**
+         * @brief Scrub non-serializable members in a staging copy used for dump.
+         *
+         * This must only be used on memcpy'd snapshots (e.g. H5 dump staging
+         * buffers), not on live pool objects.
+         */
+        void scrubDumpOnlyMembers() {
+            // Avoid offsetof(_CVSrsChestBuff, …): this type is not standard-layout for nvcc/C++ rules.
+            std::memset(reinterpret_cast<void*>(&buffer), 0, sizeof(buffer));
+            std::memset(reinterpret_cast<void*>(&buffDesc), 0, sizeof(buffDesc));
+        }
+
+        /**
+         * @brief Copy all scalar data fields from @p src, leaving @p buffer and
+         *        @p buffDesc untouched on this (live) object.
+         *
+         * Used when replaying cuBB-captured HDF5 pools: the raw H5 bytes contain
+         * stale heap pointers (cuBB-process @p buffer / @p buffDesc values) that
+         * must not overwrite the live IPC-backed pointers held by this process.
+         * Only the plain-data fields that cuMAC actually consumes are copied.
+         *
+         * @p src may be a reinterpret_cast of a raw byte buffer (not a constructed
+         * object); this method only reads plain-integer members so that is safe.
+         */
+        void copyDataFrom(const _CVSrsChestBuff& src) {
+            srs_chest_buff_state = src.srs_chest_buff_state;
+            rnti                 = src.rnti;
+            buffer_idx           = src.buffer_idx;
+            cell_id              = src.cell_id;
+            srs_chest_buff_usage = src.srs_chest_buff_usage;
+            sfn                  = src.sfn;
+            slot                 = src.slot;
+            srsPrgSize           = src.srsPrgSize;
+            srsStartPrg          = src.srsStartPrg;
+            srsStartValidPrg     = src.srsStartValidPrg;
+            srsNValidPrg         = src.srsNValidPrg;
+            // buffer and buffDesc are intentionally left untouched
+        }
         
     private:
         slot_command_api::srsChestBuffState srs_chest_buff_state;  ///< Buffer state (INIT, REQUESTED, READY, NONE)
-        std::unique_ptr<dev_buf> buffer;                           ///< GPU device memory buffer for channel estimates
+        std::unique_ptr<ipc_dev_buf> buffer;                      ///< IPC-backed GPU device memory buffer for channel estimates
         cuphy::tensor_desc buffDesc;                               ///< cuPHY tensor descriptor for this buffer
         uint32_t rnti;                                             ///< Radio Network Temporary Identifier (UE ID)
         uint32_t buffer_idx;                                       ///< Buffer index in memory pool
@@ -252,8 +293,9 @@ class CvSrsChestMemoryBank
          * @param _pdh                          Physical layer driver handle
          * @param _gDev                         GPU device pointer
          * @param _total_num_srs_chest_buffers  Total number of buffers in global pool
+         * @param _max_srs_antenna_ports        Max SRS antenna ports per buffer (dimension); e.g. 4 for 4T4R, 64 for 64T64R. From config max_ul_antenna_ports.
          */
-        CvSrsChestMemoryBank(phydriver_handle _pdh, GpuDevice* _gDev, uint32_t _total_num_srs_chest_buffers);
+        CvSrsChestMemoryBank(phydriver_handle _pdh, GpuDevice* _gDev, uint32_t _total_num_srs_chest_buffers, uint16_t _max_srs_antenna_ports = MAX_AP_PER_SLOT_SRS);
         
         /**
          * @brief Destructor - releases all buffers
@@ -268,9 +310,10 @@ class CvSrsChestMemoryBank
          * @param buffer_idx  Desired buffer index
          * @param reportType  Report type (periodic/aperiodic/etc.)
          * @param ptr         Output pointer to allocated buffer
+         * @param realBuffIndex_out  Output pointer to real buffer index
          * @return int        0 on success, negative on failure
          */
-        int preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, uint32_t reportType, CVSrsChestBuff** ptr);
+        int preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, uint32_t reportType, CVSrsChestBuff** ptr, uint32_t* realBuffIndex_out);
         
         /**
          * @brief Retrieve an existing buffer
@@ -339,15 +382,28 @@ class CvSrsChestMemoryBank
          * @return bool    true on success, false on failure
          */
         bool memPoolDeAllocatePerCell(uint16_t cell_id);
-        
+
+        /**
+         * @brief Get the SrsIpcManager instance
+         *
+         * @return SrsIpcManager*  Pointer to the SrsIpcManager instance.
+         *         The manager outlives the bank's public methods (it is
+         *         constructed in the bank ctor and released in the bank
+         *         dtor), so this reference is valid for the bank's lifetime.
+         */
+        SrsIpcManager* getSrsIpcManager() { return ipc_manager_.get(); }
+
         MemFoot             mf;  ///< Memory footprint tracking for this memory bank
 
     private:
         phydriver_handle                                                        pdh;                     ///< Physical layer driver handle
         GpuDevice*                                                              gDev;                    ///< GPU device pointer for memory allocation
         uint32_t                                                                total_num_srs_chest_buffers;  ///< Total number of buffers in global pool
+        uint16_t                                                                max_srs_antenna_ports{0};      ///< Max SRS antenna ports per buffer (for sizing)
         std::array<CVSrsChestBuff *, slot_command_api::MAX_SRS_CHEST_BUFFERS>   arr_cv_srs_chest_buff;  ///< Array of all SRS channel estimate buffer pointers
         std::queue<uint32_t>                                                    memIndexPool;            ///< Queue of free buffer indices available for allocation
         std::unordered_map<uint32_t, CellIdtoSrsBuffIndexMap>                   srsChEstBuffIndexMap;    ///< Map from cell ID to its allocated buffer index pool
+
+        std::unique_ptr<SrsIpcManager> ipc_manager_; ///< SRS IPC manager instance
 };
 #endif

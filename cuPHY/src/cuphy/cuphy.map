@@ -27,7 +27,22 @@
                   cuphy::LDPC_decode_desc_set::*;
                   cuphy::LDPC_decode_config::*;
                   cuphy::LDPC_decode_desc::*;
+                  cuphyCreateLdpcCbKernelChooser*;
+                  cuphyDestroyLdpcCbKernelChooser*;
+                  cuphyLdpcCbChooseKernel*;
+                  cuphyLdpcCbBuildSubgroupDesc*;
+                  cuphyLdpcCbBuildKernelNodeParams*;
+                  cuphyLdpcCbComputeNormalization*;
+                  cuphyCreateLdpcCbLaunchPreparer*;
+                  cuphyDestroyLdpcCbLaunchPreparer*;
+                  cuphyLdpcCbQueryLaunchFamily*;
+                  cuphyLdpcCbPreparedLaunchGetWorkspaceSize*;
+                  cuphyLdpcCbPreparedLaunchInitInPlace*;
+                  cuphyLdpcCbPrepareLaunch*;
+                  cuphyLdpcCbGetKernelNodeParams*;
+                  cuphyLdpcCbPreparedLaunchDeinit*;
                };
+                cuphySetDelayKernelNodeParams;
                 cuphySetEmptyKernelNodeParams;
                 cuphySetGenericEmptyKernelNodeParams;
                 cuphySetGenericEmptyKernelNodeGridConstantParams;
@@ -43,7 +58,6 @@
                 cuphyGetTensorSizeInBytes;
                 cuphyGetDataTypeString;
                 cuphyConvertTensor;
-                cuphyBfcCoefCompute;
                 cuphyChannelEst1DTimeFrequency;
                 cuphyPuschRxChEstGetDescrInfo;
                 cuphyCreateTrtEngine;
@@ -110,6 +124,7 @@
                 cuphyModulationGetDescrInfo;
                 cuphySetupModulation;
                 cuphyPdcchPipelinePrepare;
+                cuphyPdcchFusedTxKernelSelect;
                 cuphyCsirsKernelSelect;
                 cuphyCsirsRxKernelSelect;
                 cuphySetupPdschCsirsPreprocessing;

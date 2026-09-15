@@ -14,23 +14,54 @@
 # limitations under the License.
 
 import fileinput
+import os
+import re
 import argparse
 
 
-def update_para(filepath, paramname, newvalue):
-    param_line = "#define " + paramname
-    # Open the file in read mode
+def update_para_yaml(filepath, paramname, newvalue):
+    """Replace the scalar value of a top-level YAML key, preserving any inline comment.
+
+    cuMAC example parameters now live in cuMAC/examples/parameters.yaml and are
+    loaded at runtime (see cuMAC/examples/parameters.cpp). Lines look like:
+
+        numActiveUePerCellConst: 500  # 100, 500, 1200. should be <= 2048
+
+    This rewrites only the value token, keeping the trailing comment intact.
+    """
+    # ^<key>: <value><rest-of-line (e.g. inline comment)>
+    pattern = re.compile(rf'^(\s*{re.escape(paramname)}\s*:\s*)(\S+)(.*)$')
+    matched = False
     with fileinput.FileInput(filepath, inplace=True) as file:
-        # Iterate over the lines in the file
         for line in file:
-            # Check if the line contains the parameter name
+            m = pattern.match(line)
+            if m:
+                matched = True
+                line = f"{m.group(1)}{newvalue}{m.group(3)}\n"
+            print(line, end='')
+    if not matched:
+        # fileinput already streamed the (unmodified) file to stdout/back;
+        # surface the miss so callers see it in the log.
+        print(f"WARNING: key '{paramname}' not found in {filepath}")
+
+
+def update_para_header(filepath, paramname, newvalue):
+    """Legacy fallback: replace a `#define NAME VALUE` line in a C header."""
+    param_line = "#define " + paramname
+    with fileinput.FileInput(filepath, inplace=True) as file:
+        for line in file:
             if param_line in line:
-                # Replace the line with the new value
                 line = f" {param_line}          {newvalue}\n"
-            # Print the line (with the modified value) to the file
             print(line, end='')
 
-    # print(f"Value of {paramname} changed to {newvalue}")
+
+def update_para(filepath, paramname, newvalue):
+    """Dispatch to the YAML or legacy-header updater based on file extension."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in (".yaml", ".yml"):
+        update_para_yaml(filepath, paramname, newvalue)
+    else:
+        update_para_header(filepath, paramname, newvalue)
 
 
 def parse_args():

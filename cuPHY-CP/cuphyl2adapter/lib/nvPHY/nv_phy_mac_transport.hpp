@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,9 +23,11 @@
 #include "yaml.hpp"
 #include "nvlog.hpp"
 
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <atomic>
+#include <utility>
 
 namespace nv
 {
@@ -70,15 +72,32 @@ public:
 class phy_mac_transport
 {
 public:
-    //------------------------------------------------------------------
-    // phy_mac_transport()
-    phy_mac_transport(nv_ipc_config_t& config);
-    phy_mac_transport(yaml::node node_config, nv_ipc_module_t module_type, uint32_t cell_num, int32_t transport_id = 0, bool map_enable = false);
+    /**
+     * Construct from a populated NVIPC configuration (e.g. after load_nv_ipc_yaml_config).
+     *
+     * @param[in,out] config      NVIPC settings passed to create_nv_ipc_interface (stored in config_).
+     * @param[in]     cell_num_in MAC cell count used for bookkeeping and phy_cell mapping limits.
+     */
+    phy_mac_transport(nv_ipc_config_t& config, uint32_t cell_num_in);
+
+    /**
+     * Construct by parsing NVIPC fields from a YAML node, then opening the IPC interface.
+     *
+     * For SHM primary modules, per-pool pool_len values from YAML are multiplied by @p cell_num_in so total
+     * SHM capacity scales with the number of cells.
+     *
+     * @param[in] node_config      YAML subtree containing NVIPC / transport settings.
+     * @param[in] module_type      MAC, PHY, or primary module role for parsing and validation.
+     * @param[in] cell_num_in      Number of MAC cells (SHM pool scaling, phy_cells list size).
+     * @param[in] transport_id_in  Logical transport id for multi-transport logging and mapping.
+     * @param[in] map_enable       When true, enables mapped / pinned buffer paths as configured.
+     */
+    phy_mac_transport(yaml::node node_config, nv_ipc_module_t module_type, uint32_t cell_num_in, int32_t transport_id_in = 0, bool map_enable = false);
     phy_mac_transport(phy_mac_transport&& t) :
+        ipc_(std::move(t.ipc_)),
         config_(std::move(t.config_)),
         mapped(std::move(t.mapped)),
-        transport_id(std::move(t.transport_id)),
-        ipc_(std::move(t.ipc_))
+        transport_id(std::move(t.transport_id))
     {
     }
     //------------------------------------------------------------------
@@ -90,7 +109,7 @@ public:
     }
     //------------------------------------------------------------------
     // tx_post()
-    // (throws std::system_error on error)    
+    // (throws std::system_error on error)
     void tx_post()
     {
         if(0 != ipc_->tx_tti_sem_post(ipc_.get())) throw std::system_error(errno, std::generic_category(), "ipc connection error");
@@ -199,17 +218,17 @@ public:
 
     /**
      * Sets the started state for a specific PHY cell in the cells mask
-     * 
+     *
      * Updates the internal bitmask to track which PHY cells are currently started/running.
      * Each bit in the mask represents a cell ID, where bit position corresponds to the cell ID.
      * This is used to track the operational state of individual cells in the transport.
-     * 
+     *
      * @param[in] phy_cell_id The PHY cell ID to set the state for (0-63)
      * @param[in] started True to mark the cell as started, false to mark as stopped
      */
     void set_started_cells_mask(int32_t phy_cell_id, bool started) {
         // Check if the cell_id is out of range
-        if (phy_cell_id < 0 || phy_cell_id >= sizeof(started_cells_mask) * 8) {
+        if (phy_cell_id < 0 || phy_cell_id >= std::numeric_limits<uint64_t>::digits) {
             throw std::system_error(errno, std::generic_category(), "phy_cell_id out of range for the started_cells_mask");
         }
 

@@ -16,13 +16,42 @@
 import json
 import numpy as np
 import os
+import subprocess
 import uuid
 import sys
 import yaml
+from typing import Optional
 
 from .traffic import traffic_avg, traffic_het
 from .execute import run
 from .check_cell_capacity import check_cell_capacity
+
+
+def _fix_testcases(lst: Optional[list[str]], k: int) -> Optional[list[str]]:
+    """Return exactly k testcase IDs cycling over lst; None → None, k<=0 → unchanged."""
+    if lst is None or k <= 0:
+        return lst
+    if len(lst) == 0:
+        return lst
+    return [lst[i % len(lst)] for i in range(k)]
+
+
+def _active_cell_count(*testcase_lists: Optional[list[str]]) -> int:
+    return max((len(lst) for lst in testcase_lists if lst is not None), default=0)
+
+
+def _git_commit_id(short_len: int = 8) -> Optional[str]:
+    """Return the aerial_sdk HEAD commit id truncated to short_len chars, or None if unavailable."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    return out[:short_len] if out else None
+
 
 def run_TDD(args, sms, mig=None):
 
@@ -66,7 +95,10 @@ def run_TDD(args, sms, mig=None):
                     if(int(buffer_target) > sms):
                         print(f"Warning: SM target ({buffer_target}) capped by maxSmCount ({sms}) on {args.gpuName}")
                     
-                    output = buffer_target.zfill(3) + "_" + output
+                    prefix = buffer_target.zfill(3)
+                    if getattr(args, 'is_use_green_contexts', False):
+                        prefix += "_gc"
+                    output = prefix + "_" + output
                 else:
                     ifile = open(buffer_target, "r")
                     data_targets = json.load(ifile)
@@ -86,7 +118,10 @@ def run_TDD(args, sms, mig=None):
                         raise ValueError
 
                 buffer = [x.zfill(3) for x in args.target]
-                output = "_".join(buffer) + "_" + output
+                prefix = "_".join(buffer)
+                if getattr(args, 'is_use_green_contexts', False):
+                    prefix += "_gc"
+                output = prefix + "_" + output
         else:
             raise NotImplementedError
 
@@ -101,13 +136,19 @@ def run_TDD(args, sms, mig=None):
 
     if not args.is_no_mps:
         if mig is None:
-            system = f"CUDA_VISIBLE_DEVICES={args.gpu} CUDA_MPS_PIPE_DIRECTORY=. CUDA_LOG_DIRECTORY=."
+            system = (
+                f"CUDA_VISIBLE_DEVICES={args.gpu} CUDA_MPS_PIPE_DIRECTORY=. "
+                "CUDA_MPS_LOG_DIRECTORY=. CUDA_LOG_DIRECTORY=."
+            )
         else:
             os.mkdir(mig_gpu)
             if args.is_test:
                 print(f"Created: {mig_gpu}")
 
-            system = f"CUDA_VISIBLE_DEVICES={mig} CUDA_MPS_PIPE_DIRECTORY={mig_gpu} CUDA_LOG_DIRECTORY={mig_gpu}"
+            system = (
+                f"CUDA_VISIBLE_DEVICES={mig} CUDA_MPS_PIPE_DIRECTORY={mig_gpu} "
+                f"CUDA_MPS_LOG_DIRECTORY={mig_gpu} CUDA_LOG_DIRECTORY={mig_gpu}"
+            )
 
         # only enable MPS if not running in green contexts mode or if it was explicitly enabled; terminate otherwise.
         if not args.is_use_green_contexts:
@@ -115,16 +156,17 @@ def run_TDD(args, sms, mig=None):
         elif args.is_enable_mps_for_green_contexts:
             system = " ".join([system, "nvidia-cuda-mps-control -d"])
         else:
-            # If there is no MPS running to terminate, the following command will show an informative "Cannot find MPS control daemon process" message.
-            system = f"echo quit | CUDA_VISIBLE_DEVICES={args.gpu} CUDA_MPS_PIPE_DIRECTORY=. CUDA_LOG_DIRECTORY=. nvidia-cuda-mps-control"
-            system = " ".join([system])
+            system = (
+                "if pgrep -f '(^|/)nvidia-cuda-mps-control -d$' >/dev/null; then "
+                f"echo quit | CUDA_VISIBLE_DEVICES={args.gpu} "
+                "CUDA_MPS_PIPE_DIRECTORY=. CUDA_LOG_DIRECTORY=. "
+                "nvidia-cuda-mps-control; fi"
+            )
 
         if args.is_test:
-            if args.debug_mode not in ["ncu"]:
-                print(system)
+            print(system)
 
-        if args.debug_mode not in ["ncu"]:
-            os.system(system)
+        os.system(system)
 
     k = args.start
 
@@ -136,6 +178,11 @@ def run_TDD(args, sms, mig=None):
         d = dict(vars(args))
         d.pop("inline_config_obj", None)
         d.pop("inline_uc_obj", None)
+        commit = _git_commit_id()
+        if not commit:
+            print("Warning: could not resolve aerial_sdk git commit id; recording git_commit=unknown", file=sys.stderr)
+            commit = "unknown"
+        d["git_commit"] = commit
         return d
 
     def _load_mac_slot_and_light_weight(yaml_path, pattern):
@@ -153,7 +200,9 @@ def run_TDD(args, sms, mig=None):
                     ycfg = yaml.safe_load(f) or {}
                 cfg = ycfg.get("config") if isinstance(ycfg.get("config"), dict) else {}
                 tdd_slot = cfg.get("tdd_slot_config") or {}
-                slot_cfg = tdd_slot.get(pattern) if isinstance(tdd_slot, dict) else {}
+                # Channel-only YAML may omit tdd_slot_config entries; treat as empty.
+                slot_cfg_raw = tdd_slot.get(pattern) if isinstance(tdd_slot, dict) else None
+                slot_cfg = slot_cfg_raw if isinstance(slot_cfg_raw, dict) else {}
                 if isinstance(slot_cfg.get("MAC"), list):
                     mac_slot_config = slot_cfg["MAC"]
                 cumac_opts = cfg.get("cumac_options") or {}
@@ -175,6 +224,30 @@ def run_TDD(args, sms, mig=None):
     yaml_path = getattr(args, "yaml", None)
     pattern = getattr(args, "pattern", None)
     mac_slot_config, cumac_light_weight_flag = _load_mac_slot_and_light_weight(yaml_path, pattern)
+
+    # Save tdd_priorities from YAML so compare.py can show them without needing the YAML file.
+    _tdd_prio = None
+    if yaml_path:
+        extra_yaml_paths = (
+            [os.path.join(os.getcwd(), os.path.basename(yaml_path))]
+            if os.path.isabs(yaml_path) and not os.path.isfile(yaml_path)
+            else []
+        )
+        for _p in [yaml_path] + extra_yaml_paths:
+            try:
+                with open(_p, "r", encoding="utf-8") as _yf:
+                    _ycfg = yaml.safe_load(_yf) or {}
+                _tdd_prio = (_ycfg.get("config") or {}).get("tdd_priorities")
+                if _tdd_prio:
+                    break
+            except (yaml.YAMLError, FileNotFoundError, TypeError, OSError):
+                continue
+    if _tdd_prio:
+        if args.is_power:
+            powers['testConfig']['tdd_priorities'] = _tdd_prio
+        else:
+            sweeps['testConfig']['tdd_priorities'] = _tdd_prio
+
     if mac_slot_config is not None:
         if args.is_power:
             powers['testConfig']['mac_slot_config'] = mac_slot_config
@@ -268,22 +341,43 @@ def run_TDD(args, sms, mig=None):
 
             print(message)
 
+            # Apply per-direction cell count fix if requested
+            _fix_ul = getattr(args, "fix_ul_cell_count", -1)
+            _fix_dl = getattr(args, "fix_dl_cell_count", -1)
+            if _fix_ul > 0:
+                testcases_ul = _fix_testcases(testcases_ul, _fix_ul)
+            if _fix_dl > 0:
+                testcases_dl = _fix_testcases(testcases_dl, _fix_dl)
+            both_fixed = _fix_ul > 0 and _fix_dl > 0
+            if both_fixed:
+                cells_for_run = max(_fix_ul, _fix_dl)
+                print(
+                    f"Both fix_ul ({_fix_ul}) and fix_dl ({_fix_dl}) are set — "
+                    f"running once at {cells_for_run} cells, skipping the rest of the sweep."
+                )
+            else:
+                cells_for_run = k
+
             traffic_het(
                 args,
                 vectors,
-                k,
+                cells_for_run,
                 (testcases_dl, testcases_ul),
                 (filenames_dl, filenames_ul),
             )
 
+            run_key = str(cells_for_run).zfill(2)
             if args.is_power:
-                powers[str(k).zfill(2)] = run(
-                    args, mig, mig_gpu, command, vectors, mode, target, k, k
+                powers[run_key] = run(
+                    args, mig, mig_gpu, command, vectors, mode, target, cells_for_run, cells_for_run
                 )
             else:
-                sweeps[str(k).zfill(2)] = run(
-                    args, mig, mig_gpu, command, vectors, mode, target, k, k
+                sweeps[run_key] = run(
+                    args, mig, mig_gpu, command, vectors, mode, target, cells_for_run, cells_for_run
                 )
+
+            if both_fixed:
+                break
 
         elif "_avg_" in args.uc:
 
@@ -307,6 +401,8 @@ def run_TDD(args, sms, mig=None):
                             new_interval[subcase][ch_key] = [testcase_id] * k
                 uc[peak_key] = new_interval
             interval = uc[peak_key]
+
+            both_fixed = False  # may be set inside the subcase loop; guard for empty interval
 
             for subcase in interval.keys():
 
@@ -357,7 +453,9 @@ def run_TDD(args, sms, mig=None):
                 testcases_mac2 = None
                 filenames_mac2 = None
 
-                if args.is_rec_bf:
+                # DLBFW TVs: full reciprocal BF or DL-BFW-only isolation (--dl_bf_only).
+                # getattr: unit-test parser and other callers may omit channel-only flags.
+                if args.is_rec_bf or getattr(args, "is_dl_bf_only", False):
                     uc_dlbf = [x for x in uc_keys if "DLBFW" in x]
                     if len(uc_dlbf) != 1:
                         sys.exit(
@@ -369,6 +467,20 @@ def run_TDD(args, sms, mig=None):
                     testcases_dlbf = interval[subcase][uc_dlbf]
                     filenames_dlbf = config[uc_dlbf]
 
+                # SRS-only isolation: separate from --rec_bf (which also enables UL-BFW).
+                if getattr(args, "is_srs_only", False):
+                    uc_sr = [x for x in uc_keys if "SRS" in x]
+                    if len(uc_sr) != 1:
+                        sys.exit(
+                            "error: use case file exhibits an unexpected structure (SRS)"
+                        )
+                    else:
+                        uc_sr = uc_sr[0]
+
+                    testcases_sr = interval[subcase][uc_sr]
+                    filenames_sr = config[uc_sr]
+
+                if args.is_rec_bf:
                     uc_ulbf = [x for x in uc_keys if "ULBFW" in x]
                     if len(uc_ulbf) != 1:
                         sys.exit(
@@ -505,13 +617,47 @@ def run_TDD(args, sms, mig=None):
                 if target is not None:
                     message += "(" + ",".join(list(map(str, target))) + ")"
 
+                # Apply per-direction cell count fix if requested
+                _fix_ul = getattr(args, "fix_ul_cell_count", -1)
+                _fix_dl = getattr(args, "fix_dl_cell_count", -1)
+                if _fix_ul > 0:
+                    testcases_ul   = _fix_testcases(testcases_ul,   _fix_ul)
+                    testcases_ulbf = _fix_testcases(testcases_ulbf, _fix_ul)
+                    testcases_sr   = _fix_testcases(testcases_sr,   _fix_ul)
+                    testcases_ra   = _fix_testcases(testcases_ra,   _fix_ul)
+                    testcases_cul  = _fix_testcases(testcases_cul,  _fix_ul)
+                if _fix_dl > 0:
+                    testcases_dl   = _fix_testcases(testcases_dl,   _fix_dl)
+                    testcases_dlbf = _fix_testcases(testcases_dlbf, _fix_dl)
+                    testcases_cdl  = _fix_testcases(testcases_cdl,  _fix_dl)
+                    testcases_ssb  = _fix_testcases(testcases_ssb,  _fix_dl)
+                    testcases_cr   = _fix_testcases(testcases_cr,   _fix_dl)
+                both_fixed = _fix_ul > 0 and _fix_dl > 0
+                if both_fixed:
+                    active_cells = max(_fix_ul, _fix_dl)
+                    message += f" (fixed ul={_fix_ul}, dl={_fix_dl}, effective={active_cells})"
+
                 print(message)
+
+                if not both_fixed:
+                    active_cells = _active_cell_count(
+                        testcases_dl,
+                        testcases_ul,
+                        testcases_dlbf,
+                        testcases_ulbf,
+                        testcases_sr,
+                        testcases_ra,
+                        testcases_cdl,
+                        testcases_cul,
+                        testcases_ssb,
+                        testcases_cr,
+                    )
 
                 if args.pattern == "dddsu" and args.is_mac == True:
                     sys.exit(
                         "error: cuMAC run with dddsu pattern not supported"
                     )
-                elif args.pattern == "dddsu" and args.is_mac == True:
+                elif args.pattern == "dddsu" and args.mac2 > 0:
                     sys.exit(
                         "error: cuMAC2 run with dddsu pattern not supported"
                     )
@@ -549,8 +695,10 @@ def run_TDD(args, sms, mig=None):
                         ),
                     )
 
+                run_key_cells = active_cells if both_fixed else k
+                run_key = "+".join([str(run_key_cells).zfill(2), str(label).zfill(2)])
                 if args.is_power:
-                    powers["+".join([str(k).zfill(2), str(label).zfill(2)])] = run(
+                    powers[run_key] = run(
                         args,
                         mig,
                         mig_gpu,
@@ -558,11 +706,11 @@ def run_TDD(args, sms, mig=None):
                         vectors,
                         mode,
                         target,
-                        k,
-                        len(testcases_dl),
+                        active_cells,
+                        active_cells,
                     )
                 else:
-                    sweeps["+".join([str(k).zfill(2), str(label).zfill(2)])] = run(
+                    sweeps[run_key] = run(
                         args,
                         mig,
                         mig_gpu,
@@ -570,9 +718,16 @@ def run_TDD(args, sms, mig=None):
                         vectors,
                         mode,
                         target,
-                        k,
-                        len(testcases_dl),
+                        active_cells,
+                        active_cells,
                     )
+
+            if both_fixed:
+                print(
+                    f"Both fix_ul ({_fix_ul}) and fix_dl ({_fix_dl}) are set — "
+                    f"covered all subcases at {active_cells} cells, skipping the rest of the sweep."
+                )
+                break
         else:
             raise NotImplementedError
 

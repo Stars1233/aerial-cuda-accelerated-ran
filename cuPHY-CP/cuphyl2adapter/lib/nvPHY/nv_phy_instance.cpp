@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,3 +16,17 @@
  */
 
 #include "nv_phy_instance.hpp"
+#include "nv_phy_module.hpp"
+
+namespace nv
+{
+#ifdef ENABLE_FAPI_STORE_REPLAY
+[[nodiscard]] bool PHY_instance::on_msg_to_store(const phy_mac_msg_desc& msg, uint32_t slot_u32)
+{
+    // Route storage-only messages through the PHY_module without processing.
+    // PHY_module::store_message is defined in the store-replay-gated translation
+    // unit; this routing only exists on that path (callers are gated too).
+    return phy_module().store_message(msg, slot_u32);
+}
+#endif
+} // namespace nv

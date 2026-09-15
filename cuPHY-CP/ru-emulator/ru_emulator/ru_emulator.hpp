@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <memory>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <mutex>
 #include "aerial-fh-driver/fh_mutex.hpp"
@@ -47,14 +48,21 @@ using FssDynBfwBeamIdArray = std::array<std::array<std::array<std::array<std::ar
 using FssDisabledBfwDynBfwBeamIdArray = std::array<std::array<std::array<std::array<std::array<std::array<uint64_t, 4>, ORAN_MAX_PRB_X_SLOT>, SLOT_NUM_SYMS>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_AP_PER_SLOT>, MAX_CELLS_PER_SLOT>;
 using FssDisabledBfwDynBfwBeamIdCntArray = std::array<std::array<std::array<std::array<std::atomic<int>, SLOT_NUM_SYMS>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_AP_PER_SLOT>, MAX_CELLS_PER_SLOT>;
 using FssDynBfwBeamIdLastValidationTsArray = std::array<std::array<std::array<std::atomic<uint64_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_AP_PER_SLOT>, MAX_CELLS_PER_SLOT>;
+using FssDynBfwBeamIdSlotEpochArray = std::array<std::array<std::array<std::atomic<uint32_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_AP_PER_SLOT>, MAX_CELLS_PER_SLOT>;
 using FssDynBfwBeamIdMtxArray = std::array<std::array<std::array<aerial_fh::FHMutex, MAX_LAUNCH_PATTERN_SLOTS>, MAX_AP_PER_SLOT>, MAX_CELLS_PER_SLOT>;
+// Warmup phase stored as uint8_t (DynBfwBeamIdWarmupPhase); visit marker is abs_slot+1 (0=unset).
+using FssDynBfwBeamIdWarmupPhaseArray = std::array<std::array<std::array<std::atomic<uint8_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_AP_PER_SLOT>, MAX_CELLS_PER_SLOT>;
+using FssDynBfwBeamIdWarmupVisitArray = std::array<std::array<std::array<std::atomic<uint64_t>, MAX_LAUNCH_PATTERN_SLOTS>, MAX_AP_PER_SLOT>, MAX_CELLS_PER_SLOT>;
 using FssPdschPrbSeenArray = std::array<std::array<std::unordered_map<int, std::unordered_map<int, std::array<std::unordered_map<uint16_t, uint16_t>, OFDM_SYMBOLS_PER_SLOT>>>, MAX_FLOWS_PER_DL_CORE>, MAX_CELLS_PER_SLOT>;
 
 #define fss_dyn_bfw_beam_id (*RU_Emulator::fss_dyn_bfw_beam_id_ptr)
 #define fss_disabled_bfw_dyn_bfw_beam_id (*RU_Emulator::fss_disabled_bfw_dyn_bfw_beam_id_ptr)
 #define fss_disabled_bfw_dyn_bfw_beam_id_cnt (*RU_Emulator::fss_disabled_bfw_dyn_bfw_beam_id_cnt_ptr)
-#define fss_dyn_bfw_beam_id_last_validation_ts (*RU_Emulator::fss_dyn_bfw_beam_id_last_validation_ts_ptr)
-#define fss_dyn_bfw_beam_id_mtx (*RU_Emulator::fss_dyn_bfw_beam_id_mtx_ptr)
+#define FSS_DYN_BFW_BEAM_ID_LAST_VALIDATION_TS (*RU_Emulator::fss_dyn_bfw_beam_id_last_validation_ts_ptr)
+#define FSS_DYN_BFW_BEAM_ID_SLOT_EPOCH (*RU_Emulator::fss_dyn_bfw_beam_id_slot_epoch_ptr_)
+#define FSS_DYN_BFW_BEAM_ID_MTX (*RU_Emulator::fss_dyn_bfw_beam_id_mtx_ptr_)
+#define FSS_DYN_BFW_BEAMID_WARMUP_PHASE (*RU_Emulator::fss_dyn_bfw_beamid_warmup_phase_ptr_)
+#define FSS_DYN_BFW_BEAMID_WARMUP_VISIT (*RU_Emulator::fss_dyn_bfw_beamid_warmup_visit_ptr_)
 
 void *cplane_core_wrapper(void *arg);
 void *uplane_proc_rx_core_wrapper(void *arg);
@@ -189,6 +197,17 @@ class RU_Emulator
          * @param[out] pdu_info PDU information structure to populate
          */
         void get_ul_ports(hdf5hpp::hdf5_dataset_elem &pdu_pars, pdu_info &pdu_info);
+        /**
+         * Extract uplink port information when digBFInterfaces is already known
+         *
+         * Overload for callers that already read digBFInterfaces (e.g. via
+         * try_read_beam_ids_from_pdu), avoiding a redundant per-PDU HDF5 read.
+         *
+         * @param[in] pdu_pars PDU parameters dataset element
+         * @param[out] pdu_info PDU information structure to populate
+         * @param[in] digBFInterfaces Pre-read number of digital beamforming interfaces
+         */
+        void get_ul_ports(hdf5hpp::hdf5_dataset_elem &pdu_pars, pdu_info &pdu_info, uint16_t digBFInterfaces);
 
         /**
          * Parse a specific channel from the launch pattern
@@ -472,10 +491,39 @@ class RU_Emulator
         //// CPLANE
         /////////////////////////////////////////////////////
         /**
-         * Main C-plane processing core worker thread
+         * @brief Main C-plane processing core worker thread.
          *
-         * @param[in] arg Thread argument containing core parameters
+         * Each instance of this function runs as a dedicated pthread, pinned to
+         * the CPU specified in its @c cplane_core_param.  The thread owns a
+         * local @c slot_tx_info and follows a receive-parse-transmit loop:
+         *
+         *  1. **Receive** – calls @c receive_packets() which invokes
+         *     `aerial_fh::receive(peer_list[cell_index], …)` to burst-dequeue
+         *     C-plane messages for its assigned cell(s).
+         *  2. **Parse & validate** – iterates over received messages, calling
+         *     @c parse_c_plane(), @c verify_dl_cplane_content() (DL), or
+         *     @c verify_ul_cplane_content() (UL).
+         *  3. **Transmit** – calls @c tx_slot() or @c tx_slot_precomputed() to
+         *     generate and enqueue U-plane packets, then updates throughput
+         *     counters via @c update_ul_throughput_counters().
+         *
+         * @par Threading model and cell assignment
+         *
+         * Cell-to-thread mapping is computed by @c get_cell_cpu_assignment()
+         * and encoded in @c cplane_core_param::start_cell_index /
+         * @c num_cells_per_core.  When more UL cores are configured than
+         * cells, multiple threads share the same @c cell_index and dequeue
+         * from the same @c peer_list[cell_index].  See
+         * @c get_cell_cpu_assignment() for the full assignment algorithm and
+         * typical CI/CD configurations.
+         *
+         * @param[in] arg Pointer to a @c cplane_core_param struct
          * @return nullptr on thread exit
+         *
+         * @see get_cell_cpu_assignment
+         * @see cplane_core_param
+         * @see increment_section_rx_counter
+         * @see increment_section_rx_counter_v2
          */
         void *cplane_core(void *arg);
 
@@ -584,19 +632,53 @@ class RU_Emulator
         void tx_symbol(Slot& slot, tx_symbol_helper& tx_symbol_info, void * blank_prbs, tx_symbol_timers& timers, uint8_t section_type, aerial_fh::UPlaneMsgMultiSectionSendInfo& uplane_msg);
 
         /**
-         * Increment section receive counter for a specific symbol
+         * @brief Increment section receive counter for a specific symbol (v1,
+         *        used in the mMIMO path).
+         *
+         * Called once per OFDM symbol from @c update_ul_throughput_counters()
+         * when @c opt_enable_mmimo is true, or from @c verify_ul_cplane_content()
+         * when @c opt_dlc_tb is enabled.
+         *
+         * @par Slot completion
+         *
+         * Uses the atomic summation counter @c prb_rx_counters to detect
+         * when all expected PRBs for a slot have been received.
+         * The summation-counter path uses atomic @c fetch_add.
+         *
+         * @note PRB duplicate detection has been moved to
+         * @c verify_ul_cplane_content() using the unified
+         * @c ul_prb_trackers_ array.
          *
          * @param[in] c_plane_info C-plane packet information
          * @param[in] cell_index Cell identifier
          * @param[in] sym Symbol index
+         *
+         * @see increment_section_rx_counter_v2
          */
         void increment_section_rx_counter(oran_c_plane_info_t& c_plane_info, uint16_t cell_index, int sym);
 
         /**
-         * Increment section receive counter (version 2, symbol-agnostic)
+         * @brief Increment section receive counter, processing all symbols in
+         *        a section at once (v2, used in the non-mMIMO path).
+         *
+         * Called from @c update_ul_throughput_counters() when
+         * @c opt_enable_mmimo is false.  Unlike v1, this function iterates
+         * over @c section_info.numSymbol internally (for non-SINGLE_SECT_MODE)
+         * rather than being called per-symbol by the caller.
+         *
+         * @par Slot completion
+         *
+         * Uses the atomic summation counter to detect when all expected
+         * PRBs for a slot have been received.
+         *
+         * @note PRB duplicate detection has been moved to
+         * @c verify_ul_cplane_content() using the unified
+         * @c ul_prb_trackers_ array.
          *
          * @param[in] c_plane_info C-plane packet information
          * @param[in] cell_index Cell identifier
+         *
+         * @see increment_section_rx_counter
          */
         void increment_section_rx_counter_v2(oran_c_plane_info_t& c_plane_info, uint16_t cell_index);
 
@@ -1136,6 +1218,96 @@ class RU_Emulator
         void dynamic_beamid_validation(oran_c_plane_info_t &c_plane_info, int cell_index);
 
         /**
+         * Result flags from the per-key dynamic BFW beam-ID warmup gate.
+         */
+        struct DynBfwBeamIdWarmupGate
+        {
+            bool skip_save = false;     //!< Skip cache writes and disableBFWs=1 ref recording
+            bool skip_validate = false; //!< Skip delayed validation for this key
+        };
+
+        /**
+         * Gate for dynamic BFW beam ID save/validate during RU mid-stream join.
+         *
+         * Per-(cell, eAxC, launch_pattern_slot) — not RU-global — so one key's Observe/Prime
+         * cannot stall or invalidate another's Done state (64TR UL ontime).
+         *
+         * Visit-based (not wall-clock): one radio-slot occurrence of this key per phase so
+         * Observe→Prime never fires mid-burst inside the same FSS (that caused BFW IQ ERRORs
+         * and CON log storms with a 2000 us cap).
+         * 1) Observe — first visit: skip save+validate; on next visit Resetting invalidates
+         *    that key and enters Prime.
+         * 2) Prime — second visit: allow save, skip validate; on next visit Finishing clears
+         *    refs and enters Done (normal save + delayed validate).
+         *
+         * Lock-free per-key phase machine (atomics / CAS); no get_ns() on the warmup path.
+         *
+         * @param[in] cell_index Cell identifier
+         * @param[in] eaxc_index Antenna-carrier (eAxC) index within the cell
+         * @param[in] launch_pattern_slot Launch-pattern slot index
+         * @param[in] frameId O-RAN frame ID for this Ext11
+         * @param[in] subframeId O-RAN subframe ID for this Ext11
+         * @param[in] slotId O-RAN slot ID for this Ext11
+         * @return Return value must be checked. Contains skip_save / skip_validate flags for this packet.
+         */
+        [[nodiscard]] DynBfwBeamIdWarmupGate dyn_bfw_beamid_warmup_gate(int cell_index,
+                                                                       int eaxc_index,
+                                                                       int launch_pattern_slot,
+                                                                       uint8_t frameId,
+                                                                       uint8_t subframeId,
+                                                                       uint8_t slotId);
+
+        enum class DynBfwBeamIdWarmupPhase : uint8_t
+        {
+            Observe = 0,    //!< Skip save + validate for one radio-slot visit of this key
+            Resetting = 1,  //!< Invalidate this key's cache; still skip save
+            Prime = 2,      //!< Allow save, skip validate for one radio-slot visit
+            Finishing = 3,  //!< Clear this key's refs/timestamps; still skip save
+            Done = 4        //!< Normal save + delayed validate (develop cadence)
+        };
+
+        /**
+         * Invalidates one (cell, eAxC, slot) beam-ID cache (slot epoch → not live), clears
+         * that key's disableBFWs=1 refs, full-BW set, and validation timestamp.
+         * O(1) — does not walk PRB arrays or touch other keys.
+         *
+         * @param[in] cell_index Cell identifier
+         * @param[in] eaxc_index Antenna-carrier (eAxC) index within the cell
+         * @param[in] slot Launch-pattern slot index
+         */
+        void reset_dyn_bfw_beamid_slot_cache(int cell_index, int eaxc_index, int slot);
+
+        /**
+         * Clears disableBFWs=1 refs and validation timestamp for one (cell, eAxC, slot).
+         * Safe without the beam-ID mutex when the caller has published Finishing (skip_save).
+         *
+         * @param[in] cell_index Cell identifier
+         * @param[in] eaxc_index Antenna-carrier (eAxC) index within the cell
+         * @param[in] slot Launch-pattern slot index
+         */
+        void reset_dyn_bfw_beamid_slot_refs_and_ts(int cell_index, int eaxc_index, int slot);
+
+        /**
+         * True when this cell/eAxC/slot cache was written under the current cache epoch.
+         *
+         * @param[in] cell_index Cell identifier
+         * @param[in] eaxc_index Antenna-carrier (eAxC) index within the cell
+         * @param[in] slot Launch-pattern slot index
+         * @return Return value must be checked. True if the slot cache is live for the
+         *         current epoch; false if unset, out of range, or invalidated by an epoch bump.
+         */
+        [[nodiscard]] bool dyn_bfw_beamid_slot_cache_live(int cell_index, int eaxc_index, int slot) const;
+
+        /**
+         * Mark cell/eAxC/slot cache as live under the current cache epoch (after a save/adopt).
+         *
+         * @param[in] cell_index Cell identifier
+         * @param[in] eaxc_index Antenna-carrier (eAxC) index within the cell
+         * @param[in] slot Launch-pattern slot index
+         */
+        void dyn_bfw_beamid_mark_slot_cache_live(int cell_index, int eaxc_index, int slot);
+
+        /**
          * Validates C-plane section IDs for default coupling (range and duplicate consistency) using the given DL tracker.
          * @param[in,out] c_plane_info C-plane message info; sections and eAxC index used for lookup.
          * @param[in] cell_index Cell index for tracker and counters.
@@ -1284,7 +1456,19 @@ class RU_Emulator
         };
 
         /**
-         * C-plane core worker thread parameters
+         * @brief Parameters passed to each cplane_core worker pthread.
+         *
+         * Populated by @c start() from the output of
+         * @c get_cell_cpu_assignment() and used by @c cplane_core() to
+         * determine which cell(s) the thread services.
+         *
+         * When multiple threads share the same @c start_cell_index (the
+         * multi-thread-per-cell topology), they concurrently dequeue from
+         * the same fronthaul peer and must synchronise on shared per-cell
+         * counter structures.
+         *
+         * @see get_cell_cpu_assignment
+         * @see cplane_core
          */
         struct cplane_core_param
         {
@@ -1434,6 +1618,28 @@ class RU_Emulator
         int opt_srs_enabled;                             //!< Enable SRS channel processing and transmission
         int opt_dl_enabled;                              //!< Enable downlink data processing (PDSCH/PBCH/PDCCH/CSI-RS)
         int opt_dlc_tb;                                  //!< Enable DL C-plane transport block mode (skip IQ validation, buffer is nullptr)
+        int opt_prb_dup_check;                           //!< Enable C-plane PRB duplicate/missing detection via bitmap
+
+        /**
+         * @brief Per-cell flag indicating whether PRB tracker access requires
+         *        mutex synchronisation.
+         *
+         * Set to @c true for cells that are serviced by more than one
+         * @c cplane_core worker thread (UL or SRS).  When @c false, the
+         * tracker is accessed by exactly one thread and the per-eAxC mutex
+         * can be skipped, eliminating lock overhead on the real-time
+         * C-plane processing path.
+         *
+         * Used by both DL (@c dl_cplane_prb_trackers) and the unified UL
+         * tracker (@c ul_prb_trackers_).
+         *
+         * Populated once by @c start() after computing the UL and SRS
+         * cell-to-thread assignments.
+         *
+         * @see get_cell_cpu_assignment
+         */
+        std::array<bool, MAX_CELLS_PER_SLOT> prb_tracker_needs_lock_{};
+
         int opt_mod_comp_enabled;                        //!< Enable modulation compression for IQ data
         int opt_non_mod_comp_enabled;                    //!< Enable BFP/FIX_POINT for IQ data
         
@@ -1613,17 +1819,65 @@ class RU_Emulator
             fss_disabled_bfw_dyn_bfw_beam_id_ptr = std::make_unique<FssDisabledBfwDynBfwBeamIdArray>();
             fss_dyn_bfw_beam_id_last_validation_ts_ptr = std::make_unique<FssDynBfwBeamIdLastValidationTsArray>();
             for (auto& cell : *fss_dyn_bfw_beam_id_last_validation_ts_ptr)
-              for (auto& ap : cell)
-                for (auto& slot : ap)
-                  slot.store(0, std::memory_order_relaxed);
+            {
+                for (auto& ap : cell)
+                {
+                    for (auto& slot : ap)
+                    {
+                        slot.store(0, std::memory_order_relaxed);
+                    }
+                }
+            }
 
             fss_disabled_bfw_dyn_bfw_beam_id_cnt_ptr = std::make_unique<FssDisabledBfwDynBfwBeamIdCntArray>();
             for (auto& cell : *fss_disabled_bfw_dyn_bfw_beam_id_cnt_ptr)
-              for (auto& ap : cell)
-                for (auto& slot : ap)
-                  for (auto& sym : slot)
-                     sym.store(0, std::memory_order_relaxed);
-            fss_dyn_bfw_beam_id_mtx_ptr = std::make_unique<FssDynBfwBeamIdMtxArray>();
+            {
+                for (auto& ap : cell)
+                {
+                    for (auto& slot : ap)
+                    {
+                        for (auto& sym : slot)
+                        {
+                            sym.store(0, std::memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+            fss_dyn_bfw_beam_id_mtx_ptr_ = std::make_unique<FssDynBfwBeamIdMtxArray>();
+            fss_dyn_bfw_beam_id_slot_epoch_ptr_ = std::make_unique<FssDynBfwBeamIdSlotEpochArray>();
+            for (auto& cell : *fss_dyn_bfw_beam_id_slot_epoch_ptr_)
+            {
+                for (auto& ap : cell)
+                {
+                    for (auto& slot : ap)
+                    {
+                        slot.store(0, std::memory_order_relaxed);
+                    }
+                }
+            }
+            fss_dyn_bfw_beamid_warmup_phase_ptr_ = std::make_unique<FssDynBfwBeamIdWarmupPhaseArray>();
+            fss_dyn_bfw_beamid_warmup_visit_ptr_ = std::make_unique<FssDynBfwBeamIdWarmupVisitArray>();
+            for (auto& cell : *fss_dyn_bfw_beamid_warmup_phase_ptr_)
+            {
+                for (auto& ap : cell)
+                {
+                    for (auto& slot : ap)
+                    {
+                        slot.store(static_cast<uint8_t>(DynBfwBeamIdWarmupPhase::Observe),
+                                   std::memory_order_relaxed);
+                    }
+                }
+            }
+            for (auto& cell : *fss_dyn_bfw_beamid_warmup_visit_ptr_)
+            {
+                for (auto& ap : cell)
+                {
+                    for (auto& slot : ap)
+                    {
+                        slot.store(0, std::memory_order_relaxed);
+                    }
+                }
+            }
 
             dl_tv_objs = {&pdsch_object, &pbch_object, &pdcch_ul_object, &pdcch_dl_object, &pdsch_object, &csirs_object};
         }
@@ -1769,6 +2023,45 @@ class RU_Emulator
 
         FssPdschPrbSeenArray fss_pdsch_prb_seen;    //!< Tracks PDSCH PRBs seen per FSS for validation
 
+        /**
+         * @brief Per-(cell, eAxC) state for DL C-plane RE-level duplicate detection.
+         *
+         * Holds the RE-level PRB tracker and a packed FSS key identifying the
+         * slot it was last reset for.  When a new slot arrives the caller
+         * compares @c current_fss_key to the incoming value; a mismatch
+         * triggers @c tracker.reset() so stale data from a previous slot
+         * does not produce false positives.
+         *
+         * @note Multiple cplane_core threads may process different C-plane
+         *       messages for the same (cell, eAxC) concurrently.  All access
+         *       to @c tracker and @c current_fss_key must be serialised
+         *       via @c mtx.
+         */
+        struct DlCplanePrbState {
+            CplaneRePrbTracker tracker{};              //!< RE-level PRB allocation tracker (reMask-aware)
+            uint32_t current_fss_key{FSS_KEY_UNUSED};  //!< Packed FSS key the tracker was last reset for
+            aerial_fh::FHMutex mtx{};                  //!< Protects @c tracker and @c current_fss_key
+        };
+        std::array<std::array<DlCplanePrbState, MAX_FLOWS_PER_DL_CORE>, MAX_CELLS_PER_SLOT> dl_cplane_prb_trackers{};
+
+        /**
+         * @brief UL C-plane PRB duplicate detection state for one eAxC
+         *        within one cell (analogous to DlCplanePrbState).
+         *
+         * Uses PRB-level tracking (CplanePrbTracker) and FSS-key-based reset.
+         * The tracker covers all UL channel types (PUSCH/PUCCH/PRACH/SRS)
+         * sharing the same raw eAxC ID, enabling cross-channel overlap detection.
+         */
+        struct UlCplanePrbState {
+            CplanePrbTracker tracker{};
+            uint32_t current_fss_key{FSS_KEY_UNUSED};
+            aerial_fh::FHMutex mtx{};
+        };
+        using UlPrbTrackerArray = std::array<std::array<UlCplanePrbState, MAX_UL_EAXC_UNIFIED>, MAX_CELLS_PER_SLOT>;
+        using UlEaxcLookupArray = std::array<std::unordered_map<uint16_t, uint16_t>, MAX_CELLS_PER_SLOT>;
+        std::unique_ptr<UlPrbTrackerArray> ul_prb_trackers_;
+        std::unique_ptr<UlEaxcLookupArray> ul_eaxc_to_tracker_idx_;
+
         using slot_count_array = std::array<std::array<std::atomic<uint64_t>, MAX_CELLS_PER_SLOT>, ALL_PACKET_TYPES>;
         slot_count_array slot_count;                //!< Slot counters per packet type per cell
 
@@ -1822,6 +2115,15 @@ class RU_Emulator
         ul_tv_object prach_object;                   //!< PRACH test vectors and counters
         ul_tv_object pucch_object;                   //!< PUCCH test vectors and counters
         ul_tv_object srs_object;                     //!< SRS test vectors and counters
+
+        // Test-bench-only deduplication set for PRACH slots keyed by (frame,subframe,slot).
+        // Used by the section-type-3 path in verify_ul_cplane_content to ensure
+        // prach_object.total_slot_counters increments exactly once per actual slot
+        // (mirroring PUSCH's per-slot completion semantics). Only populated when
+        // opt_dlc_tb == 1; production RU / cuBB runs are untouched. Per cell; mutex-guarded
+        // because UL C-plane can be dispatched from multiple rx cores.
+        std::array<aerial_fh::FHMutex, MAX_CELLS_PER_SLOT>   distinct_prach_slots_mtx;
+        std::array<std::unordered_set<uint32_t>, MAX_CELLS_PER_SLOT> distinct_prach_slots_seen;
         void * zero_prbs;                            //!< Buffer of zeros for filling unused PRBs
         bool enable_srs;                             //!< SRS enabled flag
 
@@ -1874,8 +2176,14 @@ class RU_Emulator
         std::unique_ptr<FssDynBfwBeamIdArray> fss_dyn_bfw_beam_id_ptr;                           //!< Dynamic beam IDs per FSS
         std::unique_ptr<FssDisabledBfwDynBfwBeamIdArray> fss_disabled_bfw_dyn_bfw_beam_id_ptr;   //!< Disabled BFW dynamic beam IDs
         std::unique_ptr<FssDisabledBfwDynBfwBeamIdCntArray> fss_disabled_bfw_dyn_bfw_beam_id_cnt_ptr;  //!< Disabled BFW beam ID counts
-        std::unique_ptr<FssDynBfwBeamIdLastValidationTsArray> fss_dyn_bfw_beam_id_last_validation_ts_ptr;  //!< Last validation timestamp per beam ID
-        std::unique_ptr<FssDynBfwBeamIdMtxArray> fss_dyn_bfw_beam_id_mtx_ptr;                    //!< Mutexes for beam ID validation
+        std::unique_ptr<FssDynBfwBeamIdLastValidationTsArray> fss_dyn_bfw_beam_id_last_validation_ts_ptr;  //!< Last validation FSS abs-slot marker (abs+1; 0=unset) per beam ID
+        std::unique_ptr<FssDynBfwBeamIdSlotEpochArray> fss_dyn_bfw_beam_id_slot_epoch_ptr_;              //!< Per-slot cache epoch (matches dyn_bfw_beamid_cache_epoch_ when live)
+        std::unique_ptr<FssDynBfwBeamIdMtxArray> fss_dyn_bfw_beam_id_mtx_ptr_;                    //!< Mutexes for beam ID validation
+        std::unique_ptr<FssDynBfwBeamIdWarmupPhaseArray> fss_dyn_bfw_beamid_warmup_phase_ptr_;   //!< Per-(cell,eAxC,slot) warmup phase
+        std::unique_ptr<FssDynBfwBeamIdWarmupVisitArray> fss_dyn_bfw_beamid_warmup_visit_ptr_; //!< Per-key last radio abs-slot marker (abs+1; 0=unset)
+
+        // Global epoch for O(1) "cache live" checks; per-key warmup clears only that key's slot epoch.
+        std::atomic<uint32_t> dyn_bfw_beamid_cache_epoch_{1}; //!< Non-zero so slot epoch 0 means not-live after init
 
         /////////////////////////////////////////////////////
         //// GLOBAL COUNTERS AND STATISTICS

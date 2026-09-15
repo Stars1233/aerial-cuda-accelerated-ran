@@ -17,8 +17,11 @@
 
 #include "nv_ipc_ring.h"
 #include "fapi_handler.hpp"
-#include <iostream>
+#include <cuda_runtime.h>
+#include <cstdlib>
 #include <fstream>
+#include <iostream>
+#include <stdexcept>
 
 #define TAG (NVLOG_TAG_BASE_TEST_MAC + 2) // "MAC.FAPI"
 
@@ -320,8 +323,7 @@ int fapi_handler::set_restart_timer(int cell_id, int interval)
         }
     }
 
-fapi_handler::fapi_handler(phy_mac_transport& transport, test_mac_configs* configs, launch_pattern* lp, ch8_conformance_test_stats * conformance_test_stats) :
-    _transport(transport)
+fapi_handler::fapi_handler(test_mac_configs* configs, launch_pattern* lp, ch8_conformance_test_stats* conformance_test_stats)
 {
     fapi_handler_instance = this;
 
@@ -396,7 +398,9 @@ fapi_handler::fapi_handler(phy_mac_transport& transport, test_mac_configs* confi
 
     if ((schedule_time = stat_log_open("MAC_SCHED", STAT_MODE_COUNTER, 2000)) != NULL)
     {
-        schedule_time->set_limit(schedule_time, 0, 500);
+        // With fapi_tx_deadline we intentionally finish sending later (e.g. 530–730 us), so slot schedule time exceeds 500 us.
+        const auto mac_sched_limit_us = configs->get_fapi_tx_deadline_enable() ? 1000 : 500;
+        schedule_time->set_limit(schedule_time, 0, mac_sched_limit_us);
     }
     if ((stat_debug = stat_log_open("MAC_DEBUG", STAT_MODE_COUNTER, 2000)) != NULL)
     {
@@ -476,9 +480,21 @@ fapi_handler::fapi_handler(phy_mac_transport& transport, test_mac_configs* confi
     }
 }
 
+void fapi_handler::set_transport(phy_mac_transport* transport)
+{
+    transport_ = transport;
+}
+
+phy_mac_transport& fapi_handler::transport()
+{
+    if (transport_ == nullptr) {
+        throw std::runtime_error("fapi_handler::transport: transport not set");
+    }
+    return *transport_;
+}
+
 fapi_handler::~fapi_handler()
 {
-    lp->~launch_pattern();
     if (schedule_time != NULL)
     {
         schedule_time->close(schedule_time);
@@ -701,6 +717,66 @@ vector<fapi_req_t*>& fapi_handler::get_fapi_req_list(int cell_id, sfn_slot_t ss,
     return fapi_groups[group_id];
 }
 
+const nv::phy_mac_msg_desc* fapi_handler::get_prebuilt_config_req(int cell_id) const
+{
+    if (cell_id < 0 || cell_id >= get_cell_num())
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Invalid cell_id: {}", cell_id);
+        return nullptr;
+    }
+
+    if (config_reqs.empty())
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "config_reqs not populated; call prebuild_downlink_messages() first");
+        return nullptr;
+    }
+
+    const auto map_it = cell_id_map.find(cell_id);
+    if (map_it == cell_id_map.end())
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "cell_id {} missing from cell_id_map", cell_id);
+        return nullptr;
+    }
+    return &config_reqs[static_cast<size_t>(map_it->second)];
+}
+
+std::span<const nv::phy_mac_msg_desc> fapi_handler::get_prebuilt_slot_messages(int cell_id, sfn_slot_t ss) const
+{
+    if (cell_id < 0 || cell_id >= get_cell_num())
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Invalid cell_id: {}", cell_id);
+        return {};
+    }
+
+    if (slot_msgs.empty())
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "slot_msgs not populated; call prebuild_downlink_messages() first");
+        return {};
+    }
+
+    uint32_t slot_pattern_length = lp->get_slot_cell_patterns(get_slot_in_frame(ss)).size();
+    if (slot_pattern_length == 0)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "slot_pattern_length is 0, please check the launch pattern");
+        return {};
+    }
+    uint32_t slot_idx = get_slot_in_frame(ss) % slot_pattern_length;
+    if (slot_idx >= slot_msgs.size())
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "slot_idx {} out of range for prebuilt slot_msgs (size {})", slot_idx, slot_msgs.size());
+        return {};
+    }
+
+    const auto map_it = cell_id_map.find(cell_id);
+    if (map_it == cell_id_map.end())
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "cell_id {} missing from cell_id_map", cell_id);
+        return {};
+    }
+    const std::vector<nv::phy_mac_msg_desc>& vec = slot_msgs[slot_idx][static_cast<size_t>(map_it->second)];
+    return std::span<const nv::phy_mac_msg_desc>(vec);
+}
+
 void fapi_handler::slot_indication_handler(uint32_t sfn, uint32_t slot, uint64_t slot_counter)
 {
 
@@ -822,7 +898,7 @@ int fapi_handler::schedule_cell_update(uint64_t slot_counter)
             for (cell_param_t param : cmd.cell_params)
             {
                 char top_dir[1024];
-                get_root_path(top_dir, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+                get_cubb_root_path(top_dir);
 
                 char sys_cmd[2048];
                 int offset = snprintf(sys_cmd, 1024, "cd %s/build/cuPHY-CP/cuphyoam && ", top_dir);

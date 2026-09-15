@@ -51,6 +51,8 @@ struct outChanDescr_t
     Tcomplex * chanPtr; // GPU buffer for chan
     float sigmaSqrd;  // noise level
     float scalingFactor; // scaling factor for channel coe; noise will be AFTER_SCALING_SIGMA_CONST^2, only used in const scaling
+    float targetChanCoeRange; // = targetChanCoeRangeConst, snapshotted on host (g_params is host-only, unreadable in device code)
+    float minNoiseRange;      // = MinNoiseRangeConst, snapshotted on host (g_params is host-only, unreadable in device code)
 };
 
 

@@ -517,6 +517,144 @@ protected:
         (void)deviceBuffersCleanup;
     }
 
+    static cuphyPuschRxUeGrpPrms_t makeBaseUeGrp(uint16_t nPrb,
+                                                 uint8_t  nRxAnt = 1,
+                                                 uint8_t  nLayers = 1,
+                                                 uint8_t  dmrsMaxLen = 1,
+                                                 uint16_t dmrsSymBmsk = (1u << 2))
+    {
+        cuphyPuschRxUeGrpPrms_t prm{};
+        prm.nUes         = 1;
+        prm.nLayers      = nLayers;
+        prm.nPrb         = nPrb;
+        prm.nRxAnt       = nRxAnt;
+        prm.nDmrsSyms    = __builtin_popcount(dmrsSymBmsk);
+        prm.dmrsMaxLen   = dmrsMaxLen;
+        prm.dmrsAddlnPos = (dmrsMaxLen > 0) ? (dmrsMaxLen - 1) : 0;
+        prm.rssiSymPosBmsk = dmrsSymBmsk;
+
+        uint8_t cnt = 0;
+        for(uint8_t i = 0; i < OFDM_SYMBOLS_PER_SLOT; ++i)
+        {
+            if((dmrsSymBmsk >> i) & 1)
+            {
+                prm.dmrsSymLoc[cnt++] = i;
+            }
+        }
+        return prm;
+    }
+
+    static cuphyPuschRxUeGrpPrms_t makeRssiUeGrp(uint16_t        nPrb,
+                                                 uint8_t         nRxAnt = 1,
+                                                 uint8_t         nLayers = 1,
+                                                 uint8_t         dmrsMaxLen = 1,
+                                                 uint16_t        dmrsSymBmsk = (1u << 2),
+                                                 cuphyDataType_t dataRxType = CUPHY_C_32F,
+                                                 cuphyDataType_t rssiType = CUPHY_R_32F,
+                                                 cuphyDataType_t rssiFullType = CUPHY_R_32F)
+    {
+        cuphyPuschRxUeGrpPrms_t prm = makeBaseUeGrp(nPrb, nRxAnt, nLayers, dmrsMaxLen, dmrsSymBmsk);
+        prm.tInfoDataRx.elemType   = dataRxType;
+        prm.tInfoRssi.elemType     = rssiType;
+        prm.tInfoRssiEhq.elemType  = rssiType;
+        prm.tInfoRssiFull.elemType = rssiFullType;
+        return prm;
+    }
+
+    static cuphyPuschRxUeGrpPrms_t makeRsrpUeGrp(uint16_t        nPrb,
+                                                 uint8_t         nRxAnt = 1,
+                                                 uint8_t         nLayers = 1,
+                                                 uint8_t         dmrsMaxLen = 1,
+                                                 uint16_t        dmrsSymBmsk = (1u << 2),
+                                                 cuphyDataType_t hEstType = CUPHY_C_32F,
+                                                 cuphyDataType_t rsrpType = CUPHY_R_32F)
+    {
+        cuphyPuschRxUeGrpPrms_t prm = makeBaseUeGrp(nPrb, nRxAnt, nLayers, dmrsMaxLen, dmrsSymBmsk);
+        prm.tInfoHEst.elemType = hEstType;
+        prm.tInfoRsrp.elemType = rsrpType;
+        return prm;
+    }
+
+    static cuphyPuschRxRssiLaunchCfgs_t makeRssiLaunchCfgs(uint32_t nCfgs = 1)
+    {
+        cuphyPuschRxRssiLaunchCfgs_t launchCfgs{};
+        launchCfgs.nCfgs = nCfgs;
+        return launchCfgs;
+    }
+
+    static cuphyPuschRxRsrpLaunchCfgs_t makeRsrpLaunchCfgs(uint32_t nCfgs = 1)
+    {
+        cuphyPuschRxRsrpLaunchCfgs_t launchCfgs{};
+        launchCfgs.nCfgs = nCfgs;
+        return launchCfgs;
+    }
+
+    void copyUeGrpParamsToDevice(uint16_t nUeGrps)
+    {
+        ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
+        ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
+    }
+
+    cuphyStatus_t setupRssi(cuphyPuschRxRssiLaunchCfgs_t& launchCfgs,
+                            uint16_t                      nUeGrps,
+                            uint32_t                      nPrb,
+                            uint8_t                       dmrsSymbolIdx = CUPHY_PUSCH_RSSI_EST_FIRST_DMRS,
+                            uint8_t                       enableCpuToGpuDescrAsyncCpy = 1)
+    {
+        return cuphySetupPuschRxRssi(rssiHndl,
+                                     drvdUeGrpPrmsCpu,
+                                     drvdUeGrpPrmsGpu,
+                                     nUeGrps,
+                                     nPrb,
+                                     dmrsSymbolIdx,
+                                     enableCpuToGpuDescrAsyncCpy,
+                                     rssiDynDescrCpu,
+                                     rssiDynDescrGpu,
+                                     &launchCfgs,
+                                     cuStream);
+    }
+
+    cuphyStatus_t setupRsrp(cuphyPuschRxRsrpLaunchCfgs_t& launchCfgs,
+                            uint16_t                      nUeGrps,
+                            uint32_t                      nPrb,
+                            uint8_t                       dmrsSymbolIdx = CUPHY_PUSCH_RSRP_EST_FIRST_DMRS,
+                            uint8_t                       enableCpuToGpuDescrAsyncCpy = 1)
+    {
+        return cuphySetupPuschRxRsrp(rssiHndl,
+                                     drvdUeGrpPrmsCpu,
+                                     drvdUeGrpPrmsGpu,
+                                     nUeGrps,
+                                     nPrb,
+                                     dmrsSymbolIdx,
+                                     enableCpuToGpuDescrAsyncCpy,
+                                     rsrpDynDescrCpu,
+                                     rsrpDynDescrGpu,
+                                     &launchCfgs,
+                                     cuStream);
+    }
+
+    void expectRssiSelectorBindsKernel(cuphyDataType_t dataRxType)
+    {
+        const uint16_t nUeGrps = 1;
+        const uint16_t nPrb    = 4;
+        allocUeGrp(nUeGrps);
+
+        drvdUeGrpPrmsCpu[0] = makeRssiUeGrp(nPrb, 1, 1, 1, (1u << 2), dataRxType);
+        copyUeGrpParamsToDevice(nUeGrps);
+
+        const uint8_t dmrsSymbolIdxs[] = {
+            CUPHY_PUSCH_RSSI_EST_FIRST_DMRS,
+            CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS,
+            CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS,
+        };
+        for(uint8_t dmrsSymbolIdx : dmrsSymbolIdxs)
+        {
+            auto rssiLaunch = makeRssiLaunchCfgs();
+            ASSERT_EQ(CUPHY_STATUS_SUCCESS, setupRssi(rssiLaunch, nUeGrps, nPrb, dmrsSymbolIdx));
+            EXPECT_NE(nullptr, rssiLaunch.cfgs[0].kernelNodeParamsDriver.func);
+        }
+    }
+
 protected:
     cudaStream_t           cuStream = nullptr;
     cuphyPuschRxRssiHndl_t rssiHndl = nullptr;
@@ -607,58 +745,6 @@ TEST_F(PuschRssiGTest, Rsrp_WeightedAverageCfo_WithoutPostEqKernel)
     runRssiRsrp(nUeGrps, nPrb, nRxAnt, nLayers, dmrsMaxLen, dmrsSymBmsk, false, true);
 }
 
-// Cover rssiMeasKernelSelect half-precision branch via setup selection (no kernel launch)
-TEST_F(PuschRssiGTest, RssiSelector_C16_R32_SelectsKernel_NoLaunch)
-{
-    const uint16_t nUeGrps = 1;
-    const uint16_t nPrb    = 8;
-    allocUeGrp(nUeGrps);
-
-    // Minimal UE group params
-    auto& prm          = drvdUeGrpPrmsCpu[0];
-    prm.nUes           = 1;
-    prm.nLayers        = 1;
-    prm.nPrb           = nPrb;
-    prm.nRxAnt         = 1;
-    prm.nDmrsSyms      = 1;
-    prm.dmrsMaxLen     = 1;
-    prm.dmrsAddlnPos   = 0;
-    prm.rssiSymPosBmsk = (1u << 2);
-    prm.dmrsSymLoc[0]  = 2;
-
-    // Types to hit the C_16F selection branch; outputs remain R_32F
-    prm.tInfoDataRx.elemType   = CUPHY_C_16F;
-    prm.tInfoRssi.elemType     = CUPHY_R_32F;
-    prm.tInfoRssiEhq.elemType  = CUPHY_R_32F;
-    prm.tInfoRssiFull.elemType = CUPHY_R_32F;
-
-    // Prepare launch cfg container
-    cuphyPuschRxRssiLaunchCfgs_t rssiLaunch{};
-    rssiLaunch.nCfgs = 1;
-
-    // Copy UE params CPU->GPU (not required for selection but consistent with API)
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-
-    // Call setup to exercise kernel select branch (no kernel launch)
-    ASSERT_EQ(CUPHY_STATUS_SUCCESS,
-              cuphySetupPuschRxRssi(rssiHndl,
-                                    drvdUeGrpPrmsCpu,
-                                    drvdUeGrpPrmsGpu,
-                                    nUeGrps,
-                                    nPrb,
-                                    CUPHY_PUSCH_RSSI_EST_FIRST_DMRS,
-                                    1, // enable async copy of descr
-                                    rssiDynDescrCpu,
-                                    rssiDynDescrGpu,
-                                    &rssiLaunch,
-                                    cuStream));
-
-    // Validate a function pointer got selected
-    ASSERT_EQ(1u, rssiLaunch.nCfgs);
-    ASSERT_NE(nullptr, rssiLaunch.cfgs[0].kernelNodeParamsDriver.func);
-}
-
 // Cover early invalid-argument returns and symbLocBmsk==0 skip path in setup
 TEST_F(PuschRssiGTest, RssiSetup_InvalidArgs_And_NoSymbolSkip)
 {
@@ -676,45 +762,16 @@ TEST_F(PuschRssiGTest, RssiSetup_InvalidArgs_And_NoSymbolSkip)
                                     nullptr,
                                     cuStream));
 
-    // Allocate two UE groups to exercise symbLocBmsk==0 continue and nMaxRxAnt update
     const uint16_t nUeGrps = 2;
     const uint16_t nPrb    = 8;
     allocUeGrp(nUeGrps);
 
-    // UE group 0: bmsk=0 triggers continue path
-    drvdUeGrpPrmsCpu[0].nUes                   = 1;
-    drvdUeGrpPrmsCpu[0].nLayers                = 1;
-    drvdUeGrpPrmsCpu[0].nPrb                   = nPrb;
-    drvdUeGrpPrmsCpu[0].nRxAnt                 = 1;
-    drvdUeGrpPrmsCpu[0].dmrsMaxLen             = 1;
-    drvdUeGrpPrmsCpu[0].rssiSymPosBmsk         = 0; // skip
-    drvdUeGrpPrmsCpu[0].tInfoDataRx.elemType   = CUPHY_C_32F;
-    drvdUeGrpPrmsCpu[0].tInfoRssi.elemType     = CUPHY_R_32F;
-    drvdUeGrpPrmsCpu[0].tInfoRssiFull.elemType = CUPHY_R_32F;
+    drvdUeGrpPrmsCpu[0] = makeRssiUeGrp(nPrb, 1, 1, 1, 0);
+    drvdUeGrpPrmsCpu[1] = makeRssiUeGrp(nPrb, 3);
+    copyUeGrpParamsToDevice(nUeGrps);
 
-    // UE group 1: valid path
-    drvdUeGrpPrmsCpu[1]                = drvdUeGrpPrmsCpu[0];
-    drvdUeGrpPrmsCpu[1].nRxAnt         = 3; // update nMaxRxAnt branch
-    drvdUeGrpPrmsCpu[1].rssiSymPosBmsk = (1u << 2);
-    drvdUeGrpPrmsCpu[1].dmrsSymLoc[0]  = 2;
-
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-
-    cuphyPuschRxRssiLaunchCfgs_t rssiLaunch{};
-    rssiLaunch.nCfgs = 1;
-    EXPECT_EQ(CUPHY_STATUS_SUCCESS,
-              cuphySetupPuschRxRssi(rssiHndl,
-                                    drvdUeGrpPrmsCpu,
-                                    drvdUeGrpPrmsGpu,
-                                    nUeGrps,
-                                    nPrb,
-                                    CUPHY_PUSCH_RSSI_EST_FIRST_DMRS,
-                                    1,
-                                    rssiDynDescrCpu,
-                                    rssiDynDescrGpu,
-                                    &rssiLaunch,
-                                    cuStream));
+    auto rssiLaunch = makeRssiLaunchCfgs();
+    EXPECT_EQ(CUPHY_STATUS_SUCCESS, setupRssi(rssiLaunch, nUeGrps, nPrb));
 }
 
 // Cover invalid dmrsSymbolIdx branch
@@ -723,40 +780,17 @@ TEST_F(PuschRssiGTest, RssiSetup_InvalidDmrsSymbolIdx)
     const uint16_t nUeGrps = 1;
     const uint16_t nPrb    = 8;
     allocUeGrp(nUeGrps);
-    drvdUeGrpPrmsCpu[0].nUes                   = 1;
-    drvdUeGrpPrmsCpu[0].nLayers                = 1;
-    drvdUeGrpPrmsCpu[0].nPrb                   = nPrb;
-    drvdUeGrpPrmsCpu[0].nRxAnt                 = 1;
-    drvdUeGrpPrmsCpu[0].dmrsMaxLen             = 1;
-    drvdUeGrpPrmsCpu[0].rssiSymPosBmsk         = (1u << 2);
-    drvdUeGrpPrmsCpu[0].dmrsSymLoc[0]          = 2;
-    drvdUeGrpPrmsCpu[0].tInfoDataRx.elemType   = CUPHY_C_32F;
-    drvdUeGrpPrmsCpu[0].tInfoRssi.elemType     = CUPHY_R_32F;
-    drvdUeGrpPrmsCpu[0].tInfoRssiFull.elemType = CUPHY_R_32F;
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-    cuphyPuschRxRssiLaunchCfgs_t rssiLaunch{};
-    rssiLaunch.nCfgs = 1;
-    // Use an invalid dmrsSymbolIdx (e.g., 255) to hit early return branch
-    EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT,
-              cuphySetupPuschRxRssi(rssiHndl,
-                                    drvdUeGrpPrmsCpu,
-                                    drvdUeGrpPrmsGpu,
-                                    nUeGrps,
-                                    nPrb,
-                                    255,
-                                    1,
-                                    rssiDynDescrCpu,
-                                    rssiDynDescrGpu,
-                                    &rssiLaunch,
-                                    cuStream));
+    drvdUeGrpPrmsCpu[0] = makeRssiUeGrp(nPrb);
+    copyUeGrpParamsToDevice(nUeGrps);
+
+    auto rssiLaunch = makeRssiLaunchCfgs();
+    EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT, setupRssi(rssiLaunch, nUeGrps, nPrb, 255));
 }
 
 // Hit setupRssiMeas early invalid-argument by providing null derived UE-group pointers
 TEST_F(PuschRssiGTest, RssiSetup_NullDerivedUeGrpPtrs)
 {
-    cuphyPuschRxRssiLaunchCfgs_t rssiLaunch{};
-    rssiLaunch.nCfgs = 1;
+    auto rssiLaunch = makeRssiLaunchCfgs();
     EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT,
               cuphySetupPuschRxRssi(rssiHndl,
                                     nullptr, // pDrvdUeGrpPrmsCpu
@@ -771,51 +805,54 @@ TEST_F(PuschRssiGTest, RssiSetup_NullDerivedUeGrpPtrs)
                                     cuStream));
 }
 
+TEST_F(PuschRssiGTest, RssiSetup_RejectsInvalidLaunchConfigCounts)
+{
+    const uint16_t nUeGrps = 1;
+    const uint16_t nPrb    = 8;
+    allocUeGrp(nUeGrps);
+
+    drvdUeGrpPrmsCpu[0] = makeRssiUeGrp(nPrb);
+    copyUeGrpParamsToDevice(nUeGrps);
+
+    auto noRssiLaunchCfgs = makeRssiLaunchCfgs(0);
+    EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT, setupRssi(noRssiLaunchCfgs, nUeGrps, nPrb));
+
+    auto tooManyRssiLaunchCfgs = makeRssiLaunchCfgs(CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS + 1);
+    EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT, setupRssi(tooManyRssiLaunchCfgs, nUeGrps, nPrb));
+}
+
 // ----------------------------- RSRP setup coverage -----------------------------
 
-// Cover optional CPU->GPU descriptor copy disabled path and multiple heterogeneous configs
-TEST_F(PuschRssiGTest, RsrpSetup_NoAsyncCopy_MultipleHetConfigs)
+// Cover optional CPU->GPU descriptor copy disabled path with heterogeneous UE-group inputs
+TEST_F(PuschRssiGTest, RsrpSetup_NoAsyncCopy_HeterogeneousUeGroups)
 {
     const uint16_t nUeGrps = 2; // also drive nMaxRxAnt update across groups
     const uint16_t nPrb    = 8;
     allocUeGrp(nUeGrps);
-    // UE0
-    drvdUeGrpPrmsCpu[0].nUes           = 1;
-    drvdUeGrpPrmsCpu[0].nLayers        = 1;
-    drvdUeGrpPrmsCpu[0].nPrb           = nPrb;
-    drvdUeGrpPrmsCpu[0].nRxAnt         = 1;
-    drvdUeGrpPrmsCpu[0].dmrsMaxLen     = 1;
-    drvdUeGrpPrmsCpu[0].dmrsSymLoc[0]  = 2;
-    drvdUeGrpPrmsCpu[0].rssiSymPosBmsk = (1u << 2);
-    // UE1 higher RxAnt to trigger nMaxRxAnt update
-    drvdUeGrpPrmsCpu[1]        = drvdUeGrpPrmsCpu[0];
-    drvdUeGrpPrmsCpu[1].nRxAnt = 3;
-    // Types
-    for(int i = 0; i < nUeGrps; ++i)
-    {
-        drvdUeGrpPrmsCpu[i].tInfoHEst.elemType = CUPHY_C_32F;
-        drvdUeGrpPrmsCpu[i].tInfoRsrp.elemType = CUPHY_R_32F;
-    }
 
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
+    drvdUeGrpPrmsCpu[0] = makeRsrpUeGrp(nPrb);
+    drvdUeGrpPrmsCpu[1] = makeRsrpUeGrp(nPrb, 3);
+    copyUeGrpParamsToDevice(nUeGrps);
 
-    cuphyPuschRxRsrpLaunchCfgs_t rsrpLaunch{};
-    rsrpLaunch.nCfgs = 2; // multi-het cfg
-    EXPECT_EQ(CUPHY_STATUS_SUCCESS,
-              cuphySetupPuschRxRsrp(rssiHndl,
-                                    drvdUeGrpPrmsCpu,
-                                    drvdUeGrpPrmsGpu,
-                                    nUeGrps,
-                                    nPrb,
-                                    CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS,
-                                    0, // disable async copy path
-                                    rsrpDynDescrCpu,
-                                    rsrpDynDescrGpu,
-                                    &rsrpLaunch,
-                                    cuStream));
-    // Sanity
-    EXPECT_NE(nullptr, rsrpLaunch.cfgs[0].kernelNodeParamsDriver.func);
+    auto maxSupportedRsrpLaunchCfgs = makeRsrpLaunchCfgs(CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS);
+    EXPECT_EQ(CUPHY_STATUS_SUCCESS, setupRsrp(maxSupportedRsrpLaunchCfgs, nUeGrps, nPrb, CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS, 0));
+    EXPECT_NE(nullptr, maxSupportedRsrpLaunchCfgs.cfgs[0].kernelNodeParamsDriver.func);
+}
+
+TEST_F(PuschRssiGTest, RsrpSetup_RejectsInvalidLaunchConfigCounts)
+{
+    const uint16_t nUeGrps = 1;
+    const uint16_t nPrb    = 8;
+    allocUeGrp(nUeGrps);
+
+    drvdUeGrpPrmsCpu[0] = makeRsrpUeGrp(nPrb);
+    copyUeGrpParamsToDevice(nUeGrps);
+
+    auto noRsrpLaunchCfgs = makeRsrpLaunchCfgs(0);
+    EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT, setupRsrp(noRsrpLaunchCfgs, nUeGrps, nPrb, CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS));
+
+    auto tooManyRsrpLaunchCfgs = makeRsrpLaunchCfgs(CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS + 1);
+    EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT, setupRsrp(tooManyRsrpLaunchCfgs, nUeGrps, nPrb, CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS));
 }
 
 // Exercise RSRP setup guard coverage using existing helpers
@@ -837,8 +874,7 @@ TEST_F(PuschRssiGTest, RsrpSetup_InvalidArgs)
 
 TEST_F(PuschRssiGTest, RsrpSetup_NullDerivedUeGrpPtrs)
 {
-    cuphyPuschRxRsrpLaunchCfgs_t rsrpLaunch{};
-    rsrpLaunch.nCfgs = 1;
+    auto rsrpLaunch = makeRsrpLaunchCfgs();
     EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT,
               cuphySetupPuschRxRsrp(rssiHndl,
                                     nullptr, // pDrvdUeGrpPrmsCpu
@@ -858,32 +894,11 @@ TEST_F(PuschRssiGTest, RsrpSetup_InvalidDmrsSymbolIdx)
     const uint16_t nUeGrps = 1;
     const uint16_t nPrb    = 8;
     allocUeGrp(nUeGrps);
-    // Minimal valid UE group
-    drvdUeGrpPrmsCpu[0].nUes               = 1;
-    drvdUeGrpPrmsCpu[0].nLayers            = 1;
-    drvdUeGrpPrmsCpu[0].nPrb               = nPrb;
-    drvdUeGrpPrmsCpu[0].nRxAnt             = 1;
-    drvdUeGrpPrmsCpu[0].dmrsMaxLen         = 1;
-    drvdUeGrpPrmsCpu[0].dmrsSymLoc[0]      = 2;
-    drvdUeGrpPrmsCpu[0].rssiSymPosBmsk     = (1u << 2);
-    drvdUeGrpPrmsCpu[0].tInfoHEst.elemType = CUPHY_C_32F;
-    drvdUeGrpPrmsCpu[0].tInfoRsrp.elemType = CUPHY_R_32F;
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-    cuphyPuschRxRsrpLaunchCfgs_t rsrpLaunch{};
-    rsrpLaunch.nCfgs = 1;
-    EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT,
-              cuphySetupPuschRxRsrp(rssiHndl,
-                                    drvdUeGrpPrmsCpu,
-                                    drvdUeGrpPrmsGpu,
-                                    nUeGrps,
-                                    nPrb,
-                                    255, // invalid dmrs idx
-                                    1,
-                                    rsrpDynDescrCpu,
-                                    rsrpDynDescrGpu,
-                                    &rsrpLaunch,
-                                    cuStream));
+    drvdUeGrpPrmsCpu[0] = makeRsrpUeGrp(nPrb);
+    copyUeGrpParamsToDevice(nUeGrps);
+
+    auto rsrpLaunch = makeRsrpLaunchCfgs();
+    EXPECT_EQ(CUPHY_STATUS_INVALID_ARGUMENT, setupRsrp(rsrpLaunch, nUeGrps, nPrb, 255));
 }
 
 TEST_F(PuschRssiGTest, RsrpSetup_ValidPaths)
@@ -891,33 +906,12 @@ TEST_F(PuschRssiGTest, RsrpSetup_ValidPaths)
     const uint16_t nUeGrps = 1;
     const uint16_t nPrb    = 8;
     allocUeGrp(nUeGrps);
-    drvdUeGrpPrmsCpu[0].nUes               = 1;
-    drvdUeGrpPrmsCpu[0].nLayers            = 1;
-    drvdUeGrpPrmsCpu[0].nPrb               = nPrb;
-    drvdUeGrpPrmsCpu[0].nRxAnt             = 1;
-    drvdUeGrpPrmsCpu[0].dmrsMaxLen         = 1;
-    drvdUeGrpPrmsCpu[0].dmrsSymLoc[0]      = 2;
-    drvdUeGrpPrmsCpu[0].rssiSymPosBmsk     = (1u << 2);
-    drvdUeGrpPrmsCpu[0].tInfoHEst.elemType = CUPHY_C_32F;
-    drvdUeGrpPrmsCpu[0].tInfoRsrp.elemType = CUPHY_R_32F;
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-    cuphyPuschRxRsrpLaunchCfgs_t rsrpLaunch{};
-    rsrpLaunch.nCfgs = 1;
+    drvdUeGrpPrmsCpu[0] = makeRsrpUeGrp(nPrb);
+    copyUeGrpParamsToDevice(nUeGrps);
 
     auto callSetup = [&](uint8_t dmrsIdx) {
-        EXPECT_EQ(CUPHY_STATUS_SUCCESS,
-                  cuphySetupPuschRxRsrp(rssiHndl,
-                                        drvdUeGrpPrmsCpu,
-                                        drvdUeGrpPrmsGpu,
-                                        nUeGrps,
-                                        nPrb,
-                                        dmrsIdx,
-                                        1,
-                                        rsrpDynDescrCpu,
-                                        rsrpDynDescrGpu,
-                                        &rsrpLaunch,
-                                        cuStream));
+        auto rsrpLaunch = makeRsrpLaunchCfgs();
+        EXPECT_EQ(CUPHY_STATUS_SUCCESS, setupRsrp(rsrpLaunch, nUeGrps, nPrb, dmrsIdx));
         EXPECT_NE(nullptr, rsrpLaunch.cfgs[0].kernelNodeParamsDriver.func);
     };
 
@@ -933,34 +927,11 @@ TEST_F(PuschRssiGTest, RsrpSelector_UnsupportedHEstType_NoKernel)
     const uint16_t nPrb    = 4;
     allocUeGrp(nUeGrps);
 
-    auto& prm              = drvdUeGrpPrmsCpu[0];
-    prm.nUes               = 1;
-    prm.nLayers            = 1;
-    prm.nPrb               = nPrb;
-    prm.nRxAnt             = 1;
-    prm.dmrsMaxLen         = 1;
-    prm.dmrsSymLoc[0]      = 2;
-    prm.rssiSymPosBmsk     = (1u << 2);
-    prm.tInfoHEst.elemType = CUPHY_C_16F; // force condition at 1644 to be false
-    prm.tInfoRsrp.elemType = CUPHY_R_32F;
+    drvdUeGrpPrmsCpu[0] = makeRsrpUeGrp(nPrb, 1, 1, 1, (1u << 2), CUPHY_C_16F);
+    copyUeGrpParamsToDevice(nUeGrps);
 
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-
-    cuphyPuschRxRsrpLaunchCfgs_t rsrpLaunch{};
-    rsrpLaunch.nCfgs = 1;
-    (void)cuphySetupPuschRxRsrp(rssiHndl,
-                                drvdUeGrpPrmsCpu,
-                                drvdUeGrpPrmsGpu,
-                                nUeGrps,
-                                nPrb,
-                                CUPHY_PUSCH_RSRP_EST_FIRST_DMRS,
-                                1,
-                                rsrpDynDescrCpu,
-                                rsrpDynDescrGpu,
-                                &rsrpLaunch,
-                                cuStream);
-    // With unsupported hEstType selector should not bind a kernel
+    auto rsrpLaunch = makeRsrpLaunchCfgs();
+    ASSERT_EQ(CUPHY_STATUS_SUCCESS, setupRsrp(rsrpLaunch, nUeGrps, nPrb));
     EXPECT_EQ(nullptr, rsrpLaunch.cfgs[0].kernelNodeParamsDriver.func);
 }
 
@@ -971,34 +942,11 @@ TEST_F(PuschRssiGTest, RsrpSelector_C32_NonR32_NoKernel)
     const uint16_t nPrb    = 4;
     allocUeGrp(nUeGrps);
 
-    auto& prm              = drvdUeGrpPrmsCpu[0];
-    prm.nUes               = 1;
-    prm.nLayers            = 1;
-    prm.nPrb               = nPrb;
-    prm.nRxAnt             = 1;
-    prm.dmrsMaxLen         = 1;
-    prm.dmrsSymLoc[0]      = 2;
-    prm.rssiSymPosBmsk     = (1u << 2);
-    prm.tInfoHEst.elemType = CUPHY_C_32F; // outer if true
-    prm.tInfoRsrp.elemType = CUPHY_R_16F; // inner if false (non-R_32F)
+    drvdUeGrpPrmsCpu[0] = makeRsrpUeGrp(nPrb, 1, 1, 1, (1u << 2), CUPHY_C_32F, CUPHY_R_16F);
+    copyUeGrpParamsToDevice(nUeGrps);
 
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-
-    cuphyPuschRxRsrpLaunchCfgs_t rsrpLaunch{};
-    rsrpLaunch.nCfgs = 1;
-    (void)cuphySetupPuschRxRsrp(rssiHndl,
-                                drvdUeGrpPrmsCpu,
-                                drvdUeGrpPrmsGpu,
-                                nUeGrps,
-                                nPrb,
-                                CUPHY_PUSCH_RSRP_EST_FIRST_DMRS,
-                                1,
-                                rsrpDynDescrCpu,
-                                rsrpDynDescrGpu,
-                                &rsrpLaunch,
-                                cuStream);
-    // No kernel should be selected when rsrpType != R_32F
+    auto rsrpLaunch = makeRsrpLaunchCfgs();
+    ASSERT_EQ(CUPHY_STATUS_SUCCESS, setupRsrp(rsrpLaunch, nUeGrps, nPrb));
     EXPECT_EQ(nullptr, rsrpLaunch.cfgs[0].kernelNodeParamsDriver.func);
 }
 
@@ -1009,34 +957,11 @@ TEST_F(PuschRssiGTest, RsrpLaunchGeometry_RecalculateThreadBlocks)
     const uint16_t nPrb    = 1; // small PRB to make initial nThrdBlks tiny
     allocUeGrp(nUeGrps);
 
-    auto& prm              = drvdUeGrpPrmsCpu[0];
-    prm.nUes               = 1;
-    prm.nLayers            = 1;
-    prm.nPrb               = nPrb;
-    prm.nRxAnt             = 8; // large RxAnt to increase RHS
-    prm.dmrsMaxLen         = 1;
-    prm.dmrsSymLoc[0]      = 2;
-    prm.rssiSymPosBmsk     = (1u << 2);
-    prm.tInfoHEst.elemType = CUPHY_C_32F; // required selector types
-    prm.tInfoRsrp.elemType = CUPHY_R_32F;
+    drvdUeGrpPrmsCpu[0] = makeRsrpUeGrp(nPrb, 8);
+    copyUeGrpParamsToDevice(nUeGrps);
 
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-
-    cuphyPuschRxRsrpLaunchCfgs_t rsrpLaunch{};
-    rsrpLaunch.nCfgs = 1;
-    ASSERT_EQ(CUPHY_STATUS_SUCCESS,
-              cuphySetupPuschRxRsrp(rssiHndl,
-                                    drvdUeGrpPrmsCpu,
-                                    drvdUeGrpPrmsGpu,
-                                    nUeGrps,
-                                    nPrb,
-                                    CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS,
-                                    1,
-                                    rsrpDynDescrCpu,
-                                    rsrpDynDescrGpu,
-                                    &rsrpLaunch,
-                                    cuStream));
+    auto rsrpLaunch = makeRsrpLaunchCfgs();
+    ASSERT_EQ(CUPHY_STATUS_SUCCESS, setupRsrp(rsrpLaunch, nUeGrps, nPrb, CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS));
 
     // For nPrb=1: initial nThrdBlks=ceil((1*12)/48)=1; THRD_GRP_TILE_SIZE=32; maxLayers=min(8, nRxAnt)=8
     // Since 1*32 < 8*8, branch should recalc: nThrdBlks=ceil((8*8)/48)=2
@@ -1048,93 +973,13 @@ TEST_F(PuschRssiGTest, RsrpLaunchGeometry_RecalculateThreadBlocks)
 // Cover rssiMeasKernelSelect C_32F path
 TEST_F(PuschRssiGTest, RssiSelector_C32_R32)
 {
-    const uint16_t nUeGrps = 1;
-    const uint16_t nPrb    = 4;
-    allocUeGrp(nUeGrps);
-
-    auto& prm          = drvdUeGrpPrmsCpu[0];
-    prm.nUes           = 1;
-    prm.nLayers        = 1;
-    prm.nPrb           = nPrb;
-    prm.nRxAnt         = 1;
-    prm.dmrsMaxLen     = 1;
-    prm.dmrsSymLoc[0]  = 2;
-    prm.rssiSymPosBmsk = (1u << 2);
-    // Types to drive selector
-    prm.tInfoDataRx.elemType   = CUPHY_C_32F;
-    prm.tInfoRssi.elemType     = CUPHY_R_32F;
-    prm.tInfoRssiFull.elemType = CUPHY_R_32F;
-
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-
-    cuphyPuschRxRssiLaunchCfgs_t rssiLaunch{};
-    rssiLaunch.nCfgs = 1;
-    auto call        = [&](uint8_t dmrsIdx) {
-        rssiLaunch.nCfgs = 1;
-        ASSERT_EQ(CUPHY_STATUS_SUCCESS,
-                  cuphySetupPuschRxRssi(rssiHndl,
-                                        drvdUeGrpPrmsCpu,
-                                        drvdUeGrpPrmsGpu,
-                                        nUeGrps,
-                                        nPrb,
-                                        dmrsIdx,
-                                        1,
-                                        rssiDynDescrCpu,
-                                        rssiDynDescrGpu,
-                                        &rssiLaunch,
-                                        cuStream));
-        EXPECT_NE(nullptr, rssiLaunch.cfgs[0].kernelNodeParamsDriver.func);
-    };
-    call(CUPHY_PUSCH_RSSI_EST_FIRST_DMRS);
-    call(CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS);
-    call(CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS);
+    expectRssiSelectorBindsKernel(CUPHY_C_32F);
 }
 
 // Cover rssiMeasKernelSelect C_16F path
 TEST_F(PuschRssiGTest, RssiSelector_C16_R32)
 {
-    const uint16_t nUeGrps = 1;
-    const uint16_t nPrb    = 4;
-    allocUeGrp(nUeGrps);
-
-    auto& prm          = drvdUeGrpPrmsCpu[0];
-    prm.nUes           = 1;
-    prm.nLayers        = 1;
-    prm.nPrb           = nPrb;
-    prm.nRxAnt         = 1;
-    prm.dmrsMaxLen     = 1;
-    prm.dmrsSymLoc[0]  = 2;
-    prm.rssiSymPosBmsk = (1u << 2);
-    // Types to drive half-precision selector
-    prm.tInfoDataRx.elemType   = CUPHY_C_16F;
-    prm.tInfoRssi.elemType     = CUPHY_R_32F;
-    prm.tInfoRssiFull.elemType = CUPHY_R_32F;
-
-    ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(drvdUeGrpPrmsGpu, drvdUeGrpPrmsCpu, nUeGrps * sizeof(cuphyPuschRxUeGrpPrms_t), cudaMemcpyHostToDevice, cuStream));
-    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
-
-    cuphyPuschRxRssiLaunchCfgs_t rssiLaunch{};
-    rssiLaunch.nCfgs = 1;
-    auto call        = [&](uint8_t dmrsIdx) {
-        rssiLaunch.nCfgs = 1;
-        ASSERT_EQ(CUPHY_STATUS_SUCCESS,
-                  cuphySetupPuschRxRssi(rssiHndl,
-                                        drvdUeGrpPrmsCpu,
-                                        drvdUeGrpPrmsGpu,
-                                        nUeGrps,
-                                        nPrb,
-                                        dmrsIdx,
-                                        1,
-                                        rssiDynDescrCpu,
-                                        rssiDynDescrGpu,
-                                        &rssiLaunch,
-                                        cuStream));
-        EXPECT_NE(nullptr, rssiLaunch.cfgs[0].kernelNodeParamsDriver.func);
-    };
-    call(CUPHY_PUSCH_RSSI_EST_FIRST_DMRS);
-    call(CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS);
-    call(CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS);
+    expectRssiSelectorBindsKernel(CUPHY_C_16F);
 }
 
 int main(int argc, char* argv[])

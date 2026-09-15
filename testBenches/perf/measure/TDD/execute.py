@@ -23,11 +23,11 @@ def run(args, mig, mig_gpu, command, vectors, mode, target, k, actual):
 
     results = None
 
-    if args.force is not None:
-        if args.force == 0:
+    if args.device_max_connections is not None:
+        if args.device_max_connections == 0:
             connections = actual
         else:
-            connections = args.force
+            connections = args.device_max_connections
     else:
         connections = np.min(
             [32, int(np.power(2, np.floor(np.log2(96 / (len(target) + 1)))))]

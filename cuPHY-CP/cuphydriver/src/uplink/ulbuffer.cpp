@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 26) // "DRV.ULBUF"
 
 #include "ulbuffer.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -93,7 +94,7 @@ void ULInputBuffer::cleanup(cudaStream_t stream)
      * Can't be moved to buffer release because FH, at the end of the DL task,
      * still has to send the content of the buffer (bug: DPDK callback to give an ACK is not working yet)
      */
-    CUDA_CHECK_PHYDRIVER(cudaMemsetAsync(getBufD(), 0, getSize(), stream));
+    CUDA_DRIVER_CHECK(cuMemsetD8Async(reinterpret_cast<CUdeviceptr>(getBufD()), 0, getSize(), stream));
 }
 
 size_t ULInputBuffer::getSize() const

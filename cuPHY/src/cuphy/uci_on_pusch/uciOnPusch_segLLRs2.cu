@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #include "uciOnPusch_segLLRs2.hpp"
 #include "descrambling.cuh"
+#include <cassert>
 
 //#define DEBUG_PRINT
 
@@ -78,38 +79,81 @@ uciOnPuschSegLLRs2Kernel(uciOnPuschSegLLRs2DynDescr_t* pDesc)
    __shared__ extern __half sh_buff[];
    __shared__ bool sh_dmrsFlag[MAX_ND_SUPPORTED];
    __shared__ uint32_t sh_numUnassignedBitsInSymbol[MAX_ND_SUPPORTED];
+   __shared__ uint16_t sh_numUnassignedResInSymbol[MAX_ND_SUPPORTED];
+   // Preload pLayerMap values so the per-layer IMAD computing gBase no longer
+   // waits on a global LDG for each iteration. MAX_N_LAYERS_PUSCH is 8 so this is cheap.
+   __shared__ uint32_t sh_pLayerMap[MAX_N_LAYERS_PUSCH];
+   // Narrow reGrid preload: only the .nRes fields of csi1ReGrid/rvdHarqReGrid
+   // are used as control-flow gates below (~465 stall samples combined on
+   // the full-struct LDGs). Preloading just nRes (2 B × 14 × 2 arrays = 56 B
+   // SMEM) lets those branches source from LDS instead of LDG. Full
+   // reGrid_t preload was tried and regressed due to extended barrier wait;
+   // this narrower version adds only 2 LDGs per thread (tid < 14) to the pre-sync region.
+   __shared__ uint16_t sh_csi1NRes    [MAX_ND_SUPPORTED];
+   __shared__ uint16_t sh_rvdHarqNRes [MAX_ND_SUPPORTED];
 
    int tid =  threadIdx.x + blockDim.x * threadIdx.y; //blockDim.x = 12, dataSymIdx = threadIdx.y
 
     // round up to 8 halfs (16B) for per-thread stride
    __half* reLLRs  = sh_buff + THREAD_STRIDE_HALFS * tid;
 
-   // check for early exit
-   if((symIdx >= nSym) || (prbIdx >= nPrb)){
-      return;
-   }
-   if(pDmrsFlag[symIdx] && ((reIdx % 2 == 0) || (isDataPresent == 0))){
-      return;
-   }
-
-    sh_dmrsFlag[symIdx] = pDmrsFlag[symIdx];
-    sh_numUnassignedBitsInSymbol[symIdx] = pNumUnassignedBitsInSymbol[symIdx];
-    __syncthreads();
-
-   // Loads RE LLRs
+   // Hoist tEqOutLLRs.addr()/layout stride reads here so the global loads
+   // issue before __syncthreads and their latency overlaps with the
+   // cooperative preload + sync wait. By the time s0/s1/idx0 are consumed at
+   // the s0==1 branch below, the data is already back — no long_sb there.
    auto tEqOutLLRsAdr = tEqOutLLRs.addr();
    auto layout        = tEqOutLLRs.layout();
    int  s0            = layout.strides[0];
    int  s1            = layout.strides[1];
-   int  idx0          = layout.strides[2] * reIdx + layout.strides[3] * symIdx;
+   int  s2            = layout.strides[2];
+   int  s3            = layout.strides[3];
+
+   if (tid < nSym) {
+      sh_dmrsFlag[tid] = pDmrsFlag[tid];
+      sh_numUnassignedBitsInSymbol[tid] = pNumUnassignedBitsInSymbol[tid];
+      sh_numUnassignedResInSymbol[tid]  = pNumUnassignedResInSymbol[tid];
+      sh_csi1NRes[tid]    = harqAndCsi1RePrm.csi1ReGrids[tid].nRes;
+      sh_rvdHarqNRes[tid] = harqAndCsi1RePrm.rvdHarqReGrids[tid].nRes;
+   }
+   if (tid < MAX_N_LAYERS_PUSCH) {
+      sh_pLayerMap[tid] = pLayerMap[tid];
+   }
+   __syncthreads();
+
+   // check for early exit
+   if((symIdx >= nSym) || (prbIdx >= nPrb)){
+      return;
+   }
+
+#if __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
+   // For sm_120 and sm_121, we have limited occupancy due to shared memory size and
+   // max thread count per SM, so we can afford to a few extra registers to early-load
+   // values needed later. On sm_90, this would push us above 40 registers/thread,
+   // which limits occupancy and decreases performance.
+   const bool dmrsFlagSymIdx = sh_dmrsFlag[symIdx];
+   if(dmrsFlagSymIdx && ((reIdx % 2 == 0) || (isDataPresent == 0))){
+#else
+   if(sh_dmrsFlag[symIdx] && ((reIdx % 2 == 0) || (isDataPresent == 0))){
+#endif
+      return;
+   }
+
+#if __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
+   const uint32_t descramOffset = pDescramOffsets[symIdx];
+#endif
+
+   // Loads RE LLRs (s0/s1/s2/s3 and tEqOutLLRsAdr were hoisted pre-sync above)
+   int  idx0          = s2 * reIdx + s3 * symIdx;
 
    if (s0 == 1) {
-      // vectorize LD/ST
-       copyLLRsVec(tEqOutLLRsAdr, s1, idx0, reLLRs, nBitsPerQam, nLayers, pLayerMap);
+      // Async: issue cp.async.ca.shared.global copies now, commit the group,
+      // and let the per-sym loop below overlap with the outstanding LLR
+      // fetch. The wait_group happens just before the descramble reads.
+      copyLLRsVec<true /*Async*/>(tEqOutLLRsAdr, s1, idx0, reLLRs, nBitsPerQam, nLayers, sh_pLayerMap);
    } else {
       for(uint8_t layerIdx = 0; layerIdx < nLayers; ++layerIdx)
       {
-            int idx1 = pLayerMap[layerIdx] * s1 + idx0;
+            int idx1 = sh_pLayerMap[layerIdx] * s1 + idx0;
             for(uint8_t bitIdx = 0; bitIdx < nBitsPerQam; ++bitIdx)
             {
                   reLLRs[bitIdx + layerIdx * nBitsPerQam] = tEqOutLLRsAdr[bitIdx * s0 + idx1];
@@ -121,13 +165,13 @@ uciOnPuschSegLLRs2Kernel(uciOnPuschSegLLRs2DynDescr_t* pDesc)
    reGrid_t csi2ReGrid;
    uint32_t nAssignedCsi2RmBits = 0;
    uint32_t schRmBufferOffset   = 0;
-   uint16_t nUnassignedResNext  = pNumUnassignedResInSymbol[0];
+   uint16_t nUnassignedResNext  = sh_numUnassignedResInSymbol[0];
 
    for(int i = 0; i < symIdx; ++i)
    {
       uint32_t nUnassignedBits = sh_numUnassignedBitsInSymbol[i];
       uint16_t nUnassignedRes  = nUnassignedResNext;
-      nUnassignedResNext       = pNumUnassignedResInSymbol[i + 1];
+      nUnassignedResNext       = sh_numUnassignedResInSymbol[i + 1];
 
       if((nAssignedCsi2RmBits < G_csi2) && (nUnassignedRes > 0))
       {
@@ -161,20 +205,37 @@ uciOnPuschSegLLRs2Kernel(uciOnPuschSegLLRs2DynDescr_t* pDesc)
          schRmBufferOffset += nBitsPerSym >> 1;
       }else
       {
-         schRmBufferOffset += nUnassignedBits; 
+         schRmBufferOffset += nUnassignedBits;
       }
    }
 
+   // Wait for the async LLR copy to drain before any access to reLLRs below.
+   // The sym loop above doesn't touch reLLRs, so its cycles overlap with the
+   // outstanding cp.async group.
+   //
+   // This wait is effectively a no-op with no previous async copy (i.e.,
+   // when s0 != 1). Predicating the wait with a conditional resulted in a
+   // performance regression, as did moving the wait lower below the gold
+   // sequence generation. Thus, at least on RTX PRO 4500, this was the optimal
+   // placement for the wait. Different GPUs may have different optimal wait points.
+   cpLLRsVecWait<true /*Async*/>();
+
    // RE descrambling sequence
    uint32_t reDescSeq = 0;
-   if(sh_dmrsFlag[symIdx]){
-      reDescSeq = descrambling::gold32n(cinit, pDescramOffsets[symIdx] + reIdx/2*nBitsPerRe);
+#if __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
+   if(dmrsFlagSymIdx){
+#else
+   const uint32_t descramOffset = pDescramOffsets[symIdx];
+   const bool dmrsFlagSymIdx = sh_dmrsFlag[symIdx];
+   if(dmrsFlagSymIdx){
+#endif
+      reDescSeq = descrambling::gold32n(cinit, descramOffset + reIdx/2*nBitsPerRe);
    }else{
-      reDescSeq = descrambling::gold32n(cinit, pDescramOffsets[symIdx] + reIdx*nBitsPerRe);
+      reDescSeq = descrambling::gold32n(cinit, descramOffset + reIdx*nBitsPerRe);
    }
 
    // If DMRS symbol, descramble and store the LLR
-   if(sh_dmrsFlag[symIdx]){
+   if(dmrsFlagSymIdx){
       __half* pRmLLRBuff = pSchLLRs + schRmBufferOffset + reIdx / 2 * nBitsPerRe;
       descramAndStoreLLRs(reDescSeq, 0, pRmLLRBuff, nBitsPerRe, reLLRs);
       return;
@@ -186,7 +247,7 @@ uciOnPuschSegLLRs2Kernel(uciOnPuschSegLLRs2DynDescr_t* pDesc)
    {
       csi2AssignedToSymFlag = true;
       assignReGrid(csi2ReGrid, 
-                  pNumUnassignedResInSymbol[symIdx], 
+                  sh_numUnassignedResInSymbol[symIdx],
                   sh_numUnassignedBitsInSymbol[symIdx],
                   nAssignedCsi2RmBits,
                   G_csi2,
@@ -200,7 +261,7 @@ uciOnPuschSegLLRs2Kernel(uciOnPuschSegLLRs2DynDescr_t* pDesc)
    uint16_t cumltNumAssignedRes = 0;
    bool     thisReIsPunctFlag   = false;
 
-   if(rvdHarqReGrid.nRes > 0)
+   if(sh_rvdHarqNRes[symIdx] > 0)
    {
       // check if RE reserved to HARQ. Compute the number of REs
       // reserved to HARQ < reIdx
@@ -235,7 +296,7 @@ uciOnPuschSegLLRs2Kernel(uciOnPuschSegLLRs2DynDescr_t* pDesc)
       }
    }
 
-   if((csi1ReGrid.nRes > 0) && (!rvdHarqReFlag))
+   if((sh_csi1NRes[symIdx] > 0) && (!rvdHarqReFlag))
    {
       // Check if RE assigend to CSI-P1. Compute the number of CSI-P1 REs
       // assigned < reIdx.
@@ -354,7 +415,16 @@ void kernelSelect(uint16_t nCsi2Ues, csi2ToUserMap_t* pCsi2ToUserMapCpu, cuphyPu
    //printf("MAX_N_DATA_SYMS[%d]\n", MAX_N_DATA_SYMS);
    // launch geometry
    dim3 blockDim(N_SC_PER_PRB, MAX_N_DATA_SYMS); // One thread block covers one entire PRB: 12 subcarriers x MAX_N_DATA_SYMS
-   dim3 gridDim(MAX_N_PRBS, nCsi2Ues);  
+   dim3 gridDim(MAX_N_PRBS, nCsi2Ues);
+
+   // The kernel's cooperative `tid < nSym` SMEM preloads
+   // (sh_dmrsFlag, sh_numUnassigned*, sh_csi1NRes, sh_rvdHarqNRes) require
+   // the block to contain at least `nSym` threads. Per-UE nSym is bounded
+   // above by MAX_N_DATA_SYMS (computed in the loop above), so this check
+   // guards future changes to blockDim that might shrink it below that bound.
+   assert(blockDim.x * blockDim.y >= MAX_N_DATA_SYMS &&
+          "uciOnPuschSegLLRs2Kernel: blockDim.x * blockDim.y must be >= MAX_N_DATA_SYMS "
+          "(per-symbol cooperative preloads rely on tid covering [0, nSym))");
 
    // kernel (only one kernel option for now)
    void* kernelFunc = reinterpret_cast<void*>(uciOnPuschSegLLRs2Kernel);

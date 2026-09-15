@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -189,9 +189,9 @@ protected:
     bool initialized;                                          ///< Flag indicating whether init() has been called
     size_t cpu_obj_size;                                       ///< Size of main CPU object (e.g., sizeof(class))
     size_t cpu_regular_size;                                   ///< Accumulated CPU regular memory (malloc/new)
-    size_t cpu_pinned_size;                                    ///< Accumulated CPU pinned memory (cudaHostAlloc)
+    size_t cpu_pinned_size;                                    ///< Accumulated CPU pinned memory (cuMemHostAlloc)
     size_t gpu_pinned_size;                                    ///< Accumulated GPU pinned memory (GDR buffers)
-    size_t gpu_regular_size;                                   ///< Accumulated GPU device memory (cudaMalloc)
+    size_t gpu_regular_size;                                   ///< Accumulated GPU device memory (cuMemAlloc)
     int items;                                                 ///< Number of items tracked (used for counting allocations)
 };
 

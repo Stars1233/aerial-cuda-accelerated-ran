@@ -69,6 +69,9 @@ void setPdschPerTbParams(PdschPerTbParams& tbParams,
     tbParams.max_REs = rateMatchLen / (qamMod * numLayers);
     tbParams.cinit = cinit;
     tbParams.firstCodeBlockIndex = 0;  // Always zero?
+
+    // no fastpath for pyAerial for now
+    tbParams.fast_path = false;
 }
 
 
@@ -265,6 +268,7 @@ void readDmrsParams(const std::vector<py::object>& pdschConfigs,
             dmrsPrm.ref_point = refPoint;
             dmrsPrm.ueGrp_idx = ueGrpIdx;
             dmrsPrm.dmrsCdmGrpsNoData1 = (numDmrsCdmGrps == 1);
+            dmrsPrm.su_mimo = (numUes == 1);
 
             ++numTbs;
         }

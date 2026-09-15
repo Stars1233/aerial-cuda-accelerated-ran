@@ -13,20 +13,34 @@
 % See the License for the specific language governing permissions and
 % limitations under the License.
 
-function errFlag = genLP_POC2(caseSet)
+function errFlag = genLP_POC2(caseSet, cellCountToGenerate)
 
-compact_TC = [46, 48, 49, 50, 51, 59, 59.2, 59.3, 59.4, 59.5, 59.6, 60, 60.3, 60.4, 61, 62.3, 63.3, 65.1, 65.2, 65.3, 65.4, ...
-                66.1, 66.2, 66.3, 66.4, 67, 67.1, 67.2, 67.3, 67.4, 67.5, 69, 69.1, 69.2, 69.3, 69.4, 69.5, 71, 73, 75, 79, 79.1, 79.2, 81.1, 81.2, 81.3, 81.4, 83.1, 83.2, 83.3, 83.4, 85, 87, 89, 91, 101, 101.1, 102, 102.1];
+compact_TC = perfPatternTvYaml('compact_case_set');
 
+if nargin < 2
+    cellCountToGenerate = [];
+elseif ~isempty(cellCountToGenerate)
+    if ~isnumeric(cellCountToGenerate) || ~isscalar(cellCountToGenerate) || ...
+       ~isfinite(cellCountToGenerate) || cellCountToGenerate < 0 || ...
+       fix(cellCountToGenerate) ~= cellCountToGenerate
+        error('cellCountToGenerate must be a non-negative integer scalar.');
+    end
+end
+
+% Which per-pattern cell count bounds the launch pattern: the full set only
+% generates full_cells TVs per config block, the compact set compact_cells.
+% genLP_POC2 must not reference more cells than were generated.
+useCompactCells = false;
 if nargin == 0
     TcToTest = 'full';
-elseif nargin == 1
+elseif nargin >= 1
     if isnumeric(caseSet)
         TcToTest = caseSet;
     else
         switch caseSet
             case 'compact'
                 TcToTest = compact_TC;
+                useCompactCells = true;
             case 'full'
                 TcToTest = "full";
             otherwise
@@ -397,368 +411,121 @@ end
     channels_V(35) = {PUSCH};  % slot 34
     channels_V(36) = {PUSCH};  % slot 35
 
-      %% pattern config
-      % patternNum,  nTvCell,   patternType,   dlTvIdx1,  dlTvIdx2Delta, ulTvIdx, channels
-CFG = {
-        % old patterns
-        % 6,              8,       "Legacy",        252,         8*3,        668,    channels_A;
-        % 8,              8,       "Legacy",        244,         8*3,        668,    channels_A;
-        % 11,            16,       "Legacy",        292,        16*3,        700,    channels_A;
-        % 14,            16,       "Legacy",       1112,        16*3,        700,    channels_A;
-        % 16,            16,       "Legacy",       1048,        16*3,        700,    channels_A;
-        % % 16C (1 UE, 1/2 PRBs per UE, shared channel only)
-        % 21,            16,       "Legacy",       1000,           0,       1000,    channels_B;
-        % 34,            16,       "Legacy",        388,           0,        892,    channels_B;
-        % %
-        % 24,            16,        "SFN_0",       1416,           0,       1288,    channels_C;
-        % 24.1,          16,        "SFN_0",       1744,           0,       1512,    channels_C;
-        % 24.4,          16,        "SFN_0",       2000,           0,       1288,    channels_D;
-        % %
-        % 25,            16,        "SFN_1",       1480,           0,       1288,    channels_E;
-        % 25.1,          16,        "SFN_1",       1808,           0,       1512,    channels_E;
-        % 25.2           16,        "SFN_1",       1856,           0,       1512,    channels_E;
-        % 25.3,          16,        "SFN_1",       1928,           0,       1512,    channels_E;
-        % 25.4,          16,        "SFN_1",       2064,           0,       1288,    channels_F;
-        % 25.5,          16,        "SFN_1",       2168,           0,       1512,    channels_F;
-        % 25.6,          16,        "SFN_1",       2216,           0,       1288,    channels_F;
-        % 25.7,          16,        "SFN_1",       2288,           0,       1288,    channels_F;
-        % 25.8,          16,        "SFN_1",       2360,           0,       1512,    channels_F;
-        % %
-        % 26,             8,       "Legacy",       1304,           0,       1128,    channels_A2;
-        % % 
-        % 27,             8,        "SFN_0",       1528,           0,       1352,    channels_C;
-        % 27.4           12,        "SFN_0",       2720,           0,       1584,    channels_D;
-        % %
-        % 28,             8,        "SFN_1",       1560,           0,       1352,    channels_E;
-        % 28.2,           8,        "SFN_1",       1904,           0,       1352,    channels_E;
-        % 28.3,           8,        "SFN_1",       1976,           0,       1352,    channels_E;
-        % 28.4,           8,        "SFN_1",       2144,           0,       1352,    channels_F;
-        % 28.6,           8,        "SFN_1",       2264,           0,       1352,    channels_F;
-        % 28.7,          12,        "SFN_1",       2768,           0,       1584,    channels_F;
-        % %
-        % 29,             8,        "SFN_0",       1584,           0,       1384,    channels_C;
-        % 30,             8,        "SFN_1",       1616,           0,       1384,    channels_E;
-        % 31,            16,        "SFN_1",       1640,           0,       1416,    channels_E;
-        % 32,             8,        "SFN_1",       1688,           0,       1480,    channels_E;
-        % % patternNum,  nTvCell, patternType,              dlTvIdx1,                dlTvIdx2Delta, ulTvIdx,         channels
-        % 33,            16,      "80slots",               {[2000,2288,2000,1712]},         0,         1288,         channels_G;
-        % 35,            12,      "80slots",               {[2720,2768,2720,2804]},         0,         1584,         channels_G;
-        % 37,            16,      "80slots",               {[2000,2512,2000,2560]},         0,         1288,         channels_G;
-        % 38,            16,      "80slots",               {[2000,2592,2000,2640]},         0,         1288,         channels_G;
-        % 38.1,          16,      "80slots",               {[2000,2672,2000,2640]},         0,         1288,         channels_G;
-      % patternNum,  nTvCell, patternType,              dlTvIdx1,                dlTvIdx2Delta,    ulTvIdx,         channels
-        39,            16,      "80slots",               {[2000,2288,2000,1712]},         0,         1632,         channels_G;
-        40,            12,      "80slots",               {[2720,2768,2720,2804]},         0,         1696,         channels_G;
-        41,            12,      "80slots",               {[2828,2876,2828,2912]},         0,         1744,         channels_G;         
-        41.1,          12,      "80slots",               {[2828,2876,2828,2912]},         0,         2304,         channels_G;         
-        41.2,          12,      "80slots",               {[2828,2876,2828,2912]},         0,         2640,         channels_G;         
-        41.3,          12,      "80slots",               {[2828,2876,2828,2912]},         0,         2688,         channels_G;         
-        42,            12,      "80slots",               {[2828,2876,2828,2912]},         0,         1792,         channels_G;               
-        43,            16,      "80slots",               {[2936,3000,2936,3048]},         0,         1840,         channels_G;
-        44,            16,      "80slots",               {[2936,3080,2936,3128]},         0,         1840,         channels_G;                       
-        44.1,          16,      "80slots",               {[2936,3080,2936,3128]},         0,         2352,         channels_G;                       
-        44.2,          16,      "80slots",               {[2936,3080,2936,3128]},         0,         2736,         channels_G;                       
-        44.3,          16,      "80slots",               {[2936,3080,2936,3128]},         0,         2800,         channels_G;                       
-        45,            16,      "80slots",               {[2936,3000,2936,3048]},         0,         1904,         channels_G;               
-        46,            12,      "7beams",                {[3160]},                        0,         1968,         channels_H;               
-        47,            16,      "7beams",                {[3400]},                        0,         2016,         channels_H;               
-        48,            16,      "7beams",                {[3720]},                        0,         2080,         channels_H;               
-        49,            20,      "7beams",                {[4040]},                        0,         2144,         channels_I;               
-        50,            16,      "7beams",                {[4440]},                        0,         2224,         channels_H;               
-        51,            20,      "7beams",                {[4760]},                        0,         2416,         channels_H;               
-        52.1,      [12,16],      "CA",                   {3160,4440},                     0,     [1968, 2224],     channels_H;               
-        52.2,      [12,16],      "CA",                   {3160,3720},                     0,     [1968, 2080],     channels_H;               
-        52.3,      [16,16],      "CA",                   {4440,3720},                     0,     [2224, 2080],     channels_H;               
-        52.4,   [12,16,16],      "CA",                   {3160,4440,3720},                0,     [1968, 2224, 2080],     channels_H;               
-        53,            16,      "7beams",                {[5160]},                        0,         2496,         channels_H;               
-        54,            20,      "7beams",                {[5480]},                        0,         2560,         channels_I;               
-        55,            16,      "7beams",                {[6032]},                        0,         2896,         channels_H;               
-        56,            20,      "7beams",                {[6352]},                        0,         2960,         channels_I;               
-        57,            8,      "80slots",               {[5960,5992,5960,6016]},          0,         2864,         channels_G;         
-        58,            16,      "7beams",                {[6752]},                        0,         2016,         channels_H;
-        59,            20,      "7beams",                {[7072]},                        0,         3040,         channels_L;
-        59.1,          20,      "7beams",                {[7072]},                        0,         3200,         channels_L;
-        59.2,          20,      "7beams",                {[7072]},                        0,         3760,         channels_L;
-        59.3,          40,      "7beams",                {[9472]},                        0,         4471,         channels_L;
-        59.4,          20,      "7beams",                {[7072]},                        0,         3520,         channels_L;
-        59.5,          40,      "7beams",                {[9472]},                        0,         4631,         channels_L;
-        59.6,          40,      "7beams",                {[9472]},                        0,         4471,         channels_L;  % negative TC
-        60,            40,      "7beams",                {[10452]},                       0,         3600,         channels_L;
-        % 60.1,          20,      "7beams",                {[10452]},                       0,         3280,         channels_L;
-        60.2,          40,      "7beams",                {[10452]},                       0,         4911,         channels_L;
-        60.3,          40,      "7beams",                {[10452]},                       0,         5071,         channels_L;
-        60.4,          40,      "7beams",                {[10452]},                       0,         5231,         channels_L;
-        % 60.5,          20,      "7beams",                {[10452]},                       0,         4220,         channels_L;
-        61,            20,      "7beams",                {[7872]},                        0,         3360,         channels_I;      
-        62.3,          40,      "7beams_sslot",          {[9472]},                        0,         4471,         channels_J;
-        63.3,          40,      "7beams_sslot",          {[10452]},                       0,         5071,         channels_J;
-        65.1,          40,      "7beams_puschOnlyU",     {[11432]},                       0,         5971,         channels_N;
-        65.2,          40,      "7beams_puschOnlyU",     {[11432]},                       0,         6011,         channels_N;
-        65.3,          40,      "7beams",                {[11432]},                       0,         6051,         channels_L;
-        65.4,          40,      "7beams",                {[11432]},                       0,         6211,         channels_L;
-        66.1,          15,      "64TR_nrSim_puschOnlyU", {[11252]},                       0,         5431,         channels_O;
-        66.2,          15,      "64TR_nrSim_puschOnlyU", {[11252]},                       0,         5446,         channels_O;
-        66.3,          15,      "64TR_nrSim",            {[11252]},                       0,         5461,         channels_M;
-        66.4,          15,      "64TR_nrSim",            {[11252]},                       0,         5581,         channels_M;
-        67,            15,      "64TR_nrSim",            {[11342]},                       0,         4791,         channels_M;
-        67.1,          15,      "64TR_nrSim_puschOnlyU", {[11342]},                       0,         5701,         channels_O;
-        67.2,          15,      "64TR_nrSim_puschOnlyU", {[11342]},                       0,         5716,         channels_O;
-        67.3,          15,      "64TR_nrSim",            {[11342]},                       0,         5731,         channels_M;
-        67.4,          15,      "64TR_nrSim",            {[11342]},                       0,         5851,         channels_M;
-        67.5,          15,      "64TR_nrSim",            {[11342]},                       0,         5731,         channels_M;  % negative TC
-        69.3,          15,      "64TR_nrSim_624",        {[12232]},                       0,         6371,         channels_P;
-        69,            15,      "64TR_nrSim_624",        {[12232]},                       0,         6621,         channels_P;
-        69.1,          15,      "64TR_nrSim_624",        {[12232]},                       0,         6696,         channels_P;
-        69.2,          15,      "64TR_nrSim_624",        {[12232]},                       0,         6771,         channels_P;
-        69.4,          15,      "64TR_nrSim_624",        {[12232]},                       0,         6846,         channels_P;
-        69.5,          15,      "64TR_nrSim_624",        {[12232]},                       0,         7260,         channels_T;
-        71,            15,      "64TR_nrSim_624",        {[12232]},                       0,         6446,         channels_Q;
-        73,            20,      "64TR_nrSim_624",        {[12442]},                       0,         6521,         channels_P;
-        75,            15,      "64TR_nrSim_624",        {[12722]},                       0,         6921,         channels_P;
-        77,            15,      "64TR_nrSim_638",        {[12932]},                       0,         7050,         channels_R;
-        79,            15,      "64TR_nrSim_640",        {[13067]},                       0,         7155,         channels_S;
-        79.1,          15,      "64TR_nrSim_640",        {[13067]},                       0,         7953,         channels_U;  % pattern 79a: 4 SRS symbols in S slot, 2 SRS symbols in U slot, 2 ports per UE
-        79.2,          15,      "64TR_nrSim_640",        {[13067]},                       0,         8058,         channels_U;  % pattern 79b: 4 SRS symbols in S slot, 2 SRS symbols in U slot, 4 ports per UE
-        81.1,          15,      "64TR_nrSim_640",        {[13217]},                       0,         7365,         channels_S;
-        81.2,          15,      "64TR_nrSim_640",        {[13217]},                       0,         7470,         channels_U;
-        81.3,          15,      "64TR_nrSim_640",        {[13217]},                       0,         7365,         channels_S;
-        81.4,          15,      "64TR_nrSim_640",        {[13217]},                       0,         7470,         channels_U;
-        83.1,          15,      "64TR_nrSim_640",        {[13382]},                       0,         7575,         channels_S;
-        83.2,          15,      "64TR_nrSim_640",        {[13382]},                       0,         7680,         channels_U;
-        83.3,          15,      "64TR_nrSim_640",        {[13382]},                       0,         7575,         channels_S;
-        83.4,          15,      "64TR_nrSim_640",        {[13382]},                       0,         7680,         channels_U;
-        85,            15,      "64TR_nrSim_640",        {[13547]},                       0,         7785,         channels_S;
-        87,            15,      "64TR_nrSim_640",        {[13067]},                       0,         7155,         channels_S;
-        89,             9,      "64TR_nrSim_640",        {[13712]},                       0,         7890,         channels_S;
-        91,            15,      "64TR_nrSim_640",        {[13802]},                       0,         8163,         channels_S;
-        101,           24,      "4TR_pusch_prach",        {[7472]},                       0,         4375,         channels_V;
-        101.1,         24,      "4TR_pusch_prach",        {[7472]},                       0,         8268,         channels_V;
-        102,           24,      "4TR_pusch_prach",        {[7496]},                       0,         8364,         channels_V;
-        102.1,         24,      "4TR_pusch_prach",        {[7496]},                       0,         8460,         channels_V;
-        }; % end pattern CFG  
-             
-        S_SLOT_CFG = {
-        % 0 means no ULMIX TV in S slot or will be added by BFW_SRS_BIND_CFG 
-        % tvNumber WILL increase by cell number
-        % patternNum    nTvCell   sTvIdx
-          62.3           40        4040;
-          63.3           40        5391;
-          66.1           15        [0 0 0 0];
-          66.2           15        [0 0 0 0];
-          66.3           15        [0 0 5551 5566];
-          66.4           15        [0 0 5671 5686];
-          67             15        [0 0 4881 4896];
-          67.1           15        [0 0 0 0];
-          67.2           15        [0 0 0 0];
-          67.3           15        [0 0 5821 5836];
-          67.4           15        [0 0 5941 5956];
-          67.5           15        [0 0 5821 5836];  % negative TC
-          69.3           15        [0 0 6431 0];
-          69             15        [0 0 6681 0];
-          69.1           15        [0 0 6756 0];
-          69.2           15        [0 0 6831 0];
-          69.4           15        [0 0 6906 0];
-          69.5           15        [0 7320 7335 7350];
-          71             15        [0 0 6506 0];
-          73             20        [0 0 6601 0];
-          75             20        [0 0 6981 0];
-          77             15        [0 7080 7125 7140];
-          79             15        [0 7185 7230 7245];
-          79.1           15        [0 7983 8028 8043];  % pattern 79a: S slot TVs
-          79.2           15        [0 8088 8133 8148];  % pattern 79b: S slot TVs
-          81.1           15        [0 7395 7440 7455];
-          81.2           15        [0 7500 7545 7560];
-          81.3           15        [0 7395 7440 7455];
-          81.4           15        [0 7500 7545 7560];
-          83.1           15        [0 7605 7650 7665];
-          83.2           15        [0    0 7755 7770];
-          83.3           15        [0 7605 7650 7665];
-          83.4           15        [0    0 7755 7770];
-          85             15        [0    0 7860 7875];
-          87             15        [0 7185 7230 7245];
-          89              9        [0    0 7935 7944];
-          91             15        [0    0 8238 8253];
-        };
+    % Pattern 103: multichannel, 40-slot frame (SFN%2=0 + SFN%2=1)
+    channels_103 = {1, 40};
+    % Frame 0 (SFN%2=0): D slots have CSI-RS
+    channels_103(1:3)   = {PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI};
+    channels_103(4)     = {PDCCHDLUL_PDSCH};   % S slot 3
+    channels_103(5)     = {PUSCH_PUCCH};        % slot 4
+    channels_103(6)     = {PUSCH_PUCCH_PRACH};  % slot 5
+    channels_103(7:13)  = {PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI};
+    channels_103(14)    = {PDCCHDLUL_PDSCH};   % S slot 13
+    channels_103(15)    = {PUSCH_PUCCH};        % slot 14
+    channels_103(16)    = {PUSCH_PUCCH_PRACH};  % slot 15
+    channels_103(17:20) = {PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI};
+    % Frame 1 (SFN%2=1): D slots have TRS but no CQI CSI-RS
+    channels_103(21:23) = {PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI};
+    channels_103(24)    = {PDCCHDLUL_PDSCH};   % S slot 23
+    channels_103(25)    = {PUSCH_PUCCH};        % slot 24
+    channels_103(26)    = {PUSCH_PUCCH_PRACH};  % slot 25
+    channels_103(27:33) = {PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI};
+    channels_103(34)    = {PDCCHDLUL_PDSCH};   % S slot 33
+    channels_103(35)    = {PUSCH_PUCCH};        % slot 34
+    channels_103(36)    = {PUSCH_PUCCH_PRACH};  % slot 35
+    channels_103(37:40) = {PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI, PDSCH_PDCCHDLUL_CSI};
 
-        BFW_CFG = {
-            % patternNum    bfwTvDlIdx  bfwTvUlIdx
-        };
+    %% pattern config
+    % Pattern rows live in perf_pattern/perf_pattern_helper.yaml and included pattern files. Channel layouts remain here
+    % because they are MATLAB cell arrays of channel definitions.
+    channelMap = containers.Map('KeyType', 'char', 'ValueType', 'any');
+    channelMap('channels_A') = channels_A;
+    channelMap('channels_A2') = channels_A2;
+    channelMap('channels_B') = channels_B;
+    channelMap('channels_C') = channels_C;
+    channelMap('channels_D') = channels_D;
+    channelMap('channels_E') = channels_E;
+    channelMap('channels_F') = channels_F;
+    channelMap('channels_G') = channels_G;
+    channelMap('channels_H') = channels_H;
+    channelMap('channels_I') = channels_I;
+    channelMap('channels_J') = channels_J;
+    channelMap('channels_K') = channels_K;
+    channelMap('channels_L') = channels_L;
+    channelMap('channels_M') = channels_M;
+    channelMap('channels_N') = channels_N;
+    channelMap('channels_O') = channels_O;
+    channelMap('channels_P') = channels_P;
+    channelMap('channels_Q') = channels_Q;
+    channelMap('channels_R') = channels_R;
+    channelMap('channels_S') = channels_S;
+    channelMap('channels_T') = channels_T;
+    channelMap('channels_U') = channels_U;
+    channelMap('channels_V') = channels_V;
+    channelMap('channels_103') = channels_103;
 
-        % bind SRS and BFW TV
-        % srsSlotIdx is the slot index of ULMIX TV (including SRS) in launch pattern
-        % srsTvNameSlotIdx is the slot index of ULMIX TV name
-        % E.g., TV may use slot 0 in TV name (srsTvNameSlotIdx=0) and need to be run at slot 3 (srsSlotIdx=3)
-        % bfwTvDlTvIdx or bfwTvUlTvIdx = 0 means no bfw tv binds with this SRS
-        % tv number WILL NOT increase by cell number
-        BFW_SRS_BIND_CFG = {
-            % patternNum    srsTvIdx    srsSlotIdx    srsTvNameSlotIdx    bfwTvDlTvIdx    bfwDlSlotIdx   bfwTvUlTvIdx    bfwUlSlotIdx   cellIdxOverride
-            % Note: cellIdxOverride = [] means apply to all cells. cellIdxOverride = [2 4] means only apply to cells 2 and 4 (if they exist in nCell config).
-            %       When generating LP for nC, only cells in intersect(cellIdxOverride, 0:nCell-1) will be applied.
-            66.1,           823         3,            3,                  9358,           [0:2,5:12,15:22,25:32,35:38]       0,        [],   [];
-            66.1,           823         3,            3,                  9362,           [39]             0,        [],   [];
-            66.1,           833        13,           13,                  0,              []                  0,        [],   [];
-            66.2,           823         3,            3,                  9358,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            66.2,           823         3,            3,                  9362,           [39]             0,        [],   [];
-            66.2,           833        13,           13,                  0,              []                  0,        [],   [];
-            66.3,           823         3,            3,                  9358,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            66.3,           823         3,            3,                  9362,           [39]             0,        [],   [];
-            66.3,           833        13,           13,                  0,              []                  0,        [],   [];
-            66.4,           823         3,            3,                  9358,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            66.4,           823         3,            3,                  9362,           [39]             0,        [],   [];
-            66.4,           833        13,           13,                  0,              []                  0,        [],   [];
-            67,             823         3,            3,                  9350,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            67,             823         3,            3,                  9354,           [39]             0,        [],   [];
-            67,             833        13,           13,                  0,              []                  0,        [],   [];
-            67.1,           823         3,            3,                  9350,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            67.1,           823         3,            3,                  9354,           [39]             0,        [],   [];
-            67.1,           833        13,           13,                  0,              []                  0,        [],   [];
-            67.2,           823         3,            3,                  9350,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            67.2,           823         3,            3,                  9354,           [39]             0,        [],   [];
-            67.2,           833        13,           13,                  0,              []                  0,        [],   [];
-            67.3,           823         3,            3,                  9350,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            67.3,           823         3,            3,                  9354,           [39]             0,        [],   [];
-            67.3,           833        13,           13,                  0,              []                  0,        [],   [];
-            67.4,           823         3,            3,                  9350,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            67.4,           823         3,            3,                  9354,           [39]             0,        [],   [];
-            67.4,           833        13,           13,                  0,              []                  0,        [],   [];
-            67.5,           823         3,            3,                  9350,           [0:2,5:12,15:22,25:32,35:38]        0,        [],   [];
-            67.5,           823         3,            3,                  9354,           [39]             0,        [],   [];
-            67.5,           833        13,           13,                  0,              []                  0,        [],   [];
-            69.3,         21523         3,            3,                  9364,           [0,1,39]                          9357,        [3,13,23,33],   [];
-            69.3,         21523         3,            3,                  9356,           [2,5:12,15:22,25:32,35:38]        9355,        [4,14,24,34],   [];
-            69,           21523         3,            3,                  9364,           [0,1,39]                          9357,        [3,13,23,33],   [];
-            69,           21523         3,            3,                  9356,           [2,5:12,15:22,25:32,35:38]        9355,        [4,14,24,34],   [];
-            69.1,         21523         3,            3,                  9364,           [0,1,39]                          9373,        [3,13,23,33],   [];
-            69.1,         21523         3,            3,                  9356,           [2,5:12,15:22,25:32,35:38]        9375,        [4,14,24,34],   [];
-            69.2,         21523         3,            3,                  9364,           [0,1,39]                          9377,        [3,13,23,33],   [];
-            69.2,         21523         3,            3,                  9356,           [2,5:12,15:22,25:32,35:38]        9379,        [4,14,24,34],   [];
-            69.4,         21523         3,            3,                  9364,           [0,1,39]                          9357,        [3,13,23,33],   [];
-            69.4,         21523         3,            3,                  9356,           [2,5:12,15:22,25:32,35:38]        9355,        [4,14,24,34],   [];
-            69.5,         21523         3,            3,                  9364,           [0,1,39]                          9377,        [3,13,23,33],   [];
-            69.5,         21523         3,            3,                  9356,           [2,5:12,15:22,25:32,35:38]        9379,        [4,14,24,34],   [];
-            71,           21563         3,            3,                  9368,           [0,1,39]                          9365,        [3,13,23,33],   [];
-            71,           21563         3,            3,                  9366,           [2,5:12,15:22,25:32,35:38]        9367,        [4,14,24,34],   [];
-            73,           21583         3,            3,                  9370,           [0,1,39]                          9369,        [3,13,23,33],   [];
-            73,           21583         3,            3,                  9372,           [2,5:12,15:22,25:32,35:38]        9371,        [4,14,24,34],   [];
-            75,           21603         3,            3,                  9382,           [0,1,39]                          9381,        [3,13,23,33],   [];
-            75,           21603         3,            3,                  9384,           [2,5:12,15:22,25:32,35:38]        9383,        [4,14,24,34],   [];
-            77,           21623         3,            3,                  9386,           [39,79]                           9385,        [3,13,23,33,43,53,63,73],   [];
-            77,           21623         3,            3,                  9388,           [0:2,5:8,10:12,15:22,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9387,        [4,14,24,34,44,54,64,74],   [];
-            77,           21623        43,            3,                  9390,           [9,49]                            0,           [],   [];
-            79,           21643         3,            3,                  9392,           [39,79]                           9391,        [3,13,23,33,43,53,63,73],   [];
-            79,           21643         3,            3,                  9394,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9393,        [4,24,44,64],   [];
-            79,           21643        43,            3,                  9396,           [9,49]                            9395,        [14,34,54,74],   [];
-            79.1,         21640         3,            3,                  9502,           [39,79]                           9501,        [3,13,23,33,43,53,63,73],   [];
-            79.1,         21640         3,            3,                  9504,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9503,        [4,24,44,64],   [];
-            79.1,         21640        43,            3,                  9506,           [9,49]                            9505,        [14,34,54,74],   [];
-            79.2,         21641         3,            3,                  9508,           [39,79]                           9507,        [3,13,23,33,43,53,63,73],   [];
-            79.2,         21641         3,            3,                  9510,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9509,        [4,24,44,64],   [];
-            79.2,         21641        43,            3,                  9512,           [9,49]                            9511,        [14,34,54,74],   [];
-            81.1,         21673         3,            3,                  9402,           [39,79]                           9401,        [3,13,23,33,43,53,63,73],   [];
-            81.1,         21673         3,            3,                  9404,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9403,        [4,24,44,64],   [];
-            81.1,         21673        43,            3,                  9406,           [9,49]                            9405,        [14,34,54,74],   [];
-            81.2,         21693         3,            3,                  9408,           [39,79]                           9407,        [3,13,23,33,43,53,63,73],   [];
-            81.2,         21693         3,            3,                  9410,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9409,        [4,24,44,64],   [];
-            81.2,         21693        43,            3,                  9412,           [9,49]                            9411,        [14,34,54,74],   [];
-            81.3,         21673         3,            3,                  9402,           [39,79]                           9401,        [3,13,23,33,43,53,63,73],   [];
-            81.3,         21673         3,            3,                  9404,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9403,        [4,24,44,64],   [];
-            81.3,         21673        43,            3,                  9406,           [9,49]                            9405,        [14,34,54,74],   [];
-            81.4,         21693         3,            3,                  9408,           [39,79]                           9407,        [3,13,23,33,43,53,63,73],   [];
-            81.4,         21693         3,            3,                  9410,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9409,        [4,24,44,64],   [];
-            81.4,         21693        43,            3,                  9412,           [9,49]                            9411,        [14,34,54,74],   [];
-            83.1,         21713         3,            3,                  9414,           [39,79]                           9413,        [3,23,43,63],   [];
-            83.1,         21723        13,           13,                  9416,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9415,        [4,24,44,64],   [];
-            83.1,         21713        43,            3,                  9418,           [9,49]                            9417,        [13,33,53,73],   [];
-            83.1,         21723        53,           13,                  [],             []                                9419,        [14,34,54,74],   [];
-            83.2,         21733    [3,43],            3,                  9422,           [39,79]                           9421,        [3,23,43,63],   [];
-            83.2,         21734    [4,44],            4,                  9424,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9423,        [4,24,44,64],   [];
-            83.2,         21735    [5,45],            5,                  9426,           [9,49]                            9425,        [13,33,53,73],   [];
-            83.2,         21743   [13,53],           13,                  [],             []                                9427,        [14,34,54,74],   [];
-            83.3,         21713         3,            3,                  9414,           [39,79]                           9413,        [3,23,43,63],   [];
-            83.3,         21723        13,           13,                  9416,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9415,        [4,24,44,64],   [];
-            83.3,         21713        43,            3,                  9418,           [9,49]                            9417,        [13,33,53,73],   [];
-            83.3,         21723        53,           13,                  [],             []                                9419,        [14,34,54,74],   [];
-            83.4,         21733    [3,43],            3,                  9422,           [39,79]                           9421,        [3,23,43,63],   [];
-            83.4,         21734    [4,44],            4,                  9424,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9423,        [4,24,44,64],   [];
-            83.4,         21735    [5,45],            5,                  9426,           [9,49]                            9425,        [13,33,53,73],   [];
-            83.4,         21743   [13,53],           13,                  [],             []                                9427,        [14,34,54,74],   [];
-            85,           21753    [3,43],            3,                  9462,           [39,79]                           9461,        [3,23,43,63],   [];
-            85,           21753    [4,44],            3,                  9464,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9463,        [4,24,44,64],   [];
-            85,           21763    [5,45],           13,                  9466,           [9,49]                            9465,        [13,33,53,73],   [];
-            85,           21763   [13,53],           13,                  [],             []                                9467,        [14,34,54,74],   [];
-            87,           21643         3,            3,                  9392,           [39,79]                           9391,        [3,13,23,33,43,53,63,73],   [];
-            87,           21643         3,            3,                  9394,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9393,        [4,24,44,64],   [];
-            87,           21643        43,            3,                  9396,           [9,49]                            9395,        [14,34,54,74],   [];
-            % Pattern 89: 9C Mixed BW (100H/100L/100L/90H/90L/90L/60H/60L/60L)
-            % Cell 0: 100 MHz heavy (SRS slot3: 21793, SRS slot13: 21803, BFW: 9449-9454)
-            89,           21793         3,            3,                  9450,           [39,79]                           9449,        [3:10:73],       [0];
-            89,           21793        43,            3,                  9452,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9451,        [4,24,44,64],   [0];
-            89,           21803   [13,53],           13,                  9454,           [9,49]                            9453,        [14,34,54,74],   [0];
-            % Cells 1,2: 100 MHz light (SRS slot3: 21813, SRS slot13: 21823, BFW: 9455-9460)
-            89,           21813         3,            3,                  9456,           [39,79]                           9455,        [3:10:73],       [1,2];
-            89,           21813        43,            3,                  9458,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9457,        [4,24,44,64],   [1,2];
-            89,           21823   [13,53],           13,                  9460,           [9,49]                            9459,        [14,34,54,74],   [1,2];
-            % Cell 3: 90 MHz heavy (SRS slot3: 21833, SRS slot13: 21843, BFW: 9469-9474)
-            89,           21833         3,            3,                  9470,           [39,79]                           9469,        [3:10:73],       [3];
-            89,           21833        43,            3,                  9472,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9471,        [4,24,44,64],   [3];
-            89,           21843   [13,53],           13,                  9474,           [9,49]                            9473,        [14,34,54,74],   [3];
-            % Cells 4,5: 90 MHz light (SRS slot3: 21853, SRS slot13: 21863, BFW: 9475-9480)
-            89,           21853         3,            3,                  9476,           [39,79]                           9475,        [3:10:73],       [4,5];
-            89,           21853        43,            3,                  9478,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9477,        [4,24,44,64],   [4,5];
-            89,           21863   [13,53],           13,                  9480,           [9,49]                            9479,        [14,34,54,74],   [4,5];
-            % Cell 6: 60 MHz heavy (SRS slot3: 21873, SRS slot13: 21883, BFW: 9481-9486)
-            89,           21873         3,            3,                  9482,           [39,79]                           9481,        [3:10:73],       [6];
-            89,           21873        43,            3,                  9484,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9483,        [4,24,44,64],   [6];
-            89,           21883   [13,53],           13,                  9486,           [9,49]                            9485,        [14,34,54,74],   [6];
-            % Cells 7,8: 60 MHz light (SRS slot3: 21893, SRS slot13: 21903, BFW: 9487-9492)
-            89,           21893         3,            3,                  9488,           [39,79]                           9487,        [3:10:73],       [7,8];
-            89,           21893        43,            3,                  9490,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9489,        [4,24,44,64],   [7,8];
-            89,           21903   [13,53],           13,                  9492,           [9,49]                            9491,        [14,34,54,74],   [7,8];
-            % Pattern 91: 64TR 25-3 column D, 24 DL layer, reusing SRS 21753/21763 with BFW 9493-9499
-            91,           21753         3,            3,                  9494,           [39,79]                           9493,        [3,23,43,63],   [];
-            91,           21753        43,            3,                  9496,           [0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78]  9495,        [4,24,44,64],   [];
-            91,           21763        13,           13,                  9498,           [9,49]                            9497,        [13,33,53,73],   [];
-            91,           21763        53,           13,                  [],             []                                9499,        [14,34,54,74],   [];
-        };
-               
-        % override TV config, used for negative TC testing or reuse TVs
-        OVERRIDE_CFG = {
-        % patternNum  basePatternNum  cellIdx  tvIdx  tvIdxIncreInd  slotIdx  tvNameSlotIdx  mixTVInd  targetTvDlInd  verbose  
-          59.6,         59.3,          2,      3840,       0           15,        0,            1           0            1;  % Replace ULMIX TV at cell 2 (3rd cell) in slot 15,
-          67.5,         67.3,          2,      6996,       0           15,        0,            1           0            1;  % Replace ULMIX TV at cell 2 (3rd cell) in slot 15,
-          81.3,         81.1,       [0:14],    13367,      1           23,        0,            2           1            0;  % Replace DLMIX TV at cell 0~14 (1~15 cell) in slot 23,
-          81.4,         81.2,       [0:14],    13367,      1           23,        0,            2           1            0;  % Replace DLMIX TV at cell 0~14 (1~15 cell) in slot 23,
-          83.3,         83.1,       [0:14],    13532,      1           23,        0,            2           1            0;  % Replace DLMIX TV at cell 0~14 (1~15 cell) in slot 23,
-          83.4,         83.2,       [0:14],    13532,      1           23,        0,            2           1            0;  % Replace DLMIX TV at cell 0~14 (1~15 cell) in slot 23,
-          87,           79,         [0:14],    13697,      1           23,        0,            2           1            0;  % Replace DLMIX TV at cell 0~14 (1~15 cell) in slot 23,
-        };
-        % Note: basePatternNum is only for reference. cellIdx is 0-based indexing. 
-        %       cellIdx is the range of cells to be replaced. tvIdx is the TV index to replace. 
-        %       tvIdxIncreInd = 0 means that all cell will be replaced using the same TV number; tvIdxIncreInd = 1 means TV numbers incease with cell index by 1.
-        %       slotIdx is the slot index to replace. tvNameSlotIdx is the slot index to use in TV filename.
-        %       mixTVInd is for TV naming, 0 for regular, 1 for ULMIX, 2 for DLMIX in TV name   
-        %       targetTvDlInd = 0 means ULMIX TV will be replaced, targetTvInd = 1 means DLMIX TV will be replaced   
-        %       verbose = 1, print out replacedment details
-    
+    [CFG, fullCellCount, compactCellCount, S_SLOT_CFG, BFW_CFG, BFW_SRS_BIND_CFG, OVERRIDE_CFG] = perfPatternTvYaml('poc2_cfg', channelMap);
+
     %% run
 
 [nCases, ~] = size(CFG);
+
+if isnumeric(TcToTest)
+    poc2Patterns = cell2mat(CFG(:, 1));
+    requestedPatterns = reshape(TcToTest, 1, []);
+    for idxPattern = 1:numel(requestedPatterns)
+        requestedPattern = requestedPatterns(idxPattern);
+        if ismember(requestedPattern, poc2Patterns)
+            continue;
+        end
+        patternText = sprintf('%.10g', requestedPattern);
+        try
+            if ~perfPatternTvYaml('poc2_pattern', patternText)
+                patternId = perfPatternTvYaml('pattern_id', patternText);
+                warning('genLP_POC2:DeprecatedPattern', ...
+                        'Pattern %.10g (%s) is deprecated and has no pattern_type; skipping LP generation.', ...
+                        requestedPattern, patternId);
+            end
+        catch
+            warning('genLP_POC2:UnknownPattern', ...
+                    'Pattern %.10g is not defined in PERF pattern YAML; skipping LP generation.', ...
+                    requestedPattern);
+        end
+    end
+end
 
 parfor n = 1:nCases
     patternNum = CFG{n, 1}; 
     if (isnumeric(TcToTest) && ismember(patternNum, TcToTest)) || ... 
        (~isnumeric(TcToTest) && TcToTest == "full")
-        nTvCell = CFG{n, 2}; 
-        patternType = CFG{n, 3}; 
+        nTvCell = CFG{n, 2};
+        patternType = CFG{n, 3};
         dlTvIdx1 = CFG{n, 4};
         dlTvIdx2Delta = CFG{n, 5};
         ulTvIdx = CFG{n, 6};
         channels =  CFG{n, 7};
+        % Only full_cells (full set) / compact_cells (compact set) TVs per config
+        % block are generated, so the launch pattern can reference at most that
+        % many cells. config_cells (nTvCell) stays for the S-slot check below.
+        if useCompactCells
+            nGenCell = compactCellCount{n};
+        else
+            nGenCell = fullCellCount{n};
+        end
+        if isempty(cellCountToGenerate)
+            nCellToGenerate = nGenCell;
+        elseif cellCountToGenerate > nGenCell
+            warning('genLP_POC2:CellCountClamped', ...
+                    'Requested %d cells for pattern %.10g but only %d cells were generated; generating %d cells.', ...
+                    cellCountToGenerate, patternNum, nGenCell, nGenCell);
+            nCellToGenerate = nGenCell;
+        else
+            nCellToGenerate = cellCountToGenerate;
+        end
 
         sSlotCfg = S_SLOT_CFG(cell2mat(S_SLOT_CFG(:,1)) == patternNum, :);
 
         if isempty(sSlotCfg) % this pattern has no special slot cfg
-            sTvIdx = -1;
+            sTvIdx = [0 0 0 0];
         else
             if (nTvCell > sSlotCfg{2})
                 error("S slot cell count error!");
@@ -826,7 +593,7 @@ parfor n = 1:nCases
             end
         
         else
-            for nCell = 1:nTvCell
+            for nCell = 1:nCellToGenerate
                 gen_launch_pattern_POC2(patternNum, nCell, nTvCell, patternType, dlTvIdx1, dlTvIdx2Delta, ulTvIdx, sTvIdx, bfwTvDlIdx, bfwTvUlIdx, bfw_srs_bind_cfg, channels, override_cfg);
             end
         end
@@ -2249,6 +2016,74 @@ elseif patternType == "4TR_pusch_prach"
         end
     end
     [UL_TV_1{1:sum(nCell)}]=deal(UL_TV{6,1:sum(nCell)});
+
+elseif patternType == "4TR_allChan_103"
+    % Pattern 103: 3 DL TV groups + 4 UL TV groups, 40-slot frame
+    % DL Group A (offset 0):          SFN%2=0 D slots (frame 1) — PDCCH + PDSCH sym1-12 + TRS + CQI
+    % DL Group B (offset nCell):      SFN%2=1 D slots (frame 2) — PDCCH + PDSCH sym1-13 + TRS
+    % DL Group C (offset 2*nCell):    S slots (both frames) — PDCCH + PDSCH sym1-5
+    % UL: 4 slot types x nCell, same as 4TR_pusch_prach
+    D_slots = [1:3, 7:13, 17:20];
+    S_slots = [4, 14];
+    UL_slots = [5, 6, 15, 16];
+
+    for frame = 1:2
+        for i = 1:length(D_slots)
+            slot = D_slots(i);
+            cell_idx = 1;
+            bandwidth_num = length(nCell);
+            for b = 1:bandwidth_num
+                for cell_idx_in_b = 1:nCell(b)
+                    if frame == 1
+                        tmpTvIdx = cell_idx_in_b + dlTvIdx1{b}(1) - 1;              % Group A
+                    else
+                        tmpTvIdx = cell_idx_in_b + dlTvIdx1{b}(1) - 1 + nTvCell(b); % Group B
+                    end
+                    DL_TV{slot+(frame-1)*20, cell_idx} = sprintf('TVnr_DLMIX_%04d_gNB_FAPI_s0.h5', tmpTvIdx);
+                    cell_idx = cell_idx + 1;
+                end
+            end
+        end
+        for i = 1:length(S_slots)
+            slot = S_slots(i);
+            cell_idx = 1;
+            bandwidth_num = length(nCell);
+            for b = 1:bandwidth_num
+                for cell_idx_in_b = 1:nCell(b)
+                    tmpTvIdx = cell_idx_in_b + dlTvIdx1{b}(1) - 1 + 2*nTvCell(b);   % Group C
+                    DL_TV{slot+(frame-1)*20, cell_idx} = sprintf('TVnr_DLMIX_%04d_gNB_FAPI_s0.h5', tmpTvIdx);
+                    cell_idx = cell_idx + 1;
+                end
+            end
+        end
+    end
+
+    for frame = 1:2
+        for i = 1:length(UL_slots)
+            slot = UL_slots(i);
+            cell_idx = 1;
+            bandwidth_num = length(nCell);
+            for b = 1:bandwidth_num
+                for cell_idx_in_b = 1:nCell(b)
+                    switch (slot - 1)
+                        case 4
+                            tmpTvIdx = cell_idx_in_b + ulTvIdx(b) - 1;
+                        case 5
+                            tmpTvIdx = cell_idx_in_b + ulTvIdx(b) - 1 + nTvCell(b)*1;
+                        case 14
+                            tmpTvIdx = cell_idx_in_b + ulTvIdx(b) - 1 + nTvCell(b)*2;
+                        case 15
+                            tmpTvIdx = cell_idx_in_b + ulTvIdx(b) - 1 + nTvCell(b)*3;
+                        otherwise
+                            error('Invalid slot index.');
+                    end
+                    UL_TV{slot+(frame-1)*20, cell_idx} = sprintf('TVnr_ULMIX_%04d_gNB_FAPI_s0.h5', tmpTvIdx);
+                    cell_idx = cell_idx + 1;
+                end
+            end
+        end
+    end
+    [UL_TV_1{1:sum(nCell)}]=deal(UL_TV{6,1:sum(nCell)});
 end
 
 
@@ -2540,7 +2375,7 @@ if(exist('UL_TV_1'))
 end
 
 % add static harq proc id config
-if (ismember(patternNum, [69, 69.1, 69.2, 69.3, 69.4, 71, 73, 75, 77, 79, 79.1, 79.2, 81.1, 81.2, 81.3, 81.4, 83.1, 83.2, 83.3, 83.4, 85, 87, 89, 91, 101, 101.1, 102, 102.1]))
+if (ismember(patternNum, [69, 69.1, 69.2, 69.3, 69.4, 71, 73, 75, 77, 79, 79.1, 79.2, 81.1, 81.2, 81.3, 81.4, 83.1, 83.2, 83.3, 83.4, 85, 87, 89, 91, 101, 101.1, 102, 102.1, 201]))
     LP.config_static_harq_proc_id = 1.0;
 end
 

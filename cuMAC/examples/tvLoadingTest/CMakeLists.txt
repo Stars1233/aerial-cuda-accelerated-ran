@@ -14,6 +14,6 @@
 # limitations under the License.
 
 add_executable(tvLoadingTest)
-target_sources(tvLoadingTest PRIVATE main.cpp)
-target_link_libraries(tvLoadingTest PRIVATE ${HDF5_CXX_LIBRARIES} cumac CUDA::cudart CUDA::cuda_driver chanModels)
-target_include_directories(tvLoadingTest PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${CHAN_MODELS_SRC_INCLUDE_DIR} ${cumac_SOURCE_DIR}/examples/tools)
+target_sources(tvLoadingTest PRIVATE main.cpp ../parameters.cpp)
+target_link_libraries(tvLoadingTest PRIVATE ${HDF5_CXX_LIBRARIES} cumac CUDA::cudart CUDA::cuda_driver gpu3gppchan yaml-cpp)
+target_include_directories(tvLoadingTest PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${GPU3GPPCHAN_SRC_INCLUDE_DIR} ${cumac_SOURCE_DIR}/examples/tools)

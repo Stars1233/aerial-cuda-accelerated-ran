@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set(SOURCES ../common/util.cu cuphy_ex_pdsch_tx_multi_cell.cpp dummy.cu)
+set(SOURCES ../common/util.cu cuphy_ex_pdsch_tx_multi_cell.cpp dummy.cu ../common/datasets.cpp)
 add_executable(cuphy_ex_pdsch_tx_multi_cell ${SOURCES})
 target_link_libraries(cuphy_ex_pdsch_tx_multi_cell cuphy_channels cuphy_hdf5 cuphy yaml)
 

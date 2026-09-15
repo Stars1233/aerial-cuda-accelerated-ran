@@ -20,13 +20,16 @@
 #include "cumac.h"
 #include <cstdlib> // for rand() and srand()
 #include <ctime> // for time()
+#include <random>
 #include <yaml-cpp/yaml.h>
 
 using namespace cumac;
 
-int main(int argc, char* argv[]) 
+int main(int argc, char* argv[])
 {
-    if (argc < 2) 
+    cumac::loadParameters();
+
+    if (argc < 2)
     {
         std::cerr << "Usage: " << argv[0] << " <config.yaml>\n";
         return EXIT_FAILURE;
@@ -293,11 +296,12 @@ int main(int argc, char* argv[])
        CUDA_CHECK_ERR(cudaMallocHost((void **)&schdSolCpu->sortedUeList[cIdx], sizeof(uint16_t)*nMaxActUePerCell));
    }
    
-   for (int cIdx = 0; cIdx < nCell; cIdx++) 
+   std::mt19937 g(static_cast<std::mt19937::result_type>(idxTest * 10));
+   for (int cIdx = 0; cIdx < nCell; cIdx++)
    {
        std::vector<int> sortedUeVec;
-       for (uint16_t uIdx=0; uIdx<nMaxActUePerCell; uIdx++) sortedUeVec.push_back(uIdx); 
-       std::random_shuffle(sortedUeVec.begin(), sortedUeVec.end());
+       for (uint16_t uIdx=0; uIdx<nMaxActUePerCell; uIdx++) sortedUeVec.push_back(uIdx);
+       std::shuffle(sortedUeVec.begin(), sortedUeVec.end(), g);
        
        for(int uIdx = 0; uIdx < nMaxActUePerCell; uIdx++)
        {

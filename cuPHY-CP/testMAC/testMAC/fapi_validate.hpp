@@ -163,6 +163,49 @@ public:
 
         return check_result == VALD_OK ? 0 : report(level);
     }
+    
+    /**
+      * Report mismatch using circular distance in a wrapped value space.
+      *
+      * `@param`[in] level Validation severity level.
+      * `@param`[in] name1 Name of first value.
+      * `@param`[in] name2 Name of second value.
+      * `@param`[in] val1 First value.
+      * `@param`[in] val2 Second value.
+      * `@param`[in] modulus Wrap modulus.
+      * `@param`[in] tolerance Allowed circular-distance tolerance.
+      * `@return` 0 on success; otherwise the result returned by report(level).
+      */
+    template <typename T>
+    int check_value_wrap(int level, const char* name1, const char* name2, T val1, T val2, int64_t modulus, T tolerance = 0)
+    {
+        int64_t diff = static_cast<int64_t>(val1) - static_cast<int64_t>(val2);
+        if(diff < 0)
+        {
+            diff = -diff;
+        }
+        if(modulus > 0)
+        {
+            diff %= modulus;
+            if(diff > modulus - diff)
+            {
+                diff = modulus - diff;
+            }
+        }
+
+        vald_result_t check_result = VALD_OK;
+        if(diff > tolerance)
+        {
+            check_result = VALD_FAIL;
+        }
+
+        if(should_log(check_result))
+        {
+            log_value(level, name1, name2, val1, val2);
+        }
+
+        return check_result == VALD_OK ? 0 : report(level);
+    }
 
     int check_approx_value(int level, const char* name1, const char* name2, float val1, float val2, float tolerance = 0.0f)
     {
@@ -373,6 +416,12 @@ protected:
     ((vald)->check_value<int16_t>(VALD_ENABLE_ERR, #val1, #val2, (val1), (val2), ##__VA_ARGS__))
 #define FAPI_VALIDATE_I16_WARN(vald, val1, val2, ...) \
     ((vald)->check_value<int16_t>(VALD_ENABLE_WARN, #val1, #val2, (val1), (val2), ##__VA_ARGS__))
+    
+// Validate uint16_t / int16_t value with circular (wrap-around) distance, e.g. timing advance
+#define FAPI_VALIDATE_U16_WARN_WRAP(vald, val1, val2, modulus, ...) \
+    ((vald)->check_value_wrap<uint16_t>(VALD_ENABLE_WARN, #val1, #val2, (val1), (val2), (modulus), ##__VA_ARGS__))
+#define FAPI_VALIDATE_I16_WARN_WRAP(vald, val1, val2, modulus, ...) \
+    ((vald)->check_value_wrap<int16_t>(VALD_ENABLE_WARN, #val1, #val2, (val1), (val2), (modulus), ##__VA_ARGS__))
 
 // Validate uint8_t value
 #define FAPI_VALIDATE_U8_ERR(vald, val1, val2, ...) \

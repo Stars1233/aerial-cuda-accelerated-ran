@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -238,6 +238,7 @@ int main(int argc, char* argv[]) {
                                       0, // no precoding
                                       false,
                                       false,
+                                      false,
                                       h_workspace.get(), // h_workspace
                                       config_workspace.get(), // d_workspace - Explicit H2D copy as part of setup
                                       kernel_params.data(), // h_params
@@ -313,16 +314,16 @@ int main(int argc, char* argv[]) {
     cudaEventCreate(&stop);
 
     float time1 = 0.0;
+    CUresult res = CUDA_SUCCESS;
     cudaEventRecord(start);
 
-    for (int iter = 0; iter < num_iterations; iter++) {
+    for (int iter = 0; ((iter < num_iterations) && (res == CUDA_SUCCESS)); iter++) {
 
-        launch_kernel(rm_hndl.get()->m_kernelNodeParams[0], strm);
+        res = launch_kernel_ex(rm_hndl.get()->m_kernelNodeParams[0], strm, true);
     }
 
-    cudaError_t cuda_error = cudaGetLastError();
-    if (cuda_error != cudaSuccess) {
-        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,  "CUDA Error {}", cudaGetErrorString(cuda_error));
+    if (res != CUDA_SUCCESS) {
+        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,  "Launching kernel returned {}", res);
         exit(1);
     }
 

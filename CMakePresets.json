@@ -40,6 +40,10 @@
         "ENABLE_PYAERIAL": {
           "type": "BOOL",
           "value": "OFF"
+        },
+        "ENABLE_GPU3GPPCHAN_PYTHON": {
+          "type": "BOOL",
+          "value": "OFF"
         }
       }
     },
@@ -58,6 +62,289 @@
       "description": "Minimal build for ARM/Grace with cross-compilation toolchain",
       "binaryDir": "${sourceDir}/build-minimal-arm",
       "toolchainFile": "${sourceDir}/cuPHY/cmake/toolchains/grace-cross"
+    },
+    {
+      "name": "sanitizer-common",
+      "hidden": true,
+      "description": "Common settings for all sanitizer builds",
+      "cacheVariables": {
+        "ENABLE_TESTS": { "type": "BOOL", "value": "ON" },
+        "AERIAL_METRICS": { "type": "BOOL", "value": "ON" },
+        "GTEST_POPULATE_CMAKE_TESTS": { "type": "BOOL", "value": "ON" },
+        "ENABLE_CUMAC": { "type": "BOOL", "value": "ON" },
+        "ENABLE_PYAERIAL": { "type": "BOOL", "value": "ON" },
+        "ENABLE_YANG_PARSER": { "type": "BOOL", "value": "ON" },
+        "ENABLE_SCTP_CHECK": { "type": "BOOL", "value": "ON" },
+        "ENABLE_DOCA_GPU_COMM": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "asan-env",
+      "hidden": true,
+      "description": "Common environment variables for AddressSanitizer builds",
+      "inherits": "sanitizer-common",
+      "environment": {
+        "ASAN_OPTIONS": "protect_shadow_gap=0:check_initialization_order=1:strict_init_order=1:print_stats=1:atexit=1:detect_invalid_pointer_pairs=2",
+        "LSAN_OPTIONS": "print_stats=1:suppressions=${sourceDir}/tools/lsan_suppressions.txt",
+        "UBSAN_OPTIONS": "print_stats=1:halt_on_error=1:suppressions=${sourceDir}/tools/ubsan_suppressions.txt"
+      }
+    },
+    {
+      "name": "tsan-env",
+      "hidden": true,
+      "description": "Common environment variables for ThreadSanitizer builds",
+      "inherits": "sanitizer-common",
+      "environment": {
+        "TSAN_OPTIONS": "print_stats=1:halt_on_error=1:suppressions=${sourceDir}/tools/tsan_suppressions.txt"
+      }
+    },
+    {
+      "name": "asan-x86-debug",
+      "inherits": ["asan-env", "minimal-x86"],
+      "displayName": "ASan+LSan+UBSan+pointer-pair x86_64 Debug",
+      "description": "AddressSanitizer + LeakSanitizer + UBSan + pointer-compare/subtract for x86_64, Debug build",
+      "binaryDir": "${sourceDir}/build-asan-x86-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ACAR_ENABLE_SANITIZER_ADDRESS": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_LEAK": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_UNDEFINED": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_POINTER_COMPARE": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "asan-x86-release",
+      "inherits": ["asan-env", "minimal-x86"],
+      "displayName": "ASan+LSan+UBSan+pointer-pair x86_64 Release",
+      "description": "AddressSanitizer + LeakSanitizer + UBSan + pointer-compare/subtract for x86_64, Release build",
+      "binaryDir": "${sourceDir}/build-asan-x86-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ACAR_ENABLE_SANITIZER_ADDRESS": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_LEAK": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_UNDEFINED": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_POINTER_COMPARE": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "tsan-x86-debug",
+      "inherits": ["tsan-env", "minimal-x86"],
+      "displayName": "TSan x86_64 Debug",
+      "description": "ThreadSanitizer for x86_64, Debug build (mutually exclusive with ASan/LSan)",
+      "binaryDir": "${sourceDir}/build-tsan-x86-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ACAR_ENABLE_SANITIZER_THREAD": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "tsan-x86-release",
+      "inherits": ["tsan-env", "minimal-x86"],
+      "displayName": "TSan x86_64 Release",
+      "description": "ThreadSanitizer for x86_64, Release build (mutually exclusive with ASan/LSan)",
+      "binaryDir": "${sourceDir}/build-tsan-x86-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ACAR_ENABLE_SANITIZER_THREAD": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "asan-arm-debug",
+      "inherits": ["asan-env", "minimal-arm"],
+      "displayName": "ASan+LSan+UBSan+pointer-pair ARM/Grace Debug",
+      "description": "AddressSanitizer + LeakSanitizer + UBSan + pointer-compare/subtract for ARM/Grace, Debug build",
+      "binaryDir": "${sourceDir}/build-asan-arm-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ACAR_ENABLE_SANITIZER_ADDRESS": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_LEAK": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_UNDEFINED": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_POINTER_COMPARE": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "asan-arm-release",
+      "inherits": ["asan-env", "minimal-arm"],
+      "displayName": "ASan+LSan+UBSan+pointer-pair ARM/Grace Release",
+      "description": "AddressSanitizer + LeakSanitizer + UBSan + pointer-compare/subtract for ARM/Grace, Release build",
+      "binaryDir": "${sourceDir}/build-asan-arm-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ACAR_ENABLE_SANITIZER_ADDRESS": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_LEAK": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_UNDEFINED": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_POINTER_COMPARE": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "tsan-arm-debug",
+      "inherits": ["tsan-env", "minimal-arm"],
+      "displayName": "TSan ARM/Grace Debug",
+      "description": "ThreadSanitizer for ARM/Grace, Debug build (mutually exclusive with ASan/LSan)",
+      "binaryDir": "${sourceDir}/build-tsan-arm-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ACAR_ENABLE_SANITIZER_THREAD": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "tsan-arm-release",
+      "inherits": ["tsan-env", "minimal-arm"],
+      "displayName": "TSan ARM/Grace Release",
+      "description": "ThreadSanitizer for ARM/Grace, Release build (mutually exclusive with ASan/LSan)",
+      "binaryDir": "${sourceDir}/build-tsan-arm-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ACAR_ENABLE_SANITIZER_THREAD": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "minimal-auto",
+      "inherits": "minimal-base",
+      "hidden": true,
+      "description": "Auto-detect host architecture (x86_64 -> x86-64 toolchain, aarch64 -> grace-cross toolchain)",
+      "binaryDir": "${sourceDir}/build-minimal-auto",
+      "toolchainFile": "${sourceDir}/cuPHY/cmake/toolchains/auto"
+    },
+    {
+      "name": "asan-auto-debug",
+      "inherits": ["asan-env", "minimal-auto"],
+      "displayName": "ASan+LSan+UBSan+pointer-pair (auto-detect arch) Debug",
+      "description": "AddressSanitizer + LeakSanitizer + UBSan + pointer-compare/subtract, arch auto-detected from host, Debug build",
+      "binaryDir": "${sourceDir}/build-asan-auto-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ACAR_ENABLE_SANITIZER_ADDRESS": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_LEAK": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_UNDEFINED": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_POINTER_COMPARE": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "asan-auto-release",
+      "inherits": ["asan-env", "minimal-auto"],
+      "displayName": "ASan+LSan+UBSan+pointer-pair (auto-detect arch) Release",
+      "description": "AddressSanitizer + LeakSanitizer + UBSan + pointer-compare/subtract, arch auto-detected from host, Release build",
+      "binaryDir": "${sourceDir}/build-asan-auto-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ACAR_ENABLE_SANITIZER_ADDRESS": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_LEAK": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_UNDEFINED": { "type": "BOOL", "value": "ON" },
+        "ACAR_ENABLE_SANITIZER_POINTER_COMPARE": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "tsan-auto-debug",
+      "inherits": ["tsan-env", "minimal-auto"],
+      "displayName": "TSan (auto-detect arch) Debug",
+      "description": "ThreadSanitizer, arch auto-detected from host, Debug build (mutually exclusive with ASan/LSan)",
+      "binaryDir": "${sourceDir}/build-tsan-auto-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ACAR_ENABLE_SANITIZER_THREAD": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "tsan-auto-release",
+      "inherits": ["tsan-env", "minimal-auto"],
+      "displayName": "TSan (auto-detect arch) Release",
+      "description": "ThreadSanitizer, arch auto-detected from host, Release build (mutually exclusive with ASan/LSan)",
+      "binaryDir": "${sourceDir}/build-tsan-auto-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ACAR_ENABLE_SANITIZER_THREAD": { "type": "BOOL", "value": "ON" }
+      }
+    },
+    {
+      "name": "cicd-test-x86",
+      "inherits": "minimal-x86",
+      "displayName": "CI/CD Test Build (x86_64)",
+      "description": "Minimal x86_64 build with tests enabled for CI/CD ctest step",
+      "binaryDir": "${sourceDir}/build-cicd-test-x86",
+      "cacheVariables": {
+        "ENABLE_TESTS": {"type": "BOOL", "value": "ON"},
+        "AERIAL_METRICS": {"type": "BOOL", "value": "ON"},
+        "GTEST_POPULATE_CMAKE_TESTS": {"type": "BOOL", "value": "ON"},
+        "ENABLE_CUMAC": {"type": "BOOL", "value": "ON"},
+        "ENABLE_PYAERIAL": {"type": "BOOL", "value": "ON"},
+        "ENABLE_YANG_PARSER": {"type": "BOOL", "value": "ON"},
+        "ENABLE_SCTP_CHECK": {"type": "BOOL", "value": "ON"},
+        "ENABLE_DOCA_GPU_COMM": {"type": "BOOL", "value": "ON"}
+      }
+    },
+    {
+      "name": "cicd-test-arm",
+      "inherits": "minimal-arm",
+      "displayName": "CI/CD Test Build (ARM/Grace)",
+      "description": "Minimal ARM/Grace build with tests enabled for CI/CD ctest step",
+      "binaryDir": "${sourceDir}/build-cicd-test-arm",
+      "cacheVariables": {
+        "ENABLE_TESTS": {"type": "BOOL", "value": "ON"},
+        "AERIAL_METRICS": {"type": "BOOL", "value": "ON"},
+        "GTEST_POPULATE_CMAKE_TESTS": {"type": "BOOL", "value": "ON"},
+        "ENABLE_CUMAC": {"type": "BOOL", "value": "ON"},
+        "ENABLE_PYAERIAL": {"type": "BOOL", "value": "ON"},
+        "ENABLE_YANG_PARSER": {"type": "BOOL", "value": "ON"},
+        "ENABLE_SCTP_CHECK": {"type": "BOOL", "value": "ON"},
+        "ENABLE_DOCA_GPU_COMM": {"type": "BOOL", "value": "ON"}
+      }
+    },
+    {
+      "name": "pyaerial-x86",
+      "inherits": "cicd-test-x86",
+      "displayName": "pyAerial Build (x86_64)",
+      "description": "pyAerial build for x86_64. Inherits cicd-test-x86; sets NVIPC_FMTLOG_ENABLE=OFF and ASIM_CUPHY_SRS_OUTPUT_FP32=ON.",
+      "binaryDir": "${sourceDir}/build-pyaerial-x86",
+      "cacheVariables": {
+        "NVIPC_FMTLOG_ENABLE": {"type": "BOOL", "value": "OFF"},
+        "ASIM_CUPHY_SRS_OUTPUT_FP32": {"type": "BOOL", "value": "ON"}
+      }
+    },
+    {
+      "name": "pyaerial-arm",
+      "inherits": "cicd-test-arm",
+      "displayName": "pyAerial Build (aarch64)",
+      "description": "pyAerial build for aarch64. Inherits cicd-test-arm; sets NVIPC_FMTLOG_ENABLE=OFF and ASIM_CUPHY_SRS_OUTPUT_FP32=ON.",
+      "binaryDir": "${sourceDir}/build-pyaerial-arm",
+      "cacheVariables": {
+        "NVIPC_FMTLOG_ENABLE": {"type": "BOOL", "value": "OFF"},
+        "ASIM_CUPHY_SRS_OUTPUT_FP32": {"type": "BOOL", "value": "ON"}
+      }
+    },
+    {
+      "name": "gpu3gppchan-x86",
+      "inherits": "minimal-x86",
+      "displayName": "gpu3gppchan Python Build (x86_64)",
+      "description": "Build the gpu3gppchan Python wheel and component-local test environment without pyAerial.",
+      "binaryDir": "${sourceDir}/build-gpu3gppchan-x86",
+      "cacheVariables": {
+        "ENABLE_GPU3GPPCHAN_PYTHON": {"type": "BOOL", "value": "ON"}
+      }
+    },
+    {
+      "name": "gpu3gppchan-arm",
+      "inherits": "minimal-arm",
+      "displayName": "gpu3gppchan Python Build (aarch64)",
+      "description": "Build the gpu3gppchan Python wheel and component-local test environment without pyAerial.",
+      "binaryDir": "${sourceDir}/build-gpu3gppchan-arm",
+      "cacheVariables": {
+        "ENABLE_GPU3GPPCHAN_PYTHON": {"type": "BOOL", "value": "ON"}
+      }
+    },
+    {
+      "name": "cicd-test-arm-perf",
+      "inherits": "cicd-test-arm",
+      "displayName": "CI/CD Test Build (ARM/Grace, perf preset)",
+      "description": "Aerial 'perf' preset (FAPI 10.04 + 20C + conformance) layered on cicd-test-arm. Inherits all the ENABLE_*=ON flags from cicd-test-arm; only the perf-specific overrides are declared here.",
+      "binaryDir": "${sourceDir}/build-cicd-test-arm-perf",
+      "cacheVariables": {
+        "SCF_FAPI_10_04":                    { "type": "BOOL", "value": "ON" },
+        "ENABLE_CONFORMANCE_TM_PDSCH_PDCCH": { "type": "BOOL", "value": "ON" },
+        "ENABLE_20C":                        { "type": "BOOL", "value": "ON" },
+        "CMAKE_BUILD_RPATH_USE_ORIGIN":      { "type": "BOOL", "value": "ON" },
+        "CMAKE_CUDA_ARCHITECTURES":          "80;90;100;120;121"
+      }
     }
   ],
   "buildPresets": [
@@ -70,6 +357,263 @@
       "name": "minimal-arm",
       "configurePreset": "minimal-arm",
       "jobs": 0
+    },
+    {
+      "name": "asan-x86-debug",
+      "configurePreset": "asan-x86-debug",
+      "jobs": 0
+    },
+    {
+      "name": "asan-x86-release",
+      "configurePreset": "asan-x86-release",
+      "jobs": 0
+    },
+    {
+      "name": "tsan-x86-debug",
+      "configurePreset": "tsan-x86-debug",
+      "jobs": 0
+    },
+    {
+      "name": "tsan-x86-release",
+      "configurePreset": "tsan-x86-release",
+      "jobs": 0
+    },
+    {
+      "name": "asan-arm-debug",
+      "configurePreset": "asan-arm-debug",
+      "jobs": 0
+    },
+    {
+      "name": "asan-arm-release",
+      "configurePreset": "asan-arm-release",
+      "jobs": 0
+    },
+    {
+      "name": "tsan-arm-debug",
+      "configurePreset": "tsan-arm-debug",
+      "jobs": 0
+    },
+    {
+      "name": "tsan-arm-release",
+      "configurePreset": "tsan-arm-release",
+      "jobs": 0
+    },
+    {
+      "name": "asan-auto-debug",
+      "configurePreset": "asan-auto-debug",
+      "jobs": 0
+    },
+    {
+      "name": "asan-auto-release",
+      "configurePreset": "asan-auto-release",
+      "jobs": 0
+    },
+    {
+      "name": "tsan-auto-debug",
+      "configurePreset": "tsan-auto-debug",
+      "jobs": 0
+    },
+    {
+      "name": "tsan-auto-release",
+      "configurePreset": "tsan-auto-release",
+      "jobs": 0
+    },
+    {
+      "name": "cicd-test-x86",
+      "configurePreset": "cicd-test-x86",
+      "jobs": 0
+    },
+    {
+      "name": "cicd-test-arm",
+      "configurePreset": "cicd-test-arm",
+      "jobs": 0
+    },
+    {
+      "name": "cicd-test-arm-perf",
+      "configurePreset": "cicd-test-arm-perf",
+      "jobs": 0
+    },
+    {
+      "name": "pyaerial-x86",
+      "configurePreset": "pyaerial-x86",
+      "jobs": 0
+    },
+    {
+      "name": "pyaerial-arm",
+      "configurePreset": "pyaerial-arm",
+      "jobs": 0
+    },
+    {
+      "name": "gpu3gppchan-x86",
+      "configurePreset": "gpu3gppchan-x86",
+      "jobs": 0
+    },
+    {
+      "name": "gpu3gppchan-arm",
+      "configurePreset": "gpu3gppchan-arm",
+      "jobs": 0
+    },
+    {
+      "name": "cplane-test-bench-arm-perf",
+      "configurePreset": "cicd-test-arm-perf",
+      "targets": ["cplane_test_bench"],
+      "jobs": 0
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "asan-x86-debug",
+      "configurePreset": "asan-x86-debug",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false },
+      "filter": {"include": {"label": "cuphy-cp"}}
+    },
+    {
+      "name": "asan-x86-release",
+      "configurePreset": "asan-x86-release",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    },
+    {
+      "name": "tsan-x86-debug",
+      "configurePreset": "tsan-x86-debug",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false },
+      "filter": {"include": {"label": "cuphy-cp"}}
+    },
+    {
+      "name": "tsan-x86-release",
+      "configurePreset": "tsan-x86-release",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    },
+    {
+      "name": "asan-arm-debug",
+      "configurePreset": "asan-arm-debug",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false },
+      "filter": {"include": {"label": "cuphy-cp"}, "exclude": {"label": "requires-tvs"}}
+    },
+    {
+      "name": "asan-arm-release",
+      "configurePreset": "asan-arm-release",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    },
+    {
+      "name": "tsan-arm-debug",
+      "configurePreset": "tsan-arm-debug",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false },
+      "filter": {"include": {"label": "cuphy-cp"}, "exclude": {"label": "requires-tvs"}}
+    },
+    {
+      "name": "tsan-arm-release",
+      "configurePreset": "tsan-arm-release",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    },
+    {
+      "name": "asan-auto-debug",
+      "configurePreset": "asan-auto-debug",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    },
+    {
+      "name": "asan-auto-release",
+      "configurePreset": "asan-auto-release",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    },
+    {
+      "name": "tsan-auto-debug",
+      "configurePreset": "tsan-auto-debug",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    },
+    {
+      "name": "tsan-auto-release",
+      "configurePreset": "tsan-auto-release",
+      "inheritConfigureEnvironment": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": false }
+    },
+    {
+      "name": "cicd-test-x86",
+      "configurePreset": "cicd-test-x86",
+      "output": {"outputOnFailure": true},
+      "execution": {"stopOnFailure": false},
+      "filter": {"include": {"label": "cuphy-cp"}}
+    },
+    {
+      "name": "cicd-test-arm",
+      "configurePreset": "cicd-test-arm",
+      "output": {"outputOnFailure": true},
+      "execution": {"stopOnFailure": false},
+      "filter": {"include": {"label": "cuphy-cp"}}
+    },
+    {
+      "name": "cicd-test-arm-perf",
+      "configurePreset": "cicd-test-arm-perf",
+      "output": {"outputOnFailure": true},
+      "execution": {"stopOnFailure": false},
+      "filter": {"include": {"label": "cuphy-cp"}}
+    },
+    {
+      "name": "pyaerial-x86",
+      "configurePreset": "pyaerial-x86",
+      "output": {"outputOnFailure": true},
+      "execution": {"stopOnFailure": false},
+      "filter": {"include": {"label": "pyaerial"}}
+    },
+    {
+      "name": "pyaerial-arm",
+      "configurePreset": "pyaerial-arm",
+      "output": {"outputOnFailure": true},
+      "execution": {"stopOnFailure": false},
+      "filter": {"include": {"label": "pyaerial"}}
+    },
+    {
+      "name": "cplane-test-bench-arm-perf",
+      "configurePreset": "cicd-test-arm-perf",
+      "output": {
+                "outputOnFailure": true,
+                "verbosity": "verbose"
+            },
+      "execution": {"stopOnFailure": false},
+      "filter": {"include": {"name": "^cplane_tb_"}}
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "cplane-test-bench-arm-perf",
+      "displayName": "C-Plane Test Bench (ARM/Grace, perf preset)",
+      "description": "Configure and build with cicd-test-arm-perf, then run only the cplane_test_bench CTest registrations.",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "cicd-test-arm-perf"
+        },
+        {
+          "type": "build",
+          "name": "cplane-test-bench-arm-perf"
+        },
+        {
+          "type": "test",
+          "name": "cplane-test-bench-arm-perf"
+        }
+      ]
     }
   ]
 }

@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Parameter sweep specification for run_param_sweep.sh.
+#
+# Semantics: starting from `base_config`, one variant is generated per
+# (parameter, value) pair under `sweep:` — one parameter changed at a time
+# (plus an unmodified baseline when include_baseline is true).
+#
+#   overrides:  constants applied to EVERY variant (lists are rejected here)
+#   seeds:      every variant runs once per seed (sets test_bench.rand_seed,
+#               run names get an _s<seed> suffix); omit for a single run
+#               with the base config's seed
+#   sweep:      dotted key -> list of values; a value equal to the base
+#               config's own default is skipped automatically (noted on
+#               stderr), so listing defaults for documentation is free
+#
+# Edit `sweep:`/`seeds:` to decide coverage; commented entries are
+# ready-to-enable examples. The dotted key must exist in the base config
+# (the expander errors out otherwise).
+
+base_config: testBenches/gpu3GPPChan/config/statistic_channel_config.yaml
+
+# Applied to every variant (including the baseline). Constants only.
+overrides:
+  test_bench.n_tti: 10
+  simulation.h5_dump_level: 0    # minimal H5 dump
+
+# Smoke matrix runs each variant at these seeds.
+seeds: [0, 100]
+
+include_baseline: true
+
+sweep:
+  # --- enabled by default: cheap, high-coverage dimensions -----------------
+  system_level.scenario: [UMa, UMi, RMa]  # UMa == baseline default -> auto-skipped
+  system_level.n_site: [1, 3, 7]          # 1 == baseline default -> auto-skipped
+  system_level.n_ut: [10, 100, 500]
+  simulation.run_mode: [0, 1, 3]          # 0 == baseline default -> auto-skipped
+  simulation.cpu_only_mode: [0, 1]        # 0 == default -> skipped; 1 runs w/o sanitizer
+
+  # --- ready-to-enable examples (owner decides) ----------------------------
+  # system_level.enable_per_tti_lsp: [0, 2]
+  # system_level.enable_near_field_effect: [1]
+  # system_level.enable_non_stationarity: [1]
+  # system_level.ut_drop_option: [1, 2]
+  # system_level.o2i_building_penetr_loss_ind: [0, 1, 3]  # 4=legacy Table 7.4.3-3, indoor UMa/UMi <6 GHz only
+  # system_level.disable_pl_shadowing: [1]
+  # system_level.disable_small_scale_fading: [1]
+  # system_level.isac_type: [1, 2]        # needs n_st > 0 — enable together via a
+  #                                       # dedicated base config if swept
+  # simulation.n_snapshot_per_slot: [14]
+  # simulation.freq_convert_type: [0, 2, 3, 4]
+  # simulation.internal_memory_mode: [0, 2]
+  # simulation.optional_cfr_dim: [1]
+  # antenna_panels.panel_0.n_ant: [8]     # keep consistent with ant_size if changed

@@ -1,0 +1,14 @@
+metric_name,required_value,headroom,slots,mean_worst,mean_headroom
+tick_to_l2_start,15.0,5.9,,7.1,2.0
+testmac_end_max,500.0,9.3,,486.7,4.0
+tick_to_dlu_completion,1155.0,289.7,,835.3,30.0
+tick_to_dlc_nonbfw_completion,1030.0,199.0,,801.0,30.0
+tick_to_ulc_nonbfw_completion,1164.0,534.3,,599.7,30.0
+t0_to_pusch_completion,2831.0,1258.0,,1527.0,46.0
+t0_to_prach_completion,3831.0,2795.1,,1023.9,12.0
+ulu_ontime_percentage,99.9800,0.0100,,100.0000,0.0100
+dlu_ontime_percentage,99.9800,0.0100,,100.0000,0.0100
+dlc_ontime_percentage,99.9800,0.0100,,100.0000,0.0100
+ulc_ontime_percentage,99.9800,0.0100,,100.0000,0.0100
+ulutx_prach_ontime_percentage,99.9800,0.0100,,100.0000,0.0100
+ulutx_pusch_ontime_percentage,99.9800,0.0100,,100.0000,0.0100

@@ -101,7 +101,6 @@ static void set_default_shm_config(nv_ipc_config_t* cfg, nv_ipc_module_t module_
     {
         nvlog_safe_strncpy(shm_config->prefix, "nvipc", NV_NAME_MAX_LEN);
     }
-    shm_config->ring_len = SHM_RING_QUEUE_LEN;
 
     // CUDA device ID for CUDA memory pool. Can set to -1 to fall back to CPU memory pool
     shm_config->cuda_device_id = -1;

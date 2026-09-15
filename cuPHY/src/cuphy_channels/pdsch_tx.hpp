@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -215,6 +215,10 @@ private:
     struct testDescr_sz<32> arg_32B;
     struct testDescr_sz<48> arg_48B;
 
+    // Parameters for delay kernel launched before PDSCH-run GPU work in cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING mode
+    void* delayKernelParams[1]{};
+    CUDA_KERNEL_NODE_PARAMS m_delayKernelParamsDriver;
+
     static constexpr int BITS_PER_U32 = sizeof(uint32_t) * 8; // in bits
 
     //DL Pipeline is driven by HDF5 input or h_pipeline_input_bytes if no HDF5 file is available
@@ -244,6 +248,9 @@ private:
     bool aas_mode; // if true, layer_mapping, modulation, DMRS should not be included.
     bool graph_mode; // if true, a CUDA graph is run.
     bool inter_cell_batching_mode; //if true, enable batching of kernels across cells. Only relevant if there are multiple cells per cell group.
+    bool post_fec_processing{false};   // when set, indicates this pipeline will always run in cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING mode or PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING mode (i.e., execute post LDPC)
+    bool post_fec_rm_scrambling_processing{false};   // subset of post_fec_processing; when set, indicates this pipeline will always run in cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING mode (i.e., execute post RM scrambling)
+    uint32_t fec_delay_usec{0}; // if delay is not zero and post_fec_processing is enabled, launch delay kernel with said delay before actual PDSCH-run work
 
     uint32_t Emax; // reset to 0 in prepareRateMatching()
     uint32_t rounded_Emax; // rounded up to nearest 32-bit
@@ -380,6 +387,7 @@ private:
     std::vector<cuphy::tensor_ref> d_per_cell_ldpc_out_tensor_ref;
 
     cuphy::unique_device_ptr<uint32_t> d_ldpc_workspace;
+    uint32_t* d_ldpc_workspace_ptr{nullptr}; // owned by PdschTx pipeline caller in cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING mode; otherwise same as d_ldpc_workspace.get()
     std::vector<cuphy::tensor_desc> single_TB_d_ldpc_in_tensor_desc;
     std::vector<cuphy::tensor_desc> single_TB_d_ldpc_out_tensor_desc;
     std::vector<cuphy::tensor_device> single_TB_d_ldpc_out_tensor;
@@ -461,6 +469,11 @@ private:
     std::vector<CUgraphNode> m_csirsPrepNodesMultipleCells;
     std::vector<CUgraphNode> m_prepareCRCEncodeNodeMultipleCells;
 
+#if CUDA_VERSION >= 13020
+    // Attribute value for kernel nodes that may need dynamic shared memory opt-in
+    CUkernelNodeAttrValue m_kernelNodeAttrValue{.sharedMemoryMode = CU_SHARED_MEMORY_MODE_ALLOW_NON_PORTABLE};
+#endif
+
     CUresult addDependenciesHelper(CUgraph hGraph, const CUgraphNode* from, const CUgraphNode* to, size_t numDependencies);
     void addDependenciesMultipleCells();
     void updateNodeParamsMultipleCells();
@@ -499,9 +512,6 @@ private:
     //batched memory copy
     cuphyBatchedMemcpyHelper m_batchedMemcpyHelper;
 };
-
-void cumulative_read_pdsch_static_pars_from_file(cuphyPdschStatPrms_t& pdsch_static_params, hdf5hpp::hdf5_file& input_file, const char* filename, bool ref_check, bool first_call);
-void cumulative_read_cell_group_dynamic_pars_from_file(std::vector<cuphyPdschCellGrpDynPrm_t>& cell_grp_dyn_params, hdf5hpp::hdf5_file& input_file, bool first_call);
 
 void updateRefCheck(cuphyPdschTxHndl_t pdschTxHndl, bool ref_check);
 void updateRefCheckMultipleCells(cuphyPdschTxHndl_t pdschTxHndl, bool ref_check);

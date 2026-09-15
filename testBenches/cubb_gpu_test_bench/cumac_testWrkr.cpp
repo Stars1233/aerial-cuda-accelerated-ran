@@ -47,7 +47,55 @@ void CuMACTestWorkerImpl::setCumacOptions(const CumacOptions& opts)
     m_halfPrecision     = opts.half_precision;
     m_schAlg            = opts.sch_alg;
     m_heteroUeSelCells = opts.hetero_ue_sel_cells;
+
+    // AI-RAN trtEngine inference options
+    m_airanInfer          = opts.airan_infer;
+    m_airanModelPath      = opts.airan_model_path;
+    m_airanInputName      = opts.airan_input_name;
+    m_airanOutputName     = opts.airan_output_name;
+    m_airanObsDim         = opts.airan_obs_dim;
+    m_airanActionDim      = opts.airan_action_dim;
+    m_airanBatchSize      = opts.airan_batch_size;
+    m_airanMaxBatchSize   = opts.airan_max_batch_size;
+    m_airanUseCudaGraph   = opts.airan_use_cuda_graph;
+    m_airanBuilderOptLevel = opts.airan_builder_opt_level;
+
+#ifndef AERIAL_CUMAC_AIRAN_ENABLE
+    if(m_airanInfer)
+    {
+        printf("ERROR: cumac_options.airan.infer=1 requires the test bench to be built with -DENABLE_CUMAC_AIRAN=ON\n");
+        exit(1);
+    }
+#endif
 }
+
+#ifdef AERIAL_CUMAC_AIRAN_ENABLE
+void CuMACTestWorkerImpl::createAiranTvFromOptions()
+{
+    if(m_airanModelPath.empty())
+    {
+        printf("ERROR: cumac_options.airan.infer=1 but airan.model_path is empty\n");
+        exit(1);
+    }
+
+    cumac_ml::airanTvParams p;
+    p.modelPath       = m_airanModelPath;
+    p.inputName       = m_airanInputName;
+    p.outputName      = m_airanOutputName;
+    p.obsDim          = m_airanObsDim;
+    p.actionDim       = m_airanActionDim;
+    p.batchSize       = m_airanBatchSize;
+    p.maxBatchSize    = m_airanMaxBatchSize;
+    p.precision       = m_halfPrecision; // reuse the cuMAC precision flag (0 fp32, 1 fp16)
+    p.useCudaGraph    = m_airanUseCudaGraph;
+    p.builderOptLevel = m_airanBuilderOptLevel;
+
+    // One self-contained AI-RAN TV per worker (reused for all of its slots).
+    m_airanTvPath = std::string("airan_tv_") + m_name + ".h5";
+    cumac_ml::createAiranTv(m_airanTvPath, p);
+    printf("cuMAC AI-RAN inference: wrote TV %s (model %s)\n", m_airanTvPath.c_str(), m_airanModelPath.c_str());
+}
+#endif
 
 CuMACTestWorkerImpl::~CuMACTestWorkerImpl()
 {
@@ -313,6 +361,16 @@ void CuMACTestWorkerImpl::macInitHandler(std::shared_ptr<void>& shPtrPayload)
         if(m_internalTimer)
             m_GPUtime_d = std::move(cuphy::buffer<uint64_t, cuphy::device_alloc>(1));
 
+#ifdef AERIAL_CUMAC_AIRAN_ENABLE
+        if(m_airanInfer)
+        {
+            // AI-RAN inference mode does not use the cuMAC scheduler TVs or a CPU
+            // reference; author the inference TV that drives every pipe.
+            m_ref_check_mac = false;
+            createAiranTvFromOptions();
+        }
+#endif
+
         // cuMAC runs in a single slot in DDDSUUDDDD patterns
         for(uint32_t strmIdx = 0; strmIdx < m_nStrmsMac; ++strmIdx)
         {
@@ -342,7 +400,16 @@ void CuMACTestWorkerImpl::macInitHandler(std::shared_ptr<void>& shPtrPayload)
                 uint32_t macSlotIdx = itrPerStrmIdx * m_nStrmsMac + strmIdx;
                 if(m_internalTimer && strmIdx == 0)
                     m_macInterSlotStartEventVec.emplace_back(cudaEventDisableTiming);
-                
+
+#ifdef AERIAL_CUMAC_AIRAN_ENABLE
+                if(m_airanInfer)
+                {
+                    // AI-RAN trtEngine inference pipe (alternative to the cuMAC scheduler pipe).
+                    m_airanPipes.emplace_back(std::make_unique<cumac_ml::cumacAiranSubcontext>(m_airanTvPath, 1/*using GPU*/, m_halfPrecision/*precision*/, m_cuStrmsMac[strmIdx].handle()));
+                    continue; // no CPU reference for inference pipes
+                }
+#endif
+
                 m_macPipes.emplace_back(std::make_unique<cumac::cumacSubcontext>(inFileNamesMac[macSlotIdx], 1/*using GPU*/, m_halfPrecision/*using half precision*/, 0/*no RI-based layer selection*/, 0/*not Asim*/, m_heteroUeSelCells/*UE selection config*/, m_schAlg/*scheduling algorithm*/, m_modulesCalled /*UE selection, PRG allocation, layer selection, and MCS selection*/, m_cuStrmsMac[strmIdx].handle())); // using cumac::cumacSubcontext class,
 
                 if(m_ref_check_mac)
@@ -412,6 +479,21 @@ void CuMACTestWorkerImpl::macSetupHandler(std::shared_ptr<void>& shPtrPayload)
                 const uint32_t slotIdx = itrPerStrmIdx * m_nStrmsMac + strmIdx;
                 if(slotIdx >= nSlotConfig || m_macSlotRunFlag[slotIdx] == 0)
                     continue;
+
+#ifdef AERIAL_CUMAC_AIRAN_ENABLE
+                if(m_airanInfer)
+                {
+                    if(runIdx < m_airanPipes.size())
+                    {
+                        // Bind the engine I/O for this inference pipe and prime it
+                        // once (also triggers CUDA Graph capture when enabled).
+                        m_airanPipes[runIdx]->setup(m_airanTvPath, m_cuStrmsMac[strmIdx].handle());
+                        m_airanPipes[runIdx]->run(m_cuStrmsMac[strmIdx].handle());
+                    }
+                    runIdx++;
+                    continue;
+                }
+#endif
 
                 if(runIdx >= m_macPipes.size() || runIdx >= inFileNamesMac.size())
                 {
@@ -515,8 +597,26 @@ void CuMACTestWorkerImpl::macRunHandler(std::shared_ptr<void>& shPtrPayload)
 
                     CUDA_CHECK(cudaEventRecord(m_timeMacSlotStartEvents[macSlotIdx].handle(), m_cuStrmsMac[strmIdx].handle()));
 
-                    // run multi cell schedulers
-                    m_macPipes[macSlotIdx]->run(m_cuStrmsMac[strmIdx].handle());
+#ifdef AERIAL_CUMAC_AIRAN_ENABLE
+                    if(m_airanInfer)
+                    {
+                        if(macSlotIdx < m_airanPipes.size())
+                        {
+                            // run trtEngine inference for this slot (GPU sharing with cuPHY)
+                            m_airanPipes[macSlotIdx]->run(m_cuStrmsMac[strmIdx].handle());
+                        }
+                        else
+                        {
+                            printf("ERROR: macRunHandler macSlotIdx (%u) out of bounds (m_airanPipes=%zu)\n",
+                                   macSlotIdx, m_airanPipes.size());
+                        }
+                    }
+                    else
+#endif
+                    {
+                        // run multi cell schedulers
+                        m_macPipes[macSlotIdx]->run(m_cuStrmsMac[strmIdx].handle());
+                    }
 
                     CUDA_CHECK(cudaEventRecord(m_timeMacSlotEndEvents[macSlotIdx].handle(), m_cuStrmsMac[strmIdx].handle()));
                     

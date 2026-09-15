@@ -28,11 +28,16 @@ SCRIPT_DIR=$(dirname $SCRIPT)
 
 cuBB_SDK=${cuBB_SDK:-$(realpath $SCRIPT_DIR/../..)}
 
-# Default values
-MAX_DURATION=300
-IGNORE_DURATION=30
+# Load shared timing/processing defaults
+source "$SCRIPT_DIR/post_processing_defaults.cfg"
+
 MMIMO_FLAG=""
+FRAMEWORK_CPLANE_FLAG=""
 LABEL=""
+MAX_DURATION_EXPLICIT=0
+IGNORE_DURATION_EXPLICIT=0
+IGNORE_UL_CHANNELS=()
+IGNORE_DL_CHANNELS=()
 
 # Mode variables
 MODE=""
@@ -56,13 +61,22 @@ show_usage() {
     echo "  --absolute-threshold <file>     Run absolute threshold check"
     echo "  --latency-summary               Run latency_summary.py (creates latency_summary.html)"
     echo "  --latency-timeline              Generate latency_timeline.html visualization"
+    echo "  --threshold-summary <files...>  Generate threshold summary (MUST be last flag; consumes all remaining args)"
     echo
     echo "Optional Arguments:"
     echo "  --mmimo                 Enable mMIMO mode (-e flag to Python scripts)"
-    echo "  --max-duration <sec>    Max duration to process (default: $MAX_DURATION)"
-    echo "  --ignore-duration <sec> Initial seconds to skip (default: $IGNORE_DURATION)"
+    echo "  --framework-cplane      Framework C-plane mode (soft-skip metrics arch. absent on framework path; --perf-metrics only)"
+    echo "  --max-duration <sec>    Override max duration (default: mode-dependent from post_processing_defaults.cfg)"
+    echo "  --ignore-duration <sec> Override ignore duration (default: mode-dependent from post_processing_defaults.cfg)"
+    echo "  -c, --ignore-ul-channels <names...>  Same as cicd_performance_metrics.py -c; --perf-metrics only"
+    echo "  -d, --ignore-dl-channels <names...>  Same as cicd_performance_metrics.py -d; --perf-metrics only"
     echo "  --label <name>          Label for compare_logs/latency_summary output"
     echo "  -h, --help              Show this help message"
+    echo
+    echo "Timing Defaults (from post_processing_defaults.cfg):"
+    echo "  perf-metrics:                       -m $PERFMETRICS_MAX_DURATION -i $PERFMETRICS_IGNORE_DURATION"
+    echo "  compare-logs, latency-summary:      -m $ANALYSIS_MAX_DURATION -i $ANALYSIS_IGNORE_DURATION"
+    echo "  cpu-timeline, latency-timeline:     -m $TIMELINE_MAX_DURATION -i $TIMELINE_IGNORE_DURATION"
     echo
     echo "Return Codes:"
     echo "  0 = success (or pass for threshold checks)"
@@ -71,6 +85,9 @@ show_usage() {
     echo "Examples:"
     echo "  # Performance metrics extraction"
     echo "  $0 ./output/binary ./output --perf-metrics --mmimo"
+    echo "  # Performance metrics with ignored UL/DL channels (matches cicd_performance_metrics.py -c / -d)"
+    echo "  $0 ./in ./out --perf-metrics --ignore-ul-channels PUCCH PRACH --ignore-dl-channels PDCCH"
+    echo "  $0 ./in ./out --perf-metrics -c PUCCH -d PDCCH CSIRS PBCH"
     echo
     echo "  # Compare logs visualization"
     echo "  $0 ./output/binary ./output --compare-logs --label my_test --mmimo"
@@ -134,6 +151,11 @@ while [[ $# -gt 0 ]]; do
                 THRESHOLD_SUMMARY_ARGS+=("$1")
                 shift
             done
+            if [[ ${#THRESHOLD_SUMMARY_ARGS[@]} -eq 0 ]]; then
+                echo "Error: --threshold-summary requires at least one requirements CSV file"
+                echo "Usage: $0 <input> <output> --threshold-summary <file1.csv> [file2.csv ...] [-l label1 label2 ...]"
+                exit 1
+            fi
             ;;
         --latency-summary)
             MODE="latency-summary"
@@ -147,12 +169,17 @@ while [[ $# -gt 0 ]]; do
             MMIMO_FLAG="-e"
             shift
             ;;
+        --framework-cplane)
+            FRAMEWORK_CPLANE_FLAG="--framework-cplane"
+            shift
+            ;;
         --max-duration)
             if [[ -z "$2" || "$2" == -* ]]; then
                 echo "Error: Missing value for --max-duration option"
                 exit 1
             fi
-            MAX_DURATION="$2"
+            MAX_DURATION_OVERRIDE="$2"
+            MAX_DURATION_EXPLICIT=1
             shift 2
             ;;
         --ignore-duration)
@@ -160,8 +187,33 @@ while [[ $# -gt 0 ]]; do
                 echo "Error: Missing value for --ignore-duration option"
                 exit 1
             fi
-            IGNORE_DURATION="$2"
+            IGNORE_DURATION_OVERRIDE="$2"
+            IGNORE_DURATION_EXPLICIT=1
             shift 2
+            ;;
+        -c|--ignore-ul-channels)
+            shift
+            IGNORE_UL_CHANNELS=()
+            if [[ $# -eq 0 || "$1" == -* ]]; then
+                echo "Error: -c / --ignore-ul-channels requires at least one channel name (e.g. PUCCH PRACH)"
+                exit 1
+            fi
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                IGNORE_UL_CHANNELS+=("$1")
+                shift
+            done
+            ;;
+        -d|--ignore-dl-channels)
+            shift
+            IGNORE_DL_CHANNELS=()
+            if [[ $# -eq 0 || "$1" == -* ]]; then
+                echo "Error: -d / --ignore-dl-channels requires at least one channel name (e.g. PDSCH PDCCH)"
+                exit 1
+            fi
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                IGNORE_DL_CHANNELS+=("$1")
+                shift
+            done
             ;;
         --label)
             if [[ -z "$2" || "$2" == -* ]]; then
@@ -211,10 +263,44 @@ if [[ -z "$MODE" ]]; then
     exit 1
 fi
 
+if [[ ${#IGNORE_UL_CHANNELS[@]} -gt 0 || ${#IGNORE_DL_CHANNELS[@]} -gt 0 ]]; then
+    if [[ "$MODE" != "perf-metrics" ]]; then
+        echo "Error: -c/--ignore-ul-channels and -d/--ignore-dl-channels are only valid with --perf-metrics"
+        exit 1
+    fi
+fi
+
 # Validate input folder exists
 if [[ ! -d "$INPUT_FOLDER" ]]; then
     echo "Error: Input folder not found: $INPUT_FOLDER"
     exit 1
+fi
+
+# Set mode-appropriate timing defaults from post_processing_defaults.cfg,
+# then apply any explicit user overrides.
+case $MODE in
+    perf-metrics)
+        MAX_DURATION=$PERFMETRICS_MAX_DURATION
+        IGNORE_DURATION=$PERFMETRICS_IGNORE_DURATION
+        ;;
+    compare-logs|latency-summary)
+        MAX_DURATION=$ANALYSIS_MAX_DURATION
+        IGNORE_DURATION=$ANALYSIS_IGNORE_DURATION
+        ;;
+    cpu-timeline|latency-timeline)
+        MAX_DURATION=$TIMELINE_MAX_DURATION
+        IGNORE_DURATION=$TIMELINE_IGNORE_DURATION
+        ;;
+    *)
+        MAX_DURATION=$PERFMETRICS_MAX_DURATION
+        IGNORE_DURATION=$PERFMETRICS_IGNORE_DURATION
+        ;;
+esac
+if [[ $MAX_DURATION_EXPLICIT -eq 1 ]]; then
+    MAX_DURATION="$MAX_DURATION_OVERRIDE"
+fi
+if [[ $IGNORE_DURATION_EXPLICIT -eq 1 ]]; then
+    IGNORE_DURATION="$IGNORE_DURATION_OVERRIDE"
 fi
 
 # Create output folder if it doesn't exist
@@ -248,11 +334,23 @@ case $MODE in
             exit 1
         fi
 
+        IGNORE_UL_ARGS=()
+        if [[ ${#IGNORE_UL_CHANNELS[@]} -gt 0 ]]; then
+            IGNORE_UL_ARGS=(-c "${IGNORE_UL_CHANNELS[@]}")
+        fi
+        IGNORE_DL_ARGS=()
+        if [[ ${#IGNORE_DL_CHANNELS[@]} -gt 0 ]]; then
+            IGNORE_DL_ARGS=(-d "${IGNORE_DL_CHANNELS[@]}")
+        fi
+
         python3 "$CICD_PERF_METRICS" "$INPUT_FOLDER" \
             -p "$OUTPUT_FOLDER/perf.csv" \
             -m "$MAX_DURATION" \
             -i "$IGNORE_DURATION" \
-            $MMIMO_FLAG
+            $MMIMO_FLAG \
+            $FRAMEWORK_CPLANE_FLAG \
+            "${IGNORE_UL_ARGS[@]}" \
+            "${IGNORE_DL_ARGS[@]}"
 
         EXIT_CODE=$?
         if [[ $EXIT_CODE -eq 0 ]]; then
@@ -437,9 +535,19 @@ case $MODE in
             exit 1
         fi
 
-        python3 "$CICD_THRESHOLD_SUMMARY" "$OUTPUT_FOLDER/perf.csv" "${THRESHOLD_SUMMARY_ARGS[@]}"
-
+        STDERR_FILE=$(mktemp)
+        python3 "$CICD_THRESHOLD_SUMMARY" "$OUTPUT_FOLDER/perf.csv" \
+            "${THRESHOLD_SUMMARY_ARGS[@]}" 2>"$STDERR_FILE"
         EXIT_CODE=$?
+        cat "$STDERR_FILE" >&2
+
+        if [[ $EXIT_CODE -ne 0 ]] && grep -q "unrecognized arguments" "$STDERR_FILE" 2>/dev/null; then
+            echo ""
+            echo "Hint: --threshold-summary must be the LAST flag; all subsequent arguments"
+            echo "are forwarded to the Python script. If you intended a flag for this shell"
+            echo "script, place it BEFORE --threshold-summary."
+        fi
+        rm -f "$STDERR_FILE"
         ;;
 
     latency-summary)

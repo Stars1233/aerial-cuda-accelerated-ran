@@ -27,6 +27,9 @@ Examples:
     # Basic usage - use with eval or the shell wrapper
     eval $(python3 parse_test_config_params.py "F08_6C_69_MODCOMP_STT480000_1P" "CG1_R750")
 
+    # Carrier aggregation - four cells in each of two carrier groups
+    python3 parse_test_config_params.py "F08_4C_4C_52a_BFP9_STT455000_EH_1P" "CG1_CG1" -o env.sh
+
     # Save to file for later sourcing
     python3 parse_test_config_params.py "F08_6C_69_MODCOMP_STT480000_1P" "CG1_R750" -o env.sh
     source env.sh
@@ -44,6 +47,12 @@ import os
 import subprocess
 import glob
 from pathlib import Path
+
+# Make the source aerial_postproc package importable even without the venv, so we
+# can share the pure-stdlib variant template map. The empty package __init__ plus
+# the stdlib-only cicd_variants module keep this import free of pandas/numpy.
+sys.path.insert(0, str(Path(__file__).parent / "aerial_postproc"))
+from aerial_postproc.cicd_variants import absolute_template_candidates
 
 def load_mimo_patterns_from_shell_script() -> list[str]:
     """
@@ -103,29 +112,50 @@ except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as e:
     print(f"Error loading MIMO patterns: {e}", file=sys.stderr)
     sys.exit(1)
 
-# Valid host configurations
-VALID_HOST_CONFIGS = ["CG1_R750", "CG1_CG1", "GL4_R750"]
+FUTEX_CUDA_THRESHOLD_DEFAULT = 50
 
-def parse_test_case_string(test_case):
+# Valid host configurations
+VALID_HOST_CONFIGS: list[str] = [
+    "CG1_R750",
+    "CG1_CG1",
+    "CG1_LOOPBACK",
+    "GL4_R750",
+    "SPRK_R750",
+    "SPRK_CG1",
+    "MGX1_MGX1",
+]
+
+# Required number of carrier aggregation groups for each pattern.
+# For example, F08_4C_4C_52a has two groups, while
+# F08_1C_1C_2C_52d has three groups.
+CARRIER_AGGREGATION_GROUP_COUNTS = {
+    "52a": 2,
+    "52b": 2,
+    "52c": 2,
+    "52d": 3,
+}
+
+
+def parse_test_case_string(test_case, du_host, ru_host):
     """Parse the test case string and extract all parameters."""
 
     # Check if it starts with F08
     if test_case.startswith("F08_") :
-        params = parse_f08_test_case_string(test_case)
+        params = parse_f08_test_case_string(test_case, du_host, ru_host)
     elif test_case.isdigit():
-        params = parse_nrsim_test_case_string(test_case)
+        params = parse_nrsim_test_case_string(test_case, du_host, ru_host)
     else:
         print(f"Error: Test case string must start with 'F08_' or be an integer NRSIM test case. Got: {test_case}", file=sys.stderr)
         sys.exit(1)
 
     return params
 
-def parse_nrsim_test_case_string(test_case):
+def parse_nrsim_test_case_string(test_case, du_host, ru_host):
     if not test_case.isdigit():
         print(f"Error: NRSIM test case string must be an integer value. Got: {test_case}", file=sys.stderr)
         sys.exit(1)
 
-    preset = lookup_preset(test_case)
+    preset = lookup_preset(test_case, du_host, ru_host)
     channel = lookup_nrsim_channel(int(test_case))
 
     params = {
@@ -136,7 +166,7 @@ def parse_nrsim_test_case_string(test_case):
 
     return params
 
-def parse_f08_test_case_string(test_case):
+def parse_f08_test_case_string(test_case, du_host, ru_host):
     if not test_case.startswith("F08_"):
         print(f"Error: F08 test case string must start with 'F08_'. Got: {test_case}", file=sys.stderr)
         sys.exit(1)
@@ -144,19 +174,51 @@ def parse_f08_test_case_string(test_case):
     # Remove F08_ prefix
     remaining = test_case[4:]
 
-    # Parse cells and pattern - expecting format like "6C_69_..."
-    match = re.match(r'^(\d+)C_([0-9a-z]+)(?:_(.*))?$', remaining)
+    # Parse one or more cell-count groups followed by the pattern.
+    # Standard example: 6C_69; carrier aggregation example: 4C_4C_52a.
+    match = re.match(r'^((?:\d+C_)+)([0-9a-z]+)(?:_(.*))?$', remaining)
     if not match:
-        print(f"Error: Invalid test case format. Expected F08_<num>C_<pattern>_... Got: {test_case}", file=sys.stderr)
+        print(
+            "Error: Invalid test case format. Expected "
+            f"F08_<cells>C[_<cells>C...]_<pattern>_... Got: {test_case}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    num_cells = match.group(1)
-    pattern = match.group(2)
+    cell_counts = [int(value) for value in re.findall(r'(\d+)C', match.group(1))]
+    pattern = match.group(2).lower()
     modifiers = match.group(3) if match.group(3) else ""
+    cell_topology = "_".join(f"{value}C" for value in cell_counts)
+
+    if any(value < 1 for value in cell_counts):
+        print(f"Error: Cell counts must be positive in '{cell_topology}'", file=sys.stderr)
+        sys.exit(1)
+
+    if pattern in CARRIER_AGGREGATION_GROUP_COUNTS:
+        expected_groups = CARRIER_AGGREGATION_GROUP_COUNTS[pattern]
+        if len(cell_counts) != expected_groups:
+            print(
+                f"Error: Pattern {pattern} requires {expected_groups} cell-count groups "
+                f"(for example, {'1C_' * (expected_groups - 1)}1C_{pattern}). "
+                f"Got: {test_case}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif len(cell_counts) != 1:
+        print(
+            f"Error: Pattern {pattern} is not a carrier aggregation pattern and requires "
+            f"one cell-count group. Got: {cell_topology}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    num_cells = str(sum(cell_counts))
 
     # Parse modifiers
     params = {
         'num_cells': num_cells,
+        'cell_topology': cell_topology,
+        'is_carrier_aggregation': pattern in CARRIER_AGGREGATION_GROUP_COUNTS,
         'pattern': pattern,
         'compression': 1,  # Default BFP
         'bfp': 9,  # Default BFP value
@@ -172,7 +234,8 @@ def parse_f08_test_case_string(test_case):
         'reduced_logging': False,  # Default disabled
         'mumimo': 1 if pattern in MIMO_PATTERNS else 0,
         'cupti': False,  # Default disabled
-        'preset': 'perf'
+        'perf_trace': False,  # Default disabled
+        'preset': lookup_preset(test_case, du_host, ru_host)
     }
 
     # Split modifiers by underscore and process each
@@ -192,10 +255,10 @@ def parse_f08_test_case_string(test_case):
                 params['bfp'] = 14
             elif mod.startswith("STT") and len(mod) > 3:
                 params['stt'] = int(mod[3:])
-            elif mod == "1P":
-                params['num_ports'] = 1
-            elif mod == "2P":
-                params['num_ports'] = 2
+            elif re.fullmatch(r'(?:[1-9]|1[0-9]|2[0-4])P', mod):
+                # Match test_config.sh: --num-ports accepts 1..24 (e.g. 1P, 8P, 24P).
+                # MGX ARC Pro: up to 3x CX8 × 8 ports/NIC = 24 ports.
+                params['num_ports'] = int(mod[:-1])
             elif mod == "EH":
                 params['ehq'] = 1
             elif mod == "GC":
@@ -226,6 +289,8 @@ def parse_f08_test_case_string(test_case):
                 params['reduced_logging'] = True
             elif mod == "CUPTI":
                 params['cupti'] = True
+            elif mod == "PERF":
+                params['perf_trace'] = True
             elif mod.startswith("RUN") and len(mod) > 3 and mod[3:].isdigit():
                 # Run/instance identifier for CI/CD parallelization - informational only
                 params['run_instance'] = int(mod[3:])
@@ -235,14 +300,14 @@ def parse_f08_test_case_string(test_case):
             else:
                 # Unknown modifier, fail with error
                 print(f"Error: Unknown modifier '{mod}' in test case string", file=sys.stderr)
-                print(f"Valid modifiers: BFP9, BFP14, MODCOMP, STT<number>, 1P, 2P, EH, GC, WC<number>, PMU<number>, NS<number>, NICD, RUWT, NOPOST, CUPTI, RUN<number>", file=sys.stderr)
+                print("Valid modifiers: BFP9, BFP14, MODCOMP, STT<number>, [1-24]P, EH, GC, WC<number>, PMU<number>, NS<number>, NICD, RUWT, NOPOST, CUPTI, PERF, RUN<number>", file=sys.stderr)
                 sys.exit(1)
 
             i += 1
 
     return params
 
-def lookup_preset(test_case):
+def lookup_preset(test_case, du_host, ru_host):
     """Returns the build preset to use based on the test_case name"""
     default_preset = "perf"
 
@@ -261,20 +326,33 @@ def lookup_preset(test_case):
         print(f"Warning: unable to match NRSIM to channel for '{test_case}'. Using default preset: {default_preset}")
         return default_preset
 
-    nrsim_10_04_32dl = [90156, 90157, 90158]
+    # Test cases for FAPI 10.02 with SRS 10.04
+    nrsim_10_02_SRS_10_04 = [90168, 90169, 90170, 90171]
+    # Test cases for 32DL
+    nrsim_10_04_32dl = [90156, 90157, 90158, 90648]
+    # Test cases requiring the 10_04_TM build: conformance testMode TCs
+    # (38.141-1 4.9.2.2 / NR-FR1-TM*) and DFT-s-OFDM group/sequence hopping TCs.
+    # Single-channel: 2036 (PDCCH), 3296/3354/3355 (PDSCH), 120-128 (dlmix NR-FR1-TM).
+    # Multi-slot: 90051 (mixed TM/non-TM cells), 90502 (bug TestModel 2 PDSCH + 1 PDCCH).
+    nrsim_10_04_TM = [
+        120, 121, 122, 123, 124, 125, 126, 127, 128,
+        2036, 3296, 3354, 3355, 7292, 7293, 90051, 90502,
+    ]
     channels_10_04 = ["SRS", "MIX", "mSlot_mCell"]
     channels_10_02 = ["PBCH", "PDCCH_DL", "PDSCH", "CSI_RS", "PRACH", "PUCCH", "PUSCH", "BFW"]
 
-    # Exceptions to the channel mapping are checked first
-    if int(test_case) in nrsim_10_04_32dl:
-        return "10_04_32dl"
-    elif channel in channels_10_04:
-        return "10_04"
+    if int(test_case) in nrsim_10_02_SRS_10_04:
+        return "10_02_SRS_10_04"
+    elif int(test_case) in nrsim_10_04_TM:
+        return "10_04_low_memory" if du_host == "SPRK" else "10_04_TM"
+    elif int(test_case) in nrsim_10_04_32dl or channel in channels_10_04:
+        return "10_04_low_memory" if du_host == "SPRK" else "10_04"
     elif channel in channels_10_02:
         return "10_02"
     else:
         print(f"Warning: unable to match NRSIM '{test_case}' to a predetermined preset. Using default preset: {default_preset}")
         return default_preset
+
 
 def lookup_nrsim_channel(test_case_number):
     """Checks test_number for NRSIM and maps to the channel type"""
@@ -338,7 +416,8 @@ def generate_nrsim_script_params(args, params, du_host, ru_host):
 
     # 3. setup1_DU.sh parameters
     setup1_params = []
-    setup1_params.append(f"-y nrSim_SCF_CG1_{params['pattern']}")
+    setup1_params.append(f"-y nrSim_SCF_{du_host}_{params['pattern']}")
+    setup1_params.append(f"--ru-host-type=_{ru_host}")
     script_params['setup1_du'] = " ".join(setup1_params)
 
     # 4. setup2_RU.sh parameters
@@ -348,11 +427,10 @@ def generate_nrsim_script_params(args, params, du_host, ru_host):
     # 5. test_config_nrSim.sh parameters
     config_params = []
 
-    # mSlot_mCell is special - all other channels explicitly pass the channel name
+    # mSlot_mCell needs an explicit bitmask; for all other nrSim cases the
+    # application infers channels from the TV, so --channels is omitted.
     if params['channel'] == "mSlot_mCell":
         config_params.append(f"--channels 0x1ff")
-    else:
-        config_params.append(f"--channels {params['channel']}")
 
     script_params['test_config'] = " ".join(config_params) if config_params else ""
 
@@ -362,7 +440,7 @@ def generate_nrsim_script_params(args, params, du_host, ru_host):
     if args.custom_build_dir:
         run1_ru_params.append(f"--build_dir {args.custom_build_dir}.$(uname -m)")
     else:
-        run1_ru_params.append(f"--build_dir build.{params['preset']}.$ARCH")
+        run1_ru_params.append(f"--build_dir build.{params['preset']}.$(uname -m)")
     script_params['run1_ru'] = " ".join(run1_ru_params) if run1_ru_params else ""
 
     # 7. run2_cuPHYcontroller.sh parameters
@@ -390,7 +468,12 @@ def generate_f08_script_params(args, params, du_host, ru_host):
     script_params = {}
 
     # 1. copy_test_files.sh parameters
-    script_params['copy_test_files'] = f"{params['pattern']} --max_cells {params['num_cells']}"
+    if params['is_carrier_aggregation']:
+        script_params['copy_test_files'] = (
+            f"{params['pattern']} --cell-topology {params['cell_topology']}"
+        )
+    else:
+        script_params['copy_test_files'] = f"{params['pattern']} --max_cells {params['num_cells']}"
 
     # 2. build_aerial_sdk.sh parameters
     build_params = []
@@ -419,6 +502,8 @@ def generate_f08_script_params(args, params, du_host, ru_host):
     # 5. test_config.sh parameters
     config_params = [params['pattern']]
     config_params.append(f"--num-cells={params['num_cells']}")
+    if params['is_carrier_aggregation']:
+        config_params.append(f"--cell-topology={params['cell_topology']}")
     config_params.append(f"--num-ports={params['num_ports']}")
     config_params.append(f"--num-slots={params['num_slots']}")
     config_params.append(f"--compression={params['compression']}")
@@ -455,6 +540,28 @@ def generate_f08_script_params(args, params, du_host, ru_host):
         run2_cuphycontroller_params.append(f"--build_dir {args.custom_build_dir}.$(uname -m)")
     else:
         run2_cuphycontroller_params.append(f"--build_dir build.{preset}.$(uname -m)")
+    if params['perf_trace']:
+        run2_cuphycontroller_params.append("--perf_trace")
+        run2_cuphycontroller_params.append("--perf_trace_dir $cuBB_SDK/perf")
+        # The PERF modifier also enables in-kernel all-syscall counting via
+        # bpftrace, on an orthogonal CPU core (perf -> 58, bpftrace -> 59) so both
+        # tracers run together. A separate output dir keeps the perf step's *.txt
+        # purge from clobbering the bpftrace summary.
+        run2_cuphycontroller_params.append("--bpftrace")
+        run2_cuphycontroller_params.append("--bpftrace_dir $cuBB_SDK/bpftrace")
+        # Enable LD_PRELOAD CUDA API tracer alongside perf so we can compute
+        # per-API futex/total ratios for the threshold gate. nsys/cupti
+        # silently overrides LD_PRELOAD (run2_cuPHYcontroller.sh:356-358), so
+        # skip the tracer flag in that case to avoid a downstream Step 13
+        # failure with no tracer log to gate on.
+        if params['cupti']:
+            print(
+                "Warning: --cuda_tracer suppressed because nsys/cupti is also active; "
+                "futex/CUDA threshold gate (Step 13) will be skipped for this run.",
+                file=sys.stderr,
+            )
+        else:
+            run2_cuphycontroller_params.append("--cuda_tracer $cuBB_SDK/perf/cuda_api_tracer.log")
     script_params['run2_cuphycontroller'] = " ".join(run2_cuphycontroller_params) if run2_cuphycontroller_params else ""
 
     # 8. run3_testMAC.sh parameters
@@ -539,11 +646,15 @@ def find_threshold_file(script_dir: Path, threshold_type: str, pattern: str, com
     return ""
 
 
-def find_absolute_threshold_file(script_dir: Path, is_mimo: bool, ehq: int) -> str:
+def find_absolute_threshold_file(
+    script_dir: Path, is_mimo: bool, ehq: int, pattern: str = ""
+) -> str:
     """
     Find the absolute threshold (perf requirements) file.
 
-    Based on mMIMO pattern and EH modifier:
+    Prefer a variant-specific CSV when the pattern maps to a known variant
+    (via ABSOLUTE_THRESHOLD_VARIANT_MAP in aerial_postproc.cicd_variants), then
+    fall back to the generic mMIMO x EH matrix:
     - non-mMIMO + EH     -> perf_requirements_4tr_eh.csv
     - non-mMIMO + no EH  -> perf_requirements_4tr_noneh.csv
     - mMIMO + EH         -> perf_requirements_64tr_eh.csv
@@ -557,23 +668,32 @@ def find_absolute_threshold_file(script_dir: Path, is_mimo: bool, ehq: int) -> s
     if not req_dir.exists():
         return ""
 
-    if is_mimo:
-        tr_suffix = "64tr"
-    else:
-        tr_suffix = "4tr"
+    tr_suffix = "64tr" if is_mimo else "4tr"
+    eh_suffix = "eh" if ehq else "noneh"
 
-    if ehq:
-        eh_suffix = "eh"
-    else:
-        eh_suffix = "noneh"
-
-    filename = f"perf_requirements_{tr_suffix}_{eh_suffix}.csv"
-    filepath = req_dir / filename
-
-    if filepath.exists():
-        return str(filepath)
+    for filename in absolute_template_candidates(tr_suffix, eh_suffix, pattern):
+        filepath = req_dir / filename
+        if filepath.exists():
+            return str(filepath)
 
     return ""
+
+
+IGNORE_CHANNEL_PATTERNS = {
+    "101":  {"ul": ["PUCCH"], "dl": ["PDCCH", "CSIRS", "PBCH"]},
+    "101a": {"ul": ["PUCCH"], "dl": ["PDCCH", "CSIRS", "PBCH"]},
+}
+
+
+def get_ignore_channels(pattern: str) -> tuple[list[str], list[str]]:
+    """
+    Return (ignore_ul, ignore_dl) channel lists for patterns with inactive channels.
+
+    Patterns listed in IGNORE_CHANNEL_PATTERNS have channels that are not
+    scheduled and must be excluded from perf metrics validation.
+    """
+    entry = IGNORE_CHANNEL_PATTERNS.get(pattern.lower(), {})
+    return list(entry.get("ul", [])), list(entry.get("dl", []))
 
 
 def generate_post_processing_params(args, params) -> dict:
@@ -585,10 +705,13 @@ def generate_post_processing_params(args, params) -> dict:
     - parse_logs_params: Flags for post_processing_parse.sh
     - post_processing_perf_params: Flags for post_processing_analyze.sh --perf-metrics
     - post_processing_compare_params: Flags for post_processing_analyze.sh --compare-logs
+    - post_processing_cpu_timeline_params: Flags for post_processing_analyze.sh --cpu-timeline
+    - post_processing_threshold_summary_params: Flags for post_processing_analyze.sh --threshold-summary
     - post_processing_gating_params: Flags for post_processing_analyze.sh --gating-threshold
     - post_processing_warning_params: Flags for post_processing_analyze.sh --warning-threshold
     - post_processing_absolute_params: Flags for post_processing_analyze.sh --absolute-threshold
     - post_processing_latency_params: Flags for post_processing_analyze.sh --latency-summary
+    - post_processing_latency_timeline_params: Flags for post_processing_analyze.sh --latency-timeline
     """
     script_dir = Path(__file__).parent
     pp_params = {}
@@ -599,10 +722,13 @@ def generate_post_processing_params(args, params) -> dict:
         pp_params['parse_logs_params'] = ""
         pp_params['post_processing_perf_params'] = ""
         pp_params['post_processing_compare_params'] = ""
+        pp_params['post_processing_cpu_timeline_params'] = ""
+        pp_params['post_processing_threshold_summary_params'] = ""
         pp_params['post_processing_gating_params'] = ""
         pp_params['post_processing_warning_params'] = ""
         pp_params['post_processing_absolute_params'] = ""
         pp_params['post_processing_latency_params'] = ""
+        pp_params['post_processing_latency_timeline_params'] = ""
         return pp_params
 
     # Check for NOPOST modifier (reduced_logging)
@@ -611,10 +737,45 @@ def generate_post_processing_params(args, params) -> dict:
         pp_params['parse_logs_params'] = ""
         pp_params['post_processing_perf_params'] = ""
         pp_params['post_processing_compare_params'] = ""
+        pp_params['post_processing_cpu_timeline_params'] = ""
+        pp_params['post_processing_threshold_summary_params'] = ""
         pp_params['post_processing_gating_params'] = ""
         pp_params['post_processing_warning_params'] = ""
         pp_params['post_processing_absolute_params'] = ""
         pp_params['post_processing_latency_params'] = ""
+        pp_params['post_processing_latency_timeline_params'] = ""
+        return pp_params
+
+    # PERF modifier: run only futex/CUDA analysis, skip all normal post-processing.
+    # The PERF modifier changes worker thread scheduling to SCHED_OTHER which
+    # invalidates normal latency metrics and threshold gating.
+    if params['perf_trace']:
+        # The futex/CUDA threshold gate (Step 13) needs the LD_PRELOAD tracer
+        # log, which is suppressed when nsys/cupti is active (see the
+        # --cuda_tracer guard above). Only pass --futex-cuda-threshold when the
+        # tracer is actually enabled; otherwise Step 13 hard-fails on a missing
+        # tracer log instead of being skipped as the warning promises. The
+        # page-fault gate (Step 11c) runs unconditionally and needs no tracer.
+        futex_cuda_threshold = params.get(
+            "futex_cuda_threshold", FUTEX_CUDA_THRESHOLD_DEFAULT
+        )
+        pp_params['post_processing_cicd_params'] = (
+            "--skip-log-analysis --perf-trace-dir $cuBB_SDK/perf"
+            # The PERF modifier also gates the bpftrace all-syscall capture:
+            # post_processing_cicd.sh Step 14 fails the run if it is empty.
+            " --bpftrace-dir $cuBB_SDK/bpftrace"
+            + ("" if params['cupti'] else f" --futex-cuda-threshold {futex_cuda_threshold}")
+        )
+        pp_params['parse_logs_params'] = ""
+        pp_params['post_processing_perf_params'] = ""
+        pp_params['post_processing_compare_params'] = ""
+        pp_params['post_processing_cpu_timeline_params'] = ""
+        pp_params['post_processing_threshold_summary_params'] = ""
+        pp_params['post_processing_gating_params'] = ""
+        pp_params['post_processing_warning_params'] = ""
+        pp_params['post_processing_absolute_params'] = ""
+        pp_params['post_processing_latency_params'] = ""
+        pp_params['post_processing_latency_timeline_params'] = ""
         return pp_params
 
     # Extract parameters
@@ -636,7 +797,16 @@ def generate_post_processing_params(args, params) -> dict:
                                        bfp, ehq, green_ctx, num_cells)
     warning_file = find_threshold_file(script_dir, "warning_perf_requirements", pattern, compression,
                                         bfp, ehq, green_ctx, num_cells)
-    absolute_file = find_absolute_threshold_file(script_dir, is_mimo, ehq)
+    absolute_file = find_absolute_threshold_file(script_dir, is_mimo, ehq, pattern)
+
+    # Determine inactive channels based on traffic pattern
+    ignore_ul, ignore_dl = get_ignore_channels(pattern)
+    ignore_channel_flags = ""
+    if ignore_ul:
+        ignore_channel_flags += " -c " + " ".join(ignore_ul)
+    if ignore_dl:
+        ignore_channel_flags += " -d " + " ".join(ignore_dl)
+    ignore_channel_flags = ignore_channel_flags.strip()
 
     # Generate parse_logs_params
     parse_logs_opts = ["--perf-metrics"]
@@ -647,9 +817,12 @@ def generate_post_processing_params(args, params) -> dict:
     pp_params['parse_logs_params'] = " ".join(parse_logs_opts)
 
     # Generate post_processing_perf_params
+    # Timing defaults are handled by post_processing_analyze.sh via post_processing_defaults.cfg
     perf_opts = ["--perf-metrics"]
     if is_mimo:
         perf_opts.append("--mmimo")
+    if ignore_channel_flags:
+        perf_opts.append(ignore_channel_flags)
     perf_opts.append(label_flag)
     pp_params['post_processing_perf_params'] = " ".join(perf_opts)
 
@@ -688,6 +861,39 @@ def generate_post_processing_params(args, params) -> dict:
     else:
         pp_params['post_processing_latency_params'] = ""
 
+    # Generate post_processing_cpu_timeline_params
+    cpu_timeline_opts = ["--cpu-timeline"]
+    cpu_timeline_opts.append(label_flag)
+    pp_params['post_processing_cpu_timeline_params'] = " ".join(cpu_timeline_opts)
+
+    # Generate post_processing_threshold_summary_params
+    threshold_files = []
+    threshold_labels = []
+    if absolute_file:
+        threshold_files.append(str(absolute_file))
+        threshold_labels.append("absolute")
+    if gating_file:
+        threshold_files.append(str(gating_file))
+        threshold_labels.append("gating")
+    if warning_file:
+        threshold_files.append(str(warning_file))
+        threshold_labels.append("warning")
+    if threshold_files:
+        pp_params['post_processing_threshold_summary_params'] = " ".join(
+            ["--threshold-summary"] + threshold_files + ["-l"] + threshold_labels)
+    else:
+        pp_params['post_processing_threshold_summary_params'] = ""
+
+    # Generate post_processing_latency_timeline_params
+    if is_nicd:
+        latency_tl_opts = ["--latency-timeline"]
+        if is_mimo:
+            latency_tl_opts.append("--mmimo")
+        latency_tl_opts.append(label_flag)
+        pp_params['post_processing_latency_timeline_params'] = " ".join(latency_tl_opts)
+    else:
+        pp_params['post_processing_latency_timeline_params'] = ""
+
     # Generate post_processing_cicd_params (combines everything for CICD wrapper)
     cicd_opts = []
     if gating_file:
@@ -700,6 +906,8 @@ def generate_post_processing_params(args, params) -> dict:
         cicd_opts.append("--latency-summary")
     if is_mimo:
         cicd_opts.append("--mmimo")
+    if ignore_channel_flags:
+        cicd_opts.append(ignore_channel_flags)
     cicd_opts.append(label_flag)
     pp_params['post_processing_cicd_params'] = " ".join(cicd_opts)
 
@@ -714,8 +922,14 @@ def main():
     )
 
     # Positional arguments
-    parser.add_argument('test_case', help='Test case string (e.g., F08_6C_69_MODCOMP_STT480000_1P)')
-    parser.add_argument('host_config', help='Host configuration (e.g., CG1_R750)')
+    parser.add_argument(
+        'test_case',
+        help=(
+            'Test case string (e.g., F08_6C_69_MODCOMP_STT480000_1P or '
+            'F08_4C_4C_52a_BFP9_STT455000_EH_1P)'
+        ),
+    )
+    parser.add_argument('host_config', help='Host configuration (e.g., CG1_R750 or SPRK_CG1)')
 
     # Optional arguments for environment variable names
     parser.add_argument('--copy-test-files-params', dest='copy_test_files_var',
@@ -746,8 +960,8 @@ def main():
     args = parser.parse_args()
 
     # Parse test case and host config
-    params = parse_test_case_string(args.test_case)
     du_host, ru_host = parse_host_config(args.host_config)
+    params = parse_test_case_string(args.test_case, du_host, ru_host)
 
     # Generate script parameters
     script_params = generate_script_params(args, params, du_host, ru_host)
@@ -791,10 +1005,13 @@ def main():
         env_vars['PARSE_LOGS_PARAMS'] = pp_params['parse_logs_params']
         env_vars['POST_PROCESSING_PERF_PARAMS'] = pp_params['post_processing_perf_params']
         env_vars['POST_PROCESSING_COMPARE_PARAMS'] = pp_params['post_processing_compare_params']
+        env_vars['POST_PROCESSING_CPU_TIMELINE_PARAMS'] = pp_params['post_processing_cpu_timeline_params']
+        env_vars['POST_PROCESSING_THRESHOLD_SUMMARY_PARAMS'] = pp_params['post_processing_threshold_summary_params']
         env_vars['POST_PROCESSING_GATING_PARAMS'] = pp_params['post_processing_gating_params']
         env_vars['POST_PROCESSING_WARNING_PARAMS'] = pp_params['post_processing_warning_params']
         env_vars['POST_PROCESSING_ABSOLUTE_PARAMS'] = pp_params['post_processing_absolute_params']
         env_vars['POST_PROCESSING_LATENCY_PARAMS'] = pp_params['post_processing_latency_params']
+        env_vars['POST_PROCESSING_LATENCY_TIMELINE_PARAMS'] = pp_params['post_processing_latency_timeline_params']
 
     # Generate output in test_config_summary.sh format
     output_lines = []

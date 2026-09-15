@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,8 +18,11 @@
 #ifndef _CUMAC_CP_CONFIG_HPP_
 #define _CUMAC_CP_CONFIG_HPP_
 
+#include <vector>
+
 #include "yaml.hpp"
 #include "nv_phy_utils.hpp"
+#include "cumac_app.hpp"
 
 /**
  * cuMAC Control Plane configuration manager
@@ -104,11 +107,20 @@ public:
 
     std::string cumac_group_tv_file{}; //!< Path to cuMAC group test vector file
 
+    bool enable_tv_test{}; //!< When true, parse group TV files for buffer validation / testMAC
+
     uint32_t cuda_block_num{}; //!< Number of CUDA thread blocks
 
     uint32_t group_buffer_enable{}; //!< Enable contiguous group buffer allocation
     uint32_t multi_stream_enable{}; //!< Enable multiple CUDA streams
     uint32_t slot_concurrent_enable{}; //!< Enable concurrent slot processing
+
+    bool enable_gpu_share{}; //!< Enable GPU sharing from L1 for MU UE grouping
+    bool enable_cubb{false}; //!< When true, open 3 secondary lock_free_mem_pool pools shared with cuphydriver; otherwise allocate local GPU buffers
+    int srs_slot_lag{0}; //!< Slot offset applied when mapping TV files to slot indices (TV slot id + lag, wrapped mod schedule_slot_period)
+    uint32_t task_bitmask{CUMAC_CP_TASK_MASK_DEFAULT}; //!< cuMAC task enable bitmask (bit 0~3: 4T4R tasks, bit 4: PFM SORT, bit 5: MU UE GRP)
+
+    uint16_t num_blocks_per_row{8}; //!< MU UE pairing: CUDA blocks per row for channel orthogonality matrix (muUePairTask)
 
 private:
     int max_msg_size{}; //!< Maximum IPC message size in bytes

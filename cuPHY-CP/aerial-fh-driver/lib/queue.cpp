@@ -33,7 +33,7 @@
 
 namespace aerial_fh
 {
-static std::atomic<uint32_t> g_next_dpdk_rx_queue_idx{MLX5_EXTERNAL_RX_QUEUE_ID_MIN};    
+static std::atomic<uint32_t> g_next_dpdk_rx_queue_idx{MLX5_EXTERNAL_RX_QUEUE_ID_MIN};
 Queue::Queue(Nic* nic, uint16_t id, uint16_t size) :
     nic_{nic},
     id_{id},

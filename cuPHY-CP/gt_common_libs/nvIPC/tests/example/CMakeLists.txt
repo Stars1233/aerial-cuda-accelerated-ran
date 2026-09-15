@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,14 @@
 
 set (SOURCES test_ipc.c)
 add_executable(test_ipc ${SOURCES})
+# Force CXX host linker; CUDA device-link is not needed for this pure-C executable.
+set_target_properties(test_ipc PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(test_ipc nvipc -pthread)
+# sdk::options provides ASan/sanitizer flags when building within the cuBB tree.
+# Guard with TARGET check so standalone nvipc builds (nvipc_src container) are unaffected.
+if(TARGET sdk::options)
+    target_link_libraries(test_ipc sdk::options)
+endif()
 
 if(NVIPC_CUDA_ENABLE)
     target_link_libraries(test_ipc cudaipctest)

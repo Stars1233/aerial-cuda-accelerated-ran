@@ -404,7 +404,7 @@ class PdschTx(PdschTxPipeline[PdschConfig, Array]):
                 dmrs_port_indices = np.where(np.flipud(np.unpackbits(np.uint8(dmrs_ports[ue]))))[0]
                 indices += list(dmrs_port_indices + 8 * scids[ue])
             else:
-                indices += list(range(precoding_matrices[ue].shape[1]))
+                indices += list(np.arange(precoding_matrices[ue].shape[1]))
         indices = list(set(indices))
 
         return tx_slot[:, :, indices]

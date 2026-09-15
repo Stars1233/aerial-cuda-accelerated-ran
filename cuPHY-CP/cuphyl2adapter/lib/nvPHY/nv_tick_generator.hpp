@@ -108,6 +108,13 @@ namespace nv
         private:
         uint64_t sys_clock_time_handler();
         int64_t get_first_slot_timestamp();
+        /**
+         * Await the first tick with an early wakeup and dispatch it at the target boundary.
+         *
+         * @param[in,out] next_expected Absolute timestamp for the first tick; advanced on dispatch.
+         * @return true if the first tick was dispatched, false if normal loop handling should continue.
+         */
+        bool await_and_dispatch_first_tick(uint64_t& next_expected);
         void slot_indication_thread_poll_method();
         void slot_indication_thread_sleep_method();
         void slot_indication_thread_timer_fd_method();

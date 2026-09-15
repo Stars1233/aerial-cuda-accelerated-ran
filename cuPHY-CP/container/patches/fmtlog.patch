@@ -118,7 +118,7 @@ index f02cab6..aa4dd7f 100644
    uint32_t reorderIdx[parttenArgSize];
    Str<3> weekdayName;
    Str<3> monthName;
-@@ -355,53 +359,61 @@ public:
+@@ -355,53 +359,62 @@ public:
    void handleLog(fmt::string_view threadName, const fmtlog::SPSCVarQueueOPT::MsgHeader* header) {
      setArgVal<6>(threadName);
      StaticLogInfo& info = bgLogInfos[header->logId];
@@ -175,7 +175,8 @@ index f02cab6..aa4dd7f 100644
 +      hour.fromi(h);
 +      setArgVal<14>(info.getBase());
 +      setArgVal<15>(info.getLocation());
-+      setArgVal<25>(fmt::format("{}",header->logQFullCount));
++      const auto logQFullCount = fmt::format("{}", header->logQFullCount);
++      setArgVal<25>(logQFullCount);
 +      logLevel = (const char*)"VEB DBG INF WRN CON ERR FAT OFF" + (info.logLevel << 2);
 
 -    size_t headerPos = membuf.size();

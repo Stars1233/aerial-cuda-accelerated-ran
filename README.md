@@ -8,6 +8,8 @@ Documentation for AI Aerial™ can be found [here](https://docs.nvidia.com/aeria
 The following AI Aerial™ software is available as open source:
 - NVIDIA Aerial™ CUDA-Accelerated RAN (this repository)
 - [NVIDIA Aerial™ Framework](https://github.com/NVIDIA/aerial-framework)
+- [NVIDIA Aerial™ Omniverse Digital Twin (client)](https://github.com/NVIDIA/aerial-omniverse-digital-twin)
+- [NVIDIA AI Aerial™ Sample Applications](https://github.com/NVIDIA/aerial-sample-apps)
 
 Updates on new software releases, NVIDIA 6G events and technical training for AI Aerial™ are available via the [NVIDIA 6G Developer Program](https://developer.nvidia.com/6g-program).
 

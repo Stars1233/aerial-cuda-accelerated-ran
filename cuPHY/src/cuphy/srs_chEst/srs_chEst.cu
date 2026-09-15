@@ -43,6 +43,16 @@ static uint8_t fourier8PermuteIdx[8] = {0, 4, 2 , 6, 1, 5, 3, 7};
 static __device__ __constant__ uint8_t d_fourier4PermuteIdx[4];
 static uint8_t fourier4PermuteIdx[4] = {0, 2, 1, 3};
 
+// Precomputed cyclic-shift correlation phase tables for STEP 7. The rotation angle is
+// -2*pi*csIdx*scIdx/n_SRS_cs_max, and n_SRS_cs_max is fixed by combSize (8 for comb-2,
+// 12 for comb-4), so the full table depends only on combSize and can be uploaded once at
+// init() instead of recomputing the sin/cos LUT in shared memory on every block.
+// Layout: [csIdx * nSrsScBlock + scIdx], where nSrsScBlock is 24 (comb-2) or 12 (comb-4).
+static __device__ __constant__ __half2 d_srsCsPhaseComb2[8 * 24];
+static __device__ __constant__ __half2 d_srsCsPhaseComb4[12 * 12];
+static __half2 srsCsPhaseComb2[8 * 24];
+static __half2 srsCsPhaseComb4[12 * 12];
+
 static __device__ __constant__ float d_rkhsEigValesNorm[32];
 static float rkhsEigValesNorm[32] = {   0.528989676222192,
                                         0.089899165392360,
@@ -1150,6 +1160,97 @@ static __device__ __constant__  int8_t LOW_PAPR_TABLE_1[LOW_PAPR_TABLE_1_N_ROWS]
 
 
 
+// Compile-time P=2 FOCC butterfly (used when every UE in the block has exactly 2 ports).
+// The two ports of a UE share W and rx and differ only by a cyclic shift of n_SRS_cs_max/2,
+// i.e. an orthogonal cover [+1,-1] over (inputSc mod 2). So the two estimates are the
+// sum/difference of the even/odd-subcarrier partial sums of the shared W*conj(focc_cs0)*rx
+// product: est_port0 = S_even + S_odd, est_port1 = S_even - S_odd. This keeps the per-tap
+// products fully packed in __half2 (like the per-port loop), uses a compile-time stride-2
+// pairing (no runtime modulo), and needs NO twiddle multiplies for the recombine -- the
+// three things that made the runtime radix-P version regress. General over any uniform
+// 2-port comb-2/comb-4 block (any nUes/nRxAnt/nAntPorts), not tied to a fixed config.
+//
+// NOTE: the same idea extends to higher even P (e.g. P=4): the P ports of a UE differ by
+// cyclic shifts of n_SRS_cs_max/P, so their estimates are the P-point DFT of the partial
+// sums binned by (inputSc mod P), and for P=4 the DFT-4 recombine is still multiply-free
+// (adds + an imaginary-unit swap/negate). It is intentionally left unimplemented here:
+// the only available 4-port test vectors are narrowband (1 compute block/cell, GPU left
+// ~99% idle), so preliminary measurements showed no measurable impact, and the dispatch
+// for non-2-port layouts falls back to the generic per-port srsFilterMultiply below.
+template <int nSrsScBlock, int nAntPorts, uint8_t FOCC_LENGTH, uint8_t correctDelayOffsetFlag, uint8_t combSize>
+inline __device__ void srsFilterMultiplyP2(
+   __half2 *sh_Hest,
+   const __half2 *sh_rxSrs,
+   const __half2 *sh_W_matrix,
+   const __half2 *sh_focc_table,
+   const uint8_t* portToFoccMap,
+   cg::thread_block &block,
+   cg::thread_block_tile<32> &tile,
+   int tid,
+   int nRxAntSrs,
+   float* sh_phaseRamp,
+   __half2*  sh_phaseLUT,
+   uint16_t*  pPortToUeIdxWithinBlock)
+{
+    (void)tile;
+    if(correctDelayOffsetFlag == 1)
+    {
+        for(int i = tid; i < nAntPorts * nSrsScBlock; i += block.size())
+        {
+            const int inputScIdx = i / nAntPorts;
+            const int portIdx    = i % nAntPorts;
+            const float phaseRamp = sh_phaseRamp[pPortToUeIdxWithinBlock[portIdx]];
+            float sinv, cosv;
+            __sincosf(-phaseRamp * inputScIdx * combSize, &sinv, &cosv);
+            sh_phaseLUT[portIdx * (nSrsScBlock + 1) + inputScIdx] = __half2(__float2half(cosv), __float2half(sinv));
+        }
+        __syncthreads();
+    }
+
+    // nAntPorts==1 is instantiated by the kernel dispatch but never selects this P=2 path
+    // (allTwoPort requires nAntPorts even); guard so nPairs==0 isn't compiled.
+    if constexpr (nAntPorts >= 2)
+    {
+    constexpr int nPairs    = nAntPorts / 2;
+    const int     loopIters = nRxAntSrs * nSrsScBlock * nPairs;
+    for(int i = tid; i < loopIters; i += block.size())
+    {
+        const int pairIdx = i % nPairs;
+        const int scIdx   = (i / nPairs) % nSrsScBlock;
+        const int antIdx  = i / (nPairs * nSrsScBlock);
+        const int port0   = 2 * pairIdx;   // UE's two ports are contiguous: 2k, 2k+1
+
+        const __half2* foccBase0 = sh_focc_table + portToFoccMap[port0] * (FOCC_LENGTH + 1);
+        const __half2* srs       = sh_rxSrs + antIdx * nSrsScBlock;
+        const __half2* w         = sh_W_matrix + scIdx * nSrsScBlock;
+
+        float2 estEven = make_float2(0.f, 0.f); // -> port0 = S_even + S_odd
+        float2 estOdd  = make_float2(0.f, 0.f); // -> port1 = S_even - S_odd
+        #pragma unroll
+        for(int sc = 0; sc < nSrsScBlock; sc += 2)
+        {
+            __half2 in0 = srs[sc];
+            __half2 in1 = srs[sc + 1];
+            if(correctDelayOffsetFlag == 1)
+            {
+                in0 = complex_mul(sh_phaseLUT[port0 * (nSrsScBlock + 1) + sc],     in0);
+                in1 = complex_mul(sh_phaseLUT[port0 * (nSrsScBlock + 1) + sc + 1], in1);
+            }
+            const __half2 t0 = complex_mul(complex_conjmul(w[sc],     foccBase0[sc       % FOCC_LENGTH]), in0);
+            const __half2 t1 = complex_mul(complex_conjmul(w[sc + 1], foccBase0[(sc + 1) % FOCC_LENGTH]), in1);
+            const float t0x = __half2float(t0.x), t0y = __half2float(t0.y);
+            const float t1x = __half2float(t1.x), t1y = __half2float(t1.y);
+            estEven.x += t0x + t1x; estEven.y += t0y + t1y;
+            estOdd.x  += t0x - t1x; estOdd.y  += t0y - t1y;
+        }
+
+        const int outBase = port0 + nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx;
+        sh_Hest[outBase]     = __float22half2_rn(estEven);
+        sh_Hest[outBase + 1] = __float22half2_rn(estOdd);
+    }
+    }
+}
+
 template <int nSrsScBlock, int nAntPorts, uint8_t FOCC_LENGTH, uint8_t correctDelayOffsetFlag, uint8_t combSize>
 inline __device__ void srsFilterMultiply(
    __half2 *sh_Hest,
@@ -1290,7 +1391,11 @@ inline __device__ void srsFilterMultiply(
         const __half2 *w = sh_W_matrix + scIdx*nSrsScBlock;
         const __half2* foccBase = sh_focc_table + foccIdx * (FOCC_LENGTH + 1);
 
-        auto est  = half2{0, 0};
+        // Keep the per-tap complex products in packed __half2 (their magnitude
+        // ~|w*IQ| stays within FP16 range) but accumulate the 24-tap sum in FP32:
+        // at live fronthaul IQ (|IQ|~500+) the running sum overflows __half2,
+        // producing NaN in sh_Hest and zero chEstNormToL2 to L2.
+        float2 est_f = make_float2(0.f, 0.f);
         //#pragma unroll
         for(int inputScIdx = 0; inputScIdx < nSrsScBlock; inputScIdx++)
         {
@@ -1298,15 +1403,17 @@ inline __device__ void srsFilterMultiply(
             if(correctDelayOffsetFlag == 1)
             {
                 __half2 phase_conj = sh_phaseLUT[portIdx * (nSrsScBlock + 1) + inputScIdx];
-                inputSignal = complex_mul(phase_conj, inputSignal);
+                inputSignal        = complex_mul(phase_conj, inputSignal);
             }
 
-            const auto focc = foccBase[inputScIdx % FOCC_LENGTH];
-            est = __hcmadd(complex_conjmul(*w, focc), inputSignal, est);//__hadd2(est, complex_mul(complex_conjmul(*w, focc), inputSignal));
+            const __half2 focc = foccBase[inputScIdx % FOCC_LENGTH];
+            const __half2 term = complex_mul(complex_conjmul(*w, focc), inputSignal);
+            est_f.x += __half2float(term.x);
+            est_f.y += __half2float(term.y);
             w++;
             srs++;
         }
-        sh_Hest[i] = est;
+        sh_Hest[i] = __float22half2_rn(est_f);
     }
 }
 
@@ -1478,22 +1585,28 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    // All buffers are carved out from a single dynamic shared memory buffer (sh_buff)
    __shared__ extern __half2 sh_buff[];
 
-   // === Section 1: __half2 buffers (no cast needed from base) ===
-   __half2* sh_rxSrs      = sh_buff;                                       // size: [nRxAntSrs * nSrsScBlock]
+   // === Section 0: float2 buffer placed first so it inherits the dynamic shared-memory base
+   // alignment (>=16B). float2 vector stores need 8B alignment; keeping it ahead of the 4-byte
+   // float/__half2 arrays avoids any odd-nAntPorts 4-mod-8 offset (no manual round-up needed). ===
+   float2*  sh_tile_avgScCorr = reinterpret_cast<float2*>(sh_buff);                                         // size: [NUM_WARPS_PER_CTA * nAntPorts]
+
+   // === Section 1: __half2 buffers ===
+   __half2* sh_rxSrs      = reinterpret_cast<__half2*>(&sh_tile_avgScCorr[NUM_WARPS_PER_CTA * nAntPorts]);  // size: [nRxAntSrs * nSrsScBlock]
    __half2* sh_Hest       = &sh_rxSrs[nRxAntSrs * nSrsScBlock];            // size: [nRxAntSrs * nSrsScBlock * nAntPorts]
    __half2* sh_W_matrix_w = &sh_Hest[nRxAntSrs * nSrsScBlock * nAntPorts]; // size: [nSrsScBlock * nSrsScBlock]
    __half2* sh_W_matrix_n = &sh_W_matrix_w[nSrsScBlock * nSrsScBlock];     // size: [nSrsScBlock * nSrsScBlock]
 
    // === Section 2: Mixed-type buffers (require reinterpret_cast) ===
    float*   sh_phaseRamp           = reinterpret_cast<float*>(&sh_W_matrix_n[nSrsScBlock * nSrsScBlock]);   // size: [nAntPorts]
-   __half2* sh_avgScCorr           = reinterpret_cast<__half2*>(&sh_phaseRamp[nAntPorts]);                  // size: [nAntPorts]
-   __half2* sh_focc_table          = &sh_avgScCorr[nAntPorts];                                              // size: [13 * 12] (upper limit for [(FOCC_LENGTH+1) * FOCC_LENGTH])
+   // FP32 magnitude-weighted ScCorr, stored as interleaved [re,im] scalars (size 2*nAntPorts).
+   // Scalar float (4B) access has no 8B alignment requirement, so its mid-layout position is safe.
+   float*   sh_avgScCorr           = reinterpret_cast<float*>(&sh_phaseRamp[nAntPorts]);                    // size: [2 * nAntPorts]
+   __half2* sh_focc_table          = reinterpret_cast<__half2*>(&sh_avgScCorr[2 * nAntPorts]);              // size: [13 * 12] (upper limit for [(FOCC_LENGTH+1) * FOCC_LENGTH])
    float(*sh_avgSignalEnergyPrb)[N_PRB_PER_COMP_BLK] = reinterpret_cast<float(*)[N_PRB_PER_COMP_BLK]>(&sh_focc_table[13 * 12]);    // size: [nAntPorts][N_PRB_PER_COMP_BLK]
    float(*sh_avgSignalEnergySc)[nSrsScBlock]         = reinterpret_cast<float(*)[nSrsScBlock]>(&sh_avgSignalEnergyPrb[nAntPorts]); // size: [nAntPorts][nSrsScBlock]
    float*    sh_avgSignalEnergy    = reinterpret_cast<float*>(&sh_avgSignalEnergySc[nAntPorts]);            // size: [nAntPorts]
    uint32_t* sh_ueBlockCntr        = reinterpret_cast<uint32_t*>(&sh_avgSignalEnergy[nAntPorts]);           // size: [nAntPorts]
-   __half2*  sh_tile_avgScCorr     = reinterpret_cast<__half2*>(&sh_ueBlockCntr[nAntPorts]);                // size: [number_of_warps_in_CTA * nAntPorts]
-   __half2*  sh_phaseTable         = &sh_tile_avgScCorr[NUM_WARPS_PER_CTA * nAntPorts];                     // size: [13 * nSrsScBlock] (upper limit for [(n_SRS_cs_max+1) * nSrsScBlock])
+   __half2*  sh_phaseTable         = reinterpret_cast<__half2*>(&sh_ueBlockCntr[nAntPorts]);                // size: [13 * nSrsScBlock] (upper limit for [(n_SRS_cs_max+1) * nSrsScBlock])
    __half2*  sh_phaseTableEnd      = sh_phaseTable + (nSrsScBlock + 1) * 12;                                // end marker for sh_phaseTable
 
    // === Section 3: Dynamically-sized buffers (using byte pointer arithmetic) ===
@@ -1513,7 +1626,8 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
 
    // initialize
    for (int i = tid; i < nAntPorts; i += thisThrdBlk.size()) {
-      sh_avgScCorr[i] = __float2half2_rn(0.f);
+      sh_avgScCorr[2 * i]     = 0.f;
+      sh_avgScCorr[2 * i + 1] = 0.f;
       sh_phaseRamp[i] = 0;
       sh_portToFoccMap[i]          = ueGroupDescr.portToFoccMap[i];
       sh_portToUeIdxWithinBlock[i] = ueGroupDescr.portToUeIdxWithinBlock[i];
@@ -1635,90 +1749,242 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    }
    __syncthreads();
 
-   srsFilterMultiply<nSrsScBlock, nAntPorts, FOCC_LENGTH, 0, combSize>(
-       sh_Hest,
-       sh_rxSrs,
-       sh_W_matrix_w,
-       sh_focc_table,
-       sh_portToFoccMap,
-       thisThrdBlk,
-       tile,
-       tid,
-       nRxAntSrs,
-       sh_phaseRamp,
-       sh_phaseTable,
-       sh_portToUeIdxWithinBlock);
+   // Dispatch the compile-time P=2 butterfly when every UE in this block has exactly two
+   // contiguous ports (portToUeIdxWithinBlock == [0,0,1,1,...]); otherwise use the generic
+   // per-port filter multiply. nAntPorts is a compile-time constant so the scan unrolls.
+   bool allTwoPort = (nAntPorts % 2 == 0);
+   #pragma unroll
+   for(int p = 0; p < nAntPorts; ++p)
+   {
+       allTwoPort = allTwoPort && (sh_portToUeIdxWithinBlock[p] == static_cast<uint16_t>(p / 2));
+   }
+   constexpr int nUesAllTwoPort = nAntPorts / 2;
+
+   if(allTwoPort)
+   {
+       srsFilterMultiplyP2<nSrsScBlock, nAntPorts, FOCC_LENGTH, 0, combSize>(
+           sh_Hest, sh_rxSrs, sh_W_matrix_w, sh_focc_table, sh_portToFoccMap,
+           thisThrdBlk, tile, tid, nRxAntSrs, sh_phaseRamp, sh_phaseTable, sh_portToUeIdxWithinBlock);
+   }
+   else
+   {
+       srsFilterMultiply<nSrsScBlock, nAntPorts, FOCC_LENGTH, 0, combSize>(
+           sh_Hest,
+           sh_rxSrs,
+           sh_W_matrix_w,
+           sh_focc_table,
+           sh_portToFoccMap,
+           thisThrdBlk,
+           tile,
+           tid,
+           nRxAntSrs,
+           sh_phaseRamp,
+           sh_phaseTable,
+           sh_portToUeIdxWithinBlock);
+   }
    __syncthreads();
 
    //=============================================================================
    // STEP 3: estimate delay phase ramp
-   __half2 sumScCorr[nAntPorts];
-   for(int antPortIdx = 0; antPortIdx < nAntPorts; ++antPortIdx)
+   //
+   // FP32 accumulation: |H|~500 from live BFP9 IQ makes |est0*conj(est1)|~2.5e5,
+   // overflowing __half2 (FP16 max ~65504). Unlike the linear filter/correlation
+   // sums (Steps 2/5/7), these are *squared* quantities: the individual product
+   // already exceeds FP16 range, so the operands must be widened to FP32 before
+   // the multiply -- there is no packed-__half2 form that avoids the overflow.
+   // The same applies to |H|^2 / |noise|^2 in Step 6.
+   //
+   // FUTURE WORK (perf): the FP32 on Steps 3 & 6 is the residual ~12% cost of the
+   // overflow fix on this kernel. If SRS chEst latency ever becomes a bottleneck,
+   // the alternative is block/pre-scaling: divide the decompressed UL IQ (dataRx)
+   // by a per-UE/block power-of-two at load into sh_rxSrs so that even the squared
+   // terms stay within FP16, run ALL arithmetic in packed __half2, and unscale the
+   // outputs (chEst, signal/noise energies) by the known factor at the end. That
+   // keeps the FP16 throughput everywhere; the care points are that energies scale
+   // by factor^2 and the scale must unwind consistently in every reported field.
+   if(allTwoPort)
    {
-        sumScCorr[antPortIdx] = __float2half2_rn(0.f);
+       if constexpr (nUesAllTwoPort > 0)
+       {
+           float2 sumScCorr_f[nUesAllTwoPort];
+           #pragma unroll
+           for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUesAllTwoPort; ++ueIdxWithinBlock)
+           {
+               sumScCorr_f[ueIdxWithinBlock] = make_float2(0.f, 0.f);
+           }
+
+           max_loop_iters = nRxAntSrs * (nSrsScBlock - 1);
+           for(int i = tid; i < max_loop_iters; i += thisThrdBlk.size())
+           {
+               const int scIdx    = i % (nSrsScBlock - 1);
+               const int antIdx   = i / (nSrsScBlock - 1);
+               const int hestBase = nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx;
+
+               #pragma unroll
+               for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUesAllTwoPort; ++ueIdxWithinBlock)
+               {
+                   const int port0 = 2 * ueIdxWithinBlock;
+                   const float2 est00 = __half22float2(sh_Hest[hestBase + port0]);
+                   const float2 est01 = __half22float2(sh_Hest[hestBase + nAntPorts + port0]);
+                   const float2 est10 = __half22float2(sh_Hest[hestBase + port0 + 1]);
+                   const float2 est11 = __half22float2(sh_Hest[hestBase + nAntPorts + port0 + 1]);
+                   const float2 term0 = complex_conjmul(est01, est00);
+                   const float2 term1 = complex_conjmul(est11, est10);
+                   sumScCorr_f[ueIdxWithinBlock].x += term0.x + term1.x;
+                   sumScCorr_f[ueIdxWithinBlock].y += term0.y + term1.y;
+               }
+           }
+
+           const float invScCorrScale = __frcp_rn(float(nRxAntSrs * (nSrsScBlock - 1) * 2));
+           const int   tileScCorrBase = tile.meta_group_rank() * nUesAllTwoPort;
+           #pragma unroll
+           for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUesAllTwoPort; ++ueIdxWithinBlock)
+           {
+               const float red_x = cg::reduce(tile, sumScCorr_f[ueIdxWithinBlock].x, cg::plus<float>());
+               const float red_y = cg::reduce(tile, sumScCorr_f[ueIdxWithinBlock].y, cg::plus<float>());
+               if(tile.thread_rank() == 0)
+               {
+                   sh_tile_avgScCorr[tileScCorrBase + ueIdxWithinBlock] = make_float2(red_x * invScCorrScale,
+                                                                                       red_y * invScCorrScale);
+               }
+           }
+
+           __syncthreads();
+           if(tid == 0)
+           {
+               #pragma unroll
+               for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUesAllTwoPort; ++ueIdxWithinBlock)
+               {
+                   sh_nUePorts[ueIdxWithinBlock] = 2;
+                   float2 ueSum_f = make_float2(0.f, 0.f);
+
+                   // Only warps that actually launched wrote their sh_tile_avgScCorr slot.
+                   // The block may launch with fewer than NUM_WARPS_PER_CTA warps (the launch
+                   // halves blockDim when max_loop_iters < SRS_CHEST_BLOCK_SZ), so skip slots
+                   // beyond the live warp count or we sum uninitialized shared memory. Keep the
+                   // trip count at the compile-time NUM_WARPS_PER_CTA so the loop still unrolls;
+                   // nActiveWarps is uniform across the block, so the guard is branch-free.
+                   const int nActiveWarps = tile.meta_group_size();
+                   #pragma unroll
+                   for(int warpIdx = 0; warpIdx < NUM_WARPS_PER_CTA; ++warpIdx)
+                   {
+                       if(warpIdx >= nActiveWarps) continue;
+                       const float2 v = sh_tile_avgScCorr[warpIdx * nUesAllTwoPort + ueIdxWithinBlock];
+                       ueSum_f.x += v.x;
+                       ueSum_f.y += v.y;
+                   }
+
+                   sh_phaseRamp[ueIdxWithinBlock] = atan2f(ueSum_f.y, ueSum_f.x) / combSize;
+
+                   // Store magnitude-weighted (FP32): preserves the |H|^2 weighting across
+                   // compute blocks so the wideband ToA stays unbiased on selective channels.
+                   sh_avgScCorr[2 * ueIdxWithinBlock]     = ueSum_f.x;
+                   sh_avgScCorr[2 * ueIdxWithinBlock + 1] = ueSum_f.y;
+               }
+           }
+       }
    }
-
-   max_loop_iters = nRxAntSrs * (nSrsScBlock - 1);
-   for(int i = tid; i < max_loop_iters; i += thisThrdBlk.size())
+   else
    {
-       int  scIdx   = i % (nSrsScBlock - 1);
-       int  antIdx  = i / (nSrsScBlock - 1);
+       float2 sumScCorr_f[nAntPorts];
+       #pragma unroll
+       for(int antPortIdx = 0; antPortIdx < nAntPorts; ++antPortIdx)
+       {
+            sumScCorr_f[antPortIdx] = make_float2(0.f, 0.f);
+       }
 
+       max_loop_iters = nRxAntSrs * (nSrsScBlock - 1);
+       for(int i = tid; i < max_loop_iters; i += thisThrdBlk.size())
+       {
+           int  scIdx   = i % (nSrsScBlock - 1);
+           int  antIdx  = i / (nSrsScBlock - 1);
+
+           #pragma unroll
+           for(int portIdx = 0; portIdx < nAntPorts; ++portIdx)
+           {
+                const float2 est0 = __half22float2(sh_Hest[portIdx + nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx]);
+                const float2 est1 = __half22float2(sh_Hest[portIdx + nAntPorts * (scIdx + 1) + nAntPorts * nSrsScBlock * antIdx]);
+                const float2 term = complex_conjmul(est1, est0);
+                sumScCorr_f[portIdx].x += term.x;
+                sumScCorr_f[portIdx].y += term.y;
+           }
+       }
+
+       // Reduce/average in FP32; |sumScCorr| can be O(|H|^2 * nAnt) >> fp16 range before averaging.
+       const float invScCorrScale = __frcp_rn(float(nRxAntSrs * (nSrsScBlock - 1)));
+       const int   tileScCorrBase = tile.meta_group_rank() * nAntPorts;
+       #pragma unroll
        for(int portIdx = 0; portIdx < nAntPorts; ++portIdx)
        {
-            auto est0          = sh_Hest[portIdx + nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx];
-            auto est1          = sh_Hest[portIdx + nAntPorts * (scIdx + 1) + nAntPorts * nSrsScBlock * antIdx];
-            sumScCorr[portIdx] = __hadd2(sumScCorr[portIdx], complex_conjmul(est1, est0));
-       }
-   }
-
-   __half2* tile_avgScCorr = sh_tile_avgScCorr + (tile.meta_group_rank() * nAntPorts);
-   __half2  invScale       = __half2half2(__float2half(__frcp_rn(float(nRxAntSrs * (nSrsScBlock - 1)))));
-   for(int portIdx = 0; portIdx < nAntPorts; ++portIdx)
-   {
-       auto tmp = cg::reduce(tile, sumScCorr[portIdx], cg::plus<__half2>());
-       if(tile.thread_rank() == 0)
-       {
-           tile_avgScCorr[portIdx] = __hmul2(tmp, invScale);
-       }
-   }
-
-   if (tile.thread_rank() == 0)
-   {
-       uint8_t portIdx = 0;
-       for(int i = 0; i < nUes; ++i)
-       {
-           uint16_t ueIdx       = sh_ueIdxs[i];
-           uint8_t  nUePorts    = pDynDescr->ueDescrs[ueIdx].nPortsPerComb;
-           sh_nUePorts[i]       = nUePorts;  // Cache for reuse in STEP 6+
-           __half2  ueAvgScCorr = {0, 0};
-           invScale             = __half2half2(__float2half(__frcp_rn(float(nUePorts))));
-
-           // average SC corr for ports belonging to this user:
-           for(int uePortIdx = 0; uePortIdx < nUePorts; ++uePortIdx)
+           const float red_x = cg::reduce(tile, sumScCorr_f[portIdx].x, cg::plus<float>());
+           const float red_y = cg::reduce(tile, sumScCorr_f[portIdx].y, cg::plus<float>());
+           if(tile.thread_rank() == 0)
            {
-               ueAvgScCorr += tile_avgScCorr[portIdx];
-               portIdx++;
+               sh_tile_avgScCorr[tileScCorrBase + portIdx] = make_float2(red_x * invScCorrScale,
+                                                                          red_y * invScCorrScale);
            }
-           ueAvgScCorr = __hmul2(ueAvgScCorr, invScale);
+       }
 
-           atomicAdd(&sh_avgScCorr[i], ueAvgScCorr);
+       // Cross-warp reduction: one thread accumulates all warps' per-port sums, then computes
+       // sh_phaseRamp once per UE from the full block-wide correlation. Each warp wrote its
+       // disjoint iteration subset to sh_tile_avgScCorr; summing them recovers the full average.
+       __syncthreads();
+       if (tid == 0)
+       {
+           uint8_t portIdx = 0;
+           for(int i = 0; i < nUes; ++i)
+           {
+               uint16_t ueIdx    = sh_ueIdxs[i];
+               uint8_t  nUePorts = pDynDescr->ueDescrs[ueIdx].nPortsPerComb;
+               sh_nUePorts[i]    = nUePorts;
+               float2   ueSum_f  = make_float2(0.f, 0.f);
+
+               // Only warps that actually launched wrote their sh_tile_avgScCorr slot.
+               // The block may launch with fewer than NUM_WARPS_PER_CTA warps (the launch
+               // halves blockDim when max_loop_iters < SRS_CHEST_BLOCK_SZ), so skip slots
+               // beyond the live warp count or we sum uninitialized shared memory. Keep the
+               // trip count at the compile-time NUM_WARPS_PER_CTA so the loop still unrolls;
+               // nActiveWarps is uniform across the block, so the guard is branch-free.
+               const int nActiveWarps = tile.meta_group_size();
+               #pragma unroll
+               for(int warpIdx = 0; warpIdx < NUM_WARPS_PER_CTA; ++warpIdx)
+               {
+                   if(warpIdx >= nActiveWarps) continue;
+                   for(int uePortIdx = 0; uePortIdx < nUePorts; ++uePortIdx)
+                   {
+                       const float2 v = sh_tile_avgScCorr[warpIdx * nAntPorts + portIdx + uePortIdx];
+                       ueSum_f.x += v.x;
+                       ueSum_f.y += v.y;
+                   }
+               }
+               ueSum_f.x *= __frcp_rn(float(nUePorts));
+               ueSum_f.y *= __frcp_rn(float(nUePorts));
+
+               sh_phaseRamp[i] = atan2f(ueSum_f.y, ueSum_f.x) / combSize;
+
+               // Store magnitude-weighted (FP32): preserves the |H|^2 weighting across
+               // compute blocks so the wideband ToA stays unbiased on selective channels.
+               sh_avgScCorr[2 * i]     = ueSum_f.x;
+               sh_avgScCorr[2 * i + 1] = ueSum_f.y;
+
+               portIdx += nUePorts;
+           }
        }
    }
-    __syncthreads();
-
-    if(tid < nUes)
-    {
-        __half2 avgScCorr = sh_avgScCorr[tid];
-        float   phaseRamp = atanf(__half2float(avgScCorr.y) / __half2float(avgScCorr.x)) / combSize;
-        sh_phaseRamp[tid] = phaseRamp;
-    }
-    __syncthreads();
+   __syncthreads();
 
 //===================================================================================
 //    STEP 5: remove cyclic shifts and apply narrow filter to estimate channel
     if(enableDelayOffsetCorrection==1)
     {
+        if(allTwoPort)
+        {
+            srsFilterMultiplyP2<nSrsScBlock, nAntPorts, FOCC_LENGTH, 1, combSize>(
+                sh_Hest, sh_rxSrs, sh_W_matrix_n, sh_focc_table, sh_portToFoccMap,
+                thisThrdBlk, tile, tid, nRxAntSrs, sh_phaseRamp, sh_phaseTable, sh_portToUeIdxWithinBlock);
+        }
+        else
+        {
         srsFilterMultiply<nSrsScBlock, nAntPorts, FOCC_LENGTH, 1, combSize>(
             sh_Hest,
             sh_rxSrs,
@@ -1732,9 +1998,18 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
             sh_phaseRamp,
             sh_phaseTable,
             sh_portToUeIdxWithinBlock);
+        }
     }
     else
     {
+        if(allTwoPort)
+        {
+            srsFilterMultiplyP2<nSrsScBlock, nAntPorts, FOCC_LENGTH, 0, combSize>(
+                sh_Hest, sh_rxSrs, sh_W_matrix_n, sh_focc_table, sh_portToFoccMap,
+                thisThrdBlk, tile, tid, nRxAntSrs, sh_phaseRamp, sh_phaseTable, sh_portToUeIdxWithinBlock);
+        }
+        else
+        {
         srsFilterMultiply<nSrsScBlock, nAntPorts, FOCC_LENGTH, 0, combSize>(
             sh_Hest,
             sh_rxSrs,
@@ -1748,13 +2023,15 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
             sh_phaseRamp,
             sh_phaseTable,
             sh_portToUeIdxWithinBlock);
+        }
     }
     __syncthreads();
 
     //===================================================================================
    // STEP 6: Average estimates. Estimate energy and noise
+   // FP32 here for the squared energies |H|^2 / |noise|^2 (overflow __half2 at live
+   // BFP9 scale). See the FP16/scaling note at STEP 3 for the future pre-scaling option.
    float noiseEnergy = 0.0f;
-   float sigEnergy[nAntPorts] = {0.f};
 
    //if(tid==0 && blockIdx.x==0) printf(">>>> nRxAntSrs %d, nSrsScBlock %d, nAntPorts %d, n_SRS_cs_max %d\n", nRxAntSrs, nSrsScBlock, nAntPorts, n_SRS_cs_max);
 
@@ -1768,39 +2045,66 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
          int antIdx = i / nSrsScBlock;
 
          const int scIdxModFoccLength = scIdx % FOCC_LENGTH;
-         __half2   scRxEst{0, 0};
-         uint8_t   portIdx = 0;
+         float2    scRxEst_f = make_float2(0.f, 0.f);
+         const int scIdx_global = scIdx * combSize;
 
-         for(int j = 0; j < nUes; ++j)
+         if(allTwoPort)
          {
-            uint8_t  nUePorts = sh_nUePorts[j];
-            float    sigy     = 0.f;
-
-            int    scIdx_global = scIdx * combSize;
-            float2 phase = {1.f, 0.f};
-            if(enableDelayOffsetCorrection == 1)
+            // P=2 FOCC fold for the rx reconstruction: the two ports of a UE differ by a
+            // cyclic shift of n/2, so focc1 = focc0*(-1)^scIdxModFoccLength = focc0*oddPortSign.
+            // Then focc0*est0 + focc1*est1 = focc0*(est0 + oddPortSign*est1), so one focc*phase
+            // complex-multiply per UE instead of two.
+            const float oddPortSign = (scIdxModFoccLength & 1) ? -1.f : 1.f;
+            for(int j = 0; j < nUes; ++j)
             {
-                __sincosf(sh_phaseRamp[j] * scIdx_global, &phase.y, &phase.x);
-            }
-            __half2 phase_half = __float22half2_rn(phase);
+               float2 phase = make_float2(1.f, 0.f);
+               if(enableDelayOffsetCorrection == 1)
+               {
+                   __sincosf(sh_phaseRamp[j] * scIdx_global, &phase.y, &phase.x);
+               }
+               const int    p0    = 2 * j;
+               const float2 est0  = __half22float2(sh_Hest[p0 +     nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx]);
+               const float2 est1  = __half22float2(sh_Hest[p0 + 1 + nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx]);
 
-            for(int uePortIdx = 0; uePortIdx < nUePorts; ++uePortIdx)
-            {
-                auto       foccIdx = sh_portToFoccMap[portIdx];
-                const auto focc    = sh_focc_table[foccIdx * (FOCC_LENGTH + 1) + scIdxModFoccLength];
-                auto       est     = sh_Hest[portIdx + nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx];
-                auto       est2    = __hmul2(est, est);
-                sigy              += __half2float(est2.x + est2.y);
-
-                est     = complex_mul(phase_half, est);
-                scRxEst = __hcmadd(focc, est, scRxEst); //__hadd2(scRxEst, complex_mul(focc, est));
-                portIdx++;
+               const float2 estPair = make_float2(est0.x + oddPortSign * est1.x, est0.y + oddPortSign * est1.y);
+               const float2 focc0   = __half22float2(sh_focc_table[sh_portToFoccMap[p0] * (FOCC_LENGTH + 1) + scIdxModFoccLength]);
+               const float2 est_ph  = complex_mul(phase, estPair);
+               const float2 rxTerm  = complex_mul(focc0, est_ph);
+               scRxEst_f.x += rxTerm.x;
+               scRxEst_f.y += rxTerm.y;
             }
-            sigEnergy[j] += sigy;
          }
-         __half2 noise  = __hsub2(scRxEst, sh_rxSrs[i]);
-         noiseEnergy   += fmaf(__half2float(noise.x), __half2float(noise.x),
-                               __half2float(noise.y) * __half2float(noise.y));
+         else
+         {
+            uint8_t portIdx = 0;
+            for(int j = 0; j < nUes; ++j)
+            {
+               uint8_t  nUePorts = sh_nUePorts[j];
+
+               float2 phase = make_float2(1.f, 0.f);
+               if(enableDelayOffsetCorrection == 1)
+               {
+                   __sincosf(sh_phaseRamp[j] * scIdx_global, &phase.y, &phase.x);
+               }
+
+               for(int uePortIdx = 0; uePortIdx < nUePorts; ++uePortIdx)
+               {
+                   const int    foccIdx = sh_portToFoccMap[portIdx];
+                   const float2 est_f   = __half22float2(sh_Hest[portIdx + nAntPorts * scIdx + nAntPorts * nSrsScBlock * antIdx]);
+
+                   const float2 focc_f  = __half22float2(sh_focc_table[foccIdx * (FOCC_LENGTH + 1) + scIdxModFoccLength]);
+                   const float2 est_ph  = complex_mul(phase, est_f);
+                   const float2 rxTerm  = complex_mul(focc_f, est_ph);
+                   scRxEst_f.x += rxTerm.x;
+                   scRxEst_f.y += rxTerm.y;
+                   portIdx++;
+               }
+            }
+         }
+         const float2 rx_f    = __half22float2(sh_rxSrs[i]);
+         const float  noise_x = scRxEst_f.x - rx_f.x;
+         const float  noise_y = scRxEst_f.y - rx_f.y;
+         noiseEnergy += fmaf(noise_x, noise_x, noise_y * noise_y);
       }
 
       int numGroups = nSrsScBlock / (prgSize * nCombScPerPrb);
@@ -1885,16 +2189,20 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    } else {
         // Last warp handles average signal energy accumulations.
         uint8_t antPortOffset = 0;
-        for (int k = 0; k < nUes; ++k){
-            uint8_t  nUePorts    = sh_nUePorts[k];
-            float    energyAccum = 0.0f;
+        for(int k = 0; k < nUes; ++k)
+        {
+            uint8_t nUePorts    = sh_nUePorts[k];
+            float   energyAccum = 0.0f;
 
-            for (int i = thisThrdBlk.size()-1-tid; i < nSrsScBlock; i += WARP_SIZE) {
-                for(int ueAntPortIdx = 0; ueAntPortIdx < nUePorts; ++ueAntPortIdx){
-                    for (int j = 0; j < nRxAntSrs; j++) {
-                        const __half2 est  = sh_Hest[antPortOffset + ueAntPortIdx + nAntPorts * i + nAntPorts * nSrsScBlock * j];
-                        energyAccum       += fmaf(__half2float(est.x), __half2float(est.x),
-                                                  __half2float(est.y) * __half2float(est.y));
+            for(int i = thisThrdBlk.size()-1-tid; i < nSrsScBlock; i += WARP_SIZE)
+            {
+                for(int ueAntPortIdx = 0; ueAntPortIdx < nUePorts; ++ueAntPortIdx)
+                {
+                    for(int j = 0; j < nRxAntSrs; j++)
+                    {
+                        const __half2 est = sh_Hest[antPortOffset + ueAntPortIdx + nAntPorts * i + nAntPorts * nSrsScBlock * j];
+                        energyAccum += fmaf(__half2float(est.x), __half2float(est.x),
+                                            __half2float(est.y) * __half2float(est.y));
                     }
                 }
                 sh_avgSignalEnergySc[k][i] = energyAccum;
@@ -1905,20 +2213,22 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    __syncthreads();
 
    constexpr int numPrbs = nSrsScBlock / nCombScPerPrb;
-   // Flatten UE x PRB iteration for better parallelism (avoids sequential UE loop)
-   const int totalReductionWork = nUes * numPrbs;
-   for (int idx = thisThrdBlk.size()-1-tid; idx < totalReductionWork; idx += thisThrdBlk.size()) {
-       const int ueIdxWithinBlock = idx / numPrbs;
-       const int i = idx % numPrbs;
-       float accum = sh_avgSignalEnergySc[ueIdxWithinBlock][i*nCombScPerPrb];
-       for (int j = 1; j < nCombScPerPrb; j++) {
-           accum += sh_avgSignalEnergySc[ueIdxWithinBlock][i*nCombScPerPrb+j];
+   if(tid < nUes)
+   {
+       float ueSignalEnergy = 0.f;
+       for(int i = 0; i < numPrbs; ++i)
+       {
+           float accum = sh_avgSignalEnergySc[tid][i*nCombScPerPrb];
+           #pragma unroll
+           for(int j = 1; j < nCombScPerPrb; j++)
+           {
+               accum += sh_avgSignalEnergySc[tid][i*nCombScPerPrb+j];
+           }
+           sh_avgSignalEnergyPrb[tid][i] = accum;
+           ueSignalEnergy += accum;
        }
-       sh_avgSignalEnergyPrb[ueIdxWithinBlock][i] = accum;
+       sh_avgSignalEnergy[tid] = ueSignalEnergy;
    }
-
-   // No explicit block sync here because there is another block sync below
-   // before sh_avgSignalEnergyPrb is used
 
     // since sum of signal energies in rare occasions might exceed the range covered by FP16, we use float instead of __half
     float warpSum_noiseEnergy = cg::reduce(tile, noiseEnergy, cg::plus<float>());
@@ -1926,33 +2236,16 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
     {
         atomicAdd(sh_avgNoiseEnergy, warpSum_noiseEnergy);
     }
-
-    for(int ueIdxWithinBlock = 0; ueIdxWithinBlock < nUes; ++ueIdxWithinBlock)
-    {
-        float warpSum_sigEnergy = cg::reduce(tile,  sigEnergy[ueIdxWithinBlock], cg::plus<float>());
-        if(tile.thread_rank() == 0)
-        {
-            atomicAdd(&sh_avgSignalEnergy[ueIdxWithinBlock], warpSum_sigEnergy);
-        }
-    }
     __syncthreads();
 
 
    // STEP 7: calculate correlation w.r.t. cyclic shift in use and not use: sum over, PRB, antenna, cyclic shift
    // Use L2 norm to sum over antennas and compute blocks to reduce dependencies
 
-   // precompute phase rotation once and reuse nRxAntSrs times
-   const float invNSrsCSMax = __frcp_rn(static_cast<float>(n_SRS_cs_max));
-   for(int i = tid; i < n_SRS_cs_max * nSrsScBlock; i += thisThrdBlk.size())
-   {
-       int   csIdx =  i / nSrsScBlock;
-       int   scIdx =  i % nSrsScBlock;
-       float ang = -2.0f * M_PI * csIdx * scIdx * invNSrsCSMax;
-       float sinv, cosv;
-       __sincosf(ang, &sinv, &cosv);
-       int padded_idx = csIdx * (nSrsScBlock + 1) + scIdx;
-       sh_phaseTable[padded_idx] = __half2(__float2half(cosv), __float2half(sinv));
-   }
+   // The cyclic-shift phase rotation table only depends on combSize (n_SRS_cs_max is 8 for
+   // comb-2, 12 for comb-4), so it is precomputed once at init() and read from constant
+   // memory here instead of recomputing the sin/cos LUT into shared memory every block.
+   const __half2* srsCsPhaseTable = (combSize == 4) ? d_srsCsPhaseComb4 : d_srsCsPhaseComb2;
    if(tid < nAntPorts)
    {
        uint8_t csIdx            = sh_portToFoccMap[tid];          // 0 … n_SRS_cs_max‑1
@@ -1964,38 +2257,59 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
    }
    __syncthreads();
 
-   // calculate correlation over cyclic shifts, sum over PRBs
+   // calculate correlation over cyclic shifts, sum over PRBs.
+   // Radix-2 DFT decimation: the cyclic-shift correlation is an n_SRS_cs_max-point DFT of
+   // rx over the subcarriers. Bins csIdx and (csIdx + n/2) share the same even/odd-subcarrier
+   // partial sums because phase[cs+n/2][sc] = phase[cs][sc]*(-1)^sc, so
+   //   bin(csIdx)       = accEven + accOdd
+   //   bin(csIdx + n/2) = accEven - accOdd
+   // Computing the partial sums once per csIdx in [0, n/2) yields both bins -> half the
+   // phase multiplies. General for any config (comb-2/4, any used-CS layout); the in-use vs
+   // not-used decision still comes from csIdx2UeIdxLut for each bin. n_SRS_cs_max (8/12) and
+   // nSrsScBlock (24/12) are both even, so the n/2 split and stride-2 loop are exact.
    float notUseSumAbs2 = 0.0f;
-   for(int i = tid; i < nRxAntSrs * n_SRS_cs_max; i += thisThrdBlk.size())
+   const int nCsPairs = n_SRS_cs_max / 2;
+   for(int i = tid; i < nRxAntSrs * nCsPairs; i += thisThrdBlk.size())
    {
-       int antIdx = i / n_SRS_cs_max;
-       int csIdx  = i - antIdx * n_SRS_cs_max;
-       __half2 accSumRxCs {0, 0};
+       const int antIdx = i / nCsPairs;
+       const int csIdx  = i - antIdx * nCsPairs;          // 0 … n/2-1
+       const __half2* rxAnt = sh_rxSrs + antIdx * nSrsScBlock;
+       const __half2* phRow = srsCsPhaseTable + csIdx * nSrsScBlock;
 
-//#pragma unroll
-       for(int scIdx = 0; scIdx < nSrsScBlock; scIdx ++)
+       float2 accEven = make_float2(0.f, 0.f);
+       float2 accOdd  = make_float2(0.f, 0.f);
+       for(int scIdx = 0; scIdx < nSrsScBlock; scIdx += 2)
        {
-           __half2 phase_rotation = sh_phaseTable[csIdx * (nSrsScBlock + 1) + scIdx];
-           __half2 rxSrs  = sh_rxSrs[antIdx * nSrsScBlock + scIdx];
-           accSumRxCs = __hcmadd(rxSrs, phase_rotation, accSumRxCs);
+           // packed __half2 product (|rxSrs|~|IQ| stays in FP16 range), FP32 sum
+           const __half2 te = complex_mul(rxAnt[scIdx],     phRow[scIdx]);
+           const __half2 to = complex_mul(rxAnt[scIdx + 1], phRow[scIdx + 1]);
+           accEven.x += __half2float(te.x); accEven.y += __half2float(te.y);
+           accOdd.x  += __half2float(to.x); accOdd.y  += __half2float(to.y);
        }
-       float2 accSumRxCsFloat = __half22float2(accSumRxCs);
-       float  accSumRxCsAbs2  = fmaf(accSumRxCsFloat.x, accSumRxCsFloat.x, accSumRxCsFloat.y * accSumRxCsFloat.y);
+       const float2 accBase = make_float2(accEven.x + accOdd.x, accEven.y + accOdd.y); // bin csIdx
+       const float2 accPair = make_float2(accEven.x - accOdd.x, accEven.y - accOdd.y); // bin csIdx + n/2
+       const float baseAbs2 = fmaf(accBase.x, accBase.x, accBase.y * accBase.y);
+       const float pairAbs2 = fmaf(accPair.x, accPair.x, accPair.y * accPair.y);
 
-       // sum over antennas and separate cyclic shifts in use and not used
-        uint16_t ueIdxWithinBlock = csIdx2UeIdxLut[csIdx];
-
-        if(ueIdxWithinBlock == INVALID_UE_IDX)
-        {
-            notUseSumAbs2 += accSumRxCsAbs2;
-        }else
-        {
-            uint16_t         ueIdx                = sh_ueIdxs[ueIdxWithinBlock];
-            uint8_t          nUePorts             = sh_nUePorts[ueIdxWithinBlock];
-            volatile float&  tmpWidebandCsCorrUse = pDynDescr->ueDescrs[ueIdx].tmpWidebandCsCorrUse;
-
-            atomicAdd((float*)(&tmpWidebandCsCorrUse), accSumRxCsAbs2 / (nUePorts * nSrsScBlock * nRxAntSrs));
-        }
+       const float csCorrNorm = __frcp_rn(static_cast<float>(nSrsScBlock * nRxAntSrs));
+       #pragma unroll
+       for(int half = 0; half < 2; ++half)
+       {
+           const int   binCsIdx = csIdx + half * nCsPairs;
+           const float binAbs2  = (half == 0) ? baseAbs2 : pairAbs2;
+           const uint16_t ueIdxWithinBlock = csIdx2UeIdxLut[binCsIdx];
+           if(ueIdxWithinBlock == INVALID_UE_IDX)
+           {
+               notUseSumAbs2 += binAbs2;
+           }
+           else
+           {
+               const uint16_t ueIdx    = sh_ueIdxs[ueIdxWithinBlock];
+               const uint8_t  nUePorts = sh_nUePorts[ueIdxWithinBlock];
+               volatile float& tmpWidebandCsCorrUse = pDynDescr->ueDescrs[ueIdx].tmpWidebandCsCorrUse;
+               atomicAdd((float*)(&tmpWidebandCsCorrUse), binAbs2 * csCorrNorm / nUePorts);
+           }
+       }
     }
 
    // Reduce not-use sum across the block and write once (avoid high-frequency shared atomics).
@@ -2066,7 +2380,8 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
        atomicAdd((float*)(&ueDesc.tmpWidebandNoiseEnergy)  , *sh_avgNoiseEnergy);
        atomicAdd((float*)(&ueDesc.tmpWidebandSignalEnergy) , sh_avgSignalEnergy[ueIdxWithinBlock]);
        atomicAdd((float*)(&ueDesc.tmpWidebandCsCorrNotUse) , *sh_tmpWidebandCsCorrNotUse);
-       atomicAdd((__half2*)(&ueDesc.tmpWidebandScCorr)     , sh_avgScCorr[ueIdxWithinBlock]);
+       atomicAdd((float*)(&ueDesc.tmpWidebandScCorr.x)     , sh_avgScCorr[2 * ueIdxWithinBlock]);
+       atomicAdd((float*)(&ueDesc.tmpWidebandScCorr.y)     , sh_avgScCorr[2 * ueIdxWithinBlock + 1]);
        __threadfence();
        // for finalization step
         sh_ueBlockCntr[ueIdxWithinBlock] = atomicAdd(&ueDesc.ueBlockCntr, 1) + 1;
@@ -2105,13 +2420,21 @@ __device__ __forceinline__ void srsChEstKernelInner(srsChEstStatDescr_t* pStatDe
             widebandSignalEnergy = ueDesc.tmpWidebandSignalEnergy;
             widebandNoiseEnergy  = ueDesc.tmpWidebandNoiseEnergy;
 
+            // Read the FP32 accumulator as scalars (avoid a float2 vector load: the descriptor
+            // float2 is not guaranteed 8-byte aligned, which would fault an ld.v2.f32).
+            const float scCorrX = ueDesc.tmpWidebandScCorr.x;
+            const float scCorrY = ueDesc.tmpWidebandScCorr.y;
+
             // timing advance:
             uint32_t scs  = (1 << mu) * 15000; //2^mu * 15*10^3
-            toEstMicroSec = float(-1.0e6) * atan2f(__half2float(ueDesc.tmpWidebandScCorr.y), __half2float(ueDesc.tmpWidebandScCorr.x)) / static_cast<float>(2 * M_PI * scs * combSize);
+            toEstMicroSec = float(-1.0e6) * atan2f(scCorrY, scCorrX) / static_cast<float>(2 * M_PI * scs * combSize);
 
-            // wideband SC correlation:
-            widebandScCorr.x = ueDesc.tmpWidebandScCorr.x;
-            widebandScCorr.y = ueDesc.tmpWidebandScCorr.y;
+            // wideband SC correlation: the accumulator is FP32 and magnitude-weighted (can
+            // exceed the FP16 range at live BFP9 scale), so unit-normalize before writing the
+            // __half2 FAPI report field. ToA above already used the un-normalized FP32 phase.
+            const float scCorrMag = hypotf(scCorrX, scCorrY);
+            const float scInv     = (scCorrMag > 0.f) ? (1.f / scCorrMag) : 0.f;
+            widebandScCorr = __float22half2_rn(make_float2(scCorrX * scInv, scCorrY * scInv));
 
             // cyclic correlation ratio:
             widebandCsCorrUse     = ueDesc.tmpWidebandCsCorrUse;
@@ -2238,6 +2561,166 @@ static inline __device__ void twoStageFourierTransform(const uint32_t THREAD_IDX
     }
 }
 
+
+#ifndef ASIM_CUPHY_SRS_OUTPUT_FP32
+__device__ __forceinline__ float2 srsChEstHalf2BitsToFloat2(uint32_t bits)
+{
+    union { uint32_t u; half2 h; } cvt;
+    cvt.u = bits;
+    return __half22float2(cvt.h);
+}
+__device__ __forceinline__ uint32_t srsChEstPackShort2(float x, float y)
+{
+    uint32_t packedX = static_cast<uint16_t>(static_cast<int16_t>(x));
+    uint32_t packedY = static_cast<uint16_t>(static_cast<int16_t>(y));
+    return packedX | (packedY << 16);
+}
+__device__ __forceinline__ float srsChEstPeak2FromPackedHalf2(uint32_t bits)
+{
+    float2 tmp = srsChEstHalf2BitsToFloat2(bits);
+    return fmaf(tmp.x, tmp.x, tmp.y * tmp.y);
+}
+__device__ __forceinline__ float srsChEstPeak2FromUint4(uint4 raw)
+{
+    float mag0 = srsChEstPeak2FromPackedHalf2(raw.x);
+    float mag1 = srsChEstPeak2FromPackedHalf2(raw.y);
+    float mag2 = srsChEstPeak2FromPackedHalf2(raw.z);
+    float mag3 = srsChEstPeak2FromPackedHalf2(raw.w);
+    return fmaxf(fmaxf(mag0, mag1), fmaxf(mag2, mag3));
+}
+__device__ __forceinline__ uint4 srsChEstScalePackedHalf2ToShort2(uint4 raw, float scale)
+{
+    float2 tmp0 = srsChEstHalf2BitsToFloat2(raw.x);
+    float2 tmp1 = srsChEstHalf2BitsToFloat2(raw.y);
+    float2 tmp2 = srsChEstHalf2BitsToFloat2(raw.z);
+    float2 tmp3 = srsChEstHalf2BitsToFloat2(raw.w);
+    uint4 out;
+    out.x = srsChEstPackShort2(scale * tmp0.x, scale * tmp0.y);
+    out.y = srsChEstPackShort2(scale * tmp1.x, scale * tmp1.y);
+    out.z = srsChEstPackShort2(scale * tmp2.x, scale * tmp2.y);
+    out.w = srsChEstPackShort2(scale * tmp3.x, scale * tmp3.y);
+    return out;
+}
+#endif
+
+// Vectorized algo-1 normalization for a contiguous, 16B-aligned L2 layout (prgSizeRatio==1,
+// prgSizeOffset==0 -> the inner read index reduces to the flat element index). Semantically
+// identical to the algo-1 path in srsChEstNormalizationKernel (peak |H|^2 over all elements,
+// then scale = 32768 * rsqrt(peak) and write short2), but treats tChEstToL2Inner/tChEstToL2
+// as flat arrays so the peak and scale passes use uint4 (4x half2/short2) vector loads/stores.
+// Selected by kernelSelect only when every UE satisfies srsChEstNormalizationHasLinearAlignedL2.
+// Report finalization is NOT done here -- it stays in the estimator kernel (unchanged).
+__global__ void srsChEstNormalizationLinearAlgo1Kernel(srsChEstStatDescr_t* pStatDescr, srsChEstDynDescr_t* pDynDescr)
+{
+    (void)pStatDescr;
+    constexpr int WARP_SIZE    = 32;
+    const int     tid          = threadIdx.x;
+    const int     blockThreads = blockDim.x;
+    const int     laneIdx      = tid & (WARP_SIZE - 1);
+    const int     warpIdx      = tid / WARP_SIZE;
+
+    ueDescr_t& ueDesc = pDynDescr->ueDescrs[blockIdx.x];
+#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
+    float2* pChEstToL2Inner = ueDesc.tChEstToL2Inner.addr();
+    float2* pChEstToL2      = ueDesc.tChEstToL2.addr();
+#else
+    half2*  pChEstToL2Inner = ueDesc.tChEstToL2Inner.addr();
+    short2* pChEstToL2      = ueDesc.tChEstToL2.addr();
+#endif
+    const int nL2Elems = ueDesc.nPrbGrpsL2 * ueDesc.nRxAntSrsL2 * ueDesc.nAntPortsL2;
+
+    __shared__ int warpPeak2int[WARP_SIZE];
+
+    float localPeak2 = 0.f;
+#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
+    const int unrollStride = 4 * blockThreads;
+    int elemIdx = tid;
+    for(; elemIdx + 3 * blockThreads < nL2Elems; elemIdx += unrollStride)
+    {
+        float2 t0 = pChEstToL2Inner[elemIdx];
+        float2 t1 = pChEstToL2Inner[elemIdx + blockThreads];
+        float2 t2 = pChEstToL2Inner[elemIdx + 2 * blockThreads];
+        float2 t3 = pChEstToL2Inner[elemIdx + 3 * blockThreads];
+        float m0 = fmaf(t0.x, t0.x, t0.y * t0.y);
+        float m1 = fmaf(t1.x, t1.x, t1.y * t1.y);
+        float m2 = fmaf(t2.x, t2.x, t2.y * t2.y);
+        float m3 = fmaf(t3.x, t3.x, t3.y * t3.y);
+        localPeak2 = fmaxf(localPeak2, fmaxf(fmaxf(m0, m1), fmaxf(m2, m3)));
+    }
+    for(; elemIdx < nL2Elems; elemIdx += blockThreads)
+    {
+        float2 tmp = pChEstToL2Inner[elemIdx];
+        localPeak2 = fmaxf(localPeak2, fmaf(tmp.x, tmp.x, tmp.y * tmp.y));
+    }
+#else
+    const int nVecElems = nL2Elems >> 2;
+    const uint4* __restrict__ pChEstToL2InnerVec = reinterpret_cast<const uint4*>(pChEstToL2Inner);
+    for(int vecIdx = tid; vecIdx < nVecElems; vecIdx += blockThreads)
+    {
+        localPeak2 = fmaxf(localPeak2, srsChEstPeak2FromUint4(pChEstToL2InnerVec[vecIdx]));
+    }
+    for(int elemIdx = (nVecElems << 2) + tid; elemIdx < nL2Elems; elemIdx += blockThreads)
+    {
+        float2 tmp = __half22float2(pChEstToL2Inner[elemIdx]);
+        localPeak2 = fmaxf(localPeak2, fmaf(tmp.x, tmp.x, tmp.y * tmp.y));
+    }
+#endif
+
+    #pragma unroll
+    for(int off = WARP_SIZE / 2; off > 0; off >>= 1)
+    {
+        localPeak2 = fmaxf(localPeak2, __shfl_down_sync(0xffffffff, localPeak2, off));
+    }
+    if(laneIdx == 0) warpPeak2int[warpIdx] = __float_as_int(localPeak2);
+    __syncthreads();
+
+    const int numWarps = (blockThreads + WARP_SIZE - 1) / WARP_SIZE;
+    float blockPeak2 = (tid < numWarps) ? __int_as_float(warpPeak2int[laneIdx]) : 0.f;
+    #pragma unroll
+    for(int off = WARP_SIZE / 2; off > 0; off >>= 1)
+    {
+        blockPeak2 = fmaxf(blockPeak2, __shfl_down_sync(0xffffffff, blockPeak2, off));
+    }
+    if(tid == 0) warpPeak2int[0] = __float_as_int(blockPeak2);
+    __syncthreads();
+
+    constexpr float fixed_scale = 32768.0f;
+    const float scale = fixed_scale * rsqrtf(__int_as_float(warpPeak2int[0]));
+
+#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
+    elemIdx = tid;
+    for(; elemIdx + 3 * blockThreads < nL2Elems; elemIdx += unrollStride)
+    {
+        float2 t0 = pChEstToL2Inner[elemIdx];
+        float2 t1 = pChEstToL2Inner[elemIdx + blockThreads];
+        float2 t2 = pChEstToL2Inner[elemIdx + 2 * blockThreads];
+        float2 t3 = pChEstToL2Inner[elemIdx + 3 * blockThreads];
+        pChEstToL2[elemIdx]                    = make_float2(scale * t0.x, scale * t0.y);
+        pChEstToL2[elemIdx + blockThreads]     = make_float2(scale * t1.x, scale * t1.y);
+        pChEstToL2[elemIdx + 2 * blockThreads] = make_float2(scale * t2.x, scale * t2.y);
+        pChEstToL2[elemIdx + 3 * blockThreads] = make_float2(scale * t3.x, scale * t3.y);
+    }
+    for(; elemIdx < nL2Elems; elemIdx += blockThreads)
+    {
+        float2 tmp = pChEstToL2Inner[elemIdx];
+        pChEstToL2[elemIdx] = make_float2(scale * tmp.x, scale * tmp.y);
+    }
+#else
+    uint4* __restrict__ pChEstToL2Vec = reinterpret_cast<uint4*>(pChEstToL2);
+    for(int vecIdx = tid; vecIdx < nVecElems; vecIdx += blockThreads)
+    {
+        pChEstToL2Vec[vecIdx] = srsChEstScalePackedHalf2ToShort2(pChEstToL2InnerVec[vecIdx], scale);
+    }
+    for(int elemIdx = (nVecElems << 2) + tid; elemIdx < nL2Elems; elemIdx += blockThreads)
+    {
+        float2 tmp = __half22float2(pChEstToL2Inner[elemIdx]);
+        short2 res;
+        res.x = static_cast<int16_t>(scale * tmp.x);
+        res.y = static_cast<int16_t>(scale * tmp.y);
+        pChEstToL2[elemIdx] = res;
+    }
+#endif
+}
 
 __global__ void srsChEstNormalizationKernel(srsChEstStatDescr_t* pStatDescr, srsChEstDynDescr_t* pDynDescr)
 {
@@ -3352,6 +3835,41 @@ void srsChEst::getDescrInfo(size_t& statDescrSizeBytes, size_t& statDescrAlignBy
    dynDescrAlignBytes = alignof(srsChEstDynDescr_t);
 }
 
+// Returns true if this UE's L2 channel-estimate buffers have the contiguous, 16B-aligned
+// layout that srsChEstNormalizationLinearAlgo1Kernel requires: prgSizeRatio==1 and
+// prgSizeOffset==0 (so the inner read index equals the flat element index), the inner/out
+// tensors are exactly [nPrbGrpsL2, nRxAntSrsL2, nAntPortsL2] with natural contiguous
+// strides, and both base addresses are 16-byte aligned (for uint4 vector load/store).
+static bool srsChEstNormalizationHasLinearAlignedL2(ueDescr_t& ueDesc)
+{
+    if(ueDesc.prgSize == 0) return false;
+    auto& tChEstToL2Inner = ueDesc.tChEstToL2Inner;
+    auto& tChEstToL2      = ueDesc.tChEstToL2;
+    auto const& innerLayout = tChEstToL2Inner.layout();
+    auto const& outLayout   = tChEstToL2.layout();
+
+    const int nPrbGrpsL2  = ueDesc.nPrbGrpsL2;
+    const int nRxAntSrsL2 = ueDesc.nRxAntSrsL2;
+    const int nAntPortsL2 = ueDesc.nAntPortsL2;
+
+    const uint16_t prgSizeRatio = ueDesc.prgSizeL2 / ueDesc.prgSize;
+    uint16_t prgSizeOffset = 0;
+    if(ueDesc.prgSizeL2 > 4) prgSizeOffset = prgSizeRatio / 2 - 1;
+
+    const bool hasLinearLayout =
+        (prgSizeRatio == 1) && (prgSizeOffset == 0) &&
+        (innerLayout.dimensions[0] == nPrbGrpsL2)  && (outLayout.dimensions[0] == nPrbGrpsL2)  &&
+        (innerLayout.dimensions[1] == nRxAntSrsL2)  && (outLayout.dimensions[1] == nRxAntSrsL2)  &&
+        (innerLayout.dimensions[2] == nAntPortsL2)  && (outLayout.dimensions[2] == nAntPortsL2)  &&
+        (innerLayout.strides[0] == 1)                       && (outLayout.strides[0] == 1)                       &&
+        (innerLayout.strides[1] == nPrbGrpsL2)              && (outLayout.strides[1] == nPrbGrpsL2)              &&
+        (innerLayout.strides[2] == nPrbGrpsL2 * nRxAntSrsL2)&& (outLayout.strides[2] == nPrbGrpsL2 * nRxAntSrsL2);
+
+    const size_t innerAddr = reinterpret_cast<size_t>(tChEstToL2Inner.addr());
+    const size_t outAddr   = reinterpret_cast<size_t>(tChEstToL2.addr());
+    return hasLinearLayout && (((innerAddr | outAddr) & 0xF) == 0);
+}
+
 void  srsChEst::kernelSelect(srsChEstDynDescr_t*      pCpuDynDesc,
                             uint16_t                  nSrsUes,
                             uint16_t                  nCompBlocks,
@@ -3417,13 +3935,13 @@ void  srsChEst::kernelSelect(srsChEstDynDescr_t*      pCpuDynDesc,
         kernelNodeParamsDriver.sharedMemBytes += max_nRxAnts * max_nSrsSc * max_nPorts * sizeof(__half2);                // for sh_Hest
         kernelNodeParamsDriver.sharedMemBytes += 2 * max_nSrsSc * max_nSrsSc * sizeof(__half2);                          // for sh_W_{wide,narrow}
         kernelNodeParamsDriver.sharedMemBytes += max_nPorts * sizeof(float) +                                            // sh_phaseRamp
-                                                 max_nPorts * sizeof(__half2) +                                          // sh_avgScCorr
+                                                 max_nPorts * sizeof(float2) +                                           // sh_avgScCorr (FP32, magnitude-weighted)
                                                  (13 * 12 /*(max_FOCC_LENGTH+1)*max_FOCC_LENGTH*/) * sizeof(__half2) +   // sh_focc_table
                                                  (max_nPorts * N_PRB_PER_COMP_BLK) * sizeof(float) +                     // sh_avgSignalEnergyPrb
                                                  (max_nPorts * max_nSrsSc) * sizeof(float) +                             // sh_avgSignalEnergySc
                                                  max_nPorts * sizeof(float) +                                            // sh_avgSignalEnergy
                                                  max_nPorts * sizeof(uint32_t) +                                         // sh_ueBlockCntr
-                                                 max_nPorts * (SRS_CHEST_BLOCK_SZ / 32/*TILE_SIZE*/) * sizeof(__half2) + // sh_tile_avgScCorr
+                                                 max_nPorts * (SRS_CHEST_BLOCK_SZ / 32/*TILE_SIZE*/) * sizeof(float2) +  // sh_tile_avgScCorr (placed first in smem)
                                                  (max_nSrsScBlock + 1) * 12 * sizeof(__half2) +                          // sh_phaseTable- used for sin/cos LUT in srsFilterMultiply and step 7; the LUT size in srsFilterMultiply is larger or equal to LUT in step 7;
                                                  2 * sizeof(float) +                                                     // sh_avgNoiseEnergy, sh_tmpWidebandCsCorrNotUse (moved to dynamic shared)
                                                  12 * sizeof(uint16_t) +                                                 // csIdx2UeIdxLut (moved to dynamic shared)
@@ -3462,6 +3980,25 @@ void  srsChEst::kernelSelect(srsChEstDynDescr_t*      pCpuDynDesc,
         dim3  grdDim(nSrsUes);
         dim3  blkDim(256);
         void* kernelFunc = reinterpret_cast<void*>(srsChEstNormalizationKernel);
+        // For algo 1, if every UE's L2 buffers are contiguous and 16B-aligned, use the
+        // vectorized linear kernel (uint4 peak/scale passes) -- semantically identical,
+        // far fewer transactions. Any non-conforming UE falls back to the generic kernel.
+        if(m_chEstToL2NormalizationAlgo == 1)
+        {
+            bool useLinearAlgo1 = true;
+            for(int ueIdx = 0; ueIdx < nSrsUes; ++ueIdx)
+            {
+                if(!srsChEstNormalizationHasLinearAlignedL2(pCpuDynDesc->ueDescrs[ueIdx]))
+                {
+                    useLinearAlgo1 = false;
+                    break;
+                }
+            }
+            if(useLinearAlgo1)
+            {
+                kernelFunc = reinterpret_cast<void*>(srsChEstNormalizationLinearAlgo1Kernel);
+            }
+        }
        {MemtraceDisableScope md;cudaGetFuncBySymbol(&pNormalizationLaunchCfg->kernelNodeParamsDriver.func, kernelFunc);}
         CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = pNormalizationLaunchCfg->kernelNodeParamsDriver;
         kernelNodeParamsDriver.blockDimX = blkDim.x;
@@ -3535,15 +4072,9 @@ cuphyStatus_t srsChEst::setup(uint16_t                      nSrsUes,
        uint16_t&                    prgSize                            = ueDescr.prgSize;
        uint16_t&                    prgSizeL2                          = ueDescr.prgSizeL2;
        cuphySrsReport_t*&           pUeSrsReport                       = ueDescr.pUeSrsReport;
-#ifdef ASIM_CUPHY_SRS_OUTPUT_FP32
-       tensor_ref_any<CUPHY_C_32F>& tChEstBuff                         = ueDescr.tChEstBuff;
-       tensor_ref_any<CUPHY_C_32F>& tChEstToL2Inner                    = ueDescr.tChEstToL2Inner;
-       tensor_ref_any<CUPHY_C_32F>& tChEstToL2                         = ueDescr.tChEstToL2;
-#else
-       tensor_ref_any<CUPHY_C_16F>& tChEstBuff                         = ueDescr.tChEstBuff;
-       tensor_ref_any<CUPHY_C_16F>& tChEstToL2Inner                    = ueDescr.tChEstToL2Inner;
-       tensor_ref_any<CUPHY_C_16I>& tChEstToL2                         = ueDescr.tChEstToL2;
-#endif
+       auto&                        tChEstBuff                         = ueDescr.tChEstBuff;
+       auto&                        tChEstToL2Inner                    = ueDescr.tChEstToL2Inner;
+       auto&                        tChEstToL2                         = ueDescr.tChEstToL2;
        uint16_t&                    chEstBuffStartPrbGrp               = ueDescr.chEstBuffStartPrbGrp;
        uint32_t&                    ueBlockCntr                        = ueDescr.ueBlockCntr;
        uint32_t&                    ueNumBlocks                        = ueDescr.ueNumBlocks;
@@ -3553,7 +4084,7 @@ cuphyStatus_t srsChEst::setup(uint16_t                      nSrsUes,
 
        ueDescr.tmpWidebandNoiseEnergy  = 0.0f;
        ueDescr.tmpWidebandSignalEnergy = 0.0f;
-       ueDescr.tmpWidebandScCorr       = __floats2half2_rn(0.f, 0.f);
+       ueDescr.tmpWidebandScCorr       = make_float2(0.f, 0.f);
        ueDescr.tmpWidebandCsCorrUse    = 0;
        ueDescr.tmpWidebandCsCorrNotUse = 0;
 
@@ -4134,6 +4665,28 @@ void srsChEst::init(cuphySrsFilterPrms_t*   pSrsFilterPrms,
 {
     m_chEstAlgo = chEstAlgo;
     m_chEstToL2NormalizationAlgo = chEstToL2NormalizationAlgo;
+
+    // Precompute the STEP 7 cyclic-shift correlation phase tables. n_SRS_cs_max is 8 for
+    // comb-2 and 12 for comb-4 (see kernelSelect/setup), and nSrsScBlock is 24/12, so the
+    // tables depend only on combSize and can be built once here.
+    for(int csIdx = 0; csIdx < 8; ++csIdx)
+    {
+        for(int scIdx = 0; scIdx < 24; ++scIdx)
+        {
+            const float ang = -2.0f * static_cast<float>(M_PI) * csIdx * scIdx / 8.0f;
+            srsCsPhaseComb2[csIdx * 24 + scIdx] = __half2(__float2half(cosf(ang)), __float2half(sinf(ang)));
+        }
+    }
+    for(int csIdx = 0; csIdx < 12; ++csIdx)
+    {
+        for(int scIdx = 0; scIdx < 12; ++scIdx)
+        {
+            const float ang = -2.0f * static_cast<float>(M_PI) * csIdx * scIdx / 12.0f;
+            srsCsPhaseComb4[csIdx * 12 + scIdx] = __half2(__float2half(cosf(ang)), __float2half(sinf(ang)));
+        }
+    }
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(d_srsCsPhaseComb2, srsCsPhaseComb2, sizeof(srsCsPhaseComb2), 0, cudaMemcpyHostToDevice, strm));
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(d_srsCsPhaseComb4, srsCsPhaseComb4, sizeof(srsCsPhaseComb4), 0, cudaMemcpyHostToDevice, strm));
 
    tensorPrm_to_tensorRef(pSrsFilterPrms->tPrmFocc_table      , pCpuStatDesc->tFocc_table);
    tensorPrm_to_tensorRef(pSrsFilterPrms->tPrmFocc_comb2_table, pCpuStatDesc->tFocc_comb2_table);

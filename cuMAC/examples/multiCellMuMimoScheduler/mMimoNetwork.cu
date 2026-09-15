@@ -16,11 +16,32 @@
  */
 
 #include "mMimoNetwork.h"
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+namespace {
+
+/** Resolve @p path against the parent directory of @p configFilePath when relative. */
+std::string resolvePathRelativeToConfig(const std::string& path, const std::string& configFilePath)
+{
+    std::filesystem::path p(path);
+    if (p.is_absolute()) {
+        return std::filesystem::weakly_canonical(p).string();
+    }
+    const std::filesystem::path configDir =
+        std::filesystem::path(configFilePath).parent_path();
+    return std::filesystem::weakly_canonical(std::filesystem::absolute(configDir / p)).string();
+}
+
+} // namespace
 
 // Mathematical constants for channel estimation error calculations
 static constexpr float INV_SQRT_2 = 0.7071067811865476f; // 1/sqrt(2) for Gaussian noise scaling
 
-mMimoNetwork::mMimoNetwork(const std::string& configFilePath, cudaStream_t strm)
+mMimoNetwork::mMimoNetwork(const std::string& configFilePath, cudaStream_t strm, int seed_override)
 {
     if (isYamlFile(configFilePath)) {
         // Load configuration from YAML file
@@ -41,6 +62,17 @@ mMimoNetwork::mMimoNetwork(const std::string& configFilePath, cudaStream_t strm)
         throw std::runtime_error("Invalid configuration file");
     }
 
+    // sanity check on m_seed
+    if (seed_override < -1){
+        std::cerr << "Error: invalid seed" << std::endl;
+        throw std::runtime_error("Invalid seed");
+    }
+
+    // override seed if provided
+    if (seed_override >= 0) {
+        m_seed = seed_override;
+    }
+    
     randomEngine = std::default_random_engine(m_seed);
     uniformRealDist = std::uniform_real_distribution<float>(0.0,1.0);
 
@@ -56,15 +88,22 @@ mMimoNetwork::mMimoNetwork(const std::string& configFilePath, cudaStream_t strm)
     detSimParams();
 
     setupChannel();
+    
+    loadBlerTable(m_blerLutPath);
+
+    m_minSinrDb = calcSinrMinDb(m_targetMaxBlerMcs0);
+
 }
 
 mMimoNetwork::~mMimoNetwork()
 {
     /* Destruction */
     destroyApiStructs();
-    for (int i = 0; i < m_nCell; i++) {
-        CUDA_CHECK_ERR(cudaFree(m_genChanPtrArr[i]));
+
+    for (int cIdx = 0; cIdx < m_nCell; cIdx++) {
+        CUDA_CHECK_ERR(cudaFree(m_genChanPtrArr[cIdx]));
     }
+
     CUDA_CHECK_ERR(cudaFree(genChanGpu));
 }
 
@@ -73,7 +112,7 @@ void mMimoNetwork::detSimParams()
     netData->scenarioUma = 1; // UMa
     netData->carrierFreq = 5.0; // carrier frequency in unit of GHz
     netData->sfStd = 3.0; // shadow fading STD in dB
-    float noiseFigure  = 10.0; // dB
+    float noiseFigure  = 9.0; // dB
     netData->noiseVarDbm = -174.0 + noiseFigure + 10.0*log10(m_W);
     netData->noiseVar = pow(10.0, (netData->noiseVarDbm - 30.0)/10.0); // W
     netData->bsHeight = 25;
@@ -97,7 +136,9 @@ void mMimoNetwork::detSimParams()
     netData->sqrChanEstNmse = pow(10.0, m_chanEstNmseDB/20.0); // square root of channel estimation error NMSE
 
     netData->bsPos.resize(netData->numCell);
+    netData->bsOrien.resize(netData->numCell);
     netData->chanGainDB.resize(netData->numCell*m_nActiveUe);
+    netData->chanPlSfDB.resize(netData->numCell*m_nActiveUe);
     CUDA_CHECK_ERR(cudaMalloc((void **)&netData->chanGainDBGpu, netData->numCell*m_nActiveUe*sizeof(float)));
 
     netData->uePos.resize(m_nActiveUe);
@@ -114,6 +155,9 @@ void mMimoNetwork::detSimParams()
     CUDA_CHECK_ERR(cudaMalloc((void **)&netData->states, netData->numThrdBlk*netData->numThrdPerBlk*sizeof(curandState_t)));
      
     init_curand<<<netData->numThrdBlk, netData->numThrdPerBlk, 0, m_strm>>>(time(NULL), 0, netData->states);
+    
+    // Allocate random number array for PHY abstraction
+    floatRandomArr = std::make_unique<float[]>(m_nActiveUe);
 }
 
 int mMimoNetwork::loadConfigYaml(const std::string& configFilePath)
@@ -188,8 +232,13 @@ int mMimoNetwork::loadConfigYaml(const std::string& configFilePath)
         m_mcsSelCqi = root["mcsSelCqi"].as<uint8_t>();
         m_fullBufferTraffic = root["fullBufferTraffic"].as<uint8_t>();
         m_mcsSelLutType = root["mcsSelLutType"].as<uint8_t>();
-
         m_chanEstNmseDB = root["chanEstNmseDB"].as<float>();
+        m_pfAvgRateUpd = root["pfAvgRateUpd"].as<float>();
+        m_useManagedMemFlag = root["useManagedMemFlag"].as<uint8_t>();
+        m_pdschNrOfDataSymb = root["pdschNrOfDataSymb"].as<uint8_t>();
+        m_targetMaxBlerMcs0 = root["targetMaxBlerMcs0"].as<float>();
+        m_maxCombinedPostEqSinrdB = root["maxCombinedPostEqSinrdB"].as<float>();
+        m_zeroInterfSirDb = root["zeroInterfSirDb"] ? root["zeroInterfSirDb"].as<float>() : 100.0f;
         
         // Load channel configuration
         if (root["channel_config"]) {
@@ -197,7 +246,17 @@ int mMimoNetwork::loadConfigYaml(const std::string& configFilePath)
         } else {
             m_fadingType = 0; // Default to internal Rayleigh fading
         }
-        
+
+        // load BLER lookup table (resolve relative paths against the config file directory)
+        {
+            const std::string defaultBlerLut =
+                "ws_scenarios_MCS_BLER_MMSE-IRC_fused_AWGN_GTC2025.csv";
+            const std::string blerLutFromYaml = root["blerLutPath"]
+                ? root["blerLutPath"].as<std::string>()
+                : defaultBlerLut;
+            m_blerLutPath = resolvePathRelativeToConfig(blerLutFromYaml, configFilePath);
+        }
+
         printf("Loaded config parameters\n");
 
         return 0; // Success
@@ -264,6 +323,13 @@ int mMimoNetwork::loadConfigHdf5(const std::string& configFilePath)
         m_mcsSelCqi = 0;
         m_mcsSelLutType = data.mcsSelLutType;
         m_mcsSelSinrCapThr = data.mcsSelSinrCapThr;
+        m_pfAvgRateUpd = 0.001f;
+        m_useManagedMemFlag = 1;
+        m_pdschNrOfDataSymb = 8;
+        m_blerLutPath = "./cuMAC/examples/multiCellMuMimoScheduler/ws_scenarios_MCS_BLER_MMSE-IRC_fused_AWGN_GTC2025.csv"; // load BLER lookup table
+        m_targetMaxBlerMcs0 = 0.3;
+        m_maxCombinedPostEqSinrdB = 50.0;
+        m_zeroInterfSirDb = 100.0f;
 
         printf("Loaded config parameters\n");
 
@@ -313,6 +379,7 @@ void mMimoNetwork::readChannelConfig(const YAML::Node& channelConfigNode)
         // Parse SLS configuration from the embedded YAML node (only fields that exist)
         parseEmbeddedSlsConfig(channelConfigNode);
     }
+
     printf("Successfully loaded channel configuration: fading_type = %u\n", m_fadingType);
     
     // System-level parameters derived from cuMAC config
@@ -599,13 +666,6 @@ void mMimoNetwork::setupApiStructs()
 {
     // setup CPU buffers
     m_prdMatCpu.resize(m_nCell*m_nPrbGrp*m_nBsAnt*cumac::maxNumLayerPerGrpDL_);
-    m_allocSolCpu.resize(2*m_nActiveUe);
-    m_mcsSelSolCpu.resize(m_nActiveUe);
-    m_layerSelSolCpu.resize(m_nActiveUe);
-    m_ueOrderInGrpCpu.resize(m_nActiveUe);
-    m_setSchdUePerCellTTICpu.resize(m_nCell*m_numUeForGrpPerCell);
-    m_nSCIDCpu.resize(m_nActiveUe);
-    
     m_cellAssocActUe.resize(m_nCell*m_nActiveUe);
     std::fill(m_cellAssocActUe.begin(), m_cellAssocActUe.end(), 0);
     m_srsEstChanPtrArr.resize(m_nCell);
@@ -616,6 +676,7 @@ void mMimoNetwork::setupApiStructs()
         CUDA_CHECK_ERR(cudaMalloc((void **)&m_srsUeMapPtrArr[i], m_nActiveUe*sizeof(int32_t)));
         CUDA_CHECK_ERR(cudaMalloc((void **)&m_sortedUeListPtrArr[i], m_nMaxActUePerCell*sizeof(uint16_t)));
 
+        // simplified cell association for active UEs based on UE index, requires ut_drop_option == 2
         for (int uIdx = 0; uIdx < m_nActiveUePerCell; uIdx++) {
             m_cellAssocActUe[i*m_nActiveUe + i*m_nActiveUePerCell + uIdx] = 1;
         }
@@ -654,16 +715,6 @@ void mMimoNetwork::setupApiStructs()
 
     m_muGrpListPtr = std::make_unique<cumac::multiCellMuGrpList>();
 
-    // setup CPU & GPU buffers for generated channels
-    genChanCpu.resize(m_nCell);
-    CUDA_CHECK_ERR(cudaMalloc((void **)&genChanGpu, m_nCell*sizeof(cuComplex*)));
-    m_genChanPtrArr.resize(m_nCell);
-    for (int i = 0; i < m_nCell; i++) {
-        CUDA_CHECK_ERR(cudaMalloc((void **)&m_genChanPtrArr[i], m_nActiveUe*m_nPrbGrp*m_nUeAnt*m_nBsAnt*sizeof(cuComplex)));
-        genChanCpu[i].resize(m_nActiveUe*m_nPrbGrp*m_nUeAnt*m_nBsAnt);
-    }
-    CUDA_CHECK_ERR(cudaMemcpyAsync(genChanGpu, m_genChanPtrArr.data(), m_nCell*sizeof(cuComplex*), cudaMemcpyHostToDevice, m_strm));
-
     // setup API structures
     cellGrpPrmsGpu->dlSchInd = m_DL;
     cellGrpPrmsGpu->harqEnabledInd = m_harqEnabled;
@@ -686,6 +737,11 @@ void mMimoNetwork::setupApiStructs()
     cellGrpPrmsGpu->nMaxUegPerCellDl = m_nMaxUegPerCellDl;
     cellGrpPrmsGpu->nMaxUegPerCellUl = m_nMaxUegPerCellUl;
     cellGrpPrmsGpu->nPrbGrp = m_nPrbGrp;
+    if (m_nBsAnt != 64) {
+        throw std::runtime_error(
+            "Invalid nBsAnt in multiCellMuMimoScheduler: expected 64, got " +
+            std::to_string(m_nBsAnt));
+    }
     cellGrpPrmsGpu->nBsAnt = m_nBsAnt;
     cellGrpPrmsGpu->nUeAnt = m_nUeAnt;
     cellGrpPrmsGpu->W = m_W;
@@ -705,65 +761,159 @@ void mMimoNetwork::setupApiStructs()
     CUDA_CHECK_ERR(cudaMalloc((void **)&m_muGrpListPtr->numUeInGrp, cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_*sizeof(uint16_t)));
     CUDA_CHECK_ERR(cudaMalloc((void **)&m_muGrpListPtr->ueId, cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_*cumac::maxNumLayerPerGrpDL_*sizeof(uint16_t)));
     CUDA_CHECK_ERR(cudaMalloc((void **)&m_muGrpListPtr->subbandId, cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_*sizeof(int16_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->cellAssocActUe, m_nCell*m_nActiveUe*sizeof(uint8_t)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->cellAssocActUe, m_cellAssocActUe.data(), m_nCell*m_nActiveUe*sizeof(uint8_t), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->wbSinr, m_nActiveUe*m_nUeAnt*sizeof(float)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->wbSinr, m_wbSinr.data(), m_nActiveUe*m_nUeAnt*sizeof(float), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->prdMat, m_nCell*m_nPrbGrp*m_nBsAnt*cumac::maxNumLayerPerGrpDL_*sizeof(cuComplex)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->bfGainPrgCurrTx, m_nActiveUe*m_nPrbGrp*sizeof(float)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->bfGainPrgCurrTx, m_bfGainPrgCurrTx.data(), m_nActiveUe*m_nPrbGrp*sizeof(float), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->beamformGainCurrTx, m_nActiveUe*sizeof(float)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->beamformGainCurrTx, m_beamformGainCurrTx.data(), m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->beamformGainLastTx, m_nActiveUe*sizeof(float)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->beamformGainLastTx, m_beamformGainLastTx.data(), m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->ueOrderInGrp, m_nActiveUe*sizeof(uint16_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->layerSelSol, m_nActiveUe*sizeof(uint8_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->allocSol, 2*m_nActiveUe*sizeof(int16_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->mcsSelSol, m_nActiveUe*sizeof(int16_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->setSchdUePerCellTTI, m_nCell*m_numUeForGrpPerCell*sizeof(uint16_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->srsEstChan, m_nCell*sizeof(cuComplex*)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsEstChan, m_srsEstChanPtrArr.data(), m_nCell*sizeof(cuComplex*), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->srsUeMap, m_nCell*sizeof(int32_t*)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsUeMap, m_srsUeMapPtrArr.data(), m_nCell*sizeof(int32_t*), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->muGrpList, sizeof(cumac::multiCellMuGrpList)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(schdSolGpu->muGrpList, m_muGrpListPtr.get(), sizeof(cumac::multiCellMuGrpList), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->srsWbSnr, m_nActiveUe*sizeof(float)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsWbSnr, m_srsWbSnr.data(), m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->blerTargetActUe, m_nActiveUe*sizeof(float)));
-    std::vector<float> blerTargetActUe(m_nActiveUe, 0.1);
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->blerTargetActUe, blerTargetActUe.data(), sizeof(float)*m_nActiveUe, cudaMemcpyHostToDevice, m_strm));
-    if (m_riBasedLayerSelSu == 1) {
-        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->riActUe, m_nActiveUe*sizeof(int8_t)));
-        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->riActUe, m_riActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyHostToDevice, m_strm));
+
+    if (m_useManagedMemFlag == 0) {
+        // CPU buffers
+        m_mcsSelSolCpu.resize(m_nActiveUe);
+        m_layerSelSolCpu.resize(m_nActiveUe);
+        m_ueOrderInGrpCpu.resize(m_nActiveUe);
+        m_setSchdUePerCellTTICpu.resize(m_nCell*m_numUeForGrpPerCell);
+        m_allocSolCpu.resize(2*m_nActiveUe);
+        m_nSCIDCpu.resize(m_nActiveUe);
+
+        // setup CPU & GPU buffers for generated channels
+        genChanCpu.resize(m_nCell);
+        CUDA_CHECK_ERR(cudaMalloc((void **)&genChanGpu, m_nCell*sizeof(cuComplex*)));
+        m_genChanPtrArr.resize(m_nCell);
+        for (int cIdx = 0; cIdx < m_nCell; cIdx++) {
+            CUDA_CHECK_ERR(cudaMalloc((void **)&m_genChanPtrArr[cIdx], m_nActiveUe*m_nPrbGrp*m_nUeAnt*m_nBsAnt*sizeof(cuComplex)));
+            genChanCpu[cIdx].resize(m_nActiveUe*m_nPrbGrp*m_nUeAnt*m_nBsAnt);
+        }
+        CUDA_CHECK_ERR(cudaMemcpyAsync(genChanGpu, m_genChanPtrArr.data(), m_nCell*sizeof(cuComplex*), cudaMemcpyHostToDevice, m_strm));
+
+        // GPU buffers
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->cellAssocActUe, m_nCell*m_nActiveUe*sizeof(uint8_t)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->cellAssocActUe, m_cellAssocActUe.data(), m_nCell*m_nActiveUe*sizeof(uint8_t), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->wbSinr, m_nActiveUe*m_nUeAnt*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->wbSinr, m_wbSinr.data(), m_nActiveUe*m_nUeAnt*sizeof(float), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->prdMat, m_nCell*m_nPrbGrp*m_nBsAnt*cumac::maxNumLayerPerGrpDL_*sizeof(cuComplex)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->bfGainPrgCurrTx, m_nActiveUe*m_nPrbGrp*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->bfGainPrgCurrTx, m_bfGainPrgCurrTx.data(), m_nActiveUe*m_nPrbGrp*sizeof(float), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->beamformGainCurrTx, m_nActiveUe*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->beamformGainCurrTx, m_beamformGainCurrTx.data(), m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->beamformGainLastTx, m_nActiveUe*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->beamformGainLastTx, m_beamformGainLastTx.data(), m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->ueOrderInGrp, m_nActiveUe*sizeof(uint16_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->layerSelSol, m_nActiveUe*sizeof(uint8_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->allocSol, 2*m_nActiveUe*sizeof(int16_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->mcsSelSol, m_nActiveUe*sizeof(int16_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->setSchdUePerCellTTI, m_nCell*m_numUeForGrpPerCell*sizeof(uint16_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->srsEstChan, m_nCell*sizeof(cuComplex*)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsEstChan, m_srsEstChanPtrArr.data(), m_nCell*sizeof(cuComplex*), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->srsUeMap, m_nCell*sizeof(int32_t*)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsUeMap, m_srsUeMapPtrArr.data(), m_nCell*sizeof(int32_t*), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->muGrpList, sizeof(cumac::multiCellMuGrpList)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(schdSolGpu->muGrpList, m_muGrpListPtr.get(), sizeof(cumac::multiCellMuGrpList), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->srsWbSnr, m_nActiveUe*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsWbSnr, m_srsWbSnr.data(), m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->blerTargetActUe, m_nActiveUe*sizeof(float)));
+        std::vector<float> blerTargetActUe(m_nActiveUe, 0.1);
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->blerTargetActUe, blerTargetActUe.data(), sizeof(float)*m_nActiveUe, cudaMemcpyHostToDevice, m_strm));
+        if (m_riBasedLayerSelSu == 1) {
+            CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->riActUe, m_nActiveUe*sizeof(int8_t)));
+            CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->riActUe, m_riActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyHostToDevice, m_strm));
+        } else {
+            cellGrpUeStatusGpu->riActUe = nullptr;
+        }
+        if (m_mcsSelCqi == 1) { 
+            CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->cqiActUe, m_nActiveUe*sizeof(int8_t)));
+            CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->cqiActUe, m_cqiActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyHostToDevice, m_strm));
+        } else {
+            cellGrpUeStatusGpu->cqiActUe = nullptr;
+        }
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->avgRatesActUe, m_nActiveUe*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->avgRatesActUe, m_avgRatesActUe.data(), m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->allocSolLastTx, 2*m_nActiveUe*sizeof(int16_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->layerSelSolLastTx, m_nActiveUe*sizeof(uint8_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->mcsSelSolLastTx, m_nActiveUe*sizeof(int16_t)));
+        if (m_fullBufferTraffic == 1) {
+            cellGrpUeStatusGpu->bufferSize = nullptr;
+        } else {
+            CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->bufferSize, m_nActiveUe*sizeof(uint32_t)));
+        }
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->lastSchdSlotActUe, m_nActiveUe*sizeof(uint32_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->currSlotIdxPerCell, m_nCell*sizeof(uint32_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->newDataActUe, m_nActiveUe*sizeof(int8_t)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->newDataActUe, m_newDataActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->tbErrLast, m_nActiveUe*sizeof(int8_t)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->tbErrLast, m_tbErrLast.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->sortedUeList, m_nCell*sizeof(uint16_t*)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(schdSolGpu->sortedUeList, m_sortedUeListPtrArr.data(), m_nCell*sizeof(uint16_t*), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->nSCID, m_nActiveUe*sizeof(uint8_t)));
+        CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->muMimoInd, m_nActiveUe*sizeof(uint8_t)));
+    } else if (m_useManagedMemFlag == 1) {
+        // setup CUDA managed memory buffer with CPU side and GPU side pointers
+        // genChanCpu is not used when (m_useManagedMemFlag == 1)
+        CUDA_CHECK_ERR(cudaMalloc((void **)&genChanGpu, m_nCell*sizeof(cuComplex*)));
+        m_genChanPtrArr.resize(m_nCell);
+        for (int cIdx = 0; cIdx < m_nCell; cIdx++) {
+            CUDA_CHECK_ERR(cudaMallocManaged((void **)&m_genChanPtrArr[cIdx], m_nActiveUe*m_nPrbGrp*m_nUeAnt*m_nBsAnt*sizeof(cuComplex)));
+        }
+        CUDA_CHECK_ERR(cudaMemcpyAsync(genChanGpu, m_genChanPtrArr.data(), m_nCell*sizeof(cuComplex*), cudaMemcpyDefault, m_strm));
+
+        // CUDA managed memory
+        CUDA_CHECK_ERR(cudaMallocManaged((void**)&cellGrpPrmsGpu->cellAssocActUe, m_nCell*m_nActiveUe*sizeof(uint8_t)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->cellAssocActUe, m_cellAssocActUe.data(), m_nCell*m_nActiveUe*sizeof(uint8_t), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpPrmsGpu->wbSinr, m_nActiveUe*m_nUeAnt*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->wbSinr, m_wbSinr.data(), m_nActiveUe*m_nUeAnt*sizeof(float), cudaMemcpyHostToDevice, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpPrmsGpu->prdMat, m_nCell*m_nPrbGrp*m_nBsAnt*cumac::maxNumLayerPerGrpDL_*sizeof(cuComplex)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->bfGainPrgCurrTx, m_nActiveUe*m_nPrbGrp*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->bfGainPrgCurrTx, m_bfGainPrgCurrTx.data(), m_nActiveUe*m_nPrbGrp*sizeof(float), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->beamformGainCurrTx, m_nActiveUe*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->beamformGainCurrTx, m_beamformGainCurrTx.data(), m_nActiveUe*sizeof(float), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->beamformGainLastTx, m_nActiveUe*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->beamformGainLastTx, m_beamformGainLastTx.data(), m_nActiveUe*sizeof(float), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->ueOrderInGrp, m_nActiveUe*sizeof(uint16_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->layerSelSol, m_nActiveUe*sizeof(uint8_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->allocSol, 2*m_nActiveUe*sizeof(int16_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->mcsSelSol, m_nActiveUe*sizeof(int16_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->setSchdUePerCellTTI, m_nCell*m_numUeForGrpPerCell*sizeof(uint16_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpPrmsGpu->srsEstChan, m_nCell*sizeof(cuComplex*)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsEstChan, m_srsEstChanPtrArr.data(), m_nCell*sizeof(cuComplex*), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpPrmsGpu->srsUeMap, m_nCell*sizeof(int32_t*)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsUeMap, m_srsUeMapPtrArr.data(), m_nCell*sizeof(int32_t*), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->muGrpList, sizeof(cumac::multiCellMuGrpList)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(schdSolGpu->muGrpList, m_muGrpListPtr.get(), sizeof(cumac::multiCellMuGrpList), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpPrmsGpu->srsWbSnr, m_nActiveUe*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->srsWbSnr, m_srsWbSnr.data(), m_nActiveUe*sizeof(float), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpPrmsGpu->blerTargetActUe, m_nActiveUe*sizeof(float)));
+        std::vector<float> blerTargetActUe(m_nActiveUe, 0.1);
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpPrmsGpu->blerTargetActUe, blerTargetActUe.data(), sizeof(float)*m_nActiveUe, cudaMemcpyDefault, m_strm));
+        if (m_riBasedLayerSelSu == 1) {
+            CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->riActUe, m_nActiveUe*sizeof(int8_t)));
+            CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->riActUe, m_riActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyDefault, m_strm));
+        } else {
+            cellGrpUeStatusGpu->riActUe = nullptr;
+        }
+        if (m_mcsSelCqi == 1) { 
+            CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->cqiActUe, m_nActiveUe*sizeof(int8_t)));
+            CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->cqiActUe, m_cqiActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyDefault, m_strm));
+        } else {
+            cellGrpUeStatusGpu->cqiActUe = nullptr;
+        }
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->avgRatesActUe, m_nActiveUe*sizeof(float)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->avgRatesActUe, m_avgRatesActUe.data(), m_nActiveUe*sizeof(float), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->allocSolLastTx, 2*m_nActiveUe*sizeof(int16_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->layerSelSolLastTx, m_nActiveUe*sizeof(uint8_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->mcsSelSolLastTx, m_nActiveUe*sizeof(int16_t)));
+        if (m_fullBufferTraffic == 1) {
+            cellGrpUeStatusGpu->bufferSize = nullptr;
+        } else {
+            CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->bufferSize, m_nActiveUe*sizeof(uint32_t)));
+        }
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->lastSchdSlotActUe, m_nActiveUe*sizeof(uint32_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpPrmsGpu->currSlotIdxPerCell, m_nCell*sizeof(uint32_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->newDataActUe, m_nActiveUe*sizeof(int8_t)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->newDataActUe, m_newDataActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&cellGrpUeStatusGpu->tbErrLast, m_nActiveUe*sizeof(int8_t)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->tbErrLast, m_tbErrLast.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->sortedUeList, m_nCell*sizeof(uint16_t*)));
+        CUDA_CHECK_ERR(cudaMemcpyAsync(schdSolGpu->sortedUeList, m_sortedUeListPtrArr.data(), m_nCell*sizeof(uint16_t*), cudaMemcpyDefault, m_strm));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->nSCID, m_nActiveUe*sizeof(uint8_t)));
+        CUDA_CHECK_ERR(cudaMallocManaged((void **)&schdSolGpu->muMimoInd, m_nActiveUe*sizeof(uint8_t)));
     } else {
-        cellGrpUeStatusGpu->riActUe = nullptr;
+        throw std::runtime_error("Invalid useManagedMemFlag value, 0 - GPU memory, 1 - CUDA managed memory");
     }
-    if (m_mcsSelCqi == 1) { 
-        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->cqiActUe, m_nActiveUe*sizeof(int8_t)));
-        CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->cqiActUe, m_cqiActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyHostToDevice, m_strm));
-    } else {
-        cellGrpUeStatusGpu->cqiActUe = nullptr;
-    }
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->avgRatesActUe, m_nActiveUe*sizeof(float)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->avgRatesActUe, m_avgRatesActUe.data(), m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->allocSolLastTx, 2*m_nActiveUe*sizeof(int16_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->layerSelSolLastTx, m_nActiveUe*sizeof(uint8_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->mcsSelSolLastTx, m_nActiveUe*sizeof(int16_t)));
-    if (m_fullBufferTraffic == 1) {
-        cellGrpUeStatusGpu->bufferSize = nullptr;
-    } else {
-        CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->bufferSize, m_nActiveUe*sizeof(uint32_t)));
-    }
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->lastSchdSlotActUe, m_nActiveUe*sizeof(uint32_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpPrmsGpu->currSlotIdxPerCell, m_nCell*sizeof(uint32_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->newDataActUe, m_nActiveUe*sizeof(int8_t)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->newDataActUe, m_newDataActUe.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&cellGrpUeStatusGpu->tbErrLast, m_nActiveUe*sizeof(int8_t)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(cellGrpUeStatusGpu->tbErrLast, m_tbErrLast.data(), m_nActiveUe*sizeof(int8_t), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->sortedUeList, m_nCell*sizeof(uint16_t*)));
-    CUDA_CHECK_ERR(cudaMemcpyAsync(schdSolGpu->sortedUeList, m_sortedUeListPtrArr.data(), m_nCell*sizeof(uint16_t*), cudaMemcpyHostToDevice, m_strm));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->nSCID, m_nActiveUe*sizeof(uint8_t)));
-    CUDA_CHECK_ERR(cudaMalloc((void **)&schdSolGpu->muMimoInd, m_nActiveUe*sizeof(uint8_t)));
 }
 
 void mMimoNetwork::destroyApiStructs()
@@ -810,6 +960,11 @@ void mMimoNetwork::destroyApiStructs()
     CUDA_CHECK_ERR(cudaFree(schdSolGpu->sortedUeList));
     CUDA_CHECK_ERR(cudaFree(schdSolGpu->nSCID));
     CUDA_CHECK_ERR(cudaFree(schdSolGpu->muMimoInd));
+    
+    // Free estH_fr if it was allocated
+    if (cellGrpPrmsGpu->estH_fr != nullptr) {
+        CUDA_CHECK_ERR(cudaFree(cellGrpPrmsGpu->estH_fr));
+    }
 }
 
 // GPU kernel to add channel estimation error to channel data
@@ -944,9 +1099,6 @@ __global__ void genChan64TrKernel(cuComplex**       genChanGpu,
             srsEstChan[cIdx][currChannIdx].y = genChan_imag + channEstErr_imag;
         }
     }
-    //if (threadIdx.x == 0) {
-    //    printf("blockIdx.x = %d, cIdx = %d, prgIdx = %d\n", blockIdx.x, cIdx, prgIdx);
-    //}
 }
 
 void mMimoNetwork::genNetTopology()
@@ -963,16 +1115,20 @@ void mMimoNetwork::genNetTopology()
             Angle += M_PI/3.0;
         }
 
+        // Co-located base stations: up to 3 sectors per hex site at the same (x, y)
         for (int secIdx = 0; secIdx < 3; secIdx++) {
             if (bsIdx < netData->numCell) {
                 netData->bsPos[bsIdx][0] = coorX;
                 netData->bsPos[bsIdx][1] = coorY;
                 netData->bsPos[bsIdx][2] = netData->bsHeight;
+                netData->bsOrien[bsIdx] = netData->sectorOrien[secIdx];
 
                 for (int uIdx = 0; uIdx < m_nActiveUePerCell; uIdx++) {
                     float randomAngle = 2.0*M_PI*uniformRealDist(randomEngine)/3.0 - M_PI/3.0; // centered at 0 degree
-                    randomAngle += netData->sectorOrien[secIdx];
-                    float randomDistance = (netData->cellRadius - netData->minD2Bs)*uniformRealDist(randomEngine) + netData->minD2Bs;
+                    randomAngle += netData->bsOrien[bsIdx];
+
+                    // updated implementation, the UE would have uniform distribution in the area
+                    float randomDistance = (netData->cellRadius - netData->minD2Bs)*sqrtf(uniformRealDist(randomEngine)) + netData->minD2Bs;
 
                     netData->uePos[bsIdx*m_nActiveUePerCell+uIdx][0] = cos(randomAngle)*randomDistance+netData->bsPos[bsIdx][0];
                     netData->uePos[bsIdx*m_nActiveUePerCell+uIdx][1] = sin(randomAngle)*randomDistance+netData->bsPos[bsIdx][1];
@@ -997,8 +1153,9 @@ void mMimoNetwork::genLSFading()
 
     for (int cIdx = 0; cIdx < netData->numCell; cIdx++) { // loop through all cells
         snrDBAssoc[cIdx].resize(m_nActiveUePerCell); 
-        int sectorIdx = cIdx % 3;
-        float sectorOrien = netData->sectorOrien[sectorIdx];
+
+        float sectorOrien = netData->bsOrien[cIdx];
+
         for (int uIdx = 0; uIdx < m_nActiveUe; uIdx++) { // loop through all active UEs
             float distanceBsUe_2D = sqrt(pow(netData->bsPos[cIdx][0] - netData->uePos[uIdx][0], 2.0)+
                                     pow(netData->bsPos[cIdx][1] - netData->uePos[uIdx][1], 2.0));
@@ -1090,7 +1247,7 @@ void mMimoNetwork::setupChannel()
             // Create SLS channel model with the embedded configuration
             m_slsChannelModel = std::make_unique<statisChanModel<float, cuComplex>>(
                 &m_simConfig, &m_sysConfig, &m_linkConfig, &m_extConfig, m_seed, m_strm);
-            
+
             printf("SLS channel model initialized successfully with embedded configuration\n");
         } catch (const std::exception& e) {
             std::cerr << "Error initializing SLS channel model: " << e.what() << std::endl;
@@ -1157,15 +1314,16 @@ void mMimoNetwork::genSlsChannelData(int slotIdx)
         
         // run SLS channel model
         m_slsChannelModel->run(refTime, continuous_fading, activeCells, activeUts, 
-                              {}, {}, {}, {}, {}, {}, m_genChanPtrArr);
+            {}, {}, {}, {}, {}, {}, m_genChanPtrArr);
         
         // dump SLS channel data to H5 file
         if (std::find(m_dumpChanSlots.begin(), m_dumpChanSlots.end(), static_cast<uint32_t>(slotIdx)) != m_dumpChanSlots.end()) {
             m_slsChannelModel->saveSlsChanToH5File("_cuMAC_slot" + std::to_string(slotIdx));
         }
-        
+
         // dump pathloss, shadowing and antenna gain for channel estimation error (aligned with chanGainDB = antGain - PL + SF)
         m_slsChannelModel->dump_pl_sf_ant_gain_stats(netData->chanGainDB.data(), activeCells, fullActiveUts);
+        m_slsChannelModel->dump_pl_sf_stats(netData->chanPlSfDB.data(), activeCells, fullActiveUts);
         CUDA_CHECK_ERR(cudaMemcpyAsync(netData->chanGainDBGpu, netData->chanGainDB.data(), netData->numCell*m_nActiveUe*sizeof(float), cudaMemcpyHostToDevice, m_strm));
 
         // Apply channel estimation error to the generated channel data
@@ -1185,14 +1343,23 @@ void mMimoNetwork::genSlsChannelData(int slotIdx)
             netData->states);
         CUDA_CHECK_ERR(cudaGetLastError()); // Check kernel launch success
         
-        // Update UE mapping once for all cells
-        const size_t totalUeMapElements = netData->numCell * m_nActiveUe;
-        dim3 ueMapBlockSize(256);
-        dim3 ueMapGridSize((totalUeMapElements + ueMapBlockSize.x - 1) / ueMapBlockSize.x);
-        
-        updateUeMapKernel<<<ueMapGridSize, ueMapBlockSize, 0, m_strm>>>(
-            cellGrpPrmsGpu->srsUeMap, netData->numCell, m_nActiveUe);
-        CUDA_CHECK_ERR(cudaGetLastError()); // Check kernel launch success
+        // Update UE mapping once for all cells; skip when there is nothing to map —
+        // a zero grid or block dimension is an invalid CUDA launch configuration
+        if (netData->numCell > 0 && m_nActiveUe > 0) {
+            dim3 ueMapGridSize(netData->numCell);
+            dim3 ueMapBlockSize(std::min((uint16_t)256, m_nActiveUe));
+            CUfunction updateUeMapKernelFunc;
+            CUDA_CHECK_ERR(cudaGetFuncBySymbol(&updateUeMapKernelFunc, reinterpret_cast<void*>(updateUeMapKernel)));
+            int32_t** srsUeMap = cellGrpPrmsGpu->srsUeMap;
+            int numCells = netData->numCell;
+            int nActiveUe = m_nActiveUe;
+            void* kernelArgs[] = {&srsUeMap, &numCells, &nActiveUe};
+
+            CUDA_CHECK_RES(cuLaunchKernel(updateUeMapKernelFunc,
+                                          ueMapGridSize.x, ueMapGridSize.y, ueMapGridSize.z,
+                                          ueMapBlockSize.x, ueMapBlockSize.y, ueMapBlockSize.z,
+                                          0, m_strm, kernelArgs, nullptr));
+        }
         
         // Synchronize to ensure all kernels complete
         CUDA_CHECK_ERR(cudaStreamSynchronize(m_strm));
@@ -1203,16 +1370,522 @@ void mMimoNetwork::genSlsChannelData(int slotIdx)
     }
 }
 
-void mMimoNetwork::phyAbstract(int slotIdx)
+void mMimoNetwork::phyAbstract(const PhyExecTarget gpuInd, const uint16_t slotIdx, const bool saveSlotLog)
 {
+    // generate per-UE random number for tbErr simulation
+    for (int idx = 0; idx < m_nActiveUe; idx++){
+        floatRandomArr[idx] = uniformRealDist(randomEngine);
+    }
 
+    switch (gpuInd) {
+    case PhyExecTarget::GPU:       // not implemented; main.cpp rejects non-CPU at startup
+        updateDataRatePdschGpu(slotIdx, saveSlotLog);
+        break;
+    case PhyExecTarget::CPU:
+        updateDataRatePdschCpu(slotIdx, saveSlotLog);
+        break;
+    case PhyExecTarget::Both:      // not implemented; main.cpp rejects non-CPU at startup
+        updateDataRatePdschGpu(slotIdx, saveSlotLog);
+        updateDataRatePdschCpu(slotIdx, saveSlotLog);
+        break;
+    default:
+        throw std::runtime_error("Error: invalid PhyExecTarget (expected CPU, GPU, or Both)");
+    }
 }
 
-void mMimoNetwork::updateDataRatePdschGpu(int slotIdx)
+void mMimoNetwork::updateDataRatePdschCpu(const uint16_t slotIdx, const bool saveSlotLog)
 {
-    //for (int cIdx = 0; cIdx < m_nCell; cIdx++) {
-    //    CUDA_CHECK_ERR(cudaMemcpy(genChanCpu)
+    if (saveSlotLog && !m_perSlotLogExportEnabled) {
+        throw std::logic_error(
+            "Per-slot logging requested but initSimuRecords() was not called (enable with CLI -l before the simulation loop).");
+    }
 
+    // sanity check on current slot is downlink slot
+    if (m_DL != 1){
+        throw std::logic_error("function updateDataRatePdschCpu only supports downlink processing (m_DL == 1)!");
+    }
+
+    // sanity check on using CUDA managed memory
+    if (m_useManagedMemFlag != 1){
+        throw std::logic_error("function updateDataRatePdschCpu only supports CUDA managed memory (m_useManagedMemFlag == 1)!");
+    }
+
+    // sanity check on using type-1 PRBG allocation
+    if (m_allocType != 1){
+        throw std::logic_error("function updateDataRatePdschCpu only supports type-1 PRBG allocation (m_allocType == 1)");
+    }
+
+    if (m_fadingType == 1 && m_simConfig.run_mode != 1 && m_simConfig.run_mode != 3) {
+        throw std::logic_error(
+            "function updateDataRatePdschCpu only supports SLS run_mode 1 or 3; other run_mode options are not currently supported.");
+    }
+
+    // sanity check due to limitation in the simplified cell association for active UEs based on UE index
+    if (m_fadingType == 1 && m_sysConfig.ut_drop_option != 2) {
+        throw std::runtime_error(
+            "SLS channel mode (fading_type == 1) requires channel_config.system_level.ut_drop_option == 2; "
+            "the fixed contiguous UE-to-cell association assumes UEs are dropped per sector.");
+    }
+
+    if (m_harqEnabled != 0) {
+        throw std::logic_error("function updateDataRatePdschCpu does not currently support HARQ (harqEnabled must be 0).");
+    }
+
+    m_slotDuration = 15.0f / (static_cast<float>(m_scs)); // slot duration in seconds, based on subcarrier spacing
+
+    // initialize buffers common to all UEs
+    std::vector<cuComplex> CMat(m_nUeAnt * m_nUeAnt); // covariance matrix for interference + noise
+    std::vector<cuComplex> CInvMat(m_nUeAnt * m_nUeAnt); // inverse of covariance matrix
+    std::vector<cuComplex> HInterfEffMat(m_nUeAnt * m_nMaxLayerPerGrpDl); // effective interference channel including precoding matrix
+    std::vector<cuComplex> HSigEffCovMat(m_nUeAnt * m_nUeAnt); // covariance matrix of the effective signal channel including precoding matrix
+    std::vector<cuComplex> bCondensedScratch(m_nBsAnt * cumac::maxNumLayerPerGrpDL_); // scratch for matMultiplication_acondensedb_rm (reused per RBG)
+    const int maxLayerSel = static_cast<int>(m_nMaxLayerPerUeMuDl);
+    std::vector<cuComplex> HSigEffMat(m_nUeAnt * maxLayerSel); // effective signal channel including precoding matrix
+    std::vector<cuComplex> DMat(maxLayerSel * m_nUeAnt); // matrix operation buffer
+    std::vector<cuComplex> EMat(maxLayerSel * maxLayerSel); // matrix operation buffer
+    std::vector<cuComplex> EInvMat(maxLayerSel * maxLayerSel); // matrix operation buffer
+        
+    std::vector<int> assocCellIdx(m_nActiveUe, -1);
+    // cell association for each active UE
+    // for each active UE with index uIdx that is scheduled in this TTI and with nonzero RBG allocation, assocCellIdx[uIdx] is the associated cell Idx
+    // for each active UE with index uIdx that is not scheduled in this TTI or is scheduled but with zero RBG allocation, assocCellIdx[uIdx] is set to -1
+
+    std::vector<int> allocSol_rbg2Ue(m_nPrbGrp*m_nCell*m_nMaxUePerGrpDl, -1);
+    // PRBG to cell and UE groups mapping
+    // format: one dimensional array, array size = m_nPrbGrp*m_nCell*m_nMaxUePerGrpDl
+    // denote rbgIdx = 0, 1, ..., m_nPrbGrp-1 as the PRBG index,
+    // denote cIdx = 0, 1, ..., nCell-1 as the coordinated cell index,
+    // denote ueOrderInGrpIdx = 0, 1, ..., m_nMaxUePerGrpDl-1 as the UE order in group index
+    // allocSol_rbg2Ue[rbgIdx*m_nCell*m_nMaxUePerGrpDl + cIdx*m_nMaxUePerGrpDl + ueOrderInGrpIdx] = 0, 1, ... m_nActiveUe-1 indicates that for the rbgIdx-th PRBG, cIdx-th cell, for the ueOrderInGrpIdx-th UE from its UE group, the UE's global UE index is uIdx
+    // allocSol_rbg2Ue[rbgIdx*m_nCell*m_nMaxUePerGrpDl + cIdx*m_nMaxUePerGrpDl + ueOrderInGrpIdx] = -1 indicates that for the rbgIdx-th PRBG, cIdx-th cell, the ueOrderInGrpIdx-th position from the UE group is not assigned to any UE, i.e., the UE group contains at most ueOrderInGrpIdx UEs
+    
+    // determine cell association and PRBG allocation for the scheduled UEs (only active cells)
+    for (uint16_t cIdx = 0; cIdx < m_nCell; cIdx++) {
+        for (int grpUeIdx = 0; grpUeIdx < m_numUeForGrpPerCell; grpUeIdx++){
+            int uIdx = schdSolGpu->setSchdUePerCellTTI[cIdx*m_numUeForGrpPerCell + grpUeIdx];
+
+            // check if all the scheduled UEs from cIdx-th cell have been traversed
+            if (uIdx >= m_nActiveUe){
+                break;
+            } 
+
+            // check if the UE has RBG resource allocation
+            if (schdSolGpu->allocSol[2*uIdx] == -1){
+                continue;
+            }
+            int nrAllocRbg = (schdSolGpu->allocSol[2*uIdx + 1] - schdSolGpu->allocSol[2*uIdx]);
+            if (nrAllocRbg <= 0){
+                continue;
+            }
+
+            // update cell association
+            assocCellIdx[uIdx] = cIdx; 
+
+            // (optional) update simulation log
+            if (saveSlotLog) {
+                perCellperSlotNumScheUEs[cIdx][slotIdx] += 1;
+            }
+
+            // update RBG allocation
+            int ueOrderInGrpIdx = schdSolGpu->ueOrderInGrp[uIdx];
+            for (int rbgIdx = schdSolGpu->allocSol[2*uIdx]; rbgIdx < schdSolGpu->allocSol[2*uIdx + 1]; rbgIdx++){
+                allocSol_rbg2Ue[rbgIdx*m_nCell*m_nMaxUePerGrpDl + cIdx*m_nMaxUePerGrpDl + ueOrderInGrpIdx] = uIdx;
+            }   
+        }
+    }
+
+    // update path loss and shadow fading log
+    if (saveSlotLog) {
+        for (uint16_t uIdx = 0; uIdx < m_nActiveUe; uIdx++){
+            for (int cIdx = 0; cIdx < m_nCell; cIdx++){
+                perUEperCellperSlotAllCellsPathLossAndSF[uIdx][cIdx][slotIdx] = netData->chanPlSfDB[cIdx*m_nActiveUe + uIdx];
+                if (m_cellAssocActUe[cIdx*m_nActiveUe + uIdx] == 1){
+                    perUEperSlotServingCellPathLossAndSF[uIdx][slotIdx] = perUEperCellperSlotAllCellsPathLossAndSF[uIdx][cIdx][slotIdx];
+                }
+            }
+        }
+    }
+
+    // channel gain calculation
+    // for each UE, the calculation is performed over the entire bandwidth
+    if (saveSlotLog) {
+        for (uint16_t uIdx = 0; uIdx < m_nActiveUe; uIdx++){
+            for (int cIdx = 0; cIdx < m_nCell; cIdx++){
+                float perUEperSlotSingleCellChannelGain = 0.0f;
+                uint32_t hMatStart = uIdx*m_nPrbGrp*m_nUeAnt*m_nBsAnt;
+                uint32_t hMatEndplus1 = hMatStart + m_nPrbGrp*m_nUeAnt*m_nBsAnt;
+                for (uint32_t idx = hMatStart; idx < hMatEndplus1; idx++){
+                    cuComplex val = m_genChanPtrArr[cIdx][idx];
+                    perUEperSlotSingleCellChannelGain += val.x * val.x + val.y * val.y;
+                }
+                float perUEperSlotSingleCellChannelGainDb = 10.0f * log10f(perUEperSlotSingleCellChannelGain / (static_cast<float>(m_nUeAnt) * static_cast<float>(m_nBsAnt) * static_cast<float>(m_nPrbGrp)));
+                
+                perUEperCellperSlotAllCellsChannelGain[uIdx][cIdx][slotIdx] = perUEperSlotSingleCellChannelGainDb;
+                if (m_cellAssocActUe[cIdx*m_nActiveUe + uIdx] == 1){
+                    perUEperSlotServingCellChannelGain[uIdx][slotIdx] = perUEperSlotSingleCellChannelGainDb;
+                }
+            }
+        }
+    }
+
+    // update data rate for the scheduled UEs
+    for (int uIdx = 0; uIdx < m_nActiveUe; uIdx++){
+
+        // calculate per-UE per-slot geometry SIR / SNR / SINR and log to per-UE per-slot (invalid entries remain -inf)
+        // equivalent noise power per RBG, accounting for per BS antenna transmit power, and per antenna pair averaging of the channel gain
+        float noisePerRbg = netData->noiseVar * static_cast<float>(m_nUeAnt) * static_cast<float>(m_nBsAnt) * static_cast<float>(m_nBsAnt) / netData->bsTxPowerPerPrg;
+
+        // calculate per-RBG geometry SIR / SNR / SINR and log to per-UE per-RBG per-slot (invalid entries remain -inf)
+        static bool warnedZeroInterfGeoSir = false;
+        for (int rbgIdx = 0; rbgIdx < m_nPrbGrp; rbgIdx++){
+            uint32_t hPhySigMatStart = uIdx*m_nPrbGrp*m_nUeAnt*m_nBsAnt + rbgIdx*m_nUeAnt*m_nBsAnt;
+            uint32_t hPhySigMatEndplus1 = hPhySigMatStart + m_nUeAnt*m_nBsAnt;
+            float pSigPhy = 0.0f;
+            float pIntPhy = 0.0f;
+            bool geoInterfAdded = false;
+            cuComplex val = cuComplex{0.0f, 0.0f};
+            for (uint32_t idx = hPhySigMatStart; idx < hPhySigMatEndplus1; idx++){
+                for (int cIdx = 0; cIdx < m_nCell; cIdx++){
+                    val = m_genChanPtrArr[cIdx][idx];
+                    if (m_cellAssocActUe[cIdx*m_nActiveUe + uIdx] == 1){
+                        pSigPhy += val.x * val.x + val.y * val.y;
+                    } else{
+                        pIntPhy += val.x * val.x + val.y * val.y;
+                        geoInterfAdded = true;
+                    }
+                }
+            }
+
+            float geoSnr = (pSigPhy / noisePerRbg);
+            float geoSinr = (pSigPhy / (pIntPhy + noisePerRbg));
+            if (saveSlotLog) {
+                float geoSirDb;
+                if (!geoInterfAdded || pIntPhy <= 0.0f) {
+                    geoSirDb = m_zeroInterfSirDb;
+                    if (!warnedZeroInterfGeoSir) {
+                        std::cerr << "WARNING: geometry SIR division by zero avoided (no interference power accumulated, "
+                                  << "e.g. single-cell or zero coupling). Using configured zeroInterfSirDb="
+                                  << m_zeroInterfSirDb << " dB instead of +inf. Simulation continues.\n";
+                        warnedZeroInterfGeoSir = true;
+                    }
+                } else {
+                    geoSirDb = 10.0f * log10f(pSigPhy / pIntPhy);
+                }
+                perUEperRbgperSlotGeometrySir[uIdx][rbgIdx][slotIdx] = geoSirDb;
+                perUEperRbgperSlotGeometrySnr[uIdx][rbgIdx][slotIdx] = 10.0f * log10f(geoSnr);
+                perUEperRbgperSlotGeometrySinr[uIdx][rbgIdx][slotIdx] = 10.0f * log10f(geoSinr);
+            }
+        }
+
+
+        // check if the UE is scheduled in the current TTI
+        if (assocCellIdx[uIdx] == -1){
+            m_avgRatesActUe[uIdx] = (1.0f - m_pfAvgRateUpd) * m_avgRatesActUe[uIdx];
+            cellGrpUeStatusGpu->avgRatesActUe[uIdx] = m_avgRatesActUe[uIdx];
+
+            // (optional) update simulation log
+            if (saveSlotLog) {
+                perUEperSlotInsRate[uIdx][slotIdx] = 0.0f;
+                perUEperSlotAvgRate[uIdx][slotIdx] = cellGrpUeStatusGpu->avgRatesActUe[uIdx];
+            }
+
+            continue;
+        }
+
+        int nrAllocRbg = (schdSolGpu->allocSol[2*uIdx+1] - schdSolGpu->allocSol[2*uIdx]);
+
+        // get scheduling result and initialize UE-specific buffers
+        int mcsSel = schdSolGpu->mcsSelSol[uIdx];
+        float eesm_beta = eesm_beta_values[mcsSel];
+        int layerSel = schdSolGpu->layerSelSol[uIdx];
+
+        // initialize buffer for average post Equalization SINR calculation
+        float perRbgPerLayerSinr = 0.0f;
+        double sumSinr = 0.0f;
+
+        // initialize buffer for pre-equalization SINR, SIR, and SINR calculation
+        float perPrbPreEqSigEff = 0.0f;
+        float perPrbPreEqIntEff = 0.0f;
+        float perRbgPreEqSir = 0.0f;
+        float perRbgPreEqSnr = 0.0f;
+        float perRbgPreEqSinr = 0.0f;
+
+        static bool warnedZeroInterfPreEqSir = false;
+        const float zeroInterfSirLinear = std::pow(10.0f, m_zeroInterfSirDb / 10.0f);
+
+        for (int rbgIdx = schdSolGpu->allocSol[2*uIdx]; rbgIdx < schdSolGpu->allocSol[2*uIdx+1]; rbgIdx++){
+            // calculate offset in generated channel
+            uint32_t hMatStart = uIdx*m_nPrbGrp*m_nUeAnt*m_nBsAnt + rbgIdx*m_nUeAnt*m_nBsAnt;
+
+            // calculate noise + interference covariance matrix
+            // re-initialize data buffers to avoid leakage from previous iterations
+            CMat.assign(m_nUeAnt * m_nUeAnt, cuComplex{0.0f, 0.0f});
+            CInvMat.assign(m_nUeAnt * m_nUeAnt, cuComplex{0.0f, 0.0f});
+
+            // add noise to diagonal elements of covariance matrix
+            for (int ueAntIdx = 0; ueAntIdx < m_nUeAnt; ueAntIdx++){
+                CMat[ueAntIdx*m_nUeAnt + ueAntIdx].x = (netData->noiseVar / netData->bsTxPowerPerPrg);
+            }
+
+            // add inter-cell interference to covariance matrix
+            bool preEqInterfAdded = false;
+            for (int cIdx = 0; cIdx < m_nCell; cIdx++){
+                // skip serving cell
+                if (cIdx == assocCellIdx[uIdx]){
+                    continue;
+                }
+
+                // skip if neighboring cell does not have PRBG allocation on rbgIdx-th RBG
+                if (allocSol_rbg2Ue[rbgIdx*m_nCell*m_nMaxUePerGrpDl + cIdx*m_nMaxUePerGrpDl] == -1){
+                    continue;
+                }
+
+                // re-initialize HInterfEffMat to all zeros to avoid leakage from previous iterations
+                HInterfEffMat.assign(m_nUeAnt * cumac::maxNumLayerPerGrpDL_, cuComplex{0.0f, 0.0f});
+
+                // compute the effective inter-cell interference channel from cIdx
+                uint32_t hInterfMatStart = hMatStart;
+                uint32_t prdMatStart = cIdx*m_nPrbGrp*m_nBsAnt*cumac::maxNumLayerPerGrpDL_ + rbgIdx*m_nBsAnt*cumac::maxNumLayerPerGrpDL_;
+                matAlg->matMultiplication_ab_rm(&m_genChanPtrArr[cIdx][hInterfMatStart], m_nUeAnt, m_nBsAnt, &cellGrpPrmsGpu->prdMat[prdMatStart], cumac::maxNumLayerPerGrpDL_, HInterfEffMat.data());
+
+                // add Heff * Heff^H to covariance matrix
+                matAlg->matMultiplication_aaHplusb_rm(HInterfEffMat.data(), m_nUeAnt, cumac::maxNumLayerPerGrpDL_, CMat.data());
+                preEqInterfAdded = true;
+            }
+
+            // add intra-cell interference to covariance matrix
+            int layerAccum = 0; // buffer to accumulate total number of layers from previously traversed UEs from the same UE group
+            int layerCurr = 0; // buffer to store the number of layers from the current traversed UE
+            int layerStTargetUe = 0; // buffer to store the starting layer index of the target UE with index uIdx
+            
+            for (int ueOrderInGrpIdx = 0; ueOrderInGrpIdx < m_nMaxUePerGrpDl; ueOrderInGrpIdx++){
+                int uInterfIdx = allocSol_rbg2Ue[rbgIdx*m_nCell*m_nMaxUePerGrpDl + assocCellIdx[uIdx]*m_nMaxUePerGrpDl + ueOrderInGrpIdx];
+
+                // break when all UEs from the same group have been traversed
+                if (uInterfIdx == -1){
+                    break;
+                }
+
+                // accumulate total number of layers from all previously traversed UEs within the same UE group as the starting layer for the current UE
+                layerAccum += layerCurr;
+
+                // update layerCurr from the current UE
+                layerCurr = schdSolGpu->layerSelSol[uInterfIdx];
+                
+                // skip self 
+                if (uInterfIdx == uIdx){
+                    // record staring layer index for the target UE
+                    layerStTargetUe = layerAccum;
+                    continue;
+                }
+
+                // re-initialize HInterfEffMat to all zeros to avoid leakage from previous iterations
+                HInterfEffMat.assign(m_nUeAnt * cumac::maxNumLayerPerGrpDL_, cuComplex{0.0f, 0.0f});
+
+                // compute the effective intra-cell interference channel from cIdx
+                uint32_t hInterfMatStart = hMatStart; // for intra-cell interference, always use the intended UE's physical channel
+                uint32_t prdMatStart = assocCellIdx[uIdx]*m_nPrbGrp*m_nBsAnt*cumac::maxNumLayerPerGrpDL_ + rbgIdx*m_nBsAnt*cumac::maxNumLayerPerGrpDL_;
+
+                matAlg->matMultiplication_acondensedb_rm(&m_genChanPtrArr[assocCellIdx[uIdx]][hInterfMatStart], m_nUeAnt, m_nBsAnt, &cellGrpPrmsGpu->prdMat[prdMatStart], cumac::maxNumLayerPerGrpDL_, layerAccum, layerCurr, bCondensedScratch.data(), HInterfEffMat.data());
+
+                // add Heff * Heff^H to covariance matrix
+                matAlg->matMultiplication_aaHplusb_rm(HInterfEffMat.data(), m_nUeAnt, layerCurr, CMat.data());
+                preEqInterfAdded = true;
+            }
+
+            // calculate inverse of covariance matrix
+            matAlg->matInverseEigen_rm(CMat.data(), m_nUeAnt, CInvMat.data());
+
+            // re-initialize data buffers to all zeros to avoid leakage from previous iterations
+            HSigEffMat.assign(m_nUeAnt * maxLayerSel, cuComplex{0.0f, 0.0f});
+            DMat.assign(maxLayerSel * m_nUeAnt, cuComplex{0.0f, 0.0f});
+            EMat.assign(maxLayerSel * maxLayerSel, cuComplex{0.0f, 0.0f});
+            EInvMat.assign(maxLayerSel * maxLayerSel, cuComplex{0.0f, 0.0f});
+
+            // calculate effective signal channel
+            uint32_t hSigMatStart = hMatStart;
+            uint32_t prdMatStart = assocCellIdx[uIdx]*m_nPrbGrp*m_nBsAnt*cumac::maxNumLayerPerGrpDL_ + rbgIdx*m_nBsAnt*cumac::maxNumLayerPerGrpDL_;
+
+            matAlg->matMultiplication_acondensedb_rm(&m_genChanPtrArr[assocCellIdx[uIdx]][hSigMatStart], m_nUeAnt, m_nBsAnt, &cellGrpPrmsGpu->prdMat[prdMatStart], cumac::maxNumLayerPerGrpDL_, layerStTargetUe, layerSel, bCondensedScratch.data(), HSigEffMat.data());
+
+            // compute per-layer (post-Eq) SINR
+            matAlg->matMultiplication_aHb_rm(HSigEffMat.data(), m_nUeAnt, layerSel, CInvMat.data(), m_nUeAnt, DMat.data());
+            matAlg->matMultiplication_ab_rm(DMat.data(), layerSel, m_nUeAnt, HSigEffMat.data(), layerSel, EMat.data());
+            for (int layerIdx = 0; layerIdx < layerSel; layerIdx++){
+                EMat[layerIdx*layerSel+layerIdx].x += 1.0f;
+            }
+            matAlg->matInverseEigen_rm(EMat.data(), layerSel, EInvMat.data());
+            for (int layerIdx = 0; layerIdx < layerSel; layerIdx ++){
+                perRbgPerLayerSinr = (1.0f / EInvMat[layerIdx*layerSel+layerIdx].x) - 1.0f;
+                if (saveSlotLog) {
+                    const float perRbgPerLayerSinrDb = 10.0f * log10f(perRbgPerLayerSinr);
+                    perUEperRbgperLayerperSlotRawSinr[uIdx][rbgIdx][layerIdx][slotIdx] = perRbgPerLayerSinrDb;
+                }
+                sumSinr += std::exp(- static_cast<double>(perRbgPerLayerSinr) / static_cast<double>(eesm_beta));
+            }
+
+            // compute pre-Eq statistics
+            HSigEffCovMat.assign(m_nUeAnt * m_nUeAnt, cuComplex{0.0f, 0.0f});
+            matAlg->matMultiplication_aaH_rm(HSigEffMat.data(), m_nUeAnt, layerSel, HSigEffCovMat.data());
+            perPrbPreEqSigEff = 0.0f;
+            perPrbPreEqIntEff = 0.0f;
+            for (int ueAntIdx = 0; ueAntIdx < m_nUeAnt; ueAntIdx++){
+                // calculate per-PRBG signal power
+                perPrbPreEqSigEff += HSigEffCovMat[ueAntIdx*m_nUeAnt + ueAntIdx].x;
+
+                // remove noise component from the covariance matrix, and calculate per-PRBG interference power
+                perPrbPreEqIntEff += (CMat[ueAntIdx*m_nUeAnt + ueAntIdx].x - (netData->noiseVar / netData->bsTxPowerPerPrg));
+            }
+            float perRbgPreEqSirDb;
+            if (!preEqInterfAdded || perPrbPreEqIntEff <= 0.0f) {
+                perRbgPreEqSir = zeroInterfSirLinear;
+                perRbgPreEqSirDb = m_zeroInterfSirDb;
+                if (!warnedZeroInterfPreEqSir) {
+                    std::cerr << "WARNING: pre-EQ SIR division by zero avoided (no interference added to covariance matrix, "
+                              << "e.g. no scheduled inter-cell/intra-cell interferers on an RBG). Using configured zeroInterfSirDb="
+                              << m_zeroInterfSirDb << " dB instead of +inf. Simulation continues.\n";
+                    warnedZeroInterfPreEqSir = true;
+                }
+            } else {
+                perRbgPreEqSir = perPrbPreEqSigEff / perPrbPreEqIntEff;
+                perRbgPreEqSirDb = 10.0f * log10f(perRbgPreEqSir);
+            }
+            perRbgPreEqSnr = perPrbPreEqSigEff / (m_nUeAnt*netData->noiseVar/netData->bsTxPowerPerPrg);
+            perRbgPreEqSinr = perPrbPreEqSigEff / (perPrbPreEqIntEff + (m_nUeAnt*netData->noiseVar/netData->bsTxPowerPerPrg));
+
+            float perRbgPreEqSnrDb = 10.0f * log10f(perRbgPreEqSnr);
+            float perRbgPreEqSinrDb = 10.0f * log10f(perRbgPreEqSinr);
+
+            if (saveSlotLog){
+                // update per PRG statistics
+                perUEperRbgperSlotRawPreEqSir[uIdx][rbgIdx][slotIdx] = perRbgPreEqSirDb;
+                perUEperRbgperSlotRawPreEqSnr[uIdx][rbgIdx][slotIdx] = perRbgPreEqSnrDb;
+                perUEperRbgperSlotRawPreEqSinr[uIdx][rbgIdx][slotIdx] = perRbgPreEqSinrDb;
+                perCellperGrpperSlotNumScheLayers[assocCellIdx[uIdx]][rbgIdx][slotIdx] += layerSel;
+            }
+        }
+
+        // EESM based average (post-Eq) SINR calculation
+        double avgRawSinr = -static_cast<double>(eesm_beta) * std::log(sumSinr / (nrAllocRbg * layerSel));
+        float avgRawSinrDB = static_cast<float>(10.0 * std::log10(avgRawSinr));
+        avgRawSinrDB = std::min(m_maxCombinedPostEqSinrdB, std::max(avgRawSinrDB, -m_maxCombinedPostEqSinrdB)); // upper and lower bound the avgRawSinrDB to within the precision limit of double in C++
+
+        float avgSinrDB = std::max(avgRawSinrDB, m_minSinrDb);
+        float avgSinr = std::pow(10.0f, avgSinrDB / 10.0f);
+
+        // convert average SINR and MCS to BLER
+        float blerCurr = calcBler(avgSinrDB, mcsSel);
+
+        // compare random number of BLER to get CRC result
+        float rndNum = floatRandomArr[uIdx];
+        int tbErr = (rndNum < blerCurr) ? 1 : 0; 
+
+        // update tbErrLast based on newDataActUe (indication on re-transmission / new transmission status of the current transmission) and CRC result
+        if ((m_harqEnabled == 1) && (cellGrpUeStatusGpu->newDataActUe[uIdx] == 0)){
+            m_tbErrLast[uIdx] = -1;
+        } else{
+            m_tbErrLast[uIdx] = tbErr;
+        }
+        cellGrpUeStatusGpu->tbErrLast[uIdx] = m_tbErrLast[uIdx];
+
+        // update newDataActUe for the next transmission
+        if (m_harqEnabled == 1) {
+            m_newDataActUe[uIdx] = 1 - tbErr;
+            cellGrpUeStatusGpu->newDataActUe[uIdx] = m_newDataActUe[uIdx];
+        }
+
+        // update wbSinr
+        cellGrpPrmsGpu->wbSinr[uIdx * m_nUeAnt] = avgSinr;
+        m_wbSinr[uIdx * m_nUeAnt] = avgSinr;
+
+        // update avgRatesActUe
+        int nrAllocPrb = nrAllocRbg*m_nPrbPerGrp;
+        uint32_t TBS = determineTbsPxsch(nrAllocPrb, m_pdschNrOfDataSymb, layerSel, cumac::mcsTable_codeRate[mcsSel]/1024.0f, cumac::mcsTable_qamOrder[mcsSel]);
+        float insRate = 0.0f;
+        if (m_fullBufferTraffic){
+            insRate = static_cast<float>(TBS) * (1.0f-static_cast<float>(tbErr)) / m_slotDuration;
+        } else {
+            uint32_t TBS_bytes = TBS / 8;
+            uint32_t sched_bytes = std::min(TBS_bytes, cellGrpUeStatusGpu->bufferSize[uIdx]);
+            cellGrpUeStatusGpu->bufferSize[uIdx] -= sched_bytes;
+            insRate = static_cast<float>(sched_bytes * 8) * (1.0f-static_cast<float>(tbErr)) / m_slotDuration;
+        }  
+        m_avgRatesActUe[uIdx] = (1.0f-m_pfAvgRateUpd) * m_avgRatesActUe[uIdx] + m_pfAvgRateUpd * insRate;
+        cellGrpUeStatusGpu->avgRatesActUe[uIdx] = m_avgRatesActUe[uIdx];
+
+        // (optional) update simulation log
+        if (saveSlotLog) {
+            // update per-UE per-slot info
+            perUEperSlotMcs[uIdx][slotIdx] = mcsSel;
+            perUEperSlotLayerSel[uIdx][slotIdx] = layerSel;
+            perUEperSlotAvgSinr[uIdx][slotIdx] = avgRawSinrDB;
+            perUEperSlotBler[uIdx][slotIdx] = blerCurr;
+            perUEperSlotTbErr[uIdx][slotIdx] = tbErr;
+            perUEperSlotInsRate[uIdx][slotIdx] = insRate;
+            perUEperSlotAvgRate[uIdx][slotIdx] = cellGrpUeStatusGpu->avgRatesActUe[uIdx];
+
+            // accumulate per-cell per-slot info
+            perCellperSlotTbErr[assocCellIdx[uIdx]][slotIdx] += static_cast<float>(tbErr);
+            perCellperSlotInsRate[assocCellIdx[uIdx]][slotIdx] += insRate;
+        }
+    }
+
+    // (optional) update per-cell simulation log
+    if (saveSlotLog) {
+        for (int cIdx = 0; cIdx < m_nCell; cIdx++){
+            if (perCellperSlotNumScheUEs[cIdx][slotIdx] > 0){
+                perCellperSlotTbErr[cIdx][slotIdx] = perCellperSlotTbErr[cIdx][slotIdx] / static_cast<float>(perCellperSlotNumScheUEs[cIdx][slotIdx]);
+                perCellperSlotInsRate[cIdx][slotIdx] = perCellperSlotInsRate[cIdx][slotIdx];
+            } else {
+                perCellperSlotTbErr[cIdx][slotIdx] = -1.0f;
+                perCellperSlotInsRate[cIdx][slotIdx] = 0.0f;
+            }
+
+        }
+    }
+}
+
+void mMimoNetwork::updateDataRatePdschGpu(const uint16_t slotIdx, const bool saveSlotLog)
+{
+    throw std::runtime_error("updateDataRatePdschGpu() is not implemented yet.\nPlease use CPU-based PHY abstraction (gpuInd=0) instead.");
+}
+
+void mMimoNetwork::initSimuRecords(int totSimuSlots)
+{
+    if (totSimuSlots <= 0 || totSimuSlots > static_cast<int>(kMaxTotSimuSlotsPerSlotLog)) {
+        throw std::invalid_argument(
+            "initSimuRecords: totSimuSlots must be in (0, " +
+            std::to_string(kMaxTotSimuSlotsPerSlotLog) +
+            "]; per-slot buffers scale with slot count and are only for HDF5 export (-l).");
+    }
+
+    m_perSlotLogExportEnabled = true;
+
+    // Initialize per-UE simulation record logs
+    perUEperSlotMcs.resize(m_nActiveUe, std::vector<int>(totSimuSlots, -1));
+    perUEperSlotLayerSel.resize(m_nActiveUe, std::vector<int>(totSimuSlots, -1));
+    perUEperSlotAvgSinr.resize(m_nActiveUe, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity()));
+    perUEperRbgperLayerperSlotRawSinr.resize(m_nActiveUe, std::vector<std::vector<std::vector<float>>>(m_nPrbGrp, std::vector<std::vector<float>>(m_nMaxLayerPerUeMuDl, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity()))));
+    perUEperSlotServingCellPathLossAndSF.resize(m_nActiveUe, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity()));
+    perUEperCellperSlotAllCellsPathLossAndSF.resize(m_nActiveUe, std::vector<std::vector<float>>(m_nCell, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity())));
+    perUEperSlotServingCellChannelGain.resize(m_nActiveUe, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity()));
+    perUEperCellperSlotAllCellsChannelGain.resize(m_nActiveUe, std::vector<std::vector<float>>(m_nCell, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity())));
+    perUEperRbgperSlotGeometrySir.resize(m_nActiveUe, std::vector<std::vector<float>>(m_nPrbGrp, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity())));
+    perUEperRbgperSlotGeometrySnr.resize(m_nActiveUe, std::vector<std::vector<float>>(m_nPrbGrp, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity())));
+    perUEperRbgperSlotGeometrySinr.resize(m_nActiveUe, std::vector<std::vector<float>>(m_nPrbGrp, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity())));
+    perUEperRbgperSlotRawPreEqSir.resize(m_nActiveUe,std::vector<std::vector<float>>(m_nPrbGrp,std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity())));
+    perUEperRbgperSlotRawPreEqSnr.resize(m_nActiveUe,std::vector<std::vector<float>>(m_nPrbGrp,std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity())));
+    perUEperRbgperSlotRawPreEqSinr.resize(m_nActiveUe,std::vector<std::vector<float>>(m_nPrbGrp,std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity())));
+    perUEperSlotBler.resize(m_nActiveUe, std::vector<float>(totSimuSlots, -std::numeric_limits<float>::infinity()));
+    perUEperSlotTbErr.resize(m_nActiveUe, std::vector<int>(totSimuSlots, -1));
+    perUEperSlotInsRate.resize(m_nActiveUe, std::vector<float>(totSimuSlots, 0.0f));
+    perUEperSlotAvgRate.resize(m_nActiveUe, std::vector<float>(totSimuSlots, -1.0f));
+    
+    // Initialize per-cell simulation record logs
+    perCellperSlotNumScheUEs.resize(m_nCell, std::vector<int>(totSimuSlots, 0));
+    perCellperSlotTbErr.resize(m_nCell, std::vector<float>(totSimuSlots, 0.0f));
+    perCellperSlotInsRate.resize(m_nCell, std::vector<float>(totSimuSlots, 0.0f));
+    perCellperGrpperSlotNumScheLayers.resize(m_nCell,std::vector<std::vector<int>>(m_nPrbGrp,std::vector<int>(totSimuSlots, 0)));
 }
 
 void mMimoNetwork::copySolutionToCpu()
@@ -1227,15 +1900,15 @@ void mMimoNetwork::copySolutionToCpu()
 
 void mMimoNetwork::copyGenChanToCpu()
 {
-    for (int cIdx = 0; cIdx < m_nCell; cIdx++) {
-        
-    }
-
+    throw std::runtime_error("copyGenChanToCpu() is not implemented yet.");
 }
 
 void mMimoNetwork::validateSchedSol()
 {
-    copySolutionToCpu();    
+    // only copy memory from GPU to CPU with explicit CPU and GPU memory allocation
+    if (m_useManagedMemFlag == 0) {
+        copySolutionToCpu();   
+    } 
 
     for (int cIdx = 0; cIdx < m_nCell; cIdx++) {
         std::vector<std::vector<uint16_t>> schdUegs;
@@ -1246,13 +1919,29 @@ void mMimoNetwork::validateSchedSol()
         std::vector<std::vector<uint8_t>> uegNscid;
 
         for (int uIdx = 0; uIdx < m_numUeForGrpPerCell; uIdx++) {
-            uint16_t schdUeIdx = m_setSchdUePerCellTTICpu[cIdx*m_numUeForGrpPerCell + uIdx];
+            // initiate schdUeIdx from CPU memory or CUDA managed memory
+            uint16_t schdUeIdx = (m_useManagedMemFlag == 0) ? m_setSchdUePerCellTTICpu[cIdx*m_numUeForGrpPerCell + uIdx] : schdSolGpu->setSchdUePerCellTTI[cIdx*m_numUeForGrpPerCell + uIdx];
+
             if (schdUeIdx != 0xFFFF) {
-                int16_t startPrg = m_allocSolCpu[2*schdUeIdx];
-                int16_t endPrg = m_allocSolCpu[2*schdUeIdx + 1] - 1;
-                int16_t mcsSel = m_mcsSelSolCpu[schdUeIdx];
-                uint8_t layerSel = m_layerSelSolCpu[schdUeIdx];
-                uint8_t nscid = m_nSCIDCpu[schdUeIdx];
+                int16_t startPrg = (m_useManagedMemFlag == 0) ? 
+                    m_allocSolCpu[2*schdUeIdx] : 
+                    schdSolGpu->allocSol[2*schdUeIdx];
+                    
+                int16_t endPrg = (m_useManagedMemFlag == 0) ? 
+                    m_allocSolCpu[2*schdUeIdx + 1] - 1 : 
+                    schdSolGpu->allocSol[2*schdUeIdx + 1] - 1;
+                    
+                int16_t mcsSel = (m_useManagedMemFlag == 0) ? 
+                    m_mcsSelSolCpu[schdUeIdx] : 
+                    schdSolGpu->mcsSelSol[schdUeIdx];
+                    
+                uint8_t layerSel = (m_useManagedMemFlag == 0) ? 
+                    m_layerSelSolCpu[schdUeIdx] : 
+                    schdSolGpu->layerSelSol[schdUeIdx];
+                    
+                uint8_t nscid = (m_useManagedMemFlag == 0) ? 
+                    m_nSCIDCpu[schdUeIdx] : 
+                    schdSolGpu->nSCID[schdUeIdx];
                 
                 bool found = false;
                 for (int i = 0; i < schdUegs.size(); i++) {
@@ -1275,9 +1964,9 @@ void mMimoNetwork::validateSchedSol()
             }
         }
 
-        printf("Cell #%d: %d UE groups scheduled\n", cIdx, schdUegs.size());
+        printf("Cell #%d: %zu UE groups scheduled\n", cIdx, schdUegs.size());
         for (int i = 0; i < schdUegs.size(); i++) {
-            printf("    UE group #%d: %d UEs, startPrg = %d, endPrg = %d, total number of layers = %d\n", i, schdUegs[i].size(), uegAllocPrg[i][0], uegAllocPrg[i][1], std::accumulate(uegLayerSel[i].begin(), uegLayerSel[i].end(), 0));
+            printf("    UE group #%d: %zu UEs, startPrg = %d, endPrg = %d, total number of layers = %d\n", i, schdUegs[i].size(), uegAllocPrg[i][0], uegAllocPrg[i][1], std::accumulate(uegLayerSel[i].begin(), uegLayerSel[i].end(), 0));
             printf("        UE IDs: ");
             for (int j = 0; j < schdUegs[i].size(); j++) {
                 printf("%d ", schdUegs[i][j]);
@@ -1321,4 +2010,283 @@ bool mMimoNetwork::isYamlFile(const std::string& path) {
 
 bool mMimoNetwork::isHdf5File(const std::string& path) {
     return hasExtension(path, ".h5") || hasExtension(path, ".hdf5");
+}
+
+void mMimoNetwork::loadBlerTable(const std::string& blerLutPath)
+{
+    std::ifstream file(blerLutPath);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open BLER lookup table file: " + blerLutPath);
+    }
+    
+    // Initialize 3D structure for 28 MCS values
+    m_blerTable.clear();
+    m_blerTable.resize(28);
+    
+    std::string line;
+    bool firstLine = true;
+    
+    while (std::getline(file, line)) {
+        // Skip header line
+        if (firstLine) {
+            firstLine = false;
+            if (line.find("MCS") != std::string::npos) {
+                continue;
+            }
+        }
+        
+        if (line.empty()) {
+            continue;
+        }
+        
+        // Parse CSV line with quoted comma-separated values
+        // Format: MCS,"simSNR_list","BLER_list",SNR_0p1BLER
+        
+        std::vector<std::string> fields;
+        std::string field;
+        bool inQuotes = false;
+        
+        for (size_t i = 0; i < line.length(); i++) {
+            char c = line[i];
+            
+            if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (c == ',' && !inQuotes) {
+                fields.push_back(field);
+                field.clear();
+            } else {
+                field += c;
+            }
+        }
+        fields.push_back(field); // Add last field
+        
+        if (fields.size() < 4) {
+            std::cerr << "Warning: Skipping malformed line: " << line << std::endl;
+            continue;
+        }
+        
+        try {
+            // Parse MCS
+            int mcs = std::stoi(fields[0]);
+            
+            if (mcs < 0 || mcs >= 28) {
+                std::cerr << "Warning: Invalid MCS value: " << mcs << std::endl;
+                continue;
+            }
+            
+            // Parse simSNR values (comma-separated in quotes)
+            std::vector<float> simSnrValues;
+            std::istringstream snrStream(fields[1]);
+            std::string snrToken;
+            while (std::getline(snrStream, snrToken, ',')) {
+                // Trim whitespace
+                snrToken.erase(0, snrToken.find_first_not_of(" \t"));
+                snrToken.erase(snrToken.find_last_not_of(" \t") + 1);
+                if (!snrToken.empty()) {
+                    simSnrValues.push_back(std::stof(snrToken));
+                }
+            }
+            
+            // Parse BLER values (comma-separated in quotes)
+            std::vector<float> blerValues;
+            std::istringstream blerStream(fields[2]);
+            std::string blerToken;
+            while (std::getline(blerStream, blerToken, ',')) {
+                // Trim whitespace
+                blerToken.erase(0, blerToken.find_first_not_of(" \t"));
+                blerToken.erase(blerToken.find_last_not_of(" \t") + 1);
+                if (!blerToken.empty()) {
+                    blerValues.push_back(std::stof(blerToken));
+                }
+            }
+            
+            // Parse SNR_0p1BLER
+            float snr_0p1bler = std::stof(fields[3]);
+            
+            // Validate that simSNR and BLER have same length
+            if (simSnrValues.size() != blerValues.size()) {
+                std::cerr << "Warning: MCS " << mcs << " has mismatched simSNR and BLER array sizes" << std::endl;
+                continue;
+            }
+            
+            // Populate m_blerTable[mcs]
+            // Each entry is [simSNR, BLER, SNR_0p1BLER]
+            m_blerTable[mcs].resize(simSnrValues.size());
+            for (size_t i = 0; i < simSnrValues.size(); i++) {
+                m_blerTable[mcs][i] = {simSnrValues[i], blerValues[i], snr_0p1bler};
+            }
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Error parsing line: " << e.what() << std::endl;
+            continue;
+        }
+    }
+    
+    file.close();
+    
+    // Validate that all MCS values have data
+    bool allLoaded = true;
+    for (int mcs = 0; mcs < 28; mcs++) {
+        if (m_blerTable[mcs].empty()) {
+            std::cerr << "Warning: No BLER data for MCS " << mcs << std::endl;
+            allLoaded = false;
+        }
+    }
+    
+    if (allLoaded) {
+        printf("Successfully loaded BLER lookup table from %s\n", blerLutPath.c_str());
+        printf("  Data points per MCS: ");
+        for (int mcs = 0; mcs < 28; mcs++) {
+            printf("%zu ", m_blerTable[mcs].size());
+            if (mcs == 13) printf("\n                           ");
+        }
+        printf("\n");
+    } else {
+        throw std::runtime_error("Failed to load complete BLER table - missing data for some MCS values");
+    }
+}
+
+float mMimoNetwork::calcBler(const float avgSinrDB, const int MCS)
+{
+    // Validate MCS range
+    if (MCS < 0 || MCS > 27) {
+        throw std::runtime_error("Invalid MCS value encountered in calcBler: " + std::to_string(MCS) + " is outside the range of 0 - 27.");
+    }
+    
+    // Check if BLER table is loaded for this MCS
+    if (m_blerTable[MCS].empty()) {
+        throw std::runtime_error("Empty BLER table for MCS: " + std::to_string(MCS));
+    }
+    
+    const auto& blerData = m_blerTable[MCS];
+    const int numDataPoints = static_cast<int>(blerData.size());
+    
+    // Check boundary conditions
+    // If avgSinrDB is smaller than or equal to the smallest reference SINR, return BLER = 1.0
+    if (avgSinrDB <= blerData[0][0]) {
+        return 1.0f;
+    }
+    
+    // If avgSinrDB is larger than the largest reference SINR, return BLER = 0.0
+    if (avgSinrDB > blerData[numDataPoints - 1][0]) {
+        return 0.0f;
+    }
+    
+    // Find the index where blerData[idx][0] < avgSinrDB <= blerData[idx+1][0]
+    int idx = 0;
+    for (int i = 0; i < numDataPoints - 1; i++) {
+        if (avgSinrDB > blerData[i][0] && avgSinrDB <= blerData[i + 1][0]) {
+            idx = i;
+            break;
+        }
+    }
+    
+    // Calculate linear interpolation factor
+    float linIntFactor = (avgSinrDB - blerData[idx][0]) / (blerData[idx + 1][0] - blerData[idx][0]);
+    
+    // Calculate interpolated BLER value
+    float blerInterp = blerData[idx][1] + linIntFactor * (blerData[idx + 1][1] - blerData[idx][1]);
+    
+    return blerInterp;
+}
+
+float mMimoNetwork::calcSinrMinDb(const float targetMaxBlerMcs0)
+{
+    // Validate input: targetMaxBlerMcs0 must be between 0.0 and 1.0
+    if (targetMaxBlerMcs0 < 0.0f || targetMaxBlerMcs0 > 1.0f) {
+        throw std::runtime_error("Invalid targetMaxBlerMcs0 value: " + std::to_string(targetMaxBlerMcs0) + 
+                                 ". Must be between 0.0 and 1.0.");
+    }
+    
+    // Get BLER table for MCS 0
+    const int MCS = 0;
+    
+    // Check if BLER table is loaded for MCS 0
+    if (m_blerTable[MCS].empty()) {
+        throw std::runtime_error("Empty BLER table for MCS 0");
+    }
+    
+    const auto& blerData = m_blerTable[MCS];
+    const int numDataPoints = static_cast<int>(blerData.size());
+    
+    // Check boundary conditions
+    // If targetMaxBlerMcs0 is greater than or equal to the maximum BLER (at lowest SINR),
+    // return the lowest tabulated SINR (dB)
+    if (targetMaxBlerMcs0 >= blerData[0][1]) {
+        return blerData[0][0];
+    }
+    
+    // If targetMaxBlerMcs0 is smaller than or equal to the minimum BLER (at highest SINR),
+    // return the highest tabulated SINR (dB)
+    if (targetMaxBlerMcs0 <= blerData[numDataPoints - 1][1]) {
+        return blerData[numDataPoints - 1][0];
+    }
+    
+    // Find the index where blerData[idx+1][1] < targetMaxBlerMcs0 <= blerData[idx][1]
+    // Note: BLER values are in descending order (high BLER at low SINR, low BLER at high SINR)
+    int idx = 0;
+    for (int i = 0; i < numDataPoints - 1; i++) {
+        if (targetMaxBlerMcs0 <= blerData[i][1] && targetMaxBlerMcs0 > blerData[i + 1][1]) {
+            idx = i;
+            break;
+        }
+    }
+    
+    // Perform linear interpolation to find SINR in dB corresponding to targetMaxBlerMcs0
+    // BLER = blerData[idx][1] + linIntFactor * (blerData[idx+1][1] - blerData[idx][1])
+    // Solving for linIntFactor when BLER = targetMaxBlerMcs0:
+    float linIntFactor = (targetMaxBlerMcs0 - blerData[idx][1]) / (blerData[idx + 1][1] - blerData[idx][1]);
+    
+    return blerData[idx][0] + linIntFactor * (blerData[idx + 1][0] - blerData[idx][0]);
+}
+
+uint32_t mMimoNetwork::determineTbsPxsch(int rbSize, int nDataSymb, int nrOfLayers, float codeRate, int qam)
+{
+    /////////////////////////////////////////////////////////////////////////////
+    //
+    // DEVELOPMENT NOTE: legacy implementation from network.cu
+    //
+    /////////////////////////////////////////////////////////////////////////////
+
+    uint32_t TBS = 0;
+    // current assumption is that resource allocation is type-1
+    float Ninfo = static_cast<float>(rbSize*12*nDataSymb*nrOfLayers*codeRate*qam);
+
+    if (Ninfo <= 0.0f || !std::isfinite(Ninfo)) {
+        return 0;
+    }
+
+    if (Ninfo <= 3824.0) { // for small size
+        int temp = floor(log2(Ninfo)) - 6;
+        int n = temp > 3 ? temp : 3;
+        temp = static_cast<int>(pow(2.0, static_cast<float>(n)) * floor(Ninfo / pow(2.0, static_cast<float>(n))));
+        int Ninfo_prime = temp > 24 ? temp : 24;
+
+         
+        for (int tbsTbIdx = 0; tbsTbIdx < cumac::TBS_table_size; tbsTbIdx++) {
+            if (cumac::TBS_table[tbsTbIdx] >= Ninfo_prime) {
+                TBS = cumac::TBS_table[tbsTbIdx];
+                break;
+            }
+        }
+    } else { // for large size
+        int n = floor(log2(Ninfo-24.0)) - 5;
+        int temp = static_cast<int>(pow(2.0, static_cast<float>(n))*round((Ninfo-24.0)/pow(2.0, static_cast<float>(n))));
+        float Ninfo_prime = static_cast<float>(temp > 3840 ? temp : 3840);
+
+        if (codeRate < 0.25) {
+            int C = ceil( (Ninfo + 24.0) / 3816.0);
+            TBS = 8*C*ceil( (Ninfo_prime + 24.0) / (8.0*C) ) - 24;
+        } else {
+            if (Ninfo_prime > 8424.0) {
+                int C = ceil( (Ninfo_prime + 24.0) / 8424.0);
+                TBS = 8*C*ceil( (Ninfo_prime + 24.0) / (8.0*C) ) - 24;
+            } else {
+                int C = 1;
+                TBS = 8*C*ceil( (Ninfo_prime + 24.0) / (8.0*C) ) - 24;
+            }
+        }
+    }
+
+    return TBS;
 }

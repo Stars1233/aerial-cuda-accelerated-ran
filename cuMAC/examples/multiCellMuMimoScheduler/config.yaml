@@ -19,8 +19,8 @@
 seed: 0
 fullBufferTraffic: 1
 DL: 1
-harqEnabled: 1
-nCell: 6
+harqEnabled: 0
+nCell: 3
 activeCellIds: [] # list of active cell IDs for SLS generation, e.g. [0, 4, 8]; [] means all cells [0..nCell-1]. If given, its length must be equal to nCell
 ueGrpMode: 0
 semiStatFreqAlloc: 0
@@ -53,15 +53,23 @@ allocType: 1
 muGrpSrsSnrMaxGap: 100.0
 muGrpSrsSnrSplitThr: -100.0
 mcsSelLutType: 0
-
+pfAvgRateUpd: 0.001
+useManagedMemFlag: 1
+pdschNrOfDataSymb: 9 # assuming 14 OFDM symbols per slot, 1 for PDCCH, 4 for DMRS with DMRS maxLen = 2 and 2 DMRS per slot
+blerLutPath: "ws_scenarios_MCS_BLER_MMSE-IRC_fused_AWGN_GTC2025.csv"
+targetMaxBlerMcs0: 0.1
+maxCombinedPostEqSinrdB: 50.0 # the computed postEq SINR after EESM combining would be manually bounded to [- maxCombinedPostEqSinrdB, maxCombinedPostEqSinrdB], o.t.w. the exponential term in EESM combining would result in -inf / inf valued postEq Sinr after EESM combining due to the precision limitation; default value of 50 dB roughly corresponds to the precision limit of double in C++
+zeroInterfSirDb: 100.0 # fallback geometry/pre-EQ SIR (dB) when no interference power was accumulated; avoids division-by-zero (+inf) in SIR logs
 riBasedLayerSelSu: 1
 mcsSelCqi: 0
 
 # simulation parameters
 chanEstNmseDB: -15.0
+# PHY abstraction (PDSCH BLER/TBS via updateDataRatePdschCpu) is CPU-only; use CLI -p 0 (default).
+# Scheduling, SLS channel, and beamforming still run on CUDA device 0 (see gpuDeviceIdx in parameters.yaml).
 
 channel_config:
-  fading_type: 0  # 0: internal Rayleigh fading, 1: using statistic channel model based on config below
+  fading_type: 1  # 0: internal Rayleigh fading, 1: using statistic channel model based on config below
   dump_chan_slots: [] # list of slots to dump channel data to H5 file, e.g. [0, 1, 2]; [] means no dump
   
   # NOTE: Most parameters are automatically derived from cuMAC config above:
@@ -73,7 +81,7 @@ channel_config:
   system_level:
     scenario: "UMa"  # Scenario type: UMa (Urban Macro), UMi (Urban Micro), RMa (Rural Macro). TODO: currently only UMa is calibrated, will remove this restriction later
     isd: 1732.0  # Inter-site distance in meters, only used for RMa scenario (1732 or 5000), ignored for UMa/UMi
-    ut_drop_option: 0  # UT drop control: 0: randomly across whole region; 1: same number of UTs in each site; 2: same number of UTs in each sector. If nUt is not divisible by nSector/nSite, the remaining UTs will be assigned to the first nUt % (nSector/nSite) sectors/sites. E.g., nUt=20, nSector=3, sector 0 will have 7 UTs, sector 1 will have 7 UTs, sector 2 will have 6 UTs.
+    ut_drop_option: 2  # UT drop control: 0: randomly across whole region; 1: same number of UTs in each site; 2: same number of UTs in each sector. If nUt is not divisible by nSector/nSite, the remaining UTs will be assigned to the first nUt % (nSector/nSite) sectors/sites. E.g., nUt=20, nSector=3, sector 0 will have 7 UTs, sector 1 will have 7 UTs, sector 2 will have 6 UTs.
     ut_drop_cells: []  # If given, it must be a subset of activeCellIds. Example: activeCellIds:[0,4,8], ut_drop_cells:[0,8]. [] means use all active cells.
     ut_cell_2d_dist: [-1, -1]  # UT-to-serving-cell 2D distance [min,max] in meters for UE dropping. Use [-1,-1] for default dropping behavior.
     optional_pl_ind: 0  # Path loss model: 0=standard pathloss equation, 1=optional path loss equation
@@ -105,7 +113,7 @@ channel_config:
     bandwidth_hz: 100e6  # Bandwidth in Hz
     fft_size: 4096  # FFT size for OFDM processing
     n_snapshot_per_slot: 1  # Number of channel realizations per slot (1 or 14)
-    run_mode: 0  # run mode, 0: CIR only, 1: CIR and CFR on PRBG, 2: CIR and CFR on Sc, 3: CIR and CFR on PRBG/Sc, 4: CIR and CFR on all N_FFT subcarriers, no PRBG
+    run_mode: 1  # run mode, 0: CIR only, 1: CIR and CFR on PRBG, 2: CIR and CFR on Sc, 3: CIR and CFR on PRBG/Sc, 4: CIR and CFR on all N_FFT subcarriers, no PRBG
     internal_memory_mode: 1  # Memory management: 0=external memory for CIR/CFR (buffer allocated outside), 1=internal memory for CIR, external memory for CFR (use get*()), 2=internal memory for CIR/CFR (use get*())
     freq_convert_type: 1  # Frequency conversion: 0=first SC, 1=center SC, 2=last SC, 3=avg SC, 4=avg SC without ramping
     sc_sampling: 1  # Subcarrier sampling within PRBG (0:scSampling:N_sc_Prbg-1), only for freqConvertType=3/4

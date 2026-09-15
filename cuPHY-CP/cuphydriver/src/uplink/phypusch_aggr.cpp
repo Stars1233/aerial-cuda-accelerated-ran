@@ -18,6 +18,9 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 23) // "DRV.PUSCH"
 
 #include "phypusch_aggr.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+#include <numeric>
+#include <span>
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -45,6 +48,7 @@ PhyPuschAggr::PhyPuschAggr(
 
     channel_type = slot_command_api::channel_type::PUSCH;
     channel_name.assign("PUSCH");
+    DataOut.isEarlySchCbDecodePresent = 0;
 
 
     NVLOGI_FMT(TAG, "PhyPuschAggr{}: construct", this_id);
@@ -92,7 +96,9 @@ PhyPuschAggr::PhyPuschAggr(
         totNumTbCrc *= UL_MAX_CELLS_PER_SLOT;
         totNumTbByte *= UL_MAX_CELLS_PER_SLOT;
 
-        int totFhDataSize = (ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB) * OFDM_SYMBOLS_PER_SLOT * MAX_AP_PER_SLOT * UL_MAX_CELLS_PER_SLOT;
+        // Antenna dimension comes from runtime UL eAxC count.
+        const int pusch_ap_dim = static_cast<int>(pdctx->getMaxUlAntennaPorts());
+        int totFhDataSize = (ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB) * OFDM_SYMBOLS_PER_SLOT * pusch_ap_dim * UL_MAX_CELLS_PER_SLOT;
         // Don't allocate the memory if we're not going to use it
         if(pdctx->datalake_enabled()) {
             bDataRx     = std::move(cuphy::buffer<__half2, cuphy::pinned_alloc>(totFhDataSize));
@@ -104,7 +110,7 @@ PhyPuschAggr::PhyPuschAggr(
         // Channel estimates buffer: all UE groups concatenated.
         // bChannelEsts: worst-case for full cell bandwidth (groups FDM-partition PRBs, total is constant).
         // bChannelEstSizes: one uint32_t per group.
-        int totHestDataSize = MAX_AP_PER_SLOT * MAX_N_BBU_LAYERS_PUSCH_SUPPORTED * (ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB) * OFDM_SYMBOLS_PER_SLOT;
+        int totHestDataSize = pusch_ap_dim * MAX_N_BBU_LAYERS_PUSCH_SUPPORTED * (ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB) * OFDM_SYMBOLS_PER_SLOT;
         if(pdctx->datalake_enabled()) {
             bChannelEsts = std::move(cuphy::buffer<float2, cuphy::pinned_alloc>(totHestDataSize));
             bChannelEstSizes = std::move(cuphy::buffer<uint32_t, cuphy::pinned_alloc>(MAX_N_USER_GROUPS_SUPPORTED));
@@ -160,6 +166,8 @@ PhyPuschAggr::PhyPuschAggr(
         DataOut.totNumCbs              = totNumCbCrc;
         DataOut.totNumTbs              = totNumTbCrc;
         DataOut.totNumPayloadBytes     = totNumTbByte;
+        DataOut.nPerCellTbDests        = 0;
+        memset(DataOut.pPerCellTbPayloads, 0, sizeof(DataOut.pPerCellTbPayloads));
         DataOut.pTaEsts                = bTaEst.addr();
         DataOut.pRsrp                  = bRsrp.addr();
         DataOut.pRssi                  = bRssi.addr();
@@ -193,24 +201,27 @@ PhyPuschAggr::PhyPuschAggr(
         // NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "totNumTbs={}", DataOut.totNumTbs);
         bHarqBufferSizeInBytes.resize(DataOut.totNumTbs);
         DataOut.h_harqBufferSizeInBytes = bHarqBufferSizeInBytes.data();
-        cudaError_t status = cudaHostAlloc(&DataInOut.pHarqBuffersInOut, sizeof(uint8_t*)*DataOut.totNumTbs, cudaHostAllocPortable | cudaHostAllocMapped);
-        if (status != cudaSuccess)
+        CUresult cuStatus = cuMemHostAlloc((void**)&DataInOut.pHarqBuffersInOut, sizeof(uint8_t*)*DataOut.totNumTbs, CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP);
+        if (cuStatus != CUDA_SUCCESS)
         {
-            NVLOGC_FMT(TAG, "Failure with cudaHostAlloc {} for pHarqBuffersInOut", +status);
+            NVLOGC_FMT(TAG, "Failure with cuMemHostAlloc {} for pHarqBuffersInOut", +cuStatus);
             EXIT_L1(EXIT_FAILURE);
         }
-        status = cudaHostAlloc(&DataInOut.pFoCompensationBuffersInOut, sizeof(float*)*DataOut.totNumTbs, cudaHostAllocPortable | cudaHostAllocMapped);
-        if (status != cudaSuccess)
+        cuStatus = cuMemHostAlloc((void**)&DataInOut.pFoCompensationBuffersInOut, sizeof(float*)*DataOut.totNumTbs, CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP);
+        if (cuStatus != CUDA_SUCCESS)
         {
-            NVLOGC_FMT(TAG, "Failure with cudaHostAlloc {} for pFoCompensationBuffersInOut", +status);
+            NVLOGC_FMT(TAG, "Failure with cuMemHostAlloc {} for pFoCompensationBuffersInOut", +cuStatus);
             EXIT_L1(EXIT_FAILURE);
         }
-        
-        CUDA_CHECK(cudaHostAlloc((void **)&(pPreEarlyHarqWaitKernelStatus), sizeof(uint8_t), cudaHostAllocPortable | cudaHostAllocMapped));
-        CUDA_CHECK(cudaHostAlloc((void **)&(pPostEarlyHarqWaitKernelStatus), sizeof(uint8_t), cudaHostAllocPortable | cudaHostAllocMapped));
-        
-        CUDA_CHECK(cudaHostGetDevicePointer((void **)&(DataOut.pPreEarlyHarqWaitKernelStatusGpu), (void *)(pPreEarlyHarqWaitKernelStatus), 0));
-        CUDA_CHECK(cudaHostGetDevicePointer((void **)&(DataOut.pPostEarlyHarqWaitKernelStatusGpu), (void *)(pPostEarlyHarqWaitKernelStatus), 0));
+
+        CUDA_DRIVER_CHECK(cuMemHostAlloc((void**)&pPreEarlyHarqWaitKernelStatus, sizeof(uint8_t), CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP));
+        CUDA_DRIVER_CHECK(cuMemHostAlloc((void**)&pPostEarlyHarqWaitKernelStatus, sizeof(uint8_t), CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP));
+
+        CUdeviceptr devPtr;
+        CUDA_DRIVER_CHECK(cuMemHostGetDevicePointer(&devPtr, pPreEarlyHarqWaitKernelStatus, 0));
+        DataOut.pPreEarlyHarqWaitKernelStatusGpu = reinterpret_cast<uint8_t*>(devPtr);
+        CUDA_DRIVER_CHECK(cuMemHostGetDevicePointer(&devPtr, pPostEarlyHarqWaitKernelStatus, 0));
+        DataOut.pPostEarlyHarqWaitKernelStatusGpu = reinterpret_cast<uint8_t*>(devPtr);
 
         // Host-pinned memory buffer holding early exit information. Initially  memset to 0.
         // TODO contents will be reset to 0 via PhyPuschAggr::cleanup() on UL slot map release.
@@ -232,14 +243,11 @@ PhyPuschAggr::PhyPuschAggr(
     DataIn.pTDataRx = (cuphyTensorPrm_t*) calloc(UL_MAX_CELLS_PER_SLOT, sizeof(cuphyTensorPrm_t));
 
     // Data IN
+    // Antenna dimension comes from runtime UL eAxC count.
+    const int pusch_rx_ap_dim = static_cast<int>(pdctx->getMaxUlAntennaPorts());
     for(int idx = 0; idx < UL_MAX_CELLS_PER_SLOT; idx++)
     {
-/*
-        tDataRxInput[idx] = std::move(cuphy::tensor_device(CUPHY_C_16F, ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB,
-                                                            OFDM_SYMBOLS_PER_SLOT, MAX_AP_PER_SLOT,
-                                                            cuphy::tensor_flags::align_tight));
-*/
-        pusch_data_rx_desc[idx] = {CUPHY_C_16F, static_cast<int>(ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB), static_cast<int>(OFDM_SYMBOLS_PER_SLOT), static_cast<int>(MAX_AP_PER_SLOT), cuphy::tensor_flags::align_tight};
+        pusch_data_rx_desc[idx] = {CUPHY_C_16F, static_cast<int>(ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB), static_cast<int>(OFDM_SYMBOLS_PER_SLOT), pusch_rx_ap_dim, cuphy::tensor_flags::align_tight};
 
         DataIn.pTDataRx[idx].desc = pusch_data_rx_desc[idx].handle();
         DataIn.pTDataRx[idx].pAddr = nullptr;
@@ -259,26 +267,27 @@ PhyPuschAggr::PhyPuschAggr(
     sym_ord_done_sig_arr.reset(gDev->newGDRbuf(ORAN_PUSCH_SYMBOLS_X_SLOT * sizeof(uint32_t)));
     mf.addGpuPinnedSize(sym_ord_done_sig_arr->size_alloc);
 
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_setup_ph1));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_setup_ph1));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_setup_ph2));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_setup_ph2));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_crc));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_crc));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&subSlotCompletedEvent));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&waitCompletedSubSlotEvent));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&waitCompletedFullSlotEvent));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_run_ph1));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_run_ph1));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_run_ph2));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_run_ph2));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_setup_ph1, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_setup_ph1, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_setup_ph2, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_setup_ph2, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_crc, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_crc, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&subSlotCompletedEvent, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&waitCompletedSubSlotEvent, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&waitCompletedFullSlotEvent, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&uciOnPuschCompletedEvent, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_run_ph1, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_run_ph1, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_run_ph2, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_run_ph2, CU_EVENT_DEFAULT));
 
     static_params_cell.clear();
     cell_id_list.clear();
 
-    launch_kernel_warmup(s_channel);
-    launch_kernel_order(s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
-    launch_kernel_order(s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_warmup(warmup_kernel_func_, s_channel);
+    launch_kernel_order(pdctx->getOrderKernelFunctions().kernel_order_pusch, s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_order(pdctx->getOrderKernelFunctions().kernel_order_pusch, s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
     gDev->synchronizeStream(s_channel);
 
     procModeBmsk = PUSCH_PROC_MODE_FULL_SLOT;
@@ -303,7 +312,7 @@ PhyPuschAggr::PhyPuschAggr(
         cuphyStatus_t setupStatus = cuphySetupPuschRx(puschRxHndl, &(dyn_prms), batchPrmHndl);
         if(setupStatus != CUPHY_STATUS_SUCCESS)
             NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphySetupPuschRx returned error {}", setupStatus);
-        cudaStreamSynchronize(s_channel);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(s_channel));
         //////////////////////////////////////////////////////////////////////////
     }
 #endif
@@ -320,24 +329,25 @@ PhyPuschAggr::~PhyPuschAggr()
     if(puschRxHndl)
         cuphyDestroyPuschRx(puschRxHndl);
 
-    cudaFreeHost(DataInOut.pHarqBuffersInOut);
-    cudaFreeHost(DataInOut.pFoCompensationBuffersInOut);
-    cudaFreeHost(pPreEarlyHarqWaitKernelStatus);
-    cudaFreeHost(pPostEarlyHarqWaitKernelStatus);
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(DataInOut.pHarqBuffersInOut));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(DataInOut.pFoCompensationBuffersInOut));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(pPreEarlyHarqWaitKernelStatus));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(pPostEarlyHarqWaitKernelStatus));
 
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_setup_ph1));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_setup_ph1));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_setup_ph2));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_setup_ph2));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_crc));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_crc));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(subSlotCompletedEvent));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(waitCompletedSubSlotEvent));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(waitCompletedFullSlotEvent));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_run_ph1));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_run_ph1));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_run_ph2));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_run_ph2));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_setup_ph1));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_setup_ph1));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_setup_ph2));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_setup_ph2));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_crc));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_crc));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(subSlotCompletedEvent));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(waitCompletedSubSlotEvent));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(waitCompletedFullSlotEvent));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(uciOnPuschCompletedEvent));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_run_ph1));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_run_ph1));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_run_ph2));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_run_ph2));
 
     free(cellGrpDynPrm.pCellPrms);
     free(cellGrpDynPrm.pUeGrpPrms);
@@ -354,7 +364,7 @@ void PhyPuschAggr::tvStatPrms(const char* tv_h5, int cell_idx)
 
     fInput = hdf5hpp::hdf5_file::open(tv_h5);
 
-    cudaStreamSynchronize(s_channel);
+    CUDA_DRIVER_CHECK(cuStreamSynchronize(s_channel));
 
     if(read_tv == true)
         return;
@@ -394,7 +404,7 @@ void PhyPuschAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     else
         tUnShiftSeq4 = tUnShiftSeq;
 
-    cudaStreamSynchronize(s_channel);
+    CUDA_DRIVER_CHECK(cuStreamSynchronize(s_channel));
 
     std::memset(&static_params, 0, sizeof(static_params));
     static_params.pWFreq        = &tPrmWFreq;
@@ -438,6 +448,10 @@ void PhyPuschAggr::tvStatPrms(const char* tv_h5, int cell_idx)
     static_params.enableEarlyHarq         = pdctx->getPuschEarlyHarqEn();
     static_params.enableDeviceGraphLaunch = pdctx->getPuschDeviceGraphLaunchEn();
     static_params.enableBatchedMemcpy     = pdctx->getUseBatchedMemcpy();
+    static_params.openRanFunctionalSplitOption = PUSCH_7_2_A;
+    static_params.kernelSelOption              = PUSCH_ALL;
+    static_params.uciKernelSelOption           = PUSCH_UCI_ALL;
+     
 #ifdef SCF_FAPI_10_04
     static_params.enableCsiP2Fapiv3       = 1;
 #else
@@ -544,13 +558,11 @@ int PhyPuschAggr::createPhyObj()
 
         NVLOGD_FMT(TAG , "firstVal 0x{:04X} lastVal 0x{:04X} csi2MapStartIdx 0x{:02X} csi2MapSize 0x{:02X} mapBuf[0] = 0x{:04X}  mapBuf[1] = 0x{:04X}", firstVal, lastVal, mapParamBuf[lastCell.nCsi2Maps - 1].csi2MapStartIdx, mapParamBuf[lastCell.nCsi2Maps - 1].csi2MapSize, mapBuf[0], mapBuf[1]);
 
-        CUDA_CHECK_PHYDRIVER(cudaMemcpyAsync(
-            lastCell.pCsi2MapBuffer + mapOffset, mapBuf,
-            mapParamBuf[lastCell.nCsi2Maps - 1].csi2MapSize, cudaMemcpyHostToDevice, s_channel));
+        CUDA_DRIVER_CHECK(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(lastCell.pCsi2MapBuffer + mapOffset), mapBuf,
+            mapParamBuf[lastCell.nCsi2Maps - 1].csi2MapSize, s_channel));
 
-        CUDA_CHECK_PHYDRIVER(cudaMemcpyAsync(
-            lastCell.pCsi2MapPrm + mapParamsOffset, mapParamBuf,
-            lastCell.nCsi2Maps * sizeof(cuphyCsi2MapPrm_t) , cudaMemcpyHostToDevice, s_channel));
+        CUDA_DRIVER_CHECK(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(lastCell.pCsi2MapPrm + mapParamsOffset), mapParamBuf,
+            lastCell.nCsi2Maps * sizeof(cuphyCsi2MapPrm_t), s_channel));
     
         mapOffset += CUPHY_CSI2_SIZE_MAP_BUFFER_SIZE_PER_CELL;
         mapParamsOffset += CUPHY_MAX_NUM_CSI2_SIZE_MAPS_PER_CELL;
@@ -593,14 +605,15 @@ int PhyPuschAggr::createPhyObj()
         }
     }
 
-    static_params.nMaxCells            = static_params_cell.size();
-    static_params.nMaxCellsPerSlot     = static_params_cell.size();
-    static_params.pCellStatPrms        = static_cast<cuphyCellStatPrm_t*>(static_params_cell.data());
-    static_params.polarDcdrListSz      = pdctx->getPuxchPolarDcdrListSz();
-    static_params.subSlotCompletedEvent = subSlotCompletedEvent;
-    static_params.waitCompletedSubSlotEvent = waitCompletedSubSlotEvent;
-    static_params.waitCompletedFullSlotEvent = waitCompletedFullSlotEvent;
-    static_params.pSymRxStatus        = (uint32_t*)sym_ord_done_sig_arr->addrd();
+    static_params.nMaxCells                           = static_params_cell.size();
+    static_params.nMaxCellsPerSlot                    = static_params_cell.size();
+    static_params.pCellStatPrms                       = static_cast<cuphyCellStatPrm_t*>(static_params_cell.data());
+    static_params.polarDcdrListSz                     = pdctx->getPuxchPolarDcdrListSz();
+    static_params.subSlotCompletedEvent               = subSlotCompletedEvent;
+    static_params.waitCompletedSubSlotEvent           = waitCompletedSubSlotEvent;
+    static_params.waitCompletedFullSlotEvent          = waitCompletedFullSlotEvent;
+    static_params.uciOnPuschCompletedEvent            = uciOnPuschCompletedEvent;
+    static_params.pSymRxStatus                        = (uint32_t*)sym_ord_done_sig_arr->addrd();
     static_params.puschrxChestFactorySettingsFilename = pdctx->getPuschrxChestFactorySettingsFilename().c_str();
 
     /*
@@ -618,9 +631,11 @@ int PhyPuschAggr::createPhyObj()
 #endif
 
         int cuda_strm_prio = 0;
-        CUDA_CHECK_PHYDRIVER(cudaStreamGetPriority(s_channel, &cuda_strm_prio));
+        CUDA_DRIVER_CHECK(cuStreamGetPriority(s_channel, &cuda_strm_prio));
         static_params.stream_priority = cuda_strm_prio;
         static_params.ldpcKernelLaunch = PUSCH_RX_ENABLE_DRIVER_LDPC_LAUNCH;
+        static_params.useCbLdpcDecoder = 0;
+        static_params.earlySchCbDecodeMode = PUSCH_EARLY_SCH_CB_DECODE_DISABLED;
         static_params.pWorkCancelInfo   = bWorkCancelInfo.addr();
         static_params.workCancelMode    = static_cast<cuphyPuschWorkCancelMode_t>(pdctx->getPuschWorkCancelMode()); // there was a check in yamlparser.cpp
         NVLOGI_FMT(TAG, "PUSCH workCancelMode set to {}", +static_params.workCancelMode);
@@ -719,6 +734,14 @@ int PhyPuschAggr::setup(
             if(count != -1)
             {
                 DataIn.pTDataRx[count].pAddr = aggr_ulbuf_st1[idx]->getBufD();
+                // Match order-kernel IQ layout: (pusch_prb_stride * tones, symbols, nRxAnt)
+                pusch_data_rx_desc[count].set(
+                    CUPHY_C_16F,
+                    static_cast<int>(aggr_cell_list[idx]->getPuschPrbStride() * CUPHY_N_TONES_PER_PRB),
+                    static_cast<int>(OFDM_SYMBOLS_PER_SLOT),
+                    static_cast<int>(aggr_cell_list[idx]->getRxAnt()),
+                    cuphy::tensor_flags::align_tight);
+                DataIn.pTDataRx[count].desc = pusch_data_rx_desc[count].handle();
                 aggr_cell_list[idx]->setPuschDynPrmIndex(aggr_slot_params->si->slot_, count);
                 //NVLOGI_FMT(TAG, "PhyPuschAggr::setup - Cell {} cellPrmDynIdx {} ULBuffer {} at index {}",
                     //phyCellId,count,aggr_ulbuf_st1[idx]->getId(),idx);
@@ -737,6 +760,10 @@ int PhyPuschAggr::setup(
 
     setCtx();
 
+    // Attempt zero-copy: acquire nvIPC buffer from L2 to use as D2H destination
+    acquireExternalTbBuffer();
+    ExtTbBufferGuard extBufGuard(*this);
+
     struct slot_command_api::slot_indication* si = aggr_slot_params->si;
     NVLOGD_FMT(TAG, "PhyPuschAggr{} SFN {}.{} setup", this_id, si->sfn_, si->slot_);
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -751,7 +778,7 @@ int PhyPuschAggr::setup(
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup_ph1, dyn_params.phase1Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup_ph1, dyn_params.phase1Stream));
     }
     if(pdctx->getUseGreenContexts() == 0)
     {
@@ -779,9 +806,9 @@ int PhyPuschAggr::setup(
         ////////TODO//////////////////////
         {
             MemtraceDisableScope md;
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup_ph1, dyn_params.phase1Stream));
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup_ph2, dyn_params.phase1Stream));
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup_ph2, dyn_params.phase1Stream));
+            CUDA_DRIVER_CHECK(cuEventRecord(end_setup_ph1, dyn_params.phase1Stream));
+            CUDA_DRIVER_CHECK(cuEventRecord(start_setup_ph2, dyn_params.phase1Stream));
+            CUDA_DRIVER_CHECK(cuEventRecord(end_setup_ph2, dyn_params.phase1Stream));
         }
         /////////////////////////////////
         return -1;
@@ -792,7 +819,7 @@ int PhyPuschAggr::setup(
 #endif
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup_ph1, dyn_params.phase1Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup_ph1, dyn_params.phase1Stream));
     }
 
     //struct slot_command_api::slot_indication* si = aggr_slot_params->si;
@@ -903,7 +930,7 @@ int PhyPuschAggr::setup(
     dyn_params.setupPhase = cuphyPuschSetupPhase_t::PUSCH_SETUP_PHASE_2;
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup_ph2, dyn_params.phase1Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup_ph2, dyn_params.phase1Stream));
     }
     // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "Calling Setup Phase 2");
     if(pdctx->getUseGreenContexts() == 0)
@@ -919,14 +946,24 @@ int PhyPuschAggr::setup(
     if(setupStatus != CUPHY_STATUS_SUCCESS)
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphySetupPuschRx PUSCH_SETUP_PHASE_2 returned error {}", setupStatus);
+        for (auto* hb : std::span(hb_slot.data(), hq_buffer_counter))
+        {
+            hb->refSub();
+            if(hb->getRefCount() <= 0)
+            {
+                hb_pool_m->bucketReleaseBuffer(hb);
+            }
+        }
+        hq_buffer_counter = 0;
         return -1;
     }
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup_ph2, dyn_params.phase1Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup_ph2, dyn_params.phase1Stream));
     }
 
+    extBufGuard.dismiss();
     return 0;
 }
 
@@ -938,23 +975,23 @@ int PhyPuschAggr::run(cuphyPuschRunPhase_t runPhase)
     setCtx();
 
     #ifdef PUSCH_INPUT_BUFFER_DEBUG
-        CUDA_CHECK_PHYDRIVER(cudaMemcpyAsync(buf_h, buf_d, buf_sz, cudaMemcpyDefault, s_channel));
+        CUDA_DRIVER_CHECK(cuMemcpyDtoHAsync(buf_h, reinterpret_cast<CUdeviceptr>(buf_d), buf_sz, s_channel));
     #endif
 
     if(runPhase == cuphyPuschRunPhase_t::PUSCH_RUN_ALL_PHASES) {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, dyn_params.phase1Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run, dyn_params.phase1Stream));
     }
     if(runPhase == cuphyPuschRunPhase_t::PUSCH_RUN_SUB_SLOT_PROC) {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, dyn_params.phase1Stream));
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run_ph1, dyn_params.phase1Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run, dyn_params.phase1Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run_ph1, dyn_params.phase1Stream));
     }
     if(runPhase == cuphyPuschRunPhase_t::PUSCH_RUN_FULL_SLOT_COPY) {
         //Second stream waits for PUSCH_RUN_EARLY_HARQ_PROC+PUSCH_RUN_FULL_SLOT_PROC to complete
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaStreamWaitEvent(dyn_params.phase2Stream,end_run_ph1,0));
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run_ph2, dyn_params.phase2Stream));
+        CUDA_DRIVER_CHECK(cuStreamWaitEvent(dyn_params.phase2Stream, end_run_ph1, CU_EVENT_WAIT_DEFAULT));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run_ph2, dyn_params.phase2Stream));
     }
 
     if((getSetupStatus() == CH_SETUP_DONE_NO_ERROR))
@@ -970,18 +1007,18 @@ int PhyPuschAggr::run(cuphyPuschRunPhase_t runPhase)
 
     if(runPhase == cuphyPuschRunPhase_t::PUSCH_RUN_ALL_PHASES) {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, dyn_params.phase2Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, dyn_params.phase2Stream));
     }
 
     if(runPhase == cuphyPuschRunPhase_t::PUSCH_RUN_FULL_SLOT_PROC) {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run_ph1, dyn_params.phase1Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run_ph1, dyn_params.phase1Stream));
     }
 
     if(runPhase == cuphyPuschRunPhase_t::PUSCH_RUN_FULL_SLOT_COPY){
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run_ph2, dyn_params.phase2Stream));
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, dyn_params.phase2Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run_ph2, dyn_params.phase2Stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, dyn_params.phase2Stream));
     }
 
     t_ns t3 = Time::nowNs();
@@ -1025,7 +1062,7 @@ int PhyPuschAggr::wait(int wait_ns)
         return -1;
 
     while(ACCESS_ONCE(*((uint32_t*)pusch_completed_h->addr())) == 0)
-    // while(cudaEventQuery(end_crc) != cudaSuccess)
+    // while(cuEventQuery(end_crc) != CUDA_SUCCESS)
     {
         if(Time::nowNs() - start_t > threshold_t)
         {
@@ -1270,14 +1307,14 @@ int PhyPuschAggr::validate(std::array<uint8_t,UL_MAX_CELLS_PER_SLOT>& cell_timeo
     {
         NVLOGC_FMT(TAG, "CRC error encountered SFN {}.{} Generating H5 Debug PUSCH file {}", aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, std::to_string(id).c_str());
         auto& stream = s_channel;
-        cudaStreamSynchronize(stream);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
         cuphyStatus_t debugStatus = cuphyWriteDbgBufSynch(puschRxHndl, stream);
         if(debugStatus != CUPHY_STATUS_SUCCESS)
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphyWriteDbgBufSynch returned error {}", debugStatus);
             return -1;
         }
-        cudaStreamSynchronize(stream);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
         debugFileH.get()->close();
         debugFileH.reset();
         NVLOGC_FMT(TAG, "SFN {}.{} Done Generating H5 Debug PUSCH {} file, please refer to the largest h5dump file created.", aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, std::to_string(id).c_str());
@@ -1350,6 +1387,122 @@ uint8_t PhyPuschAggr::getPostEarlyHarqWaitKernelStatus()
     return *pPostEarlyHarqWaitKernelStatus;
 }
 
+/**
+ * Acquire an external nvIPC buffer for zero-copy TB D2H transfer
+ *
+ * Requests a pre-allocated buffer from the L2 adapter via the registered
+ * alloc_fn callback. On success, configures DataOut for either single-cell
+ * direct D2H or multi-cell batched D2H. Falls back silently if no buffer
+ * is available or the buffer is too small.
+ */
+void PhyPuschAggr::acquireExternalTbBuffer()
+{
+    m_extMsgBuffer.reset();
+    DataOut.nPerCellTbDests = 0;
+
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(this->getPhyDriverHandler()).get();
+    slot_command_api::ul_slot_callbacks ul_cb;
+    if (!pdctx->getUlCb(ul_cb))
+    {
+        return;
+    }
+
+    slot_command_api::pusch_params* pparms = getDynParams();
+    if (pparms == nullptr)
+    {
+        return;
+    }
+
+    slot_command_api::ul_output_msg_buffer buf{};
+    ul_cb.alloc_fn(ul_cb.alloc_fn_context, buf, *pparms);
+
+    if (buf.data_buf == nullptr)
+    {
+        return;
+    }
+
+    // Compute required buffer size from per-UE TB sizes
+    const uint32_t neededBytes = std::accumulate(
+        pparms->ue_tb_size, pparms->ue_tb_size + pparms->cell_grp_info.nUes, uint32_t{0});
+
+    // For multi-cell, each cell gets its own total_bytes-sized buffer, so total
+    // available capacity is total_bytes * num_cells.  For single-cell the single
+    // buffer must hold everything.
+    std::size_t availableBytes = buf.total_bytes;
+    if (buf.num_cells > 1)
+    {
+        availableBytes = buf.total_bytes * buf.num_cells;
+    }
+
+    if (availableBytes < neededBytes)
+    {
+        NVLOGW_FMT(TAG, "External TB buffer too small ({} < {}), falling back to internal buffer",
+                   availableBytes, neededBytes);
+        ul_cb.callback_fn(ul_cb.callback_fn_context, 0, buf,
+                          *(aggr_slot_params->si), *pparms, nullptr, nullptr);
+        return;
+    }
+
+    buf.zero_copy = true;
+    m_extMsgBuffer = std::move(buf);
+
+    const uint16_t nCells = pparms->cell_grp_info.nCells;
+    if (m_extMsgBuffer->num_cells == nCells && nCells > 1)
+    {
+        DataOut.nPerCellTbDests = nCells;
+        for (uint16_t c = 0; c < nCells; c++)
+        {
+            DataOut.pPerCellTbPayloads[c] =
+                static_cast<uint8_t*>(m_extMsgBuffer->cell_ipc_msgs[c].data_buf);
+        }
+        NVLOGD_FMT(TAG, "Using per-cell nvIPC buffers for batched TB D2H (nCells={}, total_bytes={}, needed={})",
+                   nCells, m_extMsgBuffer->total_bytes, neededBytes);
+    }
+    else
+    {
+        m_origTbPayloadsPtr = DataOut.pTbPayloads;
+        DataOut.pTbPayloads = m_extMsgBuffer->data_buf;
+        NVLOGD_FMT(TAG, "Using external nvIPC buffer for TB D2H (size={}, needed={})",
+                   m_extMsgBuffer->total_bytes, neededBytes);
+    }
+}
+
+/**
+ * Release the external TB buffer and restore internal DataOut pointers
+ *
+ * Restores DataOut.pTbPayloads to the original internal pointer and resets
+ * per-cell D2H state. When nvIPC messages were acquired but not consumed
+ * by the callback (error paths), invokes callback_fn with nullptr output
+ * to trigger release_ul_tb_buffer on the L2 side.
+ * Safe to call even if no external buffer was acquired.
+ */
+void PhyPuschAggr::releaseExternalTbBuffer()
+{
+    if (!m_extMsgBuffer.has_value())
+    {
+        return;
+    }
+
+    if (m_origTbPayloadsPtr != nullptr)
+    {
+        DataOut.pTbPayloads = m_origTbPayloadsPtr;
+        m_origTbPayloadsPtr = nullptr;
+    }
+    DataOut.nPerCellTbDests = 0;
+
+    if (m_extMsgBuffer->data_buf != nullptr || m_extMsgBuffer->num_cells > 0)
+    {
+        PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(this->getPhyDriverHandler()).get();
+        slot_command_api::ul_slot_callbacks ul_cb;
+        slot_command_api::pusch_params* pparms = getDynParams();
+        if (pdctx->getUlCb(ul_cb) && pparms != nullptr)
+        {
+            ul_cb.callback_fn(ul_cb.callback_fn_context, 0, *m_extMsgBuffer,
+                              *(aggr_slot_params->si), *pparms, nullptr, nullptr);
+        }
+    }
+    m_extMsgBuffer.reset();
+}
 
 int PhyPuschAggr::callback(std::array<uint8_t,UL_MAX_CELLS_PER_SLOT>& cell_timeout_list,bool gpu_early_harq_timeout)
 {
@@ -1366,21 +1519,24 @@ int PhyPuschAggr::callback(std::array<uint8_t,UL_MAX_CELLS_PER_SLOT>& cell_timeo
     {
         NVLOGD_FMT(TAG, "Calling UL Aggr callback");
 
-        struct slot_command_api::ul_output_msg_buffer msg;
-        msg.data_buf    = nullptr;
-        msg.total_bytes = 0;
-        msg.numTB       = 0;
-
-
         // Tell datalakes there is work to do. This only copies addresses and notifies the worker thread
         if(pdctx->getDataLake() != nullptr) {
            pdctx->getDataLake()->notify(nTbCrcErrors, aggr_slot_params->si, pusch, &DataOut, &static_params);
         }
 
-        // Only for compilation to run pass actual cuphyPuschDataOut_t* struct
-        // nCRC calculated on the GPU with cuPHYTools kernel
-        ul_cb.callback_fn(ul_cb.callback_fn_context, nTbCrcErrors, msg, *(aggr_slot_params->si), *pusch, &DataOut, &static_params);
+        if (m_extMsgBuffer.has_value())
+        {
+            ul_cb.callback_fn(ul_cb.callback_fn_context, nTbCrcErrors, *m_extMsgBuffer, *(aggr_slot_params->si), *pusch, &DataOut, &static_params);
+        }
+        else
+        {
+            slot_command_api::ul_output_msg_buffer emptyBuf{};
+            ul_cb.callback_fn(ul_cb.callback_fn_context, nTbCrcErrors, emptyBuf, *(aggr_slot_params->si), *pusch, &DataOut, &static_params);
+        }
     }
+
+    // Restore internal buffer pointer (or release if callback was not invoked)
+    releaseExternalTbBuffer();
 
     // Free HARQ buffer for CRC == 0
     if(nTbCrcErrors == 0)

@@ -1721,7 +1721,12 @@ def parse_ru_observed_throughput_per_second(line):
     return result
 
 
-testmac_times_re = re.compile('(\d+\:\d+\:\d+\.\d+) I.*\[MAC.PROCESSING_TIMES\] SFN (\d+)\.(\d+) .*tick=(\d+) slot_indication=(\d+) fapi1_start=(\d+) fapi1_stop=(\d+) fapi1_count=(\d+) sleep_time=(\d+) fapi2_start=(\d+) fapi2_stop=(\d+) fapi2_count=(\d+) notify_start=(\d+) notify_stop=(\d+)')
+testmac_times_re = re.compile(
+    r'(\d+\:\d+\:\d+\.\d+) I.*\[MAC.PROCESSING_TIMES\] SFN (\d+)\.(\d+) .*tick=(\d+) slot_indication=(\d+) '
+    r'fapi1_start=(\d+) fapi1_stop=(\d+) fapi1_count=(\d+) sleep_time=(\d+) '
+    r'fapi2_start=(\d+) fapi2_stop=(\d+) fapi2_count=(\d+) notify_start=(\d+) notify_stop=(\d+)'
+    r'(?: dl_tti_start=(\d+) dl_tti_stop=(\d+))?(?: tx_data_start=(\d+) tx_data_stop=(\d+))?(?: ul_tti_start=(\d+) ul_tti_stop=(\d+))?$'
+)
 
 def parse_testmac_times(line):
 
@@ -1744,12 +1749,20 @@ def parse_testmac_times(line):
         fapi2_count = int(found[12])
         notify_start_timestamp = int(found[13])
         notify_stop_timestamp = int(found[14])
+        g15, g16 = found.group(15), found.group(16)
+        dl_tti_start_timestamp = int(g15) if g15 is not None else None
+        dl_tti_stop_timestamp = int(g16) if g16 is not None else None
+        g17, g18, g19, g20 = found.group(17), found.group(18), found.group(19), found.group(20)
+        tx_data_start_timestamp = int(g17) if g17 is not None else None
+        tx_data_stop_timestamp = int(g18) if g18 is not None else None
+        ul_tti_start_timestamp = int(g19) if g19 is not None else None
+        ul_tti_stop_timestamp = int(g20) if g20 is not None else None
 
         # Calculate t0
         t0_timestamp = sfn_to_tai(sfn, slot%20, tick_timestamp, 0, 0)
 
         # Add separate result per subtask
-        result.append({
+        row = {
             'log_timestamp':log_timestamp,
             't0_timestamp': t0_timestamp,
             'sfn': sfn,
@@ -1768,7 +1781,17 @@ def parse_testmac_times(line):
             'start_timestamp': slot_indication_timestamp,
             'first_fapi_timestamp': fapi1_stop_timestamp,
             'end_timestamp': fapi2_stop_timestamp,
-            })
+        }
+        if dl_tti_start_timestamp is not None and dl_tti_stop_timestamp is not None:
+            row['dl_tti_start_timestamp'] = dl_tti_start_timestamp
+            row['dl_tti_stop_timestamp'] = dl_tti_stop_timestamp
+        if tx_data_start_timestamp is not None and tx_data_stop_timestamp is not None:
+            row['tx_data_start_timestamp'] = tx_data_start_timestamp
+            row['tx_data_stop_timestamp'] = tx_data_stop_timestamp
+        if ul_tti_start_timestamp is not None and ul_tti_stop_timestamp is not None:
+            row['ul_tti_start_timestamp'] = ul_tti_start_timestamp
+            row['ul_tti_stop_timestamp'] = ul_tti_stop_timestamp
+        result.append(row)
         
     #Add basic time fields
     for data_dict in result:

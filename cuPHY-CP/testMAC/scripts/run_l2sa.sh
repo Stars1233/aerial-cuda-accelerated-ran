@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -274,7 +274,7 @@ fi
 echo "copy logs ..."
 cd ${LOG_PATH}/..
 cp -r ${LOG_PATH} ${log_folder}
-error=$(grep " E " ${LOG_PATH}/*.log)
+error=$(grep -E "[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6} ERR" ${LOG_PATH}/screenlog_*.log)
 if [ $test_result -ne 0 ]; then
     mv ${log_folder} ${log_folder}_FAIL
 elif [[ -n $error ]]; then
@@ -284,4 +284,5 @@ else
     mv ${log_folder} ${log_folder}_PASS
 fi
 
+echo "Test result: $test_result"
 exit $test_result

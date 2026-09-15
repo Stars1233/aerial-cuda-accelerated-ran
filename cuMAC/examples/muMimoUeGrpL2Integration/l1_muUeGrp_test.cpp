@@ -80,7 +80,7 @@ void* l1_l2_blocking_recv_task(void* arg)
     return NULL;    
 }
 
-void srs_chan_est(SimpleCvSrsChestMemoryBank* memory_bank, l1_cumac_message_t* arr_l1_cumac_msg, const TestConfig& config, const sys_param_t& sys_param)
+void srs_chan_est(SimpleCvSrsChestMemoryBank* memory_bank, SrsInfoUpdate* arr_l1_cumac_msg, const TestConfig& config, const sys_param_t& sys_param)
 {
     l2_l1_message_t* l2_l1_msg = (l2_l1_message_t*) recv_msg_buff;
 
@@ -110,7 +110,7 @@ void srs_chan_est(SimpleCvSrsChestMemoryBank* memory_bank, l1_cumac_message_t* a
         const uint16_t rnti = arr_rnti[srs_ue_idx];
         const uint16_t buffer_Idx = arr_buffer_Idx[srs_ue_idx];
         const uint16_t srs_info_idx = arr_srs_info_idx[srs_ue_idx];
-        CVSrsChestBuff_contMemAlloc* ue_buffer = nullptr;
+        CVSrsChestBuff* ue_buffer = nullptr;
         uint32_t real_buff_idx;
         memory_bank->preAllocateBuffer(cell_idx, rnti, buffer_Idx, usage, &ue_buffer, &real_buff_idx);
         arr_l1_cumac_msg[srs_ue_idx].real_buff_idx = real_buff_idx;
@@ -126,7 +126,7 @@ void srs_chan_est(SimpleCvSrsChestMemoryBank* memory_bank, l1_cumac_message_t* a
                                  config.srs_prg_size, config.srs_start_prg, config.srs_start_valid_prg, 
                                  config.srs_n_valid_prg);
 
-        cudaMemcpy(ue_buffer->getAddr(), srs_ch_est_buff_cpu.data(), buffer_size*sizeof(__half2), cudaMemcpyHostToDevice);
+        CHECK_CUDA_ERR(cudaMemcpy(ue_buffer->getAddr(), srs_ch_est_buff_cpu.data(), buffer_size*sizeof(__half2), cudaMemcpyHostToDevice));
 
         memory_bank->updateSrsChestBufferState(cell_idx, buffer_Idx, slot_command_api::SRS_CHEST_BUFF_READY);
     }
@@ -168,26 +168,41 @@ int main(int argc, char** argv)
 
         uint32_t total_num_buffers = std::min(config.num_srs_buffers, static_cast<uint32_t>(slot_command_api::MAX_SRS_CHEST_BUFFERS));
         uint32_t buffer_size = config.num_prg * config.num_gnb_ant * config.num_ue_layer * sizeof(uint32_t);
+        const size_t cubb_srs_gpu_buf_total_size = static_cast<size_t>(buffer_size) * total_num_buffers;
+        NVLOGC(MU_TEST_TAG, "L1-MAIN: cubb_srs_gpu_buf_total_size: %u * %u = %lu", buffer_size, total_num_buffers, cubb_srs_gpu_buf_total_size);
 
         // Initialize semaphore for L1 SRS update finish notification
         nv_ipc_sem_t* l1_cumac_sem = nv_ipc_sem_open(L1_CUMAC_PRIMARY_PROCESS, L1_SEM_NAME);
 
-        // Create shared memory pool in GPU
-        nv_ipc_mempool_t* cpu_mem_pool = nv_ipc_mempool_open(L1_CUMAC_PRIMARY_PROCESS, L1_CPU_MEM_POOL_NAME, (sizeof(CVSrsChestBuff_contMemAlloc)*total_num_buffers + sizeof(l1_cumac_message_t)*MAX_NUM_UE_SRS_INFO_PER_SLOT*NUM_CELL), 1, NV_IPC_MEMPOOL_NO_CUDA_DEV); // CPU memory pool to be shared between L1 and cuMAC
-        nv_ipc_mempool_t* gpu_mem_pool = nv_ipc_mempool_open(L1_CUMAC_PRIMARY_PROCESS, L1_GPU_MEM_POOL_NAME, buffer_size, total_num_buffers, config.cuda_device_id); // GPU memory pool to be shared between L1 and cuMAC
-        
-        // Get CPU/GPU shared memory pool start address
-        void* cpu_pool_start_addr = cpu_mem_pool->get_addr(cpu_mem_pool, 0); 
-        void* gpu_pool_start_addr = gpu_mem_pool->get_addr(gpu_mem_pool, 0);
+        // Shared memory pools between L1 (primary) and cuMAC (secondary).
+        // Mirrors the cuphydriver pattern: one typed pool per object kind.
+        //   - chest_buf_pool: stores CVSrsChestBuff objects (CPU)
+        //   - msg_mem_pool:   stores SrsInfoUpdate records (CPU)
+        //   - gpu_mem_pool:   stores raw SRS channel-estimate buffers (GPU)
+        nv::lock_free_mem_pool<CVSrsChestBuff>* chest_buf_pool = new nv::lock_free_mem_pool<CVSrsChestBuff>(
+            total_num_buffers, LOCK_FREE_OPT_SHM_PRIMARY, L1_CHEST_BUF_POOL_NAME);
+        nv::lock_free_mem_pool<SrsInfoUpdate>* msg_mem_pool = new nv::lock_free_mem_pool<SrsInfoUpdate>(
+            MAX_NUM_UE_SRS_INFO_PER_SLOT * NUM_CELL, LOCK_FREE_OPT_SHM_PRIMARY, L1_MSG_MEM_POOL_NAME);
+        nv::lock_free_mem_pool<uint8_t>* gpu_mem_pool = new nv::lock_free_mem_pool<uint8_t>(
+            total_num_buffers, LOCK_FREE_OPT_SHM_PRIMARY, L1_GPU_MEM_POOL_NAME, config.cuda_device_id, buffer_size);
 
-        if (!is_aligned_for_type<CVSrsChestBuff_contMemAlloc>(cpu_pool_start_addr)) {
-            NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT, "L1-MAIN: %s: CPU memory base address is not aligned for CVSrsChestBuff_contMemAlloc", __func__);
-            return -1;
+        // Get shared memory pool start addresses
+        CVSrsChestBuff* arr_cv_srs_chest_buff_base_addr = chest_buf_pool->get_buf_addr(0);
+        SrsInfoUpdate* arr_l1_cumac_msg = msg_mem_pool->get_buf_addr(0);
+        __half2* cubb_srs_gpu_buff_base_addr = reinterpret_cast<__half2*>(gpu_mem_pool->get_buf_addr(0));
+
+        if (!is_aligned_for_type<__half2>(cubb_srs_gpu_buff_base_addr)) {
+            throw std::runtime_error("GPU memory base address is not aligned for __half2");
         }
-        CVSrsChestBuff_contMemAlloc* arr_cv_srs_chest_buff_base_addr = reinterpret_cast<CVSrsChestBuff_contMemAlloc*>(cpu_pool_start_addr);
+        if (!is_aligned_for_type<CVSrsChestBuff>(arr_cv_srs_chest_buff_base_addr)) {
+            throw std::runtime_error("CPU memory base address is not aligned for CVSrsChestBuff");
+        }
+        if (!is_aligned_for_type<SrsInfoUpdate>(arr_l1_cumac_msg)) {
+            throw std::runtime_error("CPU memory base address is not aligned for SrsInfoUpdate");
+        }
 
-        if (!is_aligned_for_type<__half2>(gpu_pool_start_addr)) {
-            NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT, "L1-MAIN: %s: GPU memory base address is not aligned for __half2", __func__);
+        if (arr_cv_srs_chest_buff_base_addr == nullptr) {
+            NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT, "L1-MAIN: %s: CVSrsChestBuff CPU pool returned null base address", __func__);
             return -1;
         }
 
@@ -201,19 +216,18 @@ int main(int argc, char** argv)
         
         // Get and print device properties
         cudaDeviceProp deviceProp;
-        cudaGetDeviceProperties(&deviceProp, config.cuda_device_id);
+        CHECK_CUDA_ERR(cudaGetDeviceProperties(&deviceProp, config.cuda_device_id));
 
-        // Create simplified SRS memory bank (uses CVSrsChestBuff_contMemAlloc class)
+        // Create simplified SRS memory bank (uses CVSrsChestBuff class)
         // This version directly uses CUDA APIs without requiring GpuDevice/PhyDriverCtx
         NVLOGC(MU_TEST_TAG, "L1-MAIN: SRS Memory Bank Test: Creating SimpleCvSrsChestMemoryBank, contiguous GPU memory: %s", (config.is_contiguous_gpu_mem ? "true" : "false"));
-        SimpleCvSrsChestMemoryBank* memory_bank = new SimpleCvSrsChestMemoryBank(config, cpu_pool_start_addr, gpu_pool_start_addr);
+        SimpleCvSrsChestMemoryBank* memory_bank = new SimpleCvSrsChestMemoryBank(config, arr_cv_srs_chest_buff_base_addr, gpu_mem_pool);
         
         // Check if buffers are contiguous in GPU memory
         NVLOGC(MU_TEST_TAG, "L1-MAIN: SRS Memory Bank Test: Checking buffer contiguity...");
         const bool contiguous = memory_bank->areBuffersContiguous();
 
-        l1_cumac_message_t* arr_l1_cumac_msg = reinterpret_cast<l1_cumac_message_t*>(arr_cv_srs_chest_buff_base_addr + total_num_buffers);
-        
+        int ret = 0;
 #ifdef SRS_MEMORY_BANK_TEST
         ret = test_srs_memory_bank(memory_bank, config);
         if (ret != 0) {
@@ -251,7 +265,7 @@ int main(int argc, char** argv)
 
         // Create L1/L2 receiver thread
         pthread_t thread_id;
-        int ret = pthread_create(&thread_id, NULL, l1_l2_blocking_recv_task, NULL);
+        ret = pthread_create(&thread_id, NULL, l1_l2_blocking_recv_task, NULL);
         if(ret != 0) {
             NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT, "%s failed, ret=%d", __func__, ret);
             return -1;
@@ -289,8 +303,9 @@ int main(int argc, char** argv)
         // clean up memory bank before closing NVIPC shared memory pools
         delete memory_bank;
 
-        cpu_mem_pool->close(cpu_mem_pool);
-        gpu_mem_pool->close(gpu_mem_pool);
+        delete chest_buf_pool;
+        delete msg_mem_pool;
+        delete gpu_mem_pool;
         l1_cumac_sem->close(l1_cumac_sem);
 
         free(recv_msg_buff);

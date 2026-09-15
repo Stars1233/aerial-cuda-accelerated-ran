@@ -1,6 +1,6 @@
 #!/bin/bash  -e
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -215,6 +215,15 @@ if [[ "$FORCE" != true ]] && [[ -v TEST_CONFIG_DONE ]]; then
     echo "Error: $0 has already been run."
     echo "   use --force to regenerate configs"
     exit 1
+fi
+
+#--------------------------------------------------------------
+# testMAC NVIPC: use CPU_LARGE data pool via fapi_tb_loc=2
+# BFW-range cases 90156-90158,90648 (cf. parse_test_config_params.py nrsim_10_04_32dl)
+#--------------------------------------------------------------
+if [[ -v NRSIM_TC ]] && [[ "$NRSIM_TC" =~ ^(90156|90157|90158|90648)$ ]]; then
+    echo "Setting test_mac fapi_tb_loc=2 (CPU_LARGE) for NRSIM_TC=$NRSIM_TC"
+    yq -i '.fapi_tb_loc = 2' "$TESTMAC_YAML"
 fi
 
 #--------------------------------------------------------------

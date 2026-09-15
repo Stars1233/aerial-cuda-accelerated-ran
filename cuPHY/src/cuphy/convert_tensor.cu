@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -242,6 +242,32 @@ cuphyStatus_t launch_convert_from_bits(const tensor_layout_any& kLayoutDst,
 }
 
 ////////////////////////////////////////////////////////////////////////
+// converts_to_zero_bit()
+template <typename TSrc>
+__device__ __forceinline__ bool converts_to_zero_bit(TSrc value)
+{
+    return value == 0;
+}
+
+template <>
+__device__ __forceinline__ bool converts_to_zero_bit(__half value)
+{
+    return (static_cast<__half_raw>(value).x & 0x7FFFU) == 0;
+}
+
+template <>
+__device__ __forceinline__ bool converts_to_zero_bit(__nv_fp8_e4m3 value)
+{
+    return (value.__x & 0x7FU) == 0;
+}
+
+template <>
+__device__ __forceinline__ bool converts_to_zero_bit(__nv_fp8_e5m2 value)
+{
+    return (value.__x & 0x7FU) == 0;
+}
+
+////////////////////////////////////////////////////////////////////////
 // convert_to_bits_kernel()
 template <typename TSrc>
 __global__ void convert_to_bits_kernel(tensor_layout_any layoutDstWords,
@@ -282,7 +308,7 @@ __global__ void convert_to_bits_kernel(tensor_layout_any layoutDstWords,
                                                     i3,
                                                     i4};
                                 size_t   in_idx  = layoutSrc.offset(nin);
-                                uint32_t src_bit = (0 == src[in_idx]) ? 0 : 1;
+                                uint32_t src_bit = converts_to_zero_bit(src[in_idx]) ? 0 : 1;
                                 out_value |= (src_bit << i);
                             }
                         }
@@ -348,18 +374,19 @@ cuphyStatus_t convert_tensor_layout(const tensor_desc& dstTensorDesc,
     case CUPHY_BIT:
         switch(srcType)
         {
-        // Converting to bits uses a hard comparison to zero. We leverage
-        // the fact that the bit pattern for zero is the same for some
-        // different types of the same size to invoke fewer kernels.
-        case CUPHY_R_8I:  // fall through...
+        // Floating-point types must retain their type here so positive and
+        // negative zero both compare equal to zero.
+        case CUPHY_R_8I:      // fall through...
         case CUPHY_R_8U:  s = launch_convert_to_bits<CUPHY_R_8U> (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_16F: // fall through...
         case CUPHY_R_16I: // fall through...
         case CUPHY_R_16U: s = launch_convert_to_bits<CUPHY_R_16U>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_32F: // fall through...
         case CUPHY_R_32I: // fall through...
         case CUPHY_R_32U: s = launch_convert_to_bits<CUPHY_R_32U>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_16F:     s = launch_convert_to_bits<CUPHY_R_16F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_32F:     s = launch_convert_to_bits<CUPHY_R_32F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
         case CUPHY_R_64F: s = launch_convert_to_bits<CUPHY_R_64F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E4M3: s = launch_convert_to_bits<CUPHY_R_8F_E4M3>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E5M2: s = launch_convert_to_bits<CUPHY_R_8F_E5M2>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
         case CUPHY_BIT:   s = launch_convert_bits_to_bits        (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
         default:                                                                                                                      break;
         }
@@ -368,9 +395,12 @@ cuphyStatus_t convert_tensor_layout(const tensor_desc& dstTensorDesc,
     case CUPHY_R_8I:
         switch(srcType)
         {
-        case CUPHY_BIT:  s = launch_convert_from_bits<CUPHY_R_8I>  (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_8I: s = launch_convert<CUPHY_R_8I, CUPHY_R_8I>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        default:                                                                                                                        break;
+        case CUPHY_BIT:   s = launch_convert_from_bits<CUPHY_R_8I>   (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8I:  s = launch_convert<CUPHY_R_8I, CUPHY_R_8I> (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_16F: s = launch_convert<CUPHY_R_8I, CUPHY_R_16F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_32F: s = launch_convert<CUPHY_R_8I, CUPHY_R_32F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_64F: s = launch_convert<CUPHY_R_8I, CUPHY_R_64F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        default:                                                                                                                          break;
         }
         break;
     //------------------------------------------------------------------
@@ -483,10 +513,14 @@ cuphyStatus_t convert_tensor_layout(const tensor_desc& dstTensorDesc,
     case CUPHY_R_16F:
         switch(srcType)
         {
-        case CUPHY_BIT:   s = launch_convert_from_bits<CUPHY_R_16F>   (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_16F: s = launch_convert<CUPHY_R_16F, CUPHY_R_16F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_32F: s = launch_convert<CUPHY_R_16F, CUPHY_R_32F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        default:                                                                                                                           break;
+        case CUPHY_BIT:       s = launch_convert_from_bits<CUPHY_R_16F>       (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_16F:     s = launch_convert<CUPHY_R_16F, CUPHY_R_16F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_32F:     s = launch_convert<CUPHY_R_16F, CUPHY_R_32F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_64F:     s = launch_convert<CUPHY_R_16F, CUPHY_R_64F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E4M3: s = launch_convert<CUPHY_R_16F, CUPHY_R_8F_E4M3>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E5M2: s = launch_convert<CUPHY_R_16F, CUPHY_R_8F_E5M2>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8I:      s = launch_convert<CUPHY_R_16F, CUPHY_R_8I>     (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        default:                                                                                                                                   break;
         }
         break;
     //------------------------------------------------------------------
@@ -502,11 +536,14 @@ cuphyStatus_t convert_tensor_layout(const tensor_desc& dstTensorDesc,
     case CUPHY_R_32F:
         switch(srcType)
         {
-        case CUPHY_BIT:   s = launch_convert_from_bits<CUPHY_R_32F>   (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_16F: s = launch_convert<CUPHY_R_32F, CUPHY_R_16F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_32F: s = launch_convert<CUPHY_R_32F, CUPHY_R_32F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_64F: s = launch_convert<CUPHY_R_32F, CUPHY_R_64F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        default:                                                                                                                           break;
+        case CUPHY_BIT:       s = launch_convert_from_bits<CUPHY_R_32F>       (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_16F:     s = launch_convert<CUPHY_R_32F, CUPHY_R_16F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_32F:     s = launch_convert<CUPHY_R_32F, CUPHY_R_32F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_64F:     s = launch_convert<CUPHY_R_32F, CUPHY_R_64F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E4M3: s = launch_convert<CUPHY_R_32F, CUPHY_R_8F_E4M3>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E5M2: s = launch_convert<CUPHY_R_32F, CUPHY_R_8F_E5M2>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8I:      s = launch_convert<CUPHY_R_32F, CUPHY_R_8I>     (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        default:                                                                                                                                   break;
         }
         break;
     //------------------------------------------------------------------
@@ -524,11 +561,14 @@ cuphyStatus_t convert_tensor_layout(const tensor_desc& dstTensorDesc,
     case CUPHY_R_64F:
         switch(srcType)
         {
-        case CUPHY_BIT:   s = launch_convert_from_bits<CUPHY_R_64F>   (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_16F: s = launch_convert<CUPHY_R_64F, CUPHY_R_16F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_32F: s = launch_convert<CUPHY_R_64F, CUPHY_R_32F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        case CUPHY_R_64F: s = launch_convert<CUPHY_R_64F, CUPHY_R_64F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
-        default:                                                                                                                           break;
+        case CUPHY_BIT:       s = launch_convert_from_bits<CUPHY_R_64F>       (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_16F:     s = launch_convert<CUPHY_R_64F, CUPHY_R_16F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_32F:     s = launch_convert<CUPHY_R_64F, CUPHY_R_32F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_64F:     s = launch_convert<CUPHY_R_64F, CUPHY_R_64F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E4M3: s = launch_convert<CUPHY_R_64F, CUPHY_R_8F_E4M3>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E5M2: s = launch_convert<CUPHY_R_64F, CUPHY_R_8F_E5M2>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8I:      s = launch_convert<CUPHY_R_64F, CUPHY_R_8I>     (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        default:                                                                                                                                   break;
         }
         break;
     //------------------------------------------------------------------
@@ -539,6 +579,32 @@ cuphyStatus_t convert_tensor_layout(const tensor_desc& dstTensorDesc,
         case CUPHY_C_32F: s = launch_convert<CUPHY_C_64F, CUPHY_C_32F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
         case CUPHY_C_64F: s = launch_convert<CUPHY_C_64F, CUPHY_C_64F>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
         default:                                                                                                                           break;
+        }
+        break;
+    //------------------------------------------------------------------
+    case CUPHY_R_8F_E4M3:
+        switch(srcType)
+        {
+        case CUPHY_BIT:       s = launch_convert_from_bits<CUPHY_R_8F_E4M3>       (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_16F:     s = launch_convert<CUPHY_R_8F_E4M3, CUPHY_R_16F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_32F:     s = launch_convert<CUPHY_R_8F_E4M3, CUPHY_R_32F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_64F:     s = launch_convert<CUPHY_R_8F_E4M3, CUPHY_R_64F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E4M3: s = launch_convert<CUPHY_R_8F_E4M3, CUPHY_R_8F_E4M3>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E5M2: s = launch_convert<CUPHY_R_8F_E4M3, CUPHY_R_8F_E5M2>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        default:                                                                                                                                       break;
+        }
+        break;
+    //------------------------------------------------------------------
+    case CUPHY_R_8F_E5M2:
+        switch(srcType)
+        {
+        case CUPHY_BIT:       s = launch_convert_from_bits<CUPHY_R_8F_E5M2>       (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_16F:     s = launch_convert<CUPHY_R_8F_E5M2, CUPHY_R_16F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_32F:     s = launch_convert<CUPHY_R_8F_E5M2, CUPHY_R_32F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_64F:     s = launch_convert<CUPHY_R_8F_E5M2, CUPHY_R_64F>    (kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E4M3: s = launch_convert<CUPHY_R_8F_E5M2, CUPHY_R_8F_E4M3>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        case CUPHY_R_8F_E5M2: s = launch_convert<CUPHY_R_8F_E5M2, CUPHY_R_8F_E5M2>(kLayoutDst, dstAddr, kLayoutSrc, srcAddr, gridDim, blockDim, strm); break;
+        default:                                                                                                                                       break;
         }
         break;
     //------------------------------------------------------------------
@@ -558,4 +624,3 @@ cuphyStatus_t convert_tensor_layout(const tensor_desc& dstTensorDesc,
     }
     return s;
 }
-

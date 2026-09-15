@@ -101,6 +101,7 @@ bool E3Agent::init()
 
         e3_sub_socket.set(zmq::sockopt::subscribe, "");
         e3_sub_socket.set(zmq::sockopt::linger, 1000);  // 1 second linger to allow graceful shutdown
+        e3_sub_socket.set(zmq::sockopt::rcvtimeo, 20);   // block per-message; bounded idle wakeups for shutdown
 
         NVLOGC_FMT(TAG_E3, "E3 sockets initialized - REP: {}, PUB: {}, SUB: {}", e3RepPort, e3PubPort, e3SubPort);
     } catch (const zmq::error_t& e) {
@@ -120,7 +121,6 @@ bool E3Agent::init()
     {
         std::lock_guard<std::mutex> lock(dataLake->e3_buffer_mutex);
         dataLake->e3_buffer_info = {};
-        dataLake->e3_buffer_info.ue_metrics.reserve(slot_command_api::MAX_PUSCH_UE_PER_TTI);
     }
     {
         std::lock_guard<std::mutex> lock(dataLake->e3_srs_buffer_mutex);
@@ -344,186 +344,214 @@ void E3Agent::notifyDataReady()
 
         json protocolData;
 
-        // Cell-level streams: shared + PUSCH-only
+        // Slot-shared (root) streams.
         const e3::StreamType cell_streams = sub.stream_bitfield & e3::PUSCH_PROVIDABLE_STREAMS & ~e3::PER_UE_STREAMS;
-        __uint128_t remaining = static_cast<__uint128_t>(cell_streams);
-        while (remaining != 0) {
-            const __uint128_t lowest_bit = remaining & (~remaining + 1);
-            switch (static_cast<e3::StreamType>(lowest_bit)) {
-                case e3::StreamType::IQ_SAMPLES: {
-                    json iq_shm_data;
-                    iq_shm_data["shm_name"] = E3_SHARED_MEMORY_KEY;
-                    iq_shm_data["fh_buffer_index"] = static_cast<int>(buffer_info.current_fh_buffer);
-                    iq_shm_data["fh_write_index"] = buffer_info.fh_write_index;
-                    protocolData["iq_samples"] = iq_shm_data;
-                    break;
+        {
+            __uint128_t remaining = static_cast<__uint128_t>(cell_streams);
+            while (remaining != 0) {
+                const __uint128_t lowest_bit = remaining & (~remaining + 1);
+                switch (static_cast<e3::StreamType>(lowest_bit)) {
+                    case e3::StreamType::TIMESTAMP:
+                        protocolData["timestamp"] = buffer_info.timestamp_ns;
+                        break;
+                    case e3::StreamType::TIMESTAMP_TAI:
+                        protocolData["timestamp_tai"] = buffer_info.timestamp_tai_ns;
+                        break;
+                    case e3::StreamType::SFN:
+                        protocolData["sfn"] = buffer_info.sfn;
+                        break;
+                    case e3::StreamType::SLOT:
+                        protocolData["slot"] = buffer_info.slot;
+                        break;
+                    case e3::StreamType::N_CELLS:
+                        protocolData["n_cells"] = buffer_info.n_cells;
+                        break;
+                    default:
+                        break;
                 }
-                case e3::StreamType::PDU_DATA: {
-                    json pdu_shm_data;
-                    pdu_shm_data["shm_name"] = E3_SHARED_MEMORY_KEY;
-                    pdu_shm_data["pusch_buffer_index"] = static_cast<int>(buffer_info.current_pusch_buffer);
-                    pdu_shm_data["pusch_write_index"] = buffer_info.pusch_write_index;
-                    protocolData["pdu_data"] = pdu_shm_data;
-                    break;
-                }
-                case e3::StreamType::H_ESTIMATES: {
-                    json hest_shm_data;
-                    hest_shm_data["shm_name"] = E3_SHARED_MEMORY_KEY;
-                    hest_shm_data["hest_buffer_index"] = static_cast<int>(buffer_info.current_hest_buffer);
-                    hest_shm_data["hest_write_index"] = buffer_info.hest_write_index;
-                    hest_shm_data["hest_row_byte_offset"] = buffer_info.hest_row_byte_offset;
-                    protocolData["h_estimates"] = hest_shm_data;
-                    break;
-                }
-                case e3::StreamType::TIMESTAMP:
-                    protocolData["timestamp"] = buffer_info.timestamp_ns;
-                    break;
-                case e3::StreamType::TIMESTAMP_TAI:
-                    protocolData["timestamp_tai"] = buffer_info.timestamp_tai_ns;
-                    break;
-                case e3::StreamType::SFN:
-                    protocolData["sfn"] = buffer_info.sfn;
-                    break;
-                case e3::StreamType::SLOT:
-                    protocolData["slot"] = buffer_info.slot;
-                    break;
-                case e3::StreamType::CELL_ID:
-                    protocolData["cell_id"] = buffer_info.cell_id;
-                    break;
-                case e3::StreamType::N_RX_ANT:
-                    protocolData["n_rx_ant"] = buffer_info.n_rx_ant;
-                    break;
-                case e3::StreamType::N_RX_ANT_SRS:
-                    protocolData["n_rx_ant_srs"] = buffer_info.n_rx_ant_srs;
-                    break;
-                case e3::StreamType::N_CELLS:
-                    protocolData["n_cells"] = buffer_info.n_cells;
-                    break;
-                case e3::StreamType::N_BS_ANTS:
-                    protocolData["n_bs_ants"] = buffer_info.n_bs_ants;
-                    break;
-                case e3::StreamType::N_UE:
-                    protocolData["n_ue"] = buffer_info.n_ue;
-                    break;
-                default:
-                    break;
+                remaining &= ~lowest_bit;
             }
-            remaining &= ~lowest_bit;
         }
 
-        // Per-UE streams: shared (RNTI) + PUSCH-only
+        // Per-cell array: SHM refs + per-cell scalars + nested ues[].
         const e3::StreamType ue_streams = sub.stream_bitfield & e3::PUSCH_PROVIDABLE_STREAMS & e3::PER_UE_STREAMS;
-        if (static_cast<__uint128_t>(ue_streams) != 0 && !buffer_info.ue_metrics.empty()) {
-            json ue_metrics_arr = json::array();
-            for (const auto& ue : buffer_info.ue_metrics) {
-                json ue_obj;
-                __uint128_t ue_remaining = static_cast<__uint128_t>(ue_streams);
-                while (ue_remaining != 0) {
-                    const __uint128_t lowest_bit = ue_remaining & (~ue_remaining + 1);
-                    switch (static_cast<e3::StreamType>(lowest_bit)) {
-                        case e3::StreamType::RNTI:
-                            ue_obj["rnti"] = ue.rnti;
-                            break;
-                        case e3::StreamType::TB_CRC_FAIL:
-                            ue_obj["tb_crc_fail"] = ue.tb_crc_fail;
-                            break;
-                        case e3::StreamType::CB_ERRORS:
-                            ue_obj["cb_errors"] = ue.cb_errors;
-                            break;
-                        case e3::StreamType::RSRP:
-                            ue_obj["rsrp"] = ue.rsrp;
-                            break;
-                        case e3::StreamType::NOISE_VAR:
-                            ue_obj["noise_var"] = ue.noise_var;
-                            break;
-                        case e3::StreamType::CB_COUNT:
-                            ue_obj["cb_count"] = ue.cb_count;
-                            break;
-                        case e3::StreamType::RSSI:
-                            ue_obj["rssi"] = ue.rssi;
-                            break;
-                        case e3::StreamType::QAM_MOD_ORDER:
-                            ue_obj["qam_mod_order"] = ue.qam_mod_order;
-                            break;
-                        case e3::StreamType::MCS_INDEX:
-                            ue_obj["mcs_index"] = ue.mcs_index;
-                            break;
-                        case e3::StreamType::MCS_TABLE_INDEX:
-                            ue_obj["mcs_table_index"] = ue.mcs_table_index;
-                            break;
-                        case e3::StreamType::RB_START:
-                            ue_obj["rb_start"] = ue.rb_start;
-                            break;
-                        case e3::StreamType::RB_SIZE:
-                            ue_obj["rb_size"] = ue.rb_size;
-                            break;
-                        case e3::StreamType::START_SYMBOL_INDEX:
-                            ue_obj["start_symbol_index"] = ue.start_symbol_index;
-                            break;
-                        case e3::StreamType::NR_OF_SYMBOLS:
-                            ue_obj["nr_of_symbols"] = ue.nr_of_symbols;
-                            break;
-                        case e3::StreamType::N_LAYERS:
-                            ue_obj["n_layers"] = ue.n_layers;
-                            break;
-                        case e3::StreamType::TB_SIZE:
-                            ue_obj["tb_size"] = ue.tb_size;
-                            break;
-                        case e3::StreamType::PDU_LEN:
-                            ue_obj["pdu_len"] = ue.pdu_len;
-                            break;
-                        case e3::StreamType::TARGET_CODE_RATE:
-                            ue_obj["target_code_rate"] = ue.target_code_rate;
-                            break;
-                        case e3::StreamType::NEW_DATA_INDICATOR:
-                            ue_obj["new_data_indicator"] = ue.new_data_indicator;
-                            break;
-                        case e3::StreamType::LAYER_OFFSET:
-                            ue_obj["layer_offset"] = ue.layer_offset;
-                            break;
-                        case e3::StreamType::UE_GRP_IDX:
-                            ue_obj["ue_grp_idx"] = ue.ue_grp_idx;
-                            break;
-                        case e3::StreamType::H_OFFSET:
-                            ue_obj["h_offset"] = ue.h_offset;
-                            break;
-                        case e3::StreamType::H_SIZE:
-                            ue_obj["h_size"] = ue.h_size;
-                            break;
-                        case e3::StreamType::N_SUBCARRIERS:
-                            ue_obj["n_subcarriers"] = ue.n_subcarriers;
-                            break;
-                        case e3::StreamType::N_DMRS_ESTIMATES:
-                            ue_obj["n_dmrs_estimates"] = ue.n_dmrs_estimates;
-                            break;
-                        case e3::StreamType::DMRS_SYMB_POS:
-                            ue_obj["dmrs_symb_pos"] = ue.dmrs_symb_pos;
-                            break;
-                        case e3::StreamType::SINR:
-                            ue_obj["sinr"] = ue.sinr;
-                            break;
-                        case e3::StreamType::TIMING_ADVANCE:
-                            ue_obj["timing_advance"] = ue.timing_advance;
-                            break;
-                        case e3::StreamType::HARQ_PROCESS_ID:
-                            ue_obj["harq_process_id"] = ue.harq_process_id;
-                            break;
-                        case e3::StreamType::RV_INDEX:
-                            ue_obj["rv_index"] = ue.rv_index;
-                            break;
-                        case e3::StreamType::CFO_HZ:
-                            ue_obj["cfo_hz"] = ue.cfo_hz;
-                            break;
-                        default:
-                            break;
+        json cells_arr = json::array();
+        for (const auto& cell : buffer_info.cells) {
+            json cell_obj;
+            __uint128_t remaining = static_cast<__uint128_t>(cell_streams);
+            while (remaining != 0) {
+                const __uint128_t lowest_bit = remaining & (~remaining + 1);
+                switch (static_cast<e3::StreamType>(lowest_bit)) {
+                    case e3::StreamType::IQ_SAMPLES: {
+                        json iq_shm_data;
+                        iq_shm_data["shm_name"] = E3_SHARED_MEMORY_KEY;
+                        iq_shm_data["fh_buffer_index"] = static_cast<int>(cell.current_fh_buffer);
+                        iq_shm_data["fh_write_index"] = cell.fh_write_index;
+                        cell_obj["iq_samples"] = iq_shm_data;
+                        break;
                     }
-                    ue_remaining &= ~lowest_bit;
+                    case e3::StreamType::PDU_DATA: {
+                        json pdu_shm_data;
+                        pdu_shm_data["shm_name"] = E3_SHARED_MEMORY_KEY;
+                        pdu_shm_data["pusch_buffer_index"] = static_cast<int>(cell.current_pusch_buffer);
+                        pdu_shm_data["pusch_write_index"] = cell.pusch_write_index;
+                        cell_obj["pdu_data"] = pdu_shm_data;
+                        break;
+                    }
+                    case e3::StreamType::H_ESTIMATES: {
+                        json hest_shm_data;
+                        hest_shm_data["shm_name"] = E3_SHARED_MEMORY_KEY;
+                        hest_shm_data["hest_buffer_index"] = static_cast<int>(cell.current_hest_buffer);
+                        hest_shm_data["hest_write_index"] = cell.hest_write_index;
+                        hest_shm_data["hest_row_byte_offset"] = cell.hest_row_byte_offset;
+                        cell_obj["h_estimates"] = hest_shm_data;
+                        break;
+                    }
+                    case e3::StreamType::CELL_ID:
+                        cell_obj["cell_id"] = cell.cell_id;
+                        break;
+                    case e3::StreamType::N_RX_ANT:
+                        cell_obj["n_rx_ant"] = cell.n_rx_ant;
+                        break;
+                    case e3::StreamType::N_RX_ANT_SRS:
+                        cell_obj["n_rx_ant_srs"] = cell.n_rx_ant_srs;
+                        break;
+                    case e3::StreamType::N_BS_ANTS:
+                        cell_obj["n_bs_ants"] = cell.n_bs_ants;
+                        break;
+                    case e3::StreamType::N_UE:
+                        cell_obj["n_ue"] = cell.n_ue;
+                        break;
+                    default:
+                        break;
                 }
-                if (!ue_obj.empty()) {
-                    ue_metrics_arr.push_back(std::move(ue_obj));
+                remaining &= ~lowest_bit;
+            }
+
+            if (static_cast<__uint128_t>(ue_streams) != 0 && !cell.ues.empty()) {
+                json ues_arr = json::array();
+                for (const auto& ue : cell.ues) {
+                    json ue_obj;
+                    __uint128_t ue_remaining = static_cast<__uint128_t>(ue_streams);
+                    while (ue_remaining != 0) {
+                        const __uint128_t lowest_bit = ue_remaining & (~ue_remaining + 1);
+                        switch (static_cast<e3::StreamType>(lowest_bit)) {
+                            case e3::StreamType::RNTI:
+                                ue_obj["rnti"] = ue.rnti;
+                                break;
+                            case e3::StreamType::TB_CRC_FAIL:
+                                ue_obj["tb_crc_fail"] = ue.tb_crc_fail;
+                                break;
+                            case e3::StreamType::CB_ERRORS:
+                                ue_obj["cb_errors"] = ue.cb_errors;
+                                break;
+                            case e3::StreamType::RSRP:
+                                ue_obj["rsrp"] = ue.rsrp;
+                                break;
+                            case e3::StreamType::NOISE_VAR:
+                                ue_obj["noise_var"] = ue.noise_var;
+                                break;
+                            case e3::StreamType::CB_COUNT:
+                                ue_obj["cb_count"] = ue.cb_count;
+                                break;
+                            case e3::StreamType::RSSI:
+                                ue_obj["rssi"] = ue.rssi;
+                                break;
+                            case e3::StreamType::QAM_MOD_ORDER:
+                                ue_obj["qam_mod_order"] = ue.qam_mod_order;
+                                break;
+                            case e3::StreamType::MCS_INDEX:
+                                ue_obj["mcs_index"] = ue.mcs_index;
+                                break;
+                            case e3::StreamType::MCS_TABLE_INDEX:
+                                ue_obj["mcs_table_index"] = ue.mcs_table_index;
+                                break;
+                            case e3::StreamType::RB_START:
+                                ue_obj["rb_start"] = ue.rb_start;
+                                break;
+                            case e3::StreamType::RB_SIZE:
+                                ue_obj["rb_size"] = ue.rb_size;
+                                break;
+                            case e3::StreamType::START_SYMBOL_INDEX:
+                                ue_obj["start_symbol_index"] = ue.start_symbol_index;
+                                break;
+                            case e3::StreamType::NR_OF_SYMBOLS:
+                                ue_obj["nr_of_symbols"] = ue.nr_of_symbols;
+                                break;
+                            case e3::StreamType::N_LAYERS:
+                                ue_obj["n_layers"] = ue.n_layers;
+                                break;
+                            case e3::StreamType::TB_SIZE:
+                                ue_obj["tb_size"] = ue.tb_size;
+                                break;
+                            case e3::StreamType::PDU_LEN:
+                                ue_obj["pdu_len"] = ue.pdu_len;
+                                break;
+                            case e3::StreamType::PDU_OFFSET:
+                                ue_obj["pdu_offset"] = ue.pdu_offset;
+                                break;
+                            case e3::StreamType::TARGET_CODE_RATE:
+                                ue_obj["target_code_rate"] = ue.target_code_rate;
+                                break;
+                            case e3::StreamType::NEW_DATA_INDICATOR:
+                                ue_obj["new_data_indicator"] = ue.new_data_indicator;
+                                break;
+                            case e3::StreamType::LAYER_OFFSET:
+                                ue_obj["layer_offset"] = ue.layer_offset;
+                                break;
+                            case e3::StreamType::UE_GRP_IDX:
+                                ue_obj["ue_grp_idx"] = ue.ue_grp_idx;
+                                break;
+                            case e3::StreamType::H_OFFSET:
+                                ue_obj["h_offset"] = ue.h_offset;
+                                break;
+                            case e3::StreamType::H_SIZE:
+                                ue_obj["h_size"] = ue.h_size;
+                                break;
+                            case e3::StreamType::N_SUBCARRIERS:
+                                ue_obj["n_subcarriers"] = ue.n_subcarriers;
+                                break;
+                            case e3::StreamType::N_DMRS_ESTIMATES:
+                                ue_obj["n_dmrs_estimates"] = ue.n_dmrs_estimates;
+                                break;
+                            case e3::StreamType::DMRS_SYMB_POS:
+                                ue_obj["dmrs_symb_pos"] = ue.dmrs_symb_pos;
+                                break;
+                            case e3::StreamType::SINR:
+                                ue_obj["sinr"] = ue.sinr;
+                                break;
+                            case e3::StreamType::TIMING_ADVANCE:
+                                ue_obj["timing_advance"] = ue.timing_advance;
+                                break;
+                            case e3::StreamType::HARQ_PROCESS_ID:
+                                ue_obj["harq_process_id"] = ue.harq_process_id;
+                                break;
+                            case e3::StreamType::RV_INDEX:
+                                ue_obj["rv_index"] = ue.rv_index;
+                                break;
+                            case e3::StreamType::CFO_HZ:
+                                ue_obj["cfo_hz"] = ue.cfo_hz;
+                                break;
+                            default:
+                                break;
+                        }
+                        ue_remaining &= ~lowest_bit;
+                    }
+                    if (!ue_obj.empty()) {
+                        ues_arr.push_back(std::move(ue_obj));
+                    }
+                }
+                if (!ues_arr.empty()) {
+                    cell_obj["ues"] = std::move(ues_arr);
                 }
             }
-            protocolData["ue_metrics"] = std::move(ue_metrics_arr);
+
+            if (!cell_obj.empty()) {
+                cells_arr.push_back(std::move(cell_obj));
+            }
+        }
+        if (!cells_arr.empty()) {
+            protocolData["cells"] = std::move(cells_arr);
         }
 
         if (protocolData.empty()) {
@@ -591,182 +619,205 @@ void E3Agent::notifySrsDataReady()
 
         json protocolData;
 
-        // Cell-level streams: shared + SRS-only
+        // Slot-shared (root) streams; per-cell streams handled inside cells[] below.
         const e3::StreamType cell_streams = sub.stream_bitfield & e3::SRS_PROVIDABLE_STREAMS & ~e3::PER_UE_STREAMS;
-        __uint128_t remaining = static_cast<__uint128_t>(cell_streams);
-        while (remaining != 0) {
-            const __uint128_t lowest_bit = remaining & (~remaining + 1);
-            switch (static_cast<e3::StreamType>(lowest_bit)) {
-                // Shared cell-level
-                case e3::StreamType::TIMESTAMP:
-                    protocolData["timestamp"] = srs_info.timestamp_ns;
-                    break;
-                case e3::StreamType::TIMESTAMP_TAI:
-                    protocolData["timestamp_tai"] = srs_info.timestamp_tai_ns;
-                    break;
-                case e3::StreamType::SFN:
-                    protocolData["sfn"] = srs_info.sfn;
-                    break;
-                case e3::StreamType::SLOT:
-                    protocolData["slot"] = srs_info.slot;
-                    break;
-                case e3::StreamType::CELL_ID:
-                    protocolData["cell_id"] = srs_info.cell_id;
-                    break;
-                case e3::StreamType::N_RX_ANT_SRS:
-                    protocolData["n_rx_ant_srs"] = srs_info.n_rx_ant_srs;
-                    break;
-                case e3::StreamType::N_CELLS:
-                    protocolData["n_cells"] = srs_info.n_cells;
-                    break;
-                // SRS-only cell-level
-                case e3::StreamType::SRS_IQ_SAMPLES: {
-                    json srs_iq_shm;
-                    srs_iq_shm["shm_name"] = E3_SHARED_MEMORY_KEY;
-                    srs_iq_shm["srs_iq_buffer_index"] = static_cast<int>(srs_info.current_srs_iq_buffer);
-                    srs_iq_shm["srs_iq_write_index"] = srs_info.srs_iq_write_index;
-                    srs_iq_shm["srs_iq_row_byte_offset"] = srs_info.srs_iq_row_byte_offset;
-                    protocolData["srs_iq_samples"] = srs_iq_shm;
-                    break;
+        {
+            __uint128_t remaining = static_cast<__uint128_t>(cell_streams);
+            while (remaining != 0) {
+                const __uint128_t lowest_bit = remaining & (~remaining + 1);
+                switch (static_cast<e3::StreamType>(lowest_bit)) {
+                    case e3::StreamType::TIMESTAMP:
+                        protocolData["timestamp"] = srs_info.timestamp_ns;
+                        break;
+                    case e3::StreamType::TIMESTAMP_TAI:
+                        protocolData["timestamp_tai"] = srs_info.timestamp_tai_ns;
+                        break;
+                    case e3::StreamType::SFN:
+                        protocolData["sfn"] = srs_info.sfn;
+                        break;
+                    case e3::StreamType::SLOT:
+                        protocolData["slot"] = srs_info.slot;
+                        break;
+                    case e3::StreamType::N_CELLS:
+                        protocolData["n_cells"] = srs_info.n_cells;
+                        break;
+                    default:
+                        break;
                 }
-                case e3::StreamType::SRS_HEST: {
-                    json srs_hest_shm;
-                    srs_hest_shm["shm_name"] = E3_SHARED_MEMORY_KEY;
-                    srs_hest_shm["srs_hest_buffer_index"] = static_cast<int>(srs_info.current_srs_hest_buffer);
-                    srs_hest_shm["srs_hest_write_index"] = srs_info.srs_hest_write_index;
-                    protocolData["srs_hest"] = srs_hest_shm;
-                    break;
-                }
-                case e3::StreamType::SRS_RB_SNR: {
-                    json srs_rbsnr_shm;
-                    srs_rbsnr_shm["shm_name"] = E3_SHARED_MEMORY_KEY;
-                    srs_rbsnr_shm["srs_rb_snr_buffer_index"] = static_cast<int>(srs_info.current_srs_rb_snr_buffer);
-                    srs_rbsnr_shm["srs_rb_snr_write_index"] = srs_info.srs_rb_snr_write_index;
-                    protocolData["srs_rb_snr"] = srs_rbsnr_shm;
-                    break;
-                }
-                case e3::StreamType::SRS_CELL_START_SYM:
-                    protocolData["srs_cell_start_sym"] = srs_info.srs_cell_start_sym;
-                    break;
-                case e3::StreamType::SRS_CELL_N_SRS_SYM:
-                    protocolData["srs_cell_n_srs_sym"] = srs_info.srs_cell_n_srs_sym;
-                    break;
-                case e3::StreamType::N_SRS_UE:
-                    protocolData["n_srs_ue"] = srs_info.n_srs_ue;
-                    break;
-                default:
-                    break;
+                remaining &= ~lowest_bit;
             }
-            remaining &= ~lowest_bit;
         }
 
-        // Per-UE streams: shared (RNTI) + SRS-only
+        // Per-cell array: SRS SHM refs + per-cell scalars + nested ues[].
         const e3::StreamType ue_streams = sub.stream_bitfield & e3::SRS_PROVIDABLE_STREAMS & e3::PER_UE_STREAMS;
-        if (static_cast<__uint128_t>(ue_streams) != 0 && !srs_info.ue_metrics.empty()) {
-            json ue_metrics_arr = json::array();
-            for (const auto& ue : srs_info.ue_metrics) {
-                json ue_obj;
-                __uint128_t ue_remaining = static_cast<__uint128_t>(ue_streams);
-                while (ue_remaining != 0) {
-                    const __uint128_t lowest_bit = ue_remaining & (~ue_remaining + 1);
-                    switch (static_cast<e3::StreamType>(lowest_bit)) {
-                        case e3::StreamType::RNTI:
-                            ue_obj["rnti"] = ue.rnti;
-                            break;
-                        case e3::StreamType::SRS_WIDEBAND_SNR:
-                            ue_obj["srs_wideband_snr"] = ue.wideband_snr;
-                            break;
-                        case e3::StreamType::SRS_SIGNAL_ENERGY:
-                            ue_obj["srs_signal_energy"] = ue.signal_energy;
-                            break;
-                        case e3::StreamType::SRS_NOISE_ENERGY:
-                            ue_obj["srs_noise_energy"] = ue.noise_energy;
-                            break;
-                        case e3::StreamType::SRS_TOA:
-                            ue_obj["srs_toa"] = ue.toa_us;
-                            break;
-                        case e3::StreamType::SRS_HD_ANT_FLAG:
-                            ue_obj["srs_hd_ant_flag"] = ue.hd_ant_flag;
-                            break;
-                        case e3::StreamType::SRS_SC_CORR:
-                            ue_obj["srs_sc_corr"] = {ue.sc_corr_re, ue.sc_corr_im};
-                            break;
-                        case e3::StreamType::SRS_CS_CORR_RATIO_DB:
-                            ue_obj["srs_cs_corr_ratio_db"] = ue.cs_corr_ratio_db;
-                            break;
-                        case e3::StreamType::SRS_ANT_PORTS:
-                            ue_obj["srs_ant_ports"] = ue.n_ant_ports;
-                            break;
-                        case e3::StreamType::SRS_N_SYMS:
-                            ue_obj["srs_n_syms"] = ue.n_syms;
-                            break;
-                        case e3::StreamType::SRS_N_REPETITIONS:
-                            ue_obj["srs_n_repetitions"] = ue.n_repetitions;
-                            break;
-                        case e3::StreamType::SRS_COMB_SIZE:
-                            ue_obj["srs_comb_size"] = ue.comb_size;
-                            break;
-                        case e3::StreamType::SRS_COMB_OFFSET:
-                            ue_obj["srs_comb_offset"] = ue.comb_offset;
-                            break;
-                        case e3::StreamType::SRS_START_SYM:
-                            ue_obj["srs_start_sym"] = ue.start_sym;
-                            break;
-                        case e3::StreamType::SRS_CYCLIC_SHIFT:
-                            ue_obj["srs_cyclic_shift"] = ue.cyclic_shift;
-                            break;
-                        case e3::StreamType::SRS_FREQ_POSITION:
-                            ue_obj["srs_freq_position"] = ue.frequency_position;
-                            break;
-                        case e3::StreamType::SRS_FREQ_SHIFT:
-                            ue_obj["srs_freq_shift"] = ue.frequency_shift;
-                            break;
-                        case e3::StreamType::SRS_FREQ_HOPPING:
-                            ue_obj["srs_freq_hopping"] = ue.frequency_hopping;
-                            break;
-                        case e3::StreamType::SRS_RESOURCE_TYPE:
-                            ue_obj["srs_resource_type"] = ue.resource_type;
-                            break;
-                        case e3::StreamType::SRS_T_SRS:
-                            ue_obj["srs_t_srs"] = ue.t_srs;
-                            break;
-                        case e3::StreamType::SRS_T_OFFSET:
-                            ue_obj["srs_t_offset"] = ue.t_offset;
-                            break;
-                        case e3::StreamType::SRS_USAGE:
-                            ue_obj["srs_usage"] = ue.usage;
-                            break;
-                        case e3::StreamType::SRS_N_VALID_PRG:
-                            ue_obj["srs_n_valid_prg"] = ue.n_valid_prg;
-                            break;
-                        case e3::StreamType::SRS_PRG_SIZE:
-                            ue_obj["srs_prg_size"] = ue.prg_size;
-                            break;
-                        case e3::StreamType::SRS_HEST_N_PRB_GRPS:
-                            ue_obj["srs_hest_n_prb_grps"] = ue.n_prb_grps;
-                            break;
-                        case e3::StreamType::SRS_HEST_OFFSET:
-                            ue_obj["srs_hest_offset"] = ue.srs_hest_offset;
-                            break;
-                        case e3::StreamType::SRS_HEST_SIZE:
-                            ue_obj["srs_hest_size"] = ue.srs_hest_size;
-                            break;
-                        case e3::StreamType::SRS_RB_SNR_OFFSET:
-                            ue_obj["srs_rb_snr_offset"] = ue.srs_rb_snr_offset;
-                            break;
-                        case e3::StreamType::SRS_RB_SNR_SIZE:
-                            ue_obj["srs_rb_snr_size"] = ue.srs_rb_snr_size;
-                            break;
-                        default:
-                            break;
+        json cells_arr = json::array();
+        for (const auto& cell : srs_info.cells) {
+            json cell_obj;
+            __uint128_t remaining = static_cast<__uint128_t>(cell_streams);
+            while (remaining != 0) {
+                const __uint128_t lowest_bit = remaining & (~remaining + 1);
+                switch (static_cast<e3::StreamType>(lowest_bit)) {
+                    case e3::StreamType::CELL_ID:
+                        cell_obj["cell_id"] = cell.cell_id;
+                        break;
+                    case e3::StreamType::N_RX_ANT_SRS:
+                        cell_obj["n_rx_ant_srs"] = cell.n_rx_ant_srs;
+                        break;
+                    case e3::StreamType::SRS_IQ_SAMPLES: {
+                        json srs_iq_shm;
+                        srs_iq_shm["shm_name"] = E3_SHARED_MEMORY_KEY;
+                        srs_iq_shm["srs_iq_buffer_index"] = static_cast<int>(cell.current_srs_iq_buffer);
+                        srs_iq_shm["srs_iq_write_index"] = cell.srs_iq_write_index;
+                        srs_iq_shm["srs_iq_row_byte_offset"] = cell.srs_iq_row_byte_offset;
+                        cell_obj["srs_iq_samples"] = srs_iq_shm;
+                        break;
                     }
-                    ue_remaining &= ~lowest_bit;
+                    case e3::StreamType::SRS_HEST: {
+                        json srs_hest_shm;
+                        srs_hest_shm["shm_name"] = E3_SHARED_MEMORY_KEY;
+                        srs_hest_shm["srs_hest_buffer_index"] = static_cast<int>(cell.current_srs_hest_buffer);
+                        srs_hest_shm["srs_hest_write_index"] = cell.srs_hest_write_index;
+                        cell_obj["srs_hest"] = srs_hest_shm;
+                        break;
+                    }
+                    case e3::StreamType::SRS_RB_SNR: {
+                        json srs_rbsnr_shm;
+                        srs_rbsnr_shm["shm_name"] = E3_SHARED_MEMORY_KEY;
+                        srs_rbsnr_shm["srs_rb_snr_buffer_index"] = static_cast<int>(cell.current_srs_rb_snr_buffer);
+                        srs_rbsnr_shm["srs_rb_snr_write_index"] = cell.srs_rb_snr_write_index;
+                        cell_obj["srs_rb_snr"] = srs_rbsnr_shm;
+                        break;
+                    }
+                    case e3::StreamType::SRS_CELL_START_SYM:
+                        cell_obj["srs_cell_start_sym"] = cell.srs_cell_start_sym;
+                        break;
+                    case e3::StreamType::SRS_CELL_N_SRS_SYM:
+                        cell_obj["srs_cell_n_srs_sym"] = cell.srs_cell_n_srs_sym;
+                        break;
+                    case e3::StreamType::N_SRS_UE:
+                        cell_obj["n_srs_ue"] = cell.n_srs_ue;
+                        break;
+                    default:
+                        break;
                 }
-                if (!ue_obj.empty()) {
-                    ue_metrics_arr.push_back(std::move(ue_obj));
+                remaining &= ~lowest_bit;
+            }
+
+            if (static_cast<__uint128_t>(ue_streams) != 0 && !cell.ues.empty()) {
+                json ues_arr = json::array();
+                for (const auto& ue : cell.ues) {
+                    json ue_obj;
+                    __uint128_t ue_remaining = static_cast<__uint128_t>(ue_streams);
+                    while (ue_remaining != 0) {
+                        const __uint128_t lowest_bit = ue_remaining & (~ue_remaining + 1);
+                        switch (static_cast<e3::StreamType>(lowest_bit)) {
+                            case e3::StreamType::RNTI:
+                                ue_obj["rnti"] = ue.rnti;
+                                break;
+                            case e3::StreamType::SRS_WIDEBAND_SNR:
+                                ue_obj["srs_wideband_snr"] = ue.wideband_snr;
+                                break;
+                            case e3::StreamType::SRS_SIGNAL_ENERGY:
+                                ue_obj["srs_signal_energy"] = ue.signal_energy;
+                                break;
+                            case e3::StreamType::SRS_NOISE_ENERGY:
+                                ue_obj["srs_noise_energy"] = ue.noise_energy;
+                                break;
+                            case e3::StreamType::SRS_TOA:
+                                ue_obj["srs_toa"] = ue.toa_us;
+                                break;
+                            case e3::StreamType::SRS_HD_ANT_FLAG:
+                                ue_obj["srs_hd_ant_flag"] = ue.hd_ant_flag;
+                                break;
+                            case e3::StreamType::SRS_SC_CORR:
+                                ue_obj["srs_sc_corr"] = {ue.sc_corr_re, ue.sc_corr_im};
+                                break;
+                            case e3::StreamType::SRS_CS_CORR_RATIO_DB:
+                                ue_obj["srs_cs_corr_ratio_db"] = ue.cs_corr_ratio_db;
+                                break;
+                            case e3::StreamType::SRS_ANT_PORTS:
+                                ue_obj["srs_ant_ports"] = ue.n_ant_ports;
+                                break;
+                            case e3::StreamType::SRS_N_SYMS:
+                                ue_obj["srs_n_syms"] = ue.n_syms;
+                                break;
+                            case e3::StreamType::SRS_N_REPETITIONS:
+                                ue_obj["srs_n_repetitions"] = ue.n_repetitions;
+                                break;
+                            case e3::StreamType::SRS_COMB_SIZE:
+                                ue_obj["srs_comb_size"] = ue.comb_size;
+                                break;
+                            case e3::StreamType::SRS_COMB_OFFSET:
+                                ue_obj["srs_comb_offset"] = ue.comb_offset;
+                                break;
+                            case e3::StreamType::SRS_START_SYM:
+                                ue_obj["srs_start_sym"] = ue.start_sym;
+                                break;
+                            case e3::StreamType::SRS_CYCLIC_SHIFT:
+                                ue_obj["srs_cyclic_shift"] = ue.cyclic_shift;
+                                break;
+                            case e3::StreamType::SRS_FREQ_POSITION:
+                                ue_obj["srs_freq_position"] = ue.frequency_position;
+                                break;
+                            case e3::StreamType::SRS_FREQ_SHIFT:
+                                ue_obj["srs_freq_shift"] = ue.frequency_shift;
+                                break;
+                            case e3::StreamType::SRS_FREQ_HOPPING:
+                                ue_obj["srs_freq_hopping"] = ue.frequency_hopping;
+                                break;
+                            case e3::StreamType::SRS_RESOURCE_TYPE:
+                                ue_obj["srs_resource_type"] = ue.resource_type;
+                                break;
+                            case e3::StreamType::SRS_T_SRS:
+                                ue_obj["srs_t_srs"] = ue.t_srs;
+                                break;
+                            case e3::StreamType::SRS_T_OFFSET:
+                                ue_obj["srs_t_offset"] = ue.t_offset;
+                                break;
+                            case e3::StreamType::SRS_USAGE:
+                                ue_obj["srs_usage"] = ue.usage;
+                                break;
+                            case e3::StreamType::SRS_N_VALID_PRG:
+                                ue_obj["srs_n_valid_prg"] = ue.n_valid_prg;
+                                break;
+                            case e3::StreamType::SRS_PRG_SIZE:
+                                ue_obj["srs_prg_size"] = ue.prg_size;
+                                break;
+                            case e3::StreamType::SRS_HEST_N_PRB_GRPS:
+                                ue_obj["srs_hest_n_prb_grps"] = ue.n_prb_grps;
+                                break;
+                            case e3::StreamType::SRS_HEST_OFFSET:
+                                ue_obj["srs_hest_offset"] = ue.srs_hest_offset;
+                                break;
+                            case e3::StreamType::SRS_HEST_SIZE:
+                                ue_obj["srs_hest_size"] = ue.srs_hest_size;
+                                break;
+                            case e3::StreamType::SRS_RB_SNR_OFFSET:
+                                ue_obj["srs_rb_snr_offset"] = ue.srs_rb_snr_offset;
+                                break;
+                            case e3::StreamType::SRS_RB_SNR_SIZE:
+                                ue_obj["srs_rb_snr_size"] = ue.srs_rb_snr_size;
+                                break;
+                            default:
+                                break;
+                        }
+                        ue_remaining &= ~lowest_bit;
+                    }
+                    if (!ue_obj.empty()) {
+                        ues_arr.push_back(std::move(ue_obj));
+                    }
+                }
+                if (!ues_arr.empty()) {
+                    cell_obj["ues"] = std::move(ues_arr);
                 }
             }
-            protocolData["ue_metrics"] = std::move(ue_metrics_arr);
+
+            if (!cell_obj.empty()) {
+                cells_arr.push_back(std::move(cell_obj));
+            }
+        }
+        if (!cells_arr.empty()) {
+            protocolData["cells"] = std::move(cells_arr);
         }
 
         if (protocolData.empty()) {
@@ -906,7 +957,10 @@ void E3Agent::managerSubscriptionThread()
     while (e3_sub_running) {
         try {
             zmq::message_t msg;
-            const auto result = e3_sub_socket.recv(msg, zmq::recv_flags::dontwait);
+            // Blocking recv (rcvtimeo-bounded) so control messages are drained at
+            // arrival rate. A dontwait+sleep loop caps intake and backs up the SUB
+            // queue, delaying/dropping controls under load.
+            const auto result = e3_sub_socket.recv(msg);
 
             if (result) {
                 try {
@@ -924,8 +978,6 @@ void E3Agent::managerSubscriptionThread()
                 NVLOGC_FMT(TAG_E3, "Error receiving from Manager: {}", e.what());
             }
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     NVLOGC_FMT(TAG_E3, "E3 Manager subscription thread stopped");
@@ -1303,6 +1355,7 @@ void E3Agent::handleSetupRequest(const json& request, std::string& response) {
 		available_data_streams.push_back(createIndicationPayloadStream("n_layers", "uint8", "Number of spatial layers [per-UE]"));
 		available_data_streams.push_back(createIndicationPayloadStream("tb_size", "uint32", "Transport block size in bytes [per-UE]"));
 		available_data_streams.push_back(createIndicationPayloadStream("pdu_len", "uint32", "PDU length in bytes (tb_size on CRC pass, 0 on fail) [per-UE]"));
+		available_data_streams.push_back(createIndicationPayloadStream("pdu_offset", "uint32", "Byte offset of UE PDU in SHM PUSCH row [per-UE]"));
 		available_data_streams.push_back(createIndicationPayloadStream("target_code_rate", "uint16", "Target code rate (x10, e.g. 3080 = R=0.308) [per-UE]"));
 		available_data_streams.push_back(createIndicationPayloadStream("new_data_indicator", "uint8", "New data indicator (0=retx, 1=new) [per-UE]"));
 		available_data_streams.push_back(createIndicationPayloadStream("layer_offset", "uint16", "Start index in H matrix layer dimension within group [per-UE]"));
@@ -1358,9 +1411,9 @@ void E3Agent::handleSetupRequest(const json& request, std::string& response) {
 		available_data_streams.push_back(createIndicationPayloadStream("srs_signal_energy", "float32", "SRS signal energy [per-UE]"));
 		available_data_streams.push_back(createIndicationPayloadStream("srs_noise_energy", "float32", "SRS noise energy [per-UE]"));
 		available_data_streams.push_back(createIndicationPayloadStream("srs_toa", "float32", "SRS time of arrival in microseconds [per-UE]"));
-		available_data_streams.push_back(createIndicationPayloadStream("srs_hd_ant_flag", "uint8", "SRS half-duplex antenna flag [per-UE]"));
-		available_data_streams.push_back(createIndicationPayloadStream("srs_sc_corr", "array(float32)", "SRS wideband spatial correlation [re, im] [per-UE]"));
-		available_data_streams.push_back(createIndicationPayloadStream("srs_cs_corr_ratio_db", "float32", "SRS cross-section correlation ratio in dB [per-UE]"));
+		available_data_streams.push_back(createIndicationPayloadStream("srs_hd_ant_flag", "uint8", "SRS high-density antenna port flag, 1 = SNR unreliable [per-UE]"));
+		available_data_streams.push_back(createIndicationPayloadStream("srs_sc_corr", "array(float32)", "SRS wideband subcarrier correlation [re, im] [per-UE]"));
+		available_data_streams.push_back(createIndicationPayloadStream("srs_cs_corr_ratio_db", "float32", "SRS correlation energy on used vs unused cyclic shifts in dB [per-UE]"));
 
 		// SRS per-UE config streams (from cuphyUeSrsPrm_t)
 		available_data_streams.push_back(createIndicationPayloadStream("srs_ant_ports", "uint8", "SRS number of antenna ports [per-UE]"));

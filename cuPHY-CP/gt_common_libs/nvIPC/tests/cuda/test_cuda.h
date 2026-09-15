@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,10 +41,16 @@ void cuda_to_lower_case(char* str, int length, int deviceId);
 
 void test_cuda_to_lower_case(int deviceId, char* str, int length, int gpu);
 
-int get_cuda_device_id(void);
+// Must be called once from the main thread after CUDA context is active.
+// Returns 0 on success, -1 on failure.
+__attribute__((warn_unused_result)) int init_test_cuda_kernels_c(void);
 
 #if defined(__cplusplus)
 } /* extern "C" */
+#endif
+
+#ifdef __cplusplus
+[[nodiscard]] bool init_test_cuda_kernels();
 #endif
 
 #endif /* _TEST_CUDA_H_ */

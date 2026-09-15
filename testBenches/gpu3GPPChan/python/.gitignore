@@ -1,0 +1,9 @@
+/build/
+/dist/
+/.venv/
+/*.egg-info/
+/src/*.egg-info/
+/src/gpu3gppchan/_gpu3gppchan*.so
+/src/gpu3gppchan/libgpu3gppchan.so*
+__pycache__/
+*.py[cod]

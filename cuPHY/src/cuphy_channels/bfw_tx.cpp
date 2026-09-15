@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -178,6 +178,9 @@ void BfwTx::createGraphExec()
     for(int32_t hetCfgIdx = 0; hetCfgIdx < CUPHY_BFW_COEF_COMP_N_MAX_HET_CFGS; ++hetCfgIdx)
     {
         CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_bfwCoefCompNodes[hetCfgIdx], m_graph, bfwCoefCompNodeDeps.data(), bfwCoefCompNodeDeps.size(), &(m_emptyNodePrms)));
+#if CUDA_VERSION >= 13020
+        CU_CHECK_EXCEPTION(cuGraphKernelNodeSetAttribute(m_bfwCoefCompNodes[hetCfgIdx], CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE, &m_kernelNodeAttrValue));
+#endif
     }
 
     //--------------------------------------------------------------------------
@@ -348,7 +351,7 @@ cuphyStatus_t BfwTx::run(uint64_t /*procModeBmsk*/)
         std::span<cuphyBfwCoefCompLaunchCfg_t> launchCfgs{m_bfwCoefCompLaunchCfgs.cfgs, m_bfwCoefCompLaunchCfgs.nCfgs};
         for(const auto& cfg : launchCfgs)
         {
-            CU_CHECK_EXCEPTION(launch_kernel(cfg.kernelNodeParamsDriver, m_cuStrm));
+            CU_CHECK_EXCEPTION(launch_kernel_ex(cfg.kernelNodeParamsDriver, m_cuStrm, true));
         }
     }
 

@@ -406,8 +406,10 @@ inline void pdsch_params_cleanup(cuphyPdschStatPrms_t& pdsch_static_params,
         delete[] cell_group->pUePrms;
         delete[] cell_group->pCwPrms;
         delete[] cell_group->pCsiRsPrms;
+        delete[] cell_group->pPmwPrms;
     }
 }
+
 
 inline void read_pdsch_static_pars_from_file(cuphyPdschStatPrms_t& pdsch_static_params,
                                              hdf5hpp::hdf5_file& input_file,
@@ -449,6 +451,9 @@ inline void read_pdsch_static_pars_from_file(cuphyPdschStatPrms_t& pdsch_static_
     pdsch_static_params.enableBatchedMemcpy = 0; //update as needed
 
     pdsch_static_params.pDbg = new cuphyPdschDbgPrms_t({filename, 1 /* check TB size*/, ref_check}); //identical_ldpc_configs not set; is deprecated
+
+    pdsch_static_params.delayUs                  = 0; // update as needed
+    pdsch_static_params.pipeline_processing_mode = cuphyPdschPipelineMode_t::PDSCH_FULL_PROCESSING; // update as needed
 }
 
 inline void read_pdsch_static_pars_from_file_v2(cuphyPdschStatPrms_t& pdsch_static_params,
@@ -1176,7 +1181,8 @@ inline void print_pdsch_static(cuphyPdschStatPrms_t* static_params)
 
     // Parameters common across all cells
     NVLOGC_FMT(NVLOG_PDSCH, "read_TB_CRC:           {:4d}", static_params->read_TB_CRC);
-    NVLOGC_FMT(NVLOG_PDSCH, "full_slot_processing:  {:4d}", static_params->full_slot_processing);
+    NVLOGC_FMT(NVLOG_PDSCH, "pipeline_processing_mode:  {:4d}", static_params->pipeline_processing_mode);
+    NVLOGC_FMT(NVLOG_PDSCH, "delayUs:               {:4d}", static_params->delayUs);
     NVLOGC_FMT(NVLOG_PDSCH, "stream_priority:       {:4d}", static_params->stream_priority);
     NVLOGC_FMT(NVLOG_PDSCH, "nMaxCellsPerSlot:      {:4d}", static_params->nMaxCellsPerSlot);
     NVLOGC_FMT(NVLOG_PDSCH, "nMaxUesPerCellGroup:   {:4d}", static_params->nMaxUesPerCellGroup);

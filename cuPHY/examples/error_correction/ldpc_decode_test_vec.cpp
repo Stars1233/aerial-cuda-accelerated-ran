@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #include "ldpc_decode_test_vec.hpp"
 #include "cuphy_hdf5.hpp"
+#include "ldpc/ldpc_params.hpp"
 
 namespace
 {
@@ -50,26 +51,7 @@ int ldpc_decode_test_vec::get_num_info_nodes(int BG, int B)
         throw std::runtime_error("Invalid block size for single segment");
     }
     //------------------------------------------------------------------
-    if(1 == BG)
-    {
-        return 22;
-    }
-    else if(B > 640)
-    {
-        return 10;
-    }
-    else if(B > 560)
-    {
-        return 9;
-    }
-    else if(B > 192)
-    {
-        return 8;
-    }
-    else
-    {
-        return 6;
-    }
+    return cuphy::ldpc::derive_Kb(BG, static_cast<uint32_t>(B));
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -165,6 +147,18 @@ void ldpc_decode_test_vec::print_config() const
     case LLR_PUNCTURE_STATUS_UNKNOWN:  pstr = "UNKNOWN";  break;
     }
     printf("Punctured info nodes             = %s\n", pstr);
+
+    std::string crc_type_str;
+    switch(config_.crc_type)
+    {
+        case CUPHY_LDPC_CRC_24A: crc_type_str = "CRC-24A"; break;
+        case CUPHY_LDPC_CRC_24B: crc_type_str = "CRC-24B"; break;
+        case CUPHY_LDPC_CRC_16: crc_type_str = "CRC-16"; break;
+        case CUPHY_LDPC_CRC_NONE: crc_type_str = "NONE"; break;
+        default: crc_type_str = "UNKNOWN"; break;
+    }
+
+    printf("CRC type                         = %s\n", crc_type_str.c_str());
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -205,5 +199,5 @@ void ldpc_decode_test_vec::export_hdf5(hdf5hpp::hdf5_file& f, cudaStream_t strm)
         cuphy::tensor_convert(tLLR_f32, LLR_desc(), LLR_addr(), strm);
         cuphy::write_HDF5_dataset(f, tLLR_f32, "inputLLR", strm);
     }
-    
+
 }

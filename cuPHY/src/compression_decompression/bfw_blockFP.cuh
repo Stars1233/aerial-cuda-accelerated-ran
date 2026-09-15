@@ -132,7 +132,8 @@ __device__ inline void bfw_scale_compress_blockFP(
             vmax = cg::reduce(tile_prb, vmax, cg::greater<int>());
 
             // Find the right shift so that the max value will fit in (compbits-1) bits
-            shift = max(0, 33 - __clz(vmax) - compbits); // shift is between 0 and 15 = 4 bits
+            // __clz return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems, thus the explicit cast
+            shift = max(0, 33 - (int)__clz(vmax) - compbits); // shift is between 0 and 15 = 4 bits
 
             // Shift all the values to remove the exponent
             for(int i = 0; i < 4; i++)

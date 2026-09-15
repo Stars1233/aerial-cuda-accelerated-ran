@@ -23,8 +23,10 @@
 // ./channInputTest ~/mnt/cuMAC/100randTTI570Ues2ta2raUMa_xpol_2.5GHz.mat
 // ~/mnt/cuMAC/testMatForH5.mat
 // For ASIM file: ./channInputTest matx_channels 1
-int main(int argc, char* argv[]) 
+int main(int argc, char* argv[])
 {
+  cumac::loadParameters();
+
   srand(seedConst);
 
   std::string iFileName;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,6 +79,8 @@ typedef struct _puschRxChEqIdftStatDescr
 {
     cuphyTensorInfo2_t tInfoDftBluesteinWorkspaceTime;
     cuphyTensorInfo2_t tInfoDftBluesteinWorkspaceFreq;
+    uint16_t           nBluesteinWorkspaceRows{};    //!< Number of valid Bluestein workspace rows provisioned.
+    uint16_t           bluesteinWorkspaceFftWidth{}; //!< FFT width (FFT128..FFT8192) provisioned for Bluestein workspace.
 } puschRxChEqIdftStatDescr_t;
 
 // Channel estimator dynamic descriptor
@@ -177,6 +179,8 @@ public:
                                  uint16_t                           nMaxPrb,                        
                                  uint8_t                            enableCfoCorrection,
                                  uint8_t                            enablePuschTdi,
+                                 uint8_t                            openRanFunctionalSplitOption,
+                                 uint8_t                            kernelSelOption,
                                  uint16_t                           symbolBitmask,
                                  bool                               enableCpuToGpuDescrAsyncCpy,
                                  puschRxChEqSoftDemapDynDescrVec_t& dynDescrVecCpu,
@@ -277,6 +281,8 @@ private:
 
     cuphyStatus_t batchEqSoftDemap(cuphyPuschRxUeGrpPrms_t*           pDrvdUeGrpPrms,
                                    uint16_t                           nUeGrps,
+                                   uint8_t                            openRanFunctionalSplitOption,
+                                   uint8_t                            kernelSelOption,
                                    uint16_t                           symbolBitmask,
                                    uint32_t&                          nHetCfgs,
                                    puschRxChEqSoftDemapDynDescrVec_t& dynDescrVecCpu);
@@ -299,6 +305,8 @@ private:
                                  uint8_t                      Nd,
                                  uint16_t                     nPrb,
                                  uint16_t                     nUeGrps,
+                                 uint8_t                      openRanFunctionalSplitOption,
+                                 uint8_t                      kernelSelOption,
                                  uint16_t                     symbolBitmask,
                                  cuphyDataType_t              coefType,
                                  cuphyDataType_t              dataRxType,
@@ -332,6 +340,8 @@ private:
                                  uint8_t                      Nd,
                                  uint16_t                     Nprb,
                                  uint16_t                     nUeGrps,
+                                 uint8_t                      openRanFunctionalSplitOption,
+                                 uint8_t                      kernelSelOption,
                                  uint16_t                     symbolBitmask,
                                  cuphyPuschRxChEqLaunchCfg_t& launchCfg);
                                  
@@ -356,6 +366,7 @@ private:
                                   uint16_t nPrb,
                                   uint16_t nLayers,
                                   uint16_t nUeGrps,
+                                  uint8_t  openRanFunctionalSplitOption,
                                   dim3&    gridDim,
                                   dim3&    blockDim);
                                   
@@ -378,6 +389,8 @@ private:
                          uint16_t                     nPrb,
                          uint16_t                     nLayers,
                          uint16_t                     nUeGrps,
+                         uint8_t                      openRanFunctionalSplitOption,
+                         uint8_t                      kernelSelOption,
                          uint16_t                     symbolBitmask,
                          cuphyPuschRxChEqLaunchCfg_t& launchCfg);
                          
@@ -406,6 +419,9 @@ private:
     puschRxChEqCoefCompKernelArgsArr_t  m_coefCompKernelArgsArr[CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ];
     puschRxChEqSoftDemapKernelArgsArr_t m_softDemapKernelArgsArr[2], m_softDemapAfterDftKernelArgsArr[2];
     puschRxChEqSoftDemapIdftKernelArgsArr_t m_softDemapIdftKernelArgsArr[2];
+
+    // cached in order to use for template specialization
+    bool m_enableDebugEqOutput{false};
 
     // 1. nRxAnt: 16, nLayer: [1, 2, 4, 8, 16] : 5 templates
     // 2. nRxAnt:  8, nLayer: [1, 2, 4, 8]     : 4 templates 

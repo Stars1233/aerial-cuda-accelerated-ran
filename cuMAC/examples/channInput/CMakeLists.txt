@@ -21,9 +21,9 @@ set_property(TARGET channInput PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET channInput PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
 # target_include_directories(channInput PRIVATE ${CMAKE_SOURCE_DIR}/asim/src/backend/bindings) # for asim.hpp
-target_include_directories(channInput PUBLIC ${HDF5_CXX_INCLUDE_DIRS} ${CHAN_MODELS_SRC_INCLUDE_DIR} ${cumac_SOURCE_DIR}/src ${cumac_SOURCE_DIR}/examples/tools)
-target_link_libraries(channInput PUBLIC ${HDF5_CXX_LIBRARIES} CUDA::cudart CUDA::cuda_driver chanModels nvipc)
+target_include_directories(channInput PUBLIC ${HDF5_CXX_INCLUDE_DIRS} ${GPU3GPPCHAN_SRC_INCLUDE_DIR} ${cumac_SOURCE_DIR}/src ${cumac_SOURCE_DIR}/examples/tools)
+target_link_libraries(channInput PUBLIC ${HDF5_CXX_LIBRARIES} CUDA::cudart CUDA::cuda_driver gpu3gppchan nvipc)
 
 add_executable(channInputTest)
-target_sources(channInputTest PRIVATE channInput_example/channInputTest.cpp)
-target_link_libraries(channInputTest PRIVATE channInput CUDA::cudart)
+target_sources(channInputTest PRIVATE channInput_example/channInputTest.cpp ../parameters.cpp)
+target_link_libraries(channInputTest PRIVATE channInput CUDA::cudart yaml-cpp)

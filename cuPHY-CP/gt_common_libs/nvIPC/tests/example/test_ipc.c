@@ -674,6 +674,14 @@ int main(int argc, char** argv)
 
     test_cuda_device_id = get_cuda_device_id_config(&config);
 
+#ifdef NVIPC_CUDA_ENABLE
+    if(test_cuda_device_id >= 0 && init_test_cuda_kernels_c() != 0)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: init_test_cuda_kernels_c failed", __func__);
+        return -1;
+    }
+#endif
+
     NVLOGC(TAG, "%s: Initiation finished test_cuda_device_id=%d", __func__, test_cuda_device_id);
     NVLOGD(TAG, "========================================");
 

@@ -22,6 +22,7 @@
 #include "cuphy.hpp"
 #include "type_convert.hpp"
 #include "bfw_blockFP.cuh"
+#include <cassert>
 #include <vector>
 
 using namespace cooperative_groups;
@@ -1202,75 +1203,6 @@ void bfc_coef_comp_kernel_launch(uint32_t           nBSAnts,
     }
 }
 
-void bfcCoefCompute(uint32_t           nBSAnts,
-                    uint32_t           nLayers,
-                    uint32_t           Nprb,
-                    const_tensor_pair& tH,
-                    const_tensor_pair& tLambda,
-                    tensor_pair&       tCoef,
-                    tensor_pair&       tDbg,
-                    cudaStream_t       strm)
-{
-#ifdef ENABLE_DEBUG
-    NVLOGD_FMT(NVLOG_BFW, AERIAL_CUPHY_EVENT, "{}() begin", __FUNCTION__);
-#endif
-    using TCompute = float;
-    if(CUPHY_C_32F == tH.first.get().type())
-    {
-        using TStorageIn = scalar_from_complex<data_type_traits<CUPHY_C_32F>::type>::type;
-        if(CUPHY_C_32F == tCoef.first.get().type())
-        {
-            using TStorageOut = scalar_from_complex<data_type_traits<CUPHY_C_32F>::type>::type;
-            bfc_coef_comp_kernel_launch<TStorageIn, TStorageOut, TCompute>(nBSAnts,
-                                                                           nLayers,
-                                                                           Nprb,
-                                                                           tH,
-                                                                           tLambda,
-                                                                           tCoef,
-                                                                           tDbg,
-                                                                           strm);
-        }
-        else if(CUPHY_C_16F == tCoef.first.get().type())
-        {
-            using TStorageOut = scalar_from_complex<data_type_traits<CUPHY_C_16F>::type>::type;
-            bfc_coef_comp_kernel_launch<TStorageIn, TStorageOut, TCompute>(nBSAnts,
-                                                                           nLayers,
-                                                                           Nprb,
-                                                                           tH,
-                                                                           tLambda,
-                                                                           tCoef,
-                                                                           tDbg,
-                                                                           strm);
-        }
-        else
-        {
-            NVLOGE_FMT(NVLOG_BFW, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type {}/{}", 
-                       __FUNCTION__, +tH.first.get().type(), +tCoef.first.get().type());
-        }
-    }
-    else if((CUPHY_C_16F == tH.first.get().type()) && (CUPHY_C_16F == tCoef.first.get().type()))
-    {
-        using TStorageIn  = scalar_from_complex<data_type_traits<CUPHY_C_16F>::type>::type;
-        using TStorageOut = scalar_from_complex<data_type_traits<CUPHY_C_16F>::type>::type;
-        bfc_coef_comp_kernel_launch<TStorageIn, TStorageOut, TCompute>(nBSAnts,
-                                                                       nLayers,
-                                                                       Nprb,
-                                                                       tH,
-                                                                       tLambda,
-                                                                       tCoef,
-                                                                       tDbg,
-                                                                       strm);
-    }
-    else
-    {
-        NVLOGE_FMT(NVLOG_BFW, AERIAL_CUPHY_EVENT, "{}: No kernel available to launch with requested data type {}/{}", 
-            __FUNCTION__, +tH.first.get().type(), +tCoef.first.get().type());
-    }
-#ifdef ENABLE_DEBUG
-        NVLOGD_FMT(NVLOG_BFW, AERIAL_CUPHY_EVENT, "{}() end", __FUNCTION__);
-#endif
-}
-
 /* New Beamforming API -------------------------------------------------------------------------------------------------------------- */
 
 template <typename TStorageIn,
@@ -2049,10 +1981,18 @@ void bfwCoefComp::bfwMmseCoefComp(bool                         getKernelFuncOnly
 
         int nShmemBytes = nSmemA + nSmemC + nSmemR + nSmemLayerScaling + nSmemAntEnergies + nSmemFrobenius;
 
+#if CUDA_VERSION < 13020
         /*cudaFuncSetAttribute(bfwMmseCoefCompKernel_v1<TStorageIn, TStorageOut, TCompute, N_BS_ANTS, N_LAYERS, N_THRD_GRPS_PER_THRD_BLK, N_THRDS_PER_GRP>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                              nShmemBytes);*/
         CU_CHECK(cuFuncSetAttribute(kernelNodeParamsDriver.func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, nShmemBytes));
+#else
+        // The explicit dynamic shared memory opt-in is no longer needed, as all kernel nodes in cuphy_channels/bfw_tx.cpp have been created
+        // with the non-portable shared memory mode attribute.
+        // In stream mode, the caller should launch this via launch_kernel_ex() API with the last arg set to true to set the non-portable shared memory mode attribute
+
+        // Please note, this now becomes the responsibility of the caller (maybe not ideal).
+#endif
     
         kernelNodeParamsDriver.blockDimX = blockDim.x;
         kernelNodeParamsDriver.blockDimY = blockDim.y;
@@ -2740,22 +2680,19 @@ cuphyStatus_t bfwCoefComp::setupCoefComp(uint16_t                      nUeGrps,
                           launchCfgs.nCfgs,
                           pChEstInfo,
                           pBfwCompCoef);
-    
+
     for(uint32_t hetCfgIdx = 0; hetCfgIdx < launchCfgs.nCfgs; ++hetCfgIdx)
     {
-        // Skip rest of the setup if there are no UE groups corresponding to the channel equalizer instance and hetCfg
-        if(0 == m_coefCompHetCfgsArr[hetCfgIdx].nUeGrps) continue;
-        
+        assert(0 != m_coefCompHetCfgsArr[hetCfgIdx].nUeGrps && "Het cfg in launch range must have at least one UE group");
+
         bfwCoefCompDynDescr_t& dynDescr = m_pDynDescrCpu[hetCfgIdx];
         dynDescr.hetCfgIdx = hetCfgIdx;
 
         bfwCoefCompHetCfg_t const& hetCfg   = m_coefCompHetCfgsArr[hetCfgIdx];
         bfwCoefCompKernelArgs_t& kernelArgs = m_coefCompKernelArgsArr[hetCfgIdx];
 
-        // Select kernel
+        // All UE groups within a heterogenous config have the same gNB antenna and layer config.
         cuphyBfwCoefCompLaunchCfg_t& launchCfg = launchCfgs.cfgs[hetCfgIdx];
-
-        // All UE groups within the a heterogenous config have the same gNB antenna and layer config
         int32_t ueGrpIdx = m_pHetCfgUeGrpMapArr[hetCfgIdx][0];
         bfwCoefCompKernelUeGrpPrm_t& kernelUeGrpPrm = m_pKernelUeGrpPrmCpu[ueGrpIdx];
         bool getKernelFuncOnly = false;
@@ -2768,10 +2705,8 @@ cuphyStatus_t bfwCoefComp::setupCoefComp(uint16_t                      nUeGrps,
                                type_to_cuphy_type<decltype(m_pStatDescrCpu->lambda)>::value,
                                launchCfg);
 
-        if(hetCfg.func != launchCfg.kernelNodeParamsDriver.func)
-        {
-           throw std::runtime_error("bfwCoefComp::setupCoefComp: Kernel function mismatch");
-        }                                   
+        assert(hetCfg.func == launchCfg.kernelNodeParamsDriver.func &&
+               "Kernel selection must remain stable between batching and launch config finalization");
 
         kernelArgs.pDynDescr    = &m_pDynDescrGpu[hetCfgIdx];
         launchCfg.kernelArgs[0] = &kernelArgs.pStatDescr;

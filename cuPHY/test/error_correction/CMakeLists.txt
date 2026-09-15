@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,8 +16,14 @@
 ########################################################################
 # test_ldpc_internal_app_addr
 set(SRCS test_ldpc_internal_app_addr.cu
-         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_desc.cpp
-         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_desc_half2.cpp)
+         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_desc_8.cpp
+         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_desc_16.cpp
+         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_desc_nzs_16.cpp
+         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_adj_desc_8.cpp
+         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_adj_desc_16.cpp
+         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_adj_desc_32.cpp
+         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_adj_desc_nzs_16.cpp
+         ${PROJECT_SOURCE_DIR}/src/cuphy/error_correction/ldpc2_bg_adj_desc_nzs_32.cpp)
 add_executable(test_ldpc_internal_app_addr ${SRCS})
 target_include_directories(test_ldpc_internal_app_addr PRIVATE ${PROJECT_SOURCE_DIR}/examples/common)
 target_link_libraries(test_ldpc_internal_app_addr cuphy)
@@ -50,8 +56,38 @@ target_compile_options(test_ldpc_internal_loader PRIVATE $<$<COMPILE_LANGUAGE:CU
                        >)
 add_test(NAME test_ldpc_internal_loader COMMAND test_ldpc_internal_loader)
 
+########################################################################
+# test_ldpc_clamp_validation
+add_executable(test_ldpc_clamp_validation test_ldpc_clamp_validation.cpp)
+target_include_directories(test_ldpc_clamp_validation PRIVATE
+                           ${PROJECT_SOURCE_DIR}/examples/error_correction)
+target_link_libraries(test_ldpc_clamp_validation cuphy gtest gtest_main)
+add_test(NAME test_ldpc_clamp_validation COMMAND test_ldpc_clamp_validation)
+
+########################################################################
+# test_ldpc_band_decoder_gates
+add_executable(test_ldpc_band_decoder_gates test_ldpc_band_decoder_gates.cpp)
+target_include_directories(test_ldpc_band_decoder_gates PRIVATE
+                           ${PROJECT_SOURCE_DIR}/src/cuphy)
+target_link_libraries(test_ldpc_band_decoder_gates cuphy CUDA::cudart gtest gtest_main)
+add_test(NAME test_ldpc_band_decoder_gates COMMAND test_ldpc_band_decoder_gates)
+
+# test_ldpc_cb_kernel_spi
+add_executable(test_ldpc_cb_kernel_spi test_ldpc_cb_kernel_spi.cpp)
+target_include_directories(test_ldpc_cb_kernel_spi PRIVATE
+                           ${PROJECT_SOURCE_DIR}/src/cuphy
+                           ${PROJECT_SOURCE_DIR}/examples/common)
+target_link_libraries(test_ldpc_cb_kernel_spi cuphy CUDA::cudart gtest gtest_main)
+add_test(NAME test_ldpc_cb_kernel_spi COMMAND test_ldpc_cb_kernel_spi)
+
+########################################################################
+# test_ldpc_cb_prepare_launch
+add_executable(test_ldpc_cb_prepare_launch test_ldpc_cb_prepare_launch.cpp)
+target_include_directories(test_ldpc_cb_prepare_launch PRIVATE
+                           ${PROJECT_SOURCE_DIR}/src/cuphy
+                           ${PROJECT_SOURCE_DIR}/examples/common)
+target_link_libraries(test_ldpc_cb_prepare_launch cuphy CUDA::cudart gtest gtest_main)
+add_test(NAME test_ldpc_cb_prepare_launch COMMAND test_ldpc_cb_prepare_launch)
+
 #                        --keep
 #                       --cudart static
-
-
-

@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <cstring>
 
 typedef enum
 {
@@ -62,6 +63,7 @@ typedef enum
     SCF_ERROR_CODE_RHOCP_PTP_EVENTS_ERROR = 0x46, //Indicates RHOCP PTP Events not returned as sync
     SCF_ERROR_CODE_RHOCP_PTP_EVENTS_SYNCED = 0x47,   //Indicates RHOCP PTP Events back to sync again after unsynced
     SCF_ERROR_CODE_SRS_WITHOUT_PUSCH_UNSUPPORTED = 0x48,  // SINGLE_SECT_MODE: unsupported UL channel combination (e.g. SRS without PUSCH)
+    SCF_ERROR_CODE_NON_SLOT_OFFLOAD_REJECTED = 0x49, // Indicates CONFIG/START/STOP could not be admitted to the non-slot offload path
 // L1 limit exceeded error codes ---- begin
     SCF_FAPI_SSB_PBCH_L1_LIMIT_EXCEEDED =   0x81, // SSB/PBCH L1 limit exceeded
     SCF_FAPI_PDCCH_L1_LIMIT_EXCEEDED = 0x82, // PDCCH L1 limit exceeded
@@ -120,6 +122,13 @@ typedef enum
     SCF_FAPI_RESV_2_END         = 0xFF,
 } scf_fapi_message_id_e;
 
+/**
+ * @brief Get the string name for a SCF FAPI message ID.
+ * @param[in] msg_id SCF FAPI message identifier.
+ * @return Message-name literal; returns "UNKNOWN_SCF_FAPI" for unknown IDs.
+ */
+const char* get_fapi_msg_name(int32_t msg_id);
+
 /* 3.4.2 DL_TTI PDU Type */
 typedef enum
 {
@@ -129,13 +138,15 @@ typedef enum
     DL_TTI_PDU_TYPE_SSB = 3,
 } scf_fapi_dl_tti_pdu_type_t;
 
-/* 3.4.2 DL_TTI PDU Type */
+/* 3.4.3 UL_TTI PDU Type */
 typedef enum
 {
     UL_TTI_PDU_TYPE_PRACH = 0,
     UL_TTI_PDU_TYPE_PUSCH = 1,
     UL_TTI_PDU_TYPE_PUCCH = 2,
-    UL_TTI_PDU_TYPE_SRS = 3,
+    UL_TTI_PDU_TYPE_SRS   = 3,
+    UL_TTI_PDU_TYPE_PUCCH_2_3_4 = 4,  /* SCF 222.10.04 Table 3-46 */
+    UL_TTI_PDU_TYPE_MsgA_PUSCH  = 5,  /* SCF 222.10.04 Table 3-46 */
 } scf_fapi_ul_tti_pdu_type_t;
 
 static constexpr int VALID_FAPI_PDU   = 0;
@@ -385,8 +396,23 @@ typedef struct scf_fapi_tl
 #endif
     uint8_t val[0];
 
+    /**
+     * Reads the TLV payload as a value of type T.
+     *
+     * Copies the bytes out via std::memcpy (rather than dereferencing a
+     * reinterpret_cast) so the read is alignment-safe even when val[0] is not
+     * naturally aligned for T — e.g. the SCF_FAPI_10_04 layout places val at
+     * offset 6. Mirrors Set().
+     *
+     * @return A copy of the TLV payload interpreted as T.
+     */
     template <typename T>
-    T AsValue() { return *reinterpret_cast<T*>(&val[0]); }
+    [[nodiscard]] T AsValue() const
+    {
+        T value;
+        std::memcpy(&value, &val[0], sizeof(T));
+        return value;
+    }
 
     template <typename T>
     T As() { return reinterpret_cast<T>(&val[0]); }
@@ -634,6 +660,16 @@ typedef struct
  *  3.4.2 DL_TTI.request
  ***********************************************/
 
+#ifdef SCF_FAPI_10_04
+/* Indices into DL_TTI_REQ::nPDUsOfEachType[5] — distinct from per-PDU pdu_type wire values.
+ * [0]=PDCCH, [1]=PDSCH, [2]=CSI-RS, [3]=SSB, [4]=DlDCIs count across all PDCCH PDUs. */
+#define DL_TTI_NPDUS_IDX_PDCCH   0
+#define DL_TTI_NPDUS_IDX_PDSCH   1
+#define DL_TTI_NPDUS_IDX_CSI_RS  2
+#define DL_TTI_NPDUS_IDX_SSB     3
+#define DL_TTI_NPDUS_IDX_DlDCIs  4
+#endif // SCF_FAPI_10_04
+
 // Table 3-35 DL_TTI.request message body
 typedef struct
 {
@@ -643,7 +679,20 @@ typedef struct
 #ifdef ENABLE_CONFORMANCE_TM_PDSCH_PDCCH
     uint8_t testMode; // value 0 - no test. 1 - TM1.1
 #endif
+#ifdef SCF_FAPI_10_04
+    uint16_t num_pdus;
+#else
     uint8_t  num_pdus;
+#endif
+#ifdef SCF_FAPI_10_04
+    // Number of PDUs of each type that are included in this message. Each array entry corresponds to a PDU type as follows:
+    // [0]: number of PDCCH PDUs
+    // [1]: number of PDSCH PDUs
+    // [2]: number of CSI-RS PDUs
+    // [3]: number of SSB PDUs
+    // [4]: number of DlDCIs across all PDCCH PDUs in this message
+    uint16_t nPDUsOfEachType[5];
+#endif
     uint8_t  ngroup;
     uint8_t  payload[0];
 } __attribute__ ((__packed__)) scf_fapi_dl_tti_req_t;
@@ -809,16 +858,44 @@ typedef struct
  *  3.4.3 UL_TTI.request
  ***********************************************/
 
+#ifdef SCF_FAPI_10_04
+/* Indices into UL_TTI_REQ::nPDUsOfEachType[6] — distinct from per-PDU pdu_type wire values.
+ * [0]=PRACH, [1]=PUSCH, [2]=PUCCH F0/F1, [3]=PUCCH F2/F3/F4, [4]=SRS, [5]=MsgA-PUSCH. */
+#define UL_TTI_NPDUS_IDX_PRACH       0
+#define UL_TTI_NPDUS_IDX_PUSCH       1
+#define UL_TTI_NPDUS_IDX_PUCCH_F01   2
+#define UL_TTI_NPDUS_IDX_PUCCH_F234  3
+#define UL_TTI_NPDUS_IDX_SRS         4
+#define UL_TTI_NPDUS_IDX_MsgA_PUSCH  5
+#endif // SCF_FAPI_10_04
+
 // Table 3-44 UL_TTI.request message body
 typedef struct
 {
     scf_fapi_body_header_t         msg_hdr;
     uint16_t sfn;
     uint16_t slot;
+#ifdef SCF_FAPI_10_04
+    uint16_t  num_pdus;
+#else
     uint8_t  num_pdus;
+#endif
+#ifdef SCF_FAPI_10_04
+    // Number of PDUs of each type that are included in this message. Each array entry corresponds to a PDU
+    // type as follows:
+    // [0]: number of PRACH PDUs
+    // [1]: number of PUSCH PDUs
+    // [2]: number of Format 0/1 PUCCH PDUs
+    // [3]: number of Format 2/3/4 PUCCH PDUs
+    // [4]: number of SRS PDUs
+    // [5]: number of MsgA-PUSCH PDUs
+    uint16_t nPDUsOfEachType[6];
+#else
+    // FAPI 10.02 summary fields                                       
     uint8_t  rach_present;
     uint8_t  num_ulsch;
     uint8_t  num_ulcch;
+#endif
     uint8_t  ngroup;
     uint8_t  payload[0];
 } __attribute__ ((__packed__)) scf_fapi_ul_tti_req_t;
@@ -1260,7 +1337,7 @@ typedef struct
     uint8_t     pdu_bitmap;
     uint32_t    handle;
     uint16_t    rnti;
-#if SCF_FAPI_10_04
+#ifdef SCF_FAPI_10_04
     scf_fapi_ul_meas_common_t measurement;
 #else
     uint8_t     ul_cqi;
@@ -1281,7 +1358,7 @@ typedef struct
     uint32_t handle;
     uint16_t rnti;
     uint8_t  pucch_format;
-#if SCF_FAPI_10_04
+#ifdef SCF_FAPI_10_04
     scf_fapi_ul_meas_common_t measurement;
 #else
     uint8_t  ul_cqi;

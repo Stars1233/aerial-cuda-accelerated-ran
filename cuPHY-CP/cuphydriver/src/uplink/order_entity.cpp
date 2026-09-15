@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 20) // "DRV.ORDER_ENTITY"
 
 #include "order_entity.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
 #include "exceptions.hpp"
@@ -217,14 +218,16 @@ OrderEntity::OrderEntity(phydriver_handle _pdh, GpuDevice* _gDev) :
     /*
      * Associate eAxC id to index for the order kernel
      */
+    // Buffer dimension for PUSCH/PRACH eAxC maps: from runtime YAML cap (was MAX_AP_PER_SLOT macro: 16 or 32).
+    const size_t ul_eaxc_map_bytes = static_cast<size_t>(pdctx->getMaxUlAntennaPorts()) * sizeof(uint16_t);
     for(auto& eAxC_map:eAxC_map_gdr){
-        eAxC_map.reset(gDev->newGDRbuf(MAX_AP_PER_SLOT * sizeof(uint16_t)));
+        eAxC_map.reset(gDev->newGDRbuf(ul_eaxc_map_bytes));
         mf.addGpuPinnedSize(eAxC_map->size_alloc);
     }
     std::fill(std::begin(eAxC_num),std::end(eAxC_num),0);
 
     for(auto& eAxC_prach_map:eAxC_prach_map_gdr){
-        eAxC_prach_map.reset(gDev->newGDRbuf(MAX_AP_PER_SLOT * sizeof(uint16_t)));
+        eAxC_prach_map.reset(gDev->newGDRbuf(ul_eaxc_map_bytes));
         mf.addGpuPinnedSize(eAxC_prach_map->size_alloc);
     }
     std::fill(std::begin(eAxC_prach_num),std::end(eAxC_prach_num),0);
@@ -238,17 +241,17 @@ OrderEntity::OrderEntity(phydriver_handle _pdh, GpuDevice* _gDev) :
 
     cell_order_list_size = 0;
 
-    CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&order_kernel_config_params, sizeof(orderKernelConfigParams_t)));
-    CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&order_kernel_config_params_srs, sizeof(orderKernelConfigParamsSrs_t)));
-    CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&orderKernelConfigParamsCpuInitComms, sizeof(orderKernelConfigParamsCpuInitComms_t)));
+    CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&order_kernel_config_params, sizeof(orderKernelConfigParams_t)));
+    CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&order_kernel_config_params_srs, sizeof(orderKernelConfigParamsSrs_t)));
+    CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&orderKernelConfigParamsCpuInitComms, sizeof(orderKernelConfigParamsCpuInitComms_t)));
 
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_idle));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_order));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_order));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_idle, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_order, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_order, CU_EVENT_DEFAULT));
 
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_idle_srs));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_order_srs));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_order_srs));    
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_idle_srs, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_order_srs, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_order_srs, CU_EVENT_DEFAULT));    
 
     setOrderLaunchedStatus(false);
     setOrderLaunchedStatusSrs(false);
@@ -259,17 +262,17 @@ OrderEntity::~OrderEntity()
     PhyDriverCtx * pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
     pdctx->setUlCtx();
 
-    CUDA_CHECK_PHYDRIVER(cudaFreeHost(order_kernel_config_params));
-    CUDA_CHECK_PHYDRIVER(cudaFreeHost(order_kernel_config_params_srs));
-    CUDA_CHECK_PHYDRIVER(cudaFreeHost(orderKernelConfigParamsCpuInitComms));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(order_kernel_config_params));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(order_kernel_config_params_srs));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(orderKernelConfigParamsCpuInitComms));
 
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_idle));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_order));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_order));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_idle));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_order));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_order));
 
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_idle_srs));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_order_srs));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_order_srs));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_idle_srs));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_order_srs));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_order_srs));
 }
 
 phydriver_handle OrderEntity::getPhyDriverHandler(void) const
@@ -305,6 +308,7 @@ int OrderEntity::reserve(int32_t* cell_idx_list, uint8_t cell_idx_list_size, boo
     }
     mlock.unlock();
 
+    const int max_ul_ap_map_dim = static_cast<int>(pdctx->getMaxUlAntennaPorts());
     for(uint32_t j = 0; j < cell_idx_list_size; j ++)
     {
         auto cell_idx = cell_idx_list[j];
@@ -341,7 +345,8 @@ int OrderEntity::reserve(int32_t* cell_idx_list, uint8_t cell_idx_list_size, boo
             eAxC_num[cell_num]++;
         }
 
-        for(int tmp = eAxC_num[cell_num]; tmp < MAX_AP_PER_SLOT; tmp++)
+        // Pad up to the same dimension used to allocate eAxC_map_gdr (runtime UL AP cap).
+        for(int tmp = eAxC_num[cell_num]; tmp < max_ul_ap_map_dim; tmp++)
             ((uint16_t*)(eAxC_map_gdr[cell_num]->addrh()))[tmp] = 0xFFFF;
 
         for(auto f : cell_ptr->geteAxCIdsPrach())
@@ -659,12 +664,14 @@ int OrderEntity::runOrder(
         ///////// Start Order Kernel
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_idle_srs, first_strm));
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_order_srs, first_strm));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_idle_srs, first_strm));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_order_srs, first_strm));
 
         if(pdctx->enableOKTb())
         {
-            if(launch_receive_kernel_for_test_bench(first_strm,
+            if(launch_receive_kernel_for_test_bench(
+                                    pdctx->getOrderKernelFunctions().receive_kernel_for_test_bench,
+                                    first_strm,
                                     order_kernel_config_params_srs->rxq_info_gpu,
                                     order_kernel_config_params_srs->sem_gpu,
                                     order_kernel_config_params_srs->sem_order_num,
@@ -711,7 +718,15 @@ int OrderEntity::runOrder(
             if(pdctx->getUlOrderKernelMode()==0) //Ping-Pong mode
             {
                 if(pdctx->get_ru_type_for_srs_proc() != SINGLE_SECT_MODE) { //Launch SRS order kernel only for non FX RU here -- srsCellMask is 0 for ru_type::SINGLE_SECT_MODE
-                    if(launch_order_kernel_doca_single_subSlot(first_strm,
+                    const auto& okf = pdctx->getOrderKernelFunctions();
+                    if(launch_order_kernel_doca_single_subSlot(okf.order_kernel_doca_single_subSlot,
+                                            okf.pingpong_trace_srs,
+                                            okf.pingpong_trace_srs_pusch,
+                                            okf.pingpong_trace_no_srs,
+                                            okf.pingpong_no_trace_srs,
+                                            okf.pingpong_no_trace_srs_pusch,
+                                            okf.pingpong_no_trace_no_srs,
+                                            first_strm,
                                             order_kernel_config_params_srs->rxq_info_gpu,
                                             order_kernel_config_params_srs->sem_gpu,
                                             order_kernel_config_params_srs->sem_gpu_aerial_fh,
@@ -827,7 +842,8 @@ int OrderEntity::runOrder(
             }
             else
             {
-                if(launch_order_kernel_doca_single_srs(first_strm,
+                if(launch_order_kernel_doca_single_srs(pdctx->getOrderKernelFunctions().order_kernel_doca_single_srs,
+                                        first_strm,
                                         order_kernel_config_params_srs->rxq_info_gpu,
                                         order_kernel_config_params_srs->sem_gpu,
                                         order_kernel_config_params_srs->sem_order_num,
@@ -895,9 +911,12 @@ int OrderEntity::runOrder(
         }
 
 
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_order_srs, first_strm));       
-        // Notify CPU RX thread (can be replaced by cudaEvent?)
-        launch_kernel_write(first_strm, (uint32_t*)start_cuphy_srs_cpu_h->addr(), 1);     
+        CUDA_DRIVER_CHECK(cuEventRecord(end_order_srs, first_strm));       
+        // Notify CPU RX thread (can be replaced by cuEvent?)
+        // gkf.kernel_write was resolved under ulMpsCtx
+        // first_strm must be created under ulMpsCtx to ensure  context match is safe.
+        const auto& gkf = pdctx->getGenericKernelFunctions();
+        launch_kernel_write(gkf.kernel_write, first_strm, (uint32_t*)start_cuphy_srs_cpu_h->addr(), 1);     
         setOrderLaunchedStatusSrs(true);                       
     }
     
@@ -1049,9 +1068,10 @@ int OrderEntity::runOrder(
             ///////// Start Order Kernel
             ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_idle, first_strm));
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_order, first_strm));
-            if(launch_order_kernel_cpu_init_comms_single_subSlot(first_strm,
+            CUDA_DRIVER_CHECK(cuEventRecord(start_idle, first_strm));
+            CUDA_DRIVER_CHECK(cuEventRecord(start_order, first_strm));
+            if(launch_order_kernel_cpu_init_comms_single_subSlot(pdctx->getOrderKernelFunctions().order_kernel_cpu_init_comms_single_subSlot,
+                                    first_strm,
                                     orderKernelConfigParamsCpuInitComms->start_cuphy_d, // Unblock cuPHY
                                     orderKernelConfigParamsCpuInitComms->order_kernel_exit_cond_d, // Notify CPU order kernel completion
                                     orderKernelConfigParamsCpuInitComms->ready_list,
@@ -1336,12 +1356,14 @@ int OrderEntity::runOrder(
             ///////// Start Order Kernel
             ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_idle, first_strm));
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_order, first_strm));
+            CUDA_DRIVER_CHECK(cuEventRecord(start_idle, first_strm));
+            CUDA_DRIVER_CHECK(cuEventRecord(start_order, first_strm));
 
             if(pdctx->enableOKTb())
             {
-                    if(launch_receive_kernel_for_test_bench(first_strm,
+                    if(launch_receive_kernel_for_test_bench(
+                                            pdctx->getOrderKernelFunctions().receive_kernel_for_test_bench,
+                                            first_strm,
                                             order_kernel_config_params->rxq_info_gpu,
                                             order_kernel_config_params->sem_gpu,
                                             order_kernel_config_params->sem_order_num,
@@ -1384,7 +1406,15 @@ int OrderEntity::runOrder(
             else
             {
                     int srs_mode = srsForRuTypeAllSym ? 3 : 0;
-                    if(launch_order_kernel_doca_single_subSlot(first_strm,
+                    const auto& okf = pdctx->getOrderKernelFunctions();
+                    if(launch_order_kernel_doca_single_subSlot(okf.order_kernel_doca_single_subSlot,
+                                            okf.pingpong_trace_srs,
+                                            okf.pingpong_trace_srs_pusch,
+                                            okf.pingpong_trace_no_srs,
+                                            okf.pingpong_no_trace_srs,
+                                            okf.pingpong_no_trace_srs_pusch,
+                                            okf.pingpong_no_trace_no_srs,
+                                            first_strm,
                                             order_kernel_config_params->rxq_info_gpu,
                                             order_kernel_config_params->sem_gpu,
                                             order_kernel_config_params->sem_gpu_aerial_fh,
@@ -1496,9 +1526,12 @@ int OrderEntity::runOrder(
             }            
         }                    
             
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_order, first_strm));
-        // Notify CPU RX thread (can be replaced by cudaEvent?)
-        launch_kernel_write(first_strm, (uint32_t*)start_cuphy_cpu_h->addr(), 1);
+        CUDA_DRIVER_CHECK(cuEventRecord(end_order, first_strm));
+        // Notify CPU RX thread (can be replaced by cuEvent?)
+        // gkf.kernel_write was resolved under ulMpsCtx
+        // first_strm must be created under ulMpsCtx to ensure  context match is safe.
+        const auto& gkf = pdctx->getGenericKernelFunctions();
+        launch_kernel_write(gkf.kernel_write, first_strm, (uint32_t*)start_cuphy_cpu_h->addr(), 1);
         setOrderLaunchedStatus(true);
 	if (pdctx->get_ru_type_for_srs_proc() == SINGLE_SECT_MODE) {
             setOrderLaunchedStatusSrs(true);
@@ -1520,6 +1553,15 @@ bool   OrderEntity::getOrderLaunchedStatus()
 }
 void  OrderEntity::setOrderLaunchedStatus(bool val)
 {
+    // Record the time the launch flag transitions to true (0 when reset) so a
+    // waitOrderLaunched timeout can report whether the producer launched late,
+    // never, or before the consumer began waiting. Best-effort diagnostic only:
+    // the relaxed store does not synchronize with the order_launched flag, so
+    // another thread may observe the flag update before this timestamp. Relaxed
+    // is intentional to keep the hot path cheap; the timeout reader (also
+    // relaxed) tolerates a stale/0 value.
+    order_launched_tsc_ns.store(val ? static_cast<uint64_t>(Time::nowNs().count()) : 0,
+                                std::memory_order_relaxed);
     order_launched=val;
 }
 
@@ -1529,6 +1571,15 @@ bool   OrderEntity::getOrderLaunchedStatusSrs()
 }
 void  OrderEntity::setOrderLaunchedStatusSrs(bool val)
 {
+    // Record the time the SRS launch flag transitions to true (0 when reset) so
+    // a waitOrderLaunchedSrs timeout can report whether the producer launched
+    // late, never, or before the consumer began waiting. Best-effort diagnostic
+    // only: the relaxed store does not synchronize with the order_launched_srs
+    // flag, so another thread may observe the flag update before this timestamp.
+    // Relaxed is intentional to keep the hot path cheap; the timeout reader (also
+    // relaxed) tolerates a stale/0 value.
+    order_launched_srs_tsc_ns.store(val ? static_cast<uint64_t>(Time::nowNs().count()) : 0,
+                                    std::memory_order_relaxed);
     order_launched_srs=val;
 }
 
@@ -1575,8 +1626,13 @@ int OrderEntity::waitOrderLaunched(int wait_ns)
     {
         if(Time::nowNs() - start_t > threshold_t)
         {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "ERROR: Order kernel Object {} waiting for more than {} ns for Order kernel launch",
-                getId(), wait_ns);
+            uint64_t launch_ns     = order_launched_tsc_ns.load(std::memory_order_relaxed);
+            uint64_t wait_start_ns = static_cast<uint64_t>(start_t.count());
+            uint64_t now_ns        = static_cast<uint64_t>(Time::nowNs().count());
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                "ERROR: Order kernel Object {} waiting for more than {} ns for Order kernel launch "
+                "(order_launch_ts_ns={} (0=never launched this slot), wait_start_ts_ns={}, now_ts_ns={}, waited_ns={})",
+                getId(), wait_ns, launch_ns, wait_start_ns, now_ns, now_ns - wait_start_ns);
             return -1;
         }
     }
@@ -1593,8 +1649,13 @@ int OrderEntity::waitOrderLaunchedSrs(int wait_ns)
     {
         if(Time::nowNs() - start_t > threshold_t)
         {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "ERROR: Order kernel Object {} waiting for more than {} ns for SRS Order kernel launch",
-                getId(), wait_ns);
+            uint64_t launch_ns     = order_launched_srs_tsc_ns.load(std::memory_order_relaxed);
+            uint64_t wait_start_ns = static_cast<uint64_t>(start_t.count());
+            uint64_t now_ns        = static_cast<uint64_t>(Time::nowNs().count());
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+                "ERROR: Order kernel Object {} waiting for more than {} ns for SRS Order kernel launch "
+                "(srs_order_launch_ts_ns={} (0=never launched this slot), wait_start_ts_ns={}, now_ts_ns={}, waited_ns={})",
+                getId(), wait_ns, launch_ns, wait_start_ns, now_ns, now_ns - wait_start_ns);
             return -1;
         }
     }

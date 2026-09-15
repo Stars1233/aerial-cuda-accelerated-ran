@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,8 +29,8 @@ import shlex
 import subprocess
 import time
 
-SUPPORTED_GPU_DRV_VER = "570.104"
-SUPPORTED_CUDA_VER = "12.8"
+SUPPORTED_GPU_DRV_VER = "610.43.02"
+SUPPORTED_CUDA_VER = "13.3"
 SUPPORTED_OFED_VER = "24.04-0.6.6"
 SUPPORTED_NIC_FW_VER = "32.41.1000"
 SUPPORTED_NVIDIA_CONTAINER_TOOLKIT_VER = "1.17.4"

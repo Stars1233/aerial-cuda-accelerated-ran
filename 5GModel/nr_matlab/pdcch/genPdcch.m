@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,7 +60,7 @@ for idxPdu = 1:nPdu
 end
 
 Xtf0 = Xtf;
-Xtf = genPdcch_cuphy(PdcchParamsList, Xtf);
+[Xtf, x_rm_bytes_save, c_scram_int_save] = genPdcch_cuphy(PdcchParamsList, Xtf);
 Xtf1 = Xtf - Xtf0; % for generating test vectors
 
 global SimCtrl;
@@ -70,16 +70,19 @@ if SimCtrl.genTV.enable && SimCtrl.genTV.cuPHY && ...
         ismember(idxSlot, SimCtrl.genTV.slotIdx)
     TVname = [SimCtrl.genTV.TVname, '_PDCCH_gNB_CUPHY_s', num2str(idxSlot),...
         'p', num2str(idxPdu)];
-    saveTV_pdcch_multiDci(SimCtrl.genTV.tvDirName, TVname, PdcchParamsList, Xtf1);
+    saveTV_pdcch_multiDci(SimCtrl.genTV.tvDirName, TVname, PdcchParamsList, Xtf1, x_rm_bytes_save, c_scram_int_save);
     SimCtrl.genTV.idx = SimCtrl.genTV.idx + 1;
 end
 
 return
 
 
-function Xtf = genPdcch_cuphy(PdcchParamsList, Xtf)
+function [Xtf, x_rm_bytes_save, c_scram_int_save] = genPdcch_cuphy(PdcchParamsList, Xtf)
 
 nPdu = length(PdcchParamsList);
+
+x_rm_bytes_save = [];
+c_scram_int_save = [];
 
 for idxPdu = 1:nPdu
     % load parameters
@@ -178,9 +181,10 @@ for idxPdu = 1:nPdu
         end
 
         % DCI channel coding and modutlation
-        x = genPdcchQpsk(Payload, Npayload, rntiBits, rntiCrc, dmrsId, aggrL, testModel);
+        [x, x_rm_bytes, c_scram_int] = genPdcchQpsk(Payload, Npayload, rntiBits, rntiCrc, dmrsId, aggrL, testModel);
+        x_rm_bytes_save = [x_rm_bytes_save; x_rm_bytes; zeros(216-length(x_rm_bytes),1)]; % 216 = CUPHY_PDCCH_MAX_TX_BITS_PER_DCI/8
+        c_scram_int_save = [c_scram_int_save; c_scram_int; zeros(54-length(c_scram_int),1)]; % 54 = CUPHY_PDCCH_MAX_TX_BITS_PER_DCI/32
         qpsk_ptr = 0;
-
         % Map to RE
         for i = 0 : (nSym - 1)
             % compute seed:
@@ -216,7 +220,7 @@ return
 
 
 
-function saveTV_pdcch_multiDci(tvDirName, TVname, PdcchParamsList, Xtf)
+function saveTV_pdcch_multiDci(tvDirName, TVname, PdcchParamsList, Xtf, x_rm_bytes_save, c_scram_int_save)
 
 [status,msg] = mkdir(tvDirName);
 h5File  = H5F.create([tvDirName filesep TVname '.h5'], 'H5F_ACC_TRUNC', 'H5P_DEFAULT', 'H5P_DEFAULT');
@@ -262,6 +266,8 @@ if ~bypassComp
     end
 end
 
+hdf5_write_nv(h5File, 'x_rm_bytes', uint8(x_rm_bytes_save));   
+hdf5_write_nv(h5File, 'c_scram_ints', uint32(c_scram_int_save));
 H5F.close(h5File);
 
 return

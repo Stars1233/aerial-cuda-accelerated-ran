@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,7 +47,7 @@ def shell_cmd(cmd, print_cmd=False, print_err=True):
 # Parse a string value after a prefix. Example "prefix=value"
 def parse_string(input_string, prefix, delimiter, default="", regular=False):
     try:
-        prefix_value = re.search(prefix + "[ " + delimiter + "]*" + "[\S]+", input_string.strip()).group(0)
+        prefix_value = re.search(prefix + "[ " + delimiter + "]*" + r"[\S]+", input_string.strip()).group(0)
         value = prefix_value.split(delimiter)[-1].strip()
     except:
         if (not(prefix in input_string) or regular):

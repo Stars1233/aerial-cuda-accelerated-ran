@@ -37,6 +37,28 @@ def create_string(list_of_strings):
   return string
 
 def generate_testmac_config_file(output_file_path, template_file, test_case, platform, copy_template, test_slots,input_dir):
+    """
+    Generate a test MAC YAML configuration for the selected test case and platform.
+
+    Args:
+        output_file_path (str | None): Destination path for the generated YAML file.
+        template_file (str): Path to the YAML template used as the base configuration.
+        test_case (str): Test case identifier that controls generated settings and test-vector selection.
+        platform (str): Target platform name for platform-specific values.
+        copy_template (bool): If True, write an unchanged template copy next to the output file.
+        test_slots (int): Number of test slots to apply to the configuration.
+        input_dir (str): Directory with launch-pattern files and gNB FAPI test vectors.
+
+    Returns:
+        None
+
+    Raises:
+        OSError: If a file operation fails.
+        yaml.YAMLError: If YAML parsing fails.
+
+    Examples:
+        generate_testmac_config_file("out.yaml", "template.yaml", "90023", "MGX1", False, 100, "vectors")
+    """
     with open(template_file, 'r') as template_content:
         test_mac_yaml_file = yaml.safe_load(template_content)
     
@@ -51,6 +73,10 @@ def generate_testmac_config_file(output_file_path, template_file, test_case, pla
             test_mac_yaml_file['recv_thread_config']['cpu_affinity'] = 13
             test_mac_yaml_file['sched_thread_config']['cpu_affinity'] = 12
         elif platform == 'CG1':
+            test_mac_yaml_file['recv_thread_config']['cpu_affinity'] = 21
+            test_mac_yaml_file['sched_thread_config']['cpu_affinity'] = 16
+        elif platform == 'MGX1':
+            # Placeholders; overridden by autoconfig l1_logical_cores_DU_MGX1_*
             test_mac_yaml_file['recv_thread_config']['cpu_affinity'] = 21
             test_mac_yaml_file['sched_thread_config']['cpu_affinity'] = 16
 
@@ -121,6 +147,9 @@ def generate_testmac_config_file(output_file_path, template_file, test_case, pla
                 elif platform == 'bf3-arm':
                     test_mac_yaml_file['builder_thread_config']['cpu_affinity'] = 14
                 elif platform == 'CG1':
+                    test_mac_yaml_file['builder_thread_config']['cpu_affinity'] = 20
+                elif platform == 'MGX1':
+                    # Placeholders; overridden by autoconfig l1_logical_cores_DU_MGX1_*
                     test_mac_yaml_file['builder_thread_config']['cpu_affinity'] = 20
                     
                 m = re.search('STT(?P<stt>[0-9]*)', test_case)

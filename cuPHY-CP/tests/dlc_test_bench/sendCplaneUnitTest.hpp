@@ -16,7 +16,10 @@
  */
 
 #include <iostream>
+#include <cstdlib>
+#include <cstdint>
 #include <memory>
+#include <new>
 #include <stdexcept>
 
 // Include cuphydriver headers first to establish their symbols
@@ -35,10 +38,7 @@
 #include <rte_eal.h>
 #include <rte_lcore.h>
 
-#include "scf_fapi_handler.hpp"
-#include "test_mac_configs.hpp"
-#include "launch_pattern.hpp"
-#include "nv_phy_mac_transport.hpp"
+#include "testmac_setup_service.hpp"
 
 #include <gtest/gtest.h>
 #include <tuple>
@@ -46,31 +46,6 @@
 #define TAG_UNIT_TB_BASE    NVLOG_TAG_BASE_DLC_TESTBENCH
 #define TAG_UNIT_TB_COMMON  TAG_UNIT_TB_BASE + 1
 #define TAG_UNIT_TB_DLC     TAG_UNIT_TB_BASE + 2
-
-// Wrapper class that exposes protected methods from scf_fapi_handler
-class TestFapiHandler : public scf_fapi_handler {
-public:
-    TestFapiHandler(nv::phy_mac_transport& transport, test_mac_configs* configs, launch_pattern* lp, ch8_conformance_test_stats* stats)
-        : scf_fapi_handler(transport, configs, lp, stats) {}
-    
-    // Expose protected methods as public
-    std::vector<fapi_req_t*>& get_fapi_req_list_public(int cell_id, sfn_slot_t ss, fapi_group_t group_id) {
-        return get_fapi_req_list(cell_id, ss, group_id);
-    }
-
-    int build_dl_tti_request_public(int cell_id, vector<fapi_req_t*>& fapi_reqs, scf_fapi_dl_tti_req_t& req) {
-        return build_dl_tti_request(cell_id, fapi_reqs, req); 
-    }
-    
-    int build_ul_tti_request_public(int cell_id, std::vector<fapi_req_t*>& fapi_reqs, scf_fapi_ul_tti_req_t& req) {
-        return build_ul_tti_request(cell_id, fapi_reqs, req); 
-    }
-
-    int build_ul_dci_request_public(int cell_id, vector<fapi_req_t*>& fapi_reqs, scf_fapi_ul_dci_t& req) {
-        return build_ul_dci_request(cell_id, fapi_reqs, req); 
-    }
-    
-};
 
 // Forward declarations
 class PhyDriverCtx;
@@ -90,15 +65,21 @@ struct TestConfig {
         static TestConfig config;
         return config;
     }
-    bool is_nrsim() const {
+    TestMacPatternMode pattern_mode() const {
         try {
-            int num = std::stoi(pattern_number);
-            return (num >= 90000 && num < 100000);
+            const int num = std::stoi(pattern_number);
+            if (num >= 90000 && num < 100000) {
+                return TestMacPatternMode::NrSim;
+            }
         } catch (...) {
-            return false;
         }
+        return TestMacPatternMode::F08SingleCell;
     }
+    bool is_nrsim() const { return pattern_mode() == TestMacPatternMode::NrSim; }
 };
+
+// Single cell until SendCPlaneUnitTest::Setup supports multi-cell (see TODO there).
+inline constexpr uint32_t kDefaultFixtureCellCount = 1U;
 
 struct LocalFapiMessage {
     static constexpr size_t FAPI_PAYLOAD_BUFFER_SIZE = 64 * 1024;
@@ -106,11 +87,27 @@ struct LocalFapiMessage {
     scf_fapi_ul_dci_t* ul_dci_req;
     // scf_fapi_ul_tti_req_t* ul_tti_req; 
 
+    LocalFapiMessage(const LocalFapiMessage&) = delete;
+    LocalFapiMessage& operator=(const LocalFapiMessage&) = delete;
+
     LocalFapiMessage() 
     {
         dl_tti_req = static_cast<scf_fapi_dl_tti_req_t*>(std::malloc(sizeof(scf_fapi_dl_tti_req_t) + FAPI_PAYLOAD_BUFFER_SIZE));
-        dl_tti_req->num_pdus = 0;
         ul_dci_req = static_cast<scf_fapi_ul_dci_t*>(std::malloc(sizeof(scf_fapi_ul_dci_t) + FAPI_PAYLOAD_BUFFER_SIZE));
+
+        if (dl_tti_req == nullptr || ul_dci_req == nullptr) {
+            if (dl_tti_req != nullptr) {
+                std::free(dl_tti_req);
+                dl_tti_req = nullptr;
+            }
+            if (ul_dci_req != nullptr) {
+                std::free(ul_dci_req);
+                ul_dci_req = nullptr;
+            }
+            throw std::bad_alloc();
+        }
+
+        dl_tti_req->num_pdus = 0;
         ul_dci_req->num_pdus = 0; 
         // ul_tti_req = new (8*1024); 
     }
@@ -138,25 +135,48 @@ struct LocalFapiMessage {
     
     void print_dl_tti_req_params() {
 
-        int offset = 0; 
+        std::size_t offset = 0; 
 
         for (int i = 0; i < dl_tti_req->num_pdus; ++i) {
+            if (offset + sizeof(scf_fapi_generic_pdu_info_t) > FAPI_PAYLOAD_BUFFER_SIZE) {
+                NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT,
+                           "DL_TTI_REQ payload bounds exceeded while printing at offset={}", offset);
+                break;
+            }
             auto& pdu    = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(&dl_tti_req->payload[0 + offset]));
+            const uint32_t pdu_size = static_cast<uint32_t>(pdu.pdu_size);
+            if (offset + pdu_size > FAPI_PAYLOAD_BUFFER_SIZE) {
+                NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT,
+                           "DL_TTI_REQ pdu_size out of bounds while printing: offset={} pdu_size={}", offset, pdu_size);
+                break;
+            }
 
             NVLOGD_FMT(TAG_UNIT_TB_COMMON, "DL_TTI_REQ SFN,Slot: {}.{} "
                "numPDUS: {} "
                "PDUType: {} "
                "PDUSize: {} ",
                (int) dl_tti_req->sfn, (int)dl_tti_req->slot,
-               dl_tti_req->num_pdus,
+               static_cast<unsigned>(dl_tti_req->num_pdus),
                (int) pdu.pdu_type,
                (int) pdu.pdu_size);
 
-            offset += pdu.pdu_size;
+            offset += pdu_size;
         }
 
+        offset = 0;
         for (int i = 0; i < ul_dci_req->num_pdus; ++i) {
-            auto& pdu    = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(&dl_tti_req->payload[0 + offset]));
+            if (offset + sizeof(scf_fapi_generic_pdu_info_t) > FAPI_PAYLOAD_BUFFER_SIZE) {
+                NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT,
+                           "UL_DCI_REQ payload bounds exceeded while printing at offset={}", offset);
+                break;
+            }
+            auto& pdu    = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(&ul_dci_req->payload[0 + offset]));
+            const uint32_t pdu_size = static_cast<uint32_t>(pdu.pdu_size);
+            if (offset + pdu_size > FAPI_PAYLOAD_BUFFER_SIZE) {
+                NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT,
+                           "UL_DCI_REQ pdu_size out of bounds while printing: offset={} pdu_size={}", offset, pdu_size);
+                break;
+            }
 
             NVLOGD_FMT(TAG_UNIT_TB_COMMON, "UL_DCI_REQ SFN,Slot: {}.{} "
                "numPDUS: {} "
@@ -167,7 +187,7 @@ struct LocalFapiMessage {
                (int) pdu.pdu_type,
                (int) pdu.pdu_size);
 
-            offset += pdu.pdu_size;
+            offset += pdu_size;
         }
         
     }
@@ -183,8 +203,6 @@ public:
     void Setup(int); 
     void print_ctx_cfg (); 
     void parse_eAxC(yaml::node node, std::vector<uint16_t> &vec); 
-    void Setup_TestMAC_Integration(); 
-    void Setup_MockTransport();
     void Setup_OneTimeConfigs(); 
     void TearDown(); 
     void Run(slot_command_api::slot_indication &slot_info); 
@@ -226,13 +244,10 @@ private:
     aerial_fh::PeerInfo peer_info{};
     peer_id_t  peer_id_{}; 
 
-    std::unique_ptr<PhyDriverCtx> ctx_; 
-    std::shared_ptr<TestFapiHandler> fapi_handler_;
-    launch_pattern* launch_pattern_;
-    std::shared_ptr<test_mac_configs> testmac_configs_;
-    std::unique_ptr<nv::phy_mac_transport> mock_transport_; 
-    uint32_t nDLAbsFrePointA_{}, nULAbsFrePointA_{};
-    LocalFapiMessage singleton_; 
+    std::unique_ptr<PhyDriverCtx> ctx_;
+    std::unique_ptr<TestMacSetupService> testmac_service_;
+    LocalFapiMessage singleton_;
+    CUdevice cuDevice_{}; //!< GPU device handle for primary context release in TearDown
 }; // class SendCPlaneUnitTest
 
 // Inherits from Peer to allow for intercepting the FH C-Plane flow right before the NIC send. 

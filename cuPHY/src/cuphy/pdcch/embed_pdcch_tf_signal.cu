@@ -24,6 +24,8 @@
 #include "crc.hpp"
 #include "polar_encoder.hpp"
 #include "polar_encoder.cuh"
+#include "polar_encoder_pdcch.cuh"
+#include "embed_pdcch_tf_signal.cuh"
 
 #include "tensor_desc.hpp"
 #include "nvlog.hpp"
@@ -344,54 +346,29 @@ __global__ void genScramblingSeqKernel(uint32_t* __restrict__ d_x_scramSeq_addr,
     }
 }
 
-// scrambling payload QAM, generate DMRS and map them to tfSignal
+// Body used by the standalone genPdcchTfSignalKernel (polar-encoder offload mode):
+// block-wide prologue (coreset-map decode, DMRS generation, bundle map + sort) followed by the
+// RE-mapping loop. The fused kernel runs a warp-specialized prologue instead and calls
+// genPdcchTfSignalMapREs directly.
+// Scrambles payload into QAM symbols, generates DMRS and maps both to tfSignal.
+// d_x_tx / d_x_scramSeq are the tx bits and scrambling sequence of THIS block's DCI
+// (already offset by the caller; may point to global or shared memory).
+// Caller must have performed the blockIdx.x >= n_sym early exit.
 template <typename TComplex>
-__global__ void genPdcchTfSignalKernel(
-    uint8_t* __restrict__ d_x_tx_addr,
-    uint32_t* __restrict__ d_x_scramSeq_addr,
-    uint32_t num_coresets,
-    PdcchParams* __restrict__ coreset_params,
-    cuphyPdcchDciPrm_t* __restrict__ params,
-    cuphyPdcchPmWOneLayer_t* __restrict__  pmw_params)
+__device__ __forceinline__ void genPdcchTfSignalBody(
+    const uint8_t* __restrict__ d_x_tx,
+    const uint32_t* __restrict__ d_x_scramSeq,
+    const PdcchParams& coreset,
+    const cuphyPdcchDciPrm_t& dci_params,
+    const cuphyPdcchPmWOneLayer_t* __restrict__ pmw_params)
 {
-    // This kernel launches one thread block per symbol per DCI.
+    // One thread block per symbol per DCI.
     // Reminder: at most 3 symbols possible.
-    const int symbol_id = blockIdx.x;
-    const int DCI_id    = blockIdx.y; // over all coresets
-
-    // Temp. FIXME find coreset
-#if 1
-    int  coreset_idx;
-    bool found = false;
-    for(int i = 0; (i < num_coresets) && !found; i++)
-    {
-        if((DCI_id >= coreset_params[i].dciStartIdx) && (DCI_id < (coreset_params[i].dciStartIdx + coreset_params[i].num_dl_dci)))
-        {
-            found       = true;
-            coreset_idx = i;
-        }
-    }
-#else
-    __shared__ int coreset_idx;
-    for(int i = threadIdx.x; i < num_coresets; i += blockDim.x)
-    {
-        if((DCI_id >= coreset_params[i].dciStartIdx) && (DCI_id < (coreset_params[i].dciStartIdx + coreset_params[i].num_dl_dci)))
-        {                    // Only one coreset will satisfy this condition
-            coreset_idx = i; // Each thread block corresponds to a single DCI and a symbol; only one thread in a thread block will update this
-        }
-    }
-    __syncthreads();
-#endif
-
-    PdcchParams&   coreset          = coreset_params[coreset_idx];
     const int      n_sym            = coreset.n_sym & 0x3;
     const uint32_t bundle_size      = coreset.bundle_size;
     const uint32_t interleaver_size = coreset.interleaver_size;
     const uint32_t shift_index      = coreset.shift_index;
 
-    if(blockIdx.x >= n_sym) return; //early exit as not all DCIs have the same # of symbols
-
-    const uint32_t n_f         = coreset.n_f;
     const uint32_t slot_number = coreset.slot_number;
     const uint32_t start_rb    = coreset.start_rb;
     const uint32_t start_sym   = coreset.start_sym;
@@ -403,34 +380,11 @@ __global__ void genPdcchTfSignalKernel(
     const uint32_t coreset_rb   = coreset.rb_coreset;
     const uint32_t coreset_type = coreset.coreset_type;
 
-    TComplex* __restrict__ tf_signal = (TComplex*)coreset.slotBufferAddr;
-
-    // Read per DCI config. parameters
-    cuphyPdcchDciPrm_t& dci_params = params[DCI_id];
-    uint32_t            dmrs_id    = dci_params.dmrs_id;
-    uint32_t            aggr_level = dci_params.aggr_level;
-    uint32_t            cce_index  = dci_params.cce_index;
-    float               beta_qam   = dci_params.beta_qam;
-    float               beta_dmrs  = dci_params.beta_dmrs;
-
-    // Read precoding matrix info
-    const uint8_t enablePrcdBf  = dci_params.enablePrcdBf;
-    uint16_t pmwPrmIdx = 0xFFFF;
-    uint8_t nPorts     = 0;
-    if(enablePrcdBf)
-    {
-        pmwPrmIdx = dci_params.pmwPrmIdx;
-        nPorts = pmw_params[pmwPrmIdx].nPorts;
-    }
-    const uint16_t offset_per_port = n_f * OFDM_SYMBOLS_PER_SLOT;
-    const TComplex zeroValue = make_complex<TComplex>::create(0,0);
-
-    //uint32_t n_rb = (6 / n_sym) * aggr_level; // Reminder n_sym values are 1, 2 or 3
-    uint32_t temp = (0x2360 >> (4 * n_sym)) & 0xf; // temp expresses 6 / n_sym
-    uint32_t n_rb = temp * aggr_level;
-
-    uint32_t* __restrict__ d_x_scramSeq = d_x_scramSeq_addr + DCI_id * (CUPHY_PDCCH_MAX_TX_BITS_PER_DCI / 32);
-    uint8_t* __restrict__ d_x_tx        = d_x_tx_addr + DCI_id * (CUPHY_PDCCH_MAX_TX_BITS_PER_DCI / 8);
+    // Read per DCI config. parameters (QAM/precoding fields are re-derived in genPdcchTfSignalMapREs)
+    uint32_t dmrs_id    = dci_params.dmrs_id;
+    uint32_t aggr_level = dci_params.aggr_level;
+    uint32_t cce_index  = dci_params.cce_index;
+    float    beta_dmrs  = dci_params.beta_dmrs;
 
     extern __shared__ TComplex shmem[];
     TComplex*                  s_dmrs_seqs = shmem;                                         // (n_rb * 3) * 2 * n_sym
@@ -440,7 +394,8 @@ __global__ void genPdcchTfSignalKernel(
     if(threadIdx.x == 0)
     {
         uint64_t tmp_map       = coreset_map;
-        int      first_set_bit = __clzll(tmp_map); //counting from msb
+        // __clzll return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems, thus the explicit cast
+        int      first_set_bit = (int)__clzll(tmp_map); //counting from msb
         tmp_map <<= (first_set_bit + 1);
         first_set_bit -= (64 - coreset_rb);
         log_to_physical_map[0] = first_set_bit;
@@ -481,69 +436,32 @@ __global__ void genPdcchTfSignalKernel(
                 &log_to_physical_map[0],
                 &phy_bundles[0]);
 
-    int pdcch_start_freq = start_rb * 12;
-    int total_n_REs      = n_rb * 12;
-    int n_qam_per_sym    = n_rb * 9; // For every RB, 9 REs are QAMs and 3 are DMRS. DMRS are in positions 1, 5 and 9 within an RB (0-indexing).
+    genPdcchTfSignalMapREs<TComplex>(d_x_tx, d_x_scramSeq, s_dmrs_seqs, &phy_bundles[0], coreset, dci_params, pmw_params);
+}
 
-    // Reminder: bundle_size is 2, 3 or 6. n_sym is 1, 2 or 3.
-    //uint32_t contiguous_rbs = bundle_size / n_sym;
-    uint32_t contiguous_rbs = (bundle_size == 6) ? temp : (bundle_size - n_sym + 1); // bundle_size / n_sym
+// scrambling payload QAM, generate DMRS and map them to tfSignal
+template <typename TComplex>
+__global__ void genPdcchTfSignalKernel(
+    uint8_t* __restrict__ d_x_tx_addr,
+    uint32_t* __restrict__ d_x_scramSeq_addr,
+    uint32_t num_coresets,
+    PdcchParams* __restrict__ coreset_params,
+    cuphyPdcchDciPrm_t* __restrict__ params,
+    cuphyPdcchPmWOneLayer_t* __restrict__ pmw_params,
+    const int* __restrict__ d_coreset_idx_of_dci)
+{
+    const int    DCI_id      = blockIdx.y; // over all coresets
+    const int    coreset_idx = d_coreset_idx_of_dci[DCI_id];
+    PdcchParams& coreset     = coreset_params[coreset_idx];
+    const int    n_sym       = coreset.n_sym & 0x3;
 
-    // Every thread writes one RE. If tid & 0x3 == 1, that's DMRS, everything else is QAM.
-    for(int tid = threadIdx.x; tid < total_n_REs; tid += blockDim.x)
-    {
-        int contiguous_res_chunk_id = tid / (12 * contiguous_rbs);
-        int phy_bundle_id           = phy_bundles[contiguous_res_chunk_id];
+    if(blockIdx.x >= n_sym) return; //early exit as not all DCIs have the same # of symbols
 
-        int g_w_idx = pdcch_start_freq + (symbol_id + start_sym) * n_f + phy_bundle_id * contiguous_rbs * 12 + (tid % (12 * contiguous_rbs));
-        //printf("threadIdx.x %d, symbol %d, DCI %d, writing phy_bundle_id %d to freq %d RE for that symbol\n",
-        //        threadIdx.x, symbol_id + start_sym, blockIdx.y, phy_bundle_id, g_w_idx -  (symbol_id + start_sym) * n_f);
-        TComplex val;
-        if((tid & 0x3) == 1)
-        { // map DMRS
-            int idxDmrs = phy_bundle_id * contiguous_rbs * 3;
-            idxDmrs += (((tid % (12 * contiguous_rbs)) - 1) >> 2);
-
-            val = s_dmrs_seqs[idxDmrs];
-        }
-        else
-        { // map QAM
-            int idxQam;
-            // find QAM index
-            if(tid == 0)
-            {
-                idxQam = 0 + symbol_id * n_qam_per_sym;
-            }
-            else
-            {
-                idxQam = (tid - ((tid - 1) / 4 + 1)) + symbol_id * n_qam_per_sym;
-            }
-            // scrambling
-            int idxBit = 2 * idxQam;
-            int x_tx_x = (d_x_tx[idxBit / 8] >> (idxBit % 8)) & 0x1;
-            int x_tx_y = (d_x_tx[idxBit / 8] >> ((idxBit + 1) % 8)) & 0x1;
-
-            uint32_t scrambling_val = d_x_scramSeq[idxBit >> 5];
-            int      x              = (x_tx_x + (scrambling_val >> (31 - (idxBit & 0x1F)))) & 0x1;
-            int      y              = (x_tx_y + (scrambling_val >> (31 - ((idxBit + 1) & 0x1F)))) & 0x1;
-
-            // modulation
-            val.x = 0.70710678f * (1 - 2 * x) * beta_qam;
-            val.y = 0.70710678f * (1 - 2 * y) * beta_qam;
-        }
-        if(enablePrcdBf)
-        {
-            for(int idx = 0; idx < nPorts; idx++)
-            {
-                tf_signal[g_w_idx + offset_per_port*idx] = __hcmadd(val, pmw_params[pmwPrmIdx].matrix[idx], zeroValue); // uncoalesced writes
-            }
-        }
-        else
-        {
-            tf_signal[g_w_idx] = val;
-        }
-        
-    }
+    genPdcchTfSignalBody<TComplex>(d_x_tx_addr + DCI_id * (CUPHY_PDCCH_MAX_TX_BITS_PER_DCI / 8),
+                                   d_x_scramSeq_addr + DCI_id * (CUPHY_PDCCH_MAX_TX_BITS_PER_DCI / 32),
+                                   coreset,
+                                   params[DCI_id],
+                                   pmw_params);
 }
 
 // dbg_print was never used in the codebase
@@ -678,41 +596,15 @@ void kernelSelectGenTfSignal(cuphyGenPdcchTfSgnlLaunchCfg_t* pLaunchCfg,
                              int                             num_coresets,
                              PdcchParams*                    h_coreset_params)
 {
-    // kernel (only one kernel option for now)
-    void* kernelFunc = reinterpret_cast<void*>(genPdcchTfSignalKernel<__half2>);
-    {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&pLaunchCfg->kernelNodeParamsDriver.func, kernelFunc));}
-
-    // FIXME temp. get max_rb coreset and max symbols for all coresets
-    uint32_t max_rb_coreset = 0;
-    uint32_t max_n_sym      = 0;
-    for(int coreset_idx = 0; coreset_idx < num_coresets; coreset_idx++)
+    if(pLaunchCfg->kernelNodeParamsDriver.func == nullptr)
     {
-        max_rb_coreset = std::max(max_rb_coreset, h_coreset_params[coreset_idx].rb_coreset);
-        max_n_sym      = std::max(max_n_sym, h_coreset_params[coreset_idx].n_sym);
+        // kernel (only one kernel option for now) and without any specialization, so update function only once.
+        // func is set to nullptr in PDCCH channel constructor
+        void* kernelFunc = reinterpret_cast<void*>(genPdcchTfSignalKernel<__half2>);
+        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&pLaunchCfg->kernelNodeParamsDriver.func, kernelFunc));}
     }
 
-    // Compute dynamic shared memory size
-    size_t s_dmrs_seqs_size = sizeof(__half2) * (max_rb_coreset * 6 * 3);
-    size_t s_gold_seqs_size = sizeof(uint32_t) * (((max_rb_coreset * 6 * 6 + 31) / 32) + 2);
-
-    // Max number of symbols is 3. Max number of DCIs is CUPHY_PDCCH_MAX_DCIS_PER_CORESET.
-    // Currently, some computations are replicated across symbols for the same DCI.
-    dim3 gridDim   = dim3(max_n_sym, num_DCIs);
-    dim3  blockDim = dim3(128);
-
-    // populate kernel parameters
-    CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = pLaunchCfg->kernelNodeParamsDriver;
-
-    kernelNodeParamsDriver.blockDimX = blockDim.x;
-    kernelNodeParamsDriver.blockDimY = blockDim.y;
-    kernelNodeParamsDriver.blockDimZ = blockDim.z;
-
-    kernelNodeParamsDriver.gridDimX = gridDim.x;
-    kernelNodeParamsDriver.gridDimY = gridDim.y;
-    kernelNodeParamsDriver.gridDimZ = gridDim.z;
-
-    kernelNodeParamsDriver.extra          = nullptr;
-    kernelNodeParamsDriver.sharedMemBytes = s_dmrs_seqs_size + s_gold_seqs_size;
+    pdcchTfSignalLaunchGeometry(pLaunchCfg->kernelNodeParamsDriver, num_DCIs, num_coresets, h_coreset_params);
 }
 
 } // namespace embedPdcchTx
@@ -779,7 +671,8 @@ cuphyStatus_t cuphyPdcchPipelinePrepare(void*                   h_input_w_crc_ad
         // When set, we  need to set the next num_dl_dci=1 bits of h_dci_tm_info to the appropriate testing mode value
 
         // Used in per-DCI payload size check below
-        int max_payload_bits = (coreset_cell_in_testing_mode ? polar_encoder::N_MAX_TM_DCI_TX_BYTES : CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES)*8;
+        int min_payload_bits = (coreset_cell_in_testing_mode ? 1 : CUPHY_PDCCH_POLAR_A_MIN);
+        int max_payload_bits = (coreset_cell_in_testing_mode ? 8 * polar_encoder::N_MAX_TM_DCI_TX_BYTES : CUPHY_PDCCH_POLAR_A_MAX);
 
         // Go over all DCIs of this coreset
         for(int i = 0; i < params[coreset_idx].num_dl_dci; i++)
@@ -796,15 +689,22 @@ cuphyStatus_t cuphyPdcchPipelinePrepare(void*                   h_input_w_crc_ad
 
             uint8_t* h_input_w_crc = (uint8_t*)(h_input_w_crc_addr) + input_w_crc_offset;
 
-            // Check for max payload size, to ensure no illegal access (shared memory) in encodeRateMatchMultipleDCIsKernel in non TM mode
-            // The kernel already has some checks in place in case of testing mode.
-            if(payload_bits > max_payload_bits) {
-                NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT, "Error! PDCCH coreset {} DCI {} (testing mode {}) has invalid payload size of {} bits.",
-                           coreset_idx, i, coreset_cell_in_testing_mode, payload_bits);
+            if(payload_bits < min_payload_bits || payload_bits > max_payload_bits) {
+                NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT, "Error! PDCCH coreset {} DCI {} (testing mode {}) has invalid payload size of {} bits (valid range [{}, {}]).",
+                           coreset_idx, i, coreset_cell_in_testing_mode, payload_bits, min_payload_bits, max_payload_bits);
                 return CUPHY_STATUS_INVALID_ARGUMENT;
             }
             if(coreset_cell_in_testing_mode)
             {
+                // Testing-mode DCIs carry a fixed 108-bit PN payload (N_MAX_TM_DCI_TX_BYTES = 14 bytes)
+                // that is copied to the tx-bit buffer verbatim, so only aggregation level 1
+                // (tx_bits = 108) is meaningful; larger levels would transmit bits beyond the payload.
+                if(dci_params.aggr_level != 1)
+                {
+                    NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT, "Error! PDCCH coreset {} DCI {} is in testing mode with unsupported aggregation level {} (must be 1).",
+                               coreset_idx, i, dci_params.aggr_level);
+                    return CUPHY_STATUS_INVALID_ARGUMENT;
+                }
                 payload_crc = 0; // If the cell this DCI belongs to is in testing mode, skip CRC computation and set CRC payload to 0; acts as padding
                 current_tm_byte |= (1 << current_tm_bit_index);
             }
@@ -871,4 +771,5 @@ cuphyStatus_t cuphyPdcchPipelinePrepare(void*                   h_input_w_crc_ad
 
     return status;
 }
+
 

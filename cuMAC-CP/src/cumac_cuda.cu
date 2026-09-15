@@ -322,6 +322,11 @@ static __global__ void gpu_copy_cell_bufs(cumac_task_info_t *task_info, cell_des
     {
         gpu_copy_element(task_info->pfmCellInfo, cell_descs, req_offset(pfmCellInfo), task_info->data_num.pfmCellInfo, cell_num);
     }
+
+    if (task_bitmask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        gpu_copy_element(reinterpret_cast<uint8_t*>(task_info->muUeGrpInfo), cell_descs, req_offset(muUeGrpInfo), task_info->data_num.muUeGrpInfo, cell_num);
+    }
 }
 
 int cumac_copy_cell_to_group(cumac_task *task, uint32_t cuda_block_num)

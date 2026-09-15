@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,11 +26,10 @@ set(CMAKE_CUDA_FLAGS_DEBUG " -g -G")
 # target_link_libraries(barsync.x comp_decomp_lib)
 
 add_executable(qam_test QAM_test.cu)
-target_link_libraries(qam_test -lcurand)
-target_include_directories(qam_test PUBLIC ../comp_decomp_lib/include)
+target_link_libraries(qam_test PRIVATE comp_decomp_lib cuda_driver_utils CUDA::curand)
 
 add_executable(qam_param_test QAM_param_test.cu)
-target_include_directories(qam_param_test PUBLIC ../comp_decomp_lib/include)
+target_link_libraries(qam_param_test PRIVATE comp_decomp_lib)
 
 find_package(HDF5 1.10 REQUIRED COMPONENTS C)
 
@@ -39,5 +38,5 @@ target_include_directories(modcomp_test PUBLIC ../comp_decomp_lib/include ${HDF5
                       ${CMAKE_CURRENT_SOURCE_DIR}/../../../cuPHY/examples/common 
                       ${CMAKE_CURRENT_SOURCE_DIR}/../../aerial-fh-driver/include/aerial-fh-driver)
 
-target_link_libraries(modcomp_test PRIVATE nvlog cuphy_hdf5 ${HDF5_C_LIBRARIES})
+target_link_libraries(modcomp_test PRIVATE comp_decomp_lib cuda_driver_utils nvlog cuphy_hdf5 ${HDF5_C_LIBRARIES})
 

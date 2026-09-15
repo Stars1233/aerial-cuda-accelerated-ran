@@ -22,36 +22,45 @@
 // usage()
 void usage() {
     printf("cuMAC 64T64R MU-MIMO scheduler pipeline test with [Arguments]\n");
+    printf("\n");
+    printf("NOTE: PDSCH PHY abstraction (MMSE-IRC SINR, BLER, TBS) runs on CPU only.\n");
+    printf("      Scheduling, channel generation, and beamforming still use the GPU.\n");
+    printf("      -p values 1 (GPU) and 2 (Both) are rejected at startup.\n");
+    printf("\n");
     printf("Arguments:\n");
-    printf("  -g  [GPU device index (default 0)]\n");
     printf("  -i  [cuMAC_HDF5_TV_file]\n");
     printf("  -a  [Indication for AODT testing: 0 - not for AODT testing, 1 - for AODT testing (default 0)]\n");
     printf("  -c  [Configuration file name (default config.yaml)]\n");
+    printf("  -t  [Number of simulation slots (default 1)]\n");
+    printf("  -s  [Random seed (default: value from config file)]\n");
+    printf("  -l  [Enable per-slot log recording (default: disabled)]\n");
+    printf("  -p  [PHY abstraction target: 0=CPU (default, only supported), 1=GPU (not implemented), 2=Both (not implemented)]\n");
     printf("  -h  [Print help usage]\n");
 }
 
-int main(int argc, char* argv[]) 
+int main(int argc, char* argv[])
 {
+    cumac::loadParameters();
+
     int iArg = 1;
 
     std::string inputFileName;
     std::string configFileName;
-    uint16_t deviceIdx = 0;
+    int deviceIdx = gpuDeviceIdx;
 
     // AODT testing indication
     uint8_t aodtTest = 0;
 
+    // simulation and PHY abstraction parameters
+    PhyExecTarget gpuInd = PhyExecTarget::CPU;
+    uint16_t totSimuSlots = 1;
+    bool saveSlotLog = false;
+    int randomSeed = -1;
+
+
     while(iArg < argc) {
         if('-' == argv[iArg][0]) {
             switch(argv[iArg][1]) {
-                case 'g': // set GPU device index
-                    if(++iArg >= argc) {
-                        fprintf(stderr, "ERROR: No GPU device index given.\n");
-                        exit(1);
-                    } else {
-                        deviceIdx = static_cast<uint16_t>(atoi(argv[iArg++]));
-                    }
-                    break;
                 case 'i': // input channel file name
                     if(++iArg >= argc) {
                         fprintf(stderr, "ERROR: No input file name given.\n");
@@ -75,6 +84,43 @@ int main(int argc, char* argv[])
                         configFileName.assign(argv[iArg++]);
                     }
                     break;
+                case 't': // set simulation slot number
+                    if(++iArg >= argc) {
+                        fprintf(stderr, "ERROR: No simulation slot number given.\n");
+                        exit(1);
+                    } else {
+                        totSimuSlots = static_cast<uint16_t>(atoi(argv[iArg++]));
+                        if (totSimuSlots == 0) {
+                            fprintf(stderr, "ERROR: Simulation slot count must be > 0.\n");
+                            exit(1);
+                        }
+                    }
+                    break;
+                case 's': // set random seed
+                    if(++iArg >= argc) {
+                        fprintf(stderr, "ERROR: No random seed given.\n");
+                        exit(1);
+                    } else {
+                        randomSeed = atoi(argv[iArg++]);
+                    }
+                    break;
+                case 'l': // enable slot log recording
+                    saveSlotLog = true;
+                    ++iArg;
+                    break;
+                case 'p': // PHY abstraction execution target (PDSCH BLER/TBS path; CPU-only today)
+                    if (++iArg >= argc) {
+                        fprintf(stderr, "ERROR: No PHY abstraction target given.\n");
+                        exit(1);
+                    } else {
+                        const int phyTarget = atoi(argv[iArg++]);
+                        if (phyTarget < 0 || phyTarget > 2) {
+                            fprintf(stderr, "ERROR: PHY abstraction target must be 0 (CPU), 1 (GPU), or 2 (Both).\n");
+                            exit(1);
+                        }
+                        gpuInd = static_cast<PhyExecTarget>(phyTarget);
+                    }
+                    break;
                 case 'h': // print help usage
                     usage();
                     exit(0);
@@ -91,6 +137,16 @@ int main(int argc, char* argv[])
         }
     }
 
+    if (!isPhyExecTargetSupported(gpuInd)) {
+        fprintf(stderr,
+                "ERROR: PHY abstraction target %d is not implemented.\n"
+                "       Only CPU (0) is supported for PDSCH BLER/TBS (updateDataRatePdschCpu).\n"
+                "       GPU (1) and Both (2) will be added in a future release.\n"
+                "       Scheduling, channel generation, and beamforming still use CUDA device 0.\n",
+                static_cast<int>(gpuInd));
+        exit(1);
+    }
+
     if (configFileName.size() == 0) {
         // default configuration file path/name from build directory
         configFileName = "./cuMAC/examples/multiCellMuMimoScheduler/config.yaml";
@@ -100,10 +156,10 @@ int main(int argc, char* argv[])
     int deviceCount{};
     CUDA_CHECK_ERR(cudaGetDeviceCount(&deviceCount));
     
-    unsigned my_dev = gpuDeviceIdx;
-    if (static_cast<int>(gpuDeviceIdx) >= deviceCount) {
-        printf("WARNING: Requested GPU device %u exceeds available device count (%d). Falling back to GPU device 0.\n", 
-               gpuDeviceIdx, deviceCount);
+    unsigned my_dev = static_cast<unsigned>(deviceIdx);
+    if (deviceIdx < 0 || deviceIdx >= deviceCount) {
+        printf("WARNING: Requested GPU device %d exceeds available device count (%d). Falling back to GPU device 0.\n",
+               deviceIdx, deviceCount);
         my_dev = 0;
     }
     
@@ -119,14 +175,18 @@ int main(int argc, char* argv[])
     std::unique_ptr<mMimoNetwork> mMimoNet;
     
     if (inputFileName.size() == 0) { // TV not provided
-        mMimoNet = std::make_unique<mMimoNetwork>(configFileName, cuStrmMain);
+        mMimoNet = std::make_unique<mMimoNetwork>(configFileName, cuStrmMain, randomSeed);
     } else {
-        mMimoNet = std::make_unique<mMimoNetwork>(inputFileName, cuStrmMain);
+        mMimoNet = std::make_unique<mMimoNetwork>(inputFileName, cuStrmMain, randomSeed);
     }
 
-    // setup randomness seed
     srand(mMimoNet->getSeed());
 
+    // initialize simulation record log
+    if (saveSlotLog){
+        mMimoNet->initSimuRecords(totSimuSlots);
+    }
+    
     // MU-MIMO UE sorting
     auto mcUeSortGpu = std::make_unique<cumac::multiCellMuUeSort>(mMimoNet->cellGrpPrmsGpu.get());
 
@@ -144,45 +204,85 @@ int main(int argc, char* argv[])
         preProcessInput(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), mMimoNet->schdSolGpu.get());
     }
 
-    if (inputFileName.size() == 0) { // TV not provided
-        mMimoNet->genFadingChannGpu(0);
+    std::cout<<"\nSimulation started!\n"<<std::endl;
+    printf("PHY abstraction (PDSCH MMSE-IRC / BLER / TBS): CPU only (PhyExecTarget::CPU)\n\n");
+
+    for (uint16_t slotIdx = 0; slotIdx < totSimuSlots; slotIdx++) {
+        std::cout<<"\nsimulation started for slot: "<<slotIdx<<std::endl;
+
+        // Synchronize stream to ensure GPU operations complete before CPU accesses managed memory
+        CUDA_CHECK_ERR(cudaStreamSynchronize(cuStrmMain));
+
+        // generate fading channel
+        if (inputFileName.size() == 0) { // TV not provided
+            mMimoNet->genFadingChannGpu(slotIdx);
+        }
+
+        // setup modules
+        mcUeSortGpu->setup(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->schdSolGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), cuStrmMain);
+
+        mcUeGrpGpu->setup(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->schdSolGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), cuStrmMain);
+
+        beamformGpu->setup(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->schdSolGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), cuStrmMain);
+
+        mcsSelGpu->setup(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->schdSolGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), cuStrmMain);
+
+        // run modules
+        mcUeSortGpu->run(cuStrmMain);
+
+        mcUeGrpGpu->run(cuStrmMain);
+
+        beamformGpu->run(cuStrmMain);
+
+        mcsSelGpu->run(cuStrmMain);
+
+        // Synchronize stream to ensure GPU operations complete before CPU accesses managed memory
+        CUDA_CHECK_ERR(cudaStreamSynchronize(cuStrmMain));
+
+        // PHY layer processing
+        mMimoNet->phyAbstract(gpuInd, slotIdx, saveSlotLog);
     }
 
-    // setup modules
-    mcUeSortGpu->setup(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->schdSolGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), cuStrmMain);
-    std::cout<<"UE sorting setup executed"<<std::endl;
-
-    mcUeGrpGpu->setup(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->schdSolGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), cuStrmMain);
-    std::cout<<"UE grouping setup executed"<<std::endl;
-
-    beamformGpu->setup(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->schdSolGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), cuStrmMain);
-    std::cout<<"Beamforming setup executed"<<std::endl;
-
-    mcsSelGpu->setup(mMimoNet->cellGrpUeStatusGpu.get(), mMimoNet->schdSolGpu.get(), mMimoNet->cellGrpPrmsGpu.get(), cuStrmMain);
-    std::cout<<"MCS selection setup executed"<<std::endl;
-
-    // run modules
-    mcUeSortGpu->run(cuStrmMain);
-    std::cout<<"UE sorting run executed"<<std::endl;
-
-    mcUeGrpGpu->run(cuStrmMain);
-    std::cout<<"UE grouping run executed"<<std::endl;
-
-    beamformGpu->run(cuStrmMain);
-    std::cout<<"Beamforming run executed"<<std::endl;  
-
-    mcsSelGpu->run(cuStrmMain);
-    std::cout<<"MCS selection run executed"<<std::endl;
-
     CUDA_CHECK_ERR(cudaStreamSynchronize(cuStrmMain));
- 
-    std::string saveTvName = "TV_cumac_result_64T64R_" + std::to_string(mMimoNet->getNCell()) +"PC_" + (mMimoNet->getDL() == 1 ? "DL" : "UL") + ".h5";
 
-    saveToH5(saveTvName,
-             mMimoNet->cellGrpUeStatusGpu.get(),
-             mMimoNet->cellGrpPrmsGpu.get(),
-             mMimoNet->schdSolGpu.get());
-    
+    std::cout<<"\nSimulation finished!\n"<<std::endl;
+    std::string saveTvName = "TV_cumac_result_64T64R_" + std::to_string(mMimoNet->getNCell()) +"PC_" + (mMimoNet->getDL() == 1 ? "DL" : "UL") + ".h5";
+    // std::string saveTvName = "TV_cumac_result_64T64R_" + std::to_string(mMimoNet->getFadingType()) +"fading_" + std::to_string(mMimoNet->getNCell()) +"PC_" + std::to_string(mMimoNet->getNActiveUePerCell()) + "ActiveUePerCell_" + std::to_string(totSimuSlots) + "slots_seed" + std::to_string(mMimoNet->getSeed()) + ".h5";
+
+    if (saveSlotLog){
+        saveToH5_perSlotLog(saveTvName,
+                            mMimoNet->cellGrpUeStatusGpu.get(),
+                            mMimoNet->cellGrpPrmsGpu.get(),
+                            mMimoNet->schdSolGpu.get(),
+                            mMimoNet->perUEperSlotMcs,
+                            mMimoNet->perUEperSlotLayerSel,
+                            mMimoNet->perUEperSlotAvgSinr,
+                            mMimoNet->perUEperRbgperSlotGeometrySinr,
+                            mMimoNet->perUEperSlotServingCellChannelGain,
+                            mMimoNet->perUEperCellperSlotAllCellsChannelGain,
+                            mMimoNet->perUEperSlotServingCellPathLossAndSF,
+                            mMimoNet->perUEperCellperSlotAllCellsPathLossAndSF,
+                            mMimoNet->perUEperRbgperSlotGeometrySir,
+                            mMimoNet->perUEperRbgperSlotGeometrySnr,
+                            mMimoNet->perUEperRbgperSlotRawPreEqSinr,
+                            mMimoNet->perUEperRbgperSlotRawPreEqSir,
+                            mMimoNet->perUEperRbgperSlotRawPreEqSnr,
+                            mMimoNet->perUEperRbgperLayerperSlotRawSinr,
+                            mMimoNet->perUEperSlotTbErr,
+                            mMimoNet->perUEperSlotBler,
+                            mMimoNet->perUEperSlotInsRate,
+                            mMimoNet->perUEperSlotAvgRate,
+                            mMimoNet->perCellperSlotNumScheUEs,
+                            mMimoNet->perCellperSlotTbErr,
+                            mMimoNet->perCellperSlotInsRate,
+                            mMimoNet->perCellperGrpperSlotNumScheLayers);
+    } else {
+        saveToH5(saveTvName,
+            mMimoNet->cellGrpUeStatusGpu.get(),
+            mMimoNet->cellGrpPrmsGpu.get(),
+            mMimoNet->schdSolGpu.get());
+    }
+
     if (inputFileName.size() == 0) { // no TV provided
         mMimoNet->validateSchedSol();
         printf("Summary - cuMAC multi-cell MU-MIMO scheduler simulation test: PASS\n");

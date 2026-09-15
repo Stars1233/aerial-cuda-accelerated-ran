@@ -17,6 +17,7 @@
 
 #include "app_config.hpp"
 #include <algorithm>
+#include <chrono>
 #include <string.h>
 #include <type_traits>
 #include "scf_fapi_handler.hpp"
@@ -24,12 +25,15 @@
 #include "nvlog.hpp"
 #include "oran_utils/conversion.hpp"
 
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+
 #ifdef AERIAL_CUMAC_ENABLE
 #include "cumac_handler.hpp"
 #endif
 
 #define TAG (NVLOG_TAG_BASE_TEST_MAC + 4) // "MAC.SCF"
 #define TAG_PROCESSING_TIMES (NVLOG_TAG_BASE_TEST_MAC + 9) // "MAC.PROCESSING_TIMES"
+
 
 // If defined, force L2 to have an approx total scheduling time
 // NB: This only works correctly for PTP GPS_ALPHA=GPS_BETA=0
@@ -45,6 +49,18 @@ static constexpr uint16_t DYN_TEST_DMRS_SYM_POS = 0x0402; // Symbol 2 and 11
 #define COPY_TIME_STAT_ENABLED 0
 
 static constexpr int MAX_MIB_BITS = 24;
+
+#ifdef SCF_FAPI_10_04
+static inline void reset_ul_tti_pdu_counts(scf_fapi_ul_tti_req_t& req)
+{
+    req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PRACH]      = 0;
+    req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUSCH]      = 0;
+    req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUCCH_F01]  = 0;
+    req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUCCH_F234] = 0;
+    req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_SRS]        = 0;
+    req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_MsgA_PUSCH] = 0;
+}
+#endif
 
 static inline void to_u8_array(uint32_t bchPayload, uint8_t* mib)
 {
@@ -156,7 +172,8 @@ inline uint8_t to_scf_ch_seg_type(channel_segment_t& seg) {
     return val;
 }
 
-scf_fapi_handler::scf_fapi_handler(phy_mac_transport& ipc_transport, test_mac_configs* configs, launch_pattern* lp, ch8_conformance_test_stats* conformance_test_stats):fapi_handler(ipc_transport, configs, lp, conformance_test_stats)
+scf_fapi_handler::scf_fapi_handler(test_mac_configs* configs, launch_pattern* lp, ch8_conformance_test_stats* conformance_test_stats)
+    : fapi_handler(configs, lp, conformance_test_stats)
 {
     sem_init(&worker_sem, 0, 0);
 
@@ -187,6 +204,12 @@ scf_fapi_handler::scf_fapi_handler(phy_mac_transport& ipc_transport, test_mac_co
             dyn_tb_data_gen_buf[i] = i % 100; // Populate cycle of 0, 1, 2, 3, ..., 100 to the buffers for test
         }
     }
+}
+
+scf_fapi_handler::~scf_fapi_handler()
+{
+    release_prebuilt_message_storage();
+    sem_destroy(&worker_sem);
 }
 
 int scf_fapi_handler::reorder_schedule_sequence(sfn_slot_t ss)
@@ -381,12 +404,13 @@ void scf_fapi_handler::worker_thread_func()
     NVLOGC_FMT(TAG, "Thread {} on CPU {} initialized fmtlog", name, sched_getcpu());
 
     nv::phy_mac_msg_desc msg_desc;
+    auto& tr = transport();
     while(sem_wait(&worker_sem) == 0)
     {
-        while(_transport.rx_recv(msg_desc) >= 0)
+        while(tr.rx_recv(msg_desc) >= 0)
         {
             on_msg(msg_desc);
-            _transport.rx_release(msg_desc);
+            tr.rx_release(msg_desc);
         }
     }
 }
@@ -697,7 +721,7 @@ int scf_fapi_handler::build_dyn_dl_tti_request(int cell_id, vector<fapi_req_t*>&
     }
 
     NVLOGI_FMT(TAG, "SFN {}.{} BUILD: cell_id={} DL_TTI.req fapi_reqs.size={} dyn_param.pdus.size={} nPDU: PDSCH={}",
-            static_cast<unsigned>(req.sfn), static_cast<unsigned>(req.slot), cell_id, fapi_reqs.size(), dyn_param.pdus.size(), req.num_pdus);
+            static_cast<unsigned>(req.sfn), static_cast<unsigned>(req.slot), cell_id, fapi_reqs.size(), dyn_param.pdus.size(), static_cast<unsigned>(req.num_pdus));
     return offset;
 }
 
@@ -711,6 +735,15 @@ int scf_fapi_handler::build_dl_tti_request(int cell_id, vector<fapi_req_t*>& fap
 
     int pdsch_pdu_index = 0;
     int pbch_num = 0, pdsch_num = 0, pdcch_dl_num = 0, csi_rs_num = 0;
+
+#ifdef SCF_FAPI_10_04
+    // Initialize nPDUsOfEachType array to 0 using index constants (not wire pdu_type values)
+    req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_PDCCH]  = 0;
+    req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_PDSCH]  = 0;
+    req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_CSI_RS] = 0;
+    req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_SSB]    = 0;
+    req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_DlDCIs] = 0;
+#endif
     for(int i = 0; i < fapi_reqs.size(); i++)
     {
         fapi_req_t*    fapi_req = fapi_reqs[i];
@@ -721,6 +754,9 @@ int scf_fapi_handler::build_dl_tti_request(int cell_id, vector<fapi_req_t*>& fap
             // Add BCH PDU parameters
             for(const pbch_tv_data_t& pbch_pdu : tv.pbch_tv.data)
             {
+#ifdef SCF_FAPI_10_04
+                req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_SSB]++;
+#endif
                 auto& pdu    = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(data + offset));
                 pdu.pdu_type = DL_TTI_PDU_TYPE_SSB;
                 pdu.pdu_size = sizeof(scf_fapi_generic_pdu_info_t);
@@ -755,6 +791,10 @@ int scf_fapi_handler::build_dl_tti_request(int cell_id, vector<fapi_req_t*>& fap
             // Add PDCCH_DL PDU parameters
             for(auto& coreset : tv.pdcch_tv.coreset)
             {
+#ifdef SCF_FAPI_10_04
+                req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_PDCCH]++;
+                req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_DlDCIs] += coreset.numDlDci;
+#endif
                 auto& pdu    = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(data + offset));
                 pdu.pdu_type = DL_TTI_PDU_TYPE_PDCCH;
 
@@ -829,7 +869,9 @@ int scf_fapi_handler::build_dl_tti_request(int cell_id, vector<fapi_req_t*>& fap
             for(pdsch_tv_data_t* tv_data : tv.pdsch_tv.data)
             {
                 struct tb_pars& tb_pars = tv_data->tbpars;
-
+#ifdef SCF_FAPI_10_04
+                req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_PDSCH]++;
+#endif
                 auto& pdu     = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(data + offset));
                 pdu.pdu_type  = DL_TTI_PDU_TYPE_PDSCH;
                 pdu.pdu_size  = sizeof(scf_fapi_generic_pdu_info_t);
@@ -942,6 +984,9 @@ int scf_fapi_handler::build_dl_tti_request(int cell_id, vector<fapi_req_t*>& fap
         {
             for(auto& csirs_pdu : tv.csirs_tv.data)
             {
+#ifdef SCF_FAPI_10_04
+                req.nPDUsOfEachType[DL_TTI_NPDUS_IDX_CSI_RS]++;
+#endif
                 auto& pdu                                 = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(data + offset));
                 pdu.pdu_type                              = DL_TTI_PDU_TYPE_CSI_RS;
                 pdu.pdu_size                              = sizeof(scf_fapi_generic_pdu_info_t);
@@ -978,8 +1023,9 @@ int scf_fapi_handler::build_dl_tti_request(int cell_id, vector<fapi_req_t*>& fap
         }
     }
 
-    NVLOGI_FMT(TAG, "SFN {}.{} BUILD: cell_id={} DL_TTI.req nPDU: PBCH={} PDSCH={} PDCCH_DL={} CSI_RS={}",
-            static_cast<unsigned>(req.sfn), static_cast<unsigned>(req.slot), cell_id, pbch_num, pdsch_num, pdcch_dl_num, csi_rs_num);
+    NVLOGI_FMT(TAG, "SFN {}.{} BUILD: cell_id={} DL_TTI.req num_pdus={} (SSB={} PDSCH={} PDCCH={} CSI_RS={})",
+            static_cast<unsigned>(req.sfn), static_cast<unsigned>(req.slot), cell_id,
+            static_cast<unsigned>(req.num_pdus), pbch_num, pdsch_num, pdcch_dl_num, csi_rs_num);
     return offset;
 }
 
@@ -1318,9 +1364,13 @@ int scf_fapi_handler::build_dyn_ul_tti_request(int cell_id, vector<fapi_req_t*>&
 {
     size_t offset    = 0;
     req.num_pdus     = 0;
+#ifdef SCF_FAPI_10_04
+    reset_ul_tti_pdu_counts(req);
+#else
     req.num_ulsch    = 0;
     req.num_ulcch    = 0;
     req.rach_present = 0;
+#endif
     req.ngroup       = 0;
 
     uint32_t handle_id_pusch_uci  = 0;
@@ -1465,7 +1515,11 @@ int scf_fapi_handler::build_dyn_ul_tti_request(int cell_id, vector<fapi_req_t*>&
 
                 offset += pduinfo.pdu_size;
                 req.num_pdus++;
+#ifdef SCF_FAPI_10_04
+                req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUSCH]++;
+#else
                 req.num_ulsch++;
+#endif
 
                 // Log print the TB size and offset
                 NVLOGD_FMT(TAG, "{}: PUSCH handle={} pdu_bitmap={} offset={} rnti={} hpid={}", __FUNCTION__, static_cast<unsigned>(ulsch_pdu.handle), static_cast<unsigned short>(ulsch_pdu.pdu_bitmap), offset, static_cast<unsigned short>(ulsch_pdu.rnti), cell_data[cell_id].harq_process_id);
@@ -1477,7 +1531,14 @@ int scf_fapi_handler::build_dyn_ul_tti_request(int cell_id, vector<fapi_req_t*>&
         }
     }
 
-    NVLOGI_FMT(TAG, "SFN {}.{} BUILD: cell_id={} UL_TTI.req num_pdus={}", static_cast<unsigned>(req.sfn), static_cast<unsigned>(req.slot), cell_id, req.num_pdus);
+    NVLOGI_FMT(TAG, "SFN {}.{} BUILD: cell_id={} UL_TTI.req num_pdus={} (PUSCH={})",
+            static_cast<unsigned>(req.sfn), static_cast<unsigned>(req.slot), cell_id,
+            static_cast<unsigned>(req.num_pdus),
+#ifdef SCF_FAPI_10_04
+            static_cast<unsigned>(req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUSCH]));
+#else
+            static_cast<unsigned>(req.num_ulsch));
+#endif
     return offset;
 }
 
@@ -1485,9 +1546,13 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
 {
     size_t offset    = 0;
     req.num_pdus     = 0;
+#ifdef SCF_FAPI_10_04
+    reset_ul_tti_pdu_counts(req);
+#else
     req.num_ulsch    = 0;
     req.num_ulcch    = 0;
     req.rach_present = 0;
+#endif
     req.ngroup       = 0;
 
     uint32_t handle_id_pusch_uci = 0;
@@ -1503,6 +1568,9 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
         {
             for(auto& prach_pars : tv.prach_tv.data)
             {
+#ifdef SCF_FAPI_10_04
+                req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PRACH]++;
+#endif
                 auto& pduinfo    = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(buffer + offset));
                 pduinfo.pdu_size = sizeof(scf_fapi_generic_pdu_info_t);
                 uint8_t* next    = pduinfo.pdu_config;
@@ -1526,7 +1594,9 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
                 req.num_pdus++;
                 prach_num++;
 
+#ifndef SCF_FAPI_10_04
                 req.rach_present = 1;
+#endif
                 // Save expected preamble id and TA value range for conformance test
                 if((configs->get_conformance_test_params()->conformance_test_enable)&&
                 (global_tick > configs->get_conformance_test_params()->conformance_test_start_time))
@@ -1540,6 +1610,9 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
             int pdu_id = 0;
             for(const pusch_tv_data_t* tv_data : tv.pusch_tv.data)
             {
+#ifdef SCF_FAPI_10_04
+                req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUSCH]++;
+#endif
                 auto& pduinfo    = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(buffer + offset));
                 pduinfo.pdu_size = sizeof(scf_fapi_generic_pdu_info_t);
                 uint8_t* next    = pduinfo.pdu_config;
@@ -1634,7 +1707,7 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
                     scf_fapi_pusch_uci_t* puschUci  = reinterpret_cast<scf_fapi_pusch_uci_t*>(next);
                     puschUci->harq_ack_bit_length   = tv_data->harqAckBitLength;
                     puschUci->csi_part_1_bit_length = tv_data->csiPart1BitLength;
-                    
+
 #ifdef SCF_FAPI_10_04
                     puschUci->flag_csi_part2 = tv_data->flagCsiPart2;
 #else
@@ -1684,7 +1757,7 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
                 pduinfo.pdu_size += sizeof(scf_fapi_pusch_maintenance_t);
                 next += sizeof(scf_fapi_pusch_maintenance_t);
 
-                // PUSCH UCI 
+                // PUSCH UCI
                 if (ulsch_pdu.pdu_bitmap & PUSCH_BITMAP_UCI && !!tv_data->flagCsiPart2 && tv_data->numPart2s > 0) {
                     scf_uci_csip2_info_t* uci_csip2_info  = reinterpret_cast<scf_uci_csip2_info_t*>(next);
                     uci_csip2_info->numPart2s = tv_data->numPart2s;
@@ -1743,7 +1816,9 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
 
                 offset += pduinfo.pdu_size;
                 req.num_pdus++;
+#ifndef SCF_FAPI_10_04
                 req.num_ulsch++;
+#endif
                 pusch_num++;
 
                 // Log print the TB size and offset
@@ -1770,6 +1845,12 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
                 pucch_pdu.bwp.cyclic_prefix = tv_data.CyclicPrefix;
 
                 pucch_pdu.format_type             = tv_data.FormatType;
+#ifdef SCF_FAPI_10_04
+                if(tv_data.FormatType == UL_TTI_PUCCH_FORMAT_0 || tv_data.FormatType == UL_TTI_PUCCH_FORMAT_1)
+                    req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUCCH_F01]++;
+                else
+                    req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_PUCCH_F234]++;
+#endif
                 pucch_pdu.multi_slot_tx_indicator = tv_data.multiSlotTxIndicator;
                 pucch_pdu.pi_2_bpsk               = tv_data.pi2Bpsk;
 
@@ -1809,7 +1890,9 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
 
                 offset += pduinfo.pdu_size;
                 req.num_pdus++;
+#ifndef SCF_FAPI_10_04
                 req.num_ulcch++;
+#endif
                 pucch_num++;
 
 #if 0 // For temporary hard-code test only
@@ -1842,6 +1925,9 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
             }
             for(const srs_tv_data_t& tv_data : tv.srs_tv.data)
             {
+#ifdef SCF_FAPI_10_04
+                req.nPDUsOfEachType[UL_TTI_NPDUS_IDX_SRS]++;
+#endif
                 auto& pduinfo    = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(buffer + offset));
                 pduinfo.pdu_size = sizeof(scf_fapi_generic_pdu_info_t);
                 uint8_t* next    = pduinfo.pdu_config;
@@ -1871,10 +1957,10 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
                         srs_pdu.handle |= (static_cast<uint32_t>(tv_data.srsChestBufferIndex) << 8);
                     }
                 }
-                NVLOGD_FMT(TAG, "cell_id={} SFN={} SLOT={} rnti={} After srsChestBufferIndex={} handle={} srsChestBuffIdx={}", 
-                           cell_id, static_cast<unsigned>(req.sfn), 
-                           static_cast<unsigned>(req.slot), 
-                           static_cast<unsigned int>(tv_data.RNTI), 
+                NVLOGD_FMT(TAG, "cell_id={} SFN={} SLOT={} rnti={} After srsChestBufferIndex={} handle={} srsChestBuffIdx={}",
+                           cell_id, static_cast<unsigned>(req.sfn),
+                           static_cast<unsigned>(req.slot),
+                           static_cast<unsigned int>(tv_data.RNTI),
                            static_cast<unsigned int>(static_cast<uint16_t>((srs_pdu.handle >> 8) & 0xFFFF)),
                            static_cast<unsigned int>(srs_pdu.handle),
                            static_cast<unsigned int>(srsChestBuffIdx));
@@ -1974,8 +2060,9 @@ int scf_fapi_handler::build_ul_tti_request(int cell_id, vector<fapi_req_t*>& fap
         }
     }
 
-    NVLOGI_FMT(TAG, "SFN {}.{} BUILD: cell_id={} UL_TTI.req nPDU: PRACH={} PUSCH={} PUCCH={} SRS={}",
-            static_cast<unsigned>(req.sfn), static_cast<unsigned>(req.slot), cell_id, prach_num, pusch_num, pucch_num, srs_num);
+    NVLOGI_FMT(TAG, "SFN {}.{} BUILD: cell_id={} UL_TTI.req num_pdus={} (PRACH={} PUSCH={} PUCCH={} SRS={})",
+            static_cast<unsigned>(req.sfn), static_cast<unsigned>(req.slot), cell_id,
+            static_cast<unsigned>(req.num_pdus), prach_num, pusch_num, pucch_num, srs_num);
     return offset;
 }
 int insertOrUpdate(std::map<uint16_t, uint16_t>& myMap, int key) {
@@ -2179,7 +2266,7 @@ int scf_fapi_handler::build_ul_dci_request(int cell_id, vector<fapi_req_t*>& fap
     return offset;
 }
 
-int scf_fapi_handler::build_dl_bfw_cvi_request(int cell_id, vector<fapi_req_t*>& fapi_reqs, scf_fapi_dl_bfw_cvi_request_t* req)
+int scf_fapi_handler::build_bfw_cvi_request(int cell_id, vector<fapi_req_t*>& fapi_reqs, scf_fapi_dl_bfw_cvi_request_t* req)
 {
 #if 1
     size_t   offset = 0;
@@ -2350,10 +2437,10 @@ int scf_fapi_handler::send_config_request(int cell_id)
         start_reconfig_timer(cell_id, configs->cell_config_timeout);
     }
 
+    nv::phy_mac_msg_desc msg_desc;
+
     // Determine target_cell_id first for correct DBT and config retrieval
     int target_cell_id = cell_remap_event[cell_id] ? cell_id_map_tmp[cell_id] : cell_id_map[cell_id];
-
-    nv::phy_mac_msg_desc msg_desc;
 
     // Use target_cell_id to get DBT info for the correct cell during reconfiguration
     auto* dbt_enabled = lp->get_dbt_info(target_cell_id);
@@ -2369,6 +2456,26 @@ int scf_fapi_handler::send_config_request(int cell_id)
         NVLOGW_FMT(TAG, "Failed to allocate nvipc buffer for cell {} CONFIG.req", cell_id);
         return -1;
     }
+
+    if (build_config_request(cell_id, msg_desc) < 0)
+    {
+        if (msg_desc.msg_buf != nullptr)
+        {
+            // Note to call tx_release instead of rx_release for locally allocated NVIPC buffer
+            transport().tx_release(msg_desc);
+        }
+        return -1;
+    }
+    // Send the message over the transport
+    transport().tx_send(msg_desc);
+    transport().tx_post();
+    return 0;
+}
+
+int scf_fapi_handler::build_config_request(int cell_id, nv::phy_mac_msg_desc& msg_desc)
+{
+    // Determine target_cell_id first for correct DBT and config retrieval
+    int target_cell_id = cell_remap_event[cell_id] ? cell_id_map_tmp[cell_id] : cell_id_map[cell_id];
 
     auto  fapi = scf_5g_fapi::add_scf_fapi_hdr<scf_fapi_config_request_msg_t>(msg_desc, SCF_FAPI_CONFIG_REQUEST, cell_id, false);
     auto& req  = *reinterpret_cast<scf_fapi_config_request_msg_t*>(fapi);
@@ -2537,7 +2644,7 @@ int scf_fapi_handler::send_config_request(int cell_id)
                     dbt_wt_data++;
                 }
                 dbt_data = reinterpret_cast<uint16_t*>(dbt_wt_data);
-                NVLOGI_FMT(TAG, "DBT beamIdx={} numDigBeams={}, numTXRUs={} DBTSize={}", i+1, numDigBeams, numTXRUs, size);
+                NVLOGD_FMT(TAG, "DBT beamIdx={} numDigBeams={}, numTXRUs={} DBTSize={}", i+1, numDigBeams, numTXRUs, size);
             }
             msg_desc.data_len = size;
             NVLOGI_FMT(TAG, "DBT PDU size={}", msg_desc.data_len);
@@ -2589,7 +2696,7 @@ int scf_fapi_handler::send_config_request(int cell_id)
     if ((csi2MapInfo!= nullptr) && (csi2MapInfo->nCsi2Maps > 0)) {
 
         std::vector<uint8_t> mapData;
-        mapData.reserve(csi2MapInfo->totalSizeInBytes);
+        mapData.resize(csi2MapInfo->totalSizeInBytes);
         auto mapDataBuf = mapData.data();
         uint16_t* buf16 = reinterpret_cast<uint16_t*>(mapDataBuf);
         uint32_t len = 0;
@@ -2614,7 +2721,7 @@ int scf_fapi_handler::send_config_request(int cell_id)
             // NVLOGD_FMT(TAG, "CONFIG_TLV_UCI_CONFIG i = {} len {} map", i, len);
             NVLOGD_FMT(TAG, "CONFIG_TLV_UCI_CONFIG numPart1Params {} mapsize {} first 0x{:04X} last 0x{:04X}", mapParams.numPart1Params, mapParams.map.size(), *buf16, *(buf16 + mapParams.map.size() - 1));
         }
-        
+
         NVLOGD_FMT(TAG, "CONFIG_TLV_UCI_CONFIG len 0x{:02X}", len);
 
         ptr = add_tlv(req, ptr,CONFIG_TLV_UCI_CONFIG, len, mapData.data());
@@ -2629,9 +2736,6 @@ int scf_fapi_handler::send_config_request(int cell_id)
     NVLOGI_FMT(TAG, "MAC_PHY_CELL_CONFIG_REQ: cell_id={} msg_len={} PHY_CELL_ID {} DL_BANDWIDTH {} UL_BANDWIDTH {} NUM_RX_ANT {} NUM_RX_PORT {} NUM_TX_ANT {} NUM_TX_PORT {} SCS_COMMON {} PRACH_SUBC_SPACING {}",
             cell_id, msg_desc.msg_len, cell_configs.phyCellId, cell_configs.dlGridSize, cell_configs.ulGridSize, cell_configs.numRxAnt, cell_configs.numRxPort, cell_configs.numTxAnt, cell_configs.numTxPort, cell_configs.mu, cell_configs.mu);
 
-    // Send the message over the transport
-    transport().tx_send(msg_desc);
-    transport().tx_post();
     return 0;
 }
 
@@ -2675,6 +2779,409 @@ int scf_fapi_handler::send_stop_request(int cell_id)
     transport().tx_send(msg_desc);
     transport().tx_post();
     return 0;
+}
+
+int scf_fapi_handler::build_slot_fapi_request(int cell_id, sfn_slot_t ss, fapi_group_t group_id, nv::phy_mac_msg_desc& msg_desc)
+{
+    sfn_slot_t ss_req = ss;
+#ifdef PREPONE_TX_DATA_REQ
+    if (group_id == TX_DATA_REQ)
+    {
+        ss_req = get_next_sfn_slot(ss);
+    }
+#endif
+
+    vector<fapi_req_t*>& fapi_reqs = get_fapi_req_list(cell_id, ss_req, group_id);
+
+    if (fapi_reqs.size() == 0)
+    {
+        if (group_id != DL_TTI_REQ || !configs->get_dummy_tti_enabled() || get_fapi_req_list(cell_id, ss_req, UL_TTI_REQ).size() > 0)
+        {
+            return 0;
+        }
+    }
+
+    if (msg_desc.msg_buf == nullptr || msg_desc.data_buf == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_TEST_MAC_EVENT, "{}: msg_desc buffers not allocated (cell_id={} group_id={})", __FUNCTION__, cell_id, static_cast<int>(group_id));
+        return -1;
+    }
+
+    int ret_code = -1;
+
+    switch (group_id)
+    {
+    case DL_TTI_REQ: {
+        auto  fapi = scf_5g_fapi::add_scf_fapi_hdr<scf_fapi_dl_tti_req_t>(msg_desc, SCF_FAPI_DL_TTI_REQUEST, cell_id, false);
+        auto& req  = *reinterpret_cast<scf_fapi_dl_tti_req_t*>(fapi);
+        req.sfn    = ss_req.u16.sfn;
+        req.slot   = ss_req.u16.slot;
+#ifdef ENABLE_CONFORMANCE_TM_PDSCH_PDCCH
+        req.testMode = 0;
+#endif
+        if (configs->app_mode == 0)
+        {
+            fapi->length += build_dl_tti_request(cell_id, fapi_reqs, req);
+        }
+        else
+        {
+            fapi->length += build_dyn_dl_tti_request(cell_id, fapi_reqs, req, lp->get_dyn_slot_param(cell_id, ss_req));
+        }
+        msg_desc.msg_len = fapi->length + sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
+        msg_desc.msg_id = SCF_FAPI_DL_TTI_REQUEST;
+        ret_code = 0;
+        break;
+    }
+    case TX_DATA_REQ: {
+        // fapi_tb_loc: 1=CPU_DATA, 2=CPU_LARGE, 3=GPU_DATA.
+        // This path always assembles via CPU memcpy in build_tx_data_request(); for
+        // option 3 we build with CPU_DATA and stamp GPU_DATA into data_pool after
+        // the build (downstream consumers/transport own the GPU staging).
+        switch (data_buf_opt)
+        {
+        case 1: case 3: msg_desc.data_pool = NV_IPC_MEMPOOL_CPU_DATA;  break;
+        case 2:         msg_desc.data_pool = NV_IPC_MEMPOOL_CPU_LARGE; break;
+        default:
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "{}: unsupported data_buf_opt={} for TX_DATA.req cell_id={}", __FUNCTION__, data_buf_opt, cell_id);
+            return -1;
+        }
+
+        scf_fapi_header_t* hdr = reinterpret_cast<scf_fapi_header_t*>(msg_desc.msg_buf);
+        hdr->message_count     = 1;
+        hdr->handle_id         = cell_id;
+        auto body_hdr          = reinterpret_cast<scf_fapi_tx_data_req_t*>(&hdr->payload);
+
+        body_hdr->msg_hdr.type_id = SCF_FAPI_TX_DATA_REQUEST;
+        msg_desc.msg_id            = SCF_FAPI_TX_DATA_REQUEST;
+        body_hdr->sfn             = ss_req.u16.sfn;
+        body_hdr->slot            = ss_req.u16.slot;
+        int tx_rc                 = 0;
+        if (configs->app_mode == 0)
+        {
+            tx_rc = build_tx_data_request(cell_id, fapi_reqs, *body_hdr, msg_desc);
+        }
+        else
+        {
+            tx_rc = build_dyn_tx_data_request(cell_id, fapi_reqs, *body_hdr, msg_desc, lp->get_dyn_slot_param(cell_id, ss_req));
+        }
+        if (tx_rc < 0)
+        {
+            msg_desc.msg_len  = 0;
+            msg_desc.data_len = 0;
+            return -1;
+        }
+        msg_desc.cell_id = cell_id;
+        if (data_buf_opt == 3)
+        {
+            msg_desc.data_pool = NV_IPC_MEMPOOL_GPU_DATA;
+        }
+        msg_desc.msg_id = SCF_FAPI_TX_DATA_REQUEST;
+        ret_code = 0;
+        break;
+    }
+    case UL_TTI_REQ: {
+        auto  fapi = scf_5g_fapi::add_scf_fapi_hdr<scf_fapi_ul_tti_req_t>(msg_desc, SCF_FAPI_UL_TTI_REQUEST, cell_id, false);
+        auto& req  = *reinterpret_cast<scf_fapi_ul_tti_req_t*>(fapi);
+        req.sfn    = ss_req.u16.sfn;
+        req.slot   = ss_req.u16.slot;
+        if (configs->app_mode == 0)
+        {
+            fapi->length += build_ul_tti_request(cell_id, fapi_reqs, req);
+        }
+        else
+        {
+            fapi->length += build_dyn_ul_tti_request(cell_id, fapi_reqs, req, lp->get_dyn_slot_param(cell_id, ss_req));
+        }
+        msg_desc.msg_len = fapi->length + sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
+        msg_desc.msg_id = SCF_FAPI_UL_TTI_REQUEST;
+        ret_code = 0;
+        break;
+    }
+    case UL_DCI_REQ: {
+        auto  fapi = scf_5g_fapi::add_scf_fapi_hdr<scf_fapi_ul_dci_t>(msg_desc, SCF_FAPI_UL_DCI_REQUEST, cell_id, false);
+        auto& req  = *reinterpret_cast<scf_fapi_ul_dci_t*>(fapi);
+        req.sfn    = ss_req.u16.sfn;
+        req.slot   = ss_req.u16.slot;
+        fapi->length += build_ul_dci_request(cell_id, fapi_reqs, req);
+        msg_desc.msg_len = fapi->length + sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
+        msg_desc.msg_id = SCF_FAPI_UL_DCI_REQUEST;
+        ret_code = 0;
+        break;
+    }
+    case DL_BFW_CVI_REQ: {
+        auto fapi = scf_5g_fapi::add_scf_fapi_hdr<scf_fapi_dl_bfw_cvi_request_t>(msg_desc, SCF_FAPI_DL_BFW_CVI_REQUEST, cell_id, false);
+        auto req  = reinterpret_cast<scf_fapi_dl_bfw_cvi_request_t*>(fapi);
+        req->sfn  = ss_req.u16.sfn;
+        req->slot = ss_req.u16.slot;
+        fapi->length += build_bfw_cvi_request(cell_id, fapi_reqs, req) + 5;
+        msg_desc.msg_len = fapi->length + sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
+        msg_desc.msg_id = SCF_FAPI_DL_BFW_CVI_REQUEST;
+        ret_code = 0;
+        break;
+    }
+    case UL_BFW_CVI_REQ: {
+        auto fapi = scf_5g_fapi::add_scf_fapi_hdr<scf_fapi_ul_bfw_cvi_request_t>(msg_desc, SCF_FAPI_UL_BFW_CVI_REQUEST, cell_id, false);
+        auto req  = reinterpret_cast<scf_fapi_ul_bfw_cvi_request_t*>(fapi);
+        req->sfn  = ss_req.u16.sfn;
+        req->slot = ss_req.u16.slot;
+        fapi->length += build_bfw_cvi_request(cell_id, fapi_reqs, req) + 5;
+        msg_desc.msg_len = fapi->length + sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
+        msg_desc.msg_id = SCF_FAPI_UL_BFW_CVI_REQUEST;
+        ret_code = 0;
+        break;
+    }
+    default:
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "{}: unknown group_id={}", __FUNCTION__, static_cast<unsigned>(group_id));
+        break;
+    }
+
+    return ret_code;
+}
+
+int alloc_and_copy_msg(nv::phy_mac_msg_desc& dst_desc, const nv::phy_mac_msg_desc& src_desc)
+{
+    if (src_desc.msg_buf == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_TEST_MAC_EVENT, "alloc_and_copy_msg_desc: src_msg_desc.msg_buf is nullptr");
+        return -1;
+    }
+
+    dst_desc.msg_buf = malloc(src_desc.msg_len);
+    if (dst_desc.msg_buf == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_TEST_MAC_EVENT, "alloc_and_copy_msg: malloc failed for msg_buf, size={}", src_desc.msg_len);
+        return -1;
+    }
+    memcpy(dst_desc.msg_buf, src_desc.msg_buf, src_desc.msg_len);
+
+    if (src_desc.data_len > 0)
+    {
+        CUresult cu_err = cuMemAllocHost(&dst_desc.data_buf, src_desc.data_len);
+        if (cu_err != CUDA_SUCCESS)
+        {
+            const char* err_str = nullptr;
+            cuGetErrorString(cu_err, &err_str);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "alloc_and_copy_msg: cuMemAllocHost failed: {}",
+                err_str ? err_str : "unknown");
+            free(dst_desc.msg_buf);
+            dst_desc.msg_buf = nullptr;
+            return -1;
+        }
+        memcpy(dst_desc.data_buf, src_desc.data_buf, src_desc.data_len);
+    }
+    else
+    {
+        dst_desc.data_buf = nullptr;
+    }
+    dst_desc.msg_id = src_desc.msg_id;
+    dst_desc.cell_id = src_desc.cell_id;
+    dst_desc.msg_len = src_desc.msg_len;
+    dst_desc.data_len = src_desc.data_len;
+    dst_desc.data_pool = src_desc.data_pool;
+
+    NVLOGI_FMT(TAG, "PREBUILD: cell_id={} msg_id=0x{:02X} - {} msg_len={} data_len={}",
+        dst_desc.cell_id, dst_desc.msg_id, get_scf_fapi_msg_name(dst_desc.msg_id), dst_desc.msg_len, dst_desc.data_len);
+    return 0;
+}
+
+int scf_fapi_handler::prebuild_downlink_messages()
+{
+    if (prebuild_downlink_done)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "prebuild_downlink_messages: already completed; call at most once per handler instance");
+        return -1;
+    }
+
+    const auto prebuild_t0 = std::chrono::steady_clock::now();
+
+    uint32_t total_msg_buf_count = 0;
+    uint32_t total_data_buf_count = 0;
+    size_t total_msg_buf_size = 0;
+    size_t total_data_buf_size = 0;
+
+    NVLOGC_FMT(TAG, "PREBUILD start: allocate temporary buffer for prebuild: msg_buf_size={}B={:.2f}KB data_buf_size={}B={:.2f}KB",
+        configs->get_max_msg_size(), static_cast<double>(configs->get_max_msg_size()) / 1024,
+        configs->get_max_data_size(), static_cast<double>(configs->get_max_data_size()) / 1024);
+
+    // Temporary NVIPC buffer for message building
+    nv::phy_mac_msg_desc msg_desc;
+    msg_desc.msg_buf = malloc(configs->get_max_msg_size());
+    if (msg_desc.msg_buf == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_TEST_MAC_EVENT, "prebuild_downlink_messages: malloc failed for temporary msg_buf, size={}", configs->get_max_msg_size());
+        return -1;
+    }
+    CUresult cu_err = cuMemAllocHost(&msg_desc.data_buf, configs->get_max_data_size());
+    if (cu_err != CUDA_SUCCESS)
+    {
+        const char* err_str = nullptr;
+        cuGetErrorString(cu_err, &err_str);
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "prebuild_downlink_messages: cuMemAllocHost failed for temporary data_buf: {}",
+            err_str ? err_str : "unknown");
+        free(msg_desc.msg_buf);
+        msg_desc.msg_buf = nullptr;
+        return -1;
+    }
+
+    int ret_code = 0;
+
+    // Build CONFIG.req for all cells
+    config_reqs.resize(cell_num);
+    for (int cell_id = 0; cell_id < cell_num; cell_id++)
+    {
+        msg_desc.msg_id = SCF_FAPI_CONFIG_REQUEST;
+        msg_desc.cell_id = cell_id;
+        msg_desc.msg_len = 0;
+        msg_desc.data_len = 0;
+        msg_desc.data_pool = 0;
+
+        // Use target_cell_id to get DBT info for the correct cell during reconfiguration
+        int target_cell_id = cell_remap_event[cell_id] ? cell_id_map_tmp[cell_id] : cell_id_map[cell_id];
+        auto* dbt_enabled = lp->get_dbt_info(target_cell_id);
+        if(dbt_enabled != nullptr && dbt_enabled->bf_stat_dyn_enabled)
+        {
+            // Using NVIPC Large Buffer
+            msg_desc.data_pool = NV_IPC_MEMPOOL_CPU_LARGE;
+        }
+
+        if (build_config_request(cell_id, msg_desc) < 0)
+        {
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "Failed to build CONFIG.req for cell_id: {}", cell_id);
+            config_reqs[cell_id].reset();
+            ret_code = -1;
+            break;
+        }
+
+        if (alloc_and_copy_msg(config_reqs[cell_id], msg_desc) < 0)
+        {
+            NVLOGE_FMT(TAG, AERIAL_TEST_MAC_EVENT, "Failed to alloc and copy CONFIG.req for cell_id: {}", cell_id);
+            config_reqs[cell_id].reset();
+            ret_code = -1;
+            break;
+        }
+
+        // Update the total statistics
+        total_msg_buf_size += msg_desc.msg_len;
+        total_msg_buf_count++;
+        if (msg_desc.data_len > 0)
+        {
+            total_data_buf_size += msg_desc.data_len;
+            total_data_buf_count++;
+        }
+    }
+
+    // Temporary memory for the slot messages
+    std::vector<nv::phy_mac_msg_desc> tmp_cell_msgs;
+    tmp_cell_msgs.resize(FAPI_REQ_SIZE);
+
+    // Build slot messages for all cells
+    int sched_slot_num = lp->get_sched_slot_num();
+    slot_msgs.resize(sched_slot_num);
+    sfn_slot_t ss = {.u16 = {0, 0}};
+    for (int slot_idx = 0; slot_idx < sched_slot_num; slot_idx++)
+    {
+        std::vector<std::vector<nv::phy_mac_msg_desc>>& cells = slot_msgs[slot_idx];
+        cells.resize(cell_num);
+        for (int cell_id = 0; cell_id < cell_num; cell_id++)
+        {
+            int cell_msg_count = 0;
+            for (int group_id = 0; group_id < FAPI_REQ_SIZE; group_id++)
+            {
+                msg_desc.msg_id = 0;
+                msg_desc.cell_id = cell_id;
+                msg_desc.msg_len = 0;
+                msg_desc.data_len = 0;
+                msg_desc.data_pool = 0;
+                if (build_slot_fapi_request(cell_id, ss, static_cast<fapi_group_t>(group_id), msg_desc) < 0)
+                {
+                    // Failed to build slot FAPI requests
+                    ret_code = -1;
+                    break;
+                }
+                else if (msg_desc.msg_len == 0)
+                {
+                    // Skip empty slot FAPI and continue
+                    continue;
+                }
+
+                if (alloc_and_copy_msg(tmp_cell_msgs[cell_msg_count], msg_desc) < 0)
+                {
+                    NVLOGE_FMT(TAG, AERIAL_TEST_MAC_EVENT, "Failed to alloc and copy slot FAPI request for cell {} slot {} group {}", cell_id, slot_idx, group_id);
+                    ret_code = -1;
+                    break;
+                }
+                cell_msg_count++;
+
+                // Update the total statistics
+                total_msg_buf_size += msg_desc.msg_len;
+                total_msg_buf_count++;
+                if (msg_desc.data_len > 0)
+                {
+                    total_data_buf_size += msg_desc.data_len;
+                    total_data_buf_count++;
+                }
+            }
+            cells[cell_id].resize(cell_msg_count);
+            for (int desc_index = 0; desc_index < cell_msg_count; desc_index++)
+            {
+                cells[cell_id][desc_index] = tmp_cell_msgs[desc_index];
+            }
+        }
+        ss = get_next_sfn_slot(ss); // Get the next slot
+    }
+
+    if (msg_desc.msg_buf != nullptr)
+    {
+        free(msg_desc.msg_buf);
+    }
+    if (msg_desc.data_buf != nullptr)
+    {
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(msg_desc.data_buf));
+    }
+
+    const int64_t time_cost_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - prebuild_t0)
+                                     .count();
+    NVLOGC_FMT(TAG, "PREBUILD finished: time_cost={}ms total: msg_buf_count={} data_buf_count={} msg_buf_size={}B={:.2f}MB data_buf_size={}B={:.2f}MB",
+        time_cost_ms, total_msg_buf_count, total_data_buf_count, total_msg_buf_size, static_cast<double>(total_msg_buf_size) / 1024 / 1024, total_data_buf_size, static_cast<double>(total_data_buf_size) / 1024 / 1024);
+    prebuild_downlink_done = ret_code == 0;
+    return ret_code;
+}
+
+void scf_fapi_handler::release_prebuilt_message_storage()
+{
+    for (auto& desc : config_reqs) {
+        if (desc.msg_buf != nullptr) {
+            std::free(desc.msg_buf);
+            desc.msg_buf = nullptr;
+        }
+        if (desc.data_buf != nullptr) {
+            CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(desc.data_buf));
+            desc.data_buf = nullptr;
+        }
+        desc.reset();
+    }
+    config_reqs.clear();
+
+    for (auto& by_slot : slot_msgs) {
+        for (auto& by_cell : by_slot) {
+            for (auto& desc : by_cell) {
+                if (desc.msg_buf != nullptr) {
+                    std::free(desc.msg_buf);
+                    desc.msg_buf = nullptr;
+                }
+                if (desc.data_buf != nullptr) {
+                    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(desc.data_buf));
+                    desc.data_buf = nullptr;
+                }
+                desc.reset();
+            }
+            by_cell.clear();
+        }
+        by_slot.clear();
+    }
+    slot_msgs.clear();
+    NVLOGC_FMT(TAG, "PREBUILD message storage released");
 }
 
 // Return successfully sent FAPI message count
@@ -2742,19 +3249,13 @@ int scf_fapi_handler::schedule_fapi_request(int cell_id, sfn_slot_t ss, fapi_gro
             case TX_DATA_REQ: {
                 if(data_buf_opt == 1)
                 {
-#ifdef ENABLE_32DL
-                    NVLOGI_FMT(TAG, "Using large CPU pools for TX DATA for 32 layer DL");
-                    msg_desc.data_pool = NV_IPC_MEMPOOL_CPU_LARGE;
-#else
-                    NVLOGI_FMT(TAG, "Using small CPU pools for TX DATA for 16 layer DL");
+                    NVLOGI_FMT(TAG, "Using CPU_DATA pool for TX DATA (fapi_tb_loc=1)");
                     msg_desc.data_pool = NV_IPC_MEMPOOL_CPU_DATA;
-#endif
                 }
                 else if(data_buf_opt == 2)
                 {
-                    NVLOGI_FMT(TAG, "Cannot use GPU pools for TX DATA yet");
-                    msg_desc.data_pool = NV_IPC_MEMPOOL_CUDA_DATA;
-                    return -1;
+                    NVLOGI_FMT(TAG, "Using CPU_LARGE pool for TX DATA (fapi_tb_loc=2)");
+                    msg_desc.data_pool = NV_IPC_MEMPOOL_CPU_LARGE;
                 }
                 else if(data_buf_opt == 3)
                 {
@@ -2840,7 +3341,7 @@ int scf_fapi_handler::schedule_fapi_request(int cell_id, sfn_slot_t ss, fapi_gro
                 scf_fapi_dl_bfw_cvi_request_t* req  = reinterpret_cast<scf_fapi_dl_bfw_cvi_request_t*>(fapi);
                 req->sfn = ss.u16.sfn;
                 req->slot = ss.u16.slot;
-                fapi->length += build_dl_bfw_cvi_request(cell_id, fapi_reqs, req) + 5;
+                fapi->length += build_bfw_cvi_request(cell_id, fapi_reqs, req) + 5;
                 msg_desc.msg_len = fapi->length + sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
             }
             break;
@@ -2855,7 +3356,7 @@ int scf_fapi_handler::schedule_fapi_request(int cell_id, sfn_slot_t ss, fapi_gro
                 scf_fapi_ul_bfw_cvi_request_t* req  = reinterpret_cast<scf_fapi_ul_bfw_cvi_request_t*>(fapi);
                 req->sfn = ss.u16.sfn;
                 req->slot = ss.u16.slot;
-                fapi->length += build_dl_bfw_cvi_request(cell_id, fapi_reqs, req) + 5;
+                fapi->length += build_bfw_cvi_request(cell_id, fapi_reqs, req) + 5;
                 msg_desc.msg_len = fapi->length + sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
             }
             break;
@@ -2955,6 +3456,23 @@ int scf_fapi_handler::schedule_fapi_request(int cell_id, sfn_slot_t ss, fapi_gro
  */
 int scf_fapi_handler::schedule_fapi_reqs(sfn_slot_t ss, int ts_offset)
 {
+    // When using deadline-based scheduling, clear slot_resp_sent at start of deadline pass so the
+    // safeguard can send SLOT.resp if the in-loop send was missed (e.g. stale state from slot index reuse).
+    if (ts_offset > 0 && configs->get_fapi_tx_deadline_enable())
+    {
+        dl_tti_start_ns_ = -1;
+        dl_tti_stop_ns_ = -1;
+        tx_data_start_ns_ = -1;
+        tx_data_stop_ns_ = -1;
+        ul_tti_start_ns_ = -1;
+        ul_tti_stop_ns_ = -1;
+        for (int cell_id = 0; cell_id < cell_num; cell_id++)
+        {
+            fapi_sched_t& fapi_sched = cell_data[cell_id].fapi_scheds[ss.u16.slot & 0x3];
+            fapi_sched.slot_resp_sent = false;
+        }
+    }
+
     for(int cell_id = 0; cell_id < cell_num; cell_id++)
     {
         fapi_sched_t& fapi_sched = cell_data[cell_id].fapi_scheds[ss.u16.slot & 0x3];
@@ -2999,14 +3517,10 @@ int scf_fapi_handler::schedule_fapi_reqs(sfn_slot_t ss, int ts_offset)
             continue;
         }
 
-        if(item.exist == 0 && ts_offset > 0 && configs->get_fapi_tx_deadline_enable())
-        {
-            // Skip non-existent items sending
-            continue;
-        }
+        bool tx_within_deadline = item.exist != 0 && ts_offset > 0 && configs->get_fapi_tx_deadline_enable();
 
         // Sleep to a proper time to send the FAPI message before deadline (ts_offset > 0 means time-controlled sending or STT sending)
-        if (ts_offset > 0 && configs->get_fapi_tx_deadline_enable())
+        if (tx_within_deadline)
         {
             int64_t now_ns = static_cast<int64_t>(std::chrono::system_clock::now().time_since_epoch().count());
             if (before_contiguous_send == 0)
@@ -3045,17 +3559,68 @@ int scf_fapi_handler::schedule_fapi_reqs(sfn_slot_t ss, int ts_offset)
             contiguous_send_num ++;
         }
 
+        // Per-message timing: bracket first send per type in this slot (same clock as fapi2_start/fapi2_stop).
+        bool track_timing = tx_within_deadline;
+        int64_t now_before = track_timing ? static_cast<int64_t>(std::chrono::system_clock::now().time_since_epoch().count()) : 0;
         int fapi_sent = schedule_fapi_request(cell_id, ss, group_id, ts_offset);
+        int64_t now_after = track_timing ? static_cast<int64_t>(std::chrono::system_clock::now().time_since_epoch().count()) : 0;
+        if (track_timing) {
+            if (group_id == DL_TTI_REQ && dl_tti_start_ns_ < 0)  { dl_tti_start_ns_ = now_before; dl_tti_stop_ns_ = now_after; }
+            if (group_id == TX_DATA_REQ && tx_data_start_ns_ < 0) { tx_data_start_ns_ = now_before; tx_data_stop_ns_ = now_after; }
+            if (group_id == UL_TTI_REQ && ul_tti_start_ns_ < 0)  { ul_tti_start_ns_ = now_before; ul_tti_stop_ns_ = now_after; }
+        }
 
         // NVLOGV_FMT(TAG, "SFN {}.{} SCHED: cell_id={} group_id={} fapi_build_num={} fapi_sent_num={}", ss.u16.sfn, ss.u16.slot, cell_id, group_id, fapi_sched.fapi_build_num, fapi_sched.fapi_sent_num);
 
-        // When sent the last FAPI message of a cell, append a SLOT.resp or notify transport if configured
-        if ((configs->builder_thread_enable != 0 && fapi_sent > 0 && fapi_sched.fapi_sent_num == fapi_sched.fapi_build_num) // When builder thread is enabled, check if send number equals to build number
-            || (configs->builder_thread_enable == 0 && group_id == FAPI_REQ_SIZE - 1)) // When builder thread is disabled, check if this is the last fapi group of a cell
+        bool to_send_slot_resp = false;
+        int32_t schedule_total_time = configs->schedule_total_time[ss.u16.slot % configs->schedule_total_time.size()];
+        if(ts_offset == 0 && configs->get_fapi_tx_deadline_enable() == 0 && schedule_total_time == 0)
+        {
+            // FAPI sending in the first call of schedule_fapi_reqs() in schedule_slot(), send SLOT.resp at the last group of a cell
+            if (group_id == FAPI_REQ_SIZE - 1) // The last FAPI group of a cell
+            {
+                if (fapi_sched.fapi_sent_num > 0)
+                {
+                    to_send_slot_resp = true;
+                }
+                else if (configs->enable_empty_slot_resp != 0)
+                {
+                    // Empty slot: send SLOT.resp at the last group
+                    to_send_slot_resp = true;
+                }
+            }
+        }
+        else if (ts_offset > 0)
+        {
+            // FAPI build are done in previous call of schedule_fapi_reqs(), now check fapi_build_num and fapi_sent_num
+            if (fapi_sched.fapi_build_num > 0)
+            {
+                if (fapi_sent > 0 && fapi_sched.fapi_sent_num == fapi_sched.fapi_build_num)
+                {
+                    to_send_slot_resp = true;
+                }
+            }
+            else
+            {
+                // Empty slot: send SLOT.resp at the first group if enable_empty_slot_resp is set
+                if (configs->enable_empty_slot_resp != 0 && group_id == 0)
+                {
+                    to_send_slot_resp = true;
+                }
+            }
+        }
+        else
+        {
+            // This is FAPI build only, no need to send SLOT.resp
+        }
+
+        // Append a SLOT.resp for each cell when need
+        if (to_send_slot_resp)
         {
             // A cell has sent all FAPI messages
 #ifdef ENABLE_L2_SLT_RSP
             send_slot_response(cell_id, ss);
+            fapi_sched.slot_resp_sent = true;
             contiguous_send_num ++;
             total_count ++;
 #else
@@ -3070,7 +3635,7 @@ int scf_fapi_handler::schedule_fapi_reqs(sfn_slot_t ss, int ts_offset)
             total_count += fapi_sched.fapi_sent_num;
         }
 
-        if (ts_offset > 0 && configs->get_fapi_tx_deadline_enable() && (item.remain_num == 1 || contiguous_remain_num == contiguous_send_num))
+        if (tx_within_deadline && (item.remain_num == 1 || contiguous_remain_num == contiguous_send_num))
         {
             int64_t now_ns = static_cast<int64_t>(std::chrono::system_clock::now().time_since_epoch().count());
             int64_t finish_time_ns = now_ns - ts_tick_tai;
@@ -3166,8 +3731,30 @@ int scf_fapi_handler::schedule_slot(sfn_slot_t ss)
 
     if (configs->get_fapi_tx_deadline_enable())
     {
+        // When deadline is enabled schedule_total_time is not used; log FAPI send window for postproc (MAC.PROCESSING_TIMES / compare_logs).
+        fapi2_start = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
         // Schedule slot with ts_offset > 0 (Here only need ts_offset> 0 to represent time-controlled sending)
         total_sent += schedule_fapi_reqs(ss, 1);
+
+#ifdef ENABLE_L2_SLT_RSP
+        // Safeguard: send SLOT.resp for any cell that completed but did not get it in the loop (e.g. last group skipped or sent in wrong order)
+        for (int cell_id = 0; cell_id < cell_num; cell_id++)
+        {
+            if (cell_data[cell_id].schedule_enable == false)
+                continue;
+            fapi_sched_t& fapi_sched = cell_data[cell_id].fapi_scheds[ss.u16.slot & 0x3];
+            if (fapi_sched.fapi_build_num > 0 && fapi_sched.fapi_sent_num == fapi_sched.fapi_build_num && !fapi_sched.slot_resp_sent)
+            {
+                // Should not happen, debug if observed this log
+                NVLOGW_FMT(TAG, "SFN {}.{} cell_id={} SLOT.resp missed", ss.u16.sfn, ss.u16.slot, cell_id);
+                send_slot_response(cell_id, ss);
+                fapi_sched.slot_resp_sent = true;
+                total_sent ++;
+            }
+        }
+#endif
+        fapi2_stop = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
+        fapi2_count = total_sent - fapi1_count;
     } else if (schedule_total_time > 0) {
         // Force L2 scheduler to take the actual L2 scheduling time plus whatever t_sleep adds up to the desired total time.
         // Also include the offset due to SLOT.indication reception latency, assuming taking credit for any time after
@@ -3244,14 +3831,35 @@ int scf_fapi_handler::schedule_slot(sfn_slot_t ss)
             ss.u16.sfn, ss.u16.slot, ts_tick, t_last.count(), t_last.count() + t_sleep_ns, t_end.count(), t_sleep_ns);
 
     //MAC.PROCESSING_TIMES message containing full timeline of testmac message sending - used to debug L2 (testmac) vs L2A message processing latency
-    NVLOGI_FMT(TAG_PROCESSING_TIMES, "SFN {}.{} {} tick={} slot_indication={} fapi1_start={} fapi1_stop={} fapi1_count={} sleep_time={} fapi2_start={} fapi2_stop={} fapi2_count={} notify_start={} notify_stop={}",
+    int64_t dl_tti_start_log = (dl_tti_start_ns_ >= 0) ? dl_tti_start_ns_ : 0;
+    int64_t dl_tti_stop_log = (dl_tti_stop_ns_ >= 0) ? dl_tti_stop_ns_ : 0;
+    int64_t tx_data_start_log = (tx_data_start_ns_ >= 0) ? tx_data_start_ns_ : 0;
+    int64_t tx_data_stop_log = (tx_data_stop_ns_ >= 0) ? tx_data_stop_ns_ : 0;
+    int64_t ul_tti_start_log = (ul_tti_start_ns_ >= 0) ? ul_tti_start_ns_ : 0;
+    int64_t ul_tti_stop_log = (ul_tti_stop_ns_ >= 0) ? ul_tti_stop_ns_ : 0;
+    NVLOGI_FMT(TAG_PROCESSING_TIMES, "SFN {}.{} {} tick={} slot_indication={} fapi1_start={} fapi1_stop={} fapi1_count={} sleep_time={} fapi2_start={} fapi2_stop={} fapi2_count={} notify_start={} notify_stop={} dl_tti_start={} dl_tti_stop={} tx_data_start={} tx_data_stop={} ul_tti_start={} ul_tti_stop={}",
                ss.u16.sfn, ss.u16.slot, __func__,
                t_slot,
                ts_tick,
                fapi1_start.count(),fapi1_stop.count(),fapi1_count,
                t_sleep_ns,
                fapi2_start.count(),fapi2_stop.count(),fapi2_count,
-               notify_start.count(),notify_stop.count());
+               notify_start.count(),notify_stop.count(),
+               dl_tti_start_log, dl_tti_stop_log,
+               tx_data_start_log, tx_data_stop_log,
+               ul_tti_start_log, ul_tti_stop_log);
+
+    // Add error check: after FAPI sending is done, fapi_sent_num should be equal to fapi_build_num for all cells
+    for (int cell_id = 0; cell_id < cell_num; cell_id++)
+    {
+        fapi_sched_t& fapi_sched = cell_data[cell_id].fapi_scheds[ss.u16.slot & 0x3];
+        if (cell_data[cell_id].schedule_enable == true && fapi_sched.fapi_sent_num != fapi_sched.fapi_build_num)
+        {
+            // Normally should not run to here, debug if observed this log
+            NVLOGE_FMT(TAG, AERIAL_TEST_MAC_EVENT, "SFN {}.{} cell_id={} missed FAPI message sending: fapi_build_num={} fapi_sent_num={}",
+                ss.u16.sfn, ss.u16.slot, cell_id, fapi_sched.fapi_build_num, fapi_sched.fapi_sent_num);
+        }
+    }
 
     return total_sent;
 }
@@ -3311,7 +3919,7 @@ int scf_fapi_handler::send_mem_bank_cv_config_req(int cell_id) {
 
     if(configs->num_mem_bank_cv_config_req_sent[cell_id] > MAX_NVIPC_FOR_MEM_BANK_CV_CONFIG_REQ)
     {
-        NVLOGE_FMT(TAG, AERIAL_NVIPC_API_EVENT, "send_mem_bank_cv_config_req: cell_id={}, numUes={}, numUesSrsSamples={}, configs->num_mem_bank_cv_config_req_sent={} is more than MAX_NVIPC_FOR_MEM_BANK_CV_CONFIG_REQ {}", 
+        NVLOGE_FMT(TAG, AERIAL_NVIPC_API_EVENT, "send_mem_bank_cv_config_req: cell_id={}, numUes={}, numUesSrsSamples={}, configs->num_mem_bank_cv_config_req_sent={} is more than MAX_NVIPC_FOR_MEM_BANK_CV_CONFIG_REQ {}",
             cell_id, numUes, numUesSrsSamples, configs->num_mem_bank_cv_config_req_sent[cell_id], MAX_NVIPC_FOR_MEM_BANK_CV_CONFIG_REQ);
         return -1;
     }
@@ -3324,9 +3932,7 @@ int scf_fapi_handler::send_mem_bank_cv_config_req(int cell_id) {
         }
         else if(data_buf_opt == 2)
         {
-            NVLOGI_FMT(TAG, "Cannot use GPU pools for TX DATA yet");
-            msg_desc[idx].data_pool = NV_IPC_MEMPOOL_CUDA_DATA;
-            return -1;
+            msg_desc[idx].data_pool = NV_IPC_MEMPOOL_CPU_LARGE;
         }
         else if(data_buf_opt == 3)
         {
@@ -3405,7 +4011,27 @@ int scf_fapi_handler::compare_ul_measurement(fapi_validate* vald, ul_measurement
     int err = 0;
     ul_measurement_t& tolerance = lp->get_cell_configs(vald->cell_id).tolerance.ul_meas[pdu_type];
 
+    // Timing advance is derived from a phase estimate (atan2) whose unambiguous
+    // range wraps at +/-1e6/(2*scs). Near that boundary (e.g. low-SNR / heavily
+    // multiplexed PUCCH F1), fp precision differences between L1 and the reference TV
+    // can flip the phase across the +/-pi branch cut, so +max and -max represent
+    // the same physical delay. Use circular distance only for valid non-PRACH TA
+    // units in [0, 63]; keep linear compare for INVALID_TA (0xFFFF / ns -1) and
+    // out-of-range values so sentinels are not treated as near 0 via wrap.
+    constexpr uint16_t kInvalidTa     = 0xFFFF;
+    constexpr uint16_t kTaMaxNonPrach = 63;
+    const int64_t      ta_unit_modulus = 64; // 6-bit TA command wraps at 64
+
 #ifdef SCF_FAPI_10_04
+    constexpr int16_t  kInvalidTaNs = -1; // INVALID_TA (0xFFFF) assigned to int16_t
+    constexpr uint32_t kMaxMu       = 4; // NR numerologies 0..4
+    const uint32_t     mu           = lp->get_cell_configs(vald->cell_id).mu;
+    // mu is config-supplied: an out-of-range value would make 15000LL << mu undefined,
+    // so reject it before the shift and fall back to the linear ns compare below.
+    const bool         mu_valid      = (mu <= kMaxMu);
+    const int64_t      ta_ns_modulus = mu_valid ? (1000000000LL / (15000LL << mu)) : 0; // full unambiguous span in ns
+    const int64_t      ta_ns_half_span = ta_ns_modulus / 2;
+
     scf_fapi_ul_meas_common_t* meas = reinterpret_cast<scf_fapi_ul_meas_common_t*>(payload);
     NVLOGD_FMT(TAG, "{} UL measurement: ul-sinr={} ta={} ta-ns={} rssi={} rsrp={}", vald->get_msg_name(),
             static_cast<int>(meas->ul_sinr_metric),
@@ -3413,8 +4039,35 @@ int scf_fapi_handler::compare_ul_measurement(fapi_validate* vald, ul_measurement
             static_cast<int>(meas->timing_advance_ns),
             static_cast<unsigned>(meas->rssi),
             static_cast<unsigned>(meas->rsrp));
-    err += FAPI_VALIDATE_U16_WARN(vald, meas->timing_advance, tv.TimingAdvance, tolerance.TimingAdvance);
-    err += FAPI_VALIDATE_I16_WARN(vald, meas->timing_advance_ns, tv.TimingAdvanceNs, tolerance.TimingAdvanceNs);
+
+    const bool ta_unit_invalid  = (meas->timing_advance == kInvalidTa) || (tv.TimingAdvance == kInvalidTa);
+    const bool ta_unit_in_range = (meas->timing_advance <= kTaMaxNonPrach) && (tv.TimingAdvance <= kTaMaxNonPrach);
+    const bool ta_ns_invalid    = (meas->timing_advance_ns == kInvalidTaNs) || (tv.TimingAdvanceNs == kInvalidTaNs);
+    const bool ta_ns_in_range =
+             (static_cast<int64_t>(meas->timing_advance_ns) >= -ta_ns_half_span) &&
+             (static_cast<int64_t>(meas->timing_advance_ns) <= ta_ns_half_span) &&
+             (static_cast<int64_t>(tv.TimingAdvanceNs) >= -ta_ns_half_span) &&
+             (static_cast<int64_t>(tv.TimingAdvanceNs) <= ta_ns_half_span);
+
+    const bool use_ta_unit_wrap = !ta_unit_invalid && ta_unit_in_range;
+    const bool use_ta_ns_wrap   = use_ta_unit_wrap && mu_valid && !ta_ns_invalid && ta_ns_in_range;
+
+    if(use_ta_unit_wrap)
+    {
+        err += FAPI_VALIDATE_U16_WARN_WRAP(vald, meas->timing_advance, tv.TimingAdvance, ta_unit_modulus, tolerance.TimingAdvance);
+    }
+    else
+    {
+        err += FAPI_VALIDATE_U16_WARN(vald, meas->timing_advance, tv.TimingAdvance, tolerance.TimingAdvance);
+    }
+    if(use_ta_ns_wrap)
+    {
+        err += FAPI_VALIDATE_I16_WARN_WRAP(vald, meas->timing_advance_ns, tv.TimingAdvanceNs, ta_ns_modulus, tolerance.TimingAdvanceNs);
+    }
+    else
+    {
+        err += FAPI_VALIDATE_I16_WARN(vald, meas->timing_advance_ns, tv.TimingAdvanceNs, tolerance.TimingAdvanceNs);
+    }
     err += FAPI_VALIDATE_U16_WARN(vald, meas->rssi, tv.RSSI, tolerance.RSSI);
     err += FAPI_VALIDATE_U16_WARN(vald, meas->rsrp, tv.RSRP, tolerance.RSRP);
 #else
@@ -3422,7 +4075,17 @@ int scf_fapi_handler::compare_ul_measurement(fapi_validate* vald, ul_measurement
     NVLOGD_FMT(TAG, "{} UL measurement: ul_cqi={} ta={} rssi={}", vald->get_msg_name(),
             static_cast<unsigned short>(meas->ul_cqi), static_cast<unsigned short>(meas->timing_advance), static_cast<unsigned short>(meas->rssi));
     err += FAPI_VALIDATE_U8_WARN(vald, meas->ul_cqi, tv.UL_CQI, tolerance.UL_CQI);
-    err += FAPI_VALIDATE_U16_WARN(vald, meas->timing_advance, tv.TimingAdvance, tolerance.TimingAdvance);
+
+    const bool ta_unit_invalid  = (meas->timing_advance == kInvalidTa) || (tv.TimingAdvance == kInvalidTa);
+    const bool ta_unit_in_range = (meas->timing_advance <= kTaMaxNonPrach) && (tv.TimingAdvance <= kTaMaxNonPrach);
+    if(!ta_unit_invalid && ta_unit_in_range)
+    {
+        err += FAPI_VALIDATE_U16_WARN_WRAP(vald, meas->timing_advance, tv.TimingAdvance, ta_unit_modulus, tolerance.TimingAdvance);
+    }
+    else
+    {
+        err += FAPI_VALIDATE_U16_WARN(vald, meas->timing_advance, tv.TimingAdvance, tolerance.TimingAdvance);
+    }
     err += FAPI_VALIDATE_U16_WARN(vald, meas->rssi, tv.RSSI, tolerance.RSSI);
 #endif
     return err;
@@ -3444,7 +4107,7 @@ int scf_fapi_handler::compare_ul_measurement_ehq(fapi_validate* vald, ul_measure
             static_cast<int>(meas->ul_sinr_metric));
     if(cell_configs.pusch_sinr_selector == 2)
         err += FAPI_VALIDATE_I16_WARN(vald, meas->ul_sinr_metric, tv.SNR_ehq, tolerance.SNR);
-        
+
     err += FAPI_VALIDATE_U16_WARN(vald, meas->rssi, tv.RSSI_ehq, tolerance.RSSI);
     err += FAPI_VALIDATE_U16_WARN(vald, meas->rsrp, tv.RSRP_ehq, tolerance.RSRP);
 #endif
@@ -3995,6 +4658,7 @@ int scf_fapi_handler::handle_uci_indication(int cell_id, scf_fapi_uci_ind_t& res
     auto handle_start_time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
     bool is_early_harq = false;
     int msg_id = SCF_FAPI_UCI_INDICATION;
+    uint8_t* pdu_end = reinterpret_cast<uint8_t*>(&resp) + sizeof(scf_fapi_body_header_t) + resp.msg_hdr.length;
 #ifdef SCF_FAPI_10_04
     bool early_harq_enabled = (configs->get_indication_per_slot()[2] == 2)? true: false;
 #endif
@@ -4045,7 +4709,21 @@ int scf_fapi_handler::handle_uci_indication(int cell_id, scf_fapi_uci_ind_t& res
     uint32_t uci_offset = 0; // UCI PDU offset
     for(int i = 0; i < resp.num_ucis; i++)
     {
-        scf_fapi_uci_pdu_t* pdu = reinterpret_cast<scf_fapi_uci_pdu_t*>(resp.payload + uci_offset);
+        uint8_t* pdu_ptr = resp.payload + uci_offset;
+        if(pdu_ptr > pdu_end || sizeof(scf_fapi_uci_pdu_t) > static_cast<size_t>(pdu_end - pdu_ptr))
+        {
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "{}: malformed UCI.ind num_ucis={} offset={} length={}",
+                    __func__, static_cast<uint16_t>(resp.num_ucis), uci_offset, static_cast<uint32_t>(resp.msg_hdr.length));
+            return -1;
+        }
+        scf_fapi_uci_pdu_t* pdu = reinterpret_cast<scf_fapi_uci_pdu_t*>(pdu_ptr);
+        if(pdu->pdu_size < sizeof(scf_fapi_uci_pdu_t)
+                || pdu->pdu_size > static_cast<size_t>(pdu_end - pdu_ptr))
+        {
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "{}: malformed UCI PDU pdu_size={} offset={} length={}",
+                    __func__, static_cast<uint16_t>(pdu->pdu_size), uci_offset, static_cast<uint32_t>(resp.msg_hdr.length));
+            return -1;
+        }
         uci_offset += pdu->pdu_size;
 
         // PDU parse offset
@@ -4132,7 +4810,7 @@ int scf_fapi_handler::handle_uci_indication(int cell_id, scf_fapi_uci_ind_t& res
                             NVLOGD_FMT(TAG, "isIndEarlyHarqEnabled = {}, Comparing Full slot UCI Indication Measurements", isIndEarlyHarqEnabled);
                             compare_ul_measurement(&vald, tv_data->uci_ind.meas, reinterpret_cast<uint8_t*>(&uci_pusch->measurement), pdu->pdu_type);
                         }
-                        
+
                     }
 #else
                     compare_ul_measurement(&vald, tv_data->uci_ind.meas, &uci_pusch->ul_cqi, pdu->pdu_type);
@@ -4289,6 +4967,12 @@ int scf_fapi_handler::handle_uci_indication(int cell_id, scf_fapi_uci_ind_t& res
                 break;
         }
     }
+    if(resp.payload > pdu_end || uci_offset > static_cast<size_t>(pdu_end - resp.payload))
+    {
+        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "{}: UCI payload overrun offset={} length={}", __func__,
+                uci_offset, static_cast<uint32_t>(resp.msg_hdr.length));
+        return -1;
+    }
 
     vald.msg_ended();
 
@@ -4314,6 +4998,11 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
         NVLOGI_FMT(TAG, "No more message");
         return;
     }
+    if(msg.msg_len < static_cast<int32_t>(sizeof(scf_fapi_header_t)))
+    {
+        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed FAPI message: msg_len={}", msg.msg_len);
+        return;
+    }
 
     scf_fapi_header_t *hdr = reinterpret_cast<scf_fapi_header_t*>(msg.msg_buf);
     int cell_id = msg.cell_id;
@@ -4330,17 +5019,31 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
     fapi_validate vald(configs->validate_enable, configs->validate_log_opt);
 
     uint32_t body_offset = 0;
+    const size_t payload_len = static_cast<size_t>(msg.msg_len) - sizeof(scf_fapi_header_t);
     for(uint8_t m = 0; m < hdr->message_count; m++)
     {
+        if(body_offset > payload_len || sizeof(scf_fapi_body_header_t) > payload_len - body_offset)
+        {
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed FAPI body header: message={} body_offset={} payload_len={}",
+                    static_cast<unsigned>(m), body_offset, payload_len);
+            return;
+        }
         scf_fapi_body_header_t* body = reinterpret_cast<scf_fapi_body_header_t*>(hdr->payload + body_offset);
-        body_offset += body->length;
+        const size_t remaining_len = payload_len - body_offset - sizeof(scf_fapi_body_header_t);
+        if(body->length > remaining_len)
+        {
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: FAPI body exceeds remaining length: body_len={} remaining_len={}",
+                    static_cast<uint32_t>(body->length), remaining_len);
+            return;
+        }
+        body_offset += sizeof(scf_fapi_body_header_t) + body->length;
 
         // Check whether the msg_len is set correctly. Note: there's only 1 FAPI message in the iterator
         uint32_t head_len = sizeof(scf_fapi_header_t) + sizeof(scf_fapi_body_header_t);
         uint32_t body_len = body->length;
         if (msg.msg_len != head_len + body_len)
         {
-            NVLOGW_FMT(TAG, "RECV: msg_len is not set correctly: cell_id={} msg_id=0x{:02X} msg_len={} head_len={} body_len={}",
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: msg_len is not set correctly: cell_id={} msg_id=0x{:02X} msg_len={} head_len={} body_len={}",
                     msg.cell_id, msg.msg_id, msg.msg_len, head_len, body_len);
         }
 
@@ -4409,11 +5112,11 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                 else if(resp->msg_body.error_code == SCF_ERROR_CODE_MSG_INVALID_CONFIG)
                 {
                     NVLOGC_FMT(TAG, "cell_config: cell_id={} failed: error_code={}", cell_id, resp->msg_body.error_code);
-                    //exit(EXIT_SUCCESS);
-                }
-                else
-                {
-                    NVLOGC_FMT(TAG, "cell_config: cell_id={} failed: error_code={}", cell_id, resp->msg_body.error_code);
+                    if(cell_remap_event[cell_id])
+                    {
+                        cell_remap_event[cell_id] = false;
+                        NVLOGW_FMT(TAG, "cell_config: skip re-mapping cell_id={} to target cell_id={}", cell_id, cell_id_map[cell_id]);
+                    }
                 }
             }
             break;
@@ -4531,11 +5234,25 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                 }
 
                 uint8_t* next = reinterpret_cast<uint8_t*>(resp.crc_info);
+                uint8_t* pdu_end = reinterpret_cast<uint8_t*>(body) + sizeof(scf_fapi_body_header_t) + body_len;
                 for (uint16_t i = 0; i < resp.num_crcs; i++)
                 {
+                    if(next > pdu_end || sizeof(scf_fapi_crc_info_t) > static_cast<size_t>(pdu_end - next))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed CRC.ind num_crcs={} body_len={}",
+                                static_cast<uint16_t>(resp.num_crcs), body_len);
+                        break;
+                    }
+                    scf_fapi_crc_info_t& crc = *(reinterpret_cast<scf_fapi_crc_info_t*>(next));
+                    const size_t crc_size = sizeof(scf_fapi_crc_info_t) + (crc.num_cb + 7) / 8 + sizeof(scf_fapi_crc_end_info_t);
+                    if(crc_size > static_cast<size_t>(pdu_end - next))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed CRC info num_cb={} body_len={}",
+                                static_cast<uint16_t>(crc.num_cb), body_len);
+                        break;
+                    }
                     validate_crc_ind(cell_id, resp.sfn, resp.slot, i, reinterpret_cast<scf_fapi_crc_info_t*>(next), vald);
 
-                    scf_fapi_crc_info_t& crc = *(reinterpret_cast<scf_fapi_crc_info_t*>(next));
                     next += sizeof(scf_fapi_crc_info_t) + (crc.num_cb + 7) / 8;
 
                     scf_fapi_crc_end_info_t *end = reinterpret_cast<scf_fapi_crc_end_info_t*>(next);
@@ -4548,6 +5265,11 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
 //                    end->measurement.timing_advance, end->measurement.timing_advance_ns, end->measurement.rssi, end->measurement.rsrp);
 //#endif
                 }
+                if(next > pdu_end)
+                {
+                    NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: CRC.ind pointer exceeds boundary");
+                    break;
+                }
                 vald.msg_ended();
                 validate_indication_timing(cell_id, handle_start_time.count(), resp.sfn, resp.slot, configs->ul_ind_deadline_ns, cell_summary[cell_id].ul_ind, thrputs[cell_id].ul_ind);
             }
@@ -4556,6 +5278,16 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
             case SCF_FAPI_RACH_INDICATION: {
                 auto& resp = *reinterpret_cast<scf_fapi_rach_ind_t*>(body);
                 auto handle_start_time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
+                uint8_t* pdu_end = reinterpret_cast<uint8_t*>(body) + sizeof(scf_fapi_body_header_t) + body_len;
+
+                uint8_t* first_rach_pdu = reinterpret_cast<uint8_t*>(resp.pdu_info);
+                if(resp.num_pdus > 0 && (first_rach_pdu > pdu_end
+                        || sizeof(scf_fapi_prach_ind_pdu_t) > static_cast<size_t>(pdu_end - first_rach_pdu)))
+                {
+                    NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed RACH.ind num_pdus={} body_len={}",
+                            resp.num_pdus, body_len);
+                    break;
+                }
 
                 if(resp.num_pdus == 0 || resp.pdu_info[0].num_preamble == 0)
                 {
@@ -4581,8 +5313,21 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                 uint8_t* next = reinterpret_cast<uint8_t*>(resp.pdu_info);
                 for(int pdu_id = 0; pdu_id < resp.num_pdus; pdu_id++)
                 {
+                    if(next > pdu_end || sizeof(scf_fapi_prach_ind_pdu_t) > static_cast<size_t>(pdu_end - next))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed RACH.ind num_pdus={} body_len={}",
+                                resp.num_pdus, body_len);
+                        break;
+                    }
                     scf_fapi_prach_ind_pdu_t* rach_pdu = reinterpret_cast<scf_fapi_prach_ind_pdu_t*>(next);
-                    next += sizeof(scf_fapi_prach_ind_pdu_t) + sizeof(scf_fapi_prach_preamble_info_t) * rach_pdu->num_preamble;
+                    const size_t rach_pdu_size = sizeof(scf_fapi_prach_ind_pdu_t) + sizeof(scf_fapi_prach_preamble_info_t) * rach_pdu->num_preamble;
+                    if(rach_pdu_size > static_cast<size_t>(pdu_end - next))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed RACH PDU num_preamble={} body_len={}",
+                                rach_pdu->num_preamble, body_len);
+                        break;
+                    }
+                    next += rach_pdu_size;
 
                     if(validate_rach_ind(cell_id, resp.sfn, resp.slot, pdu_id, rach_pdu, vald) == 0)
                     {
@@ -4623,6 +5368,11 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
 
                         }
                     }
+                }
+                if(next > pdu_end)
+                {
+                    NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: RACH.ind pointer exceeds boundary");
+                    break;
                 }
                 thrputs[cell_id].prmb += num_detectedPrmb;
                 scf_fapi_prach_preamble_info_t& preamble0 = resp.pdu_info[0].preamble_info[0];
@@ -4787,15 +5537,35 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
 
                 vald.set_fapi_req(get_fapi_req_data(cell_id, resp.sfn, resp.slot, channel_type_t::SRS));
                 uint8_t* next = reinterpret_cast<uint8_t*>(resp.srs_info);
+                uint8_t* pdu_end = reinterpret_cast<uint8_t*>(body) + sizeof(scf_fapi_body_header_t) + body_len;
                 std::size_t data_offset = 0, offset = 0;
                 uint8_t* srs_report_buffer = NULL;
                 bool free_srs_chest_buffer_index_l2 = true;
                 for(int pdu_id = 0; pdu_id < resp.num_pdus; pdu_id++)
                 {
                     int rbSnrOffset = 0;
-                    scf_fapi_srs_info_t* srs_info = reinterpret_cast<scf_fapi_srs_info_t*>(next + offset);
+                    uint8_t* pdu_ptr = next + offset;
+                    if(pdu_ptr > pdu_end || sizeof(scf_fapi_srs_info_t) > static_cast<size_t>(pdu_end - pdu_ptr))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed SRS.ind num_pdus={} body_len={}",
+                                resp.num_pdus, body_len);
+                        break;
+                    }
+                    scf_fapi_srs_info_t* srs_info = reinterpret_cast<scf_fapi_srs_info_t*>(pdu_ptr);
                     NVLOGD_FMT(TAG, "Cell id = {} Validate tvPdu_id={}", cell_id, tvPdu_id);
                     validate_srs_ind(cell_id, resp.sfn, resp.slot, pdu_id, srs_info, srs_report_buffer, srs_info->handle, &rbSnrOffset, vald, free_srs_chest_buffer_index_l2);
+                    if(rbSnrOffset < 0)
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed SRS PDU rbSnrOffset={}", rbSnrOffset);
+                        break;
+                    }
+                    const size_t srs_pdu_size = sizeof(scf_fapi_srs_info_t) + static_cast<size_t>(rbSnrOffset);
+                    if(srs_pdu_size > static_cast<size_t>(pdu_end - pdu_ptr))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed SRS PDU rbSnrOffset={} body_len={}",
+                                rbSnrOffset, body_len);
+                        break;
+                    }
 
                     offset+= sizeof(scf_fapi_srs_info_t);
                     offset += rbSnrOffset;
@@ -4804,6 +5574,11 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                     thrputs[cell_id].srs ++;
                     tvPdu_id++;
                     srsIndMap[cell_id] = std::make_tuple(srs_ind_sfn, srs_ind_slot,tvPdu_id);
+                }
+                if(next > pdu_end || offset > static_cast<size_t>(pdu_end - next))
+                {
+                    NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: SRS.ind pointer exceeds boundary");
+                    break;
                 }
                 vald.msg_ended();
 
@@ -4837,7 +5612,6 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                 scf_fapi_srs_ind_t& resp = *reinterpret_cast<scf_fapi_srs_ind_t*>(body);
                 NVLOGI_FMT(TAG, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SRS.ind with DATA num_pdu={}",
                         static_cast<unsigned>(resp.sfn), static_cast<unsigned>(resp.slot), cell_id, msg_id, resp.num_pdus);
-
                 uint16_t srs_ind_sfn       = resp.sfn;
                 uint16_t srs_ind_slot      = resp.slot;
 
@@ -4889,6 +5663,7 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                 vald.set_fapi_req(get_fapi_req_data(cell_id, resp.sfn, resp.slot, channel_type_t::SRS));
 
                 uint8_t* next = reinterpret_cast<uint8_t*>(resp.srs_info);
+                uint8_t* pdu_end = reinterpret_cast<uint8_t*>(body) + sizeof(scf_fapi_body_header_t) + body_len;
                 std::size_t data_offset = 0, offset = 0;
                 uint8_t* srs_report_buffer = reinterpret_cast<uint8_t*>(msg.data_buf);
                 uint32_t prv_handle = 0;
@@ -4896,7 +5671,14 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                 for(int pdu_id = 0; pdu_id < resp.num_pdus; pdu_id++)
                 {
                     int rbSnrOffset = 0;
-                    scf_fapi_srs_info_t* srs_info = reinterpret_cast<scf_fapi_srs_info_t*>(next + offset);
+                    uint8_t* pdu_ptr = next + offset;
+                    if(pdu_ptr > pdu_end || sizeof(scf_fapi_srs_info_t) > static_cast<size_t>(pdu_end - pdu_ptr))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed SRS.ind with DATA num_pdus={} body_len={}",
+                                resp.num_pdus, body_len);
+                        break;
+                    }
+                    scf_fapi_srs_info_t* srs_info = reinterpret_cast<scf_fapi_srs_info_t*>(pdu_ptr);
                     /*
                     next += sizeof(scf_fapi_srs_ind_t);
                     for (int i = 0; i < srs_pdu->num_reported_symbols; i ++)
@@ -4916,7 +5698,21 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                     {
                         data_offset = 0;
                     }
+                    const size_t report_len = srs_info->srs_report_tlv.length;
+                    if(report_len > static_cast<size_t>(msg.data_len) - data_offset)
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed SRS DATA PDU data_offset={} report_len={} data_len={}",
+                                data_offset, report_len, msg.data_len);
+                        break;
+                    }
 #endif
+
+                    if(data_offset > static_cast<size_t>(msg.data_len))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed SRS DATA PDU data_offset={} data_len={}",
+                                data_offset, msg.data_len);
+                        break;
+                    }
                     /* This is done to handle the mutiple usage case, Eg: USAGE_BEAM_MGMT+USAGE_CODEBOOK where data is encoded in 2 SRS PDU's
                        in SRS.IND but in TV they are part of the same PDU entry or RNTI
                        TODO: The counter "thrputs[cell_id].srs" is incremented twice if there are 2 bits set in usage which if needed can be fixed  */
@@ -4934,6 +5730,19 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                     NVLOGD_FMT(TAG, "Cell id = {} Validate pdu_id={} tvPdu_id={} prv_handle={} srs_info->handle={} srsPduIdx={} free_srs_chest_buffer_index_l2={}", cell_id, pdu_id, tvPdu_id, prv_handle,static_cast<unsigned>(srs_info->handle), srsPduIdx, free_srs_chest_buffer_index_l2);
 
                     validate_srs_ind(cell_id, resp.sfn, resp.slot, pdu_id, srs_info, srs_report_buffer+data_offset, srsPduIdx, &rbSnrOffset, vald, free_srs_chest_buffer_index_l2);
+                    if(rbSnrOffset < 0 || data_offset > static_cast<size_t>(msg.data_len))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed SRS DATA PDU rbSnrOffset={} data_offset={} data_len={}",
+                                rbSnrOffset, data_offset, msg.data_len);
+                        break;
+                    }
+                    const size_t srs_pdu_size = sizeof(scf_fapi_srs_info_t) + static_cast<size_t>(rbSnrOffset);
+                    if(srs_pdu_size > static_cast<size_t>(pdu_end - pdu_ptr))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed SRS DATA PDU rbSnrOffset={} data_offset={} data_len={} body_len={}",
+                                rbSnrOffset, data_offset, msg.data_len, body_len);
+                        break;
+                    }
                     offset+= (sizeof(scf_fapi_srs_info_t) + rbSnrOffset);
                     prv_handle = srs_info->handle;
 
@@ -4945,14 +5754,20 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                     tvPdu_id++;
                     srsIndMap[cell_id] = std::make_tuple(srs_ind_sfn, srs_ind_slot,tvPdu_id);
                 }
+                if(next > pdu_end || offset > static_cast<size_t>(pdu_end - next))
+                {
+                    NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: SRS.ind DATA pointer exceeds boundary");
+                    break;
+                }
                 vald.msg_ended();
                 //NVLOGW_FMT(TAG, "RECV: SRS_IND Not Supported: hdr.msgId=0x{:02X} msg_len={} ", msg_id, static_cast<unsigned>(body->length));
 
+                sfn_slot_t ss_msg = { .u16 = { .sfn = resp.sfn, .slot = resp.slot } };
+                int slot_interval = get_slot_interval(ss_msg, ss_tick.load());
                 std::chrono::nanoseconds ts_msg_end = std::chrono::system_clock::now().time_since_epoch();
-                NVLOGI_FMT(TAG, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SRS.ind with DATA num_pdu={} handle_time={} total_delay={}",
+                NVLOGI_FMT(TAG, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SRS.ind with DATA num_pdu={} handle_time={} total_delay={} slot_interval={}",
                         static_cast<unsigned>(resp.sfn), static_cast<unsigned>(resp.slot), cell_id, msg_id, resp.num_pdus,
-                        ts_msg_end.count() - ts_msg_start.count(), ts_msg_end.count() - transport().get_ts_send(msg));
-
+                        ts_msg_end.count() - ts_msg_start.count(), ts_msg_end.count() - transport().get_ts_send(msg), slot_interval);
 
                 validate_timing_srs_indication(cell_id, ts_msg_start.count(), resp);
 
@@ -4968,7 +5783,7 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                     size_t                  msg_offset = 0;
                     scf_fapi_rx_data_pdu_t* pdu;
                     uint8_t* tb_data = nullptr;
-
+                    uint8_t* pdu_end = reinterpret_cast<uint8_t*>(body) + sizeof(scf_fapi_body_header_t) + body_len;
                     vald.msg_start(cell_id, msg_id, resp.sfn, resp.slot);
                     vald.set_fapi_req(get_fapi_req_data(cell_id, resp.sfn, resp.slot, channel_type_t::PUSCH));
 
@@ -5000,7 +5815,20 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
 
                     for(int i = 0; i < resp.num_pdus; i++)
                     {
-                        pdu = (scf_fapi_rx_data_pdu_t*)((uint8_t*)resp.pdus + msg_offset);
+                        uint8_t* pdu_ptr = reinterpret_cast<uint8_t*>(resp.pdus) + msg_offset;
+                        if(pdu_ptr > pdu_end || sizeof(scf_fapi_rx_data_pdu_t) > static_cast<size_t>(pdu_end - pdu_ptr))
+                        {
+                            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed RX_DATA.ind num_pdus={} body_len={}",
+                                    static_cast<uint16_t>(resp.num_pdus), body_len);
+                            break;
+                        }
+                        pdu = reinterpret_cast<scf_fapi_rx_data_pdu_t*>(pdu_ptr);
+                        if(tb_offset < 0 || static_cast<size_t>(tb_offset) + pdu->pdu_len > static_cast<size_t>(msg.data_len))
+                        {
+                            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: malformed RX_DATA PDU pdu_len={} tb_offset={} data_len={}",
+                                    static_cast<uint32_t>(pdu->pdu_len), tb_offset, msg.data_len);
+                            break;
+                        }
 
                         if(msg.data_pool == NV_IPC_MEMPOOL_CPU_DATA)
                         {
@@ -5022,6 +5850,12 @@ void scf_fapi_handler::on_msg(nv_ipc_msg_t& msg)
                         }
 
                         tb_offset += pdu->pdu_len; //+ sizeof(scf_fapi_rx_data_pdu_t);
+                    }
+                    if(reinterpret_cast<uint8_t*>(resp.pdus) > pdu_end
+                            || msg_offset > static_cast<size_t>(pdu_end - reinterpret_cast<uint8_t*>(resp.pdus)))
+                    {
+                        NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT, "RECV: RX_DATA.ind pointer exceeds boundary");
+                        break;
                     }
                     NVLOGI_FMT(TAG, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SCF_FAPI_RX_DATA_INDICATION numPDUs={} tb_size={}",
                             static_cast<unsigned>(resp.sfn), static_cast<unsigned>(resp.slot), cell_id, msg_id, static_cast<int>(resp.num_pdus), tb_size);
@@ -5148,6 +5982,13 @@ int scf_fapi_handler::validate_crc_ind(int cell_id, uint16_t sfn, uint16_t slot,
     if(configs->get_conformance_test_params()->conformance_test_enable)
     {
         uint16_t ue_id = insertOrUpdate(rnti_2_ueid_map,crc->rnti);
+        if(cell_id < 0 || cell_id >= MAX_CELLS_PER_SLOT || ue_id >= FAPI_MAX_UE || crc->harq_id >= FAPI_MAX_UL_HARQ_ID)
+        {
+            NVLOGE_FMT(TAG, AERIAL_FAPI_EVENT,
+                    "{}: invalid HARQ handle index: cell_id={} ue_id={} harq_id={}",
+                    __func__, cell_id, ue_id, crc->harq_id);
+            return vald.pdu_ended(pdu_id, -1);
+        }
         ul_harq_handle_t & curr_ul_harq_handle = ul_harq_handle[cell_id][ue_id][crc->harq_id];
         if(crc->tb_crc_status == 0 || curr_ul_harq_handle.retx_count == FAPI_MAX_HARQ_RETX)
         {
@@ -5461,7 +6302,7 @@ int scf_fapi_handler::validate_srs_ind(int cell_id, uint16_t sfn, uint16_t slot,
                         }
                         for (; j < totalPrbs; j += 4)
                         {
-                            const uint8_t rb_snr = static_cast<uint8_t>((tv_data->SNRval[j] + tv_data->SNRval[j + 1] + 
+                            const uint8_t rb_snr = static_cast<uint8_t>((tv_data->SNRval[j] + tv_data->SNRval[j + 1] +
                                                                         tv_data->SNRval[j + 2] + tv_data->SNRval[j + 3]) * 0.25f);
                             FAPI_VALIDATE_U8_ERR(&vald, *reinterpret_cast<uint8_t *>(ptrSnrRpt), rb_snr, 1);
                             ptrSnrRpt += sizeof(uint8_t);

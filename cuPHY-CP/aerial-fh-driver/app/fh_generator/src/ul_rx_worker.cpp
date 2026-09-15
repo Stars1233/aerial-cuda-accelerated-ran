@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,14 +43,16 @@ void fronthaul_generator_ul_rx_worker(Worker* worker)
     sprintf(threadname, "%s", "ULRX");
     SET_THREAD_NAME(threadname);
 
+    PrimaryCtxGuard ctx_guard(0);
+
     auto& context = worker->get_context();
     auto& nic = context.nic;
-    cudaError_t result = cudaSuccess;
-
     cudaStream_t stream;
-    result = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-    if (result != cudaSuccess) {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    CUresult cuResult = cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING);
+    if (cuResult != CUDA_SUCCESS) {
+        const char* errStr = nullptr;
+        cuGetErrorString(cuResult, &errStr);
+        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cu failed with {} ", __FILE__, __LINE__, errStr ? errStr : "unknown");
         exit(EXIT_FAILURE);
     }
     ACCESS_ONCE(((uint32_t*)context.ul_rx_worker_context.exit_flag[0]->addrh())[0]) = 0;

@@ -1,6 +1,6 @@
 #!//usr/bin/env python3
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,6 +43,11 @@ def launch_pattern_x2_update_all(input_dir, output_dir):
                 for cell_index in range(numcells):
                     pattern_file['Cell_Configs'].append(
                         pattern_file['Cell_Configs'][cell_index])
+                if 'UL_Cell_Configs' in pattern_file:
+                    num_ul_cells = len(pattern_file['UL_Cell_Configs'])
+                    for cell_index in range(num_ul_cells):
+                        pattern_file['UL_Cell_Configs'].append(
+                            pattern_file['UL_Cell_Configs'][cell_index])
 
                 filename = os.path.basename(pattern).replace('.yaml','_X2.yaml')
                 with open(os.path.join(output_dir, filename), 'w+') as stream:
@@ -70,6 +75,11 @@ def launch_pattern_x2_update(launch_pattern_file, output_dir):
             for cell_index in range(numcells):
                 pattern_file['Cell_Configs'].append(
                     pattern_file['Cell_Configs'][cell_index])
+            if 'UL_Cell_Configs' in pattern_file:
+                num_ul_cells = len(pattern_file['UL_Cell_Configs'])
+                for cell_index in range(num_ul_cells):
+                    pattern_file['UL_Cell_Configs'].append(
+                        pattern_file['UL_Cell_Configs'][cell_index])
 
             filename = os.path.basename(launch_pattern_file).replace('.yaml','_X2.yaml')
             with open(os.path.join(output_dir, filename), 'w+') as stream:

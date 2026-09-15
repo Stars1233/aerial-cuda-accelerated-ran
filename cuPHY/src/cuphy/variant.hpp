@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,24 +25,26 @@ namespace cuphy_i
 {
 
 template <cuphyDataType_t TType> typename data_type_traits<TType>::type variant_as(const cuphyVariant_t& v);
-template <> inline typename data_type_traits<CUPHY_R_8I>::type  variant_as<CUPHY_R_8I> (const cuphyVariant_t& v) { return v.value.r8i;  }
-template <> inline typename data_type_traits<CUPHY_C_8I>::type  variant_as<CUPHY_C_8I> (const cuphyVariant_t& v) { return v.value.c8i;  }
-template <> inline typename data_type_traits<CUPHY_R_8U>::type  variant_as<CUPHY_R_8U> (const cuphyVariant_t& v) { return v.value.r8u;  }
-template <> inline typename data_type_traits<CUPHY_C_8U>::type  variant_as<CUPHY_C_8U> (const cuphyVariant_t& v) { return v.value.c8u;  }
-template <> inline typename data_type_traits<CUPHY_R_16I>::type variant_as<CUPHY_R_16I>(const cuphyVariant_t& v) { return v.value.r16i; }
-template <> inline typename data_type_traits<CUPHY_C_16I>::type variant_as<CUPHY_C_16I>(const cuphyVariant_t& v) { return v.value.c16i; }
-template <> inline typename data_type_traits<CUPHY_R_16U>::type variant_as<CUPHY_R_16U>(const cuphyVariant_t& v) { return v.value.r16u; }
-template <> inline typename data_type_traits<CUPHY_C_16U>::type variant_as<CUPHY_C_16U>(const cuphyVariant_t& v) { return v.value.c16u; }
-template <> inline typename data_type_traits<CUPHY_R_32I>::type variant_as<CUPHY_R_32I>(const cuphyVariant_t& v) { return v.value.r32i; }
-template <> inline typename data_type_traits<CUPHY_C_32I>::type variant_as<CUPHY_C_32I>(const cuphyVariant_t& v) { return v.value.c32i; }
-template <> inline typename data_type_traits<CUPHY_R_32U>::type variant_as<CUPHY_R_32U>(const cuphyVariant_t& v) { return v.value.r32u; }
-template <> inline typename data_type_traits<CUPHY_C_32U>::type variant_as<CUPHY_C_32U>(const cuphyVariant_t& v) { return v.value.c32u; }
-template <> inline typename data_type_traits<CUPHY_R_16F>::type variant_as<CUPHY_R_16F>(const cuphyVariant_t& v) { return v.value.r16f; }
-template <> inline typename data_type_traits<CUPHY_C_16F>::type variant_as<CUPHY_C_16F>(const cuphyVariant_t& v) { return v.value.c16f; }
-template <> inline typename data_type_traits<CUPHY_R_32F>::type variant_as<CUPHY_R_32F>(const cuphyVariant_t& v) { return v.value.r32f; }
-template <> inline typename data_type_traits<CUPHY_C_32F>::type variant_as<CUPHY_C_32F>(const cuphyVariant_t& v) { return v.value.c32f; }
-template <> inline typename data_type_traits<CUPHY_R_64F>::type variant_as<CUPHY_R_64F>(const cuphyVariant_t& v) { return v.value.r64f; }
-template <> inline typename data_type_traits<CUPHY_C_64F>::type variant_as<CUPHY_C_64F>(const cuphyVariant_t& v) { return v.value.c64f; }
+template <> inline typename data_type_traits<CUPHY_R_8I>::type      variant_as<CUPHY_R_8I>     (const cuphyVariant_t& v) { return v.value.r8i;      }
+template <> inline typename data_type_traits<CUPHY_C_8I>::type      variant_as<CUPHY_C_8I>     (const cuphyVariant_t& v) { return v.value.c8i;      }
+template <> inline typename data_type_traits<CUPHY_R_8U>::type      variant_as<CUPHY_R_8U>     (const cuphyVariant_t& v) { return v.value.r8u;      }
+template <> inline typename data_type_traits<CUPHY_C_8U>::type      variant_as<CUPHY_C_8U>     (const cuphyVariant_t& v) { return v.value.c8u;      }
+template <> inline typename data_type_traits<CUPHY_R_16I>::type     variant_as<CUPHY_R_16I>    (const cuphyVariant_t& v) { return v.value.r16i;     }
+template <> inline typename data_type_traits<CUPHY_C_16I>::type     variant_as<CUPHY_C_16I>    (const cuphyVariant_t& v) { return v.value.c16i;     }
+template <> inline typename data_type_traits<CUPHY_R_16U>::type     variant_as<CUPHY_R_16U>    (const cuphyVariant_t& v) { return v.value.r16u;     }
+template <> inline typename data_type_traits<CUPHY_C_16U>::type     variant_as<CUPHY_C_16U>    (const cuphyVariant_t& v) { return v.value.c16u;     }
+template <> inline typename data_type_traits<CUPHY_R_32I>::type     variant_as<CUPHY_R_32I>    (const cuphyVariant_t& v) { return v.value.r32i;     }
+template <> inline typename data_type_traits<CUPHY_C_32I>::type     variant_as<CUPHY_C_32I>    (const cuphyVariant_t& v) { return v.value.c32i;     }
+template <> inline typename data_type_traits<CUPHY_R_32U>::type     variant_as<CUPHY_R_32U>    (const cuphyVariant_t& v) { return v.value.r32u;     }
+template <> inline typename data_type_traits<CUPHY_C_32U>::type     variant_as<CUPHY_C_32U>    (const cuphyVariant_t& v) { return v.value.c32u;     }
+template <> inline typename data_type_traits<CUPHY_R_16F>::type     variant_as<CUPHY_R_16F>    (const cuphyVariant_t& v) { return v.value.r16f;     }
+template <> inline typename data_type_traits<CUPHY_C_16F>::type     variant_as<CUPHY_C_16F>    (const cuphyVariant_t& v) { return v.value.c16f;     }
+template <> inline typename data_type_traits<CUPHY_R_32F>::type     variant_as<CUPHY_R_32F>    (const cuphyVariant_t& v) { return v.value.r32f;     }
+template <> inline typename data_type_traits<CUPHY_C_32F>::type     variant_as<CUPHY_C_32F>    (const cuphyVariant_t& v) { return v.value.c32f;     }
+template <> inline typename data_type_traits<CUPHY_R_64F>::type     variant_as<CUPHY_R_64F>    (const cuphyVariant_t& v) { return v.value.r64f;     }
+template <> inline typename data_type_traits<CUPHY_C_64F>::type     variant_as<CUPHY_C_64F>    (const cuphyVariant_t& v) { return v.value.c64f;     }
+template <> inline typename data_type_traits<CUPHY_R_8F_E4M3>::type variant_as<CUPHY_R_8F_E4M3>(const cuphyVariant_t& v) { return v.value.r8f_e4m3; }
+template <> inline typename data_type_traits<CUPHY_R_8F_E5M2>::type variant_as<CUPHY_R_8F_E5M2>(const cuphyVariant_t& v) { return v.value.r8f_e5m2; }
 
 template <typename T> T variant_as_t(const cuphyVariant_t& v);
 template <> inline int8_t          variant_as_t<int8_t>         (const cuphyVariant_t& v) { return v.value.r8i;  }
@@ -65,6 +67,8 @@ template <> inline float           variant_as_t<float>          (const cuphyVari
 template <> inline cuComplex       variant_as_t<cuComplex>      (const cuphyVariant_t& v) { return v.value.c32f; }
 template <> inline double          variant_as_t<double>         (const cuphyVariant_t& v) { return v.value.r64f; }
 template <> inline cuDoubleComplex variant_as_t<cuDoubleComplex>(const cuphyVariant_t& v) { return v.value.c64f; }
+template <> inline __nv_fp8_e4m3   variant_as_t<__nv_fp8_e4m3>  (const cuphyVariant_t& v) { return v.value.r8f_e4m3; }
+template <> inline __nv_fp8_e5m2   variant_as_t<__nv_fp8_e5m2>  (const cuphyVariant_t& v) { return v.value.r8f_e5m2; }
 
 ////////////////////////////////////////////////////////////////////////
 // convert_variant()

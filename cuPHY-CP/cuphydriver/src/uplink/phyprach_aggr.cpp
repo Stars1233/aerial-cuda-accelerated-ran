@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,12 +20,17 @@
 //#define PRACH_H5DUMP
 
 #include "phyprach_aggr.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
 #include "exceptions.hpp"
 #include "cuda_events.hpp"
+
+#include <gsl-lite/gsl-lite.hpp>
+
 #include <unordered_map>
+#include <utility>
 
 static void print_prach_static_params(const cuphyPrachStatPrms_t * prach_stat_params)
 {
@@ -229,14 +234,14 @@ PhyPrachAggr::PhyPrachAggr(
     prach_crc_errors_h->clear();
     mf.addCpuPinnedSize(sizeof(uint32_t));
 
-    launch_kernel_warmup(s_channel);
-    launch_kernel_order(s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
-    launch_kernel_order(s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_warmup(warmup_kernel_func_, s_channel);
+    launch_kernel_order(pdctx->getOrderKernelFunctions().kernel_order_prach, s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_order(pdctx->getOrderKernelFunctions().kernel_order_prach, s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
 
     gDev->synchronizeStream(s_channel);
 
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_copy));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_copy));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_copy, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_copy, CU_EVENT_DEFAULT));
 
     handle = nullptr;
     handle_temp = nullptr;
@@ -244,8 +249,8 @@ PhyPrachAggr::PhyPrachAggr(
 
 PhyPrachAggr::~PhyPrachAggr()
 {
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_copy));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_copy));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_copy));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_copy));
     if(handle)
         cuphyDestroyPrachRx(handle);
     free(pInput.pTDataRx);
@@ -263,6 +268,14 @@ int PhyPrachAggr::createPhyObj()
     pdctx->getCellList(cell_list,&cellCount);
     if(cellCount == 0)
         return EINVAL;
+
+    // Pre-reserve to the per-context maxima so the reconfig paths (legacy in-place
+    // updateConfig and the offload staged copies) never reallocate at runtime.
+    // reserve() is idempotent across the repeated createPhyObj() calls on cell add.
+    // cell_stat is bounded by the cell list (cell_list[MAX_CELLS_PER_SLOT] above), so
+    // reserve that compile-time max -- mirrors occa_stat's PRACH_MAX_OCCASIONS_AGGR bound.
+    prachCellStatVec.reserve(MAX_CELLS_PER_SLOT);
+    prachOccaStatVec.reserve(PRACH_MAX_OCCASIONS_AGGR);
 
     //NVLOGC_FMT(TAG, "number of cells: {}", cell_list.size());
     for(uint32_t i = 0; i < cellCount; i++)
@@ -343,11 +356,103 @@ int PhyPrachAggr::createPhyObj()
     return 0;
 }
 
-int PhyPrachAggr::deleteTempPhyObj() 
+int PhyPrachAggr::deleteTempPhyObj()
 {
     if(handle_temp)
+    {
         cuphyDestroyPrachRx(handle_temp);
+        handle_temp = nullptr;  // Prevent a double-free if called again before recreate.
+    }
     return 0;
+}
+
+PhyPrachAggr::StageConfigResult
+PhyPrachAggr::stageConfig(const std::uint16_t cell_id, const cell_phy_info& cell_pinfo)
+{
+    // Reserve to the live vectors' (pre-reserved) capacities once, so the copy
+    // below and the grow-path insert in applyPrachUpdate reuse capacity instead of
+    // allocating. After the first stageConfig (and the commit swap) these are no-ops.
+    staged_.cell_stat.reserve(prachCellStatVec.capacity());
+    staged_.occa_stat.reserve(prachOccaStatVec.capacity());
+
+    // Copy the live PRACH static vectors and apply the requested update to the
+    // copies only; live state stays untouched until commitStagedConfig(). Shares
+    // the occasion-index logic with the legacy in-place updateConfig() path.
+    staged_.cell_stat = prachCellStatVec;
+    staged_.occa_stat = prachOccaStatVec;
+    staged_.active    = true;
+
+    std::optional<std::uint16_t> occa_start_idx;
+    if(applyPrachUpdate(cell_id, cell_pinfo, staged_.cell_stat, staged_.occa_stat, occa_start_idx) != 0)
+    {
+        staged_.reset();
+        return tl::unexpected(PrachStageError::StageRejected);
+    }
+    return occa_start_idx;
+}
+
+tl::expected<void, PrachStageError> PhyPrachAggr::createNewPhyObjFromStagedConfig()
+{
+    if(!staged_.active)
+    {
+        // Defensive no-op: nothing staged for this aggregator. Unreachable on the normal
+        // path -- stageCellConfig() stages every aggregator and aborts the whole reconfig
+        // (discarding all) if any one fails, so a successful stage leaves all aggregators
+        // active. Kept so a direct/partial caller cannot create from empty staged vectors.
+        return {};
+    }
+
+    setCtx();
+    // Inherit the scalar config from the live params; point only at the staged vectors.
+    cuphyPrachStatPrms_t staged_params = prach_params_static;
+    staged_params.pCellPrms    = staged_.cell_stat.data();
+    staged_params.pOccaPrms    = staged_.occa_stat.data();
+    // Boundary narrowing: occasion count (size_t) -> cuPHY's uint16_t nMaxOccaProc field.
+    // Neither type is ours to change, so flag the conversion explicitly rather than hide it.
+    gsl_Expects(std::in_range<uint16_t>(staged_.occa_stat.size()));
+    staged_params.nMaxOccaProc = static_cast<uint16_t>(staged_.occa_stat.size());
+
+    handle_temp = nullptr;
+    const cuphyStatus_t createStatus = cuphyCreatePrachRx(&handle_temp, &staged_params);
+    if(createStatus != CUPHY_STATUS_SUCCESS)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,
+            "createNewPhyObjFromStagedConfig: cuphyCreatePrachRx error {}", cuphyGetErrorString(createStatus));
+        handle_temp = nullptr;
+        return tl::unexpected(PrachStageError::TempCreateFailed);
+    }
+
+    gDev->synchronizeStream(s_channel);
+    return {};
+}
+
+void PhyPrachAggr::commitStagedConfig()
+{
+    if(!staged_.active)
+    {
+        return;
+    }
+    // Publish the staged vectors as live, then re-point the stored static params so a
+    // future handle (re)create reads the new config. cuphyCreatePrachRx already consumed
+    // the staged vectors when handle_temp was built -- it derives its own device-side
+    // state in the constructor (deriveParams) and does NOT retain pCellPrms/pOccaPrms --
+    // so no live or temp cuPHY handle points into these buffers. The swap is therefore a
+    // plain O(1) publish that also recycles the old-live buffer into staged_ (keeping its
+    // capacity for the next reconfig, no realloc). reset() then clears that recycled
+    // buffer's stale contents; it is safe precisely because no handle reads it.
+    prachCellStatVec.swap(staged_.cell_stat);
+    prachOccaStatVec.swap(staged_.occa_stat);
+    prach_params_static.pCellPrms    = prachCellStatVec.data();
+    prach_params_static.pOccaPrms    = prachOccaStatVec.data();
+    // Boundary narrowing: occasion count (size_t) -> cuPHY's uint16_t nMaxOccaProc field.
+    gsl_Expects(std::in_range<uint16_t>(prachOccaStatVec.size()));
+    prach_params_static.nMaxOccaProc = static_cast<uint16_t>(prachOccaStatVec.size());
+    staged_.reset();
+}
+
+void PhyPrachAggr::discardStagedConfig()
+{
+    staged_.reset();
 }
 
 int PhyPrachAggr::createNewPhyObj() 
@@ -482,20 +587,20 @@ int PhyPrachAggr::setup(
     t_ns t2     = Time::nowNs();
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, pDynParams.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup, pDynParams.cuStream));
     }
     cuphyStatus_t status = cuphySetupPrachRx(handle, &pDynParams);
     if (status != CUPHY_STATUS_SUCCESS) {
         NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphySetupPrachRx returned error {}", cuphyGetErrorString(status));
         {
             MemtraceDisableScope md;
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, pDynParams.cuStream));
+            CUDA_DRIVER_CHECK(cuEventRecord(end_setup, pDynParams.cuStream));
         }
         return -1;
     }
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, pDynParams.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup, pDynParams.cuStream));
     }
 
     return 0;
@@ -513,7 +618,7 @@ int PhyPrachAggr::run()
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, pDynParams.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run, pDynParams.cuStream));
     }
     if((getSetupStatus() == CH_SETUP_DONE_NO_ERROR))
     {
@@ -526,7 +631,7 @@ int PhyPrachAggr::run()
     }
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, pDynParams.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, pDynParams.cuStream));
     }
     t_ns t3 = Time::nowNs();
 
@@ -536,7 +641,7 @@ int PhyPrachAggr::run()
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_copy, pDynParams.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_copy, pDynParams.cuStream));
     }
 
     // Perform the 4 D2H copies using batched async memcpy, if enabled.
@@ -570,7 +675,7 @@ int PhyPrachAggr::run()
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_copy, pDynParams.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_copy, pDynParams.cuStream));
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -578,7 +683,7 @@ int PhyPrachAggr::run()
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     // Better to comment out this memset when debugging received input
-    // CUDA_CHECK_PHYDRIVER(cudaMemsetAsync(prach_data_rx.addr(), 0, prach_data_rx.desc().get_size_in_bytes(), s_channel));
+    // CUDA_DRIVER_CHECK(cuMemsetD8Async(reinterpret_cast<CUdeviceptr>(prach_data_rx.addr()), 0, prach_data_rx.desc().get_size_in_bytes(), s_channel));
     return ret;
 }
 
@@ -587,26 +692,26 @@ uint32_t PhyPrachAggr::getCellStatVecSize()
     return prachCellStatVec.size();
 }
 
-int PhyPrachAggr::updateConfig(cell_id_t cell_id, cell_phy_info& cell_pinfo)
+int PhyPrachAggr::applyPrachUpdate(cell_id_t                              cell_id,
+                                   const cell_phy_info&                   cell_pinfo,
+                                   std::vector<cuphyPrachCellStatPrms_t>& cell_stat,
+                                   std::vector<cuphyPrachOccaStatPrms_t>& occa_stat,
+                                   std::optional<std::uint16_t>&          occa_start_idx)
 {
-
-    /*for(auto it = prachCellStatIndex.begin(); it != prachCellStatIndex.end(); it++)
-    {
-        NVLOGD_FMT(TAG,"prachCellStatIndex key {} T {}",it->first,it->second);
-    }*/
-
-    cell_id_t temp_cell_id = cell_id;
-    auto it = prachCellStatIndex.find(temp_cell_id);
+    auto it = prachCellStatIndex.find(cell_id);
     if(it == prachCellStatIndex.end())
     {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "cell_id {} not found in prachCellStatIndex", cell_id);
         return -1;
     }
+
+    // cuphyValidatePrachParams takes a non-const struct but only reads it; the
+    // const_casts adapt the const cell_pinfo to the read-only C API.
     cuphyPrachStatPrms_t const prach_stat_params{
         .pOutInfo = nullptr,
         .nMaxCells = 1,
-        .pCellPrms = &cell_pinfo.prachStatParams,
-        .pOccaPrms = cell_pinfo.prach_configs.data(),
+        .pCellPrms = const_cast<cuphyPrachCellStatPrms_t*>(&cell_pinfo.prachStatParams),
+        .pOccaPrms = const_cast<cuphyPrachOccaStatPrms_t*>(cell_pinfo.prach_configs.data()),
         .nMaxOccaProc = static_cast<uint16_t>(cell_pinfo.prach_configs.size()),
     };
     auto status = cuphyValidatePrachParams(&prach_stat_params);
@@ -614,75 +719,99 @@ int PhyPrachAggr::updateConfig(cell_id_t cell_id, cell_phy_info& cell_pinfo)
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "cuphyValidatePrachParams returned error {}", cuphyGetErrorString(status));
         return -1;
     }
-    uint32_t cellPrmStatIdx = it->second;
+    const uint32_t cellPrmStatIdx = it->second;
 
-    if(prachCellStatVec[cellPrmStatIdx].configurationIndex != cell_pinfo.prachStatParams.configurationIndex)
+    if(cell_stat[cellPrmStatIdx].configurationIndex != cell_pinfo.prachStatParams.configurationIndex)
     {
         NVLOGI_FMT(TAG,"Cell stat idx = {} changing PRACH configIdx from {} to {}",cellPrmStatIdx,
-            prachCellStatVec[cellPrmStatIdx].configurationIndex,cell_pinfo.prachStatParams.configurationIndex);
+            cell_stat[cellPrmStatIdx].configurationIndex,cell_pinfo.prachStatParams.configurationIndex);
 
-        prachCellStatVec[cellPrmStatIdx].configurationIndex = cell_pinfo.prachStatParams.configurationIndex;
+        cell_stat[cellPrmStatIdx].configurationIndex = cell_pinfo.prachStatParams.configurationIndex;
     }
 
-    if( prachCellStatVec[cellPrmStatIdx].restrictedSet != cell_pinfo.prachStatParams.restrictedSet)
+    if( cell_stat[cellPrmStatIdx].restrictedSet != cell_pinfo.prachStatParams.restrictedSet)
     {
         NVLOGI_FMT(TAG,"Cell stat idx = {} changing restrictedSet from {} to {}",cellPrmStatIdx,
-            prachCellStatVec[cellPrmStatIdx].restrictedSet, cell_pinfo.prachStatParams.restrictedSet);
+            cell_stat[cellPrmStatIdx].restrictedSet, cell_pinfo.prachStatParams.restrictedSet);
 
-        prachCellStatVec[cellPrmStatIdx].restrictedSet = cell_pinfo.prachStatParams.restrictedSet;
+        cell_stat[cellPrmStatIdx].restrictedSet = cell_pinfo.prachStatParams.restrictedSet;
     }
 
 
-    uint32_t occStartIdx = prachCellStatVec[cellPrmStatIdx].occaStartIdx;
-    if(prachCellStatVec[cellPrmStatIdx].nFdmOccasions >= cell_pinfo.prachStatParams.nFdmOccasions)
+    uint32_t occStartIdx = cell_stat[cellPrmStatIdx].occaStartIdx;
+    if(cell_stat[cellPrmStatIdx].nFdmOccasions >= cell_pinfo.prachStatParams.nFdmOccasions)
     {
         NVLOGI_FMT(TAG, "prach aggr : update config - nFdmOccasions in new config <= existing config : {}",
             cell_pinfo.prachStatParams.nFdmOccasions);
         for(uint32_t j = 0; j < cell_pinfo.prachStatParams.nFdmOccasions; j++)
         {
-            prachOccaStatVec[occStartIdx + j].prachRootSequenceIndex = cell_pinfo.prach_configs[j].prachRootSequenceIndex;
-            prachOccaStatVec[occStartIdx + j].prachZeroCorrConf = cell_pinfo.prach_configs[j].prachZeroCorrConf;
+            occa_stat[occStartIdx + j].prachRootSequenceIndex = cell_pinfo.prach_configs[j].prachRootSequenceIndex;
+            occa_stat[occStartIdx + j].prachZeroCorrConf = cell_pinfo.prach_configs[j].prachZeroCorrConf;
         }
-        for(uint32_t j = cell_pinfo.prachStatParams.nFdmOccasions; j < prachCellStatVec[cellPrmStatIdx].nFdmOccasions; j++)
-            prachOccaStatVec[occStartIdx + j].cellPrmStatIdx =
-            prachOccaStatVec[occStartIdx + j].prachRootSequenceIndex =
-            prachOccaStatVec[occStartIdx + j].prachZeroCorrConf = 0;
+        for(uint32_t j = cell_pinfo.prachStatParams.nFdmOccasions; j < cell_stat[cellPrmStatIdx].nFdmOccasions; j++)
+        {
+            occa_stat[occStartIdx + j].cellPrmStatIdx         = 0;
+            occa_stat[occStartIdx + j].prachRootSequenceIndex = 0;
+            occa_stat[occStartIdx + j].prachZeroCorrConf      = 0;
+        }
 
-        prach_occa_stat_params = cell_pinfo.prach_configs;
-        for(uint32_t j = 0; j < prach_occa_stat_params.size(); j++)
-            prach_occa_stat_params[j].cellPrmStatIdx = cellPrmStatIdx;
-
-        prachCellStatVec[cellPrmStatIdx].nFdmOccasions = cell_pinfo.prachStatParams.nFdmOccasions;
+        cell_stat[cellPrmStatIdx].nFdmOccasions = cell_pinfo.prachStatParams.nFdmOccasions;
     }
     else
     {
-        for(uint32_t j = occStartIdx; j < occStartIdx+prachCellStatVec[cellPrmStatIdx].nFdmOccasions; j++)
-            prachOccaStatVec[j].prachRootSequenceIndex = prachOccaStatVec[j].prachZeroCorrConf = 
-                prachOccaStatVec[j].cellPrmStatIdx = 0;
-
-        //prachOccaStatVec.erase(prachOccaStatVec.begin()+occStartIdx,prachOccaStatVec.begin()+occStartIdx+
-            //prachCellStatVec[cellPrmStatIdx].nFdmOccasions);
+        for(uint32_t j = occStartIdx; j < occStartIdx+cell_stat[cellPrmStatIdx].nFdmOccasions; j++)
+        {
+            occa_stat[j].prachRootSequenceIndex = 0;
+            occa_stat[j].prachZeroCorrConf      = 0;
+            occa_stat[j].cellPrmStatIdx         = 0;
+        }
 
         NVLOGI_FMT(TAG, "prach aggr: update config - zero out {} entries at {} for cell_id {}",
-            prachCellStatVec[cellPrmStatIdx].nFdmOccasions,occStartIdx,cell_id);
+            cell_stat[cellPrmStatIdx].nFdmOccasions,occStartIdx,cell_id);
 
-        prachCellStatVec[cellPrmStatIdx].occaStartIdx = prachOccaStatVec.size();
-        PhyDriverCtx * pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
-        Cell* cell_ptr = pdctx->getCellById(cell_id);
-        cell_ptr->setPrachOccaPrmStatIdx(prachOccaStatVec.size());
-        prachCellStatVec[cellPrmStatIdx].nFdmOccasions = cell_pinfo.prachStatParams.nFdmOccasions;
-        prach_occa_stat_params = cell_pinfo.prach_configs;
-        for(uint32_t j = 0; j < prach_occa_stat_params.size(); j++)
-            prach_occa_stat_params[j].cellPrmStatIdx = cellPrmStatIdx;
-        NVLOGI_FMT(TAG, "PhyPrachAggr::updateConfig : cell-id={} cellPrmStatIdx={} occaStartIdx={}",cell_id,cellPrmStatIdx,prachOccaStatVec.size());
-        prachOccaStatVec.insert(prachOccaStatVec.end(), prach_occa_stat_params.begin(), prach_occa_stat_params.end());
-        prach_params_static.pOccaPrms = static_cast<cuphyPrachOccaStatPrms_t*>(prachOccaStatVec.data());
-        prach_params_static.nMaxOccaProc = prachOccaStatVec.size();
+        cell_stat[cellPrmStatIdx].occaStartIdx = occa_stat.size();
+        // Defer the live Cell occasion-start-index commit to the caller (legacy
+        // commits immediately; offload commits at handover). Read the value back
+        // from the field just stored (uint8 -> uint16 widening, no narrowing here).
+        occa_start_idx = cell_stat[cellPrmStatIdx].occaStartIdx;
+        cell_stat[cellPrmStatIdx].nFdmOccasions = cell_pinfo.prachStatParams.nFdmOccasions;
+
+        // Append the new occasions in place (no temporary copy), then stamp the
+        // cell-stat index on the appended range.
+        const std::size_t appended_begin = occa_stat.size();
+        NVLOGI_FMT(TAG, "PhyPrachAggr::applyPrachUpdate : cell-id={} cellPrmStatIdx={} occaStartIdx={}",cell_id,cellPrmStatIdx,appended_begin);
+        occa_stat.insert(occa_stat.end(), cell_pinfo.prach_configs.begin(), cell_pinfo.prach_configs.end());
+        for(std::size_t j = appended_begin; j < occa_stat.size(); ++j)
+        {
+            occa_stat[j].cellPrmStatIdx = cellPrmStatIdx;
+        }
 
         NVLOGI_FMT(TAG, "prach aggr: update config - added {} occasions at {} for cell_id {}. size {}",
-            prachCellStatVec[cellPrmStatIdx].nFdmOccasions,
-            prachCellStatVec[cellPrmStatIdx].occaStartIdx,cell_id,
-            prachOccaStatVec.size());
+            cell_stat[cellPrmStatIdx].nFdmOccasions,
+            cell_stat[cellPrmStatIdx].occaStartIdx,cell_id,
+            occa_stat.size());
+    }
+    return 0;
+}
+
+int PhyPrachAggr::updateConfig(cell_id_t cell_id, cell_phy_info& cell_pinfo)
+{
+    std::optional<std::uint16_t> occa_start_idx;
+    if(applyPrachUpdate(cell_id, cell_pinfo, prachCellStatVec, prachOccaStatVec, occa_start_idx) != 0)
+    {
+        return -1;
+    }
+
+    // Live side effects for the grow (append) path only: commit the cell's new
+    // occasion start index and refresh the static-params pointer/count after the
+    // vector reallocated. The in-place path leaves both unchanged (legacy parity).
+    if(occa_start_idx)
+    {
+        PhyDriverCtx * pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+        Cell* cell_ptr = pdctx->getCellById(cell_id);
+        cell_ptr->setPrachOccaPrmStatIdx(*occa_start_idx);
+        prach_params_static.pOccaPrms = static_cast<cuphyPrachOccaStatPrms_t*>(prachOccaStatVec.data());
+        prach_params_static.nMaxOccaProc = prachOccaStatVec.size();
     }
     return 0;
 }
@@ -696,7 +825,7 @@ int PhyPrachAggr::wait(int wait_ns)
         return -1;
 
     while(ACCESS_ONCE(*((uint32_t*)prach_completed_h->addr())) == 0)
-    // while(cudaEventQuery(end_copy) != cudaSuccess)
+    // while(cuEventQuery(end_copy) != CUDA_SUCCESS)
     {
         if(Time::nowNs() - start_t > threshold_t)
         {
@@ -781,14 +910,14 @@ int PhyPrachAggr::validate()
         {
             NVLOGC_FMT(TAG, "SFN {}.{} Generating H5 Debug PRACH file {}", aggr_slot_params->si->sfn_, aggr_slot_params->si->slot_, std::to_string(id).c_str());
             auto& stream = s_channel;
-            cudaStreamSynchronize(stream);
+            CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
             cuphyStatus_t debugStatus = cuphyWriteDbgBufSynchPrach(handle, stream);
             if(debugStatus != CUPHY_STATUS_SUCCESS)
             {
                 NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphyWriteDbgBufSynchPrach returned error {}", debugStatus);
                 return -1;
             }
-            cudaStreamSynchronize(stream);
+            CUDA_DRIVER_CHECK(cuStreamSynchronize(stream));
             debugFileH.get()->close();
             debugFileH.reset();            
             EXIT_L1(EXIT_FAILURE);

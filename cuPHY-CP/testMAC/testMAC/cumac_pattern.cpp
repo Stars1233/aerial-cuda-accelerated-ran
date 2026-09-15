@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "hdf5hpp.hpp"
+#include "hdf5.h"
 #include "cuphy_hdf5.hpp"
 #include "nvlog.hpp"
 
@@ -27,6 +28,7 @@
 
 #include <chrono>
 #include <vector>
+#include <filesystem>
 
 #define TAG (NVLOG_TAG_BASE_TEST_MAC + 23) // "CUMAC.PATTERN"
 
@@ -43,6 +45,13 @@
 #define CONFIG_PHY_CELL_ID_BASE 40 // phyCellId = CONFIG_PHY_CELL_ID_BASE + cell_number
 
 #define CONFIG_CUMAC_TV_PATH "testVectors/cumac/"
+
+//! Use with snprintf and (SFN, per-frame slot) to generate per-slot TV filename.
+//! Multi-frame test patterns (schedule_slot_period spanning more than one
+//! radio frame) save TVs as muUePairTV_sfn<S>_slot<N>_cell<C>.h5 where N is
+//! the slot index within frame S, both derived from the period-relative
+//! slot_idx via slots_per_frame.
+#define CONFIG_MU_UE_PAIR_TV_FORMAT "muUePairTV_sfn%d_slot%d"
 
 #define H5_N_PDU "nPdu"
 #define H5_PDU "PDU"
@@ -177,7 +186,7 @@ static int h5dset_try_read_u32_to_bits(hdf5hpp::hdf5_file& file, const char* nam
             dest[j / 8] |= src[j] == 0 ? 0 : 1 << j % 8;
         }
     }
-    delete src;
+    delete[] src;
     return ret;
 }
 
@@ -200,7 +209,7 @@ static int h5dset_try_read_convert(hdf5hpp::hdf5_file& file, const char* name, T
             dst[i] = src[i];
         }
     }
-    delete src;
+    delete[] src;
     return ret;
 }
 
@@ -234,7 +243,7 @@ template <typename T>
 static T h5file_try_parse(const char* file_name, const char* dset_name, const char* var_name, T default_value, bool miss_warning = true, int dset_id = 0)
 {
     char h5path[MAX_PATH_LEN];
-    get_full_path_file(h5path, CONFIG_CUMAC_TV_PATH, file_name, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    get_cubb_full_path(h5path, CONFIG_CUMAC_TV_PATH, file_name);
     if(access(h5path, F_OK) != 0)
     {
         NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "H5 file {} not exist", h5path);
@@ -273,9 +282,44 @@ cumac_pattern::cumac_pattern(test_mac_configs* configs)
     slots_per_frame            = SLOTS_PER_FRAME;
     config_static_harq_proc_id = 0;
     negative_test              = 0;
-    prach_reconfig_flag        = 0;
     using_init_patterns        = false;
     cumac_configs              = configs->cumac_configs;
+}
+
+void cumac_pattern::free_test_vector(cumac_test_vector_t* tv)
+{
+    if (tv == nullptr)
+    {
+        return;
+    }
+
+    // Free the PFM sorting input buffer
+    if (tv->req.pfmCellInfo != nullptr)
+    {
+        delete tv->req.pfmCellInfo;
+        tv->req.pfmCellInfo = nullptr;
+    }
+    // Free the PFM sorting output buffer
+    if (tv->resp.pfmSortSol != nullptr)
+    {
+        delete tv->resp.pfmSortSol;
+        tv->resp.pfmSortSol = nullptr;
+    }
+
+    // Free the MU UE grouping request info buffer (allocated with new uint8_t[nbytes] in load_mu_ue_grp_tv)
+    if (tv->req.muUeGrpInfo != nullptr)
+    {
+        delete[] reinterpret_cast<uint8_t*>(tv->req.muUeGrpInfo);
+        tv->req.muUeGrpInfo = nullptr;
+    }
+    if (tv->resp.muUeGrpSol != nullptr)
+    {
+        delete tv->resp.muUeGrpSol;
+        tv->resp.muUeGrpSol = nullptr;
+    }
+
+    // Free the test vector buffer
+    delete tv;
 }
 
 cumac_pattern::~cumac_pattern()
@@ -290,7 +334,8 @@ cumac_pattern::~cumac_pattern()
                 {
                     if (req->tv_data != nullptr && yaml_configs->tv_data_map_enable == 0)
                     {
-                        delete req->tv_data;
+                        free_test_vector(req->tv_data);
+                        req->tv_data = nullptr;
                     }
                     delete req;
                 }
@@ -307,7 +352,8 @@ cumac_pattern::~cumac_pattern()
                 {
                     if (req->tv_data != nullptr && yaml_configs->tv_data_map_enable == 0)
                     {
-                        delete req->tv_data;
+                        free_test_vector(req->tv_data);
+                        req->tv_data = nullptr;
                     }
                     delete req;
                 }
@@ -320,6 +366,231 @@ cumac_pattern::~cumac_pattern()
     }
 }
 
+namespace {
+
+template <typename T>
+bool h5_read_attr_scalar(hid_t loc_id, const char* name, hid_t mem_type, T* out)
+{
+    if (H5Aexists(loc_id, name) <= 0)
+        return false;
+    hid_t a = H5Aopen(loc_id, name, H5P_DEFAULT);
+    if (a < 0)
+        return false;
+    herr_t st = H5Aread(a, mem_type, out);
+    H5Aclose(a);
+    return st >= 0;
+}
+
+} // namespace
+
+int cumac_pattern::probe_schedule_slot_period()
+{
+    namespace fs = std::filesystem;
+
+    char probe_path[MAX_PATH_LEN];
+    get_full_path_file(probe_path, CONFIG_CUMAC_TV_PATH, "probe", CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    const fs::path tv_dir = fs::path(probe_path).parent_path();
+
+    std::error_code ec;
+    if (!fs::is_directory(tv_dir, ec))
+    {
+        NVLOGI_FMT(TAG, "probe_schedule_slot_period: TV directory {} not present, using legacy slot-list sizing",
+                   tv_dir.string());
+        return 0;
+    }
+
+    const std::string tv_prefix = "muUePairTV_sfn";
+    const std::string cell0_sfx = "_cell0.h5";
+    for (const auto& entry : fs::directory_iterator(tv_dir, ec))
+    {
+        if (!entry.is_regular_file()) continue;
+        const std::string fname = entry.path().filename().string();
+        if (fname.rfind(tv_prefix, 0) != 0) continue;
+        if (fname.size() <= cell0_sfx.size()) continue;
+        if (fname.compare(fname.size() - cell0_sfx.size(), cell0_sfx.size(), cell0_sfx) != 0) continue;
+
+        try
+        {
+            hdf5hpp::hdf5_file probe = hdf5hpp::hdf5_file::open(entry.path().string().c_str());
+            int32_t period_attr = 0;
+            if (h5_read_attr_scalar(probe.id(), "schedule_slot_period", H5T_NATIVE_INT32, &period_attr) && period_attr > 0)
+            {
+                NVLOGC_FMT(TAG, "probe_schedule_slot_period: read period={} from {}", period_attr, fname);
+                return period_attr;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "probe_schedule_slot_period: failed to open {}: {}", fname, e.what());
+        }
+    }
+
+    NVLOGI_FMT(TAG, "probe_schedule_slot_period: no muUePairTV with schedule_slot_period attr in {}, falling back to legacy sizing",
+               tv_dir.string());
+    return 0;
+}
+
+int cumac_pattern::probe_first_ue_group_slot()
+{
+    namespace fs = std::filesystem;
+
+    char probe_path[MAX_PATH_LEN];
+    get_full_path_file(probe_path, CONFIG_CUMAC_TV_PATH, "probe", CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    const fs::path tv_dir = fs::path(probe_path).parent_path();
+
+    const std::string tv_prefix = "muUePairTV_sfn";
+    const std::string cell0_sfx = "_cell0.h5";
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(tv_dir, ec))
+    {
+        if (!entry.is_regular_file()) continue;
+        const std::string fname = entry.path().filename().string();
+        if (fname.rfind(tv_prefix, 0) != 0) continue;
+        if (fname.size() <= cell0_sfx.size()) continue;
+        if (fname.compare(fname.size() - cell0_sfx.size(), cell0_sfx.size(), cell0_sfx) != 0) continue;
+
+        int fsfn = 0, fslot = 0;
+        if (sscanf(fname.c_str() + tv_prefix.size(), "%d_slot%d_cell0", &fsfn, &fslot) != 2) continue;
+
+        try
+        {
+            hdf5hpp::hdf5_file probe = hdf5hpp::hdf5_file::open(entry.path().string().c_str());
+            uint8_t first_slot_attr = 0;
+            if (h5_read_attr_scalar(probe.id(), "first_slot", H5T_NATIVE_UINT8, &first_slot_attr)
+                && first_slot_attr != 0)
+            {
+                const int tv_slot_id = (fsfn * SLOTS_PER_FRAME + fslot + cumac_configs->srs_slot_lag) % sched_slot_num;
+                NVLOGC_FMT(TAG, "{}: srs_slot_lag={} first_slot at SFN {}.{} -> tv_slot_idx={}",
+                           __func__, cumac_configs->srs_slot_lag, fsfn, fslot, tv_slot_id);
+                return tv_slot_id;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            NVLOGW_FMT(TAG, "{}: failed to open {}: {}", __func__, fname, e.what());
+        }
+    }
+
+    NVLOGI_FMT(TAG, "{}: no muUePairTV with first_slot attr in {}", __func__, tv_dir.string());
+    return -1;
+}
+
+int cumac_pattern::load_mu_ue_grp_tv(cumac_req_t* req)
+{
+    if (req == nullptr || req->tv_data == nullptr)
+        return -1;
+
+    cumac_tti_req_tv_t& tv = req->tv_data->req;
+    cumac_tti_resp_tv_t& tv_resp = req->tv_data->resp;
+
+    tv.muUeGrpInfo = nullptr;
+    tv.muUeGrpReqDataLen = 0;
+    tv.muUeGrpIsMemSharing = false;
+    tv_resp.muUeGrpSol = nullptr;
+
+    const int cell_id = req->cell_idx;
+    const int slot_id = req->slot_idx;
+
+    // Derive SFN/SLOT from slot_id, applying srs_slot_lag offset with wrap-around.
+    // Reduce srs_slot_lag mod sched_slot_num first so the intermediate value is always positive.
+    const int tv_slot_id = (sched_slot_num > 0)
+        ? (slot_id + sched_slot_num - cumac_configs->srs_slot_lag % sched_slot_num) % sched_slot_num
+        : slot_id;
+
+    const int sfn  = slot_id / SLOTS_PER_FRAME;
+    const int slot = slot_id % SLOTS_PER_FRAME;
+
+    const int tv_sfn  = tv_slot_id / SLOTS_PER_FRAME;
+    const int tv_slot = tv_slot_id % SLOTS_PER_FRAME;
+
+    char tv_base[128];
+    snprintf(tv_base, sizeof(tv_base), CONFIG_MU_UE_PAIR_TV_FORMAT, tv_sfn, tv_slot);
+
+    char cell_fname[MAX_PATH_LEN];
+    snprintf(cell_fname, sizeof(cell_fname), "%s_cell%d.h5", tv_base, cell_id);
+    char full_cell[MAX_PATH_LEN];
+    get_cubb_full_path(full_cell, CONFIG_CUMAC_TV_PATH, cell_fname);
+    if (access(full_cell, F_OK) != 0)
+    {
+        // Missing per-slot TV is expected when only some slots are scheduled
+        // (see schedule_slot_period). Caller clears MU_UE_GRP bit in the
+        // per-slot taskBitMask so cuMAC-CP knows to skip that slot.
+        req->tv_data->req.taskBitMask &= ~static_cast<uint32_t>(0x1 << CUMAC_TASK_MU_UE_GRP);
+        NVLOGI_FMT(TAG, "SFN {}.{} UE_PAIR_TV cell_id={} slot_idx={} tv_slot_idx={} srs_slot_lag={} {} not found",
+            sfn, slot, cell_id, slot_id, tv_slot_id, cumac_configs->srs_slot_lag, tv_base);
+        return 0;
+    }
+
+    try
+    {
+        hdf5hpp::hdf5_file cell_file = hdf5hpp::hdf5_file::open(full_cell);
+        hid_t fid = cell_file.id();
+
+        uint8_t mem_sharing_u8 = 0;
+        h5_read_attr_scalar(fid, "is_mem_sharing", H5T_NATIVE_UINT8, &mem_sharing_u8);
+        tv.muUeGrpIsMemSharing = (mem_sharing_u8 != 0);
+        tv.muUeGrpReqDataLen = cumac_muUeGrp_req_info_size(tv.muUeGrpIsMemSharing);
+
+        hdf5hpp::hdf5_dataset ds_in = cell_file.open_dataset("task_in_buf");
+        const size_t nbytes = ds_in.get_buffer_size_bytes();
+        if (nbytes != tv.muUeGrpReqDataLen)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "MU UE pair TV: cell_id={} task_in_buf size {} != expected {}", cell_id, nbytes, cumac_muUeGrp_req_info_size(tv.muUeGrpIsMemSharing));
+            return -1;
+        }
+
+        // Allocate memory for the MU UE grouping request info structure and read the data from the H5 file.
+        tv.muUeGrpInfo = reinterpret_cast<cumac_muUeGrp_req_info_t*>(new uint8_t[nbytes]);
+        ds_in.read(tv.muUeGrpInfo);
+
+         // Set the 3 pointers in to nullptr because it doesn't make sence in commnunication between 2 processes.
+        cumac_muUeGrp_req_info_t* req_info = reinterpret_cast<cumac_muUeGrp_req_info_t*>(tv.muUeGrpInfo);
+        req_info->srsInfo = nullptr;
+        req_info->srsInfoMsh = nullptr;
+        req_info->ueInfo = nullptr;
+
+        // Load the MU UE grouping response TV file.
+        char sol_fname[MAX_PATH_LEN];
+        snprintf(sol_fname, sizeof(sol_fname), "%s_solution.h5", tv_base);
+        char full_sol[MAX_PATH_LEN];
+        get_cubb_full_path(full_sol, CONFIG_CUMAC_TV_PATH, sol_fname);
+        if (access(full_sol, F_OK) != 0)
+        {
+            NVLOGW_FMT(TAG, "MU UE pair solution TV not found: {}, expected output validation disabled", full_sol);
+            NVLOGI_FMT(TAG, "Loaded MU UE pair request TV: cell_id={} bytes={} mem_sharing={}", cell_id, tv.muUeGrpReqDataLen,
+                       tv.muUeGrpIsMemSharing ? 1 : 0);
+            return 0;
+        }
+
+        hdf5hpp::hdf5_file sol_file = hdf5hpp::hdf5_file::open(full_sol);
+        hdf5hpp::hdf5_dataset ds_sol = sol_file.open_dataset("solution");
+        const size_t sol_bytes = ds_sol.get_buffer_size_bytes();
+        const size_t sol_size_per_cell = sizeof(cumac_muUeGrp_resp_info_t);
+
+        if (sol_bytes != sol_size_per_cell * cell_num)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "MU UE pair solution size {} != expected {} * {}", sol_bytes, sol_size_per_cell, cell_num);
+            return -1;
+        }
+
+        // Allocate memory for the whole cell group
+        cumac_muUeGrp_resp_info_t* total_buffer = new cumac_muUeGrp_resp_info_t[cell_num];
+        ds_sol.read(total_buffer);
+        tv_resp.muUeGrpSol = new cumac_muUeGrp_resp_info_t;
+        std::memcpy(tv_resp.muUeGrpSol, total_buffer + cell_id, sol_size_per_cell);
+        delete[] total_buffer;
+
+        NVLOGI_FMT(TAG, "SFN {}.{} UE_PAIR_TV cell_id={} slot_idx={} srs_slot_lag={} loaded {}: num_srs_info={} mem_sharing={} req_size={} sol_size={}",
+            sfn, slot, cell_id, slot_id, cumac_configs->srs_slot_lag, tv_base, tv.muUeGrpInfo->numSrsInfo, tv.muUeGrpIsMemSharing, tv.muUeGrpReqDataLen, sol_size_per_cell);
+        return 0;
+    }
+    catch (const std::exception& e)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "load_mu_ue_grp_tv cell_id={}: {}", cell_id, e.what());
+        return -1;
+    }
+}
+
 /**
  * Load PFM sorting test vector data from separate H5 file
  *
@@ -328,6 +599,11 @@ cumac_pattern::~cumac_pattern()
  */
 int cumac_pattern::load_pfm_sorting_tv(cumac_req_t* req)
 {
+    if (req == nullptr || req->tv_data == nullptr)
+    {
+        return -1;
+    }
+
     cumac_tti_req_tv_t& tv = req->tv_data->req;
     cumac_tti_resp_tv_t& tv_resp = req->tv_data->resp;
     int cell_id = req->cell_idx;
@@ -340,14 +616,12 @@ int cumac_pattern::load_pfm_sorting_tv(cumac_req_t* req)
     char pfm_tv_filename[MAX_PATH_LEN];
     snprintf(pfm_tv_filename, MAX_PATH_LEN, "PFM_SORT_TV_%dCELLS_SLOT_%d.h5", cell_num, tv_id);
     char pfm_file_path[MAX_PATH_LEN];
-    get_full_path_file(pfm_file_path, CONFIG_CUMAC_TV_PATH, pfm_tv_filename, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    get_cubb_full_path(pfm_file_path, CONFIG_CUMAC_TV_PATH, pfm_tv_filename);
 
     // Check if file exists
     if(access(pfm_file_path, F_OK) != 0)
     {
-        NVLOGW_FMT(TAG, "PFM TV file not found: {}, skipping PFM data loading", pfm_file_path);
-        tv.pfmCellInfo = nullptr;
-        tv_resp.pfmSortSol = nullptr;
+        NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "PFM TV file not found: {}", pfm_file_path);
         return -1;
     }
 
@@ -457,20 +731,28 @@ int cumac_pattern::load_pfm_sorting_tv(cumac_req_t* req)
     }
 }
 
-int cumac_pattern::parse_tv_file(cumac_req_t* req)
+int cumac_pattern::load_4t4r_tv(cumac_req_t* req)
 {
-    if(req == nullptr || req->tv_file.length() == 0)
+    if (req == nullptr || req->tv_data == nullptr)
     {
         return -1;
     }
 
+    if(req->tv_file.length() == 0)
+    {
+        NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "TV file is not set for cell {} slot {} ", req->cell_idx, req->slot_idx);
+        return -1;
+    }
+
+    cumac_tti_req_tv_t&   tv       = req->tv_data->req;
+    cumac_cell_configs_t& cell_cfg = get_cumac_cell_configs(req->cell_idx);
+
     char file_path[MAX_PATH_LEN];
-    get_full_path_file(file_path, CONFIG_CUMAC_TV_PATH, req->tv_file.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    get_cubb_full_path(file_path, CONFIG_CUMAC_TV_PATH, req->tv_file.c_str());
     if(access(file_path, F_OK) != 0)
     {
         NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "TV cell {} slot {} {} {} file not exist: {}",
                 curr_cell, curr_slot, get_task_name(curr_task), curr_tv.c_str(), file_path);
-        delete req;
         return -1;
     }
 
@@ -481,24 +763,13 @@ int cumac_pattern::parse_tv_file(cumac_req_t* req)
     }
     catch(std::exception& e)
     {
-        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "TV cell {} slot {} {} {} hdf5_file::open failed",
+        NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "TV cell {} slot {} {} {} hdf5_file::open failed",
                 curr_cell, curr_slot, get_task_name(curr_task), curr_tv.c_str());
-        delete req;
         return -1;
     }
 
     try
     {
-        if(req == nullptr)
-        {
-            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "TV cell {} slot {} {} {} channel not supported", curr_cell, curr_slot, get_task_name(curr_task), curr_tv.c_str());
-            return -1;
-        }
-
-        req->tv_data                   = new cumac_test_vector_t;
-        cumac_tti_req_tv_t&   tv       = req->tv_data->req;
-        cumac_cell_configs_t& cell_cfg = get_cumac_cell_configs(req->cell_idx);
-
         h5dset_try_read(hdf5file, "cellID", &tv.cellID, sizeof(tv.cellID));
         h5dset_try_read(hdf5file, "ULDLSch", &tv.ULDLSch, sizeof(tv.ULDLSch));
         h5dset_try_read(hdf5file, "nActiveUe", &tv.nActiveUe, sizeof(tv.nActiveUe));
@@ -523,45 +794,95 @@ int cumac_pattern::parse_tv_file(cumac_req_t* req)
         }
         hLen = tv.nPrbGrp * cell_cfg.nMaxSchUePerCell * cell_cfg.nMaxCell * tv.nBsAnt * tv.nUeAnt;
 
-        h5dset_try_read_array(hdf5file, "CRNTI", &tv.CRNTI, tv.nActiveUe);                                    // Dataset {100}
-        h5dset_try_read_array(hdf5file, "srsCRNTI", &tv.srsCRNTI, cell_cfg.nMaxSchUePerCell);                 // Dataset {6}
-        h5dset_try_read_array(hdf5file, "prgMsk", &tv.prgMsk, tv.nPrbGrp);                                    // Dataset {68}
-        h5dset_try_read_array(hdf5file, "postEqSinr", &tv.postEqSinr, tv.nActiveUe * tv.nPrbGrp * tv.nUeAnt); // Dataset {27200}
-        h5dset_try_read_array(hdf5file, "wbSinr", &tv.wbSinr, tv.nActiveUe * tv.nUeAnt);                      // Dataset {400}
+        if ((cumac_configs->task_bitmask & TESTMAC_CUMAC_TASK_MASK_4T4R) != 0U)
+        {
+            h5dset_try_read_array(hdf5file, "CRNTI", &tv.CRNTI, tv.nActiveUe);                                    // Dataset {100}
+            h5dset_try_read_array(hdf5file, "srsCRNTI", &tv.srsCRNTI, cell_cfg.nMaxSchUePerCell);                 // Dataset {6}
+            h5dset_try_read_array(hdf5file, "prgMsk", &tv.prgMsk, tv.nPrbGrp);                                    // Dataset {68}
+            h5dset_try_read_array(hdf5file, "postEqSinr", &tv.postEqSinr, tv.nActiveUe * tv.nPrbGrp * tv.nUeAnt); // Dataset {27200}
+            h5dset_try_read_array(hdf5file, "wbSinr", &tv.wbSinr, tv.nActiveUe * tv.nUeAnt);                      // Dataset {400}
 
-        h5dset_try_read_complex(hdf5file, "detMat_real", "detMat_imag", &tv.detMat, detLen);  // Dataset {6528}
-        h5dset_try_read_complex(hdf5file, "estH_fr_real", "estH_fr_imag", &tv.estH_fr, hLen); // Dataset {52224}
-        h5dset_try_read_complex(hdf5file, "prdMat_real", "prdMat_imag", &tv.prdMat, prdLen);  // Dataset {6528}
+            h5dset_try_read_complex(hdf5file, "detMat_real", "detMat_imag", &tv.detMat, detLen);  // Dataset {6528}
+            h5dset_try_read_complex(hdf5file, "estH_fr_real", "estH_fr_imag", &tv.estH_fr, hLen); // Dataset {52224}
+            h5dset_try_read_complex(hdf5file, "prdMat_real", "prdMat_imag", &tv.prdMat, prdLen);  // Dataset {6528}
 
-        h5dset_try_read_array(hdf5file, "sinVal", &tv.sinVal, cell_cfg.nMaxSchUePerCell * tv.nPrbGrp * tv.nUeAnt); // Dataset {1632}
-        h5dset_try_read_array(hdf5file, "avgRatesActUe", &tv.avgRatesActUe, tv.nActiveUe);                         // Dataset {100}
+            h5dset_try_read_array(hdf5file, "sinVal", &tv.sinVal, cell_cfg.nMaxSchUePerCell * tv.nPrbGrp * tv.nUeAnt); // Dataset {1632}
+            h5dset_try_read_array(hdf5file, "avgRatesActUe", &tv.avgRatesActUe, tv.nActiveUe);                         // Dataset {100}
 
-        h5dset_try_read_array(hdf5file, "tbErrLastActUe", &tv.tbErrLastActUe, tv.nActiveUe); // Dataset {100}
+            h5dset_try_read_array(hdf5file, "tbErrLastActUe", &tv.tbErrLastActUe, tv.nActiveUe); // Dataset {100}
 
-        // Parse TV RESPONSE
-        cumac_tti_resp_tv_t& tv_resp = req->tv_data->resp;
-        h5dset_try_read_array(hdf5file, "setSchdUePerCellTTI_resp", &tv_resp.setSchdUePerCellTTI, cell_cfg.nMaxSchUePerCell); // Dataset {6}
-        h5dset_try_read_array(hdf5file, "mcsSelSol_resp", &tv_resp.mcsSelSol, cell_cfg.nMaxSchUePerCell); // Dataset {6}
-        h5dset_try_read_array(hdf5file, "layerSelSol_resp", &tv_resp.layerSelSol, cell_cfg.nMaxSchUePerCell); // Dataset {6}
+            // Parse TV RESPONSE
+            cumac_tti_resp_tv_t& tv_resp = req->tv_data->resp;
+            h5dset_try_read_array(hdf5file, "setSchdUePerCellTTI_resp", &tv_resp.setSchdUePerCellTTI, cell_cfg.nMaxSchUePerCell); // Dataset {6}
+            h5dset_try_read_array(hdf5file, "mcsSelSol_resp", &tv_resp.mcsSelSol, cell_cfg.nMaxSchUePerCell); // Dataset {6}
+            h5dset_try_read_array(hdf5file, "layerSelSol_resp", &tv_resp.layerSelSol, cell_cfg.nMaxSchUePerCell); // Dataset {6}
 
-        uint32_t allocSol_num = cell_cfg.allocType == 0 ? tv.nPrbGrp : 2 * cell_cfg.nMaxSchUePerCell;
-        h5dset_try_read_array(hdf5file, "allocSol_resp", &tv_resp.allocSol, allocSol_num); // Dataset {12}
+            uint32_t allocSol_num = cell_cfg.allocType == 0 ? tv.nPrbGrp : 2 * cell_cfg.nMaxSchUePerCell;
+            h5dset_try_read_array(hdf5file, "allocSol_resp", &tv_resp.allocSol, allocSol_num); // Dataset {12}
+        }
     }
     catch(std::exception& e)
     {
         if(req->tv_data != nullptr)
         {
-            delete req->tv_data;
+            free_test_vector(req->tv_data);
             req->tv_data = nullptr;
         }
         NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "TV cell {} slot {} {} {} exception: {}", curr_cell, curr_slot, get_task_name(curr_task), curr_tv.c_str(), e.what());
         return -1;
     }
 
-    // Load PFM sorting data from separate H5 file if available
-    if(req->tv_data != nullptr)
+    return 0;
+}
+
+int cumac_pattern::parse_tv_file(cumac_req_t* req)
+{
+    if(req == nullptr || req->tv_file.length() == 0)
     {
-        load_pfm_sorting_tv(req);
+        return -1;
+    }
+
+    // operator new throws on failure; no nullptr check needed.
+    req->tv_data = new cumac_test_vector_t;
+
+    // Initialize the test vector data
+    memset(req->tv_data, 0, sizeof(cumac_test_vector_t));
+    req->tv_data->req.taskBitMask = static_cast<uint32_t>(cumac_configs->task_bitmask);
+
+    // Load 4T4R TV data if enabled
+    if (cumac_configs->task_bitmask & TESTMAC_CUMAC_TASK_MASK_4T4R)
+    {
+        if (load_4t4r_tv(req) != 0)
+        {
+            free_test_vector(req->tv_data);
+            req->tv_data = nullptr;
+            delete req;
+            return -1;
+        }
+    }
+
+    // Load PFM sorting data from separate H5 file if enabled
+    if(req->tv_data != nullptr && (cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_PFM_SORT)))
+    {
+        if (load_pfm_sorting_tv(req) != 0)
+        {
+            free_test_vector(req->tv_data);
+            req->tv_data = nullptr;
+            delete req;
+            return -1;
+        }
+    }
+
+    // Load MU UE pairing / muUeGrp TV (per-cell + solution) when task enabled
+    if (req->tv_data != nullptr && (cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_MU_UE_GRP)))
+    {
+        if (load_mu_ue_grp_tv(req) != 0)
+        {
+            free_test_vector(req->tv_data);
+            req->tv_data = nullptr;
+            delete req;
+            return -1;
+        }
     }
 
     return 0;
@@ -571,7 +892,7 @@ int cumac_pattern::load_h5_config_params(int cell_id, const char* config_params_
 {
     char h5path[MAX_PATH_LEN];
     NVLOGC_FMT(TAG, "config params {} {:p}", config_params_h5_file, (void*)config_params_h5_file);
-    get_full_path_file(h5path, CONFIG_CUMAC_TV_PATH, config_params_h5_file, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    get_cubb_full_path(h5path, CONFIG_CUMAC_TV_PATH, config_params_h5_file);
     if(access(h5path, F_OK) != 0)
     {
 
@@ -601,6 +922,9 @@ int cumac_pattern::load_h5_config_params(int cell_id, const char* config_params_
         NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Failed to allocate memory for cfgs");
         return -1;
     }
+
+    // Per-slot taskBitMask to be enabled in cuMAC-CP
+    cfgs->moduleBitMask = static_cast<uint32_t>(cumac_configs->task_bitmask);
 
     h5dset_try_read(hdf5file, "nMaxCell", &cfgs->nMaxCell, sizeof(cfgs->nMaxCell));
     h5dset_try_read(hdf5file, "nMaxActUePerCell", &cfgs->nMaxActUePerCell, sizeof(cfgs->nMaxActUePerCell));
@@ -670,6 +994,7 @@ struct parsing_thread_arg_t {
     int thread_num;
     int cell_num;
     int cpu_core;
+    int schedule_slot_period;
 
     std::vector<int32_t>* p_lp_cell_id_vec;
 
@@ -685,6 +1010,7 @@ static void* parsing_thread_func(void* arg)
     cumac_pattern* lp = slot_parsing->lp;
     yaml::node& slot_list = *(slot_parsing->yaml_node);
     cumac_slot_pattern_t& slots_data = *(slot_parsing->slot_data);
+    size_t pattern_length = slot_list.length();
 
     char thread_name[32];
     snprintf(thread_name, 32, "cumac_lp_%02d", slot_parsing->thread_id);
@@ -694,9 +1020,10 @@ static void* parsing_thread_func(void* arg)
     }
 
     nv_assign_thread_cpu_core(slot_parsing->cpu_core);
-    NVLOGC_FMT(TAG, "{}: thread {:02d} started on CPU core {:02d}", __FUNCTION__, slot_parsing->thread_id, slot_parsing->cpu_core);
+    NVLOGC_FMT(TAG, "{}: thread {:02d} started on CPU core {:02d} pattern_length={} schedule_period={}",
+        __FUNCTION__, slot_parsing->thread_id, slot_parsing->cpu_core, pattern_length, slot_parsing->schedule_slot_period);
 
-    for(size_t id = 0; id < slot_list.length(); ++id)
+    for(size_t id = 0; id < slot_parsing->schedule_slot_period; ++id)
     {
         if(is_app_exiting())
         {
@@ -704,9 +1031,9 @@ static void* parsing_thread_func(void* arg)
             break;
         }
 
-        int slot_id = slot_list[id]["slot"].as<int>();
+        int slot_id = id;
         curr_slot = slot_id;
-        yaml::node cumac_cell_configs = slot_list[id]["config"];
+        yaml::node cumac_cell_configs = slot_list[id % pattern_length]["config"];
         if(cumac_cell_configs.type() == YAML_SEQUENCE_NODE)
         {
             for (int cell_id = slot_parsing->thread_id; cell_id < slot_parsing->cell_num; cell_id += slot_parsing->thread_num)
@@ -718,7 +1045,8 @@ static void* parsing_thread_func(void* arg)
                     ss << __FUNCTION__ << " error: slot=" << slot_id << " lp_cell_id=" << lp_cell_id[cell_id] << std::endl;
                     throw std::runtime_error(ss.str().c_str());
                 }
-                NVLOGC_FMT(TAG, "{}: thread [{}] parsed TVs for cell {:02d} slot {:02d}/{}", __FUNCTION__, slot_parsing->thread_id, cell_id, slot_id, slot_list.length());
+                NVLOGC_FMT(TAG, "{}: thread [{}] parsed TVs for cell {:02d} slot {:02d}/{}",
+                    __FUNCTION__, slot_parsing->thread_id, cell_id, id, slot_parsing->schedule_slot_period);
             }
         }
     }
@@ -728,14 +1056,11 @@ static void* parsing_thread_func(void* arg)
 
 void cumac_pattern::parse_slots(yaml::node& slot_list, cumac_slot_pattern_t& slots_data)
 {
-    if (prach_reconfig_flag != 0)
+    if (sched_slot_num == 0)
     {
-        slots_data.resize(sched_slots_pattern.size());
+        sched_slot_num = slot_list.length();
     }
-    else
-    {
-        slots_data.resize(slot_list.length());
-    }
+    slots_data.resize(static_cast<size_t>(sched_slot_num));
 
     for(int slot_id = 0; slot_id < slots_data.size(); slot_id++)
     {
@@ -759,6 +1084,7 @@ void cumac_pattern::parse_slots(yaml::node& slot_list, cumac_slot_pattern_t& slo
         thread_arg.thread_num = thread_num;
         thread_arg.cell_num = cell_num;
         thread_arg.cpu_core = cumac_configs->get_recv_thread_config().cpu_affinity;
+        thread_arg.schedule_slot_period = sched_slot_num;
         thread_arg.p_lp_cell_id_vec = &lp_cell_id_vec;
 
         if(pthread_create(&thread_arg.pid, NULL, parsing_thread_func, &thread_arg) != 0)
@@ -782,13 +1108,13 @@ int cumac_pattern::cumac_pattern_parsing(const char* lp_file_name, uint32_t ch_m
     channel_mask = ch_mask;
 
     char pattern_file[MAX_PATH_LEN];
-    get_full_path_file(pattern_file, CONFIG_LAUNCH_PATTERN_PATH, lp_file_name, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    get_cubb_full_path(pattern_file, CONFIG_LAUNCH_PATTERN_PATH, lp_file_name);
     if(access(pattern_file, F_OK) != 0)
     {
         if(cumac_configs->cumac_cell_num > 0)
         {
             // Debug with cumac_pattern_default.yaml
-            get_full_path_file(pattern_file, CONFIG_LAUNCH_PATTERN_PATH, "cumac_pattern_default.yaml", CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+            get_cubb_full_path(pattern_file, CONFIG_LAUNCH_PATTERN_PATH, "cumac_pattern_default.yaml");
             if(access(pattern_file, F_OK) != 0)
             {
                 NVLOGF_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "YAML file not exist: {}", pattern_file);
@@ -842,6 +1168,22 @@ int cumac_pattern::cumac_pattern_parsing(const char* lp_file_name, uint32_t ch_m
     }
 
     cumac_cell_configs_v.resize(cell_num);
+    auto allocate_default_cell_configs = [&]() -> int {
+        for(int cell_id = 0; cell_id < cell_num; cell_id++)
+        {
+            cumac_cell_configs_t* cfgs = static_cast<cumac_cell_configs_t*>(calloc(1, sizeof(cumac_cell_configs_t)));
+            if (cfgs == nullptr)
+            {
+                NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "{}: failed to allocate default cell config for cell {}", __FUNCTION__, cell_id);
+                return -1;
+            }
+            cfgs->moduleBitMask = static_cast<uint32_t>(cumac_configs->task_bitmask);
+            cfgs->nMaxCell = static_cast<uint8_t>(cell_num);
+            cumac_cell_configs_v[cell_id] = cfgs;
+        }
+        return 0;
+    };
+
     if(pattern.has_key("Cell_Configs"))
     {
         // Load from list
@@ -853,43 +1195,62 @@ int cumac_pattern::cumac_pattern_parsing(const char* lp_file_name, uint32_t ch_m
         NVLOGC_FMT(TAG, "{}: config_list={} cell_mask={} cell_num={} lp_cell_id.size={}",
                 __FUNCTION__, cumac_cell_configs_list.length(), cell_mask, cell_num, lp_cell_id_vec.size());
 
-        for(int cell_id = 0; cell_id < cell_num; cell_id++)
+        if ((cumac_configs->task_bitmask & TESTMAC_CUMAC_TASK_MASK_4T4R) != 0U)
         {
-            int32_t lp_cell_id = lp_cell_id_vec[cell_id];
-            std::string config_tv = cumac_cell_configs_list[lp_cell_id].as<std::string>();
-            if(load_h5_config_params(cell_id, config_tv.c_str()) < 0)
+            for(int cell_id = 0; cell_id < cell_num; cell_id++)
+            {
+                int32_t lp_cell_id = lp_cell_id_vec[cell_id];
+                std::string config_tv = cumac_cell_configs_list[lp_cell_id].as<std::string>();
+                if(load_h5_config_params(cell_id, config_tv.c_str()) < 0)
+                {
+                    return -1;
+                }
+            }
+        }
+        else
+        {
+            // No 4T4R tasks: allocate default cell configs so pointers are valid
+            if (allocate_default_cell_configs() < 0)
             {
                 return -1;
             }
         }
     }
-
-    // Expand expected throughput array size
-    expected.resize(cell_num);
-
-    if(yaml_configs->app_mode == 0 && pattern.has_key("INIT"))
+    else if ((cumac_configs->task_bitmask & TESTMAC_CUMAC_TASK_MASK_4T4R) == 0U)
     {
-        yaml::node slot_list = pattern["INIT"];
-        init_slot_num        = slot_list.length();
-        parse_slots(slot_list, init_slots_pattern);
-        using_init_patterns = init_slot_num > 0 ? true : false;
-        NVLOGC_FMT(TAG, "{}: parsed INIT slots: cell_num={} init_slot_num={}", __FUNCTION__, cell_num, init_slot_num);
+        // No Cell_Configs key and no 4T4R tasks: still need valid pointers
+        if (allocate_default_cell_configs() < 0)
+        {
+            return -1;
+        }
     }
 
+    // Expand expected throughput array size and initialize to 0
+    expected.resize(cell_num);
     for(int i = 0; i < cell_num; i++)
     {
-        memset(&expected[i], 0, sizeof(cumac_thrput_t));
+        expected[i].reset();
+    }
+
+    // Probe the schedule_slot_period attribute from the muUePairTV files
+    if (cumac_configs->task_bitmask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        sched_slot_num = probe_schedule_slot_period();
+        if (sched_slot_num > 0)
+        {
+            first_ue_group_slot = probe_first_ue_group_slot();
+        }
     }
 
     if(yaml_configs->app_mode == 0 && pattern.has_key("SCHED"))
     {
         int64_t ts_start = system_clock::now().time_since_epoch().count();
         yaml::node slot_list = pattern["SCHED"];
-        sched_slot_num       = slot_list.length();
         parse_slots(slot_list, sched_slots_pattern);
         int64_t ts_end = system_clock::now().time_since_epoch().count();
         float time_cost = (float)(ts_end - ts_start) / 1E9;
-        NVLOGC_FMT(TAG, "{}: parsed SCHED slots: cell_num={} sched_slot_num={} time={:.1f}s", __FUNCTION__, cell_num, sched_slot_num, time_cost);
+        NVLOGC_FMT(TAG, "{}: parsed SCHED slots: cell_num={} sched_slot_num={} taskBitMask=0x{:02X} srs_slot_lag={} first_ue_group_slot={} time={:.1f}s",
+            __FUNCTION__, cell_num, sched_slot_num, cumac_configs->task_bitmask, cumac_configs->srs_slot_lag, first_ue_group_slot, time_cost);
     }
 
     if (sched_slot_num <= 0)
@@ -897,51 +1258,46 @@ int cumac_pattern::cumac_pattern_parsing(const char* lp_file_name, uint32_t ch_m
         return -1;
     }
 
+    // Update expected throughput values to per second total values
     for(int i = 0; i < cell_num; i++)
     {
-        int schedule_per_second = SLOTS_PER_SECOND / sched_slot_num;
-
-        if (expected[i].error > 0) {
-            expected[i].error = expected[i].error * schedule_per_second;
-        } else {
-            expected[i].error = 0;
+        int repeat_per_second = SLOTS_PER_SECOND / sched_slot_num;
+        cumac_thrput_t& thrput = expected[i];
+    
+        thrput.error = thrput.error * repeat_per_second;
+        thrput.cumac_slots = thrput.cumac_slots * repeat_per_second;
+        thrput.invalid = thrput.invalid * repeat_per_second;
+        for (int task = 0; task < CUMAC_TASK_TOTAL_NUM; task++) {
+            thrput.task_slots[task] = thrput.task_slots[task] * repeat_per_second;
         }
-
-        expected[i].cumac_slots = SLOTS_PER_SECOND;
-        expected[i].invalid = expected[i].invalid * schedule_per_second;
 
         // Set expected task slots based on task_bitmask
         const int task_bitmask = cumac_configs->task_bitmask;
-        for (int task = 0; task < CUMAC_TASK_TOTAL_NUM; task++) {
-            if (task_bitmask & (0x1 << task)) {
-                expected[i].task_slots[task] = SLOTS_PER_SECOND;
-            } else {
-                expected[i].task_slots[task] = 0;
-            }
-        }
-
         std::string exp_data = "CUMAC_TargetThrput: Cell=" + std::to_string(i);
-        exp_data.append(" CUMAC_SLOT=").append(std::to_string(expected[i].cumac_slots));
+        exp_data.append(" CUMAC_SLOT=").append(std::to_string(thrput.cumac_slots));
 
         // Add expected task slots for enabled tasks
         if (task_bitmask & (0x1 << CUMAC_TASK_UE_SELECTION)) {
-            exp_data.append(" UE_SEL=").append(std::to_string(expected[i].task_slots[CUMAC_TASK_UE_SELECTION]));
+            exp_data.append(" UE_SEL=").append(std::to_string(thrput.task_slots[CUMAC_TASK_UE_SELECTION]));
         }
         if (task_bitmask & (0x1 << CUMAC_TASK_PRB_ALLOCATION)) {
-            exp_data.append(" PRB_ALLOC=").append(std::to_string(expected[i].task_slots[CUMAC_TASK_PRB_ALLOCATION]));
+            exp_data.append(" PRB_ALLOC=").append(std::to_string(thrput.task_slots[CUMAC_TASK_PRB_ALLOCATION]));
         }
         if (task_bitmask & (0x1 << CUMAC_TASK_LAYER_SELECTION)) {
-            exp_data.append(" LAYER_SEL=").append(std::to_string(expected[i].task_slots[CUMAC_TASK_LAYER_SELECTION]));
+            exp_data.append(" LAYER_SEL=").append(std::to_string(thrput.task_slots[CUMAC_TASK_LAYER_SELECTION]));
         }
         if (task_bitmask & (0x1 << CUMAC_TASK_MCS_SELECTION)) {
-            exp_data.append(" MCS_SEL=").append(std::to_string(expected[i].task_slots[CUMAC_TASK_MCS_SELECTION]));
+            exp_data.append(" MCS_SEL=").append(std::to_string(thrput.task_slots[CUMAC_TASK_MCS_SELECTION]));
         }
         if (task_bitmask & (0x1 << CUMAC_TASK_PFM_SORT)) {
-            exp_data.append(" PFM_SORT=").append(std::to_string(expected[i].task_slots[CUMAC_TASK_PFM_SORT]));
+            exp_data.append(" PFM_SORT=").append(std::to_string(thrput.task_slots[CUMAC_TASK_PFM_SORT]));
+        }
+        if (task_bitmask & (0x1 << CUMAC_TASK_MU_UE_GRP)) {
+            exp_data.append(" MU_UE_GRP=").append(std::to_string(thrput.task_slots[CUMAC_TASK_MU_UE_GRP]));
         }
 
-        exp_data.append(" ERR=").append(std::to_string(expected[i].error));
-        exp_data.append(" INV=").append(std::to_string(expected[i].invalid));
+        exp_data.append(" ERR=").append(std::to_string(thrput.error));
+        exp_data.append(" INV=").append(std::to_string(thrput.invalid));
         NVLOGC_FMT(TAG, "{}", exp_data.c_str());
     }
 
@@ -950,6 +1306,24 @@ int cumac_pattern::cumac_pattern_parsing(const char* lp_file_name, uint32_t ch_m
 
 int cumac_pattern::update_expected_values(int cell_id, cumac_req_t *req)
 {
+    if (req == nullptr || req->tv_data == nullptr)
+    {
+        return -1;
+    }
+
+    cumac_thrput_t& thrput = expected[cell_id];
+    if (req->tv_data->req.taskBitMask != 0)
+    {
+        thrput.cumac_slots ++;
+    }
+
+    for (int task = 0; task < CUMAC_TASK_TOTAL_NUM; task++)
+    {
+        if (req->tv_data->req.taskBitMask & (0x1 << task))
+        {
+            thrput.task_slots[task] ++;
+        }
+    }
     return 0;
 }
 
@@ -990,14 +1364,14 @@ int cumac_pattern::populate_cumac_pattern(cumac_slot_pattern_t& slots_data, yaml
         req->slot_idx = slot_idx;
         req->tv_file = tv_file;
         curr_task = CUMAC_TASK_UE_SELECTION;
-        update_expected_values(cell_id, req);
         if (parse_tv_file(req) < 0) {
             // delete req;
             continue;
         }
+        update_expected_values(cell_id, req);
         slots_data[slot_idx][cell_id][CUMAC_SCH_TTI_REQ].push_back(req);
-        NVLOGI_FMT(TAG, "{}: added tv: slot {} cell_id {} {:<8} {}",
-                __func__, slot_idx, cell_id, get_task_name(task_type), req->tv_file.c_str());
+        NVLOGI_FMT(TAG, "{}: added tv: slot {} cell_id {} {:<8} {} task_bitmask=0x{:X}", __func__, slot_idx, cell_id,
+            get_task_name(task_type), req->tv_file.c_str(), req->tv_data == nullptr ? 0 : req->tv_data->req.taskBitMask);
     }
 
     return 0;

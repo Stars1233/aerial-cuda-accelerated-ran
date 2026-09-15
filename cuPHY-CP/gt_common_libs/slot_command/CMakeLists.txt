@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,15 +15,16 @@
 
 # Lib: slot_command
 
+find_package(gsl-lite REQUIRED)
+
 add_library(slot_command INTERFACE)
 message(VERBOSE "CMAKE_CURRENT_SOURCE_DIR is ${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(slot_command INTERFACE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>")
 message(VERBOSE "PROJECT_SOURCE_DIR is ${PROJECT_SOURCE_DIR}/nvIPC/include/")
 target_include_directories(slot_command INTERFACE "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/nvIPC/include/>")
 
-# Link to header-only targets instead of compiled libraries:
-# slot_command only needs headers from cuphy and oran.hpp from aerial-fh-driver
-target_link_libraries(slot_command INTERFACE cuphy_h oran_h)
+# Link only header providers needed by slot_command.
+target_link_libraries(slot_command INTERFACE cuphy_h oran_h gsl-lite::gsl-lite)
 
 if (ENABLE_CELL_GROUP)
     set_target_properties(slot_command PROPERTIES INTERFACE_COMPILE_DEFINITIONS ENABLE_CELL_GROUP)

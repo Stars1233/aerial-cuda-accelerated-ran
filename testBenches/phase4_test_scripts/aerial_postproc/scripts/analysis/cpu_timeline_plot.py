@@ -16,7 +16,7 @@
 # limitations under the License.
 
 import argparse
-from aerial_postproc.logplot import plot_all_tasks_cpu_timeline, ti_boxplot, timeline_plot_generic
+from aerial_postproc.logplot import plot_all_tasks_cpu_timeline, ti_boxplot, timeline_plot_generic, prepare_cpu_timeline_row_frames
 from bokeh.plotting import show
 from bokeh.io import output_file
 from bokeh.models.widgets import Panel, Tabs
@@ -27,7 +27,8 @@ import argparse
 import numpy as np
 import os
 import time
-from aerial_postproc.parsenator_formats import parse_all_PerfMetricsIO, parse_labels
+from aerial_postproc.parsenator_formats import parse_all_PerfMetricsIO, parse_labels, input_data_parser
+from aerial_postproc.perfetto_trace import PerfettoTraceConfig, RunInputs, write_chrome_trace
 
 #Adds start/end datetime using t0_timestamp, start_deadline, and end_deadline
 def add_datetimes(io_df):
@@ -42,6 +43,14 @@ def main(args):
 
     time1 = time.time()
 
+    emit_bokeh = args.plot_engine in ("bokeh", "both")
+    emit_perfetto = args.plot_engine in ("perfetto", "both")
+    grouped_input_paths = input_data_parser(list(args.input_data_list)) if emit_perfetto else None
+    if emit_perfetto and grouped_input_paths is None:
+        raise SystemExit(
+            "ERROR: unable to parse input paths; cannot emit Perfetto trace."
+        )
+
     df_ti_list,df_l2_list,df_gpu_list,df_compression_list,df_tick_list,df_testmac_list,slot_list = parse_all_PerfMetricsIO(args.input_data_list,
                                                                                                                            args.ignore_duration,
                                                                                                                            args.max_duration,
@@ -52,6 +61,7 @@ def main(args):
     time2 = time.time()
 
     panel_list = []
+    run_inputs = []
     ii = 0
     start_tir = args.ignore_duration
     end_tir = args.max_duration
@@ -97,14 +107,19 @@ def main(args):
                 data4['start_datetime'] = pd.to_datetime(data4['fapi2_start_timestamp'],unit='ns')
                 data4['end_datetime'] = pd.to_datetime(data4['fapi2_stop_timestamp'],unit='ns')
                 
-            crosshair_tool = CrosshairTool()
-            fig1 = plot_all_tasks_cpu_timeline(data1, data2, data3, data4, x_range=None, traces_only=not args.enable_cpu_percentages, cpu_only=False, crosshair_tool=crosshair_tool,ul_only=args.ul_only)
+            prep = prepare_cpu_timeline_row_frames(data1, data2, data3, data4, args.ul_only) if emit_perfetto else None
 
-            # Set fixed y-axis properties for the first plot in the column
-            plot1 = fig1.children[0]  # Get the actual plot from the column layout
-            plot1.yaxis.axis_label_standoff = 50  # Fixed standoff distance
-            plot1.min_border_left = 100  # Fixed left border width
-            plot1.sizing_mode = "stretch_width"
+            if emit_bokeh:
+                crosshair_tool = CrosshairTool()
+                fig1 = plot_all_tasks_cpu_timeline(data1, data2, data3, data4, x_range=None, traces_only=not args.enable_cpu_percentages, cpu_only=False, crosshair_tool=crosshair_tool,ul_only=args.ul_only, prep=prep)
+
+                # Set fixed y-axis properties for the first plot in the column
+                plot1 = fig1.children[0]  # Get the actual plot from the column layout
+                plot1.yaxis.axis_label_standoff = 50  # Fixed standoff distance
+                plot1.min_border_left = 100  # Fixed left border width
+                plot1.sizing_mode = "stretch_width"
+            else:
+                crosshair_tool = None
 
             #Cut/merge GPU UL data
             data3 = df_gpu[df_gpu.tir < (start_tir + timeline_max_dur)].copy()
@@ -161,28 +176,55 @@ def main(args):
             
             print("Generating GPU timeline view...")
             data3 = pd.concat([compression_df,pusch_df,pucch_df,prach_df,order_df,srs_order_df])
-            fig2 = timeline_plot_generic(data3,'Kernel Type',title="GPU Timeline View",height=600,width=1600,x_range=fig1.children[0].x_range,
-                                         tooltips=[('slot','@slot'),('duration','@duration'),('start_deadline','@start_deadline'),('end_deadline','@end_deadline')],
-                                         crosshair_tool=crosshair_tool)
-            
-            # Set matching y-axis properties for fig2
-            fig2.yaxis.axis_label_standoff = 50  # Same standoff as fig1
-            fig2.min_border_left = 100  # Same left border width as fig1
-            fig2.sizing_mode = "stretch_width"
 
-            fig_list.append(fig1)
-            fig_list.append(fig2)
+            if emit_bokeh:
+                fig2 = timeline_plot_generic(data3,'Kernel Type',title="GPU Timeline View",height=600,width=1600,x_range=fig1.children[0].x_range,
+                                             tooltips=[('slot','@slot'),('duration','@duration'),('start_deadline','@start_deadline'),('end_deadline','@end_deadline')],
+                                             crosshair_tool=crosshair_tool)
 
-        # Add all of these figures to a panel
-        print("Adding panel...")
-        panel_list.append(Panel(child=layout(fig_list), title=tab_name))
+                # Set matching y-axis properties for fig2
+                fig2.yaxis.axis_label_standoff = 50  # Same standoff as fig1
+                fig2.min_border_left = 100  # Same left border width as fig1
+                fig2.sizing_mode = "stretch_width"
 
-    # Add all of these panels to the Tabs object
-    print("Creating tabs...")
-    tabs = Tabs(tabs=panel_list)
-    print("Writing output to %s..."%args.out_filename)
-    output_file(filename=args.out_filename, title=os.path.split(__file__)[1])
-    show(tabs)
+                fig_list.append(fig1)
+                fig_list.append(fig2)
+
+                # Add this run's figures to a tab. Only emit a tab when there's
+                # data to display
+                print("Adding panel...")
+                panel_list.append(Panel(child=layout(fig_list), title=tab_name))
+
+            if emit_perfetto:
+                run_idx = ii - 1
+                run_inputs.append(RunInputs(
+                    prep=prep,
+                    gpu_envelope_df=data3,
+                    label=tab_name,
+                    input_paths=grouped_input_paths[run_idx],
+                ))
+
+    if emit_bokeh:
+        # Add all of these panels to the Tabs object
+        print("Creating tabs...")
+        tabs = Tabs(tabs=panel_list)
+        print("Writing output to %s..."%args.out_filename)
+        output_file(filename=args.out_filename, title=os.path.split(__file__)[1])
+        show(tabs)
+
+    if emit_perfetto:
+        if not run_inputs:
+            print("WARNING: no runs had TI subtask rows; skipping Perfetto trace write")
+        else:
+            config = PerfettoTraceConfig(mmimo_enable=args.mmimo_enable)
+            written_paths = write_chrome_trace(
+                runs=run_inputs,
+                out_path=args.trace_output,
+                config=config,
+                split_per_run=args.trace_split_per_run,
+            )
+            for path in written_paths:
+                print("Wrote Perfetto trace to %s (open in https://ui.perfetto.dev/)" % path)
 
 
 if __name__ == "__main__":
@@ -218,6 +260,50 @@ if __name__ == "__main__":
     parser.add_argument(
         "-u", "--ul_only", action="store_true", help="Only timeline UL data"
     )
+    parser.add_argument(
+        "-e", "--mmimo_enable", action="store_true",
+        help=(
+            "Use GH_64TR (mmimo) deadline offsets for the per-slot deadline "
+            "markers in the Perfetto trace. Defaults to GH_4TR. Matches the "
+            "same flag in latency_summary.py."
+        ),
+    )
+    parser.add_argument(
+        "--plot-engine",
+        choices=("bokeh", "perfetto", "both"),
+        default="bokeh",
+        help=(
+            "Which output to produce. 'bokeh' (default) keeps the existing HTML "
+            "behavior. 'perfetto' writes only a Chrome Trace Event Format JSON "
+            "loadable in https://ui.perfetto.dev or chrome://tracing. 'both' "
+            "writes both."
+        ),
+    )
+    parser.add_argument(
+        "--trace-output",
+        metavar="FILE.json",
+        default=None,
+        help=(
+            "Output JSON filename when --plot-engine is 'perfetto' or 'both'. "
+            "Required for those modes. Ignored for 'bokeh'."
+        ),
+    )
+    parser.add_argument(
+        "--trace-split-per-run",
+        action="store_true",
+        help=(
+            "When multiple input runs are passed with --plot-engine perfetto/both, "
+            "write one JSON per run with '.run{N}' suffixed before '.json' instead "
+            "of merging all runs into a single file."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.plot_engine in ("perfetto", "both") and not args.trace_output:
+        parser.error("--trace-output is required when --plot-engine is perfetto or both")
+    if args.plot_engine == "bokeh" and args.trace_output is not None:
+        print("WARNING: --trace-output ignored when --plot-engine is bokeh")
+    if args.plot_engine == "bokeh" and args.trace_split_per_run:
+        print("WARNING: --trace-split-per-run ignored when --plot-engine is bokeh")
 
     main(args)

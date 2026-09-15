@@ -14,10 +14,10 @@
 # limitations under the License.
 
 
-# cubb_gpu_test_config.yaml
+# cubb_gpu_test_config_perf101.yaml
 # Use with:
 #   cd $cuBB_SDK/testBenches/perf
-#   python3 measure.py --yaml cubb_gpu_test_config.yaml
+#   python3 measure.py --yaml cubb_gpu_test_config_perf101.yaml
 #
 # Notes:
 # - Keys under `config:` mostly map to long CLI flags in `measure.py` / `measure/cli.py` (without leading `--`).
@@ -45,11 +45,11 @@ config:
   #
   # Copy all TVs listed in this YAML to a new location (e.g. testVectors or container path):
   #   cd $cuBB_SDK/testBenches/perf
-  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml <src_dir> <dst_dir>
+  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config_perf101.yaml <src_dir> <dst_dir>
   # Example: from MATLAB GPU_test_input to SDK testVectors:
-  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml $cuBB_SDK/5GModel/nr_matlab/GPU_test_input $cuBB_SDK/testVectors
+  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config_perf101.yaml $cuBB_SDK/5GModel/nr_matlab/GPU_test_input $cuBB_SDK/testVectors
   # Example: from archive to container mount:
-  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config.yaml /path/to/tv/archive /opt/nvidia/cuBB/testVectors
+  #   ./copy_tvs_from_yaml.sh cubb_gpu_test_config_perf101.yaml /path/to/tv/archive /opt/nvidia/cuBB/testVectors
   #
   # - Each key is a workload/channel name (PDSCH/PUSCH/PRACH/PDCCH/PUCCH/SSB/CSIRS/MAC).
   # - Each value is a LIST of TV filenames under `testvectors_folder`.
@@ -82,6 +82,25 @@ config:
                                                     # The SM allocation is the upper limit of the SMs one workload can use.
                                                     # For green context, cubb_gpu_test_bench.cpp will automatically split the SMs into multiple green contexts.
 
+  # --- Explicit green context SM placement (optional) ---
+  # When use_green_contexts is true AND this section is present, cubb_gpu_test_bench will use
+  # these explicit green context split parameters instead of its built-in heuristic split.
+  # Each channel gets a 2-element list: [split_start, sm_count].
+  #   split_start: SM split offset at which this channel's split begins.
+  #   sm_count:    number of SMs requested for this channel's green context.
+  # IMPORTANT: these are green context split *parameters*, NOT SM IDs.
+  # The CUDA driver is responsible for assigning SMs to green context(s) based on splits.
+  # Channels may intentionally overlap to control GPU oversubscription. Users should verify the actual
+  #   green context resource allocation (SM count, potential overlap across GCs) via a tool like
+  #   Nsight Systems is as expected.
+  # Only list channels that have their own green context (isolated channels + MAC).
+  # If absent, the heuristic in cubb_gpu_test_bench.cpp is used (default).
+  # Example on a 132-SM GPU: PUSCH: [66, 66] requests a 66-SM split starting at offset 66.
+  # green_context_sm_alloc:
+  #   PUSCH: [0, 132]
+  #   PRACH: [124, 8]
+  #   PDSCH: [0, 100]
+
   # traffic generator priorities
   # If present, traffic generation will use these instead of reading the JSON file.
   tdd_priorities:
@@ -110,10 +129,10 @@ config:
   # For more examples, see measure/TDD/slotConfig.json.
   tdd_slot_config:
     dddsuudddd:
-      PDSCH: [0, 0, 1, 1, 1, 1, 1, 1, 1, 0]
-      PDCCH: [0, 0, 1, 1, 1, 1, 1, 1, 1, 0]
-      CSIRS: [0, 0, 1, 1, 1, 1, 1, 1, 1, 0]
-      PBCH: [0, 0, 0, 0, 0, 0, 1, 1, 1, 0]
+      PDSCH: [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+      PDCCH: [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+      CSIRS: [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]
+      PBCH: [0, 0, 0, 0, 1, 1, 1, 0, 0, 0]
       MAC: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
   start: 20                                         # Minimum number of cells to try (passed to --start)
   cap: 20                                           # Maximum number of cells to try (passed to --cap)
@@ -139,9 +158,13 @@ config:
   use_green_contexts: false                         # Use green contexts instead of MPS (passed to --use_green_contexts)
   enable_mps_for_green_contexts: false              # Keep MPS enabled for green contexts (passed to --enable_mps_for_green_contexts)  # for trace capture
   enable_nvprof: false                              # Enable profiler start/stop inside cubb_gpu_test_bench (passed to --enable_nvprof)
+  enable_gpu_metric: false                          # Add --gpu-metrics-devices to nsys (passed to --enable_gpu_metric)
+  # gpu_metric_set: /path/to/metrics.config          # GPU metrics config file for nsys --gpu-metrics-set (passed to --gpu_metric_set)
+  setup_once: false                                 # Skip per-pattern re-setup; reuse first pattern's TVs for all iterations (passed to --setup_once). Faster latency sweeps but functional results reflect only pattern 0's TVs.
   enable_sqlite: false                              # Export sqlite file in nsys (passed to --enable_sqlite)
   debug: false                                      # Enable debug mode (passed to --debug), for trace capture
-  debug_mode: nsys                                  # Debug mode: cta/triage/nsys/ncu/incu/nsys_simple (passed to --debug_mode)
+  debug_mode: nsys                                  # Debug mode: nsys/ncu/nsys_simple (passed to --debug_mode)
+  nsys_use_cuda_sw: false                           # Use --trace cuda-sw (software based legacy trace) instead of --trace cuda (use Hardware Event System (HES) for Blackwell, no impact on earlier arch GPUs)
 
   # --- Channel workload toggles / isolation ---
   no_pdsch: false                                   # Disable PDSCH workload (passed to --no_pdsch)
@@ -160,6 +183,8 @@ config:
   mac: false                                        # Run cuMAC workload in dedicated sub-CTX (passed to --mac)
   mac2: false                                       # Second MAC workload mode (passed to --mac2)
   mac_timer: true                                   # MAC uses internal timer (passed to --mac_timer)
+  fix_ul_cell_count: -1                             # Fix UL channels at N cells; -1 = vary with sweep (default)
+  fix_dl_cell_count: -1                             # Fix DL channels at N cells; -1 = vary with sweep (default)
 
   # --- Cell grouping / packing options ---
   groups_dl: true                                   # Use DL cell groups (passed to --groups_dl), recommend to set to true for lower latency
@@ -169,6 +194,7 @@ config:
   # --- PUSCH / LDPC options ---
   ldpc_parallel: true                               # Run LDPC decoder TB in parallel (passed to --ldpc_parallel), recommend to set to true for lower latency
   pusch_cascaded: true                              # Cascade 2nd UL slot after 1st in DDDSUUDDDD (passed to --pusch_cascaded). If true, PUSCH2/PUCCH2 starts after the completion of PUSCH1. Otherwise, PUSCH2/PUCCH2 starts after it's own delay, independent of PUSCH1
+  pucch_cascaded: false                             # Cascade PUCCH2 after PUCCH1 completion independently of pusch_cascaded (passed to --pucch_cascaded).
   pusch_subslot_proc: "0"                           # Subslot processing for PUSCH: "0","1","00","01","10","11" (passed to --pusch_subslot_proc). We have at most 2 PUSCHs, 0 for disable and 1 for enable.
 
   # --- cuMAC options ---
@@ -194,6 +220,11 @@ config:
 
 override_test_vectors:
   enable_override: false  # set to true to enable test vector override; otherwise, the default test vectors will be used.
+  enable_per_cell_latency: false  # true = generated vectors-XX.yaml uses delay_us (and PUSCH sub_slot_delay_us) * cell count
+                                  # (each channel PRACH/PUSCH/PUCCH/SRS/PDSCH/PDCCH/CSIRS scales by
+                                  #  its own configured cell count);
+                                  # false (default) = delay_us is a fixed value across all cell counts.
+                                  # Generator-only directive; never written to vectors-XX.yaml.
   # USE CAUTION WHEN OVERRIDING TEST VECTORS:
   # - If you are not sure about the override value, leave it as -1.
   # - If you are sure about the override value, set it to the desired value.
@@ -222,10 +253,24 @@ override_test_vectors:
     enable_per_prg_channel_estimation: -1           # Per-PRG channel estimation enable (0/1)
     eq_coefficient_algorithm_index: -1              # Equalizer coefficient algorithm selector
     list_length: -1                                 # Polar decoder list size
+    open_ran_functional_split: -1                   # PUSCH O-RAN split (0=7.2a, 1=7.2e)
+    kernel_sel_option: -1                           # PUSCH kernel selection (0=PUSCH_ALL, 1=PUSCH_NO_FEC, 2=PUSCH_NO_DERATE_MATCHING_FEC, 3=PUSCH_NO_SD_DERATE_MATCHING_FEC)
+    uci_kernel_sel_option: -1                       # PUSCH UCI kernel selection (0=PUSCH_UCI_ALL, 1=PUSCH_UCI_NO_POLAR, 2=PUSCH_UCI_NO_UCI_WITH_SEG, 3=PUSCH_UCI_NO_UCI)
+    delay_us: -1                                    # PUSCH full-slot delay in us (offload latency proxy; applies only when kernel_sel_option != ALL; -1=TV default)
+    sub_slot_delay_us: -1                           # PUSCH sub-slot processing path delay in us (-1=TV default)
   PUCCH:
-    list_length: -1                                 # PUCCH polar decoder list size
+    list_length: -1                                 # Polar list size -> cuphyPucchStatPrms_t::polarDcdrListSz
+    pipeline_processing_mode: -1                    # 0=full decode, 1=skip polar, 2=skip backend (RM+polSeg+polar+UciSeg, front-end only) -> pipelineMode
+    delay_us: -1                                    # Polar-decoder latency proxy: GPU busy-wait us in PUCCH pipeline; -> pipelineDelayUs (>=0 to enable, -1=no override)
   SRS:
     chEst_alg_selector: -1                          # SRS channel estimation algorithm selector, to be added later
+  PDCCH:
+    kernel_sel_option: -1                           # PDCCH kernel selection (0=ALL, 1=NO_POLAR_ENCODER) -> cuphyPdcchStatPrms_t::kernelSelOption (-1=TV default)
+    delay_us: -1                                    # PDCCH delay in us -> cuphyPdcchStatPrms_t::delayUs (>=0 to enable, -1=TV default)
+  PDSCH:
+    # NOTE: cuPHY-CP supports only FULL (0); the other modes are experimental. delay_us applies only in the post-FEC modes (2/3).
+    pipeline_processing_mode: -1                    # PDSCH pipeline mode (0=PDSCH_FULL_PROCESSING, 1=PDSCH_AAS_PROCESSING, 2=PDSCH_POST_FEC_PROCESSING, 3=PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING; -1=TV default)
+    delay_us: -1                                    # PDSCH delay in us (post-FEC modes only; -1=TV default)
 
 start_delay:
   # Start offsets for channel workloads in generated vectors YAML.
@@ -246,8 +291,12 @@ start_delay:
     # PDSCH_DLBFW (and DLBFW): delay from slot start before DLBFW runs (not after DLBFW).
     # SSB: relative to slot boundary for that slot. SSB is fixed for the last 4 slots.
   # MAC/MAC2: slot-aligned like PDSCH in each slot.
+  # DL_ANCHOR: optional DL anchor for PDCCH/SSB delays [PDSCH(default), SLOT_BOUNDARY].
+  #   PDSCH: PDCCH and SSB delays are relative to PDSCH slot start; fewer delay kernels.
+  #   SLOT_BOUNDARY: PDCCH and SSB delays are absolute from 500 us slot boundary.
+  DL_ANCHOR: PDSCH
   UL_ANCHOR: PUSCH
-  PUSCH1: 1796
+  PUSCH1: 796
   PUSCH2: 0
   PUCCH1: 0
   PUCCH2: 0

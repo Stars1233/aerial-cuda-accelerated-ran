@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@ if [ $# -lt 3 ]; then
     echo "" >&2
     echo "Examples:" >&2
     echo "  $0 \"F08_6C_69_MODCOMP_STT480000_1P\" \"CG1_R750\" test_params.sh" >&2
+    echo "  $0 \"F08_4C_4C_52a_BFP9_STT455000_EH_1P\" \"CG1_CG1\" test_params.sh" >&2
     echo "  $0 \"F08_20C_59c_BFP14_EH_GC_2P\" \"GL4_R750\" test_params.sh --custom-build-dir build.debug"  >&2
     echo "" >&2
     echo "This script generates a parameter file that must be sourced to set environment variables:" >&2

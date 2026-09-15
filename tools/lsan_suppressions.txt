@@ -1,0 +1,12 @@
+# Suppressions for false positives and third-party libraries
+
+leak:doca_gpu_create
+leak:gdr_open
+
+# fmtlog lazily preallocates one ~16MB per-thread message buffer on the first log
+# call (fmtlogDetailT::preallocate, fmtlog-inl.h) and reclaims it only at
+# process/thread exit, so LSAN reports it as a leak. One-time and bounded - not an
+# accumulating leak, and internal to fmtlog (callers like NVLOGx_FMT leak nothing).
+# Scoped to the preallocate frame so real leaks elsewhere are NOT masked. fmtlog is
+# already special-cased for UBSAN (alignment:*fmtlog*) and TSAN (race:fmtlogT).
+leak:fmtlogDetailT

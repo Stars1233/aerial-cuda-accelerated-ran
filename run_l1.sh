@@ -29,18 +29,30 @@ stop_mps() {
     # Stop existing MPS
     export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
     export CUDA_MPS_LOG_DIRECTORY=/var/log/nvidia-mps
-    echo quit | sudo -E nvidia-cuda-mps-control || true
+
+    if ! pgrep -f '[n]vidia-cuda-mps-control' > /dev/null; then
+        return 0
+    fi
+
+    echo quit | sudo -E nvidia-cuda-mps-control
+
+    # Verify the daemon actually stopped. A non-zero quit exit is OK if the
+    # process is gone (TOCTOU race between pgrep above and quit).
+    if pgrep -f '[n]vidia-cuda-mps-control' > /dev/null; then
+        echo "Error: Failed to stop MPS daemon" >&2
+        return 1
+    fi
 }
 
 restart_mps() {
     # Stop existing MPS
-    stop_mps
+    stop_mps || return 1
 
     # Start MPS
     export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
     export CUDA_MPS_LOG_DIRECTORY=/var/log/nvidia-mps
-    sudo -E nvidia-cuda-mps-control -d
-    echo start_server -uid 0 | sudo -E nvidia-cuda-mps-control
+    sudo -E nvidia-cuda-mps-control -d || return 1
+    echo start_server -uid 0 | sudo -E nvidia-cuda-mps-control || return 1
     sleep 1  # Give daemon time to start
     if ! pgrep -f nvidia-cuda-mps > /dev/null; then
         echo "Error: MPS daemon failed to start" >&2
@@ -54,8 +66,18 @@ get_platform_name() {
         echo "Error: Could not read DMI files: Vendor: $_dmi/board_vendor, Name: $_dmi/board_name, Version: $_dmi/board_version" >&2
         return
     fi
-    local _platform_name
-    _platform_name=$(cat $_dmi/board_vendor)-$(cat $_dmi/board_name)-$(cat $_dmi/board_version)
+    local _board_vendor _board_name _board_version _platform_name
+    _board_vendor=$(tr -d '\0\r\n' < "$_dmi/board_vendor")
+    _board_name=$(tr -d '\0\r\n' < "$_dmi/board_name")
+    _board_version=$(tr -d '\0\r\n' < "$_dmi/board_version")
+
+    # Some MGX systems leave board_vendor empty. Do not produce a platform
+    # name with a misleading leading dash in that case.
+    if [[ -n "$_board_vendor" ]]; then
+        _platform_name="${_board_vendor}-${_board_name}-${_board_version}"
+    else
+        _platform_name="${_board_name}-${_board_version}"
+    fi
     echo "${_platform_name}"
 }
 
@@ -82,6 +104,9 @@ case $_platform_name in
         config_file=${config_file:-P5G_WNC_DGX}
         ;;
     "Supermicro-G1SMH-G-1.02")
+        config_file=${config_file:-P5G_WNC_GH}
+        ;;
+    "QuantaEdge EGN77C-2U-"*)
         config_file=${config_file:-P5G_WNC_GH}
         ;;
     *)
@@ -111,9 +136,15 @@ _use_green_contexts=$(yq -r '.cuphydriver_config.use_green_contexts // 0' "$cuph
 _use_green_contexts=${_use_green_contexts,,}
 if [[ "$_use_green_contexts" == "true" || "$_use_green_contexts" == "1" ]]; then
     echo "run_l1: use_green_contexts enabled ($cuphy_yaml) — stopping MPS"
-    stop_mps
+    if ! stop_mps; then
+        echo "Error: Failed to stop MPS for green-context configuration" >&2
+        exit 1
+    fi
 else
-    restart_mps
+    if ! restart_mps; then
+        echo "Error: Failed to restart MPS" >&2
+        exit 1
+    fi
 fi
 
 sudo -E "${l1_bin}" "${config_file}"

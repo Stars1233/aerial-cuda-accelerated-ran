@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <functional>
+#include <string>
 
 #include "nv_ring.h"
 
@@ -205,6 +206,7 @@ class CuphyOAM
         CuphyOAM() {
             pRpc = nullptr;
             cell_reconfig_requests = nullptr;
+            cell_ctrl_requests = nullptr;
             simulate_cpu_stall_requests = nullptr;
             ul_u_plane_drop_requests = nullptr;
             zero_ul_u_plane_requests = nullptr;
@@ -221,6 +223,7 @@ class CuphyOAM
 
         nv_ring* generic_async_requests = nullptr;
         nv_ring* cell_reconfig_requests;
+        nv_ring* cell_ctrl_requests;
         nv_ring* sfn_slot_sync_requests;
         nv_ring* simulate_cpu_stall_requests;
         nv_ring* fapi_delay_requests = nullptr;

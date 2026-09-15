@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -126,16 +126,18 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
             // because here we know that the value is 0 or 1.
             switch(convertToType)
             {
-            case CUPHY_BIT:    /* src and dst types identical */                                  break;
-            case CUPHY_R_8I:   var.value.r8i  = static_cast<signed char>(b);                      break;
-            case CUPHY_R_8U:   var.value.r8u  = static_cast<unsigned char>(b);                    break;
-            case CUPHY_R_16I:  var.value.r16i = static_cast<short>(b);                            break;
-            case CUPHY_R_16U:  var.value.r16u = static_cast<unsigned short>(b);                   break;
-            case CUPHY_R_32I:  var.value.r32i = static_cast<int>(b);                              break;
-            case CUPHY_R_32U:  var.value.r32u = static_cast<unsigned int>(b);                     break;
-            case CUPHY_R_16F:  var.value.r16f = static_cast<__half_raw>(type_convert<__half>(b)); break;
-            case CUPHY_R_32F:  var.value.r32f = static_cast<float>(b);                            break;
-            case CUPHY_R_64F:  var.value.r64f = static_cast<double>(b);                           break;
+            case CUPHY_BIT:       /* src and dst types identical */                                      break;
+            case CUPHY_R_8I:      var.value.r8i      = static_cast<signed char>(b);                      break;
+            case CUPHY_R_8U:      var.value.r8u      = static_cast<unsigned char>(b);                    break;
+            case CUPHY_R_16I:     var.value.r16i     = static_cast<short>(b);                            break;
+            case CUPHY_R_16U:     var.value.r16u     = static_cast<unsigned short>(b);                   break;
+            case CUPHY_R_32I:     var.value.r32i     = static_cast<int>(b);                              break;
+            case CUPHY_R_32U:     var.value.r32u     = static_cast<unsigned int>(b);                     break;
+            case CUPHY_R_16F:     var.value.r16f     = static_cast<__half_raw>(type_convert<__half>(b)); break;
+            case CUPHY_R_32F:     var.value.r32f     = static_cast<float>(b);                            break;
+            case CUPHY_R_64F:     var.value.r64f     = static_cast<double>(b);                           break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = static_cast<__nv_fp8_e4m3>(b);                    break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = static_cast<__nv_fp8_e5m2>(b);                    break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -147,16 +149,18 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
             bool bSuccess = true;
             switch(convertToType)
             {
-            case CUPHY_BIT:    var.value.b1 = (var.value.r8i == 0) ? 0 : 1;                                   break;
-            case CUPHY_R_8I:   /* src and dst types identical */                                              break;
-            case CUPHY_R_8U:   bSuccess = safe_narrow_int_cast(var.value.r8u,  var.value.r8i);                break;
-            case CUPHY_R_16I:  var.value.r16i = type_convert<short>(var.value.r8i);                           break;
-            case CUPHY_R_16U:  bSuccess = safe_narrow_int_cast(var.value.r16u, var.value.r8i);                break;
-            case CUPHY_R_32I:  var.value.r32i = type_convert<int>(var.value.r8i);                             break;
-            case CUPHY_R_32U:  bSuccess = safe_narrow_int_cast(var.value.r32u, var.value.r8i);                break;
-            case CUPHY_R_16F:  var.value.r16f = static_cast<__half_raw>(type_convert<__half>(var.value.r8i)); break;
-            case CUPHY_R_32F:  var.value.r32f = type_convert<float>(var.value.r8i);                           break;
-            case CUPHY_R_64F:  var.value.r64f = type_convert<double>(var.value.r8i);                          break;
+            case CUPHY_BIT:       var.value.b1 = (var.value.r8i == 0) ? 0 : 1;                                   break;
+            case CUPHY_R_8I:      /* src and dst types identical */                                              break;
+            case CUPHY_R_8U:      bSuccess = safe_narrow_int_cast(var.value.r8u,  var.value.r8i);                break;
+            case CUPHY_R_16I:     var.value.r16i = type_convert<short>(var.value.r8i);                           break;
+            case CUPHY_R_16U:     bSuccess = safe_narrow_int_cast(var.value.r16u, var.value.r8i);                break;
+            case CUPHY_R_32I:     var.value.r32i = type_convert<int>(var.value.r8i);                             break;
+            case CUPHY_R_32U:     bSuccess = safe_narrow_int_cast(var.value.r32u, var.value.r8i);                break;
+            case CUPHY_R_16F:     var.value.r16f = static_cast<__half_raw>(type_convert<__half>(var.value.r8i)); break;
+            case CUPHY_R_32F:     var.value.r32f = type_convert<float>(var.value.r8i);                           break;
+            case CUPHY_R_64F:     var.value.r64f = type_convert<double>(var.value.r8i);                          break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r8i);               break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r8i);               break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -196,16 +200,18 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
             bool bSuccess = true;
             switch(convertToType)
             {
-            case CUPHY_BIT:    var.value.b1   = (var.value.r8u == 0) ? 0 : 1;                                 break;
-            case CUPHY_R_8I:   bSuccess       = safe_narrow_int_cast(var.value.r8i,  var.value.r8u);          break;
-            case CUPHY_R_8U:   /* src and dst types identical */                                              break;
-            case CUPHY_R_16I:  var.value.r16i = type_convert<short>(var.value.r8u);                           break;
-            case CUPHY_R_16U:  bSuccess       = type_convert<unsigned short>(var.value.r8u);                  break;
-            case CUPHY_R_32I:  var.value.r32i = type_convert<int>(var.value.r8u);                             break;
-            case CUPHY_R_32U:  var.value.r32u = type_convert<unsigned int>(var.value.r8u);                    break;
-            case CUPHY_R_16F:  var.value.r16f = static_cast<__half_raw>(type_convert<__half>(var.value.r8u)); break;
-            case CUPHY_R_32F:  var.value.r32f = type_convert<float>(var.value.r8u);                           break;
-            case CUPHY_R_64F:  var.value.r64f = type_convert<double>(var.value.r8u);                          break;
+            case CUPHY_BIT:       var.value.b1   = (var.value.r8u == 0) ? 0 : 1;                                 break;
+            case CUPHY_R_8I:      bSuccess       = safe_narrow_int_cast(var.value.r8i,  var.value.r8u);          break;
+            case CUPHY_R_8U:      /* src and dst types identical */                                              break;
+            case CUPHY_R_16I:     var.value.r16i = type_convert<short>(var.value.r8u);                           break;
+            case CUPHY_R_16U:     bSuccess       = type_convert<unsigned short>(var.value.r8u);                  break;
+            case CUPHY_R_32I:     var.value.r32i = type_convert<int>(var.value.r8u);                             break;
+            case CUPHY_R_32U:     var.value.r32u = type_convert<unsigned int>(var.value.r8u);                    break;
+            case CUPHY_R_16F:     var.value.r16f = static_cast<__half_raw>(type_convert<__half>(var.value.r8u)); break;
+            case CUPHY_R_32F:     var.value.r32f = type_convert<float>(var.value.r8u);                           break;
+            case CUPHY_R_64F:     var.value.r64f = type_convert<double>(var.value.r8u);                          break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r8u);               break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r8u);               break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -245,16 +251,18 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
             bool bSuccess = true;
             switch(convertToType)
             {
-            case CUPHY_BIT:    var.value.b1 = (var.value.r16i == 0) ? 0 : 1;                                                  break;
-            case CUPHY_R_8I:   bSuccess = safe_narrow_int_cast(var.value.r8i, var.value.r16i);                                break;
-            case CUPHY_R_8U:   bSuccess = safe_narrow_int_cast(var.value.r8u, var.value.r16i);                                break;
-            case CUPHY_R_16I:  /* src and dst types identical */                                                              break;
-            case CUPHY_R_16U:  bSuccess = safe_narrow_int_cast(var.value.r16u, var.value.r16i);                               break;
-            case CUPHY_R_32I:  var.value.r32i = type_convert<int>(var.value.r16i);                                            break;
-            case CUPHY_R_32U:  bSuccess = safe_narrow_int_cast(var.value.r32u, var.value.r16i);                               break;
-            case CUPHY_R_16F:  { __half h(static_cast<float>(var.value.r16i)); var.value.r16f = static_cast<__half_raw>(h); } break;
-            case CUPHY_R_32F:  var.value.r32f = type_convert<float>(var.value.r16i);                                          break;
-            case CUPHY_R_64F:  var.value.r64f = type_convert<double>(var.value.r16i);                                         break;
+            case CUPHY_BIT:       var.value.b1 = (var.value.r16i == 0) ? 0 : 1;                                                  break;
+            case CUPHY_R_8I:      bSuccess = safe_narrow_int_cast(var.value.r8i, var.value.r16i);                                break;
+            case CUPHY_R_8U:      bSuccess = safe_narrow_int_cast(var.value.r8u, var.value.r16i);                                break;
+            case CUPHY_R_16I:     /* src and dst types identical */                                                              break;
+            case CUPHY_R_16U:     bSuccess = safe_narrow_int_cast(var.value.r16u, var.value.r16i);                               break;
+            case CUPHY_R_32I:     var.value.r32i = type_convert<int>(var.value.r16i);                                            break;
+            case CUPHY_R_32U:     bSuccess = safe_narrow_int_cast(var.value.r32u, var.value.r16i);                               break;
+            case CUPHY_R_16F:     { __half h(static_cast<float>(var.value.r16i)); var.value.r16f = static_cast<__half_raw>(h); } break;
+            case CUPHY_R_32F:     var.value.r32f = type_convert<float>(var.value.r16i);                                          break;
+            case CUPHY_R_64F:     var.value.r64f = type_convert<double>(var.value.r16i);                                         break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r16i);                              break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r16i);                              break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -312,8 +320,10 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
                     var.value.r16f = static_cast<__half_raw>(h);
                 }
                 break;
-            case CUPHY_R_32F:  var.value.r32f = type_convert<float>(var.value.r16u);                  break;
-            case CUPHY_R_64F:  var.value.r64f = type_convert<double>(var.value.r16u);                 break;
+            case CUPHY_R_32F:     var.value.r32f     = type_convert<float>(var.value.r16u);           break;
+            case CUPHY_R_64F:     var.value.r64f     = type_convert<double>(var.value.r16u);          break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r16u);   break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r16u);   break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -371,8 +381,10 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
                     var.value.r16f = static_cast<__half_raw>(h);
                 }
                 break;
-            case CUPHY_R_32F:  var.value.r32f = type_convert<float>(var.value.r32i);            break;
-            case CUPHY_R_64F:  var.value.r64f = type_convert<double>(var.value.r32i);           break;
+            case CUPHY_R_32F:     var.value.r32f = type_convert<float>(var.value.r32i);             break;
+            case CUPHY_R_64F:     var.value.r64f = type_convert<double>(var.value.r32i);            break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r32i); break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r32i); break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -430,8 +442,10 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
                     var.value.r16f = static_cast<__half_raw>(h);
                 }
                 break;
-            case CUPHY_R_32F:  var.value.r32f = type_convert<float>(var.value.r32u);                  break;
-            case CUPHY_R_64F:  var.value.r64f = type_convert<double>(var.value.r32u);                 break;
+            case CUPHY_R_32F:     var.value.r32f     = type_convert<float>(var.value.r32u);           break;
+            case CUPHY_R_64F:     var.value.r64f     = type_convert<double>(var.value.r32u);          break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r32u);   break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r32u);   break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -477,16 +491,18 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
             bool bSuccess = true;
             switch(convertToType)
             {
-            case CUPHY_BIT:    var.value.b1 = (var.value.r16f.x == 0) ? 0 : 1;                                   break;
-            case CUPHY_R_8I:   bSuccess = safe_narrow_float_to_int_cast(var.value.r8i,  __half(var.value.r16f)); break;
-            case CUPHY_R_8U:   bSuccess = safe_narrow_float_to_int_cast(var.value.r8u,  __half(var.value.r16f)); break;
-            case CUPHY_R_16I:  bSuccess = safe_narrow_float_to_int_cast(var.value.r16i, __half(var.value.r16f)); break;
-            case CUPHY_R_16U:  bSuccess = safe_narrow_float_to_int_cast(var.value.r16u, __half(var.value.r16f)); break;
-            case CUPHY_R_32I:  bSuccess = safe_narrow_float_to_int_cast(var.value.r32i, __half(var.value.r16f)); break;
-            case CUPHY_R_32U:  bSuccess = safe_narrow_float_to_int_cast(var.value.r32u, __half(var.value.r16f)); break;
-            case CUPHY_R_16F:  /* src and dst types identical */                                                 break;
-            case CUPHY_R_32F:  var.value.r32f = type_convert<float>(var.value.r16f);                             break;
-            case CUPHY_R_64F:  var.value.r64f = type_convert<double>(var.value.r16f);                            break;
+            case CUPHY_BIT:       var.value.b1 = (__half2float(__half(var.value.r16f)) == 0.0f) ? 0 : 1;              break;
+            case CUPHY_R_8I:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8i,  __half(var.value.r16f)); break;
+            case CUPHY_R_8U:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8u,  __half(var.value.r16f)); break;
+            case CUPHY_R_16I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16i, __half(var.value.r16f)); break;
+            case CUPHY_R_16U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16u, __half(var.value.r16f)); break;
+            case CUPHY_R_32I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32i, __half(var.value.r16f)); break;
+            case CUPHY_R_32U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32u, __half(var.value.r16f)); break;
+            case CUPHY_R_16F:     /* src and dst types identical */                                                 break;
+            case CUPHY_R_32F:     var.value.r32f = type_convert<float>(var.value.r16f);                             break;
+            case CUPHY_R_64F:     var.value.r64f = type_convert<double>(var.value.r16f);                            break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r16f);                 break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r16f);                 break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -526,16 +542,18 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
             bool bSuccess = true;
             switch(convertToType)
             {
-            case CUPHY_BIT:    var.value.b1 = (var.value.r32f == 0) ? 0 : 1;                              break;
-            case CUPHY_R_8I:   bSuccess = safe_narrow_float_to_int_cast(var.value.r8i,  var.value.r32f);  break;
-            case CUPHY_R_8U:   bSuccess = safe_narrow_float_to_int_cast(var.value.r8u,  var.value.r32f);  break;
-            case CUPHY_R_16I:  bSuccess = safe_narrow_float_to_int_cast(var.value.r16i, var.value.r32f);  break;
-            case CUPHY_R_16U:  bSuccess = safe_narrow_float_to_int_cast(var.value.r16u, var.value.r32f);  break;
-            case CUPHY_R_32I:  bSuccess = safe_narrow_float_to_int_cast(var.value.r32i, var.value.r32f);  break;
-            case CUPHY_R_32U:  bSuccess = safe_narrow_float_to_int_cast(var.value.r32u, var.value.r32f);  break;
-            case CUPHY_R_16F:  { __half h(var.value.r32f); var.value.r16f = static_cast<__half_raw>(h); } break;
-            case CUPHY_R_32F:  /* src and dst types identical */                                          break;
-            case CUPHY_R_64F:  var.value.r64f = type_convert<double>(var.value.r32f);                     break;
+            case CUPHY_BIT:       var.value.b1 = (var.value.r32f == 0) ? 0 : 1;                              break;
+            case CUPHY_R_8I:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8i,  var.value.r32f);  break;
+            case CUPHY_R_8U:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8u,  var.value.r32f);  break;
+            case CUPHY_R_16I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16i, var.value.r32f);  break;
+            case CUPHY_R_16U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16u, var.value.r32f);  break;
+            case CUPHY_R_32I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32i, var.value.r32f);  break;
+            case CUPHY_R_32U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32u, var.value.r32f);  break;
+            case CUPHY_R_16F:     { __half h(var.value.r32f); var.value.r16f = static_cast<__half_raw>(h); } break;
+            case CUPHY_R_32F:     /* src and dst types identical */                                          break;
+            case CUPHY_R_64F:     var.value.r64f = type_convert<double>(var.value.r32f);                     break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r32f);          break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r32f);          break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -580,16 +598,18 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
             bool bSuccess = true;
             switch(convertToType)
             {
-            case CUPHY_BIT:    var.value.b1 = (var.value.r64f == 0) ? 0 : 1;                              break;
-            case CUPHY_R_8I:   bSuccess = safe_narrow_float_to_int_cast(var.value.r8i,  var.value.r64f);  break;
-            case CUPHY_R_8U:   bSuccess = safe_narrow_float_to_int_cast(var.value.r8u,  var.value.r64f);  break;
-            case CUPHY_R_16I:  bSuccess = safe_narrow_float_to_int_cast(var.value.r16i, var.value.r64f);  break;
-            case CUPHY_R_16U:  bSuccess = safe_narrow_float_to_int_cast(var.value.r16u, var.value.r64f);  break;
-            case CUPHY_R_32I:  bSuccess = safe_narrow_float_to_int_cast(var.value.r32i, var.value.r64f);  break;
-            case CUPHY_R_32U:  bSuccess = safe_narrow_float_to_int_cast(var.value.r32u, var.value.r64f);  break;
-            case CUPHY_R_16F:  { __half h(var.value.r64f); var.value.r16f = static_cast<__half_raw>(h); } break;
-            case CUPHY_R_32F:  var.value.r32f = type_convert<float>(var.value.r64f);                      break;
-            case CUPHY_R_64F:  /* src and dst types identical */                                          break;
+            case CUPHY_BIT:       var.value.b1 = (var.value.r64f == 0) ? 0 : 1;                              break;
+            case CUPHY_R_8I:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8i,  var.value.r64f);  break;
+            case CUPHY_R_8U:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8u,  var.value.r64f);  break;
+            case CUPHY_R_16I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16i, var.value.r64f);  break;
+            case CUPHY_R_16U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16u, var.value.r64f);  break;
+            case CUPHY_R_32I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32i, var.value.r64f);  break;
+            case CUPHY_R_32U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32u, var.value.r64f);  break;
+            case CUPHY_R_16F:     { __half h(var.value.r64f); var.value.r16f = static_cast<__half_raw>(h); } break;
+            case CUPHY_R_32F:     var.value.r32f = type_convert<float>(var.value.r64f);                      break;
+            case CUPHY_R_64F:     /* src and dst types identical */                                          break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r64f);          break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r64f);          break;
             default:
                 // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
@@ -621,6 +641,60 @@ cuphyStatus_t convert_variant(cuphyVariant_t& var,
             case CUPHY_C_64F:  /* src and dst types identical */                                    break;
             default:
                 // Conversion to bit and real types from complex inputs not supported
+                return CUPHY_STATUS_INVALID_CONVERSION;
+            }
+            if(!bSuccess)
+            {
+                return CUPHY_STATUS_VALUE_OUT_OF_RANGE;
+            }
+        }
+        break;
+    case CUPHY_R_8F_E4M3:
+        {
+            bool bSuccess = true;
+            switch(convertToType)
+            {
+            case CUPHY_BIT:       var.value.b1 = (static_cast<float>(var.value.r8f_e4m3) == 0.0f) ? 0 : 1;               break;
+            case CUPHY_R_8I:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8i,  __half(var.value.r8f_e4m3)); break;
+            case CUPHY_R_8U:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8u,  __half(var.value.r8f_e4m3)); break;
+            case CUPHY_R_16I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16i, __half(var.value.r8f_e4m3)); break;
+            case CUPHY_R_16U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16u, __half(var.value.r8f_e4m3)); break;
+            case CUPHY_R_32I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32i, __half(var.value.r8f_e4m3)); break;
+            case CUPHY_R_32U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32u, __half(var.value.r8f_e4m3)); break;
+            case CUPHY_R_16F:     var.value.r16f = type_convert<__half>(var.value.r8f_e4m3);                            break;
+            case CUPHY_R_32F:     var.value.r32f = type_convert<float>(var.value.r8f_e4m3);                             break;
+            case CUPHY_R_64F:     var.value.r64f = type_convert<double>(var.value.r8f_e4m3);                            break;
+            case CUPHY_R_8F_E4M3: /* src and dst types identical */                                                     break;
+            case CUPHY_R_8F_E5M2: var.value.r8f_e5m2 = type_convert<__nv_fp8_e5m2>(var.value.r8f_e4m3);                 break;
+            default:
+                // Conversion to complex types not supported
+                return CUPHY_STATUS_INVALID_CONVERSION;
+            }
+            if(!bSuccess)
+            {
+                return CUPHY_STATUS_VALUE_OUT_OF_RANGE;
+            }
+        }
+        break;
+    case CUPHY_R_8F_E5M2:
+        {
+            bool bSuccess = true;
+            switch(convertToType)
+            {
+            case CUPHY_BIT:       var.value.b1 = (static_cast<float>(var.value.r8f_e5m2) == 0.0f) ? 0 : 1;               break;
+            case CUPHY_R_8I:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8i,  __half(var.value.r8f_e5m2)); break;
+            case CUPHY_R_8U:      bSuccess = safe_narrow_float_to_int_cast(var.value.r8u,  __half(var.value.r8f_e5m2)); break;
+            case CUPHY_R_16I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16i, __half(var.value.r8f_e5m2)); break;
+            case CUPHY_R_16U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r16u, __half(var.value.r8f_e5m2)); break;
+            case CUPHY_R_32I:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32i, __half(var.value.r8f_e5m2)); break;
+            case CUPHY_R_32U:     bSuccess = safe_narrow_float_to_int_cast(var.value.r32u, __half(var.value.r8f_e5m2)); break;
+            case CUPHY_R_16F:     var.value.r16f = type_convert<__half>(var.value.r8f_e5m2);                            break;
+            case CUPHY_R_32F:     var.value.r32f = type_convert<float>(var.value.r8f_e5m2);                             break;
+            case CUPHY_R_64F:     var.value.r64f = type_convert<double>(var.value.r8f_e5m2);                            break;
+            case CUPHY_R_8F_E4M3: var.value.r8f_e4m3 = type_convert<__nv_fp8_e4m3>(var.value.r8f_e5m2);                 break;
+            case CUPHY_R_8F_E5M2: /* src and dst types identical */                                                     break;
+            default:
+                // Conversion to complex types not supported
                 return CUPHY_STATUS_INVALID_CONVERSION;
             }
             if(!bSuccess)

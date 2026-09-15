@@ -40,6 +40,8 @@
 #include <optional>
 #include <cuda_profiler_api.h> // cudaProfilerStart / cudaProfilerStop
 #include <unordered_map>
+#include <atomic>
+#include <cassert>
 
 #include "cuphy.hpp" // NOTE: dependences of the following required in test workers:
 // cuda related:   cuphy::stream, cuphy::event, cuphy::cudaContext, cuphy::cuda_exception
@@ -80,30 +82,29 @@ enum testWrkrCmdMsgType
     CUPHY_TEST_WRKR_CMD_MSG_PUSCH_RUN     = 11,
     CUPHY_TEST_WRKR_CMD_MSG_PDSCH_RUN     = 12,
     CUPHY_TEST_WRKR_CMD_MSG_PSCH_RUN      = 13,
-    CUPHY_TEST_WRKR_CMD_MSG_PDSCH_CLEAN   = 14,
-    CUPHY_TEST_WRKR_CMD_MSG_DEINIT        = 15,
-    CUPHY_TEST_WRKR_CMD_MSG_DLBFW_INIT    = 16,
-    CUPHY_TEST_WRKR_CMD_MSG_DLBFW_SETUP   = 17,
-    CUPHY_TEST_WRKR_CMD_MSG_ULBFW_INIT    = 18,
-    CUPHY_TEST_WRKR_CMD_MSG_ULBFW_SETUP   = 19,
-    CUPHY_TEST_WRKR_CMD_MSG_SRS_INIT      = 20,
-    CUPHY_TEST_WRKR_CMD_MSG_SRS_SETUP     = 21,
-    CUPHY_TEST_WRKR_CMD_MSG_PRACH_INIT    = 22,
-    CUPHY_TEST_WRKR_CMD_MSG_PRACH_SETUP   = 23,
-    CUPHY_TEST_WRKR_CMD_MSG_PUCCH_INIT    = 24,
-    CUPHY_TEST_WRKR_CMD_MSG_PUCCH_SETUP   = 25,
-    CUPHY_TEST_WRKR_CMD_MSG_PDCCH_INIT    = 26,
-    CUPHY_TEST_WRKR_CMD_MSG_PDCCH_SETUP   = 27,
-    CUPHY_TEST_WRKR_CMD_MSG_SSB_INIT      = 28,
-    CUPHY_TEST_WRKR_CMD_MSG_SSB_SETUP     = 29,
-    CUPHY_TEST_WRKR_CMD_MSG_CSIRS_INIT    = 30,
-    CUPHY_TEST_WRKR_CMD_MSG_CSIRS_SETUP   = 31,
+    CUPHY_TEST_WRKR_CMD_MSG_DEINIT        = 14,
+    CUPHY_TEST_WRKR_CMD_MSG_DLBFW_INIT    = 15,
+    CUPHY_TEST_WRKR_CMD_MSG_DLBFW_SETUP   = 16,
+    CUPHY_TEST_WRKR_CMD_MSG_ULBFW_INIT    = 17,
+    CUPHY_TEST_WRKR_CMD_MSG_ULBFW_SETUP   = 18,
+    CUPHY_TEST_WRKR_CMD_MSG_SRS_INIT      = 19,
+    CUPHY_TEST_WRKR_CMD_MSG_SRS_SETUP     = 20,
+    CUPHY_TEST_WRKR_CMD_MSG_PRACH_INIT    = 21,
+    CUPHY_TEST_WRKR_CMD_MSG_PRACH_SETUP   = 22,
+    CUPHY_TEST_WRKR_CMD_MSG_PUCCH_INIT    = 23,
+    CUPHY_TEST_WRKR_CMD_MSG_PUCCH_SETUP   = 24,
+    CUPHY_TEST_WRKR_CMD_MSG_PDCCH_INIT    = 25,
+    CUPHY_TEST_WRKR_CMD_MSG_PDCCH_SETUP   = 26,
+    CUPHY_TEST_WRKR_CMD_MSG_SSB_INIT      = 27,
+    CUPHY_TEST_WRKR_CMD_MSG_SSB_SETUP     = 28,
+    CUPHY_TEST_WRKR_CMD_MSG_CSIRS_INIT    = 29,
+    CUPHY_TEST_WRKR_CMD_MSG_CSIRS_SETUP   = 30,
     // cuMAC command messages
-    CUMAC_TEST_WRKR_CMD_MSG_MAC_INIT      = 32,
-    CUMAC_TEST_WRKR_CMD_MSG_MAC_SETUP     = 33,
-    CUMAC_TEST_WRKR_CMD_MSG_MAC_RUN       = 34,
+    CUMAC_TEST_WRKR_CMD_MSG_MAC_INIT      = 31,
+    CUMAC_TEST_WRKR_CMD_MSG_MAC_SETUP     = 32,
+    CUMAC_TEST_WRKR_CMD_MSG_MAC_RUN       = 33,
     // total number of messages
-    N_TEST_WRKR_CMD_MSGS                  = 35,
+    N_TEST_WRKR_CMD_MSGS                  = 34,
     TEST_WRKR_CMD_MSG_INVALID             = N_TEST_WRKR_CMD_MSGS
 };
 
@@ -125,7 +126,6 @@ static constexpr std::array<const char*, N_TEST_WRKR_CMD_MSGS> TEST_WRKR_CMD_MSG
     "CUPHY_TEST_WRKR_CMD_MSG_PUSCH_RUN",
     "CUPHY_TEST_WRKR_CMD_MSG_PDSCH_RUN",
     "CUPHY_TEST_WRKR_CMD_MSG_PSCH_RUN",
-    "CUPHY_TEST_WRKR_CMD_MSG_PDSCH_CLEAN",
     "CUPHY_TEST_WRKR_CMD_MSG_DEINIT",
     "CUPHY_TEST_WRKR_CMD_MSG_DLBFW_INIT",
     "CUPHY_TEST_WRKR_CMD_MSG_DLBFW_SETUP",
@@ -166,30 +166,29 @@ enum testWrkrRspMsgType
     CUPHY_TEST_WRKR_RSP_MSG_PUSCH_RUN     = 11,
     CUPHY_TEST_WRKR_RSP_MSG_PDSCH_RUN     = 12,
     CUPHY_TEST_WRKR_RSP_MSG_PSCH_RUN      = 13,
-    CUPHY_TEST_WRKR_RSP_MSG_PDSCH_CLEAN   = 14,
-    CUPHY_TEST_WRKR_RSP_MSG_DEINIT        = 15,
-    CUPHY_TEST_WRKR_RSP_MSG_DLBFW_INIT    = 16,
-    CUPHY_TEST_WRKR_RSP_MSG_DLBFW_SETUP   = 17,
-    CUPHY_TEST_WRKR_RSP_MSG_ULBFW_INIT    = 18,
-    CUPHY_TEST_WRKR_RSP_MSG_ULBFW_SETUP   = 19,
-    CUPHY_TEST_WRKR_RSP_MSG_SRS_INIT      = 20,
-    CUPHY_TEST_WRKR_RSP_MSG_SRS_SETUP     = 21,
-    CUPHY_TEST_WRKR_RSP_MSG_PRACH_INIT    = 22,
-    CUPHY_TEST_WRKR_RSP_MSG_PRACH_SETUP   = 23,
-    CUPHY_TEST_WRKR_RSP_MSG_PUCCH_INIT    = 24,
-    CUPHY_TEST_WRKR_RSP_MSG_PUCCH_SETUP   = 25,
-    CUPHY_TEST_WRKR_RSP_MSG_PDCCH_INIT    = 26,
-    CUPHY_TEST_WRKR_RSP_MSG_PDCCH_SETUP   = 27,
-    CUPHY_TEST_WRKR_RSP_MSG_SSB_INIT      = 28,
-    CUPHY_TEST_WRKR_RSP_MSG_SSB_SETUP     = 29,
-    CUPHY_TEST_WRKR_RSP_MSG_CSIRS_INIT    = 30,
-    CUPHY_TEST_WRKR_RSP_MSG_CSIRS_SETUP   = 31,
+    CUPHY_TEST_WRKR_RSP_MSG_DEINIT        = 14,
+    CUPHY_TEST_WRKR_RSP_MSG_DLBFW_INIT    = 15,
+    CUPHY_TEST_WRKR_RSP_MSG_DLBFW_SETUP   = 16,
+    CUPHY_TEST_WRKR_RSP_MSG_ULBFW_INIT    = 17,
+    CUPHY_TEST_WRKR_RSP_MSG_ULBFW_SETUP   = 18,
+    CUPHY_TEST_WRKR_RSP_MSG_SRS_INIT      = 19,
+    CUPHY_TEST_WRKR_RSP_MSG_SRS_SETUP     = 20,
+    CUPHY_TEST_WRKR_RSP_MSG_PRACH_INIT    = 21,
+    CUPHY_TEST_WRKR_RSP_MSG_PRACH_SETUP   = 22,
+    CUPHY_TEST_WRKR_RSP_MSG_PUCCH_INIT    = 23,
+    CUPHY_TEST_WRKR_RSP_MSG_PUCCH_SETUP   = 24,
+    CUPHY_TEST_WRKR_RSP_MSG_PDCCH_INIT    = 25,
+    CUPHY_TEST_WRKR_RSP_MSG_PDCCH_SETUP   = 26,
+    CUPHY_TEST_WRKR_RSP_MSG_SSB_INIT      = 27,
+    CUPHY_TEST_WRKR_RSP_MSG_SSB_SETUP     = 28,
+    CUPHY_TEST_WRKR_RSP_MSG_CSIRS_INIT    = 29,
+    CUPHY_TEST_WRKR_RSP_MSG_CSIRS_SETUP   = 30,
     // cuMAC response messages
-    CUMAC_TEST_WRKR_RSP_MSG_MAC_INIT      = 32,
-    CUMAC_TEST_WRKR_RSP_MSG_MAC_SETUP     = 33,
-    CUMAC_TEST_WRKR_RSP_MSG_MAC_RUN       = 34,
+    CUMAC_TEST_WRKR_RSP_MSG_MAC_INIT      = 31,
+    CUMAC_TEST_WRKR_RSP_MSG_MAC_SETUP     = 32,
+    CUMAC_TEST_WRKR_RSP_MSG_MAC_RUN       = 33,
     // total number of response messages
-    N_TEST_WRKR_RSP_MSGS                  = 35,
+    N_TEST_WRKR_RSP_MSGS                  = 34,
     TEST_WRKR_RSP_MSG_INVALID             = N_TEST_WRKR_RSP_MSGS
 };
 
@@ -209,7 +208,6 @@ static constexpr std::array<const char*, N_TEST_WRKR_RSP_MSGS> TEST_WRKR_RSP_MSG
         "CUPHY_TEST_WRKR_RSP_MSG_PUSCH_RUN",
         "CUPHY_TEST_WRKR_RSP_MSG_PDSCH_RUN",
         "CUPHY_TEST_WRKR_RSP_MSG_PSCH_RUN",
-        "CUPHY_TEST_WRKR_RSP_MSG_PDSCH_CLEAN",
         "CUPHY_TEST_WRKR_RSP_MSG_DEINIT",
         "CUPHY_TEST_WRKR_RSP_MSG_DLBFW_INIT",
         "CUPHY_TEST_WRKR_RSP_MSG_DLBFW_SETUP",
@@ -522,6 +520,11 @@ public:
         return m_name;
     };
 
+    inline int32_t getAppliedSmCount() const
+    {
+        return m_smCount;
+    };
+
     void print(bool cbErrors = false, bool isPschTxRx = false, bool waitRsp = true);
     void eval(bool cbErrors = false, bool isPschTxRx = false, bool waitRsp = true);
     void resetEvalBuffers(bool cbErrors = false, bool waitRsp = true);
@@ -626,6 +629,26 @@ enum class ul_anchor_mode_t : uint8_t
     PUCCH = 2  ///< Use PUCCH as UL anchor for relative UL channel start delays.
 };
 
+/**
+ * @brief Selects the DL timeline anchor used by start-delay scheduling.
+ *
+ * Parsed from start_delay.DL_ANCHOR and consumed by the test bench DL scheduler.
+ * When PDSCH, PDCCH/SSB delays are relative to the PDSCH slot start (fewer delay
+ * kernels). When SLOT_BOUNDARY, delays are absolute from the 500 us slot boundary.
+ *
+ * @note Only takes effect when DL_ANCHOR is explicitly set in YAML; when absent, the
+ *       scheduler falls back to SLOT_BOUNDARY (legacy behavior), regardless of the
+ *       C++ default below. Use start_delay_cfg_us::effective_dl_anchor() to read the
+ *       *runtime* anchor; the C++ default is only the value the struct holds when no
+ *       YAML key was provided, and is by convention the explicit-YAML answer the user
+ *       would pick if they opted in.
+ */
+enum class dl_anchor_mode_t : uint8_t
+{
+    PDSCH = 0,          ///< Use PDSCH slot start as DL anchor; PDCCH/SSB delays relative to it. Active only when YAML opts in.
+    SLOT_BOUNDARY = 1   ///< Use 500 us slot boundary as DL anchor; PDCCH/SSB delays absolute from it. Runtime fallback when YAML omits DL_ANCHOR.
+};
+
 // Runtime-configurable start delays (YAML overrides optional).
 // Defaults match the constexpr values above.
 struct start_delay_cfg_us
@@ -638,6 +661,8 @@ struct start_delay_cfg_us
     uint32_t prach_u5      = 0;
     ul_anchor_mode_t ul_anchor_mode = ul_anchor_mode_t::PUSCH; //!< UL anchor selection mode (PUSCH/PRACH/PUCCH) for start-delay scheduling.
     bool     ul_anchor_from_yaml = false; //!< True when UL anchor mode is explicitly provided by YAML start_delay.UL_ANCHOR.
+    dl_anchor_mode_t dl_anchor_mode = dl_anchor_mode_t::PDSCH; //!< DL anchor selection mode (PDSCH/SLOT_BOUNDARY) for PDCCH/SSB start delays.
+    bool     dl_anchor_from_yaml = false; //!< True when DL anchor mode is explicitly provided by YAML start_delay.DL_ANCHOR.
     bool     prach_delay_from_yaml = false;  // if true, PRACH delay is relative to PUSCH1 start; else relative to PUSCH1 end for backward compatibility
     uint32_t dlbfw_slot0_u5 = dlbfwStartSlot0DelayUsU5_;
     uint32_t ssb_u5        = 0;
@@ -658,9 +683,30 @@ struct start_delay_cfg_us
     uint32_t ssb_u6        = pdschStartDelayNoBfwUsU6_;
     uint32_t pdsch_after_bfw_u6 = pdschStartDelayAfterBfwUsU6_;
     uint32_t pdsch_no_bfw_u6    = pdschStartDelayNoBfwUsU6_;
+
+    /**
+     * Returns the *effective* DL anchor for PDCCH/SSB start-delay scheduling.
+     *
+     * Tell-Don't-Ask accessor that combines the two raw fields
+     * (`dl_anchor_mode`, `dl_anchor_from_yaml`) so callers don't reach in.
+     * When `dl_anchor_from_yaml` is `true` the user-selected `dl_anchor_mode`
+     * wins; when `false` the runtime falls back to `SLOT_BOUNDARY` (legacy
+     * behavior, regardless of whatever value `dl_anchor_mode` happens to hold).
+     *
+     * @return Must be checked. `dl_anchor_mode` when `dl_anchor_from_yaml` is
+     *         `true`, otherwise `dl_anchor_mode_t::SLOT_BOUNDARY`.
+     *
+     * @note Marked `[[nodiscard]]` — the result drives the PDCCH/SSB anchor
+     *       selection at every call site, so discarding it would be a bug.
+     */
+    [[nodiscard]] dl_anchor_mode_t effective_dl_anchor() const noexcept
+    {
+        return dl_anchor_from_yaml ? dl_anchor_mode : dl_anchor_mode_t::SLOT_BOUNDARY;
+    }
 };
 
 extern start_delay_cfg_us g_start_delay_cfg_us;
+extern bool g_pucchCascaded;
 
 // Runtime-configurable per-channel test-vector parameter overrides (optional).
 // These override parameters loaded from the H5 TV files, and should be applied
@@ -712,12 +758,29 @@ struct tv_override_cfg
         uint8_t enable_per_prg_channel_estimation = 0;
         bool has_eq_coefficient_algorithm_index = false;
         uint8_t eq_coefficient_algorithm_index = 0;
+        
+        bool has_open_ran_functional_split = false;
+        uint8_t open_ran_functional_split = 0;  // 0=7.2a, 1=7.2e
+        bool has_kernel_sel_option = false;
+        uint8_t kernel_sel_option = 0;  // 0=PUSCH_ALL, 1=PUSCH_NO_FEC, 2=PUSCH_NO_DERATE_MATCHING_FEC, 3=PUSCH_NO_SD_DERATE_MATCHING_FEC
+        bool has_uci_kernel_sel_option = false;
+        uint8_t uci_kernel_sel_option = 0;  // 0=PUSCH_UCI_ALL, 1=PUSCH_UCI_NO_POLAR, 2=PUSCH_UCI_NO_UCI_WITH_SEG, 3=PUSCH_UCI_NO_UCI
+        bool has_delay_us = false;
+        uint32_t delay_us = 0;  // PUSCH full-slot processing delay in us; 0= no delay kernel launch; non-negative; 
+        bool has_sub_slot_delay_us = false;
+        uint32_t sub_slot_delay_us = 0;  // PUSCH sub-slot processing delay in us; 0= no delay kernel launch; non-negative; 
     };
 
     struct pucch_cfg
     {
         bool has_polar_list_length = false;
         uint8_t polar_list_length = 0;
+        bool has_pipeline_processing_mode = false;
+        int32_t pipeline_processing_mode = 0; // 0=FULL, 1=No Polar Decoder
+        bool has_delay_us = false;
+        int32_t delay_us = 0; // GPU busy-wait (us) in the PUCCH pipeline; models polar-decoder latency when benchmarking accelerated / skip-polar paths.
+                                // int32_t allows -1 as a "not-set" sentinel (parse validates >= 0 before setting has_delay_us).
+                                // Applied to cuphyPucchStatPrms_t::pipelineDelayUs (uint32_t) via explicit static_cast after guard check.
     };
 
     struct srs_cfg
@@ -725,12 +788,35 @@ struct tv_override_cfg
         bool has_chest_alg_index = false;
         uint8_t chest_alg_index = 0;
     };
+    
+    struct pdcch_cfg
+    {
+        bool has_kernel_sel_option = false;
+        uint8_t kernel_sel_option = 0;
+        bool has_delay_us = false;
+        uint32_t delay_us = 0;
+    };
+
+    struct pdsch_cfg
+    {
+        bool has_pipeline_processing_mode = false;  //!< True when pipeline_processing_mode was provided by YAML.
+        uint8_t pipeline_processing_mode = 0;       //!< cuphyPdschPipelineMode_t (0=FULL, 1=AAS, 2=POST_FEC, 3=POST_FEC_RM_SCRAMBLING).
+        bool has_delay_us = false;                  //!< True when delay_us was provided by YAML.
+        uint32_t delay_us = 0;                      //!< Modeling delay in µs for the post-FEC pipeline modes (ignored by cuPHY otherwise).
+    };
 
     pusch_cfg pusch;
     pucch_cfg pucch;
     srs_cfg srs;
+    pdsch_cfg pdsch;
+    pdcch_cfg pdcch;
 };
 
 extern tv_override_cfg g_tv_override_cfg;
+
+// Path to a chest_trt YAML that activates the TensorRT AI/ML PUSCH channel estimator.
+// Set via the test bench's --E flag (empty = legacy chest). Intentionally separate from
+// tv_override_cfg: TRT enablement is independent of override_test_vectors.
+extern std::string g_pusch_trt_chest_config;
 
 #endif // !defined(TESTBENCH_COMMON_HPP_INCLUDED_)

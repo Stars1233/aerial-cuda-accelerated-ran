@@ -80,6 +80,7 @@
 #define YAML_UL_ENABLED         "ul_enabled"                     //!< Enable uplink data processing
 #define YAML_DL_ENABLED         "dl_enabled"                     //!< Enable downlink data processing
 #define YAML_DLC_TB             "dlc_tb"                         //!< Enable DL C-plane transport block mode (skip IQ validation)
+#define YAML_PRB_DUP_CHECK      "prb_dup_check"                  //!< Enable C-plane PRB duplicate/missing detection via bitmap
 #define YAML_FOREVER            "forever"                        //!< Run indefinitely (ignore num_slots limit)
 #define YAML_VALIDATE_TIMING    "validate_dl_timing"             //!< Enable downlink packet timing validation
 #define YAML_DL_WARMUP_SLOTS    "dl_warmup_slots"                //!< Number of warmup slots before starting DL validation

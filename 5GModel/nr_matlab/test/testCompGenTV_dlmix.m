@@ -54,55 +54,13 @@ switch compTvMode
         error('compTvMode is not supported...\n');
 end
 
-selected_TC = [100:599, 1000:13900, 20000:29999];
-disabled_TC = [];
-[~,TcIdx] = ismember(disabled_TC, selected_TC);
-selected_TC(TcIdx) = [];
-
-HARQ_TC = [150:189];
-
 % performance pattern table
-% columns: pattern#, start_tv, end_tv, n_cell, n_cell_to_gen
-% n_cell_to_gen: min(total_cells, 21) for 4TR (pattern#<=65), min(total_cells, 7) for 64TR (pattern#>65)
-%                set to 1 if not main perf patterns
-% TV configs are for n_cell but only generate n_cell_to_gen cells for compact set
-perf_pattern_table = [
-% pattern     start_tv  end_tv  n_cell, n_cell_to_gen
-    41,         2828,    2935,    12,     1;  % 41, 42
-    43,         2936,    3079,    16,     1;  % 43, 45
-    44,         3080,    3159,    16,     1;  % 44
-    46,         3160,    3399,    12,     1;  % 46
-    47,         3400,    3719,    16,     1;  % 47
-    48,         3720,    4039,    16,    16;  % 48
-    49,         4040,    4439,    20,    20;  % 49
-    50,         4440,    4759,    16,    16;  % 50
-    51,         4760,    5159,    20,    20;  % 51
-    53,         5160,    5479,    16,     1;  % 53
-    54,         5480,    5879,    20,     1;  % 54
-    55,         6032,    6351,    16,     1;  % 55
-    56,         6352,    6751,    20,     1;  % 56
-    57,         5960,    6031,     8,     1;  % 57
-    58,         6752,    7071,    16,     1;  % 58
-    59,         7072,    7471,    20,    20;  % 59, 59b, 59d
-    59.3,       9472,    10271,   40,    21;  % 59c, 59e, 62c
-    60,         10452,   11251,   40,    21;  % 60, 60b, 60c, 60d, 63c
-    61,         7872,    8271,    20,     1;  % 61
-    65,         11432,   12231,   40,    21;  % 65, 65a, 65b, 65c, 65d
-    66,         11252,   11341,   15,     7;  % 66, 66a, 66b, 66c, 66d
-    67,         11342,   11431,   15,     7;  % 67, 67a, 67b, 67c, 67d
-    69,         12232,   12441,   15,     7;  % 69, 69a, 69b, 69c, 69d, 69e, 71
-    73,         12442,   12721,   20,    10;  % 73
-    75,         12722,   12931,   15,     7;  % 75
-    79,         13067,   13216,   15,     7;  % 79, 79a, 79b
-    81,         13217,   13381,   15,     7;  % 81, 81a, 81b
-    83,         13382,   13546,   15,     7;  % 83, 83a, 83b
-    85,         13547,   13696,   15,     7;  % 85
-    87,         13697,   13711,   15,     7;  % 87, also need 13067~13216 from pattern 79
-    89,         13712,   13801,    9,     9;  % 89
-    91,         13802,   13951,   15,     7;  % 91
-    101,        7472,    7495,    24,    24;  % 101, 101a
-    102,        7496,    7519,    24,    24;  % 102, 102a
-];
+[perf_pattern_table, compact_TV_perf_pattern_cuBB_gpu, perfTvRanges, full_gpu_tvs] = perfPatternTvYaml('tv_table', 'dlmix');
+selected_TC = [100:599, 1000:perfTvRanges.selected_high, 20000:29999];
+disabled_TC = [];
+
+% PERF pattern TV ranges, config strides, and compact-cell counts come from
+% perf_pattern/perf_pattern_helper.yaml so DLMIX, ULMIX, genPerfPattern, and POC2 use one source.
 
 % generate compact TV list from performance patterns
 compact_TV_perf_pattern = [];
@@ -115,17 +73,9 @@ for i = 1:size(perf_pattern_table, 1)
     n_tv_set = (end_tv - start_tv + 1) / n_cell;
     compact_TV_perf_pattern = [compact_TV_perf_pattern, repelem(start_tv:n_cell:end_tv, n_cell_to_gen) + repmat(0:(n_cell_to_gen - 1), 1, n_tv_set)];
 end
+compact_TV_perf_pattern = unique(compact_TV_perf_pattern);
 
-% non-performance pattern compact TVs
-compact_TV_non_perf_pattern = [103, 120:128, 130:135, 141, 142, 143, 144, 150:189, 190, 192:195, 204, 205, 228, 229, 296:461, ...
-                                500, 501, 502, ...
-                                20000:29999]; % mMIMO, multi-cell
-
-% combine both compact TV sets
-compact_TC = [compact_TV_non_perf_pattern, compact_TV_perf_pattern];
-compact_TC = unique(compact_TC);
-
-% only generate FAPI TV in this set for per-MR cicd
+% only generate FAPI TV in this set
 % keep cuPHY TVs for one of each kind
 % generate from perf_pattern_table using setdiff(start:end, start:n_cell:end)
 compact_TV_FAPI_only = [];
@@ -140,20 +90,49 @@ for i = 1:size(perf_pattern_table, 1)
     fapi_only_tvs = setdiff(all_tvs, cuphy_tvs);
     compact_TV_FAPI_only = [compact_TV_FAPI_only, fapi_only_tvs];
 end
+compact_TV_FAPI_only = unique(compact_TV_FAPI_only);
 
-% performance pattern compact TVs required for cuBB GPU test bench
-compact_TV_perf_pattern_cuBB_gpu = [
-    9481, 9696, 9905, 9906, 10047, ... % from 59c
-    7484, ... % from 101
-    7481, ... % from 101a
-    7516, ... % from 102
-];
 compact_TV_FAPI_only = setdiff(compact_TV_FAPI_only, compact_TV_perf_pattern_cuBB_gpu);  % exclude cuBB GPU test bench TVs from FAPI-only set, will generate both cuPHY and FAPI TVs
 
-full_TC = [100:599, 1000:13951, 20000:29999];
+% non-performance pattern compact TVs
+compact_TV_non_perf_pattern = [103, 120:128, 130:135, 141, 142, 143, 144, 150:189, 190, 192:195, 204, 205, 228, 229, 296:461, ...
+                                500, 501, 502, ...
+                                20000:29999]; % mMIMO, multi-cell
 
-MIMO_64TR_TC = [190, 192:195, 281, 296:461, 11252:11431, 12232:13951, 20000:21309];
+% combine both compact TV sets
+compact_TC = [compact_TV_non_perf_pattern, compact_TV_perf_pattern];
+compact_TC = unique(compact_TC);
 
+% full set: for each perf pattern only generate full_cells cells per config
+% block (column 6 of perf_pattern_table). This mirrors the compact-set keep
+% above but with full_cells instead of compact_cells. Built as an additive
+% keep set (not a skip set) so reused/overlapping TV ranges take the most
+% generous full_cells of any pattern that claims the range.
+full_TV_perf_pattern = [];
+full_TV_perf_range   = [];
+for i = 1:size(perf_pattern_table, 1)
+    start_tv     = perf_pattern_table(i, 2);
+    end_tv       = perf_pattern_table(i, 3);
+    n_cell       = perf_pattern_table(i, 4);  % config_cells
+    n_cell_full  = perf_pattern_table(i, 6);  % full_cells
+
+    n_tv_set = (end_tv - start_tv + 1) / n_cell;
+    full_TV_perf_pattern = [full_TV_perf_pattern, repelem(start_tv:n_cell:end_tv, n_cell_full) + repmat(0:(n_cell_full - 1), 1, n_tv_set)];
+    full_TV_perf_range   = [full_TV_perf_range, start_tv:end_tv];
+end
+full_TV_perf_pattern = unique(full_TV_perf_pattern);
+full_TV_perf_range   = unique(full_TV_perf_range);
+
+% build full TC set
+full_TC = [100:599, 1000:perfTvRanges.full_high, 20000:29999];
+full_TC = setdiff(full_TC, full_TV_perf_range);                                  % drop every perf-pattern cell from the blanket range
+full_TC = unique([full_TC, full_TV_perf_pattern, compact_TV_perf_pattern_cuBB_gpu, full_gpu_tvs]);  % add back the full_cells subset, cuBB GPU TVs, and FAPI-only full_gpu_tvs
+[~,TcIdx] = ismember(disabled_TC, selected_TC);
+selected_TC(TcIdx) = [];
+
+% special TCs for different use cases
+HARQ_TC = [150:189];
+MIMO_64TR_TC = [190, 192:195, 281, 296:461, 11252:11431, 12232:13966, 20000:21309];
 negative_TC = [500, 501, 502, 20584, 20585, 20594, 20595, 20831, 20950:20989, 21270:21309, 13547:13696, 13802:13951];
 
 if isnumeric(caseSet)
@@ -178,6 +157,9 @@ if strcmp(caseSet, 'compact') || strcmp(caseSet, 'full')
     TcFapiOnly = compact_TV_FAPI_only;
 else
     TcFapiOnly = [];
+end
+if strcmp(caseSet, 'full')
+    TcFapiOnly = [TcFapiOnly, full_gpu_tvs];  % full_gpu_tvs are extra config-block cells: FAPI only, no cuPHY
 end
 TcFapiOnly = [TcFapiOnly, negative_TC];
 
@@ -4313,7 +4295,50 @@ CFG = {...
     end
     % end pattern 102: 1 UE SU-MIMO, 4 layers, MCS 27, 256QAM, PDSCH only (reduced PRB), 24C
                   
-    % [7520:7871] are available for future DLMIX TVs
+    %% pattern 103: multichannel, 6 UE FDM, 4 layers, MCS 27, 256QAM, PDCCH + PDSCH + TRS + CSI-RS, 24C
+    % DL slot SFN%2=0: PDSCH cfg 1226:1231 (sym1-12) + TRS + CQI (CSI-RS sym 13)
+    % DL slot SFN%2=1: PDSCH cfg 1232:1237 (sym1-13) + TRS
+    % S slot: PDSCH cfg 1238:1243 (sym1-5)
+    % PDCCH: cfg {88,89,90}
+    % TRS: cfg {10,11} (even cell sym 6,10), {14,15} (odd cell sym 5,9)
+    % CQI CSI-RS: cfg {13} (sym 13, SFN%2=0 only)
+                            % TC#  slotIdx   cell    ssb      pdcch      pdsch       csirs
+    row_count = length(CFG);
+    % Group A: SFN%2=0 D slots (sym 1-12 PDSCH + TRS + CQI CSI-RS), TRS beam 0, CSI beam [1,2,3,4]
+    for i = 7520:7543
+        row_count = row_count + 1;
+        if mod(i,2) == 0
+            CFG(row_count, 1:7) = { i    0         1         {}        {88,89,90}   num2cell(1226:1231)   {10,11,13}};
+        else
+            CFG(row_count, 1:7) = { i    0         1         {}        {88,89,90}   num2cell(1226:1231)   {14,15,13}};
+        end
+        TrsBeamIdxMap(i) = 0;
+        CsiBeamIdxMap(i) = [1, 2, 3, 4];
+        CellIdxInPatternMap(i) = mod(i-7520, 24);
+        enableIdentityPrecoderMap(i) = 1;
+    end
+    % Group B: SFN%2=1 D slots (sym 1-13 PDSCH + TRS, no CQI), TRS beam 5
+    for i = 7544:7567
+        row_count = row_count + 1;
+        if mod(i,2) == 0
+            CFG(row_count, 1:7) = { i    0         1         {}        {88,89,90}   num2cell(1232:1237)   {10,11}};
+        else
+            CFG(row_count, 1:7) = { i    0         1         {}        {88,89,90}   num2cell(1232:1237)   {14,15}};
+        end
+        TrsBeamIdxMap(i) = 5;
+        CellIdxInPatternMap(i) = mod(i-7520, 24);
+        enableIdentityPrecoderMap(i) = 1;
+    end
+    % Group C: S slots (sym 1-5 PDSCH, PDCCH only)
+    for i = 7568:7591
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         1         {}        {88,89,90}   num2cell(1238:1243)   {}};
+        CellIdxInPatternMap(i) = mod(i-7520, 24);
+        enableIdentityPrecoderMap(i) = 1;
+    end
+    % end pattern 103: multichannel, 6 UE FDM, 4 layers, 24C
+
+    % [7592:7871] are available for future DLMIX TVs
 
                             % TC#  slotIdx   cell    ssb      pdcch      pdsch       csirs
     %% pattern 60: 7 beams, 100 MHz (273 PRBs), 40C, ave cell, OTA, disjoint PDSCH and CSIRS
@@ -6406,6 +6431,17 @@ CFG = {...
     % slot {76,77,78,79} is the same with {6,7,8,9}
     % end pattern 91: 64TR peak, 100 MHz (273 PRBs), OTA, 25-3 column D TC, 15C, PUSCH CP-OFDM, Mixed PUCCH F1/F3, 1 UEGs, 8 UEs per slot, 1 layer per UE, 24 DL layer with more PUCCH, SRS in S slot (2 symbols)
 
+    %% pattern 201: 4 UE MU-MIMO, 4 layers per UE, MCS 27, 256QAM, PDSCH only, all D slots, 15C
+    % PDSCH: cfg 3081:3084 (4 UEs, all D slot)
+    row_count = length(CFG);
+    for i = 13952:13966
+        row_count = row_count + 1;
+        CFG(row_count, 1:7) = { i    0         10        {}        {}    num2cell(3081:3084)     {}};
+        CellIdxInPatternMap(i) = mod(i-13952, 15);
+        pdschDynamicBfMap(i) = 1;
+    end
+    % end pattern 201: 4 UE MU-MIMO, 4 layers per UE, MCS 27, 256QAM, PDSCH only, 15C
+
     % NOTE: use getLargestTvNum(CFG, threshold) to see the current largest DLMIX TV numbers for <threshold and >= threshold
     %       Search for "available for future DLMIX TVs" to find the avaiable DLMIX TV numbers smaller than that
     largestTvNum = getLargestTvNum(CFG, 20000);
@@ -6623,7 +6659,14 @@ CFG_PDCCH = { ...
    86, 160,   0,   0,    1,    1,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0}, num2cell(ones(1,16)), {39},   {[zeros(1,8) ones(1, 19)]};  % PDCCH for DL
    % PDCCH DCI1_1x24   
    87, 273,   0,   0,    1,    1,    0,    6,    0,   0,      1,    0,        {0},        {41},  {0}, num2cell(ones(1,24)), {39},   {[zeros(1,8) ones(1, 38)]};  % PDCCH for DL
-   };
+% cfg# nBWP BWP0 sym0  Nsym crstIdx intl nBndl nIntl nShift nDCI isCSS       rnti      scrbId   scrbRnti    aggrL    Npayload   coresetMap
+   % pattern 103: DCI0_1 x6, AggLvl 4, interleaverSize=2, regBundleSize=2 (24 CCEs = 144 PRBs)
+   88, 273,   0,   0,    1,    2,    1,    2,    2,   0,      6,    0,        {0},        {0},       {0},  {4 4 4 4 4 4},    {39},   {ones(1, 24)};
+   % pattern 103: DCI1_1 x5, AggLvl 4, interleaverSize=2, regBundleSize=2 (20 CCEs = 120 PRBs)
+   89, 273,   0,   0,    1,    2,    1,    2,    2,   0,      6,    0,        {0},        {0},       {0},  {4 4 4 4 4},      {39},   {[zeros(1,24) ones(1, 20)]};
+   % pattern 103: DCI1_1 x1, AggLvl 1, non-interleaved (1 CCE = 6 PRBs, interleaving disabled for AggLvl 1 compatibility)
+   90, 273,   0,   0,    1,    2,    0,    2,    0,   0,      1,    0,        {0},        {0},       {0},  {1},              {39},   {[zeros(1,44) ones(1, 1)]};
+  };
 % NOTE: For HARQ test cases, coresetMap will be overwritting based on aggregation level (using mapOnes and mapZeros)
 
 
@@ -8134,6 +8177,30 @@ CFG_PDSCH = {...
    1224,  1,     27,   4,    0,  273,  0,   14,     0,    0,    273,     7,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, all D slot
    % 4TR PDSCH: PRB 0~53, OFDM symbol 0~13
    1225,  1,     27,   4,    0,   54,  0,   14,     0,    0,    273,     7,    0,     41,     2,      1,     0,     41,      2,   0,   0;  % 1 UE SU-MIMO, all D slot
+    % pattern 103: 6 UE FDM, 4 layers, MCS 27, 256QAM, OFDM symbol 1-12, PRBs 0-272 (46+46+46+46+46+43=273, even PRB boundaries)
+% cfg#  mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym   SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+    1226,  1,       27,  4,   0,  46,  1,     12,     0,    0,    273,     0,    0,     41,     2,      1,     1,     41,      2,   0,   0;
+    1227,  1,       27,  4,  46,  46,  1,     12,     0,    0,    273,     1,    0,     41,     2,      1,     1,     41,      2,   0,   1;
+    1228,  1,       27,  4,  92,  46,  1,     12,     0,    0,    273,     2,    0,     41,     2,      1,     1,     41,      2,   0,   2;
+    1229,  1,       27,  4, 138,  46,  1,     12,     0,    0,    273,     3,    0,     41,     2,      1,     1,     41,      2,   0,   3;
+    1230,  1,       27,  4, 184,  46,  1,     12,     0,    0,    273,     4,    0,     41,     2,      1,     1,     41,      2,   0,   4;
+    1231,  1,       27,  4, 230,  43,  1,     12,     0,    0,    273,     5,    0,     41,     2,      1,     1,     41,      2,   0,   5;
+    % pattern 103: 6 UE FDM, 4 layers, MCS 27, 256QAM, OFDM symbol 1-13, PRBs 0-272 (46+46+46+46+46+43=273, even PRB boundaries)
+% cfg#  mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym   SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+    1232,  1,       27,  4,   0,  46,  1,     13,     0,    0,    273,     0,    0,     41,     2,      1,     1,     41,      2,   0,   0;
+    1233,  1,       27,  4,  46,  46,  1,     13,     0,    0,    273,     1,    0,     41,     2,      1,     1,     41,      2,   0,   1;
+    1234,  1,       27,  4,  92,  46,  1,     13,     0,    0,    273,     2,    0,     41,     2,      1,     1,     41,      2,   0,   2;
+    1235,  1,       27,  4, 138,  46,  1,     13,     0,    0,    273,     3,    0,     41,     2,      1,     1,     41,      2,   0,   3;
+    1236,  1,       27,  4, 184,  46,  1,     13,     0,    0,    273,     4,    0,     41,     2,      1,     1,     41,      2,   0,   4;
+    1237,  1,       27,  4, 230,  43,  1,     13,     0,    0,    273,     5,    0,     41,     2,      1,     1,     41,      2,   0,   5;
+    % pattern 103: 6 UE FDM, 4 layers, MCS 27, 256QAM, OFDM symbol 1-5 (S slot), PRBs 0-272 (46+46+46+46+46+43=273, even PRB boundaries)
+% cfg#  mcsTable  mcs  nl  rb0  Nrb  sym0   Nsym   SCID  BWP0   nBWP   RNTI  rvIdx dataScId  dmrs0  maxLen addPos dmrsScId nCdm port0 idxUeg
+    1238,  1,       27,  4,   0,  46,  1,      5,     0,    0,    273,     0,    0,     41,     2,      1,     1,     41,      2,   0,   0;
+    1239,  1,       27,  4,  46,  46,  1,      5,     0,    0,    273,     1,    0,     41,     2,      1,     1,     41,      2,   0,   1;
+    1240,  1,       27,  4,  92,  46,  1,      5,     0,    0,    273,     2,    0,     41,     2,      1,     1,     41,      2,   0,   2;
+    1241,  1,       27,  4, 138,  46,  1,      5,     0,    0,    273,     3,    0,     41,     2,      1,     1,     41,      2,   0,   3;
+    1242,  1,       27,  4, 184,  46,  1,      5,     0,    0,    273,     4,    0,     41,     2,      1,     1,     41,      2,   0,   4;
+    1243,  1,       27,  4, 230,  43,  1,      5,     0,    0,    273,     5,    0,     41,     2,      1,     1,     41,      2,   0,   5;
 };
 
 % append generated PXSCH config
@@ -8537,6 +8604,20 @@ cfgUeg.sym0 = 1;
 cfgUeg.Nsym = 13;
 cfgUeg.nl = 1;
 cfgUeg.prgSize = 16;
+CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
+CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
+
+% 64TR MU-MIMO, 1 UEG, 4 UEs per UEG, 4 layers per UE, PDSCH prb 0~272, OFDM symbol 0~13, 100 MHz, CFG 3081:3084
+cfgUeg = baseCfgUeg;
+cfgUeg.pxsch_cfg_idx = CFG_PDSCH{end, 1} + 1;
+cfgUeg.nUeg = 1;
+cfgUeg.nUePerUeg = 4;
+cfgUeg.startPrb = 0;
+cfgUeg.endPrb = 272;
+cfgUeg.sym0 = 0;
+cfgUeg.Nsym = 14;
+cfgUeg.nl = 4;
+cfgUeg.prgSize = 2;
 CFG_PDSCH_temp = genPxschUegCfg(cfgUeg);
 CFG_PDSCH = [CFG_PDSCH; CFG_PDSCH_temp];
 
@@ -9137,83 +9218,88 @@ parfor n = 1:NallTest
         % config PDCCH
         cfg = CFG{idxSet, 5};
         
-        if ismember(caseNum, [150:189, MIMO_64TR_TC]) % HARQ TC, 64TR
-            idx_dci = 0;
+        if ismember(caseNum, [150:189, 7520:7591, MIMO_64TR_TC]) % HARQ TC, 64TR, pattern 103
             mapZeros = zeros(1,14); % track for all OFDM symbols
+            idx_dci = 0;
+            idx_ue_cur = 0;
             for idxDLUL = 1:length(cfg)
                 idxCfg = find(cellfun(@(x) isequal(x,cfg{idxDLUL}), CFG_PDCCH(:,1)));
-                nPdcch =  length(CFG_PDCCH{idxCfg, 16});
+                aggL = cell2mat(CFG_PDCCH{idxCfg, 16});
+                nPdcch = length(aggL);
+                SysPar.pdcch{idxDLUL} = cfgPdcch;
+                SysPar.pdcch{idxDLUL}.BWPSize = CFG_PDCCH{idxCfg, 2};
+                SysPar.pdcch{idxDLUL}.BWPStart = CFG_PDCCH{idxCfg, 3};
+                SysPar.pdcch{idxDLUL}.StartSymbolIndex = CFG_PDCCH{idxCfg, 4};
+                SysPar.pdcch{idxDLUL}.DurationSymbols = CFG_PDCCH{idxCfg, 5};
+                SysPar.pdcch{idxDLUL}.coresetIdx = CFG_PDCCH{idxCfg, 6} + idxDLUL - 1;
+                SysPar.pdcch{idxDLUL}.CceRegMappingType = CFG_PDCCH{idxCfg, 7};
+                SysPar.pdcch{idxDLUL}.RegBundleSize =  CFG_PDCCH{idxCfg, 8};
+                SysPar.pdcch{idxDLUL}.InterleaverSize =  CFG_PDCCH{idxCfg, 9};
+                SysPar.pdcch{idxDLUL}.ShiftIndex =  CFG_PDCCH{idxCfg, 10};
+                SysPar.pdcch{idxDLUL}.numDlDci = nPdcch;
+                SysPar.pdcch{idxDLUL}.isCSS =  CFG_PDCCH{idxCfg, 12};
+                SysPar.pdcch{idxDLUL}.forceCceIndex = 1;
+                if ismember(idxCfg, [25:38, 53, 55, 57, 61, 63, 64, 66, 67, 69, 70, 72, 73, 75, 80, 81, 83, 84, 86, 89, 90]) % 64TR + pattern 103
+                    SysPar.pdcch{idxDLUL}.dciUL = 0;
+                elseif ismember(idxCfg, [39:52, 54, 56, 58, 62, 65, 68, 71, 74, 82, 85, 88])
+                    SysPar.pdcch{idxDLUL}.dciUL = 1;
+                end
+                ofdmSymbolIdx = SysPar.pdcch{idxDLUL}.StartSymbolIndex + (0:SysPar.pdcch{idxDLUL}.DurationSymbols-1);
+                % One zero-prefix per CFG_PDCCH entry (vs prior cores/symbols); DCIs pack back-to-back on PRBs.
+                coresetMapMerged = zeros(1, max(mapZeros(ofdmSymbolIdx+1)));
+                for idxPdcch = 1:nPdcch
+                    coresetMapMerged = [coresetMapMerged, ones(1, aggL(idxPdcch))]; %#ok<AGROW>
+                end
+                if nPdcch > 0
+                    mapZeros(ofdmSymbolIdx+1) = max(mapZeros(ofdmSymbolIdx+1)) + sum(aggL);
+                end
+                SysPar.pdcch{idxDLUL}.coresetMap = coresetMapMerged;
+                SysPar.pdcch{idxDLUL}.idxUE = idx_ue_cur + (0:nPdcch-1);
+                idx_ue_cur = idx_ue_cur + nPdcch;
+                DCI = SysPar.pdcch{idxDLUL}.DCI{1};
+                SysPar.pdcch{idxDLUL}.DCI = [];
+                cceIdx = 0;
                 for idxPdcch = 1:nPdcch
                     idx_dci = idx_dci + 1;
-                    SysPar.pdcch{idx_dci} = cfgPdcch;
-                    SysPar.pdcch{idx_dci}.BWPSize = CFG_PDCCH{idxCfg, 2};
-                    SysPar.pdcch{idx_dci}.BWPStart = CFG_PDCCH{idxCfg, 3};
-                    SysPar.pdcch{idx_dci}.StartSymbolIndex = CFG_PDCCH{idxCfg, 4};
-                    SysPar.pdcch{idx_dci}.DurationSymbols = CFG_PDCCH{idxCfg, 5};
-                    SysPar.pdcch{idx_dci}.coresetIdx = CFG_PDCCH{idxCfg, 6} + idx_dci - 1;
-                    SysPar.pdcch{idx_dci}.CceRegMappingType = CFG_PDCCH{idxCfg, 7};
-                    SysPar.pdcch{idx_dci}.RegBundleSize =  CFG_PDCCH{idxCfg, 8};
-                    SysPar.pdcch{idx_dci}.InterleaverSize =  CFG_PDCCH{idxCfg, 9};
-                    SysPar.pdcch{idx_dci}.ShiftIndex =  CFG_PDCCH{idxCfg, 10};
-                    % SysPar.pdcch{idx_dci}.numDlDci =  CFG_PDCCH{idxCfg, 11};
-                    SysPar.pdcch{idx_dci}.numDlDci =  1;
-                    SysPar.pdcch{idx_dci}.isCSS =  CFG_PDCCH{idxCfg, 12};
-                    SysPar.pdcch{idx_dci}.forceCceIndex = 1;
-                    if ismember(idxCfg, [25:38, 53, 55, 57, 61, 63, 64, 66, 67, 69, 70, 72, 73, 75, 80, 81, 83, 84, 86]) % 64TR
-                        SysPar.pdcch{idx_dci}.dciUL = 0;
-                    elseif ismember(idxCfg, [39:52, 54, 56, 58, 62, 65, 68, 71, 74, 82, 85]) 
-                        SysPar.pdcch{idx_dci}.dciUL = 1;
-                    end
-                    % SysPar.pdcch{idx_dci}.coresetMap = cell2mat(CFG_PDCCH{idxCfg, 18});
-                    aggL = cell2mat(CFG_PDCCH{idxCfg, 16});
-                    
-                    ofdmSymbolIdx = SysPar.pdcch{idx_dci}.StartSymbolIndex + (0:SysPar.pdcch{idx_dci}.DurationSymbols-1);
-                    mapOnes = aggL(idxPdcch);
-                    SysPar.pdcch{idx_dci}.coresetMap = [zeros(1, max(mapZeros(ofdmSymbolIdx+1))), ones(1, mapOnes)];
-                    mapZeros(ofdmSymbolIdx+1) = max(mapZeros(ofdmSymbolIdx+1)) + mapOnes;
-                    
-                    SysPar.pdcch{idx_dci}.idxUE = idx_dci-1;
-                    
+                    SysPar.pdcch{idxDLUL}.DCI{idxPdcch} = DCI;
                     if length(CFG_PDCCH{idxCfg, 13})==1
-                        SysPar.pdcch{idx_dci}.DCI{1}.RNTI = CFG_PDCCH{idxCfg, 13}{1} + idxPdcch;
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.RNTI = CFG_PDCCH{idxCfg, 13}{1} + idx_dci;
                     else
-                        SysPar.pdcch{idx_dci}.DCI{1}.RNTI = CFG_PDCCH{idxCfg, 13}{idxPdcch};
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.RNTI = CFG_PDCCH{idxCfg, 13}{idxPdcch};
                     end
-                    
                     if length(CFG_PDCCH{idxCfg, 14})==1
-                        %                     SysPar.pdcch{idx_dci}.DCI{1}.ScramblingId = CFG_PDCCH{idxCfg, 14}{1} + idx;
-                        SysPar.pdcch{idx_dci}.DCI{1}.ScramblingId = CFG_PDCCH{idxCfg, 14}{1};
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.ScramblingId = CFG_PDCCH{idxCfg, 14}{1};
                     else
-                        SysPar.pdcch{idx_dci}.DCI{1}.ScramblingId = CFG_PDCCH{idxCfg, 14}{idxPdcch};
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.ScramblingId = CFG_PDCCH{idxCfg, 14}{idxPdcch};
                     end
-                    
                     if length(CFG_PDCCH{idxCfg, 15}) == 1
-                        SysPar.pdcch{idx_dci}.DCI{1}.ScramblingRNTI = CFG_PDCCH{idxCfg, 15}{1} + idxPdcch;
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.ScramblingRNTI = CFG_PDCCH{idxCfg, 15}{1} + idx_dci;
                     else
-                        SysPar.pdcch{idx_dci}.DCI{1}.ScramblingRNTI = CFG_PDCCH{idxCfg, 15}{idx_dci};
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.ScramblingRNTI = CFG_PDCCH{idxCfg, 15}{idx_dci};
                     end
-                    
                     if length(CFG_PDCCH{idxCfg, 16}) == 1
-                        SysPar.pdcch{idx_dci}.DCI{1}.AggregationLevel = CFG_PDCCH{idxCfg, 16}{1};
+                        aggrLVal = CFG_PDCCH{idxCfg, 16}{1};
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.AggregationLevel = aggrLVal;
                     else
-                        SysPar.pdcch{idx_dci}.DCI{1}.AggregationLevel = CFG_PDCCH{idxCfg, 16}{idxPdcch};
+                        aggrLVal = CFG_PDCCH{idxCfg, 16}{idxPdcch};
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.AggregationLevel = aggrLVal;
                     end
-                    
                     if length(CFG_PDCCH{idxCfg, 17}) == 1
-                        SysPar.pdcch{idx_dci}.DCI{1}.PayloadSizeBits = CFG_PDCCH{idxCfg, 17}{1};
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.PayloadSizeBits = CFG_PDCCH{idxCfg, 17}{1};
                     else
-                        SysPar.pdcch{idx_dci}.DCI{1}.PayloadSizeBits = CFG_PDCCH{idxCfg, 17}{idxPdcch};
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.PayloadSizeBits = CFG_PDCCH{idxCfg, 17}{idxPdcch};
                     end
-                    
                     if length(CFG_PDCCH{idxCfg, 17}) == 1
-                        SysPar.pdcch{idx_dci}.DCI{1}.Payload = round(rand(1, CFG_PDCCH{idxCfg, 17}{1}));
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.Payload = round(rand(1, CFG_PDCCH{idxCfg, 17}{1}));
                     else
-                        SysPar.pdcch{idx_dci}.DCI{1}.Payload = round(rand(1, CFG_PDCCH{idxCfg, 17}{idxPdcch}));
+                        SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.Payload = round(rand(1, CFG_PDCCH{idxCfg, 17}{idxPdcch}));
                     end
-                    SysPar.pdcch{idx_dci}.DCI{1}.cceIndex = 0;
+                    SysPar.pdcch{idxDLUL}.DCI{idxPdcch}.cceIndex = cceIdx;
+                    cceIdx = cceIdx + aggrLVal;
                 end
             end
-            testAlloc.pdcch = idx_dci;
+            testAlloc.pdcch = length(cfg);
+            testAlloc.pdcchTotalDci = idx_dci;
         else  % non HARQ TC      
             for idx = 1:length(cfg)
                 idxCfg = find(cellfun(@(x) isequal(x,cfg{idx}), CFG_PDCCH(:,1)));
@@ -9994,7 +10080,12 @@ parfor n = 1:NallTest
             SysPar.prach{1}.msg1_FDM = 4; 
         end        
         
-        SysPar.SimCtrl.N_UE = max([2, testAlloc.pdsch, testAlloc.pdcch, testAlloc.csirs]);
+        if isfield(testAlloc, 'pdcchTotalDci')
+            nUeFromPdcch = testAlloc.pdcchTotalDci;
+        else
+            nUeFromPdcch = testAlloc.pdcch;
+        end
+        SysPar.SimCtrl.N_UE = max([2, testAlloc.pdsch, nUeFromPdcch, testAlloc.csirs]);
         SysPar.testAlloc = testAlloc;
         
         if caseNum == 103
@@ -10037,7 +10128,7 @@ parfor n = 1:NallTest
             SysPar.Chan{1}.SNR = 100;
             SysPar.SimCtrl.timeDomainSim = 1;
             
-             if ismember(caseNum, [190,192:194,280,281,296,12232:13951,20560:20831,20840:20861,20870:21309])  % nrSim pattern 90624~90636,90638~90662 and perf pattern 69,69a,69b,69c,69d,69e,71,73,75,77,79,81,83,85,87,89,91
+             if ismember(caseNum, [190,192:194,280,281,296,12232:13966,20560:20831,20840:20861,20870:21309])  % nrSim pattern 90624~90636,90638~90662 and perf pattern 69,69a,69b,69c,69d,69e,71,73,75,77,79,81,83,85,87,89,91,201
                 SysPar.SimCtrl.genTV.fhMsgMode = 2; % enable modulation compression
                 if enableCsiRs32PortsMap.isKey(caseNum) && enableCsiRs32PortsMap(caseNum) == 1
                     SysPar.SimCtrl.nPort_enable_csirs_compression = 32;

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,7 +61,8 @@ uintCRC_t computeCRC(const uint8_t* input,
     uintCRC_t allOnesMask = static_cast<uintCRC_t>(-1);
     if((sizeof(uintCRC_t) * 8 - uintCRCBitLength) > 0)
         allOnesMask >>= (sizeof(uintCRC_t) * 8 - uintCRCBitLength - 1);
-    for(int i = 0; i < size * stride; i += stride)
+    const uint64_t limit = static_cast<uint64_t>(size) * stride;
+    for(uint64_t i = 0; i < limit; i += stride)
     {
         crc ^= static_cast<uintCRC_t>(input[i] << (uintCRCBitLength - 8));
         for(int b = 0; b < 8; b++)

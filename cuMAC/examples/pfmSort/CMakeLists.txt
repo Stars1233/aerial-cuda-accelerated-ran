@@ -15,5 +15,5 @@
 
 add_executable(pfmSortTest)
 target_sources(pfmSortTest PRIVATE pfmSortTest.cpp main.cpp)
-target_link_libraries(pfmSortTest PRIVATE cumac ${HDF5_CXX_LIBRARIES} chanModels yaml-cpp yaml)
+target_link_libraries(pfmSortTest PRIVATE cumac ${HDF5_CXX_LIBRARIES} gpu3gppchan yaml-cpp yaml)
 target_include_directories(pfmSortTest PRIVATE ${HDF5_CXX_INCLUDE_DIRS})

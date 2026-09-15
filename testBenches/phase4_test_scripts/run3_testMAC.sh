@@ -29,6 +29,47 @@ CONFIG_DIR=$cuBB_SDK
 
 BUILD_DIR=build.$(uname -m)
 
+valid_channels=("PUSCH" "PDSCH" "PDCCH_UL" "PDCCH_DL" "PBCH" "PUCCH" "PRACH" "CSI_RS" "SRS" "BFW_DL" "BFW_UL" "all")
+
+normalize_channels() {
+  local channels="$1"
+
+  if [ "$channels" == "all" ]; then
+    echo "all"
+    return 0
+  fi
+
+  if [[ "$channels" =~ ^0x[0-9A-Fa-f]+$ ]]; then
+    local channels_dec
+    channels_dec=$(printf "%d" "$channels")
+    if [[ $channels_dec -gt 2047 ]]; then
+      echo "Error: Invalid channel bitmask '$channels'. Max value 0x7FF" >&2
+      return 1
+    fi
+    echo "$channels"
+    return 0
+  fi
+
+  IFS='+,' read -ra channel_list <<< "$channels"
+  local new_channels=""
+  local channel
+
+  for channel in "${channel_list[@]}"; do
+    if [[ ! " ${valid_channels[*]} " =~ " $channel " ]]; then
+      echo "Error: Invalid channel '$channel' found in --channels." >&2
+      echo "List of valid channels: ${valid_channels[*]}" >&2
+      return 1
+    fi
+    if [ -n "$new_channels" ]; then
+      new_channels="$new_channels"+"$channel"
+    else
+      new_channels="$channel"
+    fi
+  done
+
+  echo "$new_channels"
+}
+
 show_usage() {
   echo "Usage: $0 [options]"
   echo
@@ -39,23 +80,32 @@ show_usage() {
   echo "  --timeout <seconds>       Kill test_mac after seconds"
   echo "  --gdb_script <script>     Specify the gdb script to use."
   echo "  --ml2 <0|1>               Select Multi-L2 instance: 0 for first instance (ML2_CELL_MASK0), 1 for second (ML2_CELL_MASK1 + TESTMAC1_YAML)"
+  echo "  --ru_emulator_host <host> Hostname of the RU emulator; if set, test_mac waits for RU readiness before first cell_init"
+  echo "  --channels <channel_names> OR <bit_mask>"
+  echo "                            Override channels from test_config.sh for this run only."
+  echo "                            Channel names may be separated by ',' or '+' (e.g. PDSCH+PDCCH_DL+PBCH+CSI_RS)."
+  echo "                            Alternatively, specify a hex bit-mask (e.g. 0x29A)."
+  echo "                            Use 'all' to run all channels."
   echo "  -h, --help                Show this help message."
   echo
   echo "Example:"
   echo "  $0 --build_dir build_dbg"
   echo "  $0 --ml2 0"
   echo "  $0 --ml2 1"
+  echo "  $0 --channels PDSCH+PDCCH_DL+PBCH+CSI_RS+BFW_DL"
   echo
   echo "  to run test_mac in $cuBB_SDK/build_dbg path."
-  echo "  Note that test_mac runs for channels set in test_config.sh (by default, all channels)."
+  echo "  By default, test_mac runs for channels set in test_config.sh (all channels if unset there)."
   exit 1
 }
 
 TIMEOUT=0
 GDB_SCRIPT=""
-CELL_MASK=""
-CONFIG_YAML=""
+CELL_MASK=()
+CONFIG_YAML=()
 ML2_INSTANCE=""
+RU_EMULATOR_HOST=""
+CHANNELS_ARG=""
 
 # Parse additional options
 while [[ $# -gt 0 ]]; do
@@ -135,6 +185,32 @@ while [[ $# -gt 0 ]]; do
       fi
       shift 2
       ;;
+    --ru_emulator_host=*)
+      RU_EMULATOR_HOST="${1#*=}"
+      shift
+      ;;
+    --ru_emulator_host)
+      if [[ -z "$2" || "$2" == -* ]]; then
+        echo "Error: Missing value for --ru_emulator_host option"
+        show_usage
+        exit 1
+      fi
+      RU_EMULATOR_HOST="$2"
+      shift 2
+      ;;
+    --channels=*)
+      CHANNELS_ARG="${1#*=}"
+      shift
+      ;;
+    --channels)
+      if [[ -z "$2" || "$2" == -* ]]; then
+        echo "Error: Missing value for --channels option"
+        show_usage
+        exit 1
+      fi
+      CHANNELS_ARG="$2"
+      shift 2
+      ;;
     -h|--help)
       show_usage
       exit 0
@@ -171,7 +247,7 @@ if [[ -n "$ML2_INSTANCE" ]]; then
     fi
     if [[ "$ML2_INSTANCE" == "0" ]]; then
         if [[ -n "$ML2_CELL_MASK0" ]]; then
-            CELL_MASK="--cells $ML2_CELL_MASK0"
+            CELL_MASK=(--cells "$ML2_CELL_MASK0")
             echo "Using Multi-L2 instance 0: CELL_MASK=$ML2_CELL_MASK0"
         else
             echo "Error: ML2_CELL_MASK0 not found in test_config_summary.sh. Multi-L2 mode may not be configured."
@@ -179,7 +255,7 @@ if [[ -n "$ML2_INSTANCE" ]]; then
         fi
     elif [[ "$ML2_INSTANCE" == "1" ]]; then
         if [[ -n "$ML2_CELL_MASK1" ]]; then
-            CELL_MASK="--cells $ML2_CELL_MASK1"
+            CELL_MASK=(--cells "$ML2_CELL_MASK1")
             echo "Using Multi-L2 instance 1: CELL_MASK=$ML2_CELL_MASK1"
         else
             echo "Error: ML2_CELL_MASK1 not found in test_config_summary.sh. Multi-L2 mode may not be configured."
@@ -187,7 +263,7 @@ if [[ -n "$ML2_INSTANCE" ]]; then
         fi
         if [[ -n "$TESTMAC1_YAML" ]]; then
             mac_yaml_file="${TESTMAC1_YAML##*/}"
-            CONFIG_YAML="--config $mac_yaml_file"
+            CONFIG_YAML=(--config "$mac_yaml_file")
             echo "Using Multi-L2 instance 1: CONFIG=$mac_yaml_file"
         else
             echo "Error: TESTMAC1_YAML not found in test_config_summary.sh. Multi-L2 mode may not be configured."
@@ -207,26 +283,33 @@ else
 fi
 
 #-------------------------------------------------------------------------------------------------------
-# Check first interface (always required)
-ACTUAL_DU_MAC_ADDRESS_0=$(cat /sys/class/net/"${DU_ETH_INTERFACE_0}"/address)
-if [ "$ACTUAL_DU_MAC_ADDRESS_0" != "$DU_MAC_ADDRESS_0" ]; then
-    echo "Error: MAC addresses do not match for interface 0. Expected $ACTUAL_DU_MAC_ADDRESS_0, but reading $DU_MAC_ADDRESS_0 from logs. Please ensure to run setup1_DU.sh and setup2_RU.sh before running run3_testMAC.sh"
-    exit 1
-fi
-
-# Check second interface if running in 2-port mode
-if [ "${NUM_PORTS:-1}" -eq 2 ]; then
-    ACTUAL_DU_MAC_ADDRESS_1=$(cat /sys/class/net/"${DU_ETH_INTERFACE_1}"/address)
-    if [ "$ACTUAL_DU_MAC_ADDRESS_1" != "$DU_MAC_ADDRESS_1" ]; then
-        echo "Error: MAC addresses do not match for interface 1. Expected $ACTUAL_DU_MAC_ADDRESS_1, but reading $DU_MAC_ADDRESS_1 from logs. Please ensure to run setup1_DU.sh and setup2_RU.sh before running run3_testMAC.sh"
+# Verify interface MAC addresses match config
+for ((p=0; p<${NUM_PORTS:-1}; p++)); do
+    iface_var="DU_ETH_INTERFACE_${p}"
+    mac_var="DU_MAC_ADDRESS_${p}"
+    iface="${!iface_var}"
+    expected_mac="${!mac_var}"
+    if [[ -z "$iface" || -z "$expected_mac" ]]; then
+        echo "Error: DU_ETH_INTERFACE_$p or DU_MAC_ADDRESS_$p not set. Please ensure setup1_DU.sh and setup2_RU.sh completed successfully."
         exit 1
     fi
-fi
+    actual_mac=$(cat /sys/class/net/"${iface}"/address)
+    if [ "$actual_mac" != "$expected_mac" ]; then
+        echo "Error: MAC addresses do not match for interface $p. Expected $expected_mac (from config), but interface reports $actual_mac. Please ensure to run setup1_DU.sh and setup2_RU.sh before running run3_testMAC.sh"
+        exit 1
+    fi
+done
 
 #-------------------------------------------------------------------------------------------------------
 #-------------------------------------------------------------------------------------------------------
-# pattern, channels and number of cells from test_config_summary.sh
-NUM_CELLS="${NUM_CELLS}C"
+# Pattern, channels, and cell topology from test_config_summary.sh.
+if [[ -n "$CHANNELS_ARG" ]]; then
+    CHANNELS=$(normalize_channels "$CHANNELS_ARG") || exit 1
+    echo "Using command-line channel override: $CHANNELS"
+fi
+
+CELL_TOPOLOGY="${CELL_TOPOLOGY:-${NUM_CELLS}C}"
+IFS='_' read -ra CELL_TOPOLOGY_ARGS <<< "$CELL_TOPOLOGY"
 if [ "$CHANNELS" == "all" ]; then
     CHANNELS=()
 else
@@ -234,20 +317,34 @@ else
 fi
 
 
-if [ $TIMEOUT -gt 0 ]; then
-    WITH_TIMEOUT="timeout --kill-after=10 ${TIMEOUT}"
+if [ "$TIMEOUT" -gt 0 ]; then
+    WITH_TIMEOUT=(timeout --kill-after=10 "$TIMEOUT")
 else
-    WITH_TIMEOUT=""
+    WITH_TIMEOUT=()
 fi
+
+GDB_SCRIPT_ARGS=()
+if [[ -n "$GDB_SCRIPT" ]]; then
+    GDB_SCRIPT_ARGS=("$GDB_SCRIPT")
+fi
+
+RU_HOST_ARG=()
+if [[ -n "$RU_EMULATOR_HOST" ]]; then
+    RU_HOST_ARG=(--ru_emulator_host "$RU_EMULATOR_HOST")
+fi
+
+print_command() {
+    printf '%q ' "$@"
+    echo
+}
 
 #-------------------------------------------------------------------------------------------------------
 if [[ "$CONTROLLER_MODE" == *nrSim_SCF* ]]; then
-    NRSIM_TC=$(echo "$CONTROLLER_MODE" | sed -E 's/nrSim_SCF_(CG1_)?//')
-    echo "$WITH_TIMEOUT stdbuf --output=L $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac nrSim $NRSIM_TC" "${CHANNELS[@]}" "$CELL_MASK" "$CONFIG_YAML"
-    { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT stdbuf --output=L $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" nrSim $NRSIM_TC "${CHANNELS[@]}" $CELL_MASK $CONFIG_YAML; RET=$?; } || true
+    NRSIM_TC=$(echo "$CONTROLLER_MODE" | sed -E 's/nrSim_SCF_(CG1_|SPRK_|MGX1_)?//')
+    print_command "${WITH_TIMEOUT[@]}" stdbuf --output=L "${GDB_SCRIPT_ARGS[@]}" "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" nrSim "$NRSIM_TC" "${CHANNELS[@]}" "${CELL_MASK[@]}" "${CONFIG_YAML[@]}" "${RU_HOST_ARG[@]}"
+    { sudo -E LD_BIND_NOW=1 "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" "${WITH_TIMEOUT[@]}" stdbuf --output=L "${GDB_SCRIPT_ARGS[@]}" "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" nrSim "$NRSIM_TC" "${CHANNELS[@]}" "${CELL_MASK[@]}" "${CONFIG_YAML[@]}" "${RU_HOST_ARG[@]}"; RET=$?; } || true
 else
-    echo "$WITH_TIMEOUT stdbuf --output=L $GDB_SCRIPT $cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac F08 $NUM_CELLS $PATTERN" "${CHANNELS[@]}" "$CELL_MASK" "$CONFIG_YAML"
-    { sudo -E LD_BIND_NOW=1 LD_LIBRARY_PATH=${LD_LIBRARY_PATH} $WITH_TIMEOUT stdbuf --output=L $GDB_SCRIPT "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" F08 $NUM_CELLS $PATTERN "${CHANNELS[@]}" $CELL_MASK $CONFIG_YAML; RET=$?; } || true
+    print_command "${WITH_TIMEOUT[@]}" stdbuf --output=L "${GDB_SCRIPT_ARGS[@]}" "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" F08 "${CELL_TOPOLOGY_ARGS[@]}" "$PATTERN" "${CHANNELS[@]}" "${CELL_MASK[@]}" "${CONFIG_YAML[@]}" "${RU_HOST_ARG[@]}"
+    { sudo -E LD_BIND_NOW=1 "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" "${WITH_TIMEOUT[@]}" stdbuf --output=L "${GDB_SCRIPT_ARGS[@]}" "$cuBB_SDK/$BUILD_DIR/cuPHY-CP/testMAC/testMAC/test_mac" F08 "${CELL_TOPOLOGY_ARGS[@]}" "$PATTERN" "${CHANNELS[@]}" "${CELL_MASK[@]}" "${CONFIG_YAML[@]}" "${RU_HOST_ARG[@]}"; RET=$?; } || true
 fi
 exit $RET
-

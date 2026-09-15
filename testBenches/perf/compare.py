@@ -70,8 +70,8 @@ base.add_argument(
     type=str,
     nargs="+",
     dest="cells",
-    default=1,
-    help="Specifies the number of cells to focus the comparison for",
+    default=None,
+    help="Specifies the number of cells to focus the comparison for. If omitted, all cells in the JSON are plotted.",
 )
 base.add_argument(
     "--filter",
@@ -111,25 +111,57 @@ base.add_argument(
     dest="is_short_legend",
     help="whether add platform and nSlots in each legend",
 )
+base.add_argument(
+    "--short_title",
+    action="store_true",
+    default=False,
+    dest="is_short_title",
+    help="Omit SM allocation and TDD priorities from the plot title",
+)
+base.add_argument(
+    "--legend",
+    type=str,
+    nargs="+",
+    dest="legend_labels",
+    default=None,
+    help="Custom legend labels, one per input file",
+)
+base.add_argument(
+    "--mac_title",
+    type=str,
+    dest="mac_title",
+    default=None,
+    help="Custom title for the MAC subplot",
+)
+def _png_path(value: str) -> str:
+    if not value.endswith(".png"):
+        raise argparse.ArgumentTypeError(f"Output path must end with '.png', got: {value!r}")
+    return value
+
+base.add_argument(
+    "--output",
+    type=_png_path,
+    dest="output",
+    default=None,
+    help="Output PNG file path (must end with .png; overrides the default date-stamped name)",
+)
 
 args = base.parse_args()
 
-# Merge --filename and --filenames, preserving order and removing duplicates
+# Merge --filename and --filenames, preserving order and duplicates
 _fn  = args.filenames or []
 _fa  = getattr(args, "filename", None) or []
-seen = set()
-merged = []
-for f in _fn + _fa:
-    if f not in seen:
-        seen.add(f)
-        merged.append(f)
+merged = _fn + _fa
 args.filenames = merged if merged else None
 
 if args.filenames is None and args.folder is None:
     base.error("please specify which files or folder to analyze")
 
-if len(args.cells) > 1 and args.folder is not None:
-    base.error("multiple cell counts can be only be specified when using --filenames")
+if args.cells is not None and len(args.cells) > 1:
+    if args.folder is not None:
+        base.error("multiple cell counts can only be specified when using --filenames")
+    if args.filenames is None or len(args.cells) != len(args.filenames):
+        base.error("when passing multiple --cells, provide the same number of --filenames")
 
 data = {}
 legend = []
@@ -174,7 +206,7 @@ if args.filenames is not None:
         if len(filename.split("/")) > 1:
             legend.append(filename.split("/")[-2] + appenTestConfig)
         else:
-            if len(args.cells) > 1:
+            if args.cells is not None and len(args.cells) > 1:
                 legend.append(args.cells[idx] + appenTestConfig)
             else:
                 legend.append(f"Dataset #{idx+1}" + appenTestConfig)
@@ -228,24 +260,55 @@ if args.folder is not None:
 
     offset += len(folder_filenames)
 
+if args.cells is None:
+    expanded_data = {}
+    expanded_legend = []
+    expanded_key = []
+    expanded_filenames = []
+    eidx = 0
+    for idx in sorted(data.keys()):
+        cell_keys = sorted([k for k in data[idx] if k not in ('testConfig', 'constraints')])
+        for ck in cell_keys:
+            expanded_data[eidx] = data[idx].copy()
+            appenTestConfig = ''
+            if not args.is_short_legend:
+                appenTestConfig = ' ' + data[idx]['testConfig']['gpuName'] + ' ' + str(data[idx]['testConfig']['sweeps']) + ' slots'
+            expanded_legend.append(ck + appenTestConfig)
+            expanded_key.append(ck)
+            if idx < len(filenames):
+                expanded_filenames.append(filenames[idx])
+            eidx += 1
+    data = expanded_data
+    legend = expanded_legend
+    filenames = expanded_filenames
+    key = expanded_key
+
+if args.legend_labels:
+    if len(args.legend_labels) != len(legend):
+        base.error(
+            f"--legend count ({len(args.legend_labels)}) does not match "
+            f"the number of data series ({len(legend)})"
+        )
+    legend = list(args.legend_labels)
 legend.append("Constraint")
 
-if len(args.cells) > 1:
+if args.cells is not None:
+    if len(args.cells) > 1:
 
-    key = []
+        key = []
 
-    for cells in args.cells:
-        if cells.isnumeric():
-            key.append(cells.zfill(2))
-        else:
-            key.append("+".join([x.zfill(2) for x in cells.split("+")]))
-else:
-    if args.cells[0].isnumeric():
-        key = [args.cells[0].zfill(2)] * len(data.keys())
+        for cells in args.cells:
+            if cells.isnumeric():
+                key.append(cells.zfill(2))
+            else:
+                key.append("+".join([x.zfill(2) for x in cells.split("+")]))
     else:
-        key = ["+".join([x.zfill(2) for x in args.cells[0].split("+")])] * len(
-            data.keys()
-        )
+        if args.cells[0].isnumeric():
+            key = [args.cells[0].zfill(2)] * len(data.keys())
+        else:
+            key = ["+".join([x.zfill(2) for x in args.cells[0].split("+")])] * len(
+                data.keys()
+            )
 
 threshold = args.threshold / 100
 
@@ -261,7 +324,10 @@ for kidx, ikey in enumerate(data.keys()):
     if not constraints:
         constraints   = data[ikey]['constraints']  # only read constraint from the first cell setting
     else: # compare if constaints are the same for comparison
-        if data[ikey]['constraints'] != constraints:
+        all_keys = (set(constraints) | set(data[ikey]['constraints'])) - {'MAC'}
+        diff = {k: (constraints.get(k), data[ikey]['constraints'].get(k))
+                for k in all_keys if constraints.get(k) != data[ikey]['constraints'].get(k)}
+        if diff:
             raise ValueError("Error: The constraints for channels among the input files are not equal.")       
     
     # --------------------           UL channels           --------------------
@@ -495,13 +561,15 @@ for kidx, ikey in enumerate(data.keys()):
         cumac_light_weight_flag = test_cfg.get("cumac_light_weight_flag")
         pattern_len = test_cfg.get("pattern_len", 10)
         mac2_lw_offset = test_cfg.get("mac2_light_weight_flag_offset", 2)
+        # the fallback split assumes an 8-run heavy period, so keep the offset in 0..7
+        mac2_fallback_off = mac2_lw_offset % 8
 
         if mac_slot_config is not None and cumac_light_weight_flag is not None:
             lw = cumac_light_weight_flag
             n_lw = len(lw)
             if n_lw == 0:
-                mac2_heavy_buffer = mac2_buffer[2::8]
-                mac2_light_buffer = [element for index, element in enumerate(mac2_buffer) if index % 8 != 0]
+                mac2_heavy_buffer = mac2_buffer[mac2_fallback_off::8]
+                mac2_light_buffer = [element for index, element in enumerate(mac2_buffer) if index % 8 != mac2_fallback_off]
             else:
                 mac2_slot_indices = [j for j in range(min(len(mac_slot_config), pattern_len)) if mac_slot_config[j] == 1]
                 n_mac2_per_pattern = len(mac2_slot_indices) if mac2_slot_indices else 0
@@ -518,8 +586,8 @@ for kidx, ikey in enumerate(data.keys()):
                         mac2_light_buffer.append(mac2_buffer[i])
         else:
             # backward compat: fallback to previous hardcoded split
-            mac2_heavy_buffer = mac2_buffer[2::8]
-            mac2_light_buffer = [element for index, element in enumerate(mac2_buffer) if index % 8 != 0]
+            mac2_heavy_buffer = mac2_buffer[mac2_fallback_off::8]
+            mac2_light_buffer = [element for index, element in enumerate(mac2_buffer) if index % 8 != mac2_fallback_off]
 
         latency_to_cdf(ikey, mac2_heavy_buffer, "MAC2_heavy", channels)
         latency_to_cdf(ikey, mac2_light_buffer, "MAC2_light", channels)
@@ -530,7 +598,14 @@ sz_channels = len(channels.keys())
 cols = np.min([3, sz_channels])
 rows = int(np.ceil(sz_channels / 3))
 
-plt.subplots(rows, cols, figsize=(7.2 * cols, 4.8 * rows))
+fig, _ = plt.subplots(rows, cols, figsize=(7.2 * cols, 4.8 * rows))
+
+if not args.is_short_title:
+    _tc = next(iter(data.values())).get("testConfig", {}) if data else {}
+    _sm = _tc.get("target", [])
+    _prio = _tc.get("tdd_priorities", {})
+else:
+    _tc = {}
 
 for idx, key in enumerate(list(channels.keys())):
 
@@ -725,7 +800,7 @@ for idx, key in enumerate(list(channels.keys())):
                 plt.title("PUCCH")
             else:
                 plt.title(f"{usecase}: PUCCH")
-            plt.vlines(1500, 0, 1, color="k")
+            plt.vlines(constraints.get("PUCCH1", constraints.get("PUCCH", 1500)), 0, 1, color="k")
 
     elif key == "PUCCH1":
         if usecase == "F01":
@@ -776,21 +851,27 @@ for idx, key in enumerate(list(channels.keys())):
         plt.vlines(constraints["PRACH"], 0, 1, color="k")
     
     elif key == "MAC":
-        if args.is_disable_uc:
+        if args.mac_title:
+            plt.title(args.mac_title)
+        elif args.is_disable_uc:
             plt.title("MAC")
         else:
             plt.title(f"{usecase}: MAC")
         plt.vlines(constraints["MAC"], 0, 1, color="k")
         
     elif key == "MAC_heavy":
-        if args.is_disable_uc:
+        if args.mac_title:
+            plt.title(args.mac_title)
+        elif args.is_disable_uc:
             plt.title("MAC_heavy")
         else:
             plt.title(f"{usecase}: MAC_heavy")
         plt.vlines(constraints["MAC"], 0, 1, color="k")
 
     elif key == "MAC_light":
-        if args.is_disable_uc:
+        if args.mac_title:
+            plt.title(args.mac_title)
+        elif args.is_disable_uc:
             plt.title("MAC_light")
         else:
             plt.title(f"{usecase}: MAC_light")
@@ -827,9 +908,89 @@ for idx, key in enumerate(list(channels.keys())):
     plt.ylabel("CDF")
     plt.xlabel("Latency [us]")
 
-plt.tight_layout()
+# Enrich subplot titles with SM allocation and TDD priority per channel.
+# Maps channel names from titles to SM sub-context index using testConfig flags.
+if not args.is_short_title and _tc:
+    _sm = _tc.get("target", [])
+    _prio = _tc.get("tdd_priorities", {})
+    # Build sub-context order from testConfig isolation flags
+    _ctx_idx = 0
+    _ch_sm_idx = {}
+    if _tc.get("is_isolated_prach") or _tc.get("is_prach"):
+        _ch_sm_idx["PRACH"] = _ctx_idx
+        _ctx_idx += 1
+    if _tc.get("is_isolated_pdcch"):
+        for _c in ("PDCCH", "PDCCH+CSI-RS", "CSI-RS"):
+            _ch_sm_idx[_c] = _ctx_idx
+        _ctx_idx += 1
+    if _tc.get("is_isolated_pucch"):
+        for _c in ("PUCCH", "PUCCH1", "PUCCH2"):
+            _ch_sm_idx[_c] = _ctx_idx
+        _ctx_idx += 1
+    if not _tc.get("is_no_pdsch"):
+        for _c in ("PDSCH", "PDSCH+DLBFW", "DLBFW"):
+            _ch_sm_idx[_c] = _ctx_idx
+        if not _tc.get("is_isolated_pdcch"):
+            for _c in ("PDCCH", "PDCCH+CSI-RS", "CSI-RS"):
+                _ch_sm_idx.setdefault(_c, _ctx_idx)
+        if not (_tc.get("is_ssb") and _tc.get("is_isolated_ssb")):
+            _ch_sm_idx.setdefault("SSB", _ctx_idx)
+        _ctx_idx += 1
+    if not _tc.get("is_no_pusch"):
+        for _c in (
+            "PUSCH1",
+            "PUSCH2",
+            "PUSCH1_SUBSLOT_PROC",
+            "PUSCH2_SUBSLOT_PROC",
+            "ULBFW",
+            "ULBFW1",
+            "ULBFW2",
+        ):
+            _ch_sm_idx[_c] = _ctx_idx
+        if not _tc.get("is_isolated_pucch"):
+            for _c in ("PUCCH", "PUCCH1", "PUCCH2"):
+                _ch_sm_idx.setdefault(_c, _ctx_idx)
+        _ctx_idx += 1
+    if _tc.get("is_ssb") and _tc.get("is_isolated_ssb"):
+        _ch_sm_idx["SSB"] = _ctx_idx
+        _ctx_idx += 1
+    if _tc.get("is_srs_isolate"):
+        for _c in ("SRS1", "SRS2"):
+            _ch_sm_idx[_c] = _ctx_idx
+        _ctx_idx += 1
+    if _tc.get("is_mac"):
+        _ch_sm_idx["MAC"] = _ctx_idx
+        _ch_sm_idx["MAC_heavy"] = _ctx_idx
+        _ch_sm_idx["MAC_light"] = _ctx_idx
+        _ctx_idx += 1
+
+    _prio_map = {
+        "PUSCH1": "PUSCH", "PUSCH2": "PUSCH", "PUSCH1_SUBSLOT_PROC": "PUSCH",
+        "PUSCH2_SUBSLOT_PROC": "PUSCH", "PUCCH1": "PUCCH", "PUCCH2": "PUCCH",
+        "PUCCH": "PUCCH", "PDSCH": "PDSCH", "PDSCH+DLBFW": "PDSCH",
+        "PDCCH": "PDCCH", "PDCCH+CSI-RS": "PDCCH", "CSI-RS": "CSIRS",
+        "PRACH": "PRACH", "SSB": "SSB", "DLBFW": "PDSCH",
+        "ULBFW": "PUSCH", "ULBFW1": "PUSCH", "ULBFW2": "PUSCH",
+        "SRS1": "SRS", "SRS2": "SRS", "MAC": "MAC",
+    }
+
+    for ax in fig.get_axes():
+        _title = ax.get_title()
+        if not _title:
+            continue
+        _ch = _title.split(": ", 1)[-1] if ": " in _title else _title
+        _suffix_parts = []
+        _si = _ch_sm_idx.get(_ch)
+        if _si is not None and _si < len(_sm):
+            _suffix_parts.append(f"{_sm[_si]} SMs")
+        _pk = _prio_map.get(_ch)
+        if _pk and _pk in _prio:
+            _suffix_parts.append(f"Prio {_prio[_pk]}")
+        if _suffix_parts:
+            ax.set_title(f"{_title}, {', '.join(_suffix_parts)}", fontsize=10)
 
 time = datetime.datetime.now()
 buffer = "_".join([str(time.year), str(time.month).zfill(2), str(time.day).zfill(2)])
+plt.tight_layout()
 
-plt.savefig(f"compare-{buffer}.png")
+plt.savefig(args.output if args.output else f"compare-{buffer}.png", bbox_inches="tight")

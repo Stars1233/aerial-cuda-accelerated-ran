@@ -1,10 +1,11 @@
 # TV Space Analysis
 
-Analyzes test vector (TV) `.h5` disk usage from directory listings. It parses `ls -alh`-style output, classifies files (DLMIX/ULMIX, FAPI/CUPHY/OTHER), and prints a report by pattern and category. Pattern ranges align with `5GModel/nr_matlab/test/genPerfPattern.m`.
+Analyzes test vector (TV) `.h5` disk usage from directory listings. It parses `ls -alh`-style output, classifies files (DLMIX/ULMIX, FAPI/CUPHY/OTHER), and prints a report by pattern and category. Pattern ranges are loaded from `5GModel/nr_matlab/test/perf_pattern/perf_pattern_helper.yaml` and its included pattern files, the same registry used by genPerfPattern; each pattern id is matched exactly (e.g. `102` and `102a` are separate).
 
 ## Requirements
 
 - Python 3.6+
+- PyYAML (pattern ranges are loaded from `5GModel/nr_matlab/test/perf_pattern/perf_pattern_helper.yaml`)
 - Unix-like environment when using `--dir` (uses `ls -alh`)
 
 ## Usage

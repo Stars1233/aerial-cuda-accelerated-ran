@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -230,6 +230,103 @@ template <> struct row_degree<2, 38> { static const int value = 4; };
 template <> struct row_degree<2, 39> { static const int value = 4; };
 template <> struct row_degree<2, 40> { static const int value = 4; };
 template <> struct row_degree<2, 41> { static const int value = 4; };
+
+////////////////////////////////////////////////////////////////////////
+// nzs_row_degree
+// Provides the number of nonzero shifted permutation matrices with non-zero shifts as
+// a function of base graph and check node row. (Address calculations for zero shift
+// values are simpler and can be more efficient.)
+// See Tables 5.3.2-2 and 5.3.2-3, 3GPP 38.212
+template <int BG, int ROW_INDEX> struct nzs_row_degree;
+template <> struct nzs_row_degree<1, 0> { static const int value = 18; };
+template <> struct nzs_row_degree<1, 1> { static const int value = 17; };
+template <> struct nzs_row_degree<1, 2> { static const int value = 17; };
+template <> struct nzs_row_degree<1, 3> { static const int value = 18; };
+template <> struct nzs_row_degree<1, 4> { static const int value = 2; };
+template <> struct nzs_row_degree<1, 5> { static const int value = 7; };
+template <> struct nzs_row_degree<1, 6> { static const int value = 8; };
+template <> struct nzs_row_degree<1, 7> { static const int value = 6; };
+template <> struct nzs_row_degree<1, 8> { static const int value = 9; };
+template <> struct nzs_row_degree<1, 9> { static const int value = 8; };
+template <> struct nzs_row_degree<1, 10> { static const int value = 6; };
+template <> struct nzs_row_degree<1, 11> { static const int value = 7; };
+template <> struct nzs_row_degree<1, 12> { static const int value = 6; };
+template <> struct nzs_row_degree<1, 13> { static const int value = 5; };
+template <> struct nzs_row_degree<1, 14> { static const int value = 6; };
+template <> struct nzs_row_degree<1, 15> { static const int value = 6; };
+template <> struct nzs_row_degree<1, 16> { static const int value = 5; };
+template <> struct nzs_row_degree<1, 17> { static const int value = 5; };
+template <> struct nzs_row_degree<1, 18> { static const int value = 5; };
+template <> struct nzs_row_degree<1, 19> { static const int value = 5; };
+template <> struct nzs_row_degree<1, 20> { static const int value = 5; };
+template <> struct nzs_row_degree<1, 21> { static const int value = 5; };
+template <> struct nzs_row_degree<1, 22> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 23> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 24> { static const int value = 5; };
+template <> struct nzs_row_degree<1, 25> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 26> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 27> { static const int value = 3; };
+template <> struct nzs_row_degree<1, 28> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 29> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 30> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 31> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 32> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 33> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 34> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 35> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 36> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 37> { static const int value = 3; };
+template <> struct nzs_row_degree<1, 38> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 39> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 40> { static const int value = 3; };
+template <> struct nzs_row_degree<1, 41> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 42> { static const int value = 3; };
+template <> struct nzs_row_degree<1, 43> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 44> { static const int value = 4; };
+template <> struct nzs_row_degree<1, 45> { static const int value = 3; };
+
+template <> struct nzs_row_degree<2, 0> { static const int value = 7; };
+template <> struct nzs_row_degree<2, 1> { static const int value = 8; };
+template <> struct nzs_row_degree<2, 2> { static const int value = 6; };
+template <> struct nzs_row_degree<2, 3> { static const int value = 9; };
+template <> struct nzs_row_degree<2, 4> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 5> { static const int value = 5; };
+template <> struct nzs_row_degree<2, 6> { static const int value = 5; };
+template <> struct nzs_row_degree<2, 7> { static const int value = 5; };
+template <> struct nzs_row_degree<2, 8> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 9> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 10> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 11> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 12> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 13> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 14> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 15> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 16> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 17> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 18> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 19> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 20> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 21> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 22> { static const int value = 2; };
+template <> struct nzs_row_degree<2, 23> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 24> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 25> { static const int value = 2; };
+template <> struct nzs_row_degree<2, 26> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 27> { static const int value = 2; };
+template <> struct nzs_row_degree<2, 28> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 29> { static const int value = 2; };
+template <> struct nzs_row_degree<2, 30> { static const int value = 4; };
+template <> struct nzs_row_degree<2, 31> { static const int value = 2; };
+template <> struct nzs_row_degree<2, 32> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 33> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 34> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 35> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 36> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 37> { static const int value = 2; };
+template <> struct nzs_row_degree<2, 38> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 39> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 40> { static const int value = 3; };
+template <> struct nzs_row_degree<2, 41> { static const int value = 3; };
 
 ////////////////////////////////////////////////////////////////////////
 // isolated_edge_count
@@ -5732,7 +5829,7 @@ template <int BG, int Z, int CHECK_NODE, int INDEX> struct wrap_index
 
 ////////////////////////////////////////////////////////////////////////
 // vnode_shift_offset
-// Provides (vnode_colum * Z) + shift_mod for given values of the
+// Provides (vnode_column * Z) + shift_mod for given values of the
 // base graph (BG), lifting size (Z), CHECK_NODE, and row index INDEX.
 template <int BG, int Z, int CHECK_NODE, int INDEX> struct vnode_shift_offset
 {

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -103,6 +103,9 @@ public:
         float*                      pNoiseVarCpu;
         float*                      pTaEstCpu;
         //uint16_t*                   pNumCsi2BitsCpu;
+        cuphyTensorPrm_t*           pF2FrontEndLLRs;
+        cuphyTensorPrm_t*           pF3FrontEndLLRs;
+
         // HARQ/CSI part 1/CSI part 2 detection status. Refer to SCF FAPIv10.04, table 3–125, 126, 127 
         uint8_t*                    pHarqDetectionStatusCpu;
         uint8_t*                    pCsiP1DetectionStatusCpu;
@@ -121,6 +124,12 @@ public:
     [[nodiscard]] cuphyStatus_t run();
     void writeDbgBufSynch(cudaStream_t cuStream);
     const void* getMemoryTracker();
+
+    // Load caller-provided post-polar outputs for PUCCH_PIPELINE_SKIP_POLAR.
+    // This populates the internal buffers normally written by the polar decoder
+    // so the downstream UCI segmentation stage can run unchanged.
+    [[nodiscard]] cuphyStatus_t loadPostPolarDataForSkip(const cuphyPucchPostPolarData_t& postPolarData,
+                                                         cudaStream_t                    cuStream);
 
     template <fmtlog::LogLevel log_level=fmtlog::DBG>
     static void printUciPrms(const cuphyPucchUciPrm_t* uciPrms);
@@ -147,6 +156,11 @@ private:
     cuphyStatus_t setupCmn(cuphyPucchDynPrms_t *pDynPrm);
 
     void allocateDeviceMemory(void);
+    void* getFrontEndLlrOutputAddr(cuphyTensorPrm_t* pFrontEndLLRs,
+                                    uint16_t uciIdx,
+                                    uint16_t expectedElems,
+                                    const char* fmtName) const;
+    void bindFrontEndLlrOutputAddrs();
     void allocateBackendBuffers(cuphyPucchUciPrm_t&           uciPrms, 
                                 cuphyPucchF234OutOffsets_t&   outOffsets, 
                                 F234RmSizes_t&                rmSizes,
@@ -165,7 +179,6 @@ private:
 
     // run functions
     cuphyStatus_t copyOutputToCPU();
-
     // destroy functions
     void destroyComponents();
 
@@ -233,6 +246,10 @@ private:
 
     // graph parameters
     bool        m_cudaGraphModeEnabled;
+    bool        m_skipPolarDecoder;
+    bool        m_skipBackend; // PUCCH_PIPELINE_SKIP_BACKEND: also skip RM + UciSeg parser
+    const cuphyPucchPostPolarData_t* m_pPostPolarData; // optional SKIP_POLAR source data
+    uint32_t    m_pipelineDelayUs;
     CUgraph     m_graph;
     CUgraphExec m_graphExec;
     CUgraphNode m_emptyRootNode;
@@ -245,6 +262,7 @@ private:
     CUgraphNode m_polSegDeRmDeItlKernelNode;
     CUgraphNode m_polarDecoderKernelNode;
     CUgraphNode m_pucchF234RxKernelNode;
+    CUgraphNode m_delayKernelNode;
 
     // Used to avoid calling cuGraphNodeSetEnabled if status unchanged
     bool m_pucchF0RxKernelNodeEnabled;
@@ -254,8 +272,12 @@ private:
     bool m_rmDecoderKernelNodeEnabled;
     bool m_polSegKernelNodesEnabled; // covers m_compCwTreeTypesKernelNode, m_polSegDeRmDeItlKernelNode and  m_polarDecoderKernelNode
     bool m_pucchF234RxKernelNodeEnabled;
+    bool m_delayKernelNodeEnabled;
 
     CUDA_KERNEL_NODE_PARAMS m_emptyNode0paramDriver, m_emptyNode1paramDriver;
+    CUDA_KERNEL_NODE_PARAMS m_delayKernelNodeParamsDriver;
+    uint32_t                m_delayKernelArgUs;
+    void*                   m_delayKernelArgs[1];
 
 
     // F2 buffers
@@ -311,7 +333,6 @@ private:
 };
 
 #endif // !defined(PUCCH_RX_HPP_INCLUDED_)
-
 
 
 

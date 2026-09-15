@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,6 +55,10 @@ errCnt = errCnt + errFlag;
 nTV = nTV + 1;
 
 errFlag = runSim('cfg_bug5486238.yaml', 'bug5486238');
+errCnt = errCnt + errFlag;
+nTV = nTV + 1;
+
+errFlag = runSim('cfg_sfn_555_4_pusch_neg.yaml', 'bug5714275_PUSCH');
 errCnt = errCnt + errFlag;
 nTV = nTV + 1;
 

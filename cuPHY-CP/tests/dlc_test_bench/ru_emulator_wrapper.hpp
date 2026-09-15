@@ -18,6 +18,7 @@
 #pragma once
 
 #include <pthread.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 

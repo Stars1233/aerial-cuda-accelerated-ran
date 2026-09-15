@@ -78,8 +78,13 @@ log_print_file = open(result_log_file, "w+")
 
 
 def log_print(log_string):
-    print(log_string)
-    log_print_file.write(log_string)
+    current_time = time.time()
+    time_struct = time.localtime(current_time)
+    microseconds = int((current_time % 1) * 1000000)
+    timestamp = time.strftime("[%H:%M:%S", time_struct) + f".{microseconds:06d}]"
+    log_with_timestamp = f"{timestamp} {log_string}"
+    print(log_with_timestamp)
+    log_print_file.write(log_with_timestamp)
     log_print_file.write("\n")
     log_print_file.flush()
 
@@ -312,8 +317,8 @@ class Thrput:
         if (len(line) == 0):
             return 1
         # Parse DL/UL from "| DL 1586.28 Mbps 1600 Slots | UL  249.10 Mbps  400 Slots |"
-        self.slots[CHANNEL_ID_PDSCH] = parse_int(line, "DL[ ]+[\S]+[ ]+Mbps", " ", 0, True)
-        self.slots[CHANNEL_ID_PUSCH] = parse_int(line, "UL[ ]+[\S]+[ ]+Mbps", " ", 0, True)
+        self.slots[CHANNEL_ID_PDSCH] = parse_int(line, r"DL[ ]+[\S]+[ ]+Mbps", " ", 0, True)
+        self.slots[CHANNEL_ID_PUSCH] = parse_int(line, r"UL[ ]+[\S]+[ ]+Mbps", " ", 0, True)
         self.dl_thrput = parse_float(line, " DL ", " ")
         self.ul_thrput = parse_float(line, " UL ", " ")
         # Parse other data
@@ -372,8 +377,8 @@ class Thrput:
         if (len(line) == 0):
             return 1
         # Parse DL/UL from "| DL 1586.28 Mbps 1600 Slots | UL  249.10 Mbps  400 Slots |"
-        self.slots[CHANNEL_ID_PDSCH] = parse_int(line, "DL[ ]+[\S]+[ ]+Mbps", " ", 0, True)
-        self.slots[CHANNEL_ID_PUSCH] = parse_int(line, "UL[ ]+[\S]+[ ]+Mbps", " ", 0, True)
+        self.slots[CHANNEL_ID_PDSCH] = parse_int(line, r"DL[ ]+[\S]+[ ]+Mbps", " ", 0, True)
+        self.slots[CHANNEL_ID_PUSCH] = parse_int(line, r"UL[ ]+[\S]+[ ]+Mbps", " ", 0, True)
         self.dl_thrput = parse_float(line, " DL ", " ")
         self.ul_thrput = parse_float(line, " UL ", " ")
         # Parse other change slot count
@@ -459,7 +464,7 @@ def shell_cmd(cmd, print_cmd=False, print_err=True):
 # Parse a string value after a prefix. Example "prefix=value"
 def parse_string(input_string, prefix, delimiter, default="", regular=False):
     try:
-        prefix_value = re.search(prefix + "[ " + delimiter + "]*" + "[\S]+", input_string.strip()).group(0)
+        prefix_value = re.search(prefix + "[ " + delimiter + "]*" + r"[\S]+", input_string.strip()).group(0)
         value = prefix_value.split(delimiter)[-1].strip()
     except:
         if (not(prefix in input_string) or regular):
@@ -517,29 +522,28 @@ def parse_expected_thrput(log_lines, cell_num):
 
 
 MAC_LOG=None
-def parse_testmac_result(log_file, cell_num):
+def parse_testmac_result(log_file, cell_num, maxRetries=10):
     global MAC_LOG
 
     if MAC_LOG is None:
         MAC_LOG = open(log_file)
-    result = []
+    result = [Thrput(cell_id) for cell_id in range(cell_num)]
+    cells_found = 0
     errCounter = 0
-    maxRetries = 10
-    while len(result) < cell_num:
+    while cells_found < cell_num:
         try:
             line = next(MAC_LOG)
             m = re.match(r'.*Cell\s+(\d+)', line)
             if m:
-                cell_id = m.group(1)
-                thrput = Thrput(cell_id)
-                thrput.parse_testmac(line.strip())
-                result.append(thrput)
+                cell_id = int(m.group(1))
+                result[cell_id].parse_testmac(line.strip())
+                cells_found += 1
         except StopIteration:
             # Debug information - too much for the logs
             #print ("reached end of", log_file)
             errCounter += 1
             if errCounter > maxRetries:
-                print (f"retried {maxRetries} times - giving up")
+                log_print(f"parse_testmac_result: retried {maxRetries} times - giving up")
                 break
             else:
                 time.sleep(1)
@@ -553,23 +557,25 @@ def parse_ru_result(log_file, cell_num, maxRetries=10):
 
     if RU_LOG is None:
         RU_LOG = open(log_file)
-    result = []
+    result = [Thrput(cell_id) for cell_id in range(cell_num)]
+    cells_found = 0
     errCounter = 0
-    while len(result) < cell_num:
+    while cells_found < cell_num:
         try:
             line = next(RU_LOG)
             m = re.match(r'.*\[RU\]\s+Cell\s+(\d+)', line)
             if m:
-                cell_id = m.group(1)
-                thrput = Thrput(cell_id)
-                thrput.parse_ru_emulator(line.strip())
-                result.append(thrput)
+                cell_id = int(m.group(1))
+                if (cell_id >= cell_num):
+                    continue
+                result[cell_id].parse_ru_emulator(line.strip())
+                cells_found += 1
         except StopIteration:
             # Debug information - too much for the logs
             #print ("reached end of", log_file)
             errCounter += 1
             if errCounter > maxRetries:
-                print (f"retried {maxRetries} times - giving up")
+                log_print(f"parse_ru_result: retried {maxRetries} times - giving up")
                 break
             else:
                 time.sleep(1)
@@ -591,6 +597,7 @@ def wait_for_ru_thrput_start(timeout=60):
     global negative_test
     # See GT-6528 - sleep for a bit to let some warning logs scroll by before we parse for the RU logs we're looking for
     time.sleep(5)
+    log_print(f"Wait for ru_emulator throughput start ... timeout={timeout}")
     counter = 0
     while (True):
         counter += 1
@@ -616,6 +623,7 @@ def wait_for_ru_thrput_start(timeout=60):
 # Skip RU starting 0 throughput since MAC comes later
 def skip_ru_thrput_start(max_seconds=60):
     global negative_test
+    log_print(f"Skip ru_emulator starting 0 throughput ... max_seconds={max_seconds}")
     counter = 0
     while (True):
         result_list = parse_ru_result(ru_log_file, cell_num)
@@ -691,7 +699,8 @@ else:
 # Wait for testmac and/or ru_emulator throughput start
 if mac_exist:
     wait_for_log(mac_log_file, "Cell  0 |", wait_for_throughput)
-elif ru_exist:
+
+if ru_exist:
     if expected_zero:
         log_print(f"The expected data/slot throughput is zero for everything. SLEEPING for {ru_zero_timeout} seconds and then exiting cleanly.")
         count = 0
@@ -751,13 +760,15 @@ while (test_time < duration):
 
     # Parse and check test_mac throughput
     if mac_exist:
-        mac_result = parse_testmac_result(mac_log_file, cell_num)
+        # Parse in most 2 seconds since throughputs are expected to be printed every 1 second
+        mac_result = parse_testmac_result(mac_log_file, cell_num, 1)
         check_testmac_thrput(mac_result, low_limit_list, high_limit_list, cell_num, last_mac_result, mac_errs)
         last_mac_result = mac_result
 
     # Parse and check ru_emulator throughput
     if ru_exist:
-        ru_result = parse_ru_result(ru_log_file, cell_num)
+        # Parse in most 2 seconds since throughputs are expected to be printed every 1 second
+        ru_result = parse_ru_result(ru_log_file, cell_num, 1)
         check_ru_thrput(ru_result, low_limit_list, high_limit_list, cell_num, last_ru_result, ru_errs)
         last_ru_result = ru_result
 

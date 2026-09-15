@@ -161,6 +161,7 @@ cuphyStatus_t CUPHYWINAPI cuphyUpdatePdschDmrsParams(PdschDmrsParams * h_dmrs_pa
         for (int UE_idx = 0; UE_idx < ue_group->nUes; UE_idx++) {
             int TB_id = ue_group->pUePrmIdxs[UE_idx];
             h_dmrs_params[TB_id].ueGrp_idx = UE_group_idx;
+            h_dmrs_params[TB_id].su_mimo = (ue_group->nUes == 1);
 
             cuphyPdschCwPrm_t* cw = &dyn_params->pCellGrpDynPrm->pCwPrms[TB_id];
             cuphyPdschUePrm_t* ue = cw->pUePrm;
@@ -256,24 +257,259 @@ cuphyStatus_t CUPHYWINAPI cuphyUpdatePdschDmrsParams(PdschDmrsParams * h_dmrs_pa
     return CUPHY_STATUS_SUCCESS;
 }
 
-template<bool enablePrecoding, typename Tcomplex, typename Tscalar=typename scalar_from_complex<Tcomplex>::type>
-__global__ void fused_dmrs(pdschDmrsDescr_t* p_desc) {
+// fast path: use reg during precoding for 4-port
+// todo: check whether swap layer and port loop can save time
+// todo: support dmrs/data mux
+template <typename Tcomplex, typename Tscalar = typename scalar_from_complex<Tcomplex>::type>
+__device__ void dmrs_scramble_precode_4port(
+    const PdschDmrsParams& dmrs_params,
+    const int              gold_elements_one_dmrs,
+    const uint32_t*        shmem_gold_seqs,
+    const Tscalar          positive_scramble_seq,
+    const int              tid_x,
+    const int              new_tidx,
+    const uint8_t          symbol_loc[4],
+    Tcomplex*              dmrs_output)
+{
+    constexpr int NUM_DL_PORTS = 4;
+    const int     start_Rb     = dmrs_params.start_Rb;
+    const int     BWP_PRBs     = dmrs_params.num_BWP_PRBs;
+    for(int symbol_id = 0; symbol_id < dmrs_params.num_dmrs_symbols; symbol_id++)
+    {
+        int      base_shmem_index = symbol_id * gold_elements_one_dmrs;
+        int      shmem_index      = base_shmem_index + (threadIdx.x >> 4);
+        int      shmem_bit_offset = ((threadIdx.x & 0xFU) << 1); // Shift by 1 because each thread reads two bits
+        uint32_t gold_value       = ((shmem_gold_seqs[shmem_index] >> shmem_bit_offset) & 0x3U);
+        Tcomplex scrambled_val;
+        if(gold_value == 0)
+        {
+            scrambled_val = make_complex<Tcomplex>::create(positive_scramble_seq, positive_scramble_seq);
+        }
+        else if(gold_value == 1)
+        {
+            scrambled_val = make_complex<Tcomplex>::create(-positive_scramble_seq, positive_scramble_seq);
+        }
+        else if(gold_value == 2)
+        {
+            scrambled_val = make_complex<Tcomplex>::create(positive_scramble_seq, -positive_scramble_seq);
+        }
+        else if(gold_value == 3)
+        {
+            scrambled_val = make_complex<Tcomplex>::create(-positive_scramble_seq, -positive_scramble_seq);
+        }
+        Tcomplex dmrs_temp_out1[NUM_DL_PORTS] = {{0, 0}};
+        Tcomplex dmrs_temp_out2[NUM_DL_PORTS] = {{0, 0}};
+        // bool     cdm_grps_no_data_1 = params[TB_id].dmrsCdmGrpsNoData1;
+        for(int layer_id = 0; layer_id < dmrs_params.num_layers; ++layer_id)
+        {
+            Tcomplex symbol_to_read = scrambled_val;
+            // Do remap dmrs part
+            const int port_idx  = dmrs_params.port_ids[layer_id];
+            const int delta     = (port_idx >> 1) & 0x1U; // DRMS config. type 1 only; valid options 0 or 1
+            const int fOCC_flag = (port_idx & 0x1U);      // even port_idx, i.e., fOCC_flag == 0, means Wf(k') is all +1; odd port means Wf(k') is +1, -1, alternating
+            const int tOCC_flag = (port_idx >> 2) & 0x1U; // port_idx < 4, i.e., tOCC_flag == 0, means Wt(l') is all +1; port_idx >= 4 means Wt(l') is +1, -1
+            if((fOCC_flag == 1) && ((tid_x & 0x1U) == 0x1U))
+            {
+                symbol_to_read = make_complex<Tcomplex>::create(-symbol_to_read.x, -symbol_to_read.y);
+            }
+            if(((symbol_id & 0x1) == 1) && (tOCC_flag == 1))
+            {
+                symbol_to_read = make_complex<Tcomplex>::create(-symbol_to_read.x, -symbol_to_read.y);
+            }
 
+            //Each thread writes 2 consecutive symbols, one zero-ed out, if cdm_grps_no_data != 1
+            Tcomplex symbol_to_write_0, symbol_to_write_1;
+            if(delta == 0)
+            { // {symbol_read, 0}
+                symbol_to_write_0 = symbol_to_read;
+                symbol_to_write_1 = make_complex<Tcomplex>::create(0, 0);
+            }
+            else
+            { // (delta == 1) {0, symbol_read}
+                symbol_to_write_0 = make_complex<Tcomplex>::create(0, 0);
+                symbol_to_write_1 = symbol_to_read;
+            }
+#pragma unroll NUM_DL_PORTS
+            for(int out_port = 0; out_port < NUM_DL_PORTS; ++out_port)
+            {
+                __half2 matCoeff         = dmrs_params.pmW[layer_id * NUM_DL_PORTS + out_port];
+                dmrs_temp_out1[out_port] = __hcmadd(symbol_to_write_0, matCoeff, dmrs_temp_out1[out_port]);
+                dmrs_temp_out2[out_port] = __hcmadd(symbol_to_write_1, matCoeff, dmrs_temp_out2[out_port]);
+            }
+        }
+#pragma unroll NUM_DL_PORTS
+        for(int out_port = 0; out_port < NUM_DL_PORTS; ++out_port)
+        {
+            uint32_t output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * out_port + symbol_loc[symbol_id])) +
+                                    (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
+            if(dmrs_params.su_mimo)
+            {
+                dmrs_output[output_index + 0] = dmrs_temp_out1[out_port];
+                dmrs_output[output_index + 1] = dmrs_temp_out2[out_port];
+            }
+            else
+            {
+                atomicAdd(&dmrs_output[output_index + 0], dmrs_temp_out1[out_port]);
+                atomicAdd(&dmrs_output[output_index + 1], dmrs_temp_out2[out_port]);
+            }
+        }
+    }
+}
+
+/// Per-thread DMRS scramble + port remap + output write (symbol loop) for fused_dmrs.
+template <bool enablePrecoding, typename Tcomplex, typename Tscalar = typename scalar_from_complex<Tcomplex>::type>
+__device__ void dmrs_scramble_precode_generic(
+    const PdschDmrsParams& dmrs_params,
+    const int              num_dmrs_symbols,
+    const int              gold_elements_one_dmrs,
+    const uint32_t*        shmem_gold_seqs,
+    const Tscalar          positive_scramble_seq,
+    const int              tid_x,
+    const int              new_tidx,
+    const uint8_t          symbol_loc[4],
+    const int              num_ports,
+    Tcomplex*              dmrs_output)
+{
+    const int BWP_PRBs = dmrs_params.num_BWP_PRBs;
+    const int start_Rb = dmrs_params.start_Rb;
+    for(int symbol_id = 0; symbol_id < num_dmrs_symbols; symbol_id++)
+    {
+        int base_shmem_index = symbol_id * gold_elements_one_dmrs;
+        int shmem_index      = base_shmem_index + (threadIdx.x >> 4);
+
+        int      shmem_bit_offset = ((threadIdx.x & 0xFU) << 1); // Shift by 1 because each thread reads two bits
+        uint32_t gold_value       = ((shmem_gold_seqs[shmem_index] >> shmem_bit_offset) & 0x3U);
+
+#if 1
+        Tcomplex scrambled_val;
+        if(gold_value == 0)
+        {
+            scrambled_val = make_complex<Tcomplex>::create(positive_scramble_seq, positive_scramble_seq);
+        }
+        else if(gold_value == 1)
+        {
+            scrambled_val = make_complex<Tcomplex>::create(-positive_scramble_seq, positive_scramble_seq);
+        }
+        else if(gold_value == 2)
+        {
+            scrambled_val = make_complex<Tcomplex>::create(positive_scramble_seq, -positive_scramble_seq);
+        }
+        else if(gold_value == 3)
+        {
+            scrambled_val = make_complex<Tcomplex>::create(-positive_scramble_seq, -positive_scramble_seq);
+        }
+        Tcomplex dmrs_temp_out1[MAX_DL_PORTS] = {{0, 0}};
+        Tcomplex dmrs_temp_out2[MAX_DL_PORTS] = {{0, 0}};
+
+        bool cdm_grps_no_data_1 = dmrs_params.dmrsCdmGrpsNoData1;
+
+        // todo: swap layer and port id like fused rm&mod func
+        for(int layer_id = 0; layer_id < dmrs_params.num_layers; ++layer_id)
+        {
+            Tcomplex symbol_to_read = scrambled_val;
+#else
+        int mult_0 = (gold_value & 0x2) ? -1 : 1;
+        int mult_1 = (gold_value & 0x1) ? -1 : 1;
+        Tcomplex symbol_to_read = make_complex<Tcomplex>::create(mult_1 * positive_scramble_seq, mult_0 * positive_scramble_seq);
+#endif
+
+            // Do remap dmrs part
+            const int port_idx  = dmrs_params.port_ids[layer_id];
+            const int delta     = (port_idx >> 1) & 0x1U; // DRMS config. type 1 only; valid options 0 or 1
+            const int fOCC_flag = (port_idx & 0x1U);      // even port_idx, i.e., fOCC_flag == 0, means Wf(k') is all +1; odd port means Wf(k') is +1, -1, alternating
+            const int tOCC_flag = (port_idx >> 2) & 0x1U; // port_idx < 4, i.e., tOCC_flag == 0, means Wt(l') is all +1; port_idx >= 4 means Wt(l') is +1, -1
+
+            if((fOCC_flag == 1) && ((tid_x & 0x1U) == 0x1U))
+            {
+                symbol_to_read = make_complex<Tcomplex>::create(-symbol_to_read.x, -symbol_to_read.y);
+            }
+            if(((symbol_id & 0x1) == 1) && (tOCC_flag == 1))
+            {
+                symbol_to_read = make_complex<Tcomplex>::create(-symbol_to_read.x, -symbol_to_read.y);
+            }
+
+            //Each thread writes 2 consecutive symbols, one zero-ed out, if cdm_grps_no_data != 1
+            Tcomplex symbol_to_write_0, symbol_to_write_1;
+            if(delta == 0)
+            { // {symbol_read, 0}
+                symbol_to_write_0 = symbol_to_read;
+                symbol_to_write_1 = make_complex<Tcomplex>::create(0, 0);
+            }
+            else
+            { // (delta == 1) {0, symbol_read}
+                symbol_to_write_0 = make_complex<Tcomplex>::create(0, 0);
+                symbol_to_write_1 = symbol_to_read;
+            }
+            if(!enablePrecoding)
+            {
+                const int layer        = calculate_layer_id(port_idx, dmrs_params.n_scid, dmrs_params.nlAbove16);
+                uint32_t  output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * layer + symbol_loc[symbol_id])) +
+                                        (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
+                if(!cdm_grps_no_data_1)
+                {
+                    dmrs_output[output_index]     = symbol_to_write_0;
+                    dmrs_output[output_index + 1] = symbol_to_write_1;
+                }
+                else
+                {
+                    // The other RE will be written by the fused rate-matching and modulation kernel
+                    dmrs_output[output_index + delta] = symbol_to_read;
+                }
+            }
+            else
+            {
+                if(!dmrs_params.enablePrcdBf)
+                {
+                    const int layer        = calculate_layer_id(port_idx, dmrs_params.n_scid, dmrs_params.nlAbove16);
+                    uint32_t  output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * layer + symbol_loc[symbol_id])) +
+                                            (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
+                    // No need to perform atomicAdd with 0 for the alternate RE
+                    atomicAdd(&dmrs_output[output_index + delta], symbol_to_read);
+                }
+                else
+                {
+                    for(int out_port = 0; out_port < num_ports; ++out_port)
+                    {
+                        __half2 matCoeff         = dmrs_params.pmW[layer_id * num_ports + out_port];
+                        dmrs_temp_out1[out_port] = __hcmadd(symbol_to_write_0, matCoeff, dmrs_temp_out1[out_port]);
+                        dmrs_temp_out2[out_port] = __hcmadd(symbol_to_write_1, matCoeff, dmrs_temp_out2[out_port]);
+                    }
+                }
+            }
+        }
+
+        if(enablePrecoding && dmrs_params.enablePrcdBf)
+        {
+            #pragma loop unroll
+            for(int out_port = 0; out_port < num_ports; ++out_port)
+            {                
+                uint32_t output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * out_port + symbol_loc[symbol_id])) +
+                                        (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
+                atomicAdd(&dmrs_output[output_index], dmrs_temp_out1[out_port]);
+                atomicAdd(&dmrs_output[output_index + 1], dmrs_temp_out2[out_port]);
+            }
+        }
+    }
+}
+
+template <bool enablePrecoding, typename Tcomplex, typename Tscalar = typename scalar_from_complex<Tcomplex>::type>
+__global__ void fused_dmrs(pdschDmrsDescr_t* p_desc)
+{
     pdschDmrsDescr_t& desc = *p_desc;
-    const PdschDmrsParams* params = desc.dmrs_params;
     //const int num_TBs = desc.num_TBs; // The grid's y dim is num_TBs * MAX_DL_LAYERS_PER_TB. Reading from desc. not currently needed.
 
     // Let each blockIdx.y be: TB_id * num_layers + layer_id;
-    const int TB_id = blockIdx.y;
+    const int              TB_id       = blockIdx.y;
+    const PdschDmrsParams& dmrs_params = desc.dmrs_params[TB_id];
 
-    Tcomplex* dmrs_output = (Tcomplex*)params[TB_id].cell_output_tensor_addr;
+    Tcomplex* dmrs_output = (Tcomplex*)dmrs_params.cell_output_tensor_addr;
 
-    const int slot_number = params[TB_id].slot_number;
-    const int num_dmrs_symbols = params[TB_id].num_dmrs_symbols;
+    const int slot_number      = dmrs_params.slot_number;
+    const int num_dmrs_symbols = dmrs_params.num_dmrs_symbols;
     __builtin_assume((num_dmrs_symbols > 0) && (num_dmrs_symbols <= 4));
 
-    Tscalar positive_scramble_seq = 0.707106781186547f * params[TB_id].beta_dmrs;
-    __shared__ uint32_t shmem_gold_seqs[64];  // overprovisioned. Should be > (blockDim.x * 2 / 32) * 4; // Last * 4 is due to max four DMRS symbols (might be superfluous)
+    Tscalar             positive_scramble_seq = 0.707106781186547f * dmrs_params.beta_dmrs;
+    __shared__ uint32_t shmem_gold_seqs[64]; // overprovisioned. Should be > (blockDim.x * 2 / 32) * 4; // Last * 4 is due to max four DMRS symbols (might be superfluous)
 
     // Compute (blockDim.x / 32) gold_seq. elements per block; each gold32 call computes 32 bits
     __builtin_assume(blockDim.x == 256);
@@ -283,155 +519,61 @@ __global__ void fused_dmrs(pdschDmrsDescr_t* p_desc) {
     // max 4 DMRS symbols are possible.
 
     // Currently using a host-computed dmrs_sym_loc, an uint16_t to keep track of the max 4 possible symbols
-    const uint16_t bitmask = params[TB_id].dmrs_sym_loc;
-    const uint8_t symbol_loc[4] = {(uint8_t)(bitmask & 0xfu),
-                                   (uint8_t)((bitmask >> 4)& 0xfu),
-                                   (uint8_t)((bitmask >> 8) & 0xfu),
-                                   (uint8_t)((bitmask >> 12) & 0xfu)};
+    const uint16_t bitmask       = dmrs_params.dmrs_sym_loc;
+    const uint8_t  symbol_loc[4] = {(uint8_t)(bitmask & 0xfu),
+                                    (uint8_t)((bitmask >> 4) & 0xfu),
+                                    (uint8_t)((bitmask >> 8) & 0xfu),
+                                    (uint8_t)((bitmask >> 12) & 0xfu)};
 
-    for (int i = threadIdx.x; i < num_dmrs_symbols * gold_elements_one_dmrs; i += blockDim.x) {
+    for(int i = threadIdx.x; i < num_dmrs_symbols * gold_elements_one_dmrs; i += blockDim.x)
+    {
+        int      dmrs_symbol = i >> 4; // As gold_elements_one_dmrs is 16 for block size of 256.
+        int      offset      = i - dmrs_symbol * gold_elements_one_dmrs;
+        uint32_t gold_index  = blockIdx.x * gold_elements_one_dmrs + offset; // Indexing not affected by # dmrs symbols, just the seed is.
 
-        int dmrs_symbol = i >> 4; // As gold_elements_one_dmrs is 16 for block size of 256.
-        int offset = i - dmrs_symbol * gold_elements_one_dmrs;
-        uint32_t gold_index = blockIdx.x * gold_elements_one_dmrs + offset; // Indexing not affected by # dmrs symbols, just the seed is.
-
-        uint32_t double_nid = (params[TB_id].dmrs_scid << 1);
+        uint32_t double_nid = (dmrs_params.dmrs_scid << 1);
         // Reminder the seed init. value uses DRMS symbol location (0-based indexing) + 1.
-        uint32_t c_init = ((1 << 17) * (slot_number * OFDM_SYMBOLS_PER_SLOT + symbol_loc[dmrs_symbol] + 1) * (double_nid + 1) + double_nid + params[TB_id].n_scid) & 0x7FFFFFFFU;
+        uint32_t c_init    = ((1 << 17) * (slot_number * OFDM_SYMBOLS_PER_SLOT + symbol_loc[dmrs_symbol] + 1) * (double_nid + 1) + double_nid + dmrs_params.n_scid) & 0x7FFFFFFFU;
         shmem_gold_seqs[i] = gold32(c_init, gold_index << 5); // gold_index mult. by 32, the # of bits
     }
     __syncthreads();
 
     // Build scrambling sequence
-    int tid_x = threadIdx.x + blockIdx.x * blockDim.x;
-    uint16_t start_Rb = params[TB_id].start_Rb;
+    int      tid_x    = threadIdx.x + blockIdx.x * blockDim.x;
+    uint16_t start_Rb = dmrs_params.start_Rb;
 
     //Every thread will read the value from dmrs_addr
-    const int scrambling_seq_start_tone = ((params[TB_id].ref_point == 1) ? (start_Rb - params[TB_id].BWP_start_PRB) : start_Rb) * (CUPHY_N_TONES_PER_PRB >> 1);
-    const int new_tidx = tid_x - scrambling_seq_start_tone;
-    const int BWP_PRBs = params[TB_id].num_BWP_PRBs;
+    const int scrambling_seq_start_tone = ((dmrs_params.ref_point == 1) ? (start_Rb - dmrs_params.BWP_start_PRB) : start_Rb) * (CUPHY_N_TONES_PER_PRB >> 1);
+    const int new_tidx                  = tid_x - scrambling_seq_start_tone;
     // Only use threads that cover used RBs
-    bool tid_enable = (new_tidx < (params[TB_id].num_Rbs * (CUPHY_N_TONES_PER_PRB >> 1))) && (new_tidx >= 0); // Resource Allocation Type 1
-    if(params[TB_id].resourceAlloc == 0){
-        //const int tid_rb = ((params[TB_id].ref_point == 1) ? params[TB_id].BWP_start_PRB : 0) + tid_x/(CUPHY_N_TONES_PER_PRB >> 1);
-        const int tid_rb = ((params[TB_id].ref_point == 1) ? 0 : -params[TB_id].BWP_start_PRB) + tid_x/(CUPHY_N_TONES_PER_PRB >> 1);
-        if((tid_rb < (MAX_RBMASK_BYTE_SIZE*8))&&(0<=tid_rb)) {
-            tid_enable = (0!=(params[TB_id].rbBitmap[tid_rb>>5] & (1L << (tid_rb & 0x1F))));
+    bool tid_enable = (new_tidx < (dmrs_params.num_Rbs * (CUPHY_N_TONES_PER_PRB >> 1))) && (new_tidx >= 0); // Resource Allocation Type 1
+    if(dmrs_params.resourceAlloc == 0)
+    {
+        //const int tid_rb = ((dmrs_params.ref_point == 1) ? dmrs_params.BWP_start_PRB : 0) + tid_x/(CUPHY_N_TONES_PER_PRB >> 1);
+        const int tid_rb = ((dmrs_params.ref_point == 1) ? 0 : -dmrs_params.BWP_start_PRB) + tid_x / (CUPHY_N_TONES_PER_PRB >> 1);
+        if((tid_rb < (MAX_RBMASK_BYTE_SIZE * 8)) && (0 <= tid_rb))
+        {
+            tid_enable = (0 != (dmrs_params.rbBitmap[tid_rb >> 5] & (1L << (tid_rb & 0x1F))));
         }
     }
-    if(tid_enable){
-
-        for (int symbol_id = 0; symbol_id < num_dmrs_symbols; symbol_id++) {
-            int base_shmem_index = symbol_id * gold_elements_one_dmrs;
-            int shmem_index = base_shmem_index + (threadIdx.x >> 4);
-
-            /*if (shmem_index >= num_dmrs_symbols * gold_elements_one_dmrs) {
-                printf("threadIdx %d, blockIdx.x %d, blockIdx.y %d, shmem_index %d, gold_elements %d\n",
-                        threadIdx.x, blockIdx.x, blockIdx.y, shmem_index, num_dmrs_symbols * gold_elements_one_dmrs);
-            }*/
-
-            int shmem_bit_offset = ((threadIdx.x & 0xFU) << 1); // Shift by 1 because each thread reads two bits
-            uint32_t gold_value = ((shmem_gold_seqs[shmem_index] >> shmem_bit_offset) & 0x3U);
-            //uint32_t gold_value = (shmem_gold_seqs[shmem_index] >> shmem_bit_offset);
-
-#if 1
-            Tcomplex scrambled_val;
-            if (gold_value == 0) {
-                scrambled_val = make_complex<Tcomplex>::create(positive_scramble_seq, positive_scramble_seq);
-            } else if (gold_value == 1) {
-                scrambled_val = make_complex<Tcomplex>::create(-positive_scramble_seq, positive_scramble_seq);
-            } else if (gold_value == 2) {
-                scrambled_val = make_complex<Tcomplex>::create(positive_scramble_seq, -positive_scramble_seq);
-            } else if (gold_value == 3) {
-                scrambled_val = make_complex<Tcomplex>::create(-positive_scramble_seq, -positive_scramble_seq);
-            }
-            Tcomplex dmrs_temp_out1[MAX_DL_PORTS] = {{0, 0}};
-            Tcomplex dmrs_temp_out2[MAX_DL_PORTS] = {{0, 0}};
-
-            bool cdm_grps_no_data_1 = params[TB_id].dmrsCdmGrpsNoData1;
-
-            for (int layer_id = 0; layer_id < params[TB_id].num_layers; ++layer_id) {
-                Tcomplex symbol_to_read = scrambled_val;
-    #else
-                int mult_0 = (gold_value & 0x2) ? -1 : 1;
-                int mult_1 = (gold_value & 0x1) ? -1 : 1;
-                Tcomplex symbol_to_read = make_complex<Tcomplex>::create(mult_1 * positive_scramble_seq, mult_0 * positive_scramble_seq);
-    #endif
-
-                // Do remap dmrs part
-                const int port_idx = params[TB_id].port_ids[layer_id];
-                const int delta =  (port_idx >> 1) & 0x1U; // DRMS config. type 1 only; valid options 0 or 1
-                const int fOCC_flag = (port_idx & 0x1U); // even port_idx, i.e., fOCC_flag == 0, means Wf(k') is all +1; odd port means Wf(k') is +1, -1, alternating
-                const int tOCC_flag = (port_idx >> 2) & 0x1U; // port_idx < 4, i.e., tOCC_flag == 0, means Wt(l') is all +1; port_idx >= 4 means Wt(l') is +1, -1
-
-                if ((fOCC_flag == 1) && ((tid_x & 0x1U) == 0x1U)){
-                    symbol_to_read =  make_complex<Tcomplex>::create(-symbol_to_read.x, -symbol_to_read.y);
-                }
-                if (((symbol_id & 0x1) == 1) && (tOCC_flag == 1)) {
-                    symbol_to_read =  make_complex<Tcomplex>::create(-symbol_to_read.x, -symbol_to_read.y);
-                }
-
-                //Each thread writes 2 consecutive symbols, one zero-ed out, if cdm_grps_no_data != 1
-                Tcomplex symbol_to_write_0, symbol_to_write_1;
-                if (delta == 0) {  // {symbol_read, 0}
-                    symbol_to_write_0 = symbol_to_read;
-                    symbol_to_write_1 = make_complex<Tcomplex>::create(0, 0);
-                } else { // (delta == 1) {0, symbol_read}
-                    symbol_to_write_0 = make_complex<Tcomplex>::create(0, 0);
-                    symbol_to_write_1 = symbol_to_read;
-                }
-                if(!enablePrecoding)
-                {
-                    const int layer = calculate_layer_id(port_idx, params[TB_id].n_scid, params[TB_id].nlAbove16);
-                    uint32_t output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * layer + symbol_loc[symbol_id])) +
-                                            (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
-                    if (!cdm_grps_no_data_1)
-                    {
-                        dmrs_output[output_index] =  symbol_to_write_0;
-                        dmrs_output[output_index + 1] = symbol_to_write_1;
-                    }
-                    else
-                    {
-                        // The other RE will be written by the fused rate-matching and modulation kernel
-                        dmrs_output[output_index + delta] =  symbol_to_read;
-                    }
-                }
-                else
-                {
-                    if(!params[TB_id].enablePrcdBf)
-                    {
-                        const int layer = calculate_layer_id(port_idx, params[TB_id].n_scid, params[TB_id].nlAbove16);
-                        uint32_t output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * layer + symbol_loc[symbol_id])) +
-                                                (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
-                        // No need to perform atomicAdd with 0 for the alternate RE
-                        atomicAdd(&dmrs_output[output_index + delta], symbol_to_read);
-                    }
-                    else
-                    {
-                        #pragma loop unroll
-                        for(int out_port = 0; out_port < params[TB_id].Np; ++out_port) {
-                            __half2 matCoeff = params[TB_id].pmW[layer_id *  params[TB_id].Np + out_port];
-                            dmrs_temp_out1[out_port] = __hcmadd(symbol_to_write_0, matCoeff, dmrs_temp_out1[out_port]);
-                            dmrs_temp_out2[out_port] = __hcmadd(symbol_to_write_1, matCoeff, dmrs_temp_out2[out_port]);
-                        }
-                    }
-                }
-            }
-
-            if(enablePrecoding && params[TB_id].enablePrcdBf)
-            {
-                #pragma loop unroll
-                for(int out_port = 0; out_port < params[TB_id].Np; ++out_port) {
-                    uint32_t output_index = (CUPHY_N_TONES_PER_PRB * BWP_PRBs * (OFDM_SYMBOLS_PER_SLOT * out_port + symbol_loc[symbol_id])) +
-                                            (CUPHY_N_TONES_PER_PRB * start_Rb) + (new_tidx << 1);
-                    atomicAdd(&dmrs_output[output_index], dmrs_temp_out1[out_port]);
-                    atomicAdd(&dmrs_output[output_index + 1], dmrs_temp_out2[out_port]);
-                }
-            }
+    if(tid_enable)
+    {
+        // no rv/Qm check needed: DMRS generation is independent of rv and modulation order
+        // no csirs check needed: CSIRS does not mux with DMRS.
+        const bool dmrs_carry_no_data = (dmrs_params.dmrsCdmGrpsNoData1 == 0);
+        const bool fast_path          = (dmrs_params.su_mimo) && (dmrs_params.num_layers == 4) && (dmrs_params.Np == 4) && (dmrs_params.resourceAlloc == 1) && (dmrs_params.enablePrcdBf == 1) && dmrs_carry_no_data;
+        if(fast_path)
+        {
+            dmrs_scramble_precode_4port<Tcomplex, Tscalar>(
+                dmrs_params, gold_elements_one_dmrs, shmem_gold_seqs, positive_scramble_seq, tid_x, new_tidx, symbol_loc, dmrs_output);
+        }
+        else
+        {
+            dmrs_scramble_precode_generic<enablePrecoding, Tcomplex, Tscalar>(
+                dmrs_params, num_dmrs_symbols, gold_elements_one_dmrs, shmem_gold_seqs, positive_scramble_seq, tid_x, new_tidx, symbol_loc, dmrs_params.Np, dmrs_output);
         }
     }
 }
-
 
 cuphyStatus_t CUPHYWINAPI cuphySetupPdschDmrs(cuphyPdschDmrsLaunchConfig_t pdschDmrsLaunchConfig,
                                               PdschDmrsParams * dmrs_params,
@@ -640,8 +782,13 @@ __global__ void postProcessCsirsReMap(pdschCsirsPrepDescr_t* p_desc)
     int cell_index = d_dmrs_params[TB_idx].cell_index_in_cell_group;
     size_t per_cell_xtf_re_map_elements = max_BWP * CUPHY_N_TONES_PER_PRB * OFDM_SYMBOLS_PER_SLOT + OFDM_SYMBOLS_PER_SLOT;
     uint16_t* d_cell_xtf_re_map = reMapArray +  cell_index * per_cell_xtf_re_map_elements;
-
     uint16_t* re_map_symbols = d_cell_xtf_re_map + max_BWP*CUPHY_N_TONES_PER_PRB * OFDM_SYMBOLS_PER_SLOT;
+
+    // Synchronize before any early return statement to avoid potential RAW hazard (compute-sanitizer race-check) involving warp_start_pos_wr.
+    // The threads (part of a warp) that initialized warp_start_pos_wr above may return early
+    // (if re_map_symbols[symbol_idx] is 0 or (!found), before a subsequent __syncthreads is called.
+    __syncthreads();
+
     if (re_map_symbols[symbol_idx] == 0) return;
 
     //Potential future opt. option. Not implemented; Is symbol_idx a data symbol for this TB?  Check the data_sym_loc of that TB.
@@ -706,9 +853,10 @@ __global__ void postProcessCsirsReMap(pdschCsirsPrepDescr_t* p_desc)
         uint32_t rb_elem_mask = __match_any_sync(0xFFFFFFFF,(rbmap_element!=0));
         rb_elem_mask = (rbmap_element!=0) ? rb_elem_mask : ~rb_elem_mask;
         uint8_t rb_elem_idx_low = __ffs(rb_elem_mask)-1;
-        uint8_t rb_elem_idx_hi  = 31 - __clz(rb_elem_mask);
+        // __clz return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems, thus the explicit cast
+        uint8_t rb_elem_idx_hi  = 31 - (int)__clz(rb_elem_mask);
         uint16_t min_rb = (rb_elem_idx_low << 5) + __ffs(d_dmrs_params[TB_idx].rbBitmap[rb_elem_idx_low])-1;
-        uint16_t max_rb = (rb_elem_idx_hi << 5)  + (31 - __clz(d_dmrs_params[TB_idx].rbBitmap[rb_elem_idx_hi]));
+        uint16_t max_rb = (rb_elem_idx_hi << 5)  + (31 - (int)__clz(d_dmrs_params[TB_idx].rbBitmap[rb_elem_idx_hi]));
 
         uint32_t start_re_map_index = min_rb * CUPHY_N_TONES_PER_PRB + symbol_idx * all_Rbs_symbols;
 
@@ -755,6 +903,8 @@ __global__ void postProcessCsirsReMap(pdschCsirsPrepDescr_t* p_desc)
                 // and reverse so most significant bit is for RE 0 and set if rb_bit_wr is false
                 uint32_t mask_of_bits_wr = __brev((-rb_bit_wr) ^ ~outcome_wr);
                 uint8_t  rd_bits_set_to_the_left = lane_idx - __popc(mask_of_bits_wr >> (lane_shift));
+                // Note: __clz return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems. Did not add explicit cast in two
+                // use cases below as it is not necessary for current code.
                 // Count the number of lanes that match lane 0 (i.e. number of values to be written or skipped this cycle)
                 read_step = __clz((-((mask_of_bits_wr & 0x80000000)!=0)) ^ mask_of_bits_wr);
 

@@ -85,6 +85,9 @@ Parameters                    Default Value   Description
 
 Environment:
   ENABLE_STREAMS                  1           1 = run stream mode where available; 0 = prefer graph-only where coded
+  PUCCH_PIPELINE_MODE_TCS     6501 6514       PUCCH TC IDs with extra mode-specific CI checks
+                                6527 6540
+                                6254
 
 Test block indices:
 EOF
@@ -297,6 +300,31 @@ function checkPuschResults {
     fi
 }
 
+function checkPuschOffloadingResults {
+    # Check exit code of process that was the input to tee
+    pid_errval=${PIPESTATUS[0]}
+    if [ $pid_errval -ne 0 ]; then
+        echo "Process exited with non-zero exit code $pid_errval"
+        return 1
+    fi
+
+    # Check for metric mismatches by searching for "ERROR:" and "mismatch" in the same line
+    if [[ $(grep -Eo 'ERROR:.*mismatch' "$1") ]]; then
+        metricMismatch_string=$(grep -Eo 'ERROR:.*mismatch' "$1")
+        readarray -t metricMismatch_array <<<"$metricMismatch_string"
+        echo "PUSCH metric mismatches detected, count ${#metricMismatch_array[@]}"
+        return ${#metricMismatch_array[@]}
+    fi
+
+    # Check for metric mismatches by searching for "ERR" and "mismatch" in the same line
+    if [[ $(grep -Eo 'ERR.*mismatch' "$1") ]]; then
+        metricMismatch_string=$(grep -Eo 'ERR.*mismatch' "$1")
+        readarray -t metricMismatch_array <<<"$metricMismatch_string"
+        echo "PUSCH metric mismatches detected, count ${#metricMismatch_array[@]}"
+        return ${#metricMismatch_array[@]}
+    fi
+}
+
 function checkPucchMismatch {
     # Check for mismatches
     mismatches_string=$(grep -Po 'found\s*\K\d+' "$1")
@@ -446,12 +474,15 @@ function runPDCCH {
 
 function runPDSCH {
     #TODO Not all PDSCH + PDSCH component examples might be needed. Can comment some out.
-    #TODO Potentially include PDSCH multi-cell, but it needs a YAML file.
+    # Switched from using cuphy_ex_pdsch_tx to cuphy_ex_pdsch_tx_multi_cell, which exercises datasets, still using a TV (single-cell scenario)
+    #TODO: determine appropriate default values for any additional cuphy_ex_pdsch_tx_multi_cell cli args.
+    #TODO Potentially include PDSCH multi-cell with a yaml file, to exercise a multi-cell scenario
+
     PDSCH_CMDS=(
-        "$CUPHY_EXAMPLES/pdsch_tx/cuphy_ex_pdsch_tx TV_PLACEHOLDER 2 0 0 TB_ALIGNMENT_PLACEHOLDER" #PDSCH in non-AAS mode, streams, different TB alignment per TV
-        #"$CUPHY_EXAMPLES/pdsch_tx/cuphy_ex_pdsch_tx TV_PLACEHOLDER 2 1 0" #PDSCH in AAS mode, streams
-        "$CUPHY_EXAMPLES/pdsch_tx/cuphy_ex_pdsch_tx TV_PLACEHOLDER 2 0 1 TB_ALIGNMENT_PLACEHOLDER" #PDSCH in non-AAS mode, graphs, different TB alignment per TV
-        #"$CUPHY_EXAMPLES/pdsch_tx/cuphy_ex_pdsch_tx TV_PLACEHOLDER 2 1 1" #PDSCH in AAS mode, graphs
+        "$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell -i  TV_PLACEHOLDER -m 0 -s 2 -r 1 --P MODE_PLACEHOLDER -g -k -a TB_ALIGNMENT_PLACEHOLDER ANOTHER_PLACEHOLDER" #PDSCH in non-AAS mode, streams, different TB alignment per TV
+        #"$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell -i  TV_PLACEHOLDER -m 0 -s 2 -r 1 --P 1 -k ANOTHER_PLACEHOLDER" #PDSCH in AAS mode, streams
+        "$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell -i  TV_PLACEHOLDER -m 1 -s 2 -r 1 -g --P MODE_PLACEHOLDER -k -a TB_ALIGNMENT_PLACEHOLDER ANOTHER_PLACEHOLDER" #PDSCH in non-AAS mode, graphs, different TB alignment per TV
+        #"$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell -i  TV_PLACEHOLDER -m 1 -s 2 -r 1 --P 1 -k ANOTHER_PLACEHOLDER" #PDSCH in AAS mode, graphs
         #"$CUPHY_EXAMPLES/dl_rate_matching/dl_rate_matching TV_PLACEHOLDER 2"
         #"$CUPHY_EXAMPLES/modulation_mapper/modulation_mapper TV_PLACEHOLDER 2"
         #"$CUPHY_EXAMPLES/pdsch_dmrs/pdsch_dmrs TV_PLACEHOLDER"
@@ -465,18 +496,63 @@ function runPDSCH {
             for tv in $(find $BASE_TV_PATH \( -name "*PDSCH_gNB_CUPHY*.h5" -o -name "TV_cuphy_F14-DS*.h5" -o -name "TV_cuphy_F01-DS*.h5" -o -name "TV_cuphy_V*-DS*.h5" \)); do
                 # Pick different TB alignment per TV to increase test coverage for all TVnr_DLMIX_.*_PDSCH_gNB_CUPHY.*h5 or TVnr_.*_PDSCH_gNB_CUPHY_.*h5 TVs;
                 # fall back to 8 byte alignment otherwise
-
                 TB_alignment=8 # default byte alignment, unless overwritten below
+                BATCHED_MEMCPY="" # default option (no batched memcpy), unless overwritten below with "-b". Only relevant if TB buffers on host
+                TB_BUFFERS_ON_GPU=""  # default option (TB buffers on host), unless overwritten below with "-t"
+                PROCESSING_MODE="0" # default processing mode is PDSCH_FULL_PROCESSING, unless overwritten below
                 tv_num=$(echo $tv | grep "^.*TVnr[_DLMIX]*_[0-9].*PDSCH_gNB_CUPHY.*h5" | sed -e "s|^.*TVnr[_DLMIX]*_[0]*\([0-9]\+\)_PDSCH_gNB_CUPHY.*h5|\1|g")
                 if [ -n "$tv_num" ]; then
                     TB_alignment=$((1 << ($tv_num % 6))) # supported TB alignments in bytes are 1, 2, 4, 8, 16, 32
+
+                    # To extend coverage, use TB_BUFFER_ON_GPU="-t" if TV_num_mod_4 is 0 or 1 and BATCHED_MEMCPY="-b" if TV_num_mod_4 is 3 (temporarily skipping -b)
+                    # TODO: uncomment -b option below, once compute-sanitizer's initcheck issue with batched async memcpy gets resolved
+                    TV_num_mod_4=$(($tv_num % 4))
+                    if [ $TV_num_mod_4 -le  1 ]; then
+                        TB_BUFFERS_ON_GPU="-t"
+                    #elif [ $TV_num_mod_4 -eq 3 ]; then
+                    #    BATCHED_MEMCPY="-b"
+                    fi
+
+                    # Pick POST-FEC processing mode for a few TVs, if command had MODE_PLACEHOLDER in it, to extend testing coverage. Default is full slot processing mode.
+                    # TVs picked include TVs in test mode, MU-MIMO, TVs w/ CSI-RS, etc.
+                    case "$tv_num" in
+                    3355|3337|3339|3853) PROCESSING_MODE=2 ;;
+                    esac
+
+                    # Pick POST-FEC-RM-SCRAMBLING processing mode for a few TVs, if command had MODE_PLACEHOLDER in it, to extend testing coverage. Default is full slot processing mode.
+                    # Currently picked TV is TVnr_DLMIX_7551_PDSCH_*h5
+                    case "$tv_num" in
+                    7551) PROCESSING_MODE=3 ;;
+                    esac
+
                 fi
                 current_pdsch_cmd=$(echo -n "$pdsch_cmd" | sed -e "s|TV_PLACEHOLDER|$tv|g" | sed -e "s|TB_ALIGNMENT_PLACEHOLDER|$TB_alignment|g")
+                current_pdsch_cmd=$(echo -n "$current_pdsch_cmd" | sed -e "s|ANOTHER_PLACEHOLDER|$BATCHED_MEMCPY $TB_BUFFERS_ON_GPU|g")
+                current_pdsch_cmd=$(echo -n "$current_pdsch_cmd" | sed -e "s|MODE_PLACEHOLDER|$PROCESSING_MODE|g")
                 echo "$current_pdsch_cmd"
                 runtest "$current_pdsch_cmd" $RUN_COMPUTE_SANITIZER
             done
         fi
     done
+    
+    # PDSCH TC3361: always run with all compute-sanitizer tools (memcheck, racecheck, synccheck, initcheck)
+    # independent of the global RUN_COMPUTE_SANITIZER selection.
+    bin_file=$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell
+    if [ -f "${bin_file}" ]; then
+        SAVED_RUN_COMPUTE_SANITIZER=$RUN_COMPUTE_SANITIZER
+        RUN_COMPUTE_SANITIZER=15  # force all: memcheck(1)+racecheck(2)+synccheck(4)+initcheck(8)
+        find "$BASE_TV_PATH" -name "*3361*PDSCH_gNB_CUPHY*.h5" -print0 | while IFS= read -r -d '' tv; do
+            # Streams mode
+            if [ $ENABLE_STREAMS -eq 1 ]; then
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 0 -s 2 -r 1 --P 0 -g -k -a 8)
+                runtest "$test_cmd" 15
+            fi
+            # Graphs mode
+            test_cmd=$(echo -n ${bin_file} -i ${tv} -m 1 -s 2 -r 1 --P 0 -g -k -a 8)
+            runtest "$test_cmd" 15
+        done
+        RUN_COMPUTE_SANITIZER=$SAVED_RUN_COMPUTE_SANITIZER
+    fi
 }
 
 function runCSIRS {
@@ -532,6 +608,25 @@ function runPRACH {
     fi
 }
 
+if [ -z "$PUCCH_PIPELINE_MODE_TCS" ]; then
+    PUCCH_PIPELINE_MODE_TCS="6501 6514 6527 6540 6254"
+fi
+
+function pucchTvCaseId {
+    basename "$1" | sed -n "s/^TVnr_\([0-9]\+\)_PUCCH_.*$/\1/p"
+}
+
+function shouldRunPucchPipelineModeTv {
+    local tv_case_id="$(pucchTvCaseId "$1")"
+    local selected_tc=""
+    for selected_tc in $PUCCH_PIPELINE_MODE_TCS; do
+        if [ "$tv_case_id" = "$selected_tc" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 function runPUCCH {
     bin_file=$CUPHY_EXAMPLES/pucch_rx_pipeline/cuphy_ex_pucch_rx_pipeline
     checkBinFile "$bin_file"
@@ -547,6 +642,33 @@ function runPUCCH {
             test_cmd=$(echo -n ${bin_file} -i ${tv} -m 1)
             runtest "$test_cmd" 15
             checkPucchMismatch $LOGFILE
+
+            # Skip-polar mode: only exercised when the TV carries the post-polar reference
+            # datasets (cbEst0 / crcErrorFlags / sizes) needed for post-polar descriptor injection.
+            # F2/F3 TVs regenerated after the polar-skip MR carry these; F0/F1 and older TVs
+            # don't, so they're skipped silently here.
+            if h5ls "${tv}" 2>/dev/null | grep -q '^cbEst0 '; then
+                if [ $ENABLE_STREAMS -eq 1 ]; then
+                    test_cmd=$(echo -n ${bin_file} -i ${tv} -s)
+                    runtest "$test_cmd" 15
+                    checkPucchMismatch $LOGFILE
+                fi
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 1 -s)
+                runtest "$test_cmd" 15
+                checkPucchMismatch $LOGFILE
+            fi
+
+            # Skip-backend mode: targeted CI coverage for selected PUCCH TVs.
+            # Only F2/F3 TVs regenerated with frontend references carry frontEndSizes;
+            # F0/F1 selected cases keep full stream/graph coverage above.
+            if shouldRunPucchPipelineModeTv "${tv}" && h5ls "${tv}" 2>/dev/null | grep -q "^frontEndSizes "; then
+                if [ $ENABLE_STREAMS -eq 1 ]; then
+                    test_cmd=$(echo -n ${bin_file} -i ${tv} --processing-mode 2)
+                    runtest "$test_cmd" 15
+                fi
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 1 --processing-mode 2)
+                runtest "$test_cmd" 15
+            fi
         done
     fi
 }
@@ -748,6 +870,77 @@ function runPUSCH {
                 checkPuschResults $LOGFILE
             fi
         done
+
+        # 7.2e split + Graphs mode + sub-slot
+        for tv in $(find $BASE_TV_PATH \( -name "TVnr_ULMIX_85[5-9][0-9]_PUSCH_gNB_CUPHY*.h5" -o -name "TVnr_ULMIX_86[0-4][0-9]_PUSCH_gNB_CUPHY*.h5" -o -name "TVnr_ULMIX_8650_PUSCH_gNB_CUPHY*.h5" -o -name "TVnr_ULMIX_8651_PUSCH_gNB_CUPHY*.h5" -o -name "TVnr_728[9]_PUSCH_gNB_CUPHY*.h5" -o -name "TVnr_729[0-6]_PUSCH_gNB_CUPHY*.h5" -o -name "TVnr_735[8-9]_PUSCH_gNB_CUPHY*.h5" -o -name "TVnr_736[0-4]_PUSCH_gNB_CUPHY*.h5" -o -name "TVnr_754[1-3]_PUSCH_gNB_CUPHY*.h5" \)); do
+            test_cmd=$(echo -n ${bin_file} -i ${tv} -m 3 -r 1 -R 1)
+            runtest "$test_cmd" 7
+
+            if [ ${PUSCH_CB_ERROR_CHECK} -ne 0 ]; then
+                echo "do checkPuschResults $LOGFILE"
+                checkPuschResults $LOGFILE 0
+            fi
+        done
+
+        # offloading
+        for tv in $(find $BASE_TV_PATH \( -name "TVnr_*PUSCH_gNB_CUPHY*.h5" \)); do
+            tv_file=$(basename "$tv")
+
+            if [[ "$tv_file" == *"8605"* ]]; then
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 3 -r 1 -R 0 -F 2 -U 2 -X 100)
+                runtest "$test_cmd" 7
+
+                if [ ${PUSCH_CB_ERROR_CHECK} -ne 0 ]; then
+                    echo "do checkPuschResults $LOGFILE"
+                    checkPuschOffloadingResults $LOGFILE 0
+                fi
+            fi
+            if [[ "$tv_file" == *"8556"* ]]; then
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 3 -r 1 -R 1 -F 2 -U 2 -X 100)
+                runtest "$test_cmd" 7
+
+                if [ ${PUSCH_CB_ERROR_CHECK} -ne 0 ]; then
+                    echo "do checkPuschResults $LOGFILE"
+                    checkPuschOffloadingResults $LOGFILE 0
+                fi
+            fi
+            if [[ "$tv_file" == *"8604"* ]]; then
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 3 -r 1 -R 0 -F 2 -U 3 -X 100)
+                runtest "$test_cmd" 7
+
+                if [ ${PUSCH_CB_ERROR_CHECK} -ne 0 ]; then
+                    echo "do checkPuschResults $LOGFILE"
+                    checkPuschOffloadingResults $LOGFILE 0
+                fi
+            fi
+            if [[ "$tv_file" == *"8580"* ]]; then
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 3 -r 1 -R 1 -F 2 -U 3 -X 100)
+                runtest "$test_cmd" 7
+
+                if [ ${PUSCH_CB_ERROR_CHECK} -ne 0 ]; then
+                    echo "do checkPuschResults $LOGFILE"
+                    checkPuschOffloadingResults $LOGFILE 0
+                fi
+            fi
+            if [[ "$tv_file" == *"8628"* ]]; then
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 3 -r 1 -R 0 -F 3 -U 3 -X 100)
+                runtest "$test_cmd" 7
+
+                if [ ${PUSCH_CB_ERROR_CHECK} -ne 0 ]; then
+                    echo "do checkPuschResults $LOGFILE"
+                    checkPuschOffloadingResults $LOGFILE 0
+                fi
+            fi
+            if [[ "$tv_file" == *"8629"* ]]; then
+                test_cmd=$(echo -n ${bin_file} -i ${tv} -m 3 -r 1 -R 1 -F 3 -U 3 -X 100)
+                runtest "$test_cmd" 7
+
+                if [ ${PUSCH_CB_ERROR_CHECK} -ne 0 ]; then
+                    echo "do checkPuschResults $LOGFILE"
+                    checkPuschOffloadingResults $LOGFILE 0
+                fi
+            fi
+        done
     fi
 }
 
@@ -832,10 +1025,10 @@ function runComponentTests {
         # PDSCH dl_rate_matching, modulation_mapper, pdsch_dmrs, AAS mode
         if should_run_component_test_group "pdsch"; then
             PDSCH_CMDS=(
-                #"$CUPHY_EXAMPLES/pdsch_tx/cuphy_ex_pdsch_tx TV_PLACEHOLDER 2 0 0" #PDSCH in non-AAS mode, streams
-                "$CUPHY_EXAMPLES/pdsch_tx/cuphy_ex_pdsch_tx TV_PLACEHOLDER 2 1 0 TB_ALIGNMENT_PLACEHOLDER" #PDSCH in AAS mode, streams. different TB alignment per TV
-                #"$CUPHY_EXAMPLES/pdsch_tx/cuphy_ex_pdsch_tx TV_PLACEHOLDER 2 0 1" #PDSCH in non-AAS mode, graphs
-                "$CUPHY_EXAMPLES/pdsch_tx/cuphy_ex_pdsch_tx TV_PLACEHOLDER 2 1 1 TB_ALIGNMENT_PLACEHOLDER" #PDSCH in AAS mode, graphs, different TB alignment per TV
+                #"$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell -i  TV_PLACEHOLDER -m 0 -s 2 -r 1 --P MODE_PLACEHOLDER -g -k -a TB_ALIGNMENT_PLACEHOLDER ANOTHER_PLACEHOLDER" #PDSCH in non-AAS mode, streams, different TB alignment per TV
+                "$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell -i  TV_PLACEHOLDER -m 0 -s 2 -r 1 --P 1 -k -a TB_ALIGNMENT_PLACEHOLDER ANOTHER_PLACEHOLDER" #PDSCH in AAS mode, streams
+                #"$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell -i  TV_PLACEHOLDER -m 1 -s 2 -r 1 --P MODE_PLACEHOLDER -g -k -a TB_ALIGNMENT_PLACEHOLDER ANOTHER_PLACEHOLDER" #PDSCH in non-AAS mode, graphs, different TB alignment per TV
+                "$CUPHY_EXAMPLES/pdsch_tx_multi_cell/cuphy_ex_pdsch_tx_multi_cell -i  TV_PLACEHOLDER -m 1 -s 2 -r 1 --P 1 -k -a TB_ALIGNMENT_PLACEHOLDER ANOTHER_PLACEHOLDER" #PDSCH in AAS mode, graphs
                 "$CUPHY_EXAMPLES/dl_rate_matching/dl_rate_matching TV_PLACEHOLDER 2"
                 "$CUPHY_EXAMPLES/modulation_mapper/modulation_mapper TV_PLACEHOLDER 2"
                 "$CUPHY_EXAMPLES/pdsch_dmrs/pdsch_dmrs TV_PLACEHOLDER"
@@ -850,11 +1043,38 @@ function runComponentTests {
                         # Pick different TB alignment per TV to increase test coverage for all TVnr_DLMIX_.*_PDSCH_gNB_CUPHY.*h5 or TVnr_.*_PDSCH_gNB_CUPHY_.*h5 TVs;
                         # fall back to 8 byte alignment otherwise
                         TB_alignment=8 # default byte alignment, unless overwritten below
+                        BATCHED_MEMCPY="" # default option (no batched memcpy), unless overwritten below with "-b". Only relevant if TB buffers on host
+                        TB_BUFFERS_ON_GPU=""  # default option (TB buffers on host), unless overwritten below with "-t"
+                        PROCESSING_MODE="0" # default processing mode is PDSCH_FULL_PROCESSING, unless overwritten below
                         tv_num=$(echo $tv | grep "^.*TVnr[_DLMIX]*_[0-9].*PDSCH_gNB_CUPHY.*h5" | sed -e "s|^.*TVnr[_DLMIX]*_[0]*\([0-9]\+\)_PDSCH_gNB_CUPHY.*h5|\1|g")
                         if [ -n "$tv_num" ]; then
                             TB_alignment=$((1 << ($tv_num % 6))) # supported TB alignments in bytes are 1, 2, 4, 8, 16, 32
+
+                            # To extend coverage, use TB_BUFFER_ON_GPU="-t" if TV_num_mod_4 is 0 or 1 and BATCHED_MEMCPY="-b" if TV_num_mod_4 is 3 (temporarily skipping -b)
+                            # TODO: uncomment -b option below, once compute-sanitizer's initcheck issue with batched async memcpy gets resolved
+                            TV_num_mod_4=$(($tv_num % 4))
+                            if [ $TV_num_mod_4 -le  1 ]; then
+                                TB_BUFFERS_ON_GPU="-t"
+                            #elif [ $TV_num_mod_4 -eq 3 ]; then
+                            #    BATCHED_MEMCPY="-b"
+                            fi
                         fi
+
+                        # Pick POST-FEC processing mode for a few TVs, if command had MODE_PLACEHOLDER in it, to extend testing coverage. Default is full slot processing mode.
+                        # TVs picked include TVs in test mode, MU-MIMO, TVs w/ CSI-RS, etc.
+                        case "$tv_num" in
+                        3355|3337|3339|3853) PROCESSING_MODE=2 ;;
+                        esac
+
+                        # Pick POST-FEC-RM-SCRAMBLING processing mode for a few TVs, if command had MODE_PLACEHOLDER in it, to extend testing coverage. Default is full slot processing mode.
+                        # Currently picked TV is TVnr_DLMIX_7551_PDSCH_*h5
+                        case "$tv_num" in
+                        7551) PROCESSING_MODE=3 ;;
+                        esac
+
                         current_pdsch_cmd=$(echo -n "$pdsch_cmd" | sed -e "s|TV_PLACEHOLDER|$tv|g" | sed -e "s|TB_ALIGNMENT_PLACEHOLDER|$TB_alignment|g")
+                        current_pdsch_cmd=$(echo -n "$current_pdsch_cmd" | sed -e "s|ANOTHER_PLACEHOLDER|$BATCHED_MEMCPY $TB_BUFFERS_ON_GPU|g")
+                        current_pdsch_cmd=$(echo -n "$current_pdsch_cmd" | sed -e "s|MODE_PLACEHOLDER|$PROCESSING_MODE|g")
                         echo "$current_pdsch_cmd"
                         runtest "$current_pdsch_cmd" $RUN_COMPUTE_SANITIZER
                     done

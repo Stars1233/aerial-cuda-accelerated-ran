@@ -39,7 +39,7 @@ class Replay {
 public:
 	Replay(DataLake& dl, E3Agent& agent, const ReplayCfg& cfg, const CpuCfg& cpu,
 	       const RowsCfg& rows);
-	void run(std::atomic<bool>& stop);
+	[[nodiscard]] bool run(std::atomic<bool>& stop);  // a stop request is not a failure
 
 private:
 	DataLake& dl_;

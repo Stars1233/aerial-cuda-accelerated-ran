@@ -1306,6 +1306,7 @@ for idxUe = 1:nUe
      UciRmSeqLen{idxUe}.G           = G;
      UciRmSeqLen{idxUe}.harqRvdFlag = harqRvdFlag;
 
+     X_est_DFT_s_OFDM = X_est;
      % DFT spread OFDM
      if enableTfPrcd == 1
          if SimCtrl.alg.dft_s_ofdm_enable_bluestein_fft
@@ -1855,6 +1856,8 @@ for idxUe = 1:nUe
     W_perm = permute(cat(4,W{:}), [4,1,2,3]);
     rxDataUeg{idxUe}.eqCoef = W_perm(:,:,:,scIdxs);
     rxDataUeg{idxUe}.X_est = X_est(scIdxs,:,:);
+    rxDataUeg{idxUe}.enableTfPrcd = enableTfPrcd;
+    rxDataUeg{idxUe}.X_est_DFT_s_OFDM = X_est_DFT_s_OFDM(scIdxs,:,:);
     if TdiMode == 2
         rxDataUeg{idxUe}.Ree = Ree(:,scIdxs,:);
     else
@@ -2503,6 +2506,7 @@ reference_TbCbs_est = [];
 expDerateCbs = [];
 StartPrb = zeros(nPdu,1);
 
+nUplinkStreamsMax = 0;
 % construct ueGrp_pars
 for idxUeg = 1:nUeg
     ueGrp_pars(idxUeg).nUes      = uint16(length(UegList{idxUeg}.idxPdu));
@@ -2534,7 +2538,11 @@ for idxUeg = 1:nUeg
         end
     else
         [~, ~, ueGrp_pars(idxUeg).nUplinkStreams] = size(Xtf);
-    end    
+    end
+
+    if nUplinkStreamsMax < ueGrp_pars(idxUeg).nUplinkStreams
+        nUplinkStreamsMax = ueGrp_pars(idxUeg).nUplinkStreams;
+    end
 end
 
 % find max number of CBs for all UEs
@@ -2543,6 +2551,8 @@ for idxPdu = 1:nPdu
     maxNcb = max(maxNcb, PuschParamsList{idxPdu}.C);
 end
 reference_ldpcNumItr = zeros(nPdu, maxNcb); % >0 means the actual number of iterations in LDPC decoding for current CB; 0 means not a CB
+
+dmrsAddlPositionMax = 0;
 for idxPdu = 1:nPdu
     % initialize buffer offsets
     ue_refBufferOffsets(idxPdu).harqPayloadByteOffset = 0;
@@ -2616,6 +2626,9 @@ for idxPdu = 1:nPdu
 
     % DMRS parameters
     tb_pars(idxPdu).dmrsAddlPosition = uint32(PuschParams.AdditionalPosition);
+    if dmrsAddlPositionMax < tb_pars(idxPdu).dmrsAddlPosition
+        dmrsAddlPositionMax = tb_pars(idxPdu).dmrsAddlPosition;
+    end
     tb_pars(idxPdu).dmrsMaxLength = uint32(PuschParams.maxLength);
     tb_pars(idxPdu).dmrsScramId = uint32(PuschParams.N_dmrs_id);
     tb_pars(idxPdu).nSCID = uint32(PuschParams.n_scid);
@@ -2873,6 +2886,14 @@ for idxPdu = 1:nPdu
     end
 end
 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% maximum dimensions
+%% 273 PRBs
+%% 14 symbols
+X_72e_input = zeros(3276,14,nUplinkStreamsMax);
+Ree_inv_72e_input = zeros(12,nUplinkStreamsMax,273,dmrsAddlPositionMax+1);
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 % tb_data_uint8 = zeros(1, length(tb_data)/8);
 % for ii=1:length(tb_data)/8
 %     tmp = num2str(tb_data((ii-1)*8+1:ii*8)');
@@ -3037,8 +3058,46 @@ for ueGrpIdx = 0 : (nUeg - 1)
     hdf5_write_nv(h5File, saveStr, complex(single(ueGrpRxData.eqCoef)));
     saveStr = strcat('reference_X_est',num2str(ueGrpIdx));
     hdf5_write_nv(h5File, saveStr, complex(single(ueGrpRxData.X_est)));
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    startPrb         = ueGrp_pars(ueGrpIdx+1).startPrb;
+    nPrb             = ueGrp_pars(ueGrpIdx+1).nPrb;
+    if ueGrpRxData.enableTfPrcd == 0
+        [nSc, nDataSymb, nLayer] = size(ueGrpRxData.X_est);
+        %%%%% dimension checks %%%%%
+        if nPrb*12 ~= nSc
+            error('The number of sub-carriers does not match for X_est!')
+        end
+        assert(startPrb*12 + nSc <= size(X_72e_input, 1), 'SC range exceeds X_72e_input bounds');
+        assert(nDataSymb <= size(X_72e_input, 2), 'Symbol range exceeds X_72e_input bounds');
+        X_72e_input(startPrb*12+1:startPrb*12+nSc, 1:nDataSymb, 1:nLayer) = ueGrpRxData.X_est;
+    else
+        [nSc, nDataSymb, nLayer] = size(ueGrpRxData.X_est_DFT_s_OFDM);
+        %%%%% dimension checks %%%%%
+        if nPrb*12 ~= nSc
+            error('The number of sub-carriers does not match for X_est_DFT_s_OFDM!')
+        end
+        if nLayer ~= 1
+            error('X_est_DFT_s_OFDM has more than one layer!')
+        end
+        assert(startPrb*12 + nSc <= size(X_72e_input, 1), 'SC range exceeds X_72e_input bounds');
+        assert(nDataSymb <= size(X_72e_input, 2), 'Symbol range exceeds X_72e_input bounds');
+        X_72e_input(startPrb*12+1:startPrb*12+nSc, 1:nDataSymb, 1:nLayer) = ueGrpRxData.X_est_DFT_s_OFDM;
+    end
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     saveStr = strcat('reference_Ree',num2str(ueGrpIdx));
     hdf5_write_nv(h5File, saveStr, single(ueGrpRxData.Ree));
+    [nLayer, nSc, nDmrsSymb] = size(ueGrpRxData.Ree);
+    %%%%% dimension checks %%%%%
+    if nPrb*12 ~= nSc
+        error('The number of sub-carriers does not match for Ree!')
+    end
+    assert(startPrb + nPrb <= size(Ree_inv_72e_input, 3), 'PRB range exceeds Ree_inv_72e_input bounds');
+    assert(nDmrsSymb <= size(Ree_inv_72e_input, 4), 'DMRS symbol count exceeds Ree_inv_72e_input bounds');
+    Ree = reshape(ueGrpRxData.Ree, [nLayer, 12, nPrb, nDmrsSymb]);
+    Ree = permute(Ree, [2, 1, 3, 4]);
+    ReeInv = real(1./max(Ree, 1e-10));  % Prevent division by zero
+    Ree_inv_72e_input(:, 1:nLayer, startPrb+1:startPrb+nPrb, 1:nDmrsSymb) = ReeInv;
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
     saveStr = strcat('reference_cfoEst',num2str(ueGrpIdx));
     hdf5_write_nv(h5File, saveStr, complex(single(ueGrpRxData.cfoRot)));
     saveStr = strcat('reference_cfoAngle',num2str(ueGrpIdx));
@@ -3084,6 +3143,13 @@ end
 
 % write buffer offsets
 hdf5_write_nv_exp(h5File, 'ue_refBufferOffsets', ue_refBufferOffsets);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%
+hdf5_write_nv(h5File, 'X_72e_input', complex(single(X_72e_input)));
+hdf5_write_nv(h5File, 'X_72e_input_fp16', complex(single(X_72e_input)), 'fp16');
+hdf5_write_nv(h5File, 'Ree_inv_72e_input', single(Ree_inv_72e_input));
+%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
 
 % write uci buffers
 if(nUciUes > 0)

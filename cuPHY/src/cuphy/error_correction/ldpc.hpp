@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -86,6 +86,36 @@ public:
         return true;
     }
     //------------------------------------------------------------------
+    // supported_config_desc()
+    // Requirements that are NOT fields of cuphyLDPCDecodeConfigDesc_t, and
+    // so cannot be discovered by probing can_decode_config(): which decode
+    // interface the algorithm implements, whether it needs punctured input,
+    // and so on. Used only to explain a refusal.
+    //
+    // Do NOT restate parity-node counts, lifting sizes or anything else the
+    // configuration carries -- those are derived from can_decode_config()
+    // itself when a refusal is reported, which keeps them correct for
+    // algorithms that do not exist yet and stops them going stale here.
+    //
+    // Returns nullptr by default; overriding is optional.
+    [[nodiscard]]
+    virtual const char* supported_config_desc() const { return nullptr; }
+    //------------------------------------------------------------------
+    // requirements()
+    // The machine-readable form of supported_config_desc(): preconditions a
+    // CALLER must satisfy that the configuration descriptor cannot express,
+    // so can_decode_config() has no way to check them. Currently punctured
+    // input (cuphyLDPCDecodeConfigDesc_t carries no puncturing indicator) and
+    // transport-block-only support.
+    //
+    // Declared here so a caller can ask instead of keeping its own table of
+    // which algorithms need what -- such a table is a second source of truth
+    // and goes stale silently.
+    //
+    // Returns 0 by default; overriding is optional.
+    [[nodiscard]]
+    virtual uint32_t requirements() const { return 0; }
+    //------------------------------------------------------------------
     // get_launch_config()
     [[nodiscard]]
     virtual cuphyStatus_t get_launch_config(const decoder&                 dec,
@@ -132,6 +162,20 @@ public:
     // compute capability
     [[nodiscard]]
     uint64_t compute_cap() const { return cc_; }
+    //------------------------------------------------------------------
+    // algo_requirements()
+    // Caller-side preconditions declared by one algorithm. Returns 0 for an
+    // index that is out of range or not registered on this device, which is
+    // the same answer as "no requirements": a caller that cannot reach the
+    // algorithm has nothing to satisfy.
+    [[nodiscard]] uint32_t algo_requirements(int algo) const
+    {
+        if((algo < 0) || (static_cast<size_t>(algo) >= algos_.size()) || !algos_[algo])
+        {
+            return 0;
+        }
+        return algos_[algo]->requirements();
+    }
     //------------------------------------------------------------------
     // maximum shared mem per block (optin)
     [[nodiscard]]
@@ -188,7 +232,8 @@ private:
     [[nodiscard]] int choose_algo_sm86(const cuphyLDPCDecodeConfigDesc_t& config) const;
     [[nodiscard]] int choose_algo_sm89(const cuphyLDPCDecodeConfigDesc_t& config) const;
     [[nodiscard]] int choose_algo_sm90(const cuphyLDPCDecodeConfigDesc_t& config) const;
-    [[nodiscard]] static int choose_algo_sm100(const cuphyLDPCDecodeConfigDesc_t& config);
+    [[nodiscard]] int choose_algo_sm100(const cuphyLDPCDecodeConfigDesc_t& config) const;
+    [[nodiscard]] int choose_algo_sm120(const cuphyLDPCDecodeConfigDesc_t& config) const;
 
     typedef std::unique_ptr<decode_algo> decode_algo_ptr_t;
     //------------------------------------------------------------------

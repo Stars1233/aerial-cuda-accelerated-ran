@@ -140,6 +140,8 @@ void saveToH5_Asim(const std::string&                 filename,
     } else if (cellGrpPrms->nBsAnt == 64) { // 64TR
         numCfrPerCell = cellGrpPrms->nCell*cellGrpPrms->numUeForGrpPerCell*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt*cellGrpPrms->nBsAnt;
         numUe = cellGrpPrms->nActiveUe;
+    } else {
+        throw std::runtime_error("saveToH5_Asim: unsupported number of BS antennas: " + std::to_string(cellGrpPrms->nBsAnt));
     }
     
     hsize_t dims[] = {static_cast<hsize_t>(numCfrPerCell)};
@@ -824,6 +826,8 @@ void saveToH5(const std::string&                 filename,
         numUe = cellGrpPrms->nUe;
     } else if (cellGrpPrms->nBsAnt == 64) { // 64TR
         numUe = cellGrpPrms->nActiveUe;
+    } else {
+        throw std::runtime_error("saveToH5: unsupported number of BS antennas: " + std::to_string(cellGrpPrms->nBsAnt));
     }
 
     hsize_t dims[] = {static_cast<hsize_t>(numCfr)};
@@ -2305,4 +2309,1134 @@ void saveToH5_testMAC_perCell(const std::string&                 filename,
 
     // close dataset
     dataset.close();
+}
+
+void saveToH5_perSlotLog(const std::string&                 filename,
+                         cumac::cumacCellGrpUeStatus*       cellGrpUeStatus,
+                         cumac::cumacCellGrpPrms*           cellGrpPrms,
+                         cumac::cumacSchdSol*               schdSol,
+                         const std::vector<std::vector<int>>& perUEperSlotMcs,
+                         const std::vector<std::vector<int>>& perUEperSlotLayerSel,
+                         const std::vector<std::vector<float>>& perUEperSlotAvgSinr,
+                         const std::vector<std::vector<std::vector<float>>>& perUEperRbgperSlotGeometrySinr,
+                         const std::vector<std::vector<float>>& perUEperSlotServingCellChannelGain,
+                         const std::vector<std::vector<std::vector<float>>>& perUEperCellperSlotAllCellsChannelGain,
+                         const std::vector<std::vector<float>>& perUEperSlotServingCellPathLossAndSF,
+                         const std::vector<std::vector<std::vector<float>>>& perUEperCellperSlotAllCellsPathLossAndSF,
+                         const std::vector<std::vector<std::vector<float>>>& perUEperRbgperSlotGeometrySir,
+                         const std::vector<std::vector<std::vector<float>>>& perUEperRbgperSlotGeometrySnr,
+                         const std::vector<std::vector<std::vector<float>>>& perUEperRbgperSlotRawPreEqSinr,
+                         const std::vector<std::vector<std::vector<float>>>& perUEperRbgperSlotRawPreEqSir,
+                         const std::vector<std::vector<std::vector<float>>>& perUEperRbgperSlotRawPreEqSnr,
+                         const std::vector<std::vector<std::vector<std::vector<float>>>>& perUEperRbgperLayerperSlotRawSinr,
+                         const std::vector<std::vector<int>>& perUEperSlotTbErr,
+                         const std::vector<std::vector<float>>& perUEperSlotBler,
+                         const std::vector<std::vector<float>>& perUEperSlotInsRate,
+                         const std::vector<std::vector<float>>& perUEperSlotAvgRate,
+                         const std::vector<std::vector<int>>& perCellperSlotNumScheUEs,
+                         const std::vector<std::vector<float>>& perCellperSlotTbErr,
+                         const std::vector<std::vector<float>>& perCellperSlotInsRate,
+                         const std::vector<std::vector<std::vector<int>>>& perCellperGrpperSlotNumScheLayers) 
+{
+    cumac::cumacSchedulerParam param;
+
+    param.nUe = cellGrpPrms->nUe;
+    param.nCell = cellGrpPrms->nCell;
+    param.totNumCell = cellGrpPrms->nCell;
+    param.nPrbGrp = cellGrpPrms->nPrbGrp;
+    param.nBsAnt = cellGrpPrms->nBsAnt;
+    param.nUeAnt = cellGrpPrms->nUeAnt;
+    param.W  = cellGrpPrms->W;
+    param.sigmaSqrd = cellGrpPrms->sigmaSqrd;
+    param.betaCoeff = cellGrpPrms->betaCoeff;
+    param.precodingScheme = cellGrpPrms->precodingScheme;
+    param.receiverScheme = cellGrpPrms->receiverScheme;
+    param.allocType = cellGrpPrms->allocType;
+    param.columnMajor = 1;
+    param.nActiveUe = cellGrpPrms->nActiveUe;
+    param.numUeSchdPerCellTTI = cellGrpPrms->numUeSchdPerCellTTI;
+    param.sinValThr = cellGrpPrms->sinValThr;
+    param.numUeForGrpPerCell = cellGrpPrms->numUeForGrpPerCell;
+    param.chanCorrThr = cellGrpPrms->chanCorrThr;
+    param.muCoeff = cellGrpPrms->muCoeff;
+    param.srsSnrThr = cellGrpPrms->srsSnrThr;
+    param.nMaxActUePerCell = cellGrpPrms->nMaxActUePerCell;
+    param.nMaxUegPerCellDl = cellGrpPrms->nMaxUegPerCellDl;
+    param.nMaxUegPerCellUl = cellGrpPrms->nMaxUegPerCellUl;
+    param.mcsSelSinrCapThr = cellGrpPrms->mcsSelSinrCapThr;
+    param.muGrpSrsSnrMaxGap = cellGrpPrms->muGrpSrsSnrMaxGap;
+    param.muGrpSrsSnrSplitThr = cellGrpPrms->muGrpSrsSnrSplitThr;
+    param.bfPowAllocScheme = cellGrpPrms->bfPowAllocScheme;
+    param.muGrpUpdate = cellGrpPrms->muGrpUpdate;
+    param.mcsSelLutType = cellGrpPrms->mcsSelLutType;   
+    param.semiStatFreqAlloc = cellGrpPrms->semiStatFreqAlloc;
+    param.harqEnabledInd = cellGrpPrms->harqEnabledInd;
+    param.mcsSelCqi = cellGrpPrms->mcsSelCqi;
+    param.dlSchInd = cellGrpPrms->dlSchInd;
+
+    uint8_t DL = param.dlSchInd;
+
+    // Create a compound data type
+    H5::CompType compType(sizeof(cumac::cumacSchedulerParam));
+    compType.insertMember("nUe", HOFFSET(cumac::cumacSchedulerParam, nUe), H5::PredType::NATIVE_UINT16);
+    compType.insertMember("nCell", HOFFSET(cumac::cumacSchedulerParam, nCell), H5::PredType::NATIVE_UINT16);
+    compType.insertMember("totNumCell", HOFFSET(cumac::cumacSchedulerParam, totNumCell), H5::PredType::NATIVE_UINT16);
+    compType.insertMember("nPrbGrp", HOFFSET(cumac::cumacSchedulerParam, nPrbGrp), H5::PredType::NATIVE_UINT16);
+    compType.insertMember("nBsAnt", HOFFSET(cumac::cumacSchedulerParam, nBsAnt), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("nUeAnt", HOFFSET(cumac::cumacSchedulerParam, nUeAnt), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("W", HOFFSET(cumac::cumacSchedulerParam, W), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("sigmaSqrd", HOFFSET(cumac::cumacSchedulerParam, sigmaSqrd), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("betaCoeff", HOFFSET(cumac::cumacSchedulerParam, betaCoeff), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("precodingScheme", HOFFSET(cumac::cumacSchedulerParam, precodingScheme), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("receiverScheme", HOFFSET(cumac::cumacSchedulerParam, receiverScheme), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("allocType", HOFFSET(cumac::cumacSchedulerParam, allocType), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("columnMajor", HOFFSET(cumac::cumacSchedulerParam, columnMajor), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("nActiveUe", HOFFSET(cumac::cumacSchedulerParam, nActiveUe), H5::PredType::NATIVE_UINT16);
+    compType.insertMember("nMaxActUePerCell", HOFFSET(cumac::cumacSchedulerParam, nMaxActUePerCell), H5::PredType::NATIVE_UINT16);
+    compType.insertMember("numUeSchdPerCellTTI", HOFFSET(cumac::cumacSchedulerParam, numUeSchdPerCellTTI), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("sinValThr", HOFFSET(cumac::cumacSchedulerParam, sinValThr), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("numUeForGrpPerCell", HOFFSET(cumac::cumacSchedulerParam, numUeForGrpPerCell), H5::PredType::NATIVE_UINT16);
+    compType.insertMember("chanCorrThr", HOFFSET(cumac::cumacSchedulerParam, chanCorrThr), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("muCoeff", HOFFSET(cumac::cumacSchedulerParam, muCoeff), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("srsSnrThr", HOFFSET(cumac::cumacSchedulerParam, srsSnrThr), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("nMaxUegPerCellDl", HOFFSET(cumac::cumacSchedulerParam, nMaxUegPerCellDl), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("nMaxUegPerCellUl", HOFFSET(cumac::cumacSchedulerParam, nMaxUegPerCellUl), H5::PredType::NATIVE_UINT8);   
+    compType.insertMember("mcsSelSinrCapThr", HOFFSET(cumac::cumacSchedulerParam, mcsSelSinrCapThr), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("muGrpSrsSnrMaxGap", HOFFSET(cumac::cumacSchedulerParam, muGrpSrsSnrMaxGap), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("muGrpSrsSnrSplitThr", HOFFSET(cumac::cumacSchedulerParam, muGrpSrsSnrSplitThr), H5::PredType::NATIVE_FLOAT);
+    compType.insertMember("bfPowAllocScheme", HOFFSET(cumac::cumacSchedulerParam, bfPowAllocScheme), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("muGrpUpdate", HOFFSET(cumac::cumacSchedulerParam, muGrpUpdate), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("mcsSelLutType", HOFFSET(cumac::cumacSchedulerParam, mcsSelLutType), H5::PredType::NATIVE_UINT8); 
+    compType.insertMember("semiStatFreqAlloc", HOFFSET(cumac::cumacSchedulerParam, semiStatFreqAlloc), H5::PredType::NATIVE_UINT8);   
+    compType.insertMember("harqEnabledInd", HOFFSET(cumac::cumacSchedulerParam, harqEnabledInd), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("mcsSelCqi", HOFFSET(cumac::cumacSchedulerParam, mcsSelCqi), H5::PredType::NATIVE_UINT8);
+    compType.insertMember("dlSchInd", HOFFSET(cumac::cumacSchedulerParam, dlSchInd), H5::PredType::NATIVE_UINT8);   
+
+    // Open the HDF5 file
+    H5::H5File file(filename, H5F_ACC_TRUNC);
+
+    // Create a dataset
+    H5::DataSet dataset = file.createDataSet("cumacSchedulerParam", compType, H5::DataSpace());
+
+    // Write the data to the dataset
+    dataset.write(&param, compType);
+
+    uint16_t numUe;
+    int numCfr = cellGrpPrms->nPrbGrp*cellGrpPrms->nUe*cellGrpPrms->nCell*cellGrpPrms->nBsAnt*cellGrpPrms->nUeAnt;
+    int numCfrPerCell = cellGrpPrms->nCell*cellGrpPrms->numUeForGrpPerCell*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt*cellGrpPrms->nBsAnt;
+
+    if (cellGrpPrms->nBsAnt == 4) { // 4TR
+        numUe = cellGrpPrms->nUe;
+    } else if (cellGrpPrms->nBsAnt == 64) { // 64TR
+        numUe = cellGrpPrms->nActiveUe;
+    } else {
+        throw std::runtime_error("saveToH5_perSlotLog: unsupported number of BS antennas: " + std::to_string(cellGrpPrms->nBsAnt));
+    }
+
+    hsize_t dims[] = {static_cast<hsize_t>(numCfr)};
+
+    if (cellGrpPrms->nBsAnt == 4 && cellGrpPrms->estH_fr) {
+        cuComplex*  estH_fr      = new cuComplex[numCfr];
+        float*      estH_fr_real = new float[numCfr];
+        float*      estH_fr_imag = new float[numCfr];
+
+        CUDA_CHECK_ERR(cudaMemcpy(estH_fr, cellGrpPrms->estH_fr, numCfr*sizeof(cuComplex), cudaMemcpyDeviceToHost));
+
+        for (int hIdx = 0; hIdx < numCfr; hIdx++) {
+            estH_fr_real[hIdx] = estH_fr[hIdx].x;
+            estH_fr_imag[hIdx] = estH_fr[hIdx].y;
+        }
+
+        H5::DataSpace dataspaceEstH_fr_real(1, dims);
+        dataset = file.createDataSet("estH_fr_real", H5::PredType::NATIVE_FLOAT, dataspaceEstH_fr_real);
+        dataset.write(estH_fr_real, H5::PredType::NATIVE_FLOAT);
+
+        H5::DataSpace dataspaceEstH_fr_imag(1, dims);
+        dataset = file.createDataSet("estH_fr_imag", H5::PredType::NATIVE_FLOAT, dataspaceEstH_fr_imag);
+        dataset.write(estH_fr_imag, H5::PredType::NATIVE_FLOAT);
+
+        delete[] estH_fr;
+        delete[] estH_fr_real;
+        delete[] estH_fr_imag;
+    }
+
+    if (cellGrpPrms->nBsAnt == 64 && cellGrpPrms->srsEstChan) {
+        cuComplex** srsEstChan              = new cuComplex*[cellGrpPrms->nCell];
+        cuComplex*  estH_fr_perCell    = new cuComplex[numCfrPerCell];
+        float*      estH_fr_real            = new float[numCfrPerCell];
+        float*      estH_fr_imag            = new float[numCfrPerCell];
+
+        dims[0] = static_cast<hsize_t>(numCfrPerCell);
+
+        CUDA_CHECK_ERR(cudaMemcpy(srsEstChan, cellGrpPrms->srsEstChan, cellGrpPrms->nCell*sizeof(cuComplex*), cudaMemcpyDeviceToHost));
+        for (int cIdx = 0; cIdx < cellGrpPrms->nCell; cIdx++) {
+            CUDA_CHECK_ERR(cudaMemcpy(estH_fr_perCell, srsEstChan[cIdx], numCfrPerCell*sizeof(cuComplex), cudaMemcpyDeviceToHost));
+            for (int hIdx = 0; hIdx < numCfrPerCell; hIdx++) {
+                estH_fr_real[hIdx] = estH_fr_perCell[hIdx].x;
+                estH_fr_imag[hIdx] = estH_fr_perCell[hIdx].y;
+            }
+
+            std::string cfrRealFieldName = "estH_fr_real_cell" + std::to_string(cIdx);
+            H5::DataSpace dataspaceEstH_fr_real(1, dims);
+            dataset = file.createDataSet(cfrRealFieldName, H5::PredType::NATIVE_FLOAT, dataspaceEstH_fr_real);
+            dataset.write(estH_fr_real, H5::PredType::NATIVE_FLOAT);
+
+            std::string cfrImagFieldName = "estH_fr_imag_cell" + std::to_string(cIdx);
+            H5::DataSpace dataspaceEstH_fr_imag(1, dims);
+            dataset = file.createDataSet(cfrImagFieldName, H5::PredType::NATIVE_FLOAT, dataspaceEstH_fr_imag);
+            dataset.write(estH_fr_imag, H5::PredType::NATIVE_FLOAT);
+        }
+
+        delete[] srsEstChan;
+        delete[] estH_fr_perCell;
+        delete[] estH_fr_real;
+        delete[] estH_fr_imag;
+    }
+
+    if (cellGrpPrms->srsWbSnr) {
+        std::unique_ptr<float []>  srsWbSnr = std::make_unique<float []>(cellGrpPrms->nActiveUe);
+        CUDA_CHECK_ERR(cudaMemcpy(srsWbSnr.get(), cellGrpPrms->srsWbSnr, cellGrpPrms->nActiveUe*sizeof(float), cudaMemcpyDeviceToHost));
+
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+        H5::DataSpace dataspaceSrsWbSnr(1, dims);
+        dataset = file.createDataSet("srsWbSnr", H5::PredType::NATIVE_FLOAT, dataspaceSrsWbSnr);
+        dataset.write(srsWbSnr.get(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (cellGrpPrms->srsUeMap) {
+        std::unique_ptr<int32_t* []> srsUeMap = std::make_unique<int32_t* []>(cellGrpPrms->nCell);
+        std::unique_ptr<int32_t []> srsUeMap_perCell = std::make_unique<int32_t []>(cellGrpPrms->nActiveUe);
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+
+        CUDA_CHECK_ERR(cudaMemcpy(srsUeMap.get(), cellGrpPrms->srsUeMap, cellGrpPrms->nCell*sizeof(int32_t*), cudaMemcpyDeviceToHost));
+        for (int cIdx = 0; cIdx < cellGrpPrms->nCell; cIdx++) {
+            CUDA_CHECK_ERR(cudaMemcpy(srsUeMap_perCell.get(), srsUeMap[cIdx], cellGrpPrms->nActiveUe*sizeof(int32_t), cudaMemcpyDeviceToHost));
+            
+            std::string srsUeMapFieldName = "srsUeMap_cell" + std::to_string(cIdx);
+            H5::DataSpace dataspaceSrsUeMap(1, dims);
+            dataset = file.createDataSet(srsUeMapFieldName, H5::PredType::NATIVE_INT32, dataspaceSrsUeMap);
+            dataset.write(srsUeMap_perCell.get(), H5::PredType::NATIVE_INT32);
+        }
+    }
+
+    if (cellGrpPrms->sinVal) {
+        float* sinVal = new float[numUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt];
+        CUDA_CHECK_ERR(cudaMemcpy(sinVal, cellGrpPrms->sinVal, numUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt*sizeof(float), cudaMemcpyDeviceToHost));
+        
+        dims[0] = static_cast<hsize_t>(numUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt);
+        H5::DataSpace dataspaceSinVal(1, dims);
+        dataset = file.createDataSet("sinVal", H5::PredType::NATIVE_FLOAT, dataspaceSinVal);
+        dataset.write(sinVal, H5::PredType::NATIVE_FLOAT);
+
+        delete[] sinVal;
+    }
+    
+    if (cellGrpPrms->nBsAnt == 4 && cellGrpPrms->prdMat) { // 4T4R SU-MIMO  
+        int numPrdPerCell;
+        if (DL == 1) { // DL
+            numPrdPerCell = cellGrpPrms->nUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nBsAnt*cellGrpPrms->nBsAnt;
+        } else { // UL
+            numPrdPerCell = cellGrpPrms->nUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt*cellGrpPrms->nUeAnt;
+        }
+
+        cuComplex*  prdMat                  = new cuComplex[numPrdPerCell];
+        float*      prdMat_real             = new float[numPrdPerCell];
+        float*      prdMat_imag             = new float[numPrdPerCell];
+
+        CUDA_CHECK_ERR(cudaMemcpy(prdMat, cellGrpPrms->prdMat, numPrdPerCell*sizeof(cuComplex), cudaMemcpyDeviceToHost));
+
+        for (int hIdx = 0; hIdx < numPrdPerCell; hIdx++) {
+            prdMat_real[hIdx] = prdMat[hIdx].x;
+            prdMat_imag[hIdx] = prdMat[hIdx].y;
+        }
+
+        dims[0] = static_cast<hsize_t>(numPrdPerCell);
+        H5::DataSpace dataspacePrdMat_real(1, dims);
+        dataset = file.createDataSet("prdMat_real", H5::PredType::NATIVE_FLOAT, dataspacePrdMat_real);
+        dataset.write(prdMat_real, H5::PredType::NATIVE_FLOAT);
+
+        H5::DataSpace dataspacePrdMat_imag(1, dims);
+        dataset = file.createDataSet("prdMat_imag", H5::PredType::NATIVE_FLOAT, dataspacePrdMat_imag);
+        dataset.write(prdMat_imag, H5::PredType::NATIVE_FLOAT);
+
+        delete[] prdMat;
+        delete[] prdMat_real;
+        delete[] prdMat_imag;
+    }
+
+    if (cellGrpPrms->nBsAnt == 64 && cellGrpPrms->prdMat) {// 64T64R MU-MIMO
+        std::vector<cuComplex> prdMat(cellGrpPrms->nCell*cellGrpPrms->nPrbGrp*cellGrpPrms->nBsAnt*cumac::maxNumLayerPerGrpDL_);
+        std::vector<float> prdMat_real(cellGrpPrms->nCell*cellGrpPrms->nPrbGrp*cellGrpPrms->nBsAnt*cumac::maxNumLayerPerGrpDL_);
+        std::vector<float> prdMat_imag(cellGrpPrms->nCell*cellGrpPrms->nPrbGrp*cellGrpPrms->nBsAnt*cumac::maxNumLayerPerGrpDL_);
+
+        CUDA_CHECK_ERR(cudaMemcpy(prdMat.data(), cellGrpPrms->prdMat, cellGrpPrms->nCell*cellGrpPrms->nPrbGrp*cellGrpPrms->nBsAnt*cumac::maxNumLayerPerGrpDL_*sizeof(cuComplex), cudaMemcpyDeviceToHost));
+        for (int hIdx = 0; hIdx < cellGrpPrms->nCell*cellGrpPrms->nPrbGrp*cellGrpPrms->nBsAnt*cumac::maxNumLayerPerGrpDL_; hIdx++) {
+            prdMat_real[hIdx] = prdMat[hIdx].x;
+            prdMat_imag[hIdx] = prdMat[hIdx].y;
+        }
+        
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nCell*cellGrpPrms->nPrbGrp*cellGrpPrms->nBsAnt*cumac::maxNumLayerPerGrpDL_);
+        H5::DataSpace dataspacePrdMat_real(1, dims);
+        dataset = file.createDataSet("prdMat_real", H5::PredType::NATIVE_FLOAT, dataspacePrdMat_real);
+        dataset.write(prdMat_real.data(), H5::PredType::NATIVE_FLOAT);
+
+        H5::DataSpace dataspacePrdMat_imag(1, dims);
+        dataset = file.createDataSet("prdMat_imag", H5::PredType::NATIVE_FLOAT, dataspacePrdMat_imag);
+        dataset.write(prdMat_imag.data(), H5::PredType::NATIVE_FLOAT); 
+    }
+
+    if (cellGrpPrms->nBsAnt == 4 && cellGrpPrms->detMat) {
+        int numDetPerCell;
+        if (DL == 1) { // DL
+            numDetPerCell = cellGrpPrms->nUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt*cellGrpPrms->nUeAnt;
+        } else { // UL
+            numDetPerCell = cellGrpPrms->nUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nBsAnt*cellGrpPrms->nBsAnt;
+        }
+         
+        cuComplex*  detMat      = new cuComplex[numDetPerCell]; 
+        float*      detMat_real = new float[numDetPerCell];
+        float*      detMat_imag = new float[numDetPerCell];
+
+        CUDA_CHECK_ERR(cudaMemcpy(detMat, cellGrpPrms->detMat, numDetPerCell*sizeof(cuComplex), cudaMemcpyDeviceToHost));
+
+        for (int hIdx = 0; hIdx < numDetPerCell; hIdx++) {
+            detMat_real[hIdx] = detMat[hIdx].x;
+            detMat_imag[hIdx] = detMat[hIdx].y;
+        }
+
+        dims[0] = static_cast<hsize_t>(numDetPerCell);
+        H5::DataSpace dataspaceDetMat_real(1, dims);
+        dataset = file.createDataSet("detMat_real", H5::PredType::NATIVE_FLOAT, dataspaceDetMat_real);
+        dataset.write(detMat_real, H5::PredType::NATIVE_FLOAT);
+
+        H5::DataSpace dataspaceDetMat_imag(1, dims);
+        dataset = file.createDataSet("detMat_imag", H5::PredType::NATIVE_FLOAT, dataspaceDetMat_imag);
+        dataset.write(detMat_imag, H5::PredType::NATIVE_FLOAT);
+
+        delete[] detMat;
+        delete[] detMat_real;
+        delete[] detMat_imag;
+    }
+
+    if (cellGrpPrms->currSlotIdxPerCell) {
+        std::vector<uint32_t> currSlotIdxPerCell(cellGrpPrms->nCell);
+        CUDA_CHECK_ERR(cudaMemcpy(currSlotIdxPerCell.data(), cellGrpPrms->currSlotIdxPerCell, cellGrpPrms->nCell*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nCell);
+        H5::DataSpace dataspaceCurrSlotIdxPerCell(1, dims);
+        dataset = file.createDataSet("currSlotIdxPerCell", H5::PredType::NATIVE_UINT32, dataspaceCurrSlotIdxPerCell);
+        dataset.write(currSlotIdxPerCell.data(), H5::PredType::NATIVE_UINT32);  
+    }
+
+    if (cellGrpPrms->blerTargetActUe) {
+        std::vector<float> blerTargetActUe(cellGrpPrms->nActiveUe);
+        CUDA_CHECK_ERR(cudaMemcpy(blerTargetActUe.data(), cellGrpPrms->blerTargetActUe, cellGrpPrms->nActiveUe*sizeof(float), cudaMemcpyDeviceToHost));
+        
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+        H5::DataSpace dataspaceBlerTargetActUe(1, dims);
+        dataset = file.createDataSet("blerTargetActUe", H5::PredType::NATIVE_FLOAT, dataspaceBlerTargetActUe);
+        dataset.write(blerTargetActUe.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (cellGrpPrms->nBsAnt == 4 && cellGrpPrms->cellId) {
+        uint16_t* cellId = new uint16_t[cellGrpPrms->nCell];
+        CUDA_CHECK_ERR(cudaMemcpy(cellId, cellGrpPrms->cellId, cellGrpPrms->nCell*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+        dims[0] = {static_cast<hsize_t>(cellGrpPrms->nCell)};
+        H5::DataSpace dataspaceCellId(1, dims);
+        dataset = file.createDataSet("cellId", H5::PredType::NATIVE_UINT16, dataspaceCellId);
+        dataset.write(cellId, H5::PredType::NATIVE_UINT16);
+
+        delete[] cellId;
+    }
+
+    if (cellGrpPrms->nBsAnt == 4 && cellGrpPrms->numUeSchdPerCellTTIArr) {
+        uint8_t* numUeSchdPerCellTTIArr = new uint8_t[cellGrpPrms->nCell];
+        CUDA_CHECK_ERR(cudaMemcpy(numUeSchdPerCellTTIArr, cellGrpPrms->numUeSchdPerCellTTIArr, cellGrpPrms->nCell*sizeof(uint8_t), cudaMemcpyDeviceToHost));
+
+        dims[0] = {static_cast<hsize_t>(cellGrpPrms->nCell)};
+        H5::DataSpace dataspaceNumUeSchdArr(1, dims);
+        dataset = file.createDataSet("numUeSchdPerCellTTIArr", H5::PredType::NATIVE_UINT8, dataspaceNumUeSchdArr);
+        dataset.write(numUeSchdPerCellTTIArr, H5::PredType::NATIVE_UINT8);
+
+        delete[] numUeSchdPerCellTTIArr;
+    }
+    
+    if (cellGrpUeStatus) {
+        if (cellGrpUeStatus->lastSchdSlotActUe) {
+            std::vector<uint32_t> lastSchdSlotActUe(cellGrpPrms->nActiveUe);
+            CUDA_CHECK_ERR(cudaMemcpy(lastSchdSlotActUe.data(), cellGrpUeStatus->lastSchdSlotActUe, cellGrpPrms->nActiveUe*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceLastSchdSlotActUe(1, dims);
+            dataset = file.createDataSet("lastSchdSlotActUe", H5::PredType::NATIVE_UINT32, dataspaceLastSchdSlotActUe);
+            dataset.write(lastSchdSlotActUe.data(), H5::PredType::NATIVE_UINT32);   
+        }   
+
+        if (cellGrpUeStatus->beamformGainCurrTx) {
+            std::vector<float> beamformGainCurrTx(cellGrpPrms->nActiveUe);
+            CUDA_CHECK_ERR(cudaMemcpy(beamformGainCurrTx.data(), cellGrpUeStatus->beamformGainCurrTx, cellGrpPrms->nActiveUe*sizeof(float), cudaMemcpyDeviceToHost));
+            
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceBeamformGainCurrTx(1, dims);
+            dataset = file.createDataSet("beamformGainCurrTx", H5::PredType::NATIVE_FLOAT, dataspaceBeamformGainCurrTx);
+            dataset.write(beamformGainCurrTx.data(), H5::PredType::NATIVE_FLOAT);
+        }
+
+        if (cellGrpUeStatus->bfGainPrgCurrTx) { 
+            std::vector<float> bfGainPrgCurrTx(cellGrpPrms->nActiveUe*cellGrpPrms->nPrbGrp);
+            CUDA_CHECK_ERR(cudaMemcpy(bfGainPrgCurrTx.data(), cellGrpUeStatus->bfGainPrgCurrTx, cellGrpPrms->nActiveUe*cellGrpPrms->nPrbGrp*sizeof(float), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe*cellGrpPrms->nPrbGrp);
+            H5::DataSpace dataspaceBfGainPrgCurrTx(1, dims);
+            dataset = file.createDataSet("bfGainPrgCurrTx", H5::PredType::NATIVE_FLOAT, dataspaceBfGainPrgCurrTx);
+            dataset.write(bfGainPrgCurrTx.data(), H5::PredType::NATIVE_FLOAT);
+        }   
+
+        if (cellGrpUeStatus->beamformGainLastTx) {
+            std::vector<float> beamformGainLastTx(cellGrpPrms->nActiveUe);
+            CUDA_CHECK_ERR(cudaMemcpy(beamformGainLastTx.data(), cellGrpUeStatus->beamformGainLastTx, cellGrpPrms->nActiveUe*sizeof(float), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceBeamformGainLastTx(1, dims); 
+            dataset = file.createDataSet("beamformGainLastTx", H5::PredType::NATIVE_FLOAT, dataspaceBeamformGainLastTx);
+            dataset.write(beamformGainLastTx.data(), H5::PredType::NATIVE_FLOAT);   
+        }
+
+        if (cellGrpPrms->nBsAnt == 4 && cellGrpUeStatus->avgRates) {
+            float* avgRates = new float[cellGrpPrms->nUe];
+            CUDA_CHECK_ERR(cudaMemcpy(avgRates, cellGrpUeStatus->avgRates, cellGrpPrms->nUe*sizeof(float), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nUe);
+            H5::DataSpace dataspaceAvgRates(1, dims);
+            dataset = file.createDataSet("avgRates", H5::PredType::NATIVE_FLOAT, dataspaceAvgRates);
+            dataset.write(avgRates, H5::PredType::NATIVE_FLOAT);
+
+            delete[] avgRates;
+        }
+
+        if (cellGrpUeStatus->avgRatesActUe) {
+            float* avgRatesActUe = new float[cellGrpPrms->nActiveUe];
+            CUDA_CHECK_ERR(cudaMemcpy(avgRatesActUe, cellGrpUeStatus->avgRatesActUe, cellGrpPrms->nActiveUe*sizeof(float), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceAvgRatesActUe(1, dims);
+            dataset = file.createDataSet("avgRatesActUe", H5::PredType::NATIVE_FLOAT, dataspaceAvgRatesActUe);
+            dataset.write(avgRatesActUe, H5::PredType::NATIVE_FLOAT);
+
+            delete[] avgRatesActUe;
+        }
+
+        if (cellGrpPrms->nBsAnt == 4 && cellGrpUeStatus->tbErrLast) {
+            int8_t* tbErrLast = new int8_t[cellGrpPrms->nUe];
+            CUDA_CHECK_ERR(cudaMemcpy(tbErrLast, cellGrpUeStatus->tbErrLast, cellGrpPrms->nUe*sizeof(int8_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nUe);
+            H5::DataSpace dataspaceTbErrLast(1, dims);
+            dataset = file.createDataSet("tbErrLast", H5::PredType::NATIVE_INT8, dataspaceTbErrLast);
+            dataset.write(tbErrLast, H5::PredType::NATIVE_INT8);
+
+            delete[] tbErrLast;
+        }
+
+        if (cellGrpUeStatus->tbErrLastActUe) {
+            int8_t*     tbErrLastActUe = new int8_t[cellGrpPrms->nActiveUe];
+            CUDA_CHECK_ERR(cudaMemcpy(tbErrLastActUe, cellGrpUeStatus->tbErrLastActUe, cellGrpPrms->nActiveUe*sizeof(int8_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceTbErrLastActUe(1, dims);
+            dataset = file.createDataSet("tbErrLastActUe", H5::PredType::NATIVE_INT8, dataspaceTbErrLastActUe);
+            dataset.write(tbErrLastActUe, H5::PredType::NATIVE_INT8);
+
+            delete[] tbErrLastActUe;
+        }
+
+        if (cellGrpUeStatus->prioWeightActUe) {
+            uint16_t* prioWeightActUe = new uint16_t[cellGrpPrms->nActiveUe];
+            CUDA_CHECK_ERR(cudaMemcpy(prioWeightActUe, cellGrpUeStatus->prioWeightActUe, cellGrpPrms->nActiveUe*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspacePwActUe(1, dims);
+            dataset = file.createDataSet("prioWeightActUe", H5::PredType::NATIVE_UINT16, dataspacePwActUe);
+            dataset.write(prioWeightActUe, H5::PredType::NATIVE_UINT16);
+
+            delete[] prioWeightActUe;
+        }
+
+        if (cellGrpUeStatus->newDataActUe) {
+            int8_t* newDataActUe = new int8_t[cellGrpPrms->nActiveUe]; 
+            CUDA_CHECK_ERR(cudaMemcpy(newDataActUe, cellGrpUeStatus->newDataActUe, cellGrpPrms->nActiveUe*sizeof(int8_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceNdActUe(1, dims);
+            dataset = file.createDataSet("newDataActUe", H5::PredType::NATIVE_INT8, dataspaceNdActUe);
+            dataset.write(newDataActUe, H5::PredType::NATIVE_INT8);
+
+            delete[] newDataActUe;
+        }
+
+        if (cellGrpUeStatus->allocSolLastTx) {
+            int16_t* allocSolLastTx = new int16_t[2*numUe];
+            CUDA_CHECK_ERR(cudaMemcpy(allocSolLastTx, cellGrpUeStatus->allocSolLastTx, 2*numUe*sizeof(int16_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(2*numUe);
+            H5::DataSpace dataspaceAllocSolLastTx(1, dims);
+            dataset = file.createDataSet("allocSolLastTx", H5::PredType::NATIVE_INT16, dataspaceAllocSolLastTx);
+            dataset.write(allocSolLastTx, H5::PredType::NATIVE_INT16);
+
+            delete[] allocSolLastTx;
+        }
+
+        if (cellGrpUeStatus->mcsSelSolLastTx) {
+            int16_t* mcsSelSolLastTx = new int16_t[numUe];
+            CUDA_CHECK_ERR(cudaMemcpy(mcsSelSolLastTx, cellGrpUeStatus->mcsSelSolLastTx, numUe*sizeof(int16_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(numUe);
+            H5::DataSpace dataspaceMcsSelSolLastTx(1, dims);
+            dataset = file.createDataSet("mcsSelSolLastTx", H5::PredType::NATIVE_INT16, dataspaceMcsSelSolLastTx);
+            dataset.write(mcsSelSolLastTx, H5::PredType::NATIVE_INT16);
+
+            delete[] mcsSelSolLastTx;
+        }
+
+        if (cellGrpUeStatus->layerSelSolLastTx) {
+            uint8_t* layerSelSolLastTx = new uint8_t[numUe];
+            CUDA_CHECK_ERR(cudaMemcpy(layerSelSolLastTx, cellGrpUeStatus->layerSelSolLastTx, numUe*sizeof(uint8_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(numUe);
+            H5::DataSpace dataspaceLayerSelSolLastTx(1, dims);
+            dataset = file.createDataSet("layerSelSolLastTx", H5::PredType::NATIVE_UINT8, dataspaceLayerSelSolLastTx);
+            dataset.write(layerSelSolLastTx, H5::PredType::NATIVE_UINT8);
+
+            delete[] layerSelSolLastTx;
+        }
+    }
+
+    if (cellGrpPrms->nBsAnt == 4 && cellGrpPrms->cellAssoc) {
+        uint8_t* cellAssoc = new uint8_t[cellGrpPrms->nCell*cellGrpPrms->nUe];
+        CUDA_CHECK_ERR(cudaMemcpy(cellAssoc, cellGrpPrms->cellAssoc, cellGrpPrms->nCell*cellGrpPrms->nUe*sizeof(uint8_t), cudaMemcpyDeviceToHost)); 
+
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nCell*cellGrpPrms->nUe);
+        H5::DataSpace dataspaceCellAssoc(1, dims);
+        dataset = file.createDataSet("cellAssoc", H5::PredType::NATIVE_UINT8, dataspaceCellAssoc);
+        dataset.write(cellAssoc, H5::PredType::NATIVE_UINT8);
+
+        delete[] cellAssoc;
+    }
+
+    if (cellGrpPrms->cellAssocActUe) {
+        uint8_t* cellAssocActUe = new uint8_t[cellGrpPrms->nCell*cellGrpPrms->nActiveUe];
+        CUDA_CHECK_ERR(cudaMemcpy(cellAssocActUe, cellGrpPrms->cellAssocActUe, cellGrpPrms->nCell*cellGrpPrms->nActiveUe*sizeof(uint8_t), cudaMemcpyDeviceToHost)); 
+
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nCell*cellGrpPrms->nActiveUe);
+        H5::DataSpace dataspaceCellAssocActUe(1, dims);
+        dataset = file.createDataSet("cellAssocActUe", H5::PredType::NATIVE_UINT8, dataspaceCellAssocActUe);
+        dataset.write(cellAssocActUe, H5::PredType::NATIVE_UINT8);
+
+        delete[] cellAssocActUe;
+    }
+
+    if (cellGrpPrms->postEqSinr) {
+        float* postEqSinr = new float[cellGrpPrms->nActiveUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt];
+        CUDA_CHECK_ERR(cudaMemcpy(postEqSinr, cellGrpPrms->postEqSinr, cellGrpPrms->nActiveUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt*sizeof(float), cudaMemcpyDeviceToHost)); 
+
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe*cellGrpPrms->nPrbGrp*cellGrpPrms->nUeAnt);
+        H5::DataSpace dataspacePostEqSinr(1, dims);
+        dataset = file.createDataSet("postEqSinr", H5::PredType::NATIVE_FLOAT, dataspacePostEqSinr);
+        dataset.write(postEqSinr, H5::PredType::NATIVE_FLOAT);
+
+        delete[] postEqSinr;
+    }
+
+    if (cellGrpPrms->wbSinr) {
+        float*      wbSinr = new float[cellGrpPrms->nActiveUe*cellGrpPrms->nUeAnt];
+        CUDA_CHECK_ERR(cudaMemcpy(wbSinr, cellGrpPrms->wbSinr, cellGrpPrms->nActiveUe*cellGrpPrms->nUeAnt*sizeof(float), cudaMemcpyDeviceToHost)); 
+
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe*cellGrpPrms->nUeAnt);
+        H5::DataSpace dataspaceWbSinr(1, dims);
+        dataset = file.createDataSet("wbSinr", H5::PredType::NATIVE_FLOAT, dataspaceWbSinr);
+        dataset.write(wbSinr, H5::PredType::NATIVE_FLOAT);
+
+        delete[] wbSinr;
+    }
+    
+    if (schdSol) {
+        if (cellGrpPrms->nBsAnt == 64 && schdSol->muGrpList) {
+            auto muGrpListGpu           = std::make_unique<cumac::multiCellMuGrpList>();
+            CUDA_CHECK_ERR(cudaMemcpy(muGrpListGpu.get(), schdSol->muGrpList, sizeof(cumac::multiCellMuGrpList), cudaMemcpyDeviceToHost));
+
+            std::vector<uint16_t> numUeInGrp(cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_);
+            CUDA_CHECK_ERR(cudaMemcpy(numUeInGrp.data(), muGrpListGpu->numUeInGrp, cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_);
+            H5::DataSpace dataspaceNumUeInGrp(1, dims);
+            dataset = file.createDataSet("numUeInGrp", H5::PredType::NATIVE_UINT16, dataspaceNumUeInGrp);
+            dataset.write(numUeInGrp.data(), H5::PredType::NATIVE_UINT16);  
+
+            std::vector<uint16_t> ueId(cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_*cumac::maxNumLayerPerGrpDL_);
+            CUDA_CHECK_ERR(cudaMemcpy(ueId.data(), muGrpListGpu->ueId, cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_*cumac::maxNumLayerPerGrpDL_*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_*cumac::maxNumLayerPerGrpDL_);
+            H5::DataSpace dataspaceUeId(1, dims);
+            dataset = file.createDataSet("ueId", H5::PredType::NATIVE_UINT16, dataspaceUeId);
+            dataset.write(ueId.data(), H5::PredType::NATIVE_UINT16);
+
+            std::vector<int16_t> subbandId(cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_);
+            CUDA_CHECK_ERR(cudaMemcpy(subbandId.data(), muGrpListGpu->subbandId, cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_*sizeof(int16_t), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cumac::maxNumCoorCells_*cumac::maxNumUegPerCell_);
+            H5::DataSpace dataspaceSubbandId(1, dims);
+            dataset = file.createDataSet("subbandId", H5::PredType::NATIVE_INT16, dataspaceSubbandId);
+            dataset.write(subbandId.data(), H5::PredType::NATIVE_INT16);    
+        }
+
+        if (schdSol->ueOrderInGrp) {
+            std::vector<uint16_t> ueOrderInGrp(cellGrpPrms->nActiveUe);
+            CUDA_CHECK_ERR(cudaMemcpy(ueOrderInGrp.data(), schdSol->ueOrderInGrp, cellGrpPrms->nActiveUe*sizeof(uint16_t), cudaMemcpyDeviceToHost));    
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceUeOrderInGrp(1, dims);
+            dataset = file.createDataSet("ueOrderInGrp", H5::PredType::NATIVE_UINT16, dataspaceUeOrderInGrp);
+            dataset.write(ueOrderInGrp.data(), H5::PredType::NATIVE_UINT16);
+        }
+
+        if (schdSol->muMimoInd) {
+            std::unique_ptr<uint8_t []> muMimoInd = std::make_unique<uint8_t []>(cellGrpPrms->nActiveUe);
+            CUDA_CHECK_ERR(cudaMemcpy(muMimoInd.get(), schdSol->muMimoInd, cellGrpPrms->nActiveUe*sizeof(uint8_t), cudaMemcpyDeviceToHost));
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceMuMimoInd(1, dims);
+            dataset = file.createDataSet("muMimoInd", H5::PredType::NATIVE_UINT8, dataspaceMuMimoInd);
+            dataset.write(muMimoInd.get(), H5::PredType::NATIVE_UINT8);
+        }
+
+        if (schdSol->sortedUeList) {
+            std::unique_ptr<uint16_t* []> sortedUeList  = std::make_unique<uint16_t* []>(cellGrpPrms->nCell);
+            std::unique_ptr<uint16_t []> sortedUeList_perCell = std::make_unique<uint16_t []>(cellGrpPrms->nMaxActUePerCell);
+
+            CUDA_CHECK_ERR(cudaMemcpy(sortedUeList.get(), schdSol->sortedUeList, cellGrpPrms->nCell*sizeof(uint16_t*), cudaMemcpyDeviceToHost));
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nMaxActUePerCell);
+            for (int cIdx = 0; cIdx < cellGrpPrms->nCell; cIdx++) {
+                CUDA_CHECK_ERR(cudaMemcpy(sortedUeList_perCell.get(), sortedUeList[cIdx], cellGrpPrms->nMaxActUePerCell*sizeof(uint16_t), cudaMemcpyDeviceToHost));
+
+                std::string sortedUeListFieldName = "sortedUeList_cell" + std::to_string(cIdx);
+                H5::DataSpace dataspaceSortedUeList(1, dims);
+                dataset = file.createDataSet(sortedUeListFieldName, H5::PredType::NATIVE_UINT16, dataspaceSortedUeList);
+                dataset.write(sortedUeList_perCell.get(), H5::PredType::NATIVE_UINT16);
+            }
+        }
+
+        if (schdSol->setSchdUePerCellTTI) {
+            int numUeSchd;
+            if (cellGrpPrms->nBsAnt == 4) { // 4TR
+                numUeSchd = cellGrpPrms->numUeSchdPerCellTTI;
+            } else { // 64TR
+                numUeSchd = cellGrpPrms->numUeForGrpPerCell;
+            }
+
+            uint16_t* setSchdUePerCellTTI = new uint16_t[cellGrpPrms->nCell*numUeSchd];
+            CUDA_CHECK_ERR(cudaMemcpy(setSchdUePerCellTTI, schdSol->setSchdUePerCellTTI, cellGrpPrms->nCell*numUeSchd*sizeof(uint16_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nCell*numUeSchd);
+            H5::DataSpace dataspaceSetSchdUe(1, dims);
+            dataset = file.createDataSet("setSchdUePerCellTTI", H5::PredType::NATIVE_UINT16, dataspaceSetSchdUe);
+            dataset.write(setSchdUePerCellTTI, H5::PredType::NATIVE_UINT16);
+
+            delete[] setSchdUePerCellTTI;
+        }
+
+        if (schdSol->allocSol) {
+            int16_t* allocSol;
+            if (param.allocType == 1) { // type-1 allocation
+                allocSol = new int16_t[2*numUe];
+                CUDA_CHECK_ERR(cudaMemcpy(allocSol, schdSol->allocSol, 2*numUe*sizeof(int16_t), cudaMemcpyDeviceToHost));
+                dims[0] = static_cast<hsize_t>(2*numUe);
+            } else { // type-0 allocation
+                allocSol = new int16_t[cellGrpPrms->nCell*cellGrpPrms->nPrbGrp];
+                CUDA_CHECK_ERR(cudaMemcpy(allocSol, schdSol->allocSol, cellGrpPrms->nCell*cellGrpPrms->nPrbGrp*sizeof(int16_t), cudaMemcpyDeviceToHost));
+                dims[0] = static_cast<hsize_t>(cellGrpPrms->nCell*cellGrpPrms->nPrbGrp);
+            }
+
+            H5::DataSpace dataspaceAllocSol(1, dims);
+            dataset = file.createDataSet("allocSol", H5::PredType::NATIVE_INT16, dataspaceAllocSol);
+            dataset.write(allocSol, H5::PredType::NATIVE_INT16);
+
+            delete[] allocSol;
+        }
+
+        if (schdSol->mcsSelSol) {
+            int16_t*    mcsSelSol = new int16_t[numUe];
+            CUDA_CHECK_ERR(cudaMemcpy(mcsSelSol, schdSol->mcsSelSol, numUe*sizeof(int16_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(numUe);
+            H5::DataSpace dataspaceMcsSelSol(1, dims);
+            dataset = file.createDataSet("mcsSelSol", H5::PredType::NATIVE_INT16, dataspaceMcsSelSol);
+            dataset.write(mcsSelSol, H5::PredType::NATIVE_INT16);
+
+            delete[] mcsSelSol;
+        }
+
+        if (schdSol->layerSelSol) {
+            uint8_t*    layerSelSol = new uint8_t[numUe];
+            CUDA_CHECK_ERR(cudaMemcpy(layerSelSol, schdSol->layerSelSol, numUe*sizeof(uint8_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(numUe);
+            H5::DataSpace dataspaceLayerSelSol(1, dims);
+            dataset = file.createDataSet("layerSelSol", H5::PredType::NATIVE_UINT8, dataspaceLayerSelSol);
+            dataset.write(layerSelSol, H5::PredType::NATIVE_UINT8);
+
+            delete[] layerSelSol;
+        }
+
+        if (schdSol->nSCID) {
+            std::unique_ptr<uint8_t []> nSCID = std::make_unique<uint8_t []>(cellGrpPrms->nActiveUe);
+            CUDA_CHECK_ERR(cudaMemcpy(nSCID.get(), schdSol->nSCID, cellGrpPrms->nActiveUe*sizeof(uint8_t), cudaMemcpyDeviceToHost)); 
+
+            dims[0] = static_cast<hsize_t>(cellGrpPrms->nActiveUe);
+            H5::DataSpace dataspaceNSCID(1, dims);
+            dataset = file.createDataSet("nSCID", H5::PredType::NATIVE_UINT8, dataspaceNSCID);
+            dataset.write(nSCID.get(), H5::PredType::NATIVE_UINT8);
+        }
+    }
+    
+
+    if (cellGrpPrms->prgMsk) {
+        uint8_t** prgMsk = new uint8_t*[cellGrpPrms->nCell];
+        uint8_t* perCellPrgMsk = new uint8_t[cellGrpPrms->nPrbGrp];
+
+        dims[0] = static_cast<hsize_t>(cellGrpPrms->nPrbGrp);
+        CUDA_CHECK_ERR(cudaMemcpy(prgMsk, cellGrpPrms->prgMsk, cellGrpPrms->nCell*sizeof(uint8_t*), cudaMemcpyDeviceToHost));
+        for (int cIdx = 0; cIdx < cellGrpPrms->nCell; cIdx++) {
+            CUDA_CHECK_ERR(cudaMemcpy(perCellPrgMsk, prgMsk[cIdx], cellGrpPrms->nPrbGrp*sizeof(uint8_t), cudaMemcpyDeviceToHost));
+            std::string prgMskFieldName = "prgMsk" + std::to_string(cIdx);
+            H5::DataSpace dataspacePrgMsk(1, dims);
+            dataset = file.createDataSet(prgMskFieldName, H5::PredType::NATIVE_UINT8, dataspacePrgMsk);
+            dataset.write(perCellPrgMsk, H5::PredType::NATIVE_UINT8);
+        }
+
+        delete[] prgMsk;
+        delete[] perCellPrgMsk;
+    }
+
+    // the following part is the extra information recorded as compared to the implementation from saveToH5
+    // per-slot simulation record log
+    if (!perUEperSlotMcs.empty() && !perUEperSlotMcs[0].empty()) {
+        size_t numUes = perUEperSlotMcs.size();
+        size_t numSlots = perUEperSlotMcs[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<int> perUEperSlotMcs_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotMcs_flat[ueIdx * numSlots + slotIdx] = perUEperSlotMcs[ueIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for MCS data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotMcs(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotMcs", H5::PredType::NATIVE_INT32, dataspacePerUEperSlotMcs);
+        dataset.write(perUEperSlotMcs_flat.data(), H5::PredType::NATIVE_INT32);
+    }
+
+    if (!perUEperSlotLayerSel.empty() && !perUEperSlotLayerSel[0].empty()) {
+        size_t numUes = perUEperSlotLayerSel.size();
+        size_t numSlots = perUEperSlotLayerSel[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<int> perUEperSlotLayerSel_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotLayerSel_flat[ueIdx * numSlots + slotIdx] = perUEperSlotLayerSel[ueIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for layer selection data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotLayerSel(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotLayerSel", H5::PredType::NATIVE_INT32, dataspacePerUEperSlotLayerSel);
+        dataset.write(perUEperSlotLayerSel_flat.data(), H5::PredType::NATIVE_INT32);
+    }
+
+    if (!perUEperSlotAvgSinr.empty() && !perUEperSlotAvgSinr[0].empty()) {
+        size_t numUes = perUEperSlotAvgSinr.size();
+        size_t numSlots = perUEperSlotAvgSinr[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<float> perUEperSlotAvgSinr_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotAvgSinr_flat[ueIdx * numSlots + slotIdx] = perUEperSlotAvgSinr[ueIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for average SINR data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotAvgSinr(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotAvgSinr", H5::PredType::NATIVE_FLOAT, dataspacePerUEperSlotAvgSinr);
+        dataset.write(perUEperSlotAvgSinr_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperRbgperSlotGeometrySinr.empty() && !perUEperRbgperSlotGeometrySinr[0].empty() && !perUEperRbgperSlotGeometrySinr[0][0].empty()) {
+        size_t numUes = perUEperRbgperSlotGeometrySinr.size();
+        size_t numRbgs = perUEperRbgperSlotGeometrySinr[0].size();
+        size_t numSlots = perUEperRbgperSlotGeometrySinr[0][0].size();
+        std::vector<float> perUEperRbgperSlotGeometrySinr_flat(numUes * numRbgs * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t rbgIdx = 0; rbgIdx < numRbgs; ++rbgIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perUEperRbgperSlotGeometrySinr_flat[ueIdx * numRbgs * numSlots + rbgIdx * numSlots + slotIdx] =
+                        perUEperRbgperSlotGeometrySinr[ueIdx][rbgIdx][slotIdx];
+                }
+            }
+        }
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numRbgs), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperRbgperSlotGeometrySinr(3, dims3D);
+        dataset = file.createDataSet("perUEperRbgperSlotGeometrySinr", H5::PredType::NATIVE_FLOAT, dataspacePerUEperRbgperSlotGeometrySinr);
+        dataset.write(perUEperRbgperSlotGeometrySinr_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperSlotServingCellChannelGain.empty() && !perUEperSlotServingCellChannelGain[0].empty()) {
+        size_t numUes = perUEperSlotServingCellChannelGain.size();
+        size_t numSlots = perUEperSlotServingCellChannelGain[0].size();
+        std::vector<float> perUEperSlotServingCellChannelGain_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotServingCellChannelGain_flat[ueIdx * numSlots + slotIdx] =
+                    perUEperSlotServingCellChannelGain[ueIdx][slotIdx];
+            }
+        }
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotServingCellChannelGain(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotServingCellChannelGain", H5::PredType::NATIVE_FLOAT, dataspacePerUEperSlotServingCellChannelGain);
+        dataset.write(perUEperSlotServingCellChannelGain_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperCellperSlotAllCellsChannelGain.empty() && !perUEperCellperSlotAllCellsChannelGain[0].empty() && !perUEperCellperSlotAllCellsChannelGain[0][0].empty()) {
+        size_t numUes = perUEperCellperSlotAllCellsChannelGain.size();
+        size_t numCells = perUEperCellperSlotAllCellsChannelGain[0].size();
+        size_t numSlots = perUEperCellperSlotAllCellsChannelGain[0][0].size();
+        std::vector<float> perUEperCellperSlotAllCellsChannelGain_flat(numUes * numCells * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t cIdx = 0; cIdx < numCells; ++cIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perUEperCellperSlotAllCellsChannelGain_flat[ueIdx * numCells * numSlots + cIdx * numSlots + slotIdx] =
+                        perUEperCellperSlotAllCellsChannelGain[ueIdx][cIdx][slotIdx];
+                }
+            }
+        }
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numCells), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperCellperSlotAllCellsChannelGain(3, dims3D);
+        dataset = file.createDataSet("perUEperCellperSlotAllCellsChannelGain", H5::PredType::NATIVE_FLOAT, dataspacePerUEperCellperSlotAllCellsChannelGain);
+        dataset.write(perUEperCellperSlotAllCellsChannelGain_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperSlotServingCellPathLossAndSF.empty() && !perUEperSlotServingCellPathLossAndSF[0].empty()) {
+        size_t numUes = perUEperSlotServingCellPathLossAndSF.size();
+        size_t numSlots = perUEperSlotServingCellPathLossAndSF[0].size();
+        std::vector<float> perUEperSlotServingCellPathLossAndSF_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotServingCellPathLossAndSF_flat[ueIdx * numSlots + slotIdx] =
+                    perUEperSlotServingCellPathLossAndSF[ueIdx][slotIdx];
+            }
+        }
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotServingCellPathLossAndSF(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotServingCellPathLossAndSF", H5::PredType::NATIVE_FLOAT, dataspacePerUEperSlotServingCellPathLossAndSF);
+        dataset.write(perUEperSlotServingCellPathLossAndSF_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperCellperSlotAllCellsPathLossAndSF.empty() && !perUEperCellperSlotAllCellsPathLossAndSF[0].empty() && !perUEperCellperSlotAllCellsPathLossAndSF[0][0].empty()) {
+        size_t numUes = perUEperCellperSlotAllCellsPathLossAndSF.size();
+        size_t numCells = perUEperCellperSlotAllCellsPathLossAndSF[0].size();
+        size_t numSlots = perUEperCellperSlotAllCellsPathLossAndSF[0][0].size();
+        std::vector<float> perUEperCellperSlotAllCellsPathLossAndSF_flat(numUes * numCells * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t cIdx = 0; cIdx < numCells; ++cIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perUEperCellperSlotAllCellsPathLossAndSF_flat[ueIdx * numCells * numSlots + cIdx * numSlots + slotIdx] =
+                        perUEperCellperSlotAllCellsPathLossAndSF[ueIdx][cIdx][slotIdx];
+                }
+            }
+        }
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numCells), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperCellperSlotAllCellsPathLossAndSF(3, dims3D);
+        dataset = file.createDataSet("perUEperCellperSlotAllCellsPathLossAndSF", H5::PredType::NATIVE_FLOAT, dataspacePerUEperCellperSlotAllCellsPathLossAndSF);
+        dataset.write(perUEperCellperSlotAllCellsPathLossAndSF_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperRbgperSlotGeometrySir.empty() && !perUEperRbgperSlotGeometrySir[0].empty() && !perUEperRbgperSlotGeometrySir[0][0].empty()) {
+        size_t numUes = perUEperRbgperSlotGeometrySir.size();
+        size_t numRbgs = perUEperRbgperSlotGeometrySir[0].size();
+        size_t numSlots = perUEperRbgperSlotGeometrySir[0][0].size();
+        std::vector<float> perUEperRbgperSlotGeometrySir_flat(numUes * numRbgs * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t rbgIdx = 0; rbgIdx < numRbgs; ++rbgIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perUEperRbgperSlotGeometrySir_flat[ueIdx * numRbgs * numSlots + rbgIdx * numSlots + slotIdx] =
+                        perUEperRbgperSlotGeometrySir[ueIdx][rbgIdx][slotIdx];
+                }
+            }
+        }
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numRbgs), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperRbgperSlotGeometrySir(3, dims3D);
+        dataset = file.createDataSet("perUEperRbgperSlotGeometrySir", H5::PredType::NATIVE_FLOAT, dataspacePerUEperRbgperSlotGeometrySir);
+        dataset.write(perUEperRbgperSlotGeometrySir_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperRbgperSlotGeometrySnr.empty() && !perUEperRbgperSlotGeometrySnr[0].empty() && !perUEperRbgperSlotGeometrySnr[0][0].empty()) {
+        size_t numUes = perUEperRbgperSlotGeometrySnr.size();
+        size_t numRbgs = perUEperRbgperSlotGeometrySnr[0].size();
+        size_t numSlots = perUEperRbgperSlotGeometrySnr[0][0].size();
+        std::vector<float> perUEperRbgperSlotGeometrySnr_flat(numUes * numRbgs * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t rbgIdx = 0; rbgIdx < numRbgs; ++rbgIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perUEperRbgperSlotGeometrySnr_flat[ueIdx * numRbgs * numSlots + rbgIdx * numSlots + slotIdx] =
+                        perUEperRbgperSlotGeometrySnr[ueIdx][rbgIdx][slotIdx];
+                }
+            }
+        }
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numRbgs), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperRbgperSlotGeometrySnr(3, dims3D);
+        dataset = file.createDataSet("perUEperRbgperSlotGeometrySnr", H5::PredType::NATIVE_FLOAT, dataspacePerUEperRbgperSlotGeometrySnr);
+        dataset.write(perUEperRbgperSlotGeometrySnr_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperRbgperSlotRawPreEqSinr.empty() && !perUEperRbgperSlotRawPreEqSinr[0].empty() && !perUEperRbgperSlotRawPreEqSinr[0][0].empty()) {
+        size_t numUes = perUEperRbgperSlotRawPreEqSinr.size();
+        size_t numRbgs = perUEperRbgperSlotRawPreEqSinr[0].size();
+        size_t numSlots = perUEperRbgperSlotRawPreEqSinr[0][0].size();
+        std::vector<float> perUEperRbgperSlotRawPreEqSinr_flat(numUes * numRbgs * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t rbgIdx = 0; rbgIdx < numRbgs; ++rbgIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perUEperRbgperSlotRawPreEqSinr_flat[ueIdx * numRbgs * numSlots + rbgIdx * numSlots + slotIdx] =
+                        perUEperRbgperSlotRawPreEqSinr[ueIdx][rbgIdx][slotIdx];
+                }
+            }
+        }
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numRbgs), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperRbgperSlotRawPreEqSinr(3, dims3D);
+        dataset = file.createDataSet("perUEperRbgperSlotRawPreEqSinr", H5::PredType::NATIVE_FLOAT, dataspacePerUEperRbgperSlotRawPreEqSinr);
+        dataset.write(perUEperRbgperSlotRawPreEqSinr_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperRbgperSlotRawPreEqSir.empty() && !perUEperRbgperSlotRawPreEqSir[0].empty() && !perUEperRbgperSlotRawPreEqSir[0][0].empty()) {
+        size_t numUes = perUEperRbgperSlotRawPreEqSir.size();
+        size_t numRbgs = perUEperRbgperSlotRawPreEqSir[0].size();
+        size_t numSlots = perUEperRbgperSlotRawPreEqSir[0][0].size();
+        std::vector<float> perUEperRbgperSlotRawPreEqSir_flat(numUes * numRbgs * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t rbgIdx = 0; rbgIdx < numRbgs; ++rbgIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perUEperRbgperSlotRawPreEqSir_flat[ueIdx * numRbgs * numSlots + rbgIdx * numSlots + slotIdx] =
+                        perUEperRbgperSlotRawPreEqSir[ueIdx][rbgIdx][slotIdx];
+                }
+            }
+        }
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numRbgs), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperRbgperSlotRawPreEqSir(3, dims3D);
+        dataset = file.createDataSet("perUEperRbgperSlotRawPreEqSir", H5::PredType::NATIVE_FLOAT, dataspacePerUEperRbgperSlotRawPreEqSir);
+        dataset.write(perUEperRbgperSlotRawPreEqSir_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperRbgperSlotRawPreEqSnr.empty() && !perUEperRbgperSlotRawPreEqSnr[0].empty() && !perUEperRbgperSlotRawPreEqSnr[0][0].empty()) {
+        size_t numUes = perUEperRbgperSlotRawPreEqSnr.size();
+        size_t numRbgs = perUEperRbgperSlotRawPreEqSnr[0].size();
+        size_t numSlots = perUEperRbgperSlotRawPreEqSnr[0][0].size();
+        std::vector<float> perUEperRbgperSlotRawPreEqSnr_flat(numUes * numRbgs * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t rbgIdx = 0; rbgIdx < numRbgs; ++rbgIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perUEperRbgperSlotRawPreEqSnr_flat[ueIdx * numRbgs * numSlots + rbgIdx * numSlots + slotIdx] =
+                        perUEperRbgperSlotRawPreEqSnr[ueIdx][rbgIdx][slotIdx];
+                }
+            }
+        }
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numRbgs), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperRbgperSlotRawPreEqSnr(3, dims3D);
+        dataset = file.createDataSet("perUEperRbgperSlotRawPreEqSnr", H5::PredType::NATIVE_FLOAT, dataspacePerUEperRbgperSlotRawPreEqSnr);
+        dataset.write(perUEperRbgperSlotRawPreEqSnr_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperRbgperLayerperSlotRawSinr.empty() && !perUEperRbgperLayerperSlotRawSinr[0].empty()
+        && !perUEperRbgperLayerperSlotRawSinr[0][0].empty() && !perUEperRbgperLayerperSlotRawSinr[0][0][0].empty()) {
+        size_t numUes = perUEperRbgperLayerperSlotRawSinr.size();
+        size_t numRbgs = perUEperRbgperLayerperSlotRawSinr[0].size();
+        size_t numLayers = perUEperRbgperLayerperSlotRawSinr[0][0].size();
+        size_t numSlots = perUEperRbgperLayerperSlotRawSinr[0][0][0].size();
+        const size_t flatSize = numUes * numRbgs * numLayers * numSlots;
+        std::vector<float> perUEperRbgperLayerperSlotRawSinr_flat(flatSize);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t rbgIdx = 0; rbgIdx < numRbgs; ++rbgIdx) {
+                for (size_t layerIdx = 0; layerIdx < numLayers; ++layerIdx) {
+                    for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                        perUEperRbgperLayerperSlotRawSinr_flat[
+                            ueIdx * numRbgs * numLayers * numSlots + rbgIdx * numLayers * numSlots + layerIdx * numSlots + slotIdx] =
+                            perUEperRbgperLayerperSlotRawSinr[ueIdx][rbgIdx][layerIdx][slotIdx];
+                    }
+                }
+            }
+        }
+        hsize_t dims4D[4] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numRbgs), static_cast<hsize_t>(numLayers),
+                             static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperRbgperLayerperSlotRawSinr(4, dims4D);
+        dataset = file.createDataSet("perUEperRbgperLayerperSlotRawSinr", H5::PredType::NATIVE_FLOAT,
+                                     dataspacePerUEperRbgperLayerperSlotRawSinr);
+        dataset.write(perUEperRbgperLayerperSlotRawSinr_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperSlotTbErr.empty() && !perUEperSlotTbErr[0].empty()) {
+        size_t numUes = perUEperSlotTbErr.size();
+        size_t numSlots = perUEperSlotTbErr[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<int> perUEperSlotTbErr_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotTbErr_flat[ueIdx * numSlots + slotIdx] = perUEperSlotTbErr[ueIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for TB error data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotTbErr(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotTbErr", H5::PredType::NATIVE_INT32, dataspacePerUEperSlotTbErr);
+        dataset.write(perUEperSlotTbErr_flat.data(), H5::PredType::NATIVE_INT32);
+    }
+
+    if (!perUEperSlotBler.empty() && !perUEperSlotBler[0].empty()) {
+        size_t numUes = perUEperSlotBler.size();
+        size_t numSlots = perUEperSlotBler[0].size();
+        std::vector<float> perUEperSlotBler_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotBler_flat[ueIdx * numSlots + slotIdx] = perUEperSlotBler[ueIdx][slotIdx];
+            }
+        }
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotBler(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotBler", H5::PredType::NATIVE_FLOAT, dataspacePerUEperSlotBler);
+        dataset.write(perUEperSlotBler_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperSlotInsRate.empty() && !perUEperSlotInsRate[0].empty()) {
+        size_t numUes = perUEperSlotInsRate.size();
+        size_t numSlots = perUEperSlotInsRate[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<float> perUEperSlotInsRate_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotInsRate_flat[ueIdx * numSlots + slotIdx] = perUEperSlotInsRate[ueIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for instantaneous rate data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotInsRate(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotInsRate", H5::PredType::NATIVE_FLOAT, dataspacePerUEperSlotInsRate);
+        dataset.write(perUEperSlotInsRate_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perUEperSlotAvgRate.empty() && !perUEperSlotAvgRate[0].empty()) {
+        size_t numUes = perUEperSlotAvgRate.size();
+        size_t numSlots = perUEperSlotAvgRate[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<float> perUEperSlotAvgRate_flat(numUes * numSlots);
+        for (size_t ueIdx = 0; ueIdx < numUes; ++ueIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perUEperSlotAvgRate_flat[ueIdx * numSlots + slotIdx] = perUEperSlotAvgRate[ueIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for average rate data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numUes), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerUEperSlotAvgRate(2, dims2D);
+        dataset = file.createDataSet("perUEperSlotAvgRate", H5::PredType::NATIVE_FLOAT, dataspacePerUEperSlotAvgRate);
+        dataset.write(perUEperSlotAvgRate_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perCellperSlotNumScheUEs.empty() && !perCellperSlotNumScheUEs[0].empty()) {
+        size_t numCells = perCellperSlotNumScheUEs.size();
+        size_t numSlots = perCellperSlotNumScheUEs[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<int> perCellperSlotNumScheUEs_flat(numCells * numSlots);
+        for (size_t cellIdx = 0; cellIdx < numCells; ++cellIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perCellperSlotNumScheUEs_flat[cellIdx * numSlots + slotIdx] = perCellperSlotNumScheUEs[cellIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for per-cell number of scheduled UEs data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numCells), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerCellperSlotNumScheUEs(2, dims2D);
+        dataset = file.createDataSet("perCellperSlotNumScheUEs", H5::PredType::NATIVE_INT32, dataspacePerCellperSlotNumScheUEs);
+        dataset.write(perCellperSlotNumScheUEs_flat.data(), H5::PredType::NATIVE_INT32);
+    }
+
+    if (!perCellperSlotTbErr.empty() && !perCellperSlotTbErr[0].empty()) {
+        size_t numCells = perCellperSlotTbErr.size();
+        size_t numSlots = perCellperSlotTbErr[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<float> perCellperSlotTbErr_flat(numCells * numSlots);
+        for (size_t cellIdx = 0; cellIdx < numCells; ++cellIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perCellperSlotTbErr_flat[cellIdx * numSlots + slotIdx] = perCellperSlotTbErr[cellIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for per-cell TB error data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numCells), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerCellperSlotTbErr(2, dims2D);
+        dataset = file.createDataSet("perCellperSlotTbErr", H5::PredType::NATIVE_FLOAT, dataspacePerCellperSlotTbErr);
+        dataset.write(perCellperSlotTbErr_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perCellperSlotInsRate.empty() && !perCellperSlotInsRate[0].empty()) {
+        size_t numCells = perCellperSlotInsRate.size();
+        size_t numSlots = perCellperSlotInsRate[0].size();
+        
+        // Flatten the 2D vector into a 1D array for HDF5 storage
+        std::vector<float> perCellperSlotInsRate_flat(numCells * numSlots);
+        for (size_t cellIdx = 0; cellIdx < numCells; ++cellIdx) {
+            for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                perCellperSlotInsRate_flat[cellIdx * numSlots + slotIdx] = perCellperSlotInsRate[cellIdx][slotIdx];
+            }
+        }
+        
+        // Create 2D dataspace for per-cell instantaneous rate data
+        hsize_t dims2D[2] = {static_cast<hsize_t>(numCells), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerCellperSlotInsRate(2, dims2D);
+        dataset = file.createDataSet("perCellperSlotInsRate", H5::PredType::NATIVE_FLOAT, dataspacePerCellperSlotInsRate);
+        dataset.write(perCellperSlotInsRate_flat.data(), H5::PredType::NATIVE_FLOAT);
+    }
+
+    if (!perCellperGrpperSlotNumScheLayers.empty() && !perCellperGrpperSlotNumScheLayers[0].empty() && !perCellperGrpperSlotNumScheLayers[0][0].empty()) {
+        size_t numCells = perCellperGrpperSlotNumScheLayers.size();
+        size_t numGrps = perCellperGrpperSlotNumScheLayers[0].size();
+        size_t numSlots = perCellperGrpperSlotNumScheLayers[0][0].size();
+
+        // Flatten the 3D vector into a 1D array for HDF5 storage (cell, then PRG, then slot)
+        std::vector<int> perCellperGrpperSlotNumScheLayers_flat(numCells * numGrps * numSlots);
+        for (size_t cellIdx = 0; cellIdx < numCells; ++cellIdx) {
+            for (size_t grpIdx = 0; grpIdx < numGrps; ++grpIdx) {
+                for (size_t slotIdx = 0; slotIdx < numSlots; ++slotIdx) {
+                    perCellperGrpperSlotNumScheLayers_flat[cellIdx * numGrps * numSlots + grpIdx * numSlots + slotIdx] =
+                        perCellperGrpperSlotNumScheLayers[cellIdx][grpIdx][slotIdx];
+                }
+            }
+        }
+
+        // Create 3D dataspace for per-cell per-PRG per-slot number of scheduled layers data
+        hsize_t dims3D[3] = {static_cast<hsize_t>(numCells), static_cast<hsize_t>(numGrps), static_cast<hsize_t>(numSlots)};
+        H5::DataSpace dataspacePerCellperGrpperSlotNumScheLayers(3, dims3D);
+        dataset = file.createDataSet("perCellperGrpperSlotNumScheLayers", H5::PredType::NATIVE_INT32, dataspacePerCellperGrpperSlotNumScheLayers);
+        dataset.write(perCellperGrpperSlotNumScheLayers_flat.data(), H5::PredType::NATIVE_INT32);
+    }
 }

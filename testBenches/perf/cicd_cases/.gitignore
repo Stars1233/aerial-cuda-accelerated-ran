@@ -1,0 +1,4 @@
+.generated/
+runs/
+__pycache__/
+cubb_gpu_test_*.sh

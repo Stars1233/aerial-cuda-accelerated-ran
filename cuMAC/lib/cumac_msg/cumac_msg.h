@@ -22,6 +22,7 @@
 #include <stddef.h>
 
 #include "cumac_pfm_sort.h"
+#include "cumac_muUeGrp.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -79,7 +80,8 @@ typedef enum
     CUMAC_TASK_LAYER_SELECTION = 2, //!< Layer selection task (cumac::multiCellLayerSel)
     CUMAC_TASK_MCS_SELECTION = 3,   //!< MCS selection task (cumac::mcsSelectionLUT)
     CUMAC_TASK_PFM_SORT = 4,        //!< PFM sorting task
-    CUMAC_TASK_TOTAL_NUM = 5        //!< Total number of task types
+    CUMAC_TASK_MU_UE_GRP = 5,      //!< MU-MIMO UE grouping task
+    CUMAC_TASK_TOTAL_NUM = 6        //!< Total number of task types
 } cumac_task_type_t;
 
 /**
@@ -175,6 +177,7 @@ typedef struct {
  */
 typedef struct
 {
+    uint32_t moduleBitMask;    //!< Indicate which cuMAC modules should be enabled. Each bit represent 1 type defined in cumac_module_type_t
     uint8_t harqEnabledInd;    //!< Indicator for whether HARQ is enabled
     uint8_t mcsSelCqi;         //!< Indicator for whether MCS selection is based on CQI or SINR
     uint8_t nMaxCell;          //!< A constant integer for the maximum number of cells in the cell group
@@ -196,6 +199,7 @@ typedef struct
     uint8_t mcsSelLutType;     //!< MCS selection LUT type
     uint16_t prioWeightStep;   //!< Step size for UE priority weight increment per TTI if UE does not get scheduled. For priority-based UE selection
     float blerTarget;          //!< BLER target (same for all active UEs; expanded per-UE in cuMAC-CP)
+
 } cumac_config_req_payload_t;
 
 /**
@@ -223,7 +227,11 @@ typedef struct
     uint32_t allocSolLastTxActUe;    //!< The PRG allocation solution for the last transmissions of all active UEs in the cell
     uint32_t mcsSelSolLastTxActUe;   //!< MCS selection solution for the last transmissions of all active UEs in the cell
     uint32_t layerSelSolLastTxActUe; //!< Layer selection solution for the last transmissions of all active UEs in the cell
+
     uint32_t pfmCellInfo;            //!< PFM sorting input buffer
+
+    uint32_t muUeGrpInfo;            //!< MU-MIMO UE grouping request info buffer
+
 } cumac_tti_req_buf_offsets_t;
 
 /**
@@ -234,7 +242,7 @@ typedef struct
 // Payload of SCH_TTI.req
 typedef struct
 {
-    uint32_t taskBitMask; //!< Indicate which cuMAC tasks to be scheduled. Each bit represent 1 task type defined in cumac_task_type_t
+    uint32_t taskBitMask; //!< Indicate which cuMAC tasks to be scheduled. Each bit represent 1 type defined in cumac_task_type_t
     uint16_t cellID;      //!< cell ID
     uint8_t ULDLSch;      //!< Indication for UL/DL scheduling. Value - 0: UL scheduling, 1: DL scheduling
     uint16_t nActiveUe;   //!< total number of active UEs in the cell
@@ -273,6 +281,7 @@ typedef struct
     uint32_t layerSelSol;         //!< Layer selection solution for all active UEs in the cell
     uint32_t mcsSelSol;           //!< MCS selection solution for all active UEs in the cell
     uint32_t pfmSortSol;          //!< PFM sorting output buffer
+    uint32_t muUeGrpSol;          //!< MU-MIMO UE grouping output buffer (cumac_muUeGrp_resp_info_t per cell)
 } cumac_tti_resp_buf_offsets_t;
 
 /**
@@ -284,6 +293,7 @@ typedef struct {
     cumac_msg_header_t header;          //!< Message header with type CUMAC_SCH_TTI_RESPONSE
     uint16_t sfn;                       //!< Frame Number
     uint16_t slot;                      //!< Slot number
+    uint32_t taskBitMask;               //!< Indicate which cuMAC tasks to be scheduled. Each bit represent 1 type defined in cumac_task_type_t
     uint16_t nUeSchd;                   //!< Number of UEs actually scheduled this TTI for this cell
 
     cumac_tti_resp_buf_offsets_t offsets; //!< Data buffer offsets for output arrays

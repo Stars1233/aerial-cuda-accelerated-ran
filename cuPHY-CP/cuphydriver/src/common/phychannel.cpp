@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 8) // "DRV.PHYCH"
 
 #include "phychannel.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -55,6 +56,19 @@ PhyChannel::PhyChannel(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_t _cell_
 
     setCtx();
 
+    if(!resolve_kernel_write_handle(&kernel_write_func_))
+    {
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve kernel_write CUfunction handle");
+    }
+    if(!resolve_kernel_wait_eq_handle(&kernel_wait_eq_func_))
+    {
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve kernel_wait_eq CUfunction handle");
+    }
+    if(!resolve_warmup_kernel_handle(&warmup_kernel_func_))
+    {
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve warmup_kernel CUfunction handle");
+    }
+
     // Initialize memory footprint tracker for base class, name can be overridden by derived classes
     mf.init(pdh, std::string("PhyChannelBase"), 0);
 
@@ -66,12 +80,12 @@ PhyChannel::PhyChannel(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_t _cell_
     ((uint32_t*)channel_complete_gdr->addrh())[0] = 0;
     mf.addGpuPinnedSize(channel_complete_gdr->size_alloc);
 
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_run));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_run));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&start_setup));
-    CUDA_CHECK_PHYDRIVER(cudaEventCreate(&end_setup));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_run, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_run, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_setup, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_setup, CU_EVENT_DEFAULT));
 
-    CUDA_CHECK_PHYDRIVER(cudaEventCreateWithFlags(&run_completion, cudaEventDisableTiming));
+    CUDA_DRIVER_CHECK(cuEventCreate(&run_completion, CU_EVENT_DISABLE_TIMING));
 
     cellStatPrm.phyCellId  = 0;
     cellStatPrm.nRxAnt     = 0;
@@ -91,12 +105,12 @@ PhyChannel::PhyChannel(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_t _cell_
 
 PhyChannel::~PhyChannel()
 {
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_run));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_run));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(start_setup));
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(end_setup));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_run));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_run));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_setup));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_setup));
 
-    CUDA_CHECK_PHYDRIVER(cudaEventDestroy(run_completion));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(run_completion));
 
     active = false;
     setup_status     = CH_SETUP_NOT_DONE;
@@ -304,54 +318,54 @@ int PhyChannel::cleanup()
 
 int PhyChannel::waitToStartCPU(uint32_t * wait_addr_h) {
     setCtx();
-    launch_kernel_wait_eq(s_channel, wait_addr_h, 1);
+    launch_kernel_wait_eq(kernel_wait_eq_func_, s_channel, wait_addr_h, 1);
     return 0;
 }
 
 int PhyChannel::waitToStartGPU(uint32_t * wait_addr_d) {
     setCtx();
-    launch_kernel_wait_eq(s_channel, wait_addr_d, 1);
+    launch_kernel_wait_eq(kernel_wait_eq_func_, s_channel, wait_addr_d, 1);
     return 0;
 }
 
 int PhyChannel::waitToStartGPU(uint32_t * wait_addr_d, cudaStream_t stream_) {
     setCtx();
-    launch_kernel_wait_eq(stream_, wait_addr_d, 1);
+    launch_kernel_wait_eq(kernel_wait_eq_func_, stream_, wait_addr_d, 1);
     return 0;
 }
 
 int PhyChannel::waitToStartGPUEvent(cudaEvent_t event) {
     setCtx();
-    CUDA_CHECK_PHYDRIVER(cudaStreamWaitEvent(s_channel, event, 0));
+    CUDA_DRIVER_CHECK(cuStreamWaitEvent(s_channel, event, CU_EVENT_WAIT_DEFAULT));
     return 0;
 }
 
 int PhyChannel::waitToStartGPUEvent(cudaEvent_t event, cudaStream_t stream_) {
     setCtx();
-    CUDA_CHECK_PHYDRIVER(cudaStreamWaitEvent(stream_, event, 0));
+    CUDA_DRIVER_CHECK(cuStreamWaitEvent(stream_, event, CU_EVENT_WAIT_DEFAULT));
     return 0;
 }
 
-//Blocking wait on externally specified cuda event
+// Blocking wait on externally specified CUDA event (cuEventSynchronize)
 int PhyChannel::waitEvent(cudaEvent_t event) {
-    CUDA_CHECK_PHYDRIVER(cudaEventSynchronize(event));
+    CUDA_DRIVER_CHECK(cuEventSynchronize(event));
     return 0;
 }
 
-//Non-blocking wait on externally specified cuda event
+// Non-blocking wait on externally specified CUDA event (cuEventQuery)
 // Returns 1 if run completion event has been triggered
 int PhyChannel::waitEventNonBlocking(cudaEvent_t event) {
-    cudaError_t temp = cudaEventQuery(event);
+    CUresult cuStatus = cuEventQuery(event);
 
-    //While waiting for completion, call will return cudaErrorNotReady
-    if(temp == cudaErrorNotReady) {
+    //While waiting for completion, call will return CUDA_ERROR_NOT_READY
+    if(cuStatus == CUDA_ERROR_NOT_READY) {
         return 0;
     }
 
-    //Throw exception on non "cudaSuccess" value
-    CUDA_CHECK_PHYDRIVER(temp);
+    //Throw exception on non CUDA_SUCCESS value
+    CUDA_DRIVER_CHECK(cuStatus);
 
-    //Result must have been cudaSuccess
+    //Result must have been CUDA_SUCCESS
     return 1;
 }
 
@@ -372,8 +386,8 @@ int PhyChannel::signalRunCompletion()
 {
     setCtx();
 
-    launch_kernel_write(s_channel, (uint32_t*)channel_complete_h->addr(), 1);
-    launch_kernel_write(s_channel, (uint32_t*)channel_complete_gdr->addrd(), 1);
+    launch_kernel_write(kernel_write_func_, s_channel, reinterpret_cast<uint32_t*>(channel_complete_h->addr()), 1);
+    launch_kernel_write(kernel_write_func_, s_channel, reinterpret_cast<uint32_t*>(channel_complete_gdr->addrd()), 1);
 
     return 0;
 }
@@ -385,10 +399,10 @@ int PhyChannel::signalRunCompletionEvent(bool trigger_write_kernel)
     setCtx();
 
     if(trigger_write_kernel){
-        launch_kernel_write(s_channel, (uint32_t*)channel_complete_h->addr(), 1);
+        launch_kernel_write(kernel_write_func_, s_channel, reinterpret_cast<uint32_t*>(channel_complete_h->addr()), 1);
     }
 
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(run_completion, s_channel));
+    CUDA_DRIVER_CHECK(cuEventRecord(run_completion, s_channel));
 
     return 0;
 }
@@ -401,10 +415,10 @@ int PhyChannel::signalRunCompletionEvent(cudaStream_t stream_, bool trigger_writ
     setCtx();
 
     if(trigger_write_kernel){
-        launch_kernel_write(stream_, (uint32_t*)channel_complete_h->addr(), 1);
+        launch_kernel_write(kernel_write_func_, stream_, reinterpret_cast<uint32_t*>(channel_complete_h->addr()), 1);
     }
 
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(run_completion, stream_));
+    CUDA_DRIVER_CHECK(cuEventRecord(run_completion, stream_));
 
     return 0;
 }
@@ -442,11 +456,11 @@ int PhyChannel::waitRunCompletionEventNonBlocking()
     return waitEventNonBlocking(run_completion);
 }
 
-//Block a GPU stream until run completion (using wait kernel)
-int PhyChannel::waitRunCompletionGPU(cudaStream_t stream_, MpsCtx * mpsCtx_)
+//Block a GPU stream until run completion (using wait kernel).
+//Uses the caller's CUfunction and stream, not the channel's own context.
+int PhyChannel::waitRunCompletionGPU(CUfunction wait_eq_func, cudaStream_t stream_)
 {
-    mpsCtx_->setCtx();
-    launch_kernel_wait_eq(stream_, (uint32_t*)channel_complete_gdr->addrd(), 1);
+    launch_kernel_wait_eq(wait_eq_func, stream_, reinterpret_cast<uint32_t*>(channel_complete_gdr->addrd()), 1);
     return 0;
 }
 
@@ -455,7 +469,7 @@ int PhyChannel::waitRunCompletionGPUEvent(cudaStream_t stream_, MpsCtx * mpsCtx_
 {
     mpsCtx_->setCtx();
     MemtraceDisableScope md;
-    CUDA_CHECK_PHYDRIVER(cudaStreamWaitEvent(stream_, run_completion, 0));
+    CUDA_DRIVER_CHECK(cuStreamWaitEvent(stream_, run_completion, CU_EVENT_WAIT_DEFAULT));
     return 0;
 }
 

@@ -14,6 +14,6 @@
 # limitations under the License.
 
 add_executable(singleCellSchedule)
-target_sources(singleCellSchedule PRIVATE main.cpp ../network.cu)
-target_link_libraries(singleCellSchedule PRIVATE cumac channInput chanModels)
-target_include_directories(singleCellSchedule PRIVATE ${CHAN_MODELS_SRC_INCLUDE_DIR})
+target_sources(singleCellSchedule PRIVATE main.cpp ../network.cu ../parameters.cpp)
+target_link_libraries(singleCellSchedule PRIVATE cumac channInput gpu3gppchan yaml-cpp)
+target_include_directories(singleCellSchedule PRIVATE ${GPU3GPPCHAN_SRC_INCLUDE_DIR})

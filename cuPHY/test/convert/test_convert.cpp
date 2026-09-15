@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,6 +46,8 @@ namespace detail {
             case CUPHY_C_32F: return 8;
             case CUPHY_R_64F: return 8;
             case CUPHY_C_64F: return 16;
+            case CUPHY_R_8F_E4M3:
+            case CUPHY_R_8F_E5M2: return 1;
             default: return 0;
         }
     }
@@ -84,15 +86,17 @@ namespace detail {
     };
 
     // Specializations for each real type
-    template<> struct real_type<CUPHY_R_8I> { using type = int8_t; };
-    template<> struct real_type<CUPHY_R_8U> { using type = uint8_t; };
-    template<> struct real_type<CUPHY_R_16I> { using type = int16_t; };
-    template<> struct real_type<CUPHY_R_16U> { using type = uint16_t; };
-    template<> struct real_type<CUPHY_R_16F> { using type = __half; };
-    template<> struct real_type<CUPHY_R_32I> { using type = int32_t; };
-    template<> struct real_type<CUPHY_R_32U> { using type = uint32_t; };
-    template<> struct real_type<CUPHY_R_32F> { using type = float; };
-    template<> struct real_type<CUPHY_R_64F> { using type = double; };
+    template<> struct real_type<CUPHY_R_8I>      { using type = int8_t; };
+    template<> struct real_type<CUPHY_R_8U>      { using type = uint8_t; };
+    template<> struct real_type<CUPHY_R_16I>     { using type = int16_t; };
+    template<> struct real_type<CUPHY_R_16U>     { using type = uint16_t; };
+    template<> struct real_type<CUPHY_R_16F>     { using type = __half; };
+    template<> struct real_type<CUPHY_R_32I>     { using type = int32_t; };
+    template<> struct real_type<CUPHY_R_32U>     { using type = uint32_t; };
+    template<> struct real_type<CUPHY_R_32F>     { using type = float; };
+    template<> struct real_type<CUPHY_R_64F>     { using type = double; };
+    template<> struct real_type<CUPHY_R_8F_E4M3> { using type = __nv_fp8_e4m3; };
+    template<> struct real_type<CUPHY_R_8F_E5M2> { using type = __nv_fp8_e5m2; };
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -234,7 +238,9 @@ void do_convert_test_copy_bits(int SRC_NUM_ROWS,
 
 template<cuphyDataType_t Type>
 constexpr double get_tolerance() {
-    if constexpr (Type == CUPHY_R_16F || Type == CUPHY_C_16F) {
+    if constexpr (Type == CUPHY_R_8F_E4M3 || Type == CUPHY_R_8F_E5M2) {
+        return 10.0f;
+    } else if constexpr (Type == CUPHY_R_16F || Type == CUPHY_C_16F) {
         return 1e-3;  // Looser tolerance for float16
     } else if constexpr (Type == CUPHY_R_32F || Type == CUPHY_C_32F) {
         return 1e-5;  // Standard tolerance for float32
@@ -244,6 +250,69 @@ constexpr double get_tolerance() {
         return 0.0;   // Exact comparison for integer types
     }
 }
+
+template <typename T>
+bool is_zero(T t)
+{
+    return t == 0;
+}
+template <>
+bool is_zero<__half>(__half t)
+{
+    return (__half2float(t) == 0.0f);
+}
+
+template <>
+bool is_zero<__nv_fp8_e4m3>(__nv_fp8_e4m3 t)
+{
+    return static_cast<float>(t) == 0.0f;
+}
+template <>
+bool is_zero<__nv_fp8_e5m2>(__nv_fp8_e5m2 t)
+{
+    return static_cast<float>(t) == 0.0f;
+}
+
+template <typename T>
+struct display_value
+{
+    T value_;
+    display_value(T t) : value_(t) {}
+    T value() const
+    {
+        return value_;
+    }
+};
+template <>
+struct display_value<__half>
+{
+    display_value(__half t) : value_(t) {}
+    float value() const
+    {
+        return __half2float(value_);
+    }
+    __half value_;
+};
+template <>
+struct display_value<__nv_fp8_e4m3>
+{
+    display_value(__nv_fp8_e4m3 t) : value_(t) {}
+    float value() const
+    {
+        return static_cast<float>(value_);
+    }
+    __nv_fp8_e4m3 value_;
+};
+template <>
+struct display_value<__nv_fp8_e5m2>
+{
+    display_value(__nv_fp8_e5m2 t) : value_(t) {}
+    float value() const
+    {
+        return static_cast<float>(value_);
+    }
+    __nv_fp8_e5m2 value_;
+};
 
 template <cuphyDataType_t TDst, cuphyDataType_t TSrc>
 void do_convert_test_types(int NUM_ROWS, int NUM_COLS) {
@@ -258,7 +327,7 @@ void do_convert_test_types(int NUM_ROWS, int NUM_COLS) {
     cuphy::rng rng;
     if constexpr (TSrc == CUPHY_BIT) {
         rng.uniform(tSrc, 0, 1);
-    } else if constexpr (TSrc == CUPHY_R_32F || TSrc == CUPHY_R_64F) {
+    } else if constexpr (TSrc == CUPHY_R_32F || TSrc == CUPHY_R_64F || TSrc == CUPHY_R_8F_E4M3 || TSrc == CUPHY_R_8F_E5M2) {
         rng.uniform(tSrc, -1.0f, 1.0f);
     } else {
         rng.uniform(tSrc, 0, 255);
@@ -281,15 +350,7 @@ void do_convert_test_types(int NUM_ROWS, int NUM_COLS) {
                     if(((i * 32) + k) < NUM_ROWS) {
                         // verification of conversion from BIT type
                         uint32_t convert_bit = (tDst(i, j) >> k) & 0x1;
-                        uint32_t expected_bit;
-
-                        if constexpr (TSrc == CUPHY_R_16F) {
-                            float src_val = __half2float(tSrc(i * 32 + k, j));
-                            expected_bit = (src_val == 0.0f) ? 0U : 1U;
-                        } else {
-                            expected_bit = (0 == tSrc(i * 32 + k, j)) ? 0U : 1U;
-                        }
-
+                        uint32_t expected_bit = is_zero(tSrc(i * 32 + k, j)) ? 0 : 1;
                         if (convert_bit != expected_bit) {
                             std::cout << "Debug info:" << std::endl
                                      << "  Word index: " << i << std::endl
@@ -297,19 +358,14 @@ void do_convert_test_types(int NUM_ROWS, int NUM_COLS) {
                                      << "  Bit index: " << k << std::endl
                                      << "  Row: " << (i * 32 + k) << std::endl
                                      << "  Word value: 0x" << std::hex << tDst(i, j) << std::dec << std::endl
-                                     << "  Source value: " << (TSrc == CUPHY_R_16F ?
-                                            __half2float(tSrc(i * 32 + k, j)) :
-                                            static_cast<double>(tSrc(i * 32 + k, j))) << std::endl;
+                                     << "  Source value: " << display_value{tSrc(i * 32 + k, j)}.value() << std::endl;
                         }
-
                         EXPECT_EQ(convert_bit, expected_bit)
                             << "ROW = " << (i * 32 + k)
                             << ", COL = " << j
                             << ", BIT = " << k
                             << ", WORD = " << std::hex << tDst(i, j) << std::dec
-                            << ", SRC = " << (TSrc == CUPHY_R_16F ?
-                                            __half2float(tSrc(i * 32 + k, j)) :
-                                            static_cast<double>(tSrc(i * 32 + k, j)));
+                            << ", SRC = " << display_value{tSrc(i * 32 + k, j)}.value();
                     }
                 }
             }
@@ -662,25 +718,89 @@ TEST(Convert, ToBitsset) {
     do_convert_test_types<CUPHY_BIT, CUPHY_R_32I>(32, 8);
     do_convert_test_types<CUPHY_BIT, CUPHY_R_32U>(32, 8);
     do_convert_test_types<CUPHY_BIT, CUPHY_R_64F>(32, 8);
+    do_convert_test_types<CUPHY_BIT, CUPHY_R_8F_E4M3>(1, 8);
+    do_convert_test_types<CUPHY_BIT, CUPHY_R_8F_E5M2>(32, 8);
     // do_convert_test_types<CUPHY_BIT, CUPHY_VOID>(32, 8);
+}
+
+template <cuphyDataType_t TType>
+void do_convert_signed_zeros_to_bits()
+{
+    using source_tensor_t = cuphy::typed_tensor<TType, cuphy::pinned_alloc>;
+    using bit_tensor_t    = cuphy::typed_tensor<CUPHY_BIT, cuphy::pinned_alloc>;
+
+    source_tensor_t tSrc(32, 8);
+    bit_tensor_t    tDst(32, 8, cuphy::tensor_flags::align_coalesce);
+
+    for(int i = 0; i < 32; ++i)
+    {
+        tSrc(i, 0) = static_cast<typename detail::real_type<TType>::type>(1.0f);
+    }
+    tSrc(0, 0) = static_cast<typename detail::real_type<TType>::type>(0.0f);
+    tSrc(1, 0) = static_cast<typename detail::real_type<TType>::type>(-0.0f);
+
+    CUstream stream = nullptr;
+    ASSERT_EQ(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING), CUDA_SUCCESS);
+    cuphy::tensor_convert(tDst, tSrc, stream);
+    const CUresult sync_status    = cuStreamSynchronize(stream);
+    const CUresult destroy_status = cuStreamDestroy(stream);
+    ASSERT_EQ(sync_status, CUDA_SUCCESS);
+    ASSERT_EQ(destroy_status, CUDA_SUCCESS);
+
+    EXPECT_EQ(tDst(0, 0) & 0x3U, 0U);
+    EXPECT_EQ((tDst(0, 0) >> 2U) & 0x1U, 1U);
+}
+
+TEST(Convert, FloatingPointSignedZerosConvertToZeroBits)
+{
+    do_convert_signed_zeros_to_bits<CUPHY_R_16F>();
+    do_convert_signed_zeros_to_bits<CUPHY_R_32F>();
+    do_convert_signed_zeros_to_bits<CUPHY_R_64F>();
+    do_convert_signed_zeros_to_bits<CUPHY_R_8F_E4M3>();
+    do_convert_signed_zeros_to_bits<CUPHY_R_8F_E5M2>();
+}
+
+TEST(Convert, FloatingPointSignedZerosConvertToZeroVariants)
+{
+    auto expect_zero_bit = [](cuphyVariant_t value) {
+        ASSERT_EQ(cuphyConvertVariant(&value, CUPHY_BIT), CUPHY_STATUS_SUCCESS);
+        EXPECT_EQ(value.value.b1, 0U);
+    };
+
+    cuphyVariant_t half_value{};
+    half_value.type       = CUPHY_R_16F;
+    half_value.value.r16f = static_cast<__half_raw>(__float2half(-0.0f));
+    expect_zero_bit(half_value);
+
+    cuphyVariant_t e4m3_value{};
+    e4m3_value.type            = CUPHY_R_8F_E4M3;
+    e4m3_value.value.r8f_e4m3 = static_cast<__nv_fp8_e4m3>(-0.0f);
+    expect_zero_bit(e4m3_value);
+
+    cuphyVariant_t e5m2_value{};
+    e5m2_value.type            = CUPHY_R_8F_E5M2;
+    e5m2_value.value.r8f_e5m2 = static_cast<__nv_fp8_e5m2>(-0.0f);
+    expect_zero_bit(e5m2_value);
 }
 
 // Test all conversions from CUPHY_BIT
 TEST(Convert, FromBits) {
-    do_convert_test_types<CUPHY_R_8I, CUPHY_BIT>(32, 8);
-    do_convert_test_types<CUPHY_R_8U, CUPHY_BIT>(32, 8);
-    do_convert_test_types<CUPHY_R_16I, CUPHY_BIT>(32, 8);
-    do_convert_test_types<CUPHY_R_16U, CUPHY_BIT>(32, 8);
-    do_convert_test_types<CUPHY_R_16F, CUPHY_BIT>(32, 8);
-    do_convert_test_types<CUPHY_R_32I, CUPHY_BIT>(32, 8);
-    do_convert_test_types<CUPHY_R_32U, CUPHY_BIT>(32, 8);
-    do_convert_test_types<CUPHY_R_32F, CUPHY_BIT>(32, 8);
-    do_convert_test_types<CUPHY_R_64F, CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_8I,      CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_8U,      CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_16I,     CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_16U,     CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_16F,     CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_32I,     CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_32U,     CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_32F,     CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_64F,     CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_8F_E4M3, CUPHY_BIT>(32, 8);
+    do_convert_test_types<CUPHY_R_8F_E5M2, CUPHY_BIT>(32, 8);
 }
 
 // Test real number conversions
 TEST(Convert, RealNumbers) {
-// 8-bit integer conversions
+    // 8-bit integer conversions
     do_convert_test_types<CUPHY_R_8I, CUPHY_R_8I>(32, 8);
     do_convert_test_types<CUPHY_R_8I, CUPHY_R_8I>(128, 64);  // Additional test with larger dimensions
     do_convert_test_types<CUPHY_R_8U, CUPHY_R_8U>(32, 8);
@@ -694,6 +814,10 @@ TEST(Convert, RealNumbers) {
     do_convert_test_types<CUPHY_R_16U, CUPHY_R_8U>(32, 8);   // 8-bit to 16-bit unsigned
     do_convert_test_types<CUPHY_R_16U, CUPHY_R_16U>(32, 8);
     do_convert_test_types<CUPHY_R_16U, CUPHY_R_16U>(32, 16);
+
+    // 8-bit floating point conversions
+    do_convert_test_types<CUPHY_R_8F_E4M3, CUPHY_R_16F>(1, 8);
+    do_convert_test_types<CUPHY_R_8F_E5M2, CUPHY_R_16F>(1, 8);
 
     // 16-bit floating point conversions
     do_convert_test_types<CUPHY_R_16F, CUPHY_R_16F>(32, 8);
@@ -714,10 +838,12 @@ TEST(Convert, RealNumbers) {
     do_convert_test_types<CUPHY_R_32U, CUPHY_R_32U>(32, 16);
 
     // 32-bit floating point conversions
-    do_convert_test_types<CUPHY_R_32F, CUPHY_R_16F>(32, 8);  // 16-bit to 32-bit float
-    do_convert_test_types<CUPHY_R_32F, CUPHY_R_16F>(64, 64); // Additional test with different dimensions
+    do_convert_test_types<CUPHY_R_32F, CUPHY_R_16F>(32, 8);      // 16-bit to 32-bit float
+    do_convert_test_types<CUPHY_R_32F, CUPHY_R_16F>(64, 64);     // Additional test with different dimensions
     do_convert_test_types<CUPHY_R_32F, CUPHY_R_32F>(32, 8);
-    do_convert_test_types<CUPHY_R_32F, CUPHY_R_64F>(16, 16); // 64-bit to 32-bit float
+    do_convert_test_types<CUPHY_R_32F, CUPHY_R_64F>(16, 16);     // 64-bit to 32-bit float
+    do_convert_test_types<CUPHY_R_32F, CUPHY_R_8F_E4M3>(16, 16); // fp8 to 32-bit float
+    do_convert_test_types<CUPHY_R_32F, CUPHY_R_8F_E5M2>(64, 64); // fp8 to 32-bit float
 
     // 64-bit floating point conversions
     do_convert_test_types<CUPHY_R_64F, CUPHY_R_16F>(16, 16); // 16-bit to 64-bit float
@@ -728,7 +854,7 @@ TEST(Convert, RealNumbers) {
 
 // Test complex number conversions
 TEST(Convert, ComplexNumbers) {
-// 8-bit complex conversions
+    // 8-bit complex conversions
     do_convert_test_complex<CUPHY_C_8I, CUPHY_C_8I>(32, 8);
     do_convert_test_complex<CUPHY_C_8U, CUPHY_C_8U>(32, 8);
     do_convert_test_complex<CUPHY_C_8I, CUPHY_C_8I>(128, 64);  // Additional test with larger dimensions

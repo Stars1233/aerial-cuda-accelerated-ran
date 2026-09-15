@@ -8,7 +8,7 @@ The `testBenches` directory contains various testing and benchmarking tools for 
 testBenches/
 ├── cubb_gpu_test_bench/     # GPU-only performance testbench
 ├── perf/                    # Python helper scripts for cubb_gpu_test_bench
-├── chanModels/              # 3GPP 38.901 channel model
+├── gpu3GPPChan/              # 3GPP 38.901 channel model
 └── phase4_test_scripts/     # cuBB test (CPU+GPU) automation scripts
 ```
 
@@ -16,7 +16,7 @@ testBenches/
 
 - **cubb_gpu_test_bench**: GPU-only performance testbench for measuring channel latencies, cell capacity, and GPU memory/power; simplified from the comprehensive cuBB testbench
 - **perf**: Python helper scripts for `cubb_gpu_test_bench` to generate configurations, run tests, and visualize results
-- **chanModels**: 3GPP 38.901 channel model library including link-level (TDL/CDL) and system-level (UMa/UMi/RMa) models
+- **gpu3gppchan**: 3GPP 38.901 channel model library including link-level (TDL/CDL) and system-level (UMa/UMi/RMa) models
 - **phase4_test_scripts**: Automated scripts for running end-to-end cuBB tests (also called Phase-4 tests in existing documents; see [phase4_test_scripts/README.md](phase4_test_scripts/README.md))
 
 ---
@@ -220,43 +220,43 @@ For debugging, add `--test` to your `measure.py` command. The script then only p
 
 # Channel Models
 
-The `chanModels` directory contains 3GPP 38.901 channel model implementations for wireless propagation simulation, including link-level (TDL/CDL) and system-level (UMa/UMi/RMa) models. It provides a library and unit test examples. These channel models are used by cuPHY and cuMAC for simulation.
+The `gpu3GPPChan` directory contains 3GPP 38.901 channel model implementations for wireless propagation simulation, including link-level (TDL/CDL) and system-level (UMa/UMi/RMa) models. It provides a library and unit test examples. These channel models are used by cuPHY and cuMAC for simulation.
 
 ## Channel Model Types
 
 ### System Level Channel Model
-- **Location**: `chanModels/src/sls_chan_src/`
+- **Location**: `gpu3GPPChan/src/sls_chan_src/`
 - **Functionality**: 3GPP TR 38.901 statistical channel model implementation
   - Supports UMa, UMi, and RMa
   - Supports ISAC UAV sensing targets (CPU-only)
   - For UMa/UMi/RMa, GPU-accelerated computation with CUDA kernels and a CPU-only mode if GPU is not available
   - Configurable via YAML files
-- **Example**: `chanModels/examples/sls_chan/` - Demo application with H5 output support
+- **Example**: `gpu3GPPChan/examples/sls_chan/` - Demo application with H5 output support
 - Currently, only 6 GHz - UMa, 6 GHz - UMa-AV monostatic sensing are calibrated with 3GPP reference curves. Calibration of other scenarios will be added later
 
 ### Link Level Channel Model
 #### Tapped Delay Line (TDL) Channel Model
-- **Location**: `chanModels/src/tdl_chan_src/`
+- **Location**: `gpu3GPPChan/src/tdl_chan_src/`
 - **Functionality**: 3GPP TDL channel model (TDL-A, TDL-B, TDL-C profiles)
   - Simplified delay profile models for link-level simulation
   - Fast fading with configurable Doppler effects
-- **Example**: `chanModels/examples/tdl_chan/`
+- **Example**: `gpu3GPPChan/examples/tdl_chan/`
 - Calibrated with MATLAB 5G toolbox and our own implementation inside `<aerial_sdk>/5GModel/nr_matlab/channel/genTDL.m`
 
 #### Clustered Delay Line (CDL) Channel Model
-- **Location**: `chanModels/src/cdl_chan_src/`
+- **Location**: `gpu3GPPChan/src/cdl_chan_src/`
 - **Functionality**: 3GPP CDL channel model (CDL-A through CDL-E profiles)
   - Cluster-based multipath propagation
   - Support for both LOS and NLOS scenarios
-- **Example**: `chanModels/examples/cdl_chan/`
+- **Example**: `gpu3GPPChan/examples/cdl_chan/`
 - Calibrated with MATLAB 5G toolbox and our own implementation inside `<aerial_sdk>/5GModel/nr_matlab/channel/genCDL.m`
 
 ## Additional Components
 
-- **OFDM Modulator/Demodulator**: `chanModels/src/ofdm_src/` - OFDM Time-frequency domain conversion
-- **Gaussian Noise Adder**: `chanModels/src/gauNoiseAdder.*` - AWGN channel implementation
-- **Fading Channel**: `chanModels/src/fading_chan.*` - Generic fading channel implementation that includes OFDM modulation + fast fading + add noise + OFDM demodulation
-- **Analysis Tools**: `chanModels/util/` - Python scripts for channel statistics analysis and visualization with H5 dumped from `sls_chan_ex`
+- **OFDM Modulator/Demodulator**: `gpu3GPPChan/src/ofdm_src/` - OFDM Time-frequency domain conversion
+- **Gaussian Noise Adder**: `gpu3GPPChan/src/gauNoiseAdder.*` - AWGN channel implementation
+- **Fading Channel**: `gpu3GPPChan/src/fading_chan.*` - Generic fading channel implementation that includes OFDM modulation + fast fading + add noise + OFDM demodulation
+- **Analysis Tools**: `gpu3GPPChan/util/` - Python scripts for channel statistics analysis and visualization with H5 dumped from `sls_chan_ex`
 
 ## Building and Running Channel Model Examples
 

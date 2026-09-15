@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -193,22 +193,6 @@ inline void throw_fh_func(int err_code, const std::string& what, const char* fil
 
 #define STR_(x) #x          //!< Stringize helper macro
 #define STR(x) STR_(x)      //!< Stringize macro (converts x to string literal)
-
-/**
- * Check CUDA call and throw exception on error
- *
- * Wraps CUDA API calls and converts errors to FronthaulException.
- * Includes CUDA error code, name, and description in exception message.
- */
-#define CHECK_CUDA_THROW(expr)                                                                                                                                                        \
-    do                                                                                                                                                                                \
-    {                                                                                                                                                                                 \
-        cudaError_t err = (expr);                                                                                                                                                     \
-        if(err != cudaSuccess)                                                                                                                                                        \
-        {                                                                                                                                                                             \
-            THROW_FH(EIO, StringBuilder() << "CUDA call failed with " << err << "(" << cudaGetErrorName(err) << "):" << cudaGetErrorString(err) << ". Failed CUDA call: " STR(expr)); \
-        }                                                                                                                                                                             \
-    } while(0)
 
 typedef std::unique_ptr<void, decltype(&free)> UniquePtr;  //!< Unique pointer with free() deleter
 

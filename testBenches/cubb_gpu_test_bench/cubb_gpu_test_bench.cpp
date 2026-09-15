@@ -28,11 +28,19 @@ typedef std::vector<std::vector<std::vector<std::string>>> string3Dvec_t;
 // Global start-delay config (defaults from testbench_common.hpp; overridden from vectors YAML if provided).
 start_delay_cfg_us g_start_delay_cfg_us;
 
+// When true, PUCCH2 cascades after PUCCH1 completion (set via -A CLI flag).
+bool g_pucchCascaded = false;
+
 // Global TV parameter override config (optional; overridden from vectors YAML if provided).
 tv_override_cfg g_tv_override_cfg;
 
+// Path to a chest_trt YAML enabling the TensorRT PUSCH channel estimator (set via --E).
+// Separate from g_tv_override_cfg so TRT is independent of override_test_vectors.
+std::string g_pusch_trt_chest_config;
+
 static std::optional<int64_t> parse_i64_loose(const yaml::node& n);
 static std::optional<ul_anchor_mode_t> parse_ul_anchor_mode(const yaml::node& n);
+static std::optional<dl_anchor_mode_t> parse_dl_anchor_mode(const yaml::node& n);
 
 /** Read optional cumac_options from YAML (root["cumac_options"] or root["config"]["cumac_options"]). Leaves out unchanged on absence. */
 static void apply_cumac_options_from_yaml(const yaml::node& root, CumacOptions& out)
@@ -85,6 +93,72 @@ static void apply_cumac_options_from_yaml(const yaml::node& root, CumacOptions& 
         try { out.half_precision = static_cast<uint8_t>(co["half_precision"].template as<int>()); } catch(...) {}
         try { out.sch_alg = static_cast<uint8_t>(co["sch_alg"].template as<int>()); } catch(...) {}
         try { out.hetero_ue_sel_cells = static_cast<uint8_t>(co["hetero_ue_sel_cells"].template as<int>()); } catch(...) {}
+
+        // AI-RAN trtEngine inference options (cumac_options.airan.*). Selecting
+        // airan.infer=1 makes the cuMAC worker run model inference instead of the
+        // scheduler kernels (requires -DENABLE_CUMAC_AIRAN=ON).
+        try {
+            if(co.has_key("airan")) {
+                yaml::node ar = co["airan"];
+                if(ar.has_key("infer")) {
+                    const int infer = ar["infer"].template as<int>();
+                    if(infer != 0 && infer != 1) {
+                        NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                            "ERROR: cumac_options.airan.infer must be 0 or 1 (got {})", infer);
+                        exit(1);
+                    }
+                    out.airan_infer = static_cast<uint8_t>(infer);
+                }
+                if(ar.has_key("model_path")) {
+                    out.airan_model_path = ar["model_path"].template as<std::string>();
+                }
+                if(ar.has_key("input_name")) {
+                    out.airan_input_name = ar["input_name"].template as<std::string>();
+                }
+                if(ar.has_key("output_name")) {
+                    out.airan_output_name = ar["output_name"].template as<std::string>();
+                }
+                if(ar.has_key("obs_dim")) {
+                    out.airan_obs_dim = ar["obs_dim"].template as<int>();
+                }
+                if(ar.has_key("action_dim")) {
+                    out.airan_action_dim = ar["action_dim"].template as<int>();
+                }
+                if(ar.has_key("batch_size")) {
+                    out.airan_batch_size = ar["batch_size"].template as<int>();
+                }
+                if(ar.has_key("max_batch_size")) {
+                    out.airan_max_batch_size = ar["max_batch_size"].template as<int>();
+                }
+                if(ar.has_key("use_cuda_graph")) {
+                    const int useCudaGraph = ar["use_cuda_graph"].template as<int>();
+                    if(useCudaGraph != 0 && useCudaGraph != 1) {
+                        NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                            "ERROR: cumac_options.airan.use_cuda_graph must be 0 or 1 (got {})",
+                            useCudaGraph);
+                        exit(1);
+                    }
+                    out.airan_use_cuda_graph = static_cast<uint8_t>(useCudaGraph);
+                }
+                if(ar.has_key("builder_opt_level")) {
+                    out.airan_builder_opt_level = ar["builder_opt_level"].template as<int>();
+                }
+                if(out.airan_infer != 0 &&
+                   (out.airan_model_path.empty() || out.airan_obs_dim <= 0 ||
+                    out.airan_action_dim <= 0 || out.airan_batch_size <= 0 ||
+                    out.airan_max_batch_size <= 0 ||
+                    out.airan_batch_size > out.airan_max_batch_size)) {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                        "ERROR: Invalid cumac_options.airan config when infer=1 "
+                        "(model_path/dims/batch sizes)");
+                    exit(1);
+                }
+            }
+        } catch(...) {
+            NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                "ERROR: Failed to parse cumac_options.airan; check all value types");
+            exit(1);
+        }
     };
     try
     {
@@ -99,6 +173,65 @@ static void apply_cumac_options_from_yaml(const yaml::node& root, CumacOptions& 
     }
     catch(...)
     {}
+}
+
+/** Parse optional green_context_sm_alloc from YAML.
+ *  Returns a map of channel name -> (split_start, sm_count).
+ *  These are green context split *parameters*, NOT SM IDs: split_start is the SM split offset at which
+ *  the channel's split begins, and sm_count is the number of SMs requested for it. The CUDA driver is
+ *  responsible for assigning SMs to green context(s) based on splits. Channels may overlap to control
+ *  oversubscription; users should verify the actual green context resource allocation (SM count,
+ *  potential overlap across GCs) via a tool like Nsight Systems is as expected.
+ *  Empty map means the section was absent; caller should fall back to heuristic. */
+static std::unordered_map<std::string, std::pair<int,int>>
+parse_green_context_sm_alloc_from_yaml(const yaml::node& root)
+{
+    std::unordered_map<std::string, std::pair<int,int>> result;
+
+    auto parse_channels = [&](const yaml::node& gcNode) {
+        const char* channels[] = {"PUSCH", "PUCCH", "PRACH", "PDSCH", "PDCCH", "SSB", "SRS", "MAC", "MAC2"};
+        for(auto ch : channels)
+        {
+            if(!gcNode.has_key(ch))
+                continue;
+            try
+            {
+                auto chNode = gcNode[ch];
+                if(chNode.type() != YAML_SEQUENCE_NODE)
+                {
+                    NVLOGE_FMT(NVLOG_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                        "green_context_sm_alloc: {} must be a sequence of [start, count]", ch);
+                    continue;
+                }
+                if(chNode.length() < 2)
+                {
+                    NVLOGE_FMT(NVLOG_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                        "green_context_sm_alloc: {} must have [start, count], got {} entries",
+                        ch, chNode.length());
+                    continue;
+                }
+                int start = chNode[0].as<int>();
+                int count = chNode[1].as<int>();
+                result[ch] = {start, count};
+            }
+            catch(const std::exception& e)
+            {
+                NVLOGE_FMT(NVLOG_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                    "green_context_sm_alloc: failed to parse [start, count] for {}: {}", ch, e.what());
+            }
+        }
+    };
+
+    try
+    {
+        if(root.has_key("green_context_sm_alloc"))
+            parse_channels(root["green_context_sm_alloc"]);
+        else if(root.has_key("config") && root["config"].has_key("green_context_sm_alloc"))
+            parse_channels(root["config"]["green_context_sm_alloc"]);
+    }
+    catch(...)
+    {}
+    return result;
 }
 
 static void apply_start_delay_overrides_from_yaml(const yaml::node& root)
@@ -126,6 +259,7 @@ static void apply_start_delay_overrides_from_yaml(const yaml::node& root)
             {}
         };
         auto set_ul_anchor = [&](const char* k, ul_anchor_mode_t& dst) {
+            if(!sd.has_key(k)) { return; } // key absent — silent, expected
             try
             {
                 auto opt = parse_ul_anchor_mode(sd[k]);
@@ -134,9 +268,41 @@ static void apply_start_delay_overrides_from_yaml(const yaml::node& root)
                     dst = *opt;
                     g_start_delay_cfg_us.ul_anchor_from_yaml = true;
                 }
+                else
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                        "[START-DELAY] invalid UL anchor for key '{}' (expected PUSCH, PRACH, or PUCCH); ignoring",
+                        k);
+                }
             }
             catch(...)
-            {}
+            {
+                NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                    "[START-DELAY] exception parsing UL anchor for key '{}'; ignoring", k);
+            }
+        };
+        auto set_dl_anchor = [&](const char* k, dl_anchor_mode_t& dst) {
+            if(!sd.has_key(k)) { return; } // key absent — silent, expected
+            try
+            {
+                auto opt = parse_dl_anchor_mode(sd[k]);
+                if(opt.has_value())
+                {
+                    dst = *opt;
+                    g_start_delay_cfg_us.dl_anchor_from_yaml = true;
+                }
+                else
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                        "[START-DELAY] invalid DL anchor for key '{}' (expected PDSCH or SLOT_BOUNDARY); ignoring",
+                        k);
+                }
+            }
+            catch(...)
+            {
+                NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                    "[START-DELAY] exception parsing DL anchor for key '{}'; ignoring", k);
+            }
         };
 
         // Generic keys (apply to both u5/u6 where applicable)
@@ -145,8 +311,9 @@ static void apply_start_delay_overrides_from_yaml(const yaml::node& root)
         set_u32("SRS2", g_start_delay_cfg_us.srs2_u5);
         g_start_delay_cfg_us.srs2_u6 = g_start_delay_cfg_us.srs2_u5;
         set_ul_anchor("UL_ANCHOR", g_start_delay_cfg_us.ul_anchor_mode);
+        set_dl_anchor("DL_ANCHOR", g_start_delay_cfg_us.dl_anchor_mode);
 
-        // Keys matching phase3_test_config.yaml conventions
+        // Keys matching cubb_gpu_test_config.yaml conventions
         set_i32("PUSCH1", g_start_delay_cfg_us.pusch_u5);
         g_start_delay_cfg_us.pusch_u6 = g_start_delay_cfg_us.pusch_u5;
         set_u32("PUCCH1", g_start_delay_cfg_us.pucch_u5);
@@ -229,15 +396,50 @@ static std::optional<int64_t> parse_i64_loose(const yaml::node& n)
     }
 }
 
-static std::optional<ul_anchor_mode_t> parse_ul_anchor_mode(const yaml::node& n)
+/**
+ * Key-aware overload that safely looks up and parses a mapping entry.
+ *
+ * yaml::node::operator[] throws on a missing key, so callers must not write
+ * parse_i64_loose(parent[key]) inline inside a shared try block - one missing
+ * key would abort every sibling override that follows. This overload localizes
+ * that throw so a missing key only affects its own value.
+ *
+ * @param[in] parent Mapping YAML node to look @p key up in.
+ * @param[in] key    Scalar key to read and parse from @p parent.
+ * @return The parsed value on success; std::nullopt on a missing key or parse
+ *         failure.
+ */
+static std::optional<int64_t> parse_i64_loose(const yaml::node& parent, const char* key)
+{
+    try
+    {
+        return parse_i64_loose(parent[key]);
+    }
+    catch(...)
+    {
+        return std::nullopt;
+    }
+}
+
+/**
+ * Normalizes a YAML scalar to an upper-cased, whitespace-trimmed string.
+ *
+ * Shared by `parse_ul_anchor_mode` + `parse_dl_anchor_mode` so the rule lives
+ * in one place.
+ *
+ * @param[in] n  YAML node expected to hold a scalar string.
+ * @return The trimmed, upper-cased string, or `std::nullopt` if @p n is not a
+ *         string or if the trimmed value is empty.
+ */
+static std::optional<std::string> yaml_to_upper_trimmed(const yaml::node& n)
 {
     try
     {
         std::string s = const_cast<yaml::node&>(n).as<std::string>();
-        for(size_t idx = 0; idx < s.size(); ++idx)
+        for(char& c : s)
         {
-            if(s[idx] >= 'a' && s[idx] <= 'z')
-                s[idx] = static_cast<char>(s[idx] - 'a' + 'A');
+            if(c >= 'a' && c <= 'z')
+                c = static_cast<char>(c - 'a' + 'A');
         }
         size_t start = 0;
         while(start < s.size() && (s[start] == ' ' || s[start] == '\t'))
@@ -247,17 +449,59 @@ static std::optional<ul_anchor_mode_t> parse_ul_anchor_mode(const yaml::node& n)
             --end;
         if(start >= end)
             return std::nullopt;
-
-        std::string mode = s.substr(start, end - start);
-        if(mode == "PUSCH")
-            return ul_anchor_mode_t::PUSCH;
-        if(mode == "PRACH")
-            return ul_anchor_mode_t::PRACH;
-        if(mode == "PUCCH")
-            return ul_anchor_mode_t::PUCCH;
+        return s.substr(start, end - start);
     }
     catch(...)
-    {}
+    {
+        return std::nullopt;
+    }
+}
+
+/**
+ * Parses a YAML scalar into a `ul_anchor_mode_t`.
+ *
+ * Accepted values (case-insensitive, whitespace-trimmed): `PUSCH`, `PRACH`,
+ * `PUCCH`. Anything else (including an absent / non-string node) returns
+ * `std::nullopt`.
+ *
+ * @param[in] n  YAML node holding the anchor mode.
+ * @return The parsed enum value, or `std::nullopt` on parse failure or unknown
+ *         string.
+ */
+static std::optional<ul_anchor_mode_t> parse_ul_anchor_mode(const yaml::node& n)
+{
+    auto s = yaml_to_upper_trimmed(n);
+    if(!s)
+        return std::nullopt;
+    if(*s == "PUSCH")
+        return ul_anchor_mode_t::PUSCH;
+    if(*s == "PRACH")
+        return ul_anchor_mode_t::PRACH;
+    if(*s == "PUCCH")
+        return ul_anchor_mode_t::PUCCH;
+    return std::nullopt;
+}
+
+/**
+ * Parses a YAML scalar into a `dl_anchor_mode_t`.
+ *
+ * Accepted values (case-insensitive, whitespace-trimmed): `PDSCH`,
+ * `SLOT_BOUNDARY`. Anything else (including an absent /
+ * non-string node) returns `std::nullopt`.
+ *
+ * @param[in] n  YAML node holding the anchor mode.
+ * @return The parsed enum value, or `std::nullopt` on parse failure or unknown
+ *         string.
+ */
+static std::optional<dl_anchor_mode_t> parse_dl_anchor_mode(const yaml::node& n)
+{
+    auto s = yaml_to_upper_trimmed(n);
+    if(!s)
+        return std::nullopt;
+    if(*s == "PDSCH")
+        return dl_anchor_mode_t::PDSCH;
+    if(*s == "SLOT_BOUNDARY")
+        return dl_anchor_mode_t::SLOT_BOUNDARY;
     return std::nullopt;
 }
 
@@ -279,33 +523,51 @@ static void print_tv_overrides_config()
     auto print_u32 = [](const char* chan, const char* key, bool has, uint32_t v) {
         if(has) NVLOGI_FMT(NVLOG_TESTBENCH_PHY, "[TV-OVERRIDE][{}] {}={}", chan, key, static_cast<unsigned int>(v));
     };
+    auto print_i32 = [](const char* chan, const char* key, bool has, int32_t v) {
+        if(has) NVLOGI_FMT(NVLOG_TESTBENCH_PHY, "[TV-OVERRIDE][{}] {}={}", chan, key, v);
+    };
 
-    const auto& po = g_tv_override_cfg.pusch;
-    print_u8("PUSCH", "list_length", po.has_polar_list_length, po.polar_list_length);
-    print_u8("PUSCH", "enable_cfo_correction", po.has_enable_cfo_correction, po.enable_cfo_correction);
-    print_u8("PUSCH", "enable_weighted_average_cfo", po.has_enable_weighted_average_cfo, po.enable_weighted_average_cfo);
-    print_u8("PUSCH", "enable_to_estimation", po.has_enable_to_estimation, po.enable_to_estimation);
-    print_u8("PUSCH", "tdi_mode", po.has_tdi_mode, po.tdi_mode);
-    print_u8("PUSCH", "enable_dft_sofdm", po.has_enable_dft_sofdm, po.enable_dft_sofdm);
-    print_u8("PUSCH", "enable_rssi_measurement", po.has_enable_rssi_measurement, po.enable_rssi_measurement);
-    print_u8("PUSCH", "enable_sinr_measurement", po.has_enable_sinr_measurement, po.enable_sinr_measurement);
-    print_u8("PUSCH", "enable_static_dynamic_beamforming", po.has_enable_static_dynamic_beamforming, po.enable_static_dynamic_beamforming);
-    print_u8("PUSCH", "enable_early_harq", po.has_enable_early_harq, po.enable_early_harq);
-    print_u8("PUSCH", "ldpc_early_termination", po.has_ldpc_early_termination, po.ldpc_early_termination);
-    print_u16("PUSCH", "ldpc_algorithm_index", po.has_ldpc_algorithm_index, po.ldpc_algorithm_index);
-    print_u32("PUSCH", "ldpc_flags", po.has_ldpc_flags, po.ldpc_flags);
-    print_u8("PUSCH", "ldpc_use_half", po.has_ldpc_use_half, po.ldpc_use_half);
-    print_u8("PUSCH", "ldpc_max_num_iterations", po.has_ldpc_max_num_iterations, po.ldpc_max_num_iterations);
-    print_u8("PUSCH", "ldpc_max_num_iterations_algorithm_index", po.has_ldpc_max_num_iterations_algorithm_index, po.ldpc_max_num_iterations_algorithm_index);
-    print_u8("PUSCH", "dmrs_channel_estimation_algorithm_index", po.has_dmrs_channel_estimation_algorithm_index, po.dmrs_channel_estimation_algorithm_index);
-    print_u8("PUSCH", "enable_per_prg_channel_estimation", po.has_enable_per_prg_channel_estimation, po.enable_per_prg_channel_estimation);
-    print_u8("PUSCH", "eq_coefficient_algorithm_index", po.has_eq_coefficient_algorithm_index, po.eq_coefficient_algorithm_index);
+    const auto& puscho = g_tv_override_cfg.pusch;
+    print_u8("PUSCH", "list_length", puscho.has_polar_list_length, puscho.polar_list_length);
+    print_u8("PUSCH", "enable_cfo_correction", puscho.has_enable_cfo_correction, puscho.enable_cfo_correction);
+    print_u8("PUSCH", "enable_weighted_average_cfo", puscho.has_enable_weighted_average_cfo, puscho.enable_weighted_average_cfo);
+    print_u8("PUSCH", "enable_to_estimation", puscho.has_enable_to_estimation, puscho.enable_to_estimation);
+    print_u8("PUSCH", "tdi_mode", puscho.has_tdi_mode, puscho.tdi_mode);
+    print_u8("PUSCH", "enable_dft_sofdm", puscho.has_enable_dft_sofdm, puscho.enable_dft_sofdm);
+    print_u8("PUSCH", "enable_rssi_measurement", puscho.has_enable_rssi_measurement, puscho.enable_rssi_measurement);
+    print_u8("PUSCH", "enable_sinr_measurement", puscho.has_enable_sinr_measurement, puscho.enable_sinr_measurement);
+    print_u8("PUSCH", "enable_static_dynamic_beamforming", puscho.has_enable_static_dynamic_beamforming, puscho.enable_static_dynamic_beamforming);
+    print_u8("PUSCH", "enable_early_harq", puscho.has_enable_early_harq, puscho.enable_early_harq);
+    print_u8("PUSCH", "ldpc_early_termination", puscho.has_ldpc_early_termination, puscho.ldpc_early_termination);
+    print_u16("PUSCH", "ldpc_algorithm_index", puscho.has_ldpc_algorithm_index, puscho.ldpc_algorithm_index);
+    print_u32("PUSCH", "ldpc_flags", puscho.has_ldpc_flags, puscho.ldpc_flags);
+    print_u8("PUSCH", "ldpc_use_half", puscho.has_ldpc_use_half, puscho.ldpc_use_half);
+    print_u8("PUSCH", "ldpc_max_num_iterations", puscho.has_ldpc_max_num_iterations, puscho.ldpc_max_num_iterations);
+    print_u8("PUSCH", "ldpc_max_num_iterations_algorithm_index", puscho.has_ldpc_max_num_iterations_algorithm_index, puscho.ldpc_max_num_iterations_algorithm_index);
+    print_u8("PUSCH", "dmrs_channel_estimation_algorithm_index", puscho.has_dmrs_channel_estimation_algorithm_index, puscho.dmrs_channel_estimation_algorithm_index);
+    print_u8("PUSCH", "enable_per_prg_channel_estimation", puscho.has_enable_per_prg_channel_estimation, puscho.enable_per_prg_channel_estimation);
+    print_u8("PUSCH", "eq_coefficient_algorithm_index", puscho.has_eq_coefficient_algorithm_index, puscho.eq_coefficient_algorithm_index);
+    print_u8("PUSCH", "open_ran_functional_split", puscho.has_open_ran_functional_split, puscho.open_ran_functional_split);
+    print_u8("PUSCH", "kernel_sel_option", puscho.has_kernel_sel_option, puscho.kernel_sel_option);
+    print_u8("PUSCH", "uci_kernel_sel_option", puscho.has_uci_kernel_sel_option, puscho.uci_kernel_sel_option);
+    print_u32("PUSCH", "delay_us", puscho.has_delay_us, puscho.delay_us);
+    print_u32("PUSCH", "sub_slot_delay_us", puscho.has_sub_slot_delay_us, puscho.sub_slot_delay_us);
 
-    const auto& co = g_tv_override_cfg.pucch;
-    print_u8("PUCCH", "list_length", co.has_polar_list_length, co.polar_list_length);
+    const auto& puccho = g_tv_override_cfg.pucch;
+    print_u8("PUCCH", "list_length", puccho.has_polar_list_length, puccho.polar_list_length);
+    print_i32("PUCCH", "pipeline_processing_mode", puccho.has_pipeline_processing_mode, puccho.pipeline_processing_mode);
+    print_i32("PUCCH", "delay_us", puccho.has_delay_us, puccho.delay_us);
 
-    const auto& so = g_tv_override_cfg.srs;
-    print_u8("SRS", "chEst_alg_selector", so.has_chest_alg_index, so.chest_alg_index);
+    const auto& srso = g_tv_override_cfg.srs;
+    print_u8("SRS", "chEst_alg_selector", srso.has_chest_alg_index, srso.chest_alg_index);
+
+    const auto& pdccho = g_tv_override_cfg.pdcch;
+    print_u8("PDCCH", "kernel_sel_option", pdccho.has_kernel_sel_option, pdccho.kernel_sel_option);
+    print_u32("PDCCH", "delay_us", pdccho.has_delay_us, pdccho.delay_us);
+
+    const auto& pdscho = g_tv_override_cfg.pdsch;
+    print_u8("PDSCH", "pipeline_processing_mode", pdscho.has_pipeline_processing_mode, pdscho.pipeline_processing_mode);
+    print_u32("PDSCH", "delay_us", pdscho.has_delay_us, pdscho.delay_us);
 }
 
 template<typename T>
@@ -380,6 +642,25 @@ static void apply_tv_overrides_from_yaml(const yaml::node& root)
             read_uint<uint8_t>(p, "dmrs_channel_estimation_algorithm_index", g_tv_override_cfg.pusch.has_dmrs_channel_estimation_algorithm_index, g_tv_override_cfg.pusch.dmrs_channel_estimation_algorithm_index);
             read_uint<uint8_t>(p, "enable_per_prg_channel_estimation", g_tv_override_cfg.pusch.has_enable_per_prg_channel_estimation, g_tv_override_cfg.pusch.enable_per_prg_channel_estimation);
             read_uint<uint8_t>(p, "eq_coefficient_algorithm_index", g_tv_override_cfg.pusch.has_eq_coefficient_algorithm_index, g_tv_override_cfg.pusch.eq_coefficient_algorithm_index);
+            read_uint<uint8_t>(p, "open_ran_functional_split", g_tv_override_cfg.pusch.has_open_ran_functional_split, g_tv_override_cfg.pusch.open_ran_functional_split);
+            read_uint<uint8_t>(p, "kernel_sel_option", g_tv_override_cfg.pusch.has_kernel_sel_option, g_tv_override_cfg.pusch.kernel_sel_option);
+            read_uint<uint8_t>(p, "uci_kernel_sel_option", g_tv_override_cfg.pusch.has_uci_kernel_sel_option, g_tv_override_cfg.pusch.uci_kernel_sel_option);
+            {
+                auto opt = parse_i64_loose(p, "delay_us");
+                if(opt.has_value() && *opt >= 0)
+                {
+                    g_tv_override_cfg.pusch.delay_us = static_cast<uint32_t>(*opt);
+                    g_tv_override_cfg.pusch.has_delay_us = true;
+                }
+            }
+            {
+                auto opt = parse_i64_loose(p, "sub_slot_delay_us");
+                if(opt.has_value() && *opt >= 0)
+                {
+                    g_tv_override_cfg.pusch.sub_slot_delay_us = static_cast<uint32_t>(*opt);
+                    g_tv_override_cfg.pusch.has_sub_slot_delay_us = true;
+                }
+            }
         }
         catch(...)
         {}
@@ -389,6 +670,19 @@ static void apply_tv_overrides_from_yaml(const yaml::node& root)
         {
             yaml::node p = ov["PUCCH"];
             read_uint<uint8_t>(p, "list_length", g_tv_override_cfg.pucch.has_polar_list_length, g_tv_override_cfg.pucch.polar_list_length);
+            auto mode = parse_i64_loose(p, "pipeline_processing_mode");
+            if(mode.has_value() && *mode != -1)
+            {
+                g_tv_override_cfg.pucch.has_pipeline_processing_mode = true;
+                g_tv_override_cfg.pucch.pipeline_processing_mode = static_cast<int32_t>(*mode);
+            }
+
+            auto delayUs = parse_i64_loose(p, "delay_us");
+            if(delayUs.has_value() && *delayUs >= 0)
+            {
+                g_tv_override_cfg.pucch.has_delay_us = true;
+                g_tv_override_cfg.pucch.delay_us = static_cast<int32_t>(*delayUs);
+            }
         }
         catch(...)
         {}
@@ -398,6 +692,95 @@ static void apply_tv_overrides_from_yaml(const yaml::node& root)
         {
             yaml::node p = ov["SRS"];
             read_uint<uint8_t>(p, "chEst_alg_selector", g_tv_override_cfg.srs.has_chest_alg_index, g_tv_override_cfg.srs.chest_alg_index);
+        }
+        catch(...)
+        {}
+        
+        // PDCCH
+        try
+        {
+            yaml::node p = ov["PDCCH"];
+            {
+                auto opt = parse_i64_loose(p, "kernel_sel_option");
+                if(opt.has_value() && *opt != -1)
+                {
+                    if(*opt >= 0 && *opt < static_cast<int64_t>(PDCCH_MAX_KERNEL_SEL_MODES))
+                    {
+                        g_tv_override_cfg.pdcch.kernel_sel_option = static_cast<uint8_t>(*opt);
+                        g_tv_override_cfg.pdcch.has_kernel_sel_option = true;
+                    }
+                    else
+                    {
+                        NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                            "[TV-OVERRIDE][PDCCH] invalid kernel_sel_option={} (expected 0=ALL, 1=NO_POLAR_ENCODER, or -1=no override); ignoring",
+                            static_cast<long long>(*opt));
+                    }
+                }
+            }
+            {
+                auto opt = parse_i64_loose(p, "delay_us");
+                if(opt.has_value() && *opt != -1)
+                {
+                    if(*opt >= 0 && *opt <= static_cast<int64_t>(UINT32_MAX))
+                    {
+                        g_tv_override_cfg.pdcch.delay_us = static_cast<uint32_t>(*opt);
+                        g_tv_override_cfg.pdcch.has_delay_us = true;
+                    }
+                    else
+                    {
+                        NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                            "[TV-OVERRIDE][PDCCH] invalid delay_us={} (expected 0..{} or -1=no override); ignoring",
+                            static_cast<long long>(*opt),
+                            static_cast<unsigned long long>(UINT32_MAX));
+                    }
+                }
+            }
+        }
+        catch(...)
+        {}
+
+        // PDSCH
+        try
+        {
+            yaml::node p = ov["PDSCH"];
+            // pipeline_processing_mode: validate range at parse time so that
+            // out-of-range YAML values don't silently narrow to a uint8 the
+            // apply path would still reject (and so the error log says PARSE).
+            {
+                auto opt = parse_i64_loose(p, "pipeline_processing_mode");
+                if(opt.has_value() && *opt != -1)
+                {
+                    if(*opt >= 0 && *opt <= static_cast<int64_t>(PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING))
+                    {
+                        g_tv_override_cfg.pdsch.pipeline_processing_mode = static_cast<uint8_t>(*opt);
+                        g_tv_override_cfg.pdsch.has_pipeline_processing_mode = true;
+                    }
+                    else
+                    {
+                        NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                            "[TV-OVERRIDE][PDSCH] invalid pipeline_processing_mode={} (expected 0=FULL, 1=AAS, 2=POST_FEC, 3=POST_FEC_RM_SCRAMBLING, or -1=no override); ignoring",
+                            static_cast<long long>(*opt));
+                    }
+                }
+            }
+            {
+                auto opt = parse_i64_loose(p, "delay_us");
+                if(opt.has_value() && *opt != -1)
+                {
+                    if(*opt >= 0 && *opt <= static_cast<int64_t>(UINT32_MAX))
+                    {
+                        g_tv_override_cfg.pdsch.delay_us = static_cast<uint32_t>(*opt);
+                        g_tv_override_cfg.pdsch.has_delay_us = true;
+                    }
+                    else
+                    {
+                        NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                            "[TV-OVERRIDE][PDSCH] invalid delay_us={} (expected 0..{} or -1=no override); ignoring",
+                            static_cast<long long>(*opt),
+                            static_cast<unsigned long long>(UINT32_MAX));
+                    }
+                }
+            }
         }
         catch(...)
         {}
@@ -493,6 +876,7 @@ void usage()
     printf("    -S  <streams>          Number of streams per worker\n");
     printf("    -I  <iterations>       Number of iterations per stream\n");
     printf("    -B                     Enable PUSCH cascade (PUSCH2 must wait unitl PUSCH1 finishes) for DDDSUUDDDD (u5/u6) (default disabled) \n");
+    printf("    -A                     Enable PUCCH cascade (PUCCH2 must wait until PUCCH1 finishes) for DDDSUUDDDD (u5/u6) (default disabled)\n");
     printf("    -C  <contexts>         Number of contexts \n");
     printf("    -P  <iterations>       if > 0 enables power measurement mode (default: disabled). When enabled, min iteration count forced to 100)\n");
     printf("    -W  <delay (us)>       Inter slot pattern workload delay in microseconds for power measurement mode (default: 30)\n");
@@ -518,6 +902,9 @@ void usage()
     printf("    --k                    Reference check for PDCCH (can also be enabled by --c PDCCH)\n");
     printf("    --c <ch_name_1,...,ch_name_N> enable reference checks for channels whose names are provided as a comma separated list\n");
     printf("    --b                    [Deprecated] Inter-cell batching for PDSCH. No effect as inter-cell batching is always enabled with --G\n");
+    printf("    --O                    Setup once: skip per-pattern re-setup, reuse first pattern's TVs for all iterations\n");
+    printf("    --E <yaml path>        Path to a chest_trt yaml enabling the TensorRT PUSCH channel estimator (independent of override_test_vectors; same file phase-2 passes via -t)\n");
+    printf("    --C <max. connections> Used to override CUDA_DEVICE_MAX_CONNECTIONS, if set. Recommended values > 12, esp. for GC mode.\n");
     printf("    -n                     Use green contexts\n");
     printf("    -v                     Enable cudaProfilerStart/Stop around each pattern run\n");
 }
@@ -569,6 +956,7 @@ int main(int argc, char* argv[])
         bool                 enableLdpcThroughputMode  = false;
         cuphyPdschProcMode_t pdsch_proc_mode           = PDSCH_PROC_MODE_NO_GRAPHS;
         uint64_t             pusch_proc_mode           = 0;
+        uint64_t             pucch_proc_mode           = 0;
         uint32_t             ldpcLaunchMode            = 1;
         uint32_t             delayUs                   = 10000;
         uint32_t             powerDelayUs              = 30; // emperically measured values from nsight-sys indicate a lower bound of around 15-20us
@@ -630,6 +1018,11 @@ int main(int argc, char* argv[])
         uint32_t             mode                      = 0; // 0 is mode A (default), 1 is mode B
         bool                 useGreenContexts          = false; // Set if '-n' is used
         bool                 enableNvprof              = false;
+        bool                 setupOnce                 = false; // Set if '--O' is used; skip per-pattern re-setup
+        bool                 uciTiming                 = false; // Set if '--W' is used; print UCI-on-PUSCH processing latency
+
+        uint32_t             cliDeviceMaxConnections   = 0; // zero is invalid; means not set
+        const uint32_t      max_device_max_connections = 32;
 
         // mac paramters
         bool                 macCtx                    = false; // enable subcontext for first MAC workload
@@ -705,6 +1098,10 @@ int main(int argc, char* argv[])
                         NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,  "ERROR: Invalid number of run iterations");
                         exit(1);
                     }
+                    ++iArg;
+                    break;
+                case 'A':
+                    g_pucchCascaded = true;
                     ++iArg;
                     break;
                 case 'B':
@@ -997,6 +1394,31 @@ int main(int argc, char* argv[])
                         ref_check_pdcch = true;
                         ++iArg;
                         break;
+                    case 'O':
+                        setupOnce = true;
+                        ++iArg;
+                        break;
+                    case 'W':
+                        uciTiming = true;
+                        ++iArg;
+                        break;
+                    case 'E':
+                        if(++iArg >= argc)
+                        {
+                            NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT, "ERROR: No chest_trt yaml path provided for option --E");
+                            exit(1);
+                        }
+                        g_pusch_trt_chest_config.assign(argv[iArg++]);
+                        break;
+                    case 'C':
+                        if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%u", &cliDeviceMaxConnections)) || (cliDeviceMaxConnections == 0) || (cliDeviceMaxConnections > max_device_max_connections))
+                        {
+                           NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,  "ERROR: Invalid value {} to override CUDA_DEVICE_MAX_CONNECTIONS. Should be in (0, {}]. Recommended values > 12 for GC mode.",
+                                      cliDeviceMaxConnections, max_device_max_connections);
+                           exit(1);
+                        }
+                        ++iArg;
+                        break;
                     default:
                         usage();
                         exit(1);
@@ -1032,19 +1454,52 @@ int main(int argc, char* argv[])
         if(uldl == 4) // overwritten nCuphyCtxts by nCtxts, used in finishPschSim(*); cuMAC does not supported in u4 yet
             nCuphyCtxts = nCtxts;
 
+        // Make CUDA_DEVICE_MAX_CONNECTIONS configurable for both MPS or GC (green context mode) based on cli arg.
+        // Especially important for green context mode. Needs to happen before any other CUDA API call.
+        const char* dev_max_connections_env_var = getenv("CUDA_DEVICE_MAX_CONNECTIONS");
+        const int prior_dev_max_connections_val = (dev_max_connections_env_var && *dev_max_connections_env_var) ? atoi(dev_max_connections_env_var) : 0;
+        NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "CUDA_DEVICE_MAX_CONNECTIONS originally {}", (prior_dev_max_connections_val == 0) ? "unset" : std::to_string(prior_dev_max_connections_val));
+
+
+        bool update_max_connections = false;
+        uint32_t new_env_var_to_use = 0;
+        if((cliDeviceMaxConnections == 0) && (prior_dev_max_connections_val == 0))
+        {
+            update_max_connections = true;
+            new_env_var_to_use = 20; // hardcoded max connections
+            NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "CUDA_DEVICE_MAX_CONNECTIONS unset and no cli arg --C <new_value> provided. Will hardcode to {}", new_env_var_to_use);
+        }
+        else if (cliDeviceMaxConnections > 0)
+        {
+            update_max_connections = true;
+            new_env_var_to_use = cliDeviceMaxConnections;
+            if((prior_dev_max_connections_val != 0) && (cliDeviceMaxConnections < prior_dev_max_connections_val))
+            {
+                NVLOGW_FMT(NVLOG_TAG_BASE_TESTBENCH, "New cli requested CUDA_DEVICE_MAX_CONNECTIONS value of {} is smaller than previously set env. variable value {}.",
+                           cliDeviceMaxConnections, prior_dev_max_connections_val);
+            }
+        }
+
+        // Override (or set) CUDA_DEVICE_MAX_CONNECTIONS env. variable.
+        // Supported even if new (cli provided) value is smaller that set env. var.; warning logged earlier in that case.
+        int updated_device_max_connections_env_var = prior_dev_max_connections_val;
+        if(update_max_connections)
+        {
+            std::string new_max_connections_str = std::to_string(new_env_var_to_use);
+            setenv("CUDA_DEVICE_MAX_CONNECTIONS", new_max_connections_str.c_str(), 1);
+            updated_device_max_connections_env_var = new_env_var_to_use;
+        }
+        NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "CUDA_DEVICE_MAX_CONNECTIONS is {}", updated_device_max_connections_env_var);
+
+
         if(useGreenContexts)
         {
-            // Hardcode max connections for now or otherwise work like PUCCH and SSB could execute at the end of a pattern, not respecting expected timeline
-            // Needs to happen before any other CUDA API calls.
-            setenv("CUDA_DEVICE_MAX_CONNECTIONS", "12", 1);
 
 #if CUDA_VERSION < 12040
             NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,  "ERROR: CUDA_VERSION {}, which is before 12.4, does not support green contexts. Run in MPS mode, i.e., without -n.", CUDA_VERSION);
             exit(1);
 #endif
         }
-        const char* dev_max_connections_env_var = getenv("CUDA_DEVICE_MAX_CONNECTIONS");
-        NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "CUDA_DEVICE_MAX_CONNECTIONS {}", dev_max_connections_env_var);
 
         if(inputFileName.empty())
         {
@@ -1083,6 +1538,7 @@ int main(int argc, char* argv[])
         uint32_t num_slots        = static_cast<uint32_t>(testCfg.num_slots());
         uint32_t slotsPerPatternFromYaml = 0;
         CumacOptions cumacOptions;
+        std::unordered_map<std::string, std::pair<int,int>> gcSmAlloc;
 
         // Optional YAML start-delay overrides (generated by perf Python scripts).
         {
@@ -1092,6 +1548,7 @@ int main(int argc, char* argv[])
             apply_start_delay_overrides_from_yaml(r);
             apply_tv_overrides_from_yaml(r);
             apply_cumac_options_from_yaml(r, cumacOptions);
+            gcSmAlloc = parse_green_context_sm_alloc_from_yaml(r);
             if(r.has_key("slots_per_pattern"))
             {
                 slotsPerPatternFromYaml = r["slots_per_pattern"].as<unsigned int>();
@@ -1169,6 +1626,17 @@ int main(int argc, char* argv[])
             }
         }
 
+        if (setupOnce)
+        {
+            if (uldl == 4)
+            {
+                NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                           "ERROR: --setup_once (--O) is not supported in PSCH mode (uldl == 4); per-pattern setup is unavoidable in this path.");
+                exit(1);
+            }
+            printf("WARNING: --setup_once (--O) enabled. All %d patterns will reuse TVs from pattern 0.\n", num_patterns);
+        }
+
         bool graphs_mode = (cfg_process_mode >= 1); // input argument from -m option
         pdsch_proc_mode  = (graphs_mode) ? PDSCH_PROC_MODE_GRAPHS : PDSCH_PROC_MODE_NO_GRAPHS;
         if(pdsch_inter_cell_batching) // always true
@@ -1176,7 +1644,25 @@ int main(int argc, char* argv[])
             pdsch_proc_mode = (cuphyPdschProcMode_t)((uint64_t)pdsch_proc_mode | (uint64_t)PDSCH_INTER_CELL_BATCHING);
         }
         pusch_proc_mode = (graphs_mode) ? 1 : 0;
-
+        pucch_proc_mode = (graphs_mode) ? static_cast<uint64_t>(PUCCH_PROC_MODE_FULL_SLOT_GRAPHS)
+                                        : static_cast<uint64_t>(PUCCH_PROC_MODE_FULL_SLOT);
+        if(g_tv_override_cfg.enable && g_tv_override_cfg.pucch.has_pipeline_processing_mode)
+        {
+            switch(g_tv_override_cfg.pucch.pipeline_processing_mode)
+            {
+                case 0:
+                case 1:
+                case 2:
+                    break;
+                default:
+                    NVLOGE_FMT(
+                        NVLOG_TAG_BASE_TESTBENCH,
+                        AERIAL_TESTBENCH_EVENT,
+                        "Error! Unsupported override_test_vectors.PUCCH.pipeline_processing_mode={} (supported: 0,1,2)",
+                        g_tv_override_cfg.pucch.pipeline_processing_mode);
+                    exit(1);
+            }
+        }
         // read H5 files
         const std::string puschChannelName  = "PUSCH";
         const std::string pusch2ChannelName = "PUSCH2";
@@ -1991,6 +2477,134 @@ int main(int argc, char* argv[])
             }
         }
 
+        if(setupOnce && num_patterns > 1)
+        {
+            auto get_slot_channel_count = [](const auto& slotTVs, const std::string& channelName) -> size_t {
+                auto it = slotTVs.find(channelName);
+                return it == slotTVs.end() ? 0 : it->second.size();
+            };
+
+            auto get_slot_channel_files = [](const auto& slotTVs, const std::string& channelName)
+                -> const std::vector<std::string>* {
+                auto it = slotTVs.find(channelName);
+                return it == slotTVs.end() ? nullptr : &it->second;
+            };
+
+            auto check_setup_once_channel = [](const char* channelName,
+                                               bool firstRun,
+                                               bool patternRun,
+                                               size_t firstCount,
+                                               size_t patternCount,
+                                               uint32_t patternIdx) {
+                if(firstRun != patternRun || firstCount != patternCount)
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH,
+                                AERIAL_TESTBENCH_EVENT,
+                                "ERROR: --setup_once requires homogeneous pattern layouts. Channel {} pattern 0 enabled/count {}/{} but pattern {} enabled/count {}/{}",
+                                channelName,
+                                firstRun,
+                                firstCount,
+                                patternIdx,
+                                patternRun,
+                                patternCount);
+                    exit(1);
+                }
+            };
+
+            auto check_setup_once_slot_channel = [&](const char* channelLabel,
+                                                     const std::string& channelName,
+                                                     uint32_t patternIdx,
+                                                     uint32_t slotOffset) {
+                const auto& firstSlotTVs = testCfg.slots()[slotOffset];
+                const auto& patternSlotTVs = testCfg.slots()[patternIdx * nSlotsPerPattern + slotOffset];
+                const size_t firstCount = get_slot_channel_count(firstSlotTVs, channelName);
+                const size_t patternCount = get_slot_channel_count(patternSlotTVs, channelName);
+                if(firstCount != patternCount)
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH,
+                                AERIAL_TESTBENCH_EVENT,
+                                "ERROR: --setup_once requires homogeneous per-slot pattern layouts. Channel {} pattern 0 slot {} count {} but pattern {} slot {} count {}",
+                                channelLabel,
+                                slotOffset,
+                                firstCount,
+                                patternIdx,
+                                slotOffset,
+                                patternCount);
+                    exit(1);
+                }
+                // Also verify TV file identities/order: pattern-0 workloads run for all patterns
+                // when --setup_once is used, so different TV files would silently mislabel results.
+                const auto* firstFiles = get_slot_channel_files(firstSlotTVs, channelName);
+                const auto* patternFiles = get_slot_channel_files(patternSlotTVs, channelName);
+                if(firstFiles && patternFiles && *firstFiles != *patternFiles)
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH,
+                                AERIAL_TESTBENCH_EVENT,
+                                "ERROR: --setup_once requires identical per-slot TV files. Channel {} slot {} differs between pattern 0 and pattern {}",
+                                channelLabel,
+                                slotOffset,
+                                patternIdx);
+                    exit(1);
+                }
+            };
+
+            for(uint32_t patternIdx = 1; patternIdx < num_patterns; ++patternIdx)
+            {
+                if(patternMode[patternIdx] != patternMode[0])
+                {
+                    NVLOGE_FMT(NVLOG_TAG_BASE_TESTBENCH,
+                                AERIAL_TESTBENCH_EVENT,
+                                "ERROR: --setup_once requires homogeneous pattern layouts. Pattern 0 mode {} but pattern {} mode {}",
+                                patternMode[0],
+                                patternIdx,
+                                patternMode[patternIdx]);
+                    exit(1);
+                }
+                check_setup_once_channel("PUSCH", runPUSCHVec[0], runPUSCHVec[patternIdx],
+                                         inFileNamesPuschRx[0].size(), inFileNamesPuschRx[patternIdx].size(), patternIdx);
+                check_setup_once_channel("PDSCH", runPDSCHVec[0], runPDSCHVec[patternIdx],
+                                         inFileNamesPdschTx[0].size(), inFileNamesPdschTx[patternIdx].size(), patternIdx);
+                check_setup_once_channel("PDCCH", runPDCCHVec[0], runPDCCHVec[patternIdx],
+                                         inFileNamesPdcchTx[0].size(), inFileNamesPdcchTx[patternIdx].size(), patternIdx);
+                check_setup_once_channel("PUCCH", runPUCCHVec[0], runPUCCHVec[patternIdx],
+                                         inFileNamesPucchRx[0].size(), inFileNamesPucchRx[patternIdx].size(), patternIdx);
+                check_setup_once_channel("PRACH", runPRACHVec[0], runPRACHVec[patternIdx],
+                                         inFileNamesPRACH[0].size(), inFileNamesPRACH[patternIdx].size(), patternIdx);
+                check_setup_once_channel("DLBFW", runDLBFWVec[0], runDLBFWVec[patternIdx],
+                                         inFileNamesDlbfw[0].size(), inFileNamesDlbfw[patternIdx].size(), patternIdx);
+                check_setup_once_channel("ULBFW", runULBFWVec[0], runULBFWVec[patternIdx],
+                                         inFileNamesUlbfw[0].size(), inFileNamesUlbfw[patternIdx].size(), patternIdx);
+                check_setup_once_channel("SSB", runSSBVec[0], runSSBVec[patternIdx],
+                                         inFileNamesSSB[0].size(), inFileNamesSSB[patternIdx].size(), patternIdx);
+                check_setup_once_channel("CSIRS", runCSIRSVec[0], runCSIRSVec[patternIdx],
+                                         inFileNamesCSIRS[0].size(), inFileNamesCSIRS[patternIdx].size(), patternIdx);
+                check_setup_once_channel("SRS", runSRSVec[0], runSRSVec[patternIdx],
+                                         inFileNamesSRS[0].size(), inFileNamesSRS[patternIdx].size(), patternIdx);
+                check_setup_once_channel("MAC", runMACVec[0], runMACVec[patternIdx],
+                                         inFileNamesMac[0].size(), inFileNamesMac[patternIdx].size(), patternIdx);
+                check_setup_once_channel("MAC2", runMAC2Vec[0], runMAC2Vec[patternIdx],
+                                         inFileNamesMac2[0].size(), inFileNamesMac2[patternIdx].size(), patternIdx);
+
+                for(uint32_t slotOffset = 0; slotOffset < nSlotsPerPattern; ++slotOffset)
+                {
+                    check_setup_once_slot_channel("PUSCH", puschChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("PUSCH2", pusch2ChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("PDSCH", pdschChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("PDCCH", pdcchChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("PUCCH", pucchChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("PUCCH2", pucch2ChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("PRACH", prachChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("DLBFW", dlbfwChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("ULBFW", ulbfwChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("SSB", ssbChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("CSIRS", csirsChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("SRS", srsChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("MAC", macChannelName, patternIdx, slotOffset);
+                    check_setup_once_slot_channel("MAC2", mac2ChannelName, patternIdx, slotOffset);
+                }
+            }
+        }
+
         // Beamforming
         dlbfw_nItrsPerStrm      = pdsch_nItrsPerStrm;
         ulbfw_nItrsPerStrm      = pusch_nItrsPerStrm;
@@ -2070,8 +2684,7 @@ int main(int argc, char* argv[])
         CU_CHECK(cuDeviceGetAttribute(&mpsEnabled, CU_DEVICE_ATTRIBUTE_MPS_ENABLED, device));
         if (useGreenContexts) {
             if (mpsEnabled == 1) {
-                NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT,  "MPS is enabled. Heads-up that currently using green contexts with MPS enabled can have unintended side effects. Will run regardless.\n");
-                //exit(1);
+                NVLOGW_FMT(NVLOG_TAG_BASE_CUPHY, "MPS is enabled. You may want to disable it, depending on how it is configured. Will run regardless.");
             } else {
                 NVLOGC_FMT(NVLOG_TAG_BASE_CUPHY, "MPS service is not running.");
             }
@@ -2131,8 +2744,36 @@ int main(int argc, char* argv[])
         int              cpuThrdPrio       = sched_get_priority_max(cpuThrdSchdPolicy);
         std::vector<int> cpuThrdPrios(nCtxts, cpuThrdPrio);
 
-        // Main cuda stream and events for synchronizing GPU work
+        // Main CUDA stream and events for synchronizing GPU work
+        // When green contexts are in use, create a dedicated green context for mainStream
+        // with no SM partitioning (full device resource) and a single work-queue.
+#if CUDA_VERSION >= 12040
+        cuphy::cudaGreenContext mainStreamGreenCtx;
+        bool use_workqueues  = useGreenContexts;
+        constexpr bool print_resources = true; // print resources during green context creation
+        constexpr unsigned int wq_concurrency_limit_of_2 = 2;
+        constexpr unsigned int wq_concurrency_limit_of_1 = 1;
+        // For specific GCs (PUSCH, PDSCH), a concurrency limit add-on of 1 may be needed in the mMIMO case (in Aerial System Benchmark at least), as more streams exist for those cases.
+        constexpr unsigned int wq_concurrency_limit_mmimo_add_on = 1; // technically not needed in this Aerial GPU benchmark test; could be set to 0  (added for consistency with Aerial System Benchmark)
+
+        if (useGreenContexts)
+        {
+            CUdevResource fullDeviceSmResource = {};
+            CU_CHECK(cuDeviceGetDevResource(device, &fullDeviceSmResource, CU_DEV_RESOURCE_TYPE_SM));
+            // No SM split: pass the full device resource as-is.
+            NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for mainStream (instead of using the primary context)");
+            mainStreamGreenCtx.create(gpuId, &fullDeviceSmResource,
+                                      print_resources,
+                                      use_workqueues,
+                                      wq_concurrency_limit_of_1);
+        }
+        cuphy::stream mainStream = useGreenContexts
+           ? cuphy::stream(mainStreamGreenCtx.handle(), CU_STREAM_NON_BLOCKING)
+            : cuphy::stream(cudaStreamNonBlocking);
+#else
         cuphy::stream mainStream(cudaStreamNonBlocking);
+#endif
+
 
         // Power test bench operates in two distinct modes controlled by CUBB_GPU_TESTBENCH_POWER_ITERATION_BATCHING macro:
         //
@@ -2283,6 +2924,28 @@ int main(int argc, char* argv[])
                 macTestWorkerStringVec.push_back("Mac2TestWorker");
                 mac_c ++;
             }
+
+            auto macContextIndex = [&](const std::string& chName) -> int {
+                return static_cast<int>(nCuphyCtxts) + macWorkerMap[chName];
+            };
+
+            auto contextChannelName = [&](int ctxtIdx) -> const char* {
+                if(ctxtIdx < nCuphyCtxts)
+                {
+                    if(puschCtx && channelWorkerMap["PUSCH"] == ctxtIdx) return "PUSCH";
+                    if(pdschCtx && channelWorkerMap["PDSCH"] == ctxtIdx) return "PDSCH";
+                    if(pucchCtx && channelWorkerMap["PUCCH"] == ctxtIdx) return "PUCCH";
+                    if(prachCtx && channelWorkerMap["PRACH"] == ctxtIdx) return "PRACH";
+                    if(pdcchCtx && channelWorkerMap["PDCCH"] == ctxtIdx) return "PDCCH";
+                    if(ssbCtx && channelWorkerMap["SSB"] == ctxtIdx) return "SSB";
+                    if(srsCtx && channelWorkerMap["SRS"] == ctxtIdx) return "SRS";
+                    return "?";
+                }
+                if(macCtx && macContextIndex("MAC") == ctxtIdx) return "MAC";
+                if(mac2Ctx && macContextIndex("MAC2") == ctxtIdx) return "MAC2";
+                return "?";
+            };
+
             //--------------------------------------------------------------------------
             // Print run setup
             std::string ctxt_run_string            = "parallel";
@@ -2290,20 +2953,39 @@ int main(int argc, char* argv[])
 
             printf("\n----------------------------------------------------------");
             printf("\nNotes on run setup:");
-            printf("\n--> %d CUDA contexts (workers) are run in %s and in %s mode: %d cuPHY CUDA contexts, %d cuMAC contexts \n\n", nCtxts, ctxt_run_string.c_str(), graphs_streams_mode_string.c_str(), nCuphyCtxts, nCumacCtxts);
+            printf("\n--> %d CUDA contexts (workers) are run in %s and in %s mode: %d cuPHY CUDA contexts, %d cuMAC contexts \n", nCtxts, ctxt_run_string.c_str(), graphs_streams_mode_string.c_str(), nCuphyCtxts, nCumacCtxts);
+            printf("--> Using: %s\n", useGreenContexts ? "Green Contexts" : "MPS");
+            printf("\nSM allocation per context (GPU has %d SMs):\n", gpuMaxSmCount);
+            if(useGreenContexts && !gcSmAlloc.empty())
+            {
+                // The values below are green context split *parameters* (split_start, SM count), not SM IDs.
+                // The CUDA driver is responsible for assigning SMs to green context(s) based on splits.
+                // Verify the actual green context resource allocation (SM count, potential overlap across GCs)
+                // via a tool like Nsight Systems is as expected.
+                printf("  NOTE: green context values are split parameters (split_start, SM count), not SM IDs.\n");
+                printf("        Verify actual green context resource allocation (SM count, potential overlap across GCs) via a tool like Nsight Systems.\n");
+            }
             for(int ctxtIdx = 0; ctxtIdx < nCtxts; ctxtIdx++)
             {
+                const char* chName = contextChannelName(ctxtIdx);
+                const char* wrkrName = "";
                 if(ctxtIdx < nCuphyCtxts)
                 {
-                    printf("requested SMs for context [%d] %-20s : %d\n", ctxtIdx, phyTestWorkerStringVec[ctxtIdx].c_str(), ctxSmCounts[ctxtIdx]);
+                    wrkrName = phyTestWorkerStringVec[ctxtIdx].c_str();
+                }
+                else if(macCtx || mac2Ctx)
+                {
+                    wrkrName = macTestWorkerStringVec[ctxtIdx - nCuphyCtxts].c_str();
+                }
+                if (useGreenContexts && !gcSmAlloc.empty() && gcSmAlloc.count(chName))
+                {
+                    auto [smStart, smCount] = gcSmAlloc[chName];
+                    printf("  %-8s  ctx[%d]  %-20s  split_start: %d  SM count: %d\n", chName, ctxtIdx, wrkrName, smStart, smCount);
                 }
                 else
                 {
-                    if(macCtx || mac2Ctx)
-                    {
-                        printf("requested SMs for context [%d] %-20s : %d\n", ctxtIdx, macTestWorkerStringVec[ctxtIdx - nCuphyCtxts].c_str(), ctxSmCounts[ctxtIdx]);
-                    }
-                }                
+                    printf("  %-8s  ctx[%d]  %-20s  SM requested: %d\n", chName, ctxtIdx, wrkrName, ctxSmCounts[ctxtIdx]);
+                }
             }
 
             CUcontext primaryCtx;
@@ -2339,11 +3021,13 @@ int main(int argc, char* argv[])
             // Even though the remaining one may not always be used, and thus one could pass a nullptr to that API call, we keep the 2x notation for convenience
             // as theoretically, every devResource could be used to create a green context.
             // This is the reason why all resource_index.*split variables have even values (0, 2, 4, etc.).
-            devResources.resize(2*CURRENT_MAX_GREEN_CTXS);
-            actual_split_groups.resize(2*CURRENT_MAX_GREEN_CTXS);
-            min_sm_counts.resize(2*CURRENT_MAX_GREEN_CTXS);
+            // Mid-range explicit SM ranges need two splits, each producing two resources, hence the 4x sizing.
+            devResources.resize(4*CURRENT_MAX_GREEN_CTXS);
+            actual_split_groups.resize(4*CURRENT_MAX_GREEN_CTXS);
+            min_sm_counts.resize(4*CURRENT_MAX_GREEN_CTXS);
             //std::array<cuphy::cudaGreenContext, CURRENT_MAX_GREEN_CTXS> greenContexts = {};
             std::array<cuphy::cudaGreenContext, 2 /* hardcoded for now; update as needed*/> tmpGreenContextsForResplit = {}; // these are for resplits. 2 is hardcoded for now
+            std::vector<std::unique_ptr<cuphy::cudaGreenContext>> tmpGreenCtxs;
 
             // If using green contexts, create the requested splits and cuphy::cudaGreenContext objects
             if (useGreenContexts)
@@ -2360,8 +3044,11 @@ int main(int argc, char* argv[])
                 {
                     SM_granularity = 2;
                 }
-                else if (major_cc == 9)
+                else if (major_cc >= 9 && major_cc <= 12)
                 {
+                    // Validated for Hopper (sm_90) through Blackwell (sm_10x or sm_12x). Bounded explicitly so that
+                    // extending green context SM-split support to a future arch is a conscious, tested choice
+                    // rather than implicit. TODO: query the split granularity programmatically once available.
                     SM_granularity = 8;
                 }
                 else
@@ -2374,6 +3061,205 @@ int main(int argc, char* argv[])
                 CU_CHECK(cuDeviceGetDevResource(device, &initial_device_GPU_resources, default_resource_type));
                 printf("Initial GPU resources retrieved via cuDeviceGetDevResource() have type %d and SM count %d.\n",  initial_device_GPU_resources.type, initial_device_GPU_resources.sm.smCount);
 
+                if (!gcSmAlloc.empty())
+                {
+                    // --- Explicit SM allocation from YAML green_context_sm_alloc ---
+
+                    // Validate: every enabled channel must be present and vice versa
+                    std::vector<std::pair<std::string, bool>> expectedChannels = {
+                        {"PUSCH", puschCtx}, {"PDSCH", pdschCtx}, {"PUCCH", pucchCtx},
+                        {"PRACH", prachCtx}, {"PDCCH", pdcchCtx}, {"SSB", ssbCtx},
+                        {"SRS", srsCtx}, {"MAC", macCtx}, {"MAC2", mac2Ctx}
+                    };
+                    for (auto& [chName, enabled] : expectedChannels)
+                    {
+                        bool inYaml = gcSmAlloc.count(chName) > 0;
+                        if (enabled && !inYaml)
+                        {
+                            NVLOGE_FMT(NVLOG_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                                "green_context_sm_alloc: missing entry for enabled channel {}", chName);
+                            exit(1);
+                        }
+                        if (!enabled && inYaml)
+                        {
+                            NVLOGW_FMT(NVLOG_TESTBENCH,
+                                "green_context_sm_alloc: entry for {} ignored (channel not enabled)", chName);
+                        }
+                    }
+
+                    // Validate ranges, check against GPU max SM count, warn about granularity
+                    int totalAllocatedSMs = 0;
+                    int enabledChannelsCount = 0;
+                    for (auto& [chName, range] : gcSmAlloc)
+                    {
+                        bool channelEnabled = false;
+                        for (auto& [eName, en] : expectedChannels)
+                            if (eName == chName) { channelEnabled = en; break; }
+                        if (!channelEnabled) continue;
+
+                        ++enabledChannelsCount;
+                        auto [smStart, smCount] = range;
+                        if (smStart < 0 || smCount <= 0)
+                        {
+                            NVLOGE_FMT(NVLOG_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                                "green_context_sm_alloc: invalid range for {}: start={} count={}", chName, smStart, smCount);
+                            exit(1);
+                        }
+                        if (smCount > gpuMaxSmCount)
+                        {
+                            NVLOGE_FMT(NVLOG_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                                "green_context_sm_alloc: sm_count {} for {} exceeds GPU max SM count ({})",
+                                smCount, chName, gpuMaxSmCount);
+                            exit(1);
+                        }
+                        if (smStart + smCount > gpuMaxSmCount)
+                        {
+                            NVLOGE_FMT(NVLOG_TESTBENCH, AERIAL_TESTBENCH_EVENT,
+                                "green_context_sm_alloc: range for {} exceeds GPU SM count: start({}) + count({}) > maxSM({})",
+                                chName, smStart, smCount, gpuMaxSmCount);
+                            exit(1);
+                        }
+                        if (smCount % SM_granularity != 0)
+                        {
+                            NVLOGW_FMT(NVLOG_TESTBENCH,
+                                "green_context_sm_alloc: sm_count {} for {} is not aligned to SM_granularity {}; driver will round up",
+                                smCount, chName, SM_granularity);
+                        }
+                        if (smStart % SM_granularity != 0)
+                        {
+                            NVLOGW_FMT(NVLOG_TESTBENCH,
+                                "green_context_sm_alloc: sm_start {} for {} is not aligned to SM_granularity {}; driver will round up",
+                                smStart, chName, SM_granularity);
+                        }
+                        totalAllocatedSMs += smCount;
+                    }
+                    printf("green_context_sm_alloc: GPU has %d SMs, total SMs allocated across %d enabled channels = %d (%.1fx oversubscription)\n",
+                           gpuMaxSmCount, enabledChannelsCount, totalAllocatedSMs,
+                           static_cast<float>(totalAllocatedSMs) / gpuMaxSmCount);
+                    if (totalAllocatedSMs > 2 * gpuMaxSmCount)
+                    {
+                        NVLOGW_FMT(NVLOG_TESTBENCH,
+                            "green_context_sm_alloc: total allocated SMs ({}) is more than 2x the GPU max ({}); check for unintended oversubscription",
+                            totalAllocatedSMs, gpuMaxSmCount);
+                    }
+
+                    // Override ctxSmCounts from explicit allocation
+                    for (auto& [chName, range] : gcSmAlloc)
+                    {
+                        bool channelEnabled = false;
+                        for (auto& [eName, en] : expectedChannels)
+                            if (eName == chName) { channelEnabled = en; break; }
+                        if (!channelEnabled) continue;
+
+                        auto [smStart, smCount] = range;
+                        if (chName == "MAC" && macCtx)
+                            ctxSmCounts[macContextIndex("MAC")] = smCount;
+                        else if (chName == "MAC2" && mac2Ctx)
+                            ctxSmCounts[macContextIndex("MAC2")] = smCount;
+                        else if (channelWorkerMap.count(chName))
+                            ctxSmCounts[channelWorkerMap[chName]] = smCount;
+                    }
+
+                    // Create a green context per channel from its split parameters (split_start = smStart, sm_count = smCount).
+                    // NOTE: smStart is a split offset, not an SM ID; the CUDA driver is responsible for assigning SMs to the green context based on the split.
+                    unsigned int devResIdx = 0;
+                    auto createGreenCtxForRange = [&](int workerIdx, int smStart, int smCount, bool printResources=false, bool useWorkqueues=false, unsigned int wqConcurrencyLimit=2) {
+                        NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for {}", contextChannelName(workerIdx));
+                        if (smStart == 0)
+                        {
+                            actual_split_groups[devResIdx] = 1;
+                            min_sm_counts[devResIdx] = smCount;
+                            CU_CHECK(cuDevSmResourceSplitByCount(
+                                &devResources[devResIdx], &actual_split_groups[devResIdx],
+                                &initial_device_GPU_resources, &devResources[devResIdx + 1],
+                                use_flags, smCount));
+                            greenContexts[workerIdx].create(gpuId, &devResources[devResIdx], printResources, useWorkqueues, wqConcurrencyLimit);
+                            devResIdx += 2;
+                        }
+                        else if (smStart + smCount >= gpuMaxSmCount)
+                        {
+                            actual_split_groups[devResIdx] = 1;
+                            min_sm_counts[devResIdx] = smStart;
+                            CU_CHECK(cuDevSmResourceSplitByCount(
+                                &devResources[devResIdx], &actual_split_groups[devResIdx],
+                                &initial_device_GPU_resources, &devResources[devResIdx + 1],
+                                use_flags, smStart));
+                            greenContexts[workerIdx].create(gpuId, &devResources[devResIdx + 1], printResources, useWorkqueues, wqConcurrencyLimit);
+                            devResIdx += 2;
+                        }
+                        else
+                        {
+                            actual_split_groups[devResIdx] = 1;
+                            min_sm_counts[devResIdx] = smStart;
+                            CU_CHECK(cuDevSmResourceSplitByCount(
+                                &devResources[devResIdx], &actual_split_groups[devResIdx],
+                                &initial_device_GPU_resources, &devResources[devResIdx + 1],
+                                use_flags, smStart));
+                            // Keep tmpGC alive until all contexts are created, so the
+                            // intermediate resource tree is never prematurely torn down.
+                            auto& tmpGC = *tmpGreenCtxs.emplace_back(std::make_unique<cuphy::cudaGreenContext>());
+                            tmpGC.create(gpuId, &devResources[devResIdx + 1]);
+                            CUdevResource tmpRes = {};
+                            tmpGC.getResources(&tmpRes);
+                            actual_split_groups[devResIdx + 2] = 1;
+                            min_sm_counts[devResIdx + 2] = smCount;
+                            CU_CHECK(cuDevSmResourceSplitByCount(
+                                &devResources[devResIdx + 2], &actual_split_groups[devResIdx + 2],
+                                &tmpRes, &devResources[devResIdx + 3],
+                                use_flags, smCount));
+                            greenContexts[workerIdx].create(gpuId, &devResources[devResIdx + 2], printResources, useWorkqueues, wqConcurrencyLimit);
+                            devResIdx += 4;
+                        }
+                    };
+
+                    if (puschCtx && gcSmAlloc.count("PUSCH"))
+                    {
+                        auto [s, c] = gcSmAlloc["PUSCH"];
+                        createGreenCtxForRange(channelWorkerMap["PUSCH"], s, c, print_resources, use_workqueues, wq_concurrency_limit_of_2 + wq_concurrency_limit_mmimo_add_on);
+                    }
+                    if (pucchCtx && gcSmAlloc.count("PUCCH"))
+                    {
+                        auto [s, c] = gcSmAlloc["PUCCH"];
+                        createGreenCtxForRange(channelWorkerMap["PUCCH"], s, c,  print_resources, use_workqueues, wq_concurrency_limit_of_1);
+                    }
+                    if (prachCtx && gcSmAlloc.count("PRACH"))
+                    {
+                        auto [s, c] = gcSmAlloc["PRACH"];
+                        createGreenCtxForRange(channelWorkerMap["PRACH"], s, c,  print_resources, use_workqueues, wq_concurrency_limit_of_1);
+                    }
+                    if (pdschCtx && gcSmAlloc.count("PDSCH"))
+                    {
+                        auto [s, c] = gcSmAlloc["PDSCH"];
+                        createGreenCtxForRange(channelWorkerMap["PDSCH"], s, c,  print_resources, use_workqueues, wq_concurrency_limit_of_2 + wq_concurrency_limit_mmimo_add_on);
+                    }
+                    if (pdcchCtx && gcSmAlloc.count("PDCCH"))
+                    {
+                        auto [s, c] = gcSmAlloc["PDCCH"];
+                        createGreenCtxForRange(channelWorkerMap["PDCCH"], s, c,  print_resources, use_workqueues, wq_concurrency_limit_of_2);
+                    }
+                    if (ssbCtx && gcSmAlloc.count("SSB"))
+                    {
+                        auto [s, c] = gcSmAlloc["SSB"];
+                        createGreenCtxForRange(channelWorkerMap["SSB"], s, c,  print_resources, use_workqueues, wq_concurrency_limit_of_1);
+                    }
+                    if (srsCtx && gcSmAlloc.count("SRS"))
+                    {
+                        auto [s, c] = gcSmAlloc["SRS"];
+                        createGreenCtxForRange(channelWorkerMap["SRS"], s, c,  print_resources, use_workqueues, wq_concurrency_limit_of_1);
+                    }
+                    if (macCtx && gcSmAlloc.count("MAC"))
+                    {
+                        auto [s, c] = gcSmAlloc["MAC"];
+                        createGreenCtxForRange(macContextIndex("MAC"), s, c,  print_resources, use_workqueues, wq_concurrency_limit_of_1);
+                    }
+                    if (mac2Ctx && gcSmAlloc.count("MAC2"))
+                    {
+                        auto [s, c] = gcSmAlloc["MAC2"];
+                        createGreenCtxForRange(macContextIndex("MAC2"), s, c,  print_resources, use_workqueues, wq_concurrency_limit_of_1);
+                    }
+                }
+                else
+                {
 #if 0
                 // Do multiple splits of initial GPU resources; always select the first N SMs for the green context of each channel.
                 // This is solely for experimental purposes. Intention is to show the risks (perf. impact) of poorly chosen overlapping SM partitions.
@@ -2465,7 +3351,8 @@ int main(int argc, char* argv[])
                 {
                     CU_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_pusch_split], &actual_split_groups[resource_index_pusch_split], &initial_device_GPU_resources, &devResources[resource_index_pusch_split+1], use_flags, min_sm_counts[resource_index_pusch_split]));
                     //printf("Split <some val | PUSCH> result with %d actual groups has SMs %d and remaining %d and initial SMs %d\n", actual_split_groups[resource_index_pusch_split], devResources[resource_index_pusch_split].sm.smCount, devResources[resource_index_pusch_split+1].sm.smCount, initial_device_GPU_resources.sm.smCount);
-                    greenContexts[channelWorkerMap["PUSCH"]].create(gpuId, &devResources[resource_index_pusch_split+1]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for PUSCH");
+                    greenContexts[channelWorkerMap["PUSCH"]].create(gpuId, &devResources[resource_index_pusch_split+1], print_resources, use_workqueues, wq_concurrency_limit_of_2 + wq_concurrency_limit_mmimo_add_on);
                 }
 
                 // Do another split of the initial GPU resources; will then resplit the remaining split for PUCCH and PRACH
@@ -2495,18 +3382,22 @@ int main(int argc, char* argv[])
                 CUdevResource resource_to_split = {};
                 if (pucchCtx && !prachCtx)
                 {
-                    greenContexts[channelWorkerMap["PUCCH"]].create(gpuId, &devResources[resource_index_prep_for_ul_ctrl_split+1]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for PUCCH");
+                    greenContexts[channelWorkerMap["PUCCH"]].create(gpuId, &devResources[resource_index_prep_for_ul_ctrl_split+1], print_resources, use_workqueues, wq_concurrency_limit_of_1);
                 }
                 else if (prachCtx && !pucchCtx)
                 {
-                    greenContexts[channelWorkerMap["PRACH"]].create(gpuId, &devResources[resource_index_prep_for_ul_ctrl_split+1]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for PRACH");
+                    greenContexts[channelWorkerMap["PRACH"]].create(gpuId, &devResources[resource_index_prep_for_ul_ctrl_split+1], print_resources, use_workqueues, wq_concurrency_limit_of_1);
                 }
                 else if (pucchCtx && prachCtx)
                 {
                     tmpGreenContextsForResplit[0].getResources(&resource_to_split);
                     CU_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_pucch_split], &actual_split_groups[resource_index_pucch_split], &resource_to_split, &devResources[resource_index_pucch_split+1], use_flags, min_sm_counts[resource_index_pucch_split]));
-                    greenContexts[channelWorkerMap["PUCCH"]].create(gpuId, &devResources[resource_index_pucch_split]);
-                    greenContexts[channelWorkerMap["PRACH"]].create(gpuId, &devResources[resource_index_pucch_split+1]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for PUCCH");
+                    greenContexts[channelWorkerMap["PUCCH"]].create(gpuId, &devResources[resource_index_pucch_split], print_resources, use_workqueues, wq_concurrency_limit_of_1);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for PRACH");
+                    greenContexts[channelWorkerMap["PRACH"]].create(gpuId, &devResources[resource_index_pucch_split+1], print_resources, use_workqueues, wq_concurrency_limit_of_1);
                 }
 
                 // Do another split of the initial GPU resources to get PDSCH resource
@@ -2526,7 +3417,8 @@ int main(int argc, char* argv[])
                 if(pdschCtx)
                 {
                     CU_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_pdsch_split], &actual_split_groups[resource_index_pdsch_split], &initial_device_GPU_resources, &devResources[resource_index_pdsch_split+1], use_flags, min_sm_counts[resource_index_pdsch_split]));
-                    greenContexts[channelWorkerMap["PDSCH"]].create(gpuId, &devResources[resource_index_pdsch_split]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for PDSCH");
+                    greenContexts[channelWorkerMap["PDSCH"]].create(gpuId, &devResources[resource_index_pdsch_split], print_resources, use_workqueues, wq_concurrency_limit_of_2 + wq_concurrency_limit_mmimo_add_on);
                 }
 
                 // Do another split of the initial GPU resources to get PDCCH resource
@@ -2537,7 +3429,8 @@ int main(int argc, char* argv[])
                 if(pdcchCtx)
                 {
                     CU_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_pdcch_split], &actual_split_groups[resource_index_pdcch_split], &initial_device_GPU_resources, &devResources[resource_index_pdcch_split+1], use_flags, min_sm_counts[resource_index_pdcch_split]));
-                    greenContexts[channelWorkerMap["PDCCH"]].create(gpuId, &devResources[resource_index_pdcch_split]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for PDCCH");
+                    greenContexts[channelWorkerMap["PDCCH"]].create(gpuId, &devResources[resource_index_pdcch_split], print_resources, use_workqueues, wq_concurrency_limit_of_2);
                 }
 
                 CUdevResource another_resource_to_split = {};
@@ -2555,7 +3448,8 @@ int main(int argc, char* argv[])
                     min_sm_counts[resource_index_ssb_split] = ctxSmCounts[channelWorkerMap["SSB"]];
                     // If there was no PDCCH context, just resplit the initial GPU resources
                     CU_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_ssb_split], &actual_split_groups[resource_index_ssb_split], (pdcchCtx) ? &another_resource_to_split : &initial_device_GPU_resources, &devResources[resource_index_ssb_split+1], use_flags, min_sm_counts[resource_index_ssb_split]));
-                    greenContexts[channelWorkerMap["SSB"]].create(gpuId, &devResources[resource_index_ssb_split]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for SSB");
+                    greenContexts[channelWorkerMap["SSB"]].create(gpuId, &devResources[resource_index_ssb_split], print_resources, use_workqueues, wq_concurrency_limit_of_1);
                 }
 
                 if (macCtx)
@@ -2571,7 +3465,8 @@ int main(int argc, char* argv[])
                         min_sm_counts[resource_index_cumac_split] -= first_split_modulo_SM_granularity;
                     }
                     CU_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_cumac_split], &actual_split_groups[resource_index_cumac_split], &initial_device_GPU_resources, &devResources[resource_index_cumac_split+1], use_flags, min_sm_counts[resource_index_cumac_split]));
-                    greenContexts[nCuphyCtxts].create(gpuId, &devResources[resource_index_cumac_split+1]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for MAC");
+                    greenContexts[nCuphyCtxts].create(gpuId, &devResources[resource_index_cumac_split+1], print_resources, use_workqueues, wq_concurrency_limit_of_1);
                 }
 
                 if (mac2Ctx)
@@ -2579,7 +3474,7 @@ int main(int argc, char* argv[])
                     // Do another split of the initial GPU resources to get cumac2 resources
                     unsigned int resource_index_cumac2_split = ssbCtx ? 14 : 12;  //index into devResources
                     actual_split_groups[resource_index_cumac2_split] = 1;
-                    min_sm_counts[resource_index_cumac2_split] = gpuMaxSmCount - ctxSmCounts[nCuphyCtxts+1]; // single cumac2 worker for now
+                    min_sm_counts[resource_index_cumac2_split] = gpuMaxSmCount - ctxSmCounts[macContextIndex("MAC2")]; // single cumac2 worker for now
                     // Since the resource split will round up every split but the remaining one to SM_granularity, update first split to ensure we have at least the
                     // user specified SM count for cumac2, as long as there are at least SM_granularity SMs left.
                     int first_split_modulo_SM_granularity = (min_sm_counts[resource_index_cumac2_split] % SM_granularity);
@@ -2587,24 +3482,91 @@ int main(int argc, char* argv[])
                         min_sm_counts[resource_index_cumac2_split] -= first_split_modulo_SM_granularity;
                     }
                     CU_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_cumac2_split], &actual_split_groups[resource_index_cumac2_split], &initial_device_GPU_resources, &devResources[resource_index_cumac2_split+1], use_flags, min_sm_counts[resource_index_cumac2_split]));
-                    greenContexts[nCuphyCtxts+1].create(gpuId, &devResources[resource_index_cumac2_split+1]);
+                    NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Creating GC for MAC2");
+                    greenContexts[macContextIndex("MAC2")].create(gpuId, &devResources[resource_index_cumac2_split+1], print_resources, use_workqueues, wq_concurrency_limit_of_1);
                 }
 #endif
-                // print green context configs, only run if green context is used
-                std::vector<std::string> tmp_channel_names = {"PUSCH", "PUCCH", "PRACH", "PDSCH", "PDCCH", "SSB", "SRS"};
-                for (int j = 0; j < tmp_channel_names.size(); j++) 
-                {
-                    printf("channel %s has SM count %d and channelWorkerMap %d\n", tmp_channel_names[j].c_str(), greenContexts[channelWorkerMap[tmp_channel_names[j]]].getSmCount(), channelWorkerMap[tmp_channel_names[j]]);
-                }
+                } // end else (heuristic fallback)
 
-                if (macCtx)
+                // Get a warning if the total of requested WQs exceeds CUDA_DEVICE_MAX_CONNECTIONS env. variable.
+#if CUDA_VERSION >= 13010
+                if(useGreenContexts && use_workqueues)
                 {
-                    printf("MAC has SM count %d and channelWorkerMap %d\n", greenContexts[nCuphyCtxts].getSmCount(), nCuphyCtxts);
+
+                    CUdevResource initial_WQ_config_resources = {};
+                    CU_CHECK(cuDeviceGetDevResource(device,
+                                                              &initial_WQ_config_resources,
+                                                              CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
+                    unsigned int initial_device_wqs = initial_WQ_config_resources.wqConfig.wqConcurrencyLimit; // should match CUDA_DEVICE_MAX_CONNECTIONS
+
+                    // Sum up the requested wqConcurrencyLimits across all GCs with CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED sharing scope,
+                    // Also include tmp GCs used for resplits for completeness.
+                    unsigned int requested_wq_count = 0;
+                    for(int ctxtIdx = 0; ctxtIdx < nCtxts; ctxtIdx++)
+                    {
+                        CUdevResource wq_config_resource{};
+                        if (greenContexts[ctxtIdx].ctxCreated())
+                        {
+                            greenContexts[ctxtIdx].getResources(&wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG);
+                            if(wq_config_resource.wqConfig.sharingScope == CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED)
+                            {
+                                requested_wq_count += wq_config_resource.wqConfig.wqConcurrencyLimit;
+                            }
+                        }
+                    }
+
+                    for(int i = 0; i < tmpGreenContextsForResplit.size(); i += 1)
+                    {
+                        CUdevResource wq_config_resource{};
+                        if (tmpGreenContextsForResplit[i].ctxCreated())
+                        {
+                            tmpGreenContextsForResplit[i].getResources(&wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG);
+                            if(wq_config_resource.wqConfig.sharingScope == CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED)
+                            {
+                                requested_wq_count += wq_config_resource.wqConfig.wqConcurrencyLimit;
+                            }
+                        }
+                    }
+
+                    for(auto& tmpCtx : tmpGreenCtxs)
+                    {
+                        CUdevResource wq_config_resource{};
+                        if (tmpCtx->ctxCreated())
+                        {
+                            tmpCtx->getResources(&wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG);
+                            if(wq_config_resource.wqConfig.sharingScope == CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED)
+                            {
+                                requested_wq_count += wq_config_resource.wqConfig.wqConcurrencyLimit;
+                            }
+                        }
+                    }
+
+                    // Account for WQs of mainStreamGreenCtx too
+                    {
+                        CUdevResource wq_config_resource{};
+                        if (mainStreamGreenCtx.ctxCreated())
+                        {
+                            mainStreamGreenCtx.getResources(&wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG);
+                            if(wq_config_resource.wqConfig.sharingScope == CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED)
+                            {
+                                requested_wq_count += wq_config_resource.wqConfig.wqConcurrencyLimit;
+                            }
+                        }
+                    }
+
+                    if(requested_wq_count > initial_device_wqs)
+                    {
+                        NVLOGW_FMT(NVLOG_TAG_BASE_TESTBENCH, "Total WQ count requested is {} but GPU's initial WQ concurrency limit is {} (CUDA_DEVICE_MAX_CONNECTIONS {}). There is a risk of aliasing depending on how these GCs are used!",
+                                         requested_wq_count, initial_device_wqs, updated_device_max_connections_env_var);
+                    }
+                    else
+                    {
+                        NVLOGC_FMT(NVLOG_TAG_BASE_TESTBENCH, "Total WQ count requested {}; GPU's initial WQ concurrency limit is {} (CUDA_DEVICE_MAX_CONNECTIONS {}).",
+                                         requested_wq_count, initial_device_wqs, updated_device_max_connections_env_var);
+                    }
                 }
-                if (mac2Ctx)
-                {
-                    printf("MAC2 has SM count %d and channelWorkerMap %d\n", greenContexts[nCuphyCtxts+1].getSmCount(), nCuphyCtxts+1);
-                }
+#endif
+                // Detailed allocation result printed in unified post-init summary below.
             }
 #endif
 //---------------------------------------------------------------------------------------------------------------
@@ -2715,24 +3677,58 @@ int main(int argc, char* argv[])
             // initialize channel functions
             if(! cuphyTestWorkerVec.empty())
             {
-                cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].pdschTxInit(inFileNamesPdschTx[0], pdsch_nItrsPerStrm, ref_check_pdsch, identical_ldpc_configs, pdsch_proc_mode, group_pdsch_cells, nPdschCellsPerStrm, pdschPrms);
+                auto hasPhyWorker = [&](const std::string& ch) {
+                    return channelWorkerMap.count(ch) > 0;
+                };
+                auto phyWorker = [&](const std::string& ch) -> cuPHYTestWorker& {
+                    return cuphyTestWorkerVec[channelWorkerMap.at(ch)];
+                };
 
-                cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].dlbfwInit(inFileNamesDlbfw[0], dlbfw_nItrsPerStrm, ref_check_dlbfw);
+                if(hasPhyWorker("PDSCH"))
+                {
+                    phyWorker("PDSCH").pdschTxInit(inFileNamesPdschTx[0], pdsch_nItrsPerStrm, ref_check_pdsch, identical_ldpc_configs, pdsch_proc_mode, group_pdsch_cells, nPdschCellsPerStrm, pdschPrms);
+                    if(nDlbfwCells > 0)
+                    {
+                        phyWorker("PDSCH").dlbfwInit(inFileNamesDlbfw[0], dlbfw_nItrsPerStrm, ref_check_dlbfw);
+                    }
+                }
 
-                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxInit(inFileNamesPuschRx[0], fp16Mode, descramblingOn, printCbErrors, pusch_proc_mode, enableLdpcThroughputMode, group_pusch_cells, puschPrms, ldpcLaunchMode, puschSubslotProcFlag);
+                if(hasPhyWorker("PUSCH"))
+                {
+                    phyWorker("PUSCH").puschRxInit(inFileNamesPuschRx[0], fp16Mode, descramblingOn, printCbErrors, pusch_proc_mode, enableLdpcThroughputMode, group_pusch_cells, puschPrms, ldpcLaunchMode, puschSubslotProcFlag, uciTiming);
+                    if(nUlbfwCells > 0)
+                    {
+                        phyWorker("PUSCH").ulbfwInit(inFileNamesUlbfw[0], ref_check_ulbfw, pdsch_proc_mode); // TODO: ULBFW processing mode using the same with DLBFW
+                    }
+                    // Reset CUDA events after setup to flush any stale recordings from graph capture/warmup
+                    phyWorker("PUSCH").resetSlotEvents();
+                }
 
-                cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].ulbfwInit(inFileNamesUlbfw[0], ref_check_ulbfw, pdsch_proc_mode); // TODO: ULBFW processing mode using the same with DLBFW
+                if(hasPhyWorker("SRS"))
+                {
+                    phyWorker("SRS").srsInit(inFileNamesSRS[0], ref_check_srs, pusch_proc_mode, splitSRScells50_50);
+                }
 
-                cuphyTestWorkerVec[channelWorkerMap["SRS"]].srsInit(inFileNamesSRS[0], ref_check_srs, pusch_proc_mode, splitSRScells50_50);
+                if(hasPhyWorker("PRACH"))
+                {
+                    phyWorker("PRACH").prachInit(inFileNamesPRACH[0], pusch_proc_mode, ref_check_prach, group_pusch_cells, nPrachCellsPerStrm);
+                }
 
-                cuphyTestWorkerVec[channelWorkerMap["PRACH"]].prachInit(inFileNamesPRACH[0], pusch_proc_mode, ref_check_prach, group_pusch_cells, nPrachCellsPerStrm);
+                if(hasPhyWorker("PUCCH"))
+                {
+                    phyWorker("PUCCH").pucchRxInit(inFileNamesPucchRx[0], ref_check_pucch, group_pucch_cells, pucch_proc_mode);
+                }
 
-                cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].pucchRxInit(inFileNamesPucchRx[0], ref_check_pucch, group_pucch_cells, pusch_proc_mode);
+                if(hasPhyWorker("PDCCH"))
+                {
+                    phyWorker("PDCCH").pdcchTxInit(inFileNamesPdcchTx[0], pdcch_nItrsPerStrm, group_pdsch_cells, nPdcchCellsPerStrm /* can be different than nPdschCellsPerStrm */, ref_check_pdcch, (uint64_t)(pdsch_proc_mode & 0x1));
+                    phyWorker("PDCCH").csirsInit(inFileNamesCSIRS[0], csirs_nItrsPerStrm, ref_check_csirs, group_pdsch_cells, (uint64_t)(pdsch_proc_mode & 0x1));
+                }
 
-                cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].pdcchTxInit(inFileNamesPdcchTx[0], pdcch_nItrsPerStrm, group_pdsch_cells, nPdcchCellsPerStrm /* can be different than nPdschCellsPerStrm */, ref_check_pdcch, (uint64_t)(pdsch_proc_mode & 0x1));
-                cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].csirsInit(inFileNamesCSIRS[0], csirs_nItrsPerStrm, ref_check_csirs, group_pdsch_cells, (uint64_t)(pdsch_proc_mode & 0x1));
-
-                cuphyTestWorkerVec[channelWorkerMap["SSB"]].ssbInit(inFileNamesSSB[0], ssb_nItrsPerStrm, ref_check_ssb, group_pdsch_cells, (uint64_t)(pdsch_proc_mode & 0x1));
+                if(hasPhyWorker("SSB"))
+                {
+                    phyWorker("SSB").ssbInit(inFileNamesSSB[0], ssb_nItrsPerStrm, ref_check_ssb, group_pdsch_cells, (uint64_t)(pdsch_proc_mode & 0x1));
+                }
             }
 
             // cuMAC
@@ -2772,45 +3768,116 @@ int main(int argc, char* argv[])
             }
             readSmIds<cuMACTestWorker>(pCumacTestWorkers, mainStream, gpuId);
 
+            // Post-init SM allocation result (shows actual SMs applied by MPS or green context driver)
+            {
+                printf("\n%s SM allocation result:\n", useGreenContexts ? "Green context" : "MPS");
+                if(useGreenContexts)
+                {
+                    // "SM allocated" is the SM count the driver applied to each green context. It is not an
+                    // SM-ID range; the CUDA driver is responsible for assigning SMs to each green context based
+                    // on its split.
+                    printf("  NOTE: 'SM allocated' is a per-context SM count, not an SM-ID range.\n");
+                    printf("        Verify actual green context resource allocation (SM count, potential overlap across GCs) via a tool like Nsight Systems is as expected.\n");
+                }
+                for(int ctxtIdx = 0; ctxtIdx < nCtxts; ctxtIdx++)
+                {
+                    const char* chName = contextChannelName(ctxtIdx);
+                    int32_t appliedSm = 0;
+                    if(ctxtIdx < nCuphyCtxts)
+                    {
+                        appliedSm = cuphyTestWorkerVec[ctxtIdx].getAppliedSmCount();
+                    }
+                    else if(macCtx || mac2Ctx)
+                    {
+                        appliedSm = cumacTestWorkerVec[ctxtIdx - nCuphyCtxts].getAppliedSmCount();
+                    }
+                    if (useGreenContexts && !gcSmAlloc.empty() && gcSmAlloc.count(chName))
+                    {
+                        auto [s, c] = gcSmAlloc[chName];
+                        printf("  %-8s  ctx[%d]  SM allocated: %d  (requested split_start: %d, SM count: %d)\n", chName, ctxtIdx, appliedSm, s, c);
+                    }
+                    else
+                    {
+                        printf("  %-8s  ctx[%d]  SM allocated: %d\n", chName, ctxtIdx, appliedSm);
+                    }
+                }
+                printf("\n");
+            }
+
             //------------------------------------------------------------------------------------
             // Loop over slot-patterns
             //
             for(int patternIdx = 0; patternIdx < num_patterns; patternIdx++)
             {
                 // timing iterations
-                // setup pipelines
-	    	    if(! cuphyTestWorkerVec.empty()) // no need to run cuPHY workload
+                // setup pipelines (skip if setupOnce and not the first pattern)
+                if (!setupOnce || patternIdx == 0)
                 {
-                    cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].pdschTxSetup(inFileNamesPdschTx[patternIdx], pdschSlotRunFlag);
+                    int setupIdx = setupOnce ? 0 : patternIdx;
+                    if(! cuphyTestWorkerVec.empty())
+                    {
+                        auto hasPhyWorker = [&](const std::string& ch) {
+                            return channelWorkerMap.count(ch) > 0;
+                        };
+                        auto phyWorker = [&](const std::string& ch) -> cuPHYTestWorker& {
+                            return cuphyTestWorkerVec[channelWorkerMap.at(ch)];
+                        };
 
-                    cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].dlbfwSetup(inFileNamesDlbfw[patternIdx]);
+                        if(hasPhyWorker("PDSCH"))
+                        {
+                            phyWorker("PDSCH").pdschTxSetup(inFileNamesPdschTx[setupIdx], pdschSlotRunFlag);
+                            if(nDlbfwCells > 0)
+                            {
+                                phyWorker("PDSCH").dlbfwSetup(inFileNamesDlbfw[setupIdx]);
+                            }
+                        }
 
-                    cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].puschRxSetup(inFileNamesPuschRx[patternIdx]);
+                        if(hasPhyWorker("PUSCH"))
+                        {
+                            phyWorker("PUSCH").puschRxSetup(inFileNamesPuschRx[setupIdx]);
+                            if(nUlbfwCells > 0)
+                            {
+                                phyWorker("PUSCH").ulbfwSetup(inFileNamesUlbfw[setupIdx]);
+                            }
+                        }
 
-                    cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].ulbfwSetup(inFileNamesUlbfw[patternIdx]);
+                        if(hasPhyWorker("PUCCH"))
+                        {
+                            phyWorker("PUCCH").pucchRxSetup(inFileNamesPucchRx[setupIdx]);
+                        }
 
-                    cuphyTestWorkerVec[channelWorkerMap["PUCCH"]].pucchRxSetup(inFileNamesPucchRx[patternIdx]);
+                        if(hasPhyWorker("PRACH"))
+                        {
+                            phyWorker("PRACH").prachSetup(inFileNamesPRACH[setupIdx]);
+                        }
 
-                    cuphyTestWorkerVec[channelWorkerMap["PRACH"]].prachSetup(inFileNamesPRACH[patternIdx]);
+                        if(hasPhyWorker("PDCCH"))
+                        {
+                            phyWorker("PDCCH").pdcchTxSetup(inFileNamesPdcchTx[setupIdx], pdcchSlotRunFlag);
+                            phyWorker("PDCCH").csirsSetup(inFileNamesCSIRS[setupIdx], csirsSlotRunFlag);
+                        }
 
-                    cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].pdcchTxSetup(inFileNamesPdcchTx[patternIdx], pdcchSlotRunFlag);
+                        if(hasPhyWorker("SRS"))
+                        {
+                            phyWorker("SRS").srsSetup(inFileNamesSRS[setupIdx]);
+                        }
 
-                    cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].csirsSetup(inFileNamesCSIRS[patternIdx], csirsSlotRunFlag);
-                    
-                    cuphyTestWorkerVec[channelWorkerMap["SRS"]].srsSetup(inFileNamesSRS[patternIdx]);
+                        if(hasPhyWorker("SSB"))
+                        {
+                            phyWorker("SSB").ssbSetup(inFileNamesSSB[setupIdx], pbchSlotRunFlag);
+                        }
+                    }
 
-                    cuphyTestWorkerVec[channelWorkerMap["SSB"]].ssbSetup(inFileNamesSSB[patternIdx], pbchSlotRunFlag);
-                }
-                
-                if(macCtx)
-                {
-                    std::vector<uint8_t> macSlotConfig(macSlotRunFlag, macSlotRunFlag + nSlotsPerPattern);
-                    cumacTestWorkerVec[macWorkerMap["MAC"]].macSetup(inFileNamesMac[patternIdx], macSlotConfig); // cumac worker setup, using per timeslot parameter
-                }
-                if(mac2Ctx)
-                {
-                    std::vector<uint8_t> macSlotConfig(macSlotRunFlag, macSlotRunFlag + nSlotsPerPattern);
-                    cumacTestWorkerVec[macWorkerMap["MAC2"]].macSetup(inFileNamesMac2[patternIdx], macSlotConfig); // cumac2 worker setup, using per timeslot parameter
+                    if(macCtx)
+                    {
+                        std::vector<uint8_t> macSlotConfig(macSlotRunFlag, macSlotRunFlag + nSlotsPerPattern);
+                        cumacTestWorkerVec[macWorkerMap["MAC"]].macSetup(inFileNamesMac[setupIdx], macSlotConfig);
+                    }
+                    if(mac2Ctx)
+                    {
+                        std::vector<uint8_t> macSlotConfig(macSlotRunFlag, macSlotRunFlag + nSlotsPerPattern);
+                        cumacTestWorkerVec[macWorkerMap["MAC2"]].macSetup(inFileNamesMac2[setupIdx], macSlotConfig);
+                    }
                 }
                 // start profiler after setup so capture range excludes setup
                 if(enableNvprof)
@@ -2859,7 +3926,10 @@ int main(int argc, char* argv[])
 
                     if(pdcchCtx)
                     {
-                        cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].pdschTxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PDCCH"]], true, nullptr, cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr());
+                        std::vector<cuphy::event>* pdcchEventVec = pdschCtx
+                            ? select_dl_anchor_event_vec(cuphyTestWorkerVec[channelWorkerMap["PDSCH"]])
+                            : nullptr;
+                        cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].pdschTxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["PDCCH"]], true, nullptr, pdcchEventVec);
                     }
 
                     if(g_start_delay_cfg_us.ul_anchor_from_yaml)
@@ -2947,7 +4017,10 @@ int main(int argc, char* argv[])
 
                     if(ssbCtx)
                     {
-                        cuphyTestWorkerVec[channelWorkerMap["SSB"]].pdschTxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["SSB"]], true /*waitRsp*/, nullptr, uldl == 3 ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr() /*uldl == 5:  start at 5th slot*/);
+                        std::vector<cuphy::event>* ssbEventVec = nullptr;
+                        if(uldl != 3 && pdschCtx)
+                            ssbEventVec = select_dl_anchor_event_vec(cuphyTestWorkerVec[channelWorkerMap["PDSCH"]]);
+                        cuphyTestWorkerVec[channelWorkerMap["SSB"]].pdschTxRun(startEvent.handle(), shPtrStopEvents[channelWorkerMap["SSB"]], true /*waitRsp*/, nullptr, ssbEventVec);
                     }
 
                     // cuMAC run scheduler
@@ -3044,6 +4117,11 @@ int main(int argc, char* argv[])
                         printf("Average PUSCH_subslotProc run time: %.2f us from %.2f (averaged over %d iterations) \n", subslotProcPusch, startTimePusch, nTimingItrs);
                     }
                     printf("Average PUSCH run time: %.2f us from %.2f (averaged over %d iterations) \n", timePusch, startTimePusch, nTimingItrs);
+                    if(uciTiming)
+                    {
+                        float timeUciPusch = cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getTotUciOnPuschRunTime() * 1000 / static_cast<float>(nTimingItrs);
+                        printf("Average UCI_PUSCH run time: %.2f us from %.2f (averaged over %d iterations) \n", timeUciPusch, startTimePusch, nTimingItrs);
+                    }
                     if(uldl == 5 || uldl == 6)
                     {
                         float startTimePusch2 = cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getTotPusch2StartTime() * 1000 / static_cast<float>(nTimingItrs);
@@ -3054,6 +4132,11 @@ int main(int argc, char* argv[])
                             printf("Average PUSCH2_subslotProc run time: %.2f us from %.2f (averaged over %d iterations) \n", subslotProcPusch2, startTimePusch2, nTimingItrs);
                         }
                         printf("Average PUSCH2 run time: %.2f us from %.2f (averaged over %d iterations) \n", timePusch2, startTimePusch2, nTimingItrs);
+                        if(uciTiming)
+                        {
+                            float timeUciPusch2 = cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].getTotUciOnPusch2RunTime() * 1000 / static_cast<float>(nTimingItrs);
+                            printf("Average UCI_PUSCH2 run time: %.2f us from %.2f (averaged over %d iterations) \n", timeUciPusch2, startTimePusch2, nTimingItrs);
+                        }
                     }
                 }
                 if(runPUCCHVec[patternIdx])
@@ -3232,8 +4315,10 @@ int main(int argc, char* argv[])
 
                 if(printCellMetrics)
                 {
-                    cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].print();
-                    cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].print(printCbErrors);
+                    if(pdschCtx)
+                        cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].print();
+                    if(puschCtx)
+                        cuphyTestWorkerVec[channelWorkerMap["PUSCH"]].print(printCbErrors);
                     if(prachCtx)
                         cuphyTestWorkerVec[channelWorkerMap["PRACH"]].print();
                     if(pdcchCtx)
@@ -3252,10 +4337,7 @@ int main(int argc, char* argv[])
 
                 // clean up params
                 if(pdschCtx)
-                {
-                    cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].pdschTxClean();
                     cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].resetEvalBuffers();
-                }
                 if(prachCtx)
                     cuphyTestWorkerVec[channelWorkerMap["PRACH"]].resetEvalBuffers();
                 if(pdcchCtx)
@@ -3298,6 +4380,15 @@ int main(int argc, char* argv[])
                 cuphyTestWorkerVec.clear();
 
                 cumacTestWorkerVec.clear();
+
+                // Release main-scope CUDA buffers that hold pinned host memory (e.g. the GPU
+                // start-sync flag) *before* the green contexts are destroyed. They are allocated
+                // under the primary context and otherwise only freed at main() scope-exit, i.e.
+                // after the loop below has torn down the contexts -- at which point cudaFreeHost()
+                // throws "context is destroyed" (cudaErrorContextIsDestroyed). The workers were the
+                // only other owners and were just cleared above, so main holds the last reference;
+                // the flag is not used again on this (DDDSUUDDDD) path after the run.
+                shPtrGpuStartSyncFlag.reset();
 
                 // Explicitly call destroy on every cudaGreenContext object from greenContexts.
                 // Same not needed for tmpGreenContextsForResplit as these have no stream or other resources created under them
@@ -3510,7 +4601,6 @@ void finishPschSim(std::vector<cuPHYTestWorker*>& pCuphyTestWorkers, string3Dvec
         // clean up params
         for(uint32_t ctxIdx = 0; ctxIdx < nCuphyCtxts; ++ctxIdx)
         {
-            pCuphyTestWorkers[ctxIdx]->pdschTxClean();
             pCuphyTestWorkers[ctxIdx]->resetEvalBuffers(printCbErrors);
         }
 
@@ -3586,10 +4676,12 @@ void runPowerIterations(
                 pdcchCtx ? cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].getpdcchCsirsInterSlotEndEventVec() : nullptr);
         }
         if(pdcchCtx) {
+            std::vector<cuphy::event>* pdcchEventVec = pdschCtx
+                ? select_dl_anchor_event_vec(cuphyTestWorkerVec[channelWorkerMap["PDSCH"]])
+                : nullptr;
             cuphyTestWorkerVec[channelWorkerMap["PDCCH"]].pdschTxRun(
                 startEvent.handle(), shPtrStopEvents[channelWorkerMap["PDCCH"]], 
-                true, nullptr, 
-                cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr());
+                true, nullptr, pdcchEventVec);
         }
         if(g_start_delay_cfg_us.ul_anchor_from_yaml) {
             if(g_start_delay_cfg_us.ul_anchor_mode == ul_anchor_mode_t::PRACH) {
@@ -3678,10 +4770,12 @@ void runPowerIterations(
                 startEvent.handle(), shPtrStopEvents[channelWorkerMap["SRS"]]);
         }
         if(ssbCtx) {
+            std::vector<cuphy::event>* ssbEventVec = nullptr;
+            if(uldl != 3 && pdschCtx)
+                ssbEventVec = select_dl_anchor_event_vec(cuphyTestWorkerVec[channelWorkerMap["PDSCH"]]);
             cuphyTestWorkerVec[channelWorkerMap["SSB"]].pdschTxRun(
                 startEvent.handle(), shPtrStopEvents[channelWorkerMap["SSB"]], 
-                true /*waitRsp*/, nullptr, 
-                uldl == 3 ? nullptr : cuphyTestWorkerVec[channelWorkerMap["PDSCH"]].getSlotBoundaryEventVecPtr());
+                true /*waitRsp*/, nullptr, ssbEventVec);
         }
         
         // cuMAC run scheduler

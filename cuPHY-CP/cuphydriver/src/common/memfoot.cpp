@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,11 @@ bool MemFoot::init(phydriver_handle _pdh, std::string _name, size_t _cpu_obj_siz
 
     // Currently the CPU regular size of the various MemFoot objects isn't
     // accounted for in the wip_accum_mf object. The difference is due to the line below.
-    (StaticConversion<PhyDriverCtx>(pdh).get())->ctx_tot_cpu_regular_memory += cpu_obj_size;
+    if (pdh) {
+        if (auto* ctx = StaticConversion<PhyDriverCtx>(pdh).get()) {
+            ctx->ctx_tot_cpu_regular_memory += cpu_obj_size;
+        }
+    }
 
     return true;
 }

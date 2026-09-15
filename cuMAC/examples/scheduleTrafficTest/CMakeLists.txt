@@ -15,6 +15,6 @@
 
 get_filename_component(ProjectId ${CMAKE_CURRENT_SOURCE_DIR} NAME)
 add_executable(${ProjectId})
-target_sources(${ProjectId} PRIVATE main.cpp ../testBench.cpp ../network.cu ../trafficModel/trafficGenerator.cpp)
+target_sources(${ProjectId} PRIVATE main.cpp ../testBench.cpp ../network.cu ../parameters.cpp ../trafficModel/trafficGenerator.cpp)
 target_include_directories(${ProjectId} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../trafficModel/ ${cumac_SOURCE_DIR}/examples/tools)
-target_link_libraries(${ProjectId} PRIVATE cumac channInput nvlog)
+target_link_libraries(${ProjectId} PRIVATE cumac channInput nvlog yaml-cpp)

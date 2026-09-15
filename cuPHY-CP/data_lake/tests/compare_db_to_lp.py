@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,9 +104,11 @@ def create_fapi_dataframe(h5_file: h5py.File, nUEs: int, slot: float, cell_id: i
 				'numPRGs': int(pdu_data['numPRGs']),
 				'prgSize': int(pdu_data['prgSize']),
 				'tbCrcStatus': int(ind_data['TbCrcStatus']),
-				'CQI': np.min([40, np.float32(pdu_data['sinrdB'])]),
+				'sinr': np.min([40, np.float32(pdu_data['sinrdB'])]),
+				'noiseVar': np.float32(pdu_data['noiseVardB']),
 				'timingAdvance': np.float32(ind_data['TimingAdvanceNano'])/1e9,
 				'rssi': np.float32(pdu_data['dmrsRssiReportedDb']),
+				'rsrp': np.float32(pdu_data['rsrpdB']),
 				'pduLen': len(pdu_payload[0]),
 				'pduData': pdu_payload[0],
 				'CellId': cell_id
@@ -330,9 +332,11 @@ def compare_tv_to_fapi(slot_configs: List[SlotConfig], printMismatches: bool):
 		TBSize UInt32,
 		numCb UInt8,
 		tbCrcFail UInt8,
-		CQI Float32,
+		sinr Float32,
+		noiseVar Float32,
 		timingAdvance Float32,
 		rssi Float32,
+		rsrp Float32,
 		pduLen UInt32,
 		pduData Array(UInt8)
 	) ENGINE = Memory
@@ -351,8 +355,8 @@ def compare_tv_to_fapi(slot_configs: List[SlotConfig], printMismatches: bool):
 			'nrOfLayers', 'ulDmrsSymbPos', 'dmrsConfigType', 'ulDmrsScramblingId',
 			'puschIdentity', 'SCID', 'numDmrsCdmGrpsNoData', 'dmrsPorts', 'rbStart',
 			'rbSize', 'StartSymbolIndex', 'NrOfSymbols', 'rvIndex', 'harqProcessID',
-			'newDataIndicator', 'TBSize', 'numCb', 'tbCrcFail', 'CQI', 'timingAdvance',
-			'rssi', 'pduLen', 'pduData'
+			'newDataIndicator', 'TBSize', 'numCb', 'tbCrcFail', 'sinr', 'noiseVar',
+			'timingAdvance', 'rssi', 'rsrp', 'pduLen', 'pduData'
 		]
 	
 		df = slot.dataframe[columns_to_keep].copy()
@@ -367,7 +371,7 @@ def compare_tv_to_fapi(slot_configs: List[SlotConfig], printMismatches: bool):
 							'numDmrsCdmGrpsNoData', 'StartSymbolIndex', 'NrOfSymbols',
 							'rvIndex', 'harqProcessID', 'newDataIndicator', 'numCb',
 							'tbCrcFail']
-		float32_cols = ['CQI', 'timingAdvance', 'rssi']
+		float32_cols = ['sinr', 'noiseVar', 'timingAdvance', 'rssi', 'rsrp']
 			
 		for col in float32_cols:
 			df[col] = df[col].astype('float64')
@@ -381,7 +385,7 @@ def compare_tv_to_fapi(slot_configs: List[SlotConfig], printMismatches: bool):
 		# Insert DataFrame with correct types
 		client.insert_df('tv_data', df)
 
-
+	# TODO: also cover cfoHz and byte-exact pduData; SRS tables have no compare path yet.
 	comparison_query = """
 	WITH mismatches AS (
 		SELECT
@@ -412,9 +416,11 @@ def compare_tv_to_fapi(slot_configs: List[SlotConfig], printMismatches: bool):
 			countIf(f.TBSize != tv.TBSize) as TBSize_mismatch,
 			countIf(f.numCb != tv.numCb) as numCb_mismatch,
 			countIf(f.tbCrcFail != tv.tbCrcFail) as tbCrcFail_mismatch,
-			countIf(abs(f.CQI - tv.CQI) > 1) as CQI_mismatch,
+			countIf(f.sinr > -3.0e38 AND abs(least(toFloat32(40), f.sinr) - tv.sinr) > 1) as sinr_mismatch,
+			countIf(f.noiseVar > -3.0e38 AND abs(f.noiseVar - tv.noiseVar) > 1) as noiseVar_mismatch,
 			countIf(abs(f.timingAdvance - tv.timingAdvance) > 0.001) as timingAdvance_mismatch,
-			countIf(abs(f.rssi - tv.rssi) > 1) as rssi_mismatch
+			countIf(f.rssi > -3.0e38 AND abs(f.rssi - tv.rssi) > 1) as rssi_mismatch,
+			countIf(f.rsrp > -3.0e38 AND abs(f.rsrp - tv.rsrp) > 1) as rsrp_mismatch
 		FROM tv_data tv
 		JOIN fapi f ON tv.Slot = f.Slot AND tv.CellId = f.CellId AND tv.rnti = f.rnti
 		GROUP BY tv.Slot, tv.CellId, tv.harqProcessID

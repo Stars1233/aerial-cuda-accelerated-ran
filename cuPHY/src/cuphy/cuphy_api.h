@@ -165,6 +165,50 @@ typedef enum _cuphyPuschWorkCancelMode
     PUSCH_MAX_WORK_CANCEL_MODES   = 0x3
 } cuphyPuschWorkCancelMode_t;
 
+/**
+ * PUSCH Open RAN Functional Split mode
+ */
+typedef enum _cuphyPuschOpenRanFunctionalSplitMode
+{
+    PUSCH_7_2_A                        = 0x0,  
+    PUSCH_7_2_E                        = 0x1,
+    PUSCH_MAX_SPLIT_MODES              = 0x2 
+} cuphyPuschOpenRanFunctionalSplitMode_t;
+
+/**
+ * PUSCH Kernel Selection mode
+ */
+typedef enum _cuphyPuschKernelSelMode
+{
+    PUSCH_ALL                          = 0x0, 
+    PUSCH_NO_FEC                       = 0x1, 
+    PUSCH_NO_DERATE_MATCHING_FEC       = 0x2, 
+    PUSCH_NO_SD_DERATE_MATCHING_FEC    = 0x3, 
+    PUSCH_MAX_KERNEL_SEL_MODES         = 0x4
+} cuphyPuschKernelSelMode_t;
+
+/**
+ * PUSCH UCI Kernel Selection mode
+ */
+typedef enum _cuphyPuschUciKernelSelMode
+{
+    PUSCH_UCI_ALL                      = 0x0, 
+    PUSCH_UCI_NO_POLAR                 = 0x1, 
+    PUSCH_UCI_NO_UCI_WITH_SEG          = 0x2, 
+    PUSCH_UCI_NO_UCI                   = 0x3,  
+    PUSCH_MAX_UCI_KERNEL_SEL_MODES     = 0x4
+} cuphyPuschUciKernelSelMode_t;
+
+/**
+ * PUSCH early SCH codeblock decode mode
+ */
+typedef enum cuphyPuschEarlySchCbDecodeMode
+{
+    PUSCH_EARLY_SCH_CB_DECODE_DISABLED         = 0, /*!< Disable early SCH codeblock decode outside existing early-HARQ behavior */
+    PUSCH_EARLY_SCH_CB_DECODE_NON_UCI_SCH_ONLY = 1, /*!< Enable early SCH codeblock decode for SCH TBs without UCI-on-PUSCH */
+    PUSCH_EARLY_SCH_CB_DECODE_MAX
+} cuphyPuschEarlySchCbDecodeMode_t;
+
 
 /**
  * PUSCH Static Parameters
@@ -265,12 +309,16 @@ typedef struct _cuphyPuschStatPrms
     
     uint32_t nMaxLdpcHetConfigs; /*!<  maximum number of allowed heterogenous workload configs for LDPC */
 
+    uint8_t useCbLdpcDecoder; /*!< 0=TB decoder (default), 1=CB decoder */
+
     /// Debug parameters
     cuphyPuschStatDbgPrms_t* pDbg;
 
     uint8_t     enableDeviceGraphLaunch;    /*!< Static flag to allow device graph launch in PUSCH */
 
     uint8_t     enableEarlyHarq;            /*!< Static flag to control construction of early-HARQ related members in PUSCH */
+
+    cuphyPuschEarlySchCbDecodeMode_t earlySchCbDecodeMode; /*!< Controls early SCH codeblock decode for CB LDPC mode */
 
     int32_t     earlyHarqProcNodePriority;  /*!< Elevated priority used for early-HARQ processing nodes in graphs mode.
                                                 The priority values are same as CUDA stream priorities with lower numbers imply greater priorities */
@@ -285,6 +333,8 @@ typedef struct _cuphyPuschStatPrms
                                                  - This is a read only flag for cuPHY
                                                  - Status values from cuphySymbolRxState_t
                                                 Note: successful reception of symbol i does not necessarily imply successful reception of prior symbols 0,...,i-1 */
+                                                
+    cudaEvent_t uciOnPuschCompletedEvent;   /*!< Event used to signal completion of UCI-on-PUSCH */
 
     cuphyPuschWorkCancelMode_t    workCancelMode; /*!< Controls how, if at all, PUSCH graph(s) can support work cancellation. For any value other than PUSCH_NO_WORK_CANCEL, the exit cond. will be controlled by the value pointed by pWorkCancelInfo. */
 
@@ -293,7 +343,16 @@ typedef struct _cuphyPuschStatPrms
                                                            i.e. instantiating the existing/legacy/vanilla puschRx Channel estimate type. */
 
     uint8_t enableBatchedMemcpy;  /*!< Enable batched memory copy. Values: 0->1. */
-
+    
+    uint8_t openRanFunctionalSplitOption; /*!< Open RAN Functional Splits Option for PUSCH. */
+    
+    uint8_t kernelSelOption;      //!< PUSCH kernel selection option.
+    
+    uint8_t uciKernelSelOption;   //!< PUSCH UCI kernel selection option.
+    
+    uint32_t delayUs;             //!< PUSCH full-slot delay in us. 
+    
+    uint32_t subSlotDelayUs;      //!< PUSCH sub-slot delay in us.  
 } cuphyPuschStatPrms_t;
 
 //-----------------------------------------------------------------------------------------------------------
@@ -466,9 +525,14 @@ typedef struct cuphyPuschCellGrpDynPrm cuphyPuschCellGrpDynPrm_t;
  */
 typedef struct _cuphyPuschDataIn
 {
-    cuphyTensorPrm_t* pTDataRx;   /*!< array of tensors with each tensor (indexed by cellPrmDynIdx) representing the receive slot buffer of a cell in the cell group
+    cuphyTensorPrm_t* pTDataRx;     /*!< array of tensors with each tensor (indexed by cellPrmDynIdx) representing the receive slot buffer of a cell in the cell group
                                        Each cell's tensor may have a different geometry */
-    cuphyTensorPrm_t* pTNoisePwr; /*!< array of noise power metric tensors with each tensor (indexed by cellPrmDynIdx) for given a cell in the cell group */
+    cuphyTensorPrm_t* pTNoisePwr;   /*!< array of noise power metric tensors with each tensor (indexed by cellPrmDynIdx) for given a cell in the cell group */
+    
+    cuphyTensorPrm_t* pTX_72e;       /*!< array of tensors containing equalized symbols for 7.2e split (indexed by cellPrmDynIdx) */
+    
+    cuphyTensorPrm_t* pTReeInv_72e;  /*!< array of tensors containing inverse Ree matrices for 7.2e split (indexed by cellPrmDynIdx) */
+
 } cuphyPuschDataIn_t;
 
 
@@ -505,6 +569,9 @@ typedef struct _cuphyPuschDataOut
 
     uint8_t isEarlyHarqPresent; /*< calculated in Setup() PUSCH_SETUP_PHASE_1
                                     Flag when set indicates that the slot contains UEs with early-HARQ (HARQ bits fully resident on symbols 0-3) */
+
+    uint8_t isEarlySchCbDecodePresent; //!< calculated in Setup() PUSCH_SETUP_PHASE_1
+                                    /*!< Flag when set indicates that the slot has SCH codeblocks scheduled for subslot decoding */
 
     uint8_t isFrontLoadedDmrsPresent; /*< calculated in Setup() PUSCH_SETUP_PHASE_1
                                     Flag when set indicates that the slot contains UEs with frontloaded DMRS symbol(s) */
@@ -571,6 +638,11 @@ typedef struct _cuphyPuschDataOut
 
     uint32_t* pChannelEstSizes; /*< Channel Estimate Sizes: Array of nUeGrps elements, each containing the
                                      corresponding UE group's channel estimate data size in elements (float2) */
+
+    uint32_t nPerCellTbDests; /*!< Per-cell D2H TB payload destinations (GT-11677 Phase 2).
+                                   When nPerCellTbDests > 0, copyOutputToCPU emits per-cell D2H via
+                                   cuMemcpyBatchAsync instead of a single bulk copy to pTbPayloads. */
+    uint8_t* pPerCellTbPayloads[MAX_CELLS_PER_SLOT]; //!< Array of per-cell host destination pointers for batched D2H
 
 } cuphyPuschDataOut_t;
 
@@ -890,12 +962,65 @@ struct cuphyPucchRx;
  */
 typedef struct cuphyPucchRx* cuphyPucchRxHndl_t;
 
-/// PUCCH processing modes
+/// PUCCH processing modes (runtime, per-slot bitmask passed to cuphyRunPucchRx via procModeBmsk)
 typedef enum _cuphyPucchProcMode
 {
-    PUCCH_PROC_MODE_FULL_SLOT = 0x0,        /*!< stream processing */
+    PUCCH_PROC_MODE_FULL_SLOT        = 0x0, /*!< stream processing */
     PUCCH_PROC_MODE_FULL_SLOT_GRAPHS = 0x1, /*!< graph processing */
 } cuphyPucchProcMode_t;
+
+/// Controls which post-front-end stages run in PUCCH RX.
+/// Set once at channel creation via cuphyPucchStatPrms_t::pipelineMode and applies to every
+/// slot for the lifetime of the channel. PUCCH F0/F1 front-end kernels are unaffected by all
+/// modes. F2/F3 front-end kernels also run in all modes. The mode value selects which downstream
+/// stages are gated off; see the per-value docs below for the exact set of skipped stages.
+typedef enum _cuphyPucchPipelineMode
+{
+    PUCCH_PIPELINE_FULL        = 0, /*!< Run the full PUCCH RX pipeline (default). */
+    PUCCH_PIPELINE_SKIP_POLAR  = 1, /*!< Bypass the polar decoder kernel. The decoded UCI segment /
+                                            codeblock buffers and HARQ / CSI-Part1 detection-status
+                                            bytes are NOT produced by the pipeline; the caller is
+                                            responsible for populating them externally. */
+    PUCCH_PIPELINE_SKIP_BACKEND = 2, /*!< Bypass the entire post-front-end backend: Reed-Muller decoder,
+                                            comp_cwTreeTypes, polSegDeRmDeItl, polar decoder, and the
+                                            pucch_F234_uci_seg parser. Only F0..F3 front-end kernels run.
+                                            Final UCI payload buffers are NOT produced; callers that need test-vector
+                                            validation should do it outside the production API. Used for
+                                            offload prototyping. */
+} cuphyPucchPipelineMode_t;
+
+/**
+ * PUCCH post-polar source data for PUCCH_PIPELINE_SKIP_POLAR.
+ *
+ * The caller owns these descriptors and backing storage. cuPHY reads them during
+ * cuphySetupPucchRx() to populate the internal buffers normally written by the
+ * polar decoder. Leave the pipeline data pointer null when skip-polar injection
+ * is not requested.
+ */
+typedef struct _cuphyPucchPostPolarData
+{
+    uint16_t          nPolUciSegs;   /*!< Number of post-polar UCI segments described by the current slot. */
+    uint16_t          nPolCws;       /*!< Number of post-polar codeblocks described by the current slot. */
+    cuphyTensorPrm_t* pCbEsts;       /*!< Source tensor array, dim:nPolCws. Each tensor is CUPHY_R_32U and
+                                          contains decoded codeblock estimate words. */
+    cuphyTensorPrm_t  crcErrorFlags; /*!< Source tensor, dim:nPolCws, CUPHY_R_8U. Value 0 means CRC pass;
+                                          non-zero means CRC failure. */
+} cuphyPucchPostPolarData_t;
+
+/**
+ * PUCCH pipeline mode-conditional execution data.
+ *
+ * Holds optional data used by non-RUN pipeline execution. Set only fields that
+ * match cuphyPucchStatPrms_t::pipelineMode; leave others nullptr.
+ *
+ *  - SKIP_POLAR        : set pPostPolarData.
+ *  - SKIP_BACKEND/FULL : leave nullptr.
+ */
+typedef struct _cuphyPucchPipelineData
+{
+    const cuphyPucchPostPolarData_t* pPostPolarData; /*!< SKIP_POLAR only. Optional post-polar
+                                                          data supplied by a caller/offload source. */
+} cuphyPucchPipelineData_t;
 
 //-----------------------------------------------------------------------------------------------------------
 // PUCCH Static Parameters
@@ -939,6 +1064,14 @@ typedef struct _cuphyPucchStatPrms
 
 
     uint8_t enableBatchedMemcpy;  /*!< Enable batched memory copy. Values: 0->1. */
+
+    cuphyPucchPipelineMode_t pipelineMode; /*!< PUCCH pipeline operating mode (default: PUCCH_PIPELINE_FULL).
+                                                Selects which downstream stages are gated off; see the
+                                                cuphyPucchPipelineMode_t enum and the matching ref-data fields
+                                                in cuphyPucchPipelineData_t. */
+    cuphyPucchPipelineData_t pipelineData; /*!< Mode-conditional execution data; populate only the field
+                                                matching pipelineMode (others must be nullptr). */
+    uint32_t pipelineDelayUs; /*!< Optional GPU busy-wait (microseconds) in the PUCCH pipeline, used as a polar-decoder latency proxy for perf / timeline tests; 0 disables. */
 
     cuphyPucchDbgPrms_t* pDbg; /*!< Debug parameters */
 } cuphyPucchStatPrms_t;
@@ -1016,6 +1149,15 @@ typedef struct _cuphyPucchDataOut
     float*    pRsrp;        /*!< Rsrp reported in dB */
     float*    pTaEst;       /*!< Timing advance reported in uS */
     uint16_t* pNumCsi2Bits; /*!< Array containing per-UCI number of CSI-P2 bits */
+
+    cuphyTensorPrm_t* pF2FrontEndLLRs; /*!< Optional SKIP_BACKEND output tensor array, dim:nF2Ucis.
+                                             When non-null, PUCCH F2 front-end kernels write UCI LLRs
+                                             to these caller-provided CUPHY_R_16F tensors. Leave nullptr
+                                             when frontend/offload outputs are not requested. */
+    cuphyTensorPrm_t* pF3FrontEndLLRs; /*!< Optional SKIP_BACKEND output tensor array, dim:nF3Ucis.
+                                             When non-null, PUCCH F3 front-end kernels write UCI LLRs
+                                             to these caller-provided CUPHY_R_16F tensors. Leave nullptr
+                                             when frontend/offload outputs are not requested. */
 
     // HARQ/CSI part 1/CSI part 2 detection status. Refer to SCF FAPIv10.04
     // Lengths of the following arrays are equal to the number of PF2 and PF3 UCIs
@@ -1783,6 +1925,18 @@ typedef struct _cuphyPdschDbgPrms
 } cuphyPdschDbgPrms_t;
 
 /**
+ * PDSCH pipeline mode (feature of PdschTx channel object)
+ */
+typedef enum _cuphyPdschPipelineMode
+{
+    PDSCH_FULL_PROCESSING     = 0x0, /*!< all cells processed by this PdschTx will undergo full processing:  TB-CRC + CB-CRC/segmentation + LDPC encoding + rate-matching/scrambling/layer-mapping + modulation + DMRS. Only mode supported by cuPHY-CP.*/
+    PDSCH_AAS_PROCESSING      = 0x1, /*!< all cells processed by this PdschTx will undergo: TB-CRC + CB-CRC/segmentation + LDPC encoding + rate-matching/scrambling (Experimental) */
+    PDSCH_POST_FEC_PROCESSING = 0x2,  /*!< all cells processed by this PdschTx will undergo: rate-matching/scrambling/layer-mapping + modulation + DMRS (Experimental) */
+    PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING = 0x3  /*!< all cells processed by this PdschTx will undergo: layer-mapping + modulation + DMRS (Experimental) */
+} cuphyPdschPipelineMode_t;
+
+
+/**
  * PDSCH static parameters
  */
 typedef struct _cuphyPdschStatPrms
@@ -1794,10 +1948,9 @@ typedef struct _cuphyPdschStatPrms
 
     cuphyPdschDbgPrms_t* pDbg;                 /*!< array of cell-specific debug parameters with nCells elements */
     bool                 read_TB_CRC;          /*!< if true, TB crcs are read from input buffers and not computed */
-    bool                 full_slot_processing; /*!< If false, all cells ran on this PdschTx will undergo: TB-CRC + CB-CRC/segmentation + LDPC encoding + rate-matching/scrambling.
-                                    If true, all cells ran on this PdschTx will undergo full slot processing:  TB-CRC + CB-CRC/segmentation + LDPC encoding + rate-matching/scrambling/layer-mapping + modulation + DMRS
-                                    NB: This mode is an a priori known characteristic of the cell; a cell will never switch between modes.
-                                    We may consider moving this parameter to cuphyCellStatPrm_t in the future. */
+
+    cuphyPdschPipelineMode_t pipeline_processing_mode; /*!< determines processing type for all cells running on this PdschTx: full slot, AAS or post-FEC. Only full processing is supported by cuPHY-CP; other modes are experimental.*/
+    uint32_t                 delayUs;                  /*!< Modeling delay of accelerated pipeline (via single thread block GPU kernel); only relevant in case of POST-FEC pipeline_processing mode */
 
     int stream_priority; /*!< CUDA stream priority for all internal to PDSCH streams. Should match the priority of CUDA stream passed in
                                     cuphyPdschDynPrms_t during setup. */
@@ -2076,6 +2229,16 @@ typedef struct _cuphyPdschDataIn
     } pBufferType; /*!< pTbInput[] buffer type */
 } cuphyPdschDataIn_t;
 
+/**
+ * PDSCH Data Input in case of PDSCH_POST_FEC_PROCESSING or PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING mode
+ * Only one of the members will be !nullptr at a time
+ */
+typedef struct _cuphyPdschPostFecDataIn
+{
+    uint32_t* pLdpcOutput; /*!< GPU buffer (!nullptr in PDSCH_POST_FEC_PROCESSING mode); follows format of internal to PDSCH LDPC output buffer(s) in full processing mode. Layout subject to change */
+    uint32_t* pRmScramblingOutput; /*!< GPU buffer (!nullptr in PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING mode). Layout subject to change */
+} cuphyPdschPostFecDataIn_t;
+
 
 /**
  * PDSCH Data Output
@@ -2104,6 +2267,8 @@ typedef struct _cuphyPdschDynPrms
     /** Data parameters */
     cuphyPdschDataIn_t const* pDataIn;      /*!< Pointer to PDSCH data input */
     cuphyPdschDataIn_t const* pTbCRCDataIn; /*!< Pointer to optional TB CRCs */
+    cuphyPdschPostFecDataIn_t const* pPostFecDataIn; /*!< Pointer to PDSCH input buffer in case of PDSCH_POST_FEC_PROCESSING or PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING mode; nullptr otherwise */
+
     cuphyPdschDataOut_t*      pDataOut;     /*!< Pointer to PDSCH data output that will contain pCellGrpDynPrm->nCells tensors */
     cuphyPdschStatusOut_t*    pStatusInfo;  /*!< pointer to struct holding status information; currently specifies if PDSCH setup ran into MAX_ER_CB issue . */
 } cuphyPdschDynPrms_t;
@@ -2388,6 +2553,16 @@ cuphyStatus_t CUPHYWINAPI cuphyDestroyPdschTx(cuphyPdschTxHndl_t pdschTxHndl);
  *
  * @{
  */
+ 
+/**
+ * PDCCH Kernel Selection mode
+ */
+typedef enum _cuphyPdcchKernelSelMode
+{
+    PDCCH_ALL                          = 0x0, 
+    PDCCH_NO_POLAR_ENCODER             = 0x1,   
+    PDCCH_MAX_KERNEL_SEL_MODES         = 0x2
+} cuphyPdcchKernelSelMode_t;
 
 struct cuphyPdcchTx;
 /**
@@ -2404,6 +2579,9 @@ typedef struct _cuphyPdcchStatPrms
     uint16_t nMaxCellsPerSlot; /*!< Maximum number of supported cells (used to define upper limits on number of coresets, number of DCIs etc)
                                     nMaxCoresetsPerSlot = nMaxCellsPerSlot * CUPHY_PDCCH_N_MAX_CORESETS_PER_CELL
                                     nMaxDcisPerSlot     = nMaxCoresetsPerSlot * CUPHY_PDCCH_MAX_DCIS_PER_CORESET */
+    uint8_t kernelSelOption;    /*!< PDCCH kernel selection option. */
+    
+    uint32_t delayUs;          /*!< PDCCH delay in us. */
 } cuphyPdcchStatPrms_t;
 
 /**
@@ -2468,6 +2646,10 @@ typedef struct _cuphyPdcchDataIn
 {
     uint8_t* pDciInput; /*!< Pointer to DCI payloads, payload of each DCI is at stride of CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES bytes from previous.
                              When a cell is in test mode, then the buffer contains bits from the PN23 (pseudorandom sequence).*/
+                             
+    uint8_t* pXInput;   /*!< Pointer to DCI transmit bits.*/
+    
+    uint32_t* pCInput;  /*!< Pointer to scrambling code.*/
     enum
     {
         CPU_BUFFER,

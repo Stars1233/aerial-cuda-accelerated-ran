@@ -1,0 +1,44 @@
+# Suppressions for false positives and third-party libraries
+
+# RDMA/InfiniBand/MLX5 Stack Race Conditions
+# These races occur in the RDMA stack when the main thread
+# closes file descriptors while DPDK's interrupt thread accesses them via epoll_ctl.
+# See: https://inbox.dpdk.org/dev/20220518143940.597724-1-zhichaox.zeng%40intel.com/T/
+
+# DPDK interrupt thread that races with the cleanup functions below
+race:eal_intr_thread_main:eal_interrupts.c
+
+# DPDK MLX5 PMD level
+race:mlx5_pmd_socket_uninit
+race:mlx5_os_dev_shared_handler_uninstall
+race:mlx5_nl_init
+
+# MLX5 user library level
+race:mlx5dv_devx_destroy_cmd_comp
+
+# InfiniBand verbs library level
+race:verbs_uninit_context
+
+# nvIPC efd_tx, shutdown_requested, and server_socket_fd are properly synchronized via C99 atomics.
+# However, TSAN cannot see C99 __atomic_* builtins without whole-program instrumentation, so suppress them here.
+race:ipc_efd_tx_write
+race:recv_fd
+race:shutdown_and_join_thread
+race:unix_socket_server
+
+# nvIPC shared memory buffer pool operations (tx_allocate/tx_send_msg/rx_recv_msg/rx_release) are synchronized
+# via internal ring buffer atomics. TSAN reports false positives on buffer content access because it cannot see
+# the C99 atomic synchronization in the nvipc library without whole-program instrumentation.
+# The memory fences in allocate_message/send_message/receive_message/release_message ensure proper ordering.
+race:build_fapi_header
+race:validate_message_header
+
+# SeqLockedBuffer uses the SeqLock pattern: readers speculatively read non-atomic buffer data,
+# then validate via atomic sequence number checks. TSan cannot model this deliberate race.
+race:SeqLockedBuffer::write
+race:SeqLockedBuffer::read
+
+# fmtlog uses a lock-free SPSC queue between the caller thread and its bg_fmtlog collector.
+# The queue relies on atomic fences that TSAN cannot see without whole-library instrumentation.
+race:fmtlogT
+race:fmt::*::detail::buffer

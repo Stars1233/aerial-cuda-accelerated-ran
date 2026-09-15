@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,7 +21,12 @@
 #include "cell.hpp"
 #include "context.hpp"
 #include "constant.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+#include "aerial-fh-driver/doca_structs.hpp"
+#include <algorithm>
 #include <cmath>
+#include <unordered_set>
+#include <gsl-lite/gsl-lite.hpp>
 #include "ti_generic.hpp"
 
 #define PRINT_MEMORY_FOOTPRINT_IN_CTOR 1
@@ -154,24 +159,36 @@ Cell::Cell(
     }
 
     TI_GENERIC_ADD("Init UL Lists");
-    int section_type_1_ant = std::max(std::max(geteAxCNumPusch(), geteAxCNumPucch()), (size_t)nMaxRxAnt);
-    int section_type_3_ant = std::max(geteAxCNumPrach(), (size_t)nMaxRxAnt);
+    // Size for OAM headroom (64T64R max ports) so later eAxC expansion under live
+    // multi-cell traffic does not cuMemAlloc/cuMemset and stall GpuComm / msg_processing.
+    int section_type_1_ant = static_cast<int>(std::max({geteAxCNumPusch(),
+                                                         geteAxCNumPucch(),
+                                                         static_cast<size_t>(nMaxRxAnt),
+                                                         static_cast<size_t>(MAX_RX_ANT_PUSCH_PUCCH_PRACH_64T64R)}));
+    int section_type_3_ant = static_cast<int>(std::max({geteAxCNumPrach(),
+                                                         static_cast<size_t>(nMaxRxAnt),
+                                                         static_cast<size_t>(MAX_RX_ANT_PUSCH_PUCCH_PRACH_64T64R)}));
+    int section_type_2_ant = static_cast<int>(std::max(geteAxCNumSrs(),
+                                                        static_cast<size_t>(MAX_RX_ANT_SRS_64T64R)));
+    ul_buf_st1_ant_cap_ = static_cast<size_t>(section_type_1_ant);
+    ul_buf_st3_ant_cap_ = static_cast<size_t>(section_type_3_ant);
+    ul_buf_st2_ant_cap_ = static_cast<size_t>(section_type_2_ant);
 
     uint8_t ul_input_buffer_num_per_cell = pdctx->getUlInputBufferPerCell();
     uint8_t ul_input_buffer_num_per_cell_srs = pdctx->getUlInputBufferPerCellSrs();
     for(int i = 0; i < ul_input_buffer_num_per_cell; i++)
     {
-        ulbuf_st1_list.push_back(std::unique_ptr<ULInputBuffer>(new ULInputBuffer(pdh, gDev, cell_id, UL_ST1_AP_BUF_SIZE * section_type_1_ant)));
+        ulbuf_st1_list.push_back(std::make_unique<ULInputBuffer>(pdh, gDev, cell_id, UL_ST1_AP_BUF_SIZE * section_type_1_ant));
     }
 
     for(int i = 0; i < ul_input_buffer_num_per_cell; i++)
     {
-        ulbuf_st3_list.push_back(std::unique_ptr<ULInputBuffer>(new ULInputBuffer(pdh, gDev, cell_id, UL_ST3_AP_BUF_SIZE * section_type_3_ant)));
+        ulbuf_st3_list.push_back(std::make_unique<ULInputBuffer>(pdh, gDev, cell_id, UL_ST3_AP_BUF_SIZE * section_type_3_ant));
     }
 
     for(int i = 0; i < ul_input_buffer_num_per_cell_srs; i++)
     {
-        ulbuf_st2_list.push_back(std::unique_ptr<ULInputBuffer>(new ULInputBuffer(pdh, gDev, cell_id, UL_ST2_AP_BUF_SIZE * geteAxCNumSrs())));
+        ulbuf_st2_list.push_back(std::make_unique<ULInputBuffer>(pdh, gDev, cell_id, UL_ST2_AP_BUF_SIZE * section_type_2_ant));
     }
     ulbuf_st1_index     = 0;
     ulbuf_st2_index     = 0;
@@ -185,38 +202,44 @@ Cell::Cell(
         ul_pcap_capture_rxtimestamp_buffer = std::unique_ptr<ULInputBuffer>(new ULInputBuffer(pdh, gDev, cell_id, MAX_PKTS_PER_PCAP_BUFFER * sizeof(uint64_t)));
     }
 
-    switch(pdctx->getFhProxy()->getBfwCPlaneChainingMode())
+    /* BFW allocation valid only for mMIMO_enable=1 */
+    if(pdctx->getmMIMO_enable())
     {
-        case BfwCplaneChainingMode::NO_CHAINING:
+        switch(pdctx->getFhProxy()->getBfwCPlaneChainingMode())
         {
-            bfw_coeff_buffer_pinned = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
+            case BfwCplaneChainingMode::NO_CHAINING:
+            {
+                bfw_coeff_buffer_pinned = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
 
-            bfw_coeff_buffer_info.header = &bfw_coeff_buffer_header;
-            bfw_coeff_buffer_info.dataH = bfw_coeff_buffer_pinned.addr();
-            bfw_coeff_buffer_info.dataD = nullptr;
-            break;
-        }
-        case BfwCplaneChainingMode::CPU_CHAINING:
-        {
-            bfw_coeff_buffer_pinned = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
-            pdctx->registerBufferToFh(bfw_coeff_buffer_pinned.addr(), pdctx->getFhProxy()->getBfwCoeffSize());
-            bfw_coeff_buffer_info.header = &bfw_coeff_buffer_header;
-            bfw_coeff_buffer_info.dataH = bfw_coeff_buffer_pinned.addr();
-            bfw_coeff_buffer_info.dataD = nullptr;
-            break;
-        }
-        case BfwCplaneChainingMode::GPU_CHAINING: // UL still uses CPU buffer need to keep for both
-        {
-
-            bfw_coeff_buffer_dev = std::move(cuphy::buffer<uint8_t, cuphy::device_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
-            mf.addGpuRegularSize(sizeof(uint8_t)*pdctx->getFhProxy()->getBfwCoeffSize());
-            bfw_coeff_buffer_pinned = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
-            pdctx->registerBufferToFh(bfw_coeff_buffer_pinned.addr(), pdctx->getFhProxy()->getBfwCoeffSize());
-            pdctx->registerBufferToFh(bfw_coeff_buffer_dev.addr(), pdctx->getFhProxy()->getBfwCoeffSize());
-            bfw_coeff_buffer_info.header = &bfw_coeff_buffer_header;
-            bfw_coeff_buffer_info.dataH = bfw_coeff_buffer_pinned.addr();
-            bfw_coeff_buffer_info.dataD = bfw_coeff_buffer_dev.addr();
-            break;
+                bfw_coeff_buffer_info.header = &bfw_coeff_buffer_header;
+                bfw_coeff_buffer_info.dataH = bfw_coeff_buffer_pinned.addr();
+                bfw_coeff_buffer_info.dataD = nullptr;
+                break;
+            }
+            case BfwCplaneChainingMode::CPU_CHAINING:
+            {
+                bfw_coeff_buffer_pinned = std::move(cuphy::buffer<uint8_t, cuphy::pinned_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
+                pdctx->registerBufferToFh(bfw_coeff_buffer_pinned.addr(), pdctx->getFhProxy()->getBfwCoeffSize());
+                bfw_coeff_buffer_info.header = &bfw_coeff_buffer_header;
+                bfw_coeff_buffer_info.dataH = bfw_coeff_buffer_pinned.addr();
+                bfw_coeff_buffer_info.dataD = nullptr;
+                break;
+            }
+            case BfwCplaneChainingMode::GPU_CHAINING:
+            {
+                // Both DL and UL BFW now source their C-plane IQ directly from GPU memory: cuPHY
+                // writes coefficients into dataOutD and the FH chaining path DMAs them from the
+                // device buffer (GPUDirect). The pinned host buffer is therefore no longer needed.
+                // dataH is left null; the host->chunk split (set_bfw_coeff_buff_info) and the FH
+                // SE11 guards are device-aware and key off the device buffer under GPU_CHAINING.
+                bfw_coeff_buffer_dev = std::move(cuphy::buffer<uint8_t, cuphy::device_alloc>(pdctx->getFhProxy()->getBfwCoeffSize()));
+                mf.addGpuRegularSize(sizeof(uint8_t)*pdctx->getFhProxy()->getBfwCoeffSize());
+                pdctx->registerBufferToFh(bfw_coeff_buffer_dev.addr(), pdctx->getFhProxy()->getBfwCoeffSize());
+                bfw_coeff_buffer_info.header = &bfw_coeff_buffer_header;
+                bfw_coeff_buffer_info.dataH = nullptr;
+                bfw_coeff_buffer_info.dataD = bfw_coeff_buffer_dev.addr();
+                break;
+            }
         }
     }
 
@@ -224,96 +247,98 @@ Cell::Cell(
     TI_GENERIC_ADD("cudaMemsets");
     last_sem_idx_rx_h.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(last_sem_idx_rx_h->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)last_sem_idx_rx_h->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(last_sem_idx_rx_h->addr()), 0, 1));
     last_sem_idx_order_h.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(last_sem_idx_order_h->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)last_sem_idx_order_h->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(last_sem_idx_order_h->addr()), 0, 1));
 
     ul_pcap_capture_buffer_index.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(ul_pcap_capture_buffer_index->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)ul_pcap_capture_buffer_index->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(ul_pcap_capture_buffer_index->addr()), 0, 1));
 
     last_sem_idx_srs_rx_h.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(last_sem_idx_srs_rx_h->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)last_sem_idx_srs_rx_h->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(last_sem_idx_srs_rx_h->addr()), 0, 1));
     last_sem_idx_srs_order_h.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(last_sem_idx_srs_order_h->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)last_sem_idx_srs_order_h->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(last_sem_idx_srs_order_h->addr()), 0, 1));
     order_kernel_last_timeout_error_time.reset(new dev_buf(1 * sizeof(uint64_t), gDev));
     mf.addGpuRegularSize(order_kernel_last_timeout_error_time->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)order_kernel_last_timeout_error_time->addr(), 0, sizeof(uint64_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(order_kernel_last_timeout_error_time->addr()), 0, 2));
     order_kernel_srs_last_timeout_error_time.reset(new dev_buf(1 * sizeof(uint64_t), gDev));
     mf.addGpuRegularSize(order_kernel_srs_last_timeout_error_time->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)order_kernel_srs_last_timeout_error_time->addr(), 0, sizeof(uint64_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(order_kernel_srs_last_timeout_error_time->addr()), 0, 2));
     
     next_slot_on_time_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_on_time_rx_packets->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_on_time_rx_packets->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_on_time_rx_packets->addr()), 0, 1));
     next_slot_early_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_early_rx_packets->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_early_rx_packets->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_early_rx_packets->addr()), 0, 1));
     next_slot_late_rx_packets.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_late_rx_packets->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_late_rx_packets->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_late_rx_packets->addr()), 0, 1));
 
     next_slot_on_time_rx_packets_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_on_time_rx_packets_srs->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_on_time_rx_packets_srs->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_on_time_rx_packets_srs->addr()), 0, 1));
     next_slot_early_rx_packets_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_early_rx_packets_srs->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_early_rx_packets_srs->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_early_rx_packets_srs->addr()), 0, 1));
     next_slot_late_rx_packets_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_late_rx_packets_srs->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_late_rx_packets_srs->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_late_rx_packets_srs->addr()), 0, 1));
 
     next_slot_rx_packets_count_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_rx_packets_count_srs->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_packets_count_srs->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_packets_count_srs->addr()), 0, 1));
     next_slot_rx_bytes_count_srs.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_rx_bytes_count_srs->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_bytes_count_srs->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_bytes_count_srs->addr()), 0, 1));
 
     next_slot_rx_packets_ts_srs.reset(new dev_buf(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t), gDev));
     mf.addGpuRegularSize(next_slot_rx_packets_ts_srs->size_alloc);
-    CUDA_CHECK(cudaMemset((uint64_t*)next_slot_rx_packets_ts_srs->addr(), 0, ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint64_t)));
-    
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_packets_ts_srs->addr()), 0, ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_SRS_SYMBOLS_X_SLOT*2));
+
     next_slot_rx_packets_count_per_sym_srs.reset(new dev_buf(ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_rx_packets_count_per_sym_srs->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_packets_count_per_sym_srs->addr(), 0, ORAN_SRS_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_packets_count_per_sym_srs->addr()), 0, ORAN_SRS_SYMBOLS_X_SLOT));
 
     next_slot_rx_packets_ts.reset(new dev_buf(ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t), gDev));
     mf.addGpuRegularSize(next_slot_rx_packets_ts->size_alloc);
-    CUDA_CHECK(cudaMemset((uint64_t*)next_slot_rx_packets_ts->addr(), 0, ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint64_t)));
-    
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_packets_ts->addr()), 0, ORDER_KERNEL_MAX_PKTS_PER_OFDM_SYM*ORAN_PUSCH_SYMBOLS_X_SLOT*2));
+
     next_slot_rx_packets_count.reset(new dev_buf(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_rx_packets_count->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_packets_count->addr(), 0, ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_packets_count->addr()), 0, ORAN_PUSCH_SYMBOLS_X_SLOT));
 
     next_slot_rx_bytes_count.reset(new dev_buf(ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_rx_bytes_count->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_rx_bytes_count->addr(), 0, ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_rx_bytes_count->addr()), 0, ORAN_PUSCH_SYMBOLS_X_SLOT));
 
     next_slot_num_prb_ch1.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_num_prb_ch1->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_num_prb_ch1->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_num_prb_ch1->addr()), 0, 1));
 
     next_slot_num_prb_ch2.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_num_prb_ch2->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_num_prb_ch2->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_num_prb_ch2->addr()), 0, 1));
 
     next_slot_num_prb_ch3.reset(new dev_buf(1 * sizeof(uint32_t), gDev));
     mf.addGpuRegularSize(next_slot_num_prb_ch3->size_alloc);
-    CUDA_CHECK(cudaMemset((uint32_t*)next_slot_num_prb_ch3->addr(), 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(next_slot_num_prb_ch3->addr()), 0, 1));
 
     uint32_t max_K_per_CB = CUPHY_LDPC_BG1_INFO_NODES * CUPHY_LDPC_MAX_LIFTING_SIZE;
     uint32_t tb_bytes = PDSCH_MAX_UES_PER_CELL* MAX_N_CBS_PER_TB_SUPPORTED * div_round_up<uint32_t>(max_K_per_CB, 8);
     
     TI_GENERIC_ADD("cudaMallocs");
-    pdctx->getPdschMpsCtx()->setCtx();
+    pdctx->getH2DCopyManager()->setCtx();
     for(int i = 0; i < PDSCH_MAX_GPU_BUFFS ; i++)
     {
-       CUDA_CHECK_PHYDRIVER(cudaMalloc(&pdsch_tb_buffer[i], tb_bytes));   
-       mf.addGpuRegularSize(tb_bytes);
+        CUdeviceptr dptr{};
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr, tb_bytes));
+        pdsch_tb_buffer[i] = reinterpret_cast<void*>(static_cast<uintptr_t>(dptr));
+        mf.addGpuRegularSize(tb_bytes);
     }
 
     TI_GENERIC_ADD("Print memory footprint");
@@ -321,8 +346,7 @@ Cell::Cell(
     MemFoot mf_acc;
     mf_acc.init((phydriver_handle)pdh, std::string("AccumulatorCellPhy"), sizeof(MemFoot));
     mf_acc.reset();
-    //FIXME ulbuf_st2 was missing from here and destructor; unclear why. Added it
-    // dl_buf_list.size() not available here, only UL buffer are; for DL added code to Cell:setIOBuf()
+    // UL ST1/ST2/ST3 are tracked here; DL buffers are accounted in Cell::setIOBuf().
 
     if(ulbuf_st1_list.size() > 0)
     {
@@ -458,14 +482,14 @@ void Cell::clearULBuffers()
 
 void Cell::resetSemIndices()
 {
-    cudaMemset((uint32_t*)last_sem_idx_rx_h->addr(), 0, sizeof(uint32_t));
-    cudaMemset((uint32_t*)last_sem_idx_order_h->addr(), 0, sizeof(uint32_t));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(last_sem_idx_rx_h->addr()), 0, 1));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(last_sem_idx_order_h->addr()), 0, 1));
 }
 
 void Cell::resetSrsSemIndices()
 {
-    cudaMemset((uint32_t*)last_sem_idx_srs_rx_h->addr(), 0, sizeof(uint32_t));
-    cudaMemset((uint32_t*)last_sem_idx_srs_order_h->addr(), 0, sizeof(uint32_t));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(last_sem_idx_srs_rx_h->addr()), 0, 1));
+    CUDA_DRIVER_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(last_sem_idx_srs_order_h->addr()), 0, 1));
 }
 
 void Cell::printCelleAxCIds()
@@ -504,6 +528,13 @@ void Cell::printCelleAxCIds()
 
 int Cell::updateeAxCIds(std::unordered_map<int, std::vector<uint16_t>>& eaxcids_ch_map)
 {
+    // Capture UL antenna counts before remapping so we only rebuild UL input
+    // buffers when sizes change (cuMemFree/alloc stalls the GPU for all cells).
+    const size_t old_pusch = geteAxCNumPusch();
+    const size_t old_pucch = geteAxCNumPucch();
+    const size_t old_prach = geteAxCNumPrach();
+    const size_t old_srs   = geteAxCNumSrs();
+
     for(auto& [ch, eaxcids] : eaxcids_ch_map)
     {
         eAxC_ids[static_cast<slot_command_api::channel_type>(ch)] = eaxcids;
@@ -511,14 +542,7 @@ int Cell::updateeAxCIds(std::unordered_map<int, std::vector<uint16_t>>& eaxcids_
     NVLOGC_FMT(TAG, "\t Cell {} eAxCIds updated: ", mplane_id);
     printCelleAxCIds();
 
-    for(auto& nic : fh_proxy->getNicList())
-    {
-        fh_proxy->removePeer(nic2peer_map[nic]);
-    }
-    clearULBuffers();
-
-    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
-    std::vector<uint16_t>& eAxC_list_uplink=geteAxCIdsUl();
+    std::vector<uint16_t>& eAxC_list_uplink = geteAxCIdsUl();
     eAxC_list_uplink.clear();
 
     for (int channel = slot_command_api::channel_type::PUSCH; channel < slot_command_api::channel_type::SRS; channel++)
@@ -526,99 +550,135 @@ int Cell::updateeAxCIds(std::unordered_map<int, std::vector<uint16_t>>& eaxcids_
         for (auto eAxC : eAxC_ids[channel])
         {
             auto it = std::find(std::begin(eAxC_list_uplink), std::end(eAxC_list_uplink), (uint16_t) eAxC);
-            if(it!=std::end(eAxC_list_uplink))
+            if(it != std::end(eAxC_list_uplink))
+            {
                 continue;
+            }
             eAxC_list_uplink.push_back(eAxC);
         }
     }
 
+    std::unordered_set<uint16_t> desired_eaxcs;
+    for(int channel = slot_command_api::channel_type::PDSCH_CSIRS; channel < slot_command_api::channel_type::CHANNEL_MAX; channel++)
+    {
+        for(auto eAxC : eAxC_ids[channel])
+        {
+            desired_eaxcs.insert(eAxC);
+        }
+    }
+
+    // Keep the FH peer alive: destroying/recreating it frees GPU TXQ memory and
+    // stalls GpuComm for every other live cell on the same NIC (fatal DL wait).
+    // Expand-only OAM updates also keep existing Flow objects; only new eAxCs
+    // allocate GPU pkt-hdr slots. Batch H2D via begin/endFlowRegistration.
+    // begin before prepareFlowRebind: prepare is destructive (clear/remove flows),
+    // so a begin failure must not leave the peer half-reset.
     for(auto& nic : fh_proxy->getNicList())
     {
-        if(fh_proxy->registerPeer(mplane_id, nic2peer_map[nic], src_eth_addr, dst_eth_addr, vlan_tci, txq_count_uplane, dl_comp_meth, dl_bit_width, gDev->getId(), nic, &nic2doca_rxq_info_map[nic], &nic2doca_rxq_info_srs_map[nic], eAxC_list_uplink, (std::vector<uint16_t>&)geteAxCIdsSrs(), (std::vector<uint16_t>&)geteAxCIdsPdsch()))
-            PHYDRIVER_THROW_EXCEPTIONS(-1, "Add Peer for cell returned error");
-
-        for(int channel = slot_command_api::channel_type::PDSCH_CSIRS; channel < slot_command_api::channel_type::CHANNEL_MAX; channel++)
+        const auto peer_it = nic2peer_map.find(nic);
+        if(peer_it == nic2peer_map.end())
         {
-            for(auto eAxC : eAxC_ids[channel])
+            PHYDRIVER_THROW_EXCEPTIONS(-1, "NIC has no peer mapping for eAxC update");
+        }
+        const auto peer_id = peer_it->second;
+        if(fh_proxy->beginFlowRegistration(peer_id))
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(-1, "Begin flow registration returned error");
+        }
+
+        // Always end the batched session so deferred GPU hdr-size sync cannot
+        // leave the peer half-registered if prepare/updatePeer/registerFlow throws.
+        int end_registration_rc = 0;
+        {
+            auto end_registration_guard = gsl_lite::finally([&] {
+                end_registration_rc = fh_proxy->endFlowRegistration(peer_id);
+            });
+
+            if(fh_proxy->prepareFlowRebind(peer_id, desired_eaxcs))
             {
-                if(fh_proxy->registerFlow(nic2peer_map[nic], eAxC, vlan_tci, static_cast<slot_command_api::channel_type>(channel)))
-                    PHYDRIVER_THROW_EXCEPTIONS(-1, "Add flowreturned error");
+                PHYDRIVER_THROW_EXCEPTIONS(-1, "Prepare flow rebind for cell returned error");
+            }
+
+            auto eAxC_list_srs = geteAxCIdsSrs();
+            if(fh_proxy->updatePeer(peer_id, dst_eth_addr, vlan_tci, eAxC_list_uplink,
+                                    eAxC_list_srs))
+            {
+                PHYDRIVER_THROW_EXCEPTIONS(-1, "Update peer RX rules returned error");
+            }
+
+            for(int channel = slot_command_api::channel_type::PDSCH_CSIRS; channel < slot_command_api::channel_type::CHANNEL_MAX; channel++)
+            {
+                for(auto eAxC : eAxC_ids[channel])
+                {
+                    if(fh_proxy->registerFlow(peer_id, eAxC, vlan_tci, static_cast<slot_command_api::channel_type>(channel)))
+                    {
+                        PHYDRIVER_THROW_EXCEPTIONS(-1, "Add flow returned error");
+                    }
+                }
             }
         }
+        if(end_registration_rc)
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(-1, "End flow registration returned error");
+        }
     }
 
-    int section_type_1_ant = std::max(std::max(geteAxCNumPusch(), geteAxCNumPucch()), (size_t)nMaxRxAnt);
-    int section_type_3_ant = std::max(geteAxCNumPrach(), (size_t)nMaxRxAnt);
+    const size_t need_st1 = std::max({geteAxCNumPusch(), geteAxCNumPucch(), static_cast<size_t>(nMaxRxAnt)});
+    const size_t need_st3 = std::max(geteAxCNumPrach(), static_cast<size_t>(nMaxRxAnt));
+    const size_t need_st2 = geteAxCNumSrs();
 
-    uint8_t ul_input_buffer_num_per_cell = pdctx->getUlInputBufferPerCell();
-    uint8_t ul_input_buffer_num_per_cell_srs = pdctx->getUlInputBufferPerCellSrs();
-    for(int i = 0; i < ul_input_buffer_num_per_cell; i++)
+    // Keep nMaxRxAnt consistent with the expanded eAxC set (config may still say 4).
+    nMaxRxAnt = static_cast<uint16_t>(std::max({static_cast<size_t>(nMaxRxAnt),
+                                                  geteAxCNumPusch(),
+                                                  geteAxCNumPucch(),
+                                                  geteAxCNumPrach()}));
+
+    // Buffers are pre-sized for 64T64R OAM headroom at construction. Only schedule a
+    // resize if somehow the new set exceeds that capacity (should not happen for
+    // standard OAM test yamls). Never realloc on Cell::start() under live traffic —
+    // cuMemAlloc/cuMemset stalls GpuComm and blocks msg_processing (fatal timing).
+    const bool ul_buf_resize =
+        (need_st1 > ul_buf_st1_ant_cap_) ||
+        (need_st3 > ul_buf_st3_ant_cap_) ||
+        (need_st2 > ul_buf_st2_ant_cap_);
+
+    if(ul_buf_resize)
     {
-        ulbuf_st1_list.push_back(std::unique_ptr<ULInputBuffer>(new ULInputBuffer(pdh, gDev, cell_id, UL_ST1_AP_BUF_SIZE * section_type_1_ant)));
+        pending_ul_buf_resize_ = true;
+        NVLOGW_FMT(TAG,
+                   "Cell {} eAxC update exceeds UL buffer capacity (need st1/st2/st3 {}/{}/{}, cap {}/{}/{}) — "
+                   "deferring realloc to start(); this may disrupt live cells on the same GPU",
+                   mplane_id,
+                   need_st1,
+                   need_st2,
+                   need_st3,
+                   ul_buf_st1_ant_cap_,
+                   ul_buf_st2_ant_cap_,
+                   ul_buf_st3_ant_cap_);
     }
-
-    for(int i = 0; i < ul_input_buffer_num_per_cell; i++)
+    else
     {
-        ulbuf_st3_list.push_back(std::unique_ptr<ULInputBuffer>(new ULInputBuffer(pdh, gDev, cell_id, UL_ST3_AP_BUF_SIZE * section_type_3_ant)));
+        // A prior OAM update may have armed the deferred resize; clear it when the
+        // latest configuration again fits current capacity so start() skips realloc.
+        pending_ul_buf_resize_ = false;
+        if((geteAxCNumPusch() != old_pusch) ||
+           (geteAxCNumPucch() != old_pucch) ||
+           (geteAxCNumPrach() != old_prach) ||
+           (geteAxCNumSrs() != old_srs))
+        {
+            NVLOGI_FMT(TAG,
+                       "Cell {} eAxC counts changed but UL buffers already sized (cap st1/st2/st3 {}/{}/{}) — no realloc",
+                       mplane_id,
+                       ul_buf_st1_ant_cap_,
+                       ul_buf_st2_ant_cap_,
+                       ul_buf_st3_ant_cap_);
+        }
     }
 
-    for(int i = 0; i < ul_input_buffer_num_per_cell_srs; i++)
-    {
-        ulbuf_st2_list.push_back(std::unique_ptr<ULInputBuffer>(new ULInputBuffer(pdh, gDev, cell_id, UL_ST2_AP_BUF_SIZE * geteAxCNumSrs())));
-    }
-    ulbuf_st1_index     = 0;
-    ulbuf_st2_index     = 0;
-    ulbuf_st3_index     = 0;
-
+    // Cell is inactive here. Zero UL/SRS order-kernel semaphore indices so the next
+    // start() does not reuse stale last_sem_idx_* from the previous eAxC binding.
     resetSemIndices();
     resetSrsSemIndices();
-
-#if PRINT_MEMORY_FOOTPRINT_IN_CTOR
-    MemFoot mf_acc;
-    mf_acc.init((phydriver_handle)pdh, std::string("AccumulatorCellPhy"), sizeof(MemFoot));
-    mf_acc.reset();
-    //FIXME ulbuf_st2 was missing from here and destructor; unclear why. Added it
-    // dl_buf_list.size() not available here, only UL buffer are; for DL added code to Cell:setIOBuf()
-
-    if(ulbuf_st1_list.size() > 0)
-    {
-        ulbuf_st1_list[0]->mf.printMemoryFootprint();
-        for(int i = 0; i < ulbuf_st1_list.size(); i++)
-        {
-            mf_acc.addMF(ulbuf_st1_list[i]->mf);
-        }
-        mf_acc.printMemoryFootprint();
-        pdctx->wip_accum_mf.addMF(mf_acc);
-        //pdctx->wip_accum_mf.printMemoryFootprint();
-        mf_acc.reset();
-    }
-
-    if(ulbuf_st3_list.size() > 0)
-    {
-        ulbuf_st3_list[0]->mf.printMemoryFootprint();
-        for(int i = 0; i < ulbuf_st3_list.size(); i++)
-        {
-            mf_acc.addMF(ulbuf_st3_list[i]->mf);
-        }
-        mf_acc.printMemoryFootprint();
-        pdctx->wip_accum_mf.addMF(mf_acc);
-        //pdctx->wip_accum_mf.printMemoryFootprint();
-        mf_acc.reset();
-    }
-
-    if(ulbuf_st2_list.size() > 0)
-    {
-        ulbuf_st2_list[0]->mf.printMemoryFootprint();
-        for(int i = 0; i < ulbuf_st2_list.size(); i++)
-        {
-            mf_acc.addMF(ulbuf_st2_list[i]->mf);
-        }
-        mf_acc.printMemoryFootprint();
-        pdctx->wip_accum_mf.addMF(mf_acc);
-        //pdctx->wip_accum_mf.printMemoryFootprint();
-        mf_acc.reset();
-    }
-#endif
     return 0;
 }
 
@@ -655,6 +715,12 @@ int Cell::setPhyStatic(struct cell_phy_info& c_phy)
     prachCellStatParams = c_phy.prachStatParams;
     prachOccaStatParamList.reserve(PRACH_MAX_OCCASIONS);
     prachOccaStatParamList = c_phy.prach_configs;
+
+    prach_freq_offsets_ = c_phy.prach_freq_offsets;
+    prach_seq_length_   = c_phy.prach_seq_length;
+    dl_freq_abs_a_khz_  = c_phy.dl_freq_abs_a_khz;
+    pmi_entries_        = c_phy.pmi_entries;
+    bfw_dbt_pdu_payloads_ = c_phy.bfw_dbt_pdu_payloads;
 
     fh_proxy->update_peer_max_num_prbs_per_symbol(getPeerId(),std::max(phy_stat.nPrbDlBwp,phy_stat.nPrbUlBwp));
 
@@ -698,25 +764,18 @@ int Cell::setPhyStatic(struct cell_phy_info& c_phy)
 int Cell::setGpuItems()
 {
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(this->getPhyDriverHandler()).get();
-
-    if(pdctx->getUlCtx()->getGpuDevice()->getId() != gDev->getId())
-        PHYDRIVER_THROW_EXCEPTIONS(errno, "MPS device is different from Cell device. Multi-GPU is not supported yet");
-    pdctx->setUlCtx();
-    CUDA_CHECK(cudaStreamCreateWithPriority(&stream_ul, cudaStreamNonBlocking, -3));
-    CUDA_CHECK(cudaStreamCreateWithPriority(&stream_order, cudaStreamNonBlocking, -5));
-
-    launch_kernel_warmup(stream_order);
-    launch_kernel_order(stream_order, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
-    launch_kernel_order(stream_order, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
-    gDev->synchronizeStream(stream_order);
-
     if(pdctx->getDlCtx()->getGpuDevice()->getId() != gDev->getId())
         PHYDRIVER_THROW_EXCEPTIONS(errno, "MPS device is different from Cell device. Multi-GPU is not supported yet");
     pdctx->setDlCtx();
-    CUDA_CHECK(cudaStreamCreateWithPriority(&stream_dl, cudaStreamNonBlocking, -4));
-    launch_kernel_warmup(stream_dl);
+    CUfunction warmup_func{};
+    if(!resolve_warmup_kernel_handle(&warmup_func))
+    {
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve warmup_kernel CUfunction handle");
+    }
+    CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&stream_dl, CU_STREAM_NON_BLOCKING, -4));
+    launch_kernel_warmup(warmup_func, stream_dl);
     
-    cudaDeviceSynchronize();
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
 
     return 0;
 }
@@ -901,6 +960,34 @@ uint16_t Cell::getPrachOccaPrmStatIdx()
     return prachOccaPrmStatIdx;
 }
 
+std::optional<int32_t> Cell::getPrachFreqOffset(uint8_t fd_idx) const
+{
+    if (fd_idx >= prach_freq_offsets_.size()) {
+        return std::nullopt;
+    }
+    return prach_freq_offsets_[fd_idx];
+}
+
+uint8_t Cell::getPrachSeqLength() const
+{
+    return prach_seq_length_;
+}
+
+uint32_t Cell::getDlFreqAbsAKhz() const
+{
+    return dl_freq_abs_a_khz_;
+}
+
+const std::vector<cell_phy_info::pmi_entry>& Cell::getPmiEntries() const
+{
+    return pmi_entries_;
+}
+
+const std::vector<std::vector<uint8_t>>& Cell::getBfwDbtPduPayloads() const
+{
+    return bfw_dbt_pdu_payloads_;
+}
+
 const char* Cell::getTvPuschH5File(void)
 {
     if(tv_pusch_h5.empty()) return nullptr;
@@ -999,16 +1086,6 @@ uint8_t Cell::getMu() const
 GpuDevice* Cell::getGpuDevice() const
 {
     return gDev;
-}
-
-cudaStream_t Cell::getUlChannelStream()
-{
-    return stream_ul;
-}
-
-cudaStream_t Cell::getUlOrderStream()
-{
-    return stream_order;
 }
 
 cudaStream_t Cell::getDlStream()
@@ -1594,8 +1671,109 @@ void Cell::stop()
     active_srs = CELL_INACTIVE;
 }
 
+void Cell::rebuildULBuffers()
+{
+    clearULBuffers();
+
+    PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
+    int section_type_1_ant = static_cast<int>(std::max({geteAxCNumPusch(),
+                                                         geteAxCNumPucch(),
+                                                         static_cast<size_t>(nMaxRxAnt),
+                                                         static_cast<size_t>(MAX_RX_ANT_PUSCH_PUCCH_PRACH_64T64R),
+                                                         ul_buf_st1_ant_cap_}));
+    int section_type_3_ant = static_cast<int>(std::max({geteAxCNumPrach(),
+                                                         static_cast<size_t>(nMaxRxAnt),
+                                                         static_cast<size_t>(MAX_RX_ANT_PUSCH_PUCCH_PRACH_64T64R),
+                                                         ul_buf_st3_ant_cap_}));
+    int section_type_2_ant = static_cast<int>(std::max({geteAxCNumSrs(),
+                                                         static_cast<size_t>(MAX_RX_ANT_SRS_64T64R),
+                                                         ul_buf_st2_ant_cap_}));
+    ul_buf_st1_ant_cap_ = static_cast<size_t>(section_type_1_ant);
+    ul_buf_st3_ant_cap_ = static_cast<size_t>(section_type_3_ant);
+    ul_buf_st2_ant_cap_ = static_cast<size_t>(section_type_2_ant);
+
+    uint8_t ul_input_buffer_num_per_cell = pdctx->getUlInputBufferPerCell();
+    uint8_t ul_input_buffer_num_per_cell_srs = pdctx->getUlInputBufferPerCellSrs();
+    for(int i = 0; i < ul_input_buffer_num_per_cell; i++)
+    {
+        ulbuf_st1_list.push_back(std::make_unique<ULInputBuffer>(pdh, gDev, cell_id, UL_ST1_AP_BUF_SIZE * section_type_1_ant));
+    }
+
+    for(int i = 0; i < ul_input_buffer_num_per_cell; i++)
+    {
+        ulbuf_st3_list.push_back(std::make_unique<ULInputBuffer>(pdh, gDev, cell_id, UL_ST3_AP_BUF_SIZE * section_type_3_ant));
+    }
+
+    for(int i = 0; i < ul_input_buffer_num_per_cell_srs; i++)
+    {
+        ulbuf_st2_list.push_back(std::make_unique<ULInputBuffer>(pdh, gDev, cell_id, UL_ST2_AP_BUF_SIZE * section_type_2_ant));
+    }
+    ulbuf_st1_index     = 0;
+    ulbuf_st2_index     = 0;
+    ulbuf_st3_index     = 0;
+    pending_ul_buf_resize_ = false;
+
+    // Match historical updateeAxCIds behavior after UL buffer rebuild.
+    resetSemIndices();
+    resetSrsSemIndices();
+
+#if PRINT_MEMORY_FOOTPRINT_IN_CTOR
+    // Same UL MemFoot re-accumulation that updateeAxCIds used to run after realloc.
+    // UL ST1/ST2/ST3 are tracked here; DL buffers are accounted in Cell::setIOBuf().
+    MemFoot mf_acc;
+    mf_acc.init(pdh, std::string("AccumulatorCellPhy"), sizeof(MemFoot));
+    mf_acc.reset();
+
+    if(ulbuf_st1_list.size() > 0)
+    {
+        ulbuf_st1_list[0]->mf.printMemoryFootprint();
+        for(auto& ulbuf : ulbuf_st1_list)
+        {
+            mf_acc.addMF(ulbuf->mf);
+        }
+        mf_acc.printMemoryFootprint();
+        pdctx->wip_accum_mf.addMF(mf_acc);
+        //pdctx->wip_accum_mf.printMemoryFootprint();
+        mf_acc.reset();
+    }
+
+    if(ulbuf_st3_list.size() > 0)
+    {
+        ulbuf_st3_list[0]->mf.printMemoryFootprint();
+        for(auto& ulbuf : ulbuf_st3_list)
+        {
+            mf_acc.addMF(ulbuf->mf);
+        }
+        mf_acc.printMemoryFootprint();
+        pdctx->wip_accum_mf.addMF(mf_acc);
+        //pdctx->wip_accum_mf.printMemoryFootprint();
+        mf_acc.reset();
+    }
+
+    if(ulbuf_st2_list.size() > 0)
+    {
+        ulbuf_st2_list[0]->mf.printMemoryFootprint();
+        for(auto& ulbuf : ulbuf_st2_list)
+        {
+            mf_acc.addMF(ulbuf->mf);
+        }
+        mf_acc.printMemoryFootprint();
+        pdctx->wip_accum_mf.addMF(mf_acc);
+        //pdctx->wip_accum_mf.printMemoryFootprint();
+        mf_acc.reset();
+    }
+#endif
+}
+
 void Cell::start()
 {
+    if(pending_ul_buf_resize_)
+    {
+        NVLOGW_FMT(TAG,
+                   "Cell {} applying deferred UL buffer resize before start — may stall live GpuComm",
+                   mplane_id);
+        rebuildULBuffers();
+    }
     active = CELL_ACTIVE;
     active_srs = CELL_ACTIVE;
 }

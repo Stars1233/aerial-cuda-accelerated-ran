@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -142,6 +142,11 @@ static void* ipc_mempool_get_addr(nv_ipc_mempool_t* mempool, int32_t index)
     else
     {
         priv_data_t* priv_data = get_private_data(mempool);
+        if(index >= priv_data->pool_len)
+        {
+            NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid index %d", __func__, index);
+            return NULL;
+        }
         return priv_data->body + (size_t)priv_data->buf_size * index;
     }
 }
@@ -532,15 +537,15 @@ nv_ipc_mempool_t* nv_ipc_mempool_open(int primary, const char* name, int buf_siz
 #endif
     if(ipc_mempool_open(priv_data, name, cuda_device_id) < 0)
     {
-        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: name=%s length=%d cuda_device_id=%d Failed",
-                __func__, name, priv_data->pool_len, priv_data->cuda_device_id);
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: name=%s size=%d*%d cuda_device_id=%d Failed",
+                __func__, name, priv_data->buf_size, priv_data->pool_len, priv_data->cuda_device_id);
         ipc_mempool_close(mempool);
         return NULL;
     }
     else
     {
-        NVLOGI(TAG, "%s: name=%s body=%p length=%d cuda_device_id=%d in_gpu=%d OK", __func__,
-                name, priv_data->body, priv_data->pool_len, priv_data->cuda_device_id, is_device_pointer(priv_data->body));
+        NVLOGI(TAG, "%s: name=%s body=%p size=%d*%d cuda_device_id=%d in_gpu=%d OK", __func__,
+                name, priv_data->body, priv_data->buf_size, priv_data->pool_len, priv_data->cuda_device_id, is_device_pointer(priv_data->body));
         return mempool;
     }
 }

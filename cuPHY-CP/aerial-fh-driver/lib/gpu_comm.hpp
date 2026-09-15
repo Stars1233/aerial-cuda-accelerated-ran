@@ -125,6 +125,8 @@ struct PacketCopyParams {
     uint8_t frame_id;
     uint16_t subframe_id;
     uint16_t slot_id;
+    /** DOCA flow TX ring depth (<= kMaxFlows). Copy kernel Y grid and bounds checks must match Nic buffer sizing. */
+    uint32_t num_dl_flows_cap{0};
 };
 
 using num_packets_per_flow_t = std::array<uint32_t,kMaxFlows>;
@@ -135,8 +137,10 @@ int gpucomm_pre_prepare_send(PrepareParams &params, cudaStream_t cstream);
 void launch_packet_memcpy_kernel(PacketCopyParams, int num_cells, cudaStream_t strm);
 int gpucomm_prepare_send(PrepareParams &params, cudaStream_t cstream);
 int gpucomm_trigger_send(TriggerParams &params, cudaStream_t cstream, bool cx6);
-int gpucomm_ring_doorbell_for_cells(doca_gpu_eth_txq** d_txq_handlers, const uint32_t* d_wqe_indices, const uint32_t num_cells, cudaStream_t cstream);
-void force_loading_gpu_comm_kernels();
+/// Resolve CUfunction handles for all GPU communication CUDA kernels via cudaGetFuncBySymbol.
+/// Called once during GpuComm construction before any kernel launch.
+/// @return true if all kernels resolved successfully, false otherwise.
+[[nodiscard]] bool resolve_gpu_comm_kernels();
 
 class GpuComm {
 public:

@@ -26,6 +26,9 @@
 #include <string>
 #include <cstring>  // for memset
 #include <cstdlib>
+#include <algorithm> // for std::copy
+#include "polar_cw_tree_layout.hpp" // codeword-tree buffer regions
+#include "polar_op_list_host.hpp" // shared host reference for the SC/fast-SSC operation lists
 
 // Define CUDA_CHECK macro for error checking
 #define CUDA_CHECK(call) \
@@ -232,8 +235,9 @@ protected:
         const uint16_t N_cw = static_cast<uint16_t>(size);
         const uint16_t N_tree = ComputeTreeLeafCount(N_cw);
 
-        // Full tree array layout: indices [2 .. 2*N_tree-1] used, 0 and 1 unused.
-        std::vector<uint8_t> types(2u * static_cast<size_t>(N_tree), 0);
+        // Full tree array layout: indices [2 .. 2*N_tree-1] used, 0 and 1 unused,
+        // then the two operation-list regions (see polar_cw_tree_layout.hpp).
+        std::vector<uint8_t> types(cuphy::polar::PolarCwTreeLayout::sizeBytes(N_tree), 0);
 
         // Build leaf types at indices [N_tree .. 2*N_tree-1].
         // Keep leaves mostly {0,1}. Internal nodes are derived bottom-up to be consistent.
@@ -288,6 +292,17 @@ protected:
             const uint8_t l = types[static_cast<size_t>(2 * node)];
             const uint8_t r = types[static_cast<size_t>(2 * node + 1)];
             types[static_cast<size_t>(node)] = (l == r && (l == 0 || l == 1)) ? l : 3;
+        }
+
+        // Append the SC and fast-SSC operation lists in their own regions using
+        // the shared host reference -- the single source of truth that mirrors
+        // the compCwTreeTypes device kernel (see polar_op_list_host.hpp).
+        {
+            using Layout = cuphy::polar::PolarCwTreeLayout;
+            const std::vector<uint8_t> scOpList  = cuphy::polar::buildPolarOpList(types.data(), N_tree);
+            const std::vector<uint8_t> fssOpList = cuphy::polar::buildPolarFssOpList(types.data(), N_tree);
+            std::copy(scOpList.begin(),  scOpList.end(),  types.begin() + static_cast<std::ptrdiff_t>(Layout::scOpListOffset(N_tree)));
+            std::copy(fssOpList.begin(), fssOpList.end(), types.begin() + static_cast<std::ptrdiff_t>(Layout::fssOpListOffset(N_tree)));
         }
 
         return types;
@@ -998,6 +1013,111 @@ TEST_F(PolarDecoderTest, ErrorHandlingTest) {
     EXPECT_EQ(CUPHY_STATUS_SUCCESS, status);
     EXPECT_GT(sizeBytes, 0);
     EXPECT_GT(alignBytes, 0);
+}
+
+// GT-12744 / review C-2 + B-8 part 2: validate that the compCwTreeTypes device
+// kernel emits the same SC and fast-SSC operation lists as the shared host
+// reference (polar_op_list_host.hpp). The other fixtures feed a host-built
+// opList to the decoder and never check the device kernel's own [2N,3N)/[3N,4N)
+// output; this closes that gap across a range of (N_cw, K_cw) that exercise the
+// REP/SPC/pair fusion classes.
+TEST_F(PolarDecoderTest, CompCwTreeTypes_DeviceOpListMatchesHostReference) {
+    struct Cfg { uint16_t N_cw; uint16_t A_cw; uint8_t nCrcBits; uint8_t n_cw; };
+    const std::vector<Cfg> cfgs = {
+        {128, 32, 11, 7},
+        {256, 100, 11, 8},
+        {512, 58, 6, 9},
+        {1024, 200, 11, 10},
+    };
+
+    for(const Cfg& c : cfgs) {
+        const uint16_t K_cw = static_cast<uint16_t>(c.A_cw + c.nCrcBits);
+
+        PolarTestConfig cfg = {
+            "compCwTreeTypes opList vs host ref",
+            1, 1, c.N_cw, c.A_cw, c.nCrcBits, 1,
+            false, false, 0, 0, CUPHY_STATUS_SUCCESS
+        };
+        SetupTestConfiguration(cfg);
+
+        cuphyPolarUciSegPrm_t hSegPrm{};
+        hSegPrm.nCbs           = 1;
+        hSegPrm.childCbIdxs[0] = 0;
+        hSegPrm.childCbIdxs[1] = 0;
+        hSegPrm.zeroInsertFlag = 0;
+        hSegPrm.nCrcBits       = c.nCrcBits;
+        hSegPrm.K_cw           = K_cw;
+        hSegPrm.N_cw           = c.N_cw;
+        hSegPrm.E_seg          = 0;
+        hSegPrm.E_cw           = 0;
+        hSegPrm.n_cw           = c.n_cw;
+
+        cuphyPolarUciSegPrm_t* dSegPrm = nullptr;
+        ASSERT_EQ(cudaSuccess, cudaMalloc(&dSegPrm, sizeof(cuphyPolarUciSegPrm_t)));
+        ASSERT_EQ(cudaSuccess, cudaMemcpy(dSegPrm, &hSegPrm, sizeof(cuphyPolarUciSegPrm_t), cudaMemcpyHostToDevice));
+
+        size_t compDynSz = 0, compDynAlign = 0;
+        ASSERT_EQ(CUPHY_STATUS_SUCCESS, cuphyCompCwTreeTypesGetDescrInfo(&compDynSz, &compDynAlign));
+        (void)compDynAlign;
+
+        void* compDynCpu = nullptr;
+        void* compDynGpu = nullptr;
+        ASSERT_EQ(cudaSuccess, cudaMallocHost(&compDynCpu, compDynSz));
+        ASSERT_EQ(cudaSuccess, cudaMalloc(&compDynGpu, compDynSz));
+        void* compDynCpuTreeAddrs = nullptr;
+        ASSERT_EQ(cudaSuccess, cudaMallocHost(&compDynCpuTreeAddrs, sizeof(uint8_t*) * 1));
+
+        cuphyCompCwTreeTypesHndl_t compHndl = nullptr;
+        ASSERT_EQ(CUPHY_STATUS_SUCCESS, cuphyCreateCompCwTreeTypes(&compHndl));
+
+        cuphyCompCwTreeTypesLaunchCfg_t compLaunchCfg{};
+        std::vector<uint8_t*> cwTreeTypesAddrsCpu(1);
+        cwTreeTypesAddrsCpu[0] = reinterpret_cast<uint8_t*>(cwPrmsCpu[0].pCwTreeTypes);
+
+        ASSERT_EQ(CUPHY_STATUS_SUCCESS,
+                  cuphySetupCompCwTreeTypes(compHndl, /*nPolUciSegs*/ 1, &hSegPrm, dSegPrm,
+                                            cwTreeTypesAddrsCpu.data(),
+                                            compDynCpu, compDynGpu, compDynCpuTreeAddrs,
+                                            /*enableDescrAsync*/ false, &compLaunchCfg, cuStream));
+        ASSERT_EQ(cudaSuccess, cudaMemcpyAsync(compDynGpu, compDynCpu, compDynSz, cudaMemcpyHostToDevice, cuStream));
+        ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
+
+        const CUDA_KERNEL_NODE_PARAMS& p = compLaunchCfg.kernelNodeParamsDriver;
+        ASSERT_NE(nullptr, p.func);
+        ASSERT_EQ(CUDA_SUCCESS, cuLaunchKernel(p.func, p.gridDimX, p.gridDimY, p.gridDimZ,
+                                               p.blockDimX, p.blockDimY, p.blockDimZ,
+                                               p.sharedMemBytes, static_cast<CUstream>(cuStream),
+                                               p.kernelParams, p.extra));
+        ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(cuStream));
+
+        // Read back the full device-produced codeword-tree buffer.
+        std::vector<uint8_t> devOut(cuphy::polar::PolarCwTreeLayout::sizeBytes(c.N_cw), 0);
+        ASSERT_EQ(cudaSuccess, cudaMemcpy(devOut.data(), cwPrmsCpu[0].pCwTreeTypes,
+                                          devOut.size(), cudaMemcpyDeviceToHost));
+
+        // Host reference opLists computed from the device's OWN tree types [0,2N),
+        // then byte-compared against the device's emitted [2N,3N)/[3N,4N) regions.
+        const std::vector<uint8_t> hostSc  = cuphy::polar::buildPolarOpList(devOut.data(), c.N_cw);
+        const std::vector<uint8_t> hostFss = cuphy::polar::buildPolarFssOpList(devOut.data(), c.N_cw);
+        ASSERT_LE(hostSc.size(),  static_cast<size_t>(c.N_cw));
+        ASSERT_LE(hostFss.size(), static_cast<size_t>(c.N_cw));
+
+        for(size_t i = 0; i < hostSc.size(); ++i) {
+            EXPECT_EQ(hostSc[i], devOut[cuphy::polar::PolarCwTreeLayout::scOpListOffset(c.N_cw) + i])
+                << "SC opList mismatch at entry " << i << " for N_cw=" << c.N_cw;
+        }
+        for(size_t i = 0; i < hostFss.size(); ++i) {
+            EXPECT_EQ(hostFss[i], devOut[cuphy::polar::PolarCwTreeLayout::fssOpListOffset(c.N_cw) + i])
+                << "fast-SSC operation list mismatch at entry " << i << " for N_cw=" << c.N_cw;
+        }
+
+        ASSERT_EQ(CUPHY_STATUS_SUCCESS, cuphyDestroyCompCwTreeTypes(compHndl));
+        cudaFree(dSegPrm);
+        cudaFreeHost(compDynCpu);
+        cudaFree(compDynGpu);
+        cudaFreeHost(compDynCpuTreeAddrs);
+        FreeTestData();
+    }
 }
 
 // main()

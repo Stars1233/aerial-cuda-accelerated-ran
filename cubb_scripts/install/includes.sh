@@ -35,9 +35,15 @@ LOGFILE=${LOGFILE:-/var/log/aerial-installer.log}
 # Set by log_init: 1 if we need sudo to write to LOGFILE, 0 if not (so tee vs sudo tee).
 LOG_NEEDS_SUDO=1
 
-# Source versions.sh (platform-specific and common versions). One-way: includes.sh -> versions.sh only.
+# Source shared versions. Install scripts require a supported host platform.
 _INCLUDES_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-[[ -f "$_INCLUDES_DIR/versions.sh" ]] && source "$_INCLUDES_DIR/versions.sh" || { echo "ERROR: versions.sh not found: $_INCLUDES_DIR/versions.sh" >&2; exit 1; }
+_VERSIONS_SH="$(readlink -f "$_INCLUDES_DIR/../../cuPHY-CP/container/versions.sh")"
+AERIAL_REQUIRE_HOST_PLATFORM=1
+if [[ -f "$_VERSIONS_SH" ]]; then
+    source "$_VERSIONS_SH" || { echo "ERROR: failed to source $_VERSIONS_SH (exit $?)" >&2; exit 1; }
+else
+    echo "ERROR: versions.sh not found: $_VERSIONS_SH" >&2; exit 1
+fi
 
 # Parse common arguments and populate REMAINING_ARGS with unhandled arguments
 # Usage: parse_common_args "$@"
@@ -301,6 +307,7 @@ INSTALL_DEPS_APT=(
     gnupg
     ethtool
     tcpdump
+    lshw
 )
 
 # Check which dependencies are already installed and which need installing.

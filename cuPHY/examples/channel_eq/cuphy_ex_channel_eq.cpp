@@ -24,6 +24,8 @@
 
 #include "hdf5hpp.hpp"
 #include "cuphy_hdf5.hpp"
+#include "channel_eq/channel_eq.hpp"
+#include "channel_eq/dft_s_ofdm_bluestein_workspace.hpp"
 #include "pusch_rx.hpp"
 #include "pusch_utils.hpp"
 #include "datasets.hpp"
@@ -56,22 +58,9 @@ size_t getBufferSizeBluesteinWorkspace(cuphyPuschStatPrms_t const* pStatPrms)
      {
          return 0;
      }
-     else
-     {
-         //////// 53 different DFT sizes for DFT-s-OFDM//////////////////////////////
-         // 12 24 36 48 60:                                              FFT128
-         // 72 96 108 120:                                               FFT256
-         // 144 180 192 216 240:                                         FFT512
-         // 288 300 324 360 384 432 480:                                 FFT1024
-         // 540 576 600 648 720 768 864 900 960 972:                     FFT2048
-         // 1080 1152 1200 1296 1440 1500 1536 1620 1728 1800 1920 1944: FFT4096
-         // 2160 2304 2400 2592 2700 2880 2916 3000 3072 3240:           FFT8192
-         // Memeory size for Bluestein Workspace in both time and frequency domains
-         return 53*sizeof(data_type_traits<CUPHY_C_32F>::type)*FFT8192*2;
-     }
+     return cuphy::getDftSOfdmBluesteinWorkspaceSizeBytes(pStatPrms->nMaxPrb);
 }
 
-// TODO for size reduction
 size_t getBufferSize(cuphyPuschStatPrms_t const* pStatPrms)
 {
     // data type sizes
@@ -172,13 +161,12 @@ size_t getBufferSize(cuphyPuschStatPrms_t const* pStatPrms)
     uint32_t maxBytesCfoEst = N_BYTES_C32 * MAX_ND_SUPPORTED * CUPHY_PUSCH_RX_MAX_N_LAYERS_PER_UE_GROUP * MAX_N_USER_GROUPS_SUPPORTED;
     nBytesBuffer += maxBytesCfoEst + EXTRA_PADDING;
 
-    // max DFT data buffer
+    // DFT-s-OFDM DataEqDft buffer only. Bluestein chirp tables use a separate allocator;
+    // the IDFT FFT runs in registers/shared memory (no per-UE-group FFT scratch).
     if(pStatPrms->enableDftSOfdm==1)
     {
-        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * 3276 * (OFDM_SYMBOLS_PER_SLOT - 1) + EXTRA_PADDING);
-        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * FFT8192 * (OFDM_SYMBOLS_PER_SLOT - 1) + EXTRA_PADDING); //for intermediate results in Bluestein's FFT
-        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * FFT8192 + EXTRA_PADDING); //for time domain data in Bluestein's FFT Workspace
-        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * FFT8192 + EXTRA_PADDING); //for freq domain data in Bluestein's FFT Workspace
+        const uint32_t maxDftTones = CUPHY_N_TONES_PER_PRB * max_nPrbUlBwp;
+        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * maxDftTones * (OFDM_SYMBOLS_PER_SLOT - 1) + EXTRA_PADDING);
     }
 
     if(pStatPrms->enableSinrMeasurement)// || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo))
@@ -363,14 +351,27 @@ int main(int argc, char* argv[])
 
         if(chEstSettings.enableDftSOfdm==1)
         {
+            const auto bluesteinWsDims = cuphy::getDftSOfdmBluesteinWorkspaceDims(staticApiDataset.puschStatPrms.nMaxPrb);
+
             m_LinearAllocBluesteinWorkspace.reset();
-            m_tRefBluesteinWorkspaceTime.desc().set(CUPHY_C_32F, 53, FFT8192, cuphy::tensor_flags::align_tight);
+            m_tRefBluesteinWorkspaceTime.desc().set(CUPHY_C_32F,
+                                                    static_cast<int>(bluesteinWsDims.numRows),
+                                                    static_cast<int>(bluesteinWsDims.fftWidth),
+                                                    cuphy::tensor_flags::align_tight);
             m_LinearAllocBluesteinWorkspace.alloc(m_tRefBluesteinWorkspaceTime);
             copyTensorRef2Info(m_tRefBluesteinWorkspaceTime, tInfoDftBluesteinWorkspaceTime);
     
-            m_tRefBluesteinWorkspaceFreq.desc().set(CUPHY_C_32F, 53, FFT8192, cuphy::tensor_flags::align_tight);
+            m_tRefBluesteinWorkspaceFreq.desc().set(CUPHY_C_32F,
+                                                    static_cast<int>(bluesteinWsDims.numRows),
+                                                    static_cast<int>(bluesteinWsDims.fftWidth),
+                                                    cuphy::tensor_flags::align_tight);
             m_LinearAllocBluesteinWorkspace.alloc(m_tRefBluesteinWorkspaceFreq);
             copyTensorRef2Info(m_tRefBluesteinWorkspaceFreq, tInfoDftBluesteinWorkspaceFreq);
+
+            channel_eq::puschRxChEqIdftStatDescr_t* pIdftStatDescrCpu = reinterpret_cast<channel_eq::puschRxChEqIdftStatDescr_t*>(
+                static_cast<void*>(statCpuDescrStartAddrs[PUSCH_CH_EQ_IDFT_EQ_TEST]));
+            pIdftStatDescrCpu->nBluesteinWorkspaceRows    = static_cast<uint16_t>(bluesteinWsDims.numRows);
+            pIdftStatDescrCpu->bluesteinWorkspaceFftWidth = static_cast<uint16_t>(bluesteinWsDims.fftWidth);
 //    
 //            if(!m_cudaDeviceArchInfo.cuPHYSupported)
 //            {
@@ -651,6 +652,8 @@ int main(int argc, char* argv[])
                                                 m_nMaxPrb,
                                                 chEstSettings.enableCfoCorrection,
                                                 chEstSettings.enablePuschTdi,
+                                                PUSCH_7_2_A,
+                                                PUSCH_ALL,
                                                 CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK, // for full-slot processing
                                                 enableCpuToGpuDescrAsyncCpy ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
                                                 static_cast<void*>(dynCpuDescrStartAddrs[PUSCH_CH_EQ_SOFT_DEMAP_EQ_TEST]),

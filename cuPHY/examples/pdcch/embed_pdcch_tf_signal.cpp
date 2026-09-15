@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,6 +54,8 @@ int main(int argc, char* argv[])
     uint64_t procModeBmsk   = 0;
     int      num_iterations = 1;
     char nvlog_yaml_file[1024];
+    uint8_t  kernelSelMode = PDCCH_ALL;
+    uint32_t delayUs = 0;
     // Relative path from binary to default nvlog_config.yaml
     std::string relative_path = std::string("../../../../").append(NVLOG_DEFAULT_CONFIG_FILE);
     nv_get_absolute_path(nvlog_yaml_file, relative_path.c_str());
@@ -90,6 +92,22 @@ int main(int argc, char* argv[])
                 }
                 ++iArg;
                 break;
+            case 'F':
+                if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%hhu", &kernelSelMode)) || (kernelSelMode >= PDCCH_MAX_KERNEL_SEL_MODES))
+                {
+                    NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported GPU kernel selection mode");
+                    exit(1);
+                }
+                ++iArg;
+                break;
+            case 'X':
+                if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%u", &delayUs)) || delayUs > 5000)
+                {
+                    NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT,  "ERROR: too large delay duration");
+                    exit(1);
+                }
+                ++iArg;
+                break;
             default:
                 NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT, "ERROR: Unknown option: {}", argv[iArg]);
                 usage();
@@ -117,6 +135,8 @@ int main(int argc, char* argv[])
     std::unique_ptr<cuphyPdcchTxHndl_t> pdcch_handle = std::make_unique<cuphyPdcchTxHndl_t>();
 
     pdcchStaticApiDataset static_dataset;
+    static_dataset.pdcchStatPrms.kernelSelOption = kernelSelMode;
+    static_dataset.pdcchStatPrms.delayUs = delayUs;
     pdcchDynApiDataset    dynamic_dataset(inputFileName, 1 /* number of cells*/, strm_handle, procModeBmsk);
 
     status = cuphyCreatePdcchTx(pdcch_handle.get(), &(static_dataset.pdcchStatPrms));

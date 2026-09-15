@@ -15,15 +15,20 @@
  * limitations under the License.
  */
 
- #ifndef _CUMAC_MU_UE_GRP_DATA_TYPE_
- #define _CUMAC_MU_UE_GRP_DATA_TYPE_
- 
- #include <stdint.h>
- #include <stddef.h>
- 
- #if defined(__cplusplus)
- extern "C" {
- #endif
+#ifndef _CUMAC_MU_UE_GRP_DATA_TYPE_
+#define _CUMAC_MU_UE_GRP_DATA_TYPE_
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+#if defined(__cplusplus)
+#include <cuda_fp16.h>
+#endif
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
  
 // *********************************** MU-MIMO UE grouping constants *****************************************************
 /// @brief maximum number of cells for joint scheduling. Default: 6
@@ -35,8 +40,8 @@
 /// @brief number of antenna ports per RU. Default: 64
 #define MAX_NUM_BS_ANT_PORT (64U)
 
-/// @brief maximum number of PRGs per cell. Default:272 PRBs/2 prbPerPrg = 136 PRGs
-#define MAX_NUM_PRG (136U)
+/// @brief maximum number of PRGs per cell. Default: 273
+#define MAX_NUM_PRG (273U)
 
 /// @brief maximum number of subbands per UE considered for UE grouping. Default: 4
 #define MAX_NUM_SUBBAND (4U)
@@ -68,6 +73,8 @@
 /// @brief maximum number of UEGs scheduled per cell per TTI. Default: 4
 #define MAX_NUM_UEG_PER_CELL (4U)
 
+/// @brief Element count for cumac_muUeGrp_req_srs_info_t::srsChanEst (same tensor rank as the CUDA __half2 array)
+#define CUMAC_MUUEGRP_SRS_CHAN_EST_LEN (MAX_NUM_BS_ANT_PORT * MAX_NUM_UE_ANT_PORT * MAX_NUM_SUBBAND * MAX_NUM_PRG_SAMP_PER_SUBBAND)
 
 /// @brief inline function to convert a float to a 32-bit integer in bits format
 static inline uint32_t cumac_f32_to_u32_bits(float x)
@@ -80,7 +87,7 @@ static inline uint32_t cumac_f32_to_u32_bits(float x)
 // ************************************ MU-MIMO UE grouping data structures **************************************
 // input to cuMAC UE grouping on GPU
 /// @brief per SRS-enabled UE information structure
-typedef struct {
+typedef struct _cumac_muUeGrp_req_ue_info {
     uint32_t    avgRate; // average rate in DL, in bits/s
     uint32_t    currRate; // current instantaneous rate in DL, in bits/s
     uint32_t    bufferSize; // current buffer size in bits
@@ -98,7 +105,7 @@ typedef struct {
 } cumac_muUeGrp_req_ue_info_t;
 
 /// @brief per-UE SRS channel estimation information structure with cuBB/cuMAC SRS memory bank sharing
-typedef struct {
+typedef struct _cumac_muUeGrp_req_srs_info_msh {
     uint32_t    srsWbSnr; // wideband SNR in dB measured within configured SRS bandwidth for the UE, stored as a 32-bit integer. Need to be populated by L2 stack.
     uint32_t    realBuffIdx; // real buffer index of the SRS channel estimates in the SRS memory bank, also the corrresping GPU buffer index. Does NOT need to be populated by L2 stack.
     uint16_t    rnti; // C-RNTI ranging from 1 to 65535. Need to be populated by L2 stack.
@@ -111,18 +118,23 @@ typedef struct {
 } cumac_muUeGrp_req_srs_info_msh_t;
  
 /// @brief per-UE SRS channel estimation information structure (without cuBB/cuMAC SRS memory bank sharing)
-typedef struct {
+typedef struct _cumac_muUeGrp_req_srs_info {
     uint32_t    srsWbSnr; // wideband SNR in dB measured within configured SRS bandwidth for the UE, stored as a 32-bit integer
     uint16_t    rnti; // C-RNTI ranging from 1 to 65535
     uint16_t    id; // 0-based cell-specific UE ID used for cuMAC scheduling, ranging from 0 to MAX_NUM_SRS_UE_PER_CELL-1
     uint8_t     nUeAnt; // number of SRS TX antenna ports. Value: 2, 4
     uint8_t     flags = 0x00; // 1st bit (flags & 0x01) - is a valid SRS info, 0: invalid, 1: valid
-    __half2     srsChanEst[MAX_NUM_BS_ANT_PORT*MAX_NUM_UE_ANT_PORT*MAX_NUM_SUBBAND*MAX_NUM_PRG_SAMP_PER_SUBBAND];
+#if defined(__cplusplus)
+    __half2 srsChanEst[CUMAC_MUUEGRP_SRS_CHAN_EST_LEN];
+#else
+    /* Opaque layout matching CUDA __half2[CUMAC_MUUEGRP_SRS_CHAN_EST_LEN] for plain C translation units */
+    uint8_t srsChanEst[CUMAC_MUUEGRP_SRS_CHAN_EST_LEN * 4u];
+#endif
     // for each subband, each PRG, each UE/RU antenna port, each RU antenna port
 } cumac_muUeGrp_req_srs_info_t;
 
 /// @brief per-cell UE grouping information structure
-typedef struct {
+typedef struct _cumac_muUeGrp_req_info {
     uint32_t    betaCoeff = cumac_f32_to_u32_bits(1.0f); // exponent applied to the instantaneous rate for proportional-fair scheduling. Default value is 1.0.
     uint32_t    muCoeff = cumac_f32_to_u32_bits(1.5f); // coefficient for prioritizing UEs feasible for MU-MIMO transmissions. Default value is 1.5.
     uint32_t    chanCorrThr = cumac_f32_to_u32_bits(0.7f); // threshold on the channel vector correlation value for UE grouping. Value: a real number between 0 and 1.0. Default: 0.7
@@ -143,9 +155,9 @@ typedef struct {
     uint8_t     nMaxLayerPerUeMu = 4; // maximium number of layers per UE for MU-MIMO. Default: 4
     uint8_t     nMaxUegPerCell = 4; // maximum number of UEGs per cell. Default: 4
     uint8_t     allocType = 1; // PRB allocation type. Currently only support 1: consecutive type-1 allocation.  
-    cumac_muUeGrp_req_srs_info_t* srsInfo;
-    cumac_muUeGrp_req_srs_info_msh_t* srsInfoMsh;
-    cumac_muUeGrp_req_ue_info_t* ueInfo; 
+    cumac_muUeGrp_req_srs_info_t* srsInfo; // only included when memory sharing is disabled
+    cumac_muUeGrp_req_srs_info_msh_t* srsInfoMsh; // only included when memory sharing is enabled
+    cumac_muUeGrp_req_ue_info_t* ueInfo; // always included
     uint8_t     payload[];
 } cumac_muUeGrp_req_info_t;
 
@@ -197,7 +209,19 @@ typedef struct {
     uint8_t     extraPayload[0];   // extra payload for future use
 } cumac_muUeGrp_resp_msg_t;
 
- #if defined(__cplusplus)
+/// @brief get the size of the MU-MIMO UE grouping request info structure
+inline size_t cumac_muUeGrp_req_info_size(bool is_mem_sharing)
+{
+    size_t size = sizeof(cumac_muUeGrp_req_info_t) + sizeof(cumac_muUeGrp_req_ue_info_t) * MAX_NUM_SRS_UE_PER_CELL;
+    if (is_mem_sharing) {
+        size += sizeof(cumac_muUeGrp_req_srs_info_msh_t) * MAX_NUM_UE_SRS_INFO_PER_SLOT;
+    } else {
+        size += sizeof(cumac_muUeGrp_req_srs_info_t) * MAX_NUM_UE_SRS_INFO_PER_SLOT;
+    }
+    return size;
+}
+
+#if defined(__cplusplus)
 } /* extern "C" */
 #endif
 

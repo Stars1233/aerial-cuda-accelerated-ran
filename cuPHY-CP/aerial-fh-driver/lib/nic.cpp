@@ -22,6 +22,7 @@
 #include "peer.hpp"
 #include "utils.hpp"
 #include "gpu_comm.hpp"
+#include <algorithm>
 #include <time.h>
 #include <stdio.h>
 #include <net/if.h>
@@ -65,6 +66,7 @@ Nic::Nic(Fronthaul* fhi, NicInfo const* info) :
     set_mtu();
     restrict_ingress_traffic();
     create_cpu_mbuf_pool();
+    create_cpu_cplane_mbuf_pool();
     if (fhi->get_info().cuda_device_ids.empty() && !fhi->get_info().cuda_device_ids_for_compute.empty()) //CPU Init Comms mode
     {
         create_cpu_pinned_mbuf_pool();
@@ -241,14 +243,24 @@ void Nic::doca_probe_device()
             devargs_builder << "tx_pp=" << accu_tx_sched_res_ns << ",";
     }
 
-    devargs_builder << "txq_inline_max=0,dv_flow_en=2"; //HWS
+    // Newer MLX5 PMD APIs do not support the eCPRI flex parser required for C-plane
+    // flow steering in HWS mode (dv_flow_en=2). Use SWS (dv_flow_en=1) instead.
+#if HAVE_RTE_PMD_MLX5_ENABLE_STEERING
+    devargs_builder << "txq_inline_max=0,dv_flow_en=1"; // newer API: SWS, eCPRI flex parser support
+#else
+    devargs_builder << "txq_inline_max=0,dv_flow_en=2"; // legacy API: HWS
+#endif
     auto devargs = std::string(devargs_builder);
 
     NVLOGI_FMT(TAG, "DOCA hotplug-adding NIC {} with following devargs: {}", name, devargs.c_str());
 
 
     //Explicitly enable DPDK steering here (should be done before port probe)
+#if HAVE_RTE_PMD_MLX5_ENABLE_STEERING
+    if(rte_pmd_mlx5_enable_steering()<0)
+#else
     if(rte_pmd_mlx5_driver_enable_steering()<0)
+#endif
     {
         THROW_FH(rte_errno, StringBuilder() << "Failed to enable DPDK steering");
     }
@@ -529,6 +541,36 @@ void Nic::create_cpu_mbuf_pool()
         }
         cpu_tx_mbuf_pool_.reset(mp);
     }
+}
+
+void Nic::create_cpu_cplane_mbuf_pool()
+{
+    uint16_t droom_sz = RTE_ALIGN_MUL_CEIL(
+        info_.mtu + RTE_PKTMBUF_HEADROOM + RTE_ETHER_HDR_LEN + RTE_ETHER_CRC_LEN,
+        kMbufPoolDroomSzAlign);
+    const auto mbuf_num = [&]() -> uint32_t {
+        if(!(fhi_->get_info().cuda_device_ids.empty()))
+        {
+            return rte_align32pow2(info_.cpu_mbuf_num) - 1;
+        }
+        return rte_align32pow2(info_.cpu_mbuf_tx_num) - 1;
+    }();
+
+    std::string name = StringBuilder() << "cp_mbuf_" << info_.name;
+
+    NVLOGI_FMT(TAG, "Initializing C-plane mbuf mempool for NIC {}. {} mbuf entries. Mbuf droom sz: {}",
+        info_.name.c_str(), mbuf_num, droom_sz);
+
+    auto mp = rte_pktmbuf_pool_create(
+        name.c_str(), mbuf_num, 0, 0, droom_sz,
+        rte_eth_dev_socket_id(port_id_));
+
+    if (mp == nullptr) {
+        NVLOGE_FMT(TAG, AERIAL_DPDK_API_EVENT,
+            "Could not create {} mempool: {}", name, rte_strerror(rte_errno));
+        return;
+    }
+    cpu_cplane_mbuf_pool_.reset(mp);
 }
 
 void Nic::create_gpu_mbuf_pool()
@@ -966,6 +1008,7 @@ void Nic::set_port_id()
 
 void Nic::set_qp_clock_id()
 {
+#if HAVE_RTE_PMD_MLX5_TXPP_IDX
     int qp_clock_id = rte_pmd_mlx5_txpp_idx(get_port_id());
     if(qp_clock_id < 0)
     {
@@ -975,24 +1018,39 @@ void Nic::set_qp_clock_id()
     {
         qp_clock_id_ = (uint32_t)qp_clock_id;
     }
-
+#else
+    // Newer DPDK releases no longer expose rte_pmd_mlx5_txpp_idx; default to 0.
+    qp_clock_id_ = 0;
+    NVLOGI_FMT(TAG, "rte_pmd_mlx5_txpp_idx not available in this DPDK version, using default qp_clock_id=0");
+#endif
     qp_clock_id_be_ = rte_cpu_to_be_32(qp_clock_id_);
 }
 
 void Nic::set_flow_comm_buf()
 {
-    num_packets                  = kGpuCommSendPeers * kMaxFlows * kMaxPktsFlow;
+    // Cap to kMaxFlows (MAX_DL_EAXCIDS): flow indices and GPU comm layout are sized for at most kMaxFlows DL flows.
+    const auto num_dl_flows = std::min(static_cast<int>(fhi_->get_info().max_dl_antenna_ports), kMaxFlows);
+    if (num_dl_flows <= 0) {
+        NVLOGE_FMT(TAG, AERIAL_DPDK_API_EVENT, "max_dl_antenna_ports is 0 - cannot size DOCA TX ring");
+        THROW_FH(EINVAL, StringBuilder() << "max_dl_antenna_ports must be > 0 for GPU comm");
+    }
+    num_dl_flows_ = num_dl_flows;
+
+    const auto send_peers = static_cast<int>(getGpuCommSendPeers());
+    num_packets                  = send_peers * num_dl_flows * kMaxPktsFlow;
     packet_size_rnd              = ((get_mtu() + pageSizeAlign - 1) / pageSizeAlign) * pageSizeAlign;
     packet_size_rnd_local_ = packet_size_rnd;
     if(rte_is_power_of_2(packet_size_rnd_local_) == 0)
         packet_size_rnd_local_ = rte_align32pow2(packet_size_rnd_local_);
 
-    for(int i = 0; i < kGpuCommSendPeers * kMaxFlows; i++)
+    for(int i = 0; i < send_peers * num_dl_flows; i++)
     {
         flow_idx_q_.push(i);
     }
 
-    doca_error_t ret = doca_create_tx_buf(&flow_tx_buf, get_fronthaul()->get_docaGpuParams()->gpu, get_doca_dev(), DOCA_GPU_MEM_TYPE_GPU, num_packets, packet_size_rnd_local_,fhi_->get_info().enable_gpu_comm_via_cpu);
+    NVLOGI_FMT(TAG, "GPU comm DOCA tx buffer: num_dl_flows={} (kMaxFlows={}) num_packets={}", num_dl_flows, kMaxFlows, num_packets);
+
+    doca_error_t ret = doca_create_tx_buf(&flow_tx_buf, get_fronthaul()->get_docaGpuParams()->gpu, get_doca_dev(), DOCA_GPU_MEM_TYPE_GPU, static_cast<uint32_t>(num_packets), packet_size_rnd_local_,fhi_->get_info().enable_gpu_comm_via_cpu);
     if(ret != DOCA_SUCCESS)
     {
         NVLOGE_FMT(TAG, AERIAL_DPDK_API_EVENT, "Could not alloc flow DOCA tx buffer");
@@ -1137,6 +1195,11 @@ uint16_t Nic::get_mtu() const
     return info_.mtu;
 }
 
+int Nic::get_num_dl_flows() const
+{
+    return num_dl_flows_;
+}
+
 uint16_t Nic::get_nxt_flow_idx()
 {
     const std::lock_guard<aerial_fh::FHMutex> lock(flow_idx_q_lock_);
@@ -1163,6 +1226,11 @@ rte_mempool* Nic::get_cpu_mbuf_pool() const
 rte_mempool* Nic::get_cpu_tx_mbuf_pool() const
 {
     return info_.split_cpu_mp ? cpu_tx_mbuf_pool_.get() : get_cpu_mbuf_pool();
+}
+
+rte_mempool* Nic::get_cpu_cplane_mbuf_pool() const
+{
+    return cpu_cplane_mbuf_pool_.get();
 }
 
 rte_mempool* Nic::get_rx_mbuf_pool(bool hostPinned) const

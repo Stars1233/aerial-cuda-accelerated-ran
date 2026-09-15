@@ -44,9 +44,16 @@ class event_callback;
 class phy_epoll_context {
 public:
     //------------------------------------------------------------------
-    // phy_epoll_context()
-    // throw std::system_error(errno, std::generic_category()) on error
+    /*
+     * phy_epoll_context()
+     * Create a new epoll fd and throw std::system_error(errno, std::generic_category()) on error
+     */
     phy_epoll_context();
+
+    /*
+     * phy_epoll_context(phy_epoll_context&& t)
+     * Move constructor
+     */
     phy_epoll_context(phy_epoll_context&& t) :
         epoll_fd(std::move(t.epoll_fd)),
         fd_cache(std::move(t.fd_cache)),
@@ -55,8 +62,15 @@ public:
         epoll_events(std::move(t.epoll_events)),
         active(std::move(t.active))
     {
+        // Clear source epoll_fd so ~phy_epoll_context() won't close the moved fd.
+        t.epoll_fd = ipc_base::INVALID_FD;
     }
-    ~phy_epoll_context();
+
+    /*
+     * phy_epoll_context::~phy_epoll_context() noexcept
+     * Close the epoll fd and set it to INVALID_FD
+     */
+    ~phy_epoll_context() noexcept;
     //------------------------------------------------------------------
     // add_fd()
     void add_fd(int fd, event_callback* cb, uint32_t events = EPOLLIN);

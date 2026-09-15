@@ -15,22 +15,34 @@
  * limitations under the License.
  */
 
+#if !defined(RATE_MATCHING_HPP_INCLUDED_)
+#define RATE_MATCHING_HPP_INCLUDED_
+
 #include <functional>
 #include "cuphy.h"
 
 constexpr float    LLR_MAX_ABS_VALUE = 10000.0f;
-constexpr uint32_t DERM_BLK_DIM      = 96;  // block dimension for de-rate-matching kernels
+constexpr uint32_t DERM_BLK_DIM      = 256;  // block dimension for de-rate-matching kernels
 
 struct puschRxRateMatchDescr
 {
     const void*        llr_vec_in[MAX_N_TBS_PER_CELL_GROUP_SUPPORTED]; // Rm input LLRs    //ToDo change to void**
     uint16_t           schUserIdxs[MAX_N_TBS_PER_CELL_GROUP_SUPPORTED];
-    void**             out;        // Rm output LLRs
+    uint16_t           cbBegin[MAX_N_TBS_PER_CELL_GROUP_SUPPORTED]; //!< First codeblock included in each TB's rate-match range.
+    uint16_t           cbEnd[MAX_N_TBS_PER_CELL_GROUP_SUPPORTED];   //!< One past the last codeblock included in each TB's rate-match range.
+    void*              out[MAX_N_TBS_SUPPORTED];       // Rm output LLRs
     const PerTbParams* tbPrmsArray;
     int                descramblingOn;
 
 };
 typedef struct puschRxRateMatchDescr puschRxRateMatchDescr_t;
+
+struct cuphyPuschRxRateMatchCbRange
+{
+    uint16_t cbBegin; //!< First codeblock included in the rate-match range.
+    uint16_t cbEnd;   //!< One past the last codeblock included in the rate-match range.
+};
+typedef struct cuphyPuschRxRateMatchCbRange cuphyPuschRxRateMatchCbRange_t;
 
 
 typedef struct _puschRxRateMatchLaunchGeo
@@ -82,13 +94,19 @@ public:
                 void*                             pGpuDesc,                     // pointer to descriptor in gpu
                 uint8_t                           enableCpuToGpuDescrAsyncCpy,  // option to copy cpu descriptors from cpu to gpu
                 cuphyPuschRxRateMatchLaunchCfg_t* pLaunchCfg,                   // pointer to rate matching launch configuration
-                cudaStream_t                      strm);                        // stream to perform copy
+                cudaStream_t                      strm,                         // stream to perform copy
+                const cuphyPuschRxRateMatchCbRange_t* pCbRangesCpu = nullptr);  // optional per-SCH-UE CB ranges
 
 private:
     // class state modifed by setup saved in data member.
     CUfunction m_kernelFunc;
-    CUfunction m_resetBufferKernelFunc;  // Reset buffer kernel dispatcher
-    CUfunction m_clampBufferKernelFunc;  // Clamp buffer kernel dispatcher
+    CUfunction m_resetBufferKernelFunc;         // Reset buffer kernel dispatcher
+    CUfunction m_clampBufferKernelFunc;         // Clamp buffer kernel dispatcher
+    CUfunction m_cbRangeKernelFunc;
+    CUfunction m_cbRangeResetBufferKernelFunc;  // Ranged reset buffer kernel dispatcher
+    CUfunction m_cbRangeClampBufferKernelFunc;  // Ranged clamp buffer kernel dispatcher
     int        m_descramblingOn;
     int        m_rmFPconfig{};  // Store FP configuration for kernel selection
 };
+
+#endif // !defined(RATE_MATCHING_HPP_INCLUDED_)

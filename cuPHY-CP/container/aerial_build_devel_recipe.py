@@ -18,7 +18,16 @@ Usage:
 $ hpccm --recipe aerial_build_devel_recipe.py --format docker
 """
 
-# Check if AERIAL_REPO user argument exists
+import os
+from typing import Optional
+
+def required_env(name: str) -> str:
+    value: Optional[str] = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Environment variable {name} must be set")
+    return value
+
+# Check if AERIAL_REPO user argument exists, if not, raise an error.
 AERIAL_REPO = USERARG.get('AERIAL_REPO')
 if AERIAL_REPO is None:
     raise RuntimeError("User argument AERIAL_REPO must be set")
@@ -35,8 +44,10 @@ elif cpu_target == 'aarch64':
 else:
     raise RuntimeError("Unsupported platform")
 
+CONTAINER_UBUNTU_DISTRO = required_env("CONTAINER_UBUNTU_DISTRO")
+
 # Use Aerial base image
-Stage0 += baseimage(image=f'{AERIAL_REPO}aerial_base:{AERIAL_VERSION_TAG}', _arch=cpu_target, _distro='ubuntu22')
+Stage0 += baseimage(image=f'{AERIAL_REPO}aerial_base:{AERIAL_VERSION_TAG}', _arch=cpu_target, _distro=CONTAINER_UBUNTU_DISTRO)
 
 ospackages=[
         'autoconf',
@@ -47,17 +58,22 @@ ospackages=[
         'debhelper',
         'check',
         'chrpath',
-        'dpatch',
+        'clang-format',
+        'clang-tidy',
+        'cmake-format',
+        'cppcheck',
         'ethtool',
         'flex',
         'gdb',
         'git-lfs',
+        'girepository-2.0',
         'help2man',
         'htop',
         'iproute2',
         'jq',
         'libbsd-dev',
         'libcairo2',
+        'libcairo2-dev',
         'libcurl4-openssl-dev',
         'libglib2.0-dev',
         'libjson-c-dev',
@@ -74,7 +90,6 @@ ospackages=[
         'lsof',
         'libssl-dev',
         'm4',
-        'mlocate',
         'net-tools',
         'ninja-build',
         'pciutils',
@@ -84,7 +99,7 @@ ospackages=[
         'python3-cairo',
         'python3-pyelftools',
         'python3-testresources',
-        'python3.10-venv',
+        'python3.12-venv',
         'psmisc',
         'quilt',
         'rt-tests',
@@ -102,19 +117,15 @@ ospackages=[
 Stage0 += user(user='root')
 Stage0 += packages(ospackages=ospackages)
 
-# Install TensorRT for CUDA 13.0 (compatible with CUDA 13.1 runtime)
-# TensorRT 10.14.1.48 is the latest version supporting CUDA 13.0
-# Note: As of Jan 2026, TensorRT doesn't officially support CUDA 13.1 yet
-# CUDA 13.0 libraries work with CUDA 13.1 due to forward compatibility
-TENSORRT_VERSION = "10.14.1.48"
-TENSORRT_MAJOR = "10.14.1"
-CUDA_VERSION = "13.0"
+TENSORRT_VERSION = required_env("TENSORRT_VERSION")
+TENSORRT_MAJOR = ".".join(TENSORRT_VERSION.split(".")[:3])
+TENSORRT_CUDA_VERSION = required_env("TENSORRT_CUDA_VERSION")
 if cpu_target == 'x86_64':
     TENSORRT_ARCH = "x86_64-gnu"
 else:
     TENSORRT_ARCH = "aarch64-gnu"
 
-TENSORRT_FILENAME = f"TensorRT-{TENSORRT_VERSION}.Linux.{TENSORRT_ARCH}.cuda-{CUDA_VERSION}.tar.gz"
+TENSORRT_FILENAME = f"TensorRT-{TENSORRT_VERSION}.Linux.{TENSORRT_ARCH}.cuda-{TENSORRT_CUDA_VERSION}.tar.gz"
 TENSORRT_URL = f"https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/{TENSORRT_MAJOR}/tars/{TENSORRT_FILENAME}"
 
 # Download and install TensorRT
@@ -139,28 +150,24 @@ Stage0 += shell(commands=[
     'echo "defshell -bash" >> /etc/screenrc',
     ])
 
-Stage0 += pip(pip="pip3", requirements=f'requirements.txt')
+Stage0 += copy(src='requirements.txt', dest='/tmp/')
+Stage0 += shell(commands=[
+    'uv pip install --system --break-system-packages -r /tmp/requirements.txt',
+    'rm /tmp/requirements.txt',
+])
 
-# Install nsight-systems
+# Install Nsight Systems
 if cpu_target == 'x86_64':
-    cli_package_url = 'https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2026_1/NsightSystems-linux-cli-public-2026.1.1.204-3717666.deb'
+    cli_package_url = 'https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2026_3/NsightSystems-linux-cli-public-2026.3.1.157-3804839.deb'
 
 if cpu_target == 'aarch64':
-    cli_package_url = 'https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2026_1/nsight-systems-cli-2026.1.1_2026.1.1.204-1_arm64.deb'
+    cli_package_url = 'https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2026_3/nsight-systems-cli-2026.3.1_2026.3.1.157-1_arm64.deb'
 
 Stage0 += shell(commands=[
     f'wget {cli_package_url}',
     f'dpkg -i {os.path.basename(cli_package_url)}',
     f'rm {os.path.basename(cli_package_url)}',
 ])
-
-# Workaround - Needed so host-launched graphs appear under the right green context
-# Updated for CUDA 13.1
-if cpu_target == 'x86_64':
-    Stage0 += shell(commands=["cp /usr/local/cuda/lib64/libcupti.so /opt/nvidia/nsight-systems-cli/2026.1.1/target-linux-x64/libcupti.so.13.1"])
-
-if cpu_target == 'aarch64':
-    Stage0 += shell(commands=["cp /usr/local/cuda/lib64/libcupti.so /opt/nvidia/nsight-systems-cli/2026.1.1/target-linux-sbsa-armv8/libcupti-sbsa.so.13.1"])
 
 if cpu_target == 'aarch64':
     yq_binary='wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_arm64 -O /usr/bin/yq'
@@ -171,7 +178,12 @@ Stage0 += shell(commands=[
     'chmod +x /usr/bin/yq',
     ])
 
+# Needed by data_lake
+Stage0 += shell(commands=[
+    'wget -O /usr/include/zmq.hpp https://raw.githubusercontent.com/zeromq/cppzmq/v4.10.0/zmq.hpp',
+    'wget -O /usr/include/zmq_addon.hpp https://raw.githubusercontent.com/zeromq/cppzmq/v4.10.0/zmq_addon.hpp',
+    ])
+
 Stage0 += user(user='aerial')
 
 Stage0 += workdir(directory='$cuBB_SDK')
-

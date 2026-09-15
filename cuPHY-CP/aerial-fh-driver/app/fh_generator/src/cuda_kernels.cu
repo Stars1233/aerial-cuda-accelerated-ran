@@ -17,6 +17,8 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+#include "cuda_driver_utils/cuda_kernel_utils.cuh"
 #include "utils.hpp"
 #include "doca_utils.hpp"
 #include "order_entity.hpp"
@@ -36,12 +38,18 @@
 
 namespace fh_gen
 {
-// doca_error_t kernel_receive_persistent(cudaStream_t stream)
-// {
-//     cudaError_t result = cudaSuccess;
 
-//     return DOCA_SUCCESS;
-// }
+// NOTE: CUfunction handles are CUDA-context-specific. This TU-global assumes a
+// single CUDA context for all OrderEntity instances. If multiple CUDA contexts are
+// used, move this struct into OrderEntity as a per-instance member.
+namespace {
+struct FhgenKernels {
+    CUfunction kernel_write            = nullptr;
+    CUfunction receive_persistent      = nullptr;
+    CUfunction receive_slot            = nullptr;
+};
+FhgenKernels s_fhgen_kernels;
+} // anonymous namespace
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,19 +70,15 @@ __device__ __forceinline__ unsigned long long __globaltimer()
 
 void launch_kernel_write(cudaStream_t stream, uint32_t* addr, uint32_t value)
 {
-    cudaError_t result = cudaSuccess;
-
     if(!addr)
     {
         NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "addr is NULL");
         return;
     }
 
-    kernel_write<<<1, 1, 0, stream>>>(addr, value);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = { &addr, &value };
+    CUDA_DRIVER_CHECK_NON_FATAL(cuLaunchKernel(s_fhgen_kernels.kernel_write,
+        1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
 }
 
 __global__ void _kernel_receive_persistent_(
@@ -463,66 +467,80 @@ doca_error_t kernel_receive_persistent(cudaStream_t stream, int num_cells,
     struct doca_gpu_eth_rxq **rxq_info_gpu,
     uint32_t *exit_flag)
 {
-    cudaError_t result = cudaSuccess;
-    int cuda_blocks = num_cells;
-
     if(num_cells == 0)
     {
         NVLOGC_FMT(TAG, "Zero peers defined, not launching any UL RX kernel");
         return DOCA_SUCCESS;
     }
-    _kernel_receive_persistent_<<<cuda_blocks, 32, 0, stream>>>(rxq_info_gpu, exit_flag);
 
-    result = cudaGetLastError();
-    if (cudaSuccess != result) {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = { &rxq_info_gpu, &exit_flag };
+    CUresult cu_res = cuLaunchKernel(s_fhgen_kernels.receive_persistent,
+        num_cells, 1, 1, 32, 1, 1, 0, stream, args, nullptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cu_res);
+    if (cu_res != CUDA_SUCCESS)
         return DOCA_ERROR_BAD_STATE;
-    }
 
     return DOCA_SUCCESS;
 }
 
 doca_error_t kernel_receive_slot(cudaStream_t stream, orderKernelConfigParams_t* params)
 {
-    cudaError_t result = cudaSuccess;
     int cuda_blocks = params->num_cells;
-    _kernel_receive_slot_<<<cuda_blocks, 320, 0, stream>>>(
-        params->rxq_info_gpu,
-        params->sem_gpu,
-        params->exit_flag_d,
-        params->frame_id,
-        params->subframe_id,
-        params->slot_id,
-        params->slot_t0,
-        params->slot_duration,
-        params->order_kernel_exit_cond_d,
-        params->prb_x_slot,
-        params->ta4_min_ns,
-        params->ta4_max_ns,
-        params->early_rx_packets,
-        params->on_time_rx_packets,
-        params->late_rx_packets,
-        params->next_slot_early_rx_packets,
-        params->next_slot_on_time_rx_packets,
-        params->next_slot_late_rx_packets,
-        params->next_slot_num_prb,
-        params->rx_packets_ts,
-        params->rx_packets_count,
-        params->rx_packets_ts_earliest,
-        params->rx_packets_ts_latest,
-        params->next_slot_rx_packets_ts,
-        params->next_slot_rx_packets_count
-    );
+    struct doca_gpu_eth_rxq     **p_rxq          = params->rxq_info_gpu;
+    struct doca_gpu_semaphore_gpu **p_sem         = params->sem_gpu;
+    uint32_t                     *p_exit_flag    = params->exit_flag_d;
+    int                           p_frame_id     = params->frame_id;
+    int                           p_subframe_id  = params->subframe_id;
+    int                           p_slot_id      = params->slot_id;
+    uint64_t                      p_slot_t0      = params->slot_t0;
+    uint64_t                      p_slot_dur     = params->slot_duration;
+    uint32_t                    **p_exit_cond_d   = params->order_kernel_exit_cond_d;
+    int                          *p_prb_x_slot   = params->prb_x_slot;
+    uint64_t                     *p_ta4_min      = params->ta4_min_ns;
+    uint64_t                     *p_ta4_max      = params->ta4_max_ns;
+    uint32_t                    **p_early        = params->early_rx_packets;
+    uint32_t                    **p_on_time      = params->on_time_rx_packets;
+    uint32_t                    **p_late         = params->late_rx_packets;
+    uint32_t                    **p_ns_early     = params->next_slot_early_rx_packets;
+    uint32_t                    **p_ns_on_time   = params->next_slot_on_time_rx_packets;
+    uint32_t                    **p_ns_late      = params->next_slot_late_rx_packets;
+    uint32_t                    **p_ns_num_prb   = params->next_slot_num_prb;
+    uint64_t                    **p_rx_ts        = params->rx_packets_ts;
+    uint32_t                    **p_rx_cnt       = params->rx_packets_count;
+    uint64_t                    **p_rx_ts_early  = params->rx_packets_ts_earliest;
+    uint64_t                    **p_rx_ts_late   = params->rx_packets_ts_latest;
+    uint64_t                    **p_ns_rx_ts     = params->next_slot_rx_packets_ts;
+    uint32_t                    **p_ns_rx_cnt    = params->next_slot_rx_packets_count;
 
-    result = cudaGetLastError();
-    if (cudaSuccess != result) {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {
+        &p_rxq, &p_sem, &p_exit_flag,
+        &p_frame_id, &p_subframe_id, &p_slot_id,
+        &p_slot_t0, &p_slot_dur,
+        &p_exit_cond_d, &p_prb_x_slot, &p_ta4_min, &p_ta4_max,
+        &p_early, &p_on_time, &p_late,
+        &p_ns_early, &p_ns_on_time, &p_ns_late, &p_ns_num_prb,
+        &p_rx_ts, &p_rx_cnt, &p_rx_ts_early, &p_rx_ts_late,
+        &p_ns_rx_ts, &p_ns_rx_cnt
+    };
+
+    CUresult cu_res = cuLaunchKernel(s_fhgen_kernels.receive_slot,
+        cuda_blocks, 1, 1, 320, 1, 1, 0, stream, args, nullptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cu_res);
+    if (cu_res != CUDA_SUCCESS)
         return DOCA_ERROR_BAD_STATE;
-    }
 
     return DOCA_SUCCESS;
 }
 
+
+[[nodiscard]] bool resolve_fhgen_cuda_kernels()
+{
+    bool ok = true;
+    ok &= resolve_kernel_func<TAG>(&s_fhgen_kernels.kernel_write,       reinterpret_cast<const void*>(kernel_write),              "kernel_write");
+    ok &= resolve_kernel_func<TAG>(&s_fhgen_kernels.receive_persistent, reinterpret_cast<const void*>(_kernel_receive_persistent_), "_kernel_receive_persistent_");
+    ok &= resolve_kernel_func<TAG>(&s_fhgen_kernels.receive_slot,       reinterpret_cast<const void*>(_kernel_receive_slot_),       "_kernel_receive_slot_");
+    return ok;
+}
 
 #ifdef __cplusplus
 } /* extern C */

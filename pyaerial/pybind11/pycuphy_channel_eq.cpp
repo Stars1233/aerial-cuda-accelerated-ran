@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -274,6 +274,8 @@ void ChannelEqualizer::equalize(PuschParams& puschParams) {
                                                                         puschParams.getMaxNumPrb(),
                                                                         puschParams.m_puschStatPrms.enableCfoCorrection,
                                                                         puschParams.m_puschStatPrms.enablePuschTdi,
+                                                                        PUSCH_7_2_A,
+                                                                        PUSCH_ALL,
                                                                         symbolBitMask,
                                                                         enableCpuToGpuDescrAsyncCpy ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
                                                                         static_cast<void*>(dynCpuDescrStartAddrs[PUSCH_CH_EQ_SOFT_DEMAP]),

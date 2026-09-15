@@ -42,8 +42,10 @@ void usage(char* arg)
 }
 
 
-int main(int argc, char* argv[]) 
+int main(int argc, char* argv[])
 {
+  cumac::loadParameters();
+
   int c;
   uint16_t numTti = numSimChnRlz;
   schedulerParams schedParams;

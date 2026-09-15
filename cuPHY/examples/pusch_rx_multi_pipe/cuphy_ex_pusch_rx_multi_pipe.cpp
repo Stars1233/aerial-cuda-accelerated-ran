@@ -24,6 +24,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <cstring>
 #include "nvlog.hpp"
 
 #include "cuda_profiler_api.h"
@@ -62,6 +63,11 @@ void usage()
     printf("    -t  trtfile            Input yaml file for TRT ML model.\n");
     printf("                           (Not recommended for use during timing runs.)\n");
     printf("    -r  # of iterations    Number of run iterations to run\n");
+    printf("    -R  O-RAN split        Set the O-RAN functional split mode (default: 7.2a)\n");
+    printf("    -F  GPU kernel sel     Selection GPU kernels for the PUSCH pipeline.\n");
+    printf("    -U  GPU UCI kernel sel Selection GPU kernels for UCI in the PUSCH pipeline.\n");
+    printf("    -X  GPU delay duration Set the delay duration in us for the PUSCH full-slot pipeline (default: 0).\n");
+    printf("    -Y  GPU delay duration Set the delay duration in us for the PUSCH sub-slot pipeline (default: 0).\n");
     printf("    -v                     Enable nvprof profiling with 1 iteration\n");
     printf("    -w  delay_ms           Set the initial GPU delay in milliseconds (default: 2000)\n");
     printf("    --M <activeThrdPcts>   Enables use of cuda-contexts (one per thread) and uses a list of comma seperated values for active thread percentage\n");
@@ -69,8 +75,11 @@ void usage()
     printf("    -H <harq attempts>     Tests PUSCH HARQ by incrementally testing input HDF5 filenames of the form filename_s#p0.h5. \n");
     printf("    -L  nLdpcHetConfigs    Override max heterogenous LDPC workload configs (default: 32)\n");
     printf("    -T  nMaxTbPerNode      Maximum number of transport blocks per node (default: 32)\n");
+    printf("    -B  useCbLdpc          Use codeblock LDPC decoder (0=TB [default], 1=CB)\n");
+    printf("    --early-sch-cb-mode m  Early SCH CB decode mode: 0=disabled [default], 1=non-UCI SCH only\n");
     printf("    --S slot index in yaml Slot index in yaml file to use\n");
     printf("    --G SM count           Use green contexts with specified SM count per context. Do not use in combination with --M (MPS)\n");
+    printf("    --timing-json file     Write timing summary and histogram JSON to the specified file\n");
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -115,12 +124,20 @@ int main(int argc, char* argv[])
         uint32_t ldpcLaunchMode     = 0;
         uint32_t nMaxLdpcHetConfigs = 32;
         uint8_t  nMaxTbPerNode      = 32; // Maximum number of transport blocks per node
+        uint8_t  openRanFunctionalSplitMode = PUSCH_7_2_A;
+        uint8_t  kernelSelMode = PUSCH_ALL;
+        uint8_t  uciKernelSelMode = PUSCH_UCI_ALL;
+        uint32_t delayUs = 0;
+        uint32_t subSlotDelayUs = 0;
+        uint8_t  useCbLdpc          = 0;  // 0=TB decoder (default), 1=CB decoder
+        uint32_t earlySchCbDecodeMode = PUSCH_EARLY_SCH_CB_DECODE_DISABLED;
         std::vector<uint32_t> mpsActiveThrdPcts;
         uint32_t defaultMpsActiveThrdPct = 100;
         uint32_t harq_attempts = 1;
         bool drmDebug = false;
         bool debugEqualizer = false;
         int slotIdxInYaml = -1; // to specify a single slot
+        std::string timingJsonPath;
 
         // Note: this value needs to be derived empirically by measuring maxIdealDelayKernelTimeUs (see PuschRxTest::DisplayTiming)
         // For e.g. for a 16 cell F14 TV this value is ~200us on DGX-A100
@@ -167,6 +184,46 @@ int main(int argc, char* argv[])
                     if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%i", &nIterations)) || ((nIterations <= 0)))
                     {
                         NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid number of run iterations");
+                        exit(1);
+                    }
+                    ++iArg;
+                    break;
+                case 'R':
+                    if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%hhu", &openRanFunctionalSplitMode)) || (openRanFunctionalSplitMode >= PUSCH_MAX_SPLIT_MODES))
+                    {
+                        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported O-RAN functional split mode");
+                        exit(1);
+                    }
+                    ++iArg;
+                    break;
+                case 'F':
+                    if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%hhu", &kernelSelMode)) || (kernelSelMode >= PUSCH_MAX_KERNEL_SEL_MODES))
+                    {
+                        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported GPU kernel selection mode");
+                        exit(1);
+                    }
+                    ++iArg;
+                    break;
+                case 'U':
+                    if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%hhu", &uciKernelSelMode)) || (uciKernelSelMode >= PUSCH_MAX_UCI_KERNEL_SEL_MODES))
+                    {
+                        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported GPU UCI kernel selection mode");
+                        exit(1);
+                    }
+                    ++iArg;
+                    break;
+                case 'X':
+                    if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%u", &delayUs)) || (delayUs >= 5000))
+                    {
+                        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: invalid delay duration for full-slot processing");
+                        exit(1);
+                    }
+                    ++iArg;
+                    break;
+                case 'Y':
+                    if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%u", &subSlotDelayUs)) || (subSlotDelayUs >= 5000))
+                    {
+                        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: invalid delay duration for sub-slot processing");
                         exit(1);
                     }
                     ++iArg;
@@ -262,6 +319,14 @@ int main(int argc, char* argv[])
                     }
                     ++iArg;
                     break;
+                case 'B':
+                    if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%hhu", &useCbLdpc)) || (useCbLdpc > 1))
+                    {
+                        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid useCbLdpc value (should be 0 or 1)");
+                        exit(1);
+                    }
+                    ++iArg;
+                    break;
                 case 'H':
                     if(++iArg >= argc)
                     {
@@ -276,6 +341,27 @@ int main(int argc, char* argv[])
                     ++iArg;
                     break;
                 case '-':
+                    if(0 == strcmp(argv[iArg], "--timing-json"))
+                    {
+                        if(++iArg >= argc || argv[iArg][0] == '-')
+                        {
+                            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "ERROR: No timing JSON filename provided");
+                            exit(1);
+                        }
+                        timingJsonPath.assign(argv[iArg++]);
+                        break;
+                    }
+                    if(0 == strcmp(argv[iArg], "--early-sch-cb-mode"))
+                    {
+                        if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%u", &earlySchCbDecodeMode)) ||
+                           (earlySchCbDecodeMode >= PUSCH_EARLY_SCH_CB_DECODE_MAX))
+                        {
+                            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "ERROR: Invalid early SCH CB decode mode ({})", earlySchCbDecodeMode);
+                            exit(1);
+                        }
+                        ++iArg;
+                        break;
+                    }
                     switch(argv[iArg][2])
                     {
                     case 'G':
@@ -361,7 +447,12 @@ int main(int argc, char* argv[])
         {
             NVLOGI_FMT(NVLOG_PUSCH, "CUDA graph enabled!");
         } else {
-            NVLOGI_FMT(NVLOG_PUSCH, "CUDA stream mode");
+            NVLOGI_FMT(NVLOG_PUSCH, "CUDA stream mode!");
+            if(openRanFunctionalSplitMode==PUSCH_7_2_E)
+            {
+                openRanFunctionalSplitMode = PUSCH_7_2_A;
+                NVLOGC_FMT(NVLOG_PUSCH, "Only PUSCH 7.2a O-RAN functional split is supported by CUDA stream mode");
+            }
         }
 
         if(procModeBmsk & PUSCH_PROC_MODE_SUB_SLOT)
@@ -511,7 +602,11 @@ int main(int argc, char* argv[])
         std::mutex                 cvStartSyncPtMutex;
         std::condition_variable    cvStartSyncPt;
         std::atomic<std::uint32_t> atmSyncPtWaitCnt(0);
-        PuschRxTest                puschRxTest("PuschRx", nInst, useCuCtxs, delayCuStrm, cuStrmPrios, startSyncPt, cvStartSyncPtMutex, cvStartSyncPt, atmSyncPtWaitCnt, mpsActiveThrdPcts, harq_attempts, 1<<ldpcLaunchMode, nMaxLdpcHetConfigs, drmDebug, debug, debugEqualizer, useGreenCtxs, nMaxTbPerNode);
+        PuschRxTestOptions         puschRxTestOptions{};
+        puschRxTestOptions.useCbLdpc            = useCbLdpc;
+        puschRxTestOptions.earlySchCbDecodeMode = static_cast<cuphyPuschEarlySchCbDecodeMode_t>(earlySchCbDecodeMode);
+        puschRxTestOptions.timingJsonPath       = timingJsonPath;
+        PuschRxTest                puschRxTest("PuschRx", nInst, useCuCtxs, delayCuStrm, cuStrmPrios, startSyncPt, cvStartSyncPtMutex, cvStartSyncPt, atmSyncPtWaitCnt, mpsActiveThrdPcts, harq_attempts, 1<<ldpcLaunchMode, nMaxLdpcHetConfigs, drmDebug, debug, debugEqualizer, useGreenCtxs, nMaxTbPerNode, openRanFunctionalSplitMode, kernelSelMode, uciKernelSelMode, delayUs, subSlotDelayUs, std::move(puschRxTestOptions));
 
         //cudaSetDevice(gpuId); // reminder that this wil bind the primary context of this device to the calling thread; see cudaSetDevice documentation
 

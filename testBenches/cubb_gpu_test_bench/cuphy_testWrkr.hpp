@@ -113,12 +113,6 @@ struct cuPHYTestPschTxRxRunMsgPayload
     cudaEvent_t startEvent;
 };
 
-// CUPHY_TEST_WRKR_CMD_MSG_PDSCH_CLEAN payload
-struct cuPHYTestPdschTxCleanMsgPayload
-{
-    bool rsp;
-};
-
 // CUPHY_TEST_WRKR_RSP_MSG_PUSCH_RUN payload
 struct cuPHYTestPuschRxRunRspMsgPayload
 {
@@ -186,7 +180,7 @@ public:
     void pdcchTxInit(std::vector<std::string> inFileNamesPDCCH, uint32_t m_pdcch_nItrsPerStrm, bool group_cells, uint32_t cells_per_stream, bool ref_check_pdcch, uint64_t pdcch_proc_mode, bool waitRsp = true);
     void pucchRxInit(std::vector<std::string> inFileNamesPUCCH, bool ref_check_pucch, bool groupCells, uint64_t pucch_proc_mode, bool waitRsp = true);
     void pucchRxSetup(std::vector<std::string> inFileNamesPUCCH, bool waitRsp = true);
-    void puschRxInit(std::vector<std::string> inFileNamesPuschRx, uint32_t fp16Mode, int puschRxDescramblingOn, bool printCbErrors, uint64_t pusch_proc_mode, bool enableLdpcThroughputMode, bool groupCells, maxPUSCHPrms puschPrms, uint32_t ldpcLaunchMode, uint8_t* puschSubslotProcFlag, bool waitRsp = true);
+    void puschRxInit(std::vector<std::string> inFileNamesPuschRx, uint32_t fp16Mode, int puschRxDescramblingOn, bool printCbErrors, uint64_t pusch_proc_mode, bool enableLdpcThroughputMode, bool groupCells, maxPUSCHPrms puschPrms, uint32_t ldpcLaunchMode, uint8_t* puschSubslotProcFlag, bool uciTiming = false, bool waitRsp = true);
     void pdschTxInit(std::vector<std::string> inFileNamesPdschTx, uint32_t pdsch_nItrsPerStrm, bool ref_check_pdsch, bool identical_ldpc_configs, cuphyPdschProcMode_t pdsch_proc_mode, bool group_cells, uint32_t cells_per_stream, maxPDSCHPrms pdschPrms, bool waitRsp = true);
 
     void deinit(bool waitRsp = true);
@@ -195,7 +189,6 @@ public:
     void puschRxRun(cudaEvent_t startEvent, std::shared_ptr<cuphy::event>& shPtrStopEvent, cudaEvent_t prachStartEvent = nullptr, cudaEvent_t pucchStartEvent = nullptr, bool waitRsp = true); // pucchStartEvent is the start time of PUCCH1, prachStartEvent is the start time of PRACH and PUCCH2
     void pdschTxRun(cudaEvent_t startEvent, std::shared_ptr<cuphy::event>& shPtrStopEvent, bool waitRsp = true, std::vector<cuphy::event>* pdcchStopEventVec = nullptr, std::vector<cuphy::event>* pdschInterSlotEventVec = nullptr);
     void pschTxRxRun(cudaEvent_t startEvent, std::shared_ptr<cuphy::event>& shPtrStopEvent, bool waitRsp = true);
-    void pdschTxClean(bool waitRsp = true);
 
     void runSSB(std::shared_ptr<void>& shPtrPayload);
     void runPRACH(const cudaEvent_t& startEvent);
@@ -236,6 +229,9 @@ public:
     float                      getTotPusch2StartTime();
     float                      getTotPusch2SubslotProcRunTime();
     float                      getTotPusch2RunTime();
+    float                      getTotUciOnPuschRunTime();
+    float                      getTotUciOnPusch2RunTime();
+    void                       resetSlotEvents();
     float                      getTotPucchStartTime();
     float                      getTotPucchRunTime();
     float                      getTotPucch2StartTime();
@@ -246,6 +242,26 @@ public:
     float                      getTotUlbfw2RunTime();
     std::vector<cuphy::event>* getPdschInterSlotEventVecPtr();
     std::vector<cuphy::event>* getSlotBoundaryEventVecPtr();
+    /**
+     * @brief Returns the CUDA event PDCCH/SSB should anchor against for iteration @p itrIdx.
+     *
+     * Centralises the
+     * `(dl_anchor_from_yaml && == PDSCH) ? interSlot : slotBoundary` selection
+     * that was previously duplicated across PDSCH-driving methods. The choice
+     * comes from `g_start_delay_cfg_us.effective_dl_anchor()`.
+     *
+     * Not const-qualified because `cuphy::event::handle()` in the upstream
+     * `cuphy.hpp` is non-const; marking this `const` would force a `const_cast`.
+     *
+     * @param[in] itrIdx Iteration index into the selected event vector.
+     *                   Must be less than the vector's size; out-of-range
+     *                   triggers `assert` in debug builds and an `NVLOGE`
+     *                   in release builds, returning `nullptr` either way.
+     * @return Must be checked. Handle of the selected `cuphy::event`, or
+     *         `nullptr` if @p itrIdx is out of range (unreachable under the
+     *         documented invariant; defensive only).
+     */
+    [[nodiscard]] cudaEvent_t selectDlAnchorEvent(uint32_t itrIdx) noexcept;
     std::vector<cuphy::event>* getpdcchCsirsInterSlotEndEventVec();
     cudaEvent_t                getPuschStartEvent();
     cudaEvent_t                getPusch2StartEvent();
@@ -295,7 +311,6 @@ private:
     void evalHandler(std::shared_ptr<void>& shPtrPayload);
     void printHandler(std::shared_ptr<void>& shPtrPayload);
     void resetEvalHandler(std::shared_ptr<void>& shPtrPayload);
-    void pdschTxCleanHandler(std::shared_ptr<void>& shPtrPayload);
     void emptyHandler(std::shared_ptr<void>& shPtrPayload);
     void pschRdSmIdHandler(std::shared_ptr<void>& shPtrPayload);
     void setWaitValHandler(std::shared_ptr<void>& shPtrPayload);
@@ -509,6 +524,9 @@ private:
     float                                        m_totPUSCH2StartTime;
     float                                        m_totPUSCH2SubslotProcRunTime;
     float                                        m_totPUSCH2RunTime;
+    float                                        m_totUciOnPuschRunTime;
+    float                                        m_totUciOnPusch2RunTime;
+    bool                                         m_uciTiming;
     float                                        m_totULBFWStartTime;
     float                                        m_totULBFWRunTime;
     float                                        m_totULBFW2StartTime;
@@ -589,5 +607,29 @@ private:
     uint8_t                     m_csirsRunSlotIdx;
     uint8_t                     m_pbchRunSlotIdx;
 };
+
+/**
+ * Returns the `cuphy::event` vector pointer PDCCH/SSB should anchor against.
+ *
+ * Centralises the selection previously duplicated across `cubb_gpu_test_bench.cpp`.
+ * Use this from the test bench main loop; for worker-internal sites use
+ * `cuPHYTestWorker::selectDlAnchorEvent(itrIdx)` instead.
+ *
+ * @param[in] pdschWorker  The PDSCH worker whose event vectors are the source.
+ *                         (Taken by non-const reference only because the upstream
+ *                         `cuphy::event::handle()` is non-const; the helper does
+ *                         not semantically mutate the worker.) Caller must verify
+ *                         `pdschCtx` is true before calling — this helper does
+ *                         not check it.
+ * @return Must be checked. `pdschWorker.getPdschInterSlotEventVecPtr()` when the
+ *         effective DL anchor is `PDSCH`, else
+ *         `pdschWorker.getSlotBoundaryEventVecPtr()`.
+ */
+[[nodiscard]] inline std::vector<cuphy::event>* select_dl_anchor_event_vec(cuPHYTestWorker& pdschWorker)
+{
+    return (g_start_delay_cfg_us.effective_dl_anchor() == dl_anchor_mode_t::PDSCH)
+           ? pdschWorker.getPdschInterSlotEventVecPtr()
+           : pdschWorker.getSlotBoundaryEventVecPtr();
+}
 
 #endif // !defined(CUPHY_TESTWRKR_HPP_INCLUDED_)

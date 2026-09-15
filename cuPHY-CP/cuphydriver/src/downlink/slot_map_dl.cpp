@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,8 +44,6 @@ SlotMapDl::SlotMapDl(phydriver_handle _pdh, uint64_t _id, uint8_t _enableBatched
         aggr_slot_info[i]=nullptr;
     }
 
-    num_active_cells = 0;
-
     aggr_cell_list.reserve(DL_MAX_CELLS_PER_SLOT);
     aggr_dlbuf_list.reserve(DL_MAX_CELLS_PER_SLOT);
 
@@ -64,6 +62,9 @@ SlotMapDl::SlotMapDl(phydriver_handle _pdh, uint64_t _id, uint8_t _enableBatched
     atom_dl_gpu_comm_end=false;
     atom_dl_cpu_door_bell_task_done=false;
     atom_dl_comp_end=false;
+    numDlcTasks_            = 0;
+    num_dl_cplane_peer_ready_targets_ = 0;
+    slotRefTs_            = t_ns{};
     dl_si=nullptr;
     tasks_num=0;
     tasks_ts_exec={};
@@ -176,7 +177,8 @@ int SlotMapDl::waitDLCDone(int num_dlc_tasks) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGI_FMT(TAG, "waitDLCDone for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGI_FMT(TAG, "waitDLCDone for Map {} is taking more than {} ns (target={} current={})",
+                       getId(), (GENERIC_WAIT_THRESHOLD_NS * 2), num_dlc_tasks, atom_dlc_done.load());
             return -1;
         }
 
@@ -186,15 +188,21 @@ int SlotMapDl::waitDLCDone(int num_dlc_tasks) {
 }
 
 int SlotMapDl::waitPeerUpdateDone() {
+    const int expected_peer_ready_count = (num_dl_cplane_peer_ready_targets_ > 0)
+        ? num_dl_cplane_peer_ready_targets_
+        : static_cast<int>(aggr_cell_list.size());
     t_ns start_wait = Time::nowNs();
+    int  signaled_peer_ready_count = 0;
     do{
+        signaled_peer_ready_count = atom_dl_cplane_info_for_uplane_rdy_count.load();
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGI_FMT(TAG, "waitPeerUpdateDone for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGI_FMT(TAG, "waitPeerUpdateDone for Map {} is taking more than {} ns (expected={} signaled={})",
+                       getId(), (GENERIC_WAIT_THRESHOLD_NS * 2),
+                       expected_peer_ready_count, signaled_peer_ready_count);
             return -1;
         }
-
-    } while(atom_dl_cplane_info_for_uplane_rdy_count.load() < num_active_cells);
+    } while(signaled_peer_ready_count < expected_peer_ready_count);
 
     return 0;
 }
@@ -204,7 +212,8 @@ int SlotMapDl::waitUplanePrepDone(int num_uplane_prep_tasks) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGI_FMT(TAG, "waitUplanePrepDone for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGI_FMT(TAG, "waitUplanePrepDone for Map {} is taking more than {} ns (target={} current={})",
+                       getId(), (GENERIC_WAIT_THRESHOLD_NS * 2), num_uplane_prep_tasks, atom_uplane_prep_done.load());
             return -1;
         }
 
@@ -215,12 +224,12 @@ int SlotMapDl::waitUplanePrepDone(int num_uplane_prep_tasks) {
 
 int SlotMapDl::addSlotEndTask() {
     std::atomic_fetch_add(&(atom_dl_end_threads),1);
-    return 0;
+    return 0; 
 }
 
 int SlotMapDl::addSlotChannelEnd() {
     std::atomic_fetch_add(&(atom_dl_channel_end_threads),1);
-    return 0;
+    return 0; 
 }
 
 
@@ -292,7 +301,8 @@ int SlotMapDl::waitSlotEndTask(int num_tasks) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait Slot End Task for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait Slot End Task for Map {} is taking more than {} ns (target={} current={})",
+                       getId(), (GENERIC_WAIT_THRESHOLD_NS * 2), num_tasks, atom_dl_end_threads.load());
             return -1;
         }
     } while(atom_dl_end_threads != num_tasks);
@@ -308,7 +318,8 @@ int SlotMapDl::waitSlotChannelEnd(int num_channels) {
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait Slot Channel End for Map {} is taking more than {} ns", getId(), (GENERIC_WAIT_THRESHOLD_NS * 2));
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait Slot Channel End for Map {} is taking more than {} ns (target={} current={})",
+                       getId(), (GENERIC_WAIT_THRESHOLD_NS * 2), num_channels, atom_dl_channel_end_threads.load());
             return -1;
         }
 
@@ -350,12 +361,13 @@ int SlotMapDl::release(int num_cells)
     //////////////////////////////////////////////////////////////////
     //// Only last thread releases the slot map objects
     //////////////////////////////////////////////////////////////////
+    int n_active = static_cast<int>(aggr_cell_list.size());
     int prev_cells = std::atomic_fetch_add(&(atom_num_cells), num_cells);
-    if((num_active_cells > 0) && (prev_cells + num_cells < num_active_cells))
+    if((n_active > 0) && (prev_cells + num_cells < n_active))
         return 0;
 
     bool dlBfwPrinted = false;
-    if(num_active_cells > 0)
+    if(n_active > 0)
     {
         printTimes();
         dlBfwPrinted = true;
@@ -400,7 +412,6 @@ int SlotMapDl::release(int num_cells)
         // aggr_slot_params.clear();
 
         aggr_slot_params = nullptr;
-        num_active_cells = 0;
     }
 
     if(aggr_dlbfw){
@@ -433,6 +444,11 @@ int SlotMapDl::release(int num_cells)
     atom_active    = false;
     pdsch_cb_done = false;
     atom_dl_cplane_info_for_uplane_rdy_count.store(0);
+    numTasksWaitDl2Tx_      = 0;
+    numTasksWaitBufCleanup_ = 0;
+    numDlcTasks_            = 0;
+    num_dl_cplane_peer_ready_targets_ = 0;
+    slotRefTs_            = t_ns{};
     return 0;
 }
 
@@ -442,14 +458,12 @@ int SlotMapDl::aggrSetCells(Cell* c, slot_command_api::phy_slot_params * _phy_sl
     if(c == nullptr || dlbuf == nullptr)
         return EINVAL;
 
-    if(num_active_cells >= DL_MAX_CELLS_PER_SLOT)
+    if(static_cast<int>(aggr_cell_list.size()) >= DL_MAX_CELLS_PER_SLOT)
         return ENOMEM;
 
     aggr_dlbuf_list.push_back(dlbuf);
     aggr_cell_list.push_back(c);
-    aggr_slot_info[num_active_cells] = _phy_slot_params->sym_prb_info.get();
-
-    num_active_cells++;
+    aggr_slot_info[aggr_cell_list.size() - 1] = _phy_slot_params->sym_prb_info.get();
 
     return 0;
 }
@@ -473,7 +487,7 @@ int SlotMapDl::aggrSetPhy(PhyPdschAggr* pdsch, PhyPdcchAggr * pdcch_dl, PhyPdcch
 
 int SlotMapDl::getNumCells()
 {
-    return num_active_cells;
+    return static_cast<int>(aggr_cell_list.size());
 }
 
 phydriver_handle SlotMapDl::getPhyDriverHandler(void) const

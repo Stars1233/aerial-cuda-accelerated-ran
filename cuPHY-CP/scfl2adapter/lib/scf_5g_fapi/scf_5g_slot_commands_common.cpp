@@ -25,26 +25,9 @@
 namespace scf_5g_fapi {
 
     /**
-     * Check if the beamforming parameters are valid
-     * @param numPrg Number of PRGs
-     * @param numDigBFI Number of DigBFIs
-     * @param mmimo_enabled Whether MIMO is enabled
-     * @return True if the beamforming parameters are valid, false otherwise
+     * check_bf_pc_params is now inline in scf_5g_slot_commands_common.hpp
+     * for link-independence with scf_5g_csirs_helpers.
      */
-    bool check_bf_pc_params(int numPrg, int numDigBFI, bool mmimo_enabled)
-    {
-        if(!mmimo_enabled && (numPrg > MAX_NUM_PRGS))
-        {
-            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "Num PRG received {} larger than MAX {} prgs allocated", numPrg, MAX_NUM_PRGS);
-            return false;
-        }
-        if(!mmimo_enabled && (numDigBFI > MAX_NUM_DIGBFI))
-        {
-            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "Num DigBFIs received {} larger than MAX {} DigBFIs allocated", numDigBFI, MAX_NUM_DIGBFI);
-            return false;
-        }
-        return true;
-    }
 
     void check_prb_info_size(size_t& prb_info_size)
     {

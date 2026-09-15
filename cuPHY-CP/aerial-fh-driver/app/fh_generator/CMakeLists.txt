@@ -64,7 +64,7 @@ endif()
 message(VERBOSE "FH Gen Cmake DOCA Lib Dirs: ${DOCA_LIBRARY_DIRS}")
 target_include_directories(${FH_GENERATOR_TARGET} PRIVATE ${DOCA_INCLUDE_DIRS})
 
-target_link_libraries(${FH_GENERATOR_TARGET} PRIVATE ${AERIAL_FH_TARGET} CUDA::cudart CUDA::cuda_driver yaml cuphy nvlog gdrapi cuphyoamlib slot_command gRPC::grpc++ protobuf gRPC::grpc++_reflection)
+target_link_libraries(${FH_GENERATOR_TARGET} PRIVATE ${AERIAL_FH_TARGET} CUDA::cudart CUDA::cuda_driver yaml cuphy nvlog gdrapi cuphyoamlib slot_command cuda_driver_utils gRPC::grpc++ protobuf gRPC::grpc++_reflection)
 message(VERBOSE "CUDA_LIBRARIES is ${CUDA_LIBRARIES}")
 message(VERBOSE "CUDA_INCLUDE_DIRS is ${CUDA_INCLUDE_DIRS}")
 
@@ -74,4 +74,4 @@ target_include_directories(${FH_GENERATOR_TARGET} PRIVATE /usr/local/gdrcopy/inc
 
 target_link_libraries(${FH_GENERATOR_TARGET} PRIVATE -L${DOCA_LIBRARY_DIRS} -ldoca_gpunetio -ldoca_gpunetio_device -ldoca_common -ldoca_argp -ldoca_eth -ldoca_dpdk_bridge)
 target_link_directories(${FH_GENERATOR_TARGET} PRIVATE ${DPDK_LIBRARY_DIRS})
-target_link_directories(${FH_GENERATOR_TARGET} PRIVATE ${DPDK_LIBRARY_DIRS}/dpdk/pmds-23.0)
+target_link_dpdk_pmd_directories(${FH_GENERATOR_TARGET})

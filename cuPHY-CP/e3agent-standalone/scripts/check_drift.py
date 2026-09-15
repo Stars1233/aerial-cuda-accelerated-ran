@@ -24,7 +24,7 @@ make the harness write SHM at wrong offsets with no error. This compares the two
 and fails on any layout-affecting divergence.
 
 Checks:
-  - 9 layout structs: normalized field tokens must match.
+  - 11 layout structs: normalized field tokens must match.
   - hestDataType: canonical must stay 'typedef cuFloatComplex hestDataType;'
     (vendored deliberately substitutes a binary-compatible struct).
   - *_INFO_MEMBER_COUNT constants must match.
@@ -41,8 +41,8 @@ import sys
 from pathlib import Path
 
 STRUCTS = [
-    "E3UeMetrics", "E3BufferInfo", "fhInfo_t", "hestInfo_t", "srsIqInfo_t",
-    "srsHestInfo_t", "srsInfo_t", "E3SrsUeMetrics", "E3SrsBufferInfo",
+    "E3UeMetrics", "E3CellInfo", "E3BufferInfo", "fhInfo_t", "hestInfo_t", "srsIqInfo_t",
+    "srsHestInfo_t", "srsInfo_t", "E3SrsUeMetrics", "E3SrsCellInfo", "E3SrsBufferInfo",
 ]
 MEMBER_COUNTS = [
     "FH_INFO_MEMBER_COUNT", "HEST_INFO_MEMBER_COUNT", "SRS_IQ_INFO_MEMBER_COUNT",

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #include "comp_cwTreeTypes.hpp"
 #include "../cuphy_internal.h"
+#include "../polar_decoder/polar_cw_tree_layout.hpp"
 
 #include <cooperative_groups.h>
 
@@ -628,7 +629,7 @@ compCwTreeTypesKernel(compCwTreeTypesDynDescr_t* pDynDescr)
         N_MAX_THRD_TILES * sizeof(int32_t) +
         REL_SEQ_IDX_BUF_LEN * sizeof(int16_t) +
         N_MAX_CODED_BITS * sizeof(int8_t) +
-        N_MAX_TREE_TYPES * sizeof(int8_t);
+        2 * N_MAX_TREE_TYPES * sizeof(int8_t);
 
     __shared__ __align__(sizeof(uint32_t)) uint8_t smemBlk[N_SMEM_ELEMS];
     //
@@ -637,6 +638,11 @@ compCwTreeTypesKernel(compCwTreeTypesDynDescr_t* pDynDescr)
     int16_t*  pRelSeqIdxsPruned = reinterpret_cast<int16_t*>(&pTileStartOffsets[N_MAX_THRD_TILES]);
     int8_t*   pCwBitTypes       = reinterpret_cast<int8_t*>(&pRelSeqIdxsPruned[REL_SEQ_IDX_BUF_LEN]);
     int8_t*   pCwTreeTypes      = &pCwBitTypes[N_MAX_CODED_BITS];
+    // node classes for the fast-SSC operation list: 0/1/2 as tree types, 4 = REP
+    // (all leaves frozen except the last), 5 = SPC (all info except the
+    // first), 3 = mixed (descend), 6 = contains a parity-check leaf (blocks
+    // fusion). Same binary-tree indexing as pCwTreeTypes.
+    int8_t*   pCwNodeClasses    = &pCwTreeTypes[N_MAX_TREE_TYPES];
 
     //--------------------------------------------------------------------------------------------------------
     // Forbidden index interval computation
@@ -819,6 +825,120 @@ compCwTreeTypesKernel(compCwTreeTypesDynDescr_t* pDynDescr)
     for(int i = thrdIdxInBlk; i < (2 * nCodedBits - 2); i += thisThrdBlk.size())
     {
         pTreeTypesOutput[i + 2] = pCwTreeTypes[i];
+    }
+
+    //--------------------------------------------------------------------------------------------------------
+    // Emit the successive-cancellation traversal operation list consumed by the polar
+    // decoder: one byte per visited pruned node, in bit order, stored in the
+    // SC operation-list region (see polar_cw_tree_layout.hpp). Entry layout:
+    // bits[3:0] = node stage, bits[5:4] = node type (0 frozen, 1 info, 2 parity).
+    //
+    // The node visited for leaf j is its highest ancestor whose subtree is
+    // uniform (type != 3); type 3 is monotone towards the root, so the walk up
+    // can stop at the first mixed ancestor. Only the first leaf of each visited
+    // node emits an entry; stream compaction orders entries by leaf index.
+    bool    opPred  = false;
+    uint8_t opEntry = 0;
+    if(thrdIdxInBlk < nCodedBits)
+    {
+        const uint32_t j        = thrdIdxInBlk;
+        int8_t         nodeType = pCwTreeTypes[(nCodedBits - 2) + j];
+        int32_t        nodeStage = 0;
+        while(nodeStage < (n - 1))
+        {
+            const int32_t parentRowStart = (1 << (n - nodeStage - 1)) - 2;
+            const int8_t  parentType     = pCwTreeTypes[parentRowStart + (j >> (nodeStage + 1))];
+            if(parentType == 3)
+            {
+                break;
+            }
+            nodeType = parentType;
+            nodeStage++;
+        }
+        opPred  = ((j & ((1u << nodeStage) - 1)) == 0);
+        opEntry = static_cast<uint8_t>(nodeStage | (nodeType << 4));
+    }
+
+    int32_t opThrdOffset = 0;
+    strmCompactionHelper<N_THRDS_PER_TILE>(thisThrdBlk, thisThrdTile, opPred, nActiveThrdTiles, pTileStartOffsets, opThrdOffset);
+
+    if(opPred)
+    {
+        const int32_t opPos = pTileStartOffsets[tileIdx] + opThrdOffset;
+        pTreeTypesOutput[cuphy::polar::PolarCwTreeLayout::scOpListOffset(nCodedBits) + opPos] = opEntry;
+    }
+
+    //--------------------------------------------------------------------------------------------------------
+    // Fast-SSC node classes: like the tree types, but single-information REP
+    // subtrees (all leaves frozen except the last) and single-parity SPC
+    // subtrees (all info except the first) stay fused instead of mixed.
+    // Stage 0: classes are the bit types themselves, except parity-check
+    // leaves which block fusion.
+    __syncthreads();
+    {
+        int32_t clsStartIdx = nCodedBits - 2;
+        if(thrdIdxInBlk < nCodedBits)
+        {
+            int8_t t = pCwBitTypes[thrdIdxInBlk];
+            pCwNodeClasses[clsStartIdx + thrdIdxInBlk] = (t == 2) ? 6 : t;
+        }
+        __syncthreads();
+
+        for(int32_t s = 1; s < n; s++)
+        {
+            int32_t stgSize = 1 << (n - s);
+            clsStartIdx     = stgSize - 2;
+            if(thrdIdxInBlk < stgSize)
+            {
+                int32_t childStartIdx = stgSize * 2 - 2;
+                int8_t  cL            = pCwNodeClasses[childStartIdx + 2 * thrdIdxInBlk];
+                int8_t  cR            = pCwNodeClasses[childStartIdx + 2 * thrdIdxInBlk + 1];
+                int8_t  cls;
+                if(cL == 0 && cR == 0)                                { cls = 0; }
+                else if(cL == 1 && cR == 1)                           { cls = 1; }
+                else if(cL == 0 && ((s == 1 && cR == 1) || cR == 4))  { cls = 4; } // REP
+                else if(cR == 1 && ((s == 2 && cL == 4) || cL == 5))  { cls = 5; } // SPC ((0,1) pair == SPC of size 2)
+                else                                                  { cls = 3; }
+                pCwNodeClasses[clsStartIdx + thrdIdxInBlk] = cls;
+            }
+            __syncthreads();
+        }
+    }
+
+    // Emit the fast-SSC operation list into its own region (see
+    // polar_cw_tree_layout.hpp): identical emission to the SC operation list,
+    // but ascending through any non-mixed class (0/1/4/5), so REP/SPC subtrees
+    // appear as single entries.
+    bool    fssPred  = false;
+    uint8_t fssEntry = 0;
+    if(thrdIdxInBlk < nCodedBits)
+    {
+        const uint32_t j        = thrdIdxInBlk;
+        int8_t         nodeCls  = pCwNodeClasses[(nCodedBits - 2) + j];
+        if(nodeCls == 6) { nodeCls = 2; } // lone parity-check leaf decodes like a hard-decision leaf
+        int32_t        nodeStage = 0;
+        while(nodeStage < (n - 1))
+        {
+            const int32_t parentRowStart = (1 << (n - nodeStage - 1)) - 2;
+            const int8_t  parentCls      = pCwNodeClasses[parentRowStart + (j >> (nodeStage + 1))];
+            if(parentCls == 3 || parentCls == 6)
+            {
+                break;
+            }
+            nodeCls = parentCls;
+            nodeStage++;
+        }
+        fssPred  = ((j & ((1u << nodeStage) - 1)) == 0);
+        fssEntry = static_cast<uint8_t>(nodeStage | (nodeCls << 4));
+    }
+
+    int32_t fssThrdOffset = 0;
+    strmCompactionHelper<N_THRDS_PER_TILE>(thisThrdBlk, thisThrdTile, fssPred, nActiveThrdTiles, pTileStartOffsets, fssThrdOffset);
+
+    if(fssPred)
+    {
+        const int32_t fssPos = pTileStartOffsets[tileIdx] + fssThrdOffset;
+        pTreeTypesOutput[cuphy::polar::PolarCwTreeLayout::fssOpListOffset(nCodedBits) + fssPos] = fssEntry;
     }
 
     //--------------------------------------------------------------------------------------------------------

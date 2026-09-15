@@ -48,7 +48,11 @@ static constexpr uint32_t PRACH_MAX_NUM_PREAMBLES = 64;             ///< Maximum
 static constexpr uint32_t PHY_DLBFW_AGGR_X_CTX = 10;                ///< DL beamforming weight aggregation objects per context
 static constexpr uint32_t PHY_PDSCH_AGGR_X_CTX = 5;                ///< PDSCH aggregation objects per context
 static constexpr uint32_t PHY_PDCCH_DL_AGGR_X_CTX = 10;             ///< DL PDCCH aggregation objects per context
+#ifdef ENABLE_FAPI_STORE_REPLAY
+static constexpr uint32_t PHY_PDCCH_UL_AGGR_X_CTX = 10;             ///< UL PDCCH aggregation objects per context
+#else
 static constexpr uint32_t PHY_PDCCH_UL_AGGR_X_CTX = 0;              ///< UL PDCCH aggregation objects per context (unused)
+#endif
 static constexpr uint32_t PHY_PBCH_AGGR_X_CTX = 10;                 ///< PBCH aggregation objects per context
 static constexpr uint32_t PHY_CSIRS_AGGR_X_CTX = 10;                ///< CSI-RS aggregation objects per context
 
@@ -63,11 +67,7 @@ static constexpr uint32_t PHY_PUSCH_MAX_BYTES_PER_TB = 311386;      ///< Maximum
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 //// Downlink Buffer Configuration
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
-#ifdef ENABLE_32DL
-static constexpr uint32_t DL_OUTPUT_BUFFER_SIZE = 8388608;          ///< DL output buffer size: 8MB (for 32 layer support)
-#else
-static constexpr uint32_t DL_OUTPUT_BUFFER_SIZE = 4194304;          ///< DL output buffer size: 4MB (for 16 layer support)
-#endif
+// DL output buffer byte size is computed per cell in DLOutputBuffer.
 static constexpr uint32_t DL_OUTPUT_BUFFER_NUM_PER_CELL = 16;       ///< Number of DL output buffers per cell
 static constexpr uint32_t DL_OUTPUT_BUFFER_BUSY_NS = 500000 * 4;    ///< DL buffer busy time: 2ms (500us x 4 slots)
                                                                     ///< Defines how long a DL output buffer remains busy after it was last used,
@@ -77,23 +77,18 @@ static constexpr uint32_t DL_HELPER_MEMSET_BUFFERS_PER_CTX = 4;     ///< Number 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 //// Antenna and Resource Configuration
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
-#ifdef ENABLE_32DL
-static constexpr uint32_t MAX_AP_PER_SLOT = 32;                     ///< Maximum antenna ports per slot (32-layer DL)
-#else
-static constexpr uint32_t MAX_AP_PER_SLOT = 16;                     ///< Maximum antenna ports per slot (16-layer DL)
-#endif
+// Compile-time cap for fixed arrays; runtime sizing uses PhyDriverCtx::getMaxDl/UlAntennaPorts().
+static constexpr uint32_t MAX_AP_PER_SLOT = 32;                     ///< Maximum antenna ports per slot (32-layer worst case)
 static constexpr uint32_t MAX_AP_PER_SLOT_SRS = 64;                 ///< Maximum antenna ports per slot for SRS
 static constexpr uint32_t MAX_UE_SRS_ANT_PORTS = 4;                 ///< Maximum UE antenna ports for SRS
 
 static constexpr uint32_t MAX_AP_PER_SLOT_CSI_RS = 32;              ///< Maximum antenna ports per slot for CSI-RS
 static constexpr uint32_t MAX_SECTIONS_PER_CPLANE_SYMBOL = 32;      ///< Maximum C-plane sections per OFDM symbol
-#ifdef ENABLE_32DL
-static constexpr uint32_t MAX_SECTIONS_PER_UPLANE_SYMBOL = 64;      ///< Maximum U-plane sections per OFDM symbol (Note: increased for >32 PDCCH DCIs)
-#else
-static constexpr uint32_t MAX_SECTIONS_PER_UPLANE_SYMBOL = 32;      ///< Maximum U-plane sections per OFDM symbol
-#endif
+// Maximum sections per symbol; raised for >32 PDCCH DCIs in 32-layer DL.
+static constexpr uint32_t MAX_SECTIONS_PER_UPLANE_SYMBOL = 64;      ///< Maximum U-plane sections per OFDM symbol (worst case)
 
-static constexpr uint32_t MAX_NUM_OF_NIC_SUPPORTED = 2;             ///< Maximum number of NICs supported
+// Maximum NIC ports supported. MGX ARC Pro: up to 3x CX8 NICs × 8 ports/NIC = 24 ports.
+static constexpr uint32_t MAX_NUM_OF_NIC_PORT_SUPPORTED = 24;
 static constexpr uint32_t MU_SUPPORTED = 1;                         ///< Numerology (μ) supported: 1 = 30kHz SCS
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -130,14 +125,12 @@ static constexpr uint32_t ORDER_ENTITY_NUM = 8;                     ///< Number 
 //// These define when each processing stage should be launched to meet latency requirements
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 static constexpr uint32_t UL_TASK1_ORDER_LAUNCH_OFFSET_FROM_T0_NS=500000;           ///< Order kernel launch: T0 - 500us (PUSCH/PUCCH ordering)
-static constexpr uint32_t UL_TASK1_SRS_ORDER_LAUNCH_OFFSET_FROM_T0_NS=2500000;      ///< SRS order kernel launch: T0 + 2500us
+static constexpr uint32_t UL_TASK1_SRS_ORDER_LAUNCH_OFFSET_FROM_T0_NS=2500000;      ///< SRS order kernel launch: T0 + 2500us (default; overridden via YAML when gpu_init_comms_via_cpu)
 
 static constexpr uint32_t UL_TASK1_PUCCH_LAUNCH_OFFSET_FROM_T0_NS=500000;           ///< PUCCH processing launch: T0 - 500us
 
 static constexpr uint32_t UL_TASK1_PUSCH_LAUNCH_OFFSET_FROM_T0_NS=400000;           ///< PUSCH processing launch: T0 - 400us
 static constexpr uint32_t UL_TASK3_EARLY_UCI_IND_TASK_LAUNCH_OFFSET_FROM_T0_NS=1500000; ///< Early UCI indication task: T0 + 1500us
-
-static constexpr uint32_t UL_TASK1_SRS_LAUNCH_OFFSET_FROM_T0_NS = UL_TASK1_SRS_ORDER_LAUNCH_OFFSET_FROM_T0_NS; ///< SRS processing launch (same as SRS order)
 
 static constexpr uint32_t UL_TASK2_OFFSET_FROM_T0_NS=200000;                        ///< UL Task 2 (CPU init comms): T0 - 200us
 

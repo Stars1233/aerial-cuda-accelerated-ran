@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,47 +18,25 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <cuda.h>
 
 #include "nv_ipc_cuda_utils.h"
 #include "nv_ipc_utils.h"
-// #include "nvlog.hpp"
+#include <cuda_driver_utils/cuda_driver_utils.hpp>
 
 #define TAG "NVIPC.CUDAUTILS"
-
-inline cudaError __checkLastCudaError(const char* file, int line)
-{
-    cudaError lastErr = cudaGetLastError();
-    if(lastErr != cudaSuccess)
-    {
-        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "Error at {} line {}: {}", file, line, cudaGetErrorString(lastErr));
-    }
-    return lastErr;
-}
-#define checkLastCudaError() __checkLastCudaError(__FILE__, __LINE__)
 
 // Check whether CUDA driver and CUDA device exist. Return 0 if exist, else return -1
 int cuda_version_check()
 {
     int driverVersion  = -1;
-    int runtimeVersion = -1;
 
-    if(cudaDriverGetVersion(&driverVersion) != cudaSuccess)
+    if(cuDriverGetVersion(&driverVersion) != CUDA_SUCCESS)
     {
-        // checkLastCudaError();
-        // NVLOGI_FMT(TAG, "{}: cudaDriverGetVersion failed", __func__);
-    }
-    else
-    {
-        if(cudaRuntimeGetVersion(&runtimeVersion) != cudaSuccess)
-        {
-            // checkLastCudaError();
-            // NVLOGI_FMT(TAG, "{}: cudaRuntimeGetVersion failed", __func__);
-        }
+        return -1;
     }
 
-    // NVLOGC_FMT(TAG, "{}: driverVersion={} runtimeVersion={}", __func__, driverVersion, runtimeVersion);
-
-    if(driverVersion > 0 && runtimeVersion > 0)
+    if(driverVersion > 0)
     {
         return 0;
     }
@@ -71,33 +49,37 @@ int cuda_version_check()
 int cuda_is_device_pointer(const void *ptr)
 {
     int in_gpu = 0;
+    unsigned int mem_type = 0;
 
-    cudaPointerAttributes attr;
-    attr.type = cudaMemoryTypeUnregistered;
-
-    if(cudaPointerGetAttributes(&attr, ptr) != cudaSuccess)
+    CUresult res = cuPointerGetAttribute(&mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)ptr);
+    if(res != CUDA_SUCCESS)
     {
-        NVLOGD_FMT(TAG, "{}: cudaPointerGetAttributes failed", __func__);
-        in_gpu = 0;
+        NVLOGD_FMT(TAG, "{}: cuPointerGetAttribute failed", __func__);
+        return 0;
     }
 
-    if(attr.type == cudaMemoryTypeDevice) // Or cudaMemoryTypeManaged?
+    if(mem_type == CU_MEMORYTYPE_DEVICE)
     {
         in_gpu = 1;
     }
 
-    NVLOGD_FMT(TAG, "{}: {} attr: type={} device={} devicePointer=0x{} hostPointer=0x{} in_gpu={}",
-            __func__, (void *)ptr, static_cast<uint32_t>(attr.type), attr.device, attr.devicePointer, attr.hostPointer, in_gpu);
+    NVLOGD_FMT(TAG, "{}: {} mem_type={} in_gpu={}",
+            __func__, (void *)ptr, mem_type, in_gpu);
     return in_gpu;
 }
 
 int cuda_get_device_count(void)
 {
-    int num;
-    cudaError_t err = cudaGetDeviceCount (&num);
-    if (err != cudaSuccess)
+    if(cuInit(0) != CUDA_SUCCESS)
     {
-        NVLOGW_FMT(TAG, "{}: cudaGetDeviceCount failed", __func__);
+        return -1;
+    }
+
+    int num;
+    CUresult err = cuDeviceGetCount(&num);
+    if (err != CUDA_SUCCESS)
+    {
+        NVLOGW_FMT(TAG, "{}: cuDeviceGetCount failed", __func__);
         return -1;
     }
     else
@@ -109,14 +91,14 @@ int cuda_get_device_count(void)
 // Check if a CPU memory buffer is host pinned memory: 1 if yes, 0 if no
 int cuda_is_host_pinned_memory(void* phost)
 {
-    cudaPointerAttributes input_attributes;
-    if(cudaPointerGetAttributes(&input_attributes, phost) != cudaSuccess)
+    unsigned int mem_type = 0;
+    CUresult res = cuPointerGetAttribute(&mem_type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)phost);
+    if(res != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         return 0;
     }
 
-    return (input_attributes.type == cudaMemoryTypeHost) ? 1 : 0;
+    return (mem_type == CU_MEMORYTYPE_HOST) ? 1 : 0;
 }
 
 int cuda_page_lock(void* phost, size_t size)
@@ -127,11 +109,19 @@ int cuda_page_lock(void* phost, size_t size)
         return 0;
     }
 
-    int flag = cudaHostRegisterPortable | cudaHostRegisterMapped;
-    if(cudaHostRegister(phost, size, flag) != cudaSuccess)
+    CUdevice dev;
+    CUcontext ctx;
+    if(cuInit(0) != CUDA_SUCCESS || cuDeviceGet(&dev, 0) != CUDA_SUCCESS ||
+       cuDevicePrimaryCtxRetain(&ctx, dev) != CUDA_SUCCESS || cuCtxSetCurrent(ctx) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
-        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaHostRegister failed", __func__);
+        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to establish CUDA context", __func__);
+        return -1;
+    }
+
+    unsigned int flag = CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP;
+    if(cuMemHostRegister(phost, size, flag) != CUDA_SUCCESS)
+    {
+        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuMemHostRegister failed", __func__);
         return -1;
     }
     else
@@ -149,34 +139,32 @@ int cuda_page_unlock(void* phost)
         return 0;
     }
 
-    if(cudaHostUnregister(phost) != cudaSuccess)
+    PrimaryCtxGuard ctx_guard(0);
+
+    if(cuMemHostUnregister(phost) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
-        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaHostUnregister failed", __func__);
+        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuMemHostUnregister failed", __func__);
         return -1;
     }
-    else
+
+    // Balance the extra cuDevicePrimaryCtxRetain from cuda_page_lock
+    CUdevice dev;
+    if(cuDeviceGet(&dev, 0) == CUDA_SUCCESS)
     {
-        NVLOGI_FMT(TAG, "{}: OK", __func__);
-        return 0;
+        cuDevicePrimaryCtxRelease(dev);
     }
+
+    NVLOGI_FMT(TAG, "{}: OK", __func__);
+    return 0;
 }
 
 int nv_ipc_memcpy_to_host(void* host, const void* device, size_t size)
 {
     NVLOGV_FMT(TAG, "{}: dst_host={} src_gpu={} size={}", __func__, host, (void *)device, size);
-/*
-    if(cudaSetDevice(0) != cudaSuccess)
+
+    if(cuMemcpyDtoH(host, (CUdeviceptr)device, size) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
-        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaSetDevice to {} failed", __func__, 0);
-        return -1;
-    }
-*/
-    if(cudaMemcpy(host, device, size, cudaMemcpyDeviceToHost) != cudaSuccess)
-    {
-        checkLastCudaError();
-        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaMemcpy failed", __func__);
+        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuMemcpyDtoH failed", __func__);
         return -1;
     }
     else
@@ -188,18 +176,10 @@ int nv_ipc_memcpy_to_host(void* host, const void* device, size_t size)
 int nv_ipc_memcpy_to_device(void* device, const void* host, size_t size)
 {
     NVLOGV_FMT(TAG, "{}: dst_gpu={} src_host={} size={}", __func__, device, (void *)host, size);
-/*
-    if(cudaSetDevice(0) != cudaSuccess)
+
+    if(cuMemcpyHtoD((CUdeviceptr)device, host, size) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
-        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaSetDevice to {} failed", __func__, 0);
-        return -1;
-    }
-*/
-    if(cudaMemcpy(device, host, size, cudaMemcpyHostToDevice) != cudaSuccess)
-    {
-        checkLastCudaError();
-        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaMemcpy failed", __func__);
+        NVLOGE_NO_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuMemcpyHtoD failed", __func__);
         return -1;
     }
     else

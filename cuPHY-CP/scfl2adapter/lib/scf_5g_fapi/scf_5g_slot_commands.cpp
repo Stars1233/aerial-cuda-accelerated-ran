@@ -20,7 +20,12 @@
 #include "cuphy_internal.h"
 #include "cuphy.h"
 #include "memtrace.h"
+#include <aerial/containers/static_vector.hpp>
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <limits>
+#include <span>
 #include <math.h>
 using namespace slot_command_api;
 
@@ -125,7 +130,7 @@ namespace scf_5g_fapi
         return dmrsAddlPosition;
     }
 
-    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_pusch_pdu_t& msg, int32_t cell_index, slot_indication & slotinfo, int staticPuschSlotNum, uint8_t lbrm, bool bf_enabled, uint16_t cell_stat_prm_idx, float dtx_threshold, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t* slot_detail, uint16_t ul_bandwidth) {
+    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_pusch_pdu_t& msg, int32_t cell_index, slot_indication & slotinfo, int staticPuschSlotNum, uint8_t lbrm, bool bf_enabled, uint16_t cell_stat_prm_idx, float dtx_threshold, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t* slot_detail, uint16_t ul_bandwidth, uint16_t num_ul_ant) {
 
         cell_sub_cmd.slot.type = SLOT_UPLINK;
         cell_sub_cmd.slot.slot_3gpp = slotinfo;
@@ -178,13 +183,13 @@ namespace scf_5g_fapi
         ue.qamModOrder      = msg.qam_mod_order;
         // TODO FIXME: Temp LBRM Support - Disable LBRM
         ue.i_lbrm = lbrm;
-        // See 28.212 5.4.2.1 for details on the below LBRM parameters
+        // See 38.212 5.4.2.1 for details on the below LBRM parameters
         //ue.maxLayer = <set maxLayer from L2>
         //ue.maxQm = <set maxQm from L2>
         //ue.n_PRB_LBRM = <set n_PRB_LBRM from L2>
         if (ue.i_lbrm)
         {
-            ue.maxLayers = 4;
+            ue.maxLayers = static_cast<uint8_t>(std::min<uint16_t>(num_ul_ant, 4));
             if(ue.mcsTableIndex == 1)
             {
                 ue.maxQm = 8;
@@ -580,8 +585,8 @@ namespace scf_5g_fapi
         update_fh_params_prach(cell_params, addln_config, req, req.beam_index, cell_cmd, bf_enabled, ru, slot_detail,mmimo_enabled, cell_index);
     }
 
-    void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, slot_indication & slotinfo, const scf_fapi_pucch_pdu_t& pdu, int32_t cell_index, const nv::pucch_dtx_t_list& dtx_thresholds,
-                             uint16_t cell_stat_prm_idx, nv::phy_config_option& config_option, nv::slot_detail_t*  slot_detail, bool mmimo_enabled, uint16_t ul_bandwidth, uint16_t pucch_hopping_id)
+    cuphyPucchUciPrm_t* update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, slot_indication & slotinfo, const scf_fapi_pucch_pdu_t& pdu, int32_t cell_index, const nv::pucch_dtx_t_list& dtx_thresholds,
+                             uint16_t cell_stat_prm_idx, nv::phy_config_option& config_option, nv::slot_detail_t*  slot_detail, bool mmimo_enabled, uint16_t ul_bandwidth, uint16_t pucch_hopping_id, bool append_order_prbs)
     {
         // cell_sub_cmd.create_if(channel_type::PUCCH);
         cell_sub_cmd.slot.type = SLOT_UPLINK;
@@ -713,11 +718,14 @@ namespace scf_5g_fapi
         }
         NVLOGD_FMT(TAG, "{}: PUCCH grp.nF0Ucis={} grp.nF1Ucis={} sr_flag={} bit_len_harq={}", __FUNCTION__, grp.nF0Ucis, grp.nF1Ucis, pdu.sr_flag, static_cast<unsigned short>(pdu.bit_len_harq));
 
-        nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
-        auto & mplane_info = phyDriver.getMPlaneConfig(cell_index);
-        ru_type ru = mplane_info.ru;
-
-        update_fh_params_pucch(uci_info, pdu.prb_size, *reinterpret_cast<const scf_fapi_rx_beamforming_t*>(&pdu.payload[0]),cell_sub_cmd, config_option.bf_enabled, ru, slot_detail,mmimo_enabled, cell_index, ul_bandwidth);
+        if (append_order_prbs)
+        {
+            nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+            auto & mplane_info = phyDriver.getMPlaneConfig(cell_index);
+            ru_type ru = mplane_info.ru;
+            update_fh_params_pucch(uci_info, pdu.prb_size, *reinterpret_cast<const scf_fapi_rx_beamforming_t*>(&pdu.payload[0]),cell_sub_cmd, config_option.bf_enabled, ru, slot_detail,mmimo_enabled, cell_index, ul_bandwidth);
+        }
+        return &uci_info;
     }
 
 int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd, const scf_fapi_srs_pdu_t& msg, int32_t cell_index, slot_indication & slotinfo, cuphyCellStatPrm_t cell_params, uint16_t cell_stat_prm_idx,
@@ -1048,6 +1056,91 @@ int update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell
 }
 
 #ifdef SCF_FAPI_10_04
+namespace {
+
+// One UE-group BFW entry collected during the BFW PDU loop, pending recording
+// into the framework C-plane store once the coefficient buffer is BUSY-marked.
+// We stash the per-UE bits here because the host/device buffer pointers and
+// group layer total aren't known until after the whole PDU has been walked.
+struct PendingDirectBfwCviRecord {
+    uint16_t target_pdu_index{};        //!< Target PDU index within the BFW mapping.
+    uint16_t rnti{};                    //!< UE RNTI identifier from the CVI config.
+    std::array<uint8_t, DIRECT_BFW_MAX_LAYERS> ue_layer_indices{}; //!< Per-layer UE antenna indices; first num_layers entries are valid.
+    uint8_t layer_base{};               //!< Base group-layer index for this UE mapping.
+    uint8_t num_layers{};               //!< Number of active UE layers in ue_layer_indices.
+};
+
+/**
+ * Record direct BFW CVI entries collected from one BFW PDU.
+ *
+ * Shared by both BFW slot-command producers (legacy serial update_cell_command and offload-aggr
+ * update_bfw_cell_command_impl) so the record content stays identical across the
+ * process_phy_commands -> channel-task dispatch switch.
+ *
+ * @param[in] bfw_msg BFW group configuration PDU.
+ * @param[in] slotinfo Slot timing for the BFW records.
+ * @param[in] bfw_info Coefficient memory metadata and header.
+ * @param[in] bfwType DL or UL BFW selector.
+ * @param[in] cell_index SDK cell index.
+ * @param[in] host_bfws Host coefficient buffer pointer.
+ * @param[in] device_bfws Device coefficient buffer pointer.
+ * @param[in] slot_dynamic_beam_id_start Absolute dynamic beam-ID base for the slot.
+ * @param[in] group_num_layers Total number of layers in the BFW group.
+ * @param[in] pending Pending per-UE CVI records to write.
+ */
+void try_record_direct_bfw_cvi_records(
+    const scf_fapi_dl_bfw_group_config_t& bfw_msg,
+    const slot_command_api::slot_indication& slotinfo,
+    const bfw_coeff_mem_info_t& bfw_info,
+    const bfw_type bfwType,
+    const int32_t cell_index,
+    uint8_t* host_bfws,
+    uint8_t* device_bfws,
+    const uint16_t slot_dynamic_beam_id_start,
+    const uint8_t group_num_layers,
+    const std::span<const PendingDirectBfwCviRecord> pending) noexcept
+{
+    nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+    const direct_bfw_direction direct_direction = (bfwType == slot_command_api::DL_BFW)
+        ? direct_bfw_direction::dl
+        : direct_bfw_direction::ul;
+
+    for (const auto& pending_record : pending) {
+        direct_bfw_cvi_record record{
+            .direction = direct_direction,
+            .sfn = slotinfo.sfn_,
+            .slot = slotinfo.slot_,
+            .target_pdu_index = pending_record.target_pdu_index,
+            .rnti = pending_record.rnti,
+            .rb_start = bfw_msg.dl_bfw_cvi_config.rb_start,
+            .rb_size = bfw_msg.dl_bfw_cvi_config.rb_size,
+            .num_prgs = bfw_msg.dl_bfw_cvi_config.num_prgs,
+            .prg_size = bfw_msg.dl_bfw_cvi_config.prg_size,
+            .ue_layer_indices = pending_record.ue_layer_indices,
+            .layer_base = pending_record.layer_base,
+            .num_layers = pending_record.num_layers,
+            .group_num_layers = group_num_layers,
+            .host_bfws = host_bfws,
+            .device_bfws = device_bfws,
+            .header = bfw_info.header,
+            .slot_dynamic_beam_id_start = slot_dynamic_beam_id_start,
+            .n_gnb_ant = bfw_info.nGnbAnt,
+            .bfw_iq_bitwidth = DIRECT_BFW_DYNAMIC_IQ_BITWIDTH,
+        };
+
+        const int direct_record_ret = phyDriver.l1_recordDirectBfwCviRecord(
+            static_cast<uint16_t>(cell_index), record);
+        if (direct_record_ret != 0) {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                "failed to record direct BFW CVI record cell={} sfn={} slot={} pdu={} rnti={}",
+                cell_index, slotinfo.sfn_, slotinfo.slot_,
+                pending_record.target_pdu_index, pending_record.rnti);
+        }
+    }
+}
+
+} // namespace
+
 void update_cell_command(cell_group_command* cell_grp_cmd,
                          cell_sub_command& cell_sub_cmd,
                          const scf_fapi_dl_bfw_group_config_t& bfw_msg,
@@ -1080,6 +1173,17 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         return;
     }
 
+    constexpr std::size_t bfw_msg_fixed_bytes = sizeof(scf_fapi_dl_bfw_group_config_t);
+    const uint16_t bfw_pdu_size = bfw_msg.pdu_size;
+    if (bfw_pdu_size < bfw_msg_fixed_bytes)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                   "{} BFW pdu_size {} smaller than fixed header {}",
+                   (bfwType == slot_command_api::UL_BFW) ? "UL" : "DL",
+                   bfw_pdu_size, bfw_msg_fixed_bytes);
+        return;
+    }
+
     auto bfw_ue_grp_idx = bfw_params->bfw_dyn_info.nUeGrps;
     cuphyBfwUeGrpPrm_t& ue = bfw_params->ue_grp_info[bfw_ue_grp_idx];
 
@@ -1097,9 +1201,20 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
 
     nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
     const uint8_t* next = &bfw_msg.dl_bfw_cvi_config.payload[0];
+    std::size_t remaining_bytes = static_cast<std::size_t>(bfw_pdu_size) - bfw_msg_fixed_bytes;
 
-    ue.beamIdOffset = (bfwType == slot_command_api::UL_BFW) ? -1 : phyDriver.l1_getDynamicBeamIdOffset(cell_index);
+    // UL now participates in BFW C-plane chaining as well. Under chaining the cuPHY kernel must
+    // embed the beamIds/bundle headers into the coefficient buffer because the FH chaining path
+    // does not write them (unlike the inline path at fill_dynamic_section_ext11). The helper
+    // returns -1 for NO_CHAINING, preserving the legacy inline UL behavior where the FH driver
+    // assigns beamIds itself, so this is symmetric with the DL handling.
+    ue.beamIdOffset = phyDriver.l1_getDynamicBeamIdOffset(cell_index);
     //NVLOGC_FMT(TAG, "{} line {}: SFN={}:SLOT:{}  ue.beamIdOffset {}", __FUNCTION__, __LINE__,cell_grp_cmd->slot.slot_3gpp.sfn_, cell_grp_cmd->slot.slot_3gpp.slot_, ue.beamIdOffset);
+
+    // === mMIMO C-plane: record direct BFW CVI === (legacy serial process_phy_commands path)
+    const bool direct_cplane = phyDriver.l1_isFapiToCplaneDirect();
+    aerial::static_vector<PendingDirectBfwCviRecord,
+                          slot_command_api::MAX_DL_UL_BF_UE_GROUPS> pending_direct_bfw_records;
 
     uint16_t srsChestBufferIndexL2 = 0;
     uint32_t aggr_ue_cnt = 0;
@@ -1109,7 +1224,26 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         uint16_t srsStartPrg    = 0;
         uint16_t srsStartValidPrg = 0;
         uint16_t srsNValidPrg   = 0;
+        if (remaining_bytes < sizeof(scf_dl_bfw_config_start_t))
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "{} BFW pdu[{}] header truncated, remaining={} required={}",
+                       (bfwType == slot_command_api::UL_BFW) ? "UL" : "DL",
+                       ueIdx, remaining_bytes, sizeof(scf_dl_bfw_config_start_t));
+            return;
+        }
         const scf_dl_bfw_config_start_t& bfw_config_start  = *reinterpret_cast<const scf_dl_bfw_config_start_t*>(next);
+        const std::size_t ue_config_bytes =
+            sizeof(scf_dl_bfw_config_start_t) + static_cast<std::size_t>(bfw_config_start.num_ue_ants);
+        if (remaining_bytes < ue_config_bytes)
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "{} BFW pdu[{}] payload truncated, remaining={} required={} num_ue_ants={}",
+                       (bfwType == slot_command_api::UL_BFW) ? "UL" : "DL",
+                       ueIdx, remaining_bytes, ue_config_bytes,
+                       static_cast<uint8_t>(bfw_config_start.num_ue_ants));
+            return;
+        }
         srsChestBufferIndexL2 = static_cast<uint16_t>((bfw_config_start.handle >> 8) & 0xFFFF);
         cuphyTensorDescriptor_t srsDescr = NULL;
 
@@ -1128,6 +1262,8 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                 NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "cellid {} rnti {} rsrsChestBufferIndex {} state is SRS_CHEST_BUFF_REQUESTED. Dropping srs pdu from {} BFW_CVI_REQUEST",
                                         cell_index,rnti,srsChestBufferIndexL2,(bfwType == slot_command_api::UL_BFW)?"UL":"DL");
                 droppedBFWPdu++;
+                next += ue_config_bytes;
+                remaining_bytes -= ue_config_bytes;
                 continue;
             }
         }
@@ -1166,6 +1302,17 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
 
         auto pduIdx = bfw_config_start.pduIndex;
 
+        // Stash this UE group now; the actual recording happens after the coeff
+        // buffer is BUSY-marked below (we need its host/device pointers first).
+        // Bail if a group has more layers than we can hold or the slot is full.
+        if (direct_cplane &&
+            (bfw_config_start.num_ue_ants > DIRECT_BFW_MAX_LAYERS ||
+             pending_direct_bfw_records.size() == pending_direct_bfw_records.capacity())) {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                "direct BFW CVI layer/group count exceeds direct storage cell={}", cell_index);
+            return;
+        }
+
         bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].pdu_idx = pduIdx;
         bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].rnti = rnti;
 
@@ -1173,15 +1320,27 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                         static_cast<uint16_t>(bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].pdu_idx),
                         static_cast<uint16_t>(bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].rnti));
 
+        PendingDirectBfwCviRecord* pending = nullptr;
+        if (direct_cplane) {
+            pending = &pending_direct_bfw_records.emplace_back();
+            pending->target_pdu_index = pduIdx;
+            pending->rnti = rnti;
+            pending->layer_base = static_cast<uint8_t>(ue.nBfLayers);  // group-layer offset before this UE's ants
+        }
+
         const uint8_t* ue_ant_idx = &bfw_config_start.payload[0];
         for (ueAntIdx = 0; ueAntIdx < bfw_config_start.num_ue_ants; ueAntIdx++)
         {
             bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx + ue.nBfLayers].chEstInfoBufIdx = ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx;
             bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx + ue.nBfLayers].ueLayerIndex = *(ue_ant_idx+ueAntIdx);
             NVLOGD_FMT(TAG, "chEstInfoBufIdx={}, ueLayerIndex={} ue.nBfLayers={} Index={}",bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx + ue.nBfLayers].chEstInfoBufIdx, *(ue_ant_idx+ueAntIdx), ue.nBfLayers,bfw_params->prevUeGrpPerLayerInfoBufIdx);
+            if (pending != nullptr) {
+                pending->ue_layer_indices[pending->num_layers++] = *(ue_ant_idx+ueAntIdx);
+            }
             ue.nBfLayers++;
         }
-        next += sizeof(scf_dl_bfw_config_start_t) + bfw_config_start.num_ue_ants;
+        next += ue_config_bytes;
+        remaining_bytes -= ue_config_bytes;
         aggr_ue_cnt++;
     }
 
@@ -1206,6 +1365,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
             cell_grp_cmd->slot.slot_3gpp.sfn_,
             cell_grp_cmd->slot.slot_3gpp.slot_);
 
+        bool coeff_output_assigned = false;
         if ((*bfwCoeff_mem_info->header == BFW_COFF_MEM_FREE) &&
             (bfwCoeff_mem_info->slotIndex == (cell_grp_cmd->slot.slot_3gpp.slot_ % MAX_BFW_COFF_STORE_INDEX)))
         {
@@ -1219,11 +1379,22 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
             bfwCoeff_mem_info->nGnbAnt = cell_params.nRxAntSrs;
             bfwCoeff_mem_info->sfn = cell_grp_cmd->slot.slot_3gpp.sfn_;
             bfwCoeff_mem_info->slot = cell_grp_cmd->slot.slot_3gpp.slot_;
+            coeff_output_assigned = true;
         }
         else
         {
             NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: SFN {}.{} memory not available for storing bfwCoeff",
                 __FUNCTION__, __LINE__, cell_grp_cmd->slot.slot_3gpp.sfn_, cell_grp_cmd->slot.slot_3gpp.slot_);
+        }
+
+        if (direct_cplane && coeff_output_assigned) {
+            try_record_direct_bfw_cvi_records(
+                bfw_msg, slotinfo, *bfwCoeff_mem_info, bfwType, cell_index,
+                bfw_params->pBfwCoefH[bfw_ue_grp_idx], bfw_params->pBfwCoefD[bfw_ue_grp_idx],
+                static_cast<uint16_t>(ue.beamIdOffset >= 0 ? ue.beamIdOffset : 0),
+                static_cast<uint8_t>(ue.nBfLayers),
+                std::span<const PendingDirectBfwCviRecord>{
+                    pending_direct_bfw_records.data(), pending_direct_bfw_records.size()});
         }
         ue.pBfLayerPrm = &bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx];
         bfw_params->prevUeGrpPerLayerInfoBufIdx += ue.nBfLayers;
@@ -1239,6 +1410,309 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
             return;
         }
     }
+}
+
+template <bfw_type BfwType>
+static void update_bfw_cell_command_impl(cell_group_command* cell_grp_cmd,
+                                         cell_sub_command& cell_sub_cmd,
+                                         const scf_fapi_dl_bfw_group_config_t& bfw_msg,
+                                         int32_t cell_index,
+                                         slot_indication & slotinfo,
+                                         cuphyCellStatPrm_t cell_params,
+                                         bfw_coeff_mem_info_t *bfwCoeff_mem_info,
+                                         nv::slot_detail_t*  slot_detail,
+                                         uint32_t &droppedBFWPdu,
+                                         const char* function_name)
+{
+    (void)slot_detail;
+
+    constexpr bool is_ul_bfw = (BfwType == UL_BFW);
+    const char* const bfw_label = is_ul_bfw ? "UL" : "DL";
+
+    const uint8_t report_type = is_ul_bfw ? REPORT_TYPE_CODEBOOK : REPORT_TYPE_NON_CODEBOOK;
+    // Slot metadata is intentionally updated here for now. Moving this common
+    // metadata update out to the slot dispatch path was discussed, but that
+    // integration cleanup is deferred so this BFW enablement change stays scoped.
+    if constexpr (is_ul_bfw)
+    {
+        cell_sub_cmd.slot.type = SLOT_UPLINK;
+        cell_grp_cmd->slot.type = SLOT_UPLINK;
+    }
+    else
+    {
+        cell_sub_cmd.slot.type = SLOT_DOWNLINK;
+        cell_grp_cmd->slot.type = SLOT_DOWNLINK;
+    }
+
+    cell_sub_cmd.slot.slot_3gpp = slotinfo;
+    cell_grp_cmd->slot.slot_3gpp = slotinfo;
+
+    bfw_params* bfw_params = cell_grp_cmd->get_bfw_params();
+
+    if (bfw_params == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "no {} bfw command", bfw_label);
+        return;
+    }
+
+    constexpr std::size_t bfw_msg_fixed_bytes = sizeof(scf_fapi_dl_bfw_group_config_t);
+    const uint16_t bfw_pdu_size = bfw_msg.pdu_size;
+    if (bfw_pdu_size < bfw_msg_fixed_bytes)
+    {
+        NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                   "{} BFW pdu_size {} smaller than fixed header {}",
+                   bfw_label, bfw_pdu_size, bfw_msg_fixed_bytes);
+        return;
+    }
+
+    auto bfw_ue_grp_idx = bfw_params->bfw_dyn_info.nUeGrps;
+    cuphyBfwUeGrpPrm_t& ue = bfw_params->ue_grp_info[bfw_ue_grp_idx];
+
+    ue.startPrbGrp = (bfw_msg.dl_bfw_cvi_config.rb_start/bfw_msg.dl_bfw_cvi_config.prg_size);
+    ue.nPrbGrp = bfw_msg.dl_bfw_cvi_config.num_prgs;
+    ue.nRxAnt = cell_params.nRxAntSrs;
+
+    bfw_params->dl_ul_bwp_max_prg[cell_index] = ROUND_UP(cell_params.nPrbDlBwp,bfw_msg.dl_bfw_cvi_config.prg_size);
+    bfw_params->nGnbAnt = cell_params.nRxAntSrs;
+
+    uint8_t *ptr = NULL;
+    uint8_t ueIdx = 0;
+    uint8_t ueAntIdx = 0;
+
+    nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+    const uint8_t* next = &bfw_msg.dl_bfw_cvi_config.payload[0];
+    std::size_t remaining_bytes = static_cast<std::size_t>(bfw_pdu_size) - bfw_msg_fixed_bytes;
+
+    // UL now participates in BFW C-plane chaining (see note above): under chaining cuPHY must
+    // embed beamIds into the coefficient buffer. l1_getDynamicBeamIdOffset returns -1 for
+    // NO_CHAINING, preserving the legacy inline UL path where the FH driver writes beamIds.
+    ue.beamIdOffset = phyDriver.l1_getDynamicBeamIdOffset(cell_index);
+
+    // === mMIMO C-plane: record direct BFW CVI === (offload-aggr ENABLE_FAPI_STORE_REPLAY path)
+    const bool direct_cplane = phyDriver.l1_isFapiToCplaneDirect();
+    aerial::static_vector<PendingDirectBfwCviRecord,
+                          slot_command_api::MAX_DL_UL_BF_UE_GROUPS> pending_direct_bfw_records;
+
+    uint16_t srsChestBufferIndexL2 = 0;
+    uint32_t aggr_ue_cnt = 0;
+    for(ueIdx = 0; ueIdx < bfw_msg.dl_bfw_cvi_config.nUes; ueIdx++)
+    {
+        uint8_t  srsPrgSize     = 0;
+        uint16_t srsStartPrg    = 0;
+        uint16_t srsStartValidPrg = 0;
+        uint16_t srsNValidPrg   = 0;
+        if (remaining_bytes < sizeof(scf_dl_bfw_config_start_t))
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "{} BFW pdu[{}] header truncated, remaining={} required={}",
+                       bfw_label, ueIdx, remaining_bytes, sizeof(scf_dl_bfw_config_start_t));
+            return;
+        }
+        const scf_dl_bfw_config_start_t& bfw_config_start  = *reinterpret_cast<const scf_dl_bfw_config_start_t*>(next);
+        const std::size_t ue_config_bytes =
+            sizeof(scf_dl_bfw_config_start_t) + static_cast<std::size_t>(bfw_config_start.num_ue_ants);
+        if (remaining_bytes < ue_config_bytes)
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "{} BFW pdu[{}] payload truncated, remaining={} required={} num_ue_ants={}",
+                       bfw_label, ueIdx, remaining_bytes, ue_config_bytes,
+                       static_cast<uint8_t>(bfw_config_start.num_ue_ants));
+            return;
+        }
+        srsChestBufferIndexL2 = static_cast<uint16_t>((bfw_config_start.handle >> 8) & 0xFFFF);
+        cuphyTensorDescriptor_t srsDescr = NULL;
+
+        uint16_t rnti = bfw_config_start.rnti;
+        slot_command_api::srsChestBuffState srsChestBuffState = slot_command_api::SRS_CHEST_BUFF_NONE;
+        int retVal = phyDriver.l1_cv_mem_bank_get_buffer_state(cell_index,srsChestBufferIndexL2,&srsChestBuffState);
+        if(retVal != -1)
+        {
+            if(srsChestBuffState == slot_command_api::SRS_CHEST_BUFF_REQUESTED)
+            {
+                NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "cellid {} rnti {} rsrsChestBufferIndex {} state is SRS_CHEST_BUFF_REQUESTED. Dropping srs pdu from {} BFW_CVI_REQUEST",
+                                        cell_index,rnti,srsChestBufferIndexL2,bfw_label);
+                droppedBFWPdu++;
+                next += ue_config_bytes;
+                remaining_bytes -= ue_config_bytes;
+                continue;
+            }
+        }
+        else
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "l1_cv_mem_bank_get_buffer_state() returned -1. cellid {} rnti {} srsChestBufferIndex {} in {}_BFW {}",cell_index,rnti, srsChestBufferIndexL2,bfw_label,function_name);
+            return;
+        }
+
+        NVLOGD_FMT(TAG, "cell_sub_cmd.cell={}, cell_index={}",cell_sub_cmd.cell, cell_index);
+        if (!(phyDriver.l1_cv_mem_bank_retrieve_buffer(cell_index, bfw_config_start.rnti, srsChestBufferIndexL2, report_type, &srsPrgSize, &srsStartPrg, &srsStartValidPrg, &srsNValidPrg, &srsDescr, &ptr)))
+        {
+            bfw_params->chEstInfo[ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx].startPrbGrp         = srsStartPrg;
+            bfw_params->chEstInfo[ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx].tChEstBuffer.desc   = srsDescr;
+            bfw_params->chEstInfo[ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx].tChEstBuffer.pAddr  = ptr;
+            bfw_params->chEstInfo[ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx].srsPrbGrpSize       = srsPrgSize;
+            bfw_params->chEstInfo[ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx].startValidPrg       = srsStartValidPrg;
+            bfw_params->chEstInfo[ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx].nValidPrg           = srsNValidPrg;
+            NVLOGD_FMT(TAG, "{} BFW-SRS retrieved CV buffer cell {} rnti {} srsStartPrg {} srsPrgSize {} srsStartValidPrg {}, srsNValidPrg {}, srsChestBufferIndexL2 {} chEstInfo_Index {} chEstInfo_ptr {}", bfw_label, cell_sub_cmd.cell, static_cast<uint16_t>(bfw_config_start.rnti), srsStartPrg,srsPrgSize, srsStartValidPrg, srsNValidPrg, srsChestBufferIndexL2, ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx, static_cast<void *>(ptr));
+        }
+        else
+        {
+            return;
+        }
+        NVLOGD_FMT(TAG, "UL:{} DL:{} BFW: rnti={} pduIdx={} gNbAntStartIdx={} gNbAntEndIdx={} numUeAnt={} prg_size={} num_prgs={} srsChestBufferIndexL2={}",
+         is_ul_bfw ? 1 : 0,
+         is_ul_bfw ? 0 : 1,
+         static_cast<uint16_t>(bfw_config_start.rnti),
+         static_cast<uint16_t>(bfw_config_start.pduIndex),
+         static_cast<uint8_t>(bfw_config_start.gnb_ant_index_start),
+         static_cast<uint8_t>(bfw_config_start.gnb_ant_index_end),
+         static_cast<uint8_t>(bfw_config_start.num_ue_ants),
+         static_cast<uint8_t>(bfw_msg.dl_bfw_cvi_config.prg_size),
+         static_cast<uint8_t>(bfw_msg.dl_bfw_cvi_config.num_prgs),
+         srsChestBufferIndexL2);
+
+        auto pduIdx = bfw_config_start.pduIndex;
+
+        bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].pdu_idx = pduIdx;
+        bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].rnti = rnti;
+
+        NVLOGD_FMT(TAG,"slotIndex={} bfw_ue_grp_idx={} PDSCH Idx={} CVI RNTI={}", bfwCoeff_mem_info->slotIndex, bfw_ue_grp_idx,
+                        static_cast<uint16_t>(bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].pdu_idx),
+                        static_cast<uint16_t>(bfwCoeff_mem_info->pdu_idx_rnti_list[bfw_ue_grp_idx][pduIdx].rnti));
+
+        // Stash this UE group now; the actual recording happens after the coeff
+        // buffer is BUSY-marked below (we need its host/device pointers first).
+        // Bail if a group has more layers than we can hold or the slot is full.
+        if (direct_cplane &&
+            (bfw_config_start.num_ue_ants > DIRECT_BFW_MAX_LAYERS ||
+             pending_direct_bfw_records.size() == pending_direct_bfw_records.capacity())) {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                "direct BFW CVI layer/group count exceeds direct storage cell={}", cell_index);
+            return;
+        }
+
+        PendingDirectBfwCviRecord* pending = nullptr;
+        if (direct_cplane) {
+            pending = &pending_direct_bfw_records.emplace_back();
+            pending->target_pdu_index = pduIdx;
+            pending->rnti = rnti;
+            pending->layer_base = static_cast<uint8_t>(ue.nBfLayers);  // group-layer offset before this UE's ants
+        }
+
+        const uint8_t* ue_ant_idx = &bfw_config_start.payload[0];
+        for (ueAntIdx = 0; ueAntIdx < bfw_config_start.num_ue_ants; ueAntIdx++)
+        {
+            bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx + ue.nBfLayers].chEstInfoBufIdx = ueIdx + bfw_params->prevUeGrpChEstInfoBufIdx;
+            bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx + ue.nBfLayers].ueLayerIndex = *(ue_ant_idx+ueAntIdx);
+            NVLOGD_FMT(TAG, "chEstInfoBufIdx={}, ueLayerIndex={} ue.nBfLayers={} Index={}",bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx + ue.nBfLayers].chEstInfoBufIdx, *(ue_ant_idx+ueAntIdx), ue.nBfLayers,bfw_params->prevUeGrpPerLayerInfoBufIdx);
+            if (pending != nullptr) {
+                pending->ue_layer_indices[pending->num_layers++] = *(ue_ant_idx+ueAntIdx);
+            }
+            ue.nBfLayers++;
+        }
+        next += ue_config_bytes;
+        remaining_bytes -= ue_config_bytes;
+        aggr_ue_cnt++;
+    }
+
+    if(aggr_ue_cnt > 0)
+    {
+        bfw_params->prevUeGrpChEstInfoBufIdx += aggr_ue_cnt;
+        bfw_params->bfw_cvi_type = BfwType;
+
+        ue.coefBufIdx = bfw_ue_grp_idx;
+        ue.startPrb         = bfw_msg.dl_bfw_cvi_config.rb_start;
+        ue.bfwPrbGrpSize    = bfw_msg.dl_bfw_cvi_config.prg_size;
+        ue.nPrbGrp          = bfw_msg.dl_bfw_cvi_config.num_prgs;
+
+        NVLOGD_FMT(TAG,"Cell_Idx {} UL:{} DL:{} BFW: startPrb {} bfwPrbGrpSize {} nPrbGrp {} prevUeGrpChEstInfoBufIdx={} ueIdx={} aggr_ue_cnt={} sfn={} slot={}",
+            cell_index,
+            is_ul_bfw ? 1 : 0,
+            is_ul_bfw ? 0 : 1,
+            ue.startPrb,ue.bfwPrbGrpSize,ue.nPrbGrp,
+            bfw_params->prevUeGrpChEstInfoBufIdx,
+            ueIdx,
+            aggr_ue_cnt,
+            cell_grp_cmd->slot.slot_3gpp.sfn_,
+            cell_grp_cmd->slot.slot_3gpp.slot_);
+
+        bool coeff_output_assigned = false;
+        if ((*bfwCoeff_mem_info->header == BFW_COFF_MEM_FREE) &&
+            (bfwCoeff_mem_info->slotIndex == (cell_grp_cmd->slot.slot_3gpp.slot_ % MAX_BFW_COFF_STORE_INDEX)))
+        {
+            bfw_params->pBfwCoefH[bfw_ue_grp_idx] = bfwCoeff_mem_info->buff_addr_chunk_h[bfw_params->nue_grps_per_cell[cell_index]];
+            bfw_params->pBfwCoefD[bfw_ue_grp_idx] = bfwCoeff_mem_info->buff_addr_chunk_d[bfw_params->nue_grps_per_cell[cell_index]];
+            NVLOGD_FMT(TAG, "{} bfwCoeff_mem_info={} bfw_params->pBfwCoefH[{}]:{} bfw_params->pBfwCoefD[{}]:{}",function_name, reinterpret_cast<void*>(bfwCoeff_mem_info),
+                                bfw_params->nue_grps_per_cell[cell_index],reinterpret_cast<void*>(bfw_params->pBfwCoefH[bfw_ue_grp_idx]), bfw_params->nue_grps_per_cell[cell_index],reinterpret_cast<void*>(bfw_params->pBfwCoefD[bfw_ue_grp_idx]));
+            bfwCoeff_mem_info->num_buff_chunk_busy = bfw_params->nue_grps_per_cell[cell_index] + 1;
+            *bfwCoeff_mem_info->header = BFW_COFF_MEM_BUSY;
+            bfwCoeff_mem_info->nGnbAnt = cell_params.nRxAntSrs;
+            bfwCoeff_mem_info->sfn = cell_grp_cmd->slot.slot_3gpp.sfn_;
+            bfwCoeff_mem_info->slot = cell_grp_cmd->slot.slot_3gpp.slot_;
+            coeff_output_assigned = true;
+        }
+        else
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: SFN {}.{} memory not available for storing {} bfwCoeff",
+                function_name, __LINE__, cell_grp_cmd->slot.slot_3gpp.sfn_, cell_grp_cmd->slot.slot_3gpp.slot_, bfw_label);
+        }
+
+        if (direct_cplane && coeff_output_assigned) {
+            try_record_direct_bfw_cvi_records(
+                bfw_msg, slotinfo, *bfwCoeff_mem_info, BfwType, cell_index,
+                bfw_params->pBfwCoefH[bfw_ue_grp_idx], bfw_params->pBfwCoefD[bfw_ue_grp_idx],
+                static_cast<uint16_t>(ue.beamIdOffset >= 0 ? ue.beamIdOffset : 0),
+                static_cast<uint8_t>(ue.nBfLayers),
+                std::span<const PendingDirectBfwCviRecord>{
+                    pending_direct_bfw_records.data(), pending_direct_bfw_records.size()});
+        }
+        ue.pBfLayerPrm = &bfw_params->pBfLayerPrm[bfw_params->prevUeGrpPerLayerInfoBufIdx];
+        bfw_params->prevUeGrpPerLayerInfoBufIdx += ue.nBfLayers;
+        bfw_params->dataIn.pChEstInfo = &bfw_params->chEstInfo[0];
+        bfw_params->dataOutH.pBfwCoef = bfw_params->pBfwCoefH;
+        bfw_params->dataOutD.pBfwCoef = bfw_params->pBfwCoefD;
+        bfw_params->bfw_dyn_info.nUeGrps++;
+        bfw_params->nue_grps_per_cell[cell_index]++;
+        if(bfw_params->nue_grps_per_cell[cell_index] > CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS)
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "{} line {}: bfw_params->nue_grps_per_cell[{}]:{} > CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS:{}",
+                function_name, __LINE__, cell_index, bfw_params->nue_grps_per_cell[cell_index], CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS);
+            return;
+        }
+    }
+}
+
+void update_dl_bfw_cell_command(cell_group_command* cell_grp_cmd,
+                                cell_sub_command& cell_sub_cmd,
+                                const scf_fapi_dl_bfw_group_config_t& bfw_msg,
+                                int32_t cell_index,
+                                slot_indication & slotinfo,
+                                cuphyCellStatPrm_t cell_params,
+                                bfw_coeff_mem_info_t *bfwCoeff_mem_info,
+                                nv::slot_detail_t*  slot_detail,
+                                uint32_t &droppedBFWPdu)
+{
+    update_bfw_cell_command_impl<DL_BFW>(cell_grp_cmd, cell_sub_cmd, bfw_msg,
+                                         cell_index, slotinfo, cell_params,
+                                         bfwCoeff_mem_info, slot_detail,
+                                         droppedBFWPdu,
+                                         "update_dl_bfw_cell_command");
+}
+
+void update_ul_bfw_cell_command(cell_group_command* cell_grp_cmd,
+                                cell_sub_command& cell_sub_cmd,
+                                const scf_fapi_ul_bfw_group_config_t& bfw_msg,
+                                int32_t cell_index,
+                                slot_indication & slotinfo,
+                                cuphyCellStatPrm_t cell_params,
+                                bfw_coeff_mem_info_t *bfwCoeff_mem_info,
+                                nv::slot_detail_t*  slot_detail,
+                                uint32_t &droppedBFWPdu)
+{
+    update_bfw_cell_command_impl<UL_BFW>(cell_grp_cmd, cell_sub_cmd, bfw_msg,
+                                         cell_index, slotinfo, cell_params,
+                                         bfwCoeff_mem_info, slot_detail,
+                                         droppedBFWPdu,
+                                         "update_ul_bfw_cell_command");
 }
 #endif
 
@@ -1428,21 +1902,20 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
         }
     }
 
-    inline void update_fh_params_pucch(cuphyPucchUciPrm_t& uci_info, uint16_t prb_size, const scf_fapi_rx_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, bool bf_enabled,
-                                       enum ru_type ru, nv::slot_detail_t* slot_detail, bool mmimo_enabled, int32_t cell_index, uint16_t ul_bandwidth) {
-        auto sym_prbs{cell_cmd.sym_prb_info()};
-        auto& prbs{sym_prbs->prbs};
+    void append_pucch_order_prbs(cuphyPucchUciPrm_t& uci_info, uint16_t prb_size, const scf_fapi_rx_beamforming_t& pmi_bf_pdu, slot_info_t& sym_prbs, bool bf_enabled,
+                                 enum ru_type ru, nv::slot_detail_t* slot_detail, bool mmimo_enabled, int32_t cell_index, uint16_t ul_bandwidth) {
+        auto& prbs{sym_prbs.prbs};
         if(ru == SINGLE_SECT_MODE)
         {
-            bool value = ifAnySymbolPresent(sym_prbs->symbols, UL_NON_PRACH_CHANNEL_MASK);
+            bool value = ifAnySymbolPresent(sym_prbs.symbols, UL_NON_PRACH_CHANNEL_MASK);
 
             if(value)
                 return;
 
-            check_prb_info_size(sym_prbs->prbs_size);
-            prbs[sym_prbs->prbs_size] = prb_info_t(0, ul_bandwidth);
-            sym_prbs->prbs_size++;
-            std::size_t index{sym_prbs->prbs_size - 1};
+            check_prb_info_size(sym_prbs.prbs_size);
+            prbs[sym_prbs.prbs_size] = prb_info_t(0, ul_bandwidth);
+            sym_prbs.prbs_size++;
+            std::size_t index{sym_prbs.prbs_size - 1};
 
             prb_info_t& prb_info{prbs[index]};
 
@@ -1454,7 +1927,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                 update_beam_list(prb_info.beams_array, prb_info.beams_array_size, pmi_bf_pdu,mmimo_enabled, prb_info, cell_index);
             }
             uint8_t start_symbol = (slot_detail == nullptr ? 0 : slot_detail->start_sym_ul);
-            update_prb_sym_list(*sym_prbs, index, start_symbol, 1, channel_type::PUCCH, ru);
+            update_prb_sym_list(sym_prbs, index, start_symbol, 1, channel_type::PUCCH, ru);
         }
         else
         {
@@ -1463,11 +1936,18 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
             // (startPrb,  prbSize) (secondHopPrb, prbSize)
             uint16_t startCrb = uci_info.startPrb + uci_info.bwpStart;
             // Assume that if 2 PUCCH PDUs have the same startPrb, numPrb and numSym, then the numSym is the same too
-            auto& symb = sym_prbs->symbols[uci_info.startSym];
+            if (uci_info.startSym >= OFDM_SYMBOLS_PER_SLOT)
+            {
+                NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                           "append_pucch_order_prbs: PUCCH startSym {} out of range [0,{}); dropping PDU",
+                           uci_info.startSym, OFDM_SYMBOLS_PER_SLOT);
+                return;
+            }
+            auto& symb = sym_prbs.symbols[uci_info.startSym];
 
             for(std::size_t existing_prb_index = 0; existing_prb_index < symb[channel_type::PUCCH].size(); existing_prb_index++)
             {
-                if(sym_prbs->prbs_size > symb[channel_type::PUCCH][existing_prb_index])
+                if(sym_prbs.prbs_size > symb[channel_type::PUCCH][existing_prb_index])
                 {
                     auto& prb = prbs[symb[channel_type::PUCCH][existing_prb_index]];
                     if(prb.common.startPrbc == startCrb && prb.common.numPrbc == uci_info.prbSize)
@@ -1479,10 +1959,10 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
 
             if(!uci_info.freqHopFlag)
             {
-                check_prb_info_size(sym_prbs->prbs_size);
-                prbs[sym_prbs->prbs_size] = prb_info_t(startCrb, prb_size);
-                sym_prbs->prbs_size++;
-                std::size_t index{sym_prbs->prbs_size - 1};
+                check_prb_info_size(sym_prbs.prbs_size);
+                prbs[sym_prbs.prbs_size] = prb_info_t(startCrb, prb_size);
+                sym_prbs.prbs_size++;
+                std::size_t index{sym_prbs.prbs_size - 1};
                 prb_info_t& prb_info{prbs[index]};
 
                 prb_info.common.direction = fh_dir_t::FH_DIR_UL;
@@ -1497,7 +1977,7 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                     prb_info.common.portMask = (1 << pmi_bf_pdu.dig_bf_interfaces) -1;
                     uci_info.nUplinkStreams = pmi_bf_pdu.dig_bf_interfaces;
                 }
-                update_prb_sym_list(*sym_prbs, index, uci_info.startSym, 1, channel_type::PUCCH, ru);
+                update_prb_sym_list(sym_prbs, index, uci_info.startSym, 1, channel_type::PUCCH, ru);
             }
             else if(uci_info.nSym > 1)
             {
@@ -1510,11 +1990,11 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                 uint16_t secondHopStart{static_cast<uint16_t>(uci_info.startSym + hopNsym)};
                 // secondHopEnd = 13
                 uint16_t secondHopNsym{static_cast<uint16_t>(uci_info.nSym - hopNsym)};
-                check_prb_info_size(sym_prbs->prbs_size);
-                prbs[sym_prbs->prbs_size] = prb_info_t(startCrb, prb_size);
-                sym_prbs->prbs_size++;
+                check_prb_info_size(sym_prbs.prbs_size);
+                prbs[sym_prbs.prbs_size] = prb_info_t(startCrb, prb_size);
+                sym_prbs.prbs_size++;
 
-                std::size_t index{sym_prbs->prbs_size - 1};
+                std::size_t index{sym_prbs.prbs_size - 1};
                 prb_info_t& prb_info{prbs[index]};
                 prb_info.common.direction = fh_dir_t::FH_DIR_UL;
 
@@ -1528,12 +2008,12 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                     prb_info.common.portMask = (1 << pmi_bf_pdu.dig_bf_interfaces) -1;
                     uci_info.nUplinkStreams = pmi_bf_pdu.dig_bf_interfaces;
                 }
-                update_prb_sym_list(*sym_prbs, index, firstHopStart, 1, channel_type::PUCCH, ru);
+                update_prb_sym_list(sym_prbs, index, firstHopStart, 1, channel_type::PUCCH, ru);
 
-                check_prb_info_size(sym_prbs->prbs_size);
-                prbs[sym_prbs->prbs_size] = prb_info_t(uci_info.secondHopPrb + uci_info.bwpStart, prb_size);
-                sym_prbs->prbs_size++;
-                index = sym_prbs->prbs_size - 1;
+                check_prb_info_size(sym_prbs.prbs_size);
+                prbs[sym_prbs.prbs_size] = prb_info_t(uci_info.secondHopPrb + uci_info.bwpStart, prb_size);
+                sym_prbs.prbs_size++;
+                index = sym_prbs.prbs_size - 1;
 
                 prb_info_t& prb_info2{prbs[index]};
                 prb_info2.common.direction = fh_dir_t::FH_DIR_UL;
@@ -1547,9 +2027,19 @@ void update_cell_command(cell_group_command* cell_grp_cmd,
                     prb_info2.common.portMask = (1 << pmi_bf_pdu.dig_bf_interfaces) -1;
                     uci_info.nUplinkStreams = pmi_bf_pdu.dig_bf_interfaces;
                 }
-                update_prb_sym_list(*sym_prbs, index, secondHopStart, 1, channel_type::PUCCH, ru);
+                update_prb_sym_list(sym_prbs, index, secondHopStart, 1, channel_type::PUCCH, ru);
             }
         }
+    }
+
+    inline void update_fh_params_pucch(cuphyPucchUciPrm_t& uci_info, uint16_t prb_size, const scf_fapi_rx_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, bool bf_enabled,
+                                       enum ru_type ru, nv::slot_detail_t* slot_detail, bool mmimo_enabled, int32_t cell_index, uint16_t ul_bandwidth) {
+        auto* sym_prbs{cell_cmd.sym_prb_info()};
+        if (sym_prbs == nullptr)
+        {
+            return;
+        }
+        append_pucch_order_prbs(uci_info, prb_size, pmi_bf_pdu, *sym_prbs, bf_enabled, ru, slot_detail, mmimo_enabled, cell_index, ul_bandwidth);
     }
 
     inline void update_fh_params_prach(nv::phy_config& config, nv::prach_addln_config_t& addln_config, const scf_fapi_prach_pdu_t& pdu, const scf_fapi_rx_beamforming_t & bf_pdu, cell_sub_command& cell_cmd,

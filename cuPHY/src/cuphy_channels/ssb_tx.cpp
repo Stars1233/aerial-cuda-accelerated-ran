@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -730,11 +730,17 @@ cuphyStatus_t SsbTx::preparePBCH(uint32_t*                                 h_x_m
 }
 
 
-cuphyStatus_t SsbTx::expandParameters(cuphySsbDynPrms_t* dyn_params,
-                             cudaStream_t         cuda_strm)
+cuphyStatus_t SsbTx::expandParameters(cuphySsbDynPrms_t* dyn_params, cudaStream_t cuda_strm)
 {
     num_cells = dyn_params->nCells;
     num_SSBs  = dyn_params->nSSBlocks;
+    
+    if (num_cells > max_cells_per_slot || num_SSBs > max_SSBs_per_slot ||  dyn_params->nPrecodingMatrices > max_SSBs_per_slot) [[unlikely]]
+    {
+        NVLOGE_FMT(NVLOG_SSB, AERIAL_CUPHY_EVENT, "{}: nCells ({}) or nSSBlocks ({}) or nPrecodingMatrices ({}) exceeds allocated capacity ({} {})",
+                   __FUNCTION__, num_cells, num_SSBs, dyn_params->nPrecodingMatrices, max_cells_per_slot, max_SSBs_per_slot);
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    }
 
     //The extra host to host copy is needed if we want the respective H2D copy to be part of the single bulk async. copy.
     //FIXME can skip and have separate H2D copies instead

@@ -85,13 +85,32 @@ Peer::~Peer()
     free_nic_resources();
     //cudaFreeHost(up_symbol_info_gpu_); //FIXME error checking?
     free(cplane_sections_info_list_);
-    cudaFreeHost(h_up_slot_info_);
-    cudaFree(d_up_slot_info_);
-    cudaFree(d_flow_pkt_hdr_index_);
-    cudaFree(d_flow_sym_pkt_hdr_index_);
-    cudaFree(d_block_count_);
-    cudaFree(d_ecpri_seq_id_);
-    cudaFree(d_hdr_template_);
+
+    auto logFreeError = [](const char* desc, void* ptr, CUresult res) {
+        if(res != CUDA_SUCCESS)
+        {
+            const char* errStr = nullptr;
+            cuGetErrorString(res, &errStr);
+            NVLOGE_FMT(TAG, AERIAL_DPDK_API_EVENT, "Failed to free {} @{}: {} ({})", desc, ptr, res, errStr ? errStr : "unknown");
+        }
+    };
+
+    logFreeError("h_up_slot_info_", h_up_slot_info_, cuMemFreeHost(h_up_slot_info_));
+    logFreeError("d_up_slot_info_", d_up_slot_info_, cuMemFree(reinterpret_cast<CUdeviceptr>(d_up_slot_info_)));
+    logFreeError("d_flow_pkt_hdr_index_", d_flow_pkt_hdr_index_, cuMemFree(reinterpret_cast<CUdeviceptr>(d_flow_pkt_hdr_index_)));
+    logFreeError("d_flow_sym_pkt_hdr_index_", d_flow_sym_pkt_hdr_index_, cuMemFree(reinterpret_cast<CUdeviceptr>(d_flow_sym_pkt_hdr_index_)));
+    logFreeError("d_block_count_", d_block_count_, cuMemFree(reinterpret_cast<CUdeviceptr>(d_block_count_)));
+    logFreeError("d_ecpri_seq_id_", d_ecpri_seq_id_, cuMemFree(reinterpret_cast<CUdeviceptr>(d_ecpri_seq_id_)));
+    // Drain setup H2D before freeing destinations. cuStreamDestroy is non-blocking and
+    // would otherwise leave in-flight template / hdr-size copies racing the frees.
+    sync_setup_stream();
+    logFreeError("d_hdr_template_", d_hdr_template_, cuMemFree(reinterpret_cast<CUdeviceptr>(d_hdr_template_)));
+    logFreeError("d_flow_hdr_size_info_", d_flow_hdr_size_info_, cuMemFree(reinterpret_cast<CUdeviceptr>(d_flow_hdr_size_info_)));
+    if(setup_stream_ != nullptr)
+    {
+        logFreeError("setup_stream_", reinterpret_cast<void*>(setup_stream_), cuStreamDestroy(setup_stream_));
+        setup_stream_ = nullptr;
+    }
     if(info_.ud_comp_info.method == aerial_fh::UserDataCompressionMethod::MODULATION_COMPRESSION)
     {
         for(int up_slot_idx = 0; up_slot_idx < kPeerSlotsInfo; ++up_slot_idx)
@@ -99,12 +118,12 @@ Peer::~Peer()
             auto& message_info = partial_up_slot_info_[up_slot_idx].message_info;
             for(int msg_idx = 0; msg_idx < kPeerSymbolsInfo; ++msg_idx)
             {
-                ASSERT_CUDA_FH(cudaFreeHost(message_info[msg_idx].mod_comp_params));
+                logFreeError("mod_comp_params", message_info[msg_idx].mod_comp_params, cuMemFreeHost(message_info[msg_idx].mod_comp_params));
             }
         }
     }
-    ASSERT_CUDA_FH(cudaFreeHost(partial_up_slot_info_));
-    ASSERT_CUDA_FH(cudaFreeHost(h_flow_hdr_size_info_));
+    logFreeError("partial_up_slot_info_", partial_up_slot_info_, cuMemFreeHost(partial_up_slot_info_));
+    logFreeError("h_flow_hdr_size_info_", h_flow_hdr_size_info_, cuMemFreeHost(h_flow_hdr_size_info_));
 }
 
 void Peer::update_max_num_prbs_per_symbol(uint16_t max_num_prbs_per_symbol)
@@ -383,34 +402,53 @@ void Peer::gpu_comm_create_up_slot_list()
 
     size_t gpu_mem_size = 0;
 
+    CUdeviceptr dptr;
+
     // Allocate u-plane slot info array on the GPU
-    ASSERT_CUDA_FH(cudaMalloc((void**)&d_up_slot_info_, sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo));
-    ASSERT_CUDA_FH(cudaMemset(d_up_slot_info_, 0, sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo));
-    ASSERT_CUDA_FH(cudaMallocHost((void**)&h_up_slot_info_, sizeof(UplaneSlotInfoHost_t) * kPeerSlotsInfo));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAlloc(&dptr, sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo));
+    d_up_slot_info_ = reinterpret_cast<UplaneSlotInfo_t*>(dptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemsetD8(dptr, 0, sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAllocHost(reinterpret_cast<void**>(&h_up_slot_info_), sizeof(UplaneSlotInfoHost_t) * kPeerSlotsInfo));
     gpu_mem_size += sizeof(UplaneSlotInfo_t) * kPeerSlotsInfo;
 
    // Allocate large buffer of kPeerSlotsInof * MAX_DL_EAXCIDS elements initially memset to 0 to keep track of gpu_index per unique flow
-    ASSERT_CUDA_FH(cudaMalloc((void**)&d_flow_pkt_hdr_index_, sizeof(uint32_t) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
-    ASSERT_CUDA_FH(cudaMemset(d_flow_pkt_hdr_index_, 0, sizeof(uint32_t) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAlloc(&dptr, sizeof(uint32_t) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+    d_flow_pkt_hdr_index_ = reinterpret_cast<uint32_t*>(dptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemsetD32(dptr, 0, kPeerSlotsInfo * MAX_DL_EAXCIDS));
     gpu_mem_size += sizeof(uint32_t) * kPeerSlotsInfo * MAX_DL_EAXCIDS;
 
-    ASSERT_CUDA_FH(cudaMalloc((void**)&d_flow_sym_pkt_hdr_index_, sizeof(uint32_t) * 14 * MAX_DL_EAXCIDS));
-    ASSERT_CUDA_FH(cudaMemset(d_flow_sym_pkt_hdr_index_, 0, sizeof(uint32_t) * 14 * MAX_DL_EAXCIDS));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAlloc(&dptr, sizeof(uint32_t) * 14 * MAX_DL_EAXCIDS));
+    d_flow_sym_pkt_hdr_index_ = reinterpret_cast<uint32_t*>(dptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemsetD32(dptr, 0, 14 * MAX_DL_EAXCIDS));
     gpu_mem_size += sizeof(uint32_t) * 14 * MAX_DL_EAXCIDS;
 
-    ASSERT_CUDA_FH(cudaMalloc((void**)&d_block_count_, sizeof(uint32_t)));
-    ASSERT_CUDA_FH(cudaMemset(d_block_count_, 0, sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAlloc(&dptr, sizeof(uint32_t)));
+    d_block_count_ = reinterpret_cast<uint32_t*>(dptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemsetD32(dptr, 0, 1));
     gpu_mem_size += sizeof(uint32_t);
 
-
-    ASSERT_CUDA_FH(cudaMallocHost((void**)&h_flow_hdr_size_info_, sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAllocHost(reinterpret_cast<void**>(&h_flow_hdr_size_info_), sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+    // Slots for eAxCs that are never set up must stay all-zero: compute_cell_base_pkts()
+    // treats {mkey, cpu_pkt_addr, gpu_pkt_addr} == 0 as the unused-flow sentinel.
+    memset(h_flow_hdr_size_info_, 0, sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS);
     cpu_pinned_size += sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS;
-    ASSERT_CUDA_FH(cudaMalloc((void**)&d_ecpri_seq_id_, sizeof(uint32_t) * MAX_DL_EAXCIDS));
+    // Device-side buffer holding the same static flow_hdr_size_info, written at flow
+    // setup so the GPU-comms kernels read it from device instead of host memory.
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAlloc(&dptr, sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+    d_flow_hdr_size_info_ = reinterpret_cast<FlowPtrInfo*>(dptr);
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemsetD8(dptr, 0, sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+    gpu_mem_size += sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS;
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAlloc(&dptr, sizeof(uint32_t) * MAX_DL_EAXCIDS));
+    d_ecpri_seq_id_ = reinterpret_cast<uint32_t*>(dptr);
     gpu_mem_size += sizeof(uint32_t) * MAX_DL_EAXCIDS;
-    ASSERT_CUDA_FH(cudaMemset(d_ecpri_seq_id_, 0, sizeof(uint32_t) * MAX_DL_EAXCIDS));
-    ASSERT_CUDA_FH(cudaMalloc((void**)&d_hdr_template_, sizeof(uint32_t) * 8 * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemsetD32(dptr, 0, MAX_DL_EAXCIDS));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAlloc(&dptr, sizeof(uint32_t) * 8 * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+    d_hdr_template_ = reinterpret_cast<uint32_t*>(dptr);
     gpu_mem_size += sizeof(uint32_t) * 8 * kPeerSlotsInfo * MAX_DL_EAXCIDS;
-    ASSERT_CUDA_FH(cudaMallocHost((void**)&partial_up_slot_info_, sizeof(PartialUplaneSlotInfo_t) * kPeerSlotsInfo));
+    // Dedicated non-blocking stream for flow-setup H2D. CU_STREAM_PER_THREAD is not
+    // valid against the FH driver's CUDA contexts (CUDA_ERROR_INVALID_HANDLE).
+    CUDA_DRIVER_CHECK_NON_FATAL(cuStreamCreate(&setup_stream_, CU_STREAM_NON_BLOCKING));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemAllocHost(reinterpret_cast<void**>(&partial_up_slot_info_), sizeof(PartialUplaneSlotInfo_t) * kPeerSlotsInfo));
     cpu_pinned_size += sizeof(PartialUplaneSlotInfo_t) * kPeerSlotsInfo;
 
     if(info_.ud_comp_info.method == aerial_fh::UserDataCompressionMethod::MODULATION_COMPRESSION)
@@ -420,7 +458,7 @@ void Peer::gpu_comm_create_up_slot_list()
             auto& message_info = partial_up_slot_info_[up_slot_idx].message_info;
             for(int msg_idx = 0; msg_idx < kPeerSymbolsInfo; ++msg_idx)
             {
-                ASSERT_CUDA_FH(cudaMallocHost((void**)&(message_info[msg_idx].mod_comp_params), sizeof(ModCompPartialSectionInfoPerMessagePerSymbol_t)));
+                CUDA_DRIVER_CHECK_NON_FATAL(cuMemAllocHost(reinterpret_cast<void**>(&(message_info[msg_idx].mod_comp_params)), sizeof(ModCompPartialSectionInfoPerMessagePerSymbol_t)));
                 cpu_pinned_size += sizeof(ModCompPartialSectionInfoPerMessagePerSymbol_t);
             }
         }
@@ -1705,15 +1743,16 @@ void Peer::prepare_cplane_message_mmimo(const CPlaneMsgSendInfo& info, rte_mbuf*
     if(info.data_direction == DIRECTION_DOWNLINK) {
         prepare_cplane_message_mmimo_dl(info, mbufs, chain_mbufs, mbufs_regular, mbufs_bfw, cplane_prepare_info);
     } else {
-        cplane_prepare_info.created_pkts += prepare_cplane_message_mmimo_ul(info, mbufs, mbufs_regular, mbufs_bfw);
+        prepare_cplane_message_mmimo_ul(info, mbufs, chain_mbufs, mbufs_regular, mbufs_bfw, cplane_prepare_info);
     }
 }
 
-uint16_t Peer::prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, MbufArray* mbufs_regular, MbufArray* mbufs_bfw)
+void Peer::prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, rte_mbuf** chain_mbufs, MbufArray* mbufs_regular, MbufArray* mbufs_bfw, cplanePrepareInfo& cplane_prepare_info)
 {
     if(!info.hasSectionExt)
     {
-        return prepare_cplane_message_mmimo_no_se(info, mbufs, mbufs_regular, mbufs_bfw);
+        cplane_prepare_info.created_pkts += prepare_cplane_message_mmimo_no_se(info, mbufs, mbufs_regular, mbufs_bfw);
+        return;
     }
     else
     {
@@ -1753,8 +1792,10 @@ uint16_t Peer::prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rt
         bfw_txq_info.is_bfw_send_req = true;
 
         bfw_cplane_chain_info chain_info = {
+            .chain_mbufs = chain_mbufs,
+            .chained_mbufs = 0,
             .ap_idx = ap_idx,
-            .bfw_chain_mode = BfwCplaneChainingMode::NO_CHAINING
+            .bfw_chain_mode = info_.bfw_cplane_info.bfw_chain_mode,
         };
 
         init_packet(info, mbufs, packet_num, m, flow, data, common_hdr_ptr, section_ptr, common_hdr_size, pkt_section_info_room, pkt_remaining_capacity, total_section_info_size, sections_generated);
@@ -1770,6 +1811,7 @@ uint16_t Peer::prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rt
         uint16_t                    section_num_prbc        = 0;
         uint16_t                    section_max_prbc        = 0;
         bool last_packet_disableBFWs = true;
+        bool prev_section_dyn_bfw = false;
         for(section_num = 0; section_num < number_of_sections; section_num++)
         {
             {
@@ -1819,19 +1861,24 @@ uint16_t Peer::prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rt
                         THROW_FH(EINVAL, StringBuilder() << "Error: section split_count should not be more than " << kMaxSplitCount);
                     }
                     auto min_sect_sz = section_hdr_size + ext11_hdr_size + bundle_size;
-                    // Packet fragmentation
-                    if(total_section_info_size + min_sect_sz > pkt_section_info_room)
+
+                    // Start a fresh packet per dynamic-BFW section when chaining is enabled so each chained
+                    // coefficient buffer maps to exactly one packet (must match count_cplane_packets_mmimo_ext11).
+                    bool start_new_dyn_bfw_packet = prev_section_dyn_bfw || (disableBFWs == 0 && ext11_ptr->ext_11.static_bfw == false);
+                    start_new_dyn_bfw_packet = start_new_dyn_bfw_packet && (info_.bfw_cplane_info.bfw_chain_mode != BfwCplaneChainingMode::NO_CHAINING);
+
+                    if(total_section_info_size != 0 && start_new_dyn_bfw_packet)
                     {
                         add_new_packet(fhi, info, mbufs, packet_num, m, flow, sequence_id_generator, data, common_hdr_ptr, section_ptr, common_hdr_size, mtu, pkt_section_info_room, pkt_remaining_capacity, total_section_info_size, sections_generated,
                             last_packet_disableBFWs == 0 ? bfw_txq_info : txq_info);
                     }
-
-                    // Start new packet always for BFW weights if chaining enabled
-                    // if(total_section_info_size != 0 && disableBFWs == 0)
-                    // {
-                    //     add_new_packet(fhi, info, mbufs, packet_num, m, flow, sequence_id_generator, data, common_hdr_ptr, section_ptr, common_hdr_size, mtu, pkt_section_info_room, pkt_remaining_capacity, total_section_info_size, sections_generated,
-                    //         disableBFWs == 0 ? bfw_txq_info : txq_info);
-                    // }
+                    // Packet fragmentation
+                    else if(total_section_info_size + min_sect_sz > pkt_section_info_room)
+                    {
+                        add_new_packet(fhi, info, mbufs, packet_num, m, flow, sequence_id_generator, data, common_hdr_ptr, section_ptr, common_hdr_size, mtu, pkt_section_info_room, pkt_remaining_capacity, total_section_info_size, sections_generated,
+                            last_packet_disableBFWs == 0 ? bfw_txq_info : txq_info);
+                    }
+                    prev_section_dyn_bfw = (disableBFWs == 0 && ext11_ptr->ext_11.static_bfw == false);
 
                     int bundle_room         = 0;
                     int current_num_bundles = 0;
@@ -1924,7 +1971,8 @@ uint16_t Peer::prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rt
 
         populate_last_packet(fhi, info, mbufs, m, sequence_id_generator, data, common_hdr_ptr, mtu, pkt_remaining_capacity, sections_generated,
             last_packet_disableBFWs == 0 ? bfw_txq_info : txq_info);
-        return packet_num;
+        cplane_prepare_info.created_pkts += packet_num;
+        cplane_prepare_info.chained_mbufs += chain_info.chained_mbufs;
     }
 }
 
@@ -2469,9 +2517,9 @@ void Peer::count_cplane_packets_mmimo_ext11(
         auto min_sect_sz = section_hdr_size + ext11_hdr_size + bundle_size;
         bool start_new_dyn_bfw_packet = prev_section_dyn_bfw || (disableBFWs == 0 && ext11_ptr->ext_11.static_bfw == false);
         start_new_dyn_bfw_packet = start_new_dyn_bfw_packet && (info_.bfw_cplane_info.bfw_chain_mode != BfwCplaneChainingMode::NO_CHAINING);
-        if(direction == DIRECTION_DOWNLINK && (total_section_info_size != 0 && start_new_dyn_bfw_packet)) {
-            // Start new packet always if last section has dyn BFW weights if chaining enabled with DL
-            // TODO enable UL chaining
+        // Chaining starts a fresh packet per dynamic-BFW section so each chained coefficient buffer maps
+        // to exactly one packet. This applies to both DL and UL once UL chaining is enabled.
+        if((direction == DIRECTION_DOWNLINK || direction == DIRECTION_UPLINK) && (total_section_info_size != 0 && start_new_dyn_bfw_packet)) {
             ++section_num_packets;
             ++section_bfw_mbufs;
             total_section_info_size = 0;
@@ -2541,7 +2589,7 @@ cplaneCountInfo Peer::count_cplane_packets_mmimo(CPlaneMsgSendInfo const* infos,
     }
     else
     {
-        cplane_count_info.num_packets = count_cplane_packets_mmimo_ul(infos, num_msgs);
+        cplane_count_info = count_cplane_packets_mmimo_ul(infos, num_msgs);
     }
 
     if(unlikely(cplane_count_info.num_packets > max_num_packets))
@@ -2552,22 +2600,31 @@ cplaneCountInfo Peer::count_cplane_packets_mmimo(CPlaneMsgSendInfo const* infos,
     return cplane_count_info;
 }
 
-size_t Peer::count_cplane_packets_mmimo_ul(CPlaneMsgSendInfo const* infos, size_t num_msgs) {
-    size_t num_packets = 0;
-    size_t section_bfw_mbufs = 0;
-    size_t section_padding_mbufs = 0;
-    bool prev_section_dyn_bfw = false;
+cplaneCountInfo Peer::count_cplane_packets_mmimo_ul(CPlaneMsgSendInfo const* infos, size_t num_msgs) {
+    cplaneCountInfo cplane_count_info{.num_packets = 0, .num_bfw_mbufs = 0, .num_bfw_padding_mbufs = 0};
     for(size_t i = 0; i < num_msgs; ++i)
     {
         auto const& info = infos[i];
 
         if(!info.hasSectionExt)
         {
-            num_packets += count_cplane_packets_mmimo_no_section_ext(info, nic_);
+            cplane_count_info.num_packets += count_cplane_packets_mmimo_no_section_ext(info, nic_);
         }
         else
         {
             size_t section_num_packets = 1;
+            size_t section_bfw_mbufs = 0;
+            size_t section_padding_mbufs = 0;
+            bool prev_section_dyn_bfw = false;
+            // The leading dynamic-BFW section produces one chained bfw mbuf that the ext11 helper does
+            // not count (it only counts the *additional* packets started after the first), so seed it here.
+            if(info.sections[0].ext11 != nullptr)
+            {
+                if(info.sections[0].ext11->ext_11.static_bfw == 0 && oran_cmsg_get_ext_11_disableBFWs(&info.sections[0].ext11->ext_11.ext_hdr) == 0)
+                {
+                    section_bfw_mbufs = 1;
+                }
+            }
             auto&  radio_app_hdr       = info.section_common_hdr.sect_1_common_hdr.radioAppHdr;
             auto   section_type        = radio_app_hdr.sectionType;
             validate_section_type(section_type);
@@ -2609,11 +2666,22 @@ size_t Peer::count_cplane_packets_mmimo_ul(CPlaneMsgSendInfo const* infos, size_
                         prev_section_dyn_bfw
                     );
                 }
+                else
+                {
+                    auto& cur_section_info = info.sections[section_num];
+                    count_cplane_packets_mmimo_ext4_ext5(cur_section_info, section_hdr_size, pkt_section_info_room,
+                                                 total_section_info_size, section_num_packets);
+                }
             }
-            num_packets += std::max(1UL, section_num_packets);
+            cplane_count_info.num_packets += std::max(1UL, section_num_packets);
+            if(info_.bfw_cplane_info.bfw_chain_mode != BfwCplaneChainingMode::NO_CHAINING)
+            {
+                cplane_count_info.num_bfw_mbufs += section_bfw_mbufs;
+                cplane_count_info.num_bfw_padding_mbufs += section_padding_mbufs;
+            }
         }
     }
-    return num_packets;
+    return cplane_count_info;
 }
 
 cplaneCountInfo Peer::count_cplane_packets_mmimo_dl(CPlaneMsgSendInfo const* infos, size_t num_msgs)
@@ -4308,34 +4376,43 @@ void Peer::gpu_comm_update_tx_metrics(TxRequestUplaneGpuComm* tx_request)
     update_tx_metrics(tx_packets, tx_bytes);
 }
 
-void Peer::gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msgs,
-                                    TxRequestUplaneGpuComm** tx_request,
-                                    std::chrono::nanoseconds cell_start_time, std::chrono::nanoseconds symbol_duration,bool commViaCpu)
+void Peer::gpu_comm_setup_tx_request(
+    uint8_t frame_id, uint16_t subframe_id, uint16_t slot_id,
+    uint16_t max_num_prb_per_symbol,
+    std::chrono::nanoseconds cell_start_time,
+    std::chrono::nanoseconds symbol_duration,
+    bool commViaCpu,
+    TxRequestUplaneGpuComm** tx_request,
+    PartialUplaneSlotInfo_t** out_partial_info,
+    UplaneConversionParams* out_params,
+    const uint16_t* eaxcid_list,
+    uint16_t num_eaxcids)
 {
-
     int up_slot_idx = gpu_comm_get_next_up_slot_idx();
-//    NVLOGC_FMT(TAG, "gpu_comm_prepare_uplane start for slot {} with num_msgs {}", up_slot_idx, (int)num_msgs);
-    UplaneSlotInfo_t* d_slot_info = &(d_up_slot_info_[up_slot_idx]);
     PartialUplaneSlotInfo_t* partial_up_slot_info = &(partial_up_slot_info_[up_slot_idx]);
-
-    auto port_id = nic_->get_port_id();
     int buffer_slot_offset = up_slot_idx * MAX_DL_EAXCIDS;
-    uint32_t index;
-    uint32_t syms_with_packets_mask = 0;
-    uint16_t tmp_packets = 0;
+
     (*tx_request) = &(up_tx_request_[up_slot_idx]);
     (*tx_request)->txq = get_next_uplane_txq_gpu();
     (*tx_request)->prb_size_upl = prb_size_upl_;
     (*tx_request)->prbs_per_pkt_upl = prbs_per_pkt_upl_;
-    (*tx_request)->frame_id = info[0].radio_app_hdr.frameId;
-    (*tx_request)->subframe_id = info[0].radio_app_hdr.subframeId.get();
-    (*tx_request)->slot_id = info[0].radio_app_hdr.slotId.get();
+    (*tx_request)->frame_id = frame_id;
+    (*tx_request)->subframe_id = subframe_id;
+    (*tx_request)->slot_id = slot_id;
+    (*tx_request)->max_num_prb_per_symbol = max_num_prb_per_symbol;
     (*tx_request)->flow_d_info = d_flow_pkt_hdr_index_; //FIXME  + buffer_slot_offset; Confirm
     (*tx_request)->flow_sym_d_info = d_flow_sym_pkt_hdr_index_; //FIXME  + buffer_slot_offset; Confirm
     (*tx_request)->block_count = d_block_count_; //FIXME  + buffer_slot_offset; Confirm
     (*tx_request)->flow_hdr_size_info = h_flow_hdr_size_info_ + buffer_slot_offset;
+    // Device-side buffer for the GPU-comms kernels; the host-pinned pointer above is
+    // kept for CPU-side consumers.
+    (*tx_request)->d_flow_hdr_size_info = d_flow_hdr_size_info_ + buffer_slot_offset;
     (*tx_request)->flow_d_ecpri_seq_id = d_ecpri_seq_id_;//Remove '+ buffer_slot_offset' as the same sequence generator (buffer) has to be used for all slots for a given eaxcid
     (*tx_request)->flow_d_hdr_template_info = d_hdr_template_ + 8*buffer_slot_offset;
+    (*tx_request)->partial_slot_info = partial_up_slot_info;
+    (*tx_request)->d_slot_info = &(d_up_slot_info_[up_slot_idx]);
+    (*tx_request)->h_up_slot_info_ = &(h_up_slot_info_[up_slot_idx]);
+
     partial_up_slot_info->last_sym_with_packets = 0;
     partial_up_slot_info->syms_with_packets = 0;
 
@@ -4350,19 +4427,22 @@ void Peer::gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msg
 
             partial_up_slot_info->section_info[symbol_id].num_messages = 0; // reset for later
             partial_up_slot_info->section_info[symbol_id].num_packets = 0;
+
+            if (out_params) {
+                out_params->ts[symbol_id] = partial_up_slot_info->section_info[symbol_id].ts;
+            }
         }
         if(commViaCpu)
         {
-            memset(&partial_up_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count, 0, sizeof(partial_up_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count));
-            memset(&partial_up_slot_info->flowInfo_slot.sym_flow_packet_count, 0, sizeof(partial_up_slot_info->flowInfo_slot.sym_flow_packet_count));
+            std::memset(&partial_up_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count, 0, sizeof(partial_up_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count));
+            std::memset(&partial_up_slot_info->flowInfo_slot.sym_flow_packet_count, 0, sizeof(partial_up_slot_info->flowInfo_slot.sym_flow_packet_count));
         }
     }
 
-   // Update the frame/subframe/slot information from radio_app_hdr
-   // Currently same info replicated across all cells in a slot even though identical
-   partial_up_slot_info->frame_8b_subframe_4b_slot_6b = info[0].radio_app_hdr.frameId << 10; // 10 is 4 for subframe and 6 bits for slot
-   partial_up_slot_info->frame_8b_subframe_4b_slot_6b |= (info[0].radio_app_hdr.subframeId.get() << 6);
-   partial_up_slot_info->frame_8b_subframe_4b_slot_6b |= info[0].radio_app_hdr.slotId.get();
+   // Update the frame/subframe/slot information
+   partial_up_slot_info->frame_8b_subframe_4b_slot_6b = frame_id << 10; // 10 is 4 for subframe and 6 bits for slot
+   partial_up_slot_info->frame_8b_subframe_4b_slot_6b |= (subframe_id << 6);
+   partial_up_slot_info->frame_8b_subframe_4b_slot_6b |= slot_id;
 
     if(commViaCpu)
     {
@@ -4372,6 +4452,50 @@ void Peer::gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msg
         partial_up_slot_info->flowInfo_slot.flow_packet_count.fill(0);
         partial_up_slot_info->flowInfo_slot.num_flows=0;
     }
+
+    *out_partial_info = partial_up_slot_info;
+
+    if (out_params) {
+        out_params->prb_size_upl     = prb_size_upl_;
+        out_params->prbs_per_pkt_upl = prbs_per_pkt_upl_;
+        out_params->oran_hdr_size    = ORAN_IQ_HDR_SZ;
+        out_params->mtu              = nic_->get_mtu();
+        out_params->bandwidth_prbs   = max_num_prb_per_symbol;
+        out_params->comm_via_cpu     = commViaCpu;
+        out_params->total_num_flows  = static_cast<uint32_t>(dlu_eaxcid_idx_mp.size());
+        out_params->cell_start_time_ns = cell_start_time.count();
+        out_params->symbol_duration_ns = symbol_duration.count();
+        out_params->qp_clock_id      = 0;
+
+        out_params->num_ports = num_eaxcids;
+        out_params->dl_eaxcid_list.fill(0);
+        out_params->dl_flow_index_map.fill(0);
+        for (uint16_t i = 0; i < num_eaxcids; ++i) {
+            out_params->dl_eaxcid_list[i] = eaxcid_list[i];
+            auto it = dlu_eaxcid_idx_mp.find(eaxcid_list[i]);
+            out_params->dl_flow_index_map[i] =
+                (it != dlu_eaxcid_idx_mp.end()) ? it->second : 0;
+        }
+    }
+}
+
+void Peer::gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msgs,
+                                    TxRequestUplaneGpuComm** tx_request,
+                                    std::chrono::nanoseconds cell_start_time, std::chrono::nanoseconds symbol_duration,bool commViaCpu)
+{
+    PartialUplaneSlotInfo_t* partial_up_slot_info;
+
+    gpu_comm_setup_tx_request(
+        info[0].radio_app_hdr.frameId,
+        info[0].radio_app_hdr.subframeId.get(),
+        info[0].radio_app_hdr.slotId.get(),
+        0,
+        cell_start_time, symbol_duration, commViaCpu,
+        tx_request, &partial_up_slot_info);
+
+    auto port_id = nic_->get_port_id();
+    uint32_t syms_with_packets_mask = 0;
+    uint16_t tmp_packets = 0;
 
    // section information needed per message
    for(size_t i = 0; i < num_msgs; ++i) //num_msgs is messages across all symbols for this cell
@@ -4405,11 +4529,17 @@ void Peer::gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msg
        {
            partial_up_slot_info->message_info[symbol_id].mod_comp_params = nullptr;
        }
-       if(unlikely(dlu_eaxcid_idx_mp[info[i].eaxcid] >= MAX_DL_EAXCIDS))
+       auto const eaxcid_it = dlu_eaxcid_idx_mp.find(info[i].eaxcid);
+       if(unlikely(eaxcid_it == dlu_eaxcid_idx_mp.end()))
        {
-           THROW_FH(ENOMEM, StringBuilder() << "eaxcid idx " << dlu_eaxcid_idx_mp[info[i].eaxcid] << " out of bounds, max " << MAX_DL_EAXCIDS - 1);
+           THROW_FH(EINVAL, StringBuilder() << "eaxcid " << info[i].eaxcid << " not found in DL U-plane flow map");
        }
-       partial_up_slot_info->message_info[symbol_id].flow_index_info[current_messages] = dlu_eaxcid_idx_mp[info[i].eaxcid];
+       const uint32_t flow_idx = eaxcid_it->second;
+       if(unlikely(flow_idx >= MAX_DL_EAXCIDS))
+       {
+           THROW_FH(ENOMEM, StringBuilder() << "eaxcid idx " << flow_idx << " out of bounds, max " << MAX_DL_EAXCIDS - 1);
+       }
+       partial_up_slot_info->message_info[symbol_id].flow_index_info[current_messages] = flow_idx;
        partial_up_slot_info->section_info[symbol_id].num_messages += 1;
 
 
@@ -4432,20 +4562,9 @@ void Peer::gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msg
             partial_up_slot_info->ttl_pkts += tmp_packets;
             partial_up_slot_info->section_info[symbol_id].num_packets += tmp_packets;
 
-            auto it=std::find(partial_up_slot_info->flowInfo_slot.flow_eaxcid.begin(),partial_up_slot_info->flowInfo_slot.flow_eaxcid.end(),info[i].eaxcid);
-            if(it!=partial_up_slot_info->flowInfo_slot.flow_eaxcid.end())
-            {
-                index=std::distance(partial_up_slot_info->flowInfo_slot.flow_eaxcid.begin(),it);
-                partial_up_slot_info->flowInfo_slot.flow_packet_count[index]+=tmp_packets;
-                partial_up_slot_info->flowInfo_slot.sym_flow_packet_count[dlu_eaxcid_idx_mp[info[i].eaxcid]][symbol_id] += tmp_packets;
-            }
-            else
-            {
-                partial_up_slot_info->flowInfo_slot.flow_eaxcid[partial_up_slot_info->flowInfo_slot.num_flows]=info[i].eaxcid;
-                partial_up_slot_info->flowInfo_slot.flow_packet_count[partial_up_slot_info->flowInfo_slot.num_flows]+=tmp_packets;
-                partial_up_slot_info->flowInfo_slot.sym_flow_packet_count[dlu_eaxcid_idx_mp[info[i].eaxcid]][symbol_id] += tmp_packets;
-                partial_up_slot_info->flowInfo_slot.num_flows++;
-            }
+            partial_up_slot_info->flowInfo_slot.flow_eaxcid[flow_idx] = info[i].eaxcid;
+            partial_up_slot_info->flowInfo_slot.flow_packet_count[flow_idx] += tmp_packets;
+            partial_up_slot_info->flowInfo_slot.sym_flow_packet_count[flow_idx][symbol_id] += tmp_packets;
        }
 #if 0
 if (tmp_packets != 1)
@@ -4456,7 +4575,15 @@ if (tmp_packets != 1)
     if(commViaCpu)
     {
         partial_up_slot_info->syms_with_packets = __builtin_popcount(syms_with_packets_mask);
-        partial_up_slot_info->total_num_flows=getTotalNumFlows();
+        const uint32_t num_flows = static_cast<uint32_t>(dlu_eaxcid_idx_mp.size());
+        // Loops below index fixed arrays by every configured eAxC, idle ones included,
+        // so bound the map size and not just the indices seen in this slot.
+        if(unlikely(num_flows > MAX_DL_EAXCIDS))
+        {
+            THROW_FH(ENOMEM, StringBuilder() << "num_flows " << num_flows << " exceeds max " << MAX_DL_EAXCIDS);
+        }
+        partial_up_slot_info->total_num_flows=num_flows;
+        partial_up_slot_info->flowInfo_slot.num_flows=num_flows;
         NVLOGI_FMT(TAG,"F{}S{}S{} Total packets={} Total num flows={} partial_up_slot_info->syms_with_packets={}",
             (*tx_request)->frame_id,(*tx_request)->subframe_id,(*tx_request)->slot_id,partial_up_slot_info->ttl_pkts,partial_up_slot_info->total_num_flows, partial_up_slot_info->syms_with_packets);
         for(int index=0;index<partial_up_slot_info->flowInfo_slot.num_flows;index++)
@@ -4464,16 +4591,11 @@ if (tmp_packets != 1)
             //printf("index %d\n", index);
             for (int sym = 1; sym < 14; sym++) {
                 partial_up_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count[index][sym] = partial_up_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count[index][sym - 1] + partial_up_slot_info->flowInfo_slot.sym_flow_packet_count[index][sym-1];
-                NVLOGI_FMT(TAG,"Partial packets {} {} {}", index, sym, partial_up_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count[index][sym]);
+                NVLOGD_FMT(TAG,"Partial packets {} {} {}", index, sym, partial_up_slot_info->flowInfo_slot.cumulative_sym_flow_packet_count[index][sym]);
             }
-            NVLOGI_FMT(TAG,"F{}S{}S{} eaxcid={} packets_per_flow={}",(*tx_request)->frame_id,(*tx_request)->subframe_id,(*tx_request)->slot_id,partial_up_slot_info->flowInfo_slot.flow_eaxcid[index],partial_up_slot_info->flowInfo_slot.flow_packet_count[index]);
+            NVLOGD_FMT(TAG,"F{}S{}S{} eaxcid={} packets_per_flow={}",(*tx_request)->frame_id,(*tx_request)->subframe_id,(*tx_request)->slot_id,partial_up_slot_info->flowInfo_slot.flow_eaxcid[index],partial_up_slot_info->flowInfo_slot.flow_packet_count[index]);
         }
     }
-    // this is how info is communicated
-    (*tx_request)->partial_slot_info = &(partial_up_slot_info_[up_slot_idx]);
-    (*tx_request)->d_slot_info = &(d_up_slot_info_[up_slot_idx]);
-    (*tx_request)->h_up_slot_info_ = &(h_up_slot_info_[up_slot_idx]);
-
 }
 
 size_t Peer::send_uplane(TxRequestUplane* tx_request, Txq* txq)
@@ -4601,6 +4723,60 @@ std::string Peer::get_mac_address()
 FlowPtrInfo* Peer::get_flow_ptr_info()
 {
     return h_flow_hdr_size_info_;
+}
+
+void Peer::set_defer_flow_hdr_sync(const bool defer)
+{
+    defer_flow_hdr_sync_ = defer;
+}
+
+void Peer::sync_flow_hdr_size_info_to_device()
+{
+    // flow_hdr_size_info holds static per-flow config (buffer addresses, mkeys,
+    // max_pkt_sz, base hdr_stride) populated at flow setup. The whole buffer is
+    // copied on every call rather than just the caller's eAxC entries: the copy is
+    // idempotent, and copying everything keeps host and device identical no matter
+    // which flow was (re)configured last, including reconfiguration through
+    // Flow::update(). This is setup-time work, never the per-slot critical path.
+    //
+    // Both pointers are null when the peer has no GPU attached
+    // (gpu_comm_create_up_slot_list() bails out for cuda_device < 0). There is then
+    // no device buffer to keep in sync, which is a valid configuration, not an error.
+    if(d_flow_hdr_size_info_ == nullptr || h_flow_hdr_size_info_ == nullptr)
+    {
+        return;
+    }
+    // OAM multi-eAxC registration defers this until end_peer_flow_registration()
+    // so we copy once instead of once-per-new-DLU-flow.
+    if(defer_flow_hdr_sync_)
+    {
+        return;
+    }
+    // Non-blocking peer setup stream — does not serialize with live GpuComm streams.
+    if(setup_stream_ == nullptr)
+    {
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(d_flow_hdr_size_info_),
+                                                 h_flow_hdr_size_info_,
+                                                 sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS));
+        return;
+    }
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(d_flow_hdr_size_info_),
+                                                  h_flow_hdr_size_info_,
+                                                  sizeof(FlowPtrInfo) * kPeerSlotsInfo * MAX_DL_EAXCIDS,
+                                                  setup_stream_));
+    // Wait only for this peer's setup copies (prior async template/pkt-hdr H2D on
+    // setup_stream_ plus this flow_hdr copy). Does not serialize with live GpuComm.
+    // Non-batched callers (e.g. initial Cell bring-up) and end_peer_flow_registration()
+    // both rely on this drain before returning.
+    sync_setup_stream();
+}
+
+void Peer::sync_setup_stream()
+{
+    if(setup_stream_ != nullptr)
+    {
+        CUDA_DRIVER_CHECK_NON_FATAL(cuStreamSynchronize(setup_stream_));
+    }
 }
 
 uint32_t* Peer::get_hdr_template_info()

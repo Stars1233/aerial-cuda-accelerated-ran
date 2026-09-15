@@ -6,6 +6,7 @@
 !.gitattributes
 !.gitmodules
 !aerial-sdk-version
+!aerial_common
 !build*
 !5GModel
 !cmake

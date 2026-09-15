@@ -17,6 +17,10 @@
 
 #include "yamlparser.hpp"
 #include "cuphydriver.hpp"
+#include "constant.hpp"
+#include <cstdint>
+#include <memory>
+#include <span>
 #include <sstream>
 #include <fstream>
 #include "app_config.hpp"
@@ -242,15 +246,21 @@ static void parse_nic_info(yaml::node& yaml_cells,std::string *p_unique_nic_info
     }
 }
 
-static uint32_t get_nic_index(std::string& nic_name,std::string *p_unique_nic_info,size_t length)
+static uint32_t get_nic_index(const std::string& nic_name, std::span<const std::string> unique_nic_info)
 {
-    uint32_t i=0;
-    for( ;i < length; i++)
+    for(uint32_t i = 0; i < unique_nic_info.size(); i++)
     {
-        if(p_unique_nic_info[i] == nic_name)
-            break;
+        if(unique_nic_info[i] == nic_name)
+        {
+            return i;
+        }
     }
-    return i;
+    // Not found: never return `size()` — that was used as an OOB nic_index into
+    // MAX_NUM_OF_NIC_PORT_SUPPORTED-sized arrays in cuphydriver (stack smash / hang).
+    NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT,
+               "NIC '{}' not found in unique NIC list (searched {} entries)", nic_name,
+               unique_nic_info.size());
+    return UINT32_MAX;
 }
 
 static bool isSupportedCompression(aerial_fh::UserDataCompressionMethod method) {
@@ -300,22 +310,61 @@ static inline bool is_valid_mac_address(std::string_view mac_addr)
  * the YAML structure for cell configurations and ensuring that all required parameters are stored for
  * later use.
  *
+ * Only the first cell_group_num entries in the YAML cells list are passed to parse_single_cell and loaded
+ * into cell_configs / mplane_configs (cell_group_num must be <= yaml cells length; see driver validation).
+ * Additional YAML rows are ignored by parse_single_cell; parse_nic_info still scans all cells for unique NICs.
+ *
  * @param root The YAML node representing the root of the cell configuration section.
  * @return Returns 0 on successful parsing and population of configuration variables, or -1 if an error occurs.
  */
 int YamlParser::parse_cell_configs(yaml::node root)
 {
     yaml::node yaml_cells = root[YAML_PARAM_CELLS];
-    std::string *unique_nic_info = new std::string[yaml_cells.length()];
-    parse_nic_info(yaml_cells,unique_nic_info);
+    auto unique_nic_info = std::make_unique<std::string[]>(yaml_cells.length());
+    parse_nic_info(yaml_cells, unique_nic_info.get());
     for (size_t i = 0; i < phydriver_config.cell_group_num; ++i)
     {
-        if (parse_single_cell(yaml_cells[i], unique_nic_info, phydriver_config.cell_group_num) != 0)
+        if (parse_single_cell(yaml_cells[i], unique_nic_info.get(), phydriver_config.cell_group_num) != 0)
         {
             return -1;
         }
     }
-    delete[] unique_nic_info;
+
+    // max_ul_antenna_ports = max over cells of max(PUSCH, PUCCH, PRACH, SRS) eAxC ID count.
+    // max_dl_antenna_ports = max over cells of max(PDCCH, PDSCH, CSI_RS, PBCH) eAxC ID count.
+    uint16_t max_ul_antenna_ports = 0;
+    uint16_t max_dl_antenna_ports = 0;
+    using slot_command_api::channel_type;
+    for (const auto& mplane_cfg : mplane_configs)
+    {
+        size_t cell_ul = std::max({
+            mplane_cfg.eAxC_ids[channel_type::PUSCH].size(),
+            mplane_cfg.eAxC_ids[channel_type::PUCCH].size(),
+            mplane_cfg.eAxC_ids[channel_type::PRACH].size(),
+            mplane_cfg.eAxC_ids[channel_type::SRS].size()
+        });
+        size_t cell_dl = std::max({
+            mplane_cfg.eAxC_ids[channel_type::PDCCH_DL].size(),
+            mplane_cfg.eAxC_ids[channel_type::PDSCH].size(),
+            mplane_cfg.eAxC_ids[channel_type::CSI_RS].size(),
+            mplane_cfg.eAxC_ids[channel_type::PBCH].size()
+        });
+        max_ul_antenna_ports = std::max(max_ul_antenna_ports, static_cast<uint16_t>(cell_ul));
+        max_dl_antenna_ports = std::max(max_dl_antenna_ports, static_cast<uint16_t>(cell_dl));
+    }
+
+    if (max_ul_antenna_ports > static_cast<uint16_t>(slot_command_api::MAX_AP_PER_SLOT_SRS)) {
+        NVLOGW_FMT(TAG,"max_ul_antenna_ports {} exceeds MAX_AP_PER_SLOT_SRS ({}), clamping to {}",
+            max_ul_antenna_ports, slot_command_api::MAX_AP_PER_SLOT_SRS, slot_command_api::MAX_AP_PER_SLOT_SRS);
+    }
+    phydriver_config.max_ul_antenna_ports = std::min(max_ul_antenna_ports, static_cast<uint16_t>(slot_command_api::MAX_AP_PER_SLOT_SRS));
+    if (max_dl_antenna_ports > static_cast<uint16_t>(MAX_DL_EAXCIDS)) {
+        NVLOGW_FMT(TAG,"max_dl_antenna_ports {} exceeds MAX_DL_EAXCIDS ({}), clamping to {}",
+            max_dl_antenna_ports, MAX_DL_EAXCIDS, MAX_DL_EAXCIDS);
+    }
+    phydriver_config.max_dl_antenna_ports = std::min(max_dl_antenna_ports, static_cast<uint16_t>(MAX_DL_EAXCIDS));
+
+
     return 0;
 }
 
@@ -350,8 +399,11 @@ static void parse_eth_addr(const std::string &eth_addr_str, std::array<uint8_t, 
  * @param p_unique_nic_info Pointer to an array of unique NIC information strings.
  * @param length The number of unique NIC entries.
  * @return Returns 0 on successful parsing and population of the cell configuration, or -1 if an error occurs.
+ *
+ * parse_cell_configs only calls this for the first cell_group_num YAML cells. Before push_back,
+ * cell_configs.size() is the zero-based index of that entry; eAxC lists must be non-empty for each loaded cell.
  */
-int YamlParser::parse_single_cell(yaml::node cell,std::string *p_unique_nic_info,size_t length)
+int YamlParser::parse_single_cell(yaml::node cell, std::string *p_unique_nic_info, size_t length)
 {
     struct cell_phy_info cell_cfg;
     cell_mplane_info mplane_cfg;
@@ -391,7 +443,14 @@ int YamlParser::parse_single_cell(yaml::node cell,std::string *p_unique_nic_info
             return -1;
         }
         
-        mplane_cfg.nic_index = get_nic_index(mplane_cfg.nic_name,p_unique_nic_info,length);
+        mplane_cfg.nic_index = get_nic_index(mplane_cfg.nic_name, std::span<const std::string>{p_unique_nic_info, length});
+        if(mplane_cfg.nic_index == UINT32_MAX || mplane_cfg.nic_index >= MAX_NUM_OF_NIC_PORT_SUPPORTED) {
+            NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT,
+                       "Invalid nic_index {} for cell id {} nic '{}' (max supported NICs is {})",
+                       mplane_cfg.nic_index, mplane_cfg.mplane_id, mplane_cfg.nic_name,
+                       MAX_NUM_OF_NIC_PORT_SUPPORTED);
+            return -1;
+        }
         NVLOGC_FMT(TAG,"cell_id {} nic_index :{}",mplane_cfg.mplane_id,mplane_cfg.nic_index);
 
         cell_cfg.phy_stat.mu = static_cast<uint8_t>(static_cast<uint16_t>(cell[YAML_PARAM_CELL_MU]));
@@ -430,14 +489,28 @@ int YamlParser::parse_single_cell(yaml::node cell,std::string *p_unique_nic_info
 
         mplane_cfg.nic_cfg.txq_count_uplane = (uint8_t)static_cast<uint16_t>(cell[YAML_PARAM_CELL_TXQ_COUNT_UPLANE]);
 
-        parse_eAxC_to_beam_map(cell[YAML_PARAM_CELL_EAXC_ID_SSB_PBCH], std::vector<slot_command_api::channel_type>{slot_command_api::channel_type::PBCH}, mplane_cfg);
-        parse_eAxC_to_beam_map(cell[YAML_PARAM_CELL_EAXC_ID_PDCCH], std::vector<slot_command_api::channel_type>{slot_command_api::channel_type::PDCCH_DL, slot_command_api::channel_type::PDCCH_UL}, mplane_cfg);
-        parse_eAxC_to_beam_map(cell[YAML_PARAM_CELL_EAXC_ID_PDSCH], std::vector<slot_command_api::channel_type>{slot_command_api::channel_type::PDSCH, slot_command_api::channel_type::PDSCH_CSIRS}, mplane_cfg);
-        parse_eAxC_to_beam_map(cell[YAML_PARAM_CELL_EAXC_ID_CSIRS], std::vector<slot_command_api::channel_type>{slot_command_api::channel_type::CSI_RS}, mplane_cfg);
-        parse_eAxC_to_beam_map(cell[YAML_PARAM_CELL_EAXC_ID_PUSCH], std::vector<slot_command_api::channel_type>{slot_command_api::channel_type::PUSCH}, mplane_cfg);
-        parse_eAxC_to_beam_map(cell[YAML_PARAM_CELL_EAXC_ID_PUCCH], std::vector<slot_command_api::channel_type>{slot_command_api::channel_type::PUCCH}, mplane_cfg);
-        parse_eAxC_to_beam_map(cell[YAML_PARAM_CELL_EAXC_ID_SRS], std::vector<slot_command_api::channel_type>{slot_command_api::channel_type::SRS}, mplane_cfg);
-        parse_eAxC_to_beam_map(cell[YAML_PARAM_CELL_EAXC_ID_PRACH], std::vector<slot_command_api::channel_type>{slot_command_api::channel_type::PRACH}, mplane_cfg);
+        struct EaxcEntry {
+            const char* yaml_key;
+            std::vector<slot_command_api::channel_type> channels;
+        };
+        static const EaxcEntry k_eaxc_entries[] = {
+            { YAML_PARAM_CELL_EAXC_ID_SSB_PBCH, {slot_command_api::channel_type::PBCH} },
+            { YAML_PARAM_CELL_EAXC_ID_PDCCH,    {slot_command_api::channel_type::PDCCH_DL, slot_command_api::channel_type::PDCCH_UL} },
+            { YAML_PARAM_CELL_EAXC_ID_PDSCH,    {slot_command_api::channel_type::PDSCH, slot_command_api::channel_type::PDSCH_CSIRS} },
+            { YAML_PARAM_CELL_EAXC_ID_CSIRS,    {slot_command_api::channel_type::CSI_RS} },
+            { YAML_PARAM_CELL_EAXC_ID_PUSCH,    {slot_command_api::channel_type::PUSCH} },
+            { YAML_PARAM_CELL_EAXC_ID_PUCCH,    {slot_command_api::channel_type::PUCCH} },
+            { YAML_PARAM_CELL_EAXC_ID_SRS,      {slot_command_api::channel_type::SRS} },
+            { YAML_PARAM_CELL_EAXC_ID_PRACH,    {slot_command_api::channel_type::PRACH} },
+        };
+        for (const auto& e : k_eaxc_entries) {
+            if (cell[e.yaml_key].length() == 0) {
+                NVLOGE_FMT(TAG, AERIAL_CONFIG_EVENT,
+                    "Empty eAxC ID list for cell id {} (YAML key: {}).", mplane_cfg.mplane_id, e.yaml_key);
+                return -1;
+            }
+            parse_eAxC_to_beam_map(cell[e.yaml_key], e.channels, mplane_cfg);
+        }
 
         char pusch_tv_full_path[MAX_PATH_LEN];
         char srs_tv_full_path[MAX_PATH_LEN];
@@ -647,6 +720,28 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
         phydriver_config.ul_order_timeout_cpu_ns    = static_cast<uint32_t>(root[YAML_PARAM_UL_ORDER_TIMEOUT_CPU_NS]);
         phydriver_config.ul_order_timeout_gpu_ns    = static_cast<uint32_t>(root[YAML_PARAM_UL_ORDER_TIMEOUT_GPU_NS]);
         phydriver_config.cplane_disable             = (uint8_t)static_cast<uint16_t>(root[YAML_PARAM_CPLANE_DISABLE]);
+        if(root.has_key(YAML_PARAM_CPLANE_PROCESSING_DL_BATCH_SIZE))
+        {
+            phydriver_config.cplane_processing_dl_batch_size =
+                static_cast<uint16_t>(root[YAML_PARAM_CPLANE_PROCESSING_DL_BATCH_SIZE]);
+        } else
+        {
+            phydriver_config.cplane_processing_dl_batch_size = static_cast<uint16_t>(MAX_CELLS_PER_SLOT);
+            NVLOGC_FMT(TAG,
+                       "cuphycontroller config. yaml does not have cplane_processing_dl_batch_size key; defaulting to {}.",
+                       phydriver_config.cplane_processing_dl_batch_size);
+        }
+        if(root.has_key(YAML_PARAM_CPLANE_PROCESSING_UL_BATCH_SIZE))
+        {
+            phydriver_config.cplane_processing_ul_batch_size =
+                static_cast<uint16_t>(root[YAML_PARAM_CPLANE_PROCESSING_UL_BATCH_SIZE]);
+        } else
+        {
+            phydriver_config.cplane_processing_ul_batch_size = static_cast<uint16_t>(MAX_CELLS_PER_SLOT);
+            NVLOGC_FMT(TAG,
+                       "cuphycontroller config. yaml does not have cplane_processing_ul_batch_size key; defaulting to {}.",
+                       phydriver_config.cplane_processing_ul_batch_size);
+        }
         phydriver_config.dpdk_thread                = static_cast<uint32_t>(root[YAML_PARAM_DPDK_THREAD]);
         phydriver_config.dpdk_verbose_logs          = (uint8_t)static_cast<uint16_t>(root[YAML_PARAM_DPDK_VERBOSE_LOGS]);
         phydriver_config.accu_tx_sched_res_ns       = static_cast<uint32_t>(root[YAML_PARAM_ACCU_TX_SCHED_RES_NS]);
@@ -686,6 +781,16 @@ int YamlParser::parse_cuphydriver_configs(yaml::node root)
         {
             phydriver_config.ul_srs_aggr3_task_launch_offset_ns = 500000; // default value as the key is currently only present in a few config. files.
             NVLOGC_FMT(TAG, "cuphycontroller config. yaml does not have ul_srs_aggr3_task_launch_offset_ns key; defaulting to {} ns", phydriver_config.ul_srs_aggr3_task_launch_offset_ns);
+        }
+
+        if(root.has_key("ul_srs_task1_order_launch_offset_ns"))
+        {
+            phydriver_config.ul_srs_task1_order_launch_offset_ns = static_cast<uint32_t>(root[YAML_PARAM_UL_SRS_TASK1_ORDER_LAUNCH_OFFSET_NS]);
+        }
+        else
+        {
+            phydriver_config.ul_srs_task1_order_launch_offset_ns = UL_TASK1_SRS_ORDER_LAUNCH_OFFSET_FROM_T0_NS;
+            NVLOGC_FMT(TAG, "cuphycontroller config. yaml does not have ul_srs_task1_order_launch_offset_ns key; defaulting to {} ns", phydriver_config.ul_srs_task1_order_launch_offset_ns);
         }
 
         if(root.has_key("gpu_init_comms_via_cpu"))
@@ -2100,6 +2205,7 @@ void YamlParser::print_configs() const
     NVLOGC_FMT(TAG, "ul_order_timeout_gpu_srs_ns: {}", phydriver_config.ul_order_timeout_gpu_srs_ns);
     NVLOGC_FMT(TAG, "ul_order_timeout_log_interval_ns: {}", phydriver_config.ul_order_timeout_log_interval_ns);
     NVLOGC_FMT(TAG, "ul_srs_aggr3_task_launch_offset_ns: {}", phydriver_config.ul_srs_aggr3_task_launch_offset_ns);
+    NVLOGC_FMT(TAG, "ul_srs_task1_order_launch_offset_ns: {}", phydriver_config.ul_srs_task1_order_launch_offset_ns);
     NVLOGC_FMT(TAG, "workers_sched_priority: {}", phydriver_config.workers_sched_priority);
     NVLOGC_FMT(TAG, "cqe_trace_cell_mask: {}", phydriver_config.cqe_trace_cell_mask);
     // --
@@ -2357,6 +2463,10 @@ uint32_t& YamlParser::get_cuphydriver_ul_srs_aggr3_task_launch_offset_ns() {
     return phydriver_config.ul_srs_aggr3_task_launch_offset_ns;
 }
 
+uint32_t& YamlParser::get_cuphydriver_ul_srs_task1_order_launch_offset_ns() {
+    return phydriver_config.ul_srs_task1_order_launch_offset_ns;
+}
+
 uint32_t& YamlParser::get_cuphydriver_timeout_log_interval() {
     return phydriver_config.ul_order_timeout_log_interval_ns;
 }
@@ -2384,6 +2494,16 @@ uint32_t& YamlParser::get_cuphydriver_order_kernel_rx_pkts_timeout() {
 uint8_t& YamlParser::get_cplane_disable()
 {
     return phydriver_config.cplane_disable;
+}
+
+const uint16_t& YamlParser::get_cplane_processing_dl_batch_size() const noexcept
+{
+    return phydriver_config.cplane_processing_dl_batch_size;
+}
+
+const uint16_t& YamlParser::get_cplane_processing_ul_batch_size() const noexcept
+{
+    return phydriver_config.cplane_processing_ul_batch_size;
 }
 
 uint8_t& YamlParser::get_cuphydriver_use_green_contexts() {
@@ -2669,6 +2789,14 @@ uint8_t& YamlParser::get_srs_aggr_per_ctx() {
 
 uint16_t& YamlParser::get_max_harq_pools() {
     return phydriver_config.max_harq_pools;
+}
+
+uint16_t YamlParser::get_max_ul_antenna_ports() const {
+    return phydriver_config.max_ul_antenna_ports;
+}
+
+uint16_t YamlParser::get_max_dl_antenna_ports() const {
+    return phydriver_config.max_dl_antenna_ports;
 }
 
 uint8_t& YamlParser::get_ul_input_buffer_per_cell() {

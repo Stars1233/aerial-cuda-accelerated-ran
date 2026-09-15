@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -78,27 +78,29 @@ const char* CUPHYWINAPI cuphyGetDataTypeString(cuphyDataType_t t)
 { // clang-format off
     switch(t)
     {
-    case CUPHY_VOID:  return "CUPHY_VOID";
-    case CUPHY_BIT:   return "CUPHY_BIT";
-    case CUPHY_R_16F: return "CUPHY_R_16F";
-    case CUPHY_C_16F: return "CUPHY_C_16F";
-    case CUPHY_R_32F: return "CUPHY_R_32F";
-    case CUPHY_C_32F: return "CUPHY_C_32F";
-    case CUPHY_R_8I:  return "CUPHY_R_8I";
-    case CUPHY_C_8I:  return "CUPHY_C_8I";
-    case CUPHY_R_8U:  return "CUPHY_R_8U";
-    case CUPHY_C_8U:  return "CUPHY_C_8U";
-    case CUPHY_R_16I: return "CUPHY_R_16I";
-    case CUPHY_C_16I: return "CUPHY_C_16I";
-    case CUPHY_R_16U: return "CUPHY_R_16U";
-    case CUPHY_C_16U: return "CUPHY_C_16U";
-    case CUPHY_R_32I: return "CUPHY_R_32I";
-    case CUPHY_C_32I: return "CUPHY_C_32I";
-    case CUPHY_R_32U: return "CUPHY_R_32U";
-    case CUPHY_C_32U: return "CUPHY_C_32U";
-    case CUPHY_R_64F: return "CUPHY_R_64F";
-    case CUPHY_C_64F: return "CUPHY_C_64F";
-    default:          return "UNKNOWN_TYPE";
+    case CUPHY_VOID:      return "CUPHY_VOID";
+    case CUPHY_BIT:       return "CUPHY_BIT";
+    case CUPHY_R_16F:     return "CUPHY_R_16F";
+    case CUPHY_C_16F:     return "CUPHY_C_16F";
+    case CUPHY_R_32F:     return "CUPHY_R_32F";
+    case CUPHY_C_32F:     return "CUPHY_C_32F";
+    case CUPHY_R_8I:      return "CUPHY_R_8I";
+    case CUPHY_C_8I:      return "CUPHY_C_8I";
+    case CUPHY_R_8U:      return "CUPHY_R_8U";
+    case CUPHY_C_8U:      return "CUPHY_C_8U";
+    case CUPHY_R_16I:     return "CUPHY_R_16I";
+    case CUPHY_C_16I:     return "CUPHY_C_16I";
+    case CUPHY_R_16U:     return "CUPHY_R_16U";
+    case CUPHY_C_16U:     return "CUPHY_C_16U";
+    case CUPHY_R_32I:     return "CUPHY_R_32I";
+    case CUPHY_C_32I:     return "CUPHY_C_32I";
+    case CUPHY_R_32U:     return "CUPHY_R_32U";
+    case CUPHY_C_32U:     return "CUPHY_C_32U";
+    case CUPHY_R_64F:     return "CUPHY_R_64F";
+    case CUPHY_C_64F:     return "CUPHY_C_64F";
+    case CUPHY_R_8F_E4M3: return "CUPHY_R_8F_E4M3";
+    case CUPHY_R_8F_E5M2: return "CUPHY_R_8F_E5M2";
+    default:              return "UNKNOWN_TYPE";
     }
 } // clang-format on
 

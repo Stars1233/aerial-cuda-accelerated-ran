@@ -53,12 +53,12 @@ sudo apt autoremove
 ARCH=$(uname -m)
 case $ARCH in
   x86_64)
-    wget https://developer.download.nvidia.com/compute/redist/gdrcopy/CUDA%2012.8/ubuntu22_04/x64/gdrdrv-dkms_2.5.1-1_amd64.Ubuntu22_04.deb
-    sudo dpkg -i gdrdrv-dkms_2.5.1-1_amd64.Ubuntu22_04.deb
+    wget https://developer.nvidia.com/w/compute/redist/gdrcopy/CUDA%2013.0/ubuntu24_04/x64/gdrdrv-dkms_2.6-1_amd64.Ubuntu24_04.deb
+    sudo dpkg -i gdrdrv-dkms_2.6-1_amd64.Ubuntu24_04.deb
     ;;
   aarch64)
-    wget https://developer.download.nvidia.com/compute/redist/gdrcopy/CUDA%2012.8/ubuntu22_04/aarch64/gdrdrv-dkms_2.5.1-1_arm64.Ubuntu22_04.deb
-    sudo dpkg -i gdrdrv-dkms_2.5.1-1_arm64.Ubuntu22_04.deb
+    wget https://developer.nvidia.com/w/compute/redist/gdrcopy/CUDA%2013.0/ubuntu24_04/aarch64/gdrdrv-dkms_2.6-1_arm64.Ubuntu24_04.deb
+    sudo dpkg -i gdrdrv-dkms_2.6-1_arm64.Ubuntu24_04.deb
     ;;
   *)
     echo "Unsupported architecture: $ARCH"
@@ -72,8 +72,13 @@ esac
 - [HPCCM Documentation](https://github.com/NVIDIA/hpc-container-maker)
 
 ```bash
-pip3 install hpccm
+sudo apt install python3-venv
+python3 -m venv .venv
+source .venv/bin/activate
+pip install hpccm
 ```
+
+The virtual environment avoids modifying Ubuntu's externally managed system Python installation. Activate it using `source .venv/bin/activate` before using `hpccm` to build a container.
 
 ### Verify GPU and Driver
 

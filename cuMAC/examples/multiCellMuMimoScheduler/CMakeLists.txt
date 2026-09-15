@@ -14,6 +14,6 @@
 # limitations under the License.
 
 add_executable(multiCellMuMimoScheduler)
-target_sources(multiCellMuMimoScheduler PRIVATE main.cpp mMimoNetwork.cu)
-target_link_libraries(multiCellMuMimoScheduler PRIVATE cumac ${HDF5_CXX_LIBRARIES} chanModels yaml-cpp)
-target_include_directories(multiCellMuMimoScheduler PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${CHAN_MODELS_SRC_INCLUDE_DIR} ${cumac_SOURCE_DIR}/examples/tools)
+target_sources(multiCellMuMimoScheduler PRIVATE main.cpp mMimoNetwork.cu ../parameters.cpp)
+target_link_libraries(multiCellMuMimoScheduler PRIVATE cumac ${HDF5_CXX_LIBRARIES} gpu3gppchan yaml-cpp)
+target_include_directories(multiCellMuMimoScheduler PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${GPU3GPPCHAN_SRC_INCLUDE_DIR} ${cumac_SOURCE_DIR}/examples/tools)

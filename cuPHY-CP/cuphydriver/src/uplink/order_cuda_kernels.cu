@@ -23,6 +23,8 @@
 #include "gpu_blockFP.h" //Compression Decompression repo
 #include "gpu_fixed.h"  //Compression Decompression repo
 #include "nvlog.hpp"
+#include "order_kernel_functions.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 
 #pragma nv_diag_suppress 177 // warning #177-D: variable "wqe_id" was declared but never referenced
 #pragma nv_diag_suppress 550 // #550-D: variable "wqe_id_last" was set but never used
@@ -61,6 +63,14 @@ __device__ __forceinline__ unsigned long long __globaltimer()
     return globaltimer;
 }
 
+__global__ void order_kernel_printf_warmup()
+{
+    if(blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        printf("[ORDER] printf warmup\n");
+    }
+}
+
 __device__ __forceinline__ uint16_t get_eaxc_index(uint16_t* eAxC_map, int eAxC_num, uint16_t eAxC_id)
 {
     for(int i = 0; i < eAxC_num; i++)
@@ -71,6 +81,87 @@ __device__ __forceinline__ uint16_t get_eaxc_index(uint16_t* eAxC_map, int eAxC_
 
     return 0;
 }
+
+// CWE-787 mitigation for the O-RAN U-plane copy/decompress paths below.
+//
+// oran_get_offset_from_hdr() converts symbolId/startPrb (read from an untrusted
+// fronthaul packet header) plus num_prb into a byte offset of the form
+//   flow_index*symbols_x_slot*prbs_per_symbol*prb_size
+//     + symbol_id *prbs_per_symbol*prb_size
+//     + start_prb *prb_size
+// and the subsequent copy/decompress writes num_prb*prb_size bytes there. The
+// per-eAxC region the buffer is sized for spans [0, symbols_x_slot) symbols and
+// [0, prbs_per_symbol) PRBs, and get_eaxc_index() already clamps flow_index into
+// [0, eAxC_num). So a write stays inside the allocation iff the symbol index and
+// the [start_prb, start_prb+num_prb) PRB span stay inside that region. A packet
+// that violates this (e.g. symbolId=63, startPrbc=1023, numPrbc=255) would write
+// past the antenna buffer into adjacent GPU allocations. These helpers return
+// false for such packets so the caller can drop the write (num_prb=0).
+//
+// The predicate depends only on packet-header fields + uniform geometry, so it is
+// warp-uniform and safe to use without introducing divergence at collectives.
+//
+// Two overloads: the symbolId overload is used where the caller already holds
+// symbolId in a local; the packet overload forwards, reading symbolId from the
+// header for callers that don't have it handy. The two are equivalent in codegen
+// (ptxas hoists the repeated header read), so pick whichever reads better.
+//
+// These are C++ overloads, so force C++ linkage: the surrounding order kernels
+// live in an extern "C" block (opened above), which does not permit overloaded
+// functions ("more than one instance ... has C linkage").
+// The predicates take unsigned parameters so the (>= 0) arms disappear by
+// construction instead of relying on the compiler to fold them. symbol_id,
+// start_prb and num_prb do originate in unsigned packet-header fields, but the
+// geometry arguments (symbols_x_slot, prbs_per_symbol, start_symbol) are still
+// declared int at the kernel boundary and convert implicitly here. That is safe
+// only because they are positive values derived from the cell config, never
+// attacker-controlled. A caller passing a *computed* start must reject the
+// negative case itself before converting - see adj_start in order_kernel_doca.
+extern "C++" {
+
+// PRB-span half of the predicate. start_prb and num_prb come from <=16-bit header
+// fields, so the sum cannot overflow uint32_t.
+[[nodiscard]] __device__ __forceinline__ bool ul_oran_prb_span_in_bounds(
+    uint32_t start_prb, uint32_t num_prb, uint32_t prbs_per_symbol)
+{
+    return (start_prb + num_prb) <= prbs_per_symbol;
+}
+
+[[nodiscard]] __device__ __forceinline__ bool ul_oran_offset_in_bounds(
+    uint32_t symbol_id, uint32_t start_prb, uint32_t num_prb, uint32_t symbols_x_slot, uint32_t prbs_per_symbol)
+{
+    return (symbol_id < symbols_x_slot) &&
+           ul_oran_prb_span_in_bounds(start_prb, num_prb, prbs_per_symbol);
+}
+
+[[nodiscard]] __device__ __forceinline__ bool ul_oran_offset_in_bounds(
+    uint8_t* pkt, uint32_t start_prb, uint32_t num_prb, uint32_t symbols_x_slot, uint32_t prbs_per_symbol)
+{
+    return ul_oran_offset_in_bounds((uint32_t)oran_umsg_get_symbol_id(pkt), start_prb, num_prb,
+                                    symbols_x_slot, prbs_per_symbol);
+}
+
+// SRS variant: the offset is computed relative to srs start symbol, so the
+// effective symbol index is (symbolId - start_symbol).
+[[nodiscard]] __device__ __forceinline__ bool ul_oran_srs_offset_in_bounds(
+    uint32_t symbol_id, uint32_t start_prb, uint32_t num_prb, uint32_t symbols_x_slot, uint32_t prbs_per_symbol, uint32_t start_symbol)
+{
+    // The lower bound (symbolId >= start_symbol) is still required -- a packet
+    // with symbolId < start_symbol would otherwise index *before* the SRS buffer.
+    // Unsigned arithmetic enforces it for free: the subtraction wraps to a huge
+    // value, which fails the < comparison. Do not "fix" this to signed.
+    const uint32_t eff_symbol = symbol_id - start_symbol;
+    return (eff_symbol < symbols_x_slot) &&
+           ul_oran_prb_span_in_bounds(start_prb, num_prb, prbs_per_symbol);
+}
+
+[[nodiscard]] __device__ __forceinline__ bool ul_oran_srs_offset_in_bounds(
+    uint8_t* pkt, uint32_t start_prb, uint32_t num_prb, uint32_t symbols_x_slot, uint32_t prbs_per_symbol, uint32_t start_symbol)
+{
+    return ul_oran_srs_offset_in_bounds((uint32_t)oran_umsg_get_symbol_id(pkt), start_prb, num_prb,
+                                        symbols_x_slot, prbs_per_symbol, start_symbol);
+}
+} // extern "C++"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //// Order Kernel multi block
@@ -487,6 +578,26 @@ __global__ void order_kernel_doca(
 
 					// if (threadIdx.x == 0)
 					// 	t3 = __globaltimer();
+					// CWE-787: drop copy/decompress if untrusted symbolId/startPrb/numPrb
+					// would index past the per-eAxC antenna buffer. For PRACH the pointer is
+					// shifted back by startPRB_offset_idx_* (bytes), so validate the effective
+					// post-shift start PRB, which also rejects an underflow before the buffer.
+					{
+						const int chk_sxs = (section_id_pkt < prach_section_id_0) ? pusch_symbols_x_slot : prach_symbols_x_slot;
+						const int chk_pps = (section_id_pkt < prach_section_id_0) ? pusch_prb_x_port_x_symbol : prach_prb_x_port_x_symbol;
+						int shift_bytes = 0;
+						if(section_id_pkt == prach_section_id_1)      shift_bytes = startPRB_offset_idx_1;
+						else if(section_id_pkt == prach_section_id_2) shift_bytes = startPRB_offset_idx_2;
+						else if(section_id_pkt == prach_section_id_3) shift_bytes = startPRB_offset_idx_3;
+						const int adj_start = (int)oran_umsg_get_start_prb(pkt_thread) - (shift_bytes / prb_size);
+						// adj_start is the only computed (signed) start in this file, so its
+						// negative case is rejected here rather than inside the helper: the
+						// helper now takes unsigned, and a negative value would convert to a
+						// huge uint32_t that could wrap back into range across the span add.
+						if(adj_start < 0 ||
+						   !ul_oran_offset_in_bounds(pkt_thread, (uint32_t)adj_start, num_prb, chk_sxs, chk_pps))
+							num_prb = 0;
+					}
                     if(comp_meth == static_cast<uint8_t>(aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT))
                     {
                         if(bit_width == BFP_NO_COMPRESSION) // BFP with 16 bits is a special case and uses FP16, so copy the values
@@ -1264,6 +1375,14 @@ __global__ void order_kernel_doca_single(
 							else if(section_id == prach_section_id_3) gbuf_offset_ptr -= startPRB_offset_idx_3;
 						}
     
+						// CWE-787: drop copy/decompress if untrusted symbolId/startPrb/numPrb
+						// would index past the per-eAxC antenna buffer.
+						{
+							const int chk_sxs = (section_id < prach_section_id_0) ? pusch_symbols_x_slot : prach_symbols_x_slot;
+							const int chk_pps = (section_id < prach_section_id_0) ? pusch_prb_x_port_x_symbol_cell : prach_prb_x_port_x_symbol_cell;
+							if(!ul_oran_offset_in_bounds(pkt_thread, start_prb, num_prb, chk_sxs, chk_pps))
+								num_prb = 0;
+						}
                         if(comp_meth_cell == static_cast<uint8_t>(aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT))
                         {
                             if(bit_width_cell == BFP_NO_COMPRESSION) // BFP with 16 bits is a special case and uses FP16, so copy the values
@@ -1748,6 +1867,7 @@ __global__ void receive_kernel_for_test_bench(
 }
 
 int launch_receive_kernel_for_test_bench(
+	CUfunction func,
 	cudaStream_t stream,
 
 	/* DOCA objects */
@@ -1790,37 +1910,37 @@ int launch_receive_kernel_for_test_bench(
 	uint8_t num_order_cells
     )
     {
-	cudaError_t result = cudaSuccess;
-	int cudaBlocks = (num_order_cells); 
+	int cudaBlocks = (num_order_cells);
     int numThreads = 128;
 
-        // block 0 to receive, block 1 to process
-	receive_kernel_for_test_bench<<<cudaBlocks, numThreads, 0, stream>>>(
-                                                /* DOCA objects */
-                                                doca_rxq, sem_gpu, sem_order_num,
-                                                /* Cell specific */
-                                                cell_id, exit_cond_d, last_sem_idx_rx_h, bit_width,
-                                                /* Timeout */
-                                                timeout_no_pkt_ns, timeout_first_pkt_ns,max_rx_pkts,max_pkt_size,
-                                                /* Time specific */
-                                                frameId, subframeId, slotId,
-                                                /* Order kernel specific */
-                                                rx_packets_count,
-                                                next_slot_rx_packets_count,
-                                                next_slot_num_prb_ch1,next_slot_num_prb_ch2,
-                                                /*FH buffer specific*/
-                                                tb_fh_buf,tb_fh_buf_next_slot,
-                                                /* PUSCH/PRACH Output buffer specific */
-                                                pusch_prb_x_slot,prach_prb_x_slot, 
-                                                prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                                                srs_prb_x_slot);
+    void* args[] = {
+        /* DOCA objects */
+        &doca_rxq, &sem_gpu, &sem_order_num,
+        /* Cell specific */
+        &cell_id, &exit_cond_d, &last_sem_idx_rx_h, &bit_width,
+        /* Timeout */
+        const_cast<uint32_t*>(&timeout_no_pkt_ns), const_cast<uint32_t*>(&timeout_first_pkt_ns),
+        const_cast<uint32_t*>(&max_rx_pkts), const_cast<uint32_t*>(&max_pkt_size),
+        /* Time specific */
+        const_cast<uint8_t*>(&frameId), const_cast<uint8_t*>(&subframeId), const_cast<uint8_t*>(&slotId),
+        /* Order kernel specific */
+        &rx_packets_count, &next_slot_rx_packets_count, &next_slot_num_prb_ch1, &next_slot_num_prb_ch2,
+        /* FH buffer specific */
+        &tb_fh_buf, &tb_fh_buf_next_slot,
+        /* PUSCH/PRACH Output buffer specific */
+        &pusch_prb_x_slot, &prach_prb_x_slot,
+        &prach_section_id_0, &prach_section_id_1, &prach_section_id_2, &prach_section_id_3,
+        &srs_prb_x_slot
+    };
 
+    CUresult cuResult = cuLaunchKernel(func,
+        cudaBlocks, 1, 1,
+        numThreads, 1, 1,
+        0, stream,
+        args, nullptr);
+    CUDA_DRIVER_CHECK(cuResult);
 
-	result = cudaGetLastError();
-	if(cudaSuccess != result)
-	    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} \n", __FILE__, __LINE__, cudaGetErrorString(result));
-
-	return 0;
+    return 0;
 }
 
 __device__ __forceinline__ void order_kernel_doca_receive_packets_subSlot(
@@ -1976,7 +2096,6 @@ struct doca_gpu_dev_eth_rxq_attr *out_attr_sh
         if(commViaCpu)
         {
             ret = doca_gpu_dev_eth_rxq_recv<DOCA_GPUNETIO_ETH_EXEC_SCOPE_BLOCK,DOCA_GPUNETIO_ETH_MCST_DISABLED,DOCA_GPUNETIO_ETH_NIC_HANDLER_AUTO,DOCA_GPUNETIO_ETH_RX_ATTR_NONE>(doca_rxq_cell, max_rx_pkts, timeout_ns, &rx_buf_idx, &rx_pkt_num, out_attr_sh);
-            printf("doca_gpu_dev_eth_rxq_recv<BLOCK> triggered for F%dS%dS%d\n",frameId, subframeId, slotId);
             /* If any thread returns receive error, the whole execution stops */
             if (ret != DOCA_SUCCESS) {
                 doca_gpu_dev_semaphore_set_status(sem_gpu_cell, sem_idx_rx, DOCA_GPU_SEMAPHORE_STATUS_ERROR);
@@ -2418,6 +2537,14 @@ __device__ __forceinline__ void order_kernel_doca_process_receive_packets_subSlo
                     else if(section_id == prach_section_id_3) gbuf_offset_ptr -= startPRB_offset_idx_3;
                 }
 
+                // CWE-787: drop copy/decompress if untrusted symbolId/startPrb/numPrb
+                // would index past the per-eAxC antenna buffer.
+                {
+                    const int chk_sxs = (section_id < prach_section_id_0) ? pusch_symbols_x_slot : prach_symbols_x_slot;
+                    const int chk_pps = (section_id < prach_section_id_0) ? pusch_prb_x_port_x_symbol_cell : prach_prb_x_port_x_symbol_cell;
+                    if(!ul_oran_offset_in_bounds(pkt_thread, start_prb, num_prb, chk_sxs, chk_pps))
+                        num_prb = 0;
+                }
                 if(comp_meth_cell == static_cast<uint8_t>(aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT))
                 {
                     if(bit_width_cell == BFP_NO_COMPRESSION) // BFP with 16 bits is a special case and uses FP16, so copy the values
@@ -3508,14 +3635,25 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
     uint32_t warp_srs_ordered_prbs_cell = 0;
     __shared__ uint32_t smem_pusch_prach_ordered_prbs_cell;
     __shared__ uint32_t smem_srs_ordered_prbs_cell;
+    // Separate PUSCH/PRACH running accumulators, maintained purely so the timeout
+    // log below can report the real in-loop ordered PRB count. The global
+    // pusch_ordered_prbs_cell[0]/prach_ordered_prbs_cell[0] are only flushed after
+    // the main while(1) loop (atomicAdd at end of kernel), so they always read 0
+    // for a timed-out slot and are useless for triage.
+    __shared__ uint32_t smem_pusch_ordered_prbs_cell;
+    __shared__ uint32_t smem_prach_ordered_prbs_cell;
     if (tid == 0) {
         if constexpr (srs_enable==ORDER_KERNEL_SRS_ENABLE) {
             smem_srs_ordered_prbs_cell = *srs_ordered_prbs_cell;
         } else if constexpr (srs_enable==ORDER_KERNEL_PUSCH_ONLY) {
             smem_pusch_prach_ordered_prbs_cell = *pusch_ordered_prbs_cell + *prach_ordered_prbs_cell;
+            smem_pusch_ordered_prbs_cell = *pusch_ordered_prbs_cell;
+            smem_prach_ordered_prbs_cell = *prach_ordered_prbs_cell;
         } else {
             smem_srs_ordered_prbs_cell = *srs_ordered_prbs_cell;
             smem_pusch_prach_ordered_prbs_cell = *pusch_ordered_prbs_cell + *prach_ordered_prbs_cell;
+            smem_pusch_ordered_prbs_cell = *pusch_ordered_prbs_cell;
+            smem_prach_ordered_prbs_cell = *prach_ordered_prbs_cell;
         }
     }
     __syncthreads();
@@ -3565,6 +3703,9 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
         while (1) {
             uint32_t warp_pusch_prach_ordered_prbs_cell_this_burst = 0;
             uint32_t warp_srs_ordered_prbs_cell_this_burst = 0;
+            // Per-burst PUSCH/PRACH split, folded into the log-only shared accumulators below.
+            uint32_t warp_pusch_ordered_prbs_cell_this_burst = 0;
+            uint32_t warp_prach_ordered_prbs_cell_this_burst = 0;
 
             if (tid == 0) {
                 const doca_error_t ret = aerial_fh_gpu_dev_semaphore_get_packet_info_status(
@@ -3775,6 +3916,23 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                             }
                         }                        
 
+                        // CWE-787: drop copy/decompress if untrusted symbolId/startPrb/numPrb
+                        // would index past the per-eAxC antenna buffer (PUSCH/PRACH/SRS).
+                        {
+                            bool ob;
+                            if constexpr (srs_enable==ORDER_KERNEL_SRS_ENABLE)
+                                ob = !ul_oran_srs_offset_in_bounds(symbol_id_pkt, start_prb, num_prb, srs_symbols_x_slot, srs_prb_x_port_x_symbol_cell, srs_start_sym_cell);
+                            else if(section_id < prach_section_id_0)
+                            {
+                                ob = !ul_oran_offset_in_bounds(symbol_id_pkt, start_prb, num_prb, pusch_symbols_x_slot, pusch_prb_x_port_x_symbol_cell);
+                                if(srs_enable==ORDER_KERNEL_SRS_AND_PUSCH && symbol_id_pkt == srs_start_sym_cell)
+                                    ob = ob || !ul_oran_srs_offset_in_bounds(symbol_id_pkt, start_prb, num_prb, srs_symbols_x_slot, srs_prb_x_port_x_symbol_cell, srs_start_sym_cell);
+                            }
+                            else
+                                ob = !ul_oran_offset_in_bounds(symbol_id_pkt, start_prb, num_prb, prach_symbols_x_slot, prach_prb_x_port_x_symbol_cell);
+                            if(ob)
+                                num_prb = 0;
+                        }
                         if(comp_meth_cell == static_cast<uint8_t>(aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT))
                         {
                             if(bit_width_cell == BFP_NO_COMPRESSION) // BFP with 16 bits is a special case and uses FP16, so copy the values
@@ -3812,12 +3970,14 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                                             DOCA_GPUNETIO_VOLATILE(sym_ord_done_sig_arr[symbol_id_pkt])=(uint32_t)SYM_RX_DONE;
                                         }
                                     }
-                                    warp_pusch_ordered_prbs_cell += num_prb;                                    
+                                    warp_pusch_ordered_prbs_cell += num_prb;
+                                    warp_pusch_ordered_prbs_cell_this_burst += num_prb;
                                     if(buffer == srs_buffer_cell) {
                                         warp_srs_ordered_prbs_cell += num_prb;
                                     }
                                 } else {
                                     warp_prach_ordered_prbs_cell += num_prb;
+                                    warp_prach_ordered_prbs_cell_this_burst += num_prb;
                                 }
                                 warp_pusch_prach_ordered_prbs_cell_this_burst += num_prb;
                             }
@@ -3874,6 +4034,9 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                 else {
                     num_prb_added = warp_pusch_prach_ordered_prbs_cell_this_burst;
                     old_prb_count = atomicAdd(&smem_pusch_prach_ordered_prbs_cell, num_prb_added);
+                    // Keep the log-only split accumulators in sync (does not affect the exit check).
+                    atomicAdd(&smem_pusch_ordered_prbs_cell, warp_pusch_ordered_prbs_cell_this_burst);
+                    atomicAdd(&smem_prach_ordered_prbs_cell, warp_prach_ordered_prbs_cell_this_burst);
                 }
 
                 if(old_prb_count < prb_x_slot && old_prb_count + num_prb_added >= prb_x_slot) {
@@ -3898,7 +4061,7 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                             printf("%d Cell %d Order kernel sem_idx_rx %d last_sem_idx_rx %d sem_idx_order %d last_sem_idx_order %d SRS PRBs %d/%d.  First packet received timeout after %d ns F%dS%dS%d done = %d current_time=%llu,last_timeout_log_time=%llu,total_rx_pkts=%d\n",__LINE__,
                                 cell_idx, sem_idx_rx, *last_sem_idx_rx_h_cell,
                                 sem_idx_order,*last_sem_idx_order_h_cell,
-                                DOCA_GPUNETIO_VOLATILE(srs_ordered_prbs_cell[0]), srs_prb_x_slot_cell,
+                                smem_srs_ordered_prbs_cell, srs_prb_x_slot_cell,
                                 timeout_first_pkt_ns, frameId, subframeId, slotId,
                                 DOCA_GPUNETIO_VOLATILE(done_shared_sh),
                                 current_time,DOCA_GPUNETIO_VOLATILE(*order_kernel_last_timeout_error_time_cell),rx_pkt_num_total);
@@ -3913,8 +4076,8 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                             printf("%d Cell %d Order kernel sem_idx_rx %d last_sem_idx_rx %d sem_idx_order %d last_sem_idx_order %d PUSCH PRBs %d/%d PRACH PRBs %d/%d.  First packet received timeout after %d ns F%dS%dS%d done = %d current_time=%llu,last_timeout_log_time=%llu,total_rx_pkts=%d\n",__LINE__,
                                 cell_idx, sem_idx_rx, *last_sem_idx_rx_h_cell,
                                 sem_idx_order,*last_sem_idx_order_h_cell,
-                                DOCA_GPUNETIO_VOLATILE(pusch_ordered_prbs_cell[0]), pusch_prb_x_slot_cell,
-                                DOCA_GPUNETIO_VOLATILE(prach_ordered_prbs_cell[0]), prach_prb_x_slot_cell,
+                                smem_pusch_ordered_prbs_cell, pusch_prb_x_slot_cell,
+                                smem_prach_ordered_prbs_cell, prach_prb_x_slot_cell,
                                 timeout_first_pkt_ns, frameId, subframeId, slotId,
                                 DOCA_GPUNETIO_VOLATILE(done_shared_sh),
                                 current_time,DOCA_GPUNETIO_VOLATILE(*order_kernel_last_timeout_error_time_cell),rx_pkt_num_total);
@@ -3937,7 +4100,7 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                         printf("%d Cell %d Order kernel sem_idx_rx %d last_sem_idx_rx %d sem_idx_order %d last_sem_idx_order %d SRS PRBs %d/%d. No packet received timeout after %d ns F%dS%dS%d done = %d current_time=%llu,last_timeout_log_time=%llu\n",__LINE__,
                             cell_idx, sem_idx_rx, *last_sem_idx_rx_h_cell,
                             sem_idx_order,*last_sem_idx_order_h_cell,
-                            DOCA_GPUNETIO_VOLATILE(srs_ordered_prbs_cell[0]), srs_prb_x_slot_cell,
+                            smem_srs_ordered_prbs_cell, srs_prb_x_slot_cell,
                             timeout_no_pkt_ns, frameId, subframeId, slotId,
                             DOCA_GPUNETIO_VOLATILE(done_shared_sh),
                             current_time,DOCA_GPUNETIO_VOLATILE(*order_kernel_last_timeout_error_time_cell));
@@ -3952,8 +4115,8 @@ __global__ void __launch_bounds__(NUM_THREADS,NUM_CTAS_PER_SM) order_kernel_doca
                         printf("%d Cell %d Order kernel sem_idx_rx %d last_sem_idx_rx %d sem_idx_order %d last_sem_idx_order %d PUSCH PRBs %d/%d PRACH PRBs %d/%d. No packet received timeout after %d ns F%dS%dS%d done = %d current_time=%llu,last_timeout_log_time=%llu\n",__LINE__,
                             cell_idx, sem_idx_rx, *last_sem_idx_rx_h_cell,
                             sem_idx_order,*last_sem_idx_order_h_cell,
-                            DOCA_GPUNETIO_VOLATILE(pusch_ordered_prbs_cell[0]), pusch_prb_x_slot_cell,
-                            DOCA_GPUNETIO_VOLATILE(prach_ordered_prbs_cell[0]), prach_prb_x_slot_cell,
+                            smem_pusch_ordered_prbs_cell, pusch_prb_x_slot_cell,
+                            smem_prach_ordered_prbs_cell, prach_prb_x_slot_cell,
                             timeout_no_pkt_ns, frameId, subframeId, slotId,
                             DOCA_GPUNETIO_VOLATILE(done_shared_sh),
                             current_time,DOCA_GPUNETIO_VOLATILE(*order_kernel_last_timeout_error_time_cell));
@@ -4569,6 +4732,14 @@ uint8_t num_order_cells
 							else if(section_id == prach_section_id_3) gbuf_offset_ptr -= startPRB_offset_idx_3;
 						}
     
+						// CWE-787: drop copy/decompress if untrusted symbolId/startPrb/numPrb
+						// would index past the per-eAxC antenna buffer.
+						{
+							const int chk_sxs = (section_id < prach_section_id_0) ? pusch_symbols_x_slot : prach_symbols_x_slot;
+							const int chk_pps = (section_id < prach_section_id_0) ? pusch_prb_x_port_x_symbol_cell : prach_prb_x_port_x_symbol_cell;
+							if(!ul_oran_offset_in_bounds(pkt_thread, start_prb, num_prb, chk_sxs, chk_pps))
+								num_prb = 0;
+						}
                         if(comp_meth_cell == static_cast<uint8_t>(aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT))
                         {
                             if(bit_width_cell == BFP_NO_COMPRESSION) // BFP with 16 bits is a special case and uses FP16, so copy the values
@@ -5194,6 +5365,10 @@ __global__ void order_kernel_doca_single_srs(
 										    srs_symbols_x_slot, srs_prb_x_port_x_symbol_cell, prb_size,start_prb,srs_start_sym_cell);
 						gbuf_offset_ptr = buffer + offset;
 
+						// CWE-787: drop copy/decompress if untrusted symbolId/startPrb/numPrb
+						// would index past the per-eAxC SRS antenna buffer.
+						if(!ul_oran_srs_offset_in_bounds(pkt_thread, start_prb, num_prb, srs_symbols_x_slot, srs_prb_x_port_x_symbol_cell, srs_start_sym_cell))
+							num_prb = 0;
                         if(comp_meth_cell == static_cast<uint8_t>(aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT))
                         {
                             if(bit_width_cell == BFP_NO_COMPRESSION) // BFP with 16 bits is a special case and uses FP16, so copy the values
@@ -5306,6 +5481,7 @@ __global__ void order_kernel_doca_single_srs(
 }
 
 int launch_order_kernel_doca(
+	CUfunction            func,
 	cudaStream_t          stream,
 
     struct doca_gpu_eth_rxq *doca_rxq,
@@ -5373,8 +5549,6 @@ int launch_order_kernel_doca(
 	uint32_t*             prach_ordered_prbs
     )
     {
-	cudaError_t result = cudaSuccess;
-
 	if(
 	    (pusch_buffer == nullptr || pusch_prb_x_slot == 0) &&
 	    ((prach_buffer_0 == nullptr && prach_buffer_1 == nullptr && prach_buffer_2 == nullptr && prach_buffer_3 == nullptr) || prach_prb_x_slot == 0)
@@ -5387,40 +5561,49 @@ int launch_order_kernel_doca(
 	)
 	    return EINVAL;
 
+	int pusch_symbols_x_slot = ORAN_PUSCH_SYMBOLS_X_SLOT;
+	int prach_b4_symbols_x_slot = ORAN_PRACH_B4_SYMBOLS_X_SLOT;
+
         // block 0 to receive, block 1 to process
-	order_kernel_doca<<<2, 512, 0, stream>>>(
-                                                /* DOCA objects */
-                                                doca_rxq, sem_gpu, sem_order_num,
-                                                /* Cell specific */
-                                                cell_id, ru_type, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                                                /* Timeout */
-                                                timeout_no_pkt_ns, timeout_first_pkt_ns,max_rx_pkts,
-                                                /* Time specific */
-                                                frameId, subframeId, slotId,
-                                                /* Order kernel specific */
-                                                barrier_flag, done_shared,
-                                                early_rx_packets, on_time_rx_packets, late_rx_packets,
-                                                slot_start, ta4_min_ns, ta4_max_ns, slot_duration,
-                                                /* PUSCH Output buffer specific */
-                                                pusch_eAxC_map, pusch_eAxC_num,
-                                                pusch_buffer, pusch_prb_x_slot, pusch_prb_x_symbol, pusch_prb_x_symbol_x_antenna,
-                                                ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                                                /* PRACH Output buffer specific */
-                                                prach_eAxC_map, prach_eAxC_num,
-                                                prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                                                prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                                                prach_prb_x_slot, prach_prb_x_symbol, prach_prb_x_symbol_x_antenna,
-                                                ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs);
+	void* args[] = {
+	    /* DOCA objects */
+	    &doca_rxq, &sem_gpu, (void*)&sem_order_num,
+	    /* Cell specific */
+	    &cell_id, &ru_type, &start_cuphy_d, &order_kernel_exit_cond_d, &last_sem_idx_rx_h, &last_sem_idx_order_h, &comp_meth, &bit_width, &beta, &prb_size,
+	    /* Timeout */
+	    &timeout_no_pkt_ns, &timeout_first_pkt_ns, &max_rx_pkts,
+	    /* Time specific */
+	    &frameId, &subframeId, &slotId,
+	    /* Order kernel specific */
+	    &barrier_flag, &done_shared,
+	    &early_rx_packets, &on_time_rx_packets, &late_rx_packets,
+	    &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration,
+	    /* PUSCH Output buffer specific */
+	    &pusch_eAxC_map, &pusch_eAxC_num,
+	    &pusch_buffer, &pusch_prb_x_slot, &pusch_prb_x_symbol, &pusch_prb_x_symbol_x_antenna,
+	    &pusch_symbols_x_slot, &pusch_prb_stride, &pusch_ordered_prbs,
+	    /* PRACH Output buffer specific */
+	    &prach_eAxC_map, &prach_eAxC_num,
+	    &prach_buffer_0, &prach_buffer_1, &prach_buffer_2, &prach_buffer_3,
+	    &prach_section_id_0, &prach_section_id_1, &prach_section_id_2, &prach_section_id_3,
+	    &prach_prb_x_slot, &prach_prb_x_symbol, &prach_prb_x_symbol_x_antenna,
+	    &prach_b4_symbols_x_slot, &prach_prb_stride, &prach_ordered_prbs
+	};
 
-
-	result = cudaGetLastError();
-	if(cudaSuccess != result)
-	    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+	CUresult cuResult = cuLaunchKernel(func,
+	    2, 1, 1,
+	    512, 1, 1,
+	    0, stream,
+	    args, nullptr);
+	CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+	if(cuResult != CUDA_SUCCESS)
+	    return -1;
 
 	return 0;
 }
 
 int launch_order_kernel_doca_single(
+	CUfunction            func,
 	cudaStream_t          stream,
 
     struct doca_gpu_eth_rxq **doca_rxq,
@@ -5514,47 +5697,54 @@ int launch_order_kernel_doca_single(
     uint16_t max_pkt_size
     )
     {
-	cudaError_t result = cudaSuccess;
 	int cudaBlocks = (num_order_cells); //# of Thread blocks should be twice the number of cells
     int numThreads = (commViaCpu==true)?256:128;
 
+	int pusch_symbols_x_slot = ORAN_PUSCH_SYMBOLS_X_SLOT;
+	int prach_b4_symbols_x_slot = ORAN_PRACH_B4_SYMBOLS_X_SLOT;
+
         // block 0 to receive, block 1 to process
-	order_kernel_doca_single<<<cudaBlocks * 2, numThreads, 0, stream>>>(
-                                                /* DOCA objects */
-                                                doca_rxq, sem_gpu, sem_order_num,
-                                                /* Cell specific */
-                                                cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                                                /* Timeout */
-                                                timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,commViaCpu,
-                                                /* Time specific */
-                                                frameId, subframeId, slotId,
-                                                /* Order kernel specific */
-                                                barrier_flag, done_shared,
-                                                early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                                                slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,ul_rx_pkt_tracing_level,rx_packets_ts,rx_packets_count,rx_bytes_count,rx_packets_ts_earliest,rx_packets_ts_latest,next_slot_rx_packets_ts,next_slot_rx_packets_count,next_slot_rx_bytes_count,
-                                                next_slot_num_prb_ch1,next_slot_num_prb_ch2,
-                                                /* PUSCH Output buffer specific */
-                                                pusch_eAxC_map, pusch_eAxC_num,
-                                                pusch_buffer, pusch_prb_x_slot, pusch_prb_x_symbol, pusch_prb_x_symbol_x_antenna,
-                                                ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                                                /* PRACH Output buffer specific */
-                                                prach_eAxC_map, prach_eAxC_num,
-                                                prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                                                prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                                                prach_prb_x_slot, prach_prb_x_symbol, prach_prb_x_symbol_x_antenna,
-                                                ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,
-                                                pcap_buffer, pcap_buffer_ts, pcap_buffer_index, pcap_capture_enable, pcap_capture_cell_bitmask, max_pkt_size
-                                            );
+	void* args[] = {
+	    /* DOCA objects */
+	    &doca_rxq, &sem_gpu, &sem_order_num,
+	    /* Cell specific */
+	    &cell_id, &ru_type, &cell_health, &start_cuphy_d, &order_kernel_exit_cond_d, &last_sem_idx_rx_h, &last_sem_idx_order_h, &comp_meth, &bit_width, &beta, &prb_size,
+	    /* Timeout */
+	    &timeout_no_pkt_ns, &timeout_first_pkt_ns, &timeout_log_interval_ns, &timeout_log_enable, &max_rx_pkts, &rx_pkts_timeout_ns, &commViaCpu,
+	    /* Time specific */
+	    &frameId, &subframeId, &slotId,
+	    /* Order kernel specific */
+	    &barrier_flag, &done_shared,
+	    &early_rx_packets, &on_time_rx_packets, &late_rx_packets, &next_slot_early_rx_packets, &next_slot_on_time_rx_packets, &next_slot_late_rx_packets,
+	    &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration, &order_kernel_last_timeout_error_time, &ul_rx_pkt_tracing_level, &rx_packets_ts, &rx_packets_count, &rx_bytes_count, &rx_packets_ts_earliest, &rx_packets_ts_latest, &next_slot_rx_packets_ts, &next_slot_rx_packets_count, &next_slot_rx_bytes_count,
+	    &next_slot_num_prb_ch1, &next_slot_num_prb_ch2,
+	    /* PUSCH Output buffer specific */
+	    &pusch_eAxC_map, &pusch_eAxC_num,
+	    &pusch_buffer, &pusch_prb_x_slot, &pusch_prb_x_symbol, &pusch_prb_x_symbol_x_antenna,
+	    &pusch_symbols_x_slot, &pusch_prb_stride, &pusch_ordered_prbs,
+	    /* PRACH Output buffer specific */
+	    &prach_eAxC_map, &prach_eAxC_num,
+	    &prach_buffer_0, &prach_buffer_1, &prach_buffer_2, &prach_buffer_3,
+	    &prach_section_id_0, &prach_section_id_1, &prach_section_id_2, &prach_section_id_3,
+	    &prach_prb_x_slot, &prach_prb_x_symbol, &prach_prb_x_symbol_x_antenna,
+	    &prach_b4_symbols_x_slot, &prach_prb_stride, &prach_ordered_prbs,
+	    &pcap_buffer, &pcap_buffer_ts, &pcap_buffer_index, &pcap_capture_enable, &pcap_capture_cell_bitmask, &max_pkt_size
+	};
 
-
-	result = cudaGetLastError();
-	if(cudaSuccess != result)
-	    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+	CUresult cuResult = cuLaunchKernel(func,
+	    cudaBlocks * 2, 1, 1,
+	    numThreads, 1, 1,
+	    0, stream,
+	    args, nullptr);
+	CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+	if(cuResult != CUDA_SUCCESS)
+	    return -1;
 
 	return 0;
 }
 
 int launch_order_kernel_doca_single_srs(
+	CUfunction            func,
 	cudaStream_t          stream,
 
     	struct doca_gpu_eth_rxq **doca_rxq,
@@ -5612,46 +5802,54 @@ int launch_order_kernel_doca_single_srs(
 	uint8_t num_order_cells
     )
     {
-	cudaError_t result = cudaSuccess;
 	int cudaBlocks = (num_order_cells); //# of Thread blocks should be twice the number of cells
-    /*
-    printf("Before order_kernel_doca_single_srs call F%dS%dS%d\n",frameId, subframeId, slotId);
-	result = cudaGetLastError();
-	if(cudaSuccess != result)
-	    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} before OK call", __FILE__, __LINE__, cudaGetErrorString(result));
-    */
+
+	int oran_max_srs_symbols = ORAN_MAX_SRS_SYMBOLS;
+
         // block 0 to receive, block 1 to process
-	order_kernel_doca_single_srs<<<cudaBlocks, 256, 0, stream>>>(
-                                                /* DOCA objects */
-                                                doca_rxq, sem_gpu, sem_order_num,
-                                                /* Cell specific */
-                                                cell_id, ru_type, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                                                /* Timeout */
-                                                timeout_no_pkt_ns, timeout_first_pkt_ns,max_rx_pkts,
-                                                /* Time specific */
-                                                frameId, subframeId, slotId,
-                                                /* Order kernel specific */
-                                                barrier_flag, done_shared,
-                                                /* SRS packet stats */
-                                                early_rx_packets_srs, on_time_rx_packets_srs, late_rx_packets_srs,
-                                                next_slot_early_rx_packets_srs, next_slot_on_time_rx_packets_srs, next_slot_late_rx_packets_srs,
-                                                rx_packets_count_srs, rx_bytes_count_srs, next_slot_rx_packets_count_srs, next_slot_rx_bytes_count_srs,
-                                                ul_rx_pkt_tracing_level,rx_packets_ts_srs,rx_packets_count_per_sym_srs,rx_packets_ts_earliest_srs,rx_packets_ts_latest_srs,next_slot_rx_packets_ts_srs,next_slot_rx_packets_count_per_sym_srs,
-                                                slot_start_srs, ta4_min_ns, ta4_max_ns, slot_duration,
-                                                /* SRS Output buffer specific */
-                                                srs_eAxC_map, srs_eAxC_num,
-                                                srs_buffer, srs_prb_x_slot,
-                                                ORAN_MAX_SRS_SYMBOLS,srs_prb_stride, srs_ordered_prbs,srs_start_sym);
+	void* args[] = {
+	    /* DOCA objects */
+	    &doca_rxq, &sem_gpu, &sem_order_num,
+	    /* Cell specific */
+	    &cell_id, &ru_type, &start_cuphy_d, &order_kernel_exit_cond_d, &last_sem_idx_rx_h, &last_sem_idx_order_h, &comp_meth, &bit_width, &beta, &prb_size,
+	    /* Timeout */
+	    &timeout_no_pkt_ns, &timeout_first_pkt_ns, &max_rx_pkts,
+	    /* Time specific */
+	    &frameId, &subframeId, &slotId,
+	    /* Order kernel specific */
+	    &barrier_flag, &done_shared,
+	    /* SRS packet stats */
+	    &early_rx_packets_srs, &on_time_rx_packets_srs, &late_rx_packets_srs,
+	    &next_slot_early_rx_packets_srs, &next_slot_on_time_rx_packets_srs, &next_slot_late_rx_packets_srs,
+	    &rx_packets_count_srs, &rx_bytes_count_srs, &next_slot_rx_packets_count_srs, &next_slot_rx_bytes_count_srs,
+	    &ul_rx_pkt_tracing_level, &rx_packets_ts_srs, &rx_packets_count_per_sym_srs, &rx_packets_ts_earliest_srs, &rx_packets_ts_latest_srs, &next_slot_rx_packets_ts_srs, &next_slot_rx_packets_count_per_sym_srs,
+	    &slot_start_srs, &ta4_min_ns, &ta4_max_ns, &slot_duration,
+	    /* SRS Output buffer specific */
+	    &srs_eAxC_map, &srs_eAxC_num,
+	    &srs_buffer, &srs_prb_x_slot,
+	    &oran_max_srs_symbols, &srs_prb_stride, &srs_ordered_prbs, &srs_start_sym
+	};
 
-
-	result = cudaGetLastError();
-	if(cudaSuccess != result)
-	    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+	CUresult cuResult = cuLaunchKernel(func,
+	    cudaBlocks, 1, 1,
+	    256, 1, 1,
+	    0, stream,
+	    args, nullptr);
+	CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+	if(cuResult != CUDA_SUCCESS)
+	    return -1;
 
 	return 0;
 }
 
 int launch_order_kernel_doca_single_subSlot(
+	CUfunction func,
+	CUfunction pingpong_trace_srs,
+	CUfunction pingpong_trace_srs_pusch,
+	CUfunction pingpong_trace_no_srs,
+	CUfunction pingpong_no_trace_srs,
+	CUfunction pingpong_no_trace_srs_pusch,
+	CUfunction pingpong_no_trace_no_srs,
 	cudaStream_t stream,
 
 	struct doca_gpu_eth_rxq **doca_rxq,
@@ -5765,11 +5963,9 @@ int launch_order_kernel_doca_single_subSlot(
     uint8_t srs_enable
     )
     {
-	cudaError_t result = cudaSuccess;
 	int cudaBlocks = (num_order_cells); //# of Thread blocks should be twice the number of cells
 
     if(ul_order_kernel_mode == 0) {
-        // Ping-Pong mode
         order_kernel_pkt_tracing_info pkt_tracing_info = {
             .rx_packets_count = rx_packets_count,
             .rx_bytes_count = rx_bytes_count,
@@ -5780,282 +5976,137 @@ int launch_order_kernel_doca_single_subSlot(
             .rx_packets_ts = rx_packets_ts,
             .next_slot_rx_packets_ts = next_slot_rx_packets_ts,
         };
-        const bool is_test_bench = false;
-        if(ul_rx_pkt_tracing_level)
-        {
-            const uint8_t PKT_TRACE_LEVEL=1;
-            if(srs_enable==ORDER_KERNEL_SRS_ENABLE)
-            {
-                const uint8_t SRS_ENABLE=1;
-                MemtraceDisableScope md;
-                order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
-                    /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
-                    /* Cell specific */
-                    cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                    /* Timeout */
-                    timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,
-                    /* Time specific */
-                    frameId, subframeId, slotId,
-                    /* Order kernel specific */
-                    early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                    slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,pkt_tracing_info,rx_packets_dropped_count,
-                    /*sub-slot processing specific*/
-                    sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,pusch_prb_non_zero,
-                    /* PUSCH Output buffer specific */
-                    pusch_eAxC_map, pusch_eAxC_num,
-                    pusch_buffer, pusch_prb_x_slot,
-                    ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                    /* PRACH Output buffer specific */
-                    prach_eAxC_map, prach_eAxC_num,
-                    prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                    prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                    prach_prb_x_slot,
-                    ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,
-                    /* SRS Output buffer specific */
-                    srs_eAxC_map, srs_eAxC_num,
-                    srs_buffer, srs_prb_x_slot, ORAN_MAX_SRS_SYMBOLS, srs_prb_stride, srs_ordered_prbs, srs_start_sym,
-                    num_order_cells,
-                    /* PCAP Capture specific */
-                    pcap_buffer, pcap_buffer_ts, pcap_buffer_index, pcap_capture_enable, pcap_capture_cell_bitmask,
-                    /* Test bench values; not needed for non test bench calls */
-                    nullptr, max_pkt_size, nullptr);
-            } else if(srs_enable==ORDER_KERNEL_SRS_AND_PUSCH) {
-                const uint8_t SRS_ENABLE=ORDER_KERNEL_SRS_AND_PUSCH;
-                MemtraceDisableScope md;
-                order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
-                    /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
-                    /* Cell specific */
-                    cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                    /* Timeout */
-                    timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,
-                    /* Time specific */
-                    frameId, subframeId, slotId,
-                    /* Order kernel specific */
-                    early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                    slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,pkt_tracing_info,rx_packets_dropped_count,
-                    /*sub-slot processing specific*/
-                    sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,pusch_prb_non_zero,
-                    /* PUSCH Output buffer specific */
-                    pusch_eAxC_map, pusch_eAxC_num,
-                    pusch_buffer, pusch_prb_x_slot,
-                    ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                    /* PRACH Output buffer specific */
-                    prach_eAxC_map, prach_eAxC_num,
-                    prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                    prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                    prach_prb_x_slot,
-                    ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,
-                    /* SRS Output buffer specific */
-                    pusch_eAxC_map, pusch_eAxC_num,
-                    srs_buffer, srs_prb_x_slot, ORAN_MAX_SRS_SYMBOLS, srs_prb_stride, srs_ordered_prbs, srs_start_sym,
-                    num_order_cells,
-                    /* PCAP Capture specific */
-                    pcap_buffer, pcap_buffer_ts, pcap_buffer_index, pcap_capture_enable, pcap_capture_cell_bitmask,
-                    /* Test bench values; not needed for non test bench calls */
-                    nullptr, max_pkt_size, nullptr);
+
+        CUfunction pp_func{};
+        int pp_threads;
+        uint16_t** pp_srs_eAxC_map_arg = srs_eAxC_map;
+        int* pp_srs_eAxC_num_arg = srs_eAxC_num;
+
+        if(ul_rx_pkt_tracing_level) {
+            if(srs_enable == ORDER_KERNEL_SRS_ENABLE) {
+                pp_func = pingpong_trace_srs;
+                pp_threads = ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS;
+            } else if(srs_enable == ORDER_KERNEL_SRS_AND_PUSCH) {
+                pp_func = pingpong_trace_srs_pusch;
+                pp_threads = ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS;
+                pp_srs_eAxC_map_arg = pusch_eAxC_map;
+                pp_srs_eAxC_num_arg = pusch_eAxC_num;
+            } else {
+                pp_func = pingpong_trace_no_srs;
+                pp_threads = ORDER_KERNEL_PINGPONG_NUM_THREADS;
+                pp_srs_eAxC_map_arg = pusch_eAxC_map;
+                pp_srs_eAxC_num_arg = pusch_eAxC_num;
             }
-            else
-            {
-                const uint8_t SRS_ENABLE=0;
-                MemtraceDisableScope md;
-                order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_NUM_THREADS,2><<<cudaBlocks, ORDER_KERNEL_PINGPONG_NUM_THREADS, 0, stream>>>(
-                    /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
-                    /* Cell specific */
-                    cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                    /* Timeout */
-                    timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,
-                    /* Time specific */
-                    frameId, subframeId, slotId,
-                    /* Order kernel specific */
-                    early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                    slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,pkt_tracing_info,rx_packets_dropped_count,
-                    /*sub-slot processing specific*/
-                    sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,pusch_prb_non_zero,
-                    /* PUSCH Output buffer specific */
-                    pusch_eAxC_map, pusch_eAxC_num,
-                    pusch_buffer, pusch_prb_x_slot,
-                    ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                    /* PRACH Output buffer specific */
-                    prach_eAxC_map, prach_eAxC_num,
-                    prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                    prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                    prach_prb_x_slot,
-                    ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,
-                    /* SRS Output buffer specific */
-                    pusch_eAxC_map, pusch_eAxC_num,
-                    srs_buffer, srs_prb_x_slot, ORAN_MAX_SRS_SYMBOLS, srs_prb_stride, srs_ordered_prbs, srs_start_sym,
-                    num_order_cells,
-                    /* PCAP Capture specific */
-                    pcap_buffer, pcap_buffer_ts, pcap_buffer_index, pcap_capture_enable, pcap_capture_cell_bitmask,
-                    /* Test bench values; not needed for non test bench calls */
-                    nullptr, max_pkt_size, nullptr);
+        } else {
+            if(srs_enable == ORDER_KERNEL_SRS_ENABLE) {
+                pp_func = pingpong_no_trace_srs;
+                pp_threads = ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS;
+            } else if(srs_enable == ORDER_KERNEL_SRS_AND_PUSCH) {
+                pp_func = pingpong_no_trace_srs_pusch;
+                pp_threads = ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS;
+                pp_srs_eAxC_map_arg = pusch_eAxC_map;
+            } else {
+                pp_func = pingpong_no_trace_no_srs;
+                pp_threads = ORDER_KERNEL_PINGPONG_NUM_THREADS;
             }
         }
-        else
-        {
-            const uint8_t PKT_TRACE_LEVEL=0;
-            if(srs_enable==ORDER_KERNEL_SRS_ENABLE)
-            {
-                const uint8_t SRS_ENABLE=1;
-                MemtraceDisableScope md;
-                order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
-                    /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
-                    /* Cell specific */
-                    cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                    /* Timeout */
-                    timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,
-                    /* Time specific */
-                    frameId, subframeId, slotId,
-                    /* Order kernel specific */
-                    early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                    slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,pkt_tracing_info,rx_packets_dropped_count,
-                    /*sub-slot processing specific*/
-                    sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,pusch_prb_non_zero,
-                    /* PUSCH Output buffer specific */
-                    pusch_eAxC_map, pusch_eAxC_num,
-                    pusch_buffer, pusch_prb_x_slot,
-                    ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                    /* PRACH Output buffer specific */
-                    prach_eAxC_map, prach_eAxC_num,
-                    prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                    prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                    prach_prb_x_slot,
-                    ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,
-                    /* SRS Output buffer specific */
-                    srs_eAxC_map, srs_eAxC_num,
-                    srs_buffer, srs_prb_x_slot, ORAN_MAX_SRS_SYMBOLS, srs_prb_stride, srs_ordered_prbs, srs_start_sym,
-                    num_order_cells,
-                    /* PCAP Capture specific */
-                    pcap_buffer, pcap_buffer_ts, pcap_buffer_index, pcap_capture_enable, pcap_capture_cell_bitmask,
-                    /* Test bench values; not needed for non test bench calls */
-                    nullptr, max_pkt_size, nullptr);
-            } else if(srs_enable==ORDER_KERNEL_SRS_AND_PUSCH) {
-                const uint8_t SRS_ENABLE=ORDER_KERNEL_SRS_AND_PUSCH;
-                MemtraceDisableScope md;
-                order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
-                    /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
-                    /* Cell specific */
-                    cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                    /* Timeout */
-                    timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,
-                    /* Time specific */
-                    frameId, subframeId, slotId,
-                    /* Order kernel specific */
-                    early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                    slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,pkt_tracing_info,rx_packets_dropped_count,
-                    /*sub-slot processing specific*/
-                    sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,pusch_prb_non_zero,
-                    /* PUSCH Output buffer specific */
-                    pusch_eAxC_map, pusch_eAxC_num,
-                    pusch_buffer, pusch_prb_x_slot,
-                    ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                    /* PRACH Output buffer specific */
-                    prach_eAxC_map, prach_eAxC_num,
-                    prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                    prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                    prach_prb_x_slot,
-                    ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,
-                    /* SRS Output buffer specific */
-                    pusch_eAxC_map, srs_eAxC_num,
-                    srs_buffer, srs_prb_x_slot, ORAN_MAX_SRS_SYMBOLS, srs_prb_stride, srs_ordered_prbs, srs_start_sym,
-                    num_order_cells,
-                    /* PCAP Capture specific */
-                    pcap_buffer, pcap_buffer_ts, pcap_buffer_index, pcap_capture_enable, pcap_capture_cell_bitmask,
-                    /* Test bench values; not needed for non test bench calls */
-                    nullptr, max_pkt_size, nullptr);
-            }
-            else
-            {
-                const uint8_t SRS_ENABLE=0;
-                MemtraceDisableScope md;
-                order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_NUM_THREADS,2><<<cudaBlocks, ORDER_KERNEL_PINGPONG_NUM_THREADS, 0, stream>>>(
-                    /* DOCA objects */
-                    doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
-                    /* Cell specific */
-                    cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                    /* Timeout */
-                    timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,
-                    /* Time specific */
-                    frameId, subframeId, slotId,
-                    /* Order kernel specific */
-                    early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                    slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,pkt_tracing_info,rx_packets_dropped_count,
-                    /*sub-slot processing specific*/
-                    sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,pusch_prb_non_zero,
-                    /* PUSCH Output buffer specific */
-                    pusch_eAxC_map, pusch_eAxC_num,
-                    pusch_buffer, pusch_prb_x_slot,
-                    ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                    /* PRACH Output buffer specific */
-                    prach_eAxC_map, prach_eAxC_num,
-                    prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                    prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                    prach_prb_x_slot,
-                    ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,
-                    /* SRS Output buffer specific */
-                    srs_eAxC_map, srs_eAxC_num,
-                    srs_buffer, srs_prb_x_slot, ORAN_MAX_SRS_SYMBOLS, srs_prb_stride, srs_ordered_prbs, srs_start_sym,
-                    num_order_cells,
-                    /* PCAP Capture specific */
-                    pcap_buffer, pcap_buffer_ts, pcap_buffer_index, pcap_capture_enable, pcap_capture_cell_bitmask,
-                    /* Test bench values; not needed for non test bench calls */
-                    nullptr, max_pkt_size, nullptr);
-            }            
-        }        
+
+        int pusch_symbols_x_slot = ORAN_PUSCH_SYMBOLS_X_SLOT;
+        int prach_b4_symbols_x_slot = ORAN_PRACH_B4_SYMBOLS_X_SLOT;
+        int srs_symbols_x_slot = ORAN_MAX_SRS_SYMBOLS;
+        uint8_t** tb_fh_buf_null = nullptr;
+        uint32_t* rx_pkt_num_slot_null = nullptr;
+
+        void* pp_args[] = {
+            /* DOCA objects */
+            &doca_rxq, &sem_gpu, &sem_gpu_aerial_fh, &sem_order_num,
+            /* Cell specific */
+            &cell_id, &ru_type, &cell_health, &start_cuphy_d, &order_kernel_exit_cond_d, &last_sem_idx_rx_h, &last_sem_idx_order_h, &comp_meth, &bit_width, &beta, &prb_size,
+            /* Timeout */
+            &timeout_no_pkt_ns, &timeout_first_pkt_ns, &timeout_log_interval_ns, &timeout_log_enable, &max_rx_pkts, &rx_pkts_timeout_ns,
+            /* Time specific */
+            &frameId, &subframeId, &slotId,
+            /* Order kernel specific */
+            &early_rx_packets, &on_time_rx_packets, &late_rx_packets, &next_slot_early_rx_packets, &next_slot_on_time_rx_packets, &next_slot_late_rx_packets,
+            &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration, &order_kernel_last_timeout_error_time, &pkt_tracing_info, &rx_packets_dropped_count,
+            /* Sub-slot processing specific */
+            &sym_ord_done_sig_arr, &sym_ord_done_mask_arr, &pusch_prb_symbol_map, &num_order_cells_sym_mask_arr, &pusch_prb_non_zero,
+            /* PUSCH Output buffer specific */
+            &pusch_eAxC_map, &pusch_eAxC_num, &pusch_buffer, &pusch_prb_x_slot,
+            &pusch_symbols_x_slot, &pusch_prb_stride, &pusch_ordered_prbs,
+            /* PRACH Output buffer specific */
+            &prach_eAxC_map, &prach_eAxC_num,
+            &prach_buffer_0, &prach_buffer_1, &prach_buffer_2, &prach_buffer_3,
+            &prach_section_id_0, &prach_section_id_1, &prach_section_id_2, &prach_section_id_3,
+            &prach_prb_x_slot,
+            &prach_b4_symbols_x_slot, &prach_prb_stride, &prach_ordered_prbs,
+            /* SRS Output buffer specific */
+            &pp_srs_eAxC_map_arg, &pp_srs_eAxC_num_arg, &srs_buffer, &srs_prb_x_slot, &srs_symbols_x_slot, &srs_prb_stride, &srs_ordered_prbs, &srs_start_sym,
+            &num_order_cells,
+            /* PCAP Capture specific */
+            &pcap_buffer, &pcap_buffer_ts, &pcap_buffer_index, &pcap_capture_enable, &pcap_capture_cell_bitmask,
+            /* Test bench values */
+            &tb_fh_buf_null, &max_pkt_size, &rx_pkt_num_slot_null
+        };
+
+        MemtraceDisableScope md;
+        CUresult cuResult = cuLaunchKernel(pp_func,
+            cudaBlocks, 1, 1,
+            pp_threads, 1, 1,
+            0, stream,
+            pp_args, nullptr);
+        CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+        if(cuResult != CUDA_SUCCESS)
+            return -1;
     }
     else if(ul_order_kernel_mode == 1) {
         // Dual CTA mode
             // block 0 to receive, block 1 to process
         const int numThreads = (commViaCpu==true)?256:128;
-        order_kernel_doca_single_subSlot<<<cudaBlocks * 2, numThreads, 0, stream>>>(
-                                                    /* DOCA objects */
-                                                    doca_rxq, sem_gpu, sem_order_num,
-                                                    /* Cell specific */
-                                                    cell_id, ru_type, cell_health, start_cuphy_d, order_kernel_exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                                                    /* Timeout */
-                                                    timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,commViaCpu,
-                                                    /* Time specific */
-                                                    frameId, subframeId, slotId,
-                                                    /* Order kernel specific */
-                                                    barrier_flag, done_shared,
-                                                    early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                                                    slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,ul_rx_pkt_tracing_level,rx_packets_ts,rx_packets_count,rx_bytes_count,rx_packets_ts_earliest,rx_packets_ts_latest,next_slot_rx_packets_ts,next_slot_rx_packets_count,next_slot_rx_bytes_count,
-                                                    next_slot_num_prb_ch1,next_slot_num_prb_ch2,
-                                                    /*sub-slot processing specific*/
-                                                    sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,pusch_prb_non_zero,
-                                                    /* PUSCH Output buffer specific */
-                                                    pusch_eAxC_map, pusch_eAxC_num,
-                                                    pusch_buffer, pusch_prb_x_slot, pusch_prb_x_symbol, pusch_prb_x_symbol_x_antenna,
-                                                    ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                                                    /* PRACH Output buffer specific */
-                                                    prach_eAxC_map, prach_eAxC_num,
-                                                    prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                                                    prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                                                    prach_prb_x_slot, prach_prb_x_symbol, prach_prb_x_symbol_x_antenna,
-                                                    ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,num_order_cells,
-                                                    /* PCAP Capture specific */
-                                                    pcap_buffer, pcap_buffer_ts, pcap_buffer_index, pcap_capture_enable, pcap_capture_cell_bitmask, max_pkt_size
-                                                );        
+        int pusch_symbols_x_slot = ORAN_PUSCH_SYMBOLS_X_SLOT;
+        int prach_b4_symbols_x_slot = ORAN_PRACH_B4_SYMBOLS_X_SLOT;
+
+        void* args[] = {
+            &doca_rxq, &sem_gpu, &sem_order_num,
+            &cell_id, &ru_type, &cell_health, &start_cuphy_d, &order_kernel_exit_cond_d, &last_sem_idx_rx_h, &last_sem_idx_order_h, &comp_meth, &bit_width, &beta, &prb_size,
+            &timeout_no_pkt_ns, &timeout_first_pkt_ns, &timeout_log_interval_ns, &timeout_log_enable, &max_rx_pkts, &rx_pkts_timeout_ns, &commViaCpu,
+            &frameId, &subframeId, &slotId,
+            &barrier_flag, &done_shared,
+            &early_rx_packets, &on_time_rx_packets, &late_rx_packets, &next_slot_early_rx_packets, &next_slot_on_time_rx_packets, &next_slot_late_rx_packets,
+            &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration, &order_kernel_last_timeout_error_time, &ul_rx_pkt_tracing_level, &rx_packets_ts, &rx_packets_count, &rx_bytes_count, &rx_packets_ts_earliest, &rx_packets_ts_latest, &next_slot_rx_packets_ts, &next_slot_rx_packets_count, &next_slot_rx_bytes_count,
+            &next_slot_num_prb_ch1, &next_slot_num_prb_ch2,
+            &sym_ord_done_sig_arr, &sym_ord_done_mask_arr, &pusch_prb_symbol_map, &num_order_cells_sym_mask_arr, &pusch_prb_non_zero,
+            &pusch_eAxC_map, &pusch_eAxC_num,
+            &pusch_buffer, &pusch_prb_x_slot, &pusch_prb_x_symbol, &pusch_prb_x_symbol_x_antenna,
+            &pusch_symbols_x_slot, &pusch_prb_stride, &pusch_ordered_prbs,
+            &prach_eAxC_map, &prach_eAxC_num,
+            &prach_buffer_0, &prach_buffer_1, &prach_buffer_2, &prach_buffer_3,
+            &prach_section_id_0, &prach_section_id_1, &prach_section_id_2, &prach_section_id_3,
+            &prach_prb_x_slot, &prach_prb_x_symbol, &prach_prb_x_symbol_x_antenna,
+            &prach_b4_symbols_x_slot, &prach_prb_stride, &prach_ordered_prbs, &num_order_cells,
+            &pcap_buffer, &pcap_buffer_ts, &pcap_buffer_index, &pcap_capture_enable, &pcap_capture_cell_bitmask, &max_pkt_size
+        };
+
+        CUresult cuResult = cuLaunchKernel(func,
+            cudaBlocks * 2, 1, 1,
+            numThreads, 1, 1,
+            0, stream,
+            args, nullptr);
+        CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+        if(cuResult != CUDA_SUCCESS)
+            return -1;
     }
     else {
         NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT,"Invalid UL Order Kernel Mode: {}", ul_order_kernel_mode);
         return -1;
     }
 
-	result = cudaGetLastError();
-	if(cudaSuccess != result)
-	    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} \n", __FILE__, __LINE__, cudaGetErrorString(result));
-
 	return 0;
 }
 
     
 int launch_order_kernel_cpu_init_comms_single_subSlot(
+CUfunction func,
 cudaStream_t stream,
 
 uint32_t**             start_cuphy_d,
@@ -6136,36 +6187,44 @@ uint32_t**             prach_ordered_prbs,
 uint8_t num_order_cells
 )
 {
-	cudaError_t result = cudaSuccess;
 	int cudaBlocks = (num_order_cells); //# of Thread blocks should be equal to the num of cells
-	order_kernel_cpu_init_comms_single_subSlot<<<cudaBlocks,256, 0, stream>>>(
-                                                /* Cell specific */
-                                                start_cuphy_d, order_kernel_exit_cond_d,
-                                                /* Rx objects */
-                                                ready_list,rx_queue_sync_list,last_ordered_item_h,sem_order_num,                                                
-                                                /* Time specific */
-                                                frameId, subframeId, slotId,comp_meth, bit_width,prb_size,beta,barrier_flag,done_shared,
-                                                timeout_no_pkt_ns,timeout_first_pkt_ns,
-                                                /*sub-slot processing specific*/
-                                                sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,
-                                                /*Timer*/
-                                                early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                                                slot_start, ta4_min_ns, ta4_max_ns, slot_duration,ul_rx_pkt_tracing_level,rx_packets_ts,rx_packets_count,rx_bytes_count,rx_packets_ts_earliest,rx_packets_ts_latest,next_slot_rx_packets_ts,next_slot_rx_packets_count,next_slot_rx_bytes_count,                                                
-                                                /* PUSCH Output buffer specific */
-                                                pusch_eAxC_map, pusch_eAxC_num,
-                                                pusch_buffer, pusch_prb_x_slot, pusch_prb_x_symbol, pusch_prb_x_symbol_x_antenna,
-                                                ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_stride, pusch_ordered_prbs,
-                                                /* PRACH Output buffer specific */
-                                                prach_eAxC_map, prach_eAxC_num,
-                                                prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                                                prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                                                prach_prb_x_slot, prach_prb_x_symbol, prach_prb_x_symbol_x_antenna,
-                                                ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs,num_order_cells);
+	int pusch_symbols_x_slot = ORAN_PUSCH_SYMBOLS_X_SLOT;
+	int prach_b4_symbols_x_slot = ORAN_PRACH_B4_SYMBOLS_X_SLOT;
 
-	result = cudaGetLastError();
-	if(cudaSuccess != result)
-	    NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} \n", __FILE__, __LINE__, cudaGetErrorString(result));
-    
+	void* args[] = {
+	    /* Cell specific */
+	    &start_cuphy_d, &order_kernel_exit_cond_d,
+	    /* Rx objects */
+	    &ready_list, &rx_queue_sync_list, &last_ordered_item_h, &sem_order_num,
+	    /* Time specific */
+	    &frameId, &subframeId, &slotId, &comp_meth, &bit_width, &prb_size, &beta, &barrier_flag, &done_shared,
+	    &timeout_no_pkt_ns, &timeout_first_pkt_ns,
+	    /*sub-slot processing specific*/
+	    &sym_ord_done_sig_arr, &sym_ord_done_mask_arr, &pusch_prb_symbol_map, &num_order_cells_sym_mask_arr,
+	    /*Timer*/
+	    &early_rx_packets, &on_time_rx_packets, &late_rx_packets, &next_slot_early_rx_packets, &next_slot_on_time_rx_packets, &next_slot_late_rx_packets,
+	    &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration, &ul_rx_pkt_tracing_level, &rx_packets_ts, &rx_packets_count, &rx_bytes_count, &rx_packets_ts_earliest, &rx_packets_ts_latest, &next_slot_rx_packets_ts, &next_slot_rx_packets_count, &next_slot_rx_bytes_count,
+	    /* PUSCH Output buffer specific */
+	    &pusch_eAxC_map, &pusch_eAxC_num,
+	    &pusch_buffer, &pusch_prb_x_slot, &pusch_prb_x_symbol, &pusch_prb_x_symbol_x_antenna,
+	    &pusch_symbols_x_slot, &pusch_prb_stride, &pusch_ordered_prbs,
+	    /* PRACH Output buffer specific */
+	    &prach_eAxC_map, &prach_eAxC_num,
+	    &prach_buffer_0, &prach_buffer_1, &prach_buffer_2, &prach_buffer_3,
+	    &prach_section_id_0, &prach_section_id_1, &prach_section_id_2, &prach_section_id_3,
+	    &prach_prb_x_slot, &prach_prb_x_symbol, &prach_prb_x_symbol_x_antenna,
+	    &prach_b4_symbols_x_slot, &prach_prb_stride, &prach_ordered_prbs, &num_order_cells
+	};
+
+	CUresult cuResult = cuLaunchKernel(func,
+	    cudaBlocks, 1, 1,
+	    256, 1, 1,
+	    0, stream,
+	    args, nullptr);
+	CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+	if(cuResult != CUDA_SUCCESS)
+	    return -1;
+
     return 0;
 }
 
@@ -6342,6 +6401,18 @@ __global__ void kernel_order(
                         ORAN_PUSCH_PRBS_X_PORT_X_SYMBOL, // <--- per antenna
                         prb_size);
 
+                    // CWE-787: discard packets whose untrusted symbolId/startPrb/numPrb would
+                    // index past the antenna buffer (consumer skips entries with msg_addr==0).
+                    if(!ul_oran_offset_in_bounds((uint8_t*)msg_addr[threadIdx.x],
+                                                 (int)oran_umsg_get_start_prb((uint8_t*)msg_addr[threadIdx.x]),
+                                                 (int)msg_prb[threadIdx.x],
+                                                 ORAN_PUSCH_SYMBOLS_X_SLOT, ORAN_PUSCH_PRBS_X_PORT_X_SYMBOL))
+                    {
+                        msg_addr[threadIdx.x] = 0;
+                        msg_prb[threadIdx.x] = 0;
+                        gbuf_offset[threadIdx.x] = 0; // don't leave a stale OOB offset behind
+                    }
+
                     // if(gbuf_offset[threadIdx.x] == 0)
                     //     printf("Offset item %d pkt %d (addr %lx) cell %d pkt %d, flow index %d offset %d flow %d symbol %d startPrb %d numPrb %d\n",
                     //     rx_queue_index, threadIdx.x, msg_addr[threadIdx.x],
@@ -6435,6 +6506,7 @@ exit:
 }
 
 void launch_kernel_order(
+    CUfunction            func,
     cudaStream_t          stream,
     int                   fake_run,
     int                   cell_id,
@@ -6458,15 +6530,17 @@ void launch_kernel_order(
     int                   prb_size,
     float                 beta)
 {
-    cudaError_t result = cudaSuccess;
+    void* args[] = {
+        &fake_run, &cell_id, &order_kernel_end_cuphy_d, &order_completed_h,
+        &order_start_kernel_d, &ready_list, &rx_queue_sync_list, &last_ordered_item_h,
+        &buffer, &prb_x_slot, &prb_x_symbol, &prb_x_symbol_x_antenna,
+        &frameId, &subframeId, &slotId, &eAxC_map, &eAxC_num,
+        &comp_meth, &bit_width, &prb_size, &beta
+    };
 
-    //CUDA BLOCKS/THREADS per CELL
-    kernel_order<<<1, 512, 0, stream>>>(
-        fake_run, cell_id, order_kernel_end_cuphy_d, order_completed_h, order_start_kernel_d, ready_list, rx_queue_sync_list, last_ordered_item_h, buffer, prb_x_slot, prb_x_symbol, prb_x_symbol_x_antenna, frameId, subframeId, slotId, eAxC_map, eAxC_num, comp_meth, bit_width, prb_size, beta);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    CUresult res = cuLaunchKernel(func, 1, 1, 1, 512, 1, 1, 0, stream, args, nullptr);
+    if(CUDA_SUCCESS != res)
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuLaunchKernel failed for kernel_order with {} ", __FILE__, __LINE__, res);
 }
 
 
@@ -6615,6 +6689,19 @@ __device__ void populate_addrs_ch1(
                     symbol_id_pkt, packet_early_thres, packet_late_thres, rx_timestamp
                     );
                 */
+
+                // CWE-787: discard packets whose untrusted symbolId/startPrb/numPrb would
+                // index past the antenna buffer (consumer skips entries with msg_addr==0).
+                // Done after the timing bookkeeping above, which still needs msg_addr.
+                if(!ul_oran_offset_in_bounds((uint8_t*)msg_addr[threadIdx.x],
+                                             (int)oran_umsg_get_start_prb((uint8_t*)msg_addr[threadIdx.x]),
+                                             (int)msg_prb[threadIdx.x],
+                                             symbols_x_slot, prb_x_port_x_symbol))
+                {
+                    msg_addr[threadIdx.x] = 0;
+                    msg_prb[threadIdx.x] = 0;
+                    gbuf_offset[threadIdx.x] = 0; // don't leave a stale OOB offset behind
+                }
             }
         }
 
@@ -6732,6 +6819,18 @@ __device__ void populate_addrs_ch2(
                         (uint16_t)get_eaxc_index(ch1_eAxC_map, ch1_eAxC_num, flow_index),
                         symbols_x_slot_ch1, prb_x_port_x_symbol_ch1, prb_size_ch1);
 
+                    // CWE-787: discard packets whose untrusted symbolId/startPrb/numPrb would
+                    // index past the antenna buffer (consumer skips entries with msg_addr==0).
+                    if(!ul_oran_offset_in_bounds((uint8_t*)tmp_addr,
+                                                 (int)oran_umsg_get_start_prb((uint8_t*)tmp_addr),
+                                                 (int)msg_prb_ch1[threadIdx.x],
+                                                 symbols_x_slot_ch1, prb_x_port_x_symbol_ch1))
+                    {
+                        msg_addr_ch1[threadIdx.x] = 0;
+                        msg_prb_ch1[threadIdx.x] = 0;
+                        gbuf_offset_ch1[threadIdx.x] = 0; // don't leave a stale OOB offset behind
+                    }
+
                 }
                 //PRACH may have various section Id in case of multiple occasions
                 else //if(tmp_section_id == sectionId_ch2)
@@ -6746,6 +6845,18 @@ __device__ void populate_addrs_ch2(
                         (uint8_t*)tmp_addr,
                         (uint16_t)get_eaxc_index(ch2_eAxC_map, ch2_eAxC_num, flow_index),
                         symbols_x_slot_ch2, prb_x_port_x_symbol_ch2, prb_size_ch2);
+
+                    // CWE-787: discard packets whose untrusted symbolId/startPrb/numPrb would
+                    // index past the antenna buffer (consumer skips entries with msg_addr==0).
+                    if(!ul_oran_offset_in_bounds((uint8_t*)tmp_addr,
+                                                 (int)oran_umsg_get_start_prb((uint8_t*)tmp_addr),
+                                                 (int)msg_prb_ch2[threadIdx.x],
+                                                 symbols_x_slot_ch2, prb_x_port_x_symbol_ch2))
+                    {
+                        msg_addr_ch2[threadIdx.x] = 0;
+                        msg_prb_ch2[threadIdx.x] = 0;
+                        gbuf_offset_ch2[threadIdx.x] = 0; // don't leave a stale OOB offset behind
+                    }
                 }
 
                 uint64_t rx_timestamp       = rx_queue_sync_list[rx_queue_index].rx_timestamp[(ORDER_KERNEL_MAX_PKTS_BLOCK * blockIdx.x) + threadIdx.x];
@@ -7368,6 +7479,8 @@ exit:
 }
 
 int launch_kernel_order_mb(
+    CUfunction            func_one_ch,
+    CUfunction            func_two_ch,
     cudaStream_t          stream,
     int                   fake_run,
     int                   cell_id,
@@ -7421,8 +7534,6 @@ int launch_kernel_order_mb(
     uint32_t*             prach_ordered_prbs
 )
 {
-    cudaError_t result = cudaSuccess;
-
     if(
         (ST1_buffer == nullptr || ST1_prb_x_slot == 0) &&
         ((prach_buffer_o0 == nullptr && prach_buffer_o1 == nullptr && prach_buffer_o2 == nullptr && prach_buffer_o3 == nullptr) || prach_prb_x_slot == 0)
@@ -7435,114 +7546,138 @@ int launch_kernel_order_mb(
     )
         return EINVAL;
 
+    int pusch_symbols_x_slot = ORAN_PUSCH_SYMBOLS_X_SLOT;
+    int prach_b4_symbols_x_slot = ORAN_PRACH_B4_SYMBOLS_X_SLOT;
+
     // PUSCH only
     if(prach_buffer_o0 == nullptr && prach_buffer_o1 == nullptr && prach_buffer_o2 == nullptr && prach_buffer_o3 == nullptr)
     {
-        kernel_order_mb_one_ch<<<ORDER_KERNEL_MB, 512, 0, stream>>>(
+        uint8_t* null_buf = nullptr;
+        uint16_t zero_sec_id = 0;
+        int is_prach = 0;
+        void* args[] = {
             /* Cell specific */
-            cell_id, order_kernel_end_cuphy_d, order_start_kernel_d, ready_list, rx_queue_sync_list, last_ordered_item_h, comp_meth, bit_width, beta, prb_size,
+            &cell_id, &order_kernel_end_cuphy_d, &order_start_kernel_d, &ready_list, &rx_queue_sync_list, &last_ordered_item_h, &comp_meth, &bit_width, &beta, &prb_size,
             /* Timeout */
-            timeout_no_pkt_ns, timeout_first_pkt_ns,
+            &timeout_no_pkt_ns, &timeout_first_pkt_ns,
             /* Time specific */
-            frameId, subframeId, slotId,
+            &frameId, &subframeId, &slotId,
             /* Order kernel specific */
-            barrier_flag, done_shared, ready_shared, rx_queue_index,
-            early_rx_packets, on_time_rx_packets, late_rx_packets,
-            slot_start, ta4_min_ns, ta4_max_ns, slot_duration,
-            ST1_ordered_prbs,
+            &barrier_flag, &done_shared, &ready_shared, &rx_queue_index,
+            &early_rx_packets, &on_time_rx_packets, &late_rx_packets,
+            &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration,
+            &ST1_ordered_prbs,
             /* Output buffer specific */
-            ST1_eAxC_map, ST1_eAxC_num,
-            ST1_buffer, nullptr, nullptr, nullptr,
-            prach_section_id_o0,0,0,0,
-            ST1_prb_x_slot, ST1_prb_x_symbol, ST1_prb_x_symbol_x_antenna,
-            ORAN_PUSCH_SYMBOLS_X_SLOT, ST1_prb_stride, 0);
+            &ST1_eAxC_map, &ST1_eAxC_num,
+            &ST1_buffer, &null_buf, &null_buf, &null_buf,
+            &prach_section_id_o0, &zero_sec_id, &zero_sec_id, &zero_sec_id,
+            &ST1_prb_x_slot, &ST1_prb_x_symbol, &ST1_prb_x_symbol_x_antenna,
+            &pusch_symbols_x_slot, &ST1_prb_stride, &is_prach
+        };
+        CUresult cuResult = cuLaunchKernel(func_one_ch,
+            ORDER_KERNEL_MB, 1, 1,
+            512, 1, 1,
+            0, stream,
+            args, nullptr);
+        CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+        if(cuResult != CUDA_SUCCESS)
+            return -1;
     }
     // PRACH only
     else if(ST1_buffer == nullptr)
     {
-        kernel_order_mb_one_ch<<<ORDER_KERNEL_MB, 512, 0, stream>>>(
+        int is_prach = 1;
+        void* args[] = {
             /* Cell specific */
-            cell_id, order_kernel_end_cuphy_d, order_start_kernel_d, ready_list, rx_queue_sync_list, last_ordered_item_h, comp_meth, bit_width, beta, prb_size,
+            &cell_id, &order_kernel_end_cuphy_d, &order_start_kernel_d, &ready_list, &rx_queue_sync_list, &last_ordered_item_h, &comp_meth, &bit_width, &beta, &prb_size,
             /* Timeout */
-            timeout_no_pkt_ns, timeout_first_pkt_ns,
+            &timeout_no_pkt_ns, &timeout_first_pkt_ns,
             /* Time specific */
-            frameId, subframeId, slotId,
+            &frameId, &subframeId, &slotId,
             /* Order kernel specific */
-            barrier_flag, done_shared, ready_shared, rx_queue_index,
-            early_rx_packets, on_time_rx_packets, late_rx_packets,
-            slot_start, ta4_min_ns, ta4_max_ns, slot_duration,
-            prach_ordered_prbs,
+            &barrier_flag, &done_shared, &ready_shared, &rx_queue_index,
+            &early_rx_packets, &on_time_rx_packets, &late_rx_packets,
+            &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration,
+            &prach_ordered_prbs,
             /* Output buffer specific */
-            prach_eAxC_map, prach_eAxC_num,
-            prach_buffer_o0, prach_buffer_o1, prach_buffer_o2, prach_buffer_o3,
-            prach_section_id_o0, prach_section_id_o1, prach_section_id_o2, prach_section_id_o3,
-            prach_prb_x_slot, prach_prb_x_symbol, prach_prb_x_symbol_x_antenna,
-            ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, 1);
+            &prach_eAxC_map, &prach_eAxC_num,
+            &prach_buffer_o0, &prach_buffer_o1, &prach_buffer_o2, &prach_buffer_o3,
+            &prach_section_id_o0, &prach_section_id_o1, &prach_section_id_o2, &prach_section_id_o3,
+            &prach_prb_x_slot, &prach_prb_x_symbol, &prach_prb_x_symbol_x_antenna,
+            &prach_b4_symbols_x_slot, &prach_prb_stride, &is_prach
+        };
+        CUresult cuResult = cuLaunchKernel(func_one_ch,
+            ORDER_KERNEL_MB, 1, 1,
+            512, 1, 1,
+            0, stream,
+            args, nullptr);
+        CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+        if(cuResult != CUDA_SUCCESS)
+            return -1;
     }
     // PUSCH + PRACH
     else
     {
-        kernel_order_mb_two_ch<<<ORDER_KERNEL_MB, 512, 0, stream>>>(
+        void* args[] = {
             /* Cell specific */
-            cell_id, order_kernel_end_cuphy_d, order_start_kernel_d, ready_list, rx_queue_sync_list, last_ordered_item_h, comp_meth, bit_width, beta, prb_size,
+            &cell_id, &order_kernel_end_cuphy_d, &order_start_kernel_d, &ready_list, &rx_queue_sync_list, &last_ordered_item_h, &comp_meth, &bit_width, &beta, &prb_size,
             /* Timeout */
-            timeout_no_pkt_ns, timeout_first_pkt_ns,
+            &timeout_no_pkt_ns, &timeout_first_pkt_ns,
             /* Time specific */
-            frameId, subframeId, slotId,
+            &frameId, &subframeId, &slotId,
             /* Order kernel specific */
-            barrier_flag, done_shared, ready_shared, rx_queue_index,
-            early_rx_packets, on_time_rx_packets, late_rx_packets,
-            slot_start, ta4_min_ns, ta4_max_ns, slot_duration,
+            &barrier_flag, &done_shared, &ready_shared, &rx_queue_index,
+            &early_rx_packets, &on_time_rx_packets, &late_rx_packets,
+            &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration,
             /* PUSCH Output buffer specific */
-            ST1_eAxC_map, ST1_eAxC_num,
-            ST1_buffer, ST1_prb_x_slot, ST1_prb_x_symbol, ST1_prb_x_symbol_x_antenna,
-            ORAN_PUSCH_SYMBOLS_X_SLOT, ST1_prb_stride, ST1_ordered_prbs,
+            &ST1_eAxC_map, &ST1_eAxC_num,
+            &ST1_buffer, &ST1_prb_x_slot, &ST1_prb_x_symbol, &ST1_prb_x_symbol_x_antenna,
+            &pusch_symbols_x_slot, &ST1_prb_stride, &ST1_ordered_prbs,
             /* PRACH Output buffer specific */
-            prach_eAxC_map, prach_eAxC_num,
-            prach_buffer_o0, prach_buffer_o1, prach_buffer_o2, prach_buffer_o3,
-            prach_section_id_o0, prach_section_id_o1, prach_section_id_o2, prach_section_id_o3,
-
-            prach_prb_x_slot, prach_prb_x_symbol, prach_prb_x_symbol_x_antenna,
-            ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_stride, prach_ordered_prbs);
+            &prach_eAxC_map, &prach_eAxC_num,
+            &prach_buffer_o0, &prach_buffer_o1, &prach_buffer_o2, &prach_buffer_o3,
+            &prach_section_id_o0, &prach_section_id_o1, &prach_section_id_o2, &prach_section_id_o3,
+            &prach_prb_x_slot, &prach_prb_x_symbol, &prach_prb_x_symbol_x_antenna,
+            &prach_b4_symbols_x_slot, &prach_prb_stride, &prach_ordered_prbs
+        };
+        CUresult cuResult = cuLaunchKernel(func_two_ch,
+            ORDER_KERNEL_MB, 1, 1,
+            512, 1, 1,
+            0, stream,
+            args, nullptr);
+        CUDA_DRIVER_CHECK_NON_FATAL(cuResult);
+        if(cuResult != CUDA_SUCCESS)
+            return -1;
     }
-
-
-
-#if 0
-    kernel_order<<<1, 512, 0, stream>>>(
-        fake_run, cell_id, order_kernel_end_cuphy_d, order_completed_h, order_start_kernel_d, ready_list, rx_queue_sync_list, last_ordered_item_h, ST1_buffer, ST1_prb_x_slot, ST1_prb_x_symbol, ST1_prb_x_symbol_x_antenna, frameId, subframeId, slotId, eAxC_map, eAxC_num, comp_meth, bit_width, prb_size, beta);
-
-#endif
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
 
     return 0;
 }
 
 void launch_receive_process_kernel_for_test_bench(
+    CUfunction tb_pingpong_srs_func,
+    CUfunction tb_pingpong_no_srs_func,
+    CUfunction recv_process_func,
     cudaStream_t stream,
 	/* Cell */
-	const int*		cell_id,
+	int*		cell_id,
 	uint32_t		**exit_cond_d,
-    const uint16_t* sem_order_num,
-    const int*		ru_type,
+    uint16_t* sem_order_num,
+    int*		ru_type,
 
 	/* ORAN */
-	const uint8_t		frameId,
-	const uint8_t		subframeId,
-	const uint8_t		slotId,
+	uint8_t		frameId,
+	uint8_t		subframeId,
+	uint8_t		slotId,
 
-    const int		prb_size,
-    const int*		comp_meth,
-    const int*		bit_width,
-    const float*		beta,
+    int		prb_size,
+    int*		comp_meth,
+    int*		bit_width,
+    float*		beta,
     uint32_t		**last_sem_idx_order_h,
     
     uint32_t*       rx_pkt_num_slot,
     uint8_t**       tb_fh_buf,
-    const uint32_t  max_pkt_size,
+    uint32_t  max_pkt_size,
 
     /* Timer */
     uint32_t         **early_rx_packets,
@@ -7597,16 +7732,16 @@ void launch_receive_process_kernel_for_test_bench(
     uint8_t*          srs_start_sym,
 
     /*Receive CTA params*/
-    const uint32_t	timeout_no_pkt_ns,
-    const uint32_t	timeout_first_pkt_ns,
-	const uint32_t  timeout_log_interval_ns,
-	const uint8_t   timeout_log_enable,
+    uint32_t	timeout_no_pkt_ns,
+    uint32_t	timeout_first_pkt_ns,
+	uint32_t  timeout_log_interval_ns,
+	uint8_t   timeout_log_enable,
     uint64_t      **order_kernel_last_timeout_error_time,
     uint32_t		**last_sem_idx_rx_h,
     bool            commViaCpu,
     struct doca_gpu_eth_rxq **doca_rxq,
-    const uint32_t  max_rx_pkts,
-    const uint32_t  rx_pkts_timeout_ns,
+    uint32_t  max_rx_pkts,
+    uint32_t  rx_pkts_timeout_ns,
     struct doca_gpu_semaphore_gpu **sem_gpu,
     struct aerial_fh_gpu_semaphore_gpu **sem_gpu_aerial_fh,
 	uint64_t*		slot_start,
@@ -7618,17 +7753,11 @@ void launch_receive_process_kernel_for_test_bench(
     uint8_t                enable_srs
 )
 {
-	cudaError_t result = cudaSuccess;
-	int cudaBlocks = (num_order_cells); 
+	int cudaBlocks = (num_order_cells);
 
     if(ul_order_kernel_mode == 0) {
-        // Ping-Pong mode
         // The pingpong kernel is currently disabled in the test bench due to several missing buffers (e.g., packet
         // stat buffers).
-        const bool is_test_bench = true;
-        const uint8_t PKT_TRACE_LEVEL = 0;
-
-        // These are only needed when PKT_TRACE_LEVEL != 0
         order_kernel_pkt_tracing_info pkt_tracing_info = {
             .rx_packets_count = nullptr,
             .rx_bytes_count = nullptr,
@@ -7640,192 +7769,192 @@ void launch_receive_process_kernel_for_test_bench(
             .next_slot_rx_packets_ts = nullptr,
         };
 
+        CUfunction pp_func;
+        int pp_threads;
+        uint8_t pusch_prb_non_zero;
+
         if(enable_srs)
         {
-            const bool SRS_ENABLE = 1;
-            MemtraceDisableScope md;
-            order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS,1><<<cudaBlocks, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 0, stream>>>(
-                /* DOCA objects */
-                doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
-                /* Cell specific */
-                cell_id, ru_type, cell_health, start_cuphy_d, exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                /* Timeout */
-                timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,
-                /* Time specific */
-                frameId, subframeId, slotId,
-                /* Order kernel specific */
-                early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,pkt_tracing_info,rx_packets_dropped_count,
-                /*sub-slot processing specific*/
-                sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,0,
-                /* PUSCH Output buffer specific */
-                pusch_eAxC_map, pusch_eAxC_num,
-                pusch_buffer, pusch_prb_x_slot,
-                ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_x_port_x_symbol, pusch_ordered_prbs,
-                /* PRACH Output buffer specific */
-                prach_eAxC_map, prach_eAxC_num,
-                prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                prach_prb_x_slot,
-                ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_x_port_x_symbol, prach_ordered_prbs,
-                /* SRS Output buffer specific */
-                srs_eAxC_map, srs_eAxC_num,
-                srs_buffer, srs_prb_x_slot, ORAN_MAX_SRS_SYMBOLS, srs_prb_stride, srs_ordered_prbs, srs_start_sym,
-                num_order_cells,
-                /* PCAP Capture specific */
-                nullptr, nullptr, nullptr, 0, 0,
-                /* Test bench values; not needed for non test bench calls */
-                tb_fh_buf, max_pkt_size, rx_pkt_num_slot);
+            pp_func = tb_pingpong_srs_func;
+            pp_threads = ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS;
+            pusch_prb_non_zero = 0;
         }
         else
         {
-            const bool SRS_ENABLE = 0;
-            MemtraceDisableScope md;
-            order_kernel_doca_single_subSlot_pingpong<is_test_bench, PKT_TRACE_LEVEL,SRS_ENABLE,ORDER_KERNEL_PINGPONG_NUM_THREADS,2><<<cudaBlocks, ORDER_KERNEL_PINGPONG_NUM_THREADS, 0, stream>>>(
-                /* DOCA objects */
-                doca_rxq, sem_gpu, sem_gpu_aerial_fh, sem_order_num,
-                /* Cell specific */
-                cell_id, ru_type, cell_health, start_cuphy_d, exit_cond_d, last_sem_idx_rx_h, last_sem_idx_order_h, comp_meth, bit_width, beta, prb_size,
-                /* Timeout */
-                timeout_no_pkt_ns, timeout_first_pkt_ns,timeout_log_interval_ns,timeout_log_enable,max_rx_pkts,rx_pkts_timeout_ns,
-                /* Time specific */
-                frameId, subframeId, slotId,
-                /* Order kernel specific */
-                early_rx_packets, on_time_rx_packets, late_rx_packets,next_slot_early_rx_packets,next_slot_on_time_rx_packets,next_slot_late_rx_packets,
-                slot_start, ta4_min_ns, ta4_max_ns, slot_duration,order_kernel_last_timeout_error_time,pkt_tracing_info,rx_packets_dropped_count,
-                /*sub-slot processing specific*/
-                sym_ord_done_sig_arr,sym_ord_done_mask_arr,pusch_prb_symbol_map,num_order_cells_sym_mask_arr,1,
-                /* PUSCH Output buffer specific */
-                pusch_eAxC_map, pusch_eAxC_num,
-                pusch_buffer, pusch_prb_x_slot,
-                ORAN_PUSCH_SYMBOLS_X_SLOT, pusch_prb_x_port_x_symbol, pusch_ordered_prbs,
-                /* PRACH Output buffer specific */
-                prach_eAxC_map, prach_eAxC_num,
-                prach_buffer_0, prach_buffer_1, prach_buffer_2, prach_buffer_3,
-                prach_section_id_0, prach_section_id_1, prach_section_id_2, prach_section_id_3,
-                prach_prb_x_slot,
-                ORAN_PRACH_B4_SYMBOLS_X_SLOT, prach_prb_x_port_x_symbol, prach_ordered_prbs,
-                /* SRS Output buffer specific */
-                srs_eAxC_map, srs_eAxC_num,
-                srs_buffer, srs_prb_x_slot, ORAN_MAX_SRS_SYMBOLS, srs_prb_stride, srs_ordered_prbs, srs_start_sym,
-                num_order_cells,
-                /* PCAP Capture specific, not needed for non test bench calls */
-                nullptr, nullptr, nullptr, 0, 0,
-                /* Test bench values; not needed for non test bench calls */
-                tb_fh_buf, max_pkt_size, rx_pkt_num_slot);            
+            pp_func = tb_pingpong_no_srs_func;
+            pp_threads = ORDER_KERNEL_PINGPONG_NUM_THREADS;
+            pusch_prb_non_zero = 1;
         }
+
+        int pusch_sym_x_slot = ORAN_PUSCH_SYMBOLS_X_SLOT;
+        int prach_b4_symbols_x_slot = ORAN_PRACH_B4_SYMBOLS_X_SLOT;
+        int srs_symbols_x_slot = ORAN_MAX_SRS_SYMBOLS;
+        uint8_t* pcap_buffer_null = nullptr;
+        uint8_t* pcap_buffer_ts_null = nullptr;
+        uint32_t* pcap_buffer_index_null = nullptr;
+        uint8_t pcap_capture_enable = 0;
+        uint64_t pcap_capture_cell_bitmask = 0;
+
+        void* pp_args[] = {
+            /* DOCA objects */
+            &doca_rxq, &sem_gpu, &sem_gpu_aerial_fh, &sem_order_num,
+            /* Cell specific */
+            &cell_id, &ru_type, &cell_health, &start_cuphy_d, &exit_cond_d, &last_sem_idx_rx_h, &last_sem_idx_order_h, &comp_meth, &bit_width, &beta, &prb_size,
+            /* Timeout */
+            &timeout_no_pkt_ns, &timeout_first_pkt_ns, &timeout_log_interval_ns, &timeout_log_enable, &max_rx_pkts, &rx_pkts_timeout_ns,
+            /* Time specific */
+            &frameId, &subframeId, &slotId,
+            /* Order kernel specific */
+            &early_rx_packets, &on_time_rx_packets, &late_rx_packets, &next_slot_early_rx_packets, &next_slot_on_time_rx_packets, &next_slot_late_rx_packets,
+            &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration, &order_kernel_last_timeout_error_time, &pkt_tracing_info, &rx_packets_dropped_count,
+            /* Sub-slot processing specific */
+            &sym_ord_done_sig_arr, &sym_ord_done_mask_arr, &pusch_prb_symbol_map, &num_order_cells_sym_mask_arr, &pusch_prb_non_zero,
+            /* PUSCH Output buffer specific */
+            &pusch_eAxC_map, &pusch_eAxC_num, &pusch_buffer, &pusch_prb_x_slot,
+            &pusch_sym_x_slot, &pusch_prb_x_port_x_symbol, &pusch_ordered_prbs,
+            /* PRACH Output buffer specific */
+            &prach_eAxC_map, &prach_eAxC_num,
+            &prach_buffer_0, &prach_buffer_1, &prach_buffer_2, &prach_buffer_3,
+            &prach_section_id_0, &prach_section_id_1, &prach_section_id_2, &prach_section_id_3,
+            &prach_prb_x_slot,
+            &prach_b4_symbols_x_slot, &prach_prb_x_port_x_symbol, &prach_ordered_prbs,
+            /* SRS Output buffer specific */
+            &srs_eAxC_map, &srs_eAxC_num, &srs_buffer, &srs_prb_x_slot, &srs_symbols_x_slot, &srs_prb_stride, &srs_ordered_prbs, &srs_start_sym,
+            &num_order_cells,
+            /* PCAP Capture specific */
+            &pcap_buffer_null, &pcap_buffer_ts_null, &pcap_buffer_index_null, &pcap_capture_enable, &pcap_capture_cell_bitmask,
+            /* Test bench values */
+            &tb_fh_buf, &max_pkt_size, &rx_pkt_num_slot
+        };
+
+        MemtraceDisableScope md;
+        CUresult cuResult = cuLaunchKernel(pp_func,
+            cudaBlocks, 1, 1,
+            pp_threads, 1, 1,
+            0, stream,
+            pp_args, nullptr);
+        CUDA_DRIVER_CHECK(cuResult);
     }
     else {
         // Dual CTA mode
+        // block 0 to receive, block 1 to process
         int numThreads = 128;
-        receive_process_kernel_for_test_bench<<<cudaBlocks*2, numThreads, 0, stream>>>(
+
+        void* args[] = {
             /* Cell */
-            cell_id,
-            exit_cond_d,
-            sem_order_num,
-            ru_type,
-        
+            &cell_id, &exit_cond_d, &sem_order_num, &ru_type,
             /* ORAN */
-            frameId,
-            subframeId,
-            slotId,
-        
-            prb_size,
-            comp_meth,
-            bit_width,
-            beta,
-            last_sem_idx_order_h,
-            
-            rx_pkt_num_slot,
-            tb_fh_buf,
-            max_pkt_size,
-        
-        
-            /* Sub-slot processing*/
-            sym_ord_done_sig_arr,
-            sym_ord_done_mask_arr,
-            pusch_prb_symbol_map,
-            num_order_cells_sym_mask_arr,    
-            
-            /*PUSCH*/
-            pusch_buffer,
-            pusch_eAxC_map,
-            pusch_eAxC_num,    
-            pusch_symbols_x_slot,
-            pusch_prb_x_port_x_symbol,
-            pusch_ordered_prbs,
-            pusch_prb_x_slot,
-        
-            /*PRACH*/
-            prach_eAxC_map,
-            prach_eAxC_num,
-            prach_buffer_0,
-            prach_buffer_1,
-            prach_buffer_2,
-            prach_buffer_3,
-            prach_prb_x_slot,
-            prach_symbols_x_slot,
-            prach_prb_x_port_x_symbol,
-            prach_ordered_prbs,
-            prach_section_id_0,
-            prach_section_id_1,
-            prach_section_id_2,
-            prach_section_id_3,
+            &frameId, &subframeId, &slotId,
+            &prb_size, &comp_meth, &bit_width, &beta, &last_sem_idx_order_h,
+            &rx_pkt_num_slot, &tb_fh_buf, &max_pkt_size,
+            /* Sub-slot processing */
+            &sym_ord_done_sig_arr, &sym_ord_done_mask_arr, &pusch_prb_symbol_map, &num_order_cells_sym_mask_arr,
+            /* PUSCH */
+            &pusch_buffer, &pusch_eAxC_map, &pusch_eAxC_num, &pusch_symbols_x_slot,
+            &pusch_prb_x_port_x_symbol, &pusch_ordered_prbs, &pusch_prb_x_slot,
+            /* PRACH */
+            &prach_eAxC_map, &prach_eAxC_num,
+            &prach_buffer_0, &prach_buffer_1, &prach_buffer_2, &prach_buffer_3,
+            &prach_prb_x_slot, &prach_symbols_x_slot, &prach_prb_x_port_x_symbol, &prach_ordered_prbs,
+            &prach_section_id_0, &prach_section_id_1, &prach_section_id_2, &prach_section_id_3,
+            /* Receive CTA params */
+            &timeout_no_pkt_ns, &timeout_first_pkt_ns, &timeout_log_interval_ns, &timeout_log_enable,
+            &order_kernel_last_timeout_error_time, &last_sem_idx_rx_h, &commViaCpu,
+            &doca_rxq, &max_rx_pkts, &rx_pkts_timeout_ns, &sem_gpu,
+            &slot_start, &ta4_min_ns, &ta4_max_ns, &slot_duration,
+            &ul_rx_pkt_tracing_level
+        };
 
-            /*Receive CTA params*/
-            timeout_no_pkt_ns,
-            timeout_first_pkt_ns,
-            timeout_log_interval_ns,
-            timeout_log_enable,
-            order_kernel_last_timeout_error_time,
-            last_sem_idx_rx_h,
-            commViaCpu,
-            doca_rxq,
-            max_rx_pkts,
-            rx_pkts_timeout_ns,
-            sem_gpu,
-            slot_start,
-            ta4_min_ns,
-            ta4_max_ns,
-            slot_duration,
-            ul_rx_pkt_tracing_level
-        );
+        CUresult cuResult = cuLaunchKernel(recv_process_func,
+            cudaBlocks * 2, 1, 1,
+            numThreads, 1, 1,
+            0, stream,
+            args, nullptr);
+        CUDA_DRIVER_CHECK(cuResult);
     }
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
-    
-    return;
-}
-
-void force_loading_order_kernels()
-{
-    // the array below does not include the templated order_kernel_doca_single_subSlot_pingpong kernel; will skip mem. allocation tracing in its calling sites instead
-    std::array order_kernels{
-     (void*)order_kernel_doca,
-     (void*)order_kernel_doca_single,
-     (void*)receive_kernel_for_test_bench,
-     (void*)receive_process_kernel_for_test_bench,
-     (void*)order_kernel_doca_single_subSlot,
-     (void*)order_kernel_cpu_init_comms_single_subSlot,
-     (void*)order_kernel_doca_single_srs,
-     (void*)kernel_order,
-     (void*)kernel_order_mb_one_ch,
-     (void*)kernel_order_mb_two_ch};
-
-     for (int i=0; i < order_kernels.size(); i++)
-     {
-         cudaFuncAttributes attr;
-         cudaError_t e = cudaFuncGetAttributes(&attr, order_kernels[i]);
-         if(cudaSuccess != e)
-         {
-             NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cudaFuncGetAttributes call failed with {} ", __FILE__, __LINE__, cudaGetErrorString(e));
-         }
-     }
 }
 
 #ifdef __cplusplus
 }
 #endif
 
+#include "cuda_driver_utils/cuda_kernel_utils.cuh"
+
+bool init_order_kernel_functions(OrderKernelFunctions& funcs)
+{
+    bool ok = true;
+    ok &= resolve_kernel_func<TAG>(&funcs.order_kernel_doca,                        reinterpret_cast<void*>(order_kernel_doca),                        "order_kernel_doca");
+    ok &= resolve_kernel_func<TAG>(&funcs.order_kernel_doca_single,                 reinterpret_cast<void*>(order_kernel_doca_single),                 "order_kernel_doca_single");
+    ok &= resolve_kernel_func<TAG>(&funcs.order_kernel_doca_single_srs,             reinterpret_cast<void*>(order_kernel_doca_single_srs),             "order_kernel_doca_single_srs");
+    ok &= resolve_kernel_func<TAG>(&funcs.order_kernel_doca_single_subSlot,         reinterpret_cast<void*>(order_kernel_doca_single_subSlot),         "order_kernel_doca_single_subSlot");
+    ok &= resolve_kernel_func<TAG>(&funcs.order_kernel_cpu_init_comms_single_subSlot, reinterpret_cast<void*>(order_kernel_cpu_init_comms_single_subSlot), "order_kernel_cpu_init_comms_single_subSlot");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_order_mb_one_ch,                   reinterpret_cast<void*>(kernel_order_mb_one_ch),                   "kernel_order_mb_one_ch");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_order_mb_two_ch,                   reinterpret_cast<void*>(kernel_order_mb_two_ch),                   "kernel_order_mb_two_ch");
+    ok &= resolve_kernel_func<TAG>(&funcs.receive_kernel_for_test_bench,            reinterpret_cast<void*>(receive_kernel_for_test_bench),            "receive_kernel_for_test_bench");
+    ok &= resolve_kernel_func<TAG>(&funcs.receive_process_kernel_for_test_bench,    reinterpret_cast<void*>(receive_process_kernel_for_test_bench),    "receive_process_kernel_for_test_bench");
+
+    // Ping-pong kernel instantiations: <is_test_bench, pkt_trace, srs_enable, threads, ctas>
+    ok &= resolve_kernel_func<TAG>(&funcs.pingpong_trace_srs,
+        reinterpret_cast<void*>(&order_kernel_doca_single_subSlot_pingpong<false, 1, 1, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 1>),
+        "pingpong<false,1,1,SRS_THREADS,1>");
+    ok &= resolve_kernel_func<TAG>(&funcs.pingpong_trace_srs_pusch,
+        reinterpret_cast<void*>(&order_kernel_doca_single_subSlot_pingpong<false, 1, 3, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 1>),
+        "pingpong<false,1,3,SRS_THREADS,1>");
+    ok &= resolve_kernel_func<TAG>(&funcs.pingpong_trace_no_srs,
+        reinterpret_cast<void*>(&order_kernel_doca_single_subSlot_pingpong<false, 1, 0, ORDER_KERNEL_PINGPONG_NUM_THREADS, 2>),
+        "pingpong<false,1,0,THREADS,2>");
+    ok &= resolve_kernel_func<TAG>(&funcs.pingpong_no_trace_srs,
+        reinterpret_cast<void*>(&order_kernel_doca_single_subSlot_pingpong<false, 0, 1, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 1>),
+        "pingpong<false,0,1,SRS_THREADS,1>");
+    ok &= resolve_kernel_func<TAG>(&funcs.pingpong_no_trace_srs_pusch,
+        reinterpret_cast<void*>(&order_kernel_doca_single_subSlot_pingpong<false, 0, 3, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 1>),
+        "pingpong<false,0,3,SRS_THREADS,1>");
+    ok &= resolve_kernel_func<TAG>(&funcs.pingpong_no_trace_no_srs,
+        reinterpret_cast<void*>(&order_kernel_doca_single_subSlot_pingpong<false, 0, 0, ORDER_KERNEL_PINGPONG_NUM_THREADS, 2>),
+        "pingpong<false,0,0,THREADS,2>");
+
+    ok &= resolve_kernel_func<TAG>(&funcs.order_kernel_printf_warmup,
+        reinterpret_cast<void*>(order_kernel_printf_warmup), "order_kernel_printf_warmup");
+
+    return ok;
+}
+
+extern "C" void launch_order_kernel_printf_warmup(CUfunction func, cudaStream_t stream)
+{
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, stream, nullptr, nullptr));
+}
+
+bool resolve_kernel_order_handle(CUfunction* out)
+{
+    return resolve_kernel_func<TAG>(out, reinterpret_cast<void*>(kernel_order), "kernel_order");
+}
+
+bool init_order_kernel_tb_functions(OrderKernelTbFunctions& funcs)
+{
+    bool ok = true;
+
+    cudaError_t e = cudaGetFuncBySymbol(&funcs.tb_pingpong_srs,
+        reinterpret_cast<void*>(&order_kernel_doca_single_subSlot_pingpong<true, 0, 1, ORDER_KERNEL_PINGPONG_SRS_NUM_THREADS, 1>));
+    if(cudaSuccess != e)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cudaGetFuncBySymbol failed for tb_pingpong<true,0,1,1024,1>: {}", __FILE__, __LINE__, cudaGetErrorString(e));
+        ok = false;
+    }
+
+    e = cudaGetFuncBySymbol(&funcs.tb_pingpong_no_srs,
+        reinterpret_cast<void*>(&order_kernel_doca_single_subSlot_pingpong<true, 0, 0, ORDER_KERNEL_PINGPONG_NUM_THREADS, 2>));
+    if(cudaSuccess != e)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cudaGetFuncBySymbol failed for tb_pingpong<true,0,0,320,2>: {}", __FILE__, __LINE__, cudaGetErrorString(e));
+        ok = false;
+    }
+
+    e = cudaGetFuncBySymbol(&funcs.recv_process, reinterpret_cast<void*>(receive_process_kernel_for_test_bench));
+    if(cudaSuccess != e)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cudaGetFuncBySymbol failed for receive_process_kernel_for_test_bench: {}", __FILE__, __LINE__, cudaGetErrorString(e));
+        ok = false;
+    }
+
+    return ok;
+}

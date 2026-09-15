@@ -106,7 +106,11 @@ int main(int argc, char** argv) {
 		std::printf("e3agent-standalone: replay on ports %u/%u/%u, path=%s\n",
 			cfg.agent.rep_port, cfg.agent.pub_port, cfg.agent.sub_port, cfg.replay.path.c_str());
 		e3sa::Replay replay(dl, agent, cfg.replay, cfg.cpu, cfg.rows);
-		replay.run(g_stop);
+		if (!replay.run(g_stop)) {
+			agent.shutdown();
+			shm_unlink(SHM_KEY);
+			return 1;
+		}
 	} else {
 		std::printf("e3agent-standalone: synth on ports %u/%u/%u, tdd=%s\n",
 			cfg.agent.rep_port, cfg.agent.pub_port, cfg.agent.sub_port, cfg.synth.tdd_pattern.c_str());

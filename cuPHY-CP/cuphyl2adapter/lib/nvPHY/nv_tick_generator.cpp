@@ -20,6 +20,8 @@
 #include "nvlog.hpp"
 #include "memtrace.h"
 
+#include <cerrno>
+
 #define TAG (NVLOG_TAG_BASE_L2_ADAPTER + 7) // "L2A.TICK"
 
 namespace nv
@@ -29,6 +31,27 @@ namespace nv
     constexpr int64_t SFN_PERIOD = SFN_MAX * FRAME_PERIOD;
     constexpr int64_t TAI_GPS_EPOCH_DELTA = 315964800ULL; //(Jan 6th 1980(GPS epoch) - Jan 1st 1970 (TAI epoch)) /*(365x10 + 2(2 leap years)+5(5 additional days in 1980))x24x60x60*/
     constexpr int64_t GPS_TO_TAI_LAG = 19ULL; //GPS lags TAI by 19s
+
+    // The first tick can be up to SFN_PERIOD (10.24 s) away. Sleeping straight to
+    // it with one long clock_nanosleep() gives a "cold" wakeup that can land late
+    // and cause a spurious late-slot error, even though later ticks are on time.
+    // So we wake this much earlier and busy-spin the rest of the way, keeping the
+    // wakeup path warm so the first tick is on time. Only affects how the first
+    // tick is awaited; the late-slot threshold in tick_received() is unchanged.
+    constexpr uint64_t FIRST_TICK_SPIN_WINDOW_NS = 1000000ULL; // 1 ms
+
+    // Spin-loop hint: lowers pipeline pressure vs an empty asm barrier.
+    static inline void cpu_relax()
+    {
+#if defined(__aarch64__)
+        __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+        __asm__ __volatile__("pause" ::: "memory");
+#else
+        __asm__ __volatile__("" ::: "memory");
+#endif
+    }
+
     static std::atomic<bool> thread_started{false};
     static std::atomic<bool> timer_thread_start{false};
     void tti_gen::start_tick_generator()
@@ -192,6 +215,56 @@ namespace nv
         ts->tv_nsec = epoch % (1000ULL * 1000 * 1000);
     }
 
+    bool tti_gen::await_and_dispatch_first_tick(uint64_t& next_expected)
+    {
+        // First tick only: early-wake + spin (see FIRST_TICK_SPIN_WINDOW_NS).
+        // On sleep failure or stop, skip spin and fall through to the normal loop.
+        if(stop_thread.load() ||
+           next_expected <= sys_clock_time_handler() + FIRST_TICK_SPIN_WINDOW_NS)
+        {
+            return false;
+        }
+
+        struct timespec ts_expected;
+        set_timespec(&ts_expected, next_expected - FIRST_TICK_SPIN_WINDOW_NS);
+        int ret;
+        do
+        {
+            ret = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts_expected, nullptr);
+        }
+        while(ret == EINTR && !stop_thread.load());
+
+        if(ret != 0 && ret != EINTR)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CLOCK_API_EVENT, "first-tick clock_nanosleep returned error ret: {}", ret);
+            return false;
+        }
+
+        if(stop_thread.load())
+        {
+            return false;
+        }
+
+        // Busy-wait until the real boundary (warm wakeup path). If we woke
+        // past it, this exits right away and tick_received() handles it.
+        while(!stop_thread.load() && sys_clock_time_handler() < next_expected)
+        {
+            cpu_relax();
+        }
+
+        if(stop_thread.load())
+        {
+            return false;
+        }
+
+        // Dispatch the first tick directly so no extra syscall happens after the
+        // deadline, then let the loop take over from the next expected tick.
+        current_scheduled_ts = nanoseconds(next_expected);
+        slot_indication_handler();
+        next_expected += window_nsec;
+        return true;
+    }
+
     void tti_gen::slot_indication_thread_sleep_method()
     {
         while(!timer_thread_start.load())
@@ -250,6 +323,9 @@ namespace nv
 
         uint64_t next_expected = get_first_slot_timestamp();
         module_->set_first_tick(true);
+
+        await_and_dispatch_first_tick(next_expected);
+
         while(!stop_thread.load())
         {
             current_scheduled_ts = nanoseconds(next_expected);

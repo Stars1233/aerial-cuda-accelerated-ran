@@ -1,0 +1,113 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Runtime configuration for cuMAC examples.
+# Edit values here and re-run — no recompile required.
+# Override the path via the CUMAC_PARAMS_YAML environment variable.
+
+# GPU index
+gpuDeviceIdx: 0          # index of GPU device to use
+
+# simulation duration
+numSimChnRlz: 2000       # total number of simulated TTIs
+
+# randomness
+seedConst: 0             # randomness seed
+
+# system parameters
+slotDurationConst: 0.5e-3   # 1.0e-3, 0.5e-3, 0.25e-3, 0.125e-3, 0.0625e-3
+scsConst: 30000.0           # 15000.0, 30000.0, 60000.0, 120000.0, 240000.0 (numerology 0..4)
+numMcsLevels: 28
+cellRadiusConst: 1000
+numCellConst: 20            # total number of cells in the network
+numUePerCellConst: 16       # number of UEs scheduled per TTI per cell
+numUeForGrpConst: 32        # number of UEs considered for MU-MIMO UE grouping per TTI per cell
+numActiveUePerCellConst: 500  # 100, 500, 1200. should be <= 2048
+
+# antenna configurations
+nBsAntConst: 4
+bsAntSizeConst: [1, 1, 1, 2, 2]                # {M_g, N_g, M, N, P}
+bsAntSpacingConst: [1.0, 1.0, 0.5, 0.5]        # [d_g_h, d_g_v, d_h, d_v] in wavelengths
+bsAntPolarAnglesConst: [45.0, -45.0]
+bsAntPatternConst: 1                            # 0: isotropic; 1: 38.901
+nUeAntConst: 4
+ueAntSizeConst: [1, 1, 2, 2, 1]
+ueAntSpacingConst: [1.0, 1.0, 0.5, 0.5]
+ueAntPolarAnglesConst: [0.0, 90.0]
+ueAntPatternConst: 0                            # 0: isotropic; 1: 38.901
+vDirectionConst: [90.0, 0.0]                    # [RxA; RxZ]
+
+# PRB grouping
+nPrbsPerGrpConst: 4
+nPrbGrpsConst: 68
+
+# power
+PtConst: 79.4328         # Macrocell 49 dBm = 79.4328 W; Microcell 23 dBm = 0.1995 W
+
+# noise
+noiseFigureConst: 9.0    # dB
+
+# allocator / scheme selection
+gpuAllocTypeConst: 1     # 0: non-consecutive type-0, 1: consecutive type-1
+cpuAllocTypeConst: 1
+prdSchemeConst: 0        # 0: no precoding, 1: SVD precoding
+rxSchemeConst: 1         # 1: MMSE-IRC
+heteroUeSelCellsConst: 0 # 0: homogeneous UE selection across cells, 1: heterogeneous
+
+# max dimensions
+maxNumCoorCellConst: 21
+maxNumBsAntConst: 16
+maxNumUeAntConst: 16
+maxNumPrbGrpsConst: 100
+
+# PDSCH
+pdschNrOfSymbols: 12
+pdschNrOfDmrsSymb: 1
+pdschNrOfLayers: 1
+
+# PF scheduling
+initAvgRateConst: 1.0
+pfAvgRateUpdConst: 0.001
+betaCoeffConst: 1.0
+sinValThrConst: 0.1
+prioWeightStepConst: 100
+
+# power scaling
+AFTER_SCALING_SIGMA_CONST: 1.0   # noise std after scaling (for 49 dBm BS Tx)
+
+# CPU/GPU perf gap thresholds
+cpuGpuPerfGapPerUeConst: 0.005
+cpuGpuPerfGapSumRConst: 0.01
+
+# interference control
+toleranceConst: 0.4
+
+# SVD precoder
+svdToleranceConst: 1.0e-7
+svdMaxSweeps: 15
+
+# normalized channel coefficients (for __half range)
+amplifyCoeConst: 1
+
+# output files
+mcOutputFile: "output.txt"
+mcOutputFileShort: "output_short.txt"
+
+# channel-coefficient targets
+targetChanCoeRangeScale: 0.1     # multiplied by nPrbGrps * totNumUes
+MinNoiseRangeConst: 0.001        # minimum noise figure for stability
+
+# 64TR MU-MIMO
+nMaxUeSchdPerCellTTIConst: 16

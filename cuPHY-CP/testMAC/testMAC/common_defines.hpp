@@ -53,6 +53,8 @@
 #define SLOT_INTERVAL (1000L * 1000 / (1 << NR_NUMEROLOGY)) //!< Slot interval in nanoseconds
 #define SLOTS_PER_SECOND (1000L * 1000 * 1000 / SLOT_INTERVAL) //!< Number of slots per second
 #define SLOTS_PER_FRAME (1000L * 1000 * 10 / SLOT_INTERVAL) //!< Number of slots per 10ms frame
+#define SFN_NUM_MAX 1024 //!< Maximum number of SFNs
+#define SFN_SLOT_NUM_MAX (SFN_NUM_MAX * SLOTS_PER_FRAME) //!< Maximum number of SFN/SLOT combinations
 
 #define CELL_ID_ALL 0xFFFF //!< Special cell ID representing all cells
 
@@ -139,5 +141,12 @@ typedef enum
     VALD_OK   = 0, //!< Validation passed
     VALD_FAIL = 1, //!< Validation failed
 } vald_result_t;
+
+inline constexpr uint32_t get_slot_interval(sfn_slot_t ss_old, sfn_slot_t ss_new)
+{
+    uint32_t new_slots = ss_new.u16.sfn * SLOTS_PER_FRAME + ss_new.u16.slot;
+    uint32_t old_slots = ss_old.u16.sfn * SLOTS_PER_FRAME + ss_old.u16.slot;
+    return (new_slots + SFN_SLOT_NUM_MAX - old_slots) % SFN_SLOT_NUM_MAX;
+}
 
 #endif /* _COMMON_DEFINES_HPP_ */

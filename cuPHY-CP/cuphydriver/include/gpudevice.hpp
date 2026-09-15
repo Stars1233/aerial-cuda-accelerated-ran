@@ -18,19 +18,24 @@
 #ifndef GPUDEVICE_H
 #define GPUDEVICE_H
 
+/* Ensure CUDA driver API is available before any macro expansion (CUDA_DRIVER_CHECK uses CUresult). */
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include <atomic>
 #include <vector>
 #include <array>
 #include <stdio.h>
 #include <memory>
+#include <cstddef>
 #include <cstring>
 #include "locks.hpp"
 #include <gdrapi.h>
 #include "nvlog.hpp"
 #include "memfoot.hpp"
 #include "cuphydriver_api.hpp"
+#include "order_kernel_functions.hpp"
+#include "generic_kernel_functions.hpp"
 
 #if USE_NVTX
 #include "nvtx3/nvToolsExt.h"
@@ -61,68 +66,7 @@ const int      num_colors_phydrv = sizeof(colors_phydrv) / sizeof(uint32_t);
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 7) // "DRV.GPUDEV"
 #endif
 
-#define CUDA_CHECK_PHYDRIVER(stmt)                   \
-    do                                               \
-    {                                                \
-        cudaError_t result1 = (stmt);                 \
-        if(cudaSuccess != result1)                    \
-        {                                            \
-            NVLOGW_FMT(TAG,"[{}:{}] cuda failed with result1 {} ",__FILE__,__LINE__,cudaGetErrorString(result1));    \
-            cudaError_t result2 = cudaGetLastError();             \
-            if(cudaSuccess != result2)                            \
-            {                                                     \
-                NVLOGW_FMT(TAG,"[{}:{}] cuda failed with result2 {} result1 {}",__FILE__,__LINE__,cudaGetErrorString(result2),cudaGetErrorString(result1));    \
-                cudaError_t result3 = cudaGetLastError();/*check for stickiness*/             \
-                if(cudaSuccess != result3)                    \
-                {                                            \
-                    NVLOGF_FMT(TAG, AERIAL_CUDA_API_EVENT, "[{}:{}] cuda failed with result3 {} result2 {} result1 {}", \
-                           __FILE__,                         \
-                           __LINE__,                         \
-                           cudaGetErrorString(result3),      \
-                           cudaGetErrorString(result2),      \
-                           cudaGetErrorString(result1));      \
-                }                                            \
-            }                  \
-         }                                            \
-    } while(0)
-
-#define CUDA_CHECK_PHYDRIVER_NONFATAL(stmt,id)                   \
-    do                                               \
-    {                                                \
-        cudaError_t result1 = (stmt);                 \
-        if(cudaSuccess != result1)                    \
-        {                                            \
-            NVLOGW_FMT(TAG,"[{}:{}] cuda failed with result1 {} for Obj {:x}",__FILE__,__LINE__,cudaGetErrorString(result1),id);    \
-            cudaError_t result2 = cudaGetLastError();             \
-            if(cudaSuccess != result2)                            \
-            {                                                     \
-                NVLOGW_FMT(TAG,"[{}:{}] cuda failed with result2 {} result1 {} for Obj {:x}",__FILE__,__LINE__,cudaGetErrorString(result2),cudaGetErrorString(result1),id);    \
-                cudaError_t result3 = cudaGetLastError();/*check for stickiness*/             \
-                if(cudaSuccess != result3)                    \
-                {                                            \
-                    NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "[{}:{}] cuda failed with result3 {} result2 {} result1 {} for Obj {:x}", \
-                           __FILE__,                         \
-                           __LINE__,                         \
-                           cudaGetErrorString(result3),      \
-                           cudaGetErrorString(result2),      \
-                           cudaGetErrorString(result1),id);      \
-                }                                            \
-            }                                            \
-         }                                            \
-    } while(0)
-
-#define CU_CHECK_PHYDRIVER(stmt)                   \
-    do                                             \
-    {                                              \
-        CUresult result = (stmt);                  \
-        if(CUDA_SUCCESS != result)                 \
-        {                                          \
-            NVLOGF_FMT(TAG, AERIAL_CUDA_API_EVENT, "[{}:{}] cu failed with {} ", \
-                   __FILE__,                       \
-                   __LINE__,                       \
-                   +result);                        \
-        }                                          \
-    } while(0)
+/* CUDA_DRIVER_CHECK is defined in cuda_driver_utils.hpp (requires cuda.h) */
 
 #define CU_CHECK_L1_EXIT_PHYDRIVER_NONFATAL(stmt)  \
     do                                             \
@@ -176,13 +120,17 @@ typedef struct OKInstrumentation {
     int num_procs;                                         ///< Total number of process operations recorded
 } OKInstrumentation;
 
-void force_loading_generic_cuda_kernels();
-void force_loading_order_kernels();
+[[nodiscard]] bool resolve_warmup_kernel_handle(CUfunction* out);
+[[nodiscard]] bool resolve_kernel_write_handle(CUfunction* out);
+[[nodiscard]] bool resolve_kernel_wait_eq_handle(CUfunction* out);
+[[nodiscard]] bool resolve_memset_kernel_handle(CUfunction* out);
+[[nodiscard]] bool resolve_compression_kernel_handles(CompressionKernelFunctions& out);
 
-void launch_memset_kernel(void* d_buffers_addr, int num_cells, size_t max_buffer_size, cudaStream_t strm);
+void launch_memset_kernel(CUfunction func, void* d_buffers_addr, int num_cells, size_t max_buffer_size, cudaStream_t strm);
 
 
 void launch_kernel_order(
+    CUfunction            func,
     cudaStream_t          stream,
     int                   fake_run,
     int                   cell_id,
@@ -207,6 +155,8 @@ void launch_kernel_order(
     float                 beta);
 
 int launch_kernel_order_mb(
+    CUfunction            func_one_ch,
+    CUfunction            func_two_ch,
     cudaStream_t          stream,
     int                   fake_run,
     int                   cell_id,
@@ -261,6 +211,7 @@ int launch_kernel_order_mb(
 );
 
 int launch_order_kernel_doca(
+	CUfunction            func,
 	cudaStream_t          stream,
 
     struct doca_gpu_eth_rxq *doca_rxq,
@@ -328,6 +279,7 @@ int launch_order_kernel_doca(
     );
 
 int launch_order_kernel_doca_single(
+	CUfunction            func,
 	cudaStream_t          stream,
 
     struct doca_gpu_eth_rxq **doca_rxq,
@@ -423,6 +375,13 @@ int launch_order_kernel_doca_single(
     );
 
 int launch_order_kernel_doca_single_subSlot(
+	CUfunction func,
+	CUfunction pingpong_trace_srs,
+	CUfunction pingpong_trace_srs_pusch,
+	CUfunction pingpong_trace_no_srs,
+	CUfunction pingpong_no_trace_srs,
+	CUfunction pingpong_no_trace_srs_pusch,
+	CUfunction pingpong_no_trace_no_srs,
 	cudaStream_t stream,
 
 	struct doca_gpu_eth_rxq **doca_rxq,
@@ -536,7 +495,8 @@ int launch_order_kernel_doca_single_subSlot(
     );
 
 int launch_order_kernel_cpu_init_comms_single_subSlot(
-cudaStream_t stream,
+    CUfunction func,
+    cudaStream_t stream,
 
 uint32_t**             start_cuphy_d,
 uint32_t**             order_kernel_exit_cond_d,
@@ -617,6 +577,7 @@ uint8_t num_order_cells
 );
 
 int launch_order_kernel_doca_single_srs(
+	CUfunction            func,
 	cudaStream_t          stream,
 
     struct doca_gpu_eth_rxq **doca_rxq,
@@ -675,6 +636,7 @@ int launch_order_kernel_doca_single_srs(
     );
 
 int launch_receive_kernel_for_test_bench(
+	CUfunction func,
 	cudaStream_t stream,
 
 	/* DOCA objects */
@@ -717,40 +679,50 @@ int launch_receive_kernel_for_test_bench(
 	uint8_t num_order_cells
     );    
 
-void launch_kernel_wait_update(cudaStream_t stream, uint32_t* addr, uint32_t expected, uint32_t updated);
-void launch_kernel_wait_eq(cudaStream_t stream, uint32_t* addr, uint32_t value);
-void launch_kernel_wait_geq(cudaStream_t stream, uint32_t* addr, uint32_t value);
-void launch_kernel_wait_neq(cudaStream_t stream, uint32_t* addr, uint32_t value);
-void launch_kernel_write(cudaStream_t stream, uint32_t* addr, uint32_t value);
-void launch_kernel_warmup(cudaStream_t stream);
-void launch_kernel_compare(cudaStream_t stream, uint8_t* addr1, uint8_t* addr2, int size);
-void launch_kernel_check_crc(cudaStream_t stream, const uint32_t* i_buf, size_t i_elems, uint32_t* out);
-void launch_kernel_read(cudaStream_t stream, uint8_t* addr);
-void launch_kernel_copy(cudaStream_t stream, uint8_t* input_buffer, uint8_t* output_buffer, int bytes);
+void launch_kernel_wait_update(CUfunction func, cudaStream_t stream, uint32_t* addr, uint32_t expected, uint32_t updated);
+void launch_kernel_wait_eq(CUfunction func, cudaStream_t stream, uint32_t* addr, uint32_t value);
+void launch_kernel_wait_geq(CUfunction func, cudaStream_t stream, uint32_t* addr, uint32_t value);
+void launch_kernel_wait_neq(CUfunction func, cudaStream_t stream, uint32_t* addr, uint32_t value);
+void launch_kernel_write(CUfunction func, cudaStream_t stream, uint32_t* addr, uint32_t value);
+void launch_kernel_warmup(CUfunction func, cudaStream_t stream);
+/**
+ * @brief Launches the init-time order-kernel printf warmup kernel.
+ *
+ * The warmup primes device printf allocation in the current CUDA context on
+ * the provided stream, before latency-sensitive order kernels run.
+ */
+void launch_order_kernel_printf_warmup(CUfunction func, cudaStream_t stream);
+void launch_kernel_compare(CUfunction func, cudaStream_t stream, uint8_t* addr1, uint8_t* addr2, int size);
+void launch_kernel_check_crc(CUfunction func, cudaStream_t stream, const uint32_t* i_buf, size_t i_elems, uint32_t* out);
+void launch_kernel_read(CUfunction func, cudaStream_t stream, uint8_t* addr);
+void launch_kernel_copy(CUfunction func, cudaStream_t stream, uint8_t* input_buffer, uint8_t* output_buffer, int bytes);
 
-void launch_kernel_print_hex(cudaStream_t stream, uint8_t* addr, int offset, int num_bytes);
+void launch_kernel_print_hex(CUfunction func, cudaStream_t stream, uint8_t* addr, int offset, int num_bytes);
 void launch_receive_process_kernel_for_test_bench(
+    CUfunction tb_pingpong_srs_func,
+    CUfunction tb_pingpong_no_srs_func,
+    CUfunction recv_process_func,
     cudaStream_t stream,
 	/* Cell */
-	const int*		cell_id,
+	int*		cell_id,
 	uint32_t		**exit_cond_d,
-    const uint16_t* sem_order_num,
-    const int*		ru_type,
+    uint16_t* sem_order_num,
+    int*		ru_type,
 
 	/* ORAN */
-	const uint8_t		frameId,
-	const uint8_t		subframeId,
-	const uint8_t		slotId,
+	uint8_t		frameId,
+	uint8_t		subframeId,
+	uint8_t		slotId,
 
-    const int		prb_size,
-    const int*		comp_meth,
-    const int*		bit_width,
-    const float*		beta,
+    int		prb_size,
+    int*		comp_meth,
+    int*		bit_width,
+    float*		beta,
     uint32_t		**last_sem_idx_order_h,
     
     uint32_t*       rx_pkt_num_slot,
     uint8_t**       tb_fh_buf,
-    const uint32_t  max_pkt_size,
+    uint32_t  max_pkt_size,
 
     uint32_t         **early_rx_packets,
     uint32_t         **on_time_rx_packets,
@@ -804,16 +776,16 @@ void launch_receive_process_kernel_for_test_bench(
 	uint8_t*          srs_start_sym,
 
     /*Receive CTA params*/
-    const uint32_t	timeout_no_pkt_ns,
-    const uint32_t	timeout_first_pkt_ns,
-	const uint32_t  timeout_log_interval_ns,
-	const uint8_t   timeout_log_enable,
+    uint32_t	timeout_no_pkt_ns,
+    uint32_t	timeout_first_pkt_ns,
+	uint32_t  timeout_log_interval_ns,
+	uint8_t   timeout_log_enable,
     uint64_t      **order_kernel_last_timeout_error_time,
     uint32_t		**last_sem_idx_rx_h,
     bool            commViaCpu,
     struct doca_gpu_eth_rxq **doca_rxq,
-    const uint32_t  max_rx_pkts,
-    const uint32_t  rx_pkts_timeout_ns,
+    uint32_t  max_rx_pkts,
+    uint32_t  rx_pkts_timeout_ns,
     struct doca_gpu_semaphore_gpu **sem_gpu,
     struct aerial_fh_gpu_semaphore_gpu **sem_gpu_aerial_fh,
 	uint64_t*		slot_start,
@@ -827,6 +799,7 @@ void launch_receive_process_kernel_for_test_bench(
 
 
 void launch_kernel_compression(
+    const CompressionKernelFunctions& comp,
     cudaStream_t stream,
     const std::array<compression_params, NUM_USER_DATA_COMPRESSION_METHODS>& cparams_array);
 
@@ -847,13 +820,13 @@ struct hpinned_alloc
      * @brief Allocate host pinned memory
      *
      * @param nbytes - Number of bytes to allocate
-     * @return Pointer to allocated pinned host memory
+     * @return Pointer to allocated pinned host memory. If allocation fails, nullptr is returned
+     * and Fatal error is thrown.
      */
     static void* allocate(size_t nbytes)
     {
-        void* addr;
-        // CUDA_CHECK_PHYDRIVER(cudaMallocHost(&addr, nbytes));
-        CUDA_CHECK_PHYDRIVER(cudaHostAlloc(&addr, nbytes, cudaHostAllocDefault | cudaHostAllocPortable));
+        void* addr = nullptr;
+        CUDA_DRIVER_CHECK(cuMemHostAlloc(&addr, nbytes, CU_MEMHOSTALLOC_PORTABLE));
         return addr;
     }
 
@@ -864,8 +837,7 @@ struct hpinned_alloc
      */
     static void deallocate(void* addr)
     {
-        // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "hpinned_alloc CUDA_CHECK_PHYDRIVER(cudaFreeHost"));
-        CUDA_CHECK_PHYDRIVER(cudaFreeHost(addr));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(addr));
     }
 
     /**
@@ -914,12 +886,18 @@ public:
         if (!is_rdma_supported)
         {
 
-            host_ptr = hpinned_alloc::allocate(size_input); 
+            host_ptr = hpinned_alloc::allocate(size_input);
+            if(host_ptr == nullptr)
+                PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "cuMemHostAlloc");
             // In a system with full unified memory, the host and the device pointer _may_ match.
-            CU_CHECK_PHYDRIVER(cuMemHostGetDevicePointer(&dev_addr, host_ptr, 0));
+            CUDA_DRIVER_CHECK(cuMemHostGetDevicePointer(&dev_addr, host_ptr, 0));
 
             addr_d    = (uintptr_t)dev_addr;
             addr_h    = (uintptr_t)host_ptr;
+            // Mem footprint (e.g. MemFoot::addGpuPinnedSize) reads size_alloc; must not leave it uninitialized.
+            size_alloc = size_input;
+            size_free  = size_input;
+            addr_free  = 0;
             return; 
         }
 
@@ -946,8 +924,8 @@ public:
         if(CUDA_SUCCESS != e)
             PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "cuMemHostGetDevicePointer");
 #else
-        // CU_CHECK_PHYDRIVER(cuMemAlloc(&dev_addr, alloc_size));
-        CU_CHECK_PHYDRIVER(cuMemAlloc(&dev_addr, alloc_size));
+        // CUDA_DRIVER_CHECK(cuMemAlloc(&dev_addr, alloc_size));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dev_addr, alloc_size));
 #endif
 
         addr_free = (uintptr_t)dev_addr;
@@ -959,7 +937,7 @@ public:
 
         /*----------------------------------------------------------------*
             * Set attributes for the allocated device memory.                */
-        CU_CHECK_PHYDRIVER(cuPointerSetAttribute(&FLAG, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, dev_addr));
+        CUDA_DRIVER_CHECK(cuPointerSetAttribute(&FLAG, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, dev_addr));
         // if(CUDA_SUCCESS != cuPointerSetAttribute(&FLAG, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, dev_addr))
         // {
         //     cuMemFree(dev_addr);
@@ -970,7 +948,7 @@ public:
             * Pin the device buffer                                          */
         if(0 != gdr_pin_buffer(*g, dev_addr, pin_size, 0, 0, &mh))
         {
-            CU_CHECK_PHYDRIVER(cuMemFree(dev_addr));
+            CUDA_DRIVER_CHECK(cuMemFree(dev_addr));
             PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "gdr_pin_buffer");
         }
         /*----------------------------------------------------------------*
@@ -978,7 +956,7 @@ public:
         if(0 != gdr_map(*g, mh, &host_ptr, pin_size))
         {
             gdr_unpin_buffer(*g, mh);
-            CU_CHECK_PHYDRIVER(cuMemFree(dev_addr));
+            CUDA_DRIVER_CHECK(cuMemFree(dev_addr));
             PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "gdr_map");
         }
         /*----------------------------------------------------------------*
@@ -987,7 +965,7 @@ public:
         {
             gdr_unmap(*g, mh, host_ptr, pin_size);
             gdr_unpin_buffer(*g, mh);
-            CU_CHECK_PHYDRIVER(cuMemFree(dev_addr));
+            CUDA_DRIVER_CHECK(cuMemFree(dev_addr));
             PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "gdr_get_info");
         }
 
@@ -1007,7 +985,7 @@ public:
         if (is_rdma_supported) {
             gdr_unmap(*g, mh, (void*)addr_h, size_free);
             gdr_unpin_buffer(*g, mh);
-            CU_CHECK_PHYDRIVER(cuMemFree((CUdeviceptr)addr_free));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree((CUdeviceptr)addr_free));
         } else {
             hpinned_alloc::deallocate((void*)addr_h); 
         }
@@ -1083,10 +1061,17 @@ public:
     ~GpuDevice();
 
     phydriver_handle       getPhyDriverHandler(void) const;    ///< Get physical layer driver handle
-    void                   setDevice();                        ///< Set this device as active CUDA device for current thread
+    /**
+     * @brief Make this device's primary context current for the calling thread
+     *
+     * Requires cuInit (or equivalent) to have been called before first use.
+     * The primary context is retained once in the constructor and released in the destructor;
+     * this call only invokes cuCtxSetCurrent.
+     */
+    void                   setDevice();
     uint32_t               getId();                            ///< Get CUDA device ID
     void                   print_info();                       ///< Print GPU device properties to log
-    void                   synchronizeStream(cudaStream_t stream); ///< Synchronize CUDA stream (blocking wait for completion)
+    void                   synchronizeStream(CUstream stream); ///< Synchronize CUDA stream (blocking wait for completion)
     
     /**
      * @brief Run GPU warmup kernels
@@ -1095,15 +1080,18 @@ public:
      * @param stream - CUDA stream for warmup kernels
      * @return 0
      */
-    int                    runWarmup(int n, cudaStream_t stream);
+    int                    runWarmup(CUfunction warmup_func, int n, CUstream stream);
     
     /**
      * @brief Allocate new GDR pinned buffer
      *
-     * @param size - Buffer size in bytes (will be rounded to GPU page size)
-     * @return Pointer to allocated GDR buffer, nullptr on failure
+     * @param size Buffer size in bytes (will be rounded to GPU page size)
+     * @return Pointer to allocated GDR buffer
+     * @note Caller owns the returned pointer; wrap in std::unique_ptr<gpinned_buffer>
+     *       (or transfer ownership to a managed storage). Marked [[nodiscard]] so the
+     *       compiler enforces this at the call site.
      */
-    struct gpinned_buffer* newGDRbuf(size_t size);
+    [[nodiscard]] struct gpinned_buffer* newGDRbuf(const std::size_t size);
     
     gdr_t*                 getGDRhandler();                    ///< Get GDR context handle for this device
     
@@ -1112,6 +1100,7 @@ public:
 private:
     phydriver_handle      pdh;                                 ///< Physical layer driver handle
     uint32_t              id;                                  ///< CUDA device ID (0-based)
+    CUcontext             primary_ctx;                         ///< Retained primary context (retain once, release in destructor)
     int                   tot_devs;                            ///< Total number of CUDA devices in system
     struct cudaDeviceProp deviceProp;                          ///< CUDA device properties (name, compute capability, memory, etc.)
     int                   device_attr_clock_rate;              ///< GPU clock rate in kHz
@@ -1123,7 +1112,7 @@ private:
 /**
  * @brief GPU device memory allocator
  *
- * Allocator for device (GPU) memory using cudaMalloc/cudaFree.
+ * Allocator for device (GPU) memory using cuMemAlloc/cuMemFree.
  * Used with IOBuf template for device-side buffer management.
  */
 struct device_alloc
@@ -1132,15 +1121,16 @@ struct device_alloc
      * @brief Allocate device memory
      *
      * @param nbytes - Number of bytes to allocate
-     * @return Pointer to allocated device memory
+     * @return Pointer to allocated device memory. If allocation fails, nullptr is returned
+     * and Fatal error is thrown.
      */
     static void* allocate(size_t nbytes)
     {
-        void* addr;
-        CUDA_CHECK_PHYDRIVER(cudaMalloc(&addr, nbytes));
-        return addr;
+        CUdeviceptr dptr{};
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr, nbytes));
+        return reinterpret_cast<void*>(static_cast<uintptr_t>(dptr));
     }
-    
+
     /**
      * @brief Free device memory
      *
@@ -1148,8 +1138,7 @@ struct device_alloc
      */
     static void deallocate(void* addr)
     {
-        // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "device_alloc CUDA_CHECK_PHYDRIVER(cudaFree"));
-        CUDA_CHECK_PHYDRIVER(cudaFree(addr));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(addr)));
     }
 
     /**
@@ -1160,7 +1149,7 @@ struct device_alloc
      */
     static void clear(void* addr, size_t nbytes)
     {
-        CUDA_CHECK_PHYDRIVER(cudaMemset(addr, 0, nbytes));
+        CUDA_DRIVER_CHECK(cuMemsetD8(reinterpret_cast<CUdeviceptr>(addr), 0, nbytes));
     }
 };
 

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <string.h>
 #include <sys/time.h>
 #include <semaphore.h>
@@ -32,6 +33,8 @@
 
 #include "cumac_cp_tv.hpp"
 #include "cumac_cuda.hpp"
+#include "cumac_muUeGrp.h"
+#include "muMimoUserPairing/muMimoUserPairing.cuh"
 
 using namespace cumac;
 
@@ -89,6 +92,9 @@ void cumac_task::reset_cumac_task(sfn_slot_t _ss)
 
     ts_enqueue = 0;
     ts_dequeue = 0;
+
+    order_wait_sem  = nullptr;
+    order_post_sem = nullptr;
     ts_setup = 0;
     ts_run = 0;
     ts_callback = 0;
@@ -127,6 +133,14 @@ void cumac_task::reset_cumac_task(sfn_slot_t _ss)
 
     memset(&data_num, 0, sizeof(data_num));
 
+    if (cpu_cell_descs != nullptr)
+    {
+        for (uint32_t i = 0; i < cell_num; i++)
+        {
+            cpu_cell_descs[i].muUeGrpReqCopyLen = 0;
+        }
+    }
+
     if (run_in_cpu)
     {
         memset(grpPrms.cellAssocActUe, 0, static_cast<size_t>(grpPrms.nCell) * grpPrms.nActiveUe);
@@ -142,6 +156,11 @@ void cumac_task::reset_cumac_task(sfn_slot_t _ss)
     pfmSortTask.num_cell = cell_num;
     pfmSortTask.strm = strm;
     pfmSortTask.gpu_buf = reinterpret_cast<uint8_t*>(pfmCellInfo);
+
+    if (cp_handler != nullptr)
+    {
+        tv = cp_handler->get_group_tv_ptr();
+    }
 }
 
 void cumac_task::calculate_output_data_num()
@@ -160,20 +179,25 @@ void cumac_task::calculate_output_data_num()
 
 void cumac_task::init_cumac_modules()
 {
-    // Init cellAssocActUe buffer to 0
     if (run_in_cpu)
     {
-        mcUeSelCpu = new cumac::multiCellUeSelectionCpu(&grpPrms);
-        mcSchCpu = new cumac::multiCellSchedulerCpu(&grpPrms);
-        mcLayerSelCpu = new cumac::multiCellLayerSelCpu(&grpPrms);
-        mcMcsSelCpu = new cumac::mcsSelectionLUTCpu(&grpPrms);
+        if ((module_bitmask & CUMAC_CP_TASK_MASK_4T4R) != 0U)
+        {
+            mcUeSelCpu = new cumac::multiCellUeSelectionCpu(&grpPrms);
+            mcSchCpu = new cumac::multiCellSchedulerCpu(&grpPrms);
+            mcLayerSelCpu = new cumac::multiCellLayerSelCpu(&grpPrms);
+            mcMcsSelCpu = new cumac::mcsSelectionLUTCpu(&grpPrms);
+        }
     }
     else
     {
-        mcUeSelGpu = new cumac::multiCellUeSelection(&grpPrms);
-        mcSchGpu = new cumac::multiCellScheduler(&grpPrms);
-        mcLayerSelGpu = new cumac::multiCellLayerSel(&grpPrms);
-        mcMcsSelGpu = new cumac::mcsSelectionLUT(&grpPrms, strm);
+        if ((module_bitmask & CUMAC_CP_TASK_MASK_4T4R) != 0U)
+        {
+            mcUeSelGpu = new cumac::multiCellUeSelection(&grpPrms);
+            mcSchGpu = new cumac::multiCellScheduler(&grpPrms);
+            mcLayerSelGpu = new cumac::multiCellLayerSel(&grpPrms);
+            mcMcsSelGpu = new cumac::mcsSelectionLUT(&grpPrms, strm);
+        }
 
         // Initialize pfmSort module object
         pfmSortGpu = new cumac::pfmSort();
@@ -266,13 +290,34 @@ void cumac_task::print_array(const char *info, T *array, uint32_t num, uint32_t 
 
 int cumac_task::setup()
 {
-    NVLOGI_FMT(TAG, "SFN {}.{} setup in {}: nUe={} nActiveUe={} numUeSchdPerCellTTI={} nCell={} nPrbGrp={} nBsAnt={} nUeAnt={} precodingScheme={} receiverScheme={} allocType={} prioWeightStep={}", ss.u16.sfn, ss.u16.slot, run_in_cpu ? "CPU" : "GPU",
-               grpPrms.nUe, grpPrms.nActiveUe, grpPrms.numUeSchdPerCellTTI, grpPrms.nCell, grpPrms.nPrbGrp, grpPrms.nBsAnt, grpPrms.nUeAnt, grpPrms.precodingScheme, grpPrms.receiverScheme, grpPrms.allocType, grpPrms.prioWeightStep);
+    const uint32_t requested_4t4r = taskBitMask & CUMAC_CP_TASK_MASK_4T4R;
+    const uint32_t enabled_4t4r = module_bitmask & CUMAC_CP_TASK_MASK_4T4R;
+    if ((requested_4t4r & ~enabled_4t4r) != 0U)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT,
+                   "SFN {}.{} taskBitMask=0x{:X} requests disabled 4T4R modules (module_bitmask=0x{:X})",
+                   ss.u16.sfn, ss.u16.slot, taskBitMask, module_bitmask);
+        return -1;
+    }
+
+    NVLOGI_FMT(TAG, "SFN {}.{} setup in {}: 0x{:X} nUe={} nActiveUe={} numUeSchdPerCellTTI={} nCell={} nPrbGrp={} nBsAnt={} nUeAnt={} precodingScheme={} receiverScheme={} allocType={} prioWeightStep={}", ss.u16.sfn, ss.u16.slot, run_in_cpu ? "CPU" : "GPU",
+        taskBitMask, grpPrms.nUe, grpPrms.nActiveUe, grpPrms.numUeSchdPerCellTTI, grpPrms.nCell, grpPrms.nPrbGrp, grpPrms.nBsAnt, grpPrms.nUeAnt, grpPrms.precodingScheme, grpPrms.receiverScheme, grpPrms.allocType, grpPrms.prioWeightStep);
 
     ts_copy = std::chrono::system_clock::now().time_since_epoch().count();
     if (run_in_cpu == 0)
     {
         CHECK_CUDA_ERR(cudaEventRecord(ev_start, strm));
+    }
+
+    if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        if (slot_concurrent_enable == 0 && cp_handler->configs.enable_cubb)
+        {
+            sem_wait(order_wait_sem);
+        }
+
+        // Load updated SRS info from shared memory pool or dump tti_reqs for debug
+        cp_handler->load_ue_pair_shared_memory(ss, tti_reqs);
     }
 
     for (uint32_t cell_id = 0; cell_id < grpPrms.nCell; cell_id++)
@@ -281,6 +326,22 @@ int cumac_task::setup()
         if (run_in_cpu != 0 || group_buf_enabled == 0)
         {
             cp_handler->cell_copy_task(tti_reqs[cell_id], this);
+        }
+    }
+
+    if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        // If MU UE group enabled, wait until the previous slot is finished
+        if (slot_concurrent_enable == 0 && !cp_handler->configs.enable_cubb)
+        {
+            sem_wait(order_wait_sem);
+        }
+
+        // Load UE group static buffers from TV at each frame start
+        if (cp_handler->configs.enable_tv_test)
+        {
+            // Load persistent static buffers (chan_orth, srs_chan_est, srs_snr, cubb_srs) per configuration
+            cp_handler->load_ue_pair_static_buffers(ss, strm);
         }
     }
 
@@ -315,6 +376,13 @@ int cumac_task::setup()
         CHECK_VALUE_EQUAL_ERR(buf_num.pfmCellInfo, data_num.pfmCellInfo);
         NVLOGI_FMT(TAG, "SFN {}.{} DATA_NUM PFM_SORT: pfmCellInfo={}",
             ss.u16.sfn, ss.u16.slot, data_num.pfmCellInfo);
+    }
+
+    if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        CHECK_VALUE_EQUAL_ERR(buf_num.muUeGrpInfo, data_num.muUeGrpInfo);
+        NVLOGI_FMT(TAG, "SFN {}.{} DATA_NUM MU_UE_GRP: muUeGrpInfo={}",
+            ss.u16.sfn, ss.u16.slot, data_num.muUeGrpInfo);
     }
 
     if (run_in_cpu == 0)
@@ -364,6 +432,11 @@ int cumac_task::setup()
         if (taskBitMask & (0x1 << CUMAC_TASK_PFM_SORT))
         {
             print_array("pfmCellInfo", reinterpret_cast<uint8_t*>(pfmCellInfo), sizeof(cumac_pfm_cell_info_t));
+        }
+
+        if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+        {
+            print_array("cumac_muUeGrp_req_info_t", reinterpret_cast<uint8_t*>(muUeGrpInfo), data_num.muUeGrpInfo);
         }
     }
 
@@ -476,13 +549,37 @@ int cumac_task::setup()
     {
         if (run_in_cpu)
         {
-            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "SFN {}.{} {} CPU pfmSort not supported", ss.u16.sfn, ss.u16.slot, __func__);
+            NVLOGW_FMT(TAG, "SFN {}.{} {} CPU pfmSort not supported", ss.u16.sfn, ss.u16.slot, __func__);
         }
         else
         {
             NVLOGI_FMT(TAG, "SFN {}.{} {} GPU pfmSort", ss.u16.sfn, ss.u16.slot, __func__);
             // Setup pfmSortTask structure will be done in cumac_cp_handler::on_sch_tti_request
             pfmSortGpu->setup(&pfmSortTask);
+        }
+    }
+
+    // MU UE grouping: slot TV into per-task GPU buffers + kernel configuration (run stays in run())
+    if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        if (run_in_cpu)
+        {
+            NVLOGW_FMT(TAG, "SFN {}.{} {} CPU muUeGrp not supported", ss.u16.sfn, ss.u16.slot, __func__);
+        }
+        else
+        {
+            cumac::muUePairTask ue_pair{};
+            ue_pair.task_in_buf = reinterpret_cast<uint8_t*>(muUeGrpInfo);
+            ue_pair.task_out_buf = reinterpret_cast<uint8_t*>(muUeGrpSol);
+            ue_pair.strm = strm;
+            ue_pair.num_srs_ue_per_slot_cell = max_num_srs_info;
+            ue_pair.num_blocks_per_row_chanOrtMat = cp_handler->configs.num_blocks_per_row;
+            ue_pair.kernel_launch_flags = static_cast<uint8_t>(max_num_srs_info == 0 ? 0x2 : 0x3);
+            ue_pair.is_mem_sharing = cp_handler->configs.enable_gpu_share;
+
+            NVLOGI_FMT(TAG, "SFN {}.{} {} GPU muUeGrp: max_num_srs_info={} num_srs_ue_per_slot_cell={} num_blocks_per_row={} kernel_launch_flags=0x{:02X} is_mem_sharing={}",
+                ss.u16.sfn, ss.u16.slot, __func__, max_num_srs_info, ue_pair.num_srs_ue_per_slot_cell, ue_pair.num_blocks_per_row_chanOrtMat, ue_pair.kernel_launch_flags, ue_pair.is_mem_sharing);
+            muMimoUserPairingGpu->setup(&ue_pair);
         }
     }
 
@@ -495,10 +592,10 @@ int cumac_task::setup()
 
 int cumac_task::run()
 {
-    if (slot_concurrent_enable == 0)
+    if (slot_concurrent_enable == 0 && !(taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP)))
     {
-        // Wait for the previous slot to finish
-        sem_wait(&cp_handler->gpu_sem);
+        // If MU UE group is not enabled, only lock the run function
+        sem_wait(order_wait_sem);
     }
 
     NVLOGI_FMT(TAG, "SFN {}.{} run in {}: W={} sigmaSqrd={} Pt_Rbg={} Pt_rbgAnt={} betaCoeff={} sinValThr={} corrThr={}", ss.u16.sfn, ss.u16.slot, run_in_cpu ? "CPU" : "GPU",
@@ -684,10 +781,9 @@ int cumac_task::run()
         // Copy avgRates to cuMAC buffer
         if (run_in_cpu)
         {
-            cumac_cp_tv_t *ptr = get_cumac_tv_ptr();
-            if (ptr != nullptr && ptr->parsed)
+            if (tv != nullptr && tv->parsed)
             { // TODO: DIFF
-              // memcpy(grpPrms.postEqSinr, ptr->postEqSinr, data_num.postEqSinr * sizeof(*grpPrms.postEqSinr));
+              // memcpy(grpPrms.postEqSinr, tv->postEqSinr, data_num.postEqSinr * sizeof(*grpPrms.postEqSinr));
             }
             memcpy(ueStatus.tbErrLast, input_tbErrLast, sizeof(*ueStatus.tbErrLast) * data_num.tbErrLast);
         }
@@ -750,14 +846,28 @@ int cumac_task::run()
         }
     }
 
+    // muUeGrp run (setup in setup(); MU-MIMO UE pairing GPU kernel here)
+    if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        if (run_in_cpu)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "SFN {}.{} {} CPU muUeGrp not supported", ss.u16.sfn, ss.u16.slot, __func__);
+        }
+        else
+        {
+            muMimoUserPairingGpu->run(reinterpret_cast<uint8_t *>(output_muUeGrpSol));
+        }
+    }
+
     if (run_in_cpu == 0)
     {
         CHECK_CUDA_ERR(cudaEventRecord(ev_run4, strm));
-        if (slot_concurrent_enable == 0)
-        {
-            CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
-            sem_post(&cp_handler->gpu_sem);
-        }
+    }
+
+    if (slot_concurrent_enable == 0 && !(taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP)))
+    {
+        // If MU UE group is not enabled, only lock the run function
+        sem_post(order_post_sem);
     }
 
     return 0;
@@ -850,10 +960,31 @@ int cumac_task::callback()
         {
             print_array("OUT: pfmSortSol", reinterpret_cast<uint8_t*>(output_pfmSortSol), sizeof(cumac_pfm_output_cell_info_t) * cell_num, 1);
         }
+        if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+        {
+            print_array("OUT: muUeGrpSol", reinterpret_cast<uint8_t*>(output_muUeGrpSol), sizeof(cumac_muUeGrp_resp_info_t) * cell_num, 1);
+        }
+    }
+
+    // Dump MU UE-pair input buffers (chan_est, snr, chan_orth) to HDF5 for
+    // offline inspection. Only meaningful when this slot ran muUeGrp -- the
+    // dumper itself early-returns if the buffers were never allocated, but
+    // gating here avoids a redundant cudaStreamSynchronize for non-MU slots.
+    if ((debug_option & DBG_OPT_DUMP_UE_PAIR_H5) && (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP)) && run_in_cpu == 0)
+    {
+        // Make sure the H2D uploads done in setup() (or the cuphydriver
+        // shared-pool writes in load_ue_pair_shared_memory) are visible
+        // before the D2H snapshot. cudaMemcpy() inside the dumper itself
+        // is synchronous, but it does not order with prior stream-issued
+        // copies on `strm`.
+        CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
+        cp_handler->dump_ue_pair_h5(ss.u16.sfn, ss.u16.slot);
     }
 
     if (run_in_cpu == 0)
     {
+        CHECK_CUDA_ERR(cudaStreamSynchronize(strm));
+
         // Below are for timing and performance debug
         CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_copy1, ev_start, ev_copy1));
         CHECK_CUDA_ERR(cudaEventElapsedTime(&tm_copy2, ev_copy1, ev_copy2));
@@ -884,6 +1015,12 @@ int cumac_task::callback()
 
     NVLOGI_FMT(TAG, "SFN {}.{} in {} 0x{:X} CPU_DURATION: msg_send={} msg_recv={} task_enq={} task_deq={} wait={} copy={} setup={} run={} callback={} resp={} total={} debug={}", ss.u16.sfn, ss.u16.slot, run_in_cpu ? "CPU" : "GPU",
                taskBitMask, ts_last_send - ts_start, ts_last_recv - ts_last_send, ts_enqueue - ts_last_recv, ts_dequeue - ts_enqueue, ts_copy - ts_dequeue, ts_setup - ts_copy, ts_run - ts_setup, ts_callback - ts_run, ts_resp - ts_callback, ts_end - ts_resp, ts_resp - ts_copy, ts_debug - ts_end);
+
+    if (slot_concurrent_enable == 0 && (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP)))
+    {
+        // If MU UE group is enabled, lock until slot is finished
+        sem_post(order_post_sem);
+    }
 
     return taskBitMask;
 }
@@ -926,6 +1063,43 @@ int cumac_task::validate_buffer_setup()
     {
         compare_array("SETUP_pfmCellInfo", reinterpret_cast<uint8_t*>(tv->pfmCellInfo.data()), reinterpret_cast<uint8_t*>(pfmCellInfo), cell_num * sizeof(cumac_pfm_cell_info_t));
     }
+
+    if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        if (tv->ue_pair.empty())
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "{}: ue_pair vector empty; cannot validate MU UE GRP setup", __func__);
+            return -1;
+        }
+        const size_t slot_id = (ss.u16.sfn * SLOT_NUM_PER_FRAME + ss.u16.slot) % tv->ue_pair.size();
+        ue_pair_tv_t &ue_pair_tv = tv->ue_pair[slot_id];
+
+        CHECK_VALUE_EQUAL_ERR(data_num.muUeGrpInfo, ue_pair_tv.task_in_buf_group_size);
+
+        // Compare per slot input buffer
+        compare_array("SETUP_muUeGrp_task_in_buf",
+                      ue_pair_tv.task_in_buf_group_host, reinterpret_cast<uint8_t*>(muUeGrpInfo),
+                      ue_pair_tv.task_in_buf_group_size);
+
+        // Compare static input buffers
+        compare_array("SETUP_muUeGrp_chan_orth", reinterpret_cast<float *>(ue_pair_tv.chan_orth_host),
+                      cp_handler->chan_orth_mat_buf(),
+                      ue_pair_tv.chan_orth_size / sizeof(float));
+        compare_array("SETUP_muUeGrp_srs_snr", ue_pair_tv.srs_snr_host,
+                      cp_handler->get_srs_snr_buf(),
+                      ue_pair_tv.srs_snr_size / sizeof(float));
+        compare_array("SETUP_muUeGrp_srs_chan_est",
+                      ue_pair_tv.srs_chan_est_host,
+                      cp_handler->get_srs_chan_est_buf(),
+                      ue_pair_tv.srs_chan_est_size / sizeof(uint8_t));
+
+        // TODO: Compare cubb_srs_buf
+        // compare_array("SETUP_muUeGrp_cubb_srs_buf",
+        //               reinterpret_cast<float *>(ue_pair_tv.cubb_srs_buf_host),
+        //               reinterpret_cast<float *>(cp_handler->get_cubb_srs_buf()),
+        //               ue_pair_tv.cubb_srs_buf_size / sizeof(float));
+    }
+
     return 0;
 }
 
@@ -978,5 +1152,55 @@ int cumac_task::validate_buffer_callback()
     {
         compare_array("pfmSortSol", reinterpret_cast<uint8_t*>(tv->pfmSortSol.data()), reinterpret_cast<uint8_t*>(output_pfmSortSol), cell_num * sizeof(cumac_pfm_output_cell_info_t), 1);
     }
+
+    if (taskBitMask & (0x1 << CUMAC_TASK_MU_UE_GRP))
+    {
+        if (tv->ue_pair.empty())
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUMAC_CP_EVENT, "{}: ue_pair vector empty; cannot validate MU UE GRP callback", __func__);
+            return -1;
+        }
+        const size_t slot_id = (ss.u16.sfn * SLOT_NUM_PER_FRAME + ss.u16.slot) % tv->ue_pair.size();
+        ue_pair_tv_t &ue_pair_tv = tv->ue_pair[slot_id];
+        if (ue_pair_tv.mu_ue_pair_tv_loaded && !ue_pair_tv.muUeGrpSol.empty())
+        {
+            compare_array("muUeGrpSol", reinterpret_cast<uint8_t*>(ue_pair_tv.muUeGrpSol.data()),
+                          reinterpret_cast<uint8_t*>(output_muUeGrpSol), cell_num * sizeof(cumac_muUeGrp_resp_info_t), 1);
+            print_array("muUeGrpSol_TV", reinterpret_cast<uint8_t*>(ue_pair_tv.muUeGrpSol.data()), cell_num * sizeof(cumac_muUeGrp_resp_info_t), 1);
+        }
+    }
     return 0;
+}
+
+order_sem::order_sem(std::size_t num_worker_threads)
+{
+    const std::size_t d = num_worker_threads == 0 ? 1 : num_worker_threads;
+    sems_.resize(d);
+    for (std::size_t i = 0; i < d; ++i)
+    {
+        sem_init(&sems_[i], 0, i == 0 ? 1 : 0);
+    }
+    NVLOGC_FMT(TAG, "order_sem: initialized with {} semaphores", d);
+}
+
+order_sem::~order_sem()
+{
+    for (sem_t& s : sems_)
+    {
+        sem_destroy(&s);
+    }
+}
+
+void order_sem::assign_for_enqueue(cumac_task& task)
+{
+    if (task.slot_concurrent_enable != 0 || sems_.empty())
+    {
+        task.order_wait_sem  = nullptr;
+        task.order_post_sem = nullptr;
+        return;
+    }
+    const uint64_t s = next_seq_.fetch_add(1, std::memory_order_acq_rel);
+    const std::size_t d = sems_.size();
+    task.order_wait_sem  = &sems_[static_cast<std::size_t>(s % d)];
+    task.order_post_sem = &sems_[static_cast<std::size_t>((s + 1) % d)];
 }

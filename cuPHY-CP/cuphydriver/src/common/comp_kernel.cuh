@@ -16,7 +16,7 @@
  */
 
 #pragma once
-#include "cuphydriver_api.hpp"
+#include "compression_types.hpp"  // compression_params, mod_compression_params
 #include "QAM_comp.cuh"
 
 #define COMPRESSION_THREADS 576

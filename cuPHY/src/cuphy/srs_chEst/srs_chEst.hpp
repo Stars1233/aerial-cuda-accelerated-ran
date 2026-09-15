@@ -183,7 +183,12 @@ struct ueDescr_t{
         // temp wideband report
         float   tmpWidebandNoiseEnergy  = 0;
         float   tmpWidebandSignalEnergy = 0;
-        __half2 tmpWidebandScCorr       = __floats2half2_rn(0.f, 0.f);
+        // FP32 (magnitude-weighted) accumulator: the wideband ScCorr summed over compute
+        // blocks must stay magnitude(|H|^2)-weighted for an unbiased ToA on frequency-
+        // selective channels. A __half2 accumulator forced a per-block unit-normalization
+        // (to avoid FP16 overflow at live BFP9 scale) which biased toEstMicroSec. This is
+        // an internal descriptor field (not the FAPI report), so float2 is free here.
+        float2  tmpWidebandScCorr       = {0.f, 0.f};
         float   tmpWidebandCsCorrUse    = 0;
         float   tmpWidebandCsCorrNotUse = 0;
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -110,17 +110,19 @@ cuphyStatus_t tensor_fill(const tensor_desc&    tdesc,
     s  = CUPHY_STATUS_UNSUPPORTED_TYPE;
     switch(tType)
     {
-    case CUPHY_R_8U:  s = launch_fill<CUPHY_R_8U> (tLayout, addr, value, strm); break;
-    case CUPHY_R_8I:  s = launch_fill<CUPHY_R_8I> (tLayout, addr, value, strm); break;
-    case CUPHY_R_16U: s = launch_fill<CUPHY_R_16U>(tLayout, addr, value, strm); break;
-    case CUPHY_R_16I: s = launch_fill<CUPHY_R_16I>(tLayout, addr, value, strm); break;
-    case CUPHY_R_16F: s = launch_fill<CUPHY_R_16F>(tLayout, addr, value, strm); break;
-    case CUPHY_R_32F: s = launch_fill<CUPHY_R_32F>(tLayout, addr, value, strm); break;
-    case CUPHY_R_32U: s = launch_fill<CUPHY_R_32U>(tLayout, addr, value, strm); break;
-    case CUPHY_R_32I: s = launch_fill<CUPHY_R_32I>(tLayout, addr, value, strm); break;
-    case CUPHY_C_16F: s = launch_fill<CUPHY_C_16F>(tLayout, addr, value, strm); break;
-    case CUPHY_C_32F: s = launch_fill<CUPHY_C_32F>(tLayout, addr, value, strm); break;
-    default:                                                                    break;
+    case CUPHY_R_8U:      s = launch_fill<CUPHY_R_8U>     (tLayout, addr, value, strm); break;
+    case CUPHY_R_8I:      s = launch_fill<CUPHY_R_8I>     (tLayout, addr, value, strm); break;
+    case CUPHY_R_16U:     s = launch_fill<CUPHY_R_16U>    (tLayout, addr, value, strm); break;
+    case CUPHY_R_16I:     s = launch_fill<CUPHY_R_16I>    (tLayout, addr, value, strm); break;
+    case CUPHY_R_16F:     s = launch_fill<CUPHY_R_16F>    (tLayout, addr, value, strm); break;
+    case CUPHY_R_32F:     s = launch_fill<CUPHY_R_32F>    (tLayout, addr, value, strm); break;
+    case CUPHY_R_32U:     s = launch_fill<CUPHY_R_32U>    (tLayout, addr, value, strm); break;
+    case CUPHY_R_32I:     s = launch_fill<CUPHY_R_32I>    (tLayout, addr, value, strm); break;
+    case CUPHY_C_16F:     s = launch_fill<CUPHY_C_16F>    (tLayout, addr, value, strm); break;
+    case CUPHY_C_32F:     s = launch_fill<CUPHY_C_32F>    (tLayout, addr, value, strm); break;
+    case CUPHY_R_8F_E4M3: s = launch_fill<CUPHY_R_8F_E4M3>(tLayout, addr, value, strm); break;
+    case CUPHY_R_8F_E5M2: s = launch_fill<CUPHY_R_8F_E5M2>(tLayout, addr, value, strm); break;
+    default:                                                                            break;
     } // switch 
 
     return s;

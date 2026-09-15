@@ -19,6 +19,7 @@
 //#include <cooperative_groups.h>
 #include "polar_encoder.hpp"
 #include "polar_encoder.cuh"
+#include "polar_encoder_pdcch.cuh"
 #include "cuphy_api.h"
 
 using namespace cooperative_groups;
@@ -37,9 +38,6 @@ CUDA_BOTH_INLINE constexpr T round_up_to_next(T val, T increment)
 static constexpr uint32_t N_THRDS_PER_WARP      = 32;         // cudaDeviceProp::warpSize;
 static constexpr uint32_t FULL_WARP_ACTIVE_BMSK = 0xFFFFFFFF; // bitmaks when all threads in a warp are active
 static constexpr uint32_t N_THRDS_PER_TILE      = N_THRDS_PER_WARP;
-static constexpr uint32_t N_BITS_PER_WORD       = 32;
-static constexpr uint32_t N_BITS_PER_BYTE       = 8;
-static constexpr uint32_t N_BYTES_PER_WORD      = 4;
 
 // Sizing the thread block as needed by maximum number of coded bits
 // max(N_MAX_INFO_BITS, N_MAX_CODED_BITS) = N_MAX_CODED_BITS
@@ -146,11 +144,7 @@ static __device__ __constant__ uint16_t POLAR_REL_SEQ_IDXS_512[] =
   493,	499,	502,	494,	501,	447,	505,	506,	479,	508,	495,	503,	507,	509,	510,	511
 };
 
-// Table for encoded bit sub-block interleaving 
-static __device__ __constant__ uint8_t POLAR_ENC_CODED_BIT_INTERLEAVER_IDX[] = 
-{
-   0,  1,  2,  4,  3,  5,  6,  7,  8, 16,  9, 17, 10, 18, 11, 19, 12, 20, 13, 21, 14, 22, 15, 23, 24, 25, 26, 28, 27, 29, 30, 31
-};
+// Table for encoded bit sub-block interleaving (POLAR_ENC_CODED_BIT_INTERLEAVER_IDX) now lives in polar_encoder_pdcch.cuh
 
 // clang-format on
 
@@ -205,14 +199,10 @@ static constexpr uint32_t N_MAX_SORT_ENTRIES = roundUpToPow2(N_MAX_INFO_BITS);
 // - hold the largest sequence possible, this is N_MAX_CODED_BITS
 // - hold the largest padding for bitonic sort
 //   Maximum number of entries to pad = largest bitonic sort size (256) - smallest number of information bits which needs the largest bitonic sort size (129)
-static constexpr uint32_t REL_SEQ_IDX_BUF_PAD = N_MAX_SORT_ENTRIES - ((N_MAX_SORT_ENTRIES/2) + 1);
+static constexpr uint32_t REL_SEQ_IDX_BUF_PAD = N_MAX_SORT_ENTRIES - ((N_MAX_SORT_ENTRIES / 2) + 1);
 static constexpr uint32_t REL_SEQ_IDX_BUF_LEN = N_MAX_CODED_BITS + REL_SEQ_IDX_BUF_PAD;
 
-// Round n upto nearest power of 2 runtime
-static __device__ __forceinline__ uint32_t roundUpToPow2Gpu(uint32_t n)
-{
-    return (n > 1) ? (1U << (32 - __clz(n - 1))) : 1;
-}
+// N_RM_SCRATCH_BYTES and roundUpToPow2Gpu now live in polar_encoder_pdcch.cuh
 
 static __host__ __forceinline__ uint32_t roundUpToPow2Cpu(uint32_t n)
 {
@@ -329,8 +319,8 @@ __device__ void computeInterleaverIdxs(thread_block const& thisThrdBlk, thread_b
 
     // Flag to determine Bit Interleaving based on UL or DL Encoder implementation
     // DL Encoder (default) needs Bit Interleaving, while UL Encoder doesn't need it
-    uint8_t bitInterleaverUlDlIdx =  (thrdIdxInBlk < N_MAX_INFO_BITS) ? (procModeBmsk && 0x1) ? thrdIdxInBlk : POLAR_ENC_INFO_BIT_INTERLEAVER_IDX[thrdIdxInBlk] : 0; 
-    
+    uint8_t bitInterleaverUlDlIdx = (thrdIdxInBlk < N_MAX_INFO_BITS) ? (procModeBmsk & 0x1) ? thrdIdxInBlk : POLAR_ENC_INFO_BIT_INTERLEAVER_IDX[thrdIdxInBlk] : 0;
+
     // predicate for stream compaction
     bool validInterleaverIdx =
         ((thrdIdxInBlk < N_MAX_INFO_BITS) && (bitInterleaverUlDlIdx >= interleaverTblStartIdx)) ?
@@ -339,10 +329,10 @@ __device__ void computeInterleaverIdxs(thread_block const& thisThrdBlk, thread_b
 
     // Activate as many thread tiles as there are interleaver indices (i.e. max number of coded bits)
     static constexpr uint32_t N_ACTIVE_THRDS      = round_up_to_next(N_MAX_INFO_BITS, N_THRDS_PER_TILE);
-    static constexpr uint32_t N_ACTIVE_THRD_TILES = N_ACTIVE_THRDS / N_THRDS_PER_TILE;    
+    static constexpr uint32_t N_ACTIVE_THRD_TILES = N_ACTIVE_THRDS / N_THRDS_PER_TILE;
     static_assert((N_ACTIVE_THRD_TILES <= N_MAX_THRD_TILES), "Active thread tiles needed exceed max limit");
 
-    int32_t  thrdOffset  = 0;
+    int32_t thrdOffset = 0;
     strmCompactionHelper<N_THRDS_PER_TILE>(thisThrdBlk, thisThrdTile, validInterleaverIdx, N_ACTIVE_THRD_TILES, pTileStartOffsets, thrdOffset);
 
     // Wait for accumulations to complete
@@ -373,11 +363,10 @@ __device__ void computeInterleaverIdxs(thread_block const& thisThrdBlk, thread_b
 #endif
 }
 
-
 // Number of entries to be sorted needs to be power of 2 for Bitonic sort
 __device__ __forceinline__ uint32_t getNumBitonicSortEntries(uint32_t nEntries)
 {
-    uint32_t nSortEntries = roundUpToPow2Gpu(nEntries);
+    uint32_t nSortEntries = roundUpToPow2U32(nEntries);
     if(nSortEntries < 2) nSortEntries = 2;
 
     // the bitonic sort code is never called
@@ -389,54 +378,24 @@ __device__ __forceinline__ uint32_t getNumBitonicSortEntries(uint32_t nEntries)
     return nSortEntries;
 }
 
+//--------------------------------------------------------------------------------------------------------
+// Bit-extraction helpers (getBitPos*, getBit, getBitValue) now live in polar_encoder_pdcch.cuh
 
 //--------------------------------------------------------------------------------------------------------
-// Helpers for Bit extraction
-__device__ __forceinline__ uint32_t getBitPosIdxInWord(uint32_t bitPos)
-{
-    return bitPos % N_BITS_PER_WORD;
-}
-
-__device__ __forceinline__ uint32_t getBitPosIdxInByte(uint32_t bitPos)
-{
-    return bitPos % N_BITS_PER_BYTE;
-}
-
-__device__ __forceinline__ uint32_t getBitPosWordIdx(uint32_t bitPos)
-{
-    return bitPos / N_BITS_PER_WORD;
-}
-
-__device__ __forceinline__ uint32_t getBitPosByteIdx(uint32_t bitPos)
-{
-    return bitPos / N_BITS_PER_BYTE;
-}
-
-__device__ __forceinline__ bool getBit(uint32_t const* pWords, uint32_t bitPos)
-{
-    return ((pWords[getBitPosWordIdx(bitPos)] >> getBitPosIdxInWord(bitPos)) & 0x1);
-}
-
-__device__ __forceinline__ bool getBit(uint8_t const* pBytes, uint32_t bitPos)
-{
-    return ((pBytes[getBitPosByteIdx(bitPos)] >> getBitPosIdxInByte(bitPos)) & 0x1);
-}
-
-//--------------------------------------------------------------------------------------------------------
-// Helpers for Bit set/clear/move
-__device__ __forceinline__ void atomicSetBit(uint32_t* pWords, uint32_t bitPos)
+// Helpers for Bit set/clear/move (legacy path; kept for reference — current rateMatch uses unpacked bytes)
+[[maybe_unused]] __device__ __forceinline__ void atomicSetBit(uint32_t* pWords, uint32_t bitPos)
 {
     uint32_t bitMsk = 1U << getBitPosIdxInWord(bitPos);
     atomicOr(&pWords[getBitPosWordIdx(bitPos)], bitMsk);
 }
 
-__device__ __forceinline__ void atomicClrBit(uint32_t* pWords, uint32_t bitPos)
+[[maybe_unused]] __device__ __forceinline__ void atomicClrBit(uint32_t* pWords, uint32_t bitPos)
 {
     uint32_t bitMsk = 1U << getBitPosIdxInWord(bitPos);
     atomicAnd(&pWords[getBitPosWordIdx(bitPos)], ~bitMsk);
 }
 
-__device__ __forceinline__ void atomicMoveBit(uint32_t const* pSrcWords, uint32_t srcBitPos, uint32_t* pDstWords, uint32_t dstBitPos)
+[[maybe_unused]] __device__ __forceinline__ void atomicMoveBit(uint32_t const* pSrcWords, uint32_t srcBitPos, uint32_t* pDstWords, uint32_t dstBitPos)
 {
     if(getBit(pSrcWords, srcBitPos))
     {
@@ -447,6 +406,8 @@ __device__ __forceinline__ void atomicMoveBit(uint32_t const* pSrcWords, uint32_
         atomicClrBit(pDstWords, dstBitPos);
     }
 }
+
+// pack8 / pack32 now live in polar_encoder_pdcch.cuh
 
 __device__ __inline__ void xorBfly(thread_block const& thisThrdBlk, uint32_t nCodedBits, uint32_t* pCodedWords)
 {
@@ -488,6 +449,18 @@ __device__ __inline__ void xorBfly(thread_block const& thisThrdBlk, uint32_t nCo
 #endif
         }
         __syncthreads();
+#ifdef ENABLE_DEBUG
+        if(threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+        {
+            // print pCodedWords
+            for(uint32_t w = 0; w < nCodedBits / 32; w++)
+            {
+                printf("0x%08x, ", pCodedWords[w]);
+            }
+            printf("]; %% butterfly v1 sz=%d\n", size);
+        }
+        __syncthreads();
+#endif
 
 #ifdef ENABLE_DEBUG
         uint32_t nCodedWords = nCodedBits / N_BITS_PER_WORD;
@@ -498,6 +471,79 @@ __device__ __inline__ void xorBfly(thread_block const& thisThrdBlk, uint32_t nCo
 #endif
     }
 }
+
+// Compute d = u*G (38.212 5.3.1.2) via butterfly, where
+//   u is Nx1 msg word, at "pCodedWords", in device memory;
+//   scratch (in shared mem), Nx1 byte array (bit0 of each byte is valid). We use this buffer to unpack N bits in "u";
+//   d is Nx1 codeword, at "pCodedWords", in device memory;
+//   G is NxN matrix, the n-th Kronecker power of G2 = [1 0; 1 1].
+// 1. At each butterfly stage, threads work independently.
+// 2. If N = 512: Only 256 threads are utilized here.
+//
+// Note: only SSB TX uses this function.
+__device__ void xorBfly_v2(thread_block const& thisThrdBlk, uint32_t nCodedBits, uint32_t* pCodedWords, uint8_t* scratch)
+{
+    uint32_t thrdIdxInBlk = thisThrdBlk.thread_rank();
+    bool     thrdEnable   = (thrdIdxInBlk < nCodedBits / 2);
+    uint8_t* x            = scratch;
+
+    // unpack bits into byte array "x", where bit0 of x[k] is k-th bit.
+    for(uint32_t i = thrdIdxInBlk; i < nCodedBits; i += thisThrdBlk.size())
+    {
+        x[i] = ((pCodedWords[i / 32] >> (i % 32)) & 0x1);
+    }
+    __syncthreads();
+
+    // compute d = u*G
+    for(uint32_t size = 2; size <= nCodedBits; size <<= 1)
+    {
+        if(thrdEnable)
+        {
+            uint32_t stride  = size / 2;
+            uint32_t idx     = 2 * thrdIdxInBlk - (thrdIdxInBlk & (stride - 1));
+            uint32_t bitPos1 = idx + 0;
+            uint32_t bitPos2 = idx + stride;
+            x[bitPos1] ^= x[bitPos2];
+        }
+        __syncthreads();
+
+#ifdef DEBUG
+        { // pack & print
+            __syncthreads();
+            if(thrdIdxInBlk == 0 && blockIdx.x == 0 && blockIdx.y == 0)
+            {
+                uint32_t tmp[N_MAX_CODED_BITS / 32]{};
+                for(uint32_t i = 0; i < nCodedBits; i++)
+                {
+                    tmp[i / 32] |= (x[i] << (i % 32));
+                }
+                printf("w_%d = [", size);
+                for(uint32_t w = 0; w < nCodedBits / 32; w++)
+                {
+                    printf("0x%08x, ", tmp[w]);
+                }
+                printf("]; %% butterfly v2\n");
+            }
+            __syncthreads();
+        }
+#endif
+    }
+
+    // pack x into pCodedWords: 1 thread packs 8 bits.
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(pCodedWords);
+    for(uint32_t byte_idx = thrdIdxInBlk; byte_idx < nCodedBits / 8; byte_idx += thisThrdBlk.size())
+    {
+        uint8_t b{};
+        for(uint32_t i = 0; i < 8; i++)
+        {
+            b |= (x[byte_idx * 8 + i] << i);
+        }
+        bytes[byte_idx] = b;
+    }
+    __syncthreads();
+}
+
+// u2d now lives in polar_encoder_pdcch.cuh
 
 //--------------------------------------------------------------------------------------------------------
 #if 0
@@ -689,8 +735,8 @@ __device__ void encode(uint32_t nInfoBits, uint32_t nCodedBits, uint32_t nTxBits
         bool           isForbidden  = (((lutRelSeqIdx >= intervalStart[0]) && (lutRelSeqIdx <= intervalEnd[0])) ||
                             ((lutRelSeqIdx >= intervalStart[1]) && (lutRelSeqIdx <= intervalEnd[1])) ||
                             ((lutRelSeqIdx >= intervalStart[2]) && (lutRelSeqIdx <= intervalEnd[2]))) ?
-                               true :
-                               false;
+                                          true :
+                                          false;
 
         if(!isForbidden) pred = true;
     }
@@ -713,7 +759,6 @@ __device__ void encode(uint32_t nInfoBits, uint32_t nCodedBits, uint32_t nTxBits
 
     // Total number of reliability sequence indices available
     uint32_t prunedRelSeqLen = __syncthreads_count(pred);
-
 
     // Indices are stored in the last prunedRelSeqLen locations of the buffer
     int32_t prunedRelSeqStartIdx = REL_SEQ_IDX_BUF_LEN - prunedRelSeqLen;
@@ -760,7 +805,7 @@ __device__ void encode(uint32_t nInfoBits, uint32_t nCodedBits, uint32_t nTxBits
     // set parity bit index value to be 1 more than max info bits
     static constexpr uint8_t PARITY_BIT_IDX = N_MAX_INFO_BITS + 1;
     if(thrdIdxInBlk < nCodedBits)
-    {        
+    {
         // Initialize by marking all coded bits as parity bits
         pCodedBitIdxs[thrdIdxInBlk] = PARITY_BIT_IDX;
     }
@@ -800,8 +845,8 @@ __device__ void encode(uint32_t nInfoBits, uint32_t nCodedBits, uint32_t nTxBits
     {
         // Apply bit interleaving to reliability sequence indices (convenient instead of interleaving information bits)
         //  sensitive_memory_access fixing
-        int32_t interleaverIdxTblOffset  = pInvInterleaverIdxs[thrdIdxInBlk];
-        int16_t interleavedRelSeqIdx = pRelSeqIdxsPrunedSorted[interleaverIdxTblOffset];
+        int32_t interleaverIdxTblOffset = pInvInterleaverIdxs[thrdIdxInBlk];
+        int16_t interleavedRelSeqIdx    = pRelSeqIdxsPrunedSorted[interleaverIdxTblOffset];
 #if 0
         if ((interleavedRelSeqIdx < 0) || (interleavedRelSeqIdx >= N_MAX_CODED_BITS)) {
             printf("threadIdx.x %d, block %d, %d, interleavedRelSeqIdx invalid %d, max %d\n",
@@ -858,135 +903,14 @@ __device__ void encode(uint32_t nInfoBits, uint32_t nCodedBits, uint32_t nTxBits
 
     //--------------------------------------------------------------------------------------------------------
     // Butterfly xor
-    xorBfly(thisThrdBlk, nCodedBits, pCodedWords);
+    uint8_t* scratch = reinterpret_cast<uint8_t*>(pSmem);
+    xorBfly_v2(thisThrdBlk, nCodedBits, pCodedWords, scratch);
 }
+
+// print_1d / pack_and_print_1d / encode_pdcch_pbch_LUT now live in polar_encoder_pdcch.cuh
 
 //--------------------------------------------------------------------------------------------------------
-// Polar rate-matching
-// Note: pTxBits needs to be word alinged and padded to a multiple of word length
-__device__ void rateMatch(uint32_t nInfoBits, uint32_t nCodedBits, uint32_t nTxBits, uint8_t const* pInCodedBits, uint32_t* pSmem, uint8_t* pTxBits)
-{
-    thread_block const& thisThrdBlk  = this_thread_block();
-    uint32_t            thrdIdxInBlk = thisThrdBlk.thread_rank();
-    uint32_t            nThrds       = thisThrdBlk.size();
-
-    //--------------------------------------------------------------------------------------------------------
-    // Sub-block interleaving
-    // Reference: 3GPP TS 38.212, section 5.4.1.1, Sub-block interleaving
-    // The coded bits are divided into 32 sub-blocks. The sub-block size is [1,2,4,8,16] bits respectively for
-    // nCodedBits values [32,64,128,256,512]. These sub-blocks are interleaved
-    uint8_t scaleFactor = nCodedBits / N_MIN_CODED_BITS;
-    uint8_t nCodedBytes = nCodedBits / N_BITS_PER_BYTE;
-
-    // Bit selection uses interleaved coded bits
-    uint32_t const* pInCodedWords          = reinterpret_cast<uint32_t const*>(pInCodedBits);
-    uint32_t*       pInterleavedCodedWords = pSmem;
-    uint8_t*        pInterleavedCodedBits  = reinterpret_cast<uint8_t*>(pSmem);
-    // Since nThrdsInBlk >= nCodedBits, each thread may be used to interleave one coded bit
-    if(thrdIdxInBlk < nCodedBits)
-    {
-        uint32_t interleaverTblIdx = thrdIdxInBlk / scaleFactor;
-        uint32_t interleavedBitPos = (POLAR_ENC_CODED_BIT_INTERLEAVER_IDX[interleaverTblIdx] * scaleFactor) +
-                                     (thrdIdxInBlk % scaleFactor);
-
-        uint32_t srcBitPos = interleavedBitPos;
-        uint32_t dstBitPos = thrdIdxInBlk;
-        atomicMoveBit(pInCodedWords, srcBitPos, pInterleavedCodedWords, dstBitPos);
-                
-#ifdef ENABLE_DEBUG
-        printf("polarRateMatch Wr: dstBitPos %d, dstByteIdx %d, dstWordIdx %d\n", srcBitPos, getBitPosByteIdx(dstBitPos), getBitPosWordIdx(dstBitPos));
-        printf("interleavedBitPos/srcBitPos %d dstBitPos %d interleaverTblIdx %d \n", interleavedBitPos, dstBitPos, interleaverTblIdx);
-#endif
-    }
-
-    __syncthreads();
-
-    // Note that the following also assumes that nCodedBits is a multiple of 32
-    static_assert((N_MIN_CODED_BITS == N_BITS_PER_WORD), "Number of coded bits assumed to be >= 32");
-    uint32_t nCodedWords = nCodedBits / N_BITS_PER_WORD;
-
-#ifdef ENABLE_DEBUG
-    if(thrdIdxInBlk < nCodedWords)
-        printf("CodedWords[%d]: input 0x%08x interleaved 0x%08x\n", thrdIdxInBlk, pInCodedWords[thrdIdxInBlk], pInterleavedCodedWords[thrdIdxInBlk]);
-#endif
-
-    //--------------------------------------------------------------------------------------------------------
-    // Bit selection
-    // Reference: 3GPP TS 38.212, Section 5.4.1.2, Bit selection
-
-    uint32_t* pTxWords    = reinterpret_cast<uint32_t*>(pTxBits);
-    uint32_t  nTxWords    = nTxBits / N_BITS_PER_WORD;
-    uint32_t  nTxRemBytes = (nTxBits % N_BITS_PER_WORD) / N_BITS_PER_BYTE;
-    uint32_t  nTxRemBits  = ((nTxBits % N_BITS_PER_WORD) % N_BITS_PER_BYTE);
-
-    // Repetition
-    if(nTxBits >= nCodedBits)
-    {
-        // Marshal the bits in word sized chunks
-        if(thrdIdxInBlk < nTxWords)
-        {
-            pTxWords[thrdIdxInBlk] = pInterleavedCodedWords[thrdIdxInBlk % nCodedWords];
-
-#ifdef ENABLE_DEBUG
-            printf("TxWord[%03d]: 0x%08x\n", thrdIdxInBlk, pTxWords[thrdIdxInBlk]);
-#endif
-        }
-
-        // Marshal rest of the bits (which fit in byte sized chunks) in byte units
-        uint32_t startByteOffset = nTxWords * N_BYTES_PER_WORD;
-        if(thrdIdxInBlk < nTxRemBytes)
-        {
-            uint32_t byteIdx = startByteOffset + thrdIdxInBlk;
-            pTxBits[byteIdx] = pInterleavedCodedBits[byteIdx % nCodedBytes];
-
-#ifdef ENABLE_DEBUG
-            printf("TxBytes[%03d]: 0x%02x\n", byteIdx, pTxBits[byteIdx]);
-#endif
-        }
-
-        // Marshal remaining in bits
-        uint32_t byteIdx = startByteOffset + nTxRemBytes;
-
-        // Pick thread with rank 0
-        if((nTxRemBits > 0) && (0 == thrdIdxInBlk))
-        {
-            // nTxRemBits is expected to be < 8bits (if > 8 bits, it would already be moved by the byte
-            // movement section above)
-            uint8_t bmsk     = (1U << nTxRemBits) - 1;
-            pTxBits[byteIdx] = pInterleavedCodedBits[byteIdx] & bmsk;
-
-#ifdef ENABLE_DEBUG
-            printf("InterleavedCodedBits[%03d]: 0x%02x bmsk %0x08 startByteOffset %d nTxRemBytes %d\n", byteIdx, pInterleavedCodedBits[byteIdx], bmsk, startByteOffset, nTxRemBytes);
-            printf("TxBytes[%03d]: 0x%02x\n", byteIdx, pTxBits[byteIdx]);
-#endif
-        }
-    }
-    // nTxBits < nCodedBits
-    else
-    {
-        // Shortening: From nCodedBits, select the first nTxBits
-        uint32_t srcStartBitPos = 0;
-
-        // Puncturing: From nCodedBits, select the last nTxBits
-        constexpr float INFO_TX_BITS_RATIO_THD = (7.0f / 16.0f);
-        if((static_cast<float>(nInfoBits) / static_cast<float>(nTxBits)) <= INFO_TX_BITS_RATIO_THD)
-        {
-            srcStartBitPos = nCodedBits - nTxBits;
-        }
-
-        // if(0 == thrdIdxInBlk) printf("polarRateMatch: srcStartBitPos %d nCodedBits %d nTxBits %d\n", srcStartBitPos, nCodedBits, nTxBits);
-
-        // If we are here then nCodedBits > nTxBits. Since nThrdsInBlk >= nCodedBits, there must be enough
-        // threads to move all info bits with one thread per bit
-        if(thrdIdxInBlk < nTxBits)
-        {
-            uint32_t srcBitPos = srcStartBitPos + thrdIdxInBlk;
-            uint32_t dstBitPos = thrdIdxInBlk;
-            atomicMoveBit(pInterleavedCodedWords, srcBitPos, pTxWords, dstBitPos);            
-            // printf("polarRateMatch Rd: srcBitPos %d, srcByteIdx %d, srcWordIdx %d\n", srcBitPos, getBitPosByteIdx(srcBitPos), getBitPosWordIdx(srcBitPos));
-        }
-    }
-}
+// rateMatch (polar rate-matching for PBCH and PDCCH) now lives in polar_encoder_pdcch.cuh
 
 //--------------------------------------------------------------------------------------------------------
 // Encode rate match kernel entry
@@ -1007,12 +931,13 @@ __global__ void encodeRateMatchKernel(uint32_t nInfoBits, uint32_t nCodedBits, u
     // interleavedInfoBits       no       N_MAX_INFO_BITS*sizeof(uint8_t)
     // codedBitIdxs              no       N_MAX_CODED_BITS*sizeof(uint8_t)     // array containing the index of info bit or parity bit to be placed in a coded bit location
 
-    // smemRateMatch            yes       (N_MAX_CODED_BITS/8)*sizeof(uint8_t) // overlaid with invInterleaverIdxs
+    // rateMatch scratch        yes       N_RM_SCRATCH_BYTES at smem start after encode (unpacked ivl + tx stage)
 
     constexpr uint32_t N_SMEM_ELEMS =
         N_MAX_THRD_TILES * sizeof(int32_t) + REL_SEQ_IDX_BUF_LEN * sizeof(int16_t) +
         N_MAX_INFO_BITS * sizeof(uint8_t) + N_MAX_INFO_BITS * sizeof(uint8_t) +
         N_MAX_CODED_BITS * sizeof(uint8_t);
+    static_assert(N_SMEM_ELEMS >= N_RM_SCRATCH_BYTES, "smem must hold rateMatch scratch at start after encode");
 
     __shared__ __align__(sizeof(uint32_t)) uint8_t smemBlk[N_SMEM_ELEMS];
     uint32_t*                                      pSmem = reinterpret_cast<uint32_t*>(smemBlk);
@@ -1029,35 +954,43 @@ __global__ void encodeRateMatchKernel(uint32_t nInfoBits, uint32_t nCodedBits, u
     rateMatch(nInfoBits, nCodedBits, nTxBits, pCodedBits, pSmem, pTxBits);
 }
 
-__global__ void encodeRateMatchMultipleDCIsKernel(uint8_t const* pInfoBits, uint8_t* pCodedBits, uint8_t* pTxBits, cuphyPdcchDciPrm_t* pPdcchDciParams, uint8_t* pDciTmInfo)
+// pdcch_polar_cidx2uidx_lut_elem_offset now lives in polar_encoder_pdcch.cuh
+
+__global__ void encodeRateMatchMultipleDCIsKernel(uint8_t const*      pInfoBits,
+                                                  uint8_t*            pCodedBits,
+                                                  uint8_t*            pTxBits,
+                                                  cuphyPdcchDciPrm_t* pPdcchDciParams,
+                                                  uint8_t*            pDciTmInfo,
+                                                  const uint16_t*     pCidx2uidxTable)
 {
-    constexpr uint32_t N_SMEM_ELEMS =
-        N_MAX_THRD_TILES * sizeof(int32_t) + 2*N_MAX_CODED_BITS * sizeof(int16_t) +
-        N_MAX_INFO_BITS * sizeof(uint8_t) + N_MAX_INFO_BITS * sizeof(uint8_t) +
-        N_MAX_CODED_BITS * sizeof(uint8_t);
+    // shared memory usage: N bytes.
+    // (1) in encoding: N bytes needed
+    // (2) in rate-matching: N + 32 bytes needed.
+    constexpr uint32_t N_SMEM_ELEMS = (N_MAX_CODED_BITS + 32) * sizeof(uint8_t);
+    static_assert(N_SMEM_ELEMS >= N_RM_SCRATCH_BYTES, "smem must hold rateMatch scratch at start after encode");
     // Added check in PDCCH setup prep. function to ensure this kernel is never launched if there is a DCI in !testing_mode with invalid payload size,
     // to avoid illegal accesses to shared memory.
 
     __shared__ __align__(sizeof(uint32_t)) uint8_t smemBlk[N_SMEM_ELEMS];
     uint32_t*                                      pSmem = reinterpret_cast<uint32_t*>(smemBlk);
 
-    const int DCI_id = blockIdx.x;
+    const int           DCI_id     = blockIdx.x;
     cuphyPdcchDciPrm_t& dci_params = pPdcchDciParams[DCI_id];
 
-    const uint32_t offset = DCI_id * CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES_W_CRC;
+    const uint32_t offset           = DCI_id * CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES_W_CRC;
     const uint32_t d_x_coded_offset = DCI_id * (CUPHY_POLAR_ENC_MAX_CODED_BITS / 8);
-    const uint32_t tx_offset = DCI_id * (CUPHY_PDCCH_MAX_TX_BITS_PER_DCI / 8); // offset in bytes
+    const uint32_t tx_offset        = DCI_id * (CUPHY_PDCCH_MAX_TX_BITS_PER_DCI / 8); // offset in bytes
 
     const uint32_t nInfoBits = CUPHY_PDCCH_N_CRC_BITS + dci_params.Npayload;
-    const uint32_t nTxBits = 2 * 9 * 6 * dci_params.aggr_level;
-    const uint32_t roundUpToPow2_nTxBits = 2 * 64 * dci_params.aggr_level; // Reminder: possible aggregation level values {1, 2, 4, 8, 16}
+    const uint32_t nTxBits   = 2 * 9 * 6 * dci_params.aggr_level;
 
     // Find if this DCI is in testing mode or not. If it is, perform D2D copy of payload,
     // skipping encoding and rate-matching, and exit.
     uint8_t testing_mode = (pDciTmInfo[DCI_id >> 3] >> (DCI_id & 0x7)) & 0x1;
-    if (testing_mode != 0) //Could also check byte first and then narrow down if needed
+    if(testing_mode != 0) //Could also check byte first and then narrow down if needed
     {
-        if ((threadIdx.y == 0) && (threadIdx.x < N_MAX_TM_DCI_TX_BYTES)) {
+        if((threadIdx.y == 0) && (threadIdx.x < N_MAX_TM_DCI_TX_BYTES))
+        {
             // Assumes byte padding which is covered since a 24-bit 0 CRC is added to the 108 bits of the PN sequence
             // in cuphyPdcchPipelinePrepare()
             pTxBits[tx_offset + threadIdx.x] = pInfoBits[offset + threadIdx.x];
@@ -1067,30 +1000,20 @@ __global__ void encodeRateMatchMultipleDCIsKernel(uint8_t const* pInfoBits, uint
 
     //--------------------------------------------------------------------------------------------------------
     // Compute # of coded bits (see section "5.3.1 Polar coding " in 3GPP TS 38.212)
+    const uint32_t nCodedBits = pdcchPolarNumCodedBits(nInfoBits, dci_params.aggr_level);
 
-    uint32_t        nMin1CodedBits         = roundUpToPow2_nTxBits / 2;
-    constexpr float INFO_TX_BITS_RATIO_THD = (9.0f / 16.0f);
-    if((nTxBits > (9 * nMin1CodedBits) / 8) ||
-       ((static_cast<float>(nInfoBits) / static_cast<float>(nTxBits)) >= INFO_TX_BITS_RATIO_THD))
-    {
-        nMin1CodedBits *= 2;
+    const int       log2_AL        = __ffs(static_cast<int>(dci_params.aggr_level)) - 1;
+    const int       c2u_lut_offset = pdcch_polar_cidx2uidx_lut_elem_offset(static_cast<int>(nInfoBits), log2_AL);
+    const uint16_t* pCidx2uidx =
+        (pCidx2uidxTable != nullptr && c2u_lut_offset >= 0 && nInfoBits <= nTxBits) ? (pCidx2uidxTable + static_cast<unsigned>(c2u_lut_offset)) : nullptr;
+
+    // Do not launch kernel if LUT is nullptr, which means the (log2_AL, K) is invalid.
+    if(pCidx2uidx == nullptr) {
+        return;
     }
-
-    // Min number of coded bits possible given the number of info bits and min code rate
-    uint32_t nMin2CodedBits = roundUpToPow2Gpu(nInfoBits * MIN_CODE_RATE_INV);
-    uint32_t nMinCodedBits = (nMin1CodedBits < nMin2CodedBits) ? nMin1CodedBits : nMin2CodedBits;
-
-    uint32_t nCodedBits = nMinCodedBits;
-    if(nCodedBits < N_MIN_CODED_BITS) nCodedBits = N_MIN_CODED_BITS;
-    if(nCodedBits > N_MAX_CODED_BITS) nCodedBits = N_MAX_CODED_BITS;
-
-    // DCI sent over Downlink Channel, Mask set to 0
-    uint32_t procModeBmsk = 0;
-
-    // Call device functions for DCIs that are not in TM
-    encode(nInfoBits, nCodedBits, nTxBits, pInfoBits + offset, pSmem, pCodedBits + d_x_coded_offset, procModeBmsk);
+    encode_pdcch_pbch_LUT(nInfoBits, nCodedBits, nTxBits, pInfoBits + offset, pCidx2uidx, pSmem, pCodedBits + d_x_coded_offset);
     rateMatch(nInfoBits, nCodedBits, nTxBits, pCodedBits + d_x_coded_offset, pSmem, pTxBits + tx_offset);
-}
+} // End of encodeRateMatchMultipleDCIsKernel
 
 void encodeRateMatch(uint32_t nInfoBits, uint32_t nTxBits, uint8_t const* pInfoBits, uint32_t* pNCodedBits, uint8_t* pCodedBits, uint8_t* pTxBits, uint32_t procModeBmsk, cudaStream_t strm)
 {
@@ -1104,7 +1027,6 @@ void encodeRateMatch(uint32_t nInfoBits, uint32_t nTxBits, uint8_t const* pInfoB
     {
         nMin1CodedBits *= 2;
     }
-
 
     // Min number of coded bits possible given the number of info bits and min code rate
     uint32_t nMin2CodedBits = roundUpToPow2Cpu(nInfoBits * MIN_CODE_RATE_INV);
@@ -1141,18 +1063,24 @@ void encodeRateMatch(uint32_t nInfoBits, uint32_t nTxBits, uint8_t const* pInfoB
 cuphyStatus_t kernelSelectEncodeRateMatchMultiDCIs(cuphyEncoderRateMatchMultiDCILaunchCfg_t* pLaunchCfg,
                                                    uint32_t                                  num_DCIs)
 {
-    if (pLaunchCfg == nullptr) return CUPHY_STATUS_INVALID_ARGUMENT;
+    if(pLaunchCfg == nullptr) return CUPHY_STATUS_INVALID_ARGUMENT;
 
-    if (pLaunchCfg->kernelNodeParamsDriver.func == nullptr) {
+    if(pLaunchCfg->kernelNodeParamsDriver.func == nullptr)
+    {
+        // encodeRateMatchMultipleDCIsKernel: LUT-only polar encode (no legacy encode() fallback); host must pass d_cidx2uidx.
         // kernel (only one kernel option for now) and without any specialization, so update function only once
         // func is set to nullptr in PDCCH channel constructor
         void* kernelFunc = reinterpret_cast<void*>(encodeRateMatchMultipleDCIsKernel);
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&pLaunchCfg->kernelNodeParamsDriver.func, kernelFunc));}
+        {
+            MemtraceDisableScope md;
+            CUDA_CHECK(cudaGetFuncBySymbol(&pLaunchCfg->kernelNodeParamsDriver.func, kernelFunc));
+        }
     }
 
     // launch geometry (can change!)
+    // "encodeRateMatchMultipleDCIsKernel" can work with any number of threads. Tested: {32, 64, 128, 512}     
     dim3 gridDim(num_DCIs);
-    dim3 blockDim(N_THRDS_PER_TILE, N_MAX_THRD_TILES);
+    dim3 blockDim = dim3(64, 1, 1);
 
     // populate kernel parameters
     CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = pLaunchCfg->kernelNodeParamsDriver;
@@ -1165,16 +1093,14 @@ cuphyStatus_t kernelSelectEncodeRateMatchMultiDCIs(cuphyEncoderRateMatchMultiDCI
     kernelNodeParamsDriver.gridDimY = gridDim.y;
     kernelNodeParamsDriver.gridDimZ = gridDim.z;
 
-    kernelNodeParamsDriver.extra    = nullptr;
+    kernelNodeParamsDriver.extra          = nullptr;
     kernelNodeParamsDriver.sharedMemBytes = 0;
 
     return CUPHY_STATUS_SUCCESS;
 }
 
-
 __global__ void encodeRateMatchMultipleSSBsKernel(uint8_t const* pInfoBits, uint8_t* pCodedBits, uint8_t* pTxBits)
 {
-
 #if 0
     constexpr uint32_t N_SMEM_ELEMS =
         N_MAX_THRD_TILES * sizeof(int32_t) + 2*N_MAX_CODED_BITS * sizeof(int16_t) +
@@ -1184,10 +1110,11 @@ __global__ void encodeRateMatchMultipleSSBsKernel(uint8_t const* pInfoBits, uint
     // 64 is is nTxBits rounded up to be divible by 32
     // nCodedBits is the same as N_MAX_CODED_BITS
     constexpr uint32_t N_SMEM_ELEMS =
-        N_MAX_THRD_TILES * sizeof(int32_t) + 2*N_MAX_CODED_BITS * sizeof(int16_t) +
+        N_MAX_THRD_TILES * sizeof(int32_t) + 2 * N_MAX_CODED_BITS * sizeof(int16_t) +
         64 * 2 * sizeof(uint8_t) +
         N_MAX_CODED_BITS * sizeof(uint8_t);
 #endif
+    static_assert(N_SMEM_ELEMS >= N_RM_SCRATCH_BYTES, "smem must hold rateMatch scratch at start after encode");
 
     __shared__ __align__(sizeof(uint32_t)) uint8_t smemBlk[N_SMEM_ELEMS];
     uint32_t*                                      pSmem = reinterpret_cast<uint32_t*>(smemBlk);
@@ -1201,9 +1128,9 @@ __global__ void encodeRateMatchMultipleSSBsKernel(uint8_t const* pInfoBits, uint
 
     // Compute offsets in bytes for each SSB. NB: the expectation is that each offset is divisible by 32 bits.
     // Since nInfoBits is not evenly divisible by 32, so it's rounded up accodingly
-    const uint32_t info_offset    = SSB_id * 8; // offset for pInfoBits is (nInfoBits rounded to be divisible by 32) then div. 8
+    const uint32_t info_offset    = SSB_id * 8;                 // offset for pInfoBits is (nInfoBits rounded to be divisible by 32) then div. 8
     const uint32_t x_coded_offset = SSB_id * (nCodedBits >> 3); // offset for pCodedBits
-    const uint32_t tx_offset      = SSB_id * (nTxBits >> 3); // offset for pTxBits
+    const uint32_t tx_offset      = SSB_id * (nTxBits >> 3);    // offset for pTxBits
 
     // SSB sent over Broadcast Channel, Mask set to 0
     uint32_t procModeBmsk = 0;
@@ -1216,13 +1143,16 @@ __global__ void encodeRateMatchMultipleSSBsKernel(uint8_t const* pInfoBits, uint
 cuphyStatus_t kernelSelectEncodeRateMatchMultiSSBs(cuphyEncoderRateMatchMultiSSBLaunchCfg_t* pLaunchCfg,
                                                    uint16_t                                  num_SSBs)
 {
-    if (pLaunchCfg == nullptr) return CUPHY_STATUS_INVALID_ARGUMENT;
+    if(pLaunchCfg == nullptr) return CUPHY_STATUS_INVALID_ARGUMENT;
 
-    if (pLaunchCfg->kernelNodeParamsDriver.func == nullptr)
+    if(pLaunchCfg->kernelNodeParamsDriver.func == nullptr)
     {
         // kernel (only one kernel option for now), so update function once; func set to nullptr in SSB channel constructor
         void* kernelFunc = reinterpret_cast<void*>(encodeRateMatchMultipleSSBsKernel);
-        {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&pLaunchCfg->kernelNodeParamsDriver.func, kernelFunc));}
+        {
+            MemtraceDisableScope md;
+            CUDA_CHECK(cudaGetFuncBySymbol(&pLaunchCfg->kernelNodeParamsDriver.func, kernelFunc));
+        }
     }
 
     // launch geometry (can change!)
@@ -1240,13 +1170,10 @@ cuphyStatus_t kernelSelectEncodeRateMatchMultiSSBs(cuphyEncoderRateMatchMultiSSB
     kernelNodeParamsDriver.gridDimY = gridDim.y;
     kernelNodeParamsDriver.gridDimZ = gridDim.z;
 
-    kernelNodeParamsDriver.extra    = nullptr;
+    kernelNodeParamsDriver.extra          = nullptr;
     kernelNodeParamsDriver.sharedMemBytes = 0;
 
     return CUPHY_STATUS_SUCCESS;
 }
 
-
 } // namespace polar_encoder
-
-

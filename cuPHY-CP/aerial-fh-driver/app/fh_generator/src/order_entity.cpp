@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,7 @@
  */
 
 #include "order_entity.hpp"
+#include <mutex>
 
 namespace fh_gen
 {
@@ -23,7 +24,13 @@ namespace fh_gen
 OrderEntity::OrderEntity(GpuDevice* _gDev, uint64_t _id) :
     gDev(_gDev), id(_id)
 {
-    cudaMallocHost((void**)&order_kernel_config_params, sizeof(orderKernelConfigParams_t));
+    static std::once_flag kernels_resolved;
+    std::call_once(kernels_resolved, []() {
+        if (!resolve_fhgen_cuda_kernels())
+            THROW("Failed to resolve fh_generator CUDA kernel handles");
+    });
+
+    CUDA_DRIVER_CHECK(cuMemAllocHost(reinterpret_cast<void**>(&order_kernel_config_params), sizeof(orderKernelConfigParams_t)));
 
     int index = 0;
     for(auto& order_kernel_exit_cond:order_kernel_exit_cond_gdr){
@@ -55,8 +62,8 @@ OrderEntity::OrderEntity(GpuDevice* _gDev, uint64_t _id) :
     order_end.reset(new host_buf(1 * sizeof(uint32_t), gDev));
     ACCESS_ONCE(*((uint32_t*)order_end->addr())) = 0;
 
-    CUDA_CHECK(cudaEventCreate(&start_order));
-    CUDA_CHECK(cudaEventCreate(&end_order));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_order, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_order, CU_EVENT_DEFAULT));
     active.store(false);
 
     for(auto& rx_pkts_ts:rx_packets_ts){
@@ -75,7 +82,7 @@ OrderEntity::OrderEntity(GpuDevice* _gDev, uint64_t _id) :
 
 OrderEntity::~OrderEntity()
 {
-    cudaFreeHost(order_kernel_config_params);
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(order_kernel_config_params));
 }
 
 uint64_t OrderEntity::getId() const
@@ -95,10 +102,8 @@ int OrderEntity::runOrder(cudaStream_t stream)
         order_kernel_config_params->rx_packets_ts_earliest[cell_idx] = (uint64_t*)rx_packets_ts_earliest[cell_idx]->addrd();
         order_kernel_config_params->rx_packets_ts_latest[cell_idx] = (uint64_t*)rx_packets_ts_latest[cell_idx]->addrd();
     }
-    // CUDA_CHECK(cudaEventRecord(start_order, stream));
     kernel_receive_slot(stream, order_kernel_config_params);
-    // CUDA_CHECK(cudaEventRecord(end_order, stream));
-    launch_kernel_write(stream, (uint32_t*)order_end->addr(), 1);
+    launch_kernel_write(stream, reinterpret_cast<uint32_t*>(order_end->addr()), 1);
     return 1;
 }
 

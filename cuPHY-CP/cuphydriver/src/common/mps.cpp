@@ -35,7 +35,7 @@ MpsCtx::MpsCtx(
     cuCtx = 0;
     gDev->setDevice();
 
-    CU_CHECK_PHYDRIVER(cuDeviceGet(&cuDev, gDev->getId()));
+    CUDA_DRIVER_CHECK(cuDeviceGet(&cuDev, gDev->getId()));
 
 #if CUDART_VERSION >= 11040 // min CUDA version for MPS programmatic API
 
@@ -45,7 +45,7 @@ MpsCtx::MpsCtx(
         {
 
             int actualDevSmCount = 0;
-            CU_CHECK_PHYDRIVER(cuDeviceGetAttribute(&actualDevSmCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuDev));
+            CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&actualDevSmCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuDev));
             //Check number of SMs requested is less than the number of SMs on the device and exit before calling cuCtxCreate_v3.
             if (actualDevSmCount < devSmCount)
             {
@@ -62,9 +62,9 @@ MpsCtx::MpsCtx(
             ctxParams.execAffinityParams = &affinityPrm;
             ctxParams.numExecAffinityParams = 1;
             ctxParams.cigParams = nullptr;
-            CU_CHECK_PHYDRIVER(cuCtxCreate(&cuCtx, &ctxParams, CU_CTX_SCHED_SPIN | CU_CTX_MAP_HOST, cuDev));
+            CUDA_DRIVER_CHECK(cuCtxCreate(&cuCtx, &ctxParams, CU_CTX_SCHED_SPIN | CU_CTX_MAP_HOST, cuDev));
 #else
-            CU_CHECK_PHYDRIVER(cuCtxCreate_v3(&cuCtx, &affinityPrm, 1, CU_CTX_SCHED_SPIN | CU_CTX_MAP_HOST, cuDev));
+            CUDA_DRIVER_CHECK(cuCtxCreate_v3(&cuCtx, &affinityPrm, 1, CU_CTX_SCHED_SPIN | CU_CTX_MAP_HOST, cuDev));
 #endif
 
             // Sanity check, not required!
@@ -77,9 +77,9 @@ MpsCtx::MpsCtx(
     if(devSmCount != 0)
     {
         devSmCount = 0;
-        CU_CHECK_PHYDRIVER(cuDeviceGetAttribute(&devSmCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuDev));
+        CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&devSmCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuDev));
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "GPU ordinal {} gpuId {} SM usage {}", static_cast<int>(cuDev), gDev->getId(), devSmCount);
-        CU_CHECK_PHYDRIVER(cuCtxCreate(&cuCtx, CU_CTX_SCHED_AUTO | CU_CTX_MAP_HOST, cuDev));
+        CUDA_DRIVER_CHECK(cuCtxCreate(&cuCtx, CU_CTX_SCHED_AUTO | CU_CTX_MAP_HOST, cuDev));
     }
 #endif
 }
@@ -105,7 +105,7 @@ MpsCtx::MpsCtx(
     cuGreenCtx = 0;
     gDev->setDevice();
 
-    CU_CHECK_PHYDRIVER(cuDeviceGet(&cuDev, gDev->getId()));
+    CUDA_DRIVER_CHECK(cuDeviceGet(&cuDev, gDev->getId()));
 
     if(_resources == nullptr)
     {
@@ -160,15 +160,15 @@ MpsCtx::~MpsCtx()
     gDev->setDevice();
     if(!isGreenContext && (devSmCount > 0))
     {
-        CU_CHECK_PHYDRIVER(cuCtxSynchronize());
-        CU_CHECK_PHYDRIVER(cuCtxDestroy(cuCtx));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuCtxSynchronize());
+        CUDA_DRIVER_CHECK_NON_FATAL(cuCtxDestroy(cuCtx));
         ctxDestroyed = true;
     }
 #if CUDA_VERSION >= 12040
     if(isGreenContext && ctxCreated && !ctxDestroyed)
     {
-        CU_CHECK_PHYDRIVER(cuCtxSynchronize()); //FIXME
-        CU_CHECK_PHYDRIVER(cuGreenCtxDestroy(cuGreenCtx));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuCtxSynchronize()); //FIXME
+        CUDA_DRIVER_CHECK_NON_FATAL(cuGreenCtxDestroy(cuGreenCtx));
         ctxDestroyed = true;
     }
 #endif
@@ -194,7 +194,7 @@ void MpsCtx::setCtx()
     setGpuDevice();
     if(devSmCount > 0)
     {
-        CU_CHECK_PHYDRIVER(cuCtxSetCurrent(cuCtx));
+        CUDA_DRIVER_CHECK(cuCtxSetCurrent(cuCtx));
         // NVLOGC_FMT(TAG, "Setting MPS TX {} SM", devSmCount);
     }
 }
@@ -212,7 +212,7 @@ void MpsCtx::getResources(CUdevResource* resource) const
        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "Cannot call getResources() before a context has been created.");
        return;
    }
-   CU_CHECK_PHYDRIVER(cuGreenCtxGetDevResource(cuGreenCtx, resource,  CU_DEV_RESOURCE_TYPE_SM));
+   CUDA_DRIVER_CHECK(cuGreenCtxGetDevResource(cuGreenCtx, resource,  CU_DEV_RESOURCE_TYPE_SM));
 }
 
 CUgreenCtx MpsCtx::getGreenCtx() const

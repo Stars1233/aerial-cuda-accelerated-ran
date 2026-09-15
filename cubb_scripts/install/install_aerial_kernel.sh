@@ -23,6 +23,9 @@
 #   --isolcpus LIST   CPU list for isolation. Defaults in versions.sh. Overridable via ISOLCPUS env or --isolcpus
 #
 
+# Suppress interactive apt dialogs (e.g. "Pending kernel upgrade" whiptail prompt)
+export DEBIAN_FRONTEND=noninteractive
+
 # Source common functions and versions
 _SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 [[ -f "$_SCRIPT_DIR/includes.sh" ]] && source "$_SCRIPT_DIR/includes.sh" || { echo "ERROR: includes.sh not found: $_SCRIPT_DIR/includes.sh" >&2; exit 1; }
@@ -83,6 +86,10 @@ check_existing_kernel() {
     
     if dpkg -l "$headers_pkg" 2>/dev/null | grep -q "^ii"; then
         echo_and_log "[WARN] Kernel headers already installed: $headers_pkg"
+        if [[ "${ASSUME_YES:-0}" == "1" ]]; then
+            echo_and_log "[INFO] ASSUME_YES=1: keeping the installed target kernel and continuing idempotently"
+            return
+        fi
         echo ""
         echo "Options:"
         echo "  [p] Purge existing kernel packages and reinstall"
@@ -171,6 +178,13 @@ execute "sudo systemctl mask apt-daily.service apt-daily-upgrade.service apt-dai
 execute "sudo systemctl disable apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer"
 execute "sudo systemctl daemon-reload"
 
+# Blacklist the nouveau open-source GPU driver so the NVIDIA driver can load
+write_file /etc/modprobe.d/blacklist-nouveau.conf << 'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+execute_or_die "sudo update-initramfs -u"
+
 # Install the kernel and its suggested packages (headers, modules-extra, perf, nvidia-tools)
 execute_or_die "sudo apt update"
 remove_other_kernels_and_headers
@@ -180,51 +194,26 @@ autoremove_until_clean
 # Update GRUB to generate menu entries
 execute_or_die "sudo update-grub"
 
-# Find GRUB menu entries for this kernel (exclude recovery)
-echo_and_log "[INFO] Finding GRUB menu entries for kernel ${KERNEL_VERSION}..."
+# Select the default GRUB entry for the detected platform.
+case "$PLATFORM" in
+    "DGX-Spark")
+        GRUB_DEFAULT_VALUE="Advanced options for DGX OS GNU/Linux>DGX OS GNU/Linux, with Linux ${KERNEL_VERSION}"
+        ;;
+    "SMC-GraceHopper"|"MGX-ARC-Pro")
+        GRUB_DEFAULT_VALUE="Advanced options for Ubuntu>Ubuntu, with Linux ${KERNEL_VERSION}"
+        ;;
+    "Dell-R750")
+        GRUB_DEFAULT_VALUE="Advanced options for Ubuntu>Ubuntu, with Linux ${KERNEL_VERSION}"
+        ;;
+    *)
+        echo_and_log "[ERROR] Unsupported platform for GRUB configuration: ${PLATFORM}"
+        FAILED=1
+        exit 1
+        ;;
+esac
 
-# Get the advanced submenu ID and kernel menuentry (requires sudo to read /boot/grub/grub.cfg)
-if [[ $DRYRUN -eq 1 ]]; then
-    run_sudo_grep=""
-    read -t 5 -p "Run sudo to read GRUB config? [y/N]: " run_sudo_grep
-    read_rc=$?
-    # Timeout (exit >128) or "n" means skip
-    [[ $read_rc -gt 128 ]] && run_sudo_grep="n"
-    run_sudo_grep="${run_sudo_grep:-n}"
-    if [[ "${run_sudo_grep,,}" == "n" ]]; then
-        [[ $read_rc -gt 128 ]] && echo # Handle no newline on timeout
-        echo -e "\n[DRY-RUN] Using placeholder GRUB entries for 6.17.0-1014-nvidia\n"
-        GRUB_SUBMENU="gnulinux-advanced-b937ead4-f4cb-42b9-a72d-a7a7e8b9d5b4"
-        GRUB_MENUENTRY="gnulinux-6.17.0-1014-nvidia-advanced-b937ead4-f4cb-42b9-a72d-a7a7e8b9d5b4"
-    else
-        echo_and_log "[DRY-RUN] Running sudo grep to get GRUB menu entries for kernel ${KERNEL_VERSION}"
-        GRUB_SUBMENU=$(sudo grep "submenu.*gnulinux-advanced" /boot/grub/grub.cfg | head -1 | grep -oE "'[^']+'" | tail -1 | tr -d "'")
-        GRUB_MENUENTRY=$(sudo grep "menuentry.*${KERNEL_VERSION}" /boot/grub/grub.cfg | grep -v recovery | head -1 | grep -oE "'[^']+'" | tail -1 | tr -d "'")
-        if [[ -z $GRUB_SUBMENU || -z $GRUB_MENUENTRY ]]; then
-            echo_and_log "[DRY-RUN] [WARNING] Could not find GRUB entries for kernel ${KERNEL_VERSION}. This is expected if the kernel has not yet been installed."
-            echo_and_log -e "[DRY-RUN] Using placeholder GRUB entries for 6.17.0-1014-nvidia"
-            GRUB_SUBMENU="gnulinux-advanced-b937ead4-f4cb-42b9-a72d-a7a7e8b9d5b4"
-            GRUB_MENUENTRY="gnulinux-6.17.0-1014-nvidia-advanced-b937ead4-f4cb-42b9-a72d-a7a7e8b9d5b4"
-        fi
-    fi
-else
-    GRUB_SUBMENU=$(sudo grep "submenu.*gnulinux-advanced" /boot/grub/grub.cfg | head -1 | grep -oE "'[^']+'" | tail -1 | tr -d "'")
-    GRUB_MENUENTRY=$(sudo grep "menuentry.*${KERNEL_VERSION}" /boot/grub/grub.cfg | grep -v recovery | head -1 | grep -oE "'[^']+'" | tail -1 | tr -d "'")
-fi
-
-if [[ $DRYRUN -eq 0 && (-z $GRUB_SUBMENU || -z $GRUB_MENUENTRY) ]]; then
-    echo_and_log "[ERROR] Could not find GRUB entries for kernel ${KERNEL_VERSION}"
-    echo_and_log "[ERROR] GRUB_SUBMENU: ${GRUB_SUBMENU:-not found}"
-    echo_and_log "[ERROR] GRUB_MENUENTRY: ${GRUB_MENUENTRY:-not found}"
-    echo_and_log "[ERROR] Check /boot/grub/grub.cfg manually"
-    FAILED=1
-    exit 1
-else
-    GRUB_DEFAULT_VALUE="${GRUB_SUBMENU}>${GRUB_MENUENTRY}"
-    
-    echo_and_log "[INFO] Setting GRUB_DEFAULT to: ${GRUB_DEFAULT_VALUE}"
-    execute_or_die "sudo sed -i 's|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"${GRUB_DEFAULT_VALUE}\"|' /etc/default/grub"
-fi
+echo_and_log "[INFO] Setting GRUB_DEFAULT to: ${GRUB_DEFAULT_VALUE}"
+execute_or_die "sudo sed -i 's|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"${GRUB_DEFAULT_VALUE}\"|' /etc/default/grub"
 
 # Remove iommu.passthrough=y from grub config files if present
 FOUND_FILES=$(grep -rls "iommu.passthrough=y" /etc/default/grub* 2>/dev/null || true)
@@ -233,22 +222,40 @@ for file in $FOUND_FILES; do
 done
 
 # Create kernel command-line configuration (ISOLCPUS used in isolcpus=, nohz_full=, rcu_nocbs=)
-_HUGEPAGES="${HUGEPAGES:-24}"
+AERIAL_GRUB_CMDLINE_PARAMS="$(build_aerial_grub_cmdline_params)"
 
-if [[ $PLATFORM == "Supermicro_ARS-111GL-NHR" ]]; then
-    # GH200: write GRUB_CMDLINE_LINUX to /etc/default/grub.d/cmdline.cfg
-    # and serial/terminal settings to /etc/default/grub.d/menu.cfg
+if [[ $PLATFORM == "MGX-ARC-Pro" ]]; then
     execute_or_die "sudo mkdir -p /etc/default/grub.d"
-    execute_or_die "cat <<EOF | sudo tee /etc/default/grub.d/cmdline.cfg
-GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX pci=realloc=off pci=pcie_bus_safe default_hugepagesz=512M hugepagesz=512M hugepages=${_HUGEPAGES} tsc=reliable processor.max_cstate=0 audit=0 idle=poll rcu_nocb_poll nosoftlockup irqaffinity=0 isolcpus=managed_irq,domain,${ISOLCPUS} nohz_full=${ISOLCPUS} rcu_nocbs=${ISOLCPUS} earlycon module_blacklist=nouveau acpi_power_meter.force_cap_on=y numa_balancing=disable init_on_alloc=0 preempt=none\"
-EOF"
+    write_file /etc/default/grub.d/menu.cfg << 'MENU_EOF'
+GRUB_TIMEOUT_STYLE=menu
+GRUB_TIMEOUT=5
+GRUB_TERMINAL="console serial"
+GRUB_CMDLINE_LINUX_DEFAULT=""
+GRUB_SERIAL_COMMAND="$GRUB_SERIAL_COMMAND serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1"
+MENU_EOF
+elif [[ $PLATFORM == "SMC-GraceHopper" ]]; then
+    # GH200 requires serial/terminal settings in /etc/default/grub.d/menu.cfg.
+    execute_or_die "sudo mkdir -p /etc/default/grub.d"
     write_file /etc/default/grub.d/menu.cfg << 'MENU_EOF'
 GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"
 GRUB_TERMINAL="serial console"
 MENU_EOF
+fi
+
+if [[ $PLATFORM == "Dell-R750" ]]; then
+    execute_or_die "sudo mkdir -p /etc/default/grub.d"
+    execute_or_die "cat <<EOF | sudo tee /etc/default/grub.d/cmdline.cfg
+GRUB_CMDLINE_LINUX_DEFAULT=\"${AERIAL_GRUB_CMDLINE_PARAMS}\"
+EOF"
 else
     execute_or_die "cat <<EOF | sudo tee /etc/default/grub.d/cmdline.cfg
-GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX pci=realloc=off default_hugepagesz=1G hugepagesz=1G hugepages=${_HUGEPAGES} tsc=reliable processor.max_cstate=0 audit=0 idle=poll rcu_nocb_poll nosoftlockup irqaffinity=0-3 kthread_cpus=0-3 isolcpus=managed_irq,domain,${ISOLCPUS} nohz_full=${ISOLCPUS} rcu_nocbs=${ISOLCPUS} earlycon module_blacklist=nouveau acpi_power_meter.force_cap_on=y init_on_alloc=0 preempt=none\"
+GRUB_CMDLINE_LINUX=\"\$GRUB_CMDLINE_LINUX ${AERIAL_GRUB_CMDLINE_PARAMS}\"
+EOF"
+fi
+
+if [[ -n "${PCI_CONFIG_ACS:-}" ]]; then
+    execute_or_die "cat <<EOF | sudo tee /etc/default/grub.d/config-acs.cfg
+GRUB_CMDLINE_LINUX=\"\\\$GRUB_CMDLINE_LINUX pci=config_acs=\\\"${PCI_CONFIG_ACS}\\\"\"
 EOF"
 fi
 

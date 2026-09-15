@@ -32,6 +32,7 @@ CONFIG_DIR=$cuBB_SDK
 CONFIG_DIR_SET=false
 
 valid_channels=("PUSCH" "PDSCH" "PDCCH_UL" "PDCCH_DL" "PBCH" "PUCCH" "PRACH" "CSI_RS" "SRS" "BFW_DL" "BFW_UL" "all")
+valid_fapi_deadline_groups=("DL_TTI_REQ" "UL_TTI_REQ" "TX_DATA_REQ" "UL_DCI_REQ" "DL_BFW_CVI_REQ" "UL_BFW_CVI_REQ")
 
 show_usage() {
     echo "Script to set cuBB test configurations."
@@ -61,7 +62,11 @@ show_usage() {
     echo "  --reduced-logging           Enable reduced logging mode - disables detailed tracing and processing time logs (disabled by default)"
     echo "  --cupti                     Enable CUPTI tracing (disabled by default)"
     echo "  --num-cells=N  , -c N       Set number of cells (default: 20)"
-    echo "  --num-ports=N  , -p N       Set number of NIC ports (default: 1, acceptable values: 1 or 2)"
+    echo "  --cell-topology=TOPOLOGY    Set per-carrier cell counts for carrier aggregation patterns (for example: 1C_2C). Only needed for 52a/b/c/d patterns."
+    echo "  --num-ports=N  , -p N       Set number of NIC ports (default: 1, acceptable values: 1 to 24)"
+    echo "  --ru-type=N, --rut=N         Set O-RU type on all cells in cuPHY controller and RU emulator YAML (optional)"
+    echo "                              1 = SINGLE_SECT_MODE, 2 = MULTI_SECT_MODE, 3 = OTHER_MODE"
+    echo "                              If omitted, existing values in the YAML files are left unchanged"
     echo "  --num-slots=N  , -T N       Set number of test slots (default: 600000)"
     echo "  --STT=N        , -s N       Set schedule total time (default: 455000 for 4T4R and 480000 for MIMO)"
     echo "  --enable_32dl=N, -e N       Enable (1) or disable (0) enable_32dl (default: 0)"
@@ -77,9 +82,16 @@ show_usage() {
     echo "  --cicd <test_case_string>   Parse a test case string (e.g., F08_6C_79_MODCOMP_STT480000_EH_1P)"
     echo "                              This option is primarily for CI/CD integration and will parse the test case"
     echo "                              string to extract pattern, cells, and other parameters automatically"
+    echo "  --fapi-tx-deadline-enable=N Enable (1) or disable (0) FAPI TX deadline in testMAC (default: 0)"
+    echo "  --fapi-deadlines=<pairs>    When deadline is enabled, override deadlines (us) for specific groups."
+    echo "                              Format: GROUP:value,GROUP:value (e.g. DL_TTI_REQ:530,UL_TTI_REQ:664)."
+    echo "                              Valid groups: ${valid_fapi_deadline_groups[*]}. Unspecified groups remain unchanged."
     echo
     echo "Example:"
     echo "  $0 59c --num-cells=20 -B 9 -T 30000 --ehq=0 --channels PUSCH+PDSCH+CSI_RS"
+    echo "  $0 59c --fapi-tx-deadline-enable=1 --fapi-deadlines=DL_TTI_REQ:530,UL_TTI_REQ:664"
+    echo "  $0 59c --num-cells=20 --ru-type=1"
+    echo "  $0 52a --num-cells=8 --cell-topology=4C_4C"
 }
 
 # Helper function to compute the number of DLC tasks/cores available
@@ -168,6 +180,7 @@ generate_dlc_core_index_grouped() {
 
 # Default values
 NUM_CELLS=20
+CELL_TOPOLOGY=""
 NUM_PORTS=1
 TEST_SLOTS=600000
 BFP=9
@@ -193,6 +206,9 @@ DLC_CORE_PACKING_SCHEME=0
 DLC_CORE_PACKING_SCHEME_USER_SPECIFIED=false
 DLC_CORE_INDEX=""
 DLC_CORE_INDEX_USER_SPECIFIED=false
+FAPI_TX_DEADLINE_ENABLE=0
+FAPI_DEADLINES=""
+RU_TYPE=""
 # Parse command-line arguments
 BFP_EXPLICITLY_SET=false
 while [[ $# -gt 0 ]]; do
@@ -220,7 +236,19 @@ while [[ $# -gt 0 ]]; do
             BFP="$value"
             shift
             ;;
-        --channels*|--DGL*|--dlc-tb*|--ehq*|--green-ctx*|--gc-wqs*|--num-cells*|--num-ports*|--num-slots*|--STT*|--work-cancel*|--pmu*|--compression*|--data-lake*)
+        --rut=*)
+            RU_TYPE="${1#*=}"
+            shift
+            ;;
+        --rut)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for $1 option"
+                exit 1
+            fi
+            RU_TYPE="$2"
+            shift 2
+            ;;
+        --channels*|--DGL*|--dlc-tb*|--ehq*|--green-ctx*|--gc-wqs*|--num-cells*|--cell-topology*|--num-ports*|--num-slots*|--STT*|--work-cancel*|--pmu*|--compression*|--data-lake*|--ru-type*)
             if [[ "$1" == *"="* ]]; then
                 # Option with equals sign
                 option="${1%%=*}"
@@ -247,6 +275,7 @@ while [[ $# -gt 0 ]]; do
                 --green-ctx) USE_GREEN_CONTEXT="$value" ;;
                 --gc-wqs) USE_GC_WQS="$value" ;;
                 --num-cells) NUM_CELLS="$value" ;;
+                --cell-topology) CELL_TOPOLOGY="$value" ;;
                 --num-ports) NUM_PORTS="$value" ;;
                 --num-slots) TEST_SLOTS="$value" ;;
                 --STT) STT="$value" ;;
@@ -254,6 +283,7 @@ while [[ $# -gt 0 ]]; do
                 --pmu) PMU_METRICS="$value" ;;
                 --compression) COMPRESSION="$value" ;;
                 --data-lake) DATALAKE="$value" ;;
+                --ru-type) RU_TYPE="$value" ;;
                 *) echo "Unknown option: $option"; exit 1 ;;
             esac
             shift
@@ -371,6 +401,30 @@ while [[ $# -gt 0 ]]; do
             DLC_CORE_INDEX_USER_SPECIFIED=true
             shift 2
             ;;
+        --fapi-tx-deadline-enable=*)
+            FAPI_TX_DEADLINE_ENABLE="${1#*=}"
+            shift
+            ;;
+        --fapi-tx-deadline-enable)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for $1 option"
+                exit 1
+            fi
+            FAPI_TX_DEADLINE_ENABLE="$2"
+            shift 2
+            ;;
+        --fapi-deadlines=*)
+            FAPI_DEADLINES="${1#*=}"
+            shift
+            ;;
+        --fapi-deadlines)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for $1 option"
+                exit 1
+            fi
+            FAPI_DEADLINES="$2"
+            shift 2
+            ;;
         -*)
             echo "Unknown option: $1"
             exit 1
@@ -388,9 +442,13 @@ if [[ "$CONFIG_DIR_SET" == "false" ]]; then
     CONFIG_DIR="$cuBB_SDK"
 fi
 
+# Maximum number of NIC ports (must match MAX_NUM_OF_NIC_PORT_SUPPORTED).
+# MGX ARC Pro: up to 3x CX8 NICs × 8 ports/NIC = 24 ports.
+MAX_PORTS=24
+
 # Validate NUM_PORTS value
-if [ "$NUM_PORTS" -ne 1 ] && [ "$NUM_PORTS" -ne 2 ] ; then
-    echo "Error: NUM_PORTS must be either 1 or 2."
+if [ "$NUM_PORTS" -lt 1 ] || [ "$NUM_PORTS" -gt "$MAX_PORTS" ]; then
+    echo "Error: NUM_PORTS must be between 1 and $MAX_PORTS (got $NUM_PORTS)."
     exit 1
 fi
 
@@ -428,9 +486,9 @@ fi
 
 if [ -n "$CICD_TEST_CASE" ]; then
 
-    # F08_X_NC_YY_extra 
+    # F08_X_NC[_NC...]_YY_extra
     #     - X  = pattern (0, A, B, C, D, E, F)
-    #     - N  = number of cells - can be 2 digits
+    #     - N  = number of cells - can be 2 digits; carrier aggregation patterns (52a/b/c/d) use one N per carrier group
     #     - YY = F08 pattern (e.g. 03, 05, 11, 14, etc.)
     #     - Z  = Compression (e.g. 9, 14 - can be 2 digits) NOTE that this is NOT used here
     #     - extra = stuff like "restart" for test with restarting cells
@@ -443,11 +501,29 @@ if [ -n "$CICD_TEST_CASE" ]; then
         exit 0
     fi
 
-    if [[ "$CICD_TEST_CASE" =~ ^F08_([0ABCDEF])_([0-9]{1,2})C_([0-9]{2}[a-z]*)(.*) ]]; then
+    if [[ "$CICD_TEST_CASE" =~ ^F08_([0ABCDEF])_(.*)$ ]]; then
         f08_pattern="${BASH_REMATCH[1]}"
-        num_cells="${BASH_REMATCH[2]}"
-        pattern_name="${BASH_REMATCH[3]}"
-        extra="${BASH_REMATCH[4]}"
+        remainder="${BASH_REMATCH[2]}"
+        cell_topology=""
+        num_cells=0
+
+        while [[ "$remainder" =~ ^([0-9]{1,2})C_(.*)$ ]]; do
+            group_cells=$((10#${BASH_REMATCH[1]}))
+            remainder="${BASH_REMATCH[2]}"
+            if [[ -n "$cell_topology" ]]; then
+                cell_topology+="_"
+            fi
+            cell_topology+="${group_cells}C"
+            num_cells=$((num_cells + group_cells))
+        done
+
+        if [[ -z "$cell_topology" || ! "$remainder" =~ ^([0-9]+[a-z]*)(.*)$ ]]; then
+            echo "Error: Invalid CI/CD test case '$CICD_TEST_CASE'"
+            exit 1
+        fi
+
+        pattern_name="${BASH_REMATCH[1]}"
+        extra="${BASH_REMATCH[2]}"
         ehq=0
 
         # Check if the pattern name is valid
@@ -457,6 +533,9 @@ if [ -n "$CICD_TEST_CASE" ]; then
         fi
 
         CMD="$pattern_name"
+        if [[ "$cell_topology" == *_* ]]; then
+            CMD="$CMD --cell-topology=$cell_topology"
+        fi
 
         # Convert the string into an array, split by underscore
         IFS='_' read -ra parts <<< "$extra"
@@ -483,11 +562,8 @@ if [ -n "$CICD_TEST_CASE" ]; then
                 DL)
                     CMD="$CMD --data-lake=1"
                     ;;
-                1P)
-                    num_ports=1
-                    ;;
-                2P)
-                    num_ports=2
+                [1-9]P|1[0-9]P|2[0-4]P)
+                    num_ports=${part%P}
                     ;;
             esac
         done
@@ -496,6 +572,9 @@ if [ -n "$CICD_TEST_CASE" ]; then
             CMD="$CMD --ehq=0"
         fi
         CMD="$CMD --num-cells=$num_cells"
+        if [[ -v num_ports ]]; then
+            CMD="$CMD --num-ports=$num_ports"
+        fi
 
         if [[ " ${mimo_patterns[*]} " =~ " $pattern_name " ]]; then
             # CICD nees to get this information so that we can pass it to setup1_DU.sh script
@@ -524,8 +603,53 @@ if [[ ! " ${valid_perf_patterns[*]} " =~ " $pattern_name " ]]; then
     exit 1
 fi
 
+if [[ ! "$NUM_CELLS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --num-cells must be a positive integer. Got: '$NUM_CELLS'"
+    exit 1
+fi
+
+expected_topology_groups=1
+case "$pattern_name" in
+    52a|52b|52c)
+        expected_topology_groups=2
+        ;;
+    52d)
+        expected_topology_groups=3
+        ;;
+esac
+
+if [[ -z "$CELL_TOPOLOGY" ]]; then
+    if [[ "$expected_topology_groups" -gt 1 ]]; then
+        echo "Error: Pattern $pattern_name requires --cell-topology with $expected_topology_groups groups."
+        exit 1
+    fi
+    CELL_TOPOLOGY="${NUM_CELLS}C"
+fi
+
+if [[ ! "$CELL_TOPOLOGY" =~ ^[1-9][0-9]*C(_[1-9][0-9]*C)*$ ]]; then
+    echo "Error: Invalid cell topology '$CELL_TOPOLOGY'. Expected a value such as 1C_2C."
+    exit 1
+fi
+
+IFS='_' read -ra topology_groups <<< "$CELL_TOPOLOGY"
+if [[ "${#topology_groups[@]}" -ne "$expected_topology_groups" ]]; then
+    echo "Error: Pattern $pattern_name requires $expected_topology_groups cell-count group(s), but '$CELL_TOPOLOGY' has ${#topology_groups[@]}."
+    exit 1
+fi
+
+topology_total=0
+for group in "${topology_groups[@]}"; do
+    group_cells="${group%C}"
+    topology_total=$((topology_total + group_cells))
+done
+
+if [[ "$topology_total" -ne "$NUM_CELLS" ]]; then
+    echo "Error: Cell topology '$CELL_TOPOLOGY' contains $topology_total total cells, but --num-cells is $NUM_CELLS."
+    exit 1
+fi
+
 # Variables appended to VARS (in TEST_CONFIG_FILE) by this script
-    TEST_VARS="PATTERN PATTERN_MODE CHANNELS NUM_CELLS NUM_PORTS TEST_SLOTS WORK_CANCEL_MODE WC_MODE BFP EARLY_HARQ_ENABLED EHQ_STATUS DEVICE_GRAPH_LAUNCH_ENABLED DGL_STATUS USE_GREEN_CONTEXT USE_GC_WQS GC_STATUS PMU_METRICS STT DLC_TB_ENABLED ML2_CELL_MASK0 ML2_CELL_MASK1 ML2_CELL_LIST0 ML2_CELL_LIST1 TESTMAC1_YAML"
+    TEST_VARS="PATTERN PATTERN_MODE CHANNELS NUM_CELLS CELL_TOPOLOGY NUM_PORTS TEST_SLOTS WORK_CANCEL_MODE WC_MODE BFP EARLY_HARQ_ENABLED EHQ_STATUS DEVICE_GRAPH_LAUNCH_ENABLED DGL_STATUS USE_GREEN_CONTEXT USE_GC_WQS GC_STATUS PMU_METRICS STT DLC_TB_ENABLED FAPI_TX_DEADLINE_ENABLE FAPI_DEADLINES RU_TYPE ML2_CELL_MASK0 ML2_CELL_MASK1 ML2_CELL_LIST0 ML2_CELL_LIST1 TESTMAC1_YAML"
 
 TEST_CONFIG_FILE=$CONFIG_DIR/testBenches/phase4_test_scripts/test_config_summary.sh
 if [[ ! -f $TEST_CONFIG_FILE ]]; then
@@ -540,19 +664,15 @@ if [[ ! -v DU_SETUP_COMPLETE ]] || [[ ! -v RU_SETUP_COMPLETE ]]; then
 fi
 
 # Validate required variables for port configuration
-if [ "$NUM_PORTS" -eq 1 ]; then
-    if [[ ! -v DU_MAC_ADDRESS_0 ]] || [[ ! -v RU_PCIE_0 ]]; then
-        echo "Error: 1-port configuration requires DU_MAC_ADDRESS_0 and RU_PCIE_0 variables."
-        echo "Please ensure setup1_DU.sh and setup2_RU.sh completed successfully."
+for ((p=0; p<NUM_PORTS; p++)); do
+    du_mac_var="DU_MAC_ADDRESS_${p}"
+    ru_pcie_var="RU_PCIE_${p}"
+    if [[ ! -v "$du_mac_var" ]] || [[ ! -v "$ru_pcie_var" ]]; then
+        echo "Error: $NUM_PORTS-port configuration requires DU_MAC_ADDRESS_$p and RU_PCIE_$p variables."
+        echo "Please ensure setup1_DU.sh and setup2_RU.sh were run with at least $NUM_PORTS interfaces (e.g. --du-eth0..--du-eth$((NUM_PORTS-1)))."
         exit 1
     fi
-elif [ "$NUM_PORTS" -eq 2 ]; then
-    if [[ ! -v DU_MAC_ADDRESS_0 ]] || [[ ! -v RU_PCIE_0 ]] || [[ ! -v DU_MAC_ADDRESS_1 ]] || [[ ! -v RU_PCIE_1 ]]; then
-        echo "Error: 2-port configuration requires DU_MAC_ADDRESS_0, RU_PCIE_0, DU_MAC_ADDRESS_1 and RU_PCIE_1 variables."
-        echo "Please ensure setup1_DU.sh and setup2_RU.sh completed successfully."
-        exit 1
-    fi
-fi
+done
 
 if [[ "$FORCE" != true ]] && [[ -v TEST_CONFIG_DONE ]]; then
     echo "Error: $0 has already been run."
@@ -637,6 +757,38 @@ yq -i '.fapi_delay_bit_mask = 0xFF' $TESTMAC_YAML
 yq -i ".test_slots = $TEST_SLOTS" $TESTMAC_YAML
 
 #--------------------------------------------------------------
+# FAPI TX deadline configuration (testMAC)
+#--------------------------------------------------------------
+if [ "$FAPI_TX_DEADLINE_ENABLE" -eq 1 ] || [ "$FAPI_TX_DEADLINE_ENABLE" -eq 0 ]; then
+    yq -i ".fapi_tx_deadline_enable = $FAPI_TX_DEADLINE_ENABLE" $TESTMAC_YAML
+else
+    echo "Error: --fapi-tx-deadline-enable must be 0 or 1"
+    exit 1
+fi
+
+if [ -n "$FAPI_DEADLINES" ]; then
+    # Validate and apply key:value pairs (e.g. DL_TTI_REQ:530,UL_TTI_REQ:664)
+    IFS=',' read -ra DEADLINE_PAIRS <<< "$FAPI_DEADLINES"
+    for pair in "${DEADLINE_PAIRS[@]}"; do
+        [[ -z "$pair" ]] && continue
+        if [[ "$pair" =~ ^([^:]+):([0-9]+)$ ]]; then
+            group_name="${BASH_REMATCH[1]}"
+            deadline_val="${BASH_REMATCH[2]}"
+            if [[ ! " ${valid_fapi_deadline_groups[*]} " =~ " $group_name " ]]; then
+                echo "Error: Invalid FAPI deadline group '$group_name'. Valid groups: ${valid_fapi_deadline_groups[*]}"
+                exit 1
+            fi
+            # Update only this group's deadline in the YAML list; others remain unchanged
+            yq -i "(.fapi_tx_deadline[] | select(.group_id == \"$group_name\")).deadline = $deadline_val" $TESTMAC_YAML
+        else
+            echo "Error: Invalid fapi-deadlines pair '$pair'. Expected format: GROUP:value (e.g. DL_TTI_REQ:530)"
+            exit 1
+        fi
+    done
+    echo "FAPI deadline overrides applied: $FAPI_DEADLINES"
+fi
+
+#--------------------------------------------------------------
 # cuPHY controller configuration
 #--------------------------------------------------------------
 # Conformance settings
@@ -712,8 +864,8 @@ fi
 # NUM_DL_WORKERS should already be set by setup1_DU.sh in test_config_summary.sh
 echo "NUM_DL_WORKERS (from test_config_summary.sh): $NUM_DL_WORKERS"
 
-# Determine commViaCpu (1 for GL4 mode, 0 otherwise)
-if [[ "$CONTROLLER_MODE" == "F08_GL4" ]]; then
+# Determine commViaCpu (1 for GL4/SPRK mode, 0 otherwise)
+if [[ "$CUPHY_HOST_TYPE" == "_GL4" || "$CUPHY_HOST_TYPE" == "_SPRK" ]]; then
     COMM_VIA_CPU=1
 else
     COMM_VIA_CPU=0
@@ -815,8 +967,7 @@ if [[ "$MUMIMO" == "ON" ]]; then
             yq -i '.cuphydriver_config.mps_sm_srs = 32' $CUPHY_YAML
         fi
         # Adjust SM provisioning for RTX 4500-class GPUs (SM limit ~82)
-        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 2>/dev/null)
-        if echo "$GPU_NAME" | grep -qiE 'RTX[^,]*4500|RTX Pro 4500'; then
+        if echo "$DU_GPU_NAME" | grep -qiE 'RTX[^,]*4500|RTX Pro 4500'; then
             yq -i '.cuphydriver_config.mps_sm_pusch = 40' $CUPHY_YAML
             yq -i '.cuphydriver_config.mps_sm_pdsch = 80' $CUPHY_YAML
         fi
@@ -855,8 +1006,16 @@ if [[ "$MUMIMO" == "ON" ]]; then
 #   sed -i "s/T1a_min_cp_ul_ns: [0-9]\+/T1a_min_cp_ul_ns: 285000/g" $CUPHY_YAML
 #   sed -i "s/T1a_min_cp_dl_ns: [0-9]\+/T1a_min_cp_dl_ns: 419000/g" $CUPHY_YAML
 #   sed -i "s/T1a_max_cp_dl_ns: [0-9]\+/T1a_max_cp_dl_ns: 669000/g" $CUPHY_YAML
+    echo "Setting cplane_processing_dl_batch_size to 1 (64T64R: 1 cells per DL task)"
+    yq -i '.cuphydriver_config.cplane_processing_dl_batch_size = 1' $CUPHY_YAML
+    echo "Setting cplane_processing_ul_batch_size to 1 (64T64R: 1 cells per UL task)"
+    yq -i '.cuphydriver_config.cplane_processing_ul_batch_size = 1' $CUPHY_YAML
 else
     yq -i '.cuphydriver_config.bfw_c_plane_chaining_mode = 0' $CUPHY_YAML
+    echo "Setting cplane_processing_dl_batch_size to 10 (4T4R: 10 cells per DL task)"
+    yq -i '.cuphydriver_config.cplane_processing_dl_batch_size = 10' $CUPHY_YAML
+    echo "Setting cplane_processing_ul_batch_size to 20 (4T4R: 20 cells per UL task)"
+    yq -i '.cuphydriver_config.cplane_processing_ul_batch_size = 20' $CUPHY_YAML
 fi
 
 #--------------------------------------------------------------
@@ -871,6 +1030,15 @@ fi
 #--------------------------------------------------------------
 # RU emulator configuration
 #--------------------------------------------------------------
+if [[ -n "$RU_TYPE" ]]; then
+    if [[ ! "$RU_TYPE" =~ ^[123]$ ]]; then
+        echo "Error: --ru-type / --rut must be 1 (SINGLE_SECT_MODE), 2 (MULTI_SECT_MODE), or 3 (OTHER_MODE)"
+        exit 1
+    fi
+    yq -i ".cuphydriver_config.cells[].ru_type = $RU_TYPE" $CUPHY_YAML
+    yq -i ".ru_emulator.cell_configs[].ru_type = $RU_TYPE" $RU_YAML
+    echo "ru_type $RU_TYPE applied to all cells (cuPHY controller and RU emulator)"
+fi
 yq -i '.ru_emulator.enable_beam_forming = 1' $RU_YAML
 yq -i '.ru_emulator.aerial_fh_split_rx_tx_mempool = 1' $RU_YAML
 yq -i '.ru_emulator.oam_cell_ctrl_cmd = 1' $RU_YAML
@@ -958,70 +1126,99 @@ echo "Setting RU emulator network interfaces"
 yq -i ".ru_emulator.nics[0].nic_interface = \"$RU_PCIE_0\"" $RU_YAML
 yq -i ".ru_emulator.peers[0].peerethaddr = \"$DU_MAC_ADDRESS_0\"" $RU_YAML
 
-# Set all cells to use port 0 for single-port configuration
-if [ "$NUM_PORTS" -eq 1 ]; then
-    echo "Configuring single-port RU emulator"
-    
-    # Contract nics array to single entry if it has more than 1
-    NIC_COUNT=$(yq '.ru_emulator.nics | length' $RU_YAML)
-    if [ "$NIC_COUNT" -gt 1 ]; then
-        echo "Contracting RU emulator nics array from $NIC_COUNT to 1 entry"
-        yq -i '.ru_emulator.nics = [.ru_emulator.nics[0]]' $RU_YAML
-    fi
-    
-    # Contract peers array to single entry if it has more than 1
-    PEER_COUNT=$(yq '.ru_emulator.peers | length' $RU_YAML)
-    if [ "$PEER_COUNT" -gt 1 ]; then
-        echo "Contracting RU emulator peers array from $PEER_COUNT to 1 entry"
-        yq -i '.ru_emulator.peers = [.ru_emulator.peers[0]]' $RU_YAML
-    fi
-    
-    # Set all cells to use port 0
-    echo "Setting all RU emulator cells to use port 0"
-    CELL_COUNT=$(yq '.ru_emulator.cell_configs | length' $RU_YAML)
-    for ((i=0; i<CELL_COUNT; i++)); do
-        yq -i ".ru_emulator.cell_configs[$i].peer = 0" $RU_YAML
-        yq -i ".ru_emulator.cell_configs[$i].nic = 0" $RU_YAML
+# Resize nics and peers arrays to NUM_PORTS
+NIC_COUNT=$(yq '.ru_emulator.nics | length' $RU_YAML)
+if [ "$NIC_COUNT" -gt "$NUM_PORTS" ]; then
+    echo "Contracting RU emulator nics array from $NIC_COUNT to $NUM_PORTS entries"
+    for ((p=NIC_COUNT-1; p>=NUM_PORTS; p--)); do
+        yq -i "del(.ru_emulator.nics[$p])" $RU_YAML
+    done
+elif [ "$NIC_COUNT" -lt "$NUM_PORTS" ]; then
+    echo "Expanding RU emulator nics array from $NIC_COUNT to $NUM_PORTS entries"
+    for ((p=NIC_COUNT; p<NUM_PORTS; p++)); do
+        yq -i ".ru_emulator.nics[$p] = .ru_emulator.nics[0]" $RU_YAML
     done
 fi
 
-# Configure second port if NUM_PORTS is 2
-if [ "$NUM_PORTS" -eq 2 ]; then
-    echo "Configuring dual-port RU emulator"
-    
-    # Check if second NIC entry exists, if not create it based on the first one
-    NIC_COUNT=$(yq '.ru_emulator.nics | length' $RU_YAML)
-    if [ "$NIC_COUNT" -lt 2 ]; then
-        echo "Adding second NIC entry to RU emulator config"
-        yq -i '.ru_emulator.nics[1] = .ru_emulator.nics[0]' $RU_YAML
-    fi
-    
-    # Check if second peer entry exists, if not create it based on the first one
-    PEER_COUNT=$(yq '.ru_emulator.peers | length' $RU_YAML)
-    if [ "$PEER_COUNT" -lt 2 ]; then
-        echo "Adding second peer entry to RU emulator config"
-        yq -i '.ru_emulator.peers[1] = .ru_emulator.peers[0]' $RU_YAML
-    fi
-    
-    # Set second port values
-    yq -i ".ru_emulator.nics[1].nic_interface = \"$RU_PCIE_1\"" $RU_YAML
-    yq -i ".ru_emulator.peers[1].peerethaddr = \"$DU_MAC_ADDRESS_1\"" $RU_YAML
-    
-    # Distribute cells across ports: even array index to port 0, odd array index to port 1
-    echo "Distributing RU emulator cells across ports (even array index → port 0, odd array index → port 1)"
-    CELL_COUNT=$(yq '.ru_emulator.cell_configs | length' $RU_YAML)
-    for ((i=0; i<CELL_COUNT; i++)); do
-        if [ $((i % 2)) -eq 0 ]; then
-            # Even array index (0,2,4,6...) → port 0
-            yq -i ".ru_emulator.cell_configs[$i].peer = 0" $RU_YAML
-            yq -i ".ru_emulator.cell_configs[$i].nic = 0" $RU_YAML
-        else
-            # Odd array index (1,3,5,7...) → port 1
-            yq -i ".ru_emulator.cell_configs[$i].peer = 1" $RU_YAML
-            yq -i ".ru_emulator.cell_configs[$i].nic = 1" $RU_YAML
-        fi
+PEER_COUNT=$(yq '.ru_emulator.peers | length' $RU_YAML)
+if [ "$PEER_COUNT" -gt "$NUM_PORTS" ]; then
+    echo "Contracting RU emulator peers array from $PEER_COUNT to $NUM_PORTS entries"
+    for ((p=PEER_COUNT-1; p>=NUM_PORTS; p--)); do
+        yq -i "del(.ru_emulator.peers[$p])" $RU_YAML
+    done
+elif [ "$PEER_COUNT" -lt "$NUM_PORTS" ]; then
+    echo "Expanding RU emulator peers array from $PEER_COUNT to $NUM_PORTS entries"
+    for ((p=PEER_COUNT; p<NUM_PORTS; p++)); do
+        yq -i ".ru_emulator.peers[$p] = .ru_emulator.peers[0]" $RU_YAML
     done
 fi
+
+# Set each port's values
+for ((p=0; p<NUM_PORTS; p++)); do
+    ru_pcie_var="RU_PCIE_${p}"
+    du_mac_var="DU_MAC_ADDRESS_${p}"
+    yq -i ".ru_emulator.nics[$p].nic_interface = \"${!ru_pcie_var}\"" $RU_YAML
+    yq -i ".ru_emulator.peers[$p].peerethaddr = \"${!du_mac_var}\"" $RU_YAML
+done
+
+# Distribute cells across ports: cell i → port (i % NUM_PORTS)
+echo "Distributing RU emulator cells across $NUM_PORTS ports (cell i → port i % $NUM_PORTS)"
+CELL_COUNT=$(yq '.ru_emulator.cell_configs | length' $RU_YAML)
+for ((i=0; i<CELL_COUNT; i++)); do
+    port=$((i % NUM_PORTS))
+    yq -i ".ru_emulator.cell_configs[$i].peer = $port" $RU_YAML
+    yq -i ".ru_emulator.cell_configs[$i].nic = $port" $RU_YAML
+done
+
+# Ceil BASE/NUM_PORTS to the next power-of-2, capped at BASE (so 1P is unchanged).
+ceil_mbuf_pool_per_port() {
+    local base=$1
+    local ports=$2
+    local size=$((base / ports))
+    local pow2=1
+    if [ "$size" -lt 1 ]; then
+        size=1
+    fi
+    while [ "$pow2" -lt "$size" ]; do
+        pow2=$((pow2 * 2))
+    done
+    size=$pow2
+    if [ "$size" -gt "$base" ]; then
+        size=$base
+    fi
+    echo "$size"
+}
+
+# Scale RU FH CPU mbuf pools inversely with port count so total hugepage
+# usage stays roughly constant vs each pool's 1-port baseline.
+# TX and RX are scaled independently. Persist baselines in
+# aerial_fh_cpu_mbuf_pool_{tx,rx}_size_1p_base on first configure so
+# --force / reconfigure does not re-scale already-reduced pool sizes.
+RU_TX_MBUF_POOL_BASE=$(yq -r '.ru_emulator.aerial_fh_cpu_mbuf_pool_tx_size_1p_base // ""' "$RU_YAML")
+if ! [[ "$RU_TX_MBUF_POOL_BASE" =~ ^[1-9][0-9]*$ ]]; then
+    RU_TX_MBUF_POOL_BASE=$(yq -r '.ru_emulator.aerial_fh_cpu_mbuf_pool_tx_size // ""' "$RU_YAML")
+    if ! [[ "$RU_TX_MBUF_POOL_BASE" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: RU YAML missing/invalid aerial_fh_cpu_mbuf_pool_tx_size"
+        exit 1
+    fi
+    echo "Capturing RU 1-port TX mbuf pool baseline from YAML: $RU_TX_MBUF_POOL_BASE"
+    yq -i ".ru_emulator.aerial_fh_cpu_mbuf_pool_tx_size_1p_base = $RU_TX_MBUF_POOL_BASE" "$RU_YAML"
+fi
+RU_RX_MBUF_POOL_BASE=$(yq -r '.ru_emulator.aerial_fh_cpu_mbuf_pool_rx_size_1p_base // ""' "$RU_YAML")
+if ! [[ "$RU_RX_MBUF_POOL_BASE" =~ ^[1-9][0-9]*$ ]]; then
+    RU_RX_MBUF_POOL_BASE=$(yq -r '.ru_emulator.aerial_fh_cpu_mbuf_pool_rx_size // ""' "$RU_YAML")
+    if ! [[ "$RU_RX_MBUF_POOL_BASE" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: RU YAML missing/invalid aerial_fh_cpu_mbuf_pool_rx_size"
+        exit 1
+    fi
+    echo "Capturing RU 1-port RX mbuf pool baseline from YAML: $RU_RX_MBUF_POOL_BASE"
+    yq -i ".ru_emulator.aerial_fh_cpu_mbuf_pool_rx_size_1p_base = $RU_RX_MBUF_POOL_BASE" "$RU_YAML"
+fi
+RU_TX_MBUF_POOL_SIZE=$(ceil_mbuf_pool_per_port "$RU_TX_MBUF_POOL_BASE" "$NUM_PORTS")
+RU_RX_MBUF_POOL_SIZE=$(ceil_mbuf_pool_per_port "$RU_RX_MBUF_POOL_BASE" "$NUM_PORTS")
+echo "Setting RU aerial_fh_cpu_mbuf_pool_tx_size=$RU_TX_MBUF_POOL_SIZE (1P base=$RU_TX_MBUF_POOL_BASE), rx_size=$RU_RX_MBUF_POOL_SIZE (1P base=$RU_RX_MBUF_POOL_BASE) for $NUM_PORTS port(s)"
+yq -i ".ru_emulator.aerial_fh_cpu_mbuf_pool_tx_size = $RU_TX_MBUF_POOL_SIZE" "$RU_YAML"
+yq -i ".ru_emulator.aerial_fh_cpu_mbuf_pool_rx_size = $RU_RX_MBUF_POOL_SIZE" "$RU_YAML"
 
 #--------------------------------------------------------------
 # cuPHY controller network interface configuration
@@ -1031,61 +1228,63 @@ echo "Setting cuPHY controller network interface values"
 # Set first port NIC interface
 yq -i ".cuphydriver_config.nics[0].nic = \"$DU_PCIE_0\"" $CUPHY_YAML
 
-# Configure single-port cuPHY controller
-if [ "$NUM_PORTS" -eq 1 ]; then
-    echo "Configuring single-port cuPHY controller"
-    
-    # Contract nics array to single entry if it has more than 1
-    NIC_COUNT=$(yq '.cuphydriver_config.nics | length' $CUPHY_YAML)
-    if [ "$NIC_COUNT" -gt 1 ]; then
-        echo "Contracting cuPHY controller nics array from $NIC_COUNT to 1 entry"
-        yq -i '.cuphydriver_config.nics = [.cuphydriver_config.nics[0]]' $CUPHY_YAML
-    fi
-    
-    # Set all cells to use port 0
-    echo "Setting all cuPHY controller cells to use port 0"
-    CELL_COUNT=$(yq '.cuphydriver_config.cells | length' $CUPHY_YAML)
-    for ((i=0; i<CELL_COUNT; i++)); do
-        yq -i ".cuphydriver_config.cells[$i].nic = \"$DU_PCIE_0\"" $CUPHY_YAML
-        yq -i ".cuphydriver_config.cells[$i].src_mac_addr = \"$DU_MAC_ADDRESS_0\"" $CUPHY_YAML
+# Resize nics array to NUM_PORTS
+NIC_COUNT=$(yq '.cuphydriver_config.nics | length' $CUPHY_YAML)
+if [ "$NIC_COUNT" -gt "$NUM_PORTS" ]; then
+    echo "Contracting cuPHY controller nics array from $NIC_COUNT to $NUM_PORTS entries"
+    for ((p=NIC_COUNT-1; p>=NUM_PORTS; p--)); do
+        yq -i "del(.cuphydriver_config.nics[$p])" $CUPHY_YAML
+    done
+elif [ "$NIC_COUNT" -lt "$NUM_PORTS" ]; then
+    echo "Expanding cuPHY controller nics array from $NIC_COUNT to $NUM_PORTS entries"
+    for ((p=NIC_COUNT; p<NUM_PORTS; p++)); do
+        yq -i ".cuphydriver_config.nics[$p] = .cuphydriver_config.nics[0]" $CUPHY_YAML
     done
 fi
 
-# Configure dual-port cuPHY controller
-if [ "$NUM_PORTS" -eq 2 ]; then
-    echo "Configuring dual-port cuPHY controller"
-    
-    # Check if second NIC entry exists, if not create it based on the first one
-    NIC_COUNT=$(yq '.cuphydriver_config.nics | length' $CUPHY_YAML)
-    if [ "$NIC_COUNT" -lt 2 ]; then
-        echo "Adding second NIC entry to cuPHY controller config"
-        yq -i '.cuphydriver_config.nics[1] = .cuphydriver_config.nics[0]' $CUPHY_YAML
+# Set each port's NIC interface
+for ((p=0; p<NUM_PORTS; p++)); do
+    du_pcie_var="DU_PCIE_${p}"
+    yq -i ".cuphydriver_config.nics[$p].nic = \"${!du_pcie_var}\"" $CUPHY_YAML
+done
+
+# Scale DU FH CPU mbuf pools inversely with port count so total hugepage
+# usage stays roughly constant vs the 1-port baseline.
+# Persist the baseline in cuphydriver_config.cpu_mbufs_1p_base on first
+# configure so --force / reconfigure does not re-scale an already-reduced
+# nics[].cpu_mbufs.
+DU_MBUF_POOL_BASE=$(yq -r '.cuphydriver_config.cpu_mbufs_1p_base // ""' "$CUPHY_YAML")
+if ! [[ "$DU_MBUF_POOL_BASE" =~ ^[1-9][0-9]*$ ]]; then
+    DU_MBUF_POOL_BASE=$(yq -r '.cuphydriver_config.nics[0].cpu_mbufs // ""' "$CUPHY_YAML")
+    if ! [[ "$DU_MBUF_POOL_BASE" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: DU YAML missing/invalid cuphydriver_config.nics[0].cpu_mbufs"
+        exit 1
     fi
-    
-    # Set the second port NIC interface
-    yq -i ".cuphydriver_config.nics[1].nic = \"$DU_PCIE_1\"" $CUPHY_YAML
-    
-    # Distribute cells across ports: even array index to port 0, odd array index to port 1
-    echo "Distributing cuPHY controller cells across ports (even array index → port 0, odd array index → port 1)"
-    CELL_COUNT=$(yq '.cuphydriver_config.cells | length' $CUPHY_YAML)
-    for ((i=0; i<CELL_COUNT; i++)); do
-        if [ $((i % 2)) -eq 0 ]; then
-            # Even array index (0,2,4,6...) → first port (DU_PCIE_0)
-            yq -i ".cuphydriver_config.cells[$i].nic = \"$DU_PCIE_0\"" $CUPHY_YAML
-            yq -i ".cuphydriver_config.cells[$i].src_mac_addr = \"$DU_MAC_ADDRESS_0\"" $CUPHY_YAML
-        else
-            # Odd array index (1,3,5,7...) → second port (DU_PCIE_1)
-            yq -i ".cuphydriver_config.cells[$i].nic = \"$DU_PCIE_1\"" $CUPHY_YAML
-            yq -i ".cuphydriver_config.cells[$i].src_mac_addr = \"$DU_MAC_ADDRESS_1\"" $CUPHY_YAML
-        fi
-    done
+    echo "Capturing DU 1-port mbuf pool baseline from YAML: $DU_MBUF_POOL_BASE"
+    yq -i ".cuphydriver_config.cpu_mbufs_1p_base = $DU_MBUF_POOL_BASE" "$CUPHY_YAML"
 fi
+DU_MBUF_POOL_SIZE=$(ceil_mbuf_pool_per_port "$DU_MBUF_POOL_BASE" "$NUM_PORTS")
+echo "Setting DU cuphydriver_config.nics[].cpu_mbufs to $DU_MBUF_POOL_SIZE for $NUM_PORTS port(s) (1P base=$DU_MBUF_POOL_BASE)"
+for ((p=0; p<NUM_PORTS; p++)); do
+    yq -i ".cuphydriver_config.nics[$p].cpu_mbufs = $DU_MBUF_POOL_SIZE" "$CUPHY_YAML"
+done
+
+# Distribute cells across ports: cell i → port (i % NUM_PORTS)
+echo "Distributing cuPHY controller cells across $NUM_PORTS ports (cell i → port i % $NUM_PORTS)"
+CELL_COUNT=$(yq '.cuphydriver_config.cells | length' $CUPHY_YAML)
+for ((i=0; i<CELL_COUNT; i++)); do
+    port=$((i % NUM_PORTS))
+    du_pcie_var="DU_PCIE_${port}"
+    du_mac_var="DU_MAC_ADDRESS_${port}"
+    yq -i ".cuphydriver_config.cells[$i].nic = \"${!du_pcie_var}\"" $CUPHY_YAML
+    yq -i ".cuphydriver_config.cells[$i].src_mac_addr = \"${!du_mac_var}\"" $CUPHY_YAML
+done
 
 #--------------------------------------------------------------
 # Setting time window to accept packets on DU
 #--------------------------------------------------------------
 # transfer window can be anywhere between T0+50us to T0+331us, for perf tests reduce this time window
-if [[ $CUPHY_HOST_TYPE == "_CG1" || $CUPHY_HOST_TYPE == "_GL4" ]];then
+if [[ $CUPHY_HOST_TYPE == "_CG1" || $CUPHY_HOST_TYPE == "_GL4" || $CUPHY_HOST_TYPE == "_SPRK" || $CUPHY_HOST_TYPE == "_MGX1" ]];then
     # 51 us transfer window on GH, T0+331-51->ul_u_plane_tx_offset = 280
     echo "Setting ul_u_plane_tx_offset to 280"
     yq -i '.ru_emulator.oran_timing_info.ul_u_plane_tx_offset = 280' $RU_YAML
@@ -1103,6 +1302,10 @@ yq -i '.cuphydriver_config.ul_order_timeout_log_interval_ns = 0' $CUPHY_YAML
 yq -i '.cuphydriver_config.ul_order_timeout_gpu_log_enable = 1' $CUPHY_YAML
 yq -i '.nvlog.nvlog_tags[] |= select(.* == "DRV.UL_PACKET_SUMMARY") .shm_level = 5' $NVLOG_YAML
 yq -i '.nvlog.nvlog_tags[] |= select(.* == "DRV.SRS_PACKET_SUMMARY") .shm_level = 5' $NVLOG_YAML
+# RU-side companion to the DU per-slot UL summary: one lightweight per-slot U-plane TX
+# summary line (incl. Num Packets) per cell, for RU app-miss vs fronthaul-loss triage.
+# Low volume, so enabled unconditionally (not gated behind --log-nic-timings).
+yq -i '.nvlog.nvlog_tags[] |= select(.* == "RU.TX_TIMINGS_SUM") .shm_level = 5' $NVLOG_YAML
 
 # Enable detailed tracing and processing time logs unless reduced-logging mode is enabled
 if [ "$REDUCED_LOGGING" != true ]; then
@@ -1139,7 +1342,7 @@ if [ "$LOG_NIC_TIMINGS" = true ]; then
 
     yq -i '.nvlog.nvlog_tags[] |= select(.* == "RU.SYMBOL_TIMINGS") .shm_level = 5' $NVLOG_YAML
     yq -i '.nvlog.nvlog_tags[] |= select(.* == "FH.TX_TIMINGS") .shm_level = 5' $NVLOG_YAML
-    yq -i '.nvlog.nvlog_tags[] |= select(.* == "RU.TX_TIMINGS_SUM") .shm_level = 5' $NVLOG_YAML
+    # RU.TX_TIMINGS_SUM is enabled unconditionally in the always-applied logging block above.
 
     yq -i '.cuphydriver_config.ul_rx_pkt_tracing_level = 1' $CUPHY_YAML
     yq -i '.cuphydriver_config.ul_rx_pkt_tracing_level_srs = 1' $CUPHY_YAML
@@ -1319,17 +1522,21 @@ fi
 # This override is applied at the end to ensure it takes effect regardless of earlier branches.
 #
 if [[ "$CONTROLLER_MODE" != "F08_GL4" ]]; then
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 2>/dev/null)
-        if echo "$GPU_NAME" | grep -qiE 'RTX[^,]*4500'; then
-            echo "Detected GPU '$GPU_NAME' → capping mps_sm_pusch and mps_sm_pdsch to 80"
+    if echo "$DU_GPU_NAME" | grep -qiE 'NVIDIA RTX PRO 4500|RTX[^,]*4500'; then
+        echo "Detected GPU '$DU_GPU_NAME' → capping mps_sm_pusch and mps_sm_pdsch to 80"
 	    if [[ "$MUMIMO" == "ON" ]]; then
-                yq -i '.cuphydriver_config.mps_sm_pusch = 40' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_pusch = 40' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_pdsch = 82' "$CUPHY_YAML"
 	    else
-                yq -i '.cuphydriver_config.mps_sm_pusch = 80' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_pusch = 66' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_pucch = 10' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_prach = 8' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_pdsch = 46' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_pdcch = 8' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_pbch = 8' "$CUPHY_YAML"
+            yq -i '.cuphydriver_config.mps_sm_gpu_comms = 16' "$CUPHY_YAML"
 	    fi
-            yq -i '.cuphydriver_config.mps_sm_pdsch = 80' "$CUPHY_YAML"
-        fi
+        yq -i '.cuphydriver_config.mps_sm_srs = 16' "$CUPHY_YAML"
     fi
 fi
 

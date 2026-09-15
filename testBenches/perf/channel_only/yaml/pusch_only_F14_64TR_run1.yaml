@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# F14 64TR isolated PUSCH (run1 TV). Use:
+#   cd testBenches/perf
+#   python3 measure.py --yaml channel_only/yaml/pusch_only_F14_64TR_run1.yaml \
+#     --cuphy <path> --vectors <path> [--freq N] [--power N]
+#
+# CLI flags override YAML values.
+
+config:
+  usecase: F14
+  vector_files:
+    PDSCH:
+      - TVnr_DLMIX_20566_PDSCH_gNB_CUPHY_s6p15.h5
+    PUSCH:
+      - TVnr_ULMIX_21564_PUSCH_gNB_CUPHY_s4p7.h5
+    DLBFW:
+      - TVnr_9366_BFW_gNB_CUPHY_s0.h5
+    ULBFW:
+      - TVnr_9366_BFW_gNB_CUPHY_s0.h5
+    SRS:
+      - TVnr_ULMIX_21673_SRS_gNB_CUPHY_s3p47.h5
+  uc: uc_avg_F14_TDD.json
+  gpu: 0
+  freq: 1605
+  power: 165
+  start: 6
+  cap: 6
+  slots: 30
+  iterations: 1
+  delay: 10000
+  tdd_pattern: dddsuudddd_mMIMO
+  graph: true
+  no_pdsch: true
+  no_pusch: false
+  groups_pusch: true
+  ldpc_parallel: true
+  prach: false
+  pdcch: false
+  pucch: false
+  ssb: false
+  csirs: false
+  rec_bf: false
+  mac: false

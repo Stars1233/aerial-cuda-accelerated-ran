@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,13 +26,24 @@
 #include "ldpc2.cuh"
 #include "ldpc2_c2v_x2.cuh"
 #include "cuphy.hpp"
+#include "ldpc2_bg_desc.hpp"
 #include "ldpc2_app_address.cuh"
+#include "ldpc2_app_address_spec.cuh"
 #include "ldpc2_app_address_fp.cuh"
 #include "ldpc2_app_address_fp_desc.cuh"
+#include "ldpc2_app_address_fp_nzs_desc.cuh"
 #include "ldpc2_app_address_fp_dp_desc.cuh"
+#include "ldpc2_app_address_fp_dp_nzs_desc.cuh"
+#include "ldpc2_app_address_dp_desc.cuh"
+#include "ldpc2_app_address_p_desc.cuh"
+#include "ldpc2_app_address_p_nzs_desc.cuh"
 #include "ldpc/ldpc_api.hpp"
 
 using namespace ldpc2;
+
+namespace {
+constexpr float TEST_LDPC_CLAMP_VALUE = 32.0f;
+}
 
 template <int BG, int CHECK_IDX, class TAddr0, class TAddr1>
 __device__
@@ -120,12 +131,12 @@ template <typename                           T,
           int                                Z,
           template<typename, int, int> class TAddr0,
           template<typename, int>      class TAddr1_Desc,
-          template<int>                class BGDesc,
+          template<int>                class TBGDesc,
           int                                MAX_NUM_PARITY>
 __global__ __launch_bounds__(Z, 1)
 void address_pairs_compare_desc(unsigned int*            dErrorCount,
                                 const LDPC_kernel_params params,
-                                BGDesc<BG>               bgdesc)
+                                TBGDesc<BG>              bgdesc)
 {
     typedef TAddr0<T, BG, Z>   addr0_t;
     typedef TAddr1_Desc<T, BG> addr1_t;
@@ -158,10 +169,11 @@ void perform_address_compare(unsigned int* dErrorCount)
     //------------------------------------------------------------------
     // Initialize the LDPC configuration
     cuphy::LDPC_decode_config config(CUPHY_R_16F, // LLR type
-                                     mb,          // num parity nodes
-                                     Z,           // lifting size
-                                     10,          // num iterations
-                                     Kb,          // num info nodes
+                                      mb,          // num parity nodes
+                                      Z,           // lifting size
+                                      10,          // num iterations
+                                      TEST_LDPC_CLAMP_VALUE, // clamp value
+                                      Kb,          // num info nodes
                                      1.0f,        // normalization
                                      0,           // flags
                                      BG,          // base graph
@@ -194,9 +206,9 @@ template <typename                           T,
           int                                Z,
           template<typename, int, int> class TAddr0,
           template<typename, int> class      TAddr1_Desc,
-          template<int>           class      BGDesc,
+          template<int>           class      TBGDesc,
           int                                MAX_NUM_PARITY>
-void perform_address_compare_desc(unsigned int* dErrorCount, const BGDesc<BG>& bgdesc)
+void perform_address_compare_desc(unsigned int* dErrorCount, const TBGDesc<BG>& bgdesc)
 {
     //------------------------------------------------------------------
     // Reset the error count
@@ -210,12 +222,12 @@ void perform_address_compare_desc(unsigned int* dErrorCount, const BGDesc<BG>& b
                                      mb,          // num parity nodes
                                      Z,           // lifting size
                                      10,          // num iterations
+                                     TEST_LDPC_CLAMP_VALUE, // clamp value
                                      Kb,          // num info nodes
                                      1.0f,        // normalization
                                      0,           // flags
                                      BG,          // base graph
                                      0,           // algorithm index
-                                     32.0f,       // clamp value
                                      nullptr);    // workspace
     // We aren't using input/output addresses for address calculations,
     // so leave them NULL here
@@ -229,7 +241,7 @@ void perform_address_compare_desc(unsigned int* dErrorCount, const BGDesc<BG>& b
                               1);                 // num codewords
     //------------------------------------------------------------------
     // Invoke the kernel
-    address_pairs_compare_desc<T, BG, Z, TAddr0, TAddr1_Desc, BGDesc, MAX_NUM_PARITY><<<1, Z>>>(dErrorCount, params, bgdesc);
+    address_pairs_compare_desc<T, BG, Z, TAddr0, TAddr1_Desc, TBGDesc, MAX_NUM_PARITY><<<1, Z>>>(dErrorCount, params, bgdesc);
     //------------------------------------------------------------------
     // Copy data back to the host to check
     unsigned int hErrorCount = 0;
@@ -253,25 +265,63 @@ TEST(LDPCInternalAPPAddr, AddressPairsDescHalf)
     // differences.
     cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
 
-    //perform_address_compare_desc<__half, 1, 128, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z128_half);
-    //perform_address_compare_desc<__half, 1, 160, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z160_half);
-    //perform_address_compare_desc<__half, 1, 192, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z192_half);
-    //perform_address_compare_desc<__half, 1, 224, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z224_half);
-    //perform_address_compare_desc<__half, 1, 256, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z256_half);
-    //perform_address_compare_desc<__half, 1, 288, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z288_half);
-    //perform_address_compare_desc<__half, 1, 320, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z320_half);
-    //perform_address_compare_desc<__half, 1, 352, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z352_half);
-    perform_address_compare_desc<__half, 1, 384, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z384_half);
+    //perform_address_compare_desc<__half, 1, 128, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z128_16);
+    //perform_address_compare_desc<__half, 1, 160, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z160_16);
+    //perform_address_compare_desc<__half, 1, 192, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z192_16);
+    //perform_address_compare_desc<__half, 1, 224, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z224_16);
+    //perform_address_compare_desc<__half, 1, 256, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z256_16);
+    //perform_address_compare_desc<__half, 1, 288, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z288_16);
+    //perform_address_compare_desc<__half, 1, 320, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z320_16);
+    //perform_address_compare_desc<__half, 1, 352, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z352_16);
+    perform_address_compare_desc<__half, 1, 384, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z384_16);
 
-    //perform_address_compare_desc<__half, 2, 128, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z128_half);
-    //perform_address_compare_desc<__half, 2, 160, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z160_half);
-    //perform_address_compare_desc<__half, 2, 192, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z192_half);
-    //perform_address_compare_desc<__half, 2, 224, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z224_half);
-    //perform_address_compare_desc<__half, 2, 256, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z256_half);
-    //perform_address_compare_desc<__half, 2, 288, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z288_half);
-    //perform_address_compare_desc<__half, 2, 320, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z320_half);
-    //perform_address_compare_desc<__half, 2, 352, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z352_half);
-    //perform_address_compare_desc<__half, 2, 384, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z384_half);
+    //perform_address_compare_desc<__half, 2, 128, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z128_16);
+    //perform_address_compare_desc<__half, 2, 160, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z160_16);
+    //perform_address_compare_desc<__half, 2, 192, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z192_16);
+    //perform_address_compare_desc<__half, 2, 224, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z224_16);
+    //perform_address_compare_desc<__half, 2, 256, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z256_16);
+    //perform_address_compare_desc<__half, 2, 288, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z288_16);
+    //perform_address_compare_desc<__half, 2, 320, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z320_16);
+    //perform_address_compare_desc<__half, 2, 352, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z352_16);
+    //perform_address_compare_desc<__half, 2, 384, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z384_16);
+
+}
+#endif
+#if 1
+////////////////////////////////////////////////////////////////////////
+// LDPCInternalAPPAddr.AddressPairsDescNzsHalf
+// Test to validate APP address calculation functions, where one of the
+// address generators uses a base graph descriptor structure.
+// Ideally, we would have a reference CPU implementation, but for now
+// we are just testing "new" implementations that use denormalized
+// floats (app_loc_address_fp) against the original implementation
+// (app_loc_address).
+TEST(LDPCInternalAPPAddr, AddressPairsDescNzsHalf)
+{
+    //------------------------------------------------------------------
+    // Allocate and initialize a device buffer with a variable to count
+    // differences.
+    cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
+
+    //perform_address_compare_desc<__half, 1, 128, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z128_16);
+    //perform_address_compare_desc<__half, 1, 160, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z160_16);
+    //perform_address_compare_desc<__half, 1, 192, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z192_16);
+    //perform_address_compare_desc<__half, 1, 224, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z224_16);
+    //perform_address_compare_desc<__half, 1, 256, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z256_16);
+    //perform_address_compare_desc<__half, 1, 288, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z288_16);
+    //perform_address_compare_desc<__half, 1, 320, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z320_16);
+    //perform_address_compare_desc<__half, 1, 352, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z352_16);
+    perform_address_compare_desc<__half, 1, 384, app_loc_address, app_loc_address_fp_nzs_desc, BG_nzs_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_nzs_desc_Z384_16);
+
+    //perform_address_compare_desc<__half, 2, 128, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z128_16);
+    //perform_address_compare_desc<__half, 2, 160, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z160_16);
+    //perform_address_compare_desc<__half, 2, 192, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z192_16);
+    //perform_address_compare_desc<__half, 2, 224, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z224_16);
+    //perform_address_compare_desc<__half, 2, 256, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z256_16);
+    //perform_address_compare_desc<__half, 2, 288, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z288_16);
+    //perform_address_compare_desc<__half, 2, 320, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z320_16);
+    //perform_address_compare_desc<__half, 2, 352, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z352_16);
+    //perform_address_compare_desc<__half, 2, 384, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_desc_Z384_16);
 
 }
 #endif
@@ -291,25 +341,66 @@ TEST(LDPCInternalAPPAddr, AddressPairsAdjDescHalf)
     // differences.
     cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
 
-    //perform_address_compare_desc<__half, 1, 128, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z128_half);
-    //perform_address_compare_desc<__half, 1, 160, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z160_half);
-    //perform_address_compare_desc<__half, 1, 192, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z192_half);
-    //perform_address_compare_desc<__half, 1, 224, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z224_half);
-    //perform_address_compare_desc<__half, 1, 256, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z256_half);
-    //perform_address_compare_desc<__half, 1, 288, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z288_half);
-    //perform_address_compare_desc<__half, 1, 320, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z320_half);
-    //perform_address_compare_desc<__half, 1, 352, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z352_half);
-    perform_address_compare_desc<__half, 1, 384, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z384_half);
+    //perform_address_compare_desc<__half, 1, 128, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z128_16);
+    //perform_address_compare_desc<__half, 1, 160, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z160_16);
+    //perform_address_compare_desc<__half, 1, 192, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z192_16);
+    //perform_address_compare_desc<__half, 1, 224, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z224_16);
+    //perform_address_compare_desc<__half, 1, 256, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z256_16);
+    //perform_address_compare_desc<__half, 1, 288, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z288_16);
+    //perform_address_compare_desc<__half, 1, 320, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z320_16);
+    //perform_address_compare_desc<__half, 1, 352, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z352_16);
+    perform_address_compare_desc<__half, 1, 384, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z384_16);
 
-    //perform_address_compare_desc<__half, 2, 128, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z128_half);
-    //perform_address_compare_desc<__half, 2, 160, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z160_half);
-    //perform_address_compare_desc<__half, 2, 192, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z192_half);
-    //perform_address_compare_desc<__half, 2, 224, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z224_half);
-    //perform_address_compare_desc<__half, 2, 256, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z256_half);
-    //perform_address_compare_desc<__half, 2, 288, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z288_half);
-    //perform_address_compare_desc<__half, 2, 320, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z320_half);
-    //perform_address_compare_desc<__half, 2, 352, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z352_half);
-    //perform_address_compare_desc<__half, 2, 384, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z384_half);
+    //perform_address_compare_desc<__half, 2, 128, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z128_16);
+    //perform_address_compare_desc<__half, 2, 160, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z160_16);
+    //perform_address_compare_desc<__half, 2, 192, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z192_16);
+    //perform_address_compare_desc<__half, 2, 224, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z224_16);
+    //perform_address_compare_desc<__half, 2, 256, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z256_16);
+    //perform_address_compare_desc<__half, 2, 288, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z288_16);
+    //perform_address_compare_desc<__half, 2, 320, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z320_16);
+    //perform_address_compare_desc<__half, 2, 352, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z352_16);
+    //perform_address_compare_desc<__half, 2, 384, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z384_16);
+
+}
+#endif
+#if 1
+////////////////////////////////////////////////////////////////////////
+// LDPCInternalAPPAddr.AddressPairsAdjDescNzsHalf
+// Test to validate APP address calculation functions, where one of the
+// address generators uses a base graph descriptor structure.
+// Ideally, we would have a reference CPU implementation, but for now
+// we are just testing "new" implementations that use denormalized
+// floats (app_loc_address_fp) against the original implementation
+// (app_loc_address).
+TEST(LDPCInternalAPPAddr, AddressPairsAdjDescNzsHalf)
+{
+    //------------------------------------------------------------------
+    // Allocate and initialize a device buffer with a variable to count
+    // differences.
+    cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
+
+    perform_address_compare_desc<__half, 1, 384, app_loc_address, app_loc_address_fp_dp_nzs_desc, BG_adj_nzs_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_nzs_desc_Z384_16);
+    //perform_address_compare_desc<__half, 1, 384, app_loc_address, app_loc_address_fp_dp_nzs_desc, BG_adj_nzs_desc, 2>(dErrorCount.get(), BG1_adj_nzs_desc_Z384_16);
+
+}
+#endif
+#if 1
+////////////////////////////////////////////////////////////////////////
+// LDPCInternalAPPAddr.AddressPairsPredNzsHalf
+// Test to validate APP address calculation functions, where one of the
+// address generators uses a base graph descriptor structure.
+// Ideally, we would have a reference CPU implementation, but for now
+// we are just testing "new" implementations that use denormalized
+// floats (app_loc_address_fp) against the original implementation
+// (app_loc_address).
+TEST(LDPCInternalAPPAddr, AddressPairsPredNzsHalf)
+{
+    //------------------------------------------------------------------
+    // Allocate and initialize a device buffer with a variable to count
+    // differences.
+    cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
+
+    perform_address_compare_desc<__half, 1, 384, app_loc_address, app_loc_address_p_nzs_desc, BG_adj_nzs_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_nzs_desc_Z384_16);
 
 }
 #endif
@@ -328,25 +419,62 @@ TEST(LDPCInternalAPPAddr, AddressPairsAdjDescHalf2)
     // differences.
     cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
 
-    //perform_address_compare_desc<__half2, 1, 128, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z128_half2);
-    //perform_address_compare_desc<__half2, 1, 160, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z160_half2);
-    //perform_address_compare_desc<__half2, 1, 192, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z192_half2);
-    //perform_address_compare_desc<__half2, 1, 224, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z224_half2);
-    //perform_address_compare_desc<__half2, 1, 256, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z256_half2);
-    //perform_address_compare_desc<__half2, 1, 288, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z288_half2);
-    //perform_address_compare_desc<__half2, 1, 320, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z320_half2);
-    //perform_address_compare_desc<__half2, 1, 352, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z352_half2);
-    perform_address_compare_desc<__half2, 1, 384, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z384_half2);
+    //perform_address_compare_desc<__half2, 1, 128, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z128_32);
+    //perform_address_compare_desc<__half2, 1, 160, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z160_32);
+    //perform_address_compare_desc<__half2, 1, 192, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z192_32);
+    //perform_address_compare_desc<__half2, 1, 224, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z224_32);
+    //perform_address_compare_desc<__half2, 1, 256, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z256_32);
+    //perform_address_compare_desc<__half2, 1, 288, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z288_32);
+    //perform_address_compare_desc<__half2, 1, 320, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z320_32);
+    //perform_address_compare_desc<__half2, 1, 352, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z352_32);
+    perform_address_compare_desc<__half2, 1, 384, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z384_32);
 
-    //perform_address_compare_desc<__half2, 2, 128, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z128_half2);
-    //perform_address_compare_desc<__half2, 2, 160, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z160_half2);
-    //perform_address_compare_desc<__half2, 2, 192, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z192_half2);
-    //perform_address_compare_desc<__half2, 2, 224, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z224_half2);
-    //perform_address_compare_desc<__half2, 2, 256, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z256_half2);
-    //perform_address_compare_desc<__half2, 2, 288, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z288_half2);
-    //perform_address_compare_desc<__half2, 2, 320, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z320_half2);
-    //perform_address_compare_desc<__half2, 2, 352, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z352_half2);
-    //perform_address_compare_desc<__half2, 2, 384, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z384_half2);
+    //perform_address_compare_desc<__half2, 2, 128, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z128_32);
+    //perform_address_compare_desc<__half2, 2, 160, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z160_32);
+    //perform_address_compare_desc<__half2, 2, 192, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z192_32);
+    //perform_address_compare_desc<__half2, 2, 224, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z224_32);
+    //perform_address_compare_desc<__half2, 2, 256, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z256_32);
+    //perform_address_compare_desc<__half2, 2, 288, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z288_32);
+    //perform_address_compare_desc<__half2, 2, 320, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z320_32);
+    //perform_address_compare_desc<__half2, 2, 352, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z352_32);
+    //perform_address_compare_desc<__half2, 2, 384, app_loc_address, app_loc_address_fp_dp_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z384_32);
+
+}
+#endif
+#if 1
+////////////////////////////////////////////////////////////////////////
+// LDPCInternalAPPAddr.AddressPairsAdjDescHalf2Predicate
+// Test to validate APP address calculation functions, where one of the
+// address generators uses a base graph descriptor structure.
+// Ideally, we would have a reference CPU implementation, but for now
+// we are just testing "new" implementations against the original
+// implementation (app_loc_address).
+TEST(LDPCInternalAPPAddr, AddressPairsAdjDescHalf2Predicate)
+{
+    //------------------------------------------------------------------
+    // Allocate and initialize a device buffer with a variable to count
+    // differences.
+    cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
+
+    //perform_address_compare_desc<__half2, 1, 128, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z128_32);
+    //perform_address_compare_desc<__half2, 1, 160, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z160_32);
+    //perform_address_compare_desc<__half2, 1, 192, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z192_32);
+    //perform_address_compare_desc<__half2, 1, 224, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z224_32);
+    //perform_address_compare_desc<__half2, 1, 256, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z256_32);
+    //perform_address_compare_desc<__half2, 1, 288, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z288_32);
+    //perform_address_compare_desc<__half2, 1, 320, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z320_32);
+    //perform_address_compare_desc<__half2, 1, 352, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z352_32);
+    perform_address_compare_desc<__half2, 1, 384, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_adj_desc_Z384_32);
+
+    //perform_address_compare_desc<__half2, 2, 128, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z128_32);
+    //perform_address_compare_desc<__half2, 2, 160, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z160_32);
+    //perform_address_compare_desc<__half2, 2, 192, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z192_32);
+    //perform_address_compare_desc<__half2, 2, 224, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z224_32);
+    //perform_address_compare_desc<__half2, 2, 256, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z256_32);
+    //perform_address_compare_desc<__half2, 2, 288, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z288_32);
+    //perform_address_compare_desc<__half2, 2, 320, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z320_32);
+    //perform_address_compare_desc<__half2, 2, 352, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z352_32);
+    //perform_address_compare_desc<__half2, 2, 384, app_loc_address, app_loc_address_p_desc, BG_adj_desc, max_parity_nodes<2>::value>(dErrorCount.get(), BG2_adj_desc_Z384_32);
 
 }
 #endif
@@ -366,15 +494,15 @@ TEST(LDPCInternalAPPAddr, AddressPairsDescFloat)
     // differences.
     cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
 
-    perform_address_compare_desc<float, 1, 128, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z128_half2);
-    perform_address_compare_desc<float, 1, 160, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z160_half2);
-    perform_address_compare_desc<float, 1, 192, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z192_half2);
-    perform_address_compare_desc<float, 1, 224, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z224_half2);
-    perform_address_compare_desc<float, 1, 256, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z256_half2);
-    perform_address_compare_desc<float, 1, 288, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z288_half2);
-    perform_address_compare_desc<float, 1, 320, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z320_half2);
-    perform_address_compare_desc<float, 1, 352, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z352_half2);
-    perform_address_compare_desc<float, 1, 384, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z384_half2);
+    perform_address_compare_desc<float, 1, 128, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z128_32);
+    perform_address_compare_desc<float, 1, 160, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z160_32);
+    perform_address_compare_desc<float, 1, 192, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z192_32);
+    perform_address_compare_desc<float, 1, 224, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z224_32);
+    perform_address_compare_desc<float, 1, 256, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z256_32);
+    perform_address_compare_desc<float, 1, 288, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z288_32);
+    perform_address_compare_desc<float, 1, 320, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z320_32);
+    perform_address_compare_desc<float, 1, 352, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z352_32);
+    perform_address_compare_desc<float, 1, 384, app_loc_address, app_loc_address_fp_desc, BG_desc, max_parity_nodes<1>::value>(dErrorCount.get(), BG1_desc_Z384_32);
 }
 
 #endif
@@ -490,6 +618,27 @@ TEST(LDPCInternalAPPAddr, AddressPairsFloatLarge)
     perform_address_compare<float, 2, 384, app_loc_address, app_loc_address_fp_imad_lg, max_parity_nodes<2>::value>(dErrorCount.get());
     perform_address_compare<float, 2, 352, app_loc_address, app_loc_address_fp_imad_lg, max_parity_nodes<2>::value>(dErrorCount.get());
     perform_address_compare<float, 2, 320, app_loc_address, app_loc_address_fp_imad_lg, max_parity_nodes<2>::value>(dErrorCount.get());
+}
+#endif
+#if 1
+template <typename T, int BG> using gen_spec_384 = app_loc_address_gen_spec<T, BG, 384>;
+
+////////////////////////////////////////////////////////////////////////
+// LDPCInternalAPPAddr.AddressGenSpecHalf
+// Test to validate APP address calculation functions.
+// Ideally, we would have a reference CPU implementation, but for now
+// we are just testing "new" implementations that use denormalized
+// floats (app_address_gen_spec) against the original implementation
+// (app_loc_address).
+TEST(LDPCInternalAPPAddr, AddressGenSpecHalf)
+{
+    null_BG_desc_t<1> bg1_desc{};
+
+    //------------------------------------------------------------------
+    // Allocate and initialize a device buffer with a variable to count
+    // differences.
+    cuphy::unique_device_ptr<unsigned int> dErrorCount = cuphy::make_unique_device<unsigned int>(1);
+    perform_address_compare_desc<__half, 1, 384, app_loc_address, gen_spec_384, null_BG_desc_t, max_parity_nodes<1>::value>(dErrorCount.get(), bg1_desc);
 }
 #endif
 ////////////////////////////////////////////////////////////////////////

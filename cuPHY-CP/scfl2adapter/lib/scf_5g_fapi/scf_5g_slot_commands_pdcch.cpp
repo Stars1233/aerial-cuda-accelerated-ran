@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,10 @@
  * limitations under the License.
  */
 
+#include <exception>
+
 #include "scf_5g_slot_commands_pdcch.hpp"
+#include "scf_5g_slot_commands_common.hpp"
 #include "nvlog.h"
 #include "nv_phy_module.hpp"
 #include "scf_5g_fapi_dl_validate.hpp"
@@ -117,7 +120,15 @@ namespace scf_5g_fapi {
                 uint32_t bf_size = bf.num_prgs * sizeof(uint16_t) + bf.num_prgs * bf.dig_bf_interfaces * sizeof(uint16_t) + sizeof(bf);
                 auto tx_power_info_size = sizeof(scf_fapi_pdcch_tx_power_info_t);
                 auto &dci_end = *reinterpret_cast<scf_fapi_pdcch_dci_payload_t*>(&msg_dci.payload[bf_size + tx_power_info_size]);
-                auto dci_payload_len = div_round_up(static_cast<int>(dci_end.payload_size_bits), 8);
+                auto payload_size_bits = dci_end.payload_size_bits;
+                if (payload_size_bits > CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT) [[unlikely]]
+                {
+                    NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                        "PDCCH DCI payload_size_bits={} exceeds max {} bits; clamping",
+                        static_cast<int>(payload_size_bits), CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT);
+                    payload_size_bits = CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT;
+                }
+                auto dci_payload_len = div_round_up(static_cast<int>(payload_size_bits), 8);
                 auto size = (sizeof(scf_fapi_dl_dci_t) + bf_size + tx_power_info_size + sizeof(scf_fapi_pdcch_dci_payload_t) + dci_payload_len);
                 dciOffset+= size;
             }
@@ -128,6 +139,47 @@ namespace scf_5g_fapi {
         auto & mplane_info = phyDriver.getMPlaneConfig(cell_index);
         ru_type ru = mplane_info.ru;
         update_fh_params_pdcch_per_coreset(cset, dci_group, cell_cmd, cell_params.nPrbDlBwp, pm_grp, msg, dciOffsets, config_option, ru, slot_detail, mplane_info.dl_comp_meth, mmimo_enabled, cell_index);
+    }
+
+    void update_pdcch_sym_prb_info_for_pdcch_only_validation(
+        cell_sub_command& cell_cmd,
+        cuphyPdcchCoresetDynPrm_t& coreset,
+        dci_param_list& dci,
+        uint16_t bandwidth,
+        pm_group* pm_grp,
+        scf_fapi_pdcch_pdu_t& msg,
+        std::size_t* fapiDciOffsets,
+        nv::phy_config_option& config_option,
+        nv::slot_detail_t* slot_detail,
+        bool mmimo_enabled,
+        int32_t cell_index)
+    {
+        nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
+        // getMPlaneConfig throws std::runtime_error for an out-of-range cell_index.
+        // This bridge runs on the parse path (noexcept), so catch and skip the
+        // fronthaul PRB update gracefully rather than letting the exception escape.
+        try {
+            auto& mplane_info = phyDriver.getMPlaneConfig(cell_index);
+            update_fh_params_pdcch_per_coreset(
+                coreset,
+                dci,
+                cell_cmd,
+                bandwidth,
+                pm_grp,
+                msg,
+                fapiDciOffsets,
+                config_option,
+                mplane_info.ru,
+                slot_detail,
+                mplane_info.dl_comp_meth,
+                mmimo_enabled,
+                cell_index);
+        } catch (const std::exception& ex) {
+            NVLOGW_FMT(TAG,
+                       "update_pdcch_sym_prb_info_for_pdcch_only_validation: "
+                       "getMPlaneConfig(cell_index={}) failed — skipping fronthaul PRB update: {}",
+                       cell_index, ex.what());
+        }
     }
 
 
@@ -178,6 +230,13 @@ namespace scf_5g_fapi {
         auto tx_power_info_size = sizeof(scf_fapi_pdcch_tx_power_info_t);
         auto &dci_end = *reinterpret_cast<scf_fapi_pdcch_dci_payload_t*>(&msg_dci.payload[bf_size + tx_power_info_size]);
         dci.Npayload =  dci_end.payload_size_bits;
+        if (dci.Npayload > CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT) [[unlikely]]
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                "PDCCH DCI payload_size_bits={} exceeds max {} bits; clamping",
+                static_cast<int>(dci.Npayload), CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT);
+            dci.Npayload = CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT;
+        }
         auto dci_payload_len = div_round_up(static_cast<int>(dci.Npayload), 8);
         memcpy(payload.data(), dci_end.payload, dci_payload_len);
 #if 0
@@ -430,34 +489,69 @@ namespace scf_5g_fapi {
                     }
                     else if(used_bundle_dci_map[j] != current_dci)
                     {
-                        // check if beam_forming is enabled.
-                        // if yes check if beam_ids are same
-                        // if not create a PRB group and update new startRB and current_dci
-                        auto& msg_dci      = *reinterpret_cast<scf_fapi_dl_dci_t*>(dldci_buf + fapiDciOffsets[current_dci]);
-                        auto& bf           = *reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(&msg_dci.payload[0]);
-                        bool  beamsPresent = config_option.bf_enabled && (bf.dig_bf_interfaces != 0);
+                        // Decide whether to split the PRB group at a DCI boundary.
+                        //
+                        // A split is required whenever the new DCI differs from the current
+                        // PRB group in any of:
+                        //   - dig_bf_interfaces / beam IDs  (otherwise SE-11 would stamp the
+                        //     same static_beam_id on multiple bundles -> RU emulator rejects
+                        //     "static beam id : N seen before!")
+                        //   - enablePrcdBf flag
+                        //   - pmwPrmIdx (precoding matrix index) when precoding is enabled
+                        //     (otherwise the merged group would silently apply the first
+                        //     DCI's PM weights to the second DCI's PRBs)
+                        //
+                        // Compare against the NEW DCI (used_bundle_dci_map[j]); the previous
+                        // version of this code compared against current_dci which is the
+                        // same DCI that already populated prb_info.beams_array, so the
+                        // comparison was a self-compare and never produced a split.
+                        bool needSplit = true;
+                        uint32_t next_dci  = used_bundle_dci_map[j];
+                        auto& msg_dci_next = *reinterpret_cast<scf_fapi_dl_dci_t*>(dldci_buf + fapiDciOffsets[next_dci]);
+                        auto& bf_next      = *reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(&msg_dci_next.payload[0]);
+                        bool  beamsPresent = config_option.bf_enabled && (bf_next.dig_bf_interfaces != 0);
+                        // When beamforming is absent, treat beams as "matching" so the
+                        // split decision falls through to PMI alone. This preserves the
+                        // pre-existing merge behavior for non-BF configurations.
+                        bool  beamsMatch   = !beamsPresent;
                         if(beamsPresent && sym_prbs->prbs_size > 0)
                         {
-                            uint16_t*   beam_id_list = (bf.pm_idx_and_beam_idx + 1);
+                            uint16_t*   beam_id_list = (bf_next.pm_idx_and_beam_idx + 1);
                             std::size_t index{sym_prbs->prbs_size - 1};
                             prb_info_t& prb_info{prbs[index]};
-                            if(prb_info.beams_array_size == bf.dig_bf_interfaces && std::memcmp(prb_info.beams_array.data(), beam_id_list, prb_info.beams_array_size))
+                            // memcmp returns 0 when buffers match, non-zero when they differ.
+                            // Pass byte length (num_elements * sizeof(uint16_t)).
+                            if(prb_info.beams_array_size == bf_next.dig_bf_interfaces &&
+                               std::memcmp(prb_info.beams_array.data(), beam_id_list,
+                                           prb_info.beams_array_size * sizeof(uint16_t)) == 0)
                             {
-                                if (dl_comp_method != comp_method::MODULATION_COMPRESSION) {
-                                    new_prb_group(startRB, count, current_dci, channel_type::PDCCH_DL, DEFAULT_RE_MASK);
-                                } 
-                                else {
-                                    new_prb_group(startRB, count, current_dci, channel_type::PDCCH_DL, std::numeric_limits<uint16_t>::max());
-                                    std::size_t index{sym_prbs->prbs_size - 1};
-                                    prb_info_t& prb{prbs[index]};
-                                    update_mod_comp_info_common(prb, getBwScaler(bandwidth));
-                                    update_mod_comp_info_pdcch_section(channel_type::PDCCH_DMRS, prb, dci[current_dci]);
-                                    update_mod_comp_info_pdcch_section(channel_type::PDCCH_DL, prb, dci[current_dci]);
-                                }
-                                current_dci = used_bundle_dci_map[j];
-                                startRB     = (j * coreset.bundle_size / coreset.n_sym) + coreset.start_rb;
-                                count       = 0;
+                                beamsMatch = true;
                             }
+                        }
+                        bool prevPrcdBf = config_option.precoding_enabled && dci[current_dci].enablePrcdBf;
+                        bool nextPrcdBf = config_option.precoding_enabled && dci[next_dci].enablePrcdBf;
+                        bool pmiMatch   = (prevPrcdBf == nextPrcdBf) &&
+                                          (!prevPrcdBf || dci[current_dci].pmwPrmIdx == dci[next_dci].pmwPrmIdx);
+                        if(beamsMatch && pmiMatch)
+                        {
+                            needSplit = false;
+                        }
+                        if(needSplit)
+                        {
+                            if (dl_comp_method != comp_method::MODULATION_COMPRESSION) {
+                                new_prb_group(startRB, count, current_dci, channel_type::PDCCH_DL, DEFAULT_RE_MASK);
+                            }
+                            else {
+                                new_prb_group(startRB, count, current_dci, channel_type::PDCCH_DL, std::numeric_limits<uint16_t>::max());
+                                std::size_t index{sym_prbs->prbs_size - 1};
+                                prb_info_t& prb{prbs[index]};
+                                update_mod_comp_info_common(prb, getBwScaler(bandwidth));
+                                update_mod_comp_info_pdcch_section(channel_type::PDCCH_DMRS, prb, dci[current_dci]);
+                                update_mod_comp_info_pdcch_section(channel_type::PDCCH_DL, prb, dci[current_dci]);
+                            }
+                            current_dci = used_bundle_dci_map[j];
+                            startRB     = (j * coreset.bundle_size / coreset.n_sym) + coreset.start_rb;
+                            count       = 0;
                         }
                     }
                     count++;
@@ -527,7 +621,15 @@ namespace scf_5g_fapi {
         auto& pwr_info = *reinterpret_cast<scf_fapi_pdcch_tx_power_info_t*>(&msg_dci.payload[0] + bf_size);
         auto tx_power_info_size = sizeof(scf_fapi_pdcch_tx_power_info_t);
         auto &dci_end = *reinterpret_cast<scf_fapi_pdcch_dci_payload_t*>(&msg_dci.payload[bf_size + tx_power_info_size]);
-        auto dci_payload_len = div_round_up(static_cast<int>(dci_end.payload_size_bits), 8);
+        auto payload_size_bits = dci_end.payload_size_bits;
+        if (payload_size_bits > CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT) [[unlikely]]
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                "PDCCH DCI payload_size_bits={} exceeds max {} bits; clamping",
+                static_cast<int>(payload_size_bits), CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT);
+            payload_size_bits = CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES * CHAR_BIT;
+        }
+        auto dci_payload_len = div_round_up(static_cast<int>(payload_size_bits), 8);
         if (bf_enabled) {
              update_beam_list_uniq(array, array_size, bf, prb_info, mmimo_enabled, cell_index);
         }

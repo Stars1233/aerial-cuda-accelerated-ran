@@ -29,10 +29,14 @@ cuBB_SDK=$(realpath $SCRIPT_DIR/../..)
 CONFIG_DIR=$cuBB_SDK
 CONFIG_DIR_SET=false
 
+# Maximum number of NIC ports supported (must match setup1_DU.sh / MAX_NUM_OF_NIC_PORT_SUPPORTED).
+# MGX ARC Pro: up to 3x CX8 NICs × 8 ports/NIC = 24 ports.
+MAX_PORTS=24
+
 #==============================================================
 # Default Values
 #==============================================================
-# Network interface defaults
+# Network interface defaults (supports up to MAX_PORTS)
 RU_ETH_INTERFACE_0="aerial00"
 RU_ETH_INTERFACE_1="aerial01"
 
@@ -46,11 +50,9 @@ show_usage() {
     echo "Options:"
     echo "  --help         , -h       Show this help message and exit"
     echo
-    echo "  --ru-eth0=INTERFACE                Set first RU network interface name"
-    echo "                                     Default: aerial00"
-    echo
-    echo "  --ru-eth1=INTERFACE                Set second RU network interface name"
-    echo "                                     Default: aerial01"
+    echo "  --ru-ethN=INTERFACE                Set RU network interface for port N (N=0..$((MAX_PORTS-1)))"
+    echo "                                     Default: aerial00 (N=0), aerial01 (N=1)"
+    echo "                                     e.g. --ru-eth0=aerial00 --ru-eth1=aerial01 --ru-eth2=aerial02"
     echo
     echo "  --cubb-sdk=PATH                     Set cuBB SDK path"
     echo "                                     Default: auto-detect (../../ from script dir)"
@@ -77,31 +79,34 @@ while [[ $# -gt 0 ]]; do
             show_usage
             exit 0
             ;;
-        --ru-eth0=*)
-            RU_ETH_INTERFACE_0="${1#*=}"
-            shift
-            ;;
-        --ru-eth0)
-            if [[ -z "$2" || "$2" == -* ]]; then
-                echo "Error: Missing value for $1 option"
+        --ru-eth[0-9]*)
+            if [[ "$1" =~ ^--ru-eth([0-9]+)=(.+)$ ]]; then
+                idx=$((10#${BASH_REMATCH[1]}))
+                if [[ "$idx" -ge "$MAX_PORTS" ]]; then
+                    echo "Error: Port index $idx exceeds maximum ($MAX_PORTS)"
+                    exit 1
+                fi
+                declare "RU_ETH_INTERFACE_${idx}=${BASH_REMATCH[2]}"
+            elif [[ "$1" =~ ^--ru-eth([0-9]+)$ ]]; then
+                idx=$((10#${BASH_REMATCH[1]}))
+                if [[ "$idx" -ge "$MAX_PORTS" ]]; then
+                    echo "Error: Port index $idx exceeds maximum ($MAX_PORTS)"
+                    exit 1
+                fi
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    echo "Error: Missing value for $1 option"
+                    show_usage
+                    exit 1
+                fi
+                eval "RU_ETH_INTERFACE_${idx}=\"$2\""
+                shift
+            else
+                echo "Error: Malformed option: $1"
                 show_usage
                 exit 1
+
             fi
-            RU_ETH_INTERFACE_0="$2"
-            shift 2
-            ;;
-        --ru-eth1=*)
-            RU_ETH_INTERFACE_1="${1#*=}"
             shift
-            ;;
-        --ru-eth1)
-            if [[ -z "$2" || "$2" == -* ]]; then
-                echo "Error: Missing value for $1 option"
-                show_usage
-                exit 1
-            fi
-            RU_ETH_INTERFACE_1="$2"
-            shift 2
             ;;
         --core-config-input-override=*)
             CORE_CONFIG_INPUT_OVERRIDE="${1#*=}"
@@ -206,13 +211,18 @@ EXPECTED_RU_HOST_TYPE="$RU_HOST_TYPE"
 # Function to detect actual RU host type
 detect_ru_host_type() {
     local detected_type
+
     NUMA_NODES=$(lscpu | grep "NUMA node(s)" | awk '{print $3}')
     detected_type="_DEVKIT"
     if [[ "$NUMA_NODES" == "2" ]]; then
         detected_type="_R750"
     fi
     if [[ "$(arch)" == "aarch64" ]]; then
-        detected_type="_CG1"
+        if grep -qx "QuantaEdge EGN77C-2U" /sys/devices/virtual/dmi/id/board_name 2>/dev/null; then
+            detected_type="_MGX1"
+        else
+            detected_type="_CG1"
+        fi
     fi
     echo "$detected_type"
 }
@@ -247,27 +257,41 @@ RU_HOST_TYPE="$EXPECTED_RU_HOST_TYPE"
 #---------------------------------------------------------------
 echo "Setting NIC interfaces in RU-emulator config file"
 
-# Check first interface and get info if available
-if [ ! -d "/sys/class/net/${RU_ETH_INTERFACE_0}" ]; then
-    echo "Warning: Network interface ${RU_ETH_INTERFACE_0} not found in /sys/class/net/"
-    echo "         PCIe and MAC address information will not be available for interface 0"
-    RU_PCIE_0=""
-    RU_MAC_ADDRESS_0=""
-else
-    RU_PCIE_0=$(ethtool -i ${RU_ETH_INTERFACE_0} | grep bus-info | awk '{print $2}')
-    RU_MAC_ADDRESS_0=$(cat /sys/class/net/"${RU_ETH_INTERFACE_0}"/address)
-fi
+# Determine number of configured interfaces (highest index + 1)
+RU_NUM_PORTS=2
+for ((i=MAX_PORTS-1; i>=2; i--)); do
+    var_name="RU_ETH_INTERFACE_${i}"
+    if [[ -n "${!var_name}" ]]; then
+        RU_NUM_PORTS=$((i + 1))
+        break
+    fi
+done
 
-# Check second interface and get info if available
-if [ ! -d "/sys/class/net/${RU_ETH_INTERFACE_1}" ]; then
-    echo "Warning: Network interface ${RU_ETH_INTERFACE_1} not found in /sys/class/net/"
-    echo "         PCIe and MAC address information will not be available for interface 1"
-    RU_PCIE_1=""
-    RU_MAC_ADDRESS_1=""
-else
-    RU_PCIE_1=$(ethtool -i ${RU_ETH_INTERFACE_1} | grep bus-info | awk '{print $2}')
-    RU_MAC_ADDRESS_1=$(cat /sys/class/net/"${RU_ETH_INTERFACE_1}"/address)
-fi
+# Validate no gaps in port configuration
+for ((i=0; i<RU_NUM_PORTS; i++)); do
+    var_name="RU_ETH_INTERFACE_${i}"
+    if [[ -z "${!var_name}" ]]; then
+        echo "Error: Port configuration has a gap at index $i. Please configure ports 0..$((RU_NUM_PORTS-1)) contiguously."
+        exit 1
+    fi
+done
+
+# Check each interface and get info
+for ((i=0; i<RU_NUM_PORTS; i++)); do
+    var_name="RU_ETH_INTERFACE_${i}"
+    iface="${!var_name}"
+    if [ ! -d "/sys/class/net/${iface}" ]; then
+        echo "Warning: Network interface ${iface} not found in /sys/class/net/"
+        echo "         PCIe and MAC address information will not be available for interface $i"
+        eval "RU_PCIE_${i}=\"\""
+        eval "RU_MAC_ADDRESS_${i}=\"\""
+    else
+        pcie=$(ethtool -i "${iface}" 2>/dev/null | grep bus-info | awk '{print $2}')
+        mac=$(cat /sys/class/net/"${iface}"/address 2>/dev/null)
+        eval "RU_PCIE_${i}=\"${pcie}\""
+        eval "RU_MAC_ADDRESS_${i}=\"${mac}\""
+    fi
+done
 
 
 
@@ -344,11 +368,24 @@ if [[ "$NRSIM_TC" == "90629" && "$RU_HOST_TYPE" == "_R750" ]]; then
     echo "Core assignments overridden in $RU_YAML"
 fi
 
+if [[ "$NRSIM_TC" == "90629" && "$RU_HOST_TYPE" == "_LOOPBACK" ]]; then
+    echo "Overwrite default core assignments for NRSIM_TC 90629 on GH loopback setup"
+    yq -i ".ru_emulator.ul_core_list = [29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43]" $RU_YAML
+    yq -i ".ru_emulator.ul_srs_core_list = [44, 45, 46]" $RU_YAML
+    yq -i ".ru_emulator.dl_core_list = [47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64]" $RU_YAML
+    echo "Core assignments overwritten in $RU_YAML"
+fi
+
 #==============================================================
 # update test_config_summary.sh
 # Write variables to the test_config_summary.sh
 RU_SETUP_COMPLETE=1
-VARS="$VARS RU_PCIE_0 RU_PCIE_1 RU_ETH_INTERFACE_0 RU_ETH_INTERFACE_1 RU_MAC_ADDRESS_0 RU_MAC_ADDRESS_1 RU_HOST_TYPE RU_YAML RU_SETUP_COMPLETE"
+# Build RU port variables dynamically
+RU_PORT_VARS=""
+for ((i=0; i<RU_NUM_PORTS; i++)); do
+    RU_PORT_VARS="$RU_PORT_VARS RU_PCIE_${i} RU_ETH_INTERFACE_${i} RU_MAC_ADDRESS_${i}"
+done
+VARS="$VARS${RU_PORT_VARS} RU_NUM_PORTS RU_HOST_TYPE RU_YAML RU_SETUP_COMPLETE"
 > "$TEST_CONFIG_FILE"  # Clear the file before writing
 for var in ${VARS}; do
     echo "$var=\"${!var}\"" >> "$TEST_CONFIG_FILE"

@@ -247,7 +247,7 @@ void SrsRx::createComponents(cuphySrsFilterPrms_t* pSrsFilterPrms, cudaStream_t 
     m_pRkhsPrms(pStatPrms->pSrsRkhsPrms),
     m_kernelStatDescr("SrsStatDescr"),
     m_kernelDynDescr("SrsDynDescr"),
-    m_batchedMemcpyHelper(CUPHY_SRS_MAX_N_USERS + 2, // +2 for the SRS reports and rbSnrBuffer
+    m_batchedMemcpyHelper(CUPHY_SRS_MAX_N_USERS + 2 + MAX_CELLS_PER_SLOT, // +2 for SRS reports and rbSnrBuffer, + per-cell SRS IQ copies
                           batchedMemcpySrcHint::srcIsDevice, 
                           batchedMemcpyDstHint::dstIsHost, 
                           (SRS_USE_BATCHED_MEMCPY == 1) && (pStatPrms->enableBatchedMemcpy == 1))
@@ -426,24 +426,19 @@ void SrsRx::setupCmn(const cuphySrsDynPrms_t *pDynPrm)
     if(m_nSrsUes > 0) {
         m_batchedMemcpyHelper.reset(); // reset for upcoming batch of updateMemcpy calls
 
-        // Add raw SRS IQ copy (buf_st_2 GPU->host) for DataLake. The input descriptor is
-        // sized for the worst-case antenna ports, but buf_st_2 only holds nRxAntSrs ports,
-        // so copy per cell using the active ports to avoid over-reading the source.
+        // Add raw SRS IQ copy (buf_st_2 GPU->host) for DataLake
         if(m_outputPrms.pDataRxSrsHost) {
-            int dataRxDims[3] = {0, 0, 0};
-            cuphyGetTensorDescriptor(m_hPrmDataRx[0].desc, 3, nullptr, nullptr, dataRxDims, nullptr);
-            size_t perAntElems = static_cast<size_t>(dataRxDims[0]) * dataRxDims[1];
-            size_t dstOffsetElems = 0;
+            size_t perCellSize = 0;
+            cuphyGetTensorSizeInBytes(m_hPrmDataRx[0].desc, &perCellSize);
+            size_t perCellElems = perCellSize / sizeof(__half2);
             for(int32_t cellIdx = 0; cellIdx < m_nCells; ++cellIdx) {
-                size_t cellElems = perAntElems * m_srsCellPrmsVec[cellIdx].nRxAntSrs;
                 m_batchedMemcpyHelper.updateMemcpy(
-                    m_outputPrms.pDataRxSrsHost + dstOffsetElems,
+                    m_outputPrms.pDataRxSrsHost + perCellElems * cellIdx,
                     m_hPrmDataRx[cellIdx].pAddr,
-                    cellElems * sizeof(__half2),
+                    perCellSize,
                     cudaMemcpyDeviceToHost,
                     cuStream
                 );
-                dstOffsetElems += cellElems;
             }
         }
 

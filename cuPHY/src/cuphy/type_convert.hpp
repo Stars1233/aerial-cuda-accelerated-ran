@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,13 +29,15 @@
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from signed char (int8)
-template <typename T> T           CUDA_BOTH_INLINE type_convert(signed char s);
-template <>           signed char CUDA_BOTH_INLINE type_convert(signed char s) { return s; }
-template <>           short       CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<short>(s); }
-template <>           int         CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<int>(s); }
-template <>           __half      CUDA_BOTH_INLINE type_convert(signed char s) { return __float2half(static_cast<float>(s)); }
-template <>           float       CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<float>(s); }
-template <>           double      CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<double>(s); }
+template <typename T> T             CUDA_BOTH_INLINE type_convert(signed char s);
+template <>           signed char   CUDA_BOTH_INLINE type_convert(signed char s) { return s; }
+template <>           short         CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<short>(s); }
+template <>           int           CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<int>(s); }
+template <>           __half        CUDA_BOTH_INLINE type_convert(signed char s) { return __float2half(static_cast<float>(s)); }
+template <>           float         CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<float>(s); }
+template <>           double        CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<double>(s); }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<__nv_fp8_e4m3>(s); }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(signed char s) { return static_cast<__nv_fp8_e5m2>(s); }
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from char2 (int8 complex)
@@ -58,6 +60,8 @@ template <>           unsigned int   CUDA_BOTH_INLINE type_convert(unsigned char
 template <>           __half         CUDA_BOTH_INLINE type_convert(unsigned char u) { return __float2half(static_cast<float>(u)); }
 template <>           float          CUDA_BOTH_INLINE type_convert(unsigned char u) { return static_cast<float>(u); }
 template <>           double         CUDA_BOTH_INLINE type_convert(unsigned char u) { return static_cast<double>(u); }
+template <>           __nv_fp8_e4m3  CUDA_BOTH_INLINE type_convert(unsigned char u) { return static_cast<__nv_fp8_e4m3>(u); }
+template <>           __nv_fp8_e5m2  CUDA_BOTH_INLINE type_convert(unsigned char u) { return static_cast<__nv_fp8_e5m2>(u); }
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from uchar2 (uint8 complex)
@@ -73,11 +77,14 @@ template <>           cuDoubleComplex CUDA_BOTH_INLINE type_convert(uchar2 u) { 
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from short (int16)
-template <typename T> T      CUDA_BOTH_INLINE type_convert(short s);
-template <>           short  CUDA_BOTH_INLINE type_convert(short s) { return s; }
-template <>           int    CUDA_BOTH_INLINE type_convert(short s) { return static_cast<int>(s); }
-template <>           float  CUDA_BOTH_INLINE type_convert(short s) { return static_cast<float>(s); }
-template <>           double CUDA_BOTH_INLINE type_convert(short s) { return static_cast<double>(s); }
+template <typename T> T             CUDA_BOTH_INLINE type_convert(short s);
+template <>           short         CUDA_BOTH_INLINE type_convert(short s) { return s; }
+template <>           int           CUDA_BOTH_INLINE type_convert(short s) { return static_cast<int>(s); }
+template <>           __half        CUDA_BOTH_INLINE type_convert(short s) { return static_cast<__half>(s); }
+template <>           float         CUDA_BOTH_INLINE type_convert(short s) { return static_cast<float>(s); }
+template <>           double        CUDA_BOTH_INLINE type_convert(short s) { return static_cast<double>(s); }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(short s) { return static_cast<__nv_fp8_e4m3>(s); }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(short s) { return static_cast<__nv_fp8_e5m2>(s); }
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from short2 (int16 complex)
@@ -93,8 +100,11 @@ template <typename T> T              CUDA_BOTH_INLINE type_convert(unsigned shor
 template <>           unsigned short CUDA_BOTH_INLINE type_convert(unsigned short u) { return u; }
 template <>           int            CUDA_BOTH_INLINE type_convert(unsigned short u) { return static_cast<int>(u); }
 template <>           unsigned int   CUDA_BOTH_INLINE type_convert(unsigned short u) { return static_cast<unsigned int>(u); }
+template <>           __half         CUDA_BOTH_INLINE type_convert(unsigned short u) { return static_cast<__half>(u); }
 template <>           float          CUDA_BOTH_INLINE type_convert(unsigned short u) { return static_cast<float>(u); }
 template <>           double         CUDA_BOTH_INLINE type_convert(unsigned short u) { return static_cast<double>(u); }
+template <>           __nv_fp8_e4m3  CUDA_BOTH_INLINE type_convert(unsigned short u) { return static_cast<__nv_fp8_e4m3>(u); }
+template <>           __nv_fp8_e5m2  CUDA_BOTH_INLINE type_convert(unsigned short u) { return static_cast<__nv_fp8_e5m2>(u); }
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from ushort2 (uint16 complex)
@@ -107,10 +117,13 @@ template <>           cuDoubleComplex CUDA_BOTH_INLINE type_convert(ushort2 u) {
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from int (int32)
-template <typename T> T      CUDA_BOTH_INLINE type_convert(int i);
-template <>           int    CUDA_BOTH_INLINE type_convert(int i) { return i; }
-template <>           float  CUDA_BOTH_INLINE type_convert(int i) { return static_cast<float>(i); }
-template <>           double CUDA_BOTH_INLINE type_convert(int i) { return static_cast<double>(i); }
+template <typename T> T             CUDA_BOTH_INLINE type_convert(int i);
+template <>           int           CUDA_BOTH_INLINE type_convert(int i) { return i; }
+template <>           __half        CUDA_BOTH_INLINE type_convert(int i) { return static_cast<__half>(i); }
+template <>           float         CUDA_BOTH_INLINE type_convert(int i) { return static_cast<float>(i); }
+template <>           double        CUDA_BOTH_INLINE type_convert(int i) { return static_cast<double>(i); }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(int i) { return static_cast<__nv_fp8_e4m3>(i); }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(int i) { return static_cast<__nv_fp8_e5m2>(i); }
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from int2 (int32 complex)
@@ -121,10 +134,13 @@ template <>           cuDoubleComplex CUDA_BOTH_INLINE type_convert(int2 i) { re
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from uint (uint32)
-template <typename T> T      CUDA_BOTH_INLINE type_convert(unsigned int u);
-template <>           uint   CUDA_BOTH_INLINE type_convert(unsigned int u) { return u; }
-template <>           float  CUDA_BOTH_INLINE type_convert(unsigned int u) { return static_cast<float>(u); }
-template <>           double CUDA_BOTH_INLINE type_convert(unsigned int u) { return static_cast<double>(u); }
+template <typename T> T             CUDA_BOTH_INLINE type_convert(unsigned int u);
+template <>           uint          CUDA_BOTH_INLINE type_convert(unsigned int u) { return u; }
+template <>           __half        CUDA_BOTH_INLINE type_convert(unsigned int u) { return static_cast<__half>(u); }
+template <>           float         CUDA_BOTH_INLINE type_convert(unsigned int u) { return static_cast<float>(u); }
+template <>           double        CUDA_BOTH_INLINE type_convert(unsigned int u) { return static_cast<double>(u); }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(unsigned int u) { return static_cast<__nv_fp8_e4m3>(u); }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(unsigned int u) { return static_cast<__nv_fp8_e5m2>(u); }
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from uint2 (uint32 complex)
@@ -135,10 +151,14 @@ template <>           cuDoubleComplex CUDA_BOTH_INLINE type_convert(uint2 u) { r
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from __half (fp16)
-template <typename T> T      CUDA_BOTH_INLINE type_convert(__half h);
-template <>           __half CUDA_BOTH_INLINE type_convert(__half h) { return h; }
-template <>           float  CUDA_BOTH_INLINE type_convert(__half h) { return __half2float(h); }
-template <>           double CUDA_BOTH_INLINE type_convert(__half h) { return static_cast<double>(__half2float(h)); }
+template <typename T> T             CUDA_BOTH_INLINE type_convert(__half h);
+template <>           __half        CUDA_BOTH_INLINE type_convert(__half h) { return h; }
+template <>           float         CUDA_BOTH_INLINE type_convert(__half h) { return __half2float(h); }
+template <>           double        CUDA_BOTH_INLINE type_convert(__half h) { return static_cast<double>(__half2float(h)); }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(__half h) { return static_cast<__nv_fp8_e4m3>(h); }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(__half h) { return static_cast<__nv_fp8_e5m2>(h); }
+// Note: __half2char_rz clamps the result to SCHAR_MIN/SCHAR_MAX.
+template <>           int8_t        CUDA_BOTH_INLINE type_convert(__half h) { return __half2char_rz(h); }
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from __half2 (fp16 complex)
@@ -154,10 +174,36 @@ template <>           cuDoubleComplex CUDA_BOTH_INLINE type_convert(__half2 h) {
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from float (fp32)
-template <typename T> T      CUDA_BOTH_INLINE type_convert(float f);
-template <>           float  CUDA_BOTH_INLINE type_convert(float f) { return f; }
-template <>           double CUDA_BOTH_INLINE type_convert(float f) { return static_cast<double>(f); }
-template <>           __half CUDA_BOTH_INLINE type_convert(float f) { return __float2half(f); }
+template <typename T> T             CUDA_BOTH_INLINE type_convert(float f);
+template <>           float         CUDA_BOTH_INLINE type_convert(float f) { return f; }
+template <>           double        CUDA_BOTH_INLINE type_convert(float f) { return static_cast<double>(f); }
+template <>           __half        CUDA_BOTH_INLINE type_convert(float f) { return __float2half(f); }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(float f) { return static_cast<__nv_fp8_e4m3>(f); }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(float f) { return static_cast<__nv_fp8_e5m2>(f); }
+template <>           int8_t        CUDA_BOTH_INLINE type_convert(float f)
+{
+    // The C++ standard describes the result of conversion for out-of-bounds
+    // values as undefined behavior. Since there is no infinity representation
+    // for integer values, we clamp.
+    // Casting a NaN value to an integer is undefined behavior, so we arbitrarily
+    // choose to convert to 0 here for now.
+    if(isnan(f))
+    {
+        return 0;
+    }
+    else if(f >= static_cast<float>(INT8_MAX))
+    {
+        return INT8_MAX;
+    }
+    else if(f <= static_cast<float>(INT8_MIN))
+    {
+        return INT8_MIN;
+    }
+    else
+    {
+        return static_cast<int8_t>(f);
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from cuComplex (fp32 complex)
@@ -168,15 +214,66 @@ template <>           cuDoubleComplex CUDA_BOTH_INLINE type_convert(cuComplex c)
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from double (fp64)
-template <typename T> T      CUDA_BOTH_INLINE type_convert(double d);
-template <>           double CUDA_BOTH_INLINE type_convert(double d) { return d; }
-template <>           float  CUDA_BOTH_INLINE type_convert(double d) { return static_cast<float>(d); }
+template <typename T> T             CUDA_BOTH_INLINE type_convert(double d);
+template <>           __half        CUDA_BOTH_INLINE type_convert(double d) { return static_cast<__half>(d); }
+template <>           double        CUDA_BOTH_INLINE type_convert(double d) { return d; }
+template <>           float         CUDA_BOTH_INLINE type_convert(double d) { return static_cast<float>(d); }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(double d) { return static_cast<__nv_fp8_e4m3>(d); }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(double d) { return static_cast<__nv_fp8_e5m2>(d); }
+template <>           int8_t        CUDA_BOTH_INLINE type_convert(double d)
+{
+    // The C++ standard describes the result of conversion for out-of-bounds
+    // values as undefined behavior. Since there is no infinity representation
+    // for integer values, we clamp.
+    // Casting a NaN value to an integer is undefined behavior, so we arbitrarily
+    // choose to convert to 0 here for now.
+    if(isnan(d))
+    {
+        return 0;
+    }
+    else if(d >= static_cast<double>(INT8_MAX))
+    {
+        return INT8_MAX;
+    }
+    else if(d <= static_cast<double>(INT8_MIN))
+    {
+        return INT8_MIN;
+    }
+    else
+    {
+        return static_cast<int8_t>(d);
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////
 // Type conversions from cuDoubleComplex (fp64 complex)
 template <typename T> T               CUDA_BOTH_INLINE type_convert(cuDoubleComplex d);
 template <>           cuDoubleComplex CUDA_BOTH_INLINE type_convert(cuDoubleComplex d) { return d; }
 template <>           cuComplex       CUDA_BOTH_INLINE type_convert(cuDoubleComplex d) { return cuComplexDoubleToFloat(d); }
+
+////////////////////////////////////////////////////////////////////////
+// Type conversions from __nv_fp8_e4m3
+template <typename T> T             CUDA_BOTH_INLINE type_convert(__nv_fp8_e4m3 f);
+template <>           __half        CUDA_BOTH_INLINE type_convert(__nv_fp8_e4m3 f) { return static_cast<__half>(f); }
+template <>           float         CUDA_BOTH_INLINE type_convert(__nv_fp8_e4m3 f) { return static_cast<float>(f); }
+template <>           double        CUDA_BOTH_INLINE type_convert(__nv_fp8_e4m3 f) { return static_cast<double>(f); }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(__nv_fp8_e4m3 f) { return f; }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(__nv_fp8_e4m3 f)
+{
+    return static_cast<__nv_fp8_e5m2>(static_cast<__half>(f));
+}
+
+////////////////////////////////////////////////////////////////////////
+// Type conversions from __nv_fp8_e5m2
+template <typename T> T             CUDA_BOTH_INLINE type_convert(__nv_fp8_e5m2 f);
+template <>           __half        CUDA_BOTH_INLINE type_convert(__nv_fp8_e5m2 f) { return static_cast<__half>(f); }
+template <>           float         CUDA_BOTH_INLINE type_convert(__nv_fp8_e5m2 f) { return static_cast<float>(f); }
+template <>           double        CUDA_BOTH_INLINE type_convert(__nv_fp8_e5m2 f) { return static_cast<double>(f); }
+template <>           __nv_fp8_e5m2 CUDA_BOTH_INLINE type_convert(__nv_fp8_e5m2 f) { return f; }
+template <>           __nv_fp8_e4m3 CUDA_BOTH_INLINE type_convert(__nv_fp8_e5m2 f)
+{
+    return static_cast<__nv_fp8_e4m3>(static_cast<__half>(f));
+}
 
 // clang-format on
 

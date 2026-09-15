@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,9 +18,18 @@
 #if !defined(LDPC_DECODE_TEST_VEC_GEN_HPP_INCLUDED_)
 #define LDPC_DECODE_TEST_VEC_GEN_HPP_INCLUDED_
 
+#include <stdexcept>
 #include <string>
 #include "ldpc_decode_test_vec.hpp"
 
+class ldpc_invalid_crc_config : public std::runtime_error
+{
+public:
+    explicit ldpc_invalid_crc_config(const std::string& msg) :
+      std::runtime_error(msg)
+    {
+    }
+};
 
 struct test_vec_gen_params
 {
@@ -34,7 +43,8 @@ struct test_vec_gen_params
                         int             modBits,
                         int             log2QAM,
                         float           SNR_in,
-                        bool            puncture_in) :
+                        bool            puncture_in,
+                        uint32_t        crc_type_in) :
       LLRtype(llr_type),
       BG(bg),
       num_parity(nparity),
@@ -45,7 +55,8 @@ struct test_vec_gen_params
       num_modulated_bits(modBits),
       log2_QAM(log2QAM),
       SNR(SNR_in),
-      puncture(puncture_in)
+      puncture(puncture_in),
+      crc_type(crc_type_in)
     {
     }
     cuphyDataType_t LLRtype;
@@ -59,6 +70,7 @@ struct test_vec_gen_params
     int             log2_QAM;
     float           SNR;
     bool            puncture;
+    uint32_t        crc_type;
 };
 
 ////////////////////////////////////////////////////////////////////////

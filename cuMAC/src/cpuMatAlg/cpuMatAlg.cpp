@@ -301,17 +301,70 @@
     }   
  }
 
- void cpuMatAlg::matInverseEigen(cuComplex* A, int A_D, cuComplex* Result)
+void cpuMatAlg::matInverseEigen(cuComplex* A, int A_D, cuComplex* Result)
+{
+   Eigen::MatrixXcf g(A_D, A_D);
+   Eigen::MatrixXcf resultInvA(A_D, A_D);
+   g = Eigen::Map<Eigen::MatrixXcf>(reinterpret_cast<std::complex<float>*>(A), A_D, A_D);
+   resultInvA = g.inverse();
+   for (int col_j = 0; col_j < A_D; col_j++) {
+       for (int row_i = 0; row_i < A_D; row_i++) {
+           Result[row_i+col_j*A_D].x = resultInvA(row_i, col_j).real();
+           Result[row_i+col_j*A_D].y = resultInvA(row_i, col_j).imag();
+       }
+   }
+}
+
+void cpuMatAlg::matInverseEigen_rm(cuComplex* A, int A_D, cuComplex* Result)
+{
+   Eigen::MatrixXcf g(A_D, A_D);
+   Eigen::MatrixXcf resultInvA(A_D, A_D);
+   
+   // Load row-major input matrix into Eigen (which expects column-major)
+   for (int row_i = 0; row_i < A_D; row_i++) {
+       for (int col_j = 0; col_j < A_D; col_j++) {
+           const int rm_idx = row_i * A_D + col_j;  // row-major index
+           g(row_i, col_j) = std::complex<float>(A[rm_idx].x, A[rm_idx].y);
+       }
+   }
+   
+   // Compute inverse
+   resultInvA = g.inverse();
+   
+   // Store result back in row-major format
+   for (int row_i = 0; row_i < A_D; row_i++) {
+       for (int col_j = 0; col_j < A_D; col_j++) {
+           const int rm_idx = row_i * A_D + col_j;  // row-major index
+           Result[rm_idx].x = resultInvA(row_i, col_j).real();
+           Result[rm_idx].y = resultInvA(row_i, col_j).imag();
+       }
+   }
+}
+
+ void cpuMatAlg::matCondense_rm(cuComplex* A, int A_R, int A_C, int A_C_st, int A_nCondensedCols, cuComplex* Result)
  {
-    Eigen::MatrixXcf g(A_D, A_D);
-    Eigen::MatrixXcf resultInvA(A_D, A_D);
-    g = Eigen::Map<Eigen::MatrixXcf>(reinterpret_cast<std::complex<float>*>(A), A_D, A_D);
-    resultInvA = g.inverse();
-    for (int col_j = 0; col_j < A_D; col_j++) {
-        for (int row_i = 0; row_i < A_D; row_i++) {
-            Result[row_i+col_j*A_D].x = resultInvA(row_i, col_j).real();
-            Result[row_i+col_j*A_D].y = resultInvA(row_i, col_j).imag();
+    for (int rowIdx = 0; rowIdx < A_R; rowIdx++){
+        for (int colIdx = 0; colIdx < A_nCondensedCols; colIdx++){
+            Result[rowIdx*A_nCondensedCols + colIdx] = A[rowIdx*A_C + colIdx + A_C_st];
         }
     }
+ }
+
+ void cpuMatAlg::matMultiplication_acondensedb_rm(cuComplex* A, int A_R, int A_C, cuComplex* B, int B_C, int B_C_st, int B_nCondensedCols, cuComplex* bCondensedScratch, cuComplex* Result)
+ {
+    // condensify B to bCondensedScratch with contiguous element address
+    matCondense_rm(B, A_C, B_C, B_C_st, B_nCondensedCols, bCondensedScratch);
+
+    // multiply matrices A and B_condensed 
+    matMultiplication_ab_rm(A, A_R, A_C, bCondensedScratch, B_nCondensedCols, Result);
+ }
+
+ void cpuMatAlg::matMultiplication_aHcondensedb_rm(cuComplex* A, int A_R, int A_C, cuComplex* B, int B_C, int B_C_st, int B_nCondensedCols, cuComplex* bCondensedScratch, cuComplex* Result)
+ {
+    // condensify B to bCondensedScratch with contiguous element address
+    matCondense_rm(B, A_R, B_C, B_C_st, B_nCondensedCols, bCondensedScratch);
+
+    // multiply matrices A^H and B_condensed 
+    matMultiplication_aHb_rm(A, A_R, A_C, bCondensedScratch, B_nCondensedCols, Result);
  }
 }

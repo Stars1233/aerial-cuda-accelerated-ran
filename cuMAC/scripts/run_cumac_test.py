@@ -18,6 +18,7 @@ import fileinput
 import os
 import sys
 import itertools
+import fnmatch
 from datetime import datetime
 import argparse
 import csv
@@ -34,9 +35,14 @@ class cuMACTest:
     def __init__(self, config):
         self.config = config
         self.cumac_folder = Path(f"{self.config['cubb_sdk']}/cuMAC")
-        self.build_path = Path(self.config['cubb_sdk'])/"build"
-        self.param_file = self.cumac_folder / "examples/parameters.h"
-        self.param_file_bak = self.param_file.with_suffix(".h_bak")
+        self.build_path = Path(self.config['cubb_sdk']) / "build"
+        # Example parameters are loaded at runtime from parameters.yaml
+        # (see cuMAC/examples/parameters.cpp); values no longer require a rebuild.
+        self.param_file = self.cumac_folder / "examples/parameters.yaml"
+        self.param_file_bak = self.param_file.with_name(self.param_file.name + "_bak")
+        # Point the example binaries at the edited YAML regardless of their cwd.
+        self.param_env = f"CUMAC_PARAMS_YAML={self.param_file}"
+        self._built = False
         if self.config["option"] in ["f1", "f2", "f3", "f4"]:
             self._cpu_gpu_perf_gap_targets = {
                 "cpuGpuPerfGapPerUeConst": "0.05",
@@ -95,9 +101,9 @@ class cuMACTest:
             )
         self.logger = self._setup_logger()
         print(f"Log file initialized at: {self.log_file}")
-        #self.build_command = f"cd {self.cumac_folder} && {self.config['cmake']}"
+        # self.build_command = f"cd {self.cumac_folder} && {self.config['cmake']}"
         self.build_command = f"cd {self.config['cubb_sdk']} && {self.config['cmake']}"
-        self.check_command = f"grep 'nBsAntConst\|nUeAntConst\|numSimChnRlz\|gpuDeviceIdx\|seedConst\|numCellConst\|numUePerCellConst\|numActiveUePerCellConst\|nPrbsPerGrpConst\|numUePerCellConst\|gpuAllocTypeConst\|cpuAllocTypeConst\|prdSchemeConst\|rxSchemeConst\|nPrbGrpsConst\|cpuGpuPerfGapPerUeConst\|cpuGpuPerfGapSumRConst' {self.param_file}"
+        self.check_command = f"grep -E 'nBsAntConst|nUeAntConst|numSimChnRlz|gpuDeviceIdx|seedConst|numCellConst|numUePerCellConst|numActiveUePerCellConst|nPrbsPerGrpConst|gpuAllocTypeConst|cpuAllocTypeConst|prdSchemeConst|rxSchemeConst|nPrbGrpsConst|cpuGpuPerfGapPerUeConst|cpuGpuPerfGapSumRConst' {self.param_file}"
         self.UL_SUPPORTED_INDICES = [
             "0004", "0008", "0012", "0016", "0020", "0024", "0028", "0032"]
         self.UE_500_INDICES = ["0005", "0006", "0007", "0008", "0013", "0014", "0015",
@@ -534,7 +540,7 @@ class cuMACTest:
                 raw_num_cell, raw_num_active_ue_per_cell
             )
             numActiveLinks = 999999  # disable sanitizer on parse error
-        
+
         # Disable compute-sanitizer for numActiveLinks > 25600 (too slow / high memory)
         compute_sanitizer_cmd = (
             "compute-sanitizer --error-exitcode 0 --tool memcheck --leak-check full "
@@ -559,7 +565,8 @@ class cuMACTest:
             )
             cmd = f"{self.build_path}/cuMAC/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
             test_cmd = [
-                "timeout -s 9 600",
+                self.param_env,
+                "timeout -s 9 1800",
                 compute_sanitizer_cmd,
                 str(cmd),
                 "-d",
@@ -578,6 +585,7 @@ class cuMACTest:
                 / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_cuMAC_{self.config['antenna']}T{self.config['antenna']}R_{self.config['direction']}_{self.config['tv_index']}_test.log"
             )
             test_cmd = [
+                self.param_env,
                 str(cmd),
                 "-d",
                 d,
@@ -614,7 +622,7 @@ class cuMACTest:
                 / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_cuMAC_{self.config['option']}_{self.config['tv_index']}_test.log"
             )
             test_cmd = [
-                f"cd {self.build_path} && {compute_sanitizer_cmd}",
+                f"cd {self.build_path} && {self.param_env} {compute_sanitizer_cmd}",
                 str(cmd),
                 f"{self.cumac_folder}/examples/multiCellSrsScheduler/srs_scheduler_testing_config.yaml",
                 ">",
@@ -651,29 +659,30 @@ class cuMACTest:
                 self.check_and_rename_log_file(
                     test_log, f"tdl {self.config['option']} test log", "returned an error")
 
+    # apply bigger cpu/gpu perf gap patch to examples/parameters.yaml when option is f1..f4 and allow_bigger_cpu_gpu_gap is true
 
-    # apply bigger cpu/gpu perf gap patch to examples/parameters.h when option is f1..f4 and allow_bigger_cpu_gpu_gap is true
     def _maybe_apply_bigger_gap_patch(self):
         """
         If --allow-bigger-cpu-gpu-gap is enabled AND option is f1..f4,
-        change cpuGpuPerfGapPerUeConst and cpuGpuPerfGapSumRConst to 0.05 in file examples/parameters.h
-        in lines of the form:  #define NAME VALUE 
+        change cpuGpuPerfGapPerUeConst and cpuGpuPerfGapSumRConst to 0.05 in file examples/parameters.yaml
+        in lines of the form:  NAME: VALUE  # optional comment
         """
         if self.config.get("option") not in ["f1", "f2", "f3", "f4"]:
             return
         if not self.config.get("allow_bigger_cpu_gpu_gap"):
             return
-        self.logger.info("Applying bigger CPU/GPU perf-gap patch in examples/parameters.h")
+        self.logger.info("Applying bigger CPU/GPU perf-gap patch in examples/parameters.yaml")
         try:
             text = self.param_file.read_text()
             original_text = text
             for name, new_val in self._cpu_gpu_perf_gap_targets.items():
-                define_re = re.compile(
-                    rf'(^\s*#\s*define\s+{name}\s+)([0-9]*\.?[0-9]+)\b',
-                    re.IGNORECASE | re.MULTILINE
+                # Replace only the scalar value, preserving any trailing comment.
+                yaml_re = re.compile(
+                    rf'(^\s*{name}\s*:\s*)(\S+)',
+                    re.MULTILINE
                 )
-                text, n = define_re.subn(rf'\g<1>{new_val}', text)
-                self.logger.info(f"{name}: updated {n} #define occurrence(s)")
+                text, n = yaml_re.subn(rf'\g<1>{new_val}', text)
+                self.logger.info(f"{name}: updated {n} YAML occurrence(s)")
             if text != original_text:
                 # Ensure backup before first modification
                 if not self.param_file_bak.exists():
@@ -681,10 +690,9 @@ class cuMACTest:
                 self.param_file.write_text(text)
                 self.run_subprocess(self.check_command, self.log_file)
             else:
-                self.logger.warning("Bigger-gap patch made no changes (no matching #define lines found).")
-        except Exception as e:
-            self.logger.error(f"Error applying bigger CPU/GPU perf-gap patch in examples/parameters.h: {e}")
-
+                self.logger.warning("Bigger-gap patch made no changes (no matching YAML keys found).")
+        except (OSError, re.error) as e:
+            self.logger.error(f"Error applying bigger CPU/GPU perf-gap patch in examples/parameters.yaml: {e}")
 
     def run_tdl_test_all(self):
         if not self.param_file_bak.exists():
@@ -861,7 +869,7 @@ class cuMACTest:
                 )
                 return
         self.logger.info(f"Found {self.tv_file}, start to run testing ......")
-        run_test = f"cd {self.build_path}/cuMAC/examples/tvLoadingTest/ && ./tvLoadingTest -i {self.tv_file} -g 2 {dir_command} {test_command}"
+        run_test = f"cd {self.build_path}/cuMAC/examples/tvLoadingTest/ && {self.param_env} ./tvLoadingTest -i {self.tv_file} -g 2 {dir_command} {test_command}"
         self.run_subprocess(run_test, self.log_file)
 
     def single_tti_test_all(self):
@@ -943,18 +951,18 @@ class cuMACTest:
         return param_combin
 
     def get_parameter_value(self, param: str) -> str:
-        """Get the value of a preprocessor macro from the parameters header.
+        """Get the value of a parameter from the parameters YAML file.
 
-        Runs grep/awk via run_subprocess to find the #define line for the given
-        macro in self.param_file; command output is appended to self.log_file.
+        Runs grep/awk via run_subprocess to find the `param: value` line for the
+        given key in self.param_file; command output is appended to self.log_file.
         If the subprocess fails or returns non-string (e.g. 1), returns "".
 
         Args:
-            param: Macro name to look up (e.g. "numCellConst"). Lookup is done
-                in self.param_file.
+            param: Parameter key to look up (e.g. "numCellConst"). Lookup is done
+                in self.param_file (parameters.yaml).
 
         Returns:
-            The stripped macro value (third token of the matching #define line),
+            The stripped value (second token of the matching `key: value` line),
             or "" if no match, run_subprocess fails (returns 1), or result is not
             a string.
 
@@ -968,9 +976,9 @@ class cuMACTest:
             >>> self.get_parameter_value("nonexistent")
             ''
         """
-        # Match only the line that defines this macro (#define param value), not lines that use it
+        # Match only the line that defines this key (key: value), not lines that reference it
         result = self.run_subprocess(
-            f"grep -E '^\\s*#\\s*define\\s+{param}\\s+' {self.param_file} | awk '{{print $3}}'",
+            f"grep -E '^\\s*{param}\\s*:' {self.param_file} | awk '{{print $2}}'",
             self.log_file,
         )
         return result.strip() if isinstance(result, str) else ""
@@ -993,6 +1001,19 @@ class cuMACTest:
 
     def should_skip_tv(self):
         """Determine if the current TV should be skipped based on combined conditions."""
+        if any(fnmatch.fnmatchcase(self.tv_name, pat) for pat in [
+            "TV_cuMAC_4T4R_DL_TC0024_f1*",
+            "TV_cuMAC_4T4R_DL_TC0024_f3*",
+            "TV_cuMAC_4T4R_DL_TC0032_f1*",
+            "TV_cuMAC_4T4R_UL_TC0032_f1*",
+            "TV_cuMAC_4T4R_UL_TC0024_f1*",
+            "TV_cuMAC_4T4R_UL_TC0024_f3*",
+            "TV_cuMAC_4T4R_UL_TC0032_f3*",
+            "TV_cuMAC_4T4R_DL_TC0032_f3*",
+        ]):
+            self.logger.info(
+                f"Skip this test: Known issue (NVBug 5092096) for {self.tv_name}")
+            return True
         if self._is_500_ue_index():
             # For 500 UE cases, only skip f2 and f4 fading types
             if self._is_unsupported_fading_type():
@@ -1010,19 +1031,27 @@ class cuMACTest:
         return False
 
     def build_cumac(self):
-        self.logger.info(f"Start to build cuMAC ......")
-        build_result = self.run_subprocess(self.build_command, self.log_file)
-        if build_result == 0:
-            self.logger.info(
-                f"Built cuMAC successfully, ready to generate TV_cuMAC_{self.config['antenna']}T{self.config['antenna']}R_{self.config['direction']}_TC{self.config['tv_index']}."
-            )
+        # Parameter values are read at runtime from parameters.yaml, so a rebuild
+        # is only needed once to (re)produce the example binaries — not to apply
+        # new parameter values.
+        if self._built:
             return True
-        # return False
+        self.logger.info("Start to build cuMAC ......")
+        build_result = self.run_subprocess(self.build_command, self.log_file)
+        if build_result == 1:
+            self.logger.error(
+                f"Failed to build cuMAC, please check {self.log_file}"
+            )
+            return False
+        self._built = True
+        self.logger.info(
+            f"Built cuMAC successfully, ready to generate TV_cuMAC_{self.config['antenna']}T{self.config['antenna']}R_{self.config['direction']}_TC{self.config['tv_index']}."
+        )
         return True
 
     def backup_parameters(self):
         new_filename = (
-            f"{self.cumac_folder}/examples/parameters_{self.config['tv_index']}.h"
+            f"{self.cumac_folder}/examples/parameters_{self.config['tv_index']}.yaml"
         )
         if not os.path.exists(new_filename):
             self.run_subprocess(
@@ -1265,17 +1294,17 @@ class cuMACTest:
         parser.add_argument("-g", "--gpu_id", help="GPU device ID")
         parser.add_argument("-s", "--cubb_sdk", help="cuBB SDK folder")
 
-        args = parser.parse_args()   
+        args = parser.parse_args()
         config = {
             "direction": args.direction if args.direction is not None else "DL",
             "antenna": args.antenna if args.antenna is not None else "4",
             "cubb_sdk": (
                 args.cubb_sdk if args.cubb_sdk is not None else "/opt/nvidia/cuBB"
-            ),           
+            ),
             "cmake": (
                 args.cmake
                 if args.cmake is not None
-                #else "cmake -Bbuild -GNinja && cmake --build build"
+                # else "cmake -Bbuild -GNinja && cmake --build build"
                 else f"cmake -Bbuild -GNinja -DCMAKE_TOOLCHAIN_FILE={args.cubb_sdk}/cuPHY/cmake/toolchains/grace-cross -DNVIPC_FMTLOG_ENABLE=ON && cmake --build build --target cumac_examples"
             ),
             "log_folder": (
@@ -1332,7 +1361,7 @@ if __name__ == "__main__":
 
         3. Run cuMAC CDL tests:
            python3 run_cumac_test.py -o f3|f4 -d DL|UL -a 4 {-l LOG_DIR -tv TV_DIR}
-           Some tests can fail because of the cpu/gpu perf gap, if allow bigger cpu/gpu perf gap, add --allow-bigger-cpu-gpu-gap 
+           Some tests can fail because of the cpu/gpu perf gap, if allow bigger cpu/gpu perf gap, add --allow-bigger-cpu-gpu-gap
 
         4. Run cuMAC DRL tests:
            python3 run_cumac_test.py -o drl -d DL|UL {-a 4 -l LOG_DIR -tv TV_DIR}

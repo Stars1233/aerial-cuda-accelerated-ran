@@ -30,6 +30,8 @@
 #include <fcntl.h>
 #include <semaphore.h>
 #include <errno.h>
+#include <sys/stat.h>
+#include <ctype.h>
 
 #include "nv_utils.h"
 #include "shm_logger.h"
@@ -268,8 +270,31 @@ static void* log_file_save_thread(void* shmlogger_arg)
     return NULL;
 }
 
+static int shmlogger_name_is_safe(const char* name)
+{
+    if(name == NULL || name[0] == '\0')
+    {
+        return 0;
+    }
+
+    for(const char* p = name; *p != '\0'; ++p)
+    {
+        if(!(isalnum((unsigned char)*p) || *p == '_' || *p == '-' || *p == '.'))
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int log_file_open(shmlogger_t* logger, const char* name)
 {
+    if(!shmlogger_name_is_safe(name))
+    {
+        NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "%s: invalid logger name", __func__);
+        return -1;
+    }
+
     // Create or lookup the semaphore
     logger->sem = semaphore_create(name, logger->primary);
 
@@ -277,11 +302,10 @@ static int log_file_open(shmlogger_t* logger, const char* name)
     {
         char path[SHMLOG_NAME_MAX_LEN + NV_PATH_MAX_LEN];
 
-        // Create folder if not exist
-        snprintf(path, SHMLOG_NAME_MAX_LEN + NV_PATH_MAX_LEN, "mkdir -p %s", LOG_TEMP_FILE_PATH);
-        if(system(path) != 0)
+        if(mkdir(LOG_TEMP_FILE_PATH, 0755) != 0 && errno != EEXIST)
         {
-            NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "%s: %s: err=%d - %s", __func__, path, errno, strerror(errno));
+            NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "%s: mkdir %s failed: err=%d - %s", __func__,
+                    LOG_TEMP_FILE_PATH, errno, strerror(errno));
         }
 
         // Set the temporary log file path
@@ -342,6 +366,16 @@ void shmlogger_save_ipc_msg(shmlogger_t* logger, nv_ipc_msg_t* msg, int32_t flag
         return;
     }
 
+    int32_t msg_len = msg->msg_len;
+    if(msg_len < 0)
+    {
+        msg_len = 0;
+    }
+    else if(logger->config.max_msg_size > 0 && msg_len > logger->config.max_msg_size)
+    {
+        msg_len = logger->config.max_msg_size;
+    }
+
     int data_size_limit = 0; // DATA part size to save
     if(msg->data_len > 0 && (msg->data_pool == NV_IPC_MEMPOOL_CPU_DATA || msg->data_pool == NV_IPC_MEMPOOL_CPU_LARGE))
     {
@@ -350,7 +384,7 @@ void shmlogger_save_ipc_msg(shmlogger_t* logger, nv_ipc_msg_t* msg, int32_t flag
 
     // Get the SHM buffer and copy to it
     record_t record;
-    record.buf_size = msg->msg_len + data_size_limit;
+    record.buf_size = msg_len + data_size_limit;
     record.data_len = msg->data_len;
     record.flags    = flags;
     record.msg_id   = flags & 0xFFFF; // Not used
@@ -365,7 +399,7 @@ void shmlogger_save_ipc_msg(shmlogger_t* logger, nv_ipc_msg_t* msg, int32_t flag
     // record_t header
     new_offset = shm_logger_round_save(logger, new_offset, sizeof(record_t), (const char*)&record);
     // MSG part
-    new_offset = shm_logger_round_save(logger, new_offset, msg->msg_len, msg->msg_buf);
+    new_offset = shm_logger_round_save(logger, new_offset, msg_len, msg->msg_buf);
     // DATA part
     new_offset = shm_logger_round_save(logger, new_offset, data_size_limit, msg->data_buf);
     // total size

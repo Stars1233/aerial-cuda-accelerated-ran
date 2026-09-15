@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@
 #include "ring_buffer.hpp"
 #include "time.hpp"
 #include "utils.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 
 #define TAG "FH.LIB"
 
@@ -247,6 +248,43 @@ int aerial_fh::update_peer(PeerHandle handle, UserDataCompressionMethod dl_comp_
     {
         auto peer = static_cast<Peer*>(handle);
         peer->update(dl_comp_meth, dl_bit_width);
+    }
+    FH_CATCH_EXCEPTIONS();
+    return 0;
+}
+
+int aerial_fh::reset_peer_flow_registration(const PeerHandle handle)
+{
+    try
+    {
+        auto peer = static_cast<Peer*>(handle);
+        peer->get_eaxcid_idx_mp().clear();
+        peer->get_dlu_eaxcid_idx_mp().clear();
+    }
+    FH_CATCH_EXCEPTIONS();
+    return 0;
+}
+
+int aerial_fh::begin_peer_flow_registration(const PeerHandle handle)
+{
+    try
+    {
+        auto peer = static_cast<Peer*>(handle);
+        peer->set_defer_flow_hdr_sync(true);
+    }
+    FH_CATCH_EXCEPTIONS();
+    return 0;
+}
+
+int aerial_fh::end_peer_flow_registration(const PeerHandle handle)
+{
+    try
+    {
+        auto peer = static_cast<Peer*>(handle);
+        peer->set_defer_flow_hdr_sync(false);
+        // Flushes the deferred flow_hdr H2D and drains setup_stream_ (including
+        // earlier template/pkt-hdr copies from flow registration).
+        peer->sync_flow_hdr_size_info_to_device();
     }
     FH_CATCH_EXCEPTIONS();
     return 0;
@@ -800,8 +838,53 @@ int aerial_fh::gpu_comm_update_tx_metrics(PeerHandle handle, TxRequestGpuCommHan
     return 0;
 }
 
+/**
+ * Stamp the stable per-cell index into a TxRequestUplaneGpuComm (see api.hpp).
+ *
+ * @param[in] tx_request_handle GpuComm TX request handle
+ * @param[in] cell_idx Logical cell index in [0, API_MAX_NUM_CELLS)
+ * @return 0 on success, -EINVAL or -ERANGE on failure
+ */
+[[nodiscard]] int aerial_fh::set_gpu_request_cell_idx(TxRequestGpuCommHandle tx_request_handle, uint8_t cell_idx) noexcept
+{
+    if(tx_request_handle == nullptr)
+    {
+        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "set_gpu_request_cell_idx: null tx_request_handle (cell_idx={})", cell_idx);
+        return -EINVAL;
+    }
+    if(cell_idx >= API_MAX_NUM_CELLS)
+    {
+        // Out-of-range index would alias another cell's per-cell state; reject.
+        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "set_gpu_request_cell_idx: cell_idx={} >= API_MAX_NUM_CELLS={}", cell_idx, API_MAX_NUM_CELLS);
+        return -ERANGE;
+    }
+    static_cast<TxRequestUplaneGpuComm*>(tx_request_handle)->m_cell_idx = cell_idx;
+    return 0;
+}
+
+int aerial_fh::setup_uplane_gpu_comm(PeerHandle handle, uint8_t frame_id, uint16_t subframe_id, uint16_t slot_id,
+    uint16_t max_num_prb_per_symbol, std::chrono::nanoseconds cell_start_time,
+    std::chrono::nanoseconds symbol_duration, bool commViaCpu, TxRequestGpuCommHandle* output_handle,
+    PartialUplaneSlotInfo_t** out_partial_info,
+    UplaneConversionParams* out_params,
+    const uint16_t* eaxcid_list,
+    uint16_t num_eaxcids)
+{
+    try
+    {
+        auto peer = static_cast<Peer*>(handle);
+        TxRequestUplaneGpuComm* tx_request;
+        peer->gpu_comm_setup_tx_request(frame_id, subframe_id, slot_id, max_num_prb_per_symbol,
+            cell_start_time, symbol_duration, commViaCpu, &tx_request, out_partial_info,
+            out_params, eaxcid_list, num_eaxcids);
+        *output_handle = tx_request;
+    }
+    FH_CATCH_EXCEPTIONS();
+    return 0;
+}
+
 int aerial_fh::prepare_uplane_gpu_comm(PeerHandle handle, UPlaneMsgSendInfo const* info, size_t num_msgs, TxRequestGpuCommHandle* output_handle,
-		std::chrono::nanoseconds cell_start_time,  std::chrono::nanoseconds symbol_duration,bool commViaCpu)
+	std::chrono::nanoseconds cell_start_time,  std::chrono::nanoseconds symbol_duration,bool commViaCpu)
 {
 //printf("cell_start_time %lu and symbol duration %lu\n", cell_start_time.count(), symbol_duration.count());
     try
@@ -876,6 +959,87 @@ int aerial_fh::print_max_delays(NicHandle handle)
     }
     FH_CATCH_EXCEPTIONS_TX();
     return 0;
+}
+
+std::optional<aerial_fh::CplaneSender> aerial_fh::make_cplane_sender(NicHandle nic_handle, oran_pkt_dir direction)
+{
+    auto* nic = static_cast<Nic*>(nic_handle);
+    if (!nic) {
+        return std::nullopt;
+    }
+
+    auto& qm = nic->get_queue_manager();
+    Txq* txq = nullptr;
+    bool txq_assigned = false;
+    try {
+        txq = qm.assign_txq(false);
+        txq_assigned = true;
+    } catch (...) {
+        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT,
+            "make_cplane_sender: failed to assign TX queue for NIC {}", nic->get_name());
+        return std::nullopt;
+    }
+
+    auto* pool = nic->get_cpu_cplane_mbuf_pool();
+    if (!pool) {
+        if (txq_assigned && txq) {
+            qm.reclaim(txq);
+        }
+        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT,
+            "make_cplane_sender: no C-plane mempool for NIC {}", nic->get_name());
+        return std::nullopt;
+    }
+
+    rte_mbuf* test_mbuf = nullptr;
+    if (rte_pktmbuf_alloc_bulk(pool, &test_mbuf, 1) == 0) {
+        uint16_t capacity = rte_pktmbuf_tailroom(test_mbuf);
+        uint16_t mtu = nic->get_mtu();
+        rte_pktmbuf_free(test_mbuf);
+        if (mtu > capacity) {
+            if (txq_assigned && txq) {
+                qm.reclaim(txq);
+            }
+            NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT,
+                "make_cplane_sender: MTU {} exceeds mbuf capacity {}", mtu, capacity);
+            return std::nullopt;
+        }
+    }
+
+    return CplaneSender(static_cast<TxqHandle>(txq), pool);
+}
+
+int aerial_fh::CplaneSender::alloc(rte_mbuf** mbufs, unsigned count)
+{
+    return rte_pktmbuf_alloc_bulk(mempool_, mbufs, count);
+}
+
+void aerial_fh::CplaneSender::free(rte_mbuf** mbufs, unsigned count)
+{
+    rte_pktmbuf_free_bulk(mbufs, count);
+}
+
+std::error_code aerial_fh::CplaneSender::send(rte_mbuf** mbufs, std::size_t count)
+{
+    if (count == 0) {
+        return {};
+    }
+    if ((mbufs == nullptr) || (txq_handle_ == nullptr)) {
+        return std::make_error_code(std::errc::invalid_argument);
+    }
+    auto* txq = static_cast<Txq*>(txq_handle_);
+    try {
+        const std::size_t sent_packets = use_lock_
+            ? txq->send_lock(mbufs, count)
+            : txq->send(mbufs, count);
+        if (sent_packets != count) {
+            return std::make_error_code(std::errc::io_error);
+        }
+    } catch (const aerial_fh::FronthaulException& e) {
+        return std::error_code(e.err_code(), std::generic_category());
+    } catch (...) {
+        return std::make_error_code(std::errc::io_error);
+    }
+    return {};
 }
 
 size_t aerial_fh::prepare_cplane_count_packets(PeerHandle handle, CPlaneMsgSendInfo const* info, size_t num_msgs)

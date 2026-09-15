@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,6 @@
 if [ ! -v AERIAL_PYTHON ]; then
     export AERIAL_PYTHON=1
     export PS1="[Aerial Python]$PS1 "
-    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/MATLAB/MATLAB_Runtime/R2023a/runtime/glnxa64:/usr/local/MATLAB/MATLAB_Runtime/R2023a/bin/glnxa64:/usr/local/MATLAB/MATLAB_Runtime/R2023a/sys/os/glnxa64:/usr/local/MATLAB/MATLAB_Runtime/R2023a/extern/bin/glnxa64:/usr/local/MATLAB/MATLAB_Runtime/R2023a/sys/opengl/lib/glnxa64
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/MATLAB/MATLAB_Runtime/R2026a/runtime/glnxa64:/usr/local/MATLAB/MATLAB_Runtime/R2026a/bin/glnxa64:/usr/local/MATLAB/MATLAB_Runtime/R2026a/sys/os/glnxa64:/usr/local/MATLAB/MATLAB_Runtime/R2026a/extern/bin/glnxa64:/usr/local/MATLAB/MATLAB_Runtime/R2026a/sys/opengl/lib/glnxa64
 fi
 export MCORE_BUILD_TYPE="dev"

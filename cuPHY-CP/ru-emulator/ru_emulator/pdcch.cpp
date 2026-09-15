@@ -207,6 +207,17 @@ int RU_Emulator::validate_pdcch(uint8_t cell_index, const struct oran_packet_hea
 
         for (auto &pdu : dl_tv_info.pdu_infos)
         {
+            // Reset section-local PRB copies per PDU iteration — the code further
+            // down mutates numPrb (clips it to the current pdu's PRB range).
+            // Without resetting here, subsequent PDU iterations see the clipped
+            // numPrb and spuriously skip. validate_pdsch already does this at the
+            // top of its combined_pdu_infos loop; validate_pdcch was missing it.
+            // Regression coverage: cplane_test_bench pattern 0103 (multi-DCI
+            // CORESET — framework emits one section, TV has multiple per-DCI
+            // pdu_infos). Harmless for single-DCI 4T4R (loop runs once).
+            startPrb = header_info.startPrb;
+            numPrb = header_info.numPrb;
+
             if (symbolId < pdu.startSym)
             {
                 continue;
@@ -334,7 +345,13 @@ int RU_Emulator::validate_pdcch(uint8_t cell_index, const struct oran_packet_hea
             ++tv_object->good_slot_counters[cell_index];
             ++tv_object->throughput_slot_counters[cell_index];
         }
-        ++tv_object->total_slot_counters[cell_index];
+        // Test-bench mode: a slot with any section mismatch is not a real
+        // completion, so it must not be counted as completed. Production RU
+        // stats keep counting every completed slot (good or error).
+        if (!opt_dlc_tb || !tv_object->invalid_flag[cell_index][launch_pattern_slot])
+        {
+            ++tv_object->total_slot_counters[cell_index];
+        }
         tv_object->invalid_flag[cell_index][launch_pattern_slot] = false;
 
         if (tv_object->init_slot_counters[cell_index].load() <= tv_object->total_slot_counters[cell_index].load())

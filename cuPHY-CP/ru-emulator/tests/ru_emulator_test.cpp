@@ -15,6 +15,9 @@
  * limitations under the License.
  */
 
+#include <bit>
+#include <cstring>
+
 #include <gtest/gtest.h>
 #include "ru_emulator.hpp"
 #include "timing_utils.hpp"
@@ -740,16 +743,33 @@ TEST_F(RUEmulatorTest, TvModCompExtInfo_PopulateSE5) {
 /// @defgroup SE4SE5RoundTripTests SE4/SE5 wire-format round-trip tests
 /// @{
 
-static void se5_host_to_wire(oran_cmsg_sect_ext_type_5& se5) {
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    uint64_t* bf = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(&se5) + sizeof(se5.extLen));
-    *bf = __builtin_bswap64(*bf);
+namespace {
+
+constexpr uint64_t byteswap64(uint64_t value) noexcept {
+#if defined(__cpp_lib_byteswap) && __cpp_lib_byteswap >= 202110L
+    return std::byteswap(value);
+#else
+    return __builtin_bswap64(value);
 #endif
 }
 
-static void se5_wire_to_host(oran_cmsg_sect_ext_type_5& se5) {
+void se5_host_to_wire(oran_cmsg_sect_ext_type_5& se5) {
+    if constexpr (std::endian::native == std::endian::little) {
+        static_assert(sizeof(oran_cmsg_sect_ext_type_5) >= sizeof(se5.extLen) + sizeof(uint64_t));
+
+        uint64_t bf{};
+        uint8_t* bf_bytes = reinterpret_cast<uint8_t*>(&se5) + sizeof(se5.extLen);
+        std::memcpy(&bf, bf_bytes, sizeof(bf));
+        bf = byteswap64(bf);
+        std::memcpy(bf_bytes, &bf, sizeof(bf));
+    }
+}
+
+void se5_wire_to_host(oran_cmsg_sect_ext_type_5& se5) {
     se5_host_to_wire(se5);
 }
+
+} // namespace
 
 TEST_F(RUEmulatorTest, SE4_Bitfield_RoundTrip) {
     oran_cmsg_sect_ext_type_4 se4{};
@@ -834,4 +854,4 @@ int main(int argc, char **argv) {
         std::cerr << "Unknown exception caught in main" << std::endl;
         return 1;
     }
-} 
+}

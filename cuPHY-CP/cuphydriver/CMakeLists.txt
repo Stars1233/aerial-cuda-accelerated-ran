@@ -92,7 +92,6 @@ if (BUILD_EXTERNALS)
 endif ()
 
 add_subdirectory(src)
-add_subdirectory(benchmark)
 
 include_directories(../data_lake/)
 

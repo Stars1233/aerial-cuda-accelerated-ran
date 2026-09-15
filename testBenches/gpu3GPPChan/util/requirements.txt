@@ -1,0 +1,6 @@
+# Python dependencies for gpu3gppchan util (calibrations, analysis, visualization)
+matplotlib
+scipy
+h5py
+numpy
+pyyaml

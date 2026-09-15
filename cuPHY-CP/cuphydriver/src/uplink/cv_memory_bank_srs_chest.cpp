@@ -25,9 +25,10 @@
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //// Channel Vector Memory Bank
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
-CvSrsChestMemoryBank::CvSrsChestMemoryBank(phydriver_handle _pdh, GpuDevice* _gDev, uint32_t _total_num_srs_chest_buffers):
+CvSrsChestMemoryBank::CvSrsChestMemoryBank(phydriver_handle _pdh, GpuDevice* _gDev, uint32_t _total_num_srs_chest_buffers, uint16_t _max_srs_antenna_ports):
     pdh(_pdh),
-    gDev(_gDev)
+    gDev(_gDev),
+    max_srs_antenna_ports(_max_srs_antenna_ports)
 {
     PhyDriverCtx * pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
     FhProxy * fhproxy = pdctx->getFhProxy();
@@ -39,30 +40,52 @@ CvSrsChestMemoryBank::CvSrsChestMemoryBank(phydriver_handle _pdh, GpuDevice* _gD
     gDev->setDevice();
 
     // Allocate memory for CV buffers
-    //Each CV buffer is a 3-dim buffer of fp32 with dimensions - (nPrbG * nGnbAnt * nUeLayers)
-    uint32_t  size_of_each_buffer = CV_NUM_PRBG * CV_NUM_GNB_ANT * CV_NUM_UE_LAYER * sizeof(uint32_t);
+    // Each CV buffer is a 3-dim buffer of fp32 with dimensions - (nPrbG * nGnbAnt * nUeLayers)
+    // Use max_srs_antenna_ports (from config) instead of fixed MAX_AP_PER_SLOT_SRS for per-buffer sizing (e.g. 4T4R vs 64T64R).
+    uint32_t  size_of_each_buffer = CV_NUM_PRBG * max_srs_antenna_ports * CV_NUM_UE_LAYER * sizeof(uint32_t);
+
+    // Build the IPC manager config and create the manager instance
+    SrsIpcManager::Config ipc_cfg{};
+    ipc_cfg.total_num_buffers     = total_num_srs_chest_buffers;
+    ipc_cfg.srs_info_pool_len     = MAX_NUM_UE_SRS_INFO_PER_SLOT * MAX_CELLS_PER_SLOT * SLOTS_PER_FRAME * 16;
+    ipc_cfg.gpu_buf_size          = size_of_each_buffer;
+    ipc_cfg.num_prg               = static_cast<uint32_t>(CV_NUM_PRBG);
+    ipc_cfg.num_ue_layer          = static_cast<uint32_t>(CV_NUM_UE_LAYER);
+    ipc_cfg.max_srs_antenna_ports = max_srs_antenna_ports;
+    ipc_manager_ = std::make_unique<SrsIpcManager>(ipc_cfg, _gDev);
+
     for(uint32_t idx = 0; idx < total_num_srs_chest_buffers ; idx++)
     {
-        dev_buf* buffer_dev = new dev_buf(size_of_each_buffer, gDev);
+        ipc_dev_buf* buffer_dev = new ipc_dev_buf(ipc_manager_->gpu_pool(), gDev);
         mf.addGpuRegularSize(buffer_dev->size_alloc);
-        CVSrsChestBuff* buffer = new CVSrsChestBuff(buffer_dev);
+
+        // Allocate CVSrsChestBuff from shared CPU memory pool
+        CVSrsChestBuff* cpu_buffer_addr = ipc_manager_->chest_pool()->alloc();
+        if (cpu_buffer_addr == nullptr)
+        {
+            NVLOGF_FMT(TAG, AERIAL_NVIPC_API_EVENT, "nv_ipc_mempool_alloc for CVSrsChestBuff CPU buffer {}-{} failed", total_num_srs_chest_buffers, idx);
+        }
+        CVSrsChestBuff* buffer = new (cpu_buffer_addr) CVSrsChestBuff(buffer_dev);
         buffer->setSrsChestBuffState(slot_command_api::SRS_CHEST_BUFF_NONE);
         arr_cv_srs_chest_buff[idx] = buffer;
         memIndexPool.push(idx);
         NVLOGD_FMT(TAG,"realIdx={} buffer={}", idx, static_cast<void *>(buffer));
     }
-    NVLOGI_FMT(TAG, "CvSrsChestMemoryBank for {} free CV buffers created srsChEstBuffIndexMap size={}", total_num_srs_chest_buffers, srsChEstBuffIndexMap.size());
+
+    NVLOGC_FMT(TAG, "CvSrsChestMemoryBank for {} free CV buffers created (max_srs_antenna_ports={}) srsChEstBuffIndexMap size={} dump_srs_slot_num={}",
+        total_num_srs_chest_buffers, max_srs_antenna_ports, srsChEstBuffIndexMap.size(), ipc_manager_->h5_dump_slot_max());
 }
 
 CvSrsChestMemoryBank::~CvSrsChestMemoryBank()
 {
     for(int i = 0; i < total_num_srs_chest_buffers ; i++)
     {
-        delete arr_cv_srs_chest_buff[i];
+        // The CVSrsChestBuff buffer is to be freed by ipc_manager_->chest_pool()->free(...), here just call the destructor
+        arr_cv_srs_chest_buff[i]->~CVSrsChestBuff();
     }
 }
 
-int CvSrsChestMemoryBank::preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, uint32_t usage, CVSrsChestBuff** ptr)
+int CvSrsChestMemoryBank::preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, uint32_t usage, CVSrsChestBuff** ptr, uint32_t* realBuffIdx_out)
 {
     if((ptr == nullptr) || (usage == 0) || (rnti >= CV_INVALID_RNTI))
     {
@@ -84,7 +107,10 @@ int CvSrsChestMemoryBank::preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uin
 
     uint32_t realBuffIndex = srsChEstBuffIndexMap[cell_id].indexMap[buffer_idx];
 
-    NVLOGD_FMT(TAG, "preAllocateBuffer: cell_id {} rnti {} FAPI buffer_idx {} realBuffIndex {}", cell_id, rnti, buffer_idx, realBuffIndex);
+    // Translate FAPI buffer index to real global buffer index
+    if (realBuffIdx_out != nullptr) {
+        *realBuffIdx_out = realBuffIndex;
+    }
 
     *ptr = arr_cv_srs_chest_buff[realBuffIndex];
 
@@ -100,7 +126,10 @@ int CvSrsChestMemoryBank::preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uin
     }
     buffer->init(rnti, buffer_idx, cell_id, usage);
     currSrsChestBuffState = buffer->getSrsChestBuffState();
-    NVLOGD_FMT(TAG, "{} SRS Chest Buffer Pointer = {}, currSrsChestBuffState = {}", __func__, static_cast<void *>(arr_cv_srs_chest_buff[realBuffIndex]), currSrsChestBuffState);
+
+    NVLOGD_FMT(TAG, "{}: cell_id={} rnti={} FAPI buffer_idx={} realBuffIndex={} srs_chest_buff_ptr={} currSrsChestBuffState={}",
+        __func__, cell_id, rnti, buffer_idx, realBuffIndex, static_cast<void *>(arr_cv_srs_chest_buff[realBuffIndex]), currSrsChestBuffState);
+
     return retVal;
 }
 

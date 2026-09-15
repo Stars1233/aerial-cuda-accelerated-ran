@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 11) // "DRV.DLBUF"
 
 #include "dlbuffer.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -26,12 +27,6 @@
 #include "cell.hpp"
 #include <typeinfo>
 #include <slot_command/slot_command.hpp>
-
-#ifdef ENABLE_32DL
-#define MAX_PDSCH_DL_LAYERS 32
-#else
-#define MAX_PDSCH_DL_LAYERS 16
-#endif
 
 DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_t _cell_id) :
     pdh(_pdh),
@@ -45,7 +40,12 @@ DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_
 
     mf.init(_pdh, std::string("DLOutputBuffer"), sizeof(DLOutputBuffer));
 
-    sz_mr = DL_OUTPUT_BUFFER_SIZE; //CUPHY_N_TONES_PER_PRB * 273 * OFDM_SYMBOLS_PER_SLOT * cell_ptr->geteAxCNum() * sizeof(uint32_t);
+    // PDSCH DL layer count is sourced directly from per-cell PDSCH eAxC IDs in YAML.
+    const uint16_t max_pdsch_dl_layers = static_cast<uint16_t>(cell_ptr->geteAxCNumPdsch());
+
+    // DL output buffer: tones * PRBs * symbols * PDSCH layers * sizeof(FP16 complex sample).
+    sz_mr = static_cast<size_t>(CUPHY_N_TONES_PER_PRB) * ORAN_MAX_PRB * OFDM_SYMBOLS_PER_SLOT
+          * max_pdsch_dl_layers * sizeof(uint32_t);
 
     large_buffer = cuphy::make_unique_device<cuFloatComplex>(sz_mr / sizeof(cuFloatComplex));
     mf.addGpuRegularSize(sz_mr);
@@ -54,17 +54,17 @@ DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_
                                         CUPHY_C_16F,
                                         CUPHY_N_TONES_PER_PRB * ORAN_MAX_PRB,
                                         OFDM_SYMBOLS_PER_SLOT,
-                                        MAX_PDSCH_DL_LAYERS,
+                                        static_cast<int>(max_pdsch_dl_layers),
                                         cuphy::tensor_flags::align_tight
                                     );
 
     sz_tx = tx_tensor.desc().get_size_in_bytes();
-    if(sz_tx >= sz_mr)
+    if(sz_tx > sz_mr)
     {
         std::cerr << "Buffer (" << sz_mr << " bytes) is smaller than tx_tensor (" << sz_tx << ")" << std::endl;
         PHYDRIVER_THROW_EXCEPTIONS(-1, "DLOutputBuffer size is too small");
     }
-    CUDA_CHECK_PHYDRIVER(cudaMemset(tx_tensor.addr(), 0, sz_tx));
+    CUDA_DRIVER_CHECK(cuMemsetD8(reinterpret_cast<CUdeviceptr>(tx_tensor.addr()), 0, sz_tx));
     addr_d = (uint8_t*)tx_tensor.addr();
 
     addr_h.reset(new host_buf(sz_mr * sizeof(uint8_t), gDev));
@@ -80,6 +80,18 @@ DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_
     active            = false;
     id = Time::nowNs().count();
 
+    // Precondition: the DL MPS context must be current before constructing
+    // DLOutputBuffer, so that CUfunction handles are resolved in the correct
+    // context.  Currently guaranteed by Cell::setIOBuf() calling setDlCtx().
+    if(!resolve_kernel_write_handle(&kernel_write_func_))
+    {
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve kernel_write CUfunction handle");
+    }
+    if(!resolve_compression_kernel_handles(comp_kerns_))
+    {
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve compression kernel CUfunction handles");
+    }
+
     //Processing State Variables
     compression_is_queued = false;
     buffer_ready_gdr = gDev->newGDRbuf(1 * sizeof(uint32_t));
@@ -89,7 +101,9 @@ DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_
     //Reserving variables
     last_used = Time::zeroNs();
 
-    size_t prb_num_ptrs = ORAN_MAX_PRB * OFDM_SYMBOLS_PER_SLOT * API_MAX_ANTENNAS;
+    // PRB pointer table sized by configured max DL antennas from YAML.
+    const size_t ap_dim_for_prb = static_cast<size_t>(pdctx->getMaxDlAntennaPorts());
+    size_t prb_num_ptrs = ORAN_MAX_PRB * OFDM_SYMBOLS_PER_SLOT * ap_dim_for_prb;
     prb_ptrs = cuphy::make_unique_device<uint8_t*>(prb_num_ptrs);
     mf.addGpuRegularSize(prb_num_ptrs * sizeof(uint8_t*));
 
@@ -102,7 +116,10 @@ DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_
         //Initialize compression config desc
         mod_comp_config_temp = cuphy::make_unique_pinned<struct mod_compression_params>(1);
         memset(mod_comp_config_temp.get(), 0, sizeof(struct mod_compression_params));
-        CUDA_CHECK_PHYDRIVER(cudaMalloc((void**)&mod_comp_params_per_cell, sizeof(mod_compression_params)));
+        CUdeviceptr mod_comp_dptr{};
+        CUDA_DRIVER_CHECK(cuMemAlloc(&mod_comp_dptr, sizeof(mod_compression_params)));
+        mod_comp_params_per_cell =
+            reinterpret_cast<mod_compression_params*>(static_cast<uintptr_t>(mod_comp_dptr));
         mf.addGpuRegularSize(sizeof(mod_compression_params));
     }
     else
@@ -112,30 +129,29 @@ DLOutputBuffer::DLOutputBuffer(phydriver_handle _pdh, GpuDevice* _gDev, cell_id_
     if (pdctx->gpuCommDlEnabled()) {
         pdctx->setGpuCommsCtx();
         NVLOGI_FMT(TAG, "Setting GPU Comms context and initializing events!");
-        CUDA_CHECK_PHYDRIVER(cudaEventCreate(&prepare_start_evt));
-        CUDA_CHECK_PHYDRIVER(cudaEventCreate(&prepare_copy_evt));
+        CUDA_DRIVER_CHECK(cuEventCreate(&prepare_start_evt, CU_EVENT_DEFAULT));
+        CUDA_DRIVER_CHECK(cuEventCreate(&prepare_copy_evt, CU_EVENT_DEFAULT));
         if(pdctx->enablePrepareTracing()) {
-            CUDA_CHECK_PHYDRIVER(cudaEventCreate(&prepare_stop_evt));
-            CUDA_CHECK_PHYDRIVER(cudaEventCreate(&pre_prepare_stop_evt));
+            CUDA_DRIVER_CHECK(cuEventCreate(&prepare_stop_evt, CU_EVENT_DEFAULT));
+            CUDA_DRIVER_CHECK(cuEventCreate(&pre_prepare_stop_evt, CU_EVENT_DEFAULT));
         } else {
-            CUDA_CHECK_PHYDRIVER(cudaEventCreateWithFlags(&prepare_stop_evt, cudaEventDisableTiming));
-            CUDA_CHECK_PHYDRIVER(cudaEventCreateWithFlags(&pre_prepare_stop_evt, cudaEventDisableTiming));
+            CUDA_DRIVER_CHECK(cuEventCreate(&prepare_stop_evt, CU_EVENT_DISABLE_TIMING));
+            CUDA_DRIVER_CHECK(cuEventCreate(&pre_prepare_stop_evt, CU_EVENT_DISABLE_TIMING));
         }
 
-        cudaEventCreate(&tx_end_evt);        
+        CUDA_DRIVER_CHECK(cuEventCreate(&tx_end_evt, CU_EVENT_DEFAULT));
         pdctx->setDlCtx();
     }
-    cudaEventCreate(&all_channels_done_evt);
-    cudaEventCreate(&compression_start_evt);
-    cudaEventCreate(&compression_stop_evt);
+    CUDA_DRIVER_CHECK(cuEventCreate(&all_channels_done_evt, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&compression_start_evt, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&compression_stop_evt, CU_EVENT_DEFAULT));
 
-    CUDA_CHECK_PHYDRIVER(cudaEventCreateWithFlags(&ev_cleanup, cudaEventDisableTiming));
+    CUDA_DRIVER_CHECK(cuEventCreate(&ev_cleanup, CU_EVENT_DISABLE_TIMING));
 }
 
 DLOutputBuffer::~DLOutputBuffer()
 {
-    // Should not call cudaFree on addr_d, as this is using the large_buffer allocation
-    // on which the device_deleter will be called automatically.
+    // Do not call cuMemFree on addr_d: large_buffer allocation is released via device_deleter.
 
     delete buffer_ready_gdr;
     free(umsg_tx_list.umsg_info_symbol_antenna);
@@ -145,7 +161,7 @@ DLOutputBuffer::~DLOutputBuffer()
     {
         if(cell_ptr->getDLCompMeth() == static_cast<int>(aerial_fh::UserDataCompressionMethod::MODULATION_COMPRESSION))
         {
-            cudaFree(mod_comp_params_per_cell);
+            CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(mod_comp_params_per_cell)));
         }
     }
 
@@ -208,15 +224,15 @@ void DLOutputBuffer::cleanup(cudaStream_t stream, MpsCtx * mpsCtx)
      */
 
     mpsCtx->setCtx();
-    CUDA_CHECK_PHYDRIVER(cudaMemsetAsync(getBufD(), 0, getSize(), stream));
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(ev_cleanup, stream));
+    CUDA_DRIVER_CHECK(cuMemsetD8Async(reinterpret_cast<CUdeviceptr>(getBufD()), 0, getSize(), stream));
+    CUDA_DRIVER_CHECK(cuEventRecord(ev_cleanup, stream));
 }
 
 cudaEvent_t* DLOutputBuffer::cleanupEventRecord(cudaStream_t stream, MpsCtx * mpsCtx)
 {
 
     mpsCtx->setCtx();
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(ev_cleanup, stream));
+    CUDA_DRIVER_CHECK(cuEventRecord(ev_cleanup, stream));
     return &ev_cleanup;
 }
 
@@ -227,7 +243,7 @@ void DLOutputBuffer::waitCleanup(cudaStream_t stream, MpsCtx * mpsCtx)
      * still has to send the content of the buffer (bug: DPDK callback to give an ACK is not working yet)
      */
     mpsCtx->setCtx();
-    CUDA_CHECK_PHYDRIVER(cudaStreamWaitEvent(stream, ev_cleanup, 0));
+    CUDA_DRIVER_CHECK(cuStreamWaitEvent(stream, ev_cleanup, CU_EVENT_WAIT_DEFAULT));
 }
 
 size_t DLOutputBuffer::getSizeFh() const
@@ -265,15 +281,14 @@ int DLOutputBuffer::runCompression(const std::array<compression_params, NUM_USER
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(compression_start_evt, stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(compression_start_evt, stream));
     }
-    
 
-    launch_kernel_compression(stream, cparams_array);
-   
+    launch_kernel_compression(comp_kerns_, stream, cparams_array);
+
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(compression_stop_evt, stream));
+        CUDA_DRIVER_CHECK(cuEventRecord(compression_stop_evt, stream));
     }
 
     compression_is_queued = true;
@@ -281,20 +296,20 @@ int DLOutputBuffer::runCompression(const std::array<compression_params, NUM_USER
     return 0;
 }
 
-//Non-blocking wait on externally specified cuda event
+// Non-blocking wait on externally specified CUDA driver event (cuEventQuery)
 // Returns 1 if run completion event has been triggered
 int DLOutputBuffer::waitEventNonBlocking(cudaEvent_t event) {
-    cudaError_t temp = cudaEventQuery(event);
+    CUresult cuStatus = cuEventQuery(event);
 
-    //While waiting for completion, call will return cudaErrorNotReady
-    if(temp == cudaErrorNotReady) {
+    //While waiting for completion, call will return CUDA_ERROR_NOT_READY
+    if(cuStatus == CUDA_ERROR_NOT_READY) {
         return 0;
     }
 
-    //Throw exception on non "cudaSuccess" value
-    CUDA_CHECK_PHYDRIVER(temp);
+    //Throw exception on non CUDA_SUCCESS value
+    CUDA_DRIVER_CHECK(cuStatus);
 
-    //Result must have been cudaSuccess
+    //Result must have been CUDA_SUCCESS
     return 1;
 }
 
@@ -397,7 +412,7 @@ uint32_t* DLOutputBuffer::getReadyFlag()
 int DLOutputBuffer::setReadyFlag(cudaStream_t stream)
 {
     MemtraceDisableScope md;
-    launch_kernel_write(stream, (uint32_t*)buffer_ready_gdr->addrd(), (uint32_t)1);
+    launch_kernel_write(kernel_write_func_, stream, (uint32_t*)buffer_ready_gdr->addrd(), (uint32_t)1);
     return 0;
 }
 

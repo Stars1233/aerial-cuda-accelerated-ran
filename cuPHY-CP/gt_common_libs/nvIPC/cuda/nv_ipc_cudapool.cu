@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <cuda.h>
+#include <cuda_runtime_api.h>
 
 #include "nv_ipc_cudapool.h"
 #include "nv_ipc_utils.h"
@@ -25,21 +27,10 @@
 
 #define CONFIG_CREATE_CUDA_STREAM 1
 
-inline cudaError __checkLastCudaError(const char* file, int line)
-{
-    cudaError lastErr = cudaGetLastError();
-    if(lastErr != cudaSuccess)
-    {
-        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "Error at {} line {}: {}", file, line, cudaGetErrorString(lastErr));
-    }
-    return lastErr;
-}
-#define checkLastCudaError() __checkLastCudaError(__FILE__, __LINE__)
-
 typedef struct
 {
-    cudaIpcMemHandle_t   memHandle;
-    cudaIpcEventHandle_t eventHandle;
+    CUipcMemHandle   memHandle;
+    CUipcEventHandle eventHandle;
 } cuda_ipc_info_t;
 
 typedef struct
@@ -51,13 +42,16 @@ typedef struct
 
     size_t size;
 
+    CUdevice  dev;
+    CUcontext dev_ctx;
+
     cudaEvent_t event;
 
     cudaStream_t stream;
 
     // For store the CUDA info communicated between different processes, should be in CPU SHM
     cuda_ipc_info_t* ipc_info;
-    void*            cuda_addr;
+    CUdeviceptr      cuda_addr;
 
 } priv_data_t;
 
@@ -68,69 +62,80 @@ static inline priv_data_t* get_private_data(nv_ipc_cudapool_t* cudapool)
 
 static int cudapool_create(priv_data_t* priv_data)
 {
-    if(cudaMalloc(&priv_data->cuda_addr, priv_data->size) != cudaSuccess)
+    CUresult res;
+
+    res = cuMemAlloc(&priv_data->cuda_addr, priv_data->size);
+    if(res != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to allocate device memory", __func__);
         return -1;
     }
 
+    if (priv_data->primary)
+    {
+        if (cuMemsetD8(priv_data->cuda_addr, 0, priv_data->size) != CUDA_SUCCESS)
+        {
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to memset device memory", __func__);
+            return -1;
+        }
+    }
+
     memset(priv_data->ipc_info, 0, sizeof(cuda_ipc_info_t));
 
-    if(cudaIpcGetMemHandle(&priv_data->ipc_info->memHandle, priv_data->cuda_addr) != cudaSuccess)
+    res = cuIpcGetMemHandle(&priv_data->ipc_info->memHandle, priv_data->cuda_addr);
+    if(res != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to create memory handler", __func__);
         return -1;
     }
 
-    if(cudaEventCreateWithFlags(&priv_data->event, cudaEventDisableTiming | cudaEventInterprocess) != cudaSuccess)
+    res = cuEventCreate(&priv_data->event, CU_EVENT_DISABLE_TIMING | CU_EVENT_INTERPROCESS);
+    if(res != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to create event", __func__);
         return -1;
     }
 
-    if(cudaIpcGetEventHandle(&priv_data->ipc_info->eventHandle, priv_data->event) != cudaSuccess)
+    res = cuIpcGetEventHandle(&priv_data->ipc_info->eventHandle, priv_data->event);
+    if(res != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to get event handler", __func__);
         return -1;
     }
     else
     {
-        NVLOGI_FMT(TAG, "{}: sizeof(cuda_ipc_info_t)={} device_id={} cuda_addr={} OK", __func__, sizeof(cuda_ipc_info_t), priv_data->device_id, priv_data->cuda_addr);
+        NVLOGI_FMT(TAG, "{}: sizeof(cuda_ipc_info_t)={} device_id={} cuda_addr=0x{:x} OK", __func__, sizeof(cuda_ipc_info_t), priv_data->device_id, static_cast<unsigned long long>(priv_data->cuda_addr));
         return 0;
     }
 }
 
 static int cudapool_lookup(priv_data_t* priv_data)
 {
-    if(cudaIpcOpenMemHandle(&priv_data->cuda_addr, priv_data->ipc_info->memHandle, cudaIpcMemLazyEnablePeerAccess) != cudaSuccess)
+    CUresult res;
+
+    res = cuIpcOpenMemHandle(&priv_data->cuda_addr, priv_data->ipc_info->memHandle, CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS);
+    if(res != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to lookup memory handler", __func__);
         return -1;
     }
 
-    if(cudaIpcOpenEventHandle(&priv_data->event, priv_data->ipc_info->eventHandle) != cudaSuccess)
+    res = cuIpcOpenEventHandle(&priv_data->event, priv_data->ipc_info->eventHandle);
+    if(res != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to lookup event handler", __func__);
         return -1;
     }
     else
     {
-        //NVLOGI_FMT(TAG, "{}: sizeof(cuda_ipc_info_t)={} device_id={} cuda_addr={} OK", __func__, sizeof(cuda_ipc_info_t), priv_data->device_id, (void *)priv_data->cuda_addr);
         return 0;
     }
 }
 
 static int cudapool_close(priv_data_t* priv_data)
 {
-    if(cudaIpcCloseMemHandle(priv_data->cuda_addr) != cudaSuccess)
+    if(cuIpcCloseMemHandle(priv_data->cuda_addr) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to close memory handler", __func__);
         return -1;
     }
@@ -143,9 +148,8 @@ static int cudapool_close(priv_data_t* priv_data)
 
 static int cudapool_destroy(priv_data_t* priv_data)
 {
-    if(cudaFree(priv_data->cuda_addr) != cudaSuccess)
+    if(cuMemFree(priv_data->cuda_addr) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
         NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: failed to free memory", __func__);
         return -1;
     }
@@ -164,7 +168,7 @@ static void* ipc_get_cudapool_addr(nv_ipc_cudapool_t* cudapool)
         return NULL;
     }
     priv_data_t* priv_data = get_private_data(cudapool);
-    return priv_data->cuda_addr;
+    return (void*)(uintptr_t)priv_data->cuda_addr;
 }
 
 static int ipc_memcpy_to_host(nv_ipc_cudapool_t* cudapool, void* host, const void* device, size_t size)
@@ -179,10 +183,9 @@ static int ipc_memcpy_to_host(nv_ipc_cudapool_t* cudapool, void* host, const voi
 
     priv_data_t* priv_data = get_private_data(cudapool);
 
-    if(cudaSetDevice(priv_data->device_id) != cudaSuccess)
+    if(cuCtxSetCurrent(priv_data->dev_ctx) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
-        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaSetDevice to {} failed", __func__, priv_data->device_id);
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuCtxSetCurrent failed for device {}", __func__, priv_data->device_id);
         return -1;
     }
 
@@ -190,25 +193,22 @@ static int ipc_memcpy_to_host(nv_ipc_cudapool_t* cudapool, void* host, const voi
 
     if(CONFIG_CREATE_CUDA_STREAM)
     {
-        if(cudaMemcpyAsync(host, device, size, cudaMemcpyDeviceToHost, priv_data->stream) != cudaSuccess)
+        if(cuMemcpyDtoHAsync(host, (CUdeviceptr)device, size, priv_data->stream) != CUDA_SUCCESS)
         {
-            checkLastCudaError();
-            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaMemcpyAsync failed", __func__);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuMemcpyDtoHAsync failed", __func__);
             ret = -1;
         }
-        else if(cudaStreamSynchronize(priv_data->stream) != cudaSuccess)
+        else if(cuStreamSynchronize(priv_data->stream) != CUDA_SUCCESS)
         {
-            checkLastCudaError();
-            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaStreamSynchronize failed", __func__);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuStreamSynchronize failed", __func__);
             ret = -1;
         }
     }
     else
     {
-        if(cudaMemcpy(host, device, size, cudaMemcpyDeviceToHost) != cudaSuccess)
+        if(cuMemcpyDtoH(host, (CUdeviceptr)device, size) != CUDA_SUCCESS)
         {
-            checkLastCudaError();
-            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaMemcpy failed", __func__);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuMemcpyDtoH failed", __func__);
             ret = -1;
         }
     }
@@ -228,10 +228,9 @@ static int ipc_memcpy_to_device(nv_ipc_cudapool_t* cudapool, void* device, const
 
     priv_data_t* priv_data = get_private_data(cudapool);
 
-    if(cudaSetDevice(priv_data->device_id) != cudaSuccess)
+    if(cuCtxSetCurrent(priv_data->dev_ctx) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
-        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaSetDevice to {} failed", __func__, priv_data->device_id);
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuCtxSetCurrent failed for device {}", __func__, priv_data->device_id);
         return -1;
     }
 
@@ -239,25 +238,22 @@ static int ipc_memcpy_to_device(nv_ipc_cudapool_t* cudapool, void* device, const
 
     if(CONFIG_CREATE_CUDA_STREAM)
     {
-        if(cudaMemcpyAsync(device, host, size, cudaMemcpyHostToDevice, priv_data->stream) != cudaSuccess)
+        if(cuMemcpyHtoDAsync((CUdeviceptr)device, host, size, priv_data->stream) != CUDA_SUCCESS)
         {
-            checkLastCudaError();
-            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaMemcpyAsync failed", __func__);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuMemcpyHtoDAsync failed", __func__);
             ret = -1;
         }
-        else if(cudaStreamSynchronize(priv_data->stream) != cudaSuccess)
+        else if(cuStreamSynchronize(priv_data->stream) != CUDA_SUCCESS)
         {
-            checkLastCudaError();
-            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaStreamSynchronize failed", __func__);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuStreamSynchronize failed", __func__);
             ret = -1;
         }
     }
     else
     {
-        if(cudaMemcpy(device, host, size, cudaMemcpyHostToDevice) != cudaSuccess)
+        if(cuMemcpyHtoD((CUdeviceptr)device, host, size) != CUDA_SUCCESS)
         {
-            checkLastCudaError();
-            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaMemcpy failed", __func__);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuMemcpyHtoD failed", __func__);
             ret = -1;
         }
     }
@@ -276,18 +272,17 @@ static int ipc_cudapool_close(nv_ipc_cudapool_t* cudapool)
     priv_data_t* priv_data = get_private_data(cudapool);
 
     int ret = 0;
-    if(cudaSetDevice(priv_data->device_id) != cudaSuccess)
+    if(cuCtxSetCurrent(priv_data->dev_ctx) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
-        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaSetDevice to {} failed", __func__, priv_data->device_id);
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuCtxSetCurrent failed for device {}", __func__, priv_data->device_id);
         ret = -1;
     }
 
     if(CONFIG_CREATE_CUDA_STREAM)
     {
-        if(cudaStreamDestroy(priv_data->stream) != cudaSuccess)
+        if(cuStreamDestroy(priv_data->stream) != CUDA_SUCCESS)
         {
-            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaStreamDestroy failed", __func__);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuStreamDestroy failed", __func__);
             ret = -1;
         }
     }
@@ -301,6 +296,12 @@ static int ipc_cudapool_close(nv_ipc_cudapool_t* cudapool)
         ret = cudapool_close(priv_data);
     }
 
+    if(cuDevicePrimaryCtxRelease(priv_data->dev) != CUDA_SUCCESS)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuDevicePrimaryCtxRelease failed", __func__);
+        ret = -1;
+    }
+
     free(cudapool);
 
     if(ret == 0)
@@ -312,18 +313,35 @@ static int ipc_cudapool_close(nv_ipc_cudapool_t* cudapool)
 
 static int ipc_cudapool_open(priv_data_t* priv_data)
 {
-    if(cudaSetDevice(priv_data->device_id) != cudaSuccess)
+    if(cuInit(0) != CUDA_SUCCESS)
     {
-        checkLastCudaError();
-        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaSetDevice to {} failed", __func__, priv_data->device_id);
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuInit failed", __func__);
+        return -1;
+    }
+
+    if(cuDeviceGet(&priv_data->dev, priv_data->device_id) != CUDA_SUCCESS)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuDeviceGet failed for device {}", __func__, priv_data->device_id);
+        return -1;
+    }
+
+    if(cuDevicePrimaryCtxRetain(&priv_data->dev_ctx, priv_data->dev) != CUDA_SUCCESS)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuDevicePrimaryCtxRetain failed", __func__);
+        return -1;
+    }
+
+    if(cuCtxSetCurrent(priv_data->dev_ctx) != CUDA_SUCCESS)
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuCtxSetCurrent failed", __func__);
         return -1;
     }
 
     if(CONFIG_CREATE_CUDA_STREAM)
     {
-        if(cudaStreamCreate(&priv_data->stream) != cudaSuccess)
+        if(cuStreamCreate(&priv_data->stream, 0) != CUDA_SUCCESS)
         {
-            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cudaStreamCreate failed", __func__);
+            NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: cuStreamCreate failed", __func__);
             return -1;
         }
     }

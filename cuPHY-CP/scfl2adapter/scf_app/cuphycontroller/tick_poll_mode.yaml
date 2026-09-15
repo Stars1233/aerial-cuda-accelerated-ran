@@ -57,14 +57,13 @@ transport:
     primary: 1
     prefix: nvipc
     cuda_device_id: -1
-    ring_len: 8192
     mempool_size:
       cpu_msg:
         buf_size: 8192
-        pool_len: 4096
+        pool_len: 200
       cpu_data:
         buf_size: 576000
-        pool_len: 1024
+        pool_len: 50
       cuda_data:
         buf_size: 307200
         pool_len: 0

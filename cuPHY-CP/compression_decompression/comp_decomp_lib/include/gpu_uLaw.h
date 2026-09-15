@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +32,8 @@
 __device__ inline int compand(int value, int mantissaBits)
 {
     value = min(value, 32767);
-    int vrange = max(0, 19 - __clz(value));
+    // __clz return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems, thus the explicit cast
+    int vrange = max(0, 19 - (int)__clz(value));
     int shift = 15 - mantissaBits + vrange;
     int fact = 1 << (mantissaBits - 3);
     return ((value >> shift) + vrange * fact);
@@ -114,7 +115,8 @@ __device__ inline void compress_uLaw(int4 *input, unsigned char *output,
         maxV = max(maxV, __shfl_xor_sync(0xffffffff, maxV, 2, 4));
 
         // Compute shift based on global max
-        int shift = __clz(maxV) - 17; // Looking for values up to 2^15 not included
+        // __clz return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems, thus the explicit cast
+        int shift = (int)__clz(maxV) - 17; // Looking for values up to 2^15 not included
         shift = max(0, shift);
         shift = min(7, shift);
 

@@ -16,20 +16,10 @@
 %
 if (~isdeployed)
     addpath(genpath('.'))
-    if ~isfolder('yamlmatlab')
-        if ismac
-            [status, ~] = system('../aerial_mcore/scripts/download_yamlmatlab_mac.sh');
-        elseif ispc
-            % Bypass execution policy is used here to allow running unsigned scripts and not require user interaction.  
-            % Script validates hash of downloaded code to prevent downloading unintended code
-            [status, ~] = system('powershell -ExecutionPolicy Bypass -File "..\aerial_mcore\scripts\download_yamlmatlab_win.ps1"');
-        else
-            [status, ~] = system('../aerial_mcore/scripts/download_yamlmatlab.sh');
-        end
-        if status ~= 0
-            error('Failed to download yamlmatlab package');
-        else
-            addpath('yamlmatlab');
+    generatedDirs = {'bin','CompilerSDKOutput'};
+    for k = 1:length(generatedDirs)
+        if isfolder(generatedDirs{k})
+            rmpath(genpath(generatedDirs{k}));
         end
     end
 end

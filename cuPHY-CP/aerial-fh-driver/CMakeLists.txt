@@ -87,7 +87,7 @@ endif()
 set(AERIAL_FH_TARGET aerial-fh)
 add_library(${AERIAL_FH_TARGET} SHARED ${AERIAL_FH_SRCS})
 target_include_directories(${AERIAL_FH_TARGET} PUBLIC include/)
-target_link_libraries(${AERIAL_FH_TARGET} PRIVATE CUDA::cudart CUDA::cuda_driver nvlog cuphyoamlib app_config slot_command cuphy_pti aerial_utils)#
+target_link_libraries(${AERIAL_FH_TARGET} PRIVATE CUDA::cudart CUDA::cuda_driver nvlog cuphyoamlib app_config slot_command cuphy_pti aerial_utils cuda_driver_utils)#
 target_include_directories(${AERIAL_FH_TARGET} PRIVATE $<BUILD_INTERFACE:${CUBB_HOME}/cuPHY/examples/common>)
 
 #-- DOCA TX
@@ -104,9 +104,36 @@ endif (ENABLE_RIVERMAX)
 target_compile_options(${AERIAL_FH_TARGET} PRIVATE ${DPDK_CFLAGS})
 target_include_directories(${AERIAL_FH_TARGET} PRIVATE ${DPDK_INCLUDE_DIRS})
 target_link_directories(${AERIAL_FH_TARGET} PRIVATE ${DPDK_LIBRARY_DIRS})
-target_link_directories(${AERIAL_FH_TARGET} PRIVATE ${DPDK_LIBRARY_DIRS}/dpdk/pmds-23.0)
+target_link_dpdk_pmd_directories(${AERIAL_FH_TARGET})
 target_link_libraries(${AERIAL_FH_TARGET} PRIVATE -Wl,--no-as-needed)
-target_link_libraries(${AERIAL_FH_TARGET} PRIVATE ${DPDK_LIBRARIES} -lrte_net_mlx5 -lrte_bus_pci -lrte_bus_vdev -lrte_common_mlx5 -lrte_bus_auxiliary -lrte_gpu_cuda)
+target_link_libraries(${AERIAL_FH_TARGET} PRIVATE ${DPDK_LIBRARIES} -lrte_net_mlx5 -lrte_bus_pci -lrte_bus_vdev -lrte_common_mlx5 -lrte_bus_auxiliary -lrte_gpudev)
+
+# Detect MLX5 PMD API differences by probing rte_pmd_mlx5.h.
+# rte_pmd_mlx5_enable_steering and rte_pmd_mlx5_txpp_idx vary by DPDK/MLX5 PMD release.
+foreach(_dpdk_inc_dir ${DPDK_INCLUDE_DIRS})
+    if(EXISTS "${_dpdk_inc_dir}/rte_pmd_mlx5.h")
+        set(_rte_pmd_mlx5_header "${_dpdk_inc_dir}/rte_pmd_mlx5.h")
+        break()
+    endif()
+endforeach()
+if(_rte_pmd_mlx5_header)
+    file(READ "${_rte_pmd_mlx5_header}" _rte_pmd_mlx5_content)
+    if(_rte_pmd_mlx5_content MATCHES "rte_pmd_mlx5_enable_steering")
+        message(STATUS "DPDK MLX5: rte_pmd_mlx5_enable_steering found (newer API)")
+        target_compile_definitions(${AERIAL_FH_TARGET} PRIVATE HAVE_RTE_PMD_MLX5_ENABLE_STEERING=1)
+    else()
+        message(STATUS "DPDK MLX5: using rte_pmd_mlx5_driver_enable_steering (legacy API)")
+    endif()
+    if(_rte_pmd_mlx5_content MATCHES "rte_pmd_mlx5_txpp_idx")
+        message(STATUS "DPDK MLX5: rte_pmd_mlx5_txpp_idx found (legacy API)")
+        target_compile_definitions(${AERIAL_FH_TARGET} PRIVATE HAVE_RTE_PMD_MLX5_TXPP_IDX=1)
+    else()
+        message(STATUS "DPDK MLX5: rte_pmd_mlx5_txpp_idx not available, qp_clock_id defaults to 0")
+    endif()
+else()
+    message(WARNING "rte_pmd_mlx5.h not found in DPDK_INCLUDE_DIRS; assuming newer MLX5 PMD API")
+    target_compile_definitions(${AERIAL_FH_TARGET} PRIVATE HAVE_RTE_PMD_MLX5_ENABLE_STEERING=1)
+endif()
 
 target_compile_options(${AERIAL_FH_TARGET} PRIVATE ${AERIAL_ARCH_TUNE_FLAGS})
 

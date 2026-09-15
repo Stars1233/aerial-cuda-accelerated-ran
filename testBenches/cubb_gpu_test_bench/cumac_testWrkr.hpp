@@ -47,12 +47,33 @@ struct CumacOptions
     uint8_t sch_alg = 1;           //!< Scheduling algorithm: 0 round-robin, 1 proportional fair
     uint8_t hetero_ue_sel_cells = 0; //!< Heterogeneous UE selection across cells: 0 disabled, 1 enabled
     uint8_t config_slot_count = 0; //!< Length of per-slot arrays from YAML (0 = not from YAML). Must match nMacSlots when set.
+
+    // --- AI-RAN trtEngine inference mode (cumac_options.airan in YAML) ---
+    // When airan_infer = 1 the cuMAC worker runs trtEngine model inference
+    // (cumac_ml::cumacAiranSubcontext) instead of the scheduler kernels, to test
+    // GPU sharing between cuPHY and cuMAC AI-RAN inference. Requires the test
+    // bench to be built with -DENABLE_CUMAC_AIRAN=ON (AERIAL_CUMAC_AIRAN_ENABLE).
+    uint8_t     airan_infer           = 0;        //!< 0 = scheduler pipes, 1 = trtEngine inference pipes
+    std::string airan_model_path;                 //!< model file (.onnx/.engine/.pt) for the inference pipes
+    std::string airan_input_name      = "obs";    //!< model graph input tensor name
+    std::string airan_output_name     = "logits"; //!< model graph output tensor name
+    int         airan_obs_dim         = 487;       //!< input feature dimension
+    int         airan_action_dim      = 28;        //!< output dimension
+    int         airan_batch_size      = 16;        //!< inference batch size (scheduled UEs per forward pass)
+    int         airan_max_batch_size  = 16;        //!< max batch for the dynamic optimization profile
+    uint8_t     airan_use_cuda_graph  = 1;         //!< capture + replay the enqueue with a CUDA Graph
+    int         airan_builder_opt_level = 5;       //!< TensorRT builder optimization level (<0 = TRT default)
 };
 
 // cuMAC-specific includes and message payloads (only when cuMAC is enabled)
 #ifdef AERIAL_CUMAC_ENABLE
 // cuMAC header
 #include "cumac.h"
+
+// AI-RAN trtEngine inference subcontext (opt-in: -DENABLE_CUMAC_AIRAN=ON).
+#ifdef AERIAL_CUMAC_AIRAN_ENABLE
+#include "cumacAiranSubcontext.h"
+#endif
 
 //----------------------------------------------------------------------------------------------------------
 // cuMAC test worker message payloads for testWrkrMsg
@@ -178,6 +199,32 @@ private:
     uint8_t m_halfPrecision = 0;      // 0 float32, 1 half
     uint8_t m_schAlg = 1;             // 0 RR, 1 PF
     uint8_t m_heteroUeSelCells = 0;   // 0 disabled, 1 heterogeneous UE selection across cells
+
+    // AI-RAN trtEngine inference configuration (mirrors CumacOptions::airan_*).
+    // m_airanInfer/config are always present so setCumacOptions can store them;
+    // the inference pipes themselves only exist when AERIAL_CUMAC_AIRAN_ENABLE.
+    uint8_t     m_airanInfer          = 0;
+    std::string m_airanModelPath;
+    std::string m_airanInputName      = "obs";
+    std::string m_airanOutputName     = "logits";
+    int         m_airanObsDim         = 487;
+    int         m_airanActionDim      = 28;
+    int         m_airanBatchSize      = 16;
+    int         m_airanMaxBatchSize   = 16;
+    uint8_t     m_airanUseCudaGraph   = 1;
+    int         m_airanBuilderOptLevel = 5;
+#ifdef AERIAL_CUMAC_AIRAN_ENABLE
+    // AI-RAN inference pipes (one per MAC slot), the inference-mode analogue of
+    // m_macPipes. Driven through the same init/setup/run lifecycle.
+    std::vector<std::unique_ptr<cumac_ml::cumacAiranSubcontext>> m_airanPipes; // Dim: m_nMacSlots
+    std::string                                                  m_airanTvPath; // generated AI-RAN TV for this worker
+    /**
+     * @brief Create an AI-RAN test-vector file from the configured inference options.
+     *
+     * Sets m_airanTvPath to the generated file used to initialize the inference pipes.
+     */
+    void createAiranTvFromOptions();
+#endif
 };
 #else
 // Stub class when cuMAC is disabled - only declaration needed

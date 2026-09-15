@@ -16,6 +16,7 @@
  */
 
 #include "cumac.h"
+#include "common/schedulerTimeMeasure.h"
 
 // cuMAC namespace
 namespace cumac {

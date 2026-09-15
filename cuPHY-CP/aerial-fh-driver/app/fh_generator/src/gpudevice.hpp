@@ -20,11 +20,13 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include <atomic>
 #include <vector>
 #include <array>
 #include <stdio.h>
 #include <memory>
+#include <cstddef>
 #include <cstring>
 #include <gdrapi.h>
 #include "utils.hpp"
@@ -46,31 +48,6 @@ namespace fh_gen
 #endif
 #define GPU_MAX_STREAMS 16
 
-#define CUDA_CHECK(stmt)                   \
-    do                                               \
-    {                                                \
-        cudaError_t result = (stmt);                 \
-        if(cudaSuccess != result)                    \
-        {                                            \
-            NVLOGF_FMT(TAG, AERIAL_CUDA_API_EVENT, "[{}:{}] cuda failed with {} ", \
-                   __FILE__,                         \
-                   __LINE__,                         \
-                   cudaGetErrorString(result));      \
-        }                                            \
-    } while(0)
-
-#define CU_CHECK(stmt)                   \
-    do                                             \
-    {                                              \
-        CUresult result = (stmt);                  \
-        if(CUDA_SUCCESS != result)                 \
-        {                                          \
-            NVLOGF_FMT(TAG, AERIAL_CUDA_API_EVENT, "[{}:{}] cu failed with {} ", \
-                   __FILE__,                       \
-                   __LINE__,                       \
-                   +result);                        \
-        }                                          \
-    } while(0)
 
 // NB. Buffer management inspired by cuPHY
 struct hpinned_alloc
@@ -78,15 +55,13 @@ struct hpinned_alloc
     static void* allocate(size_t nbytes)
     {
         void* addr;
-        // CUDA_CHECK(cudaMallocHost(&addr, nbytes));
-        CUDA_CHECK(cudaHostAlloc(&addr, nbytes, cudaHostAllocDefault | cudaHostAllocPortable));
+        CUDA_DRIVER_CHECK(cuMemHostAlloc(&addr, nbytes, CU_MEMHOSTALLOC_PORTABLE));
         return addr;
     }
 
     static void deallocate(void* addr)
     {
-        // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "hpinned_alloc CUDA_CHECK(cudaFreeHost"));
-        CUDA_CHECK(cudaFreeHost(addr));
+        CUDA_DRIVER_CHECK(cuMemFreeHost(addr));
     }
 
     static void clear(void* addr, size_t nbytes)
@@ -118,10 +93,13 @@ public:
 
             host_ptr = hpinned_alloc::allocate(size_input); 
             // In a system with full unified memory, the host and the device pointer _may_ match.
-            CU_CHECK(cuMemHostGetDevicePointer(&dev_addr, host_ptr, 0));
+            CUDA_DRIVER_CHECK(cuMemHostGetDevicePointer(&dev_addr, host_ptr, 0));
 
-            addr_d    = (uintptr_t)dev_addr;
-            addr_h    = (uintptr_t)host_ptr;
+            addr_d    = static_cast<uintptr_t>(dev_addr);
+            addr_h    = reinterpret_cast<uintptr_t>(host_ptr);
+            size_alloc = size_input;
+            size_free  = size_input;
+            addr_free  = 0;
             return; 
         }
 
@@ -148,11 +126,10 @@ public:
         if(CUDA_SUCCESS != e)
             THROW("cuMemHostGetDevicePointer");
 #else
-        // CU_CHECK(cuMemAlloc(&dev_addr, alloc_size));
-        CU_CHECK(cuMemAlloc(&dev_addr, alloc_size));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dev_addr, alloc_size));
 #endif
 
-        addr_free = (uintptr_t)dev_addr;
+        addr_free = static_cast<uintptr_t>(dev_addr);
         // Offset into a page-aligned address if necessary
         if(dev_addr % GPU_PAGE_SIZE)
         {
@@ -160,7 +137,7 @@ public:
         }
         /*----------------------------------------------------------------*
             * Set attributes for the allocated device memory.                */
-        CU_CHECK(cuPointerSetAttribute(&FLAG, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, dev_addr));
+        CUDA_DRIVER_CHECK(cuPointerSetAttribute(&FLAG, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, dev_addr));
         // if(CUDA_SUCCESS != cuPointerSetAttribute(&FLAG, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, dev_addr))
         // {
         //     cuMemFree(dev_addr);
@@ -171,7 +148,7 @@ public:
             * Pin the device buffer                                          */
         if(0 != gdr_pin_buffer(*g, dev_addr, pin_size, 0, 0, &mh))
         {
-            CU_CHECK(cuMemFree(dev_addr));
+            CUDA_DRIVER_CHECK(cuMemFree(dev_addr));
             THROW("gdr_pin_buffer");
         }
         /*----------------------------------------------------------------*
@@ -179,7 +156,7 @@ public:
         if(0 != gdr_map(*g, mh, &host_ptr, pin_size))
         {
             gdr_unpin_buffer(*g, mh);
-            CU_CHECK(cuMemFree(dev_addr));
+            CUDA_DRIVER_CHECK(cuMemFree(dev_addr));
             THROW("gdr_map");
         }
         /*----------------------------------------------------------------*
@@ -188,12 +165,12 @@ public:
         {
             gdr_unmap(*g, mh, host_ptr, pin_size);
             gdr_unpin_buffer(*g, mh);
-            CU_CHECK(cuMemFree(dev_addr));
+            CUDA_DRIVER_CHECK(cuMemFree(dev_addr));
             THROW("gdr_get_info");
         }
 
-        addr_d    = (uintptr_t)dev_addr;
-        addr_h    = (uintptr_t)host_ptr;
+        addr_d    = static_cast<uintptr_t>(dev_addr);
+        addr_h    = reinterpret_cast<uintptr_t>(host_ptr);
         size_free = pin_size;
         size_alloc = alloc_size;
     };
@@ -201,22 +178,22 @@ public:
     ~gpinned_buffer()
     {
         if (is_rdma_supported) {
-        gdr_unmap(*g, mh, (void*)addr_h, size_free);
+        gdr_unmap(*g, mh, reinterpret_cast<void*>(addr_h), size_free);
         gdr_unpin_buffer(*g, mh);
-        CU_CHECK(cuMemFree((CUdeviceptr)addr_free));
+        CUDA_DRIVER_CHECK(cuMemFree(static_cast<CUdeviceptr>(addr_free)));
         } else {
-            hpinned_alloc::deallocate((void*)addr_h); 
+            hpinned_alloc::deallocate(reinterpret_cast<void*>(addr_h)); 
         }
     };
 
     void* addrh()
     {
-        return (void*)addr_h;
+        return reinterpret_cast<void*>(addr_h);
     }
 
     void* addrd()
     {
-        return (void*)addr_d;
+        return reinterpret_cast<void*>(addr_d);
     }
 
     size_t size()
@@ -243,14 +220,28 @@ class GpuDevice {
 public:
     GpuDevice(uint32_t _id, bool init_gdr);
     ~GpuDevice();
-    struct gpinned_buffer* newGDRbuf(size_t size);
+    /**
+     * @brief Allocate new GDR pinned buffer
+     *
+     * @param size Buffer size in bytes (will be rounded to GPU page size)
+     * @return Pointer to allocated GDR buffer
+     * @note Caller owns the returned pointer; wrap in std::unique_ptr<gpinned_buffer>
+     *       (or transfer ownership to a managed storage). Marked [[nodiscard]] so the
+     *       compiler enforces this at the call site.
+     */
+    [[nodiscard]] struct gpinned_buffer* newGDRbuf(const std::size_t size);
     gdr_t*                 getGDRhandler();
     void                   setDevice();
     void                   print_info();
 private:
     uint32_t              id;
     int                   tot_devs;
-    struct cudaDeviceProp deviceProp;
+    CUdevice              cuDevice_{};
+    CUcontext             cuCtx_{};
+    char                  deviceName_[256]{};
+    int                   devicePciBusId_{};
+    int                   devicePciDeviceId_{};
+    int                   devicePciDomainId_{};
     int                   device_attr_clock_rate;
     int                   device_is_direct_rdma_supported; 
     gdr_t                 gdrc_h;
@@ -262,19 +253,18 @@ struct device_alloc
 {
     static void* allocate(size_t nbytes)
     {
-        void* addr;
-        CUDA_CHECK(cudaMalloc(&addr, nbytes));
-        return addr;
+        CUdeviceptr dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr, nbytes));
+        return reinterpret_cast<void*>(dptr);
     }
     static void deallocate(void* addr)
     {
-        // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "device_alloc CUDA_CHECK(cudaFree"));
-        CUDA_CHECK(cudaFree(addr));
+        CUDA_DRIVER_CHECK(cuMemFree(reinterpret_cast<CUdeviceptr>(addr)));
     }
 
     static void clear(void* addr, size_t nbytes)
     {
-        CUDA_CHECK(cudaMemset(addr, 0, nbytes));
+        CUDA_DRIVER_CHECK(cuMemsetD8(reinterpret_cast<CUdeviceptr>(addr), 0, nbytes));
     }
 };
 

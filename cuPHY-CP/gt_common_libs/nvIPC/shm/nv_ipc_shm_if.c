@@ -289,7 +289,7 @@ static int shm_ipc_open(nv_ipc_t* ipc, const nv_ipc_config_shm_t* cfg)
 
             if(CONFIG_ENABLE_HOST_PAGE_LOCK && priv_data->primary && cfg->cuda_device_id >= 0 && (pool_id == NV_IPC_MEMPOOL_CPU_DATA || pool_id == NV_IPC_MEMPOOL_CPU_LARGE))
             {
-                size_t size = cfg->mempool_size[pool_id].buf_size * cfg->mempool_size[pool_id].pool_len;
+                size_t size = (size_t)cfg->mempool_size[pool_id].buf_size * cfg->mempool_size[pool_id].pool_len;
                 if(nv_ipc_page_lock(priv_data->mempools[pool_id]->get_addr(priv_data->mempools[pool_id], 0), size) < 0)
                 {
                     return -1;
@@ -667,6 +667,13 @@ static int mempools_alloc(nv_ipc_t* ipc, nv_ipc_msg_t* msg, uint32_t options)
         NVLOGW(TAG, "%s: MSG pool is full", __func__);
         return -1;
     }
+    if(msg_index >= priv_data->ring_len)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid msg_index %d ring_len %d",
+                __func__, msg_index, priv_data->ring_len);
+        msgpool->free(msgpool, msg_index);
+        return -1;
+    }
     msg->msg_buf = msgpool->get_addr(msgpool, msg_index);
 
     packet_info_t* info = priv_data->packet_infos + msg_index;
@@ -962,7 +969,7 @@ static int ring_rx_dequeue(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
     IPC_DUMPING_CHECK(priv_data)
 
     int32_t msg_index = priv_data->rx_ring->dequeue(priv_data->rx_ring);
-    if(msg_index < 0 || msg_index > priv_data->ring_len)
+    if(msg_index < 0 || msg_index >= priv_data->ring_len)
     {
         return -1;
     }
@@ -972,14 +979,30 @@ static int ring_rx_dequeue(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
         msg->msg_buf              = msgpool->get_addr(msgpool, msg_index);
 
         packet_info_t* info = priv_data->packet_infos + msg_index;
-        if(info->data_pool > 0 && info->data_pool < NV_IPC_MEMPOOL_NUM)
+        int32_t data_pool  = info->data_pool;
+        if(data_pool > 0 && data_pool < NV_IPC_MEMPOOL_NUM)
         {
-            nv_ipc_mempool_t* datapool = priv_data->mempools[info->data_pool];
-            msg->data_pool             = info->data_pool;
-            msg->data_buf              = datapool->get_addr(datapool, info->data_index);            
+            nv_ipc_mempool_t* datapool = priv_data->mempools[data_pool];
+            if(datapool != NULL)
+            {
+                msg->data_pool = data_pool;
+                msg->data_buf  = datapool->get_addr(datapool, info->data_index);
+                if(msg->data_buf == NULL)
+                {
+                    NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_index %d for pool %d",
+                            __func__, info->data_index, data_pool);
+                    return -1;
+                }
+            }
+            else
+            {
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_pool %d", __func__, data_pool);
+                return -1;
+            }
         }
         else
         {
+            // MSG part only, no DATA buffer
             msg->data_pool = NV_IPC_MEMPOOL_CPU_MSG;
             msg->data_buf  = NULL;
         }
@@ -1145,6 +1168,13 @@ nvipc_msg_dir_t nv_ipc_get_msg_direction(nv_ipc_t *ipc, nv_ipc_msg_t *msg)
 
 static int debug_get_msg(priv_data_t* priv_data, nv_ipc_msg_t* msg, int msg_index)
 {
+    if(msg_index < 0 || msg_index >= priv_data->ring_len)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid msg_index=%d ring_len=%d", __func__,
+                msg_index, priv_data->ring_len);
+        return -1;
+    }
+
     nv_ipc_mempool_t* msgpool = priv_data->mempools[NV_IPC_MEMPOOL_CPU_MSG];
     if((msg->msg_buf = msgpool->get_addr(msgpool, msg_index)) == NULL)
     {
@@ -1159,14 +1189,43 @@ static int debug_get_msg(priv_data_t* priv_data, nv_ipc_msg_t* msg, int msg_inde
     msg->data_len      = info->data_len;
     msg->data_pool     = info->data_pool;
 
-    if(msg->data_pool > 0)
+    if(msg->msg_len < 0
+            || msg->msg_len > priv_data->mempool_size[NV_IPC_MEMPOOL_CPU_MSG].buf_size)
     {
-        nv_ipc_mempool_t* datapool = priv_data->mempools[msg->data_pool];
-        msg->data_buf              = datapool->get_addr(datapool, info->data_index);
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid msg_len=%d", __func__, msg->msg_len);
+        return -1;
+    }
+
+    if(info->data_pool > 0 && info->data_pool < NV_IPC_MEMPOOL_NUM)
+    {
+        nv_ipc_mempool_t* datapool = priv_data->mempools[info->data_pool];
+        if(datapool != NULL)
+        {
+            msg->data_pool = info->data_pool;
+            msg->data_buf  = datapool->get_addr(datapool, info->data_index);
+            if(msg->data_buf == NULL)
+            {
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_index %d for pool %d",
+                        __func__, info->data_index, info->data_pool);
+                return -1;
+            }
+            if(msg->data_len < 0 || msg->data_len > priv_data->mempool_size[info->data_pool].buf_size)
+            {
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_len=%d", __func__,
+                        msg->data_len);
+                return -1;
+            }
+        }
+        else
+        {
+            msg->data_pool = NV_IPC_MEMPOOL_CPU_MSG;
+            msg->data_buf  = NULL;
+        }
     }
     else
     {
-        msg->data_buf = NULL;
+        msg->data_pool = NV_IPC_MEMPOOL_CPU_MSG;
+        msg->data_buf  = NULL;
     }
     return 0;
 }
@@ -1176,6 +1235,14 @@ static int debug_dump_queue(priv_data_t* priv_data, array_queue_t* queue, int32_
     char*   queue_name = queue->get_name(queue);
     int32_t count      = queue->get_count(queue);
     int32_t max_length = queue->get_max_length(queue);
+    if(count < 0)
+    {
+        count = 0;
+    }
+    else if(count > max_length)
+    {
+        count = max_length;
+    }
     int32_t base = -1, counter = 0;
     NVLOGC(TAG, "%s: count=%d max_length=%d", info, count, max_length);
 
@@ -1210,6 +1277,14 @@ static int debug_dump_mempools(priv_data_t* priv_data, int32_t* mempool_status, 
     char*   queue_name = queue->get_name(queue);
     int32_t count      = queue->get_count(queue);
     int32_t max_length = queue->get_max_length(queue);
+    if(count < 0)
+    {
+        count = 0;
+    }
+    else if(count > max_length)
+    {
+        count = max_length;
+    }
     int32_t base = -1, counter = 0;
 
     NVLOGC(TAG, "%s: mempool_size=%d free_count=%d max_length=%d", info, mempool_size, count, max_length);

@@ -6,18 +6,24 @@ The byte-level source of truth is `include/replay_format.hpp`: field names, type
 
 ## File layout
 
-A trace is a fixed header followed by a stream of records, one per E3 indication, in ascending `ts_tai` order:
+A trace is a fixed header followed by a stream of records, one per cell-slot, in ascending `ts_tai` order. A multi-cell slot is several records sharing one `ts_tai`; replay regroups them into a single indication (see [Ordering](#ordering)):
 
 ```text
 +------------------------------------------+  offset 0
 |  FileHeader (16 B)                       |  magic, version, shm_layout_version
 +------------------------------------------+
-|  Record 0                                |  \
-+------------------------------------------+   \  ascending ts_tai
-|  Record 1                                |   /  (PUSCH before SRS on ties)
-+------------------------------------------+  /
-|  ...                                     |
+|  PUSCH  ts_tai=T0  cell 0                |  \
++------------------------------------------+   |  slot T0: cells grouped by ts_tai,
+|  PUSCH  ts_tai=T0  cell 1                |   |  ascending cell_id, PUSCH before SRS
++------------------------------------------+   |
+|  SRS    ts_tai=T0  cell 0                |   |
++------------------------------------------+   |
+|  SRS    ts_tai=T0  cell 1                |  /
 +------------------------------------------+
+|  PUSCH  ts_tai=T1  cell 0                |  \  next slot (ascending ts_tai)
++------------------------------------------+   \
+|  ...                                     |   /
++------------------------------------------+  /
 ```
 
 The header carries the `E3RT` magic, the trace `version`, and the `shm_layout_version` (`e3::SHM_LAYOUT_VERSION` at generation time). A reader rejects any file whose magic or SHM layout version does not match its own build, so a stale trace fails fast rather than feeding garbage into the buffers.
@@ -66,7 +72,7 @@ An **SRS** body is the slot header, the per-UE metrics, the cell-level IQ blob, 
 +------------------------------------------+
 ```
 
-The slot and UE headers mirror the agent's `E3*BufferInfo` and `E3*Metrics` structs, minus the SHM bookkeeping (buffer/write indices and row offsets) that replay recomputes on the fly. Per-UE slicing into the blobs uses the offsets and sizes carried in the UE metrics.
+The slot and UE headers mirror the agent's `E3*BufferInfo` and `E3*Metrics` structs, minus the SHM bookkeeping (buffer/write indices and row offsets) that replay recomputes on the fly. Per-UE slicing into the blobs uses the offsets and sizes carried in the UE metrics. Each header also carries its own `cell_id`; `n_cells` is advisory (the count the capture saw), since replay frames slots on `ts_tai` alone.
 
 ## Blobs
 
@@ -86,7 +92,7 @@ Keep each UE's `h_offset`/`h_size` consistent with the `hest` blob: set them to 
 
 ## Ordering
 
-Records are ordered by `ts_tai` (the TAI capture timestamp), and when a PUSCH and an SRS record share a timestamp the PUSCH one comes first.
+Records are ordered by `ts_tai` (the TAI capture timestamp). Within one `ts_tai`, a slot's cells ascend by `cell_id`, and a PUSCH record comes before an SRS record on ties. Replay accumulates the consecutive records that share a `ts_tai` and publishes them as one multi-cell indication when the timestamp advances; a single-cell trace has one record per `ts_tai` and plays back as a one-cell slot.
 
 ## Pacing
 
@@ -97,6 +103,6 @@ A generator must therefore set `timestamp_tai_ns` monotonically on every record;
 ## Writing a generator
 
 1. Write the `FileHeader` with the matching `magic`, `version`, and `shm_layout_version`.
-2. Emit records in ascending `ts_tai` order, PUSCH before SRS on ties.
+2. Emit records in ascending `ts_tai` order; within a slot order cells by `cell_id`, PUSCH before SRS on ties.
 3. Fill the slot and UE headers per `replay_format.hpp`, and set `timestamp_tai_ns` for pacing.
 4. Append each stream as a blob, or write `len == 0` to omit it.

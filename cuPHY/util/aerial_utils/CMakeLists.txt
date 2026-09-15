@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +38,7 @@ set_property(TARGET aerial_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(aerial_utils PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_include_directories(aerial_utils PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_compile_options(aerial_utils PRIVATE ${AERIAL_ARCH_TUNE_FLAGS})
 
-target_link_libraries(aerial_utils PRIVATE ${CUDA_LIBRARIES} ${CUDA_DRIVER_LIBRARY} CUDA::cudart)
+target_link_libraries(aerial_utils PRIVATE CUDA::cudart CUDA::cuda_driver)
 target_link_libraries(aerial_utils PRIVATE nvlog)

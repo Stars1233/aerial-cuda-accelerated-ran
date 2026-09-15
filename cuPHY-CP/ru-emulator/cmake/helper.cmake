@@ -25,7 +25,8 @@ endif()
 
 set(CMAKE_C_FLAGS ${CMAKE_CXX_FLAGS})
 
-set(SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/ru_emulator.cpp
+set(RU_EMULATOR_COMMON_SOURCES
+            ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/ru_emulator.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/utils.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/config_parser.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../ru_emulator/fh.cpp
@@ -55,7 +56,7 @@ function(link_target target)
     target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/cuPHY-CP/aerial-fh-driver/include)
     target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR}/cuPHY/src/cuphy)
 
-    target_link_libraries(${target} PRIVATE CUDA::cudart CUDA::cuda_driver)
+    target_link_libraries(${target} PRIVATE CUDA::cuda_driver)
 
     #  Libraries
     target_link_libraries(${target} PRIVATE slot_command nvlog yaml aerial-fh cuphyoamlib app_config aerial_sdk_version perf_metrics)
@@ -71,4 +72,6 @@ endif(DOCA_GPU_DPDK)
     if(${SUBMODULE_BUILD})
         target_compile_definitions(${target} PRIVATE SUBMODULE_BUILD=1)
     endif()
+
+    target_compile_options(${target} PRIVATE ${AERIAL_ARCH_TUNE_FLAGS})
 endfunction()

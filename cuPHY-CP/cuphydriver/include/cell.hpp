@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include <array>
 #include <string>
 #include <tuple>
+#include <optional>
 #include "locks.hpp"
 #include "cuphydriver_api.hpp"
 #include "fh.hpp"
@@ -212,6 +213,28 @@ public:
     void                   clearIOBuffers();                      ///< Clear all I/O buffers (DL and UL)
     void                   clearULBuffers();                      ///< Clear only UL buffers
     /**
+     * Recreate UL ST1/ST2/ST3 input buffers for the current eAxC counts and OAM headroom.
+     */
+    void                   rebuildULBuffers();
+    /**
+     * Get allocated antenna capacity for UL ST1 (PUSCH/PUCCH) buffers.
+     * May exceed the current eAxC count when sized for OAM expansion headroom.
+     * @return Antenna capacity used to size ST1 buffers. The caller must check this value.
+     */
+    [[nodiscard]] size_t   getUlBufSt1AntCap() const { return ul_buf_st1_ant_cap_; }
+    /**
+     * Get allocated antenna capacity for UL ST2 (SRS) buffers.
+     * May exceed the current eAxC count when sized for OAM expansion headroom.
+     * @return Antenna capacity used to size ST2 buffers. The caller must check this value.
+     */
+    [[nodiscard]] size_t   getUlBufSt2AntCap() const { return ul_buf_st2_ant_cap_; }
+    /**
+     * Get allocated antenna capacity for UL ST3 (PRACH) buffers.
+     * May exceed the current eAxC count when sized for OAM expansion headroom.
+     * @return Antenna capacity used to size ST3 buffers. The caller must check this value.
+     */
+    [[nodiscard]] size_t   getUlBufSt3AntCap() const { return ul_buf_st3_ant_cap_; }
+    /**
      * Update performance and operational metrics for this cell that are exposed via Prometheus monitoring.
      * 
      * @param[in] metric  Metric type to update
@@ -309,6 +332,16 @@ public:
     //// PRACH is used for initial UE access and timing advance estimation
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     cuphyPrachCellStatPrms_t* getPrachCellStatConfig();           ///< Get PRACH cell-level static configuration
+    std::optional<int32_t>    getPrachFreqOffset(uint8_t fd_idx) const;  ///< Get ORAN freqOffset for given FD occasion index; returns std::nullopt on invalid fd_idx
+    uint8_t                   getPrachSeqLength() const;                 ///< Get PRACH sequence length (0=long, 1=short)
+    uint32_t                  getDlFreqAbsAKhz() const;                  ///< Get DL Point A absolute frequency in kHz
+    [[nodiscard]] const std::vector<cell_phy_info::pmi_entry>& getPmiEntries() const;  ///< Get PMI-to-port-count entries
+    /**
+     * @brief Return static BFW DBT PDU payloads captured from CONFIG.request.
+     *
+     * @return Const reference to per-PDU DBT payload byte vectors (mMIMO only).
+     */
+    [[nodiscard]] const std::vector<std::vector<uint8_t>>& getBfwDbtPduPayloads() const;
     cuphyPrachOccaStatPrms_t* getPrachOccaStatConfig();           ///< Get PRACH occasion static configuration
     std::size_t               getPrachOccaSize() const;           ///< Get number of PRACH occasions
     std::vector<cuphyPrachOccaStatPrms_t>* getPrachOccaStatVec(); ///< Get vector of all PRACH occasion configs
@@ -330,6 +363,8 @@ public:
     //// Manage eAxC (enhanced Antenna-Carrier) IDs and flow control for ORAN fronthaul
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     peer_id_t                    getPeerId();                     ///< Get fronthaul peer identifier
+    int                          getCplaneNicIndex() const { return cplane_nic_index_; }
+    void                         setCplaneNicIndex(int idx) { cplane_nic_index_ = idx; }
     
     /**
      * eAxC IDs identify specific antenna-carrier streams in ORAN fronthaul.
@@ -429,8 +464,6 @@ public:
     //// MPS (Multi-Process Service) enables GPU sharing between processes
     ////////////////////////////////////////////////////////////////////////////////////////////////////
     GpuDevice *            getGpuDevice() const;                  ///< Get GPU device assigned to this cell
-    cudaStream_t           getUlChannelStream();                  ///< Get CUDA stream for UL channel processing
-    cudaStream_t           getUlOrderStream();                    ///< Get CUDA stream for UL packet ordering
     cudaStream_t           getDlStream();                         ///< Get CUDA stream for DL processing
     /**
      * Allocate and initialize GPU-side items (buffers, semaphores, etc.)
@@ -527,9 +560,17 @@ private:
     cuphyPrachCellStatPrms_t prachCellStatParams;                 ///< PRACH cell-level static parameters
     std::vector<cuphyPrachOccaStatPrms_t> prachOccaStatParamList; ///< List of PRACH occasion configurations
     uint16_t           prachOccaPrmStatIdx;                       ///< This cell's index into PrachStatPrms.pOccaPrms
+
+    // CPlaneGenerator support fields
+    std::array<int32_t, 8> prach_freq_offsets_{};                 ///< ORAN C-plane freqOffset per FD occasion
+    uint8_t            prach_seq_length_{};                       ///< PRACH sequence length (0=long, 1=short)
+    uint32_t           dl_freq_abs_a_khz_{};                      ///< DL Point A frequency in kHz
+    std::vector<cell_phy_info::pmi_entry> pmi_entries_;            ///< PMI index to antenna port count mapping
+    std::vector<std::vector<uint8_t>> bfw_dbt_pdu_payloads_;       ///< Static BFW DBT PDU payloads (mMIMO only)
     CellMetrics        metrics;                                   ///< Performance metrics for this cell
 
     std::unordered_map<std::string, peer_id_t> nic2peer_map;     ///< Map NIC names to fronthaul peer IDs
+    int cplane_nic_index_{0};                                     ///< Index into PhyDriverCtx cplane_senders_ arrays
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //// Timing Configuration
@@ -568,8 +609,6 @@ private:
     //// CUDA Streams for Asynchronous Processing
     //// Using separate streams allows concurrent execution of different processing stages
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
-    cudaStream_t stream_ul;                                       ///< CUDA stream for UL channel processing
-    cudaStream_t stream_order;                                    ///< CUDA stream for packet ordering
     cudaStream_t stream_dl;                                       ///< CUDA stream for DL processing
 
     ////////////////////////////////////////////////////////////////////////
@@ -654,6 +693,10 @@ private:
     int   ulbuf_st1_index;                                        ///< Current st1 buffer index
     int   ulbuf_st2_index;                                        ///< Current st2 buffer index
     int   ulbuf_st3_index;                                        ///< Current st3 buffer index
+    bool  pending_ul_buf_resize_{};                               //!< UL buffer resize deferred from OAM eAxC update until start()
+    size_t ul_buf_st1_ant_cap_{};                                 //!< Antenna capacity allocated for ST1 (PUSCH/PUCCH) buffers
+    size_t ul_buf_st2_ant_cap_{};                                 //!< Antenna capacity allocated for ST2 (SRS) buffers
+    size_t ul_buf_st3_ant_cap_{};                                 //!< Antenna capacity allocated for ST3 (PRACH) buffers
 
     // Packet Capture Buffers (for debugging/analysis)
     std::unique_ptr<ULInputBuffer>  ul_pcap_capture_buffer;      ///< Buffer for capturing UL packets
@@ -720,7 +763,7 @@ private:
     ////////////////////////////////////////////////////////////////////////
     void *                                 pdsch_tb_buffer[PDSCH_MAX_GPU_BUFFS]; ///< PDSCH transport block buffers on GPU. 
                                                                                  ///<It is sized to hold PDSCH TB data for all UEs in a cell.
-    //cudaEvent_t                            pdsch_tb_cpy_complete; // (commented out - CUDA event for copy completion)
+    // cudaEvent_t pdsch_tb_cpy_complete; // (commented out — CUDA event for H2D copy completion; created via cuEventCreate)
 
     ////////////////////////////////////////////////////////////////////////
     //// BFW (Beamforming Weights) Parameters

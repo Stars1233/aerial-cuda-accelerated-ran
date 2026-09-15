@@ -186,6 +186,77 @@ The script looks for a tracer log file in each run subfolder (default: any file 
 
 ---
 
+## Tracing ALL Syscall Types with bpftrace
+
+The perf flow above is scoped to **futex** (and page faults) on purpose. Casting a wide net over **every** syscall with `perf record` *or* `perf stat` puts too much per-event overhead on the real-time workers and causes **timing errors** — the hot syscalls (`clock_nanosleep`, `write`, `getcpu`) fire tens of millions of times per run, and perf's per-event handler can't keep up without perturbing the workload.
+
+For all-syscall coverage we instead use **bpftrace**, which aggregates counts **in-kernel** (per-CPU, lock-free) with no per-event export to userspace. This is light enough to run alongside the RT workers, and can even run **simultaneously with the perf futex capture** (on an orthogonal CPU core).
+
+### Why bpftrace and not perf for all syscalls
+
+| | Per-event work | Data export | RT impact |
+|---|---|---|---|
+| `perf record` (all syscalls) | build + copy a sample record every syscall | ring buffer → disk, continuously | worst (stalls + drops) |
+| `perf stat` (all syscalls) | heavy generic handler across ~300 events/thread | totals at end | still too heavy per-event |
+| **bpftrace count** | one per-CPU counter bump | totals at end only | light enough to fit the RT slack |
+
+### Automated capture wrapper
+
+`bpftrace_trace_workers.sh` is the end-to-end wrapper (analogous to `perf_trace_workers.sh`). It discovers the worker TIDs, resolves them to thread names, mounts debugfs if needed, runs bpftrace, and post-processes the result:
+
+```bash
+sudo ./testBenches/phase4_test_scripts/syscall_tracer/bpftrace_trace_workers.sh -d 5 -o /tmp/run1/bpftrace_syscalls.txt
+```
+
+| Option | Purpose |
+|--------|--------|
+| `-o PATH` | bpftrace raw map dump (default `/tmp/bpftrace_syscalls.txt`). |
+| `-s PATH` | Summary table file (default: alongside the dump). |
+| `-d SECS` | Auto-stop after SECS seconds (default: run until Ctrl-C). |
+| `-c CPU_ID` | CPU to pin bpftrace to (default: **59**, orthogonal to perf's 58). |
+| `--raw` | Use the lighter `raw_syscalls:sys_enter` single probe (numeric ids) instead of the named `syscalls:sys_enter_*` wildcard. |
+| `--no-summary` | Skip post-processing; only write the raw dump. |
+
+Two things this wrapper bakes in that are easy to get wrong by hand:
+
+1. **debugfs must be mounted** for bpftrace: `sudo mount -t debugfs none /sys/kernel/debug` (per container lifetime), else it errors with *"Could not read .../available_events"*.
+2. **Filter by `comm`, not TID.** bpftrace's eBPF programs see **host/init-namespace** TIDs, while `list_cuphy_worker_tids.sh` reports **container-local** TIDs — they never match, so a TID predicate silently captures nothing. The wrapper resolves the worker `comm`s (thread names, namespace-independent) and filters on those. (perf's `-t <tid>` works with container TIDs only because `perf_event_open` translates namespaces; eBPF does not.)
+
+### Summary and pass/fail
+
+`bpftrace_syscall_summary.py` parses the map dump into a table: **one row per syscall type, one column per DL/UL worker, plus a Total column** (sorted by Total descending, with a TOTAL row). It emits a verdict and sets its exit code:
+
+- **PASS** (exit 0) if any syscalls were captured.
+- **FAIL** (exit 1) if the capture is **empty** (no syscalls recorded).
+
+```bash
+python3 testBenches/phase4_test_scripts/syscall_tracer/bpftrace_syscall_summary.py -i /tmp/run1/bpftrace_syscalls.txt
+```
+
+The wrapper runs this automatically at the end (unless `--no-summary`) and exits with the verdict code.
+
+### Driving it from the test harness
+
+`run2_cuPHYcontroller.sh` supports `--bpftrace`, mirroring `--perf_trace`: it installs bpftrace if missing, waits for L1 readiness, then launches `bpftrace_trace_workers.sh` on the worker threads. perf and bpftrace can be enabled together and run on orthogonal cores (58 / 59):
+
+```bash
+# bpftrace only (all syscalls)
+./run2_cuPHYcontroller.sh --bpftrace --bpftrace_dir /tmp/bpf
+
+# perf (futex, CPU 58) + bpftrace (all syscalls, CPU 59) together
+./run2_cuPHYcontroller.sh --perf_trace --perf_trace_dir /tmp/perf --bpftrace --bpftrace_dir /tmp/bpf
+```
+
+| Option | Purpose |
+|--------|--------|
+| `--bpftrace` | Launch `bpftrace_trace_workers.sh` once L1 is ready. |
+| `--bpftrace_opts "<opts>"` | Options forwarded to the wrapper (e.g. `"--raw"`). |
+| `--bpftrace_dir <dir>` | Output directory (required). Dump + summary are written here. |
+
+`--perf_trace_timeout` also governs the bpftrace readiness wait.
+
+---
+
 ## Challenges and Issues with perf
 
 - **Reliability:** Based on experimentation, **single cell peak traffic pattern 59c for 5s (10K slots)** has been found to generate perf captures with good reliability.
@@ -199,7 +270,10 @@ The script looks for a tracer log file in each run subfolder (default: any file 
 | File | Purpose |
 |------|--------|
 | `list_cuphy_worker_tids.sh` | List PID and DL/UL worker TIDs for cuphycontroller_scf. |
+| `perf_trace_workers.sh` | End-to-end perf wrapper (futex): discover TIDs, set SCHED_OTHER, launch `perf record`. |
 | `perf_buf_size.c` | Utility to report effective ring buffer layout for a tracepoint and TID. |
 | `build_cuda_api_tracer.sh` | Build the LD_PRELOAD CUDA API tracer library. |
 | `futex_cuda_summary_multi_thread.py` | Per-run futex → CUDA API attribution and per-thread summary. |
 | `futex_cuda_runs_summary.py` | Collate per-run summaries; optional tracer log inclusion. |
+| `bpftrace_trace_workers.sh` | End-to-end bpftrace wrapper (all syscalls): discover TIDs, comm-filter, mount debugfs, run bpftrace, summarize. |
+| `bpftrace_syscall_summary.py` | Parse a bpftrace map dump into a per-syscall/per-worker table; PASS/FAIL verdict (FAIL if empty). |

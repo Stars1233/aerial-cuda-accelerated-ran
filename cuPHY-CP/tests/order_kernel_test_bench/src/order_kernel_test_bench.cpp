@@ -78,15 +78,25 @@ OrderKernelTestBench::OrderKernelTestBench(
     
     slot_info = new slotInfo_t[sizeof(slotInfo_t)*UL_MAX_CELLS_PER_SLOT];
     add_gpu_comm_ready_flags();
-    CUDA_CHECK(cudaMallocHost((void **)&ok_tb_config_params, sizeof(orderKernelTbConfigParams_t)));
+    CUresult cuInitResult = cuInit(0);
+    if(cuInitResult != CUDA_SUCCESS)
+    {
+        const char* errStr = nullptr;
+        cuGetErrorString(cuInitResult, &errStr);
+        throw std::runtime_error(fmt::format("cuInit failed: {}", errStr ? errStr : "unknown error"));
+    }
     initStatus = initialize();
+    if (initStatus)
+    {
+        return;
+    }
+    CUDA_DRIVER_CHECK(cuMemAllocHost((void **)&ok_tb_config_params, sizeof(orderKernelTbConfigParams_t)));
 }
 
 int OrderKernelTestBench::initialize()
 {
     CUresult cuStatus;
 
-    CUDA_CHECK(cudaSetDevice(gpuId));
     CU_CHECK(cuDeviceGet(&cuDev, gpuId));
 
     int actualDevSmCount = 0;
@@ -186,17 +196,26 @@ int OrderKernelTestBench::initialize()
     }
 
     CU_CHECK(cuCtxSetCurrent(cuCtx_oktb));
-    CUDA_CHECK(cudaStreamCreateWithPriority(&stream_oktb, cudaStreamNonBlocking, -5));
-    CUDA_CHECK(cudaEventCreate(&start_ok_tb_process));
-    CUDA_CHECK(cudaEventCreate(&end_ok_tb_process));
+    CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&stream_oktb, CU_STREAM_NON_BLOCKING, -5));
+    CUDA_DRIVER_CHECK(cuEventCreate(&start_ok_tb_process, CU_EVENT_DEFAULT));
+    CUDA_DRIVER_CHECK(cuEventCreate(&end_ok_tb_process, CU_EVENT_DEFAULT));
+
+    if(!init_order_kernel_tb_functions(tb_kerns_))
+    {
+        NVLOGE_FMT(TAG_ORDER_TB_INIT, AERIAL_TESTBENCH_EVENT, "Error: Failed to resolve order kernel test bench CUfunction handles");
+        return 1;
+    }
+
     return 0;
 }
 
 void OrderKernelTestBench::setup_config_params()
 {
+    CUdeviceptr dptr;
     for (int cell_idx=0;cell_idx<UL_MAX_CELLS_PER_SLOT;cell_idx++)
     {
-        CUDA_CHECK(cudaMalloc((void**)&fh_buf_ok_tb[cell_idx],MAX_PKTS_PER_SLOT_OK_TB*ok_tb_max_packet_size*MAX_UL_SLOTS_OK_TB));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,MAX_PKTS_PER_SLOT_OK_TB*ok_tb_max_packet_size*MAX_UL_SLOTS_OK_TB));
+        fh_buf_ok_tb[cell_idx] = (uint8_t*)dptr;
     }
     //TODO: Read and set params from config file
     // uint32_t      pusch_prb_stride[UL_MAX_CELLS_PER_SLOT]={273};
@@ -278,49 +297,50 @@ OrderKernelTestBench::~OrderKernelTestBench()
 {
     if (initStatus) return;
     for (int cell_count=0;cell_count<UL_MAX_CELLS_PER_SLOT;cell_count++){
-        cudaFree(fh_buf_ok_tb[cell_count]);
-        cudaFreeHost(ok_tb_input_params.exit_cond_d[cell_count]);
-        cudaFree(ok_tb_input_params.last_sem_idx_order_h[cell_count]);
-        cudaFree(ok_tb_input_params.early_rx_packets[cell_count]);
-        cudaFree(ok_tb_input_params.on_time_rx_packets[cell_count]);
-        cudaFree(ok_tb_input_params.late_rx_packets[cell_count]);
-        cudaFree(ok_tb_input_params.next_slot_early_rx_packets[cell_count]);
-        cudaFree(ok_tb_input_params.next_slot_on_time_rx_packets[cell_count]);
-        cudaFree(ok_tb_input_params.next_slot_late_rx_packets[cell_count]);
-        cudaFree(ok_tb_input_params.rx_packets_dropped_count[cell_count]);
-        cudaFree(ok_tb_input_params.start_cuphy_d[cell_count]);
-        cudaFree(ok_tb_input_params.pusch_buffer[cell_count]);
-        cudaFreeHost(ok_tb_input_params.pusch_buffer_h[cell_count]);
-        cudaFree(ok_tb_input_params.pusch_eAxC_map[cell_count]);
-        cudaFree(ok_tb_input_params.pusch_ordered_prbs[cell_count]);
-        cudaFree(ok_tb_input_params.prach_eAxC_map[cell_count]);
-        cudaFree(ok_tb_input_params.prach_buffer_0[cell_count]);
-        cudaFree(ok_tb_input_params.prach_buffer_1[cell_count]);
-        cudaFree(ok_tb_input_params.prach_buffer_2[cell_count]);
-        cudaFree(ok_tb_input_params.prach_buffer_3[cell_count]);
-        cudaFreeHost(ok_tb_input_params.prach_buffer_0_h[cell_count]);
-        cudaFreeHost(ok_tb_input_params.prach_buffer_1_h[cell_count]);
-        cudaFreeHost(ok_tb_input_params.prach_buffer_2_h[cell_count]);
-        cudaFreeHost(ok_tb_input_params.prach_buffer_3_h[cell_count]);
-        cudaFree(ok_tb_input_params.prach_ordered_prbs[cell_count]);
-        cudaFree(ok_tb_input_params.order_kernel_last_timeout_error_time[cell_count]);
-        cudaFree(ok_tb_input_params.last_sem_idx_rx_h[cell_count]);
-        cudaFreeHost(ok_tb_input_params.pkt_info[cell_count]);
-        cudaFreeHost(ok_tb_input_params.sem_gpu[cell_count]);
-        cudaFreeHost(ok_tb_input_params.sem_gpu_aerial_fh[cell_count]);
-        cudaFree(ok_tb_input_params.doca_rxq[cell_count]);            
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(fh_buf_ok_tb[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.exit_cond_d[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.last_sem_idx_order_h[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.early_rx_packets[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.on_time_rx_packets[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.late_rx_packets[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.next_slot_early_rx_packets[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.next_slot_on_time_rx_packets[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.next_slot_late_rx_packets[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.rx_packets_dropped_count[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.start_cuphy_d[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.pusch_buffer[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.pusch_buffer_h[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.pusch_eAxC_map[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.pusch_ordered_prbs[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.prach_eAxC_map[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.prach_buffer_0[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.prach_buffer_1[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.prach_buffer_2[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.prach_buffer_3[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.prach_buffer_0_h[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.prach_buffer_1_h[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.prach_buffer_2_h[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.prach_buffer_3_h[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.prach_ordered_prbs[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.order_kernel_last_timeout_error_time[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.last_sem_idx_rx_h[cell_count])));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.pkt_info[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.sem_gpu[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_input_params.sem_gpu_aerial_fh[cell_count]));
+        CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.doca_rxq[cell_count])));
     }
-    cudaFree(ok_tb_input_params.sym_ord_done_sig_arr);
-    cudaFree(ok_tb_input_params.sym_ord_done_mask_arr);
-    cudaFree(ok_tb_input_params.pusch_prb_symbol_map);
-    cudaFree(ok_tb_input_params.num_order_cells_sym_mask_arr);
-    cudaFree(ok_tb_input_params.cell_health);
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.sym_ord_done_sig_arr)));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.sym_ord_done_mask_arr)));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.pusch_prb_symbol_map)));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.num_order_cells_sym_mask_arr)));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFree(reinterpret_cast<CUdeviceptr>(ok_tb_input_params.cell_health)));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(ok_tb_config_params));
 
-    cudaStreamDestroy(stream_oktb);
-    cuCtxSynchronize();
+    CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(stream_oktb));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuCtxSynchronize());
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(start_ok_tb_process));
+    CUDA_DRIVER_CHECK_NON_FATAL(cuEventDestroy(end_ok_tb_process));
     cuCtxDestroy(cuCtx_oktb);
-    cudaEventDestroy(start_ok_tb_process);
-    cudaEventDestroy(end_ok_tb_process);
     delete slot_info;
 }
 
@@ -347,64 +367,97 @@ void OrderKernelTestBench::OrderKernelSetupDocaParams(uint32_t cell_idx)
 
 void OrderKernelTestBench::setup_input_params()
 {
+    CUdeviceptr dptr;
     for(int cell_count=0;cell_count<UL_MAX_CELLS_PER_SLOT;cell_count++)
     {
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.exit_cond_d[cell_count],sizeof(uint32_t)));
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.exit_cond_d[cell_count],sizeof(uint32_t)));
         *ok_tb_input_params.exit_cond_d[cell_count]=ORDER_KERNEL_RUNNING;
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.last_sem_idx_order_h[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.early_rx_packets[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.on_time_rx_packets[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.late_rx_packets[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.next_slot_early_rx_packets[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.next_slot_on_time_rx_packets[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.next_slot_late_rx_packets[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.rx_packets_dropped_count[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.start_cuphy_d[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.start_cuphy_d[cell_count],0,sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.pusch_buffer[cell_count],UL_ST1_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.pusch_buffer_h[cell_count],UL_ST1_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.pusch_eAxC_map[cell_count],max_rx_ant*sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.pusch_ordered_prbs[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.pusch_ordered_prbs[cell_count],0,sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.prach_eAxC_map[cell_count],max_rx_ant*sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.prach_buffer_0[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.prach_buffer_1[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.prach_buffer_2[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.prach_buffer_3[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.prach_buffer_0_h[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.prach_buffer_1_h[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.prach_buffer_2_h[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.prach_buffer_3_h[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.prach_ordered_prbs[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.prach_ordered_prbs[cell_count],0,sizeof(uint32_t)));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.last_sem_idx_order_h[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.early_rx_packets[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.on_time_rx_packets[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.late_rx_packets[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.next_slot_early_rx_packets[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.next_slot_on_time_rx_packets[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.next_slot_late_rx_packets[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.rx_packets_dropped_count[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.start_cuphy_d[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.start_cuphy_d[cell_count],0,sizeof(uint32_t)));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,UL_ST1_AP_BUF_SIZE*max_rx_ant));
+        ok_tb_input_params.pusch_buffer[cell_count] = (uint8_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.pusch_buffer_h[cell_count],UL_ST1_AP_BUF_SIZE*max_rx_ant));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,max_rx_ant*sizeof(uint16_t)));
+        ok_tb_input_params.pusch_eAxC_map[cell_count] = (uint16_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.pusch_ordered_prbs[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.pusch_ordered_prbs[cell_count],0,sizeof(uint32_t)));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,max_rx_ant*sizeof(uint16_t)));
+        ok_tb_input_params.prach_eAxC_map[cell_count] = (uint16_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,UL_ST3_AP_BUF_SIZE*max_rx_ant));
+        ok_tb_input_params.prach_buffer_0[cell_count] = (uint8_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,UL_ST3_AP_BUF_SIZE*max_rx_ant));
+        ok_tb_input_params.prach_buffer_1[cell_count] = (uint8_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,UL_ST3_AP_BUF_SIZE*max_rx_ant));
+        ok_tb_input_params.prach_buffer_2[cell_count] = (uint8_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,UL_ST3_AP_BUF_SIZE*max_rx_ant));
+        ok_tb_input_params.prach_buffer_3[cell_count] = (uint8_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.prach_buffer_0_h[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.prach_buffer_1_h[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.prach_buffer_2_h[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.prach_buffer_3_h[cell_count],UL_ST3_AP_BUF_SIZE*max_rx_ant));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.prach_ordered_prbs[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.prach_ordered_prbs[cell_count],0,sizeof(uint32_t)));
 
         /*SRS*/
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.srs_eAxC_map[cell_count],MAX_RX_ANT_SRS_64T64R*sizeof(uint16_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.srs_buffer[cell_count],UL_ST2_AP_BUF_SIZE*MAX_RX_ANT_SRS_64T64R));
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.srs_buffer_h[cell_count],UL_ST2_AP_BUF_SIZE*MAX_RX_ANT_SRS_64T64R));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.srs_ordered_prbs[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.srs_ordered_prbs[cell_count],0,sizeof(uint32_t)));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,MAX_RX_ANT_SRS_64T64R*sizeof(uint16_t)));
+        ok_tb_input_params.srs_eAxC_map[cell_count] = (uint16_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,UL_ST2_AP_BUF_SIZE*MAX_RX_ANT_SRS_64T64R));
+        ok_tb_input_params.srs_buffer[cell_count] = (uint8_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.srs_buffer_h[cell_count],UL_ST2_AP_BUF_SIZE*MAX_RX_ANT_SRS_64T64R));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.srs_ordered_prbs[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.srs_ordered_prbs[cell_count],0,sizeof(uint32_t)));
 
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.order_kernel_last_timeout_error_time[cell_count],sizeof(uint64_t)));
-        CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.order_kernel_last_timeout_error_time[cell_count],0,sizeof(uint64_t)));        
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.last_sem_idx_rx_h[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.last_sem_idx_rx_h[cell_count],0,sizeof(uint32_t)));        
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.sem_gpu[cell_count],sizeof(doca_gpu_semaphore_gpu_t)));
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.pkt_info[cell_count],sizeof(struct doca_gpu_semaphore_packet)*4096));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint64_t)));
+        ok_tb_input_params.order_kernel_last_timeout_error_time[cell_count] = (uint64_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.order_kernel_last_timeout_error_time[cell_count],0,sizeof(uint64_t)));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.last_sem_idx_rx_h[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.last_sem_idx_rx_h[cell_count],0,sizeof(uint32_t)));
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.sem_gpu[cell_count],sizeof(doca_gpu_semaphore_gpu_t)));
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.pkt_info[cell_count],sizeof(struct doca_gpu_semaphore_packet)*4096));
         ok_tb_input_params.sem_gpu[cell_count]->pkt_info_gpu=(struct doca_gpu_semaphore_packet *)ok_tb_input_params.pkt_info[cell_count];
-        CUDA_CHECK(cudaMallocHost((void**)&ok_tb_input_params.sem_gpu_aerial_fh[cell_count],sizeof(struct aerial_fh_gpu_semaphore_gpu)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.cq_db_rec[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.rq_db_rec[cell_count],sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.doca_rxq[cell_count],sizeof(struct doca_gpu_eth_rxq)));
-        CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.cqe_addr[cell_count],sizeof(struct mlx5_cqe)*(DOCA_GPUNETIO_CQE_CI_MASK+1)));
-        CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.cqe_addr[cell_count],0,sizeof(struct mlx5_cqe)));  
+        CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&ok_tb_input_params.sem_gpu_aerial_fh[cell_count],sizeof(struct aerial_fh_gpu_semaphore_gpu)));
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.cq_db_rec[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(uint32_t)));
+        ok_tb_input_params.rq_db_rec[cell_count] = (uint32_t*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(struct doca_gpu_eth_rxq)));
+        ok_tb_input_params.doca_rxq[cell_count] = (struct doca_gpu_eth_rxq*)dptr;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,sizeof(struct mlx5_cqe)*(DOCA_GPUNETIO_CQE_CI_MASK+1)));
+        ok_tb_input_params.cqe_addr[cell_count] = (struct mlx5_cqe*)dptr;
+        CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.cqe_addr[cell_count],0,sizeof(struct mlx5_cqe)));
     }
-    CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.cell_health,UL_MAX_CELLS_PER_SLOT*sizeof(bool)));
-    CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.cell_health,0x1,UL_MAX_CELLS_PER_SLOT*sizeof(bool)));
-    CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.sym_ord_done_sig_arr,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.sym_ord_done_mask_arr,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.pusch_prb_symbol_map,UL_MAX_CELLS_PER_SLOT*ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
-    CUDA_CHECK(cudaMalloc((void**)&ok_tb_input_params.num_order_cells_sym_mask_arr,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+    CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,UL_MAX_CELLS_PER_SLOT*sizeof(bool)));
+    ok_tb_input_params.cell_health = (bool*)dptr;
+    CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.cell_health,0x1,UL_MAX_CELLS_PER_SLOT*sizeof(bool)));
+    CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+    ok_tb_input_params.sym_ord_done_sig_arr = (uint32_t*)dptr;
+    CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+    ok_tb_input_params.sym_ord_done_mask_arr = (uint32_t*)dptr;
+    CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,UL_MAX_CELLS_PER_SLOT*ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+    ok_tb_input_params.pusch_prb_symbol_map = (uint32_t*)dptr;
+    CUDA_DRIVER_CHECK(cuMemAlloc(&dptr,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+    ok_tb_input_params.num_order_cells_sym_mask_arr = (uint32_t*)dptr;
 }
 
 void OrderKernelTestBench::read_ok_tb_config_file_params()
@@ -1380,9 +1433,9 @@ void OrderKernelTestBench::get_process_kernel_run_duration(int slot_count)
 {
     float ms = 0;
 
-    CUDA_CHECK(cudaEventQuery(start_ok_tb_process));
-    CUDA_CHECK(cudaEventQuery(end_ok_tb_process));
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start_ok_tb_process, end_ok_tb_process));
+    CUDA_DRIVER_CHECK(cuEventQuery(start_ok_tb_process));
+    CUDA_DRIVER_CHECK(cuEventQuery(end_ok_tb_process));
+    CUDA_DRIVER_CHECK(cuEventElapsedTime(&ms, start_ok_tb_process, end_ok_tb_process));
 
     process_dur_us[slot_count]=ms*1000;
     NVLOGC_FMT(TAG_ORDER_TB_BASE,"Slot count {} Process kernel duration {} us",slot_count,process_dur_us[slot_count]);
@@ -1401,8 +1454,6 @@ int OrderKernelTestBench::run_test()
     }
 
     NVLOGC_FMT(TAG_ORDER_TB_RUN, "Run launch_process_kernel_for_test_bench");
-    //cudaFree(0);
-    //cudaSetDevice(0);
 
     setup_input_params();
     read_ok_tb_config_file_params();
@@ -1423,7 +1474,7 @@ int OrderKernelTestBench::run_test()
         }
         buf_ok_tb[cell_idx]=new uint8_t[max_pkts_size_per_cell];
         file.read(reinterpret_cast<char*>(buf_ok_tb[cell_idx]), max_pkts_size_per_cell);
-        CUDA_CHECK(cudaMemcpy(fh_buf_ok_tb[cell_idx], buf_ok_tb[cell_idx], max_pkts_size_per_cell, cudaMemcpyHostToDevice));
+        CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)fh_buf_ok_tb[cell_idx], buf_ok_tb[cell_idx], max_pkts_size_per_cell));
         file.close();
         file.clear();
     }
@@ -1440,33 +1491,33 @@ int OrderKernelTestBench::run_test()
             if(enable_srs)
             {
                 ok_tb_config_params->srs_prb_x_slot[cell_idx]=ok_tb_config_file_params[cell_idx].num_srs_prbs[start_slot_idx];
-                CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.srs_ordered_prbs[cell_idx],0,sizeof(uint32_t)));
+                CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.srs_ordered_prbs[cell_idx],0,sizeof(uint32_t)));
                 ok_tb_config_params->srs_eAxC_num[cell_idx]=ok_tb_config_file_params[cell_idx].srs_eAxC_num[start_slot_idx];
                 for(int tmp=0;tmp<ok_tb_config_file_params[cell_idx].srs_eAxC_num[start_slot_idx];tmp++)
                 {
                     eAxC_map_srs[tmp]=ok_tb_config_file_params[cell_idx].srs_eAxC_map[start_slot_idx][tmp];
                 }
-                CUDA_CHECK(cudaMemcpy(ok_tb_input_params.srs_eAxC_map[cell_idx],eAxC_map_srs.data(),MAX_RX_ANT_SRS_64T64R*sizeof(uint16_t),cudaMemcpyHostToDevice));
+                CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)ok_tb_input_params.srs_eAxC_map[cell_idx],eAxC_map_srs.data(),MAX_RX_ANT_SRS_64T64R*sizeof(uint16_t)));
             }
             else
             {
                 ok_tb_config_params->pusch_prb_x_slot[cell_idx]=ok_tb_config_file_params[cell_idx].num_pusch_prbs[start_slot_idx];
                 ok_tb_config_params->prach_prb_x_slot[cell_idx]=ok_tb_config_file_params[cell_idx].num_prach_prbs[start_slot_idx];
-                CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.pusch_ordered_prbs[cell_idx],0,sizeof(uint32_t)));
-                CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.prach_ordered_prbs[cell_idx],0,sizeof(uint32_t)));      
+                CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.pusch_ordered_prbs[cell_idx],0,sizeof(uint32_t)));
+                CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.prach_ordered_prbs[cell_idx],0,sizeof(uint32_t)));
                 ok_tb_config_params->pusch_eAxC_num[cell_idx]=ok_tb_config_file_params[cell_idx].pusch_eAxC_num[start_slot_idx];
                 ok_tb_config_params->prach_eAxC_num[cell_idx]=ok_tb_config_file_params[cell_idx].prach_eAxC_num[start_slot_idx];
                 for(int tmp=0;tmp<ok_tb_config_file_params[cell_idx].pusch_eAxC_num[start_slot_idx];tmp++)
                 {
                     eAxC_map_pusch[tmp]=ok_tb_config_file_params[cell_idx].pusch_eAxC_map[start_slot_idx][tmp];
                 }
-                CUDA_CHECK(cudaMemcpy(ok_tb_input_params.pusch_eAxC_map[cell_idx],eAxC_map_pusch.data(),max_rx_ant*sizeof(uint16_t),cudaMemcpyHostToDevice));
+                CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)ok_tb_input_params.pusch_eAxC_map[cell_idx],eAxC_map_pusch.data(),max_rx_ant*sizeof(uint16_t)));
                 for(int tmp=0;tmp<ok_tb_config_file_params[cell_idx].prach_eAxC_num[start_slot_idx];tmp++)
                 {
                     eAxC_map_prach[tmp]=ok_tb_config_file_params[cell_idx].prach_eAxC_map[start_slot_idx][tmp];
                 }
-                CUDA_CHECK(cudaMemcpy(ok_tb_input_params.prach_eAxC_map[cell_idx],eAxC_map_prach.data(),max_rx_ant*sizeof(uint16_t),cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaMemcpy((ok_tb_input_params.pusch_prb_symbol_map+cell_idx*ORAN_PUSCH_SYMBOLS_X_SLOT),ok_tb_config_file_params[cell_idx].pusch_prb_symbol_map[start_slot_idx],ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t),cudaMemcpyHostToDevice));                      
+                CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)ok_tb_input_params.prach_eAxC_map[cell_idx],eAxC_map_prach.data(),max_rx_ant*sizeof(uint16_t)));
+                CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)(ok_tb_input_params.pusch_prb_symbol_map+cell_idx*ORAN_PUSCH_SYMBOLS_X_SLOT),ok_tb_config_file_params[cell_idx].pusch_prb_symbol_map[start_slot_idx],ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));                      
             }
             ok_tb_config_params->rx_pkt_num_slot[cell_idx]=ok_tb_config_file_params[cell_idx].num_rx_packets[start_slot_idx];
             ok_tb_config_params->tb_fh_buf[cell_idx]=fh_buf_ok_tb[cell_idx]+(start_slot_idx*MAX_PKTS_PER_SLOT_OK_TB*ok_tb_max_packet_size);
@@ -1477,10 +1528,10 @@ int OrderKernelTestBench::run_test()
 
 
             OrderKernelSetupDocaParams(cell_idx);            
-            cudaMemcpy(ok_tb_input_params.doca_rxq[cell_idx],&doca_rxq_info[cell_idx],sizeof(struct doca_gpu_eth_rxq),cudaMemcpyHostToDevice); 
-            cudaMemcpy(&ok_tb_input_params.doca_rxq[cell_idx]->cqe_addr,&ok_tb_input_params.cqe_addr[cell_idx],sizeof(struct mlx5_cqe*),cudaMemcpyHostToDevice);
-            cudaMemcpy(&ok_tb_input_params.doca_rxq[cell_idx]->cq_db_rec,&ok_tb_input_params.cq_db_rec[cell_idx],sizeof(uint32_t*),cudaMemcpyHostToDevice);
-            cudaMemcpy(&ok_tb_input_params.doca_rxq[cell_idx]->rq_db_rec,&ok_tb_input_params.rq_db_rec[cell_idx],sizeof(uint32_t*),cudaMemcpyHostToDevice);
+            CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)ok_tb_input_params.doca_rxq[cell_idx],&doca_rxq_info[cell_idx],sizeof(struct doca_gpu_eth_rxq)));
+            CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)&ok_tb_input_params.doca_rxq[cell_idx]->cqe_addr,&ok_tb_input_params.cqe_addr[cell_idx],sizeof(struct mlx5_cqe*)));
+            CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)&ok_tb_input_params.doca_rxq[cell_idx]->cq_db_rec,&ok_tb_input_params.cq_db_rec[cell_idx],sizeof(uint32_t*)));
+            CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)&ok_tb_input_params.doca_rxq[cell_idx]->rq_db_rec,&ok_tb_input_params.rq_db_rec[cell_idx],sizeof(uint32_t*)));
         }
         ok_tb_config_params->frameId = ok_tb_config_file_params[0].frameId[start_slot_idx];
         ok_tb_config_params->subframeId = ok_tb_config_file_params[0].subframeId[start_slot_idx];
@@ -1496,14 +1547,17 @@ int OrderKernelTestBench::run_test()
         ok_tb_config_params->ul_order_kernel_mode=0;//Dual CTA mode
         if(!enable_srs)
         {
-            CUDA_CHECK(cudaMemcpy(ok_tb_input_params.num_order_cells_sym_mask_arr,ok_tb_config_file_params[0].num_order_cells_sym_mask[start_slot_idx],ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t),cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.sym_ord_done_sig_arr,SYM_RX_NOT_DONE,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
-            CUDA_CHECK(cudaMemset((void*)ok_tb_input_params.sym_ord_done_mask_arr,0,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+            CUDA_DRIVER_CHECK(cuMemcpyHtoD((CUdeviceptr)ok_tb_input_params.num_order_cells_sym_mask_arr,ok_tb_config_file_params[0].num_order_cells_sym_mask[start_slot_idx],ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+            CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.sym_ord_done_sig_arr,SYM_RX_NOT_DONE,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
+            CUDA_DRIVER_CHECK(cuMemsetD8((CUdeviceptr)ok_tb_input_params.sym_ord_done_mask_arr,0,ORAN_PUSCH_SYMBOLS_X_SLOT*sizeof(uint32_t)));
         }
 
-        CUDA_CHECK(cudaEventRecord(start_ok_tb_process, stream_oktb));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_ok_tb_process, stream_oktb));
         //printf("Before launching process kernel ok_tb_input_params.pusch_buffer[cell_idx] = 0x%p\n",(void*)ok_tb_input_params.pusch_buffer[0]);
         launch_receive_process_kernel_for_test_bench(
+            tb_kerns_.tb_pingpong_srs,
+            tb_kerns_.tb_pingpong_no_srs,
+            tb_kerns_.recv_process,
             stream_oktb,
             /* Cell */
             ok_tb_config_params->cell_id,
@@ -1597,23 +1651,23 @@ int OrderKernelTestBench::run_test()
             ok_tb_config_params->ul_order_kernel_mode,
             enable_srs
         );
-        CUDA_CHECK(cudaEventRecord(end_ok_tb_process, stream_oktb));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_ok_tb_process, stream_oktb));
         for(int cell_idx=0;cell_idx<num_test_cells;cell_idx++){
             if(enable_srs)
             {
-                CUDA_CHECK(cudaMemcpyAsync(ok_tb_input_params.srs_buffer_h[cell_idx],ok_tb_input_params.srs_buffer[cell_idx],UL_ST2_AP_BUF_SIZE*MAX_RX_ANT_SRS_64T64R,cudaMemcpyDeviceToHost,stream_oktb));
+                CUDA_DRIVER_CHECK(cuMemcpyDtoHAsync(ok_tb_input_params.srs_buffer_h[cell_idx],(CUdeviceptr)ok_tb_input_params.srs_buffer[cell_idx],UL_ST2_AP_BUF_SIZE*MAX_RX_ANT_SRS_64T64R,stream_oktb));
             }
             else {
-                CUDA_CHECK(cudaMemcpyAsync(ok_tb_input_params.pusch_buffer_h[cell_idx],ok_tb_input_params.pusch_buffer[cell_idx],UL_ST1_AP_BUF_SIZE*max_rx_ant,cudaMemcpyDeviceToHost,stream_oktb));
+                CUDA_DRIVER_CHECK(cuMemcpyDtoHAsync(ok_tb_input_params.pusch_buffer_h[cell_idx],(CUdeviceptr)ok_tb_input_params.pusch_buffer[cell_idx],UL_ST1_AP_BUF_SIZE*max_rx_ant,stream_oktb));
                 if(ok_tb_config_params->prach_prb_x_slot[cell_idx]>0)
                 {
-                    CUDA_CHECK(cudaMemcpyAsync(ok_tb_input_params.prach_buffer_0_h[cell_idx],ok_tb_input_params.prach_buffer_0[cell_idx],UL_ST3_AP_BUF_SIZE*max_rx_ant,cudaMemcpyDeviceToHost,stream_oktb));
-                    CUDA_CHECK(cudaMemcpyAsync(ok_tb_input_params.prach_buffer_1_h[cell_idx],ok_tb_input_params.prach_buffer_1[cell_idx],UL_ST3_AP_BUF_SIZE*max_rx_ant,cudaMemcpyDeviceToHost,stream_oktb));
-                    CUDA_CHECK(cudaMemcpyAsync(ok_tb_input_params.prach_buffer_2_h[cell_idx],ok_tb_input_params.prach_buffer_2[cell_idx],UL_ST3_AP_BUF_SIZE*max_rx_ant,cudaMemcpyDeviceToHost,stream_oktb));
+                    CUDA_DRIVER_CHECK(cuMemcpyDtoHAsync(ok_tb_input_params.prach_buffer_0_h[cell_idx],(CUdeviceptr)ok_tb_input_params.prach_buffer_0[cell_idx],UL_ST3_AP_BUF_SIZE*max_rx_ant,stream_oktb));
+                    CUDA_DRIVER_CHECK(cuMemcpyDtoHAsync(ok_tb_input_params.prach_buffer_1_h[cell_idx],(CUdeviceptr)ok_tb_input_params.prach_buffer_1[cell_idx],UL_ST3_AP_BUF_SIZE*max_rx_ant,stream_oktb));
+                    CUDA_DRIVER_CHECK(cuMemcpyDtoHAsync(ok_tb_input_params.prach_buffer_2_h[cell_idx],(CUdeviceptr)ok_tb_input_params.prach_buffer_2[cell_idx],UL_ST3_AP_BUF_SIZE*max_rx_ant,stream_oktb));
                 }            
             }
         }
-        cudaStreamSynchronize(stream_oktb);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(stream_oktb));
         get_process_kernel_run_duration(slot_count);
         std::array<uint32_t,UL_MAX_CELLS_PER_SLOT> mis_match_counter;
         slotInfo_t slot_info_curr;

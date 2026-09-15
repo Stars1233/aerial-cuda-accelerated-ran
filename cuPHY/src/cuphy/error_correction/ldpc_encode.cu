@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -108,7 +108,7 @@ inline __device__ DType rotated_bits(const uint32_t       shift,
                                      const uint32_t       in_offset,
                                      const uint32_t* in)
 {
-    constexpr int    remainder = (Z >= 32) ? (Z % 32) : (-Z);
+    constexpr int    remainder = (Z >= 32) ? static_cast<int>(Z % 32) : -static_cast<int>(Z);
     constexpr size_t elem_size = sizeof(DType) * 8;
     constexpr int    num_tdbv = (Z / elem_size + int(Z % elem_size != 0));
 
@@ -214,7 +214,7 @@ __global__ void ldpc_encode_in_bit_kernel(const __grid_constant__ ldpcEncodeDesc
     const bool               puncture = desc.puncture;
     const int                num_rows = desc.num_rows;
 
-    constexpr int    remainder = (Z >= 32) ? (Z % 32) : (-Z);
+    constexpr int    remainder = (Z >= 32) ? static_cast<int>(Z % 32) : -static_cast<int>(Z);
     constexpr size_t elem_size = sizeof(DType) * 8;
     constexpr int    num_tdbv = (Z / elem_size + int(Z % elem_size != 0));
 

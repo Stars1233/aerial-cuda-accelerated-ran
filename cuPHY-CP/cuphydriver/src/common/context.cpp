@@ -21,13 +21,17 @@
 #define TAG_PERF_METRICS (NVLOG_TAG_BASE_CUPHY_DRIVER + 48) // "DRV.PERF_METRICS"
 
 #include "context.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "nvlog.hpp"
 #include "time.hpp"
 #include "cuphydriver_api.hpp"
+#include "framework_cplane_service.hpp"
 #include "aerial-fh-driver/oran.hpp"
+#include <algorithm>
 #include "aerial-fh-driver/pcap_logger.hpp"
 #include "ti_generic.hpp"
 #include <fstream>
+#include <string_view>
 #include "cuphyoam.hpp"
 
 void default_err_hndl(const char* msg)
@@ -45,17 +49,60 @@ void default_dbg_hndl(const char* msg)
     fputs(msg, stdout);
 }
 
+namespace {
+[[nodiscard]] uint8_t sanitize_cplane_batch_size(uint16_t configured_batch_size, std::string_view key)
+{
+    if (configured_batch_size == 0u || configured_batch_size > MAX_CELLS_PER_SLOT)
+    {
+        NVLOGW_FMT(TAG,
+                   "{}={} out of range [1,{}]; capping to {}",
+                   key,
+                   configured_batch_size,
+                   MAX_CELLS_PER_SLOT,
+                   MAX_CELLS_PER_SLOT);
+        return static_cast<uint8_t>(MAX_CELLS_PER_SLOT);
+    }
+    return static_cast<uint8_t>(configured_batch_size);
+}
+
+[[nodiscard]] std::size_t compute_max_batches_per_direction(uint8_t sanitized_batch_size)
+{
+    const std::size_t max_cells_per_slot = static_cast<std::size_t>(MAX_CELLS_PER_SLOT);
+    const std::size_t batch_size = static_cast<std::size_t>(sanitized_batch_size);
+    return (max_cells_per_slot + batch_size - 1u) / batch_size;
+}
+
+[[nodiscard]] std::size_t compute_max_concurrent_transactions(
+    uint8_t dl_batch_size,
+    uint8_t ul_batch_size)
+{
+    return compute_max_batches_per_direction(dl_batch_size) +
+           compute_max_batches_per_direction(ul_batch_size);
+}
+
+} // namespace
+
 // This is a minimal constructor initialized for test purposes.
 PhyDriverCtx::PhyDriverCtx(const context_config & ctx_cfg, bool minimal) : 
     log_err_fn_(default_err_hndl),
     log_inf_fn_(default_inf_hndl),
     log_dbg_fn_(default_dbg_hndl),
     log_lvl(L1_LOG_LVL_ERROR),
-    use_batched_memcpy(ctx_cfg.use_batched_memcpy),
-    m_batchedMemcpyHelper(DL_MAX_CELLS_PER_SLOT, batchedMemcpySrcHint::srcIsDevice, batchedMemcpyDstHint::dstIsHost, (use_batched_memcpy == 1) && (CUPHYDRIVER_PDSCH_USE_BATCHED_COPY == 1)) 
+    use_batched_memcpy(ctx_cfg.use_batched_memcpy)
 {
     standalone = ctx_cfg.standalone;
     validation = ctx_cfg.validation;  // Enable validation mode for safer testing
+    cplane_disable = ctx_cfg.cplane_disable;
+    fapi_to_cplane_direct = ctx_cfg.fapi_to_cplane_direct;
+    cplane_processing_dl_batch_size = sanitize_cplane_batch_size(
+        ctx_cfg.cplane_processing_dl_batch_size,
+        "cplane_processing_dl_batch_size");
+    cplane_processing_ul_batch_size = sanitize_cplane_batch_size(
+        ctx_cfg.cplane_processing_ul_batch_size,
+        "cplane_processing_ul_batch_size");
+    cplane_max_concurrent_transactions = compute_max_concurrent_transactions(
+        cplane_processing_dl_batch_size,
+        cplane_processing_ul_batch_size);
     prometheus_cpu_core = ctx_cfg.prometheus_cpu_core;
     data_core = ctx_cfg.data_core; 
     enable_cpu_init_comms     = ctx_cfg.enable_cpu_init_comms;
@@ -79,7 +126,10 @@ PhyDriverCtx::PhyDriverCtx(const context_config & ctx_cfg, bool minimal) :
         if (fh_proxy->registerNic(nic_cfg, ctx_cfg.gpu_id))
             PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "NIC registration error");
     }
-    minimal_phydriver = minimal; 
+    // Allocate a null-object copy manager so callers can dispatch to it
+    // unconditionally — no null checks on the hot path.
+    m_h2dCopyMgr = std::make_unique<PdschH2DCopyManager>(null_object);
+    minimal_phydriver = minimal;
 }
 
 
@@ -88,8 +138,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     log_inf_fn_(default_inf_hndl),
     log_dbg_fn_(default_dbg_hndl),
     log_lvl(L1_LOG_LVL_ERROR),
-    use_batched_memcpy(ctx_cfg.use_batched_memcpy),
-    m_batchedMemcpyHelper(DL_MAX_CELLS_PER_SLOT, batchedMemcpySrcHint::srcIsDevice, batchedMemcpyDstHint::dstIsHost, (use_batched_memcpy == 1) && (CUPHYDRIVER_PDSCH_USE_BATCHED_COPY == 1))
+    use_batched_memcpy(ctx_cfg.use_batched_memcpy)
 {
     ctx_tot_cpu_regular_memory = 0;
     ctx_tot_cpu_pinned_memory = 0;
@@ -134,6 +183,16 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     standalone          = ctx_cfg.standalone;
     validation          = ctx_cfg.validation;
     cplane_disable      = ctx_cfg.cplane_disable;
+    fapi_to_cplane_direct = ctx_cfg.fapi_to_cplane_direct;
+    cplane_processing_dl_batch_size = sanitize_cplane_batch_size(
+        ctx_cfg.cplane_processing_dl_batch_size,
+        "cplane_processing_dl_batch_size");
+    cplane_processing_ul_batch_size = sanitize_cplane_batch_size(
+        ctx_cfg.cplane_processing_ul_batch_size,
+        "cplane_processing_ul_batch_size");
+    cplane_max_concurrent_transactions = compute_max_concurrent_transactions(
+        cplane_processing_dl_batch_size,
+        cplane_processing_ul_batch_size);
     prometheus_cpu_core = ctx_cfg.prometheus_cpu_core;
     start_section_id_prach = ctx_cfg.start_section_id_prach;
     start_section_id_srs   = ctx_cfg.start_section_id_srs;
@@ -196,10 +255,10 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     ul_rx_pkt_tracing_level_srs = ctx_cfg.ul_rx_pkt_tracing_level_srs;
     ul_warmup_frame_count = ctx_cfg.ul_warmup_frame_count;
     pmu_metrics = ctx_cfg.pmu_metrics;
-    h2d_copy_thread_enable = ctx_cfg.h2d_cpy_th_cfg.enable_h2d_copy_thread;
     enable_l1_param_sanity_check = ctx_cfg.enable_l1_param_sanity_check;
 
     mMIMO_enable           = ctx_cfg.mMIMO_enable;
+    nic_configs_           = ctx_cfg.nic_configs;
     enable_srs             = ctx_cfg.enable_srs;
     enable_dl_core_affinity = ctx_cfg.enable_dl_core_affinity;
     dlc_core_packing_scheme = ctx_cfg.dlc_core_packing_scheme;
@@ -251,6 +310,10 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     bfw_power_normalization_alg_selector   = ctx_cfg.bfw_power_normalization_alg_selector;
     bfw_beta_prescaler                     = ctx_cfg.bfw_beta_prescaler;
     total_num_srs_chest_buffers            = ctx_cfg.total_num_srs_chest_buffers;
+    // SRS chest buffer dimension: use max_ul_antenna_ports from config (max of PUSCH/PUCCH/PRACH/SRS eAxC count over cells).
+    max_srs_antenna_ports = ctx_cfg.max_ul_antenna_ports;
+    max_dl_antenna_ports  = ctx_cfg.max_dl_antenna_ports;
+    max_ul_antenna_ports  = ctx_cfg.max_ul_antenna_ports;
     send_static_bfw_wt_all_cplane          = ctx_cfg.send_static_bfw_wt_all_cplane;
 
     task_list_ul = std::unique_ptr<TaskList>(new TaskList((phydriver_handle)this, 0, TASK_LIST_SIZE));
@@ -275,6 +338,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     ul_order_kernel_mode = ctx_cfg.ul_order_kernel_mode;
     ue_mode = ctx_cfg.ue_mode;
     ul_srs_aggr3_task_launch_offset_ns = ctx_cfg.ul_srs_aggr3_task_launch_offset_ns;
+    ul_srs_task1_order_launch_offset_ns = ctx_cfg.ul_srs_task1_order_launch_offset_ns;
 
     pusch_aggr_per_ctx = ctx_cfg.pusch_aggr_per_ctx;
     pucch_aggr_per_ctx = ctx_cfg.pucch_aggr_per_ctx;
@@ -292,19 +356,15 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     ul_order_timeout_log_interval_ns = ctx_cfg.ul_order_timeout_log_interval_ns;
     enable_tx_notification = ctx_cfg.enable_tx_notification;
 
-    //Set DL wait threshold values
-    if(ctx_cfg.dl_wait_th_list.size()==0){
-        //Set default values
-        h2d_copy_wait_th = 500000; //0.5 ms
+    //Set DL wait threshold values — h2d_copy_wait_th now lives in PdschH2DCopyManager.
+    if(ctx_cfg.dl_wait_th_list.empty()){
         cuphy_dl_channel_wait_th = 4000000; //4 ms
     }
-    else if(ctx_cfg.dl_wait_th_list.size()==1){ //Only h2d wait th provided in Yaml
-        h2d_copy_wait_th = ctx_cfg.dl_wait_th_list[0];
+    else if(ctx_cfg.dl_wait_th_list.size()==1){
         cuphy_dl_channel_wait_th = 4000000; //4 ms
     }
     else
     {
-        h2d_copy_wait_th = ctx_cfg.dl_wait_th_list[0];
         cuphy_dl_channel_wait_th = ctx_cfg.dl_wait_th_list[1];
     }
 
@@ -425,6 +485,11 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
             PHYDRIVER_THROW_EXCEPTIONS(errno, "Worker DL Validation creation error");
     }
 
+    init_gpu_resources(ctx_cfg);
+}
+
+void PhyDriverCtx::init_gpu_resources(const context_config& ctx_cfg)
+{
     std::unique_ptr<GpuDevice> g = std::unique_ptr<GpuDevice>(new GpuDevice((phydriver_handle)this, ctx_cfg.gpu_id, true));
     auto ret = gpu_map.insert(std::pair<int, std::unique_ptr<GpuDevice>>(ctx_cfg.gpu_id, std::move(g)));
     if(ret.second == false)
@@ -439,14 +504,16 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     //FIXME Shall we manually hardcode the value to 12 or 32 for green contexts instead of relying on the user doing it beforehand?
     // Could also throw an error if this is green contexts mode and the value is below some threshold.
 
-    // Log CUDA runtime version
+    // Log CUDA runtime version (Runtime API only; no Driver API equivalent)
     auto runtime_version = 0;
-    CUDA_CHECK_PHYDRIVER(cudaRuntimeGetVersion(&runtime_version));
+    cudaError_t rtErr = cudaRuntimeGetVersion(&runtime_version);
+    if(rtErr != cudaSuccess)
+        NVLOGW_FMT(TAG, "[{}:{}] cudaRuntimeGetVersion failed with {}", __FILE__, __LINE__, cudaGetErrorString(rtErr));
     NVLOGC_FMT(TAG, "CUDA runtime version from cudaRuntimeGetVersion(): {}", runtime_version);
     // Log latest CUDA version supported by the driver
     auto driver_version = 0;
-    CUDA_CHECK_PHYDRIVER(cudaDriverGetVersion(&driver_version));
-    NVLOGC_FMT(TAG, "CUDA driver version from cudaDriverGetVersion(): {}", driver_version);
+    CUDA_DRIVER_CHECK(cuDriverGetVersion(&driver_version));
+    NVLOGC_FMT(TAG, "CUDA driver version from cuDriverGetVersion(): {}", driver_version);
 
     {
 #if CUDA_VERSION < 12040
@@ -471,7 +538,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                 unsigned int wq_concurrency_limit_mmimo_add_on = (this->mMIMO_enable) ? 1 : 0;
 
 		CUdevice device;
-		CU_CHECK_PHYDRIVER(cuDeviceGet(&device, gpu_device->getId()));
+		CUDA_DRIVER_CHECK(cuDeviceGet(&device, gpu_device->getId()));
 		int gpuId = gpu_device->getId();
 #if CUDA_VERSION >= 12040
                 // Note that setting the CUDA_DEVICE_MAX_CONNECTIONS variable here via setenv will not have the desired
@@ -479,7 +546,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 
 		// check if MPS service is running
 		int mpsEnabled = 0;
-		CU_CHECK_PHYDRIVER(cuDeviceGetAttribute(&mpsEnabled, CU_DEVICE_ATTRIBUTE_MPS_ENABLED, device));
+		CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&mpsEnabled, CU_DEVICE_ATTRIBUTE_MPS_ENABLED, device));
 		if (mpsEnabled == 1)
 		{
 			NVLOGE_FMT(TAG, AERIAL_CUPHY_EVENT,  "MPS is enabled. Heads-up that currently using green contexts with MPS enabled can have unintended side effects. Will run regardless.");
@@ -491,7 +558,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		// Hard code SM granularity for green context splits
 		int major_cc = 0;
 		int minor_cc = 0;
-		CU_CHECK_PHYDRIVER(cuDeviceGetAttribute(&major_cc, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+		CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&major_cc, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
 		int SM_granularity = 0;
                 int min_count = 0;
 		if(major_cc == 8)
@@ -499,8 +566,10 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		    SM_granularity = 2;
                     min_count =  4;
 		}
-		else if (major_cc == 9)
+		else if (major_cc >= 9 && major_cc <= 12)
 		{
+                    // Validated for Hopper (sm_90) through Blackwell (sm_10x or sm_12x). Bounded explicitly so that
+                    // extending green context SM-split support to a future arch is a conscious, tested choice.
                     // 2 is in case the CU_DEV_SM_RESOURCE_SPLIT_IGNORE_SM_COSCHEDULING_FLAG_IS_USED
                     SM_granularity = (use_flags == 0) ? 8 : 2;
                     min_count =  (use_flags == 0) ? 8 : 2;
@@ -510,7 +579,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		    NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT,  "Running in untested compute capability ({}.{}). Granularity of SM splits for green contexts unknown.", major_cc, minor_cc);
 		}
 		int32_t gpuMaxSmCount = 0;
-                CU_CHECK_PHYDRIVER(cuDeviceGetAttribute(&gpuMaxSmCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
+                CUDA_DRIVER_CHECK(cuDeviceGetAttribute(&gpuMaxSmCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device));
 
 
                 // On every cuDevSmResourceSplitByCount() API call, we create two CUdevResource(s): the resulting one and the remaining one.
@@ -522,7 +591,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		min_sm_counts.resize(2*CURRENT_MAX_GREEN_CTXS);
 
 		initial_device_GPU_resources = {};
-		CU_CHECK_PHYDRIVER(cuDeviceGetDevResource(device, &initial_device_GPU_resources, default_resource_type));
+		CUDA_DRIVER_CHECK(cuDeviceGetDevResource(device, &initial_device_GPU_resources, default_resource_type));
 		NVLOGC_FMT(TAG, "Initial GPU resources retrieved via cuDeviceGetDevResource() have type {} and SM count {}.",  +initial_device_GPU_resources.type, initial_device_GPU_resources.sm.smCount);
 
                 // Current SM split strategy is to take into consideration the execution duration, timing requirements and scheduling pattern of different channels and establish,
@@ -555,7 +624,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                 if ((min_sm_counts[resource_index_pusch_split] > SM_granularity) && (first_split_modulo_SM_granularity != 0)) {
                     min_sm_counts[resource_index_pusch_split] -= first_split_modulo_SM_granularity;
                 }
-		CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_pusch_split], &actual_split_groups[resource_index_pusch_split], &initial_device_GPU_resources, &devResources[resource_index_pusch_split+1], use_flags, min_sm_counts[resource_index_pusch_split]));
+		CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_pusch_split], &actual_split_groups[resource_index_pusch_split], &initial_device_GPU_resources, &devResources[resource_index_pusch_split+1], use_flags, min_sm_counts[resource_index_pusch_split]));
 		//greenContexts[0].create(gpuId, &devResources[resource_index_pusch_split+1]);
 
                 // Increasing wq concurrency limit, if applicable, in case of mMIMO case by 1, given UL-BFW also runs under PUSCH ctx in this case
@@ -573,7 +642,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                 if ((min_sm_counts[resource_index_prep_for_ul_ctrl_split] > SM_granularity) && (second_split_modulo_SM_granularity != 0)) {
                     min_sm_counts[resource_index_prep_for_ul_ctrl_split] -= second_split_modulo_SM_granularity;
                 }
-                CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_prep_for_ul_ctrl_split], &actual_split_groups[resource_index_prep_for_ul_ctrl_split], &initial_device_GPU_resources, &devResources[resource_index_prep_for_ul_ctrl_split+1], use_flags, min_sm_counts[resource_index_prep_for_ul_ctrl_split]));
+                CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_prep_for_ul_ctrl_split], &actual_split_groups[resource_index_prep_for_ul_ctrl_split], &initial_device_GPU_resources, &devResources[resource_index_prep_for_ul_ctrl_split+1], use_flags, min_sm_counts[resource_index_prep_for_ul_ctrl_split]));
                 tmpGreenContextsForResplit[0].create(gpuId, &devResources[resource_index_prep_for_ul_ctrl_split+1], print_resources);
                 // Note tmpGreenContexts used only for resplit are created with defaults in cuPHY/examples/common/cuphy.hpp etc.
 
@@ -585,7 +654,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		min_sm_counts[resource_index_pucch_split] = rounded_up_PUCCH;
                 CUdevResource resource_to_split = {};
                 tmpGreenContextsForResplit[0].getResources(&resource_to_split);
-                CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_pucch_split], &actual_split_groups[resource_index_pucch_split], &resource_to_split, &devResources[resource_index_pucch_split+1], use_flags, min_sm_counts[resource_index_pucch_split]));
+                CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_pucch_split], &actual_split_groups[resource_index_pucch_split], &resource_to_split, &devResources[resource_index_pucch_split+1], use_flags, min_sm_counts[resource_index_pucch_split]));
 
 		pucchMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pucch_split], "PUCCH", print_resources, use_workqueues, wq_concurrency_limit_of_1);
 		mpsCtxList.push_back(pucchMpsCtx);
@@ -610,7 +679,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                 }
 
 
-		CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_pdsch_split], &actual_split_groups[resource_index_pdsch_split], &initial_device_GPU_resources, &devResources[resource_index_pdsch_split+1], use_flags, min_sm_counts[resource_index_pdsch_split]));
+		CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_pdsch_split], &actual_split_groups[resource_index_pdsch_split], &initial_device_GPU_resources, &devResources[resource_index_pdsch_split+1], use_flags, min_sm_counts[resource_index_pdsch_split]));
 		pdschMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_pdsch_split], "PDSCH", print_resources, use_workqueues, wq_concurrency_limit_of_2 + wq_concurrency_limit_mmimo_add_on);
 		mpsCtxList.push_back(pdschMpsCtx);
 		dlMpsCtx = pdschMpsCtx;
@@ -621,7 +690,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		unsigned int resource_index_dl_ctrl_split = 8;  //index into devResources
 		actual_split_groups[resource_index_dl_ctrl_split] = 1;
 		min_sm_counts[resource_index_dl_ctrl_split] = getMpsSmDlCtrl();
-		CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_dl_ctrl_split], &actual_split_groups[resource_index_dl_ctrl_split], &initial_device_GPU_resources, &devResources[resource_index_dl_ctrl_split+1], use_flags, min_sm_counts[resource_index_dl_ctrl_split]));
+		CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_dl_ctrl_split], &actual_split_groups[resource_index_dl_ctrl_split], &initial_device_GPU_resources, &devResources[resource_index_dl_ctrl_split+1], use_flags, min_sm_counts[resource_index_dl_ctrl_split]));
 		dlCtrlMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_dl_ctrl_split], "DL Ctrl", print_resources, use_workqueues, wq_concurrency_limit_of_2);
 		mpsCtxList.push_back(dlCtrlMpsCtx);
 		csiRsMpsCtx = dlCtrlMpsCtx;
@@ -647,7 +716,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		min_sm_counts[resource_index_ul_order_split] = getMpsSmUlOrder();
                 CUdevResource pusch_split = {};
                 puschMpsCtx->getResources(&pusch_split); // we need to get the resources from the green context we had created and resplit
-		CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_ul_order_split], &actual_split_groups[resource_index_ul_order_split], &pusch_split, &devResources[resource_index_ul_order_split+1], use_flags, min_sm_counts[resource_index_ul_order_split]));
+		CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_ul_order_split], &actual_split_groups[resource_index_ul_order_split], &pusch_split, &devResources[resource_index_ul_order_split+1], use_flags, min_sm_counts[resource_index_ul_order_split]));
                 ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split]);
 		mpsCtxList.push_back(ulMpsCtx);
 		NVLOGC_FMT(TAG, "UL order green context with SM count of {}.", devResources[resource_index_ul_order_split].sm.smCount);
@@ -660,7 +729,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		if (complement_of_pusch_split.sm.smCount <= getMpsSmUlOrder()){ // Exception!
 			NVLOGC_FMT(TAG, "Doing an exceptional GC split for order kernel. You are advised to not assign that many SMs to PUSCH!");
 			min_sm_counts[resource_index_ul_order_split] = getMpsSmUlOrder();
-                        CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_ul_order_split], &actual_split_groups[resource_index_ul_order_split], &initial_device_GPU_resources, &devResources[resource_index_ul_order_split+1], use_flags, min_sm_counts[resource_index_ul_order_split]));
+                        CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_ul_order_split], &actual_split_groups[resource_index_ul_order_split], &initial_device_GPU_resources, &devResources[resource_index_ul_order_split+1], use_flags, min_sm_counts[resource_index_ul_order_split]));
 			ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split], "UL order", print_resources, use_workqueues, wq_concurrency_limit_of_1 + wq_concurrency_limit_mmimo_add_on);
 			mpsCtxList.push_back(ulMpsCtx);
 			NVLOGC_FMT(TAG, "UL order green context with SM count of {}.", devResources[resource_index_ul_order_split].sm.smCount);
@@ -675,7 +744,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 				min_sm_counts[resource_index_ul_order_split] -= complement_split_modulo_SM_granularity;
 			}
 
-			CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_ul_order_split], &actual_split_groups[resource_index_ul_order_split], &complement_of_pusch_split, &devResources[resource_index_ul_order_split+1], use_flags, min_sm_counts[resource_index_ul_order_split]));
+			CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_ul_order_split], &actual_split_groups[resource_index_ul_order_split], &complement_of_pusch_split, &devResources[resource_index_ul_order_split+1], use_flags, min_sm_counts[resource_index_ul_order_split]));
 			ulMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_ul_order_split+1], "UL order", print_resources, use_workqueues, wq_concurrency_limit_of_1 + wq_concurrency_limit_mmimo_add_on);
 			mpsCtxList.push_back(ulMpsCtx);
 			NVLOGC_FMT(TAG, "UL order green context with SM count of {}.", devResources[resource_index_ul_order_split+1].sm.smCount);
@@ -688,7 +757,10 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 			actual_split_groups[resource_index_gpu_comm_split] = 1;
 #if 1
 			min_sm_counts[resource_index_gpu_comm_split] = getMpsSmGpuComms();
-			CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_gpu_comm_split], &actual_split_groups[resource_index_gpu_comm_split], &initial_device_GPU_resources, &devResources[resource_index_gpu_comm_split+1], use_flags, min_sm_counts[resource_index_gpu_comm_split]));
+			CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_gpu_comm_split], &actual_split_groups[resource_index_gpu_comm_split], &initial_device_GPU_resources, &devResources[resource_index_gpu_comm_split+1], use_flags, min_sm_counts[resource_index_gpu_comm_split]));
+			// WQ concurrency stays at 1; multi-NIC deadlock is avoided by two-phase
+			// PrepareOnly→TriggerOnly submit (see PreparePRBInfo::send_mode), not by
+			// raising WQ concurrency here.
 			gpuCommsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_gpu_comm_split], "GPU comm", print_resources, use_workqueues, wq_concurrency_limit_of_1);
 			mpsCtxList.push_back(gpuCommsMpsCtx);
 
@@ -697,7 +769,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                         // Force 0 overlap of DL SMs with gpu-comm SMs.. 
 			min_sm_counts[resource_index_gpu_comm_split] = gpuMaxSmCount - getMpsSmGpuComms();
                         //FIXME check and round up?
-			CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_gpu_comm_split], &actual_split_groups[resource_index_gpu_comm_split], &initial_device_GPU_resources, &devResources[resource_index_gpu_comm_split+1], use_flags, min_sm_counts[resource_index_gpu_comm_split]));
+			CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_gpu_comm_split], &actual_split_groups[resource_index_gpu_comm_split], &initial_device_GPU_resources, &devResources[resource_index_gpu_comm_split+1], use_flags, min_sm_counts[resource_index_gpu_comm_split]));
 			gpuCommsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_gpu_comm_split+1]);
 			mpsCtxList.push_back(gpuCommsMpsCtx);
 
@@ -715,7 +787,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		    actual_split_groups[resource_index_srs_split] = 1;
 #if 1
 		    min_sm_counts[resource_index_srs_split] = getMpsSmSrs();
-		    CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_srs_split], &actual_split_groups[resource_index_srs_split], &resource_to_split_for_srs, &devResources[resource_index_srs_split+1], use_flags, min_sm_counts[resource_index_srs_split]));
+		    CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_srs_split], &actual_split_groups[resource_index_srs_split], &resource_to_split_for_srs, &devResources[resource_index_srs_split+1], use_flags, min_sm_counts[resource_index_srs_split]));
 			srsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_srs_split], "SRS", print_resources, use_workqueues, wq_concurrency_limit_of_1);
 			mpsCtxList.push_back(srsMpsCtx);
 
@@ -728,7 +800,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		   if ((min_sm_counts[resource_index_srs_split] > SM_granularity) && (complement_split_modulo_SM_granularity != 0)) {
 			min_sm_counts[resource_index_srs_split] -= complement_split_modulo_SM_granularity;
 	           }
-		   CU_CHECK_PHYDRIVER(cuDevSmResourceSplitByCount(&devResources[resource_index_srs_split], &actual_split_groups[resource_index_srs_split], &resource_to_split_for_srs, &devResources[resource_index_srs_split+1], use_flags, min_sm_counts[resource_index_srs_split]));
+		   CUDA_DRIVER_CHECK(cuDevSmResourceSplitByCount(&devResources[resource_index_srs_split], &actual_split_groups[resource_index_srs_split], &resource_to_split_for_srs, &devResources[resource_index_srs_split+1], use_flags, min_sm_counts[resource_index_srs_split]));
 		   srsMpsCtx = new MpsCtx((phydriver_handle)this, gpu_device, &devResources[resource_index_srs_split+1]);
 		   mpsCtxList.push_back(srsMpsCtx);
 
@@ -740,7 +812,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                 if(use_workqueues) {
 
                     CUdevResource initial_WQ_config_resources = {};
-                    CU_CHECK_PHYDRIVER(cuDeviceGetDevResource(device,
+                    CUDA_DRIVER_CHECK(cuDeviceGetDevResource(device,
                                                               &initial_WQ_config_resources,
                                                               CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
                     unsigned int initial_device_wqs = initial_WQ_config_resources.wqConfig.wqConcurrencyLimit; // should match CUDA_DEVICE_MAX_CONNECTIONS
@@ -750,7 +822,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
                     unsigned int requested_wq_count = 0;
                     for (auto gc : mpsCtxList) {
                         CUdevResource wq_config_resource{};
-                        CU_CHECK_PHYDRIVER(cuGreenCtxGetDevResource(gc->getGreenCtx(), &wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
+                        CUDA_DRIVER_CHECK(cuGreenCtxGetDevResource(gc->getGreenCtx(), &wq_config_resource, CU_DEV_RESOURCE_TYPE_WORKQUEUE_CONFIG));
                         if(wq_config_resource.wqConfig.sharingScope == CU_WORKQUEUE_SCOPE_GREEN_CTX_BALANCED)
                         {
                             requested_wq_count += wq_config_resource.wqConfig.wqConcurrencyLimit;
@@ -821,49 +893,96 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 		}
         }
 
-        // Force loading of kernels for CUDA 13.0 (temp. workaround to avoid dyn. memory allocation during first kernel launch)
-        // Not handling cases of templated kernels; for these mem. tracing is explicitly disabled
-        const char* memtrace_env = std::getenv("AERIAL_MEMTRACE");
-        if((memtrace_env != nullptr) && std::atoi(memtrace_env) == 1)
+        // Resolve CUfunction handles for order kernels (used by cuLaunchKernel).
+        // Non-kernel_order handles are resolved under the UL MPS context.
+        ulMpsCtx->setCtx();
+        if(!init_order_kernel_functions(order_kerns_))
         {
-            force_loading_generic_cuda_kernels();
-            force_loading_order_kernels();
+            PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve order kernel CUfunction handles");
+        }
+        if(!init_generic_cuda_kernel_functions(generic_kerns_))
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve generic kernel CUfunction handles");
+        }
+
+        // kernel_order and warmup_kernel must be resolved per MPS context since CUfunction handles are context-specific.
+        puschMpsCtx->setCtx();
+        if(!resolve_kernel_order_handle(&order_kerns_.kernel_order_pusch))
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve kernel_order for PUSCH context");
+        }
+        CUfunction warmup_kernel_pusch{};
+        if(!resolve_warmup_kernel_handle(&warmup_kernel_pusch))
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve warmup_kernel for PUSCH context");
+        }
+        pucchMpsCtx->setCtx();
+        if(!resolve_kernel_order_handle(&order_kerns_.kernel_order_pucch))
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve kernel_order for PUCCH context");
+        }
+        CUfunction warmup_kernel_pucch{};
+        if(!resolve_warmup_kernel_handle(&warmup_kernel_pucch))
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve warmup_kernel for PUCCH context");
+        }
+        prachMpsCtx->setCtx();
+        if(!resolve_kernel_order_handle(&order_kerns_.kernel_order_prach))
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve kernel_order for PRACH context");
+        }
+        CUfunction warmup_kernel_prach{};
+        if(!resolve_warmup_kernel_handle(&warmup_kernel_prach))
+        {
+            PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve warmup_kernel for PRACH context");
+        }
+        if(this->enable_srs)
+        {
+            srsMpsCtx->setCtx();
+            if(!resolve_kernel_order_handle(&order_kerns_.kernel_order_srs))
+            {
+                PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve kernel_order for SRS context");
+            }
         }
 
         if(gpuCommDlEnabled())
         {
 	    gpuCommsMpsCtx->setCtx();
-	    CUDA_CHECK_PHYDRIVER(cudaEventCreateWithFlags(&gpu_comm_prepare_done, cudaEventDisableTiming));
+	    CUDA_DRIVER_CHECK(cuEventCreate(&gpu_comm_prepare_done, CU_EVENT_DISABLE_TIMING));
         }
 
         ulMpsCtx->setCtx();
-        CUDA_CHECK(cudaStreamCreateWithPriority(&stream_order_srs_pd, cudaStreamNonBlocking, -5));
-        CUDA_CHECK(cudaStreamCreateWithPriority(&stream_order_pd, cudaStreamNonBlocking, -5));
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&stream_order_srs_pd, CU_STREAM_NON_BLOCKING, -5));
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&stream_order_pd, CU_STREAM_NON_BLOCKING, -5));
+
+        // Prime device printf allocation in the UL order context before traffic.
+        launch_order_kernel_printf_warmup(order_kerns_.order_kernel_printf_warmup, stream_order_pd);
+        CUDA_DRIVER_CHECK(cuStreamSynchronize(stream_order_pd));
 
         if(enable_ok_tb)
         {
             for (int cell_idx=0;cell_idx<UL_MAX_CELLS_PER_SLOT;cell_idx++)
             {
-                CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&fh_buf_ok_tb[cell_idx],MAX_PKTS_PER_SLOT_OK_TB*getConfigOkTbMaxPacketSize()*MAX_UL_SLOTS_OK_TB));
-                CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&config_ok_tb[cell_idx],sizeof(ok_tb_config_info_t)));
-                CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&fh_buf_ok_tb_srs[cell_idx],MAX_PKTS_PER_SLOT_OK_TB*getConfigOkTbMaxPacketSize()*MAX_UL_SLOTS_OK_TB));
-                CUDA_CHECK_PHYDRIVER(cudaMallocHost((void**)&config_ok_tb_srs[cell_idx],sizeof(ok_tb_config_srs_info_t)));
+                CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&fh_buf_ok_tb[cell_idx],MAX_PKTS_PER_SLOT_OK_TB*getConfigOkTbMaxPacketSize()*MAX_UL_SLOTS_OK_TB));
+                CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&config_ok_tb[cell_idx],sizeof(ok_tb_config_info_t)));
+                CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&fh_buf_ok_tb_srs[cell_idx],MAX_PKTS_PER_SLOT_OK_TB*getConfigOkTbMaxPacketSize()*MAX_UL_SLOTS_OK_TB));
+                CUDA_DRIVER_CHECK(cuMemAllocHost((void**)&config_ok_tb_srs[cell_idx],sizeof(ok_tb_config_srs_info_t)));
             }
             setConfigOkTbNumSlots(0);
             setConfigOkTbSrsNumSlots(0);
         }
 
         puschMpsCtx->setCtx();
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pusch[PHASE1_SPLIT_STREAM1], cudaStreamNonBlocking, -2));
-        warmupStream(aggr_stream_pusch[PHASE1_SPLIT_STREAM1]);
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pusch[PHASE2_SPLIT_STREAM1], cudaStreamNonBlocking, -2));
-        warmupStream(aggr_stream_pusch[PHASE2_SPLIT_STREAM1]);
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pusch[PHASE1_SPLIT_STREAM1], CU_STREAM_NON_BLOCKING, -2));
+        warmupStream(order_kerns_.kernel_order_pusch, warmup_kernel_pusch, aggr_stream_pusch[PHASE1_SPLIT_STREAM1]);
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pusch[PHASE2_SPLIT_STREAM1], CU_STREAM_NON_BLOCKING, -2));
+        warmupStream(order_kerns_.kernel_order_pusch, warmup_kernel_pusch, aggr_stream_pusch[PHASE2_SPLIT_STREAM1]);
         if(splitUlCudaStreamsEnabled())
         {
-            CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pusch[PHASE1_SPLIT_STREAM2], cudaStreamNonBlocking, 0));
-            warmupStream(aggr_stream_pusch[PHASE1_SPLIT_STREAM2]);
-            CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pusch[PHASE2_SPLIT_STREAM2], cudaStreamNonBlocking, 0));
-            warmupStream(aggr_stream_pusch[PHASE2_SPLIT_STREAM2]);
+            CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pusch[PHASE1_SPLIT_STREAM2], CU_STREAM_NON_BLOCKING, 0));
+            warmupStream(order_kerns_.kernel_order_pusch, warmup_kernel_pusch, aggr_stream_pusch[PHASE1_SPLIT_STREAM2]);
+            CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pusch[PHASE2_SPLIT_STREAM2], CU_STREAM_NON_BLOCKING, 0));
+            warmupStream(order_kerns_.kernel_order_pusch, warmup_kernel_pusch, aggr_stream_pusch[PHASE2_SPLIT_STREAM2]);
         }
         aggr_last_pusch = 0;
 
@@ -874,38 +993,38 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
         if(this->mMIMO_enable)
         {
             ulBfwMpsCtx->setCtx();
-            CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_ulbfw, cudaStreamNonBlocking, -2));
+            CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_ulbfw, CU_STREAM_NON_BLOCKING, -2));
             aggr_last_ulbfw = 0;
             for(int i = 0; i < getUlbfwAggrPerCtx(); i++)
                 aggr_ulbfw_items.push_back(std::unique_ptr<PhyUlBfwAggr>(new PhyUlBfwAggr((phydriver_handle)this, gpu_device, aggr_stream_ulbfw, ulBfwMpsCtx)));
 
             for(int i=0;i<SLOTS_PER_FRAME;i++)
             {
-                CUDA_CHECK(cudaEventCreateWithFlags(&ulbfw_run_completion_event[i], cudaEventDisableTiming));
+                CUDA_DRIVER_CHECK(cuEventCreate(&ulbfw_run_completion_event[i], CU_EVENT_DISABLE_TIMING));
             }
         }
 
         pucchMpsCtx->setCtx();
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pucch[0], cudaStreamNonBlocking, -3));
-        warmupStream(aggr_stream_pucch[0]);
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pucch[0], CU_STREAM_NON_BLOCKING, -3));
+        warmupStream(order_kerns_.kernel_order_pucch, warmup_kernel_pucch, aggr_stream_pucch[0]);
 
         if(splitUlCudaStreamsEnabled())
         {
-            CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pucch[1], cudaStreamNonBlocking, -1));
-            warmupStream(aggr_stream_pucch[1]);
+            CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pucch[1], CU_STREAM_NON_BLOCKING, -1));
+            warmupStream(order_kerns_.kernel_order_pucch, warmup_kernel_pucch, aggr_stream_pucch[1]);
         }
         aggr_last_pucch = 0;
         for(int i = 0; i < getPucchAggrPerCtx(); i++)
             aggr_pucch_items.push_back(std::unique_ptr<PhyPucchAggr>(new PhyPucchAggr((phydriver_handle)this, gpu_device, aggr_stream_pucch, pucchMpsCtx)));
 
         prachMpsCtx->setCtx();
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_prach[0], cudaStreamNonBlocking, -3));
-        warmupStream(aggr_stream_prach[0]);
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_prach[0], CU_STREAM_NON_BLOCKING, -3));
+        warmupStream(order_kerns_.kernel_order_prach, warmup_kernel_prach, aggr_stream_prach[0]);
 
         if(splitUlCudaStreamsEnabled())
         {
-            CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_prach[1], cudaStreamNonBlocking, -1));
-            warmupStream(aggr_stream_prach[1]);
+            CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_prach[1], CU_STREAM_NON_BLOCKING, -1));
+            warmupStream(order_kerns_.kernel_order_prach, warmup_kernel_prach, aggr_stream_prach[1]);
         }
 
         aggr_last_prach = 0;
@@ -915,16 +1034,30 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
         if(this->enable_srs) //Move SRS Phy aggregate object creation under enable srs flag for memory savings
         {
             srsMpsCtx->setCtx();
-            CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_srs, cudaStreamNonBlocking, -2));
+            CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_srs, CU_STREAM_NON_BLOCKING, -2));
             aggr_last_srs = 0;
             for(int i = 0; i < getSrsAggrPerCtx(); i++)
                 aggr_srs_items.push_back(std::unique_ptr<PhySrsAggr>(new PhySrsAggr((phydriver_handle)this, gpu_device, aggr_stream_srs, srsMpsCtx)));
 
         }
 
+        // H2D copy manager owns the H2D stream, events, and batched-memcpy state.
+        // Must be created before PhyPdschAggr objects (they access getH2DCpyStream).
+        {
+            uint32_t h2d_wait = 500000; // default 0.5 ms
+            if (!ctx_cfg.dl_wait_th_list.empty())
+            {
+                h2d_wait = ctx_cfg.dl_wait_th_list[0];
+            }
+            m_h2dCopyMgr = std::make_unique<PdschH2DCopyManager>(
+                pdschMpsCtx,
+                ctx_cfg.use_batched_memcpy,
+                h2d_wait,
+                ctx_cfg.h2d_cpy_th_cfg.enable_h2d_copy_thread);
+        }
+
         pdschMpsCtx->setCtx();
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pdsch, cudaStreamNonBlocking, -4));
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&H2D_TB_CPY_stream, cudaStreamNonBlocking, -4));
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pdsch, CU_STREAM_NON_BLOCKING, -4));
         aggr_last_pdsch = 0;
         for(int i = 0; i < PHY_PDSCH_AGGR_X_CTX; i++)
             aggr_pdsch_items.push_back(std::unique_ptr<PhyPdschAggr>(new PhyPdschAggr((phydriver_handle)this, gpu_device, aggr_stream_pdsch, pdschMpsCtx)));
@@ -935,29 +1068,23 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
         d_dl_buffers_addr = cuphy::make_unique_device<CleanupDlBufInfo>(PDSCH_MAX_CELLS_PER_CELL_GROUP * DL_HELPER_MEMSET_BUFFERS_PER_CTX);
         mf.addGpuRegularSize(sizeof(CleanupDlBufInfo) * PDSCH_MAX_CELLS_PER_CELL_GROUP * DL_HELPER_MEMSET_BUFFERS_PER_CTX);
 
-        for(int i=0;i<MAX_PDSCH_TB_CPY_CUDA_EVENTS;i++)
-        {
-            CUDA_CHECK(cudaEventCreate(&pdsch_tb_cpy_start[i]));
-            CUDA_CHECK(cudaEventCreate(&pdsch_tb_cpy_complete[i]));
-        }
-
         if(this->mMIMO_enable)
         {
             // Set the DL BFW stream priority lower (-3) than  the PDSCH stream (priority -4),
             // to prioritize PDSCH whenever possible. Both streams are under the same MPS/Green context
-            CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_dlbfw, cudaStreamNonBlocking, -3));
+            CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_dlbfw, CU_STREAM_NON_BLOCKING, -3));
             aggr_last_dlbfw = 0;
             for(int i = 0; i < PHY_DLBFW_AGGR_X_CTX; i++)
                 aggr_dlbfw_items.push_back(std::unique_ptr<PhyDlBfwAggr>(new PhyDlBfwAggr((phydriver_handle)this, gpu_device, aggr_stream_dlbfw, dlBfwMpsCtx)));
 
             for(int i=0;i<SLOTS_PER_FRAME;i++)
             {
-                CUDA_CHECK(cudaEventCreateWithFlags(&dlbfw_run_completion_event[i], cudaEventDisableTiming));
+                CUDA_DRIVER_CHECK(cuEventCreate(&dlbfw_run_completion_event[i], CU_EVENT_DISABLE_TIMING));
             }
         }
 
         pdcchMpsCtx->setCtx();
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pdcch, cudaStreamNonBlocking, -4));
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pdcch, CU_STREAM_NON_BLOCKING, -4));
 
         aggr_last_pdcch_dl = 0;
         for(int i = 0; i < PHY_PDCCH_DL_AGGR_X_CTX; i++)
@@ -966,14 +1093,14 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
         for(int i = 0; i < PHY_PDCCH_UL_AGGR_X_CTX; i++)
             aggr_pdcch_ul_items.push_back(std::unique_ptr<PhyPdcchAggr>(new PhyPdcchAggr((phydriver_handle)this, gpu_device, aggr_stream_pdcch, pdcchMpsCtx, slot_command_api::channel_type::PDCCH_UL)));
         pbchMpsCtx->setCtx();
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_pbch, cudaStreamNonBlocking, -4));
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_pbch, CU_STREAM_NON_BLOCKING, -4));
 
         aggr_last_pbch = 0;
         for(int i = 0; i < PHY_PBCH_AGGR_X_CTX; i++)
             aggr_pbch_items.push_back(std::unique_ptr<PhyPbchAggr>(new PhyPbchAggr((phydriver_handle)this, gpu_device, aggr_stream_pbch, pbchMpsCtx)));
         //Using same context as PDSCH
         csiRsMpsCtx->setCtx();
-        CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&aggr_stream_csirs, cudaStreamNonBlocking, -4));
+        CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&aggr_stream_csirs, CU_STREAM_NON_BLOCKING, -4));
         aggr_last_csirs = 0;
         for(int i = 0; i < PHY_CSIRS_AGGR_X_CTX; i++)
             aggr_csirs_items.push_back(std::unique_ptr<PhyCsiRsAggr>(new PhyCsiRsAggr((phydriver_handle)this, gpu_device, aggr_stream_csirs, csiRsMpsCtx)));
@@ -984,9 +1111,9 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
     }
 
     dlMpsCtx->setCtx();
-    CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&stream_timing_dl, cudaStreamNonBlocking, -1));
+    CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&stream_timing_dl, CU_STREAM_NON_BLOCKING, -1));
     ulMpsCtx->setCtx();
-    CUDA_CHECK_PHYDRIVER(cudaStreamCreateWithPriority(&stream_timing_ul, cudaStreamNonBlocking, -1));
+    CUDA_DRIVER_CHECK(cuStreamCreateWithPriority(&stream_timing_ul, CU_STREAM_NON_BLOCKING, -1));
 
     /* Internal GPU-init comm will be created in default DL ctx */
     if(gpuCommDlEnabled())
@@ -998,31 +1125,31 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
         if (fh_proxy->registerNic(nic_cfg, ctx_cfg.gpu_id))
             PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "NIC registration error");
     }
+
+    fw_cplane_svc_ = std::make_unique<FrameworkCPlaneService>(
+        FrameworkCPlaneService::Config{fapi_to_cplane_direct});
+
     setDlCtx();
+    if(!resolve_memset_kernel_handle(&memset_kernel_dl_))
+    {
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve memset_kernel CUfunction handle");
+    }
+    if(!resolve_kernel_wait_eq_handle(&kernel_wait_eq_dl_))
+    {
+        PHYDRIVER_THROW_EXCEPTIONS(EINVAL, "Failed to resolve kernel_wait_eq CUfunction handle for DL context");
+    }
     updateCellConfigCellId = -1;
     active = false;
-    num_pdsch_buff_copy = 0;
-    enable_prepone_h2d_cpy = false;
-    h2d_write_idx=0;
-    h2d_read_idx=0;
-
-    std::fill(h2d_copy_done_cur_slot_idx.begin(), h2d_copy_done_cur_slot_idx.end(), -1);
-    std::fill(h2d_copy_cuda_event_rec_done.begin(), h2d_copy_cuda_event_rec_done.end(), false);
-
-    h2d_copy_done_cur_slot_read_idx = 0;
-    h2d_copy_done_cur_slot_write_idx = 0;
-    reset_h2d_copy_prepone_info();
+    // H2D state (prepone ring, atomics, flags) initialized by PdschH2DCopyManager constructor.
 
     if(ctx_cfg.h2d_cpy_th_cfg.enable_h2d_copy_thread)
     {
-        //Create h2d copy prepone thread
-        std::thread t;
-        t = std::thread(&l1_copy_TB_to_gpu_buf_thread_func, (void*)this);
-        h2d_cpy_thread.swap(t);
+        m_h2dCopyMgr->copyThread() = std::jthread([this](std::stop_token st) {
+            l1_copy_TB_to_gpu_buf_thread_func(this, std::move(st));
+        });
 
-        int name_st = pthread_setname_np(h2d_cpy_thread.native_handle(), "h2dcpy_thread");
-
-        if (name_st != 0 )
+        int name_st = pthread_setname_np(m_h2dCopyMgr->copyThread().native_handle(), "h2dcpy_thread");
+        if (name_st != 0)
         {
             NVLOGE_FMT(TAG, AERIAL_THREAD_API_EVENT ,"h2d_prepone_cpy_thread Thread pthread_setname_np failed with status: {}",std::strerror(name_st));
         }
@@ -1030,14 +1157,11 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
         sched_param sch;
         int         policy;
         int         status = 0;
-        //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
 
-        //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
-        // Set thread CPU affinity
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(ctx_cfg.h2d_cpy_th_cfg.h2d_copy_thread_cpu_affinity, &cpuset);
-        status = pthread_setaffinity_np(h2d_cpy_thread.native_handle(), sizeof(cpu_set_t), &cpuset);
+        status = pthread_setaffinity_np(m_h2dCopyMgr->copyThread().native_handle(), sizeof(cpu_set_t), &cpuset);
         if(status)
         {
             NVLOGE_FMT(TAG, AERIAL_THREAD_API_EVENT, "h2d_prepone_cpy_thread setaffinity_np  failed with status : {}" , std::strerror(status));
@@ -1045,8 +1169,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
 
         if(ctx_cfg.h2d_cpy_th_cfg.h2d_copy_thread_sched_priority>0)
         {
-            // Set thread priority
-            status = pthread_getschedparam(h2d_cpy_thread.native_handle(), &policy, &sch);
+            status = pthread_getschedparam(m_h2dCopyMgr->copyThread().native_handle(), &policy, &sch);
             if(status != 0)
             {
                 NVLOGE_FMT(TAG, AERIAL_THREAD_API_EVENT, "h2d_prepone_cpy_thread pthread_getschedparam failed with status : {}", std::strerror(status));
@@ -1054,7 +1177,7 @@ PhyDriverCtx::PhyDriverCtx(const context_config& ctx_cfg) :
             sch.sched_priority = ctx_cfg.h2d_cpy_th_cfg.h2d_copy_thread_sched_priority;
 
 #ifdef ENABLE_SCHED_FIFO_ALL_RT
-            status = pthread_setschedparam(h2d_cpy_thread.native_handle(), SCHED_FIFO, &sch);
+            status = pthread_setschedparam(m_h2dCopyMgr->copyThread().native_handle(), SCHED_FIFO, &sch);
             if(status != 0)
             {
                 NVLOGE_FMT(TAG, AERIAL_THREAD_API_EVENT, "h2d_prepone_cpy_thread setschedparam failed with status : {}" , std::strerror(status));
@@ -1199,14 +1322,9 @@ PhyDriverCtx::~PhyDriverCtx()
         mf_acc.init((phydriver_handle)this, std::string("Accumulator"), sizeof(MemFoot));
         mf_acc.reset();
 
-        if(h2d_copy_thread_enable) // h2d_copy_thread_enable is reset later in the destructor too
+        if (m_h2dCopyMgr)
         {
-            try {
-                h2d_cpy_thread.detach();
-            } catch(const std::exception& e) {
-                printf("EXCEPTION detaching h2d_cpy_thread: %s\n", e.what());
-                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "EXCEPTION detaching h2d_cpy_thread: {}", e.what());
-            }
+            m_h2dCopyMgr->stopThread();
         }
 
         if(ul_pcap_capture_enable)
@@ -1252,7 +1370,7 @@ PhyDriverCtx::~PhyDriverCtx()
                     std::ofstream outFile(filename, std::ios::binary);
                     outFile.write(reinterpret_cast<const char*>(fh_buf_ok_tb[cell_idx]), MAX_PKTS_PER_SLOT_OK_TB*getConfigOkTbMaxPacketSize()*MAX_UL_SLOTS_OK_TB);
                     outFile.close();
-                    cudaFreeHost(fh_buf_ok_tb[cell_idx]);
+                    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(fh_buf_ok_tb[cell_idx]));
                 }
                 if(getConfigOkTbSrsNumSlots() > 0)
                 {
@@ -1260,7 +1378,7 @@ PhyDriverCtx::~PhyDriverCtx()
                     std::ofstream outFile(filename, std::ios::binary);
                     outFile.write(reinterpret_cast<const char*>(fh_buf_ok_tb_srs[cell_idx]), MAX_PKTS_PER_SLOT_OK_TB*getConfigOkTbMaxPacketSize()*MAX_UL_SLOTS_OK_TB);
                     outFile.close();
-                    cudaFreeHost(fh_buf_ok_tb_srs[cell_idx]);
+                    CUDA_DRIVER_CHECK_NON_FATAL(cuMemFreeHost(fh_buf_ok_tb_srs[cell_idx]));
                 }
             }
             if(getConfigOkTbNumSlots() > 0)
@@ -1404,54 +1522,47 @@ PhyDriverCtx::~PhyDriverCtx()
         NVLOGI_FMT(TAG, "Aggr items destroyed");
 
         try {
-            cudaStreamDestroy(stream_order_pd);
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(stream_order_pd));
             if(this->enable_srs)
             {
-                cudaStreamDestroy(aggr_stream_srs);
+                CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_srs));
             }
             if(this->mMIMO_enable)
             {
-                cudaStreamDestroy(aggr_stream_ulbfw);
-                cudaStreamDestroy(aggr_stream_dlbfw);
+                CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_ulbfw));
+                CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_dlbfw));
             }
-            cudaStreamDestroy(stream_order_srs_pd);
-            cudaStreamDestroy(aggr_stream_pusch[PHASE1_SPLIT_STREAM1]);
-            cudaStreamDestroy(aggr_stream_pusch[PHASE2_SPLIT_STREAM1]);
-            cudaStreamDestroy(aggr_stream_pucch[0]);
-            cudaStreamDestroy(aggr_stream_prach[0]);
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(stream_order_srs_pd));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pusch[PHASE1_SPLIT_STREAM1]));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pusch[PHASE2_SPLIT_STREAM1]));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pucch[0]));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_prach[0]));
 
             if(splitUlCudaStreamsEnabled())
             {
-                cudaStreamDestroy(aggr_stream_pusch[PHASE1_SPLIT_STREAM2]);
-                cudaStreamDestroy(aggr_stream_pusch[PHASE2_SPLIT_STREAM2]);
-                cudaStreamDestroy(aggr_stream_pucch[1]);
-                cudaStreamDestroy(aggr_stream_prach[1]);
+                CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pusch[PHASE1_SPLIT_STREAM2]));
+                CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pusch[PHASE2_SPLIT_STREAM2]));
+                CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pucch[1]));
+                CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_prach[1]));
             }
 
-            cudaStreamDestroy(aggr_stream_pdsch);
-            cudaStreamDestroy(aggr_stream_pdcch);
-            cudaStreamDestroy(aggr_stream_pbch);
-            cudaStreamDestroy(aggr_stream_csirs);
-            cudaStreamDestroy(H2D_TB_CPY_stream);
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pdsch));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pdcch));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_pbch));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(aggr_stream_csirs));
 
-            cudaStreamDestroy(stream_timing_ul);
-            cudaStreamDestroy(stream_timing_dl);
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(stream_timing_ul));
+            CUDA_DRIVER_CHECK_NON_FATAL(cuStreamDestroy(stream_timing_dl));
 
             NVLOGI_FMT(TAG, "Aggr streams destroyed");
         } catch(const std::exception& e) {
-            printf("EXCEPTION in cudaStreamDestroy: %s\n", e.what());
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "EXCEPTION in cudaStreamDestroy: {}", e.what());
+            printf("EXCEPTION in cuStreamDestroy: %s\n", e.what());
+            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "EXCEPTION in cuStreamDestroy: {}", e.what());
         }
 
-        try {
-            for(int i = 0; i < MAX_PDSCH_TB_CPY_CUDA_EVENTS; i++) {
-                CUDA_CHECK_PHYDRIVER(cudaEventDestroy(pdsch_tb_cpy_start[i]));
-                CUDA_CHECK_PHYDRIVER(cudaEventDestroy(pdsch_tb_cpy_complete[i]));
-            }
-            NVLOGI_FMT(TAG, "PDSCH TB copy events destroyed");
-        } catch(const std::exception& e) {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "EXCEPTION in cudaEventDestroy for pdsch_tb_cpy events: {}", e.what());
-        }
+        // H2D stream, events, and thread cleanup handled by m_h2dCopyMgr destructor.
+        m_h2dCopyMgr.reset();
+        NVLOGI_FMT(TAG, "PDSCH H2D copy manager destroyed");
 
         /*
         * Ensure FH termination
@@ -1576,20 +1687,11 @@ PhyDriverCtx::~PhyDriverCtx()
         wip_accum_mf.addMF(task_list_debug->mf);
         task_list_debug.reset();
 
-        std::fill(h2d_copy_cuda_event_rec_done.begin(), h2d_copy_cuda_event_rec_done.end(), false);
-        h2d_write_idx=0;
-        h2d_read_idx=0;
-        h2d_copy_thread_enable=0;
+        // Manager's thread was already detached above; final cleanup deferred to m_h2dCopyMgr.reset().
 
-        if(this->mMIMO_enable)
+        if(cv_srs_chest_memory_bank)
         {
-    #if 1
             mf_acc.addMF(cv_srs_chest_memory_bank->mf);
-            //wip_accum_mf.addMf(cv_srs_chest_memory_bank->mf);
-    #else
-            mf_acc.addMF(cv_memory_bank->mf);
-            //wip_accum_mf.addMf(cv_memory_bank->mf);
-    #endif
             mf_acc.printMemoryFootprint();
             wip_accum_mf.addMF(mf_acc);
             mf_acc.reset();
@@ -1675,7 +1777,7 @@ PhyDriverCtx::~PhyDriverCtx()
         NVLOGC_FMT(TAG, "Total GPU pinned memory {} B / {} KiB / {} MiB", ctx_tot_gpu_pinned_memory , (ctx_tot_gpu_pinned_memory/1024) , ((ctx_tot_gpu_pinned_memory/1024)/1024));
 #endif
 
-        // FIXME: cudaStreamDestroy()
+        // FIXME: cuStreamDestroy()
         wip_accum_mf.printMemoryFootprint();
 
         printf("PhyDriverCtx destructor completed successfully\n");
@@ -1941,6 +2043,13 @@ int PhyDriverCtx::setCellPhyByMplane(struct cell_phy_info& cell_pinfo)
         return -1;
     }
 
+    // Check if the phy_cell_id already exists in cell_index_map before setting the phy static parameters
+    if(cell_index_map.find(cell_pinfo.phy_stat.phyCellId) != cell_index_map.end())
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "phy_cell_id {} already exists in cell_index_map", cell_pinfo.phy_stat.phyCellId);
+        return -1;
+    }
+
     ret = cell_ptr->setPhyStatic(cell_pinfo);
     if(ret)
     {
@@ -2073,6 +2182,21 @@ Cell* PhyDriverCtx::getCellById(cell_id_t c_id)
     return it->second.get();
 }
 
+Cell* PhyDriverCtx::getCellByIdx(uint32_t idx)
+{
+    const auto it = std::find_if(
+        cell_map.begin(),
+        cell_map.end(),
+        [idx](const auto& entry) {
+            Cell* c = entry.second.get();
+            return c != nullptr && c->getIdx() == idx;
+        });
+    if (it == cell_map.end()) {
+        return nullptr;
+    }
+    return it->second.get();
+}
+
 Cell* PhyDriverCtx::getCellByPhyId(uint16_t c_phy_id)
 {
     auto it = cell_index_map.find(c_phy_id);
@@ -2080,6 +2204,24 @@ Cell* PhyDriverCtx::getCellByPhyId(uint16_t c_phy_id)
         return nullptr;
 
     return getCellById(it->second);
+}
+
+bool PhyDriverCtx::phyCellIdMismatch(uint16_t c_phy_id_old, uint16_t c_phy_id_new, cell_id_t cell_id) const
+{
+    auto it = cell_index_map.find(c_phy_id_old);
+    if(it == cell_index_map.end())
+    {
+        NVLOGW_FMT(TAG, "{}: Cell {} old phyCellId={} not found in cell_index_map", __func__, cell_id, c_phy_id_old);
+        return true;
+    }
+
+    auto new_it = cell_index_map.find(c_phy_id_new);
+    if(new_it != cell_index_map.end() && new_it->second != cell_id)
+    {
+        NVLOGW_FMT(TAG, "{}: Cell {} new phyCellId={} already exists in Cell {}", __func__, cell_id, c_phy_id_new, new_it->second);
+        return true;
+    }
+    return false;
 }
 
 //Change the phyCellId of an existing entry in cell_index_map
@@ -2170,7 +2312,7 @@ int PhyDriverCtx::removeCell(uint16_t cid)
                  * If there are no workers in the system (simulation, benchmarks, errors)
                  * the cell and the PUSCH obj will never be freed
                  */
-                if(worker_ul_map.size() == 0)
+                if(worker_ul_map.empty())
                 {
                     NVLOGD_FMT(TAG, "No active workers, cleaning up");
                     phy_cell_list[i].second->release();
@@ -2380,12 +2522,12 @@ cudaStream_t* PhyDriverCtx::getUlOrderStreamsPrach()
     return aggr_stream_prach;
 }
 
-void PhyDriverCtx::warmupStream(cudaStream_t stream)
+void PhyDriverCtx::warmupStream(CUfunction kernel_order_func, CUfunction warmup_kernel_func, cudaStream_t stream)
 {
     GpuDevice* gpu_device = getFirstGpu();
-    launch_kernel_warmup(stream);
-    launch_kernel_order(stream, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
-    launch_kernel_order(stream, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_warmup(warmup_kernel_func, stream);
+    launch_kernel_order(kernel_order_func, stream, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_order(kernel_order_func, stream, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
     gpu_device->synchronizeStream(stream);
     return;
 }
@@ -2748,30 +2890,30 @@ PhyDlBfwAggr* PhyDriverCtx::getNextDlBfwAggr(slot_params_aggr* aggr_slot_params)
 //DL BFW
 void PhyDriverCtx::recordDlBFWCompletion(int slot)
 {
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(dlbfw_run_completion_event[slot], aggr_stream_dlbfw));
+    CUDA_DRIVER_CHECK(cuEventRecord(dlbfw_run_completion_event[slot], aggr_stream_dlbfw));
 }
 
 int PhyDriverCtx::queryDlBFWCompletion(int slot)
 {
-    cudaError_t cudaStatus = cudaEventQuery(dlbfw_run_completion_event[slot]);
-    return (cudaStatus == cudaSuccess);
+    CUresult cuStatus = cuEventQuery(dlbfw_run_completion_event[slot]);
+    return (cuStatus == CUDA_SUCCESS);
 }
 
-cudaError_t PhyDriverCtx::queryDlBFWCompletion_v2(int slot)
+CUresult PhyDriverCtx::queryDlBFWCompletion_v2(int slot)
 {
-    return cudaEventQuery(dlbfw_run_completion_event[slot]);
+    return cuEventQuery(dlbfw_run_completion_event[slot]);
 }
 
 //UL BFW
 void PhyDriverCtx::recordUlBFWCompletion(int slot)
 {
-    CUDA_CHECK_PHYDRIVER(cudaEventRecord(ulbfw_run_completion_event[slot], aggr_stream_ulbfw));
+    CUDA_DRIVER_CHECK(cuEventRecord(ulbfw_run_completion_event[slot], aggr_stream_ulbfw));
 }
 
 int PhyDriverCtx::queryUlBFWCompletion(int slot)
 {
-    cudaError_t cudaStatus = cudaEventQuery(ulbfw_run_completion_event[slot]);
-    return (cudaStatus == cudaSuccess);
+    CUresult cuStatus = cuEventQuery(ulbfw_run_completion_event[slot]);
+    return (cuStatus == CUDA_SUCCESS);
 }
 
 PhyPdschAggr* PhyDriverCtx::getNextPdschAggr(slot_params_aggr* aggr_slot_params)
@@ -2842,7 +2984,9 @@ PhyPdcchAggr* PhyDriverCtx::getNextPdcchDlAggr(slot_params_aggr* aggr_slot_param
     {
         tmp->setDynAggrParams(aggr_slot_params);
         if(tmp->getDynParams() == nullptr)
+        {
             tmp->release();
+        }
     }
 
     return tmp;
@@ -2853,8 +2997,15 @@ PhyPdcchAggr* PhyDriverCtx::getNextPdcchUlAggr(slot_params_aggr* aggr_slot_param
     PhyPdcchAggr* tmp = nullptr;
     int       cnt = 0;
 
-    if(aggr_pdcch_ul_items.size() < PHY_PDCCH_UL_AGGR_X_CTX)
+    if constexpr (PHY_PDCCH_UL_AGGR_X_CTX == 0)
+    {
         return nullptr;
+    }
+
+    if(aggr_pdcch_ul_items.size() < PHY_PDCCH_UL_AGGR_X_CTX)
+    {
+        return nullptr;
+    }
 
     aggr_lock_cell_phy_pdcch_ul.lock();
 
@@ -2988,8 +3139,9 @@ int PhyDriverCtx::updateCellConfig(cell_id_t cell_id, cell_phy_info& cell_pinfo)
 int PhyDriverCtx::createPrachObjects()
 {
     int32_t val = 0;
-    for(uint32_t i = 0; i < aggr_prach_items.size(); i++)
-        val += aggr_prach_items[i]->createNewPhyObj();
+    for (auto& item : aggr_prach_items) {
+        val += item->createNewPhyObj();
+    }
     if(0 == val)
     {
         aggr_lock_cell_phy_prach.lock();
@@ -3018,16 +3170,27 @@ ru_type PhyDriverCtx::get_ru_type_for_srs_proc() const
 int PhyDriverCtx::deletePrachObjects()
 {
     NVLOGI_FMT(TAG, "Delete prach objects start");
-    for(uint32_t i = 0; i < aggr_prach_items.size(); i++)
-        aggr_prach_items[i]->deleteTempPhyObj();
+    for (auto& item : aggr_prach_items) {
+        item->deleteTempPhyObj();
+    }
     NVLOGI_FMT(TAG, "Delete prach objects end");
     return 0;
 }
 
+int PhyDriverCtx::replacePrachObjectsCallerRuns()
+{
+    for (auto& item : aggr_prach_items) {
+        item->changePhyObj();
+    }
+    num_new_prach_handles = 0;
+    return deletePrachObjects();
+}
+
 int PhyDriverCtx::replacePrachObjects()
 {
-    for(uint32_t i = 0; i < aggr_prach_items.size(); i++)
-        aggr_prach_items[i]->changePhyObj();
+    for (auto& item : aggr_prach_items) {
+        item->changePhyObj();
+    }
     num_new_prach_handles = 0;
     NVLOGI_FMT(TAG, "launch a new thread delete_prach_obj");
     pthread_t thread_id;
@@ -3035,6 +3198,26 @@ int PhyDriverCtx::replacePrachObjects()
     return 0;
 }
 
+/**
+ * @brief Return true when at least one configured cell is active.
+ *
+ * @thread_safety Scans cell_map without locking. Safe only because the
+ *   caller-runs reconfig path that calls this (and the CONFIG/START/STOP
+ *   handlers that mutate cell state) all serialize through the single
+ *   non-slot LP worker thread, so no concurrent cell_map mutation occurs.
+ */
+[[nodiscard]] bool PhyDriverCtx::hasActiveCells() const
+{
+    for (const auto& entry : cell_map)
+    {
+        Cell* cell = entry.second.get();
+        if (cell != nullptr && cell->isActive())
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 /////////////////////////////////////////////////////////////////////
 //// FhProxy
@@ -3117,9 +3300,9 @@ int PhyDriverCtx::start()
         wavgcfo_manager = std::make_unique<WAvgCfoPoolManager>(static_cast<phydriver_handle>(this), gpu_device, fhproxy->getFhInstance());
     }
 
-    if(this->enable_srs) //Moving the CV Memory bank allocation code under enable_srs flag for Memory savings
+    if(this->enable_srs) // CvSrsChestMemoryBank allocated whenever SRS is enabled (4T4R and muMIMO)
     {
-        cv_srs_chest_memory_bank = std::make_unique<CvSrsChestMemoryBank>((phydriver_handle)this, gpu_device, total_num_srs_chest_buffers);
+        cv_srs_chest_memory_bank = std::make_unique<CvSrsChestMemoryBank>((phydriver_handle)this, gpu_device, total_num_srs_chest_buffers, max_srs_antenna_ports);
     }
 
     if(prometheus_cpu_core >= 0)
@@ -3231,6 +3414,10 @@ uint32_t PhyDriverCtx::getUlSrsAggr3TaskLaunchOffsetNs() const {
     return ul_srs_aggr3_task_launch_offset_ns;
 }
 
+uint32_t PhyDriverCtx::getUlSrsTask1OrderLaunchOffsetNs() const {
+    return ul_srs_task1_order_launch_offset_ns;
+}
+
 uint32_t PhyDriverCtx::getUlOrderTimeoutLogInterval() const {
     return ul_order_timeout_log_interval_ns;
 }
@@ -3255,6 +3442,22 @@ bool PhyDriverCtx::isCPlaneDisabled() const {
     return cplane_disable;
 }
 
+bool PhyDriverCtx::isFapiToCplaneDirect() const {
+    return fapi_to_cplane_direct;
+}
+
+uint8_t PhyDriverCtx::getCplaneProcessingDlBatchSize() const {
+    return cplane_processing_dl_batch_size;
+}
+
+uint8_t PhyDriverCtx::getCplaneProcessingUlBatchSize() const {
+    return cplane_processing_ul_batch_size;
+}
+
+std::size_t PhyDriverCtx::getCplaneMaxConcurrentTransactions() const {
+    return cplane_max_concurrent_transactions;
+}
+
 uint32_t PhyDriverCtx::getUlOrderTimeoutFirstPktGPU() const {
     return ul_order_timeout_first_pkt_gpu_ns;
 }
@@ -3277,6 +3480,18 @@ WAvgCfoPoolManager * PhyDriverCtx::getWAvgCfoPoolManager() const {
 
 CvSrsChestMemoryBank* PhyDriverCtx::getCvSrsChestMemoryBank() const {
     return cv_srs_chest_memory_bank.get();
+}
+
+uint16_t PhyDriverCtx::getMaxSrsAntennaPorts() const {
+    return max_srs_antenna_ports;
+}
+
+uint16_t PhyDriverCtx::getMaxDlAntennaPorts() const {
+    return max_dl_antenna_ports;
+}
+
+uint16_t PhyDriverCtx::getMaxUlAntennaPorts() const {
+    return max_ul_antenna_ports;
 }
 
 uint8_t PhyDriverCtx::getUseGreenContexts() const {
@@ -3542,6 +3757,41 @@ uint8_t PhyDriverCtx::getmMIMO_enable(void) const {
     return mMIMO_enable;
 }
 
+uint16_t PhyDriverCtx::getNicMtu(uint32_t nic_index) const {
+    return nic_configs_.at(nic_index).nic_mtu;
+}
+
+FrameworkCPlaneService* PhyDriverCtx::getFrameworkCPlaneService() {
+    return fw_cplane_svc_.get();
+}
+
+/**
+ * Record one prior-slot direct BFW CVI completion into the framework C-plane service.
+ *
+ * @param[in] cell_id SDK cell index the record belongs to.
+ * @param[in] record Producer-built BFW completion record.
+ * @return 0 on success, -1 if the service is absent or validation fails.
+ */
+[[nodiscard]] int PhyDriverCtx::recordDirectBfwCviRecord(const uint16_t cell_id, const direct_bfw_cvi_record& record) {
+    FrameworkCPlaneService* svc = getFrameworkCPlaneService();
+    if (svc == nullptr) {
+        return -1;
+    }
+    return svc->record_bfw_cvi(cell_id, record);
+}
+
+std::vector<Cell*> PhyDriverCtx::getSortedCells() const {
+    MemtraceDisableScope md;
+    std::vector<Cell*> cells;
+    cells.reserve(cell_map.size());
+    for (auto& [id, cell_ptr] : cell_map) {
+        cells.push_back(cell_ptr.get());
+    }
+    std::sort(cells.begin(), cells.end(),
+              [](const Cell* a, const Cell* b) { return a->getIdx() < b->getIdx(); });
+    return cells;
+}
+
 uint8_t PhyDriverCtx::get_enable_srs(void) const {
     return enable_srs;
 }
@@ -3566,14 +3816,9 @@ uint32_t PhyDriverCtx::getAggr_obj_non_avail_th(void) const {
     return aggr_obj_non_avail_th;
 }
 
-uint32_t PhyDriverCtx::geth2d_copy_wait_th(void) const {
-    return h2d_copy_wait_th;
-}
+// geth2d_copy_wait_th is now an inline forwarding accessor in context.hpp
 
-void PhyDriverCtx::reset_h2d_copy_prepone_info()
-{
-    std::fill(h2d_cpy_info.begin(), h2d_cpy_info.end(), h2d_copy_prepone_info_t{});
-}
+// reset_h2d_copy_prepone_info is now an inline forwarding accessor in context.hpp
 
 uint32_t PhyDriverCtx::getcuphy_dl_channel_wait_th(void) const {
     return cuphy_dl_channel_wait_th;
@@ -3650,29 +3895,8 @@ void* PhyDriverCtx::getDlDBuffersAddr(int index)
     return (CleanupDlBufInfo*)d_dl_buffers_addr.get() + (index & (DL_HELPER_MEMSET_BUFFERS_PER_CTX - 1))*PDSCH_MAX_CELLS_PER_CELL_GROUP;
 }
 
-void PhyDriverCtx::updateBatchedMemcpyInfo(void* dst_addr, void* src_addr, size_t count)
-{
-#if 0
-    // If condition should never evaluate to true, since resetBatchedMemcpyBatches() is called when an L2 slot is dropped from cuphyl2adapter
-    if (m_batchedMemcpyHelper.useBatchedMemcpy() &&  m_batchedMemcpyHelper.getMaxMemcopiesCount() <= batched_copies)
-    {
-        NVLOGE_FMT(TAG, AERIAL_THREAD_API_EVENT, "updateBatchedMemcpyInfo will error out because max count {} <= requested count of {}; reset memcpy count beforehand", m_batchedMemcpyHelper.getMaxMemcopiesCount(), batched_copies); // Behavior observed when a slot was dropped due to profiling overhead (when running through nsys). Resetting the count is a possible workaround.
-        resetBatchedMemcpyBatches();
-    }
-#endif
-    // batched_copies is a member variable updated on every such call. Needs to be reset via  resetBatchedMemcpyBatches().
-    m_batchedMemcpyHelper.updateMemcpy(dst_addr, src_addr, count, cudaMemcpyHostToDevice, H2D_TB_CPY_stream);
-}
-
-cuphyStatus_t PhyDriverCtx::performBatchedMemcpy()
-{
-    return m_batchedMemcpyHelper.launchBatchedMemcpy(H2D_TB_CPY_stream);
-}
-
-void PhyDriverCtx::resetBatchedMemcpyBatches()
-{
-    m_batchedMemcpyHelper.reset();
-}
+// updateBatchedMemcpyInfo, performBatchedMemcpy, resetBatchedMemcpyBatches are now
+// inline forwarding accessors in context.hpp delegating to PdschH2DCopyManager.
 
 bool PhyDriverCtx::getEnableTxNotification() const
 {
@@ -3889,4 +4113,3 @@ uint16_t PhyDriverCtx::getMaxHarqTxCountBundled() const {
 uint16_t PhyDriverCtx::getMaxHarqTxCountNonBundled() const {
     return max_harq_tx_count_non_bundled;
 }
-

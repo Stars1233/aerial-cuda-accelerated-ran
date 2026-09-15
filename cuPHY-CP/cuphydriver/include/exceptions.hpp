@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -74,6 +74,28 @@ public:
     {                                                        \
         NVLOGE_FMT(TAG_EXCP, AERIAL_CUPHYDRV_API_EVENT, "{} {} line {} uncaught exception", __FILE__, __func__, __LINE__); \
         return EINVAL;                                       \
+    }
+
+/**
+ * @brief Exception catching macro for void API functions
+ *
+ * Same logging as PHYDRIVER_CATCH_EXCEPTIONS but returns from the function with no value.
+ */
+#define PHYDRIVER_CATCH_EXCEPTIONS_VOID()                    \
+    catch(pd_exc_h const& e)                                 \
+    {                                                        \
+        NVLOGE_FMT(TAG_EXCP, AERIAL_CUPHYDRV_API_EVENT, "{} {} line {} exception: {}", __FILE__, __func__, __LINE__, e.what()); \
+        return;                                              \
+    }                                                        \
+    catch(std::exception const& e)                           \
+    {                                                        \
+        NVLOGE_FMT(TAG_EXCP, AERIAL_CUPHYDRV_API_EVENT, "{} {} line {} exception: {}", __FILE__, __func__, __LINE__, e.what()); \
+        return;                                              \
+    }                                                        \
+    catch(...)                                               \
+    {                                                        \
+        NVLOGE_FMT(TAG_EXCP, AERIAL_CUPHYDRV_API_EVENT, "{} {} line {} uncaught exception", __FILE__, __func__, __LINE__); \
+        return;                                              \
     }
 
 /**

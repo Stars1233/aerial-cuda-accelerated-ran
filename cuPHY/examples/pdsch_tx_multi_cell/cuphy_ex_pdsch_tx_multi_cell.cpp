@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,13 +17,15 @@
 
 #include "util.hpp"
 #include "pdsch_tx.hpp"
+#include "cuphy_channels.hpp"
+#include "datasets.hpp"
+#include <optional>
 #include <list>
 #include <fstream>
 #include "test_config.hpp"
 
-//#define _READ_TB_CRC_ 1
-
-#define PDSCH_TB_INPUT_ON_GPU 0 //FIXME set to 1 if you want to test the TB buffers in GPU mode for cuPHY standalone
+#define _READ_TB_CRC_ 0 // Can set to 1, if needed. Not passed through cli right now. Shall we extend it?
+#define PRINT_PDSCH_CONFIG 0 // Set to 1 for dbg purposes
 
 using namespace cuphy;
 using Clock     = std::chrono::high_resolution_clock;
@@ -38,7 +40,7 @@ void usage()
 {
     printf("  Options:\n");
     printf("    -h                          Display usage information\n");
-    printf("    -i  input_filename          Input yaml file for slot/cell config \n");
+    printf("    -i  input_filename          Input file (yaml for slot/cell config or single h5 file)\n");
     printf("    -r  # of iterations         Number of run iterations to run\n");
     printf("    -d  # of microseconds       Delay kernel duration in us\n");
     printf("    -k                          Enable reference check. Compare GPU output with test vector.\n");
@@ -48,7 +50,11 @@ void usage()
     printf("    -c  cpu_id                  cpu_id used for CPU affinity setting.\n");
     printf("    -p  priority                Thread priority.\n");
     printf("    -a  alignment               Byte alignment between TBs for the same cell. Default is 1-byte alignment\n");
+    printf("    -b                          Use asynchronous batched memcpy when copying the PDSCH input buffers.\n");
+    printf("    -t                          PDSCH TB input buffers located on the device, instead of the host.\n");
     printf("    --G SM count                Use green contexts with specified SM count per context.\n");
+    printf("    --P pipeline mode           0 (default) - full processing; 1 - AAS processing (single-cell only); 2 - post-FEC processing; 3 - post-FEC and RM scrambling processing.\n");
+    printf("    --D delay(usec)             Delay in microseconds for kernel modeling FEC processing\n");
 }
 
 int main(int argc, char* argv[])
@@ -68,6 +74,7 @@ int main(int argc, char* argv[])
     std::string inputFileName;
     uint32_t    num_iterations      = 1;
     bool        ref_check_pdsch     = false;
+    bool        use_batched_memcpy  = false;
     int         cfg_process_mode    = 0;
     int         cfg_priority        = 0;
     int         cfg_cpu_id          = -1;
@@ -78,6 +85,17 @@ int main(int argc, char* argv[])
     int forced_TB_byte_alignment = 1; // 1 byte alignment by default
     bool     useGreenCtxs       = false;
     uint32_t SMsPerGreenCtx     = 0;
+    bool     pdsch_TB_input_on_GPU = false;
+    bool     read_TB_CRC           = (_READ_TB_CRC_ == 1); //false by default
+    int      cfg_pipeline_mode_index = 0; // default is full slot processing
+    constexpr int PDSCH_PROCESSING_MODES = 4;
+    std::string pipeline_modes_str[PDSCH_PROCESSING_MODES] = {"PDSCH_FULL_PROCESSING", "PDSCH_AAS_PROCESSING", "PDSCH_POST_FEC_PROCESSING", "PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING"};
+    cuphyPdschPipelineMode_t pipeline_modes[PDSCH_PROCESSING_MODES] = {cuphyPdschPipelineMode_t::PDSCH_FULL_PROCESSING,
+                                                                       cuphyPdschPipelineMode_t::PDSCH_AAS_PROCESSING,
+                                                                       cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING,
+                                                                       cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING};
+    cuphyPdschPipelineMode_t pdsch_pipeline_mode = pipeline_modes[cfg_pipeline_mode_index]; // to be updated later
+    uint32_t fec_delay_usec = 0;
 
     while(iArg < argc)
     {
@@ -92,7 +110,7 @@ int main(int argc, char* argv[])
             case 'i':
                 if(++iArg >= argc)
                 {
-                    NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,  "ERROR: No filename provided.");
+                    NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,  "ERROR: No filename provided.");
                 }
                 inputFileName.assign(argv[iArg++]);
                 break;
@@ -113,6 +131,14 @@ int main(int argc, char* argv[])
                 break;
             case 'k':
                 ref_check_pdsch = true;
+                ++iArg;
+                break;
+            case 'b':
+                use_batched_memcpy = true;
+                ++iArg;
+                break;
+            case 't':
+                pdsch_TB_input_on_GPU = true;
                 ++iArg;
                 break;
             case 's':
@@ -163,6 +189,26 @@ int main(int argc, char* argv[])
                         }
                         ++iArg;
                         break;
+                    case 'P':
+                        if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%i", &cfg_pipeline_mode_index)))
+                        {
+                            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid or missing pipeline mode argument (--P)");
+                            exit(1);
+                        }
+                        ++iArg;
+                        break;
+                    case 'D':
+                    {
+                        int parsed_fec_delay_usec = 0;
+                        if(((++iArg >= argc) || (1 != sscanf(argv[iArg], "%i", &parsed_fec_delay_usec))) || (parsed_fec_delay_usec < 0))
+                        {
+                            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid or missing fec delay in usec argument (--D)");
+                            exit(1);
+                        }
+                        fec_delay_usec = static_cast<uint32_t>(parsed_fec_delay_usec);
+                        ++iArg;
+                        break;
+                    }
                     default:
                         NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,  "ERROR: Unknown option: {}", argv[iArg]);
                         usage();
@@ -188,36 +234,32 @@ int main(int argc, char* argv[])
         exit(1);
     }
 
-    cuphy::test_config testCfg(inputFileName.c_str());
-    testCfg.print();
-    int num_cells = testCfg.num_cells(); // The same number of cells is present across all slots.
-    int num_slots = testCfg.num_slots();
-    const std:: string channelName = "PDSCH";
-
-    std::vector<std::string>  hdf5_filenames;
-    std::ifstream tvs_list_file;
-
-    int enable_homogeneous_mode = 0;
-    int cfg_aas_mode = 0;
-    bool ref_check = false;
-    bool aas_mode = (cfg_aas_mode >= 1);
-    bool graphs_mode = (cfg_process_mode >= 1);
-    std::string pipeline_mode = (aas_mode) ? "AAS" : "non AAS";
-    std::string graphs_streams_mode_string = (graphs_mode) ? "Graphs" : "Streams";
-    cuphyPdschProcMode_t tmp_pdsch_proc_mode = (graphs_mode) ? PDSCH_PROC_MODE_GRAPHS : PDSCH_PROC_MODE_NO_GRAPHS;
-    uint64_t pdsch_proc_mode = tmp_pdsch_proc_mode;
-    pdsch_proc_mode |= PDSCH_INTER_CELL_BATCHING; // not needed; inter cell batching is applied regardless of this flag
-
     const int gpuId = 0; // select GPU device 0
     CUDA_CHECK(cudaSetDevice(gpuId));
+    CUdevice current_device;
+    CU_CHECK(cuDeviceGet(&current_device, gpuId));
+
     CUmoduleLoadingMode mode{};
     CUresult status = cuModuleGetLoadingMode(&mode);
     if (status != CUDA_SUCCESS) NVLOGC_FMT(NVLOG_PDSCH, "cuModuleGetLoading returned {}", status);
     NVLOGC_FMT(NVLOG_PDSCH, "mode {} (reminder EAGER_LOADING is {} while lazy is {})", mode, CU_MODULE_EAGER_LOADING, CU_MODULE_LAZY_LOADING);
 
+    if ((cfg_pipeline_mode_index < 0) || (cfg_pipeline_mode_index >= PDSCH_PROCESSING_MODES))
+    {
+        NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT,  "ERROR: Invalid --P argument {}. Needs to be in [0, {}] range.", cfg_pipeline_mode_index, PDSCH_PROCESSING_MODES - 1);
+        exit(1);
+    }
+    else
+    {
+        if ((group_cells) && (cfg_pipeline_mode_index == 1))
+        {
+            NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT,  "ERROR: --P 1 not supported with -g");
+            exit(1);
+        }
+    }
+    pdsch_pipeline_mode = pipeline_modes[cfg_pipeline_mode_index];
+
 #if CUDA_VERSION >= 12040
-    CUdevice current_device;
-    CU_CHECK(cuDeviceGet(&current_device, gpuId));
     CUdevResource initial_device_GPU_resources = {};
     CUdevResourceType default_resource_type = CU_DEV_RESOURCE_TYPE_SM; // other alternative is CU_DEV_RESOURCE_TYPE_INVALID
     unsigned int split_groups = 1;
@@ -253,375 +295,117 @@ int main(int argc, char* argv[])
     }
 #endif
 
+    // Determine input filename type (.yaml or h5)
+    std::string inputFileExtn = inputFileName.substr(inputFileName.find_last_of(".") + 1);
+    const std::string channelName = "PDSCH";
+    bool is_yaml = (inputFileExtn == "yaml");
+    std::optional<cuphy::test_config> testCfg;
+
+    if(is_yaml)
+    {
+        testCfg.emplace(inputFileName.c_str());
+        testCfg->print_channel(channelName); // print only PDSCH channel related parts of the input YAML file
+        //testCfg->print(); // print entire YAML file contents, incl. other channels not run with this example
+    }
+    int num_cells = is_yaml ? testCfg->num_cells() : 1; // The same number of cells is present across all slots in case of a yaml
+    int num_slots = is_yaml ? testCfg->num_slots() : 1;
+
+    NVLOGC_FMT(NVLOG_PDSCH, "PDSCH multi-cell with {} cells and {} slots",  num_cells, num_slots);
+
+    bool graphs_mode = (cfg_process_mode >= 1);
+    std::string graphs_streams_mode_string = (graphs_mode) ? "Graphs" : "Streams";
+    bool identical_LDPC_configs = true; // A runtime check resets LDPC configs to non-identical if they are not.
+    cuphyPdschProcMode_t pdsch_proc_mode = (graphs_mode) ? PDSCH_PROC_MODE_GRAPHS : PDSCH_PROC_MODE_NO_GRAPHS;
+    pdsch_proc_mode = static_cast<cuphyPdschProcMode_t>((uint32_t) pdsch_proc_mode | (uint32_t) PDSCH_INTER_CELL_BATCHING); // not needed; inter cell batching is applied regardless of this flag
+
+
     // The Downlink pipeline includes: (a) CRC, (b) LDPC  encoder, (c) Rate-Matching,
     // (d) Modulation Mapper and (e) DMRS components.
 
+    std::vector<std::vector<cuphy::pdsch_tx>>       m_pdschTxPipes;
+    std::vector<std::vector<pdschStaticApiDataset>> m_pdschTxStaticApiDatasets;
+    std::vector<std::vector<pdschDynApiDataset>>    m_pdschTxDynamicApiDatasets;
+
     std::vector<stream>        streams;
-    std::vector<tensor_device> data_tx_tensor(num_cells); // Even if groups_cells is set, num_cells output tensors will exist.
-
-    // Large buffer added as cuPHY-CP needed a buffer with a power of 2 size.  Buffer below is not.
-    size_t                               large_buffer_elements = MAX_N_PRBS_SUPPORTED * CUPHY_N_TONES_PER_PRB * OFDM_SYMBOLS_PER_SLOT * MAX_DL_PORTS; // Per cell
-    size_t                               large_buffer_bytes    = large_buffer_elements * sizeof(__half2); // Per cell
-    unique_device_ptr<__half2> large_buffer                    = make_unique_device<__half2>(num_cells * large_buffer_elements);
-
-    // Reset the entire output buffer.
-    CUDA_CHECK(cudaMemset(large_buffer.get(), 0, num_cells * large_buffer_bytes)); // This is done in the default stream
-
+    cudaEvent_t                start_streams_event;
+    std::vector<cudaEvent_t> stop_streams_events(num_cells);
     const int num_pdsch_objects = group_cells ? 1 : num_cells;
 
-    cudaEvent_t              start_streams_event;
-    std::vector<cudaEvent_t> stop_streams_events(num_cells);
+    m_pdschTxPipes.resize(num_slots);
+    m_pdschTxStaticApiDatasets.resize(num_slots);
+    m_pdschTxDynamicApiDatasets.resize(num_slots);
 
-    std::string                         first_filename = testCfg.slots()[0].at(channelName)[0];
-    std::unique_ptr<hdf5hpp::hdf5_file> tmp_first_file = std::make_unique<hdf5hpp::hdf5_file>(hdf5hpp::hdf5_file(hdf5hpp::hdf5_file::open(first_filename.c_str())));
+    for(int idxSlot = 0; idxSlot < num_slots; idxSlot++) {
+        int cells_in_slot = is_yaml ? testCfg->slots()[idxSlot].at(channelName).size() : 1;
+        if (cells_in_slot != num_cells) {
+            NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Slot {} error: expected {} cells but got {}", idxSlot, num_cells, cells_in_slot);
+        }
+        // Reminder num_pdsch_object is the number of cells, if group_cells is false, or 1 otherwise
+        m_pdschTxStaticApiDatasets[idxSlot].reserve(num_pdsch_objects);
+        m_pdschTxDynamicApiDatasets[idxSlot].reserve(num_pdsch_objects);
 
-    bool use_new_api = tmp_first_file->is_valid_dataset("ue_pars");
-    if(!use_new_api)
-    {
-        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "PDSCH examples no longer support old API TVs.");
-    }
-    tmp_first_file.reset();
-
-
-    std::unique_ptr<cuphyPdschTxHndl_t[]>                pdsch_handle = std::make_unique<cuphyPdschTxHndl_t[]>(num_pdsch_objects);
-    std::vector<cuphyPdschStatPrms_t>                    pdsch_static_params(num_slots * num_pdsch_objects); // Full vector only used in ref_check. Otherwise, only the first num_pdsch_objects elements are used.
-    std::vector<cuphyTracker_t>                          pdsch_trackers(num_slots * num_pdsch_objects);
-    typedef std::vector<cuphyPdschCellGrpDynPrm_t>       dyn_params_vector_t;
-    dyn_params_vector_t                                  cell_dyn_params(1);
-    std::vector<dyn_params_vector_t>                     pdsch_cell_grp_dyn_params(num_slots * num_cells, cell_dyn_params); // Limited to one cell group per pipeline
-    std::vector<std::unique_ptr<hdf5hpp::hdf5_file>>     input_file(num_slots * num_cells); // Even under group_cells, we need to read all TVs and stitch them together.
-#if PDSCH_TB_INPUT_ON_GPU
-    std::vector<typed_tensor<CUPHY_R_8U, device_alloc>>  crc_input_data;
-    std::vector<cuphy::unique_device_ptr<uint8_t>> padded_crc_input_data(num_slots*num_cells);
-#else
-    std::vector<typed_tensor<CUPHY_R_8U, pinned_alloc>>  crc_input_data;
-    std::vector<cuphy::unique_pinned_ptr<uint8_t>> padded_crc_input_data(num_slots*num_cells);
-#endif
-    std::vector<typed_tensor<CUPHY_R_32U, pinned_alloc>> tb_crc_input_data;
-
-    // When group_cells is set, every num_cells elements for each of data_in, tb_crc_data_in and output_data will be processed by a single pipeline.
-    std::vector<cuphyPdschDataIn_t>  data_in(num_slots * num_cells);
-    std::vector<cuphyPdschDataIn_t>  tb_crc_data_in(num_slots * num_cells);
-    std::vector<cuphyPdschDataOut_t> output_data(num_slots * num_cells);
-    std::vector<cuphyPdschStatusOut_t> output_status(num_slots * num_cells);
-
-    std::vector<cuphyPdschDynPrms_t> pdsch_dyn_params(num_slots * num_cells);
-    //NVLOGC_FMT(NVLOG_PDSCH, "num_slots {}, num_cells {}", num_slots, num_cells);
-
-    auto data_in_ptr = std::make_unique<uint8_t*[]>(num_slots * num_cells);
-    auto tb_crc_data_in_ptr = std::make_unique<uint8_t*[]>(num_slots * num_cells);
-
-    if (group_cells) {
-
-        for(int idxSlot = 0; idxSlot < num_slots; idxSlot++)
+        // Loop over all cells (not num_pdsch_objects) to populate the static and dynamic datasets
+        // NB: current implementation of PDSCH static/dynamic datasets implicitly assumes that the static dataset is populated first and then the dynamic, because it relies on some max values
+        // from static. Will thus follow this format to initially limit scope of changes.
+        for(int i = 0; i < num_cells; i += 1)
         {
-            int prev_CWs = 0;
-            int cur_CWs = 0;
-            for(int i = 0; i < num_cells; i += 1) {
-                prev_CWs = cur_CWs;
-                if(idxSlot == 0)
-                {
-                    if (i < num_pdsch_objects) {
-                        streams.emplace_back(cudaStreamNonBlocking, PDSCH_STREAM_PRIORITY);
-                    }
-                    //Even though we're grouping all cells in a slot, each cell will still have its own output tensor buffer.
-                    data_tx_tensor[i] = tensor_device((void*)((__half2*)large_buffer.get() + i * large_buffer_elements),
-                                                               CUPHY_C_16F,
-                                                               CUPHY_N_TONES_PER_PRB * 273,
-                                                               OFDM_SYMBOLS_PER_SLOT, MAX_DL_LAYERS,
-                                                               cuphy::tensor_flags::align_tight); //FIXME For now assuming 273PRBs (max possible)
+            std::string tv_filename = is_yaml ? testCfg->slots()[idxSlot].at(channelName)[i] : inputFileName;
+            if((idxSlot == 0) && (i < num_pdsch_objects)) {
+                streams.emplace_back(cudaStreamNonBlocking, PDSCH_STREAM_PRIORITY);
+            }
 
-                    int data_tx_tensor_bytes = data_tx_tensor[i].desc().get_size_in_bytes();
-                    if(data_tx_tensor_bytes > large_buffer_bytes)
-                    {
-                        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Buffer ({} bytes) is smaller than data_tx_tensor ({})", large_buffer_bytes, data_tx_tensor_bytes);
-                    }
-                }
-                std::string tv_filename = testCfg.slots()[idxSlot].at(channelName)[i];
-                hdf5_filenames.emplace_back(tv_filename);
-                // NVLOGC_FMT(NVLOG_PDSCH, "PdschTx Pipeline {} uses TV {}", i, hdf5_filenames[idxSlot*num_cells+i]);
-
-                input_file[idxSlot * num_cells + i] = std::make_unique<hdf5hpp::hdf5_file>(hdf5hpp::hdf5_file(hdf5hpp::hdf5_file::open(hdf5_filenames[idxSlot * num_cells + i].c_str())));
-
-                //Read static and dynamic parameters per cell
-
-                // Accumulate the static parameters across all cells in each slot idxSlot.
-                // Only the first pdsch_static_params element will be used in the timing runs below. These parameters should be valid for all TVs in subsequent slots.
-                // All pdsch_static_params elements will be used for the reference check before run.
-                cumulative_read_pdsch_static_pars_from_file(pdsch_static_params[idxSlot],
-                                                             *input_file[idxSlot * num_cells + i],
-                                                             hdf5_filenames[idxSlot * num_cells + i].c_str(),
-                                                             ref_check,
-                                                             (i == 0) /* allocate memory for first cell in each slot based on some predefined max values */);
-                pdsch_static_params[idxSlot].pOutInfo = &pdsch_trackers[idxSlot];
-
-                //FIXME Would it help to have an std::map that maps static physical cell Ids to static cell index?
-                //FIXME also some of the dbg params read above (e.g., ref-checks, ldpc nodes) should be the same across all cells
-
-                // Accumulate the cell group dynamic parameters across all cells in each slot idxSlot.
-                cumulative_read_cell_group_dynamic_pars_from_file(pdsch_cell_grp_dyn_params[idxSlot],
-                                                                   *input_file[idxSlot * num_cells + i],
-                                                                   (i == 0) /* allocate memory for first cell in each slot based on some predefined max values */);
-
-                cur_CWs = pdsch_cell_grp_dyn_params[idxSlot][0].nCws;
-                int cell_CWs = cur_CWs - prev_CWs; // the TBs for this cell
-                //At this point input parameters have been parsed for this cell. Print and update tbStartOffset and size
-                for (int tmp_cw = prev_CWs; tmp_cw < cur_CWs; tmp_cw++) {
-                    /*NVLOGC_FMT(NVLOG_PDSCH, "Cell {}, TB {} has tbSize {} and tbStartOffset {}", i, tmp_cw,
-                               pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize,
-                               pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset);*/
-
-                    if (tmp_cw !=  prev_CWs) { // no update needed for first TB in a cell
-                        pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset = round_up_to_next<int>(pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw-1].tbStartOffset + pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw-1].tbSize, forced_TB_byte_alignment);
-                        /*NVLOGC_FMT(NVLOG_PDSCH, "Update for {}-byte alignemnt: Cell {}, TB {} has tbSize {} and tbStartOffset {}", forced_TB_byte_alignment, i, tmp_cw,
-                               pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize,
-                               pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset);*/
-
-                    }
-                }
-                // No need for padding after the last TB in the cell
-                int total_cell_TB_buffer_size = (pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[cur_CWs-1].tbStartOffset + pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[cur_CWs-1].tbSize);
-                //NVLOGC_FMT(NVLOG_PDSCH, "Cell {} has buffer size {}", i, total_cell_TB_buffer_size);
-
-                //Parse input dataset
-                hdf5hpp::hdf5_dataset crc_dataset = (*input_file[idxSlot * num_cells + i]).open_dataset("InputData");
-#if PDSCH_TB_INPUT_ON_GPU
-                crc_input_data.emplace_back(typed_tensor_from_dataset<CUPHY_R_8U, device_alloc>(crc_dataset, cuphy::tensor_flags::align_default, streams[0].handle()));
-                padded_crc_input_data[idxSlot*num_cells + i] = make_unique_device<uint8_t>(total_cell_TB_buffer_size);
-
-                // D to D copies
-                int cumulative_offset = 0;
-                for (int tmp_cw = prev_CWs; tmp_cw < cur_CWs; tmp_cw++) {
-                    CUDA_CHECK(cudaMemcpyAsync((uint8_t*)padded_crc_input_data[idxSlot*num_cells + i].get() + pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset, crc_input_data[idxSlot*num_cells + i].addr() + cumulative_offset, pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize, cudaMemcpyDeviceToDevice, streams[0].handle()));
-                    //memset the padded buffer part to 0.
-                    int padded_bytes = ((tmp_cw == cur_CWs-1) ?  total_cell_TB_buffer_size : pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw+1].tbStartOffset)
-                                       - pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset - pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize;
-                    CUDA_CHECK(cudaMemsetAsync((uint8_t*)(padded_crc_input_data[idxSlot*num_cells + i].get() + pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset + pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize), 0,  padded_bytes, streams[0].handle()));
-                    cumulative_offset += pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize;
-                }
-#else
-                crc_input_data.emplace_back(typed_tensor_from_dataset<CUPHY_R_8U, pinned_alloc>(crc_dataset, cuphy::tensor_flags::align_default, streams[0].handle()));
-                padded_crc_input_data[idxSlot*num_cells + i] = make_unique_pinned<uint8_t>(total_cell_TB_buffer_size);
-
-                // H to H copies
-                int cumulative_offset = 0;
-                for (int tmp_cw = prev_CWs; tmp_cw < cur_CWs; tmp_cw++) {
-                    CUDA_CHECK(cudaMemcpyAsync((uint8_t*)padded_crc_input_data[idxSlot*num_cells + i].get() + pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset, crc_input_data[idxSlot*num_cells + i].addr() + cumulative_offset, pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize, cudaMemcpyHostToHost, streams[0].handle()));
-                    // memset the padded buffer part to 0.
-                    int padded_bytes = ((tmp_cw == cur_CWs-1) ?  total_cell_TB_buffer_size : pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw+1].tbStartOffset)
-                                       - pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset - pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize;
-
-                    //NVLOGC_FMT(NVLOG_PDSCH, "copied for  Cell {}, TB {}; will memset {} bytes to 0", i, tmp_cw, padded_bytes);
-
-                    CUDA_CHECK(cudaMemsetAsync((uint8_t*)(padded_crc_input_data[idxSlot*num_cells + i].get() + pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbStartOffset + pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize), 0,  padded_bytes, streams[0].handle()));
-                    cumulative_offset += pdsch_cell_grp_dyn_params[idxSlot][0].pCwPrms[tmp_cw].tbSize;
-                }
-#endif
-
-#ifdef _READ_TB_CRC_
-                hdf5hpp::hdf5_dataset tb_crc_dataset = (*input_file[idxSlot * num_cells + i]).open_dataset("tbCrcBuffer");
-                tb_crc_input_data.emplace_back(typed_tensor_from_dataset<CUPHY_R_32U, pinned_alloc>(tb_crc_dataset, cuphy::tensor_flags::align_default, streams[0].handle()));
-#endif
-
-                //data_in_ptr[idxSlot * num_cells + i] = crc_input_data[idxSlot * num_cells + i].addr();
-                data_in_ptr[idxSlot * num_cells + i] = padded_crc_input_data[idxSlot * num_cells + i].get(); //change needed to support padding
-#if PDSCH_TB_INPUT_ON_GPU
-                data_in[idxSlot * num_cells + i] = {&data_in_ptr[idxSlot * num_cells + i], cuphyPdschDataIn_t::GPU_BUFFER};
-#else
-                data_in[idxSlot * num_cells + i] = {&data_in_ptr[idxSlot * num_cells + i], cuphyPdschDataIn_t::CPU_BUFFER};
-#endif
-                if (i == 0) pdsch_static_params[idxSlot].full_slot_processing = (!aas_mode);
-#ifdef _READ_TB_CRC_
-                tb_crc_data_in_ptr[idxSlot * num_cells + i] = (uint8_t*)tb_crc_input_data[idxSlot * num_cells + i].addr();
-                tb_crc_data_in[idxSlot * num_cells + i] = {&tb_crc_data_in_ptr[idxSlot * num_cells + i], cuphyPdschDataIn_t::CPU_BUFFER};
-                if (i == 0) pdsch_static_params[idxSlot].read_TB_CRC = true;
-#else
-                tb_crc_data_in[idxSlot * num_cells + i] = {nullptr, cuphyPdschDataIn_t::CPU_BUFFER};
-                if (i == 0) pdsch_static_params[idxSlot].read_TB_CRC = false;
-#endif
-
-                input_file[idxSlot * num_cells + i].reset(); // Close the file; will reopen it later
-
+            if (group_cells) {
                 if (i == 0) {
-                    output_data[idxSlot] = {new cuphyTensorPrm_t[num_cells]};
-                    pdsch_dyn_params[idxSlot] = {streams[0].handle(),
-                                                 pdsch_proc_mode,
-                                                 pdsch_cell_grp_dyn_params[idxSlot].data(),
-                                                 &data_in[idxSlot * num_cells + i] /* pointer to contiguous num_cells elements for data input */,
-                                                 &tb_crc_data_in[idxSlot * num_cells + i] /* pointer to contiguous num_cells elements for PDSCH CRC input */,
-                                                 &output_data[idxSlot] /* pointer to an array of num_cells output tensors */,
-                                                 &output_status[idxSlot] /* pointer to cell group status */};
+                    m_pdschTxStaticApiDatasets[idxSlot].emplace_back(tv_filename, "", ref_check_pdsch, identical_LDPC_configs, PDSCH_STREAM_PRIORITY, num_cells, 0 /*maxNCbsPerTb*/, 0 /*maxNTbs */, 0 /*maxNPRbs*/, use_batched_memcpy, pdsch_pipeline_mode, read_TB_CRC, fec_delay_usec);
+                } else {
+                    // Update static parameters
+                    m_pdschTxStaticApiDatasets[idxSlot][0].cumulativeUpdate(tv_filename, "", ref_check_pdsch, identical_LDPC_configs);
                 }
-                pdsch_dyn_params[idxSlot].pDataOut->pTDataTx[i].desc  = data_tx_tensor[i].desc().handle();
-                pdsch_dyn_params[idxSlot].pDataOut->pTDataTx[i].pAddr = data_tx_tensor[i].addr();
-            }
-            // Print stiched together static and dynamic parameters for each slot
-            //cuphy::print_pdsch_static(&pdsch_static_params[idxSlot]);
-            //cuphy::print_pdsch_dynamic_cell_group(&pdsch_cell_grp_dyn_params[idxSlot][0]);
-            //cuphy::print_pdsch_dynamic(&pdsch_dyn_params[idxSlot]);
+            } else {
+                m_pdschTxStaticApiDatasets[idxSlot].emplace_back(tv_filename, "", ref_check_pdsch, identical_LDPC_configs, PDSCH_STREAM_PRIORITY, 1 /*single cell per pipeline*/,  0 /*maxNCbsPerTb*/, 0 /*maxNTbs */, 0 /*maxNPRbs*/, use_batched_memcpy, pdsch_pipeline_mode, read_TB_CRC, fec_delay_usec);
+                m_pdschTxDynamicApiDatasets[idxSlot].emplace_back(tv_filename, m_pdschTxStaticApiDatasets[idxSlot][i].pdschStatPrms.nMaxCellsPerSlot, streams[i].handle(), pdsch_proc_mode, m_pdschTxStaticApiDatasets[idxSlot][i].pdschStatPrms, pdsch_TB_input_on_GPU, forced_TB_byte_alignment, m_pdschTxStaticApiDatasets[idxSlot][i].getEmax());
+                m_pdschTxPipes[idxSlot].emplace_back(m_pdschTxStaticApiDatasets[idxSlot][i].pdschStatPrms);
             }
         }
-        else
-        {
-            //Not grouping any cells. Could consolidate with if clause later
 
-            for(int idxSlot = 0; idxSlot < num_slots; idxSlot++)
+        // Dynamic now given NB above
+        if (group_cells) {
+            for(int i = 0; i < num_cells; i += 1)
             {
-                for(int i = 0; i < num_cells; i += 1)
-                {
-                    std::string tv_filename = testCfg.slots()[idxSlot].at(channelName)[i];
-                    hdf5_filenames.emplace_back(tv_filename);
-                    //NVLOGC_FMT(NVLOG_PDSCH, "PdschTx Pipeline {} uses TV {}", i, hdf5_filenames[idxSlot*num_cells+i]);
-                    input_file[idxSlot * num_cells + i] = std::make_unique<hdf5hpp::hdf5_file>(hdf5hpp::hdf5_file(hdf5hpp::hdf5_file::open(hdf5_filenames[idxSlot * num_cells + i].c_str())));
+                std::string tv_filename = is_yaml ? testCfg->slots()[idxSlot].at(channelName)[i] : inputFileName;
+                //printf("group_cells slot %d, cell %d has tvname %s\n", idxSlot, i, tv_filename.c_str());
 
-                    if(idxSlot == 0)
-                    {
-                        streams.emplace_back(cudaStreamNonBlocking, PDSCH_STREAM_PRIORITY);
-                        int num_REs = cuphy::get_HDF5_dataset_info((*input_file[idxSlot * num_cells + i]).open_dataset("Xtf")).layout().dimensions()[0];
-                        data_tx_tensor[i] = tensor_device((void*)((__half2*)large_buffer.get() + i * large_buffer_elements),
-                                                                  CUPHY_C_16F, num_REs, OFDM_SYMBOLS_PER_SLOT, MAX_DL_LAYERS,
-                                                                  cuphy::tensor_flags::align_tight);
+                if(i == 0) {
+                    m_pdschTxPipes[idxSlot].emplace_back(m_pdschTxStaticApiDatasets[idxSlot][i].pdschStatPrms);
+                    m_pdschTxDynamicApiDatasets[idxSlot].emplace_back(tv_filename, m_pdschTxStaticApiDatasets[idxSlot][i].pdschStatPrms.nMaxCellsPerSlot, streams[i].handle(), pdsch_proc_mode, m_pdschTxStaticApiDatasets[idxSlot][i].pdschStatPrms, pdsch_TB_input_on_GPU, forced_TB_byte_alignment, m_pdschTxStaticApiDatasets[idxSlot][i].getEmax());
+                } else {
 
-                        int data_tx_tensor_bytes = data_tx_tensor[i].desc().get_size_in_bytes();
-                        if(data_tx_tensor_bytes > large_buffer_bytes)
-                        {
-                            NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Buffer ({} bytes) is smaller than data_tx_tensor ({})", large_buffer_bytes, data_tx_tensor_bytes);
-                        }
-                    }
-
-                    //Read static and dynamic parameters per cell
-                    read_pdsch_static_pars_from_file(pdsch_static_params[idxSlot * num_cells + i], *input_file[idxSlot * num_cells + i],
-                                                     hdf5_filenames[idxSlot * num_cells + i].c_str(), ref_check, true);
-                    read_cell_group_dynamic_pars_from_file(pdsch_cell_grp_dyn_params[idxSlot * num_cells + i], *input_file[idxSlot * num_cells + i]);
-
-                    pdsch_static_params[idxSlot*num_cells + i].pOutInfo = &pdsch_trackers[idxSlot*num_cells + i];
-                    int cfg_num_cells = pdsch_cell_grp_dyn_params[idxSlot * num_cells + i][0].nCells;
-                    if(cfg_num_cells != 1)
-                    {
-                        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Error! # cells = {}, but this example only supports a single cell per pipeline", num_cells);
-                    }
-
-                    //Parse input dataset
-                    hdf5hpp::hdf5_dataset crc_dataset = (*input_file[idxSlot * num_cells + i]).open_dataset("InputData");
-#if PDSCH_TB_INPUT_ON_GPU
-                    crc_input_data.emplace_back(typed_tensor_from_dataset<CUPHY_R_8U, device_alloc>(crc_dataset, cuphy::tensor_flags::align_default, streams[i].handle()));
-#else
-                    crc_input_data.emplace_back(typed_tensor_from_dataset<CUPHY_R_8U, pinned_alloc>(crc_dataset, cuphy::tensor_flags::align_default, streams[i].handle()));
-#endif
-#ifdef _READ_TB_CRC_
-                    hdf5hpp::hdf5_dataset tb_crc_dataset = (*input_file[idxSlot * num_cells + i]).open_dataset("tbCrcBuffer");
-                    tb_crc_input_data.emplace_back(typed_tensor_from_dataset<CUPHY_R_32U, pinned_alloc>(tb_crc_dataset, cuphy::tensor_flags::align_default, streams[i].handle()));
-#endif
-
-                    data_in_ptr[idxSlot * num_cells + i] = crc_input_data[idxSlot * num_cells + i].addr();
-#if PDSCH_TB_INPUT_ON_GPU
-                    data_in[idxSlot * num_cells + i] = {&data_in_ptr[idxSlot * num_cells + i], cuphyPdschDataIn_t::GPU_BUFFER};
-#else
-                    data_in[idxSlot * num_cells + i] = {&data_in_ptr[idxSlot * num_cells + i], cuphyPdschDataIn_t::CPU_BUFFER};
-#endif
-                    pdsch_static_params[idxSlot * num_cells + i].full_slot_processing = (!aas_mode);
-#ifdef _READ_TB_CRC_
-                    tb_crc_data_in_ptr[idxSlot * num_cells + i] = (uint8_t*)tb_crc_input_data[idxSlot * num_cells + i].addr();
-                    tb_crc_data_in[idxSlot * num_cells + i] = {&tb_crc_data_in_ptr[idxSlot * num_cells + i], cuphyPdschDataIn_t::CPU_BUFFER};
-                    pdsch_static_params[idxSlot * num_cells + i].read_TB_CRC = true;
-#else
-                    tb_crc_data_in[idxSlot * num_cells + i] = {nullptr, cuphyPdschDataIn_t::CPU_BUFFER};
-                    pdsch_static_params[idxSlot * num_cells + i].read_TB_CRC = false;
-#endif
-
-                    input_file[idxSlot * num_cells + i].reset();                      // Close the file; will reopen it later
-                    output_data[idxSlot * num_cells + i] = {new cuphyTensorPrm_t[1]}; //single cell per pipeline for now
-
-                    pdsch_dyn_params[idxSlot * num_cells + i]                             = {streams[i].handle(), pdsch_proc_mode, pdsch_cell_grp_dyn_params[idxSlot * num_cells + i].data(), &data_in[idxSlot * num_cells + i], &tb_crc_data_in[idxSlot * num_cells + i], &output_data[idxSlot * num_cells + i], &output_status[idxSlot * num_cells + i]};
-                    pdsch_dyn_params[idxSlot * num_cells + i].pDataOut->pTDataTx[0].desc  = data_tx_tensor[i].desc().handle();
-                    pdsch_dyn_params[idxSlot * num_cells + i].pDataOut->pTDataTx[0].pAddr = data_tx_tensor[i].addr();
-
-                    //cuphy::print_pdsch_static(&pdsch_static_params[idxSlot*num_cells + i]);
-                    //cuphy::print_pdsch_dynamic_cell_group(&pdsch_cell_grp_dyn_params[idxSlot * num_cells + i][0]);
-                    //cuphy::print_pdsch_dynamic(&pdsch_dyn_params[idxSlot*num_cells + i]);
+                    // Update the dynamic parameters
+                    m_pdschTxDynamicApiDatasets[idxSlot][0].cumulativeUpdate(tv_filename, streams[0].handle(), pdsch_proc_mode);
                 }
+            }
         }
+
     }
 
 
-    if(ref_check_pdsch)
-    {
-        // Run all PDSCH pipeline(s) once w/ ref checks enabled
-        NVLOGC_FMT(NVLOG_PDSCH, "");
-        NVLOGC_FMT(NVLOG_PDSCH, "Running all {} DL pipelines once w/ reference checks enabled in {} and {} mode.", num_cells, pipeline_mode, graphs_streams_mode_string);
 
-        for(int idxSlot = 0; idxSlot < num_slots; idxSlot++)
-        {
-            for(int i = 0; i < num_pdsch_objects; i++)
-            {
-                int grouped_cell_index = (group_cells) ? idxSlot : idxSlot * num_cells + i;
-
-                if (group_cells) {
-                  NVLOGC_FMT(NVLOG_PDSCH, "--> idxSlot = {}, idx PDSCH object = {}", idxSlot, i);
-                } else {
-                  NVLOGC_FMT(NVLOG_PDSCH, "--> idxSlot = {}, idxCell = {}", idxSlot, i);
-                }
-
-                /*NVLOGC_FMT(NVLOG_PDSCH, "Pdsch Object {} has {} static cells:", i, pdsch_static_params[grouped_cell_index].nCells);
-                for (int k = 0; k <  pdsch_static_params[grouped_cell_index].nCells; k++)
-                {
-                    NVLOGC_FMT(NVLOG_PDSCH, " - static cell {} with TV name {}", k, pdsch_static_params[grouped_cell_index].pDbg[k].pCfgFileName);
-                }*/
-
-                cuphyStatus_t status = cuphyCreatePdschTx(&pdsch_handle[i], &pdsch_static_params[grouped_cell_index]);
-                if(status != CUPHY_STATUS_SUCCESS)
-                {
-                    NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphyCreatePdschTx(): {}", i, cuphyGetErrorString(status));
-                }
-
-                pdsch_dyn_params[grouped_cell_index] = {streams[i].handle(),
-                                                        pdsch_proc_mode,
-                                                        pdsch_cell_grp_dyn_params[grouped_cell_index].data(),
-                                                        &data_in[idxSlot * num_cells + i],
-                                                        &tb_crc_data_in[idxSlot * num_cells + i],
-                                                        &output_data[grouped_cell_index],
-                                                        &output_status[grouped_cell_index]};
-
-                int tensor_index = (group_cells) ? i : 0;
-                pdsch_dyn_params[grouped_cell_index].pDataOut->pTDataTx[tensor_index].desc  = data_tx_tensor[i].desc().handle();
-                pdsch_dyn_params[grouped_cell_index].pDataOut->pTDataTx[tensor_index].pAddr = data_tx_tensor[i].addr();
-
-                if (group_cells) {
-                    updateRefCheckMultipleCells(pdsch_handle[i], true);
-                } else {
-                    updateRefCheck(pdsch_handle[i], true);
-                }
-
-                status = cuphySetupPdschTx(pdsch_handle[i], &pdsch_dyn_params[grouped_cell_index], nullptr);
-                if(status != CUPHY_STATUS_SUCCESS)
-                {
-                    if (pdsch_dyn_params[grouped_cell_index].pStatusInfo->status == cuphyPdschStatusType_t::CUPHY_PDSCH_STATUS_UNSUPPORTED_MAX_ER_PER_CB) {
-                        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: CUPHY_PDSCH_STATUS_UNSUPPORTED_MAX_ER_PER_CB error in cuphySetupPdschTx(): {}. Triggered by TB {} in cell group and cellPrmStatIdx {}",
-                                      i, cuphyGetErrorString(status), pdsch_dyn_params[grouped_cell_index].pStatusInfo->ueIdx, pdsch_dyn_params[grouped_cell_index].pStatusInfo->cellPrmStatIdx);
-                    } else {
-                        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphySetupPdschTx(): {}", i, cuphyGetErrorString(status));
-                    }
-                    exit(1);
-                }
-
-                status = cuphyRunPdschTx(pdsch_handle[i], pdsch_proc_mode);
-                if(status != CUPHY_STATUS_SUCCESS)
-                {
-                    NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphyRunPdschTx(): {}", i, cuphyGetErrorString(status));
-                }
-
-                streams[i].synchronize();
-
-                status = cuphyDestroyPdschTx(pdsch_handle[i]);
-                if(status != CUPHY_STATUS_SUCCESS)
-                {
-                    NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphyDestroyPdschTx(): {}", i, cuphyGetErrorString(status));
-                }
-
-            } // end of work for one slot
-            CUDA_CHECK(cudaMemset(large_buffer.get(), 0, num_cells * large_buffer_bytes)); // This is done in the default stream
+#if PRINT_PDSCH_CONFIG
+    // Print static/dynamic dataset params for each PDSCH object. For dbg. purposes
+    for(int idxSlot = 0; idxSlot < num_slots; idxSlot++) {
+        NVLOGC_FMT(NVLOG_PDSCH, "======================== Slot {} ===============================", idxSlot);
+        for(int i = 0; i < num_pdsch_objects; i += 1) {
+            NVLOGC_FMT(NVLOG_PDSCH, "======================== PDSCH channel object {} ===============================", i);
+            m_pdschTxStaticApiDatasets[idxSlot][i].print();
+            cuphy::print_pdsch_dynamic(&m_pdschTxDynamicApiDatasets[idxSlot][i].pdsch_dyn_params);
+            //Could also print cell group params as follows
+            m_pdschTxDynamicApiDatasets[idxSlot][i].print();
+            NVLOGC_FMT(NVLOG_PDSCH, "================================================================================");
         }
+        NVLOGC_FMT(NVLOG_PDSCH, "================================================================================");
     }
+#endif
+
     if (cfg_cpu_id >=0)
     {
         cpu_set_t cpuset;
@@ -646,49 +430,21 @@ int main(int argc, char* argv[])
         }
     }
 
-    // There will either be 1 or num_cells PDSCH channel objects depending on if group_cells is set or not.
-    for(int i = 0; i < num_pdsch_objects; i++)
-    {
-        cuphyStatus_t status = cuphyCreatePdschTx(&pdsch_handle[i], &pdsch_static_params[i]);
-        if(status != CUPHY_STATUS_SUCCESS)
-        {
-            NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphyCreatePdschTx(): {}", i, cuphyGetErrorString(status));
-        }
-        // Ref_check here has to be false (a) because no buffers are reset and (b)
-        // because the static parameters which contain filename are not update on every slot, so only the ones from the first slot are used
-        // See commented out printfs below for (b).
-        if (group_cells) {
-            updateRefCheckMultipleCells(pdsch_handle[i], ref_check);
-        } else {
-            updateRefCheck(pdsch_handle[i], ref_check);
-        }
-#if 0
-        NVLOGC_FMT(NVLOG_PDSCH, "Pdsch Object {} has {} static cells:", i, pdsch_static_params[i].nCells);
-        for (int k = 0; k <  pdsch_static_params[i].nCells; k++)
-        {
-            NVLOGC_FMT(NVLOG_PDSCH, " - static cell {} with TV name {}", k, pdsch_static_params[i].pDbg[k].pCfgFileName);
-        }
-#endif
-    }
-
-    // gpu_ms_delay(10, 0, streams[0].handle()); // 10ms delay kernel. Can update/comment out.
-    // CUDA_CHECK(cudaEventRecord(start_streams_event, streams[0].handle()));
-
-    /* Time PDSCH pipeline(s) Run().
-        NB: The following are not timed: Reading the HDF5 file, allocations, memory transfers.
-        Also, the timing code does not include any reference checks as these will currently
-        fail (some buffers need to be reset across iterations).
-    */
     NVLOGC_FMT(NVLOG_PDSCH, "");
-    NVLOGC_FMT(NVLOG_PDSCH, "Timing {} PDSCH DL pipeline(s) Run() w/o reference checks in {} and {} mode.", num_cells, pipeline_mode, graphs_streams_mode_string);
+    NVLOGC_FMT(NVLOG_PDSCH, "Timing {} PDSCH DL pipeline(s). ", num_cells);
     if (group_cells)
     {
         NVLOGC_FMT(NVLOG_PDSCH, "Grouping all cells in a slot.");
+    } else {
+        NVLOGC_FMT(NVLOG_PDSCH, "");
     }
-    NVLOGC_FMT(NVLOG_PDSCH, "- NB: Allocations not included. Ref. checks will fail!");
-    NVLOGC_FMT(NVLOG_PDSCH, "");
+    if (time_setup_mode== 0) {
+        NVLOGC_FMT(NVLOG_PDSCH, "- NB: Allocations, setup processing not included.");
+        NVLOGC_FMT(NVLOG_PDSCH, "");
+    }
 
-    /* PdschTx::Run for all num_cells pipelines will be timed on streams[0].handle() CUDA stream (note, that is NOT stream 0).
+
+    /* PpdschTx::Run for all num_cells pipelines will be timed on streams[0].handle() CUDA stream (note, that is NOT stream 0).
     Have that stream wait for all other streams to complete their work too. */
 
     TimePoint timePtStartSetup, timePtStopSetup;
@@ -712,8 +468,30 @@ int main(int argc, char* argv[])
     }
     CUDA_CHECK(cudaEventCreateWithFlags(&start_streams_event, cudaEventDisableTiming));
 
-    float total_time_slot[num_slots];
+    float total_time_slot[num_slots]; // Total time of a slot divided by number of iterations (num_iterations)
     float total_time_single_cell_slot[num_slots][num_pdsch_objects];
+    //NVLOGC_FMT(NVLOG_PDSCH, "num slots {}, num_pdsch_objects {}", num_slots, num_pdsch_objects);
+
+#if 0
+    if(ref_check_pdsch) {
+        for(int idxSlot = 0; idxSlot < num_slots; idxSlot++)
+        {
+            for(int i = 0; i < num_pdsch_objects; i++)
+            {
+                m_pdschTxPipes[idxSlot][i].setup(m_pdschTxDynamicApiDatasets[idxSlot][i].pdsch_dyn_params, nullptr);
+                m_pdschTxPipes[idxSlot][i].run(static_cast<uint64_t>(pdsch_proc_mode));
+
+                if (group_cells)
+                {
+                    updateRefCheckMultipleCells(m_pdschTxPipes[idxSlot][i].handle() , false);
+                } else {
+                    updateRefCheck(m_pdschTxPipes[idxSlot][i].handle() , false);
+                }
+            }
+        }
+    }
+#endif
+    try {
 
     for(int idxSlot = 0; idxSlot < num_slots; idxSlot++)
     {
@@ -721,46 +499,10 @@ int main(int argc, char* argv[])
         std::vector<float>       total_time_single_cell(num_pdsch_objects, 0);
         std::vector<event_timer> cuphy_timer_single_cell(num_pdsch_objects);
 
-        for(int i = 0; i < num_pdsch_objects; i++)
-        {
-
-            int grouped_cell_index = (group_cells) ? idxSlot : idxSlot * num_cells + i;
-            pdsch_dyn_params[grouped_cell_index]  = {streams[i].handle(),
-                                                     pdsch_proc_mode,
-                                                     pdsch_cell_grp_dyn_params[grouped_cell_index].data(),
-                                                     &data_in[idxSlot * num_cells + i],
-                                                     &tb_crc_data_in[idxSlot * num_cells + i],
-                                                     &output_data[grouped_cell_index],
-                                                     &output_status[grouped_cell_index]};
-            /*NVLOGC_FMT(NVLOG_PDSCH, "idxSlot {}, PDSCH object {} processing {} cells, {} UE groups, {} UEs, {} CWs and {} CSI-RS.",
-                   idxSlot, i, pdsch_dyn_params[grouped_cell_index].pCellGrpDynPrm->nCells,
-                   pdsch_dyn_params[grouped_cell_index].pCellGrpDynPrm->nUeGrps,
-                   pdsch_dyn_params[grouped_cell_index].pCellGrpDynPrm->nUes,
-                   pdsch_dyn_params[grouped_cell_index].pCellGrpDynPrm->nCws,
-                   pdsch_dyn_params[grouped_cell_index].pCellGrpDynPrm->nCsiRsPrms);*/
-
-            if (group_cells) {
-               for (int cell_id = 0; cell_id < num_cells; cell_id++) {
-                   pdsch_dyn_params[grouped_cell_index].pDataOut->pTDataTx[cell_id].desc  = data_tx_tensor[cell_id].desc().handle();
-                   pdsch_dyn_params[grouped_cell_index].pDataOut->pTDataTx[cell_id].pAddr = data_tx_tensor[cell_id].addr();
-               }
-            } else {
-                pdsch_dyn_params[grouped_cell_index].pDataOut->pTDataTx[0].desc  = data_tx_tensor[i].desc().handle();
-                pdsch_dyn_params[grouped_cell_index].pDataOut->pTDataTx[0].pAddr = data_tx_tensor[i].addr();
-            }
-
-            if (time_setup_mode == 0){ // In this mode, setup is not timed
-                cuphyStatus_t status = cuphySetupPdschTx(pdsch_handle[i], &pdsch_dyn_params[grouped_cell_index], nullptr);
-                if(status != CUPHY_STATUS_SUCCESS)
-                {
-                    if (pdsch_dyn_params[grouped_cell_index].pStatusInfo->status == cuphyPdschStatusType_t::CUPHY_PDSCH_STATUS_UNSUPPORTED_MAX_ER_PER_CB) {
-                        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: CUPHY_PDSCH_STATUS_UNSUPPORTED_MAX_ER_PER_CB error in cuphySetupPdschTx(): {}. Triggered by TB {} in cell group and cellPrmStatIdx {}",
-                                      i, cuphyGetErrorString(status), pdsch_dyn_params[grouped_cell_index].pStatusInfo->ueIdx, pdsch_dyn_params[grouped_cell_index].pStatusInfo->cellPrmStatIdx);
-                    } else {
-                        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphySetupPdschTx(): {}", i, cuphyGetErrorString(status));
-                    }
-                    exit(1);
-                }
+        if (time_setup_mode == 0){ // In this mode, setup is not timed
+            for(int i = 0; i < num_pdsch_objects; i++)
+            {
+                m_pdschTxPipes[idxSlot][i].setup(m_pdschTxDynamicApiDatasets[idxSlot][i].pdsch_dyn_params, nullptr);
             }
         }
 
@@ -775,7 +517,6 @@ int main(int argc, char* argv[])
 
         for(int iter = 0; iter < num_iterations; iter++)
         {
-
             auto& elapsedTimeUsSetup      = m_elapsedTimes[ELAPSED_CPU_SETUP][iter];
             auto& elapsedTimeUsRun        = m_elapsedTimes[ELAPSED_CPU_RUN][iter];
 
@@ -790,34 +531,18 @@ int main(int argc, char* argv[])
                 {
                     CUDA_CHECK(cudaStreamWaitEvent(streams[i].handle(), start_streams_event, 0));
                 }
-                cuphy_timer_single_cell[i].record_begin(streams[i].handle());
 
+                cuphy_timer_single_cell[i].record_begin(streams[i].handle());
                 if (time_setup_mode != 0) { // If time_setup_mode is 1 or 2, it is timed
-                    int grouped_cell_index = (group_cells) ? idxSlot : idxSlot * num_cells + i;
                     timePtStartSetup = Clock::now();
-                    cuphyStatus_t status = cuphySetupPdschTx(pdsch_handle[i], &pdsch_dyn_params[grouped_cell_index], nullptr);
+                    m_pdschTxPipes[idxSlot][i].setup(m_pdschTxDynamicApiDatasets[idxSlot][i].pdsch_dyn_params, nullptr);
                     timePtStopSetup = Clock::now();
-                    if(status != CUPHY_STATUS_SUCCESS)
-                    {
-                       if (pdsch_dyn_params[grouped_cell_index].pStatusInfo->status == cuphyPdschStatusType_t::CUPHY_PDSCH_STATUS_UNSUPPORTED_MAX_ER_PER_CB) {
-                           NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: CUPHY_PDSCH_STATUS_UNSUPPORTED_MAX_ER_PER_CB error in cuphySetupPdschTx(): {}. Triggered by TB {} in cell group and cellPrmStatIdx {}",
-                                      i, cuphyGetErrorString(status), pdsch_dyn_params[grouped_cell_index].pStatusInfo->ueIdx, pdsch_dyn_params[grouped_cell_index].pStatusInfo->cellPrmStatIdx);
-                       } else {
-                           NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphySetupPdschTx(): {}", i, cuphyGetErrorString(status));
-                       }
-                       exit(1);
-                    }
                 }
                 if (time_setup_mode != 1)
                 {
-
                     timePtStartRun = Clock::now();
-                    cuphyStatus_t status = cuphyRunPdschTx(pdsch_handle[i], pdsch_proc_mode);
+                    m_pdschTxPipes[idxSlot][i].run(static_cast<uint64_t>(pdsch_proc_mode));
                     timePtStopRun = Clock::now();
-                    if(status != CUPHY_STATUS_SUCCESS)
-                    {
-                        NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphyRunPdschTx(): {}", i, cuphyGetErrorString(status));
-                    }
                 }
                 cuphy_timer_single_cell[i].record_end(streams[i].handle());
 
@@ -828,10 +553,16 @@ int main(int argc, char* argv[])
                     CUDA_CHECK(cudaEventRecord(stop_streams_events[i], strm_handle));
                     CUDA_CHECK(cudaStreamWaitEvent(streams[0].handle(), stop_streams_events[i], 0));
                 }
-                elapsedTimeDurationUs = timePtStopSetup - timePtStartSetup;
-                elapsedTimeUsSetup    += elapsedTimeDurationUs.count(); // accumulate for all PDSCH objects (e.g., if running without -g on a single thread)
-                elapsedTimeDurationUs = timePtStopRun - timePtStartRun;
-                elapsedTimeUsRun      += elapsedTimeDurationUs.count(); // accumulate fo all PDSCH objects
+                if(time_setup_mode != 0)
+                {
+                    elapsedTimeDurationUs = timePtStopSetup - timePtStartSetup;
+                    elapsedTimeUsSetup    += elapsedTimeDurationUs.count(); // accumulate for all objects (e.g., if running without -g on a single thread)
+                }
+                if(time_setup_mode != 1)
+                {
+                    elapsedTimeDurationUs = timePtStopRun - timePtStartRun;
+                    elapsedTimeUsRun      += elapsedTimeDurationUs.count(); // accumulate fo all objects
+                }
             }
 
             cuphy_timer.record_end(streams[0].handle());
@@ -844,6 +575,23 @@ int main(int argc, char* argv[])
                 total_time_single_cell[i] += cuphy_timer_single_cell[i].elapsed_time_ms();
             }
 
+            // Currently ref. check for PDSCH happens as part of PDSCH GPU run if the flag is set, which will affect (pollute) timing measurements.
+            // It is recommended you only use timing measurements without ref. check enabled.
+            // Could potentially consider adding ref. check support to the PDSCH dataset and to this code here or not include the first iteration.
+            if (ref_check_pdsch && (iter == 0)) {
+               for(int i = 0; i < num_pdsch_objects; i++)
+               {
+                   // Disable ref-check for subsequent iterations for that object. Ref. check won't work properly in case of multiple iterations when only run is replayed
+                   if (group_cells)
+                   {
+                         updateRefCheckMultipleCells(m_pdschTxPipes[idxSlot][i].handle() , false);
+                   }
+                   else
+                   {
+                         updateRefCheck(m_pdschTxPipes[idxSlot][i].handle() , false);
+                   }
+               }
+            }
             gpu_us_delay(delayUs, 0, streams[0].handle()); // 10ms delay kernel. Can update/comment out.
             CUDA_CHECK(cudaEventRecord(start_streams_event, streams[0].handle()));
         }
@@ -853,7 +601,6 @@ int main(int argc, char* argv[])
         {
             total_time_single_cell_slot[idxSlot][i] = total_time_single_cell[i] / num_iterations;
         }
-
 
         float avgElapsedTimesUs[ELAPSED_TYPES_MAX];
         float minElapsedTimesUs[ELAPSED_TYPES_MAX];
@@ -876,10 +623,9 @@ int main(int argc, char* argv[])
 
     } // end of slots
 
-
     for(int idxSlot = 0; idxSlot < num_slots; idxSlot++)
     {
-        NVLOGC_FMT(NVLOG_PDSCH, "Slot # {},  PDSCH pipeline(s) {}: {:.2f} us (avg. over {} iterations)", idxSlot, setup_modes[time_setup_mode].c_str(), total_time_slot[idxSlot] * 1000, num_iterations);
+        NVLOGC_FMT(NVLOG_PDSCH, "Slot # {}, PDSCH pipeline(s) {}: {:.2f} us (avg. over {} iterations) in {} and {} mode.", idxSlot, setup_modes[time_setup_mode].c_str(), total_time_slot[idxSlot] * 1000, num_iterations, (graphs_mode == 0) ? "Stream" : "Graphs", pipeline_modes_str[cfg_pipeline_mode_index]);
         for(int i = 0; i < num_pdsch_objects; i++)
         {
             if (group_cells) {
@@ -889,36 +635,21 @@ int main(int argc, char* argv[])
             }
         }
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-
-    // Cleanup
-    for(int idxSlot = 0; idxSlot < num_slots; idxSlot++)
+    } // end of try (TODO will indent block in a subsequent change)
+    catch(std::exception& e)
     {
-        for(int i = 0; i < num_pdsch_objects; i++)
-        {
-            int grouped_cell_index = (group_cells) ? idxSlot : idxSlot * num_cells + i;
-
-            pdsch_params_cleanup(pdsch_static_params[grouped_cell_index], pdsch_cell_grp_dyn_params[grouped_cell_index]);
-            if(idxSlot == 0)
-            {
-                cuphyStatus_t status = cuphyDestroyPdschTx(pdsch_handle[i]);
-                if(status != CUPHY_STATUS_SUCCESS)
-                {
-                    NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Pipeline {}: Error! cuphyDestroyPdschTx(): {}", i, cuphyGetErrorString(status));
-                }
-            }
-            if (!group_cells)
-            {
-                delete[] output_data[grouped_cell_index].pTDataTx;
-            }
-        }
-        if (group_cells)
-        {
-            delete[] output_data[idxSlot].pTDataTx;
-        }
+        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "EXCEPTION: {}", e.what());
+        returnValue = 1;
     }
-    nvlog_fmtlog_close(log_thread_id);
+    catch(...)
+    {
+        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "UNKNOWN EXCEPTION");
+        returnValue = 2;
+    }
 
-    return 0;
+    CUDA_CHECK(cudaDeviceSynchronize());
+    nvlog_fmtlog_close(log_thread_id);
+    return returnValue;
+
 }

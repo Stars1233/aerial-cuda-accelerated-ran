@@ -43,11 +43,15 @@ struct RowsCfg {
 	uint32_t srs_hest = 90;
 };
 
+// Local sanity cap for synth.n_cells (not part of the drift-checked schema).
+constexpr uint16_t kMaxSynthCells = 40;
+
 struct SynthCfg {
 	uint32_t slot_tick_us = 500;          // mu=1 (30 kHz SCS)
 	std::string tdd_pattern = "DDDSU";    // D=downlink, S=special, U=uplink(PUSCH)
 	uint32_t srs_periodicity_ms = 40;     // SRS rides a U slot
 	uint64_t duration_slots = 0;          // 0 = forever
+	uint16_t n_cells = 1;                 // synthetic cells per slot (one E3CellInfo each)
 };
 
 struct ReplayCfg {

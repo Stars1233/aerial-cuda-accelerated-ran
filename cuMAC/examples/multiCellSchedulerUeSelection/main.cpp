@@ -51,8 +51,10 @@ void usage()
 }
 
 
-int main(int argc, char* argv[]) 
+int main(int argc, char* argv[])
 {
+  cumac::loadParameters();
+
   int iArg = 1;
 
   // indicator for DL/UL

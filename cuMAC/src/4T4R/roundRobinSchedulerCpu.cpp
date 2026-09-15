@@ -16,6 +16,7 @@
  */
 
 #include "cumac.h"
+#include <random>
 
 // cuMAC namespace
 namespace cumac {
@@ -30,7 +31,7 @@ roundRobinSchedulerCpu::~roundRobinSchedulerCpu() {}
 
 void roundRobinSchedulerCpu::roundRobinSchedulerCpu_type0()
 {
-    std::srand(unsigned(std::time(0)));
+    std::mt19937 g(std::random_device{}());
 
     for (int cellIdx = 0; cellIdx < pCpuDynDesc->nCell; cellIdx++) {
         int cIdx = pCpuDynDesc->cellId[cellIdx]; // real cell ID among all cells in the network
@@ -53,7 +54,7 @@ void roundRobinSchedulerCpu::roundRobinSchedulerCpu_type0()
 
         int numRemainingRgb = pCpuDynDesc->nPrbGrp - numAllocRbgPerUe*numAssocUe;
 
-        std::random_shuffle(assocUeIdx.begin(), assocUeIdx.end());
+        std::shuffle(assocUeIdx.begin(), assocUeIdx.end(), g);
 
         int startRbgAlloc = 0;
 
@@ -90,7 +91,7 @@ void roundRobinSchedulerCpu::roundRobinSchedulerCpu_type0()
 
 void roundRobinSchedulerCpu::roundRobinSchedulerCpu_type1()
 {
-    std::srand(unsigned(std::time(0)));
+    std::mt19937 g(std::random_device{}());
 
     for (int cellIdx = 0; cellIdx < pCpuDynDesc->nCell; cellIdx++) {
         int cIdx = pCpuDynDesc->cellId[cellIdx]; // real cell ID among all cells in the network
@@ -113,13 +114,13 @@ void roundRobinSchedulerCpu::roundRobinSchedulerCpu_type1()
 
         int numRemainingRgb = pCpuDynDesc->nPrbGrp - numAllocRbgPerUe*numAssocUe;
 
-        std::random_shuffle(assocUeIdx.begin(), assocUeIdx.end());
+        std::shuffle(assocUeIdx.begin(), assocUeIdx.end(), g);
 
         int startRbgAlloc = 0;
 
         for (int tempUeIdx = 0; tempUeIdx < numAssocUe; tempUeIdx++) {
             int ueIdx = assocUeIdx[tempUeIdx];
-            
+
             if (numRemainingRgb > 0) {
                 pCpuDynDesc->allocSol[2*ueIdx]   = startRbgAlloc;
                 pCpuDynDesc->allocSol[2*ueIdx+1] = startRbgAlloc + numAllocRbgPerUe + 1;
@@ -148,7 +149,7 @@ void roundRobinSchedulerCpu::roundRobinSchedulerCpu_type1()
 
 void roundRobinSchedulerCpu::roundRobinSchedulerCpu_type1_harq()
 {
-    std::srand(unsigned(std::time(0)));
+    std::mt19937 g(std::random_device{}());
 
     for (int cellIdx = 0; cellIdx < pCpuDynDesc->nCell; cellIdx++) {
         int cIdx = pCpuDynDesc->cellId[cellIdx]; // real cell ID among all cells in the network
@@ -202,7 +203,7 @@ void roundRobinSchedulerCpu::roundRobinSchedulerCpu_type1_harq()
         
         int numRemainingRgb = numRemainingPrg - numAllocRbgPerUe*numAssocUeNewTx;
 
-        std::random_shuffle(assocUeIdxNewTx.begin(), assocUeIdxNewTx.end());
+        std::shuffle(assocUeIdxNewTx.begin(), assocUeIdxNewTx.end(), g);
 
         for (int uid = 0; uid < numAssocUeNewTx; uid++) {
             int ueIdx = assocUeIdxNewTx[uid];

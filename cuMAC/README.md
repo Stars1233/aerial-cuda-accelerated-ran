@@ -65,6 +65,22 @@ cd hdf5-1.10.5
 
 sudo make install
 ```
+
+### cuMAC model-generation Python environment
+
+The ONNX models used by the AI-RAN perf cases (`80021` and `80023`) require
+PyTorch and ONNX. They are intentionally not included in the main container
+image because the PyTorch CUDA dependencies are large. Inside the Aerial
+container, create the dedicated cuMAC environment with:
+
+```shell
+./cuMAC/setup_venv.sh
+```
+
+The script creates `cuMAC/.venv` and installs `torch==2.13.0`,
+`onnx==1.22.0`, and the generator's YAML dependency. Set `VENV_DIR` to use a
+different environment location, or `BASE_PYTHON` to select the interpreter
+used to create it. Use `cuMAC/.venv/bin/python` when generating models.
  
 **Building cuMAC Examples:**
 

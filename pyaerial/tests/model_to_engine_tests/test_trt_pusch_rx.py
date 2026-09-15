@@ -772,8 +772,8 @@ def execute_pipeline(rx_slot, pusch_config, channel_estimator, noise_intf_estima
     total_time = sum(timings.values())
     for stage, duration in timings.items():
         percentage = (duration / total_time) * 100
-        print(f"  {stage:<20}: {duration*1000:.2f} ms ({percentage:.1f}%)")
-    print(f"  {'Total':<20}: {total_time*1000:.2f} ms (100%)")
+        print(f"  {stage:<20}: {duration * 1000:.2f} ms ({percentage:.1f}%)")
+    print(f"  {'Total':<20}: {total_time * 1000:.2f} ms (100%)")
 
     print(f"\nResults saved to: {result_file}")
 

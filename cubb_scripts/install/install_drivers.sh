@@ -28,6 +28,9 @@
 # Usage: ./install_drivers.sh [--dry-run] [--verbose] [--uninstall]
 #
 
+# Suppress interactive apt dialogs
+export DEBIAN_FRONTEND=noninteractive
+
 # Source common functions and versions
 _SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
 [[ -f "$_SCRIPT_DIR/includes.sh" ]] && source "$_SCRIPT_DIR/includes.sh" || { echo "ERROR: includes.sh not found: $_SCRIPT_DIR/includes.sh" >&2; exit 1; }
@@ -63,6 +66,8 @@ DOCKER_ONLY=0
 STATUS_ONLY=0
 CHECK_DOCKER_LOGIN=0
 FAILED=0
+NIC_CONFIG_POWER_CYCLE_REQUIRED=0
+NIC_CONFIG_POWER_CYCLE_MARKER="${_SCRIPT_DIR}/.stamps/nic_config_power_cycle_required"
 
 for arg in "${REMAINING_ARGS[@]}"; do
     case $arg in
@@ -157,6 +162,13 @@ install_docker() {
         current_version=$(docker --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         if [[ $current_version == "$DOCKER_VERSION" ]]; then
             echo_and_log "[INFO] Docker ${DOCKER_VERSION} already installed, skipping"
+            add_user_to_docker
+            if [[ $DRYRUN -eq 1 ]]; then
+                echo_and_log "[DRY-RUN] Would reinitialize Docker access after adding ${SUDO_USER:-$USER} to the docker group"
+            else
+                unset INIT_DOCKER_CMD_DONE
+                init_docker_cmd
+            fi
             return
         fi
     fi
@@ -189,8 +201,12 @@ install_docker() {
     # init_docker_cmd ran at sourcing time (before add_user_to_docker) so its cached
     # DOCKER_PREFIX may be stale. Unsetting INIT_DOCKER_CMD_DONE forces a re-check,
     # which will detect the new group membership and switch to 'sg docker' if needed.
-    unset INIT_DOCKER_CMD_DONE
-    init_docker_cmd
+    if [[ $DRYRUN -eq 1 ]]; then
+        echo_and_log "[DRY-RUN] Would reinitialize Docker access after adding ${SUDO_USER:-$USER} to the docker group"
+    else
+        unset INIT_DOCKER_CMD_DONE
+        init_docker_cmd
+    fi
 
     echo_and_log "[INFO] Docker installation complete"
 }
@@ -274,6 +290,12 @@ EOF
         echo_and_log "[DRY-RUN] sudo tee /etc/apt/sources.list.d/docker.sources"
     fi
 
+    if [[ "$INSTALL_GPU" != "1" ]]; then
+        echo_and_log "[INFO] GPU-less platform: skipping NVIDIA Container Toolkit repository"
+        execute sudo apt update
+        return
+    fi
+
     # Add NVIDIA container toolkit GPG key
     echo_and_log "[INFO] Adding NVIDIA Container Toolkit GPG key..."
     if [[ $DRYRUN -ne 1 ]]; then
@@ -298,7 +320,12 @@ EOF
 install_nvidia_container_toolkit() {
     echo_and_log "[INFO] Installing NVIDIA Container Toolkit..."
 
-    execute sudo apt install -y nvidia-container-toolkit
+    local toolkit_package_version="${NVIDIA_CONTAINER_TOOLKIT_VERSION}${NVIDIA_CONTAINER_TOOLKIT_VERSION_SUFFIX}"
+    execute_or_die "sudo apt install -y --allow-downgrades \
+        libnvidia-container1=${toolkit_package_version} \
+        libnvidia-container-tools=${toolkit_package_version} \
+        nvidia-container-toolkit-base=${toolkit_package_version} \
+        nvidia-container-toolkit=${toolkit_package_version}"
 
     # Configure Docker runtime
     echo_and_log "[INFO] Configuring Docker runtime for NVIDIA..."
@@ -312,7 +339,7 @@ install_nvidia_container_toolkit() {
 
 # Download and install DOCA-Host deb package
 install_doca_host() {
-    echo_and_log "[INFO] Installing DOCA ${DOCA_VERSION}..."
+    echo_and_log "[INFO] Installing DOCA ${DOCA_VERSION} (${DOCA_OFED_VERSION})..."
     if [[ -f "${DOCA_DEB}" && -s "${DOCA_DEB}" ]]; then
         echo_and_log "[INFO] Using existing ${DOCA_DEB} ($(du -h "${DOCA_DEB}" | cut -f1))"
     else
@@ -324,6 +351,21 @@ install_doca_host() {
 
     echo_and_log "[INFO] Updating package lists after DOCA repo addition..."
     execute_or_die sudo apt update
+
+    # doca-ofed provides rshim and MFT on OFED platforms. Dell R750 uses the
+    # Ubuntu inbox mlx5 driver, so install those tools and MFT kernel modules
+    # directly instead.
+    if [[ "$INSTALL_DOCA_OFED" != "1" ]]; then
+        echo_and_log "[INFO] Dell R750 uses the Ubuntu inbox mlx5 driver; installing rshim, MFT, and MFT kernel modules from the DOCA repository"
+        if command -v ofed_info &>/dev/null && [[ -x /usr/sbin/ofed_uninstall.sh ]]; then
+            execute_or_die "sudo /usr/sbin/ofed_uninstall.sh --force"
+        fi
+        execute_or_die "sudo apt install -y rshim"
+        execute "sudo systemctl restart rshim"
+        execute_or_die "sudo apt install -y mft kernel-mft-dkms"
+        verify_mft_version
+        return
+    fi
 
     echo_and_log "[INFO] Installing DOCA tools, OFED, and firmware updater..."
     local openibd_cur="/etc/infiniband/openib.conf"
@@ -339,6 +381,27 @@ install_doca_host() {
        fi
     fi
     execute_or_die sudo apt -y install doca-tools doca-ofed mlnx-fw-updater
+    verify_mft_version
+}
+
+verify_mft_version() {
+    echo_and_log "[INFO] Verifying MFT version (expected: ${MFT_VERSION})..."
+    if [[ $DRYRUN -eq 1 ]]; then
+        echo_and_log "[DRY-RUN] Would verify MFT version ${MFT_VERSION} after DOCA tools install"
+        return 0
+    fi
+
+    if command -v mst &>/dev/null; then
+        local mst_output
+        mst_output=$(sudo mst version 2>&1 || true)
+        echo_and_log "$mst_output"
+        if ! echo "$mst_output" | grep -q "${MFT_VERSION}"; then
+            echo_and_log "[WARN] MFT version did not report ${MFT_VERSION}; DOCA packages may have changed package formatting"
+        fi
+    else
+        echo_and_log "[WARN] mst command not found after DOCA tools install"
+        FAILED=1
+    fi
 }
 
 # Start MST (Mellanox Software Tools)
@@ -347,8 +410,202 @@ start_mst() {
     execute_or_die sudo mst start
 }
 
+#---------------------------------------------------------------------------------------------------------------------------------------
+# Verify that NIC_DEV (set in versions.sh per platform) matches the NIC present and exists.
+# Uses ibdev2netdev -v to get the chip name and builds the expected pciconf path; compares to NIC_DEV.
+# Returns: 0 if device exists and matches NIC_DEV, 1 otherwise.
+#---------------------------------------------------------------------------------------------------------------------------------------
+check_nic_pciconf_device() {
+    local device found=0
+    if [[ $DRYRUN -eq 1 ]]; then
+        echo_and_log "[DRY-RUN] Would verify NIC device(s): ${NIC_CONFIG_DEVICES:-${NIC_DEV:-auto-detect}}"
+        return 0
+    fi
+
+    for device in ${NIC_CONFIG_DEVICES:-${NIC_DEV:-}}; do
+        found=1
+        if [[ ! -e "$device" ]]; then
+            echo_and_log "[ERROR] Expected NIC device not found: $device" >&2
+            return 1
+        fi
+        echo_and_log "[INFO] Found expected NIC device: $device"
+    done
+    [[ $found -eq 1 ]] || { echo_and_log "[ERROR] No NIC device is configured for $PLATFORM"; return 1; }
+}
+
+#=======================================================================================================================================
+# Configure NIC firmware features required for Aerial CUDA-Accelerated RAN
+#=======================================================================================================================================
+record_nic_config_power_cycle_required() {
+    [[ $DRYRUN -eq 1 ]] && return
+    mkdir -p "$(dirname "$NIC_CONFIG_POWER_CYCLE_MARKER")"
+    printf '%s\n' "$(cat /proc/sys/kernel/random/boot_id)" > "$NIC_CONFIG_POWER_CYCLE_MARKER"
+}
+
+verify_nic_config_power_cycle_completed() {
+    [[ ! -f "$NIC_CONFIG_POWER_CYCLE_MARKER" ]] && return 0
+
+    if [[ $DRYRUN -eq 1 ]]; then
+        echo_and_log "[DRY-RUN] Would verify the cold power cycle required by pending ConnectX-8 mlxconfig changes"
+        return 0
+    fi
+
+    local config_boot_id current_boot_id
+    config_boot_id=$(cat "$NIC_CONFIG_POWER_CYCLE_MARKER")
+    current_boot_id=$(cat /proc/sys/kernel/random/boot_id)
+    if [[ "$config_boot_id" == "$current_boot_id" ]]; then
+        echo_and_log "[ERROR] ConnectX-8 mlxconfig settings were changed during this boot."
+        echo_and_log "[ERROR] Perform a full BMC/host power cycle (not sudo reboot), then re-run make install."
+        return 2
+    fi
+
+    rm -f "$NIC_CONFIG_POWER_CYCLE_MARKER"
+    return 0
+}
+
+configure_nic_firmware() {
+    check_nic_pciconf_device || { FAILED=1; return 1; }
+
+    local desired_params=(
+        "FLEX_PARSER_PROFILE_ENABLE=4"
+        "PROG_PARSE_GRAPH=1"
+        "REAL_TIME_CLOCK_ENABLE=1"
+        "ACCURATE_TX_SCHEDULER=1"
+        "CQE_COMPRESSION=1"
+    )
+
+    if [[ "$NIC_DEVICE_TYPE" == "BlueField2" || "$NIC_DEVICE_TYPE" == "BlueField3" ||
+          "$NIC_DEVICE_TYPE" == "ConnectX8" ]]; then
+        desired_params+=(
+            "LINK_TYPE_P1=2"
+            "LINK_TYPE_P2=2"
+        )
+    fi
+
+    if [[ "$NIC_DEVICE_TYPE" == "BlueField2" || "$NIC_DEVICE_TYPE" == "BlueField3" ]]; then
+        desired_params+=(
+            "INTERNAL_CPU_MODEL=1"
+            "INTERNAL_CPU_PAGE_SUPPLIER=1"
+            "INTERNAL_CPU_ESWITCH_MANAGER=1"
+            "INTERNAL_CPU_IB_VPORT0=1"
+            "INTERNAL_CPU_OFFLOAD_ENGINE=1"
+        )
+    fi
+
+    if [[ "$NIC_DEVICE_TYPE" == "BlueField3" ]]; then
+        desired_params+=(
+            "EXP_ROM_VIRTIO_NET_PXE_ENABLE=0"
+            "EXP_ROM_VIRTIO_NET_UEFI_ARM_ENABLE=0"
+            "EXP_ROM_VIRTIO_NET_UEFI_x86_ENABLE=0"
+            "EXP_ROM_VIRTIO_BLK_UEFI_ARM_ENABLE=0"
+            "EXP_ROM_VIRTIO_BLK_UEFI_x86_ENABLE=0"
+        )
+    fi
+
+    desired_nic_param_regex() {
+        case "$1" in
+            CQE_COMPRESSION) echo "(AGGRESSIVE|1)" ;;
+            PROG_PARSE_GRAPH|REAL_TIME_CLOCK_ENABLE|ACCURATE_TX_SCHEDULER) echo "(True|1)" ;;
+            LINK_TYPE_P1|LINK_TYPE_P2) echo "(ETH|2)" ;;
+            INTERNAL_CPU_MODEL) echo "(EMBEDDED_CPU|1)" ;;
+            INTERNAL_CPU_PAGE_SUPPLIER|INTERNAL_CPU_ESWITCH_MANAGER|INTERNAL_CPU_IB_VPORT0) echo "(EXT_HOST_PF|1)" ;;
+            INTERNAL_CPU_OFFLOAD_ENGINE) echo "(DISABLED|1)" ;;
+            *) echo "$2" ;;
+        esac
+    }
+
+    local param_names
+    param_names=$(printf '%s\n' "${desired_params[@]}" | cut -d= -f1 | paste -sd'|' -)
+
+    local marker="${_SCRIPT_DIR}/.stamps/nic_config_power_cycle_required"
+    if [[ -f "$marker" ]]; then
+        local config_boot current_boot
+        config_boot=$(cat "$marker" 2>/dev/null || true)
+        current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+        if [[ "$config_boot" == "$current_boot" ]]; then
+            echo_and_log "[ERROR] BlueField mlxconfig changes require a full BMC/host cold power cycle."
+            echo_and_log "[ERROR] Re-run make install after the host returns."
+            return 2
+        fi
+        # A new boot ID proves only that Linux restarted; operators must ensure the
+        # documented full BMC/host cold power cycle was performed.
+        execute "rm -f '$marker'"
+    fi
+
+    local device output entry param set_value desired_regex
+    local device_needs_update any_update=0
+    local params_to_set=()
+    for device in ${NIC_CONFIG_DEVICES:-$NIC_DEV}; do
+        params_to_set=()
+        device_needs_update=0
+        echo_and_log "[INFO] Checking ${NIC_DEVICE_TYPE:-NIC} settings on $device"
+        if [[ $DRYRUN -eq 1 ]]; then
+            echo_and_log "[DRY-RUN] sudo mlxconfig -d $device q | grep -E '$param_names'"
+            echo_and_log "[DRY-RUN] If required: sudo mlxconfig -d $device --yes set <parameter>"
+            continue
+        fi
+
+        output=$(sudo mlxconfig -d "$device" q | grep -E "$param_names" || true)
+        echo_and_log "$output"
+        for entry in "${desired_params[@]}"; do
+            param="${entry%%=*}"
+            set_value="${entry#*=}"
+            desired_regex=$(desired_nic_param_regex "$param" "$set_value")
+            if ! echo "$output" | grep -qE "${param}.*${desired_regex}"; then
+                echo_and_log "[INFO] $device: $param needs update (want $set_value)"
+                device_needs_update=1
+                params_to_set+=("$entry")
+            fi
+        done
+
+        if [[ $device_needs_update -eq 0 ]]; then
+            echo_and_log "[INFO] $device settings already match the guide"
+            continue
+        fi
+
+        any_update=1
+        for entry in "${params_to_set[@]}"; do
+            execute_or_die "sudo mlxconfig -d '$device' --yes set '$entry' > /dev/null"
+        done
+    done
+
+    if [[ $any_update -eq 0 && $DRYRUN -eq 0 ]]; then
+        return 0
+    fi
+
+    if [[ "$NIC_DEVICE_TYPE" == "ConnectX8" ]]; then
+        if [[ $DRYRUN -eq 1 ]]; then
+            echo_and_log "[DRY-RUN] If ConnectX-8 mlxconfig changes are needed, a full BMC/host power cycle will be required."
+            return 0
+        fi
+        record_nic_config_power_cycle_required
+        echo_and_log "[IMPORTANT] ConnectX-8 mlxconfig settings were updated successfully."
+        echo_and_log "[IMPORTANT] Perform a full BMC/host power cycle (not sudo reboot), then re-run make install."
+        return 2
+    fi
+
+    if [[ "$NIC_DEVICE_TYPE" == "BlueField3" ]]; then
+        if [[ $DRYRUN -eq 0 ]]; then
+            mkdir -p "$(dirname "$marker")"
+            cat /proc/sys/kernel/random/boot_id > "$marker"
+        fi
+        echo_and_log "[IMPORTANT] BlueField mlxconfig changes require a full BMC/host cold power cycle."
+        echo_and_log "[IMPORTANT] Re-run make install after the host returns."
+        [[ $DRYRUN -eq 1 ]] && return 0
+        return 2
+    fi
+
+    echo_and_log "[INFO] Resetting $NIC_DEV to activate ConnectX firmware settings"
+    execute_or_die "sudo mlxfwreset -d '$NIC_DEV' --yes --level 3 r > /dev/null"
+}
+
 # Display version and status information
 show_status() {
+    if [[ $DRYRUN -eq 1 ]]; then
+        echo_and_log "[DRY-RUN] Would verify Docker ${DOCKER_VERSION}, OFED, MST, and aerial interface status"
+        return 0
+    fi
+
     echo_and_log "[INFO] Docker version (expected: ${DOCKER_VERSION}):"
     local docker_version
     docker_version=$(docker --version 2>/dev/null) || { echo_and_log "[ERROR] Docker is not installed"; FAILED=1; return; }
@@ -359,8 +616,16 @@ show_status() {
     fi
 
     echo ""
-    echo_and_log "[INFO] OFED version:"
-    ofed_info -s || { echo_and_log "[WARN] Could not get OFED version"; FAILED=1; }
+    if [[ "$INSTALL_DOCA_OFED" == "1" ]]; then
+        echo_and_log "[INFO] OFED version:"
+        ofed_info -s || { echo_and_log "[WARN] Could not get OFED version"; FAILED=1; }
+    else
+        echo_and_log "[INFO] Ubuntu inbox mlx5 driver:"
+        modinfo mlx5_core 2>/dev/null | grep -E '^(filename|version):' || {
+            echo_and_log "[WARN] Could not verify the inbox mlx5_core driver"
+            FAILED=1
+        }
+    fi
 
     echo ""
     echo_and_log "[INFO] MST version:"
@@ -412,6 +677,8 @@ show_status() {
                 echo_and_log "[INFO] $IFACE ($pci_addr): OK - ${speed}, ${physical_state}"
             elif [[ "$speed" == *"10G"* ]]; then
                 echo_and_log "[INFO] $IFACE ($pci_addr): OK - ${speed}, ${physical_state} (note: 10G link speed)"
+            else
+                echo_and_log "[INFO] $IFACE ($pci_addr): OK - ${speed}, ${physical_state}"
             fi
         else
             echo_and_log "[WARN] $IFACE ($pci_addr): ${state}, ${physical_state}, ${speed} (expected: Active, LinkUp or ETH_AN_FSM_ENABLE)"
@@ -631,7 +898,7 @@ install_gpu_driver() {
 
 # Install GDRCopy driver (GPU Direct RDMA)
 install_gdrdrv() {
-    if [[ $PLATFORM == "NVIDIA_DGX_Spark_P4242" ]]; then
+    if [[ $PLATFORM == "DGX-Spark" ]]; then
         echo_and_log "[INFO] Skipping GDRCopy driver installation on DGX Spark"
         return
     fi
@@ -645,19 +912,16 @@ install_gdrdrv() {
         execute_or_die "wget -nv ${GDRDRV_URL}"
     fi
 
-    # Install the deb package
-    echo_and_log "[INFO] Installing GDRCopy driver package..."
     execute_or_die sudo dpkg -i "${GDRDRV_FILE}"
 
     echo_and_log "[INFO] GDRCopy driver installation complete"
 }
 
-# Configure NVLink for GH200 (Supermicro only)
-configure_nvlink() {
-    if [[ $PLATFORM == "Supermicro_ARS-111GL-NHR" ]]; then
-        echo_and_log "[INFO] Configuring NVLink for GH200..."
-        write_file /etc/modprobe.d/nvidia.conf \
-            'options nvidia NVreg_RegistryDwords="RMNvLinkDisableLinks=0x3FFFF;"'
+# Configure platform-specific NVIDIA kernel module options.
+configure_nvidia_module_options() {
+    if [[ -n "${NVIDIA_MODULE_OPTIONS:-}" ]]; then
+        echo_and_log "[INFO] Configuring NVIDIA kernel module options for ${PLATFORM}..."
+        write_file /etc/modprobe.d/nvidia.conf "$NVIDIA_MODULE_OPTIONS"
     fi
 }
 
@@ -712,11 +976,15 @@ main() {
 
     # Handle docker-only option
     if [[ $DOCKER_ONLY -eq 1 ]]; then
-        echo_and_log "[INFO] Installing Docker and NVIDIA Container Toolkit..."
+        if [[ "$INSTALL_GPU" == "1" ]]; then
+            echo_and_log "[INFO] Installing Docker and NVIDIA Container Toolkit..."
+        else
+            echo_and_log "[INFO] Installing Docker..."
+        fi
         echo ""
         install_docker
         check_docker_login
-        install_nvidia_container_toolkit
+        [[ "$INSTALL_GPU" == "1" ]] && install_nvidia_container_toolkit
         echo ""
         echo "============================================"
         if [[ $FAILED -eq 1 ]]; then
@@ -727,6 +995,11 @@ main() {
         fi
         return
     fi
+
+    # A normal install or status check must not continue in the same boot after
+    # ConnectX-8 mlxconfig changes. On the first run after a cold cycle, this
+    # removes the completed marker and resumes the idempotent installation.
+    verify_nic_config_power_cycle_completed || return $?
 
     # Handle status-only option
     if [[ $STATUS_ONLY -eq 1 ]]; then
@@ -751,8 +1024,47 @@ main() {
     # (e.g., docker group not yet active) and re-run, completed groups are skipped.
     # Sub-stamps share the same .stamps/ directory used by the Makefile.
     local _sub_stamp_dir="${_SCRIPT_DIR}/.stamps"
-    _step_done()  { [[ -f "${_sub_stamp_dir}/drivers_${1}" ]]; }
+    _step_done() {
+        local step="$1"
+        local stamp="${_sub_stamp_dir}/drivers_${step}"
+        local dependency
+        local dependencies=(
+            "${_SCRIPT_DIR}/install_drivers.sh"
+            "${_SCRIPT_DIR}/includes.sh"
+            "${_VERSIONS_SH}"
+        )
+
+        [[ -f "$stamp" ]] || return 1
+
+        if [[ "$step" == "doca" ]]; then
+            dependencies+=(
+                "${_SCRIPT_DIR}/install_nic_fw.sh"
+                "${_SCRIPT_DIR}/../infra/rcu_affinity_manager.sh"
+            )
+        fi
+
+        for dependency in "${dependencies[@]}"; do
+            if [[ -e "$dependency" && "$dependency" -nt "$stamp" ]]; then
+                echo_and_log "[INFO] ${stamp##*/} is stale because ${dependency##*/} changed; re-running ${step} step"
+                return 1
+            fi
+        done
+
+        return 0
+    }
     _stamp_step() { [[ $DRYRUN -eq 0 ]] && mkdir -p "$_sub_stamp_dir" && touch "${_sub_stamp_dir}/drivers_${1}"; true; }
+
+    # A completed sub-step must not hide newer installer code or version pins.
+    local _sub_stamp
+    for _sub_stamp in "${_sub_stamp_dir}"/drivers_*; do
+        [[ -e "$_sub_stamp" ]] || continue
+        if [[ "${_SCRIPT_DIR}/install_drivers.sh" -nt "$_sub_stamp" \
+              || "${_SCRIPT_DIR}/install_nic_fw.sh" -nt "$_sub_stamp" \
+              || "${_SCRIPT_DIR}/../../cuPHY-CP/container/versions.sh" -nt "$_sub_stamp" ]]; then
+            echo_and_log "[INFO] Removing stale driver sub-stamp: $_sub_stamp"
+            [[ $DRYRUN -eq 0 ]] && rm -f "$_sub_stamp"
+        fi
+    done
 
     # These are idempotent / fast — run every time
     fix_broken_packages "install"
@@ -764,34 +1076,45 @@ main() {
     if _step_done "doca"; then
         echo_and_log "[INFO] Skipping DOCA/NIC firmware install (sub-stamp exists)"
     else
-        install_doca_host
-        start_mst
-        install_rcu_affinity_manager
-        # Persist this stage before the intentional Spark reboot exit so the
-        # next run resumes with post-reboot firmware verification.
-        _stamp_step "doca"
+        if _step_done "doca_packages"; then
+            echo_and_log "[INFO] Skipping DOCA package install (sub-stamp exists)"
+        else
+            install_doca_host
+            # Ensure mlx5 RDMA modules load at boot (required for GPUDirect)
+            write_file /etc/modules-load.d/mlx5.conf << 'EOF'
+mlx5_ib
+ib_uverbs
+EOF
+            _stamp_step "doca_packages"
 
-        if [[ $PLATFORM == "NVIDIA_DGX_Spark_P4242" ]]; then
-            if [[ $DRYRUN -eq 1 ]]; then
-                echo_and_log "[DRY-RUN] A system reboot would be required before verifying the updated NIC firmware"
-            else
-                echo ""
-                echo "============================================"
-                echo_and_log "[IMPORTANT] DOCA and mlnx-fw-updater installation completed."
-                echo_and_log "[IMPORTANT] Reboot the system so the NIC firmware update can take effect, then run make install again."
-                echo "============================================"
-                exit 2
-            fi
         fi
+
+        start_mst
+        local nic_fw_opts=()
+        [[ $DRYRUN -eq 1 ]] && nic_fw_opts+=(--dry-run)
+        [[ $VERBOSE -eq 1 ]] && nic_fw_opts+=(--verbose)
+        "${_SCRIPT_DIR}/install_nic_fw.sh" "${nic_fw_opts[@]}"
+        local nic_fw_rc=$?
+        [[ $nic_fw_rc -eq 0 ]] || return "$nic_fw_rc"
+        configure_nic_firmware
+        local nic_config_rc=$?
+        [[ $nic_config_rc -eq 0 ]] || return "$nic_config_rc"
+        install_rcu_affinity_manager
+        _stamp_step "doca"
     fi
 
     # Group 2: GPU driver + GDRCopy (download-heavy, skip if already done)
-    if _step_done "gpu"; then
+    if [[ "$INSTALL_GPU" != "1" ]]; then
+        echo_and_log "[INFO] GPU-less platform: skipping GPU driver and GDRCopy"
+    elif _step_done "gpu"; then
         echo_and_log "[INFO] Skipping GPU driver / GDRCopy install (sub-stamp exists)"
     else
         install_gpu_driver
-        configure_nvlink
+        configure_nvidia_module_options
         install_gdrdrv
+        if [[ -n "${MIG_MODE:-}" ]]; then
+            execute_or_die "sudo nvidia-smi -mig '$MIG_MODE'"
+        fi
         _stamp_step "gpu"
     fi
 
@@ -799,7 +1122,9 @@ main() {
     # This is the step that requires docker group membership to be active.
     # If it failed on a previous run (e.g., user not yet in docker group),
     # log out, log back in, then re-run make drivers to retry only this step.
-    if _step_done "toolkit"; then
+    if [[ "$INSTALL_GPU" != "1" ]]; then
+        echo_and_log "[INFO] GPU-less platform: skipping NVIDIA Container Toolkit"
+    elif _step_done "toolkit"; then
         echo_and_log "[INFO] Skipping NVIDIA container toolkit install (sub-stamp exists)"
     else
         install_nvidia_container_toolkit
@@ -819,6 +1144,9 @@ main() {
     if [[ $FAILED -eq 1 ]]; then
         echo_and_log "[ERROR] Driver installation completed with errors"
         exit 1
+    elif [[ $NIC_CONFIG_POWER_CYCLE_REQUIRED -eq 1 ]]; then
+        echo_and_log "[IMPORTANT] Driver components installed, but a ConnectX-8 cold power cycle is required."
+        return 2
     else
         echo_and_log "[INFO] Driver installation completed successfully!"
     fi

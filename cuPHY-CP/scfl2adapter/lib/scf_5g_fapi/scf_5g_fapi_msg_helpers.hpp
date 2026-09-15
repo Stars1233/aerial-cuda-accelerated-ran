@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,8 @@
 #include "nv_ipc.h"
 #include "scf_5g_fapi.h"
 
+#include "aerial/casts/casts.hpp"
+
 #include <algorithm>
 #include <tuple>
 
@@ -39,7 +41,7 @@ static scf_fapi_body_header_t *add_scf_fapi_hdr(nv_ipc_msg_t& msg, int msg_id, i
     hdr->message_count     = 1;
     hdr->handle_id         = cell_id;
 
-    auto *body = reinterpret_cast<scf_fapi_body_header_t*>(hdr->payload);
+    auto *body = aerial::casts::assume_cast<scf_fapi_body_header_t>(hdr->payload);
     body->type_id          = msg_id;
     body->length           = static_cast<uint32_t>(sizeof(T) - sizeof(scf_fapi_body_header_t));
 

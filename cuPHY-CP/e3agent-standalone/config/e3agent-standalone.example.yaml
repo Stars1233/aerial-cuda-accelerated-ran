@@ -15,7 +15,7 @@
 
 # Standalone E3 Agent environment configuration. Unknown keys are rejected.
 
-mode: synth                 # synth | replay -- selects which block below is used
+mode: synth                  # synth | replay - selects which block below is used
 log_level: INF               # VRB | DBG | INF | WRN | ERR | FAT
 
 agent:                       # E3AP ZMQ ports (mirror cuphycontroller data_config)
@@ -39,6 +39,7 @@ synth:                       # used when mode: synth
   tdd_pattern: "DDDSU"       # D=downlink (skip), S=special (skip), U=uplink (PUSCH)
   srs_periodicity_ms: 40     # SRS cadence; SRS rides a U slot
   duration_slots: 0          # 0 = run forever
+  n_cells: 1                 # cells per slot (1..40); each ring needs >= n_cells rows
 
 replay:                      # used when mode: replay
   path: /data/session.trace  # in-container path (compose mounts ./data:/data:ro)

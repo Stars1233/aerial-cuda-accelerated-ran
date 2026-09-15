@@ -754,6 +754,10 @@ void channInput<inChan_T, outChan_T>::autoScaling()
 {
     m_gridDim = {1,1,1};
     m_blockDim = {m_chanDescrCpu -> nUe, 1, 1};
+    // Snapshot the runtime parameters on the host; g_params lives in host memory
+    // and cannot be read from a device function (the macros expand to it).
+    m_chanDescrCpu -> targetChanCoeRange = targetChanCoeRangeConst;
+    m_chanDescrCpu -> minNoiseRange      = MinNoiseRangeConst;
     CUDA_CHECK_ERR(cudaGetFuncBySymbol(&m_functionPtr, reinterpret_cast<void*>(autoScalingKernel<outChan_T>)));
     CUDA_CHECK_ERR(cudaMemcpyAsync(m_chanDescrGpu, m_chanDescrCpu, sizeof(outChanDescr_t<outChan_T>), cudaMemcpyHostToDevice, m_cuStream));
     m_args[0] = &m_chanDescrGpu;
@@ -882,9 +886,9 @@ __global__ void autoScalingKernel(outChanDescr_t<outChan_T> * chanDescr)
     if(ueIdx == 0)
     {
         allUeSum[0] += allUeSum[1];
-        allUeSum[0] = targetChanCoeRangeConst / sqrt(allUeSum[0]);
+        allUeSum[0] = (chanDescr -> targetChanCoeRange) / sqrt(allUeSum[0]);
 
-        float min_noise_scaling = sqrt(MinNoiseRangeConst / (chanDescr -> sigmaSqrd));
+        float min_noise_scaling = sqrt((chanDescr -> minNoiseRange) / (chanDescr -> sigmaSqrd));
         if(allUeSum[0] < min_noise_scaling)
         {
             allUeSum[0] = min_noise_scaling;

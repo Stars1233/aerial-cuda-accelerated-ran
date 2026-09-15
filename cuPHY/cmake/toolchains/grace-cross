@@ -4,3 +4,24 @@ set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
 
 set(AERIAL_ARCH_TUNE_FLAGS -mcpu=neoverse-v2 -march=armv9-a+crypto+sve2-sm4+sve2-aes+sve2-sha3+sve2-bitperm+i8mm+bf16+nopredres)
 
+# Declare hardening level explicitly so codegen is stable regardless of whether
+# the container provides a vanilla or a distro-packaged compiler.
+# Ubuntu-packaged GCC 12.3.0 defaults to _FORTIFY_SOURCE=3,
+# -fstack-protector-strong, and -fstack-clash-protection; upstream GCC enables
+# none of them.  Pinning here keeps the two compilers code-generation-equivalent.
+#
+# Default (0/none) reproduces the Ubuntu 22 / upstream GCC baseline.
+# Override on the cmake command line to harden selectively:
+#   -DAERIAL_FORTIFY_LEVEL=3 -DAERIAL_STACK_PROTECTOR=strong
+#
+# Note: default PIE is deliberately absent.  libaerial-fh.so is compiled -fPIC
+# by CMake regardless of the compiler's PIE default, so codegen is identical
+# either way, and -fno-PIE would interfere with POSITION_INDEPENDENT_CODE.
+set(AERIAL_FORTIFY_LEVEL   "0"    CACHE STRING "_FORTIFY_SOURCE level (0 disables)")
+set(AERIAL_STACK_PROTECTOR "none" CACHE STRING "Stack protector: none | strong")
+
+# CMAKE_CXX_FLAGS does not reach nvcc's host compiler pass; set it separately.
+# ENABLE_DOCA_GPU_COMM (ON by default) pulls gpu_comm_doca.cu into
+# libaerial-fh.so, so CUDA targets must also see the hardening flags.
+include("${CMAKE_CURRENT_LIST_DIR}/hardening.cmake")
+

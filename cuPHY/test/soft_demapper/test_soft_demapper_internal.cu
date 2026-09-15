@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -266,7 +266,7 @@ __global__ void test_soft_demapper_kernel(cudaTextureObject_t   dmTexObj,
     if(symbolIdx >= symbolCount) return;
 
     // PAM noise is 1/2 QAM noise. Since we are using the inverse, mul by 2.
-    __half2 PAMnoiseVarInv = __float2half2_rn(noiseVarInv * 2.0f);
+    float PAMnoiseVarInv = noiseVarInv * 2.0f;
 
     soft_demapper_t::symbol_to_LLR_group(llr_grp,            // LLR output
                                          symbols[symbolIdx], // symbol input

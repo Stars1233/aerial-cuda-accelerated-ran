@@ -16,6 +16,7 @@
  */
 
 #include <errno.h>
+#include <string_view>
 
 #include "nv_phy_epoll_context.hpp"
 #include "nvlog.hpp"
@@ -38,12 +39,19 @@ phy_epoll_context::phy_epoll_context() :
 }
 
 ////////////////////////////////////////////////////////////////////////
-// phy_epoll_context::~phy_epoll_context()
-phy_epoll_context::~phy_epoll_context()
+/*
+ * phy_epoll_context::~phy_epoll_context() noexcept
+ * Close the epoll fd and set it to INVALID_FD
+ */
+phy_epoll_context::~phy_epoll_context() noexcept
 {
-    if(close(epoll_fd) == -1)
+    if(epoll_fd != ipc_base::INVALID_FD)
     {
-        NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "epoll fd close error: {}", strerror(errno));
+        if(close(epoll_fd) == -1)
+        {
+            NVLOGE_FMT(TAG, AERIAL_SYSTEM_API_EVENT, "{}: epoll_fd {} close error: {}", __func__, epoll_fd, std::string_view(strerror(errno)));
+        }
+        epoll_fd = ipc_base::INVALID_FD;
     }
 }
 

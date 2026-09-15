@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,7 @@
 // {
 //     char test_mac_yaml[MAX_PATH_LEN];
 //     std::string temp_path = std::string(CONFIG_TESTMAC_YAML_PATH).append(CONFIG_TESTMAC_YAML_NAME);
-//     get_full_path_file(test_mac_yaml, NULL, temp_path.c_str(), 3);
+//     get_cubb_full_path(test_mac_yaml, NULL, temp_path.c_str());
 
 //     yaml::file_parser fp(test_mac_yaml);
 //     yaml::document    doc       = fp.next_document();

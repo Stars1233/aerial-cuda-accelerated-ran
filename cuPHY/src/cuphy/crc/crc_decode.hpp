@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,20 +41,20 @@ public:
 
     void init(int reverseBytes);
 
-    void setup(uint16_t                          nSchUes,
-               uint16_t*                         pSchUserIdxsCpu,
-               uint32_t*                         pOutputCBCRCs,
-               uint8_t*                          pOutputTBs,
-               const uint32_t*                   pInputCodeBlocks,
-               uint32_t*                         pOutputTBCRCs,
-               const PerTbParams*                pTbPrmsCpu,
-               const PerTbParams*                pTbPrmsGpu,
-               void*                             pCpuDesc,                     
-               void*                             pGpuDesc,                     
-               uint8_t                           enableCpuToGpuDescrAsyncCpy, 
-               cuphyPuschRxCrcDecodeLaunchCfg_t* pCbCrcLaunchCfg,
-               cuphyPuschRxCrcDecodeLaunchCfg_t* pTbCrcLaunchCfg,
-               cudaStream_t                      strm);                        
+    cuphyStatus_t setup(uint16_t                          nSchUes,
+                        uint16_t*                         pSchUserIdxsCpu,
+                        uint32_t*                         pOutputCBCRCs,
+                        uint8_t*                          pOutputTBs,
+                        const uint32_t*                   pInputCodeBlocks,
+                        uint32_t*                         pOutputTBCRCs,
+                        const PerTbParams*                pTbPrmsCpu,
+                        const PerTbParams*                pTbPrmsGpu,
+                        void*                             pCpuDesc,
+                        void*                             pGpuDesc,
+                        uint8_t                           enableCpuToGpuDescrAsyncCpy,
+                        cuphyPuschRxCrcDecodeLaunchCfg_t* pCbCrcLaunchCfg,
+                        cuphyPuschRxCrcDecodeLaunchCfg_t* pTbCrcLaunchCfg,
+                        cudaStream_t                      strm);
 
 private:
     // class state modifed by setup saved in data member

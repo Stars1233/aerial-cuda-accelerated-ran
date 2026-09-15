@@ -1,0 +1,669 @@
+{
+  "schema_version": 2,
+  "description": "Aerial GPU Benchmark CICD case database. This is the source of truth for SM allocation, expected cell capacity, and run settings for the 80000-series configs. Each case carries an 'enabled' flag: run_cicd_cases.py --case all runs only enabled cases unless --include-disabled is passed, while an explicitly selected case id always runs. Per-GPU values live under each case's gpu_configs map; the runner picks the entry matching the detected GPU. The default operating points are GH200 at 1000 MHz and RTX_PRO_4500 at 1610 MHz; the freq/power/target defaults embedded in the case YAMLs are the RTX_PRO_4500 values for direct measure.py runs. A gpu_configs entry MAY contain an optional 'alt_freqs' map of developer-tuned operating points at non-default frequencies (keyed by MHz, e.g. 1980 for GH200); these are reference-only and are intentionally NOT run by CICD -- run_cicd_cases.py reads only the top-level entry, while run_sm_opt.py produces/consumes alt_freqs. To make an alternate frequency the CICD default, promote its values to the top-level entry. Case numbering: the last digit selects the base case and the tens digit selects the variant family (8000x = base, 8001x = base + early HARQ, 8002x = base + cuMAC in a green context). The cuMAC green-context cases carry a 6th SM entry for MAC; their SM allocations are manually tuned and run_sm_opt.py does not apply to them. A green-context gpu_configs entry additionally carries green_context_sm_alloc, a per-channel map of [split_start, sm_count] green-context split parameters. The testbench reads these ranges only from its YAML (not CLI args), so the generated wrapper script materializes a temp YAML in the run dir with the detected GPU's ranges appended at the root (root-level overrides any config-level block in the case YAML) and runs measure.py against it. Unlike MPS sm_allocation counts, green-context ranges partition the GPU exclusively unless splits deliberately overlap; keep sm_allocation consistent with the [start, count] ranges.",
+  "defaults": {
+    "usecase": "F08",
+    "function_slots": 20,
+    "function_cells": 2,
+    "confirm_slots": 300,
+    "power_start": 1,
+    "power_slots": 10,
+    "power_iterations": 2000,
+    "nsys_slots": 10,
+    "nsys_delay": 10000,
+    "nsys_iterations": 1,
+    "setup_once": true,
+    "fallback_gpu": "RTX_PRO_4500",
+    "expected_capacity_status": "seeded-from-yaml-cap-update-after-qualified-run"
+  },
+  "sm_labels": [
+    "PRACH",
+    "PDCCH",
+    "PUCCH",
+    "PDSCH",
+    "PUSCH",
+    "MAC"
+  ],
+  "cases": [
+    {
+      "case_id": "80001",
+      "enabled": true,
+      "long_name": "perf103_72a_dl200_pusch1250_o00000",
+      "yaml": "cubb_gpu_test_config_80001.yaml",
+      "description": "72a full-GPU baseline with no FEC/UCI/PDSCH/PUCCH/PDCCH offload.",
+      "delta": "Baseline 72a case; both PUSCH and PUCCH are cascaded.",
+      "lls_split": "72a",
+      "dl_offset_us": 200,
+      "pusch_budget_us": 1250,
+      "offload_digits": "o00000",
+      "early_harq": false,
+      "early_harq_budget_us": null,
+      "mac": false,
+      "use_green_contexts": false,
+      "pusch_cascaded": true,
+      "pucch_cascaded": true,
+      "gpu_configs": {
+        "GH200": {
+          "freq_mhz": 1000,
+          "power_w": 900,
+          "sm_allocation": [
+            8,
+            8,
+            12,
+            132,
+            128
+          ],
+          "expected_cell_capacity": 18,
+          "alt_freqs": {
+            "1980": {
+              "freq_mhz": 1980,
+              "power_w": 900,
+              "sm_allocation": [
+                8,
+                10,
+                10,
+                56,
+                132
+              ],
+              "expected_cell_capacity": 37,
+              "enlarge_cuphy_h_limits": true
+            }
+          }
+        },
+        "RTX_PRO_4500": {
+          "freq_mhz": 1610,
+          "power_w": 165,
+          "sm_allocation": [
+            8,
+            8,
+            8,
+            80,
+            70
+          ],
+          "expected_cell_capacity": 14
+        }
+      }
+    },
+    {
+      "case_id": "80002",
+      "enabled": false,
+      "long_name": "perf103_72e_dl200_pusch700_o00000",
+      "yaml": "cubb_gpu_test_config_80002.yaml",
+      "description": "72e full-GPU baseline with no FEC/UCI/PDSCH/PUCCH/PDCCH offload.",
+      "delta": "Moves the baseline to 72e and tightens the PUSCH budgets to 700/719 us.",
+      "lls_split": "72e",
+      "dl_offset_us": 200,
+      "pusch_budget_us": 700,
+      "offload_digits": "o00000",
+      "early_harq": false,
+      "early_harq_budget_us": null,
+      "mac": false,
+      "use_green_contexts": false,
+      "pusch_cascaded": true,
+      "pucch_cascaded": true,
+      "gpu_configs": {
+        "GH200": {
+          "freq_mhz": 1000,
+          "power_w": 900,
+          "sm_allocation": [
+            8,
+            8,
+            10,
+            60,
+            132
+          ],
+          "expected_cell_capacity": 14,
+          "alt_freqs": {
+            "1980": {
+              "freq_mhz": 1980,
+              "power_w": 900,
+              "sm_allocation": [
+                8,
+                8,
+                8,
+                44,
+                132
+              ],
+              "expected_cell_capacity": 28
+            }
+          }
+        },
+        "RTX_PRO_4500": {
+          "freq_mhz": 1610,
+          "power_w": 165,
+          "sm_allocation": [
+            8,
+            8,
+            10,
+            82,
+            80
+          ],
+          "expected_cell_capacity": 11
+        }
+      }
+    },
+    {
+      "case_id": "80003",
+      "enabled": true,
+      "long_name": "perf103_72e_dl200_pusch1200_o00000",
+      "yaml": "cubb_gpu_test_config_80003.yaml",
+      "description": "72e full-GPU case with the PUSCH budget relaxed by 500 us.",
+      "delta": "Relaxes 80002's PUSCH budgets by 500 us to 1200/1219.",
+      "lls_split": "72e",
+      "dl_offset_us": 200,
+      "pusch_budget_us": 1200,
+      "offload_digits": "o00000",
+      "early_harq": false,
+      "early_harq_budget_us": null,
+      "mac": false,
+      "use_green_contexts": false,
+      "pusch_cascaded": true,
+      "pucch_cascaded": true,
+      "gpu_configs": {
+        "GH200": {
+          "freq_mhz": 1000,
+          "power_w": 900,
+          "sm_allocation": [
+            8,
+            10,
+            10,
+            74,
+            96
+          ],
+          "expected_cell_capacity": 20,
+          "alt_freqs": {
+            "1980": {
+              "freq_mhz": 1980,
+              "power_w": 900,
+              "sm_allocation": [
+                8,
+                8,
+                8,
+                78,
+                132
+              ],
+              "expected_cell_capacity": 45,
+              "enlarge_cuphy_h_limits": true
+            }
+          }
+        },
+        "RTX_PRO_4500": {
+          "freq_mhz": 1610,
+          "power_w": 165,
+          "sm_allocation": [
+            8,
+            8,
+            8,
+            72,
+            56
+          ],
+          "expected_cell_capacity": 15
+        }
+      }
+    },
+    {
+      "case_id": "80004",
+      "enabled": false,
+      "long_name": "perf103_72e_dl200_pusch750_o00000_ovl500",
+      "yaml": "cubb_gpu_test_config_80004.yaml",
+      "description": "72e full-GPU case with 750 us PUSCH budgets and overlapped PUSCH slots.",
+      "delta": "80002 with 750/750 budgets; PUSCH2 is not cascaded and starts at a fixed 500 us offset, overlapping PUSCH1.",
+      "lls_split": "72e",
+      "dl_offset_us": 200,
+      "pusch_budget_us": 750,
+      "offload_digits": "o00000",
+      "early_harq": false,
+      "early_harq_budget_us": null,
+      "mac": false,
+      "use_green_contexts": false,
+      "pusch_cascaded": false,
+      "pucch_cascaded": true,
+      "gpu_configs": {
+        "GH200": {
+          "freq_mhz": 1000,
+          "power_w": 900,
+          "sm_allocation": [
+            8,
+            8,
+            8,
+            44,
+            132
+          ],
+          "expected_cell_capacity": 14,
+          "alt_freqs": {
+            "1980": {
+              "freq_mhz": 1980,
+              "power_w": 900,
+              "sm_allocation": [
+                8,
+                8,
+                8,
+                44,
+                132
+              ],
+              "expected_cell_capacity": 27
+            }
+          }
+        },
+        "RTX_PRO_4500": {
+          "freq_mhz": 1610,
+          "power_w": 165,
+          "sm_allocation": [
+            8,
+            8,
+            12,
+            50,
+            80
+          ],
+          "expected_cell_capacity": 12
+        }
+      }
+    },
+    {
+      "case_id": "80011",
+      "enabled": false,
+      "long_name": "perf103_72a_dl200_pusch1250_o00000_eh650",
+      "yaml": "cubb_gpu_test_config_80011.yaml",
+      "description": "72a full-GPU case with early HARQ enabled and 650 us EH budget.",
+      "delta": "Adds EH650 to 80001 while keeping both PUSCH and PUCCH cascaded.",
+      "lls_split": "72a",
+      "dl_offset_us": 200,
+      "pusch_budget_us": 1250,
+      "offload_digits": "o00000",
+      "early_harq": true,
+      "early_harq_budget_us": 650,
+      "mac": false,
+      "use_green_contexts": false,
+      "pusch_cascaded": true,
+      "pucch_cascaded": true,
+      "gpu_configs": {
+        "GH200": {
+          "freq_mhz": 1000,
+          "power_w": 900,
+          "sm_allocation": [
+            8,
+            8,
+            12,
+            78,
+            120
+          ],
+          "expected_cell_capacity": 13,
+          "alt_freqs": {
+            "1980": {
+              "freq_mhz": 1980,
+              "power_w": 900,
+              "sm_allocation": [
+                8,
+                8,
+                8,
+                60,
+                128
+              ],
+              "expected_cell_capacity": 31
+            }
+          }
+        },
+        "RTX_PRO_4500": {
+          "freq_mhz": 1610,
+          "power_w": 165,
+          "sm_allocation": [
+            8,
+            8,
+            8,
+            82,
+            74
+          ],
+          "expected_cell_capacity": 11
+        }
+      }
+    },
+    {
+      "case_id": "80013",
+      "enabled": false,
+      "long_name": "perf103_72e_dl200_pusch1200_o00000_eh216",
+      "yaml": "cubb_gpu_test_config_80013.yaml",
+      "description": "72e relaxed-budget case with early HARQ enabled and 216 us EH budget.",
+      "delta": "Adds EH216 to 80003 (72e with 1200/1219 PUSCH budgets).",
+      "lls_split": "72e",
+      "dl_offset_us": 200,
+      "pusch_budget_us": 1200,
+      "offload_digits": "o00000",
+      "early_harq": true,
+      "early_harq_budget_us": 216,
+      "mac": false,
+      "use_green_contexts": false,
+      "pusch_cascaded": true,
+      "pucch_cascaded": true,
+      "gpu_configs": {
+        "GH200": {
+          "freq_mhz": 1000,
+          "power_w": 900,
+          "sm_allocation": [
+            8,
+            8,
+            8,
+            38,
+            80
+          ],
+          "expected_cell_capacity": 16,
+          "alt_freqs": {
+            "1980": {
+              "freq_mhz": 1980,
+              "power_w": 900,
+              "sm_allocation": [
+                8,
+                8,
+                8,
+                42,
+                72
+              ],
+              "expected_cell_capacity": 30
+            }
+          }
+        },
+        "RTX_PRO_4500": {
+          "freq_mhz": 1610,
+          "power_w": 165,
+          "sm_allocation": [
+            8,
+            8,
+            8,
+            56,
+            58
+          ],
+          "expected_cell_capacity": 13
+        }
+      }
+    },
+    {
+      "case_id": "80021",
+      "enabled": false,
+      "function_cells": 8,
+      "long_name": "perf103_72a_dl200_pusch1250_o00000_macgc",
+      "yaml": "cubb_gpu_test_config_80021.yaml",
+      "description": "72a full-GPU case with cuMAC in a dedicated green context.",
+      "delta": "Adds cuMAC to 80001; green contexts replace MPS and the SM allocation gains a 6th MAC entry. Manually tuned -- run_sm_opt.py does not apply.",
+      "lls_split": "72a",
+      "dl_offset_us": 200,
+      "pusch_budget_us": 1250,
+      "offload_digits": "o00000",
+      "early_harq": false,
+      "early_harq_budget_us": null,
+      "mac": true,
+      "cumac_airan": true,
+      "use_green_contexts": true,
+      "pusch_cascaded": true,
+      "pucch_cascaded": true,
+      "gpu_configs": {
+        "GH200": {
+          "freq_mhz": 1000,
+          "power_w": 900,
+          "sm_allocation": [
+            8,
+            16,
+            18,
+            104,
+            108,
+            114
+          ],
+          "green_context_sm_alloc": {
+            "PRACH": [
+              120,
+              8
+            ],
+            "PDCCH": [
+              16,
+              16
+            ],
+            "PUCCH": [
+              112,
+              18
+            ],
+            "PDSCH": [
+              0,
+              104
+            ],
+            "PUSCH": [
+              24,
+              108
+            ],
+            "MAC": [
+              16,
+              114
+            ]
+          },
+          "expected_cell_capacity": 17,
+          "tuning_status": "manual-tuning-iter1-mps-sized-dl0-ulmax-mac24-pdcch-clear-of-mac",
+          "alt_freqs": {
+            "1980": {
+              "freq_mhz": 1980,
+              "power_w": 900,
+              "sm_allocation": [
+                8,
+                10,
+                12,
+                78,
+                126,
+                130
+              ],
+              "green_context_sm_alloc": {
+                "PRACH": [
+                  120,
+                  8
+                ],
+                "PDCCH": [
+                  16,
+                  10
+                ],
+                "PUCCH": [
+                  120,
+                  12
+                ],
+                "PDSCH": [
+                  0,
+                  78
+                ],
+                "PUSCH": [
+                  6,
+                  126
+                ],
+                "MAC": [
+                  0,
+                  130
+                ]
+              },
+              "expected_cell_capacity": 35,
+              "enlarge_cuphy_h_limits": true,
+              "tuning_status": "derived-from-80001-gh200-1980-mps-split-arranged-132sm-cap-seeded-from-80001-tuning-pending"
+            }
+          }
+        },
+        "RTX_PRO_4500": {
+          "freq_mhz": 1610,
+          "power_w": 165,
+          "sm_allocation": [
+            8,
+            8,
+            8,
+            74,
+            66,
+            8
+          ],
+          "green_context_sm_alloc": {
+            "MAC": [
+              0,
+              8
+            ],
+            "PDCCH": [
+              8,
+              8
+            ],
+            "PDSCH": [
+              0,
+              74
+            ],
+            "PUSCH": [
+              16,
+              66
+            ],
+            "PRACH": [
+              64,
+              8
+            ],
+            "PUCCH": [
+              72,
+              8
+            ]
+          },
+          "expected_cell_capacity": 14,
+          "tuning_status": "derived-from-80001-rtx-green-context-range-calibration-seeded-from-80001-tuning-pending"
+        }
+      }
+    },
+    {
+      "case_id": "80023",
+      "enabled": false,
+      "function_cells": 8,
+      "long_name": "perf103_72e_dl200_pusch1200_o00000_macgc",
+      "yaml": "cubb_gpu_test_config_80023.yaml",
+      "description": "72e relaxed-budget case with cuMAC in a dedicated green context.",
+      "delta": "Adds cuMAC to 80003; green contexts replace MPS and the SM allocation gains a 6th MAC entry. Manually tuned -- run_sm_opt.py does not apply.",
+      "lls_split": "72e",
+      "dl_offset_us": 200,
+      "pusch_budget_us": 1200,
+      "offload_digits": "o00000",
+      "early_harq": false,
+      "early_harq_budget_us": null,
+      "mac": true,
+      "cumac_airan": true,
+      "use_green_contexts": true,
+      "pusch_cascaded": true,
+      "pucch_cascaded": true,
+      "gpu_configs": {
+        "GH200": {
+          "freq_mhz": 1000,
+          "power_w": 900,
+          "sm_allocation": [
+            8,
+            16,
+            12,
+            80,
+            96,
+            112
+          ],
+          "green_context_sm_alloc": {
+            "PRACH": [
+              120,
+              8
+            ],
+            "PDCCH": [
+              16,
+              16
+            ],
+            "PUCCH": [
+              120,
+              12
+            ],
+            "PDSCH": [
+              0,
+              80
+            ],
+            "PUSCH": [
+              36,
+              96
+            ],
+            "MAC": [
+              16,
+              112
+            ]
+          },
+          "expected_cell_capacity": 21,
+          "tuning_status": "validated-gh200-1000mhz-mac112-21c-pass-22c-pusch1-pucch2-fail",
+          "alt_freqs": {
+            "1980": {
+              "freq_mhz": 1980,
+              "power_w": 900,
+              "sm_allocation": [
+                8,
+                8,
+                16,
+                58,
+                108,
+                96
+              ],
+              "green_context_sm_alloc": {
+                "PRACH": [
+                  120,
+                  8
+                ],
+                "PDCCH": [
+                  16,
+                  8
+                ],
+                "PUCCH": [
+                  112,
+                  16
+                ],
+                "PDSCH": [
+                  0,
+                  58
+                ],
+                "PUSCH": [
+                  24,
+                  108
+                ],
+                "MAC": [
+                  0,
+                  96
+                ]
+              },
+              "expected_cell_capacity": 42,
+              "enlarge_cuphy_h_limits": true,
+              "tuning_status": "validated-gh200-1980mhz-42c-pass-43c-pusch1-fail"
+            }
+          }
+        },
+        "RTX_PRO_4500": {
+          "freq_mhz": 1610,
+          "power_w": 165,
+          "sm_allocation": [
+            8,
+            8,
+            8,
+            82,
+            50,
+            8
+          ],
+          "green_context_sm_alloc": {
+            "MAC": [
+              0,
+              8
+            ],
+            "PDCCH": [
+              8,
+              8
+            ],
+            "PDSCH": [
+              0,
+              82
+            ],
+            "PUSCH": [
+              32,
+              50
+            ],
+            "PRACH": [
+              64,
+              8
+            ],
+            "PUCCH": [
+              72,
+              8
+            ]
+          },
+          "expected_cell_capacity": 15,
+          "tuning_status": "derived-from-80003-rtx-green-context-range-calibration-seeded-from-80003-tuning-pending"
+        }
+      }
+    }
+  ]
+}

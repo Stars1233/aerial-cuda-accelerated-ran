@@ -16,14 +16,10 @@
  */
 
 #include "cumac.h"
+#include "common/schedulerTimeMeasure.h"
 
 // cuMAC namespace
 namespace cumac {
-
-//#define SCHEDULER_KERNEL_TIME_MEASURE_ 
-#ifdef SCHEDULER_KERNEL_TIME_MEASURE_
-constexpr uint16_t numRunSchKnlTimeMsr = 1000;
-#endif
 
 #define dir 0
 

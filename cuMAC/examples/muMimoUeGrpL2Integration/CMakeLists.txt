@@ -19,8 +19,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g -fno-inline")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -fno-inline")
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -O0 -g -fno-inline")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g -fno-inline")
 
 add_executable(l2_muUeGrp_test)
 target_sources(l2_muUeGrp_test PRIVATE l2_muUeGrp_test.cpp)
@@ -62,6 +62,52 @@ target_link_libraries(cumac_muUeGrp_test PRIVATE
     CUDA::cudart        # For CUDA runtime
     CUDA::cuda_driver   # For CUDA driver API
 )
+
+# Standalone TV replay test: loads pre-generated HDF5 TVs, runs GPU UE
+# pairing for each slot, and verifies the computed solution against the
+# solution TV.  No NVIPC / L1 / L2 infrastructure required.
+add_executable(cumac_muUeGrp_tv_replay_test)
+target_sources(cumac_muUeGrp_tv_replay_test PRIVATE
+    cumac_muUeGrp_tv_replay_test.cu
+)
+
+add_dependencies(cumac_muUeGrp_tv_replay_test cumac)
+
+target_include_directories(cumac_muUeGrp_tv_replay_test PUBLIC
+    ${HDF5_CXX_INCLUDE_DIRS}
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    ${CMAKE_SOURCE_DIR}/cuPHY-CP/cuphydriver/include
+    ${CMAKE_SOURCE_DIR}/cuPHY-CP/gt_common_libs/slot_command/include
+    ${CMAKE_SOURCE_DIR}/cuPHY/util/aerial_utils
+    ${CMAKE_SOURCE_DIR}/cuPHY/examples/common
+    ${CMAKE_SOURCE_DIR}/cuPHY/src/cuphy_hdf5
+    ${CMAKE_SOURCE_DIR}/cuPHY/src
+    ${CMAKE_SOURCE_DIR}/cuPHY/src/cuphy_channels
+    ${CMAKE_SOURCE_DIR}/cuMAC/examples/tools
+)
+
+target_link_libraries(cumac_muUeGrp_tv_replay_test PRIVATE
+    ${HDF5_CXX_LIBRARIES}
+    cumac
+    pthread
+    nvlog
+    nvipc
+    yaml
+    cumac_msg
+    CUDA::cudart
+    CUDA::cuda_driver
+)
+
+# TV dump utility — pure C++, no CUDA runtime needed.
+# Reads muUePairTV HDF5 files and prints all task_in_buf fields in readable text.
+add_executable(dump_tv)
+target_sources(dump_tv PRIVATE dump_tv.cpp)
+target_include_directories(dump_tv PRIVATE
+    ${HDF5_CXX_INCLUDE_DIRS}
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    ${CMAKE_SOURCE_DIR}/cuPHY/examples/common  # hdf5hpp.hpp
+)
+target_link_libraries(dump_tv PRIVATE ${HDF5_CXX_LIBRARIES})
 
 # Simplified SRS Memory Bank Test
 # Tests GPU buffer allocation using original CVSrsChestBuff without full infrastructure

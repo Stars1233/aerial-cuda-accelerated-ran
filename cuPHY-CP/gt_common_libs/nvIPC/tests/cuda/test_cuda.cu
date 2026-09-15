@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,36 +18,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <cuda_runtime_api.h>
+#include <cuda.h>
 
 #include "test_cuda.h"
 #include "nv_ipc_utils.h"
 
-#define TAG "NVIPC.TESTCUDA"
+#define TAG (NVLOG_TAG_BASE_NVIPC + 5) // "NVIPC.TESTCUDA"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+#include "cuda_driver_utils/cuda_kernel_utils.cuh"
 
 #define N_BLOCK 64
 #define N_THREAD 32;
 
 static const char SUB_VAL = (char) ('A' - 'a');
-
-inline cudaError __checkLastCudaError(const char* file, int line)
-{
-    cudaError lastErr = cudaGetLastError();
-    if(lastErr != cudaSuccess)
-    {
-        NVLOGE_FMT(TAG, AERIAL_NVIPC_API_EVENT, "Error at {} line {}: {}", file, line, cudaGetErrorString(lastErr));
-    }
-    return lastErr;
-}
-
-#define checkLastCudaError() __checkLastCudaError(__FILE__, __LINE__)
-
-#define HANDLE_ERROR(x)                                                                 \
-    do                                                                                  \
-    {                                                                                   \
-        if((x) != cudaSuccess) { printf("Error %s line%d\n", __FUNCTION__, __LINE__); } \
-    } while(0)
-#define HANDLE_NULL(x)
 
 static __global__ void gpu_to_lower_case(char* str, int length)
 {
@@ -63,6 +46,28 @@ static __global__ void gpu_to_lower_case(char* str, int length)
     }
 }
 
+// CUfunction handles are context-specific. All callers must use the same deviceId
+// across the process lifetime. Must be initialized once from the main thread via
+// init_test_cuda_kernels() before any calls to test_cuda_to_lower_case or
+// cuda_to_lower_case.
+//
+// PrimaryCtxGuard is used to set the CUDA context on the calling thread (e.g. the
+// receive thread in test_ipc.c). cuCtxSynchronize ensures the async cuLaunchKernel
+// completes before PrimaryCtxGuard releases the context at scope exit.
+static CUfunction gpu_to_lower_case_func = nullptr;
+
+[[nodiscard]] bool init_test_cuda_kernels()
+{
+    return resolve_kernel_func<TAG>(&gpu_to_lower_case_func,
+                                    reinterpret_cast<const void*>(gpu_to_lower_case),
+                                    "gpu_to_lower_case");
+}
+
+extern "C" int init_test_cuda_kernels_c(void)
+{
+    return init_test_cuda_kernels() ? 0 : -1;
+}
+
 void test_cuda_to_lower_case(int deviceId, char* str, int length, int gpu)
 {
     if(deviceId < 0)
@@ -74,31 +79,17 @@ void test_cuda_to_lower_case(int deviceId, char* str, int length, int gpu)
     NVLOGI_FMT(TAG, "{}: gpu={}", __func__, gpu);
     if(gpu)
     {
+        PrimaryCtxGuard ctx_guard(deviceId);
+
         int nblock  = N_BLOCK;
         int nthread = N_THREAD;
-        HANDLE_ERROR(cudaSetDevice(deviceId));
-        gpu_to_lower_case<<<nblock, nthread>>>(str, length);
-        checkLastCudaError();
+        void* args[] = {&str, &length};
+        CUDA_DRIVER_CHECK(cuLaunchKernel(gpu_to_lower_case_func, nblock, 1, 1, nthread, 1, 1, 0, nullptr, args, nullptr));
+        CUDA_DRIVER_CHECK(cuCtxSynchronize());
     }
     else
     {
         cpu_to_lower_case(str, length);
-    }
-}
-
-int get_cuda_device_id(void)
-{
-    int num;
-    cudaError_t err = cudaGetDeviceCount (&num);
-    NVLOGC_FMT(TAG, "{}: err={} num={}", __func__, +err, num);
-
-    if (err == cudaSuccess && num > 0)
-    {
-        return 0;
-    }
-    else
-    {
-        return -1;
     }
 }
 
@@ -110,9 +101,11 @@ void cuda_to_lower_case(char* str, int length, int deviceId)
         return;
     }
 
+    PrimaryCtxGuard ctx_guard(deviceId);
+
     int nblock  = N_BLOCK;
     int nthread = N_THREAD;
-    HANDLE_ERROR(cudaSetDevice(deviceId));
-    gpu_to_lower_case<<<nblock, nthread>>>(str, length);
-    checkLastCudaError();
+    void* args[] = {&str, &length};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(gpu_to_lower_case_func, nblock, 1, 1, nthread, 1, 1, 0, nullptr, args, nullptr));
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
 }

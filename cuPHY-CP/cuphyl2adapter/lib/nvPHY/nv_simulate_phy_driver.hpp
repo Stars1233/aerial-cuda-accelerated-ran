@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 
 #include <semaphore.h>
 
+#include <atomic>
 #include <thread>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,7 @@ private:
 class SimulatePhyDriver {
 public:
     SimulatePhyDriver(nv::thread_config* cfg);
+    ~SimulatePhyDriver();
 
 public:
     void send_uci_indications(slot_indication& si, cell_sub_command& csc);
@@ -67,7 +69,7 @@ public:
 
 private:
     cuphyPuschDataOut_t  puschDataOut;
-    cuphyPuschStatPrms_t puschStatPrms;
+    cuphyPuschStatPrms_t puschStatPrms{};
     cuphyPucchDataOut_t  pucchDataOut;
     cuphyPrachDataOut_t  prachDataout;
     cuphySrsDataOut_t    srsDataOut;
@@ -95,6 +97,7 @@ private:
 
     nv::thread_config* worker_cfg;
     sem_t              sem;
+    std::atomic<bool>  stop_{false};
     std::thread        thread;
 
     std::mutex            queue_mutex;

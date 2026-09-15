@@ -33,19 +33,19 @@
 #include "nv_ipc.h"
 #include "nv_ipc_utils.h"
 #include "nv_ipc_sem.h"
-#include "nv_ipc_cudapool.h" 
-#include "nv_ipc_mempool.h" 
+#include "nv_lockfree.hpp"
 
 constexpr const char* YAML_L1_CUMAC_NVIPC_CONFIG_PATH = "./cuMAC/examples/muMimoUeGrpL2Integration/yamlConfigFiles/l1_cumac_nvipc.yaml"; // path to the L1 NVIPC configuration parameters YAML file
 constexpr const char* YAML_L1_L2_NVIPC_CONFIG_PATH = "./cuMAC/examples/muMimoUeGrpL2Integration/yamlConfigFiles/l1_l2_nvipc.yaml"; // path to the L1/L2 NVIPC configuration parameters YAML file
 
-#define L1_CPU_MEM_POOL_NAME "l1_cpu_sh_pool"
-#define L1_GPU_MEM_POOL_NAME "l1_gpu_sh_pool"
+#define L1_CHEST_BUF_POOL_NAME "l1_chest_buf_pool"
+#define L1_MSG_MEM_POOL_NAME   "l1_msg_pool"
+#define L1_GPU_MEM_POOL_NAME   "l1_gpu_sh_pool"
 #define L1_SEM_NAME "l1_sem"
 #define L1_CUMAC_PRIMARY_PROCESS 1
 
 // NVIPC interface
-nv_ipc_t* l1_cumac_ipc_interface = NULL;
+inline nv_ipc_t* l1_cumac_ipc_interface = NULL;
 
 struct CudaIpcHandles {
     cudaIpcEventHandle_t event_handle;
@@ -91,7 +91,7 @@ int test_srs_memory_bank(SimpleCvSrsChestMemoryBank* memory_bank, const TestConf
                 const uint32_t rnti = config.rnti_base + (cell_idx * config.num_srs_ues_per_cell) + ue_idx;
                 const uint16_t buffer_idx = ue_idx;
                 const uint32_t usage = 1;  // Initial usage count
-                CVSrsChestBuff_contMemAlloc* ue_buffer = nullptr;
+                CVSrsChestBuff* ue_buffer = nullptr;
                 
                 const int ret = memory_bank->preAllocateBuffer(cell_id, rnti, buffer_idx, usage, &ue_buffer);
                 if (ret == 0 && ue_buffer) {
@@ -136,7 +136,7 @@ int test_srs_memory_bank(SimpleCvSrsChestMemoryBank* memory_bank, const TestConf
             const uint32_t test_rnti = config.rnti_base + (cell_idx * config.num_srs_ues_per_cell);
             const uint16_t buffer_idx = 0;
             
-            CVSrsChestBuff_contMemAlloc* retrieved_buffer = nullptr;
+            CVSrsChestBuff* retrieved_buffer = nullptr;
             const int retrieve_ret = memory_bank->retrieveBuffer(cell_id, test_rnti, buffer_idx, &retrieved_buffer);
             if (retrieve_ret == 0 && retrieved_buffer) {
                 std::cout << "Cell " << cell_id << ", RNTI " << test_rnti << ": Retrieved buffer successfully" << std::endl;
@@ -163,7 +163,7 @@ int test_srs_memory_bank(SimpleCvSrsChestMemoryBank* memory_bank, const TestConf
         
         // Summary
         std::cout << "\n=== Test Summary ===" << std::endl;
-        std::cout << "✓ Using CVSrsChestBuff_contMemAlloc class from simple_srs_memory_bank.hpp" << std::endl;
+        std::cout << "✓ Using CVSrsChestBuff class from cv_memory_bank_srs_chest.hpp" << std::endl;
         std::cout << "✓ Configuration loaded from: " << YAML_PARAM_CONFIG_PATH << std::endl;
         std::cout << "✓ CUDA device: " << config.cuda_device_id << std::endl;
         std::cout << "✓ Successfully allocated " << memory_bank->getNumBuffers() << " GPU buffers" << std::endl;

@@ -2,3 +2,7 @@ set(CMAKE_C_COMPILER   gcc)
 set(CMAKE_CXX_COMPILER g++)
 
 set(AERIAL_ARCH_TUNE_FLAGS -march=native)
+
+set(AERIAL_FORTIFY_LEVEL   "0"    CACHE STRING "_FORTIFY_SOURCE level (0 disables)")
+set(AERIAL_STACK_PROTECTOR "none" CACHE STRING "Stack protector: none | strong")
+include("${CMAKE_CURRENT_LIST_DIR}/hardening.cmake")

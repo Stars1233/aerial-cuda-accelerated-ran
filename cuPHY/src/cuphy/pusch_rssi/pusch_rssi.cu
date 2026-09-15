@@ -271,20 +271,25 @@ __global__ void rssiMeasKernel(puschRxRssiDynDescr_t* pDynDescr)
     }
     else if(CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS == DMRS_SYMBOL_IDX)
     {
-        nSymb = nSymb - drvdUeGrpPrms.dmrsMaxLen;
+        // A group whose DMRS all sit in the front-loaded symbols has nothing left to
+        // accumulate here; it still needs the tRssi dB conversion below.
+        nSymb = (nSymb > drvdUeGrpPrms.dmrsMaxLen) ? (nSymb - drvdUeGrpPrms.dmrsMaxLen) : 0;
     }
     const uint16_t nRxAnt = drvdUeGrpPrms.nRxAnt;
     
     const uint32_t thrdIdx  = thisThrdBlk.thread_rank();
     const uint32_t nThrds = thisThrdBlk.size();
-      
-    uint32_t symbIdx  = blockIdx.z % nSymb;
-    uint32_t rxAntIdx = (blockIdx.z / nSymb) % nRxAnt;
+
+    // nSymb == 0 blocks are filtered by the accumulation guard below; keep the index
+    // math defined so they cannot divide by zero or index dmrsSymLoc out of range.
+    const uint32_t nSymbForIdx = (0 == nSymb) ? 1 : nSymb;
+    uint32_t symbIdx  = blockIdx.z % nSymbForIdx;
+    uint32_t rxAntIdx = (blockIdx.z / nSymbForIdx) % nRxAnt;
     
     uint32_t symbIdxOffset = 0;
     if(CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS == DMRS_SYMBOL_IDX)
     {
-        symbIdxOffset = drvdUeGrpPrms.dmrsMaxLen;
+        symbIdxOffset = (0 == nSymb) ? 0 : drvdUeGrpPrms.dmrsMaxLen;
     }
     
     const uint32_t symbLocIdx = drvdUeGrpPrms.dmrsSymLoc[symbIdx+symbIdxOffset]; // tSymbLoc(symbIdx);
@@ -594,9 +599,14 @@ cuphyStatus_t puschRxRssi::setupRssiMeas(cuphyPuschRxUeGrpPrms_t*      pDrvdUeGr
 {
     puschRxRssiDynDescr_t* pDynDescrVecGpu = static_cast<puschRxRssiDynDescr_t*>(pDynDescrsGpu);
 
-    if(!pDrvdUeGrpPrmsCpu || !pDrvdUeGrpPrmsGpu || !pDynDescrVecGpu || !pLaunchCfgs) return CUPHY_STATUS_INVALID_ARGUMENT;
+    if(!pDrvdUeGrpPrmsCpu || !pDrvdUeGrpPrmsGpu || !pDynDescrVecGpu || !pLaunchCfgs) [[unlikely]]
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    if((0 == pLaunchCfgs->nCfgs) || (pLaunchCfgs->nCfgs > CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS)) [[unlikely]]
+        return CUPHY_STATUS_INVALID_ARGUMENT;
     
-    if((dmrsSymbolIdx!=CUPHY_PUSCH_RSSI_EST_FIRST_DMRS)&&(dmrsSymbolIdx!=CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS)&&(dmrsSymbolIdx!=CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS))
+    if((dmrsSymbolIdx != CUPHY_PUSCH_RSSI_EST_FIRST_DMRS) &&
+       (dmrsSymbolIdx != CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS) &&
+       (dmrsSymbolIdx != CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS)) [[unlikely]]
     {
          NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Invalid dmrsSymbolIdx {}", __FUNCTION__, dmrsSymbolIdx);
          return CUPHY_STATUS_INVALID_ARGUMENT;
@@ -609,7 +619,14 @@ cuphyStatus_t puschRxRssi::setupRssiMeas(cuphyPuschRxUeGrpPrms_t*      pDrvdUeGr
 
         uint16_t nMaxRxAnt = 1;
         uint16_t nMaxDmrsSym = 1;
-        uint8_t  dmrsMaxLen = pDrvdUeGrpPrmsCpu[0].dmrsMaxLen;
+        // dmrsMaxLen / nDmrsSyms vary per UE group, and the kernel derives each group's
+        // symbol count from those fields, so the early-HARQ splits must be maximized
+        // across groups. Sampling group 0 undersizes the grid for any group with a
+        // longer front-loaded DMRS, silently dropping part of its power accumulation.
+        // Use the same fields the kernel uses (not rssiSymPosBmsk popcount): the RSSI
+        // mask is allowed to be a subset of DMRS symbols and must not drive this math.
+        uint16_t nMaxFirstDmrsSym = 1;
+        uint16_t nMaxRemDmrsSym   = 0;
         // Setup measurement symbol location indices
         for(uint16_t ueGrpIdx = 0; ueGrpIdx < nUeGrps; ueGrpIdx++)
         {
@@ -617,8 +634,23 @@ cuphyStatus_t puschRxRssi::setupRssiMeas(cuphyPuschRxUeGrpPrms_t*      pDrvdUeGr
             {
                 nMaxRxAnt = pDrvdUeGrpPrmsCpu[ueGrpIdx].nRxAnt;
             }
-            
-            
+
+            const uint16_t grpDmrsMaxLen = pDrvdUeGrpPrmsCpu[ueGrpIdx].dmrsMaxLen;
+            const uint16_t grpNDmrsSyms  = pDrvdUeGrpPrmsCpu[ueGrpIdx].nDmrsSyms;
+            if(nMaxFirstDmrsSym < grpDmrsMaxLen)
+            {
+                nMaxFirstDmrsSym = grpDmrsMaxLen;
+            }
+            // Per-group difference, not max(nDmrsSyms) - max(dmrsMaxLen): the two maxima
+            // can come from different groups and would understate the trailing count.
+            const uint16_t grpRemDmrsSym =
+                (grpNDmrsSyms > grpDmrsMaxLen) ? (grpNDmrsSyms - grpDmrsMaxLen) : 0;
+            if(nMaxRemDmrsSym < grpRemDmrsSym)
+            {
+                nMaxRemDmrsSym = grpRemDmrsSym;
+            }
+
+            // FULL_SLOT grid sizing still follows the configured RSSI symbol mask.
             uint16_t symbCnt = 0;
             uint32_t symbLocBmsk = pDrvdUeGrpPrmsCpu[ueGrpIdx].rssiSymPosBmsk;
             if(!symbLocBmsk)
@@ -638,11 +670,13 @@ cuphyStatus_t puschRxRssi::setupRssiMeas(cuphyPuschRxUeGrpPrms_t*      pDrvdUeGr
         
         if(dmrsSymbolIdx == CUPHY_PUSCH_RSSI_EST_FIRST_DMRS)
         {
-            nMaxDmrsSym = dmrsMaxLen;
+            nMaxDmrsSym = nMaxFirstDmrsSym;
         }
         else if(dmrsSymbolIdx == CUPHY_PUSCH_RSSI_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS)
         {
-            nMaxDmrsSym = nMaxDmrsSym - dmrsMaxLen;
+            // Grid must still cover one z-slice when no group has trailing DMRS symbols:
+            // those groups accumulate nothing here but still convert tRssi to dB.
+            nMaxDmrsSym = (nMaxRemDmrsSym > 0) ? nMaxRemDmrsSym : 1;
         }
         
         dynDescr.pDrvdUeGrpPrms  = pDrvdUeGrpPrmsGpu;
@@ -1920,9 +1954,14 @@ cuphyStatus_t puschRxRssi::setupRsrpMeas(cuphyPuschRxUeGrpPrms_t*      pDrvdUeGr
 {
     puschRxRsrpDynDescr_t* pDynDescrVecGpu = static_cast<puschRxRsrpDynDescr_t*>(pDynDescrsGpu);
 
-    if(!pDrvdUeGrpPrmsCpu || !pDrvdUeGrpPrmsGpu || !pDynDescrVecGpu || !pLaunchCfgs) return CUPHY_STATUS_INVALID_ARGUMENT;
+    if(!pDrvdUeGrpPrmsCpu || !pDrvdUeGrpPrmsGpu || !pDynDescrVecGpu || !pLaunchCfgs) [[unlikely]]
+        return CUPHY_STATUS_INVALID_ARGUMENT;
+    if((0 == pLaunchCfgs->nCfgs) || (pLaunchCfgs->nCfgs > CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS)) [[unlikely]]
+        return CUPHY_STATUS_INVALID_ARGUMENT;
     
-    if((dmrsSymbolIdx!=CUPHY_PUSCH_RSRP_EST_FIRST_DMRS)&&(dmrsSymbolIdx!=CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS)&&(dmrsSymbolIdx!=CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS))
+    if((dmrsSymbolIdx != CUPHY_PUSCH_RSRP_EST_FIRST_DMRS) &&
+       (dmrsSymbolIdx != CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS) &&
+       (dmrsSymbolIdx != CUPHY_PUSCH_RSRP_EST_FULL_SLOT_DMRS_WITHOUT_FIRST_DMRS)) [[unlikely]]
     {
          NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: Invalid dmrsSymbolIdx {}", __FUNCTION__, dmrsSymbolIdx);
          return CUPHY_STATUS_INVALID_ARGUMENT;

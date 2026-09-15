@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -146,52 +146,57 @@ int get_element_multiple_for_alignment(int byte_align, cuphyDataType_t type);
 // data_type_traits
 // clang-format off
 template <cuphyDataType_t T> struct data_type_traits;
-template <>                  struct data_type_traits<CUPHY_VOID>  { typedef void type;            };
-template <>                  struct data_type_traits<CUPHY_BIT>   { typedef uint32_t type;        };
-template <>                  struct data_type_traits<CUPHY_R_8I>  { typedef signed char type;     };
-template <>                  struct data_type_traits<CUPHY_C_8I>  { typedef char2 type;           };
-template <>                  struct data_type_traits<CUPHY_R_8U>  { typedef unsigned char type;   };
-template <>                  struct data_type_traits<CUPHY_C_8U>  { typedef uchar2 type;          };
-template <>                  struct data_type_traits<CUPHY_R_16I> { typedef short type;           };
-template <>                  struct data_type_traits<CUPHY_C_16I> { typedef short2 type;          };
-template <>                  struct data_type_traits<CUPHY_R_16U> { typedef unsigned short type;  };
-template <>                  struct data_type_traits<CUPHY_C_16U> { typedef ushort2 type;         };
-template <>                  struct data_type_traits<CUPHY_R_32I> { typedef int type;             };
-template <>                  struct data_type_traits<CUPHY_C_32I> { typedef int2 type;            };
-template <>                  struct data_type_traits<CUPHY_R_32U> { typedef unsigned int type;    };
-template <>                  struct data_type_traits<CUPHY_C_32U> { typedef uint2 type;           };
-template <>                  struct data_type_traits<CUPHY_R_16F> { typedef __half type;          };
-template <>                  struct data_type_traits<CUPHY_C_16F> { typedef __half2 type;         };
-template <>                  struct data_type_traits<CUPHY_R_32F> { typedef float type;           };
-template <>                  struct data_type_traits<CUPHY_C_32F> { typedef cuComplex type;       };
-template <>                  struct data_type_traits<CUPHY_R_64F> { typedef double type;          };
-template <>                  struct data_type_traits<CUPHY_C_64F> { typedef cuDoubleComplex type; };
+template <>                  struct data_type_traits<CUPHY_VOID>      { typedef void type;            };
+template <>                  struct data_type_traits<CUPHY_BIT>       { typedef uint32_t type;        };
+template <>                  struct data_type_traits<CUPHY_R_8I>      { typedef signed char type;     };
+template <>                  struct data_type_traits<CUPHY_C_8I>      { typedef char2 type;           };
+template <>                  struct data_type_traits<CUPHY_R_8U>      { typedef unsigned char type;   };
+template <>                  struct data_type_traits<CUPHY_C_8U>      { typedef uchar2 type;          };
+template <>                  struct data_type_traits<CUPHY_R_16I>     { typedef short type;           };
+template <>                  struct data_type_traits<CUPHY_C_16I>     { typedef short2 type;          };
+template <>                  struct data_type_traits<CUPHY_R_16U>     { typedef unsigned short type;  };
+template <>                  struct data_type_traits<CUPHY_C_16U>     { typedef ushort2 type;         };
+template <>                  struct data_type_traits<CUPHY_R_32I>     { typedef int type;             };
+template <>                  struct data_type_traits<CUPHY_C_32I>     { typedef int2 type;            };
+template <>                  struct data_type_traits<CUPHY_R_32U>     { typedef unsigned int type;    };
+template <>                  struct data_type_traits<CUPHY_C_32U>     { typedef uint2 type;           };
+template <>                  struct data_type_traits<CUPHY_R_16F>     { typedef __half type;          };
+template <>                  struct data_type_traits<CUPHY_C_16F>     { typedef __half2 type;         };
+template <>                  struct data_type_traits<CUPHY_R_32F>     { typedef float type;           };
+template <>                  struct data_type_traits<CUPHY_C_32F>     { typedef cuComplex type;       };
+template <>                  struct data_type_traits<CUPHY_R_64F>     { typedef double type;          };
+template <>                  struct data_type_traits<CUPHY_C_64F>     { typedef cuDoubleComplex type; };
+template <>                  struct data_type_traits<CUPHY_R_8F_E4M3> { typedef __nv_fp8_e4m3 type;   };
+template <>                  struct data_type_traits<CUPHY_R_8F_E5M2> { typedef __nv_fp8_e5m2 type;   };
+
 // clang-format on
 
 ////////////////////////////////////////////////////////////////////////////
 // type_to_cuphy_type
 // clang-format off
 template <typename T> struct type_to_cuphy_type;
-template <>           struct type_to_cuphy_type<void>            { static constexpr cuphyDataType_t value = CUPHY_VOID;  };
+template <>           struct type_to_cuphy_type<void>            { static constexpr cuphyDataType_t value = CUPHY_VOID;      };
 //template <>           struct type_to_cuphy_type<CUPHY_BIT>     { typedef uint32_t type;        };
-template <>           struct type_to_cuphy_type<signed char>     { static constexpr cuphyDataType_t value = CUPHY_R_8I;  };
-template <>           struct type_to_cuphy_type<char2>           { static constexpr cuphyDataType_t value = CUPHY_C_8I;  };
-template <>           struct type_to_cuphy_type<unsigned char>   { static constexpr cuphyDataType_t value = CUPHY_R_8U;  };
-template <>           struct type_to_cuphy_type<uchar2>          { static constexpr cuphyDataType_t value = CUPHY_C_8U;  };
-template <>           struct type_to_cuphy_type<short>           { static constexpr cuphyDataType_t value = CUPHY_R_16I; };
-template <>           struct type_to_cuphy_type<short2>          { static constexpr cuphyDataType_t value = CUPHY_C_16I; };
-template <>           struct type_to_cuphy_type<unsigned short>  { static constexpr cuphyDataType_t value = CUPHY_R_16U; };
-template <>           struct type_to_cuphy_type<ushort2>         { static constexpr cuphyDataType_t value = CUPHY_C_16U; };
-template <>           struct type_to_cuphy_type<int>             { static constexpr cuphyDataType_t value = CUPHY_R_32I; };
-template <>           struct type_to_cuphy_type<int2>            { static constexpr cuphyDataType_t value = CUPHY_C_32I; };
-template <>           struct type_to_cuphy_type<unsigned int>    { static constexpr cuphyDataType_t value = CUPHY_R_32U; };
-template <>           struct type_to_cuphy_type<uint2>           { static constexpr cuphyDataType_t value = CUPHY_C_32U; };
-template <>           struct type_to_cuphy_type<__half>          { static constexpr cuphyDataType_t value = CUPHY_R_16F; };
-template <>           struct type_to_cuphy_type<__half2>         { static constexpr cuphyDataType_t value = CUPHY_C_16F; };
-template <>           struct type_to_cuphy_type<float>           { static constexpr cuphyDataType_t value = CUPHY_R_32F; };
-template <>           struct type_to_cuphy_type<cuComplex>       { static constexpr cuphyDataType_t value = CUPHY_C_32F; };
-template <>           struct type_to_cuphy_type<double>          { static constexpr cuphyDataType_t value = CUPHY_R_64F; };
-template <>           struct type_to_cuphy_type<cuDoubleComplex> { static constexpr cuphyDataType_t value = CUPHY_C_64F; };
+template <>           struct type_to_cuphy_type<signed char>     { static constexpr cuphyDataType_t value = CUPHY_R_8I;      };
+template <>           struct type_to_cuphy_type<char2>           { static constexpr cuphyDataType_t value = CUPHY_C_8I;      };
+template <>           struct type_to_cuphy_type<unsigned char>   { static constexpr cuphyDataType_t value = CUPHY_R_8U;      };
+template <>           struct type_to_cuphy_type<uchar2>          { static constexpr cuphyDataType_t value = CUPHY_C_8U;      };
+template <>           struct type_to_cuphy_type<short>           { static constexpr cuphyDataType_t value = CUPHY_R_16I;     };
+template <>           struct type_to_cuphy_type<short2>          { static constexpr cuphyDataType_t value = CUPHY_C_16I;     };
+template <>           struct type_to_cuphy_type<unsigned short>  { static constexpr cuphyDataType_t value = CUPHY_R_16U;     };
+template <>           struct type_to_cuphy_type<ushort2>         { static constexpr cuphyDataType_t value = CUPHY_C_16U;     };
+template <>           struct type_to_cuphy_type<int>             { static constexpr cuphyDataType_t value = CUPHY_R_32I;     };
+template <>           struct type_to_cuphy_type<int2>            { static constexpr cuphyDataType_t value = CUPHY_C_32I;     };
+template <>           struct type_to_cuphy_type<unsigned int>    { static constexpr cuphyDataType_t value = CUPHY_R_32U;     };
+template <>           struct type_to_cuphy_type<uint2>           { static constexpr cuphyDataType_t value = CUPHY_C_32U;     };
+template <>           struct type_to_cuphy_type<__half>          { static constexpr cuphyDataType_t value = CUPHY_R_16F;     };
+template <>           struct type_to_cuphy_type<__half2>         { static constexpr cuphyDataType_t value = CUPHY_C_16F;     };
+template <>           struct type_to_cuphy_type<float>           { static constexpr cuphyDataType_t value = CUPHY_R_32F;     };
+template <>           struct type_to_cuphy_type<cuComplex>       { static constexpr cuphyDataType_t value = CUPHY_C_32F;     };
+template <>           struct type_to_cuphy_type<double>          { static constexpr cuphyDataType_t value = CUPHY_R_64F;     };
+template <>           struct type_to_cuphy_type<cuDoubleComplex> { static constexpr cuphyDataType_t value = CUPHY_C_64F;     };
+template <>           struct type_to_cuphy_type<__nv_fp8_e4m3>   { static constexpr cuphyDataType_t value = CUPHY_R_8F_E4M3; };
+template <>           struct type_to_cuphy_type<__nv_fp8_e5m2>   { static constexpr cuphyDataType_t value = CUPHY_R_8F_E5M2; };
 // clang-format on
 
 ////////////////////////////////////////////////////////////////////////

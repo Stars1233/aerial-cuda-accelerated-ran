@@ -16,23 +16,21 @@
  */
 
 #include "cumac.h"
+#include "common/schedulerTimeMeasure.h"
 
 // cuMAC namespace
 namespace cumac {
 
- // #define SCHEDULER_KERNEL_TIME_MEASURE_ 
- #ifdef SCHEDULER_KERNEL_TIME_MEASURE_
- constexpr uint16_t numRunSchKnlTimeMsr 1000;
- #endif
-
  #define dir 0 // controls direction of comparator sorts
 
+ /*VCAST_DONT_INSTRUMENT_START*/
  inline __device__ int smallestPow2(int k)
  {
     if (k == 1) {
        return 2;
     } else {
-       return 1 << (32-__clz(k-1));
+       // __clz return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems, thus the explicit cast
+       return 1 << (32-(int)__clz(k-1));
     }
  }
 
@@ -84,6 +82,7 @@ namespace cumac {
 
     __syncthreads(); 
  }
+/*VCAST_DONT_INSTRUMENT_END*/
 
  multiCellRRScheduler::multiCellRRScheduler(cumacCellGrpPrms* cellGrpPrms)
  {

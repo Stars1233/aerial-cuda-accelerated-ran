@@ -15,28 +15,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+from typing import List
 from setuptools import setup, find_packages
+
+def parse_requirements(path: str) -> List[str]:
+    """Parse a requirements.txt file into a list of dependency strings."""
+    lines = Path(path).read_text().splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.startswith('#') and not line.startswith('-')]
 
 setup(
     name='aerial_postproc',
     version='1.0.0',
     description='Aerial Post Processing - Performance analysis and log processing tools',
     packages=find_packages(),
-    python_requires='>=3.8',
-    install_requires=[
-        'pandas>=1.5.2',
-        'numpy>=1.24.0',
-        'bokeh>=2.4.3',
-        'holoviews>=1.15.2',
-        'h5py>=3.7.0',
-        'pyarrow>=12.0.1',
-        'tables>=3.7.0',
-        'pyparsing>=3.0.9',
-        'pyyaml>=6.0',
-        'colorama>=0.4.6',
-        'cxxfilt',
-        'ntplib',
-    ],
+    python_requires='>=3.8,<3.11',
+    install_requires=parse_requirements(
+        Path(__file__).parent / 'requirements.txt'
+    ),
     entry_points={
         'console_scripts': [
             # Add CLI entry points here if needed

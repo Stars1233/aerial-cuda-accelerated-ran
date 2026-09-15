@@ -14,7 +14,7 @@
 # limitations under the License.
 
 ---
-aerial_sdk_version: 26-1-cubb
+aerial_sdk_version: 26-2-cubb
 ru_emulator:
 
   ul_core_list: [2,3,4,5,6,7,8,9,10,11]
@@ -393,6 +393,346 @@ ru_emulator:
       nic: 0
       vlan: 2
       pcp: 7
+    -
+      name: "Cell21"
+      eth: "20:04:9B:9E:27:21"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell22"
+      eth: "20:04:9B:9E:27:22"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell23"
+      eth: "20:04:9B:9E:27:23"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell24"
+      eth: "20:04:9B:9E:27:24"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell25"
+      eth: "20:04:9B:9E:27:25"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell26"
+      eth: "20:04:9B:9E:27:26"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell27"
+      eth: "20:04:9B:9E:27:27"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell28"
+      eth: "20:04:9B:9E:27:28"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell29"
+      eth: "20:04:9B:9E:27:29"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell30"
+      eth: "20:04:9B:9E:27:30"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell31"
+      eth: "20:04:9B:9E:27:31"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell32"
+      eth: "20:04:9B:9E:27:32"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell33"
+      eth: "20:04:9B:9E:27:33"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell34"
+      eth: "20:04:9B:9E:27:34"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell35"
+      eth: "20:04:9B:9E:27:35"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell36"
+      eth: "20:04:9B:9E:27:36"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell37"
+      eth: "20:04:9B:9E:27:37"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell38"
+      eth: "20:04:9B:9E:27:38"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell39"
+      eth: "20:04:9B:9E:27:39"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
+    -
+      name: "Cell40"
+      eth: "20:04:9B:9E:27:40"
+      eAxC_UL: [0, 1, 2, 3]
+      eAxC_DL: [0, 1, 2, 3]
+      eAxC_prach_list: [5, 6, 7, 10]
+      eAxC_srs_list: [5, 6, 7, 10]
+      dl_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      ul_iq_data_fmt: {comp_meth: 1, bit_width: 9}
+      fs_offset_dl: 0
+      exponent_dl: 4
+      ref_dl: 0
+      ru_type: 3
+      peer: 0
+      nic: 0
+      vlan: 2
+      pcp: 7
   tti: 500
   dl_up_sanity_check: 1
   max_sect_stats: 0
@@ -412,6 +752,7 @@ ru_emulator:
   dlc_tb: 0
   fix_beta_dl: 1
   payload_validation: 1
+  prb_dup_check: 0
   enable_dl_proc_mt: 0 #Enable multi-threaded processing for dl_proc (receive/process)
   aerial_fh_txq_size: 1024
   aerial_fh_rxq_size: 1024

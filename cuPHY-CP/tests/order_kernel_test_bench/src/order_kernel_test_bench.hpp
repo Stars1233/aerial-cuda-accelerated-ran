@@ -24,6 +24,7 @@
 #include "yaml_parser.hpp"
 #include "utils.hpp"
 #include "gpudevice.hpp"
+#include "order_kernel_functions.hpp"
 #include "hdf5hpp.hpp"
 #include "../../../../cuPHY/examples/common/cuphy.hpp" // for cudaGreenContext
 #include <map>
@@ -551,6 +552,7 @@ private:
 
     cudaEvent_t start_ok_tb_process;
     cudaEvent_t end_ok_tb_process;
+    OrderKernelTbFunctions tb_kerns_; //!< Resolved CUfunction handles for test-bench-only order kernels
     struct doca_gpu_eth_rxq doca_rxq_info[UL_MAX_CELLS_PER_SLOT];    
 public:
     // Constructor to initialize the class
@@ -566,7 +568,7 @@ public:
     std::string get_config_file() const {
         return config_file_;
     }
-    int initialize();
+    [[nodiscard]] int initialize();
     void add_gpu_comm_ready_flags();
     void setup_input_params();
     void setup_config_params();

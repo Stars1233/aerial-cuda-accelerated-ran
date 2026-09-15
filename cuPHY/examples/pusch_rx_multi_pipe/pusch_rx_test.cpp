@@ -52,7 +52,7 @@ using ms = std::chrono::milliseconds;
 template <typename T>
 using us = std::chrono::microseconds;
 
-PuschRxTest::PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool useCuCtxs, cudaStream_t& delayCuStrm, std::vector<int>& cuStrmPrios, bool& startSyncPt, std::mutex& cvStartSyncPtMutex, std::condition_variable& cvStartSyncPt, std::atomic<std::uint32_t>& atmSyncPtWaitCnt, std::vector<uint32_t>& mpsActiveThrdPcts, uint32_t harq_attempts, uint32_t ldpcLaunchMode, uint32_t nMaxLdpcHetConfigs, bool drmDebug, bool debug, bool debugEqualizer, bool useGreenCtxs, uint8_t nMaxTbPerNode) :
+PuschRxTest::PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool useCuCtxs, cudaStream_t& delayCuStrm, std::vector<int>& cuStrmPrios, bool& startSyncPt, std::mutex& cvStartSyncPtMutex, std::condition_variable& cvStartSyncPt, std::atomic<std::uint32_t>& atmSyncPtWaitCnt, std::vector<uint32_t>& mpsActiveThrdPcts, uint32_t harq_attempts, uint32_t ldpcLaunchMode, uint32_t nMaxLdpcHetConfigs, bool drmDebug, bool debug, bool debugEqualizer, bool useGreenCtxs, uint8_t nMaxTbPerNode, uint8_t openRanFunctionalSplitMode, uint8_t kernelSelMode, uint8_t uciKernelSelMode, uint32_t delayUs, uint32_t subSlotDelayUs, PuschRxTestOptions options) :
     m_name(name),
     m_nPuschRxInst(nPuschRxInst),
     m_useCuCtxs(useCuCtxs),
@@ -69,6 +69,8 @@ PuschRxTest::PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool us
     m_ldpcLaunchMode(static_cast<cuphyPuschLdpcKernelLaunch_t>(ldpcLaunchMode)),
     m_nMaxLdpcHetConfigs(nMaxLdpcHetConfigs),
     m_nMaxTbPerNode(nMaxTbPerNode),
+    m_useCbLdpc(options.useCbLdpc),
+    m_earlySchCbDecodeMode(options.earlySchCbDecodeMode),
     m_debug(debug),
     m_enableNvProf(false),
     m_nIterations(0),
@@ -86,6 +88,13 @@ PuschRxTest::PuschRxTest(std::string const& name, uint32_t nPuschRxInst, bool us
     m_elapsedEvtTimeUsRun(nPuschRxInst),
     m_elapsedTimesUsSetup(nPuschRxInst),
     m_elapsedTimesUsRun(nPuschRxInst),
+    m_openRanFunctionalSplitMode(openRanFunctionalSplitMode),
+    m_kernelSelMode(kernelSelMode),
+    m_uciKernelSelMode(uciKernelSelMode),
+    m_delayUs(delayUs),
+    m_subSlotDelayUs(subSlotDelayUs),
+    m_timingSeriesRecords(nPuschRxInst),
+    m_timingJsonPath(std::move(options.timingJsonPath)),
     m_dbgTimePts0(nPuschRxInst),
     m_dbgTimePts1(nPuschRxInst),
     m_dbgTimePts2(nPuschRxInst),
@@ -138,6 +147,11 @@ void PuschRxTest::Setup(uint32_t                               nIterations,
                         const cuphy::cudaGreenContext&         greenCtx)
 
 {
+    if(nIterations == 0)
+    {
+        throw std::invalid_argument("PUSCH test requires at least one iteration");
+    }
+
     // timing parameters
     m_nIterations     = nIterations;
     m_enableNvProf    = enableNvProf;
@@ -152,6 +166,10 @@ void PuschRxTest::Setup(uint32_t                               nIterations,
 
     m_eStartProcRecorded = false;
     m_atmEndProcCnt      = 0;
+    for(auto& pipelineRecords : m_timingSeriesRecords)
+    {
+        pipelineRecords.clear();
+    }
 
     //pipeline parameters
     m_descramblingOn    = descramblingOn;
@@ -168,7 +186,6 @@ void PuschRxTest::Setup(uint32_t                               nIterations,
         m_elapsedEvtTimeUsRun[instIdx].resize(m_nIterations);
         m_elapsedTimesUsSetup[instIdx].resize(m_nIterations);
         m_elapsedTimesUsRun[instIdx].resize(m_nIterations);
-
         m_dbgTimePts0[instIdx].resize(m_nIterations);
         m_dbgTimePts1[instIdx].resize(m_nIterations);
         m_dbgTimePts2[instIdx].resize(m_nIterations);
@@ -266,7 +283,6 @@ void PuschRxTest::runTest(uint32_t instIdx, uint32_t transmission, uint32_t iter
     timePtStartSetup[puschSetupPhase] = Clock::now(); 
     puschRxPipe.setup(dynApiDataset.puschDynPrm, batchPrmHndl0);
     timePtStopSetup[puschSetupPhase] = Clock::now();
-
     evtTmrSetup[puschSetupPhase].record_end(cuStrm);
     
     //-------------------------------------------------------------------
@@ -284,13 +300,18 @@ void PuschRxTest::runTest(uint32_t instIdx, uint32_t transmission, uint32_t iter
     // copy early-HARQ results
     if(dynApiDataset.DataOut.isEarlyHarqPresent == 1)
     {
-        CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalHarqDetectionStatus, dynApiDataset.DataOut.HarqDetectionStatus, dynApiDataset.totNumUes, cudaMemcpyHostToHost, cuStrm));
+        if (staticApiDataset.puschStatPrms.openRanFunctionalSplitOption!=PUSCH_7_2_E)
+        {
+            CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalHarqDetectionStatus, dynApiDataset.DataOut.HarqDetectionStatus, dynApiDataset.totNumUes, cudaMemcpyHostToHost, cuStrm));
+            CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalUciCrcFlags, dynApiDataset.DataOut.pUciCrcFlags, dynApiDataset.nUciSegs, cudaMemcpyHostToHost, cuStrm));
+            CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalPreEqSinrEhq, dynApiDataset.DataOut.pSinrPreEq, sizeof(float)*dynApiDataset.cellGrpDynPrm.nUes, cudaMemcpyHostToHost, cuStrm));
+            CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalRsrpEhq, dynApiDataset.DataOut.pRsrp, sizeof(float)*dynApiDataset.cellGrpDynPrm.nUes, cudaMemcpyHostToHost, cuStrm));
+            CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalRssiEhq, dynApiDataset.DataOut.pRssi, sizeof(float)*dynApiDataset.cellGrpDynPrm.nUeGrps, cudaMemcpyHostToHost, cuStrm));
+        }
+
         CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalUciPayloads, dynApiDataset.DataOut.pUciPayloads, dynApiDataset.nUciPayloadBytes, cudaMemcpyHostToHost, cuStrm));
-        CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalUciCrcFlags, dynApiDataset.DataOut.pUciCrcFlags, dynApiDataset.nUciSegs, cudaMemcpyHostToHost, cuStrm));
-        CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalPreEqSinrEhq, dynApiDataset.DataOut.pSinrPreEq, sizeof(float)*dynApiDataset.cellGrpDynPrm.nUes, cudaMemcpyHostToHost, cuStrm));
-        CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalRsrpEhq, dynApiDataset.DataOut.pRsrp, sizeof(float)*dynApiDataset.cellGrpDynPrm.nUes, cudaMemcpyHostToHost, cuStrm));
-        CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(dynApiDataset.evalRssiEhq, dynApiDataset.DataOut.pRssi, sizeof(float)*dynApiDataset.cellGrpDynPrm.nUeGrps, cudaMemcpyHostToHost, cuStrm));
     }
+
     //-------------------------------------------------------------------
     // Run Pipeline - full-slot processing phase
     puschRunPhase = PUSCH_RUN_FULL_SLOT_PROC;
@@ -337,6 +358,19 @@ void PuschRxTest::runTest(uint32_t instIdx, uint32_t transmission, uint32_t iter
     evtTmrRun[PUSCH_RUN_FULL_SLOT_PROC].synchronize();
     evtTmrRun[PUSCH_RUN_FULL_SLOT_COPY].synchronize();
     cuphyStrm.synchronize();
+    
+    if(m_kernelSelMode != PUSCH_ALL || m_uciKernelSelMode != PUSCH_UCI_ALL)
+    {
+        // Measure UCI-on-PUSCH completion time (from full-slot run start to UCI completion)
+        float uciOnPuschElapsedMs = 0.0f;
+        CUDA_CHECK_EXCEPTION(cudaEventElapsedTime(&uciOnPuschElapsedMs,
+                          evtTmrRun[PUSCH_RUN_FULL_SLOT_PROC].begin_event_handle(),
+                          staticApiDataset.puschStatPrms.uciOnPuschCompletedEvent));
+        float uciOnPuschElapsedUs = uciOnPuschElapsedMs * 1000.0f;
+    
+        NVLOGD_FMT(NVLOG_PUSCH, "UCI-on-PUSCH execution time {}us", uciOnPuschElapsedUs);
+    }
+
     // timePtStopRun = Clock::now();          // ?? try wall clock here too
 
     //------------------------------------------------------------------
@@ -492,9 +526,11 @@ void PuschRxTest::PipelineWrkrEntry(uint32_t instIdx, const std::string& trtYaml
         // Load datasets from h5 file
         cuphy::stream& cuphyStrm = m_cuphyStrms[instIdx];
         cudaStream_t cuStrm = cuphyStrm.handle();
-        StaticApiDataset staticApiDataset(m_inputFileNameVec[0], cuStrm, m_outputFileNameVec[instIdx], m_descramblingOn, 0, true, nullptr, m_ldpcLaunchMode);
+        StaticApiDataset staticApiDataset(m_inputFileNameVec[0], cuStrm, m_outputFileNameVec[instIdx], m_descramblingOn, 0, true, nullptr, m_ldpcLaunchMode, m_openRanFunctionalSplitMode, m_kernelSelMode, m_uciKernelSelMode, m_delayUs, m_subSlotDelayUs);
         staticApiDataset.puschStatPrms.nMaxLdpcHetConfigs = m_nMaxLdpcHetConfigs;
         staticApiDataset.puschStatPrms.nMaxTbPerNode = m_nMaxTbPerNode;
+        staticApiDataset.puschStatPrms.useCbLdpcDecoder = m_useCbLdpc;
+        staticApiDataset.puschStatPrms.earlySchCbDecodeMode = m_earlySchCbDecodeMode;
         CUDA_CHECK(cudaStreamSynchronize(cuStrm));
         
         if (not trtYamlInput.empty()) {
@@ -544,9 +580,8 @@ void PuschRxTest::PipelineWrkrEntry(uint32_t instIdx, const std::string& trtYaml
 
                 //-------------------------------------------------------------------
                 // Setup datasets
-                DynApiDataset dynApiDataset(m_inputFileNameVec[slotIdx], cuStrm, m_procModeBmsk, true, m_fp16Mode, 0, m_drmDebug);
+                DynApiDataset dynApiDataset(m_inputFileNameVec[slotIdx], cuStrm, m_procModeBmsk, true, m_fp16Mode, 0, m_drmDebug, m_openRanFunctionalSplitMode);
                 EvalDataset   evalDataset(m_inputFileNameVec[slotIdx], cuStrm, 0, m_drmDebug);
-
                 //-------------------------------------------------------------------
                 // Pre-allocate HARQ buffers based on the calculated requirements from setupPhase 1
                 // Note: to avoid HARQ buffer allocation in critical path (requires memory allocation on host and device side) invoke a dummy
@@ -670,9 +705,12 @@ void PuschRxTest::PipelineWrkrEntry(uint32_t instIdx, const std::string& trtYaml
 
                 //---------------------------------------------------------------------------
                 // Display timing and TB/CB/UCI Bler
-                DisplayTiming(instIdx, slotIdx, evalDataset.nBytesVec[0], m_debug);
-                DisplayBler(evalDataset, dynApiDataset, instIdx, m_debug, m_drmDebug);
-                evalDataset.computeNumUciCbErrors(dynApiDataset, true);
+                DisplayTiming(instIdx, slotIdx, transmissions, evalDataset.nBytesVec[0], m_debug);
+                DisplayBler(evalDataset, staticApiDataset, dynApiDataset, instIdx, m_debug, m_drmDebug);
+                if(staticApiDataset.puschStatPrms.uciKernelSelOption == PUSCH_UCI_ALL && staticApiDataset.puschStatPrms.kernelSelOption != PUSCH_NO_SD_DERATE_MATCHING_FEC)
+                {
+                    evalDataset.computeNumUciCbErrors(dynApiDataset, true, staticApiDataset.puschStatPrms.openRanFunctionalSplitOption);
+                }
                 //  evalDataset.reportPuschCrcErrors(dynApiDataset.puschDynPrm);
 
                 //----------------------------------------------------------------------------
@@ -682,7 +720,10 @@ void PuschRxTest::PipelineWrkrEntry(uint32_t instIdx, const std::string& trtYaml
 
                 //---------------------------------------------------------------------------
                 // Verify internal pipeline probes
-                evalDataset.evalPuschRx(m_outputFileNameVec[instIdx], staticApiDataset, dynApiDataset, cuStrm);
+                if(staticApiDataset.puschStatPrms.openRanFunctionalSplitOption!=PUSCH_7_2_E)
+                {
+                    evalDataset.evalPuschRx(m_outputFileNameVec[instIdx], staticApiDataset, dynApiDataset, cuStrm);
+                }
 
                 if(m_useCuCtxs) CU_CHECK(cuCtxSynchronize());
             }
@@ -715,17 +756,49 @@ void PuschRxTest::WaitForCompletion()
         printf("%s Pipeline[%d]: Joining worker thread\n", m_name.c_str(), instIdx);
         instIdx++;
     }
+    WriteTimingJson();
+}
+
+void PuschRxTest::WriteTimingJson() const
+{
+    if(m_timingJsonPath.empty())
+    {
+        return;
+    }
+
+    cuphy::examples::timing::TimingReport report("cuphy_ex_pusch_rx_multi_pipe");
+    report.add_metadata("iterations", static_cast<int64_t>(m_nIterations));
+    report.add_metadata("pipelines", static_cast<int64_t>(m_nPuschRxInst));
+    report.add_metadata("delay_ms", static_cast<int64_t>(m_delayMs));
+    report.add_metadata("harq_attempts", static_cast<int64_t>(m_harqAttempts));
+    report.add_metadata("proc_mode_bmsk", static_cast<int64_t>(m_procModeBmsk));
+    report.add_metadata("ldpc_launch_mode", static_cast<int64_t>(m_ldpcLaunchMode));
+    report.add_metadata("max_ldpc_het_configs", static_cast<int64_t>(m_nMaxLdpcHetConfigs));
+    report.add_metadata("max_tb_per_node", static_cast<int64_t>(m_nMaxTbPerNode));
+    report.add_metadata("use_cb_ldpc", static_cast<int64_t>(m_useCbLdpc));
+    report.add_metadata("early_sch_cb_decode_mode", static_cast<int64_t>(m_earlySchCbDecodeMode));
+    report.add_metadata("use_cuda_contexts", m_useCuCtxs);
+    report.add_metadata("use_green_contexts", m_useGreenCtxs);
+
+    for(const auto& pipelineRecords : m_timingSeriesRecords)
+    {
+        for(const auto& record : pipelineRecords)
+        {
+            report.add_series(record.series, record.tags);
+        }
+    }
+
+    report.write_json(m_timingJsonPath, cuphy::examples::timing::ReportOptions{});
 }
 
 
-void PuschRxTest::DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t nBytes, bool debug, bool throughput, bool execTime)
+void PuschRxTest::DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t transmissionIdx, uint32_t nBytes, bool debug, bool throughput, bool execTime)
 {
-    // Helper to update accumulated, max and min values
-    auto updateAccumMinMaxVals = [](float instVal, float& accumVal, float& maxVal, float& minVal)
+    namespace timing = cuphy::examples::timing;
+
+    auto summaryValue = [](const std::optional<double>& value)
     {
-        accumVal += instVal;
-        maxVal    = std::max(instVal, maxVal);
-        minVal    = std::min(instVal, minVal);
+        return value.value_or(0.0);
     };
 
     //-------------------------------------------------------------------------------------------        
@@ -735,115 +808,96 @@ void PuschRxTest::DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t nBy
     auto& instElapsedEvtTimeUsRun   = m_elapsedEvtTimeUsRun[instIdx]; 
     auto& instElapsedTimeUsRun      = m_elapsedTimesUsRun[instIdx];
 
-    std::array<float, PUSCH_SETUP_MAX_PHASES> accumElapsedEvtTimeUsSetup, accumElapsedTimeUsSetup;
-    accumElapsedEvtTimeUsSetup.fill(0.0f);
-    accumElapsedTimeUsSetup.fill(0.0f);
-    
-    std::array<float, PUSCH_RUN_MAX_PHASES> accumElapsedEvtTimeUsRun, accumElapsedTimeUsRun;
-    accumElapsedEvtTimeUsRun.fill(0.0f);
-    accumElapsedTimeUsRun.fill(0.0f);
+    auto makeTags = [instIdx, slotIdx, transmissionIdx](const std::string& backend, const std::string& stage, const std::string& phase)
+    {
+        return std::vector<std::pair<std::string, std::string>>{
+            {"backend", backend},
+            {"stage", stage},
+            {"phase", phase},
+            {"pipeline", std::to_string(instIdx)},
+            {"slot", std::to_string(slotIdx)},
+            {"transmission", std::to_string(transmissionIdx)}};
+    };
 
-    std::array<float, PUSCH_SETUP_MAX_PHASES> maxElapsedEvtTimeUsSetup, maxElapsedTimeUsSetup;
-    maxElapsedEvtTimeUsSetup.fill(std::numeric_limits<float>::min());
-    maxElapsedTimeUsSetup.fill(std::numeric_limits<float>::min());
-    
-    std::array<float, PUSCH_RUN_MAX_PHASES> maxElapsedEvtTimeUsRun, maxElapsedTimeUsRun;
-    maxElapsedEvtTimeUsRun.fill(std::numeric_limits<float>::min());
-    maxElapsedTimeUsRun.fill(std::numeric_limits<float>::min());
+    auto summarizeAndRecord = [this, instIdx](timing::SampleSeries series, std::vector<std::pair<std::string, std::string>> tags)
+    {
+        timing::SummaryStats stats = series.summary();
+        if(!m_timingJsonPath.empty())
+        {
+            m_timingSeriesRecords[instIdx].push_back({std::move(series), std::move(tags)});
+        }
+        return stats;
+    };
 
-    std::array<float, PUSCH_SETUP_MAX_PHASES> minElapsedEvtTimeUsSetup, minElapsedTimeUsSetup;
-    minElapsedEvtTimeUsSetup.fill(std::numeric_limits<float>::max());
-    minElapsedTimeUsSetup.fill(std::numeric_limits<float>::max());
-    
-    std::array<float, PUSCH_RUN_MAX_PHASES> minElapsedEvtTimeUsRun, minElapsedTimeUsRun;
-    minElapsedEvtTimeUsRun.fill(std::numeric_limits<float>::max());
-    minElapsedTimeUsRun.fill(std::numeric_limits<float>::max());
-    
-    for(uint32_t iterIdx = 0; iterIdx < m_nIterations; ++iterIdx)
-    {    
-        // Setup phase-1
-        updateAccumMinMaxVals(instElapsedEvtTimeUsSetup[iterIdx][PUSCH_SETUP_PHASE_1], 
-                              accumElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1],
-                              maxElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1],
-                              minElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1]);
+    auto makeSetupSeries = [this](const std::string& name, const auto& samples, uint32_t phase)
+    {
+        timing::SampleSeries series(name);
+        for(uint32_t iterIdx = 0; iterIdx < m_nIterations; ++iterIdx)
+        {
+            series.add_sample(samples[iterIdx][phase]);
+        }
+        return series;
+    };
 
-        updateAccumMinMaxVals(instElapsedTimeUsSetup[iterIdx][PUSCH_SETUP_PHASE_1],
-                              accumElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1],
-                              maxElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1],
-                              minElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1]);
+    auto makeRunSeries = makeSetupSeries;
 
-        // Setup phase-2
-        updateAccumMinMaxVals(instElapsedEvtTimeUsSetup[iterIdx][PUSCH_SETUP_PHASE_2], 
-                              accumElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2],
-                              maxElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2],
-                              minElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2]);
+    auto makeTotalSeries = [this](const std::string& name, const auto& setupSamples, const auto& runSamples)
+    {
+        timing::SampleSeries series(name);
+        for(uint32_t iterIdx = 0; iterIdx < m_nIterations; ++iterIdx)
+        {
+            series.add_sample(setupSamples[iterIdx][PUSCH_SETUP_PHASE_1] +
+                              setupSamples[iterIdx][PUSCH_SETUP_PHASE_2] +
+                              runSamples[iterIdx][PUSCH_RUN_SUB_SLOT_PROC] +
+                              runSamples[iterIdx][PUSCH_RUN_FULL_SLOT_PROC] +
+                              runSamples[iterIdx][PUSCH_RUN_FULL_SLOT_COPY]);
+        }
+        return series;
+    };
 
-        updateAccumMinMaxVals(instElapsedTimeUsSetup[iterIdx][PUSCH_SETUP_PHASE_2],
-                              accumElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2],
-                              maxElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2],
-                              minElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2]);
+    std::array<timing::SummaryStats, PUSCH_SETUP_MAX_PHASES> evtSetupStats;
+    std::array<timing::SummaryStats, PUSCH_RUN_MAX_PHASES>   evtRunStats;
+    std::array<timing::SummaryStats, PUSCH_SETUP_MAX_PHASES> cpuSetupStats;
+    std::array<timing::SummaryStats, PUSCH_RUN_MAX_PHASES>   cpuRunStats;
 
-        // Run early-HARQ phase
-        updateAccumMinMaxVals(instElapsedEvtTimeUsRun[iterIdx][PUSCH_RUN_SUB_SLOT_PROC],
-                              accumElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-                              maxElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-                              minElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC]);
+    evtSetupStats[PUSCH_SETUP_PHASE_1] =
+        summarizeAndRecord(makeSetupSeries("gpu.setup.phase_1", instElapsedEvtTimeUsSetup, PUSCH_SETUP_PHASE_1),
+                           makeTags("cuda_event", "setup", "phase_1"));
+    evtSetupStats[PUSCH_SETUP_PHASE_2] =
+        summarizeAndRecord(makeSetupSeries("gpu.setup.phase_2", instElapsedEvtTimeUsSetup, PUSCH_SETUP_PHASE_2),
+                           makeTags("cuda_event", "setup", "phase_2"));
+    evtRunStats[PUSCH_RUN_SUB_SLOT_PROC] =
+        summarizeAndRecord(makeRunSeries("gpu.run.sub_slot_proc", instElapsedEvtTimeUsRun, PUSCH_RUN_SUB_SLOT_PROC),
+                           makeTags("cuda_event", "run", "sub_slot_proc"));
+    evtRunStats[PUSCH_RUN_FULL_SLOT_PROC] =
+        summarizeAndRecord(makeRunSeries("gpu.run.full_slot_proc", instElapsedEvtTimeUsRun, PUSCH_RUN_FULL_SLOT_PROC),
+                           makeTags("cuda_event", "run", "full_slot_proc"));
+    evtRunStats[PUSCH_RUN_FULL_SLOT_COPY] =
+        summarizeAndRecord(makeRunSeries("gpu.run.full_slot_copy", instElapsedEvtTimeUsRun, PUSCH_RUN_FULL_SLOT_COPY),
+                           makeTags("cuda_event", "run", "full_slot_copy"));
 
-        updateAccumMinMaxVals(instElapsedTimeUsRun[iterIdx][PUSCH_RUN_SUB_SLOT_PROC],
-                              accumElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-                              maxElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-                              minElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC]);
+    cpuSetupStats[PUSCH_SETUP_PHASE_1] =
+        summarizeAndRecord(makeSetupSeries("cpu.setup.phase_1", instElapsedTimeUsSetup, PUSCH_SETUP_PHASE_1),
+                           makeTags("cpu_clock", "setup", "phase_1"));
+    cpuSetupStats[PUSCH_SETUP_PHASE_2] =
+        summarizeAndRecord(makeSetupSeries("cpu.setup.phase_2", instElapsedTimeUsSetup, PUSCH_SETUP_PHASE_2),
+                           makeTags("cpu_clock", "setup", "phase_2"));
+    cpuRunStats[PUSCH_RUN_SUB_SLOT_PROC] =
+        summarizeAndRecord(makeRunSeries("cpu.run.sub_slot_proc", instElapsedTimeUsRun, PUSCH_RUN_SUB_SLOT_PROC),
+                           makeTags("cpu_clock", "run", "sub_slot_proc"));
+    cpuRunStats[PUSCH_RUN_FULL_SLOT_PROC] =
+        summarizeAndRecord(makeRunSeries("cpu.run.full_slot_proc", instElapsedTimeUsRun, PUSCH_RUN_FULL_SLOT_PROC),
+                           makeTags("cpu_clock", "run", "full_slot_proc"));
+    cpuRunStats[PUSCH_RUN_FULL_SLOT_COPY] =
+        summarizeAndRecord(makeRunSeries("cpu.run.full_slot_copy", instElapsedTimeUsRun, PUSCH_RUN_FULL_SLOT_COPY),
+                           makeTags("cpu_clock", "run", "full_slot_copy"));
 
-        // Run full-slot processing phase
-        updateAccumMinMaxVals(instElapsedEvtTimeUsRun[iterIdx][PUSCH_RUN_FULL_SLOT_PROC],
-                              accumElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-                              maxElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-                              minElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC]);
-
-        updateAccumMinMaxVals(instElapsedTimeUsRun[iterIdx][PUSCH_RUN_FULL_SLOT_PROC],
-                              accumElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-                              maxElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-                              minElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC]);
-                              
-        // Run full-slot D2H copy phase
-        updateAccumMinMaxVals(instElapsedEvtTimeUsRun[iterIdx][PUSCH_RUN_FULL_SLOT_COPY],
-                              accumElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-                              maxElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-                              minElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY]);
-
-        updateAccumMinMaxVals(instElapsedTimeUsRun[iterIdx][PUSCH_RUN_FULL_SLOT_COPY],
-                              accumElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-                              maxElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-                              minElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY]);
-    }
-
-    std::array<float, PUSCH_SETUP_MAX_PHASES> avgElapsedEvtTimeUsSetup;
-    avgElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1] = accumElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1] / m_nIterations;
-    avgElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2] = accumElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2] / m_nIterations;
-    
-    std::array<float, PUSCH_RUN_MAX_PHASES> avgElapsedEvtTimeUsRun;
-    avgElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC] = accumElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC] / m_nIterations;
-    avgElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC]  = accumElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC] / m_nIterations;
-    avgElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY]  = accumElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY] / m_nIterations;
-
-    std::array<float, PUSCH_SETUP_MAX_PHASES> avgElapsedTimeUsSetup;
-    avgElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1] = accumElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1] / m_nIterations;
-    avgElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2] = accumElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2] / m_nIterations;
-    
-    std::array<float, PUSCH_RUN_MAX_PHASES> avgElapsedTimeUsRun;
-    avgElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC] = accumElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC] / m_nIterations;
-    avgElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC]  = accumElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC] / m_nIterations;
-    avgElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY]  = accumElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY] / m_nIterations;
-
-    // Total GPU
-    float avgTotalElapsedEvtTimeUs = (accumElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1] + accumElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2] +
-                                      accumElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC] + accumElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC] +
-                                      accumElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY]) / m_nIterations;
-
-    // Total CPU
-    float avgTotalElapsedTimeUs = (accumElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1] + accumElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2] +
-                                   accumElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC] + accumElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC] +
-                                   accumElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY]) / m_nIterations;
+    timing::SummaryStats evtTotalStats =
+        summarizeAndRecord(makeTotalSeries("gpu.total", instElapsedEvtTimeUsSetup, instElapsedEvtTimeUsRun),
+                           makeTags("cuda_event", "total", "all"));
+    timing::SummaryStats cpuTotalStats =
+        summarizeAndRecord(makeTotalSeries("cpu.total", instElapsedTimeUsSetup, instElapsedTimeUsRun),
+                           makeTags("cpu_clock", "total", "all"));
 
     printf("slot %u ---------------------------------------------------------------\n", slotIdx);
     //------------------------------------------------------------------------------------------------------
@@ -854,9 +908,12 @@ void PuschRxTest::DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t nBy
         // CPU time (Setup/Run API host processing) and GPU setup time (CPU to GPU transfers and any other setup work on GPU) can be 
         // pipelined with GPU processing time
         size_t nEncodedBits = nBytes * 8;
+        const double avgGpuRunUs = summaryValue(evtRunStats[PUSCH_RUN_SUB_SLOT_PROC].mean) +
+                                   summaryValue(evtRunStats[PUSCH_RUN_FULL_SLOT_PROC].mean) +
+                                   summaryValue(evtRunStats[PUSCH_RUN_FULL_SLOT_COPY].mean);
         printf("PuschRx Pipeline[%02d]: Metric - Throughput (w/ GPU runtime only): %07.4f Gbps (encoded input bits %lu) \n",
                instIdx,
-               (static_cast<float>(nEncodedBits) / ((avgElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC] + avgElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC] + avgElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY]) * 1e-6)) / 1e9,
+               (static_cast<float>(nEncodedBits) / (avgGpuRunUs * 1e-6)) / 1e9,
                nEncodedBits);
     }
 
@@ -864,57 +921,47 @@ void PuschRxTest::DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t nBy
     // Display timing:
     if(execTime)
     {
-        printf("%s Pipeline[%02d]: Metric - GPU Time usec (using CUDA events, over %04d runs): Run-P1 %07.4f (%07.4f, %07.4f) Run-P2 %07.4f (%07.4f, %07.4f) Run-P3 %07.4f (%07.4f, %07.4f) Setup-P1 %07.4f (%07.4f, %07.4f) Setup-P2 %07.4f (%07.4f, %07.4f) Total %07.4f\n",
+        const std::vector<std::string> gpuTimingLines = timing::format_phase_summary_table_lines({
+            {"Run-P1", evtRunStats[PUSCH_RUN_SUB_SLOT_PROC]},
+            {"Run-P2", evtRunStats[PUSCH_RUN_FULL_SLOT_PROC]},
+            {"Run-P3", evtRunStats[PUSCH_RUN_FULL_SLOT_COPY]},
+            {"Setup-P1", evtSetupStats[PUSCH_SETUP_PHASE_1]},
+            {"Setup-P2", evtSetupStats[PUSCH_SETUP_PHASE_2]},
+            {"Total", evtTotalStats}});
+        printf("%s Pipeline[%02d]: Metric - GPU Time usec (using CUDA events, over %04d runs)\n",
                m_name.c_str(),
                instIdx,
-               m_nIterations,
-               avgElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-               minElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-               maxElapsedEvtTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-               avgElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-               minElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-               maxElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-               avgElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-               minElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-               maxElapsedEvtTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-               avgElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1],
-               minElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1],
-               maxElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_1],
-               avgElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2],
-               minElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2],
-               maxElapsedEvtTimeUsSetup[PUSCH_SETUP_PHASE_2],
-               avgTotalElapsedEvtTimeUs);
-    
-        printf("%s Pipeline[%02d]: Metric - CPU Time usec (using wall clock w/ %u ms delay kernel, over %04d runs): Run-P1 %07.4f (%07.4f, %07.4f) Run-P2 %07.4f (%07.4f, %07.4f) Run-P3 %07.4f (%07.4f, %07.4f) Setup-P1 %07.4f (%07.4f, %07.4f) Setup-P2 %07.4f (%07.4f, %07.4f) Total %07.4f\n",
+               m_nIterations);
+        for(const std::string& line : gpuTimingLines)
+        {
+            printf("%s Pipeline[%02d]:   %s\n", m_name.c_str(), instIdx, line.c_str());
+        }
+
+        const std::vector<std::string> cpuTimingLines = timing::format_phase_summary_table_lines({
+            {"Run-P1", cpuRunStats[PUSCH_RUN_SUB_SLOT_PROC]},
+            {"Run-P2", cpuRunStats[PUSCH_RUN_FULL_SLOT_PROC]},
+            {"Run-P3", cpuRunStats[PUSCH_RUN_FULL_SLOT_COPY]},
+            {"Setup-P1", cpuSetupStats[PUSCH_SETUP_PHASE_1]},
+            {"Setup-P2", cpuSetupStats[PUSCH_SETUP_PHASE_2]},
+            {"Total", cpuTotalStats}});
+        printf("%s Pipeline[%02d]: Metric - CPU Time usec (using wall clock w/ %u ms delay kernel, over %04d runs)\n",
                m_name.c_str(),
                instIdx,
                m_delayMs,
-               m_nIterations,
-               avgElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-               minElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-               maxElapsedTimeUsRun[PUSCH_RUN_SUB_SLOT_PROC],
-               avgElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-               minElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-               maxElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_PROC],
-               avgElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-               minElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-               maxElapsedTimeUsRun[PUSCH_RUN_FULL_SLOT_COPY],
-               avgElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1],
-               minElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1],
-               maxElapsedTimeUsSetup[PUSCH_SETUP_PHASE_1],
-               avgElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2],
-               minElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2],
-               maxElapsedTimeUsSetup[PUSCH_SETUP_PHASE_2],
-               avgTotalElapsedTimeUs);
-    
-        printf("%s Pipeline[%02d]: Total time usec GPU (CUDA event) %07.4f CPU (wall clock) %07.4f\n",
-               m_name.c_str(),
-               instIdx,
-               avgTotalElapsedEvtTimeUs,
-               avgTotalElapsedTimeUs);
+               m_nIterations);
+        for(const std::string& line : cpuTimingLines)
+        {
+            printf("%s Pipeline[%02d]:   %s\n", m_name.c_str(), instIdx, line.c_str());
+        }
 
         // if(debug)
         {
+            auto updateAccumMinMaxVals = [](float instVal, float& accumVal, float& maxVal, float& minVal)
+            {
+                accumVal += instVal;
+                maxVal    = std::max(instVal, maxVal);
+                minVal    = std::min(instVal, minVal);
+            };
             float accumCpuThrdNotifyDelayUs = 0.0f, accumIdealDelayKernelTimeUs = 0.0f;
             float maxCpuThrdNotifyDelayUs = std::numeric_limits<float>::min(), maxIdealDelayKernelTimeUs = std::numeric_limits<float>::min();
             float minCpuThrdNotifyDelayUs = std::numeric_limits<float>::max(), minIdealDelayKernelTimeUs = std::numeric_limits<float>::max();
@@ -939,14 +986,14 @@ void PuschRxTest::DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t nBy
                                       minIdealDelayKernelTimeUs);
             }
 
-            printf("%s Pipeline[%02d]: Debug - start-event record to notify delay in usec (wall clock) %07.4f (%07.4f, %07.4f)\n",
+            printf("%s Pipeline[%02d]: Debug - start-event record to notify delay in usec (wall clock) %07.3f (%07.3f, %07.3f)\n",
                    m_name.c_str(),
                    instIdx,
                    accumCpuThrdNotifyDelayUs/m_nIterations,
                    minCpuThrdNotifyDelayUs,
                    maxCpuThrdNotifyDelayUs);
 
-            printf("%s Pipeline[%02d]: Debug - start-event notify to pipelne launch start delay in usec (wall clock) %07.4f (%07.4f, %07.4f)\n",
+            printf("%s Pipeline[%02d]: Debug - start-event notify to pipelne launch start delay in usec (wall clock) %07.3f (%07.3f, %07.3f)\n",
                    m_name.c_str(),
                    instIdx,
                    accumIdealDelayKernelTimeUs/m_nIterations,
@@ -960,19 +1007,24 @@ void PuschRxTest::DisplayTiming(uint32_t instIdx, uint32_t slotIdx, uint32_t nBy
 //-------------------------------------------------------------------------------------
 // function computes and displays codeblock and CRC errors
 
-void DisplayBler(EvalDataset& evalDataset, DynApiDataset const& dynApiDataset, uint32_t instIdx, bool debug, bool drmDebug)
+void DisplayBler(EvalDataset& evalDataset, StaticApiDataset const& staticApiDataset, DynApiDataset const& dynApiDataset, uint32_t instIdx, bool debug, bool drmDebug)
 {
     // output of Rx pipeline:
     uint32_t* pCbCrcs                 = dynApiDataset.DataOut.pCbCrcs;
     uint32_t* pTbCrcs                 = dynApiDataset.DataOut.pTbCrcs;
     uint8_t*  pEstTbBytes             = dynApiDataset.DataOut.pTbPayloads;
 
-
-    // compute SCH Bler
-    uint32_t nCbErrors =  evalDataset.computeNumCbErrors(dynApiDataset);
-
-    // compute UCI BLER
-    evalDataset.computeNumUciCbErrors(dynApiDataset, false);
+    if(staticApiDataset.puschStatPrms.kernelSelOption == PUSCH_ALL)
+    {
+        // compute SCH Bler
+        uint32_t nCbErrors =  evalDataset.computeNumCbErrors(dynApiDataset);
+        NVLOGD_FMT(NVLOG_PUSCH,  "The number of CB errors {} for PUSCH.", nCbErrors);
+    }
+    if(staticApiDataset.puschStatPrms.uciKernelSelOption == PUSCH_UCI_ALL && staticApiDataset.puschStatPrms.kernelSelOption != PUSCH_NO_SD_DERATE_MATCHING_FEC)
+    {
+        // compute UCI BLER
+        evalDataset.computeNumUciCbErrors(dynApiDataset, false, staticApiDataset.puschStatPrms.openRanFunctionalSplitOption);
+    }
     // uint32_t nUciCbs, nUciCbErrors, nSchCbs, nSchCbErrors;
     // evalDataset.computeNumUciCbErrors(dynApiDataset, nUciCbErrors, nUciCbs);
 
@@ -1084,6 +1136,3 @@ void DisplayBler(EvalDataset& evalDataset, DynApiDataset const& dynApiDataset, u
         }
     }
 }
-
-
-

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -163,6 +163,7 @@ void LdpcRateMatch::run(const cuphy::tensor_device& dInputBits,
     constexpr bool interCellBatching = false;
     constexpr bool restructureKernel = false;
     constexpr uint8_t descAsyncCopy = 1;        // Copy descriptor to the GPU during setup.
+    constexpr uint8_t postFecRmScramblingProcessing = 0U;
     cuphyPdschStatusOut_t pdschStatusOut{};     // Populated during cuphySetupDlRateMatching, but contents not used here
     cuphyStatus_t status = cuphySetupDlRateMatching(rmHandle.get(),
                                                     &pdschStatusOut,
@@ -180,6 +181,7 @@ void LdpcRateMatch::run(const cuphy::tensor_device& dInputBits,
                                                     enablePrecoding,
                                                     restructureKernel,
                                                     interCellBatching,
+                                                    postFecRmScramblingProcessing, // post-FEC-RM scrambling mode not supported here
                                                     m_hRmWorkspace.addr(),
                                                     m_dRmWorkspace.addr(),  // Explicit H2D copy as part of setup
                                                     const_cast<PdschPerTbParams*>(tbParams.addr()),
@@ -219,7 +221,7 @@ void LdpcRateMatch::run(const cuphy::tensor_device& dInputBits,
     }
 
     // Run the kernel.
-    if(CUresult r = launch_kernel(rmHandle->m_kernelNodeParams[0], m_cuStream); r != CUDA_SUCCESS) {
+    if(CUresult r = launch_kernel_ex(rmHandle->m_kernelNodeParams[0], m_cuStream, true); r != CUDA_SUCCESS) {
         NVLOGE_FMT(NVLOG_PYAERIAL, AERIAL_PYAERIAL_EVENT, "Rate matching kernel launch failed!");
         throw std::runtime_error("LdpcRateMatch::run: Invalid argument for kernel launch!");
     }

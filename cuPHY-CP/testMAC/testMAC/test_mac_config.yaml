@@ -15,7 +15,7 @@
 
 # MAC configuration file
 ---
-aerial_sdk_version: 26-1-cubb
+aerial_sdk_version: 26-2-cubb
 name: fapi_gnb_configure_mac
 class: test_mac
 
@@ -171,6 +171,9 @@ tv_data_map_enable: 1
 
 # Enable dummy DL_TTI and UL_TTI request
 enable_dummy_tti: 0
+
+# Enable SLOT.response for empty slots
+enable_empty_slot_resp: 1
 
 # FAPI TB data location option. See enum dl_tb_loc in nv_phy_module.hpp
 # 0 - CPU_MSG buffer; 1 - CPU_DATA buffer; 2 - CUDA_DATA buffer

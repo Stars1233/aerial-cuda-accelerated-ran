@@ -22,16 +22,23 @@ from bokeh.plotting import show
 from bokeh.io import output_file
 from bokeh.layouts import row, column
 import pandas as pd
-import argparse
 import numpy as np
 import csv
 import time
 import os
+import sys
 
 from functools import partial
 
 #Variable to reference our 3 slot advance, in usec (used for testmac STT calculation)
 L2_ADVANCE_TIME = 1500
+
+# Metrics whose source TI markers are architecturally absent on the framework C-plane path.
+# Soft-skipped only when caller passes --framework-cplane (explicit opt-in; without the flag,
+# an all-NaN column for any of these still hard-fails so legacy regressions stay loud).
+FRAMEWORK_CPLANE_SKIP_METRICS = {
+    'tick_to_fhcb_completion',
+}
 
 #Deadlines for DLU/DLC/ULC
 from aerial_postproc.logparse import getReceptionWindow, TrafficType, TestCaseType, SLOT_TIME
@@ -387,6 +394,7 @@ def main(args):
         df_ru_ontime = pmio.data['df_ru_ontime']
     else:
         print("Error:: Invalid input_data %s"%args.input_data)
+        sys.exit(1)
 
     tt2 = time.time()
 
@@ -478,6 +486,14 @@ def main(args):
         'PUSCH': ['t0_to_pusch_completion', 'pusch_headroom', 'pusch_gpu_run_duration',
                   't0_to_pusch_eh_completion', 'pusch_eh_headroom', 'ulutx_pusch_ontime_percentage'],
     }
+    dl_channel_metric_map = {
+        'PDSCH': ['pdsch_gpu_total_duration'],
+        'PDCCH': ['pdcch_gpu_total_duration'],
+        'CSIRS': ['csirs_gpu_total_duration'],
+        'PBCH': ['pbch_gpu_total_duration'],
+        'COMPRESSION': ['compression_gpu_total_duration'],
+        'DLBFW': ['dlbfw_gpu_run_duration'],
+    }
     ignored_ul_metrics = []
     ignored_ul_channels = set()
     for channel in args.ignore_ul_channels:
@@ -488,6 +504,15 @@ def main(args):
             print("Note: Ignoring UL channel %s metrics: %s" % (channel_upper, ', '.join(ul_channel_metric_map[channel_upper])))
         else:
             print("WARNING: Unknown UL channel '%s'. Valid channels: %s" % (channel, ', '.join(ul_channel_metric_map.keys())))
+
+    ignored_dl_metrics = []
+    for channel in args.ignore_dl_channels:
+        channel_upper = channel.upper()
+        if channel_upper in dl_channel_metric_map:
+            ignored_dl_metrics.extend(dl_channel_metric_map[channel_upper])
+            print("Note: Ignoring DL channel %s metrics: %s" % (channel_upper, ', '.join(dl_channel_metric_map[channel_upper])))
+        else:
+            print("WARNING: Unknown DL channel '%s'. Valid channels: %s" % (channel, ', '.join(dl_channel_metric_map.keys())))
 
     non_srs_ul_channels = {'PUCCH', 'PRACH', 'PUSCH'}
     if non_srs_ul_channels.issubset(ignored_ul_channels):
@@ -549,7 +574,7 @@ def main(args):
     #Create PUSCH Early HARQ timeline
     EH_ENABLED = len(df_ti[(df_ti.task=='UL Task AGGR3 Early UCI IND') & (df_ti.subtask=='Signal Completion')]) > 0
     if EH_ENABLED:
-        add_ti_field(merged_df,'t0_to_pusch_eh_completion',df_ti,'UL Task AGGR3 Early UCI IND','Signal Completion','start_deadline', args.quantile)
+        add_ti_field(merged_df,'t0_to_pusch_eh_completion',df_ti,'UL Task AGGR3 Early UCI IND','Run PUSCH_RUN_FULL_SLOT_COPY','start_deadline', args.quantile)
         add_headroom_field(merged_df,'t0_to_pusch_eh_completion','pusch_eh_headroom',eh_slot_deadlines)
 
     #Create SRS timeline
@@ -570,7 +595,7 @@ def main(args):
 
     #GPU Fields
     #Populates everything defined in gpu_channel_name_map
-    gpu_ignore_list = ignore_list + ignored_ul_metrics
+    gpu_ignore_list = ignore_list + ignored_ul_metrics + ignored_dl_metrics
     if not args.mmimo_enable:
         gpu_ignore_list += mmimo_only_metric_list
     add_gpu_fields(merged_df, df_gpu, gpu_channel_name_map, args.quantile, gpu_ignore_list)
@@ -615,8 +640,13 @@ def main(args):
     #Validate that at each metric has at least one slot populated
     print("Running column validation...")
     all_valid = True
-    
+
     for col in [aa for aa in merged_df.columns if aa not in ['slot']]:
+        # Framework C-plane path opt-in: caller has declared these metrics N/A on this path
+        if args.framework_cplane and col in FRAMEWORK_CPLANE_SKIP_METRICS:
+            print("Note: Skipping check on %s (framework C-plane mode: TI marker not produced by this path)"%col)
+            continue
+
         #Ignore tick_to_l2_start if ignore_ticks is enabled
         if args.ignore_ticks and col == 'tick_to_l2_start':
             print("Note: skipping check on %s (--ignore_ticks is enabled)"%col)
@@ -645,6 +675,11 @@ def main(args):
         #Skip metrics for ignored UL channels (specified via --ignore_ul_channels)
         if col in ignored_ul_metrics:
             print("Note: Skipping check on %s (UL channel ignored via --ignore_ul_channels)"%col)
+            continue
+
+        #Skip metrics for ignored DL channels (specified via --ignore_dl_channels)
+        if col in ignored_dl_metrics:
+            print("Note: Skipping check on %s (DL channel ignored via --ignore_dl_channels)"%col)
             continue
             
         #For BFW/non-BFW fields, it's okay if one of them is empty as long as at least one has values
@@ -729,6 +764,9 @@ if __name__ == "__main__":
 
   # Skip PUCCH, PRACH, and SRS validation
   %(prog)s /path/to/results/ -p perf_metrics.csv -c PUCCH PRACH SRS
+
+  # Ignore specific DL channels (e.g. logs have only PDSCH/PDCCH)
+  %(prog)s /path/to/results/ -p perf_metrics.csv -d CSIRS PBCH COMPRESSION DLBFW
 """
     )
     parser.add_argument(
@@ -763,6 +801,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-c", "--ignore_ul_channels", nargs="+", default=[], help="List of UL channels to ignore in validation (e.g., PUCCH PRACH SRS PUSCH). Both timeline and GPU duration metrics for specified channels will be skipped."
+    )
+    parser.add_argument(
+        "-d", "--ignore_dl_channels", nargs="+", default=[], help="List of DL channels to ignore in validation (e.g., PDSCH PDCCH CSIRS PBCH COMPRESSION DLBFW). GPU duration metrics for specified channels will be skipped."
+    )
+    parser.add_argument(
+        "--framework-cplane", dest="framework_cplane", action="store_true", help="Framework C-plane mode. Soft-skip metrics in FRAMEWORK_CPLANE_SKIP_METRICS whose source TI markers are architecturally not produced by the framework C-plane path. Without this flag, all-NaN metrics hard-fail (legacy behavior, preserved)."
     )
     args = parser.parse_args()
 

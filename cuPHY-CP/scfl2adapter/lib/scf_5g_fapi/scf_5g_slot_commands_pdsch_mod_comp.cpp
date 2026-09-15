@@ -1274,11 +1274,24 @@ namespace scf_5g_fapi {
                 update_mod_comp_info_section(prb_info, prb_info.common.reMask,  ue.beta_qam, qamModOrder, DEFAULT_CSF);
                 break;
             case PDSCH_CSIRS: {
+                // PDSCH PRB overlaps with CSI-RS on this symbol. Emit the
+                // PDSCH mod-comp section first, then locate the CSI-RS PRB
+                // whose port mask intersects this PDSCH port mask, accumulate
+                // the re-mask across all CSI-RS sub-ports mapped to the same
+                // PDSCH port, and emit a second mod-comp section
+                // (CUPHY_QAM_4 + CSI-RS beta) so the FH encoder applies the
+                // correct scaling on overlapping REs.
                 auto common_port_mask = prb_info.common.pdschPortMask;
                 NVLOGD_FMT(TAG, "symbol {} common_port_mask 0x{:x} reMask 0x{:x}", tempPdschSym, common_port_mask, +prb_info.common.reMask);
                 update_mod_comp_info_section(prb_info, prb_info.common.reMask, ue.beta_qam, qamModOrder, DEFAULT_CSF);
 
-                auto iter = std::find_if(csi_rs_prb_info.begin(), csi_rs_prb_info.end(),[&common_port_mask, &prbs, num_csirs_eaxcids](const auto& e){ 
+                // Find the first CSI-RS PRB whose port mask intersects the
+                // PDSCH port mask. CSI-RS port indices fold modulo
+                // num_csirs_eaxcids because each eAxC carries
+                // num_csirs_eaxcids sub-ports — a CSI-RS configured on ports
+                // 8..15 needs its mask collapsed to bits 0..(N-1) before
+                // testing intersection with the PDSCH mask.
+                auto iter = std::find_if(csi_rs_prb_info.begin(), csi_rs_prb_info.end(),[&common_port_mask, &prbs, num_csirs_eaxcids](const auto& e){
                         uint64_t portMask = prbs[e].common.portMask;
                         if (__builtin_clzll(portMask) < (64 - num_csirs_eaxcids)) {
                             uint64_t newMask = 0;
@@ -1294,10 +1307,14 @@ namespace scf_5g_fapi {
                             return ((portMask & common_port_mask) != 0);
                                 });
                 if (iter != csi_rs_prb_info.end()) {
-                    
+
+                    // Seed the (reMask, ap_index) pair list and the combined
+                    // CSI-RS re-mask from the first overlapping CSI-RS PRB.
+                    // The last section of comp_info is the in-progress one
+                    // for this symbol (sections are append-only).
                     auto& csirs_prb = prbs[*iter];
                     auto next_iter = iter + num_csirs_eaxcids;
-                    auto& csirs_section = csirs_prb.comp_info.sections[csirs_prb.comp_info.common.nSections - 1]; 
+                    auto& csirs_section = csirs_prb.comp_info.sections[csirs_prb.comp_info.common.nSections - 1];
                     float beta = csirs_prb.comp_info.modCompScalingValue[csirs_prb.comp_info.common.nSections - 1];
                     uint16_t csirs_reMask = csirs_section.mcScaleReMask;
                     overlap_csirs_port_info.reMask_ap_idx_pairs[overlap_csirs_port_info.num_overlap_ports].first = csirs_reMask;
@@ -1308,9 +1325,14 @@ namespace scf_5g_fapi {
                     //for this purpose. As we want to know what is the total number of ports assigned by CSI-RS
                     //configuration. We need this information for correct beam ID assignment to overlapping CSI-RS sections.
                     overlap_csirs_port_info.num_ports = sym_prbs->overlap_csirs_port_info[*iter].num_ports;
-                    //Accumulate reMask for all ports of csirs mapped to same pdsch port.
+                    // Accumulate reMask across the remaining CSI-RS PRBs that
+                    // map to the same PDSCH port. The CSI-RS PRB list is laid
+                    // out with one entry per (eAxC, sub-port), so we advance
+                    // by num_csirs_eaxcids each iteration. Stop as soon as
+                    // the next entry's folded port bit no longer overlaps
+                    // the PDSCH port mask.
                     while(next_iter < csi_rs_prb_info.end()){
-                    
+
                         auto& next_csirs_prb = prbs[*next_iter];
                         uint8_t bit_index = __builtin_ctzll(next_csirs_prb.common.portMask);
                         uint8_t new_bit_index = bit_index % num_csirs_eaxcids;
@@ -1326,10 +1348,17 @@ namespace scf_5g_fapi {
                         next_iter+= num_csirs_eaxcids;
                     }
                     NVLOGD_FMT(TAG, "csirs_section.mcScaleReMask.get() {} beta {} reMask {} portMask {}", csirs_reMask, beta, +csirs_prb.common.reMask, +csirs_prb.common.portMask);
+                    // Emit the second mod-comp section for this PRB carrying
+                    // the combined CSI-RS coverage: QAM4 modulation, CSI-RS
+                    // beta scaling, and the union of CSI-RS sub-port re-masks.
                     update_mod_comp_info_section(prb_info, csirs_reMask, beta, CUPHY_QAM_4, csirs_section.csf);
                     // We are assuming that all other values like beam ids modcomp related values are same for different ports of csirs.
                     std::copy(csirs_prb.beams_array.begin(), csirs_prb.beams_array.begin() + csirs_prb.beams_array_size, prb_info.beams_array2.begin());
-                    prb_info.beams_array_size2 = csirs_prb.beams_array_size;       
+                    prb_info.beams_array_size2 = csirs_prb.beams_array_size;
+                    // Back-reference the source CSI-RS PRB index so downstream
+                    // beam-ID assignment can recover the originating CSI-RS
+                    // configuration that produced this overlap section.
+                    overlap_csirs_port_info.csirs_prb_idx = static_cast<uint16_t>(*iter);
                 }
             }
             break;

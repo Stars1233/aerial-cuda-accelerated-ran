@@ -17,274 +17,61 @@
 
 # -*- coding: utf-8 -*-
 """
-cuMAC MIMO Test Suite
+cuMAC 64T64R MU-MIMO channel-model Test Suite (GT-10416)
 
-This script generates and executes comprehensive test combinations for cuMAC multi-cell MU-MIMO scheduler.
-
-Features:
-- Automatic dependency installation (allpairspy, yq)
-- Optimized test combination generation using pairwise testing
-- Detailed test execution logging
-- Individual test log files for each combination
-- Comprehensive summary reports
-- Support for partial test execution (by index or range)
+Generates and executes the standalone 64T64R MU-MIMO channel-model validation
+sweep for the cuMAC multi-cell scheduler: it jointly exercises the GPU-based
+3GPP 38.901 channel model, multi-cell interference, EESM PHY abstraction and
+channel-estimation error modeling. Each combination runs the scheduler binary
+(-t <slots> -l), then the cellStatAnalysis.py post-analysis; a case passes only
+if both print their PASS line.
 
 Usage:
-  python3 cumac_64tr_test.py                    # Generate test combinations only
-  python3 cumac_64tr_test.py --execute         # Execute all test combinations
-  python3 cumac_64tr_test.py --execute 5       # Execute single combination (index 0005)
-  python3 cumac_64tr_test.py --execute 10-20   # Execute range of combinations (0010-0020)
-  python3 cumac_64tr_test.py --execute --log-dir /path/to/logs  # Execute with custom log directory
+  python3 cumac_64tr_test.py                    # Generate combinations only
+  python3 cumac_64tr_test.py --execute          # Execute all combinations
+  python3 cumac_64tr_test.py --execute 5        # Execute single combination (index 0005)
+  python3 cumac_64tr_test.py --execute 10-20    # Execute range of combinations (0010-0020)
+  python3 cumac_64tr_test.py --smoke --execute  # Execute the smoke subset
+  python3 cumac_64tr_test.py --execute --log-dir /path/to/logs  # Custom log directory
 
 Environment Variables:
-  cuBB_SDK: Path to cuBB SDK (default: /opt/nvidia/cuBB/)
+  cuBB_SDK:           Path to cuBB SDK (default: /opt/nvidia/cuBB/)
+  CUMAC_SIM_SLOTS:    Simulation slots for -t (default 1000)
+  CUMAC_TEST_TIMEOUT: Per-combination timeout in seconds (default 3600)
+  CUBB_BUILD_TIMEOUT: cuBB build timeout in seconds when build.<arch> is missing (default 7200)
 
 Output Files:
-- cumac_64tr_combinations.csv: Generated test combinations
-- ccumac_64tr_test.py.csv: Test execution results
-- test_logs/ (or custom log directory): Directory containing detailed logs
-  - test_execution.log: Main execution log
-  - test_XXXX_YYYYMMDD_HHMMSS.log: Individual test logs
-  - test_summary_report.txt: Comprehensive summary report
+- cumac_64tr_chanmodel_combinations.csv: Generated test combinations
+- cumac_64tr_results.csv: Test execution results
+- test_logs/ (or custom log directory): per-case folders with log, config.yaml,
+  result H5 and the per-cell plot PNG, plus test_execution.log and
+  test_summary_report.txt
 
 Dependencies:
-- Python packages: allpairspy, pyyaml
-- System tools: yq (for YAML manipulation)
+- System tools: yq (YAML manipulation), compute environment with the cuBB SDK
+- Post-analysis: cellStatAnalysis.py (matplotlib; auto-installed if missing)
 """
 
 import csv
+import glob
+import itertools
+import platform
+import shutil
 import subprocess
 import time
 import os
 import sys
 import logging
 from datetime import datetime
-try:
-    from allpairspy import AllPairs
-    import yaml
-    print("✓ All required Python dependencies are already available")
-except ImportError as e:
-    print(f"Failed to import allpairspy or pyyaml: {e}")
-    print("This might be due to:")
-    print("0. Python package not installed")
-    print("1. Python path issues")
-    print("2. Virtual environment not activated")
-    print("3. Package installed in different Python environment")
-    sys.exit(1)
+from pathlib import Path
 
-# Updated parameter definitions based on requirements
-PARAMETERS = {
-    "nCell": [1, 3, 6, 8, 10, 12, 16, 20, 24],  # Number of cells in simulation
-    "nActiveUePerCell": [16, 32, 64, 128],   # Active UEs per cell (also used for grouping and max active)
-    "numUeSchdPerCellTTI": [6, 8, 16],          # UEs scheduled per Transmission Time Interval
-    "nPrbGrp": [34, 68],                     # Physical Resource Block groups
-    "harqEnabled": [0, 1],                   # HARQ feature flag (0=disabled, 1=enabled)
-    "nMaxLayerPerUeMuDl": [2, 4],            # Max layers per UE for DL MU-MIMO
-    "nMaxUegPerCellDl": [1, 2, 4],           # Max UE groups per cell in downlink
-    "chanCorrThr": [0.05, 0.1, 0.2, 0.4, 0.7, 0.9]  # Channel correlation threshold
-}
-
-# Constraint validation function
+# Directory of this script - anchor the combination/result CSVs here so the same
+# files are read/written regardless of the caller's working directory (the YAML
+# slices and --execute <index> rely on a stable persisted index mapping).
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def is_valid_combination(values) -> bool:
-    """Check if parameter combination meets system constraints"""
-    if len(values) < 8:
-        return True  # Allow partial combinations during generation
-
-    nCell, nActiveUePerCell, numUeSchdPerCellTTI, nPrbGrp, harqEnabled, nMaxLayerPerUeMuDl, nMaxUegPerCellDl, chanCorrThr = values
-
-    # Scheduled UEs must be >= UE groups
-    if numUeSchdPerCellTTI < nMaxUegPerCellDl:
-        return False
-
-    return True
-
-
-def generate_test_combinations():
-    """Generate optimized test combinations based on specific requirements"""
-    all_combinations = []
-
-    # Requirement 1: numUeSchdPerCellTTI = 6 full coverage on 1,3,6,8,10,16,20,24 cells
-    print("Generating Requirement 1: numUeSchdPerCellTTI = 6 full coverage on 1,3,6,8,10,16,12,20,24 cells...")
-    for nCell in [1, 3, 6, 8, 10, 12, 16, 20, 24]:
-        for nActiveUePerCell in PARAMETERS["nActiveUePerCell"]:
-            for harqEnabled in PARAMETERS["harqEnabled"]:
-                for nMaxLayerPerUeMuDl in PARAMETERS["nMaxLayerPerUeMuDl"]:
-                    for nMaxUegPerCellDl in PARAMETERS["nMaxUegPerCellDl"]:
-                        for nPrbGrp in PARAMETERS["nPrbGrp"]:
-                            for chanCorrThr in PARAMETERS["chanCorrThr"]:
-                                # Skip invalid combinations
-                                if 6 < nMaxUegPerCellDl:  # numUeSchdPerCellTTI is fixed at 6
-                                    continue
-
-                                combo = {
-                                    "nCell": nCell,
-                                    "nActiveUePerCell": nActiveUePerCell,
-                                    "numUeSchdPerCellTTI": 6,
-                                    "nPrbGrp": nPrbGrp,
-                                    "harqEnabled": harqEnabled,
-                                    "nMaxLayerPerUeMuDl": nMaxLayerPerUeMuDl,
-                                    "nMaxUegPerCellDl": nMaxUegPerCellDl,
-                                    "chanCorrThr": chanCorrThr
-                                }
-                                all_combinations.append(combo)
-
-    # Requirement 2: numUeSchdPerCellTTI = 8, nActiveUePerCell=128, full coverage on 12, 24 cells
-    print("Generating Requirement 2: numUeSchdPerCellTTI = 8, nActiveUePerCell=128 full coverage on 12, 24 cells...")
-    for nCell in [12, 24]:
-        for harqEnabled in PARAMETERS["harqEnabled"]:
-            for nMaxLayerPerUeMuDl in PARAMETERS["nMaxLayerPerUeMuDl"]:
-                for nMaxUegPerCellDl in PARAMETERS["nMaxUegPerCellDl"]:
-                    for nPrbGrp in PARAMETERS["nPrbGrp"]:
-                        for chanCorrThr in PARAMETERS["chanCorrThr"]:
-                            # Skip invalid combinations
-                            if 8 < nMaxUegPerCellDl:  # numUeSchdPerCellTTI is fixed at 8
-                                continue
-
-                            combo = {
-                                "nCell": nCell,
-                                "nActiveUePerCell": 128,
-                                "numUeSchdPerCellTTI": 8,
-                                "nPrbGrp": nPrbGrp,
-                                "harqEnabled": harqEnabled,
-                                "nMaxLayerPerUeMuDl": nMaxLayerPerUeMuDl,
-                                "nMaxUegPerCellDl": nMaxUegPerCellDl,
-                                "chanCorrThr": chanCorrThr
-                            }
-                            all_combinations.append(combo)
-
-    # Requirement 3: numUeSchdPerCellTTI = 16, nActiveUePerCell=128, full coverage on 6, 24 cells
-    print("Generating Requirement 3: numUeSchdPerCellTTI = 16, nActiveUePerCell=128 full coverage on 6, 24 cells...")
-    for nCell in [6, 24]:
-        for harqEnabled in PARAMETERS["harqEnabled"]:
-            for nMaxLayerPerUeMuDl in PARAMETERS["nMaxLayerPerUeMuDl"]:
-                for nMaxUegPerCellDl in PARAMETERS["nMaxUegPerCellDl"]:
-                    for nPrbGrp in PARAMETERS["nPrbGrp"]:
-                        for chanCorrThr in PARAMETERS["chanCorrThr"]:
-                            # Skip invalid combinations
-                            if 16 < nMaxUegPerCellDl:  # numUeSchdPerCellTTI is fixed at 16
-                                continue
-
-                            combo = {
-                                "nCell": nCell,
-                                "nActiveUePerCell": 128,
-                                "numUeSchdPerCellTTI": 16,
-                                "nPrbGrp": nPrbGrp,
-                                "harqEnabled": harqEnabled,
-                                "nMaxLayerPerUeMuDl": nMaxLayerPerUeMuDl,
-                                "nMaxUegPerCellDl": nMaxUegPerCellDl,
-                                "chanCorrThr": chanCorrThr
-                            }
-                            all_combinations.append(combo)
-
-    # Requirement 4: nMaxUegPerCellDl = 4, nActiveUePerCell=128, nPrbGrp = 68, numUeSchdPerCellTTI = 16, Spot Check on 1,3,8,10,12,16,20 Cells
-    print("Generating Requirement 4: Spot check combinations...")
-    for nCell in [1, 3, 8, 10, 12, 16, 20]:
-        for harqEnabled in PARAMETERS["harqEnabled"]:
-            for nMaxLayerPerUeMuDl in PARAMETERS["nMaxLayerPerUeMuDl"]:
-                for chanCorrThr in PARAMETERS["chanCorrThr"]:
-                    combo = {
-                        "nCell": nCell,
-                        "nActiveUePerCell": 128,
-                        "numUeSchdPerCellTTI": 16,
-                        "nPrbGrp": 68,
-                        "harqEnabled": harqEnabled,
-                        "nMaxLayerPerUeMuDl": nMaxLayerPerUeMuDl,
-                        "nMaxUegPerCellDl": 4,
-                        "chanCorrThr": chanCorrThr
-                    }
-                    all_combinations.append(combo)
-
-    # Add additional pairwise combinations for comprehensive coverage
-    print("Generating additional pairwise combinations...")
-    pairwise_combinations = []
-
-    # Generate pairwise combinations with constraint validation
-    for combo in AllPairs(
-        [
-            PARAMETERS["nCell"],
-            PARAMETERS["nActiveUePerCell"],
-            PARAMETERS["numUeSchdPerCellTTI"],
-            PARAMETERS["nPrbGrp"],
-            PARAMETERS["harqEnabled"],
-            PARAMETERS["nMaxLayerPerUeMuDl"],
-            PARAMETERS["nMaxUegPerCellDl"],
-            PARAMETERS["chanCorrThr"]
-        ],
-        filter_func=is_valid_combination
-    ):
-        pairwise_combinations.append({
-            "nCell": combo[0],
-            "nActiveUePerCell": combo[1],
-            "numUeSchdPerCellTTI": combo[2],
-            "nPrbGrp": combo[3],
-            "harqEnabled": combo[4],
-            "nMaxLayerPerUeMuDl": combo[5],
-            "nMaxUegPerCellDl": combo[6],
-            "chanCorrThr": combo[7]
-        })
-
-    # Add unique pairwise combinations
-    for combo in pairwise_combinations:
-        if combo not in all_combinations:
-            all_combinations.append(combo)
-
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_combinations = []
-    for combo in all_combinations:
-        combo_tuple = tuple(sorted(combo.items()))
-        if combo_tuple not in seen:
-            seen.add(combo_tuple)
-            unique_combinations.append(combo)
-
-    return unique_combinations
-
-
-def expand_combinations(combinations):
-    """Expand combinations to include the redundant parameters for compatibility"""
-    expanded_combinations = []
-
-    for combo in combinations:
-        expanded_combo = {
-            "nCell": combo["nCell"],
-            "nActiveUePerCell": combo["nActiveUePerCell"],
-            "numUeForGrpPerCell": combo["nActiveUePerCell"],  # Same as nActiveUePerCell
-            "nMaxActUePerCell": combo["nActiveUePerCell"],    # Same as nActiveUePerCell
-            "numUeSchdPerCellTTI": combo["numUeSchdPerCellTTI"],
-            "nPrbGrp": combo["nPrbGrp"],
-            "harqEnabled": combo["harqEnabled"],
-            "nMaxLayerPerUeMuDl": combo["nMaxLayerPerUeMuDl"],
-            "nMaxUegPerCellDl": combo["nMaxUegPerCellDl"],
-            "chanCorrThr": combo["chanCorrThr"]
-        }
-        expanded_combinations.append(expanded_combo)
-
-    return expanded_combinations
-
-
-def save_to_csv(combinations, filename="cumac_64tr_combinations.csv"):
-    """Save generated test combinations to CSV file with proper sorting"""
-    # Sort combinations by nCell, nActiveUePerCell, numUeSchdPerCellTTI, nPrbGrp
-    sorted_combinations = sorted(combinations, key=lambda x: (x['nCell'], x['nActiveUePerCell'], x['numUeSchdPerCellTTI'], x['nPrbGrp']))
-
-    # Add index to each combination
-    for i, combo in enumerate(sorted_combinations, 1):
-        combo['index'] = f"{i:04d}"
-
-    with open(filename, 'w', newline='') as csvfile:
-        fieldnames = ['index'] + list(sorted_combinations[0].keys())[:-1]  # Put index first, remove the duplicate index
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-        writer.writeheader()
-        for combo in sorted_combinations:
-            writer.writerow(combo)
-
-    print(f"Generated {len(sorted_combinations)} test cases saved to {filename}")
-
-
-def load_combinations_from_csv(filename="cumac_64tr_combinations.csv"):
+def load_combinations_from_csv(filename="cumac_64tr_chanmodel_combinations.csv"):
     """Load combinations from existing CSV file"""
     combinations = []
     with open(filename, 'r', newline='') as csvfile:
@@ -302,63 +89,69 @@ def get_cubb_sdk_path():
     return cubb_sdk
 
 
-def update_config_file(combo):
-    """Update the config.yaml file with the given combination parameters"""
+# Timeout (seconds) for the cuBB SDK build that runs when build.<arch> is
+# missing; a full build is slow. Overridable via env CUBB_BUILD_TIMEOUT.
+CUBB_BUILD_TIMEOUT = int(os.environ.get("CUBB_BUILD_TIMEOUT", "7200"))
+
+# Timeout (seconds) for the one-off matplotlib install done when the container
+# lacks it (cellStatAnalysis.py imports matplotlib at module load).
+MATPLOTLIB_INSTALL_TIMEOUT = int(os.environ.get("MATPLOTLIB_INSTALL_TIMEOUT", "300"))
+
+
+def get_cubb_build_dir():
+    """Arch-specific cuBB build folder (build.x86_64 / build.aarch64).
+
+    Mirrors the shell `build.$(uname -m)` layout via platform.machine().
+    """
+    return f"{get_cubb_sdk_path()}build.{platform.machine()}"
+
+
+def ensure_cubb_build():
+    """Build the cuBB SDK if the arch-specific build.<arch> folder is missing.
+
+    The test executable lives under build.<arch>/; if that folder does not
+    exist yet, run $cuBB_SDK/testBenches/phase4_test_scripts/build_aerial_sdk.sh
+    (from the SDK root) before executing any test.
+    """
+    build_dir = get_cubb_build_dir()
+    if os.path.isdir(build_dir):
+        return
+
     cubb_sdk = get_cubb_sdk_path()
-    config_path = f"{cubb_sdk}cuMAC/examples/multiCellMuMimoScheduler/config.yaml"
+    build_script = f"{cubb_sdk}testBenches/phase4_test_scripts/build_aerial_sdk.sh"
+    if not os.path.exists(build_script):
+        raise FileNotFoundError(f"cuBB build script not found: {build_script}")
 
-    # Check if config file exists
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    # Update each parameter using yq
-    yq_commands = [
-        f"yq -i '.nCell = {combo['nCell']}' {config_path}",
-        f"yq -i '.nActiveUePerCell = {combo['nActiveUePerCell']}' {config_path}",
-        f"yq -i '.numUeForGrpPerCell = {combo['numUeForGrpPerCell']}' {config_path}",
-        f"yq -i '.nMaxActUePerCell = {combo['nMaxActUePerCell']}' {config_path}",
-        f"yq -i '.numUeSchdPerCellTTI = {combo['numUeSchdPerCellTTI']}' {config_path}",
-        f"yq -i '.nPrbGrp = {combo['nPrbGrp']}' {config_path}",
-        f"yq -i '.harqEnabled = {combo['harqEnabled']}' {config_path}",
-        f"yq -i '.nMaxLayerPerUeMuDl = {combo['nMaxLayerPerUeMuDl']}' {config_path}",
-        f"yq -i '.nMaxUegPerCellDl = {combo['nMaxUegPerCellDl']}' {config_path}",
-        f"yq -i '.chanCorrThr = {combo['chanCorrThr']}' {config_path}"
-    ]
-
-    for cmd in yq_commands:
-        try:
-            subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Error updating config: {e}")
-            print(f"Command: {cmd}")
-            print(f"Error output: {e.stderr}")
-            raise
+    print(f"Build folder {build_dir} not found; building cuBB via {build_script} ...")
+    logging.info("Building cuBB SDK (missing %s) via %s", build_dir, build_script)
+    subprocess.run(["bash", build_script], cwd=cubb_sdk,
+                   check=True, timeout=CUBB_BUILD_TIMEOUT)
 
 
-def run_test():
-    """Run the multiCellMuMimoScheduler test"""
-    cubb_sdk = get_cubb_sdk_path()
-    test_executable = f"{cubb_sdk}build/cuMAC/examples/multiCellMuMimoScheduler/multiCellMuMimoScheduler"
-    config_path = f"{cubb_sdk}cuMAC/examples/multiCellMuMimoScheduler/config.yaml"
+def ensure_matplotlib() -> None:
+    """Make matplotlib importable for the cellStatAnalysis.py post-analysis.
 
-    # Check if test executable exists
-    if not os.path.exists(test_executable):
-        raise FileNotFoundError(f"Test executable not found: {test_executable}")
+    The post-analysis is launched as ``python3 cellStatAnalysis.py`` and that
+    script imports matplotlib at module load, so a container without it fails
+    every case's post-analysis before any check runs. Probe the same ``python3``
+    the post-analysis uses and install matplotlib once if it is missing. A
+    failed install is logged (not raised) so the run surfaces the real
+    post-analysis error per case instead of aborting the whole sweep.
+    """
+    probe = subprocess.run(["python3", "-c", "import matplotlib"],
+                           capture_output=True, text=True)
+    if probe.returncode == 0:
+        return
 
-    # Check if config file exists
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    # Run the test with config file
-    test_cmd_args = ["compute-sanitizer", "--tool", "memcheck", test_executable, "-c", config_path]
-
+    print("matplotlib not found for cellStatAnalysis.py post-analysis; installing ...")
+    logging.info("Installing matplotlib for cellStatAnalysis.py post-analysis")
     try:
-        result = subprocess.run(test_cmd_args, capture_output=True, text=True, timeout=300)  # 5 minute timeout
-        return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "", "Test execution timed out after 5 minutes"
-    except subprocess.CalledProcessError as e:
-        return False, e.stdout, e.stderr
+        subprocess.run(["python3", "-m", "pip", "install", "matplotlib"],
+                       check=True, timeout=MATPLOTLIB_INSTALL_TIMEOUT,
+                       capture_output=True, text=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        logging.warning("matplotlib install failed (%s); post-analysis plots "
+                        "may fail for every case", exc)
 
 
 def check_test_result(stdout):
@@ -383,220 +176,6 @@ def setup_logging(log_dir="test_logs"):
     )
 
     return log_dir
-
-
-def execute_test_combinations(combinations, results_file="cumac_64tr_results.csv", start_index=None, end_index=None, log_dir="test_logs"):
-    """Execute tests for combinations and save results with detailed logging"""
-    # Setup logging
-    log_dir = setup_logging(log_dir)
-
-    # Sort combinations by nCell, nActiveUePerCell, numUeSchdPerCellTTI, nPrbGrp
-    sorted_combinations = sorted(combinations, key=lambda x: (x['nCell'], x['nActiveUePerCell'], x['numUeSchdPerCellTTI'], x['nPrbGrp']))
-
-    # Filter by index range if specified
-    if start_index is not None or end_index is not None:
-        if start_index is None:
-            start_index = 1
-        if end_index is None:
-            end_index = len(sorted_combinations)
-
-        # Convert index strings to integers for comparison
-        filtered_combinations = []
-        for combo in sorted_combinations:
-            combo_index = int(combo.get('index', '0'))
-            if start_index <= combo_index <= end_index:
-                filtered_combinations.append(combo)
-
-        sorted_combinations = filtered_combinations
-        print(f"Filtered to combinations with index range {start_index}-{end_index}")
-
-    results = []
-    total_combinations = len(sorted_combinations)
-
-    print(f"Starting test execution for {total_combinations} combinations...")
-    print("=" * 80)
-    logging.info(f"Starting test execution for {total_combinations} combinations")
-
-    for i, combo in enumerate(sorted_combinations, 1):
-        combo_index = combo.get('index', f"{i:04d}")
-        test_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_64TR_TC{combo_index}_test"
-
-        print(f"\n[{i}/{total_combinations}] Testing combination (Index: {combo_index}):")
-        print(f"  Cells: {combo['nCell']}, Active UEs: {combo['nActiveUePerCell']}, "
-              f"Scheduled: {combo['numUeSchdPerCellTTI']}, HARQ: {combo['harqEnabled']}, "
-              f"Layers: {combo['nMaxLayerPerUeMuDl']}, Groups: {combo['nMaxUegPerCellDl']}, "
-              f"PRB: {combo['nPrbGrp']}, Channel Corr: {combo['chanCorrThr']}")
-
-        # Log test start
-        logging.info(f"Starting test {test_id}: {combo}")
-
-        start_time = time.time()
-
-        # Create individual test log file
-        test_log_file = os.path.join(log_dir, f"{test_id}.log")
-
-        try:
-            # Update config file
-            logging.info(f"Updating config file for test {test_id}")
-            update_config_file(combo)
-
-            # Run test
-            logging.info(f"Running test executable for test {test_id}")
-            success, stdout, stderr = run_test()
-
-            # Save detailed test output to individual log file
-            with open(test_log_file, 'w') as f:
-                f.write(f"Test ID: {test_id}\n")
-                f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-                f.write(f"Parameters: {combo}\n")
-                f.write("=" * 80 + "\n")
-                f.write("STDOUT:\n")
-                f.write(stdout)
-                f.write("\n" + "=" * 80 + "\n")
-                f.write("STDERR:\n")
-                f.write(stderr)
-                f.write("\n" + "=" * 80 + "\n")
-                f.write(f"Return Code: {0 if success else 1}\n")
-                f.write(f"Execution Time: {time.time() - start_time:.2f}s\n")
-
-            # Check result
-            test_passed = check_test_result(stdout) if success else False
-
-            execution_time = time.time() - start_time
-
-            # Store result
-            result = {
-                **combo,
-                'test_passed': test_passed,
-                'execution_time': round(execution_time, 2),
-                'success': success,
-                'error_message': stderr if not success else "",
-                'log_file': test_log_file
-            }
-            results.append(result)
-
-            # Print result
-            status = "PASS" if test_passed else "FAIL"
-            print(f"  Result: {status} (Time: {execution_time:.2f}s)")
-            print(f"  Log file: {test_log_file}")
-
-            logging.info(f"Test {test_id} completed: {status} in {execution_time:.2f}s")
-
-            if not success:
-                print(f"  Error: {stderr[:200]}..." if len(stderr) > 200 else f"  Error: {stderr}")
-                logging.error(f"Test {test_id} failed: {stderr}")
-
-        except Exception as e:
-            execution_time = time.time() - start_time
-            print(f"  Result: ERROR (Time: {execution_time:.2f}s)")
-            print(f"  Error: {str(e)}")
-
-            # Save error log
-            with open(test_log_file, 'w') as f:
-                f.write(f"Test ID: {test_id}\n")
-                f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-                f.write(f"Parameters: {combo}\n")
-                f.write("=" * 80 + "\n")
-                f.write("ERROR:\n")
-                f.write(str(e))
-                f.write("\n" + "=" * 80 + "\n")
-                f.write(f"Execution Time: {execution_time:.2f}s\n")
-
-            logging.error(f"Test {test_id} encountered exception: {str(e)}")
-
-            result = {
-                **combo,
-                'test_passed': False,
-                'execution_time': round(execution_time, 2),
-                'success': False,
-                'error_message': str(e),
-                'log_file': test_log_file
-            }
-            results.append(result)
-
-        # Save intermediate results every 10 tests
-        if i % 10 == 0:
-            save_test_results(results, results_file)
-            print(f"\nIntermediate results saved. Completed {i}/{total_combinations} tests.")
-            logging.info(f"Intermediate results saved. Completed {i}/{total_combinations} tests.")
-
-    # Save final results
-    save_test_results(results, results_file)
-
-    # Generate summary report
-    generate_test_summary(results, log_dir)
-
-    # Print summary
-    passed_tests = sum(1 for r in results if r['test_passed'])
-    failed_tests = len(results) - passed_tests
-
-    print("\n" + "=" * 80)
-    print("TEST EXECUTION SUMMARY")
-    print("=" * 80)
-    print(f"Total tests: {len(results)}")
-    print(f"Passed: {passed_tests}")
-    print(f"Failed: {failed_tests}")
-    print(f"Success rate: {(passed_tests / len(results) * 100):.1f}%")
-    print(f"Results saved to: {results_file}")
-    print(f"Detailed logs saved to: {log_dir}")
-    print(f"Summary report: {os.path.join(log_dir, 'test_summary_report.txt')}")
-
-    logging.info(f"Test execution completed. Passed: {passed_tests}, Failed: {failed_tests}, Success rate: {(passed_tests / len(results) * 100):.1f}%")
-
-
-def select_smoke_subset(expanded_combinations):
-    """
-    Return a small, deterministic subset of combinations for smoke testing.
-    Matches exactly the rows you listed (by parameter values, not by old indices).
-    """
-    def pick(c, *, nCell, harqEnabled, nMaxLayerPerUeMuDl, chanCorrThr):
-        return (
-            c["nCell"] == nCell and
-            c["nActiveUePerCell"] == 128 and
-            c["numUeForGrpPerCell"] == 128 and
-            c["nMaxActUePerCell"] == 128 and
-            c["numUeSchdPerCellTTI"] == 16 and
-            c["nPrbGrp"] == 68 and
-            c["nMaxUegPerCellDl"] == 4 and
-            c["harqEnabled"] == harqEnabled and
-            c["nMaxLayerPerUeMuDl"] == nMaxLayerPerUeMuDl and
-            c["chanCorrThr"] == float(chanCorrThr)
-        )
-
-    targets = [
-        # nCell = 1
-        dict(nCell=1,  harqEnabled=1, nMaxLayerPerUeMuDl=2, chanCorrThr=0.9),
-        dict(nCell=1,  harqEnabled=0, nMaxLayerPerUeMuDl=4, chanCorrThr=0.9),
-
-        # nCell = 16
-        dict(nCell=16, harqEnabled=0, nMaxLayerPerUeMuDl=2, chanCorrThr=0.9),
-        dict(nCell=16, harqEnabled=1, nMaxLayerPerUeMuDl=2, chanCorrThr=0.9),
-
-        # nCell = 20
-        dict(nCell=20, harqEnabled=1, nMaxLayerPerUeMuDl=2, chanCorrThr=0.9),
-        dict(nCell=20, harqEnabled=1, nMaxLayerPerUeMuDl=4, chanCorrThr=0.9),
-
-        # nCell = 24 (one harq=0 row + a sweep of chanCorrThr with harq=1, layer=4)
-        dict(nCell=24, harqEnabled=0, nMaxLayerPerUeMuDl=2, chanCorrThr=0.9),
-        dict(nCell=24, harqEnabled=1, nMaxLayerPerUeMuDl=4, chanCorrThr=0.05),
-        dict(nCell=24, harqEnabled=1, nMaxLayerPerUeMuDl=4, chanCorrThr=0.1),
-        dict(nCell=24, harqEnabled=1, nMaxLayerPerUeMuDl=4, chanCorrThr=0.2),
-        dict(nCell=24, harqEnabled=1, nMaxLayerPerUeMuDl=4, chanCorrThr=0.4),
-        dict(nCell=24, harqEnabled=1, nMaxLayerPerUeMuDl=4, chanCorrThr=0.7),
-        dict(nCell=24, harqEnabled=1, nMaxLayerPerUeMuDl=4, chanCorrThr=0.9),
-    ]
-
-    # preserve order of 'targets'
-    picked = []
-    for t in targets:
-        # find first matching combo (there should be exactly one)
-        match = next((c for c in expanded_combinations if pick(c, **t)), None)
-        if match is not None:
-            picked.append(match)
-        else:
-            # If a row is missing due to earlier filters, surface it clearly:
-            print(f"⚠️  Smoke target not found: {t}")
-    return picked
 
 
 def save_test_results(results, filename):
@@ -672,6 +251,575 @@ def generate_test_summary(results, log_dir="test_logs"):
     return summary_file
 
 
+# =====================================================================
+# GT-10416: cuMAC standalone 64T64R MU-MIMO channel-model validation
+# ---------------------------------------------------------------------
+# Jointly validates the GPU-based 3GPP 38.901 channel model, multi-cell
+# inter-cell interference, EESM PHY abstraction and channel-estimation error
+# modeling, integrated with the 64T64R MU-MIMO scheduler.
+#
+# =====================================================================
+
+# Number of simulation slots (binary -t). Ticket default is 10000; uses
+# 1000 for practical runtime. Overridable via env CUMAC_SIM_SLOTS.
+CHANMODEL_SIM_SLOTS = int(os.environ.get("CUMAC_SIM_SLOTS", "1000"))
+
+# Per-test wall-clock timeout (seconds). Large cell counts x 1000 slots can
+# be slow; overridable via env CUMAC_TEST_TIMEOUT.
+CHANMODEL_TEST_TIMEOUT = int(os.environ.get("CUMAC_TEST_TIMEOUT", "3600"))
+
+# fading_type is fixed at 1 (statistic channel model) per the ticket.
+CHANMODEL_FADING_TYPE = 1
+
+# UE antenna panel (panel_1) layout keyed by nUeAnt, per Shaoran/West on the
+# ticket:  4 ports -> [1,1,2,2,1];  2 ports -> [1,1,1,2,1]  (isotropic UE).
+CHANMODEL_UE_ANT_SIZE = {
+    4: [1, 1, 2, 2, 1],
+    2: [1, 1, 1, 2, 1],
+}
+
+# Post-analysis QA tool (cellStatAnalysis.py). Shipped with the cuBB SDK at
+# cuMAC/examples/multiCellMuMimoScheduler/ and used in place (the test no longer
+# copies it into the container). Validates: (1) per-cell subplot sanity, (2) high TB-error ratio
+# (smoothed TB-error > 0.2 on <= 10% of valid points), (3) scheduled-slot ratio
+# >= 0.8 (via --apply-slot-ratio-threshold), and saves the per-cell plot PNG.
+# Requires matplotlib inside the container.
+CHANMODEL_SCRIPT_NAME = "cellStatAnalysis.py"
+
+# Post-analysis pass indicator required by the ticket (the main-simulation PASS
+# is checked via check_test_result).
+CHANMODEL_POST_PASS = "Summary - cuMAC multi-cell MU-MIMO scheduler simulation post analysis test: PASS"
+
+# Swept parameters (full coverage). fading_type is fixed at 1.
+CHANMODEL_PARAMETERS = {
+    "seed": [0, 100],
+    "nCell": [1, 3, 6, 21],
+    "nActiveUePerCell": [32, 64],
+    "prbConfig": [[4, 68], [2, 68]],       # [nPrbPerGrp, nPrbGrp]
+    "nUeAnt": [2, 4],
+    "chanEstNmseDB": [-100.0, -15.0],
+    "ut_drop_option": [2],
+    "run_mode": [1],
+}
+
+# Smoke subset (--smoke): 68 combos = the small-cell full sweep below (1 & 3
+# cells, 64 combos) PLUS four 6-cell sanity cases appended, so the smoke run
+# exercises the same schema as the 128-combo full sweep at a fraction of the
+# cost while still touching a multi-cell interference case. Both dicts reuse the
+# full-sweep schema; generate_chanmodel_smoke_combinations() concatenates them.
+CHANMODEL_SMOKE_PARAMETERS = {
+    "seed": [0, 100],
+    "nCell": [1, 3],
+    "nActiveUePerCell": [32, 64],
+    "prbConfig": [[4, 68], [2, 68]],       # [nPrbPerGrp, nPrbGrp]
+    "nUeAnt": [2, 4],
+    "chanEstNmseDB": [-100.0, -15.0],
+    "ut_drop_option": [2],
+    "run_mode": [1],
+}
+
+# Extra 6-cell sanity cases appended to the smoke subset (seed x NMSE).
+CHANMODEL_SMOKE_EXTRA_PARAMETERS = {
+    "seed": [0, 100],
+    "nCell": [6],
+    "nActiveUePerCell": [64],
+    "prbConfig": [[4, 68]],       # [nPrbPerGrp, nPrbGrp]
+    "nUeAnt": [4],
+    "chanEstNmseDB": [-100.0, -15.0],
+    "ut_drop_option": [2],
+    "run_mode": [1],
+}
+
+# Scheduler parameters are not part of this sweep; they stay at config.yaml
+# defaults and are re-pinned on every run (see update_chanmodel_config_file) so
+# a value left in config.yaml by an earlier run can never leak in.
+
+# Index order groups by (nCell, nActiveUePerCell, nPrbGrp, nUeAnt, run_mode) so
+# the per-YAML slices are contiguous.
+CHANMODEL_CSV = SCRIPT_DIR / "cumac_64tr_chanmodel_combinations.csv"
+CHANMODEL_RESULTS_CSV = SCRIPT_DIR / "cumac_64tr_results.csv"
+
+# The --smoke subset keeps its own combinations file so a smoke run never
+# overwrites the full-sweep combinations (and vice versa); both modes write
+# results to the same cumac_64tr_results.csv.
+CHANMODEL_SMOKE_CSV = SCRIPT_DIR / "cumac_64tr_chanmodel_smoke_combinations.csv"
+CHANMODEL_SMOKE_RESULTS_CSV = CHANMODEL_RESULTS_CSV
+
+
+def generate_chanmodel_combinations(params=None):
+    """Full-coverage (cartesian) combinations for the channel-model sweep.
+
+    params defaults to CHANMODEL_PARAMETERS (the 128-combo full-coverage sweep).
+    The --smoke subset is built by generate_chanmodel_smoke_combinations(), which
+    calls this with the smoke param dicts. All dicts share the same schema.
+
+    (nCell, nActiveUePerCell, prbConfig, nUeAnt, seed) are the outermost loops
+    so each such group forms a contiguous index block -> one test YAML per group
+    can run a clean 1-based index range (full sweep: 64 groups of 2, 0001-0128;
+    naming <nCell>C_<nUe>UEperCell_<nPrbPerGrp>PrbPerGrp_<nUeAnt>UeAnt_RunMod1_Seed<seed>).
+    Within each slice only chanEstNmseDB is swept.
+    """
+    params = CHANMODEL_PARAMETERS if params is None else params
+    combos = []
+    for nCell in params["nCell"]:
+        for nUe in params["nActiveUePerCell"]:
+            for prb in params["prbConfig"]:
+                for nUeAnt in params["nUeAnt"]:
+                    for seed in params["seed"]:
+                        for nmse, utd, rmode in itertools.product(
+                            params["chanEstNmseDB"],
+                            params["ut_drop_option"],
+                            params["run_mode"],
+                        ):
+                            combos.append({
+                                "nCell": nCell,
+                                "nActiveUePerCell": nUe,
+                                "seed": seed,
+                                "nPrbPerGrp": prb[0],
+                                "nPrbGrp": prb[1],
+                                "nUeAnt": nUeAnt,
+                                "chanEstNmseDB": nmse,
+                                "ut_drop_option": utd,
+                                "run_mode": rmode,
+                                "fading_type": CHANMODEL_FADING_TYPE,
+                            })
+    return combos
+
+
+def generate_chanmodel_smoke_combinations():
+    """Smoke combinations (--smoke): the small-cell full sweep (64) followed by
+    four 6-cell sanity cases, for 68 combos total. The extra cases are appended
+    so they land last in the CSV (indices 0065-0068).
+    """
+    return (generate_chanmodel_combinations(CHANMODEL_SMOKE_PARAMETERS)
+            + generate_chanmodel_combinations(CHANMODEL_SMOKE_EXTRA_PARAMETERS))
+
+
+def combo_signature(combo) -> tuple:
+    """Normalized tuple of the sweep-defining fields for one combination.
+
+    Used to compare a loaded CSV against the freshly generated sweep. CSV values
+    are strings and generated values are typed, so both are coerced to a common
+    form; 'index' is ignored. A missing field (e.g. an old-format CSV) raises
+    KeyError, which the caller treats as a mismatch.
+    """
+    return (
+        int(combo["nCell"]),
+        int(combo["nActiveUePerCell"]),
+        int(float(combo["seed"])),
+        int(combo["nPrbPerGrp"]),
+        int(combo["nPrbGrp"]),
+        int(combo["nUeAnt"]),
+        float(combo["chanEstNmseDB"]),
+        int(combo["ut_drop_option"]),
+        int(combo["run_mode"]),
+        int(combo["fading_type"]),
+    )
+
+
+def save_chanmodel_to_csv(combinations, filename=CHANMODEL_CSV):
+    """Save channel-model combinations preserving generation (grouped) order."""
+    for i, combo in enumerate(combinations, 1):
+        combo["index"] = f"{i:04d}"
+
+    fieldnames = ["index"] + [k for k in combinations[0].keys() if k != "index"]
+    with open(filename, "w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for combo in combinations:
+            writer.writerow(combo)
+
+    print(f"Generated {len(combinations)} channel-model test cases saved to {filename}")
+
+    # Print the per-group index ranges to make YAML wiring obvious.
+    # nPrbGrp is fixed at 68, so nPrbPerGrp is the discriminating PRB
+    # parameter; seed is part of the slice name.
+    print("\nGroup index ranges (nCell x nActiveUePerCell x nPrbPerGrp x nUeAnt x seed):")
+    groups = {}
+    order = []
+    for combo in combinations:
+        key = (int(combo["nCell"]), int(combo["nActiveUePerCell"]),
+               int(combo["nPrbPerGrp"]), int(combo["nUeAnt"]),
+               int(combo["run_mode"]), int(float(combo["seed"])))
+        idx = int(combo["index"])
+        if key not in groups:
+            order.append(key)
+        lo, hi = groups.get(key, (idx, idx))
+        groups[key] = (min(lo, idx), max(hi, idx))
+    for key in order:
+        lo, hi = groups[key]
+        print(f"  {key[0]:>2}C_{key[1]:>2}UEperCell_{key[2]}PrbPerGrp_{key[3]}UeAnt_RunMod{key[4]}_Seed{key[5]}: "
+              f"{lo:04d}-{hi:04d} ({hi - lo + 1} cases)")
+
+
+def update_chanmodel_config_file(combo) -> None:
+    """Update config.yaml for one channel-model combination via yq.
+
+    Handles both top-level keys and nested channel_config.* keys, plus the
+    coupled UE antenna panel (panel_1) layout derived from nUeAnt. Each edit is
+    run as an argument list (no shell) so a config_path with spaces/special
+    characters can never be mis-parsed.
+    """
+    cubb_sdk = get_cubb_sdk_path()
+    config_path = f"{cubb_sdk}cuMAC/examples/multiCellMuMimoScheduler/config.yaml"
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    n_ue_ant = int(combo["nUeAnt"])
+    if n_ue_ant not in CHANMODEL_UE_ANT_SIZE:
+        raise ValueError(f"Unsupported nUeAnt={n_ue_ant}; expected one of {list(CHANMODEL_UE_ANT_SIZE)}")
+    ant_size = CHANMODEL_UE_ANT_SIZE[n_ue_ant]
+    ant_size_yaml = "[" + ", ".join(str(x) for x in ant_size) + "]"
+
+    # yq assignment expressions (passed as a single arg each; no shell).
+    yq_exprs = [
+        # deployment / traffic (top-level)
+        f".seed = {combo['seed']}",
+        # harqEnabled must be 0: the GT-10416 channel-model testbench has no
+        # explicit HARQ handling (per ENG on the ticket); with the config
+        # default of 1, scheduling stalls after the first few slots.
+        ".harqEnabled = 0",
+        ".targetMaxBlerMcs0 = 0.1",  # Can be disabled once MR!5468 is merged
+        f".nCell = {combo['nCell']}",
+        f".nActiveUePerCell = {combo['nActiveUePerCell']}",
+        f".numUeForGrpPerCell = {combo['nActiveUePerCell']}",
+        f".nMaxActUePerCell = {combo['nActiveUePerCell']}",
+        f".nPrbPerGrp = {combo['nPrbPerGrp']}",
+        f".nPrbGrp = {combo['nPrbGrp']}",
+        f".nUeAnt = {n_ue_ant}",
+        f".chanEstNmseDB = {combo['chanEstNmseDB']}",
+        # scheduler parameters are not part of this sweep - re-pin them to the
+        # config.yaml defaults on every run so a leftover value from an earlier
+        # run can never leak in
+        ".numUeSchdPerCellTTI = 16",
+        ".nMaxLayerPerUeMuDl = 2",
+        ".nMaxUegPerCellDl = 4",
+        ".chanCorrThr = 0.7",
+        # channel model (nested)
+        f".channel_config.fading_type = {combo['fading_type']}",
+        # isd / optional_pl_ind are not swept - re-pin to the config.yaml
+        # defaults so a value written by an older sweep run can never leak in
+        # (isd is ignored for UMa anyway).
+        ".channel_config.system_level.isd = 1732.0",
+        f".channel_config.system_level.ut_drop_option = {combo['ut_drop_option']}",
+        ".channel_config.system_level.optional_pl_ind = 0",
+        f".channel_config.simulation.run_mode = {combo['run_mode']}",
+        # UE antenna panel (panel_1) coupled with nUeAnt
+        f".channel_config.antenna_panels.panel_1.n_ant = {n_ue_ant}",
+        f".channel_config.antenna_panels.panel_1.ant_size = {ant_size_yaml}",
+    ]
+
+    for expr in yq_exprs:
+        try:
+            subprocess.run(["yq", "-i", expr, config_path],
+                           capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error updating config with '{expr}': {e}")
+            print(f"Error output: {e.stderr}")
+            raise
+
+
+def run_chanmodel_test() -> tuple[bool, str, str]:
+    """Run multiCellMuMimoScheduler for the channel-model sweep.
+
+    Uses the ticket command:  -c config.yaml -t <slots> -l   (no sanitizer).
+    Runs from the cuBB SDK root so relative paths (BLER LUT, H5 output)
+    resolve the same way as a manual run. Returns (ok, stdout, stderr).
+
+    Assumes the cuBB SDK is already built - execute_chanmodel_combinations()
+    calls ensure_cubb_build() once up front, so a build failure aborts the run
+    instead of being retried per combination.
+    """
+    cubb_sdk = get_cubb_sdk_path()
+    test_executable = f"{get_cubb_build_dir()}/cuMAC/examples/multiCellMuMimoScheduler/multiCellMuMimoScheduler"
+    config_path = f"{cubb_sdk}cuMAC/examples/multiCellMuMimoScheduler/config.yaml"
+
+    if not os.path.exists(test_executable):
+        raise FileNotFoundError(f"Test executable not found: {test_executable}")
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    test_cmd_args = [test_executable, "-c", config_path, "-t", str(CHANMODEL_SIM_SLOTS), "-l"]
+
+    try:
+        result = subprocess.run(test_cmd_args, cwd=cubb_sdk, capture_output=True,
+                                text=True, timeout=CHANMODEL_TEST_TIMEOUT)
+        return result.returncode == 0, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", f"Test execution timed out after {CHANMODEL_TEST_TIMEOUT} seconds"
+
+
+def chanmodel_combo_name(combo):
+    """Full-combo name for the per-case folder: the leading part matches the
+    owning test YAML (cuMAC_64TR_ChanModel_<slice>_Test), followed by the
+    within-slice swept value (chanEstNmseDB), so the folder name alone fully
+    identifies the configuration of a TC. int(float()) casts because
+    CSV-loaded combos hold strings and nmse is stored as a float.
+    """
+    return (f"{int(combo['nCell'])}C_{int(combo['nActiveUePerCell'])}UEperCell_"
+            f"{int(combo['nPrbPerGrp'])}PrbPerGrp_{int(combo['nUeAnt'])}UeAnt_"
+            f"RunMod{int(combo['run_mode'])}_"
+            f"Seed{int(float(combo['seed']))}_"
+            f"Nmse{int(float(combo['chanEstNmseDB']))}")
+
+
+def run_chanmodel_post_analysis(start_time, combo_index, case_dir):
+    """Move this run's result H5 files into the per-case folder, tagged with
+    the TC index, then post-analyze them.
+
+    The binary always writes TV_cumac_result_64T64R_<cell>PC_DL.h5, so every
+    combination would otherwise overwrite the previous one. Each freshly
+    generated file is moved into case_dir (<log_dir>/TC<index>/) as
+    TV_cumac_result_64T64R_<cell>PC_DL_TC<index>.h5 - co-located with the
+    per-test log and the dumped config.yaml - before cellStatAnalysis.py
+    runs on it (per GT-10416 / MR !5468):
+        python3 cellStatAnalysis.py <h5> --apply-slot-ratio-threshold
+                --save-plot --save-plot-dir <case_dir>
+    The per-cell statistics plot lands in case_dir as <h5 stem>.png. Only
+    files produced by the current run (mtime >= start_time) are used; moving
+    them out of the SDK tree also prevents a later combination from
+    re-picking a previous combo's TV.
+    """
+    cubb_sdk = get_cubb_sdk_path()
+    post_analysis_script = f"{cubb_sdk}cuMAC/examples/multiCellMuMimoScheduler/{CHANMODEL_SCRIPT_NAME}"
+
+    if not os.path.exists(post_analysis_script):
+        return False, "", f"Post-analysis script not found: {post_analysis_script}"
+
+    pattern = os.path.join(cubb_sdk, "**", "TV_cumac_result_64T64R_*PC_DL.h5")
+    fresh = [f for f in glob.glob(pattern, recursive=True)
+             if os.path.getmtime(f) >= start_time - 1]
+
+    # Move into the per-case folder with the TC index so each combination's TV
+    # is preserved, co-located with its log and config, for debugging.
+    os.makedirs(case_dir, exist_ok=True)
+    h5_files = []
+    for f in sorted(set(fresh)):
+        stem = os.path.splitext(os.path.basename(f))[0]   # TV_cumac_result_64T64R_<cell>PC_DL
+        dest = os.path.join(case_dir, f"{stem}_TC{combo_index}.h5")
+        try:
+            if os.path.abspath(f) != os.path.abspath(dest):
+                shutil.move(f, dest)
+            h5_files.append(dest)
+        except OSError:
+            h5_files.append(f)                            # fall back to original location
+
+    if not h5_files:
+        return False, "", "No TV_cumac_result_64T64R_*PC_DL.h5 files found for post analysis"
+
+    combined_out = []
+    for h5 in h5_files:
+        try:
+            r = subprocess.run(["python3", post_analysis_script, h5,
+                                "--apply-slot-ratio-threshold",
+                                "--save-plot", "--save-plot-dir", case_dir],
+                               capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            return False, "\n".join(combined_out), f"Post analysis timed out for {h5}"
+        combined_out.append(f"[{os.path.basename(h5)}]\n{r.stdout}\n{r.stderr}")
+        # Require both the PASS line AND a clean exit, so a crash after the
+        # PASS print (e.g. during plot saving) is not counted as a pass.
+        if r.returncode != 0 or CHANMODEL_POST_PASS not in r.stdout:
+            return False, "\n".join(combined_out), f"Post analysis did not PASS for {h5}"
+
+    return True, "\n".join(combined_out), ""
+
+
+def finalize_case_dir(case_dir, passed):
+    """Rename the per-case folder to carry its verdict in the name.
+
+    <log_dir>/TC<index>  ->  <log_dir>/TC<index>_PASS  or  TC<index>_FAIL
+    so a directory listing immediately shows each combination's result. Any
+    stale verdict folder from a previous rerun of the same index is removed
+    first (latest verdict wins). Returns the final folder path (the original
+    path if the rename fails).
+    """
+    final_dir = f"{case_dir}_{'PASS' if passed else 'FAIL'}"
+    try:
+        for stale in (f"{case_dir}_PASS", f"{case_dir}_FAIL"):
+            if os.path.isdir(stale):
+                shutil.rmtree(stale)
+        os.rename(case_dir, final_dir)
+        return final_dir
+    except OSError as e:
+        logging.warning(f"Could not rename case folder {case_dir}: {e}")
+        return case_dir
+
+
+def execute_chanmodel_combinations(combinations, results_file=CHANMODEL_RESULTS_CSV,
+                                   start_index=None, end_index=None, log_dir="test_logs"):
+    """Execute the channel-model sweep with per-combination logging.
+
+    A combination passes only if BOTH the binary prints the main PASS line
+    AND the post-analysis prints its PASS line on every generated H5.
+    """
+    log_dir = setup_logging(log_dir)
+
+    # Build the cuBB SDK once up front if build.<arch> is missing. Doing it here
+    # (not inside run_chanmodel_test) means a build failure aborts the whole run
+    # rather than being retried - and timed out - for every combination.
+    ensure_cubb_build()
+
+    # Ensure matplotlib is available once up front so every case's post-analysis
+    # (cellStatAnalysis.py) can run in containers that don't ship it.
+    ensure_matplotlib()
+
+    sorted_combinations = sorted(combinations, key=lambda x: int(x.get("index", "0")))
+
+    if start_index is not None or end_index is not None:
+        if start_index is None:
+            start_index = 1
+        if end_index is None:
+            end_index = len(sorted_combinations)
+        sorted_combinations = [c for c in sorted_combinations
+                               if start_index <= int(c.get("index", "0")) <= end_index]
+        print(f"Filtered to channel-model combinations with index range {start_index}-{end_index}")
+
+    results = []
+    total = len(sorted_combinations)
+    print(f"Starting channel-model test execution for {total} combinations...")
+    print("=" * 80)
+    logging.info(f"Starting channel-model test execution for {total} combinations")
+
+    for i, combo in enumerate(sorted_combinations, 1):
+        combo_index = combo.get("index", f"{i:04d}")
+        run_ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        test_id = f"{run_ts}_64TR_ChanModel_TC{combo_index}_test"
+
+        print(f"\n[{i}/{total}] Testing channel-model combination (Index: {combo_index}):")
+        print(f"  Cells: {combo['nCell']}, ActiveUE: {combo['nActiveUePerCell']}, seed: {combo['seed']}, "
+              f"nUeAnt: {combo['nUeAnt']}, [nPrbPerGrp,nPrbGrp]: [{combo['nPrbPerGrp']},{combo['nPrbGrp']}], "
+              f"chanEstNmseDB: {combo['chanEstNmseDB']}, "
+              f"ut_drop_option: {combo['ut_drop_option']}, run_mode: {combo['run_mode']}")
+
+        logging.info(f"Starting test {test_id}: {combo}")
+        start_time = time.time()
+
+        # Per-case folder: log, the exact config.yaml used, and result H5(s)
+        # all live under <log_dir>/<timestamp>_TC<index>_<full-combo>/ for
+        # self-contained debugging — the leading timestamp matches the log
+        # file inside, then the TC index, then the combo (the slice part
+        # matches the test YAML name, the swept values follow).
+        # Latest run wins: remove folders from previous runs of this index
+        # (in-progress or _PASS/_FAIL, legacy TC<idx>-first formats included)
+        # so the listing stays one folder per index and H5s don't accumulate.
+        for prev_dir in ([os.path.join(log_dir, f"TC{combo_index}")]
+                         + glob.glob(os.path.join(log_dir, f"TC{combo_index}_*"))
+                         + glob.glob(os.path.join(log_dir, f"*_TC{combo_index}_*"))):
+            if os.path.isdir(prev_dir):
+                shutil.rmtree(prev_dir, ignore_errors=True)
+        case_dir = os.path.join(log_dir, f"{run_ts}_TC{combo_index}_{chanmodel_combo_name(combo)}")
+        os.makedirs(case_dir, exist_ok=True)
+        test_log_file = os.path.join(case_dir, f"{test_id}.log")
+
+        try:
+            logging.info(f"Updating config file for test {test_id}")
+            update_chanmodel_config_file(combo)
+
+            # Dump the fully-updated config.yaml for debugging/repro.
+            config_path = f"{get_cubb_sdk_path()}cuMAC/examples/multiCellMuMimoScheduler/config.yaml"
+            try:
+                shutil.copy2(config_path, os.path.join(case_dir, "config.yaml"))
+            except OSError as e:
+                logging.warning(f"Could not dump config.yaml for {test_id}: {e}")
+
+            logging.info(f"Running test executable for test {test_id}")
+            success, stdout, stderr = run_chanmodel_test()
+
+            main_passed = success and check_test_result(stdout)
+
+            # Post-analysis only when the main simulation passed.
+            if main_passed:
+                post_passed, post_out, post_err = run_chanmodel_post_analysis(start_time, combo_index, case_dir)
+            else:
+                post_passed, post_out, post_err = False, "", "Skipped (main simulation did not PASS)"
+
+            test_passed = bool(main_passed and post_passed)
+            execution_time = time.time() - start_time
+
+            with open(test_log_file, "w") as f:
+                f.write(f"Test ID: {test_id}\n")
+                f.write(f"Timestamp: {datetime.now().isoformat()}\n")
+                f.write(f"Parameters: {combo}\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Main PASS: {main_passed}   Post-analysis PASS: {post_passed}\n")
+                f.write("=" * 80 + "\nSIMULATION STDOUT:\n")
+                f.write(stdout)
+                f.write("\n" + "=" * 80 + "\nSIMULATION STDERR:\n")
+                f.write(stderr)
+                f.write("\n" + "=" * 80 + "\nPOST-ANALYSIS OUTPUT:\n")
+                f.write(post_out)
+                if post_err:
+                    f.write(f"\nPOST-ANALYSIS ERROR: {post_err}\n")
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"Return Code: {0 if test_passed else 1}\n")
+                f.write(f"Execution Time: {execution_time:.2f}s\n")
+
+            # Rename the case folder to TC<idx>_PASS / TC<idx>_FAIL.
+            case_dir = finalize_case_dir(case_dir, test_passed)
+            test_log_file = os.path.join(case_dir, os.path.basename(test_log_file))
+
+            status = "PASS" if test_passed else "FAIL"
+            print(f"  Result: {status} (main={main_passed}, post={post_passed}, Time: {execution_time:.2f}s)")
+            print(f"  Case folder: {case_dir}")
+            logging.info(f"Test {test_id} completed: {status} in {execution_time:.2f}s")
+
+            if not test_passed:
+                err_detail = stderr if not success else (post_err or "See log for details")
+                print(f"  Error: {err_detail[:200]}")
+                logging.error(f"Test {test_id} failed: {err_detail}")
+
+            results.append({
+                **combo,
+                "main_passed": main_passed,
+                "post_passed": post_passed,
+                "test_passed": test_passed,
+                "execution_time": round(execution_time, 2),
+                "success": success,
+                "error_message": (stderr if not success else post_err),
+                "log_file": test_log_file,
+            })
+
+        except Exception as e:
+            execution_time = time.time() - start_time
+            print(f"  Result: FAIL (exception, Time: {execution_time:.2f}s)")
+            print(f"  Error: {str(e)}")
+            with open(test_log_file, "w") as f:
+                f.write(f"Test ID: {test_id}\nParameters: {combo}\nERROR:\n{str(e)}\n")
+            case_dir = finalize_case_dir(case_dir, False)
+            test_log_file = os.path.join(case_dir, os.path.basename(test_log_file))
+            logging.error(f"Test {test_id} encountered exception: {str(e)}")
+            results.append({
+                **combo,
+                "main_passed": False,
+                "post_passed": False,
+                "test_passed": False,
+                "execution_time": round(execution_time, 2),
+                "success": False,
+                "error_message": str(e),
+                "log_file": test_log_file,
+            })
+
+        if i % 10 == 0:
+            save_test_results(results, results_file)
+            print(f"\nIntermediate results saved. Completed {i}/{total} tests.")
+
+    save_test_results(results, results_file)
+    generate_test_summary(results, log_dir)
+
+    passed = sum(1 for r in results if r["test_passed"])
+    print("\n" + "=" * 80)
+    print("CHANNEL-MODEL TEST EXECUTION SUMMARY")
+    print("=" * 80)
+    print(f"Total tests: {len(results)}")
+    print(f"Passed: {passed}")
+    print(f"Failed: {len(results) - passed}")
+    if results:
+        print(f"Success rate: {(passed / len(results) * 100):.1f}%")
+    print(f"Results saved to: {results_file}")
+
+
 def main():
     """Main execution function"""
 
@@ -719,16 +867,23 @@ def main():
             print("Options:")
             print("  --execute [index|start-end]  Execute tests for specific combination(s)")
             print("  --log-dir <directory>        Specify log directory (default: test_logs)")
-            print("  --smoke                      Generate a tiny smoke subset (~13 test cases)")
+            print("  --smoke                      Channel-model smoke subset (68 combos; use with --execute)")
             print("  --help, -h                   Show this help message")
             print("")
+            print("GT-10416 channel-model full coverage (128 combos):")
+            print("validates the GPU 38.901 channel model, runs the binary with -t <slots> -l, then the")
+            print("cellStatAnalysis.py post-analysis (--apply-slot-ratio-threshold --save-plot).")
+            print("")
             print("Examples:")
-            print("  python3 cumac_64tr_test.py                    # Generate test combinations only")
-            print("  python3 cumac_64tr_test.py --execute         # Execute all combinations")
-            print("  python3 cumac_64tr_test.py --execute 5       # Execute combination with index 0005")
-            print("  python3 cumac_64tr_test.py --execute 10-20   # Execute combinations with index range 0010-0020")
-            print("  python3 cumac_64tr_test.py --execute --log-dir /path/to/logs  # Execute with custom log directory")
-            print("  python3 cumac_64tr_test.py --execute --log-dir /path/to/logs --smoke  # Execute with custom log directory and smoke mode (13 test cases)")
+            print("  python3 cumac_64tr_test.py                    # Generate channel-model combinations only")
+            print("  python3 cumac_64tr_test.py --execute          # Execute all channel-model combinations")
+            print("  python3 cumac_64tr_test.py --execute 1-8      # Execute channel-model index range 0001-0008")
+            print("  python3 cumac_64tr_test.py --smoke --execute  # Execute the channel-model smoke subset")
+            print("")
+            print("Environment variables:")
+            print("  CUMAC_SIM_SLOTS    Simulation slots for -t (default 1000; ticket default 10000)")
+            print("  CUMAC_TEST_TIMEOUT Per-combination timeout in seconds (default 3600)")
+            print("  CUBB_BUILD_TIMEOUT cuBB build timeout (s) when build.<arch> is missing (default 7200)")
 
             sys.exit(0)
         else:
@@ -740,76 +895,67 @@ def main():
     cubb_sdk = get_cubb_sdk_path()
     print(f"Using cuBB SDK path: {cubb_sdk}")
 
-    csv_filename = "cumac_64tr_combinations.csv"
-
-    # Check if combinations file already exists
-    if os.path.exists(csv_filename):
-        print(f"Loading existing combinations from {csv_filename}...")
-        final_combinations = load_combinations_from_csv(csv_filename)
-        print(f"Loaded {len(final_combinations)} existing combinations.")
+    # --smoke runs the 68-combo channel-model smoke subset (separate CSVs); the
+    # default is the 128-combo full-coverage sweep. expected_combos is generated
+    # up front (cheap, no I/O) and reused for the stale-CSV guard below.
+    if smoke:
+        active_csv = CHANMODEL_SMOKE_CSV
+        active_results_csv = CHANMODEL_SMOKE_RESULTS_CSV
+        expected_combos = generate_chanmodel_smoke_combinations()
+        print("\nCHANNEL-MODEL SMOKE MODE (GT-10416): 68-combo channel-model subset")
     else:
-        print("Generating optimized test combinations based on requirements...")
+        active_csv = CHANMODEL_CSV
+        active_results_csv = CHANMODEL_RESULTS_CSV
+        expected_combos = generate_chanmodel_combinations()
+        print("\nCHANNEL-MODEL MODE (GT-10416): full coverage of the 38.901 channel-model sweep")
+    print(f"  Simulation slots (-t): {CHANMODEL_SIM_SLOTS}   Per-test timeout: {CHANMODEL_TEST_TIMEOUT}s")
 
-        # Generate optimized combinations
-        optimized_combinations = generate_test_combinations()
+    expected_total = len(expected_combos)
 
-        # Expand to include redundant parameters for compatibility
-        final_combinations = expand_combinations(optimized_combinations)
+    final_combinations = None
+    if os.path.exists(active_csv):
+        print(f"Loading existing channel-model combinations from {active_csv}...")
+        final_combinations = load_combinations_from_csv(active_csv)
+        # Stale guard: only reuse the CSV if it matches the current sweep exactly
+        # - same combinations, same order. Comparing full normalized signatures
+        # catches any parameter/ordering change (seeds, PRB, NMSE, ...) even when
+        # the row count is unchanged, and an old-format CSV (missing columns)
+        # falls through the KeyError/ValueError path to force regeneration.
+        try:
+            csv_matches = ([combo_signature(c) for c in final_combinations]
+                           == [combo_signature(c) for c in expected_combos])
+        except (KeyError, ValueError, TypeError):
+            csv_matches = False
+        if not csv_matches:
+            print(f"Existing {active_csv} does not match the current sweep "
+                  f"({expected_total} channel-model combos) - regenerating.")
+            final_combinations = None
+        else:
+            print(f"Loaded {len(final_combinations)} existing combinations.")
 
-        if smoke: 
-            print("\nSMOKE MODE: selecting a small, representative subset...")
-            final_combinations = select_smoke_subset(final_combinations)
+    if final_combinations is None:
+        final_combinations = expected_combos
+        print(f"Total channel-model combinations generated: {len(final_combinations)}")
+        save_chanmodel_to_csv(final_combinations, active_csv)
 
-        # Display generation summary
-        print(f"Total test combinations generated: {len(final_combinations)}")
-
-        # Show coverage breakdown
-        req1_combinations = [c for c in final_combinations if c['numUeSchdPerCellTTI'] == 6 and c['nCell'] in [1, 3, 6, 8, 10, 12, 16, 20, 24]]
-        req2_combinations = [c for c in final_combinations if c['numUeSchdPerCellTTI'] == 8 and c['nActiveUePerCell'] == 128 and c['nCell'] in [12, 24]]
-        req3_combinations = [c for c in final_combinations if c['numUeSchdPerCellTTI'] == 16 and c['nActiveUePerCell'] == 128 and c['nCell'] in [12, 24]]
-        req4_combinations = [c for c in final_combinations if c['nMaxUegPerCellDl'] == 4 and c['nActiveUePerCell'] == 128 and c['nPrbGrp'] == 68 and c['numUeSchdPerCellTTI'] == 16 and c['nCell'] in [1, 3, 8, 10, 12, 16, 20]]
-
-        print(f"\nCoverage Summary:")
-        print(f"- Requirement 1 (numUeSchdPerCellTTI=6, cells 1,3,6,8,10,16,20,24): {len(req1_combinations)} combinations")
-        print(f"- Requirement 2 (numUeSchdPerCellTTI=8, nActiveUePerCell=128, cells 12,24): {len(req2_combinations)} combinations")
-        print(f"- Requirement 3 (numUeSchdPerCellTTI=16, nActiveUePerCell=128, cells 6,24): {len(req3_combinations)} combinations")
-        print(f"- Requirement 4 (Spot check with nMaxUegPerCellDl=4, nActiveUePerCell=128, nPrbGrp=68, numUeSchdPerCellTTI=16): {len(req4_combinations)} combinations")
-
-        # Save to CSV
-        save_to_csv(final_combinations, csv_filename)
-
-    # Check if user wants to execute tests
     if execute_mode:
         print("\n" + "=" * 80)
-        print("TEST EXECUTION MODE")
+        print("CHANNEL-MODEL TEST EXECUTION MODE")
         print("=" * 80)
-
-        # Display cuBB SDK path being used
-        cubb_sdk = get_cubb_sdk_path()
-        print(f"Using cuBB SDK path: {cubb_sdk}")
-
         if start_index is not None and end_index is not None:
             if start_index == end_index:
-                print(f"Executing combination with index {start_index}")
+                print(f"Executing channel-model combination with index {start_index}")
             else:
-                print(f"Executing combinations with index range {start_index}-{end_index}")
+                print(f"Executing channel-model combinations with index range {start_index}-{end_index}")
         else:
-            print("Executing all combinations")
-
-        print("This will update the config.yaml file and run tests for each combination.")
-        print("Results will be saved to ccumac_64tr_test.py.csv")
-        print(f"Detailed logs will be saved to {log_dir}/ directory")
-
-        # Execute tests
-        execute_test_combinations(final_combinations, start_index=start_index, end_index=end_index, log_dir=log_dir)
+            print("Executing all channel-model combinations")
+        execute_chanmodel_combinations(final_combinations, results_file=active_results_csv,
+                                       start_index=start_index, end_index=end_index,
+                                       log_dir=log_dir)
     else:
-        print("\nTo execute tests, run:")
-        print("  python3 cumac_64tr_test.py --execute                      # Execute all combinations")
-        print("  python3 cumac_64tr_test.py --execute 5                   # Execute combination with index 0005")
-        print("  python3 cumac_64tr_test.py --execute 10-20               # Execute combinations with index range 0010-0020")
-        print("  python3 cumac_64tr_test.py --execute --log-dir /path/to/logs  # Execute with custom log directory")
-        print("\nEnvironment variables:")
-        print("  cuBB_SDK: Path to cuBB SDK (default: /opt/nvidia/cuBB/)")
+        print("\nTo execute channel-model tests, run:")
+        print("  python3 cumac_64tr_test.py --execute            # all channel-model combinations")
+        print("  python3 cumac_64tr_test.py --execute 1-8        # a single (nCell,UE) group range")
 
     print("Process completed successfully!")
 

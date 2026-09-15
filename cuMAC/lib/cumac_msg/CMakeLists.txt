@@ -14,6 +14,6 @@
 # limitations under the License.
 
 # Library libcumac_msg.so for cuMAC-CP and L2 integration
-add_library(cumac_msg SHARED cumac_msg.c)
+add_library(cumac_msg SHARED cumac_msg.cpp)
 set_property(TARGET cumac_msg PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_include_directories(cumac_msg PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,6 +59,7 @@ target_link_libraries(nvlog PUBLIC rt -pthread yaml yaml-cpp)
 if(NVIPC_FMTLOG_ENABLE)
     target_link_libraries(nvlog PUBLIC aerial_sdk_version PUBLIC fmtlog-shared fmt::fmt)
 endif()
+target_compile_options(nvlog PRIVATE ${AERIAL_ARCH_TUNE_FLAGS})
 
 set_target_properties(nvlog PROPERTIES PUBLIC_HEADER
    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)

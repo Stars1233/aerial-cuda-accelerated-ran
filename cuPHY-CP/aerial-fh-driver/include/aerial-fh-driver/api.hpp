@@ -20,19 +20,25 @@
 
 #include "aerial-fh-driver/oran.hpp"
 #include "aerial-fh-driver/doca_structs.hpp"
+#include "aerial-fh-driver/partial_uplane_slot_info.hpp"
 #include "slot_command/slot_command.hpp"
 
 #include <cstdint>
 #include <cstddef>
+#include <optional>
 
 #include <string>
 #include <vector>
 #include <array>
 #include <chrono>
+#include <system_error>
 #include <cuda/std/array>
 #include <doca_gpunetio.h>
 
 //#define ENABLE_DPDK_TX_PKT_TRACING
+
+struct rte_mbuf;
+struct rte_mempool;
 
 #define MAX_PKT_DEBUG 0xffff               //!< Maximum packet debug entries
 #define MAX_DL_SLOTS_TRIGGER_TIME 512      //!< Maximum downlink slot trigger times
@@ -88,6 +94,7 @@ struct FronthaulInfo
     bool               cpu_rx_only;            //!< Override to only use CPU memory to RX for UE Mode
     uint8_t            enable_gpu_comm_via_cpu; //!< GPU Comms via CPU memory (typically enabled on platforms which do not support P2P)
     uint8_t            bfw_chaining_mode{0};       //!< 0: No chaining 1: CPU chaining 2: GPU chaining
+    uint16_t           max_dl_antenna_ports{0};   //!< From ContextConfig / YAML (DL eAxC port count). Nic caps to kMaxFlows (MAX_DL_EAXCIDS).
 };
 
 /**
@@ -256,12 +263,6 @@ enum class UserDataCompressionMethod : uint8_t
 #define API_MAX_NUM_CELLS 16  //!< Maximum cells (default config)
 #endif
 
-#ifdef ENABLE_32DL
-#define API_MAX_ANTENNAS 32  //!< Maximum antenna ports per cell (32-layer Downlink config)
-#else
-#define API_MAX_ANTENNAS 16  //!< Maximum antenna ports per cell (default config)
-#endif
-
 /**
  * Packet timing information for GPU-accelerated transmission
  *
@@ -296,6 +297,12 @@ struct TxqSendTiming
  * for synchronized GPU-accelerated packet preparation.
  */
 struct PreparePRBInfo {
+    // GpuComm::send phase modes for send_mode (multi-NIC WQ-safe submission).
+    // kSendModeFull preserves legacy one-call behavior (also the in-struct default via {}).
+    static constexpr uint8_t kSendModeFull         = 0; //!< prepare + wait-compression + trigger (legacy/default)
+    static constexpr uint8_t kSendModePrepareOnly  = 1; //!< stop after prepare (records PrePrepare)
+    static constexpr uint8_t kSendModeTriggerOnly  = 2; //!< wait-compression + trigger only
+
     uint8_t **prb_ptrs[API_MAX_NUM_CELLS];                        //!< PRB data pointers per cell
     uint8_t eAxCMap[API_MAX_NUM_CELLS][API_MAX_ANTENNAS];         //!< eAxC ID mapping per cell and antenna
     uint8_t num_antennas[API_MAX_NUM_CELLS];                      //!< Number of antennas per cell
@@ -316,6 +323,14 @@ struct PreparePRBInfo {
     uint32_t cqe_trace_slot_mask;                                 //!< Slot mask for CQE tracing
     uint32_t *ready_flag;                                         //!< Ready flag pointer for synchronization
     uint32_t wait_val;                                            //!< Wait value for synchronization
+    /**
+     * GpuComm::send phase control (multi-NIC safe submission).
+     * Defaults to kSendModeFull (legacy one-call prepare+trigger).
+     * For multi-NIC shared WQ flows, use PrepareOnly for all NICs, then TriggerOnly —
+     * otherwise NIC0's wait-on-compression can stall the WQ before NIC1 records
+     * PrePrepare (deadlock).
+     */
+    uint8_t send_mode{};
 };
 
 
@@ -349,19 +364,6 @@ enum class FlowRxApiMode
 {
     TXANDRX, //!< Need to allocate RXQs
     TXONLY,  //!< Don't allocate any RXQs
-};
-
-/******************************************************************/ /**
- * \brief Cleanup buffer information for GPU memset kernel
- *
- * Used by memset kernel in both FH driver and application
- */
-struct CleanupDlBufInfo {
-    uint4* d_buf_addr;   //!< Device buffer address for cleanup
-    size_t  buf_size;    //!< Buffer size in bytes
-    // Note: Compressed buffer fields commented out - can be extended if needed:
-    // uint4* d_comp_buf_addr;  // Compressed buffer address
-    // size_t comp_buf_size;     // Compressed buffer size in bytes
 };
 
 /**
@@ -474,6 +476,41 @@ int remove_peer(PeerHandle peer);
  * \return \p 0 on success, Linux error code otherwise
  */
 int update_peer(PeerHandle handle, UserDataCompressionMethod dl_comp_meth, uint8_t dl_bit_width);
+
+/******************************************************************/ /**
+ * Clear peer eAxC-to-flow-index maps.
+ *
+ * Call after removing all flows from a peer that will be kept alive
+ * (e.g. OAM eAxC ID remapping). Without this, re-registering flows
+ * appends to stale maps and can exceed MAX_DL_EAXCIDS.
+ *
+ * @param[in] peer Peer handle.
+ * @return 0 on success. Linux error code otherwise.
+ */
+[[nodiscard]] int reset_peer_flow_registration(PeerHandle peer);
+
+/******************************************************************/ /**
+ * Begin batched peer flow (re)registration.
+ *
+ * Defers per-flow H2D of flow_hdr_size_info so OAM multi-eAxC updates
+ * copy once at ::end_peer_flow_registration instead of once per new DLU flow.
+ *
+ * @param[in] peer Peer handle.
+ * @return 0 on success. Linux error code otherwise.
+ */
+[[nodiscard]] int begin_peer_flow_registration(PeerHandle peer);
+
+/******************************************************************/ /**
+ * End batched peer flow (re)registration.
+ *
+ * Flushes deferred flow_hdr_size_info H2D and drains the peer setup stream
+ * (including earlier template/pkt-hdr copies) so subsequent datapath work
+ * sees the new flows. Does not wait on live GpuComm streams.
+ *
+ * @param[in] peer Peer handle.
+ * @return 0 on success. Linux error code otherwise.
+ */
+[[nodiscard]] int end_peer_flow_registration(PeerHandle peer);
 
 /******************************************************************/ /**
  * \brief Update peer's compression_bitwidth
@@ -1515,6 +1552,14 @@ int update_metrics(FronthaulHandle fronthaul);
  * \warning all U-plane messages must be of the same section type!
  * \warning U-plane messages must be in chronological order!
  */
+[[nodiscard]] int setup_uplane_gpu_comm(PeerHandle handle, uint8_t frame_id, uint16_t subframe_id, uint16_t slot_id,
+    uint16_t max_num_prb_per_symbol, std::chrono::nanoseconds cell_start_time,
+    std::chrono::nanoseconds symbol_duration, bool commViaCpu, TxRequestGpuCommHandle* output_handle,
+    PartialUplaneSlotInfo_t** out_partial_info,
+    UplaneConversionParams* out_params = nullptr,
+    const uint16_t* eaxcid_list = nullptr,
+    uint16_t num_eaxcids = 0);
+
 int prepare_uplane_gpu_comm(PeerHandle handle, UPlaneMsgSendInfo const* info, size_t num_msgs, TxRequestGpuCommHandle* output_handle,
  std::chrono::nanoseconds cell_start_time,  std::chrono::nanoseconds symbol_duration,bool commViaCpu);
 
@@ -1559,6 +1604,25 @@ int send_uplane_gpu_comm(NicHandle handle, TxRequestGpuPercell *pTxRequestGpuPer
  */
 int gpu_comm_update_tx_metrics(PeerHandle handle, TxRequestGpuCommHandle tx_request_handle);
 
+/**
+ * Stamp the logical (stable) per-cell index into a GPU-comm TX request.
+ *
+ * The GpuComm path uses per-cell ring state (pkt_counts_flow[], pkt_start_debug[])
+ * keyed by a stable per-cell index. Without this stamp, GpuComm validation will
+ * reject the request because the request-array position can shift across slots
+ * in multi-cell or sparse-cell scenarios and would corrupt the bookkeeping.
+ * Every producer of TxRequestUplaneGpuComm (DL aggregator, FH generator, tests)
+ * MUST call this with the stable cell index (e.g. cell_ptr->getIdx()) before the
+ * request is submitted for GpuComm send.
+ *
+ * @param[in] tx_request_handle Handle to TxRequest (must not be null)
+ * @param[in] cell_idx Stable cell index in [0, API_MAX_NUM_CELLS)
+ *
+ * @return 0 on success, -EINVAL if tx_request_handle is null,
+ *         -ERANGE if cell_idx >= API_MAX_NUM_CELLS
+ */
+[[nodiscard]] int set_gpu_request_cell_idx(TxRequestGpuCommHandle tx_request_handle, uint8_t cell_idx) noexcept;
+
 int ring_cpu_doorbell(NicHandle handle, TxRequestGpuPercell *pTxRequestGpuPercell, PreparePRBInfo &prb_info, PacketTimingInfo &packet_timing_info);
 
 int set_TriggerTs_GpuComm(NicHandle handle,uint32_t slot_idx,uint64_t trigger_ts);
@@ -1566,6 +1630,39 @@ int set_TriggerTs_GpuComm(NicHandle handle,uint32_t slot_idx,uint64_t trigger_ts
 int trigger_cqe_tracer_cb(NicHandle handle, TxRequestGpuPercell *pTxRequestGpuPercell);
 
 int print_max_delays(NicHandle handle);
+
+/**
+ * Direct C-plane alloc + send.
+ *
+ * Caches TXQ handle and C-plane mempool.
+ * alloc() calls rte_pktmbuf_alloc_bulk and send() routes through
+ * Txq::send()/Txq::send_lock() selected at construction time.
+ */
+class CplaneSender final {
+public:
+    CplaneSender() = default;
+    CplaneSender(TxqHandle txq_handle, rte_mempool* mempool, bool use_lock = false)
+        : txq_handle_(txq_handle), mempool_(mempool), use_lock_(use_lock) {}
+
+    [[nodiscard]] int alloc(rte_mbuf** mbufs, unsigned count);
+    [[nodiscard]] std::error_code send(rte_mbuf** mbufs, std::size_t count);
+    void free(rte_mbuf** mbufs, unsigned count);
+
+private:
+    TxqHandle txq_handle_{};
+    rte_mempool* mempool_{};
+    bool use_lock_{false};
+};
+
+/**
+ * Create a CplaneSender for a NIC's C-plane direction.
+ * Allocates a new TX queue from the NIC's queue manager.
+ *
+ * @param nic - NIC handle
+ * @param direction - DIRECTION_DOWNLINK or DIRECTION_UPLINK
+ * @return CplaneSender on success, std::nullopt on failure (no queues, MTU mismatch)
+ */
+[[nodiscard]] std::optional<CplaneSender> make_cplane_sender(NicHandle nic, oran_pkt_dir direction);
 
 }; // namespace aerial_fh
 

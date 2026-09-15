@@ -32,8 +32,10 @@ void usage()
     // <channel_file> = ~/mnt/cuMAC/100randTTI570Ues2ta2raUMa_xpol_2.5GHz.mat
 }
 
-int main(int argc, char* argv[]) 
+int main(int argc, char* argv[])
 {
+  cumac::loadParameters();
+
   int iArg = 1;
   std::string inputFileName = std::string();
   std::string outputFileName = std::string();

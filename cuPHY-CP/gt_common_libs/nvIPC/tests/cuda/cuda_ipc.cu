@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,19 +31,13 @@
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <cuda.h>
-#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
 
 #include "test_cuda.h"
 #include "nv_ipc.h"
 #include "nv_ipc_utils.h"
 #include "nv_ipc_cuda_utils.h"
-
-#define HANDLE_ERROR(x)                                                                 \
-    do                                                                                  \
-    {                                                                                   \
-        if((x) != cudaSuccess) { printf("Error %s line%d\n", __FUNCTION__, __LINE__); } \
-    } while(0)
-#define HANDLE_NULL(x)
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 
 // Log level: NVLOG_ERROR, NVLOG_CONSOLE, NVLOG_WARN, NVLOG_INFO, NVLOG_DEBUG, NVLOG_VERBOSE
 #define DEFAULT_TEST_LOG_LEVEL NVLOG_CONSOLE
@@ -67,8 +61,8 @@
 #define UDP_PACKET_MAX_SIZE 65000
 #define UDP_DATA_BUF_SIZE (UDP_PACKET_MAX_SIZE - SHM_MSG_BUF_SIZE) // PDU buffer size
 
-// The CUDA device ID. Set to -1 will disable CPU_DATA pool page lock and CUDA_DATA pool
-int test_cuda_device_id = -1;
+// The CUDA device ID. Defaults to 0; override via argv[2].
+int test_cuda_device_id = 0;
 
 typedef struct
 {
@@ -159,12 +153,8 @@ static int ipc_handle_rx_msg(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
         else if(msg->data_pool == NV_IPC_MEMPOOL_CPU_DATA)
         {
             gpu = 0;
-            // test memory copy betwen CPU memory and GPU memory
-            //cudaEventRecord(recv_start);
             nv_ipc_memcpy_to_device(gpu_buf_recv, msg->data_buf, SHM_DATA_BUF_SIZE);
-            HANDLE_ERROR(cudaEventSynchronize(recv_end));
-            //cudaEventSynchronize(recv_end);
-            //cudaEventElapsedTime(&recv_copy_time, recv_start, recv_end);
+            CUDA_DRIVER_CHECK(cuEventSynchronize(recv_end));
         }
 
         test_cuda_to_lower_case(test_cuda_device_id, (char*)msg->data_buf, TEST_DATA_BUF_LEN, gpu);
@@ -215,14 +205,12 @@ static int ipc_build_tx_msg(nv_ipc_t* ipc, nv_ipc_msg_t* msg)
         else if(msg->data_pool == NV_IPC_MEMPOOL_CPU_DATA)
         {
             nv_ipc_memcpy_to_host(msg->data_buf, gpu_buf_send, SHM_DATA_BUF_SIZE);
-            HANDLE_ERROR(cudaEventSynchronize(send_end));
-            // sprintf((char*)msg->data_buf, "CPU DATA Sent By %s", TAG);
+            CUDA_DRIVER_CHECK(cuEventSynchronize(send_end));
             p_cpu_data = (char*)msg->data_buf;
         }
     }
 
     NVLOGI_FMT(TAG, "Send: cell_id={} {}; {} >>>", msg->cell_id, str, p_cpu_data == NULL ? "DATA: NULL" : p_cpu_data);
-    // NVLOGV_FMT(TAG, "{} msg_id=0x{:02x}, msg_addr={}, data_addr={}", __func__, msg->msg_id, msg->msg_buf, msg->data_buf);
 
     return 0;
 }
@@ -300,7 +288,7 @@ void blocking_send_task(void)
         test_tx_msg = test_mac_tx_msg;
     }
 
-    HANDLE_ERROR(cudaEventRecord(send_start, 0));
+    CUDA_DRIVER_CHECK(cuEventRecord(send_start, 0));
 
     int i = 0;
     for(i = 0; i < TEST_MSG_COUNT; i++)
@@ -316,10 +304,10 @@ void blocking_send_task(void)
         }
     }
 
-    HANDLE_ERROR(cudaEventRecord(send_end, 0));
-    HANDLE_ERROR(cudaEventSynchronize(send_end));
+    CUDA_DRIVER_CHECK(cuEventRecord(send_end, 0));
+    CUDA_DRIVER_CHECK(cuEventSynchronize(send_end));
 
-    HANDLE_ERROR(cudaEventElapsedTime(&send_copy_time, send_start, send_end));
+    CUDA_DRIVER_CHECK(cuEventElapsedTime(&send_copy_time, send_start, send_end));
     NVLOGC_FMT(TAG, ">>> send: count={} GPU->CPU copy: {}MB {:4.1f}ms", i, i * SHM_DATA_BUF_SIZE / 1048576, send_copy_time);
 
     // Sync message by TTI
@@ -342,7 +330,7 @@ void* blocking_recv_task(void* arg)
 
         int count = 0;
 
-        HANDLE_ERROR(cudaEventRecord(recv_start, 0));
+        CUDA_DRIVER_CHECK(cuEventRecord(recv_start, 0));
         while(test_nv_ipc_recv_msg(ipc, &recv_msg) >= 0)
         {
             count++;
@@ -352,10 +340,10 @@ void* blocking_recv_task(void* arg)
                 blocking_send_task();
             }
         }
-        HANDLE_ERROR(cudaEventRecord(recv_end, 0));
-        HANDLE_ERROR(cudaEventSynchronize(recv_end));
+        CUDA_DRIVER_CHECK(cuEventRecord(recv_end, 0));
+        CUDA_DRIVER_CHECK(cuEventSynchronize(recv_end));
 
-        HANDLE_ERROR(cudaEventElapsedTime(&recv_copy_time, recv_start, recv_end));
+        CUDA_DRIVER_CHECK(cuEventElapsedTime(&recv_copy_time, recv_start, recv_end));
         NVLOGC_FMT(TAG, "<<< recv: count={} CPU->GPU copy: {}MB {:4.1f}ms", count, count * SHM_DATA_BUF_SIZE / 1048576, recv_copy_time);
 
         if(module_type == NV_IPC_MODULE_PRIMARY && TEST_DUPLEX_TRANSFER)
@@ -395,15 +383,19 @@ int main(int argc, char** argv)
     int primary;
     if(argc < 2 || (primary = atoi(argv[1])) < 0)
     {
-        fprintf(stderr, "Usage: test_ipc <module> [gpu_id]");
-        fprintf(stderr, "    module:    0 - secondary;  1 - primary.");
-        fprintf(stderr, "    gpu_id:    CUDA device_id. Default is -1 which means no GPU device");
+        fprintf(stderr, "Usage: test_ipc <module> [gpu_id]\n");
+        fprintf(stderr, "    module:    0 - secondary;  1 - primary.\n");
+        fprintf(stderr, "    gpu_id:    CUDA device_id. Default is 0\n");
         exit(1);
     }
 
-    if(argc > 2 && (test_cuda_device_id = atoi(argv[2])) < 0)
+    if(argc > 2)
     {
-        fprintf(stderr, "Invalid gpu_id: %d", test_cuda_device_id);
+        test_cuda_device_id = atoi(argv[2]);
+    }
+    if(test_cuda_device_id < 0)
+    {
+        fprintf(stderr, "Invalid gpu_id: %d\n", test_cuda_device_id);
         exit(1);
     }
 
@@ -461,22 +453,28 @@ int main(int argc, char** argv)
 
     init_test_messages();
 
-    HANDLE_ERROR(cudaEventCreate(&send_start));
-    HANDLE_ERROR(cudaEventCreate(&send_end));
-    HANDLE_ERROR(cudaEventCreate(&recv_start));
-    HANDLE_ERROR(cudaEventCreate(&recv_end));
+    if(!init_test_cuda_kernels())
+    {
+        NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "{}: init_test_cuda_kernels failed", __func__);
+        return -1;
+    }
 
-    HANDLE_ERROR(cudaMalloc(&gpu_buf_send, SHM_DATA_BUF_SIZE));
-    HANDLE_ERROR(cudaMalloc(&gpu_buf_recv, SHM_DATA_BUF_SIZE));
+    CUDA_DRIVER_CHECK(cuEventCreate(&send_start, 0));
+    CUDA_DRIVER_CHECK(cuEventCreate(&send_end, 0));
+    CUDA_DRIVER_CHECK(cuEventCreate(&recv_start, 0));
+    CUDA_DRIVER_CHECK(cuEventCreate(&recv_end, 0));
+
+    CUdeviceptr gpu_send_dptr = 0, gpu_recv_dptr = 0;
+    CUDA_DRIVER_CHECK(cuMemAlloc(&gpu_send_dptr, SHM_DATA_BUF_SIZE));
+    CUDA_DRIVER_CHECK(cuMemAlloc(&gpu_recv_dptr, SHM_DATA_BUF_SIZE));
+    gpu_buf_send = (void*)(uintptr_t)gpu_send_dptr;
+    gpu_buf_recv = (void*)(uintptr_t)gpu_recv_dptr;
 
     cpu_buf_send = (char*)malloc(SHM_DATA_BUF_SIZE);
     cpu_buf_recv = (char*)malloc(SHM_DATA_BUF_SIZE);
 
     sprintf(cpu_buf_send, "CPU DATA Sent By %s", TAG);
     nv_ipc_memcpy_to_device(gpu_buf_send, cpu_buf_send, SHM_DATA_BUF_SIZE);
-
-    // char* mlock_test = (char*) malloc(SHM_DATA_BUF_SIZE * 10 * 1024);
-    // mlock(mlock_test, SHM_DATA_BUF_SIZE * 10 * 1024);
 
     create_recv_thread();
 

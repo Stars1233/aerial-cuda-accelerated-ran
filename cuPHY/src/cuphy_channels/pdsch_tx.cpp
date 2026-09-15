@@ -93,66 +93,6 @@ void print_TB_config_params(PdschPerTbParams* kernel_params, PdschDmrsParams* dm
 }
 
 
-// Only used in pdsch_tx_multi_cell  TODO remove from here and ideally have that phase-2 example use datasets too similar to phase-3
-void cumulative_read_pdsch_static_pars_from_file(cuphyPdschStatPrms_t& pdsch_static_params, hdf5hpp::hdf5_file& input_file, const char* filename, bool ref_check, bool first_call)
-{
-    hdf5hpp::hdf5_dataset cell_static_dataset = input_file.open_dataset("cellStat_pars");
-    int                   num_cells           = cell_static_dataset.get_dataspace().get_dimensions()[0];
-
-    if (first_call) {
-        pdsch_static_params.nCells              = 0;
-        pdsch_static_params.nMaxCellsPerSlot    = 0;
-        pdsch_static_params.nMaxUesPerCellGroup = 0;
-        pdsch_static_params.nMaxCBsPerTB        = 0;
-        pdsch_static_params.nMaxPrb             = 0;
-        pdsch_static_params.stream_priority     = PDSCH_STREAM_PRIORITY;
-        //Pre-allocate max cell and dbg arrays
-        pdsch_static_params.pCellStatPrms = new cuphyCellStatPrm_t[PDSCH_MAX_CELLS_PER_CELL_GROUP];
-        pdsch_static_params.pDbg          = new cuphyPdschDbgPrms_t[PDSCH_MAX_CELLS_PER_CELL_GROUP];
-        pdsch_static_params.enableBatchedMemcpy = 1; //FIXME find appropriate default
-    }
-    cuphyCellStatPrm_t* cell_static_params = &pdsch_static_params.pCellStatPrms[pdsch_static_params.nCells];
-    cuphyPdschDbgPrms_t* dbg_params = &pdsch_static_params.pDbg[pdsch_static_params.nCells];
-    int cells_base = pdsch_static_params.nCells;
-    pdsch_static_params.nCells        += num_cells;
-    if (pdsch_static_params.nCells > PDSCH_MAX_CELLS_PER_CELL_GROUP) { NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "error! not supported max cells!"); }
-    read_cell_static_pars_from_file(cell_static_params, cell_static_dataset, num_cells, cells_base, pdsch_static_params.nMaxPrb);
-
-    for (int i = 0; i < num_cells; i++) {
-        dbg_params[i] = {filename, 1 /* TB size check */, ref_check}; // last field not set will be deprecated
-    }
-
-    // Update max. values
-    pdsch_static_params.nMaxCellsPerSlot = pdsch_static_params.nCells;
-
-    hdf5hpp::hdf5_dataset_elem cell_grp_dyn_config = input_file.open_dataset("cellGrpDyn_pars")[0];
-    int16_t new_UEs                                = cell_grp_dyn_config["nUes"].as<uint16_t>();
-    pdsch_static_params.nMaxUesPerCellGroup       += new_UEs;
-
-    hdf5hpp::hdf5_dataset_elem  cell_dyn_config = input_file.open_dataset("cellDyn_pars")[0];
-    uint8_t cell_testing_mode = 0;
-    try {
-        cell_testing_mode                   = cell_dyn_config["testModel"].as<uint8_t>();
-    } catch(...) {
-        cell_testing_mode                   = 0;
-    }
-
-    for (int UE_idx = 0; UE_idx < new_UEs; UE_idx++) {
-        if (cell_testing_mode == 0) {
-            std::string CBs_dataset_name      = "tb" + std::to_string(UE_idx) + "_cbs";
-            hdf5hpp::hdf5_dataset CBs_dataset = input_file.open_dataset(CBs_dataset_name.c_str());
-            uint16_t num_CBs_for_TB           = CBs_dataset.get_dataspace().get_dimensions()[0];
-            pdsch_static_params.nMaxCBsPerTB  = std::max(pdsch_static_params.nMaxCBsPerTB, num_CBs_for_TB);
-        } else {
-            // If the cell this UE belongs to is in testing mode, then use TB size (in bits) / 25344, rounded up, to determine number of CBs.
-            std::string tb_dataset_name      = "tb" + std::to_string(UE_idx) + "_inputdata";
-            hdf5hpp::hdf5_dataset tb_dataset  = input_file.open_dataset(tb_dataset_name.c_str());
-            uint16_t num_CBs_for_TB           = div_round_up<int>(tb_dataset.get_dataspace().get_dimensions()[1], MAX_ENCODED_CODE_BLOCK_BIT_SIZE);
-            pdsch_static_params.nMaxCBsPerTB  = std::max(pdsch_static_params.nMaxCBsPerTB, num_CBs_for_TB);
-        }
-    }
-}
-
 void PdschTx::updateCsirsWorkspaceOffsets(int cells, int params)
 {
     // workspace for CSI-RS
@@ -404,102 +344,6 @@ void PdschTx::h_compute_re_map(CsirsTables* h_csirs_tables, uint16_t* computed_r
 }
 
 
-// Only used in pdsch_tx_multi_cell  TODO remove from here and ideally have that phase-2 example use datasets too similar to phase-3
-void cumulative_read_cell_group_dynamic_pars_from_file(std::vector<cuphyPdschCellGrpDynPrm_t>& cell_grp_dyn_params, hdf5hpp::hdf5_file& input_file, bool first_call)
-{
-    hdf5hpp::hdf5_dataset cell_grp_dyn_pars_dataset = input_file.open_dataset("cellGrpDyn_pars");
-    int                   num_cell_groups           = cell_grp_dyn_pars_dataset.get_dataspace().get_dimensions()[0];
-
-    hdf5hpp::hdf5_dataset csirs_dyn_pars_dataset    = input_file.open_dataset("csirs_pars");
-    int                   num_csirs                 = csirs_dyn_pars_dataset.get_dataspace().get_dimensions()[0];
-
-    if(num_cell_groups != 1)
-    {
-        throw std::runtime_error("Only a single cell group is supported per pipeline!");
-    }
-
-    for(int cell_group_id = 0; cell_group_id < num_cell_groups; cell_group_id++)
-    {
-        cuphy::cuphyHDF5_struct cell_grp_dyn_config = cuphy::get_HDF5_struct_index(cell_grp_dyn_pars_dataset, cell_group_id);
-
-        uint16_t num_cells                        = cell_grp_dyn_config.get_value_as<uint16_t>("nCells");
-        uint16_t num_ue_groups                     = cell_grp_dyn_config.get_value_as<uint16_t>("nUeGrps");
-        uint16_t num_ues                        = cell_grp_dyn_config.get_value_as<uint16_t>("nUes");
-        uint16_t num_cws                        = cell_grp_dyn_config.get_value_as<uint16_t>("nCws");
-
-        if (first_call) {
-            cell_grp_dyn_params[cell_group_id].nCells = 0;
-            cell_grp_dyn_params[cell_group_id].nUeGrps = 0;
-            cell_grp_dyn_params[cell_group_id].nUes = 0;
-            cell_grp_dyn_params[cell_group_id].nCws = 0;
-            cell_grp_dyn_params[cell_group_id].nCsiRsPrms = 0;
-            cell_grp_dyn_params[cell_group_id].nPrecodingMatrices = 0;
-
-            //Allocate overprovisioned arrays for now for max cells, max UE groups, max UEs, max CWs.
-            cell_grp_dyn_params[cell_group_id].pCellPrms  = new cuphyPdschCellDynPrm_t[PDSCH_MAX_CELLS_PER_CELL_GROUP];
-            cell_grp_dyn_params[cell_group_id].pCellMetrics  = new cuphyPdschCellAerialMetrics_t[PDSCH_MAX_CELLS_PER_CELL_GROUP];
-            //cell_grp_dyn_params[cell_group_id].pCellMetrics  = nullptr;
-            cell_grp_dyn_params[cell_group_id].pUeGrpPrms = new cuphyPdschUeGrpPrm_t[PDSCH_MAX_UE_GROUPS_PER_CELL_GROUP];
-            cell_grp_dyn_params[cell_group_id].pUePrms    = new cuphyPdschUePrm_t[PDSCH_MAX_UES_PER_CELL_GROUP];
-            cell_grp_dyn_params[cell_group_id].pCwPrms    = new cuphyPdschCwPrm_t[PDSCH_MAX_CWS_PER_CELL_GROUP];
-            cell_grp_dyn_params[cell_group_id].pCsiRsPrms = new _cuphyCsirsRrcDynPrm[CUPHY_CSIRS_MAX_NUM_PARAMS * PDSCH_MAX_CELLS_PER_CELL_GROUP];
-            cell_grp_dyn_params[cell_group_id].pPmwPrms   = new cuphyPmW_t[PDSCH_MAX_UES_PER_CELL_GROUP];
-        }
-
-        cuphyPdschCellDynPrm_t* cell_dynamic_params = &cell_grp_dyn_params[cell_group_id].pCellPrms[cell_grp_dyn_params[cell_group_id].nCells];
-        cuphyPdschUeGrpPrm_t* ue_group_dynamic_params = &cell_grp_dyn_params[cell_group_id].pUeGrpPrms[cell_grp_dyn_params[cell_group_id].nUeGrps];
-        cuphyPdschUePrm_t* ue_dynamic_params = &cell_grp_dyn_params[cell_group_id].pUePrms[cell_grp_dyn_params[cell_group_id].nUes];
-        cuphyPdschCwPrm_t* cw_dynamic_params = &cell_grp_dyn_params[cell_group_id].pCwPrms[cell_grp_dyn_params[cell_group_id].nCws];
-        _cuphyCsirsRrcDynPrm* csirs_dynamic_params = &cell_grp_dyn_params[cell_group_id].pCsiRsPrms[cell_grp_dyn_params[cell_group_id].nCsiRsPrms];
-
-        int cells_base = cell_grp_dyn_params[cell_group_id].nCells;
-        int ue_groups_base = cell_grp_dyn_params[cell_group_id].nUeGrps;
-        int ues_base = cell_grp_dyn_params[cell_group_id].nUes;
-        int cws_base = cell_grp_dyn_params[cell_group_id].nCws;
-        int csirs_base = cell_grp_dyn_params[cell_group_id].nCsiRsPrms;
-
-        cell_grp_dyn_params[cell_group_id].nCells += num_cells;
-        cell_grp_dyn_params[cell_group_id].nUeGrps += num_ue_groups;
-        cell_grp_dyn_params[cell_group_id].nUes += num_ues;
-        cell_grp_dyn_params[cell_group_id].nCws += num_cws;
-        cell_grp_dyn_params[cell_group_id].nCsiRsPrms += num_csirs;
-
-        // Check values less than max ones.
-        if ((cell_grp_dyn_params[cell_group_id].nCells > PDSCH_MAX_CELLS_PER_CELL_GROUP) ||
-            (cell_grp_dyn_params[cell_group_id].nUeGrps > PDSCH_MAX_UE_GROUPS_PER_CELL_GROUP) ||
-            (cell_grp_dyn_params[cell_group_id].nUes > PDSCH_MAX_UES_PER_CELL_GROUP) ||
-            (cell_grp_dyn_params[cell_group_id].nCws > PDSCH_MAX_CWS_PER_CELL_GROUP) ||
-            (cell_grp_dyn_params[cell_group_id].nCsiRsPrms > PDSCH_MAX_CELLS_PER_CELL_GROUP*CUPHY_CSIRS_MAX_NUM_PARAMS))
-        {
-            // The check is cumulative per TV so the left hand side argument is an in-flux value and not the final one.
-            // Also, allocations in cuPHY PDSCH will use the max cells configured in static parameters and so the max. values used there will be adjusted accordingly.
-            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Error while stitching together dataset for multi-cell cell group. One or more of the following max limits has been exceeded.");
-            NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Current number of cells {} and max {}, number of UE groups {} and max {}, number of UEs {} and max {}, number of CWs {} and max {}, number of CSI-RS parameters {} and max {}",
-                       cell_grp_dyn_params[cell_group_id].nCells, PDSCH_MAX_CELLS_PER_CELL_GROUP,
-                       cell_grp_dyn_params[cell_group_id].nUeGrps, PDSCH_MAX_UE_GROUPS_PER_CELL_GROUP,
-                       cell_grp_dyn_params[cell_group_id].nUes, PDSCH_MAX_UES_PER_CELL_GROUP,
-                       cell_grp_dyn_params[cell_group_id].nCws, PDSCH_MAX_CWS_PER_CELL_GROUP,
-                       cell_grp_dyn_params[cell_group_id].nCsiRsPrms, PDSCH_MAX_CELLS_PER_CELL_GROUP*CUPHY_CSIRS_MAX_NUM_PARAMS);
-
-            //throw std::runtime_error("Invalid arg!");
-        }
-
-        // Populate arrays. Includes setting pointer to parent/children structs etc., so it should
-        // happen *after* all previous mem. allocations.
-        read_cell_dynamic_pars_from_file(cell_dynamic_params, input_file, cells_base, csirs_base);
-
-        std::vector<cuphyPdschDmrsPrm_t> pdsch_dmrs_pars;
-        read_dmrs_pars_from_file(pdsch_dmrs_pars, input_file, ue_groups_base);
-
-        read_ue_groups_pars_from_file(ue_group_dynamic_params, input_file, cell_dynamic_params, pdsch_dmrs_pars, ue_groups_base, ues_base);
-        read_ue_pars_from_file(ue_dynamic_params, input_file, ue_group_dynamic_params, cell_grp_dyn_params[cell_group_id], ues_base);
-        read_cw_pars_from_file(cw_dynamic_params, input_file, ue_dynamic_params, cws_base);
-
-        read_pdsch_csirs_pars_from_file(csirs_dynamic_params, num_csirs, csirs_dyn_pars_dataset);
-    }
-}
-
-
 cuphyStatus_t CUPHYWINAPI cuphyCreatePdschTx(cuphyPdschTxHndl_t* pPdschTxHndl, cuphyPdschStatPrms_t const* pStatPrms)
 {
     if((pPdschTxHndl == nullptr) || (pStatPrms == nullptr) || (pStatPrms->pDbg == nullptr))
@@ -512,7 +356,7 @@ cuphyStatus_t CUPHYWINAPI cuphyCreatePdschTx(cuphyPdschTxHndl_t* pPdschTxHndl, c
 
     return cuphy::tryCallableAndCatch([&]
     {
-        PdschTx* new_pipeline = new PdschTx(pStatPrms, 0, pStatPrms->read_TB_CRC, !(pStatPrms->full_slot_processing) /*aas mode*/);
+        PdschTx* new_pipeline = new PdschTx(pStatPrms, 0, pStatPrms->read_TB_CRC, pStatPrms->pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_AAS_PROCESSING /*aas mode*/);
 
         if(new_pipeline == nullptr)
         {
@@ -716,6 +560,8 @@ PdschTx::PdschTx(const cuphyPdschStatPrms_t* cfg_static_params, cudaStream_t cfg
     layer_mapping(true),
     read_TB_CRC(read_TB_CRC),
     inter_cell_batching_mode(true),
+    post_fec_processing((cfg_static_params->pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING) || (cfg_static_params->pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING)),
+    post_fec_rm_scrambling_processing(cfg_static_params->pipeline_processing_mode == cuphyPdschPipelineMode_t::PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING),
     max_CBs_per_TB((cfg_static_params->nMaxCBsPerTB == 0) ? MAX_N_CBS_PER_TB_SUPPORTED : cfg_static_params->nMaxCBsPerTB),
     max_cells((cfg_static_params->nMaxCellsPerSlot == 0) ? PDSCH_MAX_CELLS_PER_CELL_GROUP : cfg_static_params->nMaxCellsPerSlot),
     per_cell_group_max_TBs((cfg_static_params->nMaxUesPerCellGroup == 0) ? PDSCH_MAX_UES_PER_CELL_GROUP : cfg_static_params->nMaxUesPerCellGroup),
@@ -730,6 +576,7 @@ PdschTx::PdschTx(const cuphyPdschStatPrms_t* cfg_static_params, cudaStream_t cfg
 #endif
     m_batchedMemcpyHelper(max_cells, batchedMemcpySrcHint::srcIsHost, batchedMemcpyDstHint::dstIsDevice, (PDSCH_USE_BATCHED_MEMCPY == 1) && (cfg_static_params->enableBatchedMemcpy == 1))
 {
+    fec_delay_usec = (post_fec_processing) ? cfg_static_params->delayUs : 0;
     cfg_static_params->pOutInfo->pMemoryFootprint = &memory_footprint; // update  static parameter field that points to the cuphyMemoryFootprintTracker object for this channel
 
     /* Note on stream priority:  There is no runtime check that cfg_static_params->stream_priority is within the [greatest_priority, least_priority] of the GPU device
@@ -837,6 +684,13 @@ PdschTx::PdschTx(const cuphyPdschStatPrms_t* cfg_static_params, cudaStream_t cfg
     }
 
     allocateDescr(); //Allocate Descriptors.
+
+    // Populate delay kernel parameters for cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING mode
+    if(post_fec_processing)
+    {
+        delayKernelParams[0] = &fec_delay_usec;
+        CUPHY_CHECK(cuphySetDelayKernelNodeParams(&m_delayKernelParamsDriver, &delayKernelParams[0]));
+    }
 
     createAndInstantiateGraph(); // performed unconditionally with empty kernel nodes to avoid high initial overhead
     graph_mode = false;
@@ -1042,31 +896,34 @@ void PdschTx::allocateBuffers()
     ldpc_stream_elements = 0; // Also reset on every setup
     created_ldpc_streams = 0; // Only reset once
 
-    d_TB_CRCs = make_unique_device<uint32_t>(per_cell_group_max_TBs, &memory_footprint);
-// For CRC
+    // For CRC
     max_per_cell_CB_CRCs_elements = per_cell_max_TBs * max_CBs_per_TB;
-#if DBG_PDSCH_CRC
-    d_CB_CRCs = make_unique_device<uint32_t>(max_cells * max_per_cell_CB_CRCs_elements, &memory_footprint);
-#else
-    //Avoid writing the per-TB and per-CB CRCs separately.
-    d_CB_CRCs = nullptr;
-#endif
     max_per_cell_code_blocks_bytes = per_cell_max_TBs * max_CBs_per_TB * div_round_up<uint32_t>(max_K_per_CB, 8);
-    d_code_blocks                 = make_unique_device<uint8_t>(max_cells * max_per_cell_code_blocks_bytes, &memory_footprint);
-    if(static_params->pDbg->refCheck) {
-        // Memset needed when ref. checks are enabled to avoid compute-sanitizer's initcheck error flagged for
-        // the D2H memory copy in getHostOutputCRCMultipleCells() call if there is at least one cell in testing mode (testModel=1).
-        // That function proactively copies the entire d_code_blocks buffer, but ref. checks in refCheckCRCMultipleCells() are skipped for any cells in testing mode.
-        CUDA_CHECK(cudaMemset(d_code_blocks.get(), 0xff, max_cells * max_per_cell_code_blocks_bytes * sizeof(uint8_t)));
-    }
-
     max_per_cell_crc_workspace_elements = 2 * div_round_up<uint32_t>(max_per_cell_code_blocks_bytes, sizeof(uint32_t)); //double as temp fix.
-    // PdschPerTbParams allocated in allocateDescr()
 
-    d_crc_workspace = make_unique_device<uint32_t>(max_cells * max_per_cell_crc_workspace_elements, &memory_footprint);
-
-    if (REVERT_TO_ASYNC_COPIES == 1) { // Allocate buffer used to copy PDSCH TB input
-        d_prepare_crc_input_buffer = make_unique_device<uint8_t>(max_cells * max_per_cell_code_blocks_bytes, &memory_footprint);
+    // CRC/code-block related buffers (d_TB_CRCs, d_CB_CRCs, d_code_blocks, d_crc_workspace, d_prepare_crc_input_buffer)
+    // are not allocated in post-FEC mode; they default to nullptr on construction
+    if(!post_fec_processing)
+    {
+        d_TB_CRCs = make_unique_device<uint32_t>(per_cell_group_max_TBs, &memory_footprint);
+#if DBG_PDSCH_CRC
+        d_CB_CRCs = make_unique_device<uint32_t>(max_cells * max_per_cell_CB_CRCs_elements, &memory_footprint);
+#else
+        //Avoid writing the per-TB and per-CB CRCs separately.
+        d_CB_CRCs = nullptr;
+#endif
+        d_code_blocks                 = make_unique_device<uint8_t>(max_cells * max_per_cell_code_blocks_bytes, &memory_footprint);
+        if(static_params->pDbg->refCheck) {
+            // Memset needed when ref. checks are enabled to avoid compute-sanitizer's initcheck error flagged for
+            // the D2H memory copy in getHostOutputCRCMultipleCells() call if there is at least one cell in testing mode (testModel=1).
+            // That function proactively copies the entire d_code_blocks buffer, but ref. checks in refCheckCRCMultipleCells() are skipped for any cells in testing mode.
+            CUDA_CHECK(cudaMemset(d_code_blocks.get(), 0xff, max_cells * max_per_cell_code_blocks_bytes * sizeof(uint8_t)));
+        }
+        // PdschPerTbParams allocated in allocateDescr()
+        d_crc_workspace = make_unique_device<uint32_t>(max_cells * max_per_cell_crc_workspace_elements, &memory_footprint);
+        if (REVERT_TO_ASYNC_COPIES == 1) { // Allocate buffer used to copy PDSCH TB input
+            d_prepare_crc_input_buffer = make_unique_device<uint8_t>(max_cells * max_per_cell_code_blocks_bytes, &memory_footprint);
+        }
     }
 
 
@@ -1074,20 +931,27 @@ void PdschTx::allocateBuffers()
     max_per_TB_LDPC_workspace_size = div_round_up<uint32_t>(max_N_per_CB, 8) * max_CBs_per_TB; //FIXME div_round_up to uint32_t?
     size_t max_LDPC_workspace_size = max_per_TB_LDPC_workspace_size * per_cell_group_max_TBs;
 
-    d_ldpc_workspace = make_unique_device<uint32_t>(div_round_up<uint32_t>(max_LDPC_workspace_size, sizeof(uint32_t)), &memory_footprint);
-    if(static_params->pDbg->refCheck) {
-        // Memset needed when ref. checks are enabled to avoid compute-sanitizer's initcheck
-        CUDA_CHECK(cudaMemset(d_ldpc_workspace.get(), 0xff, round_up_to_next<uint32_t>(max_LDPC_workspace_size, sizeof(uint32_t))));
-    }
+    // d_ldpc_workspace buffer is not allocated in post-FEC mode; it defaults to nullptr on construction
+    // In post-FEC mode, d_ldpc_workspace_ptr is set to the caller-supplied pLdpcOutput buffer in expandParametersMultipleCells().
+    if(!post_fec_processing)
+    {
+        // For LDPC
+        d_ldpc_workspace = make_unique_device<uint32_t>(div_round_up<uint32_t>(max_LDPC_workspace_size, sizeof(uint32_t)), &memory_footprint);
+        d_ldpc_workspace_ptr  = d_ldpc_workspace.get();
+        if(static_params->pDbg->refCheck) {
+            // Memset needed when ref. checks are enabled to avoid compute-sanitizer's initcheck
+            CUDA_CHECK(cudaMemset(d_ldpc_workspace.get(), 0xff, round_up_to_next<uint32_t>(max_LDPC_workspace_size, sizeof(uint32_t))));
+        }
 
-    // For Rate Matching
-    // Workspace buffer allocated in allocateDescr()
+        // For Rate Matching
+        // Workspace buffer allocated in allocateDescr()
 
-    if (aas_mode) {
-        // Note: this buffer is only used in AAS mode. Allocated conditionally now that AAS mode is a static parameter passed to the PdschTx constructor
-        // Buffer increased a lot for FDM
-        uint32_t max_rm_output_elements = div_round_up<uint32_t>(per_cell_max_TBs * max_layers * max_CBs_per_TB * max_Emax, 32);
-        d_rate_matching_output          = tensor_device(CUPHY_R_32U, max_rm_output_elements, cuphy::tensor_flags::align_tight);
+        if (aas_mode) {
+            // Note: this buffer is only used in AAS mode. Allocated conditionally now that AAS mode is a static parameter passed to the PdschTx constructor
+            // Buffer increased a lot for FDM
+            uint32_t max_rm_output_elements = div_round_up<uint32_t>(per_cell_max_TBs * max_layers * max_CBs_per_TB * max_Emax, 32);
+            d_rate_matching_output          = tensor_device(CUPHY_R_32U, max_rm_output_elements, cuphy::tensor_flags::align_tight);
+        }
     }
 
     // RE maps allocated in allocateDescr()
@@ -1161,10 +1025,12 @@ void PdschTx::allocateDescr()
     }
 
     // Allocate workspace memory for some components to take advantage of the bulk async copy of the descriptors.
-
-    // Allocate LDPC workspace buffers
-    pDynDescrSizeBytes[PDSCH_LDPC_WORKSPACE]  = ldpc_workspace_bytes;
-    pDynDescrAlignBytes[PDSCH_LDPC_WORKSPACE] = alignof(uint8_t);
+    if(!post_fec_processing)
+    {
+        // Allocate LDPC workspace buffers
+        pDynDescrSizeBytes[PDSCH_LDPC_WORKSPACE]  = ldpc_workspace_bytes;
+        pDynDescrAlignBytes[PDSCH_LDPC_WORKSPACE] = alignof(uint8_t);
+    }
     ldpc_workspace_offset = ldpc_workspace_bytes / per_cell_group_max_TBs; // per-TB offset; not dividing by 2 on purpose
 
     //Allocate memory for PdschPerTbParams
@@ -1192,8 +1058,11 @@ void PdschTx::allocateDescr()
     //Allocate memory for the per-TB CRCs, max_TBs TBs, to avoid the Memset during CRC setup
     //Caveat: the associated copy for this allocation will happen -as part of the bulk async. copy-
     //even if the per-TB CRCs are provided by the caller.
-    pDynDescrSizeBytes[PDSCH_TB_CRCS]  = sizeof(uint32_t) * per_cell_group_max_TBs;
-    pDynDescrAlignBytes[PDSCH_TB_CRCS] = alignof(uint32_t);
+    if(!post_fec_processing)
+    {
+        pDynDescrSizeBytes[PDSCH_TB_CRCS]  = sizeof(uint32_t) * per_cell_group_max_TBs;
+        pDynDescrAlignBytes[PDSCH_TB_CRCS] = alignof(uint32_t);
+    }
 
     m_component_descrs.alloc(dynDescrSizeBytes, dynDescrAlignBytes, &memory_footprint);
     //m_component_descrs.displayDescrSizes();
@@ -1216,10 +1085,11 @@ void PdschTx::allocateDescr()
     h_ldpc_w_ptr = (uint8_t*)m_component_descrs.getCpuStartAddrs()[PDSCH_LDPC_WORKSPACE];
     d_ldpc_w_ptr = (uint8_t*)m_component_descrs.getGpuStartAddrs()[PDSCH_LDPC_WORKSPACE];
 
-    //h_xtf_re_maps = (uint16_t*)m_component_descrs.getCpuStartAddrs()[PDSCH_XTF_RE_MAPS];
-    //d_xtf_re_maps = (uint16_t*)m_component_descrs.getGpuStartAddrs()[PDSCH_XTF_RE_MAPS];
-    //Set memory to 0 on the host-side once; will be copied to the device on every setup as part of the bulk async. copy
-    memset(m_component_descrs.getCpuStartAddrs()[PDSCH_TB_CRCS], 0, pDynDescrSizeBytes[PDSCH_TB_CRCS]);
+    if(!post_fec_processing)
+    {
+        //Set memory to 0 on the host-side once; will be copied to the device on every setup as part of the bulk async. copy
+        memset(m_component_descrs.getCpuStartAddrs()[PDSCH_TB_CRCS], 0, pDynDescrSizeBytes[PDSCH_TB_CRCS]);
+    }
 }
 
 cuphyStatus_t PdschTx::expandParametersMultipleCells(cuphyPdschDynPrms_t* dyn_params,
@@ -1262,7 +1132,7 @@ cuphyStatus_t PdschTx::expandParametersMultipleCells(cuphyPdschDynPrms_t* dyn_pa
     }*/
 
 
-    if(dyn_params->pDataIn->pTbInput == nullptr)
+    if((dyn_params->pDataIn->pTbInput == nullptr) && (!post_fec_processing))
     {
         NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "expandParametersMultipleCells() got empty array of pipeline input buffers!");
         return CUPHY_STATUS_INVALID_ARGUMENT;
@@ -1301,27 +1171,54 @@ cuphyStatus_t PdschTx::expandParametersMultipleCells(cuphyPdschDynPrms_t* dyn_pa
     //Compute RE map per cell before calling cuphyUpdatePdschDmrsParams, as it updates it in place
     _cuphyCsirsRrcDynPrm* csirs_params = dyn_params->pCellGrpDynPrm[0].pCsiRsPrms; // single cell group
 
+    if(post_fec_processing)
+    {
+       if(post_fec_rm_scrambling_processing)
+       {
+           // Same large buffer used for all cells, but their processing accesses different parts of it
+           if((dyn_params->pPostFecDataIn == nullptr) || (dyn_params->pPostFecDataIn->pRmScramblingOutput == nullptr))
+           {
+               NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "expandParametersMultipleCells() got nullptr for post-FEC RM scrambling data input!");
+               return CUPHY_STATUS_INVALID_ARGUMENT;
+           }
+           d_ldpc_workspace_ptr  = dyn_params->pPostFecDataIn->pRmScramblingOutput;
+       }
+       else
+       {
+           // Same large buffer used for all cells, but their processing accesses different parts of it
+           // Current assumption is that layout matches that of the current internal-to-PDSCH ldpc workspace in case of full processing
+           if((dyn_params->pPostFecDataIn == nullptr) || (dyn_params->pPostFecDataIn->pLdpcOutput == nullptr))
+           {
+               NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "expandParametersMultipleCells() got nullptr for post-FEC data input!");
+               return CUPHY_STATUS_INVALID_ARGUMENT;
+           }
+           d_ldpc_workspace_ptr  = dyn_params->pPostFecDataIn->pLdpcOutput;
+       }
+    }
+
     for (int cell = 0; cell < num_cells; cell++)
     {
         per_cell_TB_params_offset[cell]  = (cell == 0) ? 0 : (per_cell_num_TBs[cell - 1] + per_cell_TB_params_offset[cell - 1]);
+        if(!post_fec_processing) {
 
-        if(dyn_params->pDataIn->pTbInput[cell] == nullptr)
-        {
-            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "expandParametersMultipleCells() got empty pipeline_input buffer!");
-            return CUPHY_STATUS_INVALID_ARGUMENT;
-        }
-        per_cell_pipeline_input_bytes[cell] = dyn_params->pDataIn->pTbInput[cell];      // pointer to uint8_t
-
-        if(static_params->read_TB_CRC)
-        {
-            if(dyn_params->pTbCRCDataIn->pTbInput[cell] == nullptr)
+            if(dyn_params->pDataIn->pTbInput[cell] == nullptr)
             {
-                NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "expandParametersMultipleCells() got empty TB CRC input buffer!");
+                NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "expandParametersMultipleCells() got empty pipeline_input buffer!");
                 return CUPHY_STATUS_INVALID_ARGUMENT;
             }
-            h_per_cell_pipeline_input_tb_crcs[cell] =  dyn_params->pTbCRCDataIn->pTbInput[cell]; // pointer to uint8_t
-        } else {
-            h_per_cell_pipeline_input_tb_crcs[cell] =  nullptr;
+            per_cell_pipeline_input_bytes[cell] = dyn_params->pDataIn->pTbInput[cell];      // pointer to uint8_t
+
+            if(static_params->read_TB_CRC)
+            {
+                if(dyn_params->pTbCRCDataIn->pTbInput[cell] == nullptr)
+                {
+                    NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "expandParametersMultipleCells() got empty TB CRC input buffer!");
+                    return CUPHY_STATUS_INVALID_ARGUMENT;
+                }
+                h_per_cell_pipeline_input_tb_crcs[cell] =  dyn_params->pTbCRCDataIn->pTbInput[cell]; // pointer to uint8_t
+            } else {
+                h_per_cell_pipeline_input_tb_crcs[cell] =  nullptr;
+            }
         }
 
         per_cell_pipeline_input_size_bytes[cell] = 0;
@@ -1449,15 +1346,18 @@ PdschTx::~PdschTx()
 cuphyStatus_t PdschTx::prepareCRC_step2MultipleCells(cudaStream_t cuda_strm)
 {
     // Called outside cuphySetupCrcEncode
+    // Grid must cover the full range the downstream CRC kernels may read.
+    // cell_CRC_max_TB_padded_bytes (= max of num_CBs * (K-F-24)/8) can exceed
+    // max_tb_size_bytes (FAPI TBS) due to TB CRC and padding; use the larger of the two.
     cuphyStatus_t status = cuphySetupPrepareCRCEncode(
             m_prepare_crc_encode_launch_cfg.get(),
             pdsch_data_in_is_gpu_buffer ? nullptr : ((REVERT_TO_ASYNC_COPIES == 1) ? (uint32_t*) d_prepare_crc_input_buffer.get() : nullptr), // if nullptr the tbStartAddr from d_tbPrmsArray will be used
             (uint32_t*)cell_group_crc_d_in_tensor_ref.addr(),
-            (uint32_t*)d_ldpc_workspace.get(),
+            (uint32_t*)d_ldpc_workspace_ptr,
             d_tbPrmsArray,
             num_TBs, // total number of TBs across all cells
             cell_max_CBs, // max # CBs per TB across all cells
-            max_tb_size_bytes, //max TB size in bytes across all cells
+            std::max(max_tb_size_bytes, cell_CRC_max_TB_padded_bytes),
             static_cast<void*>(m_component_descrs.getCpuStartAddrs()[PDSCH_CRC_PREP]), //CPU desc
             static_cast<void*>(m_component_descrs.getGpuStartAddrs()[PDSCH_CRC_PREP]), //GPU desc
             (!bulk_desc_async_copy),
@@ -1544,7 +1444,7 @@ cuphyStatus_t PdschTx::prepareCRCMultipleCells(cudaStream_t cuda_strm)
         /* tbStartAddr contains the starting address for that TB in pinned host memory. When inter_cell_batching is enabled with multiple cells,
            the CRC kernel launched during setup will access that memory directly.
         */
-        kernel_params[i].tbStartAddr   = per_cell_pipeline_input_bytes[dyn_cell] + dynamic_params->pCellGrpDynPrm->pCwPrms[i].tbStartOffset;
+        kernel_params[i].tbStartAddr   = post_fec_processing ? nullptr: (per_cell_pipeline_input_bytes[dyn_cell] + dynamic_params->pCellGrpDynPrm->pCwPrms[i].tbStartOffset);
 
         //kernel_params[i].paddingBytes = padding_bytes[i];
         kernel_params[i].cumulativeTbSizePadding = ((i == 0) ? 0 : kernel_params[i-1].cumulativeTbSizePadding) +  kernel_params[i].tbSize + padding_bytes[i];
@@ -1593,7 +1493,6 @@ cuphyStatus_t PdschTx::prepareCRCMultipleCells(cudaStream_t cuda_strm)
             //NVLOGC_FMT(NVLOG_PDSCH, "TB %d has offset of bytes {} = {} and tbSize {} B", i, tmp[i], LDPC_dst_offset[i], kernel_params[i].tbSize);
         }
 
-           
     }
     if (total_LDPC_kernel_configs > PDSCH_MAX_HET_LDPC_CONFIGS_SUPPORTED) // See ldpcEncodeDescr_t_array for size. TODO change as needed here and in graphs
     {
@@ -1645,7 +1544,6 @@ cuphyStatus_t PdschTx::prepareCRCMultipleCells(cudaStream_t cuda_strm)
         per_cell_crc_h_in_tensor_bytes_offset[cell] = (cell == 0) ? 0 : (per_cell_crc_h_in_tensor_bytes[cell - 1] + per_cell_crc_h_in_tensor_bytes_offset[cell - 1]);
         //NVLOGC_FMT(NVLOG_PDSCH, "cell {} has per_cell_CRC_input_bytes {}, padding {} extra padding (without final round up){}, offset {}",
         //                       cell, per_cell_CRC_input_bytes[cell], per_cell_total_padding_bytes[cell], per_cell_pipeline_input_padding_size_bytes[cell], per_cell_crc_h_in_tensor_bytes_offset[cell]);
- 
 
         cell_group_crc_h_in_tensor_bytes += per_cell_crc_h_in_tensor_bytes[cell];
 
@@ -1664,39 +1562,43 @@ cuphyStatus_t PdschTx::prepareCRCMultipleCells(cudaStream_t cuda_strm)
             return CUPHY_STATUS_INVALID_ARGUMENT;
         }
 
-        if(h_per_cell_pipeline_input_tb_crcs[cell]) {
-            CUDA_CHECK(cudaMemcpyAsync(d_TB_CRCs.get() + per_cell_TB_params_offset[cell],
-                                       h_per_cell_pipeline_input_tb_crcs[cell],
-                                       per_cell_num_TBs[cell] * sizeof(uint32_t),
-                                       cudaMemcpyHostToDevice,
-                                       cuda_strm));
-        }
+        if(!post_fec_processing)
+        {
+            if(h_per_cell_pipeline_input_tb_crcs[cell]) {
+                CUDA_CHECK(cudaMemcpyAsync(d_TB_CRCs.get() + per_cell_TB_params_offset[cell],
+                                           h_per_cell_pipeline_input_tb_crcs[cell],
+                                           per_cell_num_TBs[cell] * sizeof(uint32_t),
+                                           cudaMemcpyHostToDevice,
+                                           cuda_strm));
+            }
 
+            if (!pdsch_data_in_is_gpu_buffer) {
+                 if (REVERT_TO_ASYNC_COPIES == 1) {
+                     /*NVLOGC_FMT(NVLOG_PDSCH, "REVERT_TO_ASYNC_COPIES cell {}: copy from {:p} {} B to dst offset {}",
+                            cell, (void*)per_cell_pipeline_input_bytes[cell], per_cell_pipeline_input_size_bytes[cell],
+                            per_cell_crc_h_in_tensor_bytes_offset[cell]);*/
 
-        if (!pdsch_data_in_is_gpu_buffer) {
-             if (REVERT_TO_ASYNC_COPIES == 1) {
-                 /*NVLOGC_FMT(NVLOG_PDSCH, "REVERT_TO_ASYNC_COPIES cell {}: copy from {:p} {} B to dst offset {}",
-                        cell, (void*)per_cell_pipeline_input_bytes[cell], per_cell_pipeline_input_size_bytes[cell],
-                        per_cell_crc_h_in_tensor_bytes_offset[cell]);*/
-
-                  m_batchedMemcpyHelper.updateMemcpy((uint32_t*)d_prepare_crc_input_buffer.get() + (per_cell_crc_h_in_tensor_bytes_offset[cell] / sizeof(uint32_t)),
-                                                     (void*)per_cell_pipeline_input_bytes[cell],
-                                                     per_cell_pipeline_input_size_bytes[cell],
-                                                     cudaMemcpyHostToDevice,
-                                                     cuda_strm);
-             } else {
-                 // Double check that memory is host-pinned. Only relevant when running with the control plane too. For standalone cuPHY this is always the case.
-                 // In case of REVERT_TO_ASYNC_COPIES=1, no error will be triggered but the memory copy will be slower. It's also OK to always enable this check.
-                 cudaPointerAttributes input_attributes;
-                 CUDA_CHECK(cudaPointerGetAttributes(&input_attributes, per_cell_pipeline_input_bytes[cell]));
-                 if  (input_attributes.type == cudaMemoryTypeUnregistered )
-                 {
-                     NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Error! PDSCH data input pointer not accessible by device; should be pinned memory!");
-                     return CUPHY_STATUS_INVALID_ARGUMENT;
+                      m_batchedMemcpyHelper.updateMemcpy((uint32_t*)d_prepare_crc_input_buffer.get() + (per_cell_crc_h_in_tensor_bytes_offset[cell] / sizeof(uint32_t)),
+                                                         (void*)per_cell_pipeline_input_bytes[cell],
+                                                         per_cell_pipeline_input_size_bytes[cell],
+                                                         cudaMemcpyHostToDevice,
+                                                         cuda_strm);
+                 } else {
+                     // Double check that memory is host-pinned. Only relevant when running with the control plane too. For standalone cuPHY this is always the case.
+                     // In case of REVERT_TO_ASYNC_COPIES=1, no error will be triggered but the memory copy will be slower. It's also OK to always enable this check.
+                     cudaPointerAttributes input_attributes;
+                     CUDA_CHECK(cudaPointerGetAttributes(&input_attributes, per_cell_pipeline_input_bytes[cell]));
+                     if  (input_attributes.type == cudaMemoryTypeUnregistered )
+                     {
+                         NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Error! PDSCH data input pointer not accessible by device; should be pinned memory!");
+                         return CUPHY_STATUS_INVALID_ARGUMENT;
+                     }
                  }
-             }
+            }
         }
     }
+
+    if(post_fec_processing) return CUPHY_STATUS_SUCCESS;
 
     if ((!pdsch_data_in_is_gpu_buffer) && (REVERT_TO_ASYNC_COPIES == 1))
     {
@@ -1707,6 +1609,7 @@ cuphyStatus_t PdschTx::prepareCRCMultipleCells(cudaStream_t cuda_strm)
             return CUPHY_STATUS_INVALID_ARGUMENT;
         }
     }
+
 
     // Temp code just to see if having H2D copies instead of a kernel accessing pinned memory directly avoids dropped packets for UL.
     if (REVERT_TO_ASYNC_COPIES == 1) {
@@ -1953,8 +1856,8 @@ cuphyStatus_t PdschTx::prepareLDPCBatching(cudaStream_t cuda_strm)
         //Populate input/output addresses
         int max_rv = 0;
         for (int cnt = 0; cnt < TBs_in_batch; cnt++) {
-            LDPC_input_addr[cumulative_TBs + cnt] = d_code_blocks.get() + CRC_dst_offset[LDPC_batches[LDPC_cfg].TB_idxs[cnt]];
-            LDPC_output_addr[cumulative_TBs + cnt] = (uint8_t*)d_ldpc_workspace.get() + LDPC_dst_offset[LDPC_batches[LDPC_cfg].TB_idxs[cnt]];
+            LDPC_input_addr[cumulative_TBs + cnt] = (post_fec_processing) ? nullptr : d_code_blocks.get() + CRC_dst_offset[LDPC_batches[LDPC_cfg].TB_idxs[cnt]];
+            LDPC_output_addr[cumulative_TBs + cnt] = (uint8_t*)d_ldpc_workspace_ptr + LDPC_dst_offset[LDPC_batches[LDPC_cfg].TB_idxs[cnt]];
             /* NVLOGC_FMT(NVLOG_PDSCH, "LDPC kernel batch {}, global TB idx {}, parity nodes {}",
                        LDPC_cfg, LDPC_batches[LDPC_cfg].TB_idxs[cnt],
                        max_ldpc_parity_nodes[LDPC_batches[LDPC_cfg].TB_idxs[cnt]]);*/
@@ -1972,16 +1875,17 @@ cuphyStatus_t PdschTx::prepareLDPCBatching(cudaStream_t cuda_strm)
                                              N_max,
                                              CBs_in_batch * TBs_in_batch,
                                              cuphy::tensor_flags::align_tight);
-            d_ldpc_out_tensor_ref.set_addr(d_ldpc_workspace.get());
+            d_ldpc_out_tensor_ref.set_addr(d_ldpc_workspace_ptr);
         }
 
-        //Call setup for this batch
-        cuphyStatus_t status = cuphySetupLDPCEncode(
+        if(!post_fec_processing) {
+            //Call setup for this batch
+            cuphyStatus_t status = cuphySetupLDPCEncode(
                                                     &m_ldpc_encode_launch_cfg.get()[LDPC_cfg],
                                                     single_TB_d_ldpc_in_tensor_desc[first_TB_idx].handle(),
                                                     d_code_blocks.get(),
                                                     single_TB_d_ldpc_out_tensor_desc[first_TB_idx].handle(),
-                                                    d_ldpc_workspace.get(),
+                                                    d_ldpc_workspace_ptr,
                                                     kernel_params[first_TB_idx].bg,
                                                     kernel_params[first_TB_idx].Zc,
                                                     puncture_bits,
@@ -1998,10 +1902,11 @@ cuphyStatus_t PdschTx::prepareLDPCBatching(cudaStream_t cuda_strm)
                                                     (!bulk_desc_async_copy),
                                                     ldpc_streams[LDPC_cfg]);
 
-        if(status != CUPHY_STATUS_SUCCESS)
-        {
-            NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Invalid argument(s) for cuphySetupLDPCEncode; {}", cuphyGetErrorString(status));
-            return CUPHY_STATUS_INVALID_ARGUMENT;
+            if(status != CUPHY_STATUS_SUCCESS)
+            {
+                NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Invalid argument(s) for cuphySetupLDPCEncode; {}", cuphyGetErrorString(status));
+                return CUPHY_STATUS_INVALID_ARGUMENT;
+            }
         }
 
         cumulative_TBs += TBs_in_batch;
@@ -2129,7 +2034,7 @@ typed_tensor<CUPHY_BIT, pinned_alloc> PdschTx::getHostOutputLDPCTBPerCell(uint16
     int per_TB_ldpc_out_dims[2]            = {round_up_to_next((int)kernel_params[TB_id].N, BITS_PER_U32), (int)kernel_params[TB_id].num_CBs};
     cuphy::tensor_desc tmp_tensor_desc = cuphy::tensor_desc(CUPHY_BIT, per_TB_ldpc_out_dims);
 
-    tensor_device temp_tensor = tensor_device((uint8_t*)d_ldpc_out_tensor_ref.addr() + LDPC_dst_offset[temp_TB_id],
+    tensor_device temp_tensor = tensor_device((post_fec_processing) ?  (uint8_t*)d_ldpc_workspace_ptr + LDPC_dst_offset[temp_TB_id] : (uint8_t*)d_ldpc_out_tensor_ref.addr() + LDPC_dst_offset[temp_TB_id],
                                          CUPHY_BIT,
                                          per_TB_ldpc_out_dims[0],
                                          per_TB_ldpc_out_dims[1],
@@ -2321,7 +2226,7 @@ cuphyStatus_t PdschTx::prepareRateMatchingMultipleCells(cudaStream_t cuda_strm)
     }
     int N_max = div_round_up<uint32_t>(LDPC_N_max, BITS_PER_U32) * BITS_PER_U32;
 
-    uint32_t* d_per_cell_ldpc_workspace = d_ldpc_workspace.get();
+    uint32_t* d_per_cell_ldpc_workspace = d_ldpc_workspace_ptr;
 
     // Only used in if !inter_cell_batching_mode
     d_per_cell_ldpc_out_tensor_ref[0].desc().set(CUPHY_BIT,
@@ -2331,11 +2236,10 @@ cuphyStatus_t PdschTx::prepareRateMatchingMultipleCells(cudaStream_t cuda_strm)
                                                  cuphy::tensor_flags::align_tight);
     d_per_cell_ldpc_out_tensor_ref[0].set_addr(d_per_cell_ldpc_workspace);
 
-
-    uint32_t rm_workspace_offset = per_cell_TB_params_offset[0] * (rm_allocated_workspace_size/per_cell_group_max_TBs) / sizeof(uint32_t);
+    uint32_t rm_workspace_offset = per_cell_TB_params_offset[0] * (rm_allocated_workspace_size / per_cell_group_max_TBs) / sizeof(uint32_t);
     cuphyStatus_t status = cuphySetupDlRateMatching(m_rate_matching_launch_cfg.get(),
                                                     dynamic_params->pStatusInfo,
-                                                    d_ldpc_workspace.get(),
+                                                    d_ldpc_workspace_ptr,
                                                     (aas_mode) ? (uint32_t*)d_rate_matching_output.addr() : nullptr,
                                                     nullptr,
                                                     dynamic_params->pDataOut->pTDataTx[0].pAddr, //tx_tensor.addr() prev. TODO remove
@@ -2350,6 +2254,7 @@ cuphyStatus_t PdschTx::prepareRateMatchingMultipleCells(cudaStream_t cuda_strm)
                                                     dynamic_params->pCellGrpDynPrm->nPrecodingMatrices > 0 ? 1 : 0,
                                                     false,
                                                     true, //inter_cell_batching_mode
+                                                    post_fec_rm_scrambling_processing ? 1 : 0,
                                                     h_rm_workspace + rm_workspace_offset, //m_component_descrs.getCpuStartAddrs()[PDSCH_RM_WORKSPACE], CPU workspace desc
                                                     d_rm_workspace + rm_workspace_offset, //m_component_descrs.getGpuStartAddrs()[PDSCH_RM_WORKSPACE], GPU workspace desc
                                                     kernel_params + per_cell_TB_params_offset[0],  //m_component_descrs.getCpuStartAddrs()[PDSCH_PER_TB_PARAMS]
@@ -2434,14 +2339,12 @@ void PdschTx::runRateMatchingMultipleCells(cudaStream_t cuda_strm, bool ref_chec
                                 m_rate_matching_launch_cfg.get()->m_kernelNodeParams[0].blockDimY,
                                 m_rate_matching_launch_cfg.get()->m_kernelNodeParams[0].blockDimZ,
                                 m_rate_matching_launch_cfg.get()->m_kernelNodeParams[0].sharedMemBytes);*/
-    CU_CHECK_EXCEPTION(launch_kernel(m_rate_matching_launch_cfg.get()->m_kernelNodeParams[0], cuda_strm));
-#if 0
-    CUresult rm_status = launch_kernel(m_rate_matching_launch_cfg.get()->m_kernelNodeParams[0], cuda_strm);
+    CUresult rm_status = launch_kernel_ex(m_rate_matching_launch_cfg.get()->m_kernelNodeParams[0], cuda_strm, true /*use non-portable shmem*/);
     if(rm_status != CUDA_SUCCESS)
     {
-        throw std::runtime_error("Invalid argument(s) for Rate Matching");
+        NVLOGE_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT, "Fused rate matching and modulation kernel launch failure {}", (int) rm_status);
+        throw std::runtime_error("Fused rate matching and modulation kernel launch failure!");
     }
-#endif
 
     if(ref_check)
     {
@@ -2631,6 +2534,13 @@ int PdschTx::refCheckModulationMultipleCells(cudaStream_t cuda_strm)
                            freq_idx + freq_offset, symbol_pos, layer_id,
                            (float) ref_symbol.x, (float) ref_symbol.y,
                            (float) gpu_symbol.x, (float) gpu_symbol.y);*/
+                    if (gpu_mismatch == 0) {
+                        NVLOGC_FMT(NVLOG_PDSCH,
+                                   "First fused RM/modulation mismatch (cell {}, TB index in cell {}): sc={}, sym={}, layer={} - expected={:f} + i {:f} vs. gpu={:f} + i {:f}",
+                                   cell, cell_TB_id, freq_idx + freq_offset, symbol_pos, layer_id,
+                                   (float) ref_symbol.x, (float) ref_symbol.y,
+                                   (float) gpu_symbol.x, (float) gpu_symbol.y);
+                    }
                     gpu_mismatch += 1;
                 }
                 symbols_checked += 1;
@@ -2851,6 +2761,11 @@ int PdschTx::refCheckDmrsMultipleCells(cudaStream_t cuda_strm)
                                     freq_idx, symbol_id, layer_id,
                                    (float) ref_symbol.x, (float) ref_symbol.y,
                                    (float) gpu_symbol.x, (float) gpu_symbol.y);*/
+                                if (gpu_mismatch == 0) {
+                                    NVLOGC_FMT(NVLOG_PDSCH,
+                                               "First PDSCH DMRS mismatch (cell {}, TB index in cell {}): sc={}, sym={}, layer={}",
+                                               cell, TB_id, freq_idx, symbol_id, layer_id);
+                                }
                                 gpu_mismatch += 1;
                            }
                        }
@@ -2936,6 +2851,12 @@ int PdschTx::refCheckTxDataMultipleCells(cudaStream_t cuda_strm)
                                 freq_idx, symbol_id, layer_id,
                                (float) ref_symbol.x, (float) ref_symbol.y,
                                (float) gpu_symbol.x, (float) gpu_symbol.y);*/
+                        if (gpu_mismatch == 0) {
+                            NVLOGC_FMT(NVLOG_PDSCH, "First PDSCH output mismatch vs Xtf (cell {}): sc={}, sym={}, txAnt={}: expected={: 5.3f} + i {: 5.3f} vs. gpu={: 5.3f} + i {: 5.3f}",
+                                cell, freq_idx, symbol_id, layer_id,
+                                (float)ref_symbol.x, (float)ref_symbol.y,
+                                (float)gpu_symbol.x, (float)gpu_symbol.y);
+                        }
                         gpu_mismatch += 1;
                     }
                 }
@@ -2959,7 +2880,7 @@ cuphyStatus_t PdschTx::prepareBuffersMultipleCells(cudaStream_t cuda_strm)
     ldpc_stream_elements = 0;
     //PUSH_RANGE("prepareCRC", 1);
     status = prepareCRCMultipleCells(cuda_strm);
-    cuphyStatus_t status_step2 = prepareCRC_step2MultipleCells(cuda_strm);
+    cuphyStatus_t status_step2 = post_fec_processing ? CUPHY_STATUS_SUCCESS: prepareCRC_step2MultipleCells(cuda_strm);
     //POP_RANGE
     if(status != CUPHY_STATUS_SUCCESS)
     {
@@ -2967,7 +2888,7 @@ cuphyStatus_t PdschTx::prepareBuffersMultipleCells(cudaStream_t cuda_strm)
     }
     if(status_step2 != CUPHY_STATUS_SUCCESS)
     {
-        return status;
+        return status_step2;
     }
 
     // prepareRM moved before prepareLDPC.
@@ -3010,7 +2931,7 @@ cuphyStatus_t PdschTx::RunMultipleCells(const cudaStream_t& cuda_strm, bool ref_
     // Check if we are in the fallback mode (i.e., calling back to back runs for the same TV with a single setup but still require functional correctness)
     // If yes, we need to reset all buffers managed by PdschTx that involve atomic updates.
     // Note that the output tensor buffer should still be reset by the caller.
-    if ((dynamic_params->procModeBmsk & PDSCH_PROC_MODE_SETUP_ONCE_FALLBACK) != 0)
+    if ((!post_fec_processing) && ((dynamic_params->procModeBmsk & PDSCH_PROC_MODE_SETUP_ONCE_FALLBACK) != 0))
     {
         // Reset per-TB CRC buffers unless the TB-CRCs are provided by the caller. Check 1st cell, and assume similar setting across all
         if (h_per_cell_pipeline_input_tb_crcs[0] == nullptr)
@@ -3022,6 +2943,23 @@ cuphyStatus_t PdschTx::RunMultipleCells(const cudaStream_t& cuda_strm, bool ref_
 
     ldpc_streams[0] = cuda_strm;
     ran_pipeline    = true;
+
+    if(post_fec_processing)
+    {
+        // Launch single thread block delay kernel to model the delay of the accelerator, if specified delay is non-zero.
+        // This delay kernel is purposefully not part of the PDSCH graph (even if graphs mode is enabled).
+        if(fec_delay_usec != 0)
+        {
+            CU_CHECK_EXCEPTION(launch_kernel(m_delayKernelParamsDriver, cuda_strm));
+        }
+
+        // Verify input buffer is as it should be
+        if(ref_check && !post_fec_rm_scrambling_processing)
+        {
+            NVLOGC_FMT(NVLOG_PDSCH, "Will do a ref. check for LDPC output buffer (PDSCH pipeline input) in PDSCH_POST_FEC_PROCESSING mode");
+            failed_ref_checks = (refCheckLDPCMultipleCells(cuda_strm) != 0) ? 1 : 0;
+        }
+    }
 
     if(graph_mode)
     {
@@ -3038,8 +2976,11 @@ cuphyStatus_t PdschTx::RunMultipleCells(const cudaStream_t& cuda_strm, bool ref_
 
         if(ref_check)
         {
-            failed_ref_checks += (refCheckCRCMultipleCells(cuda_strm) != 0) ? 1 : 0;
-            failed_ref_checks += (refCheckLDPCMultipleCells(cuda_strm) != 0) ? 1 : 0;
+            if(!post_fec_processing)
+            {
+                failed_ref_checks += (refCheckCRCMultipleCells(cuda_strm) != 0) ? 1 : 0;
+                failed_ref_checks += (refCheckLDPCMultipleCells(cuda_strm) != 0) ? 1 : 0;
+            }
 
             if(aas_mode)
             {
@@ -3056,12 +2997,15 @@ cuphyStatus_t PdschTx::RunMultipleCells(const cudaStream_t& cuda_strm, bool ref_
     }
 
     runPdschCsirsPrepMultipleCells(cuda_strm); //TODO need not be before CRC; it only needs to complete before rate-matching
-    runCRCMultipleCells(cuda_strm, ref_check);
-
-    runLDPCBatching(cuda_strm, ref_check);
-    if(ref_check)
+    if(!post_fec_processing)
     {
-        failed_ref_checks += (refCheckLDPCMultipleCells(cuda_strm) != 0) ? 1 : 0;
+        runCRCMultipleCells(cuda_strm, ref_check);
+
+        runLDPCBatching(cuda_strm, ref_check);
+        if(ref_check)
+        {
+            failed_ref_checks += (refCheckLDPCMultipleCells(cuda_strm) != 0) ? 1 : 0;
+        }
     }
     runRateMatchingMultipleCells(cuda_strm, ref_check); // Fused Rate Matching and Modulation
 
@@ -3097,32 +3041,46 @@ void PdschTx::createAndInstantiateGraph()
     void* kernelParams_32B[1] = {&arg_32B};
     CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&m_emptyNodeParamsDriver_32B, &kernelParams_32B[0], 0, 32));
 
-    if(!read_TB_CRC)
+    if(!post_fec_processing)
     {
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_crcEncodeNodesMultipleCells[0], m_graph, nullptr, 0, &m_emptyNodeParamsDriver_48B));
+        if(!read_TB_CRC)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_crcEncodeNodesMultipleCells[0], m_graph, nullptr, 0, &m_emptyNodeParamsDriver_48B));
+        }
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_crcEncodeNodesMultipleCells[1], m_graph, nullptr, 0, &m_emptyNodeParamsDriver_48B));
     }
-    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_crcEncodeNodesMultipleCells[1], m_graph, nullptr, 0, &m_emptyNodeParamsDriver_48B));
 
     // Add fused rate matching and modulation mapper node
     CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rmNodesMultipleCells[0], m_graph, nullptr, 0, &m_emptyNodeParamsDriver));
+#if CUDA_VERSION >= 13020
+    CU_CHECK_EXCEPTION(cuGraphKernelNodeSetAttribute(m_rmNodesMultipleCells[0], CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE, &m_kernelNodeAttrValue));
+#endif
+
     if(!aas_mode)
     {
         CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_dmrsNodeMultipleCells[0], m_graph, nullptr, 0, &m_emptyNodeParamsDriver));
     }
-    int first_unused_ldpc_node = total_LDPC_kernel_configs;
-    prev_first_unused_ldpc_node = first_unused_ldpc_node;
 
-    // There is a runtime check in prepareCrcMultipleCells that verifies that total # LDPC configs is less than PDSCH_MAX_HET_LDPC_CONFIGS_SUPPORTED.
-    for(int LDPC_cfg = 0; LDPC_cfg < std::min(per_cell_group_max_TBs, PDSCH_MAX_HET_LDPC_CONFIGS_SUPPORTED); LDPC_cfg++)
+    if(!post_fec_processing)
     {
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ldpcEncodeNodesMultipleCells[LDPC_cfg], m_graph, nullptr, 0, &m_emptyNodeParamsDriver_32B));
+        int first_unused_ldpc_node = total_LDPC_kernel_configs;
+        prev_first_unused_ldpc_node = first_unused_ldpc_node;
+
+        // There is a runtime check in prepareCrcMultipleCells that verifies that total # LDPC configs is less than PDSCH_MAX_HET_LDPC_CONFIGS_SUPPORTED.
+        for(int LDPC_cfg = 0; LDPC_cfg < std::min(per_cell_group_max_TBs, PDSCH_MAX_HET_LDPC_CONFIGS_SUPPORTED); LDPC_cfg++)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ldpcEncodeNodesMultipleCells[LDPC_cfg], m_graph, nullptr, 0, &m_emptyNodeParamsDriver_32B));
+        }
     }
 
     CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_csirsPrepNodesMultipleCells[0], m_graph, nullptr, 0, &m_emptyNodeParamsDriver));
     CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_csirsPrepNodesMultipleCells[1], m_graph, nullptr, 0, &m_emptyNodeParamsDriver));
     CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_csirsPrepNodesMultipleCells[2], m_graph, nullptr, 0, &m_emptyNodeParamsDriver));
 
-    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_prepareCRCEncodeNodeMultipleCells[0], m_graph, nullptr, 0, &m_emptyNodeParamsDriver));
+    if(!post_fec_processing)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_prepareCRCEncodeNodeMultipleCells[0], m_graph, nullptr, 0, &m_emptyNodeParamsDriver));
+    }
 
     addDependenciesMultipleCells();
 
@@ -3139,7 +3097,10 @@ void PdschTx::createAndInstantiateGraph()
     CU_CHECK_EXCEPTION(cuGraphInstantiate(&exec_graph, m_graph, 0, 0, 0));
 #endif
 
-    disableLDPCNodesMultipleCells();
+    if(!post_fec_processing)
+    {
+        disableLDPCNodesMultipleCells();
+    }
     disableCsirsPrepNodesMultipleCells();
     prev_had_CSIRS_params = false;
     total_LDPC_kernel_configs = 0; // reset to 0 before first setup is called
@@ -3193,45 +3154,48 @@ void PdschTx::updateNodeParamsMultipleCells()
     // Update prev_had_CSIRS_params for next graph update
     prev_had_CSIRS_params = (dynamic_params->pCellGrpDynPrm[0].nCsiRsPrms != 0);
 
-    // Update CRC nodes
-    CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_prepareCRCEncodeNodeMultipleCells[0], &(m_prepare_crc_encode_launch_cfg.get()->m_kernelNodeParams)));
-
-    if(!read_TB_CRC)
+    if(!post_fec_processing)
     {
-        CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_crcEncodeNodesMultipleCells[0], &(m_crc_encode_launch_cfg.get()->m_kernelNodeParams[0])));
-    }
-    {
-        CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_crcEncodeNodesMultipleCells[1], &(m_crc_encode_launch_cfg.get()->m_kernelNodeParams[1])));
-    }
+        // Update CRC nodes
+        CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_prepareCRCEncodeNodeMultipleCells[0], &(m_prepare_crc_encode_launch_cfg.get()->m_kernelNodeParams)));
 
-    // Update LDPC nodes
-    // NB: The CUDA graph kernel node updates can fail for CUDA < 11.2 if they involve a change in the kernel function.
-    int first_unused_ldpc_node = total_LDPC_kernel_configs;
-
-    for(int LDPC_cfg = 0; LDPC_cfg < first_unused_ldpc_node; LDPC_cfg++)
-    {
-        // Only re-enable nodes that were previously disabled
-        if (LDPC_cfg >= prev_first_unused_ldpc_node) {
-            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(exec_graph, m_ldpcEncodeNodesMultipleCells[LDPC_cfg], 1));
+        if(!read_TB_CRC)
+        {
+            CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_crcEncodeNodesMultipleCells[0], &(m_crc_encode_launch_cfg.get()->m_kernelNodeParams[0])));
         }
-	CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_ldpcEncodeNodesMultipleCells[LDPC_cfg], &(m_ldpc_encode_launch_cfg.get()[LDPC_cfg].m_kernelNodeParams)));
-    }
+        {
+            CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_crcEncodeNodesMultipleCells[1], &(m_crc_encode_launch_cfg.get()->m_kernelNodeParams[1])));
+        }
+
+        // Update LDPC nodes
+        // NB: The CUDA graph kernel node updates can fail for CUDA < 11.2 if they involve a change in the kernel function.
+        int first_unused_ldpc_node = total_LDPC_kernel_configs;
+
+        for(int LDPC_cfg = 0; LDPC_cfg < first_unused_ldpc_node; LDPC_cfg++)
+        {
+            // Only re-enable nodes that were previously disabled
+            if (LDPC_cfg >= prev_first_unused_ldpc_node) {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(exec_graph, m_ldpcEncodeNodesMultipleCells[LDPC_cfg], 1));
+            }
+            CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_ldpcEncodeNodesMultipleCells[LDPC_cfg], &(m_ldpc_encode_launch_cfg.get()[LDPC_cfg].m_kernelNodeParams)));
+        }
 
 
-    // Update remaining nodes to point to an empty kernel function and minimal launch config or disable them.
-    // Only do that for nodes that were previously enabled, i.e., from within [first_unused_ldpc_node, prev_first_unused_ldpc_node) if non empty.
-    // This assumes that all std::min(per_cell_group_max_TBs, PDSCH_MAX_HET_LDPC_CONFIGS_SUPPORTED) LDPC graph nodes were originally disabled.
-    for(int LDPC_cfg = first_unused_ldpc_node; LDPC_cfg < prev_first_unused_ldpc_node; LDPC_cfg++)
-    {
-        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(exec_graph, m_ldpcEncodeNodesMultipleCells[LDPC_cfg], 0));
+        // Update remaining nodes to point to an empty kernel function and minimal launch config or disable them.
+        // Only do that for nodes that were previously enabled, i.e., from within [first_unused_ldpc_node, prev_first_unused_ldpc_node) if non empty.
+        // This assumes that all std::min(per_cell_group_max_TBs, PDSCH_MAX_HET_LDPC_CONFIGS_SUPPORTED) LDPC graph nodes were originally disabled.
+        for(int LDPC_cfg = first_unused_ldpc_node; LDPC_cfg < prev_first_unused_ldpc_node; LDPC_cfg++)
+        {
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(exec_graph, m_ldpcEncodeNodesMultipleCells[LDPC_cfg], 0));
+        }
+        // Update prev_first_unused_ldpc_node for next graph update
+        prev_first_unused_ldpc_node = first_unused_ldpc_node;
     }
-    // Update prev_first_unused_ldpc_node for next graph update
-    prev_first_unused_ldpc_node = first_unused_ldpc_node;
 
     // Update fused rate matching and modulation mapper node
     CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_rmNodesMultipleCells[0], &(m_rate_matching_launch_cfg.get()->m_kernelNodeParams[0])));
 
-    if(!aas_mode)
+    if(!aas_mode) // (!aas_mode) covers post_fec_processing case too; could add an || post_fec_processing to make it more clear
     {
         // Update DMRS node
         CU_CHECK_EXCEPTION_W_TAG(NVLOG_PDSCH, cuGraphExecKernelNodeSetParams(exec_graph, m_dmrsNodeMultipleCells[0], &(m_dmrs_launch_cfg.get()->m_kernelNodeParams)));
@@ -3251,6 +3215,16 @@ CUresult PdschTx::addDependenciesHelper(CUgraph hGraph, const CUgraphNode* from,
 // Add dependencies.
 void PdschTx::addDependenciesMultipleCells()
 {
+    if(post_fec_processing)
+    {
+        CU_CHECK_EXCEPTION(addDependenciesHelper(m_graph, &m_csirsPrepNodesMultipleCells[2], &m_csirsPrepNodesMultipleCells[0], 1));
+        CU_CHECK_EXCEPTION(addDependenciesHelper(m_graph, &m_csirsPrepNodesMultipleCells[0], &m_csirsPrepNodesMultipleCells[1], 1));
+        CU_CHECK_EXCEPTION(addDependenciesHelper(m_graph, &m_csirsPrepNodesMultipleCells[1], &m_rmNodesMultipleCells[0], 1));
+        CU_CHECK_EXCEPTION(addDependenciesHelper(m_graph, &m_csirsPrepNodesMultipleCells[1], &m_dmrsNodeMultipleCells[0], 1));
+        return;
+    }
+
+    // Covering !post_fec_processing case
 #if OLD_GRAPH
     CU_CHECK_EXCEPTION(addDependenciesHelper(m_graph, &m_prepareCRCEncodeNodeMultipleCells[0], &m_csirsPrepNodesMultipleCells[2], 1));
     CU_CHECK_EXCEPTION(addDependenciesHelper(m_graph, &m_csirsPrepNodesMultipleCells[2], &m_csirsPrepNodesMultipleCells[0], 1));
@@ -3345,5 +3319,4 @@ void PdschTx::addDependenciesMultipleCells()
     }
 #endif
 #endif
-
 }

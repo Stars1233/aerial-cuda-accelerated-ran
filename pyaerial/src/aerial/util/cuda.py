@@ -22,7 +22,7 @@ destroy the stream on exit. Call :meth:`CudaStream.synchronize` explicitly
 when synchronization is needed. The stream is destroyed when the
 :class:`CudaStream` object is garbage-collected.
 """
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Tuple
 
 import cupy as cp  # type: ignore
 import cuda.bindings.runtime as cudart  # type: ignore
@@ -48,6 +48,18 @@ def check_cuda_errors(result: cudart.cudaError_t) -> Any:
     return result[1:]
 
 
+class _CudaStreamProtocol:
+    """CUDA stream protocol adapter for raw cuda-python stream handles."""
+
+    def __init__(self, handle: Any) -> None:
+        """Create an adapter for a raw CUDA stream handle."""
+        self._handle = int(handle)
+
+    def __cuda_stream__(self) -> Tuple[int, int]:
+        """Return the CUDA stream protocol tuple."""
+        return (0, self._handle)
+
+
 class CudaStream:
     """RAII wrapper for a CUDA stream with context-manager support.
 
@@ -66,13 +78,23 @@ class CudaStream:
     def __enter__(self) -> "CudaStream":
         """Set CuPy's current stream for the following block.
 
-        Enters CuPy's ExternalStream so that ``with stream:`` has the same
-        effect as ``with cp.cuda.ExternalStream(int(stream.handle)):``.
+        Enters CuPy's stream so that ``with stream:`` has the same
+        effect as ``with cp.cuda.Stream.from_external(stream_protocol):``.
         Does not synchronize or destroy the stream on exit.
         Not re-entrant: nesting ``with stream:`` with the same instance raises.
 
         Returns:
-            self (this CudaStream).
+            This :class:`CudaStream` instance.
+
+        Raises:
+            RuntimeError: If this stream is already active as a context manager
+                (re-entrancy is not supported), or if the underlying CUDA stream
+                handle has already been destroyed.
+
+        Examples:
+            >>> stream = CudaStream()
+            >>> with stream:
+            ...     pass  # CuPy operations here run on this stream
         """
         if self._cupy_stream is not None:
             raise RuntimeError(
@@ -80,8 +102,9 @@ class CudaStream:
             )
         if self._handle is None:
             raise RuntimeError("CudaStream handle is no longer valid (stream destroyed)")
-        self._cupy_stream = cp.cuda.ExternalStream(int(self._handle))
-        self._cupy_stream.__enter__()
+        cupy_stream = cp.cuda.Stream.from_external(_CudaStreamProtocol(self._handle))
+        cupy_stream.__enter__()
+        self._cupy_stream = cupy_stream
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Literal[False]:

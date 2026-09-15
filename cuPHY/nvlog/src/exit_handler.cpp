@@ -19,6 +19,7 @@
 #include "nvlog.h"
 #include "exit_handler.hpp"
 #include <string>
+#include <cstring>
 #include <unistd.h>
 #include <cstdlib>
 
@@ -26,6 +27,9 @@
 
 // Define initial value of exit_handler::instance
 exit_handler* exit_handler::instance = nullptr;
+
+// Always defined when exit_handler.cpp is linked (nvlog.cpp is omitted if NVIPC_FMTLOG_ENABLE=OFF).
+exit_handler& pExitHandler = exit_handler::getInstance();
 
 const unsigned int exit_handler::EXIT_WATCHDOG_SLEEP_SEC = 5;
 
@@ -53,7 +57,9 @@ void* exit_handler::exit_watchdog_thread_func(void* arg)
     NVLOGC_FMT(TAG, "[exit_watchdog] thread closed FMT log after and force exit");
 
     // If the main thread is still not exited after watchdog sleep, print a warning log and force exit
+#ifdef NVIPC_FMTLOG_ENABLE
     nvlog_fmtlog_close();
+#endif
 
     char ts[NVLOG_TIME_STRING_LEN] = {'\0'};
     nvlog_gettimeofday_string(ts, NVLOG_TIME_STRING_LEN);

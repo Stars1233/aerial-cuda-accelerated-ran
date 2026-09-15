@@ -17,6 +17,8 @@
 
 #include "yaml_parser.hpp"
 
+#include <slot_command/slot_command.hpp>
+
 #include <cstring>
 #include <string>
 
@@ -248,7 +250,8 @@ void YamlParser::parse_fh_info(yaml::node node)
         .cuda_device_ids_for_compute       = {0},
         .rivermax              = false,
         .fh_stats_dump_cpu_core = -1,
-        .cpu_rx_only            = false
+        .cpu_rx_only            = false,
+        .max_dl_antenna_ports   = static_cast<uint16_t>(MAX_DL_EAXCIDS)  // fh_generator always allocates at maximum capacity
     };
 
     fh_info_ = fh_info;

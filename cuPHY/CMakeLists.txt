@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,6 +57,15 @@ endif()
 option(USE_MATLAB "Build MEX libraries to allow use from MATLAB" OFF)
 option(BUILD_DOCS "Generate Doxygen documentation" ON)
 option(CUPHY_BUILD_PTXAS_VERBOSE "Enable verbose mode for the PTX assembler to show local memory usage" OFF)
+option(CUPHY_ENABLE_CLMAD "Enable CLMAD-accelerated polynomial operations" ON)
+option(CUPHY_LDPC_REVERSE_ROWS "Process LDPC check rows in reverse order for supported kernels" OFF)
+
+set(CUPHY_CLMAD_BUILD_ENABLED 0)
+if(CUPHY_ENABLE_CLMAD AND
+   CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.3)
+    set(CUPHY_CLMAD_BUILD_ENABLED 1)
+endif()
+
 option(CUPHY_HDF5_VERSION_CHECK "Force HDF5 library version checking, necessary for interoperability with binary cuPHY packages" ON)
 option(ENABLE_NVTX  "Enable use of NVTX" OFF)
 option(BUILD_SHARED_LIBS "Build cuPHY as a shared library" ON)
@@ -66,8 +75,8 @@ option(ASIM_CUPHY_FP32 "Enable ASIM cuPHY PUSCH FP32 input" OFF)
 option(ENABLE_PUSCH_LDPC_OUTPUT_H5_DUMP "Enable PUSCH LDPC OUTPUT H5 DUMP" OFF)
 option(ASIM_CUPHY_SRS_OUTPUT_FP32 "Enable ASIM cuPHY SRS FP32 output" OFF)
 option(ENABLE_LINE_INFO "Add -lineinfo flag to CUPHY_NVCC_FLAGS" OFF)
-OPTION(ENABLE_32DL "Enable 32-layer Downlink" OFF)
 OPTION(ENABLE_64C "Enable 64C" OFF)
+OPTION(CUPHY_LDPC_SPLIT_DUMP_KERNELS "Build separate ET-free per-iteration APP dump twin kernels for the LDPC test bench (algo40/41 x1, algo35 x2); OFF by default -- opt in only when validating decoders, the production kernels are never touched" OFF)
 
 if(ENABLE_CUPHY_PTI_TRACING)
     add_definitions(-DCUPHY_PTI_ENABLE_TRACING)
@@ -83,9 +92,6 @@ if(ASIM_CUPHY_SRS_OUTPUT_FP32)
 endif()
 if(BFW_BOTH_COMP_FLOAT)
     add_definitions(-DBFW_BOTH_COMP_FLOAT)
-endif()
-if(ENABLE_32DL)
-    add_definitions(-DENABLE_32DL)
 endif()
 if(ENABLE_64C)
     add_definitions(-DENABLE_64C)
@@ -219,18 +225,21 @@ if (NOT TARGET nvlog)
     add_subdirectory(nvlog)
 endif()
 add_subdirectory(src)
-add_subdirectory(examples)
 add_subdirectory(util/aerial_utils)
 if (ENABLE_TESTS)
     add_subdirectory(test)
 endif()
 
 # ----------------------------------------------------------------------
-# build chanModels library from testBenches/chanModels/src if it does not exist
-if (NOT TARGET chanModels)
-    add_subdirectory(../testBenches/chanModels/src examples/chanModels/src)
+# add_subdirectory() configures immediately, so define the gpu3gppchan dependency
+# and include path before configuring the examples that consume them.
+# Build gpu3gppchan from testBenches/gpu3GPPChan/src if it does not exist.
+if (NOT TARGET gpu3gppchan)
+    add_subdirectory(../testBenches/gpu3GPPChan/src examples/gpu3GPPChan/src)
 endif()
-set(CHAN_MODELS_SRC_INCLUDE_DIR ../testBenches/chanModels/src)
+set(GPU3GPPCHAN_SRC_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../testBenches/gpu3GPPChan/src")
+
+add_subdirectory(examples)
 
 if (USE_MATLAB)
     add_subdirectory(util/matlab/mex)
@@ -281,7 +290,6 @@ install(DIRECTORY examples/prach_test DESTINATION examples FILES_MATCHING PATTER
 install(DIRECTORY examples/ss DESTINATION examples FILES_MATCHING PATTERN "*" PATTERN "CMakeLists.*" EXCLUDE)
 install(DIRECTORY examples/polar_encoder DESTINATION examples FILES_MATCHING PATTERN "*" PATTERN "CMakeLists.*" EXCLUDE)
 install(DIRECTORY examples/srs_chEst DESTINATION examples FILES_MATCHING PATTERN "*" PATTERN "CMakeLists.*" EXCLUDE)
-install(FILES CMakeLists.release.txt DESTINATION . RENAME CMakeLists.txt)
 if (BUILD_DOCS)
     install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/docs DESTINATION . FILES_MATCHING PATTERN "*")
 endif (BUILD_DOCS)

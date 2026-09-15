@@ -204,17 +204,31 @@ def check_cell_capacity(sweeps):
                     ontimePercent[key]['CSI-RS'] = calc_ontime_percentage(csirs, constraints['CSI-RS'])
                     
                 else:
-                    # PDSCH or PDSCH+DLBFW          
+                    # PDSCH or PDSCH+DLBFW (per-slot sum to align with compare.py CDF and latency_budget)
                     if sweeps[key].get("DLBFW", None) is not None:
-                        pdsch_dlbfw = sweeps[key].get("PDSCH", []) + sweeps[key].get("DLBFW", [])
+                        pdsch = sweeps[key].get("PDSCH", [])
+                        dlbfw = sweeps[key].get("DLBFW", [])
+                        if len(pdsch) != len(dlbfw):
+                            raise ValueError(
+                                f"PDSCH and DLBFW sample count mismatch for {key}: "
+                                f"PDSCH={len(pdsch)}, DLBFW={len(dlbfw)}"
+                            )
+                        pdsch_dlbfw = [p + d for p, d in zip(pdsch, dlbfw, strict=True)]
                         ontimePercent[key]['PDSCH+DLBFW'] = calc_ontime_percentage(pdsch_dlbfw, constraints['PDSCH+DLBFW'])
                     else:
                         pdsch = sweeps[key].get("PDSCH", [])
                         ontimePercent[key]['PDSCH'] = calc_ontime_percentage(pdsch, constraints['PDSCH'])
                         
-                    # PDCCH or PDCCH+CSI-RS          
+                    # PDCCH or PDCCH+CSI-RS (per-slot sum to align with compare.py CDF and latency_budget)
                     if sweeps[key].get("CSI-RS", None) is not None:
-                        pdcch_csirs = sweeps[key].get("PDCCH", []) + sweeps[key].get("CSI-RS", [])
+                        pdcch = sweeps[key].get("PDCCH", [])
+                        csirs = sweeps[key].get("CSI-RS", [])
+                        if len(pdcch) != len(csirs):
+                            raise ValueError(
+                                f"PDCCH and CSI-RS sample count mismatch for {key}: "
+                                f"PDCCH={len(pdcch)}, CSI-RS={len(csirs)}"
+                            )
+                        pdcch_csirs = [p + c for p, c in zip(pdcch, csirs, strict=True)]
                         ontimePercent[key]['PDCCH+CSI-RS'] = calc_ontime_percentage(pdcch_csirs, constraints['PDCCH+CSI-RS'])
                     else:
                         pdcch = sweeps[key].get("PDCCH", [])
@@ -256,11 +270,29 @@ def check_cell_capacity(sweeps):
         
         sweeps['constraints'] = constraints # save constraints into result json file
         
+        fix_ul = sweeps['testConfig'].get('fix_ul_cell_count')
+        fix_dl = sweeps['testConfig'].get('fix_dl_cell_count')
+        n_slots = sweeps['testConfig']['sweeps']
+
+        def _capacity_label(swept_key):
+            """Append DL/UL breakdown to the existing XX+YY key for readability."""
+            swept_n = int(swept_key.split('+')[0])
+            ul_fixed = fix_ul is not None and fix_ul > 0
+            dl_fixed = fix_dl is not None and fix_dl > 0
+            if ul_fixed and dl_fixed:
+                return f"{swept_key} (DL {fix_dl}C fixed / UL {fix_ul}C fixed)"
+            elif ul_fixed:
+                return f"{swept_key} (DL {swept_n}C / UL {fix_ul}C fixed)"
+            elif dl_fixed:
+                return f"{swept_key} (DL {fix_dl}C fixed / UL {swept_n}C)"
+            else:
+                return f"{swept_key} (DL {swept_n}C / UL {swept_n}C)"
+
         if(not successRunInd):
             print("Warning: no successful run is done, unknown cell capacity (100% on time for all channels), please retry")
         elif(cellCapacity == maxCellTested):
-            print(f"Warning: max cell count {maxCellTested} passed based on {sweeps['testConfig']['sweeps']} slots run, unknown cell capacity (100% on time for all channels), please try larger cell counts")
+            print(f"Warning: max cell count {_capacity_label(maxCellTested)} passed based on {n_slots} slots run, unknown cell capacity (100% on time for all channels), please try larger cell counts")
         elif (cellCapacity == "00+00"):
-            print(f"Warning: no cell count passed based on {sweeps['testConfig']['sweeps']} slots run, unknown cell capacity (100% on time for all channels), please try smaller cell counts")
+            print(f"Warning: no cell count passed based on {n_slots} slots run, unknown cell capacity (100% on time for all channels), please try smaller cell counts")
         else:
-            print(f"Cell capacity is {cellCapacity} based on {sweeps['testConfig']['sweeps']} slots run (100% on time for all channels)")  
+            print(f"Cell capacity is {_capacity_label(cellCapacity)} based on {n_slots} slots run (100% on time for all channels)")

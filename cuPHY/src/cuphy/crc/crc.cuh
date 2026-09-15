@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,8 +18,10 @@
 #if !defined(CRC_CUH_INCLUDED_)
 #define CRC_CUH_INCLUDED_
 
+#include <cstdint>
 #include "crc.hpp"
 #include "cuphy.h"
+#include "cuphy_clmad_util.cuh"
 #include "cuphy_internal.h"
 
 #define TABLE 1
@@ -53,7 +55,7 @@ const int LUT_SIZE = 256;
 // uintCRCBitLength at most the bit size of the unsigned int type stride is in
 // bytes
 
-#define FULL_MASK 0xffffffff
+#define FULL_MASK UINT32_MAX
 
 // XOR warp level reduction
 template <typename uintCRC_t>
@@ -101,6 +103,48 @@ __device__ T mulModPoly(T a, T b, T poly)
     }
     return prod;
 }
+
+#if CUPHY_CLMAD_AVAILABLE
+template <uint32_t T, uint64_t QPLUSCRC, uint32_t QPLUSX, uint32_t GSTAR>
+__device__ __forceinline__ uint32_t mulModCRCPoly_CRC_CLMAD(uint32_t a, uint32_t b)
+{
+    constexpr uint32_t lsbMask = (1u << T) - 1u;
+    const uint32_t     aR      = __byte_perm(a, 0, 0x0123);
+    const uint32_t     crc     = cuphy_clmad::opt_reduction<32, T, QPLUSCRC, GSTAR>(aR);
+
+    cuphy_clmad::u64_u32x2 abX;
+    abX.u64 = cuphy_clmad::clmul_lo(static_cast<uint64_t>(crc), static_cast<uint64_t>(b));
+
+    const uint32_t pX = abX.u32[0] & lsbMask;
+    const uint32_t cX = __funnelshift_rc(abX.u32[0], abX.u32[1], T);
+
+    return cuphy_clmad::opt_reduction<T, T, QPLUSX, GSTAR>(cX) ^ pX;
+}
+
+__device__ __forceinline__ uint32_t mulModCRCPoly_CRC16_CLMAD(uint32_t a, uint32_t b)
+{
+    return mulModCRCPoly_CRC_CLMAD<16,
+                                   cuphy_clmad::qplusCRC_16,
+                                   cuphy_clmad::qplusX_16,
+                                   cuphy_clmad::gcrc16astrX>(a, b);
+}
+
+__device__ __forceinline__ uint32_t mulModCRCPoly_CRC24_POLYA_CLMAD(uint32_t a, uint32_t b)
+{
+    return mulModCRCPoly_CRC_CLMAD<24,
+                                   cuphy_clmad::qplusCRC_24_A,
+                                   cuphy_clmad::qplusX_24_A,
+                                   cuphy_clmad::gcrc24aastrX>(a, b);
+}
+
+__device__ __forceinline__ uint32_t mulModCRCPoly_CRC24_POLYB_CLMAD(uint32_t a, uint32_t b)
+{
+    return mulModCRCPoly_CRC_CLMAD<24,
+                                   cuphy_clmad::qplusCRC_24_B,
+                                   cuphy_clmad::qplusX_24_B,
+                                   cuphy_clmad::gcrc24bastrX>(a, b);
+}
+#endif
 
 template <typename T, uint32_t size>
 __device__ uint32_t mulModCRCPolyLUT(uint32_t a,

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -74,6 +74,26 @@ struct c2v_cache_register
                                                                           app_addr,
                                                                           c2v_storage[CHECK_IDX],
                                                                           smem_offset);
+    }
+    //------------------------------------------------------------------
+    // Out-of-bounds read with APP sign-change tracking
+    template <unsigned int CHECK_IDX, int NUM_APP_WORDS, int ROW_DEGREE>
+    __device__
+    bool process_row_sign_change(const TKernelParams& params,
+                                 word_t               (&app)[NUM_APP_WORDS],
+                                 int                  (&app_addr)[ROW_DEGREE],
+                                 int                  smem_offset)
+    {
+        static_assert(ROW_DEGREE == row_degree<BG, CHECK_IDX>::value,
+                      "APP address size incorrect for row degree");
+        static_assert(CHECK_IDX < NUM_PARITY_NODES,
+                      "Parity check index exceeds allocation");
+        c2v_t c2v;
+        return c2v.template process_row_sign_change<CHECK_IDX, TKernelParams, c2v_storage_t>(params,
+                                                                                            app,
+                                                                                            app_addr,
+                                                                                            c2v_storage[CHECK_IDX],
+                                                                                            smem_offset);
     }
     //------------------------------------------------------------------
     // Data

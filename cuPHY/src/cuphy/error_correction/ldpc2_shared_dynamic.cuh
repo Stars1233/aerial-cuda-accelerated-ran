@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -80,7 +80,7 @@ cuphyStatus_t launch_all_shared_dynamic(ldpc::decoder&            dec,
     const uint32_t app_size = shmem_llr_buffer_size(Kb + NUM_PARITY, // num shared memory nodes
                                                     Z,               // lifting size
                                                     sizeof(T));      // element size
-    shmem_size = c2v_size + app_size;
+    shmem_size = shmem_size_with_et_context(c2v_size + app_size);
     int32_t device_shmem_max = dec.max_shmem_per_block_optin();
     if(device_shmem_max <= 0)
     {
@@ -98,7 +98,7 @@ cuphyStatus_t launch_all_shared_dynamic(ldpc::decoder&            dec,
     {
         return CUPHY_STATUS_INTERNAL_ERROR;
     }
-    
+
     //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     DEBUG_PRINT_FUNC_ATTRIBUTES((ldpc2_kernel<T, BG, Kb, Z, sched_t, llr_loader_t, BLOCKS_PER_SM>));
     DEBUG_PRINT_FUNC_MAX_BLOCKS((ldpc2_kernel<T, BG, Kb, Z, sched_t, llr_loader_t, BLOCKS_PER_SM>), blkDim, shmem_size);

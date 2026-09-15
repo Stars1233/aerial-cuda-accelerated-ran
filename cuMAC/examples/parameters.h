@@ -15,117 +15,225 @@
  * limitations under the License.
  */
 
- #pragma once
+#pragma once
 
- // debug parameters
- // #define OUTPUT_SOLUTION_
- // #define LIMIT_NUM_SM_TIME_MEASURE_
- // #define MCSCHEDULER_DEBUG_
- // #define SCSCHEDULER_DEBUG_
- // #define CHANN_INPUT_DEBUG_
- // #define CELLASSOCIATION_PRINT_SAMPLE_
+#include <cstdint>
+#include <string>
+#include <vector>
 
- // GPU index
- #define gpuDeviceIdx           0 // index of GPU device to use
+// debug parameters (kept as compile-time toggles)
+// #define OUTPUT_SOLUTION_
+// #define LIMIT_NUM_SM_TIME_MEASURE_
+// #define MCSCHEDULER_DEBUG_
+// #define SCSCHEDULER_DEBUG_
+// #define CHANN_INPUT_DEBUG_
+// #define CELLASSOCIATION_PRINT_SAMPLE_
 
- // simulation duration
- #define numSimChnRlz           2000 //total number of simulated TTIs (e.g., 15000 for 1200 active UEs per cell; 5000 for 500 active UEs per cell)
- 
- // randomness
- #define seedConst              0 // randomness seed
+namespace cumac {
 
- // system parameters
- //#define mu                     0 // OFDM numerology: 0, 1, 2, 3, 4
- #define slotDurationConst      0.5e-3 // 1.0e-3, 0.5e-3, 0.25e-3, 0.125e-3, 0.0625e-3
- #define scsConst               30000.0 // 15000.0, 30000.0, 60000.0, 120000.0, 240000.0 corresponding to OFDM numerology: 0, 1, 2, 3, 4
- #define numMcsLevels           28
- #define cellRadiusConst        1000
- #define numCellConst           20 // total number of cells in the network, including coordinated cells and interfering cells
- #define numCoorCellConst       numCellConst // currently support max 21 coordinated cells
- #define numUePerCellConst      16 // number of UEs scheduled per time slot per cell
- #define numUeForGrpConst       32 // number of UEs considered for MU-MIMO UE grouping per TTI per cell
- // assumption's that numUePerCellConst <= numUeForGrpConst
- #define numActiveUePerCellConst 500 // 100, 500, 1200. should be <= 2048
- #define totNumUesConst         numCellConst*numUePerCellConst // total number of scheduled UEs per TTI that are associated with the coordinated cells   
- #define totNumActiveUesConst   numCellConst*numActiveUePerCellConst // total number of active UEs associated with the coordinated cells   
- // antenna configurations
- // *AntSize, *AntSpacing, *AntPolarAngles, *AntPattern, vDirection are only used in CDL channel model and n*Ant must be equal to prod(*AntSize)
- // for other channel models, *AntSize, *AntSpacing, *AntPolarAngles, *AntPattern, vDirection are not used
- // by default, UE uses isotropic antennas, BS uses directional antennas
- #define nBsAntConst            4 
-#define bsAntSizeConst          {1,1,1,2,2} // {M_g,N_g,M,N,P} 3GPP TR 38.901 Section 7.3
-#define bsAntSpacingConst       {1.0f, 1.0f, 0.5f, 0.5f} // BS antenna spacing [d_g_h, d_g_v, d_h, d_v] in wavelengths
- #define bsAntPolarAnglesConst  {45.0f, -45.0f} // BS antenna polarization angles
- #define bsAntPatternConst      1 // 0: isotropic; 1: 38.901
- #define nUeAntConst            4 // assumption's that nUeAntConst <= nBsAntConst; nUeAntConst is also equal to the maximum number of layers
-#define ueAntSizeConst          {1,1,2,2,1} // {M_g,N_g,M,N,P} 3GPP TR 38.901 Section 7.3
-#define ueAntSpacingConst       {1.0f, 1.0f, 0.5f, 0.5f} // UE antenna spacing [d_g_h, d_g_v, d_h, d_v] in wavelengths
- #define ueAntPolarAnglesConst  {0.0f, 90.0f} // UE antenna polarization angles
- #define ueAntPatternConst      0  // 0: isotropic; 1: 38.901
- #define vDirectionConst        {90, 0} // moving direction, [RxA; RxZ] — RxA and RxZ specify the azimuth and zenith of the direction of travel of the moving UE; moving speed is converted to maxDopplerShift in cdlCfg
- #define nPrbsPerGrpConst       4
- #define nPrbGrpsConst          68
- #define WConst                 12.0*scsConst*nPrbsPerGrpConst
- #define totWConst              WConst*nPrbGrpsConst
- #define PtConst                79.4328 // Macrocell - 49.0 dBm (79.4328 W), Microcell - 23 dBm (0.1995 W)
- #define PtRbgConst             PtConst/nPrbGrpsConst
- #define PtRbgAntConst          PtRbgConst/nBsAntConst
- #define bandwidthRBConst       12*scsConst
- #define bandwidthRBGConst      nPrbsPerGrpConst*bandwidthRBConst
- #define noiseFigureConst       9 // dB
- // For testing need to adjust noise variance based on channel gain
- #define sigmaSqrdDBmConst      -174 + noiseFigureConst+ 10*log10(bandwidthRBGConst)
- #define sigmaSqrdConst         pow(10.0, ((sigmaSqrdDBmConst - 30.0)/10.0))
- #define gpuAllocTypeConst      1 // 0 - non-consecutive type 0 allocate, 1 - consecutive type 1 allocate
- #define cpuAllocTypeConst      1 // 0 - non-consecutive type 0 allocate, 1 - consecutive type 1 allocate
- #define prdSchemeConst         0 // 0 - no precoding, 1 - SVD precoding
- #define rxSchemeConst          1 // 1 - MMSE-IRC
- #define heteroUeSelCellsConst  0 // 0 - homogeneous UE selection config. across cells, 1 - heterogeneous UE selection config. across cells
- // heterogeneous UE selection config. currently not supported for performance benchmarking vs. RR scheduler
+// Runtime-loaded simulation parameters. Loaded once at program start from
+// parameters.yaml; downstream code accesses values through the `Const`-suffixed
+// macros defined below (back-compat shims over the global g_params instance).
+struct Params {
+    int gpuDeviceIdx;                       //!< CUDA device index used by examples.
 
- // max dimentions
- #define maxNumCoorCellConst    21
- #define maxNumBsAntConst       16
- #define maxNumUeAntConst       16
- #define maxNumPrbGrpsConst     100
+    int numSimChnRlz;                       //!< Number of simulated channel realizations (TTIs).
 
- // buffer size
- #define estHfrSizeCOnst        nPrbGrpsConst*totNumUesConst*numCoorCellConst*nBsAntConst*nUeAntConst
- 
- // PDSCH parameters
- #define pdschNrOfSymbols       12
- #define pdschNrOfDmrsSymb      1
- #define pdschNrOfDataSymb      pdschNrOfSymbols-pdschNrOfDmrsSymb
- #define pdschNrOfLayers        1
+    int seedConst;                          //!< Seed for std::srand-based randomness.
 
- // PF scheduling
- #define initAvgRateConst       1.0
- #define pfAvgRateUpdConst      0.001
- #define betaCoeffConst         1.0
- #define sinValThrConst         0.1
- #define prioWeightStepConst    100
- // power scaling
- #define AFTER_SCALING_SIGMA_CONST 1.0 // noise std after scaling to improve precision
- // 1.0 for 49.0 dBm BS Tx power
+    double slotDurationConst;               //!< Slot duration, seconds.
+    double scsConst;                        //!< Subcarrier spacing, Hz.
+    int    numMcsLevels;                    //!< Number of MCS levels modelled.
+    int    cellRadiusConst;                 //!< Cell radius, metres.
+    int    numCellConst;                    //!< Number of cells in the network.
+    int    numUePerCellConst;               //!< UEs scheduled per cell per TTI.
+    int    numUeForGrpConst;                //!< UE group size for grouping heuristics.
+    int    numActiveUePerCellConst;         //!< Total active UEs per cell (population size).
 
- #define cpuGpuPerfGapPerUeConst 0.005
- #define cpuGpuPerfGapSumRConst 0.01
- // interference control
- #define toleranceConst         0.4
+    int                    nBsAntConst;            //!< BS antennas per cell.
+    std::vector<uint16_t>  bsAntSizeConst;         //!< BS antenna shape, 5 elements {M_g, N_g, M, N, P}.
+    std::vector<float>     bsAntSpacingConst;      //!< BS antenna spacing (wavelengths), 4 elements {dg_H, dg_V, d_H, d_V}.
+    std::vector<float>     bsAntPolarAnglesConst;  //!< BS polarization angles in degrees, P entries (typically 2).
+    int                    bsAntPatternConst;      //!< BS element pattern id (0=isotropic, 1=3GPP TR38.901, ...).
+    int                    nUeAntConst;            //!< UE antennas.
+    std::vector<uint16_t>  ueAntSizeConst;         //!< UE antenna shape, 5 elements {M_g, N_g, M, N, P}.
+    std::vector<float>     ueAntSpacingConst;      //!< UE antenna spacing (wavelengths), 4 elements {dg_H, dg_V, d_H, d_V}.
+    std::vector<float>     ueAntPolarAnglesConst;  //!< UE polarization angles in degrees, P entries (typically 2).
+    int                    ueAntPatternConst;      //!< UE element pattern id.
+    std::vector<float>     vDirectionConst;        //!< UE velocity direction {azimuth, zenith} in degrees, 2 elements.
 
- // SVD precoder parameters
- #define svdToleranceConst      1.e-7
- #define svdMaxSweeps           15
+    int nPrbsPerGrpConst;                   //!< PRBs per PRB-group (RBG). Must be > 0.
+    int nPrbGrpsConst;                      //!< Number of PRB-groups. Must be > 0.
 
- // Normalized channel coefficients for __half range
- #define amplifyCoeConst        1
+    double PtConst;                         //!< Per-cell total transmit power, linear scale.
 
- // output file
- #define mcOutputFile           "output.txt"     
- #define mcOutputFileShort      "output_short.txt"
+    double noiseFigureConst;                //!< Receiver noise figure, dB.
 
-#define targetChanCoeRangeConst 0.1f * nPrbGrpsConst * totNumUesConst // target channel coefficients range for precision issue
-#define MinNoiseRangeConst      0.001f // minimum noise figure for stability issues 
+    int gpuAllocTypeConst;                  //!< GPU UE-selection allocator variant.
+    int cpuAllocTypeConst;                  //!< CPU UE-selection allocator variant.
+    int prdSchemeConst;                     //!< Precoder scheme id.
+    int rxSchemeConst;                      //!< Receiver scheme id.
+    int heteroUeSelCellsConst;              //!< Enable heterogeneous per-cell UE selection (0/1).
 
-// 64TR MU-MIMO parameters
-#define nMaxUeSchdPerCellTTIConst 16
+    int maxNumCoorCellConst;                //!< Upper bound on coordinated cells (sizing constant).
+    int maxNumBsAntConst;                   //!< Upper bound on BS antennas (sizing constant).
+    int maxNumUeAntConst;                   //!< Upper bound on UE antennas (sizing constant).
+    int maxNumPrbGrpsConst;                 //!< Upper bound on PRB-groups (sizing constant).
+
+    int pdschNrOfSymbols;                   //!< OFDM symbols in a PDSCH allocation.
+    int pdschNrOfDmrsSymb;                  //!< DMRS symbols inside that allocation.
+    int pdschNrOfLayers;                    //!< Spatial layers per PDSCH.
+
+    double initAvgRateConst;                //!< Initial PF average rate.
+    double pfAvgRateUpdConst;               //!< PF average-rate update step (EWMA alpha).
+    double betaCoeffConst;                  //!< PF fairness exponent.
+    double sinValThrConst;                  //!< SVD singular-value threshold for layer drop.
+    int    prioWeightStepConst;             //!< Integer priority-weight quantization step.
+
+    double AFTER_SCALING_SIGMA_CONST;       //!< Post-power-scaling noise variance.
+
+    double cpuGpuPerfGapPerUeConst;         //!< Per-UE CPU vs GPU runtime gap heuristic.
+    double cpuGpuPerfGapSumRConst;          //!< Sum-rate CPU vs GPU gap heuristic.
+
+    double toleranceConst;                  //!< Inter-UE interference tolerance.
+
+    double svdToleranceConst;               //!< SVD convergence tolerance.
+    int    svdMaxSweeps;                    //!< SVD maximum Jacobi sweeps.
+
+    int amplifyCoeConst;                    //!< Channel-coefficient amplification flag.
+
+    std::string mcOutputFile;               //!< Long-form per-TTI result output path.
+    std::string mcOutputFileShort;          //!< Summary result output path.
+
+    double targetChanCoeRangeScale;         //!< Scale factor for derived targetChanCoeRangeConst.
+    float  MinNoiseRangeConst;              //!< Minimum normalized noise variance.
+
+    int nMaxUeSchdPerCellTTIConst;          //!< Cap on UEs scheduled per cell per TTI (64TR MU-MIMO).
+
+    //
+    // Derived values, computed in loadParameters() after the above are read.
+    //
+    int    numCoorCellConst;        //!< Coordinated cells in current configuration; = numCellConst.
+    int    totNumUesConst;          //!< Total UEs across the network; = numCellConst * numUePerCellConst.
+    int    totNumActiveUesConst;    //!< Total active UEs; = numCellConst * numActiveUePerCellConst.
+    double WConst;                  //!< RBG bandwidth in Hz; = 12 * scsConst * nPrbsPerGrpConst.
+    double totWConst;               //!< Total bandwidth in Hz; = WConst * nPrbGrpsConst.
+    double PtRbgConst;              //!< Per-RBG transmit power; = PtConst / nPrbGrpsConst.
+    double PtRbgAntConst;           //!< Per-RBG per-antenna power; = PtRbgConst / nBsAntConst.
+    double bandwidthRBConst;        //!< PRB bandwidth in Hz; = 12 * scsConst.
+    double bandwidthRBGConst;       //!< RBG bandwidth in Hz; = nPrbsPerGrpConst * bandwidthRBConst.
+    double sigmaSqrdDBmConst;       //!< Noise power, dBm; = -174 + nf + 10*log10(bandwidthRBGConst).
+    double sigmaSqrdConst;          //!< Noise power, linear; = 10^((sigmaSqrdDBmConst - 30)/10).
+    int    estHfrSizeCOnst;         //!< Estimated H-frame element count for sizing buffers.
+    int    pdschNrOfDataSymb;       //!< Data symbols in PDSCH; = pdschNrOfSymbols - pdschNrOfDmrsSymb.
+    float  targetChanCoeRangeConst; //!< Target channel-coefficient range; = scale * nPrbGrpsConst * totNumUesConst.
+};
+
+// Single global parameter instance. Populated by loadParameters().
+extern Params g_params;
+
+/**
+ * Load runtime parameters from a YAML file into ::cumac::g_params.
+ *
+ * Resolution order for the YAML path (first existing file wins):
+ *   1. explicit `yamlPath` argument (if non-empty)
+ *   2. CUMAC_PARAMS_YAML environment variable
+ *   3. "parameters.yaml" in the current working directory
+ *   4. "<exe-dir>/parameters.yaml"
+ *   5. "<exe-dir>/../examples/parameters.yaml"
+ *
+ * If no file is found, or the file is malformed, or individual keys have the
+ * wrong type, a warning is logged and the compiled-in defaults are used
+ * (byte-identical to the legacy parameters.h #define values). The call never
+ * throws on bad input; it is safe to invoke once at program start.
+ *
+ * Safe to call multiple times; later calls fully replace g_params.
+ *
+ * @param[in] yamlPath Optional override path. Empty means "auto-discover".
+ */
+void loadParameters(const std::string& yamlPath = "");
+
+} // namespace cumac
+
+// ---------------------------------------------------------------------------
+// Back-compat shims: existing source code uses bare identifiers like
+// `numCellConst` or `gpuDeviceIdx`. These macros redirect to g_params so we
+// don't have to rewrite hundreds of call sites.
+//
+// parameters.cpp defines CUMAC_PARAMETERS_NO_MACROS before including this
+// header so it can manipulate the struct members by their real names.
+// ---------------------------------------------------------------------------
+#ifndef CUMAC_PARAMETERS_NO_MACROS
+#define gpuDeviceIdx                  (::cumac::g_params.gpuDeviceIdx)
+#define numSimChnRlz                  (::cumac::g_params.numSimChnRlz)
+#define seedConst                     (::cumac::g_params.seedConst)
+#define slotDurationConst             (::cumac::g_params.slotDurationConst)
+#define scsConst                      (::cumac::g_params.scsConst)
+#define numMcsLevels                  (::cumac::g_params.numMcsLevels)
+#define cellRadiusConst               (::cumac::g_params.cellRadiusConst)
+#define numCellConst                  (::cumac::g_params.numCellConst)
+#define numUePerCellConst             (::cumac::g_params.numUePerCellConst)
+#define numUeForGrpConst              (::cumac::g_params.numUeForGrpConst)
+#define numActiveUePerCellConst       (::cumac::g_params.numActiveUePerCellConst)
+#define nBsAntConst                   (::cumac::g_params.nBsAntConst)
+#define bsAntSizeConst                (::cumac::g_params.bsAntSizeConst)
+#define bsAntSpacingConst             (::cumac::g_params.bsAntSpacingConst)
+#define bsAntPolarAnglesConst         (::cumac::g_params.bsAntPolarAnglesConst)
+#define bsAntPatternConst             (::cumac::g_params.bsAntPatternConst)
+#define nUeAntConst                   (::cumac::g_params.nUeAntConst)
+#define ueAntSizeConst                (::cumac::g_params.ueAntSizeConst)
+#define ueAntSpacingConst             (::cumac::g_params.ueAntSpacingConst)
+#define ueAntPolarAnglesConst         (::cumac::g_params.ueAntPolarAnglesConst)
+#define ueAntPatternConst             (::cumac::g_params.ueAntPatternConst)
+#define vDirectionConst               (::cumac::g_params.vDirectionConst)
+#define nPrbsPerGrpConst              (::cumac::g_params.nPrbsPerGrpConst)
+#define nPrbGrpsConst                 (::cumac::g_params.nPrbGrpsConst)
+#define PtConst                       (::cumac::g_params.PtConst)
+#define noiseFigureConst              (::cumac::g_params.noiseFigureConst)
+#define gpuAllocTypeConst             (::cumac::g_params.gpuAllocTypeConst)
+#define cpuAllocTypeConst             (::cumac::g_params.cpuAllocTypeConst)
+#define prdSchemeConst                (::cumac::g_params.prdSchemeConst)
+#define rxSchemeConst                 (::cumac::g_params.rxSchemeConst)
+#define heteroUeSelCellsConst         (::cumac::g_params.heteroUeSelCellsConst)
+#define maxNumCoorCellConst           (::cumac::g_params.maxNumCoorCellConst)
+#define maxNumBsAntConst              (::cumac::g_params.maxNumBsAntConst)
+#define maxNumUeAntConst              (::cumac::g_params.maxNumUeAntConst)
+#define maxNumPrbGrpsConst            (::cumac::g_params.maxNumPrbGrpsConst)
+#define pdschNrOfSymbols              (::cumac::g_params.pdschNrOfSymbols)
+#define pdschNrOfDmrsSymb             (::cumac::g_params.pdschNrOfDmrsSymb)
+#define pdschNrOfLayers               (::cumac::g_params.pdschNrOfLayers)
+#define initAvgRateConst              (::cumac::g_params.initAvgRateConst)
+#define pfAvgRateUpdConst             (::cumac::g_params.pfAvgRateUpdConst)
+#define betaCoeffConst                (::cumac::g_params.betaCoeffConst)
+#define sinValThrConst                (::cumac::g_params.sinValThrConst)
+#define prioWeightStepConst           (::cumac::g_params.prioWeightStepConst)
+#define AFTER_SCALING_SIGMA_CONST     (::cumac::g_params.AFTER_SCALING_SIGMA_CONST)
+#define cpuGpuPerfGapPerUeConst       (::cumac::g_params.cpuGpuPerfGapPerUeConst)
+#define cpuGpuPerfGapSumRConst        (::cumac::g_params.cpuGpuPerfGapSumRConst)
+#define toleranceConst                (::cumac::g_params.toleranceConst)
+#define svdToleranceConst             (::cumac::g_params.svdToleranceConst)
+#define svdMaxSweeps                  (::cumac::g_params.svdMaxSweeps)
+#define amplifyCoeConst               (::cumac::g_params.amplifyCoeConst)
+#define mcOutputFile                  (::cumac::g_params.mcOutputFile)
+#define mcOutputFileShort             (::cumac::g_params.mcOutputFileShort)
+#define targetChanCoeRangeScale       (::cumac::g_params.targetChanCoeRangeScale)
+#define MinNoiseRangeConst            (::cumac::g_params.MinNoiseRangeConst)
+#define nMaxUeSchdPerCellTTIConst     (::cumac::g_params.nMaxUeSchdPerCellTTIConst)
+
+// derived
+#define numCoorCellConst              (::cumac::g_params.numCoorCellConst)
+#define totNumUesConst                (::cumac::g_params.totNumUesConst)
+#define totNumActiveUesConst          (::cumac::g_params.totNumActiveUesConst)
+#define WConst                        (::cumac::g_params.WConst)
+#define totWConst                     (::cumac::g_params.totWConst)
+#define PtRbgConst                    (::cumac::g_params.PtRbgConst)
+#define PtRbgAntConst                 (::cumac::g_params.PtRbgAntConst)
+#define bandwidthRBConst              (::cumac::g_params.bandwidthRBConst)
+#define bandwidthRBGConst             (::cumac::g_params.bandwidthRBGConst)
+#define sigmaSqrdDBmConst             (::cumac::g_params.sigmaSqrdDBmConst)
+#define sigmaSqrdConst                (::cumac::g_params.sigmaSqrdConst)
+#define estHfrSizeCOnst               (::cumac::g_params.estHfrSizeCOnst)
+#define pdschNrOfDataSymb             (::cumac::g_params.pdschNrOfDataSymb)
+#define targetChanCoeRangeConst       (::cumac::g_params.targetChanCoeRangeConst)
+
+#endif // CUMAC_PARAMETERS_NO_MACROS

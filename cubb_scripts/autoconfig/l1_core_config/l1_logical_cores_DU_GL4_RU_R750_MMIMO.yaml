@@ -54,6 +54,7 @@ ul_worker_threads: [2,3,4,5]
 dl_worker_threads: [6,7,8,9,10,11,12,13,14]
 l2a_timer_thread: 16
 l2a_message_processing_thread: 16
+l2a_nonslot_lp_thread: 0 #Note: low-priority non-slot worker, co-located on low-priority core
 dl_debug_thread: 17 #Note: set to -1 to disable
 l2a_pcap_capture_thread: 18
 

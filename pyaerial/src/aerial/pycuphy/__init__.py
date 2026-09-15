@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,17 +14,5 @@
 # limitations under the License.
 
 """pyAerial - The cuPHY backend."""
-import ctypes
-import os
 
-# Load shared libraries.
-libcuphy_path = os.path.dirname(os.path.realpath(__file__))
-
-dynamic_libs = ["libfmtlog-shared.so", "libnvlog.so", "libcuphy.so", "libchanModels.so"]
-for lib in dynamic_libs:
-    so = os.path.join(libcuphy_path, lib)
-    if os.path.isfile(so):
-        ctypes.cdll.LoadLibrary(so)
-
-# Disable lints due to import being in the wrong place.
-from ._pycuphy import *  # type: ignore  # noqa: F403  # pylint: disable=C0413
+from ._pycuphy import *  # type: ignore  # noqa: F403  # pylint: disable=W0401,C0413

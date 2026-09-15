@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -92,6 +92,8 @@ void fronthaul_generator_dl_tx_worker(Worker* worker)
 
     NVLOGC_FMT(TAG,"Start DL TX U worker on CPU {}", cpu);
 
+    PrimaryCtxGuard ctx_guard(0);
+
     auto& context = worker->get_context();
     // auto& nic = context.nic;
     int64_t frame_cycle_time_ns = ORAN_MAX_FRAME_ID;
@@ -117,8 +119,9 @@ void fronthaul_generator_dl_tx_worker(Worker* worker)
     // aerial_fh::TxRequestGpuPercell tx_v = {0};
     aerial_fh::TxRequestGpuPercell tx_v_cells[kMaxNicsSupported] = {};
     aerial_fh::TxRequestGpuCommHandle txrq_gpu[kMaxCells];
-    uint8_t** prb_ptrs;
-    CHECK_CUDA_THROW(cudaMalloc((void**)&prb_ptrs, sizeof(uint8_t*)*kMaxPrbsPerSymbol*kMaxSymbols*kMaxAntennas*kMaxCells));
+    CUdeviceptr prb_ptrs_dptr;
+    CHECK_CU_THROW(cuMemAlloc(&prb_ptrs_dptr, sizeof(uint8_t*)*kMaxPrbsPerSymbol*kMaxSymbols*kMaxAntennas*kMaxCells));
+    uint8_t** prb_ptrs = reinterpret_cast<uint8_t**>(prb_ptrs_dptr);
     ACCESS_ONCE(((uint32_t*)context.buffer_ready_gdr[0]->addrh())[0]) = 1;
     prb_info.ready_flag = (uint32_t*)context.buffer_ready_gdr[0]->addrd();
     prb_info.wait_val   = 1;
@@ -202,6 +205,11 @@ void fronthaul_generator_dl_tx_worker(Worker* worker)
                 {
                     NVLOGE_FMT(TAG,AERIAL_ORAN_FH_EVENT,"Failed to prepare U-plane");
                     THROW(StringBuilder() << "Failed to prepare U-plane");
+                }
+                if(int rc = aerial_fh::set_gpu_request_cell_idx(txrq_gpu[i], static_cast<uint8_t>(i)); rc != 0)
+                {
+                    NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "set_gpu_request_cell_idx failed (cell={}, rc={})", i, rc);
+                    THROW(StringBuilder() << "set_gpu_request_cell_idx failed");
                 }
 
                 auto& tx_v = tx_v_cells[context.dl_tx_worker_context.peer_nic_ids[i]];

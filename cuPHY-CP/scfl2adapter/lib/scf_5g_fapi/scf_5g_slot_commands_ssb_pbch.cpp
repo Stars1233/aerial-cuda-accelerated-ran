@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,10 +16,13 @@
  */
 
 #include "scf_5g_slot_commands_ssb_pbch.hpp"
+#include "aerial/casts/casts.hpp"
 #include "nvlog.h"
 #include "nvlog_fmt.hpp"
 #include "nv_phy_module.hpp"
 
+#include <algorithm>
+#include <array>
 #include <tuple>
 #define TAG (NVLOG_TAG_BASE_SCF_L2_ADAPTER + 4) // "SCF.SLOTCMD"
 
@@ -36,10 +39,10 @@ namespace scf_5g_fapi {
                                         {{ssb_pbch::DMRS_DATA, {0, 239}}}
                                      }};
 
-    inline void update_fh_params_ssb(cuphyPerSsBlockDynPrms_t& block, uint16_t k_SSB, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, nv::phy_config_option& config_option, uint32_t prec_ports, enum ru_type ru, int32_t cell_index, nv::slot_detail_t* slot_detail, comp_method dl_comp_method, nv::phy_config& cell_params, bool mmimo_enabled);
-    inline void update_mod_comp_info_section_ssb(prb_info_t& prb, ssb_pbch subtype, cuphyPerSsBlockDynPrms_t& block, uint16_t reMask);
+    void update_fh_params_ssb(cuphyPerSsBlockDynPrms_t& block, uint16_t k_SSB, const scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, nv::phy_config_option& config_option, uint32_t prec_ports, enum ru_type ru, int32_t cell_index, nv::slot_detail_t* slot_detail, comp_method dl_comp_method, const nv::phy_config& cell_params, bool mmimo_enabled);
+    void update_mod_comp_info_section_ssb(prb_info_t& prb, ssb_pbch subtype, cuphyPerSsBlockDynPrms_t& block, uint16_t reMask);
 
-    void update_cell_command(cell_group_command* cell_grp_cmd,cell_sub_command& cell_cmd, scf_fapi_ssb_pdu_t& cmd, int32_t cell_index, slot_indication & slotinfo, nv::phy_config& cell_params,
+    void update_cell_command(cell_group_command* cell_grp_cmd,cell_sub_command& cell_cmd, const scf_fapi_ssb_pdu_t& cmd, int32_t cell_index, slot_indication & slotinfo, const nv::phy_config& cell_params,
         uint8_t l_max, const uint16_t* lmax_symbols, nv::phy_config_option& config_option, pm_weight_map_t& pm_map, nv::slot_detail_t*  slot_detail, bool mmimo_enabled)
     {
         bool new_cell = false;
@@ -132,7 +135,7 @@ namespace scf_5g_fapi {
         mib_data = cmd.mib_pdu.agg;
         grp_params->nSsbBlocks++;
         auto& ssb_cell_params = grp_params->pbch_dyn_cell_params[block_params.cell_index];
-        auto& pc_bf_info = *reinterpret_cast<scf_fapi_tx_precoding_beamforming_t*>(&cmd.pc_and_bf[0]);
+        const auto& pc_bf_info = *aerial::casts::assume_cast<const scf_fapi_tx_precoding_beamforming_t>(&cmd.pc_and_bf[0]);
         auto pm_grp = cell_grp_cmd->get_pm_group();
 
 
@@ -141,8 +144,85 @@ namespace scf_5g_fapi {
     }
 
 
-    void update_pm_weights_ssb_cuphy(cell_group_command* cell_grp_cmd, cuphyPerSsBlockDynPrms_t& block, cuphyPerCellSsbDynPrms_t& ssb_cell_params, scf_fapi_tx_precoding_beamforming_t& pdu, nv::phy_config_option& config_options, pm_group* prec_group,
-                                     pm_weight_map_t& pm_map, cell_sub_command& cell_cmd, int32_t cell_index, nv::slot_detail_t *slot_detail, nv::phy_config& cell_params, bool mmimo_enabled) {
+    std::optional<uint32_t> resolve_ssb_pmw_slot(pm_group& prec_group,
+                                                 const pm_weight_map_t& pm_map,
+                                                 const uint32_t cache_pmi,
+                                                 bool* const cache_full) noexcept
+    {
+        // One index addresses both: the cache-full guard below uses
+        // ssb_pmw_idx_cache.size(), then the miss path writes ssb_list[slot].
+        static_assert(std::tuple_size_v<decltype(pm_group::ssb_list)>
+                          == std::tuple_size_v<decltype(pm_group::ssb_pmw_idx_cache)>,
+                      "SSB PMW cache and ssb_list must share a capacity: one index addresses both");
+
+        const auto pmw_iter = pm_map.find(cache_pmi);
+        if (pmw_iter == pm_map.end()) [[unlikely]] { return std::nullopt; }
+        if (pmw_iter->second.layers != 1) [[unlikely]] { return std::nullopt; }
+        // ssb_list entries are cuphyPmWOneLayer_t, whose matrix holds MAX_DL_PORTS
+        // elements. layers == 1 here, so the std::copy below writes `ports` elements into
+        // that fixed buffer; a PM config with ports > MAX_DL_PORTS would overflow it. This
+        // function is noexcept, so reject the entry rather than corrupt memory. The
+        // population site (scf_5g_fapi_phy.cpp) rejects such PDUs too -- this is defence in
+        // depth for the SSB destination, which is narrower than the source cuphyPmW_t.
+        if (pmw_iter->second.ports > MAX_DL_PORTS) [[unlikely]] { return std::nullopt; }
+
+        // Search only the live prefix [0, nPmPbch), not the whole array. Entries beyond
+        // nPmPbch hold whatever pm_group::reset() last wrote, and reset() only clears when
+        // its own precoding_enabled is set -- a different flag from the
+        // config_options.precoding_enabled that gates this path. Scanning past the live
+        // range could therefore return an nIndex belonging to a previous slot. Size is the
+        // validity bound, exactly as it is for slot_command's cleared-but-not-zeroed arrays.
+        // Clamp so a corrupt nPmPbch cannot form an iterator past end() before find_if runs.
+        const auto live_begin = prec_group.ssb_pmw_idx_cache.begin();
+        const auto live_end   = live_begin + std::min<std::size_t>(
+                                    prec_group.nPmPbch, prec_group.ssb_pmw_idx_cache.size());
+        const auto iter = std::find_if(live_begin, live_end,
+                                       [cache_pmi](const auto& e) { return e.pmwIdx == cache_pmi; });
+        if (iter != live_end) { return iter->nIndex; }
+
+        // Cache miss: append at the per-channel counter nPmPbch, NOT the cross-channel
+        // pm_group::nCacheEntries, so this cache and ssb_list stay in lockstep -- both
+        // are bounded by MAX_SSB_BLOCKS_PER_SLOT * MAX_CELLS_PER_CELL_GROUP.
+        //
+        // nCacheEntries is shared with the PDCCH and CSI-RS caches, which have different
+        // capacities, so one counter cannot index all three correctly. It is currently
+        // benign here only because SSB is the sole writer reached from the DLSlotProcessor
+        // path (SsbPduParser -> update_cell_command); the remaining PDCCH/CSI-RS writers
+        // sit on the legacy scf_5g_fapi_phy.cpp handlers. Routing either of those through
+        // a parser would make the shared counter both mis-indexed and racy, since the
+        // channel aggregation tasks run in parallel against the same pm_group. Using the
+        // per-channel counter removes that coupling ahead of time. Same rationale, and
+        // same fix, as scf_5g_csirs_slot_command_helpers.cpp.
+        const uint32_t slot = prec_group.nPmPbch;
+        if (slot >= prec_group.ssb_pmw_idx_cache.size()) [[unlikely]] {
+            // Full. This function is noexcept, so .at() overflowing here would call
+            // std::terminate rather than throw -- report the miss and let the caller
+            // fall back to unprecoded transmission.
+            //
+            // Deliberately silent: this is the functional core, and it is called once per
+            // PRG. Logging here would emit one line per PRG for the rest of the PDU once
+            // the cache fills. The caller logs once per PDU instead -- see the
+            // ssb_pmw_cache_full handling in update_pm_weights_ssb_cuphy(). Report the
+            // cause here rather than let the caller re-derive it: from outside, a full
+            // cache is indistinguishable from an unconfigured PMI.
+            if (cache_full != nullptr) { *cache_full = true; }
+            return std::nullopt;
+        }
+        auto& cache_entry = prec_group.ssb_pmw_idx_cache.at(slot);
+        cache_entry.pmwIdx = cache_pmi;
+        cache_entry.nIndex = slot;
+
+        auto& val = prec_group.ssb_list[slot];
+        val.nPorts = pmw_iter->second.weights.nPorts;
+        std::copy(pmw_iter->second.weights.matrix,
+                  pmw_iter->second.weights.matrix + (pmw_iter->second.layers * pmw_iter->second.ports),
+                  val.matrix);
+        prec_group.nPmPbch++;
+        return slot;
+    }
+
+    void update_pm_weights_ssb_cuphy(cell_group_command* cell_grp_cmd, cuphyPerSsBlockDynPrms_t& block, cuphyPerCellSsbDynPrms_t& ssb_cell_params, const scf_fapi_tx_precoding_beamforming_t& pdu, nv::phy_config_option& config_options, pm_group* prec_group,
+                                     pm_weight_map_t& pm_map, cell_sub_command& cell_cmd, int32_t cell_index, nv::slot_detail_t *slot_detail, const nv::phy_config& cell_params, bool mmimo_enabled) {
         block.enablePrcdBf = config_options.precoding_enabled;
 
         auto default_values = [&block]() {
@@ -150,42 +230,36 @@ namespace scf_5g_fapi {
         };
         auto prec_ports = UINT32_MAX;
 
+        // Set by resolve_ssb_pmw_slot() only when a PRG was dropped because the PMW cache
+        // had no room, so an unconfigured PMI is not reported as a full cache. Reported
+        // once after the loop rather than per PRG: once the cache fills, every remaining
+        // PRG in this PDU takes the same path, and this runs on the slot path.
+        bool ssb_pmw_cache_full = false;
+
         uint16_t offset = 0;
         for (uint16_t i = 0; i < pdu.num_prgs; i++) {
             uint16_t pdu_pmi = pdu.pm_idx_and_beam_idx[i + offset];
             uint32_t cache_pmi = pdu_pmi | cell_index << 16; /// PMI Unused
             block.enablePrcdBf = block.enablePrcdBf && (pdu_pmi != 0);
             if (block.enablePrcdBf) {
-                auto pmw_iter = pm_map.find(cache_pmi);
-                if (pmw_iter == pm_map.end()){
-                    default_values();
-                    continue ;
-                }
-
-                if (pmw_iter->second.layers != 1) {
+                const auto slot = resolve_ssb_pmw_slot(*prec_group, pm_map, cache_pmi,
+                                                       &ssb_pmw_cache_full);
+                if (!slot.has_value()) [[unlikely]] {
                     default_values();
                     continue;
                 }
-                auto iter = std::find_if(prec_group->ssb_pmw_idx_cache.begin(), prec_group->ssb_pmw_idx_cache.end(), [&cache_pmi](const auto& e ) {
-                    return e.pmwIdx == cache_pmi;
-                });
-                if (iter == prec_group->ssb_pmw_idx_cache.end()) {
-                    auto& cache_entry = prec_group->ssb_pmw_idx_cache.at(prec_group->nCacheEntries);
-                    cache_entry.pmwIdx = cache_pmi;
-                    cache_entry.nIndex = prec_group->nPmPbch;
-                    block.pmwPrmIdx = prec_group->nPmPbch;
-                    prec_group->nCacheEntries++;
-                    auto& val = prec_group->ssb_list[prec_group->nPmPbch];
-                    val.nPorts = pmw_iter->second.weights.nPorts;
-                    prec_ports = val.nPorts;
-                    std::copy(pmw_iter->second.weights.matrix, pmw_iter->second.weights.matrix + (pmw_iter->second.layers * pmw_iter->second.ports), val.matrix);
-                    prec_group->nPmPbch++;
-                } else {
-                    block.pmwPrmIdx = iter->nIndex;
-                    prec_ports = prec_group->ssb_list[block.pmwPrmIdx].nPorts;
-                }
+                block.pmwPrmIdx = *slot;
+                prec_ports = prec_group->ssb_list[*slot].nPorts;
             }
             offset+=(pdu.dig_bf_interfaces + 1);
+        }
+
+        if (ssb_pmw_cache_full) [[unlikely]] {
+            const auto capacity = prec_group->ssb_pmw_idx_cache.size();
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                       "SSB PMW cache full ({} entries) for cell_index={}; precoding dropped "
+                       "for the remaining PRGs of this PDU",
+                       capacity, cell_index);
         }
 
         nv::PHYDriverProxy& phyDriver = nv::PHYDriverProxy::getInstance();
@@ -195,8 +269,8 @@ namespace scf_5g_fapi {
         update_fh_params_ssb(block, ssb_cell_params.k_SSB, pdu, cell_cmd, config_options, prec_ports, ru, cell_index, slot_detail, mplane_info.dl_comp_meth, cell_params, mmimo_enabled);
     }
 
-    inline void update_fh_params_ssb( cuphyPerSsBlockDynPrms_t& block, uint16_t k_SSB, scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, nv::phy_config_option& config_option,
-                                     uint32_t prec_ports, enum ru_type ru, int32_t cell_index, nv::slot_detail_t* slot_detail, comp_method dl_comp_method, nv::phy_config& cell_params, bool mmimo_enabled) {
+    inline void update_fh_params_ssb( cuphyPerSsBlockDynPrms_t& block, uint16_t k_SSB, const scf_fapi_tx_precoding_beamforming_t& pmi_bf_pdu, cell_sub_command& cell_cmd, nv::phy_config_option& config_option,
+                                     uint32_t prec_ports, enum ru_type ru, int32_t cell_index, nv::slot_detail_t* slot_detail, comp_method dl_comp_method, const nv::phy_config& cell_params, bool mmimo_enabled) {
         auto sym_prbs{cell_cmd.sym_prb_info()};
         auto& prbs{sym_prbs->prbs};
         uint16_t ssb_start_prb = 0, ssb_num_prb = 0;
@@ -222,7 +296,13 @@ namespace scf_5g_fapi {
             }
 
             if(config_option.bf_enabled)
-                update_beam_list(prb_info.beams_array, prb_info.beams_array_size, pmi_bf_pdu, mmimo_enabled, prb_info, cell_index);
+            {
+                // update_beam_list only reads the Tx BF PDU (verified by inspection — it indexes
+                // into pmi_bf_pdu but never mutates it), so casting away const here is safe.
+                // The legacy API still takes a non-const reference; tracking the signature fix
+                // under GT-12547.
+                update_beam_list(prb_info.beams_array, prb_info.beams_array_size, const_cast<scf_fapi_tx_precoding_beamforming_t&>(pmi_bf_pdu), mmimo_enabled, prb_info, cell_index);
+            }
 
             if(ru == SINGLE_SECT_MODE) {
                 NVLOGD_FMT(TAG, "DL symbols = {}", slot_detail->max_dl_symbols);

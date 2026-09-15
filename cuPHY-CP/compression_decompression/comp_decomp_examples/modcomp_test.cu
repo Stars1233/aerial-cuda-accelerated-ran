@@ -21,6 +21,12 @@
 
 #include "cuphy_hdf5.hpp"
 #include "cuphy.hpp"
+
+#define TAG (NVLOG_TAG_BASE_COMPRESSION + 2) // "COMP.MODTEST"
+
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+#include "cuda_driver_utils/cuda_kernel_utils.cuh"
+
 #include "QAM_param.cuh"
 #include "QAM_comp.cuh"
 #include "QAM_decomp.cuh"
@@ -117,8 +123,6 @@ void usage(char* arg)
 
 }
 
-
-
 int main(int argc, char** argv)
 {
     int res = -1;
@@ -162,6 +166,21 @@ int main(int argc, char** argv)
     hdf5hpp::hdf5_dataset dset = h5file.open_dataset(dset_name.c_str());
     uint32_t nMsg;
     dset.read(&nMsg);
+
+    PrimaryCtxGuard ctx_guard(0);
+
+    CUfunction compress_func   = nullptr;
+    CUfunction decompress_func = nullptr;
+    if(!resolve_kernel_func<TAG>(&compress_func,
+                                  reinterpret_cast<const void*>(compress_QAM_lists<QAM_Comp>),
+                                  "compress_QAM_lists<QAM_Comp>") ||
+       !resolve_kernel_func<TAG>(&decompress_func,
+                                  reinterpret_cast<const void*>(decompress_QAM_lists<QAM_Decomp>),
+                                  "decompress_QAM_lists<QAM_Decomp>"))
+    {
+        std::cerr << "Failed to resolve CUDA kernels" << std::endl;
+        return -1;
+    }
 
     std::cout << "Num modcomp elements: " << nMsg << std::endl;
     std::vector<ModCompHdr> comp_hdrs;
@@ -215,16 +234,16 @@ int main(int argc, char** argv)
     QamPrbParam *prb_param_buf;
     float2 *scalers;
 
-    CUDA_CHECK(cudaMallocManaged((void **)&output_buf,    total_payload + nMsg*align                ));
-    CUDA_CHECK(cudaMallocManaged((void **)&prb_param_buf, total_prbs*sizeof(QamPrbParam)            ));
-    CUDA_CHECK(cudaMallocManaged((void **)&nprbs,            num_prb_vec.size()*sizeof(int)         ));
-    CUDA_CHECK(cudaMallocManaged((void **)&inputs,             input_vec.size()*sizeof(__half2*)    ));
-    CUDA_CHECK(cudaMallocManaged((void **)&decomp,           num_prb_vec.size()*sizeof(__half2*)    ));
-    CUDA_CHECK(cudaMallocManaged((void **)&decomp_buf,  (PRB_NUM_RE*total_prbs)*sizeof(__half2)     ));
-    CUDA_CHECK(cudaMallocManaged((void **)&outputs,           output_vec.size()*sizeof(uint8_t*)    ));
-    CUDA_CHECK(cudaMallocManaged((void **)&list_params,   list_param_vec.size()*sizeof(QamListParam)));
-    CUDA_CHECK(cudaMallocManaged((void **)&prb_params,     prb_param_vec.size()*sizeof(QamPrbParam*)));
-    CUDA_CHECK(cudaMallocManaged((void **)&scalers,           scaler_vec.size()*sizeof(float2)      ));
+    managed_alloc(&output_buf,    total_payload + nMsg*align                );
+    managed_alloc(&prb_param_buf, total_prbs*sizeof(QamPrbParam)            );
+    managed_alloc(&nprbs,            num_prb_vec.size()*sizeof(int)         );
+    managed_alloc(&inputs,             input_vec.size()*sizeof(__half2*)    );
+    managed_alloc(&decomp,           num_prb_vec.size()*sizeof(__half2*)    );
+    managed_alloc(&decomp_buf,  (PRB_NUM_RE*total_prbs)*sizeof(__half2)     );
+    managed_alloc(&outputs,           output_vec.size()*sizeof(uint8_t*)    );
+    managed_alloc(&list_params,   list_param_vec.size()*sizeof(QamListParam));
+    managed_alloc(&prb_params,     prb_param_vec.size()*sizeof(QamPrbParam*));
+    managed_alloc(&scalers,           scaler_vec.size()*sizeof(float2)      );
 
     int prb_offset = 0;
     int output_offset = 0;
@@ -241,33 +260,31 @@ int main(int argc, char** argv)
         QamPrbParam prb_param;
         prb_param.set(comp_hdrs[i].reMask,0);
         std::vector<QamPrbParam> tmp_vec(num_prb_vec[i],prb_param);
-        cudaMemcpy(prb_param_vec[i],tmp_vec.data(),tmp_vec.size()*sizeof(QamPrbParam), cudaMemcpyHostToDevice);
+        CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(prb_param_vec[i]),tmp_vec.data(),tmp_vec.size()*sizeof(QamPrbParam)));
     }
 
-    // TODO copy vector data to GPU mem
-    CUDA_CHECK(cudaMemcpy(nprbs,            num_prb_vec.data(),    num_prb_vec.size()*sizeof(int)         , cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(inputs,             input_vec.data(),      input_vec.size()*sizeof(__half2*)    , cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(outputs,           output_vec.data(),     output_vec.size()*sizeof(uint8_t*)    , cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(list_params,   list_param_vec.data(), list_param_vec.size()*sizeof(QamListParam), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(prb_params,     prb_param_vec.data(),  prb_param_vec.size()*sizeof(QamPrbParam*), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(scalers,           scaler_vec.data(),     scaler_vec.size()*sizeof(float2)      , cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(decomp,            decomp_vec.data(),     decomp_vec.size()*sizeof(__half2*)    , cudaMemcpyHostToDevice));
+    CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(nprbs),            num_prb_vec.data(),    num_prb_vec.size()*sizeof(int)         ));
+    CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(inputs),             input_vec.data(),      input_vec.size()*sizeof(__half2*)    ));
+    CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(outputs),           output_vec.data(),     output_vec.size()*sizeof(uint8_t*)    ));
+    CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(list_params),   list_param_vec.data(), list_param_vec.size()*sizeof(QamListParam)));
+    CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(prb_params),     prb_param_vec.data(),  prb_param_vec.size()*sizeof(QamPrbParam*)));
+    CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(scalers),           scaler_vec.data(),     scaler_vec.size()*sizeof(float2)      ));
+    CUDA_DRIVER_CHECK(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(decomp),            decomp_vec.data(),     decomp_vec.size()*sizeof(__half2*)    ));
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
 
     // Compress
-    QAM_Comp::gpu_compress_QAM_lists(inputs, list_params, prb_params, scalers, outputs, nprbs, nMsg);
-    //QAM_Comp::cpu_compress_QAM_lists(inputs, list_params, prb_params, scalers, cpu_outputs, nprbs, nlists);
+    CUDA_DRIVER_CHECK(QAM_Comp::gpu_compress_QAM_lists(compress_func, inputs, list_params, prb_params, scalers, outputs, nprbs, nMsg));
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
     res = 0;
 
     uint8_t tmp[273*PRB_NUM_RE]={0};
     for(int i = 0;i<comp_payld.size();i++)
     {
         int payloadSize = comp_payld[i].getSize();
-        CUDA_CHECK(cudaMemcpy(tmp,output_vec[i],payloadSize,cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_DRIVER_CHECK(cuMemcpyDtoH(tmp,reinterpret_cast<CUdeviceptr>(output_vec[i]),payloadSize));
+        CUDA_DRIVER_CHECK(cuCtxSynchronize());
         if(memcmp(tmp,comp_payld[i].elements.data(),comp_payld[i].elements.size()))
         {
             std::cerr << "Payload "<< i <<" does not match" << std::endl;
@@ -282,8 +299,8 @@ int main(int argc, char** argv)
         }
     }
 
-    QAM_Decomp::gpu_decompress_QAM_lists(outputs, list_params, prb_params, scalers, decomp, nprbs, nMsg);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_DRIVER_CHECK(QAM_Decomp::gpu_decompress_QAM_lists(decompress_func, outputs, list_params, prb_params, scalers, decomp, nprbs, nMsg));
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
     if(verbose)
     {
     for(int i = 11; i<12;i++)

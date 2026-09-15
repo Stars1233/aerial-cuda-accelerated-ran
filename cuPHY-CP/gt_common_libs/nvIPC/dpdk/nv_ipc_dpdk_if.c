@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -630,9 +630,15 @@ static int copy_buf_to_mbuf(priv_data_t* priv_data, struct rte_mbuf** mbufs, uin
     return count;
 }
 
-static struct rte_mbuf* copy_mbuf_to_buf(priv_data_t* priv_data, struct rte_mbuf* mbuf, uint8_t* dest, uint32_t size)
+static struct rte_mbuf* copy_mbuf_to_buf(priv_data_t* priv_data, struct rte_mbuf* mbuf, uint8_t* dest, uint32_t size, uint32_t dest_size)
 {
     // nvipc_hdr_t* head = get_nvipc_hdr(mbuf);
+    if(size > dest_size)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: copy size %u exceeds destination size %u", __func__, size, dest_size);
+        return (struct rte_mbuf*)-1;
+    }
+
     uint32_t count = (size + priv_data->mbuf_payload_size - 1) / priv_data->mbuf_payload_size;
 
     uint32_t         index = 0;
@@ -644,6 +650,7 @@ static struct rte_mbuf* copy_mbuf_to_buf(priv_data_t* priv_data, struct rte_mbuf
         if(curr->data_len != payload_size + sizeof(nvipc_hdr_t))
         {
             NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "mbuf size doens't match [%u-%u]: data_len=%u payload_size=%u sizeof(nvipc_hdr_t)=%lu", count, index, mbuf->data_len, payload_size, sizeof(nvipc_hdr_t));
+            return (struct rte_mbuf*)-1;
         }
 
         nvipc_hdr_t* nvipc_hdr = get_nvipc_hdr(curr);
@@ -653,6 +660,7 @@ static struct rte_mbuf* copy_mbuf_to_buf(priv_data_t* priv_data, struct rte_mbuf
     if(index != count)
     {
         NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "mbuf size doens't match: count=%u index=%u", count, index);
+        return (struct rte_mbuf*)-1;
     }
     return curr;
 }
@@ -676,14 +684,35 @@ static int copy_mbufs_from_nvipc(priv_data_t* priv_data, struct rte_mbuf** mbufs
 static int copy_mbufs_to_nvipc(priv_data_t* priv_data, nvipc_hdr_t* head)
 {
     struct rte_mbuf* next = head->next;
+    if(head->msg_len < 0 || head->msg_len > priv_data->msg_payload_size)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid msg_len=%d msg_payload_size=%d",
+                __func__, head->msg_len, priv_data->msg_payload_size);
+        return -1;
+    }
+    if(head->data_len < 0 || head->data_len > priv_data->data_payload_size)
+    {
+        NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid data_len=%d data_payload_size=%d",
+                __func__, head->data_len, priv_data->data_payload_size);
+        return -1;
+    }
     if(head->msg_len > priv_data->mbuf_payload_size)
     {
         // Copy from the second mbuf for MSG part
-        next = copy_mbuf_to_buf(priv_data, next, head->payload + priv_data->mbuf_payload_size, head->msg_len - priv_data->mbuf_payload_size);
+        next = copy_mbuf_to_buf(priv_data, next, head->payload + priv_data->mbuf_payload_size,
+                head->msg_len - priv_data->mbuf_payload_size, priv_data->msg_payload_size - priv_data->mbuf_payload_size);
+        if(next == (struct rte_mbuf*)-1)
+        {
+            return -1;
+        }
     }
     if(head->data_len > 0)
     {
-        next = copy_mbuf_to_buf(priv_data, next, head->data_buf, head->data_len);
+        next = copy_mbuf_to_buf(priv_data, next, head->data_buf, head->data_len, priv_data->data_payload_size);
+        if(next == (struct rte_mbuf*)-1)
+        {
+            return -1;
+        }
     }
     if(next != NULL)
     {
@@ -1066,19 +1095,52 @@ int dpdk_nic_recv_poll(priv_data_t* priv_data)
                         // The last mbuf segment received
 #ifdef USE_SHM_MEMPOOL_RX
                         nvipc_hdr_t* head = get_nvipc_hdr(list.head);
+                        if(head->msg_len < 0 || head->msg_len > priv_data->msg_payload_size ||
+                                head->data_len < 0 || head->data_len > priv_data->data_payload_size)
+                        {
+                            NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT,
+                                    "%s: invalid RX lengths msg_len=%d/%d data_len=%d/%d",
+                                    __func__, head->msg_len, priv_data->msg_payload_size,
+                                    head->data_len, priv_data->data_payload_size);
+                            mbuf_release(priv_data, list.head);
+                            list_init(&list);
+                            continue;
+                        }
 
                         int data_mbuf_count = (head->data_len + priv_data->mbuf_payload_size - 1) / priv_data->mbuf_payload_size;
+                        int data_index = -1;
                         if(data_mbuf_count)
                         {
-                            int data_index = priv_data->mempool->alloc(priv_data->mempool);
-                            if((head->data_buf = priv_data->mempool->get_addr(priv_data->mempool, data_index)) == NULL || data_index < 0)
+                            data_index = priv_data->mempool->alloc(priv_data->mempool);
+                            if(data_index < 0)
                             {
                                 NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: alloc SHM data buf failed: data_index=%d", __func__, data_index);
+                                mbuf_release(priv_data, list.head);
+                                list_init(&list);
+                                continue;
+                            }
+                            head->data_buf = priv_data->mempool->get_addr(priv_data->mempool, data_index);
+                            if(head->data_buf == NULL)
+                            {
+                                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: get_addr SHM data buf failed: data_index=%d", __func__, data_index);
+                                priv_data->mempool->free(priv_data->mempool, data_index);
+                                mbuf_release(priv_data, list.head);
+                                list_init(&list);
                                 continue;
                             }
                         }
 
-                        copy_mbufs_to_nvipc(priv_data, head);
+                        if(copy_mbufs_to_nvipc(priv_data, head) != 0)
+                        {
+                            if(data_index >= 0)
+                            {
+                                priv_data->mempool->free(priv_data->mempool, data_index);
+                                head->data_buf = NULL;
+                            }
+                            mbuf_release(priv_data, list.head);
+                            list_init(&list);
+                            continue;
+                        }
 #endif
                         recv_efd_notify(priv_data, list.head);
                         list_init(&list);
@@ -1260,10 +1322,16 @@ static int dpdk_mbuf_allocate(nv_ipc_t* ipc, nv_ipc_msg_t* msg, uint32_t options
     {
 #ifdef USE_SHM_MEMPOOL_TX
         int data_index = priv_data->mempool->alloc(priv_data->mempool);
-        if((msg->data_buf = priv_data->mempool->get_addr(priv_data->mempool, data_index)) == NULL || data_index < 0)
+        if(data_index < 0)
         {
             NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: alloc SHM data buf failed: data_index=%d", __func__, data_index);
             return -1;
+        }
+        msg->data_buf = priv_data->mempool->get_addr(priv_data->mempool, data_index);
+        if(msg->data_buf == NULL)
+        {
+            // Should never run to here
+            NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: get_addr SHM data buf failed: data_index=%d", __func__, data_index);
         }
 #else
         if(msg->data_pool == NV_IPC_MEMPOOL_CPU_DATA && msg->data_len <= 0)
@@ -1839,10 +1907,10 @@ static int dpdk_ipc_open(nv_ipc_t* ipc, const nv_ipc_config_dpdk_t* cfg)
         return -1;
     }
 
-    char log[32];
-    int  offset = snprintf(log, 20, "MAC: local=");
+    char log[96];
+    int  offset = snprintf(log, sizeof(log), "MAC: local=");
     offset += eth_addr_to_mac_str(log + offset, &priv_data->src);
-    offset += snprintf(log + offset, 20, " peer=");
+    offset += snprintf(log + offset, sizeof(log) - offset, " peer=");
     offset += eth_addr_to_mac_str(log + offset, &priv_data->dst);
     NVLOGC(TAG, "%s: port %u-%u %s", __func__, nb_ports, priv_data->nic_port, log);
     return 0;

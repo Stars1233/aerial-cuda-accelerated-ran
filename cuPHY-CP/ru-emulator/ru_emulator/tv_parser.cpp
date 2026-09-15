@@ -18,6 +18,147 @@
 #include "tv_parser.hpp"
 #include "ru_emulator.hpp"
 #include <set>
+#include <unordered_map>
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+// -------------------------------------------------------------------------
+// pdu_record: read an entire PDU compound record in ONE H5Dread and serve all
+// member accesses from the in-memory buffer, instead of issuing a separate
+// H5Dread per field (which is what hdf5_dataset_elem::operator[] + .as<T>()
+// does). Profiling showed load_pucch_tvs was dominated by ~12 per-field
+// H5Dread calls per PDU. FAPI TVs store every scalar PDU field as U32LE and
+// arrays (e.g. beamIdx) as fixed H5T_ARRAY, so the whole record is fixed-size
+// and inline -> a single read + offset arithmetic reproduces every field.
+// PROTOTYPE: PUCCH only; verified byte-identical to the per-field path.
+// -------------------------------------------------------------------------
+class pdu_record
+{
+public:
+    explicit pdu_record(hdf5hpp::hdf5_dataset& dset)
+    {
+        dtype_ = H5Dget_type(dset.id());
+        if(dtype_ < 0) throw std::runtime_error("pdu_record: H5Dget_type failed");
+        // dtype_ is a bare hid_t, so ~pdu_record() does not run if the ctor body
+        // throws (e.g. dset.read() on a corrupt TV). Close it explicitly on the
+        // exceptional path to avoid leaking the HDF5 type handle.
+        try
+        {
+            buf_.resize(H5Tget_size(dtype_));
+            dset.read(buf_.data());                   // single H5Dread, in-file layout
+            const int memberCount = H5Tget_nmembers(dtype_);
+            for(int i = 0; i < memberCount; ++i)
+            {
+                char* memberName = H5Tget_member_name(dtype_, i);
+                // H5Tget_member_name returns NULL on failure; off_[memberName]
+                // would then build a std::string from a null C-string (UB).
+                if(memberName == nullptr)
+                {
+                    throw std::runtime_error("pdu_record: H5Tget_member_name failed for member " +
+                                             std::to_string(i));
+                }
+                off_[memberName] = H5Tget_member_offset(dtype_, i);
+                // pdu_record assumes every scalar member is U32LE; get<T>() reads a
+                // fixed 4 bytes. Fail loud here if that ever stops holding (e.g. when
+                // extending to DL channels) instead of silently truncating a member
+                // whose bytes overlap its neighbour.
+                if(H5Tget_member_class(dtype_, i) == H5T_INTEGER)
+                {
+                    // fetch the member's type handle and query its size, then close it.
+                    // Report a type-handle failure with its own message so it is
+                    // not conflated with a genuine non-U32 member size below.
+                    const hid_t memberType = H5Tget_member_type(dtype_, i);
+                    if(memberType < 0)
+                    {
+                        std::string bad = memberName;
+                        H5free_memory(memberName);
+                        throw std::runtime_error("pdu_record: H5Tget_member_type failed for member '" +
+                                                 bad + "'");
+                    }
+                    const size_t memberSize = H5Tget_size(memberType);
+                    H5Tclose(memberType);
+                    if(memberSize != sizeof(uint32_t))
+                    {
+                        std::string bad = memberName;
+                        H5free_memory(memberName);
+                        throw std::runtime_error("pdu_record: member '" + bad +
+                                                 "' is not U32-sized (pdu_record assumes U32LE scalars)");
+                    }
+                }
+                H5free_memory(memberName);
+            }
+        }
+        catch(...)
+        {
+            H5Tclose(dtype_);
+            throw;
+        }
+    }
+    ~pdu_record() { if(dtype_ >= 0) H5Tclose(dtype_); }
+    pdu_record(const pdu_record&) = delete;
+    pdu_record& operator=(const pdu_record&) = delete;
+
+    bool has(const char* name) const { return off_.count(name) != 0; }
+
+    // All scalar PDU fields are stored as U32LE; read as u32 then narrow.
+    // memcpy (not a reinterpret_cast) to stay free of alignment/aliasing UB.
+    template <typename T>
+    T get(const char* name) const
+    {
+        const size_t off = off_.at(name);
+        // Guard the U32LE assumption's memory-safety facet: a short trailing
+        // member must not let the fixed 4-byte read run off the end of buf_.
+        if (off + sizeof(uint32_t) > buf_.size())
+        {
+            throw std::runtime_error(std::string("pdu_record::get: member '") + name +
+                                     "' reads past record buffer");
+        }
+        uint32_t raw{};
+        std::memcpy(&raw, buf_.data() + off, sizeof(raw));
+        return static_cast<T>(raw);
+    }
+
+    // H5T_ARRAY member of U32LE stored inline at the member offset.
+    template <typename T>
+    std::vector<T> get_array(const char* name) const
+    {
+        hid_t mt = H5Tget_member_type(dtype_, H5Tget_member_index(dtype_, name));
+        // dims[] holds one entry; only a rank-1 array populates it fully. Guard
+        // so a future rank-2 declaration fails loud instead of mis-sizing the read.
+        if (H5Tget_array_ndims(mt) != 1)
+        {
+            H5Tclose(mt);
+            throw std::runtime_error(std::string("pdu_record::get_array: member '") + name +
+                                     "' is not a rank-1 array");
+        }
+        hsize_t dims[1] = {0};
+        H5Tget_array_dims(mt, dims);
+        H5Tclose(mt);
+        const size_t off = off_.at(name);
+        // Mirror get()'s trailing-member guard: a self-consistent compound can't
+        // overrun, but a malformed datatype must fail loud, not read past buf_.
+        if (off + dims[0] * sizeof(uint32_t) > buf_.size())
+        {
+            throw std::runtime_error(std::string("pdu_record::get_array: member '") + name +
+                                     "' reads past record buffer");
+        }
+        const uint8_t* bytes = buf_.data() + off;
+        std::vector<T> v(dims[0]);
+        for(hsize_t k = 0; k < dims[0]; ++k)
+        {
+            uint32_t raw{};
+            std::memcpy(&raw, bytes + k * sizeof(uint32_t), sizeof(raw));
+            v[k] = static_cast<T>(raw);
+        }
+        return v;
+    }
+private:
+    std::vector<uint8_t> buf_;
+    hid_t dtype_ = -1;
+    std::unordered_map<std::string, size_t> off_;
+};
+} // namespace
 
 /**
  * @brief Try to read beam IDs from an HDF5 PDU dataset element (4T4R beam ID validation)
@@ -44,6 +185,54 @@ static void try_read_beam_ids_from_pdu(hdf5hpp::hdf5_dataset_elem& pdu_pars, tv_
         // beamIdx/digBFInterfaces not present in this TV - beam ID validation will be skipped
         info.digBFInterfaces = 0;
         info.expected_beam_ids.clear();
+    }
+}
+
+// pdu_record overload of the above: same semantics, served from the cached record
+// (no extra H5Dread). Missing digBFInterfaces or beamIdx => treat as no beamforming,
+// mirroring the try/catch behaviour of the hdf5_dataset_elem version.
+static void try_read_beam_ids_from_pdu(const pdu_record& rec, tv_info& info)
+{
+    info.digBFInterfaces = rec.has("digBFInterfaces") ? rec.get<uint16_t>("digBFInterfaces") : 0;
+    if (info.digBFInterfaces > 0)
+    {
+        if (rec.has("beamIdx"))
+        {
+            info.expected_beam_ids = rec.get_array<uint16_t>("beamIdx");
+        }
+        else
+        {
+            info.digBFInterfaces = 0;
+            info.expected_beam_ids.clear();
+        }
+    }
+}
+
+// pdu_record equivalent of RU_Emulator::get_ul_ports (file-local free function;
+// only fills pdu_info.flow_indices, needs no class state).
+// TODO(GT-12710): this duplicates the flow-index derivation in
+// RU_Emulator::get_ul_ports. Both are kept bit-identical only by RU_PDU_SELFCHECK;
+// collapse to a single implementation once the legacy per-field path is retired.
+static void fill_ul_flow_indices(const pdu_record& rec, pdu_info& pdu_info, uint16_t digBFInterfaces)
+{
+    if (digBFInterfaces == 0)
+    {
+        uint8_t dmrsPorts = rec.get<uint8_t>("dmrsPorts");
+        uint8_t scid      = rec.get<uint8_t>("SCID");
+        for (int flow_index = 0; flow_index < (int)sizeof(dmrsPorts) * 8; ++flow_index)
+        {
+            if ((dmrsPorts >> flow_index) & 0b1)
+            {
+                pdu_info.flow_indices.push_back(scid * 8 + flow_index);
+            }
+        }
+    }
+    else
+    {
+        for (int port = 0; port < digBFInterfaces; ++port)
+        {
+            pdu_info.flow_indices.push_back(port);
+        }
     }
 }
 
@@ -299,7 +488,14 @@ void RU_Emulator::read_cell_cfg_from_tv(hdf5hpp::hdf5_file & hdf5file, struct tv
 
 void RU_Emulator::get_ul_ports(hdf5hpp::hdf5_dataset_elem &pdu_pars, pdu_info &pdu_info)
 {
-    auto digBFInterfaces = pdu_pars["digBFInterfaces"].as<uint16_t>();
+    // Reads digBFInterfaces itself. Callers that already have it should use the
+    // 3-arg overload to avoid a redundant per-PDU HDF5 read (each .as<>() is a
+    // full H5Dread; PUCCH/PUSCH already read this via try_read_beam_ids_from_pdu).
+    get_ul_ports(pdu_pars, pdu_info, pdu_pars["digBFInterfaces"].as<uint16_t>());
+}
+
+void RU_Emulator::get_ul_ports(hdf5hpp::hdf5_dataset_elem &pdu_pars, pdu_info &pdu_info, uint16_t digBFInterfaces)
+{
     if (digBFInterfaces == 0)
     {
         uint8_t dmrsPorts = pdu_pars["dmrsPorts"].as<uint8_t>();
@@ -355,8 +551,8 @@ void RU_Emulator::load_pusch_tvs()
                 do_throw(sb() << "ERROR No PUSCH PDU found in TV " << pusch_object.tv_names[i]);
             }
             hdf5hpp::hdf5_dataset dset_PDU  = hdf5file.open_dataset(dset_string.c_str());
-            hdf5hpp::hdf5_dataset_elem pdu_pars = dset_PDU[0];
-            if(pdu_pars["type"].as<uint8_t>() != nrsim_tv_type::PUSCH)
+            pdu_record rec(dset_PDU);            // single H5Dread per PDU (was ~10 .as<>())
+            if(rec.get<uint8_t>("type") != nrsim_tv_type::PUSCH)
             {
                 count++;
                 continue;
@@ -366,7 +562,7 @@ void RU_Emulator::load_pusch_tvs()
             // Read beam IDs for this PDU (first PDU populates expected_beam_ids
             // as fallback; all PDUs populate per_pdu_beam_ids)
             tv_info pdu_beam_info{};
-            try_read_beam_ids_from_pdu(pdu_pars, pdu_beam_info);
+            try_read_beam_ids_from_pdu(rec, pdu_beam_info);
             if (ul_tv_info.expected_beam_ids.empty())
             {
                 ul_tv_info.digBFInterfaces = pdu_beam_info.digBFInterfaces;
@@ -374,20 +570,44 @@ void RU_Emulator::load_pusch_tvs()
             }
 
             pdu_info pdu_info;
-            pdu_info.startSym = pdu_pars["StartSymbolIndex"].as<uint8_t>();
-            pdu_info.numSym = pdu_pars["NrOfSymbols"].as<uint8_t>();
-            pdu_info.startPrb = pdu_pars["rbStart"].as<uint16_t>() + pdu_pars["BWPStart"].as<uint16_t>();
-            pdu_info.numPrb = pdu_pars["rbSize"].as<uint16_t>();
+            const uint16_t bwpStart = rec.get<uint16_t>("BWPStart");
+            pdu_info.startSym = rec.get<uint8_t>("StartSymbolIndex");
+            pdu_info.numSym = rec.get<uint8_t>("NrOfSymbols");
+            pdu_info.startPrb = rec.get<uint16_t>("rbStart") + bwpStart;
+            pdu_info.numPrb = rec.get<uint16_t>("rbSize");
             pdu_info.numFlows = numFlows;
-            pdu_info.tb_size = pdu_pars["TBSize"].as<uint32_t>();
-            pdu_info.dmrsPorts = pdu_pars["dmrsPorts"].as<uint8_t>();
-            pdu_info.scid = pdu_pars["SCID"].as<uint8_t>();
+            pdu_info.tb_size = rec.get<uint32_t>("TBSize");
+            pdu_info.dmrsPorts = rec.get<uint8_t>("dmrsPorts");
+            pdu_info.scid = rec.get<uint8_t>("SCID");
             ul_tv_info.tb_size += pdu_info.tb_size;
 
             if (opt_enable_mmimo)
             {
-                get_ul_ports(pdu_pars, pdu_info);
+                fill_ul_flow_indices(rec, pdu_info, pdu_beam_info.digBFInterfaces);
                 ul_tv_info.numPrb += pdu_info.numPrb * pdu_info.numSym * pdu_info.flow_indices.size();
+            }
+
+            static const bool pusch_selfcheck = (std::getenv("RU_PDU_SELFCHECK") != nullptr);
+            if (pusch_selfcheck)
+            {
+                hdf5hpp::hdf5_dataset_elem pp = dset_PDU[0];
+                tv_info bi{}; try_read_beam_ids_from_pdu(pp, bi);
+                struct pdu_info o{};
+                o.startSym  = pp["StartSymbolIndex"].as<uint8_t>();
+                o.numSym    = pp["NrOfSymbols"].as<uint8_t>();
+                o.startPrb  = pp["rbStart"].as<uint16_t>() + pp["BWPStart"].as<uint16_t>();
+                o.numPrb    = pp["rbSize"].as<uint16_t>();
+                o.tb_size   = pp["TBSize"].as<uint32_t>();
+                o.dmrsPorts = pp["dmrsPorts"].as<uint8_t>();
+                o.scid      = pp["SCID"].as<uint8_t>();
+                if (opt_enable_mmimo) get_ul_ports(pp, o, bi.digBFInterfaces);
+                auto chk=[&](const char*n,long a,long b){ if(a!=b) re_cons("PDU_SELFCHECK MISMATCH {} {} PDU{}: new={} old={}", pusch_object.tv_names[i].c_str(),n,count,a,b); };
+                chk("startSym",pdu_info.startSym,o.startSym); chk("numSym",pdu_info.numSym,o.numSym);
+                chk("startPrb",pdu_info.startPrb,o.startPrb); chk("numPrb",pdu_info.numPrb,o.numPrb);
+                chk("tb_size",pdu_info.tb_size,o.tb_size); chk("dmrsPorts",pdu_info.dmrsPorts,o.dmrsPorts);
+                chk("scid",pdu_info.scid,o.scid); chk("digBF",pdu_beam_info.digBFInterfaces,bi.digBFInterfaces);
+                if(pdu_beam_info.expected_beam_ids!=bi.expected_beam_ids) re_cons("PDU_SELFCHECK MISMATCH {} beamIdx PDU{}",pusch_object.tv_names[i].c_str(),count);
+                if(pdu_info.flow_indices!=o.flow_indices) re_cons("PDU_SELFCHECK MISMATCH {} flow_indices PDU{}",pusch_object.tv_names[i].c_str(),count);
             }
             auto found = [&pdu_info] (const struct pdu_info& pdu) {
                 return (pdu.startSym == pdu_info.startSym && pdu.numSym == pdu_info.numSym && pdu.startPrb == pdu_info.startPrb && pdu.numPrb ==  pdu_info.numPrb);
@@ -610,45 +830,106 @@ void RU_Emulator::load_pucch_tvs()
                 do_throw(sb() << "ERROR No PUCCH PDU found in TV " << pucch_object.tv_names[i]);
             }
             hdf5hpp::hdf5_dataset dset_PDU  = hdf5file.open_dataset(dset_string.c_str());
-            hdf5hpp::hdf5_dataset_elem pdu_pars = dset_PDU[0];
-            if(pdu_pars["type"].as<uint8_t>() != nrsim_tv_type::PUCCH)
+            // Read the whole PDU record once (single H5Dread) and serve every
+            // field from memory instead of ~12 per-field H5Dread calls.
+            pdu_record rec(dset_PDU);
+            if(rec.get<uint8_t>("type") != nrsim_tv_type::PUCCH)
             {
                 count++;
                 continue;
             }
             pucch_found = true;
 
-            // Read beam IDs for this PDU (first PDU populates expected_beam_ids
-            // as fallback; all PDUs populate per_pdu_beam_ids)
-            tv_info pdu_beam_info{};
-            try_read_beam_ids_from_pdu(pdu_pars, pdu_beam_info);
+            // Beam IDs for this PDU (first PDU populates expected_beam_ids as
+            // fallback; all PDUs populate per_pdu_beam_ids). Mirrors
+            // try_read_beam_ids_from_pdu(): missing beamIdx => treat as no BF.
+            uint16_t digBFInterfaces = rec.has("digBFInterfaces") ? rec.get<uint16_t>("digBFInterfaces") : 0;
+            std::vector<uint16_t> beam_ids;
+            if (digBFInterfaces > 0)
+            {
+                if (rec.has("beamIdx")) beam_ids = rec.get_array<uint16_t>("beamIdx");
+                else                    digBFInterfaces = 0;
+            }
             if (ul_tv_info.expected_beam_ids.empty())
             {
-                ul_tv_info.digBFInterfaces = pdu_beam_info.digBFInterfaces;
-                ul_tv_info.expected_beam_ids = pdu_beam_info.expected_beam_ids;
+                ul_tv_info.digBFInterfaces = digBFInterfaces;
+                ul_tv_info.expected_beam_ids = beam_ids;
             }
 
             // Multiple PDUs, Assume all have the same params, and accumulate TB size
             pdu_info pdu_info;
-            pdu_info.freqHopFlag = pdu_pars["freqHopFlag"].as<uint32_t>();
-            pdu_info.secondHopPrb = pdu_pars["secondHopPRB"].as<uint32_t>() + pdu_pars["BWPStart"].as<uint16_t>();
-            pdu_info.numPrb = pdu_pars["prbSize"].as<uint16_t>();
-            pdu_info.startPrb = pdu_pars["prbStart"].as<uint16_t>() + pdu_pars["BWPStart"].as<uint16_t>();
-            pdu_info.startSym = pdu_pars["StartSymbolIndex"].as<uint8_t>();
-            pdu_info.numSym = pdu_pars["NrOfSymbols"].as<uint8_t>();
+            const uint16_t bwpStart = rec.get<uint16_t>("BWPStart");
+            pdu_info.freqHopFlag = rec.get<uint32_t>("freqHopFlag");
+            pdu_info.secondHopPrb = rec.get<uint32_t>("secondHopPRB") + bwpStart;
+            pdu_info.numPrb = rec.get<uint16_t>("prbSize");
+            pdu_info.startPrb = rec.get<uint16_t>("prbStart") + bwpStart;
+            const uint8_t startSym = rec.get<uint8_t>("StartSymbolIndex");
+            const uint8_t numSym   = rec.get<uint8_t>("NrOfSymbols");
+            pdu_info.startSym = startSym;
+            pdu_info.numSym = numSym;
             pdu_info.numFlows = numFlows;
 
             if (opt_enable_mmimo)
             {
-                get_ul_ports(pdu_pars, pdu_info);
+                // Inlined get_ul_ports() using the cached record (no extra H5Dread).
+                if (digBFInterfaces == 0)
+                {
+                    uint8_t dmrsPorts = rec.get<uint8_t>("dmrsPorts");
+                    uint8_t scid      = rec.get<uint8_t>("SCID");
+                    for (int flow_index = 0; flow_index < (int)sizeof(dmrsPorts) * 8; ++flow_index)
+                        if ((dmrsPorts >> flow_index) & 0b1)
+                            pdu_info.flow_indices.push_back(scid * 8 + flow_index);
+                }
+                else
+                {
+                    for (int port = 0; port < digBFInterfaces; ++port)
+                        pdu_info.flow_indices.push_back(port);
+                }
             }
 
-            if (!pdu_beam_info.expected_beam_ids.empty())
+            // --- SELF-CHECK (prototype verification, enable via RU_PDU_SELFCHECK) ---
+            // Run the ORIGINAL per-field .as<>() path on the same PDU and assert
+            // every value matches the pdu_record path, including beamIdx and
+            // flow_indices (which are NOT printed in the config summary).
+            static const bool pdu_selfcheck = (std::getenv("RU_PDU_SELFCHECK") != nullptr);
+            if (pdu_selfcheck)
+            {
+                hdf5hpp::hdf5_dataset_elem pp = dset_PDU[0];
+                tv_info bi{};
+                try_read_beam_ids_from_pdu(pp, bi);
+                struct pdu_info o{};
+                o.freqHopFlag  = pp["freqHopFlag"].as<uint32_t>();
+                o.secondHopPrb = pp["secondHopPRB"].as<uint32_t>() + pp["BWPStart"].as<uint16_t>();
+                o.numPrb       = pp["prbSize"].as<uint16_t>();
+                o.startPrb     = pp["prbStart"].as<uint16_t>() + pp["BWPStart"].as<uint16_t>();
+                o.startSym     = pp["StartSymbolIndex"].as<uint8_t>();
+                o.numSym       = pp["NrOfSymbols"].as<uint8_t>();
+                if (opt_enable_mmimo) get_ul_ports(pp, o, bi.digBFInterfaces);
+                auto chk = [&](const char* n, long a, long b){
+                    if (a != b) re_cons("PDU_SELFCHECK MISMATCH {} {} PDU{}: new={} old={}",
+                                        pucch_object.tv_names[i].c_str(), n, count, a, b); };
+                chk("digBF", digBFInterfaces, bi.digBFInterfaces);
+                chk("freqHopFlag", pdu_info.freqHopFlag, o.freqHopFlag);
+                chk("secondHopPrb", pdu_info.secondHopPrb, o.secondHopPrb);
+                chk("numPrb", pdu_info.numPrb, o.numPrb);
+                chk("startPrb", pdu_info.startPrb, o.startPrb);
+                chk("startSym", pdu_info.startSym, o.startSym);
+                chk("numSym", pdu_info.numSym, o.numSym);
+                if (beam_ids != bi.expected_beam_ids)
+                    re_cons("PDU_SELFCHECK MISMATCH {} beamIdx PDU{}: new_sz={} old_sz={}",
+                            pucch_object.tv_names[i].c_str(), count, beam_ids.size(), bi.expected_beam_ids.size());
+                if (pdu_info.flow_indices != o.flow_indices)
+                    re_cons("PDU_SELFCHECK MISMATCH {} flow_indices PDU{}: new_sz={} old_sz={}",
+                            pucch_object.tv_names[i].c_str(), count, pdu_info.flow_indices.size(), o.flow_indices.size());
+            }
+            // --- end self-check ---
+
+            if (!beam_ids.empty())
             {
                 ul_tv_info.per_pdu_beam_ids.push_back({
                     pdu_info.startPrb,
                     pdu_info.numPrb,
-                    pdu_beam_info.expected_beam_ids});
+                    beam_ids});
             }
 
             ul_tv_info.endPrb = std::max(static_cast<int>(pdu_info.startPrb) + static_cast<int>(pdu_info.numPrb), static_cast<int>(ul_tv_info.endPrb));
@@ -685,8 +966,8 @@ void RU_Emulator::load_pucch_tvs()
 
             // ul_tv_info.numPrb = pdu_pars["prbSize"].as<uint16_t>();
             // ul_tv_info.startPrb = pdu_pars["prbStart"].as<uint16_t>() + pdu_pars["BWPStart"].as<uint16_t>();
-            ul_tv_info.startSym = pdu_pars["StartSymbolIndex"].as<uint8_t>();
-            ul_tv_info.numSym = pdu_pars["NrOfSymbols"].as<uint8_t>();
+            ul_tv_info.startSym = startSym;   // reuse values read above (no extra H5Dread)
+            ul_tv_info.numSym = numSym;
             count++;
         }
 
@@ -833,8 +1114,8 @@ void RU_Emulator::load_srs_tvs()
                 do_throw(sb() << "ERROR No SRS PDU found in TV " << srs_object.tv_names[i]);
             }
             hdf5hpp::hdf5_dataset dset_PDU  = hdf5file.open_dataset(dset_string.c_str());
-            hdf5hpp::hdf5_dataset_elem pdu_pars = dset_PDU[0];
-            if(pdu_pars["type"].as<uint8_t>() != nrsim_tv_type::SRS)
+            pdu_record rec(dset_PDU);            // single H5Dread per PDU (was ~12 .as<>())
+            if(rec.get<uint8_t>("type") != nrsim_tv_type::SRS)
             {
                 count++;
                 continue;
@@ -844,17 +1125,35 @@ void RU_Emulator::load_srs_tvs()
             srs_rb_info_t srs_rb_info[MAX_SRS_SYM]={{0}};
             scf_fapi_srs_pdu_t srs_pdu;
 
-            srs_pdu.num_symbols = pdu_pars["numSymbols"].as<uint8_t>();
-            srs_pdu.time_start_position = pdu_pars["timeStartPosition"].as<uint8_t>();
-            srs_pdu.num_repetitions = pdu_pars["numRepetitions"].as<uint8_t>();
-            srs_pdu.frequency_shift = pdu_pars["frequencyShift"].as<uint8_t>();
-            srs_pdu.bandwidth_index = pdu_pars["bandwidthIndex"].as<uint8_t>();
-            srs_pdu.config_index = pdu_pars["configIndex"].as<uint8_t>();
-            srs_pdu.frequency_position = pdu_pars["frequencyPosition"].as<uint8_t>();
-            srs_pdu.frequency_hopping = pdu_pars["frequencyHopping"].as<uint8_t>();
-            srs_pdu.resource_type = pdu_pars["resourceType"].as<uint8_t>();
-            srs_pdu.t_srs = pdu_pars["Tsrs"].as<uint16_t>();
-            srs_pdu.t_offset = pdu_pars["Toffset"].as<uint16_t>();
+            srs_pdu.num_symbols = rec.get<uint8_t>("numSymbols");
+            srs_pdu.time_start_position = rec.get<uint8_t>("timeStartPosition");
+            srs_pdu.num_repetitions = rec.get<uint8_t>("numRepetitions");
+            srs_pdu.frequency_shift = rec.get<uint8_t>("frequencyShift");
+            srs_pdu.bandwidth_index = rec.get<uint8_t>("bandwidthIndex");
+            srs_pdu.config_index = rec.get<uint8_t>("configIndex");
+            srs_pdu.frequency_position = rec.get<uint8_t>("frequencyPosition");
+            srs_pdu.frequency_hopping = rec.get<uint8_t>("frequencyHopping");
+            srs_pdu.resource_type = rec.get<uint8_t>("resourceType");
+            srs_pdu.t_srs = rec.get<uint16_t>("Tsrs");
+            srs_pdu.t_offset = rec.get<uint16_t>("Toffset");
+
+            static const bool srs_selfcheck = (std::getenv("RU_PDU_SELFCHECK") != nullptr);
+            if (srs_selfcheck)
+            {
+                hdf5hpp::hdf5_dataset_elem pp = dset_PDU[0];
+                auto chk=[&](const char*n,long a,long b){ if(a!=b) re_cons("PDU_SELFCHECK MISMATCH {} {} PDU{}: new={} old={}", srs_object.tv_names[i].c_str(),n,count,a,b); };
+                chk("numSymbols",srs_pdu.num_symbols,pp["numSymbols"].as<uint8_t>());
+                chk("timeStartPosition",srs_pdu.time_start_position,pp["timeStartPosition"].as<uint8_t>());
+                chk("numRepetitions",srs_pdu.num_repetitions,pp["numRepetitions"].as<uint8_t>());
+                chk("frequencyShift",srs_pdu.frequency_shift,pp["frequencyShift"].as<uint8_t>());
+                chk("bandwidthIndex",srs_pdu.bandwidth_index,pp["bandwidthIndex"].as<uint8_t>());
+                chk("configIndex",srs_pdu.config_index,pp["configIndex"].as<uint8_t>());
+                chk("frequencyPosition",srs_pdu.frequency_position,pp["frequencyPosition"].as<uint8_t>());
+                chk("frequencyHopping",srs_pdu.frequency_hopping,pp["frequencyHopping"].as<uint8_t>());
+                chk("resourceType",srs_pdu.resource_type,pp["resourceType"].as<uint8_t>());
+                chk("Tsrs",srs_pdu.t_srs,pp["Tsrs"].as<uint16_t>());
+                chk("Toffset",srs_pdu.t_offset,pp["Toffset"].as<uint16_t>());
+            }
 
             for(int frame = 0; frame < ORAN_MAX_FRAME_ID; frame++)
             {

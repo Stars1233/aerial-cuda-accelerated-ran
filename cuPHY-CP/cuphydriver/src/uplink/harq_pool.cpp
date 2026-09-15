@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,8 @@
 #include "context.hpp"
 #include "nvlog.hpp"
 #include "exceptions.hpp"
+
+#include <mutex>
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //// Pool of free HARQ buffers with fixed size
@@ -357,29 +359,39 @@ HarqPool * HarqPoolManager::poolFind(size_t buf_size) {
 
 void HarqPoolManager::checkPoolDepletion(ReleasedHarqBufferInfo& released_harq_buffer_info)
 {
-    
-    static uint32_t hystersis = 0;
     PhyDriverCtx * pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
 
     if(hb_pool_list[MAX_HARQ_POOLS-1]->countElements()*100/(pdctx->getMaxHarqPools()) < 30)
     {
-        NVLOGW_FMT(TAG, "Largest sized HARQ pool at less than 30 percent availability. Free all HARQ buffers");
-        freeAllHarqBuffers(released_harq_buffer_info);
+        std::unique_lock<Mutex> cleanup_guard(cleanup_lock_, std::try_to_lock);
+        if(cleanup_guard.owns_lock())
+        {
+            NVLOGW_FMT(TAG, "Largest sized HARQ pool at less than 30 percent availability. Free all HARQ buffers");
+            freeAllHarqBuffers(released_harq_buffer_info);
+        }
     }
     else
     {
         if( (hb_pool_list[0]->countElements()*100/pdctx->getMaxHarqPools() < 30) ||
             (hb_pool_list[1]->countElements()*100/pdctx->getMaxHarqPools() < 30) )
         {
-            hystersis++;
-            if(HARQ_CLEANUP_HYSTERSIS == hystersis)
+            const uint32_t current_hysteresis = hysteresis_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+            if(current_hysteresis < HARQ_CLEANUP_HYSTERESIS)
+            {
+                NVLOGW_FMT(TAG, "HARQ pool[0/1] at less than 30 percent availability. Hysteresis={}",current_hysteresis);
+                return;
+            }
+
+            hysteresis_.store(0, std::memory_order_relaxed);
+
+            // An in-progress cleanup already scans all buckets, so do not queue another one.
+            std::unique_lock<Mutex> cleanup_guard(cleanup_lock_, std::try_to_lock);
+            if(cleanup_guard.owns_lock())
             {
                 NVLOGW_FMT(TAG, "HARQ pool[0/1] at less than 30 percent availability. Entering massive cleanup ");
-                hystersis = 0;
                 cleanupHarqBuckets(released_harq_buffer_info);
             }
-            else
-                NVLOGW_FMT(TAG, "HARQ pool[0/1] at less than 30 percent availability. Hystersis={}",hystersis);
         }
     }
 }

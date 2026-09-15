@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -107,10 +107,12 @@ void nv_ipc_check_host_pinned_memory(nv_ipc_t* ipc);
 int cuda_get_device_count(void);
 
 /**
- * Check if pointer is device memory
+ * Check if pointer is device memory.
+ * Requires an active CUDA context (cuCtxSetCurrent) on the calling thread.
+ * Returns 0 if no context is active or if the query fails.
  *
  * @param[in] ptr Pointer to check
- * @return 1 if device pointer, 0 if host pointer
+ * @return 1 if device pointer, 0 if host pointer or on failure
  */
 int cuda_is_device_pointer(const void *ptr);
 

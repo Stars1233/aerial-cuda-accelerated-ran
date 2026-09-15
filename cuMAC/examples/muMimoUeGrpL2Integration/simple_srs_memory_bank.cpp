@@ -28,7 +28,7 @@ SimpleCvSrsChestMemoryBank::SimpleCvSrsChestMemoryBank(const TestConfig& _config
     , buffer_size(_config.num_prg * _config.num_gnb_ant * _config.num_ue_layer * sizeof(uint32_t))
     , is_shared_memory(false)
 {
-    std::cout << "\n=== Simplified CvSrsChestMemoryBank (using CVSrsChestBuff_contMemAlloc buffer type) ===" << std::endl;
+    std::cout << "\n=== Simplified CvSrsChestMemoryBank (using CVSrsChestBuff buffer type) ===" << std::endl;
     std::cout << "Using L1 standalone/non-shared memory" << std::endl;
     std::cout << "CUDA device: " << cuda_device_id << std::endl;
     std::cout << "Allocating " << total_num_buffers << " SRS channel estimate buffers" << std::endl;
@@ -51,16 +51,25 @@ SimpleCvSrsChestMemoryBank::SimpleCvSrsChestMemoryBank(const TestConfig& _config
               << (buffer_size * total_num_buffers / 1024.0 / 1024.0) << " MB)" << std::endl;
 
     std::cout << "\nAllocating individual GPU buffers (each via separate cudaMalloc):" << std::endl;
+
+    // Open the three IPC pools. Names mirror the originals so the consumer
+    // (cuMAC simple_srs_memory_bank, etc.) keeps finding them.
+    char pool_name[32];
+
+    // 1. GPU-backed raw byte pool: one slot per channel-estimate buffer.
+    std::snprintf(pool_name, sizeof(pool_name), "dev_pool_gpu%d", cuda_device_id);
+    gpu_mem_pool = new nv::lock_free_mem_pool<uint8_t>(total_num_buffers, LOCK_FREE_OPT_SHM_PRIMARY, pool_name, cuda_device_id, buffer_size);
+
     // Allocate GPU memory for each CV buffer
     // IMPORTANT: Each buffer gets its own cudaMalloc call, so they are NOT contiguous
     for (uint32_t idx = 0; idx < total_num_buffers; idx++) {
         // Allocate GPU device buffer
         // Pass nullptr for GpuDevice* since IOBuf doesn't actually use it (only stores it)
         // The actual allocation is done by device_alloc::allocate() which just calls cudaMalloc
-        dev_buf* device_buffer = new dev_buf(buffer_size, nullptr);
-        
-        // Create CVSrsChestBuff_contMemAlloc wrapper (contiguous memory allocation version)
-        CVSrsChestBuff_contMemAlloc* cv_buffer = new CVSrsChestBuff_contMemAlloc(device_buffer);
+        ipc_dev_buf* device_buffer = new ipc_dev_buf(gpu_mem_pool, nullptr);
+
+        // Create CVSrsChestBuff wrapper (contiguous memory allocation version)
+        CVSrsChestBuff* cv_buffer = new CVSrsChestBuff(device_buffer);
         cv_buffer->setSrsChestBuffState(slot_command_api::SRS_CHEST_BUFF_NONE);
         
         arr_cv_srs_chest_buff[idx] = cv_buffer;
@@ -73,14 +82,15 @@ SimpleCvSrsChestMemoryBank::SimpleCvSrsChestMemoryBank(const TestConfig& _config
     std::cout << "Free buffer pool initialized with " << memIndexPool.size() << " buffers" << std::endl;
 }
 
-SimpleCvSrsChestMemoryBank::SimpleCvSrsChestMemoryBank(const TestConfig& _config, void* cpu_buf_start_addr, void* gpu_buf_start_addr)
+SimpleCvSrsChestMemoryBank::SimpleCvSrsChestMemoryBank(const TestConfig& _config, void* cpu_buf_start_addr, nv::lock_free_mem_pool<uint8_t>* gpu_pool)
     : config(_config)
     , cuda_device_id(_config.cuda_device_id)
     , total_num_buffers(std::min(_config.num_srs_buffers, static_cast<uint32_t>(slot_command_api::MAX_SRS_CHEST_BUFFERS)))
     , buffer_size(_config.num_prg * _config.num_gnb_ant * _config.num_ue_layer * sizeof(uint32_t))
     , is_shared_memory(true)
+    , gpu_mem_pool(gpu_pool)
 {
-    std::cout << "\n=== Simplified CvSrsChestMemoryBank (using CVSrsChestBuff_contMemAlloc buffer type) ===" << std::endl;
+    std::cout << "\n=== Simplified CvSrsChestMemoryBank (using CVSrsChestBuff buffer type) ===" << std::endl;
     std::cout << "Using shared/contiguous GPU and GPU memory pools" << std::endl;
     std::cout << "CUDA device: " << cuda_device_id << std::endl;
     std::cout << "Allocating " << total_num_buffers << " SRS channel estimate buffers" << std::endl;
@@ -103,29 +113,31 @@ SimpleCvSrsChestMemoryBank::SimpleCvSrsChestMemoryBank(const TestConfig& _config
               << (buffer_size * total_num_buffers / 1024.0 / 1024.0) << " MB)" << std::endl;
 
     // Validate shared buffer pointer
-    if (cpu_buf_start_addr == nullptr || gpu_buf_start_addr == nullptr) {
+    if (cpu_buf_start_addr == nullptr || gpu_mem_pool == nullptr) {
         throw std::runtime_error("Shared buffer pointers are null");
     }
 
-    // get the GPU memory base address of the contiguous memory region
+    // get the GPU memory base address of the contiguous memory region from the IPC pool
+    void* gpu_buf_start_addr = gpu_mem_pool->get_buf_addr(0);
+    if (gpu_buf_start_addr == nullptr) {
+        throw std::runtime_error("GPU IPC memory pool returned null base address");
+    }
     if (!is_aligned_for_type<__half2>(gpu_buf_start_addr)) {
         throw std::runtime_error("GPU memory base address is not aligned for __half2");
     }
     gpu_buff_base_addr = reinterpret_cast<__half2*>(gpu_buf_start_addr);
 
     // get the CPU memory base address of the contiguous memory region
-    if (!is_aligned_for_type<CVSrsChestBuff_contMemAlloc>(cpu_buf_start_addr)) {
-        throw std::runtime_error("CPU memory base address is not aligned for CVSrsChestBuff_contMemAlloc");
+    if (!is_aligned_for_type<CVSrsChestBuff>(cpu_buf_start_addr)) {
+        throw std::runtime_error("CPU memory base address is not aligned for CVSrsChestBuff");
     }
-    arr_cv_srs_chest_buff_base_addr = reinterpret_cast<CVSrsChestBuff_contMemAlloc*>(cpu_buf_start_addr);
+    arr_cv_srs_chest_buff_base_addr = reinterpret_cast<CVSrsChestBuff*>(cpu_buf_start_addr);
 
-    // Create CVSrsChestBuff_contMemAlloc at (arr_cv_srs_chest_buff_base_addr + idx) using placement new
+    // Create CVSrsChestBuff at (arr_cv_srs_chest_buff_base_addr + idx) using placement new.
+    // Each ipc_dev_buf wraps one slot of the lock-free GPU pool; this matches the cuphydriver pattern.
     for (uint32_t idx = 0; idx < total_num_buffers; idx++) {
-        uint8_t* gpu_buff_addr = reinterpret_cast<uint8_t*>(gpu_buff_base_addr + idx * _config.num_prg * _config.num_gnb_ant * _config.num_ue_layer);
-        dev_buf_view* buffer_view = new dev_buf_view(gpu_buff_addr, buffer_size);
-
-        // Placement new: construct at the pre-allocated slot in the shared CPU pool; store pointer for view
-        CVSrsChestBuff_contMemAlloc* cv_buffer = new (arr_cv_srs_chest_buff_base_addr + idx) CVSrsChestBuff_contMemAlloc(buffer_view);
+        ipc_dev_buf* buffer_dev = new ipc_dev_buf(gpu_mem_pool);
+        CVSrsChestBuff* cv_buffer = new (arr_cv_srs_chest_buff_base_addr + idx) CVSrsChestBuff(buffer_dev);
         cv_buffer->setSrsChestBuffState(slot_command_api::SRS_CHEST_BUFF_NONE);
         arr_cv_srs_chest_buff[idx] = cv_buffer;
 
@@ -147,12 +159,18 @@ SimpleCvSrsChestMemoryBank::~SimpleCvSrsChestMemoryBank()
     } else {
         // Shared path: objects were placement-new'd at arr_cv_srs_chest_buff_base_addr + idx; call destructors only (do not delete)
         for (uint32_t idx = 0; idx < total_num_buffers; idx++) {
-            CVSrsChestBuff_contMemAlloc* p = arr_cv_srs_chest_buff[idx];
+            CVSrsChestBuff* p = arr_cv_srs_chest_buff[idx];
             if (p) {
-                p->~CVSrsChestBuff_contMemAlloc();
+                p->~CVSrsChestBuff();
                 arr_cv_srs_chest_buff[idx] = nullptr;
             }
         }
+    }
+    // The shared-memory constructor borrows the GPU pool from its caller.
+    // Only the standalone constructor creates and owns this pool.
+    if (!is_shared_memory && gpu_mem_pool) {
+        delete gpu_mem_pool;
+        gpu_mem_pool = nullptr;
     }
 }
 
@@ -162,7 +180,7 @@ void SimpleCvSrsChestMemoryBank::printBufferInfo() const
     std::cout << "Total buffers: " << total_num_buffers << std::endl;
 
     for (uint32_t idx = 0; idx < total_num_buffers; idx++) {
-        CVSrsChestBuff_contMemAlloc* buffer = arr_cv_srs_chest_buff[idx];
+        CVSrsChestBuff* buffer = arr_cv_srs_chest_buff[idx];
         if (buffer) {
             std::cout << "Buffer[" << idx << "]: "
                       << "GPU addr = " << static_cast<const void*>(buffer->getAddr())
@@ -187,8 +205,8 @@ bool SimpleCvSrsChestMemoryBank::areBuffersContiguous() const
     
     for (uint32_t idx = 0; idx < total_num_buffers - 1; idx++)
     {
-        CVSrsChestBuff_contMemAlloc* curr = arr_cv_srs_chest_buff[idx];
-        CVSrsChestBuff_contMemAlloc* next = arr_cv_srs_chest_buff[idx + 1];
+        CVSrsChestBuff* curr = arr_cv_srs_chest_buff[idx];
+        CVSrsChestBuff* next = arr_cv_srs_chest_buff[idx + 1];
         
         if (curr && next) {
             const uint8_t* curr_addr = curr->getAddr();
@@ -211,7 +229,7 @@ bool SimpleCvSrsChestMemoryBank::areBuffersContiguous() const
     return all_contiguous;
 }
 
-int SimpleCvSrsChestMemoryBank::preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, uint32_t usage, CVSrsChestBuff_contMemAlloc** ptr, uint32_t* realBuffIdx_out)
+int SimpleCvSrsChestMemoryBank::preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, uint32_t usage, CVSrsChestBuff** ptr, uint32_t* realBuffIdx_out)
 {
     // Validate input arguments
     if (ptr == nullptr || usage == 0 || rnti >= CV_INVALID_RNTI) {
@@ -245,7 +263,7 @@ int SimpleCvSrsChestMemoryBank::preAllocateBuffer(uint32_t cell_id, uint32_t rnt
 
     // Get the actual buffer from the global array
     *ptr = arr_cv_srs_chest_buff[realBuffIndex];
-    CVSrsChestBuff_contMemAlloc* buffer = *ptr;
+    CVSrsChestBuff* buffer = *ptr;
     
     if (!buffer) {
         std::cerr << "preAllocateBuffer: Buffer at realBuffIndex " << realBuffIndex << " is null" << std::endl;
@@ -288,7 +306,7 @@ int SimpleCvSrsChestMemoryBank::preAllocateBuffer(uint32_t cell_id, uint32_t rnt
     return 0;
 }
 
-int SimpleCvSrsChestMemoryBank::retrieveBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, CVSrsChestBuff_contMemAlloc** ptr)
+int SimpleCvSrsChestMemoryBank::retrieveBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, CVSrsChestBuff** ptr)
 {
     // Validate input arguments  
     if (ptr == nullptr || rnti >= CV_INVALID_RNTI) {
@@ -323,7 +341,7 @@ int SimpleCvSrsChestMemoryBank::retrieveBuffer(uint32_t cell_id, uint32_t rnti, 
     
     // Get the actual buffer from the global array
     *ptr = arr_cv_srs_chest_buff[realBuffIndex];
-    CVSrsChestBuff_contMemAlloc* buffer = *ptr;
+    CVSrsChestBuff* buffer = *ptr;
     
     if (!buffer) {
         std::cerr << "retrieveBuffer: Buffer at realBuffIndex " << realBuffIndex << " is null" << std::endl;
@@ -362,7 +380,7 @@ void SimpleCvSrsChestMemoryBank::updateSrsChestBufferState(uint32_t cell_id, uin
     
     // Get real buffer index and update state
     const uint32_t realBuffIndex = srsChEstBuffIndexMap[cell_id].indexMap[buffer_idx];
-    CVSrsChestBuff_contMemAlloc* buffer = arr_cv_srs_chest_buff[realBuffIndex];
+    CVSrsChestBuff* buffer = arr_cv_srs_chest_buff[realBuffIndex];
     if (buffer) {
         buffer->setSrsChestBuffState(srs_chest_buff_state);
     }
@@ -386,7 +404,7 @@ slot_command_api::srsChestBuffState SimpleCvSrsChestMemoryBank::getSrsChestBuffe
     
     // Get real buffer index and return state
     const uint32_t realBuffIndex = srsChEstBuffIndexMap[cell_id].indexMap[buffer_idx];
-    CVSrsChestBuff_contMemAlloc* buffer = arr_cv_srs_chest_buff[realBuffIndex];
+    CVSrsChestBuff* buffer = arr_cv_srs_chest_buff[realBuffIndex];
     if (buffer) {
         return buffer->getSrsChestBuffState();
     }
@@ -411,7 +429,7 @@ void SimpleCvSrsChestMemoryBank::updateSrsChestBufferUsage(uint32_t cell_id, uin
     
     // Get real buffer index and update usage
     const uint32_t realBuffIndex = srsChEstBuffIndexMap[cell_id].indexMap[buffer_idx];
-    CVSrsChestBuff_contMemAlloc* buffer = arr_cv_srs_chest_buff[realBuffIndex];
+    CVSrsChestBuff* buffer = arr_cv_srs_chest_buff[realBuffIndex];
     if (buffer) {
         buffer->setSrsChestBuffUsage(usage);
     }
@@ -435,7 +453,7 @@ uint32_t SimpleCvSrsChestMemoryBank::getSrsChestBufferUsage(uint32_t cell_id, ui
     
     // Get real buffer index and return usage
     const uint32_t realBuffIndex = srsChEstBuffIndexMap[cell_id].indexMap[buffer_idx];
-    CVSrsChestBuff_contMemAlloc* buffer = arr_cv_srs_chest_buff[realBuffIndex];
+    CVSrsChestBuff* buffer = arr_cv_srs_chest_buff[realBuffIndex];
     if (buffer) {
         return buffer->getSrsChestBuffUsage();
     }
@@ -502,46 +520,4 @@ bool SimpleCvSrsChestMemoryBank::memPoolDeAllocatePerCell(uint16_t cell_id)
     }
     
     return retVal;
-}
-
-void CVSrsChestBuff_contMemAlloc::getSrsPrgInfo(uint8_t* pSrsPrgSize_out, uint16_t* pSrsStartPrg_out, uint16_t* pSrsStartValidPrg_out, uint16_t* pSrsNValidPrg_out)
-{
-    *pSrsPrgSize_out    = srsPrgSize;
-    *pSrsStartPrg_out   = srsStartPrg;
-    *pSrsStartValidPrg_out = srsStartValidPrg;
-    *pSrsNValidPrg_out     = srsNValidPrg;
-}
-
-void CVSrsChestBuff_contMemAlloc::setSrsChestBuffState(slot_command_api::srsChestBuffState  _srs_chest_buff_state)
-{
-    srs_chest_buff_state = _srs_chest_buff_state;
-}
-
-void CVSrsChestBuff_contMemAlloc::setSrsChestBuffUsage(uint32_t  _srs_chest_buff_usage)
-{
-    srs_chest_buff_usage = _srs_chest_buff_usage;
-}
-
-void CVSrsChestBuff_contMemAlloc::configSrsInfo(uint16_t nPrg, uint8_t nAnt, uint8_t nLayer, uint8_t srsPrgSize_in, uint16_t srsStartPrg_in, uint16_t startValidPrg_in, uint16_t nValidPrg_in)
-{
-    srsPrgSize           = srsPrgSize_in;
-    srsStartPrg          = srsStartPrg_in;
-    srsStartValidPrg     = startValidPrg_in;
-    srsNValidPrg         = nValidPrg_in;
-    srs_chest_buff_state = slot_command_api::SRS_CHEST_BUFF_REQUESTED;
-
-    // Set descriptor
-    std::array<int, 3> dims = {nPrg, nAnt, nLayer};
-    cuphyStatus_t setupStatus = cuphySetTensorDescriptor(buffDesc.handle(),
-                                                        CUPHY_C_16F,
-                                                        dims.size(),
-                                                        dims.data(),
-                                                        nullptr,
-                                                        static_cast<int>(cuphy::tensor_flags::align_tight));
-
-}
-
-void CVSrsChestBuff_contMemAlloc::setSfnSlot(uint16_t _sfn, uint16_t _slot){
-    sfn = _sfn;
-    slot = _slot;
 }

@@ -503,6 +503,9 @@ class PdschDmrsConfig:
         beta_dmrs (float): Amplitude factor of DMRS signal.
         precoding_matrix (np.ndarray): Precoding matrix. The shape of the matrix is
             number of layers x number of antenna ports. If set to None, precoding is disabled.
+        su_mimo (bool): True when this transport block belongs to a UE group with a single UE
+            (matches cuPHY ``PdschDmrsParams::su_mimo``). Defaults to False; ``from_pdsch_config``
+            sets it from ``len(ue_configs) == 1``.
     """
     cell_index_in_cell_group: int = 0
     num_bwp_prbs: int = 273
@@ -525,6 +528,7 @@ class PdschDmrsConfig:
     beta_qam: float = 1.0
     beta_dmrs: float = 1.0
     precoding_matrix: np.ndarray = None
+    su_mimo: bool = False
 
     @classmethod
     def from_pdsch_config(
@@ -540,6 +544,7 @@ class PdschDmrsConfig:
             List[PdschDmrsConfig]: A list of PdschDmrsConfig objects.
         """
         dmrs_configs = []
+        su_mimo = len(pdsch_config.ue_configs) == 1
         for ue_config in pdsch_config.ue_configs:
             dmrs_config = PdschDmrsConfig(
                 cell_index_in_cell_group=0,
@@ -560,7 +565,8 @@ class PdschDmrsConfig:
                 ref_point=ue_config.ref_point,
                 beta_qam=ue_config.beta_qam,
                 beta_dmrs=ue_config.beta_dmrs,
-                precoding_matrix=ue_config.precoding_matrix
+                precoding_matrix=ue_config.precoding_matrix,
+                su_mimo=su_mimo
             )
             dmrs_configs.append(dmrs_config)
         return dmrs_configs

@@ -1,0 +1,2125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 64TR/mMIMO PERF/POC2 pattern definitions.
+# Includes active 64TR and mMIMO patterns 66-91.
+patterns:
+- id: '66'
+  pattern: 66
+  description: POC2 pattern 66.
+  comment: 'POC2 pattern 66. TV ranges: DLMIX 11252-11341.'
+  base_tv_only: true
+  ranges:
+    DLMIX:
+      tvs:
+      - main: [11252, 11341]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+- id: 66a
+  pattern: 66.1
+  description: 64TR nrSim pattern 66a PUSCH-only U variant.
+  comment: '64TR nrSim pattern 66a PUSCH-only U variant. POC2 64TR_nrSim_puschOnlyU full_cells=1, compact_cells=1, config_cells=15, channel=channels_O. TV ranges: DLMIX 11252-11341;
+    ULMIX 833, 5431-5445; BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '66'
+    tvs: [11252, 11341]
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [5431, 5445]
+    DLMIX:
+      tvs:
+      - main: [11252, 11341]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 64TR_nrSim_puschOnlyU
+  channel: channels_O
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9358
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9362
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: 66b
+  pattern: 66.2
+  description: 64TR nrSim pattern 66b PUSCH-only U variant.
+  comment: '64TR nrSim pattern 66b PUSCH-only U variant. POC2 64TR_nrSim_puschOnlyU full_cells=1, compact_cells=0, config_cells=15, channel=channels_O. TV ranges: DLMIX 11252-11341;
+    ULMIX 833, 5446-5460; BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '66'
+    tvs: [11252, 11341]
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [5446, 5460]
+    DLMIX:
+      tvs:
+      - main: [11252, 11341]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_puschOnlyU
+  channel: channels_O
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9358
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9362
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: 66c
+  pattern: 66.3
+  description: 64TR nrSim pattern 66c variant.
+  comment: '64TR nrSim pattern 66c variant. POC2 64TR_nrSim full_cells=15, compact_cells=15, config_cells=15, channel=channels_M. TV ranges: DLMIX 11252-11341; ULMIX 833, 5461-5580;
+    BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '66'
+    tvs: [11252, 11341]
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [5461, 5580]
+    DLMIX:
+      tvs:
+      - main: [11252, 11341]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 15
+  compact_cells: 15
+  pattern_type: 64TR_nrSim
+  channel: channels_M
+  s_slot:
+    tv: [0, 0, 5551, 5566]
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9358
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9362
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: 66d
+  pattern: 66.4
+  description: 64TR nrSim pattern 66d variant.
+  comment: '64TR nrSim pattern 66d variant. POC2 64TR_nrSim full_cells=1, compact_cells=0, config_cells=15, channel=channels_M. TV ranges: DLMIX 11252-11341; ULMIX 833, 5581-5700;
+    BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '66'
+    tvs: [11252, 11341]
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [5581, 5700]
+    DLMIX:
+      tvs:
+      - main: [11252, 11341]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim
+  channel: channels_M
+  s_slot:
+    tv: [0, 0, 5671, 5686]
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9358
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9362
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: '67'
+  pattern: 67
+  description: 64TR nrSim pattern 67 baseline.
+  comment: '64TR nrSim pattern 67 baseline. POC2 64TR_nrSim full_cells=1, compact_cells=0, config_cells=15, channel=channels_M. TV ranges: DLMIX 11342-11431; ULMIX 833, 4791-4910;
+    BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [4791, 4910]
+    DLMIX:
+      tvs:
+      - main: [11342, 11431]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim
+  channel: channels_M
+  s_slot:
+    tv: [0, 0, 4881, 4896]
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9350
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9354
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: 67a
+  pattern: 67.1
+  description: 64TR nrSim pattern 67a PUSCH-only U variant.
+  comment: '64TR nrSim pattern 67a PUSCH-only U variant. POC2 64TR_nrSim_puschOnlyU full_cells=1, compact_cells=1, config_cells=15, channel=channels_O. TV ranges: DLMIX 11342-11431;
+    ULMIX 833, 5701-5715; BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '67'
+    tvs: [11342, 11431]
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [5701, 5715]
+    DLMIX:
+      tvs:
+      - main: [11342, 11431]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 64TR_nrSim_puschOnlyU
+  channel: channels_O
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9350
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9354
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: 67b
+  pattern: 67.2
+  description: 64TR nrSim pattern 67b PUSCH-only U variant.
+  comment: '64TR nrSim pattern 67b PUSCH-only U variant. POC2 64TR_nrSim_puschOnlyU full_cells=1, compact_cells=1, config_cells=15, channel=channels_O. TV ranges: DLMIX 11342-11431;
+    ULMIX 833, 5716-5730; BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '67'
+    tvs: [11342, 11431]
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [5716, 5730]
+    DLMIX:
+      tvs:
+      - main: [11342, 11431]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 64TR_nrSim_puschOnlyU
+  channel: channels_O
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9350
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9354
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: 67c
+  pattern: 67.3
+  description: 64TR nrSim pattern 67c variant.
+  comment: '64TR nrSim pattern 67c variant. POC2 64TR_nrSim full_cells=3, compact_cells=3, config_cells=15, channel=channels_M. TV ranges: DLMIX 11342-11431; ULMIX 833, 5731-5850;
+    BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '67'
+    tvs: [11342, 11431]
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [5731, 5850]
+    DLMIX:
+      tvs:
+      - main: [11342, 11431]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 3
+  compact_cells: 3
+  pattern_type: 64TR_nrSim
+  channel: channels_M
+  s_slot:
+    tv: [0, 0, 5821, 5836]
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9350
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9354
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: 67d
+  pattern: 67.4
+  description: 64TR nrSim pattern 67d variant.
+  comment: '64TR nrSim pattern 67d variant. POC2 64TR_nrSim full_cells=1, compact_cells=1, config_cells=15, channel=channels_M. TV ranges: DLMIX 11342-11431; ULMIX 833, 5851-5970;
+    BFW 9292. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '67'
+    tvs: [11342, 11431]
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - main: [5851, 5970]
+    DLMIX:
+      tvs:
+      - main: [11342, 11431]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 64TR_nrSim
+  channel: channels_M
+  s_slot:
+    tv: [0, 0, 5941, 5956]
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9350
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9354
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: 67e
+  pattern: 67.5
+  description: Negative TV variant reusing pattern 67c.
+  comment: 'Negative TV variant reusing pattern 67c. POC2 64TR_nrSim full_cells=1, compact_cells=0, config_cells=15, channel=channels_M. TV ranges: DLMIX 11342-11431; ULMIX 833,
+    6996, 5731-5850; BFW 9292. has S-slot TV config. has BFW/SRS binding config. has override TV mapping.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '67'
+    tvs: [11342, 11431]
+  - side: ULMIX
+    from: 66a
+    tvs: 833
+  - side: ULMIX
+    from: 67c
+    tvs: [5731, 5850]
+  - side: BFW
+    from: 66a
+    tvs: 9292
+  ranges:
+    ULMIX:
+      tvs:
+      - additional: 833
+      - additional: 6996
+      - main: [5731, 5850]
+    DLMIX:
+      tvs:
+      - main: [11342, 11431]
+    BFW:
+      tvs: [9292]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim
+  channel: channels_M
+  s_slot:
+    tv: [0, 0, 5821, 5836]
+  bfw_srs_bind:
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9350
+    bfw_dl_slots: 0:2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 823
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9354
+    bfw_dl_slots: [39]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  - srs_tv: 833
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 0
+    bfw_dl_slots: []
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+  overrides:
+  - base_pattern: 67.3
+    cell_idx: 2
+    tv: 6996
+    tv_increments: 0
+    slot: 15
+    tv_name_slot: 0
+    mix_tv: 1
+    target_dl: 0
+    verbose: 1
+- id: '69'
+  pattern: 69
+  description: 64TR 100 MHz column G baseline.
+  comment: '64TR 100 MHz column G baseline. POC2 64TR_nrSim_624 full_cells=6, compact_cells=6, config_cells=15, channel=channels_P. TV ranges: DLMIX 12232-12441; ULMIX 6621-6695;
+    BFW 9355. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6621, 6695]
+    DLMIX:
+      tvs:
+      - main: [12232, 12441]
+    BFW:
+      tvs: [9355]
+  config_cells: 15
+  full_cells: 6
+  compact_cells: 6
+  pattern_type: 64TR_nrSim_624
+  channel: channels_P
+  s_slot:
+    tv: [0, 0, 6681, 0]
+  bfw_srs_bind:
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9364
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9357
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9356
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9355
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+- id: 69a
+  pattern: 69.1
+  description: 64TR 100 MHz column G 69a variant.
+  comment: '64TR 100 MHz column G 69a variant. POC2 64TR_nrSim_624 full_cells=3, compact_cells=3, config_cells=15, channel=channels_P. TV ranges: DLMIX 12232-12441; ULMIX 6696-6770;
+    BFW 9355. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '69'
+    tvs: [12232, 12441]
+  - side: BFW
+    from: '69'
+    tvs: 9355
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6696, 6770]
+    DLMIX:
+      tvs:
+      - main: [12232, 12441]
+    BFW:
+      tvs: [9355]
+  config_cells: 15
+  full_cells: 3
+  compact_cells: 3
+  pattern_type: 64TR_nrSim_624
+  channel: channels_P
+  s_slot:
+    tv: [0, 0, 6756, 0]
+  bfw_srs_bind:
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9364
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9373
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9356
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9375
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+- id: 69b
+  pattern: 69.2
+  description: 64TR 100 MHz column G 69b variant.
+  comment: '64TR 100 MHz column G 69b variant. POC2 64TR_nrSim_624 full_cells=6, compact_cells=6, config_cells=15, channel=channels_P. TV ranges: DLMIX 12232-12441; ULMIX 6771-6845;
+    BFW 9355. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '69'
+    tvs: [12232, 12441]
+  - side: BFW
+    from: '69'
+    tvs: 9355
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6771, 6845]
+    DLMIX:
+      tvs:
+      - main: [12232, 12441]
+    BFW:
+      tvs: [9355]
+  config_cells: 15
+  full_cells: 6
+  compact_cells: 6
+  pattern_type: 64TR_nrSim_624
+  channel: channels_P
+  s_slot:
+    tv: [0, 0, 6831, 0]
+  bfw_srs_bind:
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9364
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9377
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9356
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9379
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+- id: 69c
+  pattern: 69.3
+  description: 64TR 100 MHz column G 69c variant.
+  comment: '64TR 100 MHz column G 69c variant. POC2 64TR_nrSim_624 full_cells=3, compact_cells=3, config_cells=15, channel=channels_P. TV ranges: DLMIX 12232-12441; ULMIX 6371-6445;
+    BFW 9355. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '69'
+    tvs: [12232, 12441]
+  - side: BFW
+    from: '69'
+    tvs: 9355
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6371, 6445]
+    DLMIX:
+      tvs:
+      - main: [12232, 12441]
+    BFW:
+      tvs: [9355]
+  config_cells: 15
+  full_cells: 3
+  compact_cells: 3
+  pattern_type: 64TR_nrSim_624
+  channel: channels_P
+  s_slot:
+    tv: [0, 0, 6431, 0]
+  bfw_srs_bind:
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9364
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9357
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9356
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9355
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+- id: 69d
+  pattern: 69.4
+  description: 64TR 100 MHz column G 69d variant.
+  comment: '64TR 100 MHz column G 69d variant. POC2 64TR_nrSim_624 full_cells=1, compact_cells=0, config_cells=15, channel=channels_P. TV ranges: DLMIX 12232-12441; ULMIX 6846-6920;
+    BFW 9355. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '69'
+    tvs: [12232, 12441]
+  - side: BFW
+    from: '69'
+    tvs: 9355
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6846, 6920]
+    DLMIX:
+      tvs:
+      - main: [12232, 12441]
+    BFW:
+      tvs: [9355]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_624
+  channel: channels_P
+  s_slot:
+    tv: [0, 0, 6906, 0]
+  bfw_srs_bind:
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9364
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9357
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9356
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9355
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+- id: 69e
+  pattern: 69.5
+  description: 64TR 100 MHz column G early-HARQ ODC variant.
+  comment: '64TR 100 MHz column G early-HARQ ODC variant. POC2 64TR_nrSim_624 full_cells=1, compact_cells=1, config_cells=15, channel=channels_T. TV ranges: DLMIX 12232-12441; ULMIX
+    7260-7364; BFW 9355. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '69'
+    tvs: [12232, 12441]
+  - side: BFW
+    from: '69'
+    tvs: 9355
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7260, 7364]
+    DLMIX:
+      tvs:
+      - main: [12232, 12441]
+    BFW:
+      tvs: [9355]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 64TR_nrSim_624
+  channel: channels_T
+  s_slot:
+    tv: [0, 7320, 7335, 7350]
+  bfw_srs_bind:
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9364
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9377
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21523
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9356
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9379
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+- id: '71'
+  pattern: 71
+  description: 64TR 100 MHz column H pattern.
+  comment: '64TR 100 MHz column H pattern. POC2 64TR_nrSim_624 full_cells=1, compact_cells=1, config_cells=15, channel=channels_Q. TV ranges: DLMIX 12232-12441; ULMIX 6446-6520;
+    BFW 9365. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '69'
+    tvs: [12232, 12441]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6446, 6520]
+    DLMIX:
+      tvs:
+      - main: [12232, 12441]
+    BFW:
+      tvs: [9365]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 64TR_nrSim_624
+  channel: channels_Q
+  s_slot:
+    tv: [0, 0, 6506, 0]
+  bfw_srs_bind:
+  - srs_tv: 21563
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9368
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9365
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21563
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9366
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9367
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+- id: '73'
+  pattern: 73
+  description: 64TR 40 MHz column G pattern.
+  comment: '64TR 40 MHz column G pattern. POC2 64TR_nrSim_624 full_cells=1, compact_cells=0, config_cells=20, channel=channels_P. TV ranges: DLMIX 12442-12721; ULMIX 6521-6620;
+    BFW 9369. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6521, 6620]
+    DLMIX:
+      tvs:
+      - main: [12442, 12721]
+    BFW:
+      tvs: [9369]
+  config_cells: 20
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_624
+  channel: channels_P
+  s_slot:
+    tv: [0, 0, 6601, 0]
+  bfw_srs_bind:
+  - srs_tv: 21583
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9370
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9369
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21583
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9372
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9371
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+  command_args:
+    ULMIX: genTV
+    DLMIX: genTV
+- id: '75'
+  pattern: 75
+  description: 64TR 100 MHz column G 16-UEG pattern.
+  comment: '64TR 100 MHz column G 16-UEG pattern. POC2 64TR_nrSim_624 full_cells=1, compact_cells=0, config_cells=15, channel=channels_P. TV ranges: DLMIX 12722-12931; ULMIX 6921-6995;
+    BFW 9381. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [6921, 6995]
+    DLMIX:
+      tvs:
+      - main: [12722, 12931]
+    BFW:
+      tvs: [9381]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_624
+  channel: channels_P
+  s_slot:
+    tv: [0, 0, 6981, 0]
+  bfw_srs_bind:
+  - srs_tv: 21603
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9382
+    bfw_dl_slots: [0, 1, 39]
+    bfw_ul_tv: 9381
+    bfw_ul_slots: [3, 13, 23, 33]
+    cell_idx: []
+  - srs_tv: 21603
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9384
+    bfw_dl_slots: 2,5:12,15:22,25:32,35:38
+    bfw_ul_tv: 9383
+    bfw_ul_slots: [4, 14, 24, 34]
+    cell_idx: []
+- id: '77'
+  pattern: 77
+  description: 64TR 100 MHz column I pattern.
+  comment: '64TR 100 MHz column I pattern. POC2 64TR_nrSim_638 full_cells=1, compact_cells=0, config_cells=15, channel=channels_R. TV ranges: DLMIX 12932-13066; ULMIX 7050-7154;
+    BFW 9385. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7050, 7154]
+    DLMIX:
+      tvs:
+      - main: [12932, 13066]
+    BFW:
+      tvs: [9385]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_638
+  channel: channels_R
+  s_slot:
+    tv: [0, 7080, 7125, 7140]
+  bfw_srs_bind:
+  - srs_tv: 21623
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9386
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9385
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21623
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9388
+    bfw_dl_slots: 0:2,5:8,10:12,15:22,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9387
+    bfw_ul_slots: [4, 14, 24, 34, 44, 54, 64, 74]
+    cell_idx: []
+  - srs_tv: 21623
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9390
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 0
+    bfw_ul_slots: []
+    cell_idx: []
+- id: '79'
+  pattern: 79
+  description: 64TR 100 MHz Phase 4 column B pattern.
+  comment: '64TR 100 MHz Phase 4 column B pattern. POC2 64TR_nrSim_640 full_cells=6, compact_cells=6, config_cells=15, channel=channels_S. TV ranges: DLMIX 13067-13216; ULMIX 7155-7259;
+    BFW 9391. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7155, 7259]
+    DLMIX:
+      tvs:
+      - main: [13067, 13216]
+    BFW:
+      tvs: [9391]
+  config_cells: 15
+  full_cells: 6
+  compact_cells: 6
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 7185, 7230, 7245]
+  bfw_srs_bind:
+  - srs_tv: 21643
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9392
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9391
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21643
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9394
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9393
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21643
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9396
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9395
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: 79a
+  pattern: 79.1
+  description: 64TR 100 MHz Phase 4 column B 79a variant.
+  comment: '64TR 100 MHz Phase 4 column B 79a variant. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_U. TV ranges: DLMIX 13067-13216; ULMIX
+    7953-8057; BFW 9501. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '79'
+    tvs: [13067, 13216]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7953, 8057]
+    DLMIX:
+      tvs:
+      - main: [13067, 13216]
+    BFW:
+      tvs: [9501]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_U
+  s_slot:
+    tv: [0, 7983, 8028, 8043]
+  bfw_srs_bind:
+  - srs_tv: 21640
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9502
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9501
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21640
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9504
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9503
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21640
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9506
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9505
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: 79b
+  pattern: 79.2
+  description: 64TR 100 MHz Phase 4 column B 79b variant.
+  comment: '64TR 100 MHz Phase 4 column B 79b variant. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_U. TV ranges: DLMIX 13067-13216; ULMIX
+    8058-8162; BFW 9507. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '79'
+    tvs: [13067, 13216]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [8058, 8162]
+    DLMIX:
+      tvs:
+      - main: [13067, 13216]
+    BFW:
+      tvs: [9507]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_U
+  s_slot:
+    tv: [0, 8088, 8133, 8148]
+  bfw_srs_bind:
+  - srs_tv: 21641
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9508
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9507
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21641
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9510
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9509
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21641
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9512
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9511
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: '81'
+  pattern: 81
+  description: POC2 pattern 81.
+  comment: 'POC2 pattern 81. TV ranges: DLMIX 13217-13381.'
+  base_tv_only: true
+  ranges:
+    DLMIX:
+      tvs:
+      - main: [13217, 13381]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+- id: 81a
+  pattern: 81.1
+  description: 64TR 100 MHz 25-3 column B, SRS in S slot, 4 symbols.
+  comment: '64TR 100 MHz 25-3 column B, SRS in S slot, 4 symbols. POC2 64TR_nrSim_640 full_cells=6, compact_cells=6, config_cells=15, channel=channels_S. TV ranges: DLMIX 13217-13366;
+    ULMIX 7365-7469; BFW 9401. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '81'
+    tvs: [13217, 13366]
+    from_tvs: [13217, 13381]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7365, 7469]
+    DLMIX:
+      tvs:
+      - main: [13217, 13366]
+    BFW:
+      tvs: [9401]
+  config_cells: 15
+  full_cells: 6
+  compact_cells: 6
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 7395, 7440, 7455]
+  bfw_srs_bind:
+  - srs_tv: 21673
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9402
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9401
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21673
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9404
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9403
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21673
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9406
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9405
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: 81b
+  pattern: 81.2
+  description: 64TR 100 MHz 25-3 column B, SRS in U/U2 and S slot, 2 symbols.
+  comment: '64TR 100 MHz 25-3 column B, SRS in U/U2 and S slot, 2 symbols. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_U. TV ranges: DLMIX
+    13217-13366; ULMIX 7470-7574; BFW 9407. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '81'
+    tvs: [13217, 13366]
+    from_tvs: [13217, 13381]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7470, 7574]
+    DLMIX:
+      tvs:
+      - main: [13217, 13366]
+    BFW:
+      tvs: [9407]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_U
+  s_slot:
+    tv: [0, 7500, 7545, 7560]
+  bfw_srs_bind:
+  - srs_tv: 21693
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9408
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9407
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21693
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9410
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9409
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21693
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9412
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9411
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: 81c
+  pattern: 81.3
+  description: 64TR 100 MHz 25-3 column B, 32-port CSI-RS variant.
+  comment: '64TR 100 MHz 25-3 column B, 32-port CSI-RS variant. POC2 64TR_nrSim_640 full_cells=6, compact_cells=6, config_cells=15, channel=channels_S. TV ranges: DLMIX 13217-13321,
+    13337-13381; ULMIX 7365-7469; BFW 9401. has S-slot TV config. has BFW/SRS binding config. has override TV mapping.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '81'
+    tvs: [13217, 13321]
+    from_tvs: [13217, 13381]
+  - side: DLMIX
+    from: '81'
+    tvs: [13337, 13381]
+    from_tvs: [13217, 13381]
+  - side: ULMIX
+    from: 81a
+    tvs: [7365, 7469]
+  - side: BFW
+    from: 81a
+    tvs: 9401
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7365, 7469]
+    DLMIX:
+      tvs:
+      - main: [13217, 13321]
+      - additional: [13337, 13381]
+    BFW:
+      tvs: [9401]
+  config_cells: 15
+  full_cells: 6
+  compact_cells: 6
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 7395, 7440, 7455]
+  bfw_srs_bind:
+  - srs_tv: 21673
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9402
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9401
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21673
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9404
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9403
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21673
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9406
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9405
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+  overrides:
+  - base_pattern: 81.1
+    cell_idx: 0:14
+    tv: 13367
+    tv_increments: 1
+    slot: 23
+    tv_name_slot: 0
+    mix_tv: 2
+    target_dl: 1
+    verbose: 0
+- id: 81d
+  pattern: 81.4
+  description: 64TR 100 MHz 25-3 column B, 32-port CSI-RS plus 81b UL variant.
+  comment: '64TR 100 MHz 25-3 column B, 32-port CSI-RS plus 81b UL variant. POC2 64TR_nrSim_640 full_cells=1, compact_cells=1, config_cells=15, channel=channels_U. TV ranges: DLMIX
+    13217-13321, 13337-13381; ULMIX 7470-7574; BFW 9407. has S-slot TV config. has BFW/SRS binding config. has override TV mapping.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '81'
+    tvs: [13217, 13321]
+    from_tvs: [13217, 13381]
+  - side: DLMIX
+    from: '81'
+    tvs: [13337, 13381]
+    from_tvs: [13217, 13381]
+  - side: ULMIX
+    from: 81b
+    tvs: [7470, 7574]
+  - side: BFW
+    from: 81b
+    tvs: 9407
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7470, 7574]
+    DLMIX:
+      tvs:
+      - main: [13217, 13321]
+      - additional: [13337, 13381]
+    BFW:
+      tvs: [9407]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 64TR_nrSim_640
+  channel: channels_U
+  s_slot:
+    tv: [0, 7500, 7545, 7560]
+  bfw_srs_bind:
+  - srs_tv: 21693
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9408
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9407
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21693
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9410
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9409
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21693
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9412
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9411
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+  overrides:
+  - base_pattern: 81.2
+    cell_idx: 0:14
+    tv: 13367
+    tv_increments: 1
+    slot: 23
+    tv_name_slot: 0
+    mix_tv: 2
+    target_dl: 1
+    verbose: 0
+- id: '83'
+  pattern: 83
+  description: POC2 pattern 83.
+  comment: 'POC2 pattern 83. TV ranges: DLMIX 13382-13546.'
+  base_tv_only: true
+  ranges:
+    DLMIX:
+      tvs:
+      - main: [13382, 13546]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+- id: 83a
+  pattern: 83.1
+  description: 64TR 100 MHz 25-3 column G, 64 UEs, SRS in S slot, 4 symbols.
+  comment: '64TR 100 MHz 25-3 column G, 64 UEs, SRS in S slot, 4 symbols. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_S. TV ranges: DLMIX
+    13382-13531; ULMIX 7575-7679; BFW 9413. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '83'
+    tvs: [13382, 13531]
+    from_tvs: [13382, 13546]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7575, 7679]
+    DLMIX:
+      tvs:
+      - main: [13382, 13531]
+    BFW:
+      tvs: [9413]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 7605, 7650, 7665]
+  bfw_srs_bind:
+  - srs_tv: 21713
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9414
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9413
+    bfw_ul_slots: [3, 23, 43, 63]
+    cell_idx: []
+  - srs_tv: 21723
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 9416
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9415
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21713
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9418
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9417
+    bfw_ul_slots: [13, 33, 53, 73]
+    cell_idx: []
+  - srs_tv: 21723
+    srs_slot: 53
+    srs_name_slot: 13
+    bfw_dl_tv: []
+    bfw_dl_slots: []
+    bfw_ul_tv: 9419
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: 83b
+  pattern: 83.2
+  description: 64TR 100 MHz 25-3 column G, 64 UEs, SRS in U/U2 and S slot, 2 symbols.
+  comment: '64TR 100 MHz 25-3 column G, 64 UEs, SRS in U/U2 and S slot, 2 symbols. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_U. TV ranges:
+    DLMIX 13382-13531; ULMIX 7680-7784; BFW 9421. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '83'
+    tvs: [13382, 13531]
+    from_tvs: [13382, 13546]
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7680, 7784]
+    DLMIX:
+      tvs:
+      - main: [13382, 13531]
+    BFW:
+      tvs: [9421]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_U
+  s_slot:
+    tv: [0, 0, 7755, 7770]
+  bfw_srs_bind:
+  - srs_tv: 21733
+    srs_slot: [3, 43]
+    srs_name_slot: 3
+    bfw_dl_tv: 9422
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9421
+    bfw_ul_slots: [3, 23, 43, 63]
+    cell_idx: []
+  - srs_tv: 21734
+    srs_slot: [4, 44]
+    srs_name_slot: 4
+    bfw_dl_tv: 9424
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9423
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21735
+    srs_slot: [5, 45]
+    srs_name_slot: 5
+    bfw_dl_tv: 9426
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9425
+    bfw_ul_slots: [13, 33, 53, 73]
+    cell_idx: []
+  - srs_tv: 21743
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: []
+    bfw_dl_slots: []
+    bfw_ul_tv: 9427
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: 83c
+  pattern: 83.3
+  description: 64TR 100 MHz 25-3 column G, 32-port CSI-RS variant.
+  comment: '64TR 100 MHz 25-3 column G, 32-port CSI-RS variant. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_S. TV ranges: DLMIX 13382-13486,
+    13502-13546; ULMIX 7575-7679; BFW 9413. has S-slot TV config. has BFW/SRS binding config. has override TV mapping.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '83'
+    tvs: [13382, 13486]
+    from_tvs: [13382, 13546]
+  - side: DLMIX
+    from: '83'
+    tvs: [13502, 13546]
+    from_tvs: [13382, 13546]
+  - side: ULMIX
+    from: 83a
+    tvs: [7575, 7679]
+  - side: BFW
+    from: 83a
+    tvs: 9413
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7575, 7679]
+    DLMIX:
+      tvs:
+      - main: [13382, 13486]
+      - additional: [13502, 13546]
+    BFW:
+      tvs: [9413]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 7605, 7650, 7665]
+  bfw_srs_bind:
+  - srs_tv: 21713
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9414
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9413
+    bfw_ul_slots: [3, 23, 43, 63]
+    cell_idx: []
+  - srs_tv: 21723
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 9416
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9415
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21713
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9418
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9417
+    bfw_ul_slots: [13, 33, 53, 73]
+    cell_idx: []
+  - srs_tv: 21723
+    srs_slot: 53
+    srs_name_slot: 13
+    bfw_dl_tv: []
+    bfw_dl_slots: []
+    bfw_ul_tv: 9419
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+  overrides:
+  - base_pattern: 83.1
+    cell_idx: 0:14
+    tv: 13532
+    tv_increments: 1
+    slot: 23
+    tv_name_slot: 0
+    mix_tv: 2
+    target_dl: 1
+    verbose: 0
+- id: 83d
+  pattern: 83.4
+  description: 64TR 100 MHz 25-3 column G, 32-port CSI-RS plus 83b UL variant.
+  comment: '64TR 100 MHz 25-3 column G, 32-port CSI-RS plus 83b UL variant. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_U. TV ranges: DLMIX
+    13382-13486, 13502-13546; ULMIX 7680-7784; BFW 9421. has S-slot TV config. has BFW/SRS binding config. has override TV mapping.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '83'
+    tvs: [13382, 13486]
+    from_tvs: [13382, 13546]
+  - side: DLMIX
+    from: '83'
+    tvs: [13502, 13546]
+    from_tvs: [13382, 13546]
+  - side: ULMIX
+    from: 83b
+    tvs: [7680, 7784]
+  - side: BFW
+    from: 83b
+    tvs: 9421
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7680, 7784]
+    DLMIX:
+      tvs:
+      - main: [13382, 13486]
+      - additional: [13502, 13546]
+    BFW:
+      tvs: [9421]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_U
+  s_slot:
+    tv: [0, 0, 7755, 7770]
+  bfw_srs_bind:
+  - srs_tv: 21733
+    srs_slot: [3, 43]
+    srs_name_slot: 3
+    bfw_dl_tv: 9422
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9421
+    bfw_ul_slots: [3, 23, 43, 63]
+    cell_idx: []
+  - srs_tv: 21734
+    srs_slot: [4, 44]
+    srs_name_slot: 4
+    bfw_dl_tv: 9424
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9423
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21735
+    srs_slot: [5, 45]
+    srs_name_slot: 5
+    bfw_dl_tv: 9426
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9425
+    bfw_ul_slots: [13, 33, 53, 73]
+    cell_idx: []
+  - srs_tv: 21743
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: []
+    bfw_dl_slots: []
+    bfw_ul_tv: 9427
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+  overrides:
+  - base_pattern: 83.2
+    cell_idx: 0:14
+    tv: 13532
+    tv_increments: 1
+    slot: 23
+    tv_name_slot: 0
+    mix_tv: 2
+    target_dl: 1
+    verbose: 0
+- id: '85'
+  pattern: 85
+  description: 64TR 100 MHz 25-3 column E mixed PUCCH pattern.
+  comment: '64TR 100 MHz 25-3 column E mixed PUCCH pattern. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_S. TV ranges: DLMIX 13547-13696;
+    ULMIX 7785-7889; BFW 9461. has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7785, 7889]
+    DLMIX:
+      tvs:
+      - main: [13547, 13696]
+    BFW:
+      tvs: [9461]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 0, 7860, 7875]
+  bfw_srs_bind:
+  - srs_tv: 21753
+    srs_slot: [3, 43]
+    srs_name_slot: 3
+    bfw_dl_tv: 9462
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9461
+    bfw_ul_slots: [3, 23, 43, 63]
+    cell_idx: []
+  - srs_tv: 21753
+    srs_slot: [4, 44]
+    srs_name_slot: 3
+    bfw_dl_tv: 9464
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9463
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21763
+    srs_slot: [5, 45]
+    srs_name_slot: 13
+    bfw_dl_tv: 9466
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9465
+    bfw_ul_slots: [13, 33, 53, 73]
+    cell_idx: []
+  - srs_tv: 21763
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: []
+    bfw_dl_slots: []
+    bfw_ul_tv: 9467
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: '87'
+  pattern: 87
+  description: 64TR 100 MHz Phase 4 column B with 32-port CSI-RS reuse.
+  comment: '64TR 100 MHz Phase 4 column B with 32-port CSI-RS reuse. POC2 64TR_nrSim_640 full_cells=1, compact_cells=1, config_cells=15, channel=channels_S. TV ranges: DLMIX 13067-13171,
+    13187-13216, 13697-13711; ULMIX 7155-7259; BFW 9391. has S-slot TV config. has BFW/SRS binding config. has override TV mapping.'
+  genperf: true
+  reuses:
+  - side: DLMIX
+    from: '79'
+    tvs: [13067, 13171]
+    from_tvs: [13067, 13216]
+  - side: DLMIX
+    from: '79'
+    tvs: [13187, 13216]
+    from_tvs: [13067, 13216]
+  - side: ULMIX
+    from: '79'
+    tvs: [7155, 7259]
+  - side: BFW
+    from: '79'
+    tvs: 9391
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7155, 7259]
+    DLMIX:
+      tvs:
+      - main: [13067, 13171]
+      - additional: [13187, 13216]
+      - additional: [13697, 13711]
+      command_expr: setdiff([13067:13216 13697:13711], 13172:13186)
+    BFW:
+      tvs: [9391]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 1
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 7185, 7230, 7245]
+  bfw_srs_bind:
+  - srs_tv: 21643
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9392
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9391
+    bfw_ul_slots: [3, 13, 23, 33, 43, 53, 63, 73]
+    cell_idx: []
+  - srs_tv: 21643
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9394
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9393
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21643
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9396
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9395
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+  overrides:
+  - base_pattern: 79
+    cell_idx: 0:14
+    tv: 13697
+    tv_increments: 1
+    slot: 23
+    tv_name_slot: 0
+    mix_tv: 2
+    target_dl: 1
+    verbose: 0
+- id: '89'
+  pattern: 89
+  description: 64TR mixed 100/90/60 MHz realistic traffic pattern.
+  comment: '64TR mixed 100/90/60 MHz realistic traffic pattern. POC2 64TR_nrSim_640 full_cells=9, compact_cells=9, config_cells=9, channel=channels_S. TV ranges: DLMIX 13712-13801;
+    ULMIX 7890-7952; BFW 9449, 9455, 9469, 9475, .... has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [7890, 7952]
+    DLMIX:
+      tvs:
+      - main: [13712, 13801]
+    BFW:
+      tvs: [9449, 9455, 9469, 9475, 9481, 9487]
+  config_cells: 9
+  full_cells: 9
+  compact_cells: 9
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 0, 7935, 7944]
+  bfw_srs_bind:
+  - srs_tv: 21793
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9450
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9449
+    bfw_ul_slots: 3:10:73
+    cell_idx: [0]
+  - srs_tv: 21793
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9452
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9451
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: [0]
+  - srs_tv: 21803
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: 9454
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9453
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: [0]
+  - srs_tv: 21813
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9456
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9455
+    bfw_ul_slots: 3:10:73
+    cell_idx: [1, 2]
+  - srs_tv: 21813
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9458
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9457
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: [1, 2]
+  - srs_tv: 21823
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: 9460
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9459
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: [1, 2]
+  - srs_tv: 21833
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9470
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9469
+    bfw_ul_slots: 3:10:73
+    cell_idx: [3]
+  - srs_tv: 21833
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9472
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9471
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: [3]
+  - srs_tv: 21843
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: 9474
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9473
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: [3]
+  - srs_tv: 21853
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9476
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9475
+    bfw_ul_slots: 3:10:73
+    cell_idx: [4, 5]
+  - srs_tv: 21853
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9478
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9477
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: [4, 5]
+  - srs_tv: 21863
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: 9480
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9479
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: [4, 5]
+  - srs_tv: 21873
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9482
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9481
+    bfw_ul_slots: 3:10:73
+    cell_idx: [6]
+  - srs_tv: 21873
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9484
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9483
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: [6]
+  - srs_tv: 21883
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: 9486
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9485
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: [6]
+  - srs_tv: 21893
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9488
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9487
+    bfw_ul_slots: 3:10:73
+    cell_idx: [7, 8]
+  - srs_tv: 21893
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9490
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9489
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: [7, 8]
+  - srs_tv: 21903
+    srs_slot: [13, 53]
+    srs_name_slot: 13
+    bfw_dl_tv: 9492
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9491
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: [7, 8]
+- id: '91'
+  pattern: 91
+  description: 64TR 100 MHz pattern 91.
+  comment: '64TR 100 MHz pattern 91. POC2 64TR_nrSim_640 full_cells=1, compact_cells=0, config_cells=15, channel=channels_S. TV ranges: DLMIX 13802-13951; ULMIX 8163-8267; BFW 9461.
+    has S-slot TV config. has BFW/SRS binding config.'
+  genperf: true
+  reuses:
+  - side: BFW
+    from: '85'
+    tvs: 9461
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [8163, 8267]
+    DLMIX:
+      tvs:
+      - main: [13802, 13951]
+    BFW:
+      tvs: [9461]
+  config_cells: 15
+  full_cells: 1
+  compact_cells: 0
+  pattern_type: 64TR_nrSim_640
+  channel: channels_S
+  s_slot:
+    tv: [0, 0, 8238, 8253]
+  bfw_srs_bind:
+  - srs_tv: 21753
+    srs_slot: 3
+    srs_name_slot: 3
+    bfw_dl_tv: 9494
+    bfw_dl_slots: [39, 79]
+    bfw_ul_tv: 9493
+    bfw_ul_slots: [3, 23, 43, 63]
+    cell_idx: []
+  - srs_tv: 21753
+    srs_slot: 43
+    srs_name_slot: 3
+    bfw_dl_tv: 9496
+    bfw_dl_slots: 0:2,5:8,10:12,15:21,25:32,35:38,40:42,45:48,50:52,55:62,65:72,75:78
+    bfw_ul_tv: 9495
+    bfw_ul_slots: [4, 24, 44, 64]
+    cell_idx: []
+  - srs_tv: 21763
+    srs_slot: 13
+    srs_name_slot: 13
+    bfw_dl_tv: 9498
+    bfw_dl_slots: [9, 49]
+    bfw_ul_tv: 9497
+    bfw_ul_slots: [13, 33, 53, 73]
+    cell_idx: []
+  - srs_tv: 21763
+    srs_slot: 53
+    srs_name_slot: 13
+    bfw_dl_tv: []
+    bfw_dl_slots: []
+    bfw_ul_tv: 9499
+    bfw_ul_slots: [14, 34, 54, 74]
+    cell_idx: []
+- id: '201'
+  pattern: 201
+  description: 64TR 100 MHz pattern 201.
+  comment: '64TR 100 MHz pattern 201. POC2 4TR_pusch_prach full_cells=6, compact_cells=6, config_cells=15, channel=channels_V. TV ranges: DLMIX 13952-13966; ULMIX 8652-8711.'
+  genperf: true
+  ranges:
+    ULMIX:
+      tvs:
+      - main: [8652, 8711]
+    DLMIX:
+      tvs:
+      - main: [13952, 13966]
+  config_cells: 15
+  full_cells: 6
+  compact_cells: 6
+  pattern_type: 4TR_pusch_prach
+  channel: channels_V

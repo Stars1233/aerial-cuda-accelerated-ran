@@ -17,16 +17,17 @@
 
 """Server version verification script.
 
-This script verifies that the current machine matches the versions specified
-in a manifest CSV file.
+This script verifies that the current machine matches expected versions from
+either a manifest CSV file or cuPHY-CP/container/versions.sh.
 """
 
 import argparse
 import csv
+import os
 import re
 import subprocess
 import sys
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 
 # Mapping of component names to their version check commands
@@ -60,8 +61,8 @@ VERSION_COMMANDS: Dict[str, str] = {
     # Copy-paste: ptp4l -v 2>&1 | head -1
     "PTP4L": "ptp4l -v 2>&1 | head -1",
     
-    # Copy-paste: modinfo gdrdrv 2>/dev/null | grep ^version | awk '{print $2}'
-    "GDRCOPY": "modinfo gdrdrv 2>/dev/null | grep ^version | awk '{print $2}'",
+    # Copy-paste: dpkg -l gdrdrv-dkms 2>/dev/null | awk 'END{print $3}'
+    "GDRCOPY": "dpkg -l gdrdrv-dkms 2>/dev/null | awk 'END{print $3}'",
     
     # Copy-paste: cat /sys/class/net/aerial00/device/infiniband/*/fw_ver 2>/dev/null
     "BlueField FW": "cat /sys/class/net/aerial00/device/infiniband/*/fw_ver 2>/dev/null",
@@ -78,6 +79,21 @@ VERSION_COMMANDS: Dict[str, str] = {
     # Copy-paste: nvidia-ctk --version 2>/dev/null | head -1 | awk '{print $NF}'
     "Container Toolkit": "nvidia-ctk --version 2>/dev/null | head -1 | awk '{print $NF}'",
 }
+
+
+VERSION_SH_KEYS = [
+    "PLATFORM",
+    "KERNEL_VERSION",
+    "UBUNTU_VERSION",
+    "GPU_DRIVER_VERSION",
+    "CUDA_VERSION",
+    "DOCA_OFED_VERSION",
+    "LINUXPTP_VERSION",
+    "GDRDRV_VERSION",
+    "NVIDIA_CONTAINER_TOOLKIT_VERSION",
+    "HUGEPAGES",
+    "ISOLCPUS",
+]
 
 
 def get_version(component: str) -> Optional[str]:
@@ -107,6 +123,141 @@ def get_version(component: str) -> Optional[str]:
         return None
     except (subprocess.TimeoutExpired, subprocess.SubprocessError):
         return None
+
+
+def normalize_ubuntu_version(version: str) -> str:
+    """Normalize versions.sh Ubuntu labels to lsb_release output."""
+    if not version.startswith("ubuntu"):
+        return version
+
+    value = version.removeprefix("ubuntu").replace("_", "")
+    if re.fullmatch(r"\d{4}", value):
+        return f"{value[:2]}.{value[2:]}"
+    return value
+
+
+def normalize_cuda_version(version: str) -> str:
+    """Normalize CUDA installer version to nvidia-smi CUDA display format."""
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if not match:
+        return version
+    return f"{match.group(1)}.{match.group(2)}"
+
+
+def normalize_doca_ofed_version(version: str) -> str:
+    """Normalize versions.sh DOCA OFED label to ofed_info output format."""
+    return version.removeprefix("OFED-internal-")
+
+
+def build_expected_cmdline(values: Dict[str, str]) -> Optional[str]:
+    """Build the expected kernel cmdline from versions.sh values."""
+    kernel = values.get("KERNEL_VERSION", "")
+    hugepages = values.get("HUGEPAGES", "")
+    isolcpus = values.get("ISOLCPUS", "")
+    platform = values.get("PLATFORM", "")
+
+    if not kernel or not hugepages or not isolcpus:
+        return None
+
+    prefix = f"BOOT_IMAGE=/vmlinuz-{kernel} root=/dev/mapper/ubuntu--vg-ubuntu--lv ro"
+    if platform == "SMC-GraceHopper":
+        params = (
+            "pci=realloc=off pci=pcie_bus_safe default_hugepagesz=512M "
+            f"hugepagesz=512M hugepages={hugepages} tsc=reliable "
+            "processor.max_cstate=0 audit=0 idle=poll rcu_nocb_poll "
+            "nosoftlockup irqaffinity=0 "
+            f"isolcpus=managed_irq,domain,{isolcpus} nohz_full={isolcpus} "
+            f"rcu_nocbs={isolcpus} earlycon module_blacklist=nouveau "
+            "acpi_power_meter.force_cap_on=y numa_balancing=disable "
+            "init_on_alloc=0 preempt=none"
+        )
+    else:
+        params = (
+            f"pci=realloc=off default_hugepagesz=1G hugepagesz=1G "
+            f"hugepages={hugepages} tsc=reliable processor.max_cstate=0 "
+            "audit=0 idle=poll rcu_nocb_poll nosoftlockup irqaffinity=0-3 "
+            f"isolcpus=managed_irq,domain,{isolcpus} "
+            f"nohz_full={isolcpus} rcu_nocbs={isolcpus} earlycon "
+            "module_blacklist=nouveau acpi_power_meter.force_cap_on=y "
+            "init_on_alloc=0 preempt=none"
+        )
+
+    return f"{prefix} {params}"
+
+
+def source_versions_sh(versions_sh: str, platform: Optional[str] = None) -> Dict[str, str]:
+    """Source versions.sh in bash and return selected variables."""
+    if not os.path.isfile(versions_sh):
+        raise FileNotFoundError(f"versions.sh file '{versions_sh}' not found")
+
+    env = os.environ.copy()
+    if platform:
+        env["PLATFORM"] = platform
+
+    bash_script = """
+set -e
+source "$1"
+shift
+for key in "$@"; do
+    printf '__AERIAL_VERSION__%s=%s\\n' "$key" "${!key-}"
+done
+"""
+    proc = subprocess.run(
+        ["bash", "-c", bash_script, "server_version_check", versions_sh, *VERSION_SH_KEYS],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        env=env,
+        timeout=20,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip())
+
+    values: Dict[str, str] = {}
+    prefix = "__AERIAL_VERSION__"
+    for line in proc.stdout.splitlines():
+        if not line.startswith(prefix):
+            continue
+        key, value = line[len(prefix):].split("=", 1)
+        values[key] = value
+    return values
+
+
+def load_expected_rows_from_versions_sh(
+    versions_sh: str,
+    platform: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Load expected component rows from cuPHY-CP/container/versions.sh."""
+    values = source_versions_sh(versions_sh, platform=platform)
+
+    component_values = [
+        ("Ubuntu", normalize_ubuntu_version(values.get("UBUNTU_VERSION", "")), "n"),
+        ("Kernel", values.get("KERNEL_VERSION", ""), "n"),
+        ("GPU Driver", values.get("GPU_DRIVER_VERSION", ""), "n"),
+        ("CUDA", normalize_cuda_version(values.get("CUDA_VERSION", "")), "n"),
+        ("DOCA OFED", normalize_doca_ofed_version(values.get("DOCA_OFED_VERSION", "")), "n"),
+        ("PTP4L", values.get("LINUXPTP_VERSION", ""), "n"),
+        ("Container Toolkit", values.get("NVIDIA_CONTAINER_TOOLKIT_VERSION", ""), "y"),
+    ]
+
+    # The host installer deliberately skips GDRCopy on DGX Spark.
+    if values.get("PLATFORM") != "DGX-Spark":
+        component_values.append(("GDRCOPY", values.get("GDRDRV_VERSION", ""), "n"))
+
+    cmdline = build_expected_cmdline(values)
+    if cmdline:
+        component_values.append(("Cmdline", cmdline, "n"))
+
+    rows = []
+    for component, version, optional in component_values:
+        if not version:
+            continue
+        rows.append({
+            "component": component,
+            "version": version,
+            "optional": optional,
+        })
+    return rows
 
 
 def parse_cmdline_params(cmdline: str) -> Set[str]:
@@ -394,100 +545,75 @@ def list_components():
     print("\nNote: Kernel component is required and must match a version in the manifest")
 
 
-def check_versions(manifest_file: str) -> bool:
-    """Check versions against manifest file.
-    
-    Args:
-        manifest_file: Path to the CSV manifest file
-        
-    Returns:
-        True if all required versions match, False otherwise
-    """
+def check_expected_versions(
+    rows: List[Dict[str, str]],
+    system_type: str,
+    system_versions: Optional[Dict[str, Optional[str]]] = None,
+) -> bool:
+    """Check collected system versions against expected component rows."""
     results = []
     all_required_pass = True
     has_invalid_components = False
     cmdline_diff = None
     failed_components = []
-    
-    # Detect system type based on kernel version in manifest
-    system_type = detect_system_type(manifest_file)
-    
-    # Collect all system versions once
-    system_versions = collect_system_versions()
-    
-    # Read and process manifest
-    try:
-        with open(manifest_file, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                # Skip rows that don't match our system type
-                if 'system_type' in row and row['system_type'] != system_type:
-                    continue
-                
-                name = row['component']
-                expected = row['version']
-                optional = row['optional'].lower() == 'y'
-                
-                # Get actual version from collected data
-                actual = system_versions.get(name)
-                
-                # For Cmdline, strip out the root= parameter before comparing
-                # since it's system-specific (different volume group names)
-                if name == "Cmdline" and actual:
-                    # Remove root=... parameter from both
-                    actual_compare = re.sub(r'root=\S+\s*', '', actual)
-                    expected_compare = re.sub(r'root=\S+\s*', '', expected)
-                else:
-                    actual_compare = actual
-                    expected_compare = expected
-                
-                # Check if versions match
-                if actual is None:
-                    status = "FAIL"
-                    passed = False
-                    has_invalid_components = True
-                elif actual_compare == expected_compare:
-                    status = "PASS"
-                    passed = True
-                else:
-                    status = "FAIL"
-                    passed = False
-                    # Store cmdline diff for later display
-                    if name == "Cmdline" and actual:
-                        cmdline_diff = get_cmdline_diff(expected, actual)
-                
-                # Track overall status and failures
-                if not optional and not passed:
-                    all_required_pass = False
-                    failed_components.append(name)
-                
-                # Truncate long values for display
-                if name == "Cmdline":
-                    expected_display = expected[:30] + "..." if len(expected) > 33 else expected
-                    actual_display = actual[:30] + "..." if actual and len(actual) > 33 else (actual if actual else 'Invalid Component')
-                else:
-                    expected_display = expected
-                    actual_display = actual if actual else 'Invalid Component'
-                
-                results.append({
-                    'name': name,
-                    'expected': expected_display,
-                    'actual': actual_display,
-                    'optional': optional,
-                    'status': status,
-                    'passed': passed
-                })
-    
-    except FileNotFoundError:
-        print(f"Error: Manifest file '{manifest_file}' not found")
-        return False
-    except KeyError as e:
-        print(f"Invalid CSV format. Expected columns: system_type, component, version, optional")
-        print(f"Missing column: {e}")
-        return False
-    except Exception as e:
-        print(f"Error reading manifest: {e}")
-        return False
+
+    if system_versions is None:
+        system_versions = collect_system_versions()
+
+    for row in rows:
+        name = row['component']
+        expected = row['version']
+        optional = row.get('optional', 'n').lower() == 'y'
+
+        # Get actual version from collected data
+        actual = system_versions.get(name)
+
+        # For Cmdline, strip machine-specific boot and root paths before comparing.
+        # The kernel version is validated separately by the Kernel component.
+        if name == "Cmdline" and actual:
+            cmdline_path_pattern = r'(?:BOOT_IMAGE|root)=\S+\s*'
+            actual_compare = re.sub(cmdline_path_pattern, '', actual)
+            expected_compare = re.sub(cmdline_path_pattern, '', expected)
+        else:
+            actual_compare = actual
+            expected_compare = expected
+
+        # Check if versions match
+        if actual is None:
+            status = "FAIL"
+            passed = False
+            has_invalid_components = True
+        elif actual_compare == expected_compare:
+            status = "PASS"
+            passed = True
+        else:
+            status = "FAIL"
+            passed = False
+            # Store cmdline diff for later display
+            if name == "Cmdline" and actual:
+                cmdline_diff = get_cmdline_diff(expected, actual)
+
+        # Track overall status and failures
+        if not optional and not passed:
+            all_required_pass = False
+            failed_components.append(name)
+
+        # Truncate long values for display
+        if name == "Cmdline":
+            expected_display = expected[:30] + "..." if len(expected) > 33 else expected
+            actual_display = actual[:30] + "..." if actual and len(actual) > 33 else (actual if actual else 'Invalid Component')
+        else:
+            expected_display = expected
+            actual_display = actual if actual else 'Invalid Component'
+
+        results.append({
+            'name': name,
+            'expected': expected_display,
+            'actual': actual_display,
+            'optional': optional,
+            'status': status,
+            'passed': passed
+        })
     
     # Display results
     print(f"\nDetected System Type: {system_type}")
@@ -536,6 +662,55 @@ def check_versions(manifest_file: str) -> bool:
         print(f"\nVERSION_FAILURES: {', '.join(failed_components)}")
     
     return all_required_pass
+
+
+def check_versions(manifest_file: str) -> bool:
+    """Check versions against manifest file.
+
+    Args:
+        manifest_file: Path to the CSV manifest file
+
+    Returns:
+        True if all required versions match, False otherwise
+    """
+    # Detect system type based on kernel version in manifest
+    system_type = detect_system_type(manifest_file)
+
+    # Read and process manifest
+    try:
+        rows = []
+        with open(manifest_file, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Skip rows that don't match our system type
+                if 'system_type' in row and row['system_type'] != system_type:
+                    continue
+                rows.append(row)
+    except FileNotFoundError:
+        print(f"Error: Manifest file '{manifest_file}' not found")
+        return False
+    except KeyError as e:
+        print("Invalid CSV format. Expected columns: system_type, component, version, optional")
+        print(f"Missing column: {e}")
+        return False
+    except (csv.Error, UnicodeDecodeError) as e:
+        print(f"Error reading manifest: {e}")
+        return False
+
+    return check_expected_versions(rows, system_type)
+
+
+def check_versions_from_versions_sh(versions_sh: str, platform: Optional[str] = None) -> bool:
+    """Check versions against expected values from cuPHY-CP/container/versions.sh."""
+    try:
+        rows = load_expected_rows_from_versions_sh(versions_sh, platform=platform)
+    except (FileNotFoundError, RuntimeError, subprocess.TimeoutExpired) as e:
+        print(f"Error reading versions.sh: {e}")
+        return False
+
+    system_versions = collect_system_versions()
+    system_type = auto_detect_system_type(system_versions)
+    return check_expected_versions(rows, system_type, system_versions=system_versions)
 
 
 def check_service_health() -> bool:
@@ -696,7 +871,7 @@ def generate_manifest(output_file: str, system_type: Optional[str] = None) -> bo
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description='Verify server versions against a manifest file or generate a new manifest'
+        description='Verify server versions against a manifest CSV or cuPHY-CP/container/versions.sh'
     )
     parser.add_argument(
         'manifest',
@@ -713,6 +888,15 @@ def main():
         metavar='FILE',
         help='Generate a manifest CSV file from the current system (auto-detects system type)'
     )
+    parser.add_argument(
+        '--versions-sh',
+        metavar='FILE',
+        help='Path to cuPHY-CP/container/versions.sh to use as the expected version source'
+    )
+    parser.add_argument(
+        '--platform',
+        help='Optional PLATFORM override when sourcing versions.sh'
+    )
     
     args = parser.parse_args()
     
@@ -723,14 +907,25 @@ def main():
     
     # Handle manifest generation
     if args.output:
+        if args.versions_sh:
+            parser.error('--output cannot be combined with --versions-sh')
         success = generate_manifest(args.output)
         sys.exit(0 if success else 1)
     
+    if args.versions_sh and args.manifest:
+        parser.error('use either a CSV manifest or --versions-sh, not both')
+
     # Manifest file is required if not listing or generating
-    if not args.manifest:
-        parser.error('manifest file is required unless using -l/--list or -o/--output')
-    
-    version_check_passed = check_versions(args.manifest)
+    if args.versions_sh:
+        version_check_passed = check_versions_from_versions_sh(
+            args.versions_sh,
+            platform=args.platform,
+        )
+    elif args.manifest:
+        version_check_passed = check_versions(args.manifest)
+    else:
+        parser.error('manifest file or --versions-sh is required unless using -l/--list or -o/--output')
+
     service_health_passed = check_service_health()
     
     # Overall result
@@ -748,4 +943,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

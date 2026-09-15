@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,10 @@
  */
 
 #include "scf_5g_fapi_ul_validate.hpp"
+
+#include "aerial/casts/casts.hpp"
+
+#include <cstddef>
 
 #define TAG (NVLOG_TAG_BASE_SCF_L2_ADAPTER + 9) // "SCF.UL_FAPI_VALIDATE"
 
@@ -190,7 +194,7 @@ static int validate_srs_pdu(scf_fapi_srs_pdu_t& srs_pdu)
     }
 #ifdef SCF_FAPI_10_04_SRS
     uint8_t* next = &srs_pdu.payload[0];
-    scs_fapi_v4_srs_params_t* srs_v4_parms = reinterpret_cast<scs_fapi_v4_srs_params_t*>(next);
+    scs_fapi_v4_srs_params_t* srs_v4_parms = aerial::casts::assume_cast<scs_fapi_v4_srs_params_t>(next);
     if((srs_v4_parms->srs_bw_size < 4)||(srs_v4_parms->srs_bw_size > 272))
     {
         NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "SRS V4 PDU srs_bw_size {} out of range", static_cast<uint16_t>(srs_v4_parms->srs_bw_size));
@@ -680,13 +684,22 @@ int validate_ul_dl_bfw_cvi_req(scf_fapi_ul_bfw_cvi_request_t& msg, uint8_t is_ul
             NVLOGD_FMT(TAG, "Validating PHY_DL_BFW_CVI_REQUEST received with NUMBER of DL PDU ={}", num_pdu_rx);
         }
 
-        uint offset = 0;
+        std::size_t offset = 0;
         uint8_t ueIdx = 0;
         uint8_t ueAntIdx = 0;
 
         for (uint i = 0 ; i < num_pdu_rx; i++)
         {
             auto &bfw_msg = *(reinterpret_cast<scf_fapi_ul_bfw_group_config_t*>(data + offset));
+            constexpr std::size_t bfw_msg_fixed_bytes = sizeof(scf_fapi_ul_bfw_group_config_t);
+            const uint16_t bfw_pdu_size = bfw_msg.pdu_size;
+            if (bfw_pdu_size < bfw_msg_fixed_bytes)
+            {
+                NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                           "BFW PDU pdu_size {} smaller than fixed header {}",
+                           bfw_pdu_size, bfw_msg_fixed_bytes);
+                return INVALID_FAPI_PDU;
+            }
 
             if(bfw_msg.dl_bfw_cvi_config.rb_start > 274)
             {
@@ -719,10 +732,28 @@ int validate_ul_dl_bfw_cvi_req(scf_fapi_ul_bfw_cvi_request_t& msg, uint8_t is_ul
             }
 
             uint8_t* next = &bfw_msg.dl_bfw_cvi_config.payload[0];
+            std::size_t remaining_bytes = static_cast<std::size_t>(bfw_pdu_size) - bfw_msg_fixed_bytes;
 
             for(ueIdx = 0; ueIdx < bfw_msg.dl_bfw_cvi_config.nUes; ueIdx++)
             {
+                if (remaining_bytes < sizeof(scf_dl_bfw_config_start_t))
+                {
+                    NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                               "BFW PDU ue[{}] header truncated, remaining={} required={}",
+                               ueIdx, remaining_bytes, sizeof(scf_dl_bfw_config_start_t));
+                    return INVALID_FAPI_PDU;
+                }
                 scf_dl_bfw_config_start_t& bfw_config_start  = *reinterpret_cast<scf_dl_bfw_config_start_t*>(next);
+                const std::size_t ue_config_bytes =
+                    sizeof(scf_dl_bfw_config_start_t) + static_cast<std::size_t>(bfw_config_start.num_ue_ants);
+                if (remaining_bytes < ue_config_bytes)
+                {
+                    NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT,
+                               "BFW PDU ue[{}] payload truncated, remaining={} required={} num_ue_ants={}",
+                               ueIdx, remaining_bytes, ue_config_bytes,
+                               static_cast<uint8_t>(bfw_config_start.num_ue_ants));
+                    return INVALID_FAPI_PDU;
+                }
 
                 if(bfw_config_start.rnti > 65535)
                 {
@@ -762,8 +793,10 @@ int validate_ul_dl_bfw_cvi_req(scf_fapi_ul_bfw_cvi_request_t& msg, uint8_t is_ul
                         return INVALID_FAPI_PDU;
                     }
                 }
+                next += ue_config_bytes;
+                remaining_bytes -= ue_config_bytes;
             }
-            offset = bfw_msg.pdu_size;
+            offset += bfw_pdu_size;
         }
     }
     return ret;

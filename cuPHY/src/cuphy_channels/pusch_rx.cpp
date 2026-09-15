@@ -16,13 +16,17 @@
  */
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include "pusch_rx.hpp"
 #include "pusch_utils.hpp"
+#include "channel_eq/channel_eq.hpp"
+#include "channel_eq/dft_s_ofdm_bluestein_workspace.hpp"
 #include "cuphy.hpp"
 #include "cuphy_api.h"
 #include "util.hpp"
 #include "utils.cuh"
+#include "ldpc/ldpc_params.hpp"
 #include "convert_tensor.cuh"
 #include "cuphy_utils.hpp"
 
@@ -33,12 +37,24 @@
 #include "ch_est/ch_est_utils.hpp"
 
 #include "pucch_receiver/rm_decoder.hpp"
+#include "polar_decoder/polar_cw_tree_layout.hpp"
 #include "cfo_ta_est/cfo_ta_est.hpp"
 #include "pusch_noise_intf_est/pusch_noise_intf_est.hpp"
 #include "channel_eq/channel_eq.hpp"
 #include "crc/crc_decode.hpp"
 // #include "graph_group_count.h"
 // #define USE_NVTX 1
+
+namespace {
+
+void* alignPointer(void* ptr, size_t alignment)
+{
+    const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+    const auto aligned = (addr + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+    return reinterpret_cast<void*>(aligned);
+}
+
+} // namespace
 
 //#define CUPHY_MEMTRACE //FIXME uncomment to enable memtrace in standalone cuPHY runs.
 //Note that a call to memtrace_set_config(0) will disable mem. tracing on that thread until reenabled
@@ -127,6 +143,10 @@ void PuschRx::allocateDescr()
     {
         throw cuphy::cuphy_fn_exception(status, "cuphyPuschRxRateMatchGetDescrInfo()");
     }
+    const auto earlyRateMatchDescrInfo = getEarlyRateMatchDescrInfo(
+        m_useCbLdpc, pDynDescrSizeBytes[PUSCH_RATE_MATCH], pDynDescrAlignBytes[PUSCH_RATE_MATCH]);
+    pDynDescrSizeBytes[PUSCH_RATE_MATCH_EARLY]  = earlyRateMatchDescrInfo.sizeBytes;
+    pDynDescrAlignBytes[PUSCH_RATE_MATCH_EARLY] = earlyRateMatchDescrInfo.alignBytes;
 
     status = cuphyPuschRxCrcDecodeGetDescrInfo(&pDynDescrSizeBytes[PUSCH_CRC], &pDynDescrAlignBytes[PUSCH_CRC]);
     if(CUPHY_STATUS_SUCCESS != status)
@@ -584,14 +604,27 @@ void PuschRx::createComponents(cudaStream_t cuStrm,
 
     if(m_chEstSettings.enableDftSOfdm==1)
     {
+        const auto bluesteinWsDims = cuphy::getDftSOfdmBluesteinWorkspaceDims(m_cuphyPuschStatPrms.nMaxPrb);
+
         m_LinearAllocBluesteinWorkspace.reset();
-        m_tRefBluesteinWorkspaceTime.desc().set(CUPHY_C_32F, 53, FFT8192, cuphy::tensor_flags::align_tight);
+        m_tRefBluesteinWorkspaceTime.desc().set(CUPHY_C_32F,
+                                              static_cast<int>(bluesteinWsDims.numRows),
+                                              static_cast<int>(bluesteinWsDims.fftWidth),
+                                              cuphy::tensor_flags::align_tight);
         m_LinearAllocBluesteinWorkspace.alloc(m_tRefBluesteinWorkspaceTime);
         copyTensorRef2Info(m_tRefBluesteinWorkspaceTime, tInfoDftBluesteinWorkspaceTime);
 
-        m_tRefBluesteinWorkspaceFreq.desc().set(CUPHY_C_32F, 53, FFT8192, cuphy::tensor_flags::align_tight);
+        m_tRefBluesteinWorkspaceFreq.desc().set(CUPHY_C_32F,
+                                                static_cast<int>(bluesteinWsDims.numRows),
+                                                static_cast<int>(bluesteinWsDims.fftWidth),
+                                                cuphy::tensor_flags::align_tight);
         m_LinearAllocBluesteinWorkspace.alloc(m_tRefBluesteinWorkspaceFreq);
         copyTensorRef2Info(m_tRefBluesteinWorkspaceFreq, tInfoDftBluesteinWorkspaceFreq);
+
+        auto* pIdftStatDescrCpu = reinterpret_cast<channel_eq::puschRxChEqIdftStatDescr_t*>(
+            static_cast<void*>(statCpuDescrStartAddrs[PUSCH_CH_EQ_IDFT]));
+        pIdftStatDescrCpu->nBluesteinWorkspaceRows    = static_cast<uint16_t>(bluesteinWsDims.numRows);
+        pIdftStatDescrCpu->bluesteinWorkspaceFftWidth = static_cast<uint16_t>(bluesteinWsDims.fftWidth);
 
         if(!m_cudaDeviceArchInfo.cuPHYSupported)
         {
@@ -922,10 +955,11 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     m_enableCsiP2Fapiv3(pStatPrms->enableCsiP2Fapiv3),
     m_polDcdrListSz(pStatPrms->polarDcdrListSz),
     m_ldpcWorkspaceSize(0),
-    m_LDPCdecoder(m_ctx),
-    m_ldpcStreamPool(0),
+    m_useCbLdpc(pStatPrms->useCbLdpcDecoder != 0),
+    m_ldpcState(pStatPrms->useCbLdpcDecoder
+        ? std::variant<TbLdpcState, CbLdpcState>(std::in_place_type<CbLdpcState>)
+        : std::variant<TbLdpcState, CbLdpcState>(std::in_place_type<TbLdpcState>, m_ctx, pStatPrms->nMaxTbPerNode)),
     m_LDPCkernelLaunchMode(pStatPrms->ldpcKernelLaunch),
-    m_LDPCDecodeDescSet(pStatPrms->nMaxTbPerNode),
     m_kernelStatDescr("PuschStatDescr"),
     m_kernelDynDescr("PuschDynDescr"),
     m_earlyHarqModeEnabled(true),
@@ -949,7 +983,12 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     //m_workCancelMode(PUSCH_DEVICE_GRAPHS),
     m_useBatchedMemcpy((PUSCH_USE_BATCHED_MEMCPY == 1) && (pStatPrms->enableBatchedMemcpy == 1)),
     // Reminders about the batched memcpy helper:  first 2 elements have PUSCH_MAX_OUTPUT_TO_CPU_COPIES or 2 otherwise; hints are host,device for the last element or device,host otherwise.
-    m_batchedMemcpyHelper{{PUSCH_MAX_OUTPUT_TO_CPU_COPIES, batchedMemcpySrcHint::srcIsDevice, batchedMemcpyDstHint::dstIsHost, m_useBatchedMemcpy}, {PUSCH_MAX_OUTPUT_TO_CPU_COPIES, batchedMemcpySrcHint::srcIsDevice, batchedMemcpyDstHint::dstIsHost, m_useBatchedMemcpy}, {2, batchedMemcpySrcHint::srcIsHost, batchedMemcpyDstHint::dstIsDevice, m_useBatchedMemcpy}}
+    m_batchedMemcpyHelper{{PUSCH_MAX_OUTPUT_TO_CPU_COPIES, batchedMemcpySrcHint::srcIsDevice, batchedMemcpyDstHint::dstIsHost, m_useBatchedMemcpy}, {PUSCH_MAX_OUTPUT_TO_CPU_COPIES, batchedMemcpySrcHint::srcIsDevice, batchedMemcpyDstHint::dstIsHost, m_useBatchedMemcpy}, {2, batchedMemcpySrcHint::srcIsHost, batchedMemcpyDstHint::dstIsDevice, m_useBatchedMemcpy}},
+    m_openRanFunctionalSplitOption(pStatPrms->openRanFunctionalSplitOption),
+    m_kernelSelOption(pStatPrms->kernelSelOption),
+    m_uciKernelSelOption(pStatPrms->uciKernelSelOption),
+    m_delayUs(pStatPrms->delayUs),
+    m_subSlotDelayUs(pStatPrms->subSlotDelayUs)
 {
     // Log cond. graph and DGL options in log to be clear on what we're running during this initial testing phase
     /*NVLOGC_FMT(NVLOG_PUSCH, "TRY_COND_GRAPH_NODES {}, TRY_DGL_INSTEAD_OF_COND_GRAPHS {}, TRY_COND_GRAPH_NODES_OR_DGL {}, USE_COND_GRAPH_NODE_C0 {}, USE_COND_GRAPH_NODE_C1 {}, USE_COND_GRAPH_NODE_C2 {}, DEFAULT_COND_VAL {}, USE_KERNEL_TO_SET_COND_VAL {}", (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL),
@@ -966,6 +1005,33 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
         NVLOGW_FMT(NVLOG_PUSCH, "An invalid work cancellation mode {} was set. Valid range is [0, {}). Will fall back to PUSCH_NO_WORK_CANCEL.", +m_workCancelMode, +PUSCH_MAX_WORK_CANCEL_MODES);
         m_workCancelMode = PUSCH_NO_WORK_CANCEL;
     }
+    
+    if(m_openRanFunctionalSplitOption >= PUSCH_MAX_SPLIT_MODES)
+    {
+        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported PUSCH O-RAN functional split mode {}.", m_openRanFunctionalSplitOption);
+    }
+    
+    if(m_kernelSelOption >= PUSCH_MAX_KERNEL_SEL_MODES)
+    {
+        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported PUSCH kernel selection mode {}.", m_kernelSelOption);
+    }
+    
+    if(m_uciKernelSelOption >= PUSCH_MAX_UCI_KERNEL_SEL_MODES)
+    {
+        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported PUSCH UCI kernel selection mode {}.", m_uciKernelSelOption);
+    }
+    
+    if(m_kernelSelOption==PUSCH_NO_SD_DERATE_MATCHING_FEC)
+    {
+        m_uciKernelSelOption = PUSCH_UCI_NO_UCI;
+        NVLOGC_FMT(NVLOG_PUSCH,  "run PUSCH pipeline without UCI-on-PUSCH.");
+    }
+    
+    m_subSlotDelayKernelArgs[0] = &m_subSlotDelayUs;
+    CUPHY_CHECK(cuphySetDelayKernelNodeParams(&m_subSlotDelayKernelParamsDriver, &m_subSlotDelayKernelArgs[0]));
+    m_fullSlotDelayKernelArgs[0] = &m_delayUs;
+    CUPHY_CHECK(cuphySetDelayKernelNodeParams(&m_fullSlotDelayKernelParamsDriver, &m_fullSlotDelayKernelArgs[0]));
+
 
     pStatPrms->pOutInfo->pMemoryFootprint = &m_memoryFootprint; // update  static parameter field that points to the cuphyMemoryFootprintTracker object for this channel
 
@@ -1011,12 +1077,12 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
         throw std::out_of_range(err);
     }
 
-    if ((m_LDPCkernelLaunchMode & PUSCH_RX_LDPC_STREAM_POOL) || (m_LDPCkernelLaunchMode & PUSCH_RX_ENABLE_LDPC_DEC_SINGLE_STREAM_OPT))
+    if (!m_useCbLdpc && ((m_LDPCkernelLaunchMode & PUSCH_RX_LDPC_STREAM_POOL) || (m_LDPCkernelLaunchMode & PUSCH_RX_ENABLE_LDPC_DEC_SINGLE_STREAM_OPT)))
     {
         // stream priority of the stream pool needs to be consistent with priority of cuStream
         int tmp_priority = 0;
-        CUDA_CHECK(cudaStreamGetPriority(cuStream, &tmp_priority));
-        m_ldpcStreamPool.resize(m_chEstSettings.nMaxLdpcHetConfigs, tmp_priority);
+        CU_CHECK_EXCEPTION(cuStreamGetPriority(reinterpret_cast<CUstream>(cuStream), &tmp_priority));
+        std::get<TbLdpcState>(m_ldpcState).stream_pool.resize(m_chEstSettings.nMaxLdpcHetConfigs, tmp_priority);
     }
 
 #ifdef PUSCH_RX_ENABLE_MULTI_STREAM_LAUNCH
@@ -1024,7 +1090,7 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     // also to launch 1-simplex_decoder 2-rm_decoder and 3-polSegDeRmDeIt in CSI-P1,
     // and to launch 1-rm_decoder 2-simplex_decoder, 3-de_rate_matching_global2, and 4 polar backend in CSI-P2
     int priority = 0;
-    CUDA_CHECK(cudaStreamGetPriority(cuStream, &priority));
+    CU_CHECK_EXCEPTION(cuStreamGetPriority(reinterpret_cast<CUstream>(cuStream), &priority));
     size_t max_num_streams = 2 + CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS + CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS;
     m_G0streamPool.resize(2 , priority);
     m_G1streamPool.resize(max_num_streams , priority);
@@ -1055,7 +1121,7 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     m_tRefChEstDbgVec.resize(MAX_N_USER_GROUPS_SUPPORTED);
     m_tRefCfoEstVec.resize(MAX_N_USER_GROUPS_SUPPORTED);
     m_tRefReeDiagInvVec.resize(MAX_N_USER_GROUPS_SUPPORTED);
-    if (m_cuphyPuschStatPrms.enableDebugEqOutput)
+    if((m_cuphyPuschStatPrms.enableDebugEqOutput || m_kernelSelOption==PUSCH_NO_SD_DERATE_MATCHING_FEC)&&(m_openRanFunctionalSplitOption==PUSCH_7_2_A))
     {
         m_tRefDataEqVec.resize(MAX_N_USER_GROUPS_SUPPORTED);
     }
@@ -1100,9 +1166,60 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     m_pUciSegEst_early.resize(CUPHY_MAX_N_POL_UCI_SEGS);
 
 
-    m_ldpcLaunchCfgs.resize(m_chEstSettings.nMaxLdpcHetConfigs);
-    m_ldpcDecoderNodes.resize(CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES, std::vector<CUgraphNode>(m_chEstSettings.nMaxLdpcHetConfigs));
-    m_LDPCDecodeDescSet.resize(m_chEstSettings.nMaxLdpcHetConfigs);
+    if (m_useCbLdpc)
+    {
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        if (!m_ldpcPrms.useHalf)
+        {
+            throw std::runtime_error("CB LDPC decoder requires CUPHY_R_16F LLR input");
+        }
+        cuphyLdpcCbLaunchStaticConfig_t cbStaticCfg{};
+        cbStaticCfg.llr_type     = CUPHY_R_16F;
+        cbStaticCfg.clamp_value  = m_cuphyPuschStatPrms.ldpcClampValue;
+        cbStaticCfg.config_flags = 0;
+        if ((m_ldpcPrms.flags & CUPHY_LDPC_DECODE_CHOOSE_THROUGHPUT) != 0)
+        {
+            cbStaticCfg.config_flags |= CUPHY_LDPC_CB_THROUGHPUT_MODE;
+        }
+        cuphyStatus_t cbStatus = cuphyCreateLdpcCbLaunchPreparer(&cb.preparer, &cbStaticCfg);
+        if (cbStatus != CUPHY_STATUS_SUCCESS)
+        {
+            throw std::runtime_error("cuphyCreateLdpcCbLaunchPreparer failed");
+        }
+        cuphyLdpcCbLaunchFamily_t workspaceFamily{};
+        workspaceFamily.compatibility_class_id = 1;
+        workspaceFamily.max_subgroups = 1;
+        cuphyLdpcCbPreparedLaunchConfig_t workspaceConfig{};
+        workspaceConfig.max_subgroups = 1;
+        workspaceConfig.max_total_codeblocks = std::max<uint32_t>(m_maxNCbs, 1U);
+        size_t workspaceSize = 0;
+        size_t workspaceAlignment = 0;
+        cuphyStatus_t workspaceStatus = cuphyLdpcCbPreparedLaunchGetWorkspaceSize(cb.preparer,
+                                                                                  &workspaceFamily,
+                                                                                  &workspaceConfig,
+                                                                                  &workspaceSize,
+                                                                                  &workspaceAlignment);
+        if (workspaceStatus != CUPHY_STATUS_SUCCESS)
+        {
+            throw std::runtime_error("cuphyLdpcCbPreparedLaunchGetWorkspaceSize(max) failed");
+        }
+        cb.full_batch.reserve(m_chEstSettings.nMaxLdpcHetConfigs, m_maxNCbs, workspaceSize, workspaceAlignment);
+        cb.early_batch.reserve(m_chEstSettings.nMaxLdpcHetConfigs, m_maxNCbs, workspaceSize, workspaceAlignment);
+        cb.choice_cache.reserve(m_chEstSettings.nMaxLdpcHetConfigs);
+        cb.full_nodes.resize(CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES,
+                             std::vector<CUgraphNode>(m_chEstSettings.nMaxLdpcHetConfigs));
+        cb.early_nodes.resize(m_chEstSettings.nMaxLdpcHetConfigs);
+    }
+    else
+    {
+        auto& tb = std::get<TbLdpcState>(m_ldpcState);
+        tb.launch_configs.resize(m_chEstSettings.nMaxLdpcHetConfigs);
+        tb.decoder_nodes.resize(CUPHY_MAX_PUSCH_FULL_SLOT_PROC_MODES, std::vector<CUgraphNode>(m_chEstSettings.nMaxLdpcHetConfigs));
+        tb.decode_desc_set.resize(m_chEstSettings.nMaxLdpcHetConfigs);
+    }
+    m_earlyDecodedCbCountPerTb.resize(m_maxNTbs);
+    m_rateMatchCbRangesEarly.resize(m_maxNTbs);
+    m_rateMatchCbRangesFull.resize(m_maxNTbs);
 
     // store number of launch config state; to be used in updateGraph() to reduce CUDA api calls
     m_noiseIntfEstNodesEnabled.resize(CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
@@ -1116,17 +1233,23 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
             m_chEqSoftDemapIdftNodesEnabled[idx].resize(CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
             m_chEqSoftDemapAfterDftNodesEnabled[idx].resize(CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
         }
-        m_ldpcDecoderNodesEnabled[idx].resize(m_chEstSettings.nMaxLdpcHetConfigs, std::numeric_limits<uint8_t>::max());
+        if (!m_useCbLdpc)
+        {
+            std::get<TbLdpcState>(m_ldpcState).decoder_nodes_enabled[idx].resize(m_chEstSettings.nMaxLdpcHetConfigs, std::numeric_limits<uint8_t>::max());
+        }
         m_rssiNodesEnabled[idx].resize(CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
         m_rsrpNodesEnabled[idx].resize(CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
         m_rateMatchNodeEnabled[idx]          = std::numeric_limits<uint8_t>::max();
+        m_cbLdpcNodesEnabled[idx].resize(m_chEstSettings.nMaxLdpcHetConfigs, std::numeric_limits<uint8_t>::max());
         m_crcNodesEnabled[idx]               = std::numeric_limits<uint8_t>::max();
         m_uciSegLLRs0NodeEnabled[idx]        = std::numeric_limits<uint8_t>::max();
         m_simplexDecoderNodeEnabled[idx]     = std::numeric_limits<uint8_t>::max();
         m_rmDecoderNodeEnabled[idx]          = std::numeric_limits<uint8_t>::max();
         m_polarNodeEnabled[idx]              = std::numeric_limits<uint8_t>::max();
         m_csi2NodeEnabled[idx]               = std::numeric_limits<uint8_t>::max();
+        m_fullSlotDelayNodeEnabled[idx]      = std::numeric_limits<uint8_t>::max();
     }
+    m_subSlotDelayNodeEnabled                = std::numeric_limits<uint8_t>::max();
 
     // enable state flags for early HARQ path
     m_ehqNoiseIntfEstNodesEnabled.resize(CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
@@ -1138,6 +1261,9 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
         m_ehqChEqSoftDemapAfterDftNodesEnabled.resize(CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, std::numeric_limits<uint8_t>::max());
     }
     m_ehqUciSegLLRs0NodeEnabled         = std::numeric_limits<uint8_t>::max();
+    m_ehqRateMatchNodeEnabled           = std::numeric_limits<uint8_t>::max();
+    m_ehqCbDecoderNodeEnabled           = std::numeric_limits<uint8_t>::max();
+    m_ehqCbLdpcNodesEnabled.resize(m_chEstSettings.nMaxLdpcHetConfigs, std::numeric_limits<uint8_t>::max());
     m_ehqSimplexDecoderNodeEnabled      = std::numeric_limits<uint8_t>::max();
     m_ehqRmDecoderNodeEnabled           = std::numeric_limits<uint8_t>::max();
     m_ehqPolarNodeEnabled               = std::numeric_limits<uint8_t>::max();
@@ -1188,8 +1314,30 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
     createComponents(cuStream, rmFPconfig, descrmOn);
 
     // create (device) graph for full-slot processing in PUSCH
-    createFullSlotGraph(PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraph, m_emptyFullSlotRootNode, m_fullSlotGraphCondInfo);
+    if(m_openRanFunctionalSplitOption==PUSCH_7_2_E)
+    {
+        if((m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL))
+        {
+            create72eFullSlotGraph(m_fullSlotGraph, m_emptyFullSlotRootNode, m_fullSlotGraphCondInfo);
+        }
+        else
+        {
+            create72eFullSlotOffloadingGraph(m_fullSlotGraph, m_emptyFullSlotRootNode, m_fullSlotGraphCondInfo);
+        }
+    }
+    else
+    {
+        if((m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL))
+        {
+            createFullSlotGraph(PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraph, m_emptyFullSlotRootNode, m_fullSlotGraphCondInfo);
+        }
+        else
+        {
+            createFullSlotOffloadingGraph(PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraph, m_emptyFullSlotRootNode, m_fullSlotGraphCondInfo);
+        }  
+    }
     createFullSlotGraph(PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraph, m_emptyFrontLoadedDmrsFullSlotRootNode, m_frontLoadedDmrsFullSlotGraphCondInfo);
+    
     if(m_deviceGraphLaunchEnabled)
     {
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_fullSlotGraphExec, m_fullSlotGraph, CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
@@ -1200,14 +1348,57 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_fullSlotGraphExec, m_fullSlotGraph, 0));
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraph, 0));
     }
-    updateFullSlotGraph(true, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);     //initially disable all nodes
-    updateFullSlotGraph(true, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);  //initially disable all nodes
+    if(m_openRanFunctionalSplitOption==PUSCH_7_2_E)
+    {
+        if((m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL))
+        {
+            update72eFullSlotGraph(true, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);    //initially disable all nodes
+        }
+        else
+        {
+            update72eFullSlotOffloadingGraph(true, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo); 
+        }
+    }
+    else
+    {
+        if((m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL))
+        {
+            updateFullSlotGraph(true, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);     //initially disable all nodes
+        }
+        else
+        {
+            updateFullSlotOffloadingGraph(true, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);  
+        }
+        updateFullSlotGraph(true, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);  //initially disable all nodes
+    }
 
     //CU_CHECK_EXCEPTION(cuGraphUpload(m_deviceGraphExec, cuStream));
 
     // create (device) graph for early-HARQ/front-loaded DMRS processing in PUSCH
-    createEarlyHarqGraph();
+    if(m_openRanFunctionalSplitOption==PUSCH_7_2_E)
+    {
+        if((m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL))
+        {
+            create72eEarlyHarqGraph();
+        }
+        else
+        {
+            create72eEarlyHarqOffloadingGraph();
+        }
+    }
+    else
+    {  
+        if((m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL))
+        {
+            createEarlyHarqGraph();
+        }
+        else
+        {
+            createEarlyHarqOffloadingGraph();
+        }
+    }
     createFrontLoadedDmrsGraph();
+    
     if(m_deviceGraphLaunchEnabled)
     {
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_ehqGraphExec, m_ehqGraph, CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
@@ -1218,8 +1409,29 @@ PuschRx::PuschRx(cuphyPuschStatPrms_t const* pStatPrms, cudaStream_t cuStream) :
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_ehqGraphExec, m_ehqGraph, 0));
         CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_frontLoadedDmrsGraphExec, m_frontLoadedDmrsGraph, 0));
     }
-    updateEarlyHarqGraph(true);         // initially disable all nodes
-    updateFrontLoadedDmrsGraph(true);   // initially disable all nodes
+    if(m_openRanFunctionalSplitOption==PUSCH_7_2_E)
+    {
+        if((m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL))
+        {
+            update72eEarlyHarqGraph(true);      // initially disable all nodes
+        }
+        else
+        {
+            update72eEarlyHarqOffloadingGraph(true); 
+        }
+    }
+    else
+    {
+        if((m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL))
+        {
+            updateEarlyHarqGraph(true);         // initially disable all nodes
+        }
+        else
+        {
+            updateEarlyHarqOffloadingGraph(true); 
+        }
+        updateFrontLoadedDmrsGraph(true);   // initially disable all nodes
+    }
     //CU_CHECK_EXCEPTION(cuGraphUpload(m_ehqGraphExec, cuStream));
 
     // create launch graphs in charge of synchronization (and device graph launch when m_deviceGraphLaunchEnabled == 1)
@@ -1313,12 +1525,20 @@ cuphyStatus_t PuschRx::setupCmnPhase1(cuphyPuschDynPrms_t* pDynPrm)
     m_nSchUes                       = 0;
     m_nEarlyHarqUes                 = 0;
 
-    //early-HARQ flags and memories
-    m_earlyHarqModeEnabled = (pDynPrm->procModeBmsk & PUSCH_PROC_MODE_SUB_SLOT)? true : false;
-    //over-write m_earlyHarqModeEnabled if necessary
-    if(m_cuphyPuschStatPrms.enableEarlyHarq==0)
+    const bool subSlotProcessingRequested = (pDynPrm->procModeBmsk & PUSCH_PROC_MODE_SUB_SLOT) != 0;
+    const bool earlyHarqRequested         = m_cuphyPuschStatPrms.enableEarlyHarq != 0;
+    const bool earlySchCbDecodeRequested  =
+        m_useCbLdpc &&
+        (m_cuphyPuschStatPrms.earlySchCbDecodeMode == PUSCH_EARLY_SCH_CB_DECODE_NON_UCI_SCH_ONLY);
+    bool hasEarlySchCbDecodeWork = false;
+
+    // This flag controls the sub-slot PUSCH path. Existing early-HARQ UCI and
+    // the new early SCH CB decode mode both need that same early frontend.
+    m_earlyHarqModeEnabled = subSlotProcessingRequested && (earlyHarqRequested || earlySchCbDecodeRequested);
+
+    if(m_openRanFunctionalSplitOption==PUSCH_7_2_E)
     {
-        m_earlyHarqModeEnabled = false;
+        m_subSlotProcessingFrontLoadedDmrsEnabled = false;
     }
 
     uint8_t earlyHarqSoftDemapperSymbolUpperBound = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_UPPER_BOUND;
@@ -1329,14 +1549,14 @@ cuphyStatus_t PuschRx::setupCmnPhase1(cuphyPuschDynPrms_t* pDynPrm)
 
     for(int ueIdx = 0; ueIdx < m_cuphyPuschCellGrpDynPrm.nUes; ++ueIdx)
     {
+        m_pTbPrmsCpu[ueIdx].isEarlyHarq = 0;
         if(pUePrms[ueIdx].pduBitmap & 2)
         {
             m_outputPrms.pUciOnPuschOutOffsets[ueIdx].HarqDetectionStatusOffset  = ueIdx;
             m_outputPrms.pUciOnPuschOutOffsets[ueIdx].CsiP1DetectionStatusOffset = ueIdx;
             m_outputPrms.pUciOnPuschOutOffsets[ueIdx].CsiP2DetectionStatusOffset = ueIdx;
             m_outputPrms.pUciOnPuschOutOffsets[ueIdx].isEarlyHarq = 0;
-            m_pTbPrmsCpu[ueIdx].isEarlyHarq = 0;
-            if(m_earlyHarqModeEnabled && (pUePrms[ueIdx].pUciPrms->nBitsHarq>0))
+            if(subSlotProcessingRequested && earlyHarqRequested && (pUePrms[ueIdx].pUciPrms->nBitsHarq>0))
             {
                 //****************** determine isEarlyHarq for each UE ***************************//
                 //****************** HARQ bits in symbol 0 ~ symbol 3  ***************************//
@@ -1349,7 +1569,12 @@ cuphyStatus_t PuschRx::setupCmnPhase1(cuphyPuschDynPrms_t* pDynPrm)
                 {
                     nEarlyHarqSymbols = earlyHarqSoftDemapperSymbolUpperBound + 1 - firstHarqSymbol;
                 }
-                uint32_t nAvailableEaryHarqRmBits = static_cast<uint32_t>(nEarlyHarqSymbols)*(static_cast<uint32_t>(pUePrms[ueIdx].nUeLayers))*(static_cast<uint32_t>(pUePrms[ueIdx].pUeGrpPrm->nPrb))*CUPHY_N_TONES_PER_PRB*(static_cast<uint32_t>(pUePrms[ueIdx].qamModOrder));
+                uint32_t nAvailableEaryHarqRmBits =
+                    static_cast<uint32_t>(nEarlyHarqSymbols) *
+                    static_cast<uint32_t>(pUePrms[ueIdx].nUeLayers) *
+                    static_cast<uint32_t>(pUePrms[ueIdx].pUeGrpPrm->nPrb) *
+                    CUPHY_N_TONES_PER_PRB *
+                    static_cast<uint32_t>(pUePrms[ueIdx].qamModOrder);
                 if(G_harq<=nAvailableEaryHarqRmBits)
                 {
                     m_outputPrms.pUciOnPuschOutOffsets[ueIdx].isEarlyHarq = 1;
@@ -1379,6 +1604,26 @@ cuphyStatus_t PuschRx::setupCmnPhase1(cuphyPuschDynPrms_t* pDynPrm)
 
             m_outputPrms.totNumCbs += m_pTbPrmsCpu[ueIdx].num_CBs;
 
+            if(earlySchCbDecodeRequested && !hasEarlySchCbDecodeWork && !m_pTbPrmsCpu[ueIdx].uciOnPuschFlag &&
+               (m_pTbPrmsCpu[ueIdx].num_CBs > 0))
+            {
+                uint16_t ueGrpIdx = pUePrms[ueIdx].ueGrpIdx;
+                cuphyPuschRxUeGrpPrms_t* drvdUeGrpPrms = &m_drvdUeGrpPrmsCpu[ueGrpIdx];
+                uint8_t nEarlyHarqSymbols = 0;
+                uint8_t firstHarqSymbol = drvdUeGrpPrms->dmrsSymLoc[0] + drvdUeGrpPrms->dmrsMaxLen;
+                if(firstHarqSymbol <= earlyHarqSoftDemapperSymbolUpperBound)
+                {
+                    nEarlyHarqSymbols = earlyHarqSoftDemapperSymbolUpperBound + 1 - firstHarqSymbol;
+                }
+                uint32_t nAvailableEarlyRmBits =
+                    static_cast<uint32_t>(nEarlyHarqSymbols) *
+                    static_cast<uint32_t>(pUePrms[ueIdx].nUeLayers) *
+                    static_cast<uint32_t>(pUePrms[ueIdx].pUeGrpPrm->nPrb) *
+                    CUPHY_N_TONES_PER_PRB *
+                    static_cast<uint32_t>(pUePrms[ueIdx].qamModOrder);
+                hasEarlySchCbDecodeWork = computeLeadingEarlySchCbCount(m_pTbPrmsCpu[ueIdx], nAvailableEarlyRmBits) > 0;
+            }
+
             uint8_t  crcSizeBytes = m_pTbPrmsCpu[ueIdx].tbSize > 3824 ? 3 : 2;     // 38.212, section 7.2.1
             uint32_t tbSizeBytes  = m_pTbPrmsCpu[ueIdx].tbSize / 8 + crcSizeBytes; // in cuPHY each TB includes TB payload + TB CRC
             m_outputPrms.totNumPayloadBytes += tbSizeBytes;
@@ -1399,13 +1644,78 @@ cuphyStatus_t PuschRx::setupCmnPhase1(cuphyPuschDynPrms_t* pDynPrm)
         }
     }
 
+    // Compute per-cell TB payload byte ranges for batched D2H (GT-11677 Phase 2).
+    // Contract: pUePrms[] must be sorted/grouped by cellPrmDynIdx so that each
+    // cell's UEs form a single contiguous run. This is guaranteed by the upstream
+    // cell-group builder. If violated, cellCount would exceed nPerCellTbDests.
+    //
+    // Per-cell offsets are derived from pStartOffsetsTbPayload[] (populated above)
+    // via the first ULSCH UE in each cell, avoiding re-derivation of CRC +
+    // word-alignment padding arithmetic. Cells with no ULSCH UEs get size 0.
+    m_outputPrms.nPerCellTbDests = 0;
+    if (pDynPrm->pDataOut->nPerCellTbDests > 0 &&
+        pDynPrm->pDataOut->nPerCellTbDests == static_cast<uint32_t>(m_cuphyPuschCellGrpDynPrm.nCells))
+    {
+        int prevCellDynIdx = -1;
+        uint32_t cellCount = 0;
+        bool cellHasUlsch = false;
+        int lastUlschCellIdx = -1;
+
+        for(int ueIdx = 0; ueIdx < m_cuphyPuschCellGrpDynPrm.nUes; ++ueIdx)
+        {
+            int cellDynIdx = pUePrms[ueIdx].pUeGrpPrm->pCellPrm->cellPrmDynIdx;
+            if(cellDynIdx != prevCellDynIdx)
+            {
+                if(cellCount >= pDynPrm->pDataOut->nPerCellTbDests)
+                {
+                    NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,
+                        "{}: cellCount {} exceeds nPerCellTbDests {}, pUePrms not sorted by cellPrmDynIdx",
+                        __func__, cellCount, pDynPrm->pDataOut->nPerCellTbDests);
+                    m_outputPrms.nPerCellTbDests = cellCount;
+                    break;
+                }
+                m_outputPrms.perCellTbPayloadOffset[cellCount] = m_outputPrms.totNumPayloadBytes;
+                m_outputPrms.perCellTbPayloadSize[cellCount] = 0;
+                m_outputPrms.pPerCellTbPayloadsHost[cellCount] =
+                    pDynPrm->pDataOut->pPerCellTbPayloads[cellCount];
+                prevCellDynIdx = cellDynIdx;
+                cellHasUlsch = false;
+                cellCount++;
+            }
+
+            if((pUePrms[ueIdx].pduBitmap & 1) && !cellHasUlsch)
+            {
+                cellHasUlsch = true;
+                m_outputPrms.perCellTbPayloadOffset[cellCount - 1] =
+                    pDynPrm->pDataOut->pStartOffsetsTbPayload[ueIdx];
+                // Close out the last cell that had ULSCH data
+                if(lastUlschCellIdx >= 0)
+                {
+                    m_outputPrms.perCellTbPayloadSize[lastUlschCellIdx] =
+                        pDynPrm->pDataOut->pStartOffsetsTbPayload[ueIdx] -
+                        m_outputPrms.perCellTbPayloadOffset[lastUlschCellIdx];
+                }
+                lastUlschCellIdx = static_cast<int>(cellCount - 1);
+            }
+        }
+        // Close out the last cell that had ULSCH data
+        if(lastUlschCellIdx >= 0)
+        {
+            m_outputPrms.perCellTbPayloadSize[lastUlschCellIdx] =
+                m_outputPrms.totNumPayloadBytes - m_outputPrms.perCellTbPayloadOffset[lastUlschCellIdx];
+        }
+        m_outputPrms.nPerCellTbDests = cellCount;
+    }
+
     //over-write m_earlyHarqModeEnabled if necessary
-    if(m_nEarlyHarqUes==0)
+    if((m_nEarlyHarqUes==0) && !hasEarlySchCbDecodeWork)
     {
         m_earlyHarqModeEnabled = false;
     }
 
-    if(m_earlyHarqModeEnabled)
+    pDynPrm->pDataOut->isEarlySchCbDecodePresent = hasEarlySchCbDecodeWork ? 1 : 0;
+
+    if(m_nEarlyHarqUes > 0)
     {
         pDynPrm->pDataOut->isEarlyHarqPresent = 1;
     }
@@ -1473,7 +1783,7 @@ cuphyStatus_t PuschRx::setupCmnPhase1(cuphyPuschDynPrms_t* pDynPrm)
     return CUPHY_STATUS_SUCCESS;
 }
 
-void PuschRx::setupCmnPhase2(cuphyPuschDynPrms_t* pDynPrm)
+cuphyStatus_t PuschRx::setupCmnPhase2(cuphyPuschDynPrms_t* pDynPrm)
 {
     m_chest->chestGraph().init();
     for(int32_t chEqTimeInst = 0; chEqTimeInst < CUPHY_PUSCH_RX_MAX_N_TIME_CH_EST; ++chEqTimeInst)
@@ -1505,15 +1815,61 @@ void PuschRx::setupCmnPhase2(cuphyPuschDynPrms_t* pDynPrm)
     ////////////////////////////////////////////////////////////////////
 
     // LDPC kernel setup
-    prepareLDPCStreamsTB();
-
-    for(int i = 0; i < m_LDPCDecodeDescSet.count(); ++i)
+    if (m_useCbLdpc)
     {
-        m_ldpcLaunchCfgs[i].decode_desc = m_LDPCDecodeDescSet[i];
-        m_LDPCdecoder.get_launch_config(m_ldpcLaunchCfgs[i]);
-        // printf("LDPC: decSetIdx %d gridDim (x y z) (%d %d %d) blockDim (x y z) (%d %d %d) \n", i, m_ldpcLaunchCfgs[i].kernel_node_params_driver.gridDimX, m_ldpcLaunchCfgs[i].kernel_node_params_driver.gridDimY, m_ldpcLaunchCfgs[i].kernel_node_params_driver.gridDimZ, m_ldpcLaunchCfgs[i].kernel_node_params_driver.blockDimX, m_ldpcLaunchCfgs[i].kernel_node_params_driver.blockDimY, m_ldpcLaunchCfgs[i].kernel_node_params_driver.blockDimZ);
+        const auto reportLdpcSetupFailure = [pDynPrm](cuphyStatus_t status) {
+            pDynPrm->pStatusOut->status = cuphyPuschStatusType_t::CUPHY_PUSCH_STATUS_LDPC_SETUP_ERROR;
+            pDynPrm->pStatusOut->ueIdx = MAX_UINT16;
+            pDynPrm->pStatusOut->cellPrmStatIdx = MAX_UINT16;
+            return status;
+        };
+
+        computeEarlyHarqCbDecodePlan();
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        if(needsEarlyCbBatchPreparation(m_nEarlyDecodedSchCbs))
+        {
+            const cuphyStatus_t status = prepareCbLdpcBatches(true);
+            if (status != CUPHY_STATUS_SUCCESS)
+            {
+                return reportLdpcSetupFailure(status);
+            }
+        }
+        else
+        {
+            cb.early_batch.resetForSetup();
+        }
+        const cuphyStatus_t status = prepareCbLdpcBatches(false);
+        if (status != CUPHY_STATUS_SUCCESS)
+        {
+            return reportLdpcSetupFailure(status);
+        }
+        const uint32_t totalPlannedCbs = cb.early_batch.total_cb_count + cb.full_batch.total_cb_count;
+        if (totalPlannedCbs != m_outputPrms.totNumCbs)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,
+                       "{}: CB decode split mismatch (early {} + full {} != total {})",
+                       __FUNCTION__, cb.early_batch.total_cb_count, cb.full_batch.total_cb_count, m_outputPrms.totNumCbs);
+            return reportLdpcSetupFailure(CUPHY_STATUS_INTERNAL_ERROR);
+        }
+        if (m_nEarlyDecodedSchCbs != cb.early_batch.total_cb_count || m_nFullSlotRemainingSchCbs != cb.full_batch.total_cb_count)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,
+                       "{}: CB decode counters mismatch (tracked early/full {} / {}, prepared early/full {} / {})",
+                       __FUNCTION__, m_nEarlyDecodedSchCbs, m_nFullSlotRemainingSchCbs,
+                       cb.early_batch.total_cb_count, cb.full_batch.total_cb_count);
+            return reportLdpcSetupFailure(CUPHY_STATUS_INTERNAL_ERROR);
+        }
     }
-    // printf("PuschRx setupCmn: LDPC node count %d\n", m_LDPCDecodeDescSet.count());
+    else
+    {
+        prepareLDPCStreamsTB();
+        auto& tb = std::get<TbLdpcState>(m_ldpcState);
+        for(int i = 0; i < tb.decode_desc_set.count(); ++i)
+        {
+            tb.launch_configs[i].decode_desc = tb.decode_desc_set[i];
+            tb.decoder->get_launch_config(tb.launch_configs[i]);
+        }
+    }
 
     // debug output -- this is cheap, do it all the time
     {
@@ -1536,6 +1892,8 @@ void PuschRx::setupCmnPhase2(cuphyPuschDynPrms_t* pDynPrm)
             m_tRefDataRx[cellIdx].set_addr(pTDataRx[cellPrmDynIdx].pAddr);
         }
     }
+
+    return CUPHY_STATUS_SUCCESS;
 }
 
 void PuschRx::expandUciCodingPrms(uint32_t nInfoBits, uint32_t nRmBits, uint8_t Qm, float DTXthreshold, bool updateOnlyNumInputPrms,
@@ -1851,6 +2209,8 @@ cuphyStatus_t PuschRx::setupComponents(bool enableCpuToGpuDescrAsyncCpy, cuphyPu
                                                                        m_nMaxPrb,
                                                                        m_chEstSettings.enableCfoCorrection,
                                                                        m_chEstSettings.enablePuschTdi,
+                                                                       m_openRanFunctionalSplitOption,
+                                                                       m_kernelSelOption,
                                                                        (m_chEstSettings.enableMassiveMIMO && (m_maxDmrsMaxLen==2)) ? CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS: CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK, // for the early-HARQ processing at symbol 4/3
                                                                        enableCpuToGpuDescrAsyncCpy ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
                                                                        static_cast<void*>(dynCpuDescrStartAddrs[PUSCH_CH_EQ_SOFT_DEMAP]),
@@ -1866,6 +2226,8 @@ cuphyStatus_t PuschRx::setupComponents(bool enableCpuToGpuDescrAsyncCpy, cuphyPu
                                                                         m_nMaxPrb,
                                                                         m_chEstSettings.enableCfoCorrection,
                                                                         m_chEstSettings.enablePuschTdi,
+                                                                        m_openRanFunctionalSplitOption,
+                                                                        m_kernelSelOption,
                                                                         CUPHY_PUSCH_RX_SOFT_DEMAPPER_FULL_SLOT_SYMBOL_BITMASK, // for full-slot processing
                                                                         enableCpuToGpuDescrAsyncCpy ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
                                                                         static_cast<void*>(dynCpuDescrStartAddrs[PUSCH_CH_EQ_SOFT_DEMAP]),
@@ -2250,23 +2612,56 @@ cuphyStatus_t PuschRx::setupComponents(bool enableCpuToGpuDescrAsyncCpy, cuphyPu
 
     }
 
-    cuphyStatus_t setupRateMatchStatus;
+    cuphyStatus_t setupRateMatchStatus = CUPHY_STATUS_SUCCESS;
     cuphyStatus_t setupCrcDecodeStatus;
     if(m_nSchUes > 0)
     {
-        setupRateMatchStatus = cuphySetupPuschRxRateMatch(m_rateMatchHndl,                         // handle to rate-matching class
-                                                          m_nSchUes,                               // number of users w/h SCH data
-                                                          m_schUserIdxsVec.data(),                 // indicies of users w/h SCH data
-                                                          m_pTbPrmsCpu,                            // starting adress of transport block paramters (CPU)
-                                                          m_pTbPrmsGpu,                            // starting adress of transport block paramters (GPU)
-                                                          m_tPrmLLRVec.data(),                     // starting adress of input LLR tensor parameters
-                                                          m_tPrmLLRCdm1Vec.data(),
-                                                          m_pHarqBuffers,                          // array of rm outputs in gpu
-                                                          dynCpuDescrStartAddrs[PUSCH_RATE_MATCH], // pointer to descriptor in cpu
-                                                          dynGpuDescrStartAddrs[PUSCH_RATE_MATCH], // pointer to descriptor in gpu
-                                                          enableCpuToGpuDescrAsyncCpy ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0), // option to copy cpu descriptors from cpu to gpu
-                                                          &m_rateMatchLaunchCfg,
-                                                          phase1Stream); // stream to perform copy
+        for(uint16_t i = 0; i < m_nSchUes; ++i)
+        {
+            const uint16_t ueIdx = m_schUserIdxsVec[i];
+            const uint16_t numCbs = static_cast<uint16_t>(m_pTbPrmsCpu[ueIdx].num_CBs);
+            const uint16_t earlyCbCount = m_useCbLdpc ?
+                std::min<uint16_t>(m_earlyDecodedCbCountPerTb[ueIdx], numCbs) : 0;
+            m_rateMatchCbRangesEarly[i] = cuphyPuschRxRateMatchCbRange_t{0, earlyCbCount};
+            m_rateMatchCbRangesFull[i] = cuphyPuschRxRateMatchCbRange_t{earlyCbCount, numCbs};
+        }
+
+        puschRxRateMatch* rateMatch = static_cast<puschRxRateMatch*>(m_rateMatchHndl);
+        const uint8_t asyncDescrCpy = enableCpuToGpuDescrAsyncCpy ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
+
+        if(m_useCbLdpc && m_nEarlyDecodedSchCbs > 0)
+        {
+            rateMatch->setup(m_nSchUes,
+                             m_schUserIdxsVec.data(),
+                             m_pTbPrmsCpu,
+                             m_pTbPrmsGpu,
+                             m_tPrmLLRVec.data(),
+                             m_tPrmLLRCdm1Vec.data(),
+                             m_pHarqBuffers,
+                             dynCpuDescrStartAddrs[PUSCH_RATE_MATCH_EARLY],
+                             dynGpuDescrStartAddrs[PUSCH_RATE_MATCH_EARLY],
+                             asyncDescrCpy,
+                             &m_rateMatchLaunchCfgEarly,
+                             phase1Stream,
+                             m_rateMatchCbRangesEarly.data());
+        }
+
+        if(needsFullSlotSchDecode(m_useCbLdpc, m_nFullSlotRemainingSchCbs))
+        {
+            rateMatch->setup(m_nSchUes,
+                             m_schUserIdxsVec.data(),
+                             m_pTbPrmsCpu,
+                             m_pTbPrmsGpu,
+                             m_tPrmLLRVec.data(),
+                             m_tPrmLLRCdm1Vec.data(),
+                             m_pHarqBuffers,
+                             dynCpuDescrStartAddrs[PUSCH_RATE_MATCH],
+                             dynGpuDescrStartAddrs[PUSCH_RATE_MATCH],
+                             asyncDescrCpy,
+                             &m_rateMatchLaunchCfg,
+                             phase1Stream,
+                             m_useCbLdpc ? m_rateMatchCbRangesFull.data() : nullptr);
+        }
 
         setupCrcDecodeStatus = cuphySetupPuschRxCrcDecode(m_crcDecodeHndl,
                                                           m_nSchUes,
@@ -2685,6 +3080,38 @@ void PuschRx::createEarlyHarqGraph()
     nextNodeDeps[1].clear();
     currNodeDeps[1].clear();
 
+    if (m_useCbLdpc)
+    {
+        // Early-HARQ SCH backend: rate-match/clamp + CB decode child graph.
+        std::vector<CUgraphNode> schDeps = currNodeDeps[0];
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqResetRateMatchNode,
+                                                m_ehqGraph,
+                                                schDeps.data(),
+                                                schDeps.size(),
+                                                &m_emptyNode1paramDriver));
+        schDeps.clear();
+        schDeps.emplace_back(m_ehqResetRateMatchNode);
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRateMatchNode,
+                                                m_ehqGraph,
+                                                schDeps.data(),
+                                                schDeps.size(),
+                                                &m_emptyNode1paramDriver));
+        schDeps.clear();
+        schDeps.emplace_back(m_ehqRateMatchNode);
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqClampRateMatchNode,
+                                                m_ehqGraph,
+                                                schDeps.data(),
+                                                schDeps.size(),
+                                                &m_emptyNode1paramDriver));
+        schDeps.clear();
+        schDeps.emplace_back(m_ehqClampRateMatchNode);
+
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        addCbLdpcNodes(m_ehqGraph, schDeps, cb.early_nodes);
+    }
+
     //==========================================================================================================/
     // add m_ehqCompCwTreeTypesNode, parent node(s) : m_ehqChEqSoftDemapAfterDftNodes                           /
     //                               sibling node(s): m_ehqUciSegLLRs0Node, m_ehqRsrpNodes                      /
@@ -2707,6 +3134,444 @@ void PuschRx::createEarlyHarqGraph()
 
     //==========================================================================================================/
     // add m_ehqRssiNodes, parent node(s) : m_ehqChEqSoftDemapAfterDftNodes                                     /
+    //                     sibling node(s): m_ehqRsrpNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode            /
+    //==========================================================================================================/
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRssiNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        }
+    }
+
+    //==========================================================================================================/
+    // add m_ehqUciSegLLRs0Node, parent node(s) : m_ehqChEqSoftDemapNodes                                       /
+    //                           sibling node(s): m_ehqCompCwTreeTypesNode, m_ehqRsrpNodes, m_ehqRssiNodes      /
+    //==========================================================================================================/
+    // Most of these kernels are run optionally, and calling the setup function here during m_ehqGraph creation can cause issues
+    // if there's nothing to set up. Instead, we just use the null kernel here and update the nodes during updateGraph().
+    //if(m_nUciUes > 0)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqUciSegLLRs0Node, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        nextNodeDeps[0].emplace_back(m_ehqUciSegLLRs0Node);
+
+        // We have a dependency on the CSI-P1 control kernel for the next 3 kernels: simplex, RM and polar
+        // Simplex, RM and polar run in parallel
+        currNodeDeps[0] = nextNodeDeps[0];
+    }
+
+    //==========================================================================================================/
+    // add m_ehqSimplexDecoderNode, parent node(s) : m_ehqUciSegLLRs0Node                                       /
+    //                          sibling node(s): m_ehqRmDecoderNode, m_ehqCompCwTreeTypesNode                   /
+    //==========================================================================================================/
+    //if(m_nSpxCws_early > 0)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqSimplexDecoderNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+    }
+
+    //==========================================================================================================/
+    // add m_ehqRmDecoderNode, parent node(s) : m_ehqUciSegLLRs0Node                                            /
+    //                     sibling node(s): m_ehqSimplexDecoderNode, m_ehqCompCwTreeTypesNode                   /
+    //==========================================================================================================/
+    //if(m_nRmCws > 0)
+    {
+        CUDA_KERNEL_NODE_PARAMS rmDecoderParamsDriver;
+        rmDecoderDynDescr_t arg;
+        void* kernelParams[] = {&arg};
+        const int numPtrArgs = 0;
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&rmDecoderParamsDriver, &kernelParams[0], numPtrArgs, sizeof(rmDecoderDynDescr_t)));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRmDecoderNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &rmDecoderParamsDriver));
+    }
+
+    //if(m_nPolUciSegs_early > 0)
+    {
+        //==========================================================================================================/
+        // add m_ehqPolSegDeRmDeItlNode, parent node(s) : m_ehqUciSegLLRs0Node, m_ehqCompCwTreeTypesNode            /
+        //                               sibling node(s): none                                                      /
+        //==========================================================================================================/
+        currNodeDeps[1].insert(currNodeDeps[1].end(), currNodeDeps[0].begin(), currNodeDeps[0].end());
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqPolSegDeRmDeItlNode, m_ehqGraph, currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
+        currNodeDeps[1].clear();
+        currNodeDeps[1].emplace_back(m_ehqPolSegDeRmDeItlNode);
+
+        //==========================================================================================================/
+        // add m_ehqPolarDecoderNode, parent node(s) : m_ehqPolSegDeRmDeItlNode                                     /
+        //                            sibling node(s): none                                                         /
+        //==========================================================================================================/
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqPolarDecoderNode, m_ehqGraph, currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
+    }
+
+} // createEarlyHarqGraph
+
+void PuschRx::createEarlyHarqOffloadingGraph()
+{
+#if CUDART_VERSION < 12000
+    throw cuphy::cuda_driver_exception("Device graph launch requires CUDA 12.0 or higher");
+#endif
+
+    CU_CHECK_EXCEPTION(cuGraphCreate(&m_ehqGraph, 0));
+
+    std::vector<CUgraphNode> currNodeDeps[2], nextNodeDeps[2], delayDepsNode;
+
+    void* arg;
+    void* kernelParams[2] = {&arg, &arg};
+
+    // Initialize empty nodes with 0, 1, and 2 input pointer args
+    CUPHY_CHECK(cuphySetEmptyKernelNodeParams(&m_emptyNode0paramDriver));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode1paramDriver, 1, &(kernelParams[0])));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode2paramsDriver, 2, &(kernelParams[0])));
+
+    // Use empty node as a root
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRootNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode0paramDriver));
+
+    //==========================================================================================================/
+    // add m_ehqChEstNodes, parent node  : m_ehqRootNode                                                        /
+    //                      sibling nodes: other m_ehqChEstNodes                                                /
+    //==========================================================================================================/
+    currNodeDeps[0].emplace_back(m_ehqRootNode);
+
+    // FIXME, settings should be part of the chest itself.
+    //  But it is used in too many places.
+    m_chest->earlyHarqGraph().addKernelNodeToGraph(m_ehqGraph,
+                                                       currNodeDeps[0],
+                                                       nextNodeDeps[0],
+                                                       m_emptyNode2paramsDriver);
+
+    //==========================================================================================================/
+    // add m_ehqNoiseIntfEstNodes, parent node(s) : m_ehqChEstNodes/m_ehqChEstSecondNodes                       /
+    //                             sibling node(s): other m_ehqNoiseIntfEstNodes                                /
+    //==========================================================================================================/
+    // At minimum equalizer coefficient compute depends on channel estimation. Additionally, if noise-interference estimation
+    // is enabled then it depends on that as well
+    nextNodeDeps[1] = nextNodeDeps[0];
+
+    if(m_chEstSettings.enableSinrMeasurement  || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo))
+    {
+        CUDA_KERNEL_NODE_PARAMS noiseIntfEstParamsDriver;
+        pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t descr;
+        void* kernelParams[] = {&descr};
+        const int numPtrArgs = 0;
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&noiseIntfEstParamsDriver, &kernelParams[0], numPtrArgs, sizeof(pusch_noise_intf_est::puschRxNoiseIntfEstDynDescr_t)));
+        // Noise-interference estimation depends on all channel estimations
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqNoiseIntfEstNodes[hetCfgIdx], m_ehqGraph, nextNodeDeps[0].data(), nextNodeDeps[0].size(), &noiseIntfEstParamsDriver));
+            nextNodeDeps[1].emplace_back(m_ehqNoiseIntfEstNodes[hetCfgIdx]);
+        }
+    }
+
+    //================================================================================================================================/
+    // add m_ehqChEqCoefCompNodes, parent node(s) : m_ehqChEstNodes/m_ehqChEstSecondNodes (and conditionally m_ehqNoiseIntfEstNodes)  /
+    //                             sibling node(s): other m_ehqChEqCoefCompNodes                                                      /
+    //================================================================================================================================/
+    // Since equalizer coefficient compute depends on channel, and noise-interference when enabled, soft demap
+    // only depend on equalizer coefficient compute
+    nextNodeDeps[0].clear();
+
+    {
+        CUDA_KERNEL_NODE_PARAMS chEqCoefCompParamsDriver;
+        channel_eq::puschRxChEqCoefCompDynDescr_t coef_comp_arg;
+        void* kernelParams[] = {&arg, &coef_comp_arg};
+        const int numPtrArgs = 1;
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqCoefCompParamsDriver, &kernelParams[0], numPtrArgs, sizeof(channel_eq::puschRxChEqCoefCompDynDescr_t)));
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqChEqCoefCompNodes[hetCfgIdx], m_ehqGraph, nextNodeDeps[1].data(), nextNodeDeps[1].size(), &chEqCoefCompParamsDriver));
+            nextNodeDeps[0].emplace_back(m_ehqChEqCoefCompNodes[hetCfgIdx]);
+        }
+    }
+
+    //==========================================================================================================/
+    // add m_ehqChEqSoftDemapNodes, parent node(s) : m_ehqChEqCoefCompNodes                                     /
+    //                              sibling node(s): other m_ehqChEqSoftDemapNodes                              /
+    //==========================================================================================================/
+    currNodeDeps[0] = nextNodeDeps[0];
+    nextNodeDeps[0].clear();
+
+    {
+        CUDA_KERNEL_NODE_PARAMS chEqSoftDemapParamsDriver;
+        channel_eq::puschRxChEqSoftDemapDynDescr_t soft_demap_arg;
+        void* kernelParams[] = {&arg, &soft_demap_arg};
+        const int numPtrArgs = 1;
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqSoftDemapParamsDriver, &kernelParams[0], numPtrArgs, sizeof(channel_eq::puschRxChEqSoftDemapDynDescr_t)));
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqChEqSoftDemapNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &chEqSoftDemapParamsDriver));
+            nextNodeDeps[0].emplace_back(m_ehqChEqSoftDemapNodes[hetCfgIdx]);
+        }
+    }
+
+    if(m_chEstSettings.enableDftSOfdm == 1)
+    {
+        //==========================================================================================================/
+        // add m_ehqChEqSoftDemapIdftNodes, parent node(s) : m_ehqChEqSoftDemapNodes                                /
+        //                                   sibling node(s): other m_ehqChEqSoftDemapIdftNodes                     /
+        //==========================================================================================================/
+        currNodeDeps[0] = nextNodeDeps[0];
+        nextNodeDeps[0].clear();
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqChEqSoftDemapIdftNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode2paramsDriver));
+            nextNodeDeps[0].emplace_back(m_ehqChEqSoftDemapIdftNodes[hetCfgIdx]);
+        }
+
+        //==========================================================================================================/
+        // add m_ehqChEqSoftDemapAfterDftNodes, parent node(s) : m_ehqChEqSoftDemapIDftNodes                        /
+        //                                      sibling node(s): other m_ehqChEqSoftDemapAfterDftNodes              /
+        //==========================================================================================================/
+        currNodeDeps[0] = nextNodeDeps[0];
+        nextNodeDeps[0].clear();
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqChEqSoftDemapAfterDftNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode2paramsDriver));
+            nextNodeDeps[0].emplace_back(m_ehqChEqSoftDemapAfterDftNodes[hetCfgIdx]);
+        }
+
+    }
+
+    // SCH backend and UCI backend kernels can start after soft demap
+    currNodeDeps[0] = nextNodeDeps[0];
+    nextNodeDeps[0].clear();
+    nextNodeDeps[1].clear();
+    currNodeDeps[1].clear();
+
+    //==========================================================================================================/
+    // add m_ehqCompCwTreeTypesNode, parent node(s) : m_ehqChEqSoftDemapAfterDftNodes                           /
+    //                               sibling node(s): m_ehqUciSegLLRs0Node, m_ehqRsrpNodes                      /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqCompCwTreeTypesNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+    currNodeDeps[1].emplace_back(m_ehqCompCwTreeTypesNode);
+
+    //==========================================================================================================/
+    // add m_ehqRsrpNodes,  parent node(s) : m_ehqChEqSoftDemapAfterDftNodes                                    /
+    //                      sibling node(s): m_ehqRssiNodes, m_ehqUciSegLLRs0Node, m_ehqCompCwTreeTypesNode     /
+    //==========================================================================================================/
+    // SINR and RSSI estimation can go in parallel with SCH backend and UCI backend kernels
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRsrpNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+            delayDepsNode.emplace_back(m_ehqRsrpNodes[hetCfgIdx]);
+        }
+    }
+
+    //==========================================================================================================/
+    // add m_ehqRssiNodes, parent node(s) : m_ehqChEqSoftDemapAfterDftNodes                                     /
+    //                     sibling node(s): m_ehqRsrpNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode            /
+    //==========================================================================================================/
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRssiNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+            delayDepsNode.emplace_back(m_ehqRssiNodes[hetCfgIdx]);
+        }
+    }
+
+    //==========================================================================================================/
+    // add m_ehqUciSegLLRs0Node, parent node(s) : m_ehqChEqSoftDemapNodes                                       /
+    //                           sibling node(s): m_ehqCompCwTreeTypesNode, m_ehqRsrpNodes, m_ehqRssiNodes      /
+    //==========================================================================================================/
+    // Most of these kernels are run optionally, and calling the setup function here during m_ehqGraph creation can cause issues
+    // if there's nothing to set up. Instead, we just use the null kernel here and update the nodes during updateGraph().
+    //if(m_nUciUes > 0)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqUciSegLLRs0Node, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        nextNodeDeps[0].emplace_back(m_ehqUciSegLLRs0Node);
+
+        // We have a dependency on the CSI-P1 control kernel for the next 3 kernels: simplex, RM and polar
+        // Simplex, RM and polar run in parallel
+        currNodeDeps[0] = nextNodeDeps[0];
+    }
+
+    //==========================================================================================================/
+    // add m_ehqSimplexDecoderNode, parent node(s) : m_ehqUciSegLLRs0Node                                       /
+    //                          sibling node(s): m_ehqRmDecoderNode, m_ehqCompCwTreeTypesNode                   /
+    //==========================================================================================================/
+    //if(m_nSpxCws_early > 0)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqSimplexDecoderNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        nextNodeDeps[1].emplace_back(m_ehqSimplexDecoderNode);
+    }
+
+    //==========================================================================================================/
+    // add m_ehqRmDecoderNode, parent node(s) : m_ehqUciSegLLRs0Node                                            /
+    //                     sibling node(s): m_ehqSimplexDecoderNode, m_ehqCompCwTreeTypesNode                   /
+    //==========================================================================================================/
+    //if(m_nRmCws > 0)
+    {
+        CUDA_KERNEL_NODE_PARAMS rmDecoderParamsDriver;
+        rmDecoderDynDescr_t arg;
+        void* kernelParams[] = {&arg};
+        const int numPtrArgs = 0;
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&rmDecoderParamsDriver, &kernelParams[0], numPtrArgs, sizeof(rmDecoderDynDescr_t)));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRmDecoderNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &rmDecoderParamsDriver));
+        nextNodeDeps[1].emplace_back(m_ehqRmDecoderNode);
+    }
+
+    //if(m_nPolUciSegs_early > 0)
+    {
+        //==========================================================================================================/
+        // add m_ehqPolSegDeRmDeItlNode, parent node(s) : m_ehqUciSegLLRs0Node, m_ehqCompCwTreeTypesNode            /
+        //                               sibling node(s): none                                                      /
+        //==========================================================================================================/
+        currNodeDeps[1].insert(currNodeDeps[1].end(), currNodeDeps[0].begin(), currNodeDeps[0].end());
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqPolSegDeRmDeItlNode, m_ehqGraph, currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
+        currNodeDeps[1].clear();
+        currNodeDeps[1].emplace_back(m_ehqPolSegDeRmDeItlNode);
+
+        //==========================================================================================================/
+        // add m_ehqPolarDecoderNode, parent node(s) : m_ehqPolSegDeRmDeItlNode                                     /
+        //                            sibling node(s): none                                                         /
+        //==========================================================================================================/
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqPolarDecoderNode, m_ehqGraph, currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
+        nextNodeDeps[1].emplace_back(m_ehqPolarDecoderNode);
+    }
+    
+    if(m_subSlotDelayUs!=0)
+    {
+        if(m_uciKernelSelOption == PUSCH_UCI_NO_UCI)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_subSlotDelayNode, m_ehqGraph, delayDepsNode.data(), delayDepsNode.size(), &m_emptyNode1paramDriver));
+        }
+        else if(m_uciKernelSelOption == PUSCH_UCI_NO_UCI_WITH_SEG)
+        {
+        
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_subSlotDelayNode, m_ehqGraph, &m_ehqUciSegLLRs0Node, 1, &m_emptyNode1paramDriver));
+        }
+    }
+
+} // createEarlyHarqOffloadingGraph
+
+void PuschRx::create72eEarlyHarqGraph()
+{
+#if CUDART_VERSION < 12000
+    throw cuphy::cuda_driver_exception("Device graph launch requires CUDA 12.0 or higher");
+#endif
+
+    CU_CHECK_EXCEPTION(cuGraphCreate(&m_ehqGraph, 0));
+
+    std::vector<CUgraphNode> currNodeDeps[2], nextNodeDeps[2];
+
+    void* arg;
+    void* kernelParams[2] = {&arg, &arg};
+
+    // Initialize empty nodes with 0, 1, and 2 input pointer args
+    CUPHY_CHECK(cuphySetEmptyKernelNodeParams(&m_emptyNode0paramDriver));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode1paramDriver, 1, &(kernelParams[0])));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode2paramsDriver, 2, &(kernelParams[0])));
+
+    // Use empty node as a root
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRootNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode0paramDriver));
+    currNodeDeps[0].emplace_back(m_ehqRootNode);
+
+
+    //==========================================================================================================/
+    // add m_ehqChEqSoftDemapNodes, parent node(s) : m_ehqRootNode                                              /
+    //                              sibling node(s): other m_ehqChEqSoftDemapNodes                              /
+    //==========================================================================================================/
+
+    {
+        CUDA_KERNEL_NODE_PARAMS chEqSoftDemapParamsDriver;
+        channel_eq::puschRxChEqSoftDemapDynDescr_t soft_demap_arg;
+        void* kernelParams[] = {&arg, &soft_demap_arg};
+        const int numPtrArgs = 1;
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqSoftDemapParamsDriver, &kernelParams[0], numPtrArgs, sizeof(channel_eq::puschRxChEqSoftDemapDynDescr_t)));
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqChEqSoftDemapNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &chEqSoftDemapParamsDriver));
+            nextNodeDeps[0].emplace_back(m_ehqChEqSoftDemapNodes[hetCfgIdx]);
+        }
+    }
+    
+    if(m_chEstSettings.enableDftSOfdm == 1)
+    {
+        //==========================================================================================================/
+        // add m_ehqChEqSoftDemapIdftNodes, parent node(s) : m_ehqChEqSoftDemapNodes                                /
+        //                                   sibling node(s): other m_ehqChEqSoftDemapIdftNodes                     /
+        //==========================================================================================================/
+        currNodeDeps[0] = nextNodeDeps[0];
+        nextNodeDeps[0].clear();
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqChEqSoftDemapIdftNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode2paramsDriver));
+            nextNodeDeps[0].emplace_back(m_ehqChEqSoftDemapIdftNodes[hetCfgIdx]);
+        }
+
+        //==========================================================================================================/
+        // add m_ehqChEqSoftDemapAfterDftNodes, parent node(s) : m_ehqChEqSoftDemapIDftNodes                        /
+        //                                      sibling node(s): other m_ehqChEqSoftDemapAfterDftNodes              /
+        //==========================================================================================================/
+        currNodeDeps[0] = nextNodeDeps[0];
+        nextNodeDeps[0].clear();
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqChEqSoftDemapAfterDftNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode2paramsDriver));
+            nextNodeDeps[0].emplace_back(m_ehqChEqSoftDemapAfterDftNodes[hetCfgIdx]);
+        }
+    }
+
+    // SCH backend and UCI backend kernels can start after soft demap
+    currNodeDeps[0] = nextNodeDeps[0];
+    nextNodeDeps[0].clear();
+    nextNodeDeps[1].clear();
+    currNodeDeps[1].clear();
+
+    if (m_useCbLdpc)
+    {
+        // Early-HARQ SCH backend: rate-match/clamp + CB decode child graph.
+        std::vector<CUgraphNode> schDeps = currNodeDeps[0];
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqResetRateMatchNode,
+                                                m_ehqGraph,
+                                                schDeps.data(),
+                                                schDeps.size(),
+                                                &m_emptyNode1paramDriver));
+        schDeps.clear();
+        schDeps.emplace_back(m_ehqResetRateMatchNode);
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRateMatchNode,
+                                                m_ehqGraph,
+                                                schDeps.data(),
+                                                schDeps.size(),
+                                                &m_emptyNode1paramDriver));
+        schDeps.clear();
+        schDeps.emplace_back(m_ehqRateMatchNode);
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqClampRateMatchNode,
+                                                m_ehqGraph,
+                                                schDeps.data(),
+                                                schDeps.size(),
+                                                &m_emptyNode1paramDriver));
+        schDeps.clear();
+        schDeps.emplace_back(m_ehqClampRateMatchNode);
+
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        addCbLdpcNodes(m_ehqGraph, schDeps, cb.early_nodes);
+    }
+
+    //==========================================================================================================/
+    // add m_ehqCompCwTreeTypesNode, parent node(s) : m_ehqChEqSoftDemapNodes                                   /
+    //                               sibling node(s): m_ehqUciSegLLRs0Node, m_ehqRsrpNodes                      /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqCompCwTreeTypesNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+    currNodeDeps[1].emplace_back(m_ehqCompCwTreeTypesNode);
+
+    //==========================================================================================================/
+    // add m_ehqRsrpNodes,  parent node(s) : m_ehqChEqSoftDemapNodes                                            /
+    //                      sibling node(s): m_ehqRssiNodes, m_ehqUciSegLLRs0Node, m_ehqCompCwTreeTypesNode     /
+    //==========================================================================================================/
+    // SINR and RSSI estimation can go in parallel with SCH backend and UCI backend kernels
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRsrpNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        }
+    }
+
+    //==========================================================================================================/
+    // add m_ehqRssiNodes, parent node(s) : m_ehqChEqSoftDemapNodes                                             /
     //                     sibling node(s): m_ehqRsrpNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode            /
     //==========================================================================================================/
     if(m_chEstSettings.enableRssiMeasurement)
@@ -2777,7 +3642,170 @@ void PuschRx::createEarlyHarqGraph()
         nextNodeDeps[1].emplace_back(m_ehqPolarDecoderNode);
     }
 
-}
+} // create72eEarlyHarqGraph
+
+void PuschRx::create72eEarlyHarqOffloadingGraph()
+{
+#if CUDART_VERSION < 12000
+    throw cuphy::cuda_driver_exception("Device graph launch requires CUDA 12.0 or higher");
+#endif
+
+    CU_CHECK_EXCEPTION(cuGraphCreate(&m_ehqGraph, 0));
+
+    std::vector<CUgraphNode> currNodeDeps[2], nextNodeDeps[2], delayDepsNode;
+
+    void* arg;
+    void* kernelParams[2] = {&arg, &arg};
+
+    // Initialize empty nodes with 0, 1, and 2 input pointer args
+    CUPHY_CHECK(cuphySetEmptyKernelNodeParams(&m_emptyNode0paramDriver));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode1paramDriver, 1, &(kernelParams[0])));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode2paramsDriver, 2, &(kernelParams[0])));
+
+    // Use empty node as a root
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRootNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode0paramDriver));
+    currNodeDeps[0].emplace_back(m_ehqRootNode);
+
+
+    //==========================================================================================================/
+    // add m_ehqChEqSoftDemapNodes, parent node(s) : m_ehqRootNode                                              /
+    //                              sibling node(s): other m_ehqChEqSoftDemapNodes                              /
+    //==========================================================================================================/
+
+    {
+        CUDA_KERNEL_NODE_PARAMS chEqSoftDemapParamsDriver;
+        channel_eq::puschRxChEqSoftDemapDynDescr_t soft_demap_arg;
+        void* kernelParams[] = {&arg, &soft_demap_arg};
+        const int numPtrArgs = 1;
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&chEqSoftDemapParamsDriver, &kernelParams[0], numPtrArgs, sizeof(channel_eq::puschRxChEqSoftDemapDynDescr_t)));
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqChEqSoftDemapNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &chEqSoftDemapParamsDriver));
+            nextNodeDeps[0].emplace_back(m_ehqChEqSoftDemapNodes[hetCfgIdx]);
+        }
+    }
+    
+    if(m_kernelSelOption == PUSCH_NO_SD_DERATE_MATCHING_FEC)
+    {
+        delayDepsNode = currNodeDeps[0];
+    }
+    else
+    {
+        delayDepsNode = nextNodeDeps[0];
+    }
+
+    // SCH backend and UCI backend kernels can start after soft demap
+    currNodeDeps[0] = nextNodeDeps[0];
+    nextNodeDeps[0].clear();
+    nextNodeDeps[1].clear();
+    currNodeDeps[1].clear();
+
+    //==========================================================================================================/
+    // add m_ehqCompCwTreeTypesNode, parent node(s) : m_ehqChEqSoftDemapNodes                                   /
+    //                               sibling node(s): m_ehqUciSegLLRs0Node, m_ehqRsrpNodes                      /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqCompCwTreeTypesNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+    currNodeDeps[1].emplace_back(m_ehqCompCwTreeTypesNode);
+
+    //==========================================================================================================/
+    // add m_ehqRsrpNodes,  parent node(s) : m_ehqChEqSoftDemapNodes                                            /
+    //                      sibling node(s): m_ehqRssiNodes, m_ehqUciSegLLRs0Node, m_ehqCompCwTreeTypesNode     /
+    //==========================================================================================================/
+    // SINR and RSSI estimation can go in parallel with SCH backend and UCI backend kernels
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRsrpNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        }
+    }
+
+    //==========================================================================================================/
+    // add m_ehqRssiNodes, parent node(s) : m_ehqChEqSoftDemapNodes                                             /
+    //                     sibling node(s): m_ehqRsrpNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode            /
+    //==========================================================================================================/
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRssiNodes[hetCfgIdx], m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        }
+    }
+
+    //==========================================================================================================/
+    // add m_ehqUciSegLLRs0Node, parent node(s) : m_ehqChEqSoftDemapNodes                                       /
+    //                           sibling node(s): m_ehqCompCwTreeTypesNode, m_ehqRsrpNodes, m_ehqRssiNodes      /
+    //==========================================================================================================/
+    // Most of these kernels are run optionally, and calling the setup function here during m_ehqGraph creation can cause issues
+    // if there's nothing to set up. Instead, we just use the null kernel here and update the nodes during updateGraph().
+    //if(m_nUciUes > 0)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqUciSegLLRs0Node, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        nextNodeDeps[0].emplace_back(m_ehqUciSegLLRs0Node);
+
+        // We have a dependency on the CSI-P1 control kernel for the next 3 kernels: simplex, RM and polar
+        // Simplex, RM and polar run in parallel
+        currNodeDeps[0] = nextNodeDeps[0];
+    }
+
+    //==========================================================================================================/
+    // add m_ehqSimplexDecoderNode, parent node(s) : m_ehqUciSegLLRs0Node                                       /
+    //                          sibling node(s): m_ehqRmDecoderNode, m_ehqCompCwTreeTypesNode                   /
+    //==========================================================================================================/
+    //if(m_nSpxCws_early > 0)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqSimplexDecoderNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &m_emptyNode1paramDriver));
+        nextNodeDeps[1].emplace_back(m_ehqSimplexDecoderNode);
+    }
+
+    //==========================================================================================================/
+    // add m_ehqRmDecoderNode, parent node(s) : m_ehqUciSegLLRs0Node                                            /
+    //                     sibling node(s): m_ehqSimplexDecoderNode, m_ehqCompCwTreeTypesNode                   /
+    //==========================================================================================================/
+    //if(m_nRmCws > 0)
+    {
+        CUDA_KERNEL_NODE_PARAMS rmDecoderParamsDriver;
+        rmDecoderDynDescr_t arg;
+        void* kernelParams[] = {&arg};
+        const int numPtrArgs = 0;
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&rmDecoderParamsDriver, &kernelParams[0], numPtrArgs, sizeof(rmDecoderDynDescr_t)));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqRmDecoderNode, m_ehqGraph, currNodeDeps[0].data(), currNodeDeps[0].size(), &rmDecoderParamsDriver));
+        nextNodeDeps[1].emplace_back(m_ehqRmDecoderNode);
+    }
+
+    //if(m_nPolUciSegs_early > 0)
+    {
+        //==========================================================================================================/
+        // add m_ehqPolSegDeRmDeItlNode, parent node(s) : m_ehqUciSegLLRs0Node, m_ehqCompCwTreeTypesNode            /
+        //                               sibling node(s): none                                                      /
+        //==========================================================================================================/
+        currNodeDeps[1].insert(currNodeDeps[1].end(), currNodeDeps[0].begin(), currNodeDeps[0].end());
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqPolSegDeRmDeItlNode, m_ehqGraph, currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
+        currNodeDeps[1].clear();
+        currNodeDeps[1].emplace_back(m_ehqPolSegDeRmDeItlNode);
+
+        //==========================================================================================================/
+        // add m_ehqPolarDecoderNode, parent node(s) : m_ehqPolSegDeRmDeItlNode                                     /
+        //                            sibling node(s): none                                                         /
+        //==========================================================================================================/
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ehqPolarDecoderNode, m_ehqGraph, currNodeDeps[1].data(), currNodeDeps[1].size(), &m_emptyNode1paramDriver));
+        nextNodeDeps[1].emplace_back(m_ehqPolarDecoderNode);
+    }
+    
+    if(m_subSlotDelayUs!=0)
+    {
+        if(m_uciKernelSelOption == PUSCH_UCI_NO_UCI)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_subSlotDelayNode, m_ehqGraph, delayDepsNode.data(), delayDepsNode.size(), &m_emptyNode1paramDriver));
+        }
+        else if(m_uciKernelSelOption == PUSCH_UCI_NO_UCI_WITH_SEG)
+        {
+        
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_subSlotDelayNode, m_ehqGraph, &m_ehqUciSegLLRs0Node, 1, &m_emptyNode1paramDriver));
+        }
+    }
+
+} // create72eEarlyHarqOffloadingGraph
 
 void PuschRx::createFrontLoadedDmrsGraph()
 {
@@ -3004,21 +4032,33 @@ StageResult PuschRx::buildSchBackendStage(cuphyPuschFullSlotProcMode_t    fullSl
     nextDeps.emplace_back(m_clampRateMatchNode[fullSlotProcMode]);
 
     //==========================================================================================================/
-    // add m_ldpcDecoderNodes, parent node(s) : m_clampRateMatchNode                                            /
+    // add LDPC decoder nodes, parent node(s) : m_clampRateMatchNode                                           /
     //                         sibling node(s): other m_ldpcDecNodes                                            /
     //==========================================================================================================/
     currDeps = nextDeps;
     nextDeps.clear();
 
-    for (int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+    if (m_useCbLdpc)
     {
-        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_ldpcDecoderNodes[fullSlotProcMode][i],
-                                                *pGraph,
-                                                currDeps.data(),
-                                                currDeps.size(),
-                                                &m_emptyNode2paramsDriver));
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        addCbLdpcNodes(*pGraph, currDeps, cb.full_nodes[fullSlotProcMode]);
+        nextDeps.insert(nextDeps.end(),
+                        cb.full_nodes[fullSlotProcMode].begin(),
+                        cb.full_nodes[fullSlotProcMode].end());
+    }
+    else
+    {
+        auto& tb = std::get<TbLdpcState>(m_ldpcState);
+        for (int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&tb.decoder_nodes[fullSlotProcMode][i],
+                                                    *pGraph,
+                                                    currDeps.data(),
+                                                    currDeps.size(),
+                                                    &m_emptyNode2paramsDriver));
 
-        nextDeps.emplace_back(m_ldpcDecoderNodes[fullSlotProcMode][i]);
+            nextDeps.emplace_back(tb.decoder_nodes[fullSlotProcMode][i]);
+        }
     }
 
     //==========================================================================================================/
@@ -3488,7 +4528,177 @@ StageResult PuschRx::buildUciP1BackendStage(cuphyPuschFullSlotProcMode_t    full
     result.terminalNodes.emplace_back(m_polarDecoderNode[fullSlotProcMode]);
 
     return result;
-}
+} //buildUciP1BackendStage
+
+StageResult PuschRx::buildUciP1OffloadingBackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
+                                                      CUgraph*                        pGraph,
+                                                      const std::vector<CUgraphNode>& softDemapParents)
+{
+    StageResult result;
+
+    // Local dep vectors
+    std::vector<CUgraphNode> currDeps = softDemapParents;
+    std::vector<CUgraphNode> tmpDeps;
+    std::vector<CUgraphNode> compCwDeps;
+
+    //======================================================================================================/
+    // m_compCwTreeTypesNode, parent node(s): soft demap / after-DFT nodes                                  /
+    //                        sibling node(s): m_rssiNodes, m_uciSegLLRs0Node, m_rsrpNodes                  /
+    //======================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_compCwTreeTypesNode[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    compCwDeps.clear();
+    compCwDeps.emplace_back(m_compCwTreeTypesNode[fullSlotProcMode]);
+
+    //=======================================================================================================/
+    // m_rsrpNodes, parent node(s): soft demap nodes                                                         /
+    //              sibling node(s): m_rssiNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode                   /
+    //=======================================================================================================/
+    if((m_chEstSettings.enableSinrMeasurement) && ((m_chEstSettings.enableWeightedAverageCfo != 1) ||
+                                                   (fullSlotProcMode == PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC)))
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(
+                &m_rsrpNodes[fullSlotProcMode][hetCfgIdx],
+                *pGraph,
+                currDeps.data(),
+                currDeps.size(),
+                &m_emptyNode1paramDriver));
+        }
+    }
+
+    //=======================================================================================================/
+    // m_rssiNodes, parent node(s): m_chEqSoftDemapNodes                                                     /
+    //              sibling node(s): m_rsrpNodes, m_uciSegLLRs0Node, m_compCwTreeTypesNode                   /
+    //=======================================================================================================/
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS; ++hetCfgIdx)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rssiNodes[fullSlotProcMode][hetCfgIdx],
+                                                    *pGraph,
+                                                    currDeps.data(),
+                                                    currDeps.size(),
+                                                    &m_emptyNode1paramDriver));
+        }
+    }
+
+    //==========================================================================================================/
+    // m_uciSegLLRs0Node, parent node(s): soft demap nodes                                                      /
+    //                    sibling node(s): m_rsrpNodes, m_rssiNodes, m_compCwTreeTypesNode                      /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_uciSegLLRs0Node[fullSlotProcMode],
+                                            *pGraph,
+                                            currDeps.data(),
+                                            currDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    CUgraphNode uciSegNode = m_uciSegLLRs0Node[fullSlotProcMode];
+
+    //==========================================================================================================/
+    // UCI P1 decoders: Simplex and RM, parents: m_uciSegLLRs0Node                                              /
+    //==========================================================================================================/
+
+    result.terminalNodes.clear();
+    
+    if(m_uciKernelSelOption == PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        result.terminalNodes.emplace_back(m_uciSegLLRs0Node[fullSlotProcMode]);
+    }
+    
+    if((m_openRanFunctionalSplitOption==PUSCH_7_2_A) && (m_uciKernelSelOption == PUSCH_UCI_NO_UCI_WITH_SEG || m_uciKernelSelOption == PUSCH_UCI_NO_UCI))
+    {
+        if(m_chEstSettings.enableRssiMeasurement)
+        {
+            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS; ++hetCfgIdx)
+            {
+                result.terminalNodes.emplace_back(m_rssiNodes[fullSlotProcMode][hetCfgIdx]);
+            }
+        }
+        
+        if((m_chEstSettings.enableSinrMeasurement) && ((m_chEstSettings.enableWeightedAverageCfo != 1) ||
+                                                   (fullSlotProcMode == PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC)))
+        {
+            for(int hetCfgIdx = 0; hetCfgIdx < CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS; ++hetCfgIdx)
+            {
+                result.terminalNodes.emplace_back(m_rsrpNodes[fullSlotProcMode][hetCfgIdx]);
+            }
+            
+        }
+    }
+
+    //==========================================================================================================/
+    // add m_simplexDecoderNode, parent node(s) : m_uciSegLLRs0Node                                             /
+    //                       sibling node(s): m_rmDecoderNode, m_compCwTreeTypesNode                            /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_simplexDecoderNode[fullSlotProcMode],
+                                            *pGraph,
+                                            &uciSegNode,
+                                            1,
+                                            &m_emptyNode1paramDriver));
+
+    result.terminalNodes.emplace_back(m_simplexDecoderNode[fullSlotProcMode]);
+
+    //==========================================================================================================/
+    // add m_rmDecoderNode, parent node(s) : m_uciSegLLRs0Node                                                  /
+    //                  sibling node(s): m_simplexDecoderNode, m_compCwTreeTypesNode                            /
+    //==========================================================================================================/
+    {
+        CUDA_KERNEL_NODE_PARAMS rmDecoderParamsDriver;
+        rmDecoderDynDescr_t     arg;
+        void*                   kernelParams[] = {&arg};
+        const int               numPtrArgs     = 0;
+
+        CUPHY_CHECK(cuphySetGenericEmptyKernelNodeGridConstantParams(&rmDecoderParamsDriver,
+                                                                     &kernelParams[0],
+                                                                     numPtrArgs,
+                                                                     sizeof(rmDecoderDynDescr_t)));
+
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rmDecoderNode[fullSlotProcMode],
+                                                *pGraph,
+                                                &uciSegNode,
+                                                1,
+                                                &rmDecoderParamsDriver));
+
+        result.terminalNodes.emplace_back(m_rmDecoderNode[fullSlotProcMode]);
+    }
+
+    // Polar path
+    tmpDeps.clear();
+    tmpDeps.insert(tmpDeps.end(), compCwDeps.begin(), compCwDeps.end());
+    tmpDeps.emplace_back(uciSegNode);
+
+    //==========================================================================================================/
+    // add m_polSegDeRmDeItlNode, parent node(s) : m_uciSegLLRs0Node + m_compCwTreeTypesNode                    /
+    //                            sibling node(s): none                                                         /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_polSegDeRmDeItlNode[fullSlotProcMode],
+                                            *pGraph,
+                                            tmpDeps.data(),
+                                            tmpDeps.size(),
+                                            &m_emptyNode1paramDriver));
+
+    CUgraphNode polSegNode = m_polSegDeRmDeItlNode[fullSlotProcMode];
+
+    //==========================================================================================================/
+    // add m_polarDecoderNode, parent node(s) : m_polSegDeRmDeItlNode                                           /
+    //                         sibling node(s): none                                                            /
+    //==========================================================================================================/
+    CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_polarDecoderNode[fullSlotProcMode],
+                                            *pGraph,
+                                            &polSegNode,
+                                            1,
+                                            &m_emptyNode1paramDriver));
+
+    result.terminalNodes.emplace_back(m_polarDecoderNode[fullSlotProcMode]);
+
+    return result;
+} //buildUciP1OffloadingBackendStage
 
 StageResult PuschRx::buildCsiP2BackendStage(cuphyPuschFullSlotProcMode_t    fullSlotProcMode,
                                             CUgraph*                        pGraph,
@@ -4063,7 +5273,643 @@ void PuschRx::createFullSlotGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode,
                                                 &(condInfo.m_init_C0_node_params)));
         // Need to explicitly upload to the device before launching the graph
     }
-}
+} // createFullSlotGraph
+
+void PuschRx::createFullSlotOffloadingGraph(cuphyPuschFullSlotProcMode_t fullSlotProcMode,
+                                            CUgraph&                     fullSlotGraph,
+                                            CUgraphNode&                 emptyRootNode,
+                                            condGraphInfo&               condInfo)
+{
+    CU_CHECK_EXCEPTION(cuGraphCreate(&fullSlotGraph, 0));
+
+    // Dependency vectors (xParents = inputs to stage x)
+    std::vector<CUgraphNode> rootParents;       // inputs to Front-end (after C0)
+    std::vector<CUgraphNode> softDemapParents;  // inputs to Soft-demapper (EQ-coef outputs)
+    std::vector<CUgraphNode> uciP1Parents;      // inputs to UCI-P1 (Soft-demapper outputs)
+    std::vector<CUgraphNode> csiP2Parents;      // inputs to CSI-P2 (UCI-P1 decoders' outputs)
+    std::vector<CUgraphNode> schParents;        // inputs to SCH backend (SegLLRs2)
+
+    // For device-graphs, stash parents per stage
+    std::vector<CUgraphNode> dglParentsC1;      // parents for C1 device graph launch
+    std::vector<CUgraphNode> dglParentsC2;      // parents for C2 device graph launch
+
+    void* arg;
+    void* kernelParams[2] = {&arg, &arg};
+
+    // Initialize empty nodes with 0, 1, and 2 input pointer args
+    CUPHY_CHECK(cuphySetEmptyKernelNodeParams(&m_emptyNode0paramDriver));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode1paramDriver, 1, &(kernelParams[0])));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode2paramsDriver, 2, &(kernelParams[0])));
+
+    // Only useful if at least any one of USE_COND_GRAPH_NODE_C[0-2] is set to 1
+    CUcontext current_context;
+    CU_CHECK_EXCEPTION(cuCtxGetCurrent(&current_context));
+    unsigned int cond_handle_flags = 0; // Relevant for cond. handle creation in PUSCH_COND_IF_NODES_W_KERNEL mode.
+
+    // C0: root conditional / graph selection stage
+    {
+        CondStage c0Stage = enterConditionalStage0(fullSlotGraph,
+                                                   emptyRootNode,
+                                                   condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   rootParents); // initial parents, currently empty
+
+        // Subsequent stages (front-end, soft demap, etc.) use this graph and parents.
+        condInfo.m_pGraph[0] = c0Stage.pGraph;
+        rootParents          = std::move(c0Stage.parents);
+    }
+
+    //==========================================================================================================/
+    // Front-end stage: ChEst + (optional) noise/intf, RSRP, CFO/TA + EQ coefficient compute                    /
+    //==========================================================================================================/
+    if (fullSlotProcMode == PUSCH_LEGACY_FULL_SLOT_PROC)
+    {
+        StageResult frontEndStage = buildFrontEndStage(fullSlotProcMode,
+                                                       condInfo.m_pGraph[0],
+                                                       rootParents,
+                                                       arg);
+
+        // EQ-coefficient compute nodes become the parents for the soft-demapper stage.
+        softDemapParents = std::move(frontEndStage.terminalNodes);
+    }
+
+    //==========================================================================================================/
+    // Soft-demapper stage (incl. optional DFT-S-OFDM)                                                          /
+    //==========================================================================================================/
+    {
+        // For legacy mode, softDemapParents holds all m_chEqCoefCompNodes at this point.
+        // For other modes, this will follow the existing behavior (empty parents unless set elsewhere).
+        StageResult softDemapStage = buildSoftDemapStage(fullSlotProcMode,
+                                                         condInfo.m_pGraph[0],
+                                                         softDemapParents,
+                                                         arg);
+
+        // UCI backend kernels can start after soft demap.
+        uciP1Parents = std::move(softDemapStage.terminalNodes);
+    }
+
+    //==========================================================================================================/
+    // C1: optional conditional/device graph stage after soft demap                                             /
+    //==========================================================================================================/
+    {
+        CondStage c1Stage = enterConditionalStage1(condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   uciP1Parents, // parents = soft-demap (or after-DFT) nodes
+                                                   dglParentsC1);
+
+        condInfo.m_pGraph[1] = c1Stage.pGraph;
+        uciP1Parents         = std::move(c1Stage.parents); // inputs to UCI-P1 (post-C1)
+    }
+
+    //==========================================================================================================/
+    // Post-soft-demap fan-out: compute UCI metrics and launch UCI-P1 decoders (Simplex, RM, Polar)             /
+    //==========================================================================================================/
+    {
+        StageResult uciP1Stage = buildUciP1OffloadingBackendStage(fullSlotProcMode,
+                                                                  condInfo.m_pGraph[1],
+                                                                  uciP1Parents);
+
+        // The three UCI P1 decoders (Simplex, RM, Polar) become the parents for
+        // the CSI-P2 control / C2 conditional-graph logic that follows.
+        csiP2Parents = std::move(uciP1Stage.terminalNodes); // inputs to CSI-P2
+    }
+
+    //==========================================================================================================/
+    // C2: optional conditional/device graph stage between UCI-P1 and CSI-P2/SCH                                /
+    //==========================================================================================================/
+    bool use_cond_if_node_c2 =
+        (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C2 == 1);
+    bool use_cond_if_or_dgl_node_c2 =
+        (m_workCancelMode != PUSCH_NO_WORK_CANCEL) && (USE_COND_GRAPH_NODE_C2 == 1);
+
+    {
+        // csiP2Parents currently holds the UCI-P1 decoder nodes.
+        CondStage c2Stage = enterConditionalStage2(condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   use_cond_if_node_c2,
+                                                   csiP2Parents,  // parents for C2
+                                                   dglParentsC2);
+
+        condInfo.m_pGraph[2] = c2Stage.pGraph;
+        // We intentionally do NOT override csiP2Parents here:
+        // buildCsiP2BackendStage() still needs these parents.
+        // Whether they are used as actual parents for CSI-P2 control is governed
+        // by use_cond_if_or_dgl_node_c2 (passed to buildCsiP2BackendStage).
+    }
+
+    //===================================== CSI-P2 =======================================
+
+    //if(m_nCsi2Ues > 0) // If this gets uncommented, then the conditional graph node code above also has to be updated
+    {
+        // CSI-P2 backend (control + UCI decoders) built off UCI-P1 decoder outputs.
+        // csiP2Parents currently holds [simplexP1, rmP1, polarP1].
+        StageResult csi2Stage = buildCsiP2BackendStage(fullSlotProcMode,
+                                                       condInfo.m_pGraph[2],
+                                                       csiP2Parents,
+                                                       use_cond_if_or_dgl_node_c2);
+
+        // For SCH backend, we need SegLLRs2 as the parent.
+        schParents = std::move(csi2Stage.terminalNodes);
+    }
+    
+    // add event record for the UCI-on-PUSCH completion
+    if(m_uciKernelSelOption==PUSCH_UCI_NO_UCI)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddEventRecordNode(&m_uciOnPuschCompletedEventNode[fullSlotProcMode], *(condInfo.m_pGraph[2]), uciP1Parents.data(), uciP1Parents.size(), m_cuphyPuschStatPrms.uciOnPuschCompletedEvent));
+    }
+    else if(m_uciKernelSelOption==PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddEventRecordNode(&m_uciOnPuschCompletedEventNode[fullSlotProcMode], *(condInfo.m_pGraph[2]), csiP2Parents.data(), csiP2Parents.size(), m_cuphyPuschStatPrms.uciOnPuschCompletedEvent));
+    }
+    else
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddEventRecordNode(&m_uciOnPuschCompletedEventNode[fullSlotProcMode], *(condInfo.m_pGraph[2]), schParents.data(), schParents.size(), m_cuphyPuschStatPrms.uciOnPuschCompletedEvent));
+    }
+
+    //===================================== SCH backend (LDPC + CRC) ===========================================/
+
+    // if (m_nSchUes > 0)
+    {
+        // SCH backend (derate-match, LDPC, CRC) of CSI-P2 UEs needs to wait until
+        // CSI-P2/SCH demux (SegLLRs2) occurs. schParents currently holds m_uciOnPuschCsi2SegLLRs2Node.
+        StageResult schStage = buildSchBackendStage(fullSlotProcMode,
+                                                    condInfo.m_pGraph[2],
+                                                    schParents);
+
+        // No further graph nodes depend on SCH backend in this function today,
+        // but keep / move the terminal nodes if needed for future extensions.
+        schParents = std::move(schStage.terminalNodes);
+    }
+    
+    if(m_delayUs!=0)
+    {
+        if(m_kernelSelOption==PUSCH_NO_DERATE_MATCHING_FEC || m_kernelSelOption==PUSCH_NO_SD_DERATE_MATCHING_FEC)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_fullSlotDelayNode, *(condInfo.m_pGraph[2]), csiP2Parents.data(), csiP2Parents.size(), &m_emptyNode1paramDriver));
+        }
+        else
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_fullSlotDelayNode, *(condInfo.m_pGraph[2]), schParents.data(), schParents.size(), &m_emptyNode1paramDriver));
+        }
+    }
+
+    //===================================== Device-graph launch wiring (DGL) ===================================/
+
+    if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        // C2 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[2],
+                                              *condInfo.m_pGraph[2],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c2[2] = {&m_workCancelPtr, &condInfo.m_graphExec[2]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C2_node_params,
+                                                       &pKArgs_node_c2[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G2_init_cond_node),
+                                                condInfo.m_graph[1],
+                                                dglParentsC2.data(),
+                                                dglParentsC2.size(),
+                                                &(condInfo.m_init_C2_node_params)));
+
+        // C1 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[1],
+                                              *condInfo.m_pGraph[1],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c1[2] = {&m_workCancelPtr, &condInfo.m_graphExec[1]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C1_node_params,
+                                                       &pKArgs_node_c1[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G1_init_cond_node),
+                                                condInfo.m_graph[0],
+                                                dglParentsC1.data(),
+                                                dglParentsC1.size(),
+                                                &(condInfo.m_init_C1_node_params)));
+
+        // C0 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[0],
+                                              *condInfo.m_pGraph[0],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c0[2] = {&m_workCancelPtr, &condInfo.m_graphExec[0]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C0_node_params,
+                                                       &pKArgs_node_c0[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G0_init_cond_node),
+                                                fullSlotGraph,
+                                                nullptr,
+                                                0,
+                                                &(condInfo.m_init_C0_node_params)));
+        // Need to explicitly upload to the device before launching the graph
+    }
+} // createFullSlotOffloadingGraph
+
+void PuschRx::create72eFullSlotGraph(CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo& condInfo)
+{
+    CU_CHECK_EXCEPTION(cuGraphCreate(&fullSlotGraph, 0));
+
+    // Dependency vectors (xParents = inputs to stage x)
+    std::vector<CUgraphNode> rootParents;       // inputs to Front-end (after C0)
+    std::vector<CUgraphNode> softDemapParents;  // inputs to Soft-demapper (EQ-coef outputs)
+    std::vector<CUgraphNode> uciP1Parents;      // inputs to UCI-P1 (Soft-demapper outputs)
+    std::vector<CUgraphNode> csiP2Parents;      // inputs to CSI-P2 (UCI-P1 decoders' outputs)
+    std::vector<CUgraphNode> schParents;        // inputs to SCH backend (SegLLRs2)
+
+    // For device-graphs, stash parents per stage
+    std::vector<CUgraphNode> dglParentsC1;      // parents for C1 device graph launch
+    std::vector<CUgraphNode> dglParentsC2;      // parents for C2 device graph launch
+
+    void* arg;
+    void* kernelParams[2] = {&arg, &arg};
+
+    // Initialize empty nodes with 0, 1, and 2 input pointer args
+    CUPHY_CHECK(cuphySetEmptyKernelNodeParams(&m_emptyNode0paramDriver));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode1paramDriver, 1, &(kernelParams[0])));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode2paramsDriver, 2, &(kernelParams[0])));
+
+    // Only useful if at least any one of USE_COND_GRAPH_NODE_C[0-2] is set to 1
+    CUcontext current_context;
+    CU_CHECK_EXCEPTION(cuCtxGetCurrent(&current_context));
+    unsigned int cond_handle_flags = 0; // Relevant for cond. handle creation in PUSCH_COND_IF_NODES_W_KERNEL mode.
+
+    // C0: root conditional / graph selection stage
+    {
+        CondStage c0Stage = enterConditionalStage0(fullSlotGraph,
+                                                   emptyRootNode,
+                                                   condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   rootParents); // initial parents, currently empty
+
+        // Subsequent stages (front-end, soft demap, etc.) use this graph and parents.
+        condInfo.m_pGraph[0] = c0Stage.pGraph;
+        rootParents          = std::move(c0Stage.parents);
+    }
+
+    //==========================================================================================================/
+    // Soft-demapper stage (incl. optional DFT-S-OFDM)                                                          /
+    //==========================================================================================================/
+    {
+        softDemapParents = rootParents;
+        // For legacy mode, softDemapParents holds all m_chEqCoefCompNodes at this point.
+        // For other modes, this will follow the existing behavior (empty parents unless set elsewhere).
+        StageResult softDemapStage = buildSoftDemapStage(PUSCH_LEGACY_FULL_SLOT_PROC,
+                                                         condInfo.m_pGraph[0],
+                                                         softDemapParents,
+                                                         arg);
+
+        // UCI backend kernels can start after soft demap.
+        uciP1Parents = std::move(softDemapStage.terminalNodes);
+    }
+    
+    //==========================================================================================================/
+    // C1: optional conditional/device graph stage after soft demap                                             /
+    //==========================================================================================================/
+    {
+        CondStage c1Stage = enterConditionalStage1(condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   uciP1Parents, // parents = soft-demap (or after-DFT) nodes
+                                                   dglParentsC1);
+
+        condInfo.m_pGraph[1] = c1Stage.pGraph;
+        uciP1Parents         = std::move(c1Stage.parents); // inputs to UCI-P1 (post-C1)
+    }
+
+    //==========================================================================================================/
+    // Post-soft-demap fan-out: compute UCI metrics and launch UCI-P1 decoders (Simplex, RM, Polar)             /
+    //==========================================================================================================/
+    {
+        StageResult uciP1Stage = buildUciP1BackendStage(PUSCH_LEGACY_FULL_SLOT_PROC,
+                                                        condInfo.m_pGraph[1],
+                                                        uciP1Parents);
+
+        // The three UCI P1 decoders (Simplex, RM, Polar) become the parents for
+        // the CSI-P2 control / C2 conditional-graph logic that follows.
+        csiP2Parents = std::move(uciP1Stage.terminalNodes); // inputs to CSI-P2
+    }
+
+    //==========================================================================================================/
+    // C2: optional conditional/device graph stage between UCI-P1 and CSI-P2/SCH                                /
+    //==========================================================================================================/
+    bool use_cond_if_node_c2 =
+        (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C2 == 1);
+    bool use_cond_if_or_dgl_node_c2 =
+        (m_workCancelMode != PUSCH_NO_WORK_CANCEL) && (USE_COND_GRAPH_NODE_C2 == 1);
+
+    {
+        // csiP2Parents currently holds the UCI-P1 decoder nodes.
+        CondStage c2Stage = enterConditionalStage2(condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   use_cond_if_node_c2,
+                                                   csiP2Parents,  // parents for C2
+                                                   dglParentsC2);
+
+        condInfo.m_pGraph[2] = c2Stage.pGraph;
+        // We intentionally do NOT override csiP2Parents here:
+        // buildCsiP2BackendStage() still needs these parents.
+        // Whether they are used as actual parents for CSI-P2 control is governed
+        // by use_cond_if_or_dgl_node_c2 (passed to buildCsiP2BackendStage).
+    }
+
+    //===================================== CSI-P2 =======================================
+
+    //if(m_nCsi2Ues > 0) // If this gets uncommented, then the conditional graph node code above also has to be updated
+    {
+        // CSI-P2 backend (control + UCI decoders) built off UCI-P1 decoder outputs.
+        // csiP2Parents currently holds [simplexP1, rmP1, polarP1].
+        StageResult csi2Stage = buildCsiP2BackendStage(PUSCH_LEGACY_FULL_SLOT_PROC,
+                                                       condInfo.m_pGraph[2],
+                                                       csiP2Parents,
+                                                       use_cond_if_or_dgl_node_c2);
+
+        // For SCH backend, we need SegLLRs2 as the parent.
+        schParents = std::move(csi2Stage.terminalNodes);
+    }
+
+    //===================================== SCH backend (LDPC + CRC) ===========================================/
+
+    // if (m_nSchUes > 0)
+    {
+        StageResult schStage = buildSchBackendStage(PUSCH_LEGACY_FULL_SLOT_PROC,
+                                                    condInfo.m_pGraph[2],
+                                                    schParents);
+
+        // No further graph nodes depend on SCH backend in this function today,
+        // but keep / move the terminal nodes if needed for future extensions.
+        schParents = std::move(schStage.terminalNodes);
+    }
+
+    //===================================== Device-graph launch wiring (DGL) ===================================/
+
+    if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        // C2 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[2],
+                                              *condInfo.m_pGraph[2],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c2[2] = {&m_workCancelPtr, &condInfo.m_graphExec[2]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C2_node_params,
+                                                       &pKArgs_node_c2[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G2_init_cond_node),
+                                                condInfo.m_graph[1],
+                                                dglParentsC2.data(),
+                                                dglParentsC2.size(),
+                                                &(condInfo.m_init_C2_node_params)));
+
+        // C1 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[1],
+                                              *condInfo.m_pGraph[1],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c1[2] = {&m_workCancelPtr, &condInfo.m_graphExec[1]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C1_node_params,
+                                                       &pKArgs_node_c1[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G1_init_cond_node),
+                                                condInfo.m_graph[0],
+                                                dglParentsC1.data(),
+                                                dglParentsC1.size(),
+                                                &(condInfo.m_init_C1_node_params)));
+
+        // C0 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[0],
+                                              *condInfo.m_pGraph[0],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c0[2] = {&m_workCancelPtr, &condInfo.m_graphExec[0]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C0_node_params,
+                                                       &pKArgs_node_c0[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G0_init_cond_node),
+                                                fullSlotGraph,
+                                                nullptr,
+                                                0,
+                                                &(condInfo.m_init_C0_node_params)));
+        // Need to explicitly upload to the device before launching the graph
+    }
+} // create72eFullSlotGraph
+
+void PuschRx::create72eFullSlotOffloadingGraph(CUgraph& fullSlotGraph, CUgraphNode& emptyRootNode, condGraphInfo& condInfo)
+{
+    CU_CHECK_EXCEPTION(cuGraphCreate(&fullSlotGraph, 0));
+
+    // Dependency vectors (xParents = inputs to stage x)
+    std::vector<CUgraphNode> rootParents;       // inputs to Front-end (after C0)
+    std::vector<CUgraphNode> softDemapParents;  // inputs to Soft-demapper (EQ-coef outputs)
+    std::vector<CUgraphNode> uciP1Parents;      // inputs to UCI-P1 (Soft-demapper outputs)
+    std::vector<CUgraphNode> csiP2Parents;      // inputs to CSI-P2 (UCI-P1 decoders' outputs)
+    std::vector<CUgraphNode> schParents;        // inputs to SCH backend (SegLLRs2)
+
+    // For device-graphs, stash parents per stage
+    std::vector<CUgraphNode> dglParentsC1;      // parents for C1 device graph launch
+    std::vector<CUgraphNode> dglParentsC2;      // parents for C2 device graph launch
+
+    void* arg;
+    void* kernelParams[2] = {&arg, &arg};
+
+    // Initialize empty nodes with 0, 1, and 2 input pointer args
+    CUPHY_CHECK(cuphySetEmptyKernelNodeParams(&m_emptyNode0paramDriver));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode1paramDriver, 1, &(kernelParams[0])));
+    CUPHY_CHECK(cuphySetGenericEmptyKernelNodeParams(&m_emptyNode2paramsDriver, 2, &(kernelParams[0])));
+
+    // Only useful if at least any one of USE_COND_GRAPH_NODE_C[0-2] is set to 1
+    CUcontext current_context;
+    CU_CHECK_EXCEPTION(cuCtxGetCurrent(&current_context));
+    unsigned int cond_handle_flags = 0; // Relevant for cond. handle creation in PUSCH_COND_IF_NODES_W_KERNEL mode.
+
+    // C0: root conditional / graph selection stage
+    {
+        CondStage c0Stage = enterConditionalStage0(fullSlotGraph,
+                                                   emptyRootNode,
+                                                   condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   rootParents); // initial parents, currently empty
+
+        // Subsequent stages (front-end, soft demap, etc.) use this graph and parents.
+        condInfo.m_pGraph[0] = c0Stage.pGraph;
+        rootParents          = std::move(c0Stage.parents);
+    }
+
+    //==========================================================================================================/
+    // Soft-demapper stage (incl. optional DFT-S-OFDM)                                                          /
+    //==========================================================================================================/
+    {
+        softDemapParents = rootParents;
+        // For legacy mode, softDemapParents holds all m_chEqCoefCompNodes at this point.
+        // For other modes, this will follow the existing behavior (empty parents unless set elsewhere).
+        StageResult softDemapStage = buildSoftDemapStage(PUSCH_LEGACY_FULL_SLOT_PROC,
+                                                         condInfo.m_pGraph[0],
+                                                         softDemapParents,
+                                                         arg);
+
+        // UCI backend kernels can start after soft demap.
+        uciP1Parents = std::move(softDemapStage.terminalNodes);
+    }
+    
+    //==========================================================================================================/
+    // C1: optional conditional/device graph stage after soft demap                                             /
+    //==========================================================================================================/
+    {
+        CondStage c1Stage = enterConditionalStage1(condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   uciP1Parents, // parents = soft-demap (or after-DFT) nodes
+                                                   dglParentsC1);
+
+        condInfo.m_pGraph[1] = c1Stage.pGraph;
+        uciP1Parents         = std::move(c1Stage.parents); // inputs to UCI-P1 (post-C1)
+    }
+
+    //==========================================================================================================/
+    // Post-soft-demap fan-out: compute UCI metrics and launch UCI-P1 decoders (Simplex, RM, Polar)             /
+    //==========================================================================================================/
+    {
+        StageResult uciP1Stage = buildUciP1OffloadingBackendStage(PUSCH_LEGACY_FULL_SLOT_PROC,
+                                                                  condInfo.m_pGraph[1],
+                                                                  uciP1Parents);
+
+        // The three UCI P1 decoders (Simplex, RM, Polar) become the parents for
+        // the CSI-P2 control / C2 conditional-graph logic that follows.
+        csiP2Parents = std::move(uciP1Stage.terminalNodes); // inputs to CSI-P2
+    }
+
+    //==========================================================================================================/
+    // C2: optional conditional/device graph stage between UCI-P1 and CSI-P2/SCH                                /
+    //==========================================================================================================/
+    bool use_cond_if_node_c2 =
+        (m_workCancelMode == PUSCH_COND_IF_NODES_W_KERNEL) && (USE_COND_GRAPH_NODE_C2 == 1);
+    bool use_cond_if_or_dgl_node_c2 =
+        (m_workCancelMode != PUSCH_NO_WORK_CANCEL) && (USE_COND_GRAPH_NODE_C2 == 1);
+
+    {
+        // csiP2Parents currently holds the UCI-P1 decoder nodes.
+        CondStage c2Stage = enterConditionalStage2(condInfo,
+                                                   current_context,
+                                                   cond_handle_flags,
+                                                   use_cond_if_node_c2,
+                                                   csiP2Parents,  // parents for C2
+                                                   dglParentsC2);
+
+        condInfo.m_pGraph[2] = c2Stage.pGraph;
+        // We intentionally do NOT override csiP2Parents here:
+        // buildCsiP2BackendStage() still needs these parents.
+        // Whether they are used as actual parents for CSI-P2 control is governed
+        // by use_cond_if_or_dgl_node_c2 (passed to buildCsiP2BackendStage).
+    }
+
+    //===================================== CSI-P2 =======================================
+
+    //if(m_nCsi2Ues > 0) // If this gets uncommented, then the conditional graph node code above also has to be updated
+    {
+        // CSI-P2 backend (control + UCI decoders) built off UCI-P1 decoder outputs.
+        // csiP2Parents currently holds [simplexP1, rmP1, polarP1].
+        StageResult csi2Stage = buildCsiP2BackendStage(PUSCH_LEGACY_FULL_SLOT_PROC,
+                                                       condInfo.m_pGraph[2],
+                                                       csiP2Parents,
+                                                       use_cond_if_or_dgl_node_c2);
+
+        // For SCH backend, we need SegLLRs2 as the parent.
+        schParents = std::move(csi2Stage.terminalNodes);
+    }
+    
+    // add event record for the UCI-on-PUSCH completion
+    if(m_uciKernelSelOption==PUSCH_UCI_NO_UCI)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddEventRecordNode(&m_uciOnPuschCompletedEventNode[PUSCH_LEGACY_FULL_SLOT_PROC], *(condInfo.m_pGraph[2]), uciP1Parents.data(), uciP1Parents.size(), m_cuphyPuschStatPrms.uciOnPuschCompletedEvent));
+    }
+    else if(m_uciKernelSelOption==PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddEventRecordNode(&m_uciOnPuschCompletedEventNode[PUSCH_LEGACY_FULL_SLOT_PROC], *(condInfo.m_pGraph[2]), csiP2Parents.data(), csiP2Parents.size(), m_cuphyPuschStatPrms.uciOnPuschCompletedEvent));
+    }
+    else
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddEventRecordNode(&m_uciOnPuschCompletedEventNode[PUSCH_LEGACY_FULL_SLOT_PROC], *(condInfo.m_pGraph[2]), schParents.data(), schParents.size(), m_cuphyPuschStatPrms.uciOnPuschCompletedEvent));
+    }
+
+    //===================================== SCH backend (LDPC + CRC) ===========================================/
+
+    // if (m_nSchUes > 0)
+    {
+        StageResult schStage = buildSchBackendStage(PUSCH_LEGACY_FULL_SLOT_PROC,
+                                                    condInfo.m_pGraph[2],
+                                                    schParents);
+
+        // No further graph nodes depend on SCH backend in this function today,
+        // but keep / move the terminal nodes if needed for future extensions.
+        schParents = std::move(schStage.terminalNodes);
+    }
+   
+    if(m_delayUs!=0)
+    {
+        if(m_kernelSelOption==PUSCH_NO_DERATE_MATCHING_FEC && m_uciKernelSelOption==PUSCH_UCI_NO_UCI)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_fullSlotDelayNode, *(condInfo.m_pGraph[2]), uciP1Parents.data(), uciP1Parents.size(), &m_emptyNode1paramDriver));
+        }
+        else if(m_kernelSelOption==PUSCH_NO_DERATE_MATCHING_FEC && m_uciKernelSelOption==PUSCH_UCI_NO_UCI_WITH_SEG)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_fullSlotDelayNode, *(condInfo.m_pGraph[2]), csiP2Parents.data(), csiP2Parents.size(), &m_emptyNode1paramDriver));
+        }
+        else if(m_kernelSelOption==PUSCH_NO_SD_DERATE_MATCHING_FEC)
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_fullSlotDelayNode, *(condInfo.m_pGraph[2]), softDemapParents.data(), softDemapParents.size(), &m_emptyNode1paramDriver));
+        }
+        else
+        {
+            CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_fullSlotDelayNode, *(condInfo.m_pGraph[2]), schParents.data(), schParents.size(), &m_emptyNode1paramDriver));
+        }
+    }
+
+    //===================================== Device-graph launch wiring (DGL) ===================================/
+
+    if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        // C2 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[2],
+                                              *condInfo.m_pGraph[2],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c2[2] = {&m_workCancelPtr, &condInfo.m_graphExec[2]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C2_node_params,
+                                                       &pKArgs_node_c2[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G2_init_cond_node),
+                                                condInfo.m_graph[1],
+                                                dglParentsC2.data(),
+                                                dglParentsC2.size(),
+                                                &(condInfo.m_init_C2_node_params)));
+
+        // C1 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[1],
+                                              *condInfo.m_pGraph[1],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c1[2] = {&m_workCancelPtr, &condInfo.m_graphExec[1]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C1_node_params,
+                                                       &pKArgs_node_c1[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G1_init_cond_node),
+                                                condInfo.m_graph[0],
+                                                dglParentsC1.data(),
+                                                dglParentsC1.size(),
+                                                &(condInfo.m_init_C1_node_params)));
+
+        // C0 device graph
+        CU_CHECK_EXCEPTION(cuGraphInstantiate(&condInfo.m_graphExec[0],
+                                              *condInfo.m_pGraph[0],
+                                              CUDA_GRAPH_INSTANTIATE_FLAG_DEVICE_LAUNCH));
+        void* pKArgs_node_c0[2] = {&m_workCancelPtr, &condInfo.m_graphExec[0]};
+        CUPHY_CHECK(cuphySetWorkCancelKernelNodeParams(&condInfo.m_init_C0_node_params,
+                                                       &pKArgs_node_c0[0],
+                                                       1 /* device graph launch */));
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&(condInfo.m_graph_G0_init_cond_node),
+                                                fullSlotGraph,
+                                                nullptr,
+                                                0,
+                                                &(condInfo.m_init_C0_node_params)));
+        // Need to explicitly upload to the device before launching the graph
+    }
+} // create72eFullSlotOffloadingGraph
 
 void PuschRx::updateLaunchGraph(CUgraphExec &graphExec, CUgraphNode & graphWaitNode, CUgraphNode &graphDglNode,
                                 cuphyPuschRxWaitLaunchCfg_t& waitCfg, cuphyPuschRxDglLaunchCfg_t& dglCfg, bool enableDeviceGraphLaunch)
@@ -4138,6 +5984,378 @@ void PuschRx::updateEarlyHarqGraph(bool disableAllNodes /*=false*/)
                             m_ehqRssiNodesEnabled,
                             m_ehqRssiNodes,
                             m_ehqGraphExec);
+    }
+
+    if (m_useCbLdpc && (m_nEarlyDecodedSchCbs > 0) && !disableAllNodes)
+    {
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqResetRateMatchNode, &(m_rateMatchLaunchCfgEarly.resetKernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqRateMatchNode, &(m_rateMatchLaunchCfgEarly.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqClampRateMatchNode, &(m_rateMatchLaunchCfgEarly.clampKernelNodeParamsDriver)));
+        updateCbLdpcNodes(m_ehqGraphExec,
+                          cb.early_nodes,
+                          cb.early_batch.node_params,
+                          cb.early_batch.configs.size(),
+                          m_ehqCbLdpcNodesEnabled,
+                          true);
+
+        if (m_ehqRateMatchNodeEnabled != 1)
+        {
+            m_ehqRateMatchNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqResetRateMatchNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRateMatchNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqClampRateMatchNode, 1));
+        }
+        if (m_ehqCbDecoderNodeEnabled != 1)
+        {
+            m_ehqCbDecoderNodeEnabled = 1;
+        }
+    }
+    else if (m_useCbLdpc)
+    {
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        if (m_ehqRateMatchNodeEnabled != 0)
+        {
+            m_ehqRateMatchNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqResetRateMatchNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRateMatchNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqClampRateMatchNode, 0));
+        }
+        if (m_ehqCbDecoderNodeEnabled != 0)
+        {
+            updateCbLdpcNodes(m_ehqGraphExec,
+                              cb.early_nodes,
+                              cb.early_batch.node_params,
+                              cb.early_batch.configs.size(),
+                              m_ehqCbLdpcNodesEnabled,
+                              false);
+            m_ehqCbDecoderNodeEnabled = 0;
+        }
+    }
+
+    if(m_nEarlyHarqUes > 0 && !disableAllNodes)
+    {
+        if(m_ehqUciSegLLRs0NodeEnabled != 1)
+        {
+            m_ehqUciSegLLRs0NodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqUciSegLLRs0Node, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqUciSegLLRs0Node, &(m_uciOnPuschEarlySegLLRs0LaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_ehqUciSegLLRs0NodeEnabled != 0)
+        {
+            m_ehqUciSegLLRs0NodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqUciSegLLRs0Node, 0));
+        }
+    }
+
+    if(m_nSpxCws_early > 0 && !disableAllNodes)
+    {
+        if (m_ehqSimplexDecoderNodeEnabled != 1) {
+            m_ehqSimplexDecoderNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqSimplexDecoderNode, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqSimplexDecoderNode, &(m_simplexDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if (m_ehqSimplexDecoderNodeEnabled != 0)
+        {
+            m_ehqSimplexDecoderNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqSimplexDecoderNode, 0));
+        }
+    }
+
+    if(m_nRmCws_early > 0 && !disableAllNodes)
+    {
+        if (m_ehqRmDecoderNodeEnabled != 1) {
+            m_ehqRmDecoderNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRmDecoderNode, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqRmDecoderNode, &(m_rmDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_ehqRmDecoderNodeEnabled != 0)
+        {
+            m_ehqRmDecoderNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRmDecoderNode, 0));
+        }
+    }
+
+    if(m_nPolUciSegs_early > 0 && !disableAllNodes)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, &(m_compCwTreeTypesLaunchCfg_early.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, &(m_polSegDeRmDeItlLaunchCfg_early.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqPolarDecoderNode, &(m_polarDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+
+        if (m_ehqPolarNodeEnabled != 1)
+        {
+            m_ehqPolarNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolarDecoderNode, 1));
+        }
+    }
+    else
+    {
+        if (m_ehqPolarNodeEnabled != 0)
+        {
+            m_ehqPolarNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolarDecoderNode, 0));
+        }
+    }
+
+    if (!disableAllNodes)
+    {
+        MemtraceDisableScope md;
+        CU_CHECK_EXCEPTION(cuGraphUpload(m_ehqGraphExec, phase1Stream));
+    }
+} // updateEarlyHarqGraph
+
+void PuschRx::updateEarlyHarqOffloadingGraph(bool disableAllNodes /*=false*/)
+{
+    m_chest->earlyHarqGraph().setNodeStatus(
+            ch_est::ChestCudaUtils::toDisableAllNodes(disableAllNodes),
+            m_ehqGraphExec);
+
+    int nCfgs{};
+    if(m_chEstSettings.enableSinrMeasurement || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo)) {
+        nCfgs = disableAllNodes? 0 : m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqNoiseIntfEstNodesEnabled, m_ehqNoiseIntfEstNodes, m_ehqGraphExec);
+    }
+
+    nCfgs = disableAllNodes? 0 : m_chEqCoefCompLaunchCfgs[0].nCfgs;
+    cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqCoefCompLaunchCfgs[0].cfgs, m_ehqChEqCoefCompNodesEnabled, m_ehqChEqCoefCompNodes, m_ehqGraphExec);
+
+    nCfgs = disableAllNodes? 0 : m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+    cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqChEqSoftDemapNodesEnabled, m_ehqChEqSoftDemapNodes, m_ehqGraphExec);
+
+    if(m_chEstSettings.enableDftSOfdm==1)
+    {
+        nCfgs = disableAllNodes? 0 : m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqChEqSoftDemapIdftNodesEnabled, m_ehqChEqSoftDemapIdftNodes, m_ehqGraphExec);
+
+        nCfgs = disableAllNodes? 0 : m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqChEqSoftDemapAfterDftNodesEnabled, m_ehqChEqSoftDemapAfterDftNodes, m_ehqGraphExec);
+    }
+
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        nCfgs = disableAllNodes? 0 : m_rsrpLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS,
+                            m_rsrpLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs,
+                            m_ehqRsrpNodesEnabled,
+                            m_ehqRsrpNodes,
+                            m_ehqGraphExec);
+    }
+
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        nCfgs = disableAllNodes? 0 : m_rssiLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS,
+                            m_rssiLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs,
+                            m_ehqRssiNodesEnabled,
+                            m_ehqRssiNodes,
+                            m_ehqGraphExec);
+    }
+
+    if(m_nUciUes > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI)
+    {
+        if(m_ehqUciSegLLRs0NodeEnabled != 1)
+        {
+            m_ehqUciSegLLRs0NodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqUciSegLLRs0Node, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqUciSegLLRs0Node, &(m_uciOnPuschSegLLRs0LaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_ehqUciSegLLRs0NodeEnabled != 0)
+        {
+            m_ehqUciSegLLRs0NodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqUciSegLLRs0Node, 0));
+        }
+    }
+
+    if(m_nSpxCws_early > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        if (m_ehqSimplexDecoderNodeEnabled != 1) {
+            m_ehqSimplexDecoderNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqSimplexDecoderNode, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqSimplexDecoderNode, &(m_simplexDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if (m_ehqSimplexDecoderNodeEnabled != 0)
+        {
+            m_ehqSimplexDecoderNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqSimplexDecoderNode, 0));
+        }
+    }
+
+    if(m_nRmCws_early > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        if (m_ehqRmDecoderNodeEnabled != 1) {
+            m_ehqRmDecoderNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRmDecoderNode, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqRmDecoderNode, &(m_rmDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_ehqRmDecoderNodeEnabled != 0)
+        {
+            m_ehqRmDecoderNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRmDecoderNode, 0));
+        }
+    }
+
+    if(m_nPolUciSegs_early > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, &(m_compCwTreeTypesLaunchCfg_early.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, &(m_polSegDeRmDeItlLaunchCfg_early.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqPolarDecoderNode, &(m_polarDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+
+        if (m_ehqPolarNodeEnabled != 1)
+        {
+            m_ehqPolarNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolarDecoderNode, 1));
+        }
+    }
+    else
+    {
+        if (m_ehqPolarNodeEnabled != 0)
+        {
+            m_ehqPolarNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolarDecoderNode, 0));
+        }
+    }
+    
+    if(!disableAllNodes)
+    {
+        if((m_subSlotDelayUs!=0) && (m_uciKernelSelOption == PUSCH_UCI_NO_UCI || m_uciKernelSelOption == PUSCH_UCI_NO_UCI_WITH_SEG))
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_subSlotDelayNode, &m_subSlotDelayKernelParamsDriver));
+            if(m_subSlotDelayNodeEnabled != 1)
+            {
+                m_subSlotDelayNodeEnabled = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_subSlotDelayNode, 1));
+            }
+        }
+    }
+    else
+    {
+        if((m_subSlotDelayUs!=0) && (m_uciKernelSelOption == PUSCH_UCI_NO_UCI || m_uciKernelSelOption == PUSCH_UCI_NO_UCI_WITH_SEG))
+        {
+            if (m_subSlotDelayNodeEnabled != 0)
+            {
+                m_subSlotDelayNodeEnabled = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_subSlotDelayNode, 0));
+            }
+        }
+    }
+
+    if (!disableAllNodes)
+    {
+        MemtraceDisableScope md;
+        CU_CHECK_EXCEPTION(cuGraphUpload(m_ehqGraphExec, phase1Stream));
+    }
+} // updateEarlyHarqOffloadingGraph
+
+void PuschRx::update72eEarlyHarqGraph(bool disableAllNodes /*=false*/)
+{
+    int nCfgs{};
+    nCfgs = disableAllNodes? 0 : m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+    cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqChEqSoftDemapNodesEnabled, m_ehqChEqSoftDemapNodes, m_ehqGraphExec);
+    
+    if(m_chEstSettings.enableDftSOfdm==1)
+    {
+        nCfgs = disableAllNodes? 0 : m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqChEqSoftDemapIdftNodesEnabled, m_ehqChEqSoftDemapIdftNodes, m_ehqGraphExec);
+
+        nCfgs = disableAllNodes? 0 : m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqChEqSoftDemapAfterDftNodesEnabled, m_ehqChEqSoftDemapAfterDftNodes, m_ehqGraphExec);
+    }
+
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        nCfgs = 0;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS,
+                            m_rsrpLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs,
+                            m_ehqRsrpNodesEnabled,
+                            m_ehqRsrpNodes,
+                            m_ehqGraphExec);
+    }
+
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        nCfgs = 0;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS,
+                            m_rssiLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs,
+                            m_ehqRssiNodesEnabled,
+                            m_ehqRssiNodes,
+                            m_ehqGraphExec);
+    }
+
+    if (m_useCbLdpc && (m_nEarlyDecodedSchCbs > 0) && !disableAllNodes)
+    {
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqResetRateMatchNode, &(m_rateMatchLaunchCfgEarly.resetKernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqRateMatchNode, &(m_rateMatchLaunchCfgEarly.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqClampRateMatchNode, &(m_rateMatchLaunchCfgEarly.clampKernelNodeParamsDriver)));
+        updateCbLdpcNodes(m_ehqGraphExec,
+                          cb.early_nodes,
+                          cb.early_batch.node_params,
+                          cb.early_batch.configs.size(),
+                          m_ehqCbLdpcNodesEnabled,
+                          true);
+
+        if (m_ehqRateMatchNodeEnabled != 1)
+        {
+            m_ehqRateMatchNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqResetRateMatchNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRateMatchNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqClampRateMatchNode, 1));
+        }
+        if (m_ehqCbDecoderNodeEnabled != 1)
+        {
+            m_ehqCbDecoderNodeEnabled = 1;
+        }
+    }
+    else if (m_useCbLdpc)
+    {
+        auto& cb = std::get<CbLdpcState>(m_ldpcState);
+        if (m_ehqRateMatchNodeEnabled != 0)
+        {
+            m_ehqRateMatchNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqResetRateMatchNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRateMatchNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqClampRateMatchNode, 0));
+        }
+        if (m_ehqCbDecoderNodeEnabled != 0)
+        {
+            updateCbLdpcNodes(m_ehqGraphExec,
+                              cb.early_nodes,
+                              cb.early_batch.node_params,
+                              cb.early_batch.configs.size(),
+                              m_ehqCbLdpcNodesEnabled,
+                              false);
+            m_ehqCbDecoderNodeEnabled = 0;
+        }
     }
 
     if(m_nUciUes > 0 && !disableAllNodes)
@@ -4222,7 +6440,148 @@ void PuschRx::updateEarlyHarqGraph(bool disableAllNodes /*=false*/)
         MemtraceDisableScope md;
         CU_CHECK_EXCEPTION(cuGraphUpload(m_ehqGraphExec, phase1Stream));
     }
-}
+} // update72eEarlyHarqGraph
+
+void PuschRx::update72eEarlyHarqOffloadingGraph(bool disableAllNodes /*=false*/)
+{
+    int nCfgs{};
+    nCfgs = disableAllNodes? 0 : m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].nCfgs;
+    if(m_kernelSelOption == PUSCH_NO_SD_DERATE_MATCHING_FEC)
+    {
+        nCfgs = 0;
+    }
+    cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs, m_ehqChEqSoftDemapNodesEnabled, m_ehqChEqSoftDemapNodes, m_ehqGraphExec);
+
+
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        nCfgs = 0;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS,
+                            m_rsrpLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs,
+                            m_ehqRsrpNodesEnabled,
+                            m_ehqRsrpNodes,
+                            m_ehqGraphExec);
+    }
+
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        nCfgs = 0;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS,
+                            m_rssiLaunchCfgs[CUPHY_PUSCH_SUB_SLOT_PATH].cfgs,
+                            m_ehqRssiNodesEnabled,
+                            m_ehqRssiNodes,
+                            m_ehqGraphExec);
+    }
+
+    if(m_nUciUes > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI)
+    {
+        if(m_ehqUciSegLLRs0NodeEnabled != 1)
+        {
+            m_ehqUciSegLLRs0NodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqUciSegLLRs0Node, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqUciSegLLRs0Node, &(m_uciOnPuschSegLLRs0LaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_ehqUciSegLLRs0NodeEnabled != 0)
+        {
+            m_ehqUciSegLLRs0NodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqUciSegLLRs0Node, 0));
+        }
+    }
+
+    if(m_nSpxCws_early > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        if (m_ehqSimplexDecoderNodeEnabled != 1) {
+            m_ehqSimplexDecoderNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqSimplexDecoderNode, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqSimplexDecoderNode, &(m_simplexDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if (m_ehqSimplexDecoderNodeEnabled != 0)
+        {
+            m_ehqSimplexDecoderNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqSimplexDecoderNode, 0));
+        }
+    }
+
+    if(m_nRmCws_early > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        if (m_ehqRmDecoderNodeEnabled != 1) {
+            m_ehqRmDecoderNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRmDecoderNode, 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqRmDecoderNode, &(m_rmDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_ehqRmDecoderNodeEnabled != 0)
+        {
+            m_ehqRmDecoderNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqRmDecoderNode, 0));
+        }
+    }
+
+    if(m_nPolUciSegs_early > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, &(m_compCwTreeTypesLaunchCfg_early.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, &(m_polSegDeRmDeItlLaunchCfg_early.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_ehqPolarDecoderNode, &(m_polarDecoderLaunchCfg_early.kernelNodeParamsDriver)));
+
+        if (m_ehqPolarNodeEnabled != 1)
+        {
+            m_ehqPolarNodeEnabled = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolarDecoderNode, 1));
+        }
+    }
+    else
+    {
+        if (m_ehqPolarNodeEnabled != 0)
+        {
+            m_ehqPolarNodeEnabled = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqCompCwTreeTypesNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolSegDeRmDeItlNode, 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_ehqPolarDecoderNode, 0));
+        }
+    }
+    
+    if(!disableAllNodes)
+    {
+        if((m_subSlotDelayUs!=0) && (m_uciKernelSelOption == PUSCH_UCI_NO_UCI || m_uciKernelSelOption == PUSCH_UCI_NO_UCI_WITH_SEG))
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_ehqGraphExec, m_subSlotDelayNode, &m_subSlotDelayKernelParamsDriver));
+            if(m_subSlotDelayNodeEnabled != 1)
+            {
+                m_subSlotDelayNodeEnabled = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_subSlotDelayNode, 1));
+            }
+        }
+    }
+    else
+    {
+        if((m_subSlotDelayUs!=0) && (m_uciKernelSelOption == PUSCH_UCI_NO_UCI || m_uciKernelSelOption == PUSCH_UCI_NO_UCI_WITH_SEG))
+        {
+            if (m_subSlotDelayNodeEnabled != 0)
+            {
+                m_subSlotDelayNodeEnabled = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_ehqGraphExec, m_subSlotDelayNode, 0));
+            }
+        }
+    }
+
+    if (!disableAllNodes)
+    {
+        MemtraceDisableScope md;
+        CU_CHECK_EXCEPTION(cuGraphUpload(m_ehqGraphExec, phase1Stream));
+    }
+} // update72eEarlyHarqOffloadingGraph
 
 void PuschRx::updateFrontLoadedDmrsGraph(bool disableAllNodes /*=false*/)
 {
@@ -4432,41 +6791,91 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
         }
     }
 
-    if(m_nSchUes > 0 && !disableAllNodes)
+    const bool hasSchData = (m_nSchUes > 0) && !disableAllNodes;
+    if(hasSchData)
     {
-        // reset, clamp and the main rate match nodes are always enabled/disabled together
-        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.resetKernelNodeParamsDriver)));
-        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_rateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.kernelNodeParamsDriver)));
-        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.clampKernelNodeParamsDriver)));
-        if (m_rateMatchNodeEnabled[fullSlotProcMode] != 1)
+        const bool hasRemainingSchCbs =
+            needsFullSlotSchDecode(m_useCbLdpc, m_nFullSlotRemainingSchCbs);
+        if (hasRemainingSchCbs)
         {
-            m_rateMatchNodeEnabled[fullSlotProcMode] = 1;
-            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 1));
-            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 1));
-            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 1));
-        }
-
-        {
-            //ToDo due to different signatures of LDPC kernels, it is not straightforward to avoid dyn mem allocation in graph api call
-            // as a temporary workaround disable memtrace for m_ldpcDecoderNodes
-            // The MemtraceDisableScope is only needed for the cuGraphExecKernelNodeSetParams API call and not the cuGraphNodeSetEnabled calls, but leaving it outside the loop for now.
-            MemtraceDisableScope md;
-            for(int i = 0; i < m_LDPCDecodeDescSet.count(); ++i)
+            // reset, clamp and the main rate match nodes are always enabled/disabled together
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.resetKernelNodeParamsDriver)));
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_rateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.kernelNodeParamsDriver)));
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.clampKernelNodeParamsDriver)));
+            if (m_rateMatchNodeEnabled[fullSlotProcMode] != 1)
             {
-                CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_ldpcDecoderNodes[fullSlotProcMode][i], &m_ldpcLaunchCfgs[i].kernel_node_params_driver));
-                if(m_ldpcDecoderNodesEnabled[fullSlotProcMode][i] != 1)
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 1));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 1));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 1));
+            }
+
+            if (m_useCbLdpc)
+            {
+                auto& cb = std::get<CbLdpcState>(m_ldpcState);
+                updateCbLdpcNodes(graph_exec[2],
+                                  cb.full_nodes[fullSlotProcMode],
+                                  cb.full_batch.node_params,
+                                  cb.full_batch.configs.size(),
+                                  m_cbLdpcNodesEnabled[fullSlotProcMode],
+                                  true);
+            }
+            else
+            {
+                //ToDo due to different signatures of LDPC kernels, it is not straightforward to avoid dyn mem allocation in graph api call
+                // as a temporary workaround disable memtrace for TB LDPC graph node parameter updates
+                // The MemtraceDisableScope is only needed for the cuGraphExecKernelNodeSetParams API call and not the cuGraphNodeSetEnabled calls, but leaving it outside the loop for now.
+                MemtraceDisableScope md;
+                auto& tb = std::get<TbLdpcState>(m_ldpcState);
+                for(int i = 0; i < tb.decode_desc_set.count(); ++i)
                 {
-                    m_ldpcDecoderNodesEnabled[fullSlotProcMode][i] = 1;
-                    CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_ldpcDecoderNodes[fullSlotProcMode][i], 1));
+                    CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], &tb.launch_configs[i].kernel_node_params_driver));
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 1)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 1;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 1));
+                    }
+                }
+                for(int i = tb.decode_desc_set.count(); i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+                {
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                    }
                 }
             }
-            for(int i = m_LDPCDecodeDescSet.count(); i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+        }
+        else
+        {
+            if (m_rateMatchNodeEnabled[fullSlotProcMode] != 0)
             {
-                if(m_ldpcDecoderNodesEnabled[fullSlotProcMode][i] != 0)
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
+            }
+            if (!m_useCbLdpc)
+            {
+                auto& tb = std::get<TbLdpcState>(m_ldpcState);
+                for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
                 {
-                    m_ldpcDecoderNodesEnabled[fullSlotProcMode][i] = 0;
-                    CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_ldpcDecoderNodes[fullSlotProcMode][i], 0));
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                    }
                 }
+            }
+            else
+            {
+                auto& cb = std::get<CbLdpcState>(m_ldpcState);
+                updateCbLdpcNodes(graph_exec[2],
+                                  cb.full_nodes[fullSlotProcMode],
+                                  cb.full_batch.node_params,
+                                  cb.full_batch.configs.size(),
+                                  m_cbLdpcNodesEnabled[fullSlotProcMode],
+                                  false);
             }
         }
 
@@ -4489,12 +6898,26 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
             CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
         }
 
-        for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+        if (m_useCbLdpc)
         {
-            if(m_ldpcDecoderNodesEnabled[fullSlotProcMode][i] != 0)
+            auto& cb = std::get<CbLdpcState>(m_ldpcState);
+            updateCbLdpcNodes(graph_exec[2],
+                              cb.full_nodes[fullSlotProcMode],
+                              cb.full_batch.node_params,
+                              cb.full_batch.configs.size(),
+                              m_cbLdpcNodesEnabled[fullSlotProcMode],
+                              false);
+        }
+        else
+        {
+            auto& tb = std::get<TbLdpcState>(m_ldpcState);
+            for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
             {
-                m_ldpcDecoderNodesEnabled[fullSlotProcMode][i] = 0;
-                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_ldpcDecoderNodes[fullSlotProcMode][i], 0));
+                if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                {
+                    tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                    CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                }
             }
         }
 
@@ -4507,7 +6930,7 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
     }
     if(m_chEstSettings.enableRssiMeasurement)
     {
-        nCfgs = disableAllNodes? 0 : (((!m_earlyHarqModeEnabled)||(!m_subSlotProcessingFrontLoadedDmrsEnabled))? m_rsrpLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs : 0);
+        nCfgs = disableAllNodes? 0 : (((!m_earlyHarqModeEnabled)||(!m_subSlotProcessingFrontLoadedDmrsEnabled))? m_rssiLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs : 0);
         cuphy_utils::setHetCfgNodeStatus(nCfgs,
                             CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS,
                             m_rssiLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
@@ -4551,7 +6974,1155 @@ void PuschRx::updateFullSlotGraph(bool disableAllNodes, cuphyPuschFullSlotProcMo
             CU_CHECK_EXCEPTION(cuGraphUpload(graphExec, phase1Stream));
         }
     }
-}
+} // updateFullSlotGraph
+
+void PuschRx::updateFullSlotOffloadingGraph(bool disableAllNodes, cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraphExec graphExec, condGraphInfo& condInfo)
+{
+    bool use_work_cancel_device_graphs = (m_workCancelMode == PUSCH_DEVICE_GRAPHS);
+    CUgraphExec graph_exec[3] = { use_work_cancel_device_graphs ? condInfo.m_graphExec[0] : graphExec,
+                                  use_work_cancel_device_graphs ? condInfo.m_graphExec[1] : graphExec,
+                                  use_work_cancel_device_graphs ? condInfo.m_graphExec[2] : graphExec};
+
+    // See the comment in ::fullSlotKernelLaunch() for why we skip the first kernel when using early HARQ and
+    // delay mean estimation. If we already ran the first kernel on the first DMRS symbol
+    // with early HARQ and delay mean estimation-based channel estimation enabled, then we
+    // disable that first kernel here to avoid accumulating contributions of the first
+    // DMRS symbol to the delay mean estimation twice.
+
+    if(fullSlotProcMode == PUSCH_LEGACY_FULL_SLOT_PROC)
+    {
+        // disable channel estimation kernel nodes for instance index 0
+        m_chest->chestGraph().disableNodes0Slot(graph_exec[0]);
+        m_chest->chestGraph().setNodeStatus(ch_est::ChestCudaUtils::toDisableAllNodes(disableAllNodes),
+                                                graph_exec[0]);
+
+        int nCfgs{};
+        if(m_chEstSettings.enableSinrMeasurement || EqCoeffAlgoIsMMSEVariant(m_chEstSettings.eqCoeffAlgo))
+        {
+            nCfgs = disableAllNodes? 0 : m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+            cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_NOISE_INTF_EST_N_MAX_HET_CFGS, m_noiseIntfEstLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs, m_noiseIntfEstNodesEnabled, m_noiseIntfEstNodes, graph_exec[0]);
+        }
+
+        if(m_chEstSettings.enableCfoCorrection || m_chEstSettings.enableToEstimation)
+        {
+            nCfgs = disableAllNodes? 0 : m_cfoTaEstLaunchCfgs.nCfgs;
+            cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CFO_EST_N_MAX_HET_CFGS, m_cfoTaEstLaunchCfgs.cfgs, m_cfoTaEstNodesEnabled, m_cfoTaEstNodes, graph_exec[0]);
+        }
+
+        int32_t bound = 1;
+        if(m_chEstSettings.enablePuschTdi)
+        {
+            bound = CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ;
+        }
+
+        for(int32_t chEqTimeInstIdx = 0; chEqTimeInstIdx < bound; ++chEqTimeInstIdx)
+        {
+            nCfgs = disableAllNodes? 0 : m_chEqCoefCompLaunchCfgs[chEqTimeInstIdx].nCfgs;
+            cuphy_utils::setHetCfgNodeStatus(nCfgs, CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS, m_chEqCoefCompLaunchCfgs[chEqTimeInstIdx].cfgs, m_chEqCoefCompNodesEnabled[chEqTimeInstIdx], m_chEqCoefCompNodes[chEqTimeInstIdx], graph_exec[0]);
+        }
+    }
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    int nCfgs = disableAllNodes? 0 : m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+    cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                        CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                        m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                        m_chEqSoftDemapNodesEnabled[fullSlotProcMode],
+                        m_chEqSoftDemapNodes[fullSlotProcMode],
+                        graph_exec[0]);
+
+    if(m_chEstSettings.enableDftSOfdm==1)
+    {
+        nCfgs = disableAllNodes? 0 : m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                            m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_chEqSoftDemapIdftNodesEnabled[fullSlotProcMode],
+                            m_chEqSoftDemapIdftNodes[fullSlotProcMode],
+                            graph_exec[0]);
+
+        nCfgs = disableAllNodes? 0 : m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                            m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_chEqSoftDemapAfterDftNodesEnabled[fullSlotProcMode],
+                            m_chEqSoftDemapAfterDftNodes[fullSlotProcMode],
+                            graph_exec[0]);
+    }
+
+    if(m_nUciUes > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI)
+    {
+        if(m_uciSegLLRs0NodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_uciSegLLRs0NodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], &(m_uciOnPuschSegLLRs0LaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_uciSegLLRs0NodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_uciSegLLRs0NodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nSpxCws > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        if (m_simplexDecoderNodeEnabled[fullSlotProcMode] != 1) {
+            m_simplexDecoderNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], &(m_simplexDecoderLaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if (m_simplexDecoderNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_simplexDecoderNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nRmCws > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        if (m_rmDecoderNodeEnabled[fullSlotProcMode] != 1) {
+            m_rmDecoderNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], &(m_rmDecoderLaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_rmDecoderNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_rmDecoderNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nPolUciSegs > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], &(m_compCwTreeTypesLaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], &(m_polSegDeRmDeItlLaunchCfg.kernelNodeParamsDriver)));
+        if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], &(m_polarDecoderLaunchCfg.kernelNodeParamsDriver)));
+        }
+
+        if (m_polarNodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_polarNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], 1));
+            if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+            {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], 1));
+            }
+            else
+            {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], 0));
+            }
+        }
+    }
+    else
+    {
+        if (m_polarNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_polarNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nCsi2Ues > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], &(m_uciOnPuschCsi2CtrlLaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], &(m_uciOnPuschSegLLRs2LaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode], &(m_rmDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], &(m_simplexDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], &(m_compCwTreeTypesLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], &(m_polSegDeRmDeItlLaunchCfg_csi2.kernelNodeParamsDriver)));
+        if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], &(m_polarDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+        }
+
+        if (m_csi2NodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_csi2NodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], 1));
+            if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+            {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], 1));
+            }
+            else
+            {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], 0));
+            }
+        }
+    }
+    else
+    {
+        if (m_csi2NodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_csi2NodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode]         , 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    const bool hasSchData = (m_nSchUes > 0) && !disableAllNodes;
+    if(hasSchData)
+    {
+        const bool hasFullSlotSchDecode =
+            needsFullSlotSchDecode(m_useCbLdpc, m_nFullSlotRemainingSchCbs);
+        if(hasFullSlotSchDecode &&
+           m_kernelSelOption != PUSCH_NO_DERATE_MATCHING_FEC &&
+           m_kernelSelOption != PUSCH_NO_SD_DERATE_MATCHING_FEC)
+        {
+            // reset, clamp and the main rate match nodes are always enabled/disabled together
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.resetKernelNodeParamsDriver)));
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_rateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.kernelNodeParamsDriver)));
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.clampKernelNodeParamsDriver)));
+            if (m_rateMatchNodeEnabled[fullSlotProcMode] != 1)
+            {
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 1));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 1));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 1));
+            }
+        }
+        else
+        {
+            if (m_rateMatchNodeEnabled[fullSlotProcMode] != 0)
+            {
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
+            }
+        }
+
+        if(m_kernelSelOption == PUSCH_ALL)
+        {
+            if(m_useCbLdpc)
+            {
+                auto& cb = std::get<CbLdpcState>(m_ldpcState);
+                updateCbLdpcNodes(graph_exec[2],
+                                  cb.full_nodes[fullSlotProcMode],
+                                  cb.full_batch.node_params,
+                                  cb.full_batch.configs.size(),
+                                  m_cbLdpcNodesEnabled[fullSlotProcMode],
+                                  hasFullSlotSchDecode);
+            }
+            else
+            {
+                // Different TB LDPC kernel signatures require graph-node parameter updates.
+                MemtraceDisableScope md;
+                auto& tb = std::get<TbLdpcState>(m_ldpcState);
+                for(int i = 0; i < tb.decode_desc_set.count(); ++i)
+                {
+                    CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], &tb.launch_configs[i].kernel_node_params_driver));
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 1)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 1;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 1));
+                    }
+                }
+                for(int i = tb.decode_desc_set.count(); i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+                {
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                    }
+                }
+            }
+
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_crcNodes[fullSlotProcMode][0], &(m_crcLaunchCfgs[0].kernelNodeParamsDriver)));
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_crcNodes[fullSlotProcMode][1], &(m_crcLaunchCfgs[1].kernelNodeParamsDriver)));
+            if (m_crcNodesEnabled[fullSlotProcMode] != 1)
+            {
+                m_crcNodesEnabled[fullSlotProcMode] = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][0], 1));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][1], 1));
+            }
+        }
+        else
+        {
+            if(m_useCbLdpc)
+            {
+                auto& cb = std::get<CbLdpcState>(m_ldpcState);
+                updateCbLdpcNodes(graph_exec[2],
+                                  cb.full_nodes[fullSlotProcMode],
+                                  cb.full_batch.node_params,
+                                  cb.full_batch.configs.size(),
+                                  m_cbLdpcNodesEnabled[fullSlotProcMode],
+                                  false);
+            }
+            else
+            {
+                auto& tb = std::get<TbLdpcState>(m_ldpcState);
+                for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+                {
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                    }
+                }
+            }
+
+            if (m_crcNodesEnabled[fullSlotProcMode] != 0)
+            {
+                m_crcNodesEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][0], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][1], 0));
+            }
+        }
+    }
+    else
+    {
+        if (m_rateMatchNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_rateMatchNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
+        }
+
+        if(m_useCbLdpc)
+        {
+            auto& cb = std::get<CbLdpcState>(m_ldpcState);
+            updateCbLdpcNodes(graph_exec[2],
+                              cb.full_nodes[fullSlotProcMode],
+                              cb.full_batch.node_params,
+                              cb.full_batch.configs.size(),
+                              m_cbLdpcNodesEnabled[fullSlotProcMode],
+                              false);
+        }
+        else
+        {
+            auto& tb = std::get<TbLdpcState>(m_ldpcState);
+            for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+            {
+                if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                {
+                    tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                    CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                }
+            }
+        }
+
+        if (m_crcNodesEnabled[fullSlotProcMode] != 0)
+        {
+            m_crcNodesEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][0], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][1], 0));
+        }
+    }
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        nCfgs = disableAllNodes? 0 : (((!m_earlyHarqModeEnabled)||(!m_subSlotProcessingFrontLoadedDmrsEnabled))? m_rssiLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs : 0);
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS,
+                            m_rssiLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_rssiNodesEnabled[fullSlotProcMode],
+                            m_rssiNodes[fullSlotProcMode],
+                            graph_exec[1]);
+    }
+
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        nCfgs = disableAllNodes? 0 : (((!m_earlyHarqModeEnabled)||(!m_subSlotProcessingFrontLoadedDmrsEnabled))? m_rsrpLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs : 0);
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS,
+                            m_rsrpLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_rsrpNodesEnabled[fullSlotProcMode],
+                            m_rsrpNodes[fullSlotProcMode],
+                            ((fullSlotProcMode == PUSCH_LEGACY_FULL_SLOT_PROC)&&(m_chEstSettings.enableWeightedAverageCfo==1)) ? graph_exec[0] : graph_exec[1]);
+    }
+    
+    if(!disableAllNodes)
+    {
+        if((m_delayUs!=0) && (m_kernelSelOption != PUSCH_ALL))
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_fullSlotDelayNode, &m_fullSlotDelayKernelParamsDriver));
+            if(m_fullSlotDelayNodeEnabled[fullSlotProcMode] != 1)
+            {
+                m_fullSlotDelayNodeEnabled[fullSlotProcMode] = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_fullSlotDelayNode, 1));
+            }
+        }
+    }
+    else
+    {
+        if((m_delayUs!=0) && (m_kernelSelOption != PUSCH_ALL))
+        {
+            if (m_fullSlotDelayNodeEnabled[fullSlotProcMode] != 0)
+            {
+                m_fullSlotDelayNodeEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_fullSlotDelayNode, 0));
+            }
+        }
+    }
+
+    if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        if (!disableAllNodes)
+        {
+            // Ensure device graphs are uploaded before the main graph is uploaded or run
+            //printf("uploading device graphs in updateFullSlotGraph\n");
+
+            MemtraceDisableScope md; // Disable dynamic memory allocation check temporarily
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[2], phase1Stream));
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[1], phase1Stream));
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[0], phase1Stream));
+
+            // Upload the host graph that has a single kernel node to launch the first device graph
+            CU_CHECK_EXCEPTION(cuGraphUpload(graphExec, phase1Stream));
+        }
+    }
+    else
+    {
+        if (!disableAllNodes)
+        {
+            MemtraceDisableScope md; // Disable dynamic memory allocation check temporarily
+            CU_CHECK_EXCEPTION(cuGraphUpload(graphExec, phase1Stream));
+        }
+    }
+} // updateFullSlotOffloadingGraph
+
+void PuschRx::update72eFullSlotGraph(bool disableAllNodes,  cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraphExec graphExec, condGraphInfo& condInfo)
+{
+    bool use_work_cancel_device_graphs = (m_workCancelMode == PUSCH_DEVICE_GRAPHS);
+    CUgraphExec graph_exec[3] = { use_work_cancel_device_graphs ? condInfo.m_graphExec[0] : graphExec,
+                                  use_work_cancel_device_graphs ? condInfo.m_graphExec[1] : graphExec,
+                                  use_work_cancel_device_graphs ? condInfo.m_graphExec[2] : graphExec};
+                                  
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    int nCfgs = disableAllNodes ? 0 : m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+    cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                        CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                        m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                        m_chEqSoftDemapNodesEnabled[fullSlotProcMode],
+                        m_chEqSoftDemapNodes[fullSlotProcMode],
+                        graph_exec[0]);
+
+    if(m_chEstSettings.enableDftSOfdm==1)
+    {
+        nCfgs = disableAllNodes ? 0 : m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                            m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_chEqSoftDemapIdftNodesEnabled[fullSlotProcMode],
+                            m_chEqSoftDemapIdftNodes[fullSlotProcMode],
+                            graph_exec[0]);
+
+        nCfgs = disableAllNodes ? 0 : m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                            m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_chEqSoftDemapAfterDftNodesEnabled[fullSlotProcMode],
+                            m_chEqSoftDemapAfterDftNodes[fullSlotProcMode],
+                            graph_exec[0]);
+    }
+
+    if(m_nUciUes > 0 && !disableAllNodes)
+    {
+        if(m_uciSegLLRs0NodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_uciSegLLRs0NodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], &(m_uciOnPuschSegLLRs0LaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_uciSegLLRs0NodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_uciSegLLRs0NodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nSpxCws > 0 && !disableAllNodes)
+    {
+        if (m_simplexDecoderNodeEnabled[fullSlotProcMode] != 1) {
+            m_simplexDecoderNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], &(m_simplexDecoderLaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if (m_simplexDecoderNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_simplexDecoderNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nRmCws > 0 && !disableAllNodes)
+    {
+        if (m_rmDecoderNodeEnabled[fullSlotProcMode] != 1) {
+            m_rmDecoderNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], &(m_rmDecoderLaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_rmDecoderNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_rmDecoderNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nPolUciSegs > 0 && !disableAllNodes)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], &(m_compCwTreeTypesLaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], &(m_polSegDeRmDeItlLaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], &(m_polarDecoderLaunchCfg.kernelNodeParamsDriver)));
+
+        if (m_polarNodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_polarNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], 1));
+        }
+    }
+    else
+    {
+        if (m_polarNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_polarNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nCsi2Ues > 0 && !disableAllNodes)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], &(m_uciOnPuschCsi2CtrlLaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], &(m_uciOnPuschSegLLRs2LaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode], &(m_rmDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], &(m_simplexDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], &(m_compCwTreeTypesLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], &(m_polSegDeRmDeItlLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], &(m_polarDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+            
+        if (m_csi2NodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_csi2NodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], 1));
+        }
+    }
+    else
+    {
+        if (m_csi2NodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_csi2NodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode]         , 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    const bool hasSchData = (m_nSchUes > 0) && !disableAllNodes;
+    if(hasSchData)
+    {
+        const bool hasFullSlotSchDecode =
+            needsFullSlotSchDecode(m_useCbLdpc, m_nFullSlotRemainingSchCbs);
+        if(hasFullSlotSchDecode)
+        {
+            // reset, clamp and the main rate match nodes are always enabled/disabled together
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.resetKernelNodeParamsDriver)));
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_rateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.kernelNodeParamsDriver)));
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.clampKernelNodeParamsDriver)));
+            if (m_rateMatchNodeEnabled[fullSlotProcMode] != 1)
+            {
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 1));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 1));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 1));
+            }
+        }
+        else
+        {
+            if (m_rateMatchNodeEnabled[fullSlotProcMode] != 0)
+            {
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
+            }
+        }
+
+        if(m_useCbLdpc)
+        {
+            auto& cb = std::get<CbLdpcState>(m_ldpcState);
+            updateCbLdpcNodes(graph_exec[2],
+                              cb.full_nodes[fullSlotProcMode],
+                              cb.full_batch.node_params,
+                              cb.full_batch.configs.size(),
+                              m_cbLdpcNodesEnabled[fullSlotProcMode],
+                              hasFullSlotSchDecode);
+        }
+        else
+        {
+            //ToDo due to different signatures of LDPC kernels, it is not straightforward to avoid dyn mem allocation in graph api call
+            // as a temporary workaround disable memtrace for TB LDPC graph node parameter updates
+            // The MemtraceDisableScope is only needed for the cuGraphExecKernelNodeSetParams API call and not the cuGraphNodeSetEnabled calls, but leaving it outside the loop for now.
+            MemtraceDisableScope md;
+            auto& tb = std::get<TbLdpcState>(m_ldpcState);
+            for(int i = 0; i < tb.decode_desc_set.count(); ++i)
+            {
+                CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], &tb.launch_configs[i].kernel_node_params_driver));
+                if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 1)
+                {
+                    tb.decoder_nodes_enabled[fullSlotProcMode][i] = 1;
+                    CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 1));
+                }
+            }
+            for(int i = tb.decode_desc_set.count(); i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+            {
+                if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                {
+                    tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                    CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                }
+            }
+        }
+
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_crcNodes[fullSlotProcMode][0], &(m_crcLaunchCfgs[0].kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_crcNodes[fullSlotProcMode][1], &(m_crcLaunchCfgs[1].kernelNodeParamsDriver)));
+        if (m_crcNodesEnabled[fullSlotProcMode] != 1)
+        {
+            m_crcNodesEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][0], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][1], 1));
+        }
+    }
+    else
+    {
+        if(m_kernelSelOption != PUSCH_NO_DERATE_MATCHING_FEC)
+        {
+            if(m_rateMatchNodeEnabled[fullSlotProcMode] != 0)
+            {
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
+            }
+        }
+
+        if(m_kernelSelOption == PUSCH_ALL)
+        {
+            if(m_useCbLdpc)
+            {
+                auto& cb = std::get<CbLdpcState>(m_ldpcState);
+                updateCbLdpcNodes(graph_exec[2],
+                                  cb.full_nodes[fullSlotProcMode],
+                                  cb.full_batch.node_params,
+                                  cb.full_batch.configs.size(),
+                                  m_cbLdpcNodesEnabled[fullSlotProcMode],
+                                  false);
+            }
+            else
+            {
+                auto& tb = std::get<TbLdpcState>(m_ldpcState);
+                for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+                {
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                    }
+                }
+            }
+
+            if(m_crcNodesEnabled[fullSlotProcMode] != 0)
+            {
+                m_crcNodesEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][0], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][1], 0));
+            }
+        }
+    }
+    
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        nCfgs = 0;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS,
+                            m_rssiLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_rssiNodesEnabled[fullSlotProcMode],
+                            m_rssiNodes[fullSlotProcMode],
+                            graph_exec[1]);
+    }
+
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        nCfgs = 0;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS,
+                            m_rsrpLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_rsrpNodesEnabled[fullSlotProcMode],
+                            m_rsrpNodes[fullSlotProcMode],
+                            ((fullSlotProcMode == PUSCH_LEGACY_FULL_SLOT_PROC)&&(m_chEstSettings.enableWeightedAverageCfo==1)) ? graph_exec[0] : graph_exec[1]);
+    }
+
+    if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        if (!disableAllNodes)
+        {
+            // Ensure device graphs are uploaded before the main graph is uploaded or run
+            //printf("uploading device graphs in updateFullSlotGraph\n");
+
+            MemtraceDisableScope md; // Disable dynamic memory allocation check temporarily
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[2], phase1Stream));
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[1], phase1Stream));
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[0], phase1Stream));
+
+            // Upload the host graph that has a single kernel node to launch the first device graph
+            CU_CHECK_EXCEPTION(cuGraphUpload(graphExec, phase1Stream));
+        }
+    }
+    else
+    {
+        if (!disableAllNodes)
+        {
+            MemtraceDisableScope md; // Disable dynamic memory allocation check temporarily
+            CU_CHECK_EXCEPTION(cuGraphUpload(graphExec, phase1Stream));
+        }
+    }
+} // update72eFullSlotGraph
+
+void PuschRx::update72eFullSlotOffloadingGraph(bool disableAllNodes,  cuphyPuschFullSlotProcMode_t fullSlotProcMode, CUgraphExec graphExec, condGraphInfo& condInfo)
+{
+    bool use_work_cancel_device_graphs = (m_workCancelMode == PUSCH_DEVICE_GRAPHS);
+    CUgraphExec graph_exec[3] = { use_work_cancel_device_graphs ? condInfo.m_graphExec[0] : graphExec,
+                                  use_work_cancel_device_graphs ? condInfo.m_graphExec[1] : graphExec,
+                                  use_work_cancel_device_graphs ? condInfo.m_graphExec[2] : graphExec};
+                                  
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    int nCfgs = disableAllNodes ? 0 : m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+    if(m_kernelSelOption == PUSCH_NO_SD_DERATE_MATCHING_FEC)
+    {
+        nCfgs = 0;
+    }
+    cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                        CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                        m_chEqSoftDemapLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                        m_chEqSoftDemapNodesEnabled[fullSlotProcMode],
+                        m_chEqSoftDemapNodes[fullSlotProcMode],
+                        graph_exec[0]);
+
+    if(m_chEstSettings.enableDftSOfdm==1)
+    {
+        nCfgs = disableAllNodes ? 0 : m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                            m_chEqSoftDemapIdftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_chEqSoftDemapIdftNodesEnabled[fullSlotProcMode],
+                            m_chEqSoftDemapIdftNodes[fullSlotProcMode],
+                            graph_exec[0]);
+
+        nCfgs = disableAllNodes ? 0 : m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].nCfgs;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_CH_EQ_N_MAX_HET_CFGS,
+                            m_chEqSoftDemapAfterDftLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_chEqSoftDemapAfterDftNodesEnabled[fullSlotProcMode],
+                            m_chEqSoftDemapAfterDftNodes[fullSlotProcMode],
+                            graph_exec[0]);
+    }
+
+    if(m_nUciUes > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI)
+    {
+        if(m_uciSegLLRs0NodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_uciSegLLRs0NodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], &(m_uciOnPuschSegLLRs0LaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_uciSegLLRs0NodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_uciSegLLRs0NodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_uciSegLLRs0Node[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nSpxCws > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        if (m_simplexDecoderNodeEnabled[fullSlotProcMode] != 1) {
+            m_simplexDecoderNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], &(m_simplexDecoderLaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if (m_simplexDecoderNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_simplexDecoderNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_simplexDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nRmCws > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        if (m_rmDecoderNodeEnabled[fullSlotProcMode] != 1) {
+            m_rmDecoderNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], 1));
+        }
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], &(m_rmDecoderLaunchCfg.kernelNodeParamsDriver)));
+    }
+    else
+    {
+        if(m_rmDecoderNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_rmDecoderNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_rmDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nPolUciSegs > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], &(m_compCwTreeTypesLaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], &(m_polSegDeRmDeItlLaunchCfg.kernelNodeParamsDriver)));
+        if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], &(m_polarDecoderLaunchCfg.kernelNodeParamsDriver)));
+        }
+
+        if (m_polarNodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_polarNodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], 1));
+            if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+            {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], 1));
+            }
+            else
+            {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], 0));
+            }
+        }
+    }
+    else
+    {
+        if (m_polarNodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_polarNodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_compCwTreeTypesNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polSegDeRmDeItlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[1], m_polarDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    if(m_nCsi2Ues > 0 && !disableAllNodes && m_uciKernelSelOption != PUSCH_UCI_NO_UCI && m_uciKernelSelOption != PUSCH_UCI_NO_UCI_WITH_SEG)
+    {
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], &(m_uciOnPuschCsi2CtrlLaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], &(m_uciOnPuschSegLLRs2LaunchCfg.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode], &(m_rmDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], &(m_simplexDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], &(m_compCwTreeTypesLaunchCfg_csi2.kernelNodeParamsDriver)));
+        CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], &(m_polSegDeRmDeItlLaunchCfg_csi2.kernelNodeParamsDriver)));
+        if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], &(m_polarDecoderLaunchCfg_csi2.kernelNodeParamsDriver)));
+        }
+
+        if (m_csi2NodeEnabled[fullSlotProcMode] != 1)
+        {
+            m_csi2NodeEnabled[fullSlotProcMode] = 1;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], 1));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], 1));
+            if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+            {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], 1));
+            }
+            else
+            {
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], 0));
+            }
+        }
+    }
+    else
+    {
+        if (m_csi2NodeEnabled[fullSlotProcMode] != 0)
+        {
+            m_csi2NodeEnabled[fullSlotProcMode] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CtrlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2SegLLRs2Node[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2rmDecoderNode[fullSlotProcMode]         , 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2simplexDecoderNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2CompCwTreeTypesNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolSegDeRmDeItlNode[fullSlotProcMode], 0));
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_uciOnPuschCsi2PolarDecoderNode[fullSlotProcMode], 0));
+        }
+    }
+
+    const bool hasSchData = (m_nSchUes > 0) && !disableAllNodes;
+    if(hasSchData)
+    {
+        const bool hasFullSlotSchDecode =
+            needsFullSlotSchDecode(m_useCbLdpc, m_nFullSlotRemainingSchCbs);
+        if(hasFullSlotSchDecode &&
+           (m_kernelSelOption != PUSCH_NO_DERATE_MATCHING_FEC) &&
+           (m_kernelSelOption != PUSCH_NO_SD_DERATE_MATCHING_FEC))
+        {
+          // reset, clamp and the main rate match nodes are always enabled/disabled together
+          CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.resetKernelNodeParamsDriver)));
+          CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_rateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.kernelNodeParamsDriver)));
+          CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], &(m_rateMatchLaunchCfg.clampKernelNodeParamsDriver)));
+          if (m_rateMatchNodeEnabled[fullSlotProcMode] != 1)
+          {
+              m_rateMatchNodeEnabled[fullSlotProcMode] = 1;
+              CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 1));
+              CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 1));
+              CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 1));
+          }
+        }
+        else
+        {
+            if (m_rateMatchNodeEnabled[fullSlotProcMode] != 0)
+            {
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
+            }
+        }
+        
+        if(m_kernelSelOption == PUSCH_ALL)
+        {
+            if(m_useCbLdpc)
+            {
+                auto& cb = std::get<CbLdpcState>(m_ldpcState);
+                updateCbLdpcNodes(graph_exec[2],
+                                  cb.full_nodes[fullSlotProcMode],
+                                  cb.full_batch.node_params,
+                                  cb.full_batch.configs.size(),
+                                  m_cbLdpcNodesEnabled[fullSlotProcMode],
+                                  hasFullSlotSchDecode);
+            }
+            else
+            {
+                // Different TB LDPC kernel signatures require graph-node parameter updates.
+                MemtraceDisableScope md;
+                auto& tb = std::get<TbLdpcState>(m_ldpcState);
+                for(int i = 0; i < tb.decode_desc_set.count(); ++i)
+                {
+                    CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], &tb.launch_configs[i].kernel_node_params_driver));
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 1)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 1;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 1));
+                    }
+                }
+                for(int i = tb.decode_desc_set.count(); i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+                {
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                    }
+                }
+            }
+
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_crcNodes[fullSlotProcMode][0], &(m_crcLaunchCfgs[0].kernelNodeParamsDriver)));
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_crcNodes[fullSlotProcMode][1], &(m_crcLaunchCfgs[1].kernelNodeParamsDriver)));
+            if (m_crcNodesEnabled[fullSlotProcMode] != 1)
+            {
+                m_crcNodesEnabled[fullSlotProcMode] = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][0], 1));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][1], 1));
+            }
+        }
+        else
+        {
+            if(m_useCbLdpc)
+            {
+                auto& cb = std::get<CbLdpcState>(m_ldpcState);
+                updateCbLdpcNodes(graph_exec[2],
+                                  cb.full_nodes[fullSlotProcMode],
+                                  cb.full_batch.node_params,
+                                  cb.full_batch.configs.size(),
+                                  m_cbLdpcNodesEnabled[fullSlotProcMode],
+                                  false);
+            }
+            else
+            {
+                auto& tb = std::get<TbLdpcState>(m_ldpcState);
+                for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+                {
+                    if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                    {
+                        tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                    }
+                }
+            }
+
+            if (m_crcNodesEnabled[fullSlotProcMode] != 0)
+            {
+                m_crcNodesEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][0], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][1], 0));
+            }
+        }
+    }
+    else
+    {
+        //if((m_kernelSelOption != PUSCH_NO_DERATE_MATCHING_FEC) && (m_kernelSelOption != PUSCH_NO_SD_DERATE_MATCHING_FEC))
+        {
+            if (m_rateMatchNodeEnabled[fullSlotProcMode] != 0)
+            {
+                m_rateMatchNodeEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_resetRateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_rateMatchNode[fullSlotProcMode], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_clampRateMatchNode[fullSlotProcMode], 0));
+            }
+        }
+      
+        if(m_useCbLdpc)
+        {
+            auto& cb = std::get<CbLdpcState>(m_ldpcState);
+            updateCbLdpcNodes(graph_exec[2],
+                              cb.full_nodes[fullSlotProcMode],
+                              cb.full_batch.node_params,
+                              cb.full_batch.configs.size(),
+                              m_cbLdpcNodesEnabled[fullSlotProcMode],
+                              false);
+        }
+        else
+        {
+            auto& tb = std::get<TbLdpcState>(m_ldpcState);
+            for(int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+            {
+                if(tb.decoder_nodes_enabled[fullSlotProcMode][i] != 0)
+                {
+                    tb.decoder_nodes_enabled[fullSlotProcMode][i] = 0;
+                    CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], tb.decoder_nodes[fullSlotProcMode][i], 0));
+                }
+            }
+        }
+            if (m_crcNodesEnabled[fullSlotProcMode] != 0)
+            {
+                m_crcNodesEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][0], 0));
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_crcNodes[fullSlotProcMode][1], 0));
+            }
+    }
+    
+    if(m_chEstSettings.enableRssiMeasurement)
+    {
+        nCfgs = 0;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS,
+                            m_rssiLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_rssiNodesEnabled[fullSlotProcMode],
+                            m_rssiNodes[fullSlotProcMode],
+                            graph_exec[1]);
+    }
+
+    if(m_chEstSettings.enableSinrMeasurement)
+    {
+        nCfgs = 0;
+        cuphy_utils::setHetCfgNodeStatus(nCfgs,
+                            CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS,
+                            m_rsrpLaunchCfgs[CUPHY_PUSCH_FULL_SLOT_PATH].cfgs,
+                            m_rsrpNodesEnabled[fullSlotProcMode],
+                            m_rsrpNodes[fullSlotProcMode],
+                            ((fullSlotProcMode == PUSCH_LEGACY_FULL_SLOT_PROC)&&(m_chEstSettings.enableWeightedAverageCfo==1)) ? graph_exec[0] : graph_exec[1]);
+    }
+    
+    if(!disableAllNodes)
+    {
+        if((m_delayUs!=0) && (m_kernelSelOption != PUSCH_ALL))
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graph_exec[2], m_fullSlotDelayNode, &m_fullSlotDelayKernelParamsDriver));
+            if(m_fullSlotDelayNodeEnabled[fullSlotProcMode] != 1)
+            {
+                m_fullSlotDelayNodeEnabled[fullSlotProcMode] = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_fullSlotDelayNode, 1));
+            }
+        }
+    }
+    else
+    {
+        if((m_delayUs!=0) && (m_kernelSelOption != PUSCH_ALL))
+        {
+            if (m_fullSlotDelayNodeEnabled[fullSlotProcMode] != 0)
+            {
+                m_fullSlotDelayNodeEnabled[fullSlotProcMode] = 0;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graph_exec[2], m_fullSlotDelayNode, 0));
+            }
+        }
+    }
+
+    if (m_workCancelMode == PUSCH_DEVICE_GRAPHS)
+    {
+        if (!disableAllNodes)
+        {
+            // Ensure device graphs are uploaded before the main graph is uploaded or run
+            //printf("uploading device graphs in updateFullSlotGraph\n");
+
+            MemtraceDisableScope md; // Disable dynamic memory allocation check temporarily
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[2], phase1Stream));
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[1], phase1Stream));
+            CU_CHECK_EXCEPTION(cuGraphUpload(graph_exec[0], phase1Stream));
+
+            // Upload the host graph that has a single kernel node to launch the first device graph
+            CU_CHECK_EXCEPTION(cuGraphUpload(graphExec, phase1Stream));
+        }
+    }
+    else
+    {
+        if (!disableAllNodes)
+        {
+            MemtraceDisableScope md; // Disable dynamic memory allocation check temporarily
+            CU_CHECK_EXCEPTION(cuGraphUpload(graphExec, phase1Stream));
+        }
+    }
+} // update72eFullSlotOffloadingGraph
 
 cuphyStatus_t PuschRx::setup(cuphyPuschDynPrms_t* pDynPrm)
 {
@@ -4605,11 +8176,9 @@ cuphyStatus_t PuschRx::setup(cuphyPuschDynPrms_t* pDynPrm)
         return status;
     }
 
-    setupCmnPhase2(pDynPrm);
-
     m_cudaGraphModeEnabled = (pDynPrm->procModeBmsk & PUSCH_PROC_MODE_FULL_SLOT_GRAPHS) ? true : false;
 
-    cuphyStatus_t status = setupComponents(enableCpuToGpuDescrAsyncCpy, pDynPrm);
+    cuphyStatus_t status = setupCmnPhase2(pDynPrm);
     if(CUPHY_STATUS_SUCCESS != status)
     {
 #ifdef CUPHY_MEMTRACE
@@ -4618,6 +8187,17 @@ cuphyStatus_t PuschRx::setup(cuphyPuschDynPrms_t* pDynPrm)
         POP_RANGE
         return status;
     }
+
+    status = setupComponents(enableCpuToGpuDescrAsyncCpy, pDynPrm);
+    if(CUPHY_STATUS_SUCCESS != status)
+    {
+#ifdef CUPHY_MEMTRACE
+        memtrace_set_config(0);
+#endif
+        POP_RANGE
+        return status;
+    }
+    bool m_isStandardKernelMode = (m_kernelSelOption == PUSCH_ALL) && (m_uciKernelSelOption == PUSCH_UCI_ALL);
     if(m_cudaGraphModeEnabled)
     {
         if (m_earlyHarqModeEnabled || m_subSlotProcessingFrontLoadedDmrsEnabled)
@@ -4626,23 +8206,82 @@ cuphyStatus_t PuschRx::setup(cuphyPuschDynPrms_t* pDynPrm)
             updateLaunchGraph(m_preFullSlotGraphExec, m_postSubSlotWaitNode, m_postSubSlotDglNode, m_postSubSlotWaitCfgs, m_postSubSlotDglCfgs, m_deviceGraphLaunchEnabled);
             if((m_earlyHarqModeEnabled) && (m_subSlotProcessingFrontLoadedDmrsEnabled))
             {
-                updateEarlyHarqGraph();
-                updateFullSlotGraph(false, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
+                if(m_isStandardKernelMode)
+                {
+                    updateEarlyHarqGraph();
+                    updateFullSlotGraph(false, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
+                }
+                else
+                {
+                    updateEarlyHarqOffloadingGraph();
+                    updateFullSlotOffloadingGraph(false, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
+                }   
             }
             else if((m_earlyHarqModeEnabled) && (!m_subSlotProcessingFrontLoadedDmrsEnabled))
             {
-                updateEarlyHarqGraph();
-                updateFullSlotGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                if(m_openRanFunctionalSplitOption==PUSCH_7_2_A)
+                {
+                    if(m_isStandardKernelMode)
+                    {
+                        updateEarlyHarqGraph();
+                        updateFullSlotGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                    }
+                    else
+                    {
+                        updateEarlyHarqOffloadingGraph();
+                        updateFullSlotOffloadingGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                    }
+                }
+                else
+                {
+                    if(m_isStandardKernelMode)
+                    {
+                        update72eEarlyHarqGraph();
+                        update72eFullSlotGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                    }
+                    else
+                    {
+                        update72eEarlyHarqOffloadingGraph();
+                        update72eFullSlotOffloadingGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                    }
+                }
             }
             else if((!m_earlyHarqModeEnabled) && (m_subSlotProcessingFrontLoadedDmrsEnabled))
             {
                 updateFrontLoadedDmrsGraph();
-                updateFullSlotGraph(false, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
+                if(m_isStandardKernelMode)
+                {
+                    updateFullSlotGraph(false, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
+                }
+                else
+                {
+                    updateFullSlotOffloadingGraph(false, PUSCH_FRONT_LOADED_DMRS_FULL_SLOT_PROC, m_frontLoadedDmrsFullSlotGraphExec, m_frontLoadedDmrsFullSlotGraphCondInfo);
+                }
             }
         }
         else
-        {
-            updateFullSlotGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+        {   
+            if(m_openRanFunctionalSplitOption==PUSCH_7_2_A)
+            {
+                if(m_isStandardKernelMode)
+                {
+                    updateFullSlotGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                }
+                else
+                {
+                    updateFullSlotOffloadingGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                }
+            }
+            else
+            {   if(m_isStandardKernelMode)
+                {    
+                    update72eFullSlotGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                }
+                else
+                {
+                    update72eFullSlotOffloadingGraph(false, PUSCH_LEGACY_FULL_SLOT_PROC, m_fullSlotGraphExec, m_fullSlotGraphCondInfo);
+                }
+            }
         }
     }
 
@@ -4716,58 +8355,90 @@ cuphyStatus_t PuschRx::copyEarlyHarqOutputToCPU(cudaStream_t cuStrm)
     // Depending on how the m_batchedMemcpyHelper was constructed, the updateMemcpy calls may
     // perform an individual async. memory copy and launchBatchedMemcpy may be a no-op.
     m_batchedMemcpyHelper[batched_copy_config].reset(); // reset for upcoming batch of updateMemcpy calls
+    bool copy_found = false;
 
-    if(m_outputPrms.totNumUciPayloadBytes > 0)
+    if(m_uciKernelSelOption == PUSCH_UCI_ALL)
     {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pUciPayloadsHost, m_outputPrms.pUciPayloadsDevice, m_outputPrms.totNumUciPayloadBytes, cudaMemcpyDeviceToHost, cuStrm);
-    }
-
-    if(m_nPolUciSegs_early > 0)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pUciCrcFlagsHost, m_outputPrms.pUciCrcFlagsDevice_early, m_nPolUciSegs_early, cudaMemcpyDeviceToHost, cuStrm);
-    }
-
-    if(m_nUciUes > 0)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pHarqDetectionStatusHost, m_outputPrms.pHarqDetectionStatusDevice, m_nUes, cudaMemcpyDeviceToHost, cuStrm);
-    }
-
-    if(m_chEstSettings.enableSinrMeasurement)
-    {
-        if(m_outputPrms.pSinrPreEqHost)
+        if(m_outputPrms.totNumUciPayloadBytes > 0)
         {
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pSinrPreEqHost, m_outputPrms.pSinrPreEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pUciPayloadsHost, m_outputPrms.pUciPayloadsDevice, m_outputPrms.totNumUciPayloadBytes, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
         }
-
-        if(m_outputPrms.pRsrpHost)
+    
+        if(m_nPolUciSegs_early > 0)
+        {
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pUciCrcFlagsHost, m_outputPrms.pUciCrcFlagsDevice_early, m_nPolUciSegs_early, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
+        }
+    
+        if(m_nUciUes > 0)
+        {
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pHarqDetectionStatusHost, m_outputPrms.pHarqDetectionStatusDevice, m_nUes, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
+        }
+    }
+    
+    if(m_openRanFunctionalSplitOption==PUSCH_7_2_A)
+    {
+        if(m_chEstSettings.enableSinrMeasurement)
+        {
+            if(m_outputPrms.pSinrPreEqHost)
+            {
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pSinrPreEqHost, m_outputPrms.pSinrPreEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                copy_found = true;
+            }
+    
+            if(m_outputPrms.pRsrpHost)
+            {
+                if(m_subSlotProcessingFrontLoadedDmrsEnabled)
+                {
+                    m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRsrpHost, m_outputPrms.pRsrpDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                    copy_found = true;
+                }
+                else
+                {
+                    m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRsrpHost, m_outputPrms.pRsrpEhqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                    copy_found = true;
+                }
+            }
+        }
+    
+        if(m_chEstSettings.enableRssiMeasurement && m_outputPrms.pRssiHost)
         {
             if(m_subSlotProcessingFrontLoadedDmrsEnabled)
             {
-                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRsrpHost, m_outputPrms.pRsrpDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRssiHost, m_outputPrms.pRssiDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUeGrps, cudaMemcpyDeviceToHost, cuStrm);
+                copy_found = true;
             }
             else
             {
-                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRsrpHost, m_outputPrms.pRsrpEhqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRssiHost, m_outputPrms.pRssiEhqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUeGrps, cudaMemcpyDeviceToHost, cuStrm);
+                copy_found = true;
             }
         }
     }
-
-    if(m_chEstSettings.enableRssiMeasurement && m_outputPrms.pRssiHost)
+    
+    cuphyStatus_t status = CUPHY_STATUS_SUCCESS;
+    if(m_useBatchedMemcpy && m_batchedMemcpyHelper[batched_copy_config].getMemcpyCount()==0)
     {
-        if(m_subSlotProcessingFrontLoadedDmrsEnabled)
+        if(copy_found)
         {
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRssiHost, m_outputPrms.pRssiDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUeGrps, cudaMemcpyDeviceToHost, cuStrm);
+            status = CUPHY_STATUS_INTERNAL_ERROR;
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "NO D2H batched memory copy for PUSCH early HARQ with copy identified!");
         }
         else
         {
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRssiHost, m_outputPrms.pRssiEhqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUeGrps, cudaMemcpyDeviceToHost, cuStrm);
+            status = CUPHY_STATUS_SUCCESS;
+            NVLOGD_FMT(NVLOG_PUSCH, "NO D2H batched memory copy for PUSCH early HARQ!");
         }
     }
-
-    cuphyStatus_t status = m_batchedMemcpyHelper[batched_copy_config].launchBatchedMemcpy(cuStrm);
-    if(status != CUPHY_STATUS_SUCCESS)
+    else
     {
-        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "Launching batched memcpy for PUSCH returned an error");
+        status = m_batchedMemcpyHelper[batched_copy_config].launchBatchedMemcpy(cuStrm);
+        if(status != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "Launching batched memcpy for PUSCH returned an error");
+        }
     }
     return status;
 }
@@ -4794,83 +8465,126 @@ cuphyStatus_t PuschRx::copyOutputToCPU(cudaStream_t cuStrm)
 
     const int batched_copy_config = batchedMemcpyHelperTarget::NON_EH; // since not early harq
     m_batchedMemcpyHelper[batched_copy_config].reset(); // reset for upcoming batch of updateMemcpy calls
+    bool copy_found = false;
 
-    if(m_outputPrms.pCbCrcsHost)
+    if(m_kernelSelOption == PUSCH_ALL)
     {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pCbCrcsHost, m_outputPrms.pCbCrcsDevice, sizeof(uint32_t) * m_outputPrms.totNumCbs, cudaMemcpyDeviceToHost, cuStrm);
-    }
-    if(m_outputPrms.pTbCrcsHost)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pTbCrcsHost, m_outputPrms.pTbCrcsDevice, sizeof(uint32_t) * m_outputPrms.totNumTbs, cudaMemcpyDeviceToHost, cuStrm);
-    }
-    if(m_outputPrms.pTbPayloadsHost)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pTbPayloadsHost, m_outputPrms.pTbPayloadsDevice, m_outputPrms.totNumPayloadBytes, cudaMemcpyDeviceToHost, cuStrm);
-    }
-    if(m_chEstSettings.enableToEstimation && m_outputPrms.pTaEstsHost)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pTaEstsHost, m_outputPrms.pTaEstsDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
-    }
-    if(m_chEstSettings.enableRssiMeasurement && m_outputPrms.pRssiHost)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRssiHost, m_outputPrms.pRssiDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUeGrps, cudaMemcpyDeviceToHost, cuStrm);
-    }
-    if(m_chEstSettings.enableSinrMeasurement)
-    {
-        // Per UE RSRP
-        if(m_outputPrms.pRsrpHost)
+        if(m_outputPrms.pCbCrcsHost && (m_outputPrms.totNumCbs > 0))
         {
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRsrpHost, m_outputPrms.pRsrpDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pCbCrcsHost, m_outputPrms.pCbCrcsDevice, sizeof(uint32_t) * m_outputPrms.totNumCbs, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
         }
-        // Per UE group pre-equalizer noise variance
-        if(m_outputPrms.pNoiseVarPreEqHost)
+        if(m_outputPrms.pTbCrcsHost && (m_outputPrms.totNumTbs > 0))
         {
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pTbCrcsHost, m_outputPrms.pTbCrcsDevice, sizeof(uint32_t) * m_outputPrms.totNumTbs, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
+        }
+        if(m_outputPrms.nPerCellTbDests > 0)
+        {
+            for(uint32_t c = 0; c < m_outputPrms.nPerCellTbDests; c++)
+            {
+                if(m_outputPrms.pPerCellTbPayloadsHost[c] && m_outputPrms.perCellTbPayloadSize[c] > 0)
+                {
+                    m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(
+                        m_outputPrms.pPerCellTbPayloadsHost[c],
+                        m_outputPrms.pTbPayloadsDevice + m_outputPrms.perCellTbPayloadOffset[c],
+                        m_outputPrms.perCellTbPayloadSize[c],
+                        cudaMemcpyDeviceToHost, cuStrm);
+                }
+            }
+        }
+        else if(m_outputPrms.pTbPayloadsHost && (m_outputPrms.totNumPayloadBytes > 0))
+        {
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pTbPayloadsHost, m_outputPrms.pTbPayloadsDevice, m_outputPrms.totNumPayloadBytes, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
+        }
+    }
+    
+    if(m_openRanFunctionalSplitOption == PUSCH_7_2_A)
+    {
+        if(m_chEstSettings.enableToEstimation && m_outputPrms.pTaEstsHost)
+        {
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pTaEstsHost, m_outputPrms.pTaEstsDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
+        }
+        if(m_chEstSettings.enableRssiMeasurement && m_outputPrms.pRssiHost)
+        {
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRssiHost, m_outputPrms.pRssiDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUeGrps, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
+        }
+        if(m_chEstSettings.enableSinrMeasurement)
+        {
+            // Per UE RSRP
+            if(m_outputPrms.pRsrpHost)
+            {
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pRsrpHost, m_outputPrms.pRsrpDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                copy_found = true;
+            }
+            // Per UE group pre-equalizer noise variance
+            if(m_outputPrms.pNoiseVarPreEqHost)
+            {
 #if USE_PUSCH_PER_UE_PREQ_NOISE_VAR
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pNoiseVarPreEqHost, m_outputPrms.pNoiseVarPreEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pNoiseVarPreEqHost, m_outputPrms.pNoiseVarPreEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
 #else
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pNoiseVarPreEqHost, m_outputPrms.pNoiseVarPreEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUeGrps, cudaMemcpyDeviceToHost, cuStrm);
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pNoiseVarPreEqHost, m_outputPrms.pNoiseVarPreEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUeGrps, cudaMemcpyDeviceToHost, cuStrm);
 #endif
+                copy_found = true;
+            }
+            // Per UE post-equalizer noise variance
+            if(m_outputPrms.pNoiseVarPostEqHost)
+            {
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pNoiseVarPostEqHost, m_outputPrms.pNoiseVarPostEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                copy_found = true;
+            }
+            // Per UE pre-Eq SINR
+            const bool preEqSinrCopiedByEarlyHarq =
+                m_earlyHarqModeEnabled && m_subSlotProcessingFrontLoadedDmrsEnabled && (m_nEarlyHarqUes > 0);
+            if((m_outputPrms.pSinrPreEqHost) && !preEqSinrCopiedByEarlyHarq)
+            {
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pSinrPreEqHost, m_outputPrms.pSinrPreEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                copy_found = true;
+            }
+            // Per layer post-Eq SINR
+            if(m_outputPrms.pSinrPostEqHost)
+            {
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pSinrPostEqHost, m_outputPrms.pSinrPostEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                copy_found = true;
+            }
         }
-        // Per UE post-equalizer noise variance
-        if(m_outputPrms.pNoiseVarPostEqHost)
+        if(m_chEstSettings.enableCfoCorrection)
         {
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pNoiseVarPostEqHost, m_outputPrms.pNoiseVarPostEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+            if(m_outputPrms.pCfoHzHost)
+            {
+                m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pCfoHzHost, m_outputPrms.pCfoHzDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+                copy_found = true;
+            }
         }
-        // Per UE pre-Eq SINR
-        if((m_outputPrms.pSinrPreEqHost) && ((!m_earlyHarqModeEnabled)||(!m_subSlotProcessingFrontLoadedDmrsEnabled)))
+    }
+    
+    if(m_uciKernelSelOption == PUSCH_UCI_ALL)
+    {
+        if(m_outputPrms.totNumUciPayloadBytes > 0)
         {
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pSinrPreEqHost, m_outputPrms.pSinrPreEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pUciPayloadsHost, m_outputPrms.pUciPayloadsDevice, m_outputPrms.totNumUciPayloadBytes, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
         }
-        // Per layer post-Eq SINR
-        if(m_outputPrms.pSinrPostEqHost)
+        if(m_nCsi2Ues > 0)
         {
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pSinrPostEqHost, m_outputPrms.pSinrPostEqDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pNumCsi2BitsHost, m_outputPrms.pNumCsi2BitsDevice, m_nCsi2Ues * sizeof(uint16_t), cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
         }
-    }
-    if(m_chEstSettings.enableCfoCorrection)
-    {
-        if(m_outputPrms.pCfoHzHost)
+        if(m_nPolUciSegs > 0)
         {
-            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pCfoHzHost, m_outputPrms.pCfoHzDevice, sizeof(float) * m_cuphyPuschCellGrpDynPrm.nUes, cudaMemcpyDeviceToHost, cuStrm);
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pUciCrcFlagsHost, m_outputPrms.pUciCrcFlagsDevice, m_nPolUciSegs, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
         }
-    }
-    if(m_outputPrms.totNumUciPayloadBytes > 0)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pUciPayloadsHost, m_outputPrms.pUciPayloadsDevice, m_outputPrms.totNumUciPayloadBytes, cudaMemcpyDeviceToHost, cuStrm);
-    }
-    if(m_nCsi2Ues > 0)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pNumCsi2BitsHost, m_outputPrms.pNumCsi2BitsDevice, m_nCsi2Ues * sizeof(uint16_t), cudaMemcpyDeviceToHost, cuStrm);
-    }
-    if(m_nPolUciSegs > 0)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pUciCrcFlagsHost, m_outputPrms.pUciCrcFlagsDevice, m_nPolUciSegs, cudaMemcpyDeviceToHost, cuStrm);
-    }
-    if(m_nUciUes > 0)
-    {
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pHarqDetectionStatusHost, m_outputPrms.pHarqDetectionStatusDevice, m_nUes, cudaMemcpyDeviceToHost, cuStrm);
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pCsiP1DetectionStatusHost, m_outputPrms.pCsiP1DetectionStatusDevice, m_nUes, cudaMemcpyDeviceToHost, cuStrm);
-        m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pCsiP2DetectionStatusHost, m_outputPrms.pCsiP2DetectionStatusDevice, m_nUes, cudaMemcpyDeviceToHost, cuStrm);
+        if(m_nUciUes > 0)
+        {
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pHarqDetectionStatusHost, m_outputPrms.pHarqDetectionStatusDevice, m_nUes, cudaMemcpyDeviceToHost, cuStrm);
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pCsiP1DetectionStatusHost, m_outputPrms.pCsiP1DetectionStatusDevice, m_nUes, cudaMemcpyDeviceToHost, cuStrm);
+            m_batchedMemcpyHelper[batched_copy_config].updateMemcpy(m_outputPrms.pCsiP2DetectionStatusHost, m_outputPrms.pCsiP2DetectionStatusDevice, m_nUes, cudaMemcpyDeviceToHost, cuStrm);
+            copy_found = true;
+        }
     }
 
     // Copy H matrix estimates for all UE groups, concatenated into pChannelEstsHost.
@@ -4894,11 +8608,28 @@ cuphyStatus_t PuschRx::copyOutputToCPU(cudaStream_t cuStrm)
             offsetBytes += tensorSizeInBytes;
         }
     }
-
-    cuphyStatus_t status = m_batchedMemcpyHelper[batched_copy_config].launchBatchedMemcpy(cuStrm);
-    if(status != CUPHY_STATUS_SUCCESS)
+    
+    cuphyStatus_t status = CUPHY_STATUS_SUCCESS;
+    if(m_useBatchedMemcpy && m_batchedMemcpyHelper[batched_copy_config].getMemcpyCount()==0)
     {
-        NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "Launching batched memcpy for PUSCH returned an error");
+        if(copy_found)
+        {
+            status = CUPHY_STATUS_INTERNAL_ERROR;
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "NO D2H batched memory copy for PUSCH with copy identified!");
+        }
+        else
+        {
+            status = CUPHY_STATUS_SUCCESS;
+            NVLOGD_FMT(NVLOG_PUSCH, "NO D2H batched memory copy for PUSCH!");
+        }
+    }
+    else
+    {
+        status = m_batchedMemcpyHelper[batched_copy_config].launchBatchedMemcpy(cuStrm);
+        if(status != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "Launching batched memcpy for PUSCH returned an error");
+        }
     }
     return status;
 }
@@ -5402,7 +9133,8 @@ void PuschRx::writeDbgBufSynch(cudaStream_t cuStream)
         {   // first CW tree and CW LLR
             cuphyPolarUciSegPrm_t& uciSegPrms    = m_pUciSegPrmsCpu[0];
             uint16_t               N_cw          = uciSegPrms.N_cw;
-            uint16_t               nBytes_cwTree = 2 * N_cw;
+            // only the tree-types region is dumped, not the operation lists
+            uint16_t               nBytes_cwTree = static_cast<uint16_t>(cuphy::polar::PolarCwTreeLayout::treeTypesBytes(N_cw));
             uint16_t               nCbEstWords   = div_round_up(static_cast<uint16_t>(uciSegPrms.K_cw - uciSegPrms.nCrcBits), static_cast<uint16_t>(32));
 
             cuphy::tensor_ref tCwTree;
@@ -5863,56 +9595,68 @@ void PuschRx::fullSlotKernelLaunch()
         m_G2streamPool.advance();
 #endif
     }
+    
+    if(m_cuphyPuschStatPrms.uciOnPuschCompletedEvent)
+    {   // record the UCI-on-PUSCH completion event
+        CUDA_CHECK_EXCEPTION(cudaEventRecord(m_cuphyPuschStatPrms.uciOnPuschCompletedEvent, phase1Stream));
+    }
 
     if(m_nSchUes > 0)
     {
-#ifdef PUSCH_RX_ENABLE_MULTI_STREAM_LAUNCH
-        if(m_nCsi2Ues <= 0)
+        if(needsFullSlotSchDecode(m_useCbLdpc, m_nFullSlotRemainingSchCbs))
         {
+#ifdef PUSCH_RX_ENABLE_MULTI_STREAM_LAUNCH
+            if(m_nCsi2Ues <= 0)
+            {
                 m_G2streamPool.fork(phase1Stream, 1);
-        }
-        cudaStream_t stream = m_G2streamPool.current_stream().handle();
+            }
+            cudaStream_t stream = m_G2streamPool.current_stream().handle();
 #else
             cudaStream_t stream = phase1Stream;
 #endif
 
-        // Launch reset buffer kernel first
-        const CUDA_KERNEL_NODE_PARAMS& resetKernelNodeParamsDriver = m_rateMatchLaunchCfg.resetKernelNodeParamsDriver;
-        CU_CHECK_EXCEPTION(launch_kernel(resetKernelNodeParamsDriver, stream));
+            // Launch reset buffer kernel first
+            const CUDA_KERNEL_NODE_PARAMS& resetKernelNodeParamsDriver = m_rateMatchLaunchCfg.resetKernelNodeParamsDriver;
+            CU_CHECK_EXCEPTION(launch_kernel(resetKernelNodeParamsDriver, stream));
 
-        // Launch main de_rate_matching_global2 kernel
-        const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_rateMatchLaunchCfg.kernelNodeParamsDriver;
-        CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver, stream));
+            // Launch main de_rate_matching_global2 kernel
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_rateMatchLaunchCfg.kernelNodeParamsDriver;
+            CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver, stream));
 
-        // Launch clamp buffer kernel after derate matching
-        const CUDA_KERNEL_NODE_PARAMS& clampKernelNodeParamsDriver = m_rateMatchLaunchCfg.clampKernelNodeParamsDriver;
-        CU_CHECK_EXCEPTION(launch_kernel(clampKernelNodeParamsDriver, stream));
+            // Launch clamp buffer kernel after derate matching
+            const CUDA_KERNEL_NODE_PARAMS& clampKernelNodeParamsDriver = m_rateMatchLaunchCfg.clampKernelNodeParamsDriver;
+            CU_CHECK_EXCEPTION(launch_kernel(clampKernelNodeParamsDriver, stream));
 
 #ifdef PUSCH_RX_ENABLE_MULTI_STREAM_LAUNCH
-        {
-            MemtraceDisableScope md;
-            m_rateMatchEvent.record(stream);
-            CUDA_CHECK(cudaStreamWaitEvent(phase1Stream, m_rateMatchEvent.handle(), 0));
-        }
+            {
+                MemtraceDisableScope md;
+                m_rateMatchEvent.record(stream);
+                CUDA_CHECK(cudaStreamWaitEvent(phase1Stream, m_rateMatchEvent.handle(), 0));
+            }
 #endif
-        if(m_LDPCkernelLaunchMode & PUSCH_RX_ENABLE_DRIVER_LDPC_LAUNCH)
-        {
-            for(int i = 0; i < m_LDPCDecodeDescSet.count(); ++i)
+            if (m_useCbLdpc)
             {
-                const CUDA_KERNEL_NODE_PARAMS& kernel_node_params_driver = m_ldpcLaunchCfgs[i].kernel_node_params_driver;
+                launchLDPCStreamsCB(phase1Stream);
+            }
+            else if(m_LDPCkernelLaunchMode & PUSCH_RX_ENABLE_DRIVER_LDPC_LAUNCH)
+            {
+                auto& tb = std::get<TbLdpcState>(m_ldpcState);
+                for(int i = 0; i < tb.decode_desc_set.count(); ++i)
+                {
+                    const CUDA_KERNEL_NODE_PARAMS& kernel_node_params_driver = tb.launch_configs[i].kernel_node_params_driver;
                     CU_CHECK_EXCEPTION(launch_kernel(kernel_node_params_driver, phase1Stream));
-                // return (CUDA_SUCCESS == e) ? CUPHY_STATUS_SUCCESS : CUPHY_STATUS_INTERNAL_ERROR;
+                }
             }
-        }
-        else
-        {
-            if(m_LDPCkernelLaunchMode & PUSCH_RX_LDPC_STREAM_SEQUENTIAL)
+            else
             {
+                if(m_LDPCkernelLaunchMode & PUSCH_RX_LDPC_STREAM_SEQUENTIAL)
+                {
                     launchLDPCStreamsTensor(phase1Stream); // Note: using tensor interface for sequential for now
-            }
-            else //PUSCH_RX_LDPC_STREAM_POOL or PUSCH_RX_ENABLE_LDPC_DEC_SINGLE_STREAM_OPT
-            {
+                }
+                else //PUSCH_RX_LDPC_STREAM_POOL or PUSCH_RX_ENABLE_LDPC_DEC_SINGLE_STREAM_OPT
+                {
                     launchLDPCStreamsTB(phase1Stream);
+                }
             }
         }
 
@@ -6003,6 +9747,19 @@ cuphyStatus_t PuschRx::run(cuphyPuschRunPhase_t runPhase)
 #ifdef CUPHY_MEMTRACE
     memtrace_set_config(MI_MEMTRACE_CONFIG_ENABLE|MI_MEMTRACE_CONFIG_EXIT_AFTER_BACKTRACE);
 #endif
+
+    bool notLaunchFlag = (m_openRanFunctionalSplitOption == PUSCH_7_2_E) && (m_kernelSelOption == PUSCH_NO_SD_DERATE_MATCHING_FEC) && (m_uciKernelSelOption == PUSCH_UCI_NO_UCI) && (m_delayUs ==0);
+    if(notLaunchFlag)
+    {
+        CUDA_CHECK_EXCEPTION(cudaEventRecord(m_cuphyPuschStatPrms.subSlotCompletedEvent, phase1Stream));
+        if(m_cuphyPuschStatPrms.uciOnPuschCompletedEvent)
+        {
+            CUDA_CHECK_EXCEPTION(cudaEventRecord(m_cuphyPuschStatPrms.uciOnPuschCompletedEvent, phase1Stream));
+        }
+        NVLOGD_FMT(NVLOG_PUSCH, "No graph launched for PUSCH 7.2e split");
+        return status;
+    }
+
     if((runPhase == PUSCH_RUN_SUB_SLOT_PROC) ||  (runPhase == PUSCH_RUN_ALL_PHASES)) // (runPhase == PUSCH_RUN_ALL_PHASES) is added here for phase-3 test.
     {
         if (m_earlyHarqModeEnabled || m_subSlotProcessingFrontLoadedDmrsEnabled)
@@ -6045,7 +9802,7 @@ cuphyStatus_t PuschRx::run(cuphyPuschRunPhase_t runPhase)
 
             //========================================================================================
             // memory copy of early-HARQ output
-            if (m_earlyHarqModeEnabled)
+            if (m_nEarlyHarqUes > 0)
             {
                 if(m_outputPrms.cpuCopyOn)
                 {
@@ -6205,6 +9962,7 @@ cuphyStatus_t PuschRx::run(cuphyPuschRunPhase_t runPhase)
 // PuschRx::launchLDPCStreamsTensor()
 void PuschRx::launchLDPCStreamsTensor(cudaStream_t strm)
 {
+    auto& tb = std::get<TbLdpcState>(m_ldpcState);
     uint32_t oBytes = 0;
     uint32_t cs     = 0;
 
@@ -6256,7 +10014,7 @@ void PuschRx::launchLDPCStreamsTensor(cudaStream_t strm)
                                                     tdTB.handle(),                              // LLR descriptor
                                                     static_cast<char*>(m_pHarqBuffers[ueIdx])); // LLR address
 
-        m_LDPCdecoder.decode(dec_params, strm);
+        tb.decoder->decode(dec_params, strm);
 
         oBytes += otdTB.get_size_in_bytes();
         cs += m_pTbPrmsCpu[i % nTb].num_CBs;
@@ -6275,17 +10033,48 @@ void PuschRx::launchLDPCStreamsTensor(cudaStream_t strm)
 }
 
 ////////////////////////////////////////////////////////////////////////
+// PuschRx::computeLdpcMaxIters()
+uint16_t PuschRx::computeLdpcMaxIters(uint16_t ueIdx) const
+{
+    uint16_t maxIters = m_ldpcPrms.fixedMaxNumItrs;
+    switch(m_cuphyPuschStatPrms.ldpcMaxNumItrAlgo)
+    {
+        case LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED:
+            maxIters = m_ldpcPrms.fixedMaxNumItrs;
+            break;
+        case LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT:
+        {
+            const cuphyPuschUePrm_t& uePrms = m_cuphyPuschDynPrms.pCellGrpDynPrm->pUePrms[ueIdx];
+            float se = static_cast<float>(uePrms.qamModOrder) * static_cast<float>(uePrms.targetCodeRate) / 10240.0f;
+            if (se > 7.2f)       maxIters = 7;
+            else if (se < 0.4f)  maxIters = 20;
+            else                 maxIters = 10;
+            break;
+        }
+        case LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE:
+            maxIters = m_pTbPrmsCpu[ueIdx].ldpcMaxNumItrPerUe;
+            break;
+        default:
+            maxIters = 10;
+            break;
+    }
+
+    return maxIters;
+}
+
+////////////////////////////////////////////////////////////////////////
 // PuschRx::prepareLDPCStreamsTB()
 void PuschRx::prepareLDPCStreamsTB()
 {
+    auto& tb = std::get<TbLdpcState>(m_ldpcState);
     //------------------------------------------------------------------
     // Reset the count of valid LDPC descriptors in the descriptor set
-    m_LDPCDecodeDescSet.reset();
+    tb.decode_desc_set.reset();
     //------------------------------------------------------------------
     // Collect transport blocks with identical LDPC configurations into
     // descriptors.
-    cuphyLDPCParams& LDPC_params      = m_ldpcPrms;
-    const int32_t    OUT_STRIDE_WORDS = (MAX_DECODED_CODE_BLOCK_BIT_SIZE + 31) / 32;
+    const cuphyLDPCParams& LDPC_params = m_ldpcPrms;
+    const int32_t    OUT_STRIDE_WORDS  = (MAX_DECODED_CODE_BLOCK_BIT_SIZE + 31) / 32;
 
     size_t oWords = 0; // offset into LDPC output
     size_t oElements = 0; //offset into LDPC Soft Output
@@ -6300,7 +10089,7 @@ void PuschRx::prepareLDPCStreamsTB()
         const uint8_t ldpcMaxNumItrPerUe = m_pTbPrmsCpu[ueIdx].ldpcMaxNumItrPerUe;
         //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
         // Find/allocate a descriptor with a matching configuration
-        cuphy::LDPC_decode_desc& desc = m_LDPCDecodeDescSet.find(BG, Z, NUM_PARITY, m_cuphyPuschStatPrms.ldpcMaxNumItrAlgo, ldpcMaxNumItrPerUe);
+        cuphy::LDPC_decode_desc& desc = tb.decode_desc_set.find(BG, Z, NUM_PARITY, m_cuphyPuschStatPrms.ldpcMaxNumItrAlgo, ldpcMaxNumItrPerUe);
         //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
         // Populate the descriptor configuration fields for the first
         // transport block in the descriptor. (BG, Z, and NUM_PARITY
@@ -6308,61 +10097,14 @@ void PuschRx::prepareLDPCStreamsTB()
         if(0 == desc.num_tbs)
         {
             desc.config.llr_type       = (LDPC_params.useHalf ? CUPHY_R_16F : CUPHY_R_32F);
-            desc.config.max_iterations = LDPC_params.fixedMaxNumItrs;
-
-            switch(m_cuphyPuschStatPrms.ldpcMaxNumItrAlgo)
-            {
-                case LDPC_MAX_NUM_ITR_ALGO_TYPE_FIXED :
-                    {
-                        desc.config.max_iterations = LDPC_params.fixedMaxNumItrs;
-                        break;
-                    }
-                case LDPC_MAX_NUM_ITR_ALGO_TYPE_LUT :
-                    {
-                        cuphyPuschUePrm_t& uePrms = m_cuphyPuschDynPrms.pCellGrpDynPrm->pUePrms[ueIdx];
-                        float spectralEfficency   = static_cast<float>(uePrms.qamModOrder) * static_cast<float>(uePrms.targetCodeRate) / static_cast<float>(10240);
-                        if(spectralEfficency > 7.2)
-                        {
-                            desc.config.max_iterations = 7;
-                        }
-                        else if(spectralEfficency < 0.4)
-                        {
-                            desc.config.max_iterations = 20;
-                        }
-                        else
-                        {
-                            desc.config.max_iterations = 10;
-                        }
-                        break;
-                    }
-                case LDPC_MAX_NUM_ITR_ALGO_TYPE_PER_UE:
-                    {
-                        break;
-                    }
-                default :
-                    {
-                        desc.config.max_iterations = 10;
-                    }
-            }
-
-            // TEMPORARY HACK FOR TESTING NUM_ITERATIONS
-            if(getenv("LDPC_NUM_ITER"))
-            {
-                if(1 != sscanf(getenv("LDPC_NUM_ITER"), "%hi", &desc.config.max_iterations))
-                {
-                    fprintf(stderr,
-                            "Error reading LDPC_NUM_ITER from environment variable '%s', using file value %i.\n",
-                            getenv("LDPC_NUM_ITER"),
-                            static_cast<int>(desc.config.max_iterations));
-                }
-            }
-            desc.config.Kb        = LDPC_params.KbArray[ueIdx];
-            desc.config.flags     = LDPC_params.flags;
-            desc.config.clamp_value = m_cuphyPuschStatPrms.ldpcClampValue;
-            desc.config.algo      = LDPC_params.algoIndex;
-            desc.config.workspace = nullptr;
+            desc.config.max_iterations = computeLdpcMaxIters(ueIdx);
+            desc.config.Kb             = LDPC_params.KbArray[ueIdx];
+            desc.config.flags          = LDPC_params.flags;
+            desc.config.clamp_value    = m_cuphyPuschStatPrms.ldpcClampValue;
+            desc.config.algo           = LDPC_params.algoIndex;
+            desc.config.workspace      = nullptr;
             // Set the normalization constant based on the code rate
-            m_LDPCdecoder.set_normalization(desc.config);
+            tb.decoder->set_normalization(desc.config);
         }
         //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
         // Set up input and output addresses
@@ -6391,29 +10133,396 @@ void PuschRx::prepareLDPCStreamsTB()
 }
 
 ////////////////////////////////////////////////////////////////////////
+// PuschRx::computeEarlyHarqCbDecodePlan()
+void PuschRx::computeEarlyHarqCbDecodePlan()
+{
+    m_earlyDecodedCbCountPerTb.assign(m_maxNTbs, 0);
+    m_nEarlyDecodedSchCbs = 0;
+    m_nFullSlotRemainingSchCbs = 0;
+    std::get<CbLdpcState>(m_ldpcState).choice_cache.clear();
+
+    if (!m_earlyHarqModeEnabled)
+    {
+        for (int i = 0; i < m_nSchUes; ++i)
+        {
+            const uint16_t ueIdx = m_schUserIdxsVec[i];
+            m_nFullSlotRemainingSchCbs += m_pTbPrmsCpu[ueIdx].num_CBs;
+        }
+        return;
+    }
+
+    uint8_t earlyHarqSoftDemapperSymbolUpperBound = CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_UPPER_BOUND;
+    if ((m_chEstSettings.enableMassiveMIMO) && (m_maxDmrsMaxLen == 2))
+    {
+        earlyHarqSoftDemapperSymbolUpperBound += 1;
+    }
+
+    const cuphyPuschUePrm_t* pUePrms = m_cuphyPuschCellGrpDynPrm.pUePrms;
+    const bool earlySchCbDecodeRequested =
+        m_useCbLdpc &&
+        (m_cuphyPuschStatPrms.earlySchCbDecodeMode == PUSCH_EARLY_SCH_CB_DECODE_NON_UCI_SCH_ONLY);
+    for (int i = 0; i < m_nSchUes; ++i)
+    {
+        const uint16_t ueIdx = m_schUserIdxsVec[i];
+        const PerTbParams& tbPrms = m_pTbPrmsCpu[ueIdx];
+        const uint32_t numCbs = tbPrms.num_CBs;
+
+        uint16_t earlyCbCount = 0;
+        if (tbPrms.isEarlyHarq && numCbs > 0)
+        {
+            const uint16_t ueGrpIdx = pUePrms[ueIdx].ueGrpIdx;
+            const cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = m_drvdUeGrpPrmsCpu[ueGrpIdx];
+            const uint8_t firstHarqSymbol = drvdUeGrpPrms.dmrsSymLoc[0] + drvdUeGrpPrms.dmrsMaxLen;
+            uint8_t nEarlyHarqSymbols = 0;
+            if (firstHarqSymbol <= earlyHarqSoftDemapperSymbolUpperBound)
+            {
+                nEarlyHarqSymbols = earlyHarqSoftDemapperSymbolUpperBound + 1 - firstHarqSymbol;
+            }
+
+            const uint32_t nAvailableEarlyRmBits =
+                static_cast<uint32_t>(nEarlyHarqSymbols) *
+                static_cast<uint32_t>(pUePrms[ueIdx].nUeLayers) *
+                static_cast<uint32_t>(pUePrms[ueIdx].pUeGrpPrm->nPrb) *
+                CUPHY_N_TONES_PER_PRB *
+                static_cast<uint32_t>(pUePrms[ueIdx].qamModOrder);
+            const uint32_t uciEarlyBits = tbPrms.G_harq + tbPrms.G_csi1;
+            const uint32_t availableSchBits = (nAvailableEarlyRmBits > uciEarlyBits) ? (nAvailableEarlyRmBits - uciEarlyBits) : 0U;
+            earlyCbCount = computeLeadingEarlySchCbCount(tbPrms, availableSchBits);
+        }
+        else if (earlySchCbDecodeRequested && !tbPrms.uciOnPuschFlag && numCbs > 0)
+        {
+            const uint16_t ueGrpIdx = pUePrms[ueIdx].ueGrpIdx;
+            const cuphyPuschRxUeGrpPrms_t& drvdUeGrpPrms = m_drvdUeGrpPrmsCpu[ueGrpIdx];
+            const uint8_t firstHarqSymbol = drvdUeGrpPrms.dmrsSymLoc[0] + drvdUeGrpPrms.dmrsMaxLen;
+            uint8_t nEarlyHarqSymbols = 0;
+            if (firstHarqSymbol <= earlyHarqSoftDemapperSymbolUpperBound)
+            {
+                nEarlyHarqSymbols = earlyHarqSoftDemapperSymbolUpperBound + 1 - firstHarqSymbol;
+            }
+
+            const uint32_t availableSchBits =
+                static_cast<uint32_t>(nEarlyHarqSymbols) *
+                static_cast<uint32_t>(pUePrms[ueIdx].nUeLayers) *
+                static_cast<uint32_t>(pUePrms[ueIdx].pUeGrpPrm->nPrb) *
+                CUPHY_N_TONES_PER_PRB *
+                static_cast<uint32_t>(pUePrms[ueIdx].qamModOrder);
+            earlyCbCount = computeLeadingEarlySchCbCount(tbPrms, availableSchBits);
+        }
+
+        m_earlyDecodedCbCountPerTb[ueIdx] = earlyCbCount;
+        m_nEarlyDecodedSchCbs += earlyCbCount;
+        m_nFullSlotRemainingSchCbs += (numCbs - earlyCbCount);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////
+// PuschRx::prepareCbLdpcBatches()
+cuphyStatus_t PuschRx::prepareCbLdpcBatches(bool prepareEarlyHarqBatch)
+{
+    auto& cb = std::get<CbLdpcState>(m_ldpcState);
+    CbLdpcState::CbDecodeBatch& batch = prepareEarlyHarqBatch ? cb.early_batch : cb.full_batch;
+    cuphyLdpcCbLaunchPreparer_t preparer = cb.preparer;
+
+    batch.resetForSetup();
+
+    const cuphyLDPCParams& LDPC_params = m_ldpcPrms;
+    const int32_t    OUT_STRIDE_WORDS  = (MAX_DECODED_CODE_BLOCK_BIT_SIZE + 31) / 32;
+    const size_t     llrElemSize       = LDPC_params.useHalf ? 2 : 4;
+
+    const auto getCachedChoice = [&cb, preparer, this](const cuphyLdpcCbSubgroupKey_t& key,
+                                                        const CbLdpcState::CachedChoice** cachedChoiceOut) -> cuphyStatus_t {
+        const auto cachedChoiceIt = std::find_if(cb.choice_cache.begin(), cb.choice_cache.end(), [&key](const auto& entry) {
+            const auto& cachedKey = entry.key;
+            return cachedKey.bg == key.bg && cachedKey.Zc == key.Zc && cachedKey.parity_nodes == key.parity_nodes &&
+                   cachedKey.k == key.k && cachedKey.crc_type == key.crc_type && cachedKey.max_iters == key.max_iters &&
+                   cachedKey.algo == key.algo;
+        });
+        if (cachedChoiceIt != cb.choice_cache.end())
+        {
+            *cachedChoiceOut = &(*cachedChoiceIt);
+            return CUPHY_STATUS_SUCCESS;
+        }
+        if (cb.choice_cache.size() >= static_cast<size_t>(m_chEstSettings.nMaxLdpcHetConfigs))
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,
+                       "{}: CB LDPC kernel-choice cache capacity exceeded", __FUNCTION__);
+            return CUPHY_STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        CbLdpcState::CachedChoice entry{};
+        entry.key = key;
+        const cuphyStatus_t status = cuphyLdpcCbQueryKernelChoice(preparer, &entry.key, &entry.choice);
+        if (status != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,
+                       "{}: cuphyLdpcCbQueryKernelChoice failed with status {}", __FUNCTION__, static_cast<int>(status));
+            return status;
+        }
+        entry.family = cuphyLdpcCbLaunchFamily_t{entry.choice.compatibility_class_id,
+                                                  entry.choice.effective_algo,
+                                                  entry.choice.supports_heterogeneous_batch,
+                                                  entry.choice.max_subgroups};
+        cb.choice_cache.push_back(entry);
+        *cachedChoiceOut = &cb.choice_cache.back();
+        return CUPHY_STATUS_SUCCESS;
+    };
+
+    size_t oWords = 0; // offset into LDPC output
+
+    for(int i = 0; i < m_nSchUes; i++)
+    {
+        const uint16_t ueIdx      = m_schUserIdxsVec[i];
+        const int16_t  BG         = m_pTbPrmsCpu[ueIdx].bg;
+        const uint16_t Zc         = static_cast<uint16_t>(m_pTbPrmsCpu[ueIdx].Zc);
+        const uint16_t NUM_PARITY = static_cast<uint16_t>(LDPC_params.parityNodesArray[ueIdx]);
+        const uint16_t Kb         = static_cast<uint16_t>(LDPC_params.KbArray[ueIdx]);
+        const uint16_t k          = static_cast<uint16_t>(Kb * Zc);
+        const int      numCbs     = m_pTbPrmsCpu[ueIdx].num_CBs;
+        const uint16_t maxIters   = computeLdpcMaxIters(ueIdx);
+        const cuphyLdpcCbBaseGraph_t bgEnum = (BG == 1) ? CUPHY_LDPC_CB_BG1 : CUPHY_LDPC_CB_BG2;
+        const int earlyDecodedCbs = static_cast<int>(m_earlyDecodedCbCountPerTb[ueIdx]);
+        const int cbStart = prepareEarlyHarqBatch ? 0 : earlyDecodedCbs;
+        const int cbStop = prepareEarlyHarqBatch ? earlyDecodedCbs : numCbs;
+        const uint16_t partitionId = 0;
+
+        // Find/allocate a matching config bin only when the current UE contributes CBs to this pass.
+        int cfgIdx = -1;
+        if (cbStart < cbStop)
+        {
+            for (size_t c = 0; c < batch.configs.size(); c++)
+            {
+                const auto& cfg = batch.configs[c];
+                if (cfg.key.bg == bgEnum && cfg.key.Zc == Zc && cfg.key.parity_nodes == NUM_PARITY
+                    && cfg.key.max_iters == maxIters && cfg.key.k == k && cfg.key.algo == LDPC_params.algoIndex
+                    && cfg.partition_id == partitionId)
+                {
+                    cfgIdx = static_cast<int>(c);
+                    break;
+                }
+            }
+
+            if (cfgIdx < 0)
+            {
+                if (batch.configs.size() >= static_cast<size_t>(m_chEstSettings.nMaxLdpcHetConfigs))
+                {
+                    NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,
+                               "{}: CB LDPC requires more configuration bins than nMaxLdpcHetConfigs",
+                               __FUNCTION__);
+                    return CUPHY_STATUS_INSUFFICIENT_RESOURCES;
+                }
+
+                cfgIdx = static_cast<int>(batch.configs.size());
+                CbLdpcState::CbDecodeBatch::Config cfg{};
+                cfg.num_cb = 0;
+                cfg.data_offset = 0;
+                cfg.key.bg = bgEnum;
+                cfg.key.Zc = Zc;
+                cfg.key.parity_nodes = NUM_PARITY;
+                cfg.key.k = k;
+                cfg.key.crc_type = CUPHY_LDPC_CB_CRC_NONE;
+                cfg.key.max_iters = maxIters;
+                cfg.key.algo = LDPC_params.algoIndex;
+                cfg.partition_id = partitionId;
+
+                batch.configs.push_back(cfg);
+            }
+        }
+
+        const size_t llrStride = m_pTbPrmsCpu[ueIdx].Ncb_padded;
+        for(int c = 0; c < numCbs; c++)
+        {
+            if ((c >= cbStart) && (c < cbStop))
+            {
+                cuphyLdpcCbData_t cbData{};
+                cbData.llr_in = static_cast<const uint8_t*>(m_pHarqBuffers[ueIdx]) + c * llrStride * llrElemSize;
+                cbData.bits_out = static_cast<uint32_t*>(d_pLDPCOut) + oWords;
+                cbData.llr_out = nullptr;
+                cbData.group_id = ueIdx;
+                batch.cb_data_by_config[static_cast<size_t>(cfgIdx)].push_back(cbData);
+                batch.configs[static_cast<size_t>(cfgIdx)].num_cb++;
+                batch.total_cb_count++;
+            }
+            oWords += OUT_STRIDE_WORDS;
+        }
+    }
+
+    for (size_t cfgIdx = 0; cfgIdx < batch.configs.size(); ++cfgIdx)
+    {
+        auto& cfg = batch.configs[cfgIdx];
+        cfg.data_offset = batch.cb_data.size();
+        const auto& configData = batch.cb_data_by_config[cfgIdx];
+        batch.cb_data.insert(batch.cb_data.end(), configData.begin(), configData.end());
+    }
+
+    const size_t numConfigs = batch.configs.size();
+
+    for (size_t c = 0; c < numConfigs; c++)
+    {
+        auto& cfg = batch.configs[c];
+        batch.span_storage[c].resize(cfg.num_cb);
+        uint16_t numSpans = static_cast<uint16_t>(batch.span_storage[c].size());
+
+        cuphyStatus_t status = cuphyLdpcCbBuildSubgroupDesc(&cfg.key,
+                                                            batch.cb_data.data() + cfg.data_offset,
+                                                            cfg.num_cb,
+                                                            batch.span_storage[c].data(),
+                                                            &numSpans,
+                                                            &batch.subgroups[c]);
+        if (status != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: cuphyLdpcCbBuildSubgroupDesc failed with status {}", __FUNCTION__, static_cast<int>(status));
+            return status;
+        }
+
+        batch.batch_descs[c] = cuphyLdpcCbLaunchBatchDesc_t{&batch.subgroups[c], 1, nullptr};
+        const CbLdpcState::CachedChoice* cachedChoice = nullptr;
+        status = getCachedChoice(cfg.key, &cachedChoice);
+        if (status != CUPHY_STATUS_SUCCESS)
+        {
+            return status;
+        }
+        batch.families[c] = cachedChoice->family;
+
+        const cuphyLdpcCbPreparedLaunchConfig_t preparedConfig{
+            1,
+            cfg.num_cb,
+        };
+        size_t workspaceSize = 0;
+        size_t workspaceAlignment = 0;
+        status = cuphyLdpcCbPreparedLaunchGetWorkspaceSize(preparer,
+                                                           &batch.families[c],
+                                                           &preparedConfig,
+                                                           &workspaceSize,
+                                                           &workspaceAlignment);
+        if (status != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: cuphyLdpcCbPreparedLaunchGetWorkspaceSize failed with status {}", __FUNCTION__, static_cast<int>(status));
+            return status;
+        }
+
+        if (batch.launch_workspaces[c].size() < workspaceSize + workspaceAlignment)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT,
+                       "{}: preallocated CB LDPC workspace is too small (have {}, need {})",
+                       __FUNCTION__, batch.launch_workspaces[c].size(), workspaceSize + workspaceAlignment);
+            return CUPHY_STATUS_INSUFFICIENT_RESOURCES;
+        }
+        void* workspace = alignPointer(batch.launch_workspaces[c].data(), workspaceAlignment);
+        status = cuphyLdpcCbPreparedLaunchInitInPlace(preparer,
+                                                      &batch.families[c],
+                                                      &preparedConfig,
+                                                      workspace,
+                                                      workspaceSize,
+                                                      &batch.prepared_launches[c]);
+        if (status != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: cuphyLdpcCbPreparedLaunchInitInPlace failed with status {}", __FUNCTION__, static_cast<int>(status));
+            return status;
+        }
+
+        status = cuphyLdpcCbPrepareLaunchWithChoice(batch.prepared_launches[c],
+                                                    &batch.batch_descs[c],
+                                                    &cachedChoice->choice,
+                                                    nullptr);
+        if (status != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: cuphyLdpcCbPrepareLaunch failed with status {}", __FUNCTION__, static_cast<int>(status));
+            return status;
+        }
+
+        status = cuphyLdpcCbGetKernelNodeParams(batch.prepared_launches[c], &batch.node_params[c]);
+        if (status != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUSCH, AERIAL_CUPHY_EVENT, "{}: cuphyLdpcCbGetKernelNodeParams failed with status {}", __FUNCTION__, static_cast<int>(status));
+            return status;
+        }
+    }
+
+    return CUPHY_STATUS_SUCCESS;
+}
+
+////////////////////////////////////////////////////////////////////////
+// PuschRx::addCbLdpcNodes()
+void PuschRx::addCbLdpcNodes(CUgraph graph,
+                             const std::vector<CUgraphNode>& parents,
+                             std::vector<CUgraphNode>& nodes)
+{
+    nodes.resize(m_chEstSettings.nMaxLdpcHetConfigs);
+    for (int i = 0; i < m_chEstSettings.nMaxLdpcHetConfigs; ++i)
+    {
+        CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&nodes[i],
+                                                graph,
+                                                parents.data(),
+                                                parents.size(),
+                                                &m_emptyNode2paramsDriver));
+    }
+}
+
+////////////////////////////////////////////////////////////////////////
+// PuschRx::updateCbLdpcNodes()
+void PuschRx::updateCbLdpcNodes(CUgraphExec graphExec,
+                                const std::vector<CUgraphNode>& nodes,
+                                const std::vector<CUDA_KERNEL_NODE_PARAMS>& params,
+                                size_t activeParamCount,
+                                std::vector<uint8_t>& enabled,
+                                bool enableNodes)
+{
+    const size_t activeNodes = enableNodes ? std::min(activeParamCount, params.size()) : 0;
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        if (i < activeNodes)
+        {
+            CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(graphExec, nodes[i], &params[i]));
+            if (enabled[i] != 1)
+            {
+                enabled[i] = 1;
+                CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graphExec, nodes[i], 1));
+            }
+        }
+        else if (enabled[i] != 0)
+        {
+            enabled[i] = 0;
+            CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(graphExec, nodes[i], 0));
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////
+// PuschRx::launchLDPCStreamsCB()
+void PuschRx::launchLDPCStreamsCB(cudaStream_t strm)
+{
+    auto& cb = std::get<CbLdpcState>(m_ldpcState);
+    for (size_t i = 0; i < cb.full_batch.configs.size(); ++i)
+    {
+        CU_CHECK_EXCEPTION(launch_kernel(cb.full_batch.node_params[i], strm));
+    }
+}
+
+////////////////////////////////////////////////////////////////////////
 // PuschRx::launchLDPCStreamsTB()
 void PuschRx::launchLDPCStreamsTB(cudaStream_t strm)
 {
-    const size_t DESC_COUNT = m_LDPCDecodeDescSet.count();
+    auto& tb = std::get<TbLdpcState>(m_ldpcState);
+    const size_t DESC_COUNT = tb.decode_desc_set.count();
     if((m_LDPCkernelLaunchMode & PUSCH_RX_ENABLE_LDPC_DEC_SINGLE_STREAM_OPT) && (1 == DESC_COUNT))
     {
         // A single descriptor can be launched directly in the source stream
-        m_LDPCdecoder.decode(m_LDPCDecodeDescSet[0], strm);
+        tb.decoder->decode(tb.decode_desc_set[0], strm);
     }
     else
     {
         // Do LDPC for each TB in a different stream using a "round-robin"
         // distribution.
-        m_ldpcStreamPool.fork(strm, std::min(DESC_COUNT, m_ldpcStreamPool.max_size()));
-        for(int i = 0; i < DESC_COUNT; ++i)
+        tb.stream_pool.fork(strm, std::min(DESC_COUNT, tb.stream_pool.max_size()));
+        for(size_t i = 0; i < DESC_COUNT; ++i)
         {
-            m_LDPCdecoder.decode(m_LDPCDecodeDescSet[i],
-                                 m_ldpcStreamPool.current_stream().handle());
-            m_ldpcStreamPool.advance();
+            tb.decoder->decode(tb.decode_desc_set[i],
+                              tb.stream_pool.current_stream().handle());
+            tb.stream_pool.advance();
         }
         // Subsequent kernel submissions to strm must wait for all of
         // the LDPC kernels to complete
-        m_ldpcStreamPool.join(strm);
+        tb.stream_pool.join(strm);
     }
 }
 
@@ -6435,7 +10544,7 @@ void PuschRx::allocAndLinkPolBuffers(cuphyPolarUciSegPrm_t&     uciSegPrms,
                                     std::vector<uint32_t*>& cbEstAddrVec)
 {
     uint16_t N_cw          = uciSegPrms.N_cw;
-    uint16_t nBytes_cwTree = 2 * N_cw;
+    size_t   nBytes_cwTree = cuphy::polar::PolarCwTreeLayout::sizeBytes(N_cw);
 
     cwTreeTypesAddrVec[polSegIdx] = static_cast<uint8_t*>(m_LinearAlloc.alloc(nBytes_cwTree));
     uciSegLLRsAddrVec[polSegIdx]  = static_cast<__half*>(pSegLLRs);
@@ -6595,7 +10704,10 @@ void PuschRx::allocateDeviceMemory(cuphyPuschDynPrms_t* pDynPrm)
     // Per UE group tensor allocations
     int NUM_ANTENNAS, NUM_LAYERS, NF, NUM_DMRS_SYMS, NUM_DATA_SYMS, NH, NUM_PRBS;
 
-    cuphyTensorPrm_t* pTDataRx   = pDynPrm->pDataIn->pTDataRx;
+    cuphyTensorPrm_t* pTDataRx      = pDynPrm->pDataIn->pTDataRx;
+    cuphyTensorPrm_t* pTX_72e       = (m_openRanFunctionalSplitOption==PUSCH_7_2_E) ? pDynPrm->pDataIn->pTX_72e      : nullptr;
+    cuphyTensorPrm_t* pTReeInv_72e  = (m_openRanFunctionalSplitOption==PUSCH_7_2_E) ? pDynPrm->pDataIn->pTReeInv_72e : nullptr;
+
     for(int i = 0; i < m_cuphyPuschCellGrpDynPrm.nUeGrps; i++)
     {
         uint16_t cellPrmDynIdx = (m_cuphyPuschCellGrpDynPrm.pUeGrpPrms[i]).pCellPrm->cellPrmDynIdx;
@@ -6673,11 +10785,29 @@ void PuschRx::allocateDeviceMemory(cuphyPuschDynPrms_t* pDynPrm)
         m_LinearAlloc.alloc(m_tRefCoefVec[i]);
         copyTensorRef2Info(m_tRefCoefVec[i], drvdUeGrpPrmsCpu.tInfoEqCoef);
 
-        // Construct ReeDiagInv (inverse of equalizer output error variance) tensor dimensions and linear memory allocation
-        uint32_t nTimeChEq = m_cuphyPuschStatPrms.enablePuschTdi ? CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ : 1;
-        m_tRefReeDiagInvVec[i].desc().set(realTypeCh, CUPHY_N_TONES_PER_PRB, NUM_LAYERS, NUM_PRBS, nTimeChEq, cuphy::tensor_flags::align_tight);
-        m_LinearAlloc.alloc(m_tRefReeDiagInvVec[i]);
-        copyTensorRef2Info(m_tRefReeDiagInvVec[i], drvdUeGrpPrmsCpu.tInfoReeDiagInv);
+        if(m_openRanFunctionalSplitOption!=PUSCH_7_2_E)
+        {
+            // Construct ReeDiagInv (inverse of equalizer output error variance) tensor dimensions and linear memory allocation
+            uint32_t nTimeChEq = m_cuphyPuschStatPrms.enablePuschTdi ? CUPHY_PUSCH_RX_MAX_N_TIME_CH_EQ : 1;
+            m_tRefReeDiagInvVec[i].desc().set(realTypeCh, CUPHY_N_TONES_PER_PRB, NUM_LAYERS, NUM_PRBS, nTimeChEq, cuphy::tensor_flags::align_tight);
+            m_LinearAlloc.alloc(m_tRefReeDiagInvVec[i]);
+            copyTensorRef2Info(m_tRefReeDiagInvVec[i], drvdUeGrpPrmsCpu.tInfoReeDiagInv);
+        }
+        else
+        {
+            copyTensorPrm2Info(pTReeInv_72e[cellPrmDynIdx], drvdUeGrpPrmsCpu.tInfoReeDiagInv);
+            
+            // 7.2e + DFT-s-OFDM: tInfoReeDiagInv is the cell-global pTReeInv_72e tensor,
+            // but the AfterDft kernel indexes with local 0-based PRB. Pre-offset the base
+            // pointer by startPrb so the kernel reads the correct noise estimates.
+            // Safe because the first soft-demap kernel skips tReeDiagInv when enableTfPrcd==1.
+            if(m_chEstSettings.enableDftSOfdm == 1 && drvdUeGrpPrmsCpu.enableTfPrcd == 1 && drvdUeGrpPrmsCpu.startPrb > 0)
+            {
+                auto& reeInfo = drvdUeGrpPrmsCpu.tInfoReeDiagInv;
+                int elemBytes = get_cuphy_type_storage_element_size(reeInfo.elemType);
+                reeInfo.pAddr = static_cast<char*>(reeInfo.pAddr) + static_cast<int64_t>(drvdUeGrpPrmsCpu.startPrb) * reeInfo.strides[2] * elemBytes;
+            }
+        }
 
         // Construct Equalizer debug tensor dimensions and linear memory allocation
         if(m_outputPrms.debugOutputFlag)
@@ -6686,13 +10816,17 @@ void PuschRx::allocateDeviceMemory(cuphyPuschDynPrms_t* pDynPrm)
             m_LinearAlloc.alloc(m_tRefEqDbgVec[i]);
             copyTensorRef2Info(m_tRefEqDbgVec[i], drvdUeGrpPrmsCpu.tInfoChEqDbg);
         }
-
-        if (m_cuphyPuschStatPrms.enableDebugEqOutput)
+        
+        if((m_cuphyPuschStatPrms.enableDebugEqOutput || m_kernelSelOption==PUSCH_NO_SD_DERATE_MATCHING_FEC)&&(m_openRanFunctionalSplitOption==PUSCH_7_2_A))
         {
             // Construct estimated data (i.e. transmitted qams) tensor dimensions and linear memory allocation
             m_tRefDataEqVec[i].desc().set(CUPHY_C_16F, NUM_LAYERS, NF, NUM_DATA_SYMS, cuphy::tensor_flags::align_tight);
             m_LinearAlloc.alloc(m_tRefDataEqVec[i]);
             copyTensorRef2Info(m_tRefDataEqVec[i], drvdUeGrpPrmsCpu.tInfoDataEq);
+        }
+        else if(m_openRanFunctionalSplitOption==PUSCH_7_2_E)
+        {
+            copyTensorPrm2Info(pTX_72e[cellPrmDynIdx], drvdUeGrpPrmsCpu.tInfoDataEq);
         }
 
         if(m_chEstSettings.enableDftSOfdm==1)
@@ -7102,11 +11236,18 @@ void PuschRx::allocateDeviceMemory(cuphyPuschDynPrms_t* pDynPrm)
                 m_pUciSegPrmsCpu_csi2[csi2Idx].childCbIdxs[1] = 2*csi2Idx + 1;
                 m_pUciSegPrmsCpu_csi2[csi2Idx].exitFlag       = 1;
 
+                // The true CSI-2 N_cw is only known once uciOnPuschCsi2Ctrl has run on the
+                // device, which overwrites the GPU copy of these params. The host copy must
+                // still carry the worst case, because polarDecoder::setup() reads N_cw on the
+                // host to size the decoder's dynamic shared memory. Matches the worst-case
+                // N_cw/K_cw assigned to m_pUciSegPrmsCpu_csi2 above.
+                m_pUciCwPrmsCpu_csi2[2*csi2Idx].N_cw              = CUPHY_POLAR_DECODER_MAX_BITS;
                 m_pUciCwPrmsCpu_csi2[2*csi2Idx].cbIdxWithinUciSeg = 0;
                 m_pUciCwPrmsCpu_csi2[2*csi2Idx].pCrcStatus        = d_CsiP2DetStatus; //fix it only support 1Cb per Tb
                 m_pUciCwPrmsCpu_csi2[2*csi2Idx].en_CrcStatus      = CUPHY_DET_EN;
                 m_pUciCwPrmsCpu_csi2[2*csi2Idx].exitFlag          = 1;
 
+                m_pUciCwPrmsCpu_csi2[2*csi2Idx + 1].N_cw              = CUPHY_POLAR_DECODER_MAX_BITS;
                 m_pUciCwPrmsCpu_csi2[2*csi2Idx + 1].cbIdxWithinUciSeg = 1;
                 m_pUciCwPrmsCpu_csi2[2*csi2Idx + 1].pCrcStatus        = d_CsiP2DetStatus;
                 m_pUciCwPrmsCpu_csi2[2*csi2Idx + 1].en_CrcStatus      = CUPHY_DET_EN;
@@ -7228,7 +11369,6 @@ const void* PuschRx::getMemoryTracker()
     return &m_memoryFootprint;
 }
 
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // cuphySetupPuschRx()
 
@@ -7310,19 +11450,7 @@ size_t PuschRx::getBufferSizeBluesteinWorkspace(cuphyPuschStatPrms_t const* pSta
      {
          return 0;
      }
-     else
-     {
-         //////// 53 different DFT sizes for DFT-s-OFDM//////////////////////////////
-         // 12 24 36 48 60:                                              FFT128
-         // 72 96 108 120:                                               FFT256
-         // 144 180 192 216 240:                                         FFT512
-         // 288 300 324 360 384 432 480:                                 FFT1024
-         // 540 576 600 648 720 768 864 900 960 972:                     FFT2048
-         // 1080 1152 1200 1296 1440 1500 1536 1620 1728 1800 1920 1944: FFT4096
-         // 2160 2304 2400 2592 2700 2880 2916 3000 3072 3240:           FFT8192
-         // Memeory size for Bluestein Workspace in both time and frequency domains
-         return 53*sizeof(data_type_traits<CUPHY_C_32F>::type)*FFT8192*2;
-     }
+     return cuphy::getDftSOfdmBluesteinWorkspaceSizeBytes(pStatPrms->nMaxPrb);
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -7452,13 +11580,14 @@ size_t PuschRx::getBufferSize(cuphyPuschStatPrms_t const* pStatPrms)
     uint32_t maxBytesCfoEst = N_BYTES_C32 * MAX_ND_SUPPORTED * CUPHY_PUSCH_RX_MAX_N_LAYERS_PER_UE_GROUP * MAX_N_USER_GROUPS_SUPPORTED;
     nBytesBuffer += maxBytesCfoEst + EXTRA_PADDING;
 
-    // max DFT data buffer
-    if(m_chEstSettings.enableDftSOfdm==1)
+    // DFT-s-OFDM DataEqDft buffer: one complex sample per tone per data symbol, per UE group.
+    // Bluestein chirp tables are allocated separately via getBufferSizeBluesteinWorkspace();
+    // the IDFT FFT itself runs in registers/shared memory, so no per-UE-group FFT8192
+    // scratch or duplicate workspace reservation is needed here.
+    if(pStatPrms->enableDftSOfdm==1)
     {
-        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * 3276 * (OFDM_SYMBOLS_PER_SLOT - 1) + EXTRA_PADDING);
-        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * FFT8192 * (OFDM_SYMBOLS_PER_SLOT - 1) + EXTRA_PADDING); //for intermediate results in Bluestein's FFT
-        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * FFT8192 + EXTRA_PADDING); //for time domain data in Bluestein's FFT Workspace
-        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * FFT8192 + EXTRA_PADDING); //for freq domain data in Bluestein's FFT Workspace
+        const uint32_t maxDftTones = CUPHY_N_TONES_PER_PRB * max_nPrbUlBwp;
+        nBytesBuffer += (N_BYTES_C32 * MAX_N_USER_GROUPS_SUPPORTED * maxDftTones * (OFDM_SYMBOLS_PER_SLOT - 1) + EXTRA_PADDING);
     }
 
     uint32_t max_N_TBs = pStatPrms->nMaxTbs ? pStatPrms->nMaxTbs : ((pStatPrms->nMaxCellsPerSlot) > 1 ? MAX_N_TBS_PER_CELL_GROUP_SUPPORTED : MAX_N_TBS_SUPPORTED);
@@ -7525,9 +11654,9 @@ size_t PuschRx::getBufferSize(cuphyPuschStatPrms_t const* pStatPrms)
     uint32_t uciOutMaxBytes = nCtrlChannels * CUPHY_MAX_N_UCI_ON_PUSCH * sizeof(uint32_t);
     nBytesBuffer += uciOutMaxBytes + EXTRA_PADDING;
 
-    // polar cwTree:
-    uint32_t max_N          = 1024;
-    uint32_t cwTreeMaxBytes = (2 * max_N) * (CUPHY_MAX_N_POL_UCI_SEGS + CUPHY_MAX_N_POL_UCI_SEGS_CSI2);
+    // polar cwTree (tree types + both operation lists per segment):
+    const uint32_t maxN   = CUPHY_POLAR_DECODER_MAX_BITS;
+    size_t cwTreeMaxBytes = cuphy::polar::PolarCwTreeLayout::sizeBytes(maxN) * (CUPHY_MAX_N_POL_UCI_SEGS + CUPHY_MAX_N_POL_UCI_SEGS_CSI2);
     nBytesBuffer += cwTreeMaxBytes + EXTRA_PADDING;
 
     // polar cbEst workspace:
@@ -7535,7 +11664,7 @@ size_t PuschRx::getBufferSize(cuphyPuschStatPrms_t const* pStatPrms)
     nBytesBuffer += cbEstWorkspaceBytes + EXTRA_PADDING;
 
     // polar cw LLRs:
-    uint32_t cwLLRsMaxBytes = 2 * max_N * (CUPHY_MAX_N_POL_CWS + CUPHY_MAX_N_POL_CWS_CSI2);
+    uint32_t cwLLRsMaxBytes = 2 * maxN * (CUPHY_MAX_N_POL_CWS + CUPHY_MAX_N_POL_CWS_CSI2);
     nBytesBuffer += cwLLRsMaxBytes;
 
     if(pStatPrms->enableRssiMeasurement)
@@ -8082,16 +12211,7 @@ cuphyStatus_t PuschRx::expandBackEndParameters(cuphyPuschDynPrms_t* pDynPrm,
         /////////////////////////////////////////////////////
 
         // Derive lifting size
-        if(pPerTbPrms[i].bg == 1)
-            ldpcPrms.KbArray[i] = 22;
-        else if(B > 640)
-            ldpcPrms.KbArray[i] = 10;
-        else if(B > 560)
-            ldpcPrms.KbArray[i] = 9;
-        else if(B > 192)
-            ldpcPrms.KbArray[i] = 8;
-        else
-            ldpcPrms.KbArray[i] = 6;
+        ldpcPrms.KbArray[i] = cuphy::ldpc::derive_Kb(pPerTbPrms[i].bg, B);
         uint32_t Z[51] = {2, 4, 8, 16, 32, 64, 128, 256, 3, 6, 12, 24, 48, 96, 192, 384, 5, 10, 20, 40, 80, 160, 320, 7, 14, 28, 56, 112, 224, 9, 18, 36, 72, 144, 288, 11, 22, 44, 88, 176, 352, 13, 26, 52, 104, 208, 15, 30, 60, 120, 240};
 
         // Derive ZcArray (from derive_lifting.m)
@@ -8421,6 +12541,7 @@ void PuschRx::printStaticApiPrms(cuphyPuschStatPrms_t const* pStaticPrm)
     NVLOG_FMT(log_level, NVLOG_PUSCH, "ldpcKernelLaunch: {}", +pStaticPrm->ldpcKernelLaunch);
     NVLOG_FMT(log_level, NVLOG_PUSCH, "fixedMaxNumLdpcItrs: {}", pStaticPrm->fixedMaxNumLdpcItrs);
     NVLOG_FMT(log_level, NVLOG_PUSCH, "ldpcClampValue: {}", pStaticPrm->ldpcClampValue);
+    NVLOG_FMT(log_level, NVLOG_PUSCH, "earlySchCbDecodeMode: {}", +pStaticPrm->earlySchCbDecodeMode);
     NVLOG_FMT(log_level, NVLOG_PUSCH, "enableRssiMeasurement: {}", pStaticPrm->enableRssiMeasurement);
     NVLOG_FMT(log_level, NVLOG_PUSCH, "enableSinrMeasurement: {}", pStaticPrm->enableSinrMeasurement);
     NVLOG_FMT(log_level, NVLOG_PUSCH, "nMaxCells: {}", pStaticPrm->nMaxCells);

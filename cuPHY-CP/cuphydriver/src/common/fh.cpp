@@ -24,6 +24,7 @@
 #include "context.hpp"
 #include <unistd.h>
 #include "ti_generic.hpp"
+#include <algorithm>
 #include <limits>
 
 #define likely(x) __builtin_expect((x), 1)
@@ -59,7 +60,8 @@ FhProxy::FhProxy(
         .rivermax = false,
         .fh_stats_dump_cpu_core = ctx_cfg.fh_stats_dump_cpu_core,
         .cpu_rx_only = false,
-        .enable_gpu_comm_via_cpu = ctx_cfg.enable_gpu_comm_via_cpu
+        .enable_gpu_comm_via_cpu = ctx_cfg.enable_gpu_comm_via_cpu,
+        .max_dl_antenna_ports = ctx_cfg.max_dl_antenna_ports
     };
 
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
@@ -68,7 +70,7 @@ FhProxy::FhProxy(
         fh_info.cpu_rx_only = true;
     }
 
-    if(pdctx->cpuCommEnabled()) //Clear the cuda devices vector(non compute) if CPU Comms is enabled
+    if(pdctx->cpuCommEnabled()) // Clear CUDA device ID list (non-compute) when CPU Comms is enabled
     {
         fh_info.cuda_device_ids.clear();
     }
@@ -86,7 +88,10 @@ FhProxy::FhProxy(
     dynamic_beam_id_offset = ctx_cfg.dynamic_beam_id_start;
     dynamic_beam_id_end = ctx_cfg.dynamic_beam_id_end;
 
-    dynamic_beam_ids_per_slot     = CUPHY_BFW_N_MAX_PRB_GRPS * CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP;
+    // BFW dynamic beam IDs and coefficient buffer use the static MIMO-layer cap that cuPHY's
+    // BFW kernel sizes its internal buffers for; using the runtime antenna-port count here
+    // undersized pBfwCoef and caused "unregistered pointer" failures in cuphySetupBfwTx().
+    dynamic_beam_ids_per_slot     = CUPHY_BFW_N_MAX_PRB_GRPS * slot_command_api::BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP;
     dynamic_beam_id_covered_slots = (dynamic_beam_id_end - dynamic_beam_id_start + 1) / dynamic_beam_ids_per_slot;
 
     NVLOGC_FMT(TAG, "Dynamic beam id start: {}, end: {}, num of beam ids per slots: {}, number of consecutive slots with unique of beam ids: {} ", dynamic_beam_id_start, dynamic_beam_id_end, dynamic_beam_ids_per_slot, dynamic_beam_id_covered_slots);
@@ -107,7 +112,7 @@ FhProxy::FhProxy(
 FhProxy::~FhProxy()
 {
     //FIXME: cleanup peers
-    // delete sync_ready_list_gdr; //FIXME: causes cudaFree error
+    // delete sync_ready_list_gdr; // FIXME: causes cuMemFree error
     // sync_buffer.reset();
     // last_ordered_h.reset();
 
@@ -294,7 +299,7 @@ int FhProxy::registerPeer(
     {
         peer_info.rx_mode          = RxApiMode::UEMODE;
     }
-    peer_info.txq_cplane       = true;
+    peer_info.txq_cplane       = !pdctx->isFapiToCplaneDirect();
     peer_info.mMIMO_enable     = pdctx->getmMIMO_enable();
     if(pdctx->getmMIMO_enable())
     {
@@ -374,40 +379,56 @@ int FhProxy::registerPeer(
     mf.addCpuRegularSize(sizeof(fh_peer_t));
 
     ////////////////////////////////////////////////////////////////////////////////////////
-    /// U-plane packets to Order Kernel
+    /// U-plane packets to Order Kernel (only needed in cpu_init_comms mode)
     ////////////////////////////////////////////////////////////////////////////////////////
-    peer_ptr->rx_order_items.sync_buffer.reset(std::move(new host_buf(RX_QUEUE_SYNC_LIST_ITEMS * sizeof(struct rx_queue_sync), nullptr)));
-    peer_ptr->rx_order_items.sync_buffer->clear();
-    mf.addCpuPinnedSize(RX_QUEUE_SYNC_LIST_ITEMS * sizeof(struct rx_queue_sync));
-
-    peer_ptr->rx_order_items.sync_list             = (struct rx_queue_sync*)peer_ptr->rx_order_items.sync_buffer->addr();
-
-    peer_ptr->rx_order_items.sync_ready_list_gdr   = gDev->newGDRbuf(RX_QUEUE_SYNC_LIST_ITEMS * sizeof(uint32_t));
-    peer_ptr->rx_order_items.sync_item             = 0;
-    mf.addGpuPinnedSize(peer_ptr->rx_order_items.sync_ready_list_gdr->size_alloc);
-
-    peer_ptr->rx_order_items.last_ordered_h.reset(std::move(new host_buf(1 * sizeof(int), nullptr)));
-    peer_ptr->rx_order_items.last_ordered_h->clear();
-    peer_ptr->rx_order_items.last_ufree                     = 0;
-    mf.addCpuPinnedSize(sizeof(int));
-
-    for(int x = 0; x < RX_QUEUE_SYNC_LIST_ITEMS; x++)
+    if(pdctx->cpuCommEnabled())
     {
-        peer_ptr->rx_order_items.umsg_rx_list[x].umsg_info = (fhproxy_umsg_rx*)calloc(CK_ORDER_PKTS_BUFFERING, sizeof(fhproxy_umsg_rx));
-        if(peer_ptr->rx_order_items.umsg_rx_list[x].umsg_info == NULL)
+        peer_ptr->rx_order_items.sync_buffer.reset(std::move(new host_buf(RX_QUEUE_SYNC_LIST_ITEMS * sizeof(struct rx_queue_sync), nullptr)));
+        peer_ptr->rx_order_items.sync_buffer->clear();
+        mf.addCpuPinnedSize(RX_QUEUE_SYNC_LIST_ITEMS * sizeof(struct rx_queue_sync));
+
+        peer_ptr->rx_order_items.sync_list             = (struct rx_queue_sync*)peer_ptr->rx_order_items.sync_buffer->addr();
+
+        peer_ptr->rx_order_items.sync_ready_list_gdr   = gDev->newGDRbuf(RX_QUEUE_SYNC_LIST_ITEMS * sizeof(uint32_t));
+        peer_ptr->rx_order_items.sync_item             = 0;
+        mf.addGpuPinnedSize(peer_ptr->rx_order_items.sync_ready_list_gdr->size_alloc);
+
+        peer_ptr->rx_order_items.last_ordered_h.reset(std::move(new host_buf(1 * sizeof(int), nullptr)));
+        peer_ptr->rx_order_items.last_ordered_h->clear();
+        peer_ptr->rx_order_items.last_ufree                     = 0;
+        mf.addCpuPinnedSize(sizeof(int));
+
+        for(int x = 0; x < RX_QUEUE_SYNC_LIST_ITEMS; x++)
         {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Couldn't allocate {} fhproxy_umsg_rx", RX_QUEUE_SYNC_LIST_ITEMS);
+            peer_ptr->rx_order_items.umsg_rx_list[x].umsg_info = (fhproxy_umsg_rx*)calloc(CK_ORDER_PKTS_BUFFERING, sizeof(fhproxy_umsg_rx));
+            if(peer_ptr->rx_order_items.umsg_rx_list[x].umsg_info == nullptr)
+            {
+                NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Couldn't allocate {} fhproxy_umsg_rx", CK_ORDER_PKTS_BUFFERING);
+                for(int y = 0; y < x; y++)
+                {
+                    free(peer_ptr->rx_order_items.umsg_rx_list[y].umsg_info);
+                    peer_ptr->rx_order_items.umsg_rx_list[y].umsg_info = nullptr;
+                }
+                return -1;
+            }
+
+            mf.addCpuRegularSize(CK_ORDER_PKTS_BUFFERING * sizeof(fhproxy_umsg_rx));
+            peer_ptr->rx_order_items.umsg_rx_list[x].num = 0;
         }
 
-        mf.addCpuRegularSize(CK_ORDER_PKTS_BUFFERING * sizeof(fhproxy_umsg_rx));
-        peer_ptr->rx_order_items.umsg_rx_list[x].num = 0;
+        peer_ptr->rx_order_items.umsg_rx_index = 0;
+
+        peer_ptr->rx_order_items.flush_gmem.reset(gDev->newGDRbuf(sizeof(uint32_t)));
+        ((uint32_t*)peer_ptr->rx_order_items.flush_gmem->addrh())[0] = 0;
+        mf.addGpuPinnedSize(peer_ptr->rx_order_items.flush_gmem->size_alloc);
     }
-
-    peer_ptr->rx_order_items.umsg_rx_index = 0;
-
-    peer_ptr->rx_order_items.flush_gmem.reset(gDev->newGDRbuf(sizeof(uint32_t)));
-    ((uint32_t*)peer_ptr->rx_order_items.flush_gmem->addrh())[0] = 0;
-    mf.addGpuPinnedSize(peer_ptr->rx_order_items.flush_gmem->size_alloc);
+    else
+    {
+        peer_ptr->rx_order_items.sync_list = nullptr;
+        peer_ptr->rx_order_items.sync_item = 0;
+        peer_ptr->rx_order_items.last_ufree = 0;
+        peer_ptr->rx_order_items.umsg_rx_index = 0;
+    }
 
     return 0;
 }
@@ -430,6 +451,128 @@ int FhProxy::updatePeer(
         return -1;
     }
 
+    return 0;
+}
+
+int FhProxy::removeAllFlows(peer_id_t peer_id)
+{
+    auto peer_ptr = getPeerFromId(peer_id);
+    if(!peer_ptr)
+    {
+        return -1;
+    }
+
+    // Drop per-channel list entries for an eAxC after its unique FlowHandle is removed,
+    // so a mid-loop failure cannot leave stale handles that later double-remove.
+    auto drop_channel_flows_for_eaxc = [](flows_per_channel_t& channels, uint16_t eaxc_id) {
+        for(auto& flows : channels)
+        {
+            std::erase_if(flows, [eaxc_id](const fh_flow& f) { return f.eAxC_id == eaxc_id; });
+        }
+    };
+
+    for(auto it = peer_ptr->eAxC_ids_unique_cplane.begin();
+        it != peer_ptr->eAxC_ids_unique_cplane.end(); )
+    {
+        if(aerial_fh::remove_flow(it->second))
+        {
+            NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "Failed to remove C-plane flow: {}", it->first);
+            return -1;
+        }
+        drop_channel_flows_for_eaxc(peer_ptr->cplane_flows, it->first);
+        it = peer_ptr->eAxC_ids_unique_cplane.erase(it);
+    }
+
+    for(auto it = peer_ptr->eAxC_ids_unique_uplane.begin();
+        it != peer_ptr->eAxC_ids_unique_uplane.end(); )
+    {
+        if(aerial_fh::remove_flow(it->second))
+        {
+            NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "Failed to remove U-plane flow: {}", it->first);
+            return -1;
+        }
+        drop_channel_flows_for_eaxc(peer_ptr->uplane_flows, it->first);
+        it = peer_ptr->eAxC_ids_unique_uplane.erase(it);
+    }
+
+    if(aerial_fh::reset_peer_flow_registration(peer_ptr->peer))
+    {
+        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "Failed to reset peer flow registration maps");
+        return -1;
+    }
+    return 0;
+}
+
+int FhProxy::prepareFlowRebind(peer_id_t peer_id, const std::unordered_set<uint16_t>& desired_eaxcs)
+{
+    auto peer_ptr = getPeerFromId(peer_id);
+    if(!peer_ptr)
+    {
+        return -1;
+    }
+
+    auto has_stale_eaxc = [&desired_eaxcs](const auto& unique_map) {
+        for(const auto& [eaxc, unused] : unique_map)
+        {
+            (void)unused;
+            if(desired_eaxcs.find(eaxc) == desired_eaxcs.end())
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Both unique maps must be expand-only; a U-plane-only stale eAxC would
+    // otherwise survive forever on the incremental path.
+    if(has_stale_eaxc(peer_ptr->eAxC_ids_unique_cplane) ||
+       has_stale_eaxc(peer_ptr->eAxC_ids_unique_uplane))
+    {
+        NVLOGI_FMT(TAG, "OAM eAxC rebind: full flow rebuild for peer {}", peer_id);
+        return removeAllFlows(peer_id);
+    }
+
+    // Expand-only / reorder: keep unique Flow objects (and their GPU pkt hdr slots).
+    NVLOGI_FMT(TAG, "OAM eAxC rebind: incremental (keep {} unique flows) for peer {}",
+               peer_ptr->eAxC_ids_unique_cplane.size(), peer_id);
+    for(auto& flows : peer_ptr->cplane_flows)
+    {
+        flows.clear();
+    }
+    for(auto& flows : peer_ptr->uplane_flows)
+    {
+        flows.clear();
+    }
+    return 0;
+}
+
+int FhProxy::beginFlowRegistration(peer_id_t peer_id)
+{
+    auto peer_ptr = getPeerFromId(peer_id);
+    if(!peer_ptr)
+    {
+        return -1;
+    }
+    if(aerial_fh::begin_peer_flow_registration(peer_ptr->peer))
+    {
+        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "Failed to begin peer flow registration");
+        return -1;
+    }
+    return 0;
+}
+
+int FhProxy::endFlowRegistration(peer_id_t peer_id)
+{
+    auto peer_ptr = getPeerFromId(peer_id);
+    if(!peer_ptr)
+    {
+        return -1;
+    }
+    if(aerial_fh::end_peer_flow_registration(peer_ptr->peer))
+    {
+        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "Failed to end peer flow registration");
+        return -1;
+    }
     return 0;
 }
 
@@ -462,6 +605,12 @@ int FhProxy::removePeer(peer_id_t peer_id)
         NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, "Failed to remove peer");
         return -1;
     }
+
+    peer_ptr->peer = nullptr;
+    peer_map.erase(peer_id);
+    peer_id_vector.erase(
+        std::remove(peer_id_vector.begin(), peer_id_vector.end(), peer_id),
+        peer_id_vector.end());
     return 0;
 }
 
@@ -583,25 +732,20 @@ int FhProxy::registerFlow(peer_id_t peer_id, uint16_t eAxC_id, uint16_t vlan_tci
     auto &eAxC_ids_unique_cplane =  peer_ptr->eAxC_ids_unique_cplane;
     auto &eAxC_ids_unique_uplane =  peer_ptr->eAxC_ids_unique_uplane;
 
-    if(channel == slot_command_api::channel_type::SRS)
+    const size_t active_antenna_ports = (channel == slot_command_api::channel_type::SRS)
+        ? static_cast<size_t>(MAX_AP_PER_SLOT_SRS)
+        : ((channel == slot_command_api::channel_type::CSI_RS)
+               ? static_cast<size_t>(MAX_AP_PER_SLOT_CSI_RS)
+               : static_cast<size_t>(MAX_AP_PER_SLOT));
+
+    if(cplane_flows.size() >= active_antenna_ports)
     {
-        if(cplane_flows.size() > MAX_AP_PER_SLOT_SRS)
-        {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Can't register more than {} SRS flows x peer (current {}) channel {}", MAX_AP_PER_SLOT_SRS , cplane_flows.size(), +channel) ;
-            return -1;
-        }
-    }
-    else if(channel == slot_command_api::channel_type::CSI_RS)
-    {
-        if(cplane_flows.size() > MAX_AP_PER_SLOT_CSI_RS)
-        {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Can't register more than {} CSI-RS flows x peer (current {}) channel {}", MAX_AP_PER_SLOT_CSI_RS , cplane_flows.size(), +channel) ;
-            return -1;
-        }
-    }
-    else if(cplane_flows.size() > MAX_AP_PER_SLOT)
-    {
-        NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Can't register more than {} flows x peer (current {}) channel {}", MAX_AP_PER_SLOT , cplane_flows.size(), +channel) ;
+        NVLOGE_FMT(TAG,
+                   AERIAL_CUPHYDRV_API_EVENT,
+                   "Can't register more than {} flows x peer (current {}) channel {}",
+                   active_antenna_ports,
+                   cplane_flows.size(),
+                   +channel);
         return -1;
     }
     //NVLOGD_FMT(TAG, "Register flow for peer {}, eaxc_id {}, vlan_tci {}, channel_type {}" ,  (int) peer_id , (int)eAxC_id , vlan_tci, channel);
@@ -1015,7 +1159,13 @@ void FhProxy::fill_dynamic_section_ext11(const slot_command_api::oran_slot_ind& 
 {
     auto& bfwCoeff_buf_info = params.prb_info.bfwCoeff_buf_info;
     int bundle_size = 0;
-    if(bfwCoeff_buf_info.p_buf_bfwCoef_h == nullptr)
+    // Under GPU chaining the pinned host buffer is reclaimed and the IQ is DMA'd from the device
+    // buffer, so guard on whichever buffer this mode actually consumes (matches the buffer
+    // selection in the chaining branch below). Otherwise host-null would skip all UL/DL BFW.
+    uint8_t* active_bfw_buf = (bfw_c_plane_chaining_mode == aerial_fh::BfwCplaneChainingMode::GPU_CHAINING)
+                                ? bfwCoeff_buf_info.p_buf_bfwCoef_d
+                                : bfwCoeff_buf_info.p_buf_bfwCoef_h;
+    if(active_bfw_buf == nullptr)
     {
         return;
     }
@@ -1071,7 +1221,7 @@ void FhProxy::fill_dynamic_section_ext11(const slot_command_api::oran_slot_ind& 
 
     auto cur_prb = params.section_info.sect_1.startPrbc.get();
 
-    if(bfw_c_plane_chaining_mode == aerial_fh::BfwCplaneChainingMode::NO_CHAINING || params.prb_info.common.direction == slot_command_api::FH_DIR_UL)
+    if(bfw_c_plane_chaining_mode == aerial_fh::BfwCplaneChainingMode::NO_CHAINING)
     {
         // Assumption 1. PDSCH will always start at a multiple of prgsize
         // Assumption 2. when PDSCH and CSIRS overlap, it starts at a multiple of prgsize
@@ -1599,8 +1749,10 @@ int FhProxy::prepareCPlaneInfo(
                     if(mod_comp_enabled) {
                         if(is_pdsch_csirs)
                         {
-                            //Using PDSCH data to fill section extension 11 of CSI_RS
-                            csi_rs_prb_info = &prb_info;
+                            if(overlap_csirs_port_info.csirs_prb_idx < MAX_PRB_INFO)
+                            {
+                                csi_rs_prb_info = &(prbs[overlap_csirs_port_info.csirs_prb_idx]);
+                            }
                             beams_csirs_array = &prb_info.beams_array2;
                             beams_csirs_array_size = prb_info.beams_array_size2;
                             prb_info.common.reMask = prb_info.comp_info.sections[0].mcScaleReMask;
@@ -1817,8 +1969,15 @@ int FhProxy::prepareCPlaneInfo(
                                     encode_stat_ext_11 = true;
                                     encode_dyn_ext_11 = false;
                                 }
-                                else if(!prb_info.common.isStaticBfwEncoded) //Why not just use else?
+                                else if(!prb_info.common.isStaticBfwEncoded
+                                        && (prb_info.bfwCoeff_buf_info.p_buf_bfwCoef_h != nullptr
+                                            || prb_info.bfwCoeff_buf_info.p_buf_bfwCoef_d != nullptr)) // dynamic BFW (host or device buffer)
                                 {
+                                    // Accept the device buffer too: under GPU_CHAINING the host
+                                    // buffer is reclaimed (null) and the coefficients live in the
+                                    // device buffer. Gating on host-only would drop the dynamic
+                                    // SE11 for PDSCH-only / CSIRS-only / PBCH / BFW-only sections
+                                    // (mirrors the PDSCH+CSIRS overlap branch below).
                                     prg_size = prb_info.bfwCoeff_buf_info.prg_size;
                                     encode_stat_ext_11 = false;
                                     encode_dyn_ext_11 = true;
@@ -1835,7 +1994,11 @@ int FhProxy::prepareCPlaneInfo(
                                         encode_stat_ext_11 = true;
                                         encode_dyn_ext_11  = false;
                                     }
-                                    else if(prb_info.bfwCoeff_buf_info.p_buf_bfwCoef_h != nullptr && !prb_info.common.isStaticBfwEncoded)
+                                    // Accept the device buffer too: under GPU_CHAINING the host
+                                    // buffer is reclaimed (null) and the coefficients live in the
+                                    // device buffer, so gating on host-only would drop the dynamic
+                                    // SE11 for PDSCH+CSIRS overlap.
+                                    else if((prb_info.bfwCoeff_buf_info.p_buf_bfwCoef_h != nullptr || prb_info.bfwCoeff_buf_info.p_buf_bfwCoef_d != nullptr) && !prb_info.common.isStaticBfwEncoded)
                                     {
                                         prg_size = prb_info.bfwCoeff_buf_info.prg_size;
                                         encode_stat_ext_11 = false;
@@ -1968,7 +2131,7 @@ int FhProxy::prepareCPlaneInfo(
                         }
 
                         // At this point, the decision to disable BFW is known, so populate the singleton info in the appropriate set
-                        auto &section_count_per_ant = ((encode_dyn_ext_11 || encode_stat_ext_11) && disableBFWs == 0) ? section_count_per_ant_per_msgtype[fh_msg_info_type::BFW_MSG_INFO] : section_count_per_ant_per_msgtype[fh_msg_info_type::NON_BFW_MSG_INFO]; 
+                        auto &section_count_per_ant = ((encode_dyn_ext_11 || encode_stat_ext_11) && disableBFWs == 0) ? section_count_per_ant_per_msgtype[fh_msg_info_type::BFW_MSG_INFO] : section_count_per_ant_per_msgtype[fh_msg_info_type::NON_BFW_MSG_INFO];
                         auto &section_infos_per_ant = ((encode_dyn_ext_11 || encode_stat_ext_11) && disableBFWs == 0) ? section_infos_per_ant_per_msgtype[fh_msg_info_type::BFW_MSG_INFO] : section_infos_per_ant_per_msgtype[fh_msg_info_type::NON_BFW_MSG_INFO];
                         
                         memcpy(&section_infos_per_ant[flow_idx].at(section_count_per_ant[flow_idx]), &section_info, sizeof(fhproxy_cmsg_section)); 
@@ -2196,6 +2359,12 @@ int FhProxy::prepareCPlaneInfo(
     {
         fhproxy_cmsg         message_infos[MAX_CPLANE_MSGS_PER_SLOT];
         size_t               message_index{};
+        if (direction == DIRECTION_UPLINK)
+        {
+            NVLOGD_FMT(TAG, "[UL_CP_nonMMIMO] S1 enter build cell_id={} peer_id={} F{}S{}S{} start_tx_ns={} tx_cell_ofs_ns={} ru={} start_sym={} ch_type_range=[{},{}]",
+                cell_id, peer_id, frame_id, subframe_id, slot_id, start_tx_time.count(), tx_cell_start_ofs_ns,
+                static_cast<int>(ru), static_cast<int>(start_symbol), start_channel_type, end_channel_type);
+        }
         // Disable Modcomp for now for 4T4R
 // #ifndef ENABLE_MODCOMP
         for(int symbol_id = start_symbol; symbol_id < slot_info.symbols.size(); symbol_id++)
@@ -2532,14 +2701,27 @@ int FhProxy::prepareCPlaneInfo(
             }
         }
 
+        if (direction == DIRECTION_UPLINK)
+        {
+            NVLOGD_FMT(TAG, "[UL_CP_nonMMIMO] S2 built batch cell_id={} peer_id={} num_msgs={} section_index={} section_id={} section_id_prach={} section_id_srs={} start_sec_prach={} start_sec_srs={}",
+                cell_id, peer_id, message_index, section_index, section_id, section_id_prach, section_id_srs, start_section_id_prach, start_section_id_srs);
+        }
+
         if (section_index > MAX_CPLANE_SECTIONS_PER_SLOT)
         {
+            if (direction == DIRECTION_UPLINK)
+            {
+                NVLOGD_FMT(TAG, "[UL_CP_nonMMIMO] S-err section overflow cell_id={} peer_id={} section_index={} max={}",
+                    cell_id, peer_id, section_index, MAX_CPLANE_SECTIONS_PER_SLOT);
+            }
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Too many C-plane sections to send. Please increase MAX_CPLANE_SECTIONS_PER_SLOT");
             return SEND_CPLANE_FUNC_ERROR;
         }
 
         if (direction == DIRECTION_UPLINK && ((section_id >= start_section_id_prach) || (section_id_prach >= start_section_id_srs) || (section_id_srs < start_section_id_srs)))
         {
+            NVLOGD_FMT(TAG, "[UL_CP_nonMMIMO] S-err section_id collision cell_id={} peer_id={} section_id={} start_prach={} section_id_prach={} start_srs={} section_id_srs={}",
+                cell_id, peer_id, section_id, start_section_id_prach, section_id_prach, start_section_id_srs, section_id_srs);
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "At least two sections have the same SectionId value");
             return SEND_CPLANE_FUNC_ERROR;
         }
@@ -2548,6 +2730,11 @@ int FhProxy::prepareCPlaneInfo(
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "aerial_fh::send_cplane error");
             return SEND_CPLANE_FUNC_ERROR;
+        }
+        if (direction == DIRECTION_UPLINK)
+        {
+            NVLOGD_FMT(TAG, "[UL_CP_nonMMIMO] S3 send_cplane ok cell_id={} peer_id={} num_msgs={} F{}S{}S{}",
+                cell_id, peer_id, message_index, frame_id, subframe_id, slot_id);
         }
 
 
@@ -2905,6 +3092,31 @@ void release_dlbuffer_cb(void* addr, void* opaque)
     POP_RANGE_PHYDRV
 }
 
+int FhProxy::setupUPlaneGpuComm(peer_id_t peer_id, const slot_command_api::oran_slot_ind& slot_ind,
+        struct umsg_fh_tx_msg& txmsg, uint16_t max_num_prb_per_symbol,
+        t_ns cell_start_time, bool commViaCpu, PartialUplaneSlotInfo_t** out_partial_info,
+        UplaneConversionParams* out_params,
+        const uint16_t* eaxcid_list,
+        uint16_t num_eaxcids)
+{
+    struct fh_peer_t* peer_ptr = getPeerFromId(peer_id);
+    if (!peer_ptr) {
+        return -1;
+    }
+    t_ns symbol_duration = t_ns(SYMBOL_DURATION_NS);
+    return setup_uplane_gpu_comm(peer_ptr->peer,
+        static_cast<uint8_t>(slot_ind.oframe_id_),
+        static_cast<uint16_t>(slot_ind.osfid_),
+        static_cast<uint16_t>(slot_ind.oslotid_),
+        max_num_prb_per_symbol,
+        std::chrono::nanoseconds(cell_start_time.count()),
+        std::chrono::nanoseconds(symbol_duration.count()),
+        commViaCpu,
+        &txmsg.txrq_gpu,
+        out_partial_info,
+        out_params, eaxcid_list, num_eaxcids);
+}
+
 void FhProxy::UpdateTxMetricsGpuComm(
     peer_id_t              peer_id,
     struct umsg_fh_tx_msg& umsg_tx_list)
@@ -3137,15 +3349,17 @@ int FhProxy::prepareUPlanePackets(
                                 
                                 uint32_t mod_comp_msg_index = mod_comp_config_temp->num_messages_per_list[flow_idx][symbol_id];
 
-#ifdef ENABLE_32DL
-				// Bounds check to prevent buffer overflow in mod_compression_params arrays
+                                // Bounds check to prevent buffer overflow in mod_compression_params arrays.
+                                // Applies in all build configurations: MAX_SECTIONS_PER_UPLANE_SYMBOL is
+                                // defined for both ENABLE_32DL (64) and the default build (32), and the
+                                // backing arrays (nprbs_per_list, prb_start_per_list, scaling, params_per_list,
+                                // prb_params_per_list) are sized by it unconditionally.
                                 if (mod_comp_msg_index >= MAX_SECTIONS_PER_UPLANE_SYMBOL) {
-                                    NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT, 
+                                    NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT,
                                                "ModComp overflow: flow_idx={} symbol_id={} msg_index={} exceeds MAX_SECTIONS_PER_UPLANE_SYMBOL={}. Skipping section.",
                                                flow_idx, symbol_id, mod_comp_msg_index, MAX_SECTIONS_PER_UPLANE_SYMBOL);
-                                    continue; // Skip this section to prevent overflow
+                                    continue;
                                 }
-#endif
 
                                 //start prb and num of prbs for a given prb allocation (common if there are two channels on the same prb)
                                 mod_comp_config_temp->nprbs_per_list[flow_idx][symbol_id][mod_comp_msg_index]        = section_info.num_prbu;
@@ -3200,6 +3414,15 @@ int FhProxy::prepareUPlanePackets(
                                     section_info.prb_size = static_cast<uint32_t>(prb_info.comp_info.common.udIqWidth) * 3;
 
                                     uint32_t mod_comp_msg_index = mod_comp_config_temp->num_messages_per_list[flow_idx][symbol_id];
+
+                                    // Split-PRB ModComp: same overflow guard as the non-split path above;
+                                    // applies in all build configurations.
+                                    if(mod_comp_msg_index >= MAX_SECTIONS_PER_UPLANE_SYMBOL) {
+                                        NVLOGE_FMT(TAG, AERIAL_ORAN_FH_EVENT,
+                                                   "ModComp overflow (split PRB): flow_idx={} symbol_id={} msg_index={} exceeds MAX_SECTIONS_PER_UPLANE_SYMBOL={}. Skipping section.",
+                                                   flow_idx, symbol_id, mod_comp_msg_index, MAX_SECTIONS_PER_UPLANE_SYMBOL);
+                                        continue;
+                                    }
 
                                     //start prb and num of prbs for a given prb allocation (common if there are two channels on the same prb)
                                     mod_comp_config_temp->nprbs_per_list[flow_idx][symbol_id][mod_comp_msg_index]     = section_info.num_prbu;

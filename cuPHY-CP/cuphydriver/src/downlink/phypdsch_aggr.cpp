@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,9 +17,13 @@
 
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 15) // "DRV.PDSCH"
 
+#include <cstring>
+
 #include "phypdsch_aggr.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
+#include "pdsch_h2d_copy_manager.hpp"
 #include "cuda_events.hpp"
 #include "nvlog.hpp"
 #include "exceptions.hpp"
@@ -89,6 +93,7 @@ PhyPdschAggr::PhyPdschAggr(
 
     DataIn.pTbInput = (uint8_t**) calloc(PDSCH_MAX_CELLS_PER_CELL_GROUP, sizeof(uint8_t*));
     dyn_params.pDataIn = &DataIn;
+    dyn_params.pPostFecDataIn = nullptr; // only relevant for cuphyPdschPipelineMode_t::PDSCH_POST_FEC_PROCESSING that is not supported in cuBB
     DataOut.pTDataTx = (cuphyTensorPrm_t*) calloc(PDSCH_MAX_CELLS_PER_CELL_GROUP, sizeof(cuphyTensorPrm_t));
     statusOut = {cuphyPdschStatusType_t::CUPHY_PDSCH_STATUS_SUCCESS_OR_UNTRACKED_ISSUE, MAX_UINT16, MAX_UINT16};
     dyn_params.pDataOut = &DataOut;
@@ -164,7 +169,8 @@ int PhyPdschAggr::createPhyObj()
     static_params.nMaxCellsPerSlot      = static_params_cell.size();
     static_params.nMaxUesPerCellGroup   = PDSCH_MAX_UES_PER_CELL_GROUP;
     static_params.read_TB_CRC           = false;
-    static_params.full_slot_processing  = true;
+    static_params.pipeline_processing_mode = cuphyPdschPipelineMode_t::PDSCH_FULL_PROCESSING;
+    static_params.delayUs               = 0;
     static_params.nCells                = static_params_cell.size();
     static_params.pCellStatPrms         = static_cast<cuphyCellStatPrm_t*>(static_params_cell.data());
     static_params.enableBatchedMemcpy   = pdctx->getUseBatchedMemcpy();
@@ -176,7 +182,7 @@ int PhyPdschAggr::createPhyObj()
     if(static_params_cell.size() == pdctx->getCellGroupNum())
     {
         int cuda_strm_prio = 0;
-        CUDA_CHECK_PHYDRIVER(cudaStreamGetPriority(s_channel, &cuda_strm_prio));
+        CUDA_DRIVER_CHECK(cuStreamGetPriority(s_channel, &cuda_strm_prio));
         static_params.stream_priority = cuda_strm_prio;
 
         static_params.pDbg = new cuphyPdschDbgPrms_t[cellCount]; // ideally delete before
@@ -186,7 +192,7 @@ int PhyPdschAggr::createPhyObj()
             static_params.pDbg[i] = {"", check_TB_size, pdctx->isValidation(), identical_ldpc_configs};
         //  static_params.pDbg[i] = { "/path/to/TV_cuphy_V14-DS-08_slot0_MIMO2x16_PRB82_DataSyms10_qam64.h5",
         //                           check_TB_size, true, identical_ldpc_configs};
-        //int cuda_strm_prio = 0;
+        // int stream_prio = 0;
         //cuphy::print_pdsch_static(&static_params);
         //printPdschStaticParamsAggr(&static_params); //cuphydriver nvlog version; see below
         cuphyStatus_t createStatus = cuphyCreatePdschTx(&handle, &static_params); // Currently calling PdschTx constructor with empty filename
@@ -228,8 +234,8 @@ int PhyPdschAggr::setup(
     if(!aggr_slot_params->cgcmd->pdsch->tb_data.pTbInput[0])
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, s_channel));
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
         return 0;
     }
 #endif
@@ -281,25 +287,33 @@ int PhyPdschAggr::setup(
             */
         }
 
-         //cuphy::print_pdsch_dynamic_cell_group(dyn_params.pCellGrpDynPrm);
+         //cuphy::x_cell_group(dyn_params.pCellGrpDynPrm);
          //printParametersAggr(dyn_params.pCellGrpDynPrm);
          //printPdschDynamicCellGroupAggr(dyn_params.pCellGrpDynPrm); //cuphydriver nvlog version
          //printPdschDynPrmsAggr(&dyn_params); //cuphydriver nvlog version, included printPdschDynamicCellGroupAggr too
-        if(pdctx->enable_prepone_h2d_cpy)
         {
-            if(pdctx->h2d_copy_thread_enable) //Wait only if copy thread is enabled
+            auto* h2dMgr = pdctx->getH2DCopyManager();
+            if(h2dMgr->isPreponeEnabled())
             {
-                if(waitH2dCopyCudaEventRec()<0)
+                if(h2dMgr->isThreadEnabled())
                 {
-                    const int sfn  = aggr_slot_params->si->sfn_;
-                    const int slot = aggr_slot_params->si->slot_;
-                    NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "SFN {}, slot {}: Error! waitH2dCopyCudaEventRec timeout!", sfn, slot);
-                    return -1;
+                    if(waitH2dCopyCudaEventRec()<0)
+                    {
+                        const int sfn  = aggr_slot_params->si->sfn_;
+                        const int slot = aggr_slot_params->si->slot_;
+                        NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "SFN {}, slot {}: Error! waitH2dCopyCudaEventRec timeout!", sfn, slot);
+                        return -1;
+                    }
                 }
+                CUDA_CHECK(cudaStreamWaitEvent(s_channel, h2dMgr->getCompleteEvent(aggr_slot_params->si->slot_), 0));
+                NVLOGD_FMT(TAG,
+                           "PhyPdschAggr::setup: batch H2D TB memcpy complete — "
+                           "SFN={} slot={}",
+                           aggr_slot_params->si->sfn_,
+                           aggr_slot_params->si->slot_);
             }
-            CUDA_CHECK(cudaStreamWaitEvent(s_channel, pdctx->get_event_pdsch_tb_cpy_complete(aggr_slot_params->si->slot_), 0));
         }
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup, s_channel));
         //cuphy::print_pdsch_dynamic(&dyn_params);
         status = cuphySetupPdschTx(handle, &dyn_params, nullptr); // cuPHY should not throw any exception. Can also add try/catch if need be.
         if(status != CUPHY_STATUS_SUCCESS)
@@ -316,13 +330,13 @@ int PhyPdschAggr::setup(
 
             {
                 MemtraceDisableScope md;
-                CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+                CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
             }
             return -1;
         }
         {
             MemtraceDisableScope md;
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+            CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
         }
 
         if(pdctx->getPdschFallback() == 1)
@@ -334,7 +348,7 @@ int PhyPdschAggr::setup(
             fbOutBuf[index] = aggr_dlbuf[index]->getBufD();
 
         //Still keep these two to highlight from timers that setup is not run
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup, s_channel));
         status = cuphyFallbackBuffersSetupPdschTx(handle, (void**)fbOutBuf, aggr_dlbuf.size(), s_channel);
         if(status != CUPHY_STATUS_SUCCESS)
         {
@@ -343,7 +357,7 @@ int PhyPdschAggr::setup(
         }
         {
             MemtraceDisableScope md;
-            CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, s_channel));
+            CUDA_DRIVER_CHECK(cuEventRecord(end_setup, s_channel));
         }
     }
 
@@ -359,7 +373,7 @@ int PhyPdschAggr::run()
     setCtx();
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run, s_channel));
     }
     if((getSetupStatus() == CH_SETUP_DONE_NO_ERROR) && (aggr_slot_params->cgcmd->pdsch->tb_data.pTbInput[0]))
     {
@@ -372,7 +386,7 @@ int PhyPdschAggr::run()
     }
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, s_channel));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, s_channel));
     }
     return ret;
 }
@@ -462,30 +476,20 @@ void PhyPdschAggr::updatePhyCellId(uint16_t phyCellId_old,uint16_t phyCellId_new
 int PhyPdschAggr::waitH2dCopyCudaEventRec() {
     t_ns start_wait;
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(getPhyDriverHandler()).get();
+    auto* mgr = pdctx->getH2DCopyManager();
 
     start_wait = Time::nowNs();
+    
     int slot_index = aggr_slot_params->si->slot_ % PDSCH_MAX_GPU_BUFFS;
-    int tmp_i = 1;
     do{
         if(Time::getDifferenceNowToNs(start_wait).count() > (GENERIC_WAIT_THRESHOLD_NS * 2))
         {
             NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "SFN {}.{} H2D copy CUDA event record wait is taking more than {} ns", aggr_slot_params->si->sfn_,aggr_slot_params->si->slot_,(GENERIC_WAIT_THRESHOLD_NS * 2));
             return -1;
         }
-#if 0
-        if(Time::getDifferenceNowToNs(start_wait).count() > (tmp_i * 500000))
-        {
-            NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "H2D copy Cuda event record is taking more than {} ns for Frame {} Slot {}", tmp_i * 500000, aggr_slot_params->si->sfn_,aggr_slot_params->si->slot_);
-            tmp_i += 1;
-        }
-#endif
+    } while(mgr->cudaEventRecDone()[slot_index].load(std::memory_order_acquire) != true);
 
-        // NVLOGE_FMT(TAG, AERIAL_CUPHYDRV_API_EVENT, "Wait end Map {} num_active_cells = {} atomvar = {} ",
-        //                 getId(), num_active_cells, atom_dl_end_threads.load());
-
-    } while(pdctx->h2d_copy_cuda_event_rec_done[slot_index].load(std::memory_order_acquire) != true);
-
-    pdctx->h2d_copy_cuda_event_rec_done[slot_index].store(false,std::memory_order_release);
+    mgr->cudaEventRecDone()[slot_index].store(false, std::memory_order_release);
     return 0;
 }
 
@@ -501,14 +505,15 @@ void printPdschStaticParamsAggr(const cuphyPdschStatPrms_t* static_params)
     NVLOGI_FMT(TAG, "{} L2: PDSCH Static parameters for {} cells", __FUNCTION__, n_cells);
 
     // Parameters common across all cells
-    NVLOGI_FMT(TAG, "{} L2: read_TB_CRC:           {:4d}", __FUNCTION__, static_params->read_TB_CRC);
-    NVLOGI_FMT(TAG, "{} L2: full_slot_processing:  {:4d}", __FUNCTION__, static_params->full_slot_processing);
-    NVLOGI_FMT(TAG, "{} L2: stream_priority:       {:4d}", __FUNCTION__, static_params->stream_priority);
-    NVLOGI_FMT(TAG, "{} L2: nMaxCellsPerSlot:      {:4d}", __FUNCTION__, static_params->nMaxCellsPerSlot);
-    NVLOGI_FMT(TAG, "{} L2: nMaxUesPerCellGroup:   {:4d}", __FUNCTION__, static_params->nMaxUesPerCellGroup);
-    NVLOGI_FMT(TAG, "{} L2: nMaxCBsPerTB:          {:4d}", __FUNCTION__, static_params->nMaxCBsPerTB);
-    NVLOGI_FMT(TAG, "{} L2: nMaxPrb:               {:4d}", __FUNCTION__, static_params->nMaxPrb);
-    NVLOGI_FMT(TAG, "{} L2: enableBatchedMemcpy    {:4d}", __FUNCTION__, static_params->enableBatchedMemcpy);
+    NVLOGI_FMT(TAG, "{} L2: read_TB_CRC:               {:4d}", __FUNCTION__, static_params->read_TB_CRC);
+    NVLOGI_FMT(TAG, "{} L2: pipeline_processing_mode:  {:4d}", __FUNCTION__, static_params->pipeline_processing_mode);
+    NVLOGI_FMT(TAG, "{} L2: delayUs:                   {:4d}", __FUNCTION__, static_params->delayUs);
+    NVLOGI_FMT(TAG, "{} L2: stream_priority:           {:4d}", __FUNCTION__, static_params->stream_priority);
+    NVLOGI_FMT(TAG, "{} L2: nMaxCellsPerSlot:          {:4d}", __FUNCTION__, static_params->nMaxCellsPerSlot);
+    NVLOGI_FMT(TAG, "{} L2: nMaxUesPerCellGroup:       {:4d}", __FUNCTION__, static_params->nMaxUesPerCellGroup);
+    NVLOGI_FMT(TAG, "{} L2: nMaxCBsPerTB:              {:4d}", __FUNCTION__, static_params->nMaxCBsPerTB);
+    NVLOGI_FMT(TAG, "{} L2: nMaxPrb:                   {:4d}", __FUNCTION__, static_params->nMaxPrb);
+    NVLOGI_FMT(TAG, "{} L2: enableBatchedMemcpy        {:4d}", __FUNCTION__, static_params->enableBatchedMemcpy);
 
     // Cell specific parameters
     cuphyCellStatPrm_t* cell_static_params = static_params->pCellStatPrms;
@@ -830,11 +835,12 @@ void printPdschDynPrmsAggr(const cuphyPdschDynPrms_t* dynamic_params)
 
 float PhyPdschAggr::getPdschH2DCopyTime(const uint8_t slot) {
     PhyDriverCtx* pdctx = StaticConversion<PhyDriverCtx>(pdh).get();
-    if (!pdctx->enable_prepone_h2d_cpy) {
+    auto* mgr = pdctx->getH2DCopyManager();
+    if (!mgr->isPreponeEnabled()) [[unlikely]] {
         return 0.0f;
     }
     const uint8_t slot_index = slot % MAX_PDSCH_TB_CPY_CUDA_EVENTS;
-    return 1000.0f * GetCudaEventElapsedTime(pdctx->get_event_pdsch_tb_cpy_start(slot_index),
-                                             pdctx->get_event_pdsch_tb_cpy_complete(slot_index),
+    return 1000.0f * GetCudaEventElapsedTime(mgr->getStartEvent(slot_index),
+                                             mgr->getCompleteEvent(slot_index),
                                              __func__, getId());
 }

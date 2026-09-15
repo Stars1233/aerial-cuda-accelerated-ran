@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +35,7 @@ static constexpr int MAX_BUCKET_ENTRY = 16;                    ///< Maximum numb
 static constexpr int MAX_HARQ_PID = 16;                        ///< Maximum number of HARQ process IDs
 static constexpr int MAX_BUCKET_MAP_ENTRIES = 64;              ///< Maximum number of HARQ buffer entries per bucket map cell
 static constexpr float MAX_HARQB_NS_BUCKET = 1000000000;       ///< Maximum HARQ buffer retention time in nanoseconds (1 second)
-static constexpr uint32_t HARQ_CLEANUP_HYSTERSIS = 5;          ///< Hysteresis count for HARQ buffer cleanup (delays cleanup to avoid thrashing)
+static constexpr uint32_t HARQ_CLEANUP_HYSTERESIS = 5;          ///< Hysteresis count for HARQ buffer cleanup (delays cleanup to avoid thrashing)
 
 // #define DEBUG_HARQ_POOL
 
@@ -661,6 +661,8 @@ protected:
     GpuDevice*                                  gDev;          ///< GPU device pointer for buffer operations
     std::vector<std::unique_ptr<HarqPool>>      hb_pool_list;  ///< List of HARQ pools (one per buffer size)
     std::vector<std::unique_ptr<HarqBucket>>    hb_bucket_list; ///< List of HARQ buckets (organized by RNTI % bucket_count)
+    std::atomic<uint32_t>                       hysteresis_{0}; ///< Counts low-pool checks; threshold is approximate under concurrent reset
+    Mutex                                       cleanup_lock_;  ///< Ensures at most one HARQ bucket cleanup runs at a time
 };
 
 #endif

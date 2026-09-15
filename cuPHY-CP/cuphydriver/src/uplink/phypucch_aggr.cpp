@@ -18,6 +18,7 @@
 #define TAG (NVLOG_TAG_BASE_CUPHY_DRIVER + 22) // "DRV.PUCCH"
 
 #include "phypucch_aggr.hpp"
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 #include "cuphydriver_api.hpp"
 #include "context.hpp"
 #include "nvlog.hpp"
@@ -46,7 +47,7 @@ PhyPucchAggr::PhyPucchAggr(
 #else
     dbg_params.enableDynApiLogging  = 0;
     dbg_params.enableStatApiLogging = 0;
-    dbg_params.pOutFileName = nullptr;
+    dbg_params.pOutFileName         = nullptr;
 #endif
 
     pf0OutBuffer = std::move(cuphy::buffer<cuphyPucchF0F1UciOut_t, cuphy::pinned_alloc>(UL_MAX_CELLS_PER_SLOT * MAX_PUCCH_F0_UCIS));
@@ -93,15 +94,19 @@ PhyPucchAggr::PhyPucchAggr(
     DataOut.HarqDetectionStatus = bHarqDetectionStatus.addr();
     DataOut.CsiP1DetectionStatus = bCsiP1DetectionStatus.addr();
     DataOut.CsiP2DetectionStatus = bCsiP2DetectionStatus.addr();
+    DataOut.pF2FrontEndLLRs = nullptr;
+    DataOut.pF3FrontEndLLRs = nullptr;
     DataOut.pPucchF2OutOffsets = bPucchF2OutOffsets.addr();
     DataOut.pPucchF3OutOffsets = bPucchF3OutOffsets.addr();
 
     clearUciFlags();
 
     DataIn.pTDataRx = (cuphyTensorPrm_t*) calloc(UL_MAX_CELLS_PER_SLOT, sizeof(cuphyTensorPrm_t));
+    // Antenna dimension comes from runtime UL eAxC count.
+    const int pucch_rx_ap_dim = static_cast<int>(pdctx->getMaxUlAntennaPorts());
     for(int idx = 0; idx < UL_MAX_CELLS_PER_SLOT; idx++)
     {
-        pucch_data_rx_desc[idx] = {CUPHY_C_16F, static_cast<int>(ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB), static_cast<int>(OFDM_SYMBOLS_PER_SLOT), static_cast<int>(MAX_AP_PER_SLOT), cuphy::tensor_flags::align_tight};
+        pucch_data_rx_desc[idx] = {CUPHY_C_16F, static_cast<int>(ORAN_MAX_PRB * CUPHY_N_TONES_PER_PRB), static_cast<int>(OFDM_SYMBOLS_PER_SLOT), pucch_rx_ap_dim, cuphy::tensor_flags::align_tight};
         DataIn.pTDataRx[idx].desc = pucch_data_rx_desc[idx].handle();
         DataIn.pTDataRx[idx].pAddr = nullptr;
     }
@@ -117,9 +122,9 @@ PhyPucchAggr::PhyPucchAggr(
 
     handle = nullptr;
 
-    launch_kernel_warmup(s_channel);
-    launch_kernel_order(s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
-    launch_kernel_order(s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_warmup(warmup_kernel_func_, s_channel);
+    launch_kernel_order(pdctx->getOrderKernelFunctions().kernel_order_pucch, s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
+    launch_kernel_order(pdctx->getOrderKernelFunctions().kernel_order_pucch, s_channel, 1, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0);
 
     gDev->synchronizeStream(s_channel);
 
@@ -197,7 +202,10 @@ int PhyPucchAggr::createPhyObj()
     static_params.polarDcdrListSz      = pdctx->getPuxchPolarDcdrListSz();
     static_params.enableUlRxBf         = pdctx->getmMIMO_enable();
     static_params.enableBatchedMemcpy  = pdctx->getUseBatchedMemcpy();
-    static_params.pOutInfo             = &cuphy_tracker;
+    static_params.pipelineMode                    = PUCCH_PIPELINE_FULL;
+    static_params.pipelineData.pPostPolarData     = nullptr;
+    static_params.pipelineDelayUs                 = 0;
+    static_params.pOutInfo                        = &cuphy_tracker;
 
     /*
      * Create cuPHY object only if the desider number of cells
@@ -316,6 +324,15 @@ int PhyPucchAggr::setup(
             if(count != -1)
             {
                 DataIn.pTDataRx[count].pAddr = aggr_ulbuf_st1[idx]->getBufD();
+                // Match order-kernel IQ layout: (pusch_prb_stride * tones, symbols, nRxAnt)
+                // Same ST1 buffer as PUSCH; wrong strides break Msg4 HARQ ACK/NACK.
+                pucch_data_rx_desc[count].set(
+                    CUPHY_C_16F,
+                    static_cast<int>(aggr_cell_list[idx]->getPuschPrbStride() * CUPHY_N_TONES_PER_PRB),
+                    static_cast<int>(OFDM_SYMBOLS_PER_SLOT),
+                    static_cast<int>(aggr_cell_list[idx]->getRxAnt()),
+                    cuphy::tensor_flags::align_tight);
+                DataIn.pTDataRx[count].desc = pucch_data_rx_desc[count].handle();
                 //NVLOGI_FMT(TAG, "PhyPucchAggr::setup - Cell {} cellPrmDynIdx {} ULBuffer {} at index {}",
                     //phyCellId,count,aggr_ulbuf_st1[idx]->getId(),idx);
             }
@@ -337,7 +354,7 @@ int PhyPucchAggr::setup(
     t_ns t2     = Time::nowNs();
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_setup, dyn_params.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_setup, dyn_params.cuStream));
     }
 
     cuphyStatus_t status;
@@ -352,13 +369,13 @@ int PhyPucchAggr::setup(
     }
     if (status != CUPHY_STATUS_SUCCESS) {
         NVLOGE_FMT(TAG, AERIAL_CUPHY_API_EVENT, "cuphySetupPucchRx returned error {}", status);
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, dyn_params.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup, dyn_params.cuStream));
         return -1;
     }
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_setup, dyn_params.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_setup, dyn_params.cuStream));
     }
 
     return 0;
@@ -373,7 +390,7 @@ int PhyPucchAggr::run()
 
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(start_run, dyn_params.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(start_run, dyn_params.cuStream));
     }
     if((getSetupStatus() == CH_SETUP_DONE_NO_ERROR))
     {
@@ -387,7 +404,7 @@ int PhyPucchAggr::run()
     t_ns t3 = Time::nowNs();
     {
         MemtraceDisableScope md;
-        CUDA_CHECK_PHYDRIVER(cudaEventRecord(end_run, dyn_params.cuStream));
+        CUDA_DRIVER_CHECK(cuEventRecord(end_run, dyn_params.cuStream));
     }
 
     return ret;

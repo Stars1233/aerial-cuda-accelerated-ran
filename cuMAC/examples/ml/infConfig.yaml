@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Configuration for the cuMAC TensorRT inference engine (trtEngine) and its
+# real-time inference latency benchmark.
+#
+# Paths are resolved relative to the directory containing THIS file.
+# All knobs below influence the measured inference latency.
+
+model:
+  # Model to run. Format is auto-detected from the extension:
+  #   .pt                 PyTorch checkpoint -> converted to ONNX (see 'conversion') -> built.
+  #   .onnx               ONNX graph -> parsed and built into a TensorRT engine.
+  #   .engine/.trt/.plan  Pre-serialized TensorRT engine -> loaded directly.
+  path: trainedModels/phyMacGpuShareBenchmark/mlp_5x512__ppo__checkpoint_ppo_4layers_512neurons_update_008500.pt
+
+  # ONNX graph I/O tensor names. For a .pt these are passed to the exporter so
+  # they always match the produced ONNX (actor input -> logits output).
+  inputName: obs
+  outputName: logits
+
+  # Input feature dimension and output dimension (MCS-offset logits). For the
+  # PPO actor checkpoints these are 487 and 28 respectively.
+  obsDim: 487
+  actionDim: 28
+
+  # Fold the trained running observation normalizer into the graph so the engine
+  # consumes raw (un-normalized) observations. The deployable actor benchmark
+  # uses the actor-only path (normalizer off) by default.
+  includeObsNormalizer: false
+
+# Build precision: fp32 or fp16. FP16 typically lowers latency on GPUs with fast
+# half precision; it falls back to FP32 if the platform lacks fast FP16.
+precision: fp32
+
+engine:
+  # Capture the inference enqueue once and replay it with a CUDA Graph. This
+  # removes most per-call kernel-launch overhead and is usually the single
+  # biggest latency win for small networks.
+  useCudaGraph: true
+
+  # TensorRT builder workspace memory pool limit (MiB). 0 disables the limit.
+  workspaceMiB: 1024
+
+  # TensorRT builder optimization level (0-5; TensorRT default is 3). Higher
+  # levels search longer at build time for faster tactics and fuse more layers
+  # into fewer kernels. For this small MLP the inference latency is dominated by
+  # the number of kernel launches (not math: FP16 and FP32 measure the same), so
+  # raising this is the single biggest latency lever. A negative value leaves
+  # the TensorRT default. Engines are cached per level (".optN" in the filename).
+  builderOptimizationLevel: 5
+
+  # Serialize the built engine next to the model and reuse it on later runs
+  # (skips ONNX parsing and .pt conversion entirely on a cache hit).
+  cache: true
+  # Directory for cached ONNX/engine artifacts. Empty => alongside the model.
+  cacheDir: ""
+  # Force re-conversion and engine rebuild even if a cache exists.
+  forceRebuild: false
+
+conversion:
+  # Only used when 'model.path' is a .pt checkpoint. Requires a Python with
+  # PyTorch installed. The conversion runs once; subsequent runs hit the cache.
+  python: python3
+  script: pt_to_onnx.py
+
+runtime:
+  gpuId: 0
+  # Inference batch size = number of scheduled UEs per forward pass.
+  batchSize: 20
+  # Maximum batch size for the dynamic-batch optimization profile.
+  maxBatchSize: 24
+
+latency:
+  # Warmup iterations run before timing (also primes the CUDA Graph capture).
+  warmupIters: 200
+  # Number of measured iterations.
+  timingIters: 2000
+  # Include the host-to-device input copy inside the timed loop. Leave false to
+  # measure compute-only inference latency.
+  copyInputEachIter: false
+
+# Print build/progress messages.
+verbose: true

@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <unordered_map>
+#include <unordered_set>
 #include "cuphydriver_api.hpp"
 #include "constant.hpp"
 #include "aerial-fh-driver/api.hpp"
@@ -28,7 +29,7 @@
 #include "gpudevice.hpp"
 #include "memfoot.hpp"
 #include "cuphy.hpp"
-#include "task_instrumentation_nested.hpp"
+#include "task_instrumentation/task_instrumentation_nested.hpp"
 
 using namespace aerial_fh;
 
@@ -402,6 +403,50 @@ public:
      * @return 0 on success, negative error code on failure
      */
     int                 removePeer(peer_id_t peer_id);
+
+    /**
+     * Remove all C-/U-plane flows from a peer without destroying the peer.
+     *
+     * Used by OAM eAxC ID updates so GPU TXQs / peer GPU memory stay intact
+     * while other cells continue live traffic on the same NIC.
+     *
+     * @param[in] peer_id Peer identifier.
+     * @return 0 on success. Negative error code on failure.
+     */
+    [[nodiscard]] int   removeAllFlows(peer_id_t peer_id);
+
+    /**
+     * Prepare peer for eAxC rebind under live multi-cell traffic.
+     *
+     * If every existing unique eAxC remains in desired_eaxcs (expand-only /
+     * reorder), only clears per-channel flow lists so unique Flow objects are
+     * reused. Otherwise tears down all flows via removeAllFlows.
+     *
+     * @param[in] peer_id Peer identifier.
+     * @param[in] desired_eaxcs Full set of eAxC IDs after the OAM update.
+     * @return 0 on success. Negative error code on failure.
+     */
+    [[nodiscard]] int   prepareFlowRebind(peer_id_t peer_id, const std::unordered_set<uint16_t>& desired_eaxcs);
+
+    /**
+     * Begin batched peer flow registration.
+     *
+     * Defers GPU flow_hdr_size_info H2D until endFlowRegistration.
+     *
+     * @param[in] peer_id Peer identifier.
+     * @return 0 on success. Negative error code on failure.
+     */
+    [[nodiscard]] int   beginFlowRegistration(peer_id_t peer_id);
+
+    /**
+     * End batched peer flow registration.
+     *
+     * Flushes deferred flow_hdr_size_info H2D and drains the peer setup stream.
+     *
+     * @param[in] peer_id Peer identifier.
+     * @return 0 on success. Negative error code on failure.
+     */
+    [[nodiscard]] int   endFlowRegistration(peer_id_t peer_id);
     
     /**
      * @brief Register a flow for a specific eAxC ID and channel type
@@ -613,6 +658,13 @@ public:
      * @param batchedMemcpyHelper   - Helper for batched memory copy operations
      * @return 0 on success, negative error code on failure
      */
+    [[nodiscard]] int setupUPlaneGpuComm(peer_id_t peer_id, const slot_command_api::oran_slot_ind& slot_ind,
+            struct umsg_fh_tx_msg& txmsg, uint16_t max_num_prb_per_symbol,
+            t_ns cell_start_time, bool commViaCpu, PartialUplaneSlotInfo_t** out_partial_info,
+            UplaneConversionParams* out_params = nullptr,
+            const uint16_t* eaxcid_list = nullptr,
+            uint16_t num_eaxcids = 0);
+
     int prepareUPlanePackets(
             ru_type ru,
             peer_id_t peer_id, cudaStream_t dl_stream, t_ns start_tx_time,

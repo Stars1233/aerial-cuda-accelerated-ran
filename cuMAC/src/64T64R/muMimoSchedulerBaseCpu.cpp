@@ -16,6 +16,7 @@
  */
 
 #include "cumac.h"
+#include <random>
 
 // cuMAC namespace
 namespace cumac {
@@ -99,7 +100,7 @@ void muMimoSchedulerBaseCpu::run()
 
 void muMimoSchedulerBaseCpu::muSchBaseCpu_type1_dl()
 {
-    std::srand(unsigned(std::time(0)));
+    std::mt19937 g(std::random_device{}());
 
     uint32_t nBsUeAntPrd = pCpuDynDesc->nBsAnt*pCpuDynDesc->nUeAnt;
     uint32_t nPrgBsUeAntPrd = pCpuDynDesc->nPrbGrp*nBsUeAntPrd;
@@ -373,7 +374,7 @@ void muMimoSchedulerBaseCpu::muSchBaseCpu_type1_dl()
             subbandId[i] = i;
         }
 
-        std::random_shuffle(subbandId.begin(), subbandId.end());
+        std::shuffle(subbandId.begin(), subbandId.end(), g);
 
         for (int i = 0; i < subbandId.size(); i++) {
             if (schdUeCounter == pCpuDynDesc->numUeSchdPerCellTTI) {
@@ -514,7 +515,7 @@ void muMimoSchedulerBaseCpu::muSchBaseCpu_type1_dl()
 
 void muMimoSchedulerBaseCpu::muSchBaseCpu_type1_dl_harq()
 {
-    std::srand(unsigned(std::time(0)));
+    std::mt19937 g(std::random_device{}());
 
     uint32_t nBsUeAntPrd = pCpuDynDesc->nBsAnt*pCpuDynDesc->nUeAnt;
     uint32_t nPrgBsUeAntPrd = pCpuDynDesc->nPrbGrp*nBsUeAntPrd;
@@ -581,7 +582,7 @@ void muMimoSchedulerBaseCpu::muSchBaseCpu_type1_dl_harq()
         std::vector<int> prgAllocUeId(pCpuDynDesc->nPrbGrp, -1); // for storing 0-based local IDs for new-TX UEs. -1 indicates an unallocated PRG
 
         // PRG allocation for re-TX UEs
-        std::random_shuffle(reTxUeId.begin(), reTxUeId.end());
+        std::shuffle(reTxUeId.begin(), reTxUeId.end(), g);
 
         int numRemainingPrg = pCpuDynDesc->nPrbGrp;
         int startRbgAlloc = 0;
@@ -846,7 +847,7 @@ void muMimoSchedulerBaseCpu::muSchBaseCpu_type1_dl_harq()
             subbandId[i] = i;
         }
 
-        std::random_shuffle(subbandId.begin(), subbandId.end());
+        std::shuffle(subbandId.begin(), subbandId.end(), g);
 
         for (int i = 0; i < subbandId.size(); i++) {
             if (schdUeCounter == pCpuDynDesc->numUeSchdPerCellTTI) {

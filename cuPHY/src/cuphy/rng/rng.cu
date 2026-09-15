@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -147,6 +147,14 @@ template <> struct rng_value_cast<double>
 template <> struct rng_value_cast<__half>
 {
     __device__ static __half cast(float f) { return __float2half(f); }
+};
+template <> struct rng_value_cast<__nv_fp8_e4m3>
+{
+    __device__ static __nv_fp8_e4m3 cast(float f) { return __nv_fp8_e4m3(f); }
+};
+template <> struct rng_value_cast<__nv_fp8_e5m2>
+{
+    __device__ static __nv_fp8_e5m2 cast(float f) { return __nv_fp8_e5m2(f); }
 };
 template <> struct rng_value_cast<uint32_t>
 {
@@ -548,12 +556,14 @@ cuphyStatus_t rng::normal(const tensor_desc&    t,
     cuphyStatus_t s  = CUPHY_STATUS_UNSUPPORTED_TYPE;
     switch(tType)
     {
-    case CUPHY_R_16F: s = launch_rng_normal<CUPHY_R_16F, float>          (tLayout, p, randStates_.get(), stddev, mean, strm); break;
-    case CUPHY_R_32F: s = launch_rng_normal<CUPHY_R_32F, float>          (tLayout, p, randStates_.get(), stddev, mean, strm); break;
-    case CUPHY_R_64F: s = launch_rng_normal<CUPHY_R_64F, double>         (tLayout, p, randStates_.get(), stddev, mean, strm); break;
-    case CUPHY_C_16F: s = launch_rng_normal<CUPHY_C_16F, cuComplex>      (tLayout, p, randStates_.get(), stddev, mean, strm); break;
-    case CUPHY_C_32F: s = launch_rng_normal<CUPHY_C_32F, cuComplex>      (tLayout, p, randStates_.get(), stddev, mean, strm); break;
-    case CUPHY_C_64F: s = launch_rng_normal<CUPHY_C_64F, cuDoubleComplex>(tLayout, p, randStates_.get(), stddev, mean, strm); break;
+    case CUPHY_R_16F:     s = launch_rng_normal<CUPHY_R_16F,     float>          (tLayout, p, randStates_.get(), stddev, mean, strm); break;
+    case CUPHY_R_32F:     s = launch_rng_normal<CUPHY_R_32F,     float>          (tLayout, p, randStates_.get(), stddev, mean, strm); break;
+    case CUPHY_R_64F:     s = launch_rng_normal<CUPHY_R_64F,     double>         (tLayout, p, randStates_.get(), stddev, mean, strm); break;
+    case CUPHY_R_8F_E4M3: s = launch_rng_normal<CUPHY_R_8F_E4M3, float>          (tLayout, p, randStates_.get(), stddev, mean, strm); break;
+    case CUPHY_R_8F_E5M2: s = launch_rng_normal<CUPHY_R_8F_E5M2, float>          (tLayout, p, randStates_.get(), stddev, mean, strm); break;
+    case CUPHY_C_16F:     s = launch_rng_normal<CUPHY_C_16F,     cuComplex>      (tLayout, p, randStates_.get(), stddev, mean, strm); break;
+    case CUPHY_C_32F:     s = launch_rng_normal<CUPHY_C_32F,     cuComplex>      (tLayout, p, randStates_.get(), stddev, mean, strm); break;
+    case CUPHY_C_64F:     s = launch_rng_normal<CUPHY_C_64F,     cuDoubleComplex>(tLayout, p, randStates_.get(), stddev, mean, strm); break;
     default:                                                                                                                  break;
     } // switch 
 
@@ -576,24 +586,26 @@ cuphyStatus_t rng::uniform(const tensor_desc&    t,
     cuphyStatus_t            s            = CUPHY_STATUS_UNSUPPORTED_TYPE;
     switch(tType)
     {
-    case CUPHY_R_8I:  s = launch_rng_uniform<CUPHY_R_8I,  float>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_8I:  s = launch_rng_uniform<CUPHY_C_8I,  float2> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_R_8U:  s = launch_rng_uniform<CUPHY_R_8U,  float>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_8U:  s = launch_rng_uniform<CUPHY_C_8U,  float2> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_R_16I: s = launch_rng_uniform<CUPHY_R_16I, float>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_16I: s = launch_rng_uniform<CUPHY_C_16I, float2> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_R_16U: s = launch_rng_uniform<CUPHY_R_16U, float>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_16U: s = launch_rng_uniform<CUPHY_C_16U, float2> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_R_32I: s = launch_rng_uniform<CUPHY_R_32I, float>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_32I: s = launch_rng_uniform<CUPHY_C_32I, float2> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_R_32U: s = launch_rng_uniform<CUPHY_R_32U, float>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_32U: s = launch_rng_uniform<CUPHY_C_32U, float2> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_R_16F: s = launch_rng_uniform<CUPHY_R_16F, float>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_16F: s = launch_rng_uniform<CUPHY_C_16F, float2> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_R_32F: s = launch_rng_uniform<CUPHY_R_32F, float>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_32F: s = launch_rng_uniform<CUPHY_C_32F, float2> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_R_64F: s = launch_rng_uniform<CUPHY_R_64F, double> (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
-    case CUPHY_C_64F: s = launch_rng_uniform<CUPHY_C_64F, double2>(tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_8I:      s = launch_rng_uniform<CUPHY_R_8I,  float>    (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_8I:      s = launch_rng_uniform<CUPHY_C_8I,  float2>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_8U:      s = launch_rng_uniform<CUPHY_R_8U,  float>    (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_8U:      s = launch_rng_uniform<CUPHY_C_8U,  float2>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_16I:     s = launch_rng_uniform<CUPHY_R_16I, float>    (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_16I:     s = launch_rng_uniform<CUPHY_C_16I, float2>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_16U:     s = launch_rng_uniform<CUPHY_R_16U, float>    (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_16U:     s = launch_rng_uniform<CUPHY_C_16U, float2>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_32I:     s = launch_rng_uniform<CUPHY_R_32I, float>    (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_32I:     s = launch_rng_uniform<CUPHY_C_32I, float2>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_32U:     s = launch_rng_uniform<CUPHY_R_32U, float>    (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_32U:     s = launch_rng_uniform<CUPHY_C_32U, float2>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_16F:     s = launch_rng_uniform<CUPHY_R_16F, float>    (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_16F:     s = launch_rng_uniform<CUPHY_C_16F, float2>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_32F:     s = launch_rng_uniform<CUPHY_R_32F, float>    (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_32F:     s = launch_rng_uniform<CUPHY_C_32F, float2>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_64F:     s = launch_rng_uniform<CUPHY_R_64F, double>   (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_C_64F:     s = launch_rng_uniform<CUPHY_C_64F, double2>  (tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_8F_E4M3: s = launch_rng_uniform<CUPHY_R_8F_E4M3, float>(tLayout, p, randStates_.get(), min_v, max_v, strm); break;
+    case CUPHY_R_8F_E5M2: s = launch_rng_uniform<CUPHY_R_8F_E5M2, float>(tLayout, p, randStates_.get(), min_v, max_v, strm); break;
     case CUPHY_BIT:
         {
             tensor_layout_any tBits = word_layout_from_bit_layout(tLayout);

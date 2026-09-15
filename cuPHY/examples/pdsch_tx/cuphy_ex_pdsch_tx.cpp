@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +34,8 @@ using namespace cuphy;
  */
 void usage()
 {
+    std::cout << "DEPRECATION NOTICE: pdsch_tx example is deprecated and will be removed in a future release. Please use the pdsch_tx_multi_cell example instead, a superset of pdsch_tx, which now supports both single-cell and multi-cell tests" << std::endl;
+
     std::cout << "cuphy_ex_pdsch_tx [options]" << std::endl;
     std::cout << "  Options:" << std::endl;
     std::cout << "     -h                Display usage information" << std::endl;
@@ -97,6 +99,9 @@ int main(int argc, char* argv[]) {
             NVLOGF_FMT(NVLOG_PDSCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid TB byte alignment {}. Supported values are 1, 2, 4, 8, 16, 32", forced_TB_byte_alignment);
         }
     }
+
+    // pdsch_tx example does not support the new, experimental, PDSCH_POST_FEC_PROCESSING mode. To use that, please use pdsch_tx_multi_cell example instead. See deprecation notice below:
+    NVLOGC_FMT(NVLOG_PDSCH, "DEPRECATION NOTICE: pdsch_tx example is deprecated and will be removed in a future release. Please use the pdsch_tx_multi_cell example instead, a superset of pdsch_tx, which now supports both single-cell and multi-cell tests");
 
     CUDA_CHECK(cudaSetDevice(0));
 #if 0
@@ -213,7 +218,7 @@ int main(int argc, char* argv[]) {
     using tensor_device_R_8U          = typed_tensor<CUPHY_R_8U, device_alloc>;
     using tensor_pinned_R_32U         = typed_tensor<CUPHY_R_32U, pinned_alloc>;
     auto data_in_ptr                  = std::make_unique<uint8_t*[]>(1); // 1 cell
-    pdsch_static_params.full_slot_processing = (!aas_mode);
+    pdsch_static_params.pipeline_processing_mode = (aas_mode) ? cuphyPdschPipelineMode_t::PDSCH_AAS_PROCESSING : cuphyPdschPipelineMode_t::PDSCH_FULL_PROCESSING;
 #if _READ_TB_CRC_
     auto tb_crc_data_in_ptr              = std::make_unique<uint8_t*[]>(1); // 1 cell
     pdsch_static_params.read_TB_CRC      = true;
@@ -267,12 +272,13 @@ int main(int argc, char* argv[]) {
     cuphyPdschStatusOut_t status_info = {cuphyPdschStatusType_t::CUPHY_PDSCH_STATUS_SUCCESS_OR_UNTRACKED_ISSUE, MAX_UINT16, MAX_UINT16};
     cuphyPdschDataOut_t output_data = {new cuphyTensorPrm_t[num_cells]};
 
-    cuphyPdschDynPrms_t pdsch_dyn_params         = {strm_handle, pdsch_proc_mode, pdsch_cell_grp_dyn_params.data(), &data_in, &tb_crc_data_in, &output_data, &status_info};
+    cuphyPdschDynPrms_t pdsch_dyn_params         = {strm_handle, pdsch_proc_mode, pdsch_cell_grp_dyn_params.data(), &data_in, &tb_crc_data_in, nullptr, &output_data, &status_info};
     pdsch_dyn_params.pDataOut->pTDataTx[0].desc  = data_tx_tensor.desc().handle();
     pdsch_dyn_params.pDataOut->pTDataTx[0].pAddr = data_tx_tensor.addr();
 
 #if SPECIAL_SLOT
-    cuphyPdschDynPrms_t special_slot_pdsch_dyn_params         = {strm_handle, pdsch_proc_mode, special_slot_pdsch_cell_grp_dyn_params.data(), &special_slot_data_in, &tb_crc_data_in, &output_data};
+    cuphyPdschStatusOut_t special_slot_status_info = {cuphyPdschStatusType_t::CUPHY_PDSCH_STATUS_SUCCESS_OR_UNTRACKED_ISSUE, MAX_UINT16, MAX_UINT16};
+    cuphyPdschDynPrms_t special_slot_pdsch_dyn_params         = {strm_handle, pdsch_proc_mode, special_slot_pdsch_cell_grp_dyn_params.data(), &special_slot_data_in, &tb_crc_data_in, nullptr, &output_data, &special_slot_status_info};
     special_slot_pdsch_dyn_params.pDataOut->pTDataTx[0].desc  = data_tx_tensor.desc().handle();
     special_slot_pdsch_dyn_params.pDataOut->pTDataTx[0].pAddr = data_tx_tensor.addr();
 #endif

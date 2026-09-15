@@ -113,6 +113,8 @@ protected:
     std::atomic<bool>                        active;                            ///< Atomic flag indicating buffer is in use
     Mutex                                    mlock;                             ///< Mutex for thread-safe buffer operations
     phydriver_handle                         pdh;                               ///< Physical layer driver handle
+    CUfunction                               kernel_write_func_ = nullptr;      ///< CUfunction handle for kernel_write
+    CompressionKernelFunctions               comp_kerns_;                       ///< Per-context compression kernel handles
     GpuDevice*                               gDev;                              ///< GPU device pointer for memory operations
     MpsCtx *                                 mpsCtx;                            ///< MPS (Multi-Process Service) context for GPU resource partitioning
     cudaEvent_t                              ev_cleanup;                        ///< CUDA event for cleanup synchronization

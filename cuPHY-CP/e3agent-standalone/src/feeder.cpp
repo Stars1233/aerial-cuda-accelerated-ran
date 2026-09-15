@@ -34,6 +34,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 namespace e3sa {
 namespace {
@@ -125,38 +126,47 @@ void Feeder::puschLoop(std::atomic<bool>& stop, timespec next) {
 			const uint64_t ts = nowNs(CLOCK_REALTIME);
 			const uint64_t ph = abs_slot % MOD_SLOTS;  // precomputed-row index
 
-			// Copy the blobs in before publishing their indices (lock-free vs dApp reader).
-			std::memcpy(dl_.fhInfo[fh.half].fhData[fh.row], &fh_table_[ph * e3::shm::numFhSamples],
-				e3::shm::numFhSamples * sizeof(int16_t));
+			E3BufferInfo bi;
+			bi.sfn = sfn;
+			bi.slot = slot;
+			bi.timestamp_ns = ts;
+			bi.timestamp_tai_ns = tai_base_ns_ + abs_slot * tick_ns;
+			synth::fillPusch(bi, synth_.n_cells);
 
-			// H-est packs rows into the active half via a byte cursor (reset on flip).
-			hestInfo_t& hi = dl_.hestInfo[hest.half];
-			if (hest.row == 0) hi.writeOffsetBytes = 0;
-			const uint32_t hest_off = hi.writeOffsetBytes;
-			hi.hestData[hest.row] = hi.pDataAlloc + hest_off / sizeof(hestDataType);
-			std::memcpy(hi.hestData[hest.row], &hest_table_[ph * synth::kHestSamples],
-				synth::kHestSamples * sizeof(hestDataType));
-			hi.writeOffsetBytes += synth::kHestSamples * sizeof(hestDataType);
+			// One FH row + one H-est row per cell. Copy the blobs into SHM (lock-free vs
+			// dApp reader), then publish all cell indices at once under the lock.
+			for (uint16_t c = 0; c < synth_.n_cells; ++c) {
+				E3CellInfo& cell = bi.cells[c];
+
+				std::memcpy(dl_.fhInfo[fh.half].fhData[fh.row], &fh_table_[ph * e3::shm::numFhSamples],
+					e3::shm::numFhSamples * sizeof(int16_t));
+				cell.current_fh_buffer = fh.half;
+				cell.fh_write_index = fh.row;
+				fh.advance(rows_.fh);
+
+				// H-est packs rows into the active half via a byte cursor (reset on flip).
+				hestInfo_t& hi = dl_.hestInfo[hest.half];
+				if (hest.row == 0) hi.writeOffsetBytes = 0;
+				const uint32_t hest_off = hi.writeOffsetBytes;
+				hi.hestData[hest.row] = hi.pDataAlloc + hest_off / sizeof(hestDataType);
+				std::memcpy(hi.hestData[hest.row], &hest_table_[ph * synth::kHestSamples],
+					synth::kHestSamples * sizeof(hestDataType));
+				hi.writeOffsetBytes += synth::kHestSamples * sizeof(hestDataType);
+				cell.current_hest_buffer = hest.half;
+				cell.hest_write_index = hest.row;
+				cell.hest_row_byte_offset = hest_off;
+				hest.advance(rows_.hest);
+
+				cell.current_pusch_buffer = pusch.half;
+				cell.pusch_write_index = pusch.row;
+				pusch.advance(rows_.pusch);
+			}
 
 			{
 				std::lock_guard<std::mutex> lk(dl_.e3_buffer_mutex);
-				E3BufferInfo& bi = dl_.e3_buffer_info;
-				bi = {};
-				bi.current_fh_buffer = fh.half;       bi.fh_write_index = fh.row;
-				bi.current_pusch_buffer = pusch.half; bi.pusch_write_index = pusch.row;
-				bi.current_hest_buffer = hest.half;   bi.hest_write_index = hest.row;
-				bi.hest_row_byte_offset = hest_off;
-				bi.sfn = sfn;
-				bi.slot = slot;
-				bi.timestamp_ns = ts;
-				bi.timestamp_tai_ns = tai_base_ns_ + abs_slot * tick_ns;
-				synth::fillPusch(bi);
+				dl_.e3_buffer_info = std::move(bi);
 			}
 			agent_.notifyDataReady();
-
-			fh.advance(rows_.fh);
-			pusch.advance(rows_.pusch);
-			hest.advance(rows_.hest);
 		}
 
 		++abs_slot;
@@ -184,52 +194,59 @@ void Feeder::srsLoop(std::atomic<bool>& stop, timespec next) {
 			const uint64_t ts = nowNs(CLOCK_REALTIME);
 			const uint64_t ph = abs_slot % MOD_SLOTS;
 
-			// Copy the three blobs in before publishing indices (byte cursor reset on flip).
-			srsIqInfo_t& qi = dl_.srsIqInfo[iq.half];
-			if (iq.row == 0) qi.writeOffsetBytes = 0;
-			const uint32_t iq_off = qi.writeOffsetBytes;
-			srs_iq_advance(&qi, iq.row, &srs_iq_table_[ph * synth::kSrsIqSamples],
-				synth::kSrsIqSamples * sizeof(int16_t));
+			E3SrsBufferInfo si;
+			si.sfn = sfn;
+			si.slot = slot;
+			si.timestamp_ns = ts;
+			si.timestamp_tai_ns = tai_base_ns_ + abs_slot * tick_ns;
+			synth::fillSrs(si, synth_.n_cells);
 
-			srsHestInfo_t& hi = dl_.srsHestInfo[hest.half];
-			if (hest.row == 0) hi.writeOffsetBytes = 0;
-			const uint32_t hest_off = hi.writeOffsetBytes;
-			srs_hest_advance(&hi, hest.row, &srs_hest_table_[ph * synth::kSrsHestSamples],
-				synth::kSrsHestSamples * sizeof(int16_t));
+			// Per cell: one SRS-IQ row + per-UE H-est/RbSNR rows. Copy the blobs into SHM
+			// (lock-free vs dApp reader), then publish all cell indices at once under the lock.
+			for (uint16_t c = 0; c < synth_.n_cells; ++c) {
+				E3SrsCellInfo& cell = si.cells[c];
 
-			srsInfo_t& ri = dl_.srsInfo[rb.half];
-			if (rb.row == 0) ri.writeOffsetBytes = 0;
-			const uint32_t rb_off = ri.writeOffsetBytes;
-			srs_rb_snr_advance(&ri, rb.row, &srs_rbsnr_table_[ph * synth::kSrsRbSnrSamples],
-				synth::kSrsRbSnrSamples * sizeof(float));
+				srsIqInfo_t& qi = dl_.srsIqInfo[iq.half];
+				if (iq.row == 0) qi.writeOffsetBytes = 0;
+				const uint32_t iq_off = qi.writeOffsetBytes;
+				srs_iq_advance(&qi, iq.row, &srs_iq_table_[ph * synth::kSrsIqSamples],
+					synth::kSrsIqSamples * sizeof(int16_t));
+				cell.current_srs_iq_buffer = iq.half;
+				cell.srs_iq_write_index = iq.row + 1;
+				cell.srs_iq_row_byte_offset = iq_off;
+				iq.advance(rows_.srs_iq);
 
-			{
-				std::lock_guard<std::mutex> lk(dl_.e3_srs_buffer_mutex);
-				E3SrsBufferInfo& si = dl_.e3_srs_buffer_info;
-				si = {};
-				si.current_srs_iq_buffer = iq.half;      si.srs_iq_write_index = iq.row + 1;
-				si.current_srs_hest_buffer = hest.half;  si.srs_hest_write_index = hest.row + 1;
-				si.current_srs_rb_snr_buffer = rb.half;  si.srs_rb_snr_write_index = rb.row + 1;
-				si.srs_iq_row_byte_offset = iq_off;
-				si.srs_cell_start_sym = 1;
-				si.srs_cell_n_srs_sym = 1;
-				si.sfn = sfn;
-				si.slot = slot;
-				si.timestamp_ns = ts;
-				si.timestamp_tai_ns = tai_base_ns_ + abs_slot * tick_ns;
-				synth::fillSrs(si);
-				E3SrsUeMetrics& m = si.ue_metrics[0];
+				srsHestInfo_t& hi = dl_.srsHestInfo[hest.half];
+				if (hest.row == 0) hi.writeOffsetBytes = 0;
+				const uint32_t hest_off = hi.writeOffsetBytes;
+				srs_hest_advance(&hi, hest.row, &srs_hest_table_[ph * synth::kSrsHestSamples],
+					synth::kSrsHestSamples * sizeof(int16_t));
+				cell.current_srs_hest_buffer = hest.half;
+				cell.srs_hest_write_index = hest.row + 1;
+				hest.advance(rows_.srs_hest);
+
+				srsInfo_t& ri = dl_.srsInfo[rb.half];
+				if (rb.row == 0) ri.writeOffsetBytes = 0;
+				const uint32_t rb_off = ri.writeOffsetBytes;
+				srs_rb_snr_advance(&ri, rb.row, &srs_rbsnr_table_[ph * synth::kSrsRbSnrSamples],
+					synth::kSrsRbSnrSamples * sizeof(float));
+				cell.current_srs_rb_snr_buffer = rb.half;
+				cell.srs_rb_snr_write_index = rb.row + 1;
+				rb.advance(rows_.srs);
+
+				E3SrsUeMetrics& m = cell.ues[0];
 				m.srs_hest_offset = hest_off;
 				m.srs_hest_size = synth::kSrsHestSamples * sizeof(int16_t);
 				m.srs_rb_snr_offset = rb_off;
 				m.srs_rb_snr_size = synth::kSrsRbSnrSamples * sizeof(float);
 			}
+
+			{
+				std::lock_guard<std::mutex> lk(dl_.e3_srs_buffer_mutex);
+				dl_.e3_srs_buffer_info = std::move(si);
+			}
 			agent_.notifySrsDataReady();
 			srs_pending = false;
-
-			iq.advance(rows_.srs_iq);
-			hest.advance(rows_.srs_hest);
-			rb.advance(rows_.srs);
 		}
 
 		++abs_slot;

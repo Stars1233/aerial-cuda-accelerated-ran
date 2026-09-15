@@ -33,21 +33,11 @@ SCRIPT_DIR=$(dirname $SCRIPT)
 
 cuBB_SDK=${cuBB_SDK:-$(realpath $SCRIPT_DIR/../..)}
 
-# Default values
-NUM_PROC=32
 MMIMO_FLAG=""
+FRAMEWORK_CPLANE_FLAG=""
 LABEL=""
-
-# Internal timing parameters (not configurable via CLI)
-# Performance metrics: longer window to capture steady-state behavior
-PERFMETRICS_MAX_DURATION=300
-PERFMETRICS_IGNORE_DURATION=30
-# Analysis (compare_logs, latency_summary): shorter window for visualization
-ANALYSIS_MAX_DURATION=60
-ANALYSIS_IGNORE_DURATION=30
-# Timeline plots: very short window for detailed timeline visualization
-TIMELINE_MAX_DURATION=30.2
-TIMELINE_IGNORE_DURATION=30
+IGNORE_UL_CHANNELS=()
+IGNORE_DL_CHANNELS=()
 
 # Timing tracking arrays
 declare -a STEP_NAMES
@@ -99,13 +89,25 @@ GATING_THRESHOLD=""
 WARNING_THRESHOLD=""
 ABSOLUTE_THRESHOLD=""
 LATENCY_SUMMARY_ENABLED=0
+SKIP_LOG_ANALYSIS=0
+PERF_TRACE_DIR=""
+BPFTRACE_DIR=""
+FUTEX_CUDA_THRESHOLD=""
+FUTEX_CUDA_MIN_CALLS=10
+# Maximum acceptable total page-fault count for the page-fault gate (Step 11c).
+# Defaults to 0: a pinned/pre-faulted real-time pipeline should take no page
+# faults during the steady-state trace window, so any fault fails the test.
+# Overridable with --page-fault-threshold.
+PAGE_FAULT_THRESHOLD=0
+PAGE_FAULT_THRESHOLD_SET=0
 
 show_usage() {
     echo "Usage: $0 <phy_log> <testmac_log> <ru_log> <output_folder> [options]"
     echo
     echo "CICD wrapper that runs the full post-processing sequence with proper return codes."
-    echo "Steps 1-4 (parse, metrics, visualizations) always run."
-    echo "Threshold checks run if their files are provided. Pipeline fails without gating."
+    echo "Steps 1-4 (parse, metrics, visualizations) run unless --skip-log-analysis is set."
+    echo "Threshold checks run if their files are provided."
+    echo "Perf trace analysis runs if --perf-trace-dir is provided."
     echo
     echo "Positional Arguments (4 required):"
     echo "  phy_log                Path to phy.log file"
@@ -113,45 +115,57 @@ show_usage() {
     echo "  ru_log                 Path to ru.log file (can be blank placeholder)"
     echo "  output_folder          Directory for output files"
     echo
-    echo "Threshold Arguments (all optional, but gating is mandatory for a PASS):"
-    echo "  --gating-threshold <file>    Gating perf_requirements file (pipeline fails without this)"
+    echo "Threshold Arguments (all optional, gating is mandatory unless --perf-trace-dir is set):"
+    echo "  --gating-threshold <file>    Gating perf_requirements file"
     echo "  --warning-threshold <file>   Warning perf_requirements file"
     echo "  --absolute-threshold <file>  Absolute perf_requirements file"
     echo "  --latency-summary            Also run latency summary (NICD)"
     echo "  --mmimo                      Enable mMIMO mode"
-    echo "  --num-proc <n>               Number of processing threads (default: $NUM_PROC)"
+    echo "  --framework-cplane           Framework C-plane mode (soft-skip metrics arch. absent on framework path)"
+    echo "  -c, --ignore-ul-channels <names...>  UL channels to ignore (e.g. PUCCH PRACH SRS PUSCH)"
+    echo "  -d, --ignore-dl-channels <names...>  DL channels to ignore (e.g. PDCCH CSIRS PBCH)"
     echo "  --label <name>               Label for compare_logs output"
+    echo "  --skip-log-analysis          Skip steps 1-4 (log parsing, metrics, visualizations)"
+    echo "  --perf-trace-dir <dir>       Directory containing perf record data files. When set, runs"
+    echo "                               futex/CUDA analysis steps after the normal pipeline."
+    echo "  --futex-cuda-threshold <pct> Pass/fail gate on futex/CUDA ratios (per-API and aggregate)."
+    echo "                               Requires --perf-trace-dir and a cuda_api_tracer.log in it."
+    echo "  --futex-cuda-min-calls <N>   Minimum tracer-log total for an API to be gated (default: 10)."
+    echo "  --page-fault-threshold <N>   Max total page faults (user+kernel) allowed before failing."
+    echo "                               Requires --perf-trace-dir; runs whenever it is set (default: 0)."
+    echo "  --bpftrace-dir <dir>         Directory containing the bpftrace all-syscall capture. When set,"
+    echo "                               runs the bpftrace gate: FAIL if the capture is empty (no syscalls)."
     echo "  -h, --help                   Show this help message"
     echo
-    echo "Timing Parameters (internally configured):"
-    echo "  Perf metrics:                  -i $PERFMETRICS_IGNORE_DURATION -m $PERFMETRICS_MAX_DURATION"
-    echo "  Compare logs, latency summary: -i $ANALYSIS_IGNORE_DURATION -m $ANALYSIS_MAX_DURATION"
-    echo "  Timeline plots:                -i $TIMELINE_IGNORE_DURATION -m $TIMELINE_MAX_DURATION"
-    echo "  Thresholds:                    (no timing params, uses perf.csv)"
+    echo "Timing defaults are mode-dependent, configured in post_processing_defaults.cfg."
+    echo "post_processing_analyze.sh applies them automatically per mode."
     echo
     echo "Sequence Executed:"
-    echo "  1. post_processing_parse.sh (--perf-metrics, optionally --latency-summary)"
-    echo "  2. post_processing_analyze.sh --perf-metrics"
-    echo "  3. post_processing_analyze.sh --compare-logs"
-    echo "  4. post_processing_analyze.sh --cpu-timeline"
-    echo "  5. post_processing_analyze.sh --threshold-summary (informational)"
-    echo "  6. post_processing_analyze.sh --absolute-threshold (if provided)"
-    echo "  7. post_processing_analyze.sh --gating-threshold"
-    echo "  8. post_processing_analyze.sh --warning-threshold (if provided, failure = warning only)"
-    echo "  9. post_processing_analyze.sh --latency-summary (if --latency-summary enabled)"
-    echo " 10. post_processing_analyze.sh --latency-timeline (if --latency-summary enabled)"
+    echo "  1-4. Log parsing and visualization (skipped if --skip-log-analysis)"
+    echo "  5-8. Threshold checks (skipped if no threshold files provided)"
+    echo "  9-10. Latency analysis (if --latency-summary enabled)"
+    echo "  11-12. Perf trace analysis (if --perf-trace-dir provided)"
     echo
     echo "Return Codes:"
     echo "  0 = All steps passed"
     echo "  1 = One or more steps failed (all steps run to completion before returning)"
     echo "  2 = All steps passed, but warning threshold exceeded"
     echo
-    echo "Example:"
+    echo "Example (normal):"
     echo "  $0 phy.log testmac.log ru.log ./output \\"
     echo "      --gating-threshold /path/to/gating_perf_requirements.csv \\"
     echo "      --warning-threshold /path/to/warning_perf_requirements.csv \\"
     echo "      --absolute-threshold /path/to/perf_requirements.csv \\"
     echo "      --mmimo --label my_test"
+    echo
+    echo "Example (PUSCH-only test case, ignore inactive channels):"
+    echo "  $0 phy.log testmac.log ru.log ./output \\"
+    echo "      --gating-threshold /path/to/gating.csv \\"
+    echo "      -c PUCCH -d PDCCH CSIRS PBCH --label my_test"
+    echo
+    echo "Example (perf trace analysis, skip log processing):"
+    echo "  $0 phy.log testmac.log ru.log ./output \\"
+    echo "      --skip-log-analysis --perf-trace-dir /opt/nvidia/cuBB/perf"
 }
 
 # Parse arguments
@@ -190,13 +204,9 @@ while [[ $# -gt 0 ]]; do
             MMIMO_FLAG="--mmimo"
             shift
             ;;
-        --num-proc)
-            if [[ -z "$2" || "$2" == -* ]]; then
-                echo "Error: Missing value for --num-proc option"
-                exit 1
-            fi
-            NUM_PROC="$2"
-            shift 2
+        --framework-cplane)
+            FRAMEWORK_CPLANE_FLAG="--framework-cplane"
+            shift
             ;;
         --label)
             if [[ -z "$2" || "$2" == -* ]]; then
@@ -204,6 +214,75 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             LABEL="$2"
+            shift 2
+            ;;
+        -c|--ignore-ul-channels)
+            shift
+            IGNORE_UL_CHANNELS=()
+            if [[ $# -eq 0 || "$1" == -* ]]; then
+                echo "Error: -c / --ignore-ul-channels requires at least one channel name (e.g. PUCCH PRACH)"
+                exit 1
+            fi
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                IGNORE_UL_CHANNELS+=("$1")
+                shift
+            done
+            ;;
+        -d|--ignore-dl-channels)
+            shift
+            IGNORE_DL_CHANNELS=()
+            if [[ $# -eq 0 || "$1" == -* ]]; then
+                echo "Error: -d / --ignore-dl-channels requires at least one channel name (e.g. PDCCH CSIRS PBCH)"
+                exit 1
+            fi
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                IGNORE_DL_CHANNELS+=("$1")
+                shift
+            done
+            ;;
+        --skip-log-analysis)
+            SKIP_LOG_ANALYSIS=1
+            shift
+            ;;
+        --perf-trace-dir)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for --perf-trace-dir option"
+                exit 1
+            fi
+            PERF_TRACE_DIR="$2"
+            shift 2
+            ;;
+        --bpftrace-dir)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for --bpftrace-dir option"
+                exit 1
+            fi
+            BPFTRACE_DIR="$2"
+            shift 2
+            ;;
+        --futex-cuda-threshold)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for --futex-cuda-threshold option"
+                exit 1
+            fi
+            FUTEX_CUDA_THRESHOLD="$2"
+            shift 2
+            ;;
+        --futex-cuda-min-calls)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for --futex-cuda-min-calls option"
+                exit 1
+            fi
+            FUTEX_CUDA_MIN_CALLS="$2"
+            shift 2
+            ;;
+        --page-fault-threshold)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "Error: Missing value for --page-fault-threshold option"
+                exit 1
+            fi
+            PAGE_FAULT_THRESHOLD="$2"
+            PAGE_FAULT_THRESHOLD_SET=1
             shift 2
             ;;
         -h|--help)
@@ -241,6 +320,12 @@ TESTMAC_LOG="${POSITIONAL_ARGS[1]}"
 RU_LOG="${POSITIONAL_ARGS[2]}"
 OUTPUT_FOLDER="${POSITIONAL_ARGS[3]}"
 
+# Ensure the output folder exists. In --skip-log-analysis (perf-trace) mode,
+# Step 1 (post_processing_parse.sh) is skipped, and it is otherwise the only
+# step that creates this directory. Without it, Step 11 fails to write the
+# futex summary and the tracer-log copy fails with "No such file or directory".
+mkdir -p "$OUTPUT_FOLDER"
+
 # Validate threshold files exist if provided
 if [[ -n "$GATING_THRESHOLD" && ! -f "$GATING_THRESHOLD" ]]; then
     echo "Error: Gating threshold file not found: $GATING_THRESHOLD"
@@ -257,24 +342,25 @@ if [[ -n "$ABSOLUTE_THRESHOLD" && ! -f "$ABSOLUTE_THRESHOLD" ]]; then
     exit 1
 fi
 
+if [[ -n "$FUTEX_CUDA_THRESHOLD" && -z "$PERF_TRACE_DIR" ]]; then
+    echo "Error: --futex-cuda-threshold requires --perf-trace-dir"
+    exit 1
+fi
+
+if [[ $PAGE_FAULT_THRESHOLD_SET -eq 1 && -z "$PERF_TRACE_DIR" ]]; then
+    echo "Error: --page-fault-threshold requires --perf-trace-dir"
+    exit 1
+fi
+
+if ! [[ "$PAGE_FAULT_THRESHOLD" =~ ^[0-9]+$ ]]; then
+    echo "Error: --page-fault-threshold must be a non-negative integer (got: $PAGE_FAULT_THRESHOLD)"
+    exit 1
+fi
+
 # Script paths
 PARSE_LOGS="$SCRIPT_DIR/post_processing_parse.sh"
 POST_PROCESSING="$SCRIPT_DIR/post_processing_analyze.sh"
 
-if [[ ! -f "$PARSE_LOGS" ]]; then
-    echo "Error: post_processing_parse.sh not found at $PARSE_LOGS"
-    exit 1
-fi
-
-if [[ ! -f "$POST_PROCESSING" ]]; then
-    echo "Error: post_processing_analyze.sh not found at $POST_PROCESSING"
-    exit 1
-fi
-
-# Build timing arguments (different for perf metrics vs analysis visualizations vs timelines)
-PERFMETRICS_OPTS="--max-duration $PERFMETRICS_MAX_DURATION --ignore-duration $PERFMETRICS_IGNORE_DURATION"
-ANALYSIS_OPTS="--max-duration $ANALYSIS_MAX_DURATION --ignore-duration $ANALYSIS_IGNORE_DURATION"
-TIMELINE_OPTS="--max-duration $TIMELINE_MAX_DURATION --ignore-duration $TIMELINE_IGNORE_DURATION"
 LABEL_OPT=""
 if [[ -n "$LABEL" ]]; then
     LABEL_OPT="--label $LABEL"
@@ -301,8 +387,35 @@ fi
 if [[ $LATENCY_SUMMARY_ENABLED -eq 1 ]]; then
     echo "Latency summary:   enabled"
 fi
+if [[ -n "$PERF_TRACE_DIR" ]]; then
+    echo "Perf trace dir:    $PERF_TRACE_DIR"
+fi
+if [[ -n "$FUTEX_CUDA_THRESHOLD" ]]; then
+    echo "Futex/CUDA gate:   ${FUTEX_CUDA_THRESHOLD}% (min calls: ${FUTEX_CUDA_MIN_CALLS})"
+fi
+if [[ ${#IGNORE_UL_CHANNELS[@]} -gt 0 ]]; then
+    echo "Ignore UL channels: ${IGNORE_UL_CHANNELS[*]}"
+fi
+if [[ ${#IGNORE_DL_CHANNELS[@]} -gt 0 ]]; then
+    echo "Ignore DL channels: ${IGNORE_DL_CHANNELS[*]}"
+fi
+if [[ $SKIP_LOG_ANALYSIS -eq 1 ]]; then
+    echo "Log analysis:      SKIPPED"
+fi
 echo "=============================================================="
 echo
+
+if [[ ! -f "$POST_PROCESSING" ]]; then
+    echo "Error: post_processing_analyze.sh not found at $POST_PROCESSING"
+    exit 1
+fi
+
+if [[ $SKIP_LOG_ANALYSIS -eq 0 ]]; then
+
+if [[ ! -f "$PARSE_LOGS" ]]; then
+    echo "Error: post_processing_parse.sh not found at $PARSE_LOGS"
+    exit 1
+fi
 
 # Step 1: Parse logs
 echo ">>> Step 1: Parsing logs..."
@@ -314,8 +427,6 @@ fi
 
 "$PARSE_LOGS" "$PHY_LOG" "$TESTMAC_LOG" "$RU_LOG" "$OUTPUT_FOLDER" \
     $PARSE_OPTS \
-    --max-duration "$PERFMETRICS_MAX_DURATION" \
-    --num-proc "$NUM_PROC" \
     $MMIMO_FLAG
 
 PARSE_RESULT=$?
@@ -332,10 +443,20 @@ echo
 # Step 2: Performance metrics extraction
 echo ">>> Step 2: Extracting performance metrics..."
 STEP2_START=$(get_timestamp)
+IGNORE_UL_ARGS=()
+if [[ ${#IGNORE_UL_CHANNELS[@]} -gt 0 ]]; then
+    IGNORE_UL_ARGS=(-c "${IGNORE_UL_CHANNELS[@]}")
+fi
+IGNORE_DL_ARGS=()
+if [[ ${#IGNORE_DL_CHANNELS[@]} -gt 0 ]]; then
+    IGNORE_DL_ARGS=(-d "${IGNORE_DL_CHANNELS[@]}")
+fi
 "$POST_PROCESSING" "$OUTPUT_FOLDER/binary" "$OUTPUT_FOLDER" \
     --perf-metrics \
-    $PERFMETRICS_OPTS \
-    $MMIMO_FLAG
+    $MMIMO_FLAG \
+    $FRAMEWORK_CPLANE_FLAG \
+    "${IGNORE_UL_ARGS[@]}" \
+    "${IGNORE_DL_ARGS[@]}"
 
 PERF_RESULT=$?
 STEP2_END=$(get_timestamp)
@@ -353,7 +474,6 @@ echo ">>> Step 3: Generating compare_logs.html..."
 STEP3_START=$(get_timestamp)
 "$POST_PROCESSING" "$OUTPUT_FOLDER/binary" "$OUTPUT_FOLDER" \
     --compare-logs \
-    $ANALYSIS_OPTS \
     $LABEL_OPT \
     $MMIMO_FLAG
 
@@ -373,7 +493,6 @@ echo ">>> Step 4: Generating cpu_timeline.html..."
 STEP4_START=$(get_timestamp)
 "$POST_PROCESSING" "$OUTPUT_FOLDER/binary" "$OUTPUT_FOLDER" \
     --cpu-timeline \
-    $TIMELINE_OPTS \
     $LABEL_OPT
 
 CPU_TIMELINE_RESULT=$?
@@ -386,6 +505,8 @@ else
 fi
 record_step_timing "CPU timeline" "$STEP4_START" "$STEP4_END"
 echo
+
+fi # SKIP_LOG_ANALYSIS
 
 # Step 5: Threshold summary (informational, does not affect exit code)
 SUMMARY_FILES=()
@@ -457,6 +578,9 @@ if [[ -n "$GATING_THRESHOLD" ]]; then
     fi
     record_step_timing "Gating threshold" "$STEP7_START" "$STEP7_END"
     echo
+elif [[ $SKIP_LOG_ANALYSIS -eq 1 || -n "$PERF_TRACE_DIR" ]]; then
+    echo ">>> Step 7: SKIPPED (log analysis disabled or perf-trace-dir mode)"
+    echo
 else
     echo ">>> Step 7: GATING THRESHOLD NOT PROVIDED - pipeline will fail"
     OVERALL_RESULT=1
@@ -489,7 +613,6 @@ if [[ $LATENCY_SUMMARY_ENABLED -eq 1 ]]; then
     STEP9_START=$(get_timestamp)
     "$POST_PROCESSING" "$OUTPUT_FOLDER/binary_ls" "$OUTPUT_FOLDER" \
         --latency-summary \
-        $ANALYSIS_OPTS \
         $LABEL_OPT \
         $MMIMO_FLAG
 
@@ -509,7 +632,6 @@ if [[ $LATENCY_SUMMARY_ENABLED -eq 1 ]]; then
     STEP10_START=$(get_timestamp)
     "$POST_PROCESSING" "$OUTPUT_FOLDER/binary_ls" "$OUTPUT_FOLDER" \
         --latency-timeline \
-        $TIMELINE_OPTS \
         $LABEL_OPT \
         $MMIMO_FLAG
 
@@ -525,6 +647,229 @@ if [[ $LATENCY_SUMMARY_ENABLED -eq 1 ]]; then
     echo
 fi
 
+# Step 11-13: Perf trace analysis (optional, when --perf-trace-dir is provided)
+if [[ -n "$PERF_TRACE_DIR" ]]; then
+    FUTEX_SUMMARY_SCRIPT="$SCRIPT_DIR/syscall_tracer/futex_cuda_summary_multi_thread.py"
+    PAGE_FAULT_SUMMARY_SCRIPT="$SCRIPT_DIR/syscall_tracer/page_fault_summary.py"
+    RUNS_SUMMARY_SCRIPT="$SCRIPT_DIR/syscall_tracer/futex_cuda_runs_summary.py"
+    FUTEX_THRESHOLD_SCRIPT="$SCRIPT_DIR/syscall_tracer/futex_cuda_threshold_check.py"
+    PAGE_FAULT_THRESHOLD_SCRIPT="$SCRIPT_DIR/syscall_tracer/page_fault_threshold_check.py"
+    TRACER_LOG_NAME="cuda_api_tracer.log"
+    TRACER_LOG_IN_OUTPUT="$OUTPUT_FOLDER/$TRACER_LOG_NAME"
+
+    if [[ ! -d "$PERF_TRACE_DIR" ]]; then
+        echo ">>> Step 11: FAILED (perf trace directory not found: $PERF_TRACE_DIR)"
+        OVERALL_RESULT=1
+    else
+        FUTEX_SUMMARY_OK=0
+        PAGE_FAULT_SUMMARY_OK=0
+        TRACER_LOG_OK=0
+        rm -f "$OUTPUT_FOLDER/futex_cuda_summary.txt" \
+              "$OUTPUT_FOLDER/page_fault_summary.txt" \
+              "$OUTPUT_FOLDER/page_fault_gate_report.txt" \
+              "$OUTPUT_FOLDER/futex_cuda_runs_summary.txt" \
+              "$OUTPUT_FOLDER/futex_cuda_gate_report.txt" \
+              "$TRACER_LOG_IN_OUTPUT"
+
+        echo ">>> Step 11: Running futex_cuda_summary_multi_thread.py..."
+        STEP11_START=$(get_timestamp)
+        if [[ ! -f "$FUTEX_SUMMARY_SCRIPT" ]]; then
+            echo ">>> Step 11: FAILED (script not found: $FUTEX_SUMMARY_SCRIPT)"
+            OVERALL_RESULT=1
+        else
+            python3 "$FUTEX_SUMMARY_SCRIPT" \
+                -i "$PERF_TRACE_DIR" \
+                -o "$OUTPUT_FOLDER/futex_cuda_summary.txt" \
+                --no-sudo
+            FUTEX_RESULT=$?
+            if [[ $FUTEX_RESULT -ne 0 ]]; then
+                echo ">>> Step 11: FAILED (exit code $FUTEX_RESULT)"
+                OVERALL_RESULT=1
+            else
+                FUTEX_SUMMARY_OK=1
+                echo ">>> Step 11: COMPLETE"
+            fi
+        fi
+
+        # If a CUDA API tracer log was produced alongside the perf data, mirror
+        # it into the output folder so futex_cuda_runs_summary.py (which scans
+        # the parent of the summary file) can pick it up via --include-tracer-log.
+        TRACER_LOG_SRC="$PERF_TRACE_DIR/$TRACER_LOG_NAME"
+        if [[ -s "$TRACER_LOG_SRC" ]]; then
+            # Atomic copy: write to a temp file in the same directory, then rename.
+            # Prevents a failed cp (disk full, NFS I/O error, signal) from leaving a
+            # truncated destination that still passes existence checks and gets
+            # parsed as an empty tracer log by Step 13.
+            TRACER_LOG_TMP="${TRACER_LOG_IN_OUTPUT}.tmp.$$"
+            if cp -f "$TRACER_LOG_SRC" "$TRACER_LOG_TMP" \
+                && mv -f "$TRACER_LOG_TMP" "$TRACER_LOG_IN_OUTPUT"; then
+                TRACER_LOG_OK=1
+                echo "Copied CUDA API tracer log: $TRACER_LOG_SRC -> $TRACER_LOG_IN_OUTPUT"
+            else
+                rm -f "$TRACER_LOG_TMP" "$TRACER_LOG_IN_OUTPUT"
+                echo ">>> Step 11: FAILED (could not copy CUDA API tracer log)"
+                OVERALL_RESULT=1
+            fi
+        elif [[ -f "$TRACER_LOG_SRC" ]]; then
+            # The log file exists but is zero bytes. run2_cuPHYcontroller.sh
+            # pre-creates the file, so an empty one means the tracer was enabled
+            # but captured nothing -- treat it as a hard failure here with a
+            # clear message rather than letting it set TRACER_LOG_OK=1 and fail
+            # obscurely as a parse error in the Step 13 gate.
+            rm -f "$TRACER_LOG_IN_OUTPUT"
+            echo ">>> Step 11: FAILED (CUDA API tracer log is empty: $TRACER_LOG_SRC)"
+            OVERALL_RESULT=1
+        fi
+
+        STEP11_END=$(get_timestamp)
+        record_step_timing "Futex/CUDA summary" "$STEP11_START" "$STEP11_END"
+        echo
+
+        echo ">>> Step 11b: Running page_fault_summary.py..."
+        STEP11B_START=$(get_timestamp)
+        if [[ ! -f "$PAGE_FAULT_SUMMARY_SCRIPT" ]]; then
+            echo ">>> Step 11b: FAILED (script not found: $PAGE_FAULT_SUMMARY_SCRIPT)"
+            OVERALL_RESULT=1
+        else
+            python3 "$PAGE_FAULT_SUMMARY_SCRIPT" \
+                -i "$PERF_TRACE_DIR" \
+                -o "$OUTPUT_FOLDER/page_fault_summary.txt" \
+                --no-sudo
+            PAGE_FAULT_RESULT=$?
+            if [[ $PAGE_FAULT_RESULT -ne 0 ]]; then
+                echo ">>> Step 11b: FAILED (exit code $PAGE_FAULT_RESULT)"
+                OVERALL_RESULT=1
+            else
+                PAGE_FAULT_SUMMARY_OK=1
+                echo ">>> Step 11b: COMPLETE"
+            fi
+        fi
+        STEP11B_END=$(get_timestamp)
+        record_step_timing "Page fault summary" "$STEP11B_START" "$STEP11B_END"
+        echo
+
+        # Step 11c: Page-fault threshold gate. Always runs when --perf-trace-dir
+        # is set; with the default threshold of 0 any page fault fails the test.
+        echo ">>> Step 11c: Running page_fault_threshold_check.py (threshold ${PAGE_FAULT_THRESHOLD})..."
+        STEP11C_START=$(get_timestamp)
+        if [[ $PAGE_FAULT_SUMMARY_OK -eq 0 ]]; then
+            echo ">>> Step 11c: FAILED (prerequisite missing: page fault summary did not succeed)"
+            OVERALL_RESULT=1
+        elif [[ ! -f "$PAGE_FAULT_THRESHOLD_SCRIPT" ]]; then
+            echo ">>> Step 11c: FAILED (script not found: $PAGE_FAULT_THRESHOLD_SCRIPT)"
+            OVERALL_RESULT=1
+        else
+            python3 "$PAGE_FAULT_THRESHOLD_SCRIPT" \
+                -i "$OUTPUT_FOLDER/page_fault_summary.txt" \
+                --threshold "$PAGE_FAULT_THRESHOLD" \
+                -o "$OUTPUT_FOLDER/page_fault_gate_report.txt"
+            PAGE_FAULT_GATE_RESULT=$?
+            if [[ $PAGE_FAULT_GATE_RESULT -ne 0 ]]; then
+                echo ">>> Step 11c: FAILED (exit code $PAGE_FAULT_GATE_RESULT -- page fault threshold exceeded)"
+                OVERALL_RESULT=1
+            else
+                echo ">>> Step 11c: COMPLETE"
+            fi
+        fi
+        STEP11C_END=$(get_timestamp)
+        record_step_timing "Page fault threshold gate" "$STEP11C_START" "$STEP11C_END"
+        echo
+
+        echo ">>> Step 12: Running futex_cuda_runs_summary.py..."
+        STEP12_START=$(get_timestamp)
+        if [[ $FUTEX_SUMMARY_OK -eq 0 ]]; then
+            echo ">>> Step 12: SKIPPED (Step 11 futex summary did not succeed)"
+        elif [[ ! -f "$RUNS_SUMMARY_SCRIPT" ]]; then
+            echo ">>> Step 12: FAILED (script not found: $RUNS_SUMMARY_SCRIPT)"
+            OVERALL_RESULT=1
+        else
+            RUNS_OPTS=(-i "$OUTPUT_FOLDER" --summary-name futex_cuda_summary.txt \
+                       -o "$OUTPUT_FOLDER/futex_cuda_runs_summary.txt")
+            if [[ -f "$TRACER_LOG_IN_OUTPUT" ]]; then
+                RUNS_OPTS+=(--include-tracer-log --tracer-log-name "$TRACER_LOG_NAME")
+            fi
+            python3 "$RUNS_SUMMARY_SCRIPT" "${RUNS_OPTS[@]}"
+            RUNS_RESULT=$?
+            if [[ $RUNS_RESULT -ne 0 ]]; then
+                echo ">>> Step 12: FAILED (exit code $RUNS_RESULT)"
+                OVERALL_RESULT=1
+            else
+                echo ">>> Step 12: COMPLETE"
+            fi
+        fi
+        STEP12_END=$(get_timestamp)
+        record_step_timing "Runs summary" "$STEP12_START" "$STEP12_END"
+        echo
+
+        # Step 13: Per-API / aggregate futex-vs-CUDA threshold gate
+        if [[ -n "$FUTEX_CUDA_THRESHOLD" ]]; then
+            echo ">>> Step 13: Running futex_cuda_threshold_check.py (threshold ${FUTEX_CUDA_THRESHOLD}%)..."
+            STEP13_START=$(get_timestamp)
+            if [[ $FUTEX_SUMMARY_OK -eq 0 || $TRACER_LOG_OK -eq 0 ]]; then
+                echo ">>> Step 13: FAILED (prerequisite missing: futex_summary_ok=$FUTEX_SUMMARY_OK, tracer_log_ok=$TRACER_LOG_OK)"
+                echo "             (the CUDA API tracer may have been disabled, e.g. by --nsys; see parse_test_config_params.py guard)"
+                OVERALL_RESULT=1
+            elif [[ ! -f "$FUTEX_THRESHOLD_SCRIPT" ]]; then
+                echo ">>> Step 13: FAILED (script not found: $FUTEX_THRESHOLD_SCRIPT)"
+                OVERALL_RESULT=1
+            else
+                python3 "$FUTEX_THRESHOLD_SCRIPT" \
+                    --futex-summary "$OUTPUT_FOLDER/futex_cuda_summary.txt" \
+                    --tracer-log "$TRACER_LOG_IN_OUTPUT" \
+                    --threshold "$FUTEX_CUDA_THRESHOLD" \
+                    --min-calls "$FUTEX_CUDA_MIN_CALLS" \
+                    -o "$OUTPUT_FOLDER/futex_cuda_gate_report.txt"
+                GATE_RESULT=$?
+                if [[ $GATE_RESULT -ne 0 ]]; then
+                    echo ">>> Step 13: FAILED (exit code $GATE_RESULT -- threshold exceeded)"
+                    OVERALL_RESULT=1
+                else
+                    echo ">>> Step 13: COMPLETE"
+                fi
+            fi
+            STEP13_END=$(get_timestamp)
+            record_step_timing "Futex/CUDA threshold gate" "$STEP13_START" "$STEP13_END"
+            echo
+        fi
+    fi
+fi
+
+# Step 14: bpftrace all-syscall capture gate (optional, when --bpftrace-dir is
+# provided). Runs bpftrace_syscall_summary.py, which writes the per-syscall/
+# per-worker table and exits non-zero if the capture is empty (no syscalls) --
+# that is the pass/fail criterion. Independent of the perf (--perf-trace-dir)
+# gates above, so both can run in the same PERF-modifier post-processing pass.
+if [[ -n "$BPFTRACE_DIR" ]]; then
+    BPFTRACE_SUMMARY_SCRIPT="$SCRIPT_DIR/syscall_tracer/bpftrace_syscall_summary.py"
+    rm -f "$OUTPUT_FOLDER/bpftrace_syscall_summary.txt"
+
+    echo ">>> Step 14: Running bpftrace_syscall_summary.py (gate: FAIL if empty capture)..."
+    STEP14_START=$(get_timestamp)
+    if [[ ! -d "$BPFTRACE_DIR" ]]; then
+        echo ">>> Step 14: FAILED (bpftrace directory not found: $BPFTRACE_DIR)"
+        OVERALL_RESULT=1
+    elif [[ ! -f "$BPFTRACE_SUMMARY_SCRIPT" ]]; then
+        echo ">>> Step 14: FAILED (script not found: $BPFTRACE_SUMMARY_SCRIPT)"
+        OVERALL_RESULT=1
+    else
+        # Gate on dumps discovered in BPFTRACE_DIR (supports custom -o output names).
+        # The script exits 1 when zero syscalls were captured (empty dump).
+        python3 "$BPFTRACE_SUMMARY_SCRIPT" \
+            -i "$BPFTRACE_DIR" \
+            -o "$OUTPUT_FOLDER/bpftrace_syscall_summary.txt"
+        BPFTRACE_GATE_RESULT=$?
+        if [[ $BPFTRACE_GATE_RESULT -ne 0 ]]; then
+            echo ">>> Step 14: FAILED (exit code $BPFTRACE_GATE_RESULT -- empty bpftrace capture, no syscalls recorded)"
+            OVERALL_RESULT=1
+        else
+            echo ">>> Step 14: COMPLETE"
+        fi
+    fi
+    STEP14_END=$(get_timestamp)
+    record_step_timing "bpftrace syscall gate" "$STEP14_START" "$STEP14_END"
+    echo
+fi
+
 # Final summary
 PIPELINE_END=$(get_timestamp)
 PIPELINE_DURATION=$(calc_duration "$PIPELINE_START" "$PIPELINE_END")
@@ -533,9 +878,11 @@ echo "=============================================================="
 echo "CICD Post-Processing Summary"
 echo "=============================================================="
 echo "Output files:"
-echo "  - $OUTPUT_FOLDER/perf.csv"
-echo "  - $OUTPUT_FOLDER/compare_logs.html"
-echo "  - $OUTPUT_FOLDER/cpu_timeline.html"
+if [[ $SKIP_LOG_ANALYSIS -eq 0 ]]; then
+    echo "  - $OUTPUT_FOLDER/perf.csv"
+    echo "  - $OUTPUT_FOLDER/compare_logs.html"
+    echo "  - $OUTPUT_FOLDER/cpu_timeline.html"
+fi
 if [[ -n "$GATING_THRESHOLD" || -n "$WARNING_THRESHOLD" || -n "$ABSOLUTE_THRESHOLD" ]]; then
     echo "  - $OUTPUT_FOLDER/threshold_summary.csv"
 fi
@@ -551,6 +898,22 @@ fi
 if [[ $LATENCY_SUMMARY_ENABLED -eq 1 ]]; then
     echo "  - $OUTPUT_FOLDER/latency_summary.html"
     echo "  - $OUTPUT_FOLDER/latency_timeline.html"
+fi
+if [[ -n "$PERF_TRACE_DIR" ]]; then
+    echo "  - $OUTPUT_FOLDER/futex_cuda_summary.txt"
+    if [[ -f "$OUTPUT_FOLDER/page_fault_summary.txt" ]]; then
+        echo "  - $OUTPUT_FOLDER/page_fault_summary.txt"
+    fi
+    if [[ -f "$OUTPUT_FOLDER/page_fault_gate_report.txt" ]]; then
+        echo "  - $OUTPUT_FOLDER/page_fault_gate_report.txt"
+    fi
+    echo "  - $OUTPUT_FOLDER/futex_cuda_runs_summary.txt"
+    if [[ -n "$FUTEX_CUDA_THRESHOLD" ]]; then
+        echo "  - $OUTPUT_FOLDER/futex_cuda_gate_report.txt"
+    fi
+fi
+if [[ -n "$BPFTRACE_DIR" && -f "$OUTPUT_FOLDER/bpftrace_syscall_summary.txt" ]]; then
+    echo "  - $OUTPUT_FOLDER/bpftrace_syscall_summary.txt"
 fi
 echo
 echo "--------------------------------------------------------------"

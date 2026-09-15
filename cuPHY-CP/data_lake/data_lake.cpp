@@ -184,6 +184,10 @@ void DataLake::initMem(void) {
 			maxSrsRbSnrBytesPerRow
 		);
 
+		// Pre-size cell arrays so the per-slot collect path never reallocates them.
+		e3_buffer_info.cells.reserve(MAX_CELLS_PER_SLOT);
+		e3_srs_buffer_info.cells.reserve(MAX_CELLS_PER_SLOT);
+
 		// Create shared memory buffers through E3Agent
 		if (!e3_agent->createSharedMemoryBuffers(&pFh, &pInsertFh, &p, &pInsertPusch, &pHest, &pInsertHest,
 				&pSrsIq, &pInsertSrsIq, &pSrs, &pInsertSrs, &pSrsHest, &pInsertSrsHest)) {
@@ -554,10 +558,8 @@ void DataLake::notify(uint32_t nCrc,
 	::cuphyPuschDataOut_t const* out, ::cuphyPuschStatPrms_t const* puschStatPrms)
 {
 	NVLOGD_FMT(TAG_DATALAKE, "TIMESTAMP_LOG: DataLake notify (Op #2) for {:4}.{:02} entry at {}", slot->sfn_, slot->slot_, std::chrono::high_resolution_clock::now().time_since_epoch().count());
-	// When we have one cell this will always be true, when we have two cells using one as a dummy this will be
-	// true only when the "real" cell has PUSCH in it.
-	// TODO should make this behavior configurable
-	if(params->cell_grp_info.nCells == puschStatPrms->nMaxCells) {
+	// Collect whenever at least one cell is present; per-cell contents are emitted individually.
+	if(params->cell_grp_info.nCells > 0) {
 		if (__atomic_load_n(&dataLakeWorking, __ATOMIC_RELAXED)) {
 			NVLOGI_FMT(TAG_DATALAKE,"{:4}.{:02} Notify not called for collectSlot busy",slot->sfn_,slot->slot_);
 			return;
@@ -582,9 +584,8 @@ void DataLake::notifySrs(
 	::cuphySrsDataOut_t const* out, ::cuphySrsStatPrms_t const* srsStatPrms)
 {
 	NVLOGD_FMT(TAG_DATALAKE, "TIMESTAMP_LOG: DataLake notifySrs for {:4}.{:02} entry at {}", slot->sfn_, slot->slot_, std::chrono::high_resolution_clock::now().time_since_epoch().count());
-	// Only collect when all configured cells are present (mirrors PUSCH notify guard)
-	// TODO should make this behavior configurable
-	if(params->cell_grp_info.nCells == srsStatPrms->nMaxCells) {
+	// Collect whenever at least one cell is present; per-cell contents are emitted individually.
+	if(params->cell_grp_info.nCells > 0) {
 		if (__atomic_load_n(&dataLakeSrsWorking, __ATOMIC_RELAXED)) {
 			NVLOGI_FMT(TAG_DATALAKE,"{:4}.{:02} notifySrs not called for collectSrs busy",slot->sfn_,slot->slot_);
 			return;
@@ -679,14 +680,14 @@ void DataLake::collectSlot(void)
 		}
 	}
 
-	if(pFh->tsSwNs.size() == numRowsToInsertFh) {
+	if(pFh->tsSwNs.size() + params_->cell_grp_info.nCells > static_cast<size_t>(numRowsToInsertFh)) {
 		NVLOGW_FMT(TAG_DATALAKE,"{:4}.{:02} {} us: Skipping slot because {} buffer full, size: {}. Filled in {} ms",
 			slot_->sfn_,slot_->slot_,GET_ELAPSED_US(notifyTime),pFh->bufferName,pFh->tsTaiNs.size(),
 			std::chrono::duration_cast<std::chrono::milliseconds>(pFh->collectFullTime - pFh->collectStartTime).count());
 		return;
 	}
 
-	if(pHest->tsSwNs.size() == numRowsToInsertHest) {
+	if(pHest->tsSwNs.size() + params_->cell_grp_info.nCells > static_cast<size_t>(numRowsToInsertHest)) {
 		NVLOGW_FMT(TAG_DATALAKE,"{:4}.{:02} {} us: Skipping slot because {} H estimates buffer full, size: {}. Filled in {} ms",
 			slot_->sfn_,slot_->slot_,GET_ELAPSED_US(notifyTime),pHest->bufferName,pHest->tsTaiNs.size(),
 			std::chrono::duration_cast<std::chrono::milliseconds>(pHest->collectFullTime - pHest->collectStartTime).count());
@@ -698,51 +699,89 @@ void DataLake::collectSlot(void)
 		std::timespec_get(&ts, TIME_UTC);
 		uint64_t ts_ns = ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
 		uint64_t ts_tai_ns = sfn_to_tai(slot_->sfn_, slot_->slot_, ts_ns, 0, 0, 1);
+		const uint64_t slotTsSwNs = ts_ns;     // Slot-entry SW ts for per-slot FH/H-est rows
 
 		// Store current buffer info for E3 (only if E3 Agent is enabled)
 		if (e3_agent) {
 			std::lock_guard<std::mutex> lock(e3_buffer_mutex);
-			e3_buffer_info.current_fh_buffer = (pFh == &fhInfo[0]) ? 0 : 1;
-			e3_buffer_info.current_pusch_buffer = (p == &puschInfo[0]) ? 0 : 1;
-			e3_buffer_info.current_hest_buffer = (pHest == &hestInfo[0]) ? 0 : 1;
-			e3_buffer_info.fh_write_index = pFh->tsTaiNs.size();
-			e3_buffer_info.pusch_write_index = p->tsTaiNs.size();
-			e3_buffer_info.hest_write_index = pHest->tsTaiNs.size();
-			e3_buffer_info.hest_row_byte_offset = static_cast<uint32_t>(pHest->writeOffsetBytes);
 			e3_buffer_info.sfn = slot_->sfn_;
 			e3_buffer_info.slot = slot_->slot_;
 			e3_buffer_info.timestamp_ns = ts_ns;
 			e3_buffer_info.timestamp_tai_ns = ts_tai_ns;
 
-			// IQ metadata
-			if (params_->cell_grp_info.nCells > 0) {
-				e3_buffer_info.cell_id = puschStatPrms_->pCellStatPrms[0].phyCellId;
-				e3_buffer_info.n_rx_ant = puschStatPrms_->pCellStatPrms[0].nRxAnt;
-				e3_buffer_info.n_rx_ant_srs = puschStatPrms_->pCellStatPrms[0].nRxAntSrs;
-			} else {
-				e3_buffer_info.cell_id = 0;
-				e3_buffer_info.n_rx_ant = 0;
-				e3_buffer_info.n_rx_ant_srs = 0;
-			}
-			e3_buffer_info.n_cells = params_->cell_grp_info.nCells;
+			uint16_t nCells = params_->cell_grp_info.nCells;
+			e3_buffer_info.n_cells = nCells;
 
-			// H estimates dimension (cell-level)
-			if (params_->cell_grp_info.nUeGrps > 0) {
-				e3_buffer_info.n_bs_ants = puschStatPrms_->pCellStatPrms[0].nRxAnt;
+			// SHM refs shared by all cells this slot; per-cell IQ row is fhBase + c.
+			const uint8_t  curFh       = (pFh == &fhInfo[0]) ? 0 : 1;
+			const uint32_t fhBase      = pFh->tsTaiNs.size();
+			const uint8_t  curPusch    = (p == &puschInfo[0]) ? 0 : 1;
+			const uint32_t puschIdx    = p->tsTaiNs.size();
+			const uint8_t  curHest      = (pHest == &hestInfo[0]) ? 0 : 1;
+			const uint32_t hestBase     = pHest->tsTaiNs.size();
+			const uint32_t hestByteBase = static_cast<uint32_t>(pHest->writeOffsetBytes);
+
+			// One cell per cell_dyn_info entry; map cellPrmStatIdx -> cells[] slot.
+			int statIdxToCell[MAX_CELLS_PER_SLOT];
+			for (int s = 0; s < MAX_CELLS_PER_SLOT; ++s) statIdxToCell[s] = -1;
+			for (uint16_t c = 0; c < nCells; ++c) {
+				auto cellIdx = params_->cell_dyn_info[c].cellPrmStatIdx;
+				if (cellIdx < MAX_CELLS_PER_SLOT) statIdxToCell[cellIdx] = c;
 			}
 
-			// Per-UE metrics for all UEs across all groups.
+			// Mirror the H-est copy gate so empty slots advertise h_size=0.
+			const bool hestAvail = out_->pChannelEsts && out_->pChannelEstSizes && params_->cell_grp_info.nUeGrps > 0;
+
+			// Per-cell H-est size (elements): each UE group routed to its owning cell.
+			uint32_t cellHestSamples[MAX_CELLS_PER_SLOT] = {};
+			if (hestAvail) {
+				for (uint16_t g = 0; g < params_->cell_grp_info.nUeGrps; ++g) {
+					auto gsi = params_->cell_grp_info.pUeGrpPrms[g].pCellPrm->cellPrmStatIdx;
+					int cs = (gsi < MAX_CELLS_PER_SLOT) ? statIdxToCell[gsi] : -1;
+					if (cs >= 0) cellHestSamples[cs] += out_->pChannelEstSizes[g];
+				}
+			}
+
+			e3_buffer_info.cells.resize(nCells);
+			uint32_t hestPrefixBytes = 0;
+			for (uint16_t c = 0; c < nCells; ++c) {
+				auto cellIdx = params_->cell_dyn_info[c].cellPrmStatIdx;
+				auto& pCell  = puschStatPrms_->pCellStatPrms[cellIdx];
+				auto& cell   = e3_buffer_info.cells[c];
+				cell.cell_id              = pCell.phyCellId;
+				cell.n_rx_ant             = pCell.nRxAnt;
+				cell.n_rx_ant_srs         = pCell.nRxAntSrs;
+				cell.n_bs_ants            = pCell.nRxAnt;
+				cell.current_fh_buffer    = curFh;
+				cell.fh_write_index       = fhBase + c;
+				cell.current_pusch_buffer = curPusch;
+				cell.pusch_write_index    = puschIdx;
+				cell.current_hest_buffer  = curHest;
+				cell.hest_write_index     = hestBase + c;
+				cell.hest_row_byte_offset = hestByteBase + hestPrefixBytes;
+				hestPrefixBytes += cellHestSamples[c] * sizeof(hestDataType);
+				cell.ues.clear();
+			}
+
+			// Per-UE PDU byte offset within the slot's PUSCH region (copy/ueIdx order).
 			uint16_t numUes = params_->cell_grp_info.nUes;
-			e3_buffer_info.n_ue = numUes;
-			e3_buffer_info.ue_metrics.clear();
-			e3_buffer_info.ue_metrics.reserve(numUes);
+			uint32_t uePduOffset[MAX_N_TBS_PER_CELL_GROUP_SUPPORTED] = {};
+			uint32_t pduAcc = 0;
+			for (uint16_t u = 0; u < numUes; ++u) {
+				uePduOffset[u] = pduAcc;
+				uint8_t crcFail = (out_->pTbCrcs && out_->pStartOffsetsTbCrc) ? (out_->pTbCrcs[out_->pStartOffsetsTbCrc[u]] != 0) : 1;
+				if (crcFail == 0 || storeFailedPdu) pduAcc += params_->ue_tb_size[u];
+			}
 
-			uint32_t hOffset = 0;
+			// Per-UE metrics, grouped into their owning cell.
+			uint32_t hOffsetPerCell[MAX_CELLS_PER_SLOT] = {};
 			for (uint16_t grpIdx = 0; grpIdx < params_->cell_grp_info.nUeGrps; ++grpIdx) {
 				auto* grp = &params_->cell_grp_info.pUeGrpPrms[grpIdx];
 				uint16_t layerOffset = 0;
 
-				uint32_t grpHSize = (out_->pChannelEstSizes) ? out_->pChannelEstSizes[grpIdx] : 0;
+				uint32_t grpHSize = hestAvail ? out_->pChannelEstSizes[grpIdx] : 0;
+				auto grpStatIdx = grp->pCellPrm->cellPrmStatIdx;
+				int cellSlot = (grpStatIdx < MAX_CELLS_PER_SLOT) ? statIdxToCell[grpStatIdx] : -1;
 
 				for (uint16_t i = 0; i < grp->nUes; ++i) {
 					uint16_t ueIdx = grp->pUePrmIdxs[i];
@@ -764,7 +803,7 @@ void DataLake::collectSlot(void)
 					m.target_code_rate = ue->targetCodeRate;
 					m.new_data_indicator = ue->ndi;
 
-					m.h_offset = hOffset;
+					m.h_offset = (cellSlot >= 0) ? hOffsetPerCell[cellSlot] : 0;
 					m.h_size = grpHSize;
 					m.n_subcarriers = grp->nPrb * 12;
 					m.n_dmrs_estimates = (grp->pDmrsDynPrm != nullptr) ? grp->pDmrsDynPrm->dmrsAddlnPos + 1 : 0;
@@ -772,6 +811,7 @@ void DataLake::collectSlot(void)
 
 					m.tb_crc_fail = (out_->pTbCrcs && out_->pStartOffsetsTbCrc)	? ((out_->pTbCrcs[out_->pStartOffsetsTbCrc[ueIdx]] != 0) ? 1 : 0) : 1;
 					m.pdu_len = (m.tb_crc_fail == 0) ? m.tb_size : 0;
+					m.pdu_offset = uePduOffset[ueIdx];
 
 					m.cb_count = 0;
 					m.cb_errors = 0;
@@ -802,15 +842,14 @@ void DataLake::collectSlot(void)
 					m.rv_index = ue->rv;
 
 					layerOffset += ue->nUeLayers;
-					e3_buffer_info.ue_metrics.push_back(m);
+					if (cellSlot >= 0) e3_buffer_info.cells[cellSlot].ues.push_back(m);
 				}
-				hOffset += grpHSize;
+				if (cellSlot >= 0) hOffsetPerCell[cellSlot] += grpHSize;
 			}
-		}
 
-		// Send E3 notification after data is collected
-		if (e3_agent) {
-			e3_agent->notifyDataReady();
+			for (auto& cell : e3_buffer_info.cells) {
+				cell.n_ue = static_cast<uint16_t>(cell.ues.size());
+			}
 		}
 
 		if (p->tsTaiNs.size() == 0) {
@@ -827,22 +866,27 @@ void DataLake::collectSlot(void)
 		uint16_t ueNSubcarriers[MAX_N_TBS_PER_CELL_GROUP_SUPPORTED] = {};
 		uint8_t  ueNDmrsEstimates[MAX_N_TBS_PER_CELL_GROUP_SUPPORTED] = {};
 		uint16_t ueDmrsSymbPos[MAX_N_TBS_PER_CELL_GROUP_SUPPORTED] = {};
-		uint32_t hOff = 0;
+		// hest rows are per cell, so hOffset accumulates within a cell.
+		uint32_t hOffPerCell[MAX_CELLS_PER_SLOT] = {};
 		for (uint16_t g = 0; g < params_->cell_grp_info.nUeGrps; ++g) {
 			auto* grp = &params_->cell_grp_info.pUeGrpPrms[g];
-			uint32_t grpHSize = (out_->pChannelEstSizes) ? out_->pChannelEstSizes[g] : 0;
+			uint32_t grpHSize = (out_->pChannelEsts && out_->pChannelEstSizes) ? out_->pChannelEstSizes[g] : 0;
+			auto grpStatIdx = grp->pCellPrm->cellPrmStatIdx;
+			bool cellOk = grpStatIdx < MAX_CELLS_PER_SLOT;
+			uint32_t hOff = cellOk ? hOffPerCell[grpStatIdx] : 0;
+			uint32_t hSize = cellOk ? grpHSize : 0;
 			uint16_t layOff = 0;
 			for (uint16_t i = 0; i < grp->nUes; ++i) {
 				uint16_t idx = grp->pUePrmIdxs[i];
 				ueLayerOffsets[idx] = layOff;
 				ueHOffsets[idx] = hOff;
-				ueHSizes[idx] = grpHSize;
+				ueHSizes[idx] = hSize;
 				ueNSubcarriers[idx] = grp->nPrb * 12;
 				ueNDmrsEstimates[idx] = (grp->pDmrsDynPrm != nullptr) ? grp->pDmrsDynPrm->dmrsAddlnPos + 1 : 0;
 				ueDmrsSymbPos[idx] = grp->dmrsSymLocBmsk;
 				layOff += params_->ue_info[idx].nUeLayers;
 			}
-			hOff += grpHSize;
+			if (cellOk) hOffPerCell[grpStatIdx] += grpHSize;
 		}
 
 		for(uint16_t ueIdx = 0; ueIdx < nUes; ++ueIdx) {
@@ -1005,7 +1049,7 @@ void DataLake::collectSlot(void)
 			auto cellId = pCell.phyCellId;
 			auto nrxant = pCell.nRxAnt;
 			auto nrxantsrs = pCell.nRxAntSrs;
-			pFh->tsSwNs.push_back(ts_ns);
+			pFh->tsSwNs.push_back(slotTsSwNs);
 			pFh->tsTaiNs.push_back(ts_tai_ns);
 
 			pFh->sfn.push_back(slot_->sfn_);
@@ -1037,47 +1081,65 @@ void DataLake::collectSlot(void)
 		NVLOGD_FMT(TAG_DATALAKE,"{:4}.{:02} {} us: collectSlot done {} cells in fh.{} buffer, size: {}",
 			slot_->sfn_,slot_->slot_,GET_ELAPSED_US(notifyTime),nCells,pFh->bufferName,pFh->tsTaiNs.size());
 
-		// Process H estimates data -- all UE groups concatenated
-		if (out_->pChannelEsts && out_->pChannelEstSizes && pHest->tsTaiNs.size() <= numRowsToInsertHest && params_->cell_grp_info.nUeGrps > 0) {
+		// Process H estimates data. One packed row per cell (this cell's groups concatenated)
+		if (out_->pChannelEsts && out_->pChannelEstSizes && params_->cell_grp_info.nUeGrps > 0) {
 			if (pHest->tsTaiNs.size() == 0) {
 				pHest->collectStartTime = std::chrono::high_resolution_clock::now();
 			}
 
-			// Get the first cell ID
-			uint16_t cellId = 0;
-			if (params_->cell_grp_info.nCells > 0) {
-				cellId = puschStatPrms_->pCellStatPrms[0].phyCellId;
-			}
-
-			pHest->tsSwNs.push_back(ts_ns);
-			pHest->tsTaiNs.push_back(ts_tai_ns);
-			pHest->sfn.push_back(slot_->sfn_);
-			pHest->slot.push_back(slot_->slot_);
-			pHest->cellId.push_back(cellId);
-
-			// Total H-est size across all groups (elements are contiguous after pusch_rx copy)
-			uint32_t hestSize = 0;
+			// Source element offset of each UE group in the concatenated pChannelEsts.
+			uint32_t grpSrcOff[MAX_N_USER_GROUPS_SUPPORTED] = {};
+			uint32_t srcAcc = 0;
 			for (uint16_t g = 0; g < params_->cell_grp_info.nUeGrps; ++g) {
-				hestSize += out_->pChannelEstSizes[g];
-			}
-			pHest->hestSize.push_back(hestSize);
-
-			size_t dataIndex = pHest->tsTaiNs.size() - 1;
-			pHest->hestData[dataIndex] = pHest->pDataAlloc + (pHest->writeOffsetBytes / sizeof(hestDataType));
-			if (hestSize > 0 && hestSize <= maxHestSamplesPerRow) {
-				std::memcpy(pHest->hestData[dataIndex], out_->pChannelEsts,
-					hestSize * sizeof(hestDataType));
-				pHest->writeOffsetBytes += hestSize * sizeof(hestDataType);
-				NVLOGV_FMT(TAG_DATALAKE,"{:4}.{:02} {} us: Copied {} H estimate samples to hest[{}] offset {}",
-					slot_->sfn_, slot_->slot_, GET_ELAPSED_US(notifyTime), hestSize, dataIndex, pHest->writeOffsetBytes);
+				grpSrcOff[g] = srcAcc;
+				srcAcc += out_->pChannelEstSizes[g];
 			}
 
-			if (pHest->tsTaiNs.size() == numRowsToInsertHest) {
+			uint16_t nCellsH = params_->cell_grp_info.nCells;
+			for (uint16_t c = 0; c < nCellsH; ++c) {
+				uint16_t cellStatIdx = params_->cell_dyn_info[c].cellPrmStatIdx;
+				uint16_t cellId = puschStatPrms_->pCellStatPrms[cellStatIdx].phyCellId;
+
+				uint32_t cellHestSize = 0;
+				for (uint16_t g = 0; g < params_->cell_grp_info.nUeGrps; ++g)
+					if (params_->cell_grp_info.pUeGrpPrms[g].pCellPrm->cellPrmStatIdx == cellStatIdx)
+						cellHestSize += out_->pChannelEstSizes[g];
+
+				pHest->tsSwNs.push_back(slotTsSwNs);
+				pHest->tsTaiNs.push_back(ts_tai_ns);
+				pHest->sfn.push_back(slot_->sfn_);
+				pHest->slot.push_back(slot_->slot_);
+				pHest->cellId.push_back(cellId);
+				pHest->hestSize.push_back(cellHestSize);
+
+				size_t dataIndex = pHest->tsTaiNs.size() - 1;
+				pHest->hestData[dataIndex] = pHest->pDataAlloc + (pHest->writeOffsetBytes / sizeof(hestDataType));
+				if (cellHestSize > 0 && cellHestSize <= maxHestSamplesPerRow) {
+					uint8_t* dst = reinterpret_cast<uint8_t*>(pHest->hestData[dataIndex]);
+					uint32_t dstOff = 0;
+					for (uint16_t g = 0; g < params_->cell_grp_info.nUeGrps; ++g) {
+						if (params_->cell_grp_info.pUeGrpPrms[g].pCellPrm->cellPrmStatIdx != cellStatIdx) continue;
+						uint32_t gsz = out_->pChannelEstSizes[g];
+						std::memcpy(dst + dstOff * sizeof(hestDataType),
+							reinterpret_cast<const uint8_t*>(out_->pChannelEsts) + grpSrcOff[g] * sizeof(hestDataType),
+							gsz * sizeof(hestDataType));
+						dstOff += gsz;
+					}
+					pHest->writeOffsetBytes += cellHestSize * sizeof(hestDataType);
+				}
+			}
+
+			if (pHest->tsTaiNs.size() >= static_cast<size_t>(numRowsToInsertHest)) {
 				pHest->collectFullTime = std::chrono::high_resolution_clock::now();
 			}
 
-			NVLOGD_FMT(TAG_DATALAKE,"{:4}.{:02} {} us: collectSlot done H estimates in hest.{} buffer, size: {}",
-				slot_->sfn_,slot_->slot_,GET_ELAPSED_US(notifyTime),pHest->bufferName,pHest->tsTaiNs.size());
+			NVLOGD_FMT(TAG_DATALAKE,"{:4}.{:02} {} us: collectSlot done H estimates ({} cells) in hest.{} buffer, size: {}",
+				slot_->sfn_,slot_->slot_,GET_ELAPSED_US(notifyTime),nCellsH,pHest->bufferName,pHest->tsTaiNs.size());
+		}
+
+		// Send E3 notification after data is collected
+		if (e3_agent) {
+			e3_agent->notifyDataReady();
 		}
 	}
 
@@ -1139,9 +1201,11 @@ void DataLake::collectSrs(void)
 	if (pSrsIq->tsTaiNs.size() == 0) {
 		pSrsIq->collectStartTime = std::chrono::high_resolution_clock::now();
 	}
-	// Snapshot offset of this slot's first cell row before writing
-	const size_t srsIqSlotStartOffsetBytes = pSrsIq->writeOffsetBytes;
+	// Per-cell SRS IQ SHM row + byte offset, captured as each cell's row is written.
+	const uint32_t srsIqBaseRow = static_cast<uint32_t>(pSrsIq->tsTaiNs.size());
+	uint32_t srsIqCellByteOff[MAX_CELLS_PER_SLOT] = {};
 	for (uint16_t cellIdx = 0; cellIdx < nCells; ++cellIdx) {
+		if (cellIdx < MAX_CELLS_PER_SLOT) srsIqCellByteOff[cellIdx] = static_cast<uint32_t>(pSrsIq->writeOffsetBytes);
 		auto& cellDyn = srsParams_->cell_dyn_info[cellIdx];
 		uint16_t cellStatIdx = cellDyn.cellPrmStatIdx;
 		uint16_t cellId = srsStatPrms_->pCellStatPrms[cellStatIdx].phyCellId;
@@ -1182,6 +1246,9 @@ void DataLake::collectSrs(void)
 	if (pSrsHest->tsTaiNs.size() == 0) {
 		pSrsHest->collectStartTime = std::chrono::high_resolution_clock::now();
 	}
+
+	const uint32_t srsHestBaseRow  = static_cast<uint32_t>(pSrsHest->tsTaiNs.size());
+	const uint32_t srsRbSnrBaseRow = static_cast<uint32_t>(pSrs->tsTaiNs.size());
 
 	for (uint16_t ueIdx = 0; ueIdx < nSrsUes; ++ueIdx) {
 		auto& ue = ueArr[ueIdx];
@@ -1290,30 +1357,41 @@ void DataLake::collectSrs(void)
 	// Store SRS buffer info for E3
 	if (e3_agent) {
 		std::lock_guard<std::mutex> lock(e3_srs_buffer_mutex);
-		e3_srs_buffer_info.current_srs_iq_buffer = (pSrsIq == &srsIqInfo[0]) ? 0 : 1;
-		e3_srs_buffer_info.current_srs_hest_buffer = (pSrsHest == &srsHestInfoBuf[0]) ? 0 : 1;
-		e3_srs_buffer_info.current_srs_rb_snr_buffer = (pSrs == &srsScalarInfo[0]) ? 0 : 1;
-		e3_srs_buffer_info.srs_iq_write_index = pSrsIq->tsTaiNs.size();
-		e3_srs_buffer_info.srs_iq_row_byte_offset = static_cast<uint32_t>(srsIqSlotStartOffsetBytes);
-		e3_srs_buffer_info.srs_hest_write_index = pSrsHest->tsTaiNs.size();
-		e3_srs_buffer_info.srs_rb_snr_write_index = pSrs->tsTaiNs.size();
+
 		e3_srs_buffer_info.sfn = srsSlot_->sfn_;
 		e3_srs_buffer_info.slot = srsSlot_->slot_;
 		e3_srs_buffer_info.timestamp_ns = ts_ns;
 		e3_srs_buffer_info.timestamp_tai_ns = ts_tai_ns;
+		e3_srs_buffer_info.n_cells = nCells;
 
-		if (nCells > 0) {
-			uint16_t cellStatIdx = srsParams_->cell_dyn_info[0].cellPrmStatIdx;
-			e3_srs_buffer_info.cell_id = srsStatPrms_->pCellStatPrms[cellStatIdx].phyCellId;
-			e3_srs_buffer_info.n_cells = nCells;
-			e3_srs_buffer_info.n_rx_ant_srs = srsStatPrms_->pCellStatPrms[cellStatIdx].nRxAntSrs;
-			e3_srs_buffer_info.srs_cell_start_sym = srsParams_->cell_dyn_info[0].srsStartSym;
-			e3_srs_buffer_info.srs_cell_n_srs_sym = srsParams_->cell_dyn_info[0].nSrsSym;
+		// SHM refs shared by all cells; per-cell SRS IQ row/offset differ.
+		const uint8_t  curSrsIq    = (pSrsIq == &srsIqInfo[0]) ? 0 : 1;
+		const uint8_t  curSrsHest  = (pSrsHest == &srsHestInfoBuf[0]) ? 0 : 1;
+		const uint8_t  curSrsRbSnr = (pSrs == &srsScalarInfo[0]) ? 0 : 1;
+
+		// One cell per cell_dyn_info entry; map cellPrmStatIdx -> cells[] slot.
+		int statIdxToCell[MAX_CELLS_PER_SLOT];
+		for (int s = 0; s < MAX_CELLS_PER_SLOT; ++s) statIdxToCell[s] = -1;
+		e3_srs_buffer_info.cells.resize(nCells);
+		for (uint16_t c = 0; c < nCells; ++c) {
+			uint16_t cellStatIdx = srsParams_->cell_dyn_info[c].cellPrmStatIdx;
+			auto& pCell = srsStatPrms_->pCellStatPrms[cellStatIdx];
+			auto& cell  = e3_srs_buffer_info.cells[c];
+			cell.cell_id                   = pCell.phyCellId;
+			cell.n_rx_ant_srs              = pCell.nRxAntSrs;
+			cell.srs_cell_start_sym        = srsParams_->cell_dyn_info[c].srsStartSym;
+			cell.srs_cell_n_srs_sym        = srsParams_->cell_dyn_info[c].nSrsSym;
+			cell.current_srs_iq_buffer     = curSrsIq;
+			cell.srs_iq_write_index        = srsIqBaseRow + c;
+			cell.srs_iq_row_byte_offset    = (c < MAX_CELLS_PER_SLOT) ? srsIqCellByteOff[c] : 0;
+			cell.current_srs_hest_buffer   = curSrsHest;
+			cell.srs_hest_write_index      = srsHestBaseRow;
+			cell.current_srs_rb_snr_buffer = curSrsRbSnr;
+			cell.srs_rb_snr_write_index    = srsRbSnrBaseRow;
+			cell.ues.clear();
+			if (cellStatIdx < MAX_CELLS_PER_SLOT) statIdxToCell[cellStatIdx] = c;
 		}
-		e3_srs_buffer_info.n_srs_ue = nSrsUes;
 
-		e3_srs_buffer_info.ue_metrics.clear();
-		e3_srs_buffer_info.ue_metrics.reserve(nSrsUes);
 		for (uint16_t ueIdx = 0; ueIdx < nSrsUes; ++ueIdx) {
 			auto& ue = ueArr[ueIdx];
 			auto& rpt = srsOut_->pSrsReports[ueIdx];
@@ -1364,7 +1442,12 @@ void DataLake::collectSrs(void)
 			m.srs_hest_size = static_cast<uint32_t>(nRxAntSrs) * chEst.nPrbGrps * ue.nAntPorts * sizeof(int32_t);
 			if (m.srs_hest_size > maxSrsHestBytesPerRow) m.srs_hest_size = maxSrsHestBytesPerRow;
 
-			e3_srs_buffer_info.ue_metrics.push_back(m);
+			int cellSlot = (ue.cellIdx < MAX_CELLS_PER_SLOT) ? statIdxToCell[ue.cellIdx] : -1;
+			if (cellSlot >= 0) e3_srs_buffer_info.cells[cellSlot].ues.push_back(m);
+		}
+
+		for (auto& cell : e3_srs_buffer_info.cells) {
+			cell.n_srs_ue = static_cast<uint16_t>(cell.ues.size());
 		}
 	}
 

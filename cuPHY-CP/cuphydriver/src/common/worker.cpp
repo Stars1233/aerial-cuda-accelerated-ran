@@ -345,7 +345,7 @@ int worker_default(phydriverwrk_handle whandler, void* arg)
                 tList->getId(),gpu_device->getId(), coreId);
 
     // force CUDA API dynamic memory allocation prior to entering real-time code path
-    cudaSetDevice(gpu_device->getId());
+    gpu_device->setDevice();
 
     // enable dynamic memory allocation tracing in real-time code path
     // Use LD_PRELOAD=<special .so> when running cuphycontroller, otherwise this does nothing.

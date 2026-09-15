@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +26,7 @@
 #include "ldpc2_reg_index_fp_desc_dyn.hpp"
 #include "ldpc2_schedule_dynamic_desc.cuh"
 #include "ldpc2_c2v_cache_register.cuh"
+#include "ldpc2_crc_dispatch.cuh"
 
 using namespace ldpc2;
 
@@ -43,7 +44,7 @@ namespace
     typedef ldpc2::sign_store_policy_split_dst<__half, ldpc2::split_sign_update_bit_ops, false> sign_dst_bit_t;
     typedef ldpc2::sign_store_policy_split_src<__half, ldpc2::split_sign_update_fp,      false> sign_src_fp_t;
     typedef ldpc2::sign_store_policy_split_src<__half, ldpc2::split_sign_update_bit_ops, false> sign_src_bit_t;
-    
+
     // Sign updates with FP unit A couple of microseconds faster on V100...
     typedef sign_dst_fp_t                                                                       sign_mgr_t;
 
@@ -98,7 +99,7 @@ namespace
         static constexpr int MAX_PARITY_ROWS = ldpc2::max_parity_nodes<BG>::value;
 
         typedef TKernelParams                   kernel_params_t;
-        
+
         // TODO: Update to use C2V_row_proc and a simple row map instead of
         // the older cC2V_index, to unify implementations.
         //typedef C2V_row_proc<__half,
@@ -191,7 +192,7 @@ void ldpc2_BG2_reg_index_fp_desc_dyn(LDPC_kernel_params params, app_loc_t<2>::bg
 {
     // Shared memory is allocated dynamically
     extern __shared__ char smem[];
-    
+
     //------------------------------------------------------------------
     // Kernel configuration template
     typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
@@ -234,8 +235,9 @@ extern "C"
 __global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
 void ldpc2_BG1_reg_index_fp_desc_dyn_tb(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<1>::bg_desc_t bgdesc)
 {
-    // Shared memory is allocated dynamically
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = true;
     extern __shared__ char smem[];
+    // Shared memory is allocated dynamically
 
     //------------------------------------------------------------------
     // Kernel configuration template
@@ -249,14 +251,38 @@ void ldpc2_BG1_reg_index_fp_desc_dyn_tb(cuphyLDPCDecodeDesc_t decodeDesc, app_lo
     kernel_config_t::llr_loader_t::load_sync(smem, decodeDesc, blockIdx.x);
 
     //------------------------------------------------------------------
+    // Early-termination context (before per-iteration loop)
+    ldpc_et_context_t* et_ctx = ldpc2::get_et_ctx_ptr(smem,
+        shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + ldpc2::max_info_nodes<kernel_config_t::BG>::value,
+                              decodeDesc.config.Z,
+                              sizeof(__half)));
+    ldpc2::early_term_initialize_if_enabled<ENABLE_ACCESSORY_FEATURES, ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::cw_per_cta>(et_ctx, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
     // Perform iterations
     kernel_config_t::sched_t sched(decodeDesc.config,
                                    bgdesc,
                                    static_cast<int>(__cvta_generic_to_shared(smem)),
                                    threadIdx.x);
-    for(int iter = 0; iter < decodeDesc.config.max_iterations; ++iter)
+    int32_t iter = 0;
+    auto crc = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::failure;  // Assume fail initially
+    auto prev_packed_word = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::prev_init;
+    while(iter < decodeDesc.config.max_iterations)
     {
         sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            crc = ldpc2::should_terminate_early_crc<kernel_config_t::BG>(
+                decodeDesc,
+                blockIdx.x,
+                reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                et_ctx,
+                iter - 1,
+                prev_packed_word);
+            if(crc == 0) break;
+        }
     }
 
     //------------------------------------------------------------------
@@ -264,8 +290,98 @@ void ldpc2_BG1_reg_index_fp_desc_dyn_tb(cuphyLDPCDecodeDesc_t decodeDesc, app_lo
     //ldpc_dec_output_variable(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     ldpc_dec_output_variable_loop(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     //------------------------------------------------------------------
+    // Write CRC result if early termination enabled
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+    {
+        ldpc2::ldpc_dec_crc_output(decodeDesc, blockIdx.x, crc);
+    }
+    //------------------------------------------------------------------
+    // Write iteration count if requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+    {
+        ldpc2::ldpc_dec_iter_output<kernel_config_t::app_buf_t>(decodeDesc, blockIdx.x, iter);
+    }
+    //------------------------------------------------------------------
     // Write soft outputs if the caller requested
-    if(0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    {
+        ldpc_dec_soft_output(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    }
+}
+
+extern "C"
+__global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
+void ldpc2_BG1_reg_index_fp_desc_dyn_tb_no_accessories(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<1>::bg_desc_t bgdesc)
+{
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = false;
+    extern __shared__ char smem[];
+    // Shared memory is allocated dynamically
+
+    //------------------------------------------------------------------
+    // Kernel configuration template
+    typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<1,
+                                                      cuphyLDPCDecodeConfigDesc_t,
+                                                      __half,
+                                                      ldpc2::llr_loader_variable_batch> kernel_config_t;
+
+    //------------------------------------------------------------------
+    // Load LLR data from global to shared memory
+    kernel_config_t::llr_loader_t::load_sync(smem, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
+    // Early-termination context (before per-iteration loop)
+    ldpc_et_context_t* et_ctx = ldpc2::get_et_ctx_ptr(smem,
+        shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + ldpc2::max_info_nodes<kernel_config_t::BG>::value,
+                              decodeDesc.config.Z,
+                              sizeof(__half)));
+    ldpc2::early_term_initialize_if_enabled<ENABLE_ACCESSORY_FEATURES, ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::cw_per_cta>(et_ctx, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
+    // Perform iterations
+    kernel_config_t::sched_t sched(decodeDesc.config,
+                                   bgdesc,
+                                   static_cast<int>(__cvta_generic_to_shared(smem)),
+                                   threadIdx.x);
+    int32_t iter = 0;
+    auto crc = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::failure;  // Assume fail initially
+    auto prev_packed_word = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::prev_init;
+    while(iter < decodeDesc.config.max_iterations)
+    {
+        sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            crc = ldpc2::should_terminate_early_crc<kernel_config_t::BG>(
+                decodeDesc,
+                blockIdx.x,
+                reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                et_ctx,
+                iter - 1,
+                prev_packed_word);
+            if(crc == 0) break;
+        }
+    }
+
+    //------------------------------------------------------------------
+    // Write hard output based on APP values
+    //ldpc_dec_output_variable(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    ldpc_dec_output_variable_loop(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    //------------------------------------------------------------------
+    // Write CRC result if early termination enabled
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+    {
+        ldpc2::ldpc_dec_crc_output(decodeDesc, blockIdx.x, crc);
+    }
+    //------------------------------------------------------------------
+    // Write iteration count if requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+    {
+        ldpc2::ldpc_dec_iter_output<kernel_config_t::app_buf_t>(decodeDesc, blockIdx.x, iter);
+    }
+    //------------------------------------------------------------------
+    // Write soft outputs if the caller requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
     {
         ldpc_dec_soft_output(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     }
@@ -278,9 +394,10 @@ extern "C"
 __global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
 void ldpc2_BG2_reg_index_fp_desc_dyn_tb(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<2>::bg_desc_t bgdesc)
 {
-    // Shared memory is allocated dynamically
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = true;
     extern __shared__ char smem[];
-    
+    // Shared memory is allocated dynamically
+
     //------------------------------------------------------------------
     // Kernel configuration template
     typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
@@ -293,14 +410,38 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_tb(cuphyLDPCDecodeDesc_t decodeDesc, app_lo
     kernel_config_t::llr_loader_t::load_sync(smem, decodeDesc, blockIdx.x);
 
     //------------------------------------------------------------------
+    // Early-termination context (before per-iteration loop)
+    ldpc_et_context_t* et_ctx = ldpc2::get_et_ctx_ptr(smem,
+        shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + ldpc2::max_info_nodes<kernel_config_t::BG>::value,
+                              decodeDesc.config.Z,
+                              sizeof(__half)));
+    ldpc2::early_term_initialize_if_enabled<ENABLE_ACCESSORY_FEATURES, ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::cw_per_cta>(et_ctx, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
     // Perform iterations
     kernel_config_t::sched_t sched(decodeDesc.config,
                                    bgdesc,
                                    static_cast<int>(__cvta_generic_to_shared(smem)),
                                    threadIdx.x);
-    for(int iter = 0; iter < decodeDesc.config.max_iterations; ++iter)
+    int32_t iter = 0;
+    auto crc = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::failure;  // Assume fail initially
+    auto prev_packed_word = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::prev_init;
+    while(iter < decodeDesc.config.max_iterations)
     {
         sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            crc = ldpc2::should_terminate_early_crc<kernel_config_t::BG>(
+                decodeDesc,
+                blockIdx.x,
+                reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                et_ctx,
+                iter - 1,
+                prev_packed_word);
+            if(crc == 0) break;
+        }
     }
 
     //------------------------------------------------------------------
@@ -309,8 +450,99 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_tb(cuphyLDPCDecodeDesc_t decodeDesc, app_lo
     // No loop needed for BG2 with Z>= 32
     //ldpc_dec_output_variable_loop(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     //------------------------------------------------------------------
+    // Write CRC result if early termination enabled
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+    {
+        ldpc2::ldpc_dec_crc_output(decodeDesc, blockIdx.x, crc);
+    }
+    //------------------------------------------------------------------
+    // Write iteration count if requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+    {
+        ldpc2::ldpc_dec_iter_output<kernel_config_t::app_buf_t>(decodeDesc, blockIdx.x, iter);
+    }
+    //------------------------------------------------------------------
     // Write soft outputs if the caller requested
-    if(0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    {
+        ldpc_dec_soft_output(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    }
+}
+
+extern "C"
+__global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
+void ldpc2_BG2_reg_index_fp_desc_dyn_tb_no_accessories(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<2>::bg_desc_t bgdesc)
+{
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = false;
+    extern __shared__ char smem[];
+    // Shared memory is allocated dynamically
+
+    //------------------------------------------------------------------
+    // Kernel configuration template
+    typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
+                                                      cuphyLDPCDecodeConfigDesc_t,
+                                                      __half,
+                                                      ldpc2::llr_loader_variable_batch> kernel_config_t;
+
+    //------------------------------------------------------------------
+    // Load LLR data from global to shared memory
+    kernel_config_t::llr_loader_t::load_sync(smem, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
+    // Early-termination context (before per-iteration loop)
+    ldpc_et_context_t* et_ctx = ldpc2::get_et_ctx_ptr(smem,
+        shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + ldpc2::max_info_nodes<kernel_config_t::BG>::value,
+                              decodeDesc.config.Z,
+                              sizeof(__half)));
+    ldpc2::early_term_initialize_if_enabled<ENABLE_ACCESSORY_FEATURES, ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::cw_per_cta>(et_ctx, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
+    // Perform iterations
+    kernel_config_t::sched_t sched(decodeDesc.config,
+                                   bgdesc,
+                                   static_cast<int>(__cvta_generic_to_shared(smem)),
+                                   threadIdx.x);
+    int32_t iter = 0;
+    auto crc = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::failure;  // Assume fail initially
+    auto prev_packed_word = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::prev_init;
+    while(iter < decodeDesc.config.max_iterations)
+    {
+        sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            crc = ldpc2::should_terminate_early_crc<kernel_config_t::BG>(
+                decodeDesc,
+                blockIdx.x,
+                reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                et_ctx,
+                iter - 1,
+                prev_packed_word);
+            if(crc == 0) break;
+        }
+    }
+
+    //------------------------------------------------------------------
+    // Write hard output based on APP values
+    ldpc_dec_output_variable(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    // No loop needed for BG2 with Z>= 32
+    //ldpc_dec_output_variable_loop(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    //------------------------------------------------------------------
+    // Write CRC result if early termination enabled
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+    {
+        ldpc2::ldpc_dec_crc_output(decodeDesc, blockIdx.x, crc);
+    }
+    //------------------------------------------------------------------
+    // Write iteration count if requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+    {
+        ldpc2::ldpc_dec_iter_output<kernel_config_t::app_buf_t>(decodeDesc, blockIdx.x, iter);
+    }
+    //------------------------------------------------------------------
+    // Write soft outputs if the caller requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
     {
         ldpc_dec_soft_output(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     }
@@ -369,7 +601,7 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_fp32(LDPC_kernel_params params, app_loc_t<2
 {
     // Shared memory is allocated dynamically
     extern __shared__ char smem[];
-    
+
     //------------------------------------------------------------------
     // Kernel configuration template
     typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
@@ -412,6 +644,7 @@ extern "C"
 __global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
 void ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<1>::bg_desc_t bgdesc)
 {
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = true;
     // Shared memory is allocated dynamically
     extern __shared__ char smem[];
 
@@ -427,14 +660,38 @@ void ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32(cuphyLDPCDecodeDesc_t decodeDesc, a
     kernel_config_t::llr_loader_t::load_sync(smem, decodeDesc, blockIdx.x);
 
     //------------------------------------------------------------------
+    // Early-termination context (before per-iteration loop)
+    ldpc_et_context_t* et_ctx = ldpc2::get_et_ctx_ptr(smem,
+        shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + ldpc2::max_info_nodes<kernel_config_t::BG>::value,
+                              decodeDesc.config.Z,
+                              sizeof(kernel_config_t::app_buf_t)));
+    ldpc2::early_term_initialize_if_enabled<ENABLE_ACCESSORY_FEATURES, ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::cw_per_cta>(et_ctx, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
     // Perform iterations
     kernel_config_t::sched_t sched(decodeDesc.config,
                                    bgdesc,
                                    static_cast<int>(__cvta_generic_to_shared(smem)),
                                    threadIdx.x);
-    for(int iter = 0; iter < decodeDesc.config.max_iterations; ++iter)
+    int32_t iter = 0;
+    auto crc = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::failure;  // Assume fail initially
+    auto prev_packed_word = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::prev_init;
+    while(iter < decodeDesc.config.max_iterations)
     {
         sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            crc = ldpc2::should_terminate_early_crc<kernel_config_t::BG>(
+                decodeDesc,
+                blockIdx.x,
+                reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                et_ctx,
+                iter - 1,
+                prev_packed_word);
+            if(crc == 0) break;
+        }
     }
 
     //------------------------------------------------------------------
@@ -442,8 +699,98 @@ void ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32(cuphyLDPCDecodeDesc_t decodeDesc, a
     //ldpc_dec_output_variable(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     ldpc_dec_output_variable_loop(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     //------------------------------------------------------------------
+    // Write CRC result if early termination enabled
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+    {
+        ldpc2::ldpc_dec_crc_output(decodeDesc, blockIdx.x, crc);
+    }
+    //------------------------------------------------------------------
+    // Write iteration count if requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+    {
+        ldpc2::ldpc_dec_iter_output<kernel_config_t::app_buf_t>(decodeDesc, blockIdx.x, iter);
+    }
+    //------------------------------------------------------------------
     // Write soft outputs if the caller requested
-    if(0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    {
+        ldpc_dec_soft_output(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    }
+}
+
+extern "C"
+__global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
+void ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32_no_accessories(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<1>::bg_desc_t bgdesc)
+{
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = false;
+    // Shared memory is allocated dynamically
+    extern __shared__ char smem[];
+
+    //------------------------------------------------------------------
+    // Kernel configuration template
+    typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<1,
+                                                      cuphyLDPCDecodeConfigDesc_t,
+                                                      float,
+                                                      ldpc2::llr_loader_variable_batch_convert> kernel_config_t;
+
+    //------------------------------------------------------------------
+    // Load LLR data from global to shared memory
+    kernel_config_t::llr_loader_t::load_sync(smem, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
+    // Early-termination context (before per-iteration loop)
+    ldpc_et_context_t* et_ctx = ldpc2::get_et_ctx_ptr(smem,
+        shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + ldpc2::max_info_nodes<kernel_config_t::BG>::value,
+                              decodeDesc.config.Z,
+                              sizeof(kernel_config_t::app_buf_t)));
+    ldpc2::early_term_initialize_if_enabled<ENABLE_ACCESSORY_FEATURES, ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::cw_per_cta>(et_ctx, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
+    // Perform iterations
+    kernel_config_t::sched_t sched(decodeDesc.config,
+                                   bgdesc,
+                                   static_cast<int>(__cvta_generic_to_shared(smem)),
+                                   threadIdx.x);
+    int32_t iter = 0;
+    auto crc = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::failure;  // Assume fail initially
+    auto prev_packed_word = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::prev_init;
+    while(iter < decodeDesc.config.max_iterations)
+    {
+        sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            crc = ldpc2::should_terminate_early_crc<kernel_config_t::BG>(
+                decodeDesc,
+                blockIdx.x,
+                reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                et_ctx,
+                iter - 1,
+                prev_packed_word);
+            if(crc == 0) break;
+        }
+    }
+
+    //------------------------------------------------------------------
+    // Write hard output based on APP values
+    //ldpc_dec_output_variable(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    ldpc_dec_output_variable_loop(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    //------------------------------------------------------------------
+    // Write CRC result if early termination enabled
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+    {
+        ldpc2::ldpc_dec_crc_output(decodeDesc, blockIdx.x, crc);
+    }
+    //------------------------------------------------------------------
+    // Write iteration count if requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+    {
+        ldpc2::ldpc_dec_iter_output<kernel_config_t::app_buf_t>(decodeDesc, blockIdx.x, iter);
+    }
+    //------------------------------------------------------------------
+    // Write soft outputs if the caller requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
     {
         ldpc_dec_soft_output(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     }
@@ -456,9 +803,10 @@ extern "C"
 __global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
 void ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<2>::bg_desc_t bgdesc)
 {
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = true;
     // Shared memory is allocated dynamically
     extern __shared__ char smem[];
-    
+
     //------------------------------------------------------------------
     // Kernel configuration template
     typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
@@ -471,14 +819,38 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32(cuphyLDPCDecodeDesc_t decodeDesc, a
     kernel_config_t::llr_loader_t::load_sync(smem, decodeDesc, blockIdx.x);
 
     //------------------------------------------------------------------
+    // Early-termination context (before per-iteration loop)
+    ldpc_et_context_t* et_ctx = ldpc2::get_et_ctx_ptr(smem,
+        shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + ldpc2::max_info_nodes<kernel_config_t::BG>::value,
+                              decodeDesc.config.Z,
+                              sizeof(kernel_config_t::app_buf_t)));
+    ldpc2::early_term_initialize_if_enabled<ENABLE_ACCESSORY_FEATURES, ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::cw_per_cta>(et_ctx, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
     // Perform iterations
     kernel_config_t::sched_t sched(decodeDesc.config,
                                    bgdesc,
                                    static_cast<int>(__cvta_generic_to_shared(smem)),
                                    threadIdx.x);
-    for(int iter = 0; iter < decodeDesc.config.max_iterations; ++iter)
+    int32_t iter = 0;
+    auto crc = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::failure;  // Assume fail initially
+    auto prev_packed_word = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::prev_init;
+    while(iter < decodeDesc.config.max_iterations)
     {
         sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            crc = ldpc2::should_terminate_early_crc<kernel_config_t::BG>(
+                decodeDesc,
+                blockIdx.x,
+                reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                et_ctx,
+                iter - 1,
+                prev_packed_word);
+            if(crc == 0) break;
+        }
     }
 
     //------------------------------------------------------------------
@@ -487,8 +859,99 @@ void ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32(cuphyLDPCDecodeDesc_t decodeDesc, a
     // No loop needed for BG2 with Z>= 32
     //ldpc_dec_output_variable_loop(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     //------------------------------------------------------------------
+    // Write CRC result if early termination enabled
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+    {
+        ldpc2::ldpc_dec_crc_output(decodeDesc, blockIdx.x, crc);
+    }
+    //------------------------------------------------------------------
+    // Write iteration count if requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+    {
+        ldpc2::ldpc_dec_iter_output<kernel_config_t::app_buf_t>(decodeDesc, blockIdx.x, iter);
+    }
+    //------------------------------------------------------------------
     // Write soft outputs if the caller requested
-    if(0 != (decodeDesc.config.flags & CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
+    {
+        ldpc_dec_soft_output(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    }
+}
+
+extern "C"
+__global__ __launch_bounds__(MAX_THREADS_PER_CTA, MIN_CTA_PER_SM)
+void ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32_no_accessories(cuphyLDPCDecodeDesc_t decodeDesc, app_loc_t<2>::bg_desc_t bgdesc)
+{
+    [[maybe_unused]] constexpr bool ENABLE_ACCESSORY_FEATURES = false;
+    // Shared memory is allocated dynamically
+    extern __shared__ char smem[];
+
+    //------------------------------------------------------------------
+    // Kernel configuration template
+    typedef ldpc2_reg_index_fp_desc_dyn_kernel_config<2, // BG
+                                                      cuphyLDPCDecodeConfigDesc_t,
+                                                      float,
+                                                      ldpc2::llr_loader_variable_batch_convert> kernel_config_t;
+
+    //------------------------------------------------------------------
+    // Load LLR data from global to shared memory
+    kernel_config_t::llr_loader_t::load_sync(smem, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
+    // Early-termination context (before per-iteration loop)
+    ldpc_et_context_t* et_ctx = ldpc2::get_et_ctx_ptr(smem,
+        shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + ldpc2::max_info_nodes<kernel_config_t::BG>::value,
+                              decodeDesc.config.Z,
+                              sizeof(kernel_config_t::app_buf_t)));
+    ldpc2::early_term_initialize_if_enabled<ENABLE_ACCESSORY_FEATURES, ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::cw_per_cta>(et_ctx, decodeDesc, blockIdx.x);
+
+    //------------------------------------------------------------------
+    // Perform iterations
+    kernel_config_t::sched_t sched(decodeDesc.config,
+                                   bgdesc,
+                                   static_cast<int>(__cvta_generic_to_shared(smem)),
+                                   threadIdx.x);
+    int32_t iter = 0;
+    auto crc = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::failure;  // Assume fail initially
+    auto prev_packed_word = ldpc2::et_crc_traits<kernel_config_t::app_buf_t>::prev_init;
+    while(iter < decodeDesc.config.max_iterations)
+    {
+        sched.do_iteration();
+        ++iter;
+
+        if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+        {
+            crc = ldpc2::should_terminate_early_crc<kernel_config_t::BG>(
+                decodeDesc,
+                blockIdx.x,
+                reinterpret_cast<const kernel_config_t::app_buf_t*>(smem),
+                et_ctx,
+                iter - 1,
+                prev_packed_word);
+            if(crc == 0) break;
+        }
+    }
+
+    //------------------------------------------------------------------
+    // Write hard output based on APP values
+    ldpc_dec_output_variable(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    // No loop needed for BG2 with Z>= 32
+    //ldpc_dec_output_variable_loop(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
+    //------------------------------------------------------------------
+    // Write CRC result if early termination enabled
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_EARLY_TERM))
+    {
+        ldpc2::ldpc_dec_crc_output(decodeDesc, blockIdx.x, crc);
+    }
+    //------------------------------------------------------------------
+    // Write iteration count if requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_ITER_COUNT))
+    {
+        ldpc2::ldpc_dec_iter_output<kernel_config_t::app_buf_t>(decodeDesc, blockIdx.x, iter);
+    }
+    //------------------------------------------------------------------
+    // Write soft outputs if the caller requested
+    if(ldpc2::accessory_flag_enabled<ENABLE_ACCESSORY_FEATURES>(decodeDesc.config.flags, CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS))
     {
         ldpc_dec_soft_output(decodeDesc, reinterpret_cast<const kernel_config_t::app_buf_t*>(smem));
     }
@@ -519,13 +982,13 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode(ldpc::decoder&                     d
     LDPC_kernel_params params(config, tLLR, tDst, optSoftOutputs);
 
     cuphyStatus_t s = CUPHY_STATUS_NOT_SUPPORTED;
-    
+
     //------------------------------------------------------------------
     // Determine the dynamic amount of shared memory, which is the same
     // for both fp16 and fp32 (after conversion).
-    const uint32_t SHMEM_SIZE = shmem_llr_buffer_size(params.num_var_nodes, // num shared memory nodes
+    const uint32_t SHMEM_SIZE = shmem_size_with_et_context(shmem_llr_buffer_size(params.num_var_nodes, // num shared memory nodes
                                                       params.Z,             // lifting size
-                                                      sizeof(__half));      // element size
+                                                      sizeof(__half)));     // element size
     if(llrType == CUPHY_R_16F)
     {
         switch(config.BG)
@@ -536,9 +999,9 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode(ldpc::decoder&                     d
                 // Retrieve the base graph descriptor
                 const app_loc_t<1>::bg_desc_t* bgdesc = app_loc_t<1>::get_bg_desc(params.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG1_reg_index_fp_desc_dyn, blkDim, SHMEM_SIZE);
-                
+
                 //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
                 // Launch the kernel
                 ldpc2_BG1_reg_index_fp_desc_dyn<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(params, *bgdesc);
@@ -554,7 +1017,7 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode(ldpc::decoder&                     d
                 if(!bgdesc) break;
 
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG2_reg_index_fp_desc_dyn, blkDim, SHMEM_SIZE);
-                
+
                 //-  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
                 // Launch the kernel
                 ldpc2_BG2_reg_index_fp_desc_dyn<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(params, *bgdesc);
@@ -575,9 +1038,9 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode(ldpc::decoder&                     d
                 // Retrieve the base graph descriptor
                 const app_loc_t<1>::bg_desc_t* bgdesc = app_loc_t<1>::get_bg_desc(params.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG1_reg_index_fp_desc_dyn_fp32, blkDim, SHMEM_SIZE);
-                
+
                 //------------------------------------------------------------------
                 // Launch the kernel
                 ldpc2_BG1_reg_index_fp_desc_dyn_fp32<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(params, *bgdesc);
@@ -592,7 +1055,7 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode(ldpc::decoder&                     d
                 if(!bgdesc) break;
 
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG2_reg_index_fp_desc_dyn_fp32, blkDim, SHMEM_SIZE);
-                
+
                 //------------------------------------------------------------------
                 // Launch the kernel
                 ldpc2_BG2_reg_index_fp_desc_dyn_fp32<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(params, *bgdesc);
@@ -603,7 +1066,7 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode(ldpc::decoder&                     d
             break;
         }
     }
-    
+
     if(CUPHY_STATUS_SUCCESS != s)
     {
         return s;
@@ -623,7 +1086,7 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode_tb(ldpc::decoder&               dec,
                                                const cuphyLDPCDecodeDesc_t& decodeDesc,
                                                cudaStream_t                 strm)
 {
-    DEBUG_PRINTF("ldpc2::reg_index_fp_desc_dyn::decode_tb()\n");    
+    DEBUG_PRINTF("ldpc2::reg_index_fp_desc_dyn::decode_tb()\n");
     cuphyStatus_t s = CUPHY_STATUS_NOT_SUPPORTED;
     //------------------------------------------------------------------
     // Make sure that at least the first output pointer is non-NULL if
@@ -642,20 +1105,21 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode_tb(ldpc::decoder&               dec,
             {
                 //------------------------------------------------------------------
                 // Determine the dynamic amount of shared memory
-                const uint32_t SHMEM_SIZE = shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + max_info_nodes<1>::value, // num shared memory nodes
+                const uint32_t SHMEM_SIZE = shmem_size_with_et_context(shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + max_info_nodes<1>::value, // num shared memory nodes
                                                                   decodeDesc.config.Z,                                           // lifting size
-                                                                  sizeof(__half));                                               // element size
+                                                                  sizeof(__half)));                                              // element size
 
                 //------------------------------------------------------------------
                 // Retrieve the base graph descriptor
                 const app_loc_t<1>::bg_desc_t* bgdesc = app_loc_t<1>::get_bg_desc(decodeDesc.config.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG1_reg_index_fp_desc_dyn_tb, blkDim, SHMEM_SIZE);
 
                 //------------------------------------------------------------------
                 // Launch the kernel
-                ldpc2_BG1_reg_index_fp_desc_dyn_tb<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(decodeDesc, *bgdesc);
+                LDPC_LAUNCH_TB_KERNEL(ldpc2_BG1_reg_index_fp_desc_dyn_tb, decodeDesc.config.flags,
+                    grdDim, blkDim, SHMEM_SIZE, strm, decodeDesc, *bgdesc);
                 s = CUPHY_STATUS_SUCCESS;
             }
             break;
@@ -663,20 +1127,21 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode_tb(ldpc::decoder&               dec,
             {
                 //------------------------------------------------------------------
                 // Determine the dynamic amount of shared memory
-                const uint32_t SHMEM_SIZE = shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + max_info_nodes<2>::value, // num shared memory nodes
+                const uint32_t SHMEM_SIZE = shmem_size_with_et_context(shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + max_info_nodes<2>::value, // num shared memory nodes
                                                                   decodeDesc.config.Z,                                           // lifting size
-                                                                  sizeof(__half));                                               // element size
+                                                                  sizeof(__half)));                                              // element size
 
                 //------------------------------------------------------------------
                 // Retrieve the base graph descriptor
                 const app_loc_t<2>::bg_desc_t* bgdesc = app_loc_t<2>::get_bg_desc(decodeDesc.config.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG2_reg_index_fp_desc_dyn_tb, blkDim, SHMEM_SIZE);
-                
+
                 //------------------------------------------------------------------
                 // Launch the kernel
-                ldpc2_BG2_reg_index_fp_desc_dyn_tb<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(decodeDesc, *bgdesc);
+                LDPC_LAUNCH_TB_KERNEL(ldpc2_BG2_reg_index_fp_desc_dyn_tb, decodeDesc.config.flags,
+                    grdDim, blkDim, SHMEM_SIZE, strm, decodeDesc, *bgdesc);
                 s = CUPHY_STATUS_SUCCESS;
             }
             break;
@@ -692,20 +1157,20 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode_tb(ldpc::decoder&               dec,
             {
                 //------------------------------------------------------------------
                 // Determine the dynamic amount of shared memory
-                const uint32_t SHMEM_SIZE = shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + max_info_nodes<1>::value, // num shared memory nodes
+                const uint32_t SHMEM_SIZE = shmem_size_with_et_context(shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + max_info_nodes<1>::value, // num shared memory nodes
                                                                   decodeDesc.config.Z,                                           // lifting size
-                                                                  sizeof(__half));                                               // element size
+                                                                  sizeof(__half)));                                              // element size
 
                 //------------------------------------------------------------------
                 // Retrieve the base graph descriptor
                 const app_loc_t<1>::bg_desc_t* bgdesc = app_loc_t<1>::get_bg_desc(decodeDesc.config.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32, blkDim, SHMEM_SIZE);
 
                 //------------------------------------------------------------------
                 // Launch the kernel
-                ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(decodeDesc, *bgdesc);
+                LDPC_LAUNCH_TB_KERNEL(ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32, decodeDesc.config.flags, grdDim, blkDim, SHMEM_SIZE, strm, decodeDesc, *bgdesc);
                 s = CUPHY_STATUS_SUCCESS;
             }
             break;
@@ -713,20 +1178,20 @@ cuphyStatus_t reg_index_fp_desc_dyn::decode_tb(ldpc::decoder&               dec,
             {
                 //------------------------------------------------------------------
                 // Determine the dynamic amount of shared memory
-                const uint32_t SHMEM_SIZE = shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + max_info_nodes<2>::value, // num shared memory nodes
+                const uint32_t SHMEM_SIZE = shmem_size_with_et_context(shmem_llr_buffer_size(decodeDesc.config.num_parity_nodes + max_info_nodes<2>::value, // num shared memory nodes
                                                                   decodeDesc.config.Z,                                           // lifting size
-                                                                  sizeof(__half));                                               // element size
+                                                                  sizeof(__half)));                                              // element size
 
                 //------------------------------------------------------------------
                 // Retrieve the base graph descriptor
                 const app_loc_t<2>::bg_desc_t* bgdesc = app_loc_t<2>::get_bg_desc(decodeDesc.config.Z);
                 if(!bgdesc) break;
-                
+
                 DEBUG_PRINT_FUNC_MAX_BLOCKS(ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32, blkDim, SHMEM_SIZE);
-                
+
                 //------------------------------------------------------------------
                 // Launch the kernel
-                ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32<<<grdDim, blkDim, SHMEM_SIZE, strm>>>(decodeDesc, *bgdesc);
+                LDPC_LAUNCH_TB_KERNEL(ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32, decodeDesc.config.flags, grdDim, blkDim, SHMEM_SIZE, strm, decodeDesc, *bgdesc);
                 s = CUPHY_STATUS_SUCCESS;
             }
             break;
@@ -765,22 +1230,28 @@ reg_index_fp_desc_dyn::reg_index_fp_desc_dyn(ldpc::decoder& desc)
     //------------------------------------------------------------------
     // Determine the maximum amount of shared memory that could be used
     // by a kernel
-    const int MAX_BG1_SHMEM_SIZE = static_cast<int>(shmem_llr_buffer_size(MAX_VAR_NODES_BG1,           // num shared memory nodes
+    const int MAX_BG1_SHMEM_SIZE = static_cast<int>(shmem_size_with_et_context(shmem_llr_buffer_size(MAX_VAR_NODES_BG1,           // num shared memory nodes
                                                                           CUPHY_LDPC_MAX_LIFTING_SIZE, // lifting size
-                                                                          sizeof(__half)));            // element size
-    const int MAX_BG2_SHMEM_SIZE = static_cast<int>(shmem_llr_buffer_size(MAX_VAR_NODES_BG2,           // num shared memory nodes
+                                                                          sizeof(__half))));           // element size
+    const int MAX_BG2_SHMEM_SIZE = static_cast<int>(shmem_size_with_et_context(shmem_llr_buffer_size(MAX_VAR_NODES_BG2,           // num shared memory nodes
                                                                           CUPHY_LDPC_MAX_LIFTING_SIZE, // lifting size
-                                                                          sizeof(__half)));            // element size
+                                                                          sizeof(__half))));           // element size
 
     //------------------------------------------------------------------
     // For each kernel, set the maximum dynamic shared memory size
     typedef std::pair<const void*, int> func_attr_t;
-    std::array<func_attr_t, 4> func_attrs =
+    std::array<func_attr_t, 10> func_attrs =
     {
         func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn,    MAX_BG1_SHMEM_SIZE),
         func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn,    MAX_BG2_SHMEM_SIZE),
         func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_tb, MAX_BG1_SHMEM_SIZE),
-        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_tb, MAX_BG2_SHMEM_SIZE)
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_tb_no_accessories, MAX_BG1_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_tb, MAX_BG2_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_tb_no_accessories, MAX_BG2_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32, MAX_BG1_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32_no_accessories, MAX_BG1_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32, MAX_BG2_SHMEM_SIZE),
+        func_attr_t((const void*)ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32_no_accessories, MAX_BG2_SHMEM_SIZE)
     };
     for(func_attr_t f_a : func_attrs)
     {
@@ -807,6 +1278,7 @@ cuphyStatus_t reg_index_fp_desc_dyn::get_launch_config(const ldpc::decoder&     
     const int Z                = launchConfig.decode_desc.config.Z;
     const int BG               = launchConfig.decode_desc.config.BG;
     const int NUM_PARITY_NODES = launchConfig.decode_desc.config.num_parity_nodes;
+    const cuphyDataType_t LLR_TYPE = launchConfig.decode_desc.config.llr_type;
     const int MAX_PARITY_NODES = (1 == BG)                  ?
                                  max_parity_nodes<1>::value :
                                  max_parity_nodes<2>::value;
@@ -817,7 +1289,8 @@ cuphyStatus_t reg_index_fp_desc_dyn::get_launch_config(const ldpc::decoder&     
     if((Z < 2)                              ||
        (Z > CUPHY_LDPC_MAX_LIFTING_SIZE)    ||
        (NUM_PARITY_NODES < 4)               ||
-       (NUM_PARITY_NODES > MAX_PARITY_NODES))
+       (NUM_PARITY_NODES > MAX_PARITY_NODES) ||
+       ((LLR_TYPE != CUPHY_R_16F) && (LLR_TYPE != CUPHY_R_32F)))
     {
         return CUPHY_STATUS_UNSUPPORTED_CONFIG;
     }
@@ -835,15 +1308,28 @@ cuphyStatus_t reg_index_fp_desc_dyn::get_launch_config(const ldpc::decoder&     
 
     launchConfig.kernel_node_params_driver.extra          = nullptr;
     launchConfig.kernel_node_params_driver.kernelParams   = launchConfig.kernel_args;
-    launchConfig.kernel_node_params_driver.sharedMemBytes = shmem_llr_buffer_size(NUM_VAR_NODES,   // num shared memory nodes
+    launchConfig.kernel_node_params_driver.sharedMemBytes = shmem_size_with_et_context(shmem_llr_buffer_size(NUM_VAR_NODES,   // num shared memory nodes
                                                                                   Z,               // lifting size
-                                                                                  sizeof(__half)); // element size
+                                                                                  sizeof(__half))); // element size
 
     cudaFunction_t deviceFunction;
+    launchConfig.kernel_node_params_driver.sharedMemBytes =
+        shmem_size_for_selected_kernel(
+            launchConfig.kernel_node_params_driver.sharedMemBytes,
+            launchConfig.decode_desc.config.flags);
     MemtraceDisableScope md;
-    cudaError_t    e = (BG == 1) ?  cudaGetFuncBySymbol(&deviceFunction, (void*)ldpc2_BG1_reg_index_fp_desc_dyn_tb): 
-                                    cudaGetFuncBySymbol(&deviceFunction, (void*)ldpc2_BG2_reg_index_fp_desc_dyn_tb);
-    if (e != cudaSuccess) 
+    cudaError_t e;
+    if(LLR_TYPE == CUPHY_R_16F)
+    {
+        e = (BG == 1) ? LDPC_GET_TB_KERNEL_FUNCTION(deviceFunction, ldpc2_BG1_reg_index_fp_desc_dyn_tb, launchConfig.decode_desc.config.flags) :
+                        LDPC_GET_TB_KERNEL_FUNCTION(deviceFunction, ldpc2_BG2_reg_index_fp_desc_dyn_tb, launchConfig.decode_desc.config.flags);
+    }
+    else
+    {
+        e = (BG == 1) ? LDPC_GET_TB_KERNEL_FUNCTION(deviceFunction, ldpc2_BG1_reg_index_fp_desc_dyn_tb_fp32, launchConfig.decode_desc.config.flags) :
+                        LDPC_GET_TB_KERNEL_FUNCTION(deviceFunction, ldpc2_BG2_reg_index_fp_desc_dyn_tb_fp32, launchConfig.decode_desc.config.flags);
+    }
+    if(e != cudaSuccess)
     {
         return CUPHY_STATUS_INTERNAL_ERROR;
     }

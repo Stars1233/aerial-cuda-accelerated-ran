@@ -28,6 +28,7 @@
 # Options:
 #   DRYRUN=1          - Show commands without executing
 #   VERBOSE=1         - Print commands before executing
+#   ASSUME_YES=1      - Accept installer confirmations for non-interactive use
 #   ISOLCPUS=LIST     - CPU list for kernel isolation (e.g. 4, 4-15, 2,4,5,7,8). Default: 4-19
 #
 # Example:
@@ -37,6 +38,7 @@
 
 SHELL := /bin/bash
 SCRIPT_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+VERSIONS_SH := $(abspath $(SCRIPT_DIR)../../cuPHY-CP/container/versions.sh)
 # Current-arch build dir (aarch64 -> arm64 to match versions.sh)
 ARCH := $(shell uname -m)
 BUILD_ARCH := $(if $(filter aarch64,$(ARCH)),arm64,$(ARCH))
@@ -50,6 +52,7 @@ STAMP_KERNEL  := $(STAMP_DIR)/kernel
 STAMP_DRIVERS := $(STAMP_DIR)/drivers
 STAMP_NIC_FW  := $(STAMP_DIR)/nic_fw
 STAMP_SERVICES := $(STAMP_DIR)/services
+stamp_target = @if [[ "$(DRYRUN)" == "1" ]]; then echo "[DRY-RUN] Not writing stamp $@"; else touch $@; fi
 
 # Pass through options to scripts
 OPTS :=
@@ -62,6 +65,15 @@ endif
 
 # Environment variables to pass through
 ENV_VARS :=
+ifdef ASSUME_YES
+	ENV_VARS += ASSUME_YES=$(ASSUME_YES)
+endif
+ifdef PTP_INTERFACE
+	ENV_VARS += PTP_INTERFACE=$(PTP_INTERFACE)
+endif
+ifdef PTP_ROLE
+	ENV_VARS += PTP_ROLE=$(PTP_ROLE)
+endif
 ifdef RU_MAC
 	ENV_VARS += RU_MAC=$(RU_MAC)
 endif
@@ -77,6 +89,9 @@ endif
 ifdef AERIAL_BUILD_FLAGS
 	ENV_VARS += AERIAL_BUILD_FLAGS="$(AERIAL_BUILD_FLAGS)"
 endif
+ifdef PTP_CPU_AFFINITY
+	ENV_VARS += PTP_CPU_AFFINITY=$(PTP_CPU_AFFINITY)
+endif
 
 .PHONY: prepare all install build build_aerial build_oai net kernel drivers nic_fw services check help clean start_gnb start_cn start_all
 
@@ -86,9 +101,7 @@ $(STAMP_DIR):
 prepare: kernel
 	@echo ""
 	@echo "============================================"
-	@echo "Prepare complete! Please reboot, and after startup:"
-	@echo "To only install drivers, run: make install"
-	@echo "To also build and start the gNB and CN5G, run: make all"
+	@echo "Prepare complete! Please reboot"
 	@echo "============================================"
 	@echo ""
 
@@ -103,32 +116,40 @@ install: services
 
 # net: runs after drivers (requires OFED/mlx5 to be installed for aerial0x interfaces)
 net: $(STAMP_NET)
-$(STAMP_NET): $(SCRIPT_DIR)setup_net_ifs.sh $(SCRIPT_DIR)versions.sh $(STAMP_DRIVERS) | $(STAMP_DIR)
+$(STAMP_NET): $(SCRIPT_DIR)setup_net_ifs.sh $(VERSIONS_SH) $(STAMP_DRIVERS) | $(STAMP_DIR)
 	@echo "========================================"
 	@echo "Setting up network interfaces"
 	@echo "========================================"
-	$(SCRIPT_DIR)/setup_net_ifs.sh $(OPTS)
-	@touch $@
+	$(ENV_VARS) $(SCRIPT_DIR)/setup_net_ifs.sh $(OPTS)
+	$(stamp_target)
 
 # kernel: re-runs if install_aerial_kernel.sh or versions.sh changes
 kernel: $(STAMP_KERNEL)
-$(STAMP_KERNEL): $(SCRIPT_DIR)install_aerial_kernel.sh $(SCRIPT_DIR)versions.sh | $(STAMP_DIR)
+$(STAMP_KERNEL): $(SCRIPT_DIR)install_aerial_kernel.sh $(VERSIONS_SH) | $(STAMP_DIR)
 	@echo "========================================"
 	@echo "Installing Aerial CUDA kernel"
 	@echo "========================================"
 	$(if $(ISOLCPUS),$(info Using ISOLCPUS=$(ISOLCPUS)))
-	$(SCRIPT_DIR)/install_aerial_kernel.sh $(OPTS) $(if $(ISOLCPUS),--isolcpus $(ISOLCPUS))
-	@touch $@
-	@echo "NOTE: If kernel was updated, reboot and re-run:"
-	@echo "  make all"
+	$(ENV_VARS) $(SCRIPT_DIR)/install_aerial_kernel.sh $(OPTS) $(if $(ISOLCPUS),--isolcpus $(ISOLCPUS))
+	$(stamp_target)
+	@echo "If kernel was updated, reboot"
 	@echo ""
 
-# drivers: re-runs if install_drivers.sh or versions.sh changes; kernel must be stamped first
+# drivers: re-runs if a driver input changes; kernel must be stamped first
 drivers: $(STAMP_DRIVERS)
-$(STAMP_DRIVERS): $(SCRIPT_DIR)install_drivers.sh $(SCRIPT_DIR)versions.sh $(STAMP_KERNEL) | $(STAMP_DIR)
+$(STAMP_DRIVERS): $(SCRIPT_DIR)install_drivers.sh $(SCRIPT_DIR)install_nic_fw.sh $(SCRIPT_DIR)nvidia.sh $(SCRIPT_DIR)includes.sh $(SCRIPT_DIR)../infra/rcu_affinity_manager.sh $(VERSIONS_SH) $(STAMP_KERNEL) | $(STAMP_DIR)
 	@echo "========================================"
 	@echo "Installing drivers"
 	@echo "========================================"
+	@if [[ "$(DRYRUN)" == "1" ]]; then \
+		echo "[DRY-RUN] Would verify that the required kernel is running"; \
+	else \
+		$(ENV_VARS) $(SCRIPT_DIR)/install_aerial_kernel.sh --check || { \
+			echo "ERROR: The required kernel is installed but is not running."; \
+			echo "Run 'sudo reboot', then re-run 'make install'."; \
+			exit 1; \
+		}; \
+	fi
 	@echo ""
 	@echo "IMPORTANT: Have you configured the following?"
 	@echo "  - PTP settings"
@@ -137,31 +158,34 @@ $(STAMP_DRIVERS): $(SCRIPT_DIR)install_drivers.sh $(SCRIPT_DIR)versions.sh $(STA
 	@echo "  - Docker login if necessary"
 	@echo "Without these the gNB will not deploy properly."
 	@echo ""
-	@read -p "Continue with driver installation? (Y/n): " confirm && \
-	[[ -z $$confirm || $$confirm == [yY] || $$confirm == [yY][eE][sS] ]] || { echo "Installation cancelled."; exit 1; }
+	@if [[ "$(ASSUME_YES)" != "1" ]]; then \
+		read -p "Continue with driver installation? (Y/n): " confirm && \
+		[[ -z $$confirm || $$confirm == [yY] || $$confirm == [yY][eE][sS] ]] || { echo "Installation cancelled."; exit 1; }; \
+	fi
 	@echo ""
-	$(SCRIPT_DIR)/install_aerial_kernel.sh --remove-other-kernels $(OPTS)
-	$(SCRIPT_DIR)/install_drivers.sh $(OPTS)
-	@touch $@
+	$(ENV_VARS) $(SCRIPT_DIR)/install_aerial_kernel.sh --check $(OPTS)
+	$(ENV_VARS) $(SCRIPT_DIR)/install_aerial_kernel.sh --remove-other-kernels $(OPTS)
+	$(ENV_VARS) $(SCRIPT_DIR)/install_drivers.sh $(OPTS)
+	$(stamp_target)
 
-# nic_fw: verifies and configures NIC firmware; installs the BlueField3 BFB on GH200 when the firmware version differs from the expected version
-# Depends on drivers since flint, mlxconfig, and bfb-install require DOCA/OFED to be present
+# nic_fw: installs BlueField3 BFB firmware or verifies the platform NIC target
+# Depends on drivers since bfb-install requires DOCA/OFED to be present
 nic_fw: $(STAMP_NIC_FW)
-$(STAMP_NIC_FW): $(SCRIPT_DIR)install_nic_fw.sh $(SCRIPT_DIR)versions.sh $(STAMP_DRIVERS) | $(STAMP_DIR)
+$(STAMP_NIC_FW): $(SCRIPT_DIR)install_nic_fw.sh $(VERSIONS_SH) $(STAMP_DRIVERS) | $(STAMP_DIR)
 	@echo "========================================"
-	@echo "Verifying and configuring NIC firmware"
+	@echo "Installing platform NIC firmware"
 	@echo "========================================"
-	$(SCRIPT_DIR)/install_nic_fw.sh $(OPTS)
-	@touch $@
+	$(ENV_VARS) $(SCRIPT_DIR)/install_nic_fw.sh $(OPTS)
+	$(stamp_target)
 
-# services: runs after both net (needs aerial0x) and nic_fw (needs NIC firmware/configuration)
+# services: runs after both net (needs aerial0x) and nic_fw (needs BF3 FW)
 services: $(STAMP_SERVICES)
-$(STAMP_SERVICES): $(SCRIPT_DIR)install_services.sh $(SCRIPT_DIR)versions.sh $(STAMP_NET) $(STAMP_NIC_FW) | $(STAMP_DIR)
+$(STAMP_SERVICES): $(SCRIPT_DIR)install_services.sh $(SCRIPT_DIR)nvidia.sh $(VERSIONS_SH) $(STAMP_NET) $(STAMP_NIC_FW) | $(STAMP_DIR)
 	@echo "========================================"
 	@echo "Installing services"
 	@echo "========================================"
-	$(SCRIPT_DIR)/install_services.sh $(OPTS)
-	@touch $@
+	$(ENV_VARS) $(SCRIPT_DIR)/install_services.sh $(OPTS)
+	$(stamp_target)
 
 build: build_aerial build_oai
 
@@ -213,10 +237,17 @@ check:
 	@echo "========================================"
 	@echo ""
 	@echo "--- Kernel ---"
-	$(SCRIPT_DIR)/install_aerial_kernel.sh --check $(OPTS) || true
+	$(ENV_VARS) $(SCRIPT_DIR)/install_aerial_kernel.sh --check $(OPTS)
+	@echo ""
+	@echo "--- Drivers and network ---"
+	$(ENV_VARS) $(SCRIPT_DIR)/install_drivers.sh --status $(OPTS)
+	@echo ""
+	@echo "--- NIC firmware ---"
+	$(ENV_VARS) $(SCRIPT_DIR)/install_nic_fw.sh --check $(OPTS)
 	@echo ""
 	@echo "--- Services ---"
-	$(SCRIPT_DIR)/install_services.sh --check-sync --status $(OPTS) || true
+	$(ENV_VARS) $(SCRIPT_DIR)/install_services.sh --status $(OPTS)
+	$(ENV_VARS) $(SCRIPT_DIR)/install_services.sh --check-sync $(OPTS)
 
 help:
 	@echo "NVIDIA Aerial SDK Installation"
@@ -228,7 +259,7 @@ help:
 	@echo "  kernel    - Install Aerial CUDA kernel"
 	@echo "  drivers   - Install DOCA, OFED, and GPU drivers"
 	@echo "  net       - Setup aerial0x network interfaces (requires OFED)"
-	@echo "  nic_fw    - Verify/configure NIC firmware; install the GH200 BFB on firmware version mismatch"
+	@echo "  nic_fw    - Install/verify the platform NIC firmware target"
 	@echo "  services  - Install PTP and system services"
 	@echo "  check     - Check installation status"
 	@echo "  build     - Build Aerial SDK and OAI"
@@ -243,17 +274,21 @@ help:
 	@echo "Options (pass as make variables):"
 	@echo "  DRYRUN=1              - Show commands without executing"
 	@echo "  VERBOSE=1             - Print commands before executing"
+	@echo "  ASSUME_YES=1          - Accept confirmations for non-interactive use"
 	@echo "  ISOLCPUS=LIST         - CPU list for isolation (e.g. 4, 4-15, 2,4,5,7,8); default 4-19"
+	@echo "  PTP_INTERFACE=name    - Use one PTP interface instead of traffic detection"
+	@echo "  PTP_ROLE=client|master - PTP role; default client (external grandmaster/LLS-C3)"
 	@echo "  RU_MAC=aa:bb:cc:dd:ee:ff - Set RU MAC address for gNB"
 	@echo "  PROFILE=name          - Aerial build profile file (oai.conf, fapi_10_02.conf, fapi_10_04.conf; see cmake-profiles/)"
-	@echo "  BUILD_PRESET=preset   - Override preset (perf, 10_02, 10_04, 10_04_32dl)"
+	@echo "  BUILD_PRESET=preset   - Override preset (perf, 10_02, 10_04, 10_04_TM, 10_04_low_memory)"
 	@echo "  BUILD_CMAKE_FLAGS=... - Additional CMake flags not defined in cmake-profiles/"
 	@echo "  AERIAL_BUILD_FLAGS=... - Override build_aerial_sdk.sh args before -- (from versions.sh)"
+	@echo "  PTP_CPU_AFFINITY=CPU - Pin PTP services to a CPU or CPU list"
 	@echo ""
 	@echo "Logging: install steps log to /var/log/aerial-installer.log (override with LOGFILE=); build steps to build-<target>.log."
 	@echo ""
 	@echo "Stamp files (.stamps/): each install step creates a stamp so make skips it if already done."
-	@echo "  Stamps are invalidated automatically when versions.sh or the install script changes."
+	@echo "  Stamps are invalidated automatically when cuPHY-CP/container/versions.sh or the install script changes."
 	@echo "  To force a step to re-run: rm .stamps/<target>   (e.g. rm .stamps/drivers)"
 	@echo "  To force everything to re-run: make clean"
 	@echo ""

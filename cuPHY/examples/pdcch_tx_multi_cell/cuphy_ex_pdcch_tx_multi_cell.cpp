@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,6 +47,8 @@ void usage()
     printf("    -m  proc_mode               Processing mode: streams(0), graphs (1)\n");
     printf("    -g                          Execute all cells in a slot on the same PDCCH object with batching too.\n");
     printf("    -s  setup_mode              0 (default) - setup is not timed; 1 - time setup only; no run is run; 2 - time both setup and run, back to back.\n");
+    printf("    -F  GPU kernel sel          Selection GPU kernels for the PDCCH pipline.\n");
+    printf("    -X  GPU delay duration      Set the delay duration in us for the PDCCH pipline (default: 0).\n");
     printf("    --G SM count                Use green contexts with specified SM count per context.\n");
 }
 
@@ -74,7 +76,8 @@ int main(int argc, char* argv[])
     std::string setup_modes[3]   = {"GPU-run only", "GPU-setup only", "GPU-setup-and-run"};
     bool     useGreenCtxs        = false;
     uint32_t SMsPerGreenCtx      = 0;
-
+    uint8_t  kernelSelMode       = PDCCH_ALL;
+    uint32_t delayUsInPipeline = 0;
 
     while(iArg < argc)
     {
@@ -123,6 +126,22 @@ int main(int argc, char* argv[])
                 if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%i", &time_setup_mode)) || ((time_setup_mode < 0)) || ((time_setup_mode > 2)))
                 {
                     NVLOGF_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid process mode");
+                }
+                ++iArg;
+                break;
+            case 'F':
+                if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%hhu", &kernelSelMode)) || (kernelSelMode >= PDCCH_MAX_KERNEL_SEL_MODES))
+                {
+                    NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT,  "ERROR: unsupported GPU kernel selection mode");
+                    exit(1);
+                }
+                ++iArg;
+                break;
+            case 'X':
+                if((++iArg >= argc) || (1 != sscanf(argv[iArg], "%u", &delayUsInPipeline)) || delayUsInPipeline > 5000)
+                {
+                    NVLOGE_FMT(NVLOG_PDCCH, AERIAL_CUPHY_EVENT,  "ERROR: too large delay duration");
+                    exit(1);
                 }
                 ++iArg;
                 break;
@@ -247,6 +266,8 @@ int main(int argc, char* argv[])
             if (group_cells) {
                 if (i == 0) {
                     m_pdcchTxStaticApiDataSets[idxSlot].emplace_back(num_cells);
+                    m_pdcchTxStaticApiDataSets[idxSlot][i].pdcchStatPrms.kernelSelOption = kernelSelMode;
+                    m_pdcchTxStaticApiDataSets[idxSlot][i].pdcchStatPrms.delayUs = delayUsInPipeline;
                     m_pdcchTxDynamicApiDataSets[idxSlot].emplace_back(tv_filename, m_pdcchTxStaticApiDataSets[idxSlot][i].pdcchStatPrms.nMaxCellsPerSlot, streams[i].handle(), procModeBmsk);
                     m_pdcchTxPipes[idxSlot].emplace_back(m_pdcchTxStaticApiDataSets[idxSlot][i].pdcchStatPrms);
                 } else {
@@ -256,6 +277,8 @@ int main(int argc, char* argv[])
                 }
             } else {
                 m_pdcchTxStaticApiDataSets[idxSlot].emplace_back();
+                m_pdcchTxStaticApiDataSets[idxSlot][i].pdcchStatPrms.kernelSelOption = kernelSelMode;
+                m_pdcchTxStaticApiDataSets[idxSlot][i].pdcchStatPrms.delayUs = delayUsInPipeline;
                 m_pdcchTxDynamicApiDataSets[idxSlot].emplace_back(tv_filename, m_pdcchTxStaticApiDataSets[idxSlot][i].pdcchStatPrms.nMaxCellsPerSlot, streams[i].handle(), procModeBmsk);
                 m_pdcchTxPipes[idxSlot].emplace_back(m_pdcchTxStaticApiDataSets[idxSlot][i].pdcchStatPrms);
             }

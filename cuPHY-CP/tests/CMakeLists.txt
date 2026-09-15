@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,10 @@ target_compile_definitions(test_cuphycp PRIVATE CONFIG_CUBB_ROOT_DIR_RELATIVE_NU
 target_include_directories(test_cuphycp PRIVATE . ../testMAC/testMAC ../scfl2adapter/lib/scf_5g_fapi)
 find_package(GTest REQUIRED)
 find_package(benchmark REQUIRED)
-target_link_libraries(test_cuphycp scf_5g_fapi nvlog_static nvipc nvphy cuphy_cpp_header_only cuphy_hdf5
+target_link_libraries(test_cuphycp
+        # scf_5g_fapi and nvphy have circular static-archive refs; rescan resolves both.
+        "$<LINK_GROUP:RESCAN,scf_5g_fapi,nvphy>"
+        nvlog_static nvipc cuphy_cpp_header_only cuphy_hdf5
         yaml GTest::gmock GTest::gtest benchmark::benchmark aerial_sdk_version)
 
 if (AERIAL_METRICS)
@@ -40,3 +43,7 @@ message(STATUS "tests includes order kernel test bench")
 add_subdirectory(order_kernel_test_bench)
 message(STATUS "tests includes DL C test bench")
 add_subdirectory(dlc_test_bench)
+message(STATUS "tests includes C-Plane test bench")
+add_subdirectory(cplane_test_bench)
+message(STATUS "tests includes parser equivalence tests")
+add_subdirectory(parser_equivalence)

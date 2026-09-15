@@ -19,6 +19,13 @@ $ hpccm --recipe aerial_base_recipe.py --format docker
 """
 
 import os
+from typing import Optional
+
+def required_env(name: str) -> str:
+    value: Optional[str] = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Environment variable {name} must be set")
+    return value
 
 if cpu_target == 'x86_64':
     TARGETARCH='amd64'
@@ -28,6 +35,17 @@ else:
     raise RuntimeError("Unsupported platform")
 
 AERIAL_GPU_TYPE = USERARG.get('AERIAL_GPU_TYPE')
+DPDK_TAG = USERARG.get('DPDK_TAG', '')
+CONTAINER_CUDA_IMAGE = required_env("CONTAINER_CUDA_IMAGE")
+CONTAINER_UBUNTU_DISTRO = required_env("CONTAINER_UBUNTU_DISTRO")
+CONTAINER_GDRCOPY_VERSION = required_env("CONTAINER_GDRCOPY_VERSION")
+DOCA_VERSION = required_env("DOCA_VERSION")
+DOCA_BUILD = required_env("DOCA_BUILD")
+CONTAINER_DOCA_UBUNTU_VERSION = required_env("CONTAINER_DOCA_UBUNTU_VERSION")
+MATHDX_VERSION = required_env("MATHDX_VERSION")
+MATHDX_CUDA_VERSION = required_env("MATHDX_CUDA_VERSION")
+DOCA_HOST_ID = f"{DOCA_VERSION}-{DOCA_BUILD}-{CONTAINER_DOCA_UBUNTU_VERSION}"
+MATHDX_ARCHIVE = f"nvidia-mathdx-{MATHDX_VERSION}-{MATHDX_CUDA_VERSION}.tar.gz"
 
 stages.extend([hpccm.Stage()])
 Bootstrap = stages[0]
@@ -35,7 +53,7 @@ Externals = stages[1]
 Base      = stages[2]
 
 
-Bootstrap += baseimage(image='nvcr.io/nvidia/cuda:13.1.1-devel-ubuntu22.04', _arch=cpu_target, _distro='ubuntu22', _as='bootstrap')
+Bootstrap += baseimage(image=CONTAINER_CUDA_IMAGE, _arch=cpu_target, _distro=CONTAINER_UBUNTU_DISTRO, _as='bootstrap')
 
 if cpu_target == 'aarch64':
     Bootstrap += environment(variables={
@@ -48,20 +66,102 @@ Bootstrap += shell(commands=[
     'echo \'Acquire::Retries "3";\' > /etc/apt/apt.conf.d/80-retries'
     ])
 
+# Pin CUDA nvcc to a specific version from the base image's CUDA repo so it
+# doesn't drift on apt-get upgrade. 13.3.33-1 is available in the
+# developer.download.nvidia.com repo the base image already configures.
+_CUDA_NVCC_VERSION = '13.3.33-1'
+
+# CUDA's rolling APT repository can publish new package versions after a
+# versioned CUDA base image is released. Hold every installed CUDA component
+# before the general OS upgrade, rather than only cuda-nvcc, so a rebuild keeps
+# the complete toolkit and compatibility-library set from the base image.
+#
+# These are dpkg-query patterns, quoted below so the shell does not expand them.
+# Keep the set limited to CUDA/NVIDIA toolkit components: do not accidentally
+# hold unrelated Ubuntu packages such as libcurl.
+_CUDA_APT_PACKAGE_PATTERNS = (
+    'cccl-*',
+    'cuda',
+    'cuda-*',
+    'gds-tools-*',
+    'libcublas-*',
+    'libcudla-*',
+    'libcufft-*',
+    'libcufile-*',
+    'libcuobjclient-*',
+    'libcurand-*',
+    'libcusolver-*',
+    'libcusparse-*',
+    'libnpp-*',
+    'libnvfatbin-*',
+    'libnvjitlink-*',
+    'libnvjpeg-*',
+    'libnvptxcompiler-*',
+    'libnvvm-*',
+    # Nsight Systems is installed explicitly in aerial_build_devel_recipe.py.
+    # Hold only the CUDA base image's Nsight Compute packages here.
+    'nsight-compute*',
+    'nvidia-gds*',
+)
+_CUDA_APT_PACKAGE_QUERY = ' '.join(
+    f"'{pattern}'" for pattern in _CUDA_APT_PACKAGE_PATTERNS
+)
+# Ubuntu 24.04 ships an 'ubuntu' user at uid/gid 1000; move it out of the
+# way before we create the 'aerial' user at the same uid/gid.
 Bootstrap += shell(commands=[
-    'apt-get update -y', 'apt-get upgrade -y',
+    'groupmod -g 1001 ubuntu',
+    'usermod -u 1001 ubuntu',
+    ])
+Bootstrap += shell(commands=[
+    'apt-get update -y',
+    f'apt-get install -y --allow-downgrades cuda-nvcc-13-3={_CUDA_NVCC_VERSION}',
+    (
+        # dpkg retains records for removed packages; only installed packages
+        # can be passed to apt-mark hold.
+        "{ dpkg-query -W -f='${binary:Package} ${db:Status-Status}\\n' "
+        f'{_CUDA_APT_PACKAGE_QUERY} 2>/dev/null || true; }} '
+        "| awk '$2 == \"installed\" { print $1 }' "
+        '| xargs --no-run-if-empty apt-mark hold'
+    ),
+    'apt-get upgrade -y',
     'rm -rf /var/lib/apt/lists/*',
     ])
 
 Bootstrap += packages(ospackages=[
     'curl',
     'doxygen',
+    'gcc-13',
+    'g++-13',
     'git',
     'graphviz',
     'hdf5-tools',
     'python3-dev',
     'wget',
     ])
+
+# The upstream fixuid v0.6.0 binary embeds unsupported Go 1.20.7 standard
+# library code with known vulnerabilities.  Rebuild the unchanged, pinned
+# source with a supported Go toolchain instead of installing that prebuilt
+# binary.  The builder is pinned by its multi-architecture manifest digest and
+# mounted for this RUN only.  The source tree is removed, so neither the Go
+# toolchain nor the source is included in the resulting image layer.
+FIXUID_COMMIT = 'c639d9b3d183248f8de031679654bf2146f88083'
+FIXUID_GO_VERSION = '1.27.1'
+FIXUID_GO_BUILDER = 'golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b'
+
+Bootstrap += generic_build(
+    repository='https://github.com/boxboat/fixuid.git',
+    commit=FIXUID_COMMIT,
+    directory='fixuid',
+    build=[
+        f'test "$(git rev-parse HEAD)" = "{FIXUID_COMMIT}"',
+        f'CGO_ENABLED=0 GOOS=linux GOARCH={TARGETARCH} GOTOOLCHAIN=local '
+        f'/usr/local/go/bin/go build -mod=readonly -trimpath -buildvcs=true '
+        f'-o /usr/local/bin/fixuid .',
+        f"/usr/local/go/bin/go version /usr/local/bin/fixuid | grep -Fq 'go{FIXUID_GO_VERSION}'",
+        ],
+    _run_arguments=f'--mount=from={FIXUID_GO_BUILDER},source=/usr/local/go,target=/usr/local/go',
+    )
 
 # Configure wget with retry logic to handle intermittent GitHub CDN issues
 Bootstrap += shell(commands=[
@@ -75,36 +175,24 @@ Bootstrap += shell(commands=[
     ])
 
 # CMake
-Bootstrap += cmake(eula=True, version='3.26.6')
+Bootstrap += cmake(eula=True, version='3.28.3')
 
-# gcc
-version='12.3.0'
-Bootstrap += gnu(
-    fortran=False,
-    version=version,
-    source=True,
-    configure_opts=[
-        f'--build={cpu_target}-linux-gnu',
-        f'--host={cpu_target}-linux-gnu',
-        f'--target={cpu_target}-linux-gnu',
-        '--enable-checking=release',
-        '--enable-languages=c,c++',
-        '--disable-multilib',
-        ]
-    )
+TRIPLET = '{}-linux-gnu'.format(cpu_target)
 
+# Export canonical CC/CXX so any tool that resolves the compiler from the
+# environment (make, autoconf, etc.) gets the triplet binary explicitly.
 Bootstrap += environment(variables={
-    'CC': '/usr/local/gnu/bin/gcc',
+    'CC':  '/usr/bin/{t}-gcc'.format(t=TRIPLET),
+    'CXX': '/usr/bin/{t}-g++'.format(t=TRIPLET),
 })
 
-
 # GDRCopy
-Bootstrap += gdrcopy(version='2.5.1', ldconfig=True)
+Bootstrap += gdrcopy(version=CONTAINER_GDRCOPY_VERSION, ldconfig=True)
 
 #
 # Externals stage
 #
-Externals += baseimage(image='bootstrap', _arch=cpu_target, _distro='ubuntu22', _as='externals')
+Externals += baseimage(image='bootstrap', _arch=cpu_target, _distro=CONTAINER_UBUNTU_DISTRO, _as='externals')
 
 # Needed by libyaml, mimalloc, prometheus
 Externals += packages(ospackages=[
@@ -126,6 +214,9 @@ externals = generic_cmake(
     commit='52eb8108c5bdec04579160ae17225d66034bd723',
     recursive=True,
     preconfigure=[
+        # Re-sync submodules to the pinned commit's gitlinks: hpccm's recursive
+        # clone leaves them at live HEAD, not what the pinned commit records.
+        'git submodule update --init --recursive',
         'mkdir -p /usr/local/share/licenses/googletest',
         'cp LICENSE /usr/local/share/licenses/googletest/ 2>/dev/null',
         ],
@@ -140,22 +231,11 @@ Externals += generic_cmake(
     commit='eddb0241389718a23a42db6af5f0164b6e0139af',
     recursive=True,
     preconfigure=[
+        # Re-sync submodules to the pinned commit's gitlinks: hpccm's recursive
+        # clone leaves them at live HEAD, not what the pinned commit records.
+        'git submodule update --init --recursive',
         'mkdir -p /usr/local/share/licenses/benchmark',
         'cp LICENSE /usr/local/share/licenses/benchmark/ 2>/dev/null',
-        ],
-    )
-
-# https://github.com/grpc/grpc/blob/master/BUILDING.md
-Externals += generic_cmake(
-    cmake_opts=['-DCMAKE_CXX_STANDARD=17','-DBUILD_SHARED_LIBS=ON','-DCMAKE_BUILD_TYPE=Release','-DgRPC_INSTALL=ON','-DCMAKE_CXX_FLAGS=-Wno-error=array-bounds'],
-    repository='https://github.com/grpc/grpc.git',
-    # branch='v1.75.0',
-    commit='093085cc925e0d5aa6e92bc29e917f9bdc00add2',
-    recursive=True,
-    preconfigure=[
-        'mkdir -p /usr/local/share/licenses/grpc',
-        'cp LICENSE /usr/local/share/licenses/grpc/ 2>/dev/null',
-        'cp NOTICE.txt /usr/local/share/licenses/grpc/ 2>/dev/null',
         ],
     )
 
@@ -199,6 +279,9 @@ Externals += generic_cmake(
     commit='e5fada43131d251e9c4786b04263ce98b6767ba5',
     recursive=True,
     preconfigure=[
+        # Re-sync submodules to the pinned commit's gitlinks: hpccm's recursive
+        # clone leaves them at live HEAD, not what the pinned commit records.
+        'git submodule update --init --recursive',
         'mkdir -p /usr/local/share/licenses/prometheus-cpp',
         'cp LICENSE /usr/local/share/licenses/prometheus-cpp/ 2>/dev/null',
         ],
@@ -289,6 +372,21 @@ Externals += generic_cmake(
     )
 
 Externals += generic_cmake(
+    cmake_opts=[
+        '-DRANGE_V3_TESTS=OFF',
+        '-DRANGE_V3_EXAMPLES=OFF',
+        '-DRANGE_V3_DOCS=OFF',
+    ],
+    repository='https://github.com/ericniebler/range-v3.git',
+    # branch='0.12.0',
+    commit='a81477931a8aa2ad025c6bda0609f38e09e4d7ec',
+    preconfigure=[
+        'mkdir -p /usr/local/share/licenses/range-v3',
+        'cp LICENSE.txt /usr/local/share/licenses/range-v3/ 2>/dev/null',
+    ],
+    )
+
+Externals += generic_cmake(
     repository='https://github.com/bombela/backward-cpp.git',
     # branch='v1.6',
     commit='3bb9240cb15459768adb3e7d963a20e1523a6294',
@@ -302,7 +400,7 @@ Externals += generic_cmake(
     repository='https://github.com/yhirose/cpp-httplib.git',
     # branch='v0.27.0',
     commit='eacc1ca98e5fef25184c7d417e8417225e05e65d',
-    cmake_opts=['-DHTTPLIB_REQUIRE_OPENSSL=ON'],
+    cmake_opts=['-DHTTPLIB_REQUIRE_OPENSSL=ON', '-DHTTPLIB_USE_ZSTD_IF_AVAILABLE=OFF'],
     preconfigure=[
         'mkdir -p /usr/local/share/licenses/cpp-httplib',
         'cp LICENSE /usr/local/share/licenses/cpp-httplib/ 2>/dev/null',
@@ -356,16 +454,16 @@ Externals += generic_cmake(
 
 # https://developer.nvidia.com/cufftdx-downloads
 Externals += shell(commands=[
-    'wget -q https://developer.nvidia.com/downloads/compute/cuFFTDx/redist/cuFFTDx/cuda13/nvidia-mathdx-25.06.1-cuda13.tar.gz',
-    'tar xzf nvidia-mathdx-25.06.1-cuda13.tar.gz -C /usr/local --strip-components=1',
-    'rm nvidia-mathdx-25.06.1-cuda13.tar.gz',
+    f'wget -q https://developer.nvidia.com/downloads/compute/cuFFTDx/redist/cuFFTDx/{MATHDX_CUDA_VERSION}/{MATHDX_ARCHIVE}',
+    f'tar xzf {MATHDX_ARCHIVE} -C /usr/local --strip-components=1',
+    f'rm {MATHDX_ARCHIVE}',
     ])
 
 
 #
 # Base Stage
 #
-Base += baseimage(image='bootstrap', _arch=cpu_target, _distro='ubuntu22', _as='base')
+Base += baseimage(image='bootstrap', _arch=cpu_target, _distro=CONTAINER_UBUNTU_DISTRO, _as='base')
 
 Base += packages(ospackages=[
     'apt-utils',
@@ -377,6 +475,13 @@ Base += packages(ospackages=[
     'libcunit1-dev',
     'libzmq3-dev',
     'nlohmann-json3-dev',
+
+    'libabsl-dev',
+    'libgrpc++-dev',
+    'libgrpc-dev',
+    'libprotobuf-dev',
+    'protobuf-compiler',
+    'protobuf-compiler-grpc',
 
     # Addons to be able to run
     "sudo",
@@ -401,9 +506,6 @@ Base += shell(commands=[
     'curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh'
     ])
 
-# Doing it this way will copy the runtimes multiple times
-# Base += Externals.runtime(_from='externals')
-# this is a workaround:
 Base += externals.runtime(_from='externals')
 
 Base += shell(commands=[
@@ -416,23 +518,36 @@ Base += shell(commands=[
 Base += shell(commands=[
     'mkdir -p /tmp/doca-host',
     'cd /tmp/doca-host',
-    f'wget -q https://www.mellanox.com/downloads/DOCA/DOCA_v3.2.1/host/doca-host_3.2.1-044000-25.10-ubuntu2204_{TARGETARCH}.deb',
+    f'wget -q https://www.mellanox.com/downloads/DOCA/DOCA_v{DOCA_VERSION}/host/doca-host_{DOCA_HOST_ID}_{TARGETARCH}.deb',
     'dpkg -i /tmp/doca-host/doca-host_*.deb',
     'apt-get update -y',
     'rm -rf /tmp/doca-host',
     ])
+
+if not DPDK_TAG:
+    Base += packages(ospackages=[
+        'dpdk-community-dev',
+        ])
+
 ""
 # Uncomment ^^^ Build from source
-repo_dir = f'/usr/share/doca-host-3.2.1-044000-25.10-ubuntu2204/repo'
+repo_dir = f'/usr/share/doca-host-{DOCA_HOST_ID}/repo'
 
-Base += shell(commands=[
+pool_rm = [
     f'rm {repo_dir}/pool/doca-sdk-common_*',
     f'rm {repo_dir}/pool/libdoca-sdk-common-dev_*',
     f'rm {repo_dir}/pool/doca-sdk-verbs_*',
     f'rm {repo_dir}/pool/libdoca-sdk-verbs-dev_*',
     f'rm {repo_dir}/pool/doca-sdk-gpunetio_*',
     f'rm {repo_dir}/pool/libdoca-sdk-gpunetio-dev*',
-    ])
+]
+if DPDK_TAG:
+    pool_rm += [
+        f'rm {repo_dir}/pool/doca-sdk-dpdk-bridge_*',
+        f'rm {repo_dir}/pool/libdoca-sdk-dpdk-bridge-dev_*',
+        f'rm -f {repo_dir}/pool/*dpdk-community*',
+    ]
+Base += shell(commands=pool_rm)
 
 # Add aerial .deb files
 Base += raw(docker=f"ADD doca-for-aerial-{TARGETARCH}.tgz {repo_dir}/pool/")
@@ -450,8 +565,6 @@ deb_list = [
     'doca-samples',
     ]
 
-Base += copy(src='ldpc_decoder_cubin/', dest='/opt/nvidia/ldpc_decoder_cubin')
-
 deb_packs = ' '.join(deb_list)
 Base += shell(commands=[
     # Uncomment vvv when building from source
@@ -465,13 +578,13 @@ Base += shell(commands=[
     'rm -rf /var/lib/apt/lists/*',
     ])
 
-# Install fixuid
+# Configure the fixuid binary built in the bootstrap stage.
 Base += shell(commands=[
     'addgroup --gid 1000 aerial',
     'adduser --uid 1000 --ingroup aerial --home /home/aerial --shell /bin/bash --disabled-password --gecos "" aerial',
     'USER=aerial',
     'GROUP=aerial',
-    f'curl -SsL https://github.com/boxboat/fixuid/releases/download/v0.6.0/fixuid-0.6.0-linux-{TARGETARCH}.tar.gz | tar -C /usr/local/bin -xzf -',
+    'test -x /usr/local/bin/fixuid',
     'chown root:root /usr/local/bin/fixuid',
     'chmod 4755 /usr/local/bin/fixuid',
     'mkdir -p /etc/fixuid',
@@ -495,4 +608,3 @@ Base += user(user='aerial')
 Base += workdir(directory='/')
 
 Base += raw(docker='CMD ["bash", "-c", "echo Aerial SDK container ready, going to sleep; sleep infinity"]')
-

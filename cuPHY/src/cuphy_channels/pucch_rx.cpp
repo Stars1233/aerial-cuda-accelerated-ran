@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +16,7 @@
  */
 
 #include <cstddef>
-#include <string>
+#include <cstring>
 #include "pucch_rx.hpp"
 #include "cuphy.hpp"
 #include "cuphy_api.h"
@@ -28,6 +28,7 @@
 #include "cuphy_internal.h"
 
 #include "pucch_receiver/rm_decoder.hpp"
+#include "polar_decoder/polar_cw_tree_layout.hpp"
 
 //#define MEMTRACE      //FixMe uncomment to enable memtrace  in cuPHY runs, but note that call to memtrace_set_config(0);
 //                      //will disable mem tracing on that thread onward
@@ -38,9 +39,14 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
     m_cuStream(strm),
     m_cuphyPucchStatPrms(*(pStatPrms)),
     m_LinearAlloc(getBufferSize(pStatPrms), &m_memoryFootprint),
+    m_outputPrms(),
     m_tPrmDataRxBufCpu(pStatPrms->nMaxCellsPerSlot),
     m_tRefDataRxBufCpu(pStatPrms->nMaxCellsPerSlot),
     m_cudaGraphModeEnabled(true),
+    m_skipPolarDecoder(pStatPrms->pipelineMode == PUCCH_PIPELINE_SKIP_POLAR),
+    m_skipBackend(pStatPrms->pipelineMode == PUCCH_PIPELINE_SKIP_BACKEND),
+    m_pPostPolarData(pStatPrms->pipelineData.pPostPolarData),
+    m_pipelineDelayUs(pStatPrms->pipelineDelayUs),
     m_polDcdrListSz(pStatPrms->polarDcdrListSz),
     m_polSegPrmsBufCpu(CUPHY_MAX_N_POL_CWS),
     m_polCwPrmsBufCpu(CUPHY_MAX_N_POL_CWS),
@@ -48,6 +54,10 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
     m_pucchEnableUlRxBf(pStatPrms->enableUlRxBf),
     m_batchedMemcpyHelper(PUCCH_MAX_OUTPUT_TO_CPU_COPIES, batchedMemcpySrcHint::srcIsDevice, batchedMemcpyDstHint::dstIsHost, (PUCCH_USE_BATCHED_MEMCPY == 1) && (pStatPrms->enableBatchedMemcpy == 1))
  {
+    m_delayKernelArgUs = 0;
+    m_delayKernelArgs[0] = &m_delayKernelArgUs;
+    CUPHY_CHECK(cuphySetDelayKernelNodeParams(&m_delayKernelNodeParamsDriver, &m_delayKernelArgs[0]));
+
     pStatPrms->pOutInfo->pMemoryFootprint = &m_memoryFootprint; // update  static parameter field that points to the cuphyMemoryFootprintTracker object for this channel
 
     /* Initialize launch configs & parameters which are reassigned at setup when used */
@@ -102,11 +112,20 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
     createGraph();
 #if CUDA_VERSION >= 12000
     CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_graphExec, m_graph, 0));
-#else            
+#else
     CU_CHECK_EXCEPTION(cuGraphInstantiate(&m_graphExec, m_graph, 0, 0, 0));
 #endif
     // Optional: disable empty kernel root node
     //CU_CHECK(cuGraphNodeSetEnabled(m_graphExec, m_emptyRootNode, 0));
+
+    // Delay node is added to the graph in the always-enabled state. When the pipeline isn't
+    // configured to insert a wait (default m_pipelineDelayUs == 0), disable it on the exec now
+    // so the first slot doesn't queue a zero-delay no-op kernel before updateGraph() reconciles.
+    if(m_pipelineDelayUs == 0)
+    {
+        CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_graphExec, m_delayKernelNode, 0));
+        m_delayKernelNodeEnabled = false;
+    }
 
     if(PRINT_GPU_MEMORY_CUPHY_CHANNEL == 1)
     {
@@ -245,7 +264,7 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
         } else {
             cuphyPolarUciSegPrm_t& polSegPrms    = m_polSegPrmsBufCpu[polSegIdx];
             uint16_t N_cw                        =  polSegPrms.N_cw;
-            uint16_t nBytes_cwTree               =  2 * N_cw;
+            size_t   nBytes_cwTree               =  cuphy::polar::PolarCwTreeLayout::sizeBytes(N_cw);
 
             m_polCwTreeTypesAddrVec[polSegIdx] =  static_cast<uint8_t*>(m_LinearAlloc.alloc(nBytes_cwTree));
             m_polSegLLRsAddrVec[polSegIdx]     =  static_cast<__half*>(pSeg1LLRs);
@@ -314,6 +333,77 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
         }
    }
  }
+
+void* PucchRx::getFrontEndLlrOutputAddr(cuphyTensorPrm_t* pFrontEndLLRs,
+                                        uint16_t uciIdx,
+                                        uint16_t expectedElems,
+                                        const char* fmtName) const
+{
+    if(!m_skipBackend || (pFrontEndLLRs == nullptr))
+    {
+        return nullptr;
+    }
+
+    cuphyTensorPrm_t const& tPrm = pFrontEndLLRs[uciIdx];
+    if((tPrm.desc == nullptr) || (tPrm.pAddr == nullptr))
+    {
+        NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                   "{} frontend LLR output tensor[{}] is null in SKIP_BACKEND mode", fmtName, uciIdx);
+        throw cuphy::cuphy_exception(CUPHY_STATUS_INVALID_ARGUMENT);
+    }
+
+    cuphyDataType_t dataType = CUPHY_VOID;
+    int             rank     = 0;
+    int             dims[CUPHY_DIM_MAX]    = {};
+    int             strides[CUPHY_DIM_MAX] = {};
+    cuphyStatus_t descStatus = cuphyGetTensorDescriptor(tPrm.desc, CUPHY_DIM_MAX, &dataType, &rank, dims, strides);
+    if(descStatus != CUPHY_STATUS_SUCCESS)
+    {
+        throw cuphy::cuphy_exception(descStatus);
+    }
+
+    uint64_t nElems = 1;
+    for(int dimIdx = 0; dimIdx < rank; ++dimIdx)
+    {
+        nElems *= static_cast<uint64_t>(dims[dimIdx]);
+    }
+
+    if((dataType != CUPHY_R_16F) || (nElems != expectedElems))
+    {
+        NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                   "{} frontend LLR output tensor[{}] mismatch: type={} elems={}, expected type={} elems={}",
+                   fmtName, uciIdx, static_cast<int>(dataType), nElems, static_cast<int>(CUPHY_R_16F), expectedElems);
+        throw cuphy::cuphy_exception(CUPHY_STATUS_INVALID_ARGUMENT);
+    }
+
+    return tPrm.pAddr;
+}
+
+void PucchRx::bindFrontEndLlrOutputAddrs()
+{
+    if(!m_skipBackend)
+    {
+        return;
+    }
+
+    if(m_outputPrms.pF2FrontEndLLRs != nullptr)
+    {
+        for(uint16_t uciIdx = 0; uciIdx < m_nF2Ucis; ++uciIdx)
+        {
+            m_F2seg1LLRaddrsVec[uciIdx] = static_cast<__half*>(
+                getFrontEndLlrOutputAddr(m_outputPrms.pF2FrontEndLLRs, uciIdx, m_F2RmSizesVec[uciIdx].E_seg1, "F2"));
+        }
+    }
+
+    if(m_outputPrms.pF3FrontEndLLRs != nullptr)
+    {
+        for(uint16_t uciIdx = 0; uciIdx < m_nF3Ucis; ++uciIdx)
+        {
+            m_F3seg1LLRaddrsVec[uciIdx] = static_cast<__half*>(
+                getFrontEndLlrOutputAddr(m_outputPrms.pF3FrontEndLLRs, uciIdx, m_F3RmSizesVec[uciIdx].E_seg1, "F3"));
+        }
+    }
+}
 
  void PucchRx::allocateDeviceMemory()
  {
@@ -404,7 +494,14 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
 
     for(int F2uciIdx = 0; F2uciIdx < m_nF2Ucis; ++F2uciIdx)
     {
-        void* pSeg1LLRs               = m_LinearAlloc.alloc(m_F2RmSizesVec[F2uciIdx].E_seg1 * sizeof(__half));
+        void* pSeg1LLRs = getFrontEndLlrOutputAddr(m_outputPrms.pF2FrontEndLLRs,
+                                                   static_cast<uint16_t>(F2uciIdx),
+                                                   m_F2RmSizesVec[F2uciIdx].E_seg1,
+                                                   "F2");
+        if(pSeg1LLRs == nullptr)
+        {
+            pSeg1LLRs = m_LinearAlloc.alloc(m_F2RmSizesVec[F2uciIdx].E_seg1 * sizeof(__half));
+        }
         m_F2seg1LLRaddrsVec[F2uciIdx] = static_cast<__half*>(pSeg1LLRs);
         //m_outputPrms.pPucchF2OutOffsetsCpu[F2uciIdx].dtxFlagOffset = F234uciIdx;
         m_outputPrms.pPucchF2OutOffsetsCpu[F2uciIdx].snrOffset     = F234uciIdx;
@@ -441,7 +538,14 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
 
     for(int F3uciIdx = 0; F3uciIdx < m_nF3Ucis; ++F3uciIdx)
     {
-        void* pSeg1LLRs               = m_LinearAlloc.alloc(m_F3RmSizesVec[F3uciIdx].E_seg1 * sizeof(__half));
+        void* pSeg1LLRs = getFrontEndLlrOutputAddr(m_outputPrms.pF3FrontEndLLRs,
+                                                   static_cast<uint16_t>(F3uciIdx),
+                                                   m_F3RmSizesVec[F3uciIdx].E_seg1,
+                                                   "F3");
+        if(pSeg1LLRs == nullptr)
+        {
+            pSeg1LLRs = m_LinearAlloc.alloc(m_F3RmSizesVec[F3uciIdx].E_seg1 * sizeof(__half));
+        }
         m_F3seg1LLRaddrsVec[F3uciIdx] = static_cast<__half*>(pSeg1LLRs);
         //m_outputPrms.pPucchF3OutOffsetsCpu[F3uciIdx].dtxFlagOffset = F234uciIdx;
         m_outputPrms.pPucchF3OutOffsetsCpu[F3uciIdx].snrOffset     = F234uciIdx;
@@ -519,19 +623,23 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
      CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_pucchF3RxKernelNode, m_graph, &m_pucchF2RxKernelNode, 1, &m_emptyNode1paramDriver));
      CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_rmDecoderKernelNode, m_graph, &m_pucchF3RxKernelNode, 1, &rm_params));
      CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_compCwTreeTypesKernelNode, m_graph, &m_rmDecoderKernelNode, 1, &m_emptyNode1paramDriver));
+     CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_delayKernelNode, m_graph, &m_rmDecoderKernelNode, 1, &m_delayKernelNodeParamsDriver));
      CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_polSegDeRmDeItlKernelNode, m_graph, &m_compCwTreeTypesKernelNode, 1, &m_emptyNode1paramDriver));
      CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_polarDecoderKernelNode, m_graph, &m_polSegDeRmDeItlKernelNode, 1, &m_emptyNode1paramDriver));
-     CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_pucchF234RxKernelNode, m_graph, &m_polarDecoderKernelNode, 1, &m_emptyNode1paramDriver));
+     {
+         CUgraphNode pucchF234Deps[] = {m_polarDecoderKernelNode, m_delayKernelNode};
+         CU_CHECK_EXCEPTION(cuGraphAddKernelNode(&m_pucchF234RxKernelNode, m_graph, pucchF234Deps, 2, &m_emptyNode1paramDriver));
+     }
 
      // Have all nodes enabled in the beginning
-     m_pucchF0RxKernelNodeEnabled = true;
-     m_pucchF1RxKernelNodeEnabled = true;
-     m_pucchF2RxKernelNodeEnabled = true;
-     m_pucchF3RxKernelNodeEnabled = true;
-     m_rmDecoderKernelNodeEnabled = true;
-     m_polSegKernelNodesEnabled   = true;
+     m_pucchF0RxKernelNodeEnabled   = true;
+     m_pucchF1RxKernelNodeEnabled   = true;
+     m_pucchF2RxKernelNodeEnabled   = true;
+     m_pucchF3RxKernelNodeEnabled   = true;
+     m_rmDecoderKernelNodeEnabled   = true;
+     m_polSegKernelNodesEnabled     = true;
      m_pucchF234RxKernelNodeEnabled = true;
-
+     m_delayKernelNodeEnabled       = true;
  }
 
  void PucchRx::updateGraph()
@@ -616,7 +724,7 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
          }
      }
 
-     if ((m_nF2Ucis > 0) || (m_nF3Ucis > 0)) {
+     if (((m_nF2Ucis > 0) || (m_nF3Ucis > 0)) && !m_skipBackend) {
          if(!m_pucchF234RxKernelNodeEnabled)
          {
              CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_graphExec, m_pucchF234RxKernelNode, 1));
@@ -633,7 +741,7 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
          }
      }
 
-     if(m_nRmCws > 0)
+     if((m_nRmCws > 0) && !m_skipBackend)
      {
          if(!m_rmDecoderKernelNodeEnabled)
          {
@@ -651,7 +759,29 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
          }
      }
 
-     if(m_nPolSegs > 0)
+     // Delay kernel sits in the polar-decoder slot: after RM decoder, before pucchF234UciSeg.
+     // Skip entirely in SKIP_BACKEND — mode 2 is front-end-only, so a backend-slot delay
+     // would skew mode-2 latency/throughput and break the front-end-only contract.
+     if((m_pipelineDelayUs > 0) && !m_skipBackend)
+     {
+         if(!m_delayKernelNodeEnabled)
+         {
+             CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_graphExec, m_delayKernelNode, 1));
+             m_delayKernelNodeEnabled = true;
+         }
+         m_delayKernelArgUs = m_pipelineDelayUs;
+         CU_CHECK_EXCEPTION(cuGraphExecKernelNodeSetParams(m_graphExec, m_delayKernelNode, &m_delayKernelNodeParamsDriver));
+     }
+     else
+     {
+         if(m_delayKernelNodeEnabled)
+         {
+             CU_CHECK_EXCEPTION(cuGraphNodeSetEnabled(m_graphExec, m_delayKernelNode, 0));
+             m_delayKernelNodeEnabled = false;
+         }
+     }
+
+     if((m_nPolSegs > 0) && !m_skipPolarDecoder && !m_skipBackend)
      {
          if(!m_polSegKernelNodesEnabled)
          {
@@ -749,9 +879,12 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
     m_outputPrms.pHarqDetectionStatusCpu  = pDynPrm->pDataOut->HarqDetectionStatus;
     m_outputPrms.pCsiP1DetectionStatusCpu = pDynPrm->pDataOut->CsiP1DetectionStatus;
     m_outputPrms.pCsiP2DetectionStatusCpu = pDynPrm->pDataOut->CsiP2DetectionStatus;
+    m_outputPrms.pF2FrontEndLLRs          = pDynPrm->pDataOut->pF2FrontEndLLRs;
+    m_outputPrms.pF3FrontEndLLRs          = pDynPrm->pDataOut->pF3FrontEndLLRs;
 
     // device memory
     allocateDeviceMemory();
+    bindFrontEndLlrOutputAddrs();
 
     // optional debug output
     if (m_outputPrms.debugOutputFlag)
@@ -768,7 +901,7 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
         }
     }
     return ret;
- }
+}
 
  cuphyStatus_t PucchRx::setupComponents(bool enableCpuToGpuDescrAsyncCpy, cuphyPucchDynPrms_t *pDynPrm)
  {
@@ -937,7 +1070,7 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
         }
     }
 
-    if(m_nPolSegs > 0)
+    if((m_nPolSegs > 0) && !m_skipPolarDecoder && !m_skipBackend)
     {
         ret = cuphySetupCompCwTreeTypes(m_compCwTreeTypesHndl,
                                         m_nPolSegs,
@@ -1054,130 +1187,174 @@ PucchRx::PucchRx(cuphyPucchStatPrms_t const* pStatPrms, cudaStream_t strm) :
         CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(static_cast<void*>(m_pRmCwPrmsGpu), static_cast<void*>(m_rmCwPrmsBufCpu.addr()), m_nRmCws *sizeof(cuphyRmCwPrm_t), cudaMemcpyHostToDevice, m_cuStream));
     }
 
-    if(m_nPolSegs > 0)
+    if((m_nPolSegs > 0) && !m_skipPolarDecoder && !m_skipBackend)
     {
         CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(static_cast<void*>(m_pPolSegPrmsGpu), static_cast<void*>(m_polSegPrmsBufCpu.addr()), m_nPolSegs * sizeof(cuphyPolarUciSegPrm_t), cudaMemcpyHostToDevice, m_cuStream));
         CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(static_cast<void*>(m_pPolCwPrmsGpu) , static_cast<void*>(m_polCwPrmsBufCpu.addr()), m_nPolCbs * sizeof(cuphyPolarCwPrm_t), cudaMemcpyHostToDevice, m_cuStream));
     }
+
+    // When polar decoding is skipped, optional post-polar data can be supplied by
+    // the caller/offload path and loaded into the buffers the polar decoder would
+    // have populated.
+    if(m_skipPolarDecoder && (m_nPolSegs > 0) && (m_pPostPolarData != nullptr))
+    {
+        cuphyStatus_t sLoad = loadPostPolarDataForSkip(*m_pPostPolarData, m_cuStream);
+        if(sLoad != CUPHY_STATUS_SUCCESS)
+        {
+            NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "loadPostPolarDataForSkip auto-trigger failed");
+            return sLoad;
+        }
+    }
     return ret;
-  }
+ }
 
 
 cuphyStatus_t PucchRx::copyOutputToCPU()
 {
-     // The m_batchedMemcpyHelper can perform either a batched async memory copy or a regular copy depending on the config. parameter.
-     m_batchedMemcpyHelper.reset(); // reset for upcoming batch of updateMemcpy calls
+    // The m_batchedMemcpyHelper can perform either a batched async memory copy or a regular copy depending on the config. parameter.
+    m_batchedMemcpyHelper.reset(); // reset for upcoming batch of updateMemcpy calls
 
-     if(m_nF0Ucis > 0)
-     {
+    if(m_nF0Ucis > 0)
+    {
         m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pF0UciOutCpu, m_outputPrms.pF0UciOutGpu, sizeof(cuphyPucchF0F1UciOut_t) * m_nF0Ucis, cudaMemcpyDeviceToHost, m_cuStream);
-     }
+    }
 
     if(m_nF1Ucis > 0)
-     {
+    {
         m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pF1UciOutCpu, m_outputPrms.pF1UciOutGpu, sizeof(cuphyPucchF0F1UciOut_t) * m_nF1Ucis, cudaMemcpyDeviceToHost, m_cuStream);
-     }
+    }
 
-     if(m_outputPrms.nUciPayloadBytes > 0)
-     {
-        m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pUciPayloadsCpu, m_outputPrms.pUciPayloadsGpu, sizeof(uint8_t) * m_outputPrms.nUciPayloadBytes, cudaMemcpyDeviceToHost, m_cuStream);
-        //m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pDtxFlagsCpu, m_outputPrms.pDtxFlagsGpu, sizeof(uint8_t) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
+    if(m_outputPrms.nUciPayloadBytes > 0)
+    {
+        // SINR/RSSI/RSRP/Interf/TaEst are populated by F2/F3 front-end and remain valid
+        // in SKIP_BACKEND. The backend-only buffers (UCI payloads, CRC flags, per-UCI
+        // HARQ/CSI detection-status bytes) are NOT refreshed when the backend is skipped,
+        // and m_LinearAlloc.reset() means they can contain prior-slot data — suppress
+        // those copies in SKIP_BACKEND to avoid exporting stale values.
         m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pSinrCpu, m_outputPrms.pSinrGpu, sizeof(float) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
         m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pRssiCpu, m_outputPrms.pRssiGpu, sizeof(float) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
         m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pRsrpCpu, m_outputPrms.pRsrpGpu, sizeof(float) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
         m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pInterfCpu, m_outputPrms.pInterfGpu, sizeof(float) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
         m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pTaEstCpu, m_outputPrms.pTaEstGpu, sizeof(float) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
-        m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pCrcFlagsCpu, m_outputPrms.pCrcFlagsGpu, sizeof(uint8_t) * m_outputPrms.nUciSegs, cudaMemcpyDeviceToHost, m_cuStream);
-        m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pHarqDetectionStatusCpu, m_outputPrms.pHarqDetectionStatusGpu, sizeof(uint8_t) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
-        m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pCsiP1DetectionStatusCpu, m_outputPrms.pCsiP1DetectionStatusGpu, sizeof(uint8_t) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
-        m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pCsiP2DetectionStatusCpu, m_outputPrms.pCsiP2DetectionStatusGpu, sizeof(uint8_t) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
-     }
+        if(!m_skipBackend)
+        {
+            m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pUciPayloadsCpu, m_outputPrms.pUciPayloadsGpu, sizeof(uint8_t) * m_outputPrms.nUciPayloadBytes, cudaMemcpyDeviceToHost, m_cuStream);
+            m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pCrcFlagsCpu, m_outputPrms.pCrcFlagsGpu, sizeof(uint8_t) * m_outputPrms.nUciSegs, cudaMemcpyDeviceToHost, m_cuStream);
+            m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pHarqDetectionStatusCpu, m_outputPrms.pHarqDetectionStatusGpu, sizeof(uint8_t) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
+            m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pCsiP1DetectionStatusCpu, m_outputPrms.pCsiP1DetectionStatusGpu, sizeof(uint8_t) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
+            m_batchedMemcpyHelper.updateMemcpy(m_outputPrms.pCsiP2DetectionStatusCpu, m_outputPrms.pCsiP2DetectionStatusGpu, sizeof(uint8_t) * (m_nF3Ucis + m_nF2Ucis), cudaMemcpyDeviceToHost, m_cuStream);
+        }
+        else
+        {
+            // Suppressing the D2H copies leaves the caller's host buffers holding prior-slot
+            // data. Initialize them deterministically so a stale-buffer leak is impossible.
+            // CRC flags get CUPHY_FAPI_CRC_FAILURE (fail-closed: skipped segments must not
+            // look like CRC pass to downstream consumers). Detection-status bytes get
+            // CUPHY_FAPI_DTX (matches "no UCI decoded" semantics).
+            const size_t nUcis = m_nF3Ucis + m_nF2Ucis;
+            std::memset(m_outputPrms.pUciPayloadsCpu, 0, sizeof(uint8_t) * m_outputPrms.nUciPayloadBytes);
+            std::fill_n(m_outputPrms.pCrcFlagsCpu,              m_outputPrms.nUciSegs, static_cast<uint8_t>(CUPHY_FAPI_CRC_FAILURE));
+            std::fill_n(m_outputPrms.pHarqDetectionStatusCpu,  nUcis, static_cast<uint8_t>(CUPHY_FAPI_DTX));
+            std::fill_n(m_outputPrms.pCsiP1DetectionStatusCpu, nUcis, static_cast<uint8_t>(CUPHY_FAPI_DTX));
+            std::fill_n(m_outputPrms.pCsiP2DetectionStatusCpu, nUcis, static_cast<uint8_t>(CUPHY_FAPI_DTX));
+        }
+    }
 
-     // trigger batched async memcpy if enabled; no-op otherwise
-     cuphyStatus_t status = m_batchedMemcpyHelper.launchBatchedMemcpy(m_cuStream);
-     if(status != CUPHY_STATUS_SUCCESS)
-     {
-         NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "Launching batched memcpy for PUCCH returned an error");
-     }
-     return status;
- }
+    // trigger batched async memcpy if enabled; no-op otherwise
+    cuphyStatus_t status = m_batchedMemcpyHelper.launchBatchedMemcpy(m_cuStream);
+    if(status != CUPHY_STATUS_SUCCESS)
+    {
+        NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "Launching batched memcpy for PUCCH returned an error");
+    }
+    return status;
+}
 
- cuphyStatus_t PucchRx::run()
- {
-     cuphyStatus_t status = CUPHY_STATUS_SUCCESS; //FIXME currently only set based on copyOutpuToCpu ret. value; should be extended so exceptions are avoided.
-     if(m_cudaGraphModeEnabled)
-     {
-         MemtraceDisableScope md; // Disable temporarily
-         CU_CHECK_EXCEPTION(cuGraphLaunch(m_graphExec, m_cuStream));
-     }
-     else
-     {
-         // PUCCH F0 reciever
-         if(m_nF0Ucis > 0)
-         {
-             const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF0RxLaunchCfg.kernelNodeParamsDriver;
-             CUresult pucchF0RxRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
-             if(CUDA_SUCCESS != pucchF0RxRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
-         }
+cuphyStatus_t PucchRx::run()
+{
+    cuphyStatus_t status = CUPHY_STATUS_SUCCESS; // FIXME currently only set based on copyOutputToCPU ret. value; should be extended so exceptions are avoided.
+    if(m_cudaGraphModeEnabled)
+    {
+        MemtraceDisableScope md; // Disable temporarily
+        CU_CHECK_EXCEPTION(cuGraphLaunch(m_graphExec, m_cuStream));
+    }
+    else
+    {
+        // PUCCH F0 receiver
+        if(m_nF0Ucis > 0)
+        {
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF0RxLaunchCfg.kernelNodeParamsDriver;
+            CUresult pucchF0RxRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
+            if(CUDA_SUCCESS != pucchF0RxRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
+        }
 
-         // PUCCH F1 reciever
-         if(m_nF1Ucis > 0)
-         {
-             const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF1RxLaunchCfg.kernelNodeParamsDriver;
-             CUresult pucchF1RxRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
-             if(CUDA_SUCCESS != pucchF1RxRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
-         }
+        // PUCCH F1 receiver
+        if(m_nF1Ucis > 0)
+        {
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF1RxLaunchCfg.kernelNodeParamsDriver;
+            CUresult pucchF1RxRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
+            if(CUDA_SUCCESS != pucchF1RxRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
+        }
 
-         // PUCCH F2 reciever (front-end)
-         if(m_nF2Ucis > 0)
-         {
-             const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF2RxLaunchCfg.kernelNodeParamsDriver;
-             CUresult pucchF2RxRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
-             if(CUDA_SUCCESS != pucchF2RxRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
-         }
+        // PUCCH F2 receiver (front-end)
+        if(m_nF2Ucis > 0)
+        {
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF2RxLaunchCfg.kernelNodeParamsDriver;
+            CUresult pucchF2RxRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
+            if(CUDA_SUCCESS != pucchF2RxRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
+        }
 
-         // PUCCH F3 reciever (front-end)
-         if(m_nF3Ucis > 0)
-         {
-             const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF3RxLaunchCfg.kernelNodeParamsDriver;
-             CUresult pucchF3RxRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
-             if(CUDA_SUCCESS != pucchF3RxRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
-         }
+        // PUCCH F3 receiver (front-end)
+        if(m_nF3Ucis > 0)
+        {
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF3RxLaunchCfg.kernelNodeParamsDriver;
+            CUresult pucchF3RxRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
+            if(CUDA_SUCCESS != pucchF3RxRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
+        }
 
-         // Reed-Muller decoder
-         if(m_nRmCws > 0)
-         {
-             const CUDA_KERNEL_NODE_PARAMS&  kernelNodeParamsDriver = m_rmDecoderLaunchCfg.kernelNodeParamsDriver;
-             CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver, m_cuStream));
+        // Reed-Muller decoder
+        if((m_nRmCws > 0) && !m_skipBackend)
+        {
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_rmDecoderLaunchCfg.kernelNodeParamsDriver;
+            CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver, m_cuStream));
+        }
 
-         }
+        // Delay kernel sits in the polar-decoder slot: after RM decoder, before pucchF234UciSeg.
+        // Skip entirely in SKIP_BACKEND — mode 2 is front-end-only, so a backend-slot delay
+        // would skew mode-2 latency/throughput and break the front-end-only contract.
+        if((m_pipelineDelayUs > 0) && !m_skipBackend)
+        {
+            m_delayKernelArgUs = m_pipelineDelayUs;
+            CUresult delayRunStatus = launch_kernel(m_delayKernelNodeParamsDriver, m_cuStream);
+            if(CUDA_SUCCESS != delayRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
+        }
 
-         if(m_nPolSegs > 0)
-         {
-             const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver1 = m_compCwTreeTypesLaunchCfg.kernelNodeParamsDriver;
-             CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver1, m_cuStream));
+        if((m_nPolSegs > 0) && !m_skipPolarDecoder && !m_skipBackend)
+        {
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver1 = m_compCwTreeTypesLaunchCfg.kernelNodeParamsDriver;
+            CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver1, m_cuStream));
 
-             const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver2 = m_polSegDeRmDeItlLaunchCfg.kernelNodeParamsDriver;
-             CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver2, m_cuStream));
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver2 = m_polSegDeRmDeItlLaunchCfg.kernelNodeParamsDriver;
+            CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver2, m_cuStream));
 
-             const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver3 = m_polarDecoderLaunchCfg.kernelNodeParamsDriver;
-             CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver3, m_cuStream));
-         }
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver3 = m_polarDecoderLaunchCfg.kernelNodeParamsDriver;
+            CU_CHECK_EXCEPTION(launch_kernel(kernelNodeParamsDriver3, m_cuStream));
+        }
 
-         // PF2/3/4 UCI Segmentation
-         if ((m_nF2Ucis > 0) || (m_nF3Ucis > 0)) {
-             const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF234UciSegLaunchCfg.kernelNodeParamsDriver;
-             CUresult pucchF234UciSegRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
-             if(CUDA_SUCCESS != pucchF234UciSegRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
-         }
-     }
+        // PF2/3/4 UCI Segmentation
+        if(((m_nF2Ucis > 0) || (m_nF3Ucis > 0)) && !m_skipBackend)
+        {
+            const CUDA_KERNEL_NODE_PARAMS& kernelNodeParamsDriver = m_pucchF234UciSegLaunchCfg.kernelNodeParamsDriver;
+            CUresult pucchF234UciSegRunStatus = launch_kernel(kernelNodeParamsDriver, m_cuStream);
+            if(CUDA_SUCCESS != pucchF234UciSegRunStatus) throw cuphy::cuphy_exception(CUPHY_STATUS_INTERNAL_ERROR);
+        }
+    }
 
-     if(m_outputPrms.cpuCopyOn)
-     {
-         status = copyOutputToCPU();
-     }
-     return status;
- }
+    if(m_outputPrms.cpuCopyOn)
+    {
+        status = copyOutputToCPU();
+    }
+    return status;
+}
 
  template <fmtlog::LogLevel log_level>
  void PucchRx::printUciPrms(const cuphyPucchUciPrm_t* uciPrms)
@@ -1263,6 +1440,9 @@ cuphyStatus_t PucchRx::copyOutputToCPU()
     NVLOG_FMT(log_level, NVLOG_PUCCH,"nMaxCells:        {}", pStaticPrm->nMaxCells);
     NVLOG_FMT(log_level, NVLOG_PUCCH,"nMaxCellsPerSlot: {}", pStaticPrm->nMaxCellsPerSlot);
     NVLOG_FMT(log_level, NVLOG_PUCCH,"uciOutputMode:    {}", pStaticPrm->uciOutputMode);
+    NVLOG_FMT(log_level, NVLOG_PUCCH,"pipelineMode: {} (0=FULL, 1=SKIP_POLAR, 2=SKIP_BACKEND)",
+              static_cast<unsigned int>(pStaticPrm->pipelineMode));
+    NVLOG_FMT(log_level, NVLOG_PUCCH,"pipelineDelayUs:  {}", pStaticPrm->pipelineDelayUs);
 
     const cuphyCellStatPrm_t* pCellStatPrms = pStaticPrm->pCellStatPrms;
     NVLOG_FMT(log_level, NVLOG_PUCCH,"===============================================");
@@ -1344,6 +1524,9 @@ cuphyStatus_t PucchRx::copyOutputToCPU()
 
      // account for multiple-cells per group
      nBytesBuffer *= pStatPrms->nMaxCells;
+
+     // Polar cw tree types + SC operation lists, one buffer per UCI segment, sized per slot
+     nBytesBuffer += CUPHY_MAX_N_POL_UCI_SEGS * (cuphy::polar::PolarCwTreeLayout::sizeBytes(CUPHY_POLAR_DECODER_MAX_BITS) + 128);
      
      // F3 output bytes
      nBytesBuffer += 14*12*14*2 * CUPHY_PUCCH_F3_MAX_UCI + EXTRA_PADDING;
@@ -1797,4 +1980,202 @@ cuphyStatus_t CUPHYWINAPI cuphyRunPucchRx(cuphyPucchRxHndl_t pucchRxHndl, uint64
         p->writeDbgBufSynch(cuStream);
         // cuphyStatus_t status = p->copyOutputToCPU(cuStream);
     });
+ }
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // PucchRx::loadPostPolarDataForSkip
+ //
+ // Stages caller-provided post-polar outputs into the GPU buffers the polar
+ // decoder would otherwise produce. The source descriptors are owned by the
+ // caller; sources may be host or device memory as long as they remain valid
+ // until the setup stream has consumed the copies.
+ cuphyStatus_t PucchRx::loadPostPolarDataForSkip(const cuphyPucchPostPolarData_t& postPolarData, cudaStream_t cuStream)
+ {
+     if(m_nPolSegs == 0)
+     {
+         return CUPHY_STATUS_SUCCESS;
+     }
+
+     auto tensorNumElems = [](const cuphyTensorPrm_t& tensorPrm,
+                              cuphyDataType_t         expectedType,
+                              const char*             name,
+                              uint64_t&               nElems) -> cuphyStatus_t {
+         if((tensorPrm.desc == nullptr) || (tensorPrm.pAddr == nullptr))
+         {
+             NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                        "loadPostPolarDataForSkip: {} tensor is null", name);
+             return CUPHY_STATUS_INVALID_ARGUMENT;
+         }
+
+         cuphyDataType_t dataType = CUPHY_VOID;
+         int             rank     = 0;
+         int             dims[CUPHY_DIM_MAX]    = {};
+         int             strides[CUPHY_DIM_MAX] = {};
+         cuphyStatus_t status = cuphyGetTensorDescriptor(tensorPrm.desc, CUPHY_DIM_MAX, &dataType, &rank, dims, strides);
+         if(status != CUPHY_STATUS_SUCCESS)
+         {
+             return status;
+         }
+         if(dataType != expectedType)
+         {
+             NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                        "loadPostPolarDataForSkip: {} tensor type mismatch (actual={}, expected={})",
+                        name, static_cast<int>(dataType), static_cast<int>(expectedType));
+             return CUPHY_STATUS_INVALID_ARGUMENT;
+         }
+
+         nElems = 1;
+         for(int dimIdx = 0; dimIdx < rank; ++dimIdx)
+         {
+             nElems *= static_cast<uint64_t>(dims[dimIdx]);
+         }
+         return CUPHY_STATUS_SUCCESS;
+     };
+
+     return cuphy::tryCallableAndCatch([&] {
+         if((postPolarData.nPolUciSegs != m_nPolSegs) || (postPolarData.nPolCws != m_nPolCbs))
+         {
+             NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                        "loadPostPolarDataForSkip: polar size mismatch (data nPolUciSegs={}, nPolCws={}; expected {} / {})",
+                        postPolarData.nPolUciSegs, postPolarData.nPolCws, m_nPolSegs, m_nPolCbs);
+             return CUPHY_STATUS_INVALID_ARGUMENT;
+         }
+         if(postPolarData.pCbEsts == nullptr)
+         {
+             NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                        "loadPostPolarDataForSkip: pCbEsts is null for {} polar codeblocks", m_nPolCbs);
+             return CUPHY_STATUS_INVALID_ARGUMENT;
+         }
+
+         std::vector<cuphy::tensor_pinned> cbEstRefs;
+         cbEstRefs.reserve(m_nPolCbs);
+         for(uint16_t cwIdx = 0; cwIdx < m_nPolCbs; ++cwIdx)
+         {
+             uint64_t nWords = 0;
+             cuphyStatus_t status = tensorNumElems(postPolarData.pCbEsts[cwIdx], CUPHY_R_32U, "cbEst", nWords);
+             if(status != CUPHY_STATUS_SUCCESS)
+             {
+                 return status;
+             }
+
+             cbEstRefs.emplace_back(CUPHY_R_32U, static_cast<int>(nWords), cuphy::tensor_flags::align_tight);
+             CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(cbEstRefs.back().addr(),
+                                                  postPolarData.pCbEsts[cwIdx].pAddr,
+                                                  nWords * sizeof(uint32_t),
+                                                  cudaMemcpyDefault,
+                                                  cuStream));
+         }
+         CUDA_CHECK_EXCEPTION(cudaStreamSynchronize(cuStream));
+
+         for(uint16_t segIdx = 0; segIdx < m_nPolSegs; ++segIdx)
+         {
+             const cuphyPolarUciSegPrm_t& segPrms = m_polSegPrmsBufCpu[segIdx];
+             uint32_t nDecodedCbBits  = static_cast<uint32_t>(segPrms.K_cw) - static_cast<uint32_t>(segPrms.nCrcBits);
+             uint32_t nDecodedCbWords = div_round_up(nDecodedCbBits, static_cast<uint32_t>(32));
+
+             for(uint8_t cbInSeg = 0; cbInSeg < segPrms.nCbs; ++cbInSeg)
+             {
+                 uint16_t cwIdx = segPrms.childCbIdxs[cbInSeg];
+                 uint64_t cbWords = 0;
+                 cuphyStatus_t status = tensorNumElems(postPolarData.pCbEsts[cwIdx], CUPHY_R_32U, "cbEst", cbWords);
+                 if(status != CUPHY_STATUS_SUCCESS)
+                 {
+                     return status;
+                 }
+                 if(cbWords < nDecodedCbWords)
+                 {
+                     NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                                "loadPostPolarDataForSkip: cbEst{} too small (words={}, expected at least {})",
+                                cwIdx, cbWords, nDecodedCbWords);
+                     return CUPHY_STATUS_INVALID_ARGUMENT;
+                 }
+
+                 CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(static_cast<void*>(m_polCbEstAddrVec[cwIdx]),
+                                                      cbEstRefs[cwIdx].addr(),
+                                                      nDecodedCbWords * sizeof(uint32_t),
+                                                      cudaMemcpyHostToDevice,
+                                                      cuStream));
+             }
+         }
+
+         std::vector<std::vector<uint32_t>> combinedSegWords(m_nPolSegs);
+         for(uint16_t segIdx = 0; segIdx < m_nPolSegs; ++segIdx)
+         {
+             const cuphyPolarUciSegPrm_t& segPrms = m_polSegPrmsBufCpu[segIdx];
+             if(segPrms.nCbs <= 1)
+             {
+                 continue;
+             }
+             uint32_t nDecodedCbBits = static_cast<uint32_t>(segPrms.K_cw) - static_cast<uint32_t>(segPrms.nCrcBits);
+             uint32_t aSeg           = static_cast<uint32_t>(segPrms.nCbs) * nDecodedCbBits
+                                       - static_cast<uint32_t>(segPrms.zeroInsertFlag);
+             uint32_t aHalf          = aSeg / 2;
+             uint32_t nSegWords      = div_round_up(aSeg, static_cast<uint32_t>(32));
+             auto& segBits           = combinedSegWords[segIdx];
+             segBits.assign(nSegWords, 0u);
+
+             auto getBit = [](const uint32_t* words, uint32_t bitIdx) -> uint32_t {
+                 return (words[bitIdx >> 5] >> (bitIdx & 31u)) & 1u;
+             };
+             auto setBit = [](uint32_t* words, uint32_t bitIdx, uint32_t b) {
+                 if(b) words[bitIdx >> 5] |=  (1u << (bitIdx & 31u));
+                 else  words[bitIdx >> 5] &= ~(1u << (bitIdx & 31u));
+             };
+
+             const uint32_t* cb0 = static_cast<const uint32_t*>(cbEstRefs[segPrms.childCbIdxs[0]].addr());
+             const uint32_t* cb1 = static_cast<const uint32_t*>(cbEstRefs[segPrms.childCbIdxs[1]].addr());
+
+             for(uint32_t i = 0; i < aHalf; ++i)
+             {
+                 setBit(segBits.data(), i, getBit(cb0, i + segPrms.zeroInsertFlag));
+             }
+             for(uint32_t i = 0; i < aSeg - aHalf; ++i)
+             {
+                 setBit(segBits.data(), aHalf + i, getBit(cb1, i));
+             }
+
+             CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(static_cast<void*>(m_pUciSegEst[segIdx]),
+                                                  segBits.data(),
+                                                  nSegWords * sizeof(uint32_t),
+                                                  cudaMemcpyHostToDevice,
+                                                  cuStream));
+         }
+
+         uint64_t nCrcFlags = 0;
+         cuphyStatus_t status = tensorNumElems(postPolarData.crcErrorFlags, CUPHY_R_8U, "crcErrorFlags", nCrcFlags);
+         if(status != CUPHY_STATUS_SUCCESS)
+         {
+             return status;
+         }
+         if(nCrcFlags < m_nPolCbs)
+         {
+             NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                        "loadPostPolarDataForSkip: crcErrorFlags too small (flags={}, expected at least {})",
+                        nCrcFlags, m_nPolCbs);
+             return CUPHY_STATUS_INVALID_ARGUMENT;
+         }
+
+         cuphy::tensor_pinned crcErrFlagsRef(CUPHY_R_8U, static_cast<int>(nCrcFlags), cuphy::tensor_flags::align_tight);
+         CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(crcErrFlagsRef.addr(),
+                                              postPolarData.crcErrorFlags.pAddr,
+                                              nCrcFlags * sizeof(uint8_t),
+                                              cudaMemcpyDefault,
+                                              cuStream));
+         CUDA_CHECK_EXCEPTION(cudaStreamSynchronize(cuStream));
+         const uint8_t* pCrcErrFlagsHost = static_cast<const uint8_t*>(crcErrFlagsRef.addr());
+
+         static const uint8_t fapiPass = static_cast<uint8_t>(CUPHY_FAPI_CRC_PASS);
+         static const uint8_t fapiFail = static_cast<uint8_t>(CUPHY_FAPI_CRC_FAILURE);
+         for(uint16_t cbIdx = 0; cbIdx < m_nPolCbs; ++cbIdx)
+         {
+             const uint8_t* pSrc = (pCrcErrFlagsHost[cbIdx] == 0) ? &fapiPass : &fapiFail;
+             uint8_t* pCrcStatusGpu  = m_polCwPrmsBufCpu[cbIdx].pCrcStatus;
+             uint8_t* pCrcStatus1Gpu = m_polCwPrmsBufCpu[cbIdx].pCrcStatus1;
+             CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(pCrcStatusGpu,  pSrc, sizeof(uint8_t), cudaMemcpyHostToDevice, cuStream));
+             CUDA_CHECK_EXCEPTION(cudaMemcpyAsync(pCrcStatus1Gpu, pSrc, sizeof(uint8_t), cudaMemcpyHostToDevice, cuStream));
+         }
+
+         CUDA_CHECK_EXCEPTION(cudaStreamSynchronize(cuStream));
+         return CUPHY_STATUS_SUCCESS;
+     });
  }

@@ -55,58 +55,68 @@ uint16_t f32_to_f16_bits(float value) {
 }
 }  // namespace
 
-void fillPusch(E3BufferInfo& bi) {
-	bi.n_cells = 1;
-	bi.cell_id = 1;
-	bi.n_rx_ant = 4;
-	bi.n_rx_ant_srs = 4;
-	bi.n_bs_ants = 4;
-	bi.n_ue = 1;
+void fillPusch(E3BufferInfo& bi, uint16_t n_cells) {
+	bi.n_cells = n_cells;
+	bi.cells.resize(n_cells);
+	for (uint16_t c = 0; c < n_cells; ++c) {
+		E3CellInfo& cell = bi.cells[c];
+		cell.cell_id = c + 1;
+		cell.n_rx_ant = 4;
+		cell.n_rx_ant_srs = 4;
+		cell.n_bs_ants = 4;
+		cell.n_ue = 1;
 
-	E3UeMetrics m{};
-	m.rnti = 45936;
-	m.rsrp = -90.0f;
-	m.sinr = 20.0f;
-	m.rssi = -70.0f;
-	m.qam_mod_order = 8;
-	m.mcs_index = 21;
-	m.rb_start = 0;
-	m.rb_size = 273;
-	m.start_symbol_index = 0;
-	m.nr_of_symbols = 13;
-	m.n_layers = kLayer;
-	m.n_subcarriers = kPrb * kSc;
-	m.n_dmrs_estimates = kDmrs;
-	m.h_offset = 0;
-	m.h_size = kHestSamples;
-	m.tb_size = 52247;
-	m.pdu_len = m.tb_size;
-	bi.ue_metrics.push_back(m);
+		E3UeMetrics m{};
+		m.rnti = 45936;
+		m.rsrp = -90.0f;
+		m.sinr = 20.0f;
+		m.rssi = -70.0f;
+		m.qam_mod_order = 8;
+		m.mcs_index = 21;
+		m.rb_start = 0;
+		m.rb_size = 273;
+		m.start_symbol_index = 0;
+		m.nr_of_symbols = 13;
+		m.n_layers = kLayer;
+		m.n_subcarriers = kPrb * kSc;
+		m.n_dmrs_estimates = kDmrs;
+		m.h_offset = 0;
+		m.h_size = kHestSamples;
+		m.tb_size = 52247;
+		m.pdu_len = m.tb_size;
+		cell.ues.push_back(m);
+	}
 }
 
-void fillSrs(E3SrsBufferInfo& si) {
-	si.n_srs_ue = 1;
-	si.n_rx_ant_srs = kSrsRxAnt;
-	si.n_cells = 1;
-	si.cell_id = 1;
+void fillSrs(E3SrsBufferInfo& si, uint16_t n_cells) {
+	si.n_cells = n_cells;
+	si.cells.resize(n_cells);
+	for (uint16_t c = 0; c < n_cells; ++c) {
+		E3SrsCellInfo& cell = si.cells[c];
+		cell.cell_id = c + 1;
+		cell.n_rx_ant_srs = kSrsRxAnt;
+		cell.srs_cell_start_sym = 1;
+		cell.srs_cell_n_srs_sym = 1;
+		cell.n_srs_ue = 1;
 
-	E3SrsUeMetrics m{};
-	m.rnti = 45936;
-	m.wideband_snr = 20.0f;
-	m.n_ant_ports = kSrsAntPorts;
-	m.n_syms = 1;
-	m.n_repetitions = 1;
-	m.comb_size = 2;
-	m.comb_offset = 0;
-	m.start_sym = 1;
-	m.resource_type = 2;
-	m.usage = 2;
-	m.t_srs = 80;
-	m.t_offset = 2;
-	m.n_valid_prg = kSrsPrbGrps;
-	m.prg_size = 1;
-	m.n_prb_grps = kSrsPrbGrps;
-	si.ue_metrics.push_back(m);  // srs_hest/rb_snr offsets+sizes set by the feeder
+		E3SrsUeMetrics m{};
+		m.rnti = 45936;
+		m.wideband_snr = 20.0f;
+		m.n_ant_ports = kSrsAntPorts;
+		m.n_syms = 1;
+		m.n_repetitions = 1;
+		m.comb_size = 2;
+		m.comb_offset = 0;
+		m.start_sym = 1;
+		m.resource_type = 2;
+		m.usage = 2;
+		m.t_srs = 80;
+		m.t_offset = 2;
+		m.n_valid_prg = kSrsPrbGrps;
+		m.prg_size = 1;
+		m.n_prb_grps = kSrsPrbGrps;
+		cell.ues.push_back(m);  // srs_hest/rb_snr offsets+sizes set by the feeder
+	}
 }
 
 void fillPuschIq(int16_t* dst, float scale) {

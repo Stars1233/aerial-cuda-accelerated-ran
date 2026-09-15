@@ -21,6 +21,7 @@ import yaml
 
 from ....analyze import extract
 from ....traffic_utils import (
+    apply_per_cell_latency,
     drop_minus_one_overrides,
     expand_tvs_for_cells,
     is_truthy,
@@ -61,13 +62,11 @@ def run(args, vectors, testcases, filenames, sLotConfig):
         filenames_mac2,
     ) = filenames
 
-    ofile = open(vectors, "w")
-
     payload = {}
-    payload["cells"] = len(testcases_dl)
+    payload["cells"] = max(len(testcases_dl) if testcases_dl else 0, len(testcases_ul) if testcases_ul else 0)
     payload["slots_per_pattern"] = args.pattern_len
 
-    priorities, start_delay, tv_overrides, cumac_options = load_tdd_yaml_overrides(getattr(args, "yaml", None), logger)
+    priorities, start_delay, tv_overrides, cumac_options, gc_sm_alloc = load_tdd_yaml_overrides(getattr(args, "yaml", None), logger)
 
     if priorities is None:
         with open("measure/TDD/priorities.json", "r", encoding="utf-8") as ifile:
@@ -192,13 +191,27 @@ def run(args, vectors, testcases, filenames, sLotConfig):
     if isinstance(cumac_options, dict) and cumac_options:
         payload["cumac_options"] = cumac_options
 
+    if isinstance(gc_sm_alloc, dict) and gc_sm_alloc:
+        payload["green_context_sm_alloc"] = gc_sm_alloc
+
     cleaned_tv_overrides = drop_minus_one_overrides(tv_overrides)
     if isinstance(cleaned_tv_overrides, dict) and cleaned_tv_overrides:
+        # enable_per_cell_latency is a generator-only directive: pop it so it is
+        # never emitted to the vectors YAML and never counts as a meaningful key.
+        per_cell_latency = is_truthy(cleaned_tv_overrides.pop("enable_per_cell_latency", False))
+        if per_cell_latency:
+            # Each channel scales by its own cell count: a channel with fewer
+            # cells models proportionally less offloaded work.
+            apply_per_cell_latency(cleaned_tv_overrides, {
+                "PRACH": len(testcases_ra or ()), "PUSCH": len(testcases_ul or ()),
+                "PUCCH": len(testcases_cul or ()), "SRS": len(testcases_sr or ()),
+                "PDSCH": len(testcases_dl or ()), "PDCCH": len(testcases_cdl or ()),
+                "CSIRS": len(testcases_cr or ()),
+            })
         enabled = is_truthy(cleaned_tv_overrides.get("enable_override", False))
         meaningful_keys = [k for k in cleaned_tv_overrides.keys() if k != "enable_override"]
         if enabled and len(meaningful_keys) > 0:
             payload["override_test_vectors"] = cleaned_tv_overrides
 
-    ofile = open(vectors, "w")
-    yaml.dump(payload, ofile, sort_keys=False)
-    ofile.close()
+    with open(vectors, "w") as ofile:
+        yaml.dump(payload, ofile, sort_keys=False)

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 
 #include <cuda_runtime.h>
 #include "cuphy.h"
+#include "cuphy_clmad_util.cuh"
 #include "cuphy_internal.h"
 #include "descrambling.hpp"
 #include "GOLD_2_32_P_LUT.h"
@@ -309,6 +310,25 @@ CUDA_BOTH inline uint32_t mulModPoly31LUT(uint32_t a,
                                           uint32_t b,
                                           uint32_t poly)
 {
+#if CUPHY_CLMAD_AVAILABLE
+    if(poly == POLY_2)
+    {
+        cuphy_clmad::u64_u32x2 abX;
+        abX.u64 = cuphy_clmad::clmul_lo(static_cast<uint64_t>(a),
+                                        static_cast<uint64_t>(b));
+
+        const uint32_t pX = abX.u32[0] & 0x7FFFFFFFu;
+        const uint32_t cX = __funnelshift_rc(abX.u32[0], abX.u32[1], 31);
+        const uint32_t resA =
+            cuphy_clmad::opt_reduction<31,
+                                        31,
+                                        cuphy_clmad::qplusX_gold31,
+                                        cuphy_clmad::gastrX_gold31>(cX);
+
+        return resA ^ pX;
+    }
+#endif
+
     uint32_t prod = 0;
     // a moduloe POLY_2, 31 BITs
     uint32_t crc = a ^ (a >= POLY_2) * POLY_2;

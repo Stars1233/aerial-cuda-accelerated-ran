@@ -123,6 +123,10 @@ public:
     // CUMAC task bitmask: b0 - multiCellUeSelection; b1 - multiCellScheduler; b2 - multiCellLayerSel; b3 - mcsSelectionLUT
     int task_bitmask = 0;
 
+    // Slot offset applied when mapping MU UE grouping TV files to slot indices.
+    // TV file for slot_id is looked up at (slot_id + srs_slot_lag) % sched_slot_num.
+    int srs_slot_lag = 0;
+
     uint32_t cumac_cell_num = 0;
 
     // Total slot number in cuMAC-CP test

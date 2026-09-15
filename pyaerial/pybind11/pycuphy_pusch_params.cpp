@@ -501,6 +501,12 @@ void PuschParams::setStatPrms(const py::object& statPrms) {
     m_puschStatPrms.earlyHarqProcNodePriority = statPrms.attr("earlyHarqProcNodePriority").cast<int32_t>();
     m_puschStatPrms.workCancelMode            = statPrms.attr("workCancelMode").cast<cuphyPuschWorkCancelMode_t>();
     m_puschStatPrms.enableBatchedMemcpy       = statPrms.attr("enableBatchedMemcpy").cast<uint8_t>();
+    m_puschStatPrms.openRanFunctionalSplitOption = PUSCH_7_2_A;
+    m_puschStatPrms.kernelSelOption              = PUSCH_ALL;
+    m_puschStatPrms.uciKernelSelOption           = PUSCH_UCI_ALL;
+    m_puschStatPrms.delayUs                      = 0;
+    m_puschStatPrms.subSlotDelayUs               = 0;
+    
     if (py::object attr = py::getattr(statPrms, "chestFactorySettingsFilename"); !attr.is_none())
     {
         m_puschrxChestFactorySettingsFilename = statPrms.attr("chestFactorySettingsFilename").cast<
@@ -515,9 +521,11 @@ void PuschParams::setStatPrms(const py::object& statPrms) {
     CUDA_CHECK_EXCEPTION_PRINTF_VERSION(cudaEventCreate(&m_subSlotCompletedEvent));
     CUDA_CHECK_EXCEPTION_PRINTF_VERSION(cudaEventCreate(&m_waitCompletedSubSlotEvent));
     CUDA_CHECK_EXCEPTION_PRINTF_VERSION(cudaEventCreate(&m_waitCompletedFullSlotEvent));
+    CUDA_CHECK_EXCEPTION_PRINTF_VERSION(cudaEventCreate(&m_uciOnPuschCompletedEvent));
     m_puschStatPrms.subSlotCompletedEvent = m_subSlotCompletedEvent;
     m_puschStatPrms.waitCompletedSubSlotEvent = m_waitCompletedSubSlotEvent;
     m_puschStatPrms.waitCompletedFullSlotEvent = m_waitCompletedFullSlotEvent;
+    m_puschStatPrms.uciOnPuschCompletedEvent = m_uciOnPuschCompletedEvent;
 
     // Channel estimation filters.
     py::array WFreq       = statPrms.attr("WFreq");
@@ -864,6 +872,9 @@ void PuschParams::setDynPrmsPhase1(const py::object& dynPrms) {
         m_tPrmDataRx[cellIdx].pAddr = m_tDataRx[cellIdx].addr();
     }
     m_puschDataIn.pTDataRx = m_tPrmDataRx.data();
+    m_puschDataIn.pTX_72e      = nullptr;
+    m_puschDataIn.pTReeInv_72e = nullptr;
+
     m_puschDynPrms.pDataIn = &m_puschDataIn;
 
     // Output
@@ -896,6 +907,9 @@ void PuschParams::setDynPrmsPhase1(const py::object& dynPrms) {
     m_puschDataOut.CsiP2DetectionStatus             = numpyArrayToPtr<uint8_t>(dataOut.attr("CsiP2DetectionStatus"));
     m_puschDataOut.pPreEarlyHarqWaitKernelStatusGpu = nullptr;//numpyArrayToPtr<uint8_t>(dataOut.attr("preEarlyHarqWaitStatus"));
     m_puschDataOut.pPostEarlyHarqWaitKernelStatusGpu= nullptr;//numpyArrayToPtr<uint8_t>(dataOut.attr("postEarlyHarqWaitStatus"));
+
+    m_puschDataOut.nPerCellTbDests = 0;
+    std::memset(m_puschDataOut.pPerCellTbPayloads, 0, sizeof(m_puschDataOut.pPerCellTbPayloads));
 
     m_puschDynPrms.pDataOut = &m_puschDataOut;
 

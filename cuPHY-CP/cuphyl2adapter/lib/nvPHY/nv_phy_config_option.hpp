@@ -1,5 +1,5 @@
-/*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    /*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,6 +36,14 @@ namespace nv {
         int staticSsbSlotNum;
         int staticPucchSlotNum;
         bool duplicateConfigAllCells;
+        /// Number of cells per DL C-plane batch fired at EOM.
+        /// 0 means "unspecified/invalid" and falls back to one EOM batch for all accumulated DL cells.
+        uint8_t cplane_processing_dl_batch_size{};
+        /// Number of cells per UL C-plane batch fired at EOM.
+        /// 0 means "unspecified/invalid" and falls back to one EOM batch for all accumulated UL cells.
+        uint8_t cplane_processing_ul_batch_size{};
+        /// Precomputed max number of DL batches used as UL tx-id offset base.
+        uint8_t cplane_max_num_dl_batches{1};
         explicit phy_config_option():
         precoding_enabled(false),
         bf_enabled(false),
@@ -63,7 +71,10 @@ namespace nv {
         staticSsbSFN(std::move(other.staticSsbSFN)),
         staticSsbSlotNum(std::move(other.staticSsbSlotNum)),
         staticPucchSlotNum(std::move(other.staticPucchSlotNum)),
-        duplicateConfigAllCells(std::move(other.duplicateConfigAllCells))
+        duplicateConfigAllCells(std::move(other.duplicateConfigAllCells)),
+        cplane_processing_dl_batch_size(other.cplane_processing_dl_batch_size),
+        cplane_processing_ul_batch_size(other.cplane_processing_ul_batch_size),
+        cplane_max_num_dl_batches(other.cplane_max_num_dl_batches)
         {}
 
         phy_config_option(phy_config_option&) = delete;

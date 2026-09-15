@@ -18,8 +18,15 @@
 #include "nv_phy_module.hpp"
 #include "nv_phy_factory.hpp"
 #include "nv_phy_driver_proxy.hpp"
+#include "nv_scope_exit.hpp"
+#include "scf_5g_fapi.h"
 #include "memtrace.h"
+#include "cuphy.h"
+#include "nv_dl_aggr_tasks.hpp"
+#include "nv_ul_aggr_tasks.hpp"
 #include "oran_utils/conversion.hpp"
+#include <bit>
+#include <cstdlib>
 #include <grpcpp/grpcpp.h>
 #include "aerial_common.grpc.pb.h"
 
@@ -30,6 +37,9 @@
 #include "cuphyoam.hpp"
 
 #include <unistd.h> // usleep(), temporary!
+#include <algorithm>
+#include <span>
+#include <utility>
 #include <chrono>
 #include <atomic>
 
@@ -39,6 +49,72 @@ using grpc::Status;
 
 namespace nv
 {
+
+constexpr int32_t LOOPBACK_SLOT_INDICATION = 0x82; // Align with SCF_FAPI_SLOT_INDICATION in scf_5g_fapi.h
+
+namespace {
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+constexpr const char* NONSLOT_LP_THREAD_NAME = "nonslot_lp";
+
+[[nodiscard]] NonSlotLpWorkerConfig parse_nonslot_thread_config(const yaml::node cfg,
+                                                                const char* fallback_name)
+{
+    NonSlotLpWorkerConfig parsed{};
+    parsed.name = cfg.has_key("name") ? cfg["name"].as<std::string>() : fallback_name;
+    parsed.cpu_affinity = cfg.has_key("cpu_affinity") ? cfg["cpu_affinity"].as<int32_t>() : -1;
+    parsed.sched_priority = cfg.has_key("sched_priority") ? cfg["sched_priority"].as<int32_t>() : 0;
+    return parsed;
+}
+
+/// Placement/priority of a reference RT thread the LP worker must stay below.
+struct RtThreadRef final {
+    bool valid{false};
+    int  cpu_affinity{-1};
+    int  sched_priority{0};
+};
+
+/// Clamp @p priority to one below the lowest configured msg/timer RT priority,
+/// warning when a clamp actually occurs. Returns @p priority unchanged when no
+/// RT reference is configured.
+/// @note The cuphydriver DL/UL workers run at the message thread priority by
+///   convention (workers_sched_priority == message_thread_config.sched_priority),
+///   so clamping below the msg priority also keeps the LP worker below them.
+[[nodiscard]] int clamp_below_rt_priority(int priority,
+                                          const RtThreadRef& msg,
+                                          const RtThreadRef& timer,
+                                          const char* ctx)
+{
+    bool has_cap = false;
+    int  cap     = 0;
+    if (msg.valid && msg.sched_priority > 0)
+    {
+        cap     = msg.sched_priority - 1;
+        has_cap = true;
+    }
+    if (timer.valid && timer.sched_priority > 0)
+    {
+        const int timer_cap = timer.sched_priority - 1;
+        cap     = has_cap ? std::min(cap, timer_cap) : timer_cap;
+        has_cap = true;
+    }
+    if (!has_cap)
+    {
+        return priority;
+    }
+    cap = std::max(0, cap);
+    if (priority > cap)
+    {
+        NVLOGW_FMT(TAG,
+                   "{}: clamping nonslot_lp sched_priority from {} to {} so it stays below msg/timer priority",
+                   ctx, priority, cap);
+        return cap;
+    }
+    return priority;
+}
+#endif
+
+} // namespace
 
 static int oam_update_cell_attenuation(int32_t mplane_id, float attenuation_dB) {
     return PHYDriverProxy::getInstance().l1_cell_update_attenuation(mplane_id, attenuation_dB);
@@ -135,6 +211,20 @@ std::unordered_map<uint16_t, digBeam_t> PHY_module::static_digBeam_weight_map_ {
 
 PHY_module::~PHY_module()
 {
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    stop_nonslot_lp_worker();
+#endif
+
+    for (std::size_t i = 0; i < slot_message_storage_.size(); ++i) {
+        tx_data_ring_.set_deferred(static_cast<uint32_t>(i), false);
+        slot_message_storage_[i].release_all(transport_wrapper());
+    }
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    for (auto& storage : nonslot_dispatch_state_.message_storage) {
+        storage.release_all(transport_wrapper());
+    }
+#endif
+
     if (slot_latency != nullptr)
     {
         slot_latency->close(slot_latency);
@@ -146,6 +236,58 @@ PHY_module::~PHY_module()
         tick_logger = nullptr;
     }
 }
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+void PHY_module::init_nonslot_lp_thread_config(yaml::node node_config)
+{
+    // Reference RT threads the "low-priority" worker must never preempt.
+    RtThreadRef msg{};
+    if (thread_cfg_ != nullptr)
+    {
+        msg = RtThreadRef{true, thread_cfg_->cpu_affinity, thread_cfg_->sched_priority};
+    }
+    RtThreadRef timer{};
+    if (node_config.has_key("timer_thread_config"))
+    {
+        const auto timer_cfg = parse_nonslot_thread_config(node_config["timer_thread_config"], "timer_thread");
+        timer = RtThreadRef{true, timer_cfg.cpu_affinity, timer_cfg.sched_priority};
+    }
+
+    NonSlotLpThreadConfig config{};
+    const bool explicit_cfg = node_config.has_key("nonslot_lp_thread_config");
+    if (explicit_cfg)
+    {
+        config.worker_cfg = parse_nonslot_thread_config(node_config["nonslot_lp_thread_config"],
+                                                        NONSLOT_LP_THREAD_NAME);
+        // Lower-bound like the inherited path: clamp_below_rt_priority only upper-caps, so a
+        // hand-edited negative sched_priority would otherwise reach RT worker setup.
+        config.worker_cfg.sched_priority = std::max(0, config.worker_cfg.sched_priority);
+    }
+    else
+    {
+        // No explicit block: inherit the msg thread's core (else timer's) and
+        // run one priority step below it so the worker stays low-priority.
+        const RtThreadRef& base = msg.valid ? msg : timer;
+        config.worker_cfg.cpu_affinity = base.cpu_affinity;
+        config.worker_cfg.sched_priority = std::max(0, base.sched_priority - 1);
+    }
+    config.worker_cfg.name = NONSLOT_LP_THREAD_NAME;
+    config.worker_cfg.sched_priority =
+        clamp_below_rt_priority(config.worker_cfg.sched_priority, msg, timer, __func__);
+
+    NVLOGI_FMT(TAG,
+               "{}: nonslot_lp config explicit={} cpu={} priority={} msg_valid={} msg_cpu={} msg_priority={} "
+               "timer_valid={} timer_cpu={} timer_priority={} (parallel non-slot dispatch is the only mode)",
+               __func__,
+               explicit_cfg,
+               config.worker_cfg.cpu_affinity,
+               config.worker_cfg.sched_priority,
+               msg.valid, msg.cpu_affinity, msg.sched_priority,
+               timer.valid, timer.cpu_affinity, timer.sched_priority);
+
+    nonslot_dispatch_state_.install_worker(*this, std::move(config));
+}
+#endif
 
 PHY_module::PHY_module(yaml::node node_config) :
     total_cell_num(nv::PHYDriverProxy::getInstance().l1_get_cell_group_num()),
@@ -167,9 +309,7 @@ PHY_module::PHY_module(yaml::node node_config) :
     num_msgs(0),
     ipc_sync_mode(sync_mode_t::SYNC_MODE_PER_CELL),
     config_options_(),
-    fapi_config_check_mask_(0),
-    cell_limit_errors_{},
-    group_limit_errors_()
+    fapi_config_check_mask_(0)
 {
     if (node_config.has_key("allowed_fapi_latency"))
     {
@@ -184,6 +324,27 @@ PHY_module::PHY_module(yaml::node node_config) :
     NVLOGC_FMT(TAG, "{}: transport_num={} total_cell_num={}", __func__, transport_wrapper_.get_transport_num(), total_cell_num);
 
     next_slot_fapi_num = 0;
+
+#ifdef ENABLE_L2_SLT_RSP
+    reset_l1_limit_errors();
+#endif
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    // FapiSlotMessageStorage's capacity-init constructor is defined in the
+    // store-replay-only translation unit (nv_fapi_message_storage.cpp, gated in
+    // CMake). In non-store-replay builds the storage is never populated, so skip
+    // the re-init; the members keep their default-constructed empty state.
+    for (auto& storage : slot_message_storage_) {
+        storage = FapiSlotMessageStorage(MAX_CELLS_PER_SLOT);
+    }
+    // non_slot_message_storage_ is value-initialized by its NSDMI {}; no loop needed.
+
+    // Pre-allocate every UL order-scratch entry now so the per-slot
+    // reset_ul_order_scratch / worker-side ul_order_scratch_sym_prb_info paths
+    // never allocate on live traffic. Allocation lives solely here; the per-slot
+    // paths only clear pre-allocated storage.
+    prealloc_ul_order_scratch();
+#endif
 
     //------------------------------------------------------------------
     // Create a PHY instance for each element of the "instances" YAML
@@ -224,6 +385,10 @@ PHY_module::PHY_module(yaml::node node_config) :
         thread_cfg_->cpu_affinity = cfg["cpu_affinity"].as<int32_t>();
         thread_cfg_->sched_priority = cfg["sched_priority"].as<int32_t>();
     }
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    init_nonslot_lp_thread_config(node_config);
+#endif
 
     if(node_config.has_key("sfn_slot_sync_se")){
         yaml::node sfn_slot_sync_se_config = node_config["sfn_slot_sync_se"];
@@ -432,6 +597,19 @@ PHY_module::PHY_module(yaml::node node_config) :
     if (node_config.has_key("duplicate_config_all_cells")) {
         config_options_.duplicateConfigAllCells = (static_cast<uint>(node_config["duplicate_config_all_cells"]) > 0);
     }
+
+    auto& driver_proxy = nv::PHYDriverProxy::getInstance();
+    config_options_.cplane_processing_dl_batch_size =
+        driver_proxy.l1_get_cplane_processing_dl_batch_size();
+    config_options_.cplane_processing_ul_batch_size =
+        driver_proxy.l1_get_cplane_processing_ul_batch_size();
+    const uint8_t effective_dl_batch_size = config_options_.cplane_processing_dl_batch_size;
+    config_options_.cplane_max_num_dl_batches = static_cast<uint8_t>(
+        (MAX_CELLS_PER_SLOT + effective_dl_batch_size - 1u) / effective_dl_batch_size);
+    NVLOGI_FMT(TAG, "cplane_processing_dl_batch_size={}", config_options_.cplane_processing_dl_batch_size);
+    NVLOGI_FMT(TAG, "cplane_processing_ul_batch_size={}", config_options_.cplane_processing_ul_batch_size);
+    NVLOGI_FMT(TAG, "cplane_max_num_dl_batches={}", config_options_.cplane_max_num_dl_batches);
+
     // Tick interval error statistic logger
     int64_t stat_period = 1E9 / mu_to_ns(tick_updater_.mu_highest_) * 5;
     tick_logger = stat_log_open("TICK.ERROR", STAT_MODE_COUNTER, stat_period); // Print every 5 seconds
@@ -474,7 +652,58 @@ PHY_module::PHY_module(yaml::node node_config) :
 
     CuphyOAM::getInstance()->callback.update_cell_attenuation = oam_update_cell_attenuation;
     TxNotificationHelper::setEnableTxNotification(PHYDriverProxy::getInstance().l1_get_dl_tx_notification());
+
 }
+
+void PHY_module::incr_active_cells()
+{
+    num_cells_active++;
+}
+
+void PHY_module::decr_active_cells()
+{
+    num_cells_active--;
+}
+
+#ifdef ENABLE_L2_SLT_RSP
+void PHY_module::set_curr_sfn_slot(const sfn_slot_t ss)
+{
+    NVLOGI_FMT(TAG, "{}: set ss_curr from SFN {}.{} to SFN {}.{}", __func__, ss_curr.u16.sfn, ss_curr.u16.slot, ss.u16.sfn, ss.u16.slot);
+    ss_curr.u32 = ss.u32;
+}
+
+#if !defined(ENABLE_FAPI_STORE_REPLAY)
+uint64_t PHY_module::get_active_cell_bitmap() const noexcept
+{
+    return active_cell_bitmap;
+}
+
+uint32_t PHY_module::get_active_cell_count() const noexcept
+{
+    return num_cells_active;
+}
+
+void PHY_module::set_active_cell_bitmap(const uint16_t cell_id)
+{
+    if (cell_id >= 64U)
+    {
+        NVLOGW_FMT(TAG, "{}: cell_id={} out of range (>=64); ignoring", __func__, cell_id);
+        return;
+    }
+    active_cell_bitmap |= 1ULL << cell_id;
+}
+
+void PHY_module::unset_active_cell_bitmap(const uint16_t cell_id)
+{
+    if (cell_id >= 64U)
+    {
+        NVLOGW_FMT(TAG, "{}: cell_id={} out of range (>=64); ignoring", __func__, cell_id);
+        return;
+    }
+    active_cell_bitmap &= ~(1ULL << cell_id);
+}
+#endif
+#endif
 
 ////////////////////////////////////////////////////////////////////////
 // PHY_module::join()
@@ -483,6 +712,10 @@ void PHY_module::join()
     if (thread_.joinable()) {
         thread_.join();
     }
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    stop_nonslot_lp_worker();
+#endif
 
     // Tick thread is not started at initial, so join it after the msg_processing thread joined
     tti_module_.timer_thread_join();
@@ -539,6 +772,10 @@ void PHY_module::start()
        }
     }
 
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    start_nonslot_lp_worker();
+#endif
+
     pthread_t thread_id;
     status=pthread_create(&thread_id, NULL, cell_update_thread_func, this);
     if(status)
@@ -554,10 +791,12 @@ void PHY_module::start()
     }
 
     CuphyOAM::getInstance()->cell_eaxcids_update_callback = [this] (uint16_t mplane_id, std::unordered_map<int, std::vector<uint16_t>>& eaxcids_ch_map) {
+        PHYDriverProxy::getInstance().l1_bind_thread_to_phy_cuda_context();
         oam_cell_eaxcids_update(mplane_id, eaxcids_ch_map);
     };
 
     CuphyOAM::getInstance()->cell_multi_attri_update_callback = [this] (uint16_t mplane_id, std::unordered_map<std::string, double>& attrs, std::unordered_map<std::string, int>& res) {
+        PHYDriverProxy::getInstance().l1_bind_thread_to_phy_cuda_context();
         oam_cell_multi_attri_update(mplane_id, attrs, res);
     };
 
@@ -585,13 +824,33 @@ void PHY_module::stop()
     }
 }
 
-////////////////////////////////////////////////////////////////////////
-// PHY_module::recv_msg()
 #ifdef ENABLE_L2_SLT_RSP
+/*
+ * PHY_module::recv_msg()
+ *
+ * ss_curr represents the current SFN/slot — the slot whose FAPI messages are
+ * actively being handled. It increases monotonically.
+ *
+ * Logic / rules:
+ *   (1) Init / re-sync: When there are no pending or cached messages, set
+ *       ss_curr = ss_msg on the first FAPI message of a new slot.
+ *   (2) Normal advance: When all cells have sent SLOT.resp for the current
+ *       slot, call process_phy_commands() and advance ss_curr by one.
+ *   (3) N+2 loopback timeout: If not all cells have sent SLOT.resp before the
+ *       N+2 SLOT.ind arrives (rule 2 incomplete), call process_phy_commands()
+ *       and advance ss_curr by one. Slot-N FAPI arriving after the N+2
+ *       SLOT.ind is dropped.
+ *   (4) Early slot-N+1 cache (Multi-L2): If slot-N+1 FAPI arrives before slot-N
+ *       processing completes, cache it in next_slot_fapi_cache and set the cell
+ *       bit in cached_cell_bitmap.
+ *   (5) L2 slot-order implicit completion: Each L2 cell sends FAPI in slot order.
+ *       When every active cell has cached at least one slot-N+1 FAPI (rule 4),
+ *       slot N is treated as finished even if not all cells sent SLOT.resp —
+ *       call process_phy_commands() and advance ss_curr by one.
+ */
 bool PHY_module::recv_msg()
 {
     phy_mac_msg_desc smsg;
-    static uint32_t last_processed_slot = 0xFFFFFFFF;
 
     while(transport_wrapper().rx_recv(smsg) >= 0)
     {
@@ -602,52 +861,94 @@ bool PHY_module::recv_msg()
         NVLOGI_FMT(TAG, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SFN {}.{}",
                 ss_curr.u16.sfn, ss_curr.u16.slot, smsg.cell_id, smsg.msg_id, ss_msg.u16.sfn, ss_msg.u16.slot);
 
-        // Reset L1 limit errors when we start processing a NEW slot
-        // This prevents counter accumulation across slots
-        if (ss_msg.u32 != SFN_SLOT_INVALID && ss_msg.u32 != last_processed_slot) {
-            NVLOGD_FMT(TAG, "New slot detected: SFN {}.{} (was {}.{}), resetting L1 limit errors (PDSCH parsed was {})",
-                       ss_msg.u16.sfn, ss_msg.u16.slot,
-                       (last_processed_slot >> 16) & 0xFFFF, last_processed_slot & 0xFFFF,
-                       group_limit_errors_.pdsch_errors.parsed);
-            reset_l1_limit_errors();
-            last_processed_slot = ss_msg.u32;
+        if (smsg.cell_id < 0 || static_cast<std::size_t>(smsg.cell_id) >= phy_refs_.size())
+        {
+            NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "SFN {}.{} RECV: invalid cell_id={} msg_id=0x{:02X} SFN {}.{} - drop",
+                    ss_curr.u16.sfn, ss_curr.u16.slot, smsg.cell_id, smsg.msg_id, ss_msg.u16.sfn, ss_msg.u16.slot);
+            transport_wrapper().rx_release(smsg);
+            continue;
         }
 
-        // For disordered FAPI in Multi-L2: new slot messages comes before processing current slot and updating ss_curr
-        if(ss_msg.u32 != SFN_SLOT_INVALID && smsg.msg_id != 0x82 && ss_msg.u32 == get_next_sfn_slot(ss_curr).u32) {
-            // Save next slot FAPI message to next_slot_fapi_cache, then continue
+        /* Rule (1): init / re-sync — adopt ss_msg when no pending or cached messages. */
+        if (ss_msg.u32 != SFN_SLOT_INVALID && ss_msg.u32 != ss_curr.u32 && curr_slot_fapi_num == 0 && next_slot_fapi_num == 0) {
+            set_curr_sfn_slot(ss_msg);
+        }
+
+        /* Rule (4): cache early slot-N+1 FAPI; set cached_cell_bitmap for rule (5). */
+        if(ss_msg.u32 != SFN_SLOT_INVALID && smsg.msg_id != LOOPBACK_SLOT_INDICATION && ss_msg.u32 == get_next_sfn_slot(ss_curr).u32) {
+            /* Save next slot FAPI message to next_slot_fapi_cache, then continue. */
             if (next_slot_fapi_num < next_slot_fapi_cache.size()) {
                 next_slot_fapi_cache[next_slot_fapi_num++] = smsg;
-                NVLOGW_FMT(TAG, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SFN {}.{} - early received next slot message",
-                        ss_curr.u16.sfn, ss_curr.u16.slot, smsg.cell_id, smsg.msg_id, ss_msg.u16.sfn, ss_msg.u16.slot);
+                NVLOGW_FMT(TAG, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SFN {}.{} cell_bitmaps: active=0x{:X} eom=0x{:X} cached=0x{:X} - early received next slot message",
+                        ss_curr.u16.sfn, ss_curr.u16.slot, smsg.cell_id, smsg.msg_id, ss_msg.u16.sfn, ss_msg.u16.slot, active_cell_bitmap, fapi_eom_rcvd_bitmap, cached_cell_bitmap);
+                cached_cell_bitmap |= (1ULL << smsg.cell_id);
             } else {
                 NVLOGE_FMT(TAG, AERIAL_L2ADAPTER_EVENT, "SFN {}.{} RECV: cell_id={} msg_id=0x{:02X} SFN {}.{} - next_slot_fapi_cache out of boundary, drop",
                         ss_curr.u16.sfn, ss_curr.u16.slot, smsg.cell_id, smsg.msg_id, ss_msg.u16.sfn, ss_msg.u16.slot);
                 transport_wrapper().rx_release(smsg);
             }
-            continue;
+        }
+        else
+        {
+            if(phy_refs_[smsg.cell_id].get().on_msg(smsg))
+            {
+                // Release the NVIPC buffers if FAPI message handle finished in on_msg()
+                transport_wrapper().rx_release(smsg);
+            }
+
+            if(ss_msg.u32 != SFN_SLOT_INVALID && smsg.msg_id != LOOPBACK_SLOT_INDICATION)
+            {
+                curr_slot_fapi_num++; // Increment the current slot FAPI message count
+            }
         }
 
-        if(phy_refs_[smsg.cell_id].get().on_msg(smsg))
-        {
-            // Release the NVIPC buffers if FAPI message handle finished in on_msg()
-            transport_wrapper().rx_release(smsg);
+        /*
+         * Slot-end triggers (see recv_msg block comment above):
+         *   (3) N+2 loopback SLOT.ind received
+         *   (2) All active cells received SLOT.resp (EOM)
+         *   (5) All active cells cached slot-N+1 FAPI (implicit slot-N completion)
+         */
+        bool to_process_slot_command = false;
+        bool slot_end_rcvd = false;
+        if (smsg.msg_id == LOOPBACK_SLOT_INDICATION && get_slot_interval(ss_curr, ss_msg) >= 2) {
+            /* Rule (3): N+2 loopback timeout */
+            to_process_slot_command = true;
+        } else if (active_cell_bitmap && (fapi_eom_rcvd_bitmap & active_cell_bitmap) == active_cell_bitmap) {
+            /* Rule (2): all cells sent SLOT.resp */
+            to_process_slot_command = true;
+            slot_end_rcvd = true;
+        } else if (active_cell_bitmap && (cached_cell_bitmap & active_cell_bitmap) == active_cell_bitmap) {
+            /*
+             * Rule (5): L2 slot-order implicit completion — each cell sends FAPI in
+             * slot order, so every active cell having cached slot-N+1 FAPI means
+             * slot N finished without all cells sending SLOT.resp.
+             */
+            to_process_slot_command = true;
         }
 
-        // Process slot command at one of below cases:
-        // (1) Loopback SLOT.ind was received
-        // (2) All active cells received SLOT.resp for current SFN/SLOT
-        if (smsg.msg_id == 0x82 || (active_cell_bitmap && (fapi_eom_rcvd_bitmap & active_cell_bitmap) == active_cell_bitmap))
+        if (to_process_slot_command)
         {
-            bool slot_end_rcvd = smsg.msg_id == 0x82 ? false : true;
             process_phy_commands(slot_end_rcvd);
             fapi_eom_rcvd_bitmap = 0;
+            cached_cell_bitmap = 0;
+            curr_slot_fapi_num = 0;
             new_slot_ = true;
             is_ul_slot_ = false;
             is_dl_slot_ = false;
             is_csirs_slot_ = false;
 
-            // Process cached new slot FAPI messages and reset the counter
+            // Reset L1 limit errors when we start processing a NEW slot
+            // Log PDSCH counter before reset for debugging
+            NVLOGD_FMT(TAG, "SFN {}.{} Resetting L1 limit errors at slot end - PDSCH parsed={}, errors={}",
+                    ss_curr.u16.sfn, ss_curr.u16.slot,
+                    group_limit_errors_.pdsch_errors.parsed,
+                    group_limit_errors_.pdsch_errors.errors);
+            reset_l1_limit_errors();
+
+            /* Rule (2)/(3)/(5): advance ss_curr by one */
+            set_curr_sfn_slot(get_next_sfn_slot(ss_curr));
+
+            /* Rule (4): process cached slot-N+1 FAPI via on_msg() */
             for (uint32_t i = 0; i < next_slot_fapi_num; i++)
             {
                 auto& desc = next_slot_fapi_cache[i];
@@ -657,12 +958,8 @@ bool PHY_module::recv_msg()
                     transport_wrapper().rx_release(desc);
                 }
             }
+            curr_slot_fapi_num += next_slot_fapi_num; // Add the processed FAPI message count
             next_slot_fapi_num = 0;
-            // Log PDSCH counter before reset for debugging
-            NVLOGD_FMT(TAG, "Resetting L1 limit errors at slot end - PDSCH parsed={}, errors={}",
-                       group_limit_errors_.pdsch_errors.parsed,
-                       group_limit_errors_.pdsch_errors.errors);
-            reset_l1_limit_errors();
         }
     }
 
@@ -813,6 +1110,8 @@ void* PHY_module::cell_update_thread_func(void* arg)
 
     PHY_module *phy_mod = (PHY_module *)arg;
 
+    PHYDriverProxy::getInstance().l1_bind_thread_to_phy_cuda_context();
+
     while(1)
     {
          CuphyOAM *oam = CuphyOAM::getInstance();
@@ -893,9 +1192,12 @@ void PHY_module::msg_processing()
     memtrace_set_config(MI_MEMTRACE_CONFIG_ENABLE | MI_MEMTRACE_CONFIG_EXIT_AFTER_BACKTRACE);
     try
     {
-        // The while loop in recv_msg() returns only when there is no more message to receive. No need to add additional polling here.
+#ifdef ENABLE_FAPI_STORE_REPLAY
+        // New store-first path: enqueue DL tasks from stored slot payloads (no serial replay).
+        process_fapi_messages();
+#else
         recv_msg();
-
+#endif
 #ifdef FORCE_SLEEP_OF_L2A_MSG_THREAD
         // Add sleep to avoid system blocking by SCHED_FIFO + polling thread
         std::this_thread::sleep_for(std::chrono::nanoseconds(1));
@@ -996,27 +1298,46 @@ void PHY_module::thread_func()
 
 bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slot, bool slot_end_rcvd)
 {
-    //If slot_end_rcvd == false, the subtract 1 from slot because ss_curr is updated to the new slot
-    //while this function is called for l1_enqueue of previous slot
-    if(!slot_end_rcvd)
-        slot = (slot + nv::mu_to_slot_in_sf(get_mu_highest()) - 1)%10;
+    // recv_msg() calls process_phy_commands() before advancing ss_curr, so slot
+    // already refers to the slot being processed in both EOM and non-EOM paths.
 
-    NVLOGD_FMT(TAG, "{} slot = {} now={} l1_slot_ind_tick_={} l2a_allowed_latency_={} diff={}.",__func__,
-         slot, now.count(), l1_slot_ind_tick_[slot%10].count(),l2a_allowed_latency_,(now - l1_slot_ind_tick_[slot%10]).count());
+    int64_t diff_ns;
+    int64_t threshold_ns = static_cast<int64_t>(nv::mu_to_ns(get_mu_highest()) + l2a_allowed_latency_);
 
-    if((now - l1_slot_ind_tick_[slot%10]).count() > (nv::mu_to_ns(get_mu_highest()) + l2a_allowed_latency_))
+    if (slot_end_rcvd) {
+        // Triggered on EOM: FAPI was delayed after 0x82. Latency is from FAPI arrival, not from 0x82.
+        if (last_fapi_msg_tick_.count() <= 0) {
+            NVLOGD_FMT(TAG, "{} slot={} slot_end_rcvd=true no last_fapi_msg_tick, allow", __func__, slot);
+            return true;
+        }
+        diff_ns = (now - last_fapi_msg_tick_).count();
+        NVLOGD_FMT(TAG, "{} slot={} slot_end_rcvd=true now={} last_fapi_msg_tick={} diff={} ns threshold={} ns", __func__,
+             slot, now.count(), last_fapi_msg_tick_.count(), diff_ns, threshold_ns);
+    } else {
+        if (l1_slot_ind_tick_[slot % 10].count() <= 0) {
+            NVLOGD_FMT(TAG, "{} slot={} slot_end_rcvd=false no l1_slot_ind_tick, allow", __func__, slot);
+            return true;
+        }
+        diff_ns = (now - l1_slot_ind_tick_[slot % 10]).count();
+        NVLOGD_FMT(TAG, "{} slot = {} now={} l1_slot_ind_tick_={} l2a_allowed_latency_={} diff={}.", __func__,
+             slot, now.count(), l1_slot_ind_tick_[slot % 10].count(), l2a_allowed_latency_, diff_ns);
+    }
+
+    if (diff_ns > threshold_ns)
     {
         // Warmup latency seen for first UL and first DL slot
         if(first_dl_slot_ || first_ul_slot_)
             NVLOGI_FMT(TAG, "L2+L2A processing taking > 500us (l2+l2a_duration={} ns) for first UL/DL slot. Drop slot.",
-                (now - l1_slot_ind_tick_[slot%10]).count());
+                diff_ns);
+        else if (slot_end_rcvd)
+            NVLOGW_FMT(TAG, "L2+L2A processing taking > 500us for slot={} (slot_end_rcvd) now={} last_fapi_msg_tick={} diff={} ns. Drop slot",
+                slot, now.count(), last_fapi_msg_tick_.count(), diff_ns);
         else
             NVLOGW_FMT(TAG, "L2+L2A processing taking > 500us for slot={} now={} l1_slot_ind_tick={} diff={} ns l2a_allowed_latency={} ns. Drop slot",
-                slot, now.count(),l1_slot_ind_tick_[slot%10].count(),(now - l1_slot_ind_tick_[slot%10]).count(), l2a_allowed_latency_);
+                slot, now.count(), l1_slot_ind_tick_[slot % 10].count(), diff_ns, l2a_allowed_latency_);
         return false;
     }
-    else
-        return true;
+    return true;
 }
 /*
  processes the cell command for the slot
@@ -1105,7 +1426,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
 
         tick_lock.lock();
         uint32_t slot_interval = get_fapi_latency(ss_curr);
-        nanoseconds curr_tick = current_tick_.load();
+        nanoseconds curr_tick = current_tick_;
         tick_lock.unlock();
         slot_cmd.tick_original = curr_tick - std::chrono::nanoseconds(slot_interval * mu_to_ns(tick_updater_.mu_highest_));
         // NVLOGD_FMT(TAG, "{}: SFN {}.{} curr tick {} slot_interval {}", __func__, ss_curr.u16.sfn, ss_curr.u16.slot, curr_tick, slot_interval);
@@ -1127,8 +1448,46 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
         if ((check_time_threshold(now,ss_curr.u16.slot,slot_end_rcvd)) && (phy_list_size <= cells_size) && !(partial_cmd))
         {
             auto start_process_command_time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
-            ret = PHYDriverProxy::getInstance().l1_enqueue_phy_work(slot_cmd);
+            // fapi-to-cplane-direct path: when the framework C-plane service is active, all four
+            // skip bits must be set so l1_enqueue_phy_work does NOT schedule the legacy FHCB /
+            // DL-Cplane / UL-Cplane / GPU-Comm-Prepare tasks. The slot-level signals normally
+            // emitted by those tasks are emitted from l1_signal_dl_cplane_batch_done /
+            // l1_signal_ul_cplane_batch_done after the framework C-plane batch completes.
+            // Legacy path (fapi_to_cplane_direct == false): SKIP_NONE — bit-for-bit identical behavior.
+            const auto driver = PHYDriverProxy::getInstance().get_driver();
+            const bool fapi_to_cplane_direct =
+                driver && l1_is_fapi_to_cplane_direct(driver);
+            const auto skip = fapi_to_cplane_direct
+                                  ? (EnqueueSkipMask::SKIP_DL_FHCB
+                                     | EnqueueSkipMask::SKIP_DL_CPLANE
+                                     | EnqueueSkipMask::SKIP_UL_CPLANE
+                                     | EnqueueSkipMask::SKIP_DL_GPU_COMM_PREPARE)
+                                  : EnqueueSkipMask::SKIP_NONE;
+            ret = PHYDriverProxy::getInstance().l1_enqueue_phy_work(slot_cmd, skip);
             to_clean = 1;
+#ifdef ENABLE_FAPI_STORE_REPLAY
+            // Mode 3 (fapi-to-cplane-direct): defer TX_DATA lane release to the
+            // cuphydriver tx_data_release_fn callback, which fires after the PDSCH
+            // H2D copy completes (task_work_function_dl_aggr_1_pdsch). This MUST be
+            // set before release_stored_slot_messages() runs for this slot so that
+            // path skips the TX_DATA lane instead of freeing the IPC buffers while
+            // the driver's async H2D still reads them. Only defer when a PDSCH slot
+            // was actually enqueued (ret == 0 && phy_list_size > 0) so the callback
+            // is guaranteed to fire; otherwise the lane is released inline.
+            // Setting this before either release path runs establishes single
+            // ownership: reset() no longer clears `deferred`, so the callback's
+            // staging reset cannot flip this gate and let the message thread
+            // re-release the same IPC buffers (the observed double-free).
+            // Arm on success only (replay-present direct-mode counterpart to the
+            // split-phase arm inside launch_tx_data_h2d()): `deferred` is false
+            // by default and cleared by the callback after release, so only the
+            // enqueue-success case writes true. Mutually exclusive with the
+            // launch_tx_data_h2d() arm at runtime — never both in one slot.
+            if(fapi_to_cplane_direct && ret == 0 && phy_list_size > 0)
+            {
+                tx_data_ring_.set_deferred(ring_idx_from_slot(ss_curr.u32), true);
+            }
+#endif
             auto end_process_command_time = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch());
             auto diff = end_process_command_time - start_process_command_time;
             NVLOGI_FMT(TAG, "SFN {}.{} {}: l1_enqueue_phy_work after status = {} slot cmd size ={}  phy_refs : size = {} l1_enqueue_phy_work start: {} l1_enqueue_phy_work duration: {} ns UL {} DL {}",
@@ -1170,10 +1529,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
             to_clean = 1;
             // Need to clean the nvIPC buffers allocated for SRS.IND
             clean_srs_ind_buffers = true;
-            auto slot = ss_curr.u16.slot;
-            if(!slot_end_rcvd)
-                slot = (slot + nv::mu_to_slot_in_sf(get_mu_highest()) - 1)% (nv::mu_to_slot_in_sf(get_mu_highest()));
-            NVLOGW_FMT(TAG, "Dropping the slot command for SFN {}.{}", ss_curr.u16.sfn, slot);
+            NVLOGW_FMT(TAG, "Dropping the slot command for SFN {}.{}", ss_curr.u16.sfn, ss_curr.u16.slot);
             PHYDriverProxy::getInstance().l1_resetBatchedMemcpyBatches(); //used to guard against case when the slot is dropped and PDSCH H2D copies are batched with preponing (prepone_h2d_copy=1) enabled and without separate copy thread (enable_h2d_copy_thread in cuphycontroller yaml = 0)
         }
 
@@ -1182,13 +1538,19 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
             for (int i = 0 ; i < phy_list_size; i++)
             {
                 uint32_t phy_id = phy_list[i];
+#ifndef ENABLE_FAPI_STORE_REPLAY
+                // Mode 1 (production, store-replay OFF): dl_tbs_queue_ owns the TX_DATA
+                // IPC buffer lifetime and is drained by the on_dl_tb_processed DL
+                // callback. In store-replay builds (Modes 2 & 3) FapiSlotMessageStorage
+                // owns the TX_DATA lane and the tx_data_release_fn callback frees it,
+                // so the queue must NOT be used here — double-tracking the same buffer
+                // would risk a double-free (the store-replay DL callback is a no-op).
                 phy_mac_msg_desc &ipc = phy_refs_[phy_id].get().cur_dl_msg;
-
                 if (ipc.data_buf != nullptr)
                 {
                     if (ret == 0)
                     {
-                        std::lock_guard<std::mutex> lock(dl_tbs_lock);
+                        std::lock_guard lock(dl_tbs_lock);
                         dl_tbs_queue_.push(ipc);
                         NVLOGI_FMT(TAG, "DL TB Queue Size = {}", dl_tbs_queue_.size());
                     }
@@ -1198,6 +1560,11 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
                         transport_wrapper().rx_release(reinterpret_cast<nv::phy_mac_msg_desc&>(ipc));
                     }
                 }
+#endif
+                // Always clear this cell's held TX_DATA descriptor. In store-replay
+                // builds this only drops the PHY instance's copy; the underlying IPC
+                // buffer is owned/released by FapiSlotMessageStorage, so resetting here
+                // prevents the next slot's on_phy_dl_tx_request from re-releasing it.
                 phy_refs_[phy_id].get().cur_dl_msg.reset();
             }
             if(ret==-2){
@@ -1264,6 +1631,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
         last_fapi_msg_tick_ = std::chrono::nanoseconds(0);
     }
 
+
     void PHY_module::tick_received(std::chrono::nanoseconds& tick)
     {
         if (!all_cells_configured) {
@@ -1324,7 +1692,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
 
         tick_lock.lock();
         ss_tick.store(sfn_slot);
-        current_tick_.store(tick);
+        current_tick_ = tick;
         tick_lock.unlock();
         // NVLOGI_FMT(TAG, "{}: SFN {}.{} curr tick {}", __func__, sfn_slot.u16.sfn, sfn_slot.u16.slot, tick);
         int64_t tick_err = ts_now.count() - tick.count();
@@ -1459,7 +1827,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
 
     void PHY_module::on_dl_tb_processed()
     {
-        std::lock_guard<std::mutex> lock(dl_tbs_lock);
+        std::lock_guard lock(dl_tbs_lock);
         NVLOGD_FMT(TAG, "Queue Size before = {}", dl_tbs_queue_.size());
         if (dl_tbs_queue_.size() > 0)
         {
@@ -1475,7 +1843,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
     void PHY_module::on_dl_tb_processed(const slot_command_api::pdsch_params* params)
     {
         uint32_t i = params->cell_grp_info.nCells;
-        std::lock_guard<std::mutex> lock(dl_tbs_lock);
+        std::lock_guard lock(dl_tbs_lock);
 
         NVLOGD_FMT(TAG, "{}: size={} nCells={}", __func__, dl_tbs_queue_.size(), i);
         if (dl_tbs_queue_.size() < i)
@@ -1496,7 +1864,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
     void PHY_module::on_dl_tti_processed()
     {
         uint32_t i = num_cells_active;
-        std::lock_guard<std::mutex> lock(dl_tti_lock);
+        std::lock_guard lock(dl_tti_lock);
 
         NVLOGD_FMT(TAG, "{}: size={} nCells={}", __func__, dl_tti_queue_.size(), i);
         if (dl_tti_queue_.size() < i)
@@ -1516,7 +1884,7 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
     void PHY_module::on_dl_tti_processed(int num_dl_tti)
     {
         int i = num_dl_tti;
-        std::lock_guard<std::mutex> lock(dl_tti_lock);
+        std::lock_guard lock(dl_tti_lock);
 
         NVLOGD_FMT(TAG, "{}: size={} nCells={}", __func__, dl_tti_queue_.size(), i);
         if (dl_tti_queue_.size() < i)
@@ -1574,7 +1942,13 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
             bfwCoeff_mem_info[cell_index][slotIdx].buff_size = bfwCoffBuffChunkSize;
             bfwCoeff_mem_info[cell_index][slotIdx].buff_chunk_size = bfwCoffBuffUegSize;
             bfwCoeff_mem_info[cell_index][slotIdx].num_buff_chunk_busy = 0;
-            ptr_h = std::next(buff->dataH, bfwCoffBuffChunkSize * slotIdx);
+            // dataH may be null under GPU_CHAINING (host pinned buffer reclaimed); only the device
+            // buffer is used in that mode. Guard the host split exactly like the device split so
+            // buff_addr_chunk_h stays null rather than becoming a bogus (nullptr + offset) pointer.
+            if(buff->dataH)
+            {
+                ptr_h = std::next(buff->dataH, bfwCoffBuffChunkSize * slotIdx);
+            }
 
             if(buff->dataD)
             {
@@ -1582,7 +1956,14 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
             }
             for (uegIdx = 0; uegIdx < MAX_DL_UL_BF_UE_GROUPS ; uegIdx++)
             {
-                bfwCoeff_mem_info[cell_index][slotIdx].buff_addr_chunk_h[uegIdx] = std::next(ptr_h, bfwCoffBuffUegSize * uegIdx);
+                if(buff->dataH)
+                {
+                    bfwCoeff_mem_info[cell_index][slotIdx].buff_addr_chunk_h[uegIdx] = std::next(ptr_h, bfwCoffBuffUegSize * uegIdx);
+                }
+                else
+                {
+                    bfwCoeff_mem_info[cell_index][slotIdx].buff_addr_chunk_h[uegIdx] = nullptr;
+                }
                 if(buff->dataD)
                 {
                     bfwCoeff_mem_info[cell_index][slotIdx].buff_addr_chunk_d[uegIdx] = std::next(ptr_d, bfwCoffBuffUegSize * uegIdx);
@@ -1596,4 +1977,3 @@ bool PHY_module::check_time_threshold(std::chrono::nanoseconds now, uint16_t slo
     }
     
 } // namespace nv
-

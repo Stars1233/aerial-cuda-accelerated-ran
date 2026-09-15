@@ -1,5 +1,6 @@
 *~
 .vscode
+.venv
 build/
 __pycache__
 .ipynb_checkpoints
@@ -7,8 +8,9 @@ __pycache__
 .pytest_cache
 dist
 src/*.egg-info
-src/aerial/pycuphy/*.so
+src/aerial/pycuphy/*.so*
 notebooks/*.onnx
-notebooks/data
+notebooks/data/*
+!notebooks/data/*.parquet
 notebooks/generated
 models/*.trt

@@ -18,7 +18,36 @@
 #include "aerial-fh-driver/packet_stats.hpp"
 #include "utils.hpp"
 
+#include <cstdio>
+#include <iterator>
+#include <string>
+#include <string_view>
+
+#include <fmt/format.h>
+
 #define TAG 650 //FHGEN
+
+namespace {
+
+// Inline storage size for the formatting buffer used by flush_counters /
+// flush_counters_file. Sized so fmt::basic_memory_buffer never spills to the
+// heap up to STAT_ARRAY_CELL_SIZE cells. The worst-case line is the per-slot
+// u64 row " <u64>,<u64>,<u64> |" at ~65 B/cell; the per-cell budget below
+// (80 B) covers that plus slack, and the prefix budget covers the longest
+// label "ULU TX PRACH Slot <slot> |".
+constexpr std::size_t kFlushPerCellBudget = 80U;
+constexpr std::size_t kFlushPrefixBudget  = 64U;
+constexpr std::size_t kFlushBufferInline =
+    kFlushPrefixBudget + STAT_ARRAY_CELL_SIZE * kFlushPerCellBudget;
+
+using FlushBuffer = fmt::basic_memory_buffer<char, kFlushBufferInline>;
+
+inline std::string_view as_view(const FlushBuffer& buf)
+{
+    return std::string_view{buf.data(), buf.size()};
+}
+
+} // namespace
 
 void Packet_Statistics::increment_counters(int cell, int timing, int slot, int inc)
 {
@@ -164,62 +193,60 @@ void Packet_Statistics::flush_counters(int num_cells, int packet_type)
         return;
     }
 
-    int buffer_index = 0;
-    char buffer[MAX_PRINT_LOG_LENGTH];
+    FlushBuffer buffer;
+    auto out = std::back_inserter(buffer);
 
-    buffer_index = 0;
-    buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "slot,");
+    fmt::format_to(out, "slot,");
     for(int cell = 0; cell < num_cells; ++cell)
     {
-        buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "cell_%d_early,cell_%d_ontime,cell_%d_late,", cell, cell, cell);
+        fmt::format_to(out, "cell_{0}_early,cell_{0}_ontime,cell_{0}_late,", cell);
     }
 
-    NVLOGC_FMT(PACKET_SUMMARY_TAG, "{}",buffer);
+    NVLOGC_FMT(PACKET_SUMMARY_TAG, "{}", as_view(buffer));
 
     for(int slot = 0; slot < MAX_LAUNCH_PATTERN_SLOTS; ++slot)
     {
         if(active_slots[slot])
         {
-            buffer_index = 0;
+            buffer.clear();
             switch(packet_type) {
             case -1:
                 break;
             case DLPacketCounterType::DLC:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "DLC ");
+                fmt::format_to(out, "DLC ");
                 break;
             case DLPacketCounterType::DLU:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "DLU ");
+                fmt::format_to(out, "DLU ");
                 break;
             case DLPacketCounterType::ULC:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULC ");
+                fmt::format_to(out, "ULC ");
                 break;
             case ULUPacketCounterType::ULU_PRACH:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULU TX PRACH ");
+                fmt::format_to(out, "ULU TX PRACH ");
                 break;
             case ULUPacketCounterType::ULU_PUCCH:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULU TX PUCCH ");
+                fmt::format_to(out, "ULU TX PUCCH ");
                 break;
             case ULUPacketCounterType::ULU_PUSCH:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULU TX PUSCH ");
+                fmt::format_to(out, "ULU TX PUSCH ");
                 break;
             case ULUPacketCounterType::ULU_SRS:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULU TX SRS ");
+                fmt::format_to(out, "ULU TX SRS ");
                 break;
             default:
                 break;
             }
 
-            buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "Slot %d |", slot);
+            fmt::format_to(out, "Slot {} |", slot);
 
             for(int cell = 0; cell < num_cells; ++cell)
             {
                 auto early = stats[cell][slot][EARLY].load();
                 auto ontime = stats[cell][slot][ONTIME].load();
                 auto late = stats[cell][slot][LATE].load();
-                auto total = early + ontime + late;
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, " %lu,%lu,%lu |", early, ontime, late);
+                fmt::format_to(out, " {},{},{} |", early, ontime, late);
             }
-            NVLOGC_FMT(PACKET_SUMMARY_TAG, "{}",buffer);
+            NVLOGC_FMT(PACKET_SUMMARY_TAG, "{}", as_view(buffer));
         }
     }
 
@@ -227,36 +254,36 @@ void Packet_Statistics::flush_counters(int num_cells, int packet_type)
     {
         if(active_slots[slot])
         {
-            buffer_index = 0;
+            buffer.clear();
             switch(packet_type) {
             case -1:
                 break;
             case DLPacketCounterType::DLC:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "DLC ");
+                fmt::format_to(out, "DLC ");
                 break;
             case DLPacketCounterType::DLU:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "DLU ");
+                fmt::format_to(out, "DLU ");
                 break;
             case DLPacketCounterType::ULC:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULC ");
+                fmt::format_to(out, "ULC ");
                 break;
             case ULUPacketCounterType::ULU_PRACH:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULU TX PRACH ");
+                fmt::format_to(out, "ULU TX PRACH ");
                 break;
             case ULUPacketCounterType::ULU_PUCCH:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULU TX PUCCH ");
+                fmt::format_to(out, "ULU TX PUCCH ");
                 break;
             case ULUPacketCounterType::ULU_PUSCH:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULU TX PUSCH ");
+                fmt::format_to(out, "ULU TX PUSCH ");
                 break;
             case ULUPacketCounterType::ULU_SRS:
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "ULU TX SRS ");
+                fmt::format_to(out, "ULU TX SRS ");
                 break;
             default:
                 break;
             }
 
-            buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "Slot %d |", slot);
+            fmt::format_to(out, "Slot {} |", slot);
 
             for(int cell = 0; cell < num_cells; ++cell)
             {
@@ -265,9 +292,12 @@ void Packet_Statistics::flush_counters(int num_cells, int packet_type)
                 auto late = stats[cell][slot][LATE].load();
                 auto total = early + ontime + late;
                 total = (total == 0) ? 1 : total;
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, " %.2f,%.2f,%.2f |", (float)early / total * 100.0, (float)ontime / total * 100.0, (float)late / total * 100.0);
+                fmt::format_to(out, " {:.2f},{:.2f},{:.2f} |",
+                               static_cast<float>(early)  / total * 100.0,
+                               static_cast<float>(ontime) / total * 100.0,
+                               static_cast<float>(late)   / total * 100.0);
             }
-            NVLOGC_FMT(PACKET_SUMMARY_TAG, "{}",buffer);
+            NVLOGC_FMT(PACKET_SUMMARY_TAG, "{}", as_view(buffer));
         }
     }
 }
@@ -281,9 +311,6 @@ void Packet_Statistics::flush_counters_file(int num_cells, std::string filename)
         return;
     }
 
-    int buffer_index = 0;
-    char buffer[MAX_PRINT_LOG_LENGTH];
-
     FILE *fp;
 
     fp = fopen(filename.c_str(), "w+");
@@ -293,32 +320,34 @@ void Packet_Statistics::flush_counters_file(int num_cells, std::string filename)
         return;
     }
 
-    buffer_index = 0;
-    buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "slot,");
+    FlushBuffer buffer;
+    auto out = std::back_inserter(buffer);
+
+    fmt::format_to(out, "slot,");
     for(int cell = 0; cell < num_cells; ++cell)
     {
-        buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "cell_%d_early,cell_%d_ontime,cell_%d_late,", cell, cell, cell);
+        fmt::format_to(out, "cell_{0}_early,cell_{0}_ontime,cell_{0}_late,", cell);
     }
-
-    fprintf(fp, "%s\n", buffer);
+    buffer.push_back('\n');
+    std::fwrite(buffer.data(), 1, buffer.size(), fp);
 
 
     for(int slot = 0; slot < MAX_LAUNCH_PATTERN_SLOTS; ++slot)
     {
         if(active_slots[slot])
         {
-            buffer_index = 0;
-            buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "%d,", slot);
+            buffer.clear();
+            fmt::format_to(out, "{},", slot);
 
             for(int cell = 0; cell < num_cells; ++cell)
             {
                 auto early = stats[cell][slot][EARLY].load();
                 auto ontime = stats[cell][slot][ONTIME].load();
                 auto late = stats[cell][slot][LATE].load();
-                auto total = early + ontime + late;
-                buffer_index += snprintf(buffer+buffer_index, MAX_PRINT_LOG_LENGTH-buffer_index, "%lu,%lu,%lu,", early, ontime, late);
+                fmt::format_to(out, "{},{},{},", early, ontime, late);
             }
-            fprintf(fp, "%s\n", buffer);
+            buffer.push_back('\n');
+            std::fwrite(buffer.data(), 1, buffer.size(), fp);
         }
     }
    fclose(fp);

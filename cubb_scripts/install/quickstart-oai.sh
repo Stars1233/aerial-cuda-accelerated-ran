@@ -37,8 +37,8 @@ SCRIPT_DIR=$(dirname "$SCRIPT")
 LOGFILE="quickstart-oai.log"
 
 # Configuration
-OAI_BRANCH="${OAI_BRANCH:-ATB1.0_integration}"
-OAI_REPO="${OAI_REPO:-https://gitlab.eurecom.fr/oai/openairinterface5g.git}"
+OAI_BRANCH="${OAI_BRANCH:-ATB1.1}"
+OAI_REPO="${OAI_REPO:-https://github.com/duranta-project/openairinterface5g.git}"
 OAI_DIR="${OAI_DIR:-$HOME/openairinterface5g}"
 GNB_DIR="$OAI_DIR/ci-scripts/yaml_files/sa_gnb_aerial"
 CN5G_DIR="$OAI_DIR/doc/tutorial_resources/oai-cn5g"
@@ -51,20 +51,20 @@ is_ru_mac_format() {
 
 # Expected Docker build times per platform (in minutes)
 declare -A DOCKER_BUILD_TIMES=(
-    ["NVIDIA_DGX_Spark_P4242"]=70
+    ["DGX-Spark"]=70
 )
 
 # CN5G cpuset configuration per platform
 # Format: "service:cpuset,service:cpuset,...,default:cpuset"
 declare -A CN5G_CPUSET_CONFIG=(
-    ["NVIDIA_DGX_Spark_P4242"]="oai-amf:4,oai-upf:12-14,default:11"
-    ["Supermicro_ARS-111GL-NHR"]="oai-upf:42-43,default:41"
+    ["DGX-Spark"]="oai-amf:4,oai-upf:12-14,default:11"
+    ["SMC-GraceHopper"]="oai-upf:42-43,default:41"
 )
 
 # gNB cpuset configuration per platform
 # Format: "service:cpuset,service:cpuset,...,default:cpuset"
 declare -A GNB_CPUSET_CONFIG=(
-    ["NVIDIA_DGX_Spark_P4242"]="oai-gnb-aerial:17-19"
+    ["DGX-Spark"]="oai-gnb-aerial:17-19"
 )
 
 # Help function

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <fcntl.h>    /* For O_* constants */
 #include <sys/stat.h> /* For mode constants */
@@ -126,7 +127,7 @@ static int ipc_shm_open(priv_data_t* priv_data)
         open_flag = O_RDWR;
     }
 
-    if((priv_data->shm_fd = shm_open(priv_data->name, open_flag, 0777)) < 0)
+    if((priv_data->shm_fd = shm_open(priv_data->name, open_flag, 0660)) < 0)
     {
         NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "%s: shm_open %s failed error %d", __func__, priv_data->name,priv_data->shm_fd);
         return -1;
@@ -154,15 +155,21 @@ static int ipc_shm_open(priv_data_t* priv_data)
         }
     }
 
-    if((priv_data->mapped_addr = mmap(NULL, priv_data->size, PROT_READ | PROT_WRITE, MAP_SHARED, priv_data->shm_fd, 0)) == NULL)
+    priv_data->mapped_addr = mmap(NULL, priv_data->size, PROT_READ | PROT_WRITE, MAP_SHARED, priv_data->shm_fd, 0);
+    if(priv_data->mapped_addr == MAP_FAILED)
     {
-        NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "%s: mmap failed", __func__);
+        NVLOGE_NO(TAG, AERIAL_SYSTEM_API_EVENT, "%s: mmap failed: name=%s size=%lu errno=%d %s", __func__,
+                priv_data->name, (unsigned long)priv_data->size, errno, strerror(errno));
+        priv_data->mapped_addr = NULL;
         return -1;
     }
-    else
+
+    if (priv_data->primary)
     {
-        return 0;
+        memset(priv_data->mapped_addr, 0, priv_data->size);
     }
+
+    return 0;
 }
 
 nv_ipc_shm_t* nv_ipc_shm_open(int primary, const char* name, size_t size)

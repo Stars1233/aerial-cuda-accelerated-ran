@@ -201,9 +201,9 @@ FftKernelHandle prach_get_fft_param(dim3& block_dim, uint& shared_memory_size, u
  template<typename Tscalar, unsigned int FftSize>
 FftKernelHandle prach_get_fft_param_for_arch(unsigned int cudaDeviceArch, dim3& block_dim, uint& shared_memory_size, uint32_t& ffts_per_block) {
     switch(cudaDeviceArch) {
-        // All SM supported by cuFFTDx
-        case  700: return prach_get_fft_param<Tscalar, FftSize,  700>(block_dim, shared_memory_size, ffts_per_block);
-        case  750: return prach_get_fft_param<Tscalar, FftSize,  750>(block_dim, shared_memory_size, ffts_per_block);
+        // SM_70 (Volta) removed by cuFFTDx 26.03 (Volta support dropped in the cuda13 mathdx tarball).
+        // SM_75 (Turing) is still supported by cuFFTDx 26.03 but omitted here because it is not
+        // in CMAKE_CUDA_ARCHITECTURES (80;90;100;120;121).
         case  800: return prach_get_fft_param<Tscalar, FftSize,  800>(block_dim, shared_memory_size, ffts_per_block);
         case  860: return prach_get_fft_param<Tscalar, FftSize,  860>(block_dim, shared_memory_size, ffts_per_block);
         case  870: return prach_get_fft_param<Tscalar, FftSize,  870>(block_dim, shared_memory_size, ffts_per_block);
@@ -274,7 +274,8 @@ FftKernelHandle prach_get_fft_param(unsigned int Nfft, unsigned int cudaDeviceAr
     const int L_RA = prach_params->L_RA;
     const int N_CS = prach_params->N_CS;
 
-    int zoneSize = (N_CS*Nfft+L_RA-1)/L_RA;
+    // When N_CS=0 (zcz=0): 1 preamble per root, zone covers entire PDP (match MATLAB behavior)
+    int zoneSize = (N_CS == 0) ? 1 : (N_CS*Nfft+L_RA-1)/L_RA;
     
     __shared__ Tscalar local_power[NUM_THREAD];
     __shared__ Tscalar local_max[NUM_THREAD];
@@ -284,7 +285,7 @@ FftKernelHandle prach_get_fft_param(unsigned int Nfft, unsigned int cudaDeviceAr
     int C_v = 0;
     int zone_start = 0;
     int prmbCount = global_idxZone & (CUPHY_PRACH_RX_NUM_PREAMBLE-1); // & => mod
-    int NzonePerU = L_RA / N_CS;
+    int NzonePerU = (N_CS == 0) ? 1 : L_RA / N_CS;
     int uIdx = prmbCount / NzonePerU;
     int tIdx = threadIdx.x;
     int idxInZone = tIdx & (zoneSizeExt-1); // & => mod
@@ -581,12 +582,17 @@ FftKernelHandle prach_get_fft_param(unsigned int Nfft, unsigned int cudaDeviceAr
     if (tile.thread_rank() == 0 && antIdx < N_ant) 
     {
       atomicAdd(&d_ant_rssi[antIdx], absRx);
+      // make sure d_ant_rssi value is updated before we modify d_count below
+      __threadfence();
     }
+
+    // Ensure that all warps have completed their contributions to d_ant_rssi
+    cta.sync();
 
     if (threadId == 0)
     {
-        // make sure d_ant_rssi values are updated before we modify d_count
-        __threadfence();
+        // threadId 0 issued a __threadfence() above after updating d_ant_rssi to
+        // ensure global visibility of that write prior to updating d_count
 
         unsigned int value = atomicInc(d_count, gridDim.x);
         isLastBlockDone = (value == (gridDim.x - 1));
@@ -1097,9 +1103,11 @@ cuphyStatus_t cuphyPrachCreateGraph(cudaGraph_t* graph, cudaGraphExec_t* graphIn
         kernelNodeParams.kernelParams = (void **)kernelArgs;
         kernelNodeParams.extra = NULL;
 
+        const cudaGraphNode_t searchDependencies[] = {nodes[GraphNodeType::ComputePDPNode],
+                                                      nodes[GraphNodeType::ComputeRSSI]};
         CUDA_CHECK_EXCEPTION(
-        cudaGraphAddKernelNode(&nodes[GraphNodeType::SearchPDPNode], *graph, &nodes[GraphNodeType::ComputePDPNode],
-                                1, &kernelNodeParams));
+        cudaGraphAddKernelNode(&nodes[GraphNodeType::SearchPDPNode], *graph, searchDependencies,
+                                2, &kernelNodeParams));
     }
 
     CUDA_CHECK_EXCEPTION(cudaGraphInstantiate(graphInstance, *graph, NULL, NULL, 0));

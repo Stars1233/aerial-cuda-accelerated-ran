@@ -162,6 +162,7 @@
     } status_t;
 
     #define CUDA_CHECK_ERR(call)                                                 \
+    _Pragma("vcast_dont_instrument_start")                                       \
     {                                                                            \
         cudaError_t err = call;                                                  \
         if (err != cudaSuccess) {                                                \
@@ -169,9 +170,11 @@
                     __FILE__, __LINE__, cudaGetErrorString(err));                \
             exit(EXIT_FAILURE);                                                  \
         }                                                                        \
-    }
+    }                                                                            \
+    _Pragma("vcast_dont_instrument_end")
 
     #define CUDA_CHECK_RES(call)                                                    \
+    _Pragma("vcast_dont_instrument_start")                                          \
     {                                                                               \
         CUresult runStatus = call;                                                  \
         if (runStatus != CUDA_SUCCESS) {                                            \
@@ -183,7 +186,8 @@
                     __FILE__, __LINE__, errorName, errorMessage);                   \
             exit(EXIT_FAILURE);                                                     \
         }                                                                           \
-    }
+    }                                                                               \
+    _Pragma("vcast_dont_instrument_end")
 
     // launch configuration structure /////////////////////////////////////////////////
     typedef struct {

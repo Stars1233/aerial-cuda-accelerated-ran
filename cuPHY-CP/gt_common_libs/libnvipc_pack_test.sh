@@ -1,6 +1,6 @@
 #!/bin/bash -e
 
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,9 +53,18 @@ RUN  cd /src/nvipc_src && \
 
 
 WORKDIR /src/nvipc_src
-RUN echo "#! /bin/bash -e\nfor dir in \\\$(ls -d ./build*); do \\\$dir/nvIPC/tests/cunit/nvipc_cunit 3 2; done" > run_tests.sh && chmod +x ./run_tests.sh
+RUN printf '%s\n' \
+  '#!/bin/bash -e' \
+  'df -h /dev/shm' \
+  'for dir in \$(ls -d ./build*); do' \
+  '  df -h /dev/shm' \
+  '  rm -f /dev/shm/nvipc_*' \
+  '  \$dir/nvIPC/tests/cunit/nvipc_cunit 3 2' \
+  'done' \
+  > run_tests.sh && chmod +x run_tests.sh
 CMD /src/nvipc_src/run_tests.sh
 EOF
 docker build . -t nvipc_tester
-docker run --rm nvipc_tester
+# nvipc_primary.yaml allocates ~1GB of POSIX SHM; Docker default /dev/shm is 64MB.
+docker run --rm --shm-size=4g nvipc_tester
 exit $?

@@ -55,7 +55,8 @@ struct FileHeader {
 	uint32_t reserved;
 } __attribute__((packed));
 
-// One record per E3 indication; payload_len covers the body after this header.
+// One record per cell-slot (cells sharing a ts_tai form one indication);
+// payload_len covers the body after this header.
 struct RecordHeader {
 	uint16_t tag;
 	uint16_t reserved;

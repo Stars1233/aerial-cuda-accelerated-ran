@@ -19,32 +19,7 @@
 #define AERIAL_FH_GPU__
 
 #include "aerial-fh-driver/api.hpp"
-
-#define ASSERT_CUDA_FH(stmt)                   \
-    do                                               \
-    {                                                \
-        cudaError_t result = (stmt);                 \
-        if(cudaSuccess != result)                    \
-        {                                            \
-            NVLOGE_FMT(TAG, AERIAL_DPDK_API_EVENT, "[{}:{}] cuda failed with {} ", \
-                   __FILE__,                         \
-                   __LINE__,                         \
-                   cudaGetErrorString(result));      \
-        }                                            \
-    } while(0)
-
-#define ASSERT_CU_FH(stmt)                         \
-    do                                             \
-    {                                              \
-        CUresult result = (stmt);                  \
-        if(CUDA_SUCCESS != result)                 \
-        {                                          \
-            NVLOGE_FMT(TAG, AERIAL_DPDK_API_EVENT, "[{}:{}] cu failed with {} ", \
-                   __FILE__,                       \
-                   __LINE__,                       \
-                   result);                        \
-        }                                          \
-    } while(0)
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
 
 namespace aerial_fh
 {

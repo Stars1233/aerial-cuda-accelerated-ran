@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -135,7 +135,8 @@ __device__ inline void scale_compress_blockFP(const half *__restrict__ input,
                 maxV = __shfl_sync(~0, maxV, warpLane - laneid);
 
                 // Find the right shift so that the max value will fit in (compbits-1) bits
-                shift = max(0, 33 - __clz(maxV) - compbits); // shift is between 0 and 15 = 4 bits
+                // __clz return type changed in CUDA 13.2+ from signed to unsigned for ARM64 systems, thus the explicit cast
+                shift = max(0, 33 - (int)__clz(maxV) - compbits); // shift is between 0 and 15 = 4 bits
 
                 // Shift all the values to remove the exponent
                 for (int i = 0; i < 4; i++)

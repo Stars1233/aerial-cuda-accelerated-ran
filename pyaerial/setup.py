@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,34 +14,39 @@
 # limitations under the License.
 
 """Setup file for PyAerial package."""
-import os
-import sys
+import sysconfig
+from pathlib import Path
 
-import platform
 import setuptools
 
-sys.path.insert(0, os.path.abspath("./src/aerial"))
-import version_aerial  # pylint: disable=E0401,C0413
+EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX")
+PYCUPHY_DIR = Path(__file__).parent / "src" / "aerial" / "pycuphy"
 
-machine = platform.machine()
-version = version_aerial.RELEASE
+if not EXT_SUFFIX:
+    raise RuntimeError("EXT_SUFFIX is unavailable; cannot package _pycuphy extension")
+if not PYCUPHY_DIR.is_dir():
+    raise RuntimeError(f"pycuphy package directory not found: {PYCUPHY_DIR}")
+
+
+def _pycuphy_native_artifacts() -> list[str]:
+    core = PYCUPHY_DIR / f"_pycuphy{EXT_SUFFIX}"
+    if not core.is_file():
+        raise FileNotFoundError(f"Missing native extension: {core}")
+    return [core.name]
+
+
+class BinaryDistribution(setuptools.Distribution):
+    """Treat the pre-built _pycuphy extension as a platform library."""
+
+    def has_ext_modules(self) -> bool:
+        return True
+
 
 setuptools.setup(
-    name="pyaerial",
-    version=version,
-    author="NVIDIA",
-    description="NVIDIA pyAerial library",
-    package_dir={"": "src"},
-    packages=setuptools.find_packages(where="src"),
-    include_package_data=True,
-    package_data={"": [
-        "version_aerial.py",
-        f"_pycuphy.cpython-310-{machine}-linux-gnu.so",
-        "libcuphy.so",
-        "libnvlog.so",
-        "libfmtlog-shared.so",
-        "libchanModels.so"
-    ]},
-    python_requires=">=3.7",
+    distclass=BinaryDistribution,
+    package_data={
+        "aerial": ["version_aerial.py"],
+        "aerial.pycuphy": _pycuphy_native_artifacts(),
+    },
     zip_safe=False,
 )

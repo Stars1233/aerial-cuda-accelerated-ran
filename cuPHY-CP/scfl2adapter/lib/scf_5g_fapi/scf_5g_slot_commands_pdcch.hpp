@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,15 +17,22 @@
 
 #pragma once
 
+#include <cstddef>
+
 #include "slot_command/slot_command.hpp"
 #include "scf_5g_fapi.h"
 #include "nv_phy_fapi_msg_common.hpp"
-#include "nvlog_fmt.hpp"
-#include "scf_5g_slot_commands_common.hpp"
+#include "scf_5g_fapi_slot_types.hpp"
 #include "nv_phy_limit_errors.hpp"
 
 
 namespace scf_5g_fapi {
+
+    using slot_command_api::cell_group_command;
+    using slot_command_api::cell_sub_command;
+    using slot_command_api::dci_param_list;
+    using slot_command_api::pm_group;
+    using slot_command_api::slot_indication;
 
 #ifdef ENABLE_L2_SLT_RSP
     void update_cell_command(cell_group_command* cell_group, cell_sub_command& cell_cmd, scf_fapi_pdcch_pdu_t& msg, uint8_t testMode,
@@ -36,4 +43,17 @@ namespace scf_5g_fapi {
         int32_t cell_index, slot_indication & slotinfo, cuphyCellStatPrm_t& cell_params, int staticPdcchSlotNum, nv::phy_config_option& config_option,
         pm_weight_map_t& pm_map, nv::slot_detail_t* slot_detail, bool mmimo_enabled);
 #endif
+
+    void update_pdcch_sym_prb_info_for_pdcch_only_validation(
+        cell_sub_command& cell_cmd,
+        cuphyPdcchCoresetDynPrm_t& coreset,
+        dci_param_list& dci,
+        uint16_t bandwidth,
+        pm_group* pm_grp,
+        scf_fapi_pdcch_pdu_t& msg,
+        std::size_t* fapiDciOffsets,
+        nv::phy_config_option& config_option,
+        nv::slot_detail_t* slot_detail,
+        bool mmimo_enabled,
+        int32_t cell_index);
 }

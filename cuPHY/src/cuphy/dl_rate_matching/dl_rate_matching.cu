@@ -19,12 +19,19 @@
 #include "cuphy.hpp"
 #include "cuphy_internal.h"
 #include <vector>
+#include <bitset>
 #include <iostream>
 
 #include "dl_rate_matching.hpp"
 #include "dl_rate_matching.cuh"
+#include "utils.cuh"
 #include "descrambling.cuh"
 #include "tensor_desc.hpp"
+
+#include <algorithm>
+#include <cstring>
+#include <numeric>
+#include <utility>
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
@@ -34,6 +41,12 @@ using namespace descrambling; // for gold32
 
 #define FLOAT_COMP 1
 #define DMRS_CDM_GRPS_NO_DATA_NOT_1_FLAG 0xFFFF //used in place of the 16-bit dmrs symbol location mask to indicate dmrsGrpsNoData != 1
+
+// pdsch tx RM: keep the 4TR SU-MIMO fast path occupancy separate from the generic path.
+constexpr uint32_t NUM_FUSED_DL_RM_FAST_THREADS = 128;
+constexpr uint32_t NUM_FUSED_DL_RM_FAST_THREAD_BLOCKS_PER_SM = 8;
+constexpr uint32_t NUM_FUSED_DL_RM_GENERIC_THREADS = 288;
+constexpr uint32_t NUM_FUSED_DL_RM_GENERIC_THREAD_BLOCKS_PER_SM = 4;
 
 __device__ __constant__ float rev_qam_16_long[8] = {
     0.316227766,
@@ -108,6 +121,12 @@ __device__ __inline__ __half2 mult_half2(__half2 a, __half2 b) {
                                          __hadd(__hmul(a.x, b.y), __hmul(a.y, b.x)));
 #endif
 }
+
+
+//========== For fast path rate matching ==========/
+constexpr bool device_debug_print_output_index = false;
+
+//========== For fast path rate matching (Ends)==========/
 
 /**
  * @brief Update PdschPerTbParams struct that tracks configuration information at per TB
@@ -542,7 +561,6 @@ __device__ void QAM4_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Ediv
          }
 
     } else { // Precoding for this UE
-
          for (int i = threadIdx.x; i < rounded_Er_elements; i+= blockDim.x) {
              uint32_t read_val = dl_rm_shmem[i];
 
@@ -569,6 +587,7 @@ __device__ void QAM4_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Ediv
                          tmp_val.y = 0;
                      }
 
+                     #pragma unroll 1
                      for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                          __half2 matCoeff = dmrs_params->pmW[tmp_layer_id * num_antenna_ports + antenna_port];
 #if FLOAT_COMP
@@ -594,6 +613,7 @@ __device__ void QAM4_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Ediv
                                                                        data_symbol_loc, all_Rbs_symbols, d_xtf_re_map,
                                                                        modified_dmrs_sym_loc);
 
+                  #pragma unroll 1
                   for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                         uint32_t output_index_port_offset = all_Rbs_symbols * antenna_port * OFDM_SYMBOLS_PER_SLOT;
                         atomicAdd(&modulation_output[output_index + output_index_port_offset], local_qam_output[antenna_port]);
@@ -678,6 +698,7 @@ __device__ void QAM4_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits,
                          tmp_val.y = 0;
                      }
 
+                     #pragma unroll 1
                      for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                          __half2 matCoeff = dmrs_params->pmW[tmp_layer_id * num_antenna_ports + antenna_port];
                          __half2 new_tmp_val = mult_half2(tmp_val, matCoeff);
@@ -695,6 +716,7 @@ __device__ void QAM4_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits,
                                                                       data_symbol_loc, all_Rbs_symbols, d_xtf_re_map,
                                                                       modified_dmrs_sym_loc);
 
+                 #pragma unroll 1
                  for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                        uint32_t output_index_port_offset = all_Rbs_symbols * antenna_port * OFDM_SYMBOLS_PER_SLOT;
                        atomicAdd(&modulation_output[output_index + output_index_port_offset], local_qam_output[antenna_port]);
@@ -773,6 +795,7 @@ __device__ void QAM16_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Edi
                                                                        shmem_qam_16[(qam_value >> 1) & 0x05]) :
                                          make_complex<__half2>::create(0, 0);
 
+                     #pragma unroll 1
                      for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                          __half2 matCoeff = dmrs_params->pmW[tmp_layer_id * num_antenna_ports + antenna_port];
                          __half2 new_tmp_val = mult_half2(tmp_val, matCoeff);
@@ -791,6 +814,7 @@ __device__ void QAM16_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Edi
                                                                        data_symbol_loc, all_Rbs_symbols, d_xtf_re_map,
                                                                        modified_dmrs_sym_loc);
 
+                  #pragma unroll 1
                   for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                         uint32_t output_index_port_offset = all_Rbs_symbols * antenna_port * OFDM_SYMBOLS_PER_SLOT;
                         atomicAdd(&modulation_output[output_index + output_index_port_offset], local_qam_output[antenna_port]);
@@ -883,6 +907,7 @@ __device__ void QAM16_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits
                          tmp_val.y = 0;
                      }
 
+                     #pragma unroll 1
                      for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                          __half2 matCoeff = dmrs_params->pmW[tmp_layer_id * num_antenna_ports + antenna_port];
                          __half2 new_tmp_val = mult_half2(tmp_val, matCoeff);
@@ -902,6 +927,7 @@ __device__ void QAM16_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits
                                                                        data_symbol_loc, all_Rbs_symbols, d_xtf_re_map,
                                                                        modified_dmrs_sym_loc);
 
+                  #pragma unroll 1
                   for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                         uint32_t output_index_port_offset = all_Rbs_symbols * antenna_port * OFDM_SYMBOLS_PER_SLOT;
                         atomicAdd(&modulation_output[output_index + output_index_port_offset], local_qam_output[antenna_port]);
@@ -1021,6 +1047,7 @@ __device__ void QAM64_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Edi
                     __half2 tmp_val = make_complex<__half2>::create(shmem_qam_64[x_index],
                                                                     shmem_qam_64[y_index]);
 
+                    #pragma unroll 1
                     for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                         __half2 matCoeff = dmrs_params->pmW[tmp_layer_id * num_antenna_ports + antenna_port];
                         uint32_t output_index_port_offset = all_Rbs_symbols * antenna_port * OFDM_SYMBOLS_PER_SLOT;
@@ -1152,6 +1179,7 @@ __device__ void QAM64_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits
 
                     __half2 tmp_val = make_complex<__half2>::create(shmem_qam_64[x_index],
                                                                     shmem_qam_64[y_index]);
+                    #pragma unroll 1
                     for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                         __half2 matCoeff = dmrs_params->pmW[tmp_layer_id * num_antenna_ports + antenna_port];
                         uint32_t output_index_port_offset = all_Rbs_symbols * antenna_port * OFDM_SYMBOLS_PER_SLOT;
@@ -1165,6 +1193,343 @@ __device__ void QAM64_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits
     }
 }
 
+// "Output index" is the index of TF-grid by viewing it as an 1-D array, freq first, symbol second.
+// start/numRB: only for a CB whose REs are contiguous in XTF grid
+__device__ int calc_output_index_no_CSIRS_no_DmrsDataMux(const int RE_idx, const int start_Rb, const int all_Rbs_symbols, const int REs_per_OFDM_symbol, const uint64_t data_symbol_loc)
+{
+    int start_data_sym_idx        = RE_idx / REs_per_OFDM_symbol;
+    int outout_idx_in_pdsch_alloc = RE_idx - start_data_sym_idx * REs_per_OFDM_symbol;
+    int sym_idx                   = (data_symbol_loc >> (4 * start_data_sym_idx)) & 0xF;
+    int start_output_idx          = (start_Rb * CUPHY_N_TONES_PER_PRB) + all_Rbs_symbols * sym_idx;
+    return start_output_idx + outout_idx_in_pdsch_alloc;
+}
+
+// start/numRB: csirs possible, no dmrs data mux
+__device__ int calc_output_index_no_DmrsDataMux(
+    const uint16_t* __restrict__ d_xtf_re_map,
+    const uint32_t* __restrict__ cumulative_skipped_REs, // needed by CSIRS/PTRS
+    const uint64_t data_symbol_loc,
+    const int      RE_idx,
+    const int      start_Rb,
+    const int      all_Rbs_symbols,
+    const int      REs_per_OFDM_symbol)
+{
+    int potential_symbol = RE_idx / REs_per_OFDM_symbol; // data_sym_idx: 0...num_data_syms - 1
+    while((potential_symbol + 1 < OFDM_SYMBOLS_PER_SLOT) &&
+          (RE_idx >= ((potential_symbol + 1) * REs_per_OFDM_symbol - cumulative_skipped_REs[potential_symbol])))
+    {
+        potential_symbol += 1;
+    }
+    int      sym_idx             = (data_symbol_loc >> (4 * potential_symbol)) & 0xF;
+    uint32_t start_output_idx    = (start_Rb * CUPHY_N_TONES_PER_PRB) + (all_Rbs_symbols * sym_idx);
+    int      re_within_PRB_alloc = RE_idx - ((potential_symbol == 0) ? 0 : (potential_symbol * REs_per_OFDM_symbol - cumulative_skipped_REs[potential_symbol - 1]));
+    uint32_t output_idx          = start_output_idx + re_within_PRB_alloc;
+    uint16_t num_skipped_REs     = d_xtf_re_map[output_idx];
+    if constexpr(device_debug_print_output_index)
+    {
+        if(threadIdx.x >= 110 && threadIdx.x <= 120 && blockIdx.y == 0 && blockIdx.x == 23)
+        {
+            printf("out_idx_generic: blk%d.%d th%d: RE_idx=%d, potential_data_sym_idx=%d, sym_idx=%d, "
+                   "start_output_idx=%d, re_within_PRB_alloc=%d, output_idx=%d, num_skipped_REs=%d, "
+                   "final_output_idx=%d\n",
+                   blockIdx.x,
+                   blockIdx.y,
+                   threadIdx.x,
+                   RE_idx,
+                   potential_symbol,
+                   sym_idx,
+                   start_output_idx,
+                   re_within_PRB_alloc,
+                   output_idx,
+                   num_skipped_REs,
+                   output_idx + num_skipped_REs);
+        }
+    }
+    return output_idx + num_skipped_REs;
+}
+
+template<bool SU_MIMO>
+__device__ void pdsch_mod_precode_256qam_4layer_4port(
+    const uint32_t* __restrict__ intlv_out,
+    const __half2* __restrict__ W, // (port, layer), where port is 1st storage dim
+    const uint16_t* __restrict__ d_xtf_re_map,
+    const uint32_t* __restrict__ cumulative_skipped_REs,
+    const PdschDmrsParams* __restrict__ dmrs_params,
+    const uint32_t CB_start_qam_per_layer,
+    const int      EdivQm_bits,
+    __half2* __restrict__ modulation_output)
+{
+    constexpr int NUM_LAYERS = 4;
+    constexpr int NUM_PORTS  = 4;
+
+    int               REs_per_OFDM_symbol = dmrs_params->num_Rbs * CUPHY_N_TONES_PER_PRB;
+    int               all_Rbs_symbols     = dmrs_params->num_BWP_PRBs * CUPHY_N_TONES_PER_PRB;
+    int               start_Rb            = dmrs_params->start_Rb;
+    uint64_t          data_symbol_loc     = dmrs_params->data_sym_loc;
+    const uint32_t    port_stride         = all_Rbs_symbols * OFDM_SYMBOLS_PER_SLOT;
+    const int         num_RE              = EdivQm_bits / NUM_LAYERS;
+    const bool        has_csirs           = (cumulative_skipped_REs[dmrs_params->num_data_symbols - 1] > 0);
+    __shared__ __half shmem_qam_256[16];
+    if(threadIdx.x < 16)
+    {
+        shmem_qam_256[threadIdx.x] = (__half)(rev_qam_256[threadIdx.x] * dmrs_params->beta_qam);
+    }
+    __syncthreads();
+
+    for(int i = threadIdx.x; i < num_RE; i += blockDim.x)
+    {
+        uint32_t     read_val = intlv_out[i];
+        u128_half2x4 local_qam_output;
+        local_qam_output.u128 = 0;
+        for(int layer = 0; layer < NUM_LAYERS; layer++)
+        {
+            int      intra_index = layer;
+            uint32_t qam_value   = (read_val >> (intra_index * 8)) & 0x0FFU;
+            int      x_index     = map_index_8bits(qam_value);
+            int      y_index     = map_index_8bits(qam_value >> 1);
+            __half2  tmp_val     = make_complex<__half2>::create(shmem_qam_256[x_index], shmem_qam_256[y_index]);
+            for(int port = 0; port < NUM_PORTS; port++)
+            {
+                __half2 matCoeff          = W[layer * NUM_PORTS + port];
+                local_qam_output.h2[port] = __hcmadd(tmp_val, matCoeff, local_qam_output.h2[port]);
+            }
+        }
+
+        uint32_t output_index{};
+        if(has_csirs == false)
+        {
+            output_index = calc_output_index_no_CSIRS_no_DmrsDataMux(CB_start_qam_per_layer + i, start_Rb, all_Rbs_symbols, REs_per_OFDM_symbol, data_symbol_loc);
+        }
+        else
+        {
+            output_index = calc_output_index_no_DmrsDataMux(
+                d_xtf_re_map,
+                cumulative_skipped_REs,
+                data_symbol_loc,
+                CB_start_qam_per_layer + i,
+                start_Rb,
+                all_Rbs_symbols,
+                REs_per_OFDM_symbol);
+        }
+
+        if constexpr(device_debug_print_output_index)
+        {
+            // to debug when a CB rides on a DMRS or CSI-RS symbol
+            if(i >= 110 && i <= 120 && blockIdx.y == 0 && blockIdx.x == 23)
+            {
+                printf("after out_idx call: thblk x%d y%d i=%d: out_idx=%d, start_Rb: %d, CB+i=%d, REs_per_OFDMsym=%d, "
+                       "data_sym_loc: 0x%lx, all_Rbs_sym=%d\n",
+                       blockIdx.x,
+                       blockIdx.y,
+                       i,
+                       output_index,
+                       start_Rb,
+                       CB_start_qam_per_layer + i,
+                       REs_per_OFDM_symbol,
+                       data_symbol_loc,
+                       all_Rbs_symbols);
+            }
+        }
+        
+        if constexpr(SU_MIMO) {
+            for(int port = 0; port < NUM_PORTS; port++) {
+                modulation_output[output_index + port_stride * port] = local_qam_output.h2[port];
+            }
+        }
+        else {
+            for(int port = 0; port < NUM_PORTS; port++) {
+                atomicAdd(&modulation_output[output_index + port_stride * port], local_qam_output.h2[port]);
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// Scatter-read, contiguous-write. Inputs are placed in shared memory to avoid cache impact to other channels. 
+__device__ void bit_interleave_256qam_rv0(
+    const uint32_t* __restrict__ CB_ldpc_encoder_output,
+    const int      Kd,
+    const uint32_t F_val,
+    const int      CB_Er,
+    const int      num_QAM,
+    uint32_t*      dl_rm_shmem)
+{
+    // Each batch packs 32 QAM symbols (executed by 1 warp), where "32" is from #threads in a warp.
+    constexpr uint32_t Qm               = 8;
+    uint8_t*           dst              = reinterpret_cast<uint8_t*>(dl_rm_shmem);
+    const uint32_t     num_batches      = num_QAM / 32;
+    const uint32_t     num_QAM_leftover = num_QAM % 32; // To avoid access out of bound (or ask encoder to pad, align up to multiple of 32Qm bits)
+    const uint32_t     warp_id          = threadIdx.x / 32;
+    const uint32_t     lane_id          = threadIdx.x % 32;
+    const uint32_t     num_warps        = blockDim.x / 32;
+    const uint32_t     src_bit_stride   = CB_Er / Qm;
+    for(uint32_t batch = warp_id; batch < num_batches; batch += num_warps)
+    {
+        uint32_t src_bit_idx = batch * 32 + lane_id;
+        uint8_t  b{};
+#pragma unroll 8
+        for(uint32_t q = 0; q < Qm; ++q)
+        {
+            // read_bit_idx skips filler bits if needed
+            uint32_t read_bit_idx  = src_bit_idx + ((src_bit_idx >= Kd) ? F_val : 0);
+            uint32_t word_idx      = read_bit_idx / 32;
+            uint32_t bit_idx       = read_bit_idx % 32;
+            uint8_t  extracted_bit = static_cast<uint8_t>((CB_ldpc_encoder_output[word_idx] >> bit_idx) & 1u);
+            b |= (extracted_bit << q);
+            src_bit_idx += src_bit_stride;
+        }
+        uint32_t sym_idx = batch * 32 + lane_id;
+        dst[sym_idx]     = b;
+    }
+    if(threadIdx.x < num_QAM_leftover)
+    {
+        uint32_t batch       = num_batches;
+        uint32_t src_bit_idx = batch * 32 + lane_id;
+        uint8_t  b{};
+#pragma unroll 8
+        for(uint32_t q = 0; q < Qm; ++q)
+        {
+            uint32_t read_bit_idx  = src_bit_idx + ((src_bit_idx >= Kd) ? F_val : 0);
+            uint32_t word_idx      = read_bit_idx / 32;
+            uint32_t bit_idx       = read_bit_idx % 32;
+            uint8_t  extracted_bit = static_cast<uint8_t>((CB_ldpc_encoder_output[word_idx] >> bit_idx) & 1u);
+            b |= (extracted_bit << q);
+            src_bit_idx += src_bit_stride;
+        }
+        uint32_t sym_idx = batch * 32 + lane_id;
+        dst[sym_idx]     = b;
+    }
+    __syncthreads();
+}
+
+__device__ void compute_pdsch_scrambling_seq(uint32_t  cinit_val,
+                                             uint32_t  gold32_CB_start_output,
+                                             int       rounded_Er_elements,
+                                             uint32_t* CB_scrambling_vals) {
+    constexpr int ELEMENT_BITS = 5;
+    for(int i = threadIdx.x; i <= rounded_Er_elements; i += blockDim.x) {
+        CB_scrambling_vals[i] = gold32(cinit_val, gold32_CB_start_output + (i << ELEMENT_BITS));
+    }
+}
+
+// RM fast path: 256qam, 4layer, 4port, rv0, no dmrs/data mux, no PTRS (phase-tracking reference symbols).
+__device__ void dl_rm_and_mod_precode_256qam_4layer_4port(dlRateMatchingDescr_t* p_desc)
+{
+    [[maybe_unused]] constexpr bool enable_scrambling    = true;
+    [[maybe_unused]] constexpr bool enable_layer_mapping = true;
+    constexpr uint32_t              QM_VAL               = CUPHY_QAM_256;
+    constexpr uint32_t              NUM_LAYERS           = 4;
+    constexpr uint32_t              NUM_DL_PORTS         = 4;
+
+    dlRateMatchingDescr_t& desc                        = *p_desc;
+    const PdschPerTbParams* __restrict__ cfg_workspace = desc.cfg_workspace;
+    const uint32_t          TB_id                      = blockIdx.y;
+    const uint32_t          CB_id                      = blockIdx.x;
+    const PdschPerTbParams* TB_params                  = &cfg_workspace[TB_id];
+    if(CB_id >= TB_params->num_CBs)
+    {
+        return;
+    }
+    
+    const uint32_t emax                                 = desc.emax;
+    const int      ELEMENT_SIZE                         = 32;                                                // element = uint32_t
+    const int      ELEMENT_BITS                         = 5;                                                 // log2(ELEMENT_SIZE)
+    const uint32_t TB_start                             = desc.d_TB_start_offset_array[TB_id];               //w.r.t ldpc_encoder_output
+    uint32_t       rounded_N                            = round_up_to_next((int)TB_params->N, ELEMENT_SIZE); // N should be divisible by 32 for LDPC encoder's output.
+    uint32_t       CB_start_input                       = (TB_start + CB_id * rounded_N) >> ELEMENT_BITS;
+    const uint32_t* __restrict__ CB_ldpc_encoder_output = desc.d_rate_matching_input + CB_start_input;
+    const int rounded_Er_elements                       = emax >> ELEMENT_BITS;
+
+    constexpr int   NlQm          = (int)NUM_LAYERS * 8; // 256QAM 4-layer
+    const int       ue_grp_idx_e  = desc.d_params[TB_id].ueGrp_idx;
+    const int       num_data_syms = (int)desc.d_params[TB_id].num_data_symbols;
+    const int       num_CSIRS_REs = (int)desc.d_ue_grp_params[ue_grp_idx_e].cumulative_skipped_REs[num_data_syms - 1];
+    const int       C             = (int)TB_params->num_CBs;
+    const int       num_REs       = (int)TB_params->max_REs - num_CSIRS_REs;
+    const int       q             = num_REs / C;
+    const int       m             = num_REs - q * C;
+    const int       num_small_CBs = C - m;
+    const int       E_small       = q * NlQm;
+    const int       E_big         = (C == 1) ? E_small : (q + 1) * NlQm;
+    const bool small_CB               = (CB_id < num_small_CBs);
+    const int  CB_Er                  = small_CB ? E_small : E_big;
+    const int  EdivQm                 = CB_Er / 8;
+    const int  F_val                  = TB_params->F;
+    const int  Kd                     = TB_params->K - 2 * TB_params->Zc - F_val;
+    const int  CB_start_qam           = CB_id * EdivQm - (small_CB ? 0 : num_small_CBs * NUM_LAYERS);
+    const int  gold32_CB_start_output = CB_start_qam * QM_VAL;
+
+    /* - The first rounded_Er_elements: NUM_LAYERS * rounded_Er_element (layer mapping)
+       - Then the scrambling sequence*/
+    extern __shared__ uint32_t intlv_out[];
+    uint32_t*                  CB_scrambling_vals = (uint32_t*)&intlv_out[rounded_Er_elements * NUM_LAYERS];
+    __shared__ __half2         W[NUM_LAYERS * NUM_DL_PORTS]; //W(port, layer), where port is 1st storage dim
+
+    // asyncopy: devMem => sharedMem (1) encoder out (2) precoding matrix W(port, layer), where port is 1st storage dim
+    uint32_t* const enc_out_shmem = intlv_out + rounded_Er_elements;
+    for(int i = threadIdx.x; i < (CB_Er + F_val + 31) / 32; i += blockDim.x)
+    {
+        __pipeline_memcpy_async(enc_out_shmem + i, CB_ldpc_encoder_output + i, sizeof(uint32_t)); // 8 and 16 bytes also possible (access out of bound risk for rv > 0?)
+    }
+    const int num_ports   = desc.d_params[TB_id].Np;
+    const int num_W_elems = (int)NUM_LAYERS * num_ports;
+    for(int i = threadIdx.x; i < num_W_elems; i += blockDim.x)
+    {
+        __half2* src_ptr = (desc.d_params[TB_id].pmW);
+        __pipeline_memcpy_async(W + i, src_ptr + i, sizeof(__half2));
+    }
+    __pipeline_commit();
+
+    // do something while waiting for data from device memory
+    compute_pdsch_scrambling_seq(TB_params->cinit, gold32_CB_start_output, rounded_Er_elements, CB_scrambling_vals);
+    __syncthreads();
+
+    __pipeline_wait_prior(0);
+    __syncthreads();
+    bit_interleave_256qam_rv0(enc_out_shmem, Kd, F_val, CB_Er, EdivQm, intlv_out);
+
+    // scrambling: shared mem in & out, in-place. Each thread scrambles 32 bits.
+    __syncthreads();
+    uint32_t CB_remainder = gold32_CB_start_output & 31;
+    if(CB_remainder == 0)
+    {
+        for(int i = threadIdx.x; i < rounded_Er_elements; i += blockDim.x)
+        {
+            intlv_out[i] = intlv_out[i] ^ CB_scrambling_vals[i];
+        }
+    }
+    else
+    {
+        for(int i = threadIdx.x; i < rounded_Er_elements; i += blockDim.x)
+        {
+            intlv_out[i] = intlv_out[i] ^ ((CB_scrambling_vals[i] >> CB_remainder) | (CB_scrambling_vals[i + 1] << (32 - CB_remainder)));
+        }
+    }
+
+    const int       ue_grp_idx             = desc.d_params[TB_id].ueGrp_idx;
+    __half2*        modulation_output      = (__half2*)desc.d_params[TB_id].cell_output_tensor_addr;
+    const uint32_t  CB_start_qam_per_layer = CB_start_qam / NUM_LAYERS;
+    const uint16_t* cell_xtf_re_map        = (uint16_t*)desc.temp_xtf_re_map + desc.d_params[TB_id].cell_index_in_cell_group * (desc.max_PRB_BWP * OFDM_SYMBOLS_PER_SLOT * CUPHY_N_TONES_PER_PRB + OFDM_SYMBOLS_PER_SLOT);
+
+    const bool su_mimo = desc.d_params[TB_id].su_mimo;
+    if(su_mimo) {
+        pdsch_mod_precode_256qam_4layer_4port<true>(intlv_out, W,
+                                                    cell_xtf_re_map,                                         // for csirs RM (prepared by 3 csirsPrep kernels)
+                                                    desc.d_ue_grp_params[ue_grp_idx].cumulative_skipped_REs, // for csirs RM (prepared by 3 csirsPrep kernels)
+                                                    &desc.d_params[TB_id],
+                                                    CB_start_qam_per_layer,
+                                                    EdivQm,
+                                                    modulation_output);
+    } else {
+        pdsch_mod_precode_256qam_4layer_4port<false>(intlv_out, W,
+                                                     cell_xtf_re_map,
+                                                     desc.d_ue_grp_params[ue_grp_idx].cumulative_skipped_REs,
+                                                     &desc.d_params[TB_id],
+                                                     CB_start_qam_per_layer,
+                                                     EdivQm,
+                                                     modulation_output);
+    }
+}
 
 template<uint8_t Tnl, bool csi_rs=false, bool precoding=false, uint8_t shift_bits=Tnl/2>
 __device__ void QAM256_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int EdivQm_bits,
@@ -1309,6 +1674,7 @@ __device__ void QAM256_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Ed
                                                                               shmem_qam_256[y_index]) :
                                                 make_complex<__half2>::create(0, 0);
 
+                             #pragma unroll 1
                              for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                                  //Currently loading the precoding matrix from shared memory instead global
                                  //__half2 matCoeff = dmrs_params->pmW[tmp_layer_id * num_antenna_ports + antenna_port];
@@ -1328,6 +1694,7 @@ __device__ void QAM256_work_all_Nl_but_3(uint32_t CB_start_qam_per_layer, int Ed
                                                                               data_symbol_loc, all_Rbs_symbols, d_xtf_re_map,
                                                                               modified_dmrs_sym_loc);
 
+                         #pragma unroll 1
                          for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                              uint32_t output_index_port_offset = all_Rbs_symbols * antenna_port * OFDM_SYMBOLS_PER_SLOT;
                              atomicAdd(&modulation_output[output_index + output_index_port_offset], local_qam_output[antenna_port]);
@@ -1423,6 +1790,7 @@ __device__ void QAM256_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bit
                          tmp_val.y = 0;
                      }
 
+                     #pragma unroll 1
                      for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                          __half2 matCoeff = dmrs_params->pmW[tmp_layer_id * num_antenna_ports + antenna_port];
                          __half2 new_tmp_val = mult_half2(tmp_val, matCoeff);
@@ -1441,6 +1809,7 @@ __device__ void QAM256_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bit
                                                                       data_symbol_loc, all_Rbs_symbols, d_xtf_re_map,
                                                                        modified_dmrs_sym_loc);
 
+                 #pragma unroll 1
                  for (int antenna_port = 0; antenna_port < num_antenna_ports; antenna_port++) {
                      uint32_t output_index_port_offset = all_Rbs_symbols * antenna_port * OFDM_SYMBOLS_PER_SLOT;
                      atomicAdd(&modulation_output[output_index + output_index_port_offset], local_qam_output[antenna_port]);
@@ -1451,10 +1820,106 @@ __device__ void QAM256_work_Nl_3(uint32_t CB_start_qam_per_layer, int EdivQm_bit
     }
 }
 
+__global__ void
+__launch_bounds__(NUM_FUSED_DL_RM_FAST_THREADS, NUM_FUSED_DL_RM_FAST_THREAD_BLOCKS_PER_SM)
+fused_dl_rm_and_modulation_fast(dlRateMatchingDescr_t* p_desc) {
+    dl_rm_and_mod_precode_256qam_4layer_4port(p_desc);
+}
+
+// RM fast path for PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING code: 256qam, 4layer, 4port, rv0, no dmrs/data mux, no PTRS (phase-tracking reference symbols).
+__device__ void post_rm_scrambling_dl_rm_and_mod_precode_256qam_4layer_4port(dlRateMatchingDescr_t* p_desc)
+{
+    constexpr uint32_t              NUM_LAYERS           = 4;
+    constexpr uint32_t              NUM_DL_PORTS         = 4;
+
+    dlRateMatchingDescr_t& desc                        = *p_desc;
+    const PdschPerTbParams* __restrict__ cfg_workspace = desc.cfg_workspace;
+    const uint32_t          TB_id                      = blockIdx.y;
+    const uint32_t          CB_id                      = blockIdx.x;
+    const PdschPerTbParams* TB_params                  = &cfg_workspace[TB_id];
+    if(CB_id >= TB_params->num_CBs)
+    {
+        return;
+    }
+    const uint32_t cmax                                 = desc.cmax;
+    const uint32_t emax                                 = desc.emax;
+    const int      ELEMENT_BITS                         = 5;                                                 // log2(ELEMENT_SIZE)
+    //const uint32_t TB_start                             = desc.d_TB_start_offset_array[TB_id];               //w.r.t ldpc_encoder_output
+    const uint32_t G_start                              = TB_id * cmax * emax; // start of TB in output buffer in bits
+    uint32_t       CB_start_input                       = (G_start + CB_id * emax) >> ELEMENT_BITS;
+    const uint32_t* __restrict__ CB_input               = desc.d_rate_matching_input + CB_start_input;
+    const int rounded_Er_elements                       = emax >> ELEMENT_BITS;
+
+    constexpr int   NlQm          = (int)NUM_LAYERS * 8; // 256QAM 4-layer
+    const int       ue_grp_idx_e  = desc.d_params[TB_id].ueGrp_idx;
+    const int       num_data_syms = (int)desc.d_params[TB_id].num_data_symbols;
+    const int       num_CSIRS_REs = (int)desc.d_ue_grp_params[ue_grp_idx_e].cumulative_skipped_REs[num_data_syms - 1];
+    const int       C             = (int)TB_params->num_CBs;
+    const int       num_REs       = (int)TB_params->max_REs - num_CSIRS_REs;
+    const int       q             = num_REs / C;
+    const int       m             = num_REs - q * C;
+    const int       num_small_CBs = C - m;
+    const int       E_small       = q * NlQm;
+    const int       E_big         = (C == 1) ? E_small : (q + 1) * NlQm;
+    const bool small_CB               = (CB_id < num_small_CBs);
+    const int  CB_Er                  = small_CB ? E_small : E_big;
+    const int  EdivQm                 = CB_Er / 8;
+    const int  CB_start_qam           = CB_id * EdivQm - (small_CB ? 0 : num_small_CBs * NUM_LAYERS);
+
+    /* - The first rounded_Er_elements: NUM_LAYERS * rounded_Er_element (layer mapping) */
+    extern __shared__ uint32_t intlv_out[];
+    __shared__ __half2         W[NUM_LAYERS * NUM_DL_PORTS]; //W(port, layer), where port is 1st storage dim
+
+    const int num_ports   = desc.d_params[TB_id].Np;
+    const int num_W_elems = (int)NUM_LAYERS * num_ports;
+    for(int i = threadIdx.x; i < num_W_elems; i += blockDim.x)
+    {
+        __half2* src_ptr = (desc.d_params[TB_id].pmW);
+        __pipeline_memcpy_async(W + i, src_ptr + i, sizeof(__half2));
+    }
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
+    for(int i = threadIdx.x; i < rounded_Er_elements; i += blockDim.x)
+    {
+        intlv_out[i] = CB_input[i];
+    }
+    __syncthreads();
+
+    const int       ue_grp_idx             = desc.d_params[TB_id].ueGrp_idx;
+    __half2*        modulation_output      = (__half2*)desc.d_params[TB_id].cell_output_tensor_addr;
+    const uint32_t  CB_start_qam_per_layer = CB_start_qam / NUM_LAYERS;
+    const uint16_t* cell_xtf_re_map        = (uint16_t*)desc.temp_xtf_re_map + desc.d_params[TB_id].cell_index_in_cell_group * (desc.max_PRB_BWP * OFDM_SYMBOLS_PER_SLOT * CUPHY_N_TONES_PER_PRB + OFDM_SYMBOLS_PER_SLOT);
+
+    const bool su_mimo = desc.d_params[TB_id].su_mimo;
+    if(su_mimo) {
+        pdsch_mod_precode_256qam_4layer_4port<true>(intlv_out, W,
+                                                    cell_xtf_re_map,                                         // for csirs RM (prepared by 3 csirsPrep kernels)
+                                                    desc.d_ue_grp_params[ue_grp_idx].cumulative_skipped_REs, // for csirs RM (prepared by 3 csirsPrep kernels)
+                                                    &desc.d_params[TB_id],
+                                                    CB_start_qam_per_layer,
+                                                    EdivQm,
+                                                    modulation_output);
+    } else {
+        pdsch_mod_precode_256qam_4layer_4port<false>(intlv_out, W,
+                                                     cell_xtf_re_map,
+                                                     desc.d_ue_grp_params[ue_grp_idx].cumulative_skipped_REs,
+                                                     &desc.d_params[TB_id],
+                                                     CB_start_qam_per_layer,
+                                                     EdivQm,
+                                                     modulation_output);
+    }
+}
+
+__global__ void
+__launch_bounds__(NUM_FUSED_DL_RM_FAST_THREADS, NUM_FUSED_DL_RM_FAST_THREAD_BLOCKS_PER_SM)
+fused_post_rm_scrambling_fast(dlRateMatchingDescr_t* p_desc) {
+    post_rm_scrambling_dl_rm_and_mod_precode_256qam_4layer_4port(p_desc);
+}
+
 
 template<bool precoding>
 __global__ void
-__launch_bounds__(288, 4) /* previously used 3 blocks because 4 was not possible if we used -DCUPHY_GENCODE_ARCH_LIST="75". Since we're not using this, switched to 4. */
+__launch_bounds__(NUM_FUSED_DL_RM_GENERIC_THREADS, NUM_FUSED_DL_RM_GENERIC_THREAD_BLOCKS_PER_SM)
 fused_dl_rm_and_modulation(dlRateMatchingDescr_t* p_desc) {
 
     dlRateMatchingDescr_t& desc = *p_desc;
@@ -1469,6 +1934,7 @@ fused_dl_rm_and_modulation(dlRateMatchingDescr_t* p_desc) {
     if (CB_id >= num_CBs) { // Exit early if code block does not exist for TB_id TB
         return;
     }
+
     //const uint32_t* __restrict__ ldpc_encoder_output = desc.d_rate_matching_input;
     //const uint32_t* __restrict__ Er_array = desc.d_Er_array;
     const uint32_t* __restrict__ k0_array = desc.d_k0_array;
@@ -1517,6 +1983,7 @@ fused_dl_rm_and_modulation(dlRateMatchingDescr_t* p_desc) {
     int after_CB_split_point = (CB_id >= CB_split_id) ? 1 : 0;
     //const int CB_Er = (test_model == 0) ? ((quotient_C + after_CB_split_point) * num_layers * Qm_val): ((CB_id == num_CBs-1) ? (tbSize*8 - CB_id *rounded_N) : TB_params->N);
     const int CB_Er = (test_model == 0) ? ((quotient_C + after_CB_split_point) * num_layers * Qm_val): ((CB_id == num_CBs-1) ? (G - CB_id*MAX_ENCODED_CODE_BLOCK_BIT_SIZE) : MAX_ENCODED_CODE_BLOCK_BIT_SIZE);
+    const int rounded_CB_Er_elements = (CB_Er + 31) >> ELEMENT_BITS;  // ceil(CB_Er/32)
 #endif
     // don't care for Kd if I bypass selection/interleaving
     //const int Kd =  (test_model != 0) ? CB_Er : TB_params->K - (TB_params->Zc << 1) - F_val;
@@ -1550,25 +2017,22 @@ fused_dl_rm_and_modulation(dlRateMatchingDescr_t* p_desc) {
        - The first rounded_Er_elements (if no layer mapping) or MAX_DL_LAYERS_PER_TB * rounded_Er_element (layer mapping)
          are used to minimize the overhead of atomicOr operations
        - The following rounded_Er_elements + 1 (if scrambling) are used to keep track of the scrambling sequence values.*/
-    extern __shared__ uint32_t dl_rm_shmem[];
+    extern __shared__ __align__(16) char smem[];
+    uint32_t* dl_rm_shmem = reinterpret_cast<uint32_t*>(smem);
     __shared__ __half2 shmem_matrix[MAX_DL_LAYERS_PER_TB*MAX_DL_PORTS]; //shared memory for the precoding matrix; using max possible dimensions
 
-    const int scale = (enable_layer_mapping) ? MAX_DL_LAYERS_PER_TB : 1;
-    uint32_t * CB_scrambling_vals = (uint32_t*)&dl_rm_shmem[rounded_Er_elements * scale];
+    uint32_t * CB_scrambling_vals = (uint32_t*)&dl_rm_shmem[rounded_Er_elements];
 
     uint32_t gold32_CB_start_output = 0; // CB start (rate-matched within a TB)
 
-#if 0
-    for (int i = threadIdx.x; i < scale * rounded_Er_elements; i += blockDim.x) {
-        dl_rm_shmem[i] = 0;
-    }
-#else
-    const int limit = ((int)scale * rounded_Er_elements + 3) >> 2;
-    int4* dl_rm_shmem_int4 = (int4*)dl_rm_shmem;
-    for (int i = threadIdx.x; i < limit; i += blockDim.x) {
+    const int int4_limit = rounded_Er_elements >> 2;
+    int4* dl_rm_shmem_int4 = reinterpret_cast<int4*>(smem);
+    for (int i = threadIdx.x; i < int4_limit; i += blockDim.x) {
         dl_rm_shmem_int4[i] = {0, 0, 0, 0};
     }
-#endif
+    for (int i = (int4_limit << 2) + threadIdx.x; i < rounded_Er_elements; i += blockDim.x) {
+        dl_rm_shmem[i] = 0;
+    }
 
     // Copying precoding matrix from global to shared memory.
     // For this TB, the precoding matrix, if one exists has size num_layers * desc.d_params[TB_id].Np.
@@ -1644,106 +2108,112 @@ fused_dl_rm_and_modulation(dlRateMatchingDescr_t* p_desc) {
         }
 #endif
 
-        // Each thread block is working on a CB. Each thread on Er/(32 * blkDimX) distinct elements
-        for (int i = threadIdx.x; i < rounded_Er_elements; i += blockDim.x) {
+        const bool use_256qam_rv0_interleaver =
+            (Qm_val == CUPHY_QAM_256) && (TB_params->rv == 0) && only_first_pass && (k0 == 0);
+        if (use_256qam_rv0_interleaver) {
+            bit_interleave_256qam_rv0(CB_ldpc_encoder_output, Kd, F_val, CB_Er, EdivQm_bits, dl_rm_shmem);
+        } else {
+            // Each thread block is working on a CB. Each thread on Er/(32 * blkDimX) distinct elements
+            for (int i = threadIdx.x; i < rounded_CB_Er_elements; i += blockDim.x) {
 
-            int index = i << ELEMENT_BITS;
-            int read_index = index + k0;
+                int index = i << ELEMENT_BITS;
+                int read_index = index + k0;
 
-            uint32_t element_read = (index >= first_pass_bits) ? 0 :  CB_ldpc_encoder_output[(read_index >> ELEMENT_BITS)]; // FIXME
+                uint32_t element_read = (index >= first_pass_bits) ? 0 :  CB_ldpc_encoder_output[(read_index >> ELEMENT_BITS)]; // FIXME
 
-            int EdivQm_block_id = index / EdivQm_bits;
-            int EdivQm_bit_id = index - (EdivQm_bits * EdivQm_block_id);
+                int EdivQm_block_id = index / EdivQm_bits;
+                int EdivQm_bit_id = index - (EdivQm_bits * EdivQm_block_id);
 
-            if ((Qm_val == CUPHY_QAM_256) && special_case) {
-                // Special handling for a subset of 256-QAM cases for perf. reasons. When alignment and other conditions are favorable, avoid doing bit-level atomicOr to shared memory
-                // The special_case conditions are: redundancy version 0 (k0==0), no wrap around during bit selection, and CB_Er in bytes is divisible by 4
-                // TODO this same principle can be extended to all modulation orders (Qm). Handling of cases without the 32-bit alignment would require additional work.
+                if ((Qm_val == CUPHY_QAM_256) && special_case) {
+                    // Special handling for a subset of 256-QAM cases for perf. reasons. When alignment and other conditions are favorable, avoid doing bit-level atomicOr to shared memory
+                    // The special_case conditions are: redundancy version 0 (k0==0), no wrap around during bit selection, and CB_Er in bytes is divisible by 4
+                    // TODO this same principle can be extended to all modulation orders (Qm). Handling of cases without the 32-bit alignment would require additional work.
 
-                for (int bit_id = 0; bit_id < ELEMENT_SIZE; bit_id+= 4) {
-                    int new_bit_index = bit_id;
-                    if (index < CB_Er) {
-                        if ((index < first_pass_bits) && (buffer_case == 0) && (index + k0 < Kd)) {
-                            uint32_t four_bits_read = (element_read >> new_bit_index);
-                            // Bit interleaving
-                            int final_index = (EdivQm_bit_id * Qm_val) + EdivQm_block_id; // bit_index within CB_Er block.
-                            uint32_t val = 0;
-                            val |= (four_bits_read & 0x1ULL) <<  (final_index & ELEMENT_MASK);
-                            val |= ((four_bits_read >> 1)& 0x1ULL) <<  ((final_index + 1*Qm_val) & ELEMENT_MASK);
-                            val |= ((four_bits_read >> 2)& 0x1ULL) <<  ((final_index + 2*Qm_val) & ELEMENT_MASK);
-                            val |= ((four_bits_read >> 3)& 0x1ULL) <<  ((final_index + 3*Qm_val) & ELEMENT_MASK);
-                            atomicOr(&dl_rm_shmem[(final_index >> ELEMENT_BITS)], val);
-                        }
-                        else if ((index < first_pass_bits) && (buffer_case == 0) && (index + k0 >= Kd)) {
-
-                            read_index = index + k0 + F_val;
-                            element_read = CB_ldpc_encoder_output[(read_index >> ELEMENT_BITS)]; // not optimal
-                            new_bit_index = read_index & ELEMENT_MASK;
-                            uint32_t four_bits_read = (element_read >> new_bit_index);
-                            int final_index = (EdivQm_bit_id * Qm_val) + EdivQm_block_id; // bit_index within CB_Er block.
-
-                            uint32_t val = 0;
-                            val |= (four_bits_read & 0x1ULL) <<  (final_index & ELEMENT_MASK);
-                            val |= ((four_bits_read >> 1)& 0x1ULL) <<  ((final_index + Qm_val) & ELEMENT_MASK);
-                            val |= ((four_bits_read >> 2)& 0x1ULL) <<  ((final_index + 2*Qm_val) & ELEMENT_MASK);
-                            val |= ((four_bits_read >> 3)& 0x1ULL) <<  ((final_index + 3*Qm_val) & ELEMENT_MASK);
-                            atomicOr(&dl_rm_shmem[(final_index >> ELEMENT_BITS)], val);
-                        }
-                    }
-                    read_index += 4;
-                    index += 4;
-                    if (EdivQm_bit_id == EdivQm_bits - 4) {
-                        EdivQm_bit_id = 0;
-                        EdivQm_block_id += 1;
-                    } else {
-                        EdivQm_bit_id += 4;
-                    }
-                }
-            } else {
-                // Fallback for all Qm order other than 256-QAM and for 256-QAM !special_case cases
-                #pragma unroll 8
-                for (int bit_id = 0; bit_id < ELEMENT_SIZE; bit_id++) {
-
-                    if (index < CB_Er) {
-
-                        // Bit selection
+                    for (int bit_id = 0; bit_id < ELEMENT_SIZE; bit_id+= 4) {
                         int new_bit_index = bit_id;
-                        if (index < first_pass_bits) {
-                            if ((buffer_case == 0) && (index + k0 >= Kd)) { // Needed to skip filler bits. Only possible for rv=0 or rv=1
+                        if (index < CB_Er) {
+                            if ((index < first_pass_bits) && (buffer_case == 0) && (index + k0 < Kd)) {
+                                uint32_t four_bits_read = (element_read >> new_bit_index);
+                                // Bit interleaving
+                                int final_index = (EdivQm_bit_id * Qm_val) + EdivQm_block_id; // bit_index within CB_Er block.
+                                uint32_t val = 0;
+                                val |= (four_bits_read & 0x1ULL) <<  (final_index & ELEMENT_MASK);
+                                val |= ((four_bits_read >> 1)& 0x1ULL) <<  ((final_index + 1*Qm_val) & ELEMENT_MASK);
+                                val |= ((four_bits_read >> 2)& 0x1ULL) <<  ((final_index + 2*Qm_val) & ELEMENT_MASK);
+                                val |= ((four_bits_read >> 3)& 0x1ULL) <<  ((final_index + 3*Qm_val) & ELEMENT_MASK);
+                                atomicOr(&dl_rm_shmem[(final_index >> ELEMENT_BITS)], val);
+                            }
+                            else if ((index < first_pass_bits) && (buffer_case == 0) && (index + k0 >= Kd)) {
+
                                 read_index = index + k0 + F_val;
                                 element_read = CB_ldpc_encoder_output[(read_index >> ELEMENT_BITS)]; // not optimal
                                 new_bit_index = read_index & ELEMENT_MASK;
+                                uint32_t four_bits_read = (element_read >> new_bit_index);
+                                int final_index = (EdivQm_bit_id * Qm_val) + EdivQm_block_id; // bit_index within CB_Er block.
+
+                                uint32_t val = 0;
+                                val |= (four_bits_read & 0x1ULL) <<  (final_index & ELEMENT_MASK);
+                                val |= ((four_bits_read >> 1)& 0x1ULL) <<  ((final_index + Qm_val) & ELEMENT_MASK);
+                                val |= ((four_bits_read >> 2)& 0x1ULL) <<  ((final_index + 2*Qm_val) & ELEMENT_MASK);
+                                val |= ((four_bits_read >> 3)& 0x1ULL) <<  ((final_index + 3*Qm_val) & ELEMENT_MASK);
+                                atomicOr(&dl_rm_shmem[(final_index >> ELEMENT_BITS)], val);
                             }
-                            else if ((k0 & ELEMENT_MASK) != 0) { // N/A for rv=0
-                                read_index = index + k0;
+                        }
+                        read_index += 4;
+                        index += 4;
+                        if (EdivQm_bit_id == EdivQm_bits - 4) {
+                            EdivQm_bit_id = 0;
+                            EdivQm_block_id += 1;
+                        } else {
+                            EdivQm_bit_id += 4;
+                        }
+                    }
+                } else {
+                    // Fallback for all Qm order other than 256-QAM and for 256-QAM !special_case cases
+                    #pragma unroll 8
+                    for (int bit_id = 0; bit_id < ELEMENT_SIZE; bit_id++) {
+
+                        if (index < CB_Er) {
+
+                            // Bit selection
+                            int new_bit_index = bit_id;
+                            if (index < first_pass_bits) {
+                                if ((buffer_case == 0) && (index + k0 >= Kd)) { // Needed to skip filler bits. Only possible for rv=0 or rv=1
+                                    read_index = index + k0 + F_val;
+                                    element_read = CB_ldpc_encoder_output[(read_index >> ELEMENT_BITS)]; // not optimal
+                                    new_bit_index = read_index & ELEMENT_MASK;
+                                }
+                                else if ((k0 & ELEMENT_MASK) != 0) { // N/A for rv=0
+                                    read_index = index + k0;
+                                    element_read = CB_ldpc_encoder_output[(read_index >> ELEMENT_BITS)]; // not optimal
+                                    new_bit_index = read_index & ELEMENT_MASK;
+                                }
+                            } else { // This is applicable in all cases
+                                read_index = (index - first_pass_bits) % (TB_params->Ncb - F_val);
+                                if (read_index >= Kd) read_index += F_val;
                                 element_read = CB_ldpc_encoder_output[(read_index >> ELEMENT_BITS)]; // not optimal
                                 new_bit_index = read_index & ELEMENT_MASK;
                             }
-                        } else { // This is applicable in all cases
-                            read_index = (index - first_pass_bits) % (TB_params->Ncb - F_val);
-                            if (read_index >= Kd) read_index += F_val;
-                            element_read = CB_ldpc_encoder_output[(read_index >> ELEMENT_BITS)]; // not optimal
-                            new_bit_index = read_index & ELEMENT_MASK;
-                        }
-                        uint32_t bit_read = (element_read >> new_bit_index);
+                            uint32_t bit_read = (element_read >> new_bit_index);
 
-                        // Bit interleaving
-                        //int final_index = (EdivQm_bit_id * tmp_Qm_val) + EdivQm_block_id; // bit_index within CB_Er block.
-                        int final_index = (EdivQm_bit_id * Qm_val) + EdivQm_block_id; // bit_index within CB_Er block.
-                        bit_read = (bit_read & 0x1ULL) <<  (final_index & ELEMENT_MASK);
-                        atomicOr(&dl_rm_shmem[(final_index >> ELEMENT_BITS)], bit_read); // not optimal - todo
+                            // Bit interleaving
+                            //int final_index = (EdivQm_bit_id * tmp_Qm_val) + EdivQm_block_id; // bit_index within CB_Er block.
+                            int final_index = (EdivQm_bit_id * Qm_val) + EdivQm_block_id; // bit_index within CB_Er block.
+                            bit_read = (bit_read & 0x1ULL) <<  (final_index & ELEMENT_MASK);
+                            atomicOr(&dl_rm_shmem[(final_index >> ELEMENT_BITS)], bit_read); // not optimal - todo
+                        }
+                        read_index += 1;
+                        index += 1;
+                        if (EdivQm_bit_id == EdivQm_bits - 1) {
+                            EdivQm_bit_id = 0;
+                            EdivQm_block_id += 1;
+                        } else {
+                            EdivQm_bit_id += 1;
+                        }
                     }
-                    read_index += 1;
-                    index += 1;
-                    if (EdivQm_bit_id == EdivQm_bits - 1) {
-                        EdivQm_bit_id = 0;
-                        EdivQm_block_id += 1;
-                    } else {
-                        EdivQm_bit_id += 1;
-                    }
-                }
-            } // end of generic else clause
-        }  // end of for loop over rounded_Er_elements
+                } // end of generic else clause
+            }  // end of for loop over rounded_Er_elements
+        }
     } else {
         // For TBs in TM, we can avoid bit selection and interleaving instead of doing it at 1-bit granularity
         for (int i = threadIdx.x; i < ((CB_Er+31) >> 5); i += blockDim.x) {
@@ -1941,6 +2411,268 @@ if (threadIdx.x == 0) {
             } else {
                 QAM256_work_all_Nl_but_3<4, false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
                                      &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_Er_elements, modulation_output, cell_xtf_re_map, shmem_matrix);
+            }
+        }
+    }
+}
+
+template<bool precoding>
+__global__ void
+__launch_bounds__(288, 4)
+fused_post_rm_scrambling(dlRateMatchingDescr_t* p_desc) {
+
+    dlRateMatchingDescr_t& desc = *p_desc;
+    const PdschPerTbParams* __restrict__ cfg_workspace =  desc.cfg_workspace;
+
+    const uint32_t TB_id = blockIdx.y;
+    const uint32_t CB_id = blockIdx.x;
+
+    const PdschPerTbParams * TB_params = &cfg_workspace[TB_id];
+    const uint8_t test_model = TB_params->testModel;
+    const uint32_t num_CBs = TB_params->num_CBs;
+    if (CB_id >= num_CBs) { // Exit early if code block does not exist for TB_id TB
+        return;
+    }
+    const uint32_t cmax = desc.cmax;
+    const uint32_t emax = desc.emax;
+
+    const int ELEMENT_BITS = 5; // log2(ELEMENT_SIZE)
+    const uint32_t Qm_val = TB_params->Qm;
+    const uint32_t num_layers = TB_params->Nl; // Reminder can be [1, MAX_DL_LAYERS_PER_TB=4]
+
+    /* Er_array has 2 elements per TB.
+       - Er_array[TB_id * 2 + 0] holds the CB id of the Er split point (this TB's num_CBs is none)
+       - Er_array[TB_id * 2 + 1] holds the min Er in bits for that TB. The max Er, for all CBs >= split point
+         is min Er + num_layers * modulation order bits.
+    */
+    int ue_grp_idx = desc.d_params[TB_id].ueGrp_idx;
+    int num_data_symbols = desc.d_params[TB_id].num_data_symbols;
+
+    int csirs_rs_RE_cnt = desc.d_ue_grp_params[ue_grp_idx].cumulative_skipped_REs[num_data_symbols - 1]; // cumulative_skipped_REs computed as part of postProcessCsirsReMap kernel from cuphyRunPdschCsirsPreprocessing during PDSCH setup
+    int per_UE_REs = TB_params->max_REs - csirs_rs_RE_cnt;
+    int G = per_UE_REs * num_layers * Qm_val; // for TBs in TM this is almost equivalent to tbSize*8 (G/8 rounded up is tbSize); reminder no CSI-RS present for these cells.
+    int quotient_C = per_UE_REs / num_CBs;
+    int modulo_C = (test_model == 0) ? (per_UE_REs - quotient_C * num_CBs) : 0; //split, if any, at C - modulo_C CB
+    int CB_split_id = num_CBs - modulo_C;
+    int after_CB_split_point = (CB_id >= CB_split_id) ? 1 : 0;
+    const int CB_Er = (test_model == 0) ? ((quotient_C + after_CB_split_point) * num_layers * Qm_val): ((CB_id == num_CBs-1) ? (G - CB_id*MAX_ENCODED_CODE_BLOCK_BIT_SIZE) : MAX_ENCODED_CODE_BLOCK_BIT_SIZE);
+
+    int EdivQm_bits = 0;
+    int maxNdivQm_bits = 0;
+    // For TBs in cells in testing mode, CB_Er will be MAX_ENCODED_CODE_BLOCK_BIT_SIZE=25344 for TB_id in [0, num_CBs-2] and G - (num_CBs-1)*25344 for TB_id=num_CBs-1.
+    // For those TBs, no bit selection/ interleaving shall take place. This is currently achieved by enforcing EdivQm_bits == CB_Er, i.e., as if Qm_val was 1.
+    if (Qm_val == CUPHY_QAM_4) {
+        EdivQm_bits = CB_Er >> 1;
+        maxNdivQm_bits = MAX_ENCODED_CODE_BLOCK_BIT_SIZE >> 1;
+    } else if (Qm_val ==  CUPHY_QAM_16) {
+        EdivQm_bits = CB_Er >> 2;
+        maxNdivQm_bits = MAX_ENCODED_CODE_BLOCK_BIT_SIZE >> 2;
+    } else if (Qm_val ==  CUPHY_QAM_64) {
+        EdivQm_bits = CB_Er / 6;
+        maxNdivQm_bits = MAX_ENCODED_CODE_BLOCK_BIT_SIZE / 6;
+    } else if (Qm_val ==  CUPHY_QAM_256) {
+        EdivQm_bits = CB_Er >> 3;
+        maxNdivQm_bits = MAX_ENCODED_CODE_BLOCK_BIT_SIZE >> 3;
+    }
+    int orig_EdivQm_bits = EdivQm_bits;
+
+    if (test_model != 0) EdivQm_bits = CB_Er;
+
+    /* dynamic shared memory organized as follows:
+       - The first rounded_Er_elements (if no layer mapping) or MAX_DL_LAYERS_PER_TB * rounded_Er_element (layer mapping)
+         are used to minimize the overhead of atomicOr operations */
+    extern __shared__ uint32_t dl_rm_shmem[];
+    __shared__ __half2 shmem_matrix[MAX_DL_LAYERS_PER_TB*MAX_DL_PORTS]; //shared memory for the precoding matrix; using max possible dimensions
+
+    const uint32_t G_start = TB_id * cmax * emax; // start of TB in output buffer in bits
+    uint32_t CB_start_input = (G_start + CB_id * emax) >> ELEMENT_BITS;
+    const uint32_t* __restrict__ CB_input = desc.d_rate_matching_input + CB_start_input;
+
+    // Copying precoding matrix from global to shared memory.
+    // For this TB, the precoding matrix, if one exists has size num_layers * desc.d_params[TB_id].Np.
+    // If this TB has no precoding enabled (i.e., desc.d_params[TB_id].enablePrcdBf == 0), the shared memory contents will be invalid
+    // (but still no illegal memory access).
+    for (int i = threadIdx.x; i < MAX_DL_PORTS * MAX_DL_LAYERS_PER_TB; i += blockDim.x) {
+        __half2* src_ptr = (desc.d_params[TB_id].pmW);
+        __pipeline_memcpy_async(shmem_matrix+i, src_ptr+i, sizeof(__half2));
+    }
+    __pipeline_commit();
+
+   //if (threadIdx.x == 0) printf("TB_id %d, CB_id %d / %d num_CBs, CB_Er %d. Emax %d Cmax %d\n", TB_id, CB_id, num_CBs, CB_Er, emax, cmax);
+
+    const int rounded_CB_Er_elements = (CB_Er + 31) >> ELEMENT_BITS;  // ceil(CB_Er/32)
+    for (int i = threadIdx.x; i < rounded_CB_Er_elements; i+= blockDim.x) {
+        dl_rm_shmem[i] = CB_input[i];
+    }
+
+   __syncthreads();
+
+    //-----------------------------------------------------------------------------------------------------
+
+    // At this point we have the scrambled but not layer mapped values in shmem
+    // We know each CB_Er is evenly divisible by Qam and also Nl
+    // Go from symbol within a CB to (layer, symbol, RE)
+    // Every CB contributes either a  or (a+1) symbols per layer, where a = CB_Er_0/ (Qm_val * Nl_val)
+
+    //Only if scrambling/layer mapping
+    uint32_t CB_start_qam = 0;
+    if (after_CB_split_point == 0) {
+        // For TBs in cells in testing mode, all CBs will be before the split point.
+        if (test_model == 0) {
+            CB_start_qam = CB_id * orig_EdivQm_bits; //using EdivQm_bits is ok too
+        } else {
+            CB_start_qam = CB_id * maxNdivQm_bits;
+        }
+    } else { // after the split
+        CB_start_qam = CB_id * EdivQm_bits - CB_split_id * num_layers;
+    }
+    // Can find start symbol each CB contributes to.
+
+    uint32_t CB_start_qam_per_layer = 0;
+    bool csi_rs = (desc.d_ue_grp_params[ue_grp_idx].cumulative_skipped_REs[num_data_symbols - 1] != 0);
+    __half2* modulation_output = (__half2*)desc.d_params[TB_id].cell_output_tensor_addr;
+
+    // RE map recently extended by OFDM_SYMBOLS_PER_SLOT
+    uint16_t* cell_xtf_re_map = (uint16_t*)desc.temp_xtf_re_map + desc.d_params[TB_id].cell_index_in_cell_group * (desc.max_PRB_BWP * OFDM_SYMBOLS_PER_SLOT * CUPHY_N_TONES_PER_PRB + OFDM_SYMBOLS_PER_SLOT);
+
+    if (num_layers == 1) {
+        CB_start_qam_per_layer = CB_start_qam;
+        if (Qm_val == CUPHY_QAM_4) {
+            if (csi_rs) {
+                QAM4_work_all_Nl_but_3<1, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                                &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM4_work_all_Nl_but_3<1, false, precoding>(CB_start_qam_per_layer, orig_EdivQm_bits,
+                                                 &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_16) {
+            if (csi_rs) {
+                QAM16_work_all_Nl_but_3<1, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                                 &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM16_work_all_Nl_but_3<1, false, precoding>(CB_start_qam_per_layer, orig_EdivQm_bits,
+                                                  &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_64) {
+            if (csi_rs) {
+                QAM64_work_all_Nl_but_3<1, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                                 &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM64_work_all_Nl_but_3<1, false, precoding>(CB_start_qam_per_layer, orig_EdivQm_bits,
+                                                  &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_256) {
+            if (csi_rs) {
+                QAM256_work_all_Nl_but_3<1, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                                  &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map, shmem_matrix);
+            } else {
+                QAM256_work_all_Nl_but_3<1, false, precoding>(CB_start_qam_per_layer, orig_EdivQm_bits,
+                                                   &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map, shmem_matrix);
+            }
+        }
+    } else if (num_layers == 2) {
+        CB_start_qam_per_layer = CB_start_qam >> 1;
+        if (Qm_val == CUPHY_QAM_4) {
+            if (csi_rs) {
+                QAM4_work_all_Nl_but_3<2, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                                  &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM4_work_all_Nl_but_3<2, false, precoding>(CB_start_qam_per_layer, orig_EdivQm_bits,
+                                                 &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_16) {
+            if (csi_rs) {
+                QAM16_work_all_Nl_but_3<2, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                                 &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM16_work_all_Nl_but_3<2, false, precoding>(CB_start_qam_per_layer, orig_EdivQm_bits,
+                                                  &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_64) {
+            if (csi_rs) {
+                QAM64_work_all_Nl_but_3<2, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                                 &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM64_work_all_Nl_but_3<2, false, precoding>(CB_start_qam_per_layer, orig_EdivQm_bits,
+                                                  &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_256) {
+            if (csi_rs) {
+                QAM256_work_all_Nl_but_3<2, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                                  &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map, shmem_matrix);
+            } else {
+                QAM256_work_all_Nl_but_3<2, false, precoding>(CB_start_qam_per_layer, orig_EdivQm_bits,
+                                                   &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx],  rounded_CB_Er_elements, modulation_output, cell_xtf_re_map, shmem_matrix);
+            }
+        }
+    } else if (num_layers == 3) {
+        CB_start_qam_per_layer = CB_start_qam / 3;
+        if (Qm_val == CUPHY_QAM_4) {
+            if (csi_rs) {
+                QAM4_work_Nl_3<true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM4_work_Nl_3<false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                      &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_16) {
+            if (csi_rs) {
+                QAM16_work_Nl_3<true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM16_work_Nl_3<false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_64) {
+            if (csi_rs) {
+                QAM64_work_Nl_3<true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM64_work_Nl_3<false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_256) {
+            if (csi_rs) {
+                QAM256_work_Nl_3<true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM256_work_Nl_3<false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        }
+    } else if (num_layers == 4) {
+        CB_start_qam_per_layer = CB_start_qam >> 2;
+        if (Qm_val == CUPHY_QAM_4) {
+            if (csi_rs) {
+                QAM4_work_all_Nl_but_3<4, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM4_work_all_Nl_but_3<4, false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_16) {
+            if (csi_rs) {
+                QAM16_work_all_Nl_but_3<4, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                QAM16_work_all_Nl_but_3<4, false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_64) {
+            if (csi_rs) {
+                 QAM64_work_all_Nl_but_3<4, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            } else {
+                 QAM64_work_all_Nl_but_3<4, false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map);
+            }
+        } else if (Qm_val == CUPHY_QAM_256) {
+            if (csi_rs) {
+                QAM256_work_all_Nl_but_3<4, true, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map, shmem_matrix);
+            } else {
+                QAM256_work_all_Nl_but_3<4, false, precoding>(CB_start_qam_per_layer, EdivQm_bits,
+                                     &desc.d_params[TB_id], &desc.d_ue_grp_params[ue_grp_idx], rounded_CB_Er_elements, modulation_output, cell_xtf_re_map, shmem_matrix);
             }
         }
     }
@@ -2384,6 +3116,7 @@ cuphyStatus_t CUPHYWINAPI cuphySetupDlRateMatching(cuphyDlRateMatchingLaunchConf
                                                    uint8_t precoding,
                                                    uint8_t restructure_kernel,
                                                    uint8_t batching,
+                                                   uint8_t post_fec_rm_scrambling,
                                                    uint32_t* h_workspace,
                                                    uint32_t* d_workspace, //H2D copy from h_workspace to d_workspace happens within setup if enable_desc_async_copy
                                                    PdschPerTbParams* h_params,
@@ -2508,19 +3241,25 @@ cuphyStatus_t CUPHYWINAPI cuphySetupDlRateMatching(cuphyDlRateMatchingLaunchConf
         CUDA_CHECK(cudaMemcpyAsync(gpu_desc, cpu_desc, sizeof(dlRateMatchingDescr_t), cudaMemcpyHostToDevice, strm));
     }
     dlRateMatchingLaunchConfig->m_desc = static_cast<dlRateMatchingDescr_t*>(gpu_desc);
-    const uint32_t num_threads = 288;
 
-    size_t scrambling_shmem_elements = enable_scrambling ? rounded_emax + 1: 0;
-    size_t layer_mapping_shmem_elements = (enable_layer_mapping) ? rounded_emax * MAX_DL_LAYERS_PER_TB : rounded_emax;
-    size_t shmem_size = (scrambling_shmem_elements + layer_mapping_shmem_elements) * sizeof(uint32_t);
+    size_t scrambling_shmem_elements = enable_scrambling ? rounded_emax + 1 : 0;
+    bool post_fec_rm_scrambling_processing = (post_fec_rm_scrambling == 1);
 
     if (enable_modulation) {
         // Always update the kernel function, as the presence of precoding for the cells in a cell group
         // can change throughout the cuPHY PDSCH object's lifetime.
         // This is also the case for standalone components.
         cudaFunction_t device_function;
+        // The fast path kernel is chosen if and only if all TBs in the cell group meet the fast_path requirement,
+        // thus guaranteeing that only a single fused rate matching and modulation kernel is launched per slot.
+        const bool use_fast_fused_launch =
+            (precoding != 0) && enable_scrambling && enable_layer_mapping && (num_TBs > 0) &&
+            std::all_of(h_params, h_params + num_TBs, [](const PdschPerTbParams& params) {
+                return params.fast_path;
+            });
+        //printf("precoding %d, fast fused launch %d, post_fec_rm_scrambling_processing %d\n", precoding, use_fast_fused_launch, post_fec_rm_scrambling_processing);
         if (precoding == 0) {
-            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&device_function, reinterpret_cast<void*>(fused_dl_rm_and_modulation<false>)));}
+            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&device_function, (post_fec_rm_scrambling_processing) ? reinterpret_cast<void*>(fused_post_rm_scrambling<false>) : reinterpret_cast<void*>(fused_dl_rm_and_modulation<false>)));}
             // In some cases, shmem_size may exceed 48KB, which requires an explicit opt-in.
             // For example, a single UE with an allocation of 273 PRBs, 13 data symbols, 4 layers, 4 layers,
             // and mcsTable=2 and mcsIndex=0 (i.e., lowest code-rate) would require 70984 of shared memory.
@@ -2532,19 +3271,46 @@ cuphyStatus_t CUPHYWINAPI cuphySetupDlRateMatching(cuphyDlRateMatchingLaunchConf
             CUDA_CHECK(cudaFuncGetAttributes(&attr, fused_dl_rm_and_modulation<false>));
             if (attr.maxDynamicSharedSizeBytes < shmem_size) {
                 printf("attr.maxDynamicSharedSizeBytes %d but shmem_size %d \n", attr.maxDynamicSharedSizeBytes, shmem_size);
-                CUDA_CHECK(cudaFuncSetAttribute(fused_dl_rm_and_modulation<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
+			CUDA_CHECK(cudaFuncSetAttribute(fused_dl_rm_and_modulation<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
             }*/
 #endif
+        } else if (use_fast_fused_launch) {
+            //TODO determine if we want to enable the special case for fused_post_rm_scrambling case too
+            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&device_function, (post_fec_rm_scrambling_processing) ? reinterpret_cast<void*>(fused_post_rm_scrambling_fast) : reinterpret_cast<void*>(fused_dl_rm_and_modulation_fast)));}
+            //{MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&device_function, (post_fec_rm_scrambling_processing) ? reinterpret_cast<void*>(fused_post_rm_scrambling<true>) : reinterpret_cast<void*>(fused_dl_rm_and_modulation_fast)));}
         } else {
-            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&device_function, reinterpret_cast<void*>(fused_dl_rm_and_modulation<true>)));}
+            {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&device_function, (post_fec_rm_scrambling_processing) ? reinterpret_cast<void*>(fused_post_rm_scrambling<true>) : reinterpret_cast<void*>(fused_dl_rm_and_modulation<true>)));}
             // In some cases, shmem_size may exceed 48KB, which requires an explicit opt-in. See earlier comment too. See cuFuncSetAttribute call below
             //CUDA_CHECK(cudaFuncSetAttribute(fused_dl_rm_and_modulation<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
         }
+
+        // calculate the size of shared memory
+        size_t shmem_size = 0;
+        if (!use_fast_fused_launch) 
+        {
+            size_t rm_shmem_elements = rounded_emax;  // scale = 1, no layer mapping in shmem
+            shmem_size = (scrambling_shmem_elements + rm_shmem_elements) * sizeof(uint32_t);
+        } else {
+            size_t layer_mapping_shmem_elements = (enable_layer_mapping) ? rounded_emax * MAX_DL_LAYERS_PER_TB : rounded_emax;
+            shmem_size = (scrambling_shmem_elements + layer_mapping_shmem_elements) * sizeof(uint32_t);
+        }
+
+#if CUDA_VERSION < 13020
         CU_CHECK(cuFuncSetAttribute(device_function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shmem_size));
+#else
+        // The explicit dynamic shared memory opt-in is no longer needed, as the corresponding graph kernel node in pdsch_tx.cpp has been
+        // created with the non-portable shared memory mode attribute.
+        // In stream mode, the caller should launch this via launch_kernel_ex() API with the last arg set to true to set the non-portable shared memory mode attribute
+
+        // Please note, this now becomes the responsibility of the caller (maybe not ideal).
+        // Alternatively, we could update dlRateMatchingLaunchConfig to point to a CUlaunchCOnfig instead of  CUDA_KERNEL_NODE_PARAMS or
+        // extend it to include a bool that expresses if shared mem opt-in is needed.
+#endif
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].func = device_function;
 
         // Fused rate-matching + modulation kernel.
-        dlRateMatchingLaunchConfig->m_kernelNodeParams[0].blockDimX = num_threads;
+        dlRateMatchingLaunchConfig->m_kernelNodeParams[0].blockDimX =
+            use_fast_fused_launch ? NUM_FUSED_DL_RM_FAST_THREADS : NUM_FUSED_DL_RM_GENERIC_THREADS;
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].blockDimY = 1;
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].blockDimZ = 1;
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].gridDimX  = desc.cmax;
@@ -2560,13 +3326,16 @@ cuphyStatus_t CUPHYWINAPI cuphySetupDlRateMatching(cuphyDlRateMatchingLaunchConf
         // This is also the case for standalone components.
         {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&rm_device_function, reinterpret_cast<void*>(dl_rate_matching)));}
         {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&restructuring_device_function, reinterpret_cast<void*>(restructure_rate_matching_output)));}
+        // calculate the size of shared memory
+        size_t layer_mapping_shmem_elements = (enable_layer_mapping) ? rounded_emax * MAX_DL_LAYERS_PER_TB : rounded_emax;
+        size_t shmem_size = (scrambling_shmem_elements + layer_mapping_shmem_elements) * sizeof(uint32_t);
         CUDA_CHECK(cudaFuncSetAttribute(dl_rate_matching, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size));
 
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].func = rm_device_function;
         dlRateMatchingLaunchConfig->m_kernelNodeParams[1].func = restructuring_device_function;
 
         // For rate matching kernel
-        dlRateMatchingLaunchConfig->m_kernelNodeParams[0].blockDimX = num_threads;
+        dlRateMatchingLaunchConfig->m_kernelNodeParams[0].blockDimX = NUM_FUSED_DL_RM_GENERIC_THREADS;
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].blockDimY = 1;
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].blockDimZ = 1;
         dlRateMatchingLaunchConfig->m_kernelNodeParams[0].gridDimX  = desc.cmax;

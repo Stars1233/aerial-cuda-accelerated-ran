@@ -17,4 +17,4 @@ add_executable(cpuMatAlg)
 target_sources(cpuMatAlg PRIVATE test.cpp)
 
 target_include_directories(cpuMatAlg PRIVATE ${CMAKE_SOURCE_DIR} ${HDF5_CXX_INCLUDE_DIRS})
-target_link_libraries(cpuMatAlg PRIVATE cumac CUDA::cudart CUDA::cuda_driver ${CUDA_cusolver_LIBRARY} ${HDF5_CXX_LIBRARIES})
+target_link_libraries(cpuMatAlg PRIVATE cumac CUDA::cudart CUDA::cuda_driver CUDA::cusolver ${HDF5_CXX_LIBRARIES})

@@ -1,4 +1,4 @@
-% SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+% SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 % SPDX-License-Identifier: Apache-2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,7 +85,9 @@ end
             fprintf("\n**** Start Processing Sheet: %s ****\n", sheets{i});
             data = readtable(spreadsheet,'Sheet',sheets{i}, 'PreserveVariableNames', true);
             data = data(1:17,3:end);
-            headers = readcell(spreadsheet,'Sheet',sheets{i}, 'Range', '2:2');
+
+            [~,nCases] = size(data);
+            headers = readcell(spreadsheet,'Sheet',sheets{i}, 'Range', [2 2 2 nCases + 3]);
             headers = headers(1,3:end);
             
             duplex = readcell(spreadsheet,'Sheet',sheets{i}, 'Range', '20:20');
@@ -95,8 +97,6 @@ end
                 SysPar.carrier.duplex = 0;
             end
 
-            [~,nCases] = size(data);
-            
             for tc = 1 : nCases
                 
                 tc_str = headers{tc};

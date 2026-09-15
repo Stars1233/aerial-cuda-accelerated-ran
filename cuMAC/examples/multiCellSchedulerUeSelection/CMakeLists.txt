@@ -14,6 +14,6 @@
 # limitations under the License.
 
 add_executable(multiCellSchedulerUeSelection)
-target_sources(multiCellSchedulerUeSelection PRIVATE main.cpp ../network.cu ../trafficModel/trafficGenerator.cpp)
-target_link_libraries(multiCellSchedulerUeSelection PRIVATE cumac ${HDF5_CXX_LIBRARIES} chanModels)
-target_include_directories(multiCellSchedulerUeSelection PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${CHAN_MODELS_SRC_INCLUDE_DIR} ${cumac_SOURCE_DIR}/examples/tools)
+target_sources(multiCellSchedulerUeSelection PRIVATE main.cpp ../network.cu ../parameters.cpp ../trafficModel/trafficGenerator.cpp)
+target_link_libraries(multiCellSchedulerUeSelection PRIVATE cumac ${HDF5_CXX_LIBRARIES} gpu3gppchan yaml-cpp)
+target_include_directories(multiCellSchedulerUeSelection PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${GPU3GPPCHAN_SRC_INCLUDE_DIR} ${cumac_SOURCE_DIR}/examples/tools)

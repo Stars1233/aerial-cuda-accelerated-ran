@@ -19,6 +19,7 @@
 #include <exception>
 #include <libgen.h>
 #include <atomic>
+#include "fmt/format.h"
 #include "nvlog.h"
 #include "nvlog.hpp"
 #include "memtrace.h"
@@ -39,8 +40,6 @@ static std::atomic<int32_t> current_logfile_index{0};
 static std::atomic<int> fmt_log_initiated = 0;
 
 static pthread_t g_fmtlog_thread_id = 0; //!< Background polling thread id.
-
-exit_handler& pExitHandler=exit_handler::getInstance();
 
 static inline fmtlog::LogLevel getfmtLogLevel(int level)
 {
@@ -78,14 +77,12 @@ static inline fmtlog::LogLevel getfmtLogLevel(int level)
  */
 static void build_logfile_path(char* buf, size_t size, int index)
 {
-    if (index == 0)
-    {
-        snprintf(buf, size, "%s", logfile_base);
-    }
-    else
-    {
-        snprintf(buf, size, "%s.%d", logfile_base, index);
-    }
+    // Write up to size-1 chars then null-terminate. fmt::format_to_n bounds
+    // the output itself, so there's no manual size accounting to keep right.
+    auto result = (index == 0)
+        ? fmt::format_to_n(buf, size - 1, "{}", logfile_base)
+        : fmt::format_to_n(buf, size - 1, "{}.{}", logfile_base, index);
+    *result.out = '\0';
 }
 
 /**
@@ -204,6 +201,8 @@ void nvlog_fmtlog_close(pthread_t bg_thread_id)
     }
     fmtlog::closeLogFile();
     fmt_log_initiated.store(0);
+    current_logfile_index.store(0);
+    nvlog_safe_strncpy(logfile_base, "/tmp", MAX_PATH_LEN);
     printf("%s: FMT log closed\n", __func__);
 }
 
@@ -482,7 +481,7 @@ int get_root_path(char* path, int cubb_root_path_relative_num) {
     int length = -1;
 
     // If CUBB_HOME was set in system environment variables, return it
-    char* env = getenv(CONFIG_CUBB_ROOT_ENV);
+    const char* env = getenv(CONFIG_CUBB_ROOT_ENV);
     if (env != NULL) {
         length = snprintf(path, MAX_PATH_LEN - 1, "%s", env);
         if (path[length - 1] != '/') {
@@ -525,5 +524,67 @@ int get_full_path_file(char* dest_buf, const char* relative_path, const char* fi
         length += snprintf(dest_buf + length, MAX_PATH_LEN - length, "%s", file_name);
     }
     NVLOGV_FMT(TAG, "{}: length={} full_path={}", __func__, length, dest_buf);
+    return length;
+}
+
+int get_cubb_root_path(char* dst_buf) {
+    static constexpr int kSrcDirToRootDepth = 4;
+
+    // Prefer CUBB_HOME when set (installed SDK, CI, containers).
+    const char* env = getenv(CONFIG_CUBB_ROOT_ENV);
+    if (env != nullptr) {
+        int length = snprintf(dst_buf, MAX_PATH_LEN - 1, "%s", env);
+        if (length > 0 && length < MAX_PATH_LEN) {
+            if (dst_buf[length - 1] != '/') {
+                dst_buf[length] = '/';
+                length++;
+                dst_buf[length] = '\0';
+            }
+            return length;
+        }
+    }
+
+    // __FILE__ is <CUBB_ROOT>/cuPHY/nvlog/src/nvlog.cpp when the compiler records an absolute path.
+    char src_buf[MAX_PATH_LEN];
+    const int n = snprintf(src_buf, sizeof(src_buf), "%s", __FILE__);
+    if (n > 0 && n < static_cast<int>(sizeof(src_buf)) && src_buf[0] == '/') {
+        char* tmp = src_buf;
+        for (int i = 0; i < kSrcDirToRootDepth; i++) {
+            tmp = dirname(tmp);
+        }
+        return snprintf(dst_buf, MAX_PATH_LEN - 1, "%s/", tmp);
+    }
+
+    return -1;
+}
+
+int get_cubb_full_path(char* dest_buf, const char* relative_path, const char* file_name)
+{
+    int length = get_cubb_root_path(dest_buf);
+    if(length < 0)
+    {
+        NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "{}: failed to get cuBB root path", __func__);
+        return length;
+    }
+
+    if(relative_path != NULL)
+    {
+        length += snprintf(dest_buf + length, MAX_PATH_LEN - length, "%s", relative_path);
+        if(length >= MAX_PATH_LEN - 1)
+        {
+            length = MAX_PATH_LEN - 2;
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "{}: full path length exceeds MAX_PATH_LEN - 1, truncated to {}", __func__, length);
+        }
+        if(dest_buf[length - 1] != '/')
+        {
+            dest_buf[length]   = '/';
+            dest_buf[++length] = '\0';
+        }
+    }
+
+    if(file_name != NULL)
+    {
+        length += snprintf(dest_buf + length, MAX_PATH_LEN - length, "%s", file_name);
+    }
     return length;
 }

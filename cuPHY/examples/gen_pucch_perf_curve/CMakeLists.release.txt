@@ -15,6 +15,6 @@
 
 set(SOURCES gen_pucch_perf_curve.cpp cuphy_ex_gen_perf_curve_from_file.cpp dummy.cu ../common/datasets.cpp)
 add_executable(cuphy_ex_gen_perf_curve_from_file ${SOURCES})
-target_include_directories(cuphy_ex_gen_perf_curve_from_file PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}> ${HDF5_INCLUDE_DIRS} ${CHAN_MODELS_SRC_INCLUDE_DIR})
-target_link_libraries(cuphy_ex_gen_perf_curve_from_file cuphy_hdf5 cuphy curand ${HDF5_C_LIBRARIES} chanModels)
+target_include_directories(cuphy_ex_gen_perf_curve_from_file PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}> ${HDF5_INCLUDE_DIRS} ${GPU3GPPCHAN_SRC_INCLUDE_DIR})
+target_link_libraries(cuphy_ex_gen_perf_curve_from_file cuphy_hdf5 cuphy curand ${HDF5_C_LIBRARIES} gpu3gppchan)
 

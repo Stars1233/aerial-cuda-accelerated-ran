@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -136,7 +136,7 @@ struct mlx5_wqe_cseg {
 	uint32_t sq_ds;
 	uint32_t flags;
 	uint32_t misc;
-} __rte_packed __rte_aligned(MLX5_WSEG_SIZE);
+} __attribute__((__packed__)) __rte_aligned(MLX5_WSEG_SIZE);
 
 /* Header of data segment. Minimal size Data Segment */
 struct mlx5_wqe_dseg {
@@ -146,9 +146,9 @@ struct mlx5_wqe_dseg {
 		struct {
 			uint32_t lkey;
 			uint64_t pbuf;
-		} __rte_packed;
+		} __attribute__((__packed__));
 	};
-} __rte_packed;
+} __attribute__((__packed__));
 
 /* Subset of struct WQE Ethernet Segment. */
 struct mlx5_wqe_eseg {
@@ -164,22 +164,22 @@ struct mlx5_wqe_eseg {
 				uint16_t inline_data;
 				uint16_t vlan_tag;
 			};
-		} __rte_packed;
+		} __attribute__((__packed__));
 		struct {
 			uint32_t offsets;
 			uint32_t flags;
 			uint32_t flow_metadata;
 			uint32_t inline_hdr;
-		} __rte_packed;
+		} __attribute__((__packed__));
 	};
-} __rte_packed;
+} __attribute__((__packed__));
 
 struct mlx5_wqe_qseg {
 	uint32_t reserved0;
 	uint32_t reserved1;
 	uint32_t max_index;
 	uint32_t qpn_cqn;
-} __rte_packed;
+} __attribute__((__packed__));
 
 /* The title WQEBB, header of WQE. */
 struct mlx5_wqe {
@@ -192,11 +192,11 @@ struct mlx5_wqe {
 		struct mlx5_wqe_dseg dseg[2];
 		uint8_t data[MLX5_ESEG_EXTRA_DATA_SIZE];
 	};
-} __rte_packed;
+} __attribute__((__packed__));
 
 struct mlx5_ds_wqe {
 	struct mlx5_wqe_dseg dseg[4];
-} __rte_packed;
+} __attribute__((__packed__));
 
 #define MLX5_WQE_CSEG_SIZE sizeof(struct mlx5_wqe_cseg)
 #define MLX5_WQE_DSEG_SIZE sizeof(struct mlx5_wqe_dseg)
@@ -245,7 +245,7 @@ struct mlx5_cqe {
 		struct {
 			uint8_t user_index_hi;
 			uint16_t user_index_low;
-		} __rte_packed;
+		} __attribute__((__packed__));
 	};
 	uint32_t flow_table_metadata;
 	uint8_t rsvd4[4];

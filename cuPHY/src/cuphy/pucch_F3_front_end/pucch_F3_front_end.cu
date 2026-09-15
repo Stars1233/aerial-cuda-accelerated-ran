@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -267,57 +267,46 @@ static constexpr float MIN_DB_LIN    = 1.0232929922807537e-10; // pow(10,MIN_DB/
 static constexpr float FILT_BIAS_LIN = 1.1220184543019633 ; // Bias correction factor for noise filtering (0.5dB)
 
 // Calculate r_base vector
-static inline __device__ void LowPaprSeqGen(__half2* rbase, int m_zc, int u, int v)
+// Per-element r_base computation — returns a single __half2 for element idx.
+// Avoids shared memory and enables fusion with x_dmrs generation.
+static inline __device__ __half2 compute_rbase_element(int m_zc, int u, int v, int idx)
 {
     if(m_zc < 36)
     {
-        if(threadIdx.x < m_zc)
+        float phi_val;
+        switch(m_zc)
         {
-            switch(m_zc)
-            {
-            case 6: {
-                rbase[threadIdx.x] = {hcos(__float2half(M_PI) * __half(d_phi_6[u][threadIdx.x]) / __float2half(4.0)), hsin(__float2half(M_PI) * __half(d_phi_6[u][threadIdx.x]) / __float2half(4.0))};
-                break;
-            }
-            case 12: {
-                rbase[threadIdx.x] = {hcos(__float2half(M_PI) * __half(d_phi_12[u][threadIdx.x]) / __float2half(4.0)), hsin(__float2half(M_PI) * __half(d_phi_12[u][threadIdx.x]) / __float2half(4.0))};
-                break;
-            }
-            case 18: {
-                rbase[threadIdx.x] = {hcos(__float2half(M_PI) * __half(d_phi_18[u][threadIdx.x]) / __float2half(4.0)), hsin(__float2half(M_PI) * __half(d_phi_18[u][threadIdx.x]) / __float2half(4.0))};
-                break;
-            }
-            case 24: {
-                rbase[threadIdx.x] = {hcos(__float2half(M_PI) * __half(d_phi_24[u][threadIdx.x]) / __float2half(4.0)), hsin(__float2half(M_PI) * __half(d_phi_24[u][threadIdx.x]) / __float2half(4.0))};
-                break;
-            }
-            case 30: {
-                __half theta = __float2half(M_PI * (u + 1) * (threadIdx.x + 1) * (threadIdx.x + 2) / 31.0);
-                rbase[threadIdx.x] = {hcos(theta), -hsin(theta)};
-                break;
-            }
-            }
+        case 6:  phi_val = (float)d_phi_6[u][idx];  break;
+        case 12: phi_val = (float)d_phi_12[u][idx]; break;
+        case 18: phi_val = (float)d_phi_18[u][idx]; break;
+        case 24: phi_val = (float)d_phi_24[u][idx]; break;
+        case 30: {
+            float theta = (float)(M_PI * (u + 1) * (idx + 1) * (idx + 2) / 31.0);
+            float s, c;
+            __sincosf(theta, &s, &c);
+            return {__float2half(c), __float2half(-s)};
         }
-
-        return;
+        default: return {__float2half(1.0f), __float2half(0.0f)};
+        }
+        float angle = (float)M_PI * phi_val / 4.0f;
+        float s, c;
+        __sincosf(angle, &s, &c);
+        return {__float2half(c), __float2half(s)};
     }
     else
     {
-        int idx = 0;
-        while(m_zc > d_primeNums[idx])
-        {
-            idx++;
-        }
+        int pidx = 0;
+        while(m_zc > d_primeNums[pidx])
+            pidx++;
+        pidx--;
 
-        idx--;
-
-        float qbar = d_primeNums[idx] * (u + 1) / 31.0;
-        float q    = (int)(qbar + 0.5) + (v * (((int)(2 * qbar) & 1) * -2 + 1));
-        if(threadIdx.x < m_zc)
-        {
-            int m              = threadIdx.x % d_primeNums[idx];
-            rbase[threadIdx.x] = {__float2half(cos(M_PI * q * m * (m + 1) / d_primeNums[idx])), __float2half(-sin(M_PI * q * m * (m + 1) / d_primeNums[idx]))};
-        }
+        float qbar = d_primeNums[pidx] * (u + 1) / 31.0f;
+        float q    = (int)(qbar + 0.5f) + (v * (((int)(2 * qbar) & 1) * -2 + 1));
+        int   m    = idx % d_primeNums[pidx];
+        float angle = (float)M_PI * q * m * (m + 1) / d_primeNums[pidx];
+        float s, c;
+        __sincosf(angle, &s, &c);
+        return {__float2half(c), __float2half(-s)};
     }
 }
 
@@ -349,28 +338,61 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     tensor_ref<const __half2> tDataRx(pDynDescr->pCellPrms[cellIdx].tDataRx.pAddr, pDynDescr->pCellPrms[cellIdx].tDataRx.strides);
 
-    uint32_t prb_size = uci_data->prbSize;
-    uint32_t tot_scs  = prb_size * N_TONES_PER_PRB;
+    const uint32_t prb_size = uci_data->prbSize;
+    const uint32_t tot_scs  = prb_size * N_TONES_PER_PRB;
+
+    // ---- Cache descriptor fields in registers to avoid re-reads after __syncthreads ----
+    const int   ud_nSym             = uci_data->nSym;
+    const int   ud_nSym_data        = uci_data->nSym_data;
+    const int   ud_nSym_dmrs        = uci_data->nSym_dmrs;
+    const int   ud_startSym         = uci_data->startSym;
+    const int   ud_startPrb         = uci_data->startPrb;
+    const int   ud_secondHopPrb     = uci_data->secondHopPrb;
+    const int   ud_bwpStart         = uci_data->bwpStart;
+    const int   ud_freqHopFlag      = uci_data->freqHopFlag;
+    const int   ud_pi2Bpsk          = uci_data->pi2Bpsk;
+    const int   ud_AddDmrsFlag      = uci_data->AddDmrsFlag;
+    const int   ud_groupHopFlag     = uci_data->groupHopFlag;
+    const int   ud_seqHopFlag       = uci_data->sequenceHopFlag;
+    const int   ud_E_tot            = uci_data->E_tot;
+    const float ud_DTXthreshold     = uci_data->DTXthreshold;
+    const int   ud_rnti             = uci_data->rnti;
+    const int   ud_dataScramblingId = uci_data->dataScramblingId;
+    const int   ud_pucchHoppingId   = uci_data->pucchHoppingId;
+    const int   ud_slotNum          = uci_data->slotNum;
+    // Cache small arrays into registers
+    uint8_t ud_SetSymDmrs[MAX_DMRS_SYMS_F3];
+    uint8_t ud_SetSymData[MAX_DATA_SYMS_F3];
+    for(int i = 0; i < ud_nSym_dmrs && i < MAX_DMRS_SYMS_F3; i++)
+    {
+        ud_SetSymDmrs[i] = uci_data->SetSymDmrs[i];
+    }
+    for(int i = 0; i < ud_nSym_data && i < MAX_DATA_SYMS_F3; i++)
+    {
+        ud_SetSymData[i] = uci_data->SetSymData[i];
+    }
+    // ---- End descriptor caching ----
 
     constexpr int prbBlockSize = 4;
     constexpr int scsBlockSize = prbBlockSize * N_TONES_PER_PRB;
 
     //===========================================================================
     // dynamic shared memory allocations
+    // NOTE: This layout MUST match the dynamic shared memory size computation in kernelSelect().
     extern __shared__ __half2 sh_buff[];
 
-    int y_data_elems = max(uci_data->nSym_data * F3_DATA_FETCH_SCS * numRxAnt,  // for uci_data_s
-                           uci_data->nSym_dmrs * tot_scs * numRxAnt);         // for uci_dmrs_s
-    y_data_elems = max(y_data_elems, uci_data->nSym_data * tot_scs);          // for uci_z (IDFT output)
+    const int data_s_stride = ud_nSym_data * numRxAnt + 1;                 // +1 pad to avoid shmem bank conflicts
+    int y_data_elems = max(data_s_stride * F3_DATA_FETCH_SCS,              // for uci_data_s (padded)
+                           ud_nSym_dmrs * tot_scs * numRxAnt);             // for uci_dmrs_s
+    y_data_elems = max(y_data_elems, ud_nSym_data * tot_scs);             // for uci_z (IDFT output)
 
-    const int z_data_elems = max(uci_data->nSym_data * tot_scs,                 // for IDFT output
-                                tot_scs * numRxAnt * uci_data->nSym_dmrs);    // for GEMV temp buffer
+    const int z_data_elems = max(ud_nSym_data * tot_scs,                   // for IDFT output
+                                tot_scs * numRxAnt * ud_nSym_dmrs);        // for GEMV temp buffer
 
     __half2* y_data   = reinterpret_cast<__half2*>(sh_buff);                      // [y_data_elems]
     __half2* y_ch_est = &y_data[y_data_elems];                                    // [nAnt * nSym_dmrs * tot_scs]
-    __half2* r_base   = &y_ch_est[numRxAnt * uci_data->nSym_dmrs * tot_scs];      // [tot_scs]
-    __half2* x_dmrs   = &r_base[prb_size * N_TONES_PER_PRB];                      // [nSym_dmrs * tot_scs]
-    __half2* z_data   = &x_dmrs[uci_data->nSym_dmrs * tot_scs];                   // [z_data_elems]
+    __half2* x_dmrs   = &y_ch_est[numRxAnt * ud_nSym_dmrs * tot_scs];             // [nSym_dmrs * tot_scs]
+    __half2* z_data   = &x_dmrs[ud_nSym_dmrs * tot_scs];                          // [z_data_elems]
     __half*  eq_first_hop  = reinterpret_cast<__half*>(&z_data[z_data_elems]);    // [tot_scs]
     __half*  eq_second_hop = &eq_first_hop[tot_scs];                              // [tot_scs]
 
@@ -404,7 +426,6 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     __half2* uci_dmrs_s        = &y_data[0];  // Aliased with y_data
     __half2* uci_z             = &y_data[0];  // Aliased with y_data
     __half2* uci_x_dmrs        = &x_dmrs[0];
-    __half2* uci_r_base        = &r_base[0];
     __half2* uci_ch_est        = &y_ch_est[0];
     __half2* uci_gemv_temp     = &z_data[0];  // Aliased with z_data
     __half2* uci_z_data        = &z_data[0];  // Aliased with z_data
@@ -415,18 +436,18 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     //===========================================================================
 
     // Cooperatively populate randomSeqScrm
-    const int cInit = uci_data->rnti * 32768 + uci_data->dataScramblingId;
-    const int round = (uci_data->E_tot + 31) >> 5;   // ceil(E_tot/32)
+    const int cInit = ud_rnti * 32768 + ud_dataScramblingId;
+    const int round = (ud_E_tot + 31) >> 5;   // ceil(E_tot/32)
     for (int idx = tid; idx < round; idx += F3_CG_SIZE) {
         randomSeqScrm[idx] = descrambling::gold32n(cInit, idx * 32);
     }
 
     // Cooperatively populate csCommon - parallelize Gold sequence computation across threads
-    if(tid < uci_data->nSym)
+    if(tid < ud_nSym)
     {
-        const int pucchHoppingId = uci_data->pucchHoppingId;
-        const int slotNum        = uci_data->slotNum;
-        const int startSym       = uci_data->startSym;
+        const int pucchHoppingId = ud_pucchHoppingId;
+        const int slotNum        = ud_slotNum;
+        const int startSym       = ud_startSym;
 
         // Each thread handles symbols where tid matches (gold_word_idx % F3_CG_SIZE)
         // Gold word covers 4 symbols, so we compute one Gold word per 4 symbols
@@ -444,17 +465,17 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     // Thread 1: compute v (sequence hopping)
     if(tid == 0)
     {
-        const int pucchHoppingId = uci_data->pucchHoppingId;
-        const int slotNum        = uci_data->slotNum;
+        const int pucchHoppingId = ud_pucchHoppingId;
+        const int slotNum        = ud_slotNum;
         const int f_ss           = pucchHoppingId % 30;
 
-        if(uci_data->groupHopFlag)
+        if(ud_groupHopFlag)
         {
             const uint32_t g_uv  = descrambling::gold32n(pucchHoppingId / 30, 16 * slotNum);
             int            f_gh0 = (int)(g_uv & LOWER_BYTE_BMSK) % 30;
             u_s[0]               = (uint8_t)((f_ss + f_gh0) % 30);
 
-            if(uci_data->freqHopFlag)
+            if(ud_freqHopFlag)
             {
                 int f_gh1 = (int)((g_uv >> 8) & LOWER_BYTE_BMSK) % 30;
                 u_s[1]    = (uint8_t)((f_ss + f_gh1) % 30);
@@ -465,16 +486,16 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     }
     else if(tid == 1)
     {
-        const int pucchHoppingId = uci_data->pucchHoppingId;
-        const int slotNum        = uci_data->slotNum;
+        const int pucchHoppingId = ud_pucchHoppingId;
+        const int slotNum        = ud_slotNum;
 
-        if(uci_data->sequenceHopFlag)
+        if(ud_seqHopFlag)
         {
             const int      q   = pucchHoppingId / 30;
             const int      r   = pucchHoppingId % 30;
             const uint32_t g_v = descrambling::gold32n(32 * q + r, 2 * slotNum);
             v_s[0]             = (uint8_t)(g_v & LOWER_BIT_BMSK);
-            v_s[1]             = uci_data->freqHopFlag ? (uint8_t)((g_v >> 1) & LOWER_BIT_BMSK) : v_s[0];
+            v_s[1]             = ud_freqHopFlag ? (uint8_t)((g_v >> 1) & LOWER_BIT_BMSK) : v_s[0];
         }
         else { v_s[0] = v_s[1] = 0; }
     }
@@ -486,32 +507,33 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     uint8_t v[2] = {v_s[0], v_s[1]};
 
     // init cs[] from csCommon (unchanged use-site)
-    if(tid < uci_data->nSym) { uci_cs[tid] = (csCommon[tid] + 0) % 12; }
+    if(tid < ud_nSym) { uci_cs[tid] = (csCommon[tid] + 0) % 12; }
 
     // Load DMRS symbols. The DMRS symbols are loaded first since there are possibly fewer of them total than data
     // symbols, and we need to load the data symbols in blocks to conserve memory. F3 is different than F1 in
     // that the DMRS symbols aren't every other symbol, and instead can be anywhere.
-    const int dmrs_load_work      = tot_scs * uci_data->nSym_dmrs * numRxAnt;
-    const int dmrsFirstHopStartSc = (uci_data->startPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
-    const int dmrsSecondHopStartSc= (uci_data->secondHopPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
-    const int dmrs_half_nSym      = uci_data->nSym / 2;
-    const int nSym_dmrs_local     = uci_data->nSym_dmrs;
+    const int dmrs_load_work      = tot_scs * ud_nSym_dmrs * numRxAnt;
+    const int dmrsFirstHopStartSc = (ud_startPrb + ud_bwpStart) * N_TONES_PER_PRB;
+    const int dmrsSecondHopStartSc= (ud_secondHopPrb + ud_bwpStart) * N_TONES_PER_PRB;
+    const int dmrs_half_nSym      = ud_nSym / 2;
+    const int nSym_dmrs_local     = ud_nSym_dmrs;
 
     float rssi_linear_temp = 0;
 
+    // Coalesced layout: subcarrier varies fastest across adjacent threads
     for(int w = tid; w < dmrs_load_work; w += F3_CG_SIZE)
     {
-        const int sc       = w / (nSym_dmrs_local * numRxAnt);
-        const int rem      = w % (nSym_dmrs_local * numRxAnt);
-        const int dmrs_sym = rem / numRxAnt;
-        const int a        = rem % numRxAnt;
+        const int a        = w / (nSym_dmrs_local * tot_scs);
+        const int rem      = w % (nSym_dmrs_local * tot_scs);
+        const int dmrs_sym = rem / tot_scs;
+        const int sc       = rem % tot_scs;
 
         // SetSymDmrs[dmrs_sym] gives relative OFDM symbol index for this DMRS symbol
-        const int rel_ofdm_sym = uci_data->SetSymDmrs[dmrs_sym];
-        const int ofdm_sym     = uci_data->startSym + rel_ofdm_sym;
+        const int rel_ofdm_sym = ud_SetSymDmrs[dmrs_sym];
+        const int ofdm_sym     = ud_startSym + rel_ofdm_sym;
 
         // Determine frequency position based on hop
-        const int baseSc = (uci_data->freqHopFlag && rel_ofdm_sym >= dmrs_half_nSym)
+        const int baseSc = (ud_freqHopFlag && rel_ofdm_sym >= dmrs_half_nSym)
                                ? dmrsSecondHopStartSc : dmrsFirstHopStartSc;
 
         auto tmp  = tDataRx(baseSc + sc, ofdm_sym, a);
@@ -525,60 +547,52 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     rssi_linear_temp = cg::reduce(tile, rssi_linear_temp, cg::plus<float>());
 
-    // Phase 1: Generate r_base and x_dmrs for each DMRS symbol (serial due to r_base reuse)
-    const int nSym_dmrs = uci_data->nSym_dmrs;
-    for(int sym = 0; sym < nSym_dmrs; sym++)
+    // Phase 1: Generate x_dmrs for each DMRS symbol.
+    // r_base is computed per-element in registers and fused with cyclic shift rotation,
+    // eliminating the r_base shmem buffer and one __syncthreads per symbol.
+    for(int sym = 0; sym < ud_nSym_dmrs; sym++)
     {
-        bool firstHop = false;
-        if((sym == 0 && !uci_data->AddDmrsFlag) || (sym <= 1 && uci_data->AddDmrsFlag))
-        {
-            firstHop = true;
-        }
-
+        // Determine hopping parameters for this symbol
+        int u_idx, v_idx;
+        bool firstHop = (sym == 0 && !ud_AddDmrsFlag) || (sym <= 1 && ud_AddDmrsFlag);
         if(firstHop)
         {
-            LowPaprSeqGen(uci_r_base, tot_scs, u[0], v[0]);
+            u_idx = u[0]; v_idx = v[0];
+        }
+        // Descriptor setup rejects groupHopFlag && sequenceHopFlag.
+        else if(ud_groupHopFlag)
+        {
+            u_idx = u[1]; v_idx = v[0];
+        }
+        else if(ud_seqHopFlag)
+        {
+            u_idx = u[0]; v_idx = v[1];
         }
         else
         {
-            if(uci_data->groupHopFlag)
-            {
-                if(!uci_data->sequenceHopFlag)
-                {
-                    LowPaprSeqGen(uci_r_base, tot_scs, u[1], v[0]);
-                }
-                /*else {
-          // Commented out printf; TODO add appropriate error checking in setup
-          // Should not be possible          
-          printf("ERROR! Cannot have !firstHop && groupHopFlag && sequenceHopFlag\n");
-        }*/
-            }
-            else if(!uci_data->sequenceHopFlag)
-            {
-                LowPaprSeqGen(uci_r_base, tot_scs, u[0], v[0]);
-            }
-            else if(uci_data->sequenceHopFlag)
-            {
-                LowPaprSeqGen(uci_r_base, tot_scs, u[0], v[1]);
-            }
+            u_idx = u[0]; v_idx = v[0];
         }
-        __syncthreads();    // ensure uci_r_base is ready
 
-        // Compute x_dmrs only, store to uci_x_dmrs
+        const int cs_val = uci_cs[ud_SetSymDmrs[sym]];
+
+        // Fused: compute r_base in register, apply cyclic shift, store x_dmrs
         for(int i = tid; i < tot_scs; i += F3_CG_SIZE)
         {
-            __half2 x_dmrs = {cosf(i * (2.0 * (M_PI / 12.0)) * uci_cs[uci_data->SetSymDmrs[sym]]),
-                              sinf(i * (2.0 * (M_PI / 12.0)) * uci_cs[uci_data->SetSymDmrs[sym]])};
-            x_dmrs = complex_mul(uci_r_base[i], x_dmrs);
-            uci_x_dmrs[sym * tot_scs + i] = x_dmrs;
+            __half2 my_rbase = compute_rbase_element(tot_scs, u_idx, v_idx, i);
+
+            float s, c;
+            __sincosf(i * (2.0f * (float)(M_PI / 12.0)) * cs_val, &s, &c);
+            __half2 rot = {__float2half(c), __float2half(s)};
+
+            uci_x_dmrs[sym * tot_scs + i] = complex_mul(my_rbase, rot);
         }
-        __syncthreads();    // ensure uci_r_base is not overwritten before updating uci_x_dmrs
+        __syncthreads();    // ensure x_dmrs written before next sym or downstream reads
     }
 
     // Phase 2: Compute channel estimates (flattened across sym, subcarrier; antenna serial)
     // Each thread reads a unique x_dmrs element to avoid bank conflicts, then loops over antennas.
     {
-        const int ch_est_items = nSym_dmrs * tot_scs;
+        const int ch_est_items = ud_nSym_dmrs * tot_scs;
         for(int w = tid; w < ch_est_items; w += F3_CG_SIZE)
         {
             const int sym = w / tot_scs;
@@ -588,8 +602,8 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
             for(int a = 0; a < numRxAnt; a++)
             {
-                uci_ch_est[a * nSym_dmrs * tot_scs + sym * tot_scs + i] =
-                    complex_conjmul(uci_dmrs_s[a * nSym_dmrs * tot_scs + sym * tot_scs + i], x);
+                uci_ch_est[a * ud_nSym_dmrs * tot_scs + sym * tot_scs + i] =
+                    complex_conjmul(uci_dmrs_s[a * ud_nSym_dmrs * tot_scs + sym * tot_scs + i], x);
             }
         }
     }
@@ -599,26 +613,25 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     // Filter channel estimates in the frequency domain using W* filters. This is done by a GEMV operation
     // where each thread is calculating one inner product from a row in W.
     // gemv_temp aliases z_data (sized to hold both IDFT output and GEMV temp).
-    if(uci_data->prbSize < 4)
+    if(prb_size < 4)
     {
         __half2* Ws[3] = {&d_W1[0][0], &d_W2[0][0], &d_W3[0][0]};
-        __half2* W     = Ws[uci_data->prbSize - 1];
+        __half2* W     = Ws[prb_size - 1];
 
-        const int nSym_dmrs = uci_data->nSym_dmrs;
-        const int gemv_work = tot_scs * numRxAnt * nSym_dmrs;
+        const int gemv_work = tot_scs * numRxAnt * ud_nSym_dmrs;
 
         // Phase 1: Compute all GEMV rows in parallel, write to gemv_temp
         for(int w = tid; w < gemv_work; w += F3_CG_SIZE)
         {
             const int row = w % tot_scs;
             const int rem = w / tot_scs;
-            const int sym = rem % nSym_dmrs;
-            const int ant = rem / nSym_dmrs;
+            const int sym = rem % ud_nSym_dmrs;
+            const int ant = rem / ud_nSym_dmrs;
 
             __half2 accum = {0.0, 0.0};
             for(int sc = 0; sc < tot_scs; sc++)
             {
-                accum = complex_addmul(W[row * tot_scs + sc], uci_ch_est[ant * nSym_dmrs * tot_scs + sym * tot_scs + sc], accum);
+                accum = complex_addmul(W[row * tot_scs + sc], uci_ch_est[ant * ud_nSym_dmrs * tot_scs + sym * tot_scs + sc], accum);
             }
             uci_gemv_temp[w] = accum;
         }
@@ -629,9 +642,9 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
         {
             const int row = w % tot_scs;
             const int rem = w / tot_scs;
-            const int sym = rem % nSym_dmrs;
-            const int ant = rem / nSym_dmrs;
-            uci_ch_est[ant * nSym_dmrs * tot_scs + sym * tot_scs + row] = uci_gemv_temp[w];
+            const int sym = rem % ud_nSym_dmrs;
+            const int ant = rem / ud_nSym_dmrs;
+            uci_ch_est[ant * ud_nSym_dmrs * tot_scs + sym * tot_scs + row] = uci_gemv_temp[w];
         }
         __syncthreads();
     }
@@ -643,7 +656,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
         // Do first set of multiplies on all full blocks
         for(int a = 0; a < numRxAnt; a++)
         {
-            for(int sym = 0; sym < uci_data->nSym_dmrs; sym++)
+            for(int sym = 0; sym < ud_nSym_dmrs; sym++)
             {
                 __half2 accum = {0.0, 0.0};
 
@@ -654,7 +667,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
                     {
                         for(int sc = 0; sc < scsBlockSize; sc++)
                         {
-                            accum = complex_addmul(d_W4[tid][sc], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + (block * scsBlockSize) + sc], accum);
+                            accum = complex_addmul(d_W4[tid][sc], uci_ch_est[a * ud_nSym_dmrs * tot_scs + sym * tot_scs + (block * scsBlockSize) + sc], accum);
                         }
                     }
 
@@ -662,7 +675,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
                     if(tid < scsBlockSize)
                     {
-                        uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + (block * scsBlockSize) + tid] = accum;
+                        uci_ch_est[a * ud_nSym_dmrs * tot_scs + sym * tot_scs + (block * scsBlockSize) + tid] = accum;
                     }
                 }
 
@@ -676,12 +689,12 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
                     int start = block * scsBlockSize - (scsBlockSize - (tot_scs - block * scsBlockSize));
                     for(int sc = 0; sc < scsBlockSize; sc++)
                     {
-                        accum = complex_addmul(d_W4[tid][sc], uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + start + sc], accum);
+                        accum = complex_addmul(d_W4[tid][sc], uci_ch_est[a * ud_nSym_dmrs * tot_scs + sym * tot_scs + start + sc], accum);
                     }
 
                     __syncthreads();
 
-                    uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + sym * tot_scs + start + tid] = accum;
+                    uci_ch_est[a * ud_nSym_dmrs * tot_scs + sym * tot_scs + start + tid] = accum;
 
                     __syncthreads();
                 }
@@ -695,7 +708,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     // the total power
     float rx_energy = 0.0;
     float r_tilde   = 0.0;
-    int   num_samps = tot_scs * uci_data->nSym_dmrs * numRxAnt;
+    int   num_samps = tot_scs * ud_nSym_dmrs * numRxAnt;
     for(int i = tid; i < num_samps; i += F3_CG_SIZE)
     {
         rx_energy += __half2float(uci_ch_est[i].x * uci_ch_est[i].x + uci_ch_est[i].y * uci_ch_est[i].y);
@@ -703,16 +716,16 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     // Flatten r_tilde computation across (antenna, symbol, subcarrier) for better parallelism
     {
-        const int rtilde_work = numRxAnt * nSym_dmrs * tot_scs;
+        const int rtilde_work = numRxAnt * ud_nSym_dmrs * tot_scs;
         for(int w = tid; w < rtilde_work; w += F3_CG_SIZE)
         {
-            const int a   = w / (nSym_dmrs * tot_scs);
-            const int rem = w % (nSym_dmrs * tot_scs);
+            const int a   = w / (ud_nSym_dmrs * tot_scs);
+            const int rem = w % (ud_nSym_dmrs * tot_scs);
             const int sym = rem / tot_scs;
             const int prb = rem % tot_scs;
 
-            auto tmp = uci_dmrs_s[a * nSym_dmrs * tot_scs + sym * tot_scs + prb] -
-                       complex_mul(uci_x_dmrs[sym * tot_scs + prb], uci_ch_est[a * nSym_dmrs * tot_scs + sym * tot_scs + prb]);
+            auto tmp = uci_dmrs_s[a * ud_nSym_dmrs * tot_scs + sym * tot_scs + prb] -
+                       complex_mul(uci_x_dmrs[sym * tot_scs + prb], uci_ch_est[a * ud_nSym_dmrs * tot_scs + sym * tot_scs + prb]);
             r_tilde += static_cast<float>(tmp.x * tmp.x + tmp.y * tmp.y);
         }
     }
@@ -729,7 +742,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     sum_sc_corr = cg::reduce(tile, sum_sc_corr, cg::plus<__half2>());
     rx_energy = cg::reduce(tile, rx_energy, cg::plus<float>()) / (float)num_samps;
-    r_tilde   = cg::reduce(tile, r_tilde, cg::plus<float>()) / (float)(numRxAnt * uci_data->nSym_dmrs * tot_scs);
+    r_tilde   = cg::reduce(tile, r_tilde, cg::plus<float>()) / (float)(numRxAnt * ud_nSym_dmrs * tot_scs);
 
     if(tile.thread_rank() == 0)
     {
@@ -775,7 +788,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
             taEstMicroSec = -RAD_TO_USEC*angle/scs;
 
             rsrp_dB = 10 * log10(rx_energy); // value in dBm
-            rssi_dB =  10 * log10(rssi_linear_temp/static_cast<float>(uci_data->nSym_dmrs));
+            rssi_dB =  10 * log10(rssi_linear_temp/static_cast<float>(ud_nSym_dmrs));
             sinr_dB = rsrp_dB - r_tilde_reduc[0];        
         }
 
@@ -804,7 +817,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 
     if(tid == 0)
     {
-        if(rx_energy_reduc[0] < uci_data->DTXthreshold)
+        if(rx_energy_reduc[0] < ud_DTXthreshold)
         {
             pDynDescr->pDTXflags[uci_num] = 1;
         }
@@ -820,27 +833,27 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
         {
             float ch0 = 0.f, ch1 = 0.f;
 
-            if(TdiModePf3 && (uci_data->nSym_dmrs == 4))
+            if(TdiModePf3 && (ud_nSym_dmrs == 4))
             {
                 // ---- First hop: average dmrs0 + dmrs1 ----
                 for(int a = 0; a < numRxAnt; ++a)
                 {
-                    auto dmrs0 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 0 * tot_scs + sc];
-                    auto dmrs1 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 1 * tot_scs + sc];
+                    auto dmrs0 = uci_ch_est[a * ud_nSym_dmrs * tot_scs + 0 * tot_scs + sc];
+                    auto dmrs1 = uci_ch_est[a * ud_nSym_dmrs * tot_scs + 1 * tot_scs + sc];
                     auto s01   = dmrs0 + dmrs1;                                 // sum
                     ch0 += __half2float(s01.x * s01.x + s01.y * s01.y) * 0.25f; // (|dmrs0+dmrs1|^2)/4
                     // store average back to dmrs0 slot (matches original)
-                    uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 0 * tot_scs + sc] = complex_mul(s01, {0.5, 0.0});
+                    uci_ch_est[a * ud_nSym_dmrs * tot_scs + 0 * tot_scs + sc] = complex_mul(s01, {0.5, 0.0});
                 }
                 // ---- Second hop: average dmrs2 + dmrs3 ----
                 for(int a = 0; a < numRxAnt; ++a)
                 {
-                    auto dmrs2 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 2 * tot_scs + sc];
-                    auto dmrs3 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 3 * tot_scs + sc];
+                    auto dmrs2 = uci_ch_est[a * ud_nSym_dmrs * tot_scs + 2 * tot_scs + sc];
+                    auto dmrs3 = uci_ch_est[a * ud_nSym_dmrs * tot_scs + 3 * tot_scs + sc];
                     auto s23   = dmrs2 + dmrs3;                                 // sum
                     ch1 += __half2float(s23.x * s23.x + s23.y * s23.y) * 0.25f; // (|dmrs2+dmrs3|^2)/4
                     // store average back to dmrs2 slot (matches original)
-                    uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 2 * tot_scs + sc] = complex_mul(s23, {0.5, 0.0});
+                    uci_ch_est[a * ud_nSym_dmrs * tot_scs + 2 * tot_scs + sc] = complex_mul(s23, {0.5, 0.0});
                 }
             }
             else
@@ -848,16 +861,16 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
                 // ---- First hop: single DMRS0 ----
                 for(int a = 0; a < numRxAnt; ++a)
                 {
-                    auto h0 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + 0 * tot_scs + sc];
+                    auto h0 = uci_ch_est[a * ud_nSym_dmrs * tot_scs + 0 * tot_scs + sc];
                     ch0 += __half2float(h0.x * h0.x + h0.y * h0.y);
                 }
                 // ---- Second hop (if present): use mid DMRS ----
-                if(uci_data->nSym_dmrs >= 2)
+                if(ud_nSym_dmrs >= 2)
                 {
-                    int symNum = uci_data->nSym_dmrs >> 1; // 1 when nSym_dmrs==2
+                    int symNum = ud_nSym_dmrs >> 1; // 1 when nSym_dmrs==2
                     for(int a = 0; a < numRxAnt; ++a)
                     {
-                        auto h2 = uci_ch_est[a * uci_data->nSym_dmrs * tot_scs + symNum * tot_scs + sc];
+                        auto h2 = uci_ch_est[a * ud_nSym_dmrs * tot_scs + symNum * tot_scs + sc];
                         ch1 += __half2float(h2.x * h2.x + h2.y * h2.y);
                     }
                 }
@@ -866,7 +879,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
             // write EQ coeffs
             uci_eq_first_hop[sc] = __float2half((1.f + noiseVar_est) / (ch0 + noiseVar_est));
 
-            if(uci_data->nSym_dmrs >= 2)
+            if(ud_nSym_dmrs >= 2)
             {
                 uci_eq_second_hop[sc] = __float2half((1.f + noiseVar_est) / (ch1 + noiseVar_est));
             }
@@ -877,38 +890,38 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     // Now read in all the data symbols and do processing on those. Since there are a large number of data symbols we must do them in blocks
     // to conserve shared memory.
     const int data_blocks       = (tot_scs + (F3_DATA_FETCH_SCS - 1)) / F3_DATA_FETCH_SCS;
-    const int firstHopStartSc   = (uci_data->startPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
-    const int secondHopStartSc  = (uci_data->secondHopPrb + uci_data->bwpStart) * N_TONES_PER_PRB;
-    const int nSym_data         = uci_data->nSym_data;
-    const int half_nSym         = uci_data->nSym / 2;
+    const int firstHopStartSc   = (ud_startPrb + ud_bwpStart) * N_TONES_PER_PRB;
+    const int secondHopStartSc  = (ud_secondHopPrb + ud_bwpStart) * N_TONES_PER_PRB;
+    const int nSym_data         = ud_nSym_data;
+    const int half_nSym         = ud_nSym / 2;
     const int half_nSym_data    = nSym_data / 2;
-    const int ch_sym_second_hop = nSym_dmrs >> 1;  // DMRS symbol index for second hop
+    const int ch_sym_second_hop = ud_nSym_dmrs >> 1;  // DMRS symbol index for second hop
 
     for(int dblock = 0; dblock < data_blocks; dblock++)
     {
         const int sc_base = dblock * F3_DATA_FETCH_SCS;
         const int span    = min((int)F3_DATA_FETCH_SCS, (int)tot_scs - sc_base);
 
-        // LOAD: Flatten (sc_off, data_sym, antenna) across all threads
-        const int load_work = span * nSym_data * numRxAnt;
-        for(int w = tid; w < load_work; w += F3_CG_SIZE)
+        // LOAD: Flatten (data_sym, sc_off) across threads, antenna serial inner loop.
+        // Reduces 4 runtime div/mod to 2, hoists symbol-dependent values out of antenna loop.
+        // sc_off varies fastest to preserve global load coalescing.
+        const int load_work_2d = span * nSym_data;
+        for(int w = tid; w < load_work_2d; w += F3_CG_SIZE)
         {
-            const int sc_off   = w / (nSym_data * numRxAnt);
-            const int rem      = w % (nSym_data * numRxAnt);
-            const int data_sym = rem / numRxAnt;
-            const int a        = rem % numRxAnt;
+            const int data_sym = w / span;
+            const int sc_off   = w % span;
 
-            // SetSymData[data_sym] gives relative symbol index (0-based from startSym)
-            const int rel_sym  = uci_data->SetSymData[data_sym];
-            const int ofdm_sym = uci_data->startSym + rel_sym;
+            const int rel_sym  = ud_SetSymData[data_sym];
+            const int ofdm_sym = ud_startSym + rel_sym;
             const int scs_abs  = sc_base + sc_off;
-
-            // Determine frequency position based on hop
-            const int baseSc = (uci_data->freqHopFlag && rel_sym >= half_nSym)
+            const int baseSc = (ud_freqHopFlag && rel_sym >= half_nSym)
                                    ? secondHopStartSc : firstHopStartSc;
 
-            uci_data_s[sc_off * nSym_data * numRxAnt + data_sym * numRxAnt + a] =
-                tDataRx(baseSc + scs_abs, ofdm_sym, a);
+            for(int a = 0; a < numRxAnt; a++)
+            {
+                uci_data_s[sc_off * data_s_stride + data_sym * numRxAnt + a] =
+                    tDataRx(baseSc + scs_abs, ofdm_sym, a);
+            }
         }
 
         __syncthreads();
@@ -932,7 +945,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
                 ch_sym_idx = 0;
                 eq_coeff   = uci_eq_first_hop[scs_abs];
             }
-            else if(nSym_dmrs == 1)
+            else if(ud_nSym_dmrs == 1)
             {
                 // Second hop but only 1 DMRS - use first DMRS
                 ch_sym_idx = 0;
@@ -948,8 +961,8 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
             for(int a = 0; a < numRxAnt; a++)
             {
                 accum += complex_conjmul(
-                    uci_data_s[sc_off * nSym_data * numRxAnt + sym * numRxAnt + a],
-                    uci_ch_est[a * nSym_dmrs * tot_scs + ch_sym_idx * tot_scs + scs_abs]);
+                    uci_data_s[sc_off * data_s_stride + sym * numRxAnt + a],
+                    uci_ch_est[a * ud_nSym_dmrs * tot_scs + ch_sym_idx * tot_scs + scs_abs]);
             }
 
             uci_z_data[sym * tot_scs + scs_abs] = complex_scalar_multiply(accum, eq_coeff);
@@ -964,7 +977,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     const float idft_scale    = rsqrtf(tot_scs_f);  // 1/sqrt(tot_scs) = sqrt(tot_scs)/tot_scs
     const float ang_base      = 2.0f * M_PI / tot_scs_f;
 
-    for (int i = tid; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
+    for (int i = tid; i < tot_scs * ud_nSym_data; i += F3_CG_SIZE)
     {
         const int symnum = i / tot_scs;
         const int fftidx = i % tot_scs;
@@ -1003,10 +1016,10 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     const float demod_scale = 2.0f / noiseVar_est;
     const float pi2_scale   = 1.41421356237f / noiseVar_est;  // sqrt(2) / noiseVar = 2/sqrt(2)/noiseVar
 
-    if(uci_data->pi2Bpsk)
+    if(ud_pi2Bpsk)
     {
         __half* out = reinterpret_cast<__half*>(&uci_scrmLLR[0]);
-        for(int i = tid; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
+        for(int i = tid; i < tot_scs * ud_nSym_data; i += F3_CG_SIZE)
         {
             __half2 tmp = complex_mul({1, -1}, uci_z[i]);
             __half* ri  = (__half*)(&tmp) + (i % 2);
@@ -1015,7 +1028,7 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
     }
     else
     {
-        for(int i = tid; i < tot_scs * uci_data->nSym_data; i += F3_CG_SIZE)
+        for(int i = tid; i < tot_scs * ud_nSym_data; i += F3_CG_SIZE)
         {
             uci_scrmLLR[i].x = __float2half(demod_scale * __half2float(uci_z[i].x));
             uci_scrmLLR[i].y = __float2half(demod_scale * __half2float(uci_z[i].y));
@@ -1027,14 +1040,14 @@ pucchF3RxKernel(pucchF3RxDynDescr_t* pDynDescr)
 #ifdef ENABLE_DEBUG_F3
         if (uci_num==0)
         {
-            for(int ii = 0; ii<tot_scs * uci_data->nSym_data; ii += F3_CG_SIZE)
+            for(int ii = 0; ii<tot_scs * ud_nSym_data; ii += F3_CG_SIZE)
             {
                 printf("uci_scrmLLR = %f, ", __half2float(uci_scrmLLR[ii].x));
             }
         }
 #endif
     // Write output values to global for next kernel
-    for(int i = tid; i < uci_data->E_tot; i += F3_CG_SIZE)
+    for(int i = tid; i < ud_E_tot; i += F3_CG_SIZE)
     {
         const int      idx = i >> 5; // which 32-bit word
         const int      off = i & 31; // which bit
@@ -1114,14 +1127,14 @@ void pucchF3Rx::kernelSelect(uint16_t nUcis,
     int dyn_shared_sz = 0;
 
     const int tot_scs = maxUshape.nPrb * N_TONES_PER_PRB;
-    int y_data_elems = max(maxUshape.nSymData * F3_DATA_FETCH_SCS * maxUshape.nAnt,   // for uci_data_s
+    const int data_s_stride = maxUshape.nSymData * maxUshape.nAnt + 1;                // +1 pad (matches kernel)
+    int y_data_elems = max(data_s_stride * F3_DATA_FETCH_SCS,                          // for uci_data_s (padded)
                            maxUshape.nSymDmrs * tot_scs * maxUshape.nAnt);          // for uci_dmrs_s
     y_data_elems = max(y_data_elems, maxUshape.nSymData * tot_scs);               // for uci_z (IDFT output)
 
     dyn_shared_sz += y_data_elems * sizeof(__half2);                                  // y_data
     dyn_shared_sz += maxUshape.nAnt * maxUshape.nSymDmrs * tot_scs * sizeof(__half2); // y_ch_est
-    dyn_shared_sz += tot_scs * sizeof(__half2);                                       // r_base
-    dyn_shared_sz += maxUshape.nSymDmrs * tot_scs * sizeof(__half2);                  // x_dmrs
+    dyn_shared_sz += maxUshape.nSymDmrs * tot_scs * sizeof(__half2);                  // x_dmrs (r_base eliminated)
     // z_data: max of IDFT output size and GEMV temp buffer size
     const int z_data_elems = max(maxUshape.nSymData * tot_scs, tot_scs * maxUshape.nAnt * maxUshape.nSymDmrs);
     dyn_shared_sz += z_data_elems * sizeof(__half2);                                  // z_data
@@ -1385,4 +1398,3 @@ void pucchF3Rx::getDescrInfo(size_t& dynDescrSizeBytes, size_t& dynDescrAlignByt
    dynDescrSizeBytes  = sizeof(pucchF3RxDynDescr_t);
    dynDescrAlignBytes = alignof(pucchF3RxDynDescr_t);
 }
-

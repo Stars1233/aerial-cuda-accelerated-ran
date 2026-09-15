@@ -23,7 +23,7 @@ SCRIPT=$(readlink -f $0)
 SCRIPT_DIR=$(dirname $SCRIPT)
 echo $SCRIPT starting...
 cd $SCRIPT_DIR
-source ./setup.sh
+source ./versions.sh
 
 if [[ "$AERIAL_VERSION_TAG" == "$(unset AERIAL_VERSION_TAG && source ./setup.sh && echo $AERIAL_VERSION_TAG)" ]]
 then
@@ -46,8 +46,7 @@ case "$TARGETARCH" in
 esac
 
 NGC_ORG_TEAM=${NGC_ORG_TEAM:-nvidia/team/aerial}
-LDPC_DECODER_CUBIN_VERSION="2f9dcb" # ldpc hash {SHA:0:6}
-DOCA_FOR_AERIAL_VERSION="26-1"
+export_container_build_versions
 
 CURL_AUTH_ARGS=()
 if [[ -n "${NGC_API_KEY:-}" ]]; then
@@ -62,15 +61,17 @@ if [[ ! -f doca-for-aerial-${TARGETARCH}.tgz ]]; then
     curl --fail "${CURL_AUTH_ARGS[@]}" -H "Content-Type: application/json" -L -o doca-for-aerial-${TARGETARCH}.tgz "https://api.ngc.nvidia.com/v2/org/${NGC_ORG_TEAM}/resources/doca-for-aerial/versions/${DOCA_FOR_AERIAL_VERSION}-${TARGETARCH}/files/doca-for-aerial-${TARGETARCH}.tgz"
 fi
 
-echo "Downloading ldpc_decoder_cubin.zip..."
-curl --fail "${CURL_AUTH_ARGS[@]}" -H 'Content-Type: application/json' -L -o ldpc_decoder_cubin.zip "https://api.ngc.nvidia.com/v2/org/${NGC_ORG_TEAM}/resources/ldpc-decoder-cubin/versions/${LDPC_DECODER_CUBIN_VERSION}/files/ldpc_decoder_cubin.zip"
-unzip -o ldpc_decoder_cubin.zip
-
-hpccm --recipe aerial_base_recipe.py --cpu-target $CPU_TARGET --format docker > Dockerfile_tmp
+DPDK_TAG='MLNX_DPDK_22.11_2510.3.0'
+HPCCM_USERARGS=""
+if [[ -n "$DPDK_TAG" ]]; then
+    HPCCM_USERARGS="--userarg DPDK_TAG=$DPDK_TAG"
+fi
+hpccm --recipe aerial_base_recipe.py --cpu-target $CPU_TARGET --format docker $HPCCM_USERARGS > Dockerfile_tmp
+sed -i '1i # syntax=docker/dockerfile:1.4' Dockerfile_tmp
 if [[ -n "$AERIAL_BUILDER" ]]
 then
     docker buildx build --builder $AERIAL_BUILDER --load --platform $AERIAL_PLATFORM -t $AERIAL_REPO$IMAGE_NAME:${AERIAL_VERSION_TAG} -f Dockerfile_tmp .
 else
-    DOCKER_BUILDKIT=1 docker build --network host --no-cache-filter externals --no-cache-filter base --platform $AERIAL_PLATFORM -t $AERIAL_REPO$IMAGE_NAME:${AERIAL_VERSION_TAG} -f Dockerfile_tmp .
+    DOCKER_BUILDKIT=1 docker buildx build --network host --no-cache-filter externals --no-cache-filter base --platform $AERIAL_PLATFORM -t $AERIAL_REPO$IMAGE_NAME:${AERIAL_VERSION_TAG} -f Dockerfile_tmp .
 fi
 rm Dockerfile_tmp

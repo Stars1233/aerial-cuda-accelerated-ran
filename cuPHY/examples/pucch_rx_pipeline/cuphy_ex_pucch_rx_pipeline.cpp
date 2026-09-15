@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,6 @@
 #include "cuphy_hdf5.hpp"
 #include "cuphy.hpp"
 #include "datasets.hpp"
-#include "pucch_rx.hpp"
 #include "test_config.hpp"
 #include "nvlog.hpp"
 
@@ -61,6 +60,9 @@ void usage(char* argv[])
     printf("    -o  output_filename        Output HDFS debug file\n");
     printf("    -r  num                    Number of iterations to run\n");
     printf("    --G SM count               Use green contexts with specified SM count per context.\n");
+    printf("    -s, --skip-polar           Alias for --processing-mode 1\n");
+    printf("    --processing-mode N        PUCCH backend skip mode: 0=full, 1=skip polar, 2=skip backend (front-end only)\n");
+    printf("    --frontend-ref-tol F       Per-UCI NRMSE tol for mode-2 LLR compare (default 0.01 = 1%% NRMSE)\n");
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -84,6 +86,8 @@ int main(int argc, char* argv[])
         int         iArg = 1;
         std::string inputFilename  = std::string();
         std::string outputFilename = std::string();
+        int         processingMode = 0; // 0=full, 1=skip polar, 2=skip backend
+        float       frontEndRefTol = 0.01f;
         uint64_t    procModeBmsk   = PUCCH_PROC_MODE_FULL_SLOT;
         int         totalIters     = 1;
 
@@ -91,6 +95,121 @@ int main(int argc, char* argv[])
         {
             if('-' == argv[iArg][0])
             {
+                // Handle long options ("--...") before falling through to single-char switches
+                // so we can match by full name rather than a single character after '-'.
+                if(argv[iArg][1] == '-')
+                {
+                    std::string longOpt(argv[iArg] + 2);
+                    if(longOpt == "skip-polar")
+                    {
+                        processingMode = 1;
+                        ++iArg;
+                        continue;
+                    }
+                    if(longOpt == "processing-mode")
+                    {
+                        if(++iArg >= argc)
+                        {
+                            NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "ERROR: --processing-mode requires an argument (0, 1, or 2)");
+                            exit(1);
+                        }
+                        const std::string token(argv[iArg]);
+                        int parsedMode = 0;
+                        {
+                            size_t pos = 0;
+                            try
+                            {
+                                parsedMode = std::stoi(token, &pos);
+                            }
+                            catch(const std::invalid_argument&)
+                            {
+                                NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "ERROR: --processing-mode must be an integer 0, 1, or 2 (got '{}')", token);
+                                exit(1);
+                            }
+                            catch(const std::out_of_range&)
+                            {
+                                NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "ERROR: --processing-mode value out of range (got '{}')", token);
+                                exit(1);
+                            }
+                            if(pos != token.size())
+                            {
+                                NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "ERROR: --processing-mode has trailing characters (got '{}')", token);
+                                exit(1);
+                            }
+                        }
+                        if(parsedMode < 0 || parsedMode > 2)
+                        {
+                            NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "ERROR: --processing-mode must be 0, 1, or 2 (got {})", parsedMode);
+                            exit(1);
+                        }
+                        processingMode = parsedMode;
+                        ++iArg;
+                        continue;
+                    }
+                    if(longOpt == "frontend-ref-tol")
+                    {
+                        if(++iArg >= argc)
+                        {
+                            NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "ERROR: --frontend-ref-tol requires a float argument");
+                            exit(1);
+                        }
+                        const std::string token(argv[iArg]);
+                        float parsedTol = 0.0f;
+                        {
+                            size_t pos = 0;
+                            try
+                            {
+                                parsedTol = std::stof(token, &pos);
+                            }
+                            catch(const std::invalid_argument&)
+                            {
+                                NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                                           "ERROR: --frontend-ref-tol must be a non-negative finite float (got '{}')",
+                                           token);
+                                exit(1);
+                            }
+                            catch(const std::out_of_range&)
+                            {
+                                NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                                           "ERROR: --frontend-ref-tol value out of range (got '{}')",
+                                           token);
+                                exit(1);
+                            }
+                            if(pos != token.size())
+                            {
+                                NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                                           "ERROR: --frontend-ref-tol has trailing characters (got '{}')",
+                                           token);
+                                exit(1);
+                            }
+                        }
+                        if(!std::isfinite(parsedTol) || (parsedTol < 0.0f))
+                        {
+                            NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,
+                                       "ERROR: --frontend-ref-tol must be a non-negative finite float (got {})",
+                                       token);
+                            exit(1);
+                        }
+                        frontEndRefTol = parsedTol;
+                        ++iArg;
+                        continue;
+                    }
+                    if(longOpt == "G")
+                    {
+                        useGreenCtxs = true;
+                        if(((++iArg >= argc) || (1 != sscanf(argv[iArg], "%i", &SMsPerGreenCtx))) || (SMsPerGreenCtx == 0))
+                        {
+                            NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "ERROR: Invalid or missing useGreenCtxs argument (--G)");
+                            exit(1);
+                        }
+                        ++iArg;
+                        continue;
+                    }
+                    NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "ERROR: Unknown option: {}", argv[iArg]);
+                    usage(argv);
+                    exit(1);
+                }
+
                 switch(argv[iArg][1])
                 {
                     case 'i':
@@ -126,25 +245,10 @@ int main(int argc, char* argv[])
                             totalIters = std::stoi(argv[iArg++]);
                         }
                         break;
-                    case '-':
-                        switch(argv[iArg][2])
-                        {
-                           case 'G':
-                               useGreenCtxs = true;
-                               if(((++iArg >= argc) || (1 != sscanf(argv[iArg], "%i", &SMsPerGreenCtx))) || (SMsPerGreenCtx == 0))
-                               {
-                                   // Will later check that SMsPerGreenCtx does not exceed the SMs of the GPU. This will also capture if a negative number was provided.
-                                   NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,  "ERROR: Invalid or missing useGreenCtxs argument (--G)");
-                                   exit(1);
-                               }
-                               ++iArg;
-                               break;
-                           default:
-                               NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT,  "ERROR: Unknown option: {}", argv[iArg]);
-                               usage(argv);
-                               exit(1);
-                               break;
-                        }
+                    case 's':
+                        // short alias for --skip-polar (mode 1)
+                        processingMode = 1;
+                        ++iArg;
                         break;
                     default:
                         usage(argv);
@@ -291,6 +395,37 @@ int main(int argc, char* argv[])
         cuphyPucchDynPrms_t&  pucchDynPrm   = dynPucchApiDataset.pucchDynPrm;
         cuphyPucchStatPrms_t& pucchStatPrms =  statPucchApiDataset.pucchStatPrms;
 
+        // Honor --processing-mode by flipping the static param before PucchRx creation.
+        // Mode 1 wires post-polar descriptors from the dataset layer; mode 2 keeps
+        // front-end reference checking in the example/dataset layer.
+        const char* refH5Path = statPucchApiDataset.refH5Path.empty() ? nullptr
+                                                                      : statPucchApiDataset.refH5Path.c_str();
+        pucchStatPrms.pipelineData.pPostPolarData = nullptr;
+        if(processingMode == 1)
+        {
+            pucchStatPrms.pipelineMode = PUCCH_PIPELINE_SKIP_POLAR;
+            pucchStatPrms.pipelineData.pPostPolarData = (refH5Path != nullptr && refH5Path[0] != '\0')
+                                                        ? dynPucchApiDataset.enablePostPolarData(refH5Path, cuStrm)
+                                                        : nullptr;
+            NVLOGI_FMT(NVLOG_PUCCH, "PUCCH pipelineMode = SKIP_POLAR via mode 1; post-polar refs sourced from input TV.");
+        }
+        else if(processingMode == 2)
+        {
+            pucchStatPrms.pipelineMode = PUCCH_PIPELINE_SKIP_BACKEND;
+            if(refH5Path != nullptr)
+            {
+                dynPucchApiDataset.enableFrontEndLlrOutput(refH5Path, cuStrm);
+            }
+            NVLOGI_FMT(NVLOG_PUCCH, "PUCCH pipelineMode = SKIP_BACKEND via mode 2; front-end LLR compare vs TV (NRMSE tol={}).", frontEndRefTol);
+        }
+        else
+        {
+            // Explicitly force RUN so --processing-mode 0 overrides any prior value the
+            // TV/YAML dataset constructor may have set (rather than silently inheriting it).
+            pucchStatPrms.pipelineMode = PUCCH_PIPELINE_FULL;
+            NVLOGI_FMT(NVLOG_PUCCH, "PUCCH pipelineMode = FULL (mode 0).");
+        }
+
         //------------------------------------------------------------------
         // allocate output buffers
 
@@ -341,7 +476,7 @@ int main(int argc, char* argv[])
             //------------------------------------------------------------------
             // Run pucch reciever object
 
-            uint64_t procModeBmsk = 0; // procModeBmsk currently un-used 
+            uint64_t procModeBmsk = 0; // procModeBmsk currently un-used
 
             // Record GPU & CPU time before run
             evtTmrRun.record_begin(cuStrm);
@@ -366,7 +501,36 @@ int main(int argc, char* argv[])
 #endif
             if (iterIdx == 0)
             {
-                evalPucchDataset.evalPucchRxPipeline(pucchDynPrm);
+                if(processingMode == 2)
+                {
+                    // Mode 2 disables the UCI seg parser; final UCI bits are garbage. Verify
+                    // by NRMSE-comparing the front-end LLR buffers against the TV reference.
+                    const char* refPath = refH5Path;
+                    if(refPath == nullptr)
+                    {
+                        // Mode 2's only verification is the LLR compare. If the ref path is null,
+                        // fail visibly rather than reporting a false-green PASS for an unverified run.
+                        NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "Mode 2 requested but input TV ref path is null; cannot verify");
+                        returnValue = 4;
+                    }
+                    else
+                    {
+                        cuphyStatus_t cmpStatus = comparePucchFrontEndRefForBackendSkip(pucchDynPrm.pDataOut, refPath, frontEndRefTol, cuStrm);
+                        if(cmpStatus != CUPHY_STATUS_SUCCESS)
+                        {
+                            NVLOGE_FMT(NVLOG_PUCCH, AERIAL_CUPHY_EVENT, "Mode 2 front-end LLR compare FAILED (status={})", static_cast<int>(cmpStatus));
+                            returnValue = 3;
+                        }
+                        else
+                        {
+                            NVLOGC_FMT(NVLOG_PUCCH, "Mode 2 front-end LLR compare PASSED");
+                        }
+                    }
+                }
+                else
+                {
+                    evalPucchDataset.evalPucchRxPipeline(pucchDynPrm);
+                }
             }
 
             elpasedTimeDurationUs = timePtStopSetup - timePtStartSetup;

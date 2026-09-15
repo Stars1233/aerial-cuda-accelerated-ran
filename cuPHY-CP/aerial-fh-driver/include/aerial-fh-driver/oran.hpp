@@ -19,6 +19,7 @@
 #define AERIAL_FH_DRIVER_ORAN__
 
 #include <inttypes.h>
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -306,6 +307,9 @@ enum oran_pkt_dir : std::uint8_t
 
 #define ORAN_MAX_PRB_X_SECTION 255  //!< Maximum PRBs per section
 #define ORAN_MAX_PRB_X_SLOT 273     //!< Maximum PRBs per slot
+
+// Compile-time cap for fixed arrays (e.g. eAxCMap); runtime uses FronthaulInfo::max_dl_antenna_ports.
+#define API_MAX_ANTENNAS 32  //!< Maximum antenna ports per cell (32-layer worst case)
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1920,5 +1924,20 @@ inline int getPRACHStartPRB(int frequencyOffset, int subcarrierSpacing, int ulBa
     int startPrb = ((frequencyOffset * subcarrierSpacing / 2 - halfbw  - guardbw - subcarrierSpacing/2)) / (subcarrierSpacing * PRB_NUM_RE);
     return startPrb;
 }
+
+/******************************************************************/ /**
+ * \brief Cleanup buffer information for GPU memset kernel
+ *
+ * Used by memset kernel in both FH driver and application.
+ * Defined here (lightweight header) so CUDA kernel files can access it
+ * without pulling in the full aerial-fh-driver/api.hpp include chain.
+ */
+struct CleanupDlBufInfo final {
+    uint4* d_buf_addr{nullptr};   //!< Device buffer address for cleanup
+    size_t  buf_size{0};          //!< Buffer size in bytes
+    // Note: Compressed buffer fields commented out - can be extended if needed:
+    // uint4* d_comp_buf_addr;  // Compressed buffer address
+    // size_t comp_buf_size;     // Compressed buffer size in bytes
+};
 
 #endif //ifndef AERIAL_FH_DRIVER_ORAN__

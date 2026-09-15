@@ -63,9 +63,12 @@
 #define YAML_PARAM_UL_ORDER_TIMEOUT_LOG_INTERVAL_NS "ul_order_timeout_log_interval_ns"
 #define YAML_PARAM_UL_ORDER_TIMEOUT_GPU_LOG_ENABLE "ul_order_timeout_gpu_log_enable"
 #define YAML_PARAM_UL_SRS_AGGR3_TASK_LAUNCH_OFFSET_NS "ul_srs_aggr3_task_launch_offset_ns"
+#define YAML_PARAM_UL_SRS_TASK1_ORDER_LAUNCH_OFFSET_NS "ul_srs_task1_order_launch_offset_ns"
 #define YAML_PARAM_UL_ORDER_MAX_RX_PKTS    "ul_order_max_rx_pkts"
 #define YAML_PARAM_UL_ORDER_RX_PKTS_TIMEOUT_NS    "ul_order_rx_pkts_timeout_ns"
 #define YAML_PARAM_CPLANE_DISABLE "cplane_disable"
+#define YAML_PARAM_CPLANE_PROCESSING_DL_BATCH_SIZE "cplane_processing_dl_batch_size"
+#define YAML_PARAM_CPLANE_PROCESSING_UL_BATCH_SIZE "cplane_processing_ul_batch_size"
 #define YAML_PARAM_DPDK_THREAD "dpdk_thread"
 #define YAML_PARAM_DPDK_VERBOSE_LOGS "dpdk_verbose_logs"
 #define YAML_PARAM_ACCU_TX_SCHED_RES_NS "accu_tx_sched_res_ns"
@@ -323,11 +326,14 @@ struct cuphydriver_config
     uint32_t ul_order_timeout_gpu_srs_ns;
     uint32_t ul_order_timeout_log_interval_ns;
     uint32_t ul_srs_aggr3_task_launch_offset_ns;
+    uint32_t ul_srs_task1_order_launch_offset_ns;
     uint8_t ul_order_kernel_mode;
     uint8_t ul_order_timeout_gpu_log_enable;
     uint32_t ul_order_max_rx_pkts;
     uint32_t ul_order_rx_pkts_timeout_ns;
     uint8_t cplane_disable;
+    uint16_t cplane_processing_dl_batch_size{};
+    uint16_t cplane_processing_ul_batch_size{};
     int profiler_sec;
     l1_log_level log_level;
     uint32_t dpdk_thread;
@@ -469,6 +475,10 @@ struct cuphydriver_config
     uint8_t bfw_c_plane_chaining_mode;
     uint8_t enable_tx_notification;
     uint8_t notify_ul_harq_buffer_release;
+    /** Max UL antenna ports: max over all cells of max(PUSCH, PUCCH, PRACH, SRS) eAxC ID count. Set in parse_cell_configs(). */
+    uint16_t max_ul_antenna_ports{0};
+    /** Max DL antenna ports: max over all cells of max(PDCCH, PDSCH, CSI_RS, PBCH) eAxC ID count. Set in parse_cell_configs(). */
+    uint16_t max_dl_antenna_ports{0};
 };
 
 class YamlParser
@@ -533,12 +543,17 @@ public:
     uint32_t& get_cuphydriver_timeout_gpu_srs();
     uint32_t& get_cuphydriver_timeout_log_interval();
     uint32_t& get_cuphydriver_ul_srs_aggr3_task_launch_offset_ns();
+    uint32_t& get_cuphydriver_ul_srs_task1_order_launch_offset_ns();
     uint8_t& get_cuphydriver_ul_order_kernel_mode();
     uint8_t& get_cuphydriver_timeout_gpu_log_enable();
     uint8_t& get_cuphydriver_ue_mode();
     uint32_t& get_cuphydriver_order_kernel_max_rx_pkts();
     uint32_t& get_cuphydriver_order_kernel_rx_pkts_timeout();
     uint8_t& get_cplane_disable();
+    /// Get configured DL C-plane batch size.
+    [[nodiscard]] const uint16_t& get_cplane_processing_dl_batch_size() const noexcept;
+    /// Get configured UL C-plane batch size.
+    [[nodiscard]] const uint16_t& get_cplane_processing_ul_batch_size() const noexcept;
     uint8_t&  get_cuphydriver_use_green_contexts();
     uint8_t&  get_cuphydriver_use_gc_workqueues();
     uint8_t&  get_cuphydriver_use_batched_memcpy();
@@ -646,10 +661,14 @@ public:
     [[nodiscard]] uint8_t get_ulc_alloc_cplane_bfw_txq();
     [[nodiscard]] uint8_t get_enable_tx_notification();
     [[nodiscard]] uint8_t get_notify_ul_harq_buffer_release() const;
+    /** Max UL antenna ports (max of UL eAxC counts over all cells). */
+    [[nodiscard]] uint16_t get_max_ul_antenna_ports() const;
+    /** Max DL antenna ports (max of DL eAxC counts over all cells). */
+    [[nodiscard]] uint16_t get_max_dl_antenna_ports() const;
 private:
     int parse_cuphydriver_configs(yaml::node root);
     int parse_cell_configs(yaml::node root);
-    int parse_single_cell(yaml::node cell,std::string *p_unique_nic_info,size_t length);
+    int parse_single_cell(yaml::node cell, std::string *p_unique_nic_info, size_t length);
     int parse_eAxC_to_beam_map(yaml::node node, const std::vector<slot_command_api::channel_type>& channels, cell_mplane_info& mplane_cfg);
 
     std::string l2adapter_config_filename;

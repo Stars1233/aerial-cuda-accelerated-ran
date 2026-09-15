@@ -16,6 +16,7 @@
 import subprocess
 import fileinput
 import os
+import platform
 import itertools
 from datetime import datetime
 import argparse
@@ -43,11 +44,12 @@ class TVGenerator:
         self.direction = direction if direction is not None else "DL"
         self.antenna = antenna if antenna is not None else "4"
         self.cubb = cubb if cubb is not None else "/opt/nvidia/cuBB"
-        self.cmake = (
-            cmake
-            if cmake is not None
-            else f"cmake -Bbuild -GNinja -DCMAKE_TOOLCHAIN_FILE={self.cubb}/cuPHY/cmake/toolchains/grace-cross && cmake --build build --target cumac_examples"
-        )
+        if cmake is not None:
+            self.build_dir = os.environ.get("BUILD", f"build.{platform.machine()}")
+            self.cmake = cmake
+        else:
+            self.build_dir = "build"
+            self.cmake = f"cmake -Bbuild -GNinja -DCMAKE_TOOLCHAIN_FILE={self.cubb}/cuPHY/cmake/toolchains/grace-cross && cmake --build build --target cumac_examples"
         self.logfolder = logfolder if logfolder is not None else os.getcwd()
         self.tvfolder = (
             tvfolder if tvfolder is not None else f"{self.cubb}/testVectors/cumac"
@@ -56,10 +58,6 @@ class TVGenerator:
         self.option = option if option is not None else "1"
         self.tvIndex = tvIndex
         self.gpuid = gpuid if gpuid is not None else "0"
-        # if cmake is None:
-        #    self.build_path = f"{self.cubb}/cuMAC"
-        # else:
-        #    self.build_path = f"{self.cubb}"
         self.buildCommand = f"cd {self.cubb} && {self.cmake}"
         if self.option == "3":
             self.tvIndex = "testMAC"
@@ -73,10 +71,15 @@ class TVGenerator:
             )
         self.log_file = os.path.join(self.logfolder, self.log_filename)
         self.csv_filename = f"{self.cubb}/cuMAC/scripts/cumac_tv_parameters.csv"
-        self.param_file = f"{self.cubb}/cuMAC/examples/parameters.h"
-        self.param_file_bak = f"{self.cubb}/cuMAC/examples/parameters.h_bak"
-        self.checkcommand = f"grep 'nBsAntConst\|nUeAntConst\|numSimChnRlz\|gpuDeviceIdx\|seedConst\|numCellConst\|numUePerCellConst\|numActiveUePerCellConst\|nPrbsPerGrpConst\|numUePerCellConst\|gpuAllocTypeConst\|cpuAllocTypeConst\|prdSchemeConst\|rxSchemeConst' {self.param_file}"
+        # Example parameters are loaded at runtime from parameters.yaml
+        # (see cuMAC/examples/parameters.cpp); values no longer require a rebuild.
+        self.param_file = f"{self.cubb}/cuMAC/examples/parameters.yaml"
+        self.param_file_bak = f"{self.cubb}/cuMAC/examples/parameters.yaml_bak"
+        self.checkcommand = f"grep -E 'nBsAntConst|nUeAntConst|numSimChnRlz|gpuDeviceIdx|seedConst|numCellConst|numUePerCellConst|numActiveUePerCellConst|nPrbsPerGrpConst|gpuAllocTypeConst|cpuAllocTypeConst|prdSchemeConst|rxSchemeConst' {self.param_file}"
+        # Point the example binary at the edited YAML regardless of its cwd.
+        self.param_env = f"CUMAC_PARAMS_YAML={self.param_file}"
         self.logger = self._setup_logger()
+        self._built = False
 
     def _setup_logger(self):
         logger = logging.getLogger(__name__)
@@ -172,9 +175,7 @@ class TVGenerator:
         elif self.antenna == "64":
             nBsAntConst = [64]
             nUeAntConst = [64]
-
-        # numSimChnRlz = [5000]  # for QA release testing
-        # for ENG CI/CD testing reduce 100
+        # for ENG CI/CD testing reduce 100, for QA CI/CD testing set to 1000
         numSimChnRlz = [100]
         gpuDeviceIdx = [self.gpuid]
         seedConst = [0]
@@ -246,14 +247,33 @@ class TVGenerator:
         )
         return all_combinations
 
+    def build_once(self, tv_binary):
+        """Build cuMAC once if the binary is missing.
+
+        Parameter values are now read at runtime from parameters.yaml, so a
+        rebuild is only needed to (re)produce the binary, not to apply new
+        parameter values. Returns True on success, False if the build failed.
+        """
+        if self._built or os.path.exists(tv_binary):
+            self._built = True
+            return True
+        self.logger.info("Building cuMAC as no build folder/binary found .......")
+        if self.run_subprocess(self.buildCommand, self.log_file) == 1:
+            self.logger.error("Build failed; aborting TV generation.")
+            return False
+        self._built = True
+        return True
+
     def generate_tv(self):
         """Generate TV and copy the result to the specified folder."""
-        # Disable the build path check after 25-3 release,all build path is in /opt/nvidia/cuBB
-        # if "cuMAC" in self.cubb:
-        #    cmd = f"timeout -s 9 7200 {self.cubb}/build/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
-        # else:
-        cmd = f"timeout -s 9 3600 {self.cubb}/build/cuMAC/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
-        param_file = f"{self.cubb}/cuMAC/examples/parameters.h"
+        tv_binary = f"{self.cubb}/{self.build_dir}/cuMAC/examples/multiCellSchedulerUeSelection/multiCellSchedulerUeSelection"
+        # Load the script-edited parameters.yaml at runtime via CUMAC_PARAMS_YAML.
+        cmd = f"{self.param_env} timeout -s 9 7200 {tv_binary}"
+
+        # Disable compute-sanitizer After 25-3 release, all compute-sanitizer is disabled in cuMAC
+        # compute_sanitizer_cmd = (
+        #    "compute-sanitizer --error-exitcode 0 --tool memcheck --leak-check full "
+        # )
 
         if self.option in ["1", "4"]:
             tvfolder = f"{self.tvfolder}/{self.direction}"
@@ -273,7 +293,7 @@ class TVGenerator:
 
         base_tv_name = f"TV_cuMAC_{self.antenna}T{self.antenna}R_{self.direction}_TC"
         UePerCell = self.run_subprocess(
-            f"grep '#define numActiveUePerCellConst' {self.param_file} | awk '{{print $3}}'",
+            f"grep -E '^\\s*numActiveUePerCellConst\\s*:' {self.param_file} | awk '{{print $2}}'",
             self.log_file,
         )
         # Handle different options
@@ -296,11 +316,8 @@ class TVGenerator:
                 self.logger.info(
                     f"Running command: {generate_fast_fading_tv_cmd}")
 
-                if not os.path.exists(f"{self.cubb}/build"):
-                    self.logger.info(
-                        "Building cuMAC again as no build folder found ......."
-                    )
-                    self.run_subprocess(self.buildCommand, self.log_file)
+                if not self.build_once(tv_binary):
+                    return
 
                 if UePerCell.strip() == "500" and f_value in [2, 4]:
                     self.logger.info(
@@ -369,23 +386,17 @@ class TVGenerator:
                 self.logger.info(
                     "Updating the gpuDeviceIdx before generate testMAC TV ....."
                 )
-                command1 = f"python3 update_parameter.py -f {param_file} -p gpuDeviceIdx -v {self.gpuid}"
-                command2 = f"python3 update_parameter.py -f {param_file} -p cpuGpuPerfGapPerUeConst -v 0.01"
-                command3 = f"python3 update_parameter.py -f {param_file} -p cpuGpuPerfGapSumRConst -v 0.03"
+                command1 = f"python3 update_parameter.py -f {self.param_file} -p gpuDeviceIdx -v {self.gpuid}"
+                command2 = f"python3 update_parameter.py -f {self.param_file} -p cpuGpuPerfGapPerUeConst -v 0.01"
+                command3 = f"python3 update_parameter.py -f {self.param_file} -p cpuGpuPerfGapSumRConst -v 0.03"
 
                 self.run_subprocess(command1, self.log_file)
                 self.run_subprocess(command2, self.log_file)
                 self.run_subprocess(command3, self.log_file)
                 self.run_subprocess(self.checkcommand, self.log_file)
-                self.logger.info(
-                    "Building cuMAC to apply new parameters .......")
-                self.run_subprocess(self.buildCommand, self.log_file)
 
-            if not os.path.exists(f"{self.cubb}/build"):
-                self.logger.info(
-                    "Building cuMAC again as no build folder found ......."
-                )
-                self.run_subprocess(self.buildCommand, self.log_file)
+            if not self.build_once(tv_binary):
+                return
 
             generate_tv_log = (
                 f"{self.logfolder}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_generate_{base_tv_name}{self.tvIndex}.log"
@@ -472,11 +483,11 @@ class TVGenerator:
             self.run_subprocess(self.checkcommand, self.log_file)
             self.logger.info("Parameters have been updated.")
             gpuAllocTypeConst = self.run_subprocess(
-                f"grep 'gpuAllocTypeConst' {self.param_file} | awk '{{print $3}}'",
+                f"grep -E '^\\s*gpuAllocTypeConst\\s*:' {self.param_file} | awk '{{print $2}}'",
                 self.log_file,
             )
             prdSchemeConst = self.run_subprocess(
-                f"grep 'prdSchemeConst' {self.param_file} | awk '{{print $3}}'",
+                f"grep -E '^\\s*prdSchemeConst\\s*:' {self.param_file} | awk '{{print $2}}'",
                 self.log_file,
             )
             if self.direction.strip() == "UL" and gpuAllocTypeConst.strip() == "0":
@@ -511,17 +522,15 @@ class TVGenerator:
                 self.logger.info(
                     f"Not found {missing_tvfiles}, start to generate them."
                 )
-                self.logger.info(
-                    f"Building cuMAC to apply new parameters for TV_cuMAC_{self.antenna}T{self.antenna}R_{self.direction}_TC{self.tvIndex} ......."
-                )
-                self.run_subprocess(self.buildCommand, self.log_file)
+                # Parameters are applied at runtime from parameters.yaml; no
+                # rebuild is required. generate_tv() builds once if needed.
                 self.generate_tv()
             else:
                 self.logger.info(
                     f"Found all required TV files exist, no need to generate them."
                 )
 
-            new_filename = f"{self.cubb}/cuMAC/examples/parameter_{self.tvIndex}.h"
+            new_filename = f"{self.cubb}/cuMAC/examples/parameter_{self.tvIndex}.yaml"
             if not os.path.exists(new_filename):
                 rename = f"cp -f {self.param_file} {new_filename}"
                 mv = f"mv {new_filename} {self.logfolder}"
@@ -575,14 +584,13 @@ class TVGenerator:
                         param_combin += f"_Precoder{value}"
                     print(f"command: {command}")
                     self.run_subprocess(command, self.log_file)
-            # checkcommand = f"grep 'nBsAntConst\|nUeAntConst\|numSimChnRlz\|gpuDeviceIdx\|seedConst\|numCellConst\|numUePerCellConst\|numActiveUePerCellConst\|nPrbsPerGrpConst\|numUePerCellConst\|gpuAllocTypeConst\|cpuAllocTypeConst\|prdSchemeConst\|rxSchemeConst' {param_file}"
             self.run_subprocess(self.checkcommand, self.log_file)
             self.logger.info("Parameters have been updated.")
             gpuAllocTypeConst = self.run_subprocess(
-                f"grep 'gpuAllocTypeConst' {self.param_file} | awk '{{print $3}}'"
+                f"grep -E '^\\s*gpuAllocTypeConst\\s*:' {self.param_file} | awk '{{print $2}}'"
             )
             prdSchemeConst = self.run_subprocess(
-                f"grep 'prdSchemeConst' {self.param_file} | awk '{{print $3}}'"
+                f"grep -E '^\\s*prdSchemeConst\\s*:' {self.param_file} | awk '{{print $2}}'"
             )
             if self.direction.strip() == "UL" and gpuAllocTypeConst.strip() == "0":
                 self.logger.info(
@@ -596,31 +604,20 @@ class TVGenerator:
                 index += 1
                 continue
             self.logger.info(
-                f"Building cuMAC to apply new parameters for TV_{tvIndex} ......."
-            )
-            self.run_subprocess(self.buildCommand, self.log_file)
-            build = self.run_subprocess(self.buildCommand, self.log_file)
-            if build != 0:
-                self.logger.info(
-                    f"Built cuMAC successfully, ready to generate TV_{tvIndex}."
-                )
-            else:
-                self.logger.error(
-                    "Failed to build cuMAC, please check the {self.log_file}"
-                )
-            self.logger.info(
                 f"Start to generate TV_{tvIndex} and rename it as TV_cuMAC_{self.antenna}T{self.antenna}R_{self.direction}_{param_combin}.h5."
             )
             self.tvIndex = param_combin
             tvfile = f"{self.tvfolder}/TV_cuMAC_{self.antenna}T{self.antenna}R_{self.direction}_{param_combin}.h5"
             if not os.path.exists(tvfile):
                 self.logger.info(f"Not found {tvfile}, start to generate it.")
+                # Parameters are applied at runtime from parameters.yaml; no
+                # rebuild is required. generate_tv() builds once if needed.
                 self.generate_tv()
             else:
-                self.logger.inf(
-                    f"Found TV in {self.tvfolder},no need to gerate it")
+                self.logger.info(
+                    f"Found TV in {self.tvfolder}, no need to generate it")
 
-            new_filename = f"{filepath}/parameter_{tvIndex}.h"
+            new_filename = f"{filepath}/parameter_{tvIndex}.yaml"
             if not os.path.exists(new_filename):
                 rename = f"cp -f {self.param_file} {new_filename}"
                 mv = f"mv {new_filename} {self.logfolder}"
@@ -698,11 +695,11 @@ class TVGenerator:
                                 self.checkcommand, self.log_file)
                             self.logger.info("Parameters have been updated.")
                             gpuAllocTypeConst = self.run_subprocess(
-                                f"grep 'gpuAllocTypeConst' {self.param_file} | awk '{{print $3}}'",
+                                f"grep -E '^\\s*gpuAllocTypeConst\\s*:' {self.param_file} | awk '{{print $2}}'",
                                 self.log_file,
                             )
                             prdSchemeConst = self.run_subprocess(
-                                f"grep 'prdSchemeConst' {self.param_file} | awk '{{print $3}}'",
+                                f"grep -E '^\\s*prdSchemeConst\\s*:' {self.param_file} | awk '{{print $2}}'",
                                 self.log_file,
                             )
                             if (
@@ -722,30 +719,18 @@ class TVGenerator:
                                 )
                                 return
                             else:
-                                self.logger.info(
-                                    f"Building cuMAC to apply parameters for TV_cuMAC_{self.antenna}T{self.antenna}R_{self.direction}_TC{self.tvIndex} ......."
-                                )
-                                build = self.run_subprocess(
-                                    self.buildCommand, self.log_file
-                                )
-                                if build != 0:
-                                    self.logger.info(
-                                        f"Built cuMAC successfully, ready to generate TV_cuMAC_{self.antenna}T{self.antenna}R_{self.direction}_TC{self.tvIndex}."
-                                    )
-                                else:
-                                    self.logger.error(
-                                        f"Failed to build cuMAC, please check the {self.log_file}"
-                                    )
-                                # Generate TV
+                                # Parameters are applied at runtime from
+                                # parameters.yaml; generate_tv() builds once if
+                                # the binary is missing.
                                 self.generate_tv()
-                                new_filename = f"{self.cubb}/cuMAC/examples/parameter_{self.tvIndex}.h"
-                                # Back up the parameters.h which used by this tvIndex
+                                new_filename = f"{self.cubb}/cuMAC/examples/parameter_{self.tvIndex}.yaml"
+                                # Back up the parameters.yaml used by this tvIndex
                                 if not os.path.exists(new_filename):
                                     rename = f"cp -f {self.param_file} {new_filename}"
                                     mv = f"mv {new_filename} {self.logfolder}"
                                     self.run_subprocess(rename, self.log_file)
                                     self.run_subprocess(mv, self.log_file)
-                                # Roll back to the default parameters.sh
+                                # Roll back to the default parameters.yaml
                                 self.run_subprocess(
                                     f"cp {self.param_file_bak} {self.param_file}",
                                     self.log_file,

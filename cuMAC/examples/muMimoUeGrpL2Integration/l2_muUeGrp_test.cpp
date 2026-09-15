@@ -26,6 +26,8 @@ int L2_CUMAC_RECV_THREAD_CORE; // L2 cuMAC receiver thread core
 int NUM_TIME_SLOTS; // number of time slots
 int NUM_CELL; // number of cells
 bool PRINT_UE_PAIRING_SOLUTION; // print UE pairing solution
+bool ENABLE_TV_TEST_MODE; // enable TV test mode
+sem_t cumac_resp_sem; // flow-control semaphore: L2 main waits on it before sending the next slot in TV test mode
 
 volatile sig_atomic_t g_shutdown = 0;
 
@@ -95,6 +97,7 @@ int l2_work_per_slot_mem_sharing(nv_ipc_t* ipc_l2_l1, nv_ipc_t* ipc_l2_cumac, co
     }
 
     char tdd_direction = sys_param.TDD_pattern[slot % sys_param.TDD_pattern.length()];
+    // In cuBB TV input mode every slot is an SRS capture, so always schedule SRS.
     if (tdd_direction == 'S') { // S-slot with SRS scheduled UEs
         // determine the number of SRS UEs and SRS info for each cell
         for (size_t cIdx = 0; cIdx < sys_param.num_cell; cIdx++) {
@@ -386,6 +389,7 @@ void prepare_slot_data_l2_to_cumac(const sys_param_t& sys_param, std::vector<std
         req_data[cIdx]->srsInfo = (cumac_muUeGrp_req_srs_info_t*) (req_data[cIdx]->payload);
     }
 
+    // In cuBB TV input mode every slot is an SRS capture, so always schedule SRS.
     if (tdd_direction == 'S') { // S-slot with SRS scheduled UEs
         for (int cIdx = 0; cIdx < sys_param.num_cell; cIdx++) {
             uint16_t num_connected_srs_ue = connected_ue_list_vec[cIdx]->get_num_connected_srs_ue();
@@ -553,6 +557,10 @@ void* l2_cumac_blocking_recv_task(void* arg)
         NVLOGC(MU_TEST_TAG, "L2-cuMAC RECV: NVIPC message receive duration: %f microseconds", msg_recv_duration/1000.0);
 
         NVLOGC(MU_TEST_TAG, "L2-cuMAC RECV: time slot %d, received %d messages, expected %d messages", num_slot-1, num_recv_msg, NUM_CELL);
+
+        if (ENABLE_TV_TEST_MODE) {
+            sem_post(&cumac_resp_sem);
+        }
     }
 
     NVLOGC(MU_TEST_TAG, "L2-cuMAC RECV: test completed successfully");
@@ -577,6 +585,12 @@ int main(int argc, char** argv)
     NUM_TIME_SLOTS = sys_param.num_time_slots;
     NUM_CELL = sys_param.num_cell;
     PRINT_UE_PAIRING_SOLUTION = sys_param.print_ue_pairing_solution;
+    ENABLE_TV_TEST_MODE = sys_param.enable_tv_test_mode;
+
+    if (ENABLE_TV_TEST_MODE) {
+        sem_init(&cumac_resp_sem, 0, 1);
+        NVLOGC(MU_TEST_TAG, "L2-MAIN: TV test mode ENABLED, flow control active");
+    }
 
     // initialize connected UE list for each cell
     std::vector<std::unique_ptr<l2_connected_ue_list_t>> connected_ue_list_vec;
@@ -633,11 +647,15 @@ int main(int argc, char** argv)
 
     // Main loop or sender thread
     for (int slotIdx = 0; slotIdx < sys_param.num_time_slots && !g_shutdown; slotIdx++) {
-        // Sleep to the next slot timestamp
-        int ret = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts_slot, &ts_remain);
-        if(ret != 0)
-        {
-            NVLOGE(MU_TEST_TAG, AERIAL_CLOCK_API_EVENT, "clock_nanosleep returned error ret: %d", ret);
+        if (ENABLE_TV_TEST_MODE) {
+            sem_wait(&cumac_resp_sem);
+        } else {
+            // Sleep to the next slot timestamp
+            int ret = clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts_slot, &ts_remain);
+            if(ret != 0)
+            {
+                NVLOGE(MU_TEST_TAG, AERIAL_CLOCK_API_EVENT, "clock_nanosleep returned error ret: %d", ret);
+            }
         }
 
         // Send the UE grouping request message to cuMAC-CP
@@ -650,8 +668,10 @@ int main(int argc, char** argv)
         // Update SFN/SLOT for next slot
         advance_sfn_slot(sfn, slot);
 
-        // Update timestamp for next slot
-        get_next_slot_timespec(&ts_slot, sys_param.slot_interval_ns);
+        if (!ENABLE_TV_TEST_MODE) {
+            // Update timestamp for next slot
+            get_next_slot_timespec(&ts_slot, sys_param.slot_interval_ns);
+        }
     }
 
     if (g_shutdown) {
@@ -669,6 +689,10 @@ int main(int argc, char** argv)
     // release NVIPC interfaces
     ipc_l2_cumac->ipc_destroy(ipc_l2_cumac);
     ipc_l2_l1->ipc_destroy(ipc_l2_l1);
+
+    if (ENABLE_TV_TEST_MODE) {
+        sem_destroy(&cumac_resp_sem);
+    }
 
     NVLOGC(MU_TEST_TAG, "L2-MAIN: test completed successfully, ENABLE_L1_L2_MEM_SHARING: %s", (sys_param.enable_l1_l2_mem_sharing ? "true" : "false"));
 

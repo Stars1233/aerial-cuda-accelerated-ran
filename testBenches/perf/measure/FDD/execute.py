@@ -25,11 +25,11 @@ def run(args, designated, mig, mig_gpu, command, vectors, mode, target, k):
 
     subs, streams, steps = designated
 
-    if args.force is not None:
-        if args.force == 0:
+    if args.device_max_connections is not None:
+        if args.device_max_connections == 0:
             connections = streams
         else:
-            connections = args.force
+            connections = args.device_max_connections
     else:
         connections = np.min([32, int(np.power(2, np.floor(np.log2(96 / (subs + 1)))))])
 

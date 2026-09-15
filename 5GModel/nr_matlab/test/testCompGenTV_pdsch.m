@@ -258,6 +258,9 @@ CFG = {...
  3358,  1,        7,   1,  0,   273,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0; % modComp Qm=4
  3359,  1,       27,   1,  0,   136,  2,     12,     0,    0,    273,    0,    0,      0,     2,      1,     0,      0,      2,   0,   4,     0; % modComp w/ partial BW
  3360,  1,       27,   2,  0,   253,  2,     12,     0,    0,    273,   211,   0,     41,     2,      2,     1,     41,      2,   0,  16,     0; % modComp w/ mixed modulation
+ 
+% nCdm=1 + nCdm=2    
+ 3361,  2,        0,   2,  0,   273,  2,     12,     0,    0,    273,   211,   0,     41,     2,      1,     0,     41,      1,   0,   4,     0; 
 
  % MU-MIMO > 16 layers 
  3362,  1,       27,   2,  20,  253,  2,     12,     0,    0,    273,   211,   0,     41,     2,      2,     1,     41,      2,   0,   32,     0; % nl 32 = 4 x 8
@@ -959,6 +962,10 @@ parfor n = 1:NallTest
                         0  100   1  2  0   1    0;...
                       100  100  19  4  0   0    1;...
                       100  100  27  4  4   0    1];
+        elseif caseNum == 3361         
+            nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
+                        0  262  0   2  0   0    0;...
+                      262   11 27   4  0   0    1];
         elseif caseNum == 3265
             nUeCfg = [%rb0 nRb mcs nl p0 SCID idxUeg
                         0  60   10  1  0   0    0;...
@@ -1698,6 +1705,8 @@ parfor n = 1:NallTest
                 SysPar.pdsch{2}.numDmrsCdmGrpsNoData = 2;
                 SysPar.pdsch{1}.prcdBf = 4; % PM_W14
                 SysPar.pdsch{2}.prcdBf = 8; % PM_W24
+            elseif caseNum == 3361 % nCdm=1 for UE1 (nl=2), nCdm=2 for UE2 (nl=4)
+                SysPar.pdsch{2}.numDmrsCdmGrpsNoData = 2;
             elseif ismember(caseNum, [3338,3340])
                 SysPar.pdsch{1}.rbBitmap = rbBitmap1;
                 SysPar.pdsch{2}.rbBitmap = rbBitmap2;
@@ -1914,7 +1923,7 @@ parfor n = 1:NallTest
         
         testPass = 1;
         % bypass precoding TCs for DlTxBF enabled
-        if ismember(caseNum, [3248:3254, 3258:3260, 3264, 3287:3295, 3296, 3339, 3354, 3355]) || SysPar.SimCtrl.enableDlTxBf
+        if ismember(caseNum, [3248:3254, 3258:3260, 3264, 3287:3295, 3296, 3320, 3339, 3354, 3355]) || SysPar.SimCtrl.enableDlTxBf
             bypassCompTest = 1;
         else
             bypassCompTest = 0;

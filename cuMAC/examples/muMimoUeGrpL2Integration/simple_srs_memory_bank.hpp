@@ -18,6 +18,13 @@
 #pragma once
 
 #include "cv_memory_bank_srs_chest.hpp"
+#include "nv_lockfree.hpp"
+#include "gpudevice.hpp"
+#include "common_utils.h"
+#include "srs_ipc_manager.hpp"
+#include <H5Cpp.h>
+#include <cuda_runtime.h>
+#include <cstring>
 #include <iostream>
 #include <queue>
 #include <unordered_map>
@@ -170,199 +177,11 @@ inline bool is_aligned_for_type(void* p) {
         size_t _size;
 };
 
-/**
- * @brief SRS Channel Estimate Buffer for contiguous memory allocation
- * 
- * Stores channel estimates from Sounding Reference Signals (SRS) for a single UE.
- * Each buffer contains the frequency-domain channel response across all gNodeB antennas
- * and UE antenna ports, organized by Physical Resource Block Groups (PRBs).
- */
- typedef struct _CVSrsChestBuff_contMemAlloc
- {
-     public:
-         /**
-          * @brief Construct SRS channel estimate buffer - takes ownership of the GPU buffer
-          * 
-          * @param bdev  GPU device buffer pointer
-          */
-          _CVSrsChestBuff_contMemAlloc(dev_buf * bdev) {
-             buffer.reset(bdev);
-             buffer->clear();
-             is_contiguous_gpu_mem = false;
-         }
-
-         /**
-          * @brief Construct SRS channel estimate buffer - takes ownership of the GPU buffer view
-          * 
-          * @param bdev_view  GPU device buffer view pointer
-          */
-         _CVSrsChestBuff_contMemAlloc(dev_buf_view * bdev_view) {
-            buffer_view.reset(bdev_view);
-            buffer_view->clear();
-            is_contiguous_gpu_mem = true;
-         }
-
-         /**
-          * @brief Initialize buffer with UE and cell information
-          * 
-          * @param _rnti        Radio Network Temporary Identifier (UE ID)
-          * @param _buffer_idx  Buffer index in memory pool
-          * @param _cell_id     Cell ID this buffer belongs to
-          * @param _usage       Usage counter/reference count
-          * @return int         0 on success
-          */
-         int init(uint32_t _rnti, uint32_t _buffer_idx, uint32_t _cell_id, uint32_t _usage) {
-             srs_chest_buff_state = slot_command_api::SRS_CHEST_BUFF_INIT;
-             buffer_idx = _buffer_idx;
-             rnti = _rnti;
-             cell_id = _cell_id;
-             srs_chest_buff_usage = _usage;
-             return 0;
-         }
- 
-         /**
-          * @brief Configure SRS PRB allocation information
-          * 
-          * @param nPrg              Total number of PRB groups
-          * @param nAnt              Number of gNodeB antennas
-          * @param nLayer            Number of UE antenna layers/ports
-          * @param srsPrgSize_in     Size of each PRB group
-          * @param srsStartPrg_in    Starting PRB group index
-          * @param startValidPrg_in  First valid PRB group index
-          * @param nValidPrg_in      Number of valid PRB groups
-          */
-         void configSrsInfo(uint16_t nPrg, uint8_t nAnt, uint8_t nLayer, uint8_t srsPrgSize_in, uint16_t srsStartPrg_in, uint16_t startValidPrg_in, uint16_t nValidPrg_in);
-         
-         /**
-          * @brief Set SFN and slot for this channel estimate
-          * 
-          * @param _sfn   System Frame Number (0-1023)
-          * @param _slot  Slot number within frame
-          */
-         void setSfnSlot(uint16_t _sfn, uint16_t _slot);
-         
-         /**
-          * @brief Get GPU buffer address
-          * 
-          * @return uint8_t*  Pointer to GPU device memory
-          */
-         uint8_t * getAddr() const { return is_contiguous_gpu_mem ? buffer_view->addr() : buffer->addr();};
-         
-         /**
-          * @brief Get SRS PRB allocation information
-          * 
-          * @param[out] pSrsPrgSize_out       PRB group size
-          * @param[out] pSrsStartPrg_out      Starting PRB group index
-          * @param[out] pSrsStartValidPrg_out First valid PRB group index
-          * @param[out] pSrsNValidPrg_out     Number of valid PRB groups
-          */
-         void getSrsPrgInfo(uint8_t* pSrsPrgSize_out, uint16_t* pSrsStartPrg_out, uint16_t* pSrsStartValidPrg_out, uint16_t* pSrsNValidPrg_out);
-         
-         /**
-          * @brief Get RNTI (UE identifier)
-          * 
-          * @return uint32_t  Radio Network Temporary Identifier
-          */
-         uint32_t getRnti() const { return rnti;};
-         
-         /**
-          * @brief Get buffer index in memory pool
-          * 
-          * @return uint32_t  Buffer index
-          */
-         uint32_t getBufferIdx() const { return buffer_idx;};
-         
-         /**
-          * @brief Get cuPHY tensor descriptor for this buffer
-          * 
-          * @return cuphyTensorDescriptor_t  Tensor descriptor handle for cuPHY API
-          */
-         cuphyTensorDescriptor_t getSrsDescr() const { return buffDesc.handle();};
-         
-         /**
-          * @brief Get cell ID
-          * 
-          * @return uint32_t  Cell identifier
-          */
-         uint32_t getCellId() const { return cell_id;};
-         
-         /**
-          * @brief Get System Frame Number
-          * 
-          * @return uint16_t  SFN (0-1023)
-          */
-         uint16_t getSfn(){ return sfn;};
-         
-         /**
-          * @brief Get slot number
-          * 
-          * @return uint16_t  Slot number within frame
-          */
-         uint16_t getSlot(){ return slot;};
-         
-         /**
-          * @brief Set buffer state
-          * 
-          * @param _srs_chest_buff_state  New state (INIT, REQUESTED, READY, NONE)
-          */
-         void setSrsChestBuffState(slot_command_api::srsChestBuffState _srs_chest_buff_state);
-         
-         /**
-          * @brief Get buffer state
-          * 
-          * @return slot_command_api::srsChestBuffState  Current state
-          */
-         slot_command_api::srsChestBuffState getSrsChestBuffState() const {return srs_chest_buff_state;};
-         
-         /**
-          * @brief Get buffer usage counter
-          * 
-          * @return uint32_t  Reference/usage count
-          */
-         uint32_t getSrsChestBuffUsage() const {return srs_chest_buff_usage;};
-         
-         /**
-          * @brief Set buffer usage counter
-          * 
-          * @param _srs_chest_buff_usage  New usage count
-          */
-         void setSrsChestBuffUsage(uint32_t _srs_chest_buff_usage);
- 
-         /**
-          * @brief Clear/reset buffer to invalid state
-          */
-         void clear() {
-             srs_chest_buff_state = slot_command_api::SRS_CHEST_BUFF_NONE;
-             rnti = CV_INVALID_RNTI;
-             cell_id = 0;
-             buffer_idx = CV_INVALID_CESHT_BUF_INDEX;
-             srs_chest_buff_usage = 0;
-             sfn = 0xFFFF;
-             slot = 0xFFFF;
-         }
-         
-     private:
-         std::unique_ptr<dev_buf> buffer;                           ///< GPU device memory buffer for channel estimates
-         std::unique_ptr<dev_buf_view> buffer_view;                 ///< View of the GPU buffer as a contiguous memory region
-         cuphy::tensor_desc buffDesc;                               ///< cuPHY tensor descriptor for this buffer
-         slot_command_api::srsChestBuffState srs_chest_buff_state;  ///< Buffer state (INIT, REQUESTED, READY, NONE)
-         uint32_t rnti;                                             ///< Radio Network Temporary Identifier (UE ID)
-         uint32_t buffer_idx;                                       ///< Buffer index in memory pool
-         uint32_t cell_id;                                          ///< Cell ID this buffer belongs to
-         uint32_t srs_chest_buff_usage;                             ///< Buffer reference/usage counter
-         uint16_t sfn;                                              ///< System Frame Number (0-1023) when channel estimate was captured
-         uint16_t slot;                                             ///< Slot number within frame when channel estimate was captured
-         uint16_t srsStartPrg;                                      ///< Starting PRB group index for SRS allocation
-         uint16_t srsStartValidPrg;                                 ///< First valid PRB group index
-         uint16_t srsNValidPrg;                                     ///< Number of valid PRB groups
-         uint8_t  srsPrgSize;                                       ///< Size of each PRB group
-         bool is_contiguous_gpu_mem{true};                          ///< True if the buffer is contiguous in GPU memory
- } CVSrsChestBuff_contMemAlloc; // alignment size is 8 bytes
 
 /**
  * Simplified SRS Channel Estimate Memory Bank for Testing
- * 
- * Uses the _CVSrsChestBuff_contMemAlloc and CellIdtoSrsBuffIndexMap classes
+ *
+ * Uses the CVSrsChestBuff and CellIdtoSrsBuffIndexMap classes
  * Provides simplified construction without PhyDriverCtx/FhProxy dependencies.
  * This version focuses only on GPU memory allocation testing.
  * 
@@ -388,9 +207,10 @@ public:
      * 
      * @param config Test configuration containing all parameters including CUDA device ID
      * @param cpu_buf_start_addr Shared CPU memory buffer start address
-     * @param gpu_buf_start_addr Shared GPU memory buffer start address
+     * @param gpu_mem_pool       Non-owning shared GPU IPC memory pool; the caller
+     *                           must keep it alive until this memory bank is destroyed
      */
-    SimpleCvSrsChestMemoryBank(const TestConfig& _config, void* cpu_buf_start_addr, void* gpu_buf_start_addr);
+    SimpleCvSrsChestMemoryBank(const TestConfig& _config, void* cpu_buf_start_addr, nv::lock_free_mem_pool<uint8_t>* gpu_mem_pool);
     
     /**
      * Destructor - frees all GPU buffers
@@ -410,7 +230,7 @@ public:
      * @param idx Buffer index
      * @return Pointer to buffer, or nullptr if invalid index
      */
-     CVSrsChestBuff_contMemAlloc* getBuffer(uint32_t idx) const
+     CVSrsChestBuff* getBuffer(uint32_t idx) const
     {
         if (idx < total_num_buffers) {
             return arr_cv_srs_chest_buff[idx];
@@ -429,7 +249,7 @@ public:
      * @param realBuffIdx_out Output pointer to real buffer index (optional)
      * @return int 0 on success, negative on failure
      */
-    int preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, uint32_t usage, CVSrsChestBuff_contMemAlloc** ptr, uint32_t* realBuffIdx_out = nullptr);
+    int preAllocateBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, uint32_t usage, CVSrsChestBuff** ptr, uint32_t* realBuffIdx_out = nullptr);
     
     /**
      * Retrieve an existing buffer
@@ -440,7 +260,7 @@ public:
      * @param ptr Output pointer to retrieved buffer
      * @return int 0 on success, negative on failure
      */
-    int retrieveBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, CVSrsChestBuff_contMemAlloc** ptr);
+    int retrieveBuffer(uint32_t cell_id, uint32_t rnti, uint16_t buffer_idx, CVSrsChestBuff** ptr);
     
     /**
      * Update buffer state
@@ -516,10 +336,210 @@ private:
     uint32_t cuda_device_id {0};                                                   ///< CUDA device ID being used
     uint32_t total_num_buffers;                                                   ///< Total number of allocated buffers
     uint32_t buffer_size;
-    std::array<CVSrsChestBuff_contMemAlloc*, slot_command_api::MAX_SRS_CHEST_BUFFERS> arr_cv_srs_chest_buff; ///< Array of CVSrsChestBuff_contMemAlloc pointers
-    CVSrsChestBuff_contMemAlloc* arr_cv_srs_chest_buff_base_addr{nullptr};          ///< Base address of the CVSrsChestBuff_contMemAlloc array
+    std::array<CVSrsChestBuff*, slot_command_api::MAX_SRS_CHEST_BUFFERS> arr_cv_srs_chest_buff; ///< Array of CVSrsChestBuff pointers
+    CVSrsChestBuff* arr_cv_srs_chest_buff_base_addr{nullptr};          ///< Base address of the CVSrsChestBuff array
     __half2* gpu_buff_base_addr {nullptr};                                         ///< Base address of GPU memory for contiguous memory allocation
     std::queue<uint32_t> memIndexPool;                                            ///< Queue of free buffer indices
     std::unordered_map<uint32_t, CellIdtoSrsBuffIndexMap> srsChEstBuffIndexMap;   ///< Map from cell ID to buffer indices
+
+    nv::lock_free_mem_pool<uint8_t>* gpu_mem_pool{nullptr};
 };
+
+//! Geometry attributes saved by cuphydriver `SrsIpcManager::dump_h5` in the
+//! root group of every `cubb_srs_buffers_<dump_idx>_SFN_<sfn>.<slot>.h5` dump.
+struct CubbTvAttrs {
+    uint32_t gpu_pool_len{0};
+    uint32_t gpu_buf_size{0};
+    uint32_t num_prg{0};
+    uint32_t num_gnb_ant{0};
+    uint32_t num_ue_layer{0};
+    uint32_t cell_num{0};
+};
+
+//! Validate that the geometry attributes saved in a cubb-side
+//! `cubb_srs_buffers_SFN_<sfn>.<slot>.h5` dump match the expected values
+//! derived from the cuMAC TV-generation YAML config. The cubb dump and
+//! cuMAC pools must agree on every attribute exactly; any divergence
+//! means realBuffIdx-based addressing would land at the wrong offset
+//! (silent data corruption rather than a kernel error). On any mismatch
+//! this logs every diverging field and returns -1 so callers can print
+//! a full expected-vs-actual table from `*out_attrs` and exit before any
+//! pool bytes are touched. `out_attrs` is populated whenever the file
+//! was readable, regardless of whether validation passed.
+//!
+//! Attributes checked: gpu_pool_len, gpu_buf_size, num_prg, num_gnb_ant,
+//! num_ue_layer, cell_num.
+inline int validate_cubb_tv_attrs(const std::string& path,
+                                  uint32_t           expected_gpu_pool_len,
+                                  uint32_t           expected_gpu_buf_size,
+                                  uint32_t           expected_num_prg,
+                                  uint32_t           expected_num_gnb_ant,
+                                  uint32_t           expected_num_ue_layer,
+                                  uint32_t           expected_cell_num,
+                                  CubbTvAttrs*       out_attrs = nullptr)
+{
+    CubbTvAttrs attrs{};
+    try {
+        H5::H5File file(path, H5F_ACC_RDONLY);
+
+        auto read_u32 = [&](const char* name, uint32_t& out) {
+            file.openAttribute(name).read(H5::PredType::NATIVE_UINT32, &out);
+        };
+
+        read_u32("gpu_pool_len",  attrs.gpu_pool_len);
+        read_u32("gpu_buf_size",  attrs.gpu_buf_size);
+        read_u32("num_prg",       attrs.num_prg);
+        read_u32("num_gnb_ant",   attrs.num_gnb_ant);
+        read_u32("num_ue_layer",  attrs.num_ue_layer);
+        read_u32("cell_num",      attrs.cell_num);
+        if (out_attrs) *out_attrs = attrs;
+
+        bool ok = true;
+        auto check = [&](const char* name, uint32_t got, uint32_t want) {
+            if (got != want) {
+                NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT,
+                       "validate_cubb_tv_attrs: %s mismatch in %s "
+                       "(cubb=%u, cuMAC YAML=%u)",
+                       name, path.c_str(), got, want);
+                ok = false;
+            }
+        };
+        check("gpu_pool_len",  attrs.gpu_pool_len,  expected_gpu_pool_len);
+        check("gpu_buf_size",  attrs.gpu_buf_size,  expected_gpu_buf_size);
+        check("num_prg",       attrs.num_prg,       expected_num_prg);
+        check("num_gnb_ant",   attrs.num_gnb_ant,   expected_num_gnb_ant);
+        check("num_ue_layer",  attrs.num_ue_layer,  expected_num_ue_layer);
+        check("cell_num",      attrs.cell_num,      expected_cell_num);
+        if (!ok) {
+            return -1;
+        }
+
+        NVLOGC(MU_TEST_TAG,
+               "validate_cubb_tv_attrs: %s matches YAML "
+               "(gpu_pool_len=%u, gpu_buf_size=%u, num_prg=%u, "
+               "num_gnb_ant=%u, num_ue_layer=%u, cell_num=%u)",
+               path.c_str(), attrs.gpu_pool_len, attrs.gpu_buf_size,
+               attrs.num_prg, attrs.num_gnb_ant, attrs.num_ue_layer, attrs.cell_num);
+        return 0;
+    } catch (const H5::Exception& e) {
+        NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT,
+               "validate_cubb_tv_attrs: H5 exception reading %s: %s",
+               path.c_str(), e.getCDetailMsg());
+        if (out_attrs) *out_attrs = attrs;
+        return -1;
+    }
+}
+
+//! Overwrite the three shared SRS pools with the contents of one cuphydriver
+//! `cubb_srs_buffers_<dump_idx>_SFN_<sfn>.<slot>.h5` dump file (produced by
+//! `SrsIpcManager::dump_h5` when DUMP_SRS_SLOT_NUM>0).
+//!
+//! Per dataset:
+//!   - `ipc_gpu_pool`   -> H2D copy into `gpu_pool->get_buf_addr(0)`
+//!   - `chest_buf_pool` -> memcpy into `chest_pool->get_buf_addr(0)`
+//!   - `srs_info_pool`  -> memcpy into `msg_pool->get_buf_addr(0)`
+//!
+//! Sizes must match the L1-side pool configuration exactly; on mismatch the
+//! function logs an error and returns -1 without touching any pool. Returns 0
+//! on success.
+inline int load_cubb_pools_from_h5(
+    const std::string& path,
+    nv::lock_free_mem_pool<uint8_t>* gpu_pool,
+    nv::lock_free_mem_pool<CVSrsChestBuff>* chest_pool,
+    nv::lock_free_mem_pool<SrsInfoUpdate>* msg_pool)
+{
+    if (gpu_pool == nullptr || chest_pool == nullptr || msg_pool == nullptr) {
+        NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT,
+               "load_cubb_pools_from_h5: null pool pointer (path=%s)", path.c_str());
+        return -1;
+    }
+
+    const size_t gpu_pool_bytes   = static_cast<size_t>(gpu_pool->get_pool_len())
+                                    * static_cast<size_t>(gpu_pool->get_buf_size());
+    const size_t chest_pool_bytes = static_cast<size_t>(chest_pool->get_pool_len())
+                                    * sizeof(CVSrsChestBuff);
+    const size_t msg_pool_bytes   = static_cast<size_t>(msg_pool->get_pool_len())
+                                    * sizeof(SrsInfoUpdate);
+
+    void* gpu_base   = gpu_pool->get_buf_addr(0);
+    void* chest_base = chest_pool->get_buf_addr(0);
+    void* msg_base   = msg_pool->get_buf_addr(0);
+    if (gpu_base == nullptr || chest_base == nullptr || msg_base == nullptr) {
+        NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT,
+               "load_cubb_pools_from_h5: null pool base addr (gpu=%p chest=%p msg=%p)",
+               gpu_base, chest_base, msg_base);
+        return -1;
+    }
+
+    try {
+        H5::H5File file(path, H5F_ACC_RDONLY);
+
+        auto check_dataset_size = [&](const char* ds_name, size_t expected) -> int {
+            H5::DataSet ds = file.openDataSet(ds_name);
+            hsize_t dim = 0;
+            ds.getSpace().getSimpleExtentDims(&dim, nullptr);
+            if (static_cast<size_t>(dim) != expected) {
+                NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT,
+                       "load_cubb_pools_from_h5: %s size mismatch in %s "
+                       "(file=%llu pool=%zu)",
+                       ds_name, path.c_str(),
+                       static_cast<unsigned long long>(dim), expected);
+                return -1;
+            }
+            return 0;
+        };
+
+        if (check_dataset_size("ipc_gpu_pool",   gpu_pool_bytes)   != 0) return -1;
+        if (check_dataset_size("chest_buf_pool", chest_pool_bytes) != 0) return -1;
+        if (check_dataset_size("srs_info_pool",  msg_pool_bytes)   != 0) return -1;
+
+        if (gpu_pool_bytes > 0) {
+            std::vector<uint8_t> host_buf(gpu_pool_bytes);
+            file.openDataSet("ipc_gpu_pool").read(host_buf.data(), H5::PredType::NATIVE_UINT8);
+            cudaError_t cerr = cudaMemcpy(gpu_base, host_buf.data(), gpu_pool_bytes,
+                                          cudaMemcpyHostToDevice);
+            if (cerr != cudaSuccess) {
+                NVLOGE(MU_TEST_TAG, AERIAL_CUDA_API_EVENT,
+                       "load_cubb_pools_from_h5: cudaMemcpy H2D failed (%zu B): %s",
+                       gpu_pool_bytes, cudaGetErrorString(cerr));
+                return -1;
+            }
+        }
+
+        if (chest_pool_bytes > 0) {
+            // Read into a temp byte buffer; do NOT blast raw bytes onto live pool
+            // objects because each CVSrsChestBuff embeds an
+            // ipc_dev_buf unique_ptr and a cuphy::tensor_desc that hold live
+            // IPC-backed heap pointers for this process.  Overwriting those with
+            // cuBB-capture-process pointers corrupts L1's tensor-descriptor state.
+            // Copy only the plain scalar data fields via copyDataFrom().
+            std::vector<uint8_t> chest_tmp(chest_pool_bytes);
+            file.openDataSet("chest_buf_pool").read(chest_tmp.data(), H5::PredType::NATIVE_UINT8);
+
+            const uint32_t n_entries = chest_pool->get_pool_len();
+            for (uint32_t i = 0; i < n_entries; ++i) {
+                CVSrsChestBuff* live = chest_pool->get_buf_addr(i);
+                const CVSrsChestBuff* src =
+                    reinterpret_cast<const CVSrsChestBuff*>(
+                        chest_tmp.data() + i * sizeof(CVSrsChestBuff));
+                live->copyDataFrom(*src);
+            }
+        }
+
+        if (msg_pool_bytes > 0) {
+            file.openDataSet("srs_info_pool")
+                .read(msg_base, H5::PredType::NATIVE_UINT8);
+        }
+    } catch (const H5::Exception& e) {
+        NVLOGE(MU_TEST_TAG, AERIAL_NVIPC_API_EVENT,
+               "load_cubb_pools_from_h5: H5 exception reading %s: %s",
+               path.c_str(), e.getCDetailMsg());
+        return -1;
+    }
+
+    NVLOGC(MU_TEST_TAG,
+           "load_cubb_pools_from_h5: loaded %s (gpu=%zu B, chest=%zu B, info=%zu B)",
+           path.c_str(), gpu_pool_bytes, chest_pool_bytes, msg_pool_bytes);
+    return 0;
+}
 

@@ -208,6 +208,7 @@ inline cuphyStatus_t tryCallableAndCatch(callable&& fn, cuphyStatus_t default_er
     }
     catch (...)
     {
+        NVLOGE_FMT(NVLOG_TAG_BASE_CUPHY, AERIAL_CUPHY_EVENT, "OTHER EXCEPTION");
         ret_status = CUPHY_STATUS_INTERNAL_ERROR;
     }
     return ((default_error_status == CUPHY_N_STATUS_CONFIGS) ? ret_status : default_error_status);
@@ -603,6 +604,13 @@ public:
         return m_SMcount;
     }
 
+    //----------------------------------------------------------------------
+    //ctxCreated()
+    [[nodiscard]] bool ctxCreated() const
+    {
+        return m_ctxCreated;
+    }
+
 private:
     bool         m_ctxCreated = false;
     bool         m_ctxDeleted = false;
@@ -619,26 +627,28 @@ private:
 ////////////////////////////////////////////////////////////////////////////
 // cuphy::type_traits
 template <cuphyDataType_t Ttype> struct type_traits;
-template <> struct type_traits<CUPHY_VOID>  { typedef void            type; };
-template <> struct type_traits<CUPHY_BIT>   { typedef uint32_t        type; };
-template <> struct type_traits<CUPHY_R_8I>  { typedef signed char     type; };
-template <> struct type_traits<CUPHY_C_8I>  { typedef char2           type; };
-template <> struct type_traits<CUPHY_R_8U>  { typedef unsigned char   type; };
-template <> struct type_traits<CUPHY_C_8U>  { typedef uchar2          type; };
-template <> struct type_traits<CUPHY_R_16I> { typedef short           type; };
-template <> struct type_traits<CUPHY_C_16I> { typedef short2          type; };
-template <> struct type_traits<CUPHY_R_16U> { typedef unsigned short  type; };
-template <> struct type_traits<CUPHY_C_16U> { typedef ushort2         type; };
-template <> struct type_traits<CUPHY_R_32I> { typedef int             type; };
-template <> struct type_traits<CUPHY_C_32I> { typedef int2            type; };
-template <> struct type_traits<CUPHY_R_32U> { typedef unsigned int    type; };
-template <> struct type_traits<CUPHY_C_32U> { typedef uint2           type; };
-template <> struct type_traits<CUPHY_R_16F> { typedef __half          type; };
-template <> struct type_traits<CUPHY_C_16F> { typedef __half2         type; };
-template <> struct type_traits<CUPHY_R_32F> { typedef float           type; };
-template <> struct type_traits<CUPHY_C_32F> { typedef cuComplex       type; };
-template <> struct type_traits<CUPHY_R_64F> { typedef double          type; };
-template <> struct type_traits<CUPHY_C_64F> { typedef cuDoubleComplex type; };
+template <> struct type_traits<CUPHY_VOID>      { typedef void            type; };
+template <> struct type_traits<CUPHY_BIT>       { typedef uint32_t        type; };
+template <> struct type_traits<CUPHY_R_8I>      { typedef signed char     type; };
+template <> struct type_traits<CUPHY_C_8I>      { typedef char2           type; };
+template <> struct type_traits<CUPHY_R_8U>      { typedef unsigned char   type; };
+template <> struct type_traits<CUPHY_C_8U>      { typedef uchar2          type; };
+template <> struct type_traits<CUPHY_R_16I>     { typedef short           type; };
+template <> struct type_traits<CUPHY_C_16I>     { typedef short2          type; };
+template <> struct type_traits<CUPHY_R_16U>     { typedef unsigned short  type; };
+template <> struct type_traits<CUPHY_C_16U>     { typedef ushort2         type; };
+template <> struct type_traits<CUPHY_R_32I>     { typedef int             type; };
+template <> struct type_traits<CUPHY_C_32I>     { typedef int2            type; };
+template <> struct type_traits<CUPHY_R_32U>     { typedef unsigned int    type; };
+template <> struct type_traits<CUPHY_C_32U>     { typedef uint2           type; };
+template <> struct type_traits<CUPHY_R_16F>     { typedef __half          type; };
+template <> struct type_traits<CUPHY_C_16F>     { typedef __half2         type; };
+template <> struct type_traits<CUPHY_R_32F>     { typedef float           type; };
+template <> struct type_traits<CUPHY_C_32F>     { typedef cuComplex       type; };
+template <> struct type_traits<CUPHY_R_64F>     { typedef double          type; };
+template <> struct type_traits<CUPHY_C_64F>     { typedef cuDoubleComplex type; };
+template <> struct type_traits<CUPHY_R_8F_E4M3> { typedef __nv_fp8_e4m3   type; };
+template <> struct type_traits<CUPHY_R_8F_E5M2> { typedef __nv_fp8_e5m2   type; };
 // clang-format on
 
 // clang-format off
@@ -663,6 +673,8 @@ template <> struct type_to_cuphy_type<float>           { static constexpr cuphyD
 template <> struct type_to_cuphy_type<cuComplex>       { static constexpr cuphyDataType_t value = CUPHY_C_32F; };
 template <> struct type_to_cuphy_type<double>          { static constexpr cuphyDataType_t value = CUPHY_R_64F; };
 template <> struct type_to_cuphy_type<cuDoubleComplex> { static constexpr cuphyDataType_t value = CUPHY_C_64F; };
+template <> struct type_to_cuphy_type<__nv_fp8_e4m3>   { static constexpr cuphyDataType_t value = CUPHY_R_8F_E4M3; };
+template <> struct type_to_cuphy_type<__nv_fp8_e5m2>   { static constexpr cuphyDataType_t value = CUPHY_R_8F_E5M2; };
 // clang-format on
 
 ////////////////////////////////////////////////////////////////////////
@@ -677,27 +689,29 @@ int get_element_size(cuphyDataType_t t)
     int sz = 0;
     switch(t)
     {
-    default:                                                        break;
-    case CUPHY_VOID:                                                break;
-    case CUPHY_BIT:    sz = sizeof(type_traits<CUPHY_BIT>::type);   break;
-    case CUPHY_R_8I:   sz = sizeof(type_traits<CUPHY_R_8I>::type);  break;
-    case CUPHY_C_8I:   sz = sizeof(type_traits<CUPHY_C_8I>::type);  break;
-    case CUPHY_R_8U:   sz = sizeof(type_traits<CUPHY_R_8U>::type);  break;
-    case CUPHY_C_8U:   sz = sizeof(type_traits<CUPHY_C_8U>::type);  break;
-    case CUPHY_R_16I:  sz = sizeof(type_traits<CUPHY_R_16I>::type); break;
-    case CUPHY_C_16I:  sz = sizeof(type_traits<CUPHY_C_16I>::type); break;
-    case CUPHY_R_16U:  sz = sizeof(type_traits<CUPHY_R_16U>::type); break;
-    case CUPHY_C_16U:  sz = sizeof(type_traits<CUPHY_C_16U>::type); break;
-    case CUPHY_R_32I:  sz = sizeof(type_traits<CUPHY_R_32I>::type); break;
-    case CUPHY_C_32I:  sz = sizeof(type_traits<CUPHY_C_32I>::type); break;
-    case CUPHY_R_32U:  sz = sizeof(type_traits<CUPHY_R_32U>::type); break;
-    case CUPHY_C_32U:  sz = sizeof(type_traits<CUPHY_C_32U>::type); break;
-    case CUPHY_R_16F:  sz = sizeof(type_traits<CUPHY_R_16F>::type); break;
-    case CUPHY_C_16F:  sz = sizeof(type_traits<CUPHY_C_16F>::type); break;
-    case CUPHY_R_32F:  sz = sizeof(type_traits<CUPHY_R_32F>::type); break;
-    case CUPHY_C_32F:  sz = sizeof(type_traits<CUPHY_C_32F>::type); break;
-    case CUPHY_R_64F:  sz = sizeof(type_traits<CUPHY_R_64F>::type); break;
-    case CUPHY_C_64F:  sz = sizeof(type_traits<CUPHY_C_64F>::type); break;
+    default:                                                           break;
+    case CUPHY_VOID:                                                   break;
+    case CUPHY_BIT:       sz = sizeof(type_traits<CUPHY_BIT>::type);   break;
+    case CUPHY_R_8I:      sz = sizeof(type_traits<CUPHY_R_8I>::type);  break;
+    case CUPHY_C_8I:      sz = sizeof(type_traits<CUPHY_C_8I>::type);  break;
+    case CUPHY_R_8U:      sz = sizeof(type_traits<CUPHY_R_8U>::type);  break;
+    case CUPHY_C_8U:      sz = sizeof(type_traits<CUPHY_C_8U>::type);  break;
+    case CUPHY_R_16I:     sz = sizeof(type_traits<CUPHY_R_16I>::type); break;
+    case CUPHY_C_16I:     sz = sizeof(type_traits<CUPHY_C_16I>::type); break;
+    case CUPHY_R_16U:     sz = sizeof(type_traits<CUPHY_R_16U>::type); break;
+    case CUPHY_C_16U:     sz = sizeof(type_traits<CUPHY_C_16U>::type); break;
+    case CUPHY_R_32I:     sz = sizeof(type_traits<CUPHY_R_32I>::type); break;
+    case CUPHY_C_32I:     sz = sizeof(type_traits<CUPHY_C_32I>::type); break;
+    case CUPHY_R_32U:     sz = sizeof(type_traits<CUPHY_R_32U>::type); break;
+    case CUPHY_C_32U:     sz = sizeof(type_traits<CUPHY_C_32U>::type); break;
+    case CUPHY_R_16F:     sz = sizeof(type_traits<CUPHY_R_16F>::type); break;
+    case CUPHY_C_16F:     sz = sizeof(type_traits<CUPHY_C_16F>::type); break;
+    case CUPHY_R_32F:     sz = sizeof(type_traits<CUPHY_R_32F>::type); break;
+    case CUPHY_C_32F:     sz = sizeof(type_traits<CUPHY_C_32F>::type); break;
+    case CUPHY_R_64F:     sz = sizeof(type_traits<CUPHY_R_64F>::type); break;
+    case CUPHY_C_64F:     sz = sizeof(type_traits<CUPHY_C_64F>::type); break;
+    case CUPHY_R_8F_E4M3: sz = sizeof(type_traits<CUPHY_R_8F_E4M3>::type); break;
+    case CUPHY_R_8F_E5M2: sz = sizeof(type_traits<CUPHY_R_8F_E5M2>::type); break;
     }
     return sz;
 }
@@ -718,24 +732,26 @@ public:
         type = type_to_cuphy_type<T>::value;
         set(t);
     }
-    void set(const signed char&     sc)  { type = CUPHY_R_8I;  value.r8i  = sc;  }
-    void set(const char2&           c2)  { type = CUPHY_C_8I;  value.c8i  = c2;  }
-    void set(const unsigned char&   uc)  { type = CUPHY_R_8U;  value.r8u  = uc;  }
-    void set(const uchar2&          uc2) { type = CUPHY_C_8U;  value.c8u  = uc2; }
-    void set(const short&           s)   { type = CUPHY_R_16I; value.r16i = s;   }
-    void set(const short2&          s2)  { type = CUPHY_C_16I; value.c16i = s2;  }
-    void set(const unsigned short&  us)  { type = CUPHY_R_16U; value.r16u = us;  }
-    void set(const ushort2&         us2) { type = CUPHY_C_16U; value.c16u = us2; }
-    void set(const int&             i)   { type = CUPHY_R_32I; value.r32i = i;   }
-    void set(const int2&            i2)  { type = CUPHY_C_32I; value.c32i = i2;  }
-    void set(const unsigned int&    u)   { type = CUPHY_R_32U; value.r32u = u;   }
-    void set(const uint2&           u2)  { type = CUPHY_C_32U; value.c32u = u2;  }
-    void set(const __half&          h)   { type = CUPHY_R_16F; memcpy(&value.r16f, &h, sizeof(__half));   }
-    void set(const __half2&         h2)  { type = CUPHY_C_16F; memcpy(&value.c16f, &h2, sizeof(__half2)); }
-    void set(const float&           f)   { type = CUPHY_R_32F; value.r32f = f;   }
-    void set(const cuComplex&       c)   { type = CUPHY_C_32F; value.c32f = c;   }
-    void set(const double&          d)   { type = CUPHY_R_64F; value.r64f = d;   }
-    void set(const cuDoubleComplex& dc)  { type = CUPHY_C_64F; value.c64f = dc;  }
+    void set(const signed char&     sc)  { type = CUPHY_R_8I;      value.r8i  = sc;  }
+    void set(const char2&           c2)  { type = CUPHY_C_8I;      value.c8i  = c2;  }
+    void set(const unsigned char&   uc)  { type = CUPHY_R_8U;      value.r8u  = uc;  }
+    void set(const uchar2&          uc2) { type = CUPHY_C_8U;      value.c8u  = uc2; }
+    void set(const short&           s)   { type = CUPHY_R_16I;     value.r16i = s;   }
+    void set(const short2&          s2)  { type = CUPHY_C_16I;     value.c16i = s2;  }
+    void set(const unsigned short&  us)  { type = CUPHY_R_16U;     value.r16u = us;  }
+    void set(const ushort2&         us2) { type = CUPHY_C_16U;     value.c16u = us2; }
+    void set(const int&             i)   { type = CUPHY_R_32I;     value.r32i = i;   }
+    void set(const int2&            i2)  { type = CUPHY_C_32I;     value.c32i = i2;  }
+    void set(const unsigned int&    u)   { type = CUPHY_R_32U;     value.r32u = u;   }
+    void set(const uint2&           u2)  { type = CUPHY_C_32U;     value.c32u = u2;  }
+    void set(const __half&          h)   { type = CUPHY_R_16F;     memcpy(&value.r16f, &h, sizeof(__half));   }
+    void set(const __half2&         h2)  { type = CUPHY_C_16F;     memcpy(&value.c16f, &h2, sizeof(__half2)); }
+    void set(const float&           f)   { type = CUPHY_R_32F;     value.r32f = f;   }
+    void set(const cuComplex&       c)   { type = CUPHY_C_32F;     value.c32f = c;   }
+    void set(const double&          d)   { type = CUPHY_R_64F;     value.r64f = d;   }
+    void set(const cuDoubleComplex& dc)  { type = CUPHY_C_64F;     value.c64f = dc;  }
+    void set(const __nv_fp8_e4m3&   d)   { type = CUPHY_R_8F_E4M3; value.r8f_e4m3 = d; }
+    void set(const __nv_fp8_e5m2&   d)   { type = CUPHY_R_8F_E5M2; value.r8f_e5m2 = d; }
     template <typename T> T& as();
 };
 // clang-format on
@@ -759,6 +775,8 @@ template <> inline float&           variant::as<float>()           { if(type != 
 template <> inline cuComplex&       variant::as<cuComplex>()       { if(type != CUPHY_C_32F) throw std::runtime_error("variant type mismatch"); return value.c32f; }
 template <> inline double&          variant::as<double>()          { if(type != CUPHY_R_64F) throw std::runtime_error("variant type mismatch"); return value.r64f; }
 template <> inline cuDoubleComplex& variant::as<cuDoubleComplex>() { if(type != CUPHY_C_64F) throw std::runtime_error("variant type mismatch"); return value.c64f; }
+template <> inline __nv_fp8_e4m3&   variant::as<__nv_fp8_e4m3>()   { if(type != CUPHY_R_8F_E4M3) throw std::runtime_error("variant type mismatch"); return value.r8f_e4m3; }
+template <> inline __nv_fp8_e5m2&   variant::as<__nv_fp8_e5m2>()   { if(type != CUPHY_R_8F_E5M2) throw std::runtime_error("variant type mismatch"); return value.r8f_e5m2; }
 // clang-format on
 
 enum class tensor_flags
@@ -2568,6 +2586,19 @@ public:
     }
 
     stream(stream&& s) noexcept : stream_(std::exchange(s.stream_, nullptr)) {}
+
+    // Create a stream associated with a green context (driver API).
+#if CUDA_VERSION >= 12040
+    explicit stream(CUgreenCtx greenCtx, unsigned int flags = CU_STREAM_NON_BLOCKING, int priority = 0)
+    {
+        CUresult res = cuGreenCtxStreamCreate(&stream_, greenCtx, flags, priority);
+        if(CUDA_SUCCESS != res)
+        {
+            throw cuda_driver_exception(res, "cuGreenCtxStreamCreate");
+        }
+    }
+#endif
+
     ~stream() { if(stream_) CUDA_CHECK_NO_THROW(cudaStreamDestroy(stream_)); }
 
     void synchronize() const
@@ -3315,6 +3346,48 @@ launch_kernel(const CUDA_KERNEL_NODE_PARAMS& kernelNodeParams, cudaStream_t strm
                                 kernelNodeParams.kernelParams,
                                 kernelNodeParams.extra);
 
+    return e;
+}
+
+CUresult inline
+launch_kernel_ex(const CUDA_KERNEL_NODE_PARAMS& kernelNodeParams, cudaStream_t strm, bool need_non_portable_shmem)
+{
+    CUlaunchConfig launch_config{};
+    launch_config.hStream   = strm;
+    launch_config.gridDimX  = kernelNodeParams.gridDimX;
+    launch_config.gridDimY  = kernelNodeParams.gridDimY;
+    launch_config.gridDimZ  = kernelNodeParams.gridDimZ;
+    launch_config.blockDimX = kernelNodeParams.blockDimX;
+    launch_config.blockDimY = kernelNodeParams.blockDimY;
+    launch_config.blockDimZ = kernelNodeParams.blockDimZ;
+    launch_config.sharedMemBytes = kernelNodeParams.sharedMemBytes;
+
+#if CUDA_VERSION >= 13020
+    CUlaunchAttributeValue attr_value{};
+    CUlaunchAttribute launch_attribute{};
+#endif
+
+    if(need_non_portable_shmem && (CUDA_VERSION >= 13020))
+    {
+#if CUDA_VERSION >= 13020
+        attr_value.sharedMemoryMode = CU_SHARED_MEMORY_MODE_ALLOW_NON_PORTABLE;
+        launch_attribute.id         = CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE;
+        launch_attribute.value      = attr_value;
+
+        launch_config.numAttrs      = 1;
+        launch_config.attrs         = &launch_attribute;
+#endif
+    }
+    else
+    {
+        launch_config.numAttrs  = 0;
+        launch_config.attrs     = nullptr;
+    }
+
+    CUresult e = cuLaunchKernelEx(&launch_config,
+                                  kernelNodeParams.func,
+                                  kernelNodeParams.kernelParams,
+                                  kernelNodeParams.extra);
     return e;
 }
 

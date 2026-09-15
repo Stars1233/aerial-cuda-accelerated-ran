@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include "tensor_desc.hpp"
 #include "cuphy_kernel_util.cuh"
 #include "soft_demapper_tables.cuh"
+#include "type_convert.hpp"
 
 namespace soft_demapper
 {
@@ -63,6 +64,17 @@ template <> union LLR_group<__half, 1>
     __half f16[1];
     __device__ void write(void* dst) { *((__half*)(dst)) = f16[0]; }
 };
+template <> union LLR_group<__nv_fp8_e4m3, 1>
+{
+    __nv_fp8_e4m3 fp8_e4m3[1];
+    __device__ void write(void* dst) { *((__nv_fp8_e4m3*)(dst)) = fp8_e4m3[0]; }
+};
+template <> union LLR_group<__nv_fp8_e5m2, 1>
+{
+    __nv_fp8_e5m2 fp8_e5m2[1];
+    __device__ void write(void* dst) { *((__nv_fp8_e5m2*)(dst)) = fp8_e5m2[0]; }
+};
+
 template <> union LLR_group<float, 2>
 {
     float f[2];
@@ -75,6 +87,19 @@ template <> union LLR_group<__half, 2>
     unsigned int ui32;
     __device__ void write(void* dst) { *((unsigned int*)(dst)) = ui32; }
 };
+template <> union LLR_group<__nv_fp8_e4m3, 2>
+{
+    __nv_fp8x2_e4m3      fp8x2_e4m3[1];
+    __nv_fp8x2_storage_t storage;
+    __device__ void write(void* dst) { *((__nv_fp8x2_storage_t*)(dst)) = storage; }
+};
+template <> union LLR_group<__nv_fp8_e5m2, 2>
+{
+    __nv_fp8x2_e5m2      fp8x2_e5m2[1];
+    __nv_fp8x2_storage_t storage;
+    __device__ void write(void* dst) { *((__nv_fp8x2_storage_t*)(dst)) = storage; }
+};
+
 template <> union LLR_group<float, 4>
 {
     float f[4];
@@ -87,6 +112,21 @@ template <> union LLR_group<__half, 4>
     uint2   ui32_2;
     __device__ void write(void* dst) { *((uint2*)(dst)) = ui32_2; }
 };
+template <> union LLR_group<__nv_fp8_e4m3, 4>
+{
+    __nv_fp8x2_e4m3      fp8x2_e4m3[2];
+    __nv_fp8x4_e4m3      fp8x4_e4m3[1];
+    __nv_fp8x4_storage_t storage;
+    __device__ void write(void* dst) { *((__nv_fp8x4_storage_t*)(dst)) = storage; }
+};
+template <> union LLR_group<__nv_fp8_e5m2, 4>
+{
+    __nv_fp8x2_e5m2      fp8x2_e5m2[2];
+    __nv_fp8x4_e5m2      fp8x4_e5m2[1];
+    __nv_fp8x4_storage_t storage;
+    __device__ void write(void* dst) { *((__nv_fp8x4_storage_t*)(dst)) = storage; }
+};
+
 template <> union LLR_group<float, 6>
 {
     float        f[6];
@@ -109,6 +149,29 @@ template <> union LLR_group<__half, 6>
         for(int i = 0; i < 3; ++i) { uidst[i] = ui32[i]; }
     }
 };
+template <> union LLR_group<__nv_fp8_e4m3, 6>
+{
+    __nv_fp8x2_e4m3      fp8x2_e4m3[3];
+    __nv_fp8x2_storage_t storage[3];
+    __device__ void write(void* dst)
+    {
+        __nv_fp8x2_storage_t* sdst = (__nv_fp8x2_storage_t*)dst;
+        #pragma unroll
+        for(int i = 0; i < 3; ++i) { sdst[i] = storage[i]; }
+    }
+};
+template <> union LLR_group<__nv_fp8_e5m2, 6>
+{
+    __nv_fp8x2_e5m2      fp8x2_e5m2[3];
+    __nv_fp8x2_storage_t storage[3];
+    __device__ void write(void* dst)
+    {
+        __nv_fp8x2_storage_t* sdst = (__nv_fp8x2_storage_t*)dst;
+        #pragma unroll
+        for(int i = 0; i < 3; ++i) { sdst[i] = storage[i]; }
+    }
+};
+
 template <> union LLR_group<float, 8>
 {
     float        f[8];
@@ -191,6 +254,96 @@ template <> union LLR_group<__half, 8>
         {
             __half* hdst = static_cast<__half*>(dst);
             hdst[0] = f16[0];
+        }
+    }
+};
+template <> union LLR_group<__nv_fp8_e4m3, 8>
+{
+    __nv_fp8_e4m3        fp8_e4m3[8];
+    __nv_fp8x2_e4m3      fp8x2_e4m3[4];
+    __nv_fp8x2_storage_t fp8x2_storage[4];
+    __nv_fp8x4_e4m3      fp8x4_e4m3[2];
+    __nv_fp8x4_storage_t fp8x4_storage[2];
+    uint2                ui32_2;
+    __device__ void write(void* dst) { *((uint2*)(dst)) = ui32_2; }
+    // Debugging float conversion
+    __device__ float operator[](int i)
+    {
+        __half h = static_cast<__half>(fp8_e4m3[i]);
+        return static_cast<float>(h);
+    }
+    __device__ void write(void* dst, int count)
+    {
+        if(8 == count)
+        {
+            uint2* ui2dst = static_cast<uint2*>(dst);
+            ui2dst[0] = ui32_2;
+        }
+        else if(6 == count)
+        {
+            __nv_fp8x2_storage_t* sdst = static_cast<__nv_fp8x2_storage_t*>(dst);
+            #pragma unroll
+            for(int i = 0; i < 3; ++i) { sdst[i] = fp8x2_storage[i]; }
+        }
+        else if(4 == count)
+        {
+            __nv_fp8x4_storage_t* sdst = static_cast<__nv_fp8x4_storage_t*>(dst);
+            sdst[0] = fp8x4_storage[0];
+        }
+        else if(2 == count)
+        {
+            __nv_fp8x2_storage_t* sdst = static_cast<__nv_fp8x2_storage_t*>(dst);
+            sdst[0] = fp8x2_storage[0];
+        }
+        else if(1 == count)
+        {
+            __nv_fp8_e4m3* sdst = static_cast<__nv_fp8_e4m3*>(dst);
+            sdst[0] = fp8_e4m3[0];
+        }
+    }
+};
+template <> union LLR_group<__nv_fp8_e5m2, 8>
+{
+    __nv_fp8_e5m2        fp8_e5m2[8];
+    __nv_fp8x2_e5m2      fp8x2_e5m2[4];
+    __nv_fp8x2_storage_t fp8x2_storage[4];
+    __nv_fp8x4_e5m2      fp8x4_e5m2[2];
+    __nv_fp8x4_storage_t fp8x4_storage[2];
+    uint2                ui32_2;
+    __device__ void write(void* dst) { *((uint2*)(dst)) = ui32_2; }
+    // Debugging float conversion
+    __device__ float operator[](int i)
+    {
+        __half h = static_cast<__half>(fp8_e5m2[i]);
+        return static_cast<float>(h);
+    }
+    __device__ void write(void* dst, int count)
+    {
+        if(8 == count)
+        {
+            uint2* ui2dst = static_cast<uint2*>(dst);
+            ui2dst[0] = ui32_2;
+        }
+        else if(6 == count)
+        {
+            __nv_fp8x2_storage_t* sdst = static_cast<__nv_fp8x2_storage_t*>(dst);
+            #pragma unroll
+            for(int i = 0; i < 3; ++i) { sdst[i] = fp8x2_storage[i]; }
+        }
+        else if(4 == count)
+        {
+            __nv_fp8x4_storage_t* sdst = static_cast<__nv_fp8x4_storage_t*>(dst);
+            sdst[0] = fp8x4_storage[0];
+        }
+        else if(2 == count)
+        {
+            __nv_fp8x2_storage_t* sdst = static_cast<__nv_fp8x2_storage_t*>(dst);
+            sdst[0] = fp8x2_storage[0];
+        }
+        else if(1 == count)
+        {
+            __nv_fp8_e5m2* sdst = static_cast<__nv_fp8_e5m2*>(dst);
+            sdst[0] = fp8_e5m2[0];
         }
     }
 };
@@ -350,55 +503,48 @@ float symbol_to_tex_coords(float sym_component, float m, float b)
     return (m * sym_component) + b;
 }
 
-////////////////////////////////////////////////////////////////////////
-// noise_type_map
-// Type map for the noise variance, used to force callers of the soft
-// demapper to duplicate the noise variance to both halves of a __half2
-// when working with half precision LLRs.
-template <typename T> struct noise_type_map;
-template <> struct noise_type_map<float>
+template <typename T> struct demapper_llr_traits_t;
+
+template <>
+struct demapper_llr_traits_t<float>
 {
-    typedef float   type;
-    static __device__ float create(float f)  { return f; }
-    static __device__ float create(__half h) { return __half2float(h); }
-    static __device__ float scale(float f, float s)  { return f * s; }
-    static __device__ float scale(__half h, float s) { return (s * __half2float(h)); }
+    using tex_scalar_t = float;
+    using tex_result_t = cuphy_i::tex_result_v4<tex_scalar_t>;
 };
-template <> struct noise_type_map<__half>
+template <>
+struct demapper_llr_traits_t<__half>
 {
-    typedef __half2 type;
-    static __device__ __half2 create(float f)  { return __float2half2_rn(f); }
-    static __device__ __half2 create(__half h) { return __half2half2(h); }
-    static __device__ __half2 scale(float f, float s)  { return __float2half2_rn(f * s); }
-    static __device__ __half2 scale(__half h, float s) { return __hmul2(__half2half2(h), __float2half2_rn(s)); }
+    using tex_scalar_t = __half;
+    using tex_result_t = cuphy_i::tex_result_v4<tex_scalar_t>;
+};
+template <>
+struct demapper_llr_traits_t<__nv_fp8_e4m3>
+{
+    using tex_scalar_t = __half;
+    using tex_result_t = cuphy_i::tex_result_v4<tex_scalar_t>;
+};
+template <>
+struct demapper_llr_traits_t<__nv_fp8_e5m2>
+{
+    using tex_scalar_t = __half;
+    using tex_result_t = cuphy_i::tex_result_v4<tex_scalar_t>;
 };
 
-template <int N>
 inline __device__
-void apply_noise(LLR_group<float, N>& LLRg, float noiseInv)
+void apply_noise(cuphy_i::tex_result_v4<float>& r, float noiseInv)
 {
-    #pragma unroll
-    for(int i = 0; i < N; ++i)
-    {
-        LLRg.f[i] *= noiseInv;
-    }
-}
-
-template <int N>
-inline __device__
-void apply_noise(LLR_group<__half, N>& LLRg, __half2 noiseInv)
-{
-    #pragma unroll
-    for(int i = 0; i < N/2; ++i)
-    {
-        LLRg.f16x2[i] = __hmul2(LLRg.f16x2[i], noiseInv);
-    }
+    r.x *= noiseInv;
+    r.y *= noiseInv;
+    r.z *= noiseInv;
+    r.w *= noiseInv;
 }
 
 inline __device__
-void apply_noise(LLR_group<__half, 1>& LLRg, __half2 noiseInv)
+void apply_noise(cuphy_i::tex_result_v4<__half>& r, float noiseInv)
 {
-    LLRg.f16[0] = __hmul(LLRg.f16[0], noiseInv.x);
+    __half2 hnoise = __float2half2_rn(noiseInv);
+    r.a.f16x2 = __hmul2(r.a.f16x2, hnoise);
+    r.b.f16x2 = __hmul2(r.b.f16x2, hnoise);
 }
 
 inline __device__
@@ -528,77 +674,289 @@ void swizzle_LLRs(LLR_group<__half, 8>&                 LLR_grp,
     LLR_grp.ui32_4.w = uint32_permute<0x7632>(res_I.b.u32, res_Q.b.u32);
 }
 
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e4m3, 1>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    LLR_grp.fp8_e4m3[0] = __nv_fp8_e4m3(__low2half(res_I.a.f16x2));
+}
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e4m3, 2>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    //   7  6  5  4     3  2  1  0
+    // [ Q.hi  Q.lo ] [ I.hi  I.lo ] --> [ Q.lo I.lo ]
+    __half2 hres = __lows2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    LLR_grp.fp8x2_e4m3[0] = __nv_fp8x2_e4m3(hres);
+}
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e4m3, 4>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.lo I.a.lo ]
+    __half2 hres_low = __lows2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.hi I.a.hi ]
+    __half2 hres_hi = __highs2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    LLR_grp.fp8x4_e4m3[0] = __nv_fp8x4_e4m3(hres_low, hres_hi);
+}
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e4m3, 6>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.lo I.a.lo ]
+    __half2 hres_0 = __lows2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.hi I.a.hi ]
+    __half2 hres_1 = __highs2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.b.hi  Q.b.lo ] [ I.b.hi  I.b.lo ] --> [ Q.b.lo I.b.lo ]
+    __half2 hres_2 = __lows2half2(res_I.b.f16x2, res_Q.b.f16x2);
+
+    LLR_grp.fp8x2_e4m3[0] = __nv_fp8x2_e4m3(hres_0);
+    LLR_grp.fp8x2_e4m3[1] = __nv_fp8x2_e4m3(hres_1);
+    LLR_grp.fp8x2_e4m3[2] = __nv_fp8x2_e4m3(hres_2);
+}
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e4m3, 8>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.lo I.a.lo ]
+    __half2 hres_0 = __lows2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.hi I.a.hi ]
+    __half2 hres_1 = __highs2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.b.hi  Q.b.lo ] [ I.b.hi  I.b.lo ] --> [ Q.b.lo I.b.lo ]
+    __half2 hres_2 = __lows2half2(res_I.b.f16x2, res_Q.b.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.b.hi  Q.b.lo ] [ I.b.hi  I.b.lo ] --> [ Q.b.hi I.b.hi ]
+    __half2 hres_3 = __highs2half2(res_I.b.f16x2, res_Q.b.f16x2);
+
+    LLR_grp.fp8x4_e4m3[0] = __nv_fp8x4_e4m3(hres_0, hres_1);
+    LLR_grp.fp8x4_e4m3[1] = __nv_fp8x4_e4m3(hres_2, hres_3);
+}
+
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e5m2, 1>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    LLR_grp.fp8_e5m2[0] = __nv_fp8_e5m2(__low2half(res_I.a.f16x2));
+}
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e5m2, 2>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    //   7  6  5  4     3  2  1  0
+    // [ Q.hi  Q.lo ] [ I.hi  I.lo ] --> [ Q.lo I.lo ]
+    __half2 hres = __lows2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    LLR_grp.fp8x2_e5m2[0] = __nv_fp8x2_e5m2(hres);
+}
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e5m2, 4>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.lo I.a.lo ]
+    __half2 hres_low = __lows2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.hi I.a.hi ]
+    __half2 hres_hi = __highs2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    LLR_grp.fp8x4_e5m2[0] = __nv_fp8x4_e5m2(hres_low, hres_hi);
+}
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e5m2, 6>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.lo I.a.lo ]
+    __half2 hres_0 = __lows2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.hi I.a.hi ]
+    __half2 hres_1 = __highs2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.b.hi  Q.b.lo ] [ I.b.hi  I.b.lo ] --> [ Q.b.lo I.b.lo ]
+    __half2 hres_2 = __lows2half2(res_I.b.f16x2, res_Q.b.f16x2);
+
+    LLR_grp.fp8x2_e5m2[0] = __nv_fp8x2_e5m2(hres_0);
+    LLR_grp.fp8x2_e5m2[1] = __nv_fp8x2_e5m2(hres_1);
+    LLR_grp.fp8x2_e5m2[2] = __nv_fp8x2_e5m2(hres_2);
+}
+inline __device__
+void swizzle_LLRs(LLR_group<__nv_fp8_e5m2, 8>&          LLR_grp,
+                  const cuphy_i::tex_result_v4<__half>& res_I,
+                  const cuphy_i::tex_result_v4<__half>& res_Q)
+{
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.lo I.a.lo ]
+    __half2 hres_0 = __lows2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.a.hi  Q.a.lo ] [ I.a.hi  I.a.lo ] --> [ Q.a.hi I.a.hi ]
+    __half2 hres_1 = __highs2half2(res_I.a.f16x2, res_Q.a.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.b.hi  Q.b.lo ] [ I.b.hi  I.b.lo ] --> [ Q.b.lo I.b.lo ]
+    __half2 hres_2 = __lows2half2(res_I.b.f16x2, res_Q.b.f16x2);
+    //    7  6    5  4       3  2    1  0
+    // [ Q.b.hi  Q.b.lo ] [ I.b.hi  I.b.lo ] --> [ Q.b.hi I.b.hi ]
+    __half2 hres_3 = __highs2half2(res_I.b.f16x2, res_Q.b.f16x2);
+
+    LLR_grp.fp8x4_e5m2[0] = __nv_fp8x4_e5m2(hres_0, hres_1);
+    LLR_grp.fp8x4_e5m2[1] = __nv_fp8x4_e5m2(hres_2, hres_3);
+}
+
 ////////////////////////////////////////////////////////////////////////
 // LLR_BPSK
 // Specialized soft demapper for BPSK, using direct arithmetic instead
 // of a texture fetch.
 template <typename TSymbolScalar, typename TLLR> struct LLR_BPSK;
 
+// complex float symbol, float LLR
 template <>
 struct LLR_BPSK<float, float>
 {
     //typedef LLR_group<float, 1>                       llr_group_t;
     typedef typename complex_from_scalar<float>::type symbol_t;
-    typedef typename noise_type_map<float>::type      noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         grp.f[0]= PAMnoiseVarInv * 2 * QAM_traits<2>::A * (sym.x + sym.y);
     }
 };
 
+// complex float symbol, __half LLR
 template <>
 struct LLR_BPSK<float, __half>
 {
     //typedef LLR_group<__half, 1>                      llr_group_t;
     typedef typename complex_from_scalar<float>::type symbol_t;
-    typedef typename noise_type_map<__half>::type     noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         __half ZrA2 = __float2half(2 * QAM_traits<2>::A * (sym.x + sym.y));
-        grp.f16[0]  = __hmul(__low2half(PAMnoiseVarInv), ZrA2);
+        grp.f16[0]  = __hmul(__float2half(PAMnoiseVarInv), ZrA2);
     }
 };
 
+/// complex __half symbol, __half LLR
 template <>
 struct LLR_BPSK<__half, __half>
 {
     //typedef LLR_group<__half, 1>                       llr_group_t;
     typedef typename complex_from_scalar<__half>::type symbol_t;
-    typedef typename noise_type_map<__half>::type      noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         __half Zr  = __low2half(sym) + __high2half(sym);
         __half A2  = __float2half(2 * QAM_traits<2>::A);
-        grp.f16[0] = __hmul(__hmul(__low2half(PAMnoiseVarInv), A2), Zr);
+        grp.f16[0] = __hmul(__hmul(__float2half(PAMnoiseVarInv), A2), Zr);
     }
 };
 
+// complex __half symbol, float LLR
 template <>
 struct LLR_BPSK<__half, float>
 {
     //typedef LLR_group<float, 1>                        llr_group_t;
     typedef typename complex_from_scalar<__half>::type symbol_t;
-    typedef typename noise_type_map<float>::type       noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         __half Zr = __low2half(sym) + __high2half(sym);
         grp.f[0]  = 2 * QAM_traits<2>::A * PAMnoiseVarInv * __half2float(Zr);
+    }
+};
+
+// complex __half symbol, __nv_fp8_e4m3 LLR
+template <>
+struct LLR_BPSK<__half, __nv_fp8_e4m3>
+{
+    //typedef LLR_group<__nv_fp8_e4m3, 1>                        llr_group_t;
+    typedef typename complex_from_scalar<__half>::type symbol_t;
+    template <class TLLRGroup>
+    __device__
+    static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
+                                    const symbol_t& sym,            // input symbol
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
+    {
+        __half Zr       = __low2half(sym) + __high2half(sym);
+        __half result   = __hmul(__float2half_rn(2 * QAM_traits<2>::A * PAMnoiseVarInv), Zr);
+        grp.fp8_e4m3[0] = __nv_fp8_e4m3(result);
+    }
+};
+
+// complex __half symbol, __nv_fp8_e5m2 LLR
+template <>
+struct LLR_BPSK<__half, __nv_fp8_e5m2>
+{
+    //typedef LLR_group<__nv_fp8_e5m2, 1>                        llr_group_t;
+    typedef typename complex_from_scalar<__half>::type symbol_t;
+    template <class TLLRGroup>
+    __device__
+    static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
+                                    const symbol_t& sym,            // input symbol
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
+    {
+        __half Zr       = __low2half(sym) + __high2half(sym);
+        __half result   = __hmul(__float2half_rn(2 * QAM_traits<2>::A * PAMnoiseVarInv), Zr);
+        grp.fp8_e5m2[0] = __nv_fp8_e5m2(result);
+    }
+};
+
+// complex float symbol, __nv_fp8_e4m3 LLR
+template <>
+struct LLR_BPSK<float, __nv_fp8_e4m3>
+{
+    //typedef LLR_group<__nv_fp8_e4m3, 1>             llr_group_t;
+    typedef typename complex_from_scalar<float>::type symbol_t;
+    template <class TLLRGroup>
+    __device__
+    static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
+                                    const symbol_t& sym,            // input symbol
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
+    {
+        float ZrA2      = 2 * QAM_traits<2>::A * PAMnoiseVarInv * (sym.x + sym.y);
+        grp.fp8_e4m3[0] = __nv_fp8_e4m3(ZrA2);
+    }
+};
+
+// complex float symbol, __nv_fp8_e5m2 LLR
+template <>
+struct LLR_BPSK<float, __nv_fp8_e5m2>
+{
+    //typedef LLR_group<__nv_fp8_e5m2, 1>             llr_group_t;
+    typedef typename complex_from_scalar<float>::type symbol_t;
+    template <class TLLRGroup>
+    __device__
+    static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
+                                    const symbol_t& sym,            // input symbol
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
+    {
+        float ZrA2      = 2 * QAM_traits<2>::A * PAMnoiseVarInv * (sym.x + sym.y);
+        grp.fp8_e5m2[0] = __nv_fp8_e5m2(ZrA2);
     }
 };
 
@@ -608,144 +966,224 @@ struct LLR_BPSK<__half, float>
 // of a texture fetch.
 template <typename TSymbolScalar, typename TLLR> struct LLR_QPSK;
 
+// complex float symbol, float LLR
 template <>
 struct LLR_QPSK<float, float>
 {
     //typedef LLR_group<float, 2>                       llr_group_t;
     typedef typename complex_from_scalar<float>::type symbol_t;
-    typedef typename noise_type_map<float>::type      noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         grp.f[0]= PAMnoiseVarInv * 2 * QAM_traits<2>::A * sym.x;
         grp.f[1]= PAMnoiseVarInv * 2 * QAM_traits<2>::A * sym.y;
     }
 };
 
+// complex float symbol, __half LLR
 template <>
 struct LLR_QPSK<float, __half>
 {
     //typedef LLR_group<__half, 2>                      llr_group_t;
     typedef typename complex_from_scalar<float>::type symbol_t;
-    typedef typename noise_type_map<__half>::type     noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
-        __half2 A2   = __float2half2_rn(2 * QAM_traits<2>::A);
-        grp.f16x2[0] = __hmul2(__hmul2(PAMnoiseVarInv, A2), __floats2half2_rn(sym.x, sym.y));
+        __half2 A2       = __float2half2_rn(2 * QAM_traits<2>::A);
+        __half2 noiseInv = __float2half2_rn(PAMnoiseVarInv);
+        grp.f16x2[0] = __hmul2(__hmul2(noiseInv, A2), __floats2half2_rn(sym.x, sym.y));
 
     }
 };
 
+// complex __half symbol, __half LLR
 template <>
 struct LLR_QPSK<__half, __half>
 {
     //typedef LLR_group<__half, 2>                       llr_group_t;
     typedef typename complex_from_scalar<__half>::type symbol_t;
-    typedef typename noise_type_map<__half>::type      noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
-        __half2 A2   = __float2half2_rn(2 * QAM_traits<2>::A);
-        grp.f16x2[0] = __hmul2(__hmul2(PAMnoiseVarInv, A2), sym);
+        __half2 A2       = __float2half2_rn(2 * QAM_traits<2>::A);
+        __half2 noiseInv = __float2half2_rn(PAMnoiseVarInv);
+        grp.f16x2[0]     = __hmul2(__hmul2(noiseInv, A2), sym);
     }
 };
 
+// complex __half symbol, float LLR
 template <>
 struct LLR_QPSK<__half, float>
 {
     //typedef LLR_group<float, 2>                        llr_group_t;
     typedef typename complex_from_scalar<__half>::type symbol_t;
-    typedef typename noise_type_map<float>::type       noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         grp.f[0]  = 2 * QAM_traits<2>::A * PAMnoiseVarInv * __low2float(sym);
         grp.f[1]  = 2 * QAM_traits<2>::A * PAMnoiseVarInv * __high2float(sym);
     }
 };
 
+// complex __half symbol, __nv_fp8_e4m3 LLR
+template <>
+struct LLR_QPSK<__half, __nv_fp8_e4m3>
+{
+    //typedef LLR_group<__nv_fp8_e4m3, 2>              llr_group_t;
+    typedef typename complex_from_scalar<__half>::type symbol_t;
+    template <class TLLRGroup>
+    __device__
+    static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
+                                    const symbol_t& sym,            // input symbol
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
+    {
+        __half2 result = __hmul2(__float2half2_rn(2 * QAM_traits<2>::A * PAMnoiseVarInv),
+                                 sym);
+        grp.fp8x2_e4m3[0] = __nv_fp8x2_e4m3(result);
+    }
+};
+
+// complex __half symbol, __nv_fp8_e5m2 LLR
+template <>
+struct LLR_QPSK<__half, __nv_fp8_e5m2>
+{
+    //typedef LLR_group<__nv_fp8_e5m2, 2>              llr_group_t;
+    typedef typename complex_from_scalar<__half>::type symbol_t;
+    template <class TLLRGroup>
+    __device__
+    static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
+                                    const symbol_t& sym,            // input symbol
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
+    {
+        __half2 result = __hmul2(__float2half2_rn(2 * QAM_traits<2>::A * PAMnoiseVarInv),
+                                 sym);
+        grp.fp8x2_e5m2[0] = __nv_fp8x2_e5m2(result);
+    }
+};
+
+// complex float symbol, __nv_fp8_e4m3 LLR
+template <>
+struct LLR_QPSK<float, __nv_fp8_e4m3>
+{
+    //typedef LLR_group<__nv_fp8_e4m3, 2>             llr_group_t;
+    typedef typename complex_from_scalar<float>::type symbol_t;
+    template <class TLLRGroup>
+    __device__
+    static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
+                                    const symbol_t& sym,            // input symbol
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
+    {
+        float2 result = make_float2(PAMnoiseVarInv * 2 * QAM_traits<2>::A * sym.x,
+                                    PAMnoiseVarInv * 2 * QAM_traits<2>::A * sym.y);
+        grp.fp8x2_e4m3[0] = __nv_fp8x2_e4m3(result);
+    }
+};
+
+// complex float symbol, __nv_fp8_e5m2 LLR
+template <>
+struct LLR_QPSK<float, __nv_fp8_e5m2>
+{
+    //typedef LLR_group<__nv_fp8_e5m2, 2>             llr_group_t;
+    typedef typename complex_from_scalar<float>::type symbol_t;
+    template <class TLLRGroup>
+    __device__
+    static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
+                                    const symbol_t& sym,            // input symbol
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
+    {
+        float2 result = make_float2(PAMnoiseVarInv * 2 * QAM_traits<2>::A * sym.x,
+                                    PAMnoiseVarInv * 2 * QAM_traits<2>::A * sym.y);
+        grp.fp8x2_e5m2[0] = __nv_fp8x2_e5m2(result);
+    }
+};
+
 template <typename TSymbolScalar, typename TLLR> struct LLR_16QAM;
+
+// complex float symbol, __half LLR
 template <>
 struct LLR_16QAM<float, __half>
 {
     typedef typename complex_from_scalar<float>::type symbol_t;
-    typedef typename noise_type_map<__half>::type     noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         constexpr float A = 0.3162f;//1.0f/sqrt(10.0f);
-        __half2 A2   = __float2half2_rn(2 * A);
-        __half2 input= __floats2half2_rn(sym.x, sym.y);
-        __half2 coeff= __hmul2(PAMnoiseVarInv, A2);
-        grp.f16x2[0] = __hmul2(coeff, input);
-        grp.f16x2[1] = __hmul2(__hsub2(A2, __habs2(input)), coeff);
+        __half2 A2       = __float2half2_rn(2 * A);
+        __half2 input    = __floats2half2_rn(sym.x, sym.y);
+        __half2 noiseInv = __float2half2_rn(PAMnoiseVarInv);
+        __half2 coeff    = __hmul2(noiseInv, A2);
+        grp.f16x2[0]     = __hmul2(coeff, input);
+        grp.f16x2[1]     = __hmul2(__hsub2(A2, __habs2(input)), coeff);
     }
 };
 
 template <typename TSymbolScalar, typename TLLR> struct LLR_64QAM;
+
+// complex float symbol, __half LLR
 template <>
 struct LLR_64QAM<float, __half>
 {
     typedef typename complex_from_scalar<float>::type symbol_t;
-    typedef typename noise_type_map<__half>::type     noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         constexpr float A = 0.1543f;//1.0f/sqrt(42.0f);
-        __half2 A2   = __float2half2_rn(2 * A);
-        __half2 A4   = __float2half2_rn(4 * A);
-        __half2 input= __floats2half2_rn(sym.x, sym.y);
-        __half2 coeff= __hmul2(PAMnoiseVarInv, A2);
-        __half2 temp = __hsub2(A4, __habs2(input));
-        grp.f16x2[0] = __hmul2(coeff, input);
-        grp.f16x2[1] = __hmul2(temp, coeff);
-        grp.f16x2[2] = __hmul2(__hsub2(A2, __habs2(temp)), coeff);
+        __half2 A2       = __float2half2_rn(2 * A);
+        __half2 A4       = __float2half2_rn(4 * A);
+        __half2 input    = __floats2half2_rn(sym.x, sym.y);
+        __half2 noiseInv = __float2half2_rn(PAMnoiseVarInv);
+        __half2 coeff    = __hmul2(noiseInv, A2);
+        __half2 temp     = __hsub2(A4, __habs2(input));
+        grp.f16x2[0]     = __hmul2(coeff, input);
+        grp.f16x2[1]     = __hmul2(temp, coeff);
+        grp.f16x2[2]     = __hmul2(__hsub2(A2, __habs2(temp)), coeff);
      }
 };
 
 template <typename TSymbolScalar, typename TLLR> struct LLR_256QAM;
+
+// complex float symbol, __half LLR
 template <>
 struct LLR_256QAM<float, __half>
 {
     typedef typename complex_from_scalar<float>::type symbol_t;
-    typedef typename noise_type_map<__half>::type     noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&      grp,            // output LLRs
                                     const symbol_t& sym,            // input symbol
-                                    noise_t         PAMnoiseVarInv) // inverse of PAM noise variance
+                                    float           PAMnoiseVarInv) // inverse of PAM noise variance
     {
         constexpr float A = 0.0766965f;//1.0f/sqrt(170.0f);
-        __half2 A2   = __float2half2_rn(2 * A);
-        __half2 A4   = __float2half2_rn(4 * A);
-        __half2 A8   = __float2half2_rn(8 * A);
-        __half2 input= __floats2half2_rn(sym.x, sym.y);
-        __half2 coeff= __hmul2(PAMnoiseVarInv, A2);
-        __half2 temp = __hsub2(A8, __habs2(input));
-        __half2 temp1= __hsub2(A4, __habs2(temp));
-        grp.f16x2[0] = __hmul2(coeff, input);
-        grp.f16x2[1] = __hmul2(temp, coeff);
-        grp.f16x2[2] = __hmul2(temp1, coeff);
-        grp.f16x2[3] = __hmul2(__hsub2(A2, __habs2(temp1)), coeff);
+        __half2 A2       = __float2half2_rn(2 * A);
+        __half2 A4       = __float2half2_rn(4 * A);
+        __half2 A8       = __float2half2_rn(8 * A);
+        __half2 input    = __floats2half2_rn(sym.x, sym.y);
+        __half2 noiseInv = __float2half2_rn(PAMnoiseVarInv);
+        __half2 coeff    = __hmul2(noiseInv, A2);
+        __half2 temp     = __hsub2(A8, __habs2(input));
+        __half2 temp1    = __hsub2(A4, __habs2(temp));
+        grp.f16x2[0]     = __hmul2(coeff, input);
+        grp.f16x2[1]     = __hmul2(temp, coeff);
+        grp.f16x2[2]     = __hmul2(temp1, coeff);
+        grp.f16x2[3]     = __hmul2(__hsub2(A2, __habs2(temp1)), coeff);
      }
 };
 
@@ -758,13 +1196,12 @@ template <typename TSymbolScalar, typename TLLR, int QAM> struct soft_demapper
     typedef QAM_traits<QAM>                                   QAM_traits_t;
     //typedef LLR_group<TLLR, QAM_traits_t::bits>               llr_group_t;
     typedef typename complex_from_scalar<TSymbolScalar>::type symbol_t;
-    typedef typename noise_type_map<TLLR>::type               noise_t;
     typedef cuphy_i::tex_result_v4<TLLR>                      tex_result_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&          grp,            // output LLRs
                                     const symbol_t&     sym,            // input symbol
-                                    noise_t             PAMnoiseVarInv, // inverse of PAM noise variance
+                                    float               PAMnoiseVarInv, // inverse of PAM noise variance
                                     cudaTextureObject_t texObj)         // texture map
     {
         // Texture-fetch implementation of the soft demapper function.
@@ -775,8 +1212,9 @@ template <typename TSymbolScalar, typename TLLR, int QAM> struct soft_demapper
         t = symbol_to_tex_coords(sym, QAM_traits<QAM>::m, QAM_traits<QAM>::b);
         tex_1D_lod_ptx(res_I, texObj, t.x, QAM_traits<QAM>::LEVEL);
         tex_1D_lod_ptx(res_Q, texObj, t.y, QAM_traits<QAM>::LEVEL);
+        apply_noise(res_I, PAMnoiseVarInv);
+        apply_noise(res_Q, PAMnoiseVarInv);
         swizzle_LLRs(grp, res_I, res_Q);
-        apply_noise(grp, PAMnoiseVarInv);
     }
 };
 
@@ -786,13 +1224,12 @@ template <typename TSymbolScalar, typename TLLR> struct soft_demapper<TSymbolSca
     typedef QAM_traits<2>                                     QAM_traits_t;
     //typedef LLR_group<TLLR, QAM_traits_t::bits>               llr_group_t;
     typedef typename complex_from_scalar<TSymbolScalar>::type symbol_t;
-    typedef typename noise_type_map<TLLR>::type               noise_t;
     typedef cuphy_i::tex_result_v4<TLLR>                      tex_result_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&          grp,            // output LLRs
                                     const symbol_t&     sym,            // input symbol
-                                    noise_t             PAMnoiseVarInv, // inverse of PAM noise variance
+                                    float               PAMnoiseVarInv, // inverse of PAM noise variance
                                     cudaTextureObject_t texObj)         // texture map
     {
 #if 0
@@ -807,8 +1244,8 @@ template <typename TSymbolScalar, typename TLLR> struct soft_demapper<TSymbolSca
                                             QAM_traits<QAM>::m,
                                             QAM_traits<QAM>::b),
                        QAM_traits<QAM>::LEVEL);
+        apply_noise(res_I, PAMnoiseVarInv);
         swizzle_LLRs(grp, res_I, res_Q);
-        apply_noise(grp, PAMnoiseVarInv);
 #else
         // Direct implementation of the soft demapper function.
         // Probably more efficient than the TEX approach for BPSK and
@@ -826,13 +1263,12 @@ template <typename TSymbolScalar, typename TLLR> struct soft_demapper<TSymbolSca
     typedef QAM_traits<4>                                     QAM_traits_t;
     //typedef LLR_group<TLLR, QAM_traits_t::bits>               llr_group_t;
     typedef typename complex_from_scalar<TSymbolScalar>::type symbol_t;
-    typedef typename noise_type_map<TLLR>::type               noise_t;
     typedef cuphy_i::tex_result_v4<TLLR>                      tex_result_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&          grp,            // output LLRs
                                     const symbol_t&     sym,            // input symbol
-                                    noise_t             PAMnoiseVarInv, // inverse of PAM noise variance
+                                    float               PAMnoiseVarInv, // inverse of PAM noise variance
                                     cudaTextureObject_t texObj)         // texture map
     {
 #if 0
@@ -847,8 +1283,8 @@ template <typename TSymbolScalar, typename TLLR> struct soft_demapper<TSymbolSca
                                             QAM_traits<QAM>::m,
                                             QAM_traits<QAM>::b),
                        QAM_traits<QAM>::LEVEL);
+        apply_noise(res_I, PAMnoiseVarInv);
         swizzle_LLRs(grp, res_I, res_Q);
-        apply_noise(grp, PAMnoiseVarInv);
 #else
         // Direct implementation of the soft demapper function.
         // Probably more efficient than the TEX approach for BPSK and
@@ -866,14 +1302,13 @@ template <typename TSymbolScalar, typename TLLR> struct soft_demapper<TSymbolSca
 // known at compile time.
 template <typename TSymbolScalar, typename TLLR> struct soft_demapper_any
 {
-    typedef typename complex_from_scalar<TSymbolScalar>::type symbol_t;
-    typedef typename noise_type_map<TLLR>::type               noise_t;
-    typedef cuphy_i::tex_result_v4<TLLR>                      tex_result_t;
+    using symbol_t     = typename complex_from_scalar<TSymbolScalar>::type;
+    using tex_result_t = typename demapper_llr_traits_t<TLLR>::tex_result_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&          grp,            // output LLRs
                                     const symbol_t&     sym,            // input symbol
-                                    noise_t             PAMnoiseVarInv, // inverse of PAM noise variance
+                                    float               PAMnoiseVarInv, // inverse of PAM noise variance
                                     int                 nBits,          // num QAM bits
                                     cudaTextureObject_t texObj)         // texture map
     {
@@ -895,10 +1330,9 @@ template <typename TSymbolScalar, typename TLLR> struct soft_demapper_any
             t = symbol_to_tex_coords(sym, nBits);
             tex_1D_lod_ptx(res_I, texObj, t.x, mod_mipmap_level[nBits]);
             tex_1D_lod_ptx(res_Q, texObj, t.y, mod_mipmap_level[nBits]);
-            // Note: doing all swizzles  and noise applications for now, even if the QAM
-            // doesn't use them.
+            apply_noise(res_I, PAMnoiseVarInv);
+            apply_noise(res_Q, PAMnoiseVarInv);
             swizzle_LLRs(grp, res_I, res_Q);
-            apply_noise(grp, PAMnoiseVarInv);
         }
     }
 };
@@ -907,12 +1341,11 @@ template <typename TSymbolScalar, typename TLLR> struct soft_demapper_any
 template <typename TSymbolScalar, typename TLLR> struct soft_demapper_simplified
 {
     typedef typename complex_from_scalar<TSymbolScalar>::type symbol_t;
-    typedef typename noise_type_map<TLLR>::type               noise_t;
     template <class TLLRGroup>
     __device__
     static void symbol_to_LLR_group(TLLRGroup&          grp,            // output LLRs
                                     const symbol_t&     sym,            // input symbol
-                                    noise_t             PAMnoiseVarInv, // inverse of PAM noise variance
+                                    float               PAMnoiseVarInv, // inverse of PAM noise variance
                                     int                 nBits)          // num QAM bits
     {
         if(1 == nBits)

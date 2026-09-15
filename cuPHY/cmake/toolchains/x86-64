@@ -2,3 +2,17 @@ set(CMAKE_C_COMPILER   x86_64-linux-gnu-gcc)
 set(CMAKE_CXX_COMPILER x86_64-linux-gnu-g++)
 
 set(AERIAL_ARCH_TUNE_FLAGS -march=x86-64 -mssse3)
+
+# Declare hardening level explicitly so codegen is stable regardless of whether
+# the container provides a vanilla or a distro-packaged compiler.
+# Ubuntu-packaged GCC 12.3.0 defaults to _FORTIFY_SOURCE=3,
+# -fstack-protector-strong, and -fstack-clash-protection; upstream GCC enables
+# none of them.  Pinning here keeps the two compilers code-generation-equivalent.
+#
+# Default (0/none) reproduces the Ubuntu 22 / upstream GCC baseline.
+# Override on the cmake command line to harden selectively:
+#   -DAERIAL_FORTIFY_LEVEL=3 -DAERIAL_STACK_PROTECTOR=strong
+set(AERIAL_FORTIFY_LEVEL   "0"    CACHE STRING "_FORTIFY_SOURCE level (0 disables)")
+set(AERIAL_STACK_PROTECTOR "none" CACHE STRING "Stack protector: none | strong")
+
+include("${CMAKE_CURRENT_LIST_DIR}/hardening.cmake")

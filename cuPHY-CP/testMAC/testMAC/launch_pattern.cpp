@@ -17,6 +17,7 @@
 
 #include <unistd.h>
 #include <filesystem>
+#include <limits>
 
 #include "hdf5hpp.hpp"
 #include "cuphy_hdf5.hpp"
@@ -28,11 +29,13 @@
 #include "dyn_param_calc.hpp"
 
 #include <chrono>
+#include <type_traits>
 
 #define TAG (NVLOG_TAG_BASE_TEST_MAC + 1) // "MAC.LP"
 
 // Only used for calculate phyCellId from testMac_config_params_XXX.h5
 #define CONFIG_PHY_CELL_ID_BASE 40 // phyCellId = CONFIG_PHY_CELL_ID_BASE + cell_number
+static constexpr size_t MAX_DYNAMIC_PDUS_PER_CELL = std::numeric_limits<uint8_t>::max();
 
 #define H5_N_PDU "nPdu"
 #define H5_PDU "PDU"
@@ -184,7 +187,7 @@ template <typename T>
 static T h5file_try_parse(const char* file_name, const char* dset_name, const char* var_name, T default_value, bool miss_warning = true, int dset_id = 0)
 {
     char h5path_array[MAX_PATH_LEN];
-    get_full_path_file(h5path_array, CONFIG_TEST_VECTOR_PATH, file_name, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    get_cubb_full_path(h5path_array, CONFIG_TEST_VECTOR_PATH, file_name);
     std::filesystem::path h5path(h5path_array);
 
     if(access(h5path.c_str(), F_OK) != 0)
@@ -324,6 +327,15 @@ int launch_pattern::init_prach_config(int cell_num)
 
 launch_pattern::~launch_pattern()
 {
+    // NOTE: the parse cache (parse_tv_channels) shares one test_vector_t across every
+    // slot that references the same TV file (PDSCH/PUSCH requests instead hold private
+    // clones of the cached master), so cached tv_data is owned solely by tv_data_maps
+    // and must be freed exactly once here -- never per-req. Cheap, teardown-safe cleanup:
+    // free the (deduplicated) cache entries, and leave the per-req wrappers, private
+    // clones, and any uncached tv_data to be reclaimed by the OS at process exit. We
+    // deliberately do NOT walk every req to free it: that is a no-op at exit yet made
+    // teardown heavy enough to race testMAC's fmtlog shutdown flush (dropped the final
+    // cell_stop lines, breaking CICD get_segments()). See MR !5469 discussion.
     if (yaml_configs->tv_data_map_enable != 0)
     {
         for(auto& per_channel_map: tv_data_maps)
@@ -568,7 +580,12 @@ int launch_pattern::parse_tv_pdsch(hdf5hpp::hdf5_file& file, fapi_req_t* req)
         int bit1_count = __builtin_popcount(tv_data->dmrsSymLocBmsk) / tv_data->tbpars.dmrsMaxLength;
         switch(tv_data->tbpars.dmrsType)
         {
-        case 0: // Type A
+        case 0: // DMRS configuration type 1
+        case 1: // DMRS configuration type 2 (nvbug 5714275 / TV 90508)
+            // dmrsAddlPosition is derived purely from the time-domain DMRS symbol
+            // bitmask; dmrsConfigType selects the frequency-domain RE mapping and
+            // does not affect the additional-position count, so both types share
+            // the same computation.
             tv_data->tbpars.dmrsAddlPosition = bit1_count - 1;
             break;
 
@@ -1009,7 +1026,12 @@ int launch_pattern::parse_tv_pusch(hdf5hpp::hdf5_file& file, fapi_req_t* req)
         int bit1_count = __builtin_popcount(tv_data->dmrsSymLocBmsk) / tv_data->tbpars.dmrsMaxLength;
         switch(tv_data->tbpars.dmrsType)
         {
-        case 0: // Type A
+        case 0: // DMRS configuration type 1
+        case 1: // DMRS configuration type 2 (nvbug 5714275 / TV 90508)
+            // dmrsAddlPosition is derived purely from the time-domain DMRS symbol
+            // bitmask; dmrsConfigType selects the frequency-domain RE mapping and
+            // does not affect the additional-position count, so both types share
+            // the same computation.
             tv_data->tbpars.dmrsAddlPosition = bit1_count - 1;
             break;
 
@@ -1968,7 +1990,7 @@ int launch_pattern::parse_tv_file(fapi_req_t* req)
 int launch_pattern::load_h5_config_params(int cell_id, const char* config_params_h5_file, const char* ul_params_h5_file)
 {
     char h5path_array[MAX_PATH_LEN];
-    get_full_path_file(h5path_array, CONFIG_TEST_VECTOR_PATH, config_params_h5_file, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    get_cubb_full_path(h5path_array, CONFIG_TEST_VECTOR_PATH, config_params_h5_file);
     std::filesystem::path h5path(h5path_array);
     NVLOGC_FMT(TAG, "config params {} {:p}", h5path.c_str(), (void*)config_params_h5_file);
 
@@ -1994,7 +2016,7 @@ int launch_pattern::load_h5_config_params(int cell_id, const char* config_params
         if(nullptr != ul_params_h5_file)
         {
             char ul_h5path_array[MAX_PATH_LEN];
-            get_full_path_file(ul_h5path_array, CONFIG_TEST_VECTOR_PATH, ul_params_h5_file, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+            get_cubb_full_path(ul_h5path_array, CONFIG_TEST_VECTOR_PATH, ul_params_h5_file);
             std::filesystem::path ul_h5path(ul_h5path_array);
             if(access(ul_h5path.c_str(), F_OK) != 0)
             {
@@ -2232,7 +2254,7 @@ int launch_pattern::launch_pattern_parsing(const char* lp_file_name, uint32_t ch
     channel_mask = ch_mask;
 
     char pattern_file_array[MAX_PATH_LEN];
-    get_full_path_file(pattern_file_array, CONFIG_LAUNCH_PATTERN_PATH, lp_file_name, CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+    get_cubb_full_path(pattern_file_array, CONFIG_LAUNCH_PATTERN_PATH, lp_file_name);
     std::filesystem::path pattern_file(pattern_file_array);
 
     yaml::file_parser fp(pattern_file.c_str());
@@ -2611,8 +2633,27 @@ int launch_pattern::dynamic_pattern_parsing(yaml::node& root_pattern, uint32_t c
             yaml::node dmrs_sym_loc_bmsk_node = cell_node["dmrsSymLocBmsk"];
             yaml::node nrOfSymbols_node = cell_node["nrOfSymbols"];
 
-            dyn_param.pdus.resize(rnti_node.length());
-            for (uint32_t pdu_id = 0; pdu_id < rnti_node.length(); pdu_id ++)
+            const size_t pdu_count = rnti_node.length();
+            if(pdu_count > MAX_DYNAMIC_PDUS_PER_CELL
+                    || prbs_node.length() < pdu_count
+                    || beam_node.length() < pdu_count
+                    || layer_node.length() < pdu_count
+                    || mcs_table_node.length() < pdu_count
+                    || mcs_node.length() < pdu_count
+                    || dmrs_port_bmsk_node.length() < pdu_count
+                    || dmrs_sym_loc_bmsk_node.length() < pdu_count
+                    || nrOfSymbols_node.length() < pdu_count)
+            {
+                NVLOGE_FMT(TAG, AERIAL_YAML_PARSER_EVENT,
+                        "{}: invalid dynamic PDU list lengths: pdu_count={} max={} PRB={} Beams={} Layer={} MCS table={} MCS={} dmrsPortBmsk={} dmrsSymLocBmsk={} nrOfSymbols={}",
+                        __func__, pdu_count, MAX_DYNAMIC_PDUS_PER_CELL, prbs_node.length(),
+                        beam_node.length(), layer_node.length(), mcs_table_node.length(), mcs_node.length(),
+                        dmrs_port_bmsk_node.length(), dmrs_sym_loc_bmsk_node.length(), nrOfSymbols_node.length());
+                return -1;
+            }
+
+            dyn_param.pdus.resize(pdu_count);
+            for (uint32_t pdu_id = 0; pdu_id < pdu_count; pdu_id ++)
             {
                 dyn_pdu_param_t& pdu_param = dyn_param.pdus[pdu_id];
                 pdu_param.prb.prbStart = prbs_node[pdu_id][0UL].as<uint32_t>();
@@ -2926,6 +2967,61 @@ int launch_pattern::add_dyn_slot_channel(slot_pattern_t& slots_data, int cell_id
     return 0;
 }
 
+/**
+ * Clone a per-PDU entry list (PDSCH/PUSCH), re-basing each entry's tb_buf interior
+ * pointer from the source's data_buf into the clone's own data_buf. All other members
+ * are value/vector types and deep-copy via the entry's implicit copy constructor.
+ *
+ * @param[in]  src Channel TV to clone; each entry's tb_buf points into src.data_buf
+ * @param[out] dst Copy-constructed clone of src whose entry list is rebuilt in place
+ */
+template <typename TV>
+static void clone_tv_pdu_list(const TV& src, TV& dst)
+{
+    dst.data.clear();
+    dst.data.reserve(src.data.size());
+    const auto src_base = reinterpret_cast<uintptr_t>(src.data_buf.data());
+    for (const auto* entry : src.data)
+    {
+        auto* copy = new typename std::remove_cv_t<std::remove_pointer_t<decltype(entry)>>(*entry);
+        // Re-base only when tb_buf provably points into src.data_buf (parse always sets
+        // tb_buf = data_buf.data() + offset today); on an out-of-range pointer keep the
+        // shallow-copied original and diagnose rather than fabricate a wild pointer.
+        const auto tb_addr = reinterpret_cast<uintptr_t>(entry->tb_buf);
+        if (entry->tb_buf != nullptr && tb_addr >= src_base && tb_addr - src_base <= src.data_buf.size())
+        {
+            copy->tb_buf = dst.data_buf.data() + (tb_addr - src_base);
+        }
+        else if (entry->tb_buf != nullptr)
+        {
+            NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT,
+                       "clone_tv_pdu_list: tb_buf does not point into data_buf; keeping original pointer");
+        }
+        dst.data.push_back(copy);
+    }
+}
+
+/**
+ * Give a slot request its own private deep copy of a cached (master) test_vector_t.
+ *
+ * PDSCH/PUSCH tv_data is read every slot at runtime (TX_DATA payload copy-out, UL
+ * validation), and sharing one buffer across all slots changes testMAC's traffic-time
+ * memory-access pattern vs develop (regressed t0_to_pusch_eh_completion ~5us on
+ * F08_20C_59c EH, see MR !5469 discussion). The cache still avoids the dominant
+ * per-open HDF5 datatype-churn cost; the copy restores develop's per-request layout.
+ *
+ * @param[in] src Cached master, parsed once from the TV file (owned by tv_data_maps)
+ * @return Newly allocated private copy; lives for the process lifetime and is
+ *         reclaimed by the OS at exit (see the destructor NOTE)
+ */
+[[nodiscard]] static test_vector_t* clone_tv_data_private(const test_vector_t* src)
+{
+    test_vector_t* dst = new test_vector_t(*src);
+    clone_tv_pdu_list(src->pdsch_tv, dst->pdsch_tv);
+    clone_tv_pdu_list(src->pusch_tv, dst->pusch_tv);
+    return dst;
+}
+
 int launch_pattern::parse_tv_channels(slot_pattern_t& slots_data, int cell_id, int slot_id, int ch_mask, std::string tv_file, std::vector<std::string>& channel_type_list)
 {
     if(tv_file.length() == 0)
@@ -2955,7 +3051,7 @@ int launch_pattern::parse_tv_channels(slot_pattern_t& slots_data, int cell_id, i
         if (h5file_map.find(tv_file) == h5file_map.end())
         {
             char file_path_array[MAX_PATH_LEN];
-            get_full_path_file(file_path_array, CONFIG_TEST_VECTOR_PATH, tv_file.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
+            get_cubb_full_path(file_path_array, CONFIG_TEST_VECTOR_PATH, tv_file.c_str());
             std::filesystem::path file_path(file_path_array);
             if(access(file_path.c_str(), F_OK) != 0)
             {
@@ -2979,7 +3075,34 @@ int launch_pattern::parse_tv_channels(slot_pattern_t& slots_data, int cell_id, i
         }
         req->h5f = &h5file_map[tv_file];
 
-        if(tv_data_maps[ch].find(tv_file) == tv_data_maps[ch].end())
+        // Reuse parsed test_vector_t across slots referencing the same TV, to avoid the
+        // dominant per-open HDF5 datatype churn (a pattern references each file ~9x on avg).
+        // - Cell-INDEPENDENT parse (data is a pure function of the file): key by file.
+        //   PDSCH parse (parse_tv_pdsch) reads nothing cell-specific, so it is cache-safe.
+        // - PUSCH parse IS cell-dependent (reads get_cell_configs(cell_idx):
+        //   enableWeightedAverageCfo, pusch_sinr_selector), so key by file+cell to stay
+        //   correct when a file is shared across cells.
+        // PUCCH/PRACH remain uncached for now (also cell-dependent; smaller share of cost).
+        const bool cache_channels = (
+                            ch == channel_type_t::PBCH ||
+                            ch == channel_type_t::PDCCH_DL ||
+                            ch == channel_type_t::PDCCH_UL ||
+                            ch == channel_type_t::PDSCH ||
+                            ch == channel_type_t::CSI_RS ||
+                            ch == channel_type_t::PUSCH ||
+                            ch == channel_type_t::SRS
+                            );
+        const bool cache_enabled  = (yaml_configs->tv_data_map_enable != 0) && cache_channels;
+        const bool cell_dependent = (ch == channel_type_t::PUSCH);
+        // PDSCH/PUSCH cache entries are parse-once masters; each request gets a private
+        // deep copy (clone_tv_data_private) so runtime per-slot reads keep develop's
+        // per-request buffer layout. The pre-existing cached channels (PBCH/PDCCH/
+        // CSI_RS/SRS) stay shared, as they always were.
+        const bool private_copy = (ch == channel_type_t::PDSCH || ch == channel_type_t::PUSCH);
+        const std::string cache_key = cell_dependent ? (tv_file + "#c" + std::to_string(cell_id)) : tv_file;
+
+        auto cache_it = cache_enabled ? tv_data_maps[ch].find(cache_key) : tv_data_maps[ch].end();
+        if(!cache_enabled || cache_it == tv_data_maps[ch].end())
         {
             req->tv_data = new test_vector_t;
             if(parse_tv_file(req) != 0)
@@ -2989,27 +3112,20 @@ int launch_pattern::parse_tv_channels(slot_pattern_t& slots_data, int cell_id, i
                 continue;
             }
 
-            bool cache_channels = (
-                                ch == channel_type_t::PBCH ||
-                                ch == channel_type_t::PDCCH_DL ||
-                                ch == channel_type_t::PDCCH_UL ||
-                                // ch == channel_type_t::PDSCH ||
-                                ch == channel_type_t::CSI_RS ||
-                                // ch == channel_type_t::PUSCH ||
-                                // ch == channel_type_t::PUCCH ||
-                                // ch == channel_type_t::PRACH ||
-                                ch == channel_type_t::SRS
-                                );
-
-            // Save to TV data map if enabled
-            if (yaml_configs->tv_data_map_enable != 0 && cache_channels)
+            // Save to TV data map if enabled (owns the pointer; freed once in the destructor).
+            if (cache_enabled)
             {
-                tv_data_maps[ch][tv_file] = req->tv_data;
+                test_vector_t* master = req->tv_data;
+                tv_data_maps[ch][cache_key] = master;
+                if (private_copy)
+                {
+                    req->tv_data = clone_tv_data_private(master);
+                }
             }
         }
         else
         {
-            req->tv_data = tv_data_maps[ch][tv_file];
+            req->tv_data = private_copy ? clone_tv_data_private(cache_it->second) : cache_it->second;
         }
 
         update_expected_values(cell_id, req);

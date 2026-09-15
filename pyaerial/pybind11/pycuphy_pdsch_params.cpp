@@ -42,7 +42,8 @@ void printPdschStatPrms(const cuphyPdschStatPrms_t& statPrms) {
 
     // Parameters common across all cells
     printf("read_TB_CRC:           %4d\n", statPrms.read_TB_CRC);
-    printf("full_slot_processing:  %4d\n", statPrms.full_slot_processing);
+    printf("pipeline_processing_mode :  %4d\n", statPrms.pipeline_processing_mode);
+    printf("delayUs :              %4d\n", statPrms.delayUs);
     printf("stream_priority:       %4d\n", statPrms.stream_priority);
     printf("nMaxCellsPerSlot:      %4d\n", statPrms.nMaxCellsPerSlot);
     printf("nMaxUesPerCellGroup:   %4d\n", statPrms.nMaxUesPerCellGroup);
@@ -116,6 +117,12 @@ void printPdschDynPrms(const cuphyPdschDynPrms_t& dynPrms) {
             }
             printf("}\n");
         }
+    }
+
+    if (dynPrms.pPostFecDataIn == nullptr) {
+        printf("pPostFecDataIn:      %p\n", dynPrms.pPostFecDataIn);
+    } else {
+        printf("pPostFecDataIn: unsupported in pyaerial\n");
     }
 
     // PDSCH data output buffers
@@ -349,7 +356,8 @@ PdschParams::PdschParams(const py::object& statPrms) {
     m_pdschStatPrms.nCells = nCells;
 
     m_pdschStatPrms.read_TB_CRC          = statPrms.attr("read_TB_CRC").cast<bool>();
-    m_pdschStatPrms.full_slot_processing = statPrms.attr("full_slot_processing").cast<bool>();
+    m_pdschStatPrms.pipeline_processing_mode = statPrms.attr("full_slot_processing").cast<bool>() ? cuphyPdschPipelineMode_t::PDSCH_FULL_PROCESSING : cuphyPdschPipelineMode_t::PDSCH_AAS_PROCESSING; // no support for PDSCH_POST_FEC_PROCESSING mode
+    m_pdschStatPrms.delayUs              = 0; // Only relevant for PDSCH_POST_FEC_PROCESSING mode, which is not supported in pyaerial
     m_pdschStatPrms.stream_priority      = statPrms.attr("stream_priority").cast<int>();
     m_pdschStatPrms.nMaxCellsPerSlot     = statPrms.attr("nMaxCellsPerSlot").cast<uint16_t>();
     m_pdschStatPrms.nMaxUesPerCellGroup  = statPrms.attr("nMaxUesPerCellGroup").cast<uint16_t>();
@@ -618,6 +626,7 @@ void PdschParams::setDynPrms(const py::object& dynPrms) {
     }
     m_dataIn = {m_tbInputPtr.data(), cuphyPdschDataIn_t::GPU_BUFFER};
     m_pdschDynPrms.pDataIn = &m_dataIn;
+    m_pdschDynPrms.pPostFecDataIn = nullptr;
 
     // Optional TB CRC data input.
     py::object pyTbCrcDataIn;

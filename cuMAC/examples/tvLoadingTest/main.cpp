@@ -196,11 +196,13 @@ void usage() {
     schdModuleInd();
 }
 
-int main(int argc, char* argv[]) 
+int main(int argc, char* argv[])
 {
+    cumac::loadParameters();
+
     int iArg = 1;
     std::string inputFileName = std::string();
-    
+
     const uint8_t numSchedulerModules = 4;
     std::string modulesCalledStr = std::string();
     uint8_t modulesCalled[numSchedulerModules] = {0, 0, 0, 0};

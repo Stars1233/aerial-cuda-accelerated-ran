@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,22 +129,41 @@ __global__ void crcUplinkPuschCodeBlocksKernel(const __grid_constant__ puschRxCr
             // for CBs of size less than 3808 bits use 16-bit CRC
             if(codeBlockDataByteSize <= MAX_CB_BYTE_SIZE_FOR_CRC16)
             {
+#if CUPHY_CLMAD_AVAILABLE
+                crc ^= mulModCRCPoly_CRC16_CLMAD(inVal,
+                                                    G_CRC_16_P_LUT[(tid)]);
+#else
                 crc ^= mulModCRCPolyLUT<uint16_t, 16>(inVal,
                                                       G_CRC_16_P_LUT[(tid)],
                                                       G_CRC_16_256_LUT,
                                                       *POLY_16);
+#endif
             }
             else
+            {
+#if CUPHY_CLMAD_AVAILABLE
+                crc ^= mulModCRCPoly_CRC24_POLYA_CLMAD(inVal,
+                                                          G_CRC_24_A_P_LUT[(tid)]);
+#else
                 crc ^= mulModCRCPolyLUT<uint32_t, 24>(inVal,
                                                       G_CRC_24_A_P_LUT[(tid)],
                                                       G_CRC_24_A_256_LUT,
                                                       *POLY_A);
+#endif
+            }
         }
         else
+        {
+#if CUPHY_CLMAD_AVAILABLE
+            crc ^= mulModCRCPoly_CRC24_POLYB_CLMAD(inVal,
+                                                      G_CRC_24_B_P_LUT[tid]);
+#else
             crc ^= mulModCRCPolyLUT<uint32_t, 24>(inVal,
                                                   G_CRC_24_B_P_LUT[tid],
                                                   G_CRC_24_B_256_LUT,
                                                   *POLY_B);
+#endif
+        }
 
         // Transport Block assembly
         if((tid * 4) < codeBlockDataByteSize)
@@ -222,10 +241,15 @@ __global__ void crcUplinkPuschTransportBlockKernel(const __grid_constant__ pusch
 
     if(tid < tbSize)
     {
+#if CUPHY_CLMAD_AVAILABLE
+        crc = mulModCRCPoly_CRC24_POLYA_CLMAD(inputTBs[tbBase + tid],
+                                                 G_CRC_24_A_P_LUT[(tid)]);
+#else
         crc = mulModCRCPolyLUT<uint32_t, 24>(inputTBs[tbBase + tid],
                                              G_CRC_24_A_P_LUT[(tid)],
                                              G_CRC_24_A_256_LUT,
                                              *POLY_A);
+#endif
     }
 
     crc = xorReductionWarpShared<uint32_t>(crc, shmemBuf);
@@ -304,6 +328,10 @@ cuphyStatus_t launch(
     desc.pOutputTBCRCs    = d_tbCRCs;
     desc.pTbPrmsArray     = d_tbPrmsArray;
     desc.reverseBytes     = reverseBytes;
+    for(uint32_t i = 0; i < nTBs; ++i)
+    {
+        desc.schUserIdxs[i] = static_cast<uint16_t>(i);
+    }
 
     // Because the kernel is now grid constant, we do not need to copy the descriptor to GPU memory
 
@@ -541,10 +569,15 @@ __global__ void crcDownlinkPdschCodeBlocksKernel(const __grid_constant__ crcEnco
                 }
                 else
                     tabVal = G_CRC_16_P_LUT[offset + 1];
+#if CUPHY_CLMAD_AVAILABLE
+                crc ^= mulModCRCPoly_CRC16_CLMAD(inVal,
+                                                    tabVal);
+#else
                 crc ^= mulModCRCPolyLUT<uint16_t, 16>(inVal,
                                                       tabVal,
                                                       G_CRC_16_256_LUT,
                                                       *POLY_16);
+#endif
             }
             else
             {
@@ -559,10 +592,15 @@ __global__ void crcDownlinkPdschCodeBlocksKernel(const __grid_constant__ crcEnco
                 else
                     tabVal = G_CRC_24_A_P_LUT[offset + 1];
 
+#if CUPHY_CLMAD_AVAILABLE
+                crc ^= mulModCRCPoly_CRC24_POLYA_CLMAD(inVal,
+                                                          tabVal);
+#else
                 crc ^= mulModCRCPolyLUT<uint32_t, 24>(inVal,
                                                       tabVal,
                                                       G_CRC_24_A_256_LUT,
                                                       *POLY_A);
+#endif
             }
         }
         else
@@ -578,10 +616,15 @@ __global__ void crcDownlinkPdschCodeBlocksKernel(const __grid_constant__ crcEnco
             else
                 tabVal = G_CRC_24_B_P_LUT[offset + 1];
 
+#if CUPHY_CLMAD_AVAILABLE
+            crc ^= mulModCRCPoly_CRC24_POLYB_CLMAD(inVal,
+                                                      tabVal);
+#else
             crc ^= mulModCRCPolyLUT<uint32_t, 24>(inVal,
                                                   tabVal,
                                                   G_CRC_24_B_256_LUT,
                                                   *POLY_B);
+#endif
         }
 
         tid += blockDim.x;
@@ -669,7 +712,7 @@ __global__ void crcDownlinkPdschTransportBlockKernel(const __grid_constant__ crc
         {
             in = *(inputTBs + tbBase + tid);
             //   in    = shmemBuf[threadIdx.x + 1];
-            inVal = (in << (tbShiftBytes * 8)) & 0xffffffff;
+            inVal = in << (tbShiftBytes * 8);
         }
         else
         {
@@ -678,7 +721,7 @@ __global__ void crcDownlinkPdschTransportBlockKernel(const __grid_constant__ crc
             inPad = (uint64_t)in << sizeof(uint32_t) * 8;
             inPad ^= *(inputTBs + tbBase + tid - 1);
             // inPad ^= shmemBuf[threadIdx.x];
-            inVal = (inPad >> (32 - (tbShiftBytes * 8))) & 0xffffffff;
+            inVal = (inPad >> (32 - (tbShiftBytes * 8))) & UINT32_MAX;
         }
 
         if(reverseBytes)
@@ -698,10 +741,15 @@ __global__ void crcDownlinkPdschTransportBlockKernel(const __grid_constant__ crc
         else
             tabVal = G_CRC_24_A_P_LUT[offset + 1];
 
+#if CUPHY_CLMAD_AVAILABLE
+        crc = mulModCRCPoly_CRC24_POLYA_CLMAD(inVal,
+                                                 tabVal);
+#else
         crc = mulModCRCPolyLUT<uint32_t, 24>(inVal,
                                              tabVal,
                                              G_CRC_24_A_256_LUT,
                                              *POLY_A);
+#endif
     }
 
     //    __syncthreads();
@@ -959,7 +1007,7 @@ __global__ void prepare_crc_buffers(prepareCrcEncodeDescr_t* p_desc)
     int  element_offset_general_case = (CB_element_offset < ((tb_size - addr_modulo_4 - (tb_size & 0x3))>> 2)) ? 1 : 0;
 #endif
     int pred = 0;
-    unsigned int match_mask = __match_all_sync(0xFFFFFFFF, element_offset_general_case, &pred);
+    unsigned int match_mask = __match_all_sync(FULL_MASK, element_offset_general_case, &pred);
 
     if ((match_mask != 0) && (element_offset_general_case == 1)) {
         if (addr_modulo_4 == 0) {
@@ -971,7 +1019,7 @@ __global__ void prepare_crc_buffers(prepareCrcEncodeDescr_t* p_desc)
         } else {
             const uint32_t* ptr = (uint32_t*)(TB_addr + (CB_element_offset << 2) - addr_modulo_4);
             uint32_t temp_value = *ptr;
-            uint32_t new_value  = __shfl_down_sync(0xffffffff, temp_value, 1);
+            uint32_t new_value  = __shfl_down_sync(FULL_MASK, temp_value, 1);
             if ((threadIdx.x % 32) == 31) {
                 // The element_offset_general_case computation above has been updated to ensure all bytes of this uint32_t have been initialized.
                 // Before this update, i.e., when code was: int  element_offset_general_case = (CB_element_offset < (tb_size >> 2)) ? 1 : 0;
@@ -1171,21 +1219,32 @@ void puschRxCrcDecode::init(int reverseBytes)
     {MemtraceDisableScope md; CUDA_CHECK(cudaGetFuncBySymbol(&m_tbCrcKernelFunc, reinterpret_cast<void*>(crc::crcUplinkPuschTransportBlockKernel)));}
 }
 
-void puschRxCrcDecode::setup(uint16_t                          nSchUes,
-                             uint16_t*                         pSchUserIdxsCpu,
-                             uint32_t*                         pOutputCBCRCs,
-                             uint8_t*                          pOutputTBs,
-                             const uint32_t*                   pInputCodeBlocks,
-                             uint32_t*                         pOutputTBCRCs,
-                             const PerTbParams*                pTbPrmsCpu,
-                             const PerTbParams*                pTbPrmsGpu,
-                             void*                             pCpuDesc,
-                             void*                             pGpuDesc,
-                             uint8_t                           enableCpuToGpuDescrAsyncCpy,
-                             cuphyPuschRxCrcDecodeLaunchCfg_t* pCbCrcLaunchCfg,
-                             cuphyPuschRxCrcDecodeLaunchCfg_t* pTbCrcLaunchCfg,
-                             cudaStream_t                      strm)
+cuphyStatus_t puschRxCrcDecode::setup(uint16_t                          nSchUes,
+                                       uint16_t*                         pSchUserIdxsCpu,
+                                       uint32_t*                         pOutputCBCRCs,
+                                       uint8_t*                          pOutputTBs,
+                                       const uint32_t*                   pInputCodeBlocks,
+                                       uint32_t*                         pOutputTBCRCs,
+                                       const PerTbParams*                pTbPrmsCpu,
+                                       const PerTbParams*                pTbPrmsGpu,
+                                       void*                             pCpuDesc,
+                                       void*                             pGpuDesc,
+                                       uint8_t                           enableCpuToGpuDescrAsyncCpy,
+                                       cuphyPuschRxCrcDecodeLaunchCfg_t* pCbCrcLaunchCfg,
+                                       cuphyPuschRxCrcDecodeLaunchCfg_t* pTbCrcLaunchCfg,
+                                       cudaStream_t                      strm)
 {
+    if(nSchUes > MAX_N_TBS_PER_CELL_GROUP_SUPPORTED) [[unlikely]]
+    {
+        NVLOGE_FMT(NVLOG_PUSCH,
+                   AERIAL_CUPHY_EVENT,
+                   "{}: nSchUes {} exceeds MAX_N_TBS_PER_CELL_GROUP_SUPPORTED {}",
+                   __FUNCTION__,
+                   nSchUes,
+                   MAX_N_TBS_PER_CELL_GROUP_SUPPORTED);
+        return CUPHY_STATUS_NOT_SUPPORTED;
+    }
+
     // setup CPU descriptor
     puschRxCrcDecodeDescr_t& desc = *(static_cast<puschRxCrcDecodeDescr_t*>(pCpuDesc));
 
@@ -1195,10 +1254,6 @@ void puschRxCrcDecode::setup(uint16_t                          nSchUes,
     desc.pOutputTBCRCs    = pOutputTBCRCs;
     desc.pTbPrmsArray     = pTbPrmsGpu;
     desc.reverseBytes     = m_reverseBytes;
-    for(int i = 0; i < nSchUes; ++i)
-    {
-        desc.schUserIdxs[i] = pSchUserIdxsCpu[i];
-    }
 
     // Because the kernel is now grid constant, we do not need to copy the descriptor to GPU memory
 
@@ -1207,11 +1262,28 @@ void puschRxCrcDecode::setup(uint16_t                          nSchUes,
     uint32_t maxNCBsPerTB  = 0;
     uint32_t maxTBByteSize = 0;
 
-    for(int i = 0; i < nTbs; ++i)
+    for(uint32_t i = 0; i < nTbs; ++i)
     {
         uint16_t ueIdx = pSchUserIdxsCpu[i];
-        maxNCBsPerTB  = pTbPrmsCpu[ueIdx].num_CBs > maxNCBsPerTB ? pTbPrmsCpu[ueIdx].num_CBs : maxNCBsPerTB;
-        maxTBByteSize = pTbPrmsCpu[ueIdx].nDataBytes > maxTBByteSize ? pTbPrmsCpu[ueIdx].nDataBytes : maxTBByteSize;
+        if(ueIdx >= MAX_N_TBS_PER_CELL_GROUP_SUPPORTED) [[unlikely]]
+        {
+            return CUPHY_STATUS_INVALID_ARGUMENT;
+        }
+
+        const PerTbParams& tbParams = pTbPrmsCpu[ueIdx];
+        if(tbParams.num_CBs > MAX_N_CBS_PER_TB_SUPPORTED) [[unlikely]]
+        {
+            return CUPHY_STATUS_NOT_SUPPORTED;
+        }
+
+        if(tbParams.nDataBytes > MAX_BYTES_PER_TRANSPORT_BLOCK) [[unlikely]]
+        {
+            return CUPHY_STATUS_NOT_SUPPORTED;
+        }
+
+        desc.schUserIdxs[i] = ueIdx;
+        maxNCBsPerTB        = tbParams.num_CBs > maxNCBsPerTB ? tbParams.num_CBs : maxNCBsPerTB;
+        maxTBByteSize       = tbParams.nDataBytes > maxTBByteSize ? tbParams.nDataBytes : maxTBByteSize;
     }
 
     uint32_t tbSize = (maxTBByteSize + sizeof(uint32_t) - 1) / sizeof(uint32_t);
@@ -1251,4 +1323,5 @@ void puschRxCrcDecode::setup(uint16_t                          nSchUes,
     pTbCrcLaunchCfg->kernelNodeParamsDriver.kernelParams   = &(pTbCrcLaunchCfg->kernelArgs[0]);
     pTbCrcLaunchCfg->kernelNodeParamsDriver.sharedMemBytes = sizeof(uint32_t) * crc::WARP_SIZE;
     pTbCrcLaunchCfg->kernelNodeParamsDriver.extra          = nullptr;
+    return CUPHY_STATUS_SUCCESS;
 }

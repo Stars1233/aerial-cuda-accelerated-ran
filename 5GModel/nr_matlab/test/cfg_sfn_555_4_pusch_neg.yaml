@@ -1,0 +1,821 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+testAlloc: {dl: 0.0, ul: 1.0, ssb: 0.0, pdcch: 0.0, pdsch: 0.0, csirs: 0.0, prach: 0.0,
+  pucch: 0.0, pusch: 1.0, srs: 0.0, bfw: 0.0}
+carrier:
+  carrierFreq: 3.5
+  duplex: 1.0
+  CpType: 0.0
+  mu: 1.0
+  N_grid_start_mu: 0.0
+  N_grid_size_mu: 273.0
+  N_ID_CELL: 1.0
+  Nant_gNB: 2.0
+  Nant_gNB_srs: 4.0
+  N_FhPort_DL: 4.0
+  N_FhPort_UL: 4.0
+  Nant_UE: 2.0
+  freqShift7p5KHz: 0.0
+  SFN_start: 0.0
+  dmrsTypeAPos: 2.0
+  TddPeriod: 2.5
+  SlotConfig: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+ssb:
+  ssbSubcarrierOffset: 12.0
+  SsbOffsetPointA: 6.0
+  periodFrame: 1.0
+  caseType: case_C
+  n_hf: 0.0
+  prcdBf_vec: [0.0, 0.0, 0.0, 0.0]
+  digBFInterfaces_0: 1.0
+  beamIdx_0: 1.0
+  digBFInterfaces_1: 1.0
+  beamIdx_1: 2.0
+  digBFInterfaces_2: 1.0
+  beamIdx_2: 3.0
+  digBFInterfaces_3: 1.0
+  beamIdx_3: 4.0
+  betaPss: 0.0
+  seed: 0.0
+  mib: [0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+  cfgTx: 1.0
+  L_max: 8.0
+  symIdxInFrame: [2.0, 8.0, 16.0, 22.0, 30.0, 36.0, 44.0, 50.0]
+  ssbBitMap: [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  idxUE: 0.0
+pdcch:
+- BWPSize: 273.0
+  BWPStart: 0.0
+  StartSymbolIndex: 0.0
+  DurationSymbols: 2.0
+  coresetIdx: 1.0
+  coresetMap: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  CceRegMappingType: 0.0
+  RegBundleSize: 6.0
+  InterleaverSize: 2.0
+  ShiftIndex: 1.0
+  precoderGranularity: 0.0
+  numDlDci: 1.0
+  testModel: 0.0
+  isCSS: 0.0
+  forceCceIndex: 0.0
+  DCI:
+  - RNTI: 3.0
+    ScramblingId: 7.0
+    ScramblingRNTI: 4.0
+    beta_PDCCH_1_0: 8.0
+    powerControlOffsetSS: 1.0
+    powerControlOffsetSSProfileNR: 0.0
+    AggregationLevel: 1.0
+    cceIndex: 0.0
+    PayloadSizeBits: 45.0
+    prcdBf: 0.0
+    digBFInterfaces: 1.0
+    beamIdx: 1.0
+    seed: 0.0
+    Payload: [0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+      0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+      1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+  dciUL: 0.0
+  idxUE: 0.0
+pdsch:
+- pduBitmap: 0.0
+  BWPSize: 273.0
+  BWPStart: 0.0
+  RNTI: 46.0
+  NrOfCodewords: 1.0
+  targetCodeRate: 0.0
+  qamModOrder: 0.0
+  TBSize: 0.0
+  mcsIndex: 27.0
+  mcsTable: 1.0
+  rvIndex: 0.0
+  dataScramblingId: 40.0
+  nrOfLayers: 4.0
+  portIdx: [0.0, 1.0, 2.0, 3.0]
+  transmissionScheme: 0.0
+  refPoint: 0.0
+  DmrsSymbPos: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  DmrsMappingType: 0.0
+  dmrsConfigType: 0.0
+  DmrsScramblingId: 40.0
+  SCID: 0.0
+  numDmrsCdmGrpsNoData: 2.0
+  resourceAlloc: 1.0
+  rbBitmap: [255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0,
+    255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0,
+    255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0,
+    1.0, 0.0]
+  rbStart: 120.0
+  rbSize: 100.0
+  VRBtoPRBMapping: 0.0
+  StartSymbolIndex: 2.0
+  NrOfSymbols: 10.0
+  prcdBf: 0.0
+  digBFInterfaces: 4.0
+  beamIdx: [1.0, 2.0, 3.0, 4.0]
+  powerControlOffset: 8.0
+  powerControlOffsetSS: 1.0
+  IsLastCbPresent: 0.0
+  isInlineTbCrc: 0.0
+  dlTbCrc: 0.0
+  testModel: 0.0
+  I_LBRM: 1.0
+  maxLayers: 4.0
+  maxQm: 8.0
+  n_PRB_LBRM: 273.0
+  Xtf_remap: []
+  seed: 0.0
+  payload: []
+  idxUE: 0.0
+  idxUeg: 0.0
+csirs:
+- BWPSize: 273.0
+  BWPStart: 0.0
+  StartRB: 100.0
+  NrOfRBs: 52.0
+  CSIType: 1.0
+  Row: 3.0
+  FreqDomain: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  SymbL0: 0.0
+  SymbL1: 10.0
+  CDMType: 1.0
+  FreqDensity: 0.0
+  ScrambId: 0.0
+  prcdBf: 0.0
+  digBFInterfaces: 2.0
+  beamIdx: [1.0, 2.0]
+  powerControlOffset: 8.0
+  powerControlOffsetSS: 1.0
+  idxUE: 0.0
+prach:
+- configurationIndex: 158.0
+  restrictedSet: 0.0
+  rootSequenceIndex: 0.0
+  zeroCorrelationZone: 10.0
+  n_RA_start: 0.0
+  msg1_FDM: 1.0
+  N_nc: 1.0
+  prmbIdx: 10.0
+  ssbIdx: 0.0
+  digBFInterfaces: 4.0
+  beamIdx: [1.0, 2.0, 3.0, 4.0]
+  betaPrach: 1.0
+  allSubframes: 0.0
+  force_thr0: 0.0
+  idxUE: 0.0
+pucch:
+- BWPSize: 273.0
+  BWPStart: 0.0
+  RNTI: 46.0
+  FormatType: 0.0
+  multiSlotTxIndicator: 0.0
+  pi2Bpsk: 0.0
+  maxCodeRate: 0.0
+  prbStart: 1.0
+  prbSize: 1.0
+  startSym: 0.0
+  nSym: 8.0
+  freqHopFlag: 1.0
+  secondHopPRB: 200.0
+  groupHopFlag: 1.0
+  sequenceHopFlag: 0.0
+  hoppingId: 100.0
+  cs0: 2.0
+  dataScramblingId: 0.0
+  tOCCidx: 0.0
+  PreDftOccIdx: 0.0
+  PreDftOccLen: 0.0
+  AddDmrsFlag: 0.0
+  DmrsScramblingId: 0.0
+  DMRScyclicshift: 0.0
+  digBFInterfaces: 4.0
+  beamIdx: [1.0, 2.0, 3.0, 4.0]
+  SRFlag: 1.0
+  BitLenHarq: 0.0
+  BitLenSr: 0.0
+  BitLenCsiPart1: 0.0
+  positiveSR: 0.0
+  DTX: 0.0
+  idxUE: 0.0
+  DTXthreshold: 1.0
+  rank: 1.0
+  rankBitOffset: 0.0
+  rankBitSize: 2.0
+  UciP1ToP2Crpd: {numPart2s: 0.0}
+srs:
+- RNTI: 10.0
+  BWPSize: 273.0
+  BWPStart: 0.0
+  numAntPorts: 1.0
+  numSymbols: 1.0
+  numRepetitions: 1.0
+  timeStartPosition: 12.0
+  configIndex: 63.0
+  sequenceId: 0.0
+  bandwidthIndex: 0.0
+  combSize: 4.0
+  combOffset: 1.0
+  cyclicShift: 1.0
+  frequencyPosition: 1.0
+  frequencyShift: 1.0
+  frequencyHopping: 0.0
+  groupOrSequenceHopping: 0.0
+  resourceType: 0.0
+  Tsrs: 1.0
+  Toffset: 0.0
+  Beamforming: 0.0
+  digBFInterfaces: 4.0
+  beamIdx: [1.0, 2.0, 3.0, 4.0]
+  numTotalUeAntennas: 1.0
+  ueAntennasInThisSrsResourceSet: 1.0
+  sampledUeAntennas: 1.0
+  usage: 0.0
+  idxUE: 0.0
+  prgSize: 2.0
+bfw:
+- {nUes: 1.0, bfwUL: 0.0, RNTI: 1.0, pduIndex: 0.0, numOfUeAnt: 1.0, gnbAntIdxStart: 0.0,
+  gnbAntIdxEnd: 31.0, ueAntIdx0: 0.0, ueAntIdx1: 0.0, ueAntIdx3: 0.0, ueAntIdx4: 0.0,
+  rbStart: 0.0, rbSize: 272.0, numPRGs: 136.0, prgSize: 2.0}
+Chan:
+- type: AWGN
+  DelayProfile: CDL-A
+  DelaySpread: 3.0E-8
+  MaximumDopplerShift: 10.0
+  CDL_updateRateType: perSample
+  gNB_AntPolarizationAngles: [45.0, -45.0]
+  UE_AntPolarizationAngles: [45.0, -45.0]
+  gNB_AntArraySize: [1.0, 2.0, 2.0]
+  UE_AntArraySize: [1.0, 1.0, 2.0]
+  gNB_AntPattern: '38.901'
+  UE_AntPattern: isotropic
+  gNB_AntSpacing: [0.5, 0.5]
+  UE_AntSpacing: [0.5, 0.5]
+  MIMOCorrelation: Low
+  CDL_DPA: []
+  CDL_PCP: []
+  SNR: 40.0
+  delay: 0.0
+  CFO: 0.0
+  model_source: MATLAB5Gtoolbox
+  simplifiedDelayProfile: 1.0
+  gain: 1.0
+Interf_Chan:
+- type: AWGN
+  DelayProfile: CDL-A
+  DelaySpread: 3.0E-8
+  MaximumDopplerShift: 10.0
+  CDL_updateRateType: perSample
+  gNB_AntPolarizationAngles: [45.0, -45.0]
+  UE_AntPolarizationAngles: [45.0, -45.0]
+  gNB_AntArraySize: [1.0, 2.0, 2.0]
+  UE_AntArraySize: [1.0, 1.0, 2.0]
+  gNB_AntPattern: '38.901'
+  UE_AntPattern: isotropic
+  MIMOCorrelation: Low
+  SIR: 40.0
+  delay: 0.0
+  CFO: 0.0
+  model_source: MATLAB5Gtoolbox
+  simplifiedDelayProfile: 1.0
+  gain: 1.0
+SimCtrl:
+  relNum: 10000.0
+  N_UE: 1.0
+  N_frame: 1.0
+  N_slot_run: 1.0
+  timeDomainSim: 0.0
+  enableCS: 0.0
+  prachFalseAlarmTest: 0.0
+  puschHARQ:
+    EnableAutoHARQ: 0.0
+    MaxTransmissions: 1.0
+    MinTransmissions: 1.0
+    rvTable: [0.0, 2.0, 3.0, 1.0]
+    MAX_gNB_HARQ_BUFFERS: 32.0
+  force_pucch_payload_as: random
+  plotFigure: {tfGrid: 0.0, constellation: 0.0}
+  printCheckDet: 0.0
+  bf: {N_SRS_CHEST_BUFF: 0.0}
+  enable_codebook_BF: 1.0
+  enable_dynamic_BF: 0.0
+  genTV:
+    enable: 1.0
+    enableUE: 0.0
+    tvDirName: GPU_test_input
+    genYamlCfg: 0.0
+    cuPHY: 1.0
+    FAPI: 1.0
+    launchPattern: 0.0
+    fhMsgMode: 0.0
+    FAPIyaml: 0.0
+    slotIdx: 14.0
+    forceSlotIdxFlag: 1.0
+    bypassComp: 0.0
+    idx: 0.0
+    TVname: []
+    polDbg: 0.0
+    enable_logging_tx_Xtf: 0.0
+    enable_logging_carrier_and_channel_info: 0.0
+    enable_logging_dbg_pusch_chest: 1.0
+    add_LS_chEst: 0.0
+  oranComp:
+    iqWidth: [14.0, 9.0]
+    Ref_c: [0.0, 0.0]
+    FSOffset: [0.0, 0.0]
+    Nre_max: 3276.0
+    max_amp_ul: 65504.0
+  oranFixedPoint: {iqWidth_UL: 16.0, beta_UL: 2048.0, iqWidth_DL: 16.0, beta_DL: 2048.0}
+  BFPforCuphy: 14.0
+  FixedPointforCuphy: 0.0
+  alg:
+    enableRssiMeas: 1.0
+    enableSinrMeas: 1.0
+    enableIrc: 1.0
+    Rww_regularizer_val: 1.0E-8
+    enable_nCov_shrinkage: 1.0
+    nCov_shrinkage_method: 0.0
+    pusch_sinr_selector: 1.0
+    LDPC_maxItr: 10.0
+    LDPC_enableEarlyTerm: 0.0
+    LDPC_earlyTermAlg: SAFEET
+    LDPC_earlyTerm_NBF_num_consecutive_itr: 2.0
+    LDPC_earlyTerm_SAFEET_badItrThres: 2.0
+    LDPC_flags: 2.0
+    LDPC_DMI_method: LUT_spef
+    LDPC_DMI_ML_model_path: []
+    LDPC_DMI_ML_confidence_thres: 0.0
+    LDPC_DMI_LUT_SNRmargin_dB: 0.0
+    LDPC_DMI_LUT_numItr_vec: [10.0, 7.0]
+    LDPC_use_5Gtoolbox_flag: 0.0
+    tdi1_alg: linInterp
+    ChEst_use_vPRBs: 0.0
+    enableEarlyHarq: 1.0
+    lastEarlyHarqSymZeroIndexed: 3.0
+    dft_s_ofdm_enable_bluestein_fft: 1.0
+    dft_s_ofdm_bluestein_fft_size_lut_row1: [5.0, 10.0, 21.0, 42.0, 85.0, 170.0, 270.0]
+    dft_s_ofdm_bluestein_fft_size_lut_row2: [128.0, 256.0, 512.0, 1024.0, 2048.0,
+      4096.0, 8192.0]
+    ChEst_alg_selector: 1.0
+    ChEst_MMSE_w_delay_and_spread_est_opt: 2.0
+    ChEst_enable_update_W: 0.0
+    ChEst_enable_quantize_delay_spread_est: 1.0
+    ChEst_quantize_levels_delay_spread_est: [7.22E-8, 1.4430000000000001E-7, 2.887E-7,
+      5.774E-7]
+    pusch_equalizer_bias_corr_limit: 10.0
+    srs_chEst_alg_selector: 0.0
+    srs_chEst_toL2_normalization_algo_selector: 1.0
+    srs_chEst_toL2_constant_scaler: 32768.0
+    enableNoiseEstForZf: 1.0
+    fakeSNRdBForZf: 36.0
+    enableCfoEstimation: 1.0
+    enableCfoCorrection: 1.0
+    enableToEstimation: 1.0
+    enableToCorrection: 0.0
+    enableDftSOfdm: 0.0
+    TdiMode: 1.0
+    TdiModePf3: 1.0
+    dtxModePf2: 1.0
+    dtxModePf3: 1.0
+    dtxModeUciOnPusch: 1.0
+    useNrUCIDecode: 0.0
+    listLength: 8.0
+    enablePrcdBf: 0.0
+    enable_get_genie_meas: 0.0
+    enable_use_genie_nCov: 0.0
+    genie_nCov_method: genie_interfNoise_based
+    enable_sphere_decoder: 0.0
+    enable_use_genie_channel_for_equalizer: 0.0
+    enable_avg_nCov_prbs_fd: 0.0
+    win_size_avg_nCov_prbs_fd: 3.0
+    threshold_avg_nCov_prbs_fd_dB: 3.0
+    enable_instant_equ_coef_cfo_corr: 1.0
+    bfwPowerNormAlg_selector: 1.0
+  delaySpread: 1.0E-6
+  fp16AlgoSel: 2.0
+  fp_flag_global: 0.0
+  fp_flag_pusch_chest: 0.0
+  fp_flag_pusch_equalizer: 0.0
+  fp_flag_pusch_demapper: 0.0
+  fp_flag_pusch_demapper_out_llr: 0.0
+  fp_flag_pusch_ldpc_decoder: 0.0
+  forceRxZero: 0.0
+  useCuphySoftDemapper: 2.0
+  checkSrsHestErr: 0.0
+  forceCsiPart2Length: 0.0
+  capSamp:
+    enable: 0.0
+    fileName: []
+    isComp: 0.0
+  ul_gain_calibration: 48.68
+  enableUeRx: 0.0
+  enableDlTxBf: 0.0
+  enableUlRxBf: 0.0
+  enableSrsState: 0.0
+  BfKnownChannel: 0.0
+  nSlotSrsUpdate: 1.0
+  results: []
+  N_Interfering_UE_UL: 0.0
+  batchsim: {save_results: 0.0, save_results_short: 0.0, save_results_LDPC: 0.0, save_results_PUSCH_ChEst: 0.0}
+  seed: 0.0
+  enable_get_genie_channel_matrix: 0.0
+  enable_freeze_tx_and_channel: 0.0
+  enable_freeze_tx: 0.0
+  ml:
+    enable: 0.0
+    python_executable: python3
+    python_ExecutionMode: OutOfProcess
+    dataset: {enable_save_dataset: 0.0, channel: pusch}
+  oranCompressBetaForce: 0.0
+  enable_print_idxFrame: 0.0
+  enable_snapshot_gNB_UE_into_SimCtrl: 0.0
+  bfw: {compressBitWidth: 9.0, beta: 16384.0, enable_prg_chest: 0.0}
+  subslot_proc_option: 0.0
+  normalize_pusch_tx_power_over_layers: 0.0
+  negTV: {enable: 0.0}
+  enable_UL_Rx_RF_impairments: 0.0
+  enable_DL_Tx_RF_impairments: 0.0
+  enable_EVM_calculation: 0.0
+  UL_Rx_power_scaling_dB: 0.0
+  enable_normalize_Xtf_perUeg: 0.0
+  enable_multi_csiP2_fapiv3: 0.0
+  nCsi2Maps: 3.0
+  MAX_NUM_CSI1_PRM: 4.0
+  MAX_NUM_CSI2_MAPS: 4.0
+  MAX_NUM_CSI2_REPORTS: 16.0
+  csi2Maps_nPart1Prms:
+  - [1.0]
+  - [2.0]
+  - [1.0]
+  - [0.0]
+  csi2Maps_part1PrmSizes:
+  - [2.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [1.0]
+  - [2.0]
+  - [0.0]
+  - [0.0]
+  - [2.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  csi2Maps_sumOfPrmSizes:
+  - [2.0]
+  - [3.0]
+  - [2.0]
+  - [0.0]
+  csi2Maps_bufferStartIdxs:
+  - [0.0]
+  - [4.0]
+  - [12.0]
+  - [0.0]
+  csi2Maps_buffer: [5.0, 5.0, 4.0, 4.0, 4.0, 8.0, 10.0, 5.0, 2.0, 11.0, 20.0, 8.0,
+    8.0, 8.0, 3.0, 3.0]
+  enable_static_dynamic_beamforming: 0.0
+  num_static_beamIdx: 1024.0
+  num_TRX_beamforming: 64.0
+  timeline: {pusch_seg0_Tchan_start_offset: 1000.0, pusch_seg0_Tchan_duration: 4500.0,
+    pusch_seg1_Tchan_start_offset: 1000.0, pusch_seg1_Tchan_duration: 2000.0}
+RF:
+  ref_impedance_ohm: 50.0
+  noise_floor_dBmPerHz: -174.0
+  UL_Rx_tot_NF_dB: 5.0
+  UL_Rx_gain_dB: 33.5
+  UL_Rx_IIP3_dBm: -3.5
+  UL_Rx_IQ_imblance_gain_dB: 0.5
+  UL_Rx_IQ_imblance_phase_degree: 5.0
+  UL_Rx_PN_spectral_mask_freqOffset_Hz: [1000.0, 10000.0, 100000.0, 1000000.0]
+  UL_Rx_PN_spectral_mask_power_dBcPerHz: [-90.0, -90.0, -90.0, -140.0]
+  UL_Rx_PN_level_offset_dB: 0.0
+  UL_Rx_DC_offset_real_volt: 0.0
+  UL_Rx_DC_offset_imag_volt: 0.0
+  UL_Rx_baseband_gain_dB: 15.18
+  DL_Tx_signal_distortion_var_dB: -30.0
+  DL_Tx_gain_dB: 25.0
+  DL_Tx_IIP3_dBm: 20.0
+  DL_Tx_IQ_imblance_gain_dB: 0.5
+  DL_Tx_IQ_imblance_phase_degree: 5.0
+  DL_Tx_PN_spectral_mask_freqOffset_Hz: [1000.0, 10000.0, 100000.0, 1000000.0]
+  DL_Tx_PN_spectral_mask_power_dBcPerHz: [-90.0, -90.0, -90.0, -140.0]
+  DL_Tx_PN_level_offset_dB: 0.0
+  DL_Tx_DC_offset_real_volt: 0.0
+  DL_Tx_DC_offset_imag_volt: 0.0
+pusch:
+- pduBitmap: 3.0
+  BWPSize: 273.0
+  BWPStart: 0.0
+  RNTI: 38510.0
+  NrOfCodewords: 1.0
+  pi2BPSK: 0.0
+  targetCodeRate: 1200.0
+  qamModOrder: 2.0
+  TBSize: 28.0
+  mcsIndex: 29.0
+  mcsTable: 0.0
+  rvIndex: 0.0
+  newDataIndicator: 1.0
+  harqProcessID: 0.0
+  TransformPrecoding: 1.0
+  dataScramblingId: 0.0
+  nrOfLayers: 1.0
+  portIdx: [0.0]
+  DmrsSymbPos: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+  DmrsMappingType: 0.0
+  dmrsConfigType: 1.0
+  DmrsScramblingId: 1.0
+  puschIdentity: 1.0
+  SCID: 0.0
+  numDmrsCdmGrpsNoData: 2.0
+  resourceAlloc: 1.0
+  rbStart: 8.0
+  rbSize: 257.0
+  VRBtoPRBMapping: 0.0
+  FrequencyHopping: 0.0
+  txDirectCurrentLocation: 3301.0
+  uplinkFrequencyShift7p5khz: 0.0
+  StartSymbolIndex: 0.0
+  NrOfSymbols: 12.0
+  prcdBf: 0.0
+  I_LBRM: 0.0
+  maxLayers: 4.0
+  maxQm: 8.0
+  n_PRB_LBRM: 273.0
+  digBFInterfaces: 4.0
+  beamIdx: [16.0, 17.0, 18.0, 19.0]
+  seed: 0.0
+  payload: []
+  idxUE: 0.0
+  idxUeg: 0.0
+  harqAckBitLength: 2.0
+  harqPayload: []
+  csiPart1BitLength: 0.0
+  csiPart1Payload: []
+  csiPart2Payload: []
+  alphaScaling: 3.0
+  betaOffsetHarqAck: 9.0
+  betaOffsetCsi1: 6.0
+  betaOffsetCsi2: 6.0
+  rank: 1.0
+  rankBitOffset: 0.0
+  rankBitSize: 0.0
+  DTXthreshold: 1.0
+  groupOrSequenceHopping: 0.0
+  flagCsiPart2: 0.0
+  part2SizeMapping: [5.0, 5.0, 4.0, 4.0]
+  prgSize: 273.0
+  csiPart2BitLength: 255.0
+  calcCsi2Size_csi2MapIdx:
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  calcCsi2Size_nPart1Prms:
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  calcCsi2Size_prmOffsets:
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  calcCsi2Size_prmSizes:
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  calcCsi2Size_prmValues:
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  - [0.0]
+  nCsi2Reports: 0.0

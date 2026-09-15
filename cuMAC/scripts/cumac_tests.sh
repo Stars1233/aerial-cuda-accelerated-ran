@@ -53,7 +53,7 @@ script_folder="${cuBB_SDK}/cuMAC/scripts"
 if [[ -z "$test" || -z "$log" ]]; then
    echo "test and log are required parameters."
    echo "Usage: $script_name -t <test> -l <log> -g <gpu> -m <true|false>"
-   echo "   test: 4t4r, tdl, cdl, drl, srs, 64tr, 4t4r_fast_fading, pfmsort"
+   echo "   test: 4t4r, tdl, cdl, drl, srs, 64tr, 4t4r_fast_fading, pfmsort, muuegrp"
    echo "   log: log folder"
    echo "   gpu: gpu device id, if not provided,then will be 0"
    echo "   smoke (-m/-M): enable smoke test, true|false, if not provided,then will be false, which runs exhaustive sanity tests, but will consume more time. Used only for 4t4r and 64tr tests"
@@ -72,10 +72,10 @@ echo "log folder: ${log}/${test}"
 if [[ "$test" == "4t4r" || "$test" == "4t4r_fast_fading" ]]; then
    ant="4"
    # DL is always supported, but those are the only TVs that support both DL and UL tests
-   tvs="0004 0008 0012 0016 0020 0024 0028 0032" 
-   # 4t4r test will take 3.2 hours when numSimChnRlz = 2000 on tvs "0008 0016 0020 0024 0028 0032"  
-   # tvs_for_smoke can even be reduced from "0008 0016 0020 0024 0028 0032" to  "0016 0028 0032" 
-   tvs_for_smoke="0008 0016 0020 0024 0028 0032"  
+   tvs="0004 0008 0012 0016 0020 0024 0028 0032"
+   # 4t4r test will take 3.2 hours when numSimChnRlz = 2000 on tvs "0008 0016 0020 0024 0028 0032"
+   # tvs_for_smoke can even be reduced from "0008 0016 0020 0024 0028 0032" to  "0016 0028 0032"
+   tvs_for_smoke="0008 0016 0020 0024 0028 0032"
 
    for dir in "DL" "UL"; do
       generate_cmd="python3 ${script_folder}/generate_tv.py -d ${dir} -l ${log}/${test} -a ${ant} -s ${cuBB_SDK}"
@@ -86,14 +86,14 @@ if [[ "$test" == "4t4r" || "$test" == "4t4r_fast_fading" ]]; then
                echo "Start to generate 4T4R ${dir} smoke TV ${idx} ..."
                cd "$script_folder" && eval "$gen_cmd"
             done
-      else 
+      else
          if [ "$test" == "4t4r_fast_fading" ]; then
             generate_cmd="${generate_cmd} -o 4"
          fi
 
          echo "Start to generate 4T4R ${dir} TVs ..."
          cd "$script_folder" && eval "$generate_cmd"
-      fi 
+      fi
 
       # Temporarily commented out test cases
       for case in "UE_selection" "PRG_allocation" "Layer_selection" "MCS_selection" "Scheduler_pipeline"; do
@@ -153,5 +153,36 @@ elif [[ "$test" == "pfmsort" ]];then
       cd "$script_folder" && $test_cmd -o $test -l ${log}/${test} -i all --smoke
    else
       cd "$script_folder" && $test_cmd -o $test -l ${log}/${test} -i all
+   fi
+
+elif [[ "$test" == "muuegrp" ]];then
+   echo "Start to run cumac $test tests (480 TVs) ..."
+   muuegrp_script="${cuBB_SDK}/cuMAC/examples/muMimoUeGrpL2Integration/run_cumac_muuegrp_test.sh"
+   if [[ ! -f "$muuegrp_script" ]]; then
+      echo "Error: ${muuegrp_script} not found (expected under cuMAC/examples/muMimoUeGrpL2Integration in cuBB_SDK)." >&2
+      exit 1
+   fi
+   muuegrp_passed=0
+   muuegrp_failed=0
+   if [[ "$smoke" == "true" ]]; then
+      tvs_for_smoke="0001 0030 0031 0060 0061 0090 0091 0120 0121 0150 0151 0180 0181 0210 0211 0240 0241 0270 0271 0300 0301 0330 0331 0360 0361 0390 0391 0420 0421 0450 0451 0480"
+   else
+      tvs_for_smoke=$(seq -f "%04g" 1 480) # run all 480 TVs for non-smoke test
+   fi
+   tv_total=$(wc -w <<< "${tvs_for_smoke}")
+   for tv in $tvs_for_smoke
+   do
+       echo "Running muuegrp TV ${tv} / ${tv_total} ..."
+       if LOG_PATH="${log}/${test}" cuBB_SDK="${cuBB_SDK}" bash "$muuegrp_script" -c muUeGrp_L2_Integration -v "${tv}"; then
+           muuegrp_passed=$((muuegrp_passed + 1))
+       else
+           muuegrp_failed=$((muuegrp_failed + 1))
+           echo "cuMAC muuegrp TV ${tv}: FAILED (see logs under ${log}/${test})." >&2
+       fi
+   done
+   echo "cuMAC muuegrp summary: ${muuegrp_passed} passed, ${muuegrp_failed} failed (total ${tv_total})."
+   if (( muuegrp_failed > 0 )); then
+       echo "Error: ${muuegrp_failed} of ${tv_total} muuegrp test(s) failed." >&2
+       exit 1
    fi
 fi

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +23,10 @@
 #include "cuphy_internal.h"
 #include "utils.cuh"
 #include "tensor_desc.hpp"
+#include "ldpc/ldpc_params.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <numeric>
 #include <type_traits>
 
@@ -145,6 +147,110 @@ inline uint32_t getMaxNPrbAlloc(cuphyPuschStatPrms_t const* pStatPrms)
 {
     uint32_t maxNPrbAlloc = pStatPrms->nMaxPrb == 0 ? MAX_N_PRBS_SUPPORTED : pStatPrms->nMaxPrb;
     return maxNPrbAlloc;
+}
+
+struct PuschRateMatchDescrInfo
+{
+    size_t sizeBytes;
+    size_t alignBytes;
+};
+
+/**
+ * Returns the descriptor allocation required for early-SCH rate matching.
+ *
+ * Full-TB decoding does not use the early rate-matching path, so its descriptor
+ * is omitted from the dynamic descriptor allocation and bulk H2D copy.
+ *
+ * @param[in] useCbLdpc Whether the codeblock-centric LDPC path is enabled.
+ * @param[in] rateMatchDescrSizeBytes Size of the regular rate-matching descriptor.
+ * @param[in] rateMatchDescrAlignBytes Alignment of the regular rate-matching descriptor.
+ * @return Size and alignment required for the early rate-matching descriptor.
+ */
+[[nodiscard]] constexpr PuschRateMatchDescrInfo getEarlyRateMatchDescrInfo(
+    bool useCbLdpc, size_t rateMatchDescrSizeBytes, size_t rateMatchDescrAlignBytes) noexcept
+{
+    return useCbLdpc ? PuschRateMatchDescrInfo{rateMatchDescrSizeBytes, rateMatchDescrAlignBytes}
+                     : PuschRateMatchDescrInfo{0, 0};
+}
+
+/**
+ * Returns the number of complete leading codeblocks represented by early-SCH bits.
+ *
+ * The UCI path partitions the rate-matched budget in @c G; the non-UCI path uses
+ * @c encodedSize.
+ *
+ * @param[in] tbPrms Per-transport-block rate-matching parameters.
+ * @param[in] availableSchBits Number of early shared-channel bits available.
+ * @return The count of complete leading codeblocks available for early decode.
+ */
+[[nodiscard]] inline uint16_t computeLeadingEarlySchCbCount(const PerTbParams& tbPrms, uint32_t availableSchBits)
+{
+    const uint32_t rateMatchedBits = tbPrms.uciOnPuschFlag ? tbPrms.G : tbPrms.encodedSize;
+    if (availableSchBits == 0 || tbPrms.num_CBs == 0 || tbPrms.Nl == 0 || tbPrms.Qm == 0 ||
+        rateMatchedBits == 0)
+    {
+        return 0;
+    }
+
+    const uint32_t bitsPerQamBlock = tbPrms.Nl * tbPrms.Qm;
+    if (bitsPerQamBlock == 0)
+    {
+        return 0;
+    }
+
+    const uint32_t nQamBlocks          = rateMatchedBits / bitsPerQamBlock;
+    const uint32_t qamBlocksPerCb      = nQamBlocks / tbPrms.num_CBs;
+    const uint32_t longerCbRemainder   = nQamBlocks - qamBlocksPerCb * tbPrms.num_CBs;
+    const uint32_t shorterCbCount      = tbPrms.num_CBs - longerCbRemainder;
+    const bool     hasLongerCodeblocks =
+        qamBlocksPerCb * bitsPerQamBlock * tbPrms.num_CBs < rateMatchedBits;
+    uint64_t       consumedSchBits     = 0;
+    uint16_t       completeLeadingCbs  = 0;
+
+    for (uint32_t cbIdx = 0; cbIdx < tbPrms.num_CBs; ++cbIdx)
+    {
+        const uint32_t cbQamBlocks = qamBlocksPerCb +
+            ((cbIdx >= shorterCbCount && longerCbRemainder > 0 && hasLongerCodeblocks) ? 1U : 0U);
+        const uint64_t cbSchBits   = static_cast<uint64_t>(cbQamBlocks) * bitsPerQamBlock;
+        if (cbSchBits == 0 || consumedSchBits + cbSchBits > availableSchBits)
+        {
+            break;
+        }
+        consumedSchBits += cbSchBits;
+        ++completeLeadingCbs;
+    }
+
+    return completeLeadingCbs;
+}
+
+/**
+ * Determines whether the early-SCH decode batch requires preparation.
+ *
+ * @param[in] nEarlyDecodedSchCbs Number of codeblocks scheduled for early decode.
+ * @return @c true when at least one codeblock is scheduled for early decode.
+ */
+[[nodiscard]] inline bool needsEarlyCbBatchPreparation(uint32_t nEarlyDecodedSchCbs)
+{
+    return nEarlyDecodedSchCbs != 0;
+}
+
+/**
+ * Determines whether the full-slot path has rate-matching and LDPC work.
+ *
+ * Full-TB LDPC always uses the full-slot backend. Codeblock-centric LDPC can
+ * omit that work when every scheduled codeblock was decoded in the subslot
+ * phase. CRC processing remains separate and may still be required.
+ *
+ * @param[in] useCbLdpc Whether the codeblock-centric LDPC path is enabled.
+ * @param[in] nFullSlotRemainingSchCbs Number of SCH codeblocks left for the full-slot phase.
+ * @return @c true when full-slot rate matching and LDPC decoding are required.
+ *         @c false when codeblock-centric LDPC is enabled and no SCH codeblocks
+ *         remain for full-slot decoding.
+ */
+[[nodiscard]] constexpr bool needsFullSlotSchDecode(
+    bool useCbLdpc, uint32_t nFullSlotRemainingSchCbs) noexcept
+{
+    return !useCbLdpc || nFullSlotRemainingSchCbs != 0;
 }
 
 // Expand Parameters Helpers: UCI on PUSCH
@@ -597,11 +703,8 @@ inline void expandParameters(PerTbParams* pPerTbPrms, cuphyPuschStatPrms_t const
         }
         pPerTbPrms[i].tbSize = tbSize;
 
-        // Derive BG (from derive_BGN.m)
-        if((tbSize <= 292) || ((tbSize <= 3824) && (codeRate <= 0.67)) || (codeRate <= 0.25))
-            pPerTbPrms[i].bg = 2;
-        else
-            pPerTbPrms[i].bg = 1;
+        // Derive BG (from derive_BGN.m) - 3GPP TS 38.212 Section 6.2.2
+        pPerTbPrms[i].bg = cuphy::ldpc::derive_base_graph(tbSize, codeRate);
 
         // Derive codeblock size and number of filler bits
 
@@ -636,35 +739,9 @@ inline void expandParameters(PerTbParams* pPerTbPrms, cuphyPuschStatPrms_t const
         // Bits per code block
         uint32_t K_prime = B_prime / pPerTbPrms[i].num_CBs;
 
-        // Derive lifting size
-        if(pPerTbPrms[i].bg == 1)
-            ldpcPrms.KbArray[i] = 22;
-        else if(B > 640)
-            ldpcPrms.KbArray[i] = 10;
-        else if(B > 540)
-            ldpcPrms.KbArray[i] = 9;
-        else if(B > 192)
-            ldpcPrms.KbArray[i] = 8;
-        else
-            ldpcPrms.KbArray[i] = 6;
-        static constexpr uint32_t Z[51] = {
-            2, 4, 8, 16, 32, 64, 128, 256, 3, 6, 12, 24, 48, 96, 192, 384, 5, 10, 20, 40, 80, 160, 320, 7, 14, 28, 56,
-            112, 224, 9, 18, 36, 72, 144, 288, 11, 22, 44, 88, 176, 352, 13, 26, 52, 104, 208, 15, 30, 60, 120, 240
-        };
-
-        // Derive ZcArray (from derive_lifting.m)
-        // find smallest Z such that Z*K_b >= K_prime:
-        uint32_t tmp1{}, tmp2 = 1'000'000;
-        for(int j = 0; j < 51; j++)
-        {
-            tmp1 = Z[j] * ldpcPrms.KbArray[i];
-
-            if((tmp1 >= K_prime) && (tmp1 < tmp2))
-            {
-                tmp2             = tmp1;
-                pPerTbPrms[i].Zc = Z[j];
-            }
-        }
+        // Derive Kb and Zc - 3GPP TS 38.212 Section 5.2.2
+        ldpcPrms.KbArray[i] = cuphy::ldpc::derive_Kb(pPerTbPrms[i].bg, B);
+        pPerTbPrms[i].Zc    = cuphy::ldpc::derive_Zc(ldpcPrms.KbArray[i], K_prime);
 
         // Derive K (codeblock size) and F (number of filler bits)
 

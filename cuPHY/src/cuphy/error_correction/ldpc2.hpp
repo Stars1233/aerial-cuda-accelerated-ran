@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,8 @@
 #define LDPC_2_HPP_INCLUDED_
 
 #include "ldpc.hpp"
+#include "ldpc2_et_context.cuh"
+#include "nrLDPC_templates.cuh"
 
 ////////////////////////////////////////////////////////////////////////
 // Functions specific to the "LDPC2" family of implementations
@@ -27,14 +29,40 @@ namespace ldpc2
 
 union word_t
 {
-    float       f32;
-    uint32_t    u32;
-    int32_t     i32;
-    __half_raw  f16;
-    __half2_raw f16x2;
-    ushort2     u16x2;
-    short2      i16x2;
+    float                 f32;
+    uint32_t              u32;
+    int32_t               i32;
+    __half_raw            f16;
+    __half2_raw           f16x2;
+    ushort2               u16x2;
+    short2                i16x2;
+    __nv_fp8x4_e5m2       fp8x4_e5m2;
+    __nv_fp8x4_e4m3       fp8x4_e4m3;
 };
+
+template <typename T> __device__ T& word_t_as(word_t& w);
+
+template <> inline __device__ float&           word_t_as<float>          (word_t& w) { return w.f32; }
+template <> inline __device__ uint32_t&        word_t_as<uint32_t>       (word_t& w) { return w.u32; }
+template <> inline __device__ int32_t&         word_t_as<int32_t>        (word_t& w) { return w.i32; }
+template <> inline __device__ __half_raw&      word_t_as<__half_raw>     (word_t& w) { return w.f16; }
+template <> inline __device__ __half2_raw&     word_t_as<__half2_raw>    (word_t& w) { return w.f16x2; }
+template <> inline __device__ ushort2&         word_t_as<ushort2>        (word_t& w) { return w.u16x2; }
+template <> inline __device__ short2&          word_t_as<short2>         (word_t& w) { return w.i16x2; }
+template <> inline __device__ __nv_fp8x4_e5m2& word_t_as<__nv_fp8x4_e5m2>(word_t& w) { return w.fp8x4_e5m2; }
+template <> inline __device__ __nv_fp8x4_e4m3& word_t_as<__nv_fp8x4_e4m3>(word_t& w) { return w.fp8x4_e4m3; }
+
+template <typename T> __device__ const T& word_t_as(const word_t& w);
+
+template <> inline __device__ const float&           word_t_as<float>          (const word_t& w) { return w.f32; }
+template <> inline __device__ const uint32_t&        word_t_as<uint32_t>       (const word_t& w) { return w.u32; }
+template <> inline __device__ const int32_t&         word_t_as<int32_t>        (const word_t& w) { return w.i32; }
+template <> inline __device__ const __half_raw&      word_t_as<__half_raw>     (const word_t& w) { return w.f16; }
+template <> inline __device__ const __half2_raw&     word_t_as<__half2_raw>    (const word_t& w) { return w.f16x2; }
+template <> inline __device__ const ushort2&         word_t_as<ushort2>        (const word_t& w) { return w.u16x2; }
+template <> inline __device__ const short2&          word_t_as<short2>         (const word_t& w) { return w.i16x2; }
+template <> inline __device__ const __nv_fp8x4_e5m2& word_t_as<__nv_fp8x4_e5m2>(const word_t& w) { return w.fp8x4_e5m2; }
+template <> inline __device__ const __nv_fp8x4_e4m3& word_t_as<__nv_fp8x4_e4m3>(const word_t& w) { return w.fp8x4_e4m3; }
 
 ////////////////////////////////////////////////////////////////////////
 // LDPC_kernel_params
@@ -150,15 +178,184 @@ struct LDPC_kernel_params
 
 ////////////////////////////////////////////////////////////////////////
 // shmem_llr_buffer_size()
-// Returns the size required to store LLR/APP values in shared memory
+// Returns the size required to store LLR/APP values in shared memory only.
+// For total shared memory including early-termination context, use
+// shmem_size_with_et_context(shmem_llr_buffer_size(...)) or add the ET
+// context to your kernel's base size (e.g. LLR+C2V) via shmem_size_with_et_context().
 CUDA_BOTH_INLINE
 uint32_t shmem_llr_buffer_size(uint32_t vnodes, uint32_t Z, uint32_t elem_size)
 {
-    return (vnodes * Z * elem_size);
+    return vnodes * Z * elem_size;
 }
 
 ////////////////////////////////////////////////////////////////////////
-// shmem_llr_buffer_size()
+// shmem_size_with_et_context()
+// Given a base shared memory size (e.g. LLR buffer only, or LLR+C2V),
+// returns the total size including the early-termination context when
+template <typename EtContextT = ldpc_et_context_t>
+CUDA_BOTH_INLINE
+uint32_t shmem_size_with_et_context(uint32_t base_size)
+{
+    base_size = round_up_to_next(base_size,
+        static_cast<uint32_t>(alignof(EtContextT)));
+    base_size += sizeof(EtContextT);
+    return base_size;
+}
+
+constexpr uint32_t LDPC_ACCESSORY_FEATURE_FLAGS =
+    CUPHY_LDPC_DECODE_EARLY_TERM |
+    CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS |
+    CUPHY_LDPC_DECODE_WRITE_ITER_COUNT |
+    CUPHY_LDPC_DECODE_ET_LATENCY_DEBUG;
+
+////////////////////////////////////////////////////////////////////////
+// use_accessory_kernel()
+// Selects the full TB kernel whenever an accessory is requested. The force
+// flag selects that kernel without enabling an accessory, for A/B timing.
+[[nodiscard]] CUDA_BOTH_INLINE
+bool use_accessory_kernel(uint32_t flags)
+{
+    return 0 != (flags &
+        (LDPC_ACCESSORY_FEATURE_FLAGS | CUPHY_LDPC_DECODE_FORCE_ET_KERNEL));
+}
+
+template <bool ENABLE_ACCESSORY_FEATURES>
+[[nodiscard]] CUDA_BOTH_INLINE
+bool accessory_flag_enabled(uint32_t flags, uint32_t flag)
+{
+    return ENABLE_ACCESSORY_FEATURES && (0 != (flags & flag));
+}
+
+template <typename EtContextT = ldpc_et_context_t>
+[[nodiscard]] CUDA_BOTH_INLINE
+uint32_t shmem_size_for_accessory_kernel(uint32_t base_size, uint32_t flags)
+{
+    return use_accessory_kernel(flags) ?
+        shmem_size_with_et_context<EtContextT>(base_size) : base_size;
+}
+
+// TB launch paths already calculate a size that includes the ET context.
+// The lean kernel needs only the aligned base region preceding that context.
+template <typename EtContextT = ldpc_et_context_t>
+[[nodiscard]] CUDA_BOTH_INLINE
+uint32_t shmem_size_for_selected_kernel(uint32_t size_with_et_context, uint32_t flags)
+{
+    return use_accessory_kernel(flags) ?
+        size_with_et_context : size_with_et_context - sizeof(EtContextT);
+}
+
+#define LDPC_LAUNCH_TB_KERNEL(KERNEL, FLAGS, GRID, BLOCK, SHMEM, STREAM, ...) \
+    do                                                                        \
+    {                                                                         \
+        const uint32_t ldpc_kernel_shmem =                                    \
+            ldpc2::shmem_size_for_selected_kernel(SHMEM, FLAGS);              \
+        if(ldpc2::use_accessory_kernel(FLAGS))                                \
+        {                                                                     \
+            KERNEL<<<GRID, BLOCK, ldpc_kernel_shmem, STREAM>>>(__VA_ARGS__);  \
+        }                                                                     \
+        else                                                                  \
+        {                                                                     \
+            KERNEL##_no_accessories<<<GRID, BLOCK, ldpc_kernel_shmem,         \
+                STREAM>>>(__VA_ARGS__);                                       \
+        }                                                                     \
+    } while(false)
+
+#define LDPC_LAUNCH_TB_KERNEL_X2(KERNEL, FLAGS, GRID, BLOCK, SHMEM, STREAM, ...) \
+    do                                                                           \
+    {                                                                            \
+        const uint32_t ldpc_kernel_shmem =                                       \
+            ldpc2::shmem_size_for_selected_kernel<ldpc_et_context_x2_t>(         \
+                SHMEM, FLAGS);                                                   \
+        if(ldpc2::use_accessory_kernel(FLAGS))                                   \
+        {                                                                        \
+            KERNEL<<<GRID, BLOCK, ldpc_kernel_shmem, STREAM>>>(__VA_ARGS__);     \
+        }                                                                        \
+        else                                                                     \
+        {                                                                        \
+            KERNEL##_no_accessories<<<GRID, BLOCK, ldpc_kernel_shmem,            \
+                STREAM>>>(__VA_ARGS__);                                          \
+        }                                                                        \
+    } while(false)
+
+#define LDPC_TB_KERNEL_SYMBOL(KERNEL, FLAGS)                                   \
+    (ldpc2::use_accessory_kernel(FLAGS) ?                                      \
+        reinterpret_cast<const void*>(KERNEL) :                               \
+        reinterpret_cast<const void*>(KERNEL##_no_accessories))
+
+#define LDPC_GET_TB_KERNEL_FUNCTION(FUNCTION, KERNEL, FLAGS)                   \
+    cudaGetFuncBySymbol(&(FUNCTION), LDPC_TB_KERNEL_SYMBOL(KERNEL, FLAGS))
+
+////////////////////////////////////////////////////////////////////////
+// shmem_size_with_experimental_et_context()
+// Same, for decoders whose ET path is compiled only under
+// CUPHY_EXPERIMENTAL_LDPC_ET: reserve the context only when that path
+// actually exists in the binary.
+//
+// Decoders that ship an accessory twin must NOT use this. Their ET path is
+// compiled unconditionally and selected at runtime by flags, so they size
+// through shmem_size_for_accessory_kernel() / shmem_size_for_selected_kernel().
+[[nodiscard]] CUDA_BOTH_INLINE
+uint32_t shmem_size_with_experimental_et_context(uint32_t base_size)
+{
+#ifdef CUPHY_EXPERIMENTAL_LDPC_ET
+    return shmem_size_with_et_context(base_size);
+#else
+    return base_size;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////
+// get_llr_buffer_size_from_parity_nodes()
+// Returns the size required to store LLR/APP values in shared memory
+template <int BG, typename T>
+CUDA_BOTH_INLINE
+uint32_t get_llr_buffer_size_from_parity_nodes(uint32_t pnodes, uint32_t Z)
+{
+    return (max_info_nodes<BG>::value + pnodes) * Z * sizeof(T);
+}
+
+template <typename T>
+CUDA_BOTH_INLINE
+uint32_t get_llr_buffer_size_from_parity_nodes(int BG,
+                                               int num_parity_nodes,
+                                               int Z)
+{
+    int info_nodes = (1 == BG) ? max_info_nodes<1>::value : max_info_nodes<2>::value;
+    return (info_nodes + num_parity_nodes) * Z * sizeof(T);
+}
+
+template <int BG, typename T>
+CUDA_BOTH_INLINE
+uint32_t get_llr_buffer_size(const LDPC_kernel_params& params)
+{
+    return (max_info_nodes<BG>::value + params.num_parity_nodes) * params.Z * sizeof(T);
+}
+
+template <int BG, typename T>
+CUDA_BOTH_INLINE
+uint32_t get_llr_buffer_size(const cuphyLDPCDecodeConfigDesc_t& cfg)
+{
+    return (max_info_nodes<BG>::value + cfg.num_parity_nodes) * cfg.Z * sizeof(T);
+}
+
+template <typename T>
+CUDA_BOTH_INLINE
+uint32_t get_llr_buffer_size(int BG, const LDPC_kernel_params& params)
+{
+    int info_nodes = (1 == BG) ? max_info_nodes<1>::value : max_info_nodes<2>::value;
+    return (info_nodes + params.num_parity_nodes) * params.Z * sizeof(T);
+}
+
+template <typename T>
+CUDA_BOTH_INLINE
+uint32_t get_llr_buffer_size(const cuphyLDPCDecodeConfigDesc_t& cfg)
+{
+    int info_nodes = (1 == cfg.BG) ? max_info_nodes<1>::value : max_info_nodes<2>::value;
+    return (info_nodes + cfg.num_parity_nodes) * cfg.Z * sizeof(T);
+}
+
+////////////////////////////////////////////////////////////////////////
+// shmem_llr_buffer_size_padded()
 // Returns the size required to store LLR/APP values in shared memory,
 // including end padding that may be required by the shared memory
 // storage type used by the loader. (For example, if the loader loads

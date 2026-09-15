@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -352,15 +352,21 @@ int main(int argc, char* argv[])
             return !isnan(snr) && (snr >= SNR_THRESH);
         };
 
+        // Refs are indexed by UE group, and groups whose cell does not use the
+        // delay-estimation algorithm leave an empty placeholder entry.
+        auto hasRef = [](const auto& refs, int idx) {
+            return (static_cast<size_t>(idx) < refs.size()) && (refs[idx].addr() != nullptr);
+        };
+
         bool passed = true;
         for(int i = 0; i < nUeGrps; ++i) {
-            if (chEstAlgo == PUSCH_CH_EST_ALGO_TYPE_MULTISTAGE_MMSE_WITH_DELAY_EST && (evalDataset.tRefChEstDelayMean.size() > i)) {
+            if (chEstAlgo == PUSCH_CH_EST_ALGO_TYPE_MULTISTAGE_MMSE_WITH_DELAY_EST && hasRef(evalDataset.tRefChEstDelayMean, i)) {
                 const double delayMeanSnr = evalDataset.evalChEstDelayMean(tDmrsDelayMean, i, cuStrmMain.handle());
                 NVLOGC_FMT(NVLOG_PUSCH, "UE group {}: Delay mean SNR: {:.3f} dB", i, delayMeanSnr);
                 //passed = passed && snrMeetsThreshold(delayMeanSnr);
             }
 
-            if (chEstAlgo == PUSCH_CH_EST_ALGO_TYPE_MULTISTAGE_MMSE_WITH_DELAY_EST && (evalDataset.tRefChEstLSHest.size() > i)) {
+            if (chEstAlgo == PUSCH_CH_EST_ALGO_TYPE_MULTISTAGE_MMSE_WITH_DELAY_EST && hasRef(evalDataset.tRefChEstLSHest, i)) {
                 const double LSSnr = evalDataset.evalChEstLS(tLSEstArray, i, cuStrmMain.handle());
                 NVLOGC_FMT(NVLOG_PUSCH, "UE group {}: LSEst SNR: {:.3f} dB", i, LSSnr);
                 passed = passed && snrMeetsThreshold(LSSnr);

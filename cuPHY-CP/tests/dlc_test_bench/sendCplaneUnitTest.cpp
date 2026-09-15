@@ -15,11 +15,14 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <iterator>
 #include <fstream>
+#include <cstdlib>
 #include <cstdio>  // for std::remove
 #include <unordered_map>  // for std::unordered_map
 #include <chrono>  // for timing stub
+#include <fmt/format.h>
 #include "yamlparser.hpp"
 #include <cuda_runtime.h>
 #include <cuda.h>
@@ -74,14 +77,15 @@ void update_cell_command(slot_command_api::cell_group_command* cell_group, slot_
                             pm_weight_map_t& pm_map, nv::slot_detail_t* slot_detail, bool mmimo_enabled);
 #endif
     void update_cell_command(slot_command_api::cell_group_command* cell_grp_cmd,cell_sub_command& cell_cmd,
-                             scf_fapi_ssb_pdu_t& cmd, int32_t cell_index, slot_command_api::slot_indication& slotinfo,
-                             nv::phy_config& cell_params, uint8_t l_max, const uint16_t* lmax_symbols,
+                             const scf_fapi_ssb_pdu_t& cmd, int32_t cell_index, slot_command_api::slot_indication& slotinfo,
+                             const nv::phy_config& cell_params, uint8_t l_max, const uint16_t* lmax_symbols,
                              nv::phy_config_option& config_option, pm_weight_map_t& pm_map, nv::slot_detail_t*  slot_detail, bool mmimo_enabled);
 
     void update_cell_command(cell_group_command* cell_grp_cmd, cell_sub_command& cell_sub_cmd,
                              const scf_fapi_pdsch_pdu_t& msg, uint8_t testMode, slot_command_api::slot_indication& slotinfo,
                              int32_t cell_index, pm_weight_map_t& pm_map, bool pm_enabled, bool bf_enabled, uint16_t num_dl_prb,
-                             bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled, nv::slot_detail_t*  slot_detail);
+                             uint16_t num_dl_ant, bfw_coeff_mem_info_t *bfwCoeff_mem_info, bool mmimo_enabled,
+                             nv::slot_detail_t*  slot_detail);
 
     void update_cell_command(slot_command_api::cell_group_command* cell_grp_cmd, cell_sub_command& cell_cmd,
                              const scf_fapi_csi_rsi_pdu_t& msg, slot_command_api::slot_indication & slotinfo, int32_t cell_index,
@@ -94,7 +98,6 @@ void update_cell_command(slot_command_api::cell_group_command* cell_group, slot_
 }
 
 namespace aerial_fh {
-
 
 static bfw_buffer_info_header bfw_header[MAX_CELLS_PER_SLOT]{};
 static bfw_coeff_mem_info_t bfwCoeff_mem_info[MAX_CELLS_PER_SLOT]{};
@@ -177,7 +180,7 @@ void SendCPlaneUnitTest::Setup_OneTimeConfigs()
 {
 
     const int cell_idx = 0; // TODO
-    auto matrix_vec = launch_pattern_->get_precoding_matrix_v(cell_idx);
+    auto matrix_vec = testmac_service_->get_launch_pattern()->get_precoding_matrix_v(cell_idx);
 
     auto& pm_weight_map = nv::PHY_module::pm_map();
 
@@ -226,7 +229,8 @@ void SendCPlaneUnitTest::print_ctx_cfg() {
                "ctx_cfg_.bfw_c_plane_chaining_mode: {}\n"
                "ctx_cfg_.dlc_bfw_enable_divide_per_cell: {}\n"
                "ctx_cfg_.ulc_bfw_enable_divide_per_cell: {}\n"
-               "ctx_cfg_.send_static_bfw_wt_all_cplane: {}\n",
+               "ctx_cfg_.send_static_bfw_wt_all_cplane: {}\n"
+               "ctx_cfg_.max_dl_antenna_ports: {}\n",
                ctx_cfg_.enable_gpu_comm_via_cpu,
                ctx_cfg_.static_beam_id_start,
                ctx_cfg_.static_beam_id_end,
@@ -235,7 +239,8 @@ void SendCPlaneUnitTest::print_ctx_cfg() {
                ctx_cfg_.bfw_c_plane_chaining_mode,
                ctx_cfg_.dlc_bfw_enable_divide_per_cell,
                ctx_cfg_.ulc_bfw_enable_divide_per_cell,
-               ctx_cfg_.send_static_bfw_wt_all_cplane);
+               ctx_cfg_.send_static_bfw_wt_all_cplane,
+               ctx_cfg_.max_dl_antenna_ports);
 }
 
 void SendCPlaneUnitTest::Setup(int cell_index)
@@ -305,9 +310,26 @@ void SendCPlaneUnitTest::Setup(int cell_index)
         ctx_cfg_.send_static_bfw_wt_all_cplane = true;
         ctx_cfg_.enable_weighted_average_cfo = false;
 
+        // FH GPU DOCA TX ring needs max_dl_antenna_ports > 0 (FhProxy -> FronthaulInfo; Nic::set_flow_comm_buf).
+        yaml::node yaml_cell = config_node["cuphydriver_config"]["cells"][cell_index];
+        {
+            auto dl_eaxc_len = [](yaml::node const& cell, const char* key) -> uint16_t {
+                return static_cast<uint16_t>(cell[key].length());
+            };
+            uint16_t dl = dl_eaxc_len(yaml_cell, YAML_PARAM_CELL_EAXC_ID_SSB_PBCH);
+            dl = std::max(dl, dl_eaxc_len(yaml_cell, YAML_PARAM_CELL_EAXC_ID_PDCCH));
+            dl = std::max(dl, dl_eaxc_len(yaml_cell, YAML_PARAM_CELL_EAXC_ID_PDSCH));
+            dl = std::max(dl, dl_eaxc_len(yaml_cell, YAML_PARAM_CELL_EAXC_ID_CSIRS));
+            if (dl > static_cast<uint16_t>(MAX_DL_EAXCIDS)) {
+                NVLOGW_FMT(TAG_UNIT_TB_COMMON,
+                    "max_dl_antenna_ports {} exceeds MAX_DL_EAXCIDS ({}), clamping to {}",
+                    dl, MAX_DL_EAXCIDS, MAX_DL_EAXCIDS);
+            }
+            ctx_cfg_.max_dl_antenna_ports = std::min(std::max<uint16_t>(1, dl), static_cast<uint16_t>(MAX_DL_EAXCIDS));
+        }
+
         print_ctx_cfg ();
 
-        yaml::node yaml_cell = config_node["cuphydriver_config"]["cells"][cell_index];
         cell_mplane_info mplane_cfg{};
         mplane_cfg.dl_comp_meth = static_cast<aerial_fh::UserDataCompressionMethod>(static_cast<int>(yaml_cell["dl_iq_data_fmt"]["comp_meth"]));
         mplane_cfg.dl_bit_width = static_cast<int>(yaml_cell["dl_iq_data_fmt"]["bit_width"]);
@@ -315,8 +337,17 @@ void SendCPlaneUnitTest::Setup(int cell_index)
 
         NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Creating Minimal PhydriverContext instance...");
         bool minimal = true;
-        cudaFree(0);
-        cudaSetDevice(ctx_cfg_.gpu_id);        
+        CUresult cuInitResult = cuInit(0);
+        if(cuInitResult != CUDA_SUCCESS)
+        {
+            const char* errStr = nullptr;
+            cuGetErrorString(cuInitResult, &errStr);
+            throw std::runtime_error(fmt::format("cuInit failed: {}", errStr ? errStr : "unknown error"));
+        }
+        CUDA_DRIVER_CHECK(cuDeviceGet(&cuDevice_, ctx_cfg_.gpu_id));
+        CUcontext cuCtx;
+        CUDA_DRIVER_CHECK(cuDevicePrimaryCtxRetain(&cuCtx, cuDevice_));
+        CUDA_DRIVER_CHECK(cuCtxSetCurrent(cuCtx));
         // This is a minimally constructed phydriver object that is setup for FhProxy creation.
         ctx_ = std::make_unique<PhyDriverCtx>(ctx_cfg_, minimal);
         NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest PhyDriverCtx created successfully!");
@@ -394,8 +425,11 @@ void SendCPlaneUnitTest::Setup(int cell_index)
         }
 
 
-        Setup_MockTransport();
-        Setup_TestMAC_Integration();
+        testmac_service_ = std::make_unique<TestMacSetupService>(
+            TestConfig::instance().pattern_number,
+            TestConfig::instance().pattern_mode(),
+            kDefaultFixtureCellCount
+        );
         Setup_OneTimeConfigs();
         Setup_bfwMemInfo(0);
 
@@ -412,17 +446,21 @@ void SendCPlaneUnitTest::Setup(int cell_index)
                    TestConfig::instance().pattern_number);
 
         // Load STATIC BFW.
-        auto* dbt = launch_pattern_->get_dbt_info(0);
+        auto* dbt = testmac_service_->get_launch_pattern()->get_dbt_info(0);
 
         if (dbt) {
 
             uint16_t numDigBeams = dbt->num_static_beamIdx;
             uint16_t numTXRUs = dbt->num_TRX_beamforming;
             std::size_t size = ((sizeof(uint16_t) * 2)+ (numDigBeams * (sizeof(uint16_t) + (sizeof(complex_int16_t) * numTXRUs))));
+            constexpr std::size_t kDbtAlignment = 32U;
+            const std::size_t aligned_size = ((size + kDbtAlignment - 1U) / kDbtAlignment) * kDbtAlignment;
+            std::unique_ptr<void, decltype(&std::free)> data_buf(std::aligned_alloc(kDbtAlignment, aligned_size), &std::free);
+            if (!data_buf) {
+                throw std::bad_alloc();
+            }
 
-            void* data_buf = std::aligned_alloc(32, size);
-
-            uint16_t* dbt_data = reinterpret_cast<uint16_t*>(data_buf);
+            uint16_t* dbt_data = reinterpret_cast<uint16_t*>(data_buf.get());
             *dbt_data++        = numDigBeams;
             *dbt_data++        = numTXRUs;
 
@@ -439,7 +477,10 @@ void SendCPlaneUnitTest::Setup(int cell_index)
                 dbt_data = reinterpret_cast<uint16_t*>(dbt_wt_data);
             }
 
-            int rc = fh_proxy_->storeDBTPdu(0, data_buf);
+            int rc = fh_proxy_->storeDBTPdu(0, data_buf.get());
+            if (rc != 0) {
+                throw std::runtime_error("storeDBTPdu failed");
+            }
             NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest DBT setup completed numDigBeams:{} numTXRUs:{}", numDigBeams, numTXRUs);
         }
 
@@ -461,19 +502,19 @@ void SendCPlaneUnitTest::TearDown()
         ru_emulator_total_slot_counters_t rue_slt_counters{};
         ru_emulator_get_total_slt_counters (ru_emulator_global, 0/* cell_idx */, rue_slt_counters);
 
-        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "PDSCH {}:{}",   launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::PDSCH].load(),    rue_slt_counters.pdsch);
-        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "PDCCH_UL {}:{}",launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::PDCCH_UL].load(), rue_slt_counters.pdcch_ul);
-        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "PDCCH_DL {}:{}",launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::PDCCH_DL].load(), rue_slt_counters.pdcch_dl);
-        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "PBCH {}:{}",    launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::PBCH].load(),     rue_slt_counters.pbch);
-        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "CSI_RS {}:{}",  launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::CSI_RS].load(),   rue_slt_counters.csi_rs);
-        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "BFW_DL {}:{}",  launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::BFW_DL].load(),   rue_slt_counters.bfw_dl);
+        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "PDSCH {}:{}",   testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::PDSCH].load(),    rue_slt_counters.pdsch);
+        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "PDCCH_UL {}:{}",testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::PDCCH_UL].load(), rue_slt_counters.pdcch_ul);
+        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "PDCCH_DL {}:{}",testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::PDCCH_DL].load(), rue_slt_counters.pdcch_dl);
+        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "PBCH {}:{}",    testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::PBCH].load(),     rue_slt_counters.pbch);
+        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "CSI_RS {}:{}",  testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::CSI_RS].load(),   rue_slt_counters.csi_rs);
+        NVLOGD_FMT(TAG_UNIT_TB_COMMON, "BFW_DL {}:{}",  testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::BFW_DL].load(),   rue_slt_counters.bfw_dl);
 
-        ASSERT_EQ(launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::PDSCH].load(),    rue_slt_counters.pdsch);
-        ASSERT_EQ(launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::PDCCH_UL].load(), rue_slt_counters.pdcch_ul);
-        ASSERT_EQ(launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::PDCCH_DL].load(), rue_slt_counters.pdcch_dl);
-        ASSERT_EQ(launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::PBCH].load(),     rue_slt_counters.pbch);
-        ASSERT_EQ(launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::CSI_RS].load(),   rue_slt_counters.csi_rs);
-        ASSERT_EQ(launch_pattern_->get_expected_values().at(0 /* cell */).lp_slots[channel_type_t::BFW_DL].load(),   rue_slt_counters.bfw_dl);
+        ASSERT_EQ(testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::PDSCH].load(),    rue_slt_counters.pdsch);
+        ASSERT_EQ(testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::PDCCH_UL].load(), rue_slt_counters.pdcch_ul);
+        ASSERT_EQ(testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::PDCCH_DL].load(), rue_slt_counters.pdcch_dl);
+        ASSERT_EQ(testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::PBCH].load(),     rue_slt_counters.pbch);
+        ASSERT_EQ(testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::CSI_RS].load(),   rue_slt_counters.csi_rs);
+        ASSERT_EQ(testmac_service_->expected_values_for_cell(0).lp_slots[channel_type_t::BFW_DL].load(),   rue_slt_counters.bfw_dl);
 
         uint64_t num_err_sections = 0xFFF;
         ru_emulator_get_cplane_err_sections(ru_emulator_global, 0/* cell_idx */, num_err_sections);
@@ -483,6 +524,18 @@ void SendCPlaneUnitTest::TearDown()
         ru_emulator_get_cplane_tot_sections(ru_emulator_global, 0/* cell_idx */, num_tot_sections);
         ASSERT_GT(num_tot_sections, 0);
     }
+
+    if (fh_proxy_ != nullptr && peer != nullptr) {
+        const int remove_peer_rc = fh_proxy_->removePeer(peer_id_);
+        if (remove_peer_rc != 0) {
+            NVLOGW_FMT(TAG_UNIT_TB_COMMON, "Failed to remove peer_id={} rc={}", peer_id_, remove_peer_rc);
+        }
+        peer = nullptr;
+        peer_id_ = 0;
+        peer_id_g = 0;
+    }
+
+    cuDevicePrimaryCtxRelease(cuDevice_);
 
     NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Test cleanup completed...");
 }
@@ -721,11 +774,37 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
     NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Test Starting {} - demonstrating parameter setup", __func__);
 
     try {
+        auto validate_payload_header_bounds = [](int current_offset, const char* req_name) {
+            if (current_offset < 0) {
+                throw std::runtime_error(fmt::format("{} negative payload offset={}", req_name, current_offset));
+            }
+            const std::size_t offset = static_cast<std::size_t>(current_offset);
+            constexpr std::size_t kPayloadSize = LocalFapiMessage::FAPI_PAYLOAD_BUFFER_SIZE;
+            if (offset + sizeof(scf_fapi_generic_pdu_info_t) > kPayloadSize) {
+                throw std::runtime_error(fmt::format("{} header out of bounds offset={} payload_size={}",
+                                                     req_name,
+                                                     offset,
+                                                     kPayloadSize));
+            }
+        };
+
+        auto validate_payload_pdu_bounds = [](int current_offset, uint32_t pdu_size, const char* req_name) {
+            const std::size_t offset = static_cast<std::size_t>(current_offset);
+            constexpr std::size_t kPayloadSize = LocalFapiMessage::FAPI_PAYLOAD_BUFFER_SIZE;
+            if (offset + pdu_size > kPayloadSize) {
+                throw std::runtime_error(fmt::format("{} pdu out of bounds offset={} pdu_size={} payload_size={}",
+                                                     req_name,
+                                                     offset,
+                                                     pdu_size,
+                                                     kPayloadSize));
+            }
+        };
+
         // Create a mock PDCCH PDU
         scf_fapi_pdcch_pdu_t pdcch_pdu{};
         // Create cell parameters
         cuphyCellStatPrm_t cell_params{};
-        cell_configs_t& cell_configs = launch_pattern_->get_cell_configs(0);
+        cell_configs_t& cell_configs = testmac_service_->get_launch_pattern()->get_cell_configs(0);
         cell_params.phyCellId = 0;             // Physical cell ID
         cell_params.nRxAnt = cell_configs.numRxPort;                // Number of RX antennas
         cell_params.nRxAntSrs = cell_configs.numRxAnt;             // Number of SRS RX antennas
@@ -785,6 +864,11 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
         const int32_t cell_index = 0;           // Cell index
         const int staticPdcchSlotNum = -1;      // Dynamic slot numbering
         nv::slot_detail_t* slot_detail = nullptr; // No slot detail for this test
+#ifdef ENABLE_L2_SLT_RSP
+        nv::pdcch_limit_error_t pdcch_error{};
+        // DLC bench does not consume TX notification overflow contexts.
+        nv::TxNotificationHelper::setEnableTxNotification(false);
+#endif
         const bool mmimo_enabled = ctx_cfg_.mMIMO_enable;        // Enable mMIMO
 
         auto& pm_map = nv::PHY_module::pm_map();
@@ -799,9 +883,8 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
 
         uint16_t l_max;
         const uint16_t *lmax_symbols;
-        yaml::node&     yaml_config  = testmac_configs_->get_yaml_config();
 
-        update_ssb_config_static(nDLAbsFrePointA_, nULAbsFrePointA_, ssb_cell_params.ssb_config_.sub_c_common, &lmax_symbols, &l_max);
+        update_ssb_config_static(testmac_service_->dl_abs_freq_point_a(), testmac_service_->ul_abs_freq_point_a(), ssb_cell_params.ssb_config_.sub_c_common, &lmax_symbols, &l_max);
         bool run_fh_cb = false;
         // Process the DL TTI Request (PDCCH_DL, PBCH, PDSCH)
         int offset = 0;
@@ -811,7 +894,9 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
 
         for (int i = 0; i < singleton_.dl_tti_req->num_pdus; ++i)
         {
+            validate_payload_header_bounds(offset, "DL_TTI_REQ");
             auto &pdu = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(&singleton_.dl_tti_req->payload[0 + offset]));
+            validate_payload_pdu_bounds(offset, pdu.pdu_size, "DL_TTI_REQ");
             switch (pdu.pdu_type)
             {
                 case DL_TTI_PDU_TYPE_PDCCH:
@@ -828,9 +913,17 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
                            config_options.precoding_enabled ? "enabled" : "disabled",
                            config_options.bf_enabled ? "enabled" : "disabled");
 
+#ifdef ENABLE_L2_SLT_RSP
+                    pdcch_error = {};
                     scf_5g_fapi::update_cell_command(&cell_group_, cell_cmd_, pdcch_pdu, testMode,
                                                      cell_index, slot_info, cell_params, config_options.staticPdcchSlotNum,
-                                                     config_options, pm_map, slot_detail, mmimo_enabled, nullptr);
+                                                     config_options, pm_map, slot_detail, mmimo_enabled, &pdcch_error);
+#else
+                    scf_5g_fapi::update_cell_command(&cell_group_, cell_cmd_, pdcch_pdu, testMode,
+                                                     cell_index, slot_info, cell_params, config_options.staticPdcchSlotNum,
+                                                     config_options, pm_map, slot_detail, mmimo_enabled);
+
+#endif
                     break;
                 }
                 case DL_TTI_PDU_TYPE_SSB:
@@ -907,7 +1000,7 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
 
                     scf_5g_fapi::update_cell_command(&cell_group_, cell_cmd_, pdsch_pdu, testMode, slot_info,
                                         cell_index, pm_map, config_options.precoding_enabled, config_options.bf_enabled,
-                                        273 /* num_dl_prb */, &bfwCoeff_mem_info[cell_index],
+                                        273 /* num_dl_prb */, cell_params.nTxAnt, &bfwCoeff_mem_info[cell_index],
                                         mmimo_enabled, slot_detail);
 
                     run_fh_cb = true;
@@ -925,7 +1018,9 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
         bool first_csirs = false;
         uint32_t csirs_offset = 0;
         for (int i = 0; i < singleton_.dl_tti_req->num_pdus; ++i) {
+            validate_payload_header_bounds(offset, "DL_TTI_REQ");
             auto &pdu = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(&singleton_.dl_tti_req->payload[0 + offset]));
+            validate_payload_pdu_bounds(offset, pdu.pdu_size, "DL_TTI_REQ");
 
             if(pdu.pdu_type == DL_TTI_PDU_TYPE_CSI_RS)
             {
@@ -993,7 +1088,9 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
         offset = 0;
         for (int i = 0; i < singleton_.ul_dci_req->num_pdus; ++i)
         {
+            validate_payload_header_bounds(offset, "UL_DCI_REQ");
             auto &pdu = *(reinterpret_cast<scf_fapi_generic_pdu_info_t*>(&singleton_.ul_dci_req->payload[0 + offset]));
+            validate_payload_pdu_bounds(offset, pdu.pdu_size, "UL_DCI_REQ");
             auto &pdcch_pdu = *reinterpret_cast<scf_fapi_pdcch_pdu_t*>(&pdu.pdu_config[0]);
 
             NVLOGD_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Test PDCCH_UL parameters for update_cell_command");
@@ -1006,9 +1103,16 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
                        config_options.precoding_enabled ? "enabled" : "disabled",
                        config_options.bf_enabled ? "enabled" : "disabled");
 
+#ifdef ENABLE_L2_SLT_RSP
+            pdcch_error = {};
             scf_5g_fapi::update_cell_command(&cell_group_, cell_cmd_, pdcch_pdu, testMode,
                                              cell_index, slot_info, cell_params, staticPdcchSlotNum,
-                                             config_options, pm_map, slot_detail, mmimo_enabled, nullptr);
+                                             config_options, pm_map, slot_detail, mmimo_enabled, &pdcch_error);
+#else
+            scf_5g_fapi::update_cell_command(&cell_group_, cell_cmd_, pdcch_pdu, testMode,
+                                             cell_index, slot_info, cell_params, staticPdcchSlotNum,
+                                             config_options, pm_map, slot_detail, mmimo_enabled);
+#endif
             offset += pdu.pdu_size;
         }
 
@@ -1038,7 +1142,7 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
 
         NVLOGC_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest update_cell_command complete!"
                                        "NUM_DL_TTI_PDUS:{} NUM_UL_DCI_REQ_PDUS:{}",
-                                        singleton_.dl_tti_req->num_pdus, singleton_.ul_dci_req->num_pdus);
+                                        static_cast<unsigned>(singleton_.dl_tti_req->num_pdus), static_cast<unsigned>(singleton_.ul_dci_req->num_pdus));
 
     } catch (const std::exception& e) {
         NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT, "Error in {}:{}", __func__, e.what());
@@ -1049,96 +1153,6 @@ void SendCPlaneUnitTest::TestUpdateCellCommand(slot_command_api::slot_indication
     }
 }
 
-// Add this to your SendCPlaneUnitTest class
-void SendCPlaneUnitTest::Setup_MockTransport()
-{
-    nv_ipc_config_t ipc_config{};
-    ipc_config.module_type = NV_IPC_MODULE_PRIMARY;
-    ipc_config.ipc_transport = NV_IPC_TRANSPORT_SHM;
-    ipc_config.transport_config.shm.cuda_device_id = 0;
-    ipc_config.transport_config.shm.ring_len = 1;
-    ipc_config.transport_config.shm.mempool_size[0].buf_size = 0;
-    ipc_config.transport_config.shm.mempool_size[1].buf_size = 0;
-    ipc_config.transport_config.shm.mempool_size[2].buf_size = 0;
-    ipc_config.transport_config.shm.mempool_size[3].buf_size = 0;
-    ipc_config.transport_config.shm.mempool_size[4].buf_size = 0;
-    ipc_config.transport_config.shm.mempool_size[0].pool_len = 0;
-    ipc_config.transport_config.shm.mempool_size[1].pool_len = 0;
-    ipc_config.transport_config.shm.mempool_size[2].pool_len = 0;
-    ipc_config.transport_config.shm.mempool_size[3].pool_len = 0;
-    ipc_config.transport_config.shm.mempool_size[4].pool_len = 0;
-    strncpy (ipc_config.transport_config.shm.prefix, "testbench", strlen("testbench") + 1);
-
-    try {
-        // Create transport (this will handle NVIPC setup internally)
-        mock_transport_ = std::make_unique<nv::phy_mac_transport>(ipc_config);
-        NVLOGC_FMT(TAG_UNIT_TB_COMMON, "Debug: SendCPlaneUnitTest Test MockTransport created successfully");
-
-    } catch (const std::exception& e) {
-        NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT, "Error creating mock transport:{}", e.what());
-        throw;
-    }
-}
-
-void SendCPlaneUnitTest::Setup_TestMAC_Integration()
-{
-
-    char test_mac_yaml_array[MAX_PATH_LEN];
-    std::string temp_path = std::string(CONFIG_TESTMAC_YAML_PATH).append(CONFIG_TESTMAC_YAML_NAME);
-    get_full_path_file(test_mac_yaml_array, NULL, temp_path.c_str(), CONFIG_CUBB_ROOT_DIR_RELATIVE_NUM);
-
-    // Parse YAML config
-    yaml::file_parser parser(test_mac_yaml_array);
-    yaml::document doc = parser.next_document();
-    yaml::node config_node = doc.root();
-
-    // Create testMAC configs with yaml::node
-    testmac_configs_ = std::make_shared<test_mac_configs>(config_node);
-
-    // Build pattern filename dynamically based on pattern type
-    std::string pattern_file;
-    if (TestConfig::instance().is_nrsim()) {
-        pattern_file = "launch_pattern_nrSim_" + TestConfig::instance().pattern_number + ".yaml";
-    } else {
-        pattern_file = "launch_pattern_F08_1C_" + TestConfig::instance().pattern_number + ".yaml";
-    }
-
-    // Create and parse launch pattern
-    launch_pattern_ = new launch_pattern(testmac_configs_.get());
-    if (launch_pattern_->launch_pattern_parsing(pattern_file.c_str(), 0xFFFFFFF, 0x1) < 0)
-    {
-        NVLOGE_FMT(TAG_UNIT_TB_COMMON, AERIAL_INVALID_PARAM_EVENT, "Launch pattern parsing failed for pattern {}!",
-                   TestConfig::instance().pattern_number);
-        throw std::runtime_error("Launch pattern parsing failed");
-    }
-
-    NVLOGC_FMT(TAG_UNIT_TB_COMMON, "Launch pattern {} loaded successfully", TestConfig::instance().pattern_number);
-    for (int cell = 0; cell < 1 /* num cells is 1 */; ++cell) {
-
-        std::string exp_slot = "Launch pattern expected slot schedule: Cell=" + std::to_string(cell);
-        for(int ch = 0; ch < channel_type_t::CHANNEL_MAX; ch++)
-        {
-            exp_slot.append(" ").append(get_channel_name(ch)).append("=").append(std::to_string(launch_pattern_->get_expected_values().at(cell).lp_slots[ch]));
-        }
-        NVLOGC_FMT(TAG_UNIT_TB_COMMON,"{}", exp_slot);
-    }
-
-    // For now, skip launch pattern parsing since we don't have actual pattern files
-    // This would normally require actual test vector files
-    nv_ipc_config_t config_{};
-    // 3. Create FAPI handler with raw pointers using our wrapper class
-    fapi_handler_ = std::make_shared<TestFapiHandler>(
-        *mock_transport_.get(),
-        testmac_configs_.get(),
-        launch_pattern_,
-        nullptr
-    );
-
-    nDLAbsFrePointA_ = config_node["data"]["nDLAbsFrePointA"].as<uint32_t>();
-    nULAbsFrePointA_ = config_node["data"]["nULAbsFrePointA"].as<uint32_t>();
-    NVLOGC_FMT(TAG_UNIT_TB_COMMON, "testMAC integration setup completed!");
-
-}
 
 std::tuple<bool,bool> SendCPlaneUnitTest::GenerateFapiMessagesForSlot(uint16_t sfn, uint16_t slot)
 {
@@ -1160,17 +1174,17 @@ std::tuple<bool,bool> SendCPlaneUnitTest::GenerateFapiMessagesForSlot(uint16_t s
     for (int group_id = 0; group_id < FAPI_REQ_SIZE; group_id++) {
         // phy_mac_msg_desc msg_desc = create_local_msg_desc(local_msg);
         // Get FAPI requests for this slot/group
-        vector<fapi_req_t*>& fapi_reqs = fapi_handler_->get_fapi_req_list_public(0/*cell-id*/, ss, (fapi_group_t)group_id);
+        vector<fapi_req_t*>& fapi_reqs = testmac_service_->fapi_handler()->get_fapi_req_list(0/*cell-id*/, ss, (fapi_group_t)group_id);
 
         if (fapi_reqs.size() > 0) {
             // Build specific FAPI message type
             switch(group_id) {
                 case DL_TTI_REQ:
-                    fapi_handler_->build_dl_tti_request_public(0, fapi_reqs, *singleton_.dl_tti_req);
+                    testmac_service_->fapi_handler()->build_dl_tti_request(0, fapi_reqs, *singleton_.dl_tti_req);
                     run_dl_cplane = true;
                     break;
                 case UL_DCI_REQ:
-                    fapi_handler_->build_ul_dci_request_public(0, fapi_reqs, *singleton_.ul_dci_req);
+                    testmac_service_->fapi_handler()->build_ul_dci_request(0, fapi_reqs, *singleton_.ul_dci_req);
                     run_dl_cplane = true;
                     break;
                 // case DL_BFW_CVI_REQ:
@@ -1178,10 +1192,10 @@ std::tuple<bool,bool> SendCPlaneUnitTest::GenerateFapiMessagesForSlot(uint16_t s
                 //     compressed BFW from the TV for verification purposes.
                 //     break;
                 // case UL_TTI_REQ:
-                //     fapi_handler_->build_ul_tti_request_public(0, fapi_reqs, singleton_.ul_tti_req);
+                //     testmac_service_->fapi_handler()->build_ul_tti_request(0, fapi_reqs, singleton_.ul_tti_req);
                 //     break;
                 // case TX_DATA_REQ:
-                //     fapi_handler_->build_tx_data_request_public(0, fapi_reqs, local_msg.tx_data_req, msg_desc);
+                //     testmac_service_->fapi_handler()->build_tx_data_request(0, fapi_reqs, local_msg.tx_data_req, msg_desc);
                 //     break;
                 // Add other message types as needed
             }
@@ -1574,4 +1588,3 @@ void RegisterDynamicBenchmarks() {
     }
 }
 } // namespace aerial_fh
-

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,12 @@ set (SOURCES cuphycontroller.cpp signal_handler.cpp
 	${PROJECT_SOURCE_DIR}/dummy.cu)
 add_executable(l2_adapter_cuphycontroller_scf ${SOURCES})
 
-target_link_libraries(l2_adapter_cuphycontroller_scf PRIVATE pthread nvipc scf_5g_fapi nvphy yaml)
+target_link_libraries(l2_adapter_cuphycontroller_scf PRIVATE
+    pthread
+    nvipc
+    # scf_5g_fapi and nvphy have circular static-archive refs; rescan resolves both.
+    "$<LINK_GROUP:RESCAN,scf_5g_fapi,nvphy>"
+    yaml)
 
 if (AERIAL_METRICS)
     target_link_libraries(l2_adapter_cuphycontroller_scf PRIVATE aerial_metrics)
@@ -25,4 +30,8 @@ endif()
 
 set (SOURCES tick_unit_test.cpp ${PROJECT_SOURCE_DIR}/dummy.cu)
 add_executable(tick_unit_test ${SOURCES})
-target_link_libraries(tick_unit_test nvipc scf_5g_fapi nvphy yaml)
+target_link_libraries(tick_unit_test
+    nvipc
+    # scf_5g_fapi and nvphy have circular static-archive refs; rescan resolves both.
+    "$<LINK_GROUP:RESCAN,scf_5g_fapi,nvphy>"
+    yaml)

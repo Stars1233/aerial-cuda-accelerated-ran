@@ -647,6 +647,8 @@ protected:
 
     std::atomic<bool> order_launched;                                          ///< Atomic flag: PUSCH/PRACH order kernel launched
     std::atomic<bool> order_launched_srs;                                      ///< Atomic flag: SRS order kernel launched
+    std::atomic<uint64_t> order_launched_tsc_ns{};                             ///< Time (ns, Time::nowNs clock) the PUSCH/PUCCH/PRACH order kernel launch flag was set; 0 = not launched this slot
+    std::atomic<uint64_t> order_launched_srs_tsc_ns{};                         ///< Time (ns, Time::nowNs clock) the SRS order kernel launch flag was set; 0 = not launched this slot
     int32_t cell_order_list[UL_MAX_CELLS_PER_SLOT];                            ///< List of cell indices assigned to this entity
     uint32_t cell_order_list_size;                                             ///< Number of cells in cell_order_list
     orderKernelConfigParams_t* order_kernel_config_params;                     ///< Configuration parameters for PUSCH/PRACH/SRS order kernel

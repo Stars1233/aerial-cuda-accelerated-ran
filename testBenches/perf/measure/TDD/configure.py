@@ -14,6 +14,7 @@
 # limitations under the License.
 
 # import numpy as np
+import shlex
 
 
 def configure(args, mig, mig_gpu, connections, command, vectors, mode, k, target):
@@ -63,6 +64,9 @@ def configure(args, mig, mig_gpu, connections, command, vectors, mode, k, target
 
         if args.is_pusch_cascaded:
             system = " ".join([system, "-B"])
+
+        if args.is_pucch_cascaded:
+            system = " ".join([system, "-A"])
 
     if args.is_ldpc_parallel:
         system = " ".join([system, "-K 1"])
@@ -115,6 +119,9 @@ def configure(args, mig, mig_gpu, connections, command, vectors, mode, k, target
     if args.is_use_green_contexts:
         system = " ".join([system, "-n"])
 
+    if getattr(args, "trt_chest_config", ""):
+        system = " ".join([system, f"--E {shlex.quote(args.trt_chest_config)}"])
+
     if not args.is_no_pusch:
         system = " ".join([system, "--U"])
   
@@ -124,8 +131,14 @@ def configure(args, mig, mig_gpu, connections, command, vectors, mode, k, target
     if args.is_enable_nvprof:
         system = " ".join([system, "-v"])
 
+    if args.is_setup_once:
+        system = " ".join([system, "--O"])
+
     if args.is_ref_check:
         system = " ".join([system, "-k --k -b --c PUSCH,PDSCH,PDCCH,PUCCH,SSB,DLBFW,ULBFW,CSIRS,PRACH,SRS"])
+
+    if args.device_max_connections is not None:
+        system = " ".join([system, f"--C {args.device_max_connections}"])
 
     if mig is None:
         system = " ".join([system, f">buffer-{str(k).zfill(2)}.txt"])

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -123,6 +123,7 @@ TEST(ApiTest, OpenInvalidDpdkThread)
 TEST(ApiTest, Open)
 {
     FronthaulInfo fronthaul_info{2, 500, 1, false, false, "unit_tests", {0}};
+    fronthaul_info.max_dl_antenna_ports = static_cast<uint16_t>(kMaxFlows);
     EXPECT_EQ(0, open(&fronthaul_info, &fhi));
     EXPECT_LE(0, rte_mbuf_dynflag_lookup(RTE_MBUF_DYNFLAG_TX_TIMESTAMP_NAME, nullptr));
     EXPECT_LE(0, rte_mbuf_dynfield_lookup(RTE_MBUF_DYNFIELD_TIMESTAMP_NAME, nullptr));
@@ -490,6 +491,7 @@ TEST(ApiTest, TxqUplaneGpuCommRequest)
     PreparePRBInfo prb_info;
 
     EXPECT_EQ(0, prepare_uplane_gpu_comm(peer_rx_peer, uplane_msg_info, 4, &output_handle, 0, 0));
+    EXPECT_EQ(0, set_gpu_request_cell_idx(output_handle, 0));
     tx_handle_v.push_back(output_handle);
     EXPECT_EQ(0, send_uplane_gpu_comm(nic, tx_handle_v, prb_info));
 

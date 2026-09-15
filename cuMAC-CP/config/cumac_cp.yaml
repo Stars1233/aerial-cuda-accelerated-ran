@@ -34,7 +34,7 @@ recv_thread_config:
   sched_priority: 95
 
 # cuMAC task worker cores
-worker_cores: [31, 32, 33, 34]
+worker_cores: [31, 32]
 
 thread_num_per_core: 1
 
@@ -52,10 +52,26 @@ group_buffer_enable: 1
 multi_stream_enable: 1
 slot_concurrent_enable: 0
 
+# MU UE grouping: per-cell IPC/GPU request stride (true = mem-sharing SRS layout, false = full SRS)
+enable_gpu_share: 0
+
+# Whether to run with cuBB
+enable_cubb: 0
+
+# MU UE pairing GPU: thread blocks per row for channel orthogonality (muUePairTask.num_blocks_per_row_chanOrtMat)
+num_blocks_per_row: 8
+
+# Slot offset applied when mapping MU UE grouping TV files to slot indices.
+srs_slot_lag: 0
+
+# cuMAC task enable bitmask: bit 0-3 = 4T4R tasks, bit 4 = PFM SORT, bit 5 = MU UE GROUP
+task_bitmask: 0xFFFF
+
 # Set bits to debug
 # b0 - Enable printing cuMAC buffer
 # b1 - Enable printing NVIPC buffer
 # b2 - Enable comparing with cell group TV
+# b3 - Dump MU UE-pair GPU buffers (chan_est, snr, chan_orth) to HDF5 per slot
 debug_option: 0x0
 
 # Total cell number
@@ -63,6 +79,9 @@ cell_num: 8
 
 # CUDA task ring length, each ring buffer will be pre-allocated with CUDA buffers
 task_ring_len: 10
+
+# When 1, parse and load group test vectors (HDF5 under CONFIG_CUMAC_TV_PATH). Set 0 for production.
+enable_tv_test: 0
 
 # For debug only: the group TV for verify group buffers. Example: TV_cumac_F08-MC-CC-8PC_DL.h5
 cumac_group_tv_file: null
@@ -81,22 +100,20 @@ transport:
     prefix: cumac
     # CUDA device ID for GPU memory operations. The cpu_data and cpu_large memory pools will be registered to host pinned memory when cuda_device_id >= 0
     cuda_device_id: 0
-    # Length of the ring buffer queue for message passing between processes
-    ring_len: 8192
-    # Memory pool size configuration for different buffer types
+    # Memory pool size configuration for different buffer types (per-cell pool length)
     mempool_size:
       # CPU message buffer pool: used for small control messages
       cpu_msg:
         # Size of each buffer in bytes
         buf_size: 8192
         # Number of buffers in the pool
-        pool_len: 4096
+        pool_len: 100
       # CPU data buffer pool: used for larger data payloads on CPU
       cpu_data:
         # Size of each buffer in bytes
         buf_size: 4096000
         # Number of buffers in the pool
-        pool_len: 512
+        pool_len: 50
       # CUDA/GPU data buffer pool: used for GPU-accessible data buffers
       cuda_data:
         # Size of each buffer in bytes

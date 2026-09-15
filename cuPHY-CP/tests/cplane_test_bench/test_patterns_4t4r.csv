@@ -1,0 +1,25 @@
+# C-Plane Test Bench - 4T4R Test Patterns
+# Format: pattern_num (one per line, commas optional)
+# Lines starting with # are comments and will be ignored
+
+# 48/49/50/51 family
+48
+49
+50
+51
+
+# 59x family
+59b
+59c
+59d
+59e
+
+# 60x family
+60c
+60d
+
+# 62-65 family
+62c
+63c
+65c
+65d

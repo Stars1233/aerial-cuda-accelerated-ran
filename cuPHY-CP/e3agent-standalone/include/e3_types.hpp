@@ -54,6 +54,7 @@ struct E3UeMetrics {
 	uint8_t nr_of_symbols{};        // per-group
 	uint32_t tb_size{};
 	uint32_t pdu_len{};             // tb_size on CRC pass, 0 on CRC fail
+	uint32_t pdu_offset{};          // byte offset of this UE's PDU in the PUSCH SHM buffer
 	uint16_t target_code_rate{};
 	uint8_t new_data_indicator{};
 	uint8_t n_layers{};
@@ -70,29 +71,34 @@ struct E3UeMetrics {
 	uint8_t rv_index{};
 };
 
-struct E3BufferInfo {
-	uint8_t current_fh_buffer{};
-	uint8_t current_pusch_buffer{};
-	uint8_t current_hest_buffer{};
+// Per-cell buffer info and per-UE metrics for one cell within a slot.
+struct E3CellInfo {
+	uint16_t cell_id{};
+	uint16_t n_rx_ant{};
+	uint16_t n_rx_ant_srs{};
+	uint8_t  n_bs_ants{};
+	uint16_t n_ue{};
+
+	// SHM refs: fh_write_index is per-cell; PUSCH/H-est blocks are slot-level.
+	uint8_t  current_fh_buffer{};
 	uint32_t fh_write_index{};
+	uint8_t  current_pusch_buffer{};
 	uint32_t pusch_write_index{};
+	uint8_t  current_hest_buffer{};
 	uint32_t hest_write_index{};
 	uint32_t hest_row_byte_offset{};
 
+	std::vector<E3UeMetrics> ues;
+};
+
+// Slot-level buffer info for E3 indications; one E3CellInfo per active cell.
+struct E3BufferInfo {
 	uint16_t sfn{};
 	uint16_t slot{};
 	uint64_t timestamp_ns{};
 	uint64_t timestamp_tai_ns{};
-
-	uint16_t cell_id{};
-	uint16_t n_rx_ant{};
-	uint16_t n_rx_ant_srs{};
 	uint16_t n_cells{};
-
-	uint8_t n_bs_ants{};
-
-	uint16_t n_ue{};
-	std::vector<E3UeMetrics> ue_metrics;
+	std::vector<E3CellInfo> cells;
 };
 
 struct fhInfo_t {
@@ -368,27 +374,34 @@ struct E3SrsUeMetrics {
 	uint32_t srs_rb_snr_size{};
 };
 
-struct E3SrsBufferInfo {
-	uint8_t current_srs_iq_buffer{};
-	uint8_t current_srs_hest_buffer{};
-	uint8_t current_srs_rb_snr_buffer{};
-	uint32_t srs_iq_write_index{};
-	uint32_t srs_hest_write_index{};
-	uint32_t srs_rb_snr_write_index{};
-	uint32_t srs_iq_row_byte_offset{};
+// Per-cell SRS buffer info and per-UE metrics for one cell within a slot.
+struct E3SrsCellInfo {
+	uint16_t cell_id{};
+	uint16_t n_rx_ant_srs{};
+	uint8_t  srs_cell_start_sym{};
+	uint8_t  srs_cell_n_srs_sym{};
+	uint16_t n_srs_ue{};
 
+	// SHM refs: srs_iq is per-cell; SRS Hest/RbSNR blocks are slot-level.
+	uint8_t  current_srs_iq_buffer{};
+	uint32_t srs_iq_write_index{};
+	uint32_t srs_iq_row_byte_offset{};
+	uint8_t  current_srs_hest_buffer{};
+	uint32_t srs_hest_write_index{};
+	uint8_t  current_srs_rb_snr_buffer{};
+	uint32_t srs_rb_snr_write_index{};
+
+	std::vector<E3SrsUeMetrics> ues;
+};
+
+// Slot-level SRS buffer info for E3 indications; one E3SrsCellInfo per active cell.
+struct E3SrsBufferInfo {
 	uint16_t sfn{};
 	uint16_t slot{};
 	uint64_t timestamp_ns{};
 	uint64_t timestamp_tai_ns{};
-	uint16_t cell_id{};
 	uint16_t n_cells{};
-	uint16_t n_rx_ant_srs{};
-	uint8_t srs_cell_start_sym{};
-	uint8_t srs_cell_n_srs_sym{};
-	uint16_t n_srs_ue{};
-
-	std::vector<E3SrsUeMetrics> ue_metrics;
+	std::vector<E3SrsCellInfo> cells;
 };
 
 // ============================================================================

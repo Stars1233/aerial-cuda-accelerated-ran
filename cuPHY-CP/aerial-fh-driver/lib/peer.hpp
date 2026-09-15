@@ -238,7 +238,7 @@ public:
     /**
      * Destructor - cleanup peer resources
      */
-    ~Peer();
+    virtual ~Peer();
 
     /**
      * Get associated NIC
@@ -436,6 +436,35 @@ public:
     FlowPtrInfo*   get_flow_ptr_info();
 
     /**
+     * Copy the (static) host-pinned flow_hdr_size_info to its GPU device buffer, so
+     * the GPU-comms kernels read flow header info from device memory instead of
+     * reaching into host-pinned memory across the host-GPU link (e.g. over PCIe).
+     * Called from flow setup - both initial setup and flow reconfiguration via
+     * Flow::update() - never on the per-slot hot path. The copy is synchronous and
+     * blocks until the transfer has completed.
+     */
+    void           sync_flow_hdr_size_info_to_device();
+
+    /**
+     * Defer or resume flow_hdr_size_info H2D during batched flow registration.
+     * @param[in] defer True to skip per-flow sync until end_peer_flow_registration.
+     */
+    void           set_defer_flow_hdr_sync(bool defer);
+
+    /**
+     * Get the non-blocking setup stream used for OAM/init H2D.
+     * Never use CU_STREAM_PER_THREAD with FH driver CUDA contexts.
+     * @return Peer setup stream, or nullptr when the peer has no GPU attached.
+     */
+    [[nodiscard]] CUstream get_setup_stream() const { return setup_stream_; }
+
+    /**
+     * Drain setup_stream_ for pending setup H2D only.
+     * Does not wait on live GpuComm streams.
+     */
+    void           sync_setup_stream();
+
+    /**
      * Get header template information for GPU comm
      * @return Pointer to header template array
      */
@@ -547,18 +576,6 @@ public:
      */
     void update_tx_metrics(size_t tx_packets, size_t tx_bytes);
 
-    /**
-     * Set total number of flows
-     * @param[in] val Flow count
-     */
-    void setTotalNumFlows(uint32_t val) {total_num_flows_=val;};
-
-    /**
-     * Get total number of flows
-     * @return Flow count
-     */
-    uint32_t getTotalNumFlows(){return total_num_flows_;};
-
     // ========== GPU-Initiated Communication ==========
 
     /**
@@ -600,6 +617,35 @@ public:
      */
     void     gpu_comm_prepare_uplane(UPlaneMsgSendInfo const* info, size_t num_msgs,
                                     TxRequestUplaneGpuComm** tx_request, std::chrono::nanoseconds cell_start_time, std::chrono::nanoseconds symbols_duration,bool commViaCpu);
+
+    /**
+     * Set up a TX request handle and initialize PartialUplaneSlotInfo timestamps/counters.
+     * Extracted from gpu_comm_prepare_uplane for reuse in bypass paths.
+     *
+     * @param[in]  frame_id             Frame ID
+     * @param[in]  subframe_id          Subframe ID
+     * @param[in]  slot_id              Slot ID
+     * @param[in]  max_num_prb_per_symbol Maximum PRBs per symbol (0 if set later)
+     * @param[in]  cell_start_time      Cell start time
+     * @param[in]  symbol_duration      Symbol duration
+     * @param[in]  commViaCpu           true for CPU-assisted comm
+     * @param[out] tx_request           Allocated GPU comm TX request
+     * @param[out] out_partial_info     Pointer to initialized PartialUplaneSlotInfo_t
+     * @param[out] out_params           If non-null, filled with Peer constants + DOCA timestamps
+     * @param[in]  eaxcid_list          eAxC IDs for port mapping (only used when out_params != nullptr)
+     * @param[in]  num_eaxcids          Number of entries in eaxcid_list
+     */
+    void     gpu_comm_setup_tx_request(
+                uint8_t frame_id, uint16_t subframe_id, uint16_t slot_id,
+                uint16_t max_num_prb_per_symbol,
+                std::chrono::nanoseconds cell_start_time,
+                std::chrono::nanoseconds symbol_duration,
+                bool commViaCpu,
+                TxRequestUplaneGpuComm** tx_request,
+                PartialUplaneSlotInfo_t** out_partial_info,
+                UplaneConversionParams* out_params = nullptr,
+                const uint16_t* eaxcid_list = nullptr,
+                uint16_t num_eaxcids = 0);
 
 
     /**
@@ -655,9 +701,12 @@ protected:
     uint32_t *d_block_count_;                           //!< Block count (GPU)
     uint32_t* d_ecpri_seq_id_;                          //!< eCPRI sequence ID (GPU, uint32_t for atomicInc)
     FlowPtrInfo* h_flow_hdr_size_info_;                 //!< Flow header size info (host pinned)
+    FlowPtrInfo* d_flow_hdr_size_info_{};               //!< Flow header size info (GPU)
     uint32_t* d_hdr_template_;                          //!< Header template (GPU)
     std::unordered_map<u_int16_t, u_int16_t> eaxcid_idx_mp;    //!< eAxC ID to index map (uplink)
     std::unordered_map<u_int16_t, u_int16_t> dlu_eaxcid_idx_mp;  //!< eAxC ID to index map (downlink)
+    bool defer_flow_hdr_sync_{};                               //!< Batch H2D of flow_hdr_size_info during multi-flow OAM setup
+    CUstream setup_stream_{};                                  //!< Non-blocking stream for flow-setup H2D (avoids GpuComm stall)
 
     slot_command_api::cplane_sections_info_t* cplane_sections_info_list_;  //!< C-plane sections cache
     std::atomic<uint32_t>                     cplane_sections_info_list_cnt_;  //!< C-plane sections count
@@ -680,12 +729,12 @@ protected:
     size_t   count_cplane_packets(CPlaneMsgSendInfo const* infos, size_t num_msgs);
     cplaneCountInfo count_cplane_packets_mmimo(CPlaneMsgSendInfo const* infos, size_t num_msgs, size_t max_num_packets);
     cplaneCountInfo count_cplane_packets_mmimo_dl(CPlaneMsgSendInfo const* infos, size_t num_msgs);
-    size_t   count_cplane_packets_mmimo_ul(CPlaneMsgSendInfo const* infos, size_t num_msgs);
+    cplaneCountInfo count_cplane_packets_mmimo_ul(CPlaneMsgSendInfo const* infos, size_t num_msgs);
 
     uint16_t prepare_cplane_message(const CPlaneMsgSendInfo& info, rte_mbuf** mbufs);
     void prepare_cplane_message_mmimo(const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, rte_mbuf** chain_mbufs, MbufArray* mbufs_regular, MbufArray* mbufs_bfw, cplanePrepareInfo& cplane_prepare_info);
     void prepare_cplane_message_mmimo_dl(const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, rte_mbuf** chain_mbufs, MbufArray* mbufs_regular, MbufArray* mbufs_bfw, cplanePrepareInfo& cplane_prepare_info);
-    uint16_t prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, MbufArray* mbufs_regular, MbufArray* mbufs_bfw);
+    void prepare_cplane_message_mmimo_ul(const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, rte_mbuf** chain_mbufs, MbufArray* mbufs_regular, MbufArray* mbufs_bfw, cplanePrepareInfo& cplane_prepare_info);
     uint16_t prepare_cplane_message_mmimo_no_se(const CPlaneMsgSendInfo& info, rte_mbuf** mbufs, MbufArray* mbufs_regular, MbufArray* mbufs_bfw);
     void     adjust_src_mac_addr();
     void     request_nic_resources();
@@ -694,8 +743,7 @@ protected:
     void     send_cplane_packets(MbufArray& mbufs_bfw, MbufArray& mbufs_regular, rte_mbuf* mbufs[], size_t num_packets, size_t created_pkts, Txq* txq, Txq* bfw_txq, bool divide_budget);
     virtual void send_cplane_packets_dl(MbufArray& mbufs_bfw, MbufArray& mbufs_regular, rte_mbuf* mbufs[], size_t num_packets, size_t created_pkts);
     virtual void send_cplane_packets_ul(MbufArray& mbufs_bfw, MbufArray& mbufs_regular, rte_mbuf* mbufs[], size_t num_packets, size_t created_pkts);
-    virtual void send_cplane_enqueue_nic(Txq *txq, rte_mbuf* mbufs[], size_t num_packets); 
-    uint32_t total_num_flows_{0};  //!< Total number of flows for this peer
+    virtual void send_cplane_enqueue_nic(Txq *txq, rte_mbuf* mbufs[], size_t num_packets);
 
     /**
      * Count U-plane packets for multi-section message

@@ -27,8 +27,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Resolve the directory where this script resides
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Default build directory
-BUILD_DIR="${1:-/opt/nvidia/cuBB/build}"
+BUILD_DIR="${1:-/opt/nvidia/cuBB/build.$(arch)}"
 
 # Session name
 TMUX_SESSION="muMimoUeGrp_tests"
@@ -81,7 +84,7 @@ L1_TEST="$BUILD_DIR/cuMAC/examples/muMimoUeGrpL2Integration/l1_muUeGrp_test"
 L2_TEST="$BUILD_DIR/cuMAC/examples/muMimoUeGrpL2Integration/l2_muUeGrp_test"
 
 # Check for config file
-CONFIG_DIR="/opt/nvidia/cuBB/cuMAC/examples/muMimoUeGrpL2Integration/yamlConfigFiles"
+CONFIG_DIR="${CONFIG_DIR:-$SCRIPT_DIR/yamlConfigFiles}"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
 
 print_header "Checking Prerequisites"
@@ -184,20 +187,32 @@ if [ "$BUILD_ROOT" == "$BUILD_DIR" ]; then
     BUILD_ROOT="$BUILD_DIR"
 fi
 
+cuBB_SDK="/opt/nvidia/cuBB"
+echo "----------------------------------------"
+echo "cuBB_SDK=$cuBB_SDK"
+echo "BUILD_ROOT=$BUILD_ROOT"
+echo "BUILD_DIR=$BUILD_DIR"
+echo "BUILD=$BUILD"
+echo "CONFIG_FILE=$CONFIG_FILE"
+echo "L1_TEST=$L1_TEST"
+echo "CUMAC_TEST=$CUMAC_TEST"
+echo "L2_TEST=$L2_TEST"
+echo "----------------------------------------"
+
 # Run the tests in each pane (change to build root for relative paths to work)
 # IMPORTANT: Start L1 first - it is PRIMARY for L1-cuMAC semaphore and memory pools.
 # cuMAC (SECONDARY) must attach after L1 creates the shared resources to avoid races/segfaults.
 echo -e "${GREEN}Starting l1_muUeGrp_test in pane 0...${NC}"
-tmux send-keys -t "$TMUX_SESSION:0.0" "cd $BUILD_ROOT && $L1_TEST" C-m
+tmux send-keys -t "$TMUX_SESSION:0.0" "cd $cuBB_SDK && $L1_TEST" C-m
 
 # Brief delay so L1 can create semaphores and memory pools before cuMAC attaches
 sleep 2
 
 echo -e "${GREEN}Starting cumac_muUeGrp_test in pane 1...${NC}"
-tmux send-keys -t "$TMUX_SESSION:0.1" "cd $BUILD_ROOT && $CUMAC_TEST" C-m
+tmux send-keys -t "$TMUX_SESSION:0.1" "cd $cuBB_SDK && $CUMAC_TEST" C-m
 
 echo -e "${GREEN}Starting l2_muUeGrp_test in pane 2...${NC}"
-tmux send-keys -t "$TMUX_SESSION:0.2" "cd $BUILD_ROOT && $L2_TEST" C-m
+tmux send-keys -t "$TMUX_SESSION:0.2" "cd $cuBB_SDK && $L2_TEST" C-m
 
 echo ""
 echo -e "${BLUE}========================================${NC}"

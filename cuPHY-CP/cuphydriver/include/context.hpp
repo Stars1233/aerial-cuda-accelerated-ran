@@ -20,8 +20,13 @@
 
 #include <memory>
 #include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <condition_variable>
+#ifdef ENABLE_FAPI_STORE_REPLAY
+#include "prach_offload_reconfig.hpp"
+#endif
 #include "constant.hpp"
 #include "cuphydriver_api.hpp"
 #include "worker.hpp"
@@ -46,6 +51,8 @@
 #include "ulbuffer.hpp"
 #include "mps.hpp"
 #include "order_entity.hpp"
+#include "order_kernel_functions.hpp"
+#include "generic_kernel_functions.hpp"
 #include "memfoot.hpp"
 #include "harq_pool.hpp"
 #include "wavgcfo_pool.hpp"
@@ -54,6 +61,9 @@
 #include "cv_memory_bank_srs_chest.hpp"
 #include "ul_pcap_capture_thread.hpp"
 #include "perf_metrics/percentile_tracker.hpp"
+#include "pdsch_h2d_copy_manager.hpp"
+
+class FrameworkCPlaneService;
 
 // Current max. limit of green contexts used in cuphydriver. 7 green contexts are currently used.
 // Affects size of various vectors/arrays in PhyDriverCtx. Increase if you plan to add more green contexts.
@@ -141,6 +151,33 @@ public:
     ~PhyDriverCtx();
     bool     isValidation();
     bool     isCPlaneDisabled() const;
+    bool     isFapiToCplaneDirect() const;
+    /// Get effective DL C-plane batch size.
+    [[nodiscard]] uint8_t  getCplaneProcessingDlBatchSize() const;
+    /// Get effective UL C-plane batch size.
+    [[nodiscard]] uint8_t  getCplaneProcessingUlBatchSize() const;
+    /// Get max concurrent C-plane transaction slots.
+    [[nodiscard]] std::size_t getCplaneMaxConcurrentTransactions() const;
+
+    void         setEarlySlotMapDl(SlotMapDl* sm) { early_slot_map_dl_ = sm; }
+    SlotMapDl*   getEarlySlotMapDl() const        { return early_slot_map_dl_; }
+    void         setEarlySlotMapUl(SlotMapUl* sm) { early_slot_map_ul_ = sm; }
+    SlotMapUl*   getEarlySlotMapUl() const        { return early_slot_map_ul_; }
+
+    [[nodiscard]] FrameworkCPlaneService* getFrameworkCPlaneService();
+
+    /**
+     * Record a prior-slot direct BFW CVI completion into the framework C-plane service store.
+     *
+     * Thin delegator to FrameworkCPlaneService::record_bfw_cvi.
+     *
+     * @param[in] cell_id SDK cell index the record belongs to.
+     * @param[in] record Producer-built BFW completion record.
+     * @return 0 on success, -1 if the service is absent or validation fails.
+     * @see FrameworkCPlaneService::record_bfw_cvi
+     */
+    [[nodiscard]] int recordDirectBfwCviRecord(uint16_t cell_id, const direct_bfw_cvi_record& record);
+    std::vector<Cell*>     getSortedCells() const;
 
     /////////////////////////////////////////////////////////////////////
     //// Start
@@ -182,8 +219,18 @@ public:
     int     addNewCell(const cell_mplane_info& m_plane_info,uint32_t idx);
     int     setCellPhyByMplane(struct cell_phy_info& cell_pinfo);
     Cell *  getCellById(cell_id_t c_id);
+    Cell *  getCellByIdx(uint32_t idx);
     Cell *  getCellByPhyId(uint16_t c_phy_id);
     Cell *  getCellByMplaneId(uint16_t mplane_id);
+
+    /**
+     * @brief Check if the phyCellId can't be updated successfully
+     * @param c_phy_id_old old phyCellId of the cell
+     * @param c_phy_id_new new phyCellId to be updated
+     * @param cell_id cell identifier
+     * @return true if the phyCellId can't be updated successfully
+     */
+    bool    phyCellIdMismatch(uint16_t c_phy_id_old, uint16_t c_phy_id_new, cell_id_t cell_id) const;
     int     setCellPhyId(uint16_t c_phy_id_old, uint16_t c_phy_id_new, cell_id_t cell_id);
     int     removeCell(uint16_t cid);
     int     getCellNum();
@@ -223,16 +270,38 @@ public:
     uint32_t            getUlOrderTimeoutGPU() const;
     uint32_t            getUlOrderTimeoutGPUSrs() const;
     uint32_t            getUlSrsAggr3TaskLaunchOffsetNs() const;
+    /**
+     * @brief SRS task1 order/channel launch offset from T0 (nanoseconds).
+     * Used when gpu_init_comms_via_cpu is enabled for SRS UL order and TaskUL1AggrSrs scheduling.
+     * @return Offset in nanoseconds after the slot boundary (T0).
+     */
+    [[nodiscard]] uint32_t getUlSrsTask1OrderLaunchOffsetNs() const;
     uint8_t             getUlOrderTimeoutGPULogEnable() const;
     uint32_t            getUlOrderMaxRxPkts() const;
     uint32_t            getUlOrderRxPktsTimeout() const;
     uint32_t            getUlOrderTimeoutLogInterval() const;
     uint8_t             getUlOrderKernelMode() const;
+    [[nodiscard]] const OrderKernelFunctions& getOrderKernelFunctions() const { return order_kerns_; }
+    [[nodiscard]] const GenericCudaKernelFunctions& getGenericKernelFunctions() const { return generic_kerns_; }
+    [[nodiscard]] CUfunction getMemsetKernelDl() const { return memset_kernel_dl_; }
+    [[nodiscard]] CUfunction getKernelWaitEqDl() const { return kernel_wait_eq_dl_; }
     uint32_t            getUlOrderTimeoutFirstPktGPU() const;
     uint32_t            getUlOrderTimeoutFirstPktGPUSrs() const;
     HarqPoolManager *   getHarPoolManager() const;
     WAvgCfoPoolManager * getWAvgCfoPoolManager() const;
     CvSrsChestMemoryBank* getCvSrsChestMemoryBank() const;
+    /** Max UL antenna ports from config (SRS RX / chest sizing). */
+    [[nodiscard]] uint16_t            getMaxSrsAntennaPorts() const;
+    /**
+     * Max DL antenna ports from YAML (max DL eAxC count over all cells).
+     * Used to size DL data buffers, FH allocations, BFW arrays, mod-comp params, etc.
+     */
+    [[nodiscard]] uint16_t            getMaxDlAntennaPorts() const;
+    /**
+     * Max UL antenna ports from YAML (max(PUSCH/PUCCH/PRACH/SRS) eAxC count over cells).
+     * Used to size UL data buffers, eAxC maps, PUSCH/PUCCH RX tensors, etc.
+     */
+    [[nodiscard]] uint16_t            getMaxUlAntennaPorts() const;
     /**
      * @brief Return if green contexts (GC) mode is enabled.
      * @return Non-zero if GC enabled, zero otherwise
@@ -271,7 +340,7 @@ public:
     cudaStream_t*       getUlOrderStreamsPrach();
     cudaStream_t&       get_stream_timing_dl() {return stream_timing_dl;};
     cudaStream_t&       get_stream_timing_ul() {return stream_timing_ul;};
-    void                warmupStream(cudaStream_t stream);
+    void                warmupStream(CUfunction kernel_order_func, CUfunction warmup_kernel_func, cudaStream_t stream);
 
     PhyUlBfwAggr*       getNextUlBfwAggr(slot_params_aggr* aggr_slot_params);
     PhyPuschAggr*       getNextPuschAggr(slot_params_aggr* aggr_slot_params);
@@ -281,7 +350,7 @@ public:
     PhyDlBfwAggr*       getNextDlBfwAggr(slot_params_aggr* aggr_slot_params);
     void                recordDlBFWCompletion(int slot);
     int                 queryDlBFWCompletion(int slot);
-    cudaError_t         queryDlBFWCompletion_v2(int slot);
+    [[nodiscard]] CUresult            queryDlBFWCompletion_v2(int slot);
     void                recordUlBFWCompletion(int slot);
     int                 queryUlBFWCompletion(int slot);
     PhyPdschAggr*       getNextPdschAggr(slot_params_aggr* aggr_slot_params);
@@ -294,6 +363,28 @@ public:
     int                 createPrachObjects();
     int                 deletePrachObjects();
     int                 replacePrachObjects();
+    /// Replace PRACH objects synchronously when no cells are active.
+    [[nodiscard]] int   replacePrachObjectsCallerRuns();
+    /// Return true when any cell is active.
+    /// @thread_safety Lock-free cell_map scan; safe only under the non-slot LP
+    ///   worker's serialization of reconfig and CONFIG/START/STOP. See definition.
+    [[nodiscard]] bool  hasActiveCells() const;
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    /**
+     * Accessor for the offload active-cell PRACH reconfiguration driver.
+     *
+     * Encapsulates the handover state machine and the per-aggregator
+     * stage/create/commit/discard orchestration; see PrachOffloadReconfig.
+     *
+     * Currently inert: it has no callers and is wired in once the
+     * process_reconfig active-cell path drives it.
+     *
+     * @return reference to the owned PrachOffloadReconfig
+     */
+    [[nodiscard]] PrachOffloadReconfig& prachOffloadReconfig() { return prach_offload_; }
+#endif
+
     int                 updateCellConfig(cell_id_t cell_id, cell_phy_info& cell_pinfo);
     Mutex               updateCellConfigMutex;
     int                 updateCellConfigCellId;
@@ -383,22 +474,50 @@ public:
     void             set_level_logger(l1_log_level _log_lvl);
 
     cudaEvent_t         getGpuCommsPrepareDoneEvt(void) const { return gpu_comm_prepare_done; };
-    cudaStream_t        getH2DCpyStream(void)const { return H2D_TB_CPY_stream;};
     MpsCtx *            getPdschMpsCtx(void)const{return pdschMpsCtx;};
-    cudaEvent_t         get_event_pdsch_tb_cpy_complete(uint8_t slot_idx){return pdsch_tb_cpy_complete[slot_idx%MAX_PDSCH_TB_CPY_CUDA_EVENTS];};
-    cudaEvent_t         get_event_pdsch_tb_cpy_start(uint8_t slot_idx){return pdsch_tb_cpy_start[slot_idx%MAX_PDSCH_TB_CPY_CUDA_EVENTS];};
+
+    /// Always returns a valid manager — production and minimal/test ctors both
+    /// allocate one (the minimal ctor uses the null-object form).
+    [[nodiscard]] PdschH2DCopyManager* getH2DCopyManager() { return m_h2dCopyMgr.get(); }
+
+    // Forwarding accessors — delegate to PdschH2DCopyManager.
+    // @c m_h2dCopyMgr is guaranteed non-null on both ctor paths (the minimal
+    // ctor allocates a null-object instance whose methods are safe no-ops),
+    // so no null check is required here.
+    [[nodiscard]] cudaStream_t getH2DCpyStream() const
+    {
+        return m_h2dCopyMgr->getStream();
+    }
+    [[nodiscard]] cudaEvent_t get_event_pdsch_tb_cpy_complete(uint8_t slot_idx)
+    {
+        return m_h2dCopyMgr->getCompleteEvent(slot_idx);
+    }
+    [[nodiscard]] cudaEvent_t get_event_pdsch_tb_cpy_start(uint8_t slot_idx)
+    {
+        return m_h2dCopyMgr->getStartEvent(slot_idx);
+    }
+    [[nodiscard]] h2d_copy_prepone_info_t* get_h2d_copy_prepone_info(uint16_t idx)
+    {
+        return m_h2dCopyMgr->getPreponeInfo(idx);
+    }
+    void reset_h2d_copy_prepone_info()
+    {
+        m_h2dCopyMgr->resetPreponeInfo();
+    }
 
     uint32_t             getAggr_obj_non_avail_th(void) const;
-    h2d_copy_prepone_info_t* get_h2d_copy_prepone_info(uint16_t idx){return &h2d_cpy_info[idx];};
-    void reset_h2d_copy_prepone_info();
     
     uint8_t                 getmMIMO_enable() const;
+    uint16_t                getNicMtu(uint32_t nic_index) const;
     uint8_t                 get_enable_srs() const;
     uint8_t                 get_enable_dl_core_affinity() const;
     uint8_t                 get_dlc_core_packing_scheme() const;
     uint8_t                 getCellGroupNum() const;
     uint8_t                 get_ch_segment_proc_enable() const;
-    uint32_t                geth2d_copy_wait_th(void) const;
+    [[nodiscard]] uint32_t geth2d_copy_wait_th() const
+    {
+        return m_h2dCopyMgr->getCopyWaitThNs();
+    }
     uint32_t                getcuphy_dl_channel_wait_th(void) const;
     uint32_t                getSendCPlane_timing_error_th_ns(void) const;
     uint32_t                getSendCPlane_ulbfw_backoff_th_ns(void) const;
@@ -439,16 +558,7 @@ public:
     MemFoot mf;
     MemFoot cuphyChannelsAccumMf; // cumulative GPU footprint for cuPHY channel objects
     MemFoot wip_accum_mf;  //FIXME TBD if GPU or general
-    uint8_t num_pdsch_buff_copy;
-    bool enable_prepone_h2d_cpy;
-    uint8_t h2d_copy_thread_enable;
-    std::thread h2d_cpy_thread;
-    std::atomic<uint16_t> h2d_write_idx;
-    uint16_t h2d_read_idx; //Currently the read index is non-atomic. However, this would have to change if copy task is offloaded to multile threads vs the current single thread scheme
-    std::array<std::atomic<bool>, PDSCH_MAX_GPU_BUFFS> h2d_copy_cuda_event_rec_done;
-    std::array<std::atomic<int>, PDSCH_MAX_GPU_BUFFS> h2d_copy_done_cur_slot_idx;
-    uint8_t h2d_copy_done_cur_slot_read_idx;
-    uint8_t h2d_copy_done_cur_slot_write_idx;
+    // H2D copy state lives in PdschH2DCopyManager (m_h2dCopyMgr).
     std::array<bfw_buffer_info*, MAX_CELLS_PER_SLOT> bfw_coeff_buffer;
     bfw_buffer_info* getBfwCoeffBuffer(uint8_t cell_idx) const;
     void setBfwCoeffBuffer(uint8_t cell_idx, bfw_buffer_info* buffer_info) noexcept;
@@ -457,9 +567,20 @@ public:
     //MIB cycle is defined as the time during which MIB contents do not change - which is 16SFNs. For u=1 each SFN has 20 slots.
     const uint32_t default_mib_cycle = 16*SLOTS_PER_FRAME;
 
-    void updateBatchedMemcpyInfo(void* dst_addr, void* src_addr, size_t count);
-    [[nodiscard]] cuphyStatus_t performBatchedMemcpy();
-    void     resetBatchedMemcpyBatches();
+    // Batched memcpy wrappers — m_h2dCopyMgr is non-null on every ctor path
+    // (the minimal ctor allocates a null-object instance).
+    void updateBatchedMemcpyInfo(void* dst_addr, const void* src_addr, std::size_t count)
+    {
+        m_h2dCopyMgr->updateBatchedMemcpyInfo(dst_addr, src_addr, count);
+    }
+    [[nodiscard]] cuphyStatus_t performBatchedMemcpy()
+    {
+        return m_h2dCopyMgr->performBatchedMemcpy();
+    }
+    void resetBatchedMemcpyBatches()
+    {
+        m_h2dCopyMgr->resetBatchedMemcpyBatches();
+    }
     [[nodiscard]] bool getEnableTxNotification() const;
 
     DataLake* getDataLake(void);
@@ -494,8 +615,10 @@ public:
     perf_metrics::PercentileTracker order_kernel_timing_tracker{0, 3000000, 1000, 80};  ///< Track Order Kernel completion times per slot (0-3ms range, 1μs buckets, 80 slots)
 
 private:
-    std::array<cudaEvent_t,MAX_PDSCH_TB_CPY_CUDA_EVENTS> pdsch_tb_cpy_start;
-    std::array<cudaEvent_t,MAX_PDSCH_TB_CPY_CUDA_EVENTS> pdsch_tb_cpy_complete;
+    void init_gpu_resources(const context_config& ctx_cfg);
+
+    std::unique_ptr<PdschH2DCopyManager> m_h2dCopyMgr;
+
     std::array<cudaEvent_t,SLOTS_PER_FRAME> dlbfw_run_completion_event;
     std::array<cudaEvent_t,SLOTS_PER_FRAME> ulbfw_run_completion_event;
     //List of pre-allocated SlotMaps
@@ -523,12 +646,7 @@ private:
     //List of associated GPUs
     std::unordered_map<int, std::unique_ptr<GpuDevice>> gpu_map;
 
-    std::array<h2d_copy_prepone_info_t,(DL_MAX_CELLS_PER_SLOT*PDSCH_MAX_GPU_BUFFS)> h2d_cpy_info;
-
-    //batched memory copy
     uint8_t  use_batched_memcpy; // configuration requested via yaml file or default fall back. Batched async copy use relies on other factors too.
-    cuphyBatchedMemcpyHelper m_batchedMemcpyHelper;
-    int batched_copies = 0; // number of copies that happen in a batch for PDSCH H2D per cell TB copies.
 
     // Callbacks
     slot_command_api::ul_slot_callbacks ul_cb;
@@ -562,6 +680,12 @@ private:
 
     //Others
     bool cplane_disable;
+    bool fapi_to_cplane_direct{};
+    uint8_t cplane_processing_dl_batch_size{};
+    uint8_t cplane_processing_ul_batch_size{};
+    std::size_t cplane_max_concurrent_transactions{1};
+    SlotMapDl* early_slot_map_dl_{nullptr};
+    SlotMapUl* early_slot_map_ul_{nullptr};
     bool standalone;
     bool validation;
 
@@ -619,6 +743,7 @@ private:
     uint32_t ul_order_timeout_gpu_ns;
     uint32_t ul_order_timeout_gpu_srs_ns;
     uint32_t ul_srs_aggr3_task_launch_offset_ns;
+    uint32_t ul_srs_task1_order_launch_offset_ns{};
     uint32_t ul_order_timeout_first_pkt_gpu_ns;
     uint32_t ul_order_timeout_first_pkt_gpu_srs_ns;
     uint32_t ul_order_timeout_log_interval_ns;
@@ -627,6 +752,11 @@ private:
     uint8_t ul_order_kernel_mode;
     uint32_t ul_order_max_rx_pkts;
     uint32_t ul_order_rx_pkts_timeout_ns;
+
+    OrderKernelFunctions order_kerns_;
+    GenericCudaKernelFunctions generic_kerns_;
+    CUfunction memset_kernel_dl_ = nullptr;
+    CUfunction kernel_wait_eq_dl_ = nullptr;
 
     //Gather metrics
     int prometheus_cpu_core;
@@ -698,7 +828,6 @@ private:
     cudaStream_t                           aggr_stream_pdcch;
     cudaStream_t                           aggr_stream_pbch;
     cudaStream_t                           aggr_stream_csirs;
-    cudaStream_t                           H2D_TB_CPY_stream;
 
     Mutex                                  aggr_lock_cell_phy_dlbfw;
     Mutex                                  aggr_lock_cell_phy_pdsch;
@@ -725,6 +854,12 @@ private:
     cuphy::unique_device_ptr<CleanupDlBufInfo> d_dl_buffers_addr;
 
     uint32_t                               num_new_prach_handles;
+
+#ifdef ENABLE_FAPI_STORE_REPLAY
+    /// Offload active-cell PRACH reconfiguration driver. Declared after
+    /// aggr_prach_items / aggr_lock_cell_phy_prach: it binds references to them.
+    PrachOffloadReconfig                   prach_offload_{aggr_prach_items, aggr_lock_cell_phy_prach};
+#endif
 
     uint8_t                                pusch_workCancelMode;
     uint8_t                                enable_pusch_tdi;
@@ -766,6 +901,8 @@ private:
     uint32_t                               ul_warmup_frame_count;
     uint8_t                                pmu_metrics;
     uint8_t                                mMIMO_enable;
+    std::vector<nic_cfg>                   nic_configs_;
+    std::unique_ptr<FrameworkCPlaneService> fw_cplane_svc_;
     uint8_t                                enable_srs;
     uint8_t                                enable_dl_core_affinity;
     uint8_t                                dlc_core_packing_scheme;
@@ -806,11 +943,13 @@ private:
     uint8_t                                bfw_power_normalization_alg_selector;
     float                                  bfw_beta_prescaler;
     uint32_t                               total_num_srs_chest_buffers;
+    uint16_t                               max_srs_antenna_ports{0};
+    uint16_t                               max_dl_antenna_ports{0};   ///< Max DL eAxC count from YAML; sizes DL buffers, BFW, FH structs.
+    uint16_t                               max_ul_antenna_ports{0};   ///< Max UL eAxC count from YAML; sizes UL buffers, eAxC maps.
     /*UL/DL Aggregated Objects error handling specific*/
     aggr_obj_error_info_t                  aggr_error_info_dl;
     aggr_obj_error_info_t                  aggr_error_info_ul;  
     //DL wait thresholds(ns)
-    uint32_t                               h2d_copy_wait_th;
     uint32_t                               cuphy_dl_channel_wait_th;
     uint16_t                               forcedNumCsi2Bits;
     uint32_t                               pusch_nMaxLdpcHetConfigs;

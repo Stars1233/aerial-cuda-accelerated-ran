@@ -95,7 +95,6 @@ typedef struct
 typedef struct
 {
     int cuda_device_id;   //!< CUDA device ID for CUDA/GPU DATA memory pool
-    int32_t ring_len;     //!< Ring queue length for TX and RX queues
     /*!< Size of all memory pools: MSG, CPU_DATA, CUDA_DATA, GPU_DATA */
     nv_ipc_mempool_size_t mempool_size[NV_IPC_MEMPOOL_NUM];
     char prefix[NV_NAME_MAX_LEN]; //!< Unique name prefix for nv_ipc_t instance

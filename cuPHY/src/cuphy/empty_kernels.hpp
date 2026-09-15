@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,13 @@ struct testDescr_sz
 
 cuphyStatus_t CUPHYWINAPI internalCuphySetGenericEmptyKernelNodeGridConstantParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, void** pKernelParams, int ptrArgsCnt, uint16_t descr_size);
 cuphyStatus_t CUPHYWINAPI internalCuphySetGenericEmptyKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, int ptrArgsCnt, void** pKernelParams);
+/** @brief: Set kernel node parameters for delay kernel
+ *
+ * @param[in] pNodeParams: Pointer to CUDA_KERNEL_NODE_PARAMS to populate
+ * @param[in] pKernelParams: Pointer to kernel parameters (delay in usec)
+ * @return CUPHY_STATUS_SUCCESS or CUPHY_STATUS_INVALID_ARGUMENT or CUPHY_STATUS_INTERNAL_ERROR
+ */
+cuphyStatus_t CUPHYWINAPI internalCuphySetDelayKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, void** pKernelParams);
 cuphyStatus_t CUPHYWINAPI internalCuphySetEmptyKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams);
 cuphyStatus_t CUPHYWINAPI internalCuphySetWorkCancelKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, void** pKernelParams, uint8_t device_graph_launch);
 

@@ -19,11 +19,12 @@
 # Enable CUDA
 enable_language(CUDA)
 
-add_executable(test_polar_encoder test_polar_encoder.cpp dummy.cu)
-target_include_directories(test_polar_encoder PRIVATE 
+add_executable(test_polar_encoder test_polar_encoder.cpp test_warp_encoder_kernels.cu dummy.cu)
+target_include_directories(test_polar_encoder PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/common
     ${PROJECT_SOURCE_DIR}/src/cuphy/polar_encoder
     ${PROJECT_SOURCE_DIR}/src/cuphy
+    ${PROJECT_SOURCE_DIR}/src/cuphy_channels
     ${PROJECT_SOURCE_DIR}/include
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )

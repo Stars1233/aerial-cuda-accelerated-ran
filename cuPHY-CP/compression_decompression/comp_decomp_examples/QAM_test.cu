@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,21 +22,14 @@
 #include <cstdint>
 #include <cuda_fp16.h>
 
+#define TAG (NVLOG_TAG_BASE_COMPRESSION + 1) // "COMP.QAMTEST"
+
+#include "cuda_driver_utils/cuda_driver_utils.hpp"
+#include "cuda_driver_utils/cuda_kernel_utils.cuh"
+
 #include "QAM_param.cuh"
 #include "QAM_comp.cuh"
 #include "QAM_decomp.cuh"
-
-#define CUCHK(call)                                                              \
-    {                                                                            \
-        cudaError_t err = call;                                                  \
-        if (cudaSuccess != err)                                                  \
-        {                                                                        \
-            fprintf(stderr, "Cuda error in file '%s' line %i : %s.\n", __FILE__, \
-                    __LINE__, cudaGetErrorString(err));                          \
-            fflush(stderr);                                                      \
-            exit(EXIT_FAILURE);                                                  \
-        }                                                                        \
-    }
 
 // Kernel to convert CURAND's FP32 data into FP16
 __global__ void fp32tofp16(float *input, half *output, int n)
@@ -77,6 +70,29 @@ __global__ void prep_prbs(half **__restrict__ list_inputs,       // Input data, 
     }
 }
 
+static CUfunction fp32tofp16_func       = nullptr;
+static CUfunction prep_prbs_func        = nullptr;
+static CUfunction compress_func         = nullptr;
+static CUfunction decompress_func       = nullptr;
+
+[[nodiscard]] static bool init_kernels()
+{
+    bool ok = true;
+    ok &= resolve_kernel_func<TAG>(&fp32tofp16_func,
+                                    reinterpret_cast<const void*>(fp32tofp16),
+                                    "fp32tofp16");
+    ok &= resolve_kernel_func<TAG>(&prep_prbs_func,
+                                    reinterpret_cast<const void*>(prep_prbs),
+                                    "prep_prbs");
+    ok &= resolve_kernel_func<TAG>(&compress_func,
+                                    reinterpret_cast<const void*>(compress_QAM_lists<QAM_Comp>),
+                                    "compress_QAM_lists<QAM_Comp>");
+    ok &= resolve_kernel_func<TAG>(&decompress_func,
+                                    reinterpret_cast<const void*>(decompress_QAM_lists<QAM_Decomp>),
+                                    "decompress_QAM_lists<QAM_Decomp>");
+    return ok;
+}
+
 struct RndGen
 {
     curandGenerator_t gen;
@@ -95,12 +111,15 @@ struct RndGen
     }
     void randomize(half *data, int n)
     {
-        float *tmp;
-        cudaMalloc((void **)&tmp, n * sizeof(float));
+        CUdeviceptr tmp_d;
+        CUDA_DRIVER_CHECK(cuMemAlloc(&tmp_d, n * sizeof(float)));
+        float *tmp = reinterpret_cast<float*>(static_cast<uintptr_t>(tmp_d));
         curandGenerateUniform(gen, tmp, n);
-        fp32tofp16<<<(n + 1023) / 1024, 1024>>>(tmp, data, n);
-        cudaDeviceSynchronize();
-        cudaFree(tmp);
+        unsigned int blocks = (n + 1023) / 1024;
+        void* args[] = {&tmp, &data, &n};
+        CUDA_DRIVER_CHECK(cuLaunchKernel(fp32tofp16_func, blocks, 1, 1, 1024, 1, 1, 0, nullptr, args, nullptr));
+        CUDA_DRIVER_CHECK(cuCtxSynchronize());
+        CUDA_DRIVER_CHECK(cuMemFree(tmp_d));
     }
     void randomize(uint *data, int n)
     {
@@ -150,6 +169,14 @@ void getWidth(int i, QamListParam::qamwidth &width0, QamListParam::qamwidth &wid
 
 int main()
 {
+    PrimaryCtxGuard ctx_guard(0);
+
+    if(!init_kernels())
+    {
+        fprintf(stderr, "Failed to resolve CUDA kernels\n");
+        return EXIT_FAILURE;
+    }
+
     RndGen rndgen;
 
     const int nlists = 40;
@@ -159,44 +186,44 @@ int main()
     uint8_t **outputs, **cpu_outputs;
     QamListParam *list_params;
     QamPrbParam **prb_params;
-    CUCHK(cudaMallocManaged((void **)&nprbs, nlists * sizeof(int)));
-    CUCHK(cudaMallocManaged((void **)&list_params, nlists * sizeof(QamListParam)));
-    CUCHK(cudaMallocManaged((void **)&inputs, nlists * sizeof(half *)));
-    CUCHK(cudaMallocManaged((void **)&decomp, nlists * sizeof(half *)));
-    CUCHK(cudaMallocManaged((void **)&cpu_decomp, nlists * sizeof(half *)));
-    CUCHK(cudaMallocManaged((void **)&outputs, nlists * sizeof(uint8_t *)));
-    CUCHK(cudaMallocManaged((void **)&cpu_outputs, nlists * sizeof(uint8_t *)));
-    CUCHK(cudaMallocManaged((void **)&prb_params, nlists * sizeof(QamPrbParam *)));
+    managed_alloc(&nprbs, nlists * sizeof(int));
+    managed_alloc(&list_params, nlists * sizeof(QamListParam));
+    managed_alloc(&inputs, nlists * sizeof(half *));
+    managed_alloc(&decomp, nlists * sizeof(half *));
+    managed_alloc(&cpu_decomp, nlists * sizeof(half *));
+    managed_alloc(&outputs, nlists * sizeof(uint8_t *));
+    managed_alloc(&cpu_outputs, nlists * sizeof(uint8_t *));
+    managed_alloc(&prb_params, nlists * sizeof(QamPrbParam *));
 
     // Generate random scaling factors for each list
     float2 *scalers;
-    CUCHK(cudaMallocManaged((void **)&scalers, nlists * sizeof(float2)));
+    managed_alloc(&scalers, nlists * sizeof(float2));
     rndgen.randomize(reinterpret_cast<float *>(scalers), 2 * nlists);
-    CUCHK(cudaDeviceSynchronize());
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
     for (int i = 0; i < nlists; i++)
         scalers[i] = make_float2(scalers[i].x * 256.0f, scalers[i].y * 256.0f);
 
     for (int i = 0; i < nlists; i++)
     {
         nprbs[i] = max(1, ((i + 1) * 100 % 128));
-        CUCHK(cudaMallocManaged((void **)&inputs[i], nprbs[i] * 24 * sizeof(half)));
-        CUCHK(cudaMallocManaged((void **)&decomp[i], nprbs[i] * 24 * sizeof(half)));
-        CUCHK(cudaMallocManaged((void **)&cpu_decomp[i], nprbs[i] * 24 * sizeof(half)));
-        CUCHK(cudaMallocManaged((void **)&outputs[i], nprbs[i] * MAXMODCOMPPRBBYTES));
-        CUCHK(cudaMallocManaged((void **)&cpu_outputs[i], nprbs[i] * MAXMODCOMPPRBBYTES));
-        CUCHK(cudaMemset(outputs[i], 0, nprbs[i] * MAXMODCOMPPRBBYTES));
-        CUCHK(cudaMallocManaged((void **)&prb_params[i], nprbs[i] * sizeof(QamPrbParam)));
+        managed_alloc(&inputs[i], nprbs[i] * 24 * sizeof(half));
+        managed_alloc(&decomp[i], nprbs[i] * 24 * sizeof(half));
+        managed_alloc(&cpu_decomp[i], nprbs[i] * 24 * sizeof(half));
+        managed_alloc(&outputs[i], nprbs[i] * MAXMODCOMPPRBBYTES);
+        managed_alloc(&cpu_outputs[i], nprbs[i] * MAXMODCOMPPRBBYTES);
+        CUDA_DRIVER_CHECK(cuMemsetD8(reinterpret_cast<CUdeviceptr>(outputs[i]), 0, nprbs[i] * MAXMODCOMPPRBBYTES));
+        managed_alloc(&prb_params[i], nprbs[i] * sizeof(QamPrbParam));
 
         // Generate masks, alternate between single and dual masks
         uint *tmpmasks;
-        CUCHK(cudaMallocManaged((void **)&tmpmasks, nprbs[i] * sizeof(uint)));
+        managed_alloc(&tmpmasks, nprbs[i] * sizeof(uint));
         bool dualmasks = i % 3 > 0;
         bool missingprbs = i % 3 == 2;
         if (dualmasks)
             rndgen.randomize(tmpmasks, nprbs[i]);
         else
-            cudaMemset(tmpmasks, 0xff, nprbs[i] * sizeof(uint)); // Only one mask, mask0
-        CUCHK(cudaDeviceSynchronize());
+            CUDA_DRIVER_CHECK(cuMemsetD8(reinterpret_cast<CUdeviceptr>(tmpmasks), 0xff, nprbs[i] * sizeof(uint)));
+        CUDA_DRIVER_CHECK(cuCtxSynchronize());
         for (int j = 0; j < nprbs[i]; j++)
             if (missingprbs)
             {
@@ -220,14 +247,18 @@ int main()
         rndgen.randomize(inputs[i], nprbs[i] * 24);
     }
     // Prep the PRB values for all the lists
-    prep_prbs<<<nlists, 256>>>(inputs, prb_params, scalers, nprbs, nlists);
-    CUCHK(cudaDeviceSynchronize());
+    {
+        int nlists_arg = nlists;
+        void* args[] = {&inputs, &prb_params, &scalers, &nprbs, &nlists_arg};
+        CUDA_DRIVER_CHECK(cuLaunchKernel(prep_prbs_func, nlists, 1, 1, 256, 1, 1, 0, nullptr, args, nullptr));
+    }
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
 
     // Compress
-    QAM_Comp::gpu_compress_QAM_lists(inputs, list_params, prb_params, scalers, outputs, nprbs, nlists);
+    CUDA_DRIVER_CHECK(QAM_Comp::gpu_compress_QAM_lists(compress_func, inputs, list_params, prb_params, scalers, outputs, nprbs, nlists));
     QAM_Comp::cpu_compress_QAM_lists(inputs, list_params, prb_params, scalers, cpu_outputs, nprbs, nlists);
 
-    CUCHK(cudaDeviceSynchronize());
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
 
     // Compare the compressed data (bitwise)
     int errs = 0;
@@ -241,10 +272,10 @@ int main()
     printf("Compression on CPU and GPU : %s (%d errors)\n", errs ? "mismatch" : "binary match", errs);
 
     // Uncompress
-    QAM_Decomp::gpu_decompress_QAM_lists(outputs, list_params, prb_params, scalers, decomp, nprbs, nlists);
-    QAM_Decomp::gpu_decompress_QAM_lists(cpu_outputs, list_params, prb_params, scalers, cpu_decomp, nprbs, nlists);
+    CUDA_DRIVER_CHECK(QAM_Decomp::gpu_decompress_QAM_lists(decompress_func, outputs, list_params, prb_params, scalers, decomp, nprbs, nlists));
+    CUDA_DRIVER_CHECK(QAM_Decomp::gpu_decompress_QAM_lists(decompress_func, cpu_outputs, list_params, prb_params, scalers, cpu_decomp, nprbs, nlists));
 
-    CUCHK(cudaDeviceSynchronize());
+    CUDA_DRIVER_CHECK(cuCtxSynchronize());
 
     // Compare the CPU and GPU decompressed result
     errs = 0;
@@ -281,8 +312,6 @@ int main()
                     {
                         gpu_errs++;
                     }
-                    // gpu_errs += gpu_diff_i <= maxerr0 ? 0 : 1;
-                    // gpu_errs += gpu_diff_q <= maxerr0 ? 0 : 1;
                     cpu_errs += cpu_diff_i <= maxerr0 ? 0 : 1;
                     cpu_errs += cpu_diff_q <= maxerr0 ? 0 : 1;
                 }
@@ -296,8 +325,6 @@ int main()
                     {
                         gpu_errs++;
                     }
-                    // gpu_errs += gpu_diff_i <= maxerr1 ? 0 : 1;
-                    // gpu_errs += gpu_diff_q <= maxerr1 ? 0 : 1;
                     cpu_errs += cpu_diff_i <= maxerr1 ? 0 : 1;
                     cpu_errs += cpu_diff_q <= maxerr1 ? 0 : 1;
                 }
@@ -312,8 +339,6 @@ int main()
                     {
                         gpu_errs++;
                     }
-                    // gpu_errs += gpu_diff_i == 0.0f ? 0 : 1;
-                    // gpu_errs += gpu_diff_q == 0.0f ? 0 : 1;
                     cpu_errs += cpu_diff_i == 0.0f ? 0 : 1;
                     cpu_errs += cpu_diff_q == 0.0f ? 0 : 1;
                 }

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,10 +54,14 @@ schedule_total_time: 0
 # b2 - multiCellLayerSel;
 # b3 - mcsSelectionLUT;
 # b4 - pfmSort;
+# b5 - muUeGrp (MU-MIMO UE grouping);
 task_bitmask: 0x1
 
+# Slot offset applied when mapping MU UE grouping TV files to slot indices.
+srs_slot_lag: 0
+
 # FAPI TB data location option. See enum dl_tb_loc in nv_phy_module.hpp
-# 0 - CPU_MSG buffer; 1 - CPU_DATA buffer; 2 - CUDA_DATA buffer
+# 1 - CPU_DATA; 2 - CPU_LARGE; 3 - GPU_DATA
 fapi_tb_loc: 1
 
 cumac_cell_num: 8

@@ -17,6 +17,7 @@ set(CUMAC_SOURCES
     api.h
     ../lib/cumac_msg/cumac_pfm_sort.h
     cumac.h
+    common/schedulerTimeMeasure.h
     cpuMatAlg/cpuMatAlg.cpp
     cpuMatAlg/cpuMatAlg.h
     4T4R/cellAssociation.cu
@@ -82,6 +83,15 @@ if (NOT CMAKE_BUILD_TYPE MATCHES "Release" OR ENABLE_LINE_INFO)
 endif()
 #message("lineinfo flag value: ${CUMAC_NVCC_FLAGS}")
 
+# Canonical opt-in for the timing instrumentation that lives behind
+# SCHEDULER_KERNEL_TIME_MEASURE_/CELLASSOCIATION_KERNEL_TIME_MEASURE_/
+# CPU_SCHEDULER_TIME_MEASURE_ across the cuMAC sources. The legacy per-area
+# gates are turned on inside cuMAC/src/common/schedulerTimeMeasure.h when
+# CUMAC_KERNEL_TIME_MEASURE is defined.
+option(CUMAC_ENABLE_KERNEL_TIME_MEASURE
+       "Enable cuMAC kernel/CPU time-measurement instrumentation"
+       OFF)
+
 find_package(Eigen3 REQUIRED)
 
 add_library(cumac ${CUMAC_SOURCES})
@@ -89,6 +99,11 @@ set_property(TARGET cumac PROPERTY POSITION_INDEPENDENT_CODE ON)
 if (BUILD_SHARED_LIBS)
     set_property(TARGET cumac PROPERTY CUDA_SEPARABLE_COMPILATION ON)
     set_property(TARGET cumac PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+endif()
+
+if (CUMAC_ENABLE_KERNEL_TIME_MEASURE)
+    target_compile_definitions(cumac PRIVATE CUMAC_KERNEL_TIME_MEASURE)
+    message(STATUS "cuMAC kernel time-measurement instrumentation: ENABLED")
 endif()
 
 target_link_libraries(cumac PUBLIC ${HDF5_CXX_LIBRARIES} CUDA::cudart CUDA::cuda_driver CUDA::cusolver ${NVINFER} ${NVONNXPARSER} Eigen3::Eigen nvlog nvipc)

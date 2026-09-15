@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +40,7 @@ ldpc_decode_test_vec_file::ldpc_decode_test_vec_file(const test_vec_file_params&
     tSrcData_                 = cuphy::tensor_from_dataset(fInput.open_dataset("sourceData"),
                                                            CUPHY_BIT,
                                                            cuphy::tensor_flags::align_coalesce);
+    set_src_bits_desc(tSrcData_.desc());
     //------------------------------------------------------------------
     // Populate LDPC "configuration" data
     populate_config(fparams);
@@ -58,6 +59,8 @@ ldpc_decode_test_vec_file::ldpc_decode_test_vec_file(const test_vec_file_params&
         limit_desc_ = cuphy::index_group(cuphy::dim_all(),
                                          cuphy::index_range(0, num_cw_limit_)).get_tensor_desc(tLLR_.desc());
         set_LLR_desc(limit_desc_);
+        set_src_bits_desc(cuphy::index_group(cuphy::dim_all(),
+                                             cuphy::index_range(0, num_cw_limit_)).get_tensor_desc(tSrcData_.desc()));
     }
     else
     {

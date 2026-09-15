@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,10 +18,37 @@
 #pragma once
 
 #include "cuphy_api.h"
+#include "ldpc/ldpc_params.hpp"
 #include "nvlog.hpp"
 #include "common_utils.hpp"
 
 #define TAG_UTILS 931
+
+// 38.211 Table 7.4.1.5.3-1. "row" in 3GPP is 1-based: from 1 to 18. Access the following CSIRS tables by index = row - 1.
+static constexpr uint8_t csirsRowDataNumPorts[CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH] =
+                                                   {1, 1,    /* rows 1, 2 */
+                                                    2,       /* row 3 */
+                                                    4, 4,    /* rows 4, 5 */
+                                                    8, 8, 8, /* rows 6, 7, 8 */
+                                                    12, 12,  /* rows 9, 10 */
+                                                    16, 16,  /* rows 11, 12 */
+                                                    24, 24, 24, /* rows 13, 14, 15 */
+                                                    32, 32, 32}; /* rows 16, 17, 18 */
+static constexpr bool csirsRowDataBothL0L1[CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH] =
+    {false, false, false, false, false, false, // row1..6
+     false, false, false, false, false, false, // row7..12
+     true, true, false, true, true, false}; // row13..18
+// "l0, l0+1" counted as 2 symbols; the pattern is the same when both l0 and l1 are present.
+static constexpr uint8_t csirsRowDataNumSymPerLGroup[CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH] =
+    {1, 1, 1, 1, 2, 1, // row1..6
+     2, 1, 1, 1, 2, 1, // row7..12
+     2, 1, 1, 2, 1, 1}; // row13..18
+// note that l_prime column is always {0..num_l_prime - 1}.
+// note that when num_l_prime > 1, num_extra_sym_per_l is always 0, but not vice versa.
+static constexpr uint8_t csirsRowDataNumLPrime[CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH] =
+     {1, 1, 1, 1, 1, 1, // row1..6
+      1, 2, 1, 2, 1, 2, // row7..12
+      1, 2, 4, 1, 2, 4}; // row13..18
 
 /**
  * @brief Return base graph (BG) number based on code rate and transport block size.
@@ -112,22 +139,8 @@ inline void get_TB_size_and_num_CBs(int num_symbols, int num_prbs, int num_layer
  * @return number of information nodes (Kb)
  */
 inline uint32_t get_Kb(uint32_t transport_block_size, uint32_t base_graph) {
-    uint32_t Kb;
     uint32_t transport_block_size_w_CRC = transport_block_size + compute_TB_CRC(transport_block_size);
-    if (base_graph == 1) {
-        Kb = 22;
-    } else {
-        if (transport_block_size_w_CRC > 640) {
-            Kb = 10;
-        } else if (transport_block_size_w_CRC > 560) {
-            Kb = 9;
-        } else if (transport_block_size_w_CRC > 192) {
-            Kb = 8;
-        } else {
-            Kb = 6;
-        }
-    }
-    return Kb;
+    return cuphy::ldpc::derive_Kb(static_cast<int>(base_graph), transport_block_size_w_CRC);
 }
 
 /**
@@ -211,6 +224,20 @@ inline uint32_t get_per_UE_CSI_RS_CNT(uint16_t* xtf_re_map,
     return CSI_RS_RE_count;
 }
 
+inline __host__ bool pdsch_dl_rm_mod_fast_path_enabled(const PdschPerTbParams& tb_params,
+                                                       const int               num_ports,
+                                                       const int               resource_alloc,
+                                                       const bool              dmrs_carry_data,
+                                                       const bool              su_mimo)
+{
+    bool ok = (tb_params.Qm == CUPHY_QAM_256) && (tb_params.Nl == 4) && (num_ports == 4);
+    ok      = ok && su_mimo;
+    ok      = ok && (tb_params.testModel == 0);
+    ok      = ok && (resource_alloc == 1);
+    ok      = ok && !dmrs_carry_data;
+    ok      = ok && (tb_params.rv == 0);
+    return ok;
+}
 
 /**
  * @brief Update PdschPerTbParams structs that track configuration information at per TB
@@ -324,6 +351,7 @@ inline cuphyStatus_t cuphySetTBParamsFromStructs(PdschPerTbParams * tb_params_st
             NVLOGE_FMT(TAG_UTILS, AERIAL_CUPHY_EVENT, "n_PRB_LBRM {} is in invalid range! Should be within [32, 273].", cw->n_PRB_LBRM);
             return CUPHY_STATUS_INVALID_ARGUMENT;
         }
+
         get_TB_size_and_num_CBs(13 /* num_symbols. Force Nre = 12 * num_symbols to 156*/,
                                 cw->n_PRB_LBRM,
                                 cw->maxLayers, max_code_rate, cw->maxQm, LBRM_num_CBs, LBRM_transport_block_size, 0);
@@ -341,6 +369,18 @@ inline cuphyStatus_t cuphySetTBParamsFromStructs(PdschPerTbParams * tb_params_st
             NVLOGE_FMT(TAG_UTILS, AERIAL_CUPHY_EVENT, "tb_pars Nl {} has to be in [1, {}].", tb_params_struct[TB_id].Nl, MAX_DL_LAYERS_PER_TB);
             return CUPHY_STATUS_INVALID_ARGUMENT;
         }
+
+        // pdsch tx RM fast_path: host sets flag, kernel reads it
+        auto&      tb_params       = tb_params_struct[TB_id];
+        const int  num_ports       = (ue->enablePrcdBf != 0) ? (int)cell_grp_dyn_params->pPmwPrms[ue->pmwPrmIdx].nPorts : 0;
+        const bool dmrs_carry_data = (ue_group->pDmrsDynPrm->nDmrsCdmGrpsNoData == 1);
+        const bool su_mimo         = (ue_group->nUes == 1);
+        tb_params.fast_path = pdsch_dl_rm_mod_fast_path_enabled(tb_params,
+                                                                num_ports,
+                                                                (int)ue_group->resourceAlloc,
+                                                                dmrs_carry_data,
+                                                                su_mimo);
+
         // If this TB is for a cell in testing mode, then overwrite N, num_CBs fields
         // so we still respect the MAX_ENCODED_CODE_BLOCK_BIT_SIZE constraint.
         if (tb_params_struct[TB_id].testModel != 0) {
@@ -490,16 +530,6 @@ inline void init_CSIRS_tables(CsirsTables* h_csirs_tables) {
                                    {0, 0, 0, 0},
                                    {0, 1, 2, 3}};
 }
-
-static constexpr uint8_t csirsRowDataNumPorts[CUPHY_CSIRS_SYMBOL_LOCATION_TABLE_LENGTH] =
-                                                   {1, 1,    /* rows 0, 1 */
-                                                    2,       /* row 2 */
-                                                    4, 4,    /* rows 3, 4 */
-                                                    8, 8, 8, /* rows 5, 6, 7*/
-                                                    12, 12,  /* rows 8, 9 */
-                                                    16, 16,  /* rows 10, 11 */
-                                                    24, 24, 24, /* rows 12, 13, 14 */
-                                                    32, 32, 32}; /* rows 15, 16, 17 */
 
 /**
  * @brief Structure containing CUDA device architecture information and library support flags.

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -283,6 +283,7 @@ inline constexpr nvlog_component_ids g_nvlog_component_ids[] {
     {59, "PHY"},
     {60, "MAC"},
     {61, "NVIPC.PCAP"},
+    {62, "NVIPC.TESTMEMCPY"},
 
     // aerial_utils
     {80, "UTIL"},
@@ -347,6 +348,7 @@ inline constexpr nvlog_component_ids g_nvlog_component_ids[] {
     {246, "DRV.PACKET_TIMINGS_SRS"},
     {247, "DRV.WAVGCFO_POOL"},
     {248, "DRV.PERF_METRICS"},
+    {249, "DRV.H2D_MGR"},
 
     // cuphyl2adapter
     {300, "L2A"},
@@ -362,6 +364,8 @@ inline constexpr nvlog_component_ids g_nvlog_component_ids[] {
     {310, "L2A.SIM"},
     {311, "L2A.PROCESSING_TIMES"},
     {312, "L2A.TICK_TIMES"},
+    {313, "L2A.DL_CHANNELS"},
+    {314, "L2A.UL_CHANNELS"},
 
     // scfl2adapter
     {330, "SCF"},
@@ -449,6 +453,8 @@ inline constexpr nvlog_component_ids g_nvlog_component_ids[] {
 
     // compression_decompression
     {700, "COMP"},
+    {701, "COMP.QAMTEST"},
+    {702, "COMP.MODTEST"},
 
     // cuphyoam
     {800, "OAM"},

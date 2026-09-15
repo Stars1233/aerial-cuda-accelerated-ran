@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@
 #include "phychannel.hpp"
 #include "cell.hpp"
 #include "data_lake.hpp"
+#include <optional>
 
 /**
  * @class PhyPuschAggr
@@ -671,6 +672,9 @@ protected:
     ///< CUDA event recorded by cuPHY at start of full-slot wait (passed to cuPHY in static_params)
     cudaEvent_t waitCompletedFullSlotEvent;
     
+    ///< CUDA event recorded by cuPHY at the completion of processing UCI-on-PUSCH
+    cudaEvent_t uciOnPuschCompletedEvent;
+    
     ///< CUDA event marking start of run phase 1 (sub-slot/early HARQ)
     cudaEvent_t start_run_ph1;
     
@@ -717,6 +721,51 @@ protected:
     cuphy::unique_device_ptr<cuphyCsi2MapPrm_t>             csi2MapParamsGpuBuffer;
 
     ReleasedHarqBufferInfo released_harq_buffer_info; ///< Tracking information for released HARQ buffers
+
+    ////////////////////////////////////////////
+    //// Zero-copy TB buffer support (GT-11677)
+    ////////////////////////////////////////////
+    ///< Pre-allocated nvIPC message buffer from L2 adapter (used as D2H destination)
+    std::optional<slot_command_api::ul_output_msg_buffer> m_extMsgBuffer{};
+    ///< Saved original pTbPayloads pointer for restoration after callback
+    uint8_t* m_origTbPayloadsPtr{nullptr};
+
+    /**
+     * @brief Attempts to acquire an external buffer from L2 for zero-copy D2H.
+     *
+     * Calls the registered alloc_fn callback to get a pre-allocated nvIPC data
+     * buffer. If successful and the buffer is large enough, overrides
+     * DataOut.pTbPayloads so that cudaMemcpyAsync writes directly into the IPC
+     * buffer, eliminating the subsequent std::copy in send_rx_data_indication.
+     *
+     * Falls back silently to the internal bTbPayloads buffer on failure.
+     */
+    void acquireExternalTbBuffer();
+
+    /**
+     * @brief Restores DataOut.pTbPayloads to the internal buffer after callback.
+     */
+    void releaseExternalTbBuffer();
+
+    /**
+     * @brief RAII scope guard that releases the external TB buffer on scope exit
+     *        unless explicitly dismissed (e.g. on the success path).
+     */
+    class ExtTbBufferGuard
+    {
+    public:
+        explicit ExtTbBufferGuard(PhyPuschAggr& owner) : m_owner(owner) {}
+        ~ExtTbBufferGuard() { if (!m_dismissed) m_owner.releaseExternalTbBuffer(); }
+
+        void dismiss() noexcept { m_dismissed = true; }
+
+        ExtTbBufferGuard(const ExtTbBufferGuard&) = delete;
+        ExtTbBufferGuard& operator=(const ExtTbBufferGuard&) = delete;
+
+    private:
+        PhyPuschAggr& m_owner;
+        bool m_dismissed{false};
+    };
 
 #ifdef AERIAL_METRICS
     ////////////////////////////////////////////

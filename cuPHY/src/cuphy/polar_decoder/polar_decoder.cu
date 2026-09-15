@@ -17,9 +17,11 @@
 
 #include "polar_decoder.hpp"
 #include "../cuphy_internal.h"
+#include "polar_cw_tree_layout.hpp"
 
 #include <stdio.h>
 #include <assert.h>
+#include <algorithm>
 #include <functional>
 #include <cooperative_groups.h>
 #include <cuda_fp16.h>
@@ -35,11 +37,36 @@ using namespace cuphy_i;
 namespace polar_decoder
 {
 
-static constexpr int N_MAX_POLAR_DEPTH = 10;                             // biggest number of polar tree stages
-static constexpr int N_MAX_CODED_BITS  = CUPHY_POLAR_DECODER_MAX_BITS;   // = 1 << N_MAX_POLAR_DEPTH, biggest polar code word length
+static constexpr int N_MAX_CODED_BITS  = CUPHY_POLAR_DECODER_MAX_BITS;   // biggest polar code word length (1 << 10)
 static constexpr int WORD_LENGTH       = sizeof(uint32_t) * 8;           // word length used for storing coded bits
 static constexpr int N_MAX_WORDS       = N_MAX_CODED_BITS / WORD_LENGTH; // number of words required to store all bits
 static constexpr int BCO               = 3;                              // Bank conflict offset to minimize bank conflicts in list polar decoder
+static constexpr int CUDA_WARP_SIZE             = 32;
+static constexpr int POLAR_DECODER_BLOCK_SIZE   = CUDA_WARP_SIZE;        // threads per codeword (one warp)
+// Number of codewords decoded per block by the single/SC decoder kernel for
+// large batches. Each codeword is handled by one warp with its own dynamic
+// shared-memory slice; packing several warps per block lifts the
+// resident-block occupancy limit, which otherwise caps large launches at
+// half the warp slots. Small (latency-critical) batches keep one warp per
+// block; they cannot saturate the SMs anyway and single-warp blocks preserve
+// the shortest per-codeword critical path.
+static constexpr int POLAR_SC_WARPS_PER_BLOCK   = 4;
+static constexpr int POLAR_SC_MULTIWARP_MIN_CWS = 128;
+
+// The decoder currently launches one warp per codeword. Preserve block-wide
+// synchronization semantics if a future launch configuration uses more threads.
+template<uint32_t BLOCK_SIZE>
+__device__ __forceinline__ void sync_barrier()
+{
+    if constexpr(BLOCK_SIZE == CUDA_WARP_SIZE)
+    {
+        __syncwarp();
+    }
+    else
+    {
+        __syncthreads();
+    }
+}
 
 // clang-format off
 // depth array stored in constant mem
@@ -202,6 +229,236 @@ __device__ __forceinline__ __half2 signof2(__half2 a, __half2 b)
     return ur.h2;
 }
 
+// ==== register-resident low sub-tree (sub-trees of size <= 32) ================================
+// The SC decoder spends most of its node visits near the leaves, on small
+// sub-trees. Rather than run F/G/hard-decision on those through the LLR array
+// in (L1-cached) global memory -- a load/store plus a __syncwarp per stage --
+// the bottom 64 LLR values of the tree are held in registers and worked on with
+// warp shuffles, which are register-to-register and implicitly synchronized.
+//
+// Layout: `lowTreeLLR` is one __half2 per lane; lane l owns tree elements
+// (2l, 2l+1), so the 32 lanes cover the 64 low elements. A node of size sz
+// reads its two inputs from elements [2sz,3sz) ("a") and [3sz,4sz) ("b") and
+// writes its output to [sz,2sz), matching the array layout the vector F/G use.
+//
+// The SC main loop dispatches by sub-tree size:
+//   sz  > 32 : F_func / G_func         -- the original array (memory) path
+//   sz == 32 : F_lowTreeFromMem / ...  -- boundary: read the array inputs once
+//              and populate the register tree (elements [32,64))
+//   sz  < 32 : F_lowTree / G_lowTree   -- pure register/shuffle, no memory, no sync
+// The arithmetic is identical to the vector path, so decoding is bit-exact.
+// (The fast-SSC REP/SPC handlers reuse these for their small-node tail only;
+// they do their larger-node work in the memory array -- see rep_decide. That
+// is code reuse, not an algorithmic dependency.)
+
+// box-plus (min-sum) on a half2 pair; same arithmetic as the F_func vector path
+__device__ __forceinline__ __half2 F_pair(__half2 a2, __half2 b2)
+{
+    __half2 minAbs2 = __hmin2(__habs2(a2), __habs2(b2));
+    return __hmul2(signof2(a2, b2), minAbs2);
+}
+
+// F (min-sum) for a sub-tree of size sz < 32, held entirely in the register
+// tree: inputs and output are fetched/stored by warp shuffle, no memory.
+__device__ __forceinline__ void F_lowTree(__half2& lowTreeLLR, int32_t sz, uint32_t lane)
+{
+    if(sz == 1)
+    {
+        const __half2 in = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, 1);
+        if(lane == 0)
+        {
+            const __half aAbs   = __habs(__low2half(in));
+            const __half bAbs   = __habs(__high2half(in));
+            const __half minAbs = __hlt(aAbs, bAbs) ? aAbs : bAbs;
+            lowTreeLLR = __halves2half2(__low2half(lowTreeLLR), __hmul(signof(__low2half(in), __high2half(in)), minAbs));
+        }
+        return;
+    }
+    const __half2 a2 = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, lane + (sz >> 1));
+    const __half2 b2 = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, lane + sz);
+    if((lane >= static_cast<uint32_t>(sz >> 1)) && (lane < static_cast<uint32_t>(sz)))
+    {
+        lowTreeLLR = F_pair(a2, b2);
+    }
+}
+
+// F at the sz == 32 boundary: this is where the descent enters the register
+// tree. Read the two input rows from the LLR array in memory and populate the
+// upper register elements [32,64); smaller stages then stay in registers.
+__device__ __forceinline__ void F_lowTreeFromMem(__half2& lowTreeLLR, const __half* __restrict__ cwTreeLLR, uint32_t lane)
+{
+    if(lane >= 16)
+    {
+        const __half2* a2 = reinterpret_cast<const __half2*>(&cwTreeLLR[64]);
+        const __half2* b2 = reinterpret_cast<const __half2*>(&cwTreeLLR[96]);
+        lowTreeLLR = F_pair(a2[lane - 16], b2[lane - 16]);
+    }
+}
+
+// G for a sub-tree of size sz < 32, held entirely in the register tree; `est`
+// is the sibling's boolean codeword estimate (same sign arithmetic as G_func).
+__device__ __forceinline__ void G_lowTree(__half2& lowTreeLLR, const bool* __restrict__ est, int32_t sz, uint32_t lane)
+{
+    if(sz == 1)
+    {
+        const __half2 in = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, 1);
+        if(lane == 0)
+        {
+            const __half u = est[0] ? __float2half(-1.f) : __float2half(1.f);
+            lowTreeLLR = __halves2half2(__low2half(lowTreeLLR), __hfma(u, __low2half(in), __high2half(in)));
+        }
+        return;
+    }
+    const __half2 a2 = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, lane + (sz >> 1));
+    const __half2 b2 = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, lane + sz);
+    if((lane >= static_cast<uint32_t>(sz >> 1)) && (lane < static_cast<uint32_t>(sz)))
+    {
+        const uint32_t bits = reinterpret_cast<const uint16_t*>(est)[lane - (sz >> 1)];
+        union {
+            __half2 h2;
+            uint32_t u32;
+        } u;
+        u.u32  = 0x3C003C00u ^ ((bits & 0x1u) << 15) ^ ((bits & 0x100u) << 23);
+        lowTreeLLR = __hfma2(u.h2, a2, b2);
+    }
+}
+
+// G at the sz == 32 boundary: read the input rows from the LLR array in memory
+// and populate the upper register elements [32,64) (see F_lowTreeFromMem).
+__device__ __forceinline__ void G_lowTreeFromMem(__half2& lowTreeLLR, const __half* __restrict__ cwTreeLLR, const bool* __restrict__ est, uint32_t lane)
+{
+    if(lane >= 16)
+    {
+        const __half2* a2 = reinterpret_cast<const __half2*>(&cwTreeLLR[64]);
+        const __half2* b2 = reinterpret_cast<const __half2*>(&cwTreeLLR[96]);
+        const uint32_t bits = reinterpret_cast<const uint16_t*>(est)[lane - 16];
+        union {
+            __half2 h2;
+            uint32_t u32;
+        } u;
+        u.u32  = 0x3C003C00u ^ ((bits & 0x1u) << 15) ^ ((bits & 0x100u) << 23);
+        lowTreeLLR = __hfma2(u.h2, a2[lane - 16], b2[lane - 16]);
+    }
+}
+
+// Hard-decide a node of size sz <= 32 straight from the register tree (sign of
+// each LLR), writing the boolean codeword estimate cs[0..sz).
+__device__ __forceinline__ void hardDecision_lowTree(bool* __restrict__ cs, __half2 lowTreeLLR, int32_t sz, uint32_t lane)
+{
+    const int32_t e  = sz + static_cast<int32_t>(lane); // tree element holding bit `lane`
+    const __half2 v2 = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, e >> 1);
+    if(lane < static_cast<uint32_t>(sz))
+    {
+        const __half v = (e & 1) ? __high2half(v2) : __low2half(v2);
+        cs[lane] = __hgt(v, 0) ? 0 : 1;
+    }
+}
+
+// REP node (fast-SSC): all leaves frozen except the last. Under min-sum every
+// G step of the descent sees an all-zero estimate, so the information bit's
+// LLR is the strided pairwise half-precision sum of the node's input LLRs.
+// The reduction below reproduces the exact combining order (and rounding) of
+// the descent: out[i] = in[i] + in[i + len/2], level by level. Returns the
+// hard decision of the single information bit.
+__device__ __forceinline__ bool rep_decide(__half* __restrict__ cwTreeLLR, __half2& lowTreeLLR, int32_t sz, const uint32_t lane)
+{
+    int32_t len = sz;
+    while(len > 64)
+    {
+        const __half2* a2 = reinterpret_cast<const __half2*>(&cwTreeLLR[len]);
+        const __half2* b2 = reinterpret_cast<const __half2*>(&cwTreeLLR[len + (len >> 1)]);
+        __half2*       o2 = reinterpret_cast<__half2*>(&cwTreeLLR[len >> 1]);
+        for(int32_t i = lane; i < (len >> 2); i += warpSize)
+        {
+            o2[i] = __hadd2(a2[i], b2[i]);
+        }
+        sync_barrier<POLAR_DECODER_BLOCK_SIZE>();
+        len >>= 1;
+    }
+    if(len == 64)
+    {
+        // bridge into the register region: out elements [32,64)
+        if(lane >= 16)
+        {
+            const __half2* a2 = reinterpret_cast<const __half2*>(&cwTreeLLR[64]);
+            const __half2* b2 = reinterpret_cast<const __half2*>(&cwTreeLLR[96]);
+            lowTreeLLR = __hadd2(a2[lane - 16], b2[lane - 16]);
+        }
+        len = 32;
+    }
+    // register phase: gather element (len + lane) and reduce with the same
+    // strided order down to one value on lane 0
+    const int32_t e  = len + static_cast<int32_t>(lane);
+    const __half2 v2 = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, e >> 1);
+    __half        v  = (e & 1) ? __high2half(v2) : __low2half(v2);
+    for(int32_t half = len >> 1; half >= 1; half >>= 1)
+    {
+        const __half o = __shfl_sync(0xFFFFFFFFu, v, lane + half);
+        if(lane < static_cast<uint32_t>(half))
+        {
+            v = __hadd(v, o);
+        }
+    }
+    const __half total = __shfl_sync(0xFFFFFFFFu, v, 0);
+    return __hgt(total, __float2half(0.f)) ? 0 : 1;
+}
+
+// SPC node (fast-SSC): all leaves info except the first (a frozen parity
+// bit). Min-sum equivalent of the descent: keep the hard decisions and, if
+// their parity is odd, flip the least-reliable position (first occurrence on
+// ties). cs already holds the hard decisions.
+__device__ __forceinline__ void spc_fix(bool* __restrict__ cs, const __half* __restrict__ cwTreeLLR, __half2 lowTreeLLR, int32_t sz, const uint32_t lane)
+{
+    float    m   = HFLT_MAX;
+    int32_t  mi  = 0;
+    uint32_t par = 0;
+    if(sz <= 32)
+    {
+        const int32_t e  = sz + static_cast<int32_t>(lane);
+        const __half2 v2 = __shfl_sync(0xFFFFFFFFu, lowTreeLLR, e >> 1);
+        if(lane < static_cast<uint32_t>(sz))
+        {
+            const __half v = (e & 1) ? __high2half(v2) : __low2half(v2);
+            m  = fabsf(__half2float(v));
+            mi = static_cast<int32_t>(lane);
+        }
+        const uint32_t bits = __ballot_sync(0xFFFFFFFFu, (lane < static_cast<uint32_t>(sz)) && cs[lane]);
+        par = __popc(bits) & 1u;
+    }
+    else
+    {
+        uint32_t lpar = 0;
+        for(int32_t i = lane; i < sz; i += warpSize)
+        {
+            const float a = fabsf(__half2float(cwTreeLLR[sz + i]));
+            if(a < m)
+            {
+                m  = a;
+                mi = i;
+            }
+            lpar ^= cs[i] ? 1u : 0u;
+        }
+        par = __popc(__ballot_sync(0xFFFFFFFFu, (lpar & 1u) != 0)) & 1u;
+    }
+    // lexicographic (value, index) minimum keeps the first occurrence on ties
+    for(uint32_t off = 16; off > 0; off >>= 1)
+    {
+        const float   om = __shfl_down_sync(0xFFFFFFFFu, m, off);
+        const int32_t oi = __shfl_down_sync(0xFFFFFFFFu, mi, off);
+        if((om < m) || ((om == m) && (oi < mi)))
+        {
+            m  = om;
+            mi = oi;
+        }
+    }
+    mi = __shfl_sync(0xFFFFFFFFu, mi, 0);
+    if((par != 0) && (lane == 0))
+    {
+        cs[mi] = !cs[mi];
+    }
+    __syncwarp();
+}
+
 // to return type of polar tree node
 // type 0 => both child nodes are type 0 (for stage 0, it means frozen bits), no need to traverse the tree
 // type 1 => both child nodes are type 1 (for stage 0, it means info bits), no need to traverse the tree
@@ -221,45 +478,84 @@ __device__ __forceinline__ uint8x8 get_type8(int32_t stage, int32_t n, int32_t s
     return type8;
 }
 
-__device__ __forceinline__ void xor_butterfly(bool* __restrict__ cw, const int32_t stage, const int32_t sz)
+// Apply the lowest min(stage, 5) XOR-butterfly stages inside one 32-bit word.
+__device__ __forceinline__ uint32_t xor_butterfly_word(uint32_t wrd, int32_t stage)
+{
+    if(stage >= 5) { wrd ^= (wrd & 0xFFFF0000u) >> 16; }
+    if(stage >= 4) { wrd ^= (wrd & 0xFF00FF00u) >> 8; }
+    if(stage >= 3) { wrd ^= (wrd & 0xF0F0F0F0u) >> 4; }
+    if(stage >= 2) { wrd ^= (wrd & 0xCCCCCCCCu) >> 2; }
+    if(stage >= 1) { wrd ^= (wrd & 0xAAAAAAAAu) >> 1; }
+    return wrd;
+}
+
+// XOR butterfly over the (1 << stage) codeword bits held in cs, computed in
+// registers: bit word k of the result ends up in lane k's return value
+// (lanes >= ceil(sz/32) hold undefined words). Word-level stages use warp
+// shuffles; the five lowest stages use in-word bit arithmetic.
+__device__ __forceinline__ uint32_t xor_butterfly_regs(const bool* __restrict__ cs, const int32_t stage, const int32_t sz, const uint32_t lane)
 {
 #ifdef _DEBUG
     assert(sz == (1 << stage));
-    assert(blockDim.x == 32);
 #endif
-    for(int32_t j = stage; j > 0; j--)
+    const int32_t nWrds  = div_round_up(sz, static_cast<int32_t>(WORD_LENGTH));
+    uint32_t      myWord = 0;
+    for(int32_t k = 0; k < nWrds; k++)
     {
-        int32_t jumpSz = 1 << (j - 1);
-        int32_t mask = (jumpSz << 1) - 1;
-        for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
+        const int32_t  i    = k * WORD_LENGTH + lane;
+        const uint32_t word = __ballot_sync(0xFFFFFFFFu, (i < sz) && cs[i]);
+        if(lane == static_cast<uint32_t>(k))
         {
-            //if((i % (2 * jumpSz)) < jumpSz)
-            if((i & mask) < jumpSz)
-            {
-                bool& a = cw[i];
-                bool& b = cw[i + jumpSz];
-                cw[i]   = (a != b); // xor
-            }
+            myWord = word;
         }
-        __syncwarp();
     }
+
+    // butterfly stages with bit jumps >= 32 combine whole words across lanes
+    for(int32_t j = stage; j > 5; j--)
+    {
+        const uint32_t jump  = 1u << (j - 6);
+        const uint32_t mask  = (jump << 1) - 1;
+        const uint32_t other = __shfl_sync(0xFFFFFFFFu, myWord, (lane + jump) & (CUDA_WARP_SIZE - 1));
+        if((lane < static_cast<uint32_t>(nWrds)) && ((lane & mask) < jump))
+        {
+            myWord ^= other;
+        }
+    }
+
+    // remaining stages stay inside each 32-bit word
+    return xor_butterfly_word(myWord, stage < 5 ? stage : 5);
 }
 
-// Vectorized copy: assumes source and destination are 2-byte aligned and sz is even
-__device__ __forceinline__ void copy_est_from_cs(bool* __restrict__ est, const bool* __restrict__ cs, int32_t sz)
+// Store the codeword estimate cs[0,sz) into the packed estimate buffer at bit
+// offset sz using warp ballots.
+__device__ __forceinline__ void store_est_bits(uint32_t* __restrict__ estW, const bool* __restrict__ cs, int32_t sz, const uint32_t lane)
 {
-    auto est_w = reinterpret_cast<uint16_t*>(est);
-    auto cs_w  = reinterpret_cast<const uint16_t*>(cs);
-
-    for (int32_t i = threadIdx.x; i < sz / 2; i += blockDim.x)
+    if(sz >= static_cast<int32_t>(WORD_LENGTH))
     {
-        est_w[i] = cs_w[i];
+        const int32_t wordsPerHalf = sz / WORD_LENGTH;
+        for(int32_t w = 0; w < wordsPerHalf; w++)
+        {
+            const uint32_t word = __ballot_sync(0xFFFFFFFFu, cs[w * WORD_LENGTH + lane]);
+            if(lane == 0)
+            {
+                estW[wordsPerHalf + w] = word;
+            }
+        }
+    }
+    else
+    {
+        const uint32_t word = __ballot_sync(0xFFFFFFFFu, (lane < static_cast<uint32_t>(sz)) && cs[lane]);
+        if(lane == 0)
+        {
+            const uint32_t maskSz = (1u << sz) - 1;
+            estW[0] = (estW[0] & ~(maskSz << sz)) | (word << sz);
+        }
     }
 }
 
 // F function: implementation of box-plus (min-sum)
 // combine 2 arrays of length sz/2 and output an array of length sz/2
-__device__ __forceinline__ void F_func(__half* __restrict__ llrOut, const __half* __restrict__ llrIn, int32_t sz)
+__device__ __forceinline__ void F_func(__half* __restrict__ llrOut, const __half* __restrict__ llrIn, int32_t sz, const uint32_t lane)
 {
     const __half* a = llrIn;      // first half input
     const __half* b = &llrIn[sz]; // second half input
@@ -275,7 +571,7 @@ __device__ __forceinline__ void F_func(__half* __restrict__ llrOut, const __half
         const __half2 *b2 = reinterpret_cast<const __half2*>(b);
         __half2 *o2 = reinterpret_cast<      __half2*>(llrOut);
 
-        for (int32_t i = threadIdx.x; i < (sz >> 1); i += blockDim.x)
+        for (int32_t i = lane; i < (sz >> 1); i += warpSize)
         {
             __half2 a2i = a2[i];
             __half2 b2i = b2[i];
@@ -300,40 +596,56 @@ __device__ __forceinline__ void F_func(__half* __restrict__ llrOut, const __half
 // G function: implementation of repetition likelihood
 // combine 2 arrays of length sz/2 based on bit array Est0 and output an array of length sz/2
 // examine different variants impact on performance
-__device__ __forceinline__ void G_func(__half* __restrict__ llrOut, const __half* __restrict__ llrIn, const bool* __restrict__ est, int32_t sz)
+__device__ __forceinline__ void G_func(__half* __restrict__ llrOut, const __half* __restrict__ llrIn, const bool* __restrict__ est, int32_t sz, const uint32_t lane)
 {
     const __half* a = llrIn;      // first half input
     const __half* b = &llrIn[sz]; // second half input
 
-    for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
+    if(sz == 1)
     {
-        const __half ai = __ldg(a + i); //a[i]
-        const __half bi = __ldg(b + i); //b[i]
-        const __half u  = est[i] ? __float2half(-1.f) : __float2half(1.f);
-        llrOut[i] = __hfma(u, ai, bi);
+        const __half u = est[0] ? __float2half(-1.f) : __float2half(1.f);
+        llrOut[0] = __hfma(u, a[0], b[0]);
+        return;
+    }
+
+    const auto* a2 = reinterpret_cast<const __half2*>(a);
+    const auto* b2 = reinterpret_cast<const __half2*>(b);
+    auto* out2     = reinterpret_cast<__half2*>(llrOut);
+    const auto* est2 = reinterpret_cast<const uint16_t*>(est);
+
+    for(int32_t i = lane; i < (sz >> 1); i += warpSize)
+    {
+        const uint32_t bits = est2[i];
+        union {
+            __half2 h2;
+            uint32_t u32;
+        } u;
+        u.u32 = 0x3C003C00u ^ ((bits & 0x1u) << 15) ^ ((bits & 0x100u) << 23);
+        out2[i] = __hfma2(u.h2, a2[i], b2[i]);
     }
 }
 
 // H function: implementation of combining codewords in polar code
 // unlike F and G, H input/output arrays of hard decisions (bits)
 // combine 2 arrays of length sz/2 and output an array of length sz/2
-// examine bitwise storage instead of boolean
-// est_in0 : input from first child node, size sz/2
-// est_in1 : input from second child node, size sz/2
-__device__ __forceinline__ void H_func(bool* __restrict__ estOut, const bool* __restrict__ estIn0, const bool* __restrict__ estIn1, int32_t sz)
+// est_in0: stage estimate read from the packed estimate buffer at bit offset sz
+// est_in1: input from second child node (boolean array), size sz/2
+__device__ __forceinline__ void H_func(bool* __restrict__ estOut, const uint32_t* __restrict__ estW, const bool* __restrict__ estIn1, int32_t sz, const uint32_t lane)
 {
     bool* out0 = estOut;      // output first m values
     bool* out1 = &estOut[sz]; // output second m values
     if(sz == 1)
     {
-        out0[0] = estIn0[0] != estIn1[0];
+        out0[0] = (((estW[0] >> 1) & 1u) != 0) != estIn1[0];
         out1[0] = estIn1[0];
     }
     else
     {
-        for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
+        for(int32_t i = lane; i < sz; i += warpSize)
         {
-            out0[i] = estIn0[i] != estIn1[i]; // boolean xor, similar to (in0 + in1) % 2
+            const int32_t estBit = sz + i;
+            const bool in0 = ((estW[estBit / WORD_LENGTH] >> (estBit % WORD_LENGTH)) & 1u) != 0;
+            out0[i] = in0 != estIn1[i]; // boolean xor, similar to (in0 + in1) % 2
             out1[i] = estIn1[i];
         }
     }
@@ -548,10 +860,18 @@ __device__ __forceinline__ void copyBits(const uint32_t* __restrict__ Src, uint3
         uint32_t numTailBits = remainingBits % WORD_LENGTH;
 
         if (numTailBits > 0) {
-            maskZeros = __funnelshift_lc(wrd, ones, numTailBits);
-            maskOnes  = __funnelshift_lc(wrd, zeros, numTailBits);
-            Dst[wIdx_d + numMidWords + 1] &= maskZeros; // copy zeros
-            Dst[wIdx_d + numMidWords + 1] |= maskOnes; // copy ones
+            // The remaining source bits start at bit numHeadBits + 32*numMidWords.
+            // They may straddle two source words when neither sz nor the
+            // destination offset is word aligned, so read them with getWord()
+            // rather than indexing a single word. (The former funnelshift-based
+            // tail took the top bits of the last source word, which is only
+            // correct when sz is a multiple of the word length.)
+            uint32_t srcBitIdx = numHeadBits + numMidWords * WORD_LENGTH;
+            uint32_t srcWords  = div_round_up(sz, static_cast<uint32_t>(WORD_LENGTH));
+            uint32_t tailMask  = (1u << numTailBits) - 1;
+            uint32_t tailBits  = getWord(Src, srcWords, srcBitIdx) & tailMask;
+            Dst[wIdx_d + numMidWords + 1] &= (~tailMask | tailBits); // copy zeros
+            Dst[wIdx_d + numMidWords + 1] |= tailBits;               // copy ones
         }
     }
 }
@@ -800,18 +1120,6 @@ __device__ __forceinline__ uint16_t ComputeCRC16LUT(const uint8_t* __restrict__ 
 // verify CRC
 __device__ __forceinline__ bool validate_crc(const uint8_t nCrcBits, const uint32_t* __restrict__ X, const uint16_t nPayloadBits, uint32_t* __restrict__ sharedBuf)
 {
-    uint32_t maskCrc = 0;
-    if(nCrcBits == 11)
-    {
-        //poly    = 50208; //b11000100 00100000
-        maskCrc = 4095;  //0xFFF
-    }
-    else if(nCrcBits == 6)
-    {
-        //poly    = 388; //b110000100
-        maskCrc = 127;  //0x7F
-    }
-
     // copy input X to shared memory
     int nWords = div_round_up(static_cast<int>(nPayloadBits + nCrcBits), WORD_LENGTH);
 #ifdef _DEBUG
@@ -833,34 +1141,31 @@ __device__ __forceinline__ bool validate_crc(const uint8_t nCrcBits, const uint3
     {
         crc = ComputeCRC8LUT(reinterpret_cast<uint8_t*>(sharedBuf), nBytes);
     }
-    crc = crc & maskCrc;
-
     return (crc != 0);
 }
 
 // append received CRC bits to info bits, then verify CRC correctness
-__device__ __forceinline__ uint8_t append_and_validate_crc(const uint32_t receivedCrc, const uint8_t nCrcBits, const uint32_t* __restrict__ X, const uint16_t nPayloadBits)
+// sharedBuf: per-codeword scratch of N_MAX_WORDS words
+__device__ __forceinline__ uint8_t append_and_validate_crc(const uint32_t receivedCrc, const uint8_t nCrcBits, const uint32_t* __restrict__ X, const uint16_t nPayloadBits, uint32_t* __restrict__ sharedBuf)
 {
-    uint32_t maskCrc = 0;
-    if(nCrcBits == 11)
-    {
-        maskCrc = 0xFFF;
-    }
-    else if(nCrcBits == 6)
-    {
-        maskCrc = 0x7F;
-    }
-
-    // copy input X to shared memory
-    __shared__ uint32_t sharedBuf[N_MAX_WORDS];
-
     int nWords        = div_round_up(static_cast<int>(nPayloadBits + nCrcBits), WORD_LENGTH);
 #ifdef _DEBUG
     assert(nWords < 33);
 #endif
-    for(int i = 0; i < nWords; i++)
+    // X stores only decoded payload bits. The received CRC is tracked separately
+    // in receivedCrc and appended below, so do not read the CRC word from X.
+    // The caller streams X/cbEst out of an accumulator that starts at zero and
+    // only ever ORs payload bits in, so the bits above nPayloadBits in the final
+    // payload word are already clean.
+    int nPayloadWords = div_round_up(static_cast<int>(nPayloadBits), WORD_LENGTH);
+    for(int i = 0; i < nPayloadWords; i++)
     {
         sharedBuf[i] = X[i];
+    }
+
+    for(int i = nPayloadWords; i < nWords; i++)
+    {
+        sharedBuf[i] = 0;
     }
 
     //append crc bits
@@ -878,8 +1183,6 @@ __device__ __forceinline__ uint8_t append_and_validate_crc(const uint32_t receiv
     {
         crc = ComputeCRC8LUT(reinterpret_cast<uint8_t*>(sharedBuf), nBytes);
     }
-    crc = crc & ((maskCrc >> 1) | 1);
-
     uint8_t crcErr = crc==0? 0 : 1;
     return crcErr;
 }
@@ -991,10 +1294,12 @@ __device__ __forceinline__ void updateUciSegEstForTwoCbsInUciSeg(polarDecoderDyn
 //======================================================================================================================
 
 // Polar Decoder: Successive Cancellation with Compressed storage and Pruned Tree
+// Decodes codeword cwIdx with one warp; shSlice is the warp's private dynamic
+// shared-memory slice (see scDecoderSliceBytes()).
 __device__ __forceinline__ void
-singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
+singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr, const uint32_t cwIdx, const uint32_t lane, bool* __restrict__ shSlice)
 {
-    const uint32_t BLOCK_IDX = blockIdx.x;
+    const uint32_t BLOCK_IDX = cwIdx;
 
     uint16_t N_cw     = pDynDescr->pCwPrmsGpu[BLOCK_IDX].N_cw;
     uint8_t  nCrcBits = pDynDescr->pCwPrmsGpu[BLOCK_IDX].nCrcBits;
@@ -1005,18 +1310,33 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
     uint32_t* cbEst      = pDynDescr->pCwPrmsGpu[BLOCK_IDX].pCbEst;
     uint8_t&  crcErrFlag = pDynDescr->pPolCrcErrorFlags[BLOCK_IDX];
     uint8_t*  treeTypes  = pDynDescr->pCwPrmsGpu[BLOCK_IDX].pCwTreeTypes;
+    // Precomputed fast-SSC operation list (see polar_cw_tree_layout.hpp): one
+    // byte per visited node in bit order; bits[3:0] = node stage,
+    // bits[6:4] = node type (0 frozen, 1 info, 2 parity leaf, 4 REP, 5 SPC).
+    const uint8_t* opList = &treeTypes[cuphy::polar::PolarCwTreeLayout::fssOpListOffset(1u << n_cw)];
     // crcEst is to store CRC part of the decoded message
     uint32_t crcEst = 0;
-
-    // reset output bits to 0
-    int numCbEstWords = div_round_up(A_cw, static_cast<uint16_t>(WORD_LENGTH));
-    for (int i = threadIdx.x; i < numCbEstWords; i += blockDim.x)
+    // Decoded payload bits form a sequential stream; lane 0 accumulates them
+    // in a register word and writes each cbEst word exactly once when full
+    // (plus a final partial flush), so cbEst needs no zero pass and no
+    // read-modify-write.
+    uint32_t outAcc  = 0;
+    int32_t  outFill = 0;
+    int32_t  outWrd  = 0;
+    // register-resident low LLR tree: lane l holds elements (2l, 2l+1)
+    __half2  lowTreeLLR  = __float2half2_rn(0.f);
+    // For small trees the input LLRs themselves fall inside the register
+    // region (elements [treeSz, 2*treeSz) with treeSz <= 32): load them now.
     {
-        cbEst[i] = 0;
+        const int32_t treeSz = 1 << n_cw;
+        if(treeSz <= 32 && (lane >= static_cast<uint32_t>(treeSz / 2)) && (lane < static_cast<uint32_t>(treeSz)))
+        {
+            lowTreeLLR = reinterpret_cast<const __half2*>(cwTreeLLR)[lane];
+        }
     }
 
 #ifdef ENABLE_DEBUG
-    if(threadIdx.x == 0)
+    if(lane == 0)
     {
         printf("LLRs ------------------------------------------------------------------\n");
         for(int i = 0; i < 2 * N_cw - 1; i++)
@@ -1032,86 +1352,128 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
 #endif
 
     // Initialize ==========================================================================
-    int32_t sz;               // length of sub-array in cwTreeLLR
-    int32_t& idx = sz;        // used for retrieving start index of sub-array in cwTreeLLR; aliasing with sz is by design
+    // Length of the current sub-array in cwTreeLLR. The tree is laid out so
+    // that a node of size sz occupies [sz, 2*sz), which is why sz doubles as
+    // the node's start index below.
+    int32_t sz;
     int32_t stage     = n_cw; // stage variable
     uint8_t type      = 10;   // decoding type used to simplify in pruned tree
-    int32_t subIdx    = 0;    // index used to retrieve node id in get_type()
     int32_t bitIdx    = -1;   // keeps track of the decoded bit index in the successive algorithm
     int32_t msgBitIdx = 0;    // keeps track of index of non-frozen decoded bits
     int32_t crcBitIdx = 0;    // keeps track of index of CRC decoded bits
 
-    // propagate input LLRs to stage 0
-    while(stage > -1)
+    // first visited pruned node comes from the precomputed opList
+    int32_t opIdx   = 0;
+    uint8_t opEntry = __ldg(&opList[opIdx++]);
+
+    // propagate input LLRs to the first visited node's stage.
+    // Dispatch by sub-tree size: sz > 32 stays on the memory array (F_func);
+    // sz == 32 crosses into the register tree; sz < 32 is pure register/shuffle
+    // (see the "register-resident low sub-tree" note above the F_lowTree family).
+    while(stage > (opEntry & 0xF))
     {
         stage--;
         sz = 1 << stage;
-        auto* in  = &cwTreeLLR[idx + sz];
-        auto* out = &cwTreeLLR[idx];
-        F_func(out, in, sz);
-        __syncthreads();
-#ifdef ENABLE_DEBUG
-        if (threadIdx.x == 0) {
-            printf("F function ----------------- stage %d, size %d, idx %d, type %d ------------------\n", stage, sz, idx, get_type(stage, n_cw, subIdx, treeTypes));
-            printf("in1: ");
-            for (int i = 0; i < sz; i++) {
-                printf("%6.1f ", __half2float(in[i]));
-            }
-            printf("\nin2: ");
-            for (int i = sz; i < 2 * sz; i++) {
-                printf("%6.1f ", __half2float(in[i]));
-            }
-            printf("\nout: ");
-            for (int i = 0; i < sz; i++) {
-                printf("%6.1f ", __half2float(out[i]));
-            }
-            printf("\n");
-        }
-#endif
-        if(get_type(stage, n_cw, subIdx, treeTypes) != 3)
+        if(sz > 32)
         {
-            break;
+            auto* in  = &cwTreeLLR[2 * sz];
+            auto* out = &cwTreeLLR[sz];
+            F_func(out, in, sz, lane);
+            sync_barrier<POLAR_DECODER_BLOCK_SIZE>();
+#ifdef ENABLE_DEBUG
+            // in/out only exist on this branch; for sz <= 32 the data is
+            // register-resident (lowTreeLLR), so there is nothing to print here.
+            if (lane == 0) {
+                printf("F function ----------------- stage %d, size %d ------------------\n", stage, sz);
+                printf("in1: ");
+                for (int i = 0; i < sz; i++) {
+                    printf("%6.1f ", __half2float(in[i]));
+                }
+                printf("\nin2: ");
+                for (int i = sz; i < 2 * sz; i++) {
+                    printf("%6.1f ", __half2float(in[i]));
+                }
+                printf("\nout: ");
+                for (int i = 0; i < sz; i++) {
+                    printf("%6.1f ", __half2float(out[i]));
+                }
+                printf("\n");
+            }
+#endif
+        }
+        else if(sz == 32)
+        {
+            F_lowTreeFromMem(lowTreeLLR, cwTreeLLR, lane);
+        }
+        else
+        {
+            F_lowTree(lowTreeLLR, sz, lane);
         }
     }
 
     // Main loop  ==========================================================================
-    __shared__ extern bool sh_buff[];
-    bool*                  cs_buffer_a = sh_buff;                // temporary buffer for codeword at a given stage
-    bool*                  cs_buffer_b = &sh_buff[N_cw / 2];     // temporary buffer for codeword at a given stage
-    bool*                  cs_copy     = &cs_buffer_b[N_cw / 2]; // buffer used in xor_butterfly
-    bool*                  cs_est      = &cs_copy[N_cw / 2];     // buffer to store estimated codes words per stage
+    bool*     cs_buffer_a = shSlice;                // temporary buffer for codeword at a given stage
+    bool*     cs_buffer_b = &shSlice[N_cw / 2];     // temporary buffer for codeword at a given stage
+    // Per-stage codeword estimates, packed as bit words with stage sz stored at
+    // bit offset sz; the byte offset is rounded up for word alignment.
+    const uint32_t estByteOffset = (2u * (N_cw / 2u) + 3u) & ~3u;
+    uint32_t* estW        = reinterpret_cast<uint32_t*>(&shSlice[estByteOffset]);
+    // per-codeword CRC scratch behind the estimates
+    uint32_t* crcBuf      = &estW[max(N_cw / WORD_LENGTH, 1)];
 
     while(bitIdx < (N_cw - 1))
     {
         bool* cs = cs_buffer_a;
-        type     = get_type(stage, n_cw, subIdx, treeTypes);
+        type     = opEntry >> 4;
         sz = 1 << stage;
 
-        // at this point, type is either 0 or 1
+        // type: 0 frozen, 1 info, 2 parity leaf, 4 REP, 5 SPC
 #ifdef _DEBUG
-        assert(type < 3);
+        assert(type < 6 && type != 3);
 #endif
         if(type == 0)
         {
             // set cs array for this stage to 0
-            for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
+            for(int32_t i = lane; i < sz; i += warpSize)
             {
                 cs[i] = 0;
             }
         }
-        else //if type == 1 for any stage or type==2 for leaf nodes
+        else if(type == 4)
         {
-            // set cs based on corresponding LLR array
-            for(int32_t i = threadIdx.x; i < sz; i += blockDim.x)
+            // REP node: decide the single information bit, codeword = repeat
+            const bool b = rep_decide(cwTreeLLR, lowTreeLLR, sz, lane);
+            for(int32_t i = lane; i < sz; i += warpSize)
             {
-                bool c = __hgt(cwTreeLLR[idx + i], 0) ? 0 : 1; // make hard decision based on LLR value
-                cs[i] = cs_copy[i] = c;
+                cs[i] = b;
             }
         }
-        __syncthreads();
+        else //if type == 1/5 for any stage or type==2 for leaf nodes
+        {
+            // make hard decisions based on the LLR values
+            if(sz <= 32)
+            {
+                hardDecision_lowTree(cs, lowTreeLLR, sz, lane);
+            }
+            else
+            {
+                for(int32_t i = lane; i < sz; i += warpSize)
+                {
+                    bool c = __hgt(cwTreeLLR[sz + i], 0) ? 0 : 1;
+                    cs[i] = c;
+                }
+            }
+        }
+        sync_barrier<POLAR_DECODER_BLOCK_SIZE>();
+
+        if(type == 5)
+        {
+            // SPC node: enforce even parity on the hard decisions
+            spc_fix(cs, cwTreeLLR, lowTreeLLR, sz, lane);
+        }
 
 #ifdef ENABLE_DEBUG
-        if(threadIdx.x == 0)
+        if(lane == 0)
         {
             printf("\n====================================================\n");
             printf("Bit index %d, type %d, sz %d\n", bitIdx, type, sz);
@@ -1128,57 +1490,95 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         }
 #endif
 
-        // store message bits
-        if(type == 1)
+        // store message bits: an info node contributes sz of them, a REP node
+        // one, an SPC node sz-1 (its u[0] is the frozen parity bit)
+        if(type == 1 || type == 4 || type == 5)
         {
-            xor_butterfly(cs_copy, stage, sz);
-            // store partial decoded message into cbEst
-            // ToDo optimize updating cbEst
-            //---------------------------------------------
-
-            if(threadIdx.x == 0)
+            uint32_t myWord;
+            int32_t  bitOff;
+            int32_t  mlen;
+            if(type == 4)
             {
-                uint16_t K_cw = A_cw + nCrcBits;
-                if(msgBitIdx < A_cw)
-                {
-                    int32_t write_sz = (sz + msgBitIdx) < A_cw ? sz : A_cw - msgBitIdx;
-                    int32_t tmpW     = 0;
-                    int32_t wIdx     = 0;
-                    int32_t bIdx     = 0;
-                    for(int32_t i = 0; i < write_sz; i++)
-                    {
-                        wIdx        = (msgBitIdx + i) / WORD_LENGTH;
-                        bIdx        = (msgBitIdx + i) % WORD_LENGTH;
-                        tmpW        = cs_copy[i] << bIdx;
-                        cbEst[wIdx] = cbEst[wIdx] | tmpW;
-                    }
-                    // if sz > write_sz, fill CRC bits
-                    tmpW      = 0;
-                    crcBitIdx = sz - write_sz;
-                    for(int32_t i = write_sz; i < sz; i++)
-                    {
-                        tmpW   = cs_copy[i] << (i - write_sz);
-                        crcEst = crcEst | tmpW;
-                    }
-                }
-                else if(msgBitIdx < K_cw)
-                {
-                    int32_t write_sz = (sz + msgBitIdx) < K_cw ? sz : K_cw - msgBitIdx;
-                    int32_t tmpW     = 0;
-                    for(int32_t i = 0; i < write_sz; i++)
-                    {
-                        tmpW   = cs_copy[i] << (crcBitIdx + i);
-                        crcEst = crcEst | tmpW;
-                    }
-                    crcBitIdx += write_sz;
-                }
-                msgBitIdx += sz; // update message idx
+                myWord = cs[0] ? 1u : 0u; // the single information bit
+                bitOff = 0;
+                mlen   = 1;
             }
+            else
+            {
+                // Recover the decoded bits with a register-resident butterfly
+                // (word k of the result in lane k)
+                myWord = xor_butterfly_regs(cs, stage, sz, lane);
+                bitOff = (type == 5) ? 1 : 0;
+                mlen   = sz - bitOff;
+            }
+            const int32_t  nWrds = div_round_up(sz, static_cast<int32_t>(WORD_LENGTH));
+            const uint16_t K_cw  = A_cw + nCrcBits;
+
+            if(msgBitIdx < A_cw)
+            {
+                const int32_t write_sz = (mlen + msgBitIdx) < A_cw ? mlen : A_cw - msgBitIdx;
+                for(int32_t i = 0; i < write_sz; i += WORD_LENGTH)
+                {
+                    const int32_t  chunk = (write_sz - i) < static_cast<int32_t>(WORD_LENGTH) ? (write_sz - i) : static_cast<int32_t>(WORD_LENGTH);
+                    const int32_t  s0    = bitOff + i;
+                    const uint32_t wA    = __shfl_sync(0xFFFFFFFFu, myWord, s0 / WORD_LENGTH);
+                    const uint32_t wB    = __shfl_sync(0xFFFFFFFFu, myWord, (s0 / WORD_LENGTH + 1) < nWrds ? (s0 / WORD_LENGTH + 1) : s0 / WORD_LENGTH);
+                    uint32_t word        = (s0 % WORD_LENGTH) ? __funnelshift_rc(wA, wB, s0 % WORD_LENGTH) : wA;
+                    if(chunk < static_cast<int32_t>(WORD_LENGTH))
+                    {
+                        word &= (1u << chunk) - 1;
+                    }
+                    if(lane == 0)
+                    {
+                        outAcc |= word << outFill;
+                        const int32_t newFill = outFill + chunk;
+                        if(newFill >= static_cast<int32_t>(WORD_LENGTH))
+                        {
+                            cbEst[outWrd++] = outAcc;
+                            outAcc  = (outFill == 0) ? 0u : (word >> (WORD_LENGTH - outFill));
+                            outFill = newFill - WORD_LENGTH;
+                        }
+                        else
+                        {
+                            outFill = newFill;
+                        }
+                    }
+                }
+                // If this node crosses the payload boundary, pack its remaining CRC bits.
+                if(mlen > write_sz)
+                {
+                    const int32_t  s0 = bitOff + write_sz;
+                    const uint32_t wA = __shfl_sync(0xFFFFFFFFu, myWord, s0 / WORD_LENGTH);
+                    const uint32_t wB = __shfl_sync(0xFFFFFFFFu, myWord, (s0 / WORD_LENGTH + 1) < nWrds ? (s0 / WORD_LENGTH + 1) : s0 / WORD_LENGTH);
+                    if(lane == 0)
+                    {
+                        const uint32_t bits = (s0 % WORD_LENGTH) ? __funnelshift_rc(wA, wB, s0 % WORD_LENGTH) : wA;
+                        crcEst |= bits & ((1u << (mlen - write_sz)) - 1);
+                    }
+                    crcBitIdx = mlen - write_sz;
+                }
+            }
+            else if(msgBitIdx < K_cw)
+            {
+                const int32_t  write_sz = (mlen + msgBitIdx) < K_cw ? mlen : K_cw - msgBitIdx;
+                const uint32_t wA       = __shfl_sync(0xFFFFFFFFu, myWord, bitOff / WORD_LENGTH);
+                const uint32_t wB       = __shfl_sync(0xFFFFFFFFu, myWord, (bitOff / WORD_LENGTH + 1) < nWrds ? (bitOff / WORD_LENGTH + 1) : bitOff / WORD_LENGTH);
+                if(lane == 0)
+                {
+                    const uint32_t bits = (bitOff % WORD_LENGTH) ? __funnelshift_rc(wA, wB, bitOff % WORD_LENGTH) : wA;
+                    crcEst |= (bits & ((1u << write_sz) - 1)) << crcBitIdx;
+                }
+                crcBitIdx += write_sz;
+            }
+            msgBitIdx += mlen; // update message idx for every lane
         }
 
         // update bit index:
         bitIdx += sz;
         if(bitIdx == (N_cw - 1)) break;
+
+        // prefetch the next visited node's opList entry
+        opEntry = __ldg(&opList[opIdx++]);
 
         // use H function to combine codeword estimates all the way up to stage_idx
         int32_t stage_idx   = POLAR_DEPTH[bitIdx];
@@ -1186,75 +1586,84 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         while(stage < stage_idx)
         {
             sz = 1 << stage;
-            auto* in_0 = &cs_est[idx]; // in0 is always read from cwEst
+            // in0 is read from the packed estimate buffer at bit offset sz.
             // in1 and cs keep switching. Initially, in1 is read from cs_buffer_b
             auto* in_1 = temp_H_cntr % 2 ? cs_buffer_b : cs_buffer_a;
             cs         = temp_H_cntr % 2 ? cs_buffer_a : cs_buffer_b;
-            H_func(cs, in_0, in_1, sz);
-            __syncthreads();
+            H_func(cs, estW, in_1, sz, lane);
+            sync_barrier<POLAR_DECODER_BLOCK_SIZE>();
 
             temp_H_cntr++;
             stage++;
-            subIdx /= 2;
         }
 
         // use G function with new codeword for stage_idx to update LLRs of the sibling branch
         sz = 1 << stage;
-        subIdx++;
-        G_func(&cwTreeLLR[idx], &cwTreeLLR[idx + sz], cs, sz);
-        __syncthreads();
-
-        type = get_type(stage, n_cw, subIdx, treeTypes);
-        // use F function to propagate updated LLRs up to stage 0 (next bit at leaf node)
-        while(stage > -1)
+        if(sz > 32)
         {
-            if(type != 3)
-            {
-                break;
-            }
+            G_func(&cwTreeLLR[sz], &cwTreeLLR[2 * sz], cs, sz, lane);
+            sync_barrier<POLAR_DECODER_BLOCK_SIZE>();
+        }
+        else if(sz == 32)
+        {
+            G_lowTreeFromMem(lowTreeLLR, cwTreeLLR, cs, lane);
+        }
+        else
+        {
+            G_lowTree(lowTreeLLR, cs, sz, lane);
+        }
+
+        // use F function to propagate updated LLRs down to the next visited node's stage
+        while(stage > (opEntry & 0xF))
+        {
             stage--;
-            subIdx *= 2;
-            type = get_type(stage, n_cw, subIdx, treeTypes);
             sz = 1 << stage;
-            auto* in  = &cwTreeLLR[idx + sz];
-            auto* out = &cwTreeLLR[idx];
-            F_func(out, in, sz);
-            __syncthreads();
+            if(sz > 32)
+            {
+                auto* in  = &cwTreeLLR[2 * sz];
+                auto* out = &cwTreeLLR[sz];
+                F_func(out, in, sz, lane);
+                sync_barrier<POLAR_DECODER_BLOCK_SIZE>();
+            }
+            else if(sz == 32)
+            {
+                F_lowTreeFromMem(lowTreeLLR, cwTreeLLR, lane);
+            }
+            else
+            {
+                F_lowTree(lowTreeLLR, sz, lane);
+            }
         }
 
         // store stage_idx codeword estimate
         sz = 1 << stage_idx;
-        auto est = &cs_est[idx];
-        if(sz == 1)
-        {
-            est[0] = cs[0];
-        }
-        else
-        {
-            // Vectorized copy: assumes est and cs are 2-byte aligned and sz is even
-            copy_est_from_cs(est, cs, sz);
-        }
-        __syncthreads();
+        store_est_bits(estW, cs, sz, lane);
+        sync_barrier<POLAR_DECODER_BLOCK_SIZE>();
     }
     //======================================================================================
+    // flush the partial tail word of the payload stream
+    if((lane == 0) && (outFill > 0))
+    {
+        cbEst[outWrd] = outAcc;
+    }
+
     // now compute CRC from info bits and compare with crcEst
     // ToDo currently only look at CRC of first CB. Need to use uint32_t CRC along with atomic operations. Requires API and cuPHY controller changes
-    if((threadIdx.x == 0) && (pDynDescr->pCwPrmsGpu[BLOCK_IDX].cbIdxWithinUciSeg == 0))
+    if((lane == 0) && (pDynDescr->pCwPrmsGpu[BLOCK_IDX].cbIdxWithinUciSeg == 0))
     {
-        crcErrFlag = append_and_validate_crc(crcEst, nCrcBits, cbEst, A_cw);
+        crcErrFlag = append_and_validate_crc(crcEst, nCrcBits, cbEst, A_cw, crcBuf);
     }
 
     //======================================================================================
     // If parentUciSeg composed of two codeblocks place cbEst carefully into uciSegEst
 
-    if((threadIdx.x == 0) && (pDynDescr->pCwPrmsGpu[BLOCK_IDX].nCbsInUciSeg == 2) )
+    if((lane == 0) && (pDynDescr->pCwPrmsGpu[BLOCK_IDX].nCbsInUciSeg == 2) )
     {
        updateUciSegEstForTwoCbsInUciSeg(pDynDescr, A_cw, cbEst, BLOCK_IDX);
     }
 
 #ifdef ENABLE_DEBUG
-    if((0 == blockIdx.x) && (0 == blockIdx.y) && (0 == blockIdx.z) && (0 == threadIdx.x) && (0 == threadIdx.y) &&
-       (0 == threadIdx.z))
+    if((0 == cwIdx) && (0 == lane))
     {
         printf("\n polar codeword %d has the following parameters: \n N_cw = %d,\n nCrcBits = %d,\n A_cw = %d \n",
                BLOCK_IDX,
@@ -1268,18 +1677,33 @@ singlePolarDecoder(polarDecoderDynDescr_t* pDynDescr)
 __global__ void
 polarDecoderKernel(polarDecoderDynDescr_t* pDynDescr)
 {
-    uint8_t exitFlag = pDynDescr->pCwPrmsGpu[blockIdx.x].exitFlag;
+    // One warp per codeword; the host packs one warp per block for small
+    // batches and POLAR_SC_WARPS_PER_BLOCK warps per block for large batches.
+    // The decoder is warp-autonomous (no block-wide barriers), so warps whose
+    // codeword index is out of range or flagged may simply return.
+    const uint32_t warpId = threadIdx.x / CUDA_WARP_SIZE;
+    const uint32_t lane   = threadIdx.x % CUDA_WARP_SIZE;
+    const uint32_t cwIdx  = blockIdx.x * (blockDim.x / CUDA_WARP_SIZE) + warpId;
+    if(cwIdx >= pDynDescr->nPolCws)
+    {
+        return;
+    }
+
+    uint8_t exitFlag = pDynDescr->pCwPrmsGpu[cwIdx].exitFlag;
     if(exitFlag == 1)
     {
         return;
     }
 
-    singlePolarDecoder(pDynDescr);
+    __shared__ extern bool sh_buff[];
+    bool* shSlice = &sh_buff[warpId * pDynDescr->scSharedSliceBytes];
+
+    singlePolarDecoder(pDynDescr, cwIdx, lane, shSlice);
     // Update Detection (CRC) Status
     // ToDo currently only look at CRC of first CB. Need to use uint32_t CRC along with atomic operations. Requires API and cuPHY controller changes
-    if((threadIdx.x == 0) && (pDynDescr->pCwPrmsGpu[blockIdx.x].cbIdxWithinUciSeg == 0))
+    if((lane == 0) && (pDynDescr->pCwPrmsGpu[cwIdx].cbIdxWithinUciSeg == 0))
     {
-        updateCRCstatus(pDynDescr, pDynDescr->pPolCrcErrorFlags[blockIdx.x], blockIdx.x);
+        updateCRCstatus(pDynDescr, pDynDescr->pPolCrcErrorFlags[cwIdx], cwIdx);
     }
 }
 
@@ -2003,6 +2427,21 @@ __device__ __forceinline__ void H_func(uint32_t* __restrict__      bitsOut,
         auto out0 = isBitSet(bitsIn0, in0IdxOffset) != out1 ? 1 : 0;
         setResetSingleBit(bitsOut, 0, out0);
         setResetSingleBit(bitsOut, sz, out1);
+    } else if (sz == 16) {
+        if (grp.thread_rank() == 0) {
+            constexpr uint32_t mask = 0xFFFFu;
+            const uint32_t in1 = bitsIn1[0] & mask;
+            bitsOut[0] = ((getWord(bitsIn0, in0ArraySz, in0IdxOffset) ^ in1) & mask) | (in1 << 16);
+        }
+    } else if (sz >= WORD_LENGTH) {
+        const int32_t wordsPerHalf = sz / WORD_LENGTH;
+        for (int32_t i = grp.thread_rank(); i < 2 * wordsPerHalf; i += grp.size()) {
+            if (i < wordsPerHalf) {
+                bitsOut[i] = getWord(bitsIn0, in0ArraySz, in0IdxOffset + i * WORD_LENGTH) ^ bitsIn1[i];
+            } else {
+                bitsOut[i] = bitsIn1[i - wordsPerHalf];
+            }
+        }
     } else {
         if (grp.thread_rank() == 0) {
             xorBits(bitsIn0, in0IdxOffset, in0ArraySz,
@@ -2032,6 +2471,10 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
     uint32_t* cbEst       = pDynDescr->pCwPrmsGpu[BLOCK_IDX].pCbEst;
     bool*     scratchBuf  = pDynDescr->listPolScratchAddrs[BLOCK_IDX];
     uint8_t*  treeTypes   = pDynDescr->pCwPrmsGpu[BLOCK_IDX].pCwTreeTypes;
+    // Precomputed SC operation list stored behind the tree types (see
+    // polar_cw_tree_layout.hpp): one byte per visited pruned node in bit order;
+    // bits[3:0] = node stage, bits[5:4] = node type (0 frozen, 1 info, 2 parity).
+    const uint8_t* opList = &treeTypes[cuphy::polar::PolarCwTreeLayout::scOpListOffset(1u << n_cw)];
 
     thread_block const& thisThrdBlk = this_thread_block();
     auto     tile = tiled_partition<TILE_SZ>(thisThrdBlk);
@@ -2068,7 +2511,6 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
     int     sz;              // length of sub-array in cwLLR
     int     stage    = n_cw; // stage variable
     uint8_t type     = 10;   // type used to prune decoder tree
-    int     subIdx   = 0;    // index used to retrieve node id in get_type()
     int     bitIdx   = -1;   // keeps track of the decoded bit index in the successive algorithm
     int     numPaths = 1;    // for list decoder
 #ifdef _DEBUG
@@ -2083,8 +2525,12 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         llPointers[i] = 0;
     }
 
-    // propagate input LLRs to stage 0
-    while (stage > 0) {
+    // first visited pruned node comes from the precomputed opList
+    int     opIdx   = 0;
+    uint8_t opEntry = __ldg(&opList[opIdx++]);
+
+    // propagate input LLRs to the first visited node's stage
+    while (stage > (opEntry & 0xF)) {
         stage--;
         sz = 1 << stage;
         auto* out = &cwTreeLLR[sz];
@@ -2092,7 +2538,7 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         F_func(out, in, sz, thisThrdBlk);
 #if ENABLE_DEBUG
         if (threadIdx.x == 0 && stage==4) {
-            printf("F function ----------------- stage %d, size %d, idx %d, type %d ------------------\n", stage, sz, idx0, get_type(stage, n_cw, subIdx, treeTypes));
+            printf("F function ----------------- stage %d, size %d ------------------\n", stage, sz);
             printf("in1: ");
             for (int i = 0; i < sz; i++) {
                 printf("%6.1f ", __half2float(in[i]));
@@ -2108,9 +2554,6 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
             printf("\n");
         }
 #endif
-        if (get_type(stage, n_cw, subIdx, treeTypes) != 3) {
-            break;
-        }
     }
 
 
@@ -2123,7 +2566,7 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
     // Main loop  ==========================================================================
     while (bitIdx < (N_cw - 1)) {
         uint32_t * csBits = csBitWordsA;
-        type = get_type(stage, n_cw, subIdx, treeTypes);
+        type = opEntry >> 4;
 
         // at this point, type is either 0 or 1
 #ifdef _DEBUG
@@ -2146,6 +2589,9 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
         bitIdx += sz;
         if (bitIdx == (N_cw - 1)) break;
 
+        // prefetch the next visited node's opList entry
+        opEntry = __ldg(&opList[opIdx++]);
+
         // use H function to combine codeword estimates all the way up to stage d
         int stage_idx = POLAR_DEPTH[bitIdx];
         int csBufferSelector = 0;
@@ -2167,13 +2613,11 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
 
             get_p_prime<LIST_SZ>(pathPrime, llPointers, n_cw, stage, thisThrdBlk);
             stage++;
-            subIdx /= 2;
             csBufferSelector++;
         }
 
         // use G function with new codeword for stage_idx to update LLRs of the sibling branch
         sz = 1 << stage;
-        subIdx++;
 
         if(tile.meta_group_rank() < numPaths)
         {
@@ -2186,15 +2630,9 @@ listPolarDecoder(polarDecoderDynDescr_t* pDynDescr)
             G_func(llrOut, llrIn, csBits, sz, tile);
         }
 
-        type = get_type(stage, n_cw, subIdx, treeTypes);
-        // use F function to propagate updated LLRs up to stage 0 (next bit at leaf node)
-        while (stage > -1) {
-            if (type != 3) {
-                break;
-            }
+        // use F function to propagate updated LLRs down to the next visited node's stage
+        while (stage > (opEntry & 0xF)) {
             stage--;
-            subIdx *= 2;
-            type = get_type(stage, n_cw, subIdx, treeTypes);
             sz   = 1 << stage;
             if (tile.meta_group_rank() < numPaths) {
                 int   p   = tile.meta_group_rank();
@@ -2345,9 +2783,11 @@ listPolarDecoderKernel(polarDecoderDynDescr_t* pDynDescr)
         return;
     }
 
-    // first run simple polar decoder (list size 1)
-    singlePolarDecoder(pDynDescr);
-    __syncthreads();
+    // first run simple polar decoder (list size 1); the list kernel runs one
+    // 32-thread block per codeword, so the SC pass uses the whole shared buffer
+    __shared__ extern bool sh_buff[];
+    singlePolarDecoder(pDynDescr, blockIdx.x, threadIdx.x, sh_buff);
+    sync_barrier<POLAR_DECODER_BLOCK_SIZE>();
     // then check if decoding was successful
     uint8_t crcErrFlag = pDynDescr->pPolCrcErrorFlags[blockIdx.x];
     //  if there is CRC error, then run list polar decoder
@@ -2366,16 +2806,47 @@ listPolarDecoderKernel(polarDecoderDynDescr_t* pDynDescr)
 } //namespace polar_decoder
 //---------------------------------------------------------------------------------------------------
 
+// Per-codeword dynamic shared-memory slice of the single/SC decoder for
+// codewords up to maxN bits: two boolean cs buffers of maxN/2, the packed
+// per-stage estimate buffer (maxN bits) and a CRC scratch of N_MAX_WORDS
+// words. Region offsets and the total are word-aligned so that per-warp
+// slices remain aligned.
+static inline int scDecoderSliceBytes(int maxN)
+{
+    const int estByteOffset = (2 * (maxN / 2) + 3) & ~3;
+    const int estBytes      = ((std::max(maxN / 32, 1)) + polar_decoder::N_MAX_WORDS) * static_cast<int>(sizeof(uint32_t));
+    return estByteOffset + estBytes;
+}
+
 template<int LIST_SZ>
 void polarDecoder::kernelSelect(uint16_t                      nPolCws,
                                 const cuphyPolarCwPrm_t*      pPolUciSegPrmsCpu,
                                 cuphyPolarDecoderLaunchCfg_t* pLaunchCfg)
 {
+    // Size buffers for the largest codeword of THIS launch rather than the
+    // absolute maximum: both kernels compute their shared-memory offsets from
+    // the per-block N_cw, so the allocation only needs to cover the largest
+    // block, and a smaller footprint raises the resident-block limit.
+    int launchMaxN = 32;
+    for(uint16_t cwIdx = 0; cwIdx < nPolCws; ++cwIdx)
+    {
+        launchMaxN = std::max(launchMaxN, static_cast<int>(pPolUciSegPrmsCpu[cwIdx].N_cw));
+    }
+
     // launch geometry
-    constexpr int blkSize = 32;
+    constexpr int blkSize = polar_decoder::POLAR_DECODER_BLOCK_SIZE;
     constexpr int tileSize = blkSize / LIST_SZ;
     dim3 gridDim(nPolCws);
     dim3 blockDim(blkSize);
+    int scWarpsPerBlock = 1;
+    if(LIST_SZ == 1)
+    {
+        // the SC decoder packs several one-warp codewords into each block for
+        // large batches; small latency-critical batches keep one warp per block
+        scWarpsPerBlock = (nPolCws >= polar_decoder::POLAR_SC_MULTIWARP_MIN_CWS) ? polar_decoder::POLAR_SC_WARPS_PER_BLOCK : 1;
+        gridDim.x  = (nPolCws + scWarpsPerBlock - 1) / scWarpsPerBlock;
+        blockDim.x = scWarpsPerBlock * polar_decoder::CUDA_WARP_SIZE;
+    }
 
     // kernel
     void* kernelFunc;
@@ -2401,21 +2872,27 @@ void polarDecoder::kernelSelect(uint16_t                      nPolCws,
     kernelNodeParamsDriver.extra = nullptr;
 
     if (LIST_SZ > 1) {
+        int launchMaxWords = launchMaxN / polar_decoder::WORD_LENGTH;
+        int launchMaxDepth = 0;
+        while((1 << launchMaxDepth) < launchMaxN)
+        {
+            launchMaxDepth++;
+        }
         int dyn_shared_sz = 0;
-        dyn_shared_sz += LIST_SZ * polar_decoder::N_MAX_POLAR_DEPTH * sizeof(int16_t);                       // for linked list pointers
-        dyn_shared_sz += LIST_SZ * sizeof(__half);                                                           // for path metrics
-        dyn_shared_sz += LIST_SZ * 2 * (polar_decoder::N_MAX_WORDS + polar_decoder::BCO) * sizeof(uint32_t); // for both temp buffers used to keep a copy of codeword per stage,
-                                                                                                             // each word stores 32 bits, +BCO is to minimize bank conflicts
-        dyn_shared_sz += LIST_SZ * (polar_decoder::N_MAX_WORDS + polar_decoder::BCO) * sizeof(uint32_t);     // for storing estimated code word per stage, each word
-                                                                                                             // stores 32 bits, +BCO is to minimize bank conflicts
+        dyn_shared_sz += LIST_SZ * launchMaxDepth * sizeof(int16_t);                             // for linked list pointers
+        dyn_shared_sz += LIST_SZ * sizeof(__half);                                               // for path metrics
+        dyn_shared_sz += LIST_SZ * 2 * (launchMaxWords + polar_decoder::BCO) * sizeof(uint32_t); // for both temp buffers used to keep a copy of codeword per stage,
+                                                                                                 // each word stores 32 bits, +BCO is to minimize bank conflicts
+        dyn_shared_sz += LIST_SZ * (launchMaxWords + polar_decoder::BCO) * sizeof(uint32_t);     // for storing estimated code word per stage, each word
+                                                                                                 // stores 32 bits, +BCO is to minimize bank conflicts
 
         // since in fall-back method, we first run with list size 1 and use polarDecoderKernel() instead of listPolarDecoderKernel<tileSize, 1>(),
-        // let's ensure allocated dynamic shared mem is large enough for LIST_SZ=1 as well
-        dyn_shared_sz = max(dyn_shared_sz, 5 * polar_decoder::N_MAX_CODED_BITS / 2);
+        // let's ensure allocated dynamic shared mem is large enough for the SC pass as well
+        dyn_shared_sz = std::max(dyn_shared_sz, scDecoderSliceBytes(launchMaxN));
 
         kernelNodeParamsDriver.sharedMemBytes = dyn_shared_sz;
     } else {
-        kernelNodeParamsDriver.sharedMemBytes = 5 * polar_decoder::N_MAX_CODED_BITS / 2;
+        kernelNodeParamsDriver.sharedMemBytes = scWarpsPerBlock * scDecoderSliceBytes(launchMaxN);
     }
 
 }
@@ -2437,6 +2914,15 @@ void polarDecoder::setup(uint16_t                      nPolCws,                 
     // populate dynamic descriptor:
     pCpuDynDesc->pCwPrmsGpu        = pCwPrmsGpu;
     pCpuDynDesc->pPolCrcErrorFlags = pPolCrcErrorFlags;
+    pCpuDynDesc->nPolCws           = nPolCws;
+    {
+        int launchMaxN = 32;
+        for(uint16_t cwIdx = 0; cwIdx < nPolCws; ++cwIdx)
+        {
+            launchMaxN = std::max(launchMaxN, static_cast<int>(pCwPrmsCpu[cwIdx].N_cw));
+        }
+        pCpuDynDesc->scSharedSliceBytes = static_cast<uint16_t>(scDecoderSliceBytes(launchMaxN));
+    }
 
     for(uint16_t cwIdx = 0; cwIdx < nPolCws; ++cwIdx)
     {
@@ -2463,14 +2949,16 @@ void polarDecoder::setup(uint16_t                      nPolCws,                 
     }
 
     // select kernel (includes launch geometry). Populate launchCfg.
+    // kernelSelect reads per-codeword N_cw on the host, so it must receive the
+    // CPU copy of the codeword parameters.
     if (nPolLists == 1) {
-        kernelSelect<1>(nPolCws, pCwPrmsGpu, pLaunchCfg);
+        kernelSelect<1>(nPolCws, pCwPrmsCpu, pLaunchCfg);
     } else if (nPolLists == 2) {
-        kernelSelect<2>(nPolCws, pCwPrmsGpu, pLaunchCfg);
+        kernelSelect<2>(nPolCws, pCwPrmsCpu, pLaunchCfg);
     } else if (nPolLists == 4) {
-        kernelSelect<4>(nPolCws, pCwPrmsGpu, pLaunchCfg);
+        kernelSelect<4>(nPolCws, pCwPrmsCpu, pLaunchCfg);
     } else { // list size 8
-        kernelSelect<8>(nPolCws, pCwPrmsGpu, pLaunchCfg);
+        kernelSelect<8>(nPolCws, pCwPrmsCpu, pLaunchCfg);
     }
     pLaunchCfg->kernelArgs[0]                       = &m_kernelArgs.pDynDescr;
     pLaunchCfg->kernelNodeParamsDriver.kernelParams = &(pLaunchCfg->kernelArgs[0]);

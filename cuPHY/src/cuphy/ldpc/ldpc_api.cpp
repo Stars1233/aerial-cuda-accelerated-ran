@@ -38,13 +38,15 @@ LDPC_decode_config::LDPC_decode_config(cuphyDataType_t llr_type_in,
     max_iterations   = max_iterations_in;
     Kb               = Kb_in;
     // Normalization union member must match the input LLR type
-    if(CUPHY_R_16F == llr_type)
+    if(CUPHY_R_32F == llr_type)
     {
-        norm.f16x2   =  static_cast<__half2_raw>(__float2half2_rn(norm_in));
+        norm.f32     = norm_in;
     }
     else
     {
-        norm.f32     = norm_in;
+        // Note: all other LLR types, including fp8, currently expect
+        // normalization values set in the fp16x2 union value
+        norm.f16x2   =  static_cast<__half2_raw>(__float2half2_rn(norm_in));
     }
     flags            = flags_in;
     BG               = BG_in;
@@ -65,14 +67,20 @@ void LDPC_decode_desc::add_tensor_as_tb(const tensor_desc& llrTensorDesc,
     llr_input[num_tbs].addr             = llrAddr;
     llr_input[num_tbs].stride_elements  = llrTensorDesc.get_stride(1);
     llr_input[num_tbs].num_codewords    = llrTensorDesc.get_dim(1);
+    llr_input[num_tbs].crc_type         = nullptr;
     tb_output[num_tbs].addr             = static_cast<uint32_t*>(decodeAddr);
     // Convert bit stride to uint32_t word stride
     tb_output[num_tbs].stride_words     = decodeTensorDesc.get_stride(1) / 32;
     tb_output[num_tbs].num_codewords    = decodeTensorDesc.get_dim(1);
+    tb_output[num_tbs].crc              = nullptr;
     // Soft output slots are unused
     llr_output[num_tbs].addr            = nullptr;
     llr_output[num_tbs].stride_elements = 0;
     llr_output[num_tbs].num_codewords   = 0;
+    llr_output[num_tbs].crc_type        = nullptr;
+    // Iteration output slots are unused
+    iter_output[num_tbs].addr           = nullptr;
+    iter_output[num_tbs].num_codewords  = 0;
     ++num_tbs;
 }
 
@@ -90,16 +98,118 @@ void LDPC_decode_desc::add_tensor_as_tb(const tensor_desc& llrTensorDesc,
     llr_input[num_tbs].addr             = llrAddr;
     llr_input[num_tbs].stride_elements  = llrTensorDesc.get_stride(1);
     llr_input[num_tbs].num_codewords    = llrTensorDesc.get_dim(1);
+    llr_input[num_tbs].crc_type         = nullptr;
     tb_output[num_tbs].addr             = static_cast<uint32_t*>(decodeAddr);
     // Convert bit stride to uint32_t word stride
     tb_output[num_tbs].stride_words     = decodeTensorDesc.get_stride(1) / 32;
     tb_output[num_tbs].num_codewords    = decodeTensorDesc.get_dim(1);
+    tb_output[num_tbs].crc              = nullptr;
     llr_output[num_tbs].addr            = softOutputsAddr;
     llr_output[num_tbs].stride_elements = softOutputsTensorDesc.get_stride(1);
     llr_output[num_tbs].num_codewords   = softOutputsTensorDesc.get_dim(1);
+    llr_output[num_tbs].crc_type        = nullptr;
+    // Iteration output slots are unused
+    iter_output[num_tbs].addr           = nullptr;
+    iter_output[num_tbs].num_codewords  = 0;
     // Set the flag in the decoder descriptor to indicate that soft outputs
     // are desired.
     config.flags |= CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS;
+    ++num_tbs;
+}
+
+void LDPC_decode_desc::add_tensor_as_tb(const tensor_desc& llrTensorDesc,
+                                        void*              llrAddr,
+                                        const tensor_desc& decodeTensorDesc,
+                                        void*              decodeAddr,
+                                        uint32_t*          crcType,
+                                        uint32_t*          crcOutput,
+                                        int32_t*           iterOutput)
+{
+    if(num_tbs >= max_tbs_per_desc)
+    {
+        throw std::runtime_error("Max number of TBS in LDPC descriptor exceeded");
+    }
+    const int32_t num_cw = llrTensorDesc.get_dim(1);
+
+    llr_input[num_tbs].addr             = llrAddr;
+    llr_input[num_tbs].stride_elements  = llrTensorDesc.get_stride(1);
+    llr_input[num_tbs].num_codewords    = num_cw;
+    llr_input[num_tbs].crc_type         = crcType;
+
+    tb_output[num_tbs].addr             = static_cast<uint32_t*>(decodeAddr);
+    // Convert bit stride to uint32_t word stride
+    tb_output[num_tbs].stride_words     = decodeTensorDesc.get_stride(1) / 32;
+    tb_output[num_tbs].num_codewords    = decodeTensorDesc.get_dim(1);
+    tb_output[num_tbs].crc              = crcOutput;
+
+    // Soft output slots are unused
+    llr_output[num_tbs].addr            = nullptr;
+    llr_output[num_tbs].stride_elements = 0;
+    llr_output[num_tbs].num_codewords   = 0;
+    llr_output[num_tbs].crc_type        = nullptr;
+
+    // Iteration output
+    iter_output[num_tbs].addr           = iterOutput;
+    iter_output[num_tbs].num_codewords  = num_cw;
+
+    // Set flags based on provided parameters
+    if(crcType != nullptr)
+    {
+        config.flags |= CUPHY_LDPC_DECODE_EARLY_TERM;
+    }
+    if(iterOutput != nullptr)
+    {
+        config.flags |= CUPHY_LDPC_DECODE_WRITE_ITER_COUNT;
+    }
+    ++num_tbs;
+}
+
+void LDPC_decode_desc::add_tensor_as_tb(const tensor_desc& llrTensorDesc,
+                                        void*              llrAddr,
+                                        const tensor_desc& decodeTensorDesc,
+                                        void*              decodeAddr,
+                                        const tensor_desc& softOutputsTensorDesc,
+                                        void*              softOutputsAddr,
+                                        uint32_t*          crcType,
+                                        uint32_t*          crcOutput,
+                                        int32_t*           iterOutput)
+{
+    if(num_tbs >= max_tbs_per_desc)
+    {
+        throw std::runtime_error("Max number of TBS in LDPC descriptor exceeded");
+    }
+    const int32_t num_cw = llrTensorDesc.get_dim(1);
+
+    llr_input[num_tbs].addr             = llrAddr;
+    llr_input[num_tbs].stride_elements  = llrTensorDesc.get_stride(1);
+    llr_input[num_tbs].num_codewords    = num_cw;
+    llr_input[num_tbs].crc_type         = crcType;
+
+    tb_output[num_tbs].addr             = static_cast<uint32_t*>(decodeAddr);
+    // Convert bit stride to uint32_t word stride
+    tb_output[num_tbs].stride_words     = decodeTensorDesc.get_stride(1) / 32;
+    tb_output[num_tbs].num_codewords    = decodeTensorDesc.get_dim(1);
+    tb_output[num_tbs].crc              = crcOutput;
+
+    llr_output[num_tbs].addr            = softOutputsAddr;
+    llr_output[num_tbs].stride_elements = softOutputsTensorDesc.get_stride(1);
+    llr_output[num_tbs].num_codewords   = softOutputsTensorDesc.get_dim(1);
+    llr_output[num_tbs].crc_type        = nullptr;
+
+    // Iteration output
+    iter_output[num_tbs].addr           = iterOutput;
+    iter_output[num_tbs].num_codewords  = num_cw;
+
+    // Set flags based on provided parameters
+    config.flags |= CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS;
+    if(crcType != nullptr)
+    {
+        config.flags |= CUPHY_LDPC_DECODE_EARLY_TERM;
+    }
+    if(iterOutput != nullptr)
+    {
+        config.flags |= CUPHY_LDPC_DECODE_WRITE_ITER_COUNT;
+    }
     ++num_tbs;
 }
 

@@ -21,9 +21,12 @@ import argparse
 import importlib.util
 import os
 import re
+import shlex
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional
+
+SSH_USERNAME = "aerial"
 
 
 def parse_test_nodes(nodes_file: str) -> List[Dict[str, str]]:
@@ -81,11 +84,29 @@ def parse_test_nodes(nodes_file: str) -> List[Dict[str, str]]:
     return sorted(nodes, key=lambda x: x['hostname'])
 
 
+def remote_path(nfs_path: str, path: str) -> str:
+    """Return path as seen from the remote host."""
+    if os.path.isabs(path):
+        return path
+    return f"{nfs_path.rstrip('/')}/{path.lstrip('/')}"
+
+
+def server_version_check_dir(nfs_path: str) -> str:
+    """Return the server_version_check directory as seen from the remote host."""
+    current_script = os.path.abspath(__file__)
+    script_dir = os.path.dirname(current_script)
+    script_rel_path = os.path.relpath(script_dir, os.path.abspath(nfs_path))
+    if script_rel_path == ".." or script_rel_path.startswith("../"):
+        script_rel_path = "testBenches/phase4_test_scripts/server_version_check"
+    return f"{nfs_path.rstrip('/')}/{script_rel_path}"
+
+
 def run_check_on_node(
     hostname: str,
-    username: str,
     nfs_path: str,
-    manifest: str,
+    manifest: Optional[str],
+    versions_sh: Optional[str] = None,
+    platform: Optional[str] = None,
     test_mode: bool = False,
     verbose: bool = False
 ) -> Dict[str, Any]:
@@ -93,37 +114,47 @@ def run_check_on_node(
     
     Args:
         hostname: Target hostname
-        username: SSH username
         nfs_path: NFS mount path on remote node
         manifest: Manifest filename (assumed to be in same directory as this script)
+        versions_sh: Path to versions.sh on the remote node, absolute or relative to nfs_path
+        platform: Optional PLATFORM override for versions.sh
         test_mode: If True, print command without executing
         verbose: If True, print full output from node
         
     Returns:
         Dictionary with check results
     """
-    # Get password from environment variable
-    password = os.environ.get('SSHPASS', '')
-    if not password:
-        raise ValueError("SSHPASS environment variable not set")
+    if bool(manifest) == bool(versions_sh):
+        raise ValueError("Provide exactly one of manifest or versions_sh")
     
     # Determine script path relative to nfs_path (same directory as this script)
-    current_script = os.path.abspath(__file__)
-    script_dir = os.path.dirname(current_script)
-    script_rel_path = os.path.relpath(script_dir, os.path.abspath(nfs_path))
-    script_path = f"{nfs_path}/{script_rel_path}/server_version_check.py"
-    manifest_path = f"{nfs_path}/{script_rel_path}/{manifest}"
+    remote_script_dir = server_version_check_dir(nfs_path)
+    script_path = f"{remote_script_dir}/server_version_check.py"
+    if versions_sh:
+        check_args = f"--versions-sh {shlex.quote(remote_path(nfs_path, versions_sh))}"
+        if platform:
+            check_args += f" --platform {shlex.quote(platform)}"
+    else:
+        manifest_path = f"{remote_script_dir}/{manifest}"
+        check_args = shlex.quote(manifest_path)
     
-    # Build SSH command with sshpass -e to read password from SSHPASS env var
-    # Use sudo -S to read password from stdin
-    # Run entire command (including cd) under sudo
-    ssh_cmd = (
-        f"sshpass -e ssh "
-        f"-o ConnectTimeout=10 "
-        f"-o StrictHostKeyChecking=no "
-        f"{username}@{hostname} "
-        f"'echo \"{password}\" | sudo -S sh -c \"cd {nfs_path} && python3 {script_path} {manifest_path}\" 2>&1'"
-    )
+    remote_command = f"cd {shlex.quote(nfs_path)} && python3 {shlex.quote(script_path)} {check_args}"
+    sudo_command = f"sudo -n sh -c {shlex.quote(remote_command)}"
+
+    # Use public-key SSH as the aerial service account. OpenSSH uses
+    # SSH_AUTH_SOCK and its normal identity lookup.
+    ssh_parts = [
+        "ssh",
+        "-o BatchMode=yes",
+        "-o ConnectTimeout=10",
+        "-o PasswordAuthentication=no",
+        "-o PreferredAuthentications=publickey",
+        "-o PubkeyAuthentication=yes",
+        "-o StrictHostKeyChecking=no",
+        f"{SSH_USERNAME}@{hostname}",
+        shlex.quote(sudo_command),
+    ]
+    ssh_cmd = f"{' '.join(ssh_parts)} 2>&1"
     
     # Test mode: just print the command and return mock result
     if test_mode:
@@ -196,6 +227,11 @@ def run_check_on_node(
             elif "can't cd to" in output or "cd:" in output:
                 result['reachable'] = False
                 result['error'] = f'NFS path not accessible on node'
+                result['overall'] = 'ERROR'
+                return result
+            elif 'sudo:' in output and 'password' in output:
+                result['reachable'] = False
+                result['error'] = 'Passwordless sudo failed'
                 result['overall'] = 'ERROR'
                 return result
             elif len(output) < 100 and 'Detected System Type' not in output:
@@ -371,16 +407,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example:
-  export SSHPASS=$(cat ~/aerial_pw)
   python3 server_version_check_all.py \\
       /home/user/nfs/gitlab/cicd-scripts/cicd_test_nodes.py \\
       manifest_cg1_r750_25.3.csv \\
-      /home/user/nfs/cuBB_0102 \\
-      username
+      /home/user/nfs/cuBB_0102
 
-Note: Password must be set in SSHPASS environment variable for security.
-      It is assumed the password is stored in ~/aerial_pw (chmod 600).
-      This prevents the password from appearing in process lists or logs.
+  python3 server_version_check_all.py \\
+      /home/user/nfs/gitlab/cicd-scripts/cicd_test_nodes.py \\
+      /home/user/nfs/aerial_sdk \\
+      --versions-sh cuPHY-CP/container/versions.sh
+
+Note: SSH uses the aerial service account. By default it relies on
+      ssh-agent/default OpenSSH identity lookup. Remote sudo must be
+      passwordless.
         """
     )
     
@@ -389,16 +428,19 @@ Note: Password must be set in SSHPASS environment variable for security.
         help='Path to cicd_test_nodes.py file'
     )
     parser.add_argument(
-        'manifest',
-        help='Manifest CSV filename (in same directory as this script)'
+        'check_args',
+        nargs='+',
+        metavar='check_arg',
+        help='CSV mode: <manifest> <nfs_path>. versions.sh mode: <nfs_path>'
     )
     parser.add_argument(
-        'nfs_path',
-        help='Shared NFS path accessible on all nodes'
+        '--versions-sh',
+        metavar='FILE',
+        help='Path to versions.sh on remote nodes, absolute or relative to nfs_path'
     )
     parser.add_argument(
-        'username',
-        help='SSH username for connecting to nodes'
+        '--platform',
+        help='Optional PLATFORM override when sourcing versions.sh on each node'
     )
     parser.add_argument(
         '--filter',
@@ -417,24 +459,17 @@ Note: Password must be set in SSHPASS environment variable for security.
     )
     
     args = parser.parse_args()
-    
-    # Check if SSHPASS environment variable is set
-    if 'SSHPASS' not in os.environ:
-        print("Error: SSHPASS environment variable not set")
-        print("Set it with: export SSHPASS=$(cat ~/aerial_pw)")
-        sys.exit(1)
-    
-    # Check if sshpass is available
-    sshpass_check = subprocess.run(
-        'which sshpass',
-        shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-    if sshpass_check.returncode != 0:
-        print("Error: 'sshpass' is not installed. Install it with: sudo apt install sshpass")
-        sys.exit(1)
-    
+
+    if args.versions_sh:
+        if len(args.check_args) != 1:
+            parser.error('versions.sh mode expects: <nodes_file> <nfs_path> --versions-sh <path>')
+        manifest = None
+        nfs_path = args.check_args[0]
+    else:
+        if len(args.check_args) != 2:
+            parser.error('CSV mode expects: <nodes_file> <manifest> <nfs_path>')
+        manifest, nfs_path = args.check_args
+
     # Parse nodes
     try:
         print(f"Parsing nodes from: {args.nodes_file}")
@@ -461,18 +496,19 @@ Note: Password must be set in SSHPASS environment variable for security.
     else:
         print(f"\nRunning version checks on {len(nodes)} nodes...")
         print("(This may take several minutes)\n")
-    
+
     results = []
     for i, node in enumerate(nodes, 1):
         hostname = node['hostname']
         if not args.test:
             print(f"[{i}/{len(nodes)}] Checking {hostname}...", flush=True)
-        
+
         result = run_check_on_node(
             hostname,
-            args.username,
-            args.nfs_path,
-            args.manifest,
+            nfs_path,
+            manifest,
+            versions_sh=args.versions_sh,
+            platform=args.platform,
             test_mode=args.test,
             verbose=args.verbose
         )
@@ -492,4 +528,3 @@ Note: Password must be set in SSHPASS environment variable for security.
 
 if __name__ == '__main__':
     main()
-

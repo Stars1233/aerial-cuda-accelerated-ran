@@ -17,12 +17,14 @@ Build profiles set **BUILD_PRESET** and **PROFILE_CMAKE_FLAGS**. These are combi
 | **oai.conf**     | 10_02  | OAI L2+ (default). Enables 10.04 SRS |
 | **fapi_10_02.conf** | 10_02  | FAPI 10_02 only |
 | **fapi_10_04.conf** | 10_04  | FAPI 10_04 build (SCF_FAPI_10_04=ON). |
+| **fapi_10_04_TM.conf** | 10_04_TM | FAPI 10_04 with conformance test mode (PDSCH/PDCCH TM). |
+| **fapi_10_04_low_memory.conf** | 10_04_low_memory | FAPI 10_04, `ENABLE_20C=OFF`. |
 
 ## Adding a profile
 
 Add a file `cmake-profiles/<name>.conf` that exports:
 
-- `BUILD_PRESET` – one of: `perf`, `10_02`, `10_04`, `10_04_32dl`
+- `BUILD_PRESET` – one of: `perf`, `10_02`, `10_04`, `10_04_TM`, `10_04_low_memory`
 - `PROFILE_CMAKE_FLAGS` – CMake flags for this profile (combined with platform flags and user BUILD_CMAKE_FLAGS)
 
 Example:

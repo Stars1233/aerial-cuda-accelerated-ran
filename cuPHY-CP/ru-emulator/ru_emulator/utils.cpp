@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +29,7 @@ static std::atomic_uint64_t glob_slot_counter{0};
 
 inline bool compare_approx(const __half& a, const __half& b, const float tolf)
 {
-#if CUDART_VERSION < 12020
+#if CUDA_VERSION < 12020
     float af = __half2float(a);
     float bf = __half2float(b);
     float diff = fabs(af - bf);

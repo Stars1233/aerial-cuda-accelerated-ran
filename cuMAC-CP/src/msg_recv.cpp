@@ -158,8 +158,8 @@ cumac_receiver::cumac_receiver(yaml::node &yaml_node, cumac_cp_configs &_configs
         }
     }
 
-    NVLOGC_FMT(TAG, "{}: initialized. cell_num={} debug_option=0x{:X} configs.run_in_cpu={} gpu_id={} cuda_block_num={}",
-            __func__, cell_num, configs.debug_option, configs.run_in_cpu, configs.gpu_id, configs.cuda_block_num);
+    NVLOGC_FMT(TAG, "{}: initialized: cell_num={} debug_option=0x{:X} run_in_cpu={} gpu_id={} cuda_block_num={} enable_gpu_share={} enable_cubb={} srs_slot_lag={}",
+            __func__, cell_num, configs.debug_option, configs.run_in_cpu, configs.gpu_id, configs.cuda_block_num, configs.enable_gpu_share, configs.enable_cubb, configs.srs_slot_lag);
 }
 
 cumac_receiver::~cumac_receiver()
@@ -214,7 +214,7 @@ void cumac_receiver::recv_msg()
 bool cumac_receiver::on_msg(nv::phy_mac_msg_desc &msg)
 {
     bool ready_to_free = true;
-    if (msg.msg_id < 0 || msg.cell_id >= cell_num)
+    if (msg.msg_id < 0 || msg.cell_id < 0 || msg.cell_id >= cell_num)
     {
         NVLOGE_FMT(TAG, AERIAL_TEST_CUMAC_EVENT, "{}: Invalid CUMAC MSG cell_id: cell_id={} msg_id={}", __func__, msg.cell_id, msg.msg_id);
         return ready_to_free;

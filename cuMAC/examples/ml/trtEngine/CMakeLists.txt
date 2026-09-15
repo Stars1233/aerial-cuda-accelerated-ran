@@ -24,3 +24,10 @@ target_include_directories(trtEngine PRIVATE
     ${HDF5_CXX_INCLUDE_DIRS} 
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
 )
+
+# Default location of infConfig.yaml / pt_to_onnx.py. With this fallback the
+# benchmark runs with zero arguments from anywhere: when no infConfig.yaml is
+# found in the current working directory or next to the binary, this source-tree
+# config is used, and its relative model/script paths resolve against the source
+# tree (where the trained model and exporter live).
+target_compile_definitions(trtEngine PRIVATE CUMAC_ML_DIR="${CMAKE_CURRENT_SOURCE_DIR}/..")

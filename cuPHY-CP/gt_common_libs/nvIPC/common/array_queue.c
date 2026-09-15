@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -103,6 +103,12 @@ static int array_queue_enqueue(array_queue_t* queue, int32_t value)
         }
         else
         {
+            if(tail.node.next < 0 || tail.node.next >= priv_data->queue_len)
+            {
+                NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid tail next %d", priv_data->name,
+                        tail.node.next);
+                return -1;
+            }
             pnode_tail = &header->queue[tail.node.next];
         }
         node_tail.ulong = atomic_load(pnode_tail);
@@ -198,6 +204,12 @@ static int array_queue_dequeue(array_queue_t* queue)
             // Empty
             return -1;
         }
+        if(head.node.next < 0 || head.node.next >= priv_data->queue_len)
+        {
+            // Should never run to here
+            NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: dequeue invalid head next %d", priv_data->name, head.node.next);
+            return -1;
+        }
 
         // Load node_head
         pnode_head      = &header->queue[head.node.next];
@@ -216,6 +228,13 @@ static int array_queue_dequeue(array_queue_t* queue)
         {
             NVLOGV(TAG, "%s: dequeue empty 2", priv_data->name);
             // Empty
+            return -1;
+        }
+
+        if(node_head.node.next < 0 || node_head.node.next >= priv_data->queue_len)
+        {
+            NVLOGE_NO(TAG, AERIAL_NVIPC_API_EVENT, "%s: invalid node_head next %d", priv_data->name,
+                    node_head.node.next);
             return -1;
         }
 
@@ -310,7 +329,16 @@ static int array_queue_get_count(array_queue_t* queue)
 
     long deq_count = atomic_load(&header->deq_count);
     long enq_count = atomic_load(&header->enq_count);
-    return (int)(enq_count - deq_count);
+    long count     = enq_count - deq_count;
+    if(count < 0)
+    {
+        count = 0;
+    }
+    else if(count > priv_data->queue_len)
+    {
+        count = priv_data->queue_len;
+    }
+    return (int)count;
 }
 
 int32_t array_queue_get_next(array_queue_t* queue, int32_t base)
@@ -319,6 +347,10 @@ int32_t array_queue_get_next(array_queue_t* queue, int32_t base)
     array_queue_header_t* header    = priv_data->header;
 
     cas_union_t   curr;
+    if(base >= priv_data->queue_len)
+    {
+        return VALUE_NULL;
+    }
     atomic_ulong* pnode_base = base < 0 ? &header->head : &header->queue[base];
     curr.ulong               = atomic_load(pnode_base);
     return curr.node.next;

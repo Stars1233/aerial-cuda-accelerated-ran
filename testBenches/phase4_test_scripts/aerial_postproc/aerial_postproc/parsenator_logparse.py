@@ -76,8 +76,10 @@ def perf_metrics_parse(phy_filenames,testmac_filenames,ru_filenames,start_tir,en
         # Parse testmac log
         p2 = Parsenator(testmac_filename,
                         [parse_testmac_times],
-                        [['t0_timestamp','slot','fapi2_start_timestamp','fapi2_stop_timestamp']
-                        ], #Only necessary TI fields???,
+                        [['t0_timestamp','slot','fapi2_start_timestamp','fapi2_stop_timestamp',
+                          'dl_tti_start_timestamp','dl_tti_stop_timestamp',
+                          'tx_data_start_timestamp','tx_data_stop_timestamp',
+                          'ul_tti_start_timestamp','ul_tti_stop_timestamp']],
                         start_tir,end_tir,num_processes=num_proc,ref_t0=ref_t0)
         parsed_result = p2.parse()
         df_testmac = parsed_result[0]
@@ -164,7 +166,7 @@ def latency_parsing(phy_filenames,ru_filenames,start_tir,end_tir,slot_list=None,
             df_du_rx_srs_timing = df_du_rx_srs_timing[df_du_rx_srs_timing.slot.isin(slot_list)]
             df_ti = df_ti[df_ti.slot.isin(slot_list)]
             df_tx_timing = df_tx_timing[df_tx_timing.slot.isin(slot_list)]
-            df_tx_timing_sum = df_tx_timing[df_tx_timing.slot.isin(slot_list)]
+            df_tx_timing_sum = df_tx_timing_sum[df_tx_timing_sum.slot.isin(slot_list)]
             df_ru_rx_timing = df_ru_rx_timing[df_ru_rx_timing.slot.isin(slot_list)]
 
         #Normalize cell in df_du_rx_timing, df_ru_rx_timing, and df_tx_timing
@@ -220,8 +222,10 @@ def cicd_metrics_parsing(phy_filenames,testmac_filenames,ru_filenames,start_tir,
         # Parse testmac log
         p2 = Parsenator(testmac_filename,
                         [parse_testmac_times],
-                        [['t0_timestamp','slot','fapi2_start_timestamp','fapi2_stop_timestamp']
-                        ], #Only necessary TI fields???,
+                        [['t0_timestamp','slot','fapi2_start_timestamp','fapi2_stop_timestamp',
+                          'dl_tti_start_timestamp','dl_tti_stop_timestamp',
+                          'tx_data_start_timestamp','tx_data_stop_timestamp',
+                          'ul_tti_start_timestamp','ul_tti_stop_timestamp']],
                         start_tir,end_tir,num_processes=num_proc,ref_t0=ref_t0)
         parsed_result = p2.parse()
         df_testmac = parsed_result[0]

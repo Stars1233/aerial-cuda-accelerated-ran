@@ -14,9 +14,9 @@
 # limitations under the License.
 
 add_executable(cellAssociateTest)
-target_sources(cellAssociateTest PRIVATE cellAssociateTest.cpp ../network.cu)
-target_include_directories(cellAssociateTest PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${CHAN_MODELS_SRC_INCLUDE_DIR})
-target_link_libraries(cellAssociateTest PRIVATE cumac ${HDF5_CXX_LIBRARIES} channInput chanModels)
+target_sources(cellAssociateTest PRIVATE cellAssociateTest.cpp ../network.cu ../parameters.cpp)
+target_include_directories(cellAssociateTest PRIVATE ${HDF5_CXX_INCLUDE_DIRS} ${GPU3GPPCHAN_SRC_INCLUDE_DIR})
+target_link_libraries(cellAssociateTest PRIVATE cumac ${HDF5_CXX_LIBRARIES} channInput gpu3gppchan yaml-cpp)
 
 enable_testing()
 add_test(NAME cellAssociateTest COMMAND cellAssociateTest)

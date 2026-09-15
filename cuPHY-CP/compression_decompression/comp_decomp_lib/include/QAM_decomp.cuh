@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cuda.h>
 #include <cuda_fp16.h>
 #include "QAM_param.cuh"
 #include "QAM_packing.cuh"
@@ -127,21 +128,29 @@ struct QAM_Decomp
         reinterpret_cast<uint4 *>(output)[index] = vout.v4;
     }
 
-    // GPU kernel launcher
-    static void gpu_decompress_QAM_lists(const uint8_t *const *__restrict__ list_inputs,    // Input data, compressed bytes
-                                         const QamListParam *__restrict__ list_params,      // Per-list parameters
-                                         const QamPrbParam *const *__restrict__ prb_params, // PRB parameters, for each list
-                                         float2 *scalers,                                   // PRB scaling, for each list
-                                         half **__restrict__ list_outputs,                  // FP16 PRB outputs
-                                         const int32_t *__restrict__ nprbs,                 // Number of PRBs in each list
-                                         int32_t nlists)                                    // Number of PRB lists
-
+    // GPU kernel launcher (Driver API)
+    static CUresult gpu_decompress_QAM_lists(CUfunction kernel_func,
+                                             const uint8_t *const *__restrict__ list_inputs,    // Input data, compressed bytes
+                                             const QamListParam *__restrict__ list_params,      // Per-list parameters
+                                             const QamPrbParam *const *__restrict__ prb_params, // PRB parameters, for each list
+                                             float2 *scalers,                                   // PRB scaling, for each list
+                                             half **__restrict__ list_outputs,                  // FP16 PRB outputs
+                                             const int32_t *__restrict__ nprbs,                 // Number of PRBs in each list
+                                             int32_t nlists)                                    // Number of PRB lists
     {
-        // Each warp decompresses a list.
         const int nwarps = 8;
         dim3 threads(32, nwarps);
         dim3 blocks((nlists + nwarps - 1) / nwarps);
-        decompress_QAM_lists<QAM_Decomp><<<blocks, threads>>>(list_inputs, list_params, prb_params, scalers, list_outputs, nprbs, nlists);
+        auto a0 = list_inputs;
+        auto a1 = list_params;
+        auto a2 = prb_params;
+        auto a3 = scalers;
+        auto a4 = list_outputs;
+        auto a5 = nprbs;
+        auto a6 = nlists;
+        void* args[] = {&a0, &a1, &a2, &a3, &a4, &a5, &a6};
+        return cuLaunchKernel(kernel_func, blocks.x, blocks.y, blocks.z,
+                              threads.x, threads.y, threads.z, 0, nullptr, args, nullptr);
     }
 
     // CPU decompressor

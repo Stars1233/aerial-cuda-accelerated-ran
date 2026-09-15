@@ -42,6 +42,7 @@ mkdir -p $TEMP_SRC_DIR/external
 
 # copy required source files
 cp -a nvIPC $TEMP_SRC_DIR
+cp -a cuda_driver_utils $TEMP_SRC_DIR
 cp -a ../../cuPHY/nvlog $TEMP_SRC_DIR
 cp CMakeLists.txt $TEMP_SRC_DIR
 cp README.md $TEMP_SRC_DIR

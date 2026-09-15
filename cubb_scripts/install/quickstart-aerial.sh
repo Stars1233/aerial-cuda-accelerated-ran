@@ -60,10 +60,10 @@ OPTIONS:
     -h, --help           Display this help message and exit
 
 ENVIRONMENT VARIABLES:
-    AERIAL_VERSION_TAG   Container image tag (default: 26-1)
+    AERIAL_VERSION_TAG   Container image tag (default from cuPHY-CP/container/versions.sh: 26-2)
     PROFILE              Build profile file name (sources cmake-profiles/<PROFILE> if set).
-                          Use 'oai.conf', 'fapi_10_02.conf', 'fapi_10_04.conf', or your own <name>.conf.
-    BUILD_PRESET         Build preset: perf, 10_02, 10_04, 10_04_32dl (default: 10_02)
+                          Use 'oai.conf', 'fapi_10_02.conf', 'fapi_10_04.conf', 'fapi_10_04_TM.conf', 'fapi_10_04_low_memory.conf', or your own <name>.conf.
+    BUILD_PRESET         Build preset: perf, 10_02, 10_04, 10_04_TM, 10_04_low_memory (default: 10_02)
     PROFILE_CMAKE_FLAGS  Set by build profile; combined with platform and BUILD_CMAKE_FLAGS, will not override BUILD_PRESET if set.
     BUILD_CMAKE_FLAGS    User-added CMake flags; combined with profile + platform flags (not overridden by profile).
     AERIAL_BUILD_FLAGS   Options for build_aerial_sdk.sh before CMake-specific flags
@@ -76,7 +76,7 @@ EXAMPLES:
     $(basename "$0") --tag
 
     # Use different container tag
-    AERIAL_VERSION_TAG=26-1 $(basename "$0")
+    AERIAL_VERSION_TAG=26-2 $(basename "$0")
 
     # Use different build preset
     BUILD_PRESET=perf $(basename "$0")
@@ -84,6 +84,8 @@ EXAMPLES:
     # Use a build profile, e.g.:
     PROFILE=fapi_10_02.conf $(basename "$0")
     PROFILE=fapi_10_04.conf $(basename "$0")
+    PROFILE=fapi_10_04_TM.conf $(basename "$0")
+    PROFILE=fapi_10_04_low_memory.conf $(basename "$0")
 
     # Preview commands without executing
     $(basename "$0") --dry-run
@@ -154,7 +156,7 @@ PROFILE_CMAKE_FLAGS="${PROFILE_CMAKE_FLAGS:-}"
 # Platform-specific flags based on PLATFORM from versions.sh
 PLATFORM_CMAKE_FLAGS=""
 case "${PLATFORM:-}" in
-    NVIDIA_DGX_Spark_P4242)
+    DGX-Spark)
         ;;
     *)
         ;;

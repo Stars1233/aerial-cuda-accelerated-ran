@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -74,26 +74,28 @@ int get_cuphy_type_storage_element_size(cuphyDataType_t type)
     switch (type)
     {
     default:
-    case CUPHY_VOID:  return 0;                                           // uninitialized type
-    case CUPHY_BIT:   return sizeof(data_type_traits<CUPHY_BIT>::type);   // 1-bit value - special handling for sub-byte types
-    case CUPHY_R_8I:  return sizeof(data_type_traits<CUPHY_R_8I>::type);  // 8-bit signed integer real values
-    case CUPHY_C_8I:  return sizeof(data_type_traits<CUPHY_C_8I>::type);  // 8-bit signed integer complex values
-    case CUPHY_R_8U:  return sizeof(data_type_traits<CUPHY_R_8U>::type);  // 8-bit unsigned integer real values
-    case CUPHY_C_8U:  return sizeof(data_type_traits<CUPHY_C_8U>::type);  // 8-bit unsigned integer real values
-    case CUPHY_R_16I: return sizeof(data_type_traits<CUPHY_R_16I>::type); // 16-bit signed integer real values
-    case CUPHY_C_16I: return sizeof(data_type_traits<CUPHY_C_16I>::type); // 16-bit signed integer real values
-    case CUPHY_R_16U: return sizeof(data_type_traits<CUPHY_R_16U>::type); // 16-bit unsigned integer real values
-    case CUPHY_C_16U: return sizeof(data_type_traits<CUPHY_C_16U>::type); // 16-bit unsigned integer real values
-    case CUPHY_R_32I: return sizeof(data_type_traits<CUPHY_R_32I>::type); // 32-bit signed integer real values
-    case CUPHY_C_32I: return sizeof(data_type_traits<CUPHY_C_32I>::type); // 32-bit signed integer real values
-    case CUPHY_R_32U: return sizeof(data_type_traits<CUPHY_R_32U>::type); // 32-bit unsigned integer real values
-    case CUPHY_C_32U: return sizeof(data_type_traits<CUPHY_C_32U>::type); // 32-bit unsigned integer real values
-    case CUPHY_R_16F: return sizeof(data_type_traits<CUPHY_R_16F>::type); // half precision (16-bit) real values
-    case CUPHY_C_16F: return sizeof(data_type_traits<CUPHY_C_16F>::type); // half precision (16-bit) complex values
-    case CUPHY_R_32F: return sizeof(data_type_traits<CUPHY_R_32F>::type); // single precision (32-bit) real values
-    case CUPHY_C_32F: return sizeof(data_type_traits<CUPHY_C_32F>::type); // single precision (32-bit) complex values
-    case CUPHY_R_64F: return sizeof(data_type_traits<CUPHY_R_64F>::type); // double precision (64-bit) real values
-    case CUPHY_C_64F: return sizeof(data_type_traits<CUPHY_C_64F>::type); // double precision (64-bit) complex values
+    case CUPHY_VOID:      return 0;                                               // uninitialized type
+    case CUPHY_BIT:       return sizeof(data_type_traits<CUPHY_BIT>::type);       // 1-bit value - special handling for sub-byte types
+    case CUPHY_R_8I:      return sizeof(data_type_traits<CUPHY_R_8I>::type);      // 8-bit signed integer real values
+    case CUPHY_C_8I:      return sizeof(data_type_traits<CUPHY_C_8I>::type);      // 8-bit signed integer complex values
+    case CUPHY_R_8U:      return sizeof(data_type_traits<CUPHY_R_8U>::type);      // 8-bit unsigned integer real values
+    case CUPHY_C_8U:      return sizeof(data_type_traits<CUPHY_C_8U>::type);      // 8-bit unsigned integer real values
+    case CUPHY_R_16I:     return sizeof(data_type_traits<CUPHY_R_16I>::type);     // 16-bit signed integer real values
+    case CUPHY_C_16I:     return sizeof(data_type_traits<CUPHY_C_16I>::type);     // 16-bit signed integer real values
+    case CUPHY_R_16U:     return sizeof(data_type_traits<CUPHY_R_16U>::type);     // 16-bit unsigned integer real values
+    case CUPHY_C_16U:     return sizeof(data_type_traits<CUPHY_C_16U>::type);     // 16-bit unsigned integer real values
+    case CUPHY_R_32I:     return sizeof(data_type_traits<CUPHY_R_32I>::type);     // 32-bit signed integer real values
+    case CUPHY_C_32I:     return sizeof(data_type_traits<CUPHY_C_32I>::type);     // 32-bit signed integer real values
+    case CUPHY_R_32U:     return sizeof(data_type_traits<CUPHY_R_32U>::type);     // 32-bit unsigned integer real values
+    case CUPHY_C_32U:     return sizeof(data_type_traits<CUPHY_C_32U>::type);     // 32-bit unsigned integer real values
+    case CUPHY_R_16F:     return sizeof(data_type_traits<CUPHY_R_16F>::type);     // half precision (16-bit) real values
+    case CUPHY_C_16F:     return sizeof(data_type_traits<CUPHY_C_16F>::type);     // half precision (16-bit) complex values
+    case CUPHY_R_32F:     return sizeof(data_type_traits<CUPHY_R_32F>::type);     // single precision (32-bit) real values
+    case CUPHY_C_32F:     return sizeof(data_type_traits<CUPHY_C_32F>::type);     // single precision (32-bit) complex values
+    case CUPHY_R_64F:     return sizeof(data_type_traits<CUPHY_R_64F>::type);     // double precision (64-bit) real values
+    case CUPHY_C_64F:     return sizeof(data_type_traits<CUPHY_C_64F>::type);     // double precision (64-bit) complex values
+    case CUPHY_R_8F_E4M3: return sizeof(data_type_traits<CUPHY_R_8F_E4M3>::type); // fp8 (1 sign, 4 exponent, 3 mantissa bits)
+    case CUPHY_R_8F_E5M2: return sizeof(data_type_traits<CUPHY_R_8F_E5M2>::type); // fp8 (1 sign, 5 exponent, 2 mantissa bits)
     }
     // clang-format on
 }

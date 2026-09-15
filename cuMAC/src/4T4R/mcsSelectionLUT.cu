@@ -16,14 +16,10 @@
  */
 
 #include "cumac.h"
+#include "common/schedulerTimeMeasure.h"
 
 // cuMAC namespace
 namespace cumac {
-
-// #define SCHEDULER_KERNEL_TIME_MEASURE_ 
-#ifdef SCHEDULER_KERNEL_TIME_MEASURE_
-constexpr uint16_t numRunSchKnlTimeMsr = 1000;
-#endif
 
 static __device__ __constant__ float L1T1B024GPU[28] = {-4.57, -3.02, -0.6, 1.26, 2.87, 4.89, 5.9, 6.67, 7.72, 8.41, 9.36, 10.56, 11.65, 12.64, 13.23, 14.25, 15.23, 16.14, 16.72, 17.79, 19.19, 19.65, 20.95, 21.75, 22.6, 23.91, 24.38, 25.99};
 static __device__ __constant__ float L1T1B050PRGS01_GTC25GPU[28] = {-4.3, -2.44, -0.46, 1.24, 2.94, 4.89, 5.72, 6.84, 7.67, 8.67, 9.23, 10.48, 11.49, 12.37, 13.42, 14.43, 15.04, 16.0, 16.98, 18.03, 19.24, 19.88, 20.74, 21.71, 22.94, 23.5, 24.98, 26.08};

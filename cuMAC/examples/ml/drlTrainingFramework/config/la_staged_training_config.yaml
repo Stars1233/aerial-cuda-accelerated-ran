@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The complete curriculum: teacher cloning -> optional bootstrap -> critic
+# warmup -> PPO fine-tuning. This is the file to train with; the base config it
+# inherits from stops after cloning.
+#
+# Checkpoint selection runs after cloning, after the bootstrap when it is
+# enabled, and again after PPO. Each candidate drives its own held-out rollout
+# of checkpoint_selection_steps slots and is ranked by expected cell spectral
+# efficiency. The winner is loaded into the live policy and becomes the
+# starting point of the next phase, so a phase can never hand its successor a
+# worse policy than one it already had.
+#
+# No selection runs after critic warmup: the actor is frozen there, so every
+# candidate scores identically on a policy-driven rollout.
+#
+# Only the differences from the cloning default are listed below.
+
+base: la_training_config.yaml
+
+runtime:
+  training_mode: full
+  output_dir: runs/drl_la_staged
+  log_every: 100
+
+clone:
+  # Cloning is initialization here, not a policy in its own right, so it stops
+  # where it stops improving. On the reference configuration, teacher agreement
+  # reached 99% of its final value within the first thousand updates, peaked
+  # around update 3000, then decayed while the loss drifted back up. The last
+  # several thousand updates cost simulator slots and hand the next phase a
+  # worse actor than update 2000 did. Re-measure this on your own simulator by
+  # enabling validation and watching teacher_action_match.
+  #
+  # A cloned actor cannot be deployed regardless of how long this runs. Its
+  # labels come from the perfect-information teacher, which reads the realized
+  # channel, while its inputs are built from the estimate alone. Imitating it
+  # therefore teaches an aggression the student has no information to justify,
+  # which is why closed-loop BLER lands well above target despite ~90% action
+  # agreement. PPO is what closes that gap.
+  clone_updates: 2000
+  # One labelled slot funds sixteen gradient steps. A simulator slot costs
+  # orders of magnitude more than a gradient step, so the default of 1 spends
+  # all of cloning in the simulator: 2000 slots rather than 125. At 16 the
+  # replay buffer still decorrelates the batch enough to reach the same teacher
+  # agreement. Tune this to your own slot cost.
+  clone_collect_every: 16
+
+bootstrap:
+  # Off by default. Cloning, critic warmup and PPO already cover the imitation
+  # gap; the bootstrap is the knob to reach for when the cloned policy collapses
+  # as soon as PPO starts sampling its own states.
+  bootstrap_enabled: false
+
+checkpointing:
+  clone_checkpoint_every: 1000
+  ppo_checkpoint_every: 500
+  critic_checkpoint_every: 250
+  checkpoint_every: 2000
+  checkpoint_selection_steps: 500
+
+validation:
+  validation_every: 2000
+  validation_steps: 100
+  # Sized by the outer-loop reference, not by feedback age. reset() zeroes every
+  # age, which one reporting period clears, but the outer loop starts at
+  # olla_initial_offset_db and steps 1 dB per NACK, so it needs on the order of
+  # a hundred slots to walk down to its operating point. Scoring it before then
+  # measures a converging loop rather than the baseline.
+  validation_warmup_slots: 100

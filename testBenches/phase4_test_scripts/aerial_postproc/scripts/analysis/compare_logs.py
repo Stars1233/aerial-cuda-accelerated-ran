@@ -1069,6 +1069,107 @@ def get_compare_logs_fig(args, df_ti_list,df_testmac_list,df_l2_list,df_gpu_list
         ccdf_fig = ccdf_comparison(df_testmac_list,'start_deadline',title=title,xlabel=deadline_label)
         fig_list.append(row(column(legend_fig,fig),column(legend_fig,ccdf_fig)))
 
+        # TestMAC per-FAPI-message first/last send times (DL_TTI.req, TX_DATA.req, UL_TTI.req).
+        # Only when -f/--per-fapi-timing is set; backward compatible (old logs lack these fields).
+        # Exclude sentinel 0 (logged when message not sent or deadline disabled) to avoid huge negative deadlines and wrong Y-scale.
+        enable_per_fapi = getattr(args, 'per_fapi_timing', False)
+        df_testmac_dl_tti_start_list = []
+        df_testmac_dl_tti_end_list = []
+        for df_testmac in df_testmac_list:
+            if 'dl_tti_start_timestamp' in df_testmac.columns and 'dl_tti_stop_timestamp' in df_testmac.columns:
+                valid = (df_testmac['dl_tti_start_timestamp'].notna() & (df_testmac['dl_tti_start_timestamp'] > 0) &
+                         df_testmac['dl_tti_stop_timestamp'].notna() & (df_testmac['dl_tti_stop_timestamp'] > 0))
+                if valid.any():
+                    df_start = df_testmac.loc[valid, ['slot']].copy()
+                    df_start['start_deadline'] = (df_testmac.loc[valid, 'dl_tti_start_timestamp'].values - df_testmac.loc[valid, 't0_timestamp'].values) / 1e3
+                    df_end = df_testmac.loc[valid, ['slot']].copy()
+                    df_end['end_deadline'] = (df_testmac.loc[valid, 'dl_tti_stop_timestamp'].values - df_testmac.loc[valid, 't0_timestamp'].values) / 1e3
+                    df_testmac_dl_tti_start_list.append(df_start)
+                    df_testmac_dl_tti_end_list.append(df_end)
+                else:
+                    df_testmac_dl_tti_start_list.append(pd.DataFrame(columns=['slot', 'start_deadline']))
+                    df_testmac_dl_tti_end_list.append(pd.DataFrame(columns=['slot', 'end_deadline']))
+            else:
+                df_testmac_dl_tti_start_list.append(pd.DataFrame(columns=['slot', 'start_deadline']))
+                df_testmac_dl_tti_end_list.append(pd.DataFrame(columns=['slot', 'end_deadline']))
+        if enable_per_fapi and any(len(df) > 0 for df in df_testmac_dl_tti_start_list):
+            title = "TestMAC DL_TTI.req Last Send Times"
+            fig = whisker_comparison(df_testmac_dl_tti_end_list, 'end_deadline', ['slot', 'file_index'],
+                                    title=title, ylabel='TestMAC DL_TTI.req Last Send (usec)')
+            ccdf_fig = ccdf_comparison(df_testmac_dl_tti_end_list, 'end_deadline', title=title, xlabel=deadline_label)
+            fig_list.append(row(column(legend_fig, fig), column(legend_fig, ccdf_fig)))
+            title = "TestMAC DL_TTI.req First Send Times"
+            fig = whisker_comparison(df_testmac_dl_tti_start_list, 'start_deadline', ['slot', 'file_index'],
+                                    title=title, ylabel='TestMAC DL_TTI.req First Send (usec)')
+            ccdf_fig = ccdf_comparison(df_testmac_dl_tti_start_list, 'start_deadline', title=title, xlabel=deadline_label)
+            fig_list.append(row(column(legend_fig, fig), column(legend_fig, ccdf_fig)))
+
+        # TestMAC TX_DATA.req first/last send times (exclude sentinel 0 for correct Y-scale)
+        df_testmac_tx_data_start_list = []
+        df_testmac_tx_data_end_list = []
+        for df_testmac in df_testmac_list:
+            if 'tx_data_start_timestamp' in df_testmac.columns and 'tx_data_stop_timestamp' in df_testmac.columns:
+                valid = (df_testmac['tx_data_start_timestamp'].notna() & (df_testmac['tx_data_start_timestamp'] > 0) &
+                         df_testmac['tx_data_stop_timestamp'].notna() & (df_testmac['tx_data_stop_timestamp'] > 0))
+                if valid.any():
+                    df_start = df_testmac.loc[valid, ['slot']].copy()
+                    df_start['start_deadline'] = (df_testmac.loc[valid, 'tx_data_start_timestamp'].values - df_testmac.loc[valid, 't0_timestamp'].values) / 1e3
+                    df_end = df_testmac.loc[valid, ['slot']].copy()
+                    df_end['end_deadline'] = (df_testmac.loc[valid, 'tx_data_stop_timestamp'].values - df_testmac.loc[valid, 't0_timestamp'].values) / 1e3
+                    df_testmac_tx_data_start_list.append(df_start)
+                    df_testmac_tx_data_end_list.append(df_end)
+                else:
+                    df_testmac_tx_data_start_list.append(pd.DataFrame(columns=['slot', 'start_deadline']))
+                    df_testmac_tx_data_end_list.append(pd.DataFrame(columns=['slot', 'end_deadline']))
+            else:
+                df_testmac_tx_data_start_list.append(pd.DataFrame(columns=['slot', 'start_deadline']))
+                df_testmac_tx_data_end_list.append(pd.DataFrame(columns=['slot', 'end_deadline']))
+        if enable_per_fapi and any(len(df) > 0 for df in df_testmac_tx_data_start_list):
+            title = "TestMAC TX_DATA.req Last Send Times"
+            fig = whisker_comparison(df_testmac_tx_data_end_list, 'end_deadline', ['slot', 'file_index'],
+                                    title=title, ylabel='TestMAC TX_DATA.req Last Send (usec)')
+            ccdf_fig = ccdf_comparison(df_testmac_tx_data_end_list, 'end_deadline', title=title, xlabel=deadline_label)
+            fig_list.append(row(column(legend_fig, fig), column(legend_fig, ccdf_fig)))
+            title = "TestMAC TX_DATA.req First Send Times"
+            fig = whisker_comparison(df_testmac_tx_data_start_list, 'start_deadline', ['slot', 'file_index'],
+                                    title=title, ylabel='TestMAC TX_DATA.req First Send (usec)')
+            ccdf_fig = ccdf_comparison(df_testmac_tx_data_start_list, 'start_deadline', title=title, xlabel=deadline_label)
+            fig_list.append(row(column(legend_fig, fig), column(legend_fig, ccdf_fig)))
+
+        # TestMAC UL_TTI.req first/last send times (exclude sentinel 0 for correct Y-scale)
+        df_testmac_ul_tti_start_list = []
+        df_testmac_ul_tti_end_list = []
+        for df_testmac in df_testmac_list:
+            if 'ul_tti_start_timestamp' in df_testmac.columns and 'ul_tti_stop_timestamp' in df_testmac.columns:
+                valid = (df_testmac['ul_tti_start_timestamp'].notna() & (df_testmac['ul_tti_start_timestamp'] > 0) &
+                         df_testmac['ul_tti_stop_timestamp'].notna() & (df_testmac['ul_tti_stop_timestamp'] > 0))
+                if valid.any():
+                    df_start = df_testmac.loc[valid, ['slot']].copy()
+                    df_start['start_deadline'] = (df_testmac.loc[valid, 'ul_tti_start_timestamp'].values - df_testmac.loc[valid, 't0_timestamp'].values) / 1e3
+                    df_end = df_testmac.loc[valid, ['slot']].copy()
+                    df_end['end_deadline'] = (df_testmac.loc[valid, 'ul_tti_stop_timestamp'].values - df_testmac.loc[valid, 't0_timestamp'].values) / 1e3
+                    df_testmac_ul_tti_start_list.append(df_start)
+                    df_testmac_ul_tti_end_list.append(df_end)
+                else:
+                    df_testmac_ul_tti_start_list.append(pd.DataFrame(columns=['slot', 'start_deadline']))
+                    df_testmac_ul_tti_end_list.append(pd.DataFrame(columns=['slot', 'end_deadline']))
+            else:
+                df_testmac_ul_tti_start_list.append(pd.DataFrame(columns=['slot', 'start_deadline']))
+                df_testmac_ul_tti_end_list.append(pd.DataFrame(columns=['slot', 'end_deadline']))
+        if enable_per_fapi and any(len(df) > 0 for df in df_testmac_ul_tti_start_list):
+            title = "TestMAC UL_TTI.req Last Send Times"
+            fig = whisker_comparison(df_testmac_ul_tti_end_list, 'end_deadline', ['slot', 'file_index'],
+                                    title=title, ylabel='TestMAC UL_TTI.req Last Send (usec)')
+            ccdf_fig = ccdf_comparison(df_testmac_ul_tti_end_list, 'end_deadline', title=title, xlabel=deadline_label)
+            fig_list.append(row(column(legend_fig, fig), column(legend_fig, ccdf_fig)))
+            title = "TestMAC UL_TTI.req First Send Times"
+            fig = whisker_comparison(df_testmac_ul_tti_start_list, 'start_deadline', ['slot', 'file_index'],
+                                    title=title, ylabel='TestMAC UL_TTI.req First Send (usec)')
+            ccdf_fig = ccdf_comparison(df_testmac_ul_tti_start_list, 'start_deadline', title=title, xlabel=deadline_label)
+            fig_list.append(row(column(legend_fig, fig), column(legend_fig, ccdf_fig)))
+
+        if enable_per_fapi and not any(len(df) > 0 for df in df_testmac_dl_tti_start_list + df_testmac_tx_data_start_list + df_testmac_ul_tti_start_list):
+            print("Warning: -f/--per-fapi-timing was set but testMAC log(s) lack per-FAPI-message timing fields (or have no valid rows). Skipping per-FAPI plots. Re-run with a testMAC build that logs dl_tti_start/stop, tx_data_start/stop, ul_tti_start/stop in [MAC.PROCESSING_TIMES].")
 
     if(HAS_TICK_TIMES and enable_l2a_timeline):
         title = "Tick CPU Times"
@@ -1319,6 +1420,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-e", "--mmimo_enable", action="store_true", help="Modifies timeline requirement to mmimo settings"
+    )
+    parser.add_argument(
+        "-f", "--per-fapi-timing", action="store_true", dest="per_fapi_timing",
+        help="Enable per-FAPI-message plots (DL_TTI.req, TX_DATA.req, UL_TTI.req). Requires testMAC log with per-message timing fields."
     )
     args = parser.parse_args()
 

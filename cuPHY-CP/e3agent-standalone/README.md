@@ -38,10 +38,12 @@ All commands run from `cuPHY-CP/e3agent-standalone/`.
 ### 1. Build and run
 
 ```bash
-./restart_e3agent_standalone.sh
+./restart_e3agent_standalone.sh              # start (reuses the image; builds it the first time)
+./restart_e3agent_standalone.sh -b           # rebuild after C++ or staged data_lake changes
+./restart_e3agent_standalone.sh -c my.yaml   # start with a specific config
 ```
 
-This stages the aerial sources, builds the Docker image, and starts the `e3agent-standalone` container with shared memory and the E3AP ports. Press Ctrl+C to stop. Edit `config/e3agent-standalone.example.yaml` first (see [Configuration](#configuration)) to pick the mode and settings; for `replay` mode, generate a trace beforehand (see [Data generation](#data-generation)).
+This starts the `e3agent-standalone` container with shared memory and E3AP ports. `config/` and `data/` are mounted, so config- or trace-only edits require no rebuild. Press Ctrl+C to stop. Edit `config/e3agent-standalone.example.yaml` first (see [Configuration](#configuration)) to pick the mode and settings; for `replay` mode, generate a trace beforehand (see [Data generation](#data-generation)).
 
 ### 2. Attach a dApp
 
@@ -61,7 +63,7 @@ Single file, `config/e3agent-standalone.example.yaml`. `mode` picks the active b
 * **agent**: E3AP ZMQ ports `rep_port`/`pub_port`/`sub_port` (REP/PUB/SUB sockets), mirroring cuphycontroller.
 * **rows**: shared memory ring depths per buffer.
 * **cpu.feeder_core**: pins the feeder threads; use an isolated core for jitter free synth, or `-1` for none.
-* **synth**: a built-in generator that needs no database or capture. It ticks a slot clock (`slot_tick_us`) and, on each uplink slot, fills the PUSCH, SRS, and FH buffers with deterministic metrics and simple patterned channel estimates and IQ. `tdd_pattern` sets which slots are uplink, `srs_periodicity_ms` how often SRS appears, and `duration_slots` how long to run (`0` = forever). It also fills `ts_tai`, so the dApp sees the same timing as replay. Useful for exercising the full subscription, indication, and inference path; the IQ itself is not physically meaningful.
+* **synth**: a built-in generator that needs no database or capture. It ticks a slot clock (`slot_tick_us`) and, on each uplink slot, fills the PUSCH, SRS, and FH buffers with deterministic metrics and simple patterned channel estimates and IQ. `tdd_pattern` sets which slots are uplink, `srs_periodicity_ms` how often SRS appears, `duration_slots` how long to run (`0` = forever), and `n_cells` how many cells each slot carries (`1..40`; each ring must hold at least `n_cells` rows). It also fills `ts_tai`, so the dApp sees the same timing as replay. Useful for exercising the full subscription, indication, and inference path; the IQ itself is not physically meaningful.
 * **replay**: `path`, `loops` (0 loops forever; pacing follows recorded `ts_tai`).
 
 ## Data generation
@@ -78,6 +80,7 @@ python3 scripts/clickhouse_to_trace.py -o data/session.trace --limit 600
 Useful flags:
 
 * `--streams`/`-s`: data types to include (`fh,pusch,hest,srs_iq,srs,srs_hest`, default `all`).
+* `--cells`/`-c`: CellId subset to include (default `all`, e.g. `51,52`); all cells of a slot are kept together.
 * `--limit`/`-l`: cap the trace to the first N slot timestamps across the selected PUSCH/SRS streams.
 * `--since`/`--until`: window by wall-clock time, `'YYYY-MM-DD HH:MM:SS'` in the ClickHouse server timezone (typically UTC), e.g. `--since '2026-06-23 14:00:00' --until '2026-06-23 14:05:00'`.
 
@@ -86,4 +89,5 @@ plus the usual ClickHouse connection flags. Then set `mode: replay` and point `r
 ## Notes
 
 * **Drift guard**: `check_drift.py` runs on every build and fails if the vendored `e3_types.hpp` diverges from the canonical `aerial_sdk` structs. Disable with `-DE3SA_CHECK_DRIFT=OFF` for fast local iteration.
-* **Numerology**: fixed mu=1 (500 us slot, 20 slots/frame), single cell.
+* **Numerology**: fixed mu=1 (500 us slot, 20 slots/frame).
+* **Multi cell**: synth emits `synth.n_cells` cells per slot, and replay regroups the per-cell trace records that share a `ts_tai` into one multi-cell indication. More cells widen each slot, so size `rows` accordingly.

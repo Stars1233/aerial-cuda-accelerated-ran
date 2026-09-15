@@ -21,11 +21,14 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "constant.hpp"
-#include "cuphydriver_api.hpp"
-#include "phychannel.hpp"
+#include "compression_types.hpp"       // compression_params, mod_compression_params, CleanupDlBufInfo
+#include "aerial-fh-driver/api.hpp"    // aerial_fh::UserDataCompressionMethod
+#include "cuda_driver_utils/cuda_driver_utils.hpp"  // CUDA_DRIVER_CHECK
 #include "gpu_blockFP.h" //Compression Decompression repo
 #include "gpu_fixed.h"
 #include "comp_kernel.cuh"
+#include "generic_kernel_functions.hpp"
+#include "cuda_driver_utils/cuda_kernel_utils.cuh"  // resolve_kernel_func (must be before extern "C" block)
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,21 +57,16 @@ __global__ void print_hexbytes(uint8_t* addr, int offset, int num_bytes)
     }
 }
 
-void launch_kernel_print_hex(cudaStream_t stream, uint8_t* addr, int offset, int num_bytes)
+void launch_kernel_print_hex(const CUfunction func, const cudaStream_t stream, uint8_t* addr, int offset, int num_bytes)
 {
-    cudaError_t result = cudaSuccess;
-
     if(!addr)
     {
         NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "addr is NULL");
         return;
     }
 
-    print_hexbytes<<<1, 1, 0, stream>>>(addr, offset, num_bytes);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&addr, &offset, &num_bytes};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
 }
 
 __global__ void kernel_write(uint32_t* addr, uint32_t value)
@@ -76,10 +74,8 @@ __global__ void kernel_write(uint32_t* addr, uint32_t value)
     ACCESS_ONCE(*addr) = value;
 }
 
-void launch_kernel_write(cudaStream_t stream, uint32_t* addr, uint32_t value)
+void launch_kernel_write(const CUfunction func, const cudaStream_t stream, uint32_t* addr, uint32_t value)
 {
-    cudaError_t result = cudaSuccess;
-
     if(!addr)
     {
         NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "addr is NULL");
@@ -87,11 +83,8 @@ void launch_kernel_write(cudaStream_t stream, uint32_t* addr, uint32_t value)
     }
     MemtraceDisableScope md;
 
-    kernel_write<<<1, 1, 0, stream>>>(addr, value);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&addr, &value};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
 }
 
 __global__ void kernel_read(uint8_t* addr)
@@ -100,36 +93,25 @@ __global__ void kernel_read(uint8_t* addr)
     printf("2048) %x - 2049) %x - 2050) %x\n", addr[0], addr[1], addr[2]);
 }
 
-void launch_kernel_read(cudaStream_t stream, uint8_t* addr)
+void launch_kernel_read(const CUfunction func, const cudaStream_t stream, uint8_t* addr)
 {
-    cudaError_t result = cudaSuccess;
-
     if(!addr)
     {
         NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "addr is NULL");
         return;
     }
 
-    kernel_read<<<1, 1, 0, stream>>>(addr);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&addr};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
 }
 __global__ void warmup_kernel()
 {
     __threadfence();
 }
 
-void launch_kernel_warmup(cudaStream_t stream)
+void launch_kernel_warmup(const CUfunction func, const cudaStream_t stream)
 {
-    cudaError_t result = cudaSuccess;
-
-    warmup_kernel<<<1, 512, 0, stream>>>();
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 512, 1, 1, 0, stream, nullptr, nullptr));
 }
 
 __global__ void kernel_wait_update(uint32_t* addr, uint32_t expected, uint32_t updated)
@@ -141,15 +123,10 @@ __global__ void kernel_wait_update(uint32_t* addr, uint32_t expected, uint32_t u
     __threadfence();
 }
 
-void launch_kernel_wait_update(cudaStream_t stream, uint32_t* addr, uint32_t expected, uint32_t updated)
+void launch_kernel_wait_update(const CUfunction func, const cudaStream_t stream, uint32_t* addr, uint32_t expected, uint32_t updated)
 {
-    cudaError_t result = cudaSuccess;
-
-    kernel_wait_update<<<1, 1, 0, stream>>>(addr, expected, updated);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&addr, &expected, &updated};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
 }
 
 __global__ void kernel_wait_eq(uint32_t* addr, uint32_t value)
@@ -158,15 +135,10 @@ __global__ void kernel_wait_eq(uint32_t* addr, uint32_t value)
     __threadfence();
 }
 
-void launch_kernel_wait_eq(cudaStream_t stream, uint32_t* addr, uint32_t value)
+void launch_kernel_wait_eq(const CUfunction func, const cudaStream_t stream, uint32_t* addr, uint32_t value)
 {
-    cudaError_t result = cudaSuccess;
-
-    kernel_wait_eq<<<1, 1, 0, stream>>>(addr, value);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&addr, &value};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
 }
 
 __global__ void kernel_wait_neq(uint32_t* addr, uint32_t value)
@@ -175,15 +147,10 @@ __global__ void kernel_wait_neq(uint32_t* addr, uint32_t value)
     __threadfence();
 }
 
-void launch_kernel_wait_neq(cudaStream_t stream, uint32_t* addr, uint32_t value)
+void launch_kernel_wait_neq(const CUfunction func, const cudaStream_t stream, uint32_t* addr, uint32_t value)
 {
-    cudaError_t result = cudaSuccess;
-
-    kernel_wait_neq<<<1, 1, 0, stream>>>(addr, value);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&addr, &value};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
 }
 
 __global__ void kernel_wait_geq(uint32_t* addr, uint32_t value)
@@ -192,15 +159,10 @@ __global__ void kernel_wait_geq(uint32_t* addr, uint32_t value)
     __threadfence();
 }
 
-void launch_kernel_wait_geq(cudaStream_t stream, uint32_t* addr, uint32_t value)
+void launch_kernel_wait_geq(const CUfunction func, const cudaStream_t stream, uint32_t* addr, uint32_t value)
 {
-    cudaError_t result = cudaSuccess;
-
-    kernel_wait_geq<<<1, 1, 0, stream>>>(addr, value);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&addr, &value};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 1, 1, 1, 0, stream, args, nullptr));
 }
 
 __global__ void kernel_compare(uint8_t* addr1, uint8_t* addr2, int size)
@@ -221,15 +183,10 @@ __global__ void kernel_compare(uint8_t* addr1, uint8_t* addr2, int size)
     __threadfence();
 }
 
-void launch_kernel_compare(cudaStream_t stream, uint8_t* addr1, uint8_t* addr2, int size)
+void launch_kernel_compare(const CUfunction func, const cudaStream_t stream, uint8_t* addr1, uint8_t* addr2, int size)
 {
-    cudaError_t result = cudaSuccess;
-
-    kernel_compare<<<1, 512, 0, stream>>>(addr1, addr2, size);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&addr1, &addr2, &size};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, 512, 1, 1, 0, stream, args, nullptr));
 }
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// CRC error count on the GPU
@@ -256,33 +213,24 @@ __global__ void kernel_check_crc(const uint32_t* i_buf, size_t i_elems, uint32_t
     }
 }
 
-void launch_kernel_check_crc(cudaStream_t stream, const uint32_t* i_buf, size_t i_elems, uint32_t* out)
+void launch_kernel_check_crc(const CUfunction func, const cudaStream_t stream, const uint32_t* i_buf, size_t i_elems, uint32_t* out)
 {
-    cudaError_t result = cudaSuccess;
-    result             = cudaGetLastError();
-
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
-
-    kernel_check_crc<<<1, CRC_THREADS, sizeof(uint32_t) * 1, stream>>>(i_buf, i_elems, out);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&i_buf, &i_elems, &out};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, 1, 1, 1, CRC_THREADS, 1, 1, sizeof(uint32_t) * 1, stream, args, nullptr));
 }
 
 void launch_kernel_compression(
+    const CompressionKernelFunctions& comp,
     cudaStream_t stream,
     const std::array<compression_params, NUM_USER_DATA_COMPRESSION_METHODS>& cparams_array)
 {
-    cudaError_t result = cudaSuccess;
     MemtraceDisableScope md;
 
     // Process each compression method that has cells
     for(std::size_t comp_method = 0; comp_method < NUM_USER_DATA_COMPRESSION_METHODS; ++comp_method)
     {
         const compression_params& params = cparams_array[comp_method];
-        
+
         // Skip if no cells for this compression method
         if(params.num_cells == 0)
             continue;
@@ -295,40 +243,37 @@ void launch_kernel_compression(
             case aerial_fh::UserDataCompressionMethod::NO_COMPRESSION:
             case aerial_fh::UserDataCompressionMethod::BLOCK_FLOATING_POINT:
             {
-                dim3 blocks(*max_antennas, params.num_cells, SLOT_NUM_SYMS);
+                dim3 grid(*max_antennas, params.num_cells, SLOT_NUM_SYMS);
 
-                // If all cells have the same compression bit_width, we can specialize the kernel
                 const auto first_bfp = params.bit_width[0];
                 const bool const_bfp = std::all_of(
                     params.bit_width,
                     params.bit_width + params.num_cells,
                     [first_bfp](decltype(first_bfp) bw) { return bw == first_bfp; }
                 );
-            
+
+                // If all cells have the same compression bit_width, we can specialize the kernel
+                CUfunction chosen{};
                 if(const_bfp && first_bfp == 9)
-                {
-                    kernel_compress<9><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
-                }
+                    chosen = comp.compress_9;
                 else if(const_bfp && first_bfp == 14)
-                {
-                    kernel_compress<14><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
-                }
+                    chosen = comp.compress_14;
                 else if(const_bfp && first_bfp == 16)
-                {
-                    kernel_compress<16><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
-                }
+                    chosen = comp.compress_16;
                 else // Otherwise use the non-specialized kernel
-                {
-                    kernel_compress<0><<<blocks, COMPRESSION_THREADS, 0, stream>>>(params);
-                }
+                    chosen = comp.compress_0;
+
+                void* args[] = {const_cast<compression_params*>(&params)};
+                CUDA_DRIVER_CHECK(cuLaunchKernel(chosen, grid.x, grid.y, grid.z, COMPRESSION_THREADS, 1, 1, 0, stream, args, nullptr));
                 break;
             }
             case aerial_fh::UserDataCompressionMethod::MODULATION_COMPRESSION:
             {
                 const int nwarps = 2;
-                dim3 threads(32, nwarps, SLOT_NUM_SYMS);
-                dim3 blocks_mod((MAX_SECTIONS_PER_UPLANE_SYMBOL + nwarps - 1)/nwarps , *max_antennas, params.num_cells);
-                kernel_mod_compression<QAM_Comp><<<blocks_mod, threads, 0, stream>>>(params);
+                dim3 grid((MAX_SECTIONS_PER_UPLANE_SYMBOL + nwarps - 1) / nwarps, *max_antennas, params.num_cells);
+                dim3 block(32, nwarps, SLOT_NUM_SYMS);
+                void* args[] = {const_cast<compression_params*>(&params)};
+                CUDA_DRIVER_CHECK(cuLaunchKernel(comp.mod_compression_qam, grid.x, grid.y, grid.z, block.x, block.y, block.z, 0, stream, args, nullptr));
                 break;
             }
             default:
@@ -336,11 +281,6 @@ void launch_kernel_compression(
                 NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Compression method {} not implemented", comp_method);
                 break;
         }
-
-        result = cudaGetLastError();
-        if(cudaSuccess != result)
-            NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} for compression method {}", 
-                __FILE__, __LINE__, cudaGetErrorString(result), comp_method);
     }
 }
 
@@ -358,15 +298,10 @@ __global__ void kernel_copy(uint8_t* input_buffer, uint8_t* output_buffer, int b
     }
 }
 
-void launch_kernel_copy(cudaStream_t stream, uint8_t* input_buffer, uint8_t* output_buffer, int bytes)
+void launch_kernel_copy(const CUfunction func, const cudaStream_t stream, uint8_t* input_buffer, uint8_t* output_buffer, int bytes)
 {
-    cudaError_t result = cudaSuccess;
-
-    kernel_copy<<<COPY_BLOCKS, COPY_THREADS, 0, stream>>>(input_buffer, output_buffer, bytes);
-
-    result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&input_buffer, &output_buffer, &bytes};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, COPY_BLOCKS, 1, 1, COPY_THREADS, 1, 1, 0, stream, args, nullptr));
 }
 
 __global__ void memset_kernel(void* d_buffers) {
@@ -390,15 +325,13 @@ __global__ void memset_kernel(void* d_buffers) {
     }
 }
 
-void launch_memset_kernel(void* d_buffers_addr, int num_cells, size_t max_buffer_size, cudaStream_t strm) {
+void launch_memset_kernel(const CUfunction func, void* d_buffers_addr, int num_cells, size_t max_buffer_size, const cudaStream_t strm) {
 
     int num_threads = 1024;
     // max_buffer_size is in bytes
     int blocks = (max_buffer_size + sizeof(uint4)*num_threads - 1) / (sizeof(uint4)*num_threads);
-    memset_kernel<<<dim3(blocks, num_cells), num_threads, 0, strm>>>(d_buffers_addr);
-    cudaError_t result = cudaGetLastError();
-    if(cudaSuccess != result)
-        NVLOGE_FMT(TAG, AERIAL_CUDA_KERNEL_EVENT, "[{}:{}] cuda failed with {} ", __FILE__, __LINE__, cudaGetErrorString(result));
+    void* args[] = {&d_buffers_addr};
+    CUDA_DRIVER_CHECK(cuLaunchKernel(func, blocks, num_cells, 1, num_threads, 1, 1, 0, strm, args, nullptr));
 }
 
 void force_loading_generic_cuda_kernels()
@@ -430,6 +363,62 @@ void force_loading_generic_cuda_kernels()
 
 }
 
+bool resolve_warmup_kernel_handle(CUfunction* out)
+{
+    return resolve_kernel_func<TAG>(out, reinterpret_cast<const void*>(warmup_kernel), "warmup_kernel");
+}
+
+bool resolve_kernel_write_handle(CUfunction* out)
+{
+    return resolve_kernel_func<TAG>(out, reinterpret_cast<const void*>(kernel_write), "kernel_write");
+}
+
+bool resolve_kernel_wait_eq_handle(CUfunction* out)
+{
+    return resolve_kernel_func<TAG>(out, reinterpret_cast<const void*>(kernel_wait_eq), "kernel_wait_eq");
+}
+
+bool resolve_memset_kernel_handle(CUfunction* out)
+{
+    return resolve_kernel_func<TAG>(out, reinterpret_cast<const void*>(memset_kernel), "memset_kernel");
+}
+
+bool resolve_compression_kernel_handles(CompressionKernelFunctions& out)
+{
+    bool ok = true;
+    ok &= resolve_kernel_func<TAG>(&out.compress_0,              reinterpret_cast<const void*>(kernel_compress<0>),              "kernel_compress<0>");
+    ok &= resolve_kernel_func<TAG>(&out.compress_9,              reinterpret_cast<const void*>(kernel_compress<9>),              "kernel_compress<9>");
+    ok &= resolve_kernel_func<TAG>(&out.compress_14,             reinterpret_cast<const void*>(kernel_compress<14>),             "kernel_compress<14>");
+    ok &= resolve_kernel_func<TAG>(&out.compress_16,             reinterpret_cast<const void*>(kernel_compress<16>),             "kernel_compress<16>");
+    ok &= resolve_kernel_func<TAG>(&out.mod_compression_qam,     reinterpret_cast<const void*>(kernel_mod_compression<QAM_Comp>), "kernel_mod_compression<QAM_Comp>");
+    return ok;
+}
+
 #ifdef __cplusplus
 }
 #endif
+
+bool init_generic_cuda_kernel_functions(GenericCudaKernelFunctions& funcs)
+{
+    bool ok = true;
+    ok &= resolve_kernel_func<TAG>(&funcs.print_complex_fp16, reinterpret_cast<const void*>(print_complex_fp16), "print_complex_fp16");
+    ok &= resolve_kernel_func<TAG>(&funcs.print_hexbytes,     reinterpret_cast<const void*>(print_hexbytes),     "print_hexbytes");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_write,       reinterpret_cast<const void*>(kernel_write),       "kernel_write");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_read,        reinterpret_cast<const void*>(kernel_read),        "kernel_read");
+    ok &= resolve_kernel_func<TAG>(&funcs.warmup_kernel,      reinterpret_cast<const void*>(warmup_kernel),      "warmup_kernel");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_wait_update, reinterpret_cast<const void*>(kernel_wait_update), "kernel_wait_update");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_wait_eq,     reinterpret_cast<const void*>(kernel_wait_eq),     "kernel_wait_eq");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_wait_neq,    reinterpret_cast<const void*>(kernel_wait_neq),    "kernel_wait_neq");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_wait_geq,    reinterpret_cast<const void*>(kernel_wait_geq),    "kernel_wait_geq");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_compare,     reinterpret_cast<const void*>(kernel_compare),     "kernel_compare");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_check_crc,   reinterpret_cast<const void*>(kernel_check_crc),   "kernel_check_crc");
+    ok &= resolve_kernel_func<TAG>(&funcs.kernel_copy,        reinterpret_cast<const void*>(kernel_copy),        "kernel_copy");
+    ok &= resolve_kernel_func<TAG>(&funcs.memset_kernel,      reinterpret_cast<const void*>(memset_kernel),      "memset_kernel");
+    ok &= resolve_kernel_func<TAG>(&funcs.compression.compress_0,  reinterpret_cast<const void*>(kernel_compress<0>),  "kernel_compress<0>");
+    ok &= resolve_kernel_func<TAG>(&funcs.compression.compress_9,  reinterpret_cast<const void*>(kernel_compress<9>),  "kernel_compress<9>");
+    ok &= resolve_kernel_func<TAG>(&funcs.compression.compress_14, reinterpret_cast<const void*>(kernel_compress<14>), "kernel_compress<14>");
+    ok &= resolve_kernel_func<TAG>(&funcs.compression.compress_16, reinterpret_cast<const void*>(kernel_compress<16>), "kernel_compress<16>");
+    ok &= resolve_kernel_func<TAG>(&funcs.compression.mod_compression_qam, reinterpret_cast<const void*>(kernel_mod_compression<QAM_Comp>), "kernel_mod_compression<QAM_Comp>");
+    return ok;
+}
+

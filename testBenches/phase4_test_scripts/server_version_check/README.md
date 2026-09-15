@@ -23,16 +23,18 @@ This directory contains three main tools:
 
 - Python 3.6+
 - `sudo` access (required for some version checks and service health checks)
-- `sshpass` (for cluster-wide checks): `sudo apt install sshpass`
+- SSH agent or default OpenSSH key access for cluster-wide checks
+- Passwordless sudo for the `aerial` service account on remote hosts
 
-### Password File (for cluster-wide checks)
+### SSH Environment (for cluster-wide checks)
 
-It is assumed your SSH password is stored in `~/aerial_pw` with secure permissions (chmod 600).
-
-Load it into the environment variable:
+Cluster-wide checks SSH as `aerial`. `server_version_check_all.py` uses normal OpenSSH public-key auth, so load the required key and credentials before running it:
 ```bash
-export SSHPASS=$(cat ~/aerial_pw)
+ssh-add -l
+ssh aerial@aerial-smc-02.nvidia.com true
 ```
+
+The script does not fetch secrets. Retrieve any required credentials before running it, and make sure the SSH key is available through your shell's SSH agent or default OpenSSH identity lookup.
 
 ## Quick Start
 
@@ -111,15 +113,11 @@ The system type (DU/RU) is automatically detected based on kernel version and GP
 Run checks across multiple cluster nodes with filtering:
 
 ```bash
-# Set SSH password securely from file
-export SSHPASS=$(cat ~/aerial_pw)
-
 # Run checks on specific nodes
 ./server_version_check_all.py \
     ~/nfs/gitlab/cicd-scripts/cicd_test_nodes.py \
     manifest_cg1_r750_25.3.csv \
     ~/nfs/cuBB_0102/ \
-    aerial \
     --filter "aerial-smc-15|aerial-smc-16|aerial-r750-15|aerial-r750-16"
 ```
 
@@ -170,6 +168,11 @@ Run 'python3 testBenches/phase4_test_scripts/server_version_check/server_version
 sudo ./server_version_check.py <manifest_file>
 ```
 
+**Verify versions against cuPHY-CP/container/versions.sh:**
+```bash
+sudo ./server_version_check.py --versions-sh ../../../cuPHY-CP/container/versions.sh
+```
+
 **Generate a manifest from current system:**
 ```bash
 ./server_version_check.py -o <output_file>
@@ -183,47 +186,53 @@ sudo ./server_version_check.py <manifest_file>
 **Options:**
 - `-o, --output FILE` - Generate manifest CSV from current system
 - `-l, --list` - List all available components that can be checked
+- `--versions-sh FILE` - Use cuPHY-CP/container/versions.sh as the expected version source
+- `--platform PLATFORM` - Override PLATFORM when sourcing versions.sh
 - `-h, --help` - Show help message
 
 ### server_version_check_all.py
 
 **Run checks across cluster nodes:**
 ```bash
-export SSHPASS=$(cat ~/aerial_pw)
-./server_version_check_all.py <nodes_file> <manifest> <nfs_path> <username> [options]
+./server_version_check_all.py <nodes_file> <manifest> <nfs_path> [options]
+```
+
+**Run checks against versions.sh across selected nodes:**
+```bash
+./server_version_check_all.py <nodes_file> <nfs_path> --versions-sh cuPHY-CP/container/versions.sh --filter aerial-smc-
 ```
 
 **Arguments:**
 - `nodes_file` - Path to cicd_test_nodes.py file
 - `manifest` - Manifest CSV filename (in same directory as script)
 - `nfs_path` - Shared NFS path accessible on all nodes
-- `username` - SSH username for connecting to nodes
+
+In versions.sh mode, `manifest` is omitted and the positional arguments are `<nodes_file> <nfs_path>`. `nodes_file` is still supplied by the caller; it is not bundled with released Aerial SDK packages. SSH always uses the `aerial` service account.
 
 **Options:**
 - `--filter PATTERN` - Filter nodes by hostname pattern (regex)
+- `--versions-sh FILE` - Use versions.sh on the remote node, absolute or relative to `nfs_path`
+- `--platform PLATFORM` - Override PLATFORM when sourcing versions.sh on each node
 - `-t, --test` - Test mode: show SSH commands without executing
 - `-v, --verbose` - Verbose mode: show full output from each node
 - `-h, --help` - Show help message
 
+`server_version_check_all.py` reads `TEST_NODES` from the `nodes_file` passed on the command line. It selects complete CG1 plus R750 pairs from that file. Because the current `versions.sh` source only defines supported Aerial gNB install platforms, use `--filter aerial-smc-` or a narrower host regex unless R750 support is added to `versions.sh`.
+
 **Examples:**
 
 ```bash
-# Set password from file (do this once before running checks)
-export SSHPASS=$(cat ~/aerial_pw)
-
 # Check all nodes
 ./server_version_check_all.py \
     ~/nfs/gitlab/cicd-scripts/cicd_test_nodes.py \
     manifest_cg1_r750_25.3.csv \
-    ~/nfs/cuBB_0102/ \
-    aerial
+    ~/nfs/cuBB_0102/
 
 # Check specific nodes with filter
 ./server_version_check_all.py \
     ~/nfs/gitlab/cicd-scripts/cicd_test_nodes.py \
     manifest_cg1_r750_25.3.csv \
     ~/nfs/cuBB_0102/ \
-    aerial \
     --filter "smc-1[5-9]|r750-1[5-9]"
 
 # Test mode (show commands without executing)
@@ -231,8 +240,14 @@ export SSHPASS=$(cat ~/aerial_pw)
     ~/nfs/gitlab/cicd-scripts/cicd_test_nodes.py \
     manifest_cg1_r750_25.3.csv \
     ~/nfs/cuBB_0102/ \
-    aerial \
     --test
+
+# Check SMC hosts using versions.sh as the source of truth
+./server_version_check_all.py \
+    ~/nfs/gitlab/cicd-scripts/cicd_test_nodes.py \
+    ~/nfs/aerial_sdk \
+    --versions-sh cuPHY-CP/container/versions.sh \
+    --filter aerial-smc-
 ```
 
 ## Manifest File Format
@@ -255,4 +270,3 @@ RU,Kernel,5.15.0-1042-nvidia-lowlatency,n
 - `component` - Component name (e.g., BMC, BIOS, Kernel)
 - `version` - Expected version string
 - `optional` - `y` if optional, `n` if required
-

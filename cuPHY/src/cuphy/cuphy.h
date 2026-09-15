@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include "cuComplex.h"
 #include "cuda_fp16.h"
+#include "cuda_fp8.h"
 #include <cuda.h>
 
 #ifndef CUPHYWINAPI
@@ -82,7 +83,7 @@ extern "C" {
 
 // macro for early-HARQ processing
 #define CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK (0xF)  //0xF
-#define CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS (0x1F)  //0x1F Extra DMRS symbol from maxLen = 2 to support increased UL layer count in 64TR mMIMO. Thus HARQ bits will be configured in symbol 4 instead of symbol 3 
+#define CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_BITMASK_MMIMO_EXTRA_DMRS (0x1F)  //0x1F Extra DMRS symbol from maxLen = 2 to support increased UL layer count in 64TR mMIMO. Thus HARQ bits will be configured in symbol 4 instead of symbol 3
 #define CUPHY_PUSCH_RX_SOFT_DEMAPPER_EARLY_HARQ_SYMBOL_UPPER_BOUND (3)
 #define EARLY_HARQ_SYM_IDX_UB (4)
 
@@ -218,11 +219,8 @@ static constexpr int CUPHY_PUSCH_RX_CH_EST_ALL_ALGS_N_MAX_HET_CFGS = std::max(
 // BFW parameters
 #define CUPHY_ENABLE_FLEXIBLE_BFW_PRB_GRPS (1)
 #define CUPHY_BFW_COEF_COMP_N_MAX_HET_CFGS (8)
-#ifdef ENABLE_32DL
-#define CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP (32)
-#else
-#define CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP (16) // Maximum number of layers beamformed
-#endif
+// CUPHY_BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP relocated to cuPHY-CP slot_command.hpp
+// as slot_command_api::BFW_COEF_COMP_N_MAX_LAYERS_PER_USER_GRP (consumed only by cuPHY-CP).
 #define CUPHY_BFW_COEF_COMP_N_MAX_USER_GRPS (72) // 24 UeGrps/cell * 3 cells
 #define CUPHY_BFW_MIN_PRB_GRP_SIZE 2
 #define CUPHY_BFW_N_MAX_PRB_GRPS ((MAX_N_PRBS_SUPPORTED+1)/CUPHY_BFW_MIN_PRB_GRP_SIZE)
@@ -235,24 +233,41 @@ static constexpr int CUPHY_PUSCH_RX_CH_EST_ALL_ALGS_N_MAX_HET_CFGS = std::max(
 #define CUPHY_PUSCH_RX_CFO_CHECK_THRESHOLD (2.0)
 #define CUPHY_PUSCH_RX_TO_CHECK_THRESHOLD (0.01)
 
-// RSSI
+// PUSCH RSSI launch configurations.
+// cuphyPuschRxRssiLaunchCfgs_t::nCfgs is bounded by this max. Heterogeneous UE
+// groups are represented in UE-group parameters, not by setting nCfgs above the
+// fixed launch-config array size.
 #define CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS (1)
 
 #define CUPHY_PUSCH_RSSI_N_DIM_MEAS_FULL (3)
 #define CUPHY_PUSCH_RSSI_N_DIM_MEAS (1)
 #define CUPHY_PUSCH_RSSI_N_DIM_INTER_CTA_SYNC (1)
 
-// RSRP
+// PUSCH RSRP launch configurations.
+// cuphyPuschRxRsrpLaunchCfgs_t::nCfgs is bounded by this max. Heterogeneous UE
+// groups are represented in UE-group parameters, not by setting nCfgs above the
+// fixed launch-config array size.
 #define CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS (1)
 
 // PDCCH
 #define CUPHY_PDCCH_N_CRC_BITS (24)
+#define CUPHY_PDCCH_POLAR_A_MIN (12) // 38.212 7.3.1 DCI payload bits (before CRC)
+#define CUPHY_PDCCH_POLAR_A_MAX (140)// 38.212 5.3.1.1 K_IL_MAX=164
+#define CUPHY_PDCCH_POLAR_K_MIN (CUPHY_PDCCH_POLAR_A_MIN + CUPHY_PDCCH_N_CRC_BITS) // 36
+#define CUPHY_PDCCH_POLAR_K_MAX (CUPHY_PDCCH_POLAR_A_MAX + CUPHY_PDCCH_N_CRC_BITS) // 164
+#define CUPHY_PDCCH_POLAR_NUM_AGGR_LEVELS (5)
 #define CUPHY_PDCCH_MAX_DCIS_PER_CORESET (91)                                           // Increased to support new TVs; previous max. value was 32
 #define CUPHY_PDCCH_N_MAX_CORESETS_PER_CELL (40)
 #define CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES (20)                                          //picked byte size after 140 bits divisible by 4 TODO Can change
 #define CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES_W_CRC (CUPHY_PDCCH_MAX_DCI_PAYLOAD_BYTES + 4) // CRC is 24-bits, here rounded up so size is divisible by 32 TODO Can change
 #define CUPHY_PDCCH_MAX_AGGREGATION_LEVEL (16)
 #define CUPHY_PDCCH_MAX_TX_BITS_PER_DCI (2 * 9 * 6 * CUPHY_PDCCH_MAX_AGGREGATION_LEVEL) // Needs to be divisible by 32
+#define PDCCH_POLAR_CIDX2UIDX_LUT_SIZE                                                          \
+    ((CUPHY_PDCCH_POLAR_NUM_AGGR_LEVELS * (CUPHY_PDCCH_POLAR_K_MIN + CUPHY_PDCCH_POLAR_K_MAX) * \
+      (CUPHY_PDCCH_POLAR_K_MAX - CUPHY_PDCCH_POLAR_K_MIN + 1)) /                                \
+     2) // Expect 64500. Unit: Entry.
+#define CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_BYTE_LEN (CUPHY_PDCCH_MAX_TX_BITS_PER_DCI>>3)
+#define CUPHY_PDCCH_MAX_TX_BITS_PER_DCI_WORD_LEN (CUPHY_PDCCH_MAX_TX_BITS_PER_DCI>>5)
 
 // SSB (Signal Synchronization Block)
 #define CUPHY_SSB_N_MIB_BITS (24) // MIB (master information block) bit length before payload generation
@@ -361,7 +376,8 @@ typedef enum
     CUPHY_STATUS_UNSUPPORTED_ALIGNMENT = 13, /*!< One or more API arguments don't have the required alignment.             */
     CUPHY_STATUS_VALUE_OUT_OF_RANGE    = 14, /*!< Data conversion could not occur because an input value was out of range. */
     CUPHY_STATUS_REF_MISMATCH          = 15, /*!< Mismatch found when comparing to TV                                      */
-    CUPHY_N_STATUS_CONFIGS             = 16  /*!< Number of unique cuphyStatus_t values.                                   */
+    CUPHY_STATUS_INSUFFICIENT_RESOURCES = 16, /*!< Insufficient resources to complete the operation.                        */
+    CUPHY_N_STATUS_CONFIGS             = 17  /*!< Number of unique cuphyStatus_t values.                                   */
 } cuphyStatus_t;
 
 // required for fmt:: lib
@@ -411,6 +427,7 @@ typedef enum _cuphyPuschStatusType
     CUPHY_PUSCH_STATUS_POLAR_DECODE_CSI2_SETUP_ERROR                     = 36,
     CUPHY_PUSCH_STATUS_SINR_EARLY_HARQ_SETUP_ERROR                       = 37,
     CUPHY_PUSCH_STATUS_RSSI_EARLY_HARQ_SETUP_ERROR                       = 38,
+    CUPHY_PUSCH_STATUS_LDPC_SETUP_ERROR                                  = 39,
     // More types can be added as needed
     CUPHY_MAX_PUSCH_STATUS_TYPES
 
@@ -910,7 +927,7 @@ typedef struct _cuphyPolarCwPrm
     uint16_t N_cw;           /// codeword size
     uint8_t  nCrcBits;       /// number of crc bits per codeword. 6 or 12.
     uint16_t A_cw;           /// number of payload bits per codeword. (does not include CRC).
-    uint8_t* pCwTreeTypes;   /// pointer to cw Tree types
+    uint8_t* pCwTreeTypes;   /// pointer to cw Tree types (4*N_cw bytes: 2*N_cw tree-type bytes, N_cw SC operation-list bytes, N_cw fast-SSC operation-list bytes, all filled by compCwTreeTypes)
     uint8_t* pCrcStatus;     /// pointer to CRC status
     uint8_t* pCrcStatus1;    /// pointer to CRC status extra placeholder
     uint8_t  en_CrcStatus;   /// enable CRC Status in polar_decoder.cu
@@ -960,27 +977,34 @@ typedef struct _cuphyRmCwPrm
  */
 typedef enum
 {
-    CUPHY_VOID  = -1,         /*!< uninitialized type                       */
-    CUPHY_BIT   = 20,         /*!< 1-bit value                              */
-    CUPHY_R_8I  = CUDA_R_8I,  /*!< 8-bit signed integer real values         */
-    CUPHY_C_8I  = CUDA_C_8I,  /*!< 8-bit signed integer complex values      */
-    CUPHY_R_8U  = CUDA_R_8U,  /*!< 8-bit unsigned integer real values       */
-    CUPHY_C_8U  = CUDA_C_8U,  /*!< 8-bit unsigned integer complex values    */
-    CUPHY_R_16I = 21,         /*!< 16-bit signed integer real values        */
-    CUPHY_C_16I = 22,         /*!< 16-bit signed integer complex values     */
-    CUPHY_R_16U = 23,         /*!< 16-bit unsigned integer real values      */
-    CUPHY_C_16U = 24,         /*!< 16-bit unsigned integer complex values   */
-    CUPHY_R_32I = CUDA_R_32I, /*!< 32-bit signed integer real values        */
-    CUPHY_C_32I = CUDA_C_32I, /*!< 32-bit signed integer complex values     */
-    CUPHY_R_32U = CUDA_R_32U, /*!< 32-bit unsigned integer real values      */
-    CUPHY_C_32U = CUDA_C_32U, /*!< 32-bit unsigned integer complex values   */
-    CUPHY_R_16F = CUDA_R_16F, /*!< half precision (16-bit) real values      */
-    CUPHY_C_16F = CUDA_C_16F, /*!< half precision (16-bit) complex values   */
-    CUPHY_R_32F = CUDA_R_32F, /*!< single precision (32-bit) real values    */
-    CUPHY_C_32F = CUDA_C_32F, /*!< single precision (32-bit) complex values */
-    CUPHY_R_64F = CUDA_R_64F, /*!< double precision (64-bit) real values    */
-    CUPHY_C_64F = CUDA_C_64F  /*!< double precision (64-bit) complex values */
+    CUPHY_VOID      = -1,             /*!< uninitialized type                        */
+    CUPHY_BIT       = 100,            /*!< 1-bit value                               */
+    CUPHY_R_8I      = CUDA_R_8I,      /*!< 8-bit signed integer real values          */
+    CUPHY_C_8I      = CUDA_C_8I,      /*!< 8-bit signed integer complex values       */
+    CUPHY_R_8U      = CUDA_R_8U,      /*!< 8-bit unsigned integer real values        */
+    CUPHY_C_8U      = CUDA_C_8U,      /*!< 8-bit unsigned integer complex values     */
+    CUPHY_R_16I     = CUDA_R_16I,     /*!< 16-bit signed integer real values         */
+    CUPHY_C_16I     = CUDA_C_16I,     /*!< 16-bit signed integer complex values      */
+    CUPHY_R_16U     = CUDA_R_16U,     /*!< 16-bit unsigned integer real values       */
+    CUPHY_C_16U     = CUDA_C_16U,     /*!< 16-bit unsigned integer complex values    */
+    CUPHY_R_32I     = CUDA_R_32I,     /*!< 32-bit signed integer real values         */
+    CUPHY_C_32I     = CUDA_C_32I,     /*!< 32-bit signed integer complex values      */
+    CUPHY_R_32U     = CUDA_R_32U,     /*!< 32-bit unsigned integer real values       */
+    CUPHY_C_32U     = CUDA_C_32U,     /*!< 32-bit unsigned integer complex values    */
+    CUPHY_R_16F     = CUDA_R_16F,     /*!< half precision (16-bit) real values       */
+    CUPHY_C_16F     = CUDA_C_16F,     /*!< half precision (16-bit) complex values    */
+    CUPHY_R_32F     = CUDA_R_32F,     /*!< single precision (32-bit) real values     */
+    CUPHY_C_32F     = CUDA_C_32F,     /*!< single precision (32-bit) complex values  */
+    CUPHY_R_64F     = CUDA_R_64F,     /*!< double precision (64-bit) real values     */
+    CUPHY_C_64F     = CUDA_C_64F,     /*!< double precision (64-bit) complex values  */
+    CUPHY_R_8F_E4M3 = CUDA_R_8F_E4M3, /*!< fp8 (1 sign, 4 exponent, 3 mantissa bits) */
+    CUPHY_R_8F_E5M2 = CUDA_R_8F_E5M2  /*!< fp8 (1 sign, 5 exponent, 2 mantissa bits) */
 } cuphyDataType_t;
+
+// Largest finite magnitudes representable by the CUDA FP8 formats.
+// E4M3 reserves 0x7f for NaN; E5M2 reserves exponent 0x1f for Inf/NaN.
+#define CUPHY_FP8_E4M3_MAX_FINITE (448.0F)   // (1 + 6 / 8) * 2^8
+#define CUPHY_FP8_E5M2_MAX_FINITE (57344.0F) // (1 + 3 / 4) * 2^15
 
 /**
  * cuPHY implementation of variant type
@@ -990,25 +1014,27 @@ typedef struct
     int type;
     union
     {
-        unsigned int    b1;   /*!< CUPHY_BIT   (1-bit value)                              */
-        signed char     r8i;  /*!< CUPHY_R_8I  (8-bit signed integer real values)         */
-        char2           c8i;  /*!< CUPHY_C_8I  (8-bit signed integer complex values)      */
-        unsigned char   r8u;  /*!< CUPHY_R_8U  (8-bit unsigned integer real values)       */
-        uchar2          c8u;  /*!< CUPHY_C_8U  (8-bit unsigned integer complex values)    */
-        short           r16i; /*!< CUPHY_R_16I (16-bit signed integer real values)        */
-        short2          c16i; /*!< CUPHY_C_16I (16-bit signed integer complex values)     */
-        unsigned short  r16u; /*!< CUPHY_R_16U (16-bit unsigned integer real values)      */
-        ushort2         c16u; /*!< CUPHY_C_16U (16-bit unsigned integer complex values)   */
-        int             r32i; /*!< CUPHY_R_32I (32-bit signed integer real values)        */
-        int2            c32i; /*!< CUPHY_C_32I (32-bit signed integer complex values)     */
-        unsigned int    r32u; /*!< CUPHY_R_32U (32-bit unsigned integer real values)      */
-        uint2           c32u; /*!< CUPHY_C_32U (32-bit unsigned integer complex values)   */
-        __half_raw      r16f; /*!< CUPHY_R_16F (half precision (16-bit) real values)      */
-        __half2_raw     c16f; /*!< CUPHY_C_16F (half precision (16-bit) complex values)   */
-        float           r32f; /*!< CUPHY_R_32F (single precision (32-bit) real values)    */
-        cuComplex       c32f; /*!< CUPHY_C_32F (single precision (32-bit) complex values) */
-        double          r64f; /*!< CUPHY_R_64F (double precision (64-bit) real values)    */
-        cuDoubleComplex c64f; /*!< CUPHY_C_64F (double precision (64-bit) complex values) */
+        unsigned int    b1;       /*!< CUPHY_BIT   (1-bit value)                              */
+        signed char     r8i;      /*!< CUPHY_R_8I  (8-bit signed integer real values)         */
+        char2           c8i;      /*!< CUPHY_C_8I  (8-bit signed integer complex values)      */
+        unsigned char   r8u;      /*!< CUPHY_R_8U  (8-bit unsigned integer real values)       */
+        uchar2          c8u;      /*!< CUPHY_C_8U  (8-bit unsigned integer complex values)    */
+        short           r16i;     /*!< CUPHY_R_16I (16-bit signed integer real values)        */
+        short2          c16i;     /*!< CUPHY_C_16I (16-bit signed integer complex values)     */
+        unsigned short  r16u;     /*!< CUPHY_R_16U (16-bit unsigned integer real values)      */
+        ushort2         c16u;     /*!< CUPHY_C_16U (16-bit unsigned integer complex values)   */
+        int             r32i;     /*!< CUPHY_R_32I (32-bit signed integer real values)        */
+        int2            c32i;     /*!< CUPHY_C_32I (32-bit signed integer complex values)     */
+        unsigned int    r32u;     /*!< CUPHY_R_32U (32-bit unsigned integer real values)      */
+        uint2           c32u;     /*!< CUPHY_C_32U (32-bit unsigned integer complex values)   */
+        __half_raw      r16f;     /*!< CUPHY_R_16F (half precision (16-bit) real values)      */
+        __half2_raw     c16f;     /*!< CUPHY_C_16F (half precision (16-bit) complex values)   */
+        float           r32f;     /*!< CUPHY_R_32F (single precision (32-bit) real values)    */
+        cuComplex       c32f;     /*!< CUPHY_C_32F (single precision (32-bit) complex values) */
+        double          r64f;     /*!< CUPHY_R_64F (double precision (64-bit) real values)    */
+        cuDoubleComplex c64f;     /*!< CUPHY_C_64F (double precision (64-bit) complex values) */
+        __nv_fp8_e4m3   r8f_e4m3; /*!< fp8 (1 sign, 4 exponent, 3 mantissa bits) real values  */
+        __nv_fp8_e5m2   r8f_e5m2; /*!< fp8 (1 sign, 5 exponent, 2 mantissa bits) real values  */
     } value;
 } cuphyVariant_t;
 
@@ -1128,7 +1154,7 @@ const char* CUPHYWINAPI cuphyGetErrorName(cuphyStatus_t status);
 /* LDPC decoder flags */
 /* Default operation flag                        */
 #define CUPHY_LDPC_DECODE_DEFAULT (0)
-/* Use early termination (currently unsupported) */
+/* Use CRC-based early termination */
 #define CUPHY_LDPC_DECODE_EARLY_TERM (0x01)
 /* When possible, choose an LDPC decoder algorithm that optimizes      *
  * throughput instead of latency.                                      *
@@ -1142,6 +1168,39 @@ const char* CUPHYWINAPI cuphyGetErrorName(cuphyStatus_t status);
 #define CUPHY_LDPC_DECODE_CHOOSE_THROUGHPUT (0x2)
 /* Write soft output values following the last iteration */
 #define CUPHY_LDPC_DECODE_WRITE_SOFT_OUTPUTS (0x04)
+/* Write iteration count to output buffer */
+#define CUPHY_LDPC_DECODE_WRITE_ITER_COUNT (0x08)
+/* Exercise early-termination checks while forcing max-iteration latency */
+#define CUPHY_LDPC_DECODE_ET_LATENCY_DEBUG (0x10)
+/* Force the accessory-capable kernel variant without enabling any accessory.
+ * Intended for measuring the code-generation cost of compiled-in features. */
+#define CUPHY_LDPC_DECODE_FORCE_ET_KERNEL (0x20)
+/* Dump intermediate APP snapshots when intermediate result buffers are attached */
+#define CUPHY_LDPC_DECODE_DUMP_INTERM (0x40)
+
+/* Requirements an LDPC algorithm places on its CALLER, queried with
+ * cuphyErrorCorrectionLDPCGetAlgoRequirements(). These are preconditions the
+ * decode configuration descriptor cannot express, so the library cannot check
+ * them itself -- a caller that ignores them gets silently degraded results
+ * rather than an error. */
+/* The algorithm never loads the punctured columns V0/V1, so it must be given
+ * punctured input. Unpunctured input still decodes, but the information in
+ * those columns is silently discarded. */
+#define CUPHY_LDPC_ALGO_REQUIRES_PUNCTURED_INPUT (0x1)
+/* The algorithm implements only the transport-block interface; its tensor
+ * decode() entry point returns CUPHY_STATUS_NOT_SUPPORTED. */
+#define CUPHY_LDPC_ALGO_REQUIRES_TB_INTERFACE (0x2)
+
+/**
+ * LDPC CRC type for early termination
+ */
+typedef enum
+{
+    CUPHY_LDPC_CRC_NONE   = 0, //!< No CRC checking
+    CUPHY_LDPC_CRC_16     = 1, //!< CRC-16
+    CUPHY_LDPC_CRC_24A    = 2, //!< CRC-24A
+    CUPHY_LDPC_CRC_24B    = 3, //!< CRC-24B
+} cuphyLDPCCrcType_t;
 /// @endcond
 
 /**
@@ -1617,9 +1676,9 @@ typedef struct _puschRxUeGrpPrms
     uint8_t  nUes;
     uint16_t ueIdxs[CUPHY_PUSCH_RX_MAX_N_UE_PER_UE_GROUP]; /// UE indices used for cuPHY PUSCH input/output interfaces
     uint8_t  ueGrpLayerToUeIdx[CUPHY_PUSCH_RX_MAX_N_UE_PER_UE_GROUP];
-    
+
     /// Weighted average CFO estimation
-    float   foForgetCoeff[CUPHY_PUSCH_RX_MAX_N_UE_PER_UE_GROUP]; 
+    float   foForgetCoeff[CUPHY_PUSCH_RX_MAX_N_UE_PER_UE_GROUP];
 
     cuphyTensorInfo3_t tInfoDataRx;        /// Slot data tensor information
     cuphyTensorInfo4_t tInfoHEst;          /// Estimated channel tensor information
@@ -2551,19 +2610,21 @@ cuphySetupPuschRxChEqCoefCompute(cuphyPuschRxChEqHndl_t        puschRxChEqHndl,
  *
  * Returns ::CUPHY_STATUS_INVALID_ARGUMENT if \p puschRxChEqHndl and/or \p pDynDescrsCpu and/or \p pDynDescrsGpu and/or \p pLaunchCfgs is NULL.
  *
- * \param puschRxChEqHndl             - Handle to previously created PuschRxChEq instance
- * \param pDrvdUeGrpPrmsCpu           - Pointer to derived UE groups parameters in CPU memory
- * \param pDrvdUeGrpPrmsGpu           - Pointer to derived UE groups parameters in GPU memory
- * \param nUeGrps                     - total number of UE groups to be processed
- * \param nMaxPrb                     - maximum number of data PRBs across all UE groups
- * \param enableCfoCorrection         - enable application of CFO correction
- * \param enablePuschTdi              - enable time domain interpolation on equalizer coefficients
- * \param symbolBitmask               - bitmask for data symbols to execute soft demapper
- * \param enableCpuToGpuDescrAsyncCpy - Flag when set enables async copy of CPU descriptor into GPU
- * \param pDynDescrsCpu               - Pointer to dynamic descriptor in CPU memory
- * \param pDynDescrsGpu               - Pointer to dynamic descriptor in GPU memory
- * \param pLaunchCfgs                 - Pointer to channel estimation launch configurations
- * \param strm                        - CUDA stream for descriptor copy operation
+ * @param[in] puschRxChEqHndl               Handle to previously created PuschRxChEq instance
+ * @param[in] pDrvdUeGrpPrmsCpu             Pointer to derived UE groups parameters in CPU memory
+ * @param[in] pDrvdUeGrpPrmsGpu             Pointer to derived UE groups parameters in GPU memory
+ * @param[in] nUeGrps                       total number of UE groups to be processed
+ * @param[in] nMaxPrb                       maximum number of data PRBs across all UE groups
+ * @param[in] enableCfoCorrection           enable application of CFO correction
+ * @param[in] enablePuschTdi                enable time domain interpolation on equalizer coefficients
+ * @param[in] openRanFunctionalSplitOption  choose O-RAN functional split mode
+ * @param[in] kernelSelOption               select kernel for equalization and/or soft-demapper
+ * @param[in] symbolBitmask                 bitmask for data symbols to execute soft demapper
+ * @param[in] enableCpuToGpuDescrAsyncCpy   Flag when set enables async copy of CPU descriptor into GPU
+ * @param[in] pDynDescrsCpu                 Pointer to dynamic descriptor in CPU memory
+ * @param[in] pDynDescrsGpu                 Pointer to dynamic descriptor in GPU memory
+ * @param[in] pLaunchCfgs                   Pointer to channel estimation launch configurations
+ * @param[in] strm                          CUDA stream for descriptor copy operation
  *
  * \return
  * ::CUPHY_STATUS_SUCCESS,
@@ -2579,6 +2640,8 @@ cuphySetupPuschRxChEqSoftDemap(cuphyPuschRxChEqHndl_t        puschRxChEqHndl,
                                uint16_t                      nMaxPrb,
                                uint8_t                       enableCfoCorrection,
                                uint8_t                       enablePuschTdi,
+                               uint8_t                       openRanFunctionalSplitOption,
+                               uint8_t                       kernelSelOption,
                                uint16_t                      symbolBitmask,
                                uint8_t                       enableCpuToGpuDescrAsyncCpy,
                                void*                         pDynDescrsCpu,
@@ -2686,7 +2749,7 @@ cuphySetupPuschRxChEqSoftDemapAfterDft(cuphyPuschRxChEqHndl_t        puschRxChEq
  * Returns ::CUPHY_STATUS_INVALID_ARGUMENT if \p tSym, \p pSym, \p tBits, or \p pBits are NULL,
  *         or if \p log2_QAM does not represent a supported modulation
  *         value (1, 2, 4, 6, or 8)
- * Returns ::CUPHY_STATUS_UNSUPPORTED_TYPE is \p tSym is not of type
+ * Returns ::CUPHY_STATUS_UNSUPPORTED_TYPE if \p tSym is not of type
  *         CUPHY_C_32F or CUPHY_C_16F, or if \p tBits is not of type
  *         CUPHY_BIT
  * Returns ::CUPHY_STATUS_SIZE_MISMATCH if \p tBits is not a multiple
@@ -2725,6 +2788,10 @@ cuphyStatus_t cuphyModulateSymbol(cuphyTensorDescriptor_t tSym,
  * Returns ::CUPHY_STATUS_SUCCESS if demodulation is launched successfully
  *
  * Returns ::CUPHY_STATUS_INVALID_ARGUMENT if \p tSym, \p pSym, \p tLLR, or \p pLLR are NULL.
+ *
+ * Returns ::CUPHY_STATUS_UNSUPPORTED_TYPE if \p tSym is not of type
+ *         CUPHY_C_32F or CUPHY_C_16F, or if \p tLLR is not of type
+ *         CUPHY_R_16F, CUPHY_R_32F, CUPHY_R_8F_E4M3, or CUPHY_R_8F_E5M2.
  *
  * \param context       - cuPHY context
  * \param tLLR          - tensor descriptor for output log-likelihood values
@@ -2879,7 +2946,8 @@ cuphyStatus_t CUPHYWINAPI cuphyCreatePuschRxRssi(cuphyPuschRxRssiHndl_t* pPuschR
  * Returns ::CUPHY_STATUS_SUCCESS if setup is successful.
  *
  * Returns ::CUPHY_STATUS_INVALID_ARGUMENT if \p puschRxRssiHndl
- * and/or \p pDynDescrsCpu and/or \p pDynDescrsGpu and/or \p pLaunchCfgs is NULL.
+ * and/or \p pDynDescrsCpu and/or \p pDynDescrsGpu and/or \p pLaunchCfgs is NULL,
+ * or if \p pLaunchCfgs->nCfgs is 0 or greater than \c CUPHY_PUSCH_RX_RSSI_N_MAX_HET_CFGS.
  *
  * \param puschRxRssiHndl             - Handle to previously created PuschRxRssi instance
  * \param pDrvdUeGrpPrmsCpu           - Pointer to derived UE groups parameters in CPU memory
@@ -2920,7 +2988,8 @@ cuphySetupPuschRxRssi(cuphyPuschRxRssiHndl_t        puschRxRssiHndl,
  * Returns ::CUPHY_STATUS_SUCCESS if setup is successful.
  *
  * Returns ::CUPHY_STATUS_INVALID_ARGUMENT if \p puschRxRssiHndl
- * and/or \p pDynDescrsCpu and/or \p pDynDescrsGpu and/or \p pLaunchCfgs is NULL.
+ * and/or \p pDynDescrsCpu and/or \p pDynDescrsGpu and/or \p pLaunchCfgs is NULL,
+ * or if \p pLaunchCfgs->nCfgs is 0 or greater than \c CUPHY_PUSCH_RX_RSRP_N_MAX_HET_CFGS.
  *
  * \param puschRxRssiHndl             - Handle to previously created PuschRxRssi instance
  * \param pDrvdUeGrpPrmsCpu           - Pointer to derived UE groups parameters in CPU memory
@@ -3229,7 +3298,11 @@ cuphyStatus_t CUPHYWINAPI cuphyCreatePuschRxCrcDecode(cuphyPuschRxCrcDecodeHndl_
  *
  * Returns ::CUPHY_STATUS_SUCCESS if setup is successful.
  *
- * Returns ::CUPHY_STATUS_INVALID_ARGUMENT if any inputs NULL.
+ * Returns ::CUPHY_STATUS_INVALID_ARGUMENT if any inputs NULL, or if any scheduled user index is outside
+ * \c MAX_N_TBS_PER_CELL_GROUP_SUPPORTED.
+ *
+ * Returns ::CUPHY_STATUS_NOT_SUPPORTED if \p nSchUes exceeds \c MAX_N_TBS_PER_CELL_GROUP_SUPPORTED, or if
+ * any scheduled TB exceeds \c MAX_N_CBS_PER_TB_SUPPORTED or \c MAX_BYTES_PER_TRANSPORT_BLOCK.
  *
  * \param puschRxCrcDecodeHndl        - Address to return the PuschRxCrcDecode instance
  * \param nSchUes                     - number of users with sch data
@@ -3249,7 +3322,8 @@ cuphyStatus_t CUPHYWINAPI cuphyCreatePuschRxCrcDecode(cuphyPuschRxCrcDecodeHndl_
  *
  * \return
  * ::CUPHY_STATUS_SUCCESS,
- * ::CUPHY_STATUS_INVALID_ARGUMENT
+ * ::CUPHY_STATUS_INVALID_ARGUMENT,
+ * ::CUPHY_STATUS_NOT_SUPPORTED
  *
  * \sa ::cuphyStatus_t,::cuphyGetErrorName,::cuphyGetErrorString,::cuphyPuschRxCrcDecodeGetDescrInfo,::cuphyCreatePuschRxCrcDecode,::cuphyDestroyPuschRxCrcDecode
  */
@@ -3599,6 +3673,9 @@ struct PdschPerTbParams
     uint32_t Ncb;          /*!< same as N for now */
     uint32_t G;            /*!< number of rate-matched bits available for TB transmission without accounting punctured REs due to CSI-RS (max_G) */
     uint32_t max_REs;      /*!< number of REs for TB transmission without accounting punctured REs due to CSI-RS. It's G /(Qm * Nl) */
+    bool     fast_path;    /*!< use fast path fused RM kernel when all TBs in a cell group have this field set
+                               (conditions: SU-MIMO, 256-QAM, 4 layers/ports, rv0,
+                                Type-1 alloc, no DMRS/data mux, testModel=0). */
     uint32_t K;            /*!< non punctured systematic bits */
     uint32_t F;            /*!< filler bits */
     uint32_t cinit;        /*!< used to generate scrambling sequence; seed2 arg. of gold32 */
@@ -3694,7 +3771,9 @@ typedef struct _cuphyPdschStatusOut
  *
  *  @param[in] dlRateMatchingLaunchConfig: Pointer to cuphyDlRateMatchingLaunchConfig.
  *  @param[out] status: pointer to cuphyPdschStatusOut_t struct; updated if CB_Er > PDSCH_MAX_ER_PER_CB_BITS for any UE in cell group.
- *  @param[in] d_rate_matching_input: LDPC encoder's output; device buffer, previously allocated.
+ *  @param[in] d_rate_matching_input: input device buffer, previously allocated. Buffer contains:
+ *                                    LDPC encoder's output, if post_fec_rm_scrambling is 0 (e.g., in default PDSCH_FULL_PROCESSING mode), or
+ *                                    buffer post FEC rate matching and scrambling, if post_fec_rm_scrambling is 1 (only in PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING mode)
  *  @param[out] d_rate_matching_output: rate-matching output, with scrambling and layer-mapping, if enabled; device pointer, preallocated.
  *  @param[out] d_restructure_rate_matching_output: d_rate_matching_output restructured for modulation. There are Er bits per code block.
  *                                             Each layer starts at an uint32_t aligned boundary.
@@ -3713,6 +3792,8 @@ typedef struct _cuphyPdschStatusOut
  *  @param[in] precoding: 1 if any TB has precoding enabled; 0 otherwise.
  *  @param[in] restructure_kernel: set-up kernel node params for restructure kernel when 1.
  *  @param[in] batching: when enabled the TBs from this kernel launch can belong to different cells
+ *  @param[in] post_fec_rm_scrambling: indicates PDSCH is in PDSCH_POST_FEC_RM_SCRAMBLING_PROCESSING mode when set to 1; 0 otherwise;
+ *                                     influences GPU processing; d_rate_matching_input will contain different data too
  *  @param[in] h_workspace: pinned host memory for temporary buffers
  *  @param[in] d_workspace: device memory for h_workspace. The H2D copy from h_workspace to d_workspace happens within cuphySetupDlRateMatching if enable_desc_async_copy is set.
  *  @param[in] h_params: pointer to # TBs PdschPerTbParams struct; pinned host memory
@@ -3743,6 +3824,7 @@ cuphySetupDlRateMatching(cuphyDlRateMatchingLaunchConfig_t dlRateMatchingLaunchC
                          uint8_t                           precoding,
                          uint8_t                           restructure_kernel,
                          uint8_t                           batching,
+                         uint8_t                           post_fec_rm_scrambling,
                          uint32_t*                         h_workspace,
                          uint32_t*                         d_workspace,
                          PdschPerTbParams*                 h_params,
@@ -3917,9 +3999,10 @@ cuphyStatus_t CUPHYWINAPI cuphyDestroyLDPCDecoder(cuphyLDPCDecoder_t decoder);
  */
 typedef struct
 {
-    void*   addr;
-    int32_t stride_elements;
-    int32_t num_codewords;
+    void*     addr;             //!< Address of LLR buffer
+    int32_t   stride_elements;  //!< Stride in elements between codewords
+    int32_t   num_codewords;    //!< Number of codewords in this transport block
+    uint32_t* crc_type;         //!< Array of CRC types per codeblock (cuphyLDPCCrcType_t), or NULL
 } cuphyTransportBlockLLRDesc_t;
 
 /**
@@ -3927,10 +4010,37 @@ typedef struct
  */
 typedef struct
 {
-    uint32_t* addr;
-    int32_t   stride_words;
-    int32_t   num_codewords;
+    uint32_t* addr;           //!< Address of output data buffer
+    int32_t   stride_words;   //!< Stride in 32-bit words between codewords
+    int32_t   num_codewords;  //!< Number of codewords in this transport block
+    uint32_t* crc;            //!< CRC result per codeblock (0=pass, nonzero=fail), or NULL
 } cuphyTransportBlockDataDesc_t;
+
+/**
+ * LDPC Iteration output buffer for early termination
+ */
+typedef struct
+{
+    int32_t* addr;           //!< Host pinned memory address for iteration counts
+    int32_t  num_codewords;  //!< Number of codewords
+} cuphyTransportBlockIterDesc_t;
+
+/**
+ * LDPC intermediate APP dump buffers for diagnostics.
+ *
+ * Layout:
+ *   app_addr[cw * app_stride_elements_cw + itr * app_stride_elements_itr + idx]
+ *
+ * Element type is the decoder kernel's native APP type. Current APP dump users
+ * in this branch write fp16 APP values.
+ */
+typedef struct
+{
+    void*   app_addr;                 //!< Device address of APP history (NULL = skip)
+    int32_t app_stride_elements_cw;   //!< APP stride between codewords
+    int32_t app_stride_elements_itr;  //!< APP stride between iterations within one codeword
+    int32_t num_codewords;            //!< Number of codewords in this transport block
+} cuphyTransportBlockIntermResults_t;
 
 /**
  * LDPC Decoder normalization parameter
@@ -3946,7 +4056,7 @@ typedef union
  */
 typedef struct
 {
-    cuphyDataType_t          llr_type;         /*!< Type of LLR input data (CUPHY_R_16F or CUPHY_R_32F) */
+    cuphyDataType_t          llr_type;         /*!< Type of LLR input data (CUPHY_R_32F, CUPHY_R_16F, CUPHY_R_8F_E4M3, or CUPHY_R_8F_E5M2) */
     int16_t                  num_parity_nodes; /*!< Number of parity nodes */
     int16_t                  Z;                /*!< Lifting size */
     int16_t                  max_iterations;   /*!< Maximum number of iterations */
@@ -3969,6 +4079,8 @@ typedef struct
     cuphyTransportBlockLLRDesc_t  llr_input[CUPHY_LDPC_DECODE_DESC_MAX_TB];  /*!< Input LLR buffers */
     cuphyTransportBlockDataDesc_t tb_output[CUPHY_LDPC_DECODE_DESC_MAX_TB];  /*!< Output bit/data buffers */
     cuphyTransportBlockLLRDesc_t  llr_output[CUPHY_LDPC_DECODE_DESC_MAX_TB]; /*!< Output LLR buffers (optional) */
+    cuphyTransportBlockIterDesc_t iter_output[CUPHY_LDPC_DECODE_DESC_MAX_TB]; /*!< Iteration count outputs (optional) */
+    const cuphyTransportBlockIntermResults_t* interm_results;                     /*!< Per-TB APP dump buffers, device pointer (optional; nullptr = no dump) */
 } cuphyLDPCDecodeDesc_t;
 
 /**
@@ -3977,7 +4089,13 @@ typedef struct
 typedef struct
 {
     CUDA_KERNEL_NODE_PARAMS kernel_node_params_driver;
-    void*                   kernel_args[2];
+    /* 3 slots: decode descriptor, base graph descriptor, and an optional
+     * per-algorithm scratch pointer (the p=35..46 band decoder stages its
+     * extension columns through device memory). A kernel declaring fewer
+     * arguments leaves the trailing slots unset -- the p=4/Z=384 point kernel
+     * takes the descriptor alone, since its base graph is in immediates. The
+     * CUDA driver reads only as many slots as the function declares. */
+    void*                   kernel_args[3];
     cuphyLDPCDecodeDesc_t   decode_desc;
 } cuphyLDPCDecodeLaunchConfig_t;
 
@@ -4000,11 +4118,13 @@ typedef struct
  * If the value of \p algoIndex is zero, the library will choose the "best"
  * algorithm for the given LDPC configuration.
  *
- * The type of input tensor descriptor \p tensorDescLLR must be either ::CUPHY_R_32F or
- * ::CUPHY_R_16F, and the rank must be 2.
- *
- * The type of output tensor descriptor \p tensorDescDst must be ::CUPHY_BIT, and the
- * rank must be 2.
+ * The output tensor descriptor \p tensorDescDst must have type ::CUPHY_BIT. The input
+ * tensor descriptor \p tensorDescLLR must have one of the following types:
+ * - ::CUPHY_R_32F
+ * - ::CUPHY_R_16F
+ * - ::CUPHY_R_8F_E4M3
+ * - ::CUPHY_R_8F_E5M2
+ * The rank of both tensor descriptors must be 2.
  *
  * For input LLR tensors of type CUPHY_R_16F, loads occur as multiples of 8 elements
  * (i.e. 16 bytes). Therefore, memory allocation should be performed such that
@@ -4022,16 +4142,27 @@ typedef struct
  * the tensor. Values read from this padded memory will not be used, and do not
  * need to be zeroed or cleared.
  *
- * Soft output values will be written when \p softOutputsAddr and \p tensorDescSoftOutputs
- * are both non-NULL. Soft output values are always written as fp16 values, regardless
- * of the input LLR data type. Soft output stores will use 32-bit instructions. Therefore,
- * \p softOutputsAddr must be 4-byte aligned, strides[0] must be 1, and strides[1] must
- * be a multiple of 2.
+ * For input LLR tensors of type CUPHY_R_8F_E4M3 or CUPHY_R_8F_E5M2, loads occur as
+ * multiples of 8 elements (i.e. 8 bytes). Therefore, memory allocation should be
+ * performed such that the number of LLR elements that can be read is a multiple of
+ * 8 for each codeword. This can be done by specifying a stride that is multiple of
+ * 8 for the second dimension, or by using the CUPHY_TENSOR_ALIGN_COALESCE flag when
+ * allocating the tensor. Values read from this padded memory will not be used, and
+ * do not need to be zeroed or cleared.
  *
- * The union member of the normalization value in the configuration \p config must
- * match the LLR type in \p config. In other words, if the LLR type is CUPHY_R_32F,
- * the normalization value should be populated using the f32 union member, and if
- * the LLR type is CUPHY_R_16F, both halves of the f16x2 union member should be set
+ * Soft output values will be written when \p softOutputsAddr and \p tensorDescSoftOutputs
+ * are both non-NULL. Soft output values are written with the same type as the input
+ * LLR descriptor, and thus the soft output descriptor type must match the type of
+ * the input descriptor. Soft output stores will use 32-bit instructions. Therefore,
+ * \p softOutputsAddr must be 4-byte aligned, strides[0] must be 1, and strides[1] must
+ * be a multiple of 4/sizeof(llr_type). For example, with fp16 LLR values, the stride
+ * (in elements) must be a multiple of 2, and for 8-bit LLR values, the stride (in
+ * elements) must be a multiple of 4.
+ *
+ * The normalization value is currently provided as a union that can hold either a
+ * 32-bit floating point value, or a pair of fp16 floating point values. If the LLR type
+ * is CUPHY_R_32F, the normalization member should be populated using the f32 union member,
+ * and for all other LLR types, both halves of the f16x2 union member should be set
  * with the same normalization value in fp16 format. The CUDA __float2half2_rn()
  * function can be used to convert a float value to a pair of fp16 values.
  * Alternatively, if the ::cuphyErrorCorrectionLDPCDecodeSetNormalization() function
@@ -4046,10 +4177,9 @@ typedef struct
  *   <li>\p tensorDescLLR is NULL</li>
  *   <li>\p dstAddr NULL</li>
  *   <li>\p LLRAddr is NULL</li>
- *   <li>\p the data type of \p tensorDescDst and llr_type in \p config do not match</li>
- *   <li>the data type of \p tensorDescDst and llr_type in \p config do not match</li>
  *   <li>\p tensorDescSoftOutputs and \p softOutputsAddr are not both NULL or both non-NULL</li>
- *   <li>\p softOutputsAddr is non-NULL and the type of \p tensorDescSoftOutputs is not CUPHY_R_16F</li>
+ *   <li>\p softOutputsAddr is non-NULL and the type of \p tensorDescSoftOutputs is not the same
+ *   as the type of tensorDescLLR</li>
  * </ul>
  *
  * Returns ::CUPHY_STATUS_UNSUPPORTED_CONFIG if the combination of the LDPC configuration
@@ -4059,8 +4189,9 @@ typedef struct
  * Returns ::CUPHY_STATUS_UNSUPPORTED_RANK if either the input tensor descriptor (\p tensorDescLLR)
  * or output tensor descriptor (\p tensorDescDst) do not have a rank of 2.
  *
- * Returns ::CUPHY_STATUS_UNSUPPORTED_TYPE if the output tensor descriptor (\p tensorDescLLR)
- * is not of type ::CUPHY_BIT, or if the input tensor descriptor is not one of (::CUPHY_R_32F or ::CUPHY_R_16F)
+ * Returns ::CUPHY_STATUS_UNSUPPORTED_TYPE if the output tensor descriptor (\p tensorDescDst)
+ * is not of type ::CUPHY_BIT, or if the input tensor descriptor (\p tensorDescLLR) is not one
+ * of (::CUPHY_R_32F, ::CUPHY_R_16F, ::CUPHY_R_8F_E4M3, or ::CUPHY_R_8F_E5M2).
  *
  * Returns ::CUPHY_STATUS_SUCCESS if the decode operation was submitted to the stream
  * successfully.
@@ -4097,8 +4228,11 @@ cuphyStatus_t CUPHYWINAPI cuphyErrorCorrectionLDPCDecode(cuphyLDPCDecoder_t     
  * If the value of algo field of the descriptor \p decodeDesc is zero, the
  * library will choose the "best" algorithm for the given LDPC configuration.
  *
- * The llr_type field of the \p decodeDesc must be either ::CUPHY_R_32F or
- * ::CUPHY_R_16F.
+ * The \c llr_type field in the \c config member of \p decodeDesc must be one of:
+ * - ::CUPHY_R_32F
+ * - ::CUPHY_R_16F
+ * - ::CUPHY_R_8F_E4M3
+ * - ::CUPHY_R_8F_E5M2
  *
  * For input LLR buffers of type CUPHY_R_16F, loads occur as multiples of 8 elements
  * (i.e. 16 bytes). Therefore, memory allocation should be performed such that
@@ -4112,6 +4246,12 @@ cuphyStatus_t CUPHYWINAPI cuphyErrorCorrectionLDPCDecode(cuphyLDPCDecoder_t     
  * the number of LLR elements that can be read is a multiple of 4 for each codeword.
  * Values read from padded memory will not be used, and do not need to be zeroed
  * or cleared.
+ *
+ * For input LLR buffers of type CUPHY_R_8F_E4M3 or CUPHY_R_8F_E5M2, loads occur as
+ * multiples of 8 elements (i.e. 8 bytes). Therefore, memory allocation should be
+ * performed such that the number of LLR elements that can be read is a multiple of
+ * 8 for each codeword. Values read from padded memory will not be used, and do not
+ * need to be zeroed or cleared.
  *
  * The union member of the normalization value in the configuration \p config must
  * match the LLR type in the decode descriptor configuration. In other words, if the
@@ -4257,6 +4397,29 @@ cuphyStatus_t CUPHYWINAPI cuphyErrorCorrectionLDPCDecodeSetNormalization(cuphyLD
 cuphyStatus_t CUPHYWINAPI cuphyErrorCorrectionLDPCDecodeGetLaunchDescriptor(cuphyLDPCDecoder_t             decoder,
                                                                             cuphyLDPCDecodeLaunchConfig_t* launchConfig);
 
+/**
+ * \brief Query the caller-side requirements of one LDPC algorithm
+ *
+ * Returns the preconditions algorithm \p algo places on its caller that the
+ * decode configuration descriptor cannot express, so the library cannot check
+ * them itself. See the CUPHY_LDPC_ALGO_REQUIRES_* flags.
+ *
+ * Returns 0 for an algorithm index that is out of range or not registered on
+ * this device -- a caller that cannot reach the algorithm has nothing to
+ * satisfy.
+ *
+ * \param decoder      - LDPC decoder instance
+ * \param algo         - algorithm index
+ * \param requirements - Returns the OR of the CUPHY_LDPC_ALGO_REQUIRES_* flags
+ *
+ * \return
+ * ::CUPHY_STATUS_SUCCESS,
+ * ::CUPHY_STATUS_INVALID_ARGUMENT
+ */
+cuphyStatus_t CUPHYWINAPI cuphyErrorCorrectionLDPCGetAlgoRequirements(cuphyLDPCDecoder_t decoder,
+                                                                      int                algo,
+                                                                      uint32_t*          requirements);
+
 /** @} */ /* END CUPHY_ERROR_CORRECTION */
 
 /**
@@ -4283,6 +4446,14 @@ typedef struct cuphyModulationLaunchConfig* cuphyModulationLaunchConfig_t;
 
 cuphyStatus_t CUPHYWINAPI cuphySetEmptyKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams);
 cuphyStatus_t CUPHYWINAPI cuphySetGenericEmptyKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, int ptrArgsCnt, void** pKernelParams);
+
+/** @brief: Set kernel node parameters for delay kernel
+ *
+ * @param[in] pNodeParams: Pointer to CUDA_KERNEL_NODE_PARAMS to populate
+ * @param[in] pKernelParams: Pointer to kernel parameters (delay in usec)
+ * @return CUPHY_STATUS_SUCCESS or CUPHY_STATUS_INVALID_ARGUMENT or CUPHY_STATUS_INTERNAL_ERROR
+ */
+cuphyStatus_t CUPHYWINAPI cuphySetDelayKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, void** pKernelParams);
 cuphyStatus_t CUPHYWINAPI cuphySetGenericEmptyKernelNodeGridConstantParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, void** pKernelParams, int ptrArgsCnt, uint16_t descr_size);
 cuphyStatus_t CUPHYWINAPI cuphySetWorkCancelKernelNodeParams(CUDA_KERNEL_NODE_PARAMS* pNodeParams, void** pKernelPARAMS, uint8_t device_graph_launch);
 
@@ -4452,7 +4623,7 @@ void cuphyPucchReceiver(cuphyTensorDescriptor_t data_rx_desc,
 typedef struct
 {
     CUDA_KERNEL_NODE_PARAMS kernelNodeParamsDriver;
-    void*                   kernelArgs[5];
+    void*                   kernelArgs[6];
 } cuphyEncoderRateMatchMultiDCILaunchCfg_t;
 
 /**
@@ -4488,7 +4659,7 @@ typedef struct
 typedef struct
 {
     CUDA_KERNEL_NODE_PARAMS kernelNodeParamsDriver;
-    void*                   kernelArgs[6];
+    void*                   kernelArgs[7];
 } cuphyGenPdcchTfSgnlLaunchCfg_t;
 
 /**
@@ -4561,6 +4732,25 @@ cuphyStatus_t cuphyPdcchPipelinePrepare(void*                                   
                                         cuphyGenScramblingSeqLaunchCfg_t*         pScrmSeqLaunchCfg,
                                         cuphyGenPdcchTfSgnlLaunchCfg_t*           pTfSignalLaunchCfg,
                                         cudaStream_t                              stream);
+
+/**
+ * Select launch configuration for the fused PDCCH TX kernel (polar encode +
+ * rate match + scrambling sequence + TF signal embedding in a single kernel).
+ *
+ * Must be called after cuphyPdcchPipelinePrepare, which derives the coreset
+ * parameters (rb_coreset, n_sym) this function consumes.
+ * @param[in,out] pLaunchCfg: pointer to launch config to populate. The kernel function
+ *                 pointer is resolved once (on first call with func == nullptr).
+ * @param[in] num_coresets: number of coresets to be processed (> 0)
+ * @param[in] num_DCIs: cumulative number of DCIs over all num_coresets coresets (> 0)
+ * @param[in] h_params: pointer to PdcchParams structs (host copy, after prepare; read-only)
+ * @return CUPHY_STATUS_SUCCESS, or CUPHY_STATUS_INVALID_ARGUMENT on null pointers or
+ *         non-positive counts.
+ */
+cuphyStatus_t cuphyPdcchFusedTxKernelSelect(cuphyGenPdcchTfSgnlLaunchCfg_t* pLaunchCfg,
+                                            int                             num_coresets,
+                                            int                             num_DCIs,
+                                            const PdcchParams*              h_params);
 
 /** @} */ /* END DL_CUPHY_PDCCH */
 
@@ -4727,7 +4917,7 @@ struct PdschUeGrpParams
     // uint16_t suffices; made uint32_t for atomics
     uint32_t cumulative_skipped_REs[OFDM_SYMBOLS_PER_SLOT]; /*!< number of REs skipped up to including this current data symbol
                                                                  for this TB. Only first num_data_symbols are valid. */
-    uint8_t tb_idx;                                         /*!< TB identifier; one of the TBs of this UE group */
+    uint8_t  tb_idx;                                        /*!< TB identifier; one of the TBs of this UE group */
 };
 
 /**
@@ -4759,6 +4949,7 @@ struct PdschDmrsParams
     float    beta_dmrs;    /*!< DMRS amplitude scaling */
     float    beta_qam;     /*!< QAM amplitude scaling */
     uint8_t num_layers;   /*!< number of layers */
+    bool    su_mimo;      /*!< false if this TB's UE group contains multiple (> 1) UEs */
 
     uint8_t port_ids[MAX_DL_LAYERS_PER_TB]; /*!< at most 8 ports supported for DMRS configuration type 1 per UE, but this is per TB;
                                                   only the first num_layers values are valid; actual port is +1000 */
@@ -5071,9 +5262,20 @@ cuphyStatus_t CUPHYWINAPI cuphyConvertVariant(cuphyVariant_t* v,
  *
  * Populates tensor memory described by the given descriptor with a
  * single value.
+ * Supported destination tensor types are ::CUPHY_R_8U, ::CUPHY_R_8I,
+ * ::CUPHY_R_16U, ::CUPHY_R_16I, ::CUPHY_R_16F, ::CUPHY_R_32U,
+ * ::CUPHY_R_32I, ::CUPHY_R_32F, ::CUPHY_C_16F, and ::CUPHY_C_32F.
+ * ::CUPHY_BIT is not supported by this API.
+ *
+ * Developer note: current in-tree call sites are limited to C++ convenience
+ * wrappers, tests, and example/test-vector generation. No cuPHY runtime path
+ * currently depends on this API, so it may be a candidate for future
+ * deprecation if external usage does not require it.
  *
  * Returns ::CUPHY_STATUS_INVALID_ARGUMENT if \p tDst, \p pDst, or v is
  *         NULL, or if the type of the input variable \p v is CUPHY_VOID
+ * Returns ::CUPHY_STATUS_UNSUPPORTED_TYPE if the destination tensor type is
+ *         unsupported.
  * Returns ::CUPHY_STATUS_INVALID_CONVERSION if conversion to the destination type is not supported
  * Returns ::CUPHY_STATUS_VALUE_OUT_OF_RANGE if the destination type cannot represent the source value
  * Returns ::CUPHY_STATUS_SUCCESS if the conversion process was initiated
@@ -5086,6 +5288,7 @@ cuphyStatus_t CUPHYWINAPI cuphyConvertVariant(cuphyVariant_t* v,
  * \return
  * ::CUPHY_STATUS_SUCCESS,
  * ::CUPHY_STATUS_INVALID_ARGUMENT
+ * ::CUPHY_STATUS_UNSUPPORTED_TYPE
  * ::CUPHY_STATUS_INVALID_CONVERSION
  * ::CUPHY_STATUS_VALUE_OUT_OF_RANGE
  *
@@ -7376,7 +7579,7 @@ typedef struct _cuphyUeSrsPrm
         uint16_t RNTI;                     // RNTI of the UE
         uint32_t usage;
         uint16_t srsStartPrg;
-        uint16_t srsChestBufferIndexL2; 
+        uint16_t srsChestBufferIndexL2;
         uint16_t startValidPrg;
         uint16_t nValidPrg;
 
@@ -7702,21 +7905,6 @@ typedef struct _cuphyBfwUeGrpPrm
     int16_t beamIdOffset; //starting offset for dynamic beam IDs
 
 } cuphyBfwUeGrpPrm_t;
-
-// @todo: Pending refactoring
-cuphyStatus_t CUPHYWINAPI
-cuphyBfcCoefCompute(unsigned int            nBSAnts,
-                    unsigned int            nLayers,
-                    unsigned int            Nprb,
-                    cuphyTensorDescriptor_t tDescH,
-                    const void*             HAddr,
-                    cuphyTensorDescriptor_t tDescLambda,
-                    const void*             lambdaAddr,
-                    cuphyTensorDescriptor_t tDescCoef,
-                    void*                   coefAddr,
-                    cuphyTensorDescriptor_t tDescDbg,
-                    void*                   dbgAddr,
-                    cudaStream_t            strm);
 
 struct cuphyBfwCoefComp;
 /**
